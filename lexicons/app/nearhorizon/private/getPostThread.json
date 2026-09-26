@@ -1,0 +1,50 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getPostThread",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get a private-tier post thread. Requires auth by a ready community member. At most 200 nodes (anchor, parents and replies); unauthorized or missing children and parents are omitted, and the parent chain stops at the first missed parent.",
+      "parameters": {
+        "type": "params",
+        "required": ["uri"],
+        "properties": {
+          "uri": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT-URI of the anchor post."
+          },
+          "depth": {
+            "type": "integer",
+            "description": "How many levels of replies to include.",
+            "default": 6,
+            "minimum": 0,
+            "maximum": 10
+          },
+          "parentHeight": {
+            "type": "integer",
+            "description": "How many levels of parent posts to include.",
+            "default": 20,
+            "minimum": 0,
+            "maximum": 30
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["thread"],
+          "properties": {
+            "thread": { "type": "ref", "ref": "app.nearhorizon.private.defs#privateThreadView" }
+          }
+        }
+      },
+      "errors": [
+        { "name": "NotFound", "description": "Post not found. Returned identically whether the anchor does not exist or is not visible to the requester." },
+        { "name": "NotEnrolled", "description": "The caller is not a community member of this AppView." },
+        { "name": "NotReady", "description": "The caller's account indexing is still in progress." }
+      ]
+    }
+  }
+}

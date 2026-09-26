@@ -1,0 +1,58 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.constellation.resolveDid",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Client routing hint: resolve a DID to its PDS, handle, home network and home AppView, plus the AppView's fallback cascade. No auth required. An unresolvable DID is not an error; its unknown fields are null.",
+      "parameters": {
+        "type": "params",
+        "required": ["did"],
+        "properties": {
+          "did": { "type": "string", "format": "did" }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["did", "pds", "handle", "homeNetwork", "homeAppview", "cascade", "capabilities"],
+          "nullable": ["pds", "handle", "homeNetwork", "homeAppview"],
+          "properties": {
+            "did": { "type": "string", "format": "did" },
+            "pds": { "type": "string", "format": "uri" },
+            "handle": { "type": "string", "format": "handle" },
+            "homeNetwork": {
+              "type": "string",
+              "description": "Network name from the routing table, 'community', or null if unknown."
+            },
+            "homeAppview": {
+              "type": "string",
+              "format": "uri",
+              "description": "Home AppView endpoint. Null for the community network (use this AppView) and for unknown."
+            },
+            "cascade": {
+              "type": "array",
+              "description": "Enabled network names in fallback order.",
+              "items": { "type": "string" }
+            },
+            "capabilities": { "type": "ref", "ref": "#capabilities" }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest", "description": "Malformed DID." }
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["localIndexed"],
+      "properties": {
+        "localIndexed": {
+          "type": "boolean",
+          "description": "True when this AppView indexes the DID locally (the DID is in scope)."
+        }
+      }
+    }
+  }
+}

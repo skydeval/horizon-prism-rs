@@ -1,0 +1,48 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getAuthorFeed",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get an author's private-tier posts that the requester is authorized to read, newest first. Requires auth by a ready community member. An unknown actor and an actor with no visible posts both return an empty feed with no cursor.",
+      "parameters": {
+        "type": "params",
+        "required": ["actor"],
+        "properties": {
+          "actor": { "type": "string", "format": "did" },
+          "limit": {
+            "type": "integer",
+            "default": 30,
+            "minimum": 1,
+            "maximum": 50
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor from a previous response (createdAt::rkey of the last returned item)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["feed"],
+          "properties": {
+            "feed": {
+              "type": "array",
+              "items": { "type": "ref", "ref": "app.nearhorizon.private.defs#privatePostView" }
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Present only when the page returned at least one item and more candidates remain."
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "NotEnrolled", "description": "The caller is not a community member of this AppView." },
+        { "name": "NotReady", "description": "The caller's account indexing is still in progress." }
+      ]
+    }
+  }
+}

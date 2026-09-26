@@ -1,0 +1,52 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.defs",
+  "defs": {
+    "privatePostView": {
+      "type": "object",
+      "description": "View of one private-tier post (tools.kryphocron.feed.postPrivate) that the requester is authorized to read. Carries no counts: a reply count would disclose replies the viewer cannot see.",
+      "required": ["uri", "cid", "author", "record", "indexedAt", "labels"],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "cid": { "type": "string", "format": "cid" },
+        "author": { "type": "ref", "ref": "app.bsky.actor.defs#profileViewBasic" },
+        "record": {
+          "type": "unknown",
+          "description": "The decoded private record, with $type 'tools.kryphocron.feed.postPrivate'. Carries text, createdAt, audienceList (at-uri) and, for replies, reply ({root, parent} strong refs). Encoded-content fields are never emitted."
+        },
+        "indexedAt": { "type": "string", "format": "datetime" },
+        "labels": {
+          "type": "array",
+          "description": "Labels on the post. Empty in v1.",
+          "items": { "type": "ref", "ref": "com.atproto.label.defs#label" }
+        }
+      }
+    },
+    "privateThreadView": {
+      "type": "object",
+      "description": "A node in a private thread. Parents and replies the requester cannot see are omitted without distinction.",
+      "required": ["post"],
+      "properties": {
+        "post": { "type": "ref", "ref": "#privatePostView" },
+        "parent": {
+          "type": "union",
+          "description": "The parent post: a private post, or a public post when a private reply's parent is public. Absent at the thread root and where the parent chain stops at a missed parent.",
+          "refs": ["#privateThreadView", "#publicParent"]
+        },
+        "replies": {
+          "type": "array",
+          "description": "Authorized private replies to this post, ordered by createdAt ascending, at most 50 per node.",
+          "items": { "type": "ref", "ref": "#privateThreadView" }
+        }
+      }
+    },
+    "publicParent": {
+      "type": "object",
+      "description": "A public post that is the parent of a private reply.",
+      "required": ["post"],
+      "properties": {
+        "post": { "type": "ref", "ref": "app.bsky.feed.defs#postView" }
+      }
+    }
+  }
+}

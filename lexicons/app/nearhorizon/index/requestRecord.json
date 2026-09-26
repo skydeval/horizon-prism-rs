@@ -1,0 +1,41 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.index.requestRecord",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Ask the AppView to index one record from the caller's own repo, for an interaction no relay delivered. The AppView fetches the record from the caller's PDS; it never writes to any repository. Requires auth.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of a record in the caller's repo."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["status"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "description": "Outcome. 'unchanged' means a newer or identical version was already indexed.",
+              "knownValues": ["indexed", "deleted", "out_of_scope", "unchanged"]
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest", "description": "The URI is not in the caller's repo, or its collection is not supported." }
+      ]
+    }
+  }
+}

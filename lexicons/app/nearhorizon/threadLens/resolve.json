@@ -1,0 +1,48 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.threadLens.resolve",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Resolve a batch of post URIs, expressing every unavailable post as a typed gap. Requires auth; the caller's identity is used only for the auth gate and rate limiting, never for hydration or filtering. Never produces the 'blocked' gap.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uris"],
+          "properties": {
+            "uris": {
+              "type": "array",
+              "items": { "type": "string", "format": "at-uri" },
+              "minLength": 1,
+              "maxLength": 25
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["items"],
+          "properties": {
+            "items": {
+              "type": "array",
+              "description": "One item per input URI, in input order.",
+              "items": {
+                "type": "union",
+                "refs": [
+                  "app.nearhorizon.threadLens.defs#postNode",
+                  "app.nearhorizon.threadLens.defs#gapNode"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest", "description": "Malformed request body, or too many URIs." }
+      ]
+    }
+  }
+}

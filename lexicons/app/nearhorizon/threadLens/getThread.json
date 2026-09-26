@@ -1,0 +1,61 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.threadLens.getThread",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Assemble a thread around an anchor post, expressing every unavailable post as a typed gap. Requires auth; the caller's identity is used only for the auth gate and rate limiting, never for hydration or filtering. At most 200 nodes.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["anchor"],
+          "properties": {
+            "anchor": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of the anchor post."
+            },
+            "depth": {
+              "type": "integer",
+              "description": "How many levels of replies to include.",
+              "default": 6,
+              "minimum": 0,
+              "maximum": 10
+            },
+            "parentHeight": {
+              "type": "integer",
+              "description": "How many levels of parent posts to include.",
+              "default": 30,
+              "minimum": 0,
+              "maximum": 30
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["anchor", "nodes"],
+          "properties": {
+            "anchor": { "type": "string", "format": "at-uri" },
+            "nodes": {
+              "type": "array",
+              "items": {
+                "type": "union",
+                "refs": [
+                  "app.nearhorizon.threadLens.defs#postNode",
+                  "app.nearhorizon.threadLens.defs#gapNode"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest", "description": "Malformed request body." }
+      ]
+    }
+  }
+}

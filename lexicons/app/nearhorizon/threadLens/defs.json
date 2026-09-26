@@ -1,0 +1,38 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.threadLens.defs",
+  "defs": {
+    "postNode": {
+      "type": "object",
+      "description": "A resolved post in a Thread Lens response. Hydrated anonymously: viewer state is always empty.",
+      "required": ["uri", "post"],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "parentUri": { "type": "string", "format": "at-uri" },
+        "rootUri": { "type": "string", "format": "at-uri" },
+        "post": { "type": "ref", "ref": "app.bsky.feed.defs#postView" }
+      }
+    },
+    "gapNode": {
+      "type": "object",
+      "description": "A post that could not be shown, with a typed reason. Every per-URI failure is expressed as a gap rather than an error.",
+      "required": ["uri", "gap"],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "parentUri": { "type": "string", "format": "at-uri" },
+        "gap": {
+          "type": "string",
+          "description": "Why the post is not shown. 'blocked' reflects a block between other parties, never the viewer; 'tier-hidden' is emitted for every private-tier URI regardless of existence or viewer.",
+          "knownValues": [
+            "blocked",
+            "deleted",
+            "not-found",
+            "upstream-unavailable",
+            "content-stripped",
+            "tier-hidden"
+          ]
+        }
+      }
+    }
+  }
+}
