@@ -13,7 +13,16 @@
 //! Deletes run in batches of 10 000 rows with a 100 ms pause between batches.
 //! Each batch is its own statement; predicates are re-evaluated per batch
 //! against `scope_dids` and `members`, which are the durable source of truth.
+//!
+//! Retention is an ordinary writer under the §6.11.7 lock order: every batch
+//! takes the `ScopeState` read guard (through [`ScopeGuard`]) before its
+//! statement acquires a pool connection, and releases it after the statement
+//! commits. A batch therefore never runs concurrently with a write-guard
+//! holder (member add/remove, purge marker steps), so a DID re-entering scope
+//! through member add cannot have its rows deleted mid-batch. The pause
+//! between batches runs without the guard.
 
+use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,16 +81,42 @@ impl RetentionReport {
     }
 }
 
+/// A held `ScopeState` read guard. Dropping it releases the guard.
+pub struct ScopeReadGuard {
+    /// Held only for its `Drop`.
+    _held: Box<dyn Any + Send + Sync>,
+}
+
+impl ScopeReadGuard {
+    /// Wrap the owned guard (for example a `tokio::sync::OwnedRwLockReadGuard`).
+    #[must_use]
+    pub fn new<G: Any + Send + Sync>(guard: G) -> Self {
+        Self {
+            _held: Box::new(guard),
+        }
+    }
+}
+
+/// Access to the `ScopeState` guard (§6.11.7 lock order, step 1), implemented
+/// by `ScopeState`. Writers take the read guard before acquiring a pool
+/// connection and hold it until after commit.
+#[async_trait]
+pub trait ScopeGuard: Send + Sync {
+    /// Wait for and take the read guard.
+    async fn read(&self) -> ScopeReadGuard;
+}
+
 /// One unit of retention work. Tasks run sequentially in registration order.
 #[async_trait]
 pub trait RetentionTask: Send + Sync {
     /// Stable name for logs and metrics.
     fn name(&self) -> &'static str;
 
-    /// Run the task once.
+    /// Run the task once. Every batch takes `scope`'s read guard first.
     async fn run(
         &self,
         pool: &PgPool,
+        scope: &dyn ScopeGuard,
         settings: &RetentionSettings,
     ) -> Result<RetentionReport, sqlx::Error>;
 }
@@ -367,17 +402,28 @@ fn age_cap_steps(max_age_days: u32) -> Vec<Step> {
     ]
 }
 
-/// Run one step to completion in batches.
-async fn run_step(pool: &PgPool, step: &Step) -> Result<u64, sqlx::Error> {
+/// Run one batch under the scope read guard. The guard is taken before the
+/// statement acquires a pool connection and released after it commits (a
+/// single statement is its own transaction).
+async fn run_batch(pool: &PgPool, scope: &dyn ScopeGuard, step: &Step) -> Result<u64, sqlx::Error> {
+    let guard = scope.read().await;
+    let query = sqlx::query::<sqlx::Postgres>(&step.sql);
+    let query = match &step.bind {
+        Bind::None => query,
+        Bind::Days(d) => query.bind(*d),
+        Bind::Dids(dids) => query.bind(dids.clone()),
+    };
+    let result = query.execute(pool).await;
+    drop(guard);
+    Ok(result?.rows_affected())
+}
+
+/// Run one step to completion in batches, pausing between batches without
+/// the guard.
+async fn run_step(pool: &PgPool, scope: &dyn ScopeGuard, step: &Step) -> Result<u64, sqlx::Error> {
     let mut total = 0u64;
     loop {
-        let query = sqlx::query::<sqlx::Postgres>(&step.sql);
-        let query = match &step.bind {
-            Bind::None => query,
-            Bind::Days(d) => query.bind(*d),
-            Bind::Dids(dids) => query.bind(dids.clone()),
-        };
-        let n = query.execute(pool).await?.rows_affected();
+        let n = run_batch(pool, scope, step).await?;
         total += n;
         if n < BATCH_SIZE {
             return Ok(total);
@@ -386,10 +432,14 @@ async fn run_step(pool: &PgPool, step: &Step) -> Result<u64, sqlx::Error> {
     }
 }
 
-async fn run_steps(pool: &PgPool, steps: &[Step]) -> Result<RetentionReport, sqlx::Error> {
+async fn run_steps(
+    pool: &PgPool,
+    scope: &dyn ScopeGuard,
+    steps: &[Step],
+) -> Result<RetentionReport, sqlx::Error> {
     let mut report = RetentionReport::default();
     for step in steps {
-        let n = run_step(pool, step).await?;
+        let n = run_step(pool, scope, step).await?;
         if n > 0 {
             metrics::counter!(METRIC_DELETED_ROWS, "table" => step.table).increment(n);
         }
@@ -419,6 +469,7 @@ impl RetentionTask for PublicRetention {
     async fn run(
         &self,
         pool: &PgPool,
+        scope: &dyn ScopeGuard,
         settings: &RetentionSettings,
     ) -> Result<RetentionReport, sqlx::Error> {
         let owners = self.inputs.private_owners().await?;
@@ -426,7 +477,7 @@ impl RetentionTask for PublicRetention {
         let mut steps = scope_steps(owners, private_authors);
         steps.extend(age_cap_steps(settings.max_age_days));
         steps.extend(time_steps(settings));
-        run_steps(pool, &steps).await
+        run_steps(pool, scope, &steps).await
     }
 }
 
@@ -449,11 +500,12 @@ pub fn next_run_after(now: DateTime<Utc>, at: UtcTimeOfDay) -> DateTime<Utc> {
 /// remaining tasks still run.
 pub async fn run_once(
     pool: &PgPool,
+    scope: &dyn ScopeGuard,
     tasks: &[Arc<dyn RetentionTask>],
     settings: &RetentionSettings,
 ) {
     for task in tasks {
-        match task.run(pool, settings).await {
+        match task.run(pool, scope, settings).await {
             Ok(report) => tracing::info!(
                 event = "retention_task_done",
                 task = task.name(),
@@ -479,6 +531,7 @@ pub async fn run_once(
 #[must_use]
 pub fn spawn_scheduler(
     pool: PgPool,
+    scope: Arc<dyn ScopeGuard>,
     tasks: Vec<Arc<dyn RetentionTask>>,
     settings: RetentionSettings,
     at: UtcTimeOfDay,
@@ -490,7 +543,7 @@ pub fn spawn_scheduler(
             let wait = (next - now).to_std().unwrap_or(Duration::ZERO);
             tracing::debug!(event = "retention_scheduled", next = %next, "next retention run scheduled");
             tokio::time::sleep(wait).await;
-            run_once(&pool, &tasks, &settings).await;
+            run_once(&pool, scope.as_ref(), &tasks, &settings).await;
         }
     })
 }
@@ -636,6 +689,55 @@ mod tests {
             next_run_after(after, at),
             Utc.with_ymd_and_hms(2027, 1, 1, 4, 0, 0).single().expect("valid")
         );
+    }
+
+    /// The `ScopeState` shape item 4 provides: an owned tokio `RwLock` guard.
+    struct LockScope {
+        lock: Arc<tokio::sync::RwLock<()>>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ScopeGuard for LockScope {
+        async fn read(&self) -> ScopeReadGuard {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ScopeReadGuard::new(Arc::clone(&self.lock).read_owned().await)
+        }
+    }
+
+    fn lock_scope() -> LockScope {
+        LockScope {
+            lock: Arc::new(tokio::sync::RwLock::new(())),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_guard_excludes_writers_until_dropped() {
+        let scope = lock_scope();
+        let guard = scope.read().await;
+        assert!(scope.lock.try_write().is_err(), "writer excluded while held");
+        drop(guard);
+        assert!(scope.lock.try_write().is_ok(), "writer admitted after release");
+    }
+
+    #[tokio::test]
+    async fn batch_takes_the_guard_and_releases_it_on_failure() {
+        let scope = lock_scope();
+        // Nothing listens on port 1, so the statement fails at connect.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let step = time_steps(&RetentionSettings {
+            tombstone_days: 7,
+            notification_days: 90,
+            max_age_days: 0,
+        })
+        .remove(0);
+        assert!(run_batch(&pool, &scope, &step).await.is_err());
+        assert_eq!(scope.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(scope.lock.try_write().is_ok(), "guard released after the batch");
     }
 
     #[test]

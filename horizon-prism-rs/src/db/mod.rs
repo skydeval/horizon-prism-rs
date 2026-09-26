@@ -16,6 +16,6 @@ pub use migrations::{
 pub use pool::connect;
 pub use retention::{
     PublicRetention, RetentionInputs, RetentionReport, RetentionSettings, RetentionTask,
-    spawn_scheduler,
+    ScopeGuard, ScopeReadGuard, spawn_scheduler,
 };
 pub use sampler::StorageSampler;
