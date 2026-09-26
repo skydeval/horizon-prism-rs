@@ -3,7 +3,8 @@
 //! encoding published in `did.json`, and the `ServiceIdentity` passed to
 //! `verify_jwt` as `local_audience`.
 
-use k256::ecdsa::{SigningKey, VerifyingKey};
+use k256::ecdsa::signature::Signer;
+use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use kryphocron::{Did, KeyId, PublicKey, ServiceIdentity, SignatureAlgorithm};
 use serde_json::{Value, json};
 
@@ -100,6 +101,16 @@ impl ServiceKey {
             .to_encoded_point(true)
             .as_bytes()
             .to_vec()
+    }
+
+    /// ES256K over `message` (ECDSA secp256k1, SHA-256), as the 64-byte
+    /// `r ‖ s` JWS encoding with `s` normalized to the low half of the curve
+    /// order (ATProto requires low-S).
+    #[must_use]
+    pub fn sign_es256k(&self, message: &[u8]) -> [u8; 64] {
+        let signature: Signature = self.signing.sign(message);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        signature.to_bytes().into()
     }
 
     #[must_use]

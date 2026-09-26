@@ -9,6 +9,7 @@
 
 pub mod admin_executor;
 pub mod aggregations;
+pub mod appview_clients;
 pub mod cli;
 pub mod config;
 pub mod db;

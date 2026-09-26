@@ -37,6 +37,12 @@ commit.
   record-level fallback (§8.3 step 6, Thread Lens step 4): through `net`,
   3 s timeout, 256 KiB cap; classified as record, `NotFound`, `Transient` or
   `Invalid`. `net` gains a test-only loopback client for fake upstreams.
+- **Item 7: `appview_clients`.** One outbound client per enabled network
+  (the local `community` network has none): `unauth`, or `service_jwt` with
+  a fresh AppView-signed token per call (`iss` did:web, `aud` =
+  `appview_did`, `lxm`, 60 s `exp`, 16-byte `jti`, ES256K low-S). Typed
+  `getProfile`, `getPosts`, `getPostThread`, `getAuthorFeed`, `getFollows`;
+  3 s per call, 4 MiB cap.
 - **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
   owns every private table behind a `pub(crate)` facade: defensive
   `postPrivate` / audience parsing with dead-lettering of malformed records
