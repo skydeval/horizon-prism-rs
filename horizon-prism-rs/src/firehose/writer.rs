@@ -28,8 +28,6 @@ use crate::aggregations::{Admission, AdmissionInput, RecordKind, ScopeSets, Scop
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
 use crate::private_tier::{PrivateOp, PrivateTier};
 
-/// Metric: op outcomes.
-pub const METRIC_OPS: &str = "firehose_ops_total";
 /// Metric: ops not written because of their class.
 pub const METRIC_SKIPPED: &str = "firehose_ops_skipped_total";
 /// Metric: LWW skips.
@@ -411,6 +409,11 @@ impl Writer {
         &self.scope
     }
 
+    #[must_use]
+    pub fn private(&self) -> &Arc<dyn PrivateTier> {
+        &self.private
+    }
+
     /// Apply one commit's ops for `repo` at `rev` in one transaction.
     ///
     /// # Errors
@@ -495,14 +498,6 @@ impl Writer {
                     error: error.clone(),
                 });
             }
-            let label = match &outcome {
-                OpOutcome::Written => "written",
-                OpOutcome::Unchanged => "unchanged",
-                OpOutcome::Rejected(_) => "rejected",
-                OpOutcome::Skipped(_) => "skipped",
-                OpOutcome::Failed(_) => "failed",
-            };
-            metrics::counter!(METRIC_OPS, "outcome" => label).increment(1);
             report.outcomes.push(outcome);
         }
 
