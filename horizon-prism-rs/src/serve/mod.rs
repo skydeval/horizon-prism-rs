@@ -22,6 +22,7 @@ use crate::db::retention::{PublicRetention, RetentionInputs, RetentionSettings, 
 use crate::db::{GateError, ScopeGuard, StorageSampler, enforce_gate};
 use crate::admin_executor::{AdminExecutor, Handlers};
 use crate::firehose::backfill::{Backfill, BackfillSource, NetSource};
+use crate::sync::{BudgetRates, HeadProber, HostBudgets, NetHeadSource};
 use crate::firehose::consumer::{Consumer, ConsumerStatus, spawn_lag_sampler};
 use crate::firehose::coverage::CoverageTracker;
 use crate::firehose::watermark::Watermarks;
@@ -204,12 +205,15 @@ pub async fn run() -> Result<(), StartupError> {
         .spawn(),
     );
 
+    // Per-host PDS budgets (§6.11.3): probe, read-fetch and backfill buckets.
+    let budgets = HostBudgets::new(BudgetRates::from_app(&cfg));
+
     // Backfill, count refresher, weekly rebuild.
     let source: Arc<dyn BackfillSource> = Arc::new(NetSource::new(
         pool.clone(),
         resolver.clone(),
         constellation.clone(),
-        cfg.file.backfill.per_pds_rate_per_sec,
+        budgets.clone(),
     ));
     let backfill = Backfill::new(writer.clone(), Arc::clone(&source), cfg.file.backfill.clone(), fh.deterministic_attempts);
     tasks.extend(
@@ -221,6 +225,19 @@ pub async fn run() -> Result<(), StartupError> {
     tasks.push(CountRefresher::new(pool.clone(), redis.clone(), constellation, &cfg.file.counts).spawn());
     let rebuild = Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days);
     tasks.push(rebuild.clone().spawn_weekly());
+
+    // Repo-head prober (§6.11.3).
+    tasks.push(
+        HeadProber::new(
+            pool.clone(),
+            scope.clone(),
+            Arc::clone(&private),
+            Arc::new(NetHeadSource::new(net.clone())),
+            budgets,
+            cfg.file.sync.clone(),
+        )
+        .spawn(),
+    );
 
     // Admin executor (§3.3).
     tasks.push(

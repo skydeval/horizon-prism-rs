@@ -22,13 +22,12 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::TimeDelta;
-use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
+use crate::sync::{Class, HostBudgets};
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
@@ -242,27 +241,27 @@ pub trait BackfillSource: Send + Sync {
     async fn inbound_blocks(&self, member: &str, cursor: Option<&str>) -> Result<LinksPage, String>;
 }
 
-/// The production source: `net` for PDS calls under a per-host budget, the
+/// The production source: `net` for PDS calls under the host's backfill
+/// bucket (§6.11.3: independent of the probe and read-fetch buckets), the
 /// identity resolver, and Constellation (which does not use the PDS budget).
 pub struct NetSource {
     pool: PgPool,
     resolver: IdentityResolver,
     net: NetClient,
     constellation: ConstellationClient,
-    limiter: DefaultKeyedRateLimiter<String>,
+    budgets: HostBudgets,
 }
 
 impl NetSource {
     #[must_use]
-    pub fn new(pool: PgPool, resolver: IdentityResolver, constellation: ConstellationClient, per_pds_rate: u32) -> Self {
+    pub fn new(pool: PgPool, resolver: IdentityResolver, constellation: ConstellationClient, budgets: HostBudgets) -> Self {
         let net = resolver.net().clone();
-        let rate = NonZeroU32::new(per_pds_rate).unwrap_or(NonZeroU32::MIN);
         Self {
             pool,
             resolver,
             net,
             constellation,
-            limiter: RateLimiter::keyed(Quota::per_second(rate)),
+            budgets,
         }
     }
 
@@ -270,7 +269,7 @@ impl NetSource {
         let url = Url::parse_with_params(&format!("{}/xrpc/{method}", pds.trim_end_matches('/')), params)
             .map_err(|e| format!("{method} url: {e}"))?;
         let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-        self.limiter.until_key_ready(&host).await;
+        self.budgets.acquire(&host, Class::Backfill).await;
         self.net
             .get(url.as_str(), &RequestOptions::new(cap).timeout(PDS_TIMEOUT))
             .await

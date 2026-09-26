@@ -14,6 +14,7 @@ pub mod microcosm;
 pub mod net;
 pub mod private_tier;
 pub mod serve;
+pub mod sync;
 
 #[cfg(test)]
 pub(crate) mod test_support;
