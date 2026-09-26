@@ -1,0 +1,14 @@
+# horizon-prism-rs reverse proxy (design v1 §11.5).
+# APP_PUBLIC_HOSTNAME and CADDY_ACME_EMAIL come from the compose environment.
+# Caddy provisions and renews the certificate, redirects HTTP to HTTPS, and sets
+# X-Forwarded-For/-Proto/-Host. trusted_proxies is deliberately unset, so client-
+# supplied X-Forwarded-For is replaced with the real client address.
+
+{
+	email {$CADDY_ACME_EMAIL}
+}
+
+{$APP_PUBLIC_HOSTNAME} {
+	encode zstd gzip
+	reverse_proxy app:3030
+}

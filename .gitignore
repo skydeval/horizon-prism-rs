@@ -2,3 +2,4 @@ docs/internal
 horizon-prism-rs/target
 .chainlink
 .claude
+docker/.env

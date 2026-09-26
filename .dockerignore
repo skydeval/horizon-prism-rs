@@ -1,0 +1,6 @@
+.git
+.chainlink
+.claude
+docs/internal
+**/target
+docker/.env

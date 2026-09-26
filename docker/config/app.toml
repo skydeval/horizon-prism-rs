@@ -1,0 +1,115 @@
+# horizon-prism-rs application config (design v1). Non-secret settings only;
+# secrets and deployment-specific values come from APP_* environment variables
+# (design §11.3). Unknown keys fail startup.
+
+[http]
+bind = "0.0.0.0:3030"
+# X-Forwarded-For is honored only from this peer address (Caddy's fixed
+# compose address, design §7.4).
+trusted_proxy = "172.30.0.10"
+
+[metrics]
+bind = "0.0.0.0:9091"
+
+[indexing]
+# community_scoped | full. full is recognized but not implemented in v1 (lock #4).
+public_scope = "community_scoped"
+
+[scope]
+# members_only | members_and_follows | members_and_interactions | members_and_one_hop
+policy = "members_and_one_hop"
+rebuild_grace_days = 7
+
+[community]
+auto_enroll = true
+max_auto_enroll_per_hour = 50
+
+[firehose]
+stream_key = "firehose:events"
+group = "horizon-prism-rs"
+consumer_name = "app"
+batch_size = 500
+dead_letter_stream = "firehose:dead-letters"
+dead_letter_after_deliveries = 5
+lag_warn_entries = 100000
+
+[identity]
+plc_url = "https://plc.directory"
+did_fresh_secs = 3600
+did_stale_max_secs = 86400
+
+[kryphocron]
+oracle_freshness_bound_secs = 120
+
+[private_read]
+min_latency_ms = 150
+
+[counts]
+# local | local_then_constellation
+public_source = "local_then_constellation"
+fresh_secs = 300
+stale_max_secs = 86400
+sync_timeout_ms = 800
+refresh_rate_per_sec = 20
+
+[microcosm]
+slingshot_url = "https://slingshot.microcosm.blue"
+constellation_url = "https://constellation.microcosm.blue"
+
+[backfill]
+concurrency = 4
+per_pds_rate_per_sec = 5
+
+[retention]
+out_of_scope_grace_days = 7
+# 0 disables the age cap for unprotected content.
+max_age_days = 0
+tombstone_days = 7
+notification_days = 90
+run_at_utc = "04:00"
+
+[storage]
+# 200 GiB. Drives db_budget_ratio and the budget warnings.
+budget_bytes = 214748364800
+
+[[constellation.networks]]
+name = "bluesky"
+pds_patterns = ["*.host.bsky.network", "bsky.social"]
+appview_url = "https://public.api.bsky.app"
+auth = "unauth"
+rate_per_sec = 20
+burst = 40
+enabled = true
+
+[[constellation.networks]]
+name = "community-a"
+pds_patterns = ["community-a.example", "*.community-a.example"]
+appview_url = "https://api.community-a.example"
+auth = "unauth"
+rate_per_sec = 10
+burst = 20
+enabled = true
+
+[[constellation.networks]]
+name = "community-b"
+pds_patterns = ["community-b.example", "*.community-b.example"]
+appview_url = "https://api.community-b.example"
+# Unauthenticated reads return 401; service_jwt needs Community B's AppView DID,
+# which api.community-b.example does not publish. Enable only after setting
+# appview_did and passing design §14 check B-6.
+auth = "service_jwt"
+appview_did = ""
+rate_per_sec = 10
+burst = 20
+enabled = false
+
+[[constellation.networks]]
+name = "community"
+# Add the community PDS hostnames (exact host or *.suffix) here.
+pds_patterns = []
+appview_url = "local"
+auth = "unauth"
+enabled = true
+
+[constellation.cascade]
+order = ["bluesky", "community-a", "community-b"]

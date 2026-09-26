@@ -1,0 +1,157 @@
+# horizon-prism-rs stack (design v1 §11).
+#
+# Run from this directory:  docker compose up -d
+# Compose reads interpolation values from ./.env (copy .env.example).
+# The build context for `app` is the repo root (..); see ../.dockerignore.
+
+name: horizon-prism-rs
+
+x-horizon-firehose: &horizon-firehose
+  build:
+    # horizon-firehose publishes no image; build it from a pinned commit.
+    context: https://github.com/skydeval/horizon-firehose.git#3f7ee6fc3ec7188ec26a5966134dd3e1065d8443
+    dockerfile: Dockerfile
+  image: horizon-firehose:3f7ee6fc3ec7
+  environment:
+    HF_CONFIG_PATH: /app/config/relay.toml
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  # horizon-firehose's shutdown budget is 30 s.
+  stop_grace_period: 35s
+  networks:
+    - prism
+
+services:
+  db:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - prism
+
+  redis:
+    image: redis:7-alpine
+    # AOF keeps the stream and the sidecars' cursor keys across restarts.
+    # noeviction: an evicted cursor key silently resumes a sidecar from live tip.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:?set REDIS_MAXMEMORY in .env}
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+    networks:
+      - prism
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: horizon-prism-rs:local
+    environment:
+      APP_PUBLIC_HOSTNAME: ${APP_PUBLIC_HOSTNAME:?set APP_PUBLIC_HOSTNAME in .env}
+      APP_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      APP_REDIS_URL: redis://redis:6379
+      APP_CONFIG_PATH: /app/config/app.toml
+      APP_DATA_DIR: /app/data
+      APP_SERVICE_SIGNING_KEY_HEX: ${APP_SERVICE_SIGNING_KEY_HEX:?set APP_SERVICE_SIGNING_KEY_HEX in .env}
+      APP_CORRELATION_KEY_HEX: ${APP_CORRELATION_KEY_HEX:?set APP_CORRELATION_KEY_HEX in .env}
+      APP_ALLOW_STARTUP_MIGRATE: ${APP_ALLOW_STARTUP_MIGRATE:-0}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+    volumes:
+      - app-data:/app/data
+      - ./config/app.toml:/app/config/app.toml:ro
+    ports:
+      - "127.0.0.1:3030:3030"
+      - "127.0.0.1:9091:9091"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Distroless has no shell or curl; the binary probes itself.
+      test: ["CMD", "/app/horizon-prism-rs", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 60s
+    stop_grace_period: 30s
+    restart: unless-stopped
+    networks:
+      - prism
+
+  horizon-firehose-bsky:
+    <<: *horizon-firehose
+    volumes:
+      - ./firehose/bsky.toml:/app/config/relay.toml:ro
+
+  horizon-firehose-microcosm:
+    <<: *horizon-firehose
+    volumes:
+      - ./firehose/microcosm.toml:/app/config/relay.toml:ro
+
+  horizon-firehose-community-a:
+    <<: *horizon-firehose
+    volumes:
+      - ./firehose/community-a.toml:/app/config/relay.toml:ro
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      APP_PUBLIC_HOSTNAME: ${APP_PUBLIC_HOSTNAME:?set APP_PUBLIC_HOSTNAME in .env}
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:?set CADDY_ACME_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      prism:
+        # app trusts X-Forwarded-For only from this address (design §7.4).
+        ipv4_address: 172.30.0.10
+
+networks:
+  prism:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  db-data:
+  redis-data:
+  app-data:
+  caddy-data:
+  caddy-config:
