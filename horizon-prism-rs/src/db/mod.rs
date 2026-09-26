@@ -5,6 +5,7 @@
 //! live only in `private_tier`, and private retention plugs into the
 //! scheduler here as a [`retention::RetentionTask`].
 
+pub mod locks;
 pub mod migrations;
 pub mod pool;
 pub mod retention;
