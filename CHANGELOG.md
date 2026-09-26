@@ -77,6 +77,9 @@ commit.
 
 ### Changed
 
+- Design-v2 §7.1/§9.6: `getLikes` and `getRepostedBy` page Constellation
+  `/links` (per-record timestamps), not `/links/distinct-dids`; counts are
+  unchanged.
 - I: postPrivate field parsing at the private-tier decode boundary must be defensive (#235)
 - Design-v2 clarifications: dead-letter replay leaves the entry in place
   (§5.9); the head prober skips DIDs with an `authz` job in flight (§6.11.3);
