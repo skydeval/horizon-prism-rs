@@ -280,6 +280,10 @@ groups:
       - alert: MembersNotReady
         expr: members_not_ready_total > 0
         for: 24h
+      # The daily authorization re-check (design §6.11.5) has fallen behind its
+      # 24 h budget: raise backfill.per_pds_rate_per_sec or lower community.max_members.
+      - alert: AuthzBudgetExceeded
+        expr: authz_daily_backlog_seconds > 86400
 ```
 
 A latched audit guard (design §6.5) makes `/xrpc/_health` return 503. `docker compose ps` then shows `app` as unhealthy. Restart `app` after investigating the logged panic.

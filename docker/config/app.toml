@@ -124,7 +124,7 @@ per_pds_rate_per_sec = 5
 # Safety ceiling for "all" block/audience listings; hitting it leaves readiness
 # unset so private reads fail closed (design §5.10).
 full_listing_ceiling = 1000000
-# Failed member/private/resync jobs are re-queued on this schedule (design §5.10).
+# Failed member/private/authz/resync jobs are re-queued on this schedule (design §5.10).
 retry_every_hours = 6
 # Reconcile deletions confirmed per job via getRecord (design §5.10).
 reconcile_confirm_limit = 1000
