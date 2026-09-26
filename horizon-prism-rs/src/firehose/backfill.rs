@@ -70,6 +70,8 @@ pub const PDS_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub const METRIC_JOBS: &str = "backfill_jobs";
 pub const METRIC_MEMBERS_NOT_READY: &str = "members_not_ready_total";
+/// An authorization record failed every deterministic attempt (§5.10).
+pub const METRIC_AUTHZ_STUCK: &str = "authz_backfill_stuck_total";
 
 /// Retry delay after the `attempt`-th consecutive failure (1-based).
 #[must_use]
@@ -629,8 +631,13 @@ impl Backfill {
             }
             let listing = self.list_collection(&pds, &job.did, c).await?;
             for record in &listing.selected {
-                if !self.write_record(&job.did, &result.rev, c.nsid, record).await? && c.authorization {
+                if let Some(error) = self.write_record(&job.did, &result.rev, c.nsid, record).await?
+                    && c.authorization
+                {
                     result.auth_write_failed = true;
+                    if job.depth.is_full_authorization() {
+                        self.authz_stuck(&job.did, &record.uri, &error);
+                    }
                 }
             }
             if listing.ceiling_hit && c.authorization {
@@ -748,13 +755,19 @@ impl Backfill {
         }
     }
 
-    /// Write one record with rev R. Returns `false` when it failed
-    /// deterministically (it is skipped).
-    async fn write_record(&self, did: &str, rev: &str, collection: &str, record: &ListedRecord) -> Result<bool, String> {
+    /// Write one record with rev R. Returns the error when it failed
+    /// deterministically after the writer's in-place attempts (it is skipped).
+    async fn write_record(
+        &self,
+        did: &str,
+        rev: &str,
+        collection: &str,
+        record: &ListedRecord,
+    ) -> Result<Option<String>, String> {
         let expected = format!("at://{did}/{collection}/");
         if !record.uri.starts_with(&expected) {
             tracing::warn!(event = "backfill_record_skipped", did, uri = %record.uri, "listed record outside the repo/collection");
-            return Ok(false);
+            return Ok(Some("listed record outside the repo/collection".to_string()));
         }
         let op = RawOp {
             action: Action::Create,
@@ -770,9 +783,24 @@ impl Backfill {
             .map_err(|e| e.to_string())?;
         if let Some(OpOutcome::Failed(error)) = report.outcomes.first() {
             tracing::warn!(event = "backfill_record_skipped", did, uri = %record.uri, %error, "record failed deterministically");
-            return Ok(false);
+            return Ok(Some(error.clone()));
         }
-        Ok(true)
+        Ok(None)
+    }
+
+    /// A readiness-capable job could not write an authorization record after
+    /// every deterministic attempt: readiness can never be set until the
+    /// record is removed from the PDS (§5.10). Loud by design.
+    fn authz_stuck(&self, did: &str, record_uri: &str, error: &str) {
+        metrics::counter!(METRIC_AUTHZ_STUCK, "did" => did.to_string()).increment(1);
+        tracing::error!(
+            event = "authz_stuck",
+            did,
+            record_uri,
+            error,
+            attempts = self.attempts,
+            "authorization record fails deterministically; readiness stays unset until it is removed from the PDS"
+        );
     }
 
     async fn delete_record(&self, did: &str, rev: &str, collection: &str, rkey: &str) -> Result<(), String> {
@@ -1422,6 +1450,58 @@ mod tests {
                 .await
                 .expect("inbound block");
         assert_eq!((author.as_str(), subject.as_str(), rev.as_str()), (blocker, DID, crate::firehose::writer::SENTINEL_REV));
+        db.drop_db().await;
+    }
+
+    #[tokio::test]
+    async fn a_bad_authorization_record_keeps_readiness_unset() {
+        let Some(db) = fresh_db("backfill_authz_stuck").await else {
+            return;
+        };
+        sqlx::query("INSERT INTO members (did, source) VALUES ($1, 'admin')")
+            .bind(DID)
+            .execute(&db.pool)
+            .await
+            .expect("member");
+        let mut source = FakeSource {
+            rev: "3kzzzzzzzzzzz".to_string(),
+            ..FakeSource::default()
+        };
+        source.listings.insert(
+            NSID_BLOCK.to_string(),
+            vec![
+                rec(DID, NSID_BLOCK, "3kaaaaaaaaaaa", json!({"subject": "not a did"})),
+                rec(DID, NSID_BLOCK, "3kbbbbbbbbbbb", json!({"subject": "did:plc:cccccccccccccccccccccccc"})),
+            ],
+        );
+        let writer = Writer::new(db.pool.clone(), state(true), Arc::new(DisabledPrivateTier));
+        let backfill = Backfill::new(writer, Arc::new(source), BackfillConfig::default(), 5);
+        let mut conn = db.pool.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Authz).await.expect("enqueue");
+        drop(conn);
+        let (_, outcome) = backfill.run_once().await.expect("run").expect("job");
+        // Fail-closed: the job completes, the good record is written, and
+        // readiness and applied_rev stay unset.
+        assert_eq!(outcome, JobOutcome::Done);
+        let blocks: i64 = sqlx::query_scalar("SELECT count(*) FROM blocks")
+            .fetch_one(&db.pool)
+            .await
+            .expect("blocks");
+        assert_eq!(blocks, 1);
+        let ready: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT ready_at FROM members WHERE did = $1")
+                .bind(DID)
+                .fetch_one(&db.pool)
+                .await
+                .expect("member");
+        assert_eq!(ready, None);
+        let applied: Option<String> = sqlx::query_scalar("SELECT applied_rev FROM sync_state WHERE did = $1")
+            .bind(DID)
+            .fetch_optional(&db.pool)
+            .await
+            .expect("sync_state")
+            .flatten();
+        assert_eq!(applied, None);
         db.drop_db().await;
     }
 

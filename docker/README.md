@@ -284,6 +284,15 @@ groups:
       # 24 h budget: raise backfill.per_pds_rate_per_sec or lower community.max_members.
       - alert: AuthzBudgetExceeded
         expr: authz_daily_backlog_seconds > 86400
+      # A member or private owner is permanently not ready: one of its
+      # authorization records (block, audience, private post) fails parsing on
+      # every attempt, so readiness is never set (fail-closed, design §5.10).
+      # The `authz_stuck` ERROR log names the record URI.
+      - alert: AuthzBackfillStuck
+        expr: authz_backfill_stuck_total > 0
+        for: 5m
+        annotations:
+          summary: "Member {{ $labels.did }} is wedged on a bad authz record — investigate and remove from PDS to unwedge."
 ```
 
 A latched audit guard (design §6.5) makes `/xrpc/_health` return 503. `docker compose ps` then shows `app` as unhealthy. Restart `app` after investigating the logged panic.
