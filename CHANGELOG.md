@@ -174,6 +174,8 @@ commit.
 
 ### Changed
 
+- Dockerfile: the COPY comment no longer describes `clippy.toml` as
+  pending; it names the file and the clippy step that enforces it.
 - F: requestRecord emits two distinct InvalidRequest messages (#232)
 - Design-v2 §6.11.1/§4.2: eligibility failure handling (3 failures over
   24 h), negative answers, streak reset, and the `member remove`

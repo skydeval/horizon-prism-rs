@@ -15,7 +15,8 @@ RUN rustup component add clippy
 
 WORKDIR /build
 # Whole crate directory: Cargo.toml, Cargo.lock, src/, migrations/ (embedded by
-# sqlx::migrate!), and clippy.toml once committed. target/ is excluded by .dockerignore.
+# sqlx::migrate!) and clippy.toml (the disallowed codec surface, enforced by the
+# clippy step below). target/ is excluded by .dockerignore.
 COPY horizon-prism-rs/ ./
 
 # Private-table source check (design §4.2): private tables may only be named
