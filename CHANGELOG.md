@@ -98,6 +98,9 @@ commit.
 
 ### Changed
 
+- Design-v2 §6.11.1/§4.2: eligibility failure handling (3 failures over
+  24 h), negative answers, streak reset, and the `member remove`
+  re-confirmation; reply cids and the eligibility columns in the schema.
 - Design-v2 §7.1/§9.6: `getLikes` and `getRepostedBy` page Constellation
   `/links` (per-record timestamps), not `/links/distinct-dids`; counts are
   unchanged.
