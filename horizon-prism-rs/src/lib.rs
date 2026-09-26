@@ -3,7 +3,9 @@
 //!
 //! Modules are added in the §15 implementation order.
 
+pub mod admin_executor;
 pub mod aggregations;
+pub mod cli;
 pub mod config;
 pub mod db;
 pub mod firehose;

@@ -17,6 +17,8 @@ enum Command {
     Serve,
     /// `GET http://127.0.0.1:3030/xrpc/_health`; exit 0 on 200 with `"ok":true`.
     Healthcheck,
+    /// Mutating admin commands, executed by `serve` (§3.3).
+    Admin(horizon_prism_rs::cli::dispatch::AdminArgs),
 }
 
 fn main() -> ExitCode {
@@ -37,6 +39,7 @@ fn main() -> ExitCode {
                 ExitCode::from(e.exit_code)
             }
         },
+        Command::Admin(args) => ExitCode::from(runtime.block_on(horizon_prism_rs::cli::dispatch::run(&args))),
         Command::Healthcheck => {
             if runtime.block_on(horizon_prism_rs::serve::healthcheck()) {
                 ExitCode::SUCCESS

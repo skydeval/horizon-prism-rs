@@ -20,7 +20,8 @@ use crate::aggregations::{PurgeLifecycle, Purger, Rebuild, ScopeState};
 use crate::config::AppConfig;
 use crate::db::retention::{PublicRetention, RetentionInputs, RetentionSettings, RetentionTask, spawn_scheduler};
 use crate::db::{GateError, ScopeGuard, StorageSampler, enforce_gate};
-use crate::firehose::backfill::{Backfill, NetSource};
+use crate::admin_executor::{AdminExecutor, Handlers};
+use crate::firehose::backfill::{Backfill, BackfillSource, NetSource};
 use crate::firehose::consumer::{Consumer, ConsumerStatus, spawn_lag_sampler};
 use crate::firehose::coverage::CoverageTracker;
 use crate::firehose::watermark::Watermarks;
@@ -204,13 +205,13 @@ pub async fn run() -> Result<(), StartupError> {
     );
 
     // Backfill, count refresher, weekly rebuild.
-    let source = Arc::new(NetSource::new(
+    let source: Arc<dyn BackfillSource> = Arc::new(NetSource::new(
         pool.clone(),
         resolver.clone(),
         constellation.clone(),
         cfg.file.backfill.per_pds_rate_per_sec,
     ));
-    let backfill = Backfill::new(writer.clone(), source, cfg.file.backfill.clone(), fh.deterministic_attempts);
+    let backfill = Backfill::new(writer.clone(), Arc::clone(&source), cfg.file.backfill.clone(), fh.deterministic_attempts);
     tasks.extend(
         backfill
             .spawn()
@@ -218,8 +219,24 @@ pub async fn run() -> Result<(), StartupError> {
             .map_err(|e| StartupError::new(1, format!("starting backfill: {e}")))?,
     );
     tasks.push(CountRefresher::new(pool.clone(), redis.clone(), constellation, &cfg.file.counts).spawn());
+    let rebuild = Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days);
+    tasks.push(rebuild.clone().spawn_weekly());
+
+    // Admin executor (§3.3).
     tasks.push(
-        Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days).spawn_weekly(),
+        AdminExecutor::new(Handlers {
+            pool: pool.clone(),
+            scope: scope.clone(),
+            private: Arc::clone(&private),
+            writer: writer.clone(),
+            purger: purger.clone(),
+            rebuild,
+            redis: redis.clone(),
+            source,
+            dead_letter_stream: fh.dead_letter_stream.clone(),
+            deterministic_attempts: fh.deterministic_attempts,
+        })
+        .spawn(),
     );
 
     // HTTP.
