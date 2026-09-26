@@ -3,5 +3,51 @@ name = "horizon-prism-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
+publish = false
 
+[lib]
+name = "horizon_prism_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "horizon-prism-rs"
+path = "src/main.rs"
+
+# Versions pinned major/minor per design-v2 §3.1.
 [dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace", "timeout", "limit", "request-id"] }
+# Postgres only (lock #2): the default `any` feature is off. Runtime-checked
+# queries only; no query!/query_as! macros, so builds need no database.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "chrono", "json"] }
+redis = { version = "0.27", features = ["tokio-comp", "aio", "streams", "connection-manager"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+hickory-resolver = "0.25"
+ipnet = "2"
+kryphocron = "0.4"
+kryphocron-lexicons = "0.3"
+proto-blue = "0.3.3"
+k256 = { version = "0.13", features = ["ecdsa"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+governor = "0.10"
+moka = { version = "0.12", features = ["future", "sync"] }
+futures = "0.3"
+arc-swap = "1"
+rand = "0.9"
+chrono = "0.4"
+hex = "0.4"
+base64 = "0.22"
+blake3 = "1"
+thiserror = "2"
+anyhow = "1"
+# kryphocron's HttpDidFetcher and proto-blue's FetchHandler are #[async_trait].
+async-trait = "0.1"
+url = "2"

@@ -1,6 +1,7 @@
-# horizon-prism-rs application config (design v1). Non-secret settings only;
+# horizon-prism-rs application config (design v2). Non-secret settings only;
 # secrets and deployment-specific values come from APP_* environment variables
-# (design §11.3). Unknown keys fail startup.
+# (design §11.3). Unknown keys fail startup. Every value below is the default;
+# an omitted key takes the same value.
 
 [http]
 bind = "0.0.0.0:3030"
@@ -66,6 +67,8 @@ coverage_capacity = 3000000
 plc_url = "https://plc.directory"
 did_fresh_secs = 3600
 did_stale_max_secs = 86400
+# Bounds kryphocron's DID-document cache on the JWT path (design §6.7).
+jwt_issuer_tracker_max = 20000
 
 [kryphocron]
 oracle_freshness_bound_secs = 120
