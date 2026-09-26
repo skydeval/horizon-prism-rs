@@ -35,6 +35,11 @@ commit.
 
 ### Changed
 
+- Design-v2 clarifications: dead-letter replay leaves the entry in place
+  (§5.9); the head prober skips DIDs with an `authz` job in flight (§6.11.3);
+  `admin backfill` defaults to `member` depth for members, `scope` otherwise
+  (§3.3); item 5 builds the `kryphocron_glue` JWT path and an upstream seam
+  (§15). postPrivate field parsing tracked for item 6 (#235).
 - `read_checked` computes consumer lag as `entries-added − entries-read` from
   the group counter; Redis 7.4 re-estimates the `XINFO GROUPS` `lag` field.
 - `hickory-resolver` pinned to 0.26 so one hickory is in the dependency graph.
