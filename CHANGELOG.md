@@ -179,6 +179,8 @@ commit.
 
 ### Changed
 
+- Design-v2 §6.11.3: read-fetch budget 25 per host (ascending-PDS worst
+  case); §13 row 185.
 - `sync.read_fetch_rate_per_host` defaults to 25 (was 20), in code and in
   `docker/config/app.toml`: the worst-case ascending-PDS author feed needs
   21 read-fetch calls (order probe, 10 post pages, 10 repost pages).
