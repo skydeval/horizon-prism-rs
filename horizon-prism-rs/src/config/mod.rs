@@ -38,15 +38,22 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    /// Includes unknown-key rejections from `deny_unknown_fields`.
+    /// Includes unknown-key rejections from `deny_unknown_fields`. Boxed to
+    /// keep the error small.
     #[error("invalid config file: {0}")]
-    Parse(#[from] toml::de::Error),
+    Parse(Box<toml::de::Error>),
     #[error("missing required environment variable {0}")]
     MissingEnv(&'static str),
     #[error("invalid environment variable {var}: {reason}")]
     InvalidEnv { var: &'static str, reason: String },
     #[error("config_error: {}", .0.join("; "))]
     Invalid(Vec<String>),
+}
+
+impl From<toml::de::Error> for ConfigError {
+    fn from(e: toml::de::Error) -> Self {
+        Self::Parse(Box::new(e))
+    }
 }
 
 /// The complete runtime configuration.
