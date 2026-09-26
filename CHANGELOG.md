@@ -33,6 +33,10 @@ commit.
   marker, so the purge end's owner re-evaluation sees fresh eligibility. The
   outcome never blocks the removal and is reported in the command result
   (`eligibility`).
+- **Item 7: Slingshot client.** `microcosm::slingshot` `getRecord` for
+  record-level fallback (§8.3 step 6, Thread Lens step 4): through `net`,
+  3 s timeout, 256 KiB cap; classified as record, `NotFound`, `Transient` or
+  `Invalid`. `net` gains a test-only loopback client for fake upstreams.
 - **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
   owns every private table behind a `pub(crate)` facade: defensive
   `postPrivate` / audience parsing with dead-lettering of malformed records

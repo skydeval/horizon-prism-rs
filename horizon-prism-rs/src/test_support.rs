@@ -33,6 +33,18 @@ pub async fn fresh_db(test: &str) -> Option<TestDb> {
     Some(db)
 }
 
+/// Serve `router` on an ephemeral loopback port (fake upstreams), returning
+/// its `http://127.0.0.1:<port>` base URL. Use with
+/// `NetClient::loopback_for_tests`.
+pub async fn serve_fake(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("fake upstream");
+    });
+    format!("http://{addr}")
+}
+
 /// A fresh database with no migrations applied (migration tests).
 pub async fn empty_db(test: &str) -> Option<TestDb> {
     let Ok(admin_url) = std::env::var(ENV) else {

@@ -215,10 +215,16 @@ impl RequestOptions {
 #[derive(Debug, Clone)]
 struct UrlPolicy {
     http_allowed_origins: Arc<Vec<String>>,
+    /// Test-only: accept `http` and loopback so fake upstreams can be served
+    /// on 127.0.0.1. Never set outside `#[cfg(test)]`.
+    allow_loopback: bool,
 }
 
 impl UrlPolicy {
     fn check(&self, url: &Url) -> Result<(), NetError> {
+        if self.allow_loopback {
+            return Ok(());
+        }
         match url.scheme() {
             "https" => {}
             "http"
@@ -283,6 +289,7 @@ impl NetClient {
     pub fn with_lookup<L: HostLookup>(config: &NetConfig, lookup: L) -> Result<Self, NetError> {
         let policy = UrlPolicy {
             http_allowed_origins: Arc::new(config.http_allowed_origins.clone()),
+            allow_loopback: false,
         };
         let redirect_policy = {
             let policy = policy.clone();
@@ -309,6 +316,24 @@ impl NetClient {
             .build()
             .map_err(|e| NetError::Build(e.to_string()))?;
         Ok(Self { http, policy })
+    }
+
+    /// Test-only client for fake upstreams on `http://127.0.0.1:<port>`: no
+    /// scheme or address guard, but the same timeouts and body caps.
+    #[cfg(test)]
+    pub(crate) fn loopback_for_tests() -> Self {
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .expect("test client");
+        Self {
+            http,
+            policy: UrlPolicy {
+                http_allowed_origins: Arc::new(Vec::new()),
+                allow_loopback: true,
+            },
+        }
     }
 
     /// Parse and check a URL against the scheme and literal-address policy.
