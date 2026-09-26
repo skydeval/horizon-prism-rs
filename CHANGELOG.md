@@ -179,6 +179,9 @@ commit.
 
 ### Changed
 
+- `sync.read_fetch_rate_per_host` defaults to 25 (was 20), in code and in
+  `docker/config/app.toml`: the worst-case ascending-PDS author feed needs
+  21 read-fetch calls (order probe, 10 post pages, 10 repost pages).
 - Dockerfile: the COPY comment no longer describes `clippy.toml` as
   pending; it names the file and the clippy step that enforces it.
 - F: requestRecord emits two distinct InvalidRequest messages (#232)

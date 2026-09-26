@@ -118,7 +118,7 @@ max_head_fetches_per_request = 16
 head_fetch_timeout_ms = 500
 divergence_grace_secs = 300
 max_probe_rate_per_host = 25
-read_fetch_rate_per_host = 20
+read_fetch_rate_per_host = 25
 
 [db]
 lock_timeout_secs = 30

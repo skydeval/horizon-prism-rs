@@ -260,7 +260,7 @@ impl Default for SyncConfig {
             head_fetch_timeout_ms: 500,
             divergence_grace_secs: 300,
             max_probe_rate_per_host: 25,
-            read_fetch_rate_per_host: 20,
+            read_fetch_rate_per_host: 25,
         }
     }
 }

@@ -93,7 +93,7 @@ divergence_grace_secs = 300
 # automatically from the tracked-DID count, up to this cap.
 max_probe_rate_per_host = 25
 # Synchronous read-time fetches never wait: no token = immediate miss.
-read_fetch_rate_per_host = 20
+read_fetch_rate_per_host = 25
 
 [db]
 # Backstop against lock waits (design §6.11.7); a timeout is a transient failure.
