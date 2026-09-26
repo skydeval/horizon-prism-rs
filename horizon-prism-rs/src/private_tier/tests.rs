@@ -317,6 +317,26 @@ async fn private_reads_round_trip_and_every_miss_is_uniform() {
     let v: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(v["thread"]["post"]["record"]["text"], "note to self");
 
+    // A reply ingested with strong refs stores and emits both cids.
+    let mut reply = f.encoded_post(ALICE, "3kreply22222", "reply to self", Some(&orphan)).await;
+    reply["reply"] = json!({"root": {"uri": own, "cid": "bafyroot"}, "parent": {"uri": own, "cid": "bafyparent"}});
+    f.ingest(ALICE, NSID_POST_PRIVATE, "3kreply22222", reply).await;
+    let reply_uri = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3kreply22222");
+    let stored: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT reply_root_cid, reply_parent_cid FROM private_posts WHERE uri = $1")
+            .bind(&reply_uri)
+            .fetch_one(&f.pool)
+            .await
+            .expect("row");
+    assert_eq!(stored, (Some("bafyroot".into()), Some("bafyparent".into())));
+    let (status, body, _) = get(&base, POSTS, &format!("uris={reply_uri}"), ALICE, ALICE_KEY).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        v["posts"][0]["record"]["reply"],
+        json!({"root": {"uri": own, "cid": "bafyroot"}, "parent": {"uri": own, "cid": "bafyparent"}})
+    );
+
     // Misses are byte-identical to a nonexistent record and still floored.
     let (_, not_found, took) = get(&base, THREAD, &format!("uri={missing}"), BOB, BOB_KEY).await;
     assert!(took >= FLOOR, "miss took {took:?}");

@@ -91,6 +91,8 @@ pub(super) struct ViewMeta {
     pub audience_uri: Option<String>,
     pub reply_root_uri: Option<String>,
     pub reply_parent_uri: Option<String>,
+    pub reply_root_cid: Option<String>,
+    pub reply_parent_cid: Option<String>,
     pub created_at: DateTime<Utc>,
     pub indexed_at: DateTime<Utc>,
 }
@@ -100,7 +102,7 @@ pub(super) struct ViewMeta {
 /// Database errors.
 pub(super) async fn view_meta(pool: &PgPool, rauth: &RecordAuthz) -> Result<Option<ViewMeta>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT cid, audience_uri, reply_root_uri, reply_parent_uri, created_at, indexed_at \
+        "SELECT cid, audience_uri, reply_root_uri, reply_parent_uri, reply_root_cid, reply_parent_cid, created_at, indexed_at \
          FROM private_posts WHERE uri = $1",
     )
     .bind(rauth.uri())

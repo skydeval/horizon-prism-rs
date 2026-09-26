@@ -19,7 +19,7 @@ use super::{Applied, IngestError, PrivateOp, owners};
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE, NSID_PRIVATE_BLOCK};
 use crate::firehose::jobs::Depth;
-use crate::firehose::normalize::bytes_field;
+use crate::firehose::normalize::{bytes_field, strong_ref_cid};
 use crate::firehose::records::created_at;
 
 /// The stored fields of a `postPrivate` record.
@@ -32,6 +32,9 @@ pub(crate) struct PostPrivateFields {
     pub audience_uri: Option<String>,
     pub reply_root_uri: Option<String>,
     pub reply_parent_uri: Option<String>,
+    /// Strong-ref cids (migration 0002); absent in some records.
+    pub reply_root_cid: Option<String>,
+    pub reply_parent_cid: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -81,19 +84,23 @@ impl PostPrivateFields {
             Some(Value::Object(m)) => Some(at_uri(m.get("uri").unwrap_or(&Value::Null), "audienceList.uri")?),
             Some(_) => return Err(malformed("audienceList is neither an at-uri nor a ref")),
         };
-        let (reply_root_uri, reply_parent_uri) = match record.get("reply") {
-            None | Some(Value::Null) => (None, None),
+        let (reply_root, reply_parent) = match record.get("reply") {
+            None | Some(Value::Null) => ((None, None), (None, None)),
             Some(r @ Value::Object(_)) => {
-                let part = |k: &str| {
-                    r.get(k)
-                        .and_then(|p| p.get("uri"))
+                let part = |k: &str| -> Result<(Option<String>, Option<String>), IngestError> {
+                    let strong_ref = r.get(k).ok_or_else(|| malformed(format!("reply.{k} missing")))?;
+                    let uri = strong_ref
+                        .get("uri")
                         .ok_or_else(|| malformed(format!("reply.{k}.uri missing")))
-                        .and_then(|u| at_uri(u, &format!("reply.{k}.uri")))
+                        .and_then(|u| at_uri(u, &format!("reply.{k}.uri")))?;
+                    let cid = strong_ref_cid(strong_ref).map_err(|()| malformed(format!("reply.{k}.cid is not a cid")))?;
+                    Ok((Some(uri), cid))
                 };
-                (Some(part("root")?), Some(part("parent")?))
+                (part("root")?, part("parent")?)
             }
             Some(_) => return Err(malformed("reply is not an object")),
         };
+        let ((reply_root_uri, reply_root_cid), (reply_parent_uri, reply_parent_cid)) = (reply_root, reply_parent);
         Ok(Self {
             text,
             encoded_content,
@@ -102,6 +109,8 @@ impl PostPrivateFields {
             audience_uri,
             reply_root_uri,
             reply_parent_uri,
+            reply_root_cid,
+            reply_parent_cid,
             created_at: created_at(record, now),
         })
     }
@@ -204,11 +213,13 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             let f = PostPrivateFields::parse(&op.record, now)?;
             sqlx::query(
                 "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, audience_uri, reply_root_uri, \
-                   reply_parent_uri, encoded_content, encoded_codec, encoded_generation, plaintext_text, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                   reply_parent_uri, encoded_content, encoded_codec, encoded_generation, plaintext_text, created_at, \
+                   reply_root_cid, reply_parent_cid) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
                  ON CONFLICT (uri) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, \
                    audience_uri = EXCLUDED.audience_uri, reply_root_uri = EXCLUDED.reply_root_uri, \
-                   reply_parent_uri = EXCLUDED.reply_parent_uri, encoded_content = EXCLUDED.encoded_content, \
+                   reply_parent_uri = EXCLUDED.reply_parent_uri, reply_root_cid = EXCLUDED.reply_root_cid, \
+                   reply_parent_cid = EXCLUDED.reply_parent_cid, encoded_content = EXCLUDED.encoded_content, \
                    encoded_codec = EXCLUDED.encoded_codec, encoded_generation = EXCLUDED.encoded_generation, \
                    plaintext_text = EXCLUDED.plaintext_text, created_at = EXCLUDED.created_at \
                  WHERE private_posts.rev < EXCLUDED.rev",
@@ -226,6 +237,8 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .bind(&f.encoded_generation)
             .bind(&f.text)
             .bind(f.created_at)
+            .bind(&f.reply_root_cid)
+            .bind(&f.reply_parent_cid)
             .execute(&mut *conn)
             .await?
             .rows_affected()
@@ -485,6 +498,13 @@ mod tests {
         let b64 = json!({"encodedContent": {"$bytes": "AP8"}, "encodedContentCodec": "laquna/0.2",
                          "audienceList": {"uri": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/tools.kryphocron.policy.audience/1", "cid": "c"}});
         assert_eq!(PostPrivateFields::parse(&b64, now()).expect("b64").encoded_content, Some(vec![0, 255]));
+        let root = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/1";
+        let reply = json!({"text": "r", "reply": {"root": {"uri": root, "cid": "bafyroot"}, "parent": {"uri": root, "cid": {"$link": "bafyparent"}}}});
+        let f = PostPrivateFields::parse(&reply, now()).expect("reply");
+        assert_eq!((f.reply_root_cid.as_deref(), f.reply_parent_cid.as_deref()), (Some("bafyroot"), Some("bafyparent")));
+        let no_cids = json!({"reply": {"root": {"uri": root}, "parent": {"uri": root}}});
+        let f = PostPrivateFields::parse(&no_cids, now()).expect("cid-less reply");
+        assert_eq!((f.reply_parent_uri.as_deref(), f.reply_parent_cid), (Some(root), None));
         let plain = json!({"text": "hi"});
         let f = PostPrivateFields::parse(&plain, now()).expect("plain");
         assert_eq!((f.text.as_deref(), f.audience_uri), (Some("hi"), None));
@@ -502,6 +522,8 @@ mod tests {
             json!({"audienceList": {"cid": "c"}}),
             json!({"reply": {"root": {"uri": "at://did:plc:a/x/1"}}}),
             json!({"reply": "x"}),
+            json!({"reply": {"root": {"uri": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/1", "cid": 5},
+                             "parent": {"uri": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/1"}}}),
             json!({"encodedContentCodec": ["laquna"]}),
         ] {
             assert!(matches!(PostPrivateFields::parse(&bad, now()), Err(IngestError::Malformed(_))), "{bad}");

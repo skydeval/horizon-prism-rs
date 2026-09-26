@@ -62,6 +62,21 @@ pub fn cid_link(value: &Value) -> Option<String> {
     }
 }
 
+/// The `cid` of a strong ref (`{uri, cid}`, e.g. `reply.root`): `Ok(None)`
+/// when absent or null, `Err(())` when present but neither a string nor a
+/// `{"$link"}`.
+///
+/// # Errors
+///
+/// A present `cid` of the wrong shape.
+#[allow(clippy::result_unit_err)]
+pub fn strong_ref_cid(strong_ref: &Value) -> Result<Option<String>, ()> {
+    match strong_ref.get("cid") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => cid_link(v).map(Some).ok_or(()),
+    }
+}
+
 /// A blob's CID (`ref` as a string or `{"$link"}`), e.g. a profile avatar.
 #[must_use]
 pub fn blob_cid(value: &Value) -> Option<String> {

@@ -355,7 +355,16 @@ async fn read_inner(
         record["audienceList"] = json!(a);
     }
     if let (Some(root), Some(parent)) = (&meta.reply_root_uri, &meta.reply_parent_uri) {
-        record["reply"] = json!({"root": {"uri": root}, "parent": {"uri": parent}});
+        // Strong refs; a cid is absent only for rows ingested before
+        // migration 0002 that no resync has refreshed yet.
+        let strong_ref = |uri: &str, cid: &Option<String>| match cid {
+            Some(c) => json!({"uri": uri, "cid": c}),
+            None => json!({"uri": uri}),
+        };
+        record["reply"] = json!({
+            "root": strong_ref(root, &meta.reply_root_cid),
+            "parent": strong_ref(parent, &meta.reply_parent_cid),
+        });
     }
     let view = json!({
         "uri": rauth.uri(),
