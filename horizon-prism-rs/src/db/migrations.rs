@@ -282,6 +282,8 @@ mod tests {
         let first = all.first().expect("at least one migration");
         assert_eq!(first.version, 1);
         assert_eq!(first.name(), "0001_initial");
+        let names: Vec<String> = all.iter().map(|m| m.name()).collect();
+        assert_eq!(names[1], "0002_private_reply_cids");
     }
 
     #[test]

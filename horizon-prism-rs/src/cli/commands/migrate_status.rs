@@ -51,7 +51,7 @@ mod tests {
             return;
         };
         let out = render(&db.pool).await.expect("render");
-        assert_eq!(out, "0001_initial  applied\nstatus: up to date");
+        assert_eq!(out, "0001_initial  applied\n0002_private_reply_cids  applied\nstatus: up to date");
         db.drop_db().await;
     }
 }

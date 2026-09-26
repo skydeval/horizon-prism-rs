@@ -25,6 +25,16 @@ impl TestDb {
 
 /// Create and migrate a fresh database, or `None` when the env var is unset.
 pub async fn fresh_db(test: &str) -> Option<TestDb> {
+    let db = empty_db(test).await?;
+    crate::db::migrations::MIGRATOR
+        .run(&db.pool)
+        .await
+        .expect("apply migrations");
+    Some(db)
+}
+
+/// A fresh database with no migrations applied (migration tests).
+pub async fn empty_db(test: &str) -> Option<TestDb> {
     let Ok(admin_url) = std::env::var(ENV) else {
         eprintln!("{ENV} unset; skipping Postgres-backed test {test}");
         return None;
@@ -39,9 +49,5 @@ pub async fn fresh_db(test: &str) -> Option<TestDb> {
     let pool = PgPool::connect(&format!("{base}/{name}"))
         .await
         .expect("connect test database");
-    crate::db::migrations::MIGRATOR
-        .run(&pool)
-        .await
-        .expect("apply migrations");
     Some(TestDb { admin, pool, name })
 }

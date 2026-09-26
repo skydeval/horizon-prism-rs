@@ -12,6 +12,9 @@ commit.
 
 ### Added
 
+- **Item 7: migration 0002.** `private_posts.reply_root_cid` and
+  `reply_parent_cid` (nullable). Rows written earlier keep NULL until an
+  `admin backfill --depth resync` refetches them.
 - **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
   owns every private table behind a `pub(crate)` facade: defensive
   `postPrivate` / audience parsing with dead-lettering of malformed records

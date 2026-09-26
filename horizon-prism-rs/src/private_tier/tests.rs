@@ -367,6 +367,28 @@ async fn private_reads_round_trip_and_every_miss_is_uniform() {
 }
 
 #[tokio::test]
+async fn migration_0002_adds_nullable_reply_cids() {
+    let Some(db) = crate::test_support::empty_db("migration_0002").await else {
+        return;
+    };
+    let migrations: Vec<_> = crate::db::migrations::MIGRATOR.iter().collect();
+    sqlx::raw_sql(&migrations[0].sql).execute(&db.pool).await.expect("0001");
+    exec(
+        &db.pool,
+        "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, reply_root_uri, reply_parent_uri, plaintext_text, created_at) \
+         VALUES ('at://did:plc:a/tools.kryphocron.feed.postPrivate/3k', 'did:plc:a', '3k', 'bafy', '3kaaaaaaaaaa2', \
+                 'at://did:plc:b/app.bsky.feed.post/1', 'at://did:plc:b/app.bsky.feed.post/1', 'x', now())",
+    )
+    .await;
+    assert_eq!(migrations[1].version, 2);
+    sqlx::raw_sql(&migrations[1].sql).execute(&db.pool).await.expect("0002 applies over existing rows");
+    let cids: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT reply_root_cid, reply_parent_cid FROM private_posts").fetch_one(&db.pool).await.expect("row");
+    assert_eq!(cids, (None, None));
+    db.drop_db().await;
+}
+
+#[tokio::test]
 async fn blocks_in_either_direction_are_misses() {
     let Some(db) = fresh_db("private_blocks_miss").await else {
         return;
