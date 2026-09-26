@@ -258,6 +258,22 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn post_context(&self, viewer: &Viewer, uris: &[String], mode: CountMode) -> Result<PostContext, sqlx::Error> {
+        self.post_context_for(Some(viewer), uris, mode).await
+    }
+
+    /// [`Hydrator::post_context`]; with `viewer = None` no viewer state is
+    /// computed at all (Thread Lens, §10.3: never `actor_viewer` or
+    /// `post_viewer`).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(crate) async fn post_context_for(
+        &self,
+        viewer: Option<&Viewer>,
+        uris: &[String],
+        mode: CountMode,
+    ) -> Result<PostContext, sqlx::Error> {
         let uris: Vec<String> = uris.iter().filter(|u| !is_private_uri(u)).cloned().collect();
         let mut posts = self.load_posts(&uris).await?;
         let mut extra: Vec<String> = Vec::new();
@@ -284,8 +300,10 @@ impl Hydrator {
                 authors.push(a.to_string());
             }
         }
-        let profiles = self.profile_context(viewer, &authors, None).await?;
-        let viewers = self.post_viewer(viewer, &all_uris).await?;
+        let (profiles, viewers) = match viewer {
+            Some(v) => (self.profile_context(v, &authors, None).await?, self.post_viewer(v, &all_uris).await?),
+            None => (self.anonymous_profile_context(&authors).await?, HashMap::new()),
+        };
         let labels = self.load_labels(&all_uris).await?;
         let counts = self.constellation_counts(&uris, mode).await;
         let gates = moderation::gate_many(self.pool(), &all_uris).await?;
@@ -512,7 +530,7 @@ impl Hydrator {
     }
 
     /// A Constellation `/links` page through the read-time cache.
-    async fn links_page(
+    pub(super) async fn links_page(
         &self,
         target: &str,
         collection: &str,

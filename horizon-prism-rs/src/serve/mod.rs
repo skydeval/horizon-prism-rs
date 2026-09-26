@@ -3,7 +3,8 @@
 //! background tasks, and the HTTP listener.
 //!
 //! HTTP: the `app.bsky.*` surface (§7.1), the `app.nearhorizon.private.*`
-//! endpoints (§7.9), `/.well-known/did.json` and `GET /xrpc/_health`.
+//! endpoints (§7.9), Thread Lens (§10), `resolveDid` (§8.7),
+//! `/.well-known/did.json` and `GET /xrpc/_health`.
 
 pub mod health;
 
@@ -37,6 +38,7 @@ use crate::constellation::{Cascade, DidLookup, Router as DidRouter, RoutingTable
 use crate::hydration::upstream::{PdsLister, RealUpstreamSource};
 use crate::hydration::{HydrationConfig, Hydrator, ReadCache};
 use crate::microcosm::SlingshotClient;
+use crate::threadlens::{Ladder, ThreadLensState};
 use crate::kryphocron_glue::GlueContext;
 use crate::private_tier::handlers::PrivateState;
 use crate::private_tier::retention::PrivateRetention;
@@ -290,10 +292,11 @@ pub async fn run() -> Result<(), StartupError> {
         crate::appview_clients::from_config(&cfg.file.constellation, &net, &glue.service_key),
     );
     let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes);
+    let slingshot = SlingshotClient::new(net.clone(), &cfg.file.microcosm.slingshot_url);
     let upstream = RealUpstreamSource::new(
         did_router.clone(),
-        cascade,
-        SlingshotClient::new(net.clone(), &cfg.file.microcosm.slingshot_url),
+        cascade.clone(),
+        slingshot.clone(),
         PdsLister::new(net.clone(), budgets),
         read_cache.clone(),
     );
@@ -349,6 +352,10 @@ pub async fn run() -> Result<(), StartupError> {
         .await
         .map_err(|e| StartupError::new(1, format!("binding {}: {e}", cfg.file.http.bind)))?;
     tracing::info!(event = "serve_started", bind = %cfg.file.http.bind, tasks = tasks.len(), "serving");
+    let thread_lens = ThreadLensState {
+        app: app.clone(),
+        ladder: Ladder::new(app.hydrator.clone(), did_router.clone(), cascade, slingshot),
+    };
     let resolve_did = ResolveDidState {
         app: app.clone(),
         router: did_router,
@@ -356,6 +363,7 @@ pub async fn run() -> Result<(), StartupError> {
     let routes = crate::xrpc::router(app)
         .merge(crate::private_tier::handlers::router(private_state))
         .merge(crate::constellation::resolve_did::router(resolve_did))
+        .merge(crate::threadlens::router(thread_lens))
         .merge(health::router(state));
     axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())

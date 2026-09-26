@@ -104,6 +104,20 @@ impl Hydrator {
         })
     }
 
+    /// Profiles with no viewer state computed (Thread Lens, §10.3).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(crate) async fn anonymous_profile_context(&self, dids: &[String]) -> Result<ProfileContext, sqlx::Error> {
+        Ok(ProfileContext {
+            rows: self.load_actors(dids).await?,
+            viewer: ActorViewer::default(),
+            labels: self.load_labels(dids).await?,
+            followers: HashMap::new(),
+        })
+    }
+
     /// `app.bsky.actor.getProfile`.
     ///
     /// # Errors

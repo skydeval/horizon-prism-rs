@@ -154,7 +154,7 @@ pub struct RealUpstreamSource {
 
 /// A `postView` synthesized from a Slingshot or PDS record: no counts, no
 /// hydrated embed (§7.1 record-level fallback).
-fn post_from_record(uri: &str, cid: Option<&str>, handle: &str, value: &Value) -> Value {
+pub(crate) fn post_from_record(uri: &str, cid: Option<&str>, handle: &str, value: &Value) -> Value {
     let author = uri_author(uri).unwrap_or_default();
     let indexed = value.get("createdAt").cloned().unwrap_or(Value::Null);
     json!({

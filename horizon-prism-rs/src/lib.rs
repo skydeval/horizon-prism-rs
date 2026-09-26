@@ -24,6 +24,7 @@ pub mod net;
 pub mod private_tier;
 pub mod serve;
 pub mod sync;
+pub mod threadlens;
 pub mod xrpc;
 
 #[cfg(test)]

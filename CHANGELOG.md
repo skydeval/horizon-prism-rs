@@ -67,6 +67,20 @@ commit.
   moderation gate first. Non-indexed handles resolve through the identity
   resolver (bidirectionally verified). `serve` wires the routing table,
   AppView clients, cascade, Slingshot and `resolveDid`.
+- **Item 7: Thread Lens.** `app.nearhorizon.threadLens.getThread` and
+  `.resolve` (POST, service-JWT auth, 2/s burst 10 per DID). The caller DID
+  is used for the auth gate and rate limit only. Hydration runs with no
+  viewer at all (never `actor_viewer`/`post_viewer`, every `viewer` is
+  `{}`), and the gap taxonomy has no viewer-relative variant. The §10.4
+  ladder: `tier-hidden` before any lookup, then the moderation gate, local
+  tombstones and posts, home AppView and cascade (`getPosts`), Slingshot,
+  and classification (`deleted`, `not-found`, `upstream-unavailable`,
+  `content-stripped`). `getThread` takes its structure from upstream
+  `getPostThread` (`#blockedPost` stubs → local/Slingshot, else
+  `blocked`; `#notFoundPost` → full ladder), falls back to the anchor and
+  parent chain, appends local and Constellation replies breadth-first, and
+  caps at 200 nodes. Responses are `PublicEmit`s built in
+  `hydration::lens`.
 - **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
   owns every private table behind a `pub(crate)` facade: defensive
   `postPrivate` / audience parsing with dead-lettering of malformed records
