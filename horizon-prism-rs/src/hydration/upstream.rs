@@ -646,6 +646,90 @@ mod tests {
         )
     }
 
+    /// A PDS listing `app.bsky.feed.post` in ascending rkey order, `n` posts
+    /// (`3k000000`…), honouring `limit` and `cursor`; no reposts. Counts
+    /// listing calls per collection.
+    async fn ascending_pds(n: usize) -> (String, Arc<std::sync::Mutex<HashMap<String, usize>>>) {
+        let calls: Arc<std::sync::Mutex<HashMap<String, usize>>> = Arc::default();
+        let router = AxumRouter::new()
+            .route(
+                "/xrpc/com.atproto.repo.listRecords",
+                get(
+                    move |State(calls): State<Arc<std::sync::Mutex<HashMap<String, usize>>>>,
+                          Query(q): Query<HashMap<String, String>>| async move {
+                        *calls.lock().expect("lock").entry(q["collection"].clone()).or_default() += 1;
+                        if q["collection"] != NSID_POST {
+                            return axum::Json(json!({"records": []})).into_response();
+                        }
+                        let limit: usize = q["limit"].parse().expect("limit");
+                        let after = q.get("cursor").cloned().unwrap_or_default();
+                        let records: Vec<Value> = (0..n)
+                            .map(|i| format!("3k{i:06}"))
+                            .filter(|rkey| *rkey > after)
+                            .take(limit)
+                            .map(|rkey| {
+                                json!({"uri": format!("at://{OUTSIDER}/{NSID_POST}/{rkey}"), "cid": "c",
+                                       "value": {"$type": NSID_POST, "text": rkey, "createdAt": "2026-09-26T00:00:00Z"}})
+                            })
+                            .collect();
+                        let cursor = records.last().and_then(|r| r["uri"].as_str()).map(|u| u.rsplit('/').next().unwrap_or_default().to_string());
+                        let more = cursor.as_ref().is_some_and(|c| (0..n).map(|i| format!("3k{i:06}")).any(|r| r > *c));
+                        axum::Json(json!({"records": records, "cursor": if more { cursor } else { None }})).into_response()
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&calls));
+        (serve_fake(router).await, calls)
+    }
+
+    fn pds_source(pds: &str, cascade_base: &str) -> RealUpstreamSource {
+        let lookup = Arc::new(StubLookup::default());
+        lookup.pds.lock().expect("lock").insert(OUTSIDER.into(), pds.to_string());
+        let router = DidRouter::new(Arc::new(table_with_community(&[])), lookup as Arc<dyn DidLookup>);
+        let net = NetClient::loopback_for_tests();
+        let generous = HostBudgets::new(BudgetRates {
+            max_probe_per_host: 25.0,
+            head_max_age_secs: 60.0,
+            read_fetch_per_host: 100.0,
+            backfill_per_host: 5.0,
+        });
+        RealUpstreamSource::new(
+            router,
+            cascade_for(&[("bluesky", cascade_base), ("community-a", cascade_base)]),
+            SlingshotClient::new(net.clone(), cascade_base),
+            PdsLister::new(net, generous),
+            ReadCache::new(1024 * 1024),
+        )
+    }
+
+    #[tokio::test]
+    async fn ascending_pds_feed_is_the_newest_limit_of_at_most_ten_pages_without_a_cursor() {
+        let (missing, _) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound"})).await;
+
+        // 250 posts over 3 pages: the newest `limit` of all of them.
+        let (pds, calls) = ascending_pds(250).await;
+        let up = pds_source(&pds, &missing);
+        let feed = up.author_feed(OUTSIDER, 5, None, "posts_with_replies").await.expect("feed");
+        let texts: Vec<&str> = feed["feed"].as_array().expect("feed").iter().filter_map(|i| i["post"]["record"]["text"].as_str()).collect();
+        assert_eq!(texts, ["3k000249", "3k000248", "3k000247", "3k000246", "3k000245"]);
+        assert!(feed.get("cursor").is_none(), "an ascending PDS gives no cursor");
+        // The order probe plus three pages of posts.
+        assert_eq!(calls.lock().expect("lock").get(NSID_POST).copied(), Some(4));
+        // A `P:` cursor on an ascending PDS ends the feed.
+        let next = up.author_feed(OUTSIDER, 5, Some("P:3k000245:"), "posts_with_replies").await.expect("feed");
+        assert_eq!(next, json!({"feed": []}));
+
+        // 1500 posts (15 pages): at most 10 pages are read, so the page is the
+        // newest of the first 1000 records, still with no cursor.
+        let (pds, calls) = ascending_pds(1500).await;
+        let up = pds_source(&pds, &missing);
+        let feed = up.author_feed(OUTSIDER, 3, None, "posts_with_replies").await.expect("feed");
+        let texts: Vec<&str> = feed["feed"].as_array().expect("feed").iter().filter_map(|i| i["post"]["record"]["text"].as_str()).collect();
+        assert_eq!(texts, ["3k000999", "3k000998", "3k000997"]);
+        assert!(feed.get("cursor").is_none());
+        assert_eq!(calls.lock().expect("lock").get(NSID_POST).copied(), Some(1 + ASCENDING_MAX_PAGES));
+    }
+
     #[tokio::test]
     async fn upstream_counts_prefer_constellation() {
         let Some(db) = crate::test_support::fresh_db("upstream_counts").await else {

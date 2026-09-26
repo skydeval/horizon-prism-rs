@@ -12,6 +12,11 @@ commit.
 
 ### Added
 
+- **Item 8.5: pre-Phase B verification tests.** Ascending-PDS author-feed
+  fallback (newest `limit` records from at most 10 listing pages, no cursor,
+  a `P:` cursor ends the feed) against a mock ascending PDS; eligibility
+  streak restarts after a mid-streak success. The Thread Lens block-party
+  and `tier-hidden` no-lookup tests re-run green.
 - **Item 8.5: `app.nearhorizon.index.requestRecord`.** The §5.9 safety net:
   any authenticated DID may ask the AppView to index a record from its own
   repo; the record is fetched from the caller's PDS (`getLatestCommit`, then

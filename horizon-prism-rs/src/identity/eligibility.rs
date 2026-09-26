@@ -256,6 +256,26 @@ mod tests {
                 .expect("row");
         assert_eq!(row, (0, None));
 
+        // A success mid-streak restarts it: two failures, a success, then a
+        // failure more than a day after the first one does not clear.
+        apply(pool, &scope, &private, DID, &failed).await.expect("fail");
+        apply(pool, &scope, &private, DID, &failed).await.expect("fail");
+        sqlx::query("UPDATE actors SET eligibility_failing_since = now() - interval '25 hours' WHERE did = $1")
+            .bind(DID)
+            .execute(pool)
+            .await
+            .expect("age");
+        apply(pool, &scope, &private, DID, &Confirmation::Eligible).await.expect("confirm");
+        apply(pool, &scope, &private, DID, &failed).await.expect("fail");
+        assert!(confirmed(pool.clone()).await, "the streak restarted at the success");
+        let (count,): (i32,) = sqlx::query_as("SELECT eligibility_failure_count FROM actors WHERE did = $1")
+            .bind(DID)
+            .fetch_one(pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 1);
+        apply(pool, &scope, &private, DID, &Confirmation::Eligible).await.expect("confirm");
+
         // Two failures, a day passes, a third: cleared.
         apply(pool, &scope, &private, DID, &failed).await.expect("fail");
         apply(pool, &scope, &private, DID, &failed).await.expect("fail");
