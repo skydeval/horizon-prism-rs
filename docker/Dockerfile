@@ -10,13 +10,16 @@ RUN apt-get update \
 
 # kryphocron-lexicons' build script invokes proto-blue-codegen as a subprocess.
 RUN cargo install proto-blue-codegen --locked --version 0.3.3
+# The official image installs the minimal rustup profile, which omits clippy.
+RUN rustup component add clippy
 
 WORKDIR /build
-COPY horizon-prism-rs/Cargo.toml horizon-prism-rs/Cargo.lock ./
-COPY horizon-prism-rs/src ./src
-# sqlx::migrate! embeds migrations at compile time.
-COPY horizon-prism-rs/migrations ./migrations
+# Whole crate directory: Cargo.toml, Cargo.lock, src/, migrations/ (embedded by
+# sqlx::migrate!), and clippy.toml once committed. target/ is excluded by .dockerignore.
+COPY horizon-prism-rs/ ./
 
+# Enforces the private-tier codec guard (design §6.3); a violation fails the build.
+RUN cargo clippy --release --locked --all-targets -- -D warnings
 RUN cargo build --release --locked --bin horizon-prism-rs
 
 # Writable data dir for kryphocron at-rest state, owned by distroless nonroot (65532).

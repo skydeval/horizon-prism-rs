@@ -32,6 +32,16 @@ batch_size = 500
 dead_letter_stream = "firehose:dead-letters"
 dead_letter_after_deliveries = 5
 lag_warn_entries = 100000
+# Relay coverage tracker (design §5.11).
+coverage_window_secs = 600
+coverage_capacity = 3000000
+
+# Short labels for each sidecar's _relay value (the full relay URL); used as the
+# metrics relay label. Unlisted values are labeled "other".
+[firehose.relay_labels]
+"wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos" = "bsky"
+"wss://relay.fire.hose.cam/xrpc/com.atproto.sync.subscribeRepos" = "microcosm"
+"wss://relay.community-a.example/xrpc/com.atproto.sync.subscribeRepos" = "community-a"
 
 [identity]
 plc_url = "https://plc.directory"
@@ -61,7 +71,8 @@ concurrency = 4
 per_pds_rate_per_sec = 5
 
 [retention]
-out_of_scope_grace_days = 7
+# Out-of-scope grace is scope.rebuild_grace_days (design §9.4); retention deletes
+# rows of authors no longer in scope_dids on its next run.
 # 0 disables the age cap for unprotected content.
 max_age_days = 0
 tombstone_days = 7
