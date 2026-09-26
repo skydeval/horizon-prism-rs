@@ -148,6 +148,7 @@ impl Hydrator {
             ..Overlay::default()
         };
         let report = normalize_upstream(&mut view, &overlay);
+        self.enrich_counts(&mut view).await?;
         anonymize(&mut view);
         Ok((view, report))
     }

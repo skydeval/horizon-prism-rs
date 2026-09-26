@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 8: upstream views prefer Constellation counts.** After
+  normalization, every upstream post view (`likeCount`, `repostCount`,
+  `replyCount`, `quoteCount`) and profile view (`followersCount`) takes a
+  fresh or stale `constellation_counts` value over the upstream count;
+  stale rows and targets with no row are queued on `cc:refresh`, and with no
+  row the upstream count stays (never a local zero). Applies to public
+  upstream views and Thread Lens. `upstream_view_counts_total{source}`.
 - **Item 7: migration 0002.** `private_posts.reply_root_cid` and
   `reply_parent_cid` (nullable). Rows written earlier keep NULL until an
   `admin backfill --depth resync` refetches them.

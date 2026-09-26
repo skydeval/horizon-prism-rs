@@ -28,6 +28,7 @@ use url::Url;
 use super::cache::ReadCache;
 use super::normalize::is_private_uri;
 use super::{INVALID_HANDLE, blob_url};
+use crate::aggregations::counts::{self, Counts, Freshness};
 use crate::constellation::{Call, Cascade, Router};
 use crate::db::locks::uri_author;
 use crate::firehose::backfill::{ListOrder, ListPage, ListedRecord, detect_order};
@@ -76,6 +77,103 @@ impl UpstreamSource for NoUpstream {
     }
     async fn follows(&self, _actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
         None
+    }
+}
+
+/// Metric: where an upstream view's counts came from.
+pub const METRIC_UPSTREAM_COUNTS: &str = "upstream_view_counts_total";
+
+/// Reads one count from a Constellation row.
+type CountPick = fn(&Counts) -> Option<i32>;
+
+/// Count fields on post views, with the `Counts` field that overrides each.
+const POST_COUNT_FIELDS: [(&str, CountPick); 4] = [
+    ("likeCount", |c| c.likes),
+    ("repostCount", |c| c.reposts),
+    ("replyCount", |c| c.replies),
+    ("quoteCount", |c| c.quotes),
+];
+
+/// The count-carrying views in an upstream response: post views by URI and
+/// profile views with `followersCount` by DID.
+fn count_targets(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| count_targets(x, out)),
+        Value::Object(m) => {
+            let is_post = m.contains_key("author") && m.contains_key("cid");
+            if is_post && let Some(u) = m.get("uri").and_then(Value::as_str) {
+                out.push(u.to_string());
+            }
+            if m.contains_key("followersCount") && let Some(d) = m.get("did").and_then(Value::as_str) {
+                out.push(d.to_string());
+            }
+            m.values().for_each(|x| count_targets(x, out));
+        }
+        _ => {}
+    }
+}
+
+fn apply_counts(v: &mut Value, counts: &HashMap<String, Counts>) {
+    match v {
+        Value::Array(a) => a.iter_mut().for_each(|x| apply_counts(x, counts)),
+        Value::Object(m) => {
+            let is_post = m.contains_key("author") && m.contains_key("cid");
+            let uri = m.get("uri").and_then(Value::as_str).map(str::to_string);
+            let did = m.get("did").and_then(Value::as_str).map(str::to_string);
+            if is_post && let Some(c) = uri.as_deref().and_then(|u| counts.get(u)) {
+                for (field, pick) in POST_COUNT_FIELDS {
+                    if let Some(n) = pick(c) {
+                        m.insert(field.into(), json!(n));
+                    }
+                }
+            }
+            if m.contains_key("followersCount")
+                && let Some(n) = did.as_deref().and_then(|d| counts.get(d)).and_then(|c| c.followers)
+            {
+                m.insert("followersCount".into(), json!(n));
+            }
+            m.values_mut().for_each(|x| apply_counts(x, counts));
+        }
+        _ => {}
+    }
+}
+
+impl super::Hydrator {
+    /// §7.1/§9.6 counts on upstream views: a fresh or stale
+    /// `constellation_counts` row overrides the upstream count (stale rows
+    /// are also queued for refresh); with no usable row the upstream count
+    /// stays (never a local zero) and the target is queued on `cc:refresh`.
+    /// A count Constellation does not carry is never touched.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(crate) async fn enrich_counts(&self, view: &mut Value) -> Result<(), sqlx::Error> {
+        let mut targets = Vec::new();
+        count_targets(view, &mut targets);
+        targets.sort();
+        targets.dedup();
+        let mut found: HashMap<String, Counts> = HashMap::new();
+        for t in targets {
+            let source = match counts::cached(self.pool(), &t, &self.inner.cfg.counts).await? {
+                Some((c, Freshness::Fresh)) => {
+                    found.insert(t, c);
+                    "fresh"
+                }
+                Some((c, _)) => {
+                    self.enqueue_refresh(&t).await;
+                    found.insert(t, c);
+                    "stale"
+                }
+                None => {
+                    self.enqueue_refresh(&t).await;
+                    "upstream"
+                }
+            };
+            metrics::counter!(METRIC_UPSTREAM_COUNTS, "source" => source).increment(1);
+        }
+        apply_counts(view, &found);
+        Ok(())
     }
 }
 
@@ -546,6 +644,46 @@ mod tests {
             PdsLister::new(net, budgets()),
             ReadCache::new(1024 * 1024),
         )
+    }
+
+    #[tokio::test]
+    async fn upstream_counts_prefer_constellation() {
+        let Some(db) = crate::test_support::fresh_db("upstream_counts").await else {
+            return;
+        };
+        let p = &db.pool;
+        let h = crate::hydration::testing::hydrator(p, crate::aggregations::ScopeSets::default());
+        let fresh = format!("at://{OUTSIDER}/{NSID_POST}/fresh");
+        let stale = format!("at://{OUTSIDER}/{NSID_POST}/stale");
+        let unknown = format!("at://{OUTSIDER}/{NSID_POST}/unknown");
+        let only_likes = Counts {
+            likes: Some(200),
+            ..Counts::default()
+        };
+        counts::store(p, &fresh, &only_likes).await.expect("store");
+        counts::store(p, &stale, &Counts { likes: Some(7), ..Counts::default() }).await.expect("store");
+        sqlx::query("UPDATE constellation_counts SET fetched_at = now() - interval '1 hour' WHERE target = $1")
+            .bind(&stale)
+            .execute(p)
+            .await
+            .expect("age");
+        counts::store(p, OUTSIDER, &Counts { followers: Some(1234), ..Counts::default() }).await.expect("store");
+        let post = |uri: &str| {
+            json!({"uri": uri, "cid": "c", "author": {"did": OUTSIDER, "handle": "o.test"}, "record": {"text": "t"},
+                   "likeCount": 50, "repostCount": 5, "replyCount": 3, "quoteCount": 1})
+        };
+        let view = json!({
+            "posts": [post(&fresh), post(&stale), post(&unknown)],
+            "profile": {"did": OUTSIDER, "handle": "o.test", "followersCount": 10, "followsCount": 4}
+        });
+        let (v, _) = h.normalized(&crate::hydration::Viewer::anonymous(), view).await.expect("normalize");
+        assert_eq!(v["posts"][0]["likeCount"], 200, "a fresh Constellation value overrides upstream");
+        assert_eq!(v["posts"][0]["repostCount"], 5, "a count Constellation does not carry is untouched");
+        assert_eq!(v["posts"][1]["likeCount"], 7, "a stale value is still used");
+        assert_eq!(v["posts"][2]["likeCount"], 50, "no row: upstream's count is kept, never a local zero");
+        assert_eq!(v["profile"]["followersCount"], 1234);
+        assert_eq!(v["profile"]["followsCount"], 4);
+        db.drop_db().await;
     }
 
     #[tokio::test]

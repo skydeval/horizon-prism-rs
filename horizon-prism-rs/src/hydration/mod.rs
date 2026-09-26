@@ -455,6 +455,7 @@ impl Hydrator {
             labels: self.load_labels(&labelled).await?,
         };
         let report = normalize::normalize_upstream(&mut view, &overlay);
+        self.enrich_counts(&mut view).await?;
         Ok((view, report))
     }
 
