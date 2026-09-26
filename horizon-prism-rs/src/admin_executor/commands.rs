@@ -334,7 +334,7 @@ impl Handlers {
         let Some((collection, rkey)) = path.split_once('/').filter(|_| is_did(&repo)) else {
             return Ok(Outcome::Failed("unparseable entry: no repo/path to replay".to_string()));
         };
-        let pds = self.source.prepare(&repo).await?;
+        let pds = self.source.prepare(&repo).await.map_err(|e| e.to_string())?;
         let rev = self.source.latest_rev(&pds, &repo).await?;
         let record = self.source.get_record(&pds, &repo, collection, rkey).await?;
         let op = match &record {

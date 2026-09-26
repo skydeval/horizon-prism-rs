@@ -205,8 +205,8 @@ mod tests {
 
     #[async_trait]
     impl BackfillSource for NoNetwork {
-        async fn prepare(&self, _: &str) -> Result<String, String> {
-            Err("no network in tests".into())
+        async fn prepare(&self, _: &str) -> Result<String, crate::firehose::backfill::PrepareError> {
+            Err(crate::firehose::backfill::PrepareError::Failed("no network in tests".into()))
         }
         async fn latest_rev(&self, _: &str, _: &str) -> Result<String, String> {
             Err("no network in tests".into())

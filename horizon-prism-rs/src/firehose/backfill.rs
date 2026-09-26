@@ -43,10 +43,10 @@ use super::classifier::{
 use super::gap;
 use super::jobs::Depth;
 use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, Writer};
-use crate::aggregations::enroll::{host_matches, pds_host};
 use crate::config::BackfillConfig;
 use crate::identity::refresher::{RefreshReason, RepoStatus, account_status, is_repo_not_found};
 use crate::identity::resolver::extract_info;
+use crate::identity::eligibility::{self, Confirmation};
 use crate::identity::{IdentityResolver, ResolveIntent};
 use crate::microcosm::{ConstellationClient, LinksPage};
 use crate::net::{BodyCap, NetClient, RequestOptions};
@@ -227,11 +227,24 @@ pub fn detect_order(records: &[ListedRecord]) -> Option<ListOrder> {
     }
 }
 
+/// Why `prepare` produced no PDS (§6.11.1 eligibility classes).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PrepareError {
+    /// A definitive answer: no PDS in the DID document, repo not found, or
+    /// repo inactive.
+    #[error("{0}")]
+    Negative(String),
+    /// No answer: resolution or transport failure, 5xx, or another status.
+    #[error("{0}")]
+    Failed(String),
+}
+
 /// Everything a job fetches from outside the database.
 #[async_trait]
 pub trait BackfillSource: Send + Sync {
-    /// Upsert the DID's identity fields and return its PDS endpoint.
-    async fn prepare(&self, did: &str) -> Result<String, String>;
+    /// Upsert the DID's identity fields, confirm hosting with
+    /// `getRepoStatus`, and return its PDS endpoint.
+    async fn prepare(&self, did: &str) -> Result<String, PrepareError>;
     /// `getLatestCommit` rev.
     async fn latest_rev(&self, pds: &str, did: &str) -> Result<String, String>;
     async fn list_records(&self, pds: &str, did: &str, collection: &str, cursor: Option<&str>)
@@ -293,18 +306,22 @@ struct XrpcError {
 
 #[async_trait]
 impl BackfillSource for NetSource {
-    async fn prepare(&self, did: &str) -> Result<String, String> {
+    async fn prepare(&self, did: &str) -> Result<String, PrepareError> {
         let fetched = self
             .resolver
             .refresh_now(did, ResolveIntent::AdmittedAuthor)
             .await
-            .map_err(|e| format!("resolve: {e}"))?;
+            .map_err(|e| PrepareError::Failed(format!("resolve: {e}")))?;
         let info = extract_info(&fetched.doc, did);
-        let pds = info.pds_endpoint.clone().ok_or("DID document names no #atproto_pds")?;
+        let pds = info
+            .pds_endpoint
+            .clone()
+            .ok_or_else(|| PrepareError::Negative("DID document names no #atproto_pds".into()))?;
         let handle = self.resolver.verify_handle(did, info.claimed_handle.as_deref()).await;
         let response = self
             .pds_get(&pds, "com.atproto.sync.getRepoStatus", &[("did", did)], BodyCap::REPO_STATUS)
-            .await?;
+            .await
+            .map_err(PrepareError::Failed)?;
         let status = response.status.as_u16();
         if !response.is_success() {
             if is_repo_not_found(status, &response.body) {
@@ -317,12 +334,14 @@ impl BackfillSource for NetSource {
                 .bind(RefreshReason::ACCOUNT)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| e.to_string())?;
-                return Err("repo not found at its PDS".to_string());
+                .map_err(|e| PrepareError::Failed(e.to_string()))?;
+                return Err(PrepareError::Negative("repo not found at its PDS".to_string()));
             }
-            return Err(format!("getRepoStatus: HTTP {status}"));
+            return Err(PrepareError::Failed(format!("getRepoStatus: HTTP {status}")));
         }
-        let repo: RepoStatus = response.json().map_err(|e| format!("getRepoStatus: {e}"))?;
+        let repo: RepoStatus = response
+            .json()
+            .map_err(|e| PrepareError::Failed(format!("getRepoStatus: {e}")))?;
         let account = account_status(&repo);
         sqlx::query(
             "INSERT INTO actors (did, pds_endpoint, handle, handle_checked_at, account_status, status_checked_at) \
@@ -337,9 +356,9 @@ impl BackfillSource for NetSource {
         .bind(&account)
         .execute(&self.pool)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| PrepareError::Failed(e.to_string()))?;
         if !repo.active {
-            return Err(format!("repo inactive ({account})"));
+            return Err(PrepareError::Negative(format!("repo inactive ({account})")));
         }
         Ok(pds)
     }
@@ -529,35 +548,6 @@ impl Backfill {
         self
     }
 
-    /// Owner eligibility for a non-member (§6.11.1). `prepare` has just
-    /// confirmed hosting with `getRepoStatus` (`active: true`), so the DID is
-    /// eligible iff its PDS host matches the community patterns. The
-    /// confirmation is recorded and the owner status re-evaluated in one
-    /// transaction (which re-checks that rows still exist, #160); the
-    /// in-memory set follows after commit. Returns whether the DID is an
-    /// owner now.
-    async fn confirm_owner(&self, did: &str, pds: &str) -> Result<bool, sqlx::Error> {
-        let eligible = pds_host(pds).is_some_and(|h| self.community_patterns.iter().any(|p| host_matches(&h, p)));
-        let guard = self.writer.scope().read_guard().await;
-        let mut tx = self.pool.begin().await?;
-        self.writer.private().record_eligibility(&mut tx, did, eligible).await?;
-        let applied = self.writer.private().reevaluate_owner(&mut tx, did).await?;
-        tx.commit().await?;
-        drop(guard);
-        let owner = applied.owners_joined.iter().any(|d| d == did);
-        let mut sets = self.writer.scope().write_guard().await;
-        if owner {
-            sets.private_owners.insert(did.to_string());
-        } else {
-            sets.private_owners.remove(did);
-        }
-        drop(sets);
-        if !owner {
-            tracing::info!(event = "backfill_owner_ineligible", did, eligible, "not a private owner; job ends without listings");
-        }
-        Ok(owner)
-    }
-
     /// Start the workers, the retry scheduler, the daily `authz` schedule and
     /// the metrics sampler. Jobs left `running` by a previous process are
     /// re-queued first.
@@ -658,14 +648,23 @@ impl Backfill {
 
     /// Steps 1–5. `Ok(None)` when superseded part-way.
     async fn run(&self, job: &Job) -> Result<Option<RunResult>, String> {
-        let pds = self.source.prepare(&job.did).await?;
         let is_member = self.writer.scope().read_guard().await.is_member(&job.did);
-        if matches!(job.depth, Depth::Private | Depth::Authz)
-            && !is_member
-            && !self.confirm_owner(&job.did, &pds).await.map_err(|e| e.to_string())?
-        {
-            return Ok(Some(RunResult::default()));
+        let prepared = self.source.prepare(&job.did).await;
+        // A non-member's private/authz job is an eligibility confirmation
+        // (§6.11.1). A DID that is not an owner afterwards ends `done`
+        // without listings; a failed confirmation of a still-eligible owner
+        // fails the job, which retries.
+        if matches!(job.depth, Depth::Private | Depth::Authz) && !is_member {
+            let confirmation = Confirmation::from_prepare(&prepared, &self.community_patterns);
+            let owner = eligibility::apply(&self.pool, self.writer.scope(), self.writer.private(), &job.did, &confirmation)
+                .await
+                .map_err(|e| e.to_string())?;
+            if !owner {
+                tracing::info!(event = "backfill_owner_ineligible", did = %job.did, ?confirmation, "not a private owner; job ends without listings");
+                return Ok(Some(RunResult::default()));
+            }
         }
+        let pds = prepared.map_err(|e| e.to_string())?;
         let rev = self.source.latest_rev(&pds, &job.did).await?;
         let plan = plan(job.depth, is_member);
         let mut result = RunResult {
@@ -1275,7 +1274,7 @@ mod tests {
 
     #[async_trait]
     impl BackfillSource for FakeSource {
-        async fn prepare(&self, _did: &str) -> Result<String, String> {
+        async fn prepare(&self, _did: &str) -> Result<String, PrepareError> {
             Ok("https://pds.example".to_string())
         }
         async fn latest_rev(&self, _pds: &str, _did: &str) -> Result<String, String> {
@@ -1558,8 +1557,8 @@ mod tests {
         struct Down;
         #[async_trait]
         impl BackfillSource for Down {
-            async fn prepare(&self, _did: &str) -> Result<String, String> {
-                Err("pds down".to_string())
+            async fn prepare(&self, _did: &str) -> Result<String, PrepareError> {
+                Err(PrepareError::Failed("pds down".to_string()))
             }
             async fn latest_rev(&self, _: &str, _: &str) -> Result<String, String> {
                 unreachable!()

@@ -19,6 +19,14 @@ commit.
   `reply.{root,parent}.cid` (string or `$link`; a cid of any other shape is
   malformed) and `privatePostView.record.reply` carries `{uri, cid}` strong
   refs, `{uri}` only for pre-0002 rows.
+- **Item 7: eligibility failure handling.** Migration 0003 adds
+  `actors.eligibility_failure_count` and `eligibility_failing_since`. A
+  failed `getRepoStatus` confirmation (network error, 5xx) keeps eligibility
+  and extends the streak; three consecutive failures spanning at least 24 h
+  remove it (`eligibility_cleared_after_failures`). Definitive answers (repo
+  not found, inactive, no PDS, host outside the community patterns) remove
+  it at once, and any answer resets the streak. Backfill `prepare` now
+  returns a typed `PrepareError` (`Negative` / `Failed`).
 - **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
   owns every private table behind a `pub(crate)` facade: defensive
   `postPrivate` / audience parsing with dead-lettering of malformed records
