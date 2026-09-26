@@ -5,4 +5,5 @@
 
 pub mod config;
 pub mod db;
+pub mod identity;
 pub mod net;
