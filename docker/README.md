@@ -128,6 +128,18 @@ docker compose ps app
 docker compose exec -T db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' < backup-YYYYMMDDTHHMMSS.dump
 ```
 
+## Admin commands
+
+Commands that change state are executed by the running `app` service, not by the `docker compose exec` process you type them in:
+- `member add` and `member remove`;
+- `label add` and `label remove`;
+- `scope rebuild`, `backfill` and `resync`;
+- `deadletter replay` and `deadletter drop`.
+
+The CLI queues the command and waits up to `admin.command_timeout_secs` (600 s) for the result. If it times out, the command keeps running, and `admin commands list` shows its state. `app` must be running for these commands to take effect.
+
+Read-only commands (`… list`, `stream info`, `migrate status`, `keygen`) run directly.
+
 ## Log inspection
 
 All services log JSON.

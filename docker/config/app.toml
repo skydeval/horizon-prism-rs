@@ -96,6 +96,11 @@ read_fetch_rate_per_host = 20
 # Backstop against lock waits (design §6.11.7); a timeout is a transient failure.
 lock_timeout_secs = 30
 
+[admin]
+# Mutating admin commands are executed by `serve` (design §3.3); the CLI waits
+# this long for completion before giving up (the command keeps running).
+command_timeout_secs = 600
+
 [cache]
 # In-process read-time cache budget (design §7.6).
 read_time_bytes = 268435456
