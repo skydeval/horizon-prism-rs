@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use super::AppState;
 use super::auth::request_ip;
 use super::errors::XrpcError;
-use super::handlers::{actor, did_web, feed, graph, mutes, notifications, timeline};
+use super::handlers::{actor, did_web, feed, graph, index, mutes, notifications, timeline};
 use super::rate_limit::Class;
 
 pub(crate) async fn global_limit(
@@ -58,6 +58,15 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(notifications::UPDATE_SEEN), post(notifications::update_seen))
         .route("/.well-known/did.json", get(did_web::did_json))
         .layer(middleware::from_fn_with_state(state.clone(), global_limit))
+        .with_state(state)
+}
+
+/// The `index.requestRecord` route (§5.9), with its own state (the write
+/// path and the PDS source); merged into the app by `serve`.
+pub fn index_router(state: index::IndexState) -> Router {
+    Router::new()
+        .route(&xrpc(index::REQUEST_RECORD), post(index::request_record))
+        .layer(middleware::from_fn_with_state(state.app.clone(), global_limit))
         .with_state(state)
 }
 

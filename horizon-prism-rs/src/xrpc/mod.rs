@@ -1,6 +1,7 @@
-//! The XRPC surface (design-v2 §7): `app.bsky.*` handlers, the auth
-//! extractor, rate limiting and error mapping. Private-tier, Thread Lens,
-//! `resolveDid` and `requestRecord` endpoints arrive with items 6 and 7.
+//! The XRPC surface (design-v2 §7): `app.bsky.*` handlers,
+//! `index.requestRecord`, the auth extractor, rate limiting and error
+//! mapping. The private-tier, Thread Lens and `resolveDid` routers live with
+//! their modules.
 
 pub mod auth;
 pub mod errors;

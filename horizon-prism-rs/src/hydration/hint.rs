@@ -1,7 +1,8 @@
-//! The `app.nearhorizon.constellation.resolveDid` view (design-v2 §8.7),
-//! built here so the handler returns a sealed [`PublicEmit`] (§7.2). Every
-//! input is public: the DID document, the routing table, and scope
-//! membership.
+//! Small public views built here so their handlers return a sealed
+//! [`PublicEmit`] (§7.2): the `app.nearhorizon.constellation.resolveDid`
+//! view (§8.7) and the `index.requestRecord` status (§5.9). Every input is
+//! public: the DID document, the routing table, scope membership, and the
+//! caller's own write outcome.
 
 use serde_json::{Value, json};
 
@@ -21,6 +22,13 @@ pub struct RoutingHint {
     pub cascade: Vec<String>,
     /// The DID is in `scope_dids`.
     pub local_indexed: bool,
+}
+
+/// The `app.nearhorizon.index.requestRecord` output (§5.9): the outcome for
+/// the caller's own record only.
+#[must_use]
+pub fn index_status(status: crate::firehose::index_request::IndexStatus) -> PublicEmit<Value> {
+    PublicEmit::new(json!({ "status": status.as_str() }))
 }
 
 /// The `resolveDid` output.

@@ -17,8 +17,9 @@ use crate::aggregations::membership::{AddOutcome, add_member};
 use crate::db::locks::uri_author;
 use crate::firehose::backfill::BackfillSource;
 use crate::firehose::gap::{self, GapCause};
+use crate::firehose::index_request::{IndexError, index_record};
 use crate::firehose::jobs::{self, Depth};
-use crate::firehose::writer::{Action, ApplyOptions, OpOutcome, RawOp, Writer};
+use crate::firehose::writer::Writer;
 use crate::identity::eligibility::{self, Confirmation};
 use crate::private_tier::PrivateTier;
 
@@ -378,39 +379,12 @@ impl Handlers {
         let Some((collection, rkey)) = path.split_once('/').filter(|_| is_did(&repo)) else {
             return Ok(Outcome::Failed("unparseable entry: no repo/path to replay".to_string()));
         };
-        let pds = self.source.prepare(&repo).await.map_err(|e| e.to_string())?;
-        let rev = self.source.latest_rev(&pds, &repo).await?;
-        let record = self.source.get_record(&pds, &repo, collection, rkey).await?;
-        let op = match &record {
-            Some(r) => RawOp {
-                action: Action::Create,
-                collection: collection.to_string(),
-                rkey: rkey.to_string(),
-                cid: Some(r.cid.clone()),
-                record: Some(r.value.clone()),
-            },
-            None => RawOp {
-                action: Action::Delete,
-                collection: collection.to_string(),
-                rkey: rkey.to_string(),
-                cid: None,
-                record: None,
-            },
+        let indexed = match index_record(self.source.as_ref(), &self.writer, &repo, collection, rkey, self.deterministic_attempts).await {
+            Ok(i) => i,
+            Err(e @ IndexError::Write(_)) => return Ok(Outcome::Failed(format!("replay failed: {e}"))),
+            Err(e) => return Err(e.to_string()),
         };
-        let options = ApplyOptions {
-            advance_applied_rev: false,
-            dead_letter_readiness: false,
-            attempts: self.deterministic_attempts,
-        };
-        let report = self.writer.apply(&repo, &rev, &[op], options).await.map_err(|e| e.to_string())?;
-        let status = match report.outcomes.first() {
-            Some(OpOutcome::Written) if record.is_some() => "indexed",
-            Some(OpOutcome::Written) => "deleted",
-            Some(OpOutcome::Unchanged) => "unchanged",
-            Some(OpOutcome::Rejected(_) | OpOutcome::Skipped(_)) => "out_of_scope",
-            Some(OpOutcome::Failed(e)) => return Ok(Outcome::Failed(format!("replay failed: {e}"))),
-            None => "unchanged",
-        };
+        let (rev, status) = (indexed.rev, indexed.status.as_str());
         Ok(Outcome::Done(json!({ "id": id, "repo": repo, "path": path, "rev": rev, "status": status })))
     }
 

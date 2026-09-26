@@ -5,6 +5,7 @@ pub mod actor;
 pub mod did_web;
 pub mod feed;
 pub mod graph;
+pub mod index;
 pub mod mutes;
 pub mod notifications;
 pub mod timeline;

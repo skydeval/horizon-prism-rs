@@ -8,6 +8,7 @@ pub mod consumer;
 pub mod coverage;
 pub mod deadletter;
 pub mod gap;
+pub mod index_request;
 pub mod jobs;
 pub mod normalize;
 pub mod records;

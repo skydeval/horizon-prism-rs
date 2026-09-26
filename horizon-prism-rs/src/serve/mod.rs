@@ -3,7 +3,7 @@
 //! background tasks, and the HTTP listener.
 //!
 //! HTTP: the `app.bsky.*` surface (§7.1), the `app.nearhorizon.private.*`
-//! endpoints (§7.9), Thread Lens (§10), `resolveDid` (§8.7),
+//! endpoints (§7.9), Thread Lens (§10), `resolveDid` (§8.7), `requestRecord` (§5.9),
 //! `/.well-known/did.json` and `GET /xrpc/_health`.
 
 pub mod health;
@@ -274,7 +274,7 @@ pub async fn run() -> Result<(), StartupError> {
             purger: purger.clone(),
             rebuild,
             redis: redis.clone(),
-            source,
+            source: Arc::clone(&source),
             dead_letter_stream: fh.dead_letter_stream.clone(),
             deterministic_attempts: fh.deterministic_attempts,
             community_patterns: Arc::new(community_patterns.clone()),
@@ -356,6 +356,12 @@ pub async fn run() -> Result<(), StartupError> {
         app: app.clone(),
         ladder: Ladder::new(app.hydrator.clone(), did_router.clone(), cascade, slingshot),
     };
+    let index = crate::xrpc::handlers::index::IndexState {
+        app: app.clone(),
+        source,
+        writer: writer.clone(),
+        attempts: fh.deterministic_attempts,
+    };
     let resolve_did = ResolveDidState {
         app: app.clone(),
         router: did_router,
@@ -364,6 +370,7 @@ pub async fn run() -> Result<(), StartupError> {
         .merge(crate::private_tier::handlers::router(private_state))
         .merge(crate::constellation::resolve_did::router(resolve_did))
         .merge(crate::threadlens::router(thread_lens))
+        .merge(crate::xrpc::router::index_router(index))
         .merge(health::router(state));
     axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())

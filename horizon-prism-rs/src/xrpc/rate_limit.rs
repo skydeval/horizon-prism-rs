@@ -10,9 +10,8 @@
 //! | `app.nearhorizon.private.*` | DID | 10/s, 20 |
 //! | `app.nearhorizon.threadLens.*` | DID | 2/s, 10 |
 //! | `app.nearhorizon.constellation.resolveDid` | IP | 10/s, 20 |
+//! | `app.nearhorizon.index.requestRecord` | DID | 0.5/s, 30 |
 //! | any request | IP | 100/s, 200 (global backstop) |
-//!
-//! `index.requestRecord` (0.5/s, 30) is added with its endpoint.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -32,26 +31,32 @@ pub enum Class {
     Private,
     ThreadLens,
     ResolveDid,
+    IndexRequest,
     Global,
 }
 
-/// Rate and burst per class (§7.4).
+/// Replenishment period and burst per class (§7.4): one token every
+/// period, `burst` at most.
 #[must_use]
-pub fn quota(class: Class) -> (u32, u32) {
+pub fn quota(class: Class) -> (Duration, u32) {
+    let per_second = |rate: u64| Duration::from_nanos(1_000_000_000 / rate);
     match class {
-        Class::AnonRead => (30, 60),
-        Class::AuthRead => (60, 120),
-        Class::Write => (5, 20),
-        Class::Private => (10, 20),
-        Class::ThreadLens => (2, 10),
-        Class::ResolveDid => (10, 20),
-        Class::Global => (100, 200),
+        Class::AnonRead => (per_second(30), 60),
+        Class::AuthRead => (per_second(60), 120),
+        Class::Write => (per_second(5), 20),
+        Class::Private => (per_second(10), 20),
+        Class::ThreadLens => (per_second(2), 10),
+        Class::ResolveDid => (per_second(10), 20),
+        // 0.5/s: one token every 2 s.
+        Class::IndexRequest => (Duration::from_secs(2), 30),
+        Class::Global => (per_second(100), 200),
     }
 }
 
 fn limiter(class: Class) -> DefaultKeyedRateLimiter<String> {
-    let (rate, burst) = quota(class);
-    let q = Quota::per_second(NonZeroU32::new(rate).unwrap_or(NonZeroU32::MIN))
+    let (period, burst) = quota(class);
+    let q = Quota::with_period(period)
+        .unwrap_or_else(|| Quota::per_second(NonZeroU32::MIN))
         .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::MIN));
     RateLimiter::keyed(q)
 }
@@ -71,6 +76,7 @@ pub struct RateLimits {
     private: Arc<DefaultKeyedRateLimiter<String>>,
     thread_lens: Arc<DefaultKeyedRateLimiter<String>>,
     resolve_did: Arc<DefaultKeyedRateLimiter<String>>,
+    index_request: Arc<DefaultKeyedRateLimiter<String>>,
     global: Arc<DefaultKeyedRateLimiter<String>>,
 }
 
@@ -90,6 +96,7 @@ impl RateLimits {
             private: Arc::new(limiter(Class::Private)),
             thread_lens: Arc::new(limiter(Class::ThreadLens)),
             resolve_did: Arc::new(limiter(Class::ResolveDid)),
+            index_request: Arc::new(limiter(Class::IndexRequest)),
             global: Arc::new(limiter(Class::Global)),
         }
     }
@@ -102,6 +109,7 @@ impl RateLimits {
             Class::Private => &self.private,
             Class::ThreadLens => &self.thread_lens,
             Class::ResolveDid => &self.resolve_did,
+            Class::IndexRequest => &self.index_request,
             Class::Global => &self.global,
         }
     }
@@ -145,6 +153,7 @@ impl RateLimits {
                     Class::Private,
                     Class::ThreadLens,
                     Class::ResolveDid,
+                    Class::IndexRequest,
                     Class::Global,
                 ] {
                     let b = this.bucket(class);

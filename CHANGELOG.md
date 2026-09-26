@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 8.5: `app.nearhorizon.index.requestRecord`.** The §5.9 safety net:
+  any authenticated DID may ask the AppView to index a record from its own
+  repo; the record is fetched from the caller's PDS (`getLatestCommit`, then
+  `getRecord`) and run through the normal write path, answering `indexed`,
+  `deleted`, `out_of_scope` or `unchanged`. A URI outside the caller's
+  repo and an unsupported collection are distinct `InvalidRequest` messages
+  (#232); per-DID 0.5/s, burst 30. `admin deadletter replay` now shares the
+  same procedure (`firehose::index_request`).
 - **Item 8: upstream views prefer Constellation counts.** After
   normalization, every upstream post view (`likeCount`, `repostCount`,
   `replyCount`, `quoteCount`) and profile view (`followersCount`) takes a
@@ -166,6 +174,7 @@ commit.
 
 ### Changed
 
+- F: requestRecord emits two distinct InvalidRequest messages (#232)
 - Design-v2 §6.11.1/§4.2: eligibility failure handling (3 failures over
   24 h), negative answers, streak reset, and the `member remove`
   re-confirmation; reply cids and the eligibility columns in the schema.
