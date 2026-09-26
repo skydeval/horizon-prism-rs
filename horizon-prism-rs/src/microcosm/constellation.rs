@@ -29,7 +29,7 @@ pub enum ConstellationError {
 }
 
 /// One record linking to the target.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct LinkingRecord {
     pub did: String,
     pub collection: String,
@@ -37,12 +37,24 @@ pub struct LinkingRecord {
 }
 
 /// One `/links` page.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct LinksPage {
     #[serde(default)]
     pub total: u64,
     #[serde(default)]
     pub linking_records: Vec<LinkingRecord>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// One `/links/distinct-dids` page: `{"total", "linking_dids": [did…],
+/// "cursor"}` (parsed leniently; this shape was not probed).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct DidsPage {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub linking_dids: Vec<String>,
     #[serde(default)]
     pub cursor: Option<String>,
 }
@@ -136,6 +148,29 @@ impl ConstellationClient {
             &[("target", target), ("collection", collection), ("path", path)],
         )?;
         Ok(self.get::<Total>(&url).await?.total)
+    }
+
+    /// One page of distinct DIDs linking to `target` (`/links/distinct-dids`,
+    /// §7.1 `getFollowers`).
+    ///
+    /// # Errors
+    ///
+    /// Transport, status or decode failures.
+    pub async fn distinct_dids_page(
+        &self,
+        target: &str,
+        collection: &str,
+        path: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<DidsPage, ConstellationError> {
+        let limit = limit.to_string();
+        let mut params = vec![("target", target), ("collection", collection), ("path", path), ("limit", &limit)];
+        if let Some(c) = cursor {
+            params.push(("cursor", c));
+        }
+        let url = self.url("/links/distinct-dids", &params)?;
+        self.get(&url).await
     }
 
     /// Every link count to `target`.

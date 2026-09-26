@@ -2,4 +2,4 @@
 
 pub mod constellation;
 
-pub use constellation::{ConstellationClient, ConstellationError, LinkingRecord, LinksPage};
+pub use constellation::{ConstellationClient, ConstellationError, DidsPage, LinkingRecord, LinksPage};

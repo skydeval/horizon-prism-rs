@@ -12,6 +12,17 @@ commit.
 
 ### Added
 
+- **Item 5: public hydration.** `hydration` builds `app.bsky.*` views from
+  local tables behind the sealed `PublicEmit<T>`: profiles (`getProfile(s)`,
+  `searchActors`), posts with embeds, author feeds with the §5.12 filters and
+  pins, member timelines, threads (parent chain, replies, 200-node cap),
+  follows, followers, mutes and notifications. Viewer state only for ready
+  members (`blocks` only, never private blocks); §9.6 counts (synchronous
+  Constellation for single-object views, `cc:refresh` for lists);
+  Constellation-first likes, reposts, quotes and followers with local
+  fallback; the §8.6 upstream normalizer; the in-process read-time cache; an
+  `UpstreamSource` seam answering a uniform miss until item 7. `moderation`
+  adds the §7.10 gate (`!takedown`, `!hide`, account status).
 - **Item 4.5: admin executor and head prober.** CLI-to-`serve` command queue
   with `LISTEN/NOTIFY` (member add/remove, labels, scope rebuild, backfill,
   resync, dead-letter replay/drop), purge-aware per-DID deferral and crash
