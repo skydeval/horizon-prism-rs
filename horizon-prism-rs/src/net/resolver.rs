@@ -132,9 +132,10 @@ impl HickoryLookup {
     ///
     /// # Errors
     ///
-    /// The resolver configuration could not be read.
-    pub fn from_system() -> Result<Self, hickory_resolver::ResolveError> {
-        let resolver = hickory_resolver::TokioResolver::builder_tokio()?.build();
+    /// The resolver configuration could not be read, or the resolver could
+    /// not be built (hickory 0.26 made `build` fallible).
+    pub fn from_system() -> Result<Self, hickory_resolver::net::NetError> {
+        let resolver = hickory_resolver::TokioResolver::builder_tokio()?.build()?;
         Ok(Self { resolver })
     }
 }
