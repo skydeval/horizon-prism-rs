@@ -28,6 +28,9 @@ use crate::aggregations::{Admission, AdmissionInput, RecordKind, ScopeSets, Scop
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
 use crate::private_tier::{PrivateOp, PrivateTier};
 
+/// The lowest possible TID string: inbound-block rows lose to any real rev
+/// under LWW (§5.10).
+pub const SENTINEL_REV: &str = "2222222222222";
 /// Metric: ops not written because of their class.
 pub const METRIC_SKIPPED: &str = "firehose_ops_skipped_total";
 /// Metric: LWW skips.
@@ -519,6 +522,65 @@ impl Writer {
         drop(guard);
         self.commit_effects(effects).await;
         Ok(report)
+    }
+
+    /// The Constellation inbound-block pass's writes (§5.10): blocks of
+    /// `member` by `(blocker did, rkey)`, with the sentinel rev and
+    /// `created_at = indexed_at = now()`. One batch is one transaction under
+    /// the ordinary-writer lock order: read guard, the shared DID lock of each
+    /// blocker, sorted per-URI locks. Each row passes admission (rule 2);
+    /// tombstoned URIs are skipped and existing rows are left alone.
+    /// Returns the rows inserted.
+    ///
+    /// # Errors
+    ///
+    /// Any database error (transient for the job).
+    pub async fn apply_inbound_blocks(&self, member: &str, blockers: &[(String, String)]) -> Result<u64, sqlx::Error> {
+        let guard = self.scope.read_guard().await;
+        let sets: &ScopeSets = &guard;
+        let mut dids: Vec<String> = Vec::new();
+        let mut uris: Vec<String> = Vec::new();
+        for (did, rkey) in blockers {
+            let input = AdmissionInput {
+                author: did.clone(),
+                kind: RecordKind::Block,
+                subjects: vec![member.to_string()],
+            };
+            if !proto_blue::syntax::Did::is_valid(did) || !proto_blue::syntax::RecordKey::is_valid(rkey) {
+                continue;
+            }
+            match admit(&input, sets) {
+                Admission::Admit(_) => {
+                    dids.push(did.clone());
+                    uris.push(format!("at://{did}/{}/{rkey}", super::classifier::NSID_BLOCK));
+                }
+                Admission::Reject(reason) => {
+                    metrics::counter!(METRIC_SKIPPED, "reason" => reason.as_str()).increment(1);
+                }
+            }
+        }
+        if uris.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        lock_dids_shared(&mut tx, &dids).await?;
+        lock_uris(&mut tx, &uris).await?;
+        let inserted = sqlx::query(
+            "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at, indexed_at) \
+             SELECT u, d, $3, $4, now(), now() FROM unnest($1::text[], $2::text[]) AS t(u, d) \
+             WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.uri = t.u) \
+             ON CONFLICT (uri) DO NOTHING",
+        )
+        .bind(&uris)
+        .bind(&dids)
+        .bind(member)
+        .bind(SENTINEL_REV)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        drop(guard);
+        Ok(inserted)
     }
 
     /// Run one op in savepoints until it succeeds, fails transiently (abort)

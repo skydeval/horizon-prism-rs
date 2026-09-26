@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod firehose;
 pub mod identity;
+pub mod microcosm;
 pub mod net;
 pub mod private_tier;
 
