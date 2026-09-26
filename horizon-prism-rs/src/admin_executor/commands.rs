@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use crate::aggregations::{PurgeKind, Purger, Rebuild, ScopeState};
-use crate::db::locks::{lock_dids_shared, uri_author};
+use crate::aggregations::membership::{AddOutcome, add_member};
+use crate::db::locks::uri_author;
 use crate::firehose::backfill::BackfillSource;
 use crate::firehose::gap::{self, GapCause};
 use crate::firehose::jobs::{self, Depth};
@@ -198,62 +199,20 @@ impl Handlers {
     /// `member` backfill, and re-evaluate owner status; the in-memory sets
     /// follow after commit.
     async fn member_add(&self, did: &str) -> Result<Outcome, String> {
-        if self.purging(did).await.map_err(|e| e.to_string())? {
-            return Ok(Outcome::Defer);
-        }
-        let mut sets = self.scope.write_guard().await;
-        if sets.purge_kind(did).is_some() {
-            return Ok(Outcome::Defer);
-        }
-        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
-        lock_dids_shared(&mut tx, &[did.to_string()]).await.map_err(|e| e.to_string())?;
-        let inserted = sqlx::query("INSERT INTO members (did, source) VALUES ($1, 'admin') ON CONFLICT (did) DO NOTHING")
-            .bind(did)
-            .execute(&mut *tx)
+        match add_member(&self.pool, &self.scope, &self.private, did, "admin")
             .await
             .map_err(|e| e.to_string())?
-            .rows_affected()
-            > 0;
-        if !inserted {
-            return Ok(Outcome::Done(json!({ "did": did, "status": "already_member" })));
+        {
+            AddOutcome::Purging => Ok(Outcome::Defer),
+            AddOutcome::AlreadyMember => Ok(Outcome::Done(json!({ "did": did, "status": "already_member" }))),
+            AddOutcome::Added { became_owner } => {
+                let mut jobs = vec![json!({ "did": did, "depth": "member" })];
+                if became_owner {
+                    jobs.push(json!({ "did": did, "depth": "private" }));
+                }
+                Ok(Outcome::Done(json!({ "did": did, "status": "added", "jobs": jobs })))
+            }
         }
-        sqlx::query(
-            "INSERT INTO scope_dids (did, reasons) VALUES ($1, $2) \
-             ON CONFLICT (did) DO UPDATE SET reasons = scope_dids.reasons | EXCLUDED.reasons, justified_at = now()",
-        )
-        .bind(did)
-        .bind(crate::aggregations::REASON_MEMBER)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-        jobs::enqueue(&mut tx, did, Depth::Member).await.map_err(|e| e.to_string())?;
-        let applied = self.private.reevaluate_owner(&mut tx, did).await.map_err(|e| e.to_string())?;
-        let became_owner = applied.owners_joined.iter().any(|d| d == did);
-        if became_owner {
-            jobs::enqueue(&mut tx, did, Depth::Private).await.map_err(|e| e.to_string())?;
-        }
-        let follows: i64 = sqlx::query_scalar("SELECT count(*) FROM follows WHERE author_did = $1")
-            .bind(did)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        tx.commit().await.map_err(|e| e.to_string())?;
-
-        sets.members.insert(did.to_string());
-        sets.scope.insert(did.to_string());
-        sets.member_follows.insert(did.to_string(), u32::try_from(follows).unwrap_or(u32::MAX));
-        for d in applied.owners_joined {
-            sets.private_owners.insert(d);
-        }
-        for d in &applied.owners_left {
-            sets.private_owners.remove(d);
-        }
-        drop(sets);
-        let mut jobs = vec![json!({ "did": did, "depth": "member" })];
-        if became_owner {
-            jobs.push(json!({ "did": did, "depth": "private" }));
-        }
-        Ok(Outcome::Done(json!({ "did": did, "status": "added", "jobs": jobs })))
     }
 
     /// `member remove`: the `member_removed` marker step runs here (write

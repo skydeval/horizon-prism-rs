@@ -11,12 +11,14 @@ pub mod db;
 pub mod firehose;
 pub mod hydration;
 pub mod identity;
+pub(crate) mod kryphocron_glue;
 pub mod microcosm;
 pub mod moderation;
 pub mod net;
 pub mod private_tier;
 pub mod serve;
 pub mod sync;
+pub mod xrpc;
 
 #[cfg(test)]
 pub(crate) mod test_support;

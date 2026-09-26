@@ -1,0 +1,208 @@
+//! Auto-enroll (design-v2 §9.2). Triggered only by authenticated calls to
+//! `getTimeline`, `listNotifications` and `getUnreadCount`.
+//!
+//! Checked before inserting, in order:
+//! 0. the DID is not being purged (else `NotReady`, nothing inserted);
+//! 1. its PDS host matches `community.enroll_pds_patterns` (default: the
+//!    `community` network's `pds_patterns`) **and** that PDS answers
+//!    `getRepoStatus` with `active: true`;
+//! 2. `members` count < `community.max_members`;
+//! 3. enrollments in the past hour < `community.max_auto_enroll_per_hour`.
+//!
+//! Refusals are cached in-process for `community.enroll_refusal_cache_secs`
+//! and counted in `auto_enroll_refused_total{reason}`. No network call runs
+//! under the `ScopeState` guard.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use moka::future::Cache;
+use sqlx::PgPool;
+
+use super::ScopeState;
+use super::membership::{AddOutcome, add_member};
+use crate::config::AppConfig;
+use crate::identity::refresher::RepoStatus;
+use crate::identity::{IdentityResolver, ResolveIntent};
+use crate::net::{BodyCap, NetClient, RequestOptions};
+use crate::private_tier::PrivateTier;
+
+pub const METRIC_REFUSED: &str = "auto_enroll_refused_total";
+
+/// The caller's membership state for a `member` endpoint (§7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Enrollment {
+    /// A member; `ready` when `members.ready_at` is set.
+    Member { ready: bool },
+    /// Just enrolled (not ready yet).
+    Enrolled,
+    /// Being purged: `NotReady`.
+    Purging,
+    /// Not enrolled: `NotEnrolled`, with the refusal reason.
+    Refused(&'static str),
+}
+
+/// §8.2 pattern: `*.suffix` needs at least one label before `.suffix`; a bare
+/// host matches exactly.
+#[must_use]
+pub fn host_matches(host: &str, pattern: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let pattern = pattern.to_ascii_lowercase();
+    match pattern.strip_prefix("*.") {
+        Some(suffix) => host
+            .strip_suffix(suffix)
+            .and_then(|rest| rest.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty()),
+        None => host == pattern,
+    }
+}
+
+/// The lowercased host of a PDS endpoint, port stripped (§8.2).
+#[must_use]
+pub fn pds_host(endpoint: &str) -> Option<String> {
+    url::Url::parse(endpoint).ok()?.host_str().map(str::to_ascii_lowercase)
+}
+
+/// The enroller. Cheap to clone.
+#[derive(Clone)]
+pub struct AutoEnroller {
+    pool: PgPool,
+    scope: ScopeState,
+    private: Arc<dyn PrivateTier>,
+    resolver: IdentityResolver,
+    net: NetClient,
+    enabled: bool,
+    max_members: i64,
+    max_per_hour: i64,
+    patterns: Arc<Vec<String>>,
+    refused: Cache<String, &'static str>,
+}
+
+impl AutoEnroller {
+    #[must_use]
+    pub fn new(
+        cfg: &AppConfig,
+        pool: PgPool,
+        scope: ScopeState,
+        private: Arc<dyn PrivateTier>,
+        resolver: IdentityResolver,
+        net: NetClient,
+    ) -> Self {
+        let c = &cfg.file.community;
+        let patterns = if c.enroll_pds_patterns.is_empty() {
+            cfg.file
+                .constellation
+                .networks
+                .iter()
+                .find(|n| n.name == crate::config::COMMUNITY_NETWORK)
+                .map(|n| n.pds_patterns.clone())
+                .unwrap_or_default()
+        } else {
+            c.enroll_pds_patterns.clone()
+        };
+        Self {
+            pool,
+            scope,
+            private,
+            resolver,
+            net,
+            enabled: c.auto_enroll,
+            max_members: i64::from(c.max_members),
+            max_per_hour: i64::from(c.max_auto_enroll_per_hour),
+            patterns: Arc::new(patterns),
+            refused: Cache::builder()
+                .max_capacity(100_000)
+                .time_to_live(Duration::from_secs(c.enroll_refusal_cache_secs))
+                .build(),
+        }
+    }
+
+    async fn refuse(&self, did: &str, reason: &'static str) -> Enrollment {
+        metrics::counter!(METRIC_REFUSED, "reason" => reason).increment(1);
+        self.refused.insert(did.to_string(), reason).await;
+        Enrollment::Refused(reason)
+    }
+
+    /// The caller's state, enrolling it if it is eligible.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn check(&self, did: &str) -> Result<Enrollment, sqlx::Error> {
+        let ready: Option<bool> = sqlx::query_scalar("SELECT ready_at IS NOT NULL FROM members WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(ready) = ready {
+            return Ok(Enrollment::Member { ready });
+        }
+        if self.scope.read_guard().await.purge_kind(did).is_some() {
+            return Ok(Enrollment::Purging);
+        }
+        if let Some(reason) = self.refused.get(did).await {
+            return Ok(Enrollment::Refused(reason));
+        }
+        if !self.enabled {
+            return Ok(self.refuse(did, "disabled").await);
+        }
+        // 1. PDS host and hosting confirmation (network, before any guard).
+        let Ok(info) = self.resolver.resolve_info(did, ResolveIntent::Lookup).await else {
+            return Ok(self.refuse(did, "unresolvable").await);
+        };
+        let Some(endpoint) = info.pds_endpoint else {
+            return Ok(self.refuse(did, "no_pds").await);
+        };
+        let Some(host) = pds_host(&endpoint) else {
+            return Ok(self.refuse(did, "no_pds").await);
+        };
+        if !self.patterns.iter().any(|p| host_matches(&host, p)) {
+            return Ok(self.refuse(did, "pds_not_community").await);
+        }
+        let url = format!("https://{host}/xrpc/com.atproto.sync.getRepoStatus?did={did}");
+        let active = match self.net.get_json::<RepoStatus>(&url, &RequestOptions::new(BodyCap::REPO_STATUS)).await {
+            Ok(Ok(status)) => status.active,
+            _ => false,
+        };
+        if !active {
+            return Ok(self.refuse(did, "not_hosted").await);
+        }
+        // 2 and 3. Bounds.
+        let (members, recent): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE source = 'auto_enroll' AND added_at > now() - interval '1 hour') FROM members",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if members >= self.max_members {
+            return Ok(self.refuse(did, "max_members").await);
+        }
+        if recent >= self.max_per_hour {
+            // Transient: do not cache the refusal for an hour.
+            metrics::counter!(METRIC_REFUSED, "reason" => "rate").increment(1);
+            return Ok(Enrollment::Refused("rate"));
+        }
+        Ok(match add_member(&self.pool, &self.scope, &self.private, did, "auto_enroll").await? {
+            AddOutcome::Added { .. } => {
+                tracing::info!(event = "auto_enrolled", did, "member auto-enrolled");
+                Enrollment::Enrolled
+            }
+            AddOutcome::AlreadyMember => Enrollment::Member { ready: false },
+            AddOutcome::Purging => Enrollment::Purging,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pattern_matching() {
+        assert!(host_matches("morel.us-east.host.bsky.network", "*.host.bsky.network"));
+        assert!(!host_matches("host.bsky.network", "*.host.bsky.network"));
+        assert!(!host_matches("evilhost.bsky.network", "*.host.bsky.network"));
+        assert!(host_matches("bsky.social", "bsky.social"));
+        assert!(!host_matches("x.bsky.social", "bsky.social"));
+        assert!(host_matches("PDS.Example.org", "pds.example.org"));
+        assert_eq!(pds_host("https://PDS.example.org:8443/").as_deref(), Some("pds.example.org"));
+    }
+}

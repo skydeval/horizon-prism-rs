@@ -13,6 +13,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 use sqlx::PgPool;
 
+use super::commands;
 use crate::admin_executor::{AdminCommand, CHANNEL};
 use crate::config::AppConfig;
 use crate::firehose::jobs::Depth;
@@ -62,18 +63,66 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: DeadletterAction,
     },
+    /// Firehose stream state (read-only).
+    Stream {
+        #[command(subcommand)]
+        action: StreamAction,
+    },
+    /// The admin command queue (read-only).
+    Commands {
+        #[command(subcommand)]
+        action: CommandsAction,
+    },
+    /// Print a fresh service signing key, its did:key and a correlation key.
+    Keygen,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum MemberAction {
     Add { did: String },
     Remove { did: String },
+    List,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum LabelAction {
     Add { subject: String, val: String },
     Remove { subject: String, val: String },
+    List {
+        /// Only labels on this URI or DID.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Only labels with this value.
+        #[arg(long)]
+        val: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StreamAction {
+    Info,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CommandsAction {
+    List {
+        /// queued | running | done | failed
+        #[arg(long)]
+        state: Option<String>,
+    },
+}
+
+/// `migrate …`
+#[derive(Debug, Args)]
+pub struct MigrateArgs {
+    #[command(subcommand)]
+    pub command: MigrateCmd,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MigrateCmd {
+    /// Applied and pending migrations (read-only).
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -88,6 +137,10 @@ pub enum ScopeAction {
 pub enum DeadletterAction {
     Replay { id: String },
     Drop { id: String },
+    List {
+        #[arg(long, default_value_t = commands::deadletter_list::DEFAULT_LIMIT)]
+        limit: u32,
+    },
 }
 
 /// The final state of a submitted command.
@@ -106,6 +159,12 @@ impl AdminCmd {
     /// A usage message.
     pub fn to_command(&self) -> Result<AdminCommand, String> {
         let cmd = match self {
+            Self::Member { action: MemberAction::List }
+            | Self::Label { action: LabelAction::List { .. } }
+            | Self::Deadletter { action: DeadletterAction::List { .. } }
+            | Self::Stream { .. }
+            | Self::Commands { .. }
+            | Self::Keygen => return Err("read-only commands run in the CLI".to_string()),
             Self::Member { action: MemberAction::Add { did } } => AdminCommand::MemberAdd { did: did.clone() },
             Self::Member { action: MemberAction::Remove { did } } => AdminCommand::MemberRemove { did: did.clone() },
             Self::Label { action: LabelAction::Add { subject, val } } => AdminCommand::LabelAdd {
@@ -180,8 +239,87 @@ pub async fn wait(pool: &PgPool, id: i64, timeout: Duration, poll: Duration) -> 
     }
 }
 
-/// Run one mutating admin command from the CLI. Returns the process exit code.
+/// Print a read-only command's output; `Err` is a printable failure.
+fn finish(result: Result<String, String>) -> u8 {
+    match result {
+        Ok(out) => {
+            println!("{out}");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            if e.starts_with("config_error") { 78 } else { 1 }
+        }
+    }
+}
+
+async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
+    use commands::{admin_commands_list, deadletter_list, keygen, label_list, member_list, stream_info};
+    if let AdminCmd::Keygen = cmd {
+        return Some(Ok(keygen::render()));
+    }
+    let is_read_only = matches!(
+        cmd,
+        AdminCmd::Member { action: MemberAction::List }
+            | AdminCmd::Label { action: LabelAction::List { .. } }
+            | AdminCmd::Deadletter { action: DeadletterAction::List { .. } }
+            | AdminCmd::Stream { .. }
+            | AdminCmd::Commands { .. }
+    );
+    if !is_read_only {
+        return None;
+    }
+    Some(
+        async {
+            let cfg = commands::config()?;
+            match cmd {
+                AdminCmd::Member { .. } => member_list::render(&commands::pool(&cfg).await?).await.map_err(|e| e.to_string()),
+                AdminCmd::Label { action: LabelAction::List { subject, val } } => {
+                    label_list::render(&commands::pool(&cfg).await?, subject.as_deref(), val.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                AdminCmd::Commands { action: CommandsAction::List { state } } => {
+                    admin_commands_list::render(&commands::pool(&cfg).await?, state.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                AdminCmd::Deadletter { action: DeadletterAction::List { limit } } => {
+                    let mut redis = commands::redis(&cfg).await?;
+                    deadletter_list::render(&mut redis, &cfg.file.firehose.dead_letter_stream, *limit).await
+                }
+                AdminCmd::Stream { .. } => {
+                    let mut redis = commands::redis(&cfg).await?;
+                    stream_info::render(&mut redis, &cfg.file.firehose.stream_key, &cfg.file.firehose.group).await
+                }
+                _ => Err("not a read-only command".to_string()),
+            }
+        }
+        .await,
+    )
+}
+
+/// `migrate status` (read-only). Returns the process exit code.
+pub async fn run_migrate(args: &MigrateArgs) -> u8 {
+    match args.command {
+        MigrateCmd::Status => {
+            let result = async {
+                let cfg = commands::config()?;
+                let pool = commands::pool(&cfg).await?;
+                commands::migrate_status::render(&pool).await.map_err(|e| e.to_string())
+            }
+            .await;
+            finish(result)
+        }
+    }
+}
+
+/// Run one admin command from the CLI: read-only commands directly,
+/// mutating ones through `serve`'s executor. Returns the process exit code.
 pub async fn run(args: &AdminArgs) -> u8 {
+    if let Some(result) = read_only(&args.command).await {
+        return finish(result);
+    }
     let cmd = match args.command.to_command() {
         Ok(c) => c,
         Err(e) => {

@@ -2,11 +2,12 @@
 //! `PgPool` / Redis / `NetClient` / `IdentityResolver` / `ScopeState`, the
 //! background tasks, and the HTTP listener.
 //!
-//! The HTTP surface is a placeholder until the XRPC items land: only
-//! `GET /xrpc/_health` (§7.1).
+//! HTTP: the `app.bsky.*` surface (§7.1), `/.well-known/did.json` and
+//! `GET /xrpc/_health`.
 
 pub mod health;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +31,11 @@ use crate::firehose::writer::Writer;
 use crate::identity::{IdentityRefresher, IdentityResolver, IdentitySettings, PersistencePolicy};
 use crate::microcosm::ConstellationClient;
 use crate::net::{NetClient, NetConfig};
+use crate::aggregations::enroll::AutoEnroller;
+use crate::hydration::{HydrationConfig, Hydrator, NoUpstream, ReadCache};
+use crate::kryphocron_glue::GlueContext;
 use crate::private_tier::{DisabledPrivateTier, PrivateTier};
+use crate::xrpc::{AppState, RateLimits};
 use health::{AuditLatch, HealthState};
 
 /// Exit code for configuration errors and the migration gate (EX_CONFIG).
@@ -138,6 +143,11 @@ pub async fn run() -> Result<(), StartupError> {
     let constellation = ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url);
 
     let mut tasks = Vec::new();
+
+    // Client authentication (§6.7, §6.8): service identity and the JWT path.
+    let (glue, issuer_drainer) = GlueContext::new(&cfg, resolver.clone())
+        .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
+    tasks.push(issuer_drainer);
 
     // Purges interrupted by a crash resume first (§6.11.7).
     {
@@ -257,6 +267,35 @@ pub async fn run() -> Result<(), StartupError> {
     );
 
     // HTTP.
+    let hydrator = Hydrator::new(
+        pool.clone(),
+        scope.clone(),
+        Some(ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url)),
+        Some(redis.clone()),
+        Arc::new(NoUpstream),
+        ReadCache::new(cfg.file.cache.read_time_bytes),
+        HydrationConfig {
+            labeler_did: glue.service_key.did().to_string(),
+            counts: cfg.file.counts.clone(),
+        },
+    );
+    let limits = RateLimits::new();
+    tasks.push(limits.spawn_housekeeping());
+    let app = AppState {
+        hydrator,
+        auth: Arc::new(glue.verifier.clone()),
+        limits,
+        enroller: Some(AutoEnroller::new(
+            &cfg,
+            pool.clone(),
+            scope.clone(),
+            Arc::clone(&private),
+            resolver.clone(),
+            net.clone(),
+        )),
+        trusted_proxy: cfg.file.http.trusted_proxy,
+        did_document: Arc::new(glue.service_key.did_document()),
+    };
     let state = HealthState {
         pool: pool.clone(),
         redis,
@@ -268,7 +307,8 @@ pub async fn run() -> Result<(), StartupError> {
         .await
         .map_err(|e| StartupError::new(1, format!("binding {}: {e}", cfg.file.http.bind)))?;
     tracing::info!(event = "serve_started", bind = %cfg.file.http.bind, tasks = tasks.len(), "serving");
-    axum::serve(listener, health::router(state))
+    let routes = crate::xrpc::router(app).merge(health::router(state));
+    axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| StartupError::new(1, format!("http server: {e}")))?;

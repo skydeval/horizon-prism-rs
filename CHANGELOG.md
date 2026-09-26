@@ -12,6 +12,20 @@ commit.
 
 ### Added
 
+- **Item 5: `app.bsky.*` XRPC surface and read-only admin CLI.** axum routes
+  for `actor.getProfile(s)`, `actor.searchActors`, `feed.getPosts`,
+  `getPostThread`, `getAuthorFeed`, `getLikes`, `getRepostedBy`, `getQuotes`,
+  `getTimeline`, `graph.getFollows`, `getFollowers`, `getMutes`,
+  `muteActor`, `unmuteActor`, `notification.listNotifications`,
+  `getUnreadCount`, `updateSeen`, and `/.well-known/did.json` (secp256k1
+  Multikey). Callers authenticate through the `kryphocron_glue` JWT path:
+  `verify_request_jwt` with the issuer tracker, eviction drainer, rotation
+  retry and the `aud`-fragment / `lxm` host checks. Per-IP and per-DID
+  `governor` limits with `ratelimit-reset`, trusted-proxy
+  `X-Forwarded-For`, `NotEnrolled` / `NotReady` gates, and auto-enroll
+  (§9.2) sharing the member-add path with the admin executor. Read-only CLI:
+  `admin member list`, `label list`, `deadletter list`, `stream info`,
+  `commands list`, `keygen`, and `migrate status`.
 - **Item 5: public hydration.** `hydration` builds `app.bsky.*` views from
   local tables behind the sealed `PublicEmit<T>`: profiles (`getProfile(s)`,
   `searchActors`), posts with embeds, author feeds with the §5.12 filters and

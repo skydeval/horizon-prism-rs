@@ -12,6 +12,8 @@ pub mod admit;
 pub mod counts;
 pub mod growth;
 pub mod policy;
+pub mod enroll;
+pub mod membership;
 pub mod purge;
 pub mod rebuild;
 pub mod scope_state;
