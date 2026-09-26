@@ -26,6 +26,12 @@ commit.
   label emission and enforcement (`!takedown` hidden from lists and direct
   fetches, `!hide` listed nowhere but returned on direct `getPosts`,
   informational labels on posts, authors, profiles and thread replies).
+- **Item 8: mutating admin commands tested through the queue.**
+  `backfill` (default `member`/`scope` depth, explicit depth),
+  `scope rebuild --dry-run` (counts, no side effects), `resync
+  --private-and-members` (gap epoch advanced, member readiness cleared,
+  `authz`/`resync` enqueued), `deadletter replay` (record re-fetched and
+  admitted, absent record deleted, entry left listed) and `deadletter drop`.
 - **Item 7: migration 0002.** `private_posts.reply_root_cid` and
   `reply_parent_cid` (nullable). Rows written earlier keep NULL until an
   `admin backfill --depth resync` refetches them.

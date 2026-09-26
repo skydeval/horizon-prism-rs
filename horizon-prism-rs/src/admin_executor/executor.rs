@@ -193,6 +193,7 @@ mod tests {
     use crate::cli::dispatch::{Finished, submit, wait};
     use crate::config::ScopePolicy;
     use crate::firehose::backfill::{BackfillSource, ListPage, ListedRecord};
+    use crate::firehose::jobs::Depth;
     use crate::firehose::writer::Writer;
     use crate::microcosm::LinksPage;
     use crate::private_tier::{DisabledPrivateTier, PrivateTier};
@@ -223,7 +224,11 @@ mod tests {
     }
 
     async fn setup(name: &str, sets: ScopeSets) -> Option<(TestDb, AdminExecutor, ScopeState)> {
-        setup_with(name, sets, Arc::new(DisabledPrivateTier), Arc::new(NoNetwork)).await
+        setup_with(name, sets, Arc::new(DisabledPrivateTier), Arc::new(NoNetwork), &test_stream()).await
+    }
+
+    fn test_stream() -> String {
+        format!("test:dl:{}", rand::random::<u32>())
     }
 
     async fn setup_with(
@@ -231,6 +236,7 @@ mod tests {
         sets: ScopeSets,
         private: Arc<dyn PrivateTier>,
         source: Arc<dyn BackfillSource>,
+        dead_letter_stream: &str,
     ) -> Option<(TestDb, AdminExecutor, ScopeState)> {
         let Ok(redis_url) = std::env::var("HPRS_TEST_REDIS_URL") else {
             eprintln!("HPRS_TEST_REDIS_URL unset; skipping executor test");
@@ -250,7 +256,7 @@ mod tests {
             rebuild: Rebuild::new(db.pool.clone(), scope.clone(), Arc::clone(&private), 7),
             redis,
             source,
-            dead_letter_stream: format!("test:dl:{}", rand::random::<u32>()),
+            dead_letter_stream: dead_letter_stream.to_string(),
             deterministic_attempts: 5,
             community_patterns: Arc::new(vec!["*.community.example".to_string()]),
         };
@@ -296,7 +302,8 @@ mod tests {
         let private: Arc<dyn PrivateTier> = Arc::new(crate::private_tier::KryphocronPrivateTier);
         let source = Arc::new(CommunityPds::default());
         let Some((db, exec, scope)) =
-            setup_with("admin_reconfirm", sets, Arc::clone(&private), Arc::clone(&source) as Arc<dyn BackfillSource>).await
+            setup_with("admin_reconfirm", sets, Arc::clone(&private), Arc::clone(&source) as Arc<dyn BackfillSource>, &test_stream())
+                .await
         else {
             return;
         };
@@ -346,6 +353,149 @@ mod tests {
         assert!(private.eligibility_confirmed_at(&mut conn, stale).await.expect("read").is_some());
         drop(conn);
         assert!(scope.read_guard().await.is_owner(stale), "an eligible owner stays an owner");
+        db.drop_db().await;
+    }
+
+    /// A PDS serving one post (`…/keep`) and nothing else, at a rev newer
+    /// than any test row.
+    struct ReplayPds;
+
+    #[async_trait]
+    impl BackfillSource for ReplayPds {
+        async fn prepare(&self, _: &str) -> Result<String, crate::firehose::backfill::PrepareError> {
+            Ok("https://pds.example.com".into())
+        }
+        async fn latest_rev(&self, _: &str, _: &str) -> Result<String, String> {
+            Ok("3kzzzzzzzzzz2".into())
+        }
+        async fn list_records(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<ListPage, String> {
+            Err("unused".into())
+        }
+        async fn get_record(&self, _: &str, did: &str, collection: &str, rkey: &str) -> Result<Option<ListedRecord>, String> {
+            Ok((rkey == "keep").then(|| ListedRecord {
+                uri: format!("at://{did}/{collection}/{rkey}"),
+                cid: "bafykeep".into(),
+                value: json!({"$type": "app.bsky.feed.post", "text": "replayed", "createdAt": "2026-09-26T00:00:00Z"}),
+            }))
+        }
+        async fn inbound_blocks(&self, _: &str, _: Option<&str>) -> Result<LinksPage, String> {
+            Err("unused".into())
+        }
+    }
+
+    async fn run(exec: &AdminExecutor, pool: &PgPool, cmd: AdminCommand) -> Finished {
+        let id = submit(pool, &cmd).await.expect("submit");
+        exec.drain().await.expect("drain");
+        wait(pool, id, Duration::from_secs(10), Duration::from_millis(10)).await.expect("wait")
+    }
+
+    fn done(f: Finished) -> Value {
+        match f {
+            Finished::Done(v) => v,
+            other => panic!("expected done, got {other:?}"),
+        }
+    }
+
+    async fn count(pool: &PgPool, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.expect(sql)
+    }
+
+    #[tokio::test]
+    async fn mutating_commands_through_the_queue() {
+        const MEMBER: &str = PURGING;
+        const SCOPED: &str = OTHER;
+        let mut sets = ScopeSets::default();
+        sets.members.insert(MEMBER.into());
+        for d in [MEMBER, SCOPED] {
+            sets.scope.insert(d.into());
+        }
+        let stream = test_stream();
+        let Some((db, exec, _scope)) =
+            setup_with("admin_mutating", sets, Arc::new(DisabledPrivateTier), Arc::new(ReplayPds), &stream).await
+        else {
+            return;
+        };
+        let p = &db.pool;
+        sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())")
+            .bind(MEMBER)
+            .execute(p)
+            .await
+            .expect("member");
+        for d in [MEMBER, SCOPED] {
+            sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 1)").bind(d).execute(p).await.expect("scope");
+        }
+
+        // backfill: default depth member for a member, scope otherwise;
+        // an explicit depth wins.
+        for (did, depth, expected) in [(MEMBER, None, "member"), (SCOPED, None, "scope"), (SCOPED, Some(Depth::Authz), "authz")] {
+            let r = done(run(&exec, p, AdminCommand::Backfill { did: did.into(), depth }).await);
+            assert_eq!(r["jobs"][0]["depth"], expected, "{did}");
+            let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM backfill_jobs WHERE did = $1 AND depth = $2 AND state = 'queued'")
+                .bind(did)
+                .bind(expected)
+                .fetch_one(p)
+                .await
+                .expect("job");
+            assert_eq!(queued, 1);
+        }
+
+        // scope rebuild --dry-run: counts, and nothing changes.
+        let snapshot = "SELECT (SELECT count(*) FROM scope_dids) * 1000000 + (SELECT count(*) FROM purging_dids) * 1000                         + (SELECT count(*) FROM backfill_jobs)";
+        let before = count(p, snapshot).await;
+        let r = done(run(&exec, p, AdminCommand::ScopeRebuild { dry_run: true }).await);
+        assert_eq!(r["dry_run"], true);
+        for k in ["justified", "would_add", "would_purge"] {
+            assert!(r[k].is_number(), "{k} in {r}");
+        }
+        assert_eq!(count(p, snapshot).await, before, "a dry run has no side effects");
+
+        // resync: a gap is recorded, member readiness cleared, authz for
+        // tracked DIDs and resync for members enqueued.
+        let epoch_before = {
+            let mut conn = p.acquire().await.expect("conn");
+            crate::firehose::gap::current_epoch(&mut conn).await.expect("epoch")
+        };
+        let r = done(run(&exec, p, AdminCommand::Resync).await);
+        assert_eq!(r["gap_epoch"], epoch_before + 1);
+        assert_eq!(count(p, "SELECT count(*) FROM members WHERE ready_at IS NOT NULL").await, 0);
+        let jobs: Vec<String> = sqlx::query_scalar("SELECT depth FROM backfill_jobs WHERE did = $1 AND state = 'queued' ORDER BY depth")
+            .bind(MEMBER)
+            .fetch_all(p)
+            .await
+            .expect("jobs");
+        assert!(jobs.contains(&"authz".to_string()) && jobs.contains(&"resync".to_string()), "{jobs:?}");
+
+        // deadletter replay: the record is re-fetched and admitted; an
+        // absent record goes through the delete path.
+        let gone = crate::hydration::testing::post(p, MEMBER, "gone", "old", None, None).await;
+        let mut redis = ConnectionManager::new(redis::Client::open(std::env::var("HPRS_TEST_REDIS_URL").expect("url")).expect("client"))
+            .await
+            .expect("redis");
+        let add = |path: &str| redis::cmd("XADD").arg(&stream).arg("*").arg("repo").arg(MEMBER).arg("path").arg(path).clone();
+        let keep_id: String = add("app.bsky.feed.post/keep").query_async(&mut redis).await.expect("xadd");
+        let gone_id: String = add("app.bsky.feed.post/gone").query_async(&mut redis).await.expect("xadd");
+        let r = done(run(&exec, p, AdminCommand::DeadletterReplay { id: keep_id.clone() }).await);
+        assert_eq!(r["status"], "indexed", "{r}");
+        let text: String = sqlx::query_scalar("SELECT text FROM posts WHERE uri = $1")
+            .bind(format!("at://{MEMBER}/app.bsky.feed.post/keep"))
+            .fetch_one(p)
+            .await
+            .expect("replayed post");
+        assert_eq!(text, "replayed");
+        let r = done(run(&exec, p, AdminCommand::DeadletterReplay { id: gone_id.clone() }).await);
+        assert_eq!(r["status"], "deleted", "{r}");
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM posts WHERE uri = $1").bind(&gone).fetch_one(p).await.expect("count");
+        assert_eq!(left, 0);
+        // Replay leaves the entry listed (§5.9); drop removes it.
+        let len: i64 = redis::cmd("XLEN").arg(&stream).query_async(&mut redis).await.expect("xlen");
+        assert_eq!(len, 2);
+        let r = done(run(&exec, p, AdminCommand::DeadletterDrop { id: keep_id.clone() }).await);
+        assert_eq!(r["dropped"], true);
+        let remaining: Vec<(String, Vec<(String, String)>)> =
+            redis::cmd("XRANGE").arg(&stream).arg("-").arg("+").query_async(&mut redis).await.expect("xrange");
+        assert_eq!(remaining.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(), [gone_id]);
+        assert!(matches!(run(&exec, p, AdminCommand::DeadletterDrop { id: keep_id }).await, Finished::Failed(_)));
+        let _: i64 = redis::cmd("DEL").arg(&stream).query_async(&mut redis).await.expect("del");
         db.drop_db().await;
     }
 
