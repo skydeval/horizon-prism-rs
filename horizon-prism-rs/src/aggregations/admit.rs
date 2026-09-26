@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_scope_rejects_only_private_posts_and_audiences() {
+    fn out_of_scope_rejects_only_private_post_and_audience_records() {
         let mut s = sets();
         s.purging.insert(STRANGER.into(), PurgeKind::OutOfScope);
         assert_eq!(
