@@ -8,10 +8,11 @@
 //! | authenticated reads (`app.bsky.*`) | DID | 60/s, 120 |
 //! | writes to AppView state (`muteActor`, `unmuteActor`, `updateSeen`) | DID | 5/s, 20 |
 //! | `app.nearhorizon.private.*` | DID | 10/s, 20 |
+//! | `app.nearhorizon.threadLens.*` | DID | 2/s, 10 |
+//! | `app.nearhorizon.constellation.resolveDid` | IP | 10/s, 20 |
 //! | any request | IP | 100/s, 200 (global backstop) |
 //!
-//! The item-7 classes (`threadLens.*`, `requestRecord`, `resolveDid`) are
-//! added with their endpoints.
+//! `index.requestRecord` (0.5/s, 30) is added with its endpoint.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -29,6 +30,8 @@ pub enum Class {
     AuthRead,
     Write,
     Private,
+    ThreadLens,
+    ResolveDid,
     Global,
 }
 
@@ -40,6 +43,8 @@ pub fn quota(class: Class) -> (u32, u32) {
         Class::AuthRead => (60, 120),
         Class::Write => (5, 20),
         Class::Private => (10, 20),
+        Class::ThreadLens => (2, 10),
+        Class::ResolveDid => (10, 20),
         Class::Global => (100, 200),
     }
 }
@@ -64,6 +69,8 @@ pub struct RateLimits {
     auth: Arc<DefaultKeyedRateLimiter<String>>,
     write: Arc<DefaultKeyedRateLimiter<String>>,
     private: Arc<DefaultKeyedRateLimiter<String>>,
+    thread_lens: Arc<DefaultKeyedRateLimiter<String>>,
+    resolve_did: Arc<DefaultKeyedRateLimiter<String>>,
     global: Arc<DefaultKeyedRateLimiter<String>>,
 }
 
@@ -81,6 +88,8 @@ impl RateLimits {
             auth: Arc::new(limiter(Class::AuthRead)),
             write: Arc::new(limiter(Class::Write)),
             private: Arc::new(limiter(Class::Private)),
+            thread_lens: Arc::new(limiter(Class::ThreadLens)),
+            resolve_did: Arc::new(limiter(Class::ResolveDid)),
             global: Arc::new(limiter(Class::Global)),
         }
     }
@@ -91,6 +100,8 @@ impl RateLimits {
             Class::AuthRead => &self.auth,
             Class::Write => &self.write,
             Class::Private => &self.private,
+            Class::ThreadLens => &self.thread_lens,
+            Class::ResolveDid => &self.resolve_did,
             Class::Global => &self.global,
         }
     }
@@ -127,7 +138,15 @@ impl RateLimits {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                for class in [Class::AnonRead, Class::AuthRead, Class::Write, Class::Private, Class::Global] {
+                for class in [
+                    Class::AnonRead,
+                    Class::AuthRead,
+                    Class::Write,
+                    Class::Private,
+                    Class::ThreadLens,
+                    Class::ResolveDid,
+                    Class::Global,
+                ] {
                     let b = this.bucket(class);
                     b.retain_recent();
                     b.shrink_to_fit();

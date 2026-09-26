@@ -42,26 +42,8 @@ pub enum Enrollment {
     Refused(&'static str),
 }
 
-/// §8.2 pattern: `*.suffix` needs at least one label before `.suffix`; a bare
-/// host matches exactly.
-#[must_use]
-pub fn host_matches(host: &str, pattern: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    match pattern.strip_prefix("*.") {
-        Some(suffix) => host
-            .strip_suffix(suffix)
-            .and_then(|rest| rest.strip_suffix('.'))
-            .is_some_and(|label| !label.is_empty()),
-        None => host == pattern,
-    }
-}
-
-/// The lowercased host of a PDS endpoint, port stripped (§8.2).
-#[must_use]
-pub fn pds_host(endpoint: &str) -> Option<String> {
-    url::Url::parse(endpoint).ok()?.host_str().map(str::to_ascii_lowercase)
-}
+/// §8.2 PDS matching, shared with the routing table.
+pub use crate::constellation::matcher::{host_matches, pds_host};
 
 /// The enroller. Cheap to clone.
 #[derive(Clone)]

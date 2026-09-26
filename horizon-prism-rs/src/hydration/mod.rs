@@ -15,6 +15,7 @@ pub mod cache;
 pub mod emit;
 pub mod feed;
 pub mod graph;
+pub mod hint;
 pub mod normalize;
 pub mod notifications;
 pub mod thread;

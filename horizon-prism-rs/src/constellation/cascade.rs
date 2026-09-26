@@ -1,0 +1,387 @@
+//! The AppView cascade (design-v2 §8.3 steps 4–5).
+//!
+//! Networks are called in the routing table's plan order: the home AppView
+//! (if callable), then the cascade `order` without it. Each call is
+//! classified (§8.3); the first `hit` ends the cascade.
+//!
+//! **Limits.**
+//! - 3 s per call (the client's), 6 s for the whole cascade.
+//! - A per-network token bucket (`rate_per_sec`/`burst`). An empty bucket
+//!   counts as transient and skips the network; requests never queue.
+//! - A per-network breaker: 5 consecutive `transient`/`auth-refused` calls
+//!   open it for 30 s; then one half-open probe is let through. A probe that
+//!   fails re-opens it; any other answer closes it. An open breaker skips
+//!   the network as transient.
+
+use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use serde_json::Value;
+
+use super::classifier::{Class, classify};
+use super::routing::RoutingTable;
+use crate::appview_clients::AppViewClient;
+use crate::net::{NetError, NetResponse};
+
+/// The whole cascade's budget per request (§8.3).
+pub const CASCADE_BUDGET: Duration = Duration::from_secs(6);
+/// Consecutive failures that open a breaker.
+pub const BREAKER_THRESHOLD: u32 = 5;
+/// How long an open breaker stays open.
+pub const BREAKER_OPEN: Duration = Duration::from_secs(30);
+
+pub const METRIC_CALLS: &str = "upstream_calls_total";
+pub const METRIC_AUTH_REFUSED: &str = "upstream_auth_refused_total";
+pub const METRIC_SKIPPED: &str = "upstream_skipped_total";
+
+/// A per-network circuit breaker.
+#[derive(Debug, Default)]
+pub struct Breaker {
+    failures: u32,
+    open_until: Option<Instant>,
+    probing: bool,
+}
+
+impl Breaker {
+    /// Whether a call may go out now. Past the open period, exactly one
+    /// half-open probe is admitted until its result is recorded.
+    pub fn allow(&mut self, now: Instant) -> bool {
+        match self.open_until {
+            None => true,
+            Some(until) if now < until => false,
+            Some(_) if self.probing => false,
+            Some(_) => {
+                self.probing = true;
+                true
+            }
+        }
+    }
+
+    /// Record a call's class.
+    pub fn record(&mut self, class: Class, now: Instant) {
+        if class.is_failure() {
+            self.failures += 1;
+            if self.probing || self.failures >= BREAKER_THRESHOLD {
+                self.open_until = Some(now + BREAKER_OPEN);
+                self.probing = false;
+            }
+        } else {
+            *self = Self::default();
+        }
+    }
+
+    #[must_use]
+    pub fn is_open(&self, now: Instant) -> bool {
+        self.open_until.is_some_and(|until| now < until)
+    }
+}
+
+/// One upstream call, by method.
+#[derive(Debug, Clone, Copy)]
+pub enum Call<'a> {
+    Profile(&'a str),
+    Posts(&'a [String]),
+    PostThread { uri: &'a str, depth: u32, parent_height: u32 },
+    AuthorFeed { actor: &'a str, limit: u32, cursor: Option<&'a str>, filter: &'a str },
+    Follows { actor: &'a str, limit: u32, cursor: Option<&'a str> },
+}
+
+impl Call<'_> {
+    async fn invoke(self, client: &AppViewClient) -> Result<NetResponse, NetError> {
+        match self {
+            Self::Profile(actor) => client.get_profile(actor).await,
+            Self::Posts(uris) => client.get_posts(uris).await,
+            Self::PostThread { uri, depth, parent_height } => client.get_post_thread(uri, depth, parent_height).await,
+            Self::AuthorFeed { actor, limit, cursor, filter } => client.get_author_feed(actor, limit, cursor, filter).await,
+            Self::Follows { actor, limit, cursor } => client.get_follows(actor, limit, cursor).await,
+        }
+    }
+}
+
+/// The cascade's result.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fetched {
+    Hit { network: String, body: Value },
+    /// No hit; every network tried (or skipped) with its class.
+    Exhausted(Vec<(String, Class)>),
+}
+
+impl Fetched {
+    #[must_use]
+    pub fn hit(self) -> Option<Value> {
+        match self {
+            Self::Hit { body, .. } => Some(body),
+            Self::Exhausted(_) => None,
+        }
+    }
+
+    /// No network answered with a miss or a withheld response: every one was
+    /// transient, auth-refused, rate-limited or behind an open breaker.
+    #[must_use]
+    pub fn all_transient(&self) -> bool {
+        match self {
+            Self::Hit { .. } => false,
+            Self::Exhausted(attempts) => attempts.iter().all(|(_, c)| c.is_failure()),
+        }
+    }
+}
+
+struct NetworkState {
+    client: AppViewClient,
+    limiter: Option<DefaultDirectRateLimiter>,
+    breaker: Mutex<Breaker>,
+}
+
+/// The cascade. Cheap to clone.
+#[derive(Clone)]
+pub struct Cascade {
+    table: Arc<RoutingTable>,
+    networks: Arc<HashMap<String, NetworkState>>,
+}
+
+impl Cascade {
+    /// One state per client; the token bucket comes from the table.
+    #[must_use]
+    pub fn new(table: Arc<RoutingTable>, clients: Vec<AppViewClient>) -> Self {
+        let networks = clients
+            .into_iter()
+            .map(|client| {
+                let limiter = table.network(client.network()).and_then(|n| n.rate).map(|(rate, burst)| {
+                    RateLimiter::direct(
+                        Quota::per_second(NonZeroU32::new(rate).unwrap_or(NonZeroU32::MIN))
+                            .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::MIN)),
+                    )
+                });
+                (
+                    client.network().to_string(),
+                    NetworkState {
+                        client,
+                        limiter,
+                        breaker: Mutex::new(Breaker::default()),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            table,
+            networks: Arc::new(networks),
+        }
+    }
+
+    #[must_use]
+    pub fn table(&self) -> &RoutingTable {
+        &self.table
+    }
+
+    /// Whether `network`'s breaker is open now (tests, metrics).
+    #[must_use]
+    pub fn breaker_open(&self, network: &str) -> bool {
+        self.networks
+            .get(network)
+            .is_some_and(|s| s.breaker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_open(Instant::now()))
+    }
+
+    /// Run `call` through the plan for a DID whose home network is `home`.
+    pub async fn fetch(&self, home: Option<&str>, call: Call<'_>) -> Fetched {
+        let deadline = Instant::now() + CASCADE_BUDGET;
+        let mut attempts = Vec::new();
+        for name in self.table.plan(home) {
+            let Some(state) = self.networks.get(&name) else {
+                continue;
+            };
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            if !state.breaker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).allow(now) {
+                metrics::counter!(METRIC_SKIPPED, "network" => name.clone(), "reason" => "breaker_open").increment(1);
+                attempts.push((name, Class::Transient));
+                continue;
+            }
+            if state.limiter.as_ref().is_some_and(|l| l.check().is_err()) {
+                metrics::counter!(METRIC_SKIPPED, "network" => name.clone(), "reason" => "rate_limited").increment(1);
+                // Releases a half-open probe slot taken above.
+                let mut b = state.breaker.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if b.probing {
+                    b.probing = false;
+                }
+                attempts.push((name, Class::Transient));
+                continue;
+            }
+            let result = match tokio::time::timeout(deadline - now, call.invoke(&state.client)).await {
+                Ok(r) => r,
+                Err(_) => Err(NetError::Timeout),
+            };
+            let (class, body) = classify(&result);
+            state
+                .breaker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(class, Instant::now());
+            metrics::counter!(METRIC_CALLS, "network" => name.clone(), "class" => class.label()).increment(1);
+            if class == Class::AuthRefused {
+                metrics::counter!(METRIC_AUTH_REFUSED, "network" => name.clone()).increment(1);
+            }
+            if let (Class::Hit, Some(body)) = (class, body) {
+                return Fetched::Hit { network: name, body };
+            }
+            attempts.push((name, class));
+        }
+        Fetched::Exhausted(attempts)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use serde_json::json;
+
+    use super::*;
+    use crate::appview_clients::AppViewAuth;
+    use crate::config::ConstellationConfig;
+    use crate::net::NetClient;
+    use crate::test_support::serve_fake;
+
+    #[test]
+    fn breaker_opens_after_five_failures_and_half_opens_after_thirty_seconds() {
+        let t0 = Instant::now();
+        let mut b = Breaker::default();
+        for _ in 0..4 {
+            assert!(b.allow(t0));
+            b.record(Class::Transient, t0);
+        }
+        assert!(!b.is_open(t0), "four failures keep it closed");
+        b.record(Class::AuthRefused, t0);
+        assert!(b.is_open(t0));
+        assert!(!b.allow(t0 + Duration::from_secs(29)));
+        // One half-open probe after 30 s; a second caller waits.
+        let t1 = t0 + BREAKER_OPEN;
+        assert!(b.allow(t1));
+        assert!(!b.allow(t1));
+        // A failed probe re-opens at once.
+        b.record(Class::Transient, t1);
+        assert!(b.is_open(t1));
+        let t2 = t1 + BREAKER_OPEN;
+        assert!(b.allow(t2));
+        // A successful probe closes it.
+        b.record(Class::Miss, t2);
+        assert!(!b.is_open(t2));
+        assert!(b.allow(t2) && b.allow(t2));
+        // Non-failures reset the streak.
+        for _ in 0..4 {
+            b.record(Class::Transient, t2);
+        }
+        b.record(Class::Withheld, t2);
+        b.record(Class::Transient, t2);
+        assert!(!b.is_open(t2));
+    }
+
+    /// A fake AppView answering every call with a fixed status, counting
+    /// calls.
+    pub(crate) async fn fake_appview(status: StatusCode, body: Value) -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = (Arc::clone(&calls), status, body);
+        let router = Router::new()
+            .route(
+                "/xrpc/{method}",
+                get(|State((calls, status, body)): State<(Arc<AtomicUsize>, StatusCode, Value)>| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (status, axum::Json(body)).into_response()
+                }),
+            )
+            .with_state(state);
+        (serve_fake(router).await, calls)
+    }
+
+    /// A routing table whose outbound networks point at the given bases.
+    pub(crate) fn cascade_for(bases: &[(&str, &str)]) -> Cascade {
+        let mut cfg = ConstellationConfig::default();
+        for n in &mut cfg.networks {
+            if let Some((_, base)) = bases.iter().find(|(name, _)| *name == n.name) {
+                n.appview_url = (*base).to_string();
+            }
+        }
+        let table = Arc::new(RoutingTable::from_config(&cfg));
+        let net = NetClient::loopback_for_tests();
+        let clients = table
+            .networks()
+            .iter()
+            .filter(|n| n.callable())
+            .map(|n| AppViewClient::new(&n.name, n.appview_url.as_deref().unwrap_or_default(), AppViewAuth::Unauth, net.clone()))
+            .collect();
+        Cascade::new(table, clients)
+    }
+
+    #[tokio::test]
+    async fn home_first_then_cascade_skipping_misses_and_opening_breakers() {
+        let (down, down_calls) = fake_appview(StatusCode::SERVICE_UNAVAILABLE, json!({})).await;
+        let (hit, hit_calls) = fake_appview(StatusCode::OK, json!({"did": "did:plc:x", "handle": "x.test"})).await;
+        let cascade = cascade_for(&[("bluesky", &down), ("community-a", &hit)]);
+
+        // Home community-a answers first; bluesky is never called.
+        match cascade.fetch(Some("community-a"), Call::Profile("x.test")).await {
+            Fetched::Hit { network, body } => assert_eq!((network.as_str(), &body["handle"]), ("community-a", &json!("x.test"))),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(down_calls.load(Ordering::SeqCst), 0);
+
+        // Unknown home: bluesky (transient) then community-a (hit).
+        for _ in 0..5 {
+            assert!(cascade.fetch(None, Call::Profile("x.test")).await.hit().is_some());
+        }
+        assert_eq!(down_calls.load(Ordering::SeqCst), 5);
+        assert!(cascade.breaker_open("bluesky"), "five transient calls open the breaker");
+        // While open, bluesky is skipped without a call.
+        assert!(cascade.fetch(None, Call::Profile("x.test")).await.hit().is_some());
+        assert_eq!(down_calls.load(Ordering::SeqCst), 5);
+        assert_eq!(hit_calls.load(Ordering::SeqCst), 7);
+    }
+
+    #[tokio::test]
+    async fn exhaustion_reports_classes() {
+        let (missing, _) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound", "message": "Post not found"})).await;
+        let (down, _) = fake_appview(StatusCode::BAD_GATEWAY, json!({})).await;
+        let cascade = cascade_for(&[("bluesky", &missing), ("community-a", &down)]);
+        let r = cascade.fetch(None, Call::Posts(&["at://did:plc:x/app.bsky.feed.post/1".into()])).await;
+        assert_eq!(
+            r,
+            Fetched::Exhausted(vec![("bluesky".into(), Class::Miss), ("community-a".into(), Class::Transient)])
+        );
+        assert!(!r.all_transient(), "a miss is an answer");
+        let cascade = cascade_for(&[("bluesky", &down), ("community-a", &down)]);
+        assert!(cascade.fetch(None, Call::Profile("x")).await.all_transient());
+    }
+
+    #[tokio::test]
+    async fn an_empty_token_bucket_skips_the_network() {
+        let (hit, calls) = fake_appview(StatusCode::OK, json!({})).await;
+        let mut cfg = ConstellationConfig::default();
+        for n in &mut cfg.networks {
+            if n.name == "bluesky" {
+                n.appview_url = hit.clone();
+                n.rate_per_sec = Some(1);
+                n.burst = Some(2);
+            }
+        }
+        let table = Arc::new(RoutingTable::from_config(&cfg));
+        let client = AppViewClient::new("bluesky", &hit, AppViewAuth::Unauth, NetClient::loopback_for_tests());
+        let cascade = Cascade::new(table, vec![client]);
+        let mut hits = 0;
+        for _ in 0..5 {
+            if cascade.fetch(None, Call::Profile("x")).await.hit().is_some() {
+                hits += 1;
+            }
+        }
+        assert_eq!((hits, calls.load(Ordering::SeqCst)), (2, 2), "burst 2, then skipped as transient without a call");
+        assert!(!cascade.breaker_open("bluesky"), "rate limiting is not an upstream failure");
+    }
+}

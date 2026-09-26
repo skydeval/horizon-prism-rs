@@ -12,6 +12,7 @@ pub mod aggregations;
 pub mod appview_clients;
 pub mod cli;
 pub mod config;
+pub mod constellation;
 pub mod db;
 pub mod firehose;
 pub mod hydration;

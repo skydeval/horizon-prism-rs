@@ -43,6 +43,18 @@ commit.
   `appview_did`, `lxm`, 60 s `exp`, 16-byte `jti`, ES256K low-S). Typed
   `getProfile`, `getPosts`, `getPostThread`, `getAuthorFeed`, `getFollows`;
   3 s per call, 4 MiB cap.
+- **Item 7: `constellation` routing.** The routing table from
+  `[[constellation.networks]]` and `[constellation.cascade]`: §8.2 PDS
+  matching (first match in file order; `community` is local, never an
+  outbound call), the per-DID `route` cache (200 000 entries, 1 h, resolved
+  DIDs only), and the call plan (home AppView, then the cascade without it,
+  disabled networks skipped). §8.3 response classes (`hit`, `miss`,
+  `withheld`, `auth-refused`, `transient`); per-network token buckets
+  (empty = transient skip) and breakers (5 consecutive failures, 30 s open,
+  one half-open probe); 3 s per call, 6 s per cascade.
+  `app.nearhorizon.constellation.resolveDid` (public, 10/s burst 20 per IP,
+  `cache-control: public, max-age=300`). Rate classes `threadLens` (2/s,
+  10 per DID) and `resolveDid` added.
 - **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
   owns every private table behind a `pub(crate)` facade: defensive
   `postPrivate` / audience parsing with dead-lettering of malformed records
