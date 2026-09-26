@@ -181,7 +181,7 @@ Each dead letter records one failed op: repo, rev, action, path and error, plus 
 
 ### A sidecar in a crash loop
 
-The sidecars exit on a stale cursor, a relay protocol error, or an event over 4 MiB, instead of silently skipping ahead. When this happens, `docker compose ps` shows the sidecar restarting, and its logs show the reason. Private reads fail closed if that relay is one of `firehose.private_relays`.
+The sidecars exit on a stale cursor or a relay protocol error, instead of silently skipping ahead. When this happens, `docker compose ps` shows the sidecar restarting, and its logs show the reason. Private reads fail closed if that relay is one of `firehose.private_relays`.
 
 If the relay no longer has the saved cursor, accept the gap. Always run step 1 first.
 
@@ -194,7 +194,7 @@ If the relay no longer has the saved cursor, accept the gap. Always run step 1 f
 2. Compute the sidecar's cursor key: `firehose:cursor:` plus the unpadded URL-safe base64 of the relay URL in that sidecar's `firehose/*.toml`. For example, for the Community A sidecar:
 
    ```sh
-   printf '%s' 'wss://relay.community-a.example/xrpc/com.atproto.sync.subscribeRepos' | base64 -w0 | tr '+/' '-_' | tr -d '='
+   printf '%s' 'wss://relay.community-a.example/xrpc/com.atproto.sync.subscribeRepos' | base64 | tr -d '\n=' | tr '+/' '-_'
    ```
 
 3. Delete that key. The sidecar restarts from live tip.
@@ -205,11 +205,19 @@ If the relay no longer has the saved cursor, accept the gap. Always run step 1 f
 
 ### Silent frame drops
 
-horizon-firehose drops frames it cannot decode, with no configuration option to stop instead. Those drops are covered by the daily re-sync (design §6.11.5). Check for them:
+horizon-firehose drops three kinds of event, and none of them can be configured to stop the sidecar instead:
+- frames it cannot decode;
+- frames whose decoder panicked;
+- events over the 4 MiB size cap (`on_oversize = "skip_with_log"`). A fatal setting would let one crafted commit stop all ingest.
+
+Those drops are covered by the daily re-sync (design §6.11.5). Check for them:
 
 ```sh
-docker compose logs --no-log-prefix horizon-firehose-bsky horizon-firehose-microcosm horizon-firehose-community-a | jq -c 'select(.fields.message == "CBOR/CAR decode failed; dropping frame")'
+docker compose logs --no-log-prefix horizon-firehose-bsky horizon-firehose-microcosm horizon-firehose-community-a \
+  | jq -R -c 'fromjson? // empty | select(.fields.message == "CBOR/CAR decode failed; dropping frame" or .fields.message == "decoder panicked on frame (isolated); dropping and continuing" or .fields.message == "dropping oversize event per on_oversize=skip_with_log")'
 ```
+
+`jq -R … fromjson?` skips any non-JSON line instead of aborting.
 
 If any appear, run `admin resync --private-and-members` to re-sync now rather than waiting for the daily pass.
 
@@ -226,6 +234,7 @@ If any appear, run `admin resync --private-and-members` to re-sync now rather th
   The app detects the gap and re-syncs members and private owners (design §5.7).
 - **Private reads during a stall:** if all sidecars stall, private reads fail closed within about 2 minutes (`oracle_freshness_bound`) and recover once ingest catches up.
 - **Disk:** the app warns at 80% and 95% of `storage.budget_bytes` in `config/app.toml`, which defaults to 200 GiB.
+- **Load on the community PDS:** the app checks each member's and private owner's repo head in the background, and on some private reads. Per PDS host it sends at most about 25 head checks/s, 20 read-time checks/s and 5 backfill requests/s (`[sync]` and `[backfill]` in `config/app.toml`). At the 25/s cap, about 1100 tracked accounts per host can be kept fresh. Lower `community.max_members` if your PDS should see less.
 
 ## Metrics and alert examples
 

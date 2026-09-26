@@ -86,6 +86,15 @@ head_max_age_secs = 60
 max_head_fetches_per_request = 16
 head_fetch_timeout_ms = 500
 divergence_grace_secs = 300
+# Independent per-PDS-host budgets (design §6.11.3). The prober rate is sized
+# automatically from the tracked-DID count, up to this cap.
+max_probe_rate_per_host = 25
+# Synchronous read-time fetches never wait: no token = immediate miss.
+read_fetch_rate_per_host = 20
+
+[db]
+# Backstop against lock waits (design §6.11.7); a timeout is a transient failure.
+lock_timeout_secs = 30
 
 [cache]
 # In-process read-time cache budget (design §7.6).

@@ -35,8 +35,9 @@ on_protocol_error = "exit"
 
 [publisher]
 max_event_size_bytes = 4194304
-# Stop instead of silently dropping an oversize event (design §6.11.5).
-on_oversize = "fail_hard"
+# Skip (not fail_hard): fail_hard would let one crafted commit stop all ingest.
+# An oversize commit only affects its own repo; see design §6.11.5.
+on_oversize = "skip_with_log"
 
 [logging]
 level = "info"
