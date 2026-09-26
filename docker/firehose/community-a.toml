@@ -31,8 +31,9 @@ record_types = []
 
 [cursor]
 save_interval_seconds = 5
-on_stale_cursor = "live_tip"
-on_protocol_error = "reconnect_from_live_tip"
+# Exit instead of silently resuming from live tip: a skip must be visible (design §5.7).
+on_stale_cursor = "exit"
+on_protocol_error = "exit"
 
 [publisher]
 max_event_size_bytes = 1048576

@@ -20,7 +20,12 @@ COPY horizon-prism-rs/ ./
 
 # Private-table source check (design §4.2): private tables may only be named
 # under src/private_tier/. Any other source file naming one fails the build.
-RUN leaks="$(grep -rlE 'private_(posts|audiences|blocks|tombstones|owner_ready)' --include='*.rs' src | grep -v '^src/private_tier/' || true)"; \
+# grep exits 0 (matches), 1 (no matches) or 2 (error); anything but 0/1 fails.
+RUN set -e; \
+    test -d src; \
+    rc=0; grep -rlE 'private_(posts|audiences|blocks|tombstones|owner_ready)' --include='*.rs' src > /tmp/private_refs || rc=$?; \
+    if [ "$rc" -gt 1 ]; then echo "private-table source check: grep failed ($rc)"; exit 1; fi; \
+    leaks="$(grep -v '^src/private_tier/' /tmp/private_refs || true)"; \
     if [ -n "$leaks" ]; then echo "private-tier table referenced outside src/private_tier/:"; echo "$leaks"; exit 1; fi
 
 # Enforces the private-tier codec guard (design §6.3); a violation fails the build.

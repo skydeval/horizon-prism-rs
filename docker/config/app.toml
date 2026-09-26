@@ -28,6 +28,8 @@ max_follow_scope_per_member = 10000
 auto_enroll = true
 max_auto_enroll_per_hour = 50
 max_members = 1000
+# Auto-enrolled members still not ready after this many days are removed (design §9.2).
+never_ready_expiry_days = 7
 # PDS hosts eligible for auto-enroll (exact host or *.suffix). Empty = the
 # community network's pds_patterns below. Others need `admin member add`.
 enroll_pds_patterns = []
@@ -38,8 +40,13 @@ group = "horizon-prism-rs"
 consumer_name = "app"
 batch_size = 500
 dead_letter_stream = "firehose:dead-letters"
-# Deterministic failures are retried in place this many times, then dead-lettered.
+# Deterministic failures are retried in place this many times, then dead-lettered
+# as metadata plus the first 4 KiB of data (design §5.3).
 deterministic_attempts = 5
+dead_letter_maxlen = 10000
+# Relays that must crawl the community PDS; private reads gate on the slowest of
+# these (design §5.3). Labels come from [firehose.relay_labels].
+private_relays = ["bsky", "microcosm"]
 lag_warn_entries = 100000
 # Relay coverage tracker (design §5.11).
 coverage_window_secs = 600
@@ -92,6 +99,10 @@ per_pds_rate_per_sec = 5
 # Safety ceiling for "all" block/audience listings; hitting it leaves readiness
 # unset so private reads fail closed (design §5.10).
 full_listing_ceiling = 1000000
+# Failed member/private/resync jobs are re-queued on this schedule (design §5.10).
+retry_every_hours = 6
+# Reconcile deletions confirmed per job via getRecord (design §5.10).
+reconcile_confirm_limit = 1000
 
 [retention]
 # Out-of-scope grace is scope.rebuild_grace_days (design §9.4); retention deletes

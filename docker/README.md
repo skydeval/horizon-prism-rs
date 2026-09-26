@@ -177,9 +177,38 @@ docker compose exec app /app/horizon-prism-rs admin deadletter list
 docker compose exec app /app/horizon-prism-rs admin deadletter replay <id>
 ```
 
+Dead-letter entries keep metadata and the first 4 KiB of the payload only. `replay` re-fetches the record from its PDS.
+
+### A sidecar in a crash loop
+
+The sidecars exit on a stale cursor or a relay protocol error instead of silently skipping ahead. When this happens, `docker compose ps` shows the sidecar restarting, and its logs show the reason. Private reads fail closed if that relay is one of `firehose.private_relays`.
+
+If the relay no longer has the saved cursor, accept the gap.
+
+1. Find the sidecar's cursor key. Each key is `firehose:cursor:` plus the URL-safe base64 of the relay URL.
+
+   ```sh
+   docker compose exec redis redis-cli --scan --pattern 'firehose:cursor:*'
+   ```
+
+2. Delete that key, then re-sync members and private owners:
+
+   ```sh
+   docker compose exec redis redis-cli DEL '<key from step 1>'
+   docker compose exec app /app/horizon-prism-rs admin resync --private-and-members
+   ```
+
 ## Sizing
 
-- **`REDIS_MAXMEMORY`:** the stream is capped at about 1 500 000 entries, which is about 330 s across three relays. At a typical 1–2 KiB per entry that is about 1.5–3 GiB. Request caches live inside the app process, not in Redis. `6gb` leaves headroom. Redis runs `noeviction`: at the ceiling, writes fail, and the sidecars retry until space frees. Nothing is silently evicted.
+- **`REDIS_MAXMEMORY`:** the stream is capped at about 1 500 000 entries, which is about 330 s across three relays. At a typical 1–2 KiB per entry that is about 1.5–3 GiB. Request caches live inside the app process, not in Redis. `6gb` leaves headroom. Redis runs `noeviction`: at the ceiling it rejects new stream entries, and nothing frees space on its own. The stream is only trimmed by new writes. Ingest stops, and private reads fail closed.
+
+  Watch `redis_memory_ratio`. To recover, either raise `REDIS_MAXMEMORY` in `.env` and run `docker compose up -d redis`, or trim the stream, accepting a gap:
+
+  ```sh
+  docker compose exec redis redis-cli XTRIM firehose:events MAXLEN '~' 500000
+  ```
+
+  The app detects the gap and re-syncs members and private owners (design §5.7).
 - **Private reads during a stall:** if all sidecars stall, private reads fail closed within about 2 minutes (`oracle_freshness_bound`) and recover once ingest catches up.
 - **Disk:** the app warns at 80% and 95% of `storage.budget_bytes` in `config/app.toml`, which defaults to 200 GiB.
 
@@ -203,7 +232,21 @@ groups:
         for: 30m
       - alert: PrivateTierIngestStale
         expr: private_tier_last_event_age_seconds > 86400
+      - alert: RelayWatermarkBehind
+        expr: firehose_worker_delay_seconds > 120
+        for: 5m
+      - alert: RedisMemoryHigh
+        expr: redis_memory_ratio > 0.8
+        for: 10m
+      - alert: BackfillJobsFailed
+        expr: backfill_jobs{state="failed"} > 0
+        for: 1h
+      - alert: MembersNotReady
+        expr: members_not_ready_total > 0
+        for: 24h
 ```
+
+A latched audit guard (design §6.5) makes `/xrpc/_health` return 503. `docker compose ps` then shows `app` as unhealthy. Restart `app` after investigating the logged panic.
 
 ## Teardown
 
