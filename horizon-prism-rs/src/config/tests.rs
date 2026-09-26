@@ -18,7 +18,7 @@ fn base_env() -> HashMap<&'static str, String> {
     ])
 }
 
-fn lookup_in(env: &HashMap<&'static str, String>) -> impl Fn(&str) -> Option<String> + '_ {
+fn lookup_in<'a>(env: &'a HashMap<&'static str, String>) -> impl Fn(&str) -> Option<String> + 'a {
     move |k: &str| env.get(k).cloned()
 }
 
