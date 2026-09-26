@@ -28,8 +28,11 @@ max_follow_scope_per_member = 10000
 auto_enroll = true
 max_auto_enroll_per_hour = 50
 max_members = 1000
-# Auto-enrolled members still not ready after this many days are removed (design §9.2).
+# Auto-enrolled members that have never been ready (first_ready_at NULL) after
+# this many days are removed (design §9.2).
 never_ready_expiry_days = 7
+# Refused enrollments are cached this long before getRepoStatus is re-checked.
+enroll_refusal_cache_secs = 3600
 # PDS hosts eligible for auto-enroll (exact host or *.suffix). Empty = the
 # community network's pds_patterns below. Others need `admin member add`.
 enroll_pds_patterns = []
@@ -70,11 +73,19 @@ oracle_freshness_bound_secs = 120
 [private_read]
 bind_concurrency = 8
 
-# Whole-handler latency floors, sized above each endpoint's worst case (design §6.9).
+# Whole-handler latency floors, sized above each endpoint's worst case including
+# one synchronous repo-head fetch round (design §6.9, §6.11.3).
 [private_read.floor_ms]
-get_posts = 150
-get_post_thread = 400
-get_author_feed = 400
+get_posts = 800
+get_post_thread = 1000
+get_author_feed = 1000
+
+# Repo-head check for tracked DIDs (design §6.11.3).
+[sync]
+head_max_age_secs = 60
+max_head_fetches_per_request = 16
+head_fetch_timeout_ms = 500
+divergence_grace_secs = 300
 
 [cache]
 # In-process read-time cache budget (design §7.6).

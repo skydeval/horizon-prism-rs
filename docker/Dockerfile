@@ -23,7 +23,7 @@ COPY horizon-prism-rs/ ./
 # grep exits 0 (matches), 1 (no matches) or 2 (error); anything but 0/1 fails.
 RUN set -e; \
     test -d src; \
-    rc=0; grep -rlE 'private_(posts|audiences|blocks|tombstones|owner_ready)' --include='*.rs' src > /tmp/private_refs || rc=$?; \
+    rc=0; grep -rlE 'private_(posts|audiences|blocks|tombstones|owner_ready|owner_eligible)' --include='*.rs' src > /tmp/private_refs || rc=$?; \
     if [ "$rc" -gt 1 ]; then echo "private-table source check: grep failed ($rc)"; exit 1; fi; \
     leaks="$(grep -v '^src/private_tier/' /tmp/private_refs || true)"; \
     if [ -n "$leaks" ]; then echo "private-tier table referenced outside src/private_tier/:"; echo "$leaks"; exit 1; fi

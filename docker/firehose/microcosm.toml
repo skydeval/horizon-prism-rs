@@ -34,8 +34,9 @@ on_stale_cursor = "exit"
 on_protocol_error = "exit"
 
 [publisher]
-max_event_size_bytes = 1048576
-on_oversize = "skip_with_log"
+max_event_size_bytes = 4194304
+# Stop instead of silently dropping an oversize event (design §6.11.5).
+on_oversize = "fail_hard"
 
 [logging]
 level = "info"

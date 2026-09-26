@@ -7,7 +7,7 @@ This is the deployment runbook for the stack in `docker/`. Design references are
 | Service | Role | Host exposure |
 |---|---|---|
 | `db` | Postgres 16 | none |
-| `redis` | Firehose stream, cursor keys, caches (AOF, `noeviction`) | none |
+| `redis` | Firehose stream, dead letters, sidecar cursor keys, and a capped count-refresh set (AOF, `noeviction`). Request caches live in the app process. | none |
 | `app` | horizon-prism-rs (XRPC + worker) | `127.0.0.1:3030` (XRPC), `127.0.0.1:9091` (metrics) |
 | `horizon-firehose-bsky` | relay consumer, `bsky.network` | none |
 | `horizon-firehose-microcosm` | relay consumer, `relay.fire.hose.cam` | none |
@@ -177,26 +177,41 @@ docker compose exec app /app/horizon-prism-rs admin deadletter list
 docker compose exec app /app/horizon-prism-rs admin deadletter replay <id>
 ```
 
-Dead-letter entries keep metadata and the first 4 KiB of the payload only. `replay` re-fetches the record from its PDS.
+Each dead letter records one failed op: repo, rev, action, path and error, plus the first 4 KiB of the payload. `replay` re-fetches exactly that record from its PDS. A dead letter for a member or private owner also clears that DID's readiness and re-syncs it.
 
 ### A sidecar in a crash loop
 
-The sidecars exit on a stale cursor or a relay protocol error instead of silently skipping ahead. When this happens, `docker compose ps` shows the sidecar restarting, and its logs show the reason. Private reads fail closed if that relay is one of `firehose.private_relays`.
+The sidecars exit on a stale cursor, a relay protocol error, or an event over 4 MiB, instead of silently skipping ahead. When this happens, `docker compose ps` shows the sidecar restarting, and its logs show the reason. Private reads fail closed if that relay is one of `firehose.private_relays`.
 
-If the relay no longer has the saved cursor, accept the gap.
+If the relay no longer has the saved cursor, accept the gap. Always run step 1 first.
 
-1. Find the sidecar's cursor key. Each key is `firehose:cursor:` plus the URL-safe base64 of the relay URL.
-
-   ```sh
-   docker compose exec redis redis-cli --scan --pattern 'firehose:cursor:*'
-   ```
-
-2. Delete that key, then re-sync members and private owners:
+1. Record the gap and clear readiness **before** the sidecar can resume:
 
    ```sh
-   docker compose exec redis redis-cli DEL '<key from step 1>'
    docker compose exec app /app/horizon-prism-rs admin resync --private-and-members
    ```
+
+2. Compute the sidecar's cursor key: `firehose:cursor:` plus the unpadded URL-safe base64 of the relay URL in that sidecar's `firehose/*.toml`. For example, for the Community A sidecar:
+
+   ```sh
+   printf '%s' 'wss://relay.community-a.example/xrpc/com.atproto.sync.subscribeRepos' | base64 -w0 | tr '+/' '-_' | tr -d '='
+   ```
+
+3. Delete that key. The sidecar restarts from live tip.
+
+   ```sh
+   docker compose exec redis redis-cli DEL 'firehose:cursor:<value from step 2>'
+   ```
+
+### Silent frame drops
+
+horizon-firehose drops frames it cannot decode, with no configuration option to stop instead. Those drops are covered by the daily re-sync (design §6.11.5). Check for them:
+
+```sh
+docker compose logs --no-log-prefix horizon-firehose-bsky horizon-firehose-microcosm horizon-firehose-community-a | jq -c 'select(.fields.message == "CBOR/CAR decode failed; dropping frame")'
+```
+
+If any appear, run `admin resync --private-and-members` to re-sync now rather than waiting for the daily pass.
 
 ## Sizing
 
