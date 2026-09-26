@@ -4,3 +4,4 @@
 //! Modules are added in the §15 implementation order.
 
 pub mod config;
+pub mod db;
