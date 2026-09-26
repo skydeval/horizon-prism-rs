@@ -21,7 +21,9 @@ tls_extra_ca_file = ""
 [redis]
 url = "redis://redis:6379"
 stream_key = "firehose:events"
-max_stream_len = 500000
+# Three sidecars share this stream (~4,500 events/s combined): 1.5M entries is
+# ~330 s of buffer (design §5.2).
+max_stream_len = 1500000
 cleanup_unknown_cursors = false
 
 [filter]

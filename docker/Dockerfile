@@ -18,6 +18,11 @@ WORKDIR /build
 # sqlx::migrate!), and clippy.toml once committed. target/ is excluded by .dockerignore.
 COPY horizon-prism-rs/ ./
 
+# Private-table source check (design §4.2): private tables may only be named
+# under src/private_tier/. Any other source file naming one fails the build.
+RUN leaks="$(grep -rlE 'private_(posts|audiences|blocks|tombstones|owner_ready)' --include='*.rs' src | grep -v '^src/private_tier/' || true)"; \
+    if [ -n "$leaks" ]; then echo "private-tier table referenced outside src/private_tier/:"; echo "$leaks"; exit 1; fi
+
 # Enforces the private-tier codec guard (design §6.3); a violation fails the build.
 RUN cargo clippy --release --locked --all-targets -- -D warnings
 RUN cargo build --release --locked --bin horizon-prism-rs

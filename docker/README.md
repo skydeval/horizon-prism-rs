@@ -80,7 +80,11 @@ curl -fsS https://<APP_PUBLIC_HOSTNAME>/.well-known/did.json
 
 The first must return `"ok":true`. The second must show `did:web:<APP_PUBLIC_HOSTNAME>`.
 
-**10. Add yourself as a member.** With auto-enroll on, signing in from a client also does this.
+**10. Add yourself as a member.**
+
+With auto-enroll on, a client also enrols you the first time it loads your timeline or notifications, but only if your PDS host matches `community.enroll_pds_patterns` and `community.max_members` has not been reached. Members on other PDSes must be added here.
+
+A new member gets `NotReady` from member-only endpoints until their initial indexing finishes. Check its state with `admin member list`.
 
 ```sh
 docker compose exec app /app/horizon-prism-rs admin member add did:plc:yourdid
@@ -175,7 +179,8 @@ docker compose exec app /app/horizon-prism-rs admin deadletter replay <id>
 
 ## Sizing
 
-- **`REDIS_MAXMEMORY`:** the stream is capped at about 500 000 entries. At a typical 1–2 KiB per entry that is about 0.5–1 GiB, plus read-time caches. `4gb` leaves headroom. Redis runs `noeviction`: at the ceiling, writes fail, and the sidecars retry until space frees. Nothing is silently evicted.
+- **`REDIS_MAXMEMORY`:** the stream is capped at about 1 500 000 entries, which is about 330 s across three relays. At a typical 1–2 KiB per entry that is about 1.5–3 GiB. Request caches live inside the app process, not in Redis. `6gb` leaves headroom. Redis runs `noeviction`: at the ceiling, writes fail, and the sidecars retry until space frees. Nothing is silently evicted.
+- **Private reads during a stall:** if all sidecars stall, private reads fail closed within about 2 minutes (`oracle_freshness_bound`) and recover once ingest catches up.
 - **Disk:** the app warns at 80% and 95% of `storage.budget_bytes` in `config/app.toml`, which defaults to 200 GiB.
 
 ## Metrics and alert examples

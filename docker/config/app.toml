@@ -19,10 +19,18 @@ public_scope = "community_scoped"
 # members_only | members_and_follows | members_and_interactions | members_and_one_hop
 policy = "members_and_one_hop"
 rebuild_grace_days = 7
+# Follow-derived scope growth per member (design §9.4).
+max_follow_scope_per_member = 10000
 
 [community]
+# Auto-enroll triggers only from getTimeline / listNotifications / getUnreadCount
+# (design §9.2), never from Thread Lens, private or index-request calls.
 auto_enroll = true
 max_auto_enroll_per_hour = 50
+max_members = 1000
+# PDS hosts eligible for auto-enroll (exact host or *.suffix). Empty = the
+# community network's pds_patterns below. Others need `admin member add`.
+enroll_pds_patterns = []
 
 [firehose]
 stream_key = "firehose:events"
@@ -30,7 +38,8 @@ group = "horizon-prism-rs"
 consumer_name = "app"
 batch_size = 500
 dead_letter_stream = "firehose:dead-letters"
-dead_letter_after_deliveries = 5
+# Deterministic failures are retried in place this many times, then dead-lettered.
+deterministic_attempts = 5
 lag_warn_entries = 100000
 # Relay coverage tracker (design §5.11).
 coverage_window_secs = 600
@@ -52,7 +61,17 @@ did_stale_max_secs = 86400
 oracle_freshness_bound_secs = 120
 
 [private_read]
-min_latency_ms = 150
+bind_concurrency = 8
+
+# Whole-handler latency floors, sized above each endpoint's worst case (design §6.9).
+[private_read.floor_ms]
+get_posts = 150
+get_post_thread = 400
+get_author_feed = 400
+
+[cache]
+# In-process read-time cache budget (design §7.6).
+read_time_bytes = 268435456
 
 [counts]
 # local | local_then_constellation
@@ -61,6 +80,7 @@ fresh_secs = 300
 stale_max_secs = 86400
 sync_timeout_ms = 800
 refresh_rate_per_sec = 20
+refresh_queue_max = 100000
 
 [microcosm]
 slingshot_url = "https://slingshot.microcosm.blue"
@@ -69,6 +89,9 @@ constellation_url = "https://constellation.microcosm.blue"
 [backfill]
 concurrency = 4
 per_pds_rate_per_sec = 5
+# Safety ceiling for "all" block/audience listings; hitting it leaves readiness
+# unset so private reads fail closed (design §5.10).
+full_listing_ceiling = 1000000
 
 [retention]
 # Out-of-scope grace is scope.rebuild_grace_days (design §9.4); retention deletes
