@@ -32,7 +32,11 @@ use crate::identity::{IdentityRefresher, IdentityResolver, IdentitySettings, Per
 use crate::microcosm::ConstellationClient;
 use crate::net::{NetClient, NetConfig};
 use crate::aggregations::enroll::AutoEnroller;
-use crate::hydration::{HydrationConfig, Hydrator, NoUpstream, ReadCache};
+use crate::constellation::resolve_did::ResolveDidState;
+use crate::constellation::{Cascade, DidLookup, Router as DidRouter, RoutingTable};
+use crate::hydration::upstream::{PdsLister, RealUpstreamSource};
+use crate::hydration::{HydrationConfig, Hydrator, ReadCache};
+use crate::microcosm::SlingshotClient;
 use crate::kryphocron_glue::GlueContext;
 use crate::private_tier::handlers::PrivateState;
 use crate::private_tier::retention::PrivateRetention;
@@ -253,7 +257,7 @@ pub async fn run() -> Result<(), StartupError> {
         scope.clone(),
         Arc::clone(&private),
         Arc::new(NetHeadSource::new(net.clone())),
-        budgets,
+        budgets.clone(),
         cfg.file.sync.clone(),
     );
     tasks.push(prober.clone().spawn());
@@ -276,14 +280,32 @@ pub async fn run() -> Result<(), StartupError> {
         .spawn(),
     );
 
+    // Constellation routing (§8): the table, the `route` cache over the
+    // identity resolver, one client per outbound network, the cascade, and
+    // the upstream source behind hydration's seam.
+    let table = Arc::new(RoutingTable::from_config(&cfg.file.constellation));
+    let did_router = DidRouter::new(Arc::clone(&table), Arc::new(resolver.clone()) as Arc<dyn DidLookup>);
+    let cascade = Cascade::new(
+        Arc::clone(&table),
+        crate::appview_clients::from_config(&cfg.file.constellation, &net, &glue.service_key),
+    );
+    let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes);
+    let upstream = RealUpstreamSource::new(
+        did_router.clone(),
+        cascade,
+        SlingshotClient::new(net.clone(), &cfg.file.microcosm.slingshot_url),
+        PdsLister::new(net.clone(), budgets),
+        read_cache.clone(),
+    );
+
     // HTTP.
     let hydrator = Hydrator::new(
         pool.clone(),
         scope.clone(),
         Some(ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url)),
         Some(redis.clone()),
-        Arc::new(NoUpstream),
-        ReadCache::new(cfg.file.cache.read_time_bytes),
+        Arc::new(upstream),
+        read_cache,
         HydrationConfig {
             labeler_did: glue.service_key.did().to_string(),
             counts: cfg.file.counts.clone(),
@@ -327,8 +349,13 @@ pub async fn run() -> Result<(), StartupError> {
         .await
         .map_err(|e| StartupError::new(1, format!("binding {}: {e}", cfg.file.http.bind)))?;
     tracing::info!(event = "serve_started", bind = %cfg.file.http.bind, tasks = tasks.len(), "serving");
+    let resolve_did = ResolveDidState {
+        app: app.clone(),
+        router: did_router,
+    };
     let routes = crate::xrpc::router(app)
         .merge(crate::private_tier::handlers::router(private_state))
+        .merge(crate::constellation::resolve_did::router(resolve_did))
         .merge(health::router(state));
     axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())

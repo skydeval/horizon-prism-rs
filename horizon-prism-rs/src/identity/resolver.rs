@@ -401,6 +401,16 @@ impl IdentityResolver {
         Ok(extract_info(&doc, did))
     }
 
+    /// The DID for `handle`, verified bidirectionally (the DID document
+    /// claims the handle back), or `None`.
+    pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
+        let handle = handle.trim().trim_start_matches('@').to_ascii_lowercase();
+        let did = self.inner.handles.resolve_handle(&handle).await?;
+        let info = self.resolve_info(&did, ResolveIntent::Lookup).await.ok()?;
+        verify_bidirectional(&did, info.claimed_handle.as_deref(), Some(&did)).filter(|h| h.eq_ignore_ascii_case(&handle))?;
+        Some(did)
+    }
+
     /// The verified handle for `did`, or `None`.
     pub async fn verify_handle(&self, did: &str, claimed: Option<&str>) -> Option<String> {
         let claimed = claimed?;

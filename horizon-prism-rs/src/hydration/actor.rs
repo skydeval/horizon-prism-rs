@@ -122,9 +122,9 @@ impl Hydrator {
             .profile_context(viewer, std::slice::from_ref(&did), Some(CountMode::Sync { started }))
             .await?;
         if !ctx.rows.contains_key(&did) && !self.in_scope(&did).await {
-            // Out-of-scope subject: the §8.3 cascade (item 7).
+            // Out-of-scope subject: the §8.3 cascade, then Slingshot.
             return Ok(match self.upstream().profile(&did).await {
-                Some(v) => Ok(Self::emit(v)),
+                Some(v) => Ok(Self::emit(self.normalized(viewer, v).await?.0)),
                 None => Err(ViewError::new("InvalidRequest", "Profile not found")),
             });
         }

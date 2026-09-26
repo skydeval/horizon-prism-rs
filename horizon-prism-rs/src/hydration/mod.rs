@@ -297,10 +297,15 @@ impl Hydrator {
         if actor.starts_with("did:") {
             return Ok(proto_blue::syntax::Did::is_valid(actor).then(|| actor.to_string()));
         }
-        sqlx::query_scalar("SELECT did FROM actors WHERE handle = $1")
+        let local: Option<String> = sqlx::query_scalar("SELECT did FROM actors WHERE handle = $1")
             .bind(actor.to_ascii_lowercase())
             .fetch_optional(self.pool())
-            .await
+            .await?;
+        if local.is_some() || !proto_blue::syntax::Handle::is_valid(actor) {
+            return Ok(local);
+        }
+        // A handle this AppView has not indexed (§6.7).
+        Ok(self.upstream().resolve_handle(actor).await)
     }
 
     /// Whether a DID is an in-scope subject (§7.1).
@@ -427,6 +432,29 @@ impl Hydrator {
             blocked_by: blocked_by.into_iter().collect(),
             muted: muted.into_iter().collect(),
         })
+    }
+
+    /// Normalize an upstream view for `viewer` (§8.6): local viewer state
+    /// (§7.5) and local labels replace upstream's, and private-tier
+    /// references become not-found. Returns what normalization observed.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn normalized(&self, viewer: &Viewer, mut view: Value) -> Result<(Value, normalize::NormalizeReport), sqlx::Error> {
+        let (dids, uris) = normalize::subjects(&view);
+        let dids: Vec<String> = dids.into_iter().collect();
+        let uris: Vec<String> = uris.into_iter().collect();
+        let actors = self.actor_viewer(viewer, &dids).await?;
+        let post_viewers = self.post_viewer(viewer, &uris).await?;
+        let labelled: Vec<String> = dids.iter().chain(uris.iter()).cloned().collect();
+        let overlay = normalize::Overlay {
+            profile_viewers: dids.iter().map(|d| (d.clone(), actors.view(d))).collect(),
+            post_viewers,
+            labels: self.load_labels(&labelled).await?,
+        };
+        let report = normalize::normalize_upstream(&mut view, &overlay);
+        Ok((view, report))
     }
 
     /// The viewer's likes and reposts of `uris` (§7.5).

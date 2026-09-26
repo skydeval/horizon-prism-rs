@@ -174,6 +174,11 @@ pub struct DidSummary {
 pub trait DidLookup: Send + Sync {
     /// `None` when the DID does not resolve.
     async fn summary(&self, did: &str) -> Option<DidSummary>;
+
+    /// A handle's DID, verified bidirectionally; `None` by default.
+    async fn did_for_handle(&self, _handle: &str) -> Option<String> {
+        None
+    }
 }
 
 #[async_trait]
@@ -185,6 +190,10 @@ impl DidLookup for IdentityResolver {
             pds: info.pds_endpoint,
             handle,
         })
+    }
+
+    async fn did_for_handle(&self, handle: &str) -> Option<String> {
+        self.resolve_handle(handle).await
     }
 }
 

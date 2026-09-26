@@ -59,7 +59,7 @@ impl Hydrator {
         };
         if !self.in_scope(&did).await {
             return Ok(match self.upstream().follows(&did, limit, cursor).await {
-                Some(v) => Ok(Self::emit(v)),
+                Some(v) => Ok(Self::emit(self.normalized(viewer, v).await?.0)),
                 None => Err(not_found()),
             });
         }

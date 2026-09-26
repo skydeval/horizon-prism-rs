@@ -332,7 +332,16 @@ impl Hydrator {
         let mut posts: Vec<Value> = wanted.iter().filter_map(|u| ctx.post_view(u)).collect();
         let missing: Vec<String> = wanted.iter().filter(|u| !ctx.posts.contains_key(*u)).cloned().collect();
         if !missing.is_empty() {
-            posts.extend(self.upstream().posts(&missing).await);
+            // §8.3 step 0: the moderation gate before any upstream source.
+            let gates = moderation::gate_many(self.pool(), &missing).await?;
+            let allowed: Vec<String> = missing
+                .into_iter()
+                .filter(|u| !gates.get(u).copied().unwrap_or(Gate::Visible).is_hidden())
+                .collect();
+            let upstream = Value::Array(self.upstream().posts(&allowed).await);
+            if let Value::Array(views) = self.normalized(viewer, upstream).await?.0 {
+                posts.extend(views);
+            }
         }
         Ok(Ok(Self::emit(json!({ "posts": posts }))))
     }
@@ -409,7 +418,7 @@ impl Hydrator {
             // Out-of-scope subject: the cascade (item 7).
             return Ok(
                 match self.upstream().author_feed(&did, limit, cursor, filter).await {
-                    Some(v) => Ok(Self::emit(v)),
+                    Some(v) => Ok(Self::emit(self.normalized(viewer, v).await?.0)),
                     None => Err(ViewError::new("InvalidRequest", "Profile not found")),
                 },
             );

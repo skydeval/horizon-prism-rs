@@ -55,6 +55,18 @@ commit.
   `app.nearhorizon.constellation.resolveDid` (public, 10/s burst 20 per IP,
   `cache-control: public, max-age=300`). Rate classes `threadLens` (2/s,
   10 per DID) and `resolveDid` added.
+- **Item 7: `RealUpstreamSource`.** Hydration's seam now serves
+  out-of-scope subjects: home AppView then the cascade (skipped for the
+  `community` network), then record-level fallback. Profiles, posts and
+  thread anchors (with their parent chain) fall back to Slingshot records;
+  author feeds and follows fall back to the author PDS `listRecords` on the
+  read-fetch budget, continuing (`P:` cursor) only on PDSes that list
+  descending (order probed once per host, cached 24 h). Upstream views are
+  normalized (§8.6: local viewer state and labels, private references
+  not-found) and cached in `rt`; upstream post and thread fetches run the
+  moderation gate first. Non-indexed handles resolve through the identity
+  resolver (bidirectionally verified). `serve` wires the routing table,
+  AppView clients, cascade, Slingshot and `resolveDid`.
 - **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
   owns every private table behind a `pub(crate)` facade: defensive
   `postPrivate` / audience parsing with dead-lettering of malformed records

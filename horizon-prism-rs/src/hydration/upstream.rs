@@ -1,21 +1,47 @@
-//! The upstream seam (design-v2 §13 row 182). Out-of-scope subjects are
-//! served by the §8 routing cascade and Slingshot, which item 7 builds. Until
-//! then [`NoUpstream`] answers every lookup with nothing, which every caller
-//! turns into that endpoint's uniform miss.
+//! The upstream seam (design-v2 §8.3, §7.1 out-of-scope column).
 //!
-//! Whatever an implementation returns is raw upstream JSON: callers pass it
-//! through [`super::normalize::normalize_upstream`] and never write it to
-//! content tables (§7.1, §7.6).
+//! [`RealUpstreamSource`] serves subjects this AppView does not index:
+//! 1. the subject DID's home network (§8.2, via the `route` cache);
+//! 2. the home AppView, then the cascade (§8.3 steps 4–5), skipped entirely
+//!    for the `community` network (local data only, then Slingshot);
+//! 3. record-level fallback: Slingshot `getRecord` for single records and
+//!    threads; the author PDS `listRecords` for author feeds (continuing
+//!    only on PDSes that list descending, §7.1, §5.10) and follows.
+//!
+//! Whatever it returns is raw upstream JSON or a view synthesized from
+//! records: callers normalize it (§8.6) and never write it to content
+//! tables (§7.1, §7.6). Post views and profiles go through the `rt`
+//! read-time cache (§7.6).
+//!
+//! [`NoUpstream`] answers every lookup with nothing (tests, and callers that
+//! must not reach upstream).
+
+use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use futures::StreamExt;
+use serde_json::{Value, json};
+use url::Url;
+
+use super::cache::ReadCache;
+use super::normalize::is_private_uri;
+use super::{INVALID_HANDLE, blob_url};
+use crate::constellation::{Call, Cascade, Router};
+use crate::db::locks::uri_author;
+use crate::firehose::backfill::{ListOrder, ListPage, ListedRecord, detect_order};
+use crate::firehose::normalize::{blob_cid, normalize_record};
+use crate::microcosm::SlingshotClient;
+use crate::net::{BodyCap, NetClient, RequestOptions};
+use crate::sync::{Class as BudgetClass, HostBudgets};
 
 /// Upstream lookups for subjects this AppView does not index.
 #[async_trait]
 pub trait UpstreamSource: Send + Sync {
     /// `app.bsky.actor.getProfile` for a DID or handle.
     async fn profile(&self, actor: &str) -> Option<Value>;
-    /// Post views for URIs (`getPosts` / Slingshot).
+    /// Post views for URIs (`getPosts` / Slingshot), in input order.
     async fn posts(&self, uris: &[String]) -> Vec<Value>;
     /// `app.bsky.feed.getPostThread`.
     async fn post_thread(&self, uri: &str, depth: u32, parent_height: u32) -> Option<Value>;
@@ -23,9 +49,14 @@ pub trait UpstreamSource: Send + Sync {
     async fn author_feed(&self, actor: &str, limit: u32, cursor: Option<&str>, filter: &str) -> Option<Value>;
     /// `app.bsky.graph.getFollows` output.
     async fn follows(&self, actor: &str, limit: u32, cursor: Option<&str>) -> Option<Value>;
+    /// The DID of a handle this AppView has not indexed (§6.7), verified
+    /// bidirectionally.
+    async fn resolve_handle(&self, _handle: &str) -> Option<String> {
+        None
+    }
 }
 
-/// Item-5 wiring: no upstream.
+/// No upstream.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoUpstream;
 
@@ -45,5 +76,521 @@ impl UpstreamSource for NoUpstream {
     }
     async fn follows(&self, _actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
         None
+    }
+}
+
+/// Slingshot calls in flight per request.
+pub const SLINGSHOT_CONCURRENCY: usize = 8;
+/// PDS listing: per-call timeout, page size, and the ascending-PDS page cap.
+pub const PDS_TIMEOUT: Duration = Duration::from_secs(3);
+pub const PDS_PAGE: u32 = 100;
+pub const ASCENDING_MAX_PAGES: usize = 10;
+/// Listing-order detection cache per PDS host (§5.10).
+pub const ORDER_TTL: Duration = Duration::from_secs(24 * 3600);
+
+const NSID_PROFILE: &str = "app.bsky.actor.profile";
+const NSID_POST: &str = "app.bsky.feed.post";
+const NSID_REPOST: &str = "app.bsky.feed.repost";
+const NSID_FOLLOW: &str = "app.bsky.graph.follow";
+
+/// Author-PDS listings on the read path: the host's read-fetch bucket
+/// (never queued), and the §5.10 order cache.
+#[derive(Clone)]
+pub struct PdsLister {
+    net: NetClient,
+    budgets: HostBudgets,
+    orders: moka::future::Cache<String, ListOrder>,
+}
+
+impl PdsLister {
+    #[must_use]
+    pub fn new(net: NetClient, budgets: HostBudgets) -> Self {
+        Self {
+            net,
+            budgets,
+            orders: moka::future::Cache::builder().max_capacity(100_000).time_to_live(ORDER_TTL).build(),
+        }
+    }
+
+    /// One `listRecords` page, or `None` (no budget, transport or status
+    /// failure).
+    pub async fn list(&self, pds: &str, did: &str, collection: &str, limit: u32, cursor: Option<&str>) -> Option<ListPage> {
+        if !self.budgets.try_acquire(&HostBudgets::host_of(pds), BudgetClass::ReadFetch) {
+            return None;
+        }
+        let limit = limit.to_string();
+        let mut params = vec![("repo", did), ("collection", collection), ("limit", limit.as_str())];
+        if let Some(c) = cursor {
+            params.push(("cursor", c));
+        }
+        let url = Url::parse_with_params(&format!("{}/xrpc/com.atproto.repo.listRecords", pds.trim_end_matches('/')), &params).ok()?;
+        let options = RequestOptions::new(BodyCap::LIST_RECORDS).timeout(PDS_TIMEOUT);
+        self.net.get_json::<ListPage>(url.as_str(), &options).await.ok()?.ok()
+    }
+
+    /// The host's listing order, probed once with a `limit=2` listing and
+    /// cached 24 h. `None` when undetermined.
+    pub async fn order(&self, pds: &str, did: &str) -> Option<ListOrder> {
+        let host = HostBudgets::host_of(pds);
+        if let Some(o) = self.orders.get(&host).await {
+            return Some(o);
+        }
+        let page = self.list(pds, did, NSID_POST, 2, None).await?;
+        let order = detect_order(&page.records)?;
+        self.orders.insert(host, order).await;
+        Some(order)
+    }
+}
+
+/// The production upstream. Cheap to clone.
+#[derive(Clone)]
+pub struct RealUpstreamSource {
+    router: Router,
+    cascade: Cascade,
+    slingshot: SlingshotClient,
+    pds: PdsLister,
+    cache: ReadCache,
+}
+
+/// A `postView` synthesized from a Slingshot or PDS record: no counts, no
+/// hydrated embed (§7.1 record-level fallback).
+fn post_from_record(uri: &str, cid: Option<&str>, handle: &str, value: &Value) -> Value {
+    let author = uri_author(uri).unwrap_or_default();
+    let indexed = value.get("createdAt").cloned().unwrap_or(Value::Null);
+    json!({
+        "$type": "app.bsky.feed.defs#postView",
+        "uri": uri,
+        "cid": cid.unwrap_or_default(),
+        "author": {"did": author, "handle": handle, "viewer": {}, "labels": []},
+        "record": normalize_record(value),
+        "indexedAt": indexed,
+        "viewer": {},
+        "labels": [],
+    })
+}
+
+/// A `profileViewDetailed` synthesized from the profile record.
+fn profile_from_record(did: &str, handle: &str, pds: Option<&str>, value: &Value) -> Value {
+    let mut v = json!({"did": did, "handle": handle, "viewer": {}, "labels": []});
+    for (from, to) in [("displayName", "displayName"), ("description", "description"), ("createdAt", "createdAt")] {
+        if let Some(x) = value.get(from).filter(|x| x.is_string()) {
+            v[to] = x.clone();
+        }
+    }
+    for key in ["avatar", "banner"] {
+        if let Some(url) = value.get(key).and_then(blob_cid).and_then(|cid| blob_url(pds, did, &cid)) {
+            v[key] = json!(url);
+        }
+    }
+    v
+}
+
+impl RealUpstreamSource {
+    #[must_use]
+    pub fn new(router: Router, cascade: Cascade, slingshot: SlingshotClient, pds: PdsLister, cache: ReadCache) -> Self {
+        Self {
+            router,
+            cascade,
+            slingshot,
+            pds,
+            cache,
+        }
+    }
+
+    /// The DID's home network, and whether it is this AppView.
+    async fn home(&self, did: &str) -> (Option<String>, bool) {
+        let d = self.router.resolve_did(did).await;
+        let community = d.is_community();
+        (d.network_name, community)
+    }
+
+    /// Cascade call for a subject DID, skipped for the community network.
+    async fn cascade(&self, did: &str, call: Call<'_>) -> Option<Value> {
+        let (home, community) = self.home(did).await;
+        if community {
+            return None;
+        }
+        self.cascade.fetch(home.as_deref(), call).await.hit()
+    }
+
+    async fn handle_of(&self, did: &str) -> String {
+        self.router
+            .lookup()
+            .summary(did)
+            .await
+            .and_then(|s| s.handle)
+            .unwrap_or_else(|| INVALID_HANDLE.to_string())
+    }
+
+    /// One post through Slingshot, cached.
+    async fn slingshot_post(&self, uri: &str) -> Option<Value> {
+        let key = format!("rt:post:{uri}");
+        if let Some(v) = self.cache.get_json::<Value>(&key).await {
+            return Some(v);
+        }
+        let record = self.slingshot.get_record(uri).await.ok()?;
+        let handle = self.handle_of(uri_author(uri)?).await;
+        let view = post_from_record(uri, record.cid.as_deref(), &handle, &record.value);
+        self.cache.put_json(&key, &view).await;
+        Some(view)
+    }
+
+    /// Author-PDS feed items after the `P:` cursor (§7.1): posts and reposts
+    /// merged by rkey (TID order), filtered, at most `limit`.
+    async fn pds_feed(&self, did: &str, limit: u32, cursor: Option<&str>, filter: &str) -> Option<Value> {
+        let pds = self.router.lookup().summary(did).await?.pds?;
+        let order = self.pds.order(&pds, did).await?;
+        let (post_cursor, repost_cursor) = match cursor.and_then(|c| c.strip_prefix("P:")) {
+            Some(c) => {
+                let (p, r) = c.split_once(':').unwrap_or((c, ""));
+                (Some(p.to_string()).filter(|s| !s.is_empty()), Some(r.to_string()).filter(|s| !s.is_empty()))
+            }
+            None => (None, None),
+        };
+        let limit_usize = usize::try_from(limit).unwrap_or(50);
+        let (posts, reposts, paged) = match order {
+            ListOrder::Descending => {
+                let posts = self.pds.list(&pds, did, NSID_POST, limit, post_cursor.as_deref()).await?.records;
+                let reposts = self.pds.list(&pds, did, NSID_REPOST, limit, repost_cursor.as_deref()).await?.records;
+                (posts, reposts, true)
+            }
+            // An ascending PDS: only the first page, the newest `limit` of a
+            // bounded listing, and no cursor (§7.1).
+            ListOrder::Ascending if cursor.is_none() => {
+                let posts = self.newest_ascending(&pds, did, NSID_POST, limit_usize).await;
+                let reposts = self.newest_ascending(&pds, did, NSID_REPOST, limit_usize).await;
+                (posts, reposts, false)
+            }
+            ListOrder::Ascending => return Some(json!({"feed": []})),
+        };
+        let mut merged: Vec<(bool, ListedRecord)> =
+            posts.into_iter().map(|r| (false, r)).chain(reposts.into_iter().map(|r| (true, r))).collect();
+        merged.sort_by_key(|(_, r)| Reverse(r.rkey().to_string()));
+        let handle = self.handle_of(did).await;
+        let mut feed = Vec::new();
+        let (mut last_post, mut last_repost) = (post_cursor, repost_cursor);
+        for (is_repost, r) in merged.into_iter().take(limit_usize) {
+            if is_repost {
+                last_repost = Some(r.rkey().to_string());
+                let Some(subject) = r.value.pointer("/subject/uri").and_then(Value::as_str) else {
+                    continue;
+                };
+                if is_private_uri(subject) || filter == "posts_with_media" {
+                    continue;
+                }
+                if let Some(post) = self.posts(&[subject.to_string()]).await.into_iter().next() {
+                    feed.push(json!({
+                        "post": post,
+                        "reason": {"$type": "app.bsky.feed.defs#reasonRepost", "by": {"did": did, "handle": handle, "viewer": {}, "labels": []},
+                                   "indexedAt": r.value.get("createdAt").cloned().unwrap_or(Value::Null)},
+                    }));
+                }
+            } else {
+                last_post = Some(r.rkey().to_string());
+                let reply_root = r.value.pointer("/reply/root/uri").and_then(Value::as_str);
+                let keep = match filter {
+                    "posts_no_replies" => reply_root.is_none(),
+                    "posts_with_media" => r.value.pointer("/embed/$type").and_then(Value::as_str).is_some_and(|t| {
+                        matches!(t, "app.bsky.embed.images" | "app.bsky.embed.video" | "app.bsky.embed.recordWithMedia")
+                    }),
+                    "posts_and_author_threads" => reply_root.is_none_or(|u| uri_author(u) == Some(did)),
+                    _ => true,
+                };
+                if keep {
+                    feed.push(json!({"post": post_from_record(&r.uri, Some(&r.cid), &handle, &r.value)}));
+                }
+            }
+        }
+        let mut out = json!({ "feed": feed });
+        if paged && (last_post.is_some() || last_repost.is_some()) && !out["feed"].as_array().is_some_and(Vec::is_empty) {
+            out["cursor"] = json!(format!("P:{}:{}", last_post.unwrap_or_default(), last_repost.unwrap_or_default()));
+        }
+        Some(out)
+    }
+
+    /// The newest `n` records of an ascending listing, paging at most
+    /// [`ASCENDING_MAX_PAGES`].
+    async fn newest_ascending(&self, pds: &str, did: &str, collection: &str, n: usize) -> Vec<ListedRecord> {
+        let mut all: Vec<ListedRecord> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..ASCENDING_MAX_PAGES {
+            let Some(page) = self.pds.list(pds, did, collection, PDS_PAGE, cursor.as_deref()).await else {
+                break;
+            };
+            let done = page.cursor.is_none() || page.records.is_empty();
+            all.extend(page.records);
+            if done {
+                break;
+            }
+            cursor = page.cursor;
+        }
+        all.sort_by_key(|r| Reverse(r.rkey().to_string()));
+        all.truncate(n);
+        all
+    }
+}
+
+#[async_trait]
+impl UpstreamSource for RealUpstreamSource {
+    async fn profile(&self, actor: &str) -> Option<Value> {
+        let key = format!("rt:profile:{actor}");
+        if let Some(v) = self.cache.get_json::<Value>(&key).await {
+            return Some(v);
+        }
+        let view = match self.cascade(actor, Call::Profile(actor)).await {
+            Some(v) => v,
+            None => {
+                // Slingshot profile record (§7.1).
+                let record = self.slingshot.get_record(&format!("at://{actor}/{NSID_PROFILE}/self")).await.ok()?;
+                let summary = self.router.lookup().summary(actor).await.unwrap_or_default();
+                let handle = summary.handle.unwrap_or_else(|| INVALID_HANDLE.to_string());
+                profile_from_record(actor, &handle, summary.pds.as_deref(), &record.value)
+            }
+        };
+        self.cache.put_json(&key, &view).await;
+        Some(view)
+    }
+
+    async fn posts(&self, uris: &[String]) -> Vec<Value> {
+        let mut found: HashMap<String, Value> = HashMap::new();
+        let mut by_author: HashMap<String, Vec<String>> = HashMap::new();
+        for uri in uris.iter().filter(|u| !is_private_uri(u)) {
+            if let Some(v) = self.cache.get_json::<Value>(&format!("rt:post:{uri}")).await {
+                found.insert(uri.clone(), v);
+            } else if let Some(a) = uri_author(uri) {
+                by_author.entry(a.to_string()).or_default().push(uri.clone());
+            }
+        }
+        for (author, group) in &by_author {
+            if let Some(body) = self.cascade(author, Call::Posts(group)).await {
+                for post in body.get("posts").and_then(Value::as_array).into_iter().flatten() {
+                    if let Some(uri) = post.get("uri").and_then(Value::as_str).filter(|u| group.iter().any(|g| g == u)) {
+                        self.cache.put_json(&format!("rt:post:{uri}"), post).await;
+                        found.insert(uri.to_string(), post.clone());
+                    }
+                }
+            }
+        }
+        let missing: Vec<String> = by_author.into_values().flatten().filter(|u| !found.contains_key(u)).collect();
+        let fetched: Vec<(String, Option<Value>)> = futures::stream::iter(missing)
+            .map(|uri| async move {
+                let v = self.slingshot_post(&uri).await;
+                (uri, v)
+            })
+            .buffer_unordered(SLINGSHOT_CONCURRENCY)
+            .collect()
+            .await;
+        for (uri, v) in fetched {
+            if let Some(v) = v {
+                found.insert(uri, v);
+            }
+        }
+        uris.iter().filter_map(|u| found.remove(u)).collect()
+    }
+
+    async fn post_thread(&self, uri: &str, depth: u32, parent_height: u32) -> Option<Value> {
+        if is_private_uri(uri) {
+            return None;
+        }
+        let author = uri_author(uri)?;
+        if let Some(v) = self.cascade(author, Call::PostThread { uri, depth, parent_height }).await {
+            return Some(v);
+        }
+        // Slingshot: the anchor and its parent chain (§7.1).
+        let anchor = self.slingshot_post(uri).await?;
+        let mut chain: Vec<Value> = Vec::new();
+        let mut next = anchor.pointer("/record/reply/parent/uri").and_then(Value::as_str).map(str::to_string);
+        while let Some(p) = next.take() {
+            if chain.len() >= usize::try_from(parent_height).unwrap_or(0) {
+                break;
+            }
+            if is_private_uri(&p) {
+                chain.push(json!({"$type": "app.bsky.feed.defs#notFoundPost", "uri": p, "notFound": true}));
+                break;
+            }
+            match self.slingshot_post(&p).await {
+                Some(post) => {
+                    next = post.pointer("/record/reply/parent/uri").and_then(Value::as_str).map(str::to_string);
+                    chain.push(json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": post}));
+                }
+                None => {
+                    chain.push(json!({"$type": "app.bsky.feed.defs#notFoundPost", "uri": p, "notFound": true}));
+                    break;
+                }
+            }
+        }
+        let mut parent: Option<Value> = None;
+        for mut node in chain.into_iter().rev() {
+            if let Some(p) = parent.take() {
+                node["parent"] = p;
+            }
+            parent = Some(node);
+        }
+        let mut thread = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": anchor, "replies": []});
+        if let Some(p) = parent {
+            thread["parent"] = p;
+        }
+        Some(json!({ "thread": thread }))
+    }
+
+    async fn author_feed(&self, actor: &str, limit: u32, cursor: Option<&str>, filter: &str) -> Option<Value> {
+        // A `P:` cursor continues from the author PDS; upstream cursors are
+        // opaque and go back to the cascade.
+        if !cursor.is_some_and(|c| c.starts_with("P:"))
+            && let Some(v) = self.cascade(actor, Call::AuthorFeed { actor, limit, cursor, filter }).await
+        {
+            return Some(v);
+        }
+        self.pds_feed(actor, limit, cursor, filter).await
+    }
+
+    async fn follows(&self, actor: &str, limit: u32, cursor: Option<&str>) -> Option<Value> {
+        if !cursor.is_some_and(|c| c.starts_with("P:"))
+            && let Some(v) = self.cascade(actor, Call::Follows { actor, limit, cursor }).await
+        {
+            return Some(v);
+        }
+        // The author PDS `listRecords app.bsky.graph.follow` (§7.1).
+        let pds = self.router.lookup().summary(actor).await?.pds?;
+        let page = self
+            .pds
+            .list(&pds, actor, NSID_FOLLOW, limit, cursor.and_then(|c| c.strip_prefix("P:")))
+            .await?;
+        let subjects: Vec<String> = page
+            .records
+            .iter()
+            .filter_map(|r| r.value.get("subject").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let follows: Vec<Value> = futures::stream::iter(subjects)
+            .map(|did| async move {
+                let handle = self.handle_of(&did).await;
+                json!({"did": did, "handle": handle, "viewer": {}, "labels": []})
+            })
+            .buffered(SLINGSHOT_CONCURRENCY)
+            .collect()
+            .await;
+        let handle = self.handle_of(actor).await;
+        let mut out = json!({"subject": {"did": actor, "handle": handle, "viewer": {}, "labels": []}, "follows": follows});
+        if let Some(c) = page.cursor {
+            out["cursor"] = json!(format!("P:{c}"));
+        }
+        Some(out)
+    }
+
+    async fn resolve_handle(&self, handle: &str) -> Option<String> {
+        self.router.lookup().did_for_handle(handle).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Router as AxumRouter;
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+
+    use super::*;
+    use crate::constellation::cascade::tests::{cascade_for, fake_appview};
+    use crate::constellation::routing::tests::{StubLookup, table_with_community};
+    use crate::constellation::{DidLookup, Router as DidRouter};
+    use crate::sync::BudgetRates;
+    use crate::test_support::serve_fake;
+
+    const OUTSIDER: &str = "did:plc:oooooooooooooooooooooooo";
+
+    fn budgets() -> HostBudgets {
+        HostBudgets::new(BudgetRates {
+            max_probe_per_host: 25.0,
+            head_max_age_secs: 60.0,
+            read_fetch_per_host: 10.0,
+            backfill_per_host: 5.0,
+        })
+    }
+
+    async fn fake_slingshot() -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = AxumRouter::new()
+            .route(
+                "/xrpc/com.atproto.repo.getRecord",
+                get(|State(calls): State<Arc<AtomicUsize>>, Query(q): Query<HashMap<String, String>>| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let uri = format!("at://{}/{}/{}", q["repo"], q["collection"], q["rkey"]);
+                    if q["rkey"] == "gone" {
+                        return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "RecordNotFound"}))).into_response();
+                    }
+                    let value = if q["collection"] == NSID_PROFILE {
+                        json!({"$type": NSID_PROFILE, "displayName": "Outsider"})
+                    } else {
+                        json!({"$type": NSID_POST, "text": format!("from slingshot {}", q["rkey"]), "createdAt": "2026-09-26T00:00:00Z"})
+                    };
+                    axum::Json(json!({"uri": uri, "cid": "bafyslingshot", "value": value})).into_response()
+                }),
+            )
+            .with_state(Arc::clone(&calls));
+        (serve_fake(router).await, calls)
+    }
+
+    fn source(cascade: Cascade, slingshot: &str) -> RealUpstreamSource {
+        let lookup = Arc::new(StubLookup::default());
+        lookup.pds.lock().expect("lock").insert(OUTSIDER.into(), "https://pds.unknown.example".into());
+        let router = DidRouter::new(Arc::new(table_with_community(&[])), lookup as Arc<dyn DidLookup>);
+        let net = NetClient::loopback_for_tests();
+        RealUpstreamSource::new(
+            router,
+            cascade,
+            SlingshotClient::new(net.clone(), slingshot),
+            PdsLister::new(net, budgets()),
+            ReadCache::new(1024 * 1024),
+        )
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_profile_comes_from_the_cascade() {
+        let (appview, calls) = fake_appview(StatusCode::OK, json!({"did": OUTSIDER, "handle": "outsider.example", "displayName": "From AppView"})).await;
+        let (missing, _) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound"})).await;
+        let (slingshot, slingshot_calls) = fake_slingshot().await;
+        let up = source(cascade_for(&[("bluesky", &missing), ("community-a", &appview)]), &slingshot);
+        let v = up.profile(OUTSIDER).await.expect("profile");
+        assert_eq!(v["displayName"], "From AppView");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(slingshot_calls.load(Ordering::SeqCst), 0);
+        // Cached for the next request.
+        assert_eq!(up.profile(OUTSIDER).await.expect("cached")["displayName"], "From AppView");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_post_falls_back_to_slingshot_when_the_cascade_misses() {
+        let (missing, cascade_calls) = fake_appview(StatusCode::OK, json!({"posts": []})).await;
+        let (slingshot, slingshot_calls) = fake_slingshot().await;
+        let up = source(cascade_for(&[("bluesky", &missing), ("community-a", &missing)]), &slingshot);
+        let uris = vec![
+            format!("at://{OUTSIDER}/{NSID_POST}/3kaaa"),
+            format!("at://{OUTSIDER}/{NSID_POST}/gone"),
+            format!("at://{OUTSIDER}/tools.kryphocron.feed.postPrivate/3kaaa"),
+        ];
+        let posts = up.posts(&uris).await;
+        assert_eq!(posts.len(), 1, "gone is a miss; private URIs never go upstream");
+        assert_eq!(posts[0]["uri"], uris[0]);
+        assert_eq!(posts[0]["record"]["text"], "from slingshot 3kaaa");
+        assert_eq!(posts[0]["cid"], "bafyslingshot");
+        assert_eq!(posts[0]["author"]["did"], OUTSIDER);
+        // Both cascade networks were asked (an empty `posts` is a hit with
+        // nothing in it), then Slingshot per missing URI.
+        assert!(cascade_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(slingshot_calls.load(Ordering::SeqCst), 2);
+
+        // The profile falls back to the Slingshot profile record too.
+        let (notfound, _) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound"})).await;
+        let up = source(cascade_for(&[("bluesky", &notfound), ("community-a", &notfound)]), &slingshot);
+        let profile = up.profile(OUTSIDER).await.expect("profile");
+        assert_eq!((profile["displayName"].as_str(), profile["handle"].as_str()), (Some("Outsider"), Some("oooo.test")));
+        // A thread falls back to the anchor from Slingshot.
+        let thread = up.post_thread(&uris[0], 6, 20).await.expect("thread");
+        assert_eq!(thread["thread"]["post"]["record"]["text"], "from slingshot 3kaaa");
     }
 }

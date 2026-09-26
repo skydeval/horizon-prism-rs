@@ -15,7 +15,7 @@ use super::feed::PostContext;
 use super::normalize::is_private_uri;
 use super::{CountMode, Hydrator, ViewError, ViewResult, Viewer};
 use crate::db::locks::uri_author;
-use crate::moderation::Gate;
+use crate::moderation::{self, Gate};
 
 /// Total nodes in one thread response (§7.1).
 pub const MAX_NODES: usize = 200;
@@ -99,9 +99,10 @@ impl Hydrator {
         let Some(anchor_row) = anchor.get(uri) else {
             let author = uri_author(uri).unwrap_or_default().to_string();
             if !self.in_scope(&author).await
+                && !moderation::gate(self.pool(), uri).await?.is_hidden()
                 && let Some(v) = self.upstream().post_thread(uri, depth, parent_height).await
             {
-                return Ok(Ok(Self::emit(v)));
+                return Ok(Ok(Self::emit(self.normalized(viewer, v).await?.0)));
             }
             return Ok(Err(not_found()));
         };
