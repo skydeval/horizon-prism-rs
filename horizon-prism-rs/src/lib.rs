@@ -10,3 +10,6 @@ pub mod firehose;
 pub mod identity;
 pub mod net;
 pub mod private_tier;
+
+#[cfg(test)]
+pub(crate) mod test_support;

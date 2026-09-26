@@ -1,0 +1,183 @@
+//! Record classification (design-v2 §5.4).
+//!
+//! 1. `kryphocron_lexicons::Tier::from_nsid` answers for the closed
+//!    `tools.kryphocron.*` registry: `Kryphocron(tier)`.
+//! 2. `NotRegistered` is not an error; classification falls through.
+//! 3. The v1 ecosystem NSIDs map to `Ecosystem(kind)`.
+//! 4. Everything else is `Unindexed`.
+//!
+//! The routing on [`RecordClass`] is a `match` with no default arm, so a
+//! private-tier op can only reach `private_tier` and an ecosystem op can only
+//! reach public tables.
+
+use kryphocron_lexicons::Tier;
+
+use crate::aggregations::RecordKind;
+
+pub const NSID_POST: &str = "app.bsky.feed.post";
+pub const NSID_LIKE: &str = "app.bsky.feed.like";
+pub const NSID_REPOST: &str = "app.bsky.feed.repost";
+pub const NSID_FOLLOW: &str = "app.bsky.graph.follow";
+pub const NSID_BLOCK: &str = "app.bsky.graph.block";
+pub const NSID_PROFILE: &str = "app.bsky.actor.profile";
+pub const NSID_POST_PRIVATE: &str = "tools.kryphocron.feed.postPrivate";
+pub const NSID_AUDIENCE: &str = "tools.kryphocron.policy.audience";
+pub const NSID_PRIVATE_BLOCK: &str = "tools.kryphocron.graph.block";
+
+/// Ecosystem record kinds indexed in v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EcosystemKind {
+    Post,
+    Like,
+    Repost,
+    Follow,
+    Block,
+    /// `app.bsky.actor.profile`, rkey `self` only.
+    Profile,
+}
+
+/// Kryphocron records Aurora-Locus produces (§5.4 table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KryphocronKind {
+    PostPrivate,
+    Audience,
+    PrivateBlock,
+}
+
+/// The classification of one op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordClass {
+    /// A registered `tools.kryphocron.*` NSID. `kind` is `None` for registry
+    /// NSIDs with no producer (skipped as `kryphocron_unproduced`).
+    Kryphocron { tier: Tier, kind: Option<KryphocronKind> },
+    Ecosystem(EcosystemKind),
+    Unindexed,
+}
+
+impl RecordClass {
+    /// The admission kind of a class that is written, if any.
+    #[must_use]
+    pub fn record_kind(self) -> Option<RecordKind> {
+        match self {
+            Self::Ecosystem(k) => Some(match k {
+                EcosystemKind::Post => RecordKind::Post,
+                EcosystemKind::Like => RecordKind::Like,
+                EcosystemKind::Repost => RecordKind::Repost,
+                EcosystemKind::Follow => RecordKind::Follow,
+                EcosystemKind::Block => RecordKind::Block,
+                EcosystemKind::Profile => RecordKind::Profile,
+            }),
+            Self::Kryphocron {
+                tier: Tier::Private,
+                kind: Some(k),
+            } => Some(match k {
+                KryphocronKind::PostPrivate => RecordKind::PrivatePost,
+                KryphocronKind::Audience => RecordKind::PrivateAudience,
+                KryphocronKind::PrivateBlock => RecordKind::PrivateBlock,
+            }),
+            Self::Kryphocron { .. } | Self::Unindexed => None,
+        }
+    }
+}
+
+/// Classify a collection NSID (and, for profiles, the rkey).
+#[must_use]
+pub fn classify(nsid: &str, rkey: &str) -> RecordClass {
+    if let Ok(parsed) = kryphocron_lexicons::Nsid::new(nsid)
+        && let Ok(tier) = Tier::from_nsid(&parsed)
+    {
+        let kind = match (tier, nsid) {
+            (Tier::Private, NSID_POST_PRIVATE) => Some(KryphocronKind::PostPrivate),
+            (Tier::Private, NSID_AUDIENCE) => Some(KryphocronKind::Audience),
+            (Tier::Private, NSID_PRIVATE_BLOCK) => Some(KryphocronKind::PrivateBlock),
+            _ => None,
+        };
+        return RecordClass::Kryphocron { tier, kind };
+    }
+    match nsid {
+        NSID_POST => RecordClass::Ecosystem(EcosystemKind::Post),
+        NSID_LIKE => RecordClass::Ecosystem(EcosystemKind::Like),
+        NSID_REPOST => RecordClass::Ecosystem(EcosystemKind::Repost),
+        NSID_FOLLOW => RecordClass::Ecosystem(EcosystemKind::Follow),
+        NSID_BLOCK => RecordClass::Ecosystem(EcosystemKind::Block),
+        NSID_PROFILE if rkey == "self" => RecordClass::Ecosystem(EcosystemKind::Profile),
+        _ => RecordClass::Unindexed,
+    }
+}
+
+/// `firehose_ops_skipped_total{reason}` label for a class that is not written.
+#[must_use]
+pub fn skip_reason(class: RecordClass) -> Option<&'static str> {
+    match class {
+        RecordClass::Unindexed => Some("unindexed"),
+        RecordClass::Kryphocron { kind: None, .. }
+        | RecordClass::Kryphocron {
+            tier: Tier::Public, ..
+        } => Some("kryphocron_unproduced"),
+        RecordClass::Kryphocron { .. } | RecordClass::Ecosystem(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ecosystem_nsids() {
+        assert_eq!(classify(NSID_POST, "3k"), RecordClass::Ecosystem(EcosystemKind::Post));
+        assert_eq!(classify(NSID_LIKE, "3k"), RecordClass::Ecosystem(EcosystemKind::Like));
+        assert_eq!(classify(NSID_REPOST, "3k"), RecordClass::Ecosystem(EcosystemKind::Repost));
+        assert_eq!(classify(NSID_FOLLOW, "3k"), RecordClass::Ecosystem(EcosystemKind::Follow));
+        assert_eq!(classify(NSID_BLOCK, "3k"), RecordClass::Ecosystem(EcosystemKind::Block));
+        assert_eq!(classify(NSID_PROFILE, "self"), RecordClass::Ecosystem(EcosystemKind::Profile));
+    }
+
+    #[test]
+    fn profile_other_rkeys_and_other_nsids_are_unindexed() {
+        assert_eq!(classify(NSID_PROFILE, "3k"), RecordClass::Unindexed);
+        assert_eq!(classify("app.bsky.graph.list", "3k"), RecordClass::Unindexed);
+        assert_eq!(classify("not an nsid", "3k"), RecordClass::Unindexed);
+        assert_eq!(skip_reason(RecordClass::Unindexed), Some("unindexed"));
+    }
+
+    #[test]
+    fn produced_kryphocron_nsids_are_private() {
+        for (nsid, kind, rk) in [
+            (NSID_POST_PRIVATE, KryphocronKind::PostPrivate, RecordKind::PrivatePost),
+            (NSID_AUDIENCE, KryphocronKind::Audience, RecordKind::PrivateAudience),
+            (NSID_PRIVATE_BLOCK, KryphocronKind::PrivateBlock, RecordKind::PrivateBlock),
+        ] {
+            let c = classify(nsid, "3k");
+            assert_eq!(
+                c,
+                RecordClass::Kryphocron {
+                    tier: Tier::Private,
+                    kind: Some(kind)
+                }
+            );
+            assert_eq!(c.record_kind(), Some(rk));
+            assert_eq!(skip_reason(c), None);
+        }
+    }
+
+    #[test]
+    fn unproduced_kryphocron_nsids_are_skipped() {
+        for nsid in [
+            "tools.kryphocron.feed.postPublic",
+            "tools.kryphocron.feed.like",
+            "tools.kryphocron.feed.repost",
+            "tools.kryphocron.feed.threadgate",
+            "tools.kryphocron.graph.mute",
+        ] {
+            let c = classify(nsid, "3k");
+            assert!(matches!(c, RecordClass::Kryphocron { .. }), "{nsid}");
+            assert_eq!(c.record_kind(), None, "{nsid}");
+            assert_eq!(skip_reason(c), Some("kryphocron_unproduced"), "{nsid}");
+        }
+    }
+
+    #[test]
+    fn unregistered_kryphocron_namespace_falls_through() {
+        assert_eq!(classify("tools.kryphocron.feed.unknownThing", "3k"), RecordClass::Unindexed);
+    }
+}
