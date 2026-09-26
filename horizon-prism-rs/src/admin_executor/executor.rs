@@ -223,6 +223,15 @@ mod tests {
     }
 
     async fn setup(name: &str, sets: ScopeSets) -> Option<(TestDb, AdminExecutor, ScopeState)> {
+        setup_with(name, sets, Arc::new(DisabledPrivateTier), Arc::new(NoNetwork)).await
+    }
+
+    async fn setup_with(
+        name: &str,
+        sets: ScopeSets,
+        private: Arc<dyn PrivateTier>,
+        source: Arc<dyn BackfillSource>,
+    ) -> Option<(TestDb, AdminExecutor, ScopeState)> {
         let Ok(redis_url) = std::env::var("HPRS_TEST_REDIS_URL") else {
             eprintln!("HPRS_TEST_REDIS_URL unset; skipping executor test");
             return None;
@@ -232,7 +241,6 @@ mod tests {
             .await
             .expect("redis");
         let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000);
-        let private: Arc<dyn PrivateTier> = Arc::new(DisabledPrivateTier);
         let handlers = Handlers {
             pool: db.pool.clone(),
             scope: scope.clone(),
@@ -241,11 +249,104 @@ mod tests {
             purger: Purger::new(db.pool.clone(), scope.clone(), Arc::clone(&private)),
             rebuild: Rebuild::new(db.pool.clone(), scope.clone(), Arc::clone(&private), 7),
             redis,
-            source: Arc::new(NoNetwork),
+            source,
             dead_letter_stream: format!("test:dl:{}", rand::random::<u32>()),
             deterministic_attempts: 5,
+            community_patterns: Arc::new(vec!["*.community.example".to_string()]),
         };
         Some((db, AdminExecutor::new(handlers), scope))
+    }
+
+    /// A source whose `prepare` confirms a community PDS and records who
+    /// asked.
+    #[derive(Default)]
+    struct CommunityPds {
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl BackfillSource for CommunityPds {
+        async fn prepare(&self, did: &str) -> Result<String, crate::firehose::backfill::PrepareError> {
+            self.asked.lock().expect("lock").push(did.to_string());
+            Ok("https://pds1.community.example".into())
+        }
+        async fn latest_rev(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("unused".into())
+        }
+        async fn list_records(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<ListPage, String> {
+            Err("unused".into())
+        }
+        async fn get_record(&self, _: &str, _: &str, _: &str, _: &str) -> Result<Option<ListedRecord>, String> {
+            Err("unused".into())
+        }
+        async fn inbound_blocks(&self, _: &str, _: Option<&str>) -> Result<LinksPage, String> {
+            Err("unused".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn member_remove_reconfirms_only_stale_eligibility() {
+        let (stale, fresh) = (PURGING, OTHER);
+        let mut sets = ScopeSets::default();
+        for d in [stale, fresh] {
+            sets.members.insert(d.into());
+            sets.scope.insert(d.into());
+            sets.private_owners.insert(d.into());
+        }
+        let private: Arc<dyn PrivateTier> = Arc::new(crate::private_tier::KryphocronPrivateTier);
+        let source = Arc::new(CommunityPds::default());
+        let Some((db, exec, scope)) =
+            setup_with("admin_reconfirm", sets, Arc::clone(&private), Arc::clone(&source) as Arc<dyn BackfillSource>).await
+        else {
+            return;
+        };
+        let p = &db.pool;
+        for d in [stale, fresh] {
+            sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())")
+                .bind(d)
+                .execute(p)
+                .await
+                .expect("member");
+            let mut conn = p.acquire().await.expect("conn");
+            let nsid = crate::firehose::classifier::NSID_POST_PRIVATE;
+            private
+                .apply(
+                    &mut conn,
+                    &crate::private_tier::PrivateOp {
+                        uri: format!("at://{d}/{nsid}/3kpost222222"),
+                        author_did: d.into(),
+                        nsid: nsid.into(),
+                        rkey: "3kpost222222".into(),
+                        cid: "bafy".into(),
+                        rev: "3kaaaaaaaaaa2".into(),
+                        record: json!({"text": "t"}),
+                    },
+                )
+                .await
+                .expect("private row");
+        }
+        // `fresh` was confirmed an hour ago; `stale` never was.
+        {
+            let mut conn = p.acquire().await.expect("conn");
+            private.record_eligibility(&mut conn, fresh, true).await.expect("confirm");
+        }
+        for d in [stale, fresh] {
+            let id = submit(p, &AdminCommand::MemberRemove { did: d.into() }).await.expect("submit");
+            exec.drain().await.expect("drain");
+            match wait(p, id, Duration::from_secs(5), Duration::from_millis(10)).await.expect("wait") {
+                Finished::Done(result) => {
+                    let expected = if d == stale { "confirmed" } else { "fresh" };
+                    assert_eq!(result["eligibility"], expected, "{d}");
+                }
+                other => panic!("expected done, got {other:?}"),
+            }
+        }
+        assert_eq!(*source.asked.lock().expect("lock"), vec![stale.to_string()], "only the stale DID is re-confirmed");
+        let mut conn = p.acquire().await.expect("conn");
+        assert!(private.eligibility_confirmed_at(&mut conn, stale).await.expect("read").is_some());
+        drop(conn);
+        assert!(scope.read_guard().await.is_owner(stale), "an eligible owner stays an owner");
+        db.drop_db().await;
     }
 
     async fn state(pool: &PgPool, id: i64) -> String {

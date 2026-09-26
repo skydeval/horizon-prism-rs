@@ -271,6 +271,7 @@ pub async fn run() -> Result<(), StartupError> {
             source,
             dead_letter_stream: fh.dead_letter_stream.clone(),
             deterministic_attempts: fh.deterministic_attempts,
+            community_patterns: Arc::new(community_patterns.clone()),
         })
         .spawn(),
     );

@@ -27,6 +27,12 @@ commit.
   not found, inactive, no PDS, host outside the community patterns) remove
   it at once, and any answer resets the streak. Backfill `prepare` now
   returns a typed `PrepareError` (`Negative` / `Failed`).
+- **Item 7: `admin member remove` re-confirms eligibility.** For a private
+  owner whose community-PDS confirmation is missing or older than 24 h, the
+  command re-confirms with `getRepoStatus` before the `member_removed`
+  marker, so the purge end's owner re-evaluation sees fresh eligibility. The
+  outcome never blocks the removal and is reported in the command result
+  (`eligibility`).
 - **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
   owns every private table behind a `pub(crate)` facade: defensive
   `postPrivate` / audience parsing with dead-lettering of malformed records

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use redis::aio::ConnectionManager;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -18,6 +19,7 @@ use crate::firehose::backfill::BackfillSource;
 use crate::firehose::gap::{self, GapCause};
 use crate::firehose::jobs::{self, Depth};
 use crate::firehose::writer::{Action, ApplyOptions, OpOutcome, RawOp, Writer};
+use crate::identity::eligibility::{self, Confirmation};
 use crate::private_tier::PrivateTier;
 
 /// Label values accepted by `label add` (§7.8). Anything else is rejected.
@@ -163,6 +165,8 @@ pub struct Handlers {
     pub source: Arc<dyn BackfillSource>,
     pub dead_letter_stream: String,
     pub deterministic_attempts: u32,
+    /// The `community` network's `pds_patterns` (owner eligibility, §6.11.1).
+    pub community_patterns: Arc<Vec<String>>,
 }
 
 impl Handlers {
@@ -217,6 +221,11 @@ impl Handlers {
 
     /// `member remove`: the `member_removed` marker step runs here (write
     /// guard); the batched deletion and purge end run in the background.
+    ///
+    /// A private owner's community-PDS eligibility decides whether it stays
+    /// an owner once membership is gone (§6.11.1), so a confirmation older
+    /// than 24 h (or none) is refreshed first. The network call runs before
+    /// any guard, and its outcome never blocks the removal.
     async fn member_remove(&self, did: &str) -> Result<Outcome, String> {
         let is_member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM members WHERE did = $1)")
             .bind(did)
@@ -226,6 +235,7 @@ impl Handlers {
         if !is_member {
             return Ok(Outcome::Failed(format!("{did} is not a member")));
         }
+        let reconfirmed = self.reconfirm_if_stale(did).await;
         match self.purger.marker(did, PurgeKind::MemberRemoved).await {
             Ok(()) => {}
             Err(crate::aggregations::purge::PurgeError::Busy(_)) => return Ok(Outcome::Defer),
@@ -243,7 +253,41 @@ impl Handlers {
                 tracing::error!(event = "member_remove_purge_failed", did = %did_owned, %error, "member_removed purge failed; it resumes at the next startup");
             }
         });
-        Ok(Outcome::Done(json!({ "did": did, "status": "removed", "purge": "member_removed" })))
+        Ok(Outcome::Done(json!({ "did": did, "status": "removed", "purge": "member_removed", "eligibility": reconfirmed })))
+    }
+
+    /// Re-confirm a private owner's eligibility when the last confirmation
+    /// is missing or stale. Returns what happened, for the command result.
+    async fn reconfirm_if_stale(&self, did: &str) -> &'static str {
+        if !self.scope.read_guard().await.is_owner(did) {
+            return "not_owner";
+        }
+        let confirmed_at = match self.pool.acquire().await {
+            Ok(mut conn) => self.private.eligibility_confirmed_at(&mut conn, did).await,
+            Err(e) => Err(e),
+        };
+        let confirmed_at = match confirmed_at {
+            Ok(t) => t,
+            Err(error) => {
+                tracing::warn!(event = "member_remove_eligibility_read_failed", did, %error, "eligibility not re-confirmed");
+                return "unchecked";
+            }
+        };
+        if !eligibility::is_stale(confirmed_at, Utc::now()) {
+            return "fresh";
+        }
+        let confirmation = eligibility::confirm(self.source.as_ref(), &self.community_patterns, did).await;
+        let label = match &confirmation {
+            Confirmation::Eligible => "confirmed",
+            Confirmation::Ineligible(_) => "ineligible",
+            Confirmation::Failed(_) => "failed",
+        };
+        if let Err(error) = eligibility::apply(&self.pool, &self.scope, &self.private, did, &confirmation).await {
+            tracing::warn!(event = "member_remove_eligibility_write_failed", did, %error, "eligibility re-confirmation not recorded");
+            return "unchecked";
+        }
+        tracing::info!(event = "member_remove_eligibility_reconfirmed", did, outcome = label, "stale eligibility re-confirmed before removal");
+        label
     }
 
     async fn label_add(&self, subject: &str, val: &str) -> Result<Outcome, String> {
