@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use super::actor::{ProfileContext, ProfileKind};
 use super::normalize::is_private_uri;
-use super::{CountMode, Hydrator, PostRow, ViewError, ViewResult, Viewer, blob_url, ts};
+use super::{CountMode, Hydrator, PostRow, PublicEmit, ViewError, ViewResult, Viewer, blob_url, ts};
 use crate::aggregations::counts::Counts;
 use crate::db::locks::uri_author;
 use crate::firehose::normalize::blob_cid;
@@ -297,6 +297,21 @@ impl Hydrator {
             counts,
             gates,
         })
+    }
+
+    /// One public `postView`, for a private thread's `publicParent`
+    /// (§7.2): local and not hidden, else `None`.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn public_post_view(&self, viewer: &Viewer, uri: &str) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
+        if is_private_uri(uri) {
+            return Ok(None);
+        }
+        let wanted = [uri.to_string()];
+        let ctx = self.post_context(viewer, &wanted, CountMode::List).await?;
+        Ok(ctx.post_view(uri).map(PublicEmit::new))
     }
 
     /// `app.bsky.feed.getPosts` (≤ 25): private-tier, hidden and unknown

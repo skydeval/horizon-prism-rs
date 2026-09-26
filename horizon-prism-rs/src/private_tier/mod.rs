@@ -1,16 +1,48 @@
-//! The private tier's `pub(crate)` surface as seen by the rest of the crate
-//! (design-v2 §3.2).
+//! The private tier (design-v2 §3.2, §4.5, §6.3, §6.4, §7.2, §7.9): the only
+//! module that touches the private tables or decodes private content.
 //!
-//! Only `private_tier` touches the private tables (§4.2). Everything else
-//! (the firehose writer, backfill, the gap transaction, purges, readiness)
-//! calls through [`PrivateTier`]. Item 6 provides the concrete
-//! implementation; until then [`DisabledPrivateTier`] is wired in: it admits
-//! nothing into the private tables and reports no private owners, so private
-//! reads keep failing closed.
+//! - Internals (`schema`, `oracle`, `pipeline`, `emit`) are private to this
+//!   module; their items are `pub(super)`, so nothing outside `private_tier`
+//!   can name a private-table query, a `RecordAuthz` or a `PrivateEmit`.
+//! - The `pub(crate)` surface is `ingest`, `readiness`, `owners`, `handlers`
+//!   and `retention`. The rest of the crate reaches ingest, readiness, owner
+//!   and purge operations through the [`PrivateTier`] facade, whose concrete
+//!   implementation is [`KryphocronPrivateTier`].
+//! - Content-returning queries take `&RecordAuthz` only (no URI parameter),
+//!   and a private row reaches a response only as a `PrivateEmit` built from
+//!   the same witness.
+//!
+//! Sealed: outside this module, neither the content queries nor the
+//! witness nor the emit types can be named.
+//!
+//! ```compile_fail
+//! use horizon_prism_rs::private_tier::schema::encoded;
+//! ```
+//!
+//! ```compile_fail
+//! use horizon_prism_rs::private_tier::pipeline::RecordAuthz;
+//! ```
+//!
+//! ```compile_fail
+//! use horizon_prism_rs::private_tier::emit::PrivateEmit;
+//! ```
+
+mod emit;
+pub(crate) mod handlers;
+pub(crate) mod ingest;
+mod oracle;
+pub(crate) mod owners;
+mod pipeline;
+pub(crate) mod readiness;
+pub(crate) mod retention;
+mod schema;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashSet;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
 /// A private-tier record op that passed admission (§9.3).
@@ -34,22 +66,34 @@ pub struct PrivateOp {
 pub struct Applied {
     /// A row was inserted, updated or deleted.
     pub changed: bool,
-    /// DIDs that became private owners in this transaction (§6.11.1). The
-    /// caller adds them to the in-memory owner set after commit.
+    /// DIDs that are private owners after this transaction (§6.11.1). The
+    /// caller adds them to the in-memory owner set after commit (idempotent).
     pub owners_joined: Vec<String>,
-    /// DIDs that stopped being private owners in this transaction.
+    /// DIDs that are not private owners after this transaction.
     pub owners_left: Vec<String>,
+}
+
+/// An ingest failure.
+#[derive(Debug, thiserror::Error)]
+pub enum IngestError {
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+    /// A field Aurora-Locus did not validate on write is malformed (#235).
+    /// Deterministic: the op is dead-lettered by the firehose discipline.
+    #[error("malformed private record: {0}")]
+    Malformed(String),
 }
 
 /// The private tier as the rest of the crate may use it.
 #[async_trait]
 pub trait PrivateTier: Send + Sync {
-    /// The private-owner set for `ScopeState` (§9.3 rule 3). DIDs only.
+    /// `owners::load`: the private-owner set for `ScopeState` (§9.3 rule 3).
+    /// DIDs only.
     async fn load_owners(&self, pool: &PgPool) -> Result<HashSet<String>, sqlx::Error>;
 
     /// `ingest::apply`: LWW create/update of an admitted private record, with
     /// owner re-evaluation and `private` job enqueue (§5.5, §6.11.1).
-    async fn apply(&self, conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, sqlx::Error>;
+    async fn apply(&self, conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError>;
 
     /// `ingest::delete`: LWW delete (§5.5). `author_in_scope` feeds the
     /// tombstone rule.
@@ -67,7 +111,7 @@ pub trait PrivateTier: Send + Sync {
     /// Clear one DID's owner readiness (dead letter, divergence, purge marker).
     async fn clear_owner_readiness(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error>;
 
-    /// `readiness::mark_owner_ready` (§5.10).
+    /// `readiness::mark_owner_ready` (§5.10). A no-op for a non-owner.
     async fn mark_owner_ready(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error>;
 
     /// URIs of `did`'s local rows in `nsid` with `rev < below_rev`: the
@@ -89,7 +133,7 @@ pub trait PrivateTier: Send + Sync {
     async fn purge_out_of_scope_batch(&self, conn: &mut PgConnection, did: &str, limit: i64)
     -> Result<u64, sqlx::Error>;
 
-    /// The private part of a `member_removed` purge: class-M private replies
+    /// The private part of a `member_removed` purge: class-M private rows
     /// admitted only because `did` was a member (§6.11.7), at most `limit`.
     async fn purge_member_removed_batch(
         &self,
@@ -98,15 +142,109 @@ pub trait PrivateTier: Send + Sync {
         limit: i64,
     ) -> Result<u64, sqlx::Error>;
 
-    /// `owners::reevaluate` (§6.11.1), used at purge end.
+    /// `owners::reevaluate` (§6.11.1).
     async fn reevaluate_owner(&self, conn: &mut PgConnection, did: &str) -> Result<Applied, sqlx::Error>;
+
+    /// Record an eligibility confirmation (`confirmed`) or its failure, which
+    /// removes eligibility (§6.11.1).
+    async fn record_eligibility(&self, conn: &mut PgConnection, did: &str, confirmed: bool) -> Result<(), sqlx::Error>;
+
+    /// When the DID's community-PDS eligibility was last confirmed.
+    async fn eligibility_confirmed_at(&self, conn: &mut PgConnection, did: &str)
+    -> Result<Option<DateTime<Utc>>, sqlx::Error>;
 }
 
-/// Pre-item-6 wiring: private-tier ops are skipped and counted.
+/// The private tier.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KryphocronPrivateTier;
+
+#[async_trait]
+impl PrivateTier for KryphocronPrivateTier {
+    async fn load_owners(&self, pool: &PgPool) -> Result<HashSet<String>, sqlx::Error> {
+        owners::load(pool).await
+    }
+
+    async fn apply(&self, conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError> {
+        ingest::apply(conn, op).await
+    }
+
+    async fn delete(
+        &self,
+        conn: &mut PgConnection,
+        uri: &str,
+        rev: &str,
+        author_in_scope: bool,
+    ) -> Result<Applied, sqlx::Error> {
+        ingest::delete(conn, uri, rev, author_in_scope).await
+    }
+
+    async fn clear_all_readiness(&self, conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+        readiness::clear_all(conn).await
+    }
+
+    async fn clear_owner_readiness(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+        readiness::clear_owner(conn, did).await
+    }
+
+    async fn mark_owner_ready(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+        readiness::mark_owner_ready(conn, did).await
+    }
+
+    async fn local_uris(
+        &self,
+        conn: &mut PgConnection,
+        did: &str,
+        nsid: &str,
+        below_rev: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        ingest::local_uris(conn, did, nsid, below_rev).await
+    }
+
+    async fn purge_did_batch(&self, conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
+        ingest::purge_did(conn, did, limit).await
+    }
+
+    async fn purge_out_of_scope_batch(
+        &self,
+        conn: &mut PgConnection,
+        did: &str,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        ingest::purge_out_of_scope(conn, did, limit).await
+    }
+
+    async fn purge_member_removed_batch(
+        &self,
+        conn: &mut PgConnection,
+        did: &str,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        ingest::purge_member_removed(conn, did, limit).await
+    }
+
+    async fn reevaluate_owner(&self, conn: &mut PgConnection, did: &str) -> Result<Applied, sqlx::Error> {
+        owners::reevaluate(conn, did).await
+    }
+
+    async fn record_eligibility(&self, conn: &mut PgConnection, did: &str, confirmed: bool) -> Result<(), sqlx::Error> {
+        owners::record_eligibility(conn, did, confirmed).await
+    }
+
+    async fn eligibility_confirmed_at(
+        &self,
+        conn: &mut PgConnection,
+        did: &str,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        owners::eligibility_confirmed_at(conn, did).await
+    }
+}
+
+/// A private tier that admits nothing and reports no owners (tests of other
+/// modules). Private-tier ops are skipped and counted.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DisabledPrivateTier;
 
-/// Metric: private-tier ops skipped because the private tier is not wired.
+/// Metric: private-tier ops skipped because the private tier is disabled.
 pub const METRIC_PRIVATE_SKIPPED: &str = "private_tier_ops_skipped_total";
 
 #[async_trait]
@@ -115,7 +253,7 @@ impl PrivateTier for DisabledPrivateTier {
         Ok(HashSet::new())
     }
 
-    async fn apply(&self, _conn: &mut PgConnection, _op: &PrivateOp) -> Result<Applied, sqlx::Error> {
+    async fn apply(&self, _conn: &mut PgConnection, _op: &PrivateOp) -> Result<Applied, IngestError> {
         metrics::counter!(METRIC_PRIVATE_SKIPPED, "op" => "apply").increment(1);
         Ok(Applied::default())
     }
@@ -177,5 +315,17 @@ impl PrivateTier for DisabledPrivateTier {
 
     async fn reevaluate_owner(&self, _conn: &mut PgConnection, _did: &str) -> Result<Applied, sqlx::Error> {
         Ok(Applied::default())
+    }
+
+    async fn record_eligibility(&self, _conn: &mut PgConnection, _did: &str, _confirmed: bool) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    async fn eligibility_confirmed_at(
+        &self,
+        _conn: &mut PgConnection,
+        _did: &str,
+    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        Ok(None)
     }
 }

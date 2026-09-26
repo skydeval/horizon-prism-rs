@@ -294,6 +294,17 @@ impl HeadProber {
     ///
     /// Database errors.
     pub async fn read_head(&self, did: &str) -> Result<Option<String>, sqlx::Error> {
+        self.read_head_with(did, true).await
+    }
+
+    /// [`HeadProber::read_head`], with the synchronous fetch allowed only
+    /// when `allow_fetch` (the caller's per-request cap,
+    /// `sync.max_head_fetches_per_request`).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn read_head_with(&self, did: &str, allow_fetch: bool) -> Result<Option<String>, sqlx::Error> {
         let row: Option<(Option<String>, bool, Option<String>)> = sqlx::query_as(
             "SELECT s.head_rev, \
                COALESCE(s.head_checked_at > now() - make_interval(secs => $2), false), a.pds_endpoint \
@@ -309,7 +320,9 @@ impl HeadProber {
         if fresh && head.is_some() {
             return Ok(head);
         }
-        let Some(pds) = pds else { return Ok(None) };
+        let Some(pds) = pds.filter(|_| allow_fetch) else {
+            return Ok(None);
+        };
         if !self.budgets.try_acquire(&HostBudgets::host_of(&pds), Class::ReadFetch) {
             metrics::counter!(METRIC_CHECKS, "result" => "read_budget_exhausted").increment(1);
             return Ok(None);

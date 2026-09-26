@@ -2,8 +2,8 @@
 //! `PgPool` / Redis / `NetClient` / `IdentityResolver` / `ScopeState`, the
 //! background tasks, and the HTTP listener.
 //!
-//! HTTP: the `app.bsky.*` surface (§7.1), `/.well-known/did.json` and
-//! `GET /xrpc/_health`.
+//! HTTP: the `app.bsky.*` surface (§7.1), the `app.nearhorizon.private.*`
+//! endpoints (§7.9), `/.well-known/did.json` and `GET /xrpc/_health`.
 
 pub mod health;
 
@@ -34,7 +34,9 @@ use crate::net::{NetClient, NetConfig};
 use crate::aggregations::enroll::AutoEnroller;
 use crate::hydration::{HydrationConfig, Hydrator, NoUpstream, ReadCache};
 use crate::kryphocron_glue::GlueContext;
-use crate::private_tier::{DisabledPrivateTier, PrivateTier};
+use crate::private_tier::handlers::PrivateState;
+use crate::private_tier::retention::PrivateRetention;
+use crate::private_tier::{KryphocronPrivateTier, PrivateTier};
 use crate::xrpc::{AppState, RateLimits};
 use health::{AuditLatch, HealthState};
 
@@ -60,10 +62,11 @@ impl StartupError {
     }
 }
 
-/// `retention` inputs from `ScopeState`. Private row authors come from the
-/// private tier (item 6); until then there are none.
+/// `retention` inputs: the owner set from `ScopeState`, and private row
+/// authors from the private tier (after `PrivateRetention` ran).
 struct ScopeRetentionInputs {
     scope: ScopeState,
+    pool: sqlx::PgPool,
 }
 
 #[async_trait]
@@ -75,7 +78,7 @@ impl RetentionInputs for ScopeRetentionInputs {
     }
 
     async fn private_row_authors(&self) -> Result<Vec<String>, sqlx::Error> {
-        Ok(Vec::new())
+        crate::private_tier::retention::row_authors(&self.pool).await
     }
 }
 
@@ -126,8 +129,7 @@ pub async fn run() -> Result<(), StartupError> {
     let consumer_redis = redis_manager(&cfg.env.redis_url).await?;
     let net = NetClient::new(&NetConfig::from_app(&cfg)).map_err(|e| StartupError::new(1, format!("net client: {e}")))?;
 
-    // Private tier: item 6 replaces this.
-    let private: Arc<dyn PrivateTier> = Arc::new(DisabledPrivateTier);
+    let private: Arc<dyn PrivateTier> = Arc::new(KryphocronPrivateTier);
     let scope = ScopeState::load(
         &pool,
         private.as_ref(),
@@ -194,9 +196,15 @@ pub async fn run() -> Result<(), StartupError> {
     tasks.push(spawn_lag_sampler(redis.clone(), fh.clone()));
 
     // Retention and the storage sampler.
-    let retention: Vec<Arc<dyn RetentionTask>> = vec![Arc::new(PublicRetention::new(Arc::new(ScopeRetentionInputs {
-        scope: scope.clone(),
-    })))];
+    // Private retention runs first (§3.2), so the public `actors` step sees
+    // the private row authors that remain.
+    let retention: Vec<Arc<dyn RetentionTask>> = vec![
+        Arc::new(PrivateRetention::new(scope.clone())),
+        Arc::new(PublicRetention::new(Arc::new(ScopeRetentionInputs {
+            scope: scope.clone(),
+            pool: pool.clone(),
+        }))),
+    ];
     let guard: Arc<dyn ScopeGuard> = Arc::new(scope.clone());
     tasks.push(spawn_scheduler(
         pool.clone(),
@@ -225,7 +233,10 @@ pub async fn run() -> Result<(), StartupError> {
         constellation.clone(),
         budgets.clone(),
     ));
-    let backfill = Backfill::new(writer.clone(), Arc::clone(&source), cfg.file.backfill.clone(), fh.deterministic_attempts);
+    let community_patterns: Vec<String> =
+        cfg.file.constellation.community().map(|n| n.pds_patterns.clone()).unwrap_or_default();
+    let backfill = Backfill::new(writer.clone(), Arc::clone(&source), cfg.file.backfill.clone(), fh.deterministic_attempts)
+        .with_community_patterns(community_patterns.clone());
     tasks.extend(
         backfill
             .spawn()
@@ -236,18 +247,16 @@ pub async fn run() -> Result<(), StartupError> {
     let rebuild = Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days);
     tasks.push(rebuild.clone().spawn_weekly());
 
-    // Repo-head prober (§6.11.3).
-    tasks.push(
-        HeadProber::new(
-            pool.clone(),
-            scope.clone(),
-            Arc::clone(&private),
-            Arc::new(NetHeadSource::new(net.clone())),
-            budgets,
-            cfg.file.sync.clone(),
-        )
-        .spawn(),
+    // Repo-head prober (§6.11.3); the private pipeline shares it.
+    let prober = HeadProber::new(
+        pool.clone(),
+        scope.clone(),
+        Arc::clone(&private),
+        Arc::new(NetHeadSource::new(net.clone())),
+        budgets,
+        cfg.file.sync.clone(),
     );
+    tasks.push(prober.clone().spawn());
 
     // Admin executor (§3.3).
     tasks.push(
@@ -296,18 +305,30 @@ pub async fn run() -> Result<(), StartupError> {
         trusted_proxy: cfg.file.http.trusted_proxy,
         did_document: Arc::new(glue.service_key.did_document()),
     };
+    let private_state = PrivateState::new(
+        app.clone(),
+        glue.pipeline.clone(),
+        prober,
+        watermarks.clone(),
+        Duration::from_secs(cfg.file.kryphocron.oracle_freshness_bound_secs),
+        community_patterns,
+        usize::try_from(cfg.file.sync.max_head_fetches_per_request).unwrap_or(16),
+        &cfg.file.private_read,
+    );
     let state = HealthState {
         pool: pool.clone(),
         redis,
         watermarks,
         status,
-        audit: AuditLatch::default(),
+        audit: AuditLatch::from_flag(glue.audit_latched()),
     };
     let listener = TcpListener::bind(cfg.file.http.bind)
         .await
         .map_err(|e| StartupError::new(1, format!("binding {}: {e}", cfg.file.http.bind)))?;
     tracing::info!(event = "serve_started", bind = %cfg.file.http.bind, tasks = tasks.len(), "serving");
-    let routes = crate::xrpc::router(app).merge(health::router(state));
+    let routes = crate::xrpc::router(app)
+        .merge(crate::private_tier::handlers::router(private_state))
+        .merge(health::router(state));
     axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await

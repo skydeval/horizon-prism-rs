@@ -12,6 +12,23 @@ commit.
 
 ### Added
 
+- **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
+  owns every private table behind a `pub(crate)` facade: defensive
+  `postPrivate` / audience parsing with dead-lettering of malformed records
+  (#235), LWW ingest, owner set and readiness, purges, and private retention
+  (registered ahead of public retention). Reads run the §6.3 pipeline per
+  record: moderation gate, owner readiness, repo-head check, a per-record
+  oracle snapshot (Block/Audience/Mute, rules 1–7), host freshness against
+  `private_watermark`, kryphocron issue/bind, the sealed `RecordAuthz`
+  witness, record validation and `decode_record_content`, emitted only
+  through `PrivateEmit`. `getPosts`, `getPostThread` (200 nodes,
+  `publicParent`) and `getAuthorFeed` (`created_at::rkey` cursor) share one
+  uniform miss, per-endpoint timing floors, a 10/s (burst 20) per-DID limit
+  and `private_read_outcome_total` / `private_read_unfloored_seconds`. The
+  `private` backfill job confirms non-member owner eligibility (§6.11.1).
+  `kryphocron_glue` gains panic-contained log audit sinks, the user-sink
+  latch reported by `/xrpc/_health`, and validated at-rest hooks from
+  `APP_DATA_DIR`; `clippy.toml` forbids the public codec surface.
 - **Item 5: `app.bsky.*` XRPC surface and read-only admin CLI.** axum routes
   for `actor.getProfile(s)`, `actor.searchActors`, `feed.getPosts`,
   `getPostThread`, `getAuthorFeed`, `getLikes`, `getRepostedBy`, `getQuotes`,
@@ -60,6 +77,7 @@ commit.
 
 ### Changed
 
+- I: postPrivate field parsing at the private-tier decode boundary must be defensive (#235)
 - Design-v2 clarifications: dead-letter replay leaves the entry in place
   (§5.9); the head prober skips DIDs with an `authz` job in flight (§6.11.3);
   `admin backfill` defaults to `member` depth for members, `scope` otherwise

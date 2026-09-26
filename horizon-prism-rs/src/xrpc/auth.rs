@@ -166,6 +166,30 @@ pub async fn prepare(
     Ok(Prepared { viewer, ip })
 }
 
+/// The private-endpoint gate (§6.3 steps 1–2, §7.4): authentication
+/// required, the `private` per-DID bucket, and a ready member. Returns the
+/// verified caller, whose JWT feeds the kryphocron `AuthContext`. Failures
+/// here are ordinary errors, outside the timing floor.
+///
+/// # Errors
+///
+/// `AuthRequired`/`InvalidToken`, `RateLimitExceeded`, `NotEnrolled`,
+/// `NotReady`.
+pub async fn prepare_private(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+) -> Result<VerifiedCaller, XrpcError> {
+    let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let caller = state.auth.verify(authorization, method).await?;
+    state.limits.check(Class::Private, &caller.did)?;
+    match member_state(state, &caller.did).await? {
+        Enrollment::Member { ready: true } => Ok(caller),
+        Enrollment::Member { ready: false } | Enrollment::Enrolled | Enrollment::Purging => Err(XrpcError::not_ready()),
+        Enrollment::Refused(_) => Err(XrpcError::not_enrolled()),
+    }
+}
+
 async fn member_state(state: &AppState, did: &str) -> Result<Enrollment, sqlx::Error> {
     let ready: Option<bool> = sqlx::query_scalar("SELECT ready_at IS NOT NULL FROM members WHERE did = $1")
         .bind(did)

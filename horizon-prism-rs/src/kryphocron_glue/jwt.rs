@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kryphocron::resolver::{DefaultDidResolver, DidResolver, HttpDidFetcher};
-use kryphocron::verification::{JwtVerificationConfig, JwtVerificationError, verify_jwt};
+use kryphocron::verification::{JwtVerificationConfig, JwtVerificationError, VerifiedJwt, verify_jwt};
 use kryphocron::{Did, ServiceIdentity, TraceId};
 use moka::notification::RemovalCause;
 use moka::policy::EvictionPolicy;
@@ -58,10 +58,18 @@ pub enum AuthError {
     Invalid(String),
 }
 
-/// The authenticated caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The authenticated caller, with the verified token that the private
+/// pipeline passes to `ingress::from_xrpc_request` (§6.3 step 6).
+#[derive(Debug, Clone)]
 pub struct VerifiedCaller {
     pub did: String,
+    pub jwt: VerifiedJwt,
+}
+
+impl PartialEq for VerifiedCaller {
+    fn eq(&self, other: &Self) -> bool {
+        self.did == other.did
+    }
 }
 
 /// The fetcher side of the §6.7 retry: refresh an issuer through the cell.
@@ -242,6 +250,7 @@ impl<F: IssuerRefresh> JwtVerifier<F> {
         metrics::counter!(METRIC_AUTH, "result" => "ok").increment(1);
         Ok(VerifiedCaller {
             did: verified.issuer().as_str().to_string(),
+            jwt: verified,
         })
     }
 }
@@ -399,8 +408,8 @@ pub(crate) mod tests {
 
         let ok = mint(&key, did, &aud(), Some(METHOD));
         assert_eq!(
-            v.verify_request_jwt(Some(&format!("Bearer {ok}")), METHOD).await,
-            Ok(VerifiedCaller { did: did.to_string() })
+            v.verify_request_jwt(Some(&format!("Bearer {ok}")), METHOD).await.map(|c| c.did),
+            Ok(did.to_string())
         );
         let with_fragment = mint(&key, did, &format!("{}#bsky_appview", aud()), Some(METHOD));
         assert!(v.verify_request_jwt(Some(&with_fragment), METHOD).await.is_ok());

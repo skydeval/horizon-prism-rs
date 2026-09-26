@@ -1,0 +1,431 @@
+//! `app.nearhorizon.private.*` handlers (design-v2 §7.9, §6.3, §6.9).
+//!
+//! - Steps 1–2 (clock, auth gate) run first. Gate failures (401,
+//!   `NotEnrolled`, `NotReady`, 429) are ordinary errors outside the floor.
+//! - Candidates come from the §6.9 prefilter. Each is read through the
+//!   per-record pipeline with in-task concurrency `bind_concurrency`.
+//! - Step 13: every response, hit or miss, waits until the endpoint's floor
+//!   measured from handler entry. The unfloored time is exported as
+//!   `private_read_unfloored_seconds{endpoint}`.
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use axum::extract::{ConnectInfo, RawQuery, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use chrono::{DateTime, SecondsFormat, Utc};
+use futures::StreamExt;
+use serde_json::Value;
+
+use super::emit::{PrivateEmit, PrivateResponse, ThreadNode, ThreadParent};
+use super::pipeline::{self, PipelineEnv, RequestState};
+use super::schema;
+use crate::config::PrivateReadConfig;
+use crate::db::locks::uri_author;
+use crate::hydration::Viewer;
+use crate::hydration::normalize::is_private_uri;
+use crate::hydration::actor::ProfileContext;
+use crate::kryphocron_glue::VerifiedCaller;
+use crate::xrpc::AppState;
+use crate::xrpc::auth::{Params, prepare_private};
+use crate::xrpc::errors::XrpcError;
+use crate::xrpc::router::global_limit;
+
+pub const GET_POSTS: &str = "app.nearhorizon.private.getPosts";
+pub const GET_POST_THREAD: &str = "app.nearhorizon.private.getPostThread";
+pub const GET_AUTHOR_FEED: &str = "app.nearhorizon.private.getAuthorFeed";
+
+/// Metric: handler time before the floor.
+const METRIC_UNFLOORED: &str = "private_read_unfloored_seconds";
+/// A thread holds at most this many nodes (anchor, parents, replies).
+pub(super) const THREAD_NODE_CAP: usize = 200;
+/// Replies per thread node.
+pub(super) const REPLIES_PER_NODE: i64 = 50;
+
+/// The endpoint floors (`private_read.floor_ms.*`).
+#[derive(Debug, Clone, Copy)]
+pub struct Floors {
+    pub get_posts: Duration,
+    pub get_post_thread: Duration,
+    pub get_author_feed: Duration,
+}
+
+/// State for the private router.
+#[derive(Clone)]
+pub struct PrivateState {
+    pub(super) app: AppState,
+    pub(super) env: PipelineEnv,
+    pub(super) floors: Floors,
+    pub(super) concurrency: usize,
+}
+
+impl PrivateState {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        app: AppState,
+        glue: crate::kryphocron_glue::PipelineGlue,
+        prober: crate::sync::HeadProber,
+        watermarks: crate::firehose::watermark::Watermarks,
+        freshness_bound: Duration,
+        community_patterns: Vec<String>,
+        max_head_fetches: usize,
+        cfg: &PrivateReadConfig,
+    ) -> Self {
+        let pool = app.hydrator.pool().clone();
+        Self {
+            app,
+            env: PipelineEnv {
+                pool,
+                glue,
+                prober,
+                watermarks,
+                freshness_bound,
+                community_patterns: std::sync::Arc::new(community_patterns),
+                max_head_fetches,
+            },
+            floors: Floors {
+                get_posts: Duration::from_millis(cfg.floor_ms.get_posts),
+                get_post_thread: Duration::from_millis(cfg.floor_ms.get_post_thread),
+                get_author_feed: Duration::from_millis(cfg.floor_ms.get_author_feed),
+            },
+            concurrency: usize::try_from(cfg.bind_concurrency).unwrap_or(8).max(1),
+        }
+    }
+}
+
+fn xrpc(nsid: &str) -> String {
+    format!("/xrpc/{nsid}")
+}
+
+/// The private router, merged into the app by `serve`.
+pub fn router(state: PrivateState) -> Router {
+    Router::new()
+        .route(&xrpc(GET_POSTS), get(get_posts))
+        .route(&xrpc(GET_POST_THREAD), get(get_post_thread))
+        .route(&xrpc(GET_AUTHOR_FEED), get(get_author_feed))
+        .layer(middleware::from_fn_with_state(state.app.clone(), global_limit))
+        .with_state(state)
+}
+
+/// Step 13: record the unfloored time, then wait out the floor.
+async fn floor(endpoint: &'static str, start: Instant, target: Duration) {
+    metrics::histogram!(METRIC_UNFLOORED, "endpoint" => endpoint).record(start.elapsed().as_secs_f64());
+    kryphocron::equalize_timing(start, target).await;
+}
+
+/// Profiles for the owners of `uris` (public data, viewer-relative).
+async fn profiles(s: &PrivateState, viewer: &Viewer, uris: &[String]) -> Result<ProfileContext, XrpcError> {
+    let mut dids: Vec<String> = Vec::new();
+    for u in uris {
+        if let Some(a) = uri_author(u)
+            && !dids.iter().any(|d| d == a)
+        {
+            dids.push(a.to_string());
+        }
+    }
+    Ok(s.app.hydrator.profile_context(viewer, &dids, None).await?)
+}
+
+/// Read `uris` in order with the configured concurrency; misses are `None`.
+async fn read_many(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    uris: &[String],
+    authors: &ProfileContext,
+    start: Instant,
+) -> Vec<Option<PrivateEmit<Value>>> {
+    // Futures are lazy: building them all first only fixes their borrows.
+    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, rs, caller, u, authors, start)).collect();
+    futures::stream::iter(reads)
+        .buffered(s.concurrency)
+        .map(Result::ok)
+        .collect()
+        .await
+}
+
+fn ok(body: PrivateResponse) -> Response {
+    Json(body).into_response()
+}
+
+pub async fn get_posts(
+    State(s): State<PrivateState>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, GET_POSTS).await?;
+    let requested = Params::parse(q.as_deref()).all("uris");
+    if requested.is_empty() || requested.len() > 25 {
+        return Err(XrpcError::invalid("Error: uris must have between 1 and 25 items"));
+    }
+    let result = posts_body(&s, &caller, &requested, start).await;
+    floor("getPosts", start, s.floors.get_posts).await;
+    result.map(ok)
+}
+
+async fn posts_body(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    requested: &[String],
+    start: Instant,
+) -> Result<PrivateResponse, XrpcError> {
+    let mut wanted: Vec<String> = Vec::new();
+    for u in requested {
+        if !wanted.contains(u) {
+            wanted.push(u.clone());
+        }
+    }
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted).await?.into_iter().collect();
+    let candidates: Vec<String> = wanted.into_iter().filter(|u| passing.contains(u)).collect();
+    let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
+    let authors = profiles(s, &viewer, &candidates).await?;
+    let rs = RequestState::new(s.env.max_head_fetches);
+    let posts = read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
+    Ok(PrivateResponse::posts(posts))
+}
+
+fn not_found() -> XrpcError {
+    XrpcError::new(StatusCode::BAD_REQUEST, "NotFound", "Post not found")
+}
+
+/// `depth` 0–10 (default 6), `parentHeight` 0–30 (default 20).
+fn bounded(p: &Params, key: &str, default: u32, max: u32) -> Result<u32, XrpcError> {
+    match p.u32(key)?.unwrap_or(default) {
+        v if v <= max => Ok(v),
+        _ => Err(XrpcError::invalid(format!("Error: {key} must be between 0 and {max}"))),
+    }
+}
+
+pub async fn get_post_thread(
+    State(s): State<PrivateState>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, GET_POST_THREAD).await?;
+    let p = Params::parse(q.as_deref());
+    let uri = p.required("uri")?.to_string();
+    let depth = bounded(&p, "depth", 6, 10)?;
+    let parent_height = bounded(&p, "parentHeight", 20, 30)?;
+    let result = thread_body(&s, &caller, &uri, depth, parent_height, start).await;
+    floor("getPostThread", start, s.floors.get_post_thread).await;
+    result.and_then(|t| t.ok_or_else(not_found)).map(ok)
+}
+
+/// The parent URI named by an authorized view's `record.reply.parent`.
+fn view_parent(post: &PrivateEmit<Value>) -> Option<String> {
+    post.view()
+        .pointer("/record/reply/parent/uri")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+async fn thread_body(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    uri: &str,
+    depth: u32,
+    parent_height: u32,
+    start: Instant,
+) -> Result<Option<PrivateResponse>, XrpcError> {
+    let rs = RequestState::new(s.env.max_head_fetches);
+    let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
+    let anchor_uri = vec![uri.to_string()];
+    let authors = profiles(s, &viewer, &anchor_uri).await?;
+    let Ok(anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
+        return Ok(None);
+    };
+    let mut budget = THREAD_NODE_CAP - 1;
+
+    // Parents: the chain stops at the first miss or at a public parent.
+    let mut chain: Vec<PrivateEmit<Value>> = Vec::new();
+    let mut public_top = None;
+    let mut next = view_parent(&anchor);
+    while let Some(parent) = next.take() {
+        if chain.len() >= parent_height as usize || budget == 0 {
+            break;
+        }
+        if is_private_uri(&parent) {
+            let authors = profiles(s, &viewer, std::slice::from_ref(&parent)).await?;
+            let Ok(p) = pipeline::read(&s.env, &rs, caller, &parent, &authors, start).await else {
+                break;
+            };
+            budget -= 1;
+            next = view_parent(&p);
+            chain.push(p);
+        } else {
+            if let Some(post) = s.app.hydrator.public_post_view(&viewer, &parent).await? {
+                budget -= 1;
+                public_top = Some(post);
+            }
+            break;
+        }
+    }
+
+    // Replies, breadth-first, up to `depth` levels and the node cap.
+    let mut replies: HashMap<String, Vec<PrivateEmit<Value>>> = HashMap::new();
+    let mut expanded: HashSet<String> = HashSet::new();
+    let mut level: Vec<String> = anchor_uri;
+    for _ in 0..depth {
+        if level.is_empty() || budget == 0 {
+            break;
+        }
+        let mut batch: Vec<(String, String)> = Vec::new();
+        for parent in &level {
+            if batch.len() >= budget {
+                break;
+            }
+            expanded.insert(parent.clone());
+            for c in schema::reply_candidates(&s.env.pool, &caller.did, parent, REPLIES_PER_NODE).await? {
+                if batch.len() >= budget {
+                    break;
+                }
+                batch.push((parent.clone(), c));
+            }
+        }
+        let uris: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
+        let authors = profiles(s, &viewer, &uris).await?;
+        let results = read_many(s, &rs, caller, &uris, &authors, start).await;
+        level = Vec::new();
+        for ((parent, child), hit) in batch.into_iter().zip(results) {
+            if let Some(post) = hit {
+                budget -= 1;
+                level.push(child);
+                replies.entry(parent).or_default().push(post);
+            }
+        }
+    }
+
+    let mut root = build(anchor, uri, &mut replies, &expanded);
+    // Nest the parent chain above the anchor, nearest first.
+    let mut parent: Option<ThreadParent> = public_top.map(ThreadParent::Public);
+    for p in chain.into_iter().rev() {
+        parent = Some(ThreadParent::Private(ThreadNode {
+            post: p,
+            parent: parent.map(Box::new),
+            replies: None,
+        }));
+    }
+    root.parent = parent.map(Box::new);
+    Ok(Some(PrivateResponse::thread(root)))
+}
+
+fn build(
+    post: PrivateEmit<Value>,
+    uri: &str,
+    replies: &mut HashMap<String, Vec<PrivateEmit<Value>>>,
+    expanded: &HashSet<String>,
+) -> ThreadNode {
+    let children = replies.remove(uri).unwrap_or_default();
+    let nodes = children
+        .into_iter()
+        .map(|c| {
+            let child_uri = c.view().get("uri").and_then(Value::as_str).unwrap_or_default().to_string();
+            build(c, &child_uri, replies, expanded)
+        })
+        .collect();
+    ThreadNode {
+        post,
+        parent: None,
+        replies: expanded.contains(uri).then_some(nodes),
+    }
+}
+
+/// `created_at::rkey`.
+fn cursor(at: DateTime<Utc>, rkey: &str) -> String {
+    format!("{}::{rkey}", at.to_rfc3339_opts(SecondsFormat::Micros, true))
+}
+
+fn parse_cursor(c: Option<&str>) -> Result<Option<(DateTime<Utc>, String)>, XrpcError> {
+    let Some(c) = c.filter(|c| !c.is_empty()) else {
+        return Ok(None);
+    };
+    let (at, rkey) = c.split_once("::").ok_or_else(|| XrpcError::invalid("Error: malformed cursor"))?;
+    let at = DateTime::parse_from_rfc3339(at).map_err(|_| XrpcError::invalid("Error: malformed cursor"))?;
+    Ok(Some((at.with_timezone(&Utc), rkey.to_string())))
+}
+
+pub async fn get_author_feed(
+    State(s): State<PrivateState>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, GET_AUTHOR_FEED).await?;
+    let p = Params::parse(q.as_deref());
+    let actor = p.required("actor")?.to_string();
+    if !actor.starts_with("did:") {
+        return Err(XrpcError::invalid("Error: actor must be a valid did"));
+    }
+    let limit = match p.u32("limit")?.unwrap_or(30) {
+        l @ 1..=50 => l,
+        _ => return Err(XrpcError::invalid("Error: limit must be between 1 and 50")),
+    };
+    let after = parse_cursor(p.one("cursor"))?;
+    let result = feed_body(&s, &caller, &actor, limit as usize, after, start).await;
+    floor("getAuthorFeed", start, s.floors.get_author_feed).await;
+    result.map(ok)
+}
+
+async fn feed_body(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    actor: &str,
+    limit: usize,
+    after: Option<(DateTime<Utc>, String)>,
+    start: Instant,
+) -> Result<PrivateResponse, XrpcError> {
+    let max_binds = limit * 4;
+    // One lookahead row tells whether prefiltered candidates remain.
+    let mut candidates =
+        schema::author_candidates(&s.env.pool, &caller.did, actor, after, i64::try_from(max_binds + 1).unwrap_or(i64::MAX))
+            .await?;
+    let beyond = candidates.len() > max_binds;
+    candidates.truncate(max_binds);
+    let uris: Vec<String> = candidates.iter().map(|(u, _, _)| u.clone()).collect();
+    let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
+    let authors = profiles(s, &viewer, &uris).await?;
+    let rs = RequestState::new(s.env.max_head_fetches);
+
+    let mut feed = Vec::new();
+    let mut last: Option<usize> = None;
+    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+    let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
+    while let Some((i, hit)) = reads.next().await {
+        if let Ok(post) = hit {
+            feed.push(post);
+            last = Some(i);
+            if feed.len() == limit {
+                break;
+            }
+        }
+    }
+    drop(reads);
+    let cursor = last
+        .filter(|&i| i + 1 < candidates.len() || beyond)
+        .map(|i| cursor(candidates[i].1, &candidates[i].2));
+    Ok(PrivateResponse::feed(feed, cursor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_round_trips() {
+        let at = DateTime::parse_from_rfc3339("2026-09-26T12:00:00.123456Z").expect("ts").with_timezone(&Utc);
+        let c = cursor(at, "3kaaaaaaaaaa2");
+        assert_eq!(parse_cursor(Some(&c)).expect("parse"), Some((at, "3kaaaaaaaaaa2".to_string())));
+        assert!(parse_cursor(Some("garbage")).is_err());
+        assert_eq!(parse_cursor(None).expect("none"), None);
+    }
+}

@@ -1,0 +1,11 @@
+# design-v2 §3.1, §6.3: the public codec surface is bypassable, so it is
+# forbidden outright. Private content is decoded only through
+# kryphocron::decode_record_content behind a ReadAuthorization witness, and the
+# codec is installed inside kryphocron by DefaultAtRestHooks::for_data_dir.
+disallowed-methods = [
+    { path = "kryphocron::encryption::ContentCodec::decode", reason = "decode only via kryphocron::decode_record_content (design-v2 §6.3)" },
+]
+disallowed-types = [
+    { path = "kryphocron::encryption::DecodeContext", reason = "decode only via kryphocron::decode_record_content (design-v2 §6.3)" },
+    { path = "kryphocron::codec::laquna::Codec", reason = "the codec is installed by DefaultAtRestHooks::for_data_dir (design-v2 §6.6)" },
+]

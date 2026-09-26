@@ -4,7 +4,9 @@
 //! `backfill.concurrency` (4) and a per-PDS-host budget of
 //! `backfill.per_pds_rate_per_sec` (5/s). For each job:
 //! 1. upsert the DID's identity fields (PDS endpoint, verified handle,
-//!    account status) — the claim already recorded `gap_epoch`;
+//!    account status) — the claim already recorded `gap_epoch`; for a
+//!    non-member's `private`/`authz` job, confirm owner eligibility
+//!    (§6.11.1) and end `done` without listings if the DID is not an owner;
 //! 2. `getLatestCommit` gives rev R;
 //! 3. list each collection of the depth table with its limit, writing every
 //!    selected record through the normal write path with rev R;
@@ -41,6 +43,7 @@ use super::classifier::{
 use super::gap;
 use super::jobs::Depth;
 use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, Writer};
+use crate::aggregations::enroll::{host_matches, pds_host};
 use crate::config::BackfillConfig;
 use crate::identity::refresher::{RefreshReason, RepoStatus, account_status, is_repo_not_found};
 use crate::identity::resolver::extract_info;
@@ -496,6 +499,8 @@ pub struct Backfill {
     settings: BackfillConfig,
     attempts: u32,
     order_cache: moka::future::Cache<String, ListOrder>,
+    /// The `community` network's `pds_patterns` (owner eligibility).
+    community_patterns: Arc<Vec<String>>,
 }
 
 impl Backfill {
@@ -512,7 +517,45 @@ impl Backfill {
                 .max_capacity(100_000)
                 .time_to_live(ORDER_CACHE_TTL)
                 .build(),
+            community_patterns: Arc::new(Vec::new()),
         }
+    }
+
+    /// Set the community PDS patterns for owner eligibility (§6.11.1).
+    /// Without them no non-member is eligible (fail closed).
+    #[must_use]
+    pub fn with_community_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.community_patterns = Arc::new(patterns);
+        self
+    }
+
+    /// Owner eligibility for a non-member (§6.11.1). `prepare` has just
+    /// confirmed hosting with `getRepoStatus` (`active: true`), so the DID is
+    /// eligible iff its PDS host matches the community patterns. The
+    /// confirmation is recorded and the owner status re-evaluated in one
+    /// transaction (which re-checks that rows still exist, #160); the
+    /// in-memory set follows after commit. Returns whether the DID is an
+    /// owner now.
+    async fn confirm_owner(&self, did: &str, pds: &str) -> Result<bool, sqlx::Error> {
+        let eligible = pds_host(pds).is_some_and(|h| self.community_patterns.iter().any(|p| host_matches(&h, p)));
+        let guard = self.writer.scope().read_guard().await;
+        let mut tx = self.pool.begin().await?;
+        self.writer.private().record_eligibility(&mut tx, did, eligible).await?;
+        let applied = self.writer.private().reevaluate_owner(&mut tx, did).await?;
+        tx.commit().await?;
+        drop(guard);
+        let owner = applied.owners_joined.iter().any(|d| d == did);
+        let mut sets = self.writer.scope().write_guard().await;
+        if owner {
+            sets.private_owners.insert(did.to_string());
+        } else {
+            sets.private_owners.remove(did);
+        }
+        drop(sets);
+        if !owner {
+            tracing::info!(event = "backfill_owner_ineligible", did, eligible, "not a private owner; job ends without listings");
+        }
+        Ok(owner)
     }
 
     /// Start the workers, the retry scheduler, the daily `authz` schedule and
@@ -616,8 +659,14 @@ impl Backfill {
     /// Steps 1–5. `Ok(None)` when superseded part-way.
     async fn run(&self, job: &Job) -> Result<Option<RunResult>, String> {
         let pds = self.source.prepare(&job.did).await?;
-        let rev = self.source.latest_rev(&pds, &job.did).await?;
         let is_member = self.writer.scope().read_guard().await.is_member(&job.did);
+        if matches!(job.depth, Depth::Private | Depth::Authz)
+            && !is_member
+            && !self.confirm_owner(&job.did, &pds).await.map_err(|e| e.to_string())?
+        {
+            return Ok(Some(RunResult::default()));
+        }
+        let rev = self.source.latest_rev(&pds, &job.did).await?;
         let plan = plan(job.depth, is_member);
         let mut result = RunResult {
             rev,

@@ -3,6 +3,10 @@
 //!
 //! Modules are added in the §15 implementation order.
 
+// §3.1, §6.3: the public codec surface (`ContentCodec::decode`,
+// `DecodeContext`, `laquna::Codec`) is forbidden by clippy.toml.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 pub mod admin_executor;
 pub mod aggregations;
 pub mod cli;

@@ -26,7 +26,7 @@ use super::records::{GraphRecord, PostRecord, ProfileRecord, RecordError, Subjec
 use crate::aggregations::growth::{self, GrowthPlan};
 use crate::aggregations::{Admission, AdmissionInput, RecordKind, ScopeSets, ScopeState, admit};
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
-use crate::private_tier::{PrivateOp, PrivateTier};
+use crate::private_tier::{IngestError, PrivateOp, PrivateTier};
 
 /// The lowest possible TID string: inbound-block rows lose to any real rev
 /// under LWW (§5.10).
@@ -148,6 +148,16 @@ impl From<sqlx::Error> for OpError {
             Self::Deterministic(e.to_string())
         } else {
             Self::Transient(e)
+        }
+    }
+}
+
+/// A malformed private record is deterministic (dead-lettered, #235).
+impl From<IngestError> for OpError {
+    fn from(e: IngestError) -> Self {
+        match e {
+            IngestError::Db(e) => e.into(),
+            IngestError::Malformed(msg) => Self::Deterministic(msg),
         }
     }
 }

@@ -7,10 +7,11 @@
 //! | anonymous reads (`app.bsky.*`) | IP | 30/s, 60 |
 //! | authenticated reads (`app.bsky.*`) | DID | 60/s, 120 |
 //! | writes to AppView state (`muteActor`, `unmuteActor`, `updateSeen`) | DID | 5/s, 20 |
+//! | `app.nearhorizon.private.*` | DID | 10/s, 20 |
 //! | any request | IP | 100/s, 200 (global backstop) |
 //!
-//! The item-6/7 classes (`private.*`, `threadLens.*`, `requestRecord`,
-//! `resolveDid`) are added with their endpoints.
+//! The item-7 classes (`threadLens.*`, `requestRecord`, `resolveDid`) are
+//! added with their endpoints.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -27,6 +28,7 @@ pub enum Class {
     AnonRead,
     AuthRead,
     Write,
+    Private,
     Global,
 }
 
@@ -37,6 +39,7 @@ pub fn quota(class: Class) -> (u32, u32) {
         Class::AnonRead => (30, 60),
         Class::AuthRead => (60, 120),
         Class::Write => (5, 20),
+        Class::Private => (10, 20),
         Class::Global => (100, 200),
     }
 }
@@ -60,6 +63,7 @@ pub struct RateLimits {
     anon: Arc<DefaultKeyedRateLimiter<String>>,
     auth: Arc<DefaultKeyedRateLimiter<String>>,
     write: Arc<DefaultKeyedRateLimiter<String>>,
+    private: Arc<DefaultKeyedRateLimiter<String>>,
     global: Arc<DefaultKeyedRateLimiter<String>>,
 }
 
@@ -76,6 +80,7 @@ impl RateLimits {
             anon: Arc::new(limiter(Class::AnonRead)),
             auth: Arc::new(limiter(Class::AuthRead)),
             write: Arc::new(limiter(Class::Write)),
+            private: Arc::new(limiter(Class::Private)),
             global: Arc::new(limiter(Class::Global)),
         }
     }
@@ -85,6 +90,7 @@ impl RateLimits {
             Class::AnonRead => &self.anon,
             Class::AuthRead => &self.auth,
             Class::Write => &self.write,
+            Class::Private => &self.private,
             Class::Global => &self.global,
         }
     }
@@ -121,7 +127,7 @@ impl RateLimits {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                for class in [Class::AnonRead, Class::AuthRead, Class::Write, Class::Global] {
+                for class in [Class::AnonRead, Class::AuthRead, Class::Write, Class::Private, Class::Global] {
                     let b = this.bucket(class);
                     b.retain_recent();
                     b.shrink_to_fit();

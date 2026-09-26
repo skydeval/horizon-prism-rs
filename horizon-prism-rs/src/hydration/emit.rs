@@ -6,6 +6,17 @@
 use serde::Serialize;
 
 /// A public-tier response body.
+///
+/// Sealed: code outside `hydration` cannot build one, by constructor or by
+/// tuple syntax.
+///
+/// ```compile_fail
+/// let _ = horizon_prism_rs::hydration::PublicEmit::new(serde_json::json!({}));
+/// ```
+///
+/// ```compile_fail
+/// let _ = horizon_prism_rs::hydration::PublicEmit(serde_json::json!({}));
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct PublicEmit<T>(T);

@@ -16,7 +16,7 @@ use super::errors::XrpcError;
 use super::handlers::{actor, did_web, feed, graph, mutes, notifications, timeline};
 use super::rate_limit::Class;
 
-async fn global_limit(
+pub(crate) async fn global_limit(
     State(s): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,

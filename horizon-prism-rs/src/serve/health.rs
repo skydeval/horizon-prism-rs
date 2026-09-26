@@ -24,12 +24,18 @@ use crate::firehose::watermark::Watermarks;
 /// Per-probe timeout.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The audit latch (§6.5). The kryphocron glue item sets it when the user
-/// audit sink terminates; until then it never latches.
+/// The audit latch (§6.5): shared with `GlueContext::audit_latched`, set when
+/// the user audit sink panicked. `audit_ok = !latched`.
 #[derive(Debug, Clone, Default)]
 pub struct AuditLatch(Arc<AtomicBool>);
 
 impl AuditLatch {
+    /// Report the glue's latch flag.
+    #[must_use]
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
     #[must_use]
     pub fn latched(&self) -> bool {
         self.0.load(Ordering::Relaxed)
