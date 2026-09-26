@@ -19,6 +19,13 @@ commit.
   stale rows and targets with no row are queued on `cc:refresh`, and with no
   row the upstream count stays (never a local zero). Applies to public
   upstream views and Thread Lens. `upstream_view_counts_total{source}`.
+- **Item 8: notification, mute and label coverage.** Tests for every
+  notification reason's record (`reply`, `mention`, `quote`, `like`,
+  `repost`, `follow`), block exclusion in both directions for the list and
+  the unread count, `indexed_at::id` paging, unmute idempotence, and local
+  label emission and enforcement (`!takedown` hidden from lists and direct
+  fetches, `!hide` listed nowhere but returned on direct `getPosts`,
+  informational labels on posts, authors, profiles and thread replies).
 - **Item 7: migration 0002.** `private_posts.reply_root_cid` and
   `reply_parent_cid` (nullable). Rows written earlier keep NULL until an
   `admin backfill --depth resync` refetches them.

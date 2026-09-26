@@ -227,6 +227,7 @@ mod tests {
         assert_eq!(m.inner()["mutes"][0]["viewer"]["muted"], true);
         assert!(h.set_mute(&me, ALICE, true).await.expect("db").is_err());
         h.set_mute(&me, BOB, false).await.expect("db").expect("unmuted");
+        h.set_mute(&me, BOB, false).await.expect("db").expect("unmute is idempotent");
         let m = h.get_mutes(&me, 50, None).await.expect("db").expect("view");
         assert_eq!(m.inner()["mutes"], json!([]));
         db.drop_db().await;

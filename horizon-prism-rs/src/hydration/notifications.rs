@@ -196,6 +196,86 @@ mod tests {
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
 
+    const CAROL: &str = "did:plc:cccccccccccccccccccccccc";
+    const DAVE: &str = "did:plc:dddddddddddddddddddddddd";
+
+    #[tokio::test]
+    async fn every_reason_hydrates_its_record_and_blocks_exclude_both_ways() {
+        let Some(db) = fresh_db("hydration_notification_reasons").await else {
+            return;
+        };
+        let p = &db.pool;
+        for (d, h) in [(ALICE, "alice.test"), (BOB, "bob.test"), (CAROL, "carol.test"), (DAVE, "dave.test")] {
+            actor(p, d, h, h).await;
+        }
+        let root = post(p, ALICE, "3kroot222222", "root", None, None).await;
+        let reply = post(p, BOB, "3kreply22222", "reply", Some(&root), Some(&root)).await;
+        let mention = post(p, BOB, "3kmention222", "hi @alice.test", None, None).await;
+        let quote = post(p, BOB, "3kquote22222", "quoting", None, None).await;
+        let (like, repost, follow) = (
+            format!("at://{BOB}/app.bsky.feed.like/3klike"),
+            format!("at://{BOB}/app.bsky.feed.repost/3krepost"),
+            format!("at://{BOB}/app.bsky.graph.follow/3kfollow"),
+        );
+        exec(p, &format!("INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES ('{like}', '{BOB}', '{root}', 'bafyroot', '3k', now())")).await;
+        exec(p, &format!("INSERT INTO reposts (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES ('{repost}', '{BOB}', '{root}', 'bafyroot', '3k', now())")).await;
+        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('{follow}', '{BOB}', '{ALICE}', '3k', now())")).await;
+        for (reason, uri, subject) in [
+            ("reply", &reply, Some(&root)),
+            ("mention", &mention, None),
+            ("quote", &quote, Some(&root)),
+            ("like", &like, Some(&root)),
+            ("repost", &repost, Some(&root)),
+            ("follow", &follow, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO notifications (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
+                 VALUES ($1, $2, $3, $4, $5, 'bafy')",
+            )
+            .bind(ALICE)
+            .bind(BOB)
+            .bind(reason)
+            .bind(subject)
+            .bind(uri)
+            .execute(p)
+            .await
+            .expect("notification");
+        }
+        // Carol blocks Alice; Alice blocks Dave. Both directions exclude.
+        for (i, (author, subject, n)) in [(CAROL, ALICE, "carol"), (ALICE, DAVE, "dave")].into_iter().enumerate() {
+            exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{author}/app.bsky.graph.block/{i}', '{author}', '{subject}', '3k', now())")).await;
+            let other = if author == ALICE { subject } else { author };
+            exec(p, &format!("INSERT INTO notifications (recipient_did, author_did, reason, record_uri, record_cid) VALUES ('{ALICE}', '{other}', 'follow', 'at://{other}/app.bsky.graph.follow/{n}', 'bafy')")).await;
+        }
+        let h = hydrator(p, ScopeSets::default());
+        let me = Viewer {
+            did: Some(ALICE.into()),
+            hydrate: true,
+        };
+        let l = h.list_notifications(&me, 100, None, &[]).await.expect("db").expect("view");
+        let list = l.inner()["notifications"].as_array().expect("list");
+        let by_reason: std::collections::HashMap<&str, &Value> = list.iter().map(|n| (n["reason"].as_str().expect("reason"), n)).collect();
+        assert_eq!(list.len(), 6, "blocked authors (both directions) are excluded: {list:?}");
+        assert!(list.iter().all(|n| n["author"]["did"] == BOB));
+        assert_eq!(by_reason["reply"]["record"]["text"], "reply");
+        assert_eq!(by_reason["reply"]["reasonSubject"], json!(root));
+        assert_eq!(by_reason["mention"]["record"]["text"], "hi @alice.test");
+        assert_eq!(by_reason["quote"]["record"]["text"], "quoting");
+        assert_eq!(by_reason["like"]["record"], json!({"$type": "app.bsky.feed.like", "subject": {"uri": root, "cid": "bafyroot"}, "createdAt": by_reason["like"]["record"]["createdAt"]}));
+        assert_eq!(by_reason["repost"]["record"]["$type"], "app.bsky.feed.repost");
+        assert_eq!(by_reason["repost"]["record"]["subject"]["uri"], json!(root));
+        assert_eq!(by_reason["follow"]["record"]["subject"], ALICE);
+        assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 6, "the count uses the same exclusions");
+
+        // Paging with the indexed_at::id cursor.
+        let first = h.list_notifications(&me, 4, None, &[]).await.expect("db").expect("view");
+        let cursor = first.inner()["cursor"].as_str().expect("cursor").to_string();
+        assert!(cursor.contains("::"));
+        let rest = h.list_notifications(&me, 4, Some(&cursor), &[]).await.expect("db").expect("view");
+        assert_eq!(rest.inner()["notifications"].as_array().map(Vec::len), Some(2));
+        db.drop_db().await;
+    }
+
     #[tokio::test]
     async fn list_count_seen_and_exclusions() {
         let Some(db) = fresh_db("hydration_notifications").await else {

@@ -767,6 +767,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_labels_are_emitted_and_enforced() {
+        let Some(db) = fresh_db("hydration_labels").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let taken = post(p, BOB, "3ktaken22222", "taken down", None, None).await;
+        let hidden = post(p, BOB, "3khidden2222", "hidden", None, None).await;
+        let nsfw = post(p, BOB, "3knsfw222222", "informational", None, None).await;
+        let reply = post(p, ALICE, "3kreply22222", "graphic", Some(&nsfw), Some(&nsfw)).await;
+        for (subject, val) in [(&taken, "!takedown"), (&hidden, "!hide"), (&nsfw, "porn"), (&reply, "graphic-media")] {
+            exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{subject}', '{val}')")).await;
+        }
+        exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{BOB}', 'nudity')")).await;
+        let h = hydrator(p, sets());
+        let anon = Viewer::anonymous();
+        let label_vals = |v: &Value| -> Vec<String> {
+            v["labels"].as_array().into_iter().flatten().filter_map(|l| l["val"].as_str().map(str::to_string)).collect()
+        };
+
+        // Direct fetch: !takedown is not found; !hide is returned with its
+        // label; informational labels ride along on post and author.
+        let v = h.get_posts(&anon, &[taken.clone(), hidden.clone(), nsfw.clone()]).await.expect("db").expect("view");
+        let posts = v.inner()["posts"].as_array().expect("posts");
+        let uris: Vec<&str> = posts.iter().filter_map(|x| x["uri"].as_str()).collect();
+        assert_eq!(uris, [hidden.as_str(), nsfw.as_str()], "!takedown is omitted even from a direct fetch");
+        assert_eq!(label_vals(&posts[0]), ["!hide"]);
+        assert_eq!(label_vals(&posts[1]), ["porn"]);
+        assert_eq!(label_vals(&posts[1]["author"]), ["nudity"]);
+        let l = &posts[1]["labels"][0];
+        assert_eq!((l["src"].as_str(), l["uri"].as_str()), (Some(crate::hydration::testing::LABELER), Some(nsfw.as_str())));
+        assert!(l["cts"].is_string());
+
+        // Lists: both !takedown and !hide are omitted; informational stays.
+        let feed = h.get_author_feed(&anon, BOB, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
+        let listed: Vec<&str> = feed.inner()["feed"].as_array().expect("feed").iter().filter_map(|i| i["post"]["uri"].as_str()).collect();
+        assert_eq!(listed, [nsfw.as_str()]);
+        assert_eq!(label_vals(&feed.inner()["feed"][0]["post"]), ["porn"]);
+
+        // Profiles and threads carry labels too.
+        let profile = h.get_profile(&anon, BOB).await.expect("db").expect("view");
+        assert_eq!(label_vals(profile.inner()), ["nudity"]);
+        let thread = h.get_post_thread(&anon, &nsfw, 6, 20).await.expect("db").expect("view");
+        assert_eq!(label_vals(&thread.inner()["thread"]["post"]), ["porn"]);
+        assert_eq!(label_vals(&thread.inner()["thread"]["replies"][0]["post"]), ["graphic-media"]);
+        let e = h.get_post_thread(&anon, &taken, 6, 20).await.expect("db").expect_err("taken down");
+        assert_eq!(e.error, "NotFound");
+
+        // A takedown on the author hides the profile and every post.
+        exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{BOB}', '!takedown')")).await;
+        let e = h.get_profile(&anon, BOB).await.expect("db").expect_err("taken down");
+        assert_eq!(e.error, "AccountTakedown");
+        let v = h.get_posts(&anon, std::slice::from_ref(&nsfw)).await.expect("db").expect("view");
+        assert_eq!(v.inner()["posts"], json!([]));
+        db.drop_db().await;
+    }
+
+    #[tokio::test]
     async fn posts_author_feed_and_timeline() {
         let Some(db) = fresh_db("hydration_feed").await else {
             return;
