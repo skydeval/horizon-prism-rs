@@ -15,14 +15,22 @@
 //! against `scope_dids` and `members`, which are the durable source of truth.
 //!
 //! Retention is an ordinary writer under the §6.11.7 lock order: every batch
-//! takes the `ScopeState` read guard (through [`ScopeGuard`]) before its
-//! statement acquires a pool connection, and releases it after the statement
-//! commits. A batch therefore never runs concurrently with a write-guard
-//! holder (member add/remove, purge marker steps), so a DID re-entering scope
-//! through member add cannot have its rows deleted mid-batch. The pause
-//! between batches runs without the guard.
+//! takes the `ScopeState` read guard (through [`ScopeGuard`]) before it
+//! acquires a pool connection, and releases it after commit. A batch never
+//! runs concurrently with a write-guard holder (member add/remove, purge
+//! marker steps). The pause between batches runs without the guard.
+//!
+//! Steps whose deletions depend on scope or membership run **per DID**: under
+//! the read guard, one transaction takes the DID's exclusive advisory lock
+//! (`hashtextextended('did:' || did, 0)`) and then deletes that DID's rows, so
+//! the delete's scope and membership predicates are evaluated with the lock
+//! held. Scope growth takes the shared lock on each growth subject DID before
+//! inserting `scope_dids` (§6.11.7, §9.4), so a DID re-entering scope by any
+//! path is either visible to that delete or blocked until it finishes; it can
+//! never be half-deleted. Time-bounded steps keep plain row batches.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +43,10 @@ use crate::config::{RetentionConfig, UtcTimeOfDay};
 
 /// Rows deleted per batch (§4.4).
 pub const BATCH_SIZE: u64 = 10_000;
+/// DIDs fetched per candidate page for per-DID steps.
+pub const CANDIDATE_PAGE: u64 = 500;
+/// Takes a DID's exclusive advisory lock for the transaction (§6.11.7 key).
+pub const LOCK_DID_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended('did:' || $1, 0))";
 /// Pause between batches (§4.4).
 pub const BATCH_PAUSE: Duration = Duration::from_millis(100);
 /// `constellation_counts` rows unrefreshed this long are deleted (§4.4).
@@ -48,6 +60,10 @@ pub const FINISHED_WORK_DAYS: i32 = 30;
 pub const METRIC_DELETED_ROWS: &str = "retention_deleted_rows_total";
 /// Metric: retention task failures, labelled by task.
 pub const METRIC_TASK_FAILURES: &str = "retention_task_failures_total";
+/// Metric: candidate DIDs with nothing left to delete once locked, because
+/// they re-entered scope (or became protected) meanwhile. Counts how often
+/// the retention/growth race actually fires.
+pub const METRIC_SKIPPED_BY_RECHECK: &str = "retention_dids_skipped_by_recheck_total";
 
 /// Settings a retention run needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,11 +158,15 @@ enum Bind {
     Dids(Vec<String>),
 }
 
-/// One batched delete.
+/// One retention delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Step {
     table: &'static str,
+    /// The batched delete. For a per-DID step it also filters on the DID
+    /// parameter that follows the step's own bind.
     sql: String,
+    /// Per-DID steps: the query listing DIDs that have deletable rows.
+    candidates: Option<String>,
     bind: Bind,
 }
 
@@ -175,6 +195,32 @@ fn batched(table: &'static str, key: &str, alias: &str, pred: &str, bind: Bind) 
         sql: format!(
             "DELETE FROM {table} WHERE {key} IN (SELECT {alias}.{key} FROM {table} {alias} WHERE {pred} LIMIT {BATCH_SIZE})"
         ),
+        candidates: None,
+        bind,
+    }
+}
+
+/// A per-DID step (§6.11.7): rows are deleted one DID at a time, under that
+/// DID's exclusive advisory lock. `did_col` is the expression naming the DID a
+/// row belongs to. The DID is the parameter after the step's own bind.
+fn scoped(
+    table: &'static str,
+    key: &str,
+    alias: &str,
+    did_col: &str,
+    pred: &str,
+    bind: Bind,
+) -> Step {
+    let did_param = if matches!(bind, Bind::None) { 1 } else { 2 };
+    Step {
+        table,
+        sql: format!(
+            "DELETE FROM {table} WHERE {key} IN (SELECT {alias}.{key} FROM {table} {alias} \
+             WHERE {did_col} = ${did_param} AND {pred} LIMIT {BATCH_SIZE})"
+        ),
+        candidates: Some(format!(
+            "SELECT DISTINCT {did_col} AS did FROM {table} {alias} WHERE {pred} LIMIT {CANDIDATE_PAGE}"
+        )),
         bind,
     }
 }
@@ -189,31 +235,35 @@ fn scope_steps(private_owners: Vec<String>, private_row_authors: Vec<String>) ->
     ]);
     let subject_member = |alias: &str| member_among(&[author_of(&format!("{alias}.subject_uri"))]);
     vec![
-        batched(
+        scoped(
             "posts",
             "uri",
             "p",
+            "p.author_did",
             &format!("{} AND NOT {post_member_exception}", not_in_scope("p.author_did")),
             Bind::None,
         ),
-        batched(
+        scoped(
             "likes",
             "uri",
             "l",
+            "l.author_did",
             &format!("{} AND NOT {}", not_in_scope("l.author_did"), subject_member("l")),
             Bind::None,
         ),
-        batched(
+        scoped(
             "reposts",
             "uri",
             "r",
+            "r.author_did",
             &format!("{} AND NOT {}", not_in_scope("r.author_did"), subject_member("r")),
             Bind::None,
         ),
-        batched(
+        scoped(
             "follows",
             "uri",
             "f",
+            "f.author_did",
             &format!(
                 "{} AND NOT {}",
                 not_in_scope("f.author_did"),
@@ -221,10 +271,11 @@ fn scope_steps(private_owners: Vec<String>, private_row_authors: Vec<String>) ->
             ),
             Bind::None,
         ),
-        batched(
+        scoped(
             "blocks",
             "uri",
             "b",
+            "b.author_did",
             &format!(
                 "{} AND NOT {} AND NOT (b.author_did = ANY($1::text[]))",
                 not_in_scope("b.author_did"),
@@ -232,19 +283,21 @@ fn scope_steps(private_owners: Vec<String>, private_row_authors: Vec<String>) ->
             ),
             Bind::Dids(private_owners),
         ),
-        batched(
+        scoped(
             "feed_items",
             "uri",
             "fi",
+            "fi.originator_did",
             &not_in_scope("fi.originator_did"),
             Bind::None,
         ),
         // Derived: counts for posts whose author left scope and that no
         // remaining interaction row references.
-        batched(
+        scoped(
             "post_counts",
             "post_uri",
             "pc",
+            "split_part(pc.post_uri, '/', 3)",
             &format!(
                 "{} AND NOT EXISTS (SELECT 1 FROM likes x WHERE x.subject_uri = pc.post_uri) \
                  AND NOT EXISTS (SELECT 1 FROM reposts x WHERE x.subject_uri = pc.post_uri) \
@@ -256,10 +309,11 @@ fn scope_steps(private_owners: Vec<String>, private_row_authors: Vec<String>) ->
         ),
         // Identity rows: out of scope, not a member, and no class-M row
         // authored by the DID remains in any table.
-        batched(
+        scoped(
             "actors",
             "did",
             "a",
+            "a.did",
             &format!(
                 "{} AND NOT {} \
                  AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.author_did = a.did) \
@@ -274,10 +328,11 @@ fn scope_steps(private_owners: Vec<String>, private_row_authors: Vec<String>) ->
             Bind::Dids(private_row_authors),
         ),
         // actor_counts (class S) follow their identity row.
-        batched(
+        scoped(
             "actor_counts",
             "did",
             "ac",
+            "ac.did",
             &format!(
                 "{} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.did = ac.did)",
                 not_in_scope("ac.did")
@@ -418,12 +473,87 @@ async fn run_batch(pool: &PgPool, scope: &dyn ScopeGuard, step: &Step) -> Result
     Ok(result?.rows_affected())
 }
 
-/// Run one step to completion in batches, pausing between batches without
-/// the guard.
+/// Run one step to completion, pausing between batches without the guard.
 async fn run_step(pool: &PgPool, scope: &dyn ScopeGuard, step: &Step) -> Result<u64, sqlx::Error> {
+    if let Some(candidates) = &step.candidates {
+        return run_per_did(pool, scope, step, candidates).await;
+    }
     let mut total = 0u64;
     loop {
         let n = run_batch(pool, scope, step).await?;
+        total += n;
+        if n < BATCH_SIZE {
+            return Ok(total);
+        }
+        tokio::time::sleep(BATCH_PAUSE).await;
+    }
+}
+
+/// A per-DID step: list DIDs with deletable rows, then delete each DID's
+/// rows under its exclusive lock. Each DID is handled at most once per run.
+async fn run_per_did(
+    pool: &PgPool,
+    scope: &dyn ScopeGuard,
+    step: &Step,
+    candidates_sql: &str,
+) -> Result<u64, sqlx::Error> {
+    let mut total = 0u64;
+    let mut seen = HashSet::new();
+    loop {
+        let query = sqlx::query_scalar::<sqlx::Postgres, String>(candidates_sql);
+        let query = match &step.bind {
+            Bind::None => query,
+            Bind::Days(d) => query.bind(*d),
+            Bind::Dids(dids) => query.bind(dids.clone()),
+        };
+        let fresh: Vec<String> = query
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .filter(|did| seen.insert(did.clone()))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(total);
+        }
+        for did in &fresh {
+            total += delete_for_did(pool, scope, step, did).await?;
+        }
+        tokio::time::sleep(BATCH_PAUSE).await;
+    }
+}
+
+/// Delete one DID's rows for `step` (§6.11.7). Each batch: read guard, then a
+/// transaction that takes the DID's exclusive advisory lock and deletes. The
+/// delete's own predicate re-checks `scope_dids` and `members` after the lock
+/// is held, so a scope insert committed by a writer holding the DID's shared
+/// lock is always seen: either it committed before the lock was granted, or
+/// the writer is still waiting for the lock and inserts afterwards.
+async fn delete_for_did(
+    pool: &PgPool,
+    scope: &dyn ScopeGuard,
+    step: &Step,
+    did: &str,
+) -> Result<u64, sqlx::Error> {
+    let mut total = 0u64;
+    let mut first = true;
+    loop {
+        let guard = scope.read().await;
+        let mut tx = pool.begin().await?;
+        sqlx::query(LOCK_DID_SQL).bind(did).execute(&mut *tx).await?;
+        let query = sqlx::query::<sqlx::Postgres>(&step.sql);
+        let query = match &step.bind {
+            Bind::None => query.bind(did),
+            Bind::Days(d) => query.bind(*d).bind(did),
+            Bind::Dids(dids) => query.bind(dids.clone()).bind(did),
+        };
+        let n = query.execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        drop(guard);
+        if first && n == 0 {
+            metrics::counter!(METRIC_SKIPPED_BY_RECHECK, "table" => step.table).increment(1);
+            tracing::debug!(event = "retention_did_skipped_by_recheck", table = step.table, did, "DID re-entered scope before its rows were deleted");
+        }
+        first = false;
         total += n;
         if n < BATCH_SIZE {
             return Ok(total);
@@ -738,6 +868,190 @@ mod tests {
         assert!(run_batch(&pool, &scope, &step).await.is_err());
         assert_eq!(scope.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(scope.lock.try_write().is_ok(), "guard released after the batch");
+    }
+
+    #[test]
+    fn scope_steps_run_per_did_and_time_steps_do_not() {
+        for step in scope_steps(vec![], vec![]) {
+            let candidates = step.candidates.as_deref().unwrap_or_else(|| panic!("{} per DID", step.table));
+            assert!(candidates.starts_with("SELECT DISTINCT "), "{}", step.table);
+            assert!(candidates.ends_with("LIMIT 500"), "{}", step.table);
+        }
+        let settings = RetentionSettings {
+            tombstone_days: 7,
+            notification_days: 90,
+            max_age_days: 30,
+        };
+        for step in time_steps(&settings).into_iter().chain(age_cap_steps(30)) {
+            assert!(step.candidates.is_none(), "{} uses row batches", step.table);
+        }
+    }
+
+    #[test]
+    fn per_did_delete_binds_the_did_after_the_step_bind() {
+        let steps = scope_steps(vec![], vec![]);
+        let sql = |t: &str| steps.iter().find(|s| s.table == t).map(|s| s.sql.clone()).unwrap_or_default();
+        assert!(sql("posts").contains("WHERE p.author_did = $1 AND "));
+        assert!(sql("feed_items").contains("WHERE fi.originator_did = $1 AND "));
+        assert!(sql("post_counts").contains("WHERE split_part(pc.post_uri, '/', 3) = $1 AND "));
+        // blocks and actors bind a DID array first.
+        assert!(sql("blocks").contains("WHERE b.author_did = $2 AND "));
+        assert!(sql("actors").contains("WHERE a.did = $2 AND "));
+    }
+
+    #[test]
+    fn did_lock_uses_the_design_key() {
+        assert_eq!(
+            LOCK_DID_SQL,
+            "SELECT pg_advisory_xact_lock(hashtextextended('did:' || $1, 0))"
+        );
+    }
+
+    /// Tests against a real Postgres 16. They run when `HPRS_TEST_DATABASE_URL`
+    /// names a server the tests may create databases on; otherwise they pass
+    /// without doing anything.
+    mod pg {
+        use super::*;
+
+        const ENV: &str = "HPRS_TEST_DATABASE_URL";
+        const DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+
+        struct NoPrivate;
+
+        #[async_trait]
+        impl RetentionInputs for NoPrivate {
+            async fn private_owners(&self) -> Result<Vec<String>, sqlx::Error> {
+                Ok(Vec::new())
+            }
+            async fn private_row_authors(&self) -> Result<Vec<String>, sqlx::Error> {
+                Ok(Vec::new())
+            }
+        }
+
+        struct TestDb {
+            admin: PgPool,
+            pool: PgPool,
+            name: String,
+        }
+
+        impl TestDb {
+            async fn drop_db(self) {
+                self.pool.close().await;
+                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name))
+                    .execute(&self.admin)
+                    .await;
+            }
+        }
+
+        async fn fresh_db() -> Option<TestDb> {
+            let Ok(admin_url) = std::env::var(ENV) else {
+                eprintln!("{ENV} unset; skipping Postgres-backed retention test");
+                return None;
+            };
+            let admin = PgPool::connect(&admin_url).await.expect("connect admin database");
+            let name = format!("hprs_test_{}", rand::random::<u32>());
+            sqlx::query(&format!("CREATE DATABASE {name}"))
+                .execute(&admin)
+                .await
+                .expect("create test database");
+            let base = admin_url.rsplit_once('/').expect("URL with a database path").0;
+            let pool = PgPool::connect(&format!("{base}/{name}"))
+                .await
+                .expect("connect test database");
+            crate::db::migrations::MIGRATOR
+                .run(&pool)
+                .await
+                .expect("apply migrations");
+            Some(TestDb { admin, pool, name })
+        }
+
+        async fn insert_post(pool: &PgPool) -> String {
+            let uri = format!("at://{DID}/app.bsky.feed.post/3kaaaaaaaaaaa");
+            sqlx::query(
+                "INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at) \
+                 VALUES ($1, $2, '3kaaaaaaaaaaa', 'bafyreitest', '3kaaaaaaaaaaa', '{}'::jsonb, now())",
+            )
+            .bind(&uri)
+            .bind(DID)
+            .execute(pool)
+            .await
+            .expect("insert post");
+            uri
+        }
+
+        async fn post_exists(pool: &PgPool, uri: &str) -> bool {
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM posts WHERE uri = $1)")
+                .bind(uri)
+                .fetch_one(pool)
+                .await
+                .expect("query post")
+        }
+
+        async fn run_public(pool: &PgPool) -> RetentionReport {
+            let settings = RetentionSettings {
+                tombstone_days: 7,
+                notification_days: 90,
+                max_age_days: 0,
+            };
+            PublicRetention::new(Arc::new(NoPrivate))
+                .run(pool, &lock_scope(), &settings)
+                .await
+                .expect("retention run")
+        }
+
+        #[tokio::test]
+        async fn out_of_scope_rows_are_deleted() {
+            let Some(db) = fresh_db().await else { return };
+            let uri = insert_post(&db.pool).await;
+            run_public(&db.pool).await;
+            assert!(!post_exists(&db.pool, &uri).await);
+            db.drop_db().await;
+        }
+
+        #[tokio::test]
+        async fn did_in_scope_at_recheck_is_skipped() {
+            let Some(db) = fresh_db().await else { return };
+            let uri = insert_post(&db.pool).await;
+            sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)")
+                .bind(DID)
+                .execute(&db.pool)
+                .await
+                .expect("insert scope");
+            run_public(&db.pool).await;
+            assert!(post_exists(&db.pool, &uri).await);
+            db.drop_db().await;
+        }
+
+        /// The race: growth holds the subject DID's shared lock with its
+        /// `scope_dids` insert not yet committed when retention reaches the
+        /// DID. Retention must wait for it and then keep the rows.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn in_flight_growth_wins_over_retention() {
+            let Some(db) = fresh_db().await else { return };
+            let uri = insert_post(&db.pool).await;
+
+            let mut growth = db.pool.begin().await.expect("begin growth");
+            sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended('did:' || $1, 0))")
+                .bind(DID)
+                .execute(&mut *growth)
+                .await
+                .expect("shared DID lock");
+            sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)")
+                .bind(DID)
+                .execute(&mut *growth)
+                .await
+                .expect("uncommitted scope insert");
+
+            let pool = db.pool.clone();
+            let retention = tokio::spawn(async move { run_public(&pool).await });
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!retention.is_finished(), "retention waits for the growth transaction");
+
+            growth.commit().await.expect("commit growth");
+            retention.await.expect("retention task");
+            assert!(post_exists(&db.pool, &uri).await, "the re-entered DID keeps its rows");
+            db.drop_db().await;
+        }
     }
 
     #[test]
