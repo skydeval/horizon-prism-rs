@@ -78,7 +78,7 @@ curl -fsS https://<APP_PUBLIC_HOSTNAME>/xrpc/_health
 curl -fsS https://<APP_PUBLIC_HOSTNAME>/.well-known/did.json
 ```
 
-The first must return `"ok":true`. The second must show `did:web:<APP_PUBLIC_HOSTNAME>`.
+The first must return `"ok":true`; anonymously it shows only `ok` and `version`, and the full body (db, redis, audit guard, watermarks) needs a service JWT with `lxm` `_health`. The second must show `did:web:<APP_PUBLIC_HOSTNAME>`.
 
 **10. Add yourself as a member.**
 

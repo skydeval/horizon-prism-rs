@@ -211,5 +211,12 @@ commit.
 
 ### Security
 
+- `/xrpc/_health` answers anonymous callers with `{"ok","version"}` only;
+  the db/redis/audit flags, per-relay watermarks, `private_watermark` and
+  `gap_blocked` need a service JWT that verifies with `lxm` `_health` (no
+  membership check). An invalid token is answered as anonymous. Status
+  codes are unchanged (200/503), and the route stays outside the global
+  per-IP bucket except that a request carrying `Authorization` is charged
+  to it before verification. Design-v2 §7.1; §13 row 186.
 - Authorization-collection records that fail deterministically keep readiness
   unset (fail-closed) and raise the `AuthzBackfillStuck` alert.

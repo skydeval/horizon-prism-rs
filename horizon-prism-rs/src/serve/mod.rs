@@ -347,6 +347,9 @@ pub async fn run() -> Result<(), StartupError> {
         watermarks,
         status,
         audit: AuditLatch::from_flag(glue.audit_latched()),
+        auth: app.auth.clone(),
+        limits: app.limits.clone(),
+        trusted_proxy: app.trusted_proxy,
     };
     let listener = TcpListener::bind(cfg.file.http.bind)
         .await
