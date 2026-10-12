@@ -294,6 +294,12 @@ subscribed_post_max_age_secs = 86400
 [bookmarks]
 max_per_actor = 50000
 
+# Unfinished posts a member saves to finish later: how many one member may
+# keep, and the largest one (in bytes; 1 MiB).
+[drafts]
+max_per_actor = 1000
+max_bytes = 1048576
+
 # How often the "joined through this starter pack" numbers are recounted.
 [starter_packs]
 counts_refresh_secs = 3600

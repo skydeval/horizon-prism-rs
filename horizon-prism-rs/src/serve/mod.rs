@@ -377,6 +377,8 @@ pub async fn run() -> Result<(), StartupError> {
             thread_mutes_max: cfg.file.thread_mutes.max_per_actor,
             activity_subscriptions_max: cfg.file.activity_subscriptions.max_per_actor,
             bookmarks_max: cfg.file.bookmarks.max_per_actor,
+            drafts_max: cfg.file.drafts.max_per_actor,
+            drafts_max_bytes: cfg.file.drafts.max_bytes,
             known_followers_scan_max_pages: cfg.file.known_followers.scan_max_pages,
             known_followers_profile_scan_pages: cfg.file.known_followers.profile_scan_pages,
             known_likers_scan_max_pages: cfg.file.known_likers.scan_max_pages,

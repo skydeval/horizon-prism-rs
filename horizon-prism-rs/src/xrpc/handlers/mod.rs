@@ -4,6 +4,7 @@
 pub mod actor;
 pub mod bookmarks;
 pub mod did_web;
+pub mod drafts;
 pub mod feed;
 pub mod graph;
 pub mod index;

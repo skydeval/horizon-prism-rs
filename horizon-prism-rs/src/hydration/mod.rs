@@ -12,6 +12,7 @@
 
 pub mod activity_subscriptions;
 pub mod bookmarks;
+pub mod drafts;
 pub mod actor;
 pub mod cache;
 pub mod emit;
@@ -134,6 +135,10 @@ pub struct HydrationConfig {
     pub activity_subscriptions_max: u32,
     /// `bookmarks.max_per_actor`.
     pub bookmarks_max: u32,
+    /// `drafts.max_per_actor`.
+    pub drafts_max: u32,
+    /// `drafts.max_bytes`.
+    pub drafts_max_bytes: u32,
     /// `known_followers.scan_max_pages`.
     pub known_followers_scan_max_pages: u32,
     /// `known_followers.profile_scan_pages`.
@@ -826,6 +831,8 @@ pub(crate) mod testing {
                 thread_mutes_max: 3,
                 activity_subscriptions_max: 2,
                 bookmarks_max: 3,
+                drafts_max: 2,
+                drafts_max_bytes: 2000,
                 known_followers_scan_max_pages: 2,
                 known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,
@@ -858,6 +865,8 @@ pub(crate) mod testing {
                 thread_mutes_max: 3,
                 activity_subscriptions_max: 2,
                 bookmarks_max: 3,
+                drafts_max: 2,
+                drafts_max_bytes: 2000,
                 known_followers_scan_max_pages: 2,
                 known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,

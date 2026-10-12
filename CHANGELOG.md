@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 15: drafts (#675).** `app.bsky.draft.createDraft`, `getDrafts`,
+  `updateDraft` and `deleteDraft`. A draft is checked against the
+  lexicon (posts, text length, the embed lists) and against
+  `[drafts] max_bytes` (default 1 MiB) before it is stored; a member
+  keeps at most `[drafts] max_per_actor` (default 1000, then
+  `DraftLimitReached`). An update of an id the member does not own
+  changes nothing and succeeds. Nothing inside a draft is fetched or
+  logged (design-v3 §5.9).
 - **Item 15: bookmarks (#675).** `app.bsky.bookmark.createBookmark`,
   `deleteBookmark` and `getBookmarks`. Only posts can be bookmarked;
   any other collection, private-tier URIs included, is
