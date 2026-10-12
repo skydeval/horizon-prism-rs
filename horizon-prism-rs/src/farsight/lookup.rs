@@ -328,6 +328,9 @@ type Outcome = (String, Option<PairAnswer>);
 struct Called {
     outcomes: Vec<Outcome>,
     levels: Vec<Coverage>,
+    /// Every part of the call was answered (both halves, when it was
+    /// asked again as two).
+    answered: bool,
 }
 
 /// What a caller with budgets of its own may spend on one lookup
@@ -346,6 +349,12 @@ pub struct PairBudget {
 pub struct PairAnswers {
     pub answers: HashMap<String, PairAnswer>,
     pub levels: Vec<Coverage>,
+    /// `checkBlocks` calls the lookup made.
+    pub calls: usize,
+    /// The lookup made at least one call, every call was answered whole,
+    /// and every answer's level was `complete` or `assisted`: Farsight
+    /// vouches for the viewer's side (design-v3 §5.15.4).
+    pub vouches: bool,
 }
 
 impl Lookup {
@@ -617,6 +626,8 @@ impl Lookup {
             let now = Instant::now();
             let mut state = self.state();
             let mut cache = self.farsight.cache();
+            out.calls = called.len();
+            out.vouches = !called.is_empty() && called.iter().all(|call| call.answered && call.levels.iter().all(|level| level.vouches()));
             for call in called {
                 out.levels.extend(call.levels);
                 for (other, outcome) in call.outcomes {
@@ -665,7 +676,7 @@ impl Lookup {
             let inner = &self.farsight.inner;
             let none = |chunk: Vec<String>, outcome: &'static str| {
                 metrics::counter!(METRIC_CALLS, "outcome" => outcome).increment(1);
-                Called { outcomes: chunk.into_iter().map(|did| (did, None)).collect(), levels: Vec::new() }
+                Called { outcomes: chunk.into_iter().map(|did| (did, None)).collect(), levels: Vec::new(), answered: false }
             };
             // The admission is the probe-slot guard: dropped on any exit
             // below without a recorded outcome, it gives the slot back.
@@ -701,7 +712,7 @@ impl Lookup {
                             (did, pair)
                         })
                         .collect();
-                    Called { outcomes, levels: vec![answer.coverage] }
+                    Called { outcomes, levels: vec![answer.coverage], answered: true }
                 }
                 Err(CallError::TooLarge) => {
                     // Big, not failing: not recorded by the breaker.
@@ -716,9 +727,10 @@ impl Lookup {
                             Called {
                                 outcomes: a.outcomes.into_iter().chain(b.outcomes).collect(),
                                 levels: a.levels.into_iter().chain(b.levels).collect(),
+                                answered: a.answered && b.answered,
                             }
                         }
-                        None => Called { outcomes: chunk.into_iter().map(|did| (did, None)).collect(), levels: Vec::new() },
+                        None => Called { outcomes: chunk.into_iter().map(|did| (did, None)).collect(), levels: Vec::new(), answered: false },
                     }
                 }
                 Err(error) => {

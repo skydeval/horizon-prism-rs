@@ -24,7 +24,7 @@ pub mod lookup;
 
 pub use answer::{ChunkAnswer, Coverage, PairAnswer, Relation};
 pub use client::{CallError, FarsightClient};
-pub use lookup::{Farsight, Lookup};
+pub use lookup::{Farsight, Lookup, PairAnswers, PairBudget};
 
 use crate::config::{FarsightConfig, RateClassConfig};
 use crate::xrpc::rate_limit::class_problem;

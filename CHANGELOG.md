@@ -12,6 +12,15 @@ commit.
 
 ### Added
 
+- **Item 12a: Thread Lens verdicts (#674).** `threadlens::verdict`
+  decides, for the viewer and each author, one of "you block them",
+  "they block you", "clear" and "cannot say", from the viewer's own
+  blocks and list blocks, and from Farsight. An author is "clear" only
+  when Farsight vouches for it and for the viewer's side of the request;
+  a block always counts, vouched or not. Lookups run in rounds, each
+  author sent at most once per request, within
+  `threadlens.verdict_max_dids`. Thread Lens does not use it yet
+  (design-v3 §5.15.4 – §5.15.6).
 - **Item 12a: a second way to read Farsight (#674).** The `farsight`
   module can now return, for a viewer and a set of accounts, the whole
   answer per pair (a direct or list block in either direction, and

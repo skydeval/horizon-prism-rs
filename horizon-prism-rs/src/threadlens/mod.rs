@@ -16,6 +16,7 @@ pub mod gaps;
 pub mod handlers;
 pub mod ladder;
 pub mod thread;
+pub mod verdict;
 
 #[cfg(test)]
 mod tests;
