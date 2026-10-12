@@ -311,6 +311,11 @@ max_bytes = 1048576
 [labels]
 query_max_patterns = 25
 
+# Apps ask about the labeling services their user subscribes to. This is how
+# many services one such request may name.
+[labelers]
+get_services_max_dids = 50
+
 # How often the "joined through this starter pack" numbers are recounted.
 [starter_packs]
 counts_refresh_secs = 3600

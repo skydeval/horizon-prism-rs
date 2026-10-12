@@ -862,6 +862,20 @@ impl Default for BookmarksConfig {
     }
 }
 
+/// `[labelers]` (design-v3 §5.7).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LabelersConfig {
+    /// Labelers one `getServices` request may name.
+    pub get_services_max_dids: u32,
+}
+
+impl Default for LabelersConfig {
+    fn default() -> Self {
+        Self { get_services_max_dids: 50 }
+    }
+}
+
 /// `[labels]` (design-v3 §5.12).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1190,6 +1204,7 @@ pub struct FileConfig {
     pub bookmarks: BookmarksConfig,
     pub drafts: DraftsConfig,
     pub labels: LabelsConfig,
+    pub labelers: LabelersConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,
     pub known_likers: KnownLikersConfig,

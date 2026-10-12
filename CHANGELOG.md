@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 15: `app.bsky.labeler.getServices` (#675).** The labeling
+  services an app asks about: stored ones from local rows, any other
+  from its service record through Slingshot. Each view carries its
+  creator's profile, like count, the viewer's like, local labels and
+  `indexedAt`; `detailed=true` adds the policies and subject fields. A
+  labeler taken down here is left out. At most
+  `[labelers] get_services_max_dids` per request (default 50)
+  (design-v3 §5.7).
 - **Item 15: `bookmarkCount` (#675).** Post views can carry how many
   members bookmarked the post, by `[bookmarks] emit_count`: `never` (the
   default, safe for a small community where a count of 1 points at one

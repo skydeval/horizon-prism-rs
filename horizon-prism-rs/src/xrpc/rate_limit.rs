@@ -191,6 +191,7 @@ pub const SERVED: &[Served] = &[
     served("app.bsky.draft.updateDraft", Family::Write, false),
     served("app.bsky.draft.deleteDraft", Family::Write, false),
     served("app.bsky.draft.getDrafts", Family::Read, false),
+    served("app.bsky.labeler.getServices", Family::Read, true),
     served("com.atproto.label.queryLabels", Family::Read, true),
     served("com.atproto.repo.getRecord", Family::Read, true),
     served("app.nearhorizon.feed.getAuthorPolls", Family::Read, true),

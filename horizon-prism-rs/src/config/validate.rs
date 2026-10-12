@@ -56,6 +56,9 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if !(60..=2_592_000).contains(&cfg.notifications.subscribed_post_max_age_secs) {
         out.push("notifications.subscribed_post_max_age_secs must be 60 to 2592000".to_string());
     }
+    if !(1..=1000).contains(&cfg.labelers.get_services_max_dids) {
+        out.push("labelers.get_services_max_dids must be 1 to 1000".to_string());
+    }
     if !(1..=1000).contains(&cfg.labels.query_max_patterns) {
         out.push("labels.query_max_patterns must be 1 to 1000".to_string());
     }

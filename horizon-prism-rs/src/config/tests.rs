@@ -273,6 +273,9 @@ max_bytes = 1048576
 [labels]
 query_max_patterns = 25
 
+[labelers]
+get_services_max_dids = 50
+
 [starter_packs]
 counts_refresh_secs = 3600
 
