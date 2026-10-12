@@ -20,6 +20,7 @@ pub mod answer;
 pub mod chunks;
 pub mod client;
 pub mod did;
+pub mod fallback;
 pub mod gate;
 pub mod lookup;
 
