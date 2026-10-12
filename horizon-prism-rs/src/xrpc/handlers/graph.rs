@@ -15,6 +15,7 @@ pub const GET_FOLLOWS: &str = "app.bsky.graph.getFollows";
 pub const GET_FOLLOWERS: &str = "app.bsky.graph.getFollowers";
 pub const GET_LIST: &str = "app.bsky.graph.getList";
 pub const GET_LISTS: &str = "app.bsky.graph.getLists";
+pub const GET_RELATIONSHIPS: &str = "app.bsky.graph.getRelationships";
 pub const GET_LISTS_WITH_MEMBERSHIP: &str = "app.bsky.graph.getListsWithMembership";
 pub const GET_STARTER_PACKS_WITH_MEMBERSHIP: &str = "app.bsky.graph.getStarterPacksWithMembership";
 pub const GET_STARTER_PACK: &str = "app.bsky.graph.getStarterPack";
@@ -95,6 +96,17 @@ pub async fn get_actor_starter_packs(
             .get_actor_starter_packs(&req.viewer, &req.req, p.required("actor")?, clamp_limit(p.u32("limit")?), p.one("cursor"))
             .await,
     )
+}
+
+pub async fn get_relationships(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_RELATIONSHIPS, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(&req.req, s.hydrator.get_relationships(&req.req, p.required("actor")?, &p.all("others")).await)
 }
 
 /// The viewer's own lists and packs: a ready member.

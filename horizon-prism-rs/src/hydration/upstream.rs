@@ -78,6 +78,10 @@ pub trait UpstreamSource: Send + Sync {
     async fn lists(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>, _purposes: &[String]) -> Option<Value> {
         None
     }
+    /// An upstream AppView's `app.bsky.graph.getRelationships` output.
+    async fn relationships(&self, _req: &Requester, _actor: &str, _others: &[String]) -> Option<Value> {
+        None
+    }
     /// An upstream AppView's `app.bsky.graph.getStarterPack` output, for the
     /// parts of a pack this AppView cannot build itself (the sample of a
     /// list it does not serve locally).
@@ -818,6 +822,10 @@ impl UpstreamSource for RealUpstreamSource {
             out["cursor"] = json!(format!("P:{c}"));
         }
         Some(out)
+    }
+
+    async fn relationships(&self, req: &Requester, actor: &str, others: &[String]) -> Option<Value> {
+        self.cascade(req, actor, Call::Relationships { actor, others }).await
     }
 
     async fn starter_pack(&self, req: &Requester, uri: &str) -> Option<Value> {

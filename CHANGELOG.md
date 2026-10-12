@@ -12,6 +12,17 @@ commit.
 
 ### Added
 
+- **Item 12: `getRelationships` (#673).** For a ready member, `following`,
+  `followedBy`, `blocking` and `blockedBy` come from local rows, which are
+  complete for a member (design-v3 §5.3). `blockingByList` is the member's
+  `listblock` record for a moderation list that names the other account,
+  and only for a list whose owner is a ready member; it is read from public
+  rows and never from the subscription tables. Any other actor is asked of
+  an upstream AppView; when none answers, local rows answer what they can
+  and `relationships_partial_total` counts it. A stored block is read only
+  when its author is in scope or its subject is a member. At most 30
+  `others`; one that does not resolve is `#notFoundActor`. `blockedByList`
+  is not set yet: it needs the block index.
 - **Item 12: starter-pack joined counts (#673).** A job recounts, for every
   stored pack, how many accounts joined through it, every
   `starter_packs.counts_refresh_secs` (default 3600, at least 60). The

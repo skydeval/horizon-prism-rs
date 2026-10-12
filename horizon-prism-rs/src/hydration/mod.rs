@@ -20,6 +20,7 @@ pub mod lens;
 pub mod lists;
 pub mod normalize;
 pub mod notifications;
+pub mod relationships;
 pub mod starter_packs;
 pub mod thread;
 pub mod upstream;
@@ -666,6 +667,8 @@ pub(crate) mod testing {
         pub list_items: HashMap<String, Value>,
         /// DID → `getLists` output.
         pub lists: HashMap<String, Value>,
+        /// Actor DID → `getRelationships` output.
+        pub relationships: HashMap<String, Value>,
         /// Pack URI → `getStarterPack` output.
         pub starter_packs: HashMap<String, Value>,
         /// DID → `getActorStarterPacks` output.
@@ -694,6 +697,9 @@ pub(crate) mod testing {
         }
         async fn lists(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>, _purposes: &[String]) -> Option<Value> {
             self.lists.get(actor).cloned()
+        }
+        async fn relationships(&self, _req: &Requester, actor: &str, _others: &[String]) -> Option<Value> {
+            self.relationships.get(actor).cloned()
         }
         async fn starter_pack(&self, _req: &Requester, uri: &str) -> Option<Value> {
             self.starter_packs.get(uri).cloned()

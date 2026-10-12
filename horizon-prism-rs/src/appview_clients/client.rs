@@ -148,6 +148,17 @@ impl AppViewClient {
         self.query("app.bsky.graph.getList", &params).await
     }
 
+    /// `app.bsky.graph.getRelationships`.
+    ///
+    /// # Errors
+    ///
+    /// Any [`NetError`].
+    pub async fn get_relationships(&self, actor: &str, others: &[String]) -> Result<NetResponse, NetError> {
+        let mut params = vec![("actor", actor.to_string())];
+        params.extend(others.iter().map(|o| ("others", o.clone())));
+        self.query("app.bsky.graph.getRelationships", &params).await
+    }
+
     /// `app.bsky.graph.getStarterPack`.
     ///
     /// # Errors
