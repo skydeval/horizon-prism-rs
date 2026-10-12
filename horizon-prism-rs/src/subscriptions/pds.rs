@@ -211,13 +211,13 @@ impl OwnerRecords for PdsRecords {
     /// A purge or a reset bumps the job's generation: the run stops within
     /// one page.
     async fn superseded(&self) -> bool {
-        let generation: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar("SELECT generation FROM backfill_jobs WHERE did = $1 AND depth = $2")
+        let row: Result<Option<(i64, String)>, sqlx::Error> = sqlx::query_as("SELECT generation, state FROM backfill_jobs WHERE did = $1 AND depth = $2")
             .bind(&self.owner)
             .bind(jobs::DEPTH)
             .fetch_optional(&self.pool)
             .await;
         // A read that failed says nothing: the batches check again.
-        generation.is_ok_and(|g| g != Some(self.generation))
+        row.is_ok_and(|row| !row.is_some_and(|(generation, state)| generation == self.generation && state == "running"))
     }
 }
 

@@ -12,6 +12,18 @@ commit.
 
 ### Added
 
+- **Item 12: choosing the next list sync (#673).**
+  `subscriptions::claim` picks one due sync per lane (fast, and slow for
+  owners whose servers answer slowly). A queued sync whose reason has
+  gone, such as a mute withdrawn before the run began, ends without a
+  run and without moving the owner's pacing
+  (`list_sync_causeless_total`). Among the rest the pick goes to whoever
+  has held the lane least lately: each member's mutes and each member's
+  blocks count separately, beside two shared turns for repairs nobody
+  waits on and for owners that were cut. The general backfill worker no
+  longer claims or re-queues `list_sync` rows. A run also stops when its
+  job row is no longer `running`. Nothing starts a claim yet (design-v3
+  §4.3 "A separate claim", "Fair claims").
 - **Item 12: list sync against real servers (#673).**
   `subscriptions::pds` checks a list owner's account (a fresh identity
   document that is neither stored nor cached, then the repository's

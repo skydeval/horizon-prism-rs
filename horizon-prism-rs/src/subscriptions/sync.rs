@@ -152,15 +152,16 @@ fn storable(purpose: Option<&str>) -> Option<&str> {
     purpose.filter(|p| !p.contains('\0') && p.len() <= MAX_PURPOSE_BYTES)
 }
 
-/// Whether the job still has the generation the run was claimed with. Takes
-/// the job row `FOR SHARE` (lock step 6).
+/// Whether the job is still the run that was claimed: still `running`, at
+/// the same generation. A purge cancels the row; a reset or the stuck-row
+/// check bumps the generation. Takes the job row `FOR SHARE` (lock step 6).
 async fn current(conn: &mut PgConnection, snap: &Snapshot) -> Result<bool, sqlx::Error> {
-    let generation: Option<i64> = sqlx::query_scalar("SELECT generation FROM backfill_jobs WHERE did = $1 AND depth = $2 FOR SHARE")
+    let row: Option<(i64, String)> = sqlx::query_as("SELECT generation, state FROM backfill_jobs WHERE did = $1 AND depth = $2 FOR SHARE")
         .bind(&snap.owner)
         .bind(jobs::DEPTH)
         .fetch_optional(conn)
         .await?;
-    Ok(generation == Some(snap.generation))
+    Ok(row.is_some_and(|(generation, state)| generation == snap.generation && state == "running"))
 }
 
 /// Lock `list`'s row and say whether it is still the active instance the

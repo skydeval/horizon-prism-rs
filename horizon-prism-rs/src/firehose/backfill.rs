@@ -606,13 +606,14 @@ impl Backfill {
 
     /// Start the workers, the retry scheduler, the daily `authz` schedule and
     /// the metrics sampler. Jobs left `running` by a previous process are
-    /// re-queued first.
+    /// re-queued first. `list_sync` rows are not this worker's: they have
+    /// their own claim (`subscriptions::claim`).
     ///
     /// # Errors
     ///
     /// The startup re-queue failed.
     pub async fn spawn(self) -> Result<Vec<JoinHandle<()>>, sqlx::Error> {
-        let n = sqlx::query("UPDATE backfill_jobs SET state = 'queued', updated_at = now() WHERE state = 'running'")
+        let n = sqlx::query("UPDATE backfill_jobs SET state = 'queued', updated_at = now() WHERE state = 'running' AND depth <> 'list_sync'")
             .execute(&self.pool)
             .await?
             .rows_affected();
@@ -671,7 +672,7 @@ impl Backfill {
     async fn claim(&self) -> Result<Option<Job>, sqlx::Error> {
         let row: Option<(String, String, i32)> = sqlx::query_as(
             "WITH next AS ( \
-               SELECT did, depth FROM backfill_jobs WHERE state = 'queued' AND not_before <= now() \
+               SELECT did, depth FROM backfill_jobs WHERE state = 'queued' AND depth <> 'list_sync' AND not_before <= now() \
                ORDER BY not_before LIMIT 1 FOR UPDATE SKIP LOCKED) \
              UPDATE backfill_jobs j SET state = 'running', updated_at = now(), \
                gap_epoch = COALESCE((SELECT (value #>> '{}')::bigint FROM worker_state WHERE key = $1), 0) \

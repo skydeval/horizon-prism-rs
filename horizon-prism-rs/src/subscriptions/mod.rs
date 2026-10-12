@@ -7,12 +7,14 @@
 //! only to apply those members' own mutes and blocks.
 //!
 //! Built so far: the member's side ([`references`]), the list phase and
-//! the release of an unreferenced list ([`list_phase`]), and the job row's
-//! enqueue rules ([`jobs`]). Nothing runs them yet. The `list_sync` job,
-//! the copy rule and the views that apply a reference are not built, so a
-//! stored reference has no effect on any view.
+//! the release of an unreferenced list ([`list_phase`], [`applier`]), the
+//! job row's enqueue rules ([`jobs`]), the claim ([`claim`]) and the run
+//! itself ([`run`], [`sync`], [`fetch`], [`pds`]). Nothing starts them
+//! yet. The copy rule and the views that apply a reference are not built,
+//! so a stored reference has no effect on any view.
 
 pub mod applier;
+pub mod claim;
 pub mod fetch;
 pub mod jobs;
 pub mod list_phase;
