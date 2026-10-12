@@ -27,6 +27,7 @@ use crate::firehose::jobs::{self, Depth};
 use crate::firehose::writer::SENTINEL_REV;
 use crate::identity::AccountLifecycle;
 use crate::private_tier::PrivateTier;
+use crate::subscriptions::{jobs as list_sync, triggers};
 
 /// Rows per deletion batch (§6.11.7).
 pub const BATCH: i64 = 10_000;
@@ -49,12 +50,21 @@ pub struct Purger {
     pool: PgPool,
     scope: ScopeState,
     private: Arc<dyn PrivateTier>,
+    /// `lists.sync_min_interval_secs`, for the list sync a purge end owes.
+    sync_min_interval_secs: u32,
 }
 
 impl Purger {
     #[must_use]
     pub fn new(pool: PgPool, scope: ScopeState, private: Arc<dyn PrivateTier>) -> Self {
-        Self { pool, scope, private }
+        Self { pool, scope, private, sync_min_interval_secs: 600 }
+    }
+
+    /// Set `lists.sync_min_interval_secs`.
+    #[must_use]
+    pub fn with_sync_min_interval_secs(mut self, secs: u32) -> Self {
+        self.sync_min_interval_secs = secs;
+        self
     }
 
     /// Run a whole purge. A purge of the same kind already in progress is
@@ -282,6 +292,10 @@ impl Purger {
             .bind(did)
             .execute(&mut *tx)
             .await?;
+        // Rule 4 (§4.3): while the marker stood nothing the DID did to its
+        // lists was copied, so a DID that still owns a subscribed list is
+        // owed a list sync. Its owner row is taken before any job row.
+        triggers::request_if_active(&mut tx, did, list_sync::LOW, self.sync_min_interval_secs).await?;
         sqlx::query(
             "UPDATE backfill_jobs SET state = 'queued', not_before = now(), updated_at = now() \
              WHERE did = $1 AND depth IN ('member', 'private', 'authz') AND state IN ('queued', 'running')",
@@ -675,6 +689,36 @@ mod tests {
 
         // Idempotent through the lifecycle hook.
         PurgeLifecycle::new(purger).account_deleted(SCOPED).await.expect("again");
+        db.drop_db().await;
+    }
+
+    /// Rule 4: the purge cancels the owner's list sync, and its end
+    /// requests one when the owner still has a subscribed list.
+    #[tokio::test]
+    async fn purge_end_requests_a_list_sync_for_an_owner_with_a_subscribed_list() {
+        use crate::subscriptions::list_phase;
+        use crate::subscriptions::references::{Budget, mute_list};
+
+        let Some(db) = fresh_db("purge_list_sync").await else {
+            return;
+        };
+        let p = &db.pool;
+        let list = format!("at://{SCOPED}/app.bsky.graph.list/3klist1");
+        mute_list(p, MEMBER, &list, Budget { max_references: 5, max_owners: 5 }).await.expect("mute");
+        list_phase::apply(p, &list, 600).await.expect("apply");
+        let scope = ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10);
+        let purger = Purger::new(p.clone(), scope, Arc::new(DisabledPrivateTier));
+
+        purger.marker(SCOPED, PurgeKind::AccountDeleted).await.expect("marker");
+        assert_eq!(count(p, "SELECT count(*) FROM backfill_jobs WHERE depth = 'list_sync' AND state = 'cancelled'").await, 1);
+        assert_eq!(purger.resume_all().await.expect("resume"), 1);
+        assert_eq!(count(p, "SELECT count(*) FROM backfill_jobs WHERE depth = 'list_sync' AND state = 'queued'").await, 1);
+        assert_eq!(count(p, "SELECT count(*) FROM subscribed_owners WHERE owner_did = 'did:plc:dddddddddddddddddddddddd' AND resync_requested_at IS NOT NULL").await, 1);
+
+        // An account with no subscribed list is owed nothing.
+        purger.purge(OUTSIDER, PurgeKind::AccountDeleted).await.expect("purge");
+        assert_eq!(count(p, "SELECT count(*) FROM backfill_jobs WHERE did = 'did:plc:cccccccccccccccccccccccc'").await, 0);
+        assert_eq!(count(p, "SELECT count(*) FROM subscribed_owners").await, 1);
         db.drop_db().await;
     }
 }

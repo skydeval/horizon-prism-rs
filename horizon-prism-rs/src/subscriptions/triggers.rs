@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use super::applier::Waiting;
 use super::jobs;
@@ -27,35 +27,41 @@ const WEEKLY_KEY: &str = "list_sync_weekly_ran_at";
 /// Database errors.
 pub async fn enqueue(pool: &PgPool, owner: &str, priority: i16, min_interval_secs: u32, request: bool) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    enqueue_in(&mut tx, owner, priority, min_interval_secs, request).await?;
+    tx.commit().await
+}
+
+/// [`enqueue`], inside the caller's transaction.
+async fn enqueue_in(conn: &mut PgConnection, owner: &str, priority: i16, min_interval_secs: u32, request: bool) -> Result<(), sqlx::Error> {
     if request {
         sqlx::query(
             "INSERT INTO subscribed_owners (owner_did, resync_requested_at) VALUES ($1, clock_timestamp()) \
              ON CONFLICT (owner_did) DO UPDATE SET resync_requested_at = clock_timestamp()",
         )
         .bind(owner)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     } else {
-        sqlx::query("SELECT 1 FROM subscribed_owners WHERE owner_did = $1 FOR SHARE").bind(owner).execute(&mut *tx).await?;
+        sqlx::query("SELECT 1 FROM subscribed_owners WHERE owner_did = $1 FOR SHARE").bind(owner).execute(&mut *conn).await?;
     }
-    jobs::enqueue(&mut tx, owner, priority, min_interval_secs).await?;
-    tx.commit().await
+    jobs::enqueue(conn, owner, priority, min_interval_secs).await
 }
 
-/// Request a run for `owner` if it still has an active list: the end of a
-/// purge of the owner, whose changes were withheld while the purge stood.
-/// Returns whether a run was requested.
+/// Request a run for `owner` if it still has an active list, inside the
+/// caller's transaction: the end of a purge of the owner, whose changes
+/// were withheld while the purge stood, and `admin lists sync`. Returns
+/// whether a run was requested.
 ///
 /// # Errors
 ///
 /// Database errors.
-pub async fn request_if_active(pool: &PgPool, owner: &str, priority: i16, min_interval_secs: u32) -> Result<bool, sqlx::Error> {
+pub async fn request_if_active(conn: &mut PgConnection, owner: &str, priority: i16, min_interval_secs: u32) -> Result<bool, sqlx::Error> {
     let active: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM subscribed_lists WHERE owner_did = $1 AND state = 'active')")
         .bind(owner)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     if active {
-        enqueue(pool, owner, priority, min_interval_secs, true).await?;
+        enqueue_in(conn, owner, priority, min_interval_secs, true).await?;
     }
     Ok(active)
 }
@@ -245,8 +251,10 @@ mod tests {
 
         // A requested run is recorded on the owner's row, and only for an
         // owner with an active list.
-        assert!(request_if_active(p, A, jobs::LOW, 600).await.expect("request"));
-        assert!(!request_if_active(p, M1, jobs::LOW, 600).await.expect("request"));
+        let mut conn = p.acquire().await.expect("conn");
+        assert!(request_if_active(&mut conn, A, jobs::LOW, 600).await.expect("request"));
+        assert!(!request_if_active(&mut conn, M1, jobs::LOW, 600).await.expect("request"));
+        drop(conn);
         let requested: Vec<String> = sqlx::query_scalar("SELECT owner_did FROM subscribed_owners WHERE resync_requested_at IS NOT NULL").fetch_all(p).await.expect("requested");
         assert_eq!(requested, vec![A.to_string()]);
 

@@ -23,6 +23,7 @@ use crate::firehose::jobs::{self, Depth};
 use crate::firehose::writer::Writer;
 use crate::identity::eligibility::{self, Confirmation};
 use crate::private_tier::PrivateTier;
+use crate::subscriptions::{jobs as list_sync, triggers};
 
 /// Label values accepted by `label add` (§7.8). Anything else is rejected.
 pub const LABEL_VALUES: [&str; 6] = ["!takedown", "!hide", "porn", "sexual", "nudity", "graphic-media"];
@@ -44,6 +45,8 @@ pub enum AdminCommand {
     FarsightStatus,
     /// `farsight prime <did> [--force]`: ask Farsight to read a repository.
     FarsightPrime { did: String, force: bool },
+    /// `lists sync <list-uri>`: sync a subscribed list's owner now.
+    ListsSync { uri: String },
 }
 
 /// A command that cannot be parsed or is invalid.
@@ -76,6 +79,7 @@ impl AdminCommand {
             Self::DeadletterDrop { id } => ("deadletter drop", json!({ "id": id })),
             Self::FarsightStatus => ("farsight status", json!({})),
             Self::FarsightPrime { did, force } => ("farsight prime", json!({ "did": did, "force": force })),
+            Self::ListsSync { uri } => ("lists sync", json!({ "uri": uri })),
         }
     }
 
@@ -139,6 +143,14 @@ impl AdminCommand {
                 did: did()?,
                 force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
             },
+            "lists sync" => {
+                let uri = s("uri")?;
+                let is_list = uri_author(&uri).is_some_and(is_did) && uri.split('/').nth(3) == Some("app.bsky.graph.list");
+                if !is_list {
+                    return Err(InvalidCommand(format!("{command}: {uri:?} is not a list's at-uri")));
+                }
+                Self::ListsSync { uri }
+            }
             other => return Err(InvalidCommand(format!("unknown command {other:?}"))),
         })
     }
@@ -151,6 +163,9 @@ impl AdminCommand {
             Self::LabelAdd { subject, .. } | Self::LabelRemove { subject, .. } => {
                 if is_did(subject) { Some(subject) } else { uri_author(subject) }
             }
+            // Waits on a purge of the owner, whose end requests the sync
+            // itself.
+            Self::ListsSync { uri } => uri_author(uri),
             Self::ScopeRebuild { .. }
             | Self::Resync
             | Self::DeadletterReplay { .. }
@@ -188,6 +203,8 @@ pub struct Handlers {
     pub community_patterns: Arc<Vec<String>>,
     /// The block-list index, when `farsight.url` is set.
     pub farsight: Option<Farsight>,
+    /// `lists.sync_min_interval_secs`.
+    pub sync_min_interval_secs: u32,
 }
 
 impl Handlers {
@@ -217,8 +234,34 @@ impl Handlers {
             AdminCommand::DeadletterDrop { id } => self.deadletter_drop(id).await,
             AdminCommand::FarsightStatus => self.farsight_status().await,
             AdminCommand::FarsightPrime { did, force } => self.farsight_prime(did, *force).await,
+            AdminCommand::ListsSync { uri } => self.lists_sync(uri).await,
         };
         result.unwrap_or_else(Outcome::Failed)
+    }
+
+    /// `lists sync` (design-v3 §4.3, §14.3): a high-priority list sync for
+    /// the owner of a subscribed list, recorded on the owner's row so it
+    /// runs even when nothing else shows a run is owed. It is still paced
+    /// like any other run of that owner.
+    async fn lists_sync(&self, uri: &str) -> Result<Outcome, String> {
+        let owner = uri_author(uri).ok_or_else(|| "not an at-uri".to_string())?;
+        if self.purging(owner).await.map_err(|e| e.to_string())? {
+            return Ok(Outcome::Defer);
+        }
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let subscribed: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM subscribed_lists WHERE list_uri = $1 AND state = 'active')")
+            .bind(uri)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !subscribed {
+            return Err("no member references this list".to_string());
+        }
+        triggers::request_if_active(&mut tx, owner, list_sync::HIGH, self.sync_min_interval_secs)
+            .await
+            .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(Outcome::Done(json!({ "uri": uri, "owner": owner, "requested": true })))
     }
 
     fn farsight(&self) -> Result<&Farsight, String> {
@@ -489,6 +532,13 @@ mod tests {
             assert_eq!(cmd.did(), None);
         }
         assert!(AdminCommand::parse("farsight prime", &json!({"did": "bob"})).is_err());
+        // `lists sync` takes a list's at-uri and waits on its owner's purge.
+        let sync = AdminCommand::ListsSync { uri: format!("at://{DID}/app.bsky.graph.list/3k") };
+        let (name, args) = sync.to_row();
+        assert_eq!(AdminCommand::parse(name, &args), Ok(sync.clone()));
+        assert_eq!(sync.did(), Some(DID));
+        assert!(AdminCommand::parse("lists sync", &json!({"uri": format!("at://{DID}/app.bsky.feed.post/3k")})).is_err());
+        assert!(AdminCommand::parse("lists sync", &json!({"uri": DID})).is_err());
         assert!(AdminCommand::parse("label add", &json!({"subject": DID, "val": "spam"})).is_err());
         assert!(AdminCommand::parse("label add", &json!({"subject": "https://x", "val": "porn"})).is_err());
         assert!(AdminCommand::parse("backfill", &json!({"did": DID, "depth": "deep"})).is_err());

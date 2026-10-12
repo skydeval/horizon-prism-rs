@@ -21,9 +21,14 @@ commit.
   owner that looks gone (never for an ordinary owner), and requested
   syncs recorded on the owner's row. A sync row left `running` at
   startup, or found stuck, now ends as a run does: the owner's pacing
-  moves and the next start is paced. The sweep and the weekly run are
-  on in `serve`; the event and requested syncs have no caller yet
-  (design-v3 §4.3 "When a sync is enqueued").
+  moves and the next start is paced. All are on in `serve`: the firehose
+  consumer raises the event sync, and the end of a purge of a list
+  owner requests one (design-v3 §4.3 "When a sync is enqueued").
+- **Item 12: `admin lists sync <list-uri>` (#673).** Asks for a
+  high-priority sync of the owner of a list some member mutes or blocks.
+  It is still paced like any other sync of that owner, waits while the
+  owner is being purged, and fails for a list no member references
+  (design-v3 §14.3).
 - **Item 12: list syncs on the backfill workers (#673).**
   `subscriptions::runner` lets a backfill worker run a list sync before
   its ordinary work: the fast lane first, then the slow lane, each with

@@ -68,6 +68,13 @@ impl Rebuild {
         }
     }
 
+    /// Set `lists.sync_min_interval_secs` on the rebuild's purges.
+    #[must_use]
+    pub fn with_sync_min_interval_secs(mut self, secs: u32) -> Self {
+        self.purger = self.purger.with_sync_min_interval_secs(secs);
+        self
+    }
+
     /// Step 1: DID → reason bits under the active policy.
     ///
     /// # Errors

@@ -27,10 +27,11 @@ use super::deadletter::{self, DeadLetter};
 use super::gap::{self, GapCause};
 use super::router::route_identity;
 use super::scripts::{self, CheckedRead, ScriptError};
-use super::stream::{Commit, Event, StreamEntry, decode, parse_read_reply, repo_hint};
+use super::stream::{Commit, Event, IdentityKind, StreamEntry, decode, parse_read_reply, repo_hint};
 use super::watermark::{Watermarks, contribution};
 use super::writer::{ApplyOptions, Transient, Writer};
 use crate::config::FirehoseConfig;
+use crate::subscriptions::triggers;
 
 /// `XAUTOCLAIM` min-idle (§5.3).
 pub const AUTOCLAIM_MIN_IDLE_MS: u64 = 60_000;
@@ -99,6 +100,8 @@ pub struct Consumer {
     watermarks: Watermarks,
     coverage: CoverageHandle,
     status: Arc<ConsumerStatus>,
+    /// `lists.sync_min_interval_secs`, for a sync an owner's event causes.
+    sync_min_interval_secs: u32,
 }
 
 impl Consumer {
@@ -120,7 +123,15 @@ impl Consumer {
             watermarks,
             coverage,
             status,
+            sync_min_interval_secs: 600,
         }
+    }
+
+    /// Set `lists.sync_min_interval_secs`.
+    #[must_use]
+    pub fn with_sync_min_interval_secs(mut self, secs: u32) -> Self {
+        self.sync_min_interval_secs = secs;
+        self
     }
 
     fn apply_options(&self) -> ApplyOptions {
@@ -362,6 +373,13 @@ impl Consumer {
         match event {
             Event::Identity { kind, did, .. } => {
                 route_identity(&self.pool, kind, &did).await?;
+                // Rule 4 (§4.3): an owner of a subscribed list that looks
+                // gone is looked at again; an ordinary owner's events
+                // cause no sync.
+                let owner_event = matches!(kind, IdentityKind::Identity | IdentityKind::Account);
+                if owner_event && self.writer.scope().read_guard().await.subscribed.tracks(&did) {
+                    triggers::owner_event(&self.pool, &did, self.sync_min_interval_secs).await?;
+                }
                 Ok(())
             }
             Event::Commit(commit) => self.process_commit(entry, commit).await,

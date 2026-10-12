@@ -154,7 +154,8 @@ pub async fn run() -> Result<(), StartupError> {
     let resolver = IdentityResolver::new(net.clone(), pool.clone(), IdentitySettings::from_app(&cfg), policy);
     let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private))
         .with_subscribed_post_max_age_secs(cfg.file.notifications.subscribed_post_max_age_secs);
-    let purger = Purger::new(pool.clone(), scope.clone(), Arc::clone(&private));
+    let purger = Purger::new(pool.clone(), scope.clone(), Arc::clone(&private))
+        .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs);
     let constellation = ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url);
 
     let mut tasks = Vec::new();
@@ -241,6 +242,7 @@ pub async fn run() -> Result<(), StartupError> {
             coverage,
             Arc::clone(&status),
         )
+        .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
         .spawn(),
     );
     tasks.push(spawn_lag_sampler(redis.clone(), fh.clone()));
@@ -325,7 +327,8 @@ pub async fn run() -> Result<(), StartupError> {
             .map_err(|e| StartupError::new(1, format!("starting backfill: {e}")))?,
     );
     tasks.push(CountRefresher::new(pool.clone(), redis.clone(), constellation.clone(), &cfg.file.counts).spawn());
-    let rebuild = Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days);
+    let rebuild = Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days)
+        .with_sync_min_interval_secs(lists.sync_min_interval_secs);
     tasks.push(rebuild.clone().spawn_weekly());
 
     // Repo-head prober (§6.11.3); the private pipeline shares it.
@@ -354,6 +357,7 @@ pub async fn run() -> Result<(), StartupError> {
             deterministic_attempts: fh.deterministic_attempts,
             community_patterns: Arc::new(community_patterns.clone()),
             farsight: farsight.clone(),
+            sync_min_interval_secs: lists.sync_min_interval_secs,
         })
         .spawn(),
     );

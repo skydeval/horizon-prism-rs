@@ -260,6 +260,7 @@ mod tests {
             deterministic_attempts: 5,
             community_patterns: Arc::new(vec!["*.community.example".to_string()]),
             farsight: None,
+            sync_min_interval_secs: 600,
         };
         Some((db, AdminExecutor::new(handlers), scope))
     }
@@ -557,6 +558,32 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(failed, 2);
+        db.drop_db().await;
+    }
+
+    /// `lists sync`: a requested, high-priority sync for a subscribed
+    /// list's owner; a list nobody references fails.
+    #[tokio::test]
+    async fn lists_sync_requests_a_run_for_a_subscribed_list() {
+        use crate::subscriptions::list_phase;
+        use crate::subscriptions::references::{Budget, mute_list};
+
+        let Some((db, exec, _scope)) = setup("admin_lists_sync", ScopeSets::default()).await else {
+            return;
+        };
+        let p = &db.pool;
+        let list = format!("at://{OTHER}/app.bsky.graph.list/3klist1");
+        let unknown = format!("at://{OTHER}/app.bsky.graph.list/3klist2");
+        assert!(matches!(run(&exec, p, AdminCommand::ListsSync { uri: list.clone() }).await, Finished::Failed(_)));
+        mute_list(p, PURGING, &list, Budget { max_references: 5, max_owners: 5 }).await.expect("mute");
+        list_phase::apply(p, &list, 600).await.expect("apply");
+        sqlx::query("UPDATE backfill_jobs SET state = 'done', priority = 1").execute(p).await.expect("done");
+
+        let result = done(run(&exec, p, AdminCommand::ListsSync { uri: list }).await);
+        assert_eq!(result["owner"], OTHER);
+        assert_eq!(count(p, "SELECT count(*) FROM backfill_jobs WHERE depth = 'list_sync' AND state = 'queued' AND priority = 0").await, 1);
+        assert_eq!(count(p, "SELECT count(*) FROM subscribed_owners WHERE resync_requested_at IS NOT NULL").await, 1);
+        assert!(matches!(run(&exec, p, AdminCommand::ListsSync { uri: unknown }).await, Finished::Failed(_)));
         db.drop_db().await;
     }
 

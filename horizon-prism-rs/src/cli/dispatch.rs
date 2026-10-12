@@ -78,8 +78,22 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: FarsightAction,
     },
+    /// Lists that members mute or block (design-v3 §4.3).
+    Lists {
+        #[command(subcommand)]
+        action: ListsAction,
+    },
     /// Print a fresh service signing key, its did:key and a correlation key.
     Keygen,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ListsAction {
+    /// Read a referenced list's owner again, ahead of its usual turn.
+    Sync {
+        /// The list's at-uri.
+        uri: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -209,6 +223,7 @@ impl AdminCmd {
                 did: did.clone(),
                 force: *force,
             },
+            Self::Lists { action: ListsAction::Sync { uri } } => AdminCommand::ListsSync { uri: uri.clone() },
         };
         let (command, args) = cmd.to_row();
         AdminCommand::parse(command, &args).map_err(|e| e.to_string())
