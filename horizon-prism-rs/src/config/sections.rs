@@ -812,6 +812,47 @@ impl Default for ThreadMutesConfig {
     }
 }
 
+/// `[farsight]`: the block and block-list index this AppView asks about
+/// inbound list blocks (design-v3 §5.14.4). With `url` unset, no call is
+/// ever made.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FarsightConfig {
+    /// Base URL of the Farsight instance; `https` only.
+    pub url: Option<String>,
+    /// One `checkBlocks` call, and all one request may wait on Farsight.
+    pub timeout_ms: u64,
+    /// Lifetime of a cached pair answer.
+    pub cache_ttl_secs: u64,
+    pub cache_entries_per_viewer: u64,
+    pub cache_entries_total: u64,
+    /// Chunks of up to 100 accounts one request may ask about.
+    pub max_calls_per_request: u32,
+    pub rate_per_sec: Float,
+    pub burst: u32,
+    /// One requester's share of that bucket.
+    pub requester_share: Float,
+    /// Whether enrolling a member asks Farsight to read its repository.
+    pub prime_on_enroll: bool,
+}
+
+impl Default for FarsightConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            timeout_ms: 500,
+            cache_ttl_secs: 30,
+            cache_entries_per_viewer: 2000,
+            cache_entries_total: 200_000,
+            max_calls_per_request: 3,
+            rate_per_sec: Float(50.0),
+            burst: 100,
+            requester_share: Float(0.25),
+            prime_on_enroll: true,
+        }
+    }
+}
+
 /// `[known_followers]` (design-v3 §5.3).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -984,6 +1025,7 @@ pub struct FileConfig {
     pub thread_mutes: ThreadMutesConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,
+    pub farsight: FarsightConfig,
     pub schema_backfill: SchemaBackfillConfig,
     pub schema_index: SchemaIndexConfig,
     pub features: FeaturesConfig,

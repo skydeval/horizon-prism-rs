@@ -14,6 +14,7 @@ pub mod cli;
 pub mod config;
 pub mod constellation;
 pub mod db;
+pub mod farsight;
 pub mod firehose;
 pub mod honest_501;
 pub mod hydration;

@@ -83,6 +83,7 @@ services:
       APP_CORRELATION_KEY_HEX: ${APP_CORRELATION_KEY_HEX:?set APP_CORRELATION_KEY_HEX in .env}
       APP_ALLOW_STARTUP_MIGRATE: ${APP_ALLOW_STARTUP_MIGRATE:-0}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      FARSIGHT_TOKEN: ${FARSIGHT_TOKEN:-}
     volumes:
       - app-data:/app/data
       - ./config/app.toml:/app/config/app.toml:ro

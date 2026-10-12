@@ -261,6 +261,17 @@ counts_refresh_secs = 3600
 [known_followers]
 scan_max_pages = 20
 
+[farsight]
+timeout_ms = 500
+cache_ttl_secs = 30
+cache_entries_per_viewer = 2000
+cache_entries_total = 200000
+max_calls_per_request = 3
+rate_per_sec = 50.0
+burst = 100
+requester_share = 0.25
+prime_on_enroll = true
+
 [schema_backfill]
 batch_size = 10000
 pause_ms = 100

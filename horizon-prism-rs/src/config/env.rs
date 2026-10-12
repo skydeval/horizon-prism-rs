@@ -19,6 +19,8 @@ pub const ENV_SERVICE_SIGNING_KEY_HEX: &str = "APP_SERVICE_SIGNING_KEY_HEX";
 pub const ENV_CORRELATION_KEY_HEX: &str = "APP_CORRELATION_KEY_HEX";
 pub const ENV_ALLOW_STARTUP_MIGRATE: &str = "APP_ALLOW_STARTUP_MIGRATE";
 pub const ENV_LOG_LEVEL: &str = "APP_LOG_LEVEL";
+/// The one variable without the `APP_` prefix: Farsight's API key.
+pub const ENV_FARSIGHT_TOKEN: &str = "FARSIGHT_TOKEN";
 
 /// Default `APP_CONFIG_PATH` inside the image (§11.3).
 pub const DEFAULT_CONFIG_PATH: &str = "/app/config/app.toml";
@@ -76,6 +78,23 @@ impl fmt::Debug for SecretUrl {
     }
 }
 
+/// An API key from the environment (`FARSIGHT_TOKEN`). `Debug` redacts it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretToken(String);
+
+impl SecretToken {
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretToken(<redacted>)")
+    }
+}
+
 /// Values taken from `APP_*` environment variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvConfig {
@@ -90,6 +109,8 @@ pub struct EnvConfig {
     pub allow_startup_migrate: bool,
     /// tracing env-filter directive.
     pub log_level: String,
+    /// `FARSIGHT_TOKEN`: the API key for `farsight.url` (design-v3 §5.14.4).
+    pub farsight_token: Option<SecretToken>,
 }
 
 impl EnvConfig {
@@ -156,6 +177,10 @@ impl EnvConfig {
             correlation_key,
             allow_startup_migrate,
             log_level,
+            farsight_token: lookup(ENV_FARSIGHT_TOKEN)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(SecretToken),
         })
     }
 

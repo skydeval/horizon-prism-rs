@@ -17,12 +17,12 @@ pub use env::{
     DEFAULT_CONFIG_PATH, DEFAULT_DATA_DIR, DEFAULT_LOG_LEVEL, ENV_ALLOW_STARTUP_MIGRATE,
     ENV_CONFIG_PATH, ENV_CORRELATION_KEY_HEX, ENV_DATA_DIR, ENV_DATABASE_URL, ENV_LOG_LEVEL,
     ENV_PUBLIC_HOSTNAME, ENV_REDIS_URL, ENV_SERVICE_SIGNING_KEY_HEX, EnvConfig, Secret32,
-    SecretUrl, config_path, validate_hostname,
+    SecretToken, SecretUrl, config_path, validate_hostname,
 };
 pub use sections::{
     AdminConfig, AuthConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
     CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, FeaturesConfig,
-    FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
+    FarsightConfig, FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
     KnownFollowersConfig, KryphocronConfig, LOCAL_APPVIEW, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig,
     PrivateReadConfig, PrivateReadFloors, PublicScope, RateClassConfig, RateLimitsConfig,
     RetentionConfig, SchemaBackfillConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
@@ -138,7 +138,8 @@ impl AppConfig {
     ///
     /// [`ConfigError::Invalid`] listing every problem found.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let problems = validate::problems(&self.file, &self.env.public_hostname);
+        let mut problems = validate::problems(&self.file, &self.env.public_hostname);
+        crate::farsight::config_problems(&self.file.farsight, self.env.farsight_token.is_some(), &mut problems);
         if problems.is_empty() {
             Ok(())
         } else {

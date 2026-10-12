@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **Item 12: the Farsight client (#673).** `[farsight]` config and the
+  `FARSIGHT_TOKEN` environment variable (design-v3 §5.14.4). With
+  `farsight.url` unset, the default, nothing changes. Startup refuses a
+  `url` that is not `https`, or one set without `FARSIGHT_TOKEN`. The
+  `farsight` module holds the parts no request uses yet: the DIDs Farsight
+  accepts and their canonical form, the split of a lookup into calls of at
+  most 100 accounts and 6 KB, the `checkBlocks` call with its failures
+  classified, the reading of an answer into one pair answer per account,
+  and the rule for writing a new answer over a cached one. No request calls
+  Farsight yet.
 - **Item 12: `getListFeed` (#673).** The posts and reposts of a list's
   members, newest first (design-v3 §5.5). Local rows answer only when the
   list is served locally and every member is in scope, so that the feed is

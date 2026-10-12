@@ -289,6 +289,26 @@ counts_refresh_secs = 3600
 [known_followers]
 scan_max_pages = 20
 
+# Farsight is the block-list index of this stack. With url set, the app asks
+# it, when a member loads a page, which accounts on that page block the
+# member through a block list. With url unset (the default) it is never
+# asked, and such blocks are not applied.
+# url must be https and reach Farsight at a public address. Set
+# FARSIGHT_TOKEN in .env to a Farsight API key with the read and backfill
+# scopes. Whoever runs that Farsight sees which accounts each member's pages
+# contain, so point this at an instance you run or trust.
+[farsight]
+# url = "https://farsight.example.net"
+timeout_ms = 500                 # one call, and all one request may wait
+cache_ttl_secs = 30
+cache_entries_per_viewer = 2000
+cache_entries_total = 200000
+max_calls_per_request = 3        # each call covers up to 100 accounts
+rate_per_sec = 50.0              # keep at or below the key's limit on Farsight
+burst = 100
+requester_share = 0.25           # the most one member may use of that rate
+prime_on_enroll = true           # ask Farsight to read a new member's repo
+
 # Limits on checking sign-in tokens before a request is charged to anyone.
 # They stop forged or broken tokens from using up CPU or a member's limits.
 [auth]
