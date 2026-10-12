@@ -82,6 +82,15 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 11: retention covers the new tables (#671).** The daily job
+  prunes lists, list items, list blocks, opt-outs, starter packs, labeler
+  declarations, self records and poll posts once their author leaves
+  scope (design-v3 §14.1). Thread and post gates go the same way, unless
+  their post row is still kept. Starter-pack counts whose pack is gone
+  are swept, and `tag_activity_hourly` rows older than 72 hours are
+  deleted. The subscription tables and the viewer-private tables are
+  never swept. Deleting a post now deletes its canonical thread gate and
+  post gate with it.
 - **Item 11: backfills fetch the new collections (#671).** The depth
   table gains them (design-v3 §II-5.10): a member's lists, list items, list
   blocks, opt-outs and starter packs are listed whole, its thread and post

@@ -336,6 +336,22 @@ fn build_upsert(
     }))
 }
 
+/// The canonical gates of a post: the threadgate and postgate in the post
+/// author's repo with the post's rkey (design-v3 §3.2). Empty when `post_uri`
+/// is not a post URI.
+fn canonical_gates(post_uri: &str) -> Vec<String> {
+    let Some((prefix, rkey)) = post_uri.rsplit_once('/') else {
+        return Vec::new();
+    };
+    let Some(repo) = prefix.strip_suffix(super::classifier::NSID_POST).and_then(|p| p.strip_suffix('/')) else {
+        return Vec::new();
+    };
+    [super::classifier::NSID_THREADGATE, super::classifier::NSID_POSTGATE]
+        .iter()
+        .map(|nsid| format!("{repo}/{nsid}/{rkey}"))
+        .collect()
+}
+
 /// Changes to apply to `ScopeState` after commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MemoryEffects {
@@ -482,7 +498,16 @@ impl Writer {
                 plans.push(GrowthPlan::default());
             }
         }
-        let lock_uri_list: Vec<String> = prepared.iter().filter_map(|p| p.uri().map(str::to_string)).collect();
+        let mut lock_uri_list: Vec<String> = prepared.iter().filter_map(|p| p.uri().map(str::to_string)).collect();
+        // A post delete also deletes the post's canonical gates (design-v3
+        // §14.1), so their URIs are locked with it, in the same sorted pass.
+        for p in &prepared {
+            if let Prepared::Delete(d) = p
+                && d.kind == RecordKind::Post
+            {
+                lock_uri_list.extend(canonical_gates(&d.uri));
+            }
+        }
 
         let mut tx = self.pool.begin().await?;
         // 2 and 3: DID locks, then per-URI locks.
@@ -734,7 +759,19 @@ impl Writer {
                 return Ok((outcome, eff));
             }
             RecordKind::Profile => delete_profile(conn, repo, rev).await?,
-            RecordKind::Post => delete_row(conn, "posts", &d.uri, rev).await?,
+            RecordKind::Post => {
+                let removed = delete_row(conn, "posts", &d.uri, rev).await?;
+                if removed {
+                    // The gates of a post that is gone gate nothing.
+                    for (table, gate) in ["threadgates", "postgates"].into_iter().zip(canonical_gates(&d.uri)) {
+                        sqlx::query(&format!("DELETE FROM {table} WHERE uri = $1"))
+                            .bind(gate)
+                            .execute(&mut *conn)
+                            .await?;
+                    }
+                }
+                removed
+            }
             RecordKind::Like => delete_row(conn, "likes", &d.uri, rev).await?,
             RecordKind::Repost => delete_row(conn, "reposts", &d.uri, rev).await?,
             RecordKind::Follow => {
@@ -1474,6 +1511,18 @@ mod tests {
             let r = w.apply(AUTHOR, &rev(2), &back, OPTIONS).await.expect("apply");
             assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
             assert_eq!(count("list_items").await, 0);
+
+            // Deleting a post deletes its canonical gates with it.
+            let gated = [
+                create("app.bsky.feed.post", "3kgated", json!({"text": "gated"})),
+                create("app.bsky.feed.threadgate", "3kgated", json!({"post": format!("at://{AUTHOR}/app.bsky.feed.post/3kgated")})),
+                create("app.bsky.feed.postgate", "3kgated", json!({"post": format!("at://{AUTHOR}/app.bsky.feed.post/3kgated")})),
+            ];
+            w.apply(AUTHOR, &rev(4), &gated, OPTIONS).await.expect("apply");
+            assert_eq!((count("threadgates").await, count("postgates").await), (1, 2));
+            let gone = [raw(Action::Delete, "app.bsky.feed.post", "3kgated", Value::Null)];
+            w.apply(AUTHOR, &rev(5), &gone, OPTIONS).await.expect("apply");
+            assert_eq!((count("threadgates").await, count("postgates").await), (0, 1), "the other post's postgate stays");
 
             // An author outside the scope is not admitted for these.
             let stranger = [create("app.bsky.graph.list", "3klist", json!({"name": "Theirs", "purpose": "app.bsky.graph.defs#modlist"}))];

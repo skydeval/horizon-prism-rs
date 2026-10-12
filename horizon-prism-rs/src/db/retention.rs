@@ -55,6 +55,10 @@ pub const CONSTELLATION_COUNTS_DAYS: i32 = 7;
 pub const DID_CACHE_GRACE_DAYS: i32 = 7;
 /// Finished `backfill_jobs` and `admin_commands` are kept this long (§4.4).
 pub const FINISHED_WORK_DAYS: i32 = 30;
+/// How long `tag_activity_hourly` rows are kept (design-v3 §7.5): the
+/// default of `trends.aggregate_retention_hours`, which becomes a config key
+/// with the trend endpoints. It matches the triggers' own default cutoff.
+pub const TREND_AGGREGATE_HOURS: i32 = 72;
 
 /// Metric: rows deleted by retention, labelled by table.
 pub const METRIC_DELETED_ROWS: &str = "retention_deleted_rows_total";
@@ -234,7 +238,7 @@ fn scope_steps(private_owners: Vec<String>, private_row_authors: Vec<String>) ->
         author_of("p.quote_uri"),
     ]);
     let subject_member = |alias: &str| member_among(&[author_of(&format!("{alias}.subject_uri"))]);
-    vec![
+    let mut steps = vec![
         scoped(
             "posts",
             "uri",
@@ -339,6 +343,50 @@ fn scope_steps(private_owners: Vec<String>, private_row_authors: Vec<String>) ->
             ),
             Bind::None,
         ),
+    ];
+    // The v3 record tables are content: after `feed_items`, before the
+    // derived counts and identity rows.
+    steps.splice(6..6, v3_scope_steps());
+    steps
+}
+
+/// Class S deletes of the record tables design-v3 added (§14.1): kept while
+/// the author is in scope. Subscriptions never keep, create or delete rows
+/// of these tables.
+fn v3_scope_steps() -> Vec<Step> {
+    let class_s = |table: &'static str, alias: &'static str, author: &'static str| {
+        let col = format!("{alias}.{author}");
+        scoped(table, "uri", alias, &col, &not_in_scope(&col), Bind::None)
+    };
+    // A gate is also kept while its post row is kept (class M).
+    let gate = |table: &'static str, alias: &'static str| {
+        let col = format!("{alias}.author_did");
+        let pred = format!(
+            "{} AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.uri = {alias}.post_uri)",
+            not_in_scope(&col)
+        );
+        scoped(table, "uri", alias, &col, &pred, Bind::None)
+    };
+    vec![
+        class_s("lists", "ls", "creator_did"),
+        class_s("list_items", "li", "author_did"),
+        class_s("list_blocks", "lb", "author_did"),
+        class_s("list_optouts", "lo", "author_did"),
+        class_s("starter_packs", "sp", "creator_did"),
+        class_s("labeler_services", "lsv", "creator_did"),
+        class_s("actor_self_records", "asr", "did"),
+        class_s("nearhorizon_poll_posts", "pp", "author_did"),
+        gate("threadgates", "tg"),
+        gate("postgates", "pg"),
+        // Derived counts follow their pack: an orphan sweep.
+        scoped(
+            "starter_pack_counts",
+            "pack_uri",
+            "spc",
+            "split_part(spc.pack_uri, '/', 3)",
+            "NOT EXISTS (SELECT 1 FROM starter_packs x WHERE x.uri = spc.pack_uri)",
+            Bind::None,
+        ),
     ]
 }
 
@@ -359,6 +407,14 @@ fn time_steps(settings: &RetentionSettings) -> Vec<Step> {
             "n",
             "n.indexed_at < now() - make_interval(days => $1)",
             days(settings.notification_days),
+        ),
+        // Trend aggregates: hours past the aggregate's retention (§7.5).
+        batched(
+            "tag_activity_hourly",
+            "ctid",
+            "ta",
+            &format!("ta.hour < now() - make_interval(hours => {TREND_AGGREGATE_HOURS})"),
+            Bind::None,
         ),
         batched(
             "constellation_counts",
@@ -738,11 +794,48 @@ mod tests {
                 "follows",
                 "blocks",
                 "feed_items",
+                "lists",
+                "list_items",
+                "list_blocks",
+                "list_optouts",
+                "starter_packs",
+                "labeler_services",
+                "actor_self_records",
+                "nearhorizon_poll_posts",
+                "threadgates",
+                "postgates",
+                "starter_pack_counts",
                 "post_counts",
                 "actors",
                 "actor_counts"
             ]
         );
+    }
+
+    /// design-v3 §14.1: the rule-4 subscription tables and the
+    /// AppView-private tables are never retention's to delete.
+    #[test]
+    fn subscription_and_viewer_private_tables_are_not_swept() {
+        for step in all_steps() {
+            for kept in [
+                "subscribed_lists",
+                "subscribed_list_items",
+                "subscribed_owners",
+                "list_references",
+                "list_mutes",
+                "thread_mutes",
+                "bookmarks",
+                "drafts",
+                "activity_subscriptions",
+                "notification_preferences_v2",
+            ] {
+                assert_ne!(step.table, kept);
+            }
+        }
+        // A gate outlives its author's scope while its post row is kept.
+        let steps = scope_steps(vec![], vec![]);
+        let gate = steps.iter().find(|s| s.table == "threadgates").expect("gate step");
+        assert!(gate.sql.contains("NOT EXISTS (SELECT 1 FROM posts x WHERE x.uri = tg.post_uri)"));
     }
 
     #[test]
