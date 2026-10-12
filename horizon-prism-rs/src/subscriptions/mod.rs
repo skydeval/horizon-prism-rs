@@ -16,3 +16,4 @@ pub mod applier;
 pub mod jobs;
 pub mod list_phase;
 pub mod references;
+pub mod sync;

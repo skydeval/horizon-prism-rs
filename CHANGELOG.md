@@ -12,6 +12,17 @@ commit.
 
 ### Added
 
+- **Item 12: what a list sync writes (#673).** `subscriptions::sync`
+  takes an owner's listings and brings the private copy in line: it
+  keeps each list's oldest entries up to the cap, removes an entry that
+  is gone only when two complete listings in a row lack it (one on a
+  list's first sync), removes and remembers an entry moved to a list
+  nobody subscribes to, and records each list's purpose. A waiting list
+  mute or block takes effect only when the run served its list and
+  listed the list's own record; otherwise it is marked once and waits
+  for the owner's next run. A listing cut short only adds. Fetching the
+  listings and scheduling the job are not built yet (design-v3 §4.3
+  "The run").
 - **Item 12: the reference applier and the in-memory subscribed sets
   (#673).** `subscriptions::applier` is the background task that runs the
   list phase (on a signal, at startup with a full reconcile, and every
