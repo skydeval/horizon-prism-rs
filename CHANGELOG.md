@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 15: `com.atproto.repo.getRecord` (#675).** Serves public
+  records this AppView stores with their JSON (posts, profiles, lists of
+  ready members, starter packs, labeler services, gates, public polls,
+  and the three self-keyed declaration records), from local tables only.
+  A private-tier collection is `RecordNotFound` before any lookup;
+  collections kept without their JSON (likes, reposts, follows, blocks,
+  list items) are refused by name; a handle is resolved only for an
+  indexed account, with no outbound lookup (design-v3 §5.10).
 - **Item 15: `com.atproto.label.queryLabels` (#675).** Anyone can read
   the labels this AppView's operator applied, by exact account or record,
   or by a prefix that names one whole account (`at://<did>/…*`), so no

@@ -26,6 +26,7 @@ pub mod normalize;
 pub mod notification_prefs;
 pub mod notifications;
 pub mod relationships;
+pub mod repo;
 pub mod starter_packs;
 pub mod thread;
 pub mod thread_v2;
