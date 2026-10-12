@@ -618,6 +618,72 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// B-77, the thread part: an account that blocks the viewer through a
+    /// list is a blocked item as the anchor or a parent, and its replies
+    /// are left out.
+    #[tokio::test]
+    async fn an_inbound_list_blocker_is_a_blocked_item() {
+        use crate::farsight::lookup::tests::{V, engine};
+        use crate::hydration::testing::hydrator_with_farsight;
+        use crate::xrpc::backstop::{self, Selected};
+
+        let Some(db) = fresh_db("hydration_thread_v2_inbound").await else {
+            return;
+        };
+        let p = &db.pool;
+        for (d, h) in [(OP, "op.test"), (BOB, "bob.test"), (CAROL, "carol.test")] {
+            actor(p, d, h, h).await;
+        }
+        let root = post(p, OP, "3kaaaaaaaaaa2", "root", None, None).await;
+        let reply = post(p, BOB, "3kaaaaaaaaaa3", "reply", Some(&root), Some(&root)).await;
+        let theirs = post(p, CAROL, "3kaaaaaaaaaa4", "carol's", None, None).await;
+        let under = post(p, OP, "3kaaaaaaaaaa5", "under carol's", Some(&theirs), Some(&theirs)).await;
+        let mut sets = ScopeSets::default();
+        for d in [OP, BOB, CAROL] {
+            sets.scope.insert(d.into());
+        }
+        let (farsight, fake) = engine("").await;
+        fake.blockers.lock().expect("blockers").insert(OP.to_string());
+        let h = hydrator_with_farsight(p, sets, farsight.clone());
+        let me = Viewer {
+            did: Some(V.into()),
+            hydrate: true,
+        };
+        let req = Requester::test();
+        let options = opts(DEFAULT_BELOW, DEFAULT_BRANCHING, Sort::Oldest);
+        let selected = Selected::by_ip("203.0.113.9".parse().expect("ip"));
+        selected.attach_farsight(farsight.request(&req));
+        backstop::scope(selected, async {
+            const BLOCKED: &str = "app.bsky.unspecced.defs#threadItemBlocked";
+            let types = |v: &Value| -> Vec<(String, i64, String)> {
+                v["thread"]
+                    .as_array()
+                    .expect("thread")
+                    .iter()
+                    .map(|i| {
+                        (
+                            i["uri"].as_str().expect("uri").to_string(),
+                            i["depth"].as_i64().expect("depth"),
+                            i["value"]["$type"].as_str().expect("type").to_string(),
+                        )
+                    })
+                    .collect()
+            };
+            // The blocker's post as the anchor: one blocked item.
+            let v = h.get_post_thread_v2(&me, &req, &root, &options).await.expect("db").expect("view");
+            assert_eq!(types(v.inner()), [(root.clone(), 0, BLOCKED.to_string())]);
+            // As a parent: a blocked item above the anchor.
+            let v = h.get_post_thread_v2(&me, &req, &reply, &options).await.expect("db").expect("view");
+            assert_eq!(types(v.inner())[0], (root.clone(), -1, BLOCKED.to_string()));
+            // As a reply: left out.
+            let v = h.get_post_thread_v2(&me, &req, &theirs, &options).await.expect("db").expect("view");
+            assert!(types(v.inner()).iter().all(|(uri, ..)| *uri != under));
+            assert_eq!(types(v.inner()).len(), 1);
+        })
+        .await;
+        db.drop_db().await;
+    }
+
     /// B-41: the endpoints over stored rows.
     #[tokio::test]
     async fn v2_over_local_rows() {
