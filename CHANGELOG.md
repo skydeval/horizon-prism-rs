@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 12: list references and the member phase (#673).** New module
+  `subscriptions::references`: a member's list mute or list block is a
+  reference to a list, admitted while it is inside the member's budget
+  (its first references of that kind, naming a bounded number of list
+  owners, counted in arrival order from the member's own rows only). The
+  member phase writes the member's rows and a change marker in one
+  transaction that takes no lock on shared state. Nothing calls it yet
+  and no reference has any effect on a view yet (design-v3 §4.3).
 - **Item 12: migration `0018_subscribed_list_purpose` (#673).** Four
   optional columns for the rule that a member's own list block or list
   mute has an effect only on a moderation list: a subscribed list's

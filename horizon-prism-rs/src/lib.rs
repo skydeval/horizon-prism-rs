@@ -26,6 +26,7 @@ pub mod net;
 pub mod private_tier;
 pub mod serve;
 pub mod services;
+pub mod subscriptions;
 pub mod sync;
 pub mod threadlens;
 pub mod xrpc;
