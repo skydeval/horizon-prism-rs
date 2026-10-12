@@ -12,6 +12,24 @@ commit.
 
 ### Added
 
+- **Item 12b: the fallback for inbound list blocks (#683).** With
+  `farsight.fallback.enabled`, and only while Farsight is down, a ready
+  member's ordinary page asks the AppView that `farsight.fallback.network`
+  names (`app.bsky.graph.getRelationships`, with no sign-in) which of
+  the accounts whose Farsight calls did not get through block the member
+  through a list. A reported block applies as any inbound list block
+  does, for `cache_ttl_secs`. It never counts as a complete answer,
+  never overrides what Farsight said, and Farsight is asked again as
+  soon as it is back. An account told "nothing" is not sent again for
+  `cache_ttl_secs`; a member the other AppView does not know is not sent
+  again for as long. Thread Lens, the unread count, `getRelationships`,
+  private reads and anonymous requests never cause a call. The fallback
+  has its own rate bucket and its own breaker
+  (`farsight_fallback_calls_total{class}`,
+  `farsight_fallback_skipped_total{reason}`). Each call tells that
+  AppView which member is looking at which accounts, so it is off unless
+  switched on, and `serve` says so at startup when it is (design-v3
+  §5.14.17; proposed locked decision 39).
 - **Item 12b: knowing when Farsight is down (#683).** The `farsight`
   module now keeps, beside its breaker, whether every call since
   Farsight's last answer failed as a service failure (a timeout, a

@@ -456,14 +456,32 @@ impl SharedBucket {
         self.draw_at(requester, Instant::now())
     }
 
-    fn draw_at(&self, requester: &ChargeKey, now: Instant) -> Result<Pool, Exhausted> {
+    /// [`Self::draw`] without counting a miss in
+    /// `requester_share_exhausted_total`. For a caller that treats an
+    /// empty share as "no answer" and counts it itself (Farsight's lookup
+    /// and its fallback, design-v3 §5.14.17.4): such a miss is never a
+    /// `429` and stops nothing else in the request.
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`], as [`Self::draw`].
+    pub fn quiet_draw(&self, requester: &ChargeKey) -> Result<Pool, Exhausted> {
+        self.take(requester, Instant::now())
+    }
+
+    fn take(&self, requester: &ChargeKey, now: Instant) -> Result<Pool, Exhausted> {
         let inner = &self.inner;
-        let outcome = match requester {
+        match requester {
             ChargeKey::Member(_) => self
                 .draw_in(&inner.member, requester, now)
                 .or_else(|_| self.draw_in(&inner.nonmember, requester, now)),
             ChargeKey::Ip(_) => self.draw_in(&inner.nonmember, requester, now),
-        };
+        }
+    }
+
+    fn draw_at(&self, requester: &ChargeKey, now: Instant) -> Result<Pool, Exhausted> {
+        let inner = &self.inner;
+        let outcome = self.take(requester, now);
         if let Err(e) = &outcome {
             metrics::counter!(METRIC_EXHAUSTED, "target_kind" => inner.target_kind, "pool" => e.pool.label())
                 .increment(1);

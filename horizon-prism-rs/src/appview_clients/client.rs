@@ -60,11 +60,20 @@ impl AppViewClient {
     ///
     /// Transport failures ([`NetError`]); statuses are in the response.
     pub async fn query(&self, method: &str, params: &[(&str, String)]) -> Result<NetResponse, NetError> {
+        self.query_within(method, params, CALL_TIMEOUT).await
+    }
+
+    /// [`Self::query`] with a time limit of the caller's.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures ([`NetError`]); statuses are in the response.
+    pub async fn query_within(&self, method: &str, params: &[(&str, String)], timeout: Duration) -> Result<NetResponse, NetError> {
         let url = Url::parse_with_params(&format!("{}/xrpc/{method}", self.base), params).map_err(|e| NetError::InvalidUrl {
             url: self.base.clone(),
             reason: e.to_string(),
         })?;
-        let mut options = RequestOptions::new(BodyCap::APPVIEW).timeout(CALL_TIMEOUT);
+        let mut options = RequestOptions::new(BodyCap::APPVIEW).timeout(timeout);
         if let AppViewAuth::ServiceJwt { aud, key } = &self.auth {
             let token = jwt::mint(key, aud, method, chrono::Utc::now().timestamp());
             let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| NetError::Encode(e.to_string()))?;
@@ -170,6 +179,17 @@ impl AppViewClient {
         let mut params = vec![("actor", actor.to_string())];
         params.extend(others.iter().map(|o| ("others", o.clone())));
         self.query("app.bsky.graph.getRelationships", &params).await
+    }
+
+    /// [`Self::get_relationships`] with a time limit of the caller's.
+    ///
+    /// # Errors
+    ///
+    /// Any [`NetError`].
+    pub async fn get_relationships_within(&self, actor: &str, others: &[String], timeout: Duration) -> Result<NetResponse, NetError> {
+        let mut params = vec![("actor", actor.to_string())];
+        params.extend(others.iter().map(|o| ("others", o.clone())));
+        self.query_within("app.bsky.graph.getRelationships", &params, timeout).await
     }
 
     /// `app.bsky.graph.getStarterPack`.

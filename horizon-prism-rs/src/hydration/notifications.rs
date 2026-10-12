@@ -314,6 +314,9 @@ impl Hydrator {
         if count > 0
             && let Some(lookup) = crate::xrpc::backstop::farsight()
         {
+            // A count is not a render: it never starts a fallback call
+            // (design-v3 §5.14.17.2 "Which lookups may ask").
+            lookup.set_no_fallback();
             let authors: Vec<String> = sqlx::query_scalar(
                 "SELECT n.author_did FROM notifications n WHERE n.recipient_did = $1 \
                    AND n.indexed_at > COALESCE($2::timestamptz, \

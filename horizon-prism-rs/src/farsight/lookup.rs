@@ -15,8 +15,8 @@
 //! turns a response into a 429.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, join_all};
@@ -25,8 +25,11 @@ use super::answer::{Coverage, PairAnswer, Source};
 use super::chunks::{chunks, halves};
 use super::client::{CallError, FarsightClient};
 use super::did::canonical;
+use super::fallback::{self, Found, Ledger};
 use super::gate::{Effect, GateRead, ReadGate};
-use crate::config::FarsightConfig;
+use crate::appview_clients::AppViewClient;
+use crate::config::{FarsightConfig, FarsightFallbackConfig};
+use crate::net::NetError;
 use crate::constellation::Class;
 use crate::constellation::cascade::SharedBreaker;
 use crate::hydration::ReadCache;
@@ -75,6 +78,9 @@ struct ViewerCache {
 struct Cache {
     viewers: HashMap<String, ViewerCache>,
     total: usize,
+    /// The fallback's ledger (§5.14.17.6), under the cache's lock so that
+    /// applying a fallback answer is one step.
+    ledger: Ledger,
 }
 
 impl Cache {
@@ -101,20 +107,22 @@ impl Cache {
     fn write(&mut self, viewer: &str, other: &str, new: &PairAnswer, now: Instant, s: &Settings) -> PairAnswer {
         let live = self.entry(viewer, other, now);
         let (merged, restart, source) = PairAnswer::written_over(new, live.as_ref().map(|(answer, source)| (answer, *source)));
-        let v = self.viewers.entry(viewer.to_string()).or_default();
-        let expires = match v.entries.get(other) {
+        let expires = match self.viewers.get(viewer).and_then(|v| v.entries.get(other)) {
             Some(e) if !restart => e.expires,
             _ => now + s.ttl,
         };
+        self.store(viewer, other, merged.clone(), expires, source, s);
+        merged
+    }
+
+    /// Put an entry for the pair, within the cache's two bounds.
+    fn store(&mut self, viewer: &str, other: &str, answer: PairAnswer, expires: Instant, source: Source, s: &Settings) {
+        let v = self.viewers.entry(viewer.to_string()).or_default();
         let fresh = v
             .entries
             .insert(
                 other.to_string(),
-                Entry {
-                    answer: merged.clone(),
-                    expires,
-                    source,
-                },
+                Entry { answer, expires, source },
             )
             .is_none();
         if fresh {
@@ -142,17 +150,36 @@ impl Cache {
                 self.total -= gone.entries.len();
             }
         }
-        merged
     }
 
+    /// A viewer's entries, notes and stop go together.
     fn forget(&mut self, viewer: &str) {
         if let Some(gone) = self.viewers.remove(viewer) {
             self.total -= gone.entries.len();
         }
+        self.ledger.forget(viewer);
     }
 }
 
+/// The fallback's parts (§5.14.17): its own client for the AppView it
+/// asks, its own bucket, and a breaker of its own.
+struct Fallback {
+    client: AppViewClient,
+    /// One call, and all one request may wait on the fallback.
+    timeout: Duration,
+    max_calls: u32,
+    /// Lifetime of a "blocked" entry and of a ledger note.
+    ttl: Duration,
+    bucket: SharedBucket,
+    breaker: SharedBreaker,
+}
+
 struct Inner {
+    /// Set once at startup when `farsight.fallback.enabled`.
+    fallback: OnceLock<Fallback>,
+    /// Raised by every purge of a viewer, so that a request begun before
+    /// a purge adds nothing to shared state after it.
+    purges: AtomicU64,
     client: FarsightClient,
     settings: Settings,
     bucket: SharedBucket,
@@ -184,6 +211,8 @@ impl Farsight {
         let size = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
         Self {
             inner: Arc::new(Inner {
+                fallback: OnceLock::new(),
+                purges: AtomicU64::new(0),
                 client,
                 settings: Settings {
                     timeout: Duration::from_millis(cfg.timeout_ms),
@@ -201,6 +230,34 @@ impl Farsight {
         }
     }
 
+    /// Switch the fallback on for this engine (design-v3 §5.14.17), with
+    /// `client` for the AppView that `farsight.fallback.network` names.
+    /// Called at most once, at startup, with a validated config.
+    pub fn enable_fallback(&self, client: AppViewClient, cfg: &FarsightFallbackConfig, shares: &Shares) {
+        let positive = |n: i64| u64::try_from(n).unwrap_or(0);
+        let _ = self.inner.fallback.set(Fallback {
+            client,
+            timeout: Duration::from_millis(positive(cfg.timeout_ms)),
+            max_calls: u32::try_from(cfg.max_calls_per_request).unwrap_or(0),
+            ttl: Duration::from_secs(positive(cfg.cache_ttl_secs)),
+            bucket: shares.bucket_with_share("farsight_fallback", cfg.rate_per_sec.0, u32::try_from(cfg.burst).unwrap_or(0), cfg.requester_share.0),
+            breaker: SharedBreaker::default(),
+        });
+    }
+
+    /// Whether the fallback's own breaker is open now. False when the
+    /// fallback is not enabled.
+    #[must_use]
+    pub fn fallback_breaker_open(&self) -> bool {
+        self.inner.fallback.get().is_some_and(|f| f.breaker.is_open(Instant::now()))
+    }
+
+    /// Ledger notes held, over every viewer.
+    #[must_use]
+    pub fn ledger_notes(&self) -> usize {
+        self.cache().ledger.len()
+    }
+
     fn cache(&self) -> std::sync::MutexGuard<'_, Cache> {
         self.inner.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -215,15 +272,21 @@ impl Farsight {
                 memo: HashMap::new(),
                 calls_left: self.inner.settings.max_calls,
                 allowance: self.inner.settings.timeout,
+                fallback_calls_left: self.inner.fallback.get().map_or(0, |f| f.max_calls),
+                fallback_allowance: self.inner.fallback.get().map_or(Duration::ZERO, |f| f.timeout),
             })),
             cache_only: Arc::new(AtomicBool::new(false)),
+            no_fallback: Arc::new(AtomicBool::new(false)),
+            purges: self.inner.purges.load(Ordering::SeqCst),
         }
     }
 
     /// Drop a viewer's cached answers (a removed member, a deleted account).
     pub fn forget(&self, viewer: &str) {
         let viewer = canonical(viewer).unwrap_or_else(|| viewer.to_string());
-        self.cache().forget(&viewer);
+        let mut cache = self.cache();
+        self.inner.purges.fetch_add(1, Ordering::SeqCst);
+        cache.forget(&viewer);
     }
 
     /// Ask Farsight to read a member's own repository (design-v3 §5.14.11),
@@ -317,6 +380,10 @@ struct State {
     /// How long the request may still wait on Farsight. The clock runs
     /// only while a call of the request is in flight.
     allowance: Duration,
+    /// Fallback calls the request may still make, and how long it may
+    /// still wait on them. Both zero with the fallback off.
+    fallback_calls_left: u32,
+    fallback_allowance: Duration,
 }
 
 /// One request's handle on Farsight. A hydration path that is given none
@@ -329,6 +396,10 @@ pub struct Lookup {
     key: ChargeKey,
     state: Arc<Mutex<State>>,
     cache_only: Arc<AtomicBool>,
+    /// This request never starts a fallback call (§5.14.17.2).
+    no_fallback: Arc<AtomicBool>,
+    /// The purge count when the request began.
+    purges: u64,
 }
 
 impl std::fmt::Debug for Lookup {
@@ -349,6 +420,10 @@ struct Called {
     /// Every part of the call was answered (both halves, when it was
     /// asked again as two).
     answered: bool,
+    /// The accounts the fallback may be asked about if Farsight turns out
+    /// to be down: those of a call the gate refused, or that ended in a
+    /// service failure (§5.14.17.2 "Which accounts").
+    eligible: Vec<String>,
 }
 
 /// What a caller with budgets of its own may spend on one lookup
@@ -382,6 +457,14 @@ impl Lookup {
     /// receives a viewer beside them; and for per-keystroke surfaces.
     pub fn set_cache_only(&self) {
         self.cache_only.store(true, Ordering::Relaxed);
+    }
+
+    /// From here on this request never starts a fallback call, though it
+    /// still reads a fallback result an ordinary render already cached.
+    /// For every lookup that is not a ready member's ordinary render:
+    /// Thread Lens rounds, and the unread count's correction.
+    pub fn set_no_fallback(&self) {
+        self.no_fallback.store(true, Ordering::Relaxed);
     }
 
     /// How many accounts this request may still ask about, at most.
@@ -509,6 +592,11 @@ impl Lookup {
     /// Pair answers for `others` (canonical DIDs, in page order): from the
     /// request's memo, then the viewer's cache, then Farsight. An account
     /// with no answer is absent.
+    ///
+    /// A cached entry the fallback wrote is a block in hand, but never
+    /// stands in for Farsight: its account is still asked about. When the
+    /// calls are done and Farsight turns out to be down, the fallback is
+    /// asked about the accounts whose calls never got through.
     async fn pairs(&self, actor: &str, others: &[String]) -> HashMap<String, PairAnswer> {
         let inner = &self.farsight.inner;
         let cache_only = self.cache_only.load(Ordering::Relaxed);
@@ -523,11 +611,18 @@ impl Lookup {
                     if let Some(answer) = known {
                         found.insert(other.clone(), answer.clone());
                     }
-                } else if let Some(answer) = cache.get(actor, other, now) {
-                    state.memo.insert(other.clone(), Some(answer.clone()));
-                    found.insert(other.clone(), answer);
-                } else {
-                    ask.push(other.clone());
+                    continue;
+                }
+                match cache.entry(actor, other, now) {
+                    Some((answer, Source::Farsight)) => {
+                        state.memo.insert(other.clone(), Some(answer.clone()));
+                        found.insert(other.clone(), answer);
+                    }
+                    Some((answer, Source::Fallback)) => {
+                        found.insert(other.clone(), answer);
+                        ask.push(other.clone());
+                    }
+                    None => ask.push(other.clone()),
                 }
             }
             // A cache-only miss is not memoized, so it never suppresses a
@@ -537,9 +632,10 @@ impl Lookup {
             }
             let mut plan = chunks(actor, &ask);
             let allowed = usize::try_from(state.calls_left).unwrap_or(usize::MAX);
-            // Accounts past the call cap get no answer.
+            // Accounts past the call cap get no answer beyond a block
+            // already in hand.
             for skipped in plan.iter().skip(allowed).flatten() {
-                state.memo.insert(skipped.clone(), None);
+                state.memo.insert(skipped.clone(), found.get(skipped).cloned());
             }
             plan.truncate(allowed);
             state.calls_left -= u32::try_from(plan.len()).unwrap_or(state.calls_left).min(state.calls_left);
@@ -547,25 +643,156 @@ impl Lookup {
         };
         let started = Instant::now();
         let per_call = inner.settings.timeout;
-        let outcomes: Vec<Outcome> = join_all(plan.into_iter().map(|chunk| self.call(actor, chunk, allowance, started, true, per_call)))
-            .await
-            .into_iter()
-            .flat_map(|called| called.outcomes)
-            .collect();
-        let now = Instant::now();
-        let mut state = self.state();
-        state.allowance = state.allowance.saturating_sub(started.elapsed());
-        let mut cache = self.farsight.cache();
-        for (other, outcome) in outcomes {
-            // The memo holds the merged entry, so a block the cache already
-            // named is not lost to an answer that does not vouch.
-            let merged = outcome.map(|answer| cache.write(actor, &other, &answer, now, &inner.settings));
-            if let Some(answer) = &merged {
-                found.insert(other.clone(), answer.clone());
+        let called: Vec<Called> = join_all(plan.into_iter().map(|chunk| self.call(actor, chunk, allowance, started, true, per_call))).await;
+        let mut eligible: Vec<String> = Vec::new();
+        {
+            let now = Instant::now();
+            let mut state = self.state();
+            state.allowance = state.allowance.saturating_sub(started.elapsed());
+            let mut cache = self.farsight.cache();
+            for call in called {
+                eligible.extend(call.eligible);
+                for (other, outcome) in call.outcomes {
+                    // The memo holds the merged entry, so a block the cache
+                    // already named is not lost to an answer that does not
+                    // vouch; with no answer, a block in hand stands.
+                    let merged = outcome.map(|answer| cache.write(actor, &other, &answer, now, &inner.settings));
+                    let held = merged.or_else(|| found.get(&other).cloned());
+                    if let Some(answer) = &held {
+                        found.insert(other.clone(), answer.clone());
+                    }
+                    state.memo.insert(other, held);
+                }
             }
-            state.memo.insert(other, merged);
+        }
+        // One read of the gate, after the merge (§5.14.17.2 "How a lookup
+        // decides"): the answer count it returns is the snapshot a
+        // fallback answer is later checked against.
+        if let Some(fb) = inner.fallback.get()
+            && !eligible.is_empty()
+            && !self.no_fallback.load(Ordering::Relaxed)
+        {
+            let read = inner.gate.read(Instant::now());
+            if read.down {
+                found.extend(self.ask_fallback(fb, actor, &eligible, read.answers).await);
+            }
         }
         found
+    }
+
+    /// Ask the fallback about `eligible`, less what the reductions of
+    /// §5.14.17.5 leave out, and apply its answer under §5.14.17.6's two
+    /// guards. Returns the blocks it taught this request.
+    async fn ask_fallback(&self, fb: &Fallback, actor: &str, eligible: &[String], snapshot: u64) -> HashMap<String, PairAnswer> {
+        let inner = &self.farsight.inner;
+        let skip = |reason: &'static str| metrics::counter!(fallback::METRIC_SKIPPED, "reason" => reason).increment(1);
+        let (plan, allowance) = {
+            let now = Instant::now();
+            let mut state = self.state();
+            let mut cache = self.farsight.cache();
+            // The other AppView does not know this viewer: not again yet.
+            if cache.ledger.stopped(actor, now, fb.ttl) {
+                skip("stopped");
+                return HashMap::new();
+            }
+            // Not sent: a pair with a live entry of either source (a block
+            // in hand could not be removed by the answer anyway), and a
+            // pair told "nothing" lately.
+            let mut send: Vec<String> = Vec::new();
+            for other in eligible {
+                let held = cache.entry(actor, other, now).is_some() || cache.ledger.noted(actor, other, now, fb.ttl);
+                if !held && !send.contains(other) {
+                    send.push(other.clone());
+                }
+            }
+            let mut plan = fallback::calls(actor, &send);
+            plan.truncate(usize::try_from(state.fallback_calls_left).unwrap_or(usize::MAX));
+            state.fallback_calls_left -= u32::try_from(plan.len()).unwrap_or(state.fallback_calls_left).min(state.fallback_calls_left);
+            (plan, state.fallback_allowance)
+        };
+        if plan.is_empty() || allowance.is_zero() {
+            return HashMap::new();
+        }
+        let started = Instant::now();
+        let answers = join_all(plan.into_iter().map(|call| self.fallback_call(fb, actor, call, allowance))).await;
+
+        // The apply step: one step under the cache's lock.
+        let now = Instant::now();
+        let mut learned: HashMap<String, PairAnswer> = HashMap::new();
+        let mut state = self.state();
+        state.fallback_allowance = state.fallback_allowance.saturating_sub(started.elapsed());
+        let mut cache = self.farsight.cache();
+        // A member was purged since the request began: its own response
+        // still uses what it learned, and nothing is left for later ones.
+        let purged = inner.purges.load(Ordering::SeqCst) != self.purges;
+        // Guard 1: Farsight answered meanwhile. The whole answer goes.
+        if inner.gate.read(now).answers != snapshot {
+            skip("farsight_answered");
+            return learned;
+        }
+        for (class, results) in answers {
+            if class == fallback::Class::ActorNotFound && !purged {
+                cache.ledger.stop(actor, now);
+            }
+            for (other, result) in results {
+                match result {
+                    Found::Blocked(list) => {
+                        // Guard 2: a fallback result never changes an
+                        // entry Farsight wrote.
+                        if matches!(cache.entry(actor, &other, now), Some((_, Source::Farsight))) {
+                            continue;
+                        }
+                        let answer = PairAnswer::from_fallback(list);
+                        if !purged {
+                            cache.store(actor, &other, answer.clone(), now + fb.ttl, Source::Fallback, &inner.settings);
+                        }
+                        state.memo.insert(other.clone(), Some(answer.clone()));
+                        learned.insert(other, answer);
+                    }
+                    Found::Nothing => {
+                        if !purged {
+                            cache.ledger.note(actor, &other, now, inner.settings.per_viewer, inner.settings.total);
+                        }
+                    }
+                }
+            }
+        }
+        learned
+    }
+
+    /// One fallback call, within the request's fallback allowance. Every
+    /// response is classified, and every class but a cut by the request's
+    /// own budget is recorded on the fallback's breaker: nobody but a
+    /// ready member reaches it, so no failure is left out.
+    async fn fallback_call(&self, fb: &Fallback, actor: &str, call: Vec<String>, allowance: Duration) -> (fallback::Class, HashMap<String, Found>) {
+        use fallback::Class as Fb;
+        let skipped = |reason: &'static str| {
+            metrics::counter!(fallback::METRIC_SKIPPED, "reason" => reason).increment(1);
+            (Fb::Budget, HashMap::new())
+        };
+        let Some(admission) = fb.breaker.admit(Instant::now()) else {
+            return skipped("breaker_open");
+        };
+        // A miss is "no answer" and touches nothing else: never a wait,
+        // never a 429, and not counted as an exhausted share.
+        if fb.bucket.quiet_draw(&self.key).is_err() {
+            return skipped("no_budget");
+        }
+        let whole = allowance >= fb.timeout;
+        let (class, results) = match fb.client.get_relationships_within(actor, &call, allowance.min(fb.timeout)).await {
+            Ok(response) => fallback::read(response.status.as_u16(), &response.body, actor, &call),
+            Err(NetError::Timeout) if whole => (Fb::Timeout, HashMap::new()),
+            Err(NetError::Timeout) => (Fb::Budget, HashMap::new()),
+            Err(NetError::BodyTooLarge { .. }) => (Fb::Malformed, HashMap::new()),
+            Err(_) => (Fb::Transport, HashMap::new()),
+        };
+        match class {
+            Fb::Ok => admission.record(Class::Hit, Instant::now()),
+            Fb::Budget => drop(admission),
+            _ => admission.record(Class::Transient, Instant::now()),
+        }
+        metrics::counter!(fallback::METRIC_CALLS, "class" => class.label()).increment(1);
+        (class, results)
     }
 
     /// The second reader's entry point (design-v3 §5.14.9): the pair
@@ -587,6 +814,8 @@ impl Lookup {
     /// - `force` names one account that is asked about although an entry
     ///   for it is held.
     pub async fn pair_answers(&self, viewer: &str, others: &[String], budget: PairBudget, force: Option<&str>) -> PairAnswers {
+        // No Thread Lens round starts a fallback call (§5.14.17.7).
+        self.set_no_fallback();
         let mut out = PairAnswers::default();
         let Some(actor) = canonical(viewer) else {
             return out;
@@ -692,21 +921,28 @@ impl Lookup {
     ) -> BoxFuture<'a, Called> {
         Box::pin(async move {
             let inner = &self.farsight.inner;
-            let none = |chunk: Vec<String>, outcome: &'static str| {
+            let none = |chunk: Vec<String>, outcome: &'static str, eligible: bool| {
                 metrics::counter!(METRIC_CALLS, "outcome" => outcome).increment(1);
-                Called { outcomes: chunk.into_iter().map(|did| (did, None)).collect(), levels: Vec::new(), answered: false }
+                Called {
+                    eligible: if eligible { chunk.clone() } else { Vec::new() },
+                    outcomes: chunk.into_iter().map(|did| (did, None)).collect(),
+                    levels: Vec::new(),
+                    answered: false,
+                }
             };
             // The admission is the probe-slot guard: dropped on any exit
             // below without a recorded outcome, it gives the slot back.
             let Some(admission) = inner.gate.admit(Instant::now()) else {
-                return none(chunk, "breaker_open");
+                return none(chunk, "breaker_open", true);
             };
-            let Ok(pool) = inner.bucket.draw(&self.key) else {
-                return none(chunk, "no_budget");
+            // An empty share is counted here, as "no_budget", and nowhere
+            // else.
+            let Ok(pool) = inner.bucket.quiet_draw(&self.key) else {
+                return none(chunk, "no_budget", false);
             };
             let remaining = allowance.saturating_sub(started.elapsed());
             if remaining.is_zero() {
-                return none(chunk, "allowance_spent");
+                return none(chunk, "allowance_spent", false);
             }
             // A call that has its whole timeout and reaches it is a failure
             // of Farsight. One cut short by earlier calls is not. Decided
@@ -731,7 +967,7 @@ impl Lookup {
                             (did, pair)
                         })
                         .collect();
-                    Called { outcomes, levels: vec![answer.coverage], answered: true }
+                    Called { outcomes, levels: vec![answer.coverage], answered: true, eligible: Vec::new() }
                 }
                 Err(CallError::TooLarge) => {
                     // Big, not failing: not recorded by the breaker.
@@ -747,9 +983,10 @@ impl Lookup {
                                 outcomes: a.outcomes.into_iter().chain(b.outcomes).collect(),
                                 levels: a.levels.into_iter().chain(b.levels).collect(),
                                 answered: a.answered && b.answered,
+                                eligible: a.eligible.into_iter().chain(b.eligible).collect(),
                             }
                         }
-                        None => Called { outcomes: chunk.into_iter().map(|did| (did, None)).collect(), levels: Vec::new(), answered: false },
+                        None => Called { outcomes: chunk.into_iter().map(|did| (did, None)).collect(), levels: Vec::new(), answered: false, eligible: Vec::new() },
                     }
                 }
                 Err(error) => {
@@ -780,7 +1017,7 @@ impl Lookup {
                     if pool == Pool::Member {
                         inner.gate.record(admission, failing.then_some(Class::Transient), effect, Instant::now());
                     }
-                    none(chunk, error.label())
+                    none(chunk, error.label(), pool == Pool::Member && effect == Effect::ServiceFailure)
                 }
             }
         })
@@ -858,6 +1095,69 @@ pub(crate) mod tests {
         let cfg = crate::config::FileConfig::parse(&format!("[farsight]\n{toml}")).expect("parse").farsight;
         let client = FarsightClient::new(NetClient::loopback_for_tests(), &base, "fsk_test").expect("client");
         (Farsight::new(client, &cfg, &Shares::for_tests()), fake)
+    }
+
+    /// A fake AppView answering `getRelationships` for the fallback.
+    #[derive(Default)]
+    pub(crate) struct FakeAppView {
+        /// Accounts it reports as blocking the actor through a list.
+        pub blockers: Mutex<HashSet<String>>,
+        /// A status other than 200 to answer with, as `ActorNotFound`.
+        pub status: Mutex<u16>,
+        pub asked: Mutex<Vec<Vec<String>>>,
+    }
+
+    async fn relationships(State(fake): State<Arc<FakeAppView>>, RawQuery(q): RawQuery) -> axum::response::Response {
+        let query = q.unwrap_or_default();
+        let param = |name: &str| -> Vec<String> {
+            url::form_urlencoded::parse(query.as_bytes()).filter(|(k, _)| k == name).map(|(_, v)| v.into_owned()).collect()
+        };
+        let others = param("others");
+        fake.asked.lock().expect("asked").push(others.clone());
+        let status = *fake.status.lock().expect("status");
+        if status != 0 && status != 200 {
+            return (StatusCode::from_u16(status).expect("status"), axum::Json(json!({"error": "ActorNotFound"}))).into_response();
+        }
+        let blockers = fake.blockers.lock().expect("blockers");
+        let entries: Vec<Value> = others
+            .iter()
+            .map(|o| {
+                let mut entry = json!({"$type": "app.bsky.graph.defs#relationship", "did": o});
+                if blockers.contains(o) {
+                    entry["blockedByList"] = json!(LIST);
+                }
+                entry
+            })
+            .collect();
+        axum::Json(json!({"actor": param("actor").first(), "relationships": entries})).into_response()
+    }
+
+    /// Switch the fallback on for `farsight`, against a fake AppView.
+    pub(crate) async fn with_fallback(farsight: &Farsight) -> Arc<FakeAppView> {
+        let fake = Arc::new(FakeAppView::default());
+        let base = serve_fake(Router::new().route("/xrpc/app.bsky.graph.getRelationships", get(relationships)).with_state(Arc::clone(&fake))).await;
+        let client = AppViewClient::new("bluesky", &base, crate::appview_clients::AppViewAuth::Unauth, NetClient::loopback_for_tests());
+        farsight.enable_fallback(client, &FarsightFallbackConfig::default(), &Shares::for_tests());
+        fake
+    }
+
+    /// An account Farsight's grammar accepts, by number.
+    fn numbered(i: usize) -> String {
+        format!("did:plc:{:e>24}", format!("{i:x}").replace(['0', '1', '8', '9'], "f"))
+    }
+
+    /// Farsight answers once, then hangs until its breaker opens: down.
+    async fn down(toml: &str) -> (Farsight, Arc<Fake>, Arc<FakeAppView>) {
+        let (farsight, fake) = engine(&format!("timeout_ms = 50\n{toml}")).await;
+        let upstream = with_fallback(&farsight).await;
+        let none = HashSet::new();
+        farsight.request(&member()).inbound_list_blocks(V, &page(&[A]), &none).await;
+        *fake.delay_ms.lock().expect("delay") = 400;
+        for i in 0..5 {
+            farsight.request(&member()).inbound_list_blocks(V, &[numbered(i + 2)], &none).await;
+        }
+        assert!(farsight.gate().down);
+        (farsight, fake, upstream)
     }
 
     fn member() -> Requester {
@@ -954,6 +1254,92 @@ pub(crate) mod tests {
         let before = calls(&fake);
         let none = farsight.request(&member()).pair_answers(V, &page(&["did:plc:dddddddddddddddddddddddd"]), PairBudget { max_calls: 0, ..budget }, None).await;
         assert!(none.answers.is_empty() && calls(&fake) == before);
+    }
+
+    /// B-90: while Farsight is down, a member's ordinary lookup asks the
+    /// fallback about the accounts its calls never got through for. A
+    /// "blocked" becomes a block in hand; a "nothing" is only noted, so
+    /// the pair is not sent again. Nothing else ever asks.
+    #[tokio::test]
+    async fn the_fallback_is_asked_only_while_farsight_is_down() {
+        let none = HashSet::new();
+        // Up: a miss on Farsight's side never reaches the fallback.
+        let (farsight, _fake) = engine("").await;
+        let upstream = with_fallback(&farsight).await;
+        farsight.request(&member()).inbound_list_blocks(V, &page(&[A, B]), &none).await;
+        assert!(upstream.asked.lock().expect("asked").is_empty());
+
+        let (farsight, _fake, upstream) = down("").await;
+        // The request whose own call was the fifth failure already asked.
+        assert_eq!(*upstream.asked.lock().expect("asked"), [vec![numbered(6)]]);
+        upstream.blockers.lock().expect("blockers").insert(B.to_string());
+        let asked = || upstream.asked.lock().expect("asked").len();
+
+        let blocked = farsight.request(&member()).inbound_list_blocks(V, &page(&[B, C]), &none).await;
+        assert_eq!(blocked, HashMap::from([(B.to_string(), LIST.to_string())]));
+        assert_eq!(upstream.asked.lock().expect("asked")[1], [B, C]);
+        // B's block is in hand and C was told "nothing": neither is sent
+        // again, and B still applies.
+        let again = farsight.request(&member()).inbound_list_blocks(V, &page(&[B, C]), &none).await;
+        assert_eq!((again.len(), asked()), (1, 2));
+        assert_eq!(farsight.ledger_notes(), 2, "the fifth request's account, and C");
+        // Never vouched: Thread Lens reads it as a block and nothing more.
+        let lens = farsight.request(&member());
+        let budget = PairBudget { max_calls: 1, timeout: Duration::from_millis(50) };
+        let pairs = lens.pair_answers(V, &page(&[B, &numbered(40)]), budget, None).await;
+        assert!(pairs.answers[B].inbound.list.is_some() && !pairs.answers[B].vouched && !pairs.vouches);
+        // A Thread Lens round, a count, and a cache-only read ask nothing.
+        assert_eq!(asked(), 2);
+        let quiet = farsight.request(&member());
+        quiet.set_no_fallback();
+        quiet.inbound_list_blocks(V, &[numbered(41)], &none).await;
+        let cached = farsight.request(&member());
+        cached.set_cache_only();
+        cached.inbound_list_blocks(V, &[numbered(42)], &none).await;
+        assert_eq!(asked(), 2);
+        // An anonymous caller's request draws on the non-member pool and
+        // is charged by address; it has no fallback either way here, and
+        // the relationships reader never asks.
+        let rt = ReadCache::new(1024);
+        farsight.request(&member()).relationship_lists(V, &[numbered(43)], &rt).await;
+        assert_eq!(asked(), 2);
+        // A purge of the viewer clears its blocks in hand and its notes.
+        farsight.forget(V);
+        assert_eq!((farsight.cached(), farsight.ledger_notes()), (0, 0));
+    }
+
+    /// B-91: the per-request cap bounds the calls; an `ActorNotFound`
+    /// holds the fallback off for that viewer; five failures open the
+    /// fallback's own breaker.
+    #[tokio::test]
+    async fn the_fallback_has_its_own_bounds_and_breaker() {
+        let none = HashSet::new();
+        let (farsight, _fake, upstream) = down("").await;
+        let before = upstream.asked.lock().expect("asked").len();
+        // 70 accounts: two calls of 30 at the default cap, the rest unasked.
+        let letter = |n: u8| char::from(b'b' + n);
+        let many: Vec<String> = (0..70u8).map(|i| format!("did:plc:{:a>24}", format!("{}{}", letter(i / 20), letter(i % 20)))).collect();
+        farsight.request(&member()).inbound_list_blocks(V, &many, &none).await;
+        let asked = upstream.asked.lock().expect("asked").clone();
+        assert_eq!(asked[before..].iter().map(Vec::len).collect::<Vec<_>>(), [30, 30]);
+
+        // The other AppView does not know the viewer: one call, then none
+        // for this viewer; another viewer is still asked.
+        let (farsight, _fake, upstream) = down("").await;
+        *upstream.status.lock().expect("status") = 400;
+        let before = upstream.asked.lock().expect("asked").len();
+        farsight.request(&member()).inbound_list_blocks(V, &[numbered(50)], &none).await;
+        farsight.request(&member()).inbound_list_blocks(V, &[numbered(51)], &none).await;
+        assert_eq!(upstream.asked.lock().expect("asked").len(), before + 1);
+        // Five failures in a row open the fallback's breaker for everyone.
+        for (i, viewer) in ["did:plc:wwwwwwwwwwwwwwwwwwwwwwww", "did:plc:xxxxxxxxxxxxxxxxxxxxxxxx", "did:plc:yyyyyyyyyyyyyyyyyyyyyyyy", "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz"].into_iter().enumerate() {
+            farsight.request(&Requester::new(ChargeKey::member(viewer))).inbound_list_blocks(viewer, &[numbered(60 + i)], &none).await;
+        }
+        assert!(farsight.fallback_breaker_open());
+        let before = upstream.asked.lock().expect("asked").len();
+        let other = "did:plc:uuuuuuuuuuuuuuuuuuuuuuuu";
+        farsight.request(&Requester::new(ChargeKey::member(other))).inbound_list_blocks(other, &[numbered(70)], &none).await;
+        assert_eq!(upstream.asked.lock().expect("asked").len(), before);
     }
 
     /// B-81: the prime is counted, and its breaker is apart from the read

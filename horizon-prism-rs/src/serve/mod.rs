@@ -195,7 +195,28 @@ pub async fn run() -> Result<(), StartupError> {
             let client = crate::farsight::FarsightClient::new(net.clone(), url, token.expose())
                 .ok_or_else(|| StartupError::new(78, "FARSIGHT_TOKEN is not a usable header value".to_string()))?;
             tracing::info!(event = "farsight_enabled", "inbound list blocks are read from Farsight");
-            Some(crate::farsight::Farsight::new(client, &cfg.file.farsight, &shares))
+            let farsight = crate::farsight::Farsight::new(client, &cfg.file.farsight, &shares);
+            // The fallback (§5.14.17), only when the operator switched it
+            // on. Validation has checked the entry it names.
+            let fallback = &cfg.file.farsight.fallback;
+            if fallback.enabled
+                && let Some(network) = cfg.file.constellation.networks.iter().find(|n| n.name == fallback.network)
+            {
+                let upstream = crate::appview_clients::AppViewClient::new(
+                    &network.name,
+                    &network.appview_url,
+                    crate::appview_clients::AppViewAuth::Unauth,
+                    net.clone(),
+                );
+                farsight.enable_fallback(upstream, fallback, &shares);
+                tracing::warn!(
+                    event = "farsight_fallback_enabled",
+                    network = %network.name,
+                    appview = %network.appview_url,
+                    "the fallback is on: while Farsight is down, each fallback call tells this AppView that this deployment is rendering a page for a member that contains the accounts named, and it can join that with other calls from this address",
+                );
+            }
+            Some(farsight)
         }
         _ => None,
     };
