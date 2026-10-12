@@ -11,6 +11,23 @@ use crate::xrpc::AppState;
 use crate::xrpc::auth::{Access, Params, prepare};
 
 pub const GET_TIMELINE: &str = "app.bsky.feed.getTimeline";
+pub const GET_LIST_FEED: &str = "app.bsky.feed.getListFeed";
+
+pub async fn get_list_feed(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_LIST_FEED, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(
+        &req.req,
+        s.hydrator
+            .get_list_feed(&req.viewer, &req.req, p.required("list")?, clamp_limit(p.u32("limit")?), p.one("cursor"))
+            .await,
+    )
+}
 
 pub async fn get_timeline(
     State(s): State<AppState>,

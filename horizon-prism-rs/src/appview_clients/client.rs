@@ -148,6 +148,19 @@ impl AppViewClient {
         self.query("app.bsky.graph.getList", &params).await
     }
 
+    /// `app.bsky.feed.getListFeed`.
+    ///
+    /// # Errors
+    ///
+    /// Any [`NetError`].
+    pub async fn get_list_feed(&self, list: &str, limit: u32, cursor: Option<&str>) -> Result<NetResponse, NetError> {
+        let mut params = vec![("list", list.to_string()), ("limit", limit.to_string())];
+        if let Some(c) = cursor {
+            params.push(("cursor", c.to_string()));
+        }
+        self.query("app.bsky.feed.getListFeed", &params).await
+    }
+
     /// `app.bsky.graph.getRelationships`.
     ///
     /// # Errors

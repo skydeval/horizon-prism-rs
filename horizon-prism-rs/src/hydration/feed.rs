@@ -17,6 +17,10 @@ use crate::moderation::{self, Gate};
 use crate::hydration::HydrationError;
 use crate::xrpc::pools::{Exhausted, Requester};
 
+/// `list_feed_partial_total`: list feeds answered from the in-scope members
+/// only, because no upstream answered.
+pub const METRIC_LIST_FEED_PARTIAL: &str = "list_feed_partial_total";
+
 pub const NSID_LIKE: &str = "app.bsky.feed.like";
 pub const NSID_REPOST: &str = "app.bsky.feed.repost";
 pub const NSID_POST: &str = "app.bsky.feed.post";
@@ -573,6 +577,132 @@ impl Hydrator {
         Ok(Ok(Self::emit(out)))
     }
 
+    /// Drop the `feedViewPost`s the viewer's own mutes and blocks exclude
+    /// (design-v3 §5.3 "Where mutes apply", "Where blocks apply"), from a
+    /// feed that is already hydrated:
+    /// - a block in either direction with the post's author or the reposter;
+    /// - a full mute of either;
+    /// - a repost by an account whose reposts are muted;
+    /// - a quote post by an account whose quote posts are muted.
+    ///
+    /// Anyone but a ready member has no such state, and gets the feed back.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(super) async fn without_excluded(&self, viewer: &Viewer, feed: Vec<Value>) -> Result<Vec<Value>, sqlx::Error> {
+        if viewer.state_did().is_none() {
+            return Ok(feed);
+        }
+        let did = |item: &Value, pointer: &str| item.pointer(pointer).and_then(Value::as_str).map(str::to_string);
+        let dids: Vec<String> = feed
+            .iter()
+            .flat_map(|item| [did(item, "/post/author/did"), did(item, "/reason/by/did")])
+            .flatten()
+            .collect();
+        let state = self.actor_viewer(viewer, &dids).await?;
+        // A quote post: by its stored row, or, for a post that is not
+        // stored, by its record's embed.
+        let uris: Vec<String> = feed.iter().filter_map(|item| did(item, "/post/uri")).collect();
+        let stored_quotes: HashSet<String> = sqlx::query_scalar("SELECT uri FROM posts WHERE uri = ANY($1) AND quote_uri IS NOT NULL")
+            .bind(&uris)
+            .fetch_all(self.pool())
+            .await?
+            .into_iter()
+            .collect();
+        Ok(feed
+            .into_iter()
+            .filter(|item| {
+                let author = did(item, "/post/author/did");
+                let reposter = did(item, "/reason/by/did");
+                let quotes = did(item, "/post/uri").is_some_and(|u| stored_quotes.contains(&u))
+                    || item
+                        .pointer("/post/record/embed/$type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| matches!(t, "app.bsky.embed.record" | "app.bsky.embed.recordWithMedia"));
+                let hidden = |d: &String| state.blocked_either_way(d) || state.muted.contains(d);
+                !(author.iter().chain(&reposter).any(hidden)
+                    || reposter.as_ref().is_some_and(|d| state.muted_reposts.contains(d))
+                    || (quotes && author.as_ref().is_some_and(|d| state.muted_quotes.contains(d))))
+            })
+            .collect())
+    }
+
+    /// `app.bsky.feed.getListFeed` (design-v3 §5.5): the posts and reposts
+    /// of a list's members, newest first.
+    ///
+    /// Local `feed_items` answer only when the list is served locally (its
+    /// owner is a ready member) and every member of it is in scope, so the
+    /// feed is complete. Otherwise an upstream AppView is asked. When none
+    /// answers, a locally served list is answered from the members that are
+    /// in scope, and `list_feed_partial_total` counts it.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn get_list_feed(&self, viewer: &Viewer, req: &Requester, list: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+        let unknown = || ViewError::new("UnknownList", "List not found");
+        let Some((_, local)) = self.load_list(req, list).await? else {
+            return Ok(Err(unknown()));
+        };
+        let owner = uri_author(list).unwrap_or_default().to_string();
+        let gates = moderation::gate_many(self.pool(), &[owner, list.to_string()]).await?;
+        if gates.values().any(|g| g.is_hidden()) {
+            return Ok(Err(unknown()));
+        }
+        let members: Vec<String> = if local {
+            sqlx::query_scalar("SELECT DISTINCT subject_did FROM list_items WHERE list_uri = $1")
+                .bind(list)
+                .fetch_all(self.pool())
+                .await?
+        } else {
+            Vec::new()
+        };
+        let in_scope: Vec<String> = {
+            let scope = self.scope().read_guard().await;
+            members.iter().filter(|d| scope.in_scope(d)).cloned().collect()
+        };
+        let complete = local && in_scope.len() == members.len();
+        // A `PL:` cursor continues a partial local answer: a local cursor
+        // behind a `P`, so it is never sent upstream.
+        let partial_cursor = cursor.filter(|c| c.starts_with("PL:")).map(|c| &c[1..]);
+        if !complete && partial_cursor.is_none() {
+            if let Some(found) = self.upstream().list_feed(req, list, limit, cursor).await {
+                let (mut found, _) = self.normalized(viewer, found).await?;
+                if let Some(feed) = found.get_mut("feed").and_then(Value::as_array_mut) {
+                    *feed = self.without_excluded(viewer, std::mem::take(feed)).await?;
+                }
+                return Ok(Ok(Self::emit(found)));
+            }
+            if !local {
+                return Ok(Err(unknown()));
+            }
+            metrics::counter!(METRIC_LIST_FEED_PARTIAL).increment(1);
+        }
+        let (at, after_uri) = parse_local_cursor(partial_cursor.or(cursor));
+        let items: Vec<FeedItem> = sqlx::query_as(
+            "SELECT f.uri, f.originator_did, f.post_uri, f.kind, f.sort_at FROM feed_items f \
+             WHERE f.originator_did = ANY($1) AND f.kind IN ('post', 'reply', 'repost') \
+               AND ($2::timestamptz IS NULL OR (f.sort_at, f.uri) < ($2, $3)) \
+             ORDER BY f.sort_at DESC, f.uri DESC LIMIT $4",
+        )
+        .bind(&in_scope)
+        .bind(at)
+        .bind(after_uri.unwrap_or_default())
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await?;
+        let feed = self.without_excluded(viewer, self.feed_views(viewer, req, &items).await?).await?;
+        let mut out = json!({ "feed": feed });
+        if items.len() == usize::try_from(limit).unwrap_or(usize::MAX)
+            && let Some(last) = items.last()
+        {
+            let next = local_cursor(last.sort_at, &last.uri);
+            out["cursor"] = json!(if complete { next } else { format!("P{next}") });
+        }
+        Ok(Ok(Self::emit(out)))
+    }
+
     /// `app.bsky.feed.getTimeline` for a ready member: `feed_items` of the
     /// viewer's follows and the viewer, excluding muted authors and blocks in
     /// either direction (§7.5), reverse-chronological.
@@ -589,16 +719,6 @@ impl Hydrator {
             "SELECT f.uri, f.originator_did, f.post_uri, f.kind, f.sort_at FROM feed_items f \
              WHERE (f.originator_did = $1 OR f.originator_did IN (SELECT subject_did FROM follows WHERE author_did = $1)) \
                AND ($2::timestamptz IS NULL OR (f.sort_at, f.uri) < ($2, $3)) \
-               AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.scope = 'full' \
-                   AND m.subject_did IN (f.originator_did, split_part(f.post_uri, '/', 3))) \
-               AND NOT (f.kind = 'repost' AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
-                   AND m.subject_did = f.originator_did AND m.scope IN ('reposts', 'reposts_and_quotes'))) \
-               AND NOT EXISTS (SELECT 1 FROM mutes m JOIN posts p ON p.author_did = m.subject_did \
-                   WHERE m.viewer_did = $1 AND m.scope IN ('quotes', 'reposts_and_quotes') \
-                     AND p.uri = f.post_uri AND p.quote_uri IS NOT NULL) \
-               AND NOT EXISTS (SELECT 1 FROM blocks b WHERE \
-                   (b.author_did = $1 AND b.subject_did IN (f.originator_did, split_part(f.post_uri, '/', 3))) \
-                OR (b.subject_did = $1 AND b.author_did IN (f.originator_did, split_part(f.post_uri, '/', 3)))) \
              ORDER BY f.sort_at DESC, f.uri DESC LIMIT $4",
         )
         .bind(me)
@@ -607,7 +727,10 @@ impl Hydrator {
         .bind(i64::from(limit))
         .fetch_all(self.pool())
         .await?;
-        let feed = self.feed_views(viewer, req, &items).await?;
+        // Every scanned item is hydrated; the viewer's mutes and blocks drop
+        // items afterwards (design-v3 §8.1 "Hydrate before filtering"). A
+        // page can be short; the cursor follows the scan.
+        let feed = self.without_excluded(viewer, self.feed_views(viewer, req, &items).await?).await?;
         let mut out = json!({ "feed": feed });
         if items.len() == usize::try_from(limit).unwrap_or(usize::MAX)
             && let Some(last) = items.last()

@@ -155,6 +155,7 @@ pub const SERVED: &[Served] = &[
     served("app.bsky.feed.getRepostedBy", Family::Read, true),
     served("app.bsky.feed.getQuotes", Family::Read, true),
     served("app.bsky.feed.getTimeline", Family::Read, false),
+    served("app.bsky.feed.getListFeed", Family::Read, true),
     served("app.bsky.graph.getFollows", Family::Read, true),
     served("app.bsky.graph.getFollowers", Family::Read, true),
     served("app.bsky.graph.getList", Family::Read, true),

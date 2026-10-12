@@ -698,6 +698,87 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// B-35: a list feed is local only when the list is served locally and
+    /// every member is in scope; the viewer's mutes and blocks apply.
+    #[tokio::test]
+    async fn list_feeds() {
+        use crate::hydration::testing::post;
+
+        let Some(db) = fresh_db("hydration_list_feed").await else {
+            return;
+        };
+        let p = &db.pool;
+        for (d, h) in [(ALICE, "alice.test"), (BOB, "bob.test"), (CAROL, "carol.test")] {
+            actor(p, d, h, h).await;
+        }
+        exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
+        let feed_list = list(p, ALICE, "feed", "Feed", PURPOSE_CURATE, 1).await;
+        item(p, &feed_list, "i1", BOB, 2).await;
+        item(p, &feed_list, "i2", CAROL, 1).await;
+        let bobs = post(p, BOB, "3kbbbbbbbbbb2", "from bob", None, None).await;
+        let carols = post(p, CAROL, "3kcccccccccc2", "from carol", None, None).await;
+        for (uri, who, age) in [(&bobs, BOB, 2), (&carols, CAROL, 1)] {
+            exec(p, &format!(
+                "INSERT INTO feed_items (uri, originator_did, post_uri, kind, sort_at) VALUES ('{uri}', '{who}', '{uri}', 'post', now() - interval '{age} minutes') \
+                 ON CONFLICT (uri) DO NOTHING"
+            )).await;
+        }
+        let texts = |v: &Value| -> Vec<String> {
+            v["feed"].as_array().expect("feed").iter().map(|i| i["post"]["record"]["text"].as_str().expect("text").to_string()).collect()
+        };
+        let (anon, req) = (Viewer::anonymous(), Requester::test());
+        let mut all = ScopeSets::default();
+        for d in [ALICE, BOB, CAROL] {
+            all.scope.insert(d.into());
+        }
+
+        // Every member in scope: local rows, newest first, paged.
+        let h = hydrator(p, all.clone());
+        let v = h.get_list_feed(&anon, &req, &feed_list, 50, None).await.expect("db").expect("view");
+        assert_eq!(texts(v.inner()), ["from carol", "from bob"]);
+        let first = h.get_list_feed(&anon, &req, &feed_list, 1, None).await.expect("db").expect("view");
+        let cursor = first.inner()["cursor"].as_str().expect("cursor").to_string();
+        let second = h.get_list_feed(&anon, &req, &feed_list, 1, Some(&cursor)).await.expect("db").expect("view");
+        assert_eq!(texts(second.inner()), ["from bob"]);
+        // The viewer's mute drops the muted member's posts after hydration.
+        exec(p, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{ALICE}', '{CAROL}')")).await;
+        let owner = Viewer {
+            did: Some(ALICE.into()),
+            hydrate: true,
+        };
+        let v = h.get_list_feed(&owner, &req, &feed_list, 50, None).await.expect("db").expect("view");
+        assert_eq!(texts(v.inner()), ["from bob"]);
+
+        // A member out of scope: upstream is asked; with no answer, the
+        // in-scope members answer, with a cursor of their own.
+        let mut some = ScopeSets::default();
+        some.scope.insert(BOB.into());
+        let partial = hydrator(p, some.clone());
+        let v = partial.get_list_feed(&anon, &req, &feed_list, 1, None).await.expect("db").expect("view");
+        assert_eq!(texts(v.inner()), ["from bob"]);
+        let partial_cursor = v.inner()["cursor"].as_str().expect("cursor").to_string();
+        assert!(partial_cursor.starts_with("PL:"));
+        let v = partial.get_list_feed(&anon, &req, &feed_list, 1, Some(&partial_cursor)).await.expect("db").expect("view");
+        assert_eq!(v.inner()["feed"], json!([]));
+        let mut up = FixedUpstream::default();
+        up.list_feeds.insert(feed_list.clone(), json!({"feed": [{"post": {
+            "uri": format!("at://{CAROL}/app.bsky.feed.post/far"), "cid": "bafyfar", "author": {"did": CAROL, "handle": "carol.test"},
+            "record": {"text": "from upstream"}, "indexedAt": "2026-01-01T00:00:00Z"}}], "cursor": "up"}));
+        let asked = hydrator_with(p, some, Arc::new(up));
+        let v = asked.get_list_feed(&anon, &req, &feed_list, 50, None).await.expect("db").expect("view");
+        assert_eq!((texts(v.inner()), &v.inner()["cursor"]), (vec!["from upstream".to_string()], &json!("up")));
+        // The muting viewer does not see the muted author upstream either.
+        let v = asked.get_list_feed(&owner, &req, &feed_list, 50, None).await.expect("db").expect("view");
+        assert_eq!(v.inner()["feed"], json!([]));
+
+        // A list nobody can serve, and a URI that is not a list.
+        for miss in [list_uri(BOB, "nope"), "garbage".to_string()] {
+            let e = h.get_list_feed(&anon, &req, &miss, 50, None).await.expect("db").expect_err("miss");
+            assert_eq!(e.error, "UnknownList", "{miss}");
+        }
+        db.drop_db().await;
+    }
+
     /// B-35: any other owner's list is read upstream, even when rows are
     /// stored here.
     #[tokio::test]

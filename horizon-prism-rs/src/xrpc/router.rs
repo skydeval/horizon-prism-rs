@@ -213,6 +213,7 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(feed::GET_REPOSTED_BY), get(feed::get_reposted_by))
         .route(&xrpc(feed::GET_QUOTES), get(feed::get_quotes))
         .route(&xrpc(timeline::GET_TIMELINE), get(timeline::get_timeline))
+        .route(&xrpc(timeline::GET_LIST_FEED), get(timeline::get_list_feed))
         .route(&xrpc(graph::GET_FOLLOWS), get(graph::get_follows))
         .route(&xrpc(graph::GET_FOLLOWERS), get(graph::get_followers))
         .route(&xrpc(graph::GET_LIST), get(graph::get_list))

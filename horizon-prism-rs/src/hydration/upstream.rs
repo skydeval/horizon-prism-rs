@@ -78,6 +78,10 @@ pub trait UpstreamSource: Send + Sync {
     async fn lists(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>, _purposes: &[String]) -> Option<Value> {
         None
     }
+    /// An upstream AppView's `app.bsky.feed.getListFeed` output.
+    async fn list_feed(&self, _req: &Requester, _list: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+        None
+    }
     /// An upstream AppView's `app.bsky.graph.getRelationships` output.
     async fn relationships(&self, _req: &Requester, _actor: &str, _others: &[String]) -> Option<Value> {
         None
@@ -822,6 +826,10 @@ impl UpstreamSource for RealUpstreamSource {
             out["cursor"] = json!(format!("P:{c}"));
         }
         Some(out)
+    }
+
+    async fn list_feed(&self, req: &Requester, list: &str, limit: u32, cursor: Option<&str>) -> Option<Value> {
+        self.cascade(req, uri_author(list)?, Call::ListFeed { list, limit, cursor }).await
     }
 
     async fn relationships(&self, req: &Requester, actor: &str, others: &[String]) -> Option<Value> {

@@ -669,6 +669,8 @@ pub(crate) mod testing {
         pub list_items: HashMap<String, Value>,
         /// DID → `getLists` output.
         pub lists: HashMap<String, Value>,
+        /// List URI → `getListFeed` output.
+        pub list_feeds: HashMap<String, Value>,
         /// Actor DID → `getRelationships` output.
         pub relationships: HashMap<String, Value>,
         /// Pack URI → `getStarterPack` output.
@@ -699,6 +701,9 @@ pub(crate) mod testing {
         }
         async fn lists(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>, _purposes: &[String]) -> Option<Value> {
             self.lists.get(actor).cloned()
+        }
+        async fn list_feed(&self, _req: &Requester, list: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+            self.list_feeds.get(list).cloned()
         }
         async fn relationships(&self, _req: &Requester, actor: &str, _others: &[String]) -> Option<Value> {
             self.relationships.get(actor).cloned()

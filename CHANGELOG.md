@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 12: `getListFeed` (#673).** The posts and reposts of a list's
+  members, newest first (design-v3 §5.5). Local rows answer only when the
+  list is served locally and every member is in scope, so that the feed is
+  complete. Otherwise an upstream AppView is asked. When none answers, a
+  locally served list is answered from its in-scope members, with a cursor
+  of its own kind, and `list_feed_partial_total` counts it. The viewer's
+  mutes and blocks drop items after hydration. An unknown list is
+  `UnknownList`.
 - **Item 12: `getKnownFollowers` (#673).** For a ready member: the accounts
   it follows that follow the named account (design-v3 §5.3). Stored follows
   are joined with a scan of the account's followers on Constellation, at
@@ -607,6 +615,8 @@ commit.
 
 ### Changed
 
+- `getTimeline` does the same as `listNotifications` below: it hydrates
+  every scanned item and applies the viewer's mutes and blocks afterwards.
 - `listNotifications` hydrates every row it scans and applies the viewer's
   mutes, blocks and thread mutes afterwards, where it filtered in SQL before
   (design-v3 §8.1 "Hydrate before filtering"). What a member's read fetches
