@@ -19,6 +19,7 @@ pub mod emit;
 pub mod feed;
 pub mod graph;
 pub mod hint;
+pub mod labels;
 pub mod lens;
 pub mod lists;
 pub mod normalize;
@@ -139,6 +140,8 @@ pub struct HydrationConfig {
     pub drafts_max: u32,
     /// `drafts.max_bytes`.
     pub drafts_max_bytes: u32,
+    /// `labels.query_max_patterns`.
+    pub labels_query_max_patterns: u32,
     /// `known_followers.scan_max_pages`.
     pub known_followers_scan_max_pages: u32,
     /// `known_followers.profile_scan_pages`.
@@ -833,6 +836,7 @@ pub(crate) mod testing {
                 bookmarks_max: 3,
                 drafts_max: 2,
                 drafts_max_bytes: 2000,
+                labels_query_max_patterns: 25,
                 known_followers_scan_max_pages: 2,
                 known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,
@@ -867,6 +871,7 @@ pub(crate) mod testing {
                 bookmarks_max: 3,
                 drafts_max: 2,
                 drafts_max_bytes: 2000,
+                labels_query_max_patterns: 25,
                 known_followers_scan_max_pages: 2,
                 known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,

@@ -379,6 +379,7 @@ pub async fn run() -> Result<(), StartupError> {
             bookmarks_max: cfg.file.bookmarks.max_per_actor,
             drafts_max: cfg.file.drafts.max_per_actor,
             drafts_max_bytes: cfg.file.drafts.max_bytes,
+            labels_query_max_patterns: cfg.file.labels.query_max_patterns,
             known_followers_scan_max_pages: cfg.file.known_followers.scan_max_pages,
             known_followers_profile_scan_pages: cfg.file.known_followers.profile_scan_pages,
             known_likers_scan_max_pages: cfg.file.known_likers.scan_max_pages,

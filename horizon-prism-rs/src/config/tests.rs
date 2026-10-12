@@ -268,6 +268,9 @@ max_per_actor = 50000
 max_per_actor = 1000
 max_bytes = 1048576
 
+[labels]
+query_max_patterns = 25
+
 [starter_packs]
 counts_refresh_secs = 3600
 

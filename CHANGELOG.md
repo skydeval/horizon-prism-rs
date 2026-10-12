@@ -12,6 +12,12 @@ commit.
 
 ### Added
 
+- **Item 15: `com.atproto.label.queryLabels` (#675).** Anyone can read
+  the labels this AppView's operator applied, by exact account or record,
+  or by a prefix that names one whole account (`at://<did>/…*`), so no
+  request can list every label. Up to `[labels] query_max_patterns`
+  patterns (default 25), 250 labels a page. Labels on private-tier
+  records are never returned. Labels are unsigned (design-v3 §5.12).
 - **Item 15: drafts (#675).** `app.bsky.draft.createDraft`, `getDrafts`,
   `updateDraft` and `deleteDraft`. A draft is checked against the
   lexicon (posts, text length, the embed lists) and against

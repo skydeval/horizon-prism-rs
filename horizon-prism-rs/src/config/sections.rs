@@ -841,6 +841,20 @@ impl Default for BookmarksConfig {
     }
 }
 
+/// `[labels]` (design-v3 §5.12).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LabelsConfig {
+    /// Patterns one `queryLabels` request may carry.
+    pub query_max_patterns: u32,
+}
+
+impl Default for LabelsConfig {
+    fn default() -> Self {
+        Self { query_max_patterns: 25 }
+    }
+}
+
 /// `[drafts]` (design-v3 §5.9).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1154,6 +1168,7 @@ pub struct FileConfig {
     pub notifications: NotificationsConfig,
     pub bookmarks: BookmarksConfig,
     pub drafts: DraftsConfig,
+    pub labels: LabelsConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,
     pub known_likers: KnownLikersConfig,

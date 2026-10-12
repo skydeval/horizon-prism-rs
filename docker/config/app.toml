@@ -300,6 +300,11 @@ max_per_actor = 50000
 max_per_actor = 1000
 max_bytes = 1048576
 
+# Anyone may ask which labels you applied to an account or to its records.
+# This is how many accounts or records one such request may name.
+[labels]
+query_max_patterns = 25
+
 # How often the "joined through this starter pack" numbers are recounted.
 [starter_packs]
 counts_refresh_secs = 3600
