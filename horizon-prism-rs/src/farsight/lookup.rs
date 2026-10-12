@@ -25,6 +25,7 @@ use super::answer::{Coverage, PairAnswer};
 use super::chunks::{chunks, halves};
 use super::client::{CallError, FarsightClient};
 use super::did::canonical;
+use super::gate::{Effect, GateRead, ReadGate};
 use crate::config::FarsightConfig;
 use crate::constellation::Class;
 use crate::constellation::cascade::SharedBreaker;
@@ -147,7 +148,8 @@ struct Inner {
     client: FarsightClient,
     settings: Settings,
     bucket: SharedBucket,
-    breaker: SharedBreaker,
+    /// The read breaker with the state of the run (§5.14.17.2).
+    gate: ReadGate,
     /// The breaker of `requestBackfill`, apart from the read breaker.
     prime_breaker: SharedBreaker,
     prime_on_enroll: bool,
@@ -183,7 +185,7 @@ impl Farsight {
                     max_calls: cfg.max_calls_per_request,
                 },
                 bucket: shares.bucket_with_share("farsight", cfg.rate_per_sec.0, cfg.burst, cfg.requester_share.0),
-                breaker: SharedBreaker::default(),
+                gate: ReadGate::default(),
                 prime_breaker: SharedBreaker::default(),
                 prime_on_enroll: cfg.prime_on_enroll,
                 cache: Mutex::new(Cache::default()),
@@ -276,10 +278,18 @@ impl Farsight {
         self.inner.prime_on_enroll
     }
 
+    /// One read of the gate: whether Farsight is down now (it has answered
+    /// this process, its read breaker is open, and nothing but service
+    /// failures came since its last answer), and its answer count.
+    #[must_use]
+    pub fn gate(&self) -> GateRead {
+        self.inner.gate.read(Instant::now())
+    }
+
     /// Whether the read breaker is open now.
     #[must_use]
     pub fn breaker_open(&self) -> bool {
-        self.inner.breaker.is_open(Instant::now())
+        self.inner.gate.is_open(Instant::now())
     }
 
     /// Cached entries across all viewers.
@@ -680,7 +690,7 @@ impl Lookup {
             };
             // The admission is the probe-slot guard: dropped on any exit
             // below without a recorded outcome, it gives the slot back.
-            let Some(admission) = inner.breaker.admit(Instant::now()) else {
+            let Some(admission) = inner.gate.admit(Instant::now()) else {
                 return none(chunk, "breaker_open");
             };
             let Ok(pool) = inner.bucket.draw(&self.key) else {
@@ -699,7 +709,8 @@ impl Lookup {
             let whole = split && allowance >= per_call;
             match inner.client.check_blocks(actor, &chunk, remaining.min(per_call)).await {
                 Ok(mut answer) => {
-                    admission.record(Class::Hit, Instant::now());
+                    // An answer, whoever asked: a new, clean run starts.
+                    inner.gate.record(admission, Some(Class::Hit), Effect::Answer, Instant::now());
                     metrics::counter!(METRIC_CALLS, "outcome" => "ok").increment(1);
                     metrics::counter!(METRIC_COVERAGE, "level" => answer.coverage.label()).increment(1);
                     for reason in std::mem::take(&mut answer.partial_reasons) {
@@ -739,16 +750,27 @@ impl Lookup {
                     }
                     let failing = match error {
                         CallError::Timeout => whole,
-                        CallError::Transport | CallError::Parse => true,
+                        CallError::Transport | CallError::RefusedAddress | CallError::Parse => true,
                         CallError::RateLimited | CallError::Overloaded => true,
                         CallError::Status(status) => status >= 500 || matches!(status, 401 | 403 | 429),
                         CallError::TooLarge => false,
                     };
+                    // What the outcome says about Farsight (§5.14.17.2):
+                    // only a timeout of a call that had its whole time, a
+                    // transport error and a 5xx are service failures.
+                    let effect = match error {
+                        CallError::Timeout if whole => Effect::ServiceFailure,
+                        CallError::Timeout | CallError::TooLarge => Effect::None,
+                        CallError::Transport | CallError::Overloaded => Effect::ServiceFailure,
+                        CallError::Status(status) if status >= 500 => Effect::ServiceFailure,
+                        CallError::RefusedAddress | CallError::RateLimited | CallError::Parse | CallError::Status(_) => Effect::Unclean,
+                    };
                     // A failure of a call drawn on the non-member pool is
-                    // not recorded: an anonymous caller chooses the accounts
-                    // it asks about, and could choose slow ones.
-                    if failing && pool == Pool::Member {
-                        admission.record(Class::Transient, Instant::now());
+                    // not recorded, on the breaker or on the run: an
+                    // anonymous caller chooses the accounts it asks about,
+                    // and could choose slow ones.
+                    if pool == Pool::Member {
+                        inner.gate.record(admission, failing.then_some(Class::Transient), effect, Instant::now());
                     }
                     none(chunk, error.label())
                 }
@@ -1114,6 +1136,34 @@ pub(crate) mod tests {
         let before = calls(&fake);
         farsight.request(&member()).inbound_list_blocks(V, &page(&[A]), &none).await;
         assert_eq!(calls(&fake), before);
+        // It never answered this process, so it is not "down": a Farsight
+        // that was never reachable is a configuration fault.
+        assert!(!farsight.gate().down);
+    }
+
+    /// design-v3 §5.14.17.2: Farsight is down once it has answered, its
+    /// breaker is open, and only service failures came since. A refusal
+    /// such as a 404 in that run keeps it from being "down".
+    #[tokio::test]
+    async fn farsight_is_down_after_an_answer_and_five_clean_failures() {
+        let none = HashSet::new();
+        let account = |i: usize| format!("did:plc:{:e>24}", format!("{i:x}").replace(['0', '1', '8', '9'], "f"));
+        for refusal in [false, true] {
+            let (farsight, fake) = engine("timeout_ms = 50\n").await;
+            farsight.request(&member()).inbound_list_blocks(V, &page(&[A]), &none).await;
+            assert_eq!(farsight.gate(), GateRead { down: false, answers: 1 });
+            if refusal {
+                *fake.status.lock().expect("status") = 404;
+                farsight.request(&member()).inbound_list_blocks(V, &[account(9)], &none).await;
+                *fake.status.lock().expect("status") = 200;
+            }
+            *fake.delay_ms.lock().expect("delay") = 400;
+            for i in 0..5 {
+                farsight.request(&member()).inbound_list_blocks(V, &[account(i + 2)], &none).await;
+            }
+            assert!(farsight.breaker_open());
+            assert_eq!(farsight.gate().down, !refusal);
+        }
     }
 
     #[tokio::test]

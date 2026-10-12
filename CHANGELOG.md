@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **Item 12b: knowing when Farsight is down (#683).** The `farsight`
+  module now keeps, beside its breaker, whether every call since
+  Farsight's last answer failed as a service failure (a timeout, a
+  transport error or a `5xx`). Farsight counts as down only when it has
+  answered this process at least once, its breaker is open, and nothing
+  else came in between: so a wrong URL or a revoked key never counts,
+  and one `401`, `429` or `404` keeps it from counting until Farsight
+  answers again. A refused address is now told apart from a transport
+  error (`farsight_calls_total{outcome="refused_address"}`). Nothing
+  acts on "down" yet (design-v3 §5.14.17.2).
 - **Item 12b: fallback settings (#683).** A `[farsight.fallback]`
   section, off by default: `enabled`, `network`, `timeout_ms`,
   `max_calls_per_request`, `cache_ttl_secs`, `rate_per_sec`, `burst` and

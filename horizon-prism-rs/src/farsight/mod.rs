@@ -20,6 +20,7 @@ pub mod answer;
 pub mod chunks;
 pub mod client;
 pub mod did;
+pub mod gate;
 pub mod lookup;
 
 pub use answer::{ChunkAnswer, Coverage, PairAnswer, Relation};

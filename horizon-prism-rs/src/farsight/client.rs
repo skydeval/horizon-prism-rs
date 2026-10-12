@@ -19,8 +19,12 @@ use crate::net::{BodyCap, NetClient, NetError, RequestOptions};
 pub enum CallError {
     /// The call reached its time limit.
     Timeout,
-    /// Connect, TLS, reset, or an address the guard refuses.
+    /// Connect, TLS, reset, or a rejected redirect.
     Transport,
+    /// The call never left: an address the resolver guard refused, a
+    /// scheme that is not allowed, or a URL that does not build. A
+    /// configuration fault, not Farsight failing.
+    RefusedAddress,
     /// `429 RateLimitExceeded`: this key's allowance on Farsight is spent.
     RateLimited,
     /// `503 Overloaded`: Farsight had no place for the call in time, or a
@@ -47,6 +51,7 @@ impl CallError {
         match self {
             Self::Timeout => "timeout",
             Self::Transport => "transport",
+            Self::RefusedAddress => "refused_address",
             Self::RateLimited => "rate_limited",
             Self::Overloaded => "overloaded",
             Self::Status(401 | 403) => "auth",
@@ -95,13 +100,14 @@ impl FarsightClient {
     pub async fn check_blocks(&self, actor: &str, others: &[String], timeout: Duration) -> Result<ChunkAnswer, CallError> {
         let mut params: Vec<(&str, &str)> = vec![("actor", actor)];
         params.extend(others.iter().map(|o| ("others", o.as_str())));
-        let url = Url::parse_with_params(&format!("{}{CHECK_BLOCKS_PATH}", self.base), &params).map_err(|_| CallError::Transport)?;
+        let url = Url::parse_with_params(&format!("{}{CHECK_BLOCKS_PATH}", self.base), &params).map_err(|_| CallError::RefusedAddress)?;
         let options = RequestOptions::new(BodyCap::APPVIEW)
             .timeout(timeout)
             .header(AUTHORIZATION, self.authorization.clone());
         let response = self.net.get(url.as_str(), &options).await.map_err(|e| match e {
             NetError::Timeout => CallError::Timeout,
             NetError::BodyTooLarge { .. } => CallError::TooLarge,
+            NetError::BlockedAddress { .. } | NetError::SchemeNotAllowed { .. } | NetError::InvalidUrl { .. } => CallError::RefusedAddress,
             _ => CallError::Transport,
         })?;
         if response.status.as_u16() != 200 {
