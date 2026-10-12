@@ -636,13 +636,51 @@ pub(crate) mod testing {
 
     pub(crate) const LABELER: &str = "did:web:appview.example.com";
 
+    /// An upstream answering from fixed maps, counting its calls.
+    #[derive(Default)]
+    pub(crate) struct FixedUpstream {
+        /// DID → `profileViewDetailed`.
+        pub profiles: HashMap<String, Value>,
+        /// URI → `postView`.
+        pub posts: HashMap<String, Value>,
+        /// DID → `getAuthorFeed` output, keyed with the cursor it answers.
+        pub feeds: HashMap<(String, Option<String>), Value>,
+        pub calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl UpstreamSource for FixedUpstream {
+        async fn profile(&self, _req: &Requester, actor: &str) -> Option<Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.profiles.get(actor).cloned()
+        }
+        async fn posts(&self, _req: &Requester, uris: &[String]) -> Vec<Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            uris.iter().filter_map(|u| self.posts.get(u).cloned()).collect()
+        }
+        async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
+            None
+        }
+        async fn author_feed(&self, _req: &Requester, actor: &str, _limit: u32, cursor: Option<&str>, _filter: &str) -> Option<Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.feeds.get(&(actor.to_string(), cursor.map(str::to_string))).cloned()
+        }
+        async fn follows(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+            None
+        }
+    }
+
     pub(crate) fn hydrator(pool: &PgPool, sets: ScopeSets) -> Hydrator {
+        hydrator_with(pool, sets, Arc::new(NoUpstream))
+    }
+
+    pub(crate) fn hydrator_with(pool: &PgPool, sets: ScopeSets, upstream: Arc<dyn UpstreamSource>) -> Hydrator {
         Hydrator::new(
             pool.clone(),
             ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000),
             None,
             None,
-            Arc::new(NoUpstream),
+            upstream,
             ReadCache::new(1024 * 1024),
             HydrationConfig {
                 labeler_did: LABELER.into(),

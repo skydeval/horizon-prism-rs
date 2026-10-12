@@ -4,11 +4,15 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
 use super::{ActorRow, ActorViewer, CountMode, Hydrator, INVALID_HANDLE, ViewError, ViewResult, Viewer, blob_url, ts};
 use crate::moderation::{self, Gate};
 use crate::xrpc::pools::Requester;
+
+/// Upstream profile fetches in flight for one `getProfiles`.
+pub const PROFILE_FETCH_CONCURRENCY: usize = 8;
 
 /// Which profile view to build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,10 +170,38 @@ impl Hydrator {
         let gates = moderation::gate_many(self.pool(), &dids).await?;
         dids.retain(|d| !gates.get(d).copied().unwrap_or(Gate::Visible).is_hidden());
         let ctx = self.profile_context(viewer, req, &dids, Some(CountMode::Sync { started })).await?;
+        // Out-of-scope actors take `getProfile`'s path: the cascade, then
+        // the Slingshot profile record (design-v3 §11 G-1). One that no
+        // source resolves, or that there is no budget to fetch, is omitted.
+        let mut outside: Vec<String> = Vec::new();
+        for d in &dids {
+            if !ctx.rows.contains_key(d) && !self.in_scope(d).await {
+                outside.push(d.clone());
+            }
+        }
+        let fetched: Vec<(String, Option<Value>)> = futures::stream::iter(outside)
+            .map(|d| async move {
+                let view = self.upstream().profile(req, &d).await;
+                (d, view)
+            })
+            .buffer_unordered(PROFILE_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        let mut remote: HashMap<String, Value> = HashMap::new();
+        for (d, view) in fetched {
+            if let Some(v) = view {
+                remote.insert(d, self.normalized(viewer, v).await?.0);
+            }
+        }
         let profiles: Vec<Value> = dids
             .iter()
-            .filter(|d| ctx.rows.contains_key(*d))
-            .map(|d| ctx.view(d, ProfileKind::Detailed))
+            .filter_map(|d| {
+                if ctx.rows.contains_key(d) {
+                    Some(ctx.view(d, ProfileKind::Detailed))
+                } else {
+                    remote.remove(d)
+                }
+            })
             .collect();
         Ok(Ok(Self::emit(json!({ "profiles": profiles }))))
     }
@@ -275,6 +307,47 @@ mod tests {
         // A non-member caller is anonymous too.
         let stranger = h.viewer(Some("did:plc:cccccccccccccccccccccccc")).await.expect("viewer");
         assert!(!stranger.hydrate);
+        db.drop_db().await;
+    }
+
+    /// design-v3 §11 G-1: `getProfiles` fetches out-of-scope actors upstream.
+    #[tokio::test]
+    async fn get_profiles_fetches_out_of_scope_actors_upstream() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        use crate::hydration::testing::{FixedUpstream, hydrator_with};
+
+        let Some(db) = fresh_db("hydration_get_profiles_upstream").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        let (outsider, unknown, hidden) = (
+            "did:plc:oooooooooooooooooooooooo",
+            "did:plc:uuuuuuuuuuuuuuuuuuuuuuuu",
+            "did:plc:hhhhhhhhhhhhhhhhhhhhhhhh",
+        );
+        exec(p, "INSERT INTO labels (subject, val) VALUES ('did:plc:hhhhhhhhhhhhhhhhhhhhhhhh', '!takedown')").await;
+        let mut up = FixedUpstream::default();
+        for did in [outsider, hidden] {
+            up.profiles.insert(did.into(), json!({"did": did, "handle": "far.example", "displayName": "Far", "viewer": {"muted": true}, "labels": []}));
+        }
+        let up = Arc::new(up);
+        let h = hydrator_with(p, sets(), up.clone());
+        let req = Requester::test();
+        let asked: Vec<String> = [outsider, ALICE, unknown, hidden].iter().map(|d| (*d).to_string()).collect();
+        let out = h.get_profiles(&Viewer::anonymous(), &req, &asked).await.expect("db").expect("view");
+        let profiles = out.inner()["profiles"].as_array().expect("profiles").clone();
+        // Input order; the unresolved and the taken-down actor are omitted.
+        let dids: Vec<&str> = profiles.iter().filter_map(|v| v["did"].as_str()).collect();
+        assert_eq!(dids, [outsider, ALICE]);
+        assert_eq!(profiles[0]["displayName"], "Far");
+        // The upstream view is normalized: no upstream viewer state leaks.
+        assert_ne!(profiles[0]["viewer"]["muted"], json!(true));
+        assert_eq!(profiles[1]["handle"], "alice.test");
+        // Only the two visible out-of-scope actors were asked for.
+        assert_eq!(up.calls.load(Ordering::SeqCst), 2);
         db.drop_db().await;
     }
 

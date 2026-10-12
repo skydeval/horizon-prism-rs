@@ -82,6 +82,12 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 10: `getProfiles` resolves out-of-scope actors (G-1, #670).**
+  An actor this AppView does not index is fetched the way `getProfile`
+  fetches it (its home AppView and the cascade, then the Slingshot profile
+  record), up to 8 at a time, and returned in input order. Before, such
+  actors were dropped. One that no source resolves, or that there is no
+  upstream budget for, is omitted.
 - **Item 10: token-issuer lookups are charged to the request (#669).**
   When verifying a token needs the issuer's DID document from the network,
   the fetch costs the request one token of its identity share and, for a
