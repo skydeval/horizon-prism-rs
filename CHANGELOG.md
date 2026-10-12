@@ -12,6 +12,15 @@ commit.
 
 ### Added
 
+- **Item 12: `getKnownFollowers` (#673).** For a ready member: the accounts
+  it follows that follow the named account (design-v3 §5.3). Stored follows
+  are joined with a scan of the account's followers on Constellation, at
+  most `known_followers.scan_max_pages` pages (default 20) of 100, each page
+  charged to the caller's Constellation share. A scan that stops early
+  gives a shorter list and counts in
+  `known_followers_scan_truncated_total`. Accounts with a block in either
+  direction are left out. The result is paged from a snapshot with an offset
+  cursor. With Constellation unavailable, stored follows alone answer.
 - **Item 12: `getRelationships` (#673).** For a ready member, `following`,
   `followedBy`, `blocking` and `blockedBy` come from local rows, which are
   complete for a member (design-v3 §5.3). `blockingByList` is the member's

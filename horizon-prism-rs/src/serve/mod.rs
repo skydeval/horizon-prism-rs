@@ -361,6 +361,7 @@ pub async fn run() -> Result<(), StartupError> {
             counts: cfg.file.counts.clone(),
             thread: cfg.file.thread.clone(),
             thread_mutes_max: cfg.file.thread_mutes.max_per_actor,
+            known_followers_scan_max_pages: cfg.file.known_followers.scan_max_pages,
             constellation_bucket: Some(shares.bucket(
                 "constellation",
                 microcosm.constellation_rate_per_sec.0,

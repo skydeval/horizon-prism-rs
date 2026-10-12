@@ -812,6 +812,20 @@ impl Default for ThreadMutesConfig {
     }
 }
 
+/// `[known_followers]` (design-v3 §5.3).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KnownFollowersConfig {
+    /// Constellation pages one `getKnownFollowers` scan may read.
+    pub scan_max_pages: u32,
+}
+
+impl Default for KnownFollowersConfig {
+    fn default() -> Self {
+        Self { scan_max_pages: 20 }
+    }
+}
+
 /// `[starter_packs]` (design-v3 §5.5).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -969,6 +983,7 @@ pub struct FileConfig {
     pub thread: ThreadConfig,
     pub thread_mutes: ThreadMutesConfig,
     pub starter_packs: StarterPacksConfig,
+    pub known_followers: KnownFollowersConfig,
     pub schema_backfill: SchemaBackfillConfig,
     pub schema_index: SchemaIndexConfig,
     pub features: FeaturesConfig,

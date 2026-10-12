@@ -283,6 +283,12 @@ max_per_actor = 10000
 [starter_packs]
 counts_refresh_secs = 3600
 
+# "Followers you know": how many pages of an account's followers (100 each)
+# one request may ask Constellation for. Each page uses the caller's
+# Constellation allowance, so raise that with this.
+[known_followers]
+scan_max_pages = 20
+
 # Limits on checking sign-in tokens before a request is charged to anyone.
 # They stop forged or broken tokens from using up CPU or a member's limits.
 [auth]

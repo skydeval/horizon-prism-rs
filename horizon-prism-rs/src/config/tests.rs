@@ -258,6 +258,9 @@ max_per_actor = 10000
 [starter_packs]
 counts_refresh_secs = 3600
 
+[known_followers]
+scan_max_pages = 20
+
 [schema_backfill]
 batch_size = 10000
 pause_ms = 100

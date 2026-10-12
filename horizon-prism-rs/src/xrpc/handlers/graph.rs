@@ -15,6 +15,7 @@ pub const GET_FOLLOWS: &str = "app.bsky.graph.getFollows";
 pub const GET_FOLLOWERS: &str = "app.bsky.graph.getFollowers";
 pub const GET_LIST: &str = "app.bsky.graph.getList";
 pub const GET_LISTS: &str = "app.bsky.graph.getLists";
+pub const GET_KNOWN_FOLLOWERS: &str = "app.bsky.graph.getKnownFollowers";
 pub const GET_RELATIONSHIPS: &str = "app.bsky.graph.getRelationships";
 pub const GET_LISTS_WITH_MEMBERSHIP: &str = "app.bsky.graph.getListsWithMembership";
 pub const GET_STARTER_PACKS_WITH_MEMBERSHIP: &str = "app.bsky.graph.getStarterPacksWithMembership";
@@ -111,6 +112,22 @@ pub async fn get_relationships(
 
 /// The viewer's own lists and packs: a ready member.
 const OWN: Access = Access::Member { ready: true, enroll: false };
+
+pub async fn get_known_followers(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_KNOWN_FOLLOWERS, OWN, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(
+        &req.req,
+        s.hydrator
+            .get_known_followers(&req.viewer, &req.req, p.required("actor")?, clamp_limit(p.u32("limit")?), p.one("cursor"))
+            .await,
+    )
+}
 
 pub async fn get_lists_with_membership(
     State(s): State<AppState>,

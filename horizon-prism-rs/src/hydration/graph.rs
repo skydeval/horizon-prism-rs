@@ -15,6 +15,11 @@ use crate::hydration::HydrationError;
 use crate::xrpc::pools::Requester;
 
 pub const NSID_FOLLOW: &str = "app.bsky.graph.follow";
+/// `known_followers_scan_truncated_total`: scans that stopped before the
+/// end of the subject's followers, so the answer may be short.
+pub const METRIC_KNOWN_FOLLOWERS_TRUNCATED: &str = "known_followers_scan_truncated_total";
+/// Followers asked of Constellation per page of a known-followers scan.
+const KNOWN_FOLLOWERS_PAGE: u32 = 100;
 
 /// What a direct mute covers (design-v3 §5.3): `mutes.scope`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +288,95 @@ impl Hydrator {
         Ok(Ok(Self::emit(out)))
     }
 
+    /// The followers of `subject` that the viewer follows, with blocked
+    /// accounts removed: those with a stored follow first, newest first,
+    /// then the rest by DID.
+    async fn known_followers_of(&self, viewer: &Viewer, req: &Requester, me: &str, subject: &str) -> Result<Vec<String>, sqlx::Error> {
+        let mine: HashSet<String> = sqlx::query_scalar("SELECT subject_did FROM follows WHERE author_did = $1")
+            .bind(me)
+            .fetch_all(self.pool())
+            .await?
+            .into_iter()
+            .collect();
+        let mut known: Vec<String> = sqlx::query_scalar(
+            "SELECT author_did FROM follows WHERE subject_did = $2 \
+               AND author_did IN (SELECT subject_did FROM follows WHERE author_did = $1) \
+             ORDER BY created_at DESC, author_did",
+        )
+        .bind(me)
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await?;
+        // Followers this AppView does not store, from Constellation: a
+        // bounded scan, each page charged to the caller's share.
+        let mut remote: Vec<String> = Vec::new();
+        if let Some(client) = self.backlinks() {
+            let mut cursor: Option<String> = None;
+            let mut truncated = false;
+            for page in 0..self.inner.cfg.known_followers_scan_max_pages {
+                if self.draw_constellation(req).is_err() {
+                    truncated = true;
+                    break;
+                }
+                let Ok(found) = client.distinct_dids_page(subject, NSID_FOLLOW, ".subject", KNOWN_FOLLOWERS_PAGE, cursor.as_deref()).await else {
+                    break;
+                };
+                remote.extend(found.linking_dids.into_iter().filter(|d| mine.contains(d)));
+                cursor = found.cursor;
+                if cursor.is_none() {
+                    break;
+                }
+                truncated = page + 1 == self.inner.cfg.known_followers_scan_max_pages;
+            }
+            if truncated {
+                metrics::counter!(METRIC_KNOWN_FOLLOWERS_TRUNCATED).increment(1);
+            }
+        }
+        let stored: HashSet<String> = known.iter().cloned().collect();
+        remote.retain(|d| !stored.contains(d));
+        remote.sort_unstable();
+        remote.dedup();
+        known.extend(remote);
+        known.dedup();
+        let state = self.actor_viewer(viewer, &known).await?;
+        known.retain(|d| d != me && d != subject && !state.blocked_either_way(d));
+        Ok(known)
+    }
+
+    /// `app.bsky.graph.getKnownFollowers` for a ready-member viewer
+    /// (design-v3 §5.3): the accounts the viewer follows that follow
+    /// `actor`. The set is built once per (viewer, subject) and paged from
+    /// a snapshot held for the read-time cache's lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn get_known_followers(&self, viewer: &Viewer, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+        let Some(me) = viewer.state_did().map(str::to_string) else {
+            return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
+        };
+        let did = match self.subject(req, actor).await? {
+            Ok(d) => d,
+            Err(e) => return Ok(Err(e)),
+        };
+        let key = format!("rt:known-followers:{me}:{did}");
+        let offset = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+        // A first page always rebuilds; later pages read the snapshot.
+        let snapshot = if offset > 0 { self.cache().get_json::<Vec<String>>(&key).await } else { None };
+        let all = match snapshot {
+            Some(all) => all,
+            None => {
+                let all = self.known_followers_of(viewer, req, &me, &did).await?;
+                self.cache().put_json(&key, &all).await;
+                all
+            }
+        };
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let page: Vec<String> = all.iter().skip(offset).take(limit).cloned().collect();
+        let next = (offset + page.len() < all.len()).then(|| (offset + page.len()).to_string());
+        self.actor_list(viewer, req, &did, page, "followers", next).await
+    }
+
     /// `app.bsky.graph.muteThread` (`mute`) / `unmuteThread` for the
     /// (member) viewer (design-v3 §5.3). `root` is the thread's root post.
     /// It is not looked up: a thread mute is the viewer's private state, so
@@ -376,6 +470,50 @@ mod tests {
 
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// B-55: the accounts the viewer follows that follow the subject.
+    #[tokio::test]
+    async fn known_followers_are_the_viewers_follows_that_follow_the_subject() {
+        let Some(db) = fresh_db("hydration_known_followers").await else {
+            return;
+        };
+        let p = &db.pool;
+        let (carol, dave, erin) = ("did:plc:cccccccccccccccccccccccc", "did:plc:dddddddddddddddddddddddd", "did:plc:eeeeeeeeeeeeeeeeeeeeeeee");
+        for (d, h) in [(ALICE, "alice.test"), (BOB, "bob.test"), (carol, "carol.test"), (dave, "dave.test"), (erin, "erin.test")] {
+            actor(p, d, h, h).await;
+        }
+        // Alice follows Bob, Carol and Erin. Bob, Carol, Erin and a
+        // stranger follow Dave. Erin blocks Alice.
+        let mut n = 0;
+        for (author, subject, age) in [(ALICE, BOB, 0), (ALICE, carol, 0), (ALICE, erin, 0), (BOB, dave, 2), (carol, dave, 1), (erin, dave, 0), ("did:plc:ssssssssssssssssssssssss", dave, 0)] {
+            n += 1;
+            exec(p, &format!(
+                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
+                 ('at://{author}/app.bsky.graph.follow/{n}', '{author}', '{subject}', '3k', now() - interval '{age} minutes')"
+            )).await;
+        }
+        exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{erin}/app.bsky.graph.block/1', '{erin}', '{ALICE}', '3k', now())")).await;
+        let h = hydrator(p, ScopeSets::default());
+        let me = Viewer {
+            did: Some(ALICE.into()),
+            hydrate: true,
+        };
+        let req = Requester::test();
+        let v = h.get_known_followers(&me, &req, "dave.test", 50, None).await.expect("db").expect("view");
+        assert_eq!(v.inner()["subject"]["did"], dave);
+        let dids: Vec<&str> = v.inner()["followers"].as_array().expect("followers").iter().map(|f| f["did"].as_str().expect("did")).collect();
+        assert_eq!(dids, [carol, BOB], "newest follow first; the blocker and the stranger are left out");
+        assert!(v.inner().get("cursor").is_none());
+        // Paged from the snapshot with an offset cursor.
+        let first = h.get_known_followers(&me, &req, dave, 1, None).await.expect("db").expect("view");
+        assert_eq!(first.inner()["cursor"], "1");
+        let second = h.get_known_followers(&me, &req, dave, 1, Some("1")).await.expect("db").expect("view");
+        assert_eq!(second.inner()["followers"][0]["did"], BOB);
+        assert!(second.inner().get("cursor").is_none());
+        // Only a ready member has follows to compare.
+        assert!(h.get_known_followers(&Viewer::anonymous(), &req, dave, 50, None).await.expect("db").is_err());
+        db.drop_db().await;
+    }
 
     #[tokio::test]
     async fn follows_followers_and_mutes() {

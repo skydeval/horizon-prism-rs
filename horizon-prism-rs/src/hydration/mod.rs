@@ -122,6 +122,8 @@ pub struct HydrationConfig {
     pub thread: ThreadConfig,
     /// `thread_mutes.max_per_actor`.
     pub thread_mutes_max: u32,
+    /// `known_followers.scan_max_pages`.
+    pub known_followers_scan_max_pages: u32,
     /// The shared bucket for request-origin Constellation calls
     /// (`microcosm.constellation_rate_per_sec`); `None` leaves them unmetered.
     pub constellation_bucket: Option<SharedBucket>,
@@ -745,6 +747,7 @@ pub(crate) mod testing {
                 counts: CountsConfig::default(),
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
+                known_followers_scan_max_pages: 2,
                 constellation_bucket: None,
             },
         )
