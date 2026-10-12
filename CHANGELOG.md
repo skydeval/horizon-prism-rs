@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 12: reading a list owner's records within bounds (#673).**
+  `subscriptions::fetch` reads the owner's list records, then its list
+  items, page by page, and stops at the first limit reached: records,
+  pages, slow answers, time spent in calls, or total time. A listing
+  stopped early is marked incomplete with the reason; a slow answerer or
+  a server of tiny pages is told apart from an owner that is simply
+  large. No record is fetched by name (design-v3 §4.3 "Per-owner
+  bounds").
 - **Item 12: how a list sync run ends (#673).** Every end of a run
   records its time on the list owner's row first, then settles the job:
   a completion is done (or queued again if a sync was asked for while it
