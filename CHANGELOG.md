@@ -19,8 +19,9 @@ commit.
   now counts a run still in progress. A row left `running` with no run
   behind it is queued again at a new generation by a check every quarter
   of `lists.sync_stuck_secs` (`list_sync_stuck_requeued_total`,
-  `list_sync_running_age_seconds`), and at startup. `serve` does not
-  turn the lanes on yet (design-v3 §4.3 "Lanes").
+  `list_sync_running_age_seconds`), and at startup. `serve` starts the
+  applier and gives the lanes to its backfill workers; nothing creates a
+  reference yet, so they stay idle (design-v3 §4.3 "Lanes").
 - **Item 12: choosing the next list sync (#673).**
   `subscriptions::claim` picks one due sync per lane (fast, and slow for
   owners whose servers answer slowly). A queued sync whose reason has

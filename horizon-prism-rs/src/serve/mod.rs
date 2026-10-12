@@ -25,6 +25,7 @@ use crate::db::schema_backfill::{self, SchemaBackfill};
 use crate::db::{GateError, ScopeGuard, StorageSampler, enforce_gate};
 use crate::admin_executor::{AdminExecutor, Handlers};
 use crate::firehose::backfill::{Backfill, BackfillSource, NetSource};
+use crate::subscriptions::{self, applier::Applier, fetch::Bounds, pds::PdsOwners, runner::{Lanes, ListSync}};
 use crate::sync::{BudgetRates, HeadProber, HostBudgets, NetHeadSource};
 use crate::firehose::consumer::{Consumer, ConsumerStatus, spawn_lag_sampler};
 use crate::firehose::coverage::CoverageTracker;
@@ -284,9 +285,39 @@ pub async fn run() -> Result<(), StartupError> {
     ));
     let community_patterns: Vec<String> =
         cfg.file.constellation.community().map(|n| n.pds_patterns.clone()).unwrap_or_default();
+    // Rule 4 (§4.3): the applier runs list phases and releases; the backfill
+    // workers serve the `list_sync` lanes.
+    let lists = &cfg.file.lists;
+    let applier = Applier::new(pool.clone(), scope.clone(), lists.sync_min_interval_secs);
+    tasks.push(tokio::spawn(applier.clone().run()));
+    let list_sync = ListSync::new(
+        pool.clone(),
+        scope.clone(),
+        Arc::new(PdsOwners::new(pool.clone(), resolver.clone(), budgets.clone())),
+        applier.waiting().clone(),
+        subscriptions::run::Settings {
+            max_items: lists.subscribed_max_items,
+            min_interval_secs: lists.sync_min_interval_secs,
+            bounds: Bounds {
+                max_records: lists.subscribed_max_owner_listitems,
+                max_pages: lists.sync_max_pages,
+                probe_call: Duration::from_secs(u64::from(lists.sync_probe_call_secs)),
+                min_records_per_call_sec: lists.sync_min_records_per_call_sec,
+                max_call: Duration::from_secs(u64::from(lists.sync_max_call_secs)),
+                max_wall: Duration::from_secs(u64::from(lists.sync_max_wall_secs)),
+            },
+        },
+        Lanes {
+            fast: lists.sync_max_concurrent,
+            slow: lists.sync_slow_max_concurrent,
+            stuck_secs: lists.sync_stuck_secs,
+            max_wall_secs: lists.sync_max_wall_secs,
+        },
+    );
     let backfill = Backfill::new(writer.clone(), Arc::clone(&source), cfg.file.backfill.clone(), fh.deterministic_attempts)
         .with_community_patterns(community_patterns.clone())
-        .with_farsight(farsight.clone());
+        .with_farsight(farsight.clone())
+        .with_list_sync(Some(list_sync));
     tasks.extend(
         backfill
             .spawn()
