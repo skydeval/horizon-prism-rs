@@ -16,11 +16,13 @@ commit.
   list sync reads all of an owner's list records and then fails while
   reading the list items, what the list records said about each list's
   purpose is still written before the run is retried.
-- **Item 12: a list sync's batches retry after a deadlock (#673).** A
-  batch that loses a deadlock or a serialization conflict, for instance
-  to a firehose write by the same owner, is run again in place, up to
-  five times, instead of failing the run
-  (`list_sync_batch_retries_total`).
+- **Item 12: lost deadlocks are retried in place (#673).** A list
+  sync's batch or its final step that loses a deadlock or a
+  serialization conflict, for instance to a firehose write by the same
+  owner, is run again in place, up to five times, instead of failing the
+  run. `muteActorList` and `unmuteActorList` do the same, so such a
+  conflict never reaches the client
+  (`list_subscription_tx_retries_total`).
 - **Item 12: removed list settings say what replaced them (#673).** A
   config that still has `lists.subscribed_max_total` or
   `retention.subscribed_list_grace_days` is refused at startup with a

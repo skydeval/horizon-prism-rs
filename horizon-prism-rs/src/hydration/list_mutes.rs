@@ -19,6 +19,7 @@ use super::{HydrationError, Hydrator, ViewError, ViewResult, Viewer};
 use crate::db::locks::uri_author;
 use crate::moderation::{self, Gate};
 use crate::subscriptions::references::{Muted, OverBudget, mute_list, unmute_list};
+use crate::subscriptions::{retryable, retrying};
 use crate::xrpc::pools::Requester;
 
 fn invalid(message: impl Into<String>) -> ViewError {
@@ -47,7 +48,8 @@ impl Hydrator {
             if row.purpose != PURPOSE_MOD {
                 return Ok(Err(invalid("Only a moderation list can be muted")));
             }
-            match mute_list(self.pool(), me, list, budget).await? {
+            // A lost deadlock never reaches the client (§4.3 "Lock order").
+            match retrying(retryable, || mute_list(self.pool(), me, list, budget)).await? {
                 Muted::Added => true,
                 Muted::Already => false,
                 Muted::Refused(OverBudget::References) => {
@@ -61,7 +63,7 @@ impl Hydrator {
                 }
             }
         } else {
-            unmute_list(self.pool(), me, list, budget).await?
+            retrying(retryable, || unmute_list(self.pool(), me, list, budget)).await?
         };
         if changed && let Some(applier) = &self.inner.cfg.list_applier {
             applier.signal();

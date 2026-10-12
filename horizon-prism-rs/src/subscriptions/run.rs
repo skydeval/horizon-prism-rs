@@ -21,6 +21,7 @@ use sqlx::PgPool;
 use super::copy::Limits;
 use super::fetch::{self, Bounds, CutReason, FetchError, OwnerRecords};
 use super::jobs::{self, Cut, RunEnd};
+use super::retrying;
 use super::sync::{self, Stopped};
 use crate::aggregations::ScopeState;
 
@@ -223,7 +224,8 @@ async fn attempt(
     scope.reload_owner_tombstones(pool, owner).await?;
     match fetched.cut {
         None => {
-            sync::complete(pool, &snap, &fetched.listing, &served, &listed, settings.max_items, pause).await?;
+            let complete = || sync::complete(pool, &snap, &fetched.listing, &served, &listed, settings.max_items, pause);
+            retrying(Stopped::lost_deadlock, complete).await?;
             Ok(Outcome::Completed)
         }
         Some(reason) => {

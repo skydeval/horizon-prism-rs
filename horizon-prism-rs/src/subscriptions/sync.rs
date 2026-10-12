@@ -22,6 +22,7 @@ use sqlx::{PgConnection, PgPool};
 
 use super::copy::{Limits, METRIC_TOMBSTONES_EVICTED};
 use super::jobs;
+use super::{retryable, retrying};
 use crate::db::locks::lock_uris;
 
 /// URIs per reconcile batch: one advisory lock each.
@@ -33,10 +34,6 @@ const MAX_PURPOSE_BYTES: usize = 512;
 const UNLISTED_CLEARS_AFTER_HOURS: i32 = 24;
 
 pub const METRIC_PURPOSE_WRITE_ERRORS: &str = "list_purpose_write_errors_total";
-pub const METRIC_BATCH_RETRIES: &str = "list_sync_batch_retries_total";
-/// A batch that keeps losing to other transactions fails the run after
-/// this many more tries.
-const BATCH_ATTEMPTS: u32 = 5;
 
 /// One active list of the owner as the run found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +97,14 @@ pub enum Stopped {
     /// The job's generation changed: a purge or a reset superseded the run.
     Superseded,
     Db(sqlx::Error),
+}
+
+impl Stopped {
+    /// A database error that is a lost deadlock: retried in place.
+    #[must_use]
+    pub fn lost_deadlock(&self) -> bool {
+        matches!(self, Self::Db(error) if retryable(error))
+    }
 }
 
 impl From<sqlx::Error> for Stopped {
@@ -341,17 +346,7 @@ pub async fn reconcile(pool: &PgPool, snap: &Snapshot, listing: &Listing, limits
         for batch in acts.chunks(BATCH) {
             // A deadlock with a firehose write of the same owner is re-run
             // from the batch's run check; it never fails the job.
-            let mut attempt = 0;
-            let same = loop {
-                match one_batch(pool, snap, list, listing, batch).await {
-                    Err(Stopped::Db(error)) if retryable(&error) && attempt < BATCH_ATTEMPTS => {
-                        attempt += 1;
-                        metrics::counter!(METRIC_BATCH_RETRIES).increment(1);
-                        tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(attempt))).await;
-                    }
-                    other => break other?,
-                }
-            };
+            let same = retrying(Stopped::lost_deadlock, || one_batch(pool, snap, list, listing, batch)).await?;
             if !same {
                 whole = false;
                 break;
@@ -376,12 +371,6 @@ pub async fn reconcile(pool: &PgPool, snap: &Snapshot, listing: &Listing, limits
         metrics::counter!(METRIC_TOMBSTONES_EVICTED).increment(evicted);
     }
     Ok(served)
-}
-
-/// A deadlock or a serialization failure: the transaction lost to another
-/// and can be run again as it is.
-fn retryable(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(db) if matches!(db.code().as_deref(), Some("40P01" | "40001")))
 }
 
 /// One batch, in one transaction. Returns whether the list is still the
