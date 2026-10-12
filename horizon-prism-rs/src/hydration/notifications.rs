@@ -119,7 +119,32 @@ impl Hydrator {
             }
             out.insert(uri, record);
         }
+        // `starterpack-joined` points at the joiner's profile record, as it
+        // is now.
+        let profiles: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT 'at://' || did || '/app.bsky.actor.profile/self', profile_record FROM actors \
+             WHERE profile_record IS NOT NULL AND 'at://' || did || '/app.bsky.actor.profile/self' = ANY($1)",
+        )
+        .bind(&uris)
+        .fetch_all(self.pool())
+        .await?;
+        out.extend(profiles);
         Ok(out)
+    }
+
+    /// The current CID of each `starterpack-joined` row's profile record, so
+    /// that the record and its CID change together when the profile is
+    /// edited (design-v3 §8.6).
+    async fn profile_cids(&self, rows: &[NotificationRow]) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+        let joiners: Vec<String> = rows.iter().filter(|r| r.reason == "starterpack-joined").map(|r| r.author_did.clone()).collect();
+        if joiners.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let found: Vec<(String, String)> = sqlx::query_as("SELECT did, profile_cid FROM actors WHERE did = ANY($1) AND profile_cid IS NOT NULL")
+            .bind(&joiners)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(found.into_iter().collect())
     }
 
     /// `app.bsky.notification.listNotifications` (limit ≤ 100).
@@ -155,6 +180,7 @@ impl Hydrator {
         let authors: Vec<String> = rows.iter().map(|r| r.author_did.clone()).collect();
         let ctx = self.profile_context(viewer, req, &authors, None).await?;
         let records = self.notification_records(&rows).await?;
+        let profile_cids = self.profile_cids(&rows).await?;
         let labels = self.load_labels(&rows.iter().map(|r| r.record_uri.clone()).collect::<Vec<_>>()).await?;
         let threads: Vec<String> = rows
             .iter()
@@ -209,7 +235,7 @@ impl Hydrator {
                 let record = records.get(&r.record_uri)?.clone();
                 let mut n = json!({
                     "uri": r.record_uri,
-                    "cid": r.record_cid,
+                    "cid": profile_cids.get(&r.author_did).filter(|_| r.reason == "starterpack-joined").unwrap_or(&r.record_cid),
                     "author": ctx.view(&r.author_did, ProfileKind::View),
                     "reason": r.reason,
                     "record": record,

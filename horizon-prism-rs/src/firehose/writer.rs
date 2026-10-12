@@ -210,6 +210,8 @@ struct Upsert {
     body: Body,
     input: AdmissionInput,
     record: Value,
+    /// The op created the record (not an update).
+    created: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -331,6 +333,7 @@ fn build_upsert(
         cid: cid.to_string(),
         collection: op.collection.clone(),
         body,
+        created: op.action == Action::Create,
         input: AdmissionInput {
             author: repo.to_string(),
             kind,
@@ -779,6 +782,28 @@ impl Writer {
                         .bind(&u.uri)
                         .execute(&mut *conn)
                         .await?;
+                }
+            }
+            // `starterpack-joined` (§8.6): only a profile created just now,
+            // seen on the firehose, tells the pack's creator. An edit, a
+            // backfill or a replay never does, so an old join is not
+            // announced again.
+            Body::Profile(p) => {
+                if live
+                    && u.created
+                    && let Some(pack) = &p.joined_via_starter_pack
+                    && pack.uri.contains("/app.bsky.graph.starterpack/")
+                    && let Some(creator) = uri_author(&pack.uri)
+                    && creator != author
+                    && sets.is_member(creator)
+                    && p.created_at.is_none_or(|at| Utc::now().signed_duration_since(at) <= self.subscribed_post_max_age)
+                {
+                    let n = Notification {
+                        recipient: creator.to_string(),
+                        reason: "starterpack-joined",
+                        reason_subject: Some(pack.uri.clone()),
+                    };
+                    insert_notification(conn, &n, author, &u.uri, &u.cid).await?;
                 }
             }
             _ => {}
@@ -1505,6 +1530,33 @@ mod tests {
                 .await
                 .expect("follow notification");
             assert_eq!(stored, Some(pack));
+            // Joining through the member's starter pack: a profile created
+            // live tells the member; an edit, or a backfilled create, does
+            // not.
+            let mine = format!("at://{AUTHOR}/app.bsky.graph.starterpack/3kmine");
+            let profile = |name: &str, action: Action| RawOp {
+                action,
+                collection: "app.bsky.actor.profile".into(),
+                rkey: "self".into(),
+                cid: Some(format!("bafy{name}")),
+                record: Some(json!({"displayName": name, "joinedViaStarterPack": {"uri": mine, "cid": "bafymine"},
+                                    "createdAt": Utc::now().to_rfc3339()})),
+            };
+            let joined = || async {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notifications WHERE reason = 'starterpack-joined' AND recipient_did = $1 AND reason_subject = $2")
+                    .bind(AUTHOR)
+                    .bind(&mine)
+                    .fetch_one(p)
+                    .await
+                    .expect("count")
+            };
+            let backfill = ApplyOptions { live: false, ..OPTIONS };
+            w.apply(liker, &rev(3), &[profile("first", Action::Create)], backfill).await.expect("apply");
+            assert_eq!(joined().await, 0);
+            w.apply(liker, &rev(4), &[profile("edited", Action::Update)], OPTIONS).await.expect("apply");
+            assert_eq!(joined().await, 0);
+            w.apply(liker, &rev(5), &[profile("again", Action::Create)], OPTIONS).await.expect("apply");
+            assert_eq!(joined().await, 1);
             db.drop_db().await;
         }
 

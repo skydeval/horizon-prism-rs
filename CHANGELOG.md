@@ -12,6 +12,12 @@ commit.
 
 ### Added
 
+- **Item 14: `starterpack-joined` notifications (#675).** When an
+  account's profile is created, as seen live on the firehose, and names a
+  member's starter pack as the one it joined through, that member is
+  notified. A profile edit, a backfill or a replay announces nothing. The
+  notification shows the joiner's current profile record and its CID
+  (design-v3 §8.6).
 - **Item 14: `like-via-repost`, `repost-via-repost` and `starterPack`
   (#675).** A like or repost made from a member's repost notifies that
   member, when the repost is stored here and has the same subject, and
