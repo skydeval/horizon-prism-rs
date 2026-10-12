@@ -658,6 +658,9 @@ pub(crate) mod testing {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             uris.iter().filter_map(|u| self.posts.get(u).cloned()).collect()
         }
+        async fn post_records(&self, req: &Requester, uris: &[String]) -> Vec<Value> {
+            self.posts(req, uris).await
+        }
         async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
             None
         }
@@ -675,10 +678,16 @@ pub(crate) mod testing {
     }
 
     pub(crate) fn hydrator_with(pool: &PgPool, sets: ScopeSets, upstream: Arc<dyn UpstreamSource>) -> Hydrator {
+        hydrator_full(pool, sets, upstream, None)
+    }
+
+    /// A hydrator with an upstream and a Constellation at `constellation`
+    /// (a fake's base URL).
+    pub(crate) fn hydrator_full(pool: &PgPool, sets: ScopeSets, upstream: Arc<dyn UpstreamSource>, constellation: Option<&str>) -> Hydrator {
         Hydrator::new(
             pool.clone(),
             ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000),
-            None,
+            constellation.map(|base| ConstellationClient::new(crate::net::NetClient::loopback_for_tests(), base)),
             None,
             upstream,
             ReadCache::new(1024 * 1024),

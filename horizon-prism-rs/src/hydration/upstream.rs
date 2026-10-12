@@ -46,6 +46,12 @@ pub trait UpstreamSource: Send + Sync {
     async fn profile(&self, req: &Requester, actor: &str) -> Option<Value>;
     /// Post views for URIs (`getPosts` / Slingshot), in input order.
     async fn posts(&self, req: &Requester, uris: &[String]) -> Vec<Value>;
+    /// Post views built from the records alone (Slingshot, §7.1's
+    /// record-level fallback), in input order. No AppView is asked, so
+    /// the views carry no counts and no hydrated embeds.
+    async fn post_records(&self, _req: &Requester, _uris: &[String]) -> Vec<Value> {
+        Vec::new()
+    }
     /// `app.bsky.feed.getPostThread`.
     async fn post_thread(&self, req: &Requester, uri: &str, depth: u32, parent_height: u32) -> Option<Value>;
     /// `app.bsky.feed.getAuthorFeed` output.
@@ -516,6 +522,19 @@ impl UpstreamSource for RealUpstreamSource {
             }
         }
         uris.iter().filter_map(|u| found.remove(u)).collect()
+    }
+
+    async fn post_records(&self, req: &Requester, uris: &[String]) -> Vec<Value> {
+        let public: Vec<String> = uris.iter().filter(|u| !is_private_uri(u)).cloned().collect();
+        futures::stream::iter(public)
+            .map(|uri| async move {
+                // Once a share or pool is empty, the rest are left out.
+                if req.spent() { None } else { self.slingshot_post(req, &uri).await }
+            })
+            .buffered(SLINGSHOT_CONCURRENCY)
+            .filter_map(|v| async move { v })
+            .collect()
+            .await
     }
 
     async fn post_thread(&self, req: &Requester, uri: &str, depth: u32, parent_height: u32) -> Option<Value> {

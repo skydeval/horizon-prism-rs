@@ -82,6 +82,12 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 10: `getQuotes` shows quoting posts it does not store (G-7,
+  #670).** A quoting post Constellation lists and this AppView has not
+  indexed is fetched from Slingshot through the read-time cache, at most
+  `limit` per page, and placed in listing order. Before, such posts were
+  left out. Hidden posts and blocked authors are filtered before any
+  fetch.
 - **Item 10: `getProfiles` resolves out-of-scope actors (G-1, #670).**
   An actor this AppView does not index is fetched the way `getProfile`
   fetches it (its home AppView and the cascade, then the Slingshot profile

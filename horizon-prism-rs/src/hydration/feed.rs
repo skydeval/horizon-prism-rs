@@ -733,7 +733,7 @@ impl Hydrator {
 
     /// `app.bsky.feed.getQuotes`: Constellation first over `.embed.record.uri`
     /// and `.embed.record.record.uri`, merged; local `posts_quote` otherwise.
-    /// Non-local quoting posts need Slingshot (item 7) and are omitted.
+    /// Quoting posts not stored here come from Slingshot.
     ///
     /// # Errors
     ///
@@ -804,11 +804,33 @@ impl Hydrator {
             uris = rows.into_iter().map(|(u, _)| u).collect();
         }
         let ctx = self.post_context(viewer, req, &uris, CountMode::List).await?;
+        let listable = |u: &&String| {
+            ctx.gates.get(*u).copied().unwrap_or(Gate::Visible).listable() && !ctx.author_blocked(uri_author(u).unwrap_or_default())
+        };
+        // Quoting posts not stored here are fetched from Slingshot through
+        // the read-time cache, at most `limit` per page (design-v3 §11 G-7).
+        let missing: Vec<String> = uris
+            .iter()
+            .filter(listable)
+            .filter(|u| ctx.post_view(u).is_none())
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        let mut remote: HashMap<String, Value> = HashMap::new();
+        if !missing.is_empty() {
+            let fetched = Value::Array(self.upstream().post_records(req, &missing).await);
+            if let Value::Array(views) = self.normalized(viewer, fetched).await?.0 {
+                for v in views {
+                    if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string) {
+                        remote.insert(u, v);
+                    }
+                }
+            }
+        }
         let posts: Vec<Value> = uris
             .iter()
-            .filter(|u| ctx.gates.get(*u).copied().unwrap_or(Gate::Visible).listable())
-            .filter(|u| !ctx.author_blocked(uri_author(u).unwrap_or_default()))
-            .filter_map(|u| ctx.post_view(u))
+            .filter(listable)
+            .filter_map(|u| ctx.post_view(u).or_else(|| remote.remove(u)))
             .collect();
         let mut out = json!({ "uri": uri, "posts": posts });
         if let Some(c) = next {
@@ -850,6 +872,71 @@ mod tests {
             s.members.insert(d.into());
         }
         s
+    }
+
+    /// A Constellation whose `/links` answers `records` for `path`, and an
+    /// empty page for any other path.
+    async fn fake_links(path: &'static str, records: Value) -> String {
+        use axum::extract::Query;
+        use axum::routing::get;
+
+        let router = axum::Router::new().route(
+            "/links",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let records = if q.get("path").map(String::as_str) == Some(path) { records.clone() } else { json!([]) };
+                async move { axum::Json(json!({"total": 0, "linking_records": records})) }
+            }),
+        );
+        crate::test_support::serve_fake(router).await
+    }
+
+    /// design-v3 §11 G-7: quoting posts not stored here come from Slingshot.
+    #[tokio::test]
+    async fn get_quotes_fetches_quoting_posts_it_does_not_store() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        use crate::hydration::testing::{FixedUpstream, hydrator_full};
+
+        let Some(db) = fresh_db("hydration_quotes_upstream").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let subject = post(p, ALICE, "subject", "the quoted post", None, None).await;
+        let local = post(p, BOB, "localquote", "bob quotes", None, None).await;
+        let outsider = "did:plc:oooooooooooooooooooooooo";
+        let far = format!("at://{outsider}/{NSID_POST}/farquote");
+        let gone = format!("at://{outsider}/{NSID_POST}/gone");
+        let base = fake_links(
+            ".embed.record.uri",
+            json!([
+                {"did": outsider, "collection": NSID_POST, "rkey": "farquote"},
+                {"did": BOB, "collection": NSID_POST, "rkey": "localquote"},
+                {"did": outsider, "collection": NSID_POST, "rkey": "gone"},
+            ]),
+        )
+        .await;
+        let mut up = FixedUpstream::default();
+        up.posts.insert(
+            far.clone(),
+            json!({"$type": "app.bsky.feed.defs#postView", "uri": far, "cid": "bafyfar",
+                   "author": {"did": outsider, "handle": "far.example", "viewer": {}, "labels": []},
+                   "record": {"$type": NSID_POST, "text": "a far quote", "createdAt": "2026-09-26T00:00:00Z"},
+                   "indexedAt": "2026-09-26T00:00:00Z", "viewer": {}, "labels": []}),
+        );
+        let up = Arc::new(up);
+        let h = hydrator_full(p, sets(), up.clone(), Some(&base));
+        let req = Requester::test();
+        let out = h.get_quotes(&Viewer::anonymous(), &req, &subject, 50, None).await.expect("db").expect("view");
+        let uris: Vec<&str> = out.inner()["posts"].as_array().expect("posts").iter().filter_map(|v| v["uri"].as_str()).collect();
+        // Listing order; the record nobody has is left out.
+        assert_eq!(uris, [far.as_str(), local.as_str()]);
+        assert_eq!(out.inner()["posts"][0]["record"]["text"], "a far quote");
+        assert_eq!(up.calls.load(Ordering::SeqCst), 1, "one batch for the posts not stored here");
+        let _ = gone;
+        db.drop_db().await;
     }
 
     #[test]
