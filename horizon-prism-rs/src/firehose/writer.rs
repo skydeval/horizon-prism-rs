@@ -757,6 +757,32 @@ impl Writer {
             insert_notification(conn, &n, author, &u.uri, &u.cid).await?;
         }
         // After the reasons above, which take precedence (§8.6).
+        match &u.body {
+            Body::Like(s) | Body::Repost(s) => {
+                let reason = if matches!(u.body, Body::Like(_)) { "like-via-repost" } else { "repost-via-repost" };
+                if let Some(via) = &s.via
+                    && via.uri.contains("/app.bsky.feed.repost/")
+                    && let Some(reposter) = uri_author(&via.uri)
+                    && reposter != author
+                    && sets.is_member(reposter)
+                {
+                    insert_via_notification(conn, reason, author, &u.uri, &u.cid, &via.uri, &s.subject.uri).await?;
+                }
+            }
+            // A follow made through a starter pack names it (§8.6).
+            Body::Follow(g) => {
+                if let Some(via) = &g.via
+                    && via.uri.contains("/app.bsky.graph.starterpack/")
+                {
+                    sqlx::query("UPDATE notifications SET starter_pack_uri = $1 WHERE record_uri = $2 AND reason = 'follow'")
+                        .bind(&via.uri)
+                        .bind(&u.uri)
+                        .execute(&mut *conn)
+                        .await?;
+                }
+            }
+            _ => {}
+        }
         if live
             && let Body::Post(p) = &u.body
             && sets.in_scope(author)
@@ -1140,6 +1166,37 @@ async fn insert_notification(
     Ok(())
 }
 
+/// `like-via-repost` / `repost-via-repost` (design-v3 §8.6): a like or
+/// repost made from someone's repost notifies that reposter. Only when the
+/// repost is stored here and reposts the same subject, and not when the
+/// reposter was already notified of this record (as the subject's author).
+async fn insert_via_notification(
+    conn: &mut PgConnection,
+    reason: &'static str,
+    author: &str,
+    record_uri: &str,
+    record_cid: &str,
+    via: &str,
+    subject: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO notifications (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
+         SELECT r.author_did, $1, $2, r.uri, $3, $4 FROM reposts r \
+         WHERE r.uri = $5 AND r.subject_uri = $6 \
+           AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.recipient_did = r.author_did AND n.record_uri = $3) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(author)
+    .bind(reason)
+    .bind(record_uri)
+    .bind(record_cid)
+    .bind(via)
+    .bind(subject)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// `subscribed-post` notifications for a post by `author` just written from
 /// the firehose (design-v3 §5.6): one for each member subscribed to the
 /// author for this kind of post (`reply` or a top-level post), where
@@ -1390,6 +1447,65 @@ mod tests {
                 .fetch_optional(pool)
                 .await
                 .expect("query post")
+        }
+
+        /// design-v3 §8.6: a like made from a member's repost notifies the
+        /// reposter, only when the repost is stored and has the same
+        /// subject; a follow through a starter pack keeps the pack.
+        #[tokio::test]
+        async fn via_reasons_and_the_follows_starter_pack() {
+            let Some(db) = fresh_db("writer_via_reasons").await else {
+                return;
+            };
+            let p = &db.pool;
+            let liker = "did:plc:cccccccccccccccccccccccc";
+            let mut sets = ScopeSets::default();
+            sets.scope.insert(AUTHOR.into());
+            sets.scope.insert(liker.into());
+            sets.members.insert(AUTHOR.into());
+            let w = Writer::new(p.clone(), ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000), Arc::new(DisabledPrivateTier));
+            let op = |collection: &str, rkey: &str, record: Value| RawOp {
+                action: Action::Create,
+                collection: collection.into(),
+                rkey: rkey.into(),
+                cid: Some(format!("bafy{rkey}")),
+                record: Some(record),
+            };
+            let post = format!("at://{SUBJECT}/app.bsky.feed.post/3kpost");
+            let other = format!("at://{SUBJECT}/app.bsky.feed.post/3kother");
+            let repost = format!("at://{AUTHOR}/app.bsky.feed.repost/3krepost");
+            let subject = |uri: &str| json!({"uri": uri, "cid": "bafysubject"});
+            let now = "2026-09-26T00:00:00Z";
+            // The member reposts a stranger's post.
+            let r = op("app.bsky.feed.repost", "3krepost", json!({"subject": subject(&post), "createdAt": now}));
+            w.apply(AUTHOR, &rev(1), &[r], OPTIONS).await.expect("apply");
+            // A like made from that repost, and one whose `via` names the
+            // repost but likes another post.
+            let via = json!({"uri": repost, "cid": "bafy3krepost"});
+            let like = op("app.bsky.feed.like", "3klike", json!({"subject": subject(&post), "via": via, "createdAt": now}));
+            let stray = op("app.bsky.feed.like", "3kstray", json!({"subject": subject(&other), "via": via, "createdAt": now}));
+            w.apply(liker, &rev(1), &[like, stray], OPTIONS).await.expect("apply");
+            let got: Vec<(String, Option<String>, String)> =
+                sqlx::query_as("SELECT reason, reason_subject, record_uri FROM notifications WHERE recipient_did = $1 ORDER BY id")
+                    .bind(AUTHOR)
+                    .fetch_all(p)
+                    .await
+                    .expect("notifications");
+            assert_eq!(got, [("like-via-repost".to_string(), Some(repost.clone()), format!("at://{liker}/app.bsky.feed.like/3klike"))]);
+            // A follow made through a starter pack.
+            let pack = format!("at://{SUBJECT}/app.bsky.graph.starterpack/3kpack");
+            let follow = op(
+                "app.bsky.graph.follow",
+                "3kfollow",
+                json!({"subject": AUTHOR, "via": {"uri": pack, "cid": "bafypack"}, "createdAt": now}),
+            );
+            w.apply(liker, &rev(2), &[follow], OPTIONS).await.expect("apply");
+            let stored: Option<String> = sqlx::query_scalar("SELECT starter_pack_uri FROM notifications WHERE reason = 'follow'")
+                .fetch_one(p)
+                .await
+                .expect("follow notification");
+            assert_eq!(stored, Some(pack));
+            db.drop_db().await;
         }
 
         /// B-43: `subscribed-post` comes only from a live write of a fresh

@@ -55,6 +55,12 @@ fn preference_clause(hidden: usize, follows: usize) -> String {
     )
 }
 
+/// A like or repost row: URI, subject URI and CID, `created_at`, `via` URI
+/// and CID.
+type SubjectRow = (String, String, Option<String>, DateTime<Utc>, Option<String>, Option<String>);
+/// A follow row: URI, subject, `created_at`, `via` URI and CID.
+type FollowRow = (String, String, DateTime<Utc>, Option<String>, Option<String>);
+
 #[derive(Debug, sqlx::FromRow)]
 struct NotificationRow {
     id: i64,
@@ -64,6 +70,8 @@ struct NotificationRow {
     record_uri: String,
     record_cid: String,
     indexed_at: DateTime<Utc>,
+    /// On a `follow`: the starter pack the follow was made through.
+    starter_pack_uri: Option<String>,
 }
 
 impl Hydrator {
@@ -85,26 +93,31 @@ impl Hydrator {
             .await?;
         out.extend(posts);
         for (table, ty) in [("likes", "app.bsky.feed.like"), ("reposts", "app.bsky.feed.repost")] {
-            let rows: Vec<(String, String, Option<String>, DateTime<Utc>)> = sqlx::query_as(&format!(
-                "SELECT uri, subject_uri, subject_cid, created_at FROM {table} WHERE uri = ANY($1)"
+            let rows: Vec<SubjectRow> = sqlx::query_as(&format!(
+                "SELECT uri, subject_uri, subject_cid, created_at, via_uri, via_cid FROM {table} WHERE uri = ANY($1)"
             ))
             .bind(&uris)
             .fetch_all(self.pool())
             .await?;
-            for (uri, subject, cid, created) in rows {
-                out.insert(
-                    uri,
-                    json!({"$type": ty, "subject": {"uri": subject, "cid": cid.unwrap_or_default()}, "createdAt": ts(created)}),
-                );
+            for (uri, subject, cid, created, via_uri, via_cid) in rows {
+                let mut record = json!({"$type": ty, "subject": {"uri": subject, "cid": cid.unwrap_or_default()}, "createdAt": ts(created)});
+                if let Some(via) = via_uri {
+                    record["via"] = json!({"uri": via, "cid": via_cid.unwrap_or_default()});
+                }
+                out.insert(uri, record);
             }
         }
-        let follows: Vec<(String, String, DateTime<Utc>)> =
-            sqlx::query_as("SELECT uri, subject_did, created_at FROM follows WHERE uri = ANY($1)")
+        let follows: Vec<FollowRow> =
+            sqlx::query_as("SELECT uri, subject_did, created_at, via_uri, via_cid FROM follows WHERE uri = ANY($1)")
                 .bind(&uris)
                 .fetch_all(self.pool())
                 .await?;
-        for (uri, subject, created) in follows {
-            out.insert(uri, json!({"$type": "app.bsky.graph.follow", "subject": subject, "createdAt": ts(created)}));
+        for (uri, subject, created, via_uri, via_cid) in follows {
+            let mut record = json!({"$type": "app.bsky.graph.follow", "subject": subject, "createdAt": ts(created)});
+            if let Some(via) = via_uri {
+                record["via"] = json!({"uri": via, "cid": via_cid.unwrap_or_default()});
+            }
+            out.insert(uri, record);
         }
         Ok(out)
     }
@@ -125,7 +138,7 @@ impl Hydrator {
         // So what a member's read fetches and caches does not depend on what
         // it muted. A page can be short; the cursor follows the scan.
         let rows: Vec<NotificationRow> = sqlx::query_as(
-            "SELECT n.id, n.author_did, n.reason, n.reason_subject, n.record_uri, n.record_cid, n.indexed_at \
+            "SELECT n.id, n.author_did, n.reason, n.reason_subject, n.record_uri, n.record_cid, n.indexed_at, n.starter_pack_uri \
              FROM notifications n WHERE n.recipient_did = $1 \
                AND ($2::timestamptz IS NULL OR (n.indexed_at, n.id) < ($2, $3)) \
                AND (cardinality($5::text[]) = 0 OR n.reason = ANY($5)) \
@@ -149,6 +162,21 @@ impl Hydrator {
             .cloned()
             .collect();
         let muted_threads = self.in_muted_threads(viewer, &threads).await?;
+        // The starter packs follows were made through (§8.6); one that no
+        // longer resolves leaves its field out.
+        let mut pack_uris: Vec<String> = rows.iter().filter_map(|r| r.starter_pack_uri.clone()).collect();
+        pack_uris.sort_unstable();
+        pack_uris.dedup();
+        let mut packs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        for chunk in pack_uris.chunks(25) {
+            if let Ok(found) = self.get_starter_packs(viewer, req, chunk).await? {
+                for pack in found.inner()["starterPacks"].as_array().into_iter().flatten() {
+                    if let Some(uri) = pack.get("uri").and_then(Value::as_str) {
+                        packs.insert(uri.to_string(), pack.clone());
+                    }
+                }
+            }
+        }
         // The member's preferences are private state too, applied here and
         // not in the scan.
         let prefs = self.reason_filter(me).await?;
@@ -191,6 +219,9 @@ impl Hydrator {
                 });
                 if let Some(s) = &r.reason_subject {
                     n["reasonSubject"] = json!(s);
+                }
+                if let Some(pack) = r.starter_pack_uri.as_ref().and_then(|u| packs.get(u)) {
+                    n["starterPack"] = pack.clone();
                 }
                 Some(n)
             })

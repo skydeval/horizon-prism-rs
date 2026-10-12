@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 14: `like-via-repost`, `repost-via-repost` and `starterPack`
+  (#675).** A like or repost made from a member's repost notifies that
+  member, when the repost is stored here and has the same subject, and
+  unless they were already notified of it as the post's author. A
+  `follow` notification whose follow was made through a starter pack
+  carries the pack as `starterPack`. Rebuilt like, repost and follow
+  records include their `via` (design-v3 §8.6).
 - **Item 14: sweep of subscriptions that can no longer notify (#675).**
   The daily retention run deletes activity subscriptions whose subject is
   no longer indexed here, so they are not shown as active
