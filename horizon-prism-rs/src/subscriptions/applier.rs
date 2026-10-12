@@ -55,6 +55,16 @@ impl Waiting {
             .insert((member.to_string(), source.to_string()), Instant::now());
     }
 
+    /// Add a pair unless it is already there; its time is then kept.
+    pub fn add_if_absent(&self, owner: &str, member: &str, source: &str) {
+        let mut owners = self.owners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners
+            .entry(owner.to_string())
+            .or_default()
+            .entry((member.to_string(), source.to_string()))
+            .or_insert_with(Instant::now);
+    }
+
     /// The pairs waiting on `owner`, sorted.
     #[must_use]
     pub fn of(&self, owner: &str) -> Vec<(String, String)> {

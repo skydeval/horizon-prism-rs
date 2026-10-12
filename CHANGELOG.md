@@ -12,6 +12,18 @@ commit.
 
 ### Added
 
+- **Item 12: the other reasons a list sync starts (#673).**
+  `subscriptions::triggers` adds the recovery sweep (at startup and with
+  every retry-scheduler run: it finds again every reference still
+  waiting on a sync, and every list never synced), the weekly run (a
+  low-priority sync for each owner with no complete listing in 7 days,
+  one owner a second), a sync on an account or identity event for an
+  owner that looks gone (never for an ordinary owner), and requested
+  syncs recorded on the owner's row. A sync row left `running` at
+  startup, or found stuck, now ends as a run does: the owner's pacing
+  moves and the next start is paced. The sweep and the weekly run are
+  on in `serve`; the event and requested syncs have no caller yet
+  (design-v3 §4.3 "When a sync is enqueued").
 - **Item 12: list syncs on the backfill workers (#673).**
   `subscriptions::runner` lets a backfill worker run a list sync before
   its ordinary work: the fast lane first, then the slow lane, each with

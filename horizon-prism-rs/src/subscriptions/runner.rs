@@ -23,7 +23,11 @@ use super::applier::Waiting;
 use super::claim::{self, Lane, LaneTime};
 use super::jobs;
 use super::run::{self, Outcome, OwnerSource, Settings};
+use super::triggers;
 use crate::aggregations::ScopeState;
+
+/// The weekly run enqueues one owner per this long.
+const WEEKLY_SPACING: Duration = Duration::from_secs(1);
 
 pub const METRIC_RUNNING_AGE: &str = "list_sync_running_age_seconds";
 pub const METRIC_STUCK: &str = "list_sync_stuck_requeued_total";
@@ -63,7 +67,7 @@ pub struct ListSync {
     time: LaneTime,
     settings: Settings,
     window: Duration,
-    stuck: Duration,
+    lanes: Lanes,
     fast: Arc<Semaphore>,
     slow: Arc<Semaphore>,
     live: Live,
@@ -80,7 +84,7 @@ impl ListSync {
             time: LaneTime::default(),
             settings,
             window: Duration::from_secs(u64::from(lanes.max_wall_secs).saturating_mul(2).max(3600)),
-            stuck: Duration::from_secs(u64::from(lanes.stuck_secs)),
+            lanes,
             fast: Arc::new(Semaphore::new(lanes.fast as usize)),
             slow: Arc::new(Semaphore::new(lanes.slow as usize)),
             live: Live::default(),
@@ -125,16 +129,22 @@ impl ListSync {
     /// Database errors.
     pub async fn requeue_stuck(&self) -> Result<u64, sqlx::Error> {
         let live: Vec<String> = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
-        let n = sqlx::query(
-            "UPDATE backfill_jobs SET state = 'queued', generation = generation + 1, not_before = now(), updated_at = now() \
-             WHERE depth = $1 AND state = 'running' AND updated_at < now() - make_interval(secs => $2) AND NOT (did = ANY($3))",
+        let stuck: Vec<String> = sqlx::query_scalar(
+            "SELECT did FROM backfill_jobs WHERE depth = $1 AND state = 'running' \
+               AND updated_at < now() - make_interval(secs => $2) AND NOT (did = ANY($3)) ORDER BY did",
         )
         .bind(jobs::DEPTH)
-        .bind(self.stuck.as_secs_f64())
+        .bind(f64::from(self.lanes.stuck_secs))
         .bind(&live)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        .fetch_all(&self.pool)
+        .await?;
+        let mut n = 0;
+        for owner in stuck {
+            // A run end like any other: the owner's row first, and paced.
+            if jobs::interrupt(&self.pool, &owner, self.settings.min_interval_secs, Some(self.lanes.stuck_secs)).await? {
+                n += 1;
+            }
+        }
         if n > 0 {
             tracing::warn!(event = "list_sync_stuck_requeued", jobs = n, "re-queued list sync rows left running");
             metrics::counter!(METRIC_STUCK).increment(n);
@@ -142,10 +152,49 @@ impl ListSync {
         Ok(n)
     }
 
+    /// At startup: no run of a previous process is live, so every row left
+    /// `running` is queued again. Returns how many.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn requeue_interrupted(&self) -> Result<u64, sqlx::Error> {
+        let running: Vec<String> = sqlx::query_scalar("SELECT did FROM backfill_jobs WHERE depth = $1 AND state = 'running' ORDER BY did")
+            .bind(jobs::DEPTH)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut n = 0;
+        for owner in running {
+            if jobs::interrupt(&self.pool, &owner, self.settings.min_interval_secs, None).await? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// The recovery sweep, now and then every `every` (the retry
+    /// scheduler's period), each followed by the weekly run when a week
+    /// has passed.
+    pub async fn sweep_loop(self, every: Duration) {
+        let pause = self.settings.min_interval_secs;
+        loop {
+            match triggers::recovery_sweep(&self.pool, &self.waiting, pause).await {
+                Ok(n) => tracing::info!(event = "list_sync_recovery_sweep", owners = n, "list sync recovery sweep"),
+                Err(error) => tracing::warn!(event = "list_sync_recovery_sweep_failed", %error, "the list sync recovery sweep failed"),
+            }
+            match triggers::weekly(&self.pool, pause, WEEKLY_SPACING).await {
+                Ok(Some(n)) => tracing::info!(event = "list_sync_weekly", owners = n, "weekly list syncs enqueued"),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(event = "list_sync_weekly_failed", %error, "enqueueing the weekly list syncs failed"),
+            }
+            tokio::time::sleep(every).await;
+        }
+    }
+
     /// The stuck-row check, every quarter of the stuck bound, and the age
     /// of the oldest `running` row as a gauge.
     pub async fn stuck_loop(self) {
-        let every = (self.stuck / 4).max(Duration::from_secs(1));
+        let every = Duration::from_secs(u64::from(self.lanes.stuck_secs / 4).max(1));
         loop {
             tokio::time::sleep(every).await;
             if let Err(error) = self.requeue_stuck().await {
@@ -235,6 +284,10 @@ mod tests {
         assert_eq!(sync.requeue_stuck().await.expect("stuck"), 1);
         let after: (String, i64) = sqlx::query_as("SELECT state, generation FROM backfill_jobs").fetch_one(p).await.expect("job");
         assert_eq!(after, ("queued".to_string(), before + 1));
+        // At startup every running row comes back, whatever its age.
+        sqlx::query("UPDATE backfill_jobs SET state = 'running', updated_at = now()").execute(p).await.expect("running");
+        assert_eq!(sync.requeue_interrupted().await.expect("startup"), 1);
+        assert_eq!(sync.requeue_interrupted().await.expect("startup"), 0);
         db.drop_db().await;
     }
 }

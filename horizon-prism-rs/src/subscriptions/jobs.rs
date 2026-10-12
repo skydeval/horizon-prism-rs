@@ -214,6 +214,47 @@ pub async fn settle(
     Ok(true)
 }
 
+/// Queue again a row left `running` with no run behind it (the process
+/// stopped, or the run died): a run end like any other, so the owner's
+/// row is written first and the new start is paced. The generation moves
+/// on, so nothing of the old run can settle the row. With `older_than_secs`
+/// only a row that has been `running` at least that long is touched.
+/// Returns whether a row was.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn interrupt(pool: &sqlx::PgPool, owner: &str, min_interval_secs: u32, older_than_secs: Option<u32>) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    record_run_end(&mut tx, owner, None).await?;
+    let pacing: OwnerPacing =
+        sqlx::query_as("SELECT last_run_ended_at, gone_suspect_at, owner_gone, slow_until, cut_until FROM subscribed_owners WHERE owner_did = $1")
+            .bind(owner)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or_default();
+    let earliest = earliest_start(&pacing, min_interval_secs, Utc::now());
+    let n = sqlx::query(
+        "UPDATE backfill_jobs SET state = 'queued', generation = generation + 1, not_before = $3, updated_at = now() \
+         WHERE did = $1 AND depth = $2 AND state = 'running' \
+           AND ($4::float8 IS NULL OR updated_at < now() - make_interval(secs => $4::float8))",
+    )
+    .bind(owner)
+    .bind(DEPTH)
+    .bind(earliest)
+    .bind(older_than_secs.map(f64::from))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        // Nothing was running after all: the owner's row stays as it was.
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// End a run that is not a completion: the owner's row, then the job row,
 /// in one transaction.
 ///

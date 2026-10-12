@@ -617,20 +617,20 @@ impl Backfill {
 
     /// Start the workers, the retry scheduler, the daily `authz` schedule and
     /// the metrics sampler. Jobs left `running` by a previous process are
-    /// re-queued first; a `list_sync` row also gets a new generation, so
-    /// nothing of the run it was in can still settle it.
+    /// re-queued first; a `list_sync` row row by row, as a run end with a
+    /// new generation (`subscriptions::jobs::interrupt`).
     ///
     /// # Errors
     ///
     /// The startup re-queue failed.
     pub async fn spawn(self) -> Result<Vec<JoinHandle<()>>, sqlx::Error> {
-        let n = sqlx::query(
-            "UPDATE backfill_jobs SET state = 'queued', updated_at = now(), \
-               generation = generation + CASE WHEN depth = 'list_sync' THEN 1 ELSE 0 END WHERE state = 'running'",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let mut n = sqlx::query("UPDATE backfill_jobs SET state = 'queued', updated_at = now() WHERE state = 'running' AND depth <> 'list_sync'")
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if let Some(list_sync) = &self.list_sync {
+            n += list_sync.requeue_interrupted().await?;
+        }
         if n > 0 {
             tracing::info!(event = "backfill_requeued_interrupted", jobs = n, "re-queued jobs left running");
         }
@@ -644,7 +644,9 @@ impl Backfill {
         let this = self.clone();
         handles.push(tokio::spawn(async move { this.daily_loop().await }));
         if let Some(list_sync) = self.list_sync.clone() {
-            handles.push(tokio::spawn(list_sync.stuck_loop()));
+            handles.push(tokio::spawn(list_sync.clone().stuck_loop()));
+            let every = Duration::from_secs(u64::from(self.settings.retry_every_hours.max(1)) * 3600);
+            handles.push(tokio::spawn(list_sync.sweep_loop(every)));
         }
         let this = self;
         handles.push(tokio::spawn(async move { this.metrics_loop().await }));
