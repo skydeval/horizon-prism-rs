@@ -136,8 +136,9 @@ commit.
   AppView's own rows only when its owner is a ready member, whose lists and
   list items are held in full (design-v3 §5.5). Any other list is read as if
   nothing were stored: its record from Slingshot, its items from an upstream
-  AppView, and, when none answers, from the owner's PDS (at most 5 pages a
-  request, with a `P:` cursor while the PDS has more). `listView` carries
+  AppView, and, when none answers, from the owner's PDS (at most
+  `lists.read_listing_pages` pages a request, default 5, with a `P:` cursor
+  while the PDS has more). `listView` carries
   the creator, `listItemCount` (distinct subjects, or the upstream's number),
   local labels, and the viewer's own `muted`, `blocked` and
   `referenceListOptOut`. Duplicate items of one subject show once. A

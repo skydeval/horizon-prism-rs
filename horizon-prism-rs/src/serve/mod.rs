@@ -358,7 +358,8 @@ pub async fn run() -> Result<(), StartupError> {
             ),
         ),
         read_cache.clone(),
-    );
+    )
+    .with_list_read_pages(cfg.file.lists.read_listing_pages);
 
     // HTTP.
     let hydrator = Hydrator::new(

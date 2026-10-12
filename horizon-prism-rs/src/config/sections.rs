@@ -853,6 +853,20 @@ impl Default for FarsightConfig {
     }
 }
 
+/// `[lists]` (design-v3 §5.5).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ListsConfig {
+    /// Owner-PDS pages one `getList` request reads when no AppView answers.
+    pub read_listing_pages: u32,
+}
+
+impl Default for ListsConfig {
+    fn default() -> Self {
+        Self { read_listing_pages: 5 }
+    }
+}
+
 /// `[known_followers]` (design-v3 §5.3).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1025,6 +1039,7 @@ pub struct FileConfig {
     pub thread_mutes: ThreadMutesConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,
+    pub lists: ListsConfig,
     pub farsight: FarsightConfig,
     pub schema_backfill: SchemaBackfillConfig,
     pub schema_index: SchemaIndexConfig,

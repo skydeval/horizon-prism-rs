@@ -32,6 +32,9 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if cfg.schema_backfill.batch_size == 0 {
         out.push("schema_backfill.batch_size must be at least 1".to_string());
     }
+    if !(1..=100).contains(&cfg.lists.read_listing_pages) {
+        out.push("lists.read_listing_pages must be 1 to 100".to_string());
+    }
     if !(1..=1000).contains(&cfg.known_followers.scan_max_pages) {
         out.push("known_followers.scan_max_pages must be 1 to 1000".to_string());
     }

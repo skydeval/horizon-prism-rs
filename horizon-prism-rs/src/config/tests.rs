@@ -261,6 +261,9 @@ counts_refresh_secs = 3600
 [known_followers]
 scan_max_pages = 20
 
+[lists]
+read_listing_pages = 5
+
 [farsight]
 timeout_ms = 500
 cache_ttl_secs = 30

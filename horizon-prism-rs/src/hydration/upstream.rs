@@ -240,8 +240,8 @@ const NSID_FOLLOW: &str = "app.bsky.graph.follow";
 const NSID_LIST: &str = "app.bsky.graph.list";
 const NSID_LISTITEM: &str = "app.bsky.graph.listitem";
 const NSID_STARTERPACK: &str = "app.bsky.graph.starterpack";
-/// Owner-PDS pages one `getList` request reads when no AppView answers
-/// (`lists.read_listing_pages`, design-v3 §5.5).
+/// Owner-PDS pages one `getList` request reads when no AppView answers:
+/// the default of `lists.read_listing_pages` (design-v3 §5.5).
 pub const LIST_READ_PAGES: usize = 5;
 
 /// Author-PDS listings on the read path: the host's public-fallback bucket
@@ -310,6 +310,8 @@ pub struct RealUpstreamSource {
     slingshot: SlingshotClient,
     pds: PdsLister,
     cache: ReadCache,
+    /// `lists.read_listing_pages`.
+    list_read_pages: usize,
 }
 
 /// A `postView` synthesized from a Slingshot or PDS record: no counts, no
@@ -379,7 +381,16 @@ impl RealUpstreamSource {
             slingshot,
             pds,
             cache,
+            list_read_pages: LIST_READ_PAGES,
         }
+    }
+
+    /// Set `lists.read_listing_pages`: the owner-PDS pages one `getList`
+    /// request reads when no AppView answers.
+    #[must_use]
+    pub fn with_list_read_pages(mut self, pages: u32) -> Self {
+        self.list_read_pages = usize::try_from(pages).unwrap_or(LIST_READ_PAGES);
+        self
     }
 
     /// The DID's home network, and whether it is this AppView.
@@ -749,14 +760,14 @@ impl UpstreamSource for RealUpstreamSource {
         if req.spent() {
             return None;
         }
-        // The owner's PDS, filtered to this list: at most `LIST_READ_PAGES`
+        // The owner's PDS, filtered to this list: at most `list_read_pages`
         // pages, each asking only for what the page still lacks. The order
         // is the PDS's own.
         let pds = self.router.lookup().summary(req, owner).await?.pds?;
         let mut next = cursor.and_then(|c| c.strip_prefix("P:")).map(str::to_string);
         let mut subjects: Vec<(String, String)> = Vec::new();
         let mut answered = false;
-        for _ in 0..LIST_READ_PAGES {
+        for _ in 0..self.list_read_pages {
             let want = limit.saturating_sub(u32::try_from(subjects.len()).unwrap_or(u32::MAX));
             if want == 0 {
                 break;
