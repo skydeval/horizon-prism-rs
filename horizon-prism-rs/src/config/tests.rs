@@ -255,6 +255,9 @@ max_remote_fetches = 100
 [thread_mutes]
 max_per_actor = 10000
 
+[starter_packs]
+counts_refresh_secs = 3600
+
 [schema_backfill]
 batch_size = 10000
 pause_ms = 100

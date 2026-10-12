@@ -812,6 +812,20 @@ impl Default for ThreadMutesConfig {
     }
 }
 
+/// `[starter_packs]` (design-v3 §5.5).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StarterPacksConfig {
+    /// How often every stored pack's joined counts are refreshed.
+    pub counts_refresh_secs: u64,
+}
+
+impl Default for StarterPacksConfig {
+    fn default() -> Self {
+        Self { counts_refresh_secs: 3600 }
+    }
+}
+
 /// `[auth]`: limits on token verification done before the per-requester
 /// backstop (design-v3 §II-8.3).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -954,6 +968,7 @@ pub struct FileConfig {
     pub auth: AuthConfig,
     pub thread: ThreadConfig,
     pub thread_mutes: ThreadMutesConfig,
+    pub starter_packs: StarterPacksConfig,
     pub schema_backfill: SchemaBackfillConfig,
     pub schema_index: SchemaIndexConfig,
     pub features: FeaturesConfig,

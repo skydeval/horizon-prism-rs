@@ -32,6 +32,9 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if cfg.schema_backfill.batch_size == 0 {
         out.push("schema_backfill.batch_size must be at least 1".to_string());
     }
+    if cfg.starter_packs.counts_refresh_secs < 60 {
+        out.push("starter_packs.counts_refresh_secs must be at least 60".to_string());
+    }
     if cfg.thread_mutes.max_per_actor == 0 {
         out.push("thread_mutes.max_per_actor must be at least 1".to_string());
     }

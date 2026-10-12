@@ -281,7 +281,7 @@ pub async fn run() -> Result<(), StartupError> {
             .await
             .map_err(|e| StartupError::new(1, format!("starting backfill: {e}")))?,
     );
-    tasks.push(CountRefresher::new(pool.clone(), redis.clone(), constellation, &cfg.file.counts).spawn());
+    tasks.push(CountRefresher::new(pool.clone(), redis.clone(), constellation.clone(), &cfg.file.counts).spawn());
     let rebuild = Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days);
     tasks.push(rebuild.clone().spawn_weekly());
 
@@ -417,6 +417,15 @@ pub async fn run() -> Result<(), StartupError> {
     let schema_backfill = SchemaBackfill::new(pool.clone(), schema_backfill::Settings::from_config(&cfg.file));
     let schema_status = schema_backfill.status();
     tasks.push(schema_backfill.spawn());
+    // Starter-pack joined counts (design-v3 §5.5).
+    tasks.push(
+        crate::aggregations::pack_counts::PackCounts::new(
+            pool.clone(),
+            Some(constellation.clone()),
+            Duration::from_secs(cfg.file.starter_packs.counts_refresh_secs),
+        )
+        .spawn(),
+    );
     // The one-time re-sync that fetches the new collections of DIDs known
     // before the upgrade (design-v3 §12.3).
     tasks.push(crate::firehose::v3_resync::spawn(pool.clone()));

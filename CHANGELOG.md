@@ -12,6 +12,15 @@ commit.
 
 ### Added
 
+- **Item 12: starter-pack joined counts (#673).** A job recounts, for every
+  stored pack, how many accounts joined through it, every
+  `starter_packs.counts_refresh_secs` (default 3600, at least 60). The
+  all-time number comes from Constellation, or from local profile rows when
+  Constellation does not answer. The week number is today's all-time value
+  minus the value of 7 days ago when both came from the same source;
+  otherwise it is the local count of joiners whose profile is at most 7 days
+  old. A count is written only while its pack exists.
+  `starter_pack_counts_refreshed_total{source}`.
 - **Item 12: `getListsWithMembership` and `getStarterPacksWithMembership`
   (#673).** A ready member's own moderation and curate lists, or its own
   starter packs, each with the named actor's list item when the actor is on

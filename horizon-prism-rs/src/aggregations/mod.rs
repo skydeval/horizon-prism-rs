@@ -14,6 +14,7 @@ pub mod growth;
 pub mod policy;
 pub mod enroll;
 pub mod membership;
+pub mod pack_counts;
 pub mod purge;
 pub mod rebuild;
 pub mod scope_state;

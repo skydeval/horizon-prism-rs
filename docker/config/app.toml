@@ -279,6 +279,10 @@ max_remote_fetches = 100
 [thread_mutes]
 max_per_actor = 10000
 
+# How often the "joined through this starter pack" numbers are recounted.
+[starter_packs]
+counts_refresh_secs = 3600
+
 # Limits on checking sign-in tokens before a request is charged to anyone.
 # They stop forged or broken tokens from using up CPU or a member's limits.
 [auth]

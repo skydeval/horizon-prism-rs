@@ -26,7 +26,7 @@ pub use sections::{
     KryphocronConfig, LOCAL_APPVIEW, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig,
     PrivateReadConfig, PrivateReadFloors, PublicScope, RateClassConfig, RateLimitsConfig,
     RetentionConfig, SchemaBackfillConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
-    SyncConfig, ThreadConfig, ThreadMutesConfig, UtcTimeOfDay,
+    StarterPacksConfig, SyncConfig, ThreadConfig, ThreadMutesConfig, UtcTimeOfDay,
 };
 pub use validate::{OTHER_RELAY_LABEL, pds_pattern};
 
