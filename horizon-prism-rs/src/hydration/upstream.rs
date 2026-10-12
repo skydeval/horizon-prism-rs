@@ -34,6 +34,7 @@ use crate::constellation::{Call, Cascade, Router};
 use crate::db::locks::uri_author;
 use crate::firehose::backfill::{ListOrder, ListPage, ListedRecord, detect_order};
 use crate::firehose::normalize::{blob_cid, normalize_record};
+use crate::identity::handle_lookup::HandleOutcome;
 use crate::microcosm::SlingshotClient;
 use crate::net::{BodyCap, NetClient, RequestOptions};
 use crate::sync::HostBudgets;
@@ -107,6 +108,14 @@ pub trait UpstreamSource: Send + Sync {
     /// bidirectionally.
     async fn resolve_handle(&self, _req: &Requester, _handle: &str) -> Option<String> {
         None
+    }
+    /// [`UpstreamSource::resolve_handle`] with the reason kept when there is
+    /// no DID (design-v3 §5.11). By default every miss is "no such handle".
+    async fn handle_outcome(&self, req: &Requester, handle: &str) -> HandleOutcome {
+        match self.resolve_handle(req, handle).await {
+            Some(did) => HandleOutcome::Found(did),
+            None => HandleOutcome::NotFound,
+        }
     }
 }
 
@@ -929,6 +938,10 @@ impl UpstreamSource for RealUpstreamSource {
 
     async fn resolve_handle(&self, req: &Requester, handle: &str) -> Option<String> {
         self.router.lookup().did_for_handle(req, handle).await
+    }
+
+    async fn handle_outcome(&self, req: &Requester, handle: &str) -> HandleOutcome {
+        self.router.lookup().handle_outcome(req, handle).await
     }
 }
 

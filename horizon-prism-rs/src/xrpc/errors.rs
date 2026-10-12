@@ -112,6 +112,9 @@ impl From<HydrationError> for XrpcError {
         if let HydrationError::NoBudget(exhausted) = e {
             return exhausted.into();
         }
+        if matches!(e, HydrationError::Upstream) {
+            return Self::new(StatusCode::BAD_GATEWAY, "UpstreamFailure", "An upstream lookup could not be completed");
+        }
         tracing::error!(event = "xrpc_internal_error", error = %e, "request failed");
         Self::internal()
     }

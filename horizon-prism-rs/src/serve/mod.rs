@@ -333,7 +333,17 @@ pub async fn run() -> Result<(), StartupError> {
     let table = Arc::new(RoutingTable::from_config(&cfg.file.constellation));
     // Request-path identity work: one token of the requester's identity
     // share per DID or handle, and PLC's request bucket per PLC fetch.
-    let lookup = RequestLookup::new(resolver.clone(), identity_share, plc_bucket);
+    // `resolveHandle` asks DNS for the handle's TXT record itself, to tell
+    // "no such handle" from a lookup that failed (design-v3 §5.11).
+    let handle_dns = crate::net::HickoryLookup::from_system().map_err(|e| StartupError::new(1, format!("dns resolver: {e}")))?;
+    let lookup = RequestLookup::new(resolver.clone(), identity_share, plc_bucket).with_handle_lookup(
+        Arc::new(handle_dns),
+        crate::constellation::routing::HandleCacheSettings {
+            capacity: cfg.file.identity.resolve_handle_cache_max,
+            ttl: Duration::from_secs(cfg.file.identity.resolve_handle_ttl_secs),
+            negative_ttl: Duration::from_secs(cfg.file.identity.resolve_handle_negative_ttl_secs),
+        },
+    );
     let did_router = DidRouter::new(Arc::clone(&table), Arc::new(lookup) as Arc<dyn DidLookup>);
     let cascade = Cascade::new(
         Arc::clone(&table),

@@ -106,6 +106,9 @@ plc_request_burst = 40
 requester_resolutions_per_sec = 5.0
 requester_resolutions_burst = 25
 member_pool_refresh_secs = 600
+resolve_handle_cache_max = 100000
+resolve_handle_ttl_secs = 300
+resolve_handle_negative_ttl_secs = 60
 
 [kryphocron]
 oracle_freshness_bound_secs = 120

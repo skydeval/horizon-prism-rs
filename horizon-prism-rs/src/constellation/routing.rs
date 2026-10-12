@@ -20,6 +20,7 @@ use moka::future::Cache;
 
 use super::matcher::{first_match, pds_host};
 use crate::config::{COMMUNITY_NETWORK, ConstellationConfig, LOCAL_APPVIEW, NetworkAuth};
+use crate::identity::handle_lookup::{HandleOutcome, TxtSource};
 use crate::identity::{IdentityResolver, ResolveIntent};
 use crate::xrpc::pools::{Requester, RequesterLimit, SharedBucket};
 
@@ -180,7 +181,37 @@ pub trait DidLookup: Send + Sync {
     async fn did_for_handle(&self, _req: &Requester, _handle: &str) -> Option<String> {
         None
     }
+
+    /// A handle's DID with the reason kept when there is none
+    /// (design-v3 §5.11). By default, [`DidLookup::did_for_handle`] with
+    /// every miss read as "no such handle".
+    async fn handle_outcome(&self, req: &Requester, handle: &str) -> HandleOutcome {
+        match self.did_for_handle(req, handle).await {
+            Some(did) => HandleOutcome::Found(did),
+            None => HandleOutcome::NotFound,
+        }
+    }
 }
+
+/// `resolveHandle`'s cache (design-v3 §5.11 step 4): how many answers are
+/// kept, and for how long a DID and a "no such handle" each.
+#[derive(Debug, Clone, Copy)]
+pub struct HandleCacheSettings {
+    pub capacity: u64,
+    pub ttl: Duration,
+    pub negative_ttl: Duration,
+}
+
+/// The typed handle lookup of a [`RequestLookup`] and its two caches. A
+/// "could not find out" is never kept.
+#[derive(Clone)]
+struct Handles {
+    txt: Arc<dyn TxtSource>,
+    found: Cache<String, String>,
+    absent: Cache<String, ()>,
+}
+
+pub const METRIC_HANDLE_RESOLUTIONS: &str = "handle_resolutions_total";
 
 #[async_trait]
 impl DidLookup for IdentityResolver {
@@ -220,6 +251,8 @@ pub struct RequestLookup {
     own: RequesterLimit,
     plc: SharedBucket,
     summaries: Cache<String, DidSummary>,
+    /// The typed handle lookup, when one is set.
+    handles: Option<Handles>,
 }
 
 impl RequestLookup {
@@ -230,7 +263,20 @@ impl RequestLookup {
             own,
             plc,
             summaries: Cache::builder().max_capacity(SUMMARY_CAPACITY).time_to_live(SUMMARY_TTL).build(),
+            handles: None,
         }
+    }
+
+    /// Resolve handles through `txt` and the well-known file, telling "no
+    /// such handle" from "could not find out", with the answers cached.
+    #[must_use]
+    pub fn with_handle_lookup(mut self, txt: Arc<dyn TxtSource>, cache: HandleCacheSettings) -> Self {
+        self.handles = Some(Handles {
+            txt,
+            found: Cache::builder().max_capacity(cache.capacity).time_to_live(cache.ttl).build(),
+            absent: Cache::builder().max_capacity(cache.capacity).time_to_live(cache.negative_ttl).build(),
+        });
+        self
     }
 
     /// One identity token for a resolution that is about to start.
@@ -265,6 +311,41 @@ impl DidLookup for RequestLookup {
         }
         let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
         self.resolver.resolve_handle_admitted(handle, &plc).await
+    }
+
+    async fn handle_outcome(&self, req: &Requester, handle: &str) -> HandleOutcome {
+        let Some(handles) = &self.handles else {
+            return match self.did_for_handle(req, handle).await {
+                Some(did) => HandleOutcome::Found(did),
+                None => HandleOutcome::NotFound,
+            };
+        };
+        let count = |result: &'static str| metrics::counter!(METRIC_HANDLE_RESOLUTIONS, "result" => result).increment(1);
+        if let Some(did) = handles.found.get(handle).await {
+            count("cache");
+            return HandleOutcome::Found(did);
+        }
+        if handles.absent.get(handle).await.is_some() {
+            count("cache");
+            return HandleOutcome::NotFound;
+        }
+        if !self.admitted(req) {
+            return HandleOutcome::Unavailable;
+        }
+        let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
+        let outcome = self.resolver.resolve_handle_typed(handles.txt.as_ref(), handle, &plc).await;
+        match &outcome {
+            HandleOutcome::Found(did) => {
+                count("network_ok");
+                handles.found.insert(handle.to_string(), did.clone()).await;
+            }
+            HandleOutcome::NotFound => {
+                count("network_not_found");
+                handles.absent.insert(handle.to_string(), ()).await;
+            }
+            HandleOutcome::Unavailable => count("network_error"),
+        }
+        outcome
     }
 }
 

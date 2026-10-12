@@ -451,6 +451,38 @@ impl IdentityResolver {
         Some(did)
     }
 
+    /// The DID of `handle` with the reason kept when there is none
+    /// (design-v3 §5.11): the TXT record and the well-known file are both
+    /// asked, a DID found is verified against its document, and "no such
+    /// handle" is told apart from "could not find out". `admit` as in
+    /// [`IdentityResolver::resolve_admitted`].
+    pub async fn resolve_handle_typed(
+        &self,
+        txt: &dyn super::handle_lookup::TxtSource,
+        handle: &str,
+        admit: &(dyn Fn(&str) -> bool + Sync),
+    ) -> super::handle_lookup::HandleOutcome {
+        use super::handle_lookup::{HandleOutcome, HandleProbe, Step, candidate, neither_found};
+
+        let probe = HandleProbe { txt, net: &self.inner.net };
+        let (from_txt, from_file) = probe.run(handle).await;
+        let Some(did) = candidate(&from_txt, &from_file) else {
+            return match neither_found(&from_txt, &from_file) {
+                Step::Confirmed => HandleOutcome::NotFound,
+                _ => HandleOutcome::Unavailable,
+            };
+        };
+        // The document must name the handle back. A document that could
+        // not be fetched decides nothing.
+        match self.resolve_info_admitted(did, ResolveIntent::Lookup, admit).await {
+            Ok(info) if info.claimed_handle.as_deref().is_some_and(|claimed| claimed.eq_ignore_ascii_case(handle)) => {
+                HandleOutcome::Found(did.to_string())
+            }
+            Ok(_) => HandleOutcome::NotFound,
+            Err(_) => HandleOutcome::Unavailable,
+        }
+    }
+
     /// The verified handle for `did`, or `None`.
     pub async fn verify_handle(&self, did: &str, claimed: Option<&str>) -> Option<String> {
         let claimed = claimed?;

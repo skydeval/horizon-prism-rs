@@ -81,6 +81,13 @@ requester_resolutions_burst = 25
 # Checking a member's sign-in token may need its identity document. Part of
 # the PLC budget is kept for that, and one member can use it this often.
 member_pool_refresh_secs = 600
+# Looking up which account a handle (a name like alice.example.com) belongs
+# to: how many answers are remembered, and for how many seconds. A found
+# account is remembered longer than "no such handle"; a lookup that failed
+# is never remembered.
+resolve_handle_cache_max = 100000
+resolve_handle_ttl_secs = 300
+resolve_handle_negative_ttl_secs = 60
 
 [kryphocron]
 oracle_freshness_bound_secs = 120

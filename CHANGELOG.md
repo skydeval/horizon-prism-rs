@@ -12,6 +12,17 @@ commit.
 
 ### Added
 
+- **Item 15: `com.atproto.identity.resolveHandle` (#675).** The account a
+  handle belongs to. Bad syntax is refused before anything is looked up.
+  An indexed account's stored handle is answered at once. Otherwise the
+  handle's DNS record and its well-known file are both asked, and the
+  account found must name the handle back. "No such handle" is
+  `HandleNotFound`; a lookup that could not be completed is
+  `502 UpstreamFailure`, never mistaken for "not found". Answers are
+  remembered (`[identity] resolve_handle_cache_max`,
+  `resolve_handle_ttl_secs`, `resolve_handle_negative_ttl_secs`); a failed
+  lookup never is. Counted in `handle_resolutions_total{result}`
+  (design-v3 §5.11).
 - **Item 15: `app.bsky.labeler.getServices` (#675).** The labeling
   services an app asks about: stored ones from local rows, any other
   from its service record through Slingshot. Each view carries its

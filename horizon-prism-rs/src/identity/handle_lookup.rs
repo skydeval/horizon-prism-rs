@@ -26,6 +26,19 @@ use crate::net::{BodyCap, NetClient, NetError, RequestOptions};
 const WELL_KNOWN_BODY_CAP: BodyCap = BodyCap(2048);
 const WELL_KNOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// What resolving a handle came to, after the DID it names was checked to
+/// name the handle back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandleOutcome {
+    /// The handle's DID.
+    Found(String),
+    /// There is no such handle: both places name no DID, or the DID named
+    /// does not claim the handle.
+    NotFound,
+    /// It could not be found out now (a failure, or no budget for it).
+    Unavailable,
+}
+
 /// How one lookup ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {

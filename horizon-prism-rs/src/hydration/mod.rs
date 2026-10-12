@@ -19,6 +19,7 @@ pub mod emit;
 pub mod feed;
 pub mod graph;
 pub mod hint;
+pub mod identity;
 pub mod labelers;
 pub mod labels;
 pub mod lens;
@@ -71,6 +72,10 @@ pub enum HydrationError {
     /// (design-v3 §II-8.3): `429 RateLimitExceeded`, never an empty page.
     #[error("no upstream budget for this request")]
     NoBudget(Exhausted),
+    /// What the request needs from another server could not be had now,
+    /// and nothing shows it is absent: `502 UpstreamFailure`.
+    #[error("an upstream lookup could not be completed")]
+    Upstream,
 }
 
 /// A lexicon-level failure a handler returns as a 400.

@@ -56,6 +56,17 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if !(60..=2_592_000).contains(&cfg.notifications.subscribed_post_max_age_secs) {
         out.push("notifications.subscribed_post_max_age_secs must be 60 to 2592000".to_string());
     }
+    if cfg.identity.resolve_handle_cache_max == 0 {
+        out.push("identity.resolve_handle_cache_max must be at least 1".to_string());
+    }
+    for (name, secs) in [
+        ("resolve_handle_ttl_secs", cfg.identity.resolve_handle_ttl_secs),
+        ("resolve_handle_negative_ttl_secs", cfg.identity.resolve_handle_negative_ttl_secs),
+    ] {
+        if !(1..=86_400).contains(&secs) {
+            out.push(format!("identity.{name} must be 1 to 86400"));
+        }
+    }
     if !(1..=1000).contains(&cfg.labelers.get_services_max_dids) {
         out.push("labelers.get_services_max_dids must be 1 to 1000".to_string());
     }

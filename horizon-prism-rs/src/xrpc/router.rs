@@ -249,6 +249,7 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(labels::QUERY_LABELS), get(labels::query_labels))
         .route(&xrpc(labels::GET_SERVICES), get(labels::get_services))
         .route(&xrpc(repo::GET_RECORD), get(repo::get_record))
+        .route(&xrpc(repo::RESOLVE_HANDLE), get(repo::resolve_handle))
         .route(&xrpc(feed::GET_ACTOR_LIKES), get(feed::get_actor_likes))
         .route(&xrpc(feed::GET_AUTHOR_POLLS), get(feed::get_author_polls))
         .route(&xrpc(notifications::LIST_ACTIVITY_SUBSCRIPTIONS), get(notifications::list_activity_subscriptions))

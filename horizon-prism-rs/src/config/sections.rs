@@ -189,6 +189,11 @@ pub struct IdentityConfig {
     /// How often one member's DID may be resolved from the issuer-refresh
     /// slice of PLC's member pool.
     pub member_pool_refresh_secs: u64,
+    /// `resolveHandle`'s cache (design-v3 §5.11): how many answers it
+    /// keeps, and for how long a DID and a "no such handle" each.
+    pub resolve_handle_cache_max: u64,
+    pub resolve_handle_ttl_secs: u64,
+    pub resolve_handle_negative_ttl_secs: u64,
 }
 
 impl Default for IdentityConfig {
@@ -203,6 +208,9 @@ impl Default for IdentityConfig {
             requester_resolutions_per_sec: Float(5.0),
             requester_resolutions_burst: 25,
             member_pool_refresh_secs: 600,
+            resolve_handle_cache_max: 100_000,
+            resolve_handle_ttl_secs: 300,
+            resolve_handle_negative_ttl_secs: 60,
         }
     }
 }

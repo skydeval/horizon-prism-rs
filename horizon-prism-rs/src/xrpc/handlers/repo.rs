@@ -1,4 +1,5 @@
-//! `com.atproto.repo.getRecord` (public): stored public records only.
+//! `com.atproto.repo.getRecord` (public): stored public records only; and
+//! `com.atproto.identity.resolveHandle` (public).
 
 use std::net::SocketAddr;
 
@@ -10,6 +11,18 @@ use crate::xrpc::AppState;
 use crate::xrpc::auth::{Access, Params, prepare};
 
 pub const GET_RECORD: &str = "com.atproto.repo.getRecord";
+pub const RESOLVE_HANDLE: &str = "com.atproto.identity.resolveHandle";
+
+pub async fn resolve_handle(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, RESOLVE_HANDLE, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(&req.req, s.hydrator.resolve_handle(&req.req, p.required("handle")?).await)
+}
 
 pub async fn get_record(
     State(s): State<AppState>,
