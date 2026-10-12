@@ -234,6 +234,31 @@ pub struct PostRow {
     pub quote_count: Option<i32>,
 }
 
+/// Blocks a request knows beyond what local rows show (design-v3
+/// §5.15.12). Thread Lens judges every author with Farsight's help and
+/// supplies the result here, so that every view built for the request
+/// (profiles, posts, embeds, upstream views) applies the same blocks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KnownBlocks {
+    /// Authors the viewer blocks.
+    pub by_viewer: HashSet<String>,
+    /// Authors that block the viewer.
+    pub of_viewer: HashSet<String>,
+}
+
+tokio::task_local! {
+    static KNOWN_BLOCKS: Arc<KnownBlocks>;
+}
+
+/// Run `work` with `blocks` applied by every `actor_viewer` call it makes.
+pub async fn with_known_blocks<F: std::future::Future>(blocks: Arc<KnownBlocks>, work: F) -> F::Output {
+    KNOWN_BLOCKS.scope(blocks, work).await
+}
+
+fn known_blocks() -> Option<Arc<KnownBlocks>> {
+    KNOWN_BLOCKS.try_with(Arc::clone).ok()
+}
+
 /// A locally servable list, for a `listViewBasic`: uri, cid, name,
 /// purpose, avatar CID, indexed time, and its creator's PDS.
 type LocalListRow = (String, String, String, String, Option<String>, DateTime<Utc>, Option<String>);
@@ -253,6 +278,10 @@ pub struct ActorViewer {
     pub followed_by: HashMap<String, String>,
     pub blocking: HashMap<String, String>,
     pub blocked_by: HashSet<String>,
+    /// Subjects the viewer blocks by a block this AppView holds no record
+    /// of (one Farsight reported). It applies as a block; `viewer.blocking`
+    /// needs a record URI and is not emitted for it.
+    pub blocking_unrecorded: HashSet<String>,
     /// Subjects that are fully muted: by a `full` direct mute, or by a list
     /// mute of the viewer's that applies.
     pub muted: HashSet<String>,
@@ -317,7 +346,10 @@ impl ActorViewer {
     /// or the viewer's own list block that applies.
     #[must_use]
     pub fn blocked_either_way(&self, did: &str) -> bool {
-        self.blocking.contains_key(did) || self.blocked_by.contains(did) || self.blocking_by_list.contains_key(did)
+        self.blocking.contains_key(did)
+            || self.blocked_by.contains(did)
+            || self.blocking_by_list.contains_key(did)
+            || self.blocking_unrecorded.contains(did)
     }
 }
 
@@ -632,6 +664,19 @@ impl Hydrator {
             }
         }
         out.list_views = self.local_list_basics(me, out.muted_by_list.values().chain(out.blocking_by_list.values())).await?;
+        // Blocks the request itself knows (Thread Lens, §5.15.12). The
+        // direction is the one the request found, not a guess from which
+        // source spoke.
+        if let Some(known) = known_blocks() {
+            for did in dids.iter().filter(|did| did.as_str() != me) {
+                if known.of_viewer.contains(did) {
+                    out.blocked_by.insert(did.clone());
+                }
+                if known.by_viewer.contains(did) && !out.blocking.contains_key(did) {
+                    out.blocking_unrecorded.insert(did.clone());
+                }
+            }
+        }
         Ok(out)
     }
 

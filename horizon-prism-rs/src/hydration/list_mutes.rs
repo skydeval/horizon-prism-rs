@@ -289,6 +289,22 @@ mod tests {
         // Nobody else's view is touched by Alice's references.
         let bob = h.actor_viewer(&Viewer { did: Some(BOB.into()), hydrate: true }, &[CAROL.to_string()]).await.expect("viewer");
         assert!(!bob.muted.contains(CAROL) && !bob.blocked_either_way(CAROL));
+
+        // Blocks a request knows beyond local rows (Thread Lens) apply to
+        // every view it builds, in the direction it found them. A block
+        // with no record here hides, and carries no `blocking` URI.
+        let known = std::sync::Arc::new(crate::hydration::KnownBlocks {
+            by_viewer: [CAROL.to_string()].into(),
+            of_viewer: [BOB.to_string(), ALICE.to_string()].into(),
+        });
+        let s = crate::hydration::with_known_blocks(known, h.actor_viewer(&me, &[CAROL.to_string(), BOB.to_string(), ALICE.to_string()]))
+            .await
+            .expect("viewer");
+        assert!(s.blocked_either_way(CAROL) && s.blocked_either_way(BOB) && !s.blocked_either_way(ALICE));
+        assert!(s.view(CAROL).get("blocking").is_none());
+        assert_eq!((&s.view(CAROL)["blockedBy"], &s.view(BOB)["blockedBy"]), (&json!(false), &json!(true)));
+        // Outside such a request nothing of it remains.
+        assert!(!state().await.blocked_either_way(BOB));
         db.drop_db().await;
     }
 

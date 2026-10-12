@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 12a: one set of blocks for a whole request (#674).** A request
+  can supply the blocks it knows beyond local rows
+  (`hydration::with_known_blocks`), and every view built for it
+  (profiles, posts, embeds, upstream views) then applies them, in the
+  direction found. A block with no record here hides its author and
+  carries no `viewer.blocking` URI. Thread Lens will supply its verdicts
+  this way (design-v3 §5.15.12).
 - **Item 12a: Thread Lens verdicts (#674).** `threadlens::verdict`
   decides, for the viewer and each author, one of "you block them",
   "they block you", "clear" and "cannot say", from the viewer's own
