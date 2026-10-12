@@ -866,6 +866,13 @@ commit.
 
 ### Changed
 
+- **Item 15: host names are looked up fully qualified (#675).** Every
+  outbound DNS lookup now asks for the name with a trailing dot, so the
+  resolver never retries it with a search domain. Inside Docker that
+  retry could turn a DNS server failure into "no such name". An address
+  is not looked up at all, as before. Groundwork for `resolveHandle`:
+  `identity::handle_lookup` sorts a handle's DNS record and well-known
+  file into found, confirmed absent, or try again (design-v3 §5.11).
 - `getTimeline` does the same as `listNotifications` below: it hydrates
   every scanned item and applies the viewer's mutes and blocks afterwards.
 - `listNotifications` hydrates every row it scans and applies the viewer's

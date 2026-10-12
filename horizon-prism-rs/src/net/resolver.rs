@@ -140,12 +140,70 @@ impl HickoryLookup {
     }
 }
 
+/// What a TXT lookup found, as far as its caller needs to tell apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxtAnswer {
+    /// The TXT records of the name, each with its strings joined.
+    Records(Vec<String>),
+    /// The name does not exist, or has no TXT record (NXDOMAIN, NODATA).
+    NoSuchName,
+    /// Anything else: a timeout, SERVFAIL, REFUSED. Says nothing about
+    /// the name.
+    Failed,
+}
+
+/// Whether a lookup failed because the name does not exist or has no
+/// record of the type asked for.
+#[must_use]
+pub fn no_such_name(error: &hickory_resolver::net::NetError) -> bool {
+    use hickory_resolver::net::{DnsError, NetError};
+    use hickory_resolver::proto::op::ResponseCode;
+
+    matches!(
+        error,
+        NetError::Dns(DnsError::NoRecordsFound(none)) if matches!(none.response_code, ResponseCode::NXDomain | ResponseCode::NoError)
+    )
+}
+
+/// `host` as a fully qualified name, so the resolver never retries it with
+/// a search domain (which can turn a server failure into "no such name").
+/// An address is left as it is.
+fn fully_qualified(host: &str) -> String {
+    if host.ends_with('.') || host.parse::<IpAddr>().is_ok() {
+        host.to_string()
+    } else {
+        format!("{host}.")
+    }
+}
+
+impl HickoryLookup {
+    /// The TXT records of `name`, asked as a fully qualified name.
+    pub async fn txt(&self, name: &str) -> TxtAnswer {
+        use hickory_resolver::proto::rr::RData;
+
+        match self.resolver.txt_lookup(fully_qualified(name)).await {
+            Ok(lookup) => TxtAnswer::Records(
+                lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|record| match &record.data {
+                        RData::TXT(txt) => Some(txt.txt_data.iter().map(|part| String::from_utf8_lossy(part)).collect::<String>()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            Err(error) if no_such_name(&error) => TxtAnswer::NoSuchName,
+            Err(_) => TxtAnswer::Failed,
+        }
+    }
+}
+
 impl HostLookup for HickoryLookup {
     fn lookup(&self, host: String) -> BoxFuture<'static, Result<Vec<IpAddr>, BoxError>> {
         let resolver = self.resolver.clone();
         Box::pin(async move {
             let lookup = resolver
-                .lookup_ip(host.as_str())
+                .lookup_ip(fully_qualified(&host))
                 .await
                 .map_err(|e| Box::new(e) as BoxError)?;
             let ips: Vec<IpAddr> = lookup.iter().collect();
