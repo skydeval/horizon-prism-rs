@@ -25,7 +25,7 @@ pub use sections::{
     FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
     KryphocronConfig, LOCAL_APPVIEW, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig,
     PrivateReadConfig, PrivateReadFloors, PublicScope, RateClassConfig, RateLimitsConfig,
-    RetentionConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
+    RetentionConfig, SchemaBackfillConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
     SyncConfig, ThreadConfig, UtcTimeOfDay,
 };
 pub use validate::{OTHER_RELAY_LABEL, pds_pattern};

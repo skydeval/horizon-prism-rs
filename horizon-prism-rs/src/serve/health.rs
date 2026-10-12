@@ -27,6 +27,7 @@ use redis::aio::ConnectionManager;
 use serde::Serialize;
 use sqlx::PgPool;
 
+use crate::db::schema_backfill::SchemaStatus;
 use crate::firehose::consumer::ConsumerStatus;
 use crate::firehose::watermark::Watermarks;
 use crate::xrpc::errors::XrpcError;
@@ -72,6 +73,8 @@ pub struct HealthState {
     pub limits: RateLimits,
     /// `http.trusted_proxy` (§7.4).
     pub trusted_proxy: IpAddr,
+    /// The post-migration task's progress (design-v3 §12.2).
+    pub schema: SchemaStatus,
 }
 
 /// The anonymous response body.
@@ -101,6 +104,11 @@ pub struct Health {
     pub watermarks: BTreeMap<String, Option<String>>,
     pub private_watermark: Option<String>,
     pub gap_blocked: bool,
+    /// The column backfill has visited every old row. Until then search
+    /// and trends are incomplete for old rows.
+    pub schema_backfill_done: bool,
+    /// Every search index is built. Until then search runs degraded.
+    pub search_indexes_ready: bool,
 }
 
 fn rfc3339(t: DateTime<Utc>) -> String {
@@ -109,7 +117,7 @@ fn rfc3339(t: DateTime<Utc>) -> String {
 
 /// Assemble the body from probe results.
 #[must_use]
-pub fn body(db: bool, redis: bool, audit_ok: bool, watermarks: &Watermarks, gap_blocked: bool) -> Health {
+pub fn body(db: bool, redis: bool, audit_ok: bool, watermarks: &Watermarks, gap_blocked: bool, schema: &SchemaStatus) -> Health {
     Health {
         ok: db && redis && audit_ok,
         version: env!("CARGO_PKG_VERSION"),
@@ -123,6 +131,8 @@ pub fn body(db: bool, redis: bool, audit_ok: bool, watermarks: &Watermarks, gap_
             .collect(),
         private_watermark: watermarks.private_watermark().map(rfc3339),
         gap_blocked,
+        schema_backfill_done: schema.backfill_done(),
+        search_indexes_ready: schema.indexes_ready(),
     }
 }
 
@@ -161,7 +171,7 @@ async fn health(State(state): State<HealthState>, ConnectInfo(peer): ConnectInfo
         probe_db(&state.pool),
         probe_redis(&state.redis)
     );
-    let h = body(db, redis, !state.audit.latched(), &state.watermarks, state.status.gap_blocked());
+    let h = body(db, redis, !state.audit.latched(), &state.watermarks, state.status.gap_blocked(), &state.schema);
     let code = if h.ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     if detail {
         (code, Json(h)).into_response()
@@ -192,13 +202,16 @@ mod tests {
         let w = marks();
         let t = DateTime::parse_from_rfc3339("2026-09-26T12:00:00Z").expect("t").with_timezone(&Utc);
         w.observe("bsky", t);
-        let h = body(true, true, true, &w, false);
+        let schema = SchemaStatus::default();
+        let h = body(true, true, true, &w, false, &schema);
         assert!(h.ok);
         let json = serde_json::to_value(&h).expect("json");
         assert_eq!(json["watermarks"]["bsky"], "2026-09-26T12:00:00.000Z");
         assert!(json["watermarks"]["microcosm"].is_null());
         assert!(json["private_watermark"].is_null());
         assert_eq!(json["gap_blocked"], false);
+        // An unfinished backfill is reported and does not fail health.
+        assert_eq!((&json["schema_backfill_done"], &json["search_indexes_ready"]), (&false.into(), &false.into()));
         for key in ["ok", "version", "db", "redis", "audit_ok", "watermarks", "private_watermark", "gap_blocked"] {
             assert!(json.get(key).is_some(), "{key}");
         }
@@ -207,13 +220,14 @@ mod tests {
     #[test]
     fn unhealthy_when_any_dependency_fails_or_audit_latches() {
         let w = marks();
-        assert!(!body(false, true, true, &w, false).ok);
-        assert!(!body(true, false, true, &w, false).ok);
+        let s = SchemaStatus::default();
+        assert!(!body(false, true, true, &w, false, &s).ok);
+        assert!(!body(true, false, true, &w, false, &s).ok);
         let latch = AuditLatch::default();
         latch.latch();
-        assert!(!body(true, true, !latch.latched(), &w, false).ok);
+        assert!(!body(true, true, !latch.latched(), &w, false, &s).ok);
         // A held gap is reported but does not fail health.
-        assert!(body(true, true, true, &w, true).ok);
+        assert!(body(true, true, true, &w, true, &s).ok);
     }
 
     /// Anonymous and invalid-token callers get `{ok, version}`; a verifying
@@ -245,6 +259,7 @@ mod tests {
             auth: Arc::new(auth),
             limits: RateLimits::new(),
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
+            schema: SchemaStatus::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");

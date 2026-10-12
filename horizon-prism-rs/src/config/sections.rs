@@ -743,6 +743,39 @@ impl PartialEq for Float {
 
 impl Eq for Float {}
 
+/// `[schema_backfill]`: the post-migration column backfill (design-v3 §12.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchemaBackfillConfig {
+    /// Rows per batch.
+    pub batch_size: u32,
+    /// Pause between batches.
+    pub pause_ms: u64,
+}
+
+impl Default for SchemaBackfillConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 10_000,
+            pause_ms: 100,
+        }
+    }
+}
+
+/// `[schema_index]`: the post-migration index builds (design-v3 §12.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchemaIndexConfig {
+    /// The first wait after a failed build; it doubles up to an hour.
+    pub retry_backoff_secs: u64,
+}
+
+impl Default for SchemaIndexConfig {
+    fn default() -> Self {
+        Self { retry_backoff_secs: 300 }
+    }
+}
+
 /// `[thread]`: bounds on one thread response (design-v3 §5.1).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -906,6 +939,8 @@ pub struct FileConfig {
     pub rate_limits: RateLimitsConfig,
     pub auth: AuthConfig,
     pub thread: ThreadConfig,
+    pub schema_backfill: SchemaBackfillConfig,
+    pub schema_index: SchemaIndexConfig,
     pub features: FeaturesConfig,
     pub honest_501: Honest501Config,
     pub services: BTreeMap<String, ServiceConfig>,

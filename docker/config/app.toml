@@ -254,6 +254,19 @@ global = { per_sec = 100.0, burst = 200 }
 service_proxy_member = { per_sec = 5.0, burst = 20 }
 service_proxy_ip = { per_sec = 10.0, burst = 20 }
 
+# After an upgrade, a background task fills new columns for rows written
+# before it (in batches, with a pause between them), then builds the large
+# search indexes one at a time without blocking writes. Until it finishes,
+# search and trends are incomplete for old posts. `_health` detail shows
+# schema_backfill_done and search_indexes_ready.
+[schema_backfill]
+batch_size = 10000
+pause_ms = 100
+
+[schema_index]
+# First wait after a failed index build; it doubles up to an hour.
+retry_backoff_secs = 300
+
 # Bounds on one thread view: posts shown in total, replies asked of
 # Constellation per post, and posts fetched from Slingshot because they are
 # not stored here.

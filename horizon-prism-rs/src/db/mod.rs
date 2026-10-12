@@ -10,6 +10,7 @@ pub mod migrations;
 pub mod pool;
 pub mod retention;
 pub mod sampler;
+pub mod schema_backfill;
 
 pub use migrations::{
     GateError, GateOutcome, GatePlan, MIGRATION_GATE_EXIT_CODE, MIGRATOR, enforce_gate,

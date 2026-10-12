@@ -251,6 +251,13 @@ member_verify_burst = 400
 max_nodes = 200
 constellation_replies_per_node = 50
 max_remote_fetches = 100
+
+[schema_backfill]
+batch_size = 10000
+pause_ms = 100
+
+[schema_index]
+retry_backoff_secs = 300
 "#;
 
 #[test]

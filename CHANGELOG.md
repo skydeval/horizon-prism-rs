@@ -82,6 +82,28 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 11: the post-migration backfill task (#671).** `serve` starts a
+  background task once migrations are applied (design-v3 §12.2).
+  - Phase 1 fills the new `posts` columns from each stored record, and the
+    new profile columns of `actors`, in keyset batches
+    (`schema_backfill.batch_size`, default 10 000, with
+    `schema_backfill.pause_ms`, default 100, between them). A batch only
+    touches rows still unfilled whose `cid` (or profile rev) is the one it
+    read, so it never overwrites what the writer stored meanwhile. Progress
+    is kept in `worker_state`, so a restart resumes.
+  - Phase 2 then builds `posts_search`, `posts_tags`, `posts_domains`,
+    `posts_urls`, `posts_mentions`, `posts_langs`, `posts_created`,
+    `likes_via` and `reposts_via`, one at a time, with
+    `CREATE INDEX CONCURRENTLY` on a connection of its own with no lock or
+    statement timeout. An invalid index left by an interrupted build is
+    waited for while a backend still builds it and dropped otherwise. A
+    failed build is retried after `schema_index.retry_backoff_secs`
+    (default 300), doubling up to an hour.
+  - `_health` detail gains `schema_backfill_done` and
+    `search_indexes_ready`. Metrics: `schema_backfill_remaining{table}`,
+    `schema_index_pending`, `schema_index_build_failures_total{index}`.
+  Expect the `posts` heap and its indexes to grow, up to about twice,
+  while phase 1 rewrites old rows.
 - **Item 11: twelve more collections are indexed (#671).** Lists, list
   items, list blocks, reference-list opt-outs, starter packs, labeler
   declarations, the notification declaration, actor status and

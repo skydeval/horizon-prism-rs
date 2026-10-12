@@ -21,6 +21,7 @@ use crate::aggregations::counts::CountRefresher;
 use crate::aggregations::{PurgeLifecycle, Purger, Rebuild, ScopeState};
 use crate::config::AppConfig;
 use crate::db::retention::{PublicRetention, RetentionInputs, RetentionSettings, RetentionTask, spawn_scheduler};
+use crate::db::schema_backfill::{self, SchemaBackfill};
 use crate::db::{GateError, ScopeGuard, StorageSampler, enforce_gate};
 use crate::admin_executor::{AdminExecutor, Handlers};
 use crate::firehose::backfill::{Backfill, BackfillSource, NetSource};
@@ -409,6 +410,12 @@ pub async fn run() -> Result<(), StartupError> {
         usize::try_from(cfg.file.sync.max_head_fetches_per_request).unwrap_or(16),
         &cfg.file.private_read,
     );
+    // The post-migration task (design-v3 §12.2): every migration is applied
+    // and ingest is running, so old rows can be filled and the large
+    // indexes built while the app serves.
+    let schema_backfill = SchemaBackfill::new(pool.clone(), schema_backfill::Settings::from_config(&cfg.file));
+    let schema_status = schema_backfill.status();
+    tasks.push(schema_backfill.spawn());
     let state = HealthState {
         pool: pool.clone(),
         redis,
@@ -418,6 +425,7 @@ pub async fn run() -> Result<(), StartupError> {
         auth: app.auth.clone(),
         limits: app.limits.clone(),
         trusted_proxy: app.trusted_proxy,
+        schema: schema_status,
     };
     let listener = TcpListener::bind(cfg.file.http.bind)
         .await
