@@ -23,6 +23,7 @@ pub mod did;
 pub mod fallback;
 pub mod gate;
 pub mod lookup;
+pub mod memory;
 
 pub use answer::{ChunkAnswer, Coverage, PairAnswer, Relation};
 pub use client::{CallError, FarsightClient};
