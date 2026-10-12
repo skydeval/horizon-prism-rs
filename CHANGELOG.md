@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 12a: a second way to read Farsight (#674).** The `farsight`
+  module can now return, for a viewer and a set of accounts, the whole
+  answer per pair (a direct or list block in either direction, and
+  whether Farsight vouches for it) and the coverage level of each call,
+  under a call and time budget the caller brings. It shares the cache
+  with ordinary views, so a page render and a Thread Lens request for
+  the same pair cost one lookup. Nothing calls it yet (design-v3
+  §5.14.9).
 - **Item 12a: Thread Lens v2 settings (#674).** A `[threadlens]`
   section with `page_nodes` (200), `listing_calls` (60),
   `verdict_round_timeout_ms` (500), `parent_rounds` (8) and

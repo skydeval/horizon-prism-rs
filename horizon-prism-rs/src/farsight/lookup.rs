@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, join_all};
 
-use super::answer::PairAnswer;
+use super::answer::{Coverage, PairAnswer};
 use super::chunks::{chunks, halves};
 use super::client::{CallError, FarsightClient};
 use super::did::canonical;
@@ -322,6 +322,32 @@ impl std::fmt::Debug for Lookup {
 /// An asked account with its answer, or `None` for "no answer".
 type Outcome = (String, Option<PairAnswer>);
 
+/// What one `checkBlocks` call (or its two halves) gave: an outcome per
+/// asked account, and the coverage level of each answered response.
+#[derive(Debug, Default)]
+struct Called {
+    outcomes: Vec<Outcome>,
+    levels: Vec<Coverage>,
+}
+
+/// What a caller with budgets of its own may spend on one lookup
+/// (design-v3 §5.14.9): Thread Lens brings its own, per verdict round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairBudget {
+    /// `checkBlocks` calls, at most.
+    pub max_calls: u32,
+    /// How long the calls may take together, and each alone.
+    pub timeout: Duration,
+}
+
+/// The pair answers of one lookup, keyed as the caller spelled the
+/// accounts, and the coverage level of each call that was answered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PairAnswers {
+    pub answers: HashMap<String, PairAnswer>,
+    pub levels: Vec<Coverage>,
+}
+
 impl Lookup {
     /// From here on this request answers from the viewer's cache only and
     /// makes no call. For a listing whose accounts come from the viewer's
@@ -422,10 +448,11 @@ impl Lookup {
                 (plan, state.allowance)
             };
             let started = Instant::now();
-            let outcomes: Vec<Outcome> = join_all(plan.into_iter().map(|chunk| self.call(&canonical_actor, chunk, allowance, started, true)))
+            let per_call = inner.settings.timeout;
+            let outcomes: Vec<Outcome> = join_all(plan.into_iter().map(|chunk| self.call(&canonical_actor, chunk, allowance, started, true, per_call)))
                 .await
                 .into_iter()
-                .flatten()
+                .flat_map(|called| called.outcomes)
                 .collect();
             {
                 let mut state = self.state();
@@ -492,10 +519,11 @@ impl Lookup {
             (plan, state.allowance)
         };
         let started = Instant::now();
-        let outcomes: Vec<Outcome> = join_all(plan.into_iter().map(|chunk| self.call(actor, chunk, allowance, started, true)))
+        let per_call = inner.settings.timeout;
+        let outcomes: Vec<Outcome> = join_all(plan.into_iter().map(|chunk| self.call(actor, chunk, allowance, started, true, per_call)))
             .await
             .into_iter()
-            .flatten()
+            .flat_map(|called| called.outcomes)
             .collect();
         let now = Instant::now();
         let mut state = self.state();
@@ -513,15 +541,117 @@ impl Lookup {
         found
     }
 
+    /// The second reader's entry point (design-v3 §5.14.9): the pair
+    /// answers, both directions, for `others` as seen from `viewer`, with
+    /// the coverage level of each call. Thread Lens reads them under its
+    /// own rules, with the budget it brings.
+    ///
+    /// - It shares the request's memo and the viewer's cache with the
+    ///   ordinary reader. An entry is used when it vouches or names a
+    ///   block; one that does neither is asked about again.
+    /// - A DID outside Farsight's grammar gets an answer with no block
+    ///   that does not vouch.
+    /// - Nothing is removed from `others`: not accounts with a direct
+    ///   block, and not `viewer` itself, which a caller may include to
+    ///   read the level of a call when nobody else is asked about. There
+    ///   is no pair answer for `viewer`.
+    /// - `force` names one account that is asked about although an entry
+    ///   for it is held.
+    pub async fn pair_answers(&self, viewer: &str, others: &[String], budget: PairBudget, force: Option<&str>) -> PairAnswers {
+        let mut out = PairAnswers::default();
+        let Some(actor) = canonical(viewer) else {
+            return out;
+        };
+        let inner = &self.farsight.inner;
+        let forced = force.and_then(canonical);
+        let mut wanted: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for did in others {
+            match canonical(did) {
+                Some(c) => {
+                    if seen.insert(c.clone()) {
+                        wanted.push(c);
+                    }
+                }
+                None => {
+                    out.answers.insert(did.clone(), PairAnswer::clean(false));
+                }
+            }
+        }
+        let mut found: HashMap<String, PairAnswer> = HashMap::new();
+        let mut ask: Vec<String> = Vec::new();
+        {
+            let now = Instant::now();
+            let state = self.state();
+            let mut cache = self.farsight.cache();
+            for other in &wanted {
+                if *other == actor || forced.as_ref() == Some(other) {
+                    ask.push(other.clone());
+                    continue;
+                }
+                let held = state.memo.get(other).cloned().flatten().or_else(|| cache.get(&actor, other, now));
+                match held {
+                    Some(answer) if answer.vouched || answer.any_block() => {
+                        found.insert(other.clone(), answer);
+                    }
+                    _ => ask.push(other.clone()),
+                }
+            }
+        }
+        if !ask.is_empty() && !self.cache_only.load(Ordering::Relaxed) {
+            let mut plan = chunks(&actor, &ask);
+            plan.truncate(usize::try_from(budget.max_calls).unwrap_or(usize::MAX));
+            let started = Instant::now();
+            let called = join_all(plan.into_iter().map(|chunk| self.call(&actor, chunk, budget.timeout, started, true, budget.timeout))).await;
+            let now = Instant::now();
+            let mut state = self.state();
+            let mut cache = self.farsight.cache();
+            for call in called {
+                out.levels.extend(call.levels);
+                for (other, outcome) in call.outcomes {
+                    if other == actor {
+                        continue;
+                    }
+                    // As in the ordinary reader: the merged entry, so a
+                    // block the cache already named is not lost to an
+                    // answer that does not vouch.
+                    if let Some(answer) = outcome {
+                        let merged = cache.write(&actor, &other, &answer, now, &inner.settings);
+                        state.memo.insert(other.clone(), Some(merged.clone()));
+                        found.insert(other, merged);
+                    }
+                }
+            }
+        }
+        for did in others {
+            if let Some(c) = canonical(did)
+                && c != actor
+                && let Some(answer) = found.get(&c)
+            {
+                out.answers.insert(did.clone(), answer.clone());
+            }
+        }
+        out
+    }
+
     /// One `checkBlocks` call for `chunk`, within what is left of
-    /// `allowance` since `started`. An answer over the response cap is asked
-    /// again once, as two halves (`split`).
-    fn call<'a>(&'a self, actor: &'a str, chunk: Vec<String>, allowance: Duration, started: Instant, split: bool) -> BoxFuture<'a, Vec<Outcome>> {
+    /// `allowance` since `started`, and no longer than `per_call`. An
+    /// answer over the response cap is asked again once, as two halves
+    /// (`split`).
+    fn call<'a>(
+        &'a self,
+        actor: &'a str,
+        chunk: Vec<String>,
+        allowance: Duration,
+        started: Instant,
+        split: bool,
+        per_call: Duration,
+    ) -> BoxFuture<'a, Called> {
         Box::pin(async move {
             let inner = &self.farsight.inner;
             let none = |chunk: Vec<String>, outcome: &'static str| {
                 metrics::counter!(METRIC_CALLS, "outcome" => outcome).increment(1);
-                chunk.into_iter().map(|did| (did, None)).collect::<Vec<Outcome>>()
+                Called { outcomes: chunk.into_iter().map(|did| (did, None)).collect(), levels: Vec::new() }
             };
             // The admission is the probe-slot guard: dropped on any exit
             // below without a recorded outcome, it gives the slot back.
@@ -541,8 +671,8 @@ impl Lookup {
             // passed since `started`, so what remains is never the whole.
             // A half asked again after an over-cap answer (`!split`) only
             // has what the first call left, so it is never the whole.
-            let whole = split && allowance >= inner.settings.timeout;
-            match inner.client.check_blocks(actor, &chunk, remaining.min(inner.settings.timeout)).await {
+            let whole = split && allowance >= per_call;
+            match inner.client.check_blocks(actor, &chunk, remaining.min(per_call)).await {
                 Ok(mut answer) => {
                     admission.record(Class::Hit, Instant::now());
                     metrics::counter!(METRIC_CALLS, "outcome" => "ok").increment(1);
@@ -550,10 +680,14 @@ impl Lookup {
                     for reason in std::mem::take(&mut answer.partial_reasons) {
                         metrics::counter!(METRIC_PARTIAL, "reason" => reason).increment(1);
                     }
-                    chunk.into_iter().map(|did| {
-                        let pair = answer.pairs.remove(&did);
-                        (did, pair)
-                    }).collect()
+                    let outcomes = chunk
+                        .into_iter()
+                        .map(|did| {
+                            let pair = answer.pairs.remove(&did);
+                            (did, pair)
+                        })
+                        .collect();
+                    Called { outcomes, levels: vec![answer.coverage] }
                 }
                 Err(CallError::TooLarge) => {
                     // Big, not failing: not recorded by the breaker.
@@ -561,10 +695,16 @@ impl Lookup {
                     metrics::counter!(METRIC_CALLS, "outcome" => "too_large").increment(1);
                     match halves(&chunk).filter(|_| split) {
                         Some((a, b)) => {
-                            let (a, b) = futures::join!(self.call(actor, a, allowance, started, false), self.call(actor, b, allowance, started, false));
-                            a.into_iter().chain(b).collect()
+                            let (a, b) = futures::join!(
+                                self.call(actor, a, allowance, started, false, per_call),
+                                self.call(actor, b, allowance, started, false, per_call)
+                            );
+                            Called {
+                                outcomes: a.outcomes.into_iter().chain(b.outcomes).collect(),
+                                levels: a.levels.into_iter().chain(b.levels).collect(),
+                            }
                         }
-                        None => chunk.into_iter().map(|did| (did, None)).collect(),
+                        None => Called { outcomes: chunk.into_iter().map(|did| (did, None)).collect(), levels: Vec::new() },
                     }
                 }
                 Err(error) => {
@@ -703,6 +843,49 @@ pub(crate) mod tests {
         let before = farsight.cached();
         farsight.forget(V);
         assert_eq!(farsight.cached(), before - 3);
+    }
+
+    /// design-v3 §5.14.9: the second reader gets whole pair answers and
+    /// the level of each call, under a budget of its own; it shares the
+    /// cache with the ordinary reader, asks again about a pair that
+    /// neither vouches nor names a block, and may force one call.
+    #[tokio::test]
+    async fn the_second_reader_gets_pair_answers_and_levels() {
+        let (farsight, fake) = engine("").await;
+        fake.blockers.lock().expect("blockers").insert(A.to_string());
+        let budget = PairBudget { max_calls: 2, timeout: Duration::from_millis(500) };
+        let request = farsight.request(&member());
+        let got = request.pair_answers(V, &page(&[A, B, "did:example:odd"]), budget, None).await;
+        assert_eq!(got.levels, [Coverage::parse(Some("complete"))]);
+        assert_eq!(got.answers[A].inbound.list.as_deref(), Some(LIST));
+        assert!(got.answers[A].vouched && got.answers[B].vouched && !got.answers[B].any_block());
+        // A DID outside Farsight's grammar: no block, not vouched, not sent.
+        assert!(!got.answers["did:example:odd"].vouched);
+        assert_eq!(fake.asked.lock().expect("asked")[0], [A, B]);
+        // Held now: no call, for this reader or the ordinary one.
+        let again = farsight.request(&member());
+        assert_eq!(again.pair_answers(V, &page(&[A, B]), budget, None).await.answers.len(), 2);
+        again.inbound_list_blocks(V, &page(&[A, B]), &HashSet::new()).await;
+        assert_eq!(calls(&fake), 1);
+        // The viewer may be put among the others, to read a call's level:
+        // it is sent, and has no pair answer. One account can be forced.
+        let level = again.pair_answers(V, &page(&[V]), budget, None).await;
+        assert!(level.answers.is_empty() && level.levels.len() == 1);
+        again.pair_answers(V, &page(&[A, B]), budget, Some(B)).await;
+        assert_eq!(fake.asked.lock().expect("asked")[2], [B]);
+
+        // An answer that does not vouch and names no block is asked about
+        // again; a block it names is kept.
+        *fake.level.lock().expect("level") = "partial";
+        let request = farsight.request(&member());
+        let got = request.pair_answers(V, &page(&[C]), budget, None).await;
+        assert!(!got.answers[C].vouched);
+        farsight.request(&member()).pair_answers(V, &page(&[C]), budget, None).await;
+        assert_eq!(fake.asked.lock().expect("asked").iter().filter(|chunk| chunk.as_slice() == [C]).count(), 2);
+        // The budget bounds the calls: none allowed, none made, no answer.
+        let before = calls(&fake);
+        let none = farsight.request(&member()).pair_answers(V, &page(&["did:plc:dddddddddddddddddddddddd"]), PairBudget { max_calls: 0, ..budget }, None).await;
+        assert!(none.answers.is_empty() && calls(&fake) == before);
     }
 
     /// B-81: the prime is counted, and its breaker is apart from the read
