@@ -448,6 +448,18 @@ rate_per_sec = 10.0
 burst = 20
 requester_share = 0.25           # the most one member may use of that rate
 
+# A memory of who blocks each member through a list, so those blocks keep
+# applying while Farsight gives no answer, and across a restart. Off unless
+# you turn it on, and it needs farsight.url above. What it stores says
+# which accounts a member's pages showed, and roughly when, so it is kept
+# only this long and only for members. This build has the settings and the
+# table but does not remember anything yet.
+[farsight.memory]
+enabled = false
+retention_hours = 24             # a remembered block applies this long
+max_per_viewer = 1000            # blocks remembered for one member
+max_total = 100000               # blocks remembered in all
+
 # Limits on checking sign-in tokens before a request is charged to anyone.
 # They stop forged or broken tokens from using up CPU or a member's limits.
 [auth]

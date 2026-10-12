@@ -23,7 +23,7 @@ pub use sections::{
     ActivitySubscriptionsConfig, AdminConfig, AuthConfig, BookmarkCount, BookmarksConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
     CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, DraftsConfig, FeaturesConfig,
     FarsightConfig, FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
-    KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelersConfig, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig, ThreadLensConfig, FarsightFallbackConfig,
+    KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelersConfig, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig, ThreadLensConfig, FarsightFallbackConfig, FarsightMemoryConfig,
     PrivateReadConfig, PrivateReadFloors, PublicScope, RateClassConfig, RateLimitsConfig,
     RetentionConfig, SchemaBackfillConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
     StarterPacksConfig, SyncConfig, ThreadConfig, ThreadMutesConfig, ThreadV2Config, UtcTimeOfDay,
@@ -164,6 +164,9 @@ impl AppConfig {
         // off, `serve` logs what it would reject and starts.
         if self.file.farsight.fallback.enabled {
             problems.extend(crate::farsight::fallback_problems(&self.file.farsight, &self.file.constellation.networks));
+        }
+        if self.file.farsight.memory.enabled {
+            problems.extend(crate::farsight::memory_problems(&self.file.farsight));
         }
         if problems.is_empty() {
             Ok(())

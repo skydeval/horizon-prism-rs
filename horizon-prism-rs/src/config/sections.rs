@@ -958,6 +958,37 @@ pub struct FarsightConfig {
     pub prime_on_enroll: bool,
     /// `[farsight.fallback]`: off by default.
     pub fallback: FarsightFallbackConfig,
+    /// `[farsight.memory]`: off by default.
+    pub memory: FarsightMemoryConfig,
+}
+
+/// `[farsight.memory]` (design-v3 §5.14.18; proposed locked decision 39):
+/// remember, per ready member and for a bounded time, the inbound list
+/// blocks a live answer reported, so they keep applying while Farsight
+/// gives no answer and across a restart. Off by default. The numbers are
+/// signed and, with the switch off, only parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FarsightMemoryConfig {
+    pub enabled: bool,
+    /// A remembered block applies until this long after it was last
+    /// confirmed.
+    pub retention_hours: i64,
+    /// Blocks remembered for one member.
+    pub max_per_viewer: i64,
+    /// Blocks remembered in all.
+    pub max_total: i64,
+}
+
+impl Default for FarsightMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retention_hours: 24,
+            max_per_viewer: 1000,
+            max_total: 100_000,
+        }
+    }
 }
 
 /// `[farsight.fallback]` (design-v3 §5.14.17; proposed locked decision
@@ -1016,6 +1047,7 @@ impl Default for FarsightConfig {
             requester_share: Float(0.25),
             prime_on_enroll: true,
             fallback: FarsightFallbackConfig::default(),
+            memory: FarsightMemoryConfig::default(),
         }
     }
 }

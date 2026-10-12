@@ -112,10 +112,84 @@ pub fn fallback_problems(cfg: &FarsightConfig, networks: &[NetworkConfig]) -> Ve
     out
 }
 
+/// What startup rejects in `[farsight.memory]` when the memory is enabled
+/// (design-v3 §5.14.18.1). With the switch off these are not errors.
+#[must_use]
+pub fn memory_problems(cfg: &FarsightConfig) -> Vec<String> {
+    let m = &cfg.memory;
+    let mut out = Vec::new();
+    if cfg.url.is_none() {
+        out.push("farsight.memory.enabled needs farsight.url: without Farsight nothing could ever be learned".to_string());
+    }
+    for (key, value, min, max) in [
+        ("retention_hours", m.retention_hours, 1, 720),
+        ("max_per_viewer", m.max_per_viewer, 1, 10_000),
+        ("max_total", m.max_total, m.max_per_viewer.max(1), 1_000_000),
+    ] {
+        if !(min..=max).contains(&value) {
+            out.push(format!("farsight.memory.{key} = {value} is outside {min}..={max}"));
+        }
+    }
+    out
+}
+
+/// With the memory off, empty its table (design-v3 §5.14.18.1 "When
+/// disabled"): nothing reads it then, and rows left from a time it was on
+/// are a member's reading activity at rest. Best effort, under a 5 s lock
+/// timeout: a failure is counted and never stops a start. A function over
+/// the pool, since it must run with no Farsight configured too.
+pub async fn truncate_memory(pool: &sqlx::PgPool) -> bool {
+    let emptied = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '5s'").execute(&mut *tx).await?;
+        sqlx::query("TRUNCATE learned_inbound_blocks").execute(&mut *tx).await?;
+        tx.commit().await
+    }
+    .await;
+    if let Err(error) = &emptied {
+        metrics::counter!(METRIC_MEMORY_DROPPED, "reason" => "startup_truncate").increment(1);
+        tracing::warn!(event = "farsight_memory_truncate_failed", %error, "the memory's table could not be emptied; the daily job tries again");
+    }
+    emptied.is_ok()
+}
+
+/// `farsight_memory_dropped_total{reason}`.
+pub const METRIC_MEMORY_DROPPED: &str = "farsight_memory_dropped_total";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::FileConfig;
+
+    /// design-v3 §5.14.18.1: the memory's keys are checked only when it is
+    /// on; off, its table is emptied.
+    #[tokio::test]
+    async fn the_memory_is_off_by_default_and_then_holds_nothing() {
+        let problems = |toml: &str| memory_problems(&FileConfig::parse(toml).expect("parse").farsight);
+        let on = "[farsight]\nurl = \"https://farsight.example.net\"\n[farsight.memory]\nenabled = true\n";
+        assert_eq!(problems(on), Vec::<String>::new(), "the defaults are valid");
+        let has = |toml: &str, needle: &str| {
+            let out = problems(toml);
+            assert!(out.iter().any(|p| p.contains(needle)), "{needle:?} not in {out:?}");
+        };
+        has("[farsight.memory]\nenabled = true\n", "needs farsight.url");
+        has(&format!("{on}retention_hours = 0\n"), "farsight.memory.retention_hours");
+        has(&format!("{on}max_per_viewer = 10001\n"), "farsight.memory.max_per_viewer");
+        has(&format!("{on}max_per_viewer = 500\nmax_total = 100\n"), "farsight.memory.max_total = 100 is outside 500..=1000000");
+        assert!(FileConfig::parse("[farsight.memory]\nno_such_key = 1\n").is_err());
+
+        let Some(db) = crate::test_support::fresh_db("farsight_memory_truncate").await else {
+            return;
+        };
+        sqlx::query("INSERT INTO learned_inbound_blocks (viewer_did, other_did, source, confirmed_at) VALUES ('did:plc:v', 'did:plc:o', 'farsight', now())")
+            .execute(&db.pool)
+            .await
+            .expect("row");
+        assert!(truncate_memory(&db.pool).await);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM learned_inbound_blocks").fetch_one(&db.pool).await.expect("count");
+        assert_eq!(rows, 0);
+        db.drop_db().await;
+    }
 
     /// design-v3 §5.14.17.1: off, the fallback's keys never stop a start;
     /// on, each bad value is named.

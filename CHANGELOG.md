@@ -12,6 +12,15 @@ commit.
 
 ### Added
 
+- **Item 12c: the memory's table and settings (#684).** Migration
+  `0019_learned_inbound_blocks` adds one empty table, and a
+  `[farsight.memory]` section (off by default) adds `enabled`,
+  `retention_hours`, `max_per_viewer` and `max_total`, checked at startup
+  only when enabled. With the memory off, `serve` empties the table at
+  startup, best effort. **Nothing is remembered yet**: with it on,
+  `serve` says so at startup. An upgrade to this build needs
+  `APP_ALLOW_STARTUP_MIGRATE=1` for one start, as for any migration
+  (design-v3 §5.14.18.1; proposed locked decision 39).
 - **Item 12b: the fallback for inbound list blocks (#683).** With
   `farsight.fallback.enabled`, and only while Farsight is down, a ready
   member's ordinary page asks the AppView that `farsight.fallback.network`

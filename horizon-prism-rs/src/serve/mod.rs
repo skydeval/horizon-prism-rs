@@ -141,6 +141,20 @@ pub async fn run() -> Result<(), StartupError> {
             return Err(StartupError::new(code, format!("migration gate: {e}")));
         }
     }
+    // The memory of learned blocks (§5.14.18.1) is off unless switched on.
+    // Off, its table holds nothing: emptied here, best effort.
+    if !cfg.file.farsight.memory.enabled {
+        crate::farsight::truncate_memory(&pool).await;
+        for problem in crate::farsight::memory_problems(&cfg.file.farsight)
+            .into_iter()
+            .filter(|p| !p.contains("needs farsight.url"))
+        {
+            tracing::warn!(event = "farsight_memory_config", %problem, "this value would be rejected if farsight.memory.enabled were true");
+        }
+    } else {
+        // The table and the settings exist; the reads and writes do not.
+        tracing::warn!(event = "farsight_memory_not_built", "farsight.memory.enabled is set, but this build does not remember blocks yet: nothing is stored or read");
+    }
     let redis = redis_manager(&cfg.env.redis_url).await?;
     let consumer_redis = redis_manager(&cfg.env.redis_url).await?;
     let net = NetClient::new(&NetConfig::from_app(&cfg)).map_err(|e| StartupError::new(1, format!("net client: {e}")))?;
