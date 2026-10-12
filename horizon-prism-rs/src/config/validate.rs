@@ -44,6 +44,9 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if !(1..=100).contains(&cfg.lists.read_listing_pages) {
         out.push("lists.read_listing_pages must be 1 to 100".to_string());
     }
+    if cfg.known_followers.profile_scan_pages > 100 {
+        out.push("known_followers.profile_scan_pages must be at most 100".to_string());
+    }
     if !(1..=1000).contains(&cfg.known_followers.scan_max_pages) {
         out.push("known_followers.scan_max_pages must be 1 to 1000".to_string());
     }

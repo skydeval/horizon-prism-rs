@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 13: `followingRule` checks Constellation (#675).** For a thread
+  whose author lets only accounts they follow reply, a follow that is not
+  stored here is looked for among the viewer's followers on Constellation
+  (at most `[known_followers] profile_scan_pages` pages, default 2,
+  charged to the caller). `viewer.replyDisabled` is then `false` or
+  `true`; when the scan cannot finish it is left out, as before
+  (design-v3 §8.3).
 - **Item 13: thread position on feed items (#675).** A post in a feed
   that is part of its author's own thread (the root, then the author's
   earliest reply to each post in turn) carries `opThreadPostIndex` and

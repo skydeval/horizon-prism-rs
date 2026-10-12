@@ -916,11 +916,14 @@ impl Default for ListsConfig {
 pub struct KnownFollowersConfig {
     /// Constellation pages one `getKnownFollowers` scan may read.
     pub scan_max_pages: u32,
+    /// Constellation pages a single-object view may read of an account's
+    /// followers (a threadgate's `followingRule`, design-v3 §8.3).
+    pub profile_scan_pages: u32,
 }
 
 impl Default for KnownFollowersConfig {
     fn default() -> Self {
-        Self { scan_max_pages: 20 }
+        Self { scan_max_pages: 20, profile_scan_pages: 2 }
     }
 }
 

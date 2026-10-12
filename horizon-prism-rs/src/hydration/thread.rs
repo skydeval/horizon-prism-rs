@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use super::actor::ProfileKind;
 use super::feed::{NSID_POST, PostContext};
+use super::graph::NSID_FOLLOW;
 use super::lists::is_list_uri;
 use super::normalize::is_private_uri;
 use super::{CountMode, Hydrator, ViewError, ViewResult, Viewer};
@@ -31,6 +32,7 @@ pub const LISTING_CONCURRENCY: usize = 8;
 pub const NSID_LIKE: &str = "app.bsky.feed.like";
 /// Likers asked of Constellation per page of a known-likers scan.
 const KNOWN_LIKERS_PAGE: u32 = 100;
+const FOLLOWER_SCAN_PAGE: u32 = 100;
 /// Profiles shown in `viewer.knownLikers`.
 const KNOWN_LIKERS_SHOWN: usize = 5;
 pub const DEFAULT_DEPTH: u32 = 6;
@@ -289,10 +291,31 @@ impl Hydrator {
         Ok(Some(json!({"count": likers.len(), "actors": actors})))
     }
 
+    /// Whether `follower` is among `subject`'s followers on Constellation: a
+    /// scan of at most `known_followers.profile_scan_pages` pages, each
+    /// charged to the caller's share. `None` when the scan could not finish
+    /// (no Constellation, no budget, an error, or more pages than allowed).
+    async fn follower_scan(&self, req: &Requester, subject: &str, follower: &str) -> Option<bool> {
+        let client = self.backlinks()?;
+        let mut cursor: Option<String> = None;
+        for _ in 0..self.inner.cfg.known_followers_profile_scan_pages {
+            self.draw_constellation(req).ok()?;
+            let page = client.distinct_dids_page(subject, NSID_FOLLOW, ".subject", FOLLOWER_SCAN_PAGE, cursor.as_deref()).await.ok()?;
+            if page.linking_dids.iter().any(|d| d == follower) {
+                return Some(true);
+            }
+            cursor = page.cursor;
+            if cursor.is_none() {
+                return Some(false);
+            }
+        }
+        None
+    }
+
     /// `viewer.replyDisabled` for a post in the thread rooted at `root`
     /// (design-v3 §8.3), for a ready member. `None` leaves the field out:
     /// no gate, no `allow`, or an answer this AppView cannot know.
-    async fn reply_disabled(&self, viewer: &Viewer, root: &str, allow: Option<&Value>) -> Result<Option<bool>, sqlx::Error> {
+    async fn reply_disabled(&self, viewer: &Viewer, req: &Requester, root: &str, allow: Option<&Value>) -> Result<Option<bool>, sqlx::Error> {
         let (Some(me), Some(rules)) = (viewer.state_did(), allow.and_then(Value::as_array)) else {
             return Ok(None);
         };
@@ -327,9 +350,18 @@ impl Hydrator {
                         .bind(me)
                         .fetch_one(self.pool())
                         .await?;
-                    // A follow not stored here may still exist.
-                    complete &= follows;
-                    follows
+                    // A follow not stored here may still exist: look for the
+                    // author among the viewer's followers on Constellation.
+                    match follows {
+                        true => true,
+                        false => match self.follower_scan(req, me, author).await {
+                            Some(found) => found,
+                            None => {
+                                complete = false;
+                                false
+                            }
+                        },
+                    }
                 }
                 "app.bsky.feed.threadgate#listRule" => {
                     let list = rule.get("list").and_then(Value::as_str).unwrap_or_default();
@@ -533,7 +565,7 @@ impl Hydrator {
         };
         let root = anchor_row.reply_root_uri.clone().unwrap_or_else(|| uri.to_string());
         let root_gate = self.threadgate(viewer, req, &root).await?;
-        let reply_disabled = self.reply_disabled(viewer, &root, root_gate.as_ref().and_then(|g| g.allow.as_ref())).await?;
+        let reply_disabled = self.reply_disabled(viewer, req, &root, root_gate.as_ref().and_then(|g| g.allow.as_ref())).await?;
         let (gate, hidden) = match root_gate {
             Some(g) => (Some(g.view), Hidden { uris: g.hidden, keep: keep_hidden }),
             None => (None, Hidden::default()),
@@ -595,6 +627,61 @@ mod tests {
 
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// design-v3 §8.3 `followingRule`: a follow by the root's author that is
+    /// not stored here is looked for among the viewer's followers on
+    /// Constellation, and a scan that cannot finish leaves the field out.
+    #[tokio::test]
+    async fn the_following_rule_scans_the_viewers_followers() {
+        use std::sync::Arc;
+
+        use axum::extract::Query;
+        use axum::routing::get;
+
+        use crate::hydration::testing::{FixedUpstream, hydrator_full};
+
+        let Some(db) = fresh_db("hydration_following_rule").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let root = post(p, BOB, "3kaaaaaaaaaa2", "root", None, None).await;
+        let carol = "did:plc:cccccccccccccccccccccccc";
+        // Alice's followers: Bob, on the second of two pages. Carol's: one
+        // page without Bob. Bob's own: more pages than a scan may read.
+        let router = axum::Router::new().route(
+            "/links/distinct-dids",
+            get(move |Query(q): Query<HashMap<String, String>>| async move {
+                let target = q.get("target").map(String::as_str).unwrap_or_default();
+                let page = q.get("cursor").map(String::as_str);
+                axum::Json(match (target, page) {
+                    (ALICE, None) => json!({"total": 2, "linking_dids": ["did:plc:xxxxxxxxxxxxxxxxxxxxxxxx"], "cursor": "2"}),
+                    (ALICE, Some(_)) => json!({"total": 2, "linking_dids": [BOB]}),
+                    (BOB, _) => json!({"total": 9, "linking_dids": [], "cursor": "more"}),
+                    _ => json!({"total": 1, "linking_dids": ["did:plc:xxxxxxxxxxxxxxxxxxxxxxxx"]}),
+                })
+            }),
+        );
+        let base = crate::test_support::serve_fake(router).await;
+        let h = hydrator_full(p, ScopeSets::default(), Arc::new(FixedUpstream::default()), Some(&base));
+        let req = Requester::test();
+        let allow = json!([{"$type": "app.bsky.feed.threadgate#followingRule"}]);
+        let who = |did: &str| Viewer {
+            did: Some(did.into()),
+            hydrate: true,
+        };
+        assert_eq!(h.reply_disabled(&who(ALICE), &req, &root, Some(&allow)).await.expect("db"), Some(false));
+        assert_eq!(h.reply_disabled(&who(carol), &req, &root, Some(&allow)).await.expect("db"), Some(true));
+        // Bob looks at a post of Alice's: his followers run to more pages
+        // than the scan may read, so the answer is unknown.
+        let hers = post(p, ALICE, "3kaaaaaaaaaa3", "hers", None, None).await;
+        assert_eq!(h.reply_disabled(&who(BOB), &req, &hers, Some(&allow)).await.expect("db"), None);
+        // Without Constellation, a follow not stored here is unknown too.
+        let bare = hydrator(p, ScopeSets::default());
+        assert_eq!(bare.reply_disabled(&who(ALICE), &req, &root, Some(&allow)).await.expect("db"), None);
+        db.drop_db().await;
+    }
 
     /// design-v3 §5.1, §11 G-6: replies and parents not stored here.
     #[tokio::test]

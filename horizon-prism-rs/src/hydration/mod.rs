@@ -126,6 +126,8 @@ pub struct HydrationConfig {
     pub thread_mutes_max: u32,
     /// `known_followers.scan_max_pages`.
     pub known_followers_scan_max_pages: u32,
+    /// `known_followers.profile_scan_pages`.
+    pub known_followers_profile_scan_pages: u32,
     /// `known_likers.scan_max_pages`.
     pub known_likers_scan_max_pages: u32,
     /// `thread_v2.max_parents`.
@@ -788,6 +790,7 @@ pub(crate) mod testing {
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
                 known_followers_scan_max_pages: 2,
+                known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,
                 thread_v2_max_parents: 80,
                 op_thread_max_walk: 4,
@@ -817,6 +820,7 @@ pub(crate) mod testing {
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
                 known_followers_scan_max_pages: 2,
+                known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,
                 thread_v2_max_parents: 80,
                 op_thread_max_walk: 4,

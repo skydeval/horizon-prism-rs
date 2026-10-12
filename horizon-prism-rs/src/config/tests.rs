@@ -260,6 +260,7 @@ counts_refresh_secs = 3600
 
 [known_followers]
 scan_max_pages = 20
+profile_scan_pages = 2
 
 [known_likers]
 scan_max_pages = 5

@@ -288,6 +288,10 @@ counts_refresh_secs = 3600
 # Constellation allowance, so raise that with this.
 [known_followers]
 scan_max_pages = 20
+# On an opened post whose author lets only "people I follow" reply: how many
+# pages of your own followers (100 each) one request may ask Constellation
+# for, to see whether the author follows you. 0 uses only follows stored here.
+profile_scan_pages = 2
 
 # "Liked by people you follow" on an opened post: how many pages of the
 # post's likers (100 each) one request may ask Constellation for. 0 uses
