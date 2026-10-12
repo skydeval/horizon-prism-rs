@@ -80,7 +80,7 @@ pub async fn request_record(
     if matches!(classify(collection, rkey), RecordClass::Unindexed) {
         return Err(XrpcError::invalid(UNSUPPORTED_COLLECTION));
     }
-    match index_record(s.source.as_ref(), &s.writer, repo, collection, rkey, s.attempts).await {
+    match index_record(s.source.as_ref(), &s.writer, repo, collection, rkey, s.attempts, false).await {
         Ok(indexed) => Ok(Json(index_status(indexed.status))),
         Err(IndexError::Fetch(error)) => {
             tracing::info!(event = "request_record_fetch_failed", repo, %error, "the caller's PDS did not answer");

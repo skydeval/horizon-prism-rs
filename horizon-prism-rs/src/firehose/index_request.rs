@@ -52,7 +52,9 @@ pub enum IndexError {
     Write(String),
 }
 
-/// Run §5.9 for one record of `repo`.
+/// Run §5.9 for one record of `repo`. `subscription_rules` is on for a
+/// dead-letter replay and off for `requestRecord` (design-v3 §4.3 "Owner-side
+/// rules and their switch").
 ///
 /// # Errors
 ///
@@ -64,6 +66,7 @@ pub async fn index_record(
     collection: &str,
     rkey: &str,
     attempts: u32,
+    subscription_rules: bool,
 ) -> Result<Indexed, IndexError> {
     let pds = source.prepare(repo).await.map_err(|e| IndexError::Fetch(e.to_string()))?;
     let rev = source.latest_rev(&pds, repo).await.map_err(IndexError::Fetch)?;
@@ -89,6 +92,7 @@ pub async fn index_record(
         dead_letter_readiness: false,
         attempts,
         live: false,
+        subscription_rules,
     };
     let report = writer.apply(repo, &rev, &[op], options).await.map_err(|e| IndexError::Write(e.0))?;
     let status = match report.outcomes.first() {

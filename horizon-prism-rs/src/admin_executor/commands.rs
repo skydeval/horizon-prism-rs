@@ -464,7 +464,7 @@ impl Handlers {
         let Some((collection, rkey)) = path.split_once('/').filter(|_| is_did(&repo)) else {
             return Ok(Outcome::Failed("unparseable entry: no repo/path to replay".to_string()));
         };
-        let indexed = match index_record(self.source.as_ref(), &self.writer, &repo, collection, rkey, self.deterministic_attempts).await {
+        let indexed = match index_record(self.source.as_ref(), &self.writer, &repo, collection, rkey, self.deterministic_attempts, true).await {
             Ok(i) => i,
             Err(e @ IndexError::Write(_)) => return Ok(Outcome::Failed(format!("replay failed: {e}"))),
             Err(e) => return Err(e.to_string()),

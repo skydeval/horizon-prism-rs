@@ -15,6 +15,7 @@
 
 pub mod applier;
 pub mod claim;
+pub mod copy;
 pub mod fetch;
 pub mod jobs;
 pub mod list_phase;

@@ -12,6 +12,20 @@ commit.
 
 ### Added
 
+- **Item 12: the copy rule and the purpose rule in the writer (#673).**
+  When the owner of a list that a member mutes or blocks changes the
+  list, the writer now keeps the private copy current: a list item is
+  copied, a delete or a move out of the list removes the copy and leaves
+  a tombstone so a late, older create is not copied again, and the
+  list's purpose is stored on its row. This happens whether or not the
+  owner's records are admitted to the public tables, and never changes
+  what the public tables or an op's outcome show. Caps:
+  `lists.subscribed_max_items` per list (`list_items_over_cap_total`)
+  and `lists.subscription_tombstones_max_per_owner`
+  (`subscription_tombstones_evicted_total`). The firehose, backfill and
+  dead-letter replay run the rules; `requestRecord` does not
+  (`ApplyOptions.subscription_rules`; design-v3 §4.3 "The copy rule",
+  "The purpose rule").
 - **Item 12: the other reasons a list sync starts (#673).**
   `subscriptions::triggers` adds the recovery sweep (at startup and with
   every retry-scheduler run: it finds again every reference still

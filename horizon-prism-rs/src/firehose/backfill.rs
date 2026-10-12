@@ -920,6 +920,7 @@ impl Backfill {
             dead_letter_readiness: false,
             attempts: self.attempts,
             live: false,
+            subscription_rules: true,
         }
     }
 

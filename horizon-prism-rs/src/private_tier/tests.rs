@@ -215,6 +215,7 @@ impl Fixture {
                     dead_letter_readiness: false,
                     attempts: 1,
                     live: false,
+                    subscription_rules: false,
                 },
             )
             .await

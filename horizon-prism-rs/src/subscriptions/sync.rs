@@ -148,7 +148,7 @@ pub async fn snapshot(pool: &PgPool, owner: &str, generation: i64) -> Result<Sna
 }
 
 /// A purpose is stored as read only if it has no NUL and is short enough.
-fn storable(purpose: Option<&str>) -> Option<&str> {
+pub(super) fn storable(purpose: Option<&str>) -> Option<&str> {
     purpose.filter(|p| !p.contains('\0') && p.len() <= MAX_PURPOSE_BYTES)
 }
 

@@ -153,7 +153,11 @@ pub async fn run() -> Result<(), StartupError> {
     let policy: Arc<dyn PersistencePolicy> = Arc::new(scope.clone());
     let resolver = IdentityResolver::new(net.clone(), pool.clone(), IdentitySettings::from_app(&cfg), policy);
     let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private))
-        .with_subscribed_post_max_age_secs(cfg.file.notifications.subscribed_post_max_age_secs);
+        .with_subscribed_post_max_age_secs(cfg.file.notifications.subscribed_post_max_age_secs)
+        .with_subscription_limits(subscriptions::copy::Limits {
+            max_items: cfg.file.lists.subscribed_max_items,
+            tombstones_max_per_owner: cfg.file.lists.subscription_tombstones_max_per_owner,
+        });
     let purger = Purger::new(pool.clone(), scope.clone(), Arc::clone(&private))
         .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs);
     let constellation = ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url);

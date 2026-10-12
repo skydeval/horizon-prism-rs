@@ -140,6 +140,7 @@ impl Consumer {
             dead_letter_readiness: true,
             attempts: self.cfg.deterministic_attempts,
             live: true,
+            subscription_rules: true,
         }
     }
 

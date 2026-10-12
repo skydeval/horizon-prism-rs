@@ -28,6 +28,8 @@ use crate::aggregations::growth::{self, GrowthPlan};
 use crate::aggregations::{Admission, AdmissionInput, RecordKind, ScopeSets, ScopeState, admit};
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
 use crate::private_tier::{IngestError, PrivateOp, PrivateTier};
+use crate::subscriptions::copy;
+use crate::subscriptions::fetch::{NSID_LIST, NSID_LISTITEM};
 
 /// The lowest possible TID string: inbound-block rows lose to any real rev
 /// under LWW (§5.10).
@@ -98,6 +100,12 @@ pub struct ApplyOptions {
     /// generates `subscribed-post` notifications (design-v3 §5.6): backfill,
     /// `requestRecord` and replay would announce history.
     pub live: bool,
+    /// Run rule 4's owner-side rules (design-v3 §4.3): the copy rule and
+    /// the purpose rule, for a repo that owns a subscribed list. The
+    /// firehose, backfill and dead-letter replay set it; `requestRecord`
+    /// does not, so what it does for a list owner is the same whether or
+    /// not any member subscribes to one of the owner's lists.
+    pub subscription_rules: bool,
 }
 
 /// What happened to one op.
@@ -440,6 +448,9 @@ pub struct Writer {
     private: Arc<dyn PrivateTier>,
     /// `notifications.subscribed_post_max_age_secs`.
     subscribed_post_max_age: chrono::Duration,
+    /// Rule 4's caps (`lists.subscribed_max_items`,
+    /// `lists.subscription_tombstones_max_per_owner`).
+    subscription_limits: copy::Limits,
 }
 
 impl Writer {
@@ -450,7 +461,15 @@ impl Writer {
             scope,
             private,
             subscribed_post_max_age: chrono::Duration::seconds(86_400),
+            subscription_limits: copy::Limits { max_items: 50_000, tombstones_max_per_owner: 10_000 },
         }
+    }
+
+    /// Set rule 4's caps.
+    #[must_use]
+    pub fn with_subscription_limits(mut self, limits: copy::Limits) -> Self {
+        self.subscription_limits = limits;
+        self
     }
 
     /// How old a post may be and still be announced to its author's
@@ -530,6 +549,14 @@ impl Writer {
                 lock_uri_list.extend(canonical_gates(&d.uri));
             }
         }
+        // Rule 4 (§4.3): the owner-side rules run for a repo that owns a
+        // subscribed list. The copy rule writes by list-item URI whatever
+        // became of the op itself, so those URIs are locked too.
+        let owner_side = options.subscription_rules && sets.subscribed.tracks(repo);
+        if owner_side {
+            let items = ops.iter().filter(|op| op.collection == NSID_LISTITEM && proto_blue::syntax::RecordKey::is_valid(&op.rkey));
+            lock_uri_list.extend(items.map(|op| format!("at://{repo}/{NSID_LISTITEM}/{}", op.rkey)));
+        }
 
         let mut tx = self.pool.begin().await?;
         // 2 and 3: DID locks, then per-URI locks.
@@ -538,7 +565,11 @@ impl Writer {
 
         let mut report = ApplyReport::default();
         let mut effects = MemoryEffects::default();
+        let mut copied = copy::Effects::default();
         for (i, (p, op)) in prepared.iter().zip(ops).enumerate() {
+            if owner_side {
+                self.owner_side(&mut tx, repo, rev, op, sets, &mut copied).await?;
+            }
             let outcome = match p {
                 Prepared::Skip(reason) => {
                     metrics::counter!(METRIC_SKIPPED, "reason" => *reason).increment(1);
@@ -589,7 +620,90 @@ impl Writer {
         tx.commit().await?;
         drop(guard);
         self.commit_effects(effects).await;
+        self.commit_copied(copied).await;
         Ok(report)
+    }
+
+    /// Rule 4's owner-side rules for one op of a repo in `O_sub` (design-v3
+    /// §4.3): the purpose rule for a list record, the copy rule for a list
+    /// item. They run in a savepoint of their own and never change the
+    /// op's outcome: a deterministic database error rolls back that
+    /// savepoint only and is counted.
+    async fn owner_side(
+        &self,
+        tx: &mut PgConnection,
+        repo: &str,
+        rev: &str,
+        op: &RawOp,
+        sets: &ScopeSets,
+        copied: &mut copy::Effects,
+    ) -> Result<(), Transient> {
+        let (is_list, is_item) = (op.collection == NSID_LIST, op.collection == NSID_LISTITEM);
+        if !(is_list || is_item) || !proto_blue::syntax::RecordKey::is_valid(&op.rkey) {
+            return Ok(());
+        }
+        let uri = format!("at://{repo}/{}/{}", op.collection, op.rkey);
+        let mut sp = tx.begin().await?;
+        let nothing = Ok(copy::Effects::default());
+        let result = if is_list {
+            // A create or update with no record body writes nothing.
+            let list_op = match (op.action, &op.record) {
+                (Action::Delete, _) => Some(copy::ListOp::Delete),
+                (_, Some(record)) => Some(copy::ListOp::Put(record)),
+                (_, None) => None,
+            };
+            match list_op {
+                Some(list_op) => copy::list_purpose(&mut sp, &uri, rev, list_op).await.map(|()| copy::Effects::default()),
+                None => nothing,
+            }
+        } else {
+            let ctx = copy::Ctx { sets, earlier: copied, limits: self.subscription_limits };
+            match (op.action, &op.record, &op.cid) {
+                (Action::Delete, ..) => copy::item_delete(&mut sp, ctx, repo, &uri, rev).await,
+                (_, Some(record), Some(cid)) => {
+                    let item = copy::Item { owner: repo, uri: &uri, rkey: &op.rkey, cid, rev, record };
+                    copy::item_upsert(&mut sp, ctx, item).await
+                }
+                _ => nothing,
+            }
+        };
+        match result {
+            Ok(eff) => {
+                sp.commit().await?;
+                copied.merge(eff);
+            }
+            Err(error) if is_deterministic(&error) => {
+                sp.rollback().await?;
+                let metric = if is_list { copy::METRIC_PURPOSE_ERRORS } else { copy::METRIC_COPY_ERRORS };
+                metrics::counter!(metric).increment(1);
+                tracing::warn!(event = "subscription_rule_write_failed", %error, "an owner-side subscription write failed");
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    /// After a commit that changed the subscription copy: the owners'
+    /// tombstone counts move by what was inserted and evicted, and the
+    /// touched lists' item counts are read again from their rows.
+    async fn commit_copied(&self, copied: copy::Effects) {
+        if copied.is_empty() {
+            return;
+        }
+        if !copied.tombstones.is_empty() {
+            let mut sets = self.scope.write_guard().await;
+            for (owner, delta) in &copied.tombstones {
+                if let Some(count) = sets.subscribed.owners.get_mut(owner) {
+                    *count = u32::try_from((i64::from(*count) + delta).max(0)).unwrap_or(u32::MAX);
+                }
+            }
+        }
+        let mut touched = copied.touched;
+        touched.sort_unstable();
+        touched.dedup();
+        if let Err(error) = self.scope.refresh_subscribed(&self.pool, &touched).await {
+            tracing::warn!(event = "subscribed_counts_refresh_failed", %error, "re-reading subscribed list counts failed");
+        }
     }
 
     /// The Constellation inbound-block pass's writes (§5.10): blocks of
@@ -1440,6 +1554,7 @@ mod tests {
             dead_letter_readiness: true,
             attempts: 5,
             live: true,
+            subscription_rules: true,
         };
 
         fn writer(pool: &PgPool, member: bool) -> Writer {
@@ -1472,6 +1587,78 @@ mod tests {
                 .fetch_optional(pool)
                 .await
                 .expect("query post")
+        }
+
+        /// design-v3 §4.3: a list owner outside scope has its list items
+        /// copied for the members who reference the list, and nothing is
+        /// written to the public tables. With `subscription_rules` off
+        /// (`requestRecord`) nothing of rule 4 is written at all.
+        #[tokio::test]
+        async fn the_owner_side_rules_run_beside_admission() {
+            use crate::subscriptions::list_phase;
+            use crate::subscriptions::references::{Budget, mute_list};
+
+            let Some(db) = fresh_db("writer_owner_side").await else {
+                return;
+            };
+            let p = &db.pool;
+            let owner = "did:plc:oooooooooooooooooooooooo";
+            let list = format!("at://{owner}/app.bsky.graph.list/3klist");
+            mute_list(p, AUTHOR, &list, Budget { max_references: 5, max_owners: 5 }).await.expect("mute");
+            list_phase::apply(p, &list, 600).await.expect("apply");
+            let scope = ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10_000);
+            scope.refresh_subscribed(p, std::slice::from_ref(&list)).await.expect("subscribed");
+            let w = Writer::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier));
+            let op = |action: Action, collection: &str, rkey: &str, record: Value| RawOp {
+                action,
+                collection: collection.into(),
+                rkey: rkey.into(),
+                cid: (action != Action::Delete).then(|| format!("bafy{rkey}")),
+                record: (action != Action::Delete).then_some(record),
+            };
+            let count = |sql: &'static str| async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(p).await.expect(sql) };
+            let now = "2026-09-26T00:00:00Z";
+            let item = |rkey: &str| op(Action::Create, "app.bsky.graph.listitem", rkey, json!({"list": list, "subject": SUBJECT, "createdAt": now}));
+            let record = op(
+                Action::Create,
+                "app.bsky.graph.list",
+                "3klist",
+                json!({"name": "n", "purpose": "app.bsky.graph.defs#modlist", "createdAt": now}),
+            );
+
+            // Off: the owner's write leaves no trace in rule 4's tables.
+            let quiet = ApplyOptions { subscription_rules: false, ..OPTIONS };
+            let r = w.apply(owner, &rev(1), &[record.clone(), item("3kone")], quiet).await.expect("apply");
+            assert!(r.outcomes.iter().all(|o| matches!(o, OpOutcome::Rejected(_))), "{:?}", r.outcomes);
+            assert_eq!(count("SELECT count(*) FROM subscribed_list_items").await, 0);
+            assert_eq!(count("SELECT count(*) FROM subscribed_lists WHERE purpose IS NOT NULL").await, 0);
+
+            // On: the same ops are still refused for the public tables, and
+            // the copy and the purpose are written.
+            let r = w.apply(owner, &rev(2), &[record, item("3kone"), item("3ktwo")], OPTIONS).await.expect("apply");
+            assert!(r.outcomes.iter().all(|o| matches!(o, OpOutcome::Rejected(_))), "{:?}", r.outcomes);
+            assert!(r.failed.is_empty());
+            assert_eq!(count("SELECT count(*) FROM subscribed_list_items").await, 2);
+            assert_eq!(count("SELECT count(*) FROM subscribed_lists WHERE purpose = 'app.bsky.graph.defs#modlist'").await, 1);
+            assert_eq!(count("SELECT count(*) FROM list_items").await + count("SELECT count(*) FROM lists").await, 0);
+            assert_eq!(scope.snapshot().await.subscribed.lists.get(&list), Some(&2));
+
+            // A delete removes the copy and leaves a tombstone; the public
+            // tombstone table learns nothing; the counts follow.
+            let gone = op(Action::Delete, "app.bsky.graph.listitem", "3kone", Value::Null);
+            w.apply(owner, &rev(3), &[gone], OPTIONS).await.expect("apply");
+            assert_eq!(count("SELECT count(*) FROM subscribed_list_items").await, 1);
+            assert_eq!(count("SELECT count(*) FROM subscription_tombstones").await, 1);
+            assert_eq!(count("SELECT count(*) FROM record_tombstones").await, 0);
+            let snap = scope.snapshot().await;
+            assert_eq!((snap.subscribed.lists.get(&list), snap.subscribed.owners.get(owner)), (Some(&1), Some(&1)));
+            // The late create of the deleted item is not copied again.
+            w.apply(owner, &rev(2), &[item("3kone")], OPTIONS).await.expect("apply");
+            assert_eq!(count("SELECT count(*) FROM subscribed_list_items").await, 1);
+            // Someone who owns no subscribed list is untouched by all this.
+            w.apply(SUBJECT, &rev(1), &[op(Action::Delete, "app.bsky.graph.listitem", "3kx", Value::Null)], OPTIONS).await.expect("apply");
+            assert_eq!(count("SELECT count(*) FROM subscription_tombstones").await, 1);
+            db.drop_db().await;
         }
 
         /// design-v3 §8.6: a like made from a member's repost notifies the
