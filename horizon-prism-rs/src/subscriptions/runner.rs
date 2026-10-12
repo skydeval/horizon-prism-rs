@@ -19,7 +19,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 
-use super::applier::Waiting;
+use super::applier::{Applier, Waiting};
 use super::claim::{self, Lane, LaneTime};
 use super::jobs;
 use super::run::{self, Outcome, OwnerSource, Settings};
@@ -75,13 +75,13 @@ pub struct ListSync {
 
 impl ListSync {
     #[must_use]
-    pub fn new(pool: PgPool, scope: ScopeState, source: Arc<dyn OwnerSource>, waiting: Waiting, settings: Settings, lanes: Lanes) -> Self {
+    pub fn new(pool: PgPool, scope: ScopeState, source: Arc<dyn OwnerSource>, applier: &Applier, settings: Settings, lanes: Lanes) -> Self {
         Self {
             pool,
             scope,
             source,
-            waiting,
-            time: LaneTime::default(),
+            waiting: applier.waiting().clone(),
+            time: applier.lane_time().clone(),
             settings,
             window: Duration::from_secs(u64::from(lanes.max_wall_secs).saturating_mul(2).max(3600)),
             lanes,
@@ -89,12 +89,6 @@ impl ListSync {
             slow: Arc::new(Semaphore::new(lanes.slow as usize)),
             live: Live::default(),
         }
-    }
-
-    /// The fairness account, for a purge to forget a member.
-    #[must_use]
-    pub fn lane_time(&self) -> &LaneTime {
-        &self.time
     }
 
     /// Run one due sync, if a lane has both a free permit and a due row:
@@ -246,7 +240,8 @@ mod tests {
         let bounds = Bounds { max_records: 1000, max_pages: 10, probe_call: Duration::from_secs(5), min_records_per_call_sec: 1, max_call: Duration::from_secs(60), max_wall: Duration::from_secs(60) };
         let settings = Settings { max_items: 100, tombstones_max_per_owner: 10_000, min_interval_secs: 600, bounds };
         let lanes = Lanes { fast, slow: 1, stuck_secs: 5400, max_wall_secs: 3600 };
-        ListSync::new(pool.clone(), scope, Arc::new(Tombstoned), Waiting::default(), settings, lanes)
+        let applier = Applier::new(pool.clone(), scope.clone(), 600);
+        ListSync::new(pool.clone(), scope, Arc::new(Tombstoned), &applier, settings, lanes)
     }
 
     /// A worker runs a due sync and frees its lane; a lane with no permit

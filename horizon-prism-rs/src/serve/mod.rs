@@ -322,7 +322,7 @@ pub async fn run() -> Result<(), StartupError> {
         pool.clone(),
         scope.clone(),
         Arc::new(PdsOwners::new(pool.clone(), resolver.clone(), budgets.clone())),
-        applier.waiting().clone(),
+        &applier,
         subscriptions::run::Settings {
             max_items: lists.subscribed_max_items,
             tombstones_max_per_owner: lists.subscription_tombstones_max_per_owner,

@@ -191,7 +191,7 @@ impl Purger {
         if let Some(applier) = &self.applier {
             // What waited on a sync for this member waits no longer.
             if kind != PurgeKind::OutOfScope {
-                applier.waiting().forget_member(did);
+                applier.forget_member(did);
             }
             if dropped {
                 applier.signal();

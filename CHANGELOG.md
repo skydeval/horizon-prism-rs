@@ -16,6 +16,10 @@ commit.
   list sync reads all of an owner's list records and then fails while
   reading the list items, what the list records said about each list's
   purpose is still written before the run is retried.
+- **Item 12: a purge clears a member from the sync lanes' accounting
+  (#673).** Removing a member or deleting its account now also drops
+  what was held in memory about it for scheduling list syncs: what
+  waited for it, and the lane time charged to it.
 - **Item 12: lost deadlocks are retried in place (#673).** A list
   sync's batch or its final step that loses a deadlock or a
   serialization conflict, for instance to a firehose write by the same

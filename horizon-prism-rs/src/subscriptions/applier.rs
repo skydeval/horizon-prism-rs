@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use tokio::sync::Notify;
 
+use super::claim::LaneTime;
 use super::list_phase::{self, Applied, ListState};
 use crate::aggregations::ScopeState;
 use crate::db::locks::uri_author;
@@ -103,6 +104,9 @@ pub struct Applier {
     scope: ScopeState,
     signal: Arc<Notify>,
     waiting: Waiting,
+    /// The sync lanes' fairness account. It lives here, beside the
+    /// waiting sets, so that a purge can clear a member from both.
+    lane_time: LaneTime,
     sync_min_interval_secs: u32,
     /// Lists whose release is queued or running.
     releasing: Arc<Mutex<HashSet<String>>>,
@@ -124,6 +128,7 @@ impl Applier {
             scope,
             signal: Arc::new(Notify::new()),
             waiting: Waiting::default(),
+            lane_time: LaneTime::default(),
             sync_min_interval_secs,
             releasing: Arc::default(),
             handed_over: Arc::default(),
@@ -134,6 +139,19 @@ impl Applier {
     #[must_use]
     pub fn waiting(&self) -> &Waiting {
         &self.waiting
+    }
+
+    /// The sync lanes' fairness account, shared with the sync claim.
+    #[must_use]
+    pub fn lane_time(&self) -> &LaneTime {
+        &self.lane_time
+    }
+
+    /// Forget everything held in memory about `member` (a purge of that
+    /// member): what waited on a sync for it, and its share of the lanes.
+    pub fn forget_member(&self, member: &str) {
+        self.waiting.forget_member(member);
+        self.lane_time.forget_member(member);
     }
 
     /// Tell the applier that a member phase committed markers.
