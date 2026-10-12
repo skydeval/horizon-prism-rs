@@ -23,6 +23,7 @@ use super::classifier::{EcosystemKind, RecordClass, classify, skip_reason};
 use super::jobs::{self, Depth};
 use super::normalize::normalize_record;
 use super::records::{GraphRecord, PostRecord, ProfileRecord, RecordError, SubjectRecord, private_subjects};
+use super::rows::{self, Cell, Row};
 use crate::aggregations::growth::{self, GrowthPlan};
 use crate::aggregations::{Admission, AdmissionInput, RecordKind, ScopeSets, ScopeState, admit};
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
@@ -183,6 +184,8 @@ enum Body {
     Follow(GraphRecord),
     Block(GraphRecord),
     Profile(ProfileRecord),
+    /// A record of one of the tables design-v3 added (§3.2).
+    Row(Row),
     /// A private-tier record; the facade parses it.
     Private,
 }
@@ -248,7 +251,9 @@ fn prepare(repo: &str, op: &RawOp, now: DateTime<Utc>) -> Prepared {
         return Prepared::Invalid("create/update without record or cid".to_string());
     };
     match build_upsert(repo, class, kind, uri, op, cid, record, now) {
-        Ok(u) => Prepared::Upsert(Box::new(u)),
+        Ok(Some(u)) => Prepared::Upsert(Box::new(u)),
+        // A listitem naming a list outside its own repo (§3.2).
+        Ok(None) => Prepared::Skip("unindexed"),
         Err(e) => Prepared::Invalid(e.0),
     }
 }
@@ -263,7 +268,8 @@ fn build_upsert(
     cid: &str,
     record: &Value,
     now: DateTime<Utc>,
-) -> Result<Upsert, RecordError> {
+) -> Result<Option<Upsert>, RecordError> {
+    let normalized = normalize_record(record);
     let (body, subjects) = match class {
         RecordClass::Ecosystem(EcosystemKind::Post) => {
             let p = PostRecord::parse(record, now)?;
@@ -305,12 +311,17 @@ fn build_upsert(
             (Body::Block(g), subjects)
         }
         RecordClass::Ecosystem(EcosystemKind::Profile) => (Body::Profile(ProfileRecord::parse(record, now)), Vec::new()),
+        // The v3 record tables: rule 1 only, so no subjects.
+        RecordClass::Ecosystem(other) => match rows::row(other, repo, &op.collection, record, &normalized, now)? {
+            Some(row) => (Body::Row(row), Vec::new()),
+            None => return Ok(None),
+        },
         RecordClass::Kryphocron { kind: Some(k), .. } => (Body::Private, private_subjects(k, record)?),
         RecordClass::Kryphocron { kind: None, .. } | RecordClass::Unindexed => {
             return Err(RecordError("not an indexed class".to_string()));
         }
     };
-    Ok(Upsert {
+    Ok(Some(Upsert {
         uri,
         rkey: op.rkey.clone(),
         cid: cid.to_string(),
@@ -321,8 +332,8 @@ fn build_upsert(
             kind,
             subjects,
         },
-        record: normalize_record(record),
-    })
+        record: normalized,
+    }))
 }
 
 /// Changes to apply to `ScopeState` after commit.
@@ -393,7 +404,7 @@ fn notifications_for(author: &str, body: &Body, sets: &ScopeSets) -> Vec<Notific
                 push(Some(m), "mention", None);
             }
         }
-        Body::Block(_) | Body::Profile(_) | Body::Private => {}
+        Body::Block(_) | Body::Profile(_) | Body::Row(_) | Body::Private => {}
     }
     out
 }
@@ -677,6 +688,7 @@ impl Writer {
             }
             Body::Block(g) => upsert_graph(conn, "blocks", u, g, rev).await?.is_some(),
             Body::Profile(p) => upsert_profile(conn, u, p, rev).await?,
+            Body::Row(row) => upsert_row(conn, u, row, rev).await?,
             Body::Private => false,
         };
         if !written {
@@ -733,6 +745,7 @@ impl Writer {
                 removed
             }
             RecordKind::Block => delete_row(conn, "blocks", &d.uri, rev).await?,
+            RecordKind::Table(table) => delete_row(conn, table, &d.uri, rev).await?,
         };
         // Tombstone iff a row was removed, or the author is in S (§5.5).
         if removed || author_in_scope {
@@ -955,6 +968,41 @@ async fn upsert_profile(
     Ok(n > 0)
 }
 
+/// The last-writer-wins upsert of a v3 record table (§II-5.5): every column
+/// of the row is set, and an older or equal rev changes nothing.
+async fn upsert_row(conn: &mut PgConnection, u: &Upsert, row: &Row, rev: &str) -> Result<bool, sqlx::Error> {
+    let table = row.table;
+    let mut columns: Vec<&str> = vec!["uri", row.owner_column];
+    if row.has_rkey {
+        columns.push("rkey");
+    }
+    columns.extend(["cid", "rev"]);
+    columns.extend(row.cells.iter().map(|(name, _)| *name));
+    let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${i}")).collect();
+    let updates: Vec<String> = columns.iter().skip(1).map(|c| format!("{c} = EXCLUDED.{c}")).collect();
+    let sql = format!(
+        "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT (uri) DO UPDATE SET {} WHERE {table}.rev < EXCLUDED.rev",
+        columns.join(", "),
+        placeholders.join(", "),
+        updates.join(", "),
+    );
+    let mut query = sqlx::query(&sql).bind(&u.uri).bind(&u.input.author);
+    if row.has_rkey {
+        query = query.bind(&u.rkey);
+    }
+    query = query.bind(&u.cid).bind(rev);
+    for (_, cell) in &row.cells {
+        query = match cell {
+            Cell::Text(v) => query.bind(v.as_deref()),
+            Cell::TextArray(v) => query.bind(v),
+            Cell::Json(v) => query.bind(v.as_ref()),
+            Cell::Bool(v) => query.bind(*v),
+            Cell::Time(v) => query.bind(*v),
+        };
+    }
+    Ok(query.execute(conn).await?.rows_affected() > 0)
+}
+
 async fn delete_row(conn: &mut PgConnection, table: &'static str, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
     let sql = format!("DELETE FROM {table} WHERE uri = $1 AND rev <= $2");
     Ok(sqlx::query(&sql)
@@ -1092,7 +1140,13 @@ mod tests {
     fn prepare_classifies_and_validates() {
         let now = Utc::now();
         assert_eq!(
-            prepare("did:plc:a", &op(Action::Create, "app.bsky.graph.list", "3k", Some(json!({}))), now),
+            prepare("did:plc:a", &op(Action::Create, "app.bsky.feed.generator", "3k", Some(json!({}))), now),
+            Prepared::Skip("unindexed")
+        );
+        // A listitem naming a list outside its own repo is unindexed too.
+        let foreign = json!({"list": "at://did:plc:b/app.bsky.graph.list/3k", "subject": "did:plc:c"});
+        assert_eq!(
+            prepare("did:plc:a", &op(Action::Create, "app.bsky.graph.listitem", "3k", Some(foreign)), now),
             Prepared::Skip("unindexed")
         );
         assert!(matches!(
@@ -1318,6 +1372,113 @@ mod tests {
             w.apply(AUTHOR, &rev(1), &again, OPTIONS).await.expect("apply");
             let profile: ProfileRow = sqlx::query_as(profile_sql).bind(AUTHOR).fetch_one(p).await.expect("profile");
             assert_eq!((profile.0.as_deref(), profile.4.as_deref()), (Some("bafyprofile"), Some("A")));
+            db.drop_db().await;
+        }
+
+        /// design-v3 §3.2: the twelve collections v3 indexes are written,
+        /// updated by rev and deleted like every other record.
+        #[tokio::test]
+        async fn v3_collections_are_written_updated_and_deleted() {
+            let Some(db) = fresh_db("writer_v3_collections").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, false);
+            let raw = |action: Action, collection: &str, rkey: &str, record: Value| RawOp {
+                action,
+                collection: collection.into(),
+                rkey: rkey.into(),
+                cid: (action != Action::Delete).then(|| format!("bafy{rkey}")),
+                record: (action != Action::Delete).then_some(record),
+            };
+            let create = |collection: &str, rkey: &str, record: Value| raw(Action::Create, collection, rkey, record);
+            let list = format!("at://{AUTHOR}/app.bsky.graph.list/3klist");
+            let foreign = format!("at://{SUBJECT}/app.bsky.graph.list/3klist");
+            let post = format!("at://{AUTHOR}/app.bsky.feed.post/3kpost");
+            let ops = [
+                create("app.bsky.graph.list", "3klist", json!({"name": "Mods", "purpose": "app.bsky.graph.defs#modlist"})),
+                create("app.bsky.graph.listitem", "3kitem", json!({"list": list, "subject": SUBJECT})),
+                // Names a list in another repo: not indexed.
+                create("app.bsky.graph.listitem", "3kforeign", json!({"list": foreign, "subject": SUBJECT})),
+                create("app.bsky.graph.listblock", "3kblock", json!({"subject": foreign})),
+                create("app.bsky.graph.referencelistoptout", "3kopt", json!({"subject": foreign})),
+                create("app.bsky.graph.starterpack", "3kpack", json!({"name": "Starter", "list": list, "description": "new here"})),
+                create("app.bsky.labeler.service", "self", json!({"policies": {"labelValues": ["spam"]}})),
+                create("app.bsky.notification.declaration", "self", json!({"allowSubscriptions": "followers"})),
+                create("app.bsky.actor.status", "self", json!({"status": "app.bsky.actor.status#live"})),
+                // Only rkey `self` is indexed for a self record.
+                create("app.bsky.actor.status", "3kother", json!({"status": "x"})),
+                create("app.bsky.feed.threadgate", "3kpost", json!({"post": post, "allow": []})),
+                create("app.bsky.feed.postgate", "3kpost", json!({"post": post, "detachedEmbeddingUris": ["at://x/y/z"]})),
+                create(
+                    "app.nearhorizon.poll.post",
+                    "3kpoll",
+                    json!({"text": "which?", "visibility": "public", "options": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}]}),
+                ),
+                // A list with no purpose is a broken record.
+                create("app.bsky.graph.list", "3kbroken", json!({"name": "x"})),
+            ];
+            let report = w.apply(AUTHOR, &rev(1), &ops, OPTIONS).await.expect("apply");
+            let skipped: Vec<usize> = report.outcomes.iter().enumerate().filter(|(_, o)| **o == OpOutcome::Skipped("unindexed")).map(|(i, _)| i).collect();
+            assert_eq!(skipped, [2, 9]);
+            assert_eq!(report.failed.iter().map(|f| f.index).collect::<Vec<_>>(), [13]);
+            assert_eq!(report.outcomes.iter().filter(|o| **o == OpOutcome::Written).count(), 11);
+
+            let count = |table: &'static str| async move {
+                let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(p).await.expect(table);
+                n
+            };
+            for (table, rows) in [
+                ("lists", 1),
+                ("list_items", 1),
+                ("list_blocks", 1),
+                ("list_optouts", 1),
+                ("starter_packs", 1),
+                ("labeler_services", 1),
+                ("actor_self_records", 2),
+                ("threadgates", 1),
+                ("postgates", 1),
+                ("nearhorizon_poll_posts", 1),
+            ] {
+                assert_eq!(count(table).await, rows, "{table}");
+            }
+            let gate: (String, Option<Value>, Vec<String>) =
+                sqlx::query_as("SELECT post_uri, allow, hidden_replies FROM threadgates").fetch_one(p).await.expect("gate");
+            assert_eq!(gate, (post.clone(), Some(json!([])), Vec::new()));
+            let pack: (String, bool) = sqlx::query_as("SELECT creator_did, search_tsv @@ to_tsquery('simple', 'starter') FROM starter_packs")
+                .fetch_one(p)
+                .await
+                .expect("pack");
+            assert_eq!(pack, (AUTHOR.to_string(), true));
+
+            // An older or equal rev changes nothing; a newer one replaces.
+            let rename = |name: &str| [raw(Action::Update, "app.bsky.graph.list", "3klist", json!({"name": name, "purpose": "app.bsky.graph.defs#curatelist"}))];
+            let r = w.apply(AUTHOR, &rev(1), &rename("Stale"), OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
+            let r = w.apply(AUTHOR, &rev(2), &rename("Renamed"), OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written]);
+            let name: (String, String) = sqlx::query_as("SELECT name, purpose FROM lists").fetch_one(p).await.expect("list");
+            assert_eq!(name, ("Renamed".to_string(), "app.bsky.graph.defs#curatelist".to_string()));
+
+            // Deletes remove the row and leave a tombstone that stops an
+            // older write from bringing it back.
+            let deletes = [
+                raw(Action::Delete, "app.bsky.graph.listitem", "3kitem", Value::Null),
+                raw(Action::Delete, "app.bsky.actor.status", "self", Value::Null),
+                raw(Action::Delete, "app.bsky.feed.threadgate", "3kpost", Value::Null),
+            ];
+            let r = w.apply(AUTHOR, &rev(3), &deletes, OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written, OpOutcome::Written, OpOutcome::Written]);
+            assert_eq!((count("list_items").await, count("actor_self_records").await, count("threadgates").await), (0, 1, 0));
+            let back = [create("app.bsky.graph.listitem", "3kitem", json!({"list": list, "subject": SUBJECT}))];
+            let r = w.apply(AUTHOR, &rev(2), &back, OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
+            assert_eq!(count("list_items").await, 0);
+
+            // An author outside the scope is not admitted for these.
+            let stranger = [create("app.bsky.graph.list", "3klist", json!({"name": "Theirs", "purpose": "app.bsky.graph.defs#modlist"}))];
+            let r = w.apply(SUBJECT, &rev(1), &stranger, OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Rejected("not_in_scope")]);
             db.drop_db().await;
         }
 

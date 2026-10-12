@@ -82,6 +82,27 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 11: twelve more collections are indexed (#671).** Lists, list
+  items, list blocks, reference-list opt-outs, starter packs, labeler
+  declarations, the notification declaration, actor status and
+  content-visibility declaration, thread gates, post gates and Nearhorizon
+  poll posts are classified and written to their tables, with the same
+  last-writer-wins, tombstone and delete rules as every record
+  (design-v3 §3.2). All are admitted by rule 1 only: their author must be
+  in scope.
+  - A list item is indexed only when its `list` is a list in its own
+    repo. Otherwise any account could add subjects to another account's
+    list.
+  - The labeler and the three declaration records are indexed only at
+    rkey `self`.
+  - `index.requestRecord` accepts these collections.
+  - The `account_deleted` purge removes an account's rows from every new
+    record table, its derived starter-pack counts, its own private state,
+    and subscriptions others hold on it. The `member_removed` purge
+    removes the member's private state (list and thread mutes, bookmarks,
+    drafts, activity subscriptions, notification preferences).
+  No endpoint reads the new tables yet, and the subscription copy of list
+  items (rule 4) is item 12.
 - **Item 11: the writer fills the new columns (#671).** Every post
   written from now on stores `tags`, `link_domains`, `link_urls`,
   `lang_prefixes`, `embed_type`, `media_type` and `search_tsv`

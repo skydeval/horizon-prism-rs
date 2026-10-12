@@ -13,6 +13,9 @@ pub enum RecordKind {
     Follow,
     Block,
     Profile,
+    /// A record of one of the tables design-v3 added (§3.2), named by its
+    /// table. Admitted by rule 1 alone: it has no rule-2 subjects.
+    Table(&'static str),
     PrivatePost,
     PrivateAudience,
     PrivateBlock,

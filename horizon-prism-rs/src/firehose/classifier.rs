@@ -20,6 +20,18 @@ pub const NSID_REPOST: &str = "app.bsky.feed.repost";
 pub const NSID_FOLLOW: &str = "app.bsky.graph.follow";
 pub const NSID_BLOCK: &str = "app.bsky.graph.block";
 pub const NSID_PROFILE: &str = "app.bsky.actor.profile";
+pub const NSID_LIST: &str = "app.bsky.graph.list";
+pub const NSID_LISTITEM: &str = "app.bsky.graph.listitem";
+pub const NSID_LISTBLOCK: &str = "app.bsky.graph.listblock";
+pub const NSID_LIST_OPTOUT: &str = "app.bsky.graph.referencelistoptout";
+pub const NSID_STARTER_PACK: &str = "app.bsky.graph.starterpack";
+pub const NSID_LABELER_SERVICE: &str = "app.bsky.labeler.service";
+pub const NSID_NOTIFICATION_DECLARATION: &str = "app.bsky.notification.declaration";
+pub const NSID_ACTOR_STATUS: &str = "app.bsky.actor.status";
+pub const NSID_CONTENT_VISIBILITY: &str = "app.bsky.actor.contentVisibilityDeclaration";
+pub const NSID_THREADGATE: &str = "app.bsky.feed.threadgate";
+pub const NSID_POSTGATE: &str = "app.bsky.feed.postgate";
+pub const NSID_POLL_POST: &str = "app.nearhorizon.poll.post";
 pub const NSID_POST_PRIVATE: &str = "tools.kryphocron.feed.postPrivate";
 pub const NSID_AUDIENCE: &str = "tools.kryphocron.policy.audience";
 pub const NSID_PRIVATE_BLOCK: &str = "tools.kryphocron.graph.block";
@@ -34,6 +46,20 @@ pub enum EcosystemKind {
     Block,
     /// `app.bsky.actor.profile`, rkey `self` only.
     Profile,
+    // The collections design-v3 added (§3.2).
+    List,
+    ListItem,
+    ListBlock,
+    ListOptout,
+    StarterPack,
+    /// `app.bsky.labeler.service`, rkey `self` only.
+    LabelerService,
+    /// `app.bsky.notification.declaration`, `app.bsky.actor.status` or
+    /// `app.bsky.actor.contentVisibilityDeclaration`, rkey `self` only.
+    SelfRecord,
+    Threadgate,
+    Postgate,
+    PollPost,
 }
 
 /// Kryphocron records Aurora-Locus produces (§5.4 table).
@@ -66,6 +92,7 @@ impl RecordClass {
                 EcosystemKind::Follow => RecordKind::Follow,
                 EcosystemKind::Block => RecordKind::Block,
                 EcosystemKind::Profile => RecordKind::Profile,
+                other => RecordKind::Table(super::rows::table(other)?),
             }),
             Self::Kryphocron {
                 tier: Tier::Private,
@@ -101,6 +128,19 @@ pub fn classify(nsid: &str, rkey: &str) -> RecordClass {
         NSID_FOLLOW => RecordClass::Ecosystem(EcosystemKind::Follow),
         NSID_BLOCK => RecordClass::Ecosystem(EcosystemKind::Block),
         NSID_PROFILE if rkey == "self" => RecordClass::Ecosystem(EcosystemKind::Profile),
+        NSID_LIST => RecordClass::Ecosystem(EcosystemKind::List),
+        NSID_LISTITEM => RecordClass::Ecosystem(EcosystemKind::ListItem),
+        NSID_LISTBLOCK => RecordClass::Ecosystem(EcosystemKind::ListBlock),
+        NSID_LIST_OPTOUT => RecordClass::Ecosystem(EcosystemKind::ListOptout),
+        NSID_STARTER_PACK => RecordClass::Ecosystem(EcosystemKind::StarterPack),
+        NSID_THREADGATE => RecordClass::Ecosystem(EcosystemKind::Threadgate),
+        NSID_POSTGATE => RecordClass::Ecosystem(EcosystemKind::Postgate),
+        NSID_POLL_POST => RecordClass::Ecosystem(EcosystemKind::PollPost),
+        // rkey-self records accept only rkey `self`, like profiles (§3.2).
+        NSID_LABELER_SERVICE if rkey == "self" => RecordClass::Ecosystem(EcosystemKind::LabelerService),
+        NSID_NOTIFICATION_DECLARATION | NSID_ACTOR_STATUS | NSID_CONTENT_VISIBILITY if rkey == "self" => {
+            RecordClass::Ecosystem(EcosystemKind::SelfRecord)
+        }
         _ => RecordClass::Unindexed,
     }
 }
@@ -135,9 +175,41 @@ mod tests {
     #[test]
     fn profile_other_rkeys_and_other_nsids_are_unindexed() {
         assert_eq!(classify(NSID_PROFILE, "3k"), RecordClass::Unindexed);
-        assert_eq!(classify("app.bsky.graph.list", "3k"), RecordClass::Unindexed);
+        assert_eq!(classify("app.bsky.feed.generator", "3k"), RecordClass::Unindexed);
+        assert_eq!(classify("app.bsky.graph.verification", "3k"), RecordClass::Unindexed);
+        assert_eq!(classify("app.nearhorizon.poll.vote", "3k"), RecordClass::Unindexed);
         assert_eq!(classify("not an nsid", "3k"), RecordClass::Unindexed);
         assert_eq!(skip_reason(RecordClass::Unindexed), Some("unindexed"));
+    }
+
+    /// design-v3 §3.2: the twelve collections v3 indexes.
+    #[test]
+    fn v3_collections_and_their_tables() {
+        for (nsid, kind, table) in [
+            (NSID_LIST, EcosystemKind::List, "lists"),
+            (NSID_LISTITEM, EcosystemKind::ListItem, "list_items"),
+            (NSID_LISTBLOCK, EcosystemKind::ListBlock, "list_blocks"),
+            (NSID_LIST_OPTOUT, EcosystemKind::ListOptout, "list_optouts"),
+            (NSID_STARTER_PACK, EcosystemKind::StarterPack, "starter_packs"),
+            (NSID_THREADGATE, EcosystemKind::Threadgate, "threadgates"),
+            (NSID_POSTGATE, EcosystemKind::Postgate, "postgates"),
+            (NSID_POLL_POST, EcosystemKind::PollPost, "nearhorizon_poll_posts"),
+        ] {
+            let c = classify(nsid, "3kaaaaaaaaaaa");
+            assert_eq!(c, RecordClass::Ecosystem(kind), "{nsid}");
+            assert_eq!(c.record_kind(), Some(RecordKind::Table(table)), "{nsid}");
+        }
+        // rkey-self records accept only `self`.
+        for (nsid, kind, table) in [
+            (NSID_LABELER_SERVICE, EcosystemKind::LabelerService, "labeler_services"),
+            (NSID_NOTIFICATION_DECLARATION, EcosystemKind::SelfRecord, "actor_self_records"),
+            (NSID_ACTOR_STATUS, EcosystemKind::SelfRecord, "actor_self_records"),
+            (NSID_CONTENT_VISIBILITY, EcosystemKind::SelfRecord, "actor_self_records"),
+        ] {
+            assert_eq!(classify(nsid, "self").record_kind(), Some(RecordKind::Table(table)), "{nsid}");
+            assert_eq!(classify(nsid, "self"), RecordClass::Ecosystem(kind));
+            assert_eq!(classify(nsid, "3kaaaaaaaaaaa"), RecordClass::Unindexed, "{nsid}");
+        }
     }
 
     #[test]

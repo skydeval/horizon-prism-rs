@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod normalize;
 pub mod records;
 pub mod router;
+pub mod rows;
 pub mod scripts;
 pub mod stream;
 pub mod watermark;

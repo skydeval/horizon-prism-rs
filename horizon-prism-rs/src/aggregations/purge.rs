@@ -206,11 +206,27 @@ impl Purger {
                     ("reposts", "author_did"),
                     ("follows", "author_did"),
                     ("blocks", "author_did"),
+                    // The record tables design-v3 added (§3.1).
+                    ("lists", "creator_did"),
+                    ("list_items", "author_did"),
+                    ("list_blocks", "author_did"),
+                    ("list_optouts", "author_did"),
+                    ("starter_packs", "creator_did"),
+                    ("labeler_services", "creator_did"),
+                    ("actor_self_records", "did"),
+                    ("threadgates", "author_did"),
+                    ("postgates", "author_did"),
+                    ("nearhorizon_poll_posts", "author_did"),
                 ] {
                     n += delete_batch(conn, table, "uri", &format!("{column} = $1"), did).await?;
                 }
+                // Derived counts follow their pack row.
+                n += delete_batch(conn, "starter_pack_counts", "pack_uri", "split_part(pack_uri, '/', 3) = $1", did).await?;
                 n += delete_batch(conn, "notifications", "id", "author_did = $1 OR recipient_did = $1", did).await?;
                 n += delete_batch(conn, "mutes", "ctid", "viewer_did = $1", did).await?;
+                n += viewer_private_batch(conn, did).await?;
+                // Subscriptions others hold on the deleted account go too.
+                n += delete_batch(conn, "activity_subscriptions", "ctid", "subject_did = $1", did).await?;
                 for table in ["notification_seen", "actor_counts"] {
                     n += sqlx::query(&format!("DELETE FROM {table} WHERE did = $1"))
                         .bind(did)
@@ -222,7 +238,9 @@ impl Purger {
                 // authored profile goes.
                 n += sqlx::query(
                     "UPDATE actors SET display_name = NULL, description = NULL, avatar_cid = NULL, \
-                     banner_cid = NULL, profile_record = NULL, profile_rev = NULL \
+                     banner_cid = NULL, profile_record = NULL, profile_rev = NULL, profile_cid = NULL, \
+                     pronouns = NULL, website = NULL, joined_via_starter_pack_uri = NULL, \
+                     joined_via_starter_pack_cid = NULL, profile_created_at = NULL \
                      WHERE did = $1 AND profile_record IS NOT NULL",
                 )
                 .bind(did)
@@ -236,6 +254,7 @@ impl Purger {
             }
             PurgeKind::MemberRemoved => {
                 n += delete_batch(conn, "mutes", "ctid", "viewer_did = $1", did).await?;
+                n += viewer_private_batch(conn, did).await?;
                 n += sqlx::query("DELETE FROM notification_seen WHERE did = $1")
                     .bind(did)
                     .execute(&mut *conn)
@@ -321,6 +340,24 @@ impl Purger {
         }
         Ok(resumed)
     }
+}
+
+/// One batch over the AppView-private tables design-v3 added (§3.1): state a
+/// member's own calls wrote, deleted by the `member_removed` and
+/// `account_deleted` purges.
+async fn viewer_private_batch(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
+    let mut n = 0;
+    for (table, predicate) in [
+        ("list_mutes", "viewer_did = $1"),
+        ("thread_mutes", "viewer_did = $1"),
+        ("bookmarks", "viewer_did = $1"),
+        ("drafts", "owner_did = $1"),
+        ("activity_subscriptions", "subscriber_did = $1"),
+        ("notification_preferences_v2", "did = $1"),
+    ] {
+        n += delete_batch(conn, table, "ctid", predicate, did).await?;
+    }
+    Ok(n)
 }
 
 /// `DELETE FROM table WHERE key IN (SELECT key … LIMIT BATCH)`.
@@ -506,6 +543,22 @@ mod tests {
         }
         exec(p, "INSERT INTO notification_seen (did, seen_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', now())").await;
         exec(p, "INSERT INTO backfill_jobs (did, depth, state) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'resync', 'queued')").await;
+        // The member's own AppView-private state goes; another member's
+        // stays. Its public records (a list) stay too: only membership ends.
+        for viewer in [MEMBER, OTHER_MEMBER] {
+            for sql in [
+                "INSERT INTO list_mutes (viewer_did, list_uri) VALUES ($1, 'at://x/app.bsky.graph.list/1')",
+                "INSERT INTO thread_mutes (viewer_did, root_uri) VALUES ($1, 'at://x/app.bsky.feed.post/1')",
+                "INSERT INTO bookmarks (viewer_did, post_uri, post_cid) VALUES ($1, 'at://x/app.bsky.feed.post/1', 'c')",
+                "INSERT INTO drafts (owner_did, id, draft) VALUES ($1, '3k', '{}')",
+                "INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply) VALUES ($1, 'did:plc:x', true, false)",
+                "INSERT INTO notification_preferences_v2 (did, prefs) VALUES ($1, '{}')",
+                "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) \
+                 VALUES ('at://' || $1 || '/app.bsky.graph.list/1', $1, '1', 'c', '3k', 'n', 'p', '{}', now())",
+            ] {
+                sqlx::query(sql).bind(viewer).execute(p).await.expect(sql);
+            }
+        }
 
         let mut sets = ScopeSets::default();
         for d in [MEMBER, OTHER_MEMBER] {
@@ -537,6 +590,10 @@ mod tests {
         assert_eq!(count(p, "SELECT count(*) FROM blocks").await, 1);
         assert_eq!(count(p, "SELECT count(*) FROM blocks WHERE rev = '3kaaaaaaaaaaa'").await, 1);
         assert_eq!(count(p, "SELECT count(*) FROM notification_seen").await, 0);
+        for table in ["list_mutes", "thread_mutes", "bookmarks", "drafts", "activity_subscriptions", "notification_preferences_v2"] {
+            assert_eq!(count(p, &format!("SELECT count(*) FROM {table}")).await, 1, "{table}: only the other member's row is left");
+        }
+        assert_eq!(count(p, "SELECT count(*) FROM lists").await, 2);
 
         purger.end(MEMBER).await.expect("end");
         assert_eq!(count(p, "SELECT count(*) FROM purging_dids").await, 0);
@@ -565,6 +622,26 @@ mod tests {
         .execute(p)
         .await
         .expect("post");
+        // Every v3 record table, a pack's derived counts, the account's own
+        // private state, and a subscription someone else holds on it.
+        let authored = [
+            "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES ('at://' || $1 || '/l/1', $1, '1', 'c', '3k', 'n', 'p', '{}', now())",
+            "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES ('at://' || $1 || '/li/1', $1, '1', 'c', '3k', 'l', 'did:plc:x', now())",
+            "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lb/1', $1, '1', 'c', '3k', 'l', now())",
+            "INSERT INTO list_optouts (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lo/1', $1, '1', 'c', '3k', 'l', now())",
+            "INSERT INTO starter_packs (uri, creator_did, rkey, cid, rev, name, list_uri, record, created_at) VALUES ('at://' || $1 || '/sp/1', $1, '1', 'c', '3k', 'n', 'l', '{}', now())",
+            "INSERT INTO starter_pack_counts (pack_uri, all_time_source, refreshed_at) VALUES ('at://' || $1 || '/sp/1', 'local', now())",
+            "INSERT INTO labeler_services (uri, creator_did, cid, rev, policies, record, created_at) VALUES ('at://' || $1 || '/ls/self', $1, 'c', '3k', '{}', '{}', now())",
+            "INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) VALUES ('at://' || $1 || '/s/self', $1, 's', 'c', '3k', '{}')",
+            "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, record, created_at) VALUES ('at://' || $1 || '/tg/1', $1, '1', 'c', '3k', 'p', '{}', now())",
+            "INSERT INTO postgates (uri, author_did, rkey, cid, rev, post_uri, record, created_at) VALUES ('at://' || $1 || '/pg/1', $1, '1', 'c', '3k', 'p', '{}', now())",
+            "INSERT INTO nearhorizon_poll_posts (uri, author_did, rkey, cid, rev, text, options, visibility, record, created_at) VALUES ('at://' || $1 || '/pp/1', $1, '1', 'c', '3k', 't', '[]', 'public', '{}', now())",
+            "INSERT INTO bookmarks (viewer_did, post_uri, post_cid) VALUES ($1, 'at://x/app.bsky.feed.post/1', 'c')",
+            "INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply) VALUES ('did:plc:x', $1, true, false)",
+        ];
+        for sql in authored {
+            sqlx::query(sql).bind(SCOPED).execute(p).await.expect(sql);
+        }
         let mut sets = ScopeSets::default();
         sets.scope.insert(SCOPED.into());
         let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10);
@@ -578,6 +655,23 @@ mod tests {
         assert_eq!(count(p, "SELECT count(*) FROM posts").await, 0);
         assert_eq!(count(p, "SELECT count(*) FROM purging_dids").await, 0);
         assert_eq!(count(p, "SELECT count(*) FROM actors WHERE profile_record IS NULL").await, 1);
+        for table in [
+            "lists",
+            "list_items",
+            "list_blocks",
+            "list_optouts",
+            "starter_packs",
+            "starter_pack_counts",
+            "labeler_services",
+            "actor_self_records",
+            "threadgates",
+            "postgates",
+            "nearhorizon_poll_posts",
+            "bookmarks",
+            "activity_subscriptions",
+        ] {
+            assert_eq!(count(p, &format!("SELECT count(*) FROM {table}")).await, 0, "{table}");
+        }
 
         // Idempotent through the lifecycle hook.
         PurgeLifecycle::new(purger).account_deleted(SCOPED).await.expect("again");
