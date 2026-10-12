@@ -234,6 +234,18 @@ pub struct PostRow {
     pub quote_count: Option<i32>,
 }
 
+/// A locally servable list, for a `listViewBasic`: uri, cid, name,
+/// purpose, avatar CID, indexed time, and its creator's PDS.
+type LocalListRow = (String, String, String, String, Option<String>, DateTime<Utc>, Option<String>);
+
+/// When a list reference `r` to the list row `l` **applies** (design-v3
+/// §4.3 "Effective references", "List purpose"): it is admitted, a sync
+/// has served it, its list is active, and the list is a moderation list.
+/// A reference past the member's budget, not yet synced, or to any other
+/// kind of list has no effect on any view.
+pub(crate) const APPLIES: &str =
+    "r.admitted AND r.effective AND l.state = 'active' AND l.purpose = 'app.bsky.graph.defs#modlist'";
+
 /// Viewer relationships to actors (§7.5).
 #[derive(Debug, Clone, Default)]
 pub struct ActorViewer {
@@ -241,8 +253,19 @@ pub struct ActorViewer {
     pub followed_by: HashMap<String, String>,
     pub blocking: HashMap<String, String>,
     pub blocked_by: HashSet<String>,
-    /// Subjects with a `full` direct mute.
+    /// Subjects that are fully muted: by a `full` direct mute, or by a list
+    /// mute of the viewer's that applies.
     pub muted: HashSet<String>,
+    /// Subjects on a list the viewer mutes, with that list (design-v3
+    /// §5.3). Only a mute that applies: admitted, synced since, and of a
+    /// moderation list.
+    pub muted_by_list: HashMap<String, String>,
+    /// Subjects on a list the viewer blocks, with that list, under the
+    /// same rule. Such a block is the viewer's own and applies outbound.
+    pub blocking_by_list: HashMap<String, String>,
+    /// `listViewBasic`s for the lists above that are served from local
+    /// rows.
+    pub list_views: HashMap<String, Value>,
     /// Subjects whose direct mute covers reposts (`reposts`,
     /// `reposts_and_quotes`).
     pub muted_reposts: HashSet<String>,
@@ -256,12 +279,18 @@ pub struct ActorViewer {
 impl ActorViewer {
     /// The lexicon `viewerState` for one actor. `muted` is the full mute;
     /// the scoped flags are emitted only when it is false (design-v3 §5.3,
-    /// "Viewer mute flags"). List mutes join `muted` with §II-15 item 12.
+    /// "Viewer mute flags"). A list mute that applies sets `muted` too,
+    /// and names its list whatever the direct mute's scope.
     #[must_use]
     pub fn view(&self, did: &str) -> Value {
         let mut v = serde_json::Map::new();
         let muted = self.muted.contains(did);
         v.insert("muted".into(), json!(muted));
+        for (field, by_list) in [("mutedByList", &self.muted_by_list), ("blockingByList", &self.blocking_by_list)] {
+            if let Some(view) = by_list.get(did).and_then(|list| self.list_views.get(list)) {
+                v.insert(field.into(), view.clone());
+            }
+        }
         if !muted && self.muted_reposts.contains(did) {
             v.insert("mutedOnlyReposts".into(), json!(true));
         }
@@ -284,10 +313,11 @@ impl ActorViewer {
         Value::Object(v)
     }
 
-    /// A block in either direction.
+    /// A block in either direction: a direct one, an inbound list block,
+    /// or the viewer's own list block that applies.
     #[must_use]
     pub fn blocked_either_way(&self, did: &str) -> bool {
-        self.blocking.contains_key(did) || self.blocked_by.contains(did)
+        self.blocking.contains_key(did) || self.blocked_by.contains(did) || self.blocking_by_list.contains_key(did)
     }
 }
 
@@ -572,7 +602,97 @@ impl Hydrator {
                 }
             }
         }
+        // The viewer's own list mutes and list blocks that apply (design-v3
+        // §4.3 "List purpose", §5.3): the reference is admitted and has been
+        // served by a sync, its list is active and is a moderation list.
+        // The items come from the subscription copy, never from
+        // `list_items`, so every reference is applied from one source.
+        let by_list: Vec<(String, String, String)> = sqlx::query_as(&format!(
+            "SELECT DISTINCT ON (i.subject_did, r.source) i.subject_did, r.source, r.list_uri \
+             FROM list_references r \
+             JOIN subscribed_lists l ON l.list_uri = r.list_uri \
+             JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
+             WHERE r.member_did = $1 AND {APPLIES} AND i.subject_did = ANY($2) \
+             ORDER BY i.subject_did, r.source, r.arrived_at, r.list_uri"
+        ))
+        .bind(me)
+        .bind(dids)
+        .fetch_all(p)
+        .await?;
+        for (did, source, list) in by_list {
+            // The viewer is never hidden from itself by its own list.
+            if did == me {
+                continue;
+            }
+            if source == "mute" {
+                out.muted.insert(did.clone());
+                out.muted_by_list.insert(did, list);
+            } else {
+                out.blocking_by_list.insert(did, list);
+            }
+        }
+        out.list_views = self.local_list_basics(me, out.muted_by_list.values().chain(out.blocking_by_list.values())).await?;
         Ok(out)
+    }
+
+    /// `listViewBasic`s for those of `lists` that are locally servable
+    /// (their owner is a ready member), with the viewer's own state on
+    /// them. Any other list has no view here: its record is not stored.
+    async fn local_list_basics(&self, me: &str, lists: impl Iterator<Item = &String>) -> Result<HashMap<String, Value>, sqlx::Error> {
+        let mut uris: Vec<String> = lists.cloned().collect();
+        uris.sort_unstable();
+        uris.dedup();
+        if uris.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows: Vec<LocalListRow> = sqlx::query_as(
+            "SELECT l.uri, l.cid, l.name, l.purpose, l.avatar_cid, l.indexed_at, a.pds_endpoint FROM lists l \
+             JOIN members m ON m.did = l.creator_did AND m.ready_at IS NOT NULL \
+             LEFT JOIN actors a ON a.did = l.creator_did WHERE l.uri = ANY($1)",
+        )
+        .bind(&uris)
+        .fetch_all(self.pool())
+        .await?;
+        let muted: HashSet<String> = sqlx::query_scalar("SELECT list_uri FROM list_mutes WHERE viewer_did = $1 AND list_uri = ANY($2)")
+            .bind(me)
+            .bind(&uris)
+            .fetch_all(self.pool())
+            .await?
+            .into_iter()
+            .collect();
+        let blocked: HashMap<String, String> = sqlx::query_as(
+            "SELECT DISTINCT ON (list_uri) list_uri, uri FROM list_blocks WHERE author_did = $1 AND list_uri = ANY($2) ORDER BY list_uri, created_at, uri",
+        )
+        .bind(me)
+        .bind(&uris)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .collect();
+        let labels = self.load_labels(&uris).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(uri, cid, name, purpose, avatar_cid, indexed_at, pds)| {
+                let mut viewer = json!({ "muted": muted.contains(&uri) });
+                if let Some(record) = blocked.get(&uri) {
+                    viewer["blocked"] = json!(record);
+                }
+                let mut view = json!({
+                    "uri": uri,
+                    "cid": cid,
+                    "name": name,
+                    "purpose": purpose,
+                    "labels": labels.get(&uri).cloned().unwrap_or_default(),
+                    "viewer": viewer,
+                    "indexedAt": ts(indexed_at),
+                });
+                let creator = uri_author(&uri).unwrap_or_default();
+                if let Some(url) = avatar_cid.as_deref().and_then(|cid| blob_url(pds.as_deref(), creator, cid)) {
+                    view["avatar"] = json!(url);
+                }
+                (uri, view)
+            })
+            .collect())
     }
 
     /// Normalize an upstream view for `viewer` (§8.6): local viewer state

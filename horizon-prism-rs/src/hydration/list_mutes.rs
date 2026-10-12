@@ -175,6 +175,113 @@ mod tests {
         uri
     }
 
+    /// A list mute or list block hides its list's members only when it
+    /// applies: admitted, served by a sync, on an active moderation list.
+    #[tokio::test]
+    async fn only_a_reference_that_applies_hides_anyone() {
+        const CAROL: &str = "did:plc:cccccccccccccccccccccccc";
+        const OWNER: &str = "did:plc:oooooooooooooooooooooooo";
+        let Some(db) = fresh_db("hydration_list_mutes_apply").await else {
+            return;
+        };
+        let p = &db.pool;
+        for (did, handle) in [(ALICE, "alice.test"), (BOB, "bob.test"), (CAROL, "carol.test")] {
+            actor(p, did, handle, handle).await;
+        }
+        exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now()), ('{BOB}', 'admin', now())")).await;
+        let h = hydrator(p, ScopeSets::default());
+        let me = Viewer { did: Some(ALICE.into()), hydrate: true };
+        // One list of a ready member (its view can be shown) and one of an
+        // outside owner. Carol is on both.
+        let local = list(p, "3kmods", PURPOSE_MOD).await;
+        let outside = format!("at://{OWNER}/app.bsky.graph.list/3kout");
+        for (uri, owner) in [(&local, BOB), (&outside, OWNER)] {
+            exec(p, &format!("INSERT INTO subscribed_lists (list_uri, owner_did, state, purpose) VALUES ('{uri}', '{owner}', 'active', '{PURPOSE_MOD}')")).await;
+            exec(
+                p,
+                &format!(
+                    "INSERT INTO subscribed_list_items (uri, list_uri, owner_did, rkey, cid, rev, subject_did) VALUES \
+                     ('at://{owner}/app.bsky.graph.listitem/3kc', '{uri}', '{owner}', '3kc', 'c', '3k', '{CAROL}'), \
+                     ('at://{owner}/app.bsky.graph.listitem/3ka', '{uri}', '{owner}', '3ka', 'c', '3k', '{ALICE}')"
+                ),
+            )
+            .await;
+        }
+        let reference = |uri: &String, source: &'static str, effective: bool| {
+            let uri = uri.clone();
+            async move {
+                exec(
+                    p,
+                    &format!(
+                        "INSERT INTO list_references (member_did, list_uri, source, admitted, effective) VALUES \
+                         ('{ALICE}', '{uri}', '{source}', true, {effective}) \
+                         ON CONFLICT (member_did, list_uri, source) DO UPDATE SET effective = EXCLUDED.effective"
+                    ),
+                )
+                .await;
+            }
+        };
+        let state = || {
+            let (h, me) = (&h, &me);
+            async move { h.actor_viewer(me, &[CAROL.to_string(), ALICE.to_string()]).await.expect("viewer") }
+        };
+        exec(
+            p,
+            &format!(
+                "INSERT INTO notifications (recipient_did, author_did, reason, record_uri, record_cid) VALUES \
+                 ('{ALICE}', '{CAROL}', 'follow', 'at://{CAROL}/app.bsky.graph.follow/3k', 'bafy')"
+            ),
+        )
+        .await;
+        let unread = || {
+            let (h, me) = (&h, &me);
+            async move { h.unread_count(me).await.expect("db").expect("count").inner()["count"].clone() }
+        };
+
+        // Admitted but not yet served by a sync: no effect anywhere.
+        reference(&outside, "mute", false).await;
+        let s = state().await;
+        assert!(!s.muted.contains(CAROL) && !s.blocked_either_way(CAROL));
+        assert_eq!(unread().await, json!(1));
+
+        // Served: the mute applies. The outside list has no view to show.
+        reference(&outside, "mute", true).await;
+        let s = state().await;
+        assert!(s.muted.contains(CAROL) && !s.blocked_either_way(CAROL));
+        assert_eq!(s.view(CAROL)["muted"], json!(true));
+        assert!(s.view(CAROL).get("mutedByList").is_none());
+        // The viewer's own entry on the list does nothing to the viewer.
+        assert!(!s.muted.contains(ALICE));
+        assert_eq!(unread().await, json!(0));
+
+        // A list that is not a moderation list (any more) is dormant.
+        exec(p, &format!("UPDATE subscribed_lists SET purpose = '{PURPOSE_CURATE}' WHERE list_uri = '{outside}'")).await;
+        assert!(!state().await.muted.contains(CAROL));
+        assert_eq!(unread().await, json!(1));
+        exec(p, &format!("UPDATE subscribed_lists SET purpose = NULL WHERE list_uri = '{outside}'")).await;
+        assert!(!state().await.muted.contains(CAROL));
+
+        // A list of a ready member: the view names the list.
+        reference(&local, "mute", true).await;
+        let s = state().await;
+        assert_eq!(s.view(CAROL)["mutedByList"]["uri"], json!(local));
+        assert_eq!(s.view(CAROL)["mutedByList"]["name"], json!("3kmods"));
+        // A list block applies as a block does, outbound.
+        reference(&local, "block", true).await;
+        let s = state().await;
+        assert!(s.blocked_either_way(CAROL));
+        assert_eq!(s.view(CAROL)["blockingByList"]["uri"], json!(local));
+        assert_eq!(s.view(CAROL)["blockedBy"], json!(false));
+        // A list being released applies no longer.
+        exec(p, "UPDATE subscribed_lists SET state = 'unreferenced'").await;
+        let s = state().await;
+        assert!(!s.muted.contains(CAROL) && !s.blocked_either_way(CAROL));
+        // Nobody else's view is touched by Alice's references.
+        let bob = h.actor_viewer(&Viewer { did: Some(BOB.into()), hydrate: true }, &[CAROL.to_string()]).await.expect("viewer");
+        assert!(!bob.muted.contains(CAROL) && !bob.blocked_either_way(CAROL));
+        db.drop_db().await;
+    }
+
     /// A moderation list can be muted, up to the member's budget; any
     /// other list, or anything that is not a list, is refused; the mutes
     /// and the blocks are listed newest first.

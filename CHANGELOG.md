@@ -19,9 +19,19 @@ commit.
   `400 InvalidRequest` and nothing is written. A list that is not a
   moderation list, or a URI that is not a list, is `400 InvalidRequest`.
   The two listings show the lists the member mutes and blocks, newest
-  first, whether or not they have an effect yet. A mute does not hide
-  anything yet: applying it to feeds, notifications, threads and viewer
-  state is the next step (design-v3 §5.3).
+  first, whether or not they have an effect yet (design-v3 §5.3).
+- **Item 12: a member's list mutes and list blocks take effect
+  (#673).** Once a list's owner has been synced, the accounts on a
+  moderation list the member mutes are treated as fully muted, and those
+  on one it blocks as blocked by the member: in the timeline and list
+  feeds, notifications and the unread count, threads, and everywhere
+  else a direct mute or block already applies. Profile views carry
+  `muted: true`, and `mutedByList` / `blockingByList` when the list
+  belongs to a ready member (other lists' views are not stored, so the
+  field is left out). A reference past the member's budget, not yet
+  synced, or to a list that is not a moderation list changes nothing.
+  The members come from the private copy only, and nobody else's views
+  are affected (design-v3 §4.3 "List purpose", §5.3).
 - **Item 12: budget changes and tombstone clean-up (#673).** At startup
   every member's references are checked again against the configured
   budget, so raising `lists.subscribed_max_per_member` or

@@ -32,6 +32,8 @@ fn parse_cursor(c: Option<&str>) -> (Option<DateTime<Utc>>, i64) {
 //   excludes every reason, a repost mute the repost reasons, a quote mute
 //   `quote`.
 // - Blocks in either direction.
+// - The viewer's own list mutes and list blocks that apply (design-v3
+//   §4.3 "List purpose"): as a full mute, and as a direct block.
 // - Muted threads: the notification's record or its subject post is the
 //   muted root, or a post under it.
 const EXCLUSIONS: &str = "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did \
@@ -40,6 +42,11 @@ const EXCLUSIONS: &str = "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did =
          OR (m.scope IN ('quotes', 'reposts_and_quotes') AND n.reason = 'quote'))) \
      AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = n.author_did) \
                      OR (b.author_did = n.author_did AND b.subject_did = $1)) \
+     AND NOT EXISTS (SELECT 1 FROM list_references r \
+                     JOIN subscribed_lists l ON l.list_uri = r.list_uri \
+                     JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
+                     WHERE r.member_did = $1 AND i.subject_did = n.author_did \
+                       AND r.admitted AND r.effective AND l.state = 'active' AND l.purpose = 'app.bsky.graph.defs#modlist') \
      AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
                        n.record_uri, n.reason_subject, \
                        (SELECT p.reply_root_uri FROM posts p WHERE p.uri = n.record_uri), \
