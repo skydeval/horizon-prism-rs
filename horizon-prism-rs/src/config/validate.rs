@@ -41,6 +41,7 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if cfg.op_thread.max_walk > 1000 {
         out.push("op_thread.max_walk must be at most 1000".to_string());
     }
+    lists_problems(cfg, &mut out);
     if !(1..=100).contains(&cfg.lists.read_listing_pages) {
         out.push("lists.read_listing_pages must be 1 to 100".to_string());
     }
@@ -95,6 +96,51 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
         out.push("thread.max_nodes must be at least 1".to_string());
     }
     out
+}
+
+/// `[lists]` rule-4 keys (design-v3 §4.3, §13).
+fn lists_problems(cfg: &FileConfig, out: &mut Vec<String>) {
+    let l = &cfg.lists;
+    for (name, value) in [
+        ("subscribed_max_per_member", u64::from(l.subscribed_max_per_member)),
+        ("max_owners_per_member", u64::from(l.max_owners_per_member)),
+        ("subscribed_max_items", u64::from(l.subscribed_max_items)),
+        ("subscription_tombstones_max_per_owner", u64::from(l.subscription_tombstones_max_per_owner)),
+        ("sync_min_interval_secs", u64::from(l.sync_min_interval_secs)),
+        ("sync_max_concurrent", u64::from(l.sync_max_concurrent)),
+        ("sync_slow_max_concurrent", u64::from(l.sync_slow_max_concurrent)),
+        ("sync_stuck_secs", u64::from(l.sync_stuck_secs)),
+        ("subscribed_max_owner_listitems", l.subscribed_max_owner_listitems),
+        ("sync_max_pages", u64::from(l.sync_max_pages)),
+        ("sync_probe_call_secs", u64::from(l.sync_probe_call_secs)),
+        ("sync_min_records_per_call_sec", u64::from(l.sync_min_records_per_call_sec)),
+        ("sync_max_call_secs", u64::from(l.sync_max_call_secs)),
+        ("sync_max_wall_secs", u64::from(l.sync_max_wall_secs)),
+    ] {
+        if value == 0 {
+            out.push(format!("lists.{name} must be at least 1"));
+        }
+    }
+    if l.sync_probe_call_secs > l.sync_max_call_secs {
+        out.push("lists.sync_probe_call_secs must be at most lists.sync_max_call_secs".to_string());
+    }
+    // Two backfill workers always stay free for readiness jobs.
+    let lanes = u64::from(l.sync_max_concurrent) + u64::from(l.sync_slow_max_concurrent);
+    if lanes + 2 > u64::from(cfg.backfill.concurrency) {
+        out.push(format!(
+            "lists.sync_max_concurrent + lists.sync_slow_max_concurrent ({lanes}) must be at most backfill.concurrency - 2 ({})",
+            i64::from(cfg.backfill.concurrency) - 2
+        ));
+    }
+    // On an idle host the wall bound must never cut an owner the records,
+    // pages, throughput and in-call bounds would let finish.
+    let rate = u64::from(cfg.backfill.per_pds_rate_per_sec.max(1));
+    let least_wall = u64::from(l.sync_max_call_secs) + l.subscribed_max_owner_listitems.div_ceil(100).div_ceil(rate);
+    if u64::from(l.sync_max_wall_secs) < least_wall {
+        out.push(format!(
+            "lists.sync_max_wall_secs must be at least {least_wall} (sync_max_call_secs + subscribed_max_owner_listitems / 100 / backfill.per_pds_rate_per_sec)"
+        ));
+    }
 }
 
 fn indexing(cfg: &FileConfig, out: &mut Vec<String>) {

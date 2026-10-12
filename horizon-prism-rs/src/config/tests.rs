@@ -297,6 +297,20 @@ max_walk = 50
 
 [lists]
 read_listing_pages = 5
+subscribed_max_per_member = 25
+max_owners_per_member = 10
+subscribed_max_items = 50000
+subscription_tombstones_max_per_owner = 10000
+sync_min_interval_secs = 600
+sync_max_concurrent = 1
+sync_slow_max_concurrent = 1
+sync_stuck_secs = 5400
+subscribed_max_owner_listitems = 1000000
+sync_max_pages = 20000
+sync_probe_call_secs = 60
+sync_min_records_per_call_sec = 200
+sync_max_call_secs = 900
+sync_max_wall_secs = 3600
 
 [farsight]
 timeout_ms = 500
@@ -726,6 +740,26 @@ fn zero_values_that_break_runtime_are_rejected() {
         let p = invalid_problems(load(&text));
         assert!(has(&p, &format!("{section}.{key} must be greater than 0")), "{section}.{key}");
     }
+}
+
+/// design-v3 §4.3, §13: the list-sync lanes leave two backfill workers
+/// free, and the wall bound cannot cut what the other bounds allow.
+#[test]
+fn list_sync_bounds_are_checked_against_each_other() {
+    let p = invalid_problems(load("[lists]\nsync_max_concurrent = 2\n"));
+    assert!(has(&p, "must be at most backfill.concurrency - 2"), "{p:?}");
+    let p = invalid_problems(load("[backfill]\nconcurrency = 3\n"));
+    assert!(has(&p, "must be at most backfill.concurrency - 2"), "{p:?}");
+    // 900 + 1 000 000 / 100 / 5 = 2900 at the defaults.
+    let p = invalid_problems(load("[lists]\nsync_max_wall_secs = 2899\n"));
+    assert!(has(&p, "lists.sync_max_wall_secs must be at least 2900"), "{p:?}");
+    assert!(load("[lists]\nsync_max_wall_secs = 2900\n").is_ok());
+    let p = invalid_problems(load("[lists]\nsync_probe_call_secs = 901\n"));
+    assert!(has(&p, "sync_probe_call_secs must be at most"), "{p:?}");
+    let p = invalid_problems(load("[lists]\nsubscribed_max_per_member = 0\nmax_owners_per_member = 0\n"));
+    assert!(has(&p, "lists.subscribed_max_per_member must be at least 1") && has(&p, "lists.max_owners_per_member must be at least 1"));
+    // The removed aggregate cap is an unknown key.
+    assert!(load("[lists]\nsubscribed_max_total = 5\n").is_err());
 }
 
 #[test]

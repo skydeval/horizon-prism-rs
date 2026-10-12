@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 12: `[lists]` settings for members' list mutes and blocks
+  (#673).** The per-member budget (`subscribed_max_per_member` 25,
+  `max_owners_per_member` 10, `subscribed_max_items` 50 000), the
+  tombstone cap, and the list-sync pacing, lanes and per-run bounds, all
+  at the design's defaults. Startup refuses lanes that would leave fewer
+  than two backfill workers for readiness jobs, and a wall-time bound
+  shorter than the other bounds allow. Nothing reads them yet
+  (design-v3 §4.3, §13).
 - **Item 12: the list phase, release, and sync enqueue rules (#673).**
   `subscriptions::list_phase` turns a change marker into the list's
   `subscribed_lists` row (active while an admitted reference exists,

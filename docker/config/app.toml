@@ -359,6 +359,43 @@ max_walk = 50
 [lists]
 read_listing_pages = 5
 
+# A member's own list mutes and list blocks. To apply one, this server keeps
+# a private copy of the list. These bound what one member can make it keep.
+# Each limit counts mutes and blocks separately, so a member can hold twice
+# as many in all.
+#   subscribed_max_per_member  lists one member's mutes (or blocks) may use
+#   max_owners_per_member      different list owners those lists may have
+#   subscribed_max_items       entries kept of one list (the oldest ones)
+# A list mute past the limit is refused. A list block past it is stored but
+# has no effect, because the block lives in the member's own account.
+subscribed_max_per_member = 25
+max_owners_per_member = 10
+subscribed_max_items = 50000
+# Deleted list entries are remembered for a while so a late copy of one
+# cannot bring it back. This many are remembered per list owner.
+subscription_tombstones_max_per_owner = 10000
+
+# Copying a list owner's lists from the owner's server ("list sync").
+#   sync_min_interval_secs    least time between two copies for one owner
+#   sync_max_concurrent       owners copied at once
+#   sync_slow_max_concurrent  slow owners copied at once, on their own lane
+# The two together must leave two of [backfill] concurrency free.
+sync_min_interval_secs = 600
+sync_max_concurrent = 1
+sync_slow_max_concurrent = 1
+# A copy that looks stuck for this long (seconds) is started over.
+sync_stuck_secs = 5400
+# One copy stops early when the owner has more than this many records, takes
+# more than this many pages, answers slower than sync_min_records_per_call_sec
+# after sync_probe_call_secs of waiting on it, or takes longer than
+# sync_max_call_secs waiting on it or sync_max_wall_secs in all.
+subscribed_max_owner_listitems = 1000000
+sync_max_pages = 20000
+sync_probe_call_secs = 60
+sync_min_records_per_call_sec = 200
+sync_max_call_secs = 900
+sync_max_wall_secs = 3600
+
 # Farsight is the block-list index of this stack. With url set, the app asks
 # it, when a member loads a page, which accounts on that page block the
 # member through a block list. With url unset (the default) it is never

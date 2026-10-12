@@ -1024,11 +1024,50 @@ impl Default for OpThreadConfig {
 pub struct ListsConfig {
     /// Owner-PDS pages one `getList` request reads when no AppView answers.
     pub read_listing_pages: u32,
+    // Rule 4 (design-v3 §4.3): a member's budget, per source.
+    /// Admitted references one member may hold of one source.
+    pub subscribed_max_per_member: u32,
+    /// Distinct list owners those references may name.
+    pub max_owners_per_member: u32,
+    /// Items kept of one subscribed list (its smallest record keys).
+    pub subscribed_max_items: u32,
+    /// Tombstones kept per list owner.
+    pub subscription_tombstones_max_per_owner: u32,
+    // `list_sync` pacing and lanes.
+    /// The least time between two runs for one owner.
+    pub sync_min_interval_secs: u32,
+    pub sync_max_concurrent: u32,
+    pub sync_slow_max_concurrent: u32,
+    /// A run left `running` this long with nothing running it is re-queued.
+    pub sync_stuck_secs: u32,
+    // The bounds of one run's listings.
+    pub subscribed_max_owner_listitems: u64,
+    pub sync_max_pages: u32,
+    pub sync_probe_call_secs: u32,
+    pub sync_min_records_per_call_sec: u32,
+    pub sync_max_call_secs: u32,
+    pub sync_max_wall_secs: u32,
 }
 
 impl Default for ListsConfig {
     fn default() -> Self {
-        Self { read_listing_pages: 5 }
+        Self {
+            read_listing_pages: 5,
+            subscribed_max_per_member: 25,
+            max_owners_per_member: 10,
+            subscribed_max_items: 50_000,
+            subscription_tombstones_max_per_owner: 10_000,
+            sync_min_interval_secs: 600,
+            sync_max_concurrent: 1,
+            sync_slow_max_concurrent: 1,
+            sync_stuck_secs: 5400,
+            subscribed_max_owner_listitems: 1_000_000,
+            sync_max_pages: 20_000,
+            sync_probe_call_secs: 60,
+            sync_min_records_per_call_sec: 200,
+            sync_max_call_secs: 900,
+            sync_max_wall_secs: 3600,
+        }
     }
 }
 
