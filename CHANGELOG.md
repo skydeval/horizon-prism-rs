@@ -12,6 +12,15 @@ commit.
 
 ### Added
 
+- **Item 12b: fallback settings (#683).** A `[farsight.fallback]`
+  section, off by default: `enabled`, `network`, `timeout_ms`,
+  `max_calls_per_request`, `cache_ttl_secs`, `rate_per_sec`, `burst` and
+  `requester_share`. With the switch off the values are only parsed, and
+  `serve` logs any it would reject; with it on, startup refuses a
+  missing `farsight.url`, a network that is unknown, disabled, local or
+  not `unauth`, and numbers out of range. Nothing reads them yet: no
+  fallback call is made (design-v3 §5.14.17.1; proposed locked decision
+  39).
 - **Item 12a: one set of blocks for a whole request (#674).** A request
   can supply the blocks it knows beyond local rows
   (`hydration::with_known_blocks`), and every view built for it

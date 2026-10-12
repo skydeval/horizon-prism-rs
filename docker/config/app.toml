@@ -430,6 +430,24 @@ burst = 100
 requester_share = 0.25           # the most one member may use of that rate
 prime_on_enroll = true           # ask Farsight to read a new member's repo
 
+# A stand-in for when Farsight is down. Off unless you turn it on, and it
+# needs farsight.url above. While Farsight has stopped answering, a ready
+# member's pages ask one other AppView (an entry of the routing table
+# below, which must not need sign-in) who blocks the member through a list.
+# That AppView then sees the member's DID beside the accounts on its pages,
+# which Farsight being yours avoids; that is why this is off by default.
+# Its answers are never treated as complete, and Farsight's are never
+# overridden by them.
+[farsight.fallback]
+enabled = false
+network = "bluesky"              # which routing-table entry to ask
+timeout_ms = 1000                # one call, and all one request may wait
+max_calls_per_request = 2        # each call covers up to 30 accounts
+cache_ttl_secs = 300             # how long one of its answers is kept
+rate_per_sec = 10.0
+burst = 20
+requester_share = 0.25           # the most one member may use of that rate
+
 # Limits on checking sign-in tokens before a request is charged to anyone.
 # They stop forged or broken tokens from using up CPU or a member's limits.
 [auth]

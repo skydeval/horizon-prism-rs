@@ -23,7 +23,7 @@ pub use sections::{
     ActivitySubscriptionsConfig, AdminConfig, AuthConfig, BookmarkCount, BookmarksConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
     CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, DraftsConfig, FeaturesConfig,
     FarsightConfig, FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
-    KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelersConfig, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig, ThreadLensConfig,
+    KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelersConfig, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig, ThreadLensConfig, FarsightFallbackConfig,
     PrivateReadConfig, PrivateReadFloors, PublicScope, RateClassConfig, RateLimitsConfig,
     RetentionConfig, SchemaBackfillConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
     StarterPacksConfig, SyncConfig, ThreadConfig, ThreadMutesConfig, ThreadV2Config, UtcTimeOfDay,
@@ -160,6 +160,11 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut problems = validate::problems(&self.file, &self.env.public_hostname);
         crate::farsight::config_problems(&self.file.farsight, self.env.farsight_token.is_some(), &mut problems);
+        // The fallback's keys are checked only when it is switched on;
+        // off, `serve` logs what it would reject and starts.
+        if self.file.farsight.fallback.enabled {
+            problems.extend(crate::farsight::fallback_problems(&self.file.farsight, &self.file.constellation.networks));
+        }
         if problems.is_empty() {
             Ok(())
         } else {

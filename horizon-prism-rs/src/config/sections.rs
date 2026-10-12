@@ -956,6 +956,50 @@ pub struct FarsightConfig {
     pub requester_share: Float,
     /// Whether enrolling a member asks Farsight to read its repository.
     pub prime_on_enroll: bool,
+    /// `[farsight.fallback]`: off by default.
+    pub fallback: FarsightFallbackConfig,
+}
+
+/// `[farsight.fallback]` (design-v3 §5.14.17; proposed locked decision
+/// 39): while Farsight is down, a ready member's ordinary render may ask
+/// one AppView of the routing table who blocks the member through a list.
+/// Off by default. The numbers are signed so that a negative value is out
+/// of range rather than of the wrong type: with the switch off they are
+/// only parsed, and a config that never enables the fallback always
+/// starts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FarsightFallbackConfig {
+    pub enabled: bool,
+    /// The `name` of a `[[constellation.networks]]` entry; its
+    /// `appview_url` is the AppView asked.
+    pub network: String,
+    /// One fallback call, and all one request may wait on the fallback.
+    pub timeout_ms: i64,
+    /// Calls of up to 30 accounts one request may make.
+    pub max_calls_per_request: i64,
+    /// Lifetime of a fallback result.
+    pub cache_ttl_secs: i64,
+    /// The fallback's own request bucket.
+    pub rate_per_sec: Float,
+    pub burst: i64,
+    /// One requester's share of that bucket.
+    pub requester_share: Float,
+}
+
+impl Default for FarsightFallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            network: "bluesky".to_string(),
+            timeout_ms: 1000,
+            max_calls_per_request: 2,
+            cache_ttl_secs: 300,
+            rate_per_sec: Float(10.0),
+            burst: 20,
+            requester_share: Float(0.25),
+        }
+    }
 }
 
 impl Default for FarsightConfig {
@@ -971,6 +1015,7 @@ impl Default for FarsightConfig {
             burst: 100,
             requester_share: Float(0.25),
             prime_on_enroll: true,
+            fallback: FarsightFallbackConfig::default(),
         }
     }
 }

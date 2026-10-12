@@ -26,7 +26,7 @@ pub use answer::{ChunkAnswer, Coverage, PairAnswer, Relation};
 pub use client::{CallError, FarsightClient};
 pub use lookup::{Farsight, Lookup, PairAnswers, PairBudget};
 
-use crate::config::{FarsightConfig, RateClassConfig};
+use crate::config::{FarsightConfig, LOCAL_APPVIEW, NetworkAuth, NetworkConfig, RateClassConfig};
 use crate::xrpc::rate_limit::class_problem;
 
 /// Every problem in `[farsight]` (design-v3 §5.14.4, §13). `token` is
@@ -63,10 +63,85 @@ pub fn config_problems(cfg: &FarsightConfig, token: bool, out: &mut Vec<String>)
     }
 }
 
+/// What startup rejects in `[farsight.fallback]` when the fallback is
+/// enabled (design-v3 §5.14.17.1). With the switch off these are not
+/// errors: `serve` logs them and starts.
+#[must_use]
+pub fn fallback_problems(cfg: &FarsightConfig, networks: &[NetworkConfig]) -> Vec<String> {
+    let f = &cfg.fallback;
+    let mut out = Vec::new();
+    // The fallback is for a Farsight that is down, never in its place.
+    if cfg.url.is_none() {
+        out.push("farsight.fallback.enabled needs farsight.url: the fallback only stands in while a configured Farsight is down".to_string());
+    }
+    match networks.iter().find(|n| n.name == f.network) {
+        None => out.push(format!("farsight.fallback.network = {:?} names no [[constellation.networks]] entry", f.network)),
+        Some(n) if !n.enabled => out.push(format!("farsight.fallback.network = {:?} names an entry that is not enabled", f.network)),
+        Some(n) if n.appview_url == LOCAL_APPVIEW => out.push(format!("farsight.fallback.network = {:?} names the local entry, which has no AppView to ask", f.network)),
+        // A signed call would put this AppView's identity beside the
+        // viewer's DID; the method needs no authentication.
+        Some(n) if n.auth != NetworkAuth::Unauth => {
+            out.push(format!("farsight.fallback.network = {:?} names an entry whose auth is not \"unauth\"", f.network));
+        }
+        Some(_) => {}
+    }
+    let ttl_floor = i64::try_from(cfg.cache_ttl_secs).unwrap_or(i64::MAX);
+    for (key, value, min, max) in [
+        ("timeout_ms", f.timeout_ms, 100, 2000),
+        ("max_calls_per_request", f.max_calls_per_request, 1, 10),
+        ("cache_ttl_secs", f.cache_ttl_secs, ttl_floor, 3600),
+    ] {
+        if !(min..=max).contains(&value) {
+            out.push(format!("farsight.fallback.{key} = {value} is outside {min}..={max}"));
+        }
+    }
+    match u32::try_from(f.burst) {
+        Ok(burst) => {
+            if let Some(p) = class_problem(RateClassConfig::new(f.rate_per_sec.0, burst)) {
+                out.push(format!("farsight.fallback.rate_per_sec: {p}"));
+            }
+        }
+        Err(_) => out.push(format!("farsight.fallback.burst = {} is out of range", f.burst)),
+    }
+    let share = f.requester_share.0;
+    if !(share > 0.0 && share <= 1.0) {
+        out.push(format!("farsight.fallback.requester_share = {share} must be above 0 and at most 1"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::FileConfig;
+
+    /// design-v3 §5.14.17.1: off, the fallback's keys never stop a start;
+    /// on, each bad value is named.
+    #[test]
+    fn the_fallbacks_keys_are_checked_only_when_it_is_on() {
+        let problems = |toml: &str| {
+            let cfg = FileConfig::parse(toml).expect("parse");
+            fallback_problems(&cfg.farsight, &cfg.constellation.networks)
+        };
+        let on = "[farsight]\nurl = \"https://farsight.example.net\"\n[farsight.fallback]\nenabled = true\n";
+        assert_eq!(problems(on), Vec::<String>::new(), "the defaults are valid");
+        let has = |toml: &str, needle: &str| {
+            let out = problems(toml);
+            assert!(out.iter().any(|p| p.contains(needle)), "{needle:?} not in {out:?}");
+        };
+        has("[farsight.fallback]\nenabled = true\n", "needs farsight.url");
+        has(&format!("{on}network = \"nowhere\"\n"), "names no [[constellation.networks]] entry");
+        has(&format!("{on}network = \"community\"\n"), "local entry");
+        has(&format!("{on}timeout_ms = -5\n"), "farsight.fallback.timeout_ms = -5");
+        has(&format!("{on}max_calls_per_request = 11\n"), "farsight.fallback.max_calls_per_request");
+        // Not shorter-lived than a Farsight answer.
+        has(&format!("{on}cache_ttl_secs = 10\n"), "farsight.fallback.cache_ttl_secs = 10 is outside 30..=3600");
+        has(&format!("{on}burst = -1\n"), "farsight.fallback.burst");
+        has(&format!("{on}requester_share = 0.0\n"), "farsight.fallback.requester_share");
+        // A wrong type and an unknown key are parse errors whatever the switch.
+        assert!(FileConfig::parse("[farsight.fallback]\ntimeout_ms = \"soon\"\n").is_err());
+        assert!(FileConfig::parse("[farsight.fallback]\nno_such_key = 1\n").is_err());
+    }
 
     fn check(toml: &str, token: bool) -> Vec<String> {
         let cfg = FileConfig::parse(toml).expect("parse");

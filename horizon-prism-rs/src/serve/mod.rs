@@ -179,6 +179,16 @@ pub async fn run() -> Result<(), StartupError> {
     // Every upstream a public request reaches has one request bucket,
     // split into pools and per-requester shares (design-v3 §II-8.3).
     let shares = Shares::from_config(&cfg.file);
+    // The fallback's keys stop a start only when it is switched on
+    // (§5.14.17.1); off, what would be rejected is only said.
+    if !cfg.file.farsight.fallback.enabled {
+        for problem in crate::farsight::fallback_problems(&cfg.file.farsight, &cfg.file.constellation.networks)
+            .into_iter()
+            .filter(|p| !p.contains("needs farsight.url"))
+        {
+            tracing::warn!(event = "farsight_fallback_config", %problem, "this value would be rejected if farsight.fallback.enabled were true");
+        }
+    }
     // The block-list index (design-v3 §5.14), only when configured.
     let farsight = match (&cfg.file.farsight.url, &cfg.env.farsight_token) {
         (Some(url), Some(token)) => {
