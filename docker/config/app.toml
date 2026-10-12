@@ -300,6 +300,12 @@ scan_max_pages = 5
 [thread_v2]
 max_parents = 80
 
+# A feed post that is part of its author's own thread says where it sits
+# ("2 of 5"). This is the longest such thread that gets worked out; a post in
+# a longer one carries no position. 0 turns it off.
+[op_thread]
+max_walk = 50
+
 # Showing a list that no other AppView could answer for: how many pages of
 # the list owner's records one request may read from the owner's server.
 [lists]

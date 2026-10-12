@@ -881,6 +881,21 @@ impl Default for ThreadV2Config {
     }
 }
 
+/// `[op_thread]` (design-v3 §8.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpThreadConfig {
+    /// Stored posts one feed item's walk along its author's thread may
+    /// cover. Below 2, feed items carry no thread position.
+    pub max_walk: u32,
+}
+
+impl Default for OpThreadConfig {
+    fn default() -> Self {
+        Self { max_walk: 50 }
+    }
+}
+
 /// `[lists]` (design-v3 §5.5).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1065,6 +1080,7 @@ pub struct FileConfig {
     pub auth: AuthConfig,
     pub thread: ThreadConfig,
     pub thread_v2: ThreadV2Config,
+    pub op_thread: OpThreadConfig,
     pub thread_mutes: ThreadMutesConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,

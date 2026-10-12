@@ -452,6 +452,80 @@ impl Hydrator {
         Ok(Ok(Self::emit(json!({ "posts": posts }))))
     }
 
+    /// By post: its place and the length of its thread's contiguous run by
+    /// the root's author (design-v3 §5.1 "OP thread", §8.2), for the posts
+    /// on such a run of two or more. Stored posts only, at most
+    /// `op_thread.max_walk` of them: a post is left out when the run is
+    /// longer, when a post above it is not stored, or when its author is out
+    /// of scope (whose replies are not all here).
+    async fn op_paths(&self, posts: &HashMap<String, PostRow>, uris: &[String]) -> Result<HashMap<String, (i32, i32)>, sqlx::Error> {
+        let max = i32::try_from(self.inner.cfg.op_thread_max_walk).unwrap_or(i32::MAX);
+        if max < 2 {
+            return Ok(HashMap::new());
+        }
+        let starts: Vec<String> = {
+            let scope = self.scope().read_guard().await;
+            let mut starts: Vec<String> = Vec::new();
+            for uri in uris {
+                let Some(row) = posts.get(uri) else { continue };
+                let by_root_author = row.reply_root_uri.as_deref().is_none_or(|root| root.split('/').nth(2) == Some(row.author_did.as_str()));
+                if by_root_author && scope.in_scope(&row.author_did) && !starts.contains(uri) {
+                    starts.push(uri.clone());
+                }
+            }
+            starts
+        };
+        if starts.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Up: each step must be the author's earliest reply to a post by the
+        // same author. The walk is on the run only when it ends at a root.
+        let up: Vec<(String, i32, bool)> = sqlx::query_as(
+            "WITH RECURSIVE up(start, uri, parent, author, at, n) AS ( \
+               SELECT uri, uri, reply_parent_uri, author_did, created_at, 0 FROM posts WHERE uri = ANY($1) \
+               UNION ALL \
+               SELECT up.start, q.uri, q.reply_parent_uri, up.author, q.created_at, up.n + 1 \
+               FROM up JOIN posts q ON q.uri = up.parent \
+               WHERE up.n < $2 AND q.author_did = up.author \
+                 AND NOT EXISTS (SELECT 1 FROM posts s WHERE s.reply_parent_uri = up.parent AND s.author_did = up.author \
+                                 AND (s.created_at, s.uri) < (up.at, up.uri)) \
+             ) SELECT DISTINCT ON (start) start, n, parent IS NULL FROM up ORDER BY start, n DESC",
+        )
+        .bind(&starts)
+        .bind(max)
+        .fetch_all(self.pool())
+        .await?;
+        let above: HashMap<String, i32> = up.into_iter().filter(|(_, _, at_root)| *at_root).map(|(start, n, _)| (start, n)).collect();
+        if above.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let on_run: Vec<String> = above.keys().cloned().collect();
+        // Down: the author's earliest reply to each post in turn.
+        let down: Vec<(String, Option<i32>)> = sqlx::query_as(
+            "WITH RECURSIVE down(start, uri, author, n) AS ( \
+               SELECT uri, uri, author_did, 0 FROM posts WHERE uri = ANY($1) \
+               UNION ALL \
+               SELECT d.start, nx.uri, d.author, d.n + 1 FROM down d \
+               CROSS JOIN LATERAL (SELECT s.uri FROM posts s WHERE s.reply_parent_uri = d.uri AND s.author_did = d.author \
+                                   ORDER BY s.created_at, s.uri LIMIT 1) nx \
+               WHERE d.n < $2 \
+             ) SELECT start, max(n) FROM down GROUP BY start",
+        )
+        .bind(&on_run)
+        .bind(max)
+        .fetch_all(self.pool())
+        .await?;
+        let mut out = HashMap::new();
+        for (start, below) in down {
+            let Some(n) = above.get(&start) else { continue };
+            let count = n + 1 + below.unwrap_or(0);
+            if (2..=max).contains(&count) {
+                out.insert(start, (n + 1, count));
+            }
+        }
+        Ok(out)
+    }
+
     /// Render feed items as `feedViewPost`s, dropping hidden, collapsed,
     /// muted-or-blocked (timeline) and missing posts.
     ///
@@ -464,6 +538,7 @@ impl Hydrator {
         let originators: Vec<String> = items.iter().map(|i| i.originator_did.clone()).collect();
         let reposters = self.profile_context(viewer, req, &originators, None).await?;
         let originator_gates = moderation::gate_many(self.pool(), &originators).await?;
+        let op_paths = self.op_paths(&ctx.posts, &uris).await?;
         let mut out = Vec::new();
         for item in items {
             if !ctx.gates.get(&item.post_uri).copied().unwrap_or(Gate::Visible).listable()
@@ -487,6 +562,10 @@ impl Hydrator {
                     "root": ctx.reply_ref_view(root),
                     "parent": ctx.reply_ref_view(parent),
                 });
+            }
+            if let Some((index, count)) = op_paths.get(&item.post_uri) {
+                v["opThreadPostIndex"] = json!(index);
+                v["opThreadPostCount"] = json!(count);
             }
             out.push(v);
         }
@@ -1251,6 +1330,43 @@ mod tests {
             json!({"$type": "app.bsky.embed.record#viewDetached", "uri": quoted, "detached": true})
         );
         assert_eq!(posts[1]["embed"]["record"]["$type"], "app.bsky.embed.record#viewRecord");
+        db.drop_db().await;
+    }
+
+    #[tokio::test]
+    async fn feed_items_carry_their_place_in_the_authors_thread() {
+        let Some(db) = fresh_db("hydration_op_thread").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let one = post(p, BOB, "3kaaaaaaaaaa2", "one", None, None).await;
+        let two = post(p, BOB, "3kaaaaaaaaaa3", "two", Some(&one), Some(&one)).await;
+        let three = post(p, BOB, "3kaaaaaaaaaa4", "three", Some(&two), Some(&one)).await;
+        // Off the run: a later second reply by Bob to the root, and a reply
+        // by someone else.
+        let aside = post(p, BOB, "3kaaaaaaaaaa5", "aside", Some(&one), Some(&one)).await;
+        post(p, ALICE, "3kaaaaaaaaaa6", "hello", Some(&one), Some(&one)).await;
+        let alone = post(p, BOB, "3kaaaaaaaaaa7", "alone", None, None).await;
+        let h = hydrator(p, sets());
+        let place = |v: &Value, uri: &str| -> (Option<Value>, Option<Value>) {
+            let item = v["feed"].as_array().expect("feed").iter().find(|i| i["post"]["uri"] == uri).expect("item");
+            (item.get("opThreadPostIndex").cloned(), item.get("opThreadPostCount").cloned())
+        };
+        let feed = h.get_author_feed(&Viewer::anonymous(), &Requester::test(), BOB, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
+        for (uri, index) in [(&one, 1), (&two, 2), (&three, 3)] {
+            assert_eq!(place(feed.inner(), uri), (Some(json!(index)), Some(json!(3))), "{uri}");
+        }
+        assert_eq!(place(feed.inner(), &aside), (None, None));
+        assert_eq!(place(feed.inner(), &alone), (None, None));
+        // A run longer than `op_thread.max_walk` (4 here) is not worked out.
+        let four = post(p, BOB, "3kaaaaaaaaaa8", "four", Some(&three), Some(&one)).await;
+        post(p, BOB, "3kaaaaaaaaaa9", "five", Some(&four), Some(&one)).await;
+        let feed = h.get_author_feed(&Viewer::anonymous(), &Requester::test(), BOB, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
+        for uri in [&one, &three, &four] {
+            assert_eq!(place(feed.inner(), uri), (None, None), "{uri}");
+        }
         db.drop_db().await;
     }
 

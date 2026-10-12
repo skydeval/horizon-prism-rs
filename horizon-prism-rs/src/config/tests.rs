@@ -267,6 +267,9 @@ scan_max_pages = 5
 [thread_v2]
 max_parents = 80
 
+[op_thread]
+max_walk = 50
+
 [lists]
 read_listing_pages = 5
 

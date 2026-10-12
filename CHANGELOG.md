@@ -12,6 +12,12 @@ commit.
 
 ### Added
 
+- **Item 13: thread position on feed items (#675).** A post in a feed
+  that is part of its author's own thread (the root, then the author's
+  earliest reply to each post in turn) carries `opThreadPostIndex` and
+  `opThreadPostCount`. Worked out from stored posts only, for in-scope
+  authors, up to `[op_thread] max_walk` posts (default 50; a longer
+  thread carries no position; 0 turns it off) (design-v3 §8.2).
 - **Item 13: `thread_v2.max_parents` (#675).** How many parents
   `getPostThreadV2` returns above the opened post is now a setting
   (default 80, at most 1000) instead of a fixed number (design-v3 §5.1).
