@@ -79,6 +79,18 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 10: token-issuer lookups are charged to the request (#669).**
+  When verifying a token needs the issuer's DID document from the network,
+  the fetch costs the request one token of its identity share and, for a
+  `did:plc`, a PLC token (design-v3 §II-8.3). The charge is the first step
+  of the fetch itself, so a document already held costs nothing and a
+  fetch that finds no budget stores no failure. PLC's member pool keeps
+  half of itself as an issuer-refresh slice: on a request charged to an IP
+  key, a ready member's document may be fetched from it once per
+  `identity.member_pool_refresh_secs` (default 600). So a flood of tokens
+  naming members takes at most that slice, and the rest of the member pool
+  stays for members' own requests. A request whose issuer lookup found no
+  budget answers `429 RateLimitExceeded`, not `401`.
 - **Item 10: pre-auth backstop parts (#669).**
   `xrpc::backstop` holds the two parts of design-v3 §II-8.3's backstop
   that need no I/O. The claims pre-check reads a token's unverified

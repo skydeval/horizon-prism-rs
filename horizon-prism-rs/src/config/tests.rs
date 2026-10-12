@@ -105,6 +105,7 @@ plc_request_rate_per_sec = 20.0
 plc_request_burst = 40
 requester_resolutions_per_sec = 5.0
 requester_resolutions_burst = 25
+member_pool_refresh_secs = 600
 
 [kryphocron]
 oracle_freshness_bound_secs = 120

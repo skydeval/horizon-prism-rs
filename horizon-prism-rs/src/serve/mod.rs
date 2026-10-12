@@ -29,6 +29,7 @@ use crate::firehose::consumer::{Consumer, ConsumerStatus, spawn_lag_sampler};
 use crate::firehose::coverage::CoverageTracker;
 use crate::firehose::watermark::Watermarks;
 use crate::firehose::writer::Writer;
+use crate::identity::fetch_cell::AuthBudget;
 use crate::identity::{IdentityRefresher, IdentityResolver, IdentitySettings, PersistencePolicy};
 use crate::microcosm::ConstellationClient;
 use crate::net::{NetClient, NetConfig};
@@ -155,8 +156,35 @@ pub async fn run() -> Result<(), StartupError> {
 
     let mut tasks = Vec::new();
 
+    // Every upstream a public request reaches has one request bucket,
+    // split into pools and per-requester shares (design-v3 §II-8.3).
+    let shares = Shares::from_config(&cfg.file);
+    let microcosm = &cfg.file.microcosm;
+    let identity = &cfg.file.identity;
+    // Identity work for requests: the requester's identity share, and PLC's
+    // request bucket with its issuer-refresh slice.
+    let identity_share = RequesterLimit::new(
+        "identity",
+        identity.requester_resolutions_per_sec.0,
+        identity.requester_resolutions_burst,
+        cfg.file.constellation.requester_share_max_entries,
+    );
+    let (plc_bucket, issuer_slice) = shares.bucket_with_slice(
+        "plc",
+        identity.plc_request_rate_per_sec.0,
+        identity.plc_request_burst,
+        Duration::from_secs(identity.member_pool_refresh_secs),
+    );
+    let member_keys = MemberKeys::default();
+
     // Client authentication (§6.7, §6.8): service identity and the JWT path.
-    let (glue, issuer_drainer) = GlueContext::new(&cfg, resolver.clone())
+    let auth_budget = AuthBudget {
+        identity: identity_share.clone(),
+        plc: plc_bucket.clone(),
+        slice: issuer_slice,
+        members: member_keys.clone(),
+    };
+    let (glue, issuer_drainer) = GlueContext::new(&cfg, resolver.clone(), auth_budget)
         .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
     tasks.push(issuer_drainer);
 
@@ -289,23 +317,9 @@ pub async fn run() -> Result<(), StartupError> {
     // identity resolver, one client per outbound network, the cascade, and
     // the upstream source behind hydration's seam.
     let table = Arc::new(RoutingTable::from_config(&cfg.file.constellation));
-    // Every upstream a public request reaches has one request bucket,
-    // split into pools and per-requester shares (design-v3 §II-8.3).
-    let shares = Shares::from_config(&cfg.file);
-    let microcosm = &cfg.file.microcosm;
-    let identity = &cfg.file.identity;
     // Request-path identity work: one token of the requester's identity
     // share per DID or handle, and PLC's request bucket per PLC fetch.
-    let lookup = RequestLookup::new(
-        resolver.clone(),
-        RequesterLimit::new(
-            "identity",
-            identity.requester_resolutions_per_sec.0,
-            identity.requester_resolutions_burst,
-            cfg.file.constellation.requester_share_max_entries,
-        ),
-        shares.bucket("plc", identity.plc_request_rate_per_sec.0, identity.plc_request_burst),
-    );
+    let lookup = RequestLookup::new(resolver.clone(), identity_share, plc_bucket);
     let did_router = DidRouter::new(Arc::clone(&table), Arc::new(lookup) as Arc<dyn DidLookup>);
     let cascade = Cascade::new(
         Arc::clone(&table),
@@ -355,7 +369,7 @@ pub async fn run() -> Result<(), StartupError> {
     // memory, and the limits on verifying against them.
     let backstop = Backstop {
         limits: VerifyLimits::from_config(&cfg.file.auth),
-        keys: MemberKeys::default(),
+        keys: member_keys,
     };
     if let Err(error) = backstop.keys.reload(&pool).await {
         tracing::warn!(event = "member_keys_reload_failed", %error, "member keys not loaded at startup");

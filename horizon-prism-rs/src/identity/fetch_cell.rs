@@ -40,6 +40,9 @@ use moka::policy::EvictionPolicy;
 use super::ResolveIntent;
 use super::cache::Freshness;
 use super::resolver::IdentityResolver;
+use crate::xrpc::backstop;
+use crate::xrpc::member_keys::MemberKeys;
+use crate::xrpc::pools::{ChargeKey, IssuerSlice, Requester, RequesterLimit, SharedBucket};
 
 /// Cell entry lifetime (§6.7).
 pub const CELL_TTL: Duration = Duration::from_secs(60);
@@ -124,9 +127,66 @@ impl JwtFetchCell {
             .await
     }
 
+    /// Like [`JwtFetchCell::get_with`], for an `init` that may decline to
+    /// fetch. A declined init stores nothing, so the next caller runs its
+    /// own; callers that were waiting on it get the same `Err`.
+    ///
+    /// # Errors
+    ///
+    /// [`NoBudget`] when the `init` that ran declined.
+    pub async fn try_get_with<F>(&self, did: &str, init: F) -> Result<Arc<FetchOutcome>, NoBudget>
+    where
+        F: Future<Output = Result<FetchOutcome, NoBudget>>,
+    {
+        self.cache
+            .try_get_with(did.to_string(), async move { init.await.map(Arc::new) })
+            .await
+            .map_err(|_| NoBudget)
+    }
+
     /// Apply pending evictions (tests and diagnostics).
     pub async fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks().await;
+    }
+}
+
+/// The request had no budget for an issuer fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoBudget;
+
+/// What [`FetchOutcome::Failed`] says when no budget was found.
+pub const NO_BUDGET: &str = "no request budget for the issuer lookup";
+
+/// The budget an issuer fetch on the token path is charged to (design-v3
+/// §II-8.3 "One charge point for every auth-path issuer resolution").
+#[derive(Clone)]
+pub struct AuthBudget {
+    /// The requester's identity share.
+    pub identity: RequesterLimit,
+    /// PLC's request bucket.
+    pub plc: SharedBucket,
+    /// The issuer-refresh slice of PLC's member pool.
+    pub slice: IssuerSlice,
+    /// Who the ready members are.
+    pub members: MemberKeys,
+}
+
+impl AuthBudget {
+    /// Charge one issuer fetch for `did` to `req`: a token of its identity
+    /// share and, for a `did:plc`, a PLC token. On a request charged to an
+    /// IP key, a ready member's DID takes the issuer-refresh slice when its
+    /// allowance for the window is unused; otherwise, and for everyone
+    /// else, the requester's own pool pays.
+    #[must_use]
+    pub fn admit(&self, req: &Requester, did: &str) -> bool {
+        if !req.draw_own(&self.identity) {
+            return false;
+        }
+        if !did.starts_with("did:plc:") {
+            return true;
+        }
+        let by_ip = matches!(req.key(), ChargeKey::Ip(_));
+        (by_ip && self.members.is_ready_member(did) && self.slice.take(did)) || req.draw(&self.plc)
     }
 }
 
@@ -135,12 +195,24 @@ impl JwtFetchCell {
 pub struct GuardedDidFetcher {
     resolver: IdentityResolver,
     cell: JwtFetchCell,
+    budget: Option<AuthBudget>,
 }
 
 impl GuardedDidFetcher {
     #[must_use]
     pub fn new(resolver: IdentityResolver, cell: JwtFetchCell) -> Self {
-        Self { resolver, cell }
+        Self {
+            resolver,
+            cell,
+            budget: None,
+        }
+    }
+
+    /// Charge every fetch made for a request to that request.
+    #[must_use]
+    pub fn with_budget(mut self, budget: AuthBudget) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     #[must_use]
@@ -194,12 +266,35 @@ impl GuardedDidFetcher {
 
     /// Refresh through the cell (§6.7 retry step 1): reuse a live entry, or
     /// run exactly one fetch however many callers race.
+    ///
+    /// The fetch is charged to the running request as the first step of
+    /// the cell's init, so there is no separate check that could race the
+    /// fetch, and a live entry costs nothing. An init that finds no budget
+    /// stores nothing. A caller that was only waiting on another request's
+    /// init, and got that request's "no budget", tries once more with its
+    /// own.
     pub async fn refresh(&self, did: &str) -> Arc<FetchOutcome> {
-        self.cell.get_with(did, self.fetch_and_store(did)).await
+        for _ in 0..2 {
+            if let Ok(outcome) = self.cell.try_get_with(did, self.charged_fetch(did)).await {
+                return outcome;
+            }
+        }
+        Arc::new(FetchOutcome::Failed(NO_BUDGET.to_string()))
     }
 
-    /// The cell's init future: fetch through `net`, write the host cache under
-    /// the persistence rule, then return the outcome.
+    /// The cell's init future: charge the running request, then fetch.
+    /// Outside a request (no selection) nothing is charged.
+    async fn charged_fetch(&self, did: &str) -> Result<FetchOutcome, NoBudget> {
+        if let (Some(budget), Some(selected)) = (&self.budget, backstop::selected())
+            && !budget.admit(&selected.req, did)
+        {
+            return Err(NoBudget);
+        }
+        Ok(self.fetch_and_store(did).await)
+    }
+
+    /// Fetch through `net`, write the host cache under the persistence rule,
+    /// then return the outcome.
     async fn fetch_and_store(&self, did: &str) -> FetchOutcome {
         match self.resolver.fetch_document(did).await {
             Ok(fetched) => {
@@ -332,6 +427,69 @@ mod tests {
         }
         cell.run_pending_tasks().await;
         assert!(cell.cache.weighted_size() <= 3 * 1100);
+    }
+
+    #[test]
+    fn issuer_fetches_are_charged_to_the_request() {
+        use crate::xrpc::pools::Shares;
+
+        const MEMBER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        const OTHER_MEMBER: &str = "did:plc:cccccccccccccccccccccccc";
+        const OUTSIDER: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        // PLC: 8/s, burst 8. Non-member pool 4; the member pool's 4 are 2
+        // for members and 2 for the issuer-refresh slice.
+        let budget = || {
+            let (plc, slice) = Shares::for_tests().bucket_with_slice("plc", 8.0, 8, Duration::from_secs(600));
+            let members = MemberKeys::default();
+            members.mark_ready(MEMBER);
+            members.mark_ready(OTHER_MEMBER);
+            AuthBudget {
+                identity: RequesterLimit::new("identity", 1.0, 100, 1000),
+                plc,
+                slice,
+                members,
+            }
+        };
+        let ip = |n: u8| Requester::of(None, std::net::IpAddr::from([203, 0, 113, n]));
+
+        // A flood of IP-keyed requests naming members and non-members: the
+        // non-member pool's 4 tokens, plus one slice token per member.
+        let b = budget();
+        let flood = ip(1);
+        let admitted = |did: &str| (0..10).filter(|_| b.admit(&flood, did)).count();
+        assert_eq!(admitted(OUTSIDER), 4, "the non-member pool");
+        assert!(flood.spent());
+        assert_eq!(admitted(MEMBER), 1, "its slice allowance, once per window");
+        assert_eq!(admitted(OTHER_MEMBER), 1);
+        assert_eq!(admitted(MEMBER), 0);
+        // The members' own half is untouched: a member-keyed request (its
+        // refetch in the handler) still draws on it, and never on the slice.
+        let member = Requester::new(ChargeKey::member(MEMBER));
+        assert!(b.admit(&member, MEMBER) && b.admit(&member, MEMBER));
+        assert!(!b.admit(&member, MEMBER), "member pool 2, non-member pool empty");
+
+        // A did:web issuer costs an identity token only.
+        let b = budget();
+        let req = ip(2);
+        for _ in 0..100 {
+            assert!(b.admit(&req, "did:web:example.com"));
+        }
+        // The identity share is now empty: nothing is admitted, PLC or not.
+        assert!(!b.admit(&req, "did:web:example.com"));
+        assert!(!b.admit(&req, OUTSIDER));
+        assert!(b.admit(&ip(3), OUTSIDER), "another requester has its own share");
+    }
+
+    #[tokio::test]
+    async fn a_declined_init_stores_nothing() {
+        let cell = JwtFetchCell::new();
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(cell.try_get_with(did, async { Err(NoBudget) }).await, Err(NoBudget));
+        assert!(cell.peek(did).await.is_none());
+        let stored = cell.try_get_with(did, async { Ok(doc(b"{}")) }).await.expect("fetched");
+        assert_eq!(*stored, doc(b"{}"));
+        // A live entry never runs the init.
+        assert!(cell.try_get_with(did, async { Err(NoBudget) }).await.is_ok());
     }
 
     #[test]

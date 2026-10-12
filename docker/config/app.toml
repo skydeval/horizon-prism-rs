@@ -78,6 +78,9 @@ plc_request_burst = 40
 # Identities (DIDs or handles) one requester may have resolved per second.
 requester_resolutions_per_sec = 5.0
 requester_resolutions_burst = 25
+# Checking a member's sign-in token may need its identity document. Part of
+# the PLC budget is kept for that, and one member can use it this often.
+member_pool_refresh_secs = 600
 
 [kryphocron]
 oracle_freshness_bound_secs = 120

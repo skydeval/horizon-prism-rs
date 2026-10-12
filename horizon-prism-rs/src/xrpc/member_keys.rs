@@ -21,7 +21,7 @@
 //! 10 minutes, then hourly. The refresh is internal work: it is not charged
 //! to any request bucket.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
@@ -108,9 +108,23 @@ impl MemberKey {
 #[derive(Debug, Clone, Default)]
 pub struct MemberKeys {
     keys: Arc<RwLock<HashMap<String, MemberKey>>>,
+    /// Every ready member, with or without a document held.
+    ready: Arc<RwLock<HashSet<String>>>,
 }
 
 impl MemberKeys {
+    /// Whether `did` was a ready member at the last reload.
+    #[must_use]
+    pub fn is_ready_member(&self, did: &str) -> bool {
+        self.ready.read().unwrap_or_else(PoisonError::into_inner).contains(did)
+    }
+
+    /// Mark `did` a ready member (tests).
+    #[cfg(test)]
+    pub fn mark_ready(&self, did: &str) {
+        self.ready.write().unwrap_or_else(PoisonError::into_inner).insert(did.to_string());
+    }
+
     /// The key held for `did`, whatever its age.
     #[must_use]
     pub fn get(&self, did: &str) -> Option<MemberKey> {
@@ -149,6 +163,7 @@ impl MemberKeys {
         let now = Utc::now();
         let mut fresh: HashMap<String, MemberKey> = HashMap::with_capacity(rows.len());
         let mut due = Vec::new();
+        *self.ready.write().unwrap_or_else(PoisonError::into_inner) = rows.iter().map(|r| r.0.clone()).collect();
         for (did, doc, fetched_at) in rows {
             let key = doc.zip(fetched_at).and_then(|(doc, at)| MemberKey::from_document(&doc, at));
             let old = key.as_ref().is_none_or(|k| {
@@ -295,6 +310,7 @@ mod tests {
         assert_eq!(keys.get(ready).and_then(|k| k.age(Utc::now())), Some(KeyAge::Fresh));
         assert_eq!(keys.get(old).and_then(|k| k.age(Utc::now())), Some(KeyAge::Stale));
         assert!(!keys.contains(bare) && !keys.contains(pending), "no document, or not ready");
+        assert!(keys.is_ready_member(bare) && !keys.is_ready_member(pending));
         db.drop_db().await;
     }
 }

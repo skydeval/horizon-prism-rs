@@ -24,6 +24,7 @@ pub use jwt::{AuthError, JwtVerifier, VerifiedCaller};
 pub use service_key::{ServiceKey, ServiceKeyError, keygen};
 
 use crate::config::AppConfig;
+use crate::identity::fetch_cell::AuthBudget;
 use crate::identity::{GuardedDidFetcher, IdentityResolver, JwtFetchCell};
 
 /// A startup failure building the glue.
@@ -118,10 +119,10 @@ impl GlueContext {
     ///
     /// An invalid service key or hostname, or at-rest hooks that cannot be
     /// built or validated. `serve` exits before any listener binds.
-    pub fn new(cfg: &AppConfig, resolver: IdentityResolver) -> Result<(Self, JoinHandle<()>), GlueError> {
+    pub fn new(cfg: &AppConfig, resolver: IdentityResolver, budget: AuthBudget) -> Result<(Self, JoinHandle<()>), GlueError> {
         let service_key = ServiceKey::new(&cfg.env.public_hostname, cfg.env.service_signing_key.expose())?;
         let identity = service_key.service_identity()?;
-        let fetcher = GuardedDidFetcher::new(resolver, JwtFetchCell::new());
+        let fetcher = GuardedDidFetcher::new(resolver, JwtFetchCell::new()).with_budget(budget);
         let (verifier, drainer) = JwtVerifier::new(
             identity,
             fetcher,

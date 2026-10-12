@@ -186,6 +186,9 @@ pub struct IdentityConfig {
     /// One requester's identity share: a token per DID or handle resolved.
     pub requester_resolutions_per_sec: Float,
     pub requester_resolutions_burst: u32,
+    /// How often one member's DID may be resolved from the issuer-refresh
+    /// slice of PLC's member pool.
+    pub member_pool_refresh_secs: u64,
 }
 
 impl Default for IdentityConfig {
@@ -199,6 +202,7 @@ impl Default for IdentityConfig {
             plc_request_burst: 40,
             requester_resolutions_per_sec: Float(5.0),
             requester_resolutions_burst: 25,
+            member_pool_refresh_secs: 600,
         }
     }
 }
