@@ -14,6 +14,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use serde_json::{Value, json};
 
+use super::actor::ProfileKind;
 use super::feed::{NSID_POST, PostContext};
 use super::lists::is_list_uri;
 use super::normalize::is_private_uri;
@@ -27,6 +28,11 @@ use crate::xrpc::pools::Requester;
 pub const MAX_NODES: usize = 200;
 /// Constellation reply listings in flight for one response.
 pub const LISTING_CONCURRENCY: usize = 8;
+pub const NSID_LIKE: &str = "app.bsky.feed.like";
+/// Likers asked of Constellation per page of a known-likers scan.
+const KNOWN_LIKERS_PAGE: u32 = 100;
+/// Profiles shown in `viewer.knownLikers`.
+const KNOWN_LIKERS_SHOWN: usize = 5;
 pub const DEFAULT_DEPTH: u32 = 6;
 pub const DEFAULT_PARENT_HEIGHT: u32 = 80;
 
@@ -215,6 +221,61 @@ impl Hydrator {
         let me = viewer.did.as_deref();
         let hidden = hidden.into_iter().filter(|reply| me.is_none() || uri_author(reply) != me).collect();
         Ok(Some(RootGate { view, hidden, allow }))
+    }
+
+    /// `viewer.knownLikers` for a thread's anchor (design-v3 §8.2): the
+    /// accounts the ready-member viewer follows that liked the post. Stored
+    /// likes are joined with a bounded scan of the post's likers on
+    /// Constellation, each page charged to the caller's share. `None` when
+    /// there are none.
+    async fn known_likers(&self, viewer: &Viewer, req: &Requester, post: &str) -> Result<Option<Value>, sqlx::Error> {
+        let Some(me) = viewer.state_did() else {
+            return Ok(None);
+        };
+        let mut likers: Vec<String> = sqlx::query_scalar(
+            "SELECT author_did FROM likes WHERE subject_uri = $2 \
+               AND author_did IN (SELECT subject_did FROM follows WHERE author_did = $1) \
+             ORDER BY created_at DESC, author_did",
+        )
+        .bind(me)
+        .bind(post)
+        .fetch_all(self.pool())
+        .await?;
+        if let Some(client) = self.backlinks() {
+            let follows: HashSet<String> = sqlx::query_scalar("SELECT subject_did FROM follows WHERE author_did = $1")
+                .bind(me)
+                .fetch_all(self.pool())
+                .await?
+                .into_iter()
+                .collect();
+            let mut cursor: Option<String> = None;
+            for _ in 0..self.inner.cfg.known_likers_scan_max_pages {
+                if follows.is_empty() || self.draw_constellation(req).is_err() {
+                    break;
+                }
+                let Ok(page) = client.distinct_dids_page(post, NSID_LIKE, ".subject.uri", KNOWN_LIKERS_PAGE, cursor.as_deref()).await else {
+                    break;
+                };
+                for did in page.linking_dids {
+                    if follows.contains(&did) && !likers.contains(&did) {
+                        likers.push(did);
+                    }
+                }
+                cursor = page.cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        let state = self.actor_viewer(viewer, &likers).await?;
+        likers.retain(|d| !state.blocked_either_way(d));
+        if likers.is_empty() {
+            return Ok(None);
+        }
+        let shown: Vec<String> = likers.iter().take(KNOWN_LIKERS_SHOWN).cloned().collect();
+        let ctx = self.profile_context(viewer, req, &shown, None).await?;
+        let actors: Vec<Value> = shown.iter().map(|d| ctx.view(d, ProfileKind::Basic)).collect();
+        Ok(Some(json!({"count": likers.len(), "actors": actors})))
     }
 
     /// `viewer.replyDisabled` for a post in the thread rooted at `root`
@@ -469,6 +530,9 @@ impl Hydrator {
         let mut post = post;
         if let Some(disabled) = reply_disabled {
             post["viewer"]["replyDisabled"] = json!(disabled);
+        }
+        if let Some(likers) = self.known_likers(viewer, req, uri).await? {
+            post["viewer"]["knownLikers"] = likers;
         }
         let mut thread = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": post});
         if parent_height > 0

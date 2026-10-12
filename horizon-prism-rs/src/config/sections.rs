@@ -853,6 +853,20 @@ impl Default for FarsightConfig {
     }
 }
 
+/// `[known_likers]` (design-v3 §8.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KnownLikersConfig {
+    /// Constellation pages one thread view may read for `knownLikers`.
+    pub scan_max_pages: u32,
+}
+
+impl Default for KnownLikersConfig {
+    fn default() -> Self {
+        Self { scan_max_pages: 5 }
+    }
+}
+
 /// `[lists]` (design-v3 §5.5).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1039,6 +1053,7 @@ pub struct FileConfig {
     pub thread_mutes: ThreadMutesConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,
+    pub known_likers: KnownLikersConfig,
     pub lists: ListsConfig,
     pub farsight: FarsightConfig,
     pub schema_backfill: SchemaBackfillConfig,

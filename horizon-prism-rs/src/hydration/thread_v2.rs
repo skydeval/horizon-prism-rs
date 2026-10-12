@@ -615,7 +615,24 @@ mod tests {
         assert_eq!(disabled(me.clone()).await, None);
         // No `allow` at all: anyone may reply, and the field is left out.
         exec(p, &format!("UPDATE threadgates SET allow = NULL WHERE uri = '{gate}'")).await;
-        assert_eq!(disabled(me).await, None);
+        assert_eq!(disabled(me.clone()).await, None);
+
+        // `viewer.knownLikers` on the anchor: likers the viewer follows.
+        // The viewer follows the OP (above), who liked the post; Bob liked
+        // it too, and the viewer does not follow Bob.
+        for (who, n) in [(OP, 1), (BOB, 2)] {
+            exec(p, &format!(
+                "INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES \
+                 ('at://{who}/app.bsky.feed.like/{n}', '{who}', '{second}', 'bafy', '3k', now())"
+            )).await;
+        }
+        let v = h.get_post_thread_v2(&me, &req, &second, &options).await.expect("db").expect("view");
+        let known = &v.inner()["thread"][1]["value"]["post"]["viewer"]["knownLikers"];
+        assert_eq!((&known["count"], &known["actors"][0]["did"]), (&json!(1), &json!(OP)));
+        // Only on the anchor, and only for a ready member.
+        assert!(v.inner()["thread"][0]["value"]["post"]["viewer"].get("knownLikers").is_none());
+        let v = h.get_post_thread_v2(&anon, &req, &second, &options).await.expect("db").expect("view");
+        assert!(v.inner()["thread"][1]["value"]["post"]["viewer"].get("knownLikers").is_none());
         db.drop_db().await;
     }
 }

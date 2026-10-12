@@ -261,6 +261,9 @@ counts_refresh_secs = 3600
 [known_followers]
 scan_max_pages = 20
 
+[known_likers]
+scan_max_pages = 5
+
 [lists]
 read_listing_pages = 5
 

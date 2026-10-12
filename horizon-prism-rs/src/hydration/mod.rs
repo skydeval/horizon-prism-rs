@@ -126,6 +126,8 @@ pub struct HydrationConfig {
     pub thread_mutes_max: u32,
     /// `known_followers.scan_max_pages`.
     pub known_followers_scan_max_pages: u32,
+    /// `known_likers.scan_max_pages`.
+    pub known_likers_scan_max_pages: u32,
     /// The block-list index, when `farsight.url` is set.
     pub farsight: Option<Farsight>,
     /// The shared bucket for request-origin Constellation calls
@@ -782,6 +784,7 @@ pub(crate) mod testing {
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
                 known_followers_scan_max_pages: 2,
+                known_likers_scan_max_pages: 2,
                 farsight: Some(farsight),
                 constellation_bucket: None,
             },
@@ -808,6 +811,7 @@ pub(crate) mod testing {
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
                 known_followers_scan_max_pages: 2,
+                known_likers_scan_max_pages: 2,
                 farsight: None,
                 constellation_bucket: None,
             },

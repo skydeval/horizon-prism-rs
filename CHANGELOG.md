@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 13: `viewer.knownLikers` on the thread anchor (#675).** For a
+  ready member: the accounts it follows that liked the post, with a count
+  and up to 5 profiles (design-v3 §8.2). Stored likes are joined with a
+  scan of the post's likers on Constellation, at most
+  `known_likers.scan_max_pages` pages (default 5) of 100, each charged to
+  the caller's Constellation share. Accounts with a block either way are
+  left out, and the field is left out when nobody is left.
 - **Item 13: `viewer.replyDisabled` on the thread anchor (#675).** For a
   ready member, from the root post's threadgate (design-v3 §8.3). The
   root's author may always reply. `allow = []` disables replies. Otherwise

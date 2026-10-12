@@ -289,6 +289,12 @@ counts_refresh_secs = 3600
 [known_followers]
 scan_max_pages = 20
 
+# "Liked by people you follow" on an opened post: how many pages of the
+# post's likers (100 each) one request may ask Constellation for. 0 uses
+# only the likes stored here.
+[known_likers]
+scan_max_pages = 5
+
 # Showing a list that no other AppView could answer for: how many pages of
 # the list owner's records one request may read from the owner's server.
 [lists]
