@@ -248,6 +248,7 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(drafts::GET_DRAFTS), get(drafts::get_drafts))
         .route(&xrpc(labels::QUERY_LABELS), get(labels::query_labels))
         .route(&xrpc(repo::GET_RECORD), get(repo::get_record))
+        .route(&xrpc(feed::GET_ACTOR_LIKES), get(feed::get_actor_likes))
         .route(&xrpc(notifications::LIST_ACTIVITY_SUBSCRIPTIONS), get(notifications::list_activity_subscriptions))
         .route(&xrpc(notifications::PUT_ACTIVITY_SUBSCRIPTION), post(notifications::put_activity_subscription))
         .route("/.well-known/did.json", get(did_web::did_json))

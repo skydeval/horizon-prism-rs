@@ -12,6 +12,11 @@ commit.
 
 ### Added
 
+- **Item 15: `app.bsky.feed.getActorLikes` (#675).** A ready member's own
+  likes, newest first; `actor` must be the caller. Liked posts not stored
+  here are fetched from Slingshot, at most a page's worth. A liked post
+  that is gone or hidden, or whose author has a block with the member,
+  is left out (design-v3 §5.4).
 - **Item 15: `com.atproto.repo.getRecord` (#675).** Serves public
   records this AppView stores with their JSON (posts, profiles, lists of
   ready members, starter packs, labeler services, gates, public polls,

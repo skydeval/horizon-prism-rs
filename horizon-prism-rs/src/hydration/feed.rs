@@ -1122,6 +1122,78 @@ impl Hydrator {
         }
         Ok(Ok(Self::emit(out)))
     }
+
+    /// `app.bsky.feed.getActorLikes` (design-v3 §5.4): the posts the caller
+    /// liked, newest like first. `actor` must be the caller. A liked post
+    /// that is gone, hidden, or by an author with a block is left out.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn get_actor_likes(&self, viewer: &Viewer, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+        let Some(me) = viewer.did.as_deref() else {
+            return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
+        };
+        if self.resolve_actor(req, actor).await?.as_deref() != Some(me) {
+            return Ok(Err(ViewError::new("InvalidRequest", "actor must be the requesting account")));
+        }
+        let (at, after) = parse_local_cursor(cursor);
+        let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT uri, subject_uri, created_at FROM likes WHERE author_did = $1 \
+               AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
+             ORDER BY created_at DESC, uri DESC LIMIT $4",
+        )
+        .bind(me)
+        .bind(at)
+        .bind(after.unwrap_or_default())
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await?;
+        let next = (rows.len() == usize::try_from(limit).unwrap_or(usize::MAX))
+            .then(|| rows.last().map(|(like, _, t)| local_cursor(*t, like)))
+            .flatten();
+        let mut uris: Vec<String> = Vec::new();
+        for (_, subject, _) in rows {
+            if !is_private_uri(&subject) && !uris.contains(&subject) {
+                uris.push(subject);
+            }
+        }
+        let ctx = self.post_context(viewer, req, &uris, CountMode::List).await?;
+        let listable = |u: &&String| {
+            ctx.gates.get(*u).copied().unwrap_or(Gate::Visible).listable() && !ctx.author_blocked(uri_author(u).unwrap_or_default())
+        };
+        // Liked posts not stored here come from Slingshot through the
+        // read-time cache, at most `limit` per page.
+        let missing: Vec<String> = uris
+            .iter()
+            .filter(listable)
+            .filter(|u| ctx.post_view(u).is_none())
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        let mut remote: HashMap<String, Value> = HashMap::new();
+        if !missing.is_empty() {
+            let fetched = Value::Array(self.upstream().post_records(req, &missing).await);
+            if let Value::Array(views) = self.normalized(viewer, fetched).await?.0 {
+                for v in views {
+                    if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string) {
+                        remote.insert(u, v);
+                    }
+                }
+            }
+        }
+        let feed: Vec<Value> = uris
+            .iter()
+            .filter(listable)
+            .filter_map(|u| ctx.post_view(u).or_else(|| remote.remove(u)))
+            .map(|post| json!({ "post": post }))
+            .collect();
+        let mut out = json!({ "feed": feed });
+        if let Some(c) = next {
+            out["cursor"] = json!(c);
+        }
+        Ok(Ok(Self::emit(out)))
+    }
 }
 
 #[cfg(test)]
@@ -1386,6 +1458,52 @@ mod tests {
         for uri in [&one, &three, &four] {
             assert_eq!(place(feed.inner(), uri), (None, None), "{uri}");
         }
+        db.drop_db().await;
+    }
+
+    /// design-v3 §5.4: a member's own likes, without blocked authors.
+    #[tokio::test]
+    async fn actor_likes_are_the_callers_own() {
+        let Some(db) = fresh_db("hydration_actor_likes").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let first = post(p, BOB, "3kaaaaaaaaaa2", "first", None, None).await;
+        let second = post(p, BOB, "3kaaaaaaaaaa3", "second", None, None).await;
+        for (n, subject) in [(1, &first), (2, &second)] {
+            exec(p, &format!(
+                "INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES \
+                 ('at://{ALICE}/app.bsky.feed.like/{n}', '{ALICE}', '{subject}', 'bafy', '3k', now() + interval '{n} seconds')"
+            )).await;
+        }
+        let h = hydrator(p, ScopeSets::default());
+        let me = Viewer {
+            did: Some(ALICE.into()),
+            hydrate: true,
+        };
+        let req = Requester::test();
+        let uris = |v: &Value| -> Vec<String> {
+            v["feed"].as_array().expect("feed").iter().map(|i| i["post"]["uri"].as_str().expect("uri").to_string()).collect()
+        };
+        // Newest like first; by handle too; no per-item cursor.
+        let l = h.get_actor_likes(&me, &req, "alice.test", 50, None).await.expect("db").expect("view");
+        assert_eq!(uris(l.inner()), [second.clone(), first.clone()]);
+        assert!(l.inner()["feed"][0].get("cursor").is_none());
+        assert_eq!(l.inner()["feed"][0]["post"]["viewer"]["like"].as_str().map(|s| s.contains("/app.bsky.feed.like/")), Some(true));
+        // Someone else's likes are not served.
+        let e = h.get_actor_likes(&me, &req, BOB, 50, None).await.expect("db").expect_err("other");
+        assert!(e.message.contains("requesting account"));
+        // Paging.
+        let page = h.get_actor_likes(&me, &req, ALICE, 1, None).await.expect("db").expect("view");
+        let cursor = page.inner()["cursor"].as_str().expect("cursor").to_string();
+        let rest = h.get_actor_likes(&me, &req, ALICE, 1, Some(&cursor)).await.expect("db").expect("view");
+        assert_eq!(uris(rest.inner()), std::slice::from_ref(&first));
+        // A block with the author leaves the post out.
+        exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{BOB}/app.bsky.graph.block/1', '{BOB}', '{ALICE}', '3k', now())")).await;
+        let l = h.get_actor_likes(&me, &req, ALICE, 50, None).await.expect("db").expect("view");
+        assert_eq!(l.inner()["feed"], json!([]));
         db.drop_db().await;
     }
 
