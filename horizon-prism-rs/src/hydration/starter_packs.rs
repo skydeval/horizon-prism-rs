@@ -260,6 +260,62 @@ impl Hydrator {
         Ok(Ok(Self::emit(json!({ "starterPack": view }))))
     }
 
+    /// `app.bsky.graph.getStarterPacksWithMembership`: the (ready member)
+    /// viewer's own packs, each with `actor`'s list item when `actor` is on
+    /// the pack's list.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn get_starter_packs_with_membership(&self, viewer: &Viewer, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+        let Some(me) = viewer.did.clone() else {
+            return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
+        };
+        let did = match self.subject(req, actor).await? {
+            Ok(d) => d,
+            Err(e) => return Ok(Err(e)),
+        };
+        let (at, after) = parse_local_cursor(cursor);
+        let rows: Vec<PackRow> = sqlx::query_as(&format!(
+            "SELECT {PACK_COLUMNS} FROM starter_packs WHERE creator_did = $1 \
+               AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
+             ORDER BY created_at DESC, uri DESC LIMIT $4"
+        ))
+        .bind(&me)
+        .bind(at)
+        .bind(after.unwrap_or_default())
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await?;
+        let next = (rows.len() == usize::try_from(limit).unwrap_or(usize::MAX))
+            .then(|| rows.last().map(|r| local_cursor(r.created_at, &r.uri)))
+            .flatten();
+        let uris: Vec<String> = rows.iter().map(|r| r.uri.clone()).collect();
+        let lists: Vec<String> = rows.iter().map(|r| r.list_uri.clone()).collect();
+        let member_of = self.memberships(&lists, &did).await?;
+        let people = self.profile_context(viewer, req, &[me.clone(), did.clone()], None).await?;
+        let (joined, labels) = (self.joined_counts(&uris).await?, self.load_labels(&uris).await?);
+        let pds = people.rows.get(&me).and_then(|r| r.pds_endpoint.clone());
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut pack = Self::pack_basic(row, &people, None, &joined, &labels);
+            if let Some((list_row, true)) = self.load_list(req, &row.list_uri).await? {
+                let count = self.list_item_count(&row.list_uri).await?;
+                pack["list"] = self.list_basic(viewer, &list_row, pds.as_deref(), Some(count)).await?;
+            }
+            let mut entry = json!({ "starterPack": pack });
+            if let Some(item) = member_of.get(&row.list_uri) {
+                entry["listItem"] = json!({"uri": item, "subject": people.view(&did, ProfileKind::View)});
+            }
+            entries.push(entry);
+        }
+        let mut out = json!({ "starterPacksWithMembership": entries });
+        if let Some(c) = next {
+            out["cursor"] = json!(c);
+        }
+        Ok(Ok(Self::emit(out)))
+    }
+
     /// `app.bsky.graph.getActorStarterPacks`.
     ///
     /// # Errors
@@ -429,6 +485,20 @@ mod tests {
         let cursor = v.inner()["cursor"].as_str().expect("cursor").to_string();
         let v = h.get_actor_starter_packs(&anon, &req, ALICE, 1, Some(&cursor)).await.expect("db").expect("view");
         assert_eq!(v.inner()["starterPacks"][0]["record"]["name"], "First");
+
+        // B-57: the owner's packs with one actor's membership.
+        let owner = Viewer {
+            did: Some(ALICE.into()),
+            hydrate: true,
+        };
+        let w = h.get_starter_packs_with_membership(&owner, &req, "bob.test", 50, None).await.expect("db").expect("view");
+        let entries = w.inner()["starterPacksWithMembership"].as_array().expect("entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["starterPack"]["list"]["listItemCount"], 13);
+        assert_eq!(entries[0]["listItem"]["uri"], format!("at://{ALICE}/app.bsky.graph.listitem/i01"));
+        let w = h.get_starter_packs_with_membership(&owner, &req, ALICE, 50, None).await.expect("db").expect("view");
+        assert!(w.inner()["starterPacksWithMembership"][0].get("listItem").is_none());
+        assert!(h.get_starter_packs_with_membership(&anon, &req, BOB, 50, None).await.expect("db").is_err());
 
         for miss in [pack_uri(ALICE, "none"), format!("at://{ALICE}/app.bsky.graph.list/sp"), "garbage".to_string()] {
             let e = h.get_starter_pack(&anon, &req, &miss).await.expect("db").expect_err("miss");

@@ -12,6 +12,11 @@ commit.
 
 ### Added
 
+- **Item 12: `getListsWithMembership` and `getStarterPacksWithMembership`
+  (#673).** A ready member's own moderation and curate lists, or its own
+  starter packs, each with the named actor's list item when the actor is on
+  the list. Reference lists are never included, and asking for them is `400
+  InvalidRequest`.
 - **Item 12: starter-pack views (#673).** `getStarterPack`,
   `getStarterPacks` (at most 25 URIs, misses omitted) and
   `getActorStarterPacks` (design-v3 §5.5). A stored pack is served from its

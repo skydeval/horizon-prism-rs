@@ -217,6 +217,8 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(graph::GET_FOLLOWERS), get(graph::get_followers))
         .route(&xrpc(graph::GET_LIST), get(graph::get_list))
         .route(&xrpc(graph::GET_LISTS), get(graph::get_lists))
+        .route(&xrpc(graph::GET_LISTS_WITH_MEMBERSHIP), get(graph::get_lists_with_membership))
+        .route(&xrpc(graph::GET_STARTER_PACKS_WITH_MEMBERSHIP), get(graph::get_starter_packs_with_membership))
         .route(&xrpc(graph::GET_STARTER_PACK), get(graph::get_starter_pack))
         .route(&xrpc(graph::GET_STARTER_PACKS), get(graph::get_starter_packs))
         .route(&xrpc(graph::GET_ACTOR_STARTER_PACKS), get(graph::get_actor_starter_packs))

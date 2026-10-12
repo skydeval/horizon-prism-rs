@@ -159,6 +159,8 @@ pub const SERVED: &[Served] = &[
     served("app.bsky.graph.getFollowers", Family::Read, true),
     served("app.bsky.graph.getList", Family::Read, true),
     served("app.bsky.graph.getLists", Family::Read, true),
+    served("app.bsky.graph.getListsWithMembership", Family::Read, false),
+    served("app.bsky.graph.getStarterPacksWithMembership", Family::Read, false),
     served("app.bsky.graph.getStarterPack", Family::Read, true),
     served("app.bsky.graph.getStarterPacks", Family::Read, true),
     served("app.bsky.graph.getActorStarterPacks", Family::Read, true),

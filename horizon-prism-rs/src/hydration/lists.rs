@@ -360,6 +360,89 @@ impl Hydrator {
         Ok(Ok(Self::emit(out)))
     }
 
+    /// For each of `lists`, the newest `listitem` URI that names `subject`.
+    pub(super) async fn memberships(&self, lists: &[String], subject: &str) -> Result<HashMap<String, String>, sqlx::Error> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT ON (list_uri) list_uri, uri FROM list_items WHERE list_uri = ANY($1) AND subject_did = $2 \
+             ORDER BY list_uri, created_at DESC, uri DESC",
+        )
+        .bind(lists)
+        .bind(subject)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// `app.bsky.graph.getListsWithMembership`: the (ready member) viewer's
+    /// own moderation and curate lists, each with `actor`'s list item when
+    /// `actor` is on it. Reference lists are never included.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn get_lists_with_membership(&self, viewer: &Viewer, req: &Requester, actor: &str, purposes: &[String], limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+        let Some(me) = viewer.did.clone() else {
+            return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
+        };
+        let mut tokens: Vec<String> = Vec::new();
+        for p in purposes {
+            match purpose_token(p) {
+                Some(token) if token != PURPOSE_REFERENCE => tokens.push(token.to_string()),
+                _ => return Ok(Err(ViewError::new("InvalidRequest", "Error: purposes must be modlist or curatelist"))),
+            }
+        }
+        if tokens.is_empty() {
+            tokens = vec![PURPOSE_MOD.to_string(), PURPOSE_CURATE.to_string()];
+        }
+        let did = match self.subject(req, actor).await? {
+            Ok(d) => d,
+            Err(e) => return Ok(Err(e)),
+        };
+        let (at, after) = parse_local_cursor(cursor);
+        let rows: Vec<ListRow> = sqlx::query_as(&format!(
+            "SELECT {LIST_COLUMNS} FROM lists WHERE creator_did = $1 AND purpose = ANY($5) \
+               AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
+             ORDER BY created_at DESC, uri DESC LIMIT $4"
+        ))
+        .bind(&me)
+        .bind(at)
+        .bind(after.unwrap_or_default())
+        .bind(i64::from(limit))
+        .bind(&tokens)
+        .fetch_all(self.pool())
+        .await?;
+        let next = (rows.len() == usize::try_from(limit).unwrap_or(usize::MAX))
+            .then(|| rows.last().map(|r| local_cursor(r.created_at, &r.uri)))
+            .flatten();
+        let uris: Vec<String> = rows.iter().map(|r| r.uri.clone()).collect();
+        let counts: HashMap<String, i64> =
+            sqlx::query_as("SELECT list_uri, count(DISTINCT subject_did) FROM list_items WHERE list_uri = ANY($1) GROUP BY list_uri")
+                .bind(&uris)
+                .fetch_all(self.pool())
+                .await?
+                .into_iter()
+                .collect();
+        let member_of = self.memberships(&uris, &did).await?;
+        let people = self.profile_context(viewer, req, &[me.clone(), did.clone()], None).await?;
+        let labels = self.load_labels(&uris).await?;
+        let list_viewer = self.list_viewer(viewer, &uris).await?;
+        let out_lists: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let mut entry = json!({"list": Self::list_view(r, &people, Some(counts.get(&r.uri).copied().unwrap_or(0)), &labels, &list_viewer)});
+                if let Some(item) = member_of.get(&r.uri) {
+                    entry["listItem"] = json!({"uri": item, "subject": people.view(&did, ProfileKind::View)});
+                }
+                entry
+            })
+            .collect();
+        let mut out = json!({ "listsWithMembership": out_lists });
+        if let Some(c) = next {
+            out["cursor"] = json!(c);
+        }
+        Ok(Ok(Self::emit(out)))
+    }
+
     /// `app.bsky.graph.getLists`. `purposes` may hold short forms or full
     /// tokens; an unknown value is `400 InvalidRequest`.
     ///
@@ -589,6 +672,19 @@ mod tests {
         assert_eq!(two.inner()["lists"].as_array().map(Vec::len), Some(2));
         let e = h.get_lists(&anon, &req, ALICE, &["feedlist".into()], 50, None).await.expect("db").expect_err("bad purpose");
         assert_eq!(e.error, "InvalidRequest");
+        // B-57: the owner's own lists with one actor's membership; reference
+        // lists never appear.
+        let w = h.get_lists_with_membership(&owner, &req, "bob.test", &[], 50, None).await.expect("db").expect("view");
+        let entries = w.inner()["listsWithMembership"].as_array().expect("entries");
+        assert_eq!(entries.iter().map(|e| e["list"]["name"].as_str().expect("name")).collect::<Vec<_>>(), ["Curated", "Mods"]);
+        assert!(entries[0].get("listItem").is_none());
+        assert_eq!(entries[1]["listItem"]["uri"], format!("at://{ALICE}/app.bsky.graph.listitem/i2"));
+        assert_eq!(entries[1]["listItem"]["subject"]["did"], BOB);
+        let w = h.get_lists_with_membership(&owner, &req, BOB, &["curatelist".into()], 50, None).await.expect("db").expect("view");
+        assert_eq!(w.inner()["listsWithMembership"].as_array().map(Vec::len), Some(1));
+        assert!(h.get_lists_with_membership(&owner, &req, BOB, &["referencelist".into()], 50, None).await.expect("db").is_err());
+        assert!(h.get_lists_with_membership(&anon, &req, BOB, &[], 50, None).await.expect("db").is_err());
+
         let page = h.get_lists(&anon, &req, ALICE, &[], 2, None).await.expect("db").expect("view");
         let cursor = page.inner()["cursor"].as_str().expect("cursor").to_string();
         let rest = h.get_lists(&anon, &req, ALICE, &[], 2, Some(&cursor)).await.expect("db").expect("view");
