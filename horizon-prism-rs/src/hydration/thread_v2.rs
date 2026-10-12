@@ -16,8 +16,7 @@
 //!   left out of both;
 //! - the contiguous thread by the root's author is marked (`opThread`).
 //!
-//! Not built yet: the root's threadgate (`threadgate`, hidden replies) and
-//! the `!no-unauthenticated` items.
+//! Not built yet: the `!no-unauthenticated` items.
 
 use std::collections::HashMap;
 
@@ -27,8 +26,6 @@ use super::thread::{HIDDEN_MARK, Tree};
 use super::{Hydrator, ViewResult, Viewer};
 use crate::xrpc::pools::Requester;
 
-/// Parents returned above the anchor (`thread_v2.max_parents`).
-pub const MAX_PARENTS: u32 = 80;
 pub const DEFAULT_BELOW: u32 = 6;
 pub const MAX_BELOW: u32 = 20;
 pub const DEFAULT_BRANCHING: u32 = 10;
@@ -294,7 +291,7 @@ impl Hydrator {
     /// threadgate hides kept and marked, and the gate's view. `None` for an
     /// anchor that misses (nonexistent, private-tier, hidden or collapsed).
     async fn v2_tree(&self, viewer: &Viewer, req: &Requester, anchor: &str, below: u32) -> Result<Option<Tree>, super::HydrationError> {
-        Ok(self.thread_tree(viewer, req, anchor, below, MAX_PARENTS, true).await?.ok())
+        Ok(self.thread_tree(viewer, req, anchor, below, self.inner.cfg.thread_v2_max_parents, true).await?.ok())
     }
 
     /// `app.bsky.unspecced.getPostThreadV2`. The lexicon declares no errors:

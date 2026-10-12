@@ -12,6 +12,9 @@ commit.
 
 ### Added
 
+- **Item 13: `thread_v2.max_parents` (#675).** How many parents
+  `getPostThreadV2` returns above the opened post is now a setting
+  (default 80, at most 1000) instead of a fixed number (design-v3 §5.1).
 - **Item 13: `threadgate` on post views (#675).** A post with a valid
   threadgate of its own carries it as `threadgate` wherever the post view
   appears, with the lists its rules name (design-v3 §8.2).

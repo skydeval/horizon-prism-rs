@@ -867,6 +867,20 @@ impl Default for KnownLikersConfig {
     }
 }
 
+/// `[thread_v2]` (design-v3 §5.1).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThreadV2Config {
+    /// Parents `getPostThreadV2` returns above the anchor.
+    pub max_parents: u32,
+}
+
+impl Default for ThreadV2Config {
+    fn default() -> Self {
+        Self { max_parents: 80 }
+    }
+}
+
 /// `[lists]` (design-v3 §5.5).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1050,6 +1064,7 @@ pub struct FileConfig {
     pub rate_limits: RateLimitsConfig,
     pub auth: AuthConfig,
     pub thread: ThreadConfig,
+    pub thread_v2: ThreadV2Config,
     pub thread_mutes: ThreadMutesConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,

@@ -264,6 +264,9 @@ scan_max_pages = 20
 [known_likers]
 scan_max_pages = 5
 
+[thread_v2]
+max_parents = 80
+
 [lists]
 read_listing_pages = 5
 

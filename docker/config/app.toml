@@ -295,6 +295,11 @@ scan_max_pages = 20
 [known_likers]
 scan_max_pages = 5
 
+# An opened post: how many of the posts it replies to, going up the
+# conversation, the newer thread view returns above it.
+[thread_v2]
+max_parents = 80
+
 # Showing a list that no other AppView could answer for: how many pages of
 # the list owner's records one request may read from the owner's server.
 [lists]

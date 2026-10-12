@@ -35,6 +35,9 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if cfg.known_likers.scan_max_pages > 1000 {
         out.push("known_likers.scan_max_pages must be at most 1000".to_string());
     }
+    if cfg.thread_v2.max_parents > 1000 {
+        out.push("thread_v2.max_parents must be at most 1000".to_string());
+    }
     if !(1..=100).contains(&cfg.lists.read_listing_pages) {
         out.push("lists.read_listing_pages must be 1 to 100".to_string());
     }

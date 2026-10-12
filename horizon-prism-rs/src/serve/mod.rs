@@ -376,6 +376,7 @@ pub async fn run() -> Result<(), StartupError> {
             thread_mutes_max: cfg.file.thread_mutes.max_per_actor,
             known_followers_scan_max_pages: cfg.file.known_followers.scan_max_pages,
             known_likers_scan_max_pages: cfg.file.known_likers.scan_max_pages,
+            thread_v2_max_parents: cfg.file.thread_v2.max_parents,
             farsight: farsight.clone(),
             constellation_bucket: Some(shares.bucket(
                 "constellation",
