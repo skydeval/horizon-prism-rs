@@ -26,6 +26,23 @@ commit.
   that accepts anonymous calls is a startup error. `service_proxy_member`
   and `service_proxy_ip` are accepted and validated; nothing charges them
   until service proxying is built.
+- **Item 10: pools and fair shares, not yet wired (#669).** `xrpc::pools`
+  holds the shared upstream bucket of design-v3 §II-8.3: a member pool and
+  a non-member pool (`constellation.nonmember_fraction`, default 0.5), and
+  inside each a per-requester share (`constellation.requester_share`,
+  default 0.25) kept in one LRU cache
+  (`constellation.requester_share_max_entries`, default 200 000). A draw
+  takes the share token and the pool token as one step, so an empty pool
+  does not spend the share. New settings, validated at startup:
+  `microcosm.slingshot_rate_per_sec`/`_burst`,
+  `microcosm.constellation_rate_per_sec`/`_burst`,
+  `identity.plc_request_rate_per_sec`/`_burst` and
+  `identity.requester_resolutions_per_sec`/`_burst`. No upstream call draws
+  on these buckets yet.
+- **Item 10: IPv6 callers are limited per `/64`.** Every IP-keyed rate
+  limit (anonymous reads and search, `resolve`, the per-IP backstop) keys
+  an IPv6 address by its `/64`, and an IPv4-mapped address by its IPv4
+  address (design-v3 §II-8.3 item 3).
 - **Item 10: gallery embeds.** `app.bsky.embed.gallery` is rendered wherever
   an embed is: as a post's embed, as the media of `recordWithMedia` (which
   no longer loses its quoted record), and inside a quoted post's `embeds`

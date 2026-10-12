@@ -72,6 +72,12 @@ did_fresh_secs = 3600
 did_stale_max_secs = 86400
 # Bounds kryphocron's DID-document cache on the JWT path (design §6.7).
 jwt_issuer_tracker_max = 20000
+# The request bucket for PLC directory lookups made while serving requests.
+plc_request_rate_per_sec = 20.0
+plc_request_burst = 40
+# Identities (DIDs or handles) one requester may have resolved per second.
+requester_resolutions_per_sec = 5.0
+requester_resolutions_burst = 25
 
 [kryphocron]
 oracle_freshness_bound_secs = 120
@@ -123,6 +129,11 @@ refresh_queue_max = 100000
 [microcosm]
 slingshot_url = "https://slingshot.microcosm.blue"
 constellation_url = "https://constellation.microcosm.blue"
+# The request buckets for calls made while serving requests.
+slingshot_rate_per_sec = 50.0
+slingshot_burst = 100
+constellation_rate_per_sec = 50.0
+constellation_burst = 100
 
 [backfill]
 concurrency = 4
@@ -147,6 +158,16 @@ run_at_utc = "04:00"
 [storage]
 # 200 GiB. Drives db_budget_ratio and the budget warnings.
 budget_bytes = 214748364800
+
+# Every upstream that public requests reach has one request bucket. Each is
+# split in two: signed-in members of this AppView draw on their own part
+# first, and everyone else shares `nonmember_fraction` of it. Inside either
+# part one requester (a member, or an IP address) gets at most
+# `requester_share` of it, so no single caller can use it all up.
+[constellation]
+requester_share = 0.25
+nonmember_fraction = 0.5
+requester_share_max_entries = 200000
 
 [[constellation.networks]]
 name = "bluesky"

@@ -180,6 +180,12 @@ pub struct IdentityConfig {
     pub did_stale_max_secs: u64,
     /// Capacity of the kryphocron issuer tracker (§6.7).
     pub jwt_issuer_tracker_max: u64,
+    /// The shared bucket for request-origin PLC fetches (design-v3 §II-8.3).
+    pub plc_request_rate_per_sec: Float,
+    pub plc_request_burst: u32,
+    /// One requester's identity share: a token per DID or handle resolved.
+    pub requester_resolutions_per_sec: Float,
+    pub requester_resolutions_burst: u32,
 }
 
 impl Default for IdentityConfig {
@@ -189,6 +195,10 @@ impl Default for IdentityConfig {
             did_fresh_secs: 3600,
             did_stale_max_secs: 86_400,
             jwt_issuer_tracker_max: 20_000,
+            plc_request_rate_per_sec: Float(20.0),
+            plc_request_burst: 40,
+            requester_resolutions_per_sec: Float(5.0),
+            requester_resolutions_burst: 25,
         }
     }
 }
@@ -354,6 +364,11 @@ impl Default for CountsConfig {
 pub struct MicrocosmConfig {
     pub slingshot_url: String,
     pub constellation_url: String,
+    /// The shared buckets for request-origin calls (design-v3 §II-8.3).
+    pub slingshot_rate_per_sec: Float,
+    pub slingshot_burst: u32,
+    pub constellation_rate_per_sec: Float,
+    pub constellation_burst: u32,
 }
 
 impl Default for MicrocosmConfig {
@@ -361,6 +376,10 @@ impl Default for MicrocosmConfig {
         Self {
             slingshot_url: "https://slingshot.microcosm.blue".to_string(),
             constellation_url: "https://constellation.microcosm.blue".to_string(),
+            slingshot_rate_per_sec: Float(50.0),
+            slingshot_burst: 100,
+            constellation_rate_per_sec: Float(50.0),
+            constellation_burst: 100,
         }
     }
 }
@@ -533,6 +552,12 @@ impl Default for CascadeConfig {
 pub struct ConstellationConfig {
     pub networks: Vec<NetworkConfig>,
     pub cascade: CascadeConfig,
+    /// One requester's fair share of a pool, in (0, 1] (design-v3 §II-8.3).
+    pub requester_share: Float,
+    /// The part of every shared bucket that non-members draw on, in (0, 1).
+    pub nonmember_fraction: Float,
+    /// Capacity of the per-requester share cache.
+    pub requester_share_max_entries: u64,
 }
 
 /// The `appview_url` value marking the network served by this AppView.
@@ -594,6 +619,9 @@ impl Default for ConstellationConfig {
                 ),
             ],
             cascade: CascadeConfig::default(),
+            requester_share: Float(0.25),
+            nonmember_fraction: Float(0.5),
+            requester_share_max_entries: 200_000,
         }
     }
 }
@@ -689,6 +717,20 @@ pub struct ServiceConfig {
     /// on a built-in one.
     pub methods: Option<BTreeMap<String, String>>,
 }
+
+/// A decimal config value. Compared bitwise, so the config stays `Eq` (a NaN
+/// equals itself here; validation rejects one anyway).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(transparent)]
+pub struct Float(pub f64);
+
+impl PartialEq for Float {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for Float {}
 
 /// One rate-limit class (design-v3 §10): `per_sec` tokens a second, `burst`
 /// at most. A class table gives both keys.

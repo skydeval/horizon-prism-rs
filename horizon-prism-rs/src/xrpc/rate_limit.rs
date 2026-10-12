@@ -24,7 +24,7 @@
 //! family.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -172,7 +172,7 @@ fn period(per_sec: f64) -> Duration {
 }
 
 /// Why a class's numbers are unusable (§10), if they are.
-fn class_problem(c: RateClassConfig) -> Option<String> {
+pub(crate) fn class_problem(c: RateClassConfig) -> Option<String> {
     if !c.per_sec.is_finite() {
         return Some("per_sec must be a finite number".to_string());
     }
@@ -289,7 +289,7 @@ impl RateLimits {
     ///
     /// [`Limited`] when the bucket is empty.
     pub fn check_ip(&self, class: Class, ip: IpAddr) -> Result<(), Limited> {
-        self.check(class, &ip.to_string())
+        self.check(class, &ip_key(ip).to_string())
     }
 
     /// The family a method is charged to: its entry in the served table,
@@ -309,7 +309,7 @@ impl RateLimits {
     /// [`Limited`] when the bucket is empty.
     pub fn charge(&self, method: &str, default: Family, did: Option<&str>, ip: IpAddr) -> Result<(), Limited> {
         match (self.family(method, default), did) {
-            (Family::Resolve, _) => self.check(Class::Resolve, &format!("{method}|{ip}")),
+            (Family::Resolve, _) => self.check(Class::Resolve, &format!("{method}|{}", ip_key(ip))),
             (Family::Read, Some(did)) => self.check(Class::AuthRead, did),
             (Family::Search, Some(did)) => self.check(Class::SearchAuth, did),
             (Family::Search, None) => self.check_ip(Class::SearchAnon, ip),
@@ -353,6 +353,19 @@ pub fn client_ip(peer: IpAddr, xff: Option<&str>, trusted_proxy: IpAddr) -> IpAd
         .unwrap_or(peer)
 }
 
+/// The key an address is charged under (design-v3 §II-8.3 item 3): an IPv4
+/// address, or an IPv6 `/64`, since one subscriber holds a whole `/64`.
+#[must_use]
+pub fn ip_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+            IpAddr::V4,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -393,6 +406,26 @@ mod tests {
         assert_eq!(client_ip(caddy, Some("9.9.9.9, 1.2.3.4"), caddy), "1.2.3.4".parse::<IpAddr>().expect("ip"));
         assert_eq!(client_ip(caddy, Some("garbage"), caddy), caddy);
         assert_eq!(client_ip(caddy, None, caddy), caddy);
+    }
+
+    #[test]
+    fn ipv6_is_keyed_by_its_64() {
+        let key = |s: &str| ip_key(s.parse().expect("ip"));
+        assert_eq!(key("203.0.113.7"), key("203.0.113.7"));
+        assert_ne!(key("203.0.113.7"), key("203.0.113.8"));
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::".parse::<IpAddr>().expect("ip"));
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), key("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:203.0.113.7"), key("203.0.113.7"));
+
+        // One /64 shares an anonymous bucket.
+        let limits = RateLimits::new();
+        for i in 0..60 {
+            let ip: IpAddr = format!("2001:db8:1:2::{i:x}").parse().expect("ip");
+            limits.check_ip(Class::AnonRead, ip).expect("within burst");
+        }
+        assert!(limits.check_ip(Class::AnonRead, "2001:db8:1:2::ffff".parse().expect("ip")).is_err());
+        limits.check_ip(Class::AnonRead, "2001:db8:1:3::1".parse().expect("ip")).expect("another /64");
     }
 
     fn check(toml: &str) -> Vec<String> {

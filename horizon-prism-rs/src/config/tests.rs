@@ -101,6 +101,10 @@ plc_url = "https://plc.directory"
 did_fresh_secs = 3600
 did_stale_max_secs = 86400
 jwt_issuer_tracker_max = 20000
+plc_request_rate_per_sec = 20.0
+plc_request_burst = 40
+requester_resolutions_per_sec = 5.0
+requester_resolutions_burst = 25
 
 [kryphocron]
 oracle_freshness_bound_secs = 120
@@ -141,6 +145,10 @@ refresh_queue_max = 100000
 [microcosm]
 slingshot_url = "https://slingshot.microcosm.blue"
 constellation_url = "https://constellation.microcosm.blue"
+slingshot_rate_per_sec = 50.0
+slingshot_burst = 100
+constellation_rate_per_sec = 50.0
+constellation_burst = 100
 
 [backfill]
 concurrency = 4
@@ -157,6 +165,11 @@ run_at_utc = "04:00"
 
 [storage]
 budget_bytes = 214748364800
+
+[constellation]
+requester_share = 0.25
+nonmember_fraction = 0.5
+requester_share_max_entries = 200000
 
 [[constellation.networks]]
 name = "bluesky"

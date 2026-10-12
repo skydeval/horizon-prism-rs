@@ -22,7 +22,7 @@ pub use env::{
 pub use sections::{
     AdminConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
     CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, FeaturesConfig,
-    FileConfig, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
+    FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
     KryphocronConfig, LOCAL_APPVIEW, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig,
     PrivateReadConfig, PrivateReadFloors, PublicScope, RateClassConfig, RateLimitsConfig,
     RetentionConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,

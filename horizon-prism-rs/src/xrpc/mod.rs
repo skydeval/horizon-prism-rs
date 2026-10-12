@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod errors;
 pub mod handlers;
+pub mod pools;
 pub mod rate_limit;
 pub mod router;
 
