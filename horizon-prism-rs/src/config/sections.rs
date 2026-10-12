@@ -798,6 +798,20 @@ impl Default for ThreadConfig {
     }
 }
 
+/// `[thread_mutes]`: the cap on one member's muted threads (design-v3 §4.5).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThreadMutesConfig {
+    /// Threads one member may have muted; `muteThread` past it is a 400.
+    pub max_per_actor: u32,
+}
+
+impl Default for ThreadMutesConfig {
+    fn default() -> Self {
+        Self { max_per_actor: 10_000 }
+    }
+}
+
 /// `[auth]`: limits on token verification done before the per-requester
 /// backstop (design-v3 §II-8.3).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -939,6 +953,7 @@ pub struct FileConfig {
     pub rate_limits: RateLimitsConfig,
     pub auth: AuthConfig,
     pub thread: ThreadConfig,
+    pub thread_mutes: ThreadMutesConfig,
     pub schema_backfill: SchemaBackfillConfig,
     pub schema_index: SchemaIndexConfig,
     pub features: FeaturesConfig,

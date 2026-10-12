@@ -47,6 +47,8 @@ pub struct Overlay {
     pub profile_viewers: HashMap<String, Value>,
     /// Post viewer state by URI (absent means `{}`).
     pub post_viewers: HashMap<String, Value>,
+    /// Thread roots the viewer muted, among [`thread_roots`] of the view.
+    pub muted_threads: HashSet<String>,
     /// Local label objects by subject (URI or DID).
     pub labels: HashMap<String, Vec<Value>>,
 }
@@ -77,6 +79,34 @@ fn stripped(m: &Map<String, Value>) -> bool {
             .any(|v| STRIPPING_LABELS.contains(&v))
     });
     record_empty || label_hit
+}
+
+/// The thread root a post view's record names, if the post is a reply.
+fn reply_root(m: &Map<String, Value>) -> Option<&str> {
+    m.get("record")
+        .or_else(|| m.get("value"))
+        .and_then(|r| r.pointer("/reply/root/uri"))
+        .and_then(Value::as_str)
+}
+
+/// The thread roots named by the reply posts in an upstream view.
+#[must_use]
+pub fn thread_roots(v: &Value) -> HashSet<String> {
+    fn collect(v: &Value, out: &mut HashSet<String>) {
+        match v {
+            Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+            Value::Object(m) => {
+                if let Some(root) = reply_root(m) {
+                    out.insert(root.to_string());
+                }
+                m.values().for_each(|child| collect(child, out));
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    collect(v, &mut out);
+    out
 }
 
 fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
@@ -116,7 +146,10 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
             // 3. Viewer state.
             if post_like && let Some(uri) = &uri {
                 if m.contains_key("viewer") || is_post_view(m) {
-                    let viewer = overlay.post_viewers.get(uri).cloned().unwrap_or_else(|| json!({}));
+                    let mut viewer = overlay.post_viewers.get(uri).cloned().unwrap_or_else(|| json!({}));
+                    if reply_root(m).is_some_and(|root| overlay.muted_threads.contains(root)) {
+                        viewer["threadMuted"] = json!(true);
+                    }
                     m.insert("viewer".into(), viewer);
                 }
                 if let Some(local) = overlay.labels.get(uri) {

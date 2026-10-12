@@ -1,5 +1,6 @@
-//! `app.bsky.graph.getMutes`, `muteActor`, `unmuteActor` (member; mute
-//! management does not require readiness, §7.1).
+//! `app.bsky.graph.getMutes`, `muteActor`, `unmuteActor`, `muteThread`,
+//! `unmuteThread` (member; mute management does not require readiness,
+//! §7.1) and `getBlocks` (ready member).
 
 use std::net::SocketAddr;
 
@@ -17,6 +18,9 @@ use crate::xrpc::errors::XrpcError;
 pub const GET_MUTES: &str = "app.bsky.graph.getMutes";
 pub const MUTE_ACTOR: &str = "app.bsky.graph.muteActor";
 pub const UNMUTE_ACTOR: &str = "app.bsky.graph.unmuteActor";
+pub const MUTE_THREAD: &str = "app.bsky.graph.muteThread";
+pub const UNMUTE_THREAD: &str = "app.bsky.graph.unmuteThread";
+pub const GET_BLOCKS: &str = "app.bsky.graph.getBlocks";
 
 const MEMBER: Access = Access::Member { ready: false, enroll: false };
 
@@ -65,6 +69,46 @@ pub async fn mute_actor(
     let req = prepare(&s, &headers, peer, MUTE_ACTOR, MEMBER, true).await?;
     let (actor, v) = input(&body)?;
     respond(&req.req, s.hydrator.set_mute(&req.viewer, &req.req, &actor,Some(scope_of(&v)?)).await)
+}
+
+fn root_of(body: &[u8]) -> Result<String, XrpcError> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("root").and_then(Value::as_str).map(str::to_string))
+        .ok_or_else(|| XrpcError::invalid("Error: Input must have the property \"root\""))
+}
+
+pub async fn mute_thread(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, MUTE_THREAD, MEMBER, true).await?;
+    respond(&req.req, s.hydrator.set_thread_mute(&req.viewer, &root_of(&body)?, true).await)
+}
+
+pub async fn unmute_thread(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, UNMUTE_THREAD, MEMBER, true).await?;
+    respond(&req.req, s.hydrator.set_thread_mute(&req.viewer, &root_of(&body)?, false).await)
+}
+
+/// `app.bsky.graph.getBlocks`: a ready member's own blocks.
+pub async fn get_blocks(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let access = Access::Member { ready: true, enroll: false };
+    let req = prepare(&s, &headers, peer, GET_BLOCKS, access, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(&req.req, s.hydrator.get_blocks(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
 }
 
 pub async fn unmute_actor(

@@ -252,6 +252,9 @@ max_nodes = 200
 constellation_replies_per_node = 50
 max_remote_fetches = 100
 
+[thread_mutes]
+max_per_actor = 10000
+
 [schema_backfill]
 batch_size = 10000
 pause_ms = 100

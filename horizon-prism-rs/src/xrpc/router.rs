@@ -218,6 +218,9 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(mutes::GET_MUTES), get(mutes::get_mutes))
         .route(&xrpc(mutes::MUTE_ACTOR), post(mutes::mute_actor))
         .route(&xrpc(mutes::UNMUTE_ACTOR), post(mutes::unmute_actor))
+        .route(&xrpc(mutes::MUTE_THREAD), post(mutes::mute_thread))
+        .route(&xrpc(mutes::UNMUTE_THREAD), post(mutes::unmute_thread))
+        .route(&xrpc(mutes::GET_BLOCKS), get(mutes::get_blocks))
         .route(&xrpc(notifications::LIST_NOTIFICATIONS), get(notifications::list_notifications))
         .route(&xrpc(notifications::GET_UNREAD_COUNT), get(notifications::get_unread_count))
         .route(&xrpc(notifications::UPDATE_SEEN), post(notifications::update_seen))
@@ -604,6 +607,27 @@ mod tests {
         assert_eq!((status, v["error"].as_str()), (400, Some("InvalidRequest")), "{v}");
         let (status, v) = get_json(&client, &format!("{base}/xrpc/{count}?seenAt=2099-01-01T00:00:00Z"), Some(&count_token)).await;
         assert_eq!((status, &v["count"]), (200, &json!(0)), "{v}");
+        // Thread mutes and getBlocks are member endpoints.
+        let mute = "app.bsky.graph.muteThread";
+        let mute_token = mint(&signing_key(3), ALICE, &aud, Some(mute));
+        for (body, status) in [(json!({"root": root}), 200), (json!({"root": "nope"}), 400), (json!({}), 400)] {
+            let r = client
+                .post(format!("{base}/xrpc/{mute}"))
+                .header("authorization", format!("Bearer {mute_token}"))
+                .json(&body)
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(r.status().as_u16(), status, "{body}");
+        }
+        let r = client.post(format!("{base}/xrpc/{mute}")).json(&json!({"root": root})).send().await.expect("request");
+        assert_eq!(r.status().as_u16(), 401);
+        let blocks = "app.bsky.graph.getBlocks";
+        let blocks_token = mint(&signing_key(3), ALICE, &aud, Some(blocks));
+        let (status, v) = get_json(&client, &format!("{base}/xrpc/{blocks}"), Some(&blocks_token)).await;
+        assert_eq!((status, &v["blocks"]), (200, &json!([])), "{v}");
+        let (status, _) = get_json(&client, &format!("{base}/xrpc/{blocks}"), None).await;
+        assert_eq!(status, 401);
         // A token minted for another method is rejected (lxm).
         let (status, _) = get_json(&client, &format!("{base}/xrpc/app.bsky.notification.getUnreadCount"), Some(&token)).await;
         assert_eq!(status, 401);

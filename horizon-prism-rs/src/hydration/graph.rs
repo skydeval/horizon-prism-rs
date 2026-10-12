@@ -2,6 +2,8 @@
 //! (Constellation first), `getMutes`, `muteActor`, `unmuteActor` (local
 //! `mutes`).
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
@@ -238,6 +240,131 @@ impl Hydrator {
         }
         Ok(Ok(Self::emit(json!({}))))
     }
+
+    /// `app.bsky.graph.getBlocks`: the (member) viewer's own
+    /// `app.bsky.graph.block` records, newest first, each with
+    /// `viewer.blocking`. Private blocks are in another table and never
+    /// listed (§II-7.5).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn get_blocks(&self, viewer: &Viewer, req: &Requester, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+        let Some(me) = viewer.did.as_deref() else {
+            return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
+        };
+        let (at, after) = parse_local_cursor(cursor);
+        let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT subject_did, uri, created_at FROM blocks WHERE author_did = $1 \
+             AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
+             ORDER BY created_at DESC, uri DESC LIMIT $4",
+        )
+        .bind(me)
+        .bind(at)
+        .bind(after.unwrap_or_default())
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await?;
+        let next = (rows.len() == usize::try_from(limit).unwrap_or(usize::MAX))
+            .then(|| rows.last().map(|(_, u, t)| local_cursor(*t, u)))
+            .flatten();
+        let dids: Vec<String> = rows.into_iter().map(|(d, _, _)| d).collect();
+        let gates = moderation::gate_many(self.pool(), &dids).await?;
+        let ctx = self.profile_context(viewer, req, &dids, None).await?;
+        let blocks: Vec<Value> = dids
+            .iter()
+            .filter(|d| !gates.get(*d).copied().unwrap_or(Gate::Visible).is_hidden())
+            .map(|d| ctx.view(d, ProfileKind::View))
+            .collect();
+        let mut out = json!({ "blocks": blocks });
+        if let Some(c) = next {
+            out["cursor"] = json!(c);
+        }
+        Ok(Ok(Self::emit(out)))
+    }
+
+    /// `app.bsky.graph.muteThread` (`mute`) / `unmuteThread` for the
+    /// (member) viewer (design-v3 §5.3). `root` is the thread's root post.
+    /// It is not looked up: a thread mute is the viewer's private state, so
+    /// the call makes no fetch and answers the same for a post that exists
+    /// and one that does not. A member holds at most
+    /// `thread_mutes.max_per_actor` thread mutes.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn set_thread_mute(&self, viewer: &Viewer, root: &str, mute: bool) -> ViewResult<Value> {
+        let Some(me) = viewer.did.as_deref() else {
+            return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
+        };
+        if !is_post_uri(root) {
+            return Ok(Err(ViewError::new("InvalidRequest", "root must be the at-uri of a post")));
+        }
+        if !mute {
+            sqlx::query("DELETE FROM thread_mutes WHERE viewer_did = $1 AND root_uri = $2")
+                .bind(me)
+                .bind(root)
+                .execute(self.pool())
+                .await?;
+            return Ok(Ok(Self::emit(json!({}))));
+        }
+        // A repeat mute is not a new row, so it passes at the cap.
+        let stored: bool = sqlx::query_scalar(
+            "WITH ins AS ( \
+               INSERT INTO thread_mutes (viewer_did, root_uri) \
+               SELECT $1, $2 WHERE (SELECT count(*) FROM thread_mutes WHERE viewer_did = $1) < $3 \
+               ON CONFLICT (viewer_did, root_uri) DO NOTHING RETURNING 1) \
+             SELECT EXISTS (SELECT 1 FROM ins) \
+                 OR EXISTS (SELECT 1 FROM thread_mutes WHERE viewer_did = $1 AND root_uri = $2)",
+        )
+        .bind(me)
+        .bind(root)
+        .bind(i64::from(self.inner.cfg.thread_mutes_max))
+        .fetch_one(self.pool())
+        .await?;
+        if !stored {
+            return Ok(Err(ViewError::new("InvalidRequest", "thread mute limit reached")));
+        }
+        Ok(Ok(Self::emit(json!({}))))
+    }
+
+    /// Which of `uris` are in a thread the ready-member viewer muted: a
+    /// stored post whose root is muted, or any URI that is itself a muted
+    /// root. Empty for every other viewer.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn in_muted_threads(&self, viewer: &Viewer, uris: &[String]) -> Result<HashSet<String>, sqlx::Error> {
+        let Some(me) = viewer.state_did() else {
+            return Ok(HashSet::new());
+        };
+        if uris.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT u.uri FROM unnest($2::text[]) AS u(uri) \
+             LEFT JOIN posts p ON p.uri = u.uri \
+             JOIN thread_mutes t ON t.viewer_did = $1 AND t.root_uri = COALESCE(p.reply_root_uri, u.uri)",
+        )
+        .bind(me)
+        .bind(uris)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+}
+
+/// Whether `uri` is `at://<did>/app.bsky.feed.post/<rkey>`.
+fn is_post_uri(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("at://") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    let (Some(did), Some(collection), Some(rkey), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    did.starts_with("did:") && collection == "app.bsky.feed.post" && !rkey.is_empty()
 }
 
 #[cfg(test)]
@@ -332,6 +459,28 @@ mod tests {
         h.set_mute(&me, &req,BOB, None).await.expect("db").expect("unmute deletes a scoped row");
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mutes").fetch_one(p).await.expect("count");
         assert_eq!(rows, 0);
+
+        // B-56: getBlocks lists the viewer's own blocks, newest first, with
+        // the block record's URI, and never anyone else's.
+        let carol = "did:plc:cccccccccccccccccccccccc";
+        actor(p, carol, "carol.test", "Carol").await;
+        for (author, subject, rkey, age) in [(ALICE, BOB, "b1", 2), (ALICE, carol, "b2", 1), (BOB, ALICE, "b3", 0)] {
+            exec(p, &format!(
+                "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES \
+                 ('at://{author}/app.bsky.graph.block/{rkey}', '{author}', '{subject}', '3k', now() - interval '{age} minutes')"
+            )).await;
+        }
+        let b = h.get_blocks(&me, &req, 50, None).await.expect("db").expect("view");
+        let blocks = b.inner()["blocks"].as_array().expect("blocks");
+        assert_eq!(blocks.iter().map(|v| v["did"].as_str().expect("did")).collect::<Vec<_>>(), [carol, BOB]);
+        assert_eq!(blocks[0]["viewer"]["blocking"], format!("at://{ALICE}/app.bsky.graph.block/b2"));
+        assert_eq!(blocks[1]["viewer"]["blockedBy"], true);
+        assert!(b.inner().get("cursor").is_none());
+        let first = h.get_blocks(&me, &req, 1, None).await.expect("db").expect("view");
+        let cursor = first.inner()["cursor"].as_str().expect("cursor").to_string();
+        let second = h.get_blocks(&me, &req, 1, Some(&cursor)).await.expect("db").expect("view");
+        assert_eq!(second.inner()["blocks"][0]["did"], BOB);
+        assert!(h.get_blocks(&anon, &req, 50, None).await.expect("db").is_err());
         db.drop_db().await;
     }
 }

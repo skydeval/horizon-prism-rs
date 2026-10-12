@@ -360,6 +360,7 @@ pub async fn run() -> Result<(), StartupError> {
             labeler_did: glue.service_key.did().to_string(),
             counts: cfg.file.counts.clone(),
             thread: cfg.file.thread.clone(),
+            thread_mutes_max: cfg.file.thread_mutes.max_per_actor,
             constellation_bucket: Some(shares.bucket(
                 "constellation",
                 microcosm.constellation_rate_per_sec.0,

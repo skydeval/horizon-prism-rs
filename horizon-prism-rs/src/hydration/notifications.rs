@@ -2,7 +2,8 @@
 //! `getUnreadCount`, `updateSeen`, for a member viewer.
 //!
 //! - Muted authors and authors with an `app.bsky` block in either direction
-//!   are excluded.
+//!   are excluded, and so is every notification in a thread the viewer
+//!   muted (design-v3 §5.3).
 //! - `isRead = indexed_at <= notification_seen.seen_at`.
 //! - `updateSeen` sets `seen_at = GREATEST(existing, seenAt)`, clamped to
 //!   `now()`.
@@ -25,14 +26,24 @@ fn parse_cursor(c: Option<&str>) -> (Option<DateTime<Utc>>, i64) {
         .map_or((None, 0), |(t, id)| (Some(t), id))
 }
 
-// Mutes by scope (design-v3 §5.3, "Where mutes apply"): a full mute excludes
-// every reason, a repost mute the repost reasons, a quote mute `quote`.
+// What the unread count leaves out; `listNotifications` applies the same
+// rules after hydration.
+// - Mutes by scope (design-v3 §5.3, "Where mutes apply"): a full mute
+//   excludes every reason, a repost mute the repost reasons, a quote mute
+//   `quote`.
+// - Blocks in either direction.
+// - Muted threads: the notification's record or its subject post is the
+//   muted root, or a post under it.
 const EXCLUSIONS: &str = "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did \
        AND (m.scope = 'full' \
          OR (m.scope IN ('reposts', 'reposts_and_quotes') AND n.reason IN ('repost', 'repost-via-repost')) \
          OR (m.scope IN ('quotes', 'reposts_and_quotes') AND n.reason = 'quote'))) \
      AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = n.author_did) \
-                     OR (b.author_did = n.author_did AND b.subject_did = $1))";
+                     OR (b.author_did = n.author_did AND b.subject_did = $1)) \
+     AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
+                       n.record_uri, n.reason_subject, \
+                       (SELECT p.reply_root_uri FROM posts p WHERE p.uri = n.record_uri), \
+                       (SELECT p.reply_root_uri FROM posts p WHERE p.uri = n.reason_subject)))";
 
 #[derive(Debug, sqlx::FromRow)]
 struct NotificationRow {
@@ -98,13 +109,18 @@ impl Hydrator {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
         let (at, id) = parse_cursor(cursor);
-        let rows: Vec<NotificationRow> = sqlx::query_as(&format!(
+        // The scan applies none of the viewer's private state: every scanned
+        // row is hydrated, and the viewer's mutes, blocks and thread mutes
+        // drop rows afterwards (design-v3 §8.1 "Hydrate before filtering").
+        // So what a member's read fetches and caches does not depend on what
+        // it muted. A page can be short; the cursor follows the scan.
+        let rows: Vec<NotificationRow> = sqlx::query_as(
             "SELECT n.id, n.author_did, n.reason, n.reason_subject, n.record_uri, n.record_cid, n.indexed_at \
-             FROM notifications n WHERE n.recipient_did = $1 AND {EXCLUSIONS} \
+             FROM notifications n WHERE n.recipient_did = $1 \
                AND ($2::timestamptz IS NULL OR (n.indexed_at, n.id) < ($2, $3)) \
                AND (cardinality($5::text[]) = 0 OR n.reason = ANY($5)) \
-             ORDER BY n.indexed_at DESC, n.id DESC LIMIT $4"
-        ))
+             ORDER BY n.indexed_at DESC, n.id DESC LIMIT $4",
+        )
         .bind(me)
         .bind(at)
         .bind(id)
@@ -117,8 +133,24 @@ impl Hydrator {
         let ctx = self.profile_context(viewer, req, &authors, None).await?;
         let records = self.notification_records(&rows).await?;
         let labels = self.load_labels(&rows.iter().map(|r| r.record_uri.clone()).collect::<Vec<_>>()).await?;
+        let threads: Vec<String> = rows
+            .iter()
+            .flat_map(|r| std::iter::once(&r.record_uri).chain(&r.reason_subject))
+            .cloned()
+            .collect();
+        let muted_threads = self.in_muted_threads(viewer, &threads).await?;
+        let dropped = |r: &NotificationRow| {
+            let who = &ctx.viewer;
+            who.blocked_either_way(&r.author_did)
+                || who.muted.contains(&r.author_did)
+                || (who.muted_reposts.contains(&r.author_did) && matches!(r.reason.as_str(), "repost" | "repost-via-repost"))
+                || (who.muted_quotes.contains(&r.author_did) && r.reason == "quote")
+                || muted_threads.contains(&r.record_uri)
+                || r.reason_subject.as_ref().is_some_and(|s| muted_threads.contains(s))
+        };
         let notifications: Vec<Value> = rows
             .iter()
+            .filter(|r| !dropped(r))
             .filter_map(|r| {
                 let record = records.get(&r.record_uri)?.clone();
                 let mut n = json!({
@@ -287,12 +319,19 @@ mod tests {
         assert_eq!(by_reason["follow"]["record"]["subject"], ALICE);
         assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 6, "the count uses the same exclusions");
 
-        // Paging with the indexed_at::id cursor.
+        // Paging with the indexed_at::id cursor. The cursor follows the scan,
+        // which includes the two rows the blocks drop: the first page is
+        // short, and nothing is lost.
         let first = h.list_notifications(&me, &req,4, None, &[]).await.expect("db").expect("view");
+        assert_eq!(first.inner()["notifications"].as_array().map(Vec::len), Some(2));
         let cursor = first.inner()["cursor"].as_str().expect("cursor").to_string();
         assert!(cursor.contains("::"));
         let rest = h.list_notifications(&me, &req,4, Some(&cursor), &[]).await.expect("db").expect("view");
-        assert_eq!(rest.inner()["notifications"].as_array().map(Vec::len), Some(2));
+        assert_eq!(rest.inner()["notifications"].as_array().map(Vec::len), Some(4));
+        let cursor = rest.inner()["cursor"].as_str().expect("cursor").to_string();
+        let end = h.list_notifications(&me, &req,4, Some(&cursor), &[]).await.expect("db").expect("view");
+        assert_eq!(end.inner()["notifications"], json!([]));
+        assert!(end.inner().get("cursor").is_none());
         db.drop_db().await;
     }
 
@@ -327,6 +366,57 @@ mod tests {
         // Reason filter.
         let only = h.list_notifications(&me, &req,50, None, &["reply".into()]).await.expect("db").expect("view");
         assert_eq!(only.inner()["notifications"].as_array().map(Vec::len), Some(1));
+
+        // B-59: a muted thread sends no notifications (the reply under the
+        // root, and the like of the root), and its posts say so.
+        h.set_thread_mute(&me, &root, true).await.expect("db").expect("muted");
+        h.set_thread_mute(&me, &root, true).await.expect("db").expect("idempotent");
+        let l = h.list_notifications(&me, &req,50, None, &[]).await.expect("db").expect("view");
+        assert_eq!(l.inner()["notifications"], json!([]));
+        assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 0);
+        let state = h.post_viewer(&me, &[root.clone(), reply.clone()]).await.expect("db");
+        assert_eq!((&state[&root]["threadMuted"], &state[&reply]["threadMuted"]), (&json!(true), &json!(true)));
+        let other = Viewer {
+            did: Some(BOB.into()),
+            hydrate: true,
+        };
+        assert!(h.post_viewer(&other, std::slice::from_ref(&root)).await.expect("db")[&root].get("threadMuted").is_none());
+        // An upstream view of a reply that is not stored takes its root
+        // from its record.
+        let far = json!({"uri": "at://did:plc:zzzzzzzzzzzzzzzzzzzzzzzz/app.bsky.feed.post/3kfar", "cid": "bafyfar",
+            "author": {"did": "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz", "handle": "far.example"},
+            "record": {"text": "far reply", "reply": {"root": {"uri": root, "cid": "bafyroot"}, "parent": {"uri": root, "cid": "bafyroot"}}}});
+        let (mine, _) = h.normalized(&me, far.clone()).await.expect("db");
+        assert_eq!(mine["viewer"]["threadMuted"], true);
+        let (theirs, _) = h.normalized(&other, far).await.expect("db");
+        assert!(theirs["viewer"].get("threadMuted").is_none());
+        h.set_thread_mute(&me, &root, false).await.expect("db").expect("unmuted");
+        h.set_thread_mute(&me, &root, false).await.expect("db").expect("unmute is idempotent");
+        let l = h.list_notifications(&me, &req,50, None, &[]).await.expect("db").expect("view");
+        assert_eq!(l.inner()["notifications"].as_array().map(Vec::len), Some(2));
+        assert!(h.post_viewer(&me, std::slice::from_ref(&root)).await.expect("db")[&root].get("threadMuted").is_none());
+
+        // The root is not looked up, must be a post's at-uri, and the cap
+        // (3 in tests) refuses a new thread but not a repeat.
+        for bad in [
+            "not a uri",
+            "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.like/1",
+            "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/tools.kryphocron.feed.postPrivate/1",
+            "at://alice.test/app.bsky.feed.post/1",
+            "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/1/extra",
+        ] {
+            let e = h.set_thread_mute(&me, bad, true).await.expect("db").expect_err(bad);
+            assert_eq!(e.error, "InvalidRequest", "{bad}");
+        }
+        let unknown = |n: u8| format!("at://did:plc:zzzzzzzzzzzzzzzzzzzzzzzz/app.bsky.feed.post/{n}");
+        for n in 0..3 {
+            h.set_thread_mute(&me, &unknown(n), true).await.expect("db").expect("a post nobody stored");
+        }
+        let e = h.set_thread_mute(&me, &unknown(3), true).await.expect("db").expect_err("past the cap");
+        assert!(e.message.contains("limit"), "{}", e.message);
+        h.set_thread_mute(&me, &unknown(0), true).await.expect("db").expect("a repeat at the cap");
+        h.set_thread_mute(&other, &unknown(3), true).await.expect("db").expect("another member's own cap");
+        exec(p, "DELETE FROM thread_mutes").await;
 
         // updateSeen clamps to now and never moves back.
         h.update_seen(&me, "2099-01-01T00:00:00Z").await.expect("db").expect("seen");

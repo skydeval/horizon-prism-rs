@@ -117,6 +117,8 @@ pub struct HydrationConfig {
     pub labeler_did: String,
     pub counts: CountsConfig,
     pub thread: ThreadConfig,
+    /// `thread_mutes.max_per_actor`.
+    pub thread_mutes_max: u32,
     /// The shared bucket for request-origin Constellation calls
     /// (`microcosm.constellation_rate_per_sec`); `None` leaves them unmetered.
     pub constellation_bucket: Option<SharedBucket>,
@@ -500,10 +502,14 @@ impl Hydrator {
         let uris: Vec<String> = uris.into_iter().collect();
         let actors = self.actor_viewer(viewer, &dids).await?;
         let post_viewers = self.post_viewer(viewer, &uris).await?;
+        // An upstream reply is not stored, so its root comes from its record.
+        let roots: Vec<String> = normalize::thread_roots(&view).into_iter().collect();
+        let muted_threads = self.in_muted_threads(viewer, &roots).await?;
         let labelled: Vec<String> = dids.iter().chain(uris.iter()).cloned().collect();
         let overlay = normalize::Overlay {
             profile_viewers: dids.iter().map(|d| (d.clone(), actors.view(d))).collect(),
             post_viewers,
+            muted_threads,
             labels: self.load_labels(&labelled).await?,
         };
         let report = normalize::normalize_upstream(&mut view, &overlay);
@@ -538,6 +544,10 @@ impl Hydrator {
         }
         for (subject, repost) in reposts {
             out.entry(subject).or_insert_with(|| json!({}))["repost"] = json!(repost);
+        }
+        // A post in a thread the viewer muted (design-v3 §5.3, §8.2).
+        for uri in self.in_muted_threads(viewer, uris).await? {
+            out.entry(uri).or_insert_with(|| json!({}))["threadMuted"] = json!(true);
         }
         Ok(out)
     }
@@ -701,6 +711,7 @@ pub(crate) mod testing {
                 labeler_did: LABELER.into(),
                 counts: CountsConfig::default(),
                 thread: ThreadConfig::default(),
+                thread_mutes_max: 3,
                 constellation_bucket: None,
             },
         )

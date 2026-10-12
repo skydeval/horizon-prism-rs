@@ -275,6 +275,10 @@ max_nodes = 200
 constellation_replies_per_node = 50
 max_remote_fetches = 100
 
+# How many threads one member may mute. Past it, muting another is refused.
+[thread_mutes]
+max_per_actor = 10000
+
 # Limits on checking sign-in tokens before a request is charged to anyone.
 # They stop forged or broken tokens from using up CPU or a member's limits.
 [auth]

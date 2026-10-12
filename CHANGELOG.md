@@ -12,6 +12,17 @@ commit.
 
 ### Added
 
+- **Item 12: thread mutes and `getBlocks` (#673).**
+  `app.bsky.graph.muteThread` and `unmuteThread` store the caller's muted
+  thread roots (design-v3 §5.3). A muted thread sends the muter no
+  notifications: not for a reply in it, and not for a like, repost or quote
+  of a post in it. Post views in it carry `viewer.threadMuted: true`,
+  including upstream views of replies this AppView does not store. `root`
+  must be the at-uri of an `app.bsky.feed.post`; it is not looked up, so the
+  call makes no fetch. A member may mute `thread_mutes.max_per_actor`
+  threads (default 10 000); past it the call is `400 InvalidRequest`, and a
+  repeat of an existing mute still succeeds. `app.bsky.graph.getBlocks`
+  lists a ready member's own blocks, newest first, with `viewer.blocking`.
 - **Item 11a: deferred services can be forwarded (#672).**
   `[services.<name>] state = "proxy"` is now accepted for `contact`,
   `age_assurance` and operator-defined services (design-v3 §6.7); before,
@@ -539,6 +550,11 @@ commit.
 
 ### Changed
 
+- `listNotifications` hydrates every row it scans and applies the viewer's
+  mutes, blocks and thread mutes afterwards, where it filtered in SQL before
+  (design-v3 §8.1 "Hydrate before filtering"). What a member's read fetches
+  and caches no longer depends on what the member muted. A page can now hold
+  fewer than `limit` items while a cursor is still returned.
 - `getAuthorFeed` `posts_with_media` now means images and galleries. Video
   moved to its own filter, as in the reference AppView, so a client with
   Media and Video tabs does not show a video twice. A `recordWithMedia`
