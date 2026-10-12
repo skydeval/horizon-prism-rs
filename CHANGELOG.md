@@ -26,9 +26,10 @@ commit.
   on one it blocks as blocked by the member: in the timeline and list
   feeds, notifications and the unread count, threads, and everywhere
   else a direct mute or block already applies. Profile views carry
-  `muted: true`, and `mutedByList` / `blockingByList` when the list
-  belongs to a ready member (other lists' views are not stored, so the
-  field is left out). A reference past the member's budget, not yet
+  `muted: true`, and `mutedByList` / `blockingByList` with the list's
+  view: from its row for a ready member's list, from its record for any
+  other (left out if the record cannot be read; the mute or block
+  applies all the same). A reference past the member's budget, not yet
   synced, or to a list that is not a moderation list changes nothing.
   The members come from the private copy only, and nobody else's views
   are affected (design-v3 §4.3 "List purpose", §5.3).

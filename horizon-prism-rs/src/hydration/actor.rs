@@ -97,7 +97,26 @@ impl Hydrator {
         followers: Option<CountMode>,
     ) -> Result<ProfileContext, sqlx::Error> {
         let rows = self.load_actors(dids).await?;
-        let actor_viewer = self.actor_viewer(viewer, dids).await?;
+        let mut actor_viewer = self.actor_viewer(viewer, dids).await?;
+        // `mutedByList` and `blockingByList` carry a list view (design-v3
+        // §5.3), hydrated like any other: a list that is not locally
+        // servable is read from its record. One that cannot be read leaves
+        // the field out; the mute or block applies all the same.
+        let mut unseen: Vec<String> = actor_viewer
+            .muted_by_list
+            .values()
+            .chain(actor_viewer.blocking_by_list.values())
+            .filter(|list| !actor_viewer.list_views.contains_key(*list))
+            .cloned()
+            .collect();
+        unseen.sort_unstable();
+        unseen.dedup();
+        for list in unseen {
+            if let Some((row, _)) = self.load_list(req, &list).await? {
+                let view = self.list_basic(viewer, &row, None, None).await?;
+                actor_viewer.list_views.insert(list, view);
+            }
+        }
         let labels = self.load_labels(dids).await?;
         let followers = match followers {
             Some(mode) => self

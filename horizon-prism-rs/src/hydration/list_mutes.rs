@@ -156,7 +156,7 @@ mod tests {
     use super::*;
     use crate::aggregations::ScopeSets;
     use crate::hydration::lists::PURPOSE_CURATE;
-    use crate::hydration::testing::{actor, exec, hydrator};
+    use crate::hydration::testing::{FixedUpstream, actor, exec, hydrator, hydrator_with};
     use crate::test_support::fresh_db;
 
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -189,12 +189,17 @@ mod tests {
             actor(p, did, handle, handle).await;
         }
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now()), ('{BOB}', 'admin', now())")).await;
-        let h = hydrator(p, ScopeSets::default());
-        let me = Viewer { did: Some(ALICE.into()), hydrate: true };
-        // One list of a ready member (its view can be shown) and one of an
-        // outside owner. Carol is on both.
+        // One list of a ready member (read from its row) and one of an
+        // outside owner (read from its record). Carol is on both.
         let local = list(p, "3kmods", PURPOSE_MOD).await;
         let outside = format!("at://{OWNER}/app.bsky.graph.list/3kout");
+        let mut up = FixedUpstream::default();
+        up.records.insert(
+            outside.clone(),
+            json!({"uri": outside, "cid": "bafyout", "value": {"$type": "app.bsky.graph.list", "name": "Outside", "purpose": PURPOSE_MOD, "createdAt": "2026-01-01T00:00:00Z"}}),
+        );
+        let h = hydrator_with(p, ScopeSets::default(), std::sync::Arc::new(up));
+        let me = Viewer { did: Some(ALICE.into()), hydrate: true };
         for (uri, owner) in [(&local, BOB), (&outside, OWNER)] {
             exec(p, &format!("INSERT INTO subscribed_lists (list_uri, owner_did, state, purpose) VALUES ('{uri}', '{owner}', 'active', '{PURPOSE_MOD}')")).await;
             exec(
@@ -244,12 +249,15 @@ mod tests {
         assert!(!s.muted.contains(CAROL) && !s.blocked_either_way(CAROL));
         assert_eq!(unread().await, json!(1));
 
-        // Served: the mute applies. The outside list has no view to show.
+        // Served: the mute applies. A profile view names the list, read
+        // from its record as any list of an outside owner is.
         reference(&outside, "mute", true).await;
         let s = state().await;
         assert!(s.muted.contains(CAROL) && !s.blocked_either_way(CAROL));
         assert_eq!(s.view(CAROL)["muted"], json!(true));
-        assert!(s.view(CAROL).get("mutedByList").is_none());
+        let profiles = h.profile_context(&me, &Requester::test(), &[CAROL.to_string()], None).await.expect("profiles");
+        let by_list = &profiles.viewer.view(CAROL)["mutedByList"];
+        assert_eq!((&by_list["uri"], &by_list["name"], &by_list["viewer"]["muted"]), (&json!(outside), &json!("Outside"), &json!(false)));
         // The viewer's own entry on the list does nothing to the viewer.
         assert!(!s.muted.contains(ALICE));
         assert_eq!(unread().await, json!(0));
