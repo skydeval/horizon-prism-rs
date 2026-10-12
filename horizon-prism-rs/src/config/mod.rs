@@ -23,7 +23,7 @@ pub use sections::{
     ActivitySubscriptionsConfig, AdminConfig, AuthConfig, BookmarkCount, BookmarksConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
     CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, DraftsConfig, FeaturesConfig,
     FarsightConfig, FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
-    KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelersConfig, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig,
+    KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelersConfig, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig, ThreadLensConfig,
     PrivateReadConfig, PrivateReadFloors, PublicScope, RateClassConfig, RateLimitsConfig,
     RetentionConfig, SchemaBackfillConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
     StarterPacksConfig, SyncConfig, ThreadConfig, ThreadMutesConfig, ThreadV2Config, UtcTimeOfDay,

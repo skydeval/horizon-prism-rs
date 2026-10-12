@@ -17,6 +17,9 @@ pub const ENV_CONFIG_PATH: &str = "APP_CONFIG_PATH";
 pub const ENV_DATA_DIR: &str = "APP_DATA_DIR";
 pub const ENV_SERVICE_SIGNING_KEY_HEX: &str = "APP_SERVICE_SIGNING_KEY_HEX";
 pub const ENV_CORRELATION_KEY_HEX: &str = "APP_CORRELATION_KEY_HEX";
+/// The key Thread Lens seals its paging cursors with (design-v3 §5.15.14).
+/// Optional: without it a key is made at each start.
+pub const ENV_THREADLENS_CURSOR_KEY_HEX: &str = "APP_THREADLENS_CURSOR_KEY_HEX";
 pub const ENV_ALLOW_STARTUP_MIGRATE: &str = "APP_ALLOW_STARTUP_MIGRATE";
 pub const ENV_LOG_LEVEL: &str = "APP_LOG_LEVEL";
 /// The one variable without the `APP_` prefix: Farsight's API key.
@@ -111,6 +114,10 @@ pub struct EnvConfig {
     pub log_level: String,
     /// `FARSIGHT_TOKEN`: the API key for `farsight.url` (design-v3 §5.14.4).
     pub farsight_token: Option<SecretToken>,
+    /// `APP_THREADLENS_CURSOR_KEY_HEX`: seals Thread Lens paging cursors.
+    /// `None` means a key is generated at start, and cursors do not
+    /// outlive the process.
+    pub threadlens_cursor_key: Option<Secret32>,
 }
 
 impl EnvConfig {
@@ -168,7 +175,14 @@ impl EnvConfig {
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
 
+        // Optional, but a value that is set must be a whole key.
+        let threadlens_cursor_key = match lookup(ENV_THREADLENS_CURSOR_KEY_HEX).filter(|v| !v.trim().is_empty()) {
+            None => None,
+            Some(hex) => Some(Secret32::from_hex(&hex).map_err(|r| invalid(ENV_THREADLENS_CURSOR_KEY_HEX, r))?),
+        };
+
         Ok(Self {
+            threadlens_cursor_key,
             public_hostname,
             database_url: SecretUrl(database_url),
             redis_url,

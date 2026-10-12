@@ -41,6 +41,18 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if cfg.op_thread.max_walk > 1000 {
         out.push("op_thread.max_walk must be at most 1000".to_string());
     }
+    // design-v3 §13: below these a Thread Lens response could add nothing,
+    // or could never reach a parent beyond the ordinary view.
+    for (key, value, least) in [
+        ("threadlens.page_nodes", cfg.threadlens.page_nodes, 2),
+        ("threadlens.listing_calls", cfg.threadlens.listing_calls, 2),
+        ("threadlens.parent_rounds", cfg.threadlens.parent_rounds, 1),
+        ("threadlens.verdict_round_timeout_ms", cfg.threadlens.verdict_round_timeout_ms, 1),
+    ] {
+        if value < least {
+            out.push(format!("{key} must be at least {least}"));
+        }
+    }
     lists_problems(cfg, &mut out);
     if !(1..=100).contains(&cfg.lists.read_listing_pages) {
         out.push("lists.read_listing_pages must be 1 to 100".to_string());

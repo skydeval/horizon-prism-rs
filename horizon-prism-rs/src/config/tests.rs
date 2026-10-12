@@ -295,6 +295,13 @@ max_parents = 80
 [op_thread]
 max_walk = 50
 
+[threadlens]
+page_nodes = 200
+listing_calls = 60
+verdict_round_timeout_ms = 500
+parent_rounds = 8
+verdict_max_dids = 600
+
 [lists]
 read_listing_pages = 5
 subscribed_max_per_member = 25
@@ -740,6 +747,18 @@ fn zero_values_that_break_runtime_are_rejected() {
         let p = invalid_problems(load(&text));
         assert!(has(&p, &format!("{section}.{key} must be greater than 0")), "{section}.{key}");
     }
+}
+
+/// design-v3 §13: the Thread Lens bounds have floors, and the cursor key
+/// is optional.
+#[test]
+fn threadlens_bounds_have_floors() {
+    let p = invalid_problems(load("[threadlens]\npage_nodes = 1\nlisting_calls = 1\nparent_rounds = 0\n"));
+    assert!(has(&p, "threadlens.page_nodes must be at least 2"), "{p:?}");
+    assert!(has(&p, "threadlens.listing_calls must be at least 2") && has(&p, "threadlens.parent_rounds must be at least 1"), "{p:?}");
+    let cfg = load("[threadlens]\npage_nodes = 2\nlisting_calls = 2\nparent_rounds = 1\n").expect("the floors themselves are valid");
+    assert_eq!((cfg.file.threadlens.verdict_max_dids, cfg.file.threadlens.verdict_round_timeout_ms), (600, 500));
+    assert!(cfg.env.threadlens_cursor_key.is_none());
 }
 
 /// design-v3 §4.3 "Budgets": a config that still carries a key the

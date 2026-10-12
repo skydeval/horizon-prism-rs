@@ -1018,6 +1018,38 @@ impl Default for OpThreadConfig {
     }
 }
 
+/// `[threadlens]` (design-v3 §5.15, §13): the bounds of one Thread Lens
+/// response.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThreadLensConfig {
+    /// The most nodes one response adds beyond the ordinary thread view.
+    /// The ordinary view itself is never cut and does not count.
+    pub page_nodes: u32,
+    /// Reply sequences a response starts to read, and Constellation pages
+    /// it fetches, counted together.
+    pub listing_calls: u32,
+    /// The time limit of one verdict round's Farsight calls.
+    pub verdict_round_timeout_ms: u32,
+    /// Verdict rounds the walk up the parents may make in one request.
+    pub parent_rounds: u32,
+    /// Distinct authors looked up for bridging in one request, beyond the
+    /// ordinary view's own.
+    pub verdict_max_dids: u32,
+}
+
+impl Default for ThreadLensConfig {
+    fn default() -> Self {
+        Self {
+            page_nodes: 200,
+            listing_calls: 60,
+            verdict_round_timeout_ms: 500,
+            parent_rounds: 8,
+            verdict_max_dids: 600,
+        }
+    }
+}
+
 /// `[lists]` (design-v3 §5.5).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1245,6 +1277,7 @@ pub struct FileConfig {
     pub thread: ThreadConfig,
     pub thread_v2: ThreadV2Config,
     pub op_thread: OpThreadConfig,
+    pub threadlens: ThreadLensConfig,
     pub thread_mutes: ThreadMutesConfig,
     pub activity_subscriptions: ActivitySubscriptionsConfig,
     pub notifications: NotificationsConfig,

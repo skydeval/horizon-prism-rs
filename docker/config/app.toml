@@ -354,6 +354,20 @@ max_parents = 80
 [op_thread]
 max_walk = 50
 
+# Thread Lens: the thread view that can show replies an ordinary view
+# leaves out. One response adds at most page_nodes posts beyond the ordinary
+# view (which is never cut); the client asks again for more. listing_calls
+# bounds how many reply lists one response starts to read. The other three
+# bound the block checks one response makes: the time one round of checks
+# may take, how many rounds the walk up the parents may make, and how many
+# different authors are checked.
+[threadlens]
+page_nodes = 200
+listing_calls = 60
+verdict_round_timeout_ms = 500
+parent_rounds = 8
+verdict_max_dids = 600
+
 # Showing a list that no other AppView could answer for: how many pages of
 # the list owner's records one request may read from the owner's server.
 [lists]

@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 12a: Thread Lens v2 settings (#674).** A `[threadlens]`
+  section with `page_nodes` (200), `listing_calls` (60),
+  `verdict_round_timeout_ms` (500), `parent_rounds` (8) and
+  `verdict_max_dids` (600), checked at startup, and an optional
+  `APP_THREADLENS_CURSOR_KEY_HEX` that `admin keygen` now prints a value
+  for. Nothing reads them yet: Thread Lens still behaves as before
+  (design-v3 §5.15, §13).
 - **Item 12: purposes survive a failed item listing (#673).** When a
   list sync reads all of an owner's list records and then fails while
   reading the list items, what the list records said about each list's
