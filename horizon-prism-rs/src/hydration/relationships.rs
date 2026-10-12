@@ -16,8 +16,8 @@
 //! scope or its subject is a member. A block stored only because its author
 //! holds private posts is never read here: showing it would reveal that.
 //!
-//! `blockedByList` (another account's list block naming the actor) comes
-//! from the block index and is not set here yet.
+//! `blockedByList` (another account's list block naming the actor) is read
+//! from Farsight for a ready member (§5.14.8). It carries the list's URI.
 
 use std::collections::HashMap;
 
@@ -124,6 +124,20 @@ impl Hydrator {
             Pairs::new()
         };
 
+        // Inbound list blocks, for a ready member, from Farsight on the
+        // caller's share: the list's URI, as the reference returns. With no
+        // answer the field is left out and the response still goes out.
+        let blocked_by_list: Pairs = match self.farsight().filter(|_| member) {
+            Some(farsight) => {
+                let (lists, complete) = farsight.request(req).relationship_lists(&actor, &dids, self.cache()).await;
+                if !complete {
+                    metrics::counter!(METRIC_PARTIAL).increment(1);
+                }
+                lists
+            }
+            None => Pairs::new(),
+        };
+
         let relationships: Vec<Value> = resolved
             .iter()
             .map(|(given, did)| {
@@ -139,6 +153,7 @@ impl Hydrator {
                     ("blocking", &blocking),
                     ("blockedBy", &blocked_by),
                     ("blockingByList", &by_list),
+                    ("blockedByList", &blocked_by_list),
                 ] {
                     if let Some(uri) = pairs.get(did) {
                         r.insert(key.into(), json!(uri));

@@ -5,10 +5,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The blocks one account holds against the other.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relation {
     /// A direct `app.bsky.graph.block`.
     pub direct: bool,
@@ -45,7 +46,7 @@ impl Relation {
 }
 
 /// Farsight's answer for (viewer, other).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairAnswer {
     /// Blocks the other account holds against the viewer.
     pub inbound: Relation,

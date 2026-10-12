@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 12: `getRelationships.blockedByList` (#673).** For a ready-member
+  `actor`, each other account that blocks it through a list gets
+  `blockedByList`, the list's URI, from one Farsight lookup on the caller's
+  share (design-v3 §5.14.8). Answers are cached in shared entries for
+  `farsight.cache_ttl_secs`. This public endpoint never reads or writes a
+  member's own cached answers, so it cannot show that a member recently
+  viewed an account. With no answer from Farsight the field is left out,
+  the response still goes out, and `relationships_partial_total` counts it.
 - **Item 12: inbound list blocks from Farsight (#673).** With
   `farsight.url` set, a ready member's public requests ask Farsight which
   accounts on the page block the member through a list, and such an account

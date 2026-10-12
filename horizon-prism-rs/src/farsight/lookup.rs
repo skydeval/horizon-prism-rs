@@ -28,6 +28,7 @@ use super::did::canonical;
 use crate::config::FarsightConfig;
 use crate::constellation::Class;
 use crate::constellation::cascade::SharedBreaker;
+use crate::hydration::ReadCache;
 use crate::xrpc::pools::{ChargeKey, Pool, Requester, SharedBucket, Shares};
 
 /// `farsight_calls_total{outcome}`.
@@ -299,6 +300,84 @@ impl Lookup {
             .collect()
     }
 
+    /// `getRelationships`'s reader (§5.14.8): for each of `others`, the
+    /// first list through which it blocks `actor`, keyed as `others` spells
+    /// it. The second value is false when some account got no answer.
+    ///
+    /// This is a public endpoint that anyone can call about a member, so it
+    /// reads and writes only shared entries of the read-time cache `rt`,
+    /// never a viewer's own cache: otherwise it would answer faster exactly
+    /// when the member had recently seen the account. It does not skip
+    /// accounts with a direct block.
+    pub async fn relationship_lists(&self, actor: &str, others: &[String], rt: &ReadCache) -> (HashMap<String, String>, bool) {
+        let Some(canonical_actor) = canonical(actor) else {
+            return (HashMap::new(), false);
+        };
+        let inner = &self.farsight.inner;
+        let ttl_ms = i64::try_from(inner.settings.ttl.as_millis()).unwrap_or(i64::MAX);
+        let key = |other: &str| format!("rt:farsight-pair:{canonical_actor}:{other}");
+        let mut wanted: Vec<String> = Vec::new();
+        for other in others {
+            if let Some(c) = canonical(other)
+                && c != canonical_actor
+                && !wanted.contains(&c)
+            {
+                wanted.push(c);
+            }
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut found: HashMap<String, PairAnswer> = HashMap::new();
+        let mut ask: Vec<String> = Vec::new();
+        for other in &wanted {
+            match rt.get_json::<(i64, PairAnswer)>(&key(other)).await {
+                Some((at, answer)) if now_ms.saturating_sub(at) < ttl_ms => {
+                    found.insert(other.clone(), answer);
+                }
+                _ => ask.push(other.clone()),
+            }
+        }
+        let mut complete = true;
+        if !ask.is_empty() {
+            let (plan, allowance) = {
+                let mut state = self.state();
+                let mut plan = chunks(&canonical_actor, &ask);
+                let allowed = usize::try_from(state.calls_left).unwrap_or(usize::MAX);
+                complete &= plan.len() <= allowed;
+                plan.truncate(allowed);
+                state.calls_left -= u32::try_from(plan.len()).unwrap_or(state.calls_left).min(state.calls_left);
+                (plan, state.allowance)
+            };
+            let started = Instant::now();
+            let outcomes: Vec<Outcome> = join_all(plan.into_iter().map(|chunk| self.call(&canonical_actor, chunk, allowance, started, true)))
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            {
+                let mut state = self.state();
+                state.allowance = state.allowance.saturating_sub(started.elapsed());
+            }
+            let at = chrono::Utc::now().timestamp_millis();
+            for (other, outcome) in outcomes {
+                match outcome {
+                    Some(answer) => {
+                        rt.put_json(&key(&other), &(at, &answer)).await;
+                        found.insert(other, answer);
+                    }
+                    None => complete = false,
+                }
+            }
+        }
+        let lists = others
+            .iter()
+            .filter_map(|other| {
+                let list = found.get(&canonical(other)?)?.inbound.list.clone()?;
+                Some((other.clone(), list))
+            })
+            .collect();
+        (lists, complete)
+    }
+
     /// Pair answers for `others` (canonical DIDs, in page order): from the
     /// request's memo, then the viewer's cache, then Farsight. An account
     /// with no answer is absent.
@@ -545,6 +624,36 @@ pub(crate) mod tests {
         let before = farsight.cached();
         farsight.forget(V);
         assert_eq!(farsight.cached(), before - 3);
+    }
+
+    /// B-80: `getRelationships` reads Farsight through shared entries only.
+    #[tokio::test]
+    async fn relationships_use_the_shared_cache_and_never_a_viewers() {
+        let (farsight, fake) = engine("").await;
+        fake.blockers.lock().expect("blockers").insert(A.to_string());
+        let rt = ReadCache::new(1024 * 1024);
+        let anonymous = Requester::test();
+        let (lists, complete) = farsight.request(&anonymous).relationship_lists(V, &page(&[A, B, V]), &rt).await;
+        assert_eq!((lists, complete), (HashMap::from([(A.to_string(), LIST.to_string())]), true));
+        assert_eq!(fake.asked.lock().expect("asked")[0], [A, B]);
+        // A repeat is answered from the shared entries.
+        farsight.request(&anonymous).relationship_lists(V, &page(&[B, A]), &rt).await;
+        assert_eq!(calls(&fake), 1);
+        // Nothing was written to the member's own cache, and the member's
+        // render does not read the shared entries: it asks.
+        assert_eq!(farsight.cached(), 0);
+        farsight.request(&member()).inbound_list_blocks(V, &page(&[A]), &HashSet::new()).await;
+        assert_eq!(calls(&fake), 2);
+        // And the other way: a member's cached answer does not spare the
+        // public endpoint its call.
+        farsight.request(&member()).inbound_list_blocks(V, &page(&[C]), &HashSet::new()).await;
+        farsight.request(&anonymous).relationship_lists(V, &page(&[C]), &rt).await;
+        assert_eq!(calls(&fake), 4);
+        // No answer: nothing listed, and the caller is told.
+        *fake.status.lock().expect("status") = 503;
+        let d = "did:plc:dddddddddddddddddddddddd";
+        let (lists, complete) = farsight.request(&anonymous).relationship_lists(V, &page(&[d]), &rt).await;
+        assert!(lists.is_empty() && !complete);
     }
 
     #[tokio::test]
