@@ -646,6 +646,8 @@ pub(crate) mod testing {
         pub posts: HashMap<String, Value>,
         /// DID → `getAuthorFeed` output, keyed with the cursor it answers.
         pub feeds: HashMap<(String, Option<String>), Value>,
+        /// What `lists_descending` answers.
+        pub descending: bool,
         pub calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -671,6 +673,9 @@ pub(crate) mod testing {
         }
         async fn follows(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
             None
+        }
+        async fn lists_descending(&self, _req: &Requester, _actor: &str) -> bool {
+            self.descending
         }
     }
 

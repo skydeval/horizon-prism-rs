@@ -82,6 +82,14 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 10: an in-scope author's feed continues from its PDS (G-3,
+  #670).** When `getAuthorFeed` runs out of stored rows for an in-scope
+  author whose PDS lists records newest first, it emits a
+  `P:<oldest stored post rkey>:<oldest stored repost rkey>` cursor and the
+  next page comes from the PDS, as it already did for out-of-scope
+  authors. On a PDS that lists oldest first, or whose order is unknown,
+  the feed ends with the stored rows. A PDS page that the filter empties
+  now keeps its cursor, so it no longer ends the feed.
 - **Item 10: `getPostThread` shows replies and parents it does not store
   (G-6, #670).** A node's replies are the union of the local rows and the
   replies Constellation lists for it (up to

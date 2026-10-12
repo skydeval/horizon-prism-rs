@@ -489,6 +489,18 @@ impl Hydrator {
                 },
             );
         }
+        // A `P:` cursor continues an in-scope author's feed from the author's
+        // PDS, below the records stored here (design-v3 §11 G-3).
+        if cursor.is_some_and(|c| c.starts_with("P:")) {
+            return match self.upstream().author_feed(req, &did, limit, cursor, filter).await {
+                Some(v) => Ok(Ok(Self::emit(self.normalized(viewer, v).await?.0))),
+                None => match req.exhausted() {
+                    // No budget for the listing: a 429, never an empty page.
+                    Some(exhausted) => Err(HydrationError::NoBudget(exhausted)),
+                    None => Ok(Ok(Self::emit(json!({ "feed": [] })))),
+                },
+            };
+        }
         let (at, after_uri) = parse_local_cursor(cursor);
         let kinds: &[&str] = match filter {
             "posts_no_replies" => &["post", "repost"],
@@ -544,6 +556,19 @@ impl Hydrator {
             && let Some(last) = items.last()
         {
             out["cursor"] = json!(local_cursor(last.sort_at, &last.uri));
+        } else if self.upstream().lists_descending(req, &did).await {
+            // The local rows are exhausted. On a PDS that lists newest
+            // first, the feed continues there, below the oldest record of
+            // each collection stored here (§II-7.1). On any other PDS it
+            // ends here.
+            let (posts, reposts): (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT (SELECT min(rkey) FROM posts WHERE author_did = $1), \
+                        (SELECT min(split_part(uri, '/', 5)) FROM feed_items WHERE originator_did = $1 AND kind = 'repost')",
+            )
+            .bind(&did)
+            .fetch_one(self.pool())
+            .await?;
+            out["cursor"] = json!(format!("P:{}:{}", posts.unwrap_or_default(), reposts.unwrap_or_default()));
         }
         Ok(Ok(Self::emit(out)))
     }
@@ -888,6 +913,70 @@ mod tests {
             }),
         );
         crate::test_support::serve_fake(router).await
+    }
+
+    /// design-v3 §11 G-3: an in-scope author's feed continues from a PDS
+    /// that lists newest first.
+    #[tokio::test]
+    async fn an_in_scope_author_feed_continues_from_a_descending_pds() {
+        use std::sync::Arc;
+
+        use crate::hydration::testing::{FixedUpstream, hydrator_with};
+
+        let Some(db) = fresh_db("hydration_author_feed_handover").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        post(p, ALICE, "3kbbbbbbbbbb2", "newer", None, None).await;
+        post(p, ALICE, "3kaaaaaaaaaa2", "oldest stored", None, None).await;
+        let anon = Viewer::anonymous();
+        let req = Requester::test();
+
+        // A PDS that lists oldest first, or whose order is unknown: the
+        // feed ends with the local rows.
+        let h = hydrator_with(p, sets(), Arc::new(FixedUpstream::default()));
+        let page = h.get_author_feed(&anon, &req, ALICE, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
+        assert_eq!(page.inner()["feed"].as_array().map(Vec::len), Some(2));
+        assert!(page.inner().get("cursor").is_none());
+
+        // A PDS that lists newest first: the feed hands over below the
+        // oldest stored record of each collection.
+        let handover = "P:3kaaaaaaaaaa2:".to_string();
+        let older = format!("at://{ALICE}/{NSID_POST}/3jzzzzzzzzzz2");
+        let mut up = FixedUpstream {
+            descending: true,
+            ..FixedUpstream::default()
+        };
+        up.feeds.insert(
+            (ALICE.to_string(), Some(handover.clone())),
+            json!({"feed": [{"post": {"$type": "app.bsky.feed.defs#postView", "uri": older, "cid": "bafyold",
+                "author": {"did": ALICE, "handle": "alice.test", "viewer": {}, "labels": []},
+                "record": {"$type": NSID_POST, "text": "older, from the PDS", "createdAt": "2025-01-01T00:00:00Z"},
+                "indexedAt": "2025-01-01T00:00:00Z", "viewer": {}, "labels": []}}],
+                "cursor": "P:3jzzzzzzzzzz2:"}),
+        );
+        let h = hydrator_with(p, sets(), Arc::new(up));
+        let page = h.get_author_feed(&anon, &req, ALICE, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
+        assert_eq!(page.inner()["cursor"], json!(handover));
+        let next = h
+            .get_author_feed(&anon, &req, ALICE, 50, Some(&handover), "posts_with_replies", false)
+            .await
+            .expect("db")
+            .expect("view");
+        assert_eq!(next.inner()["feed"][0]["post"]["uri"], json!(older));
+        assert_eq!(next.inner()["cursor"], "P:3jzzzzzzzzzz2:");
+        // Past the end of the PDS listing: an empty page and no cursor.
+        let end = h
+            .get_author_feed(&anon, &req, ALICE, 50, Some("P:3jzzzzzzzzzz2:"), "posts_with_replies", false)
+            .await
+            .expect("db")
+            .expect("view");
+        assert_eq!(end.inner(), &json!({"feed": []}));
+        // A full local page keeps its local cursor.
+        let page = h.get_author_feed(&anon, &req, ALICE, 1, None, "posts_with_replies", false).await.expect("db").expect("view");
+        assert!(page.inner()["cursor"].as_str().is_some_and(|c| c.starts_with("L:")));
+        db.drop_db().await;
     }
 
     /// design-v3 §11 G-7: quoting posts not stored here come from Slingshot.

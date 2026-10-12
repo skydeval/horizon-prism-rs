@@ -58,6 +58,11 @@ pub trait UpstreamSource: Send + Sync {
     async fn author_feed(&self, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>, filter: &str) -> Option<Value>;
     /// `app.bsky.graph.getFollows` output.
     async fn follows(&self, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>) -> Option<Value>;
+    /// Whether `actor`'s PDS lists records newest first, so a feed can
+    /// continue from it (§II-7.1). `false` when unknown.
+    async fn lists_descending(&self, _req: &Requester, _actor: &str) -> bool {
+        false
+    }
     /// The DID of a handle this AppView has not indexed (§6.7), verified
     /// bidirectionally.
     async fn resolve_handle(&self, _req: &Requester, _handle: &str) -> Option<String> {
@@ -384,6 +389,8 @@ impl RealUpstreamSource {
         let handle = self.handle_of(req, did).await;
         let mut feed = Vec::new();
         let (mut last_post, mut last_repost) = (post_cursor, repost_cursor);
+        // Records that entered the window, kept by the filter or not.
+        let mut consumed = 0usize;
         for (is_repost, r) in merged.into_iter().take(limit_usize) {
             if is_repost {
                 let rkey = r.rkey().to_string();
@@ -394,6 +401,7 @@ impl RealUpstreamSource {
                     .filter(|s| !is_private_uri(s) && !matches!(filter, "posts_with_media" | "posts_with_video"));
                 let Some(subject) = subject else {
                     last_repost = Some(rkey);
+                    consumed += 1;
                     continue;
                 };
                 match self.posts(req, &[subject.to_string()]).await.into_iter().next() {
@@ -409,8 +417,10 @@ impl RealUpstreamSource {
                     None => {}
                 }
                 last_repost = Some(rkey);
+                consumed += 1;
             } else {
                 last_post = Some(r.rkey().to_string());
+                consumed += 1;
                 let reply_root = r.value.pointer("/reply/root/uri").and_then(Value::as_str);
                 let keep = match filter {
                     "posts_no_replies" => reply_root.is_none(),
@@ -431,7 +441,9 @@ impl RealUpstreamSource {
             return None;
         }
         let mut out = json!({ "feed": feed });
-        if paged && (last_post.is_some() || last_repost.is_some()) && !out["feed"].as_array().is_some_and(Vec::is_empty) {
+        // A cursor whenever the window consumed a record: a page the filter
+        // emptied does not end the feed (§II-7.1, R3-110).
+        if paged && consumed > 0 {
             out["cursor"] = json!(format!("P:{}:{}", last_post.unwrap_or_default(), last_repost.unwrap_or_default()));
         }
         Some(out)
@@ -636,6 +648,13 @@ impl UpstreamSource for RealUpstreamSource {
             out["cursor"] = json!(format!("P:{c}"));
         }
         Some(out)
+    }
+
+    async fn lists_descending(&self, req: &Requester, actor: &str) -> bool {
+        let Some(pds) = self.router.lookup().summary(req, actor).await.and_then(|s| s.pds) else {
+            return false;
+        };
+        self.pds.order(req, &pds, actor).await == Some(ListOrder::Descending)
     }
 
     async fn resolve_handle(&self, req: &Requester, handle: &str) -> Option<String> {
