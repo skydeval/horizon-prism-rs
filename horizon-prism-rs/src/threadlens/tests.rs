@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 
+use super::cursor::CursorKey;
 use super::handlers::{GET_THREAD, RESOLVE, ThreadLensState, router};
 use super::ladder::{Ladder, Mode, Resolved};
 use super::{Gap, thread};
@@ -121,12 +122,12 @@ async fn tier_hidden_is_emitted_without_any_lookup() {
         assert_eq!(l.resolve(&viewer, &req, PRIVATE, mode).await.expect("no database call"), Resolved::Gap(Gap::TierHidden));
     }
     let request = thread::Request { viewer: &viewer, req: &req, anchor: PRIVATE, depth: 6, parent_height: 80 };
-    let got = thread::get_thread(&l, &ThreadLensConfig::default(), request).await.expect("no database call");
+    let got = thread::get_thread(&l, &ThreadLensConfig::default(), &CursorKey::generated(), request, None).await.expect("no database call");
     assert_eq!(got.nodes.len(), 1);
     assert!(matches!(&got.nodes[0], LensNode::Gap { gap: Gap::TierHidden, .. }));
     // Decided by the URI's form: no round ran, so bridging reads "off".
     assert_eq!(got.bridging, Bridging::Off);
-    let resolved = thread::resolve(&l, &ThreadLensConfig::default(), &viewer, &req, &[PRIVATE.to_string()]).await.expect("no database call");
+    let resolved = thread::resolve(&l, &ThreadLensConfig::default(), &CursorKey::generated(), &viewer, &req, &[PRIVATE.to_string()]).await.expect("no database call");
     assert!(matches!(&resolved.nodes[0], LensNode::Gap { gap: Gap::TierHidden, .. }));
     assert_eq!(calls.appview.load(Ordering::SeqCst), 0, "no AppView call");
     assert_eq!(calls.slingshot.load(Ordering::SeqCst), 0, "no Slingshot call");
@@ -162,6 +163,7 @@ fn state(h: Hydrator, l: Ladder) -> ThreadLensState {
         },
         ladder: l,
         cfg: ThreadLensConfig::default(),
+        cursor_key: CursorKey::new(&[9; 32]),
     }
 }
 
@@ -294,5 +296,61 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     assert!(status == 400 && body.contains("NotReady"), "{body}");
     let r = reqwest::Client::new().post(format!("{url}/xrpc/{GET_THREAD}")).json(&thread_input).send().await.expect("request");
     assert_eq!(r.status().as_u16(), 401);
+    db.drop_db().await;
+}
+
+/// B-84: one response adds at most `page_nodes` nodes and says where it
+/// stopped; the cursor resumes there, only for its own node; with
+/// bridging off a cursor that cannot be read from is kept as it was.
+#[tokio::test]
+async fn a_response_is_paged_by_a_sealed_cursor() {
+    let Some(db) = fresh_db("threadlens_paging").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(AUTHOR, "author.test"), (R1, "r1.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    // The viewer blocks R1, whose reply has three replies beneath it.
+    let anchor = post(p, AUTHOR, "3kanchor2222", "anchor", None, None).await;
+    let gapped = post(p, R1, "3kgapped2222", "gapped", Some(&anchor), Some(&anchor)).await;
+    let mut beneath = Vec::new();
+    for rkey in ["3kbeneath222", "3kbeneath333", "3kbeneath444"] {
+        beneath.push(post(p, AUTHOR, rkey, "beneath", Some(&gapped), Some(&anchor)).await);
+    }
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
+    let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
+    let base = fake_upstream(Arc::new(Calls::default()), None).await;
+    let l = ladder(h, &base, Arc::new(StubLookup::default()));
+    let (req, viewer, key) = (Requester::test(), member(VIEWER_A), CursorKey::new(&[9; 32]));
+    // Three added nodes a response: the gap, and two of the three beneath.
+    let cfg = ThreadLensConfig { page_nodes: 3, ..ThreadLensConfig::default() };
+    let uris = |nodes: &[LensNode]| nodes.iter().map(|n| n.uri().to_string()).collect::<Vec<_>>();
+    let marker = |nodes: &[LensNode], uri: &str| nodes.iter().find(|n| n.uri() == uri).and_then(|n| n.markers().more_replies.clone());
+
+    let request = thread::Request { viewer: &viewer, req: &req, anchor: &anchor, depth: 6, parent_height: 80 };
+    let first = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    assert_eq!(uris(&first.nodes), [anchor.clone(), gapped.clone(), beneath[0].clone(), beneath[1].clone()]);
+    let cursor = marker(&first.nodes, &gapped).expect("a marker on the gap").expect("with a cursor");
+    // The cursor is bound to its node.
+    assert!(key.open(&anchor, &cursor).is_none());
+    let position = key.open(&gapped, &cursor).expect("opens for its node");
+
+    // The continuation: the gap as the anchor, no parents, the rest of
+    // its sequence, and no marker left.
+    let next = thread::Request { viewer: &viewer, req: &req, anchor: &gapped, depth: 1, parent_height: 0 };
+    let second = thread::get_thread(&l, &cfg, &key, next, Some((position.clone(), cursor.clone()))).await.expect("thread");
+    assert_eq!(uris(&second.nodes), [gapped.clone(), beneath[2].clone()]);
+    assert!(matches!(&second.nodes[0], LensNode::Gap { gap: Gap::BlockedByYou, .. }));
+    assert_eq!(marker(&second.nodes, &gapped), None);
+
+    // Farsight stops vouching: replies to a gap are bridge candidates, so
+    // nothing is read, and the marker keeps the cursor it came with.
+    *fake.level.lock().expect("level") = "partial";
+    let off = thread::get_thread(&l, &cfg, &key, next, Some((position, cursor.clone()))).await.expect("thread");
+    assert_eq!((uris(&off.nodes), off.bridging), (vec![gapped.clone()], Bridging::Off));
+    assert_eq!(marker(&off.nodes, &gapped), Some(Some(cursor)));
     db.drop_db().await;
 }

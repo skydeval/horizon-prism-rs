@@ -558,6 +558,12 @@ pub async fn run() -> Result<(), StartupError> {
         app: app.clone(),
         ladder: Ladder::new(app.hydrator.clone(), did_router.clone(), cascade, slingshot),
         cfg: cfg.file.threadlens.clone(),
+        // Without a configured key, cursors do not outlive the process.
+        cursor_key: cfg
+            .env
+            .threadlens_cursor_key
+            .as_ref()
+            .map_or_else(crate::threadlens::cursor::CursorKey::generated, |key| crate::threadlens::cursor::CursorKey::new(key.expose())),
     };
     let index = crate::xrpc::handlers::index::IndexState {
         app: app.clone(),

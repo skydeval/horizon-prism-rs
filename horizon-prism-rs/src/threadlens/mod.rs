@@ -12,6 +12,7 @@
 //!   `tier-hidden` before any lookup (§10.5).
 //! - The gap taxonomy has no viewer-relative variant.
 
+pub mod cursor;
 pub mod gaps;
 pub mod handlers;
 pub mod ladder;

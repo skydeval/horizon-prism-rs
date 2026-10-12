@@ -21,6 +21,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::cursor::CursorKey;
 use super::ladder::Ladder;
 use super::thread::{Request, get_thread as assemble, resolve as resolve_each};
 use crate::config::ThreadLensConfig;
@@ -48,6 +49,8 @@ pub struct ThreadLensState {
     pub app: AppState,
     pub ladder: Ladder,
     pub cfg: ThreadLensConfig,
+    /// Seals the paging cursors.
+    pub cursor_key: CursorKey,
 }
 
 /// The Thread Lens routes, merged into the app by `serve`.
@@ -120,11 +123,15 @@ pub async fn get_thread(
     if depth > MAX_DEPTH || parent_height > MAX_DEPTH {
         return Err(XrpcError::invalid("Error: depth and parentHeight must be 0-1000"));
     }
-    // No cursor is issued yet, so none can be valid: the client restarts
-    // that node without one.
-    if input.replies_cursor.is_some() {
-        return Err(XrpcError::invalid("Error: repliesCursor is not valid for this anchor"));
-    }
+    // A cursor that fails authentication, or was issued for another node,
+    // is refused: the client restarts that node without one.
+    let cursor = match input.replies_cursor {
+        None => None,
+        Some(raw) => match s.cursor_key.open(&input.anchor, &raw) {
+            Some(position) => Some((position, raw)),
+            None => return Err(XrpcError::invalid("Error: repliesCursor is not valid for this anchor")),
+        },
+    };
     let request = Request {
         viewer: &viewer,
         req: &req,
@@ -132,7 +139,7 @@ pub async fn get_thread(
         depth,
         parent_height,
     };
-    let thread = assemble(&s.ladder, &s.cfg, request).await?;
+    let thread = assemble(&s.ladder, &s.cfg, &s.cursor_key, request, cursor).await?;
     Ok(Json(lens_thread(&input.anchor, &thread.nodes, thread.bridging)))
 }
 
@@ -150,6 +157,6 @@ pub async fn resolve(
     if !input.uris.iter().all(|u| at_uri(u)) {
         return Err(XrpcError::invalid("Error: uris must be at-uris"));
     }
-    let resolved = resolve_each(&s.ladder, &s.cfg, &viewer, &req, &input.uris).await?;
+    let resolved = resolve_each(&s.ladder, &s.cfg, &s.cursor_key, &viewer, &req, &input.uris).await?;
     Ok(Json(lens_items(&resolved.nodes, resolved.bridging)))
 }

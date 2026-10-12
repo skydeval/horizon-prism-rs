@@ -1135,10 +1135,12 @@ commit.
   fetched (`block-state-unknown`). `depth` and `parentHeight` go to
   1000; one response adds at most `threadlens.page_nodes` nodes and
   marks where it stopped (`moreParents`, `moreReplies`, `truncated`).
-  Post views carry the caller's viewer state. The lexicons are edited in
-  place. Not yet built: paging cursors (`repliesCursor` is refused, so a
-  node with more replies than one response reads cannot be read past
-  that point) (design-v3 §5.15; proposed locked decision 38).
+  Post views carry the caller's viewer state. A `moreReplies` marker
+  carries a cursor when part of the node's replies was read; the cursor
+  is sealed with `APP_THREADLENS_CURSOR_KEY_HEX` (or a key made at
+  start), opens only for the node it was issued for, and is passed back
+  as `repliesCursor`. The lexicons are edited in place (design-v3 §5.15;
+  proposed locked decision 38).
 - **Item 12: Farsight call outcomes are named (#673).**
   `farsight_calls_total{outcome}` now says `rate_limited` (this key's
   allowance on Farsight is spent), `overloaded` (Farsight is up and

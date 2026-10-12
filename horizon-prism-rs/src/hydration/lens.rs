@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use super::normalize::NormalizeReport;
@@ -331,26 +332,38 @@ impl Hydrator {
     }
 
     /// The local phase of a post's reply sequence (§5.15.14): the stored
-    /// replies to `uri`, in `(created_at, uri)` order, at most `limit`.
+    /// replies to `uri` after the position `after`, in `(created_at, uri)`
+    /// order, at most `limit`, each with its `created_at`.
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn lens_local_replies(&self, uri: &str, limit: u32) -> Result<Vec<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT uri FROM posts WHERE reply_parent_uri = $1 ORDER BY created_at, uri LIMIT $2")
-            .bind(uri)
-            .bind(i64::from(limit))
-            .fetch_all(self.pool())
-            .await
+    pub async fn lens_local_replies(&self, uri: &str, after: Option<(DateTime<Utc>, &str)>, limit: u32) -> Result<Vec<(String, DateTime<Utc>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT uri, created_at FROM posts WHERE reply_parent_uri = $1 \
+               AND ($2::timestamptz IS NULL OR (created_at, uri) > ($2, $3)) \
+             ORDER BY created_at, uri LIMIT $4",
+        )
+        .bind(uri)
+        .bind(after.map(|(at, _)| at))
+        .bind(after.map_or("", |(_, uri)| uri))
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await
     }
 
     /// The Constellation phase of a post's reply sequence: one page of
-    /// the replies its listing names, at most `limit`. `None` when the
-    /// listing gave no answer (no budget, or Constellation did not
-    /// respond).
-    pub async fn lens_listed_replies(&self, req: &Requester, uri: &str, limit: u32) -> Option<Vec<String>> {
-        let page = self.links_page(req, uri, super::feed::NSID_POST, ".reply.parent.uri", limit, None).await.ok()??;
-        Some(page.linking_records.into_iter().map(|r| format!("at://{}/{}/{}", r.did, r.collection, r.rkey)).collect())
+    /// the replies its listing names from `cursor`, at most `limit`, and
+    /// the listing's next cursor. `None` when the listing gave no answer
+    /// (no budget, or Constellation did not respond). With no
+    /// Constellation configured there is no such phase: an empty page.
+    pub async fn lens_listed_replies(&self, req: &Requester, uri: &str, limit: u32, cursor: Option<&str>) -> Option<(Vec<String>, Option<String>)> {
+        if self.backlinks().is_none() {
+            return Some((Vec::new(), None));
+        }
+        let page = self.links_page(req, uri, super::feed::NSID_POST, ".reply.parent.uri", limit, cursor).await.ok()??;
+        let replies = page.linking_records.into_iter().map(|r| format!("at://{}/{}/{}", r.did, r.collection, r.rkey)).collect();
+        Some((replies, page.cursor))
     }
 }
 
