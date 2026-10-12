@@ -28,6 +28,9 @@ pub struct ProfileContext {
     pub viewer: ActorViewer,
     pub labels: HashMap<String, Vec<Value>>,
     pub followers: HashMap<String, i32>,
+    /// By actor: `allowSubscriptions` of its stored notification
+    /// declaration. No entry means no record, which reads as `followers`.
+    pub declarations: HashMap<String, String>,
 }
 
 impl ProfileContext {
@@ -69,6 +72,9 @@ impl ProfileContext {
                 if let Some(pinned) = r.profile_record.as_ref().and_then(|p| p.get("pinnedPost")).cloned() {
                     v.insert("pinnedPost".into(), pinned);
                 }
+                // Who may subscribe to this account's posts (design-v3 §8.1).
+                let allow = self.declarations.get(did).map_or("followers", String::as_str);
+                v.insert("associated".into(), json!({"activitySubscription": {"allowSubscriptions": allow}}));
             }
         }
         v.insert("viewer".into(), self.viewer.view(did));
@@ -102,11 +108,19 @@ impl Hydrator {
                 .collect(),
             None => HashMap::new(),
         };
+        let declarations: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT did, record->>'allowSubscriptions' FROM actor_self_records WHERE did = ANY($1) AND collection = $2",
+        )
+        .bind(dids)
+        .bind(super::activity_subscriptions::NSID_DECLARATION)
+        .fetch_all(self.pool())
+        .await?;
         Ok(ProfileContext {
             rows,
             viewer: actor_viewer,
             labels,
             followers,
+            declarations: declarations.into_iter().filter_map(|(did, allow)| Some((did, allow?))).collect(),
         })
     }
 
@@ -121,6 +135,7 @@ impl Hydrator {
             viewer: ActorViewer::default(),
             labels: self.load_labels(dids).await?,
             followers: HashMap::new(),
+            declarations: HashMap::new(),
         })
     }
 

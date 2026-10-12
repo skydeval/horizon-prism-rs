@@ -212,6 +212,8 @@ pub struct ActorViewer {
     /// Subjects whose direct mute covers quote posts (`quotes`,
     /// `reposts_and_quotes`).
     pub muted_quotes: HashSet<String>,
+    /// Subjects the viewer has an activity subscription to: `(post, reply)`.
+    pub subscribed: HashMap<String, (bool, bool)>,
 }
 
 impl ActorViewer {
@@ -238,6 +240,9 @@ impl ActorViewer {
         }
         if let Some(u) = self.followed_by.get(did) {
             v.insert("followedBy".into(), json!(u));
+        }
+        if let Some((post, reply)) = self.subscribed.get(did) {
+            v.insert("activitySubscription".into(), json!({"post": post, "reply": reply}));
         }
         Value::Object(v)
     }
@@ -489,7 +494,15 @@ impl Hydrator {
                 .bind(dids)
                 .fetch_all(p)
                 .await?;
+        let subscribed: Vec<(String, bool, bool)> = sqlx::query_as(
+            "SELECT subject_did, post, reply FROM activity_subscriptions WHERE subscriber_did = $1 AND subject_did = ANY($2)",
+        )
+        .bind(me)
+        .bind(dids)
+        .fetch_all(p)
+        .await?;
         let mut out = ActorViewer {
+            subscribed: subscribed.into_iter().map(|(did, post, reply)| (did, (post, reply))).collect(),
             following: following.into_iter().collect(),
             followed_by: followed_by.into_iter().collect(),
             blocking: blocking.into_iter().collect(),

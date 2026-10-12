@@ -149,6 +149,8 @@ impl Hydrator {
         let subscriptions: Vec<Value> = rows
             .iter()
             .map(|(did, post, reply, _)| {
+                // Set here too: the viewer state of a member that is not
+                // ready is not hydrated, and the listing is its own rows.
                 let mut view = ctx.view(did, ProfileKind::View);
                 view["viewer"]["activitySubscription"] = json!({"post": post, "reply": reply});
                 view
@@ -246,6 +248,15 @@ mod tests {
         let cursor = first.inner()["cursor"].as_str().expect("cursor").to_string();
         let second = h.list_activity_subscriptions(&me, &req, 1, Some(&cursor)).await.expect("db").expect("view");
         assert_eq!(second.inner()["subscriptions"][0]["did"], CAROL);
+
+        // Profile views carry both sides: the viewer's subscription, and on
+        // a detailed view who the account lets subscribe.
+        let profile = h.get_profile(&me, &req, CAROL).await.expect("db").expect("view");
+        assert_eq!(profile.inner()["viewer"]["activitySubscription"], json!({"post": true, "reply": true}));
+        assert_eq!(profile.inner()["associated"]["activitySubscription"]["allowSubscriptions"], "mutuals");
+        let profile = h.get_profile(&me, &req, DAVE).await.expect("db").expect("view");
+        assert!(profile.inner()["viewer"].get("activitySubscription").is_none());
+        assert_eq!(profile.inner()["associated"]["activitySubscription"]["allowSubscriptions"], "followers");
 
         // Turning one off needs nothing: not readiness, not scope; and it
         // can be repeated.

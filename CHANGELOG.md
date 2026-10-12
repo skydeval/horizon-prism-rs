@@ -12,6 +12,12 @@ commit.
 
 ### Added
 
+- **Item 14: subscription state on profiles (#675).** Profile views
+  carry `viewer.activitySubscription` for a ready member subscribed to
+  the account, and detailed profile views carry
+  `associated.activitySubscription.allowSubscriptions` from the account's
+  notification declaration (`followers` when it has none)
+  (design-v3 §8.1).
 - **Item 14: `starterpack-joined` notifications (#675).** When an
   account's profile is created, as seen live on the firehose, and names a
   member's starter pack as the one it joined through, that member is
