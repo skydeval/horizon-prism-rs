@@ -19,6 +19,26 @@ pub const NSID_LIKE: &str = "app.bsky.feed.like";
 pub const NSID_REPOST: &str = "app.bsky.feed.repost";
 pub const NSID_POST: &str = "app.bsky.feed.post";
 
+/// The one media classifier (design-v3 §8.4): `images`, `video`, `gallery`
+/// or `None` for a post record, looking at the top-level embed and at
+/// `recordWithMedia.media`. The author-feed media filters use it for
+/// records that have no `posts` row; the local filter's SQL is the same
+/// test.
+#[must_use]
+pub fn media_type(record: &Value) -> Option<&'static str> {
+    let embed = record.get("embed")?;
+    let kind = match embed.get("$type").and_then(Value::as_str)? {
+        "app.bsky.embed.recordWithMedia" => embed.pointer("/media/$type").and_then(Value::as_str)?,
+        other => other,
+    };
+    match kind {
+        "app.bsky.embed.images" => Some("images"),
+        "app.bsky.embed.video" => Some("video"),
+        "app.bsky.embed.gallery" => Some("gallery"),
+        _ => None,
+    }
+}
+
 /// Clamp a lexicon `limit` (1..=100, default 50).
 #[must_use]
 pub fn clamp_limit(limit: Option<u32>) -> u32 {
@@ -192,6 +212,29 @@ impl PostContext {
                     v["aspectRatio"] = ar.clone();
                 }
                 Some(v)
+            }
+            // design-v3 §8.4. `items` is a union in the lexicon, so every
+            // view item carries its `$type` (images#view items do not). Only
+            // `#image` record items are read, and an item missing its
+            // required `alt` or `aspectRatio` is dropped, not invented.
+            "app.bsky.embed.gallery" => {
+                let items: Vec<Value> = embed
+                    .get("items")?
+                    .as_array()?
+                    .iter()
+                    .filter(|item| item.get("$type").and_then(Value::as_str) == Some("app.bsky.embed.gallery#image"))
+                    .filter_map(|item| {
+                        let cid = item.get("image").and_then(blob_cid)?;
+                        Some(json!({
+                            "$type": "app.bsky.embed.gallery#viewImage",
+                            "thumbnail": blob_url(pds.as_deref(), did, &cid)?,
+                            "fullsize": blob_url(pds.as_deref(), did, &cid)?,
+                            "alt": item.get("alt").and_then(Value::as_str)?,
+                            "aspectRatio": item.get("aspectRatio").filter(|ar| ar.is_object())?.clone(),
+                        }))
+                    })
+                    .collect();
+                Some(json!({"$type": "app.bsky.embed.gallery#view", "items": items}))
             }
             _ => None,
         }
@@ -446,14 +489,24 @@ impl Hydrator {
             "posts_no_replies" => &["post", "repost"],
             _ => &["post", "reply", "repost"],
         };
-        let (media, threads) = (filter == "posts_with_media", filter == "posts_and_author_threads");
+        let threads = filter == "posts_and_author_threads";
+        // The media embed types a media filter keeps (§8.4): the same test
+        // as `media_type`, on the top-level embed or on recordWithMedia's
+        // media. Video is its own filter. `posts.media_type` replaces the
+        // expression once its migration lands (§II-15 item 11).
+        let media: Option<Vec<&str>> = match filter {
+            "posts_with_media" => Some(vec!["app.bsky.embed.images", "app.bsky.embed.gallery"]),
+            "posts_with_video" => Some(vec!["app.bsky.embed.video"]),
+            _ => None,
+        };
         let items: Vec<FeedItem> = sqlx::query_as(
             "SELECT f.uri, f.originator_did, f.post_uri, f.kind, f.sort_at FROM feed_items f \
              LEFT JOIN posts p ON p.uri = f.post_uri \
              WHERE f.originator_did = $1 AND f.kind = ANY($2) \
                AND ($3::timestamptz IS NULL OR (f.sort_at, f.uri) < ($3, $4)) \
-               AND (NOT $6 OR (f.kind <> 'repost' AND p.embed->>'$type' IN \
-                    ('app.bsky.embed.images', 'app.bsky.embed.video', 'app.bsky.embed.recordWithMedia'))) \
+               AND ($6::text[] IS NULL OR (f.kind <> 'repost' AND \
+                    (CASE WHEN p.embed->>'$type' = 'app.bsky.embed.recordWithMedia' \
+                          THEN p.embed->'media'->>'$type' ELSE p.embed->>'$type' END) = ANY($6))) \
                AND (NOT $7 OR f.kind <> 'reply' OR split_part(p.reply_root_uri, '/', 3) = $1) \
              ORDER BY f.sort_at DESC, f.uri DESC LIMIT $5",
         )
@@ -769,6 +822,108 @@ mod tests {
             s.members.insert(d.into());
         }
         s
+    }
+
+    #[test]
+    fn media_classifier() {
+        let of = |embed: Value| media_type(&json!({"$type": NSID_POST, "embed": embed}));
+        assert_eq!(of(json!({"$type": "app.bsky.embed.images"})), Some("images"));
+        assert_eq!(of(json!({"$type": "app.bsky.embed.video"})), Some("video"));
+        assert_eq!(of(json!({"$type": "app.bsky.embed.gallery"})), Some("gallery"));
+        assert_eq!(of(json!({"$type": "app.bsky.embed.external"})), None);
+        assert_eq!(of(json!({"$type": "app.bsky.embed.record"})), None);
+        let with = |media: &str| of(json!({"$type": "app.bsky.embed.recordWithMedia", "media": {"$type": media}}));
+        assert_eq!(with("app.bsky.embed.gallery"), Some("gallery"));
+        assert_eq!(with("app.bsky.embed.video"), Some("video"));
+        assert_eq!(with("app.bsky.embed.external"), None);
+        assert_eq!(media_type(&json!({"$type": NSID_POST, "text": "plain"})), None);
+    }
+
+    /// design-v3 §8.4 and §11 G-2: gallery views, and the media and video
+    /// filters of `getAuthorFeed`.
+    #[tokio::test]
+    async fn gallery_views_and_media_filters() {
+        let Some(db) = fresh_db("hydration_gallery").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let blob = |cid: &str| json!({"$type": "blob", "ref": {"$link": cid}, "mimeType": "image/png", "size": 1});
+        let gallery = json!({"$type": "app.bsky.embed.gallery", "items": [
+            {"$type": "app.bsky.embed.gallery#image", "image": blob("bafyg1"), "alt": "one",
+             "aspectRatio": {"width": 4, "height": 3}},
+            // Missing its required aspectRatio: dropped, not invented.
+            {"$type": "app.bsky.embed.gallery#image", "image": blob("bafyg2"), "alt": "no ratio"},
+            // Another item type: skipped.
+            {"$type": "app.example.other#thing", "image": blob("bafyg3"), "alt": "x",
+             "aspectRatio": {"width": 1, "height": 1}},
+        ]});
+        let plain = post(p, BOB, "3kaaaaaaaaaa2", "plain", None, None).await;
+        let images = post(p, BOB, "3kaaaaaaaaaa3", "images", None, None).await;
+        let video = post(p, BOB, "3kaaaaaaaaaa4", "video", None, None).await;
+        let with_gallery = post(p, BOB, "3kaaaaaaaaaa5", "gallery", None, None).await;
+        let quote_gallery = post(p, BOB, "3kaaaaaaaaaa6", "quote with gallery", None, None).await;
+        let set = |uri: String, embed: Value| async move {
+            sqlx::query("UPDATE posts SET embed = $1 WHERE uri = $2")
+                .bind(embed)
+                .bind(uri)
+                .execute(p)
+                .await
+                .expect("embed");
+        };
+        set(images.clone(), json!({"$type": "app.bsky.embed.images", "images": [{"image": blob("bafyi1"), "alt": "i"}]})).await;
+        set(video.clone(), json!({"$type": "app.bsky.embed.video", "video": blob("bafyv1")})).await;
+        set(with_gallery.clone(), gallery.clone()).await;
+        set(
+            quote_gallery.clone(),
+            json!({"$type": "app.bsky.embed.recordWithMedia",
+                   "record": {"$type": "app.bsky.embed.record", "record": {"uri": plain, "cid": "bafyplain"}},
+                   "media": gallery}),
+        )
+        .await;
+        let h = hydrator(p, sets());
+        let anon = Viewer::anonymous();
+
+        let v = h.get_posts(&anon, &[with_gallery.clone(), quote_gallery.clone()]).await.expect("db").expect("view");
+        let posts = v.inner()["posts"].as_array().expect("posts");
+        let view = &posts[0]["embed"];
+        assert_eq!(view["$type"], "app.bsky.embed.gallery#view");
+        assert_eq!(view["items"].as_array().map(Vec::len), Some(1));
+        let item = &view["items"][0];
+        assert_eq!(item["$type"], "app.bsky.embed.gallery#viewImage");
+        assert_eq!(item["alt"], "one");
+        assert_eq!(item["aspectRatio"], json!({"width": 4, "height": 3}));
+        let url = format!("https://pds.example.com/xrpc/com.atproto.sync.getBlob?did={BOB}&cid=bafyg1");
+        assert_eq!((&item["thumbnail"], &item["fullsize"]), (&json!(url), &json!(url)));
+        assert!(item.get("thumb").is_none());
+        // recordWithMedia with gallery media keeps the quoted record.
+        let rwm = &posts[1]["embed"];
+        assert_eq!(rwm["$type"], "app.bsky.embed.recordWithMedia#view");
+        assert_eq!(rwm["media"]["$type"], "app.bsky.embed.gallery#view");
+        assert_eq!(rwm["record"]["record"]["uri"], json!(plain));
+
+        let uris = |filter: &'static str| {
+            let h = &h;
+            let anon = &anon;
+            async move {
+                let feed = h.get_author_feed(anon, BOB, 50, None, filter, false).await.expect("db").expect("view");
+                let mut uris: Vec<String> = feed.inner()["feed"]
+                    .as_array()
+                    .expect("feed")
+                    .iter()
+                    .map(|i| i["post"]["uri"].as_str().expect("uri").to_string())
+                    .collect();
+                uris.sort();
+                uris
+            }
+        };
+        // Gallery counts as media, directly and inside recordWithMedia;
+        // video is its own filter.
+        assert_eq!(uris("posts_with_media").await, [images, with_gallery, quote_gallery]);
+        assert_eq!(uris("posts_with_video").await, [video]);
+        assert_eq!(uris("posts_with_replies").await.len(), 5);
+        db.drop_db().await;
     }
 
     #[tokio::test]

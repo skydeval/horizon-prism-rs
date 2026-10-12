@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::cache::ReadCache;
+use super::feed::media_type;
 use super::normalize::is_private_uri;
 use super::{INVALID_HANDLE, blob_url};
 use crate::aggregations::counts::{self, Counts, Freshness};
@@ -373,7 +374,7 @@ impl RealUpstreamSource {
                 let Some(subject) = r.value.pointer("/subject/uri").and_then(Value::as_str) else {
                     continue;
                 };
-                if is_private_uri(subject) || filter == "posts_with_media" {
+                if is_private_uri(subject) || matches!(filter, "posts_with_media" | "posts_with_video") {
                     continue;
                 }
                 if let Some(post) = self.posts(&[subject.to_string()]).await.into_iter().next() {
@@ -388,9 +389,9 @@ impl RealUpstreamSource {
                 let reply_root = r.value.pointer("/reply/root/uri").and_then(Value::as_str);
                 let keep = match filter {
                     "posts_no_replies" => reply_root.is_none(),
-                    "posts_with_media" => r.value.pointer("/embed/$type").and_then(Value::as_str).is_some_and(|t| {
-                        matches!(t, "app.bsky.embed.images" | "app.bsky.embed.video" | "app.bsky.embed.recordWithMedia")
-                    }),
+                    // §8.4: gallery counts as media; video is its own filter.
+                    "posts_with_media" => matches!(media_type(&r.value), Some("images" | "gallery")),
+                    "posts_with_video" => media_type(&r.value) == Some("video"),
                     "posts_and_author_threads" => reply_root.is_none_or(|u| uri_author(u) == Some(did)),
                     _ => true,
                 };

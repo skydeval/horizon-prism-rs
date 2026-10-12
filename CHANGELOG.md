@@ -12,6 +12,17 @@ commit.
 
 ### Added
 
+- **Item 10: gallery embeds.** `app.bsky.embed.gallery` is rendered wherever
+  an embed is: as a post's embed, as the media of `recordWithMedia` (which
+  no longer loses its quoted record), and inside a quoted post's `embeds`
+  (design-v3 §8.4; locked decision 33). Every view item carries
+  `$type: app.bsky.embed.gallery#viewImage` with `thumbnail`, `fullsize`,
+  `alt` and `aspectRatio`; a record item of another type, or one missing
+  `alt` or `aspectRatio`, is left out.
+- **Item 10: `getAuthorFeed` `posts_with_video` (G-2).** The filter is
+  accepted and returns posts whose media is a video, directly or inside
+  `recordWithMedia`. One classifier, `media_type`, decides for local rows
+  and for records listed from a PDS.
 - **Item 10: scoped mutes.** `muteActor` takes `onlyReposts` and
   `onlyQuoteposts` and stores `mutes.scope` (`full`, `reposts`, `quotes`,
   `reposts_and_quotes`; migration 0012). A repeat call replaces the scope
@@ -225,6 +236,10 @@ commit.
 
 ### Changed
 
+- `getAuthorFeed` `posts_with_media` now means images and galleries. Video
+  moved to its own filter, as in the reference AppView, so a client with
+  Media and Video tabs does not show a video twice. A `recordWithMedia`
+  whose media is an external link no longer counts as media.
 - The per-IP backstop is one layer on the final router instead of one per
   sub-router. `GET` and `HEAD` on `/xrpc/_health` stay exempt.
 - `app.nearhorizon.private.getAuthorFeed`'s lexicon description names its

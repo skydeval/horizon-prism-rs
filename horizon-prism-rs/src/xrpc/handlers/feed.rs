@@ -20,7 +20,14 @@ pub const GET_LIKES: &str = "app.bsky.feed.getLikes";
 pub const GET_REPOSTED_BY: &str = "app.bsky.feed.getRepostedBy";
 pub const GET_QUOTES: &str = "app.bsky.feed.getQuotes";
 
-const FILTERS: [&str; 4] = ["posts_with_replies", "posts_no_replies", "posts_with_media", "posts_and_author_threads"];
+// The lexicon's known values at `b3d7c33` (design-v3 §11 G-2).
+const FILTERS: [&str; 5] = [
+    "posts_with_replies",
+    "posts_no_replies",
+    "posts_with_media",
+    "posts_and_author_threads",
+    "posts_with_video",
+];
 
 pub async fn get_posts(
     State(s): State<AppState>,
