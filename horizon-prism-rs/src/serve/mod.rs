@@ -461,6 +461,8 @@ pub async fn run() -> Result<(), StartupError> {
             thread_v2_max_parents: cfg.file.thread_v2.max_parents,
             op_thread_max_walk: cfg.file.op_thread.max_walk,
             farsight: farsight.clone(),
+            list_budget,
+            list_applier: Some(applier.clone()),
             constellation_bucket: Some(shares.bucket(
                 "constellation",
                 microcosm.constellation_rate_per_sec.0,

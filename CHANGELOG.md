@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **Item 12: `muteActorList`, `unmuteActorList`, `getListMutes`,
+  `getListBlocks` (#673).** A member can mute a moderation list, up to
+  `lists.subscribed_max_per_member` lists from at most
+  `lists.max_owners_per_member` owners; past that the call is
+  `400 InvalidRequest` and nothing is written. A list that is not a
+  moderation list, or a URI that is not a list, is `400 InvalidRequest`.
+  The two listings show the lists the member mutes and blocks, newest
+  first, whether or not they have an effect yet. A mute does not hide
+  anything yet: applying it to feeds, notifications, threads and viewer
+  state is the next step (design-v3 §5.3).
 - **Item 12: budget changes and tombstone clean-up (#673).** At startup
   every member's references are checked again against the configured
   budget, so raising `lists.subscribed_max_per_member` or

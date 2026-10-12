@@ -22,6 +22,10 @@ pub const UNMUTE_ACTOR: &str = "app.bsky.graph.unmuteActor";
 pub const MUTE_THREAD: &str = "app.bsky.graph.muteThread";
 pub const UNMUTE_THREAD: &str = "app.bsky.graph.unmuteThread";
 pub const GET_BLOCKS: &str = "app.bsky.graph.getBlocks";
+pub const MUTE_ACTOR_LIST: &str = "app.bsky.graph.muteActorList";
+pub const UNMUTE_ACTOR_LIST: &str = "app.bsky.graph.unmuteActorList";
+pub const GET_LIST_MUTES: &str = "app.bsky.graph.getListMutes";
+pub const GET_LIST_BLOCKS: &str = "app.bsky.graph.getListBlocks";
 
 const MEMBER: Access = Access::Member { ready: false, enroll: false };
 
@@ -116,6 +120,65 @@ pub async fn get_blocks(
     let req = prepare(&s, &headers, peer, GET_BLOCKS, access, false).await?;
     let p = Params::parse(q.as_deref());
     respond(&req.req, s.hydrator.get_blocks(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+}
+
+fn list_of(body: &[u8]) -> Result<String, XrpcError> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("list").and_then(Value::as_str).map(str::to_string))
+        .ok_or_else(|| XrpcError::invalid("Error: Input must have the property \"list\""))
+}
+
+/// `app.bsky.graph.muteActorList` (design-v3 §5.3): a member's private
+/// mute of a moderation list.
+pub async fn mute_actor_list(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, MUTE_ACTOR_LIST, MEMBER, true).await?;
+    respond(&req.req, s.hydrator.set_list_mute(&req.viewer, &req.req, &list_of(&body)?, true).await)
+}
+
+pub async fn unmute_actor_list(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, UNMUTE_ACTOR_LIST, MEMBER, true).await?;
+    respond(&req.req, s.hydrator.set_list_mute(&req.viewer, &req.req, &list_of(&body)?, false).await)
+}
+
+/// `app.bsky.graph.getListMutes`: the lists the viewer mutes.
+pub async fn get_list_mutes(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_LIST_MUTES, MEMBER, false).await?;
+    // The viewer's private mutes: Farsight is not asked about the lists'
+    // owners beside them (design-v3 §5.14.5, viewer-private mode).
+    if let Some(lookup) = backstop::farsight() {
+        lookup.set_cache_only();
+    }
+    let p = Params::parse(q.as_deref());
+    respond(&req.req, s.hydrator.get_list_mutes(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+}
+
+/// `app.bsky.graph.getListBlocks`: the lists a ready member blocks.
+pub async fn get_list_blocks(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let access = Access::Member { ready: true, enroll: false };
+    let req = prepare(&s, &headers, peer, GET_LIST_BLOCKS, access, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(&req.req, s.hydrator.get_list_blocks(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
 }
 
 pub async fn unmute_actor(

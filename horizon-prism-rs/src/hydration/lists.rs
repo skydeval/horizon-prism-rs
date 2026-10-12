@@ -67,7 +67,7 @@ pub(super) struct ListRow {
     pub(super) uri: String,
     cid: String,
     name: String,
-    purpose: String,
+    pub(super) purpose: String,
     description: Option<String>,
     description_facets: Option<Value>,
     avatar_cid: Option<String>,
@@ -103,7 +103,7 @@ impl ListRow {
 /// The viewer's own state on lists: its list mute, its `listblock` record,
 /// its reference-list opt-out. Empty for anyone but a ready member.
 #[derive(Debug, Default)]
-struct ListViewer {
+pub(super) struct ListViewer {
     known: bool,
     muted: HashSet<String>,
     blocked: HashMap<String, String>,
@@ -139,7 +139,7 @@ impl Hydrator {
             .await
     }
 
-    async fn list_viewer(&self, viewer: &Viewer, lists: &[String]) -> Result<ListViewer, sqlx::Error> {
+    pub(super) async fn list_viewer(&self, viewer: &Viewer, lists: &[String]) -> Result<ListViewer, sqlx::Error> {
         let Some(me) = viewer.state_did() else {
             return Ok(ListViewer::default());
         };
@@ -222,7 +222,7 @@ impl Hydrator {
     }
 
     /// A `listView`. `count` is the number of distinct subjects when known.
-    fn list_view(row: &ListRow, creators: &ProfileContext, count: Option<i64>, labels: &HashMap<String, Vec<Value>>, viewer: &ListViewer) -> Value {
+    pub(super) fn list_view(row: &ListRow, creators: &ProfileContext, count: Option<i64>, labels: &HashMap<String, Vec<Value>>, viewer: &ListViewer) -> Value {
         let creator = uri_author(&row.uri).unwrap_or_default();
         let mut v = json!({
             "uri": row.uri,

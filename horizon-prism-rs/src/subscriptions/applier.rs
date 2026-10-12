@@ -110,6 +110,12 @@ pub struct Applier {
     handed_over: Arc<Mutex<HashSet<String>>>,
 }
 
+impl std::fmt::Debug for Applier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Applier").finish_non_exhaustive()
+    }
+}
+
 impl Applier {
     #[must_use]
     pub fn new(pool: PgPool, scope: ScopeState, sync_min_interval_secs: u32) -> Self {

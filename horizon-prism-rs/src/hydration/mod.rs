@@ -23,6 +23,7 @@ pub mod identity;
 pub mod labelers;
 pub mod labels;
 pub mod lens;
+pub mod list_mutes;
 pub mod lists;
 pub mod normalize;
 pub mod notification_prefs;
@@ -54,6 +55,8 @@ use crate::config::{CountsConfig, CountsSource, ThreadConfig};
 use crate::db::locks::uri_author;
 use crate::farsight::Farsight;
 use crate::microcosm::ConstellationClient;
+use crate::subscriptions::applier::Applier;
+use crate::subscriptions::references::Budget;
 use crate::xrpc::pools::{Exhausted, Requester, SharedBucket};
 
 /// Placeholder handle for DIDs without a verified handle (ATProto convention).
@@ -168,6 +171,12 @@ pub struct HydrationConfig {
     pub op_thread_max_walk: u32,
     /// The block-list index, when `farsight.url` is set.
     pub farsight: Option<Farsight>,
+    /// A member's budget of list mutes (`lists.subscribed_max_per_member`,
+    /// `lists.max_owners_per_member`).
+    pub list_budget: Budget,
+    /// Told when a member mutes or unmutes a list, so the list phase
+    /// follows at once.
+    pub list_applier: Option<Applier>,
     /// The shared bucket for request-origin Constellation calls
     /// (`microcosm.constellation_rate_per_sec`); `None` leaves them unmetered.
     pub constellation_bucket: Option<SharedBucket>,
@@ -870,6 +879,8 @@ pub(crate) mod testing {
             thread_v2_max_parents: 80,
             op_thread_max_walk: 4,
             farsight: None,
+            list_budget: Budget { max_references: 2, max_owners: 5 },
+            list_applier: None,
             constellation_bucket: None,
         }
     }
