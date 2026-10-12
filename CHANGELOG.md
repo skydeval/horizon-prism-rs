@@ -12,6 +12,10 @@ commit.
 
 ### Added
 
+- **Item 13: `viewer.embeddingDisabled` (#675).** A ready member sees
+  `embeddingDisabled: true` on a post whose author turned quoting off (a
+  valid postgate with a `disableRule`, design-v3 §8.3). The author's own
+  view does not carry it.
 - **Item 13: threadgates in thread views (#675).** `getPostThread` and
   `getPostThreadV2` carry the root post's `threadgate` view, with the lists
   its rules name as `listViewBasic` (design-v3 §5.1, §8.3). A gate counts

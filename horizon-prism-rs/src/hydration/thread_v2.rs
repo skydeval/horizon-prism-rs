@@ -510,7 +510,30 @@ mod tests {
             did: Some(ME.into()),
             hydrate: true,
         };
+        // The author turned quoting off on `second`: every viewer but the
+        // author is told. A postgate under another record key is ignored.
+        for (rkey, target) in [("3kaaaaaaaaaa3", &second), ("elsewhere", &root)] {
+            sqlx::query(
+                "INSERT INTO postgates (uri, author_did, rkey, cid, rev, post_uri, embedding_rules, record, created_at) \
+                 VALUES ($1, $2, $3, 'bafypg', '3k', $4, '[{\"$type\": \"app.bsky.feed.postgate#disableRule\"}]', '{}', now())",
+            )
+            .bind(format!("at://{OP}/app.bsky.feed.postgate/{rkey}"))
+            .bind(OP)
+            .bind(rkey)
+            .bind(target)
+            .execute(p)
+            .await
+            .expect("postgate");
+        }
         let v = h.get_post_thread_v2(&me, &req, &second, &options).await.expect("db").expect("view");
+        assert_eq!(v.inner()["thread"][1]["value"]["post"]["viewer"]["embeddingDisabled"], true);
+        assert!(v.inner()["thread"][0]["value"]["post"]["viewer"].get("embeddingDisabled").is_none());
+        let author = Viewer {
+            did: Some(OP.into()),
+            hydrate: true,
+        };
+        let own = h.get_post_thread_v2(&author, &req, &second, &options).await.expect("db").expect("view");
+        assert!(own.inner()["thread"][1]["value"]["post"]["viewer"].get("embeddingDisabled").is_none());
         assert_eq!(v.inner()["thread"].as_array().map(Vec::len), Some(2));
         assert_eq!(v.inner()["hasOtherReplies"], true);
         let o = h.get_post_thread_other_v2(&me, &req, &second).await.expect("db").expect("view");

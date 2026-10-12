@@ -569,6 +569,21 @@ impl Hydrator {
         for (subject, repost) in reposts {
             out.entry(subject).or_insert_with(|| json!({}))["repost"] = json!(repost);
         }
+        // A post whose author turned quoting off (design-v3 §8.3): a valid
+        // postgate with a `disableRule`. Not for the author's own view.
+        let gated: Vec<String> = sqlx::query_scalar(
+            "SELECT post_uri FROM postgates WHERE post_uri = ANY($1) \
+               AND embedding_rules @> '[{\"$type\": \"app.bsky.feed.postgate#disableRule\"}]'::jsonb \
+               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
+        )
+        .bind(uris)
+        .fetch_all(self.pool())
+        .await?;
+        for uri in gated {
+            if uri_author(&uri) != Some(me) {
+                out.entry(uri).or_insert_with(|| json!({}))["embeddingDisabled"] = json!(true);
+            }
+        }
         // A post in a thread the viewer muted (design-v3 §5.3, §8.2).
         for uri in self.in_muted_threads(viewer, uris).await? {
             out.entry(uri).or_insert_with(|| json!({}))["threadMuted"] = json!(true);
