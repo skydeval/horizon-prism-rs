@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
+use super::copy::{Limits, METRIC_TOMBSTONES_EVICTED};
 use super::jobs;
 use crate::db::locks::lock_uris;
 
@@ -288,8 +289,8 @@ enum Act<'a> {
 /// # Errors
 ///
 /// [`Stopped`].
-pub async fn reconcile(pool: &PgPool, snap: &Snapshot, listing: &Listing, max_items: u32) -> Result<HashSet<String>, Stopped> {
-    let max_items = usize::try_from(max_items).unwrap_or(usize::MAX);
+pub async fn reconcile(pool: &PgPool, snap: &Snapshot, listing: &Listing, limits: Limits) -> Result<HashSet<String>, Stopped> {
+    let max_items = usize::try_from(limits.max_items).unwrap_or(usize::MAX);
     let in_snapshot: HashSet<&str> = snap.lists.iter().map(|l| l.uri.as_str()).collect();
     // Where each listed item is now, and each list's items by record key.
     let listed_under: HashMap<&str, &str> = listing.items.iter().map(|i| (i.uri.as_str(), i.list_uri.as_str())).collect();
@@ -350,6 +351,20 @@ pub async fn reconcile(pool: &PgPool, snap: &Snapshot, listing: &Listing, max_it
         if whole {
             served.insert(list.uri.clone());
         }
+    }
+    // The tombstones the batches wrote for moved-out items count against
+    // the owner's cap like any other: the oldest past it go.
+    let evicted = sqlx::query(
+        "DELETE FROM subscription_tombstones WHERE owner_did = $1 AND uri IN ( \
+           SELECT uri FROM subscription_tombstones WHERE owner_did = $1 ORDER BY deleted_at DESC, uri OFFSET $2)",
+    )
+    .bind(&snap.owner)
+    .bind(i64::from(limits.tombstones_max_per_owner))
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if evicted > 0 {
+        metrics::counter!(METRIC_TOMBSTONES_EVICTED).increment(evicted);
     }
     Ok(served)
 }
@@ -645,7 +660,7 @@ mod tests {
             .expect("job");
         let snap = snapshot(pool, OWNER, generation).await.expect("snapshot");
         let listed = write_purposes(pool, &snap, listing).await.expect("purposes");
-        let served = reconcile(pool, &snap, listing, max_items).await.expect("reconcile");
+        let served = reconcile(pool, &snap, listing, Limits { max_items, tombstones_max_per_owner: 10_000 }).await.expect("reconcile");
         if listing.items_complete && listing.lists.is_some() {
             complete(pool, &snap, listing, &served, &listed, max_items, 600).await.expect("complete");
         } else {
@@ -791,7 +806,7 @@ mod tests {
         sqlx::query("UPDATE list_references SET admitted_at = now() + interval '1 second' WHERE list_uri = $1").bind(&a).execute(p).await.expect("re-admitted");
         let again = listing("3kaaa7", &[(&a, Some(MODLIST)), (&b, Some(MODLIST))], vec![]);
         let listed = write_purposes(p, &snap, &again).await.expect("purposes");
-        let served = reconcile(p, &snap, &again, 10).await.expect("reconcile");
+        let served = reconcile(p, &snap, &again, Limits { max_items: 10, tombstones_max_per_owner: 10_000 }).await.expect("reconcile");
         complete(p, &snap, &again, &served, &listed, 10, 600).await.expect("complete");
         assert!(!reference(p, &a).await.0);
         let state: String = sqlx::query_scalar("SELECT state FROM backfill_jobs").fetch_one(p).await.expect("state");

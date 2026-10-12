@@ -237,6 +237,24 @@ impl ScopeState {
         Ok(())
     }
 
+    /// Read one tracked owner's tombstone count again, after a list sync
+    /// wrote or evicted tombstones of that owner.
+    ///
+    /// # Errors
+    ///
+    /// Any database error; the count is unchanged on error.
+    pub async fn reload_owner_tombstones(&self, pool: &PgPool, owner: &str) -> Result<(), sqlx::Error> {
+        let mut sets = self.write_guard().await;
+        let fresh: i64 = sqlx::query_scalar("SELECT count(*) FROM subscription_tombstones WHERE owner_did = $1")
+            .bind(owner)
+            .fetch_one(pool)
+            .await?;
+        if let Some(count) = sets.subscribed.owners.get_mut(owner) {
+            *count = u32::try_from(fresh).unwrap_or(u32::MAX);
+        }
+        Ok(())
+    }
+
     /// Replace every set with a fresh load (after a rebuild).
     ///
     /// # Errors

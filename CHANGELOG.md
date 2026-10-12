@@ -12,6 +12,11 @@ commit.
 
 ### Added
 
+- **Item 12: the tombstone cap covers a sync's own tombstones (#673).**
+  The tombstones a list sync writes for items moved out of a list now
+  count against `lists.subscription_tombstones_max_per_owner`: after a
+  run's writes the owner's oldest tombstones past the cap are removed,
+  and the in-memory count is read again.
 - **Item 12: `admin lists purge <did>` (#673).** Deletes an account's
   list mutes and the list records it authored (lists, list items, list
   blocks, opt-outs), and its references with them. A local cleanup, not

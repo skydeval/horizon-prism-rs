@@ -18,6 +18,7 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
 
+use super::copy::Limits;
 use super::fetch::{self, Bounds, CutReason, FetchError, OwnerRecords};
 use super::jobs::{self, Cut, RunEnd};
 use super::sync::{self, Stopped};
@@ -55,6 +56,8 @@ pub trait OwnerSource: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
     pub max_items: u32,
+    /// `lists.subscription_tombstones_max_per_owner`.
+    pub tombstones_max_per_owner: u32,
     pub min_interval_secs: u32,
     pub bounds: Bounds,
 }
@@ -206,7 +209,10 @@ async fn attempt(
     // 4. After the last request to the owner's server: the purposes, then
     // the items.
     let listed = sync::write_purposes(pool, &snap, &fetched.listing).await?;
-    let served = sync::reconcile(pool, &snap, &fetched.listing, settings.max_items).await?;
+    let limits = Limits { max_items: settings.max_items, tombstones_max_per_owner: settings.tombstones_max_per_owner };
+    let served = sync::reconcile(pool, &snap, &fetched.listing, limits).await?;
+    // The run may have written and evicted tombstones of this owner.
+    scope.reload_owner_tombstones(pool, owner).await?;
     match fetched.cut {
         None => {
             sync::complete(pool, &snap, &fetched.listing, &served, &listed, settings.max_items, pause).await?;
@@ -289,6 +295,7 @@ mod tests {
     fn settings(max_pages: u32) -> Settings {
         Settings {
             max_items: 100,
+            tombstones_max_per_owner: 10_000,
             min_interval_secs: 600,
             bounds: Bounds {
                 max_records: 1000,

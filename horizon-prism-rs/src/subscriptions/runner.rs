@@ -244,7 +244,7 @@ mod tests {
 
     fn list_sync(pool: &PgPool, scope: ScopeState, fast: u32) -> ListSync {
         let bounds = Bounds { max_records: 1000, max_pages: 10, probe_call: Duration::from_secs(5), min_records_per_call_sec: 1, max_call: Duration::from_secs(60), max_wall: Duration::from_secs(60) };
-        let settings = Settings { max_items: 100, min_interval_secs: 600, bounds };
+        let settings = Settings { max_items: 100, tombstones_max_per_owner: 10_000, min_interval_secs: 600, bounds };
         let lanes = Lanes { fast, slow: 1, stuck_secs: 5400, max_wall_secs: 3600 };
         ListSync::new(pool.clone(), scope, Arc::new(Tombstoned), Waiting::default(), settings, lanes)
     }

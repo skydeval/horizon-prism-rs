@@ -325,6 +325,7 @@ pub async fn run() -> Result<(), StartupError> {
         applier.waiting().clone(),
         subscriptions::run::Settings {
             max_items: lists.subscribed_max_items,
+            tombstones_max_per_owner: lists.subscription_tombstones_max_per_owner,
             min_interval_secs: lists.sync_min_interval_secs,
             bounds: Bounds {
                 max_records: lists.subscribed_max_owner_listitems,
