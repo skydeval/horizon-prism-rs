@@ -128,6 +128,7 @@ impl Consumer {
             advance_applied_rev: true,
             dead_letter_readiness: true,
             attempts: self.cfg.deterministic_attempts,
+            live: true,
         }
     }
 

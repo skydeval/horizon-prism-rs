@@ -94,6 +94,10 @@ pub struct ApplyOptions {
     pub dead_letter_readiness: bool,
     /// In-place attempts for a deterministic failure (`firehose.deterministic_attempts`).
     pub attempts: u32,
+    /// The commit comes from the firehose as it happens. Only such a write
+    /// generates `subscribed-post` notifications (design-v3 §5.6): backfill,
+    /// `requestRecord` and replay would announce history.
+    pub live: bool,
 }
 
 /// What happened to one op.
@@ -431,12 +435,27 @@ pub struct Writer {
     pool: PgPool,
     scope: ScopeState,
     private: Arc<dyn PrivateTier>,
+    /// `notifications.subscribed_post_max_age_secs`.
+    subscribed_post_max_age: chrono::Duration,
 }
 
 impl Writer {
     #[must_use]
     pub fn new(pool: PgPool, scope: ScopeState, private: Arc<dyn PrivateTier>) -> Self {
-        Self { pool, scope, private }
+        Self {
+            pool,
+            scope,
+            private,
+            subscribed_post_max_age: chrono::Duration::seconds(86_400),
+        }
+    }
+
+    /// How old a post may be and still be announced to its author's
+    /// subscribers (`notifications.subscribed_post_max_age_secs`).
+    #[must_use]
+    pub fn with_subscribed_post_max_age_secs(mut self, secs: u32) -> Self {
+        self.subscribed_post_max_age = chrono::Duration::seconds(i64::from(secs));
+        self
     }
 
     #[must_use]
@@ -530,12 +549,12 @@ impl Writer {
                     }
                     _ => {
                         let target = OpTarget::Upsert(u, &plans[i]);
-                        self.run_with_attempts(&mut tx, options.attempts, target, repo, rev, sets, &mut effects)
+                        self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
                             .await?
                     }
                 },
                 Prepared::Delete(d) => {
-                    self.run_with_attempts(&mut tx, options.attempts, OpTarget::Delete(d), repo, rev, sets, &mut effects)
+                    self.run_with_attempts(&mut tx, options, OpTarget::Delete(d), repo, rev, sets, &mut effects)
                         .await?
                 }
             };
@@ -635,7 +654,7 @@ impl Writer {
     async fn run_with_attempts(
         &self,
         tx: &mut PgConnection,
-        attempts: u32,
+        options: ApplyOptions,
         target: OpTarget<'_>,
         repo: &str,
         rev: &str,
@@ -643,10 +662,10 @@ impl Writer {
         effects: &mut MemoryEffects,
     ) -> Result<OpOutcome, Transient> {
         let mut last_error = String::new();
-        for _ in 0..attempts.max(1) {
+        for _ in 0..options.attempts.max(1) {
             let mut sp = tx.begin().await?;
             let result = match target {
-                OpTarget::Upsert(u, plan) => self.apply_upsert(&mut sp, u, plan, rev, sets).await,
+                OpTarget::Upsert(u, plan) => self.apply_upsert(&mut sp, u, plan, rev, sets, options.live).await,
                 OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets).await,
             };
             match result {
@@ -672,6 +691,7 @@ impl Writer {
         plan: &GrowthPlan,
         rev: &str,
         sets: &ScopeSets,
+        live: bool,
     ) -> Result<(OpOutcome, MemoryEffects), OpError> {
         let mut eff = MemoryEffects::default();
         let author = u.input.author.as_str();
@@ -735,6 +755,14 @@ impl Writer {
         }
         for n in notifications_for(author, &u.body, sets) {
             insert_notification(conn, &n, author, &u.uri, &u.cid).await?;
+        }
+        // After the reasons above, which take precedence (§8.6).
+        if live
+            && let Body::Post(p) = &u.body
+            && sets.in_scope(author)
+            && Utc::now().signed_duration_since(p.created_at) <= self.subscribed_post_max_age
+        {
+            insert_subscribed_post(conn, author, &u.uri, &u.cid, p.reply_parent.is_some(), p.created_at).await?;
         }
         eff.growth_added = growth::apply(conn, plan).await?;
         Ok((OpOutcome::Written, eff))
@@ -1112,6 +1140,52 @@ async fn insert_notification(
     Ok(())
 }
 
+/// `subscribed-post` notifications for a post by `author` just written from
+/// the firehose (design-v3 §5.6): one for each member subscribed to the
+/// author for this kind of post (`reply` or a top-level post), where
+/// - the subscription is older than the post;
+/// - the author has been backfilled once, so its declaration is stored if
+///   it has one;
+/// - the author's declaration still allows the subscriber (no record means
+///   followers; a subscriber it refuses is skipped and its row is kept);
+/// - no other notification for this record went to that member.
+async fn insert_subscribed_post(
+    conn: &mut PgConnection,
+    author: &str,
+    record_uri: &str,
+    record_cid: &str,
+    reply: bool,
+    created_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO notifications (recipient_did, author_did, reason, record_uri, record_cid) \
+         SELECT s.subscriber_did, $1, 'subscribed-post', $2, $3 \
+         FROM activity_subscriptions s \
+         CROSS JOIN (SELECT COALESCE((SELECT record->>'allowSubscriptions' FROM actor_self_records \
+                                      WHERE did = $1 AND collection = 'app.bsky.notification.declaration'), \
+                                     'followers') AS allow) d \
+         WHERE s.subject_did = $1 AND s.subscriber_did <> $1 \
+           AND CASE WHEN $4 THEN s.reply ELSE s.post END \
+           AND s.created_at < $5 \
+           AND EXISTS (SELECT 1 FROM members m WHERE m.did = s.subscriber_did) \
+           AND EXISTS (SELECT 1 FROM sync_state y WHERE y.did = $1 AND y.last_resync_at IS NOT NULL) \
+           AND d.allow IN ('followers', 'mutuals') \
+           AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = s.subscriber_did AND f.subject_did = $1) \
+           AND (d.allow <> 'mutuals' \
+                OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = s.subscriber_did)) \
+           AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.recipient_did = s.subscriber_did AND n.record_uri = $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(author)
+    .bind(record_uri)
+    .bind(record_cid)
+    .bind(reply)
+    .bind(created_at)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Clear one DID's readiness and enqueue `authz` (§6.11.2, §6.11.6).
 ///
 /// # Errors
@@ -1283,6 +1357,7 @@ mod tests {
             advance_applied_rev: true,
             dead_letter_readiness: true,
             attempts: 5,
+            live: true,
         };
 
         fn writer(pool: &PgPool, member: bool) -> Writer {
@@ -1315,6 +1390,84 @@ mod tests {
                 .fetch_optional(pool)
                 .await
                 .expect("query post")
+        }
+
+        /// B-43: `subscribed-post` comes only from a live write of a fresh
+        /// post, for a subscription the author's declaration allows.
+        #[tokio::test]
+        async fn a_subscribed_authors_post_notifies_its_subscribers() {
+            let Some(db) = fresh_db("writer_subscribed_post").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, false);
+            let exec = |sql: String| async move {
+                sqlx::query(&sql).execute(p).await.expect("setup");
+            };
+            exec(format!("INSERT INTO members (did, source, ready_at) VALUES ('{SUBJECT}', 'admin', now())")).await;
+            exec(format!("INSERT INTO sync_state (did, last_resync_at) VALUES ('{AUTHOR}', now())")).await;
+            exec(format!(
+                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
+                 ('at://{SUBJECT}/app.bsky.graph.follow/1', '{SUBJECT}', '{AUTHOR}', '3k', now())"
+            ))
+            .await;
+            exec(format!(
+                "INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply, created_at) VALUES \
+                 ('{SUBJECT}', '{AUTHOR}', true, false, now() - interval '1 hour')"
+            ))
+            .await;
+            let post = |rkey: &str, created: String, reply: bool| {
+                let mut record = json!({"text": rkey, "createdAt": created});
+                if reply {
+                    let parent = json!({"uri": format!("at://{AUTHOR}/app.bsky.feed.post/3kfirst"), "cid": "bafyfirst"});
+                    record["reply"] = json!({"root": parent, "parent": parent});
+                }
+                RawOp {
+                    action: Action::Create,
+                    collection: "app.bsky.feed.post".into(),
+                    rkey: rkey.into(),
+                    cid: Some(format!("bafy{rkey}")),
+                    record: Some(record),
+                }
+            };
+            let fresh = || Utc::now().to_rfc3339();
+            let notified = || async {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT record_uri FROM notifications WHERE recipient_did = $1 AND reason = 'subscribed-post' ORDER BY id",
+                )
+                .bind(SUBJECT)
+                .fetch_all(p)
+                .await
+                .expect("notifications")
+            };
+            let backfill = ApplyOptions { live: false, ..OPTIONS };
+
+            // Not from the firehose; a reply, which the subscription leaves
+            // out; a post older than the limit: nothing.
+            w.apply(AUTHOR, &rev(1), &[post("3kfirst", fresh(), false)], backfill).await.expect("apply");
+            w.apply(AUTHOR, &rev(2), &[post("3kreply", fresh(), true)], OPTIONS).await.expect("apply");
+            w.apply(AUTHOR, &rev(3), &[post("3kold", "2026-01-01T00:00:00Z".into(), false)], OPTIONS).await.expect("apply");
+            assert!(notified().await.is_empty());
+            // A fresh post from the firehose: one notification.
+            w.apply(AUTHOR, &rev(4), &[post("3kfresh", fresh(), false)], OPTIONS).await.expect("apply");
+            assert_eq!(notified().await, [format!("at://{AUTHOR}/app.bsky.feed.post/3kfresh")]);
+            // The author's declaration now refuses: skipped, the row kept.
+            exec(format!(
+                "INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) VALUES \
+                 ('at://{AUTHOR}/app.bsky.notification.declaration/self', '{AUTHOR}', 'app.bsky.notification.declaration', \
+                  'bafyd', '3k', '{{\"allowSubscriptions\": \"none\"}}')"
+            ))
+            .await;
+            w.apply(AUTHOR, &rev(5), &[post("3krefused", fresh(), false)], OPTIONS).await.expect("apply");
+            assert_eq!(notified().await.len(), 1);
+            let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM activity_subscriptions").fetch_one(p).await.expect("count");
+            assert_eq!(kept, 1);
+            // An author never backfilled announces nothing.
+            exec("DELETE FROM actor_self_records".into()).await;
+            exec("UPDATE sync_state SET last_resync_at = NULL".into()).await;
+            w.apply(AUTHOR, &rev(6), &[post("3kunsynced", fresh(), false)], OPTIONS).await.expect("apply");
+            assert_eq!(notified().await.len(), 1);
+            db.drop_db().await;
         }
 
         /// design-v3 §3.1, §3.2: the columns the v3 migrations added.

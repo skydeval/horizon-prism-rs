@@ -889,6 +889,7 @@ impl Backfill {
             advance_applied_rev: false,
             dead_letter_readiness: false,
             attempts: self.attempts,
+            live: false,
         }
     }
 

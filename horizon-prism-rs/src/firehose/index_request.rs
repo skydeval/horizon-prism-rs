@@ -88,6 +88,7 @@ pub async fn index_record(
         advance_applied_rev: false,
         dead_letter_readiness: false,
         attempts,
+        live: false,
     };
     let report = writer.apply(repo, &rev, &[op], options).await.map_err(|e| IndexError::Write(e.0))?;
     let status = match report.outcomes.first() {

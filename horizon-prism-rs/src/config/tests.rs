@@ -258,6 +258,9 @@ max_per_actor = 10000
 [activity_subscriptions]
 max_per_actor = 1000
 
+[notifications]
+subscribed_post_max_age_secs = 86400
+
 [starter_packs]
 counts_refresh_secs = 3600
 

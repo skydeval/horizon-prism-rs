@@ -151,7 +151,8 @@ pub async fn run() -> Result<(), StartupError> {
     .map_err(|e| StartupError::new(1, format!("loading scope state: {e}")))?;
     let policy: Arc<dyn PersistencePolicy> = Arc::new(scope.clone());
     let resolver = IdentityResolver::new(net.clone(), pool.clone(), IdentitySettings::from_app(&cfg), policy);
-    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private));
+    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private))
+        .with_subscribed_post_max_age_secs(cfg.file.notifications.subscribed_post_max_age_secs);
     let purger = Purger::new(pool.clone(), scope.clone(), Arc::clone(&private));
     let constellation = ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url);
 

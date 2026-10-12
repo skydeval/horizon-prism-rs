@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 14: `subscribed-post` notifications (#675).** When a post by an
+  in-scope, once-backfilled author arrives from the firehose, each member
+  subscribed to that author for that kind of post gets a `subscribed-post`
+  notification, unless another reason already notified them of it. Posts
+  older than `[notifications] subscribed_post_max_age_secs` (default one
+  day) or older than the subscription, and posts written by backfill or
+  `requestRecord`, announce nothing. The author's declaration is checked
+  again each time (design-v3 §5.6).
 - **Item 14: activity subscriptions (#675).**
   `app.bsky.notification.putActivitySubscription` and
   `listActivitySubscriptions`. Turning a subscription off always works.

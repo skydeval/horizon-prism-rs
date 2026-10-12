@@ -827,6 +827,23 @@ impl Default for ActivitySubscriptionsConfig {
     }
 }
 
+/// `[notifications]` (design-v3 §5.6).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotificationsConfig {
+    /// How old a post may be and still be announced to its author's
+    /// subscribers.
+    pub subscribed_post_max_age_secs: u32,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            subscribed_post_max_age_secs: 86_400,
+        }
+    }
+}
+
 /// `[farsight]`: the block and block-list index this AppView asks about
 /// inbound list blocks (design-v3 §5.14.4). With `url` unset, no call is
 /// ever made.
@@ -1101,6 +1118,7 @@ pub struct FileConfig {
     pub op_thread: OpThreadConfig,
     pub thread_mutes: ThreadMutesConfig,
     pub activity_subscriptions: ActivitySubscriptionsConfig,
+    pub notifications: NotificationsConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,
     pub known_likers: KnownLikersConfig,

@@ -284,6 +284,11 @@ max_per_actor = 10000
 [activity_subscriptions]
 max_per_actor = 1000
 
+# A post older than this (in seconds, by its own date) is not announced to
+# the people subscribed to its author. One day by default.
+[notifications]
+subscribed_post_max_age_secs = 86400
+
 # How often the "joined through this starter pack" numbers are recounted.
 [starter_packs]
 counts_refresh_secs = 3600
