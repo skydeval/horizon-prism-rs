@@ -743,6 +743,28 @@ impl PartialEq for Float {
 
 impl Eq for Float {}
 
+/// `[thread]`: bounds on one thread response (design-v3 §5.1).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThreadConfig {
+    /// Nodes in one response: anchor, parents and replies.
+    pub max_nodes: u32,
+    /// Replies Constellation is asked for per node.
+    pub constellation_replies_per_node: u32,
+    /// Posts fetched from Slingshot for one response.
+    pub max_remote_fetches: u32,
+}
+
+impl Default for ThreadConfig {
+    fn default() -> Self {
+        Self {
+            max_nodes: 200,
+            constellation_replies_per_node: 50,
+            max_remote_fetches: 100,
+        }
+    }
+}
+
 /// `[auth]`: limits on token verification done before the per-requester
 /// backstop (design-v3 §II-8.3).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -883,6 +905,7 @@ impl RateLimitsConfig {
 pub struct FileConfig {
     pub rate_limits: RateLimitsConfig,
     pub auth: AuthConfig,
+    pub thread: ThreadConfig,
     pub features: FeaturesConfig,
     pub honest_501: Honest501Config,
     pub services: BTreeMap<String, ServiceConfig>,

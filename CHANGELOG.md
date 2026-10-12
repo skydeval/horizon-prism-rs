@@ -82,6 +82,20 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 10: `getPostThread` shows replies and parents it does not store
+  (G-6, #670).** A node's replies are the union of the local rows and the
+  replies Constellation lists for it (up to
+  `thread.constellation_replies_per_node`, default 50). Replies and
+  parents not stored here are fetched from Slingshot through the read-time
+  cache, at most `thread.max_remote_fetches` (default 100) per request;
+  the node cap is `thread.max_nodes` (default 200). Before, only local
+  replies were shown and a parent by an out-of-scope author was a
+  not-found item.
+  - A listed reply that cannot be fetched, or whose record does not reply
+    to that node, is left out, not shown as not-found.
+  - A reply or parent by an in-scope author is never fetched: if it is not
+    stored, it is gone.
+  - A parent there was no budget to fetch ends the chain with no item.
 - **Item 10: `getQuotes` shows quoting posts it does not store (G-7,
   #670).** A quoting post Constellation lists and this AppView has not
   indexed is fetched from Slingshot through the read-time cache, at most

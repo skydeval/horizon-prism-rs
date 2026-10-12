@@ -246,6 +246,11 @@ verify_rate_per_sec = 500.0
 verify_burst = 1000
 member_verify_rate_per_sec = 200.0
 member_verify_burst = 400
+
+[thread]
+max_nodes = 200
+constellation_replies_per_node = 50
+max_remote_fetches = 100
 "#;
 
 #[test]

@@ -358,6 +358,7 @@ pub async fn run() -> Result<(), StartupError> {
         HydrationConfig {
             labeler_did: glue.service_key.did().to_string(),
             counts: cfg.file.counts.clone(),
+            thread: cfg.file.thread.clone(),
             constellation_bucket: Some(shares.bucket(
                 "constellation",
                 microcosm.constellation_rate_per_sec.0,

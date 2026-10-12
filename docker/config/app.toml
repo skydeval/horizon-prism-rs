@@ -254,6 +254,14 @@ global = { per_sec = 100.0, burst = 200 }
 service_proxy_member = { per_sec = 5.0, burst = 20 }
 service_proxy_ip = { per_sec = 10.0, burst = 20 }
 
+# Bounds on one thread view: posts shown in total, replies asked of
+# Constellation per post, and posts fetched from Slingshot because they are
+# not stored here.
+[thread]
+max_nodes = 200
+constellation_replies_per_node = 50
+max_remote_fetches = 100
+
 # Limits on checking sign-in tokens before a request is charged to anyone.
 # They stop forged or broken tokens from using up CPU or a member's limits.
 [auth]

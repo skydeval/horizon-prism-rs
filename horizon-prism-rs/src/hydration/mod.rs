@@ -37,7 +37,7 @@ pub use upstream::{NoUpstream, UpstreamSource};
 
 use crate::aggregations::ScopeState;
 use crate::aggregations::counts::{self, Counts, Freshness};
-use crate::config::{CountsConfig, CountsSource};
+use crate::config::{CountsConfig, CountsSource, ThreadConfig};
 use crate::db::locks::uri_author;
 use crate::microcosm::ConstellationClient;
 use crate::xrpc::pools::{Exhausted, Requester, SharedBucket};
@@ -116,6 +116,7 @@ pub struct HydrationConfig {
     /// `did:web:<host>`: the `src` of local labels (§7.8).
     pub labeler_did: String,
     pub counts: CountsConfig,
+    pub thread: ThreadConfig,
     /// The shared bucket for request-origin Constellation calls
     /// (`microcosm.constellation_rate_per_sec`); `None` leaves them unmetered.
     pub constellation_bucket: Option<SharedBucket>,
@@ -694,6 +695,7 @@ pub(crate) mod testing {
             HydrationConfig {
                 labeler_did: LABELER.into(),
                 counts: CountsConfig::default(),
+                thread: ThreadConfig::default(),
                 constellation_bucket: None,
             },
         )

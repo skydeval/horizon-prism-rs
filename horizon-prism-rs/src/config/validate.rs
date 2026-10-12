@@ -29,6 +29,9 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     crate::xrpc::rate_limit::problems(&cfg.rate_limits, &mut out);
     crate::xrpc::pools::problems(cfg, &mut out);
     crate::xrpc::backstop::problems(&cfg.auth, &mut out);
+    if cfg.thread.max_nodes == 0 {
+        out.push("thread.max_nodes must be at least 1".to_string());
+    }
     out
 }
 
