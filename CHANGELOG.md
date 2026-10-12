@@ -12,6 +12,12 @@ commit.
 
 ### Added
 
+- **Item 13: `!no-unauthenticated` in the newer thread view (#675).** A
+  signed-out viewer of `getPostThreadV2` is not shown posts by an account
+  whose profile carries the `!no-unauthenticated` label: the opened post
+  and the posts above it become `threadItemNoUnauthenticated` items, and
+  replies are left out. Only profiles stored here are read for the label
+  (design-v3 §5.1).
 - **Item 13: `followingRule` checks Constellation (#675).** For a thread
   whose author lets only accounts they follow reply, a follow that is not
   stored here is looked for among the viewer's followers on Constellation

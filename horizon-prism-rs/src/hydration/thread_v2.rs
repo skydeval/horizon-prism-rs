@@ -16,9 +16,11 @@
 //!   left out of both;
 //! - the contiguous thread by the root's author is marked (`opThread`).
 //!
-//! Not built yet: the `!no-unauthenticated` items.
+//! - a signed-out viewer is not shown posts whose author's profile carries
+//!   the `!no-unauthenticated` label: the anchor and parents become
+//!   `threadItemNoUnauthenticated`, and replies are left out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
@@ -33,6 +35,59 @@ pub const MAX_BRANCHING: u32 = 100;
 
 const POST_NODE: &str = "app.bsky.feed.defs#threadViewPost";
 const BLOCKED_NODE: &str = "app.bsky.feed.defs#blockedPost";
+/// A post kept from a signed-out viewer at its author's request: the node
+/// `withhold` leaves in the tree, with only `uri` and `parent`.
+const WITHHELD_NODE: &str = "withheld";
+/// The self-label by which an account asks not to be shown to signed-out
+/// viewers.
+const NO_UNAUTHENTICATED: &str = "!no-unauthenticated";
+
+/// Every post author in the tree: the anchor, its parents and its replies.
+fn authors(node: &Value, out: &mut Vec<String>) {
+    let who = author(node);
+    if !who.is_empty() && !out.iter().any(|d| d == who) {
+        out.push(who.to_string());
+    }
+    if let Some(parent) = node.get("parent") {
+        authors(parent, out);
+    }
+    for reply in node.get("replies").and_then(Value::as_array).into_iter().flatten() {
+        authors(reply, out);
+    }
+}
+
+/// Remove the posts of `withheld` authors: the anchor and each parent
+/// become a bare node (and the anchor loses its replies); a reply goes, with
+/// everything under it.
+fn withhold(node: &mut Value, withheld: &HashSet<String>) {
+    withhold_above(node, withheld);
+    if kind(node) == POST_NODE {
+        withhold_below(node, withheld);
+    }
+}
+
+fn withhold_above(node: &mut Value, withheld: &HashSet<String>) {
+    if let Some(parent) = node.get_mut("parent") {
+        withhold_above(parent, withheld);
+    }
+    if kind(node) == POST_NODE && withheld.contains(author(node)) {
+        let parent = node.get_mut("parent").map(Value::take);
+        let at = uri(node).to_string();
+        *node = json!({"$type": WITHHELD_NODE, "uri": at});
+        if let Some(parent) = parent {
+            node["parent"] = parent;
+        }
+    }
+}
+
+fn withhold_below(node: &mut Value, withheld: &HashSet<String>) {
+    if let Some(replies) = node.get_mut("replies").and_then(Value::as_array_mut) {
+        replies.retain(|r| !(kind(r) == POST_NODE && withheld.contains(author(r))));
+        for reply in replies {
+            withhold_below(reply, withheld);
+        }
+    }
+}
 
 /// Sibling order within a group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,10 +328,15 @@ pub fn flatten(thread: &Value, options: &Options, viewer: Option<&str>) -> (Vec<
             let value = match kind(node) {
                 POST_NODE => f.post_item(node, depth, topmost && is_reply(node), 0, false),
                 BLOCKED_NODE => item(uri(node), depth, json!({"$type": "app.bsky.unspecced.defs#threadItemBlocked", "author": node["author"]})),
+                WITHHELD_NODE => item(uri(node), depth, json!({"$type": "app.bsky.unspecced.defs#threadItemNoUnauthenticated"})),
                 _ => item(uri(node), depth, json!({"$type": "app.bsky.unspecced.defs#threadItemNotFound"})),
             };
             f.items.push(value);
         }
+    }
+    if kind(thread) == WITHHELD_NODE {
+        f.items.push(item(uri(thread), 0, json!({"$type": "app.bsky.unspecced.defs#threadItemNoUnauthenticated"})));
+        return (f.items, f.other);
     }
     let more_parents = is_reply(thread) && (!options.above || chain.is_empty());
     let more = f.more_replies(thread, 0);
@@ -291,7 +351,29 @@ impl Hydrator {
     /// threadgate hides kept and marked, and the gate's view. `None` for an
     /// anchor that misses (nonexistent, private-tier, hidden or collapsed).
     async fn v2_tree(&self, viewer: &Viewer, req: &Requester, anchor: &str, below: u32) -> Result<Option<Tree>, super::HydrationError> {
-        Ok(self.thread_tree(viewer, req, anchor, below, self.inner.cfg.thread_v2_max_parents, true).await?.ok())
+        let Ok((mut tree, gate)) = self.thread_tree(viewer, req, anchor, below, self.inner.cfg.thread_v2_max_parents, true).await? else {
+            return Ok(None);
+        };
+        // A signed-out viewer is not shown posts by accounts that ask for
+        // that with a label on their profile. Only profiles stored here are
+        // read: no fetch is made to find the label of any other author.
+        if viewer.did.is_none() {
+            let mut dids = Vec::new();
+            authors(&tree, &mut dids);
+            let withheld: HashSet<String> = sqlx::query_scalar(
+                "SELECT did FROM actors WHERE did = ANY($1) AND profile_record->'labels'->'values' @> $2",
+            )
+            .bind(&dids)
+            .bind(json!([{ "val": NO_UNAUTHENTICATED }]))
+            .fetch_all(self.pool())
+            .await?
+            .into_iter()
+            .collect();
+            if !withheld.is_empty() {
+                withhold(&mut tree, &withheld);
+            }
+        }
+        Ok(Some((tree, gate)))
     }
 
     /// `app.bsky.unspecced.getPostThreadV2`. The lexicon declares no errors:
@@ -471,6 +553,69 @@ mod tests {
         orphan["parent"] = json!({"$type": "app.bsky.feed.defs#notFoundPost", "uri": "gone", "notFound": true});
         let (items, _) = flatten(&orphan, &opts(6, 10, Sort::Oldest), None);
         assert_eq!(items[0], json!({"uri": "gone", "depth": -1, "value": {"$type": "app.bsky.unspecced.defs#threadItemNotFound"}}));
+    }
+
+    /// design-v3 §5.1: posts by an account whose profile carries
+    /// `!no-unauthenticated` are kept from a signed-out viewer only.
+    #[tokio::test]
+    async fn a_signed_out_viewer_is_not_shown_labelled_authors() {
+        let Some(db) = fresh_db("hydration_thread_v2_no_unauth").await else {
+            return;
+        };
+        let p = &db.pool;
+        for (d, h) in [(OP, "op.test"), (BOB, "bob.test"), (ME, "me.test")] {
+            actor(p, d, h, h).await;
+        }
+        let root = post(p, OP, "3kaaaaaaaaaa2", "root", None, None).await;
+        let second = post(p, OP, "3kaaaaaaaaaa3", "second", Some(&root), Some(&root)).await;
+        let reply = post(p, BOB, "3kaaaaaaaaaa4", "reply", Some(&second), Some(&root)).await;
+        post(p, ME, "3kaaaaaaaaaa5", "under the reply", Some(&reply), Some(&root)).await;
+        let mut sets = ScopeSets::default();
+        for d in [OP, BOB, ME] {
+            sets.scope.insert(d.into());
+        }
+        let h = hydrator(p, sets);
+        let (anon, req) = (Viewer::anonymous(), Requester::test());
+        let options = opts(DEFAULT_BELOW, DEFAULT_BRANCHING, Sort::Oldest);
+        let label = |did: &'static str, on: bool| async move {
+            let labels = if on { r#"{"labels": {"$type": "com.atproto.label.defs#selfLabels", "values": [{"val": "!no-unauthenticated"}]}}"# } else { "{}" };
+            exec(p, &format!("UPDATE actors SET profile_record = '{labels}' WHERE did = '{did}'")).await;
+        };
+        const WITHHELD: &str = "app.bsky.unspecced.defs#threadItemNoUnauthenticated";
+        const POST: &str = "app.bsky.unspecced.defs#threadItemPost";
+        let types = |v: &Value| -> Vec<(String, String)> {
+            v["thread"]
+                .as_array()
+                .expect("thread")
+                .iter()
+                .map(|i| (i["uri"].as_str().expect("uri").to_string(), i["value"]["$type"].as_str().expect("type").to_string()))
+                .collect()
+        };
+        let of = |list: &[(&String, &str)]| -> Vec<(String, String)> { list.iter().map(|(u, t)| ((*u).clone(), (*t).to_string())).collect() };
+
+        // A labelled reply author: the reply and what is under it are gone.
+        label(BOB, true).await;
+        let v = h.get_post_thread_v2(&anon, &req, &second, &options).await.expect("db").expect("view");
+        assert_eq!(types(v.inner()), of(&[(&root, POST), (&second, POST)]));
+        // A signed-in viewer is shown everything.
+        let me = Viewer {
+            did: Some(ME.into()),
+            hydrate: true,
+        };
+        let v = h.get_post_thread_v2(&me, &req, &second, &options).await.expect("db").expect("view");
+        assert_eq!(v.inner()["thread"].as_array().map(Vec::len), Some(4));
+        // A labelled anchor: its parents, the anchor as an item, no replies.
+        let v = h.get_post_thread_v2(&anon, &req, &reply, &options).await.expect("db").expect("view");
+        assert_eq!(types(v.inner()), of(&[(&root, POST), (&second, POST), (&reply, WITHHELD)]));
+        assert!(v.inner()["thread"][2]["value"].get("post").is_none());
+        let o = h.get_post_thread_other_v2(&anon, &req, &reply).await.expect("db").expect("view");
+        assert_eq!(o.inner()["thread"], json!([]));
+        // Labelled parents are items; the anchor is shown.
+        label(BOB, false).await;
+        label(OP, true).await;
+        let v = h.get_post_thread_v2(&anon, &req, &reply, &options).await.expect("db").expect("view");
+        assert_eq!(types(v.inner())[..3], of(&[(&root, WITHHELD), (&second, WITHHELD), (&reply, POST)]));
+        db.drop_db().await;
     }
 
     /// B-41: the endpoints over stored rows.
