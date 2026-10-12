@@ -150,6 +150,8 @@ pub const SERVED: &[Served] = &[
     served("app.bsky.actor.searchActors", Family::Search, true),
     served("app.bsky.feed.getPosts", Family::Read, true),
     served("app.bsky.feed.getPostThread", Family::Read, true),
+    served("app.bsky.unspecced.getPostThreadV2", Family::Read, true),
+    served("app.bsky.unspecced.getPostThreadOtherV2", Family::Read, true),
     served("app.bsky.feed.getAuthorFeed", Family::Read, true),
     served("app.bsky.feed.getLikes", Family::Read, true),
     served("app.bsky.feed.getRepostedBy", Family::Read, true),

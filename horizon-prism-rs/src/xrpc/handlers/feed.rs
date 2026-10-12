@@ -56,6 +56,49 @@ pub async fn get_post_thread(
     respond(&req.req, s.hydrator.get_post_thread(&req.viewer, &req.req, p.required("uri")?, depth, parent_height).await)
 }
 
+pub const GET_POST_THREAD_V2: &str = "app.bsky.unspecced.getPostThreadV2";
+pub const GET_POST_THREAD_OTHER_V2: &str = "app.bsky.unspecced.getPostThreadOtherV2";
+
+/// A bounded integer parameter: its default when absent, `400` outside the
+/// lexicon's range.
+fn bounded(p: &Params, key: &str, default: u32, max: u32) -> Result<u32, XrpcError> {
+    match p.u32(key)? {
+        None => Ok(default),
+        Some(v) if v <= max => Ok(v),
+        Some(_) => Err(XrpcError::invalid(format!("Error: {key} can not be greater than {max}"))),
+    }
+}
+
+pub async fn get_post_thread_v2(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    use crate::hydration::thread_v2::{DEFAULT_BELOW, DEFAULT_BRANCHING, MAX_BELOW, MAX_BRANCHING, Options, Sort};
+
+    let req = prepare(&s, &headers, peer, GET_POST_THREAD_V2, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    let options = Options {
+        above: p.one("above") != Some("false"),
+        below: bounded(&p, "below", DEFAULT_BELOW, MAX_BELOW)?,
+        branching: bounded(&p, "branchingFactor", DEFAULT_BRANCHING, MAX_BRANCHING)?,
+        sort: Sort::parse(p.one("sort")),
+    };
+    respond(&req.req, s.hydrator.get_post_thread_v2(&req.viewer, &req.req, p.required("anchor")?, &options).await)
+}
+
+pub async fn get_post_thread_other_v2(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_POST_THREAD_OTHER_V2, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(&req.req, s.hydrator.get_post_thread_other_v2(&req.viewer, &req.req, p.required("anchor")?).await)
+}
+
 pub async fn get_author_feed(
     State(s): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

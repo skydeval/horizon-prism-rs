@@ -12,6 +12,22 @@ commit.
 
 ### Added
 
+- **Item 13: `getPostThreadV2` and `getPostThreadOtherV2` (#675).** The
+  flat thread view (design-v3 §5.1), built from the same tree
+  `getPostThread` assembles, so the endpoints agree on what a thread holds.
+  Parents are at negative depths, the anchor at 0, replies below. Siblings
+  come in this order: the root's author, the viewer, accounts the viewer
+  follows, everyone else; each group by `sort` (`oldest`, `newest`, or
+  `top` by like count). Every direct reply of the anchor is returned, and
+  at most `branchingFactor` replies of each deeper post, to `below` levels;
+  `moreReplies` counts what was known and not returned. A direct reply by
+  an account the viewer fully mutes moves to `getPostThreadOtherV2` with
+  `mutedByViewer`; a muted reply deeper down is left out of both. The
+  contiguous thread by the root's author carries `opThread`,
+  `opThreadPostIndex` and `opThreadPostCount`. A missing, private-tier or
+  hidden anchor is one `threadItemNotFound` item, and a blocked anchor one
+  `threadItemBlocked`. Not built yet: the threadgate view and replies
+  hidden by it, and the `!no-unauthenticated` items.
 - **Item 12: `admin farsight status` and `admin farsight prime` (#673).**
   `status` prints Farsight's own report in brief, with whether this
   AppView's read breaker is open and how many answers it has cached.

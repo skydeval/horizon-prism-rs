@@ -208,6 +208,8 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(actor::SEARCH_ACTORS), get(actor::search_actors))
         .route(&xrpc(feed::GET_POSTS), get(feed::get_posts))
         .route(&xrpc(feed::GET_POST_THREAD), get(feed::get_post_thread))
+        .route(&xrpc(feed::GET_POST_THREAD_V2), get(feed::get_post_thread_v2))
+        .route(&xrpc(feed::GET_POST_THREAD_OTHER_V2), get(feed::get_post_thread_other_v2))
         .route(&xrpc(feed::GET_AUTHOR_FEED), get(feed::get_author_feed))
         .route(&xrpc(feed::GET_LIKES), get(feed::get_likes))
         .route(&xrpc(feed::GET_REPOSTED_BY), get(feed::get_reposted_by))

@@ -23,6 +23,7 @@ pub mod notifications;
 pub mod relationships;
 pub mod starter_packs;
 pub mod thread;
+pub mod thread_v2;
 pub mod upstream;
 
 use std::collections::{HashMap, HashSet};
