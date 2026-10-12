@@ -2,15 +2,21 @@
 //! locked decision 35). Each built-in service (contact, age assurance, push)
 //! and each operator-defined one is `disabled`, `proxy` or `serve`.
 //!
-//! This build implements `disabled` only: the compiled service table, the
-//! whole of §6.7.2.3's validation, and the disjointness check. `proxy` and
-//! `serve` are rejected at startup (rules 2, 2a and 9) until the proxy
-//! handler lands (§II-15 item 11a).
+//! This module holds the compiled service table, the whole of §6.7.2.3's
+//! validation, and the disjointness check. [`proxy`] is the `proxy` state's
+//! handler. `serve` is rejected at startup (rule 2), and so is `proxy` for
+//! push (rule 2a).
+
+#[cfg(test)]
+mod e2e;
+pub mod proxy;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
-use crate::config::{FeaturesConfig, FileConfig, ServiceConfig, ServiceState};
+use crate::config::{FeaturesConfig, FileConfig, RateClassConfig, ServiceConfig, ServiceState};
 use crate::honest_501::{self, Owner, Verb};
+use crate::xrpc::rate_limit::class_problem;
 
 /// A built-in service: its NSIDs, verbs and messages are compiled into
 /// `honest_501::DEFERRALS`.
@@ -46,8 +52,6 @@ pub const BUILTIN: &[Builtin] = &[
 /// (§6.6, R3-84). Both are empty in v0.1.
 pub const IMPLEMENTED_SERVICES: &[&str] = &[];
 pub const IMPLEMENTED_FEATURES: &[&str] = &[];
-/// Rule 9: whether this build has the proxy handler. Item 11a turns it on.
-pub const PROXY_BUILT: bool = false;
 /// `aud_fragments` default for a custom service (§6.7.2.4).
 pub const CUSTOM_FRAGMENT: &str = "bsky_appview";
 /// A custom service may not claim an NSID in these namespaces (§6.7.2.4).
@@ -115,6 +119,45 @@ pub fn table(cfg: &FileConfig) -> Vec<Service> {
     out
 }
 
+/// The settings of one service in `proxy` state, with §6.7.2.1's defaults
+/// filled in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProxySettings {
+    pub proxy_url: String,
+    /// The `aud` fragments its routes accept beside a bare `aud` (§6.7.5.4).
+    pub aud_fragments: Vec<String>,
+    pub timeout: Duration,
+    pub body_read_timeout: Duration,
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub max_in_flight: usize,
+    pub rate_per_sec: f64,
+    pub burst: u32,
+    pub allow_private_network: bool,
+}
+
+impl ProxySettings {
+    /// The settings of service `name`. Call it on a validated block in
+    /// `proxy` state; `None` when the block has no `proxy_url`.
+    #[must_use]
+    pub fn of(name: &str, s: &ServiceConfig) -> Option<Self> {
+        let canonical = builtin(name).map_or(CUSTOM_FRAGMENT, |b| b.canonical_fragment);
+        let bytes = |v: Option<u64>, default: usize| v.and_then(|v| usize::try_from(v).ok()).unwrap_or(default);
+        Some(Self {
+            proxy_url: s.proxy_url.clone()?,
+            aud_fragments: s.aud_fragments.clone().unwrap_or_else(|| vec![canonical.to_string()]),
+            timeout: Duration::from_millis(s.timeout_ms.unwrap_or(10_000)),
+            body_read_timeout: Duration::from_millis(s.body_read_timeout_ms.unwrap_or(10_000)),
+            max_request_bytes: bytes(s.max_request_bytes, 1024 * 1024),
+            max_response_bytes: bytes(s.max_response_bytes, 4 * 1024 * 1024),
+            max_in_flight: bytes(s.max_in_flight, 64),
+            rate_per_sec: f64::from(s.rate_per_sec.unwrap_or(20)),
+            burst: s.burst.unwrap_or(40),
+            allow_private_network: s.allow_private_network == Some(true),
+        })
+    }
+}
+
 /// Every problem in `[features]`, `[honest_501]` and `[services.*]`
 /// (§6.6, §6.7.2.3, §6.7.2.4). `public_hostname` is `APP_PUBLIC_HOSTNAME`.
 pub fn problems(cfg: &FileConfig, public_hostname: &str, out: &mut Vec<String>) {
@@ -159,7 +202,7 @@ fn features(f: &FeaturesConfig, out: &mut Vec<String>) {
     }
 }
 
-/// Rules 2, 2a and 9, and the custom-service state rule.
+/// Rules 2 and 2a, and the custom-service state rule.
 fn state(name: &str, s: &ServiceConfig, known: Option<&Builtin>, out: &mut Vec<String>) {
     match s.state {
         ServiceState::Disabled => {}
@@ -175,8 +218,6 @@ fn state(name: &str, s: &ServiceConfig, known: Option<&Builtin>, out: &mut Vec<S
                 out.push(format!(
                     "services.{name}.state = \"proxy\": {name} cannot be proxied in this version (deferral D-2)"
                 ));
-            } else if !PROXY_BUILT {
-                out.push(format!("services.{name}.state = \"proxy\": this build does not support proxying yet"));
             }
         }
     }
@@ -241,6 +282,14 @@ fn proxy_keys(name: &str, s: &ServiceConfig, public_hostname: &str, out: &mut Ve
         if value == Some(0) {
             out.push(format!("services.{name}.{key} must be greater than 0"));
         }
+    }
+    // §10's rules for a rate, on the bucket as it will be built.
+    let (rate, burst) = (s.rate_per_sec.unwrap_or(20), s.burst.unwrap_or(40));
+    if rate > 0
+        && burst > 0
+        && let Some(p) = class_problem(RateClassConfig::new(f64::from(rate), burst))
+    {
+        out.push(format!("services.{name}.rate_per_sec: {p}"));
     }
 }
 
@@ -344,19 +393,18 @@ mod tests {
     }
 
     #[test]
-    fn serve_and_proxy_are_rejected_in_this_build() {
+    fn serve_is_rejected_and_proxy_only_for_push() {
         one("[services.contact]\nstate = \"serve\"\n", "does not implement");
         one("[services.push]\nstate = \"serve\"\n", "does not implement");
-        // Rule 2a: push names D-2. Rule 9: the others are not built yet.
+        // Rule 2a: push names D-2. The others can be proxied.
         one("[services.push]\nstate = \"proxy\"\nproxy_url = \"https://p.example\"\n", "D-2");
-        one(
+        for ok in [
             "[services.contact]\nstate = \"proxy\"\nproxy_url = \"https://c.example\"\n",
-            "does not support proxying yet",
-        );
-        one(
+            "[services.age_assurance]\nstate = \"proxy\"\nproxy_url = \"http://age:8080\"\nallow_private_network = true\n",
             "[services.eu]\nstate = \"proxy\"\nproxy_url = \"https://e.example\"\nmethods = { \"eu.example.a.b\" = \"GET\" }\n",
-            "does not support proxying yet",
-        );
+        ] {
+            assert_eq!(check(ok), Vec::<String>::new(), "{ok}");
+        }
         one(
             "[services.eu]\nstate = \"serve\"\nmethods = { \"eu.example.a.b\" = \"GET\" }\n",
             "can only be disabled or proxied",
@@ -398,7 +446,30 @@ mod tests {
         one(&format!("{base}rate_per_sec = 0\n"), "rate_per_sec must be greater than 0");
         one(&format!("{base}aud_fragments = [\"#bsky_appview\"]\n"), "not a DID URL fragment");
         one(&format!("{base}aud_fragments = [\"\"]\n"), "not a DID URL fragment");
+        one(&format!("{base}rate_per_sec = 2000000\n"), "services.contact.rate_per_sec: per_sec");
         assert!(fragment_ok("bsky_appview") && fragment_ok("x_test"));
+    }
+
+    #[test]
+    fn proxy_settings_fill_the_defaults() {
+        let cfg = FileConfig::parse(concat!(
+            "[services.contact]\nstate = \"proxy\"\nproxy_url = \"https://c.example\"\n",
+            "[services.eu]\nstate = \"proxy\"\nproxy_url = \"http://eu:8080\"\nallow_private_network = true\n",
+            "aud_fragments = [\"eu_notices\", \"bsky_appview\"]\ntimeout_ms = 500\nmax_in_flight = 2\nrate_per_sec = 3\nburst = 4\n",
+            "methods = { \"eu.example.a.b\" = \"GET\" }\n",
+        ))
+        .expect("parse");
+        let contact = ProxySettings::of("contact", &cfg.services["contact"]).expect("settings");
+        assert_eq!(contact.aud_fragments, ["bsky_appview"]);
+        assert_eq!((contact.timeout, contact.body_read_timeout), (Duration::from_secs(10), Duration::from_secs(10)));
+        assert_eq!((contact.max_request_bytes, contact.max_response_bytes), (1 << 20, 4 << 20));
+        assert_eq!((contact.max_in_flight, contact.rate_per_sec, contact.burst), (64, 20.0, 40));
+        assert!(!contact.allow_private_network);
+        let eu = ProxySettings::of("eu", &cfg.services["eu"]).expect("settings");
+        assert_eq!(eu.aud_fragments, ["eu_notices", "bsky_appview"]);
+        assert_eq!((eu.timeout, eu.max_in_flight, eu.rate_per_sec, eu.burst), (Duration::from_millis(500), 2, 3.0, 4));
+        assert!(eu.allow_private_network);
+        assert!(ProxySettings::of("push", &ServiceConfig::default()).is_none());
     }
 
     #[test]

@@ -302,10 +302,27 @@ member_verify_burst = 400
 # [rate_limits.endpoint_class]
 # "app.bsky.feed.getTimeline" = "search"
 
-# Deferred external services. Each is "disabled" (the default), "proxy" or
-# "serve". This version accepts only "disabled": the endpoints answer 501.
+# Deferred external services. Each is "disabled" (the default: its endpoints
+# answer 501) or "proxy" (they are forwarded to proxy_url). "serve" is
+# reserved and refused in this version, and push accepts only "disabled".
 # Built-in blocks: [services.contact], [services.age_assurance],
 # [services.push]. They never need to appear in this file.
+# See "Forwarding a service to another server" in the README.
+#
+# The keys below proxy_url are accepted only with state = "proxy"; the
+# values shown are the defaults.
+# [services.contact]
+# state = "proxy"
+# proxy_url = "https://contact.example.net"
+# aud_fragments = ["bsky_appview"]   # token audiences accepted beside a bare one
+# timeout_ms = 10000                 # the call to the target
+# body_read_timeout_ms = 10000       # reading the caller's request body
+# max_request_bytes = 1048576
+# max_response_bytes = 4194304
+# max_in_flight = 64                 # calls in progress; over it, 503
+# rate_per_sec = 20                  # all callers together, to this target
+# burst = 40
+# allow_private_network = false      # true: http and private addresses
 #
 # A custom service declares its own NSIDs and verbs. While disabled it
 # registers nothing. NSIDs in com.atproto.*, app.bsky.*, chat.bsky.*,

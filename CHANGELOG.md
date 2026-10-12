@@ -12,6 +12,53 @@ commit.
 
 ### Added
 
+- **Item 11a: deferred services can be forwarded (#672).**
+  `[services.<name>] state = "proxy"` is now accepted for `contact`,
+  `age_assurance` and operator-defined services (design-v3 §6.7); before,
+  it stopped startup. Push still accepts only `disabled`, and `serve` is
+  still refused. A request to a forwarded NSID goes to
+  `<proxy_url>/xrpc/<nsid>` with its query and body unchanged, and the
+  target's status and JSON body come back unchanged.
+  - **Tokens.** A request with an `Authorization` header is verified here
+    first, with `lxm` equal to the called method and an `aud` fragment that
+    is absent or in the service's `aud_fragments` (default `bsky_appview`).
+    The header is then forwarded unchanged. One that fails is answered `401
+    InvalidToken` here and is never forwarded. A caller the backstop already
+    verified is not verified twice, but still meets the service's fragment
+    list.
+  - **Headers.** Only `Authorization`, `Content-Type` and `Content-Encoding`
+    (POST), `Accept-Language` and `atproto-accept-labelers` are sent, with
+    this AppView's `User-Agent`. Cookies, `atproto-proxy`, `X-Forwarded-For`
+    and every other header are dropped, so the target never sees the
+    caller's address. Of the target's headers only `Content-Type`,
+    `Content-Encoding`, `Content-Language` and `atproto-content-labelers`
+    are relayed, and `X-Content-Type-Options: nosniff` is added.
+  - **Limits.** `service_proxy_member` (5/s, burst 20) and
+    `service_proxy_ip` (10/s, burst 20) have one bucket per service and per
+    key, the key being the one the backstop selected. Each service has a
+    request bucket (`rate_per_sec` 20, `burst` 40) with the member and
+    non-member pools and per-requester shares of §II-8.3
+    (`target_kind="service"`), and `max_in_flight` (64) calls in progress.
+    Over a bucket: `429` with `ratelimit-reset`. Over `max_in_flight`: `503
+    NotEnoughResources`, not queued. A POST body is read in full first,
+    within `max_request_bytes` (`413 PayloadTooLarge`) and
+    `body_read_timeout_ms` (`400 InvalidRequest`), so a slow sender holds
+    nothing of the service's.
+  - **Answers.** JSON within `max_response_bytes`, or an empty body, is
+    relayed with the target's status. A redirect, another content type or a
+    larger body is `502 UpstreamFailure`; no answer within `timeout_ms` is
+    `504 UpstreamTimeout`. These messages never name the target.
+  - **Transport.** Each service has its own client: no redirects, the
+    system resolver, `https` to public addresses only.
+    `allow_private_network = true` permits `http` and loopback, RFC 1918,
+    CGNAT and unique-local addresses for that service's host. Over `http`
+    every resolved address must be private. Link-local addresses stay
+    blocked.
+  - `app.bsky.contact.sendNotification` keeps its 501 in every state.
+  - Metrics: `service_proxy_requests_total{service, nsid, outcome}`,
+    `service_proxy_duration_seconds{service}`, `service_state{service,
+    state}`. Operator notes are in `docker/README.md`, "Forwarding a service
+    to another server".
 - **Item 10: rate limits are config (#669).** Every limit is
   `[rate_limits.<class>]` with `per_sec` (a decimal) and `burst`, with the
   former constants as defaults (design-v3 §10). Startup refuses a `per_sec`

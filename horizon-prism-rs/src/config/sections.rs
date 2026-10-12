@@ -883,8 +883,8 @@ pub struct RateLimitsConfig {
     pub index_request: RateClassConfig,
     pub resolve: RateClassConfig,
     pub global: RateClassConfig,
-    /// The two members of the `service_proxy` family (§6.7.6.2). Read once
-    /// the proxy handler is built.
+    /// The two members of the `service_proxy` family (§6.7.6.2), each with
+    /// one bucket per proxied service and key.
     pub service_proxy_member: RateClassConfig,
     pub service_proxy_ip: RateClassConfig,
     /// NSID to family name: moves one served endpoint to another family.

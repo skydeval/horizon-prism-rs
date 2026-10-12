@@ -283,8 +283,7 @@ mod tests {
     fn every_route_is_registered_by_default_and_a_pin_holds() {
         let cfg = FileConfig::default();
         assert!(DEFERRALS.iter().all(|d| registered(d, &cfg)));
-        // Were proxying built, a proxied contact service would keep only its
-        // pinned 501 route.
+        // A proxied contact service keeps only its pinned 501 route.
         let cfg = FileConfig::parse("[services.contact]\nstate = \"proxy\"\nproxy_url = \"https://c.example\"\n").expect("parse");
         let kept: Vec<&str> = DEFERRALS
             .iter()

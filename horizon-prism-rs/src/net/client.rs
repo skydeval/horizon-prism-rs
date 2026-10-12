@@ -10,6 +10,10 @@
 //! - bodies are read up to a per-call cap;
 //! - no inbound header is ever forwarded. Callers pass only the headers they
 //!   own (the service-JWT `Authorization` in `appview_clients`).
+//!
+//! The one exception to the last rule is not this client: a proxied
+//! `[services.*]` call goes through [`super::service_proxy`], which forwards
+//! an allowlist of the request's headers (design-v3 §6.7.5.6).
 
 use std::sync::Arc;
 use std::time::Duration;

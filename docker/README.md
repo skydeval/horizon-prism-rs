@@ -260,6 +260,41 @@ If any appear, run `admin resync --private-and-members` to re-sync now rather th
 - **Disk:** the app warns at 80% and 95% of `storage.budget_bytes` in `config/app.toml`, which defaults to 200 GiB.
 - **Load on the community PDS:** the app checks each member's and private owner's repo head in the background, and on some private reads. Per PDS host it sends at most about 25 head checks/s, 20 read-time checks/s and 5 backfill requests/s (`[sync]` and `[backfill]` in `config/app.toml`). At the 25/s cap, about 1100 tracked accounts per host can be kept fresh. Lower `community.max_members` if your PDS should see less.
 
+## Forwarding a service to another server
+
+Contact matching, age assurance and push registration are not built into this AppView. By default their endpoints answer `501`. You can forward contact, age assurance, or endpoints of your own, to a server you run or have an agreement with. Push cannot be forwarded in this version.
+
+```toml
+[services.contact]
+state = "proxy"
+proxy_url = "https://contact.example.net"
+
+# Endpoints of your own: name each one and its verb.
+[services.eu_region_notices]
+state = "proxy"
+proxy_url = "http://notices:8080"
+allow_private_network = true
+methods = { "eu.example.region.getNotices" = "GET" }
+```
+
+`config/app.toml` lists the other keys (timeouts, size caps, rate) with their defaults. Restart `app` after a change.
+
+**What the target receives.** The request's query and body, unchanged, at `<proxy_url>/xrpc/<method>`. If the caller sent a token, the app checks it first and forwards it unchanged. A token that fails the check is answered with `401` here and is not forwarded. The target does not receive cookies, the caller's IP address or any other header, apart from `Content-Type`, `Content-Encoding`, `Accept-Language` and `atproto-accept-labelers`.
+
+**What the target must do.**
+
+- Accept service tokens whose audience (`aud`) is this AppView's DID, `did:web:<APP_PUBLIC_HOSTNAME>`, with no fragment or with `#bsky_appview`. A caller's PDS signs tokens for this AppView, not for your target. Bluesky's own servers refuse such tokens, so pointing `proxy_url` at Bluesky does not work for signed-in calls.
+- Check the token itself: the issuer, the signature, the expiry and the method name (`lxm`).
+- Answer at `/xrpc/<method>` with JSON, or with an empty body. Any other content type, a redirect or an answer over `max_response_bytes` reaches the caller as `502`.
+
+**Private networks.** `proxy_url` must be `https` and resolve to a public address. `allow_private_network = true` lifts both rules for that one service, so a sidecar on the compose network can be reached as `http://<service name>:<port>`. Over `http`, every address the name resolves to must be private, or the call fails: a token never crosses a public network unencrypted.
+
+**Trust.** The target sees your members' tokens for the forwarded methods, and their contact or age-assurance data. Each token is good only for the one method it was made for and expires within minutes, but until then the target can replay it to this AppView and use up that member's rate limit. Forward only to a server you trust with that.
+
+**Limits.** Each forwarded service has its own caller limits (`[rate_limits.service_proxy_member]`, `[rate_limits.service_proxy_ip]`), a cap on what the target receives from this AppView in total (`rate_per_sec`, `burst`) and a cap on calls in progress (`max_in_flight`). Over a limit the caller gets `429`, or `503` when `max_in_flight` is reached. `service_proxy_requests_total{service, nsid, outcome}` counts every call by how it ended, and `service_proxy_duration_seconds{service}` times the target.
+
+`app.bsky.contact.sendNotification` always answers `501`: it is a callback from a contact service into the AppView, which this version does not accept. A forwarded contact service therefore cannot create "a contact joined" notifications here.
+
 ## Metrics and alert examples
 
 Scrape `127.0.0.1:9091/metrics` from a Prometheus on this host. Example rules:

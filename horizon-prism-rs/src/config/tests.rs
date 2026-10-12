@@ -455,12 +455,12 @@ fn load_with_reports_missing_file() {
 
 // ---- validation rules ----
 
-/// design-v3 §6.6, §6.7.2.3: nothing but `disabled` loads in this build.
+/// design-v3 §6.6, §6.7.2.3: `disabled` and `proxy` load; `serve` does not,
+/// and push stays `disabled`.
 #[test]
 fn services_and_features_are_validated_at_load() {
-    // The item-10 check: proxying is not built yet (rule 9).
-    let p = invalid_problems(load("[services.contact]\nstate = \"proxy\"\nproxy_url = \"https://c.example\"\n"));
-    assert!(has(&p, "services.contact.state = \"proxy\""), "{p:?}");
+    let cfg = load("[services.contact]\nstate = \"proxy\"\nproxy_url = \"https://c.example\"\n").expect("loads");
+    assert_eq!(cfg.file.services["contact"].state, crate::config::ServiceState::Proxy);
     // B-28's last sentence.
     for text in [
         "[services.push]\nstate = \"serve\"\n",

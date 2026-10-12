@@ -255,7 +255,7 @@ impl<F: IssuerRefresh> JwtVerifier<F> {
         }));
         let deadline = Instant::now() + AUTH_DEADLINE;
         match verify_jwt(token, &self.identity, &resolver, &self.config, deadline, trace_id()).await {
-            Ok(verified) => match host_checks(verified, method) {
+            Ok(verified) => match host_checks(verified, method, CORE_FRAGMENTS) {
                 Ok(caller) => MemoryVerdict::Verified(Box::new(caller)),
                 Err(_) => MemoryVerdict::SignatureOnly,
             },
@@ -280,6 +280,22 @@ impl<F: IssuerRefresh> JwtVerifier<F> {
     /// [`AuthError::Required`] without credentials, [`AuthError::Invalid`]
     /// for anything else after the one rotation retry.
     pub async fn verify_request_jwt(&self, authorization: Option<&str>, method: &str) -> Result<VerifiedCaller, AuthError> {
+        self.verify_request_jwt_for(authorization, method, CORE_FRAGMENTS).await
+    }
+
+    /// [`JwtVerifier::verify_request_jwt`] for a route with its own `aud`
+    /// fragment allowlist (design-v3 §6.7.5.4): a bare `aud`, or one of
+    /// `fragments`.
+    ///
+    /// # Errors
+    ///
+    /// As [`JwtVerifier::verify_request_jwt`].
+    pub async fn verify_request_jwt_for<S: AsRef<str> + Sync>(
+        &self,
+        authorization: Option<&str>,
+        method: &str,
+        fragments: &[S],
+    ) -> Result<VerifiedCaller, AuthError> {
         let Some(raw) = authorization.map(str::trim).filter(|s| !s.is_empty()) else {
             return Err(AuthError::Required);
         };
@@ -308,17 +324,29 @@ impl<F: IssuerRefresh> JwtVerifier<F> {
             }
             (Err(e), _) => return Err(invalid(&e.to_string())),
         };
-        host_checks(verified, method)
+        host_checks(verified, method, fragments)
     }
 }
 
+/// The `aud` fragments a core route accepts beside a bare `aud` (§6.8).
+const CORE_FRAGMENTS: &[&str] = &[APPVIEW_FRAGMENT];
+
+/// Whether a verified token's `aud` fragment is absent or one of `fragments`.
+/// A bare `aud` always passes: it is what every PDS proxy sends.
+#[must_use]
+pub fn fragment_allowed<S: AsRef<str>>(verified: &VerifiedJwt, fragments: &[S]) -> bool {
+    verified
+        .audience_fragment()
+        .is_none_or(|f| fragments.iter().any(|a| a.as_ref() == f))
+}
+
 /// The checks this host adds to kryphocron's (§6.8): the `aud` fragment is
-/// absent or `#bsky_appview`, and `lxm` is the called method.
-fn host_checks(verified: VerifiedJwt, method: &str) -> Result<VerifiedCaller, AuthError> {
-    match verified.audience_fragment() {
-        None => {}
-        Some(APPVIEW_FRAGMENT) => {}
-        Some(other) => return Err(invalid(&format!("aud fragment #{other} is not served here"))),
+/// absent or one the route accepts (`#bsky_appview` on a core route), and
+/// `lxm` is the called method.
+fn host_checks<S: AsRef<str>>(verified: VerifiedJwt, method: &str, fragments: &[S]) -> Result<VerifiedCaller, AuthError> {
+    if !fragment_allowed(&verified, fragments) {
+        let other = verified.audience_fragment().unwrap_or_default();
+        return Err(invalid(&format!("aud fragment #{other} is not served here")));
     }
     match verified.lxm() {
         Some(lxm) if lxm == method => {}

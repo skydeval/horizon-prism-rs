@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod resolver;
+pub mod service_proxy;
 
 pub use client::{
     BodyCap, CONNECT_TIMEOUT, DEFAULT_TIMEOUT, MAX_REDIRECTS, NetClient, NetConfig, NetError,

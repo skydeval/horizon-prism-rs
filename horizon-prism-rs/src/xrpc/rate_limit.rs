@@ -34,6 +34,7 @@ use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use tokio::task::JoinHandle;
 
 use super::backstop::Backstop;
+use super::pools::ChargeKey;
 use crate::config::{RateClassConfig, RateLimitsConfig};
 
 /// A bucket class.
@@ -49,10 +50,14 @@ pub enum Class {
     IndexRequest,
     Resolve,
     Global,
+    /// A proxied service's calls from a ready member (design-v3 §6.7.6.2).
+    ServiceProxyMember,
+    /// A proxied service's calls from everyone else, by IP key.
+    ServiceProxyIp,
 }
 
 impl Class {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 12] = [
         Self::AnonRead,
         Self::AuthRead,
         Self::SearchAnon,
@@ -63,6 +68,8 @@ impl Class {
         Self::IndexRequest,
         Self::Resolve,
         Self::Global,
+        Self::ServiceProxyMember,
+        Self::ServiceProxyIp,
     ];
 
     fn config(self, cfg: &RateLimitsConfig) -> RateClassConfig {
@@ -77,6 +84,8 @@ impl Class {
             Self::IndexRequest => cfg.index_request,
             Self::Resolve => cfg.resolve,
             Self::Global => cfg.global,
+            Self::ServiceProxyMember => cfg.service_proxy_member,
+            Self::ServiceProxyIp => cfg.service_proxy_ip,
         }
     }
 }
@@ -338,6 +347,21 @@ impl RateLimits {
             // no caller: validation keeps it off endpoints that accept
             // anonymous calls, and its handlers authenticate first.
             (_, None) => self.check_ip(Class::AnonRead, ip),
+        }
+    }
+
+    /// Charge one call to proxied service `service` (design-v3 §6.7.6.2):
+    /// `service_proxy_member` for a ready member, `service_proxy_ip` for
+    /// everyone else, one bucket per service and key. `key` is the key the
+    /// backstop selected, never a DID verified later.
+    ///
+    /// # Errors
+    ///
+    /// [`Limited`] when the bucket is empty.
+    pub fn charge_service(&self, service: &str, key: &ChargeKey) -> Result<(), Limited> {
+        match key {
+            ChargeKey::Member(did) => self.check(Class::ServiceProxyMember, &format!("{service}|{did}")),
+            ChargeKey::Ip(ip) => self.check(Class::ServiceProxyIp, &format!("{service}|{ip}")),
         }
     }
 

@@ -24,13 +24,19 @@ use super::pools::{ChargeKey, Requester};
 use super::rate_limit::{Family, client_ip};
 use crate::aggregations::enroll::Enrollment;
 use crate::hydration::Viewer;
-use crate::kryphocron_glue::jwt::{IssuerRefresh, MemoryVerdict};
+use crate::kryphocron_glue::jwt::{IssuerRefresh, MemoryVerdict, fragment_allowed};
 use crate::kryphocron_glue::{AuthError, JwtVerifier, VerifiedCaller};
 
 /// Verifies `Authorization` headers for a method.
 #[async_trait]
 pub trait Authenticator: Send + Sync {
     async fn verify(&self, authorization: Option<&str>, method: &str) -> Result<VerifiedCaller, AuthError>;
+
+    /// [`Authenticator::verify`] for a proxied service's route: the `aud`
+    /// fragment is absent or one of `fragments` (design-v3 §6.7.5.4).
+    async fn verify_for(&self, authorization: Option<&str>, method: &str, _fragments: &[String]) -> Result<VerifiedCaller, AuthError> {
+        self.verify(authorization, method).await
+    }
 
     /// The backstop's claims pre-check on the token's unverified payload
     /// ([`backstop::precheck`]). `None` by default: nothing is pre-verified.
@@ -48,6 +54,10 @@ pub trait Authenticator: Send + Sync {
 impl<F: IssuerRefresh> Authenticator for JwtVerifier<F> {
     async fn verify(&self, authorization: Option<&str>, method: &str) -> Result<VerifiedCaller, AuthError> {
         self.verify_request_jwt(authorization, method).await
+    }
+
+    async fn verify_for(&self, authorization: Option<&str>, method: &str, fragments: &[String]) -> Result<VerifiedCaller, AuthError> {
+        self.verify_request_jwt_for(authorization, method, fragments).await
     }
 
     fn precheck(&self, authorization: &str, method: &str) -> Option<Claims> {
@@ -71,13 +81,39 @@ impl<F: IssuerRefresh> Authenticator for JwtVerifier<F> {
 ///
 /// `AuthRequired`, `InvalidToken` or `RateLimitExceeded`.
 pub async fn authenticate(state: &AppState, authorization: Option<&str>, method: &str) -> Result<VerifiedCaller, XrpcError> {
+    authenticate_for(state, authorization, method, None).await
+}
+
+/// [`authenticate`], with a proxied service's `aud` fragment allowlist in
+/// place of the core one when `fragments` is given (design-v3 §6.7.5.4). The
+/// allowlist applies to a caller the backstop already verified too; its
+/// signature is still not verified twice.
+///
+/// # Errors
+///
+/// As [`authenticate`].
+pub async fn authenticate_for(
+    state: &AppState,
+    authorization: Option<&str>,
+    method: &str,
+    fragments: Option<&[String]>,
+) -> Result<VerifiedCaller, XrpcError> {
     let selected = backstop::selected();
     if let (Some(s), Some(a)) = (&selected, authorization)
         && let Some(caller) = s.verified(a)
     {
-        return Ok(caller);
+        return match fragments {
+            Some(allowed) if !fragment_allowed(&caller.jwt, allowed) => {
+                Err(AuthError::Invalid("aud fragment is not served on this route".to_string()).into())
+            }
+            _ => Ok(caller),
+        };
     }
-    match state.auth.verify(authorization, method).await {
+    let verified = match fragments {
+        Some(allowed) => state.auth.verify_for(authorization, method, allowed).await,
+        None => state.auth.verify(authorization, method).await,
+    };
+    match verified {
         Ok(caller) => {
             // A verification here with a fresh key is a recent success for
             // the caller at this IP key (R3-233).

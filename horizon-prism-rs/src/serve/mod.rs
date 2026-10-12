@@ -448,10 +448,14 @@ pub async fn run() -> Result<(), StartupError> {
         app: app.clone(),
         router: did_router,
     };
+    // The routes of every `[services.*]` block in `proxy` state (§6.7.3).
+    let proxied = crate::services::proxy::router(&app, &cfg.file, &shares, &cfg.env.public_hostname)
+        .map_err(|e| StartupError::new(1, format!("service proxy client: {e}")))?;
     // §6.3's order: merge every route, then the fallbacks, the rate limit
     // and CORS outermost. Nothing is merged after `finalize`.
     let merged = crate::xrpc::router(app.clone())
         .merge(crate::honest_501::router(&app, &cfg.file))
+        .merge(proxied)
         .merge(crate::private_tier::handlers::router(private_state))
         .merge(crate::constellation::resolve_did::router(resolve_did))
         .merge(crate::threadlens::router(thread_lens))
