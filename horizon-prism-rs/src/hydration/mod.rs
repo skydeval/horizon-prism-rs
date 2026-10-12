@@ -17,6 +17,7 @@ pub mod feed;
 pub mod graph;
 pub mod hint;
 pub mod lens;
+pub mod lists;
 pub mod normalize;
 pub mod notifications;
 pub mod thread;
@@ -658,6 +659,12 @@ pub(crate) mod testing {
         pub feeds: HashMap<(String, Option<String>), Value>,
         /// What `lists_descending` answers.
         pub descending: bool,
+        /// URI → `{uri, cid, value}`.
+        pub records: HashMap<String, Value>,
+        /// List URI → `list_items` output.
+        pub list_items: HashMap<String, Value>,
+        /// DID → `getLists` output.
+        pub lists: HashMap<String, Value>,
         pub calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -673,6 +680,15 @@ pub(crate) mod testing {
         }
         async fn post_records(&self, req: &Requester, uris: &[String]) -> Vec<Value> {
             self.posts(req, uris).await
+        }
+        async fn record(&self, _req: &Requester, uri: &str) -> Option<Value> {
+            self.records.get(uri).cloned()
+        }
+        async fn list_items(&self, _req: &Requester, list: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+            self.list_items.get(list).cloned()
+        }
+        async fn lists(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>, _purposes: &[String]) -> Option<Value> {
+            self.lists.get(actor).cloned()
         }
         async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
             None

@@ -1,4 +1,4 @@
-//! `app.bsky.graph.getFollows`, `getFollowers`.
+//! `app.bsky.graph.getFollows`, `getFollowers`, `getList`, `getLists`.
 
 use std::net::SocketAddr;
 
@@ -12,6 +12,8 @@ use crate::xrpc::auth::{Access, Params, prepare};
 
 pub const GET_FOLLOWS: &str = "app.bsky.graph.getFollows";
 pub const GET_FOLLOWERS: &str = "app.bsky.graph.getFollowers";
+pub const GET_LIST: &str = "app.bsky.graph.getList";
+pub const GET_LISTS: &str = "app.bsky.graph.getLists";
 
 pub async fn get_follows(
     State(s): State<AppState>,
@@ -22,6 +24,33 @@ pub async fn get_follows(
     let req = prepare(&s, &headers, peer, GET_FOLLOWS, Access::Opt, false).await?;
     let p = Params::parse(q.as_deref());
     respond(&req.req, s.hydrator.get_follows(&req.viewer, &req.req, p.required("actor")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+}
+
+pub async fn get_list(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_LIST, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(&req.req, s.hydrator.get_list(&req.viewer, &req.req, p.required("list")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+}
+
+pub async fn get_lists(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_LISTS, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(
+        &req.req,
+        s.hydrator
+            .get_lists(&req.viewer, &req.req, p.required("actor")?, &p.all("purposes"), clamp_limit(p.u32("limit")?), p.one("cursor"))
+            .await,
+    )
 }
 
 pub async fn get_followers(

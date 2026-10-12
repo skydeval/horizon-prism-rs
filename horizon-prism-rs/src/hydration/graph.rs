@@ -55,7 +55,7 @@ fn not_found() -> ViewError {
 }
 
 impl Hydrator {
-    async fn subject(&self, req: &Requester, actor: &str) -> Result<Result<String, ViewError>, sqlx::Error> {
+    pub(super) async fn subject(&self, req: &Requester, actor: &str) -> Result<Result<String, ViewError>, sqlx::Error> {
         let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(not_found()));
         };

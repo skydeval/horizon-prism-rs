@@ -157,6 +157,8 @@ pub const SERVED: &[Served] = &[
     served("app.bsky.feed.getTimeline", Family::Read, false),
     served("app.bsky.graph.getFollows", Family::Read, true),
     served("app.bsky.graph.getFollowers", Family::Read, true),
+    served("app.bsky.graph.getList", Family::Read, true),
+    served("app.bsky.graph.getLists", Family::Read, true),
     served("app.bsky.graph.getMutes", Family::Read, false),
     served("app.bsky.graph.muteActor", Family::Write, false),
     served("app.bsky.graph.unmuteActor", Family::Write, false),

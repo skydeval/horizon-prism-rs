@@ -134,6 +134,33 @@ impl AppViewClient {
         }
         self.query("app.bsky.graph.getFollows", &params).await
     }
+
+    /// `app.bsky.graph.getList`.
+    ///
+    /// # Errors
+    ///
+    /// Any [`NetError`].
+    pub async fn get_list(&self, list: &str, limit: u32, cursor: Option<&str>) -> Result<NetResponse, NetError> {
+        let mut params = vec![("list", list.to_string()), ("limit", limit.to_string())];
+        if let Some(c) = cursor {
+            params.push(("cursor", c.to_string()));
+        }
+        self.query("app.bsky.graph.getList", &params).await
+    }
+
+    /// `app.bsky.graph.getLists`, with `purposes` as full tokens.
+    ///
+    /// # Errors
+    ///
+    /// Any [`NetError`].
+    pub async fn get_lists(&self, actor: &str, limit: u32, cursor: Option<&str>, purposes: &[String]) -> Result<NetResponse, NetError> {
+        let mut params = vec![("actor", actor.to_string()), ("limit", limit.to_string())];
+        if let Some(c) = cursor {
+            params.push(("cursor", c.to_string()));
+        }
+        params.extend(purposes.iter().map(|p| ("purposes", p.clone())));
+        self.query("app.bsky.graph.getLists", &params).await
+    }
 }
 
 /// One client per enabled network with an outbound AppView (the `community`

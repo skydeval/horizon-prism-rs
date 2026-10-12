@@ -63,6 +63,21 @@ pub trait UpstreamSource: Send + Sync {
     async fn lists_descending(&self, _req: &Requester, _actor: &str) -> bool {
         false
     }
+    /// One record by AT-URI (Slingshot): `{uri, cid, value}`.
+    async fn record(&self, _req: &Requester, _uri: &str) -> Option<Value> {
+        None
+    }
+    /// The items of a list this AppView does not serve from its own rows
+    /// (design-v3 §5.5): `{items: [listItemView], cursor?, listItemCount?}`.
+    /// `listItemCount` is present only when an AppView answered.
+    async fn list_items(&self, _req: &Requester, _list: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+        None
+    }
+    /// `app.bsky.graph.getLists` output for an actor whose lists this
+    /// AppView does not hold in full. `purposes` are full tokens.
+    async fn lists(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>, _purposes: &[String]) -> Option<Value> {
+        None
+    }
     /// The DID of a handle this AppView has not indexed (§6.7), verified
     /// bidirectionally.
     async fn resolve_handle(&self, _req: &Requester, _handle: &str) -> Option<String> {
@@ -203,6 +218,11 @@ const NSID_PROFILE: &str = "app.bsky.actor.profile";
 const NSID_POST: &str = "app.bsky.feed.post";
 const NSID_REPOST: &str = "app.bsky.feed.repost";
 const NSID_FOLLOW: &str = "app.bsky.graph.follow";
+const NSID_LIST: &str = "app.bsky.graph.list";
+const NSID_LISTITEM: &str = "app.bsky.graph.listitem";
+/// Owner-PDS pages one `getList` request reads when no AppView answers
+/// (`lists.read_listing_pages`, design-v3 §5.5).
+pub const LIST_READ_PAGES: usize = 5;
 
 /// Author-PDS listings on the read path: the host's public-fallback bucket
 /// (design-v3 §II-6.11.3; never queued, and separate from the private
@@ -301,6 +321,31 @@ fn profile_from_record(did: &str, handle: &str, pds: Option<&str>, value: &Value
         if let Some(url) = value.get(key).and_then(blob_cid).and_then(|cid| blob_url(pds, did, &cid)) {
             v[key] = json!(url);
         }
+    }
+    v
+}
+
+/// A `listView` synthesized from a list record: no item count, and the
+/// creator in its minimal form.
+pub(crate) fn list_from_record(uri: &str, cid: &str, creator_handle: &str, pds: Option<&str>, value: &Value) -> Value {
+    let creator = uri_author(uri).unwrap_or_default();
+    let mut v = json!({
+        "uri": uri,
+        "cid": cid,
+        "creator": {"did": creator, "handle": creator_handle, "viewer": {}, "labels": []},
+        "name": value.get("name").cloned().unwrap_or_else(|| json!("")),
+        "purpose": value.get("purpose").cloned().unwrap_or(Value::Null),
+        "indexedAt": value.get("createdAt").cloned().unwrap_or(Value::Null),
+        "viewer": {},
+        "labels": [],
+    });
+    for key in ["description", "descriptionFacets"] {
+        if let Some(x) = value.get(key).filter(|x| !x.is_null()) {
+            v[key] = x.clone();
+        }
+    }
+    if let Some(url) = value.get("avatar").and_then(blob_cid).and_then(|cid| blob_url(pds, creator, &cid)) {
+        v["avatar"] = json!(url);
     }
     v
 }
@@ -655,6 +700,112 @@ impl UpstreamSource for RealUpstreamSource {
             return false;
         };
         self.pds.order(req, &pds, actor).await == Some(ListOrder::Descending)
+    }
+
+    async fn record(&self, req: &Requester, uri: &str) -> Option<Value> {
+        let key = format!("rt:record:{uri}");
+        if let Some(v) = self.cache.get_json::<Value>(&key).await {
+            return Some(v);
+        }
+        let record = self.slingshot.get_record(req, uri).await.ok()?;
+        let view = json!({"uri": uri, "cid": record.cid, "value": record.value});
+        self.cache.put_json(&key, &view).await;
+        Some(view)
+    }
+
+    async fn list_items(&self, req: &Requester, list: &str, limit: u32, cursor: Option<&str>) -> Option<Value> {
+        let owner = uri_author(list)?;
+        if !cursor.is_some_and(|c| c.starts_with("P:"))
+            && let Some(body) = self.cascade(req, owner, Call::List { list, limit, cursor }).await
+        {
+            let mut out = json!({"items": body.get("items").cloned().unwrap_or_else(|| json!([]))});
+            for (to, from) in [("cursor", "/cursor"), ("listItemCount", "/list/listItemCount")] {
+                if let Some(v) = body.pointer(from).filter(|v| !v.is_null()) {
+                    out[to] = v.clone();
+                }
+            }
+            return Some(out);
+        }
+        if req.spent() {
+            return None;
+        }
+        // The owner's PDS, filtered to this list: at most `LIST_READ_PAGES`
+        // pages, each asking only for what the page still lacks. The order
+        // is the PDS's own.
+        let pds = self.router.lookup().summary(req, owner).await?.pds?;
+        let mut next = cursor.and_then(|c| c.strip_prefix("P:")).map(str::to_string);
+        let mut subjects: Vec<(String, String)> = Vec::new();
+        let mut answered = false;
+        for _ in 0..LIST_READ_PAGES {
+            let want = limit.saturating_sub(u32::try_from(subjects.len()).unwrap_or(u32::MAX));
+            if want == 0 {
+                break;
+            }
+            let Some(page) = self.pds.list(req, &pds, owner, NSID_LISTITEM, want, next.as_deref()).await else {
+                break;
+            };
+            answered = true;
+            subjects.extend(page.records.iter().filter_map(|r| {
+                let in_list = r.value.get("list").and_then(Value::as_str) == Some(list);
+                let subject = r.value.get("subject").and_then(Value::as_str)?;
+                in_list.then(|| (r.uri.clone(), subject.to_string()))
+            }));
+            next = page.cursor;
+            if next.is_none() {
+                break;
+            }
+        }
+        if !answered {
+            return None;
+        }
+        let items: Vec<Value> = futures::stream::iter(subjects)
+            .map(|(uri, did)| async move {
+                let handle = self.handle_of(req, &did).await;
+                json!({"uri": uri, "subject": {"did": did, "handle": handle, "viewer": {}, "labels": []}})
+            })
+            .buffered(SLINGSHOT_CONCURRENCY)
+            .collect()
+            .await;
+        let mut out = json!({"items": items});
+        // A cursor whenever the PDS has more, so a short page never claims
+        // to be the end of the list.
+        if let Some(c) = next {
+            out["cursor"] = json!(format!("P:{c}"));
+        }
+        Some(out)
+    }
+
+    async fn lists(&self, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>, purposes: &[String]) -> Option<Value> {
+        if !cursor.is_some_and(|c| c.starts_with("P:"))
+            && let Some(v) = self.cascade(req, actor, Call::Lists { actor, limit, cursor, purposes }).await
+        {
+            return Some(v);
+        }
+        if req.spent() {
+            return None;
+        }
+        // The owner's PDS `listRecords app.bsky.graph.list`: one page, whose
+        // cursor is the PDS's (§5.0's single-stream rule).
+        let pds = self.router.lookup().summary(req, actor).await?.pds?;
+        let page = self
+            .pds
+            .list(req, &pds, actor, NSID_LIST, limit, cursor.and_then(|c| c.strip_prefix("P:")))
+            .await?;
+        let handle = self.handle_of(req, actor).await;
+        let lists: Vec<Value> = page
+            .records
+            .iter()
+            .filter(|r| {
+                let purpose = r.value.get("purpose").and_then(Value::as_str).unwrap_or_default();
+                purposes.is_empty() || purposes.iter().any(|p| p == purpose)
+            })
+            .map(|r| list_from_record(&r.uri, &r.cid, &handle, Some(&pds), &r.value))
+            .collect();
+        let mut out = json!({"lists": lists});
+        if let Some(c) = page.cursor {
+            out["cursor"] = json!(format!("P:{c}"));
+        }
+        Some(out)
     }
 
     async fn resolve_handle(&self, req: &Requester, handle: &str) -> Option<String> {

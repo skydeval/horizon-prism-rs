@@ -12,6 +12,19 @@ commit.
 
 ### Added
 
+- **Item 12: `getList` and `getLists` (#673).** A list is served from this
+  AppView's own rows only when its owner is a ready member, whose lists and
+  list items are held in full (design-v3 §5.5). Any other list is read as if
+  nothing were stored: its record from Slingshot, its items from an upstream
+  AppView, and, when none answers, from the owner's PDS (at most 5 pages a
+  request, with a `P:` cursor while the PDS has more). `listView` carries
+  the creator, `listItemCount` (distinct subjects, or the upstream's number),
+  local labels, and the viewer's own `muted`, `blocked` and
+  `referenceListOptOut`. Duplicate items of one subject show once. A
+  reference list leaves out subjects who opted out, except for its owner,
+  who sees them with `subjectOptedOut`. `getLists` takes `purposes` as short
+  forms or full tokens. A URI that is not an `app.bsky.graph.list` misses
+  with no fetch.
 - **Item 12: thread mutes and `getBlocks` (#673).**
   `app.bsky.graph.muteThread` and `unmuteThread` store the caller's muted
   thread roots (design-v3 §5.3). A muted thread sends the muter no

@@ -215,6 +215,8 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(timeline::GET_TIMELINE), get(timeline::get_timeline))
         .route(&xrpc(graph::GET_FOLLOWS), get(graph::get_follows))
         .route(&xrpc(graph::GET_FOLLOWERS), get(graph::get_followers))
+        .route(&xrpc(graph::GET_LIST), get(graph::get_list))
+        .route(&xrpc(graph::GET_LISTS), get(graph::get_lists))
         .route(&xrpc(mutes::GET_MUTES), get(mutes::get_mutes))
         .route(&xrpc(mutes::MUTE_ACTOR), post(mutes::mute_actor))
         .route(&xrpc(mutes::UNMUTE_ACTOR), post(mutes::unmute_actor))

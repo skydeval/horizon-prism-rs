@@ -184,6 +184,8 @@ pub enum Call<'a> {
     PostThread { uri: &'a str, depth: u32, parent_height: u32 },
     AuthorFeed { actor: &'a str, limit: u32, cursor: Option<&'a str>, filter: &'a str },
     Follows { actor: &'a str, limit: u32, cursor: Option<&'a str> },
+    List { list: &'a str, limit: u32, cursor: Option<&'a str> },
+    Lists { actor: &'a str, limit: u32, cursor: Option<&'a str>, purposes: &'a [String] },
 }
 
 impl Call<'_> {
@@ -194,6 +196,8 @@ impl Call<'_> {
             Self::PostThread { uri, depth, parent_height } => client.get_post_thread(uri, depth, parent_height).await,
             Self::AuthorFeed { actor, limit, cursor, filter } => client.get_author_feed(actor, limit, cursor, filter).await,
             Self::Follows { actor, limit, cursor } => client.get_follows(actor, limit, cursor).await,
+            Self::List { list, limit, cursor } => client.get_list(list, limit, cursor).await,
+            Self::Lists { actor, limit, cursor, purposes } => client.get_lists(actor, limit, cursor, purposes).await,
         }
     }
 }
