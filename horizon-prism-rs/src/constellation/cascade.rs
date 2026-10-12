@@ -38,6 +38,8 @@ pub const BREAKER_OPEN: Duration = Duration::from_secs(30);
 pub const METRIC_CALLS: &str = "upstream_calls_total";
 pub const METRIC_AUTH_REFUSED: &str = "upstream_auth_refused_total";
 pub const METRIC_SKIPPED: &str = "upstream_skipped_total";
+/// Calls cut short by the request's deadline, by network.
+pub const METRIC_BUDGET_CUTOFF: &str = "upstream_budget_cutoff_total";
 
 /// A per-network circuit breaker.
 #[derive(Debug, Default)]
@@ -320,9 +322,14 @@ impl Cascade {
                 drop(admission);
                 return Fetched::NoAnswer(attempts);
             }
-            let result = match tokio::time::timeout(deadline - now, call.invoke(&state.client)).await {
-                Ok(r) => r,
-                Err(_) => Err(NetError::Timeout),
+            let Ok(result) = tokio::time::timeout(deadline - now, call.invoke(&state.client)).await else {
+                // The request's own deadline fired before the call's 3 s
+                // timeout could: a `budget` cut, not an upstream failure
+                // (design-v3 §II-8.3, R3-174). It is not recorded by the
+                // breaker, gives a probe slot back, and is no answer.
+                metrics::counter!(METRIC_BUDGET_CUTOFF, "network" => name).increment(1);
+                drop(admission);
+                return Fetched::NoAnswer(attempts);
             };
             let (class, body) = classify(&result);
             admission.record(class, Instant::now());
@@ -573,6 +580,29 @@ pub(crate) mod tests {
         assert!(r.all_transient() && req.spent());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(!cascade.breaker_open("bluesky"), "rate limiting is not an upstream failure");
+    }
+
+    /// R3-174: a call cut by the request's deadline is not an upstream
+    /// failure, however often it happens.
+    #[tokio::test]
+    async fn a_deadline_cut_is_not_a_breaker_failure() {
+        let router = Router::new().route(
+            "/xrpc/{method}",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                axum::Json(json!({})).into_response()
+            }),
+        );
+        let base = serve_fake(router).await;
+        let cascade = cascade_for(&[("bluesky", &base), ("community-a", &base)]);
+        for _ in 0..(BREAKER_THRESHOLD + 2) {
+            let req = Requester::test().with_deadline(Instant::now() + Duration::from_millis(50));
+            let r = cascade.fetch(&req, None, Call::Profile("x.test")).await;
+            assert_eq!(r, Fetched::NoAnswer(Vec::new()), "no answer, and the plan stops");
+            assert!(r.all_transient());
+            assert!(!req.spent(), "a deadline is not an empty pool");
+        }
+        assert!(!cascade.breaker_open("bluesky"));
     }
 
     #[tokio::test]

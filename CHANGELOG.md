@@ -47,7 +47,10 @@ commit.
   - Posts and profiles inside a list are left out; a thread's parent chain
     stops without a not-found item; counts use the stored or local value;
     Thread Lens reports `upstream-unavailable`.
-  - A cascade cut by the request's deadline is no answer too.
+  - A cascade cut by the request's deadline is no answer too. A call the
+    deadline cuts short is not counted against the network's breaker
+    (`upstream_budget_cutoff_total{network}`); before, slow requests could
+    open a healthy network's breaker.
   - An author feed or follows list read from another AppView or the
     author's PDS answers 429 when it ran out of budget before producing
     anything. A PDS feed that runs out while fetching a reposted post ends
