@@ -547,8 +547,10 @@ impl Lookup {
     /// own rules, with the budget it brings.
     ///
     /// - It shares the request's memo and the viewer's cache with the
-    ///   ordinary reader. An entry is used when it vouches or names a
-    ///   block; one that does neither is asked about again.
+    ///   ordinary reader. A cached entry that vouches settles its account
+    ///   with no call. Any other account is sent once per request; if
+    ///   Farsight then gives no answer, a cached entry that does not vouch
+    ///   is what is returned, so a block it names still applies.
     /// - A DID outside Farsight's grammar gets an answer with no block
     ///   that does not vouch.
     /// - Nothing is removed from `others`: not accounts with a direct
@@ -578,28 +580,37 @@ impl Lookup {
                 }
             }
         }
-        let mut found: HashMap<String, PairAnswer> = HashMap::new();
+        // The request memo settles an account for the whole request: once
+        // it holds anything for one, an answer or "no answer", that
+        // account is not sent again by a later round. A cached entry
+        // settles one only if it vouches; one that does not is sent, and
+        // stands (with any block it names) if Farsight gives no answer.
         let mut ask: Vec<String> = Vec::new();
+        let mut standing: HashMap<String, PairAnswer> = HashMap::new();
         {
             let now = Instant::now();
-            let state = self.state();
+            let mut state = self.state();
             let mut cache = self.farsight.cache();
             for other in &wanted {
                 if *other == actor || forced.as_ref() == Some(other) {
                     ask.push(other.clone());
-                    continue;
-                }
-                let held = state.memo.get(other).cloned().flatten().or_else(|| cache.get(&actor, other, now));
-                match held {
-                    Some(answer) if answer.vouched || answer.any_block() => {
-                        found.insert(other.clone(), answer);
+                } else if !state.memo.contains_key(other) {
+                    match cache.get(&actor, other, now) {
+                        Some(entry) if entry.vouched => {
+                            state.memo.insert(other.clone(), Some(entry));
+                        }
+                        entry => {
+                            standing.extend(entry.map(|e| (other.clone(), e)));
+                            ask.push(other.clone());
+                        }
                     }
-                    _ => ask.push(other.clone()),
                 }
             }
         }
         if !ask.is_empty() && !self.cache_only.load(Ordering::Relaxed) {
             let mut plan = chunks(&actor, &ask);
+            // An account the budget does not reach is not judged at all:
+            // nothing is held for it, and a later round may send it.
             plan.truncate(usize::try_from(budget.max_calls).unwrap_or(usize::MAX));
             let started = Instant::now();
             let called = join_all(plan.into_iter().map(|chunk| self.call(&actor, chunk, budget.timeout, started, true, budget.timeout))).await;
@@ -612,25 +623,28 @@ impl Lookup {
                     if other == actor {
                         continue;
                     }
-                    // As in the ordinary reader: the merged entry, so a
-                    // block the cache already named is not lost to an
-                    // answer that does not vouch.
-                    if let Some(answer) = outcome {
-                        let merged = cache.write(&actor, &other, &answer, now, &inner.settings);
-                        state.memo.insert(other.clone(), Some(merged.clone()));
-                        found.insert(other, merged);
-                    }
+                    // An answer is merged into the cached entry, so a block
+                    // the cache already named is not lost to one that does
+                    // not vouch. With no answer the entry as it stood when
+                    // the round was built is held, or "no answer".
+                    let held = match outcome {
+                        Some(answer) => Some(cache.write(&actor, &other, &answer, now, &inner.settings)),
+                        None => standing.remove(&other).or_else(|| state.memo.get(&other).cloned().flatten()),
+                    };
+                    state.memo.insert(other, held);
                 }
             }
         }
+        let state = self.state();
         for did in others {
             if let Some(c) = canonical(did)
                 && c != actor
-                && let Some(answer) = found.get(&c)
+                && let Some(Some(answer)) = state.memo.get(&c)
             {
                 out.answers.insert(did.clone(), answer.clone());
             }
         }
+        drop(state);
         out
     }
 
@@ -880,8 +894,20 @@ pub(crate) mod tests {
         let request = farsight.request(&member());
         let got = request.pair_answers(V, &page(&[C]), budget, None).await;
         assert!(!got.answers[C].vouched);
+        // Within the request it is settled: a later round does not resend.
+        request.pair_answers(V, &page(&[C]), budget, None).await;
+        assert_eq!(fake.asked.lock().expect("asked").iter().filter(|chunk| chunk.as_slice() == [C]).count(), 1);
         farsight.request(&member()).pair_answers(V, &page(&[C]), budget, None).await;
         assert_eq!(fake.asked.lock().expect("asked").iter().filter(|chunk| chunk.as_slice() == [C]).count(), 2);
+        // A cached block that does not vouch is sent again, and stands
+        // when Farsight gives no answer.
+        fake.blockers.lock().expect("blockers").insert(C.to_string());
+        farsight.request(&member()).pair_answers(V, &page(&[C]), budget, None).await;
+        *fake.status.lock().expect("status") = 503;
+        let down = farsight.request(&member()).pair_answers(V, &page(&[C, B]), budget, None).await;
+        assert!(down.levels.is_empty() && down.answers[C].inbound.list.is_some() && !down.answers[C].vouched);
+        assert!(down.answers[B].vouched, "a vouching entry needs no call");
+        *fake.status.lock().expect("status") = 200;
         // The budget bounds the calls: none allowed, none made, no answer.
         let before = calls(&fake);
         let none = farsight.request(&member()).pair_answers(V, &page(&["did:plc:dddddddddddddddddddddddd"]), PairBudget { max_calls: 0, ..budget }, None).await;
