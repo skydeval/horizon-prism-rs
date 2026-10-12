@@ -27,6 +27,8 @@ use crate::firehose::jobs::{self, Depth};
 use crate::firehose::writer::SENTINEL_REV;
 use crate::identity::AccountLifecycle;
 use crate::private_tier::PrivateTier;
+use crate::subscriptions::applier::Applier;
+use crate::subscriptions::references::drop_member;
 use crate::subscriptions::{jobs as list_sync, triggers};
 
 /// Rows per deletion batch (§6.11.7).
@@ -52,12 +54,22 @@ pub struct Purger {
     private: Arc<dyn PrivateTier>,
     /// `lists.sync_min_interval_secs`, for the list sync a purge end owes.
     sync_min_interval_secs: u32,
+    /// Told when a purge removes a member's list references.
+    applier: Option<Applier>,
 }
 
 impl Purger {
     #[must_use]
     pub fn new(pool: PgPool, scope: ScopeState, private: Arc<dyn PrivateTier>) -> Self {
-        Self { pool, scope, private, sync_min_interval_secs: 600 }
+        Self { pool, scope, private, sync_min_interval_secs: 600, applier: None }
+    }
+
+    /// Set the applier to tell when a purge removes a member's list
+    /// references.
+    #[must_use]
+    pub fn with_applier(mut self, applier: Applier) -> Self {
+        self.applier = Some(applier);
+        self
     }
 
     /// Set `lists.sync_min_interval_secs`.
@@ -136,6 +148,13 @@ impl Purger {
                 sqlx::query("DELETE FROM scope_dids WHERE did = $1").bind(did).execute(&mut *tx).await?;
             }
         }
+        // Rule 4 (§4.3): someone who stops being a member references no
+        // list. The lists it referenced are marked, and the list phase
+        // releases those nobody else references.
+        let dropped = match kind {
+            PurgeKind::MemberRemoved | PurgeKind::AccountDeleted => drop_member(&mut tx, did).await?,
+            PurgeKind::OutOfScope => false,
+        };
         // Readiness, for every kind.
         self.private.clear_owner_readiness(&mut tx, did).await?;
         sqlx::query("UPDATE members SET ready_at = NULL WHERE did = $1")
@@ -169,6 +188,15 @@ impl Purger {
             }
         }
         drop(sets);
+        if let Some(applier) = &self.applier {
+            // What waited on a sync for this member waits no longer.
+            if kind != PurgeKind::OutOfScope {
+                applier.waiting().forget_member(did);
+            }
+            if dropped {
+                applier.signal();
+            }
+        }
         tracing::info!(event = "purge_marked", did, kind = kind.as_str(), "purge marker committed");
         Ok(())
     }
@@ -719,6 +747,13 @@ mod tests {
         purger.purge(OUTSIDER, PurgeKind::AccountDeleted).await.expect("purge");
         assert_eq!(count(p, "SELECT count(*) FROM backfill_jobs WHERE did = 'did:plc:cccccccccccccccccccccccc'").await, 0);
         assert_eq!(count(p, "SELECT count(*) FROM subscribed_owners").await, 1);
+
+        // A removed member references no list any more; the list it
+        // referenced is marked for the list phase.
+        exec(p, "DELETE FROM list_reference_changes").await;
+        purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("purge");
+        assert_eq!(count(p, "SELECT count(*) FROM list_references").await, 0);
+        assert_eq!(count(p, "SELECT count(*) FROM list_reference_changes").await, 1);
         db.drop_db().await;
     }
 }

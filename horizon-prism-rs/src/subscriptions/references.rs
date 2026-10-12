@@ -276,6 +276,68 @@ async fn drop_reference(conn: &mut PgConnection, member: &str, list: &str, sourc
     Ok(if admitted == Some(true) { vec![list.to_string()] } else { Vec::new() })
 }
 
+/// The member phase of member add: references for the list mutes and list
+/// blocks the new member already has stored, in the order they were made.
+/// Runs in the caller's transaction. Returns whether markers were written.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn adopt_member(conn: &mut PgConnection, member: &str, budget: Budget) -> Result<bool, sqlx::Error> {
+    lock_member(&mut *conn, member).await?;
+    // `clock_timestamp()` plus the row's rank keeps the order the mutes
+    // and blocks were made in, whatever the clock's resolution.
+    sqlx::query(
+        "INSERT INTO list_references (member_did, list_uri, source, arrived_at, admitted) \
+         SELECT $1, m.list_uri, 'mute', clock_timestamp() + make_interval(secs => (row_number() OVER (ORDER BY m.created_at, m.list_uri)) * 0.000001), false \
+         FROM list_mutes m WHERE m.viewer_did = $1 ORDER BY m.created_at, m.list_uri \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(member)
+    .execute(&mut *conn)
+    .await?;
+    // One block reference per list, named by its earliest record. A
+    // subject in any other collection makes no reference.
+    sqlx::query(
+        "INSERT INTO list_references (member_did, list_uri, source, source_uri, arrived_at, admitted) \
+         SELECT $1, b.list_uri, 'block', b.uri, clock_timestamp() + make_interval(secs => (row_number() OVER (ORDER BY b.created_at, b.uri)) * 0.000001), false \
+         FROM (SELECT DISTINCT ON (list_uri) list_uri, uri, created_at FROM list_blocks \
+               WHERE author_did = $1 AND split_part(list_uri, '/', 4) = 'app.bsky.graph.list' ORDER BY list_uri, created_at, uri) b \
+         ORDER BY b.created_at, b.uri \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(member)
+    .execute(&mut *conn)
+    .await?;
+    let mut changed = recompute(&mut *conn, member, Source::Mute, budget).await?;
+    changed.extend(recompute(&mut *conn, member, Source::Block, budget).await?);
+    insert_markers(conn, &changed).await?;
+    Ok(!changed.is_empty())
+}
+
+/// The member phase of a purge's marker step (`member_removed`,
+/// `account_deleted`): every reference of the member is deleted, and each
+/// list it had an admitted reference to gets a marker, so the list phase
+/// releases what nobody references any more. Runs in the caller's
+/// transaction. Returns whether markers were written.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn drop_member(conn: &mut PgConnection, member: &str) -> Result<bool, sqlx::Error> {
+    lock_member(&mut *conn, member).await?;
+    let deleted: Vec<Option<String>> =
+        sqlx::query_scalar("DELETE FROM list_references WHERE member_did = $1 RETURNING CASE WHEN admitted THEN list_uri END")
+            .bind(member)
+            .fetch_all(&mut *conn)
+            .await?;
+    let mut changed: Vec<String> = deleted.into_iter().flatten().collect();
+    changed.sort_unstable();
+    changed.dedup();
+    insert_markers(conn, &changed).await?;
+    Ok(!changed.is_empty())
+}
+
 /// The member phase for a member's list blocks of one list, after a
 /// `listblock` record of the member was written, changed or deleted: the
 /// `block` reference is derived again from the member's remaining
@@ -380,6 +442,67 @@ mod tests {
         let mut found = found;
         found.sort_unstable();
         found
+    }
+
+    /// A member added with list mutes and list blocks already stored gets
+    /// references for them, in the order they were made and under the
+    /// budget; a removed member's references all go, and the lists it
+    /// really referenced are marked.
+    #[tokio::test]
+    async fn member_add_and_member_removal() {
+        let Some(db) = fresh_db("subscriptions_member_add").await else {
+            return;
+        };
+        let p = &db.pool;
+        let budget = Budget { max_references: 2, max_owners: 5 };
+        for (n, at) in [(1, "2026-01-03"), (2, "2026-01-01"), (3, "2026-01-02")] {
+            sqlx::query("INSERT INTO list_mutes (viewer_did, list_uri, created_at) VALUES ($1, $2, $3::timestamptz)")
+                .bind(ME)
+                .bind(list('a', n))
+                .bind(at)
+                .execute(p)
+                .await
+                .expect("mute");
+        }
+        let block = |rkey: &'static str, subject: String, at: &'static str| async move {
+            sqlx::query(
+                "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) \
+                 VALUES ('at://' || $1 || '/app.bsky.graph.listblock/' || $2, $1, $2, 'c', '3k', $3, $4::timestamptz)",
+            )
+            .bind(ME)
+            .bind(rkey)
+            .bind(subject)
+            .bind(at)
+            .execute(p)
+            .await
+            .expect("block");
+        };
+        // Two records for one list, and one whose subject is not a list.
+        block("3kb2", list('b', 1), "2026-01-02").await;
+        block("3kb1", list('b', 1), "2026-01-01").await;
+        block("3kb3", format!("at://{OTHER}/app.bsky.feed.post/3k"), "2026-01-01").await;
+
+        let mut conn = p.acquire().await.expect("conn");
+        assert!(adopt_member(&mut conn, ME, budget).await.expect("adopt"));
+        // The two oldest mutes are admitted; the newest is past the budget.
+        assert_eq!(
+            flags(p, ME, "mute").await,
+            vec![(list('a', 2), true, true), (list('a', 3), true, true), (list('a', 1), false, false)]
+        );
+        assert_eq!(flags(p, ME, "block").await, vec![(list('b', 1), true, true)]);
+        let source: Option<String> = sqlx::query_scalar("SELECT source_uri FROM list_references WHERE source = 'block'").fetch_one(p).await.expect("source");
+        assert!(source.expect("uri").ends_with("/3kb1"), "the earliest record names the reference");
+        assert_eq!(markers(p).await, vec![list('a', 2), list('a', 3), list('b', 1)]);
+        // Again: nothing new.
+        assert!(!adopt_member(&mut conn, ME, budget).await.expect("again"));
+
+        // Removal: every reference goes; only admitted ones are marked.
+        assert!(drop_member(&mut conn, ME).await.expect("drop"));
+        assert!(flags(p, ME, "mute").await.is_empty() && flags(p, ME, "block").await.is_empty());
+        assert_eq!(markers(p).await, vec![list('a', 2), list('a', 3), list('b', 1)]);
+        assert!(!drop_member(&mut conn, ME).await.expect("nothing left"));
+        drop(conn);
+        db.drop_db().await;
     }
 
     /// B-73: a mute inside the budget is admitted and marked; one past it

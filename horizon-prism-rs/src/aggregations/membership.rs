@@ -15,6 +15,7 @@ use super::policy::REASON_MEMBER;
 use crate::db::locks::lock_dids_shared;
 use crate::firehose::jobs::{self, Depth};
 use crate::private_tier::PrivateTier;
+use crate::subscriptions::references::{Budget, adopt_member};
 
 /// What adding a member did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +37,7 @@ pub async fn add_member(
     private: &Arc<dyn PrivateTier>,
     did: &str,
     source: &str,
+    list_budget: Budget,
 ) -> Result<AddOutcome, sqlx::Error> {
     let mut sets = scope.write_guard().await;
     if sets.purge_kind(did).is_some() {
@@ -60,6 +62,10 @@ pub async fn add_member(
     if !inserted {
         return Ok(AddOutcome::AlreadyMember);
     }
+    // Rule 4 (design-v3 §4.3): the list mutes and list blocks the new
+    // member already has stored become its references. The list phase
+    // picks the markers up at its next pass.
+    adopt_member(&mut tx, did, list_budget).await?;
     sqlx::query(
         "INSERT INTO scope_dids (did, reasons) VALUES ($1, $2) \
          ON CONFLICT (did) DO UPDATE SET reasons = scope_dids.reasons | EXCLUDED.reasons, justified_at = now()",

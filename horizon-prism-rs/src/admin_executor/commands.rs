@@ -23,6 +23,7 @@ use crate::firehose::jobs::{self, Depth};
 use crate::firehose::writer::Writer;
 use crate::identity::eligibility::{self, Confirmation};
 use crate::private_tier::PrivateTier;
+use crate::subscriptions::references::Budget;
 use crate::subscriptions::{jobs as list_sync, triggers};
 
 /// Label values accepted by `label add` (§7.8). Anything else is rejected.
@@ -205,6 +206,8 @@ pub struct Handlers {
     pub farsight: Option<Farsight>,
     /// `lists.sync_min_interval_secs`.
     pub sync_min_interval_secs: u32,
+    /// A member's budget of list references (design-v3 §4.3).
+    pub list_budget: Budget,
 }
 
 impl Handlers {
@@ -289,7 +292,7 @@ impl Handlers {
     /// `member` backfill, and re-evaluate owner status; the in-memory sets
     /// follow after commit.
     async fn member_add(&self, did: &str) -> Result<Outcome, String> {
-        match add_member(&self.pool, &self.scope, &self.private, did, "admin")
+        match add_member(&self.pool, &self.scope, &self.private, did, "admin", self.list_budget)
             .await
             .map_err(|e| e.to_string())?
         {

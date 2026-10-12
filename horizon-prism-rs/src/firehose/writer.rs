@@ -1070,9 +1070,11 @@ impl Writer {
     }
 }
 
-/// The list a stored list block names.
+/// The list a stored list block names. A subject in any other collection
+/// makes no reference.
 async fn list_block_target(conn: &mut PgConnection, uri: &str) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar("SELECT list_uri FROM list_blocks WHERE uri = $1").bind(uri).fetch_optional(conn).await
+    let subject: Option<String> = sqlx::query_scalar("SELECT list_uri FROM list_blocks WHERE uri = $1").bind(uri).fetch_optional(conn).await?;
+    Ok(subject.filter(|s| s.split('/').nth(3) == Some(NSID_LIST)))
 }
 
 async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {

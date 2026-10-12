@@ -166,7 +166,8 @@ pub async fn run() -> Result<(), StartupError> {
             tombstones_max_per_owner: cfg.file.lists.subscription_tombstones_max_per_owner,
         });
     let purger = Purger::new(pool.clone(), scope.clone(), Arc::clone(&private))
-        .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs);
+        .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
+        .with_applier(applier.clone());
     let constellation = ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url);
 
     let mut tasks = Vec::new();
@@ -368,6 +369,7 @@ pub async fn run() -> Result<(), StartupError> {
             community_patterns: Arc::new(community_patterns.clone()),
             farsight: farsight.clone(),
             sync_min_interval_secs: lists.sync_min_interval_secs,
+            list_budget,
         })
         .spawn(),
     );

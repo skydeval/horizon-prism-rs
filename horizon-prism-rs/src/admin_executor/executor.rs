@@ -261,6 +261,7 @@ mod tests {
             community_patterns: Arc::new(vec!["*.community.example".to_string()]),
             farsight: None,
             sync_min_interval_secs: 600,
+            list_budget: crate::subscriptions::references::Budget { max_references: 25, max_owners: 10 },
         };
         Some((db, AdminExecutor::new(handlers), scope))
     }

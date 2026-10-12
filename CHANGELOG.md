@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 12: references follow membership (#673).** Adding a member
+  (by `admin member add` or auto-enrolment) gives it references for the
+  list mutes and list blocks it already has stored, in the order they
+  were made and under its budget. Removing a member, or deleting its
+  account, deletes all its references in the purge's first step, and
+  the lists nobody else references are released (design-v3 §4.3
+  "Callers of the member phase").
 - **Item 12: a member's list block becomes a reference (#673).** When a
   member's own `app.bsky.graph.listblock` record is written, changed to
   name another list, or deleted, the writer derives that member's

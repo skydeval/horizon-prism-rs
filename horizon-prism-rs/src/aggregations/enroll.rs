@@ -26,6 +26,7 @@ use crate::identity::refresher::RepoStatus;
 use crate::identity::{IdentityResolver, ResolveIntent};
 use crate::net::{BodyCap, NetClient, RequestOptions};
 use crate::private_tier::PrivateTier;
+use crate::subscriptions::references::Budget;
 
 pub const METRIC_REFUSED: &str = "auto_enroll_refused_total";
 
@@ -57,6 +58,8 @@ pub struct AutoEnroller {
     max_members: i64,
     max_per_hour: i64,
     patterns: Arc<Vec<String>>,
+    /// A member's budget of list references (design-v3 §4.3).
+    list_budget: Budget,
     refused: Cache<String, &'static str>,
 }
 
@@ -92,6 +95,10 @@ impl AutoEnroller {
             max_members: i64::from(c.max_members),
             max_per_hour: i64::from(c.max_auto_enroll_per_hour),
             patterns: Arc::new(patterns),
+            list_budget: Budget {
+                max_references: cfg.file.lists.subscribed_max_per_member,
+                max_owners: cfg.file.lists.max_owners_per_member,
+            },
             refused: Cache::builder()
                 .max_capacity(100_000)
                 .time_to_live(Duration::from_secs(c.enroll_refusal_cache_secs))
@@ -162,7 +169,7 @@ impl AutoEnroller {
             metrics::counter!(METRIC_REFUSED, "reason" => "rate").increment(1);
             return Ok(Enrollment::Refused("rate"));
         }
-        Ok(match add_member(&self.pool, &self.scope, &self.private, did, "auto_enroll").await? {
+        Ok(match add_member(&self.pool, &self.scope, &self.private, did, "auto_enroll", self.list_budget).await? {
             AddOutcome::Added { .. } => {
                 tracing::info!(event = "auto_enrolled", did, "member auto-enrolled");
                 Enrollment::Enrolled
