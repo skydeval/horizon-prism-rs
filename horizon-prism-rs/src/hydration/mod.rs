@@ -20,6 +20,7 @@ pub mod lens;
 pub mod lists;
 pub mod normalize;
 pub mod notifications;
+pub mod starter_packs;
 pub mod thread;
 pub mod upstream;
 
@@ -665,6 +666,10 @@ pub(crate) mod testing {
         pub list_items: HashMap<String, Value>,
         /// DID → `getLists` output.
         pub lists: HashMap<String, Value>,
+        /// Pack URI → `getStarterPack` output.
+        pub starter_packs: HashMap<String, Value>,
+        /// DID → `getActorStarterPacks` output.
+        pub actor_packs: HashMap<String, Value>,
         pub calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -689,6 +694,12 @@ pub(crate) mod testing {
         }
         async fn lists(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>, _purposes: &[String]) -> Option<Value> {
             self.lists.get(actor).cloned()
+        }
+        async fn starter_pack(&self, _req: &Requester, uri: &str) -> Option<Value> {
+            self.starter_packs.get(uri).cloned()
+        }
+        async fn actor_starter_packs(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+            self.actor_packs.get(actor).cloned()
         }
         async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
             None

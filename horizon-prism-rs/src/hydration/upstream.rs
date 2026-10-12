@@ -78,6 +78,17 @@ pub trait UpstreamSource: Send + Sync {
     async fn lists(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>, _purposes: &[String]) -> Option<Value> {
         None
     }
+    /// An upstream AppView's `app.bsky.graph.getStarterPack` output, for the
+    /// parts of a pack this AppView cannot build itself (the sample of a
+    /// list it does not serve locally).
+    async fn starter_pack(&self, _req: &Requester, _uri: &str) -> Option<Value> {
+        None
+    }
+    /// `app.bsky.graph.getActorStarterPacks` output for an actor whose
+    /// packs this AppView does not hold in full.
+    async fn actor_starter_packs(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+        None
+    }
     /// The DID of a handle this AppView has not indexed (§6.7), verified
     /// bidirectionally.
     async fn resolve_handle(&self, _req: &Requester, _handle: &str) -> Option<String> {
@@ -220,6 +231,7 @@ const NSID_REPOST: &str = "app.bsky.feed.repost";
 const NSID_FOLLOW: &str = "app.bsky.graph.follow";
 const NSID_LIST: &str = "app.bsky.graph.list";
 const NSID_LISTITEM: &str = "app.bsky.graph.listitem";
+const NSID_STARTERPACK: &str = "app.bsky.graph.starterpack";
 /// Owner-PDS pages one `getList` request reads when no AppView answers
 /// (`lists.read_listing_pages`, design-v3 §5.5).
 pub const LIST_READ_PAGES: usize = 5;
@@ -802,6 +814,47 @@ impl UpstreamSource for RealUpstreamSource {
             .map(|r| list_from_record(&r.uri, &r.cid, &handle, Some(&pds), &r.value))
             .collect();
         let mut out = json!({"lists": lists});
+        if let Some(c) = page.cursor {
+            out["cursor"] = json!(format!("P:{c}"));
+        }
+        Some(out)
+    }
+
+    async fn starter_pack(&self, req: &Requester, uri: &str) -> Option<Value> {
+        self.cascade(req, uri_author(uri)?, Call::StarterPack(uri)).await
+    }
+
+    async fn actor_starter_packs(&self, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>) -> Option<Value> {
+        if !cursor.is_some_and(|c| c.starts_with("P:"))
+            && let Some(v) = self.cascade(req, actor, Call::ActorStarterPacks { actor, limit, cursor }).await
+        {
+            return Some(v);
+        }
+        if req.spent() {
+            return None;
+        }
+        // The owner's PDS `listRecords app.bsky.graph.starterpack`.
+        let pds = self.router.lookup().summary(req, actor).await?.pds?;
+        let page = self
+            .pds
+            .list(req, &pds, actor, NSID_STARTERPACK, limit, cursor.and_then(|c| c.strip_prefix("P:")))
+            .await?;
+        let handle = self.handle_of(req, actor).await;
+        let packs: Vec<Value> = page
+            .records
+            .iter()
+            .map(|r| {
+                json!({
+                    "uri": r.uri,
+                    "cid": r.cid,
+                    "record": r.value,
+                    "creator": {"did": actor, "handle": handle, "viewer": {}, "labels": []},
+                    "labels": [],
+                    "indexedAt": r.value.get("createdAt").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        let mut out = json!({"starterPacks": packs});
         if let Some(c) = page.cursor {
             out["cursor"] = json!(format!("P:{c}"));
         }

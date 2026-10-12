@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **Item 12: starter-pack views (#673).** `getStarterPack`,
+  `getStarterPacks` (at most 25 URIs, misses omitted) and
+  `getActorStarterPacks` (design-v3 §5.5). A stored pack is served from its
+  row, any other from Slingshot. An actor's packs are listed from local rows
+  only for a ready member; otherwise from an upstream AppView, then the
+  owner's PDS. The pack's list follows the same rule as `getList`: its item
+  count and its sample of at most 12 members come from local rows only when
+  the list's owner is a ready member, and from an upstream AppView
+  otherwise. Joined counts are shown when the counts job has stored them;
+  that job is not built yet. `feeds` is omitted.
 - **Item 12: `getList` and `getLists` (#673).** A list is served from this
   AppView's own rows only when its owner is a ready member, whose lists and
   list items are held in full (design-v3 §5.5). Any other list is read as if

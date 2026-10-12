@@ -63,8 +63,8 @@ fn list_not_found() -> ViewError {
 
 /// What a `listView` is built from: a `lists` row, or a fetched record.
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct ListRow {
-    uri: String,
+pub(super) struct ListRow {
+    pub(super) uri: String,
     cid: String,
     name: String,
     purpose: String,
@@ -169,6 +169,58 @@ impl Hydrator {
         })
     }
 
+    /// A list by URI under the locally-servable rule: its row when the
+    /// owner is a ready member, else its record from Slingshot. The flag
+    /// says which.
+    pub(super) async fn load_list(&self, req: &Requester, list: &str) -> Result<Option<(ListRow, bool)>, sqlx::Error> {
+        if !is_list_uri(list) {
+            return Ok(None);
+        }
+        let local = self.is_ready_member(uri_author(list).unwrap_or_default()).await?;
+        let row: Option<ListRow> = if local {
+            sqlx::query_as(&format!("SELECT {LIST_COLUMNS} FROM lists WHERE uri = $1"))
+                .bind(list)
+                .fetch_optional(self.pool())
+                .await?
+        } else {
+            self.upstream().record(req, list).await.as_ref().and_then(ListRow::from_record)
+        };
+        Ok(row.map(|r| (r, local)))
+    }
+
+    /// A `listViewBasic` with the viewer's own state. `pds` is the
+    /// creator's, for the avatar.
+    pub(super) async fn list_basic(&self, viewer: &Viewer, row: &ListRow, pds: Option<&str>, count: Option<i64>) -> Result<Value, sqlx::Error> {
+        let uris = [row.uri.clone()];
+        let labels = self.load_labels(&uris).await?;
+        let list_viewer = self.list_viewer(viewer, &uris).await?;
+        let creator = uri_author(&row.uri).unwrap_or_default();
+        let mut v = json!({
+            "uri": row.uri,
+            "cid": row.cid,
+            "name": row.name,
+            "purpose": row.purpose,
+            "labels": labels.get(&row.uri).cloned().unwrap_or_default(),
+            "viewer": list_viewer.view(&row.uri),
+            "indexedAt": ts(row.indexed_at),
+        });
+        if let Some(url) = row.avatar_cid.as_deref().and_then(|cid| blob_url(pds, creator, cid)) {
+            v["avatar"] = json!(url);
+        }
+        if let Some(n) = count {
+            v["listItemCount"] = json!(n);
+        }
+        Ok(v)
+    }
+
+    /// Distinct subjects of a locally servable list.
+    pub(super) async fn list_item_count(&self, list: &str) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT count(DISTINCT subject_did) FROM list_items WHERE list_uri = $1")
+            .bind(list)
+            .fetch_one(self.pool())
+            .await
+    }
+
     /// A `listView`. `count` is the number of distinct subjects when known.
     fn list_view(row: &ListRow, creators: &ProfileContext, count: Option<i64>, labels: &HashMap<String, Vec<Value>>, viewer: &ListViewer) -> Value {
         let creator = uri_author(&row.uri).unwrap_or_default();
@@ -217,15 +269,7 @@ impl Hydrator {
         let local = self.is_ready_member(&owner).await?;
 
         // The list record.
-        let row: Option<ListRow> = if local {
-            sqlx::query_as(&format!("SELECT {LIST_COLUMNS} FROM lists WHERE uri = $1"))
-                .bind(list)
-                .fetch_optional(self.pool())
-                .await?
-        } else {
-            self.upstream().record(req, list).await.as_ref().and_then(ListRow::from_record)
-        };
-        let Some(row) = row else {
+        let Some((row, _)) = self.load_list(req, list).await? else {
             return Ok(Err(list_not_found()));
         };
 

@@ -186,6 +186,8 @@ pub enum Call<'a> {
     Follows { actor: &'a str, limit: u32, cursor: Option<&'a str> },
     List { list: &'a str, limit: u32, cursor: Option<&'a str> },
     Lists { actor: &'a str, limit: u32, cursor: Option<&'a str>, purposes: &'a [String] },
+    StarterPack(&'a str),
+    ActorStarterPacks { actor: &'a str, limit: u32, cursor: Option<&'a str> },
 }
 
 impl Call<'_> {
@@ -198,6 +200,8 @@ impl Call<'_> {
             Self::Follows { actor, limit, cursor } => client.get_follows(actor, limit, cursor).await,
             Self::List { list, limit, cursor } => client.get_list(list, limit, cursor).await,
             Self::Lists { actor, limit, cursor, purposes } => client.get_lists(actor, limit, cursor, purposes).await,
+            Self::StarterPack(uri) => client.get_starter_pack(uri).await,
+            Self::ActorStarterPacks { actor, limit, cursor } => client.get_actor_starter_packs(actor, limit, cursor).await,
         }
     }
 }

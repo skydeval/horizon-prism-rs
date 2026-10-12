@@ -148,6 +148,28 @@ impl AppViewClient {
         self.query("app.bsky.graph.getList", &params).await
     }
 
+    /// `app.bsky.graph.getStarterPack`.
+    ///
+    /// # Errors
+    ///
+    /// Any [`NetError`].
+    pub async fn get_starter_pack(&self, uri: &str) -> Result<NetResponse, NetError> {
+        self.query("app.bsky.graph.getStarterPack", &[("starterPack", uri.to_string())]).await
+    }
+
+    /// `app.bsky.graph.getActorStarterPacks`.
+    ///
+    /// # Errors
+    ///
+    /// Any [`NetError`].
+    pub async fn get_actor_starter_packs(&self, actor: &str, limit: u32, cursor: Option<&str>) -> Result<NetResponse, NetError> {
+        let mut params = vec![("actor", actor.to_string()), ("limit", limit.to_string())];
+        if let Some(c) = cursor {
+            params.push(("cursor", c.to_string()));
+        }
+        self.query("app.bsky.graph.getActorStarterPacks", &params).await
+    }
+
     /// `app.bsky.graph.getLists`, with `purposes` as full tokens.
     ///
     /// # Errors
