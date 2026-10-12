@@ -271,6 +271,13 @@ commit.
 
 ### Fixed
 
+- **Item 10: `seenAt` on the notification endpoints (G-4, G-5).**
+  `getUnreadCount` now reads `seenAt` and, when present, counts from it
+  instead of from the stored last-seen time; before, the parameter was
+  ignored. `listNotifications` answers `400 InvalidRequest` to a request
+  carrying `seenAt`, which the lexicon marks unsupported; before, it was
+  accepted and ignored. `priority` stays accepted and ignored on both.
+
 - Retention and scope growth no longer race: scope-dependent deletes run per
   DID under the DID's exclusive advisory lock, and growth takes the subject's
   shared lock before inserting `scope_dids`.

@@ -565,6 +565,19 @@ mod tests {
         let (status, v) = get_json(&client, &format!("{base}/xrpc/app.bsky.feed.getTimeline"), Some(&token)).await;
         assert_eq!(status, 200, "{v}");
         assert!(v["feed"].is_array());
+        // G-5: listNotifications rejects seenAt. G-4: getUnreadCount reads it.
+        let list = "app.bsky.notification.listNotifications";
+        let list_token = mint(&signing_key(3), ALICE, &aud, Some(list));
+        let (status, v) = get_json(&client, &format!("{base}/xrpc/{list}?seenAt=2026-01-01T00:00:00Z"), Some(&list_token)).await;
+        assert_eq!((status, v["error"].as_str()), (400, Some("InvalidRequest")), "{v}");
+        let (status, v) = get_json(&client, &format!("{base}/xrpc/{list}?priority=true"), Some(&list_token)).await;
+        assert_eq!(status, 200, "{v}");
+        let count = "app.bsky.notification.getUnreadCount";
+        let count_token = mint(&signing_key(3), ALICE, &aud, Some(count));
+        let (status, v) = get_json(&client, &format!("{base}/xrpc/{count}?seenAt=yesterday"), Some(&count_token)).await;
+        assert_eq!((status, v["error"].as_str()), (400, Some("InvalidRequest")), "{v}");
+        let (status, v) = get_json(&client, &format!("{base}/xrpc/{count}?seenAt=2099-01-01T00:00:00Z"), Some(&count_token)).await;
+        assert_eq!((status, &v["count"]), (200, &json!(0)), "{v}");
         // A token minted for another method is rejected (lxm).
         let (status, _) = get_json(&client, &format!("{base}/xrpc/app.bsky.notification.getUnreadCount"), Some(&token)).await;
         assert_eq!(status, 401);

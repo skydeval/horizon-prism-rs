@@ -154,14 +154,27 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn unread_count(&self, viewer: &Viewer) -> ViewResult<Value> {
+        self.unread_count_since(viewer, None).await
+    }
+
+    /// `getUnreadCount` with its `seenAt` parameter (design-v3 §11 G-4):
+    /// when present it is the comparison point, in place of the stored
+    /// last-seen time.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn unread_count_since(&self, viewer: &Viewer, seen_at: Option<DateTime<Utc>>) -> ViewResult<Value> {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
         let count: i64 = sqlx::query_scalar(&format!(
             "SELECT count(*) FROM notifications n WHERE n.recipient_did = $1 AND {EXCLUSIONS} \
-               AND n.indexed_at > COALESCE((SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity')"
+               AND n.indexed_at > COALESCE($2::timestamptz, \
+                   (SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity')"
         ))
         .bind(me)
+        .bind(seen_at)
         .fetch_one(self.pool())
         .await?;
         Ok(Ok(Self::emit(json!({ "count": count }))))
@@ -317,6 +330,15 @@ mod tests {
         assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 0);
         h.update_seen(&me, "2000-01-01T00:00:00Z").await.expect("db").expect("seen");
         assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 0);
+        // G-4: an explicit seenAt is the comparison point, whatever is stored.
+        let since = |t: &str| {
+            let t = DateTime::parse_from_rfc3339(t).expect("t").with_timezone(&Utc);
+            let h = &h;
+            let me = &me;
+            async move { h.unread_count_since(me, Some(t)).await.expect("db").expect("view").inner()["count"].clone() }
+        };
+        assert_eq!(since("2000-01-01T00:00:00Z").await, 2);
+        assert_eq!(since("2099-01-01T00:00:00Z").await, 0);
         let l = h.list_notifications(&me, 50, None, &[]).await.expect("db").expect("view");
         assert!(l.inner()["notifications"].as_array().expect("list").iter().all(|x| x["isRead"] == true));
 

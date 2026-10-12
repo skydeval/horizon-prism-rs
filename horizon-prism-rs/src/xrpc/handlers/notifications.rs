@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::HeaderMap;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{XrpcResult, respond};
@@ -27,6 +28,12 @@ pub async fn list_notifications(
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, LIST_NOTIFICATIONS, TRIGGER, false).await?;
     let p = Params::parse(q.as_deref());
+    // design-v3 §11 G-5: at `b3d7c33` the lexicon says `seenAt` here is
+    // "unsupported and will cause an error". `priority` is deprecated and
+    // ignored.
+    if p.one("seenAt").is_some() {
+        return Err(XrpcError::invalid("Error: seenAt is not supported on listNotifications"));
+    }
     respond(
         s.hydrator
             .list_notifications(&req.viewer, clamp_limit(p.u32("limit")?), p.one("cursor"), &p.all("reasons"))
@@ -38,9 +45,20 @@ pub async fn get_unread_count(
     State(s): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    RawQuery(q): RawQuery,
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, GET_UNREAD_COUNT, TRIGGER, false).await?;
-    respond(s.hydrator.unread_count(&req.viewer).await)
+    // design-v3 §11 G-4: `seenAt`, when present, is the comparison point.
+    // `priority` is deprecated and ignored.
+    let seen_at = match Params::parse(q.as_deref()).one("seenAt") {
+        None => None,
+        Some(raw) => Some(
+            DateTime::parse_from_rfc3339(raw)
+                .map_err(|_| XrpcError::invalid("Error: seenAt must be a datetime"))?
+                .with_timezone(&Utc),
+        ),
+    };
+    respond(s.hydrator.unread_count_since(&req.viewer, seen_at).await)
 }
 
 pub async fn update_seen(
