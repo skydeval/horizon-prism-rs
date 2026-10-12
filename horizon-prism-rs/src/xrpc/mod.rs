@@ -4,6 +4,7 @@
 //! their modules.
 
 pub mod auth;
+pub mod backstop;
 pub mod errors;
 pub mod handlers;
 pub mod pools;

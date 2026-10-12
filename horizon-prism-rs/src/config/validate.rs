@@ -28,6 +28,7 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     crate::services::problems(cfg, public_hostname, &mut out);
     crate::xrpc::rate_limit::problems(&cfg.rate_limits, &mut out);
     crate::xrpc::pools::problems(cfg, &mut out);
+    crate::xrpc::backstop::problems(&cfg.auth, &mut out);
     out
 }
 

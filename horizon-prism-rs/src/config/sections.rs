@@ -739,6 +739,50 @@ impl PartialEq for Float {
 
 impl Eq for Float {}
 
+/// `[auth]`: limits on token verification done before the per-requester
+/// backstop (design-v3 §II-8.3).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Failed verifications per IP key, all issuers together.
+    pub failed_verify_rate_per_sec: Float,
+    pub failed_verify_burst: u32,
+    /// Failed verifications per (IP key, issuer).
+    pub failed_verify_per_iss_rate_per_sec: Float,
+    pub failed_verify_per_iss_burst: u32,
+    /// A member that verified from an IP key within this window is exempt
+    /// from both failure limits there.
+    pub failed_verify_success_window_secs: u64,
+    /// Capacity of the failure and ceiling state.
+    pub failed_verify_state_max: u64,
+    /// IP keys remembered per member as recent successes.
+    pub failed_verify_success_ips_max: u32,
+    /// The per-IP-key ceiling: failed verifications it may cost.
+    pub verify_rate_per_sec: Float,
+    pub verify_burst: u32,
+    /// The per-member ceiling on successful verifications.
+    pub member_verify_rate_per_sec: Float,
+    pub member_verify_burst: u32,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            failed_verify_rate_per_sec: Float(10.0),
+            failed_verify_burst: 20,
+            failed_verify_per_iss_rate_per_sec: Float(1.0),
+            failed_verify_per_iss_burst: 5,
+            failed_verify_success_window_secs: 86_400,
+            failed_verify_state_max: 100_000,
+            failed_verify_success_ips_max: 16,
+            verify_rate_per_sec: Float(500.0),
+            verify_burst: 1000,
+            member_verify_rate_per_sec: Float(200.0),
+            member_verify_burst: 400,
+        }
+    }
+}
+
 /// One rate-limit class (design-v3 §10): `per_sec` tokens a second, `burst`
 /// at most. A class table gives both keys.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -834,6 +878,7 @@ impl RateLimitsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
     pub rate_limits: RateLimitsConfig,
+    pub auth: AuthConfig,
     pub features: FeaturesConfig,
     pub honest_501: Honest501Config,
     pub services: BTreeMap<String, ServiceConfig>,

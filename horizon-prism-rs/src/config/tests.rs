@@ -232,6 +232,19 @@ resolve = { per_sec = 10.0, burst = 20 }
 global = { per_sec = 100.0, burst = 200 }
 service_proxy_member = { per_sec = 5.0, burst = 20 }
 service_proxy_ip = { per_sec = 10.0, burst = 20 }
+
+[auth]
+failed_verify_rate_per_sec = 10.0
+failed_verify_burst = 20
+failed_verify_per_iss_rate_per_sec = 1.0
+failed_verify_per_iss_burst = 5
+failed_verify_success_window_secs = 86400
+failed_verify_state_max = 100000
+failed_verify_success_ips_max = 16
+verify_rate_per_sec = 500.0
+verify_burst = 1000
+member_verify_rate_per_sec = 200.0
+member_verify_burst = 400
 "#;
 
 #[test]

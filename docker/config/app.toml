@@ -251,6 +251,26 @@ global = { per_sec = 100.0, burst = 200 }
 service_proxy_member = { per_sec = 5.0, burst = 20 }
 service_proxy_ip = { per_sec = 10.0, burst = 20 }
 
+# Limits on checking sign-in tokens before a request is charged to anyone.
+# They stop forged or broken tokens from using up CPU or a member's limits.
+[auth]
+# Tokens that fail to verify: per client address, and per (address, account).
+failed_verify_rate_per_sec = 10.0
+failed_verify_burst = 20
+failed_verify_per_iss_rate_per_sec = 1.0
+failed_verify_per_iss_burst = 5
+# An account that verified from an address within this window is not held
+# back by the two limits above at that address.
+failed_verify_success_window_secs = 86400
+failed_verify_state_max = 100000
+failed_verify_success_ips_max = 16
+# Failing checks one client address may cost, and valid checks one account
+# may cost.
+verify_rate_per_sec = 500.0
+verify_burst = 1000
+member_verify_rate_per_sec = 200.0
+member_verify_burst = 400
+
 # Move one served endpoint to another class family: "read", "search",
 # "write", "private", "thread_lens", "index_request" or "resolve". An
 # endpoint that accepts anonymous calls can only take "read", "search" or

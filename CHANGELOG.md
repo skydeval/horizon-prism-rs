@@ -53,6 +53,18 @@ commit.
     anything. A PDS feed that runs out while fetching a reposted post ends
     the page before that item and keeps its cursor behind it, so the next
     page resumes there.
+- **Item 10: pre-auth backstop parts, not yet wired (#669).**
+  `xrpc::backstop` holds the two parts of design-v3 §II-8.3's backstop
+  that need no I/O. The claims pre-check reads a token's unverified
+  payload and applies the claim checks the verifier makes after the
+  signature (`iss`, `aud` with no fragment or `#bsky_appview`, `lxm`,
+  `iat`, `exp`, `nbf`, the validity window, `nonce`), with the verifier's
+  own skew and window. `VerifyLimits` is the token lifecycle around a
+  pre-backstop verification: failed-verification limits per (IP key,
+  issuer) and per IP key, an exemption for a member that verified from
+  that IP key against the same key within a day, a per-member ceiling and
+  a per-IP-key ceiling. New `[auth]` settings, validated at startup. No
+  request goes through them yet.
 - **Item 10: identity lookups and author-PDS listings are charged
   (#669).** Resolving a DID or a handle for a request costs one token of
   the requester's identity share

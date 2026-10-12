@@ -20,7 +20,7 @@ pub use env::{
     SecretUrl, config_path, validate_hostname,
 };
 pub use sections::{
-    AdminConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
+    AdminConfig, AuthConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
     CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, FeaturesConfig,
     FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
     KryphocronConfig, LOCAL_APPVIEW, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig,

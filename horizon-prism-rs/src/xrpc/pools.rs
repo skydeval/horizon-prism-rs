@@ -98,12 +98,19 @@ impl Exhausted {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Rate {
-    per_sec: f64,
-    burst: f64,
+pub(super) struct Rate {
+    pub(super) per_sec: f64,
+    pub(super) burst: f64,
 }
 
 impl Rate {
+    pub(super) fn new(per_sec: f64, burst: u32) -> Self {
+        Self {
+            per_sec,
+            burst: f64::from(burst),
+        }
+    }
+
     fn scaled(self, by: f64) -> Self {
         Self {
             per_sec: self.per_sec * by,
@@ -117,16 +124,27 @@ impl Rate {
     }
 }
 
-/// A token bucket that starts full.
+/// A token bucket that starts full. Tokens can be taken and given back.
 #[derive(Debug, Clone, Copy)]
-struct Bucket {
+pub(super) struct Bucket {
     tokens: f64,
     at: Instant,
 }
 
 impl Bucket {
-    fn full(rate: Rate, now: Instant) -> Self {
+    pub(super) fn full(rate: Rate, now: Instant) -> Self {
         Self { tokens: rate.burst, at: now }
+    }
+
+    /// Whether a token could be taken now, without taking it.
+    pub(super) fn has_token(&mut self, rate: Rate, now: Instant) -> bool {
+        self.refill(rate, now);
+        self.tokens >= 1.0
+    }
+
+    /// Return a taken token. A bucket never rises above its burst.
+    pub(super) fn give_back(&mut self, rate: Rate) {
+        self.tokens = (self.tokens + 1.0).min(rate.burst);
     }
 
     fn refill(&mut self, rate: Rate, now: Instant) {
@@ -140,7 +158,8 @@ impl Bucket {
         Duration::try_from_secs_f64((1.0 - self.tokens).max(0.0) / rate.per_sec).unwrap_or(Duration::MAX)
     }
 
-    fn take(&mut self, rate: Rate, now: Instant) -> Result<(), Duration> {
+    /// Take one token, or say how long until there is one.
+    pub(super) fn take(&mut self, rate: Rate, now: Instant) -> Result<(), Duration> {
         self.refill(rate, now);
         if self.tokens < 1.0 {
             return Err(self.wait(rate));
