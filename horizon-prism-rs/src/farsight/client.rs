@@ -21,7 +21,12 @@ pub enum CallError {
     Timeout,
     /// Connect, TLS, reset, or an address the guard refuses.
     Transport,
-    /// Any status but 200.
+    /// `429 RateLimitExceeded`: this key's allowance on Farsight is spent.
+    RateLimited,
+    /// `503 Overloaded`: Farsight had no place for the call in time, or a
+    /// query of it ran too long. Farsight is up, and full.
+    Overloaded,
+    /// Any other status but 200.
     Status(u16),
     /// A 200 whose body is not a `checkBlocks` answer.
     Parse,
@@ -42,6 +47,9 @@ impl CallError {
         match self {
             Self::Timeout => "timeout",
             Self::Transport => "transport",
+            Self::RateLimited => "rate_limited",
+            Self::Overloaded => "overloaded",
+            Self::Status(401 | 403) => "auth",
             Self::Status(_) => "status",
             Self::Parse => "parse",
             Self::TooLarge => "too_large",
@@ -97,7 +105,15 @@ impl FarsightClient {
             _ => CallError::Transport,
         })?;
         if response.status.as_u16() != 200 {
-            return Err(CallError::Status(response.status.as_u16()));
+            // Farsight uses 429 and 503 for two conditions each, told apart
+            // by the error's name, not by the status.
+            let named = serde_json::from_slice::<Value>(&response.body).ok();
+            let error = named.as_ref().and_then(|v| v.get("error")).and_then(Value::as_str);
+            return Err(match (response.status.as_u16(), error) {
+                (429, Some("RateLimitExceeded")) => CallError::RateLimited,
+                (503, Some("Overloaded")) => CallError::Overloaded,
+                (status, _) => CallError::Status(status),
+            });
         }
         let body: Value = serde_json::from_slice(&response.body).map_err(|_| CallError::Parse)?;
         ChunkAnswer::read(&body, others).ok_or(CallError::Parse)
@@ -197,6 +213,16 @@ mod tests {
         if query.contains("denied") {
             return (StatusCode::FORBIDDEN, "{}").into_response();
         }
+        // Farsight's two 429s and two 503s differ only by the error's name.
+        for (marker, status, error) in [
+            ("ratelimited", StatusCode::TOO_MANY_REQUESTS, "RateLimitExceeded"),
+            ("overloaded", StatusCode::SERVICE_UNAVAILABLE, "Overloaded"),
+            ("notsetup", StatusCode::SERVICE_UNAVAILABLE, "SetupRequired"),
+        ] {
+            if query.contains(marker) {
+                return (status, axum::Json(json!({"error": error, "message": "no"}))).into_response();
+            }
+        }
         if query.contains("garbage") {
             return "not json".into_response();
         }
@@ -246,6 +272,11 @@ mod tests {
         assert_eq!(ask("slow", 100).await, Some(CallError::Timeout));
         assert_eq!(ask("denied", 2000).await, Some(CallError::Status(403)));
         assert!(CallError::Status(403).is_auth() && CallError::Status(401).is_auth() && !CallError::Status(500).is_auth());
+        assert_eq!(ask("ratelimited", 2000).await, Some(CallError::RateLimited));
+        assert_eq!(ask("overloaded", 2000).await, Some(CallError::Overloaded));
+        assert_eq!(ask("notsetup", 2000).await, Some(CallError::Status(503)));
+        let labels = [CallError::RateLimited, CallError::Overloaded, CallError::Status(403), CallError::Status(503)].map(CallError::label);
+        assert_eq!(labels, ["rate_limited", "overloaded", "auth", "status"]);
         assert_eq!(ask("garbage", 2000).await, Some(CallError::Parse));
         assert_eq!(ask("huge", 5000).await, Some(CallError::TooLarge));
         let dead = FarsightClient::new(NetClient::loopback_for_tests(), "http://127.0.0.1:9", "fsk_test").expect("client");

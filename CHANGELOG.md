@@ -911,6 +911,13 @@ commit.
 
 ### Changed
 
+- **Item 12: Farsight call outcomes are named (#673).**
+  `farsight_calls_total{outcome}` now says `rate_limited` (this key's
+  allowance on Farsight is spent), `overloaded` (Farsight is up and
+  full) and `auth` (the key is refused) where it said `status` for all
+  three. They are read from the error name Farsight sends, since it uses
+  429 and 503 for two conditions each. What counts as a failure is
+  unchanged.
 - **Item 15: host names are looked up fully qualified (#675).** Every
   outbound DNS lookup now asks for the name with a trailing dot, so the
   resolver never retries it with a search domain. Inside Docker that

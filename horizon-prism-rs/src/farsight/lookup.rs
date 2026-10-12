@@ -574,6 +574,7 @@ impl Lookup {
                     let failing = match error {
                         CallError::Timeout => whole,
                         CallError::Transport | CallError::Parse => true,
+                        CallError::RateLimited | CallError::Overloaded => true,
                         CallError::Status(status) => status >= 500 || matches!(status, 401 | 403 | 429),
                         CallError::TooLarge => false,
                     };
