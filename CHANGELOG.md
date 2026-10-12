@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 14: activity subscriptions (#675).**
+  `app.bsky.notification.putActivitySubscription` and
+  `listActivitySubscriptions`. Turning a subscription off always works.
+  Turning one on needs a ready member, a subject this AppView indexes,
+  room under `[activity_subscriptions] max_per_actor` (default 1000), and
+  the subject's permission (its notification declaration; no record means
+  followers only). No notification is generated from them yet
+  (design-v3 §5.6).
 - **Item 14: notification preferences (#675).**
   `app.bsky.notification.getPreferences` and `putPreferencesV2` store a
   member's preferences (13 keys; `chat` is always its default), and they

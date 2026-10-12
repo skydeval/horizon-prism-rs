@@ -10,6 +10,7 @@
 //! - Counts follow §9.6: synchronous Constellation enrichment for
 //!   single-object views, cached values plus `cc:refresh` for lists.
 
+pub mod activity_subscriptions;
 pub mod actor;
 pub mod cache;
 pub mod emit;
@@ -125,6 +126,8 @@ pub struct HydrationConfig {
     pub thread: ThreadConfig,
     /// `thread_mutes.max_per_actor`.
     pub thread_mutes_max: u32,
+    /// `activity_subscriptions.max_per_actor`.
+    pub activity_subscriptions_max: u32,
     /// `known_followers.scan_max_pages`.
     pub known_followers_scan_max_pages: u32,
     /// `known_followers.profile_scan_pages`.
@@ -790,6 +793,7 @@ pub(crate) mod testing {
                 counts: CountsConfig::default(),
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
+                activity_subscriptions_max: 2,
                 known_followers_scan_max_pages: 2,
                 known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,
@@ -820,6 +824,7 @@ pub(crate) mod testing {
                 counts: CountsConfig::default(),
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
+                activity_subscriptions_max: 2,
                 known_followers_scan_max_pages: 2,
                 known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,

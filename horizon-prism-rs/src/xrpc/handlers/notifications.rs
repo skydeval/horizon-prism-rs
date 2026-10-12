@@ -20,6 +20,8 @@ pub const UPDATE_SEEN: &str = "app.bsky.notification.updateSeen";
 pub const GET_PREFERENCES: &str = "app.bsky.notification.getPreferences";
 pub const PUT_PREFERENCES: &str = "app.bsky.notification.putPreferences";
 pub const PUT_PREFERENCES_V2: &str = "app.bsky.notification.putPreferencesV2";
+pub const LIST_ACTIVITY_SUBSCRIPTIONS: &str = "app.bsky.notification.listActivitySubscriptions";
+pub const PUT_ACTIVITY_SUBSCRIPTION: &str = "app.bsky.notification.putActivitySubscription";
 
 const TRIGGER: Access = Access::Member { ready: true, enroll: true };
 /// Preferences are the member's own state here: no readiness needed.
@@ -103,6 +105,48 @@ pub async fn put_preferences_v2(
         .filter(Value::is_object)
         .ok_or_else(|| XrpcError::invalid("Error: Input must be an object"))?;
     respond(&req.req, s.hydrator.put_notification_preferences(&req.viewer, &input).await)
+}
+
+/// A viewer-private listing: an inbound list block applies from the
+/// viewer's cache only, with no Farsight call (design-v3 §5.14.5).
+pub async fn list_activity_subscriptions(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, LIST_ACTIVITY_SUBSCRIPTIONS, MEMBER, false).await?;
+    if let Some(lookup) = crate::xrpc::backstop::farsight() {
+        lookup.set_cache_only();
+    }
+    let p = Params::parse(q.as_deref());
+    respond(
+        &req.req,
+        s.hydrator
+            .list_activity_subscriptions(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor"))
+            .await,
+    )
+}
+
+/// Turning a subscription off needs no readiness, so the access level asks
+/// for none; turning one on checks it in the hydrator.
+pub async fn put_activity_subscription(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, PUT_ACTIVITY_SUBSCRIPTION, MEMBER, true).await?;
+    let input = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let subject = input
+        .get("subject")
+        .and_then(Value::as_str)
+        .ok_or_else(|| XrpcError::invalid("Error: Input must have the property \"subject\""))?;
+    let flag = |name: &str| input.pointer(&format!("/activitySubscription/{name}")).and_then(Value::as_bool);
+    let (Some(post), Some(reply)) = (flag("post"), flag("reply")) else {
+        return Err(XrpcError::invalid("Error: Input must have the property \"activitySubscription\""));
+    };
+    respond(&req.req, s.hydrator.put_activity_subscription(&req.viewer, subject, post, reply).await)
 }
 
 /// The legacy `putPreferences {priority}` (design-v3 §5.6): accepted so old

@@ -279,6 +279,11 @@ max_remote_fetches = 100
 [thread_mutes]
 max_per_actor = 10000
 
+# How many accounts one member may ask to be notified about when they post.
+# Past it, subscribing to another is refused.
+[activity_subscriptions]
+max_per_actor = 1000
+
 # How often the "joined through this starter pack" numbers are recounted.
 [starter_packs]
 counts_refresh_secs = 3600

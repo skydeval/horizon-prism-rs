@@ -812,6 +812,21 @@ impl Default for ThreadMutesConfig {
     }
 }
 
+/// `[activity_subscriptions]`: the cap on one member's subscriptions
+/// (design-v3 §4.5).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ActivitySubscriptionsConfig {
+    /// Accounts one member may subscribe to; a new one past it is a 400.
+    pub max_per_actor: u32,
+}
+
+impl Default for ActivitySubscriptionsConfig {
+    fn default() -> Self {
+        Self { max_per_actor: 1000 }
+    }
+}
+
 /// `[farsight]`: the block and block-list index this AppView asks about
 /// inbound list blocks (design-v3 §5.14.4). With `url` unset, no call is
 /// ever made.
@@ -1085,6 +1100,7 @@ pub struct FileConfig {
     pub thread_v2: ThreadV2Config,
     pub op_thread: OpThreadConfig,
     pub thread_mutes: ThreadMutesConfig,
+    pub activity_subscriptions: ActivitySubscriptionsConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,
     pub known_likers: KnownLikersConfig,

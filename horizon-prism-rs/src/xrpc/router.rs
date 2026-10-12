@@ -239,6 +239,8 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(notifications::GET_PREFERENCES), get(notifications::get_preferences))
         .route(&xrpc(notifications::PUT_PREFERENCES), post(notifications::put_preferences))
         .route(&xrpc(notifications::PUT_PREFERENCES_V2), post(notifications::put_preferences_v2))
+        .route(&xrpc(notifications::LIST_ACTIVITY_SUBSCRIPTIONS), get(notifications::list_activity_subscriptions))
+        .route(&xrpc(notifications::PUT_ACTIVITY_SUBSCRIPTION), post(notifications::put_activity_subscription))
         .route("/.well-known/did.json", get(did_web::did_json))
         .route("/did.json", get(did_web::did_json))
         .with_state(state)

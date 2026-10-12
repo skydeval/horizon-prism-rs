@@ -181,6 +181,8 @@ pub const SERVED: &[Served] = &[
     served("app.bsky.notification.getPreferences", Family::Read, false),
     served("app.bsky.notification.putPreferences", Family::Write, false),
     served("app.bsky.notification.putPreferencesV2", Family::Write, false),
+    served("app.bsky.notification.listActivitySubscriptions", Family::Read, false),
+    served("app.bsky.notification.putActivitySubscription", Family::Write, false),
     served("app.nearhorizon.private.getPosts", Family::Private, false),
     served("app.nearhorizon.private.getPostThread", Family::Private, false),
     served("app.nearhorizon.private.getAuthorFeed", Family::Private, false),
