@@ -16,6 +16,7 @@ pub mod applier;
 pub mod fetch;
 pub mod jobs;
 pub mod list_phase;
+pub mod pds;
 pub mod references;
 pub mod run;
 pub mod sync;

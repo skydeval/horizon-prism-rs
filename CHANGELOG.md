@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 12: list sync against real servers (#673).**
+  `subscriptions::pds` checks a list owner's account (a fresh identity
+  document that is neither stored nor cached, then the repository's
+  status and latest revision at its PDS) and reads its records from that
+  same PDS under the host's backfill allowance. Time waiting for that
+  allowance is not counted as the owner's server being slow. A timeout
+  or a server error never starts a suspicion that the owner is gone
+  (design-v3 §4.3 "The run", step 2).
 - **Item 12: a whole list sync run, and owners that are gone (#673).**
   `subscriptions::run` takes one run from start to end. An owner being
   purged is not listed. An owner whose account does not answer is first

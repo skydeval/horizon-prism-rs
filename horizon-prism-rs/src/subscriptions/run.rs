@@ -46,8 +46,9 @@ pub trait OwnerSource: Send + Sync {
     /// The owner's status. `Err` is a transient failure (a timeout, a
     /// server error): it says nothing, and the run is retried.
     async fn status(&self, owner: &str) -> Result<OwnerStatus, String>;
-    /// The owner's records, read at the PDS `status` found.
-    async fn records(&self, owner: &str) -> Result<Box<dyn OwnerRecords>, String>;
+    /// The owner's records, read at the PDS `status` found, for the run
+    /// claimed at `generation`.
+    async fn records(&self, owner: &str, generation: i64) -> Result<Box<dyn OwnerRecords>, String>;
 }
 
 /// What a run needs from the configuration.
@@ -187,7 +188,7 @@ async fn attempt(
         .execute(pool)
         .await?;
     // 3. The listings.
-    let records = match source.records(owner).await {
+    let records = match source.records(owner, generation).await {
         Ok(records) => records,
         Err(error) => {
             jobs::end_run(pool, owner, generation, RunEnd::Failed(&error), None, pause).await?;
@@ -280,7 +281,7 @@ mod tests {
         async fn status(&self, _owner: &str) -> Result<OwnerStatus, String> {
             self.status.lock().expect("status").clone()
         }
-        async fn records(&self, _owner: &str) -> Result<Box<dyn OwnerRecords>, String> {
+        async fn records(&self, _owner: &str, _generation: i64) -> Result<Box<dyn OwnerRecords>, String> {
             Ok(Box::new(Records { items: self.items }))
         }
     }
