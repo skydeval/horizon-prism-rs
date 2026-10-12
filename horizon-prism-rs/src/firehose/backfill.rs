@@ -46,6 +46,7 @@ use super::gap;
 use super::jobs::Depth;
 use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, Writer};
 use crate::config::BackfillConfig;
+use crate::farsight::Farsight;
 use crate::identity::refresher::{RefreshReason, RepoStatus, account_status, is_repo_not_found};
 use crate::identity::resolver::extract_info;
 use crate::identity::eligibility::{self, Confirmation};
@@ -565,6 +566,8 @@ pub struct Backfill {
     order_cache: moka::future::Cache<String, ListOrder>,
     /// The `community` network's `pds_patterns` (owner eligibility).
     community_patterns: Arc<Vec<String>>,
+    /// The block-list index to prime on a member job, when configured.
+    farsight: Option<Farsight>,
 }
 
 impl Backfill {
@@ -582,7 +585,15 @@ impl Backfill {
                 .time_to_live(ORDER_CACHE_TTL)
                 .build(),
             community_patterns: Arc::new(Vec::new()),
+            farsight: None,
         }
+    }
+
+    /// Prime `farsight` on every member job.
+    #[must_use]
+    pub fn with_farsight(mut self, farsight: Option<Farsight>) -> Self {
+        self.farsight = farsight;
+        self
     }
 
     /// Set the community PDS patterns for owner eligibility (§6.11.1).
@@ -694,6 +705,19 @@ impl Backfill {
     /// Steps 1–5. `Ok(None)` when superseded part-way.
     async fn run(&self, job: &Job) -> Result<Option<RunResult>, String> {
         let is_member = self.writer.scope().read_guard().await.is_member(&job.did);
+        // A member job asks Farsight to read the member's repository
+        // (design-v3 §5.14.11). Best effort, on a task of its own: its
+        // outcome never affects the job or readiness.
+        if job.depth == Depth::Member
+            && let Some(farsight) = self.farsight.clone().filter(Farsight::prime_on_enroll)
+        {
+            let did = job.did.clone();
+            tokio::spawn(async move {
+                if let Err(reason) = farsight.prime(&did, false).await {
+                    tracing::debug!(event = "farsight_prime_failed", reason, "Farsight was not primed for a member");
+                }
+            });
+        }
         let prepared = self.source.prepare(&job.did).await;
         // A non-member's private/authz job is an eligibility confirmation
         // (§6.11.1). A DID that is not an owner afterwards ends `done`

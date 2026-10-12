@@ -160,6 +160,16 @@ pub async fn run() -> Result<(), StartupError> {
     // Every upstream a public request reaches has one request bucket,
     // split into pools and per-requester shares (design-v3 §II-8.3).
     let shares = Shares::from_config(&cfg.file);
+    // The block-list index (design-v3 §5.14), only when configured.
+    let farsight = match (&cfg.file.farsight.url, &cfg.env.farsight_token) {
+        (Some(url), Some(token)) => {
+            let client = crate::farsight::FarsightClient::new(net.clone(), url, token.expose())
+                .ok_or_else(|| StartupError::new(78, "FARSIGHT_TOKEN is not a usable header value".to_string()))?;
+            tracing::info!(event = "farsight_enabled", "inbound list blocks are read from Farsight");
+            Some(crate::farsight::Farsight::new(client, &cfg.file.farsight, &shares))
+        }
+        _ => None,
+    };
     let microcosm = &cfg.file.microcosm;
     let identity = &cfg.file.identity;
     // Identity work for requests: the requester's identity share, and PLC's
@@ -274,7 +284,8 @@ pub async fn run() -> Result<(), StartupError> {
     let community_patterns: Vec<String> =
         cfg.file.constellation.community().map(|n| n.pds_patterns.clone()).unwrap_or_default();
     let backfill = Backfill::new(writer.clone(), Arc::clone(&source), cfg.file.backfill.clone(), fh.deterministic_attempts)
-        .with_community_patterns(community_patterns.clone());
+        .with_community_patterns(community_patterns.clone())
+        .with_farsight(farsight.clone());
     tasks.extend(
         backfill
             .spawn()
@@ -347,17 +358,6 @@ pub async fn run() -> Result<(), StartupError> {
         ),
         read_cache.clone(),
     );
-
-    // The block-list index (design-v3 §5.14), only when configured.
-    let farsight = match (&cfg.file.farsight.url, &cfg.env.farsight_token) {
-        (Some(url), Some(token)) => {
-            let client = crate::farsight::FarsightClient::new(net.clone(), url, token.expose())
-                .ok_or_else(|| StartupError::new(78, "FARSIGHT_TOKEN is not a usable header value".to_string()))?;
-            tracing::info!(event = "farsight_enabled", "inbound list blocks are read from Farsight");
-            Some(crate::farsight::Farsight::new(client, &cfg.file.farsight, &shares))
-        }
-        _ => None,
-    };
 
     // HTTP.
     let hydrator = Hydrator::new(

@@ -40,6 +40,9 @@ pub const METRIC_PARTIAL: &str = "farsight_partial_total";
 /// `farsight_auth_failed_total`: a 401 or 403, so a revoked or
 /// under-scoped key is visible.
 pub const METRIC_AUTH_FAILED: &str = "farsight_auth_failed_total";
+/// `farsight_prime_failed_total{reason}`: `requestBackfill` calls that did
+/// not succeed, or were skipped while their breaker was open.
+pub const METRIC_PRIME_FAILED: &str = "farsight_prime_failed_total";
 
 #[derive(Debug, Clone, Copy)]
 struct Settings {
@@ -145,6 +148,9 @@ struct Inner {
     settings: Settings,
     bucket: SharedBucket,
     breaker: SharedBreaker,
+    /// The breaker of `requestBackfill`, apart from the read breaker.
+    prime_breaker: SharedBreaker,
+    prime_on_enroll: bool,
     cache: Mutex<Cache>,
 }
 
@@ -178,6 +184,8 @@ impl Farsight {
                 },
                 bucket: shares.bucket_with_share("farsight", cfg.rate_per_sec.0, cfg.burst, cfg.requester_share.0),
                 breaker: SharedBreaker::default(),
+                prime_breaker: SharedBreaker::default(),
+                prime_on_enroll: cfg.prime_on_enroll,
                 cache: Mutex::new(Cache::default()),
             }),
         }
@@ -206,6 +214,46 @@ impl Farsight {
     pub fn forget(&self, viewer: &str) {
         let viewer = canonical(viewer).unwrap_or_else(|| viewer.to_string());
         self.cache().forget(&viewer);
+    }
+
+    /// Ask Farsight to read a member's own repository (design-v3 §5.14.11),
+    /// so a new member's blocks and list blocks are current there from
+    /// enrollment. Best effort: the outcome is counted and nothing waits on
+    /// it. It has a breaker of its own, which gates only this call: its
+    /// refusals are ordinary during mass enrollment and say nothing about
+    /// whether reads work.
+    ///
+    /// # Errors
+    ///
+    /// The counted reason.
+    pub async fn prime(&self, actor: &str, force: bool) -> Result<(), &'static str> {
+        let failed = |reason: &'static str| {
+            metrics::counter!(METRIC_PRIME_FAILED, "reason" => reason).increment(1);
+            Err(reason)
+        };
+        let Some(actor) = canonical(actor) else {
+            return failed("invalid_did");
+        };
+        let Some(admission) = self.inner.prime_breaker.admit(Instant::now()) else {
+            return failed("breaker_open");
+        };
+        match self.inner.client.request_backfill(&actor, force).await {
+            Ok(()) => {
+                admission.record(Class::Hit, Instant::now());
+                Ok(())
+            }
+            Err(reason) => {
+                admission.record(Class::Transient, Instant::now());
+                failed(reason)
+            }
+        }
+    }
+
+    /// Whether enrolling a member should prime Farsight
+    /// (`farsight.prime_on_enroll`).
+    #[must_use]
+    pub fn prime_on_enroll(&self) -> bool {
+        self.inner.prime_on_enroll
     }
 
     /// Whether the read breaker is open now.
@@ -630,6 +678,47 @@ pub(crate) mod tests {
         let before = farsight.cached();
         farsight.forget(V);
         assert_eq!(farsight.cached(), before - 3);
+    }
+
+    /// B-81: the prime is counted, and its breaker is apart from the read
+    /// breaker.
+    #[tokio::test]
+    async fn the_prime_has_a_breaker_of_its_own() {
+        use axum::routing::post;
+
+        use crate::farsight::client::REQUEST_BACKFILL_PATH;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let app = Router::new().route(
+            REQUEST_BACKFILL_PATH,
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if body["actor"] == A {
+                        (StatusCode::ACCEPTED, axum::Json(json!({"enqueued": true}))).into_response()
+                    } else {
+                        (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error": "QueueFull"}))).into_response()
+                    }
+                }
+            }),
+        );
+        let base = serve_fake(app).await;
+        let cfg = crate::config::FarsightConfig::default();
+        let client = FarsightClient::new(NetClient::loopback_for_tests(), &base, "fsk_test").expect("client");
+        let farsight = Farsight::new(client, &cfg, &Shares::for_tests());
+        assert!(farsight.prime_on_enroll());
+        assert_eq!(farsight.prime(A, false).await, Ok(()));
+        assert_eq!(farsight.prime("did:key:z6Mk", false).await, Err("invalid_did"));
+        for _ in 0..5 {
+            assert_eq!(farsight.prime(B, false).await, Err("queue_full"));
+        }
+        // Its breaker is open: the next prime is skipped, and reads are not
+        // affected.
+        assert_eq!(farsight.prime(A, false).await, Err("breaker_open"));
+        assert_eq!(hits.load(Ordering::SeqCst), 6);
+        assert!(!farsight.breaker_open());
     }
 
     /// B-80: `getRelationships` reads Farsight through shared entries only.

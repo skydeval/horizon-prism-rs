@@ -104,6 +104,43 @@ impl FarsightClient {
     }
 }
 
+/// The method that asks Farsight to read an account's repository.
+pub const REQUEST_BACKFILL_PATH: &str = "/xrpc/app.nearhorizon.farsight.admin.requestBackfill";
+
+impl FarsightClient {
+    /// `admin.requestBackfill { actor, priority: "normal" }`: ask Farsight
+    /// to read `actor`'s own repository now. Any 2xx is success (Farsight
+    /// answers 202). Its outcome is never polled.
+    ///
+    /// # Errors
+    ///
+    /// A short reason, for counting: `queue_full`, `rate_limited`,
+    /// `forbidden`, `status`, `timeout` or `transport`.
+    pub async fn request_backfill(&self, actor: &str, force: bool) -> Result<(), &'static str> {
+        let url = format!("{}{REQUEST_BACKFILL_PATH}", self.base);
+        let mut body = serde_json::json!({"actor": actor, "priority": "normal"});
+        if force {
+            body["force"] = Value::Bool(true);
+        }
+        let options = RequestOptions::new(BodyCap::REPO_STATUS).header(AUTHORIZATION, self.authorization.clone());
+        let response = self.net.post_json(&url, &body, &options).await.map_err(|e| match e {
+            NetError::Timeout => "timeout",
+            _ => "transport",
+        })?;
+        if response.status.is_success() {
+            return Ok(());
+        }
+        let named = serde_json::from_slice::<Value>(&response.body).ok();
+        let error = named.as_ref().and_then(|v| v.get("error")).and_then(Value::as_str);
+        Err(match (response.status.as_u16(), error) {
+            (_, Some("QueueFull")) => "queue_full",
+            (429, _) => "rate_limited",
+            (401 | 403, _) => "forbidden",
+            _ => "status",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

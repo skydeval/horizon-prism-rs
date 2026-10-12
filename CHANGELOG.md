@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 12: Farsight is primed when a member is enrolled (#673).** With
+  `farsight.prime_on_enroll` (default true), each `member` backfill job
+  asks Farsight to read the member's own repository, so the member's blocks
+  and list blocks are current there at once (design-v3 §5.14.11). The call
+  is best effort and never affects the job or readiness. It has a breaker
+  of its own, apart from the one for reads.
+  `farsight_prime_failed_total{reason}`.
 - **Item 12: inbound list blocks in notifications (#673).** An account that
   blocks the viewer through a list sends it no notifications: it is left
   out of `listNotifications`, and `getUnreadCount` subtracts its unread rows
