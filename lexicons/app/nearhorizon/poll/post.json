@@ -1,0 +1,42 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.poll.post",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A poll: a question with two to six options. This AppView indexes poll records and serves the public ones; it keeps no votes and serves no tallies.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["options", "visibility"],
+        "properties": {
+          "text": { "type": "string", "description": "The question." },
+          "options": {
+            "type": "array",
+            "minLength": 2,
+            "maxLength": 6,
+            "items": { "type": "ref", "ref": "#option" }
+          },
+          "visibility": {
+            "type": "string",
+            "description": "Who the poll is for. Only 'public' polls are served.",
+            "knownValues": ["public"]
+          },
+          "multiSelect": { "type": "boolean" },
+          "resultVisibility": { "type": "string" },
+          "deadline": { "type": "string", "format": "datetime" },
+          "createdAt": { "type": "string", "format": "datetime" }
+        }
+      }
+    },
+    "option": {
+      "type": "object",
+      "required": ["id", "label"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "media": { "type": "unknown" }
+      }
+    }
+  }
+}

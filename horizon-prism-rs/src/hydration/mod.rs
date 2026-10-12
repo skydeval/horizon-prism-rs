@@ -25,6 +25,7 @@ pub mod lists;
 pub mod normalize;
 pub mod notification_prefs;
 pub mod notifications;
+pub mod polls;
 pub mod relationships;
 pub mod repo;
 pub mod starter_packs;

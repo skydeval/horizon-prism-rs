@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 15: `app.nearhorizon.feed.getAuthorPolls` (#675).** An
+  account's public polls, newest first, with a basic author view.
+  Non-public polls are never returned. An indexed author's polls come
+  from stored rows; anyone else's from their own server, a page at a
+  time. `limit` is 1 to 100 (default 25); more is a 400. Lexicon files
+  for the endpoint and for `app.nearhorizon.poll.post` are under
+  `lexicons/` (design-v3 §5.13).
 - **Item 15: `app.bsky.feed.getActorLikes` (#675).** A ready member's own
   likes, newest first; `actor` must be the caller. Liked posts not stored
   here are fetched from Slingshot, at most a page's worth. A liked post

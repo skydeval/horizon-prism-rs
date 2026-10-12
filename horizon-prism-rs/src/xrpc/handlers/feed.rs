@@ -20,6 +20,7 @@ pub const GET_LIKES: &str = "app.bsky.feed.getLikes";
 pub const GET_REPOSTED_BY: &str = "app.bsky.feed.getRepostedBy";
 pub const GET_QUOTES: &str = "app.bsky.feed.getQuotes";
 pub const GET_ACTOR_LIKES: &str = "app.bsky.feed.getActorLikes";
+pub const GET_AUTHOR_POLLS: &str = "app.nearhorizon.feed.getAuthorPolls";
 
 // The lexicon's known values at `b3d7c33` (design-v3 §11 G-2).
 const FILTERS: [&str; 5] = [
@@ -164,6 +165,19 @@ pub async fn get_quotes(
     let req = prepare(&s, &headers, peer, GET_QUOTES, Access::Opt, false).await?;
     let p = Params::parse(q.as_deref());
     respond(&req.req, s.hydrator.get_quotes(&req.viewer, &req.req, p.required("uri")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+}
+
+/// `limit` is not clamped here: past 100 is a 400 (design-v3 §5.13).
+pub async fn get_author_polls(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_AUTHOR_POLLS, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    let limit = p.u32("limit")?.unwrap_or(crate::hydration::polls::DEFAULT_LIMIT);
+    respond(&req.req, s.hydrator.get_author_polls(&req.viewer, &req.req, p.required("actor")?, limit, p.one("cursor")).await)
 }
 
 /// A member's own likes only (design-v3 §5.4).

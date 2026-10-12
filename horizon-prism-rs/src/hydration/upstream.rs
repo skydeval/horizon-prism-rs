@@ -97,6 +97,12 @@ pub trait UpstreamSource: Send + Sync {
     async fn actor_starter_packs(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
         None
     }
+    /// `app.nearhorizon.feed.getAuthorPolls` output for an actor whose polls
+    /// this AppView does not store: one page of the actor's PDS listing,
+    /// public polls only (design-v3 §5.13).
+    async fn author_polls(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+        None
+    }
     /// The DID of a handle this AppView has not indexed (§6.7), verified
     /// bidirectionally.
     async fn resolve_handle(&self, _req: &Requester, _handle: &str) -> Option<String> {
@@ -240,6 +246,7 @@ const NSID_FOLLOW: &str = "app.bsky.graph.follow";
 const NSID_LIST: &str = "app.bsky.graph.list";
 const NSID_LISTITEM: &str = "app.bsky.graph.listitem";
 const NSID_STARTERPACK: &str = "app.bsky.graph.starterpack";
+const NSID_POLL: &str = "app.nearhorizon.poll.post";
 /// Owner-PDS pages one `getList` request reads when no AppView answers:
 /// the default of `lists.read_listing_pages` (design-v3 §5.5).
 pub const LIST_READ_PAGES: usize = 5;
@@ -882,6 +889,38 @@ impl UpstreamSource for RealUpstreamSource {
             })
             .collect();
         let mut out = json!({"starterPacks": packs});
+        if let Some(c) = page.cursor {
+            out["cursor"] = json!(format!("P:{c}"));
+        }
+        Some(out)
+    }
+
+    async fn author_polls(&self, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>) -> Option<Value> {
+        // No AppView serves this NSID: the author's PDS
+        // `listRecords app.nearhorizon.poll.post`, one page, whose cursor is
+        // the PDS's. A page of only non-public polls is empty and still
+        // carries its cursor, so the listing goes on.
+        let pds = self.router.lookup().summary(req, actor).await?.pds?;
+        let page = self
+            .pds
+            .list(req, &pds, actor, NSID_POLL, limit, cursor.and_then(|c| c.strip_prefix("P:")))
+            .await?;
+        let handle = self.handle_of(req, actor).await;
+        let polls: Vec<Value> = page
+            .records
+            .iter()
+            .filter(|r| r.value.get("visibility").and_then(Value::as_str) == Some("public"))
+            .map(|r| {
+                json!({
+                    "uri": r.uri,
+                    "cid": r.cid,
+                    "author": {"did": actor, "handle": handle, "viewer": {}, "labels": []},
+                    "record": r.value,
+                    "indexedAt": r.value.get("createdAt").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        let mut out = json!({ "polls": polls });
         if let Some(c) = page.cursor {
             out["cursor"] = json!(format!("P:{c}"));
         }
