@@ -12,6 +12,9 @@
 //!   open it for 30 s; then one half-open probe is let through. A probe that
 //!   fails re-opens it; any other answer closes it. An open breaker skips
 //!   the network as transient.
+//! - The probe slot is held by a guard (design-v3 §II-8.3): a probe that
+//!   ends without a recorded outcome, a request dropped mid-call included,
+//!   gives the slot back, so the next call probes instead.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -45,19 +48,42 @@ pub struct Breaker {
     probing: bool,
 }
 
+/// What [`Breaker::admit`] decided for one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit {
+    /// The breaker is open, or its half-open probe is already out.
+    Refused,
+    /// The breaker is closed.
+    Normal,
+    /// This call is the half-open probe and holds the probe slot.
+    Probe,
+}
+
 impl Breaker {
-    /// Whether a call may go out now. Past the open period, exactly one
-    /// half-open probe is admitted until its result is recorded.
-    pub fn allow(&mut self, now: Instant) -> bool {
+    /// Decide whether a call may go out now. Past the open period, exactly
+    /// one half-open probe is admitted until its result is recorded or its
+    /// slot is released.
+    pub fn admit(&mut self, now: Instant) -> Admit {
         match self.open_until {
-            None => true,
-            Some(until) if now < until => false,
-            Some(_) if self.probing => false,
+            None => Admit::Normal,
+            Some(until) if now < until => Admit::Refused,
+            Some(_) if self.probing => Admit::Refused,
             Some(_) => {
                 self.probing = true;
-                true
+                Admit::Probe
             }
         }
+    }
+
+    /// Whether a call may go out now ([`Breaker::admit`] as a boolean).
+    pub fn allow(&mut self, now: Instant) -> bool {
+        self.admit(now) != Admit::Refused
+    }
+
+    /// Give the half-open probe slot back without a result. The breaker
+    /// stays half-open, so the next call is admitted as the probe.
+    pub fn release_probe(&mut self) {
+        self.probing = false;
     }
 
     /// Record a call's class.
@@ -76,6 +102,76 @@ impl Breaker {
     #[must_use]
     pub fn is_open(&self, now: Instant) -> bool {
         self.open_until.is_some_and(|until| now < until)
+    }
+}
+
+/// A breaker shared by every caller of one key (a network; later Farsight's
+/// read call). Calls go out through [`SharedBreaker::admit`], whose
+/// [`Admission`] is the probe-slot guard of design-v3 §II-8.3.
+#[derive(Debug, Default)]
+pub struct SharedBreaker(Mutex<Breaker>);
+
+impl SharedBreaker {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Breaker> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Ask to make a call. `None` means the breaker refuses it.
+    pub fn admit(&self, now: Instant) -> Option<Admission<'_>> {
+        match self.lock().admit(now) {
+            Admit::Refused => None,
+            Admit::Normal => Some(Admission {
+                breaker: self,
+                holds_probe: false,
+            }),
+            Admit::Probe => Some(Admission {
+                breaker: self,
+                holds_probe: true,
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn is_open(&self, now: Instant) -> bool {
+        self.lock().is_open(now)
+    }
+
+    /// Put the breaker in the half-open state: its open period has passed
+    /// and no probe is out.
+    #[cfg(test)]
+    pub(crate) fn force_half_open(&self) {
+        let mut b = self.lock();
+        b.open_until = Some(Instant::now());
+        b.probing = false;
+    }
+}
+
+/// An admitted call. [`Admission::record`] reports its outcome. If it is
+/// dropped without one, for any reason, the half-open probe slot it may hold
+/// is released: an empty bucket, an outcome the breaker does not record, or
+/// a request dropped while its call is in flight (a client that disconnects
+/// drops its handler, and the call with it). Without this an unrecorded
+/// probe would leave the breaker refusing every call until restart.
+#[derive(Debug)]
+pub struct Admission<'a> {
+    breaker: &'a SharedBreaker,
+    holds_probe: bool,
+}
+
+impl Admission<'_> {
+    /// Record the call's class. A failure counts toward opening the breaker
+    /// (a failed probe re-opens it at once); anything else closes it.
+    pub fn record(mut self, class: Class, now: Instant) {
+        self.breaker.lock().record(class, now);
+        self.holds_probe = false;
+    }
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        if self.holds_probe {
+            self.breaker.lock().release_probe();
+        }
     }
 }
 
@@ -132,7 +228,7 @@ impl Fetched {
 struct NetworkState {
     client: AppViewClient,
     limiter: Option<DefaultDirectRateLimiter>,
-    breaker: Mutex<Breaker>,
+    breaker: SharedBreaker,
 }
 
 /// The cascade. Cheap to clone.
@@ -160,7 +256,7 @@ impl Cascade {
                     NetworkState {
                         client,
                         limiter,
-                        breaker: Mutex::new(Breaker::default()),
+                        breaker: SharedBreaker::default(),
                     },
                 )
             })
@@ -181,7 +277,14 @@ impl Cascade {
     pub fn breaker_open(&self, network: &str) -> bool {
         self.networks
             .get(network)
-            .is_some_and(|s| s.breaker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_open(Instant::now()))
+            .is_some_and(|s| s.breaker.is_open(Instant::now()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_half_open(&self, network: &str) {
+        if let Some(s) = self.networks.get(network) {
+            s.breaker.force_half_open();
+        }
     }
 
     /// Run `call` through the plan for a DID whose home network is `home`.
@@ -196,18 +299,17 @@ impl Cascade {
             if now >= deadline {
                 break;
             }
-            if !state.breaker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).allow(now) {
+            // The admission is the probe-slot guard (design-v3 §II-8.3):
+            // every exit below that does not record an outcome, and a drop
+            // of this future while the call is in flight, releases the slot.
+            let Some(admission) = state.breaker.admit(now) else {
                 metrics::counter!(METRIC_SKIPPED, "network" => name.clone(), "reason" => "breaker_open").increment(1);
                 attempts.push((name, Class::Transient));
                 continue;
-            }
+            };
             if state.limiter.as_ref().is_some_and(|l| l.check().is_err()) {
                 metrics::counter!(METRIC_SKIPPED, "network" => name.clone(), "reason" => "rate_limited").increment(1);
-                // Releases a half-open probe slot taken above.
-                let mut b = state.breaker.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if b.probing {
-                    b.probing = false;
-                }
+                drop(admission);
                 attempts.push((name, Class::Transient));
                 continue;
             }
@@ -216,11 +318,7 @@ impl Cascade {
                 Err(_) => Err(NetError::Timeout),
             };
             let (class, body) = classify(&result);
-            state
-                .breaker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record(class, Instant::now());
+            admission.record(class, Instant::now());
             metrics::counter!(METRIC_CALLS, "network" => name.clone(), "class" => class.label()).increment(1);
             if class == Class::AuthRefused {
                 metrics::counter!(METRIC_AUTH_REFUSED, "network" => name.clone()).increment(1);
@@ -236,7 +334,7 @@ impl Cascade {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use axum::Router;
     use axum::extract::State;
@@ -283,6 +381,76 @@ pub(crate) mod tests {
         b.record(Class::Withheld, t2);
         b.record(Class::Transient, t2);
         assert!(!b.is_open(t2));
+    }
+
+    /// design-v3 §II-8.3, the probe-slot guard: a probe that ends without a
+    /// recorded outcome gives its slot back.
+    #[test]
+    fn an_unrecorded_probe_releases_its_slot() {
+        let b = SharedBreaker::default();
+        let t0 = Instant::now();
+        for _ in 0..BREAKER_THRESHOLD {
+            b.admit(t0).expect("closed").record(Class::Transient, t0);
+        }
+        assert!(b.is_open(t0));
+        assert!(b.admit(t0).is_none());
+
+        let t1 = t0 + BREAKER_OPEN;
+        let probe = b.admit(t1).expect("the probe");
+        assert!(b.admit(t1).is_none(), "one probe at a time");
+        drop(probe);
+        // Released, not recorded: still half-open, and the next call is the
+        // probe.
+        let probe = b.admit(t1).expect("the slot was released");
+        assert!(b.admit(t1).is_none());
+        probe.record(Class::Transient, t1);
+        assert!(b.is_open(t1), "a failed probe re-opens");
+
+        let t2 = t1 + BREAKER_OPEN;
+        b.admit(t2).expect("the probe").record(Class::Hit, t2);
+        assert!(!b.is_open(t2));
+        // Closed: any number of calls, and an unrecorded one changes nothing.
+        let (first, second) = (b.admit(t2), b.admit(t2));
+        assert!(first.is_some() && second.is_some());
+        drop((first, second));
+        assert!(b.admit(t2).is_some());
+    }
+
+    /// B-79's network-breaker case: a request dropped while it holds the
+    /// half-open probe does not leave the network refused until restart.
+    #[tokio::test]
+    async fn a_dropped_probe_request_does_not_wedge_the_network() {
+        let hang = Arc::new(AtomicBool::new(true));
+        let router = Router::new()
+            .route(
+                "/xrpc/{method}",
+                get(|State(hang): State<Arc<AtomicBool>>| async move {
+                    if hang.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                    axum::Json(json!({"did": "did:plc:x", "handle": "x.test"})).into_response()
+                }),
+            )
+            .with_state(Arc::clone(&hang));
+        let base = serve_fake(router).await;
+        let cascade = cascade_for(&[("bluesky", &base)]);
+        cascade.force_half_open("bluesky");
+
+        // The probing request is dropped well before the per-call timeout,
+        // as when its client disconnects.
+        let probing = cascade.fetch(Some("bluesky"), Call::Profile("x.test"));
+        assert!(tokio::time::timeout(Duration::from_millis(200), probing).await.is_err());
+
+        hang.store(false, Ordering::SeqCst);
+        // The next call is admitted as the probe, and its hit closes the
+        // breaker.
+        for _ in 0..2 {
+            match cascade.fetch(Some("bluesky"), Call::Profile("x.test")).await {
+                Fetched::Hit { network, .. } => assert_eq!(network, "bluesky"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(!cascade.breaker_open("bluesky"));
     }
 
     /// A fake AppView answering every call with a fixed status, counting

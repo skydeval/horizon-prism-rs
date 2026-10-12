@@ -271,6 +271,16 @@ commit.
 
 ### Fixed
 
+- **Item 10: an upstream network could stay unreachable until restart
+  (#669).** After a breaker's open period one probing call is let through
+  and every other call is refused until that call's result is recorded. A
+  request dropped while its probe was in flight (a client disconnecting, a
+  timeout further up) never recorded one, so the network was skipped by
+  every later cascade until the process restarted. Admitted calls now hold
+  the probe slot through a guard that gives it back on any exit without a
+  recorded outcome (design-v3 §II-8.3). `SharedBreaker` and `Admission` are
+  the reusable form, for the Farsight breaker later.
+
 - **Item 10: `seenAt` on the notification endpoints (G-4, G-5).**
   `getUnreadCount` now reads `seenAt` and, when present, counts from it
   instead of from the stored last-seen time; before, the parameter was
