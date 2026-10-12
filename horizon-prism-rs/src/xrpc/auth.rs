@@ -17,6 +17,7 @@ use axum::http::HeaderMap;
 
 use super::AppState;
 use super::errors::XrpcError;
+use super::pools::Requester;
 use super::rate_limit::{Family, client_ip};
 use crate::aggregations::enroll::Enrollment;
 use crate::hydration::Viewer;
@@ -100,6 +101,9 @@ impl Params {
 pub struct Prepared {
     pub viewer: Viewer,
     pub ip: IpAddr,
+    /// Who the request's upstream calls are charged to: a ready member by
+    /// DID, everyone else by IP key.
+    pub req: Requester,
 }
 
 /// The client IP for a request.
@@ -151,6 +155,7 @@ pub async fn prepare(
         }
     }
     let viewer = state.hydrator.viewer(caller_did.as_deref()).await?;
+    let req = Requester::of(viewer.state_did(), ip);
     // Mute management works before readiness: act as the caller.
     let viewer = if matches!(access, Access::Member { ready: false, .. }) && !viewer.hydrate {
         Viewer {
@@ -160,7 +165,7 @@ pub async fn prepare(
     } else {
         viewer
     };
-    Ok(Prepared { viewer, ip })
+    Ok(Prepared { viewer, ip, req })
 }
 
 /// The private-endpoint gate (§6.3 steps 1–2, §7.4): authentication

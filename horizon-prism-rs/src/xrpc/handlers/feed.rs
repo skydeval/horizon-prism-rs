@@ -40,7 +40,7 @@ pub async fn get_posts(
     if uris.is_empty() || uris.len() > 25 {
         return Err(XrpcError::invalid("Error: uris must have between 1 and 25 items"));
     }
-    respond(s.hydrator.get_posts(&req.viewer, &uris).await)
+    respond(s.hydrator.get_posts(&req.viewer, &req.req, &uris).await)
 }
 
 pub async fn get_post_thread(
@@ -53,7 +53,7 @@ pub async fn get_post_thread(
     let p = Params::parse(q.as_deref());
     let depth = p.u32("depth")?.unwrap_or(DEFAULT_DEPTH);
     let parent_height = p.u32("parentHeight")?.unwrap_or(DEFAULT_PARENT_HEIGHT);
-    respond(s.hydrator.get_post_thread(&req.viewer, p.required("uri")?, depth, parent_height).await)
+    respond(s.hydrator.get_post_thread(&req.viewer, &req.req, p.required("uri")?, depth, parent_height).await)
 }
 
 pub async fn get_author_feed(
@@ -72,6 +72,7 @@ pub async fn get_author_feed(
         s.hydrator
             .get_author_feed(
                 &req.viewer,
+                &req.req,
                 p.required("actor")?,
                 clamp_limit(p.u32("limit")?),
                 p.one("cursor"),
@@ -90,7 +91,7 @@ pub async fn get_likes(
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, GET_LIKES, Access::Opt, false).await?;
     let p = Params::parse(q.as_deref());
-    respond(s.hydrator.get_likes(&req.viewer, p.required("uri")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+    respond(s.hydrator.get_likes(&req.viewer, &req.req, p.required("uri")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
 }
 
 pub async fn get_reposted_by(
@@ -103,7 +104,7 @@ pub async fn get_reposted_by(
     let p = Params::parse(q.as_deref());
     respond(
         s.hydrator
-            .get_reposted_by(&req.viewer, p.required("uri")?, clamp_limit(p.u32("limit")?), p.one("cursor"))
+            .get_reposted_by(&req.viewer, &req.req, p.required("uri")?, clamp_limit(p.u32("limit")?), p.one("cursor"))
             .await,
     )
 }
@@ -116,5 +117,5 @@ pub async fn get_quotes(
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, GET_QUOTES, Access::Opt, false).await?;
     let p = Params::parse(q.as_deref());
-    respond(s.hydrator.get_quotes(&req.viewer, p.required("uri")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+    respond(s.hydrator.get_quotes(&req.viewer, &req.req, p.required("uri")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
 }

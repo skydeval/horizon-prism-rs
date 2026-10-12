@@ -28,6 +28,7 @@ use super::classifier::{Class, classify};
 use super::routing::RoutingTable;
 use crate::appview_clients::AppViewClient;
 use crate::net::{NetError, NetResponse};
+use crate::xrpc::pools::Requester;
 
 /// The whole cascade's budget per request (§8.3).
 pub const CASCADE_BUDGET: Duration = Duration::from_secs(6);
@@ -288,7 +289,7 @@ impl Cascade {
     }
 
     /// Run `call` through the plan for a DID whose home network is `home`.
-    pub async fn fetch(&self, home: Option<&str>, call: Call<'_>) -> Fetched {
+    pub async fn fetch(&self, _req: &Requester, home: Option<&str>, call: Call<'_>) -> Fetched {
         let deadline = Instant::now() + CASCADE_BUDGET;
         let mut attempts = Vec::new();
         for name in self.table.plan(home) {
@@ -438,14 +439,15 @@ pub(crate) mod tests {
 
         // The probing request is dropped well before the per-call timeout,
         // as when its client disconnects.
-        let probing = cascade.fetch(Some("bluesky"), Call::Profile("x.test"));
+        let req = Requester::test();
+        let probing = cascade.fetch(&req, Some("bluesky"), Call::Profile("x.test"));
         assert!(tokio::time::timeout(Duration::from_millis(200), probing).await.is_err());
 
         hang.store(false, Ordering::SeqCst);
         // The next call is admitted as the probe, and its hit closes the
         // breaker.
         for _ in 0..2 {
-            match cascade.fetch(Some("bluesky"), Call::Profile("x.test")).await {
+            match cascade.fetch(&req, Some("bluesky"), Call::Profile("x.test")).await {
                 Fetched::Hit { network, .. } => assert_eq!(network, "bluesky"),
                 other => panic!("{other:?}"),
             }
@@ -494,9 +496,10 @@ pub(crate) mod tests {
         let (down, down_calls) = fake_appview(StatusCode::SERVICE_UNAVAILABLE, json!({})).await;
         let (hit, hit_calls) = fake_appview(StatusCode::OK, json!({"did": "did:plc:x", "handle": "x.test"})).await;
         let cascade = cascade_for(&[("bluesky", &down), ("community-a", &hit)]);
+        let req = Requester::test();
 
         // Home community-a answers first; bluesky is never called.
-        match cascade.fetch(Some("community-a"), Call::Profile("x.test")).await {
+        match cascade.fetch(&req, Some("community-a"), Call::Profile("x.test")).await {
             Fetched::Hit { network, body } => assert_eq!((network.as_str(), &body["handle"]), ("community-a", &json!("x.test"))),
             other => panic!("{other:?}"),
         }
@@ -504,12 +507,12 @@ pub(crate) mod tests {
 
         // Unknown home: bluesky (transient) then community-a (hit).
         for _ in 0..5 {
-            assert!(cascade.fetch(None, Call::Profile("x.test")).await.hit().is_some());
+            assert!(cascade.fetch(&req, None, Call::Profile("x.test")).await.hit().is_some());
         }
         assert_eq!(down_calls.load(Ordering::SeqCst), 5);
         assert!(cascade.breaker_open("bluesky"), "five transient calls open the breaker");
         // While open, bluesky is skipped without a call.
-        assert!(cascade.fetch(None, Call::Profile("x.test")).await.hit().is_some());
+        assert!(cascade.fetch(&req, None, Call::Profile("x.test")).await.hit().is_some());
         assert_eq!(down_calls.load(Ordering::SeqCst), 5);
         assert_eq!(hit_calls.load(Ordering::SeqCst), 7);
     }
@@ -519,14 +522,15 @@ pub(crate) mod tests {
         let (missing, _) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound", "message": "Post not found"})).await;
         let (down, _) = fake_appview(StatusCode::BAD_GATEWAY, json!({})).await;
         let cascade = cascade_for(&[("bluesky", &missing), ("community-a", &down)]);
-        let r = cascade.fetch(None, Call::Posts(&["at://did:plc:x/app.bsky.feed.post/1".into()])).await;
+        let req = Requester::test();
+        let r = cascade.fetch(&req, None, Call::Posts(&["at://did:plc:x/app.bsky.feed.post/1".into()])).await;
         assert_eq!(
             r,
             Fetched::Exhausted(vec![("bluesky".into(), Class::Miss), ("community-a".into(), Class::Transient)])
         );
         assert!(!r.all_transient(), "a miss is an answer");
         let cascade = cascade_for(&[("bluesky", &down), ("community-a", &down)]);
-        assert!(cascade.fetch(None, Call::Profile("x")).await.all_transient());
+        assert!(cascade.fetch(&req, None, Call::Profile("x")).await.all_transient());
     }
 
     #[tokio::test]
@@ -543,9 +547,10 @@ pub(crate) mod tests {
         let table = Arc::new(RoutingTable::from_config(&cfg));
         let client = AppViewClient::new("bluesky", &hit, AppViewAuth::Unauth, NetClient::loopback_for_tests());
         let cascade = Cascade::new(table, vec![client]);
+        let req = Requester::test();
         let mut hits = 0;
         for _ in 0..5 {
-            if cascade.fetch(None, Call::Profile("x")).await.hit().is_some() {
+            if cascade.fetch(&req, None, Call::Profile("x")).await.hit().is_some() {
                 hits += 1;
             }
         }

@@ -36,7 +36,7 @@ pub async fn list_notifications(
     }
     respond(
         s.hydrator
-            .list_notifications(&req.viewer, clamp_limit(p.u32("limit")?), p.one("cursor"), &p.all("reasons"))
+            .list_notifications(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor"), &p.all("reasons"))
             .await,
     )
 }

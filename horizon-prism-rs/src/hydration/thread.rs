@@ -16,6 +16,7 @@ use super::normalize::is_private_uri;
 use super::{CountMode, Hydrator, ViewError, ViewResult, Viewer};
 use crate::db::locks::uri_author;
 use crate::moderation::{self, Gate};
+use crate::xrpc::pools::Requester;
 
 /// Total nodes in one thread response (§7.1).
 pub const MAX_NODES: usize = 200;
@@ -88,7 +89,7 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_post_thread(&self, viewer: &Viewer, uri: &str, depth: u32, parent_height: u32) -> ViewResult<Value> {
+    pub async fn get_post_thread(&self, viewer: &Viewer, req: &Requester, uri: &str, depth: u32, parent_height: u32) -> ViewResult<Value> {
         let started = Instant::now();
         if is_private_uri(uri) {
             return Ok(Err(not_found()));
@@ -100,7 +101,7 @@ impl Hydrator {
             let author = uri_author(uri).unwrap_or_default().to_string();
             if !self.in_scope(&author).await
                 && !moderation::gate(self.pool(), uri).await?.is_hidden()
-                && let Some(v) = self.upstream().post_thread(uri, depth, parent_height).await
+                && let Some(v) = self.upstream().post_thread(req, uri, depth, parent_height).await
             {
                 return Ok(Ok(Self::emit(self.normalized(viewer, v).await?.0)));
             }
@@ -147,9 +148,9 @@ impl Hydrator {
             }
         }
 
-        let mut ctx = self.post_context(viewer, &uris, CountMode::List).await?;
+        let mut ctx = self.post_context(viewer, req, &uris, CountMode::List).await?;
         let anchor_counts = self
-            .constellation_counts(std::slice::from_ref(&uri.to_string()), CountMode::Sync { started })
+            .constellation_counts(req, std::slice::from_ref(&uri.to_string()), CountMode::Sync { started })
             .await;
         ctx.counts.extend(anchor_counts);
         if !ctx.listable(uri) {
@@ -200,8 +201,9 @@ mod tests {
         let sibling = post(p, ALICE, "3kaaaaaaaaaa5", "sibling", Some(&mid), Some(&root)).await;
         exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{sibling}', '!hide')")).await;
         let anon = Viewer::anonymous();
+        let req = Requester::test();
 
-        let t = h.get_post_thread(&anon, &mid, 6, 80).await.expect("db").expect("view");
+        let t = h.get_post_thread(&anon, &req,&mid, 6, 80).await.expect("db").expect("view");
         let t = &t.inner()["thread"];
         assert_eq!(t["post"]["uri"], json!(mid));
         assert_eq!(t["parent"]["post"]["uri"], json!(root));
@@ -210,7 +212,7 @@ mod tests {
         assert_eq!(replies[0]["post"]["uri"], json!(leaf));
 
         // parentHeight 0 drops the parent; depth 0 drops replies.
-        let t = h.get_post_thread(&anon, &mid, 0, 0).await.expect("db").expect("view");
+        let t = h.get_post_thread(&anon, &req,&mid, 0, 0).await.expect("db").expect("view");
         assert!(t.inner()["thread"].get("parent").is_none());
         assert_eq!(t.inner()["thread"]["replies"], json!([]));
 
@@ -220,7 +222,7 @@ mod tests {
             format!("at://{ALICE}/app.bsky.feed.post/3kaaaaaaaaaz9"),
             sibling.clone(),
         ] {
-            let e = h.get_post_thread(&anon, &uri, 6, 80).await.expect("db").expect_err("miss");
+            let e = h.get_post_thread(&anon, &req,&uri, 6, 80).await.expect("db").expect_err("miss");
             assert_eq!((e.error, e.message.as_str()), ("NotFound", "Post not found"), "{uri}");
         }
         db.drop_db().await;

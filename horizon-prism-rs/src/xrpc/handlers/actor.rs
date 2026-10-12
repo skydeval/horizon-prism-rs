@@ -23,7 +23,7 @@ pub async fn get_profile(
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, GET_PROFILE, Access::Opt, false).await?;
     let p = Params::parse(q.as_deref());
-    respond(s.hydrator.get_profile(&req.viewer, p.required("actor")?).await)
+    respond(s.hydrator.get_profile(&req.viewer, &req.req, p.required("actor")?).await)
 }
 
 pub async fn get_profiles(
@@ -37,7 +37,7 @@ pub async fn get_profiles(
     if actors.is_empty() || actors.len() > 25 {
         return Err(XrpcError::invalid("Error: actors must have between 1 and 25 items"));
     }
-    respond(s.hydrator.get_profiles(&req.viewer, &actors).await)
+    respond(s.hydrator.get_profiles(&req.viewer, &req.req, &actors).await)
 }
 
 pub async fn search_actors(
@@ -51,7 +51,7 @@ pub async fn search_actors(
     let term = p.one("q").or_else(|| p.one("term")).unwrap_or_default();
     respond(
         s.hydrator
-            .search_actors(&req.viewer, term, clamp_limit(p.u32("limit")?).min(100), p.one("cursor"))
+            .search_actors(&req.viewer, &req.req, term,clamp_limit(p.u32("limit")?).min(100), p.one("cursor"))
             .await,
     )
 }

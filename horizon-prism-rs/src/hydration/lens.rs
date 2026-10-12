@@ -15,6 +15,7 @@ use super::normalize::{NormalizeReport, Overlay, normalize_upstream, subjects};
 use super::{CountMode, Hydrator, PublicEmit};
 use crate::moderation::{self, Gate};
 use crate::threadlens::gaps::Gap;
+use crate::xrpc::pools::Requester;
 
 /// One `lensNode` (§10.2).
 #[derive(Debug, Clone, PartialEq)]
@@ -122,8 +123,8 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn lens_local_posts(&self, uris: &[String]) -> Result<HashMap<String, Value>, sqlx::Error> {
-        let ctx = self.post_context_for(None, uris, CountMode::List).await?;
+    pub async fn lens_local_posts(&self, req: &Requester, uris: &[String]) -> Result<HashMap<String, Value>, sqlx::Error> {
+        let ctx = self.post_context_for(None, req, uris, CountMode::List).await?;
         Ok(uris
             .iter()
             .filter(|u| ctx.gates.get(*u).copied().unwrap_or(Gate::Visible) == Gate::Visible)
@@ -183,14 +184,14 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn lens_replies(&self, uri: &str, limit: u32) -> Result<Vec<String>, sqlx::Error> {
+    pub async fn lens_replies(&self, req: &Requester, uri: &str, limit: u32) -> Result<Vec<String>, sqlx::Error> {
         let mut out: Vec<String> =
             sqlx::query_scalar("SELECT uri FROM posts WHERE reply_parent_uri = $1 ORDER BY created_at, uri LIMIT $2")
                 .bind(uri)
                 .bind(i64::from(limit))
                 .fetch_all(self.pool())
                 .await?;
-        if let Some(page) = self.links_page(uri, super::feed::NSID_POST, ".reply.parent.uri", limit, None).await {
+        if let Some(page) = self.links_page(req, uri, super::feed::NSID_POST, ".reply.parent.uri", limit, None).await {
             for r in page.linking_records {
                 let reply = format!("at://{}/{}/{}", r.did, r.collection, r.rkey);
                 if !out.contains(&reply) {

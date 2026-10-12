@@ -40,6 +40,7 @@ use crate::aggregations::counts::{self, Counts, Freshness};
 use crate::config::{CountsConfig, CountsSource};
 use crate::db::locks::uri_author;
 use crate::microcosm::ConstellationClient;
+use crate::xrpc::pools::Requester;
 
 /// Placeholder handle for DIDs without a verified handle (ATProto convention).
 pub const INVALID_HANDLE: &str = "handle.invalid";
@@ -309,7 +310,7 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn resolve_actor(&self, actor: &str) -> Result<Option<String>, sqlx::Error> {
+    pub async fn resolve_actor(&self, req: &Requester, actor: &str) -> Result<Option<String>, sqlx::Error> {
         let actor = actor.trim().trim_start_matches('@');
         if actor.starts_with("did:") {
             return Ok(proto_blue::syntax::Did::is_valid(actor).then(|| actor.to_string()));
@@ -322,7 +323,7 @@ impl Hydrator {
             return Ok(local);
         }
         // A handle this AppView has not indexed (§6.7).
-        Ok(self.upstream().resolve_handle(actor).await)
+        Ok(self.upstream().resolve_handle(req, actor).await)
     }
 
     /// Whether a DID is an in-scope subject (§7.1).
@@ -526,7 +527,7 @@ impl Hydrator {
 
     /// Constellation counts for targets under the §9.6 rule. Targets with no
     /// usable value are absent (the caller uses local counts).
-    pub async fn constellation_counts(&self, targets: &[String], mode: CountMode) -> HashMap<String, Counts> {
+    pub async fn constellation_counts(&self, _req: &Requester, targets: &[String], mode: CountMode) -> HashMap<String, Counts> {
         let mut out = HashMap::new();
         let Some(client) = self.constellation() else {
             return out;

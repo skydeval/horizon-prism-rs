@@ -28,6 +28,7 @@ use crate::kryphocron_glue::jwt::tests::{AUDIENCE_HOST, StubFetcher, mint, signi
 use crate::microcosm::SlingshotClient;
 use crate::net::NetClient;
 use crate::test_support::{fresh_db, serve_fake};
+use crate::xrpc::pools::Requester;
 use crate::xrpc::{AppState, RateLimits};
 
 const AUTHOR: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -105,10 +106,11 @@ async fn tier_hidden_is_emitted_without_any_lookup() {
     let base = fake_upstream(Arc::clone(&calls), None).await;
     let lookup = Arc::new(StubLookup::default());
     let l = ladder(&pool, &base, Arc::clone(&lookup));
+    let req = Requester::test();
     for mode in [Mode::Full, Mode::BlockedStub] {
-        assert_eq!(l.resolve(PRIVATE, mode).await.expect("no database call"), Resolved::Gap(Gap::TierHidden));
+        assert_eq!(l.resolve(&req, PRIVATE, mode).await.expect("no database call"), Resolved::Gap(Gap::TierHidden));
     }
-    let nodes = thread::get_thread(&l, PRIVATE, 6, 30).await.expect("no database call");
+    let nodes = thread::get_thread(&l, &req, PRIVATE, 6, 30).await.expect("no database call");
     assert_eq!(nodes.len(), 1);
     assert!(matches!(&nodes[0], crate::hydration::lens::LensNode::Gap { gap: Gap::TierHidden, .. }));
     assert_eq!(calls.appview.load(Ordering::SeqCst), 0, "no AppView call");
@@ -255,7 +257,7 @@ async fn upstream_structure_stubs_become_typed_gaps() {
     let calls = Arc::new(Calls::default());
     let base = fake_upstream(Arc::clone(&calls), Some(structure)).await;
     let l = ladder(p, &base, Arc::new(StubLookup::default()));
-    let nodes = thread::get_thread(&l, &uri("3kanchor"), 6, 30).await.expect("thread");
+    let nodes = thread::get_thread(&l, &Requester::test(), &uri("3kanchor"), 6, 30).await.expect("thread");
     let summary: Vec<(String, Option<&'static str>)> = nodes
         .iter()
         .map(|n| match n {

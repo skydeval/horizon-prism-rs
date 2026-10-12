@@ -19,6 +19,7 @@ use crate::hydration::hint::{RoutingHint, routing_hint};
 use crate::xrpc::AppState;
 use crate::xrpc::auth::{Params, request_ip};
 use crate::xrpc::errors::XrpcError;
+use crate::xrpc::pools::Requester;
 use crate::xrpc::rate_limit::Family;
 
 pub const RESOLVE_DID: &str = "app.nearhorizon.constellation.resolveDid";
@@ -45,13 +46,15 @@ pub async fn resolve_did(
     headers: HeaderMap,
     RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
-    s.app.limits.charge(RESOLVE_DID, Family::Resolve, None, request_ip(&s.app, &headers, peer))?;
+    let ip = request_ip(&s.app, &headers, peer);
+    s.app.limits.charge(RESOLVE_DID, Family::Resolve, None, ip)?;
+    let req = Requester::of(None, ip);
     let params = Params::parse(q.as_deref());
     let did = params.required("did")?;
     if !proto_blue::syntax::Did::is_valid(did) {
         return Err(XrpcError::invalid("Error: did must be a valid did"));
     }
-    let summary = s.router.lookup().summary(did).await.unwrap_or_default();
+    let summary = s.router.lookup().summary(&req, did).await.unwrap_or_default();
     let decision = summary
         .pds
         .as_deref()

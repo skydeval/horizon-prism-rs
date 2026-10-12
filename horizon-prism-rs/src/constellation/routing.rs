@@ -21,6 +21,7 @@ use moka::future::Cache;
 use super::matcher::{first_match, pds_host};
 use crate::config::{COMMUNITY_NETWORK, ConstellationConfig, LOCAL_APPVIEW, NetworkAuth};
 use crate::identity::{IdentityResolver, ResolveIntent};
+use crate::xrpc::pools::Requester;
 
 /// `route` cache capacity and TTL (§7.6).
 pub const ROUTE_CACHE_CAPACITY: u64 = 200_000;
@@ -173,17 +174,17 @@ pub struct DidSummary {
 #[async_trait]
 pub trait DidLookup: Send + Sync {
     /// `None` when the DID does not resolve.
-    async fn summary(&self, did: &str) -> Option<DidSummary>;
+    async fn summary(&self, req: &Requester, did: &str) -> Option<DidSummary>;
 
     /// A handle's DID, verified bidirectionally; `None` by default.
-    async fn did_for_handle(&self, _handle: &str) -> Option<String> {
+    async fn did_for_handle(&self, _req: &Requester, _handle: &str) -> Option<String> {
         None
     }
 }
 
 #[async_trait]
 impl DidLookup for IdentityResolver {
-    async fn summary(&self, did: &str) -> Option<DidSummary> {
+    async fn summary(&self, _req: &Requester, did: &str) -> Option<DidSummary> {
         let info = self.resolve_info(did, ResolveIntent::Lookup).await.ok()?;
         let handle = self.verify_handle(did, info.claimed_handle.as_deref()).await;
         Some(DidSummary {
@@ -192,7 +193,7 @@ impl DidLookup for IdentityResolver {
         })
     }
 
-    async fn did_for_handle(&self, handle: &str) -> Option<String> {
+    async fn did_for_handle(&self, _req: &Requester, handle: &str) -> Option<String> {
         self.resolve_handle(handle).await
     }
 }
@@ -229,11 +230,11 @@ impl Router {
     }
 
     /// The home network of `did` (§8.3 steps 2–3).
-    pub async fn resolve_did(&self, did: &str) -> RoutingDecision {
+    pub async fn resolve_did(&self, req: &Requester, did: &str) -> RoutingDecision {
         if let Some(d) = self.cache.get(did).await {
             return d;
         }
-        let Some(pds) = self.lookup.summary(did).await.and_then(|s| s.pds) else {
+        let Some(pds) = self.lookup.summary(req, did).await.and_then(|s| s.pds) else {
             return RoutingDecision::unknown();
         };
         let decision = self.table.decide(&pds);
@@ -260,7 +261,7 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl DidLookup for StubLookup {
-        async fn summary(&self, did: &str) -> Option<DidSummary> {
+        async fn summary(&self, _req: &Requester, did: &str) -> Option<DidSummary> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let pds = self.pds.lock().expect("lock").get(did).cloned()?;
             Some(DidSummary {
@@ -331,13 +332,14 @@ pub(crate) mod tests {
             .expect("lock")
             .insert("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(), "https://pds.community-a.example".into());
         let router = Router::new(Arc::new(table_with_community(&[])), Arc::clone(&lookup) as Arc<dyn DidLookup>);
+        let req = Requester::test();
         for _ in 0..3 {
-            let d = router.resolve_did("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").await;
+            let d = router.resolve_did(&req, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").await;
             assert_eq!(d.network_name.as_deref(), Some("community-a"));
         }
         assert_eq!(lookup.calls.load(Ordering::SeqCst), 1, "cached after the first lookup");
         for _ in 0..2 {
-            assert_eq!(router.resolve_did("did:plc:uuuuuuuuuuuuuuuuuuuuuuuu").await, RoutingDecision::unknown());
+            assert_eq!(router.resolve_did(&req, "did:plc:uuuuuuuuuuuuuuuuuuuuuuuu").await, RoutingDecision::unknown());
         }
         assert_eq!(lookup.calls.load(Ordering::SeqCst), 3, "unresolved DIDs are not cached");
     }

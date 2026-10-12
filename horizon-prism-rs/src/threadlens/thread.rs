@@ -29,6 +29,7 @@ use crate::constellation::Call;
 use crate::db::locks::uri_author;
 use crate::hydration::lens::LensNode;
 use crate::hydration::normalize::{NormalizeReport, is_private_uri};
+use crate::xrpc::pools::Requester;
 
 /// Nodes per response (anchor, parents and replies).
 pub const NODE_CAP: usize = 200;
@@ -55,6 +56,7 @@ fn node_from(resolved: Resolved, uri: &str, parent_uri: Option<String>) -> LensN
 /// One structure node (already normalized) to a lens node.
 async fn structure_node(
     ladder: &Ladder,
+    req: &Requester,
     v: &Value,
     parent_uri: Option<String>,
     report: &NormalizeReport,
@@ -78,7 +80,7 @@ async fn structure_node(
         return Ok(None);
     };
     if ty == "app.bsky.feed.defs#blockedPost" || v.get("blocked").is_some() {
-        let node = match ladder.resolve(&uri, Mode::BlockedStub).await? {
+        let node = match ladder.resolve(req, &uri, Mode::BlockedStub).await? {
             Resolved::Post(post) => LensNode::post(post),
             Resolved::Gap(gap @ (Gap::TierHidden | Gap::Deleted | Gap::ContentStripped)) => LensNode::Gap { uri, parent_uri, gap },
             Resolved::Gap(_) => LensNode::Gap {
@@ -90,7 +92,7 @@ async fn structure_node(
         return Ok(Some(node));
     }
     // `#notFoundPost` and anything else with a URI: the full ladder.
-    let resolved = ladder.resolve(&uri, Mode::Full).await?;
+    let resolved = ladder.resolve(req, &uri, Mode::Full).await?;
     Ok(Some(node_from(resolved, &uri, parent_uri)))
 }
 
@@ -99,7 +101,7 @@ async fn structure_node(
 /// # Errors
 ///
 /// Database errors.
-pub async fn get_thread(ladder: &Ladder, anchor: &str, depth: u32, parent_height: u32) -> Result<Vec<LensNode>, sqlx::Error> {
+pub async fn get_thread(ladder: &Ladder, req: &Requester, anchor: &str, depth: u32, parent_height: u32) -> Result<Vec<LensNode>, sqlx::Error> {
     if is_private_uri(anchor) {
         return Ok(vec![LensNode::Gap {
             uri: anchor.to_string(),
@@ -112,11 +114,11 @@ pub async fn get_thread(ladder: &Ladder, anchor: &str, depth: u32, parent_height
     if ladder.hydrator().lens_visible(anchor).await?
         && let Some(author) = uri_author(anchor)
     {
-        let home = ladder.router().resolve_did(author).await;
+        let home = ladder.router().resolve_did(req, author).await;
         if !home.is_community()
             && let Some(body) = ladder
                 .cascade()
-                .fetch(home.network_name.as_deref(), Call::PostThread { uri: anchor, depth, parent_height })
+                .fetch(req, home.network_name.as_deref(), Call::PostThread { uri: anchor, depth, parent_height })
                 .await
                 .hit()
             && let Some(thread) = body.get("thread").filter(|t| t.is_object()).cloned()
@@ -133,12 +135,12 @@ pub async fn get_thread(ladder: &Ladder, anchor: &str, depth: u32, parent_height
             chain.reverse();
             let mut above: Option<String> = None;
             for p in &chain {
-                if let Some(n) = structure_node(ladder, p, above.clone(), &report).await? {
+                if let Some(n) = structure_node(ladder, req, p, above.clone(), &report).await? {
                     above = Some(n.uri().to_string());
                     nodes.push(n);
                 }
             }
-            if let Some(n) = structure_node(ladder, &thread, above, &report).await? {
+            if let Some(n) = structure_node(ladder, req, &thread, above, &report).await? {
                 nodes.push(n);
             }
             // Upstream replies, breadth-first.
@@ -155,7 +157,7 @@ pub async fn get_thread(ladder: &Ladder, anchor: &str, depth: u32, parent_height
                     if nodes.len() >= NODE_CAP {
                         break;
                     }
-                    if let Some(n) = structure_node(ladder, &r, Some(parent), &report).await? {
+                    if let Some(n) = structure_node(ladder, req, &r, Some(parent), &report).await? {
                         let uri = n.uri().to_string();
                         for child in r.get("replies").and_then(Value::as_array).into_iter().flatten() {
                             next.push((child.clone(), uri.clone()));
@@ -169,7 +171,7 @@ pub async fn get_thread(ladder: &Ladder, anchor: &str, depth: u32, parent_height
     }
     if !structured {
         // The anchor and its parent chain through the ladder.
-        let anchor_node = node_from(ladder.resolve(anchor, Mode::Full).await?, anchor, None);
+        let anchor_node = node_from(ladder.resolve(req, anchor, Mode::Full).await?, anchor, None);
         let mut chain: Vec<LensNode> = Vec::new();
         let mut next = match &anchor_node {
             LensNode::Post { parent_uri, .. } => parent_uri.clone(),
@@ -179,7 +181,7 @@ pub async fn get_thread(ladder: &Ladder, anchor: &str, depth: u32, parent_height
             if chain.len() >= usize::try_from(parent_height).unwrap_or(0) {
                 break;
             }
-            let node = node_from(ladder.resolve(&p, Mode::Full).await?, &p, None);
+            let node = node_from(ladder.resolve(req, &p, Mode::Full).await?, &p, None);
             next = match &node {
                 LensNode::Post { parent_uri, .. } => parent_uri.clone(),
                 LensNode::Gap { .. } => None,
@@ -190,14 +192,14 @@ pub async fn get_thread(ladder: &Ladder, anchor: &str, depth: u32, parent_height
         nodes.extend(chain);
         nodes.push(anchor_node);
     }
-    append_replies(ladder, anchor, depth, &mut nodes).await?;
+    append_replies(ladder, req, anchor, depth, &mut nodes).await?;
     nodes.truncate(NODE_CAP);
     Ok(nodes)
 }
 
 /// Local and Constellation replies absent from `nodes`, breadth-first from
 /// the anchor to `depth`, each through the ladder, within the cap.
-async fn append_replies(ladder: &Ladder, anchor: &str, depth: u32, nodes: &mut Vec<LensNode>) -> Result<(), sqlx::Error> {
+async fn append_replies(ladder: &Ladder, req: &Requester, anchor: &str, depth: u32, nodes: &mut Vec<LensNode>) -> Result<(), sqlx::Error> {
     let mut seen: HashSet<String> = nodes.iter().map(|n| n.uri().to_string()).collect();
     let anchor_is_post = nodes.iter().any(|n| matches!(n, LensNode::Post { uri, .. } if uri == anchor));
     let mut level: Vec<String> = if anchor_is_post { vec![anchor.to_string()] } else { Vec::new() };
@@ -214,7 +216,7 @@ async fn append_replies(ladder: &Ladder, anchor: &str, depth: u32, nodes: &mut V
             }));
             let fresh: Vec<String> = ladder
                 .hydrator()
-                .lens_replies(parent, REPLIES_PER_NODE)
+                .lens_replies(req, parent, REPLIES_PER_NODE)
                 .await?
                 .into_iter()
                 .filter(|u| seen.insert(u.clone()))
@@ -222,7 +224,7 @@ async fn append_replies(ladder: &Ladder, anchor: &str, depth: u32, nodes: &mut V
                 .collect();
             let resolved: Vec<(String, Result<Resolved, sqlx::Error>)> = futures::stream::iter(fresh)
                 .map(|u| async move {
-                    let r = ladder.resolve(&u, Mode::Full).await;
+                    let r = ladder.resolve(req, &u, Mode::Full).await;
                     (u, r)
                 })
                 .buffered(LADDER_CONCURRENCY)

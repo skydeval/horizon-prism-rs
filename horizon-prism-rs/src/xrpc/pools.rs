@@ -351,6 +351,80 @@ impl SharedBucket {
     }
 }
 
+/// The time one XRPC request may spend on synchronous upstream work
+/// (§II-8.3 "Limits"): every cascade of the request shares it.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(6);
+
+/// The request-scoped handle: who is charged for the request's upstream
+/// calls, the deadline they share, and whether any of them found its share
+/// or pool empty. A handler creates one and passes it down; a path that is
+/// given none (a background job, the CLI) cannot draw on a request bucket.
+/// Cheap to clone; clones share the exhaustion record.
+#[derive(Debug, Clone)]
+pub struct Requester {
+    key: ChargeKey,
+    deadline: Instant,
+    exhausted: Arc<Mutex<Option<Exhausted>>>,
+}
+
+impl Requester {
+    /// A request starting now.
+    #[must_use]
+    pub fn new(key: ChargeKey) -> Self {
+        Self {
+            key,
+            deadline: Instant::now() + REQUEST_DEADLINE,
+            exhausted: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A ready member's request when `member` is given, else `ip`'s.
+    #[must_use]
+    pub fn of(member: Option<&str>, ip: IpAddr) -> Self {
+        Self::new(member.map_or_else(|| ChargeKey::ip(ip), ChargeKey::member))
+    }
+
+    /// A request from a fixed test address.
+    #[cfg(test)]
+    #[must_use]
+    pub fn test() -> Self {
+        Self::of(None, IpAddr::from([192, 0, 2, 1]))
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &ChargeKey {
+        &self.key
+    }
+
+    /// When the request's synchronous upstream work must end.
+    #[must_use]
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Take one token of `bucket` for this request. `false` is "no answer"
+    /// (§II-8.3 "Exhaustion"), and the request remembers it.
+    #[must_use]
+    pub fn draw(&self, bucket: &SharedBucket) -> bool {
+        match bucket.draw(&self.key) {
+            Ok(_) => true,
+            Err(e) => {
+                let mut seen = self.exhausted.lock().unwrap_or_else(PoisonError::into_inner);
+                if seen.is_none_or(|s| s.retry_after < e.retry_after) {
+                    *seen = Some(e);
+                }
+                false
+            }
+        }
+    }
+
+    /// The longest wait among the draws of this request that found nothing.
+    #[must_use]
+    pub fn exhausted(&self) -> Option<Exhausted> {
+        *self.exhausted.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Every problem in the pool and shared-bucket settings (design-v3 §13).
 pub fn problems(cfg: &FileConfig, out: &mut Vec<String>) {
     let c = &cfg.constellation;

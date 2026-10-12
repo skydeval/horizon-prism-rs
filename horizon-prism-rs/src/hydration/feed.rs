@@ -14,6 +14,7 @@ use crate::aggregations::counts::Counts;
 use crate::db::locks::uri_author;
 use crate::firehose::normalize::blob_cid;
 use crate::moderation::{self, Gate};
+use crate::xrpc::pools::Requester;
 
 pub const NSID_LIKE: &str = "app.bsky.feed.like";
 pub const NSID_REPOST: &str = "app.bsky.feed.repost";
@@ -300,8 +301,8 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn post_context(&self, viewer: &Viewer, uris: &[String], mode: CountMode) -> Result<PostContext, sqlx::Error> {
-        self.post_context_for(Some(viewer), uris, mode).await
+    pub async fn post_context(&self, viewer: &Viewer, req: &Requester, uris: &[String], mode: CountMode) -> Result<PostContext, sqlx::Error> {
+        self.post_context_for(Some(viewer), req, uris, mode).await
     }
 
     /// [`Hydrator::post_context`]; with `viewer = None` no viewer state is
@@ -314,6 +315,7 @@ impl Hydrator {
     pub(crate) async fn post_context_for(
         &self,
         viewer: Option<&Viewer>,
+        req: &Requester,
         uris: &[String],
         mode: CountMode,
     ) -> Result<PostContext, sqlx::Error> {
@@ -344,11 +346,11 @@ impl Hydrator {
             }
         }
         let (profiles, viewers) = match viewer {
-            Some(v) => (self.profile_context(v, &authors, None).await?, self.post_viewer(v, &all_uris).await?),
+            Some(v) => (self.profile_context(v, req, &authors, None).await?, self.post_viewer(v, &all_uris).await?),
             None => (self.anonymous_profile_context(&authors).await?, HashMap::new()),
         };
         let labels = self.load_labels(&all_uris).await?;
-        let counts = self.constellation_counts(&uris, mode).await;
+        let counts = self.constellation_counts(req, &uris, mode).await;
         let gates = moderation::gate_many(self.pool(), &all_uris).await?;
         Ok(PostContext {
             posts,
@@ -366,12 +368,12 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn public_post_view(&self, viewer: &Viewer, uri: &str) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
+    pub async fn public_post_view(&self, viewer: &Viewer, req: &Requester, uri: &str) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
         if is_private_uri(uri) {
             return Ok(None);
         }
         let wanted = [uri.to_string()];
-        let ctx = self.post_context(viewer, &wanted, CountMode::List).await?;
+        let ctx = self.post_context(viewer, req, &wanted, CountMode::List).await?;
         Ok(ctx.post_view(uri).map(PublicEmit::new))
     }
 
@@ -381,7 +383,7 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_posts(&self, viewer: &Viewer, uris: &[String]) -> ViewResult<Value> {
+    pub async fn get_posts(&self, viewer: &Viewer, req: &Requester, uris: &[String]) -> ViewResult<Value> {
         let started = Instant::now();
         let mut wanted: Vec<String> = Vec::new();
         for u in uris.iter().take(25) {
@@ -389,7 +391,7 @@ impl Hydrator {
                 wanted.push(u.clone());
             }
         }
-        let ctx = self.post_context(viewer, &wanted, CountMode::Sync { started }).await?;
+        let ctx = self.post_context(viewer, req, &wanted, CountMode::Sync { started }).await?;
         let mut posts: Vec<Value> = wanted.iter().filter_map(|u| ctx.post_view(u)).collect();
         let missing: Vec<String> = wanted.iter().filter(|u| !ctx.posts.contains_key(*u)).cloned().collect();
         if !missing.is_empty() {
@@ -399,7 +401,7 @@ impl Hydrator {
                 .into_iter()
                 .filter(|u| !gates.get(u).copied().unwrap_or(Gate::Visible).is_hidden())
                 .collect();
-            let upstream = Value::Array(self.upstream().posts(&allowed).await);
+            let upstream = Value::Array(self.upstream().posts(req, &allowed).await);
             if let Value::Array(views) = self.normalized(viewer, upstream).await?.0 {
                 posts.extend(views);
             }
@@ -413,11 +415,11 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn feed_views(&self, viewer: &Viewer, items: &[FeedItem]) -> Result<Vec<Value>, sqlx::Error> {
+    pub async fn feed_views(&self, viewer: &Viewer, req: &Requester, items: &[FeedItem]) -> Result<Vec<Value>, sqlx::Error> {
         let uris: Vec<String> = items.iter().map(|i| i.post_uri.clone()).collect();
-        let ctx = self.post_context(viewer, &uris, CountMode::List).await?;
+        let ctx = self.post_context(viewer, req, &uris, CountMode::List).await?;
         let originators: Vec<String> = items.iter().map(|i| i.originator_did.clone()).collect();
-        let reposters = self.profile_context(viewer, &originators, None).await?;
+        let reposters = self.profile_context(viewer, req, &originators, None).await?;
         let originator_gates = moderation::gate_many(self.pool(), &originators).await?;
         let mut out = Vec::new();
         for item in items {
@@ -453,16 +455,18 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_author_feed(
         &self,
         viewer: &Viewer,
+        req: &Requester,
         actor: &str,
         limit: u32,
         cursor: Option<&str>,
         filter: &str,
         include_pins: bool,
     ) -> ViewResult<Value> {
-        let Some(did) = self.resolve_actor(actor).await? else {
+        let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(ViewError::new("InvalidRequest", "Profile not found")));
         };
         if let Some((error, message)) = moderation::gate(self.pool(), &did).await?.profile_error() {
@@ -478,7 +482,7 @@ impl Hydrator {
         if !self.in_scope(&did).await {
             // Out-of-scope subject: the cascade (item 7).
             return Ok(
-                match self.upstream().author_feed(&did, limit, cursor, filter).await {
+                match self.upstream().author_feed(req, &did, limit, cursor, filter).await {
                     Some(v) => Ok(Self::emit(self.normalized(viewer, v).await?.0)),
                     None => Err(ViewError::new("InvalidRequest", "Profile not found")),
                 },
@@ -519,7 +523,7 @@ impl Hydrator {
         .bind(threads)
         .fetch_all(self.pool())
         .await?;
-        let mut feed = self.feed_views(viewer, &items).await?;
+        let mut feed = self.feed_views(viewer, req, &items).await?;
         if include_pins && cursor.is_none() {
             let pinned: Option<String> = sqlx::query_scalar("SELECT profile_record #>> '{pinnedPost,uri}' FROM actors WHERE did = $1")
                 .bind(&did)
@@ -527,7 +531,7 @@ impl Hydrator {
                 .await?
                 .flatten();
             if let Some(uri) = pinned.filter(|u| uri_author(u) == Some(did.as_str())) {
-                let ctx = self.post_context(viewer, std::slice::from_ref(&uri), CountMode::List).await?;
+                let ctx = self.post_context(viewer, req, std::slice::from_ref(&uri), CountMode::List).await?;
                 if let Some(post) = ctx.post_view(&uri) {
                     feed.retain(|f| f["post"]["uri"] != json!(uri));
                     feed.insert(0, json!({"post": post, "reason": {"$type": "app.bsky.feed.defs#reasonPin"}}));
@@ -550,7 +554,7 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_timeline(&self, viewer: &Viewer, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+    pub async fn get_timeline(&self, viewer: &Viewer, req: &Requester, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
         let Some(me) = viewer.state_did() else {
             return Ok(Err(ViewError::new("NotReady", "Account indexing in progress")));
         };
@@ -577,7 +581,7 @@ impl Hydrator {
         .bind(i64::from(limit))
         .fetch_all(self.pool())
         .await?;
-        let feed = self.feed_views(viewer, &items).await?;
+        let feed = self.feed_views(viewer, req, &items).await?;
         let mut out = json!({ "feed": feed });
         if items.len() == usize::try_from(limit).unwrap_or(usize::MAX)
             && let Some(last) = items.last()
@@ -590,6 +594,7 @@ impl Hydrator {
     /// A Constellation `/links` page through the read-time cache.
     pub(super) async fn links_page(
         &self,
+        _req: &Requester,
         target: &str,
         collection: &str,
         path: &str,
@@ -618,6 +623,7 @@ impl Hydrator {
     /// `(did, record uri, createdAt)`.
     async fn interaction_actors(
         &self,
+        req: &Requester,
         uri: &str,
         collection: &str,
         limit: u32,
@@ -625,7 +631,7 @@ impl Hydrator {
     ) -> Result<(Vec<(String, DateTime<Utc>)>, Option<String>), sqlx::Error> {
         let remote_cursor = cursor.and_then(|c| c.strip_prefix("C:"));
         if !cursor.is_some_and(|c| c.starts_with("L:"))
-            && let Some(page) = self.links_page(uri, collection, ".subject.uri", limit, remote_cursor).await
+            && let Some(page) = self.links_page(req, uri, collection, ".subject.uri", limit, remote_cursor).await
         {
             let mut seen = HashSet::new();
             let actors = page
@@ -655,10 +661,10 @@ impl Hydrator {
         Ok((rows.into_iter().map(|(d, _, t)| (d, t)).collect(), next))
     }
 
-    async fn visible_actors(&self, viewer: &Viewer, actors: Vec<(String, DateTime<Utc>)>) -> Result<(Vec<(String, DateTime<Utc>)>, ProfileContext), sqlx::Error> {
+    async fn visible_actors(&self, viewer: &Viewer, req: &Requester, actors: Vec<(String, DateTime<Utc>)>) -> Result<(Vec<(String, DateTime<Utc>)>, ProfileContext), sqlx::Error> {
         let dids: Vec<String> = actors.iter().map(|(d, _)| d.clone()).collect();
         let gates = moderation::gate_many(self.pool(), &dids).await?;
-        let ctx = self.profile_context(viewer, &dids, None).await?;
+        let ctx = self.profile_context(viewer, req, &dids, None).await?;
         let kept = actors
             .into_iter()
             .filter(|(d, _)| {
@@ -673,12 +679,12 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_likes(&self, viewer: &Viewer, uri: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+    pub async fn get_likes(&self, viewer: &Viewer, req: &Requester, uri: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
         if is_private_uri(uri) || moderation::gate(self.pool(), uri).await?.is_hidden() {
             return Ok(Ok(Self::emit(json!({ "uri": uri, "likes": [] }))));
         }
-        let (actors, next) = self.interaction_actors(uri, NSID_LIKE, limit, cursor).await?;
-        let (actors, ctx) = self.visible_actors(viewer, actors).await?;
+        let (actors, next) = self.interaction_actors(req, uri, NSID_LIKE, limit, cursor).await?;
+        let (actors, ctx) = self.visible_actors(viewer, req, actors).await?;
         let likes: Vec<Value> = actors
             .iter()
             .map(|(d, t)| json!({"indexedAt": ts(*t), "createdAt": ts(*t), "actor": ctx.view(d, ProfileKind::View)}))
@@ -695,12 +701,12 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_reposted_by(&self, viewer: &Viewer, uri: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+    pub async fn get_reposted_by(&self, viewer: &Viewer, req: &Requester, uri: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
         if is_private_uri(uri) || moderation::gate(self.pool(), uri).await?.is_hidden() {
             return Ok(Ok(Self::emit(json!({ "uri": uri, "repostedBy": [] }))));
         }
-        let (actors, next) = self.interaction_actors(uri, NSID_REPOST, limit, cursor).await?;
-        let (actors, ctx) = self.visible_actors(viewer, actors).await?;
+        let (actors, next) = self.interaction_actors(req, uri, NSID_REPOST, limit, cursor).await?;
+        let (actors, ctx) = self.visible_actors(viewer, req, actors).await?;
         let reposted: Vec<Value> = actors.iter().map(|(d, _)| ctx.view(d, ProfileKind::View)).collect();
         let mut out = json!({ "uri": uri, "repostedBy": reposted });
         if let Some(c) = next {
@@ -716,7 +722,7 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_quotes(&self, viewer: &Viewer, uri: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+    pub async fn get_quotes(&self, viewer: &Viewer, req: &Requester, uri: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
         if is_private_uri(uri) || moderation::gate(self.pool(), uri).await?.is_hidden() {
             return Ok(Ok(Self::emit(json!({ "uri": uri, "posts": [] }))));
         }
@@ -730,12 +736,12 @@ impl Hydrator {
             None
         } else {
             let a = if cursor.is_none() || c1.is_some() {
-                self.links_page(uri, NSID_POST, ".embed.record.uri", limit, c1).await
+                self.links_page(req, uri, NSID_POST, ".embed.record.uri", limit, c1).await
             } else {
                 None
             };
             let b = if cursor.is_none() || c2.is_some() {
-                self.links_page(uri, NSID_POST, ".embed.record.record.uri", limit, c2).await
+                self.links_page(req, uri, NSID_POST, ".embed.record.record.uri", limit, c2).await
             } else {
                 None
             };
@@ -775,7 +781,7 @@ impl Hydrator {
             }
             uris = rows.into_iter().map(|(u, _)| u).collect();
         }
-        let ctx = self.post_context(viewer, &uris, CountMode::List).await?;
+        let ctx = self.post_context(viewer, req, &uris, CountMode::List).await?;
         let posts: Vec<Value> = uris
             .iter()
             .filter(|u| ctx.gates.get(*u).copied().unwrap_or(Gate::Visible).listable())
@@ -884,8 +890,9 @@ mod tests {
         .await;
         let h = hydrator(p, sets());
         let anon = Viewer::anonymous();
+        let req = Requester::test();
 
-        let v = h.get_posts(&anon, &[with_gallery.clone(), quote_gallery.clone()]).await.expect("db").expect("view");
+        let v = h.get_posts(&anon, &req,&[with_gallery.clone(), quote_gallery.clone()]).await.expect("db").expect("view");
         let posts = v.inner()["posts"].as_array().expect("posts");
         let view = &posts[0]["embed"];
         assert_eq!(view["$type"], "app.bsky.embed.gallery#view");
@@ -906,8 +913,9 @@ mod tests {
         let uris = |filter: &'static str| {
             let h = &h;
             let anon = &anon;
+            let req = &req;
             async move {
-                let feed = h.get_author_feed(anon, BOB, 50, None, filter, false).await.expect("db").expect("view");
+                let feed = h.get_author_feed(anon, req, BOB, 50, None, filter, false).await.expect("db").expect("view");
                 let mut uris: Vec<String> = feed.inner()["feed"]
                     .as_array()
                     .expect("feed")
@@ -944,13 +952,14 @@ mod tests {
         exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{BOB}', 'nudity')")).await;
         let h = hydrator(p, sets());
         let anon = Viewer::anonymous();
+        let req = Requester::test();
         let label_vals = |v: &Value| -> Vec<String> {
             v["labels"].as_array().into_iter().flatten().filter_map(|l| l["val"].as_str().map(str::to_string)).collect()
         };
 
         // Direct fetch: !takedown is not found; !hide is returned with its
         // label; informational labels ride along on post and author.
-        let v = h.get_posts(&anon, &[taken.clone(), hidden.clone(), nsfw.clone()]).await.expect("db").expect("view");
+        let v = h.get_posts(&anon, &req,&[taken.clone(), hidden.clone(), nsfw.clone()]).await.expect("db").expect("view");
         let posts = v.inner()["posts"].as_array().expect("posts");
         let uris: Vec<&str> = posts.iter().filter_map(|x| x["uri"].as_str()).collect();
         assert_eq!(uris, [hidden.as_str(), nsfw.as_str()], "!takedown is omitted even from a direct fetch");
@@ -962,25 +971,25 @@ mod tests {
         assert!(l["cts"].is_string());
 
         // Lists: both !takedown and !hide are omitted; informational stays.
-        let feed = h.get_author_feed(&anon, BOB, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
+        let feed = h.get_author_feed(&anon, &req,BOB, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
         let listed: Vec<&str> = feed.inner()["feed"].as_array().expect("feed").iter().filter_map(|i| i["post"]["uri"].as_str()).collect();
         assert_eq!(listed, [nsfw.as_str()]);
         assert_eq!(label_vals(&feed.inner()["feed"][0]["post"]), ["porn"]);
 
         // Profiles and threads carry labels too.
-        let profile = h.get_profile(&anon, BOB).await.expect("db").expect("view");
+        let profile = h.get_profile(&anon, &req, BOB).await.expect("db").expect("view");
         assert_eq!(label_vals(profile.inner()), ["nudity"]);
-        let thread = h.get_post_thread(&anon, &nsfw, 6, 20).await.expect("db").expect("view");
+        let thread = h.get_post_thread(&anon, &req,&nsfw, 6, 20).await.expect("db").expect("view");
         assert_eq!(label_vals(&thread.inner()["thread"]["post"]), ["porn"]);
         assert_eq!(label_vals(&thread.inner()["thread"]["replies"][0]["post"]), ["graphic-media"]);
-        let e = h.get_post_thread(&anon, &taken, 6, 20).await.expect("db").expect_err("taken down");
+        let e = h.get_post_thread(&anon, &req,&taken, 6, 20).await.expect("db").expect_err("taken down");
         assert_eq!(e.error, "NotFound");
 
         // A takedown on the author hides the profile and every post.
         exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{BOB}', '!takedown')")).await;
-        let e = h.get_profile(&anon, BOB).await.expect("db").expect_err("taken down");
+        let e = h.get_profile(&anon, &req, BOB).await.expect("db").expect_err("taken down");
         assert_eq!(e.error, "AccountTakedown");
-        let v = h.get_posts(&anon, std::slice::from_ref(&nsfw)).await.expect("db").expect("view");
+        let v = h.get_posts(&anon, &req,std::slice::from_ref(&nsfw)).await.expect("db").expect("view");
         assert_eq!(v.inner()["posts"], json!([]));
         db.drop_db().await;
     }
@@ -1001,9 +1010,10 @@ mod tests {
         let private = format!("at://{BOB}/tools.kryphocron.feed.postPrivate/3kaaaaaaaaaa5");
         let h = hydrator(p, sets());
         let anon = Viewer::anonymous();
+        let req = Requester::test();
 
         // getPosts: private omitted; !hide returned with its label.
-        let v = h.get_posts(&anon, &[root.clone(), private, hidden.clone()]).await.expect("db").expect("view");
+        let v = h.get_posts(&anon, &req,&[root.clone(), private, hidden.clone()]).await.expect("db").expect("view");
         let posts = v.inner()["posts"].as_array().expect("posts");
         assert_eq!(posts.len(), 2);
         assert_eq!(posts[1]["labels"][0]["val"], "!hide");
@@ -1011,26 +1021,26 @@ mod tests {
         assert_eq!(posts[0]["$type"], "app.bsky.feed.defs#postView");
 
         // Author feed: the !hide post is omitted from lists.
-        let feed = h.get_author_feed(&anon, "bob.test", 50, None, "posts_with_replies", false).await.expect("db").expect("view");
+        let feed = h.get_author_feed(&anon, &req,"bob.test", 50, None, "posts_with_replies", false).await.expect("db").expect("view");
         assert_eq!(feed.inner()["feed"].as_array().map(Vec::len), Some(1));
 
         // Alice's reply carries its reply context.
-        let feed = h.get_author_feed(&anon, ALICE, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
+        let feed = h.get_author_feed(&anon, &req,ALICE, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
         assert_eq!(feed.inner()["feed"][0]["reply"]["parent"]["uri"], json!(root));
-        let no_replies = h.get_author_feed(&anon, ALICE, 50, None, "posts_no_replies", false).await.expect("db").expect("view");
+        let no_replies = h.get_author_feed(&anon, &req,ALICE, 50, None, "posts_no_replies", false).await.expect("db").expect("view");
         assert_eq!(no_replies.inner()["feed"].as_array().map(Vec::len), Some(0));
 
         // Timeline for Alice (ready): her reply; Bob's root once she follows him.
         let me = h.viewer(Some(ALICE)).await.expect("viewer");
-        let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let tl = h.get_timeline(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(tl.inner()["feed"].as_array().map(Vec::len), Some(1));
         exec(p, "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
                  ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.follow/1', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '3k', now())").await;
-        let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let tl = h.get_timeline(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(tl.inner()["feed"].as_array().map(Vec::len), Some(2));
         // Muting Bob removes his items (and Alice's reply stays).
         exec(p, "INSERT INTO mutes (viewer_did, subject_did) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb')").await;
-        let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let tl = h.get_timeline(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(tl.inner()["feed"].as_array().map(Vec::len), Some(1));
         // Scoped mutes (B-34). Bob reposts Alice's reply and writes a quote
         // post: the timeline holds Alice's reply, Bob's root, his repost and
@@ -1050,7 +1060,7 @@ mod tests {
                 .map(|i| (i["post"]["uri"].as_str().expect("uri").to_string(), i.get("reason").is_some()))
                 .collect()
         };
-        let all = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let all = h.get_timeline(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(kinds(all.inner()).len(), 4);
         let mute = |scope: &'static str| async move {
             exec(p, "DELETE FROM mutes").await;
@@ -1060,20 +1070,20 @@ mod tests {
         };
         // reposts: only Bob's repost item goes.
         mute("reposts").await;
-        let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let tl = h.get_timeline(&me, &req,50, None).await.expect("db").expect("view");
         let k = kinds(tl.inner());
         assert_eq!(k.len(), 3, "{k:?}");
         assert!(k.iter().all(|(_, repost)| !repost));
         assert!(k.iter().any(|(u, _)| *u == root) && k.iter().any(|(u, _)| *u == quote));
         // quotes: only Bob's quote post goes.
         mute("quotes").await;
-        let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let tl = h.get_timeline(&me, &req,50, None).await.expect("db").expect("view");
         let k = kinds(tl.inner());
         assert_eq!(k.len(), 3, "{k:?}");
         assert!(k.iter().all(|(u, _)| *u != quote) && k.iter().any(|(_, repost)| *repost));
         // both: the repost and the quote post go; Bob's plain post stays.
         mute("reposts_and_quotes").await;
-        let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let tl = h.get_timeline(&me, &req,50, None).await.expect("db").expect("view");
         let k = kinds(tl.inner());
         assert_eq!(k.len(), 2, "{k:?}");
         assert!(k.iter().any(|(u, _)| *u == root) && k.iter().any(|(u, _)| *u == reply));
@@ -1084,15 +1094,15 @@ mod tests {
 
         // Paging.
         exec(p, "DELETE FROM mutes").await;
-        let page = h.get_timeline(&me, 1, None).await.expect("db").expect("view");
+        let page = h.get_timeline(&me, &req,1, None).await.expect("db").expect("view");
         let cursor = page.inner()["cursor"].as_str().expect("cursor").to_string();
-        let next = h.get_timeline(&me, 1, Some(&cursor)).await.expect("db").expect("view");
+        let next = h.get_timeline(&me, &req,1, Some(&cursor)).await.expect("db").expect("view");
         assert_ne!(page.inner()["feed"][0]["post"]["uri"], next.inner()["feed"][0]["post"]["uri"]);
 
         // Local likes fallback (no Constellation in tests).
         exec(p, &format!("INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES \
                  ('at://{ALICE}/app.bsky.feed.like/1', '{ALICE}', '{root}', '3k', now())")).await;
-        let likes = h.get_likes(&anon, &root, 50, None).await.expect("db").expect("view");
+        let likes = h.get_likes(&anon, &req, &root, 50, None).await.expect("db").expect("view");
         assert_eq!(likes.inner()["likes"][0]["actor"]["did"], ALICE);
         let _ = reply;
         db.drop_db().await;

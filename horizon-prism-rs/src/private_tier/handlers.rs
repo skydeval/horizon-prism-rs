@@ -9,7 +9,7 @@
 //!   `private_read_unfloored_seconds{endpoint}`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, RawQuery, State};
@@ -31,8 +31,9 @@ use crate::hydration::normalize::is_private_uri;
 use crate::hydration::actor::ProfileContext;
 use crate::kryphocron_glue::VerifiedCaller;
 use crate::xrpc::AppState;
-use crate::xrpc::auth::{Params, prepare_private};
+use crate::xrpc::auth::{Params, prepare_private, request_ip};
 use crate::xrpc::errors::XrpcError;
+use crate::xrpc::pools::Requester;
 
 pub const GET_POSTS: &str = "app.nearhorizon.private.getPosts";
 pub const GET_POST_THREAD: &str = "app.nearhorizon.private.getPostThread";
@@ -116,7 +117,7 @@ async fn floor(endpoint: &'static str, start: Instant, target: Duration) {
 }
 
 /// Profiles for the owners of `uris` (public data, viewer-relative).
-async fn profiles(s: &PrivateState, viewer: &Viewer, uris: &[String]) -> Result<ProfileContext, XrpcError> {
+async fn profiles(s: &PrivateState, viewer: &Viewer, req: &Requester, uris: &[String]) -> Result<ProfileContext, XrpcError> {
     let mut dids: Vec<String> = Vec::new();
     for u in uris {
         if let Some(a) = uri_author(u)
@@ -125,7 +126,7 @@ async fn profiles(s: &PrivateState, viewer: &Viewer, uris: &[String]) -> Result<
             dids.push(a.to_string());
         }
     }
-    Ok(s.app.hydrator.profile_context(viewer, &dids, None).await?)
+    Ok(s.app.hydrator.profile_context(viewer, req, &dids, None).await?)
 }
 
 /// Read `uris` in order with the configured concurrency; misses are `None`.
@@ -162,7 +163,8 @@ pub async fn get_posts(
     if requested.is_empty() || requested.len() > 25 {
         return Err(XrpcError::invalid("Error: uris must have between 1 and 25 items"));
     }
-    let result = posts_body(&s, &caller, &requested, start).await;
+    let ip = request_ip(&s.app, &headers, peer);
+    let result = posts_body(&s, &caller, ip, &requested, start).await;
     floor("getPosts", start, s.floors.get_posts).await;
     result.map(ok)
 }
@@ -170,6 +172,7 @@ pub async fn get_posts(
 async fn posts_body(
     s: &PrivateState,
     caller: &VerifiedCaller,
+    ip: IpAddr,
     requested: &[String],
     start: Instant,
 ) -> Result<PrivateResponse, XrpcError> {
@@ -182,7 +185,8 @@ async fn posts_body(
     let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted).await?.into_iter().collect();
     let candidates: Vec<String> = wanted.into_iter().filter(|u| passing.contains(u)).collect();
     let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
-    let authors = profiles(s, &viewer, &candidates).await?;
+    let req = Requester::of(viewer.state_did(), ip);
+    let authors = profiles(s, &viewer, &req, &candidates).await?;
     let rs = RequestState::new(s.env.max_head_fetches);
     let posts = read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
     Ok(PrivateResponse::posts(posts))
@@ -212,7 +216,8 @@ pub async fn get_post_thread(
     let uri = p.required("uri")?.to_string();
     let depth = bounded(&p, "depth", 6, 10)?;
     let parent_height = bounded(&p, "parentHeight", 20, 30)?;
-    let result = thread_body(&s, &caller, &uri, depth, parent_height, start).await;
+    let ip = request_ip(&s.app, &headers, peer);
+    let result = thread_body(&s, &caller, ip, &uri, depth, parent_height, start).await;
     floor("getPostThread", start, s.floors.get_post_thread).await;
     result.and_then(|t| t.ok_or_else(not_found)).map(ok)
 }
@@ -228,6 +233,7 @@ fn view_parent(post: &PrivateEmit<Value>) -> Option<String> {
 async fn thread_body(
     s: &PrivateState,
     caller: &VerifiedCaller,
+    ip: IpAddr,
     uri: &str,
     depth: u32,
     parent_height: u32,
@@ -235,8 +241,9 @@ async fn thread_body(
 ) -> Result<Option<PrivateResponse>, XrpcError> {
     let rs = RequestState::new(s.env.max_head_fetches);
     let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
+    let req = Requester::of(viewer.state_did(), ip);
     let anchor_uri = vec![uri.to_string()];
-    let authors = profiles(s, &viewer, &anchor_uri).await?;
+    let authors = profiles(s, &viewer, &req, &anchor_uri).await?;
     let Ok(anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
         return Ok(None);
     };
@@ -251,7 +258,7 @@ async fn thread_body(
             break;
         }
         if is_private_uri(&parent) {
-            let authors = profiles(s, &viewer, std::slice::from_ref(&parent)).await?;
+            let authors = profiles(s, &viewer, &req, std::slice::from_ref(&parent)).await?;
             let Ok(p) = pipeline::read(&s.env, &rs, caller, &parent, &authors, start).await else {
                 break;
             };
@@ -259,7 +266,7 @@ async fn thread_body(
             next = view_parent(&p);
             chain.push(p);
         } else {
-            if let Some(post) = s.app.hydrator.public_post_view(&viewer, &parent).await? {
+            if let Some(post) = s.app.hydrator.public_post_view(&viewer, &req, &parent).await? {
                 budget -= 1;
                 public_top = Some(post);
             }
@@ -289,7 +296,7 @@ async fn thread_body(
             }
         }
         let uris: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
-        let authors = profiles(s, &viewer, &uris).await?;
+        let authors = profiles(s, &viewer, &req, &uris).await?;
         let results = read_many(s, &rs, caller, &uris, &authors, start).await;
         level = Vec::new();
         for ((parent, child), hit) in batch.into_iter().zip(results) {
@@ -368,7 +375,8 @@ pub async fn get_author_feed(
         _ => return Err(XrpcError::invalid("Error: limit must be between 1 and 50")),
     };
     let after = parse_cursor(p.one("cursor"))?;
-    let result = feed_body(&s, &caller, &actor, limit as usize, after, start).await;
+    let ip = request_ip(&s.app, &headers, peer);
+    let result = feed_body(&s, &caller, ip, &actor, limit as usize, after, start).await;
     floor("getAuthorFeed", start, s.floors.get_author_feed).await;
     result.map(ok)
 }
@@ -376,6 +384,7 @@ pub async fn get_author_feed(
 async fn feed_body(
     s: &PrivateState,
     caller: &VerifiedCaller,
+    ip: IpAddr,
     actor: &str,
     limit: usize,
     after: Option<(DateTime<Utc>, String)>,
@@ -390,7 +399,8 @@ async fn feed_body(
     candidates.truncate(max_binds);
     let uris: Vec<String> = candidates.iter().map(|(u, _, _)| u.clone()).collect();
     let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
-    let authors = profiles(s, &viewer, &uris).await?;
+    let req = Requester::of(viewer.state_did(), ip);
+    let authors = profiles(s, &viewer, &req, &uris).await?;
     let rs = RequestState::new(s.env.max_head_fetches);
 
     let mut feed = Vec::new();

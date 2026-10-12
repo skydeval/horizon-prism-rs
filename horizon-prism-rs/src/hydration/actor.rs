@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 
 use super::{ActorRow, ActorViewer, CountMode, Hydrator, INVALID_HANDLE, ViewError, ViewResult, Viewer, blob_url, ts};
 use crate::moderation::{self, Gate};
+use crate::xrpc::pools::Requester;
 
 /// Which profile view to build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +82,7 @@ impl Hydrator {
     pub async fn profile_context(
         &self,
         viewer: &Viewer,
+        req: &Requester,
         dids: &[String],
         followers: Option<CountMode>,
     ) -> Result<ProfileContext, sqlx::Error> {
@@ -89,7 +91,7 @@ impl Hydrator {
         let labels = self.load_labels(dids).await?;
         let followers = match followers {
             Some(mode) => self
-                .constellation_counts(dids, mode)
+                .constellation_counts(req, dids, mode)
                 .await
                 .into_iter()
                 .filter_map(|(d, c)| c.followers.map(|f| (d, f)))
@@ -123,9 +125,9 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_profile(&self, viewer: &Viewer, actor: &str) -> ViewResult<Value> {
+    pub async fn get_profile(&self, viewer: &Viewer, req: &Requester, actor: &str) -> ViewResult<Value> {
         let started = Instant::now();
-        let Some(did) = self.resolve_actor(actor).await? else {
+        let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(ViewError::new("InvalidRequest", "Profile not found")));
         };
         let gate = moderation::gate(self.pool(), &did).await?;
@@ -133,11 +135,11 @@ impl Hydrator {
             return Ok(Err(ViewError::new(error, message)));
         }
         let ctx = self
-            .profile_context(viewer, std::slice::from_ref(&did), Some(CountMode::Sync { started }))
+            .profile_context(viewer, req, std::slice::from_ref(&did), Some(CountMode::Sync { started }))
             .await?;
         if !ctx.rows.contains_key(&did) && !self.in_scope(&did).await {
             // Out-of-scope subject: the §8.3 cascade, then Slingshot.
-            return Ok(match self.upstream().profile(&did).await {
+            return Ok(match self.upstream().profile(req, &did).await {
                 Some(v) => Ok(Self::emit(self.normalized(viewer, v).await?.0)),
                 None => Err(ViewError::new("InvalidRequest", "Profile not found")),
             });
@@ -151,11 +153,11 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_profiles(&self, viewer: &Viewer, actors: &[String]) -> ViewResult<Value> {
+    pub async fn get_profiles(&self, viewer: &Viewer, req: &Requester, actors: &[String]) -> ViewResult<Value> {
         let started = Instant::now();
         let mut dids: Vec<String> = Vec::new();
         for a in actors.iter().take(25) {
-            if let Some(d) = self.resolve_actor(a).await?
+            if let Some(d) = self.resolve_actor(req, a).await?
                 && !dids.contains(&d)
             {
                 dids.push(d);
@@ -163,7 +165,7 @@ impl Hydrator {
         }
         let gates = moderation::gate_many(self.pool(), &dids).await?;
         dids.retain(|d| !gates.get(d).copied().unwrap_or(Gate::Visible).is_hidden());
-        let ctx = self.profile_context(viewer, &dids, Some(CountMode::Sync { started })).await?;
+        let ctx = self.profile_context(viewer, req, &dids, Some(CountMode::Sync { started })).await?;
         let profiles: Vec<Value> = dids
             .iter()
             .filter(|d| ctx.rows.contains_key(*d))
@@ -178,7 +180,7 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn search_actors(&self, viewer: &Viewer, q: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+    pub async fn search_actors(&self, viewer: &Viewer, req: &Requester, q: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
         let q = q.trim().trim_start_matches('@').to_lowercase();
         if q.is_empty() {
             return Ok(Ok(Self::emit(json!({ "actors": [] }))));
@@ -204,7 +206,7 @@ impl Hydrator {
             .filter(|d| !gates.get(*d).copied().unwrap_or(Gate::Visible).is_hidden())
             .cloned()
             .collect();
-        let ctx = self.profile_context(viewer, &visible, None).await?;
+        let ctx = self.profile_context(viewer, req, &visible, None).await?;
         let actors: Vec<Value> = visible.iter().map(|d| ctx.view(d, ProfileKind::View)).collect();
         let mut out = json!({ "actors": actors });
         if i64::try_from(dids.len()).unwrap_or(0) == limit {
@@ -248,9 +250,10 @@ mod tests {
                  ('at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.graph.block/1', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', '3k', now())").await;
         exec(p, "INSERT INTO labels (subject, val) VALUES ('did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', 'porn')").await;
         let h = hydrator(p, sets());
+        let req = Requester::test();
 
         // Anonymous.
-        let anon = h.get_profile(&Viewer::anonymous(), "bob.test").await.expect("db").expect("view");
+        let anon = h.get_profile(&Viewer::anonymous(), &req,"bob.test").await.expect("db").expect("view");
         assert_eq!(anon.inner()["viewer"], json!({"muted": false, "blockedBy": false}));
         assert_eq!(anon.inner()["handle"], "bob.test");
         assert_eq!(anon.inner()["labels"][0]["src"], LABELER);
@@ -258,14 +261,14 @@ mod tests {
         // A member who is not ready: exactly as anonymous.
         let unready = h.viewer(Some(ALICE)).await.expect("viewer");
         assert!(!unready.hydrate);
-        let v = h.get_profile(&unready, BOB).await.expect("db").expect("view");
+        let v = h.get_profile(&unready, &req, BOB).await.expect("db").expect("view");
         assert_eq!(v.inner()["viewer"], anon.inner()["viewer"]);
 
         // Ready: following and blockedBy populated.
         exec(p, "UPDATE members SET ready_at = now()").await;
         let ready = h.viewer(Some(ALICE)).await.expect("viewer");
         assert!(ready.hydrate);
-        let v = h.get_profile(&ready, BOB).await.expect("db").expect("view");
+        let v = h.get_profile(&ready, &req, BOB).await.expect("db").expect("view");
         assert_eq!(v.inner()["viewer"]["following"], "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.follow/1");
         assert_eq!(v.inner()["viewer"]["blockedBy"], true);
 
@@ -285,17 +288,18 @@ mod tests {
         actor(p, BOB, "bob.test", "Bob").await;
         exec(p, "INSERT INTO actor_counts (did, followers_count, follows_count, posts_count) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 3, 2, 1)").await;
         let h = hydrator(p, sets());
-        let v = h.get_profile(&Viewer::anonymous(), ALICE).await.expect("db").expect("view");
+        let req = Requester::test();
+        let v = h.get_profile(&Viewer::anonymous(), &req,ALICE).await.expect("db").expect("view");
         let v = v.inner();
         assert_eq!((v["followersCount"].clone(), v["followsCount"].clone(), v["postsCount"].clone()), (json!(3), json!(2), json!(1)));
         assert_eq!(v["createdAt"], "2026-01-01T00:00:00Z");
 
         // Takedown: AccountTakedown, and omitted from getProfiles.
         exec(p, "INSERT INTO labels (subject, val) VALUES ('did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '!takedown')").await;
-        let e = h.get_profile(&Viewer::anonymous(), BOB).await.expect("db").expect_err("hidden");
+        let e = h.get_profile(&Viewer::anonymous(), &req,BOB).await.expect("db").expect_err("hidden");
         assert_eq!(e.error, "AccountTakedown");
         let many = h
-            .get_profiles(&Viewer::anonymous(), &[ALICE.into(), BOB.into(), "nobody.test".into()])
+            .get_profiles(&Viewer::anonymous(), &req, &[ALICE.into(), BOB.into(), "nobody.test".into()])
             .await
             .expect("db")
             .expect("view");
@@ -303,13 +307,13 @@ mod tests {
 
         // Unknown out-of-scope actor: uniform miss.
         let e = h
-            .get_profile(&Viewer::anonymous(), "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz")
+            .get_profile(&Viewer::anonymous(), &req, "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz")
             .await
             .expect("db")
             .expect_err("miss");
         assert_eq!(e.error, "InvalidRequest");
 
-        let found = h.search_actors(&Viewer::anonymous(), "ali", 10, None).await.expect("db").expect("view");
+        let found = h.search_actors(&Viewer::anonymous(), &req, "ali", 10, None).await.expect("db").expect("view");
         assert_eq!(found.inner()["actors"][0]["did"], ALICE);
         db.drop_db().await;
     }

@@ -25,6 +25,7 @@ use crate::hydration::Hydrator;
 use crate::hydration::normalize::is_private_uri;
 use crate::hydration::upstream::post_from_record;
 use crate::microcosm::{SlingshotClient, SlingshotError};
+use crate::xrpc::pools::Requester;
 
 /// Which ladder steps run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +95,7 @@ impl Ladder {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn resolve(&self, uri: &str, mode: Mode) -> Result<Resolved, sqlx::Error> {
+    pub async fn resolve(&self, req: &Requester, uri: &str, mode: Mode) -> Result<Resolved, sqlx::Error> {
         // 1. Private tier: nothing else runs.
         if is_private_uri(uri) {
             return Ok(Resolved::Gap(Gap::TierHidden));
@@ -109,16 +110,16 @@ impl Ladder {
         if self.hydrator.tombstoned(uri).await? {
             return Ok(Resolved::Gap(Gap::Deleted));
         }
-        if let Some(view) = self.hydrator.lens_local_posts(&[uri.to_string()]).await?.remove(uri) {
+        if let Some(view) = self.hydrator.lens_local_posts(req, &[uri.to_string()]).await?.remove(uri) {
             return Ok(Resolved::Post(view));
         }
         // 3. Home AppView and the cascade.
         let mut cascade = CascadeOutcome::Skipped;
         if mode == Mode::Full {
-            let home = self.router.resolve_did(&author).await;
+            let home = self.router.resolve_did(req, &author).await;
             if !home.is_community() {
                 let uris = [uri.to_string()];
-                match self.cascade.fetch(home.network_name.as_deref(), Call::Posts(&uris)).await {
+                match self.cascade.fetch(req, home.network_name.as_deref(), Call::Posts(&uris)).await {
                     Fetched::Hit { body, .. } => {
                         let found = body
                             .get("posts")
@@ -142,7 +143,7 @@ impl Ladder {
                 let handle = self
                     .router
                     .lookup()
-                    .summary(&author)
+                    .summary(req, &author)
                     .await
                     .and_then(|s| s.handle)
                     .unwrap_or_else(|| crate::hydration::INVALID_HANDLE.to_string());

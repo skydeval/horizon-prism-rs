@@ -9,6 +9,7 @@ use super::actor::ProfileKind;
 use super::feed::{local_cursor, parse_local_cursor};
 use super::{Hydrator, ViewError, ViewResult, Viewer};
 use crate::moderation::{self, Gate};
+use crate::xrpc::pools::Requester;
 
 pub const NSID_FOLLOW: &str = "app.bsky.graph.follow";
 
@@ -51,8 +52,8 @@ fn not_found() -> ViewError {
 }
 
 impl Hydrator {
-    async fn subject(&self, actor: &str) -> Result<Result<String, ViewError>, sqlx::Error> {
-        let Some(did) = self.resolve_actor(actor).await? else {
+    async fn subject(&self, req: &Requester, actor: &str) -> Result<Result<String, ViewError>, sqlx::Error> {
+        let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(not_found()));
         };
         if let Some((error, message)) = moderation::gate(self.pool(), &did).await?.profile_error() {
@@ -63,11 +64,11 @@ impl Hydrator {
 
     /// Render a subject plus a list of actors as `profileView`s, dropping
     /// hidden actors and blocks in either direction.
-    async fn actor_list(&self, viewer: &Viewer, subject: &str, dids: Vec<String>, key: &str, cursor: Option<String>) -> ViewResult<Value> {
+    async fn actor_list(&self, viewer: &Viewer, req: &Requester, subject: &str, dids: Vec<String>, key: &str, cursor: Option<String>) -> ViewResult<Value> {
         let gates = moderation::gate_many(self.pool(), &dids).await?;
         let mut all = dids.clone();
         all.push(subject.to_string());
-        let ctx = self.profile_context(viewer, &all, None).await?;
+        let ctx = self.profile_context(viewer, req, &all, None).await?;
         let list: Vec<Value> = dids
             .iter()
             .filter(|d| !gates.get(*d).copied().unwrap_or(Gate::Visible).is_hidden() && !ctx.viewer.blocked_either_way(d))
@@ -86,13 +87,13 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_follows(&self, viewer: &Viewer, actor: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
-        let did = match self.subject(actor).await? {
+    pub async fn get_follows(&self, viewer: &Viewer, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+        let did = match self.subject(req, actor).await? {
             Ok(d) => d,
             Err(e) => return Ok(Err(e)),
         };
         if !self.in_scope(&did).await {
-            return Ok(match self.upstream().follows(&did, limit, cursor).await {
+            return Ok(match self.upstream().follows(req, &did, limit, cursor).await {
                 Some(v) => Ok(Self::emit(self.normalized(viewer, v).await?.0)),
                 None => Err(not_found()),
             });
@@ -113,7 +114,7 @@ impl Hydrator {
             .then(|| rows.last().map(|(_, u, t)| local_cursor(*t, u)))
             .flatten();
         let dids = rows.into_iter().map(|(d, _, _)| d).collect();
-        self.actor_list(viewer, &did, dids, "follows", next).await
+        self.actor_list(viewer, req, &did, dids, "follows", next).await
     }
 
     /// `app.bsky.graph.getFollowers`: Constellation first for every subject,
@@ -122,8 +123,8 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_followers(&self, viewer: &Viewer, actor: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
-        let did = match self.subject(actor).await? {
+    pub async fn get_followers(&self, viewer: &Viewer, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+        let did = match self.subject(req, actor).await? {
             Ok(d) => d,
             Err(e) => return Ok(Err(e)),
         };
@@ -134,7 +135,7 @@ impl Hydrator {
             match client.distinct_dids_page(&did, NSID_FOLLOW, ".subject", limit, remote).await {
                 Ok(page) => {
                     let next = page.cursor.map(|c| format!("C:{c}"));
-                    return self.actor_list(viewer, &did, page.linking_dids, "followers", next).await;
+                    return self.actor_list(viewer, req, &did, page.linking_dids, "followers", next).await;
                 }
                 Err(error) => tracing::debug!(event = "constellation_followers_failed", %error, "falling back to local follows"),
             }
@@ -155,7 +156,7 @@ impl Hydrator {
             .then(|| rows.last().map(|(_, u, t)| local_cursor(*t, u)))
             .flatten();
         let dids = rows.into_iter().map(|(d, _, _)| d).collect();
-        self.actor_list(viewer, &did, dids, "followers", next).await
+        self.actor_list(viewer, req, &did, dids, "followers", next).await
     }
 
     /// `app.bsky.graph.getMutes` for the (member) viewer.
@@ -163,7 +164,7 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn get_mutes(&self, viewer: &Viewer, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
+    pub async fn get_mutes(&self, viewer: &Viewer, req: &Requester, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
@@ -184,7 +185,7 @@ impl Hydrator {
             .then(|| rows.last().map(|(d, t)| local_cursor(*t, d)))
             .flatten();
         let dids: Vec<String> = rows.into_iter().map(|(d, _)| d).collect();
-        let ctx = self.profile_context(viewer, &dids, None).await?;
+        let ctx = self.profile_context(viewer, req, &dids, None).await?;
         let mut out = json!({ "mutes": dids.iter().map(|d| ctx.view(d, ProfileKind::View)).collect::<Vec<_>>() });
         if let Some(c) = next {
             out["cursor"] = json!(c);
@@ -200,11 +201,11 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn set_mute(&self, viewer: &Viewer, actor: &str, mute: Option<MuteScope>) -> ViewResult<Value> {
+    pub async fn set_mute(&self, viewer: &Viewer, req: &Requester, actor: &str, mute: Option<MuteScope>) -> ViewResult<Value> {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
-        let Some(did) = self.resolve_actor(actor).await? else {
+        let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(ViewError::new("InvalidRequest", "Actor not found")));
         };
         if did == me {
@@ -260,12 +261,13 @@ mod tests {
         sets.scope.insert(BOB.into());
         let h = hydrator(p, sets);
         let anon = Viewer::anonymous();
-        let f = h.get_follows(&anon, "alice.test", 50, None).await.expect("db").expect("view");
+        let req = Requester::test();
+        let f = h.get_follows(&anon, &req,"alice.test", 50, None).await.expect("db").expect("view");
         assert_eq!(f.inner()["follows"][0]["did"], BOB);
         assert_eq!(f.inner()["subject"]["did"], ALICE);
-        let f = h.get_followers(&anon, BOB, 50, None).await.expect("db").expect("view");
+        let f = h.get_followers(&anon, &req,BOB, 50, None).await.expect("db").expect("view");
         assert_eq!(f.inner()["followers"][0]["did"], ALICE);
-        let e = h.get_follows(&anon, "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz", 50, None).await.expect("db").expect_err("miss");
+        let e = h.get_follows(&anon, &req,"did:plc:zzzzzzzzzzzzzzzzzzzzzzzz", 50, None).await.expect("db").expect_err("miss");
         assert_eq!(e.error, "InvalidRequest");
 
         let me = Viewer {
@@ -273,21 +275,21 @@ mod tests {
             hydrate: true,
         };
         let full = Some(MuteScope::Full);
-        h.set_mute(&me, "bob.test", full).await.expect("db").expect("muted");
-        h.set_mute(&me, "bob.test", full).await.expect("db").expect("idempotent");
-        let m = h.get_mutes(&me, 50, None).await.expect("db").expect("view");
+        h.set_mute(&me, &req,"bob.test", full).await.expect("db").expect("muted");
+        h.set_mute(&me, &req,"bob.test", full).await.expect("db").expect("idempotent");
+        let m = h.get_mutes(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(m.inner()["mutes"][0]["did"], BOB);
         assert_eq!(m.inner()["mutes"][0]["viewer"]["muted"], true);
-        assert!(h.set_mute(&me, ALICE, full).await.expect("db").is_err());
-        h.set_mute(&me, BOB, None).await.expect("db").expect("unmuted");
-        h.set_mute(&me, BOB, None).await.expect("db").expect("unmute is idempotent");
-        let m = h.get_mutes(&me, 50, None).await.expect("db").expect("view");
+        assert!(h.set_mute(&me, &req,ALICE, full).await.expect("db").is_err());
+        h.set_mute(&me, &req,BOB, None).await.expect("db").expect("unmuted");
+        h.set_mute(&me, &req,BOB, None).await.expect("db").expect("unmute is idempotent");
+        let m = h.get_mutes(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(m.inner()["mutes"], json!([]));
 
         // B-34: scoped mutes. A repeat call replaces the scope and keeps the
         // row's created_at; `getMutes` lists full mutes only.
         let viewer_of_bob = || async {
-            let ctx = h.profile_context(&me, &[BOB.to_string()], None).await.expect("ctx");
+            let ctx = h.profile_context(&me, &req, &[BOB.to_string()], None).await.expect("ctx");
             ctx.view(BOB, ProfileKind::View)["viewer"].clone()
         };
         let created = || async {
@@ -297,33 +299,33 @@ mod tests {
                 .await
                 .expect("row")
         };
-        h.set_mute(&me, BOB, Some(MuteScope::Reposts)).await.expect("db").expect("scoped");
+        h.set_mute(&me, &req,BOB, Some(MuteScope::Reposts)).await.expect("db").expect("scoped");
         let first = created().await;
         let v = viewer_of_bob().await;
         assert_eq!((&v["muted"], &v["mutedOnlyReposts"]), (&json!(false), &json!(true)));
         assert!(v.get("mutedOnlyQuoteposts").is_none());
-        let m = h.get_mutes(&me, 50, None).await.expect("db").expect("view");
+        let m = h.get_mutes(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(m.inner()["mutes"], json!([]));
 
-        h.set_mute(&me, BOB, Some(MuteScope::RepostsAndQuotes)).await.expect("db").expect("both");
+        h.set_mute(&me, &req,BOB, Some(MuteScope::RepostsAndQuotes)).await.expect("db").expect("both");
         let v = viewer_of_bob().await;
         assert_eq!((&v["mutedOnlyReposts"], &v["mutedOnlyQuoteposts"]), (&json!(true), &json!(true)));
 
         // No flags: a full mute, and the scoped flags are suppressed.
-        h.set_mute(&me, BOB, full).await.expect("db").expect("widened by request");
+        h.set_mute(&me, &req,BOB, full).await.expect("db").expect("widened by request");
         let v = viewer_of_bob().await;
         assert_eq!(v["muted"], true);
         assert!(v.get("mutedOnlyReposts").is_none() && v.get("mutedOnlyQuoteposts").is_none());
-        let m = h.get_mutes(&me, 50, None).await.expect("db").expect("view");
+        let m = h.get_mutes(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(m.inner()["mutes"][0]["did"], BOB);
 
         // Narrowed again; still one row, with its first created_at.
-        h.set_mute(&me, BOB, Some(MuteScope::Quotes)).await.expect("db").expect("narrowed");
+        h.set_mute(&me, &req,BOB, Some(MuteScope::Quotes)).await.expect("db").expect("narrowed");
         let v = viewer_of_bob().await;
         assert_eq!((&v["muted"], &v["mutedOnlyQuoteposts"]), (&json!(false), &json!(true)));
         assert!(v.get("mutedOnlyReposts").is_none());
         assert_eq!(created().await, first);
-        h.set_mute(&me, BOB, None).await.expect("db").expect("unmute deletes a scoped row");
+        h.set_mute(&me, &req,BOB, None).await.expect("db").expect("unmute deletes a scoped row");
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mutes").fetch_one(p).await.expect("count");
         assert_eq!(rows, 0);
         db.drop_db().await;

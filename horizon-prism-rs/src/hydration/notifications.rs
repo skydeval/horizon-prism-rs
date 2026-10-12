@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use super::actor::ProfileKind;
 use super::{Hydrator, ViewError, ViewResult, Viewer, ts};
+use crate::xrpc::pools::Requester;
 
 /// Cursor: `<indexed_at>::<id>`.
 fn cursor_of(at: DateTime<Utc>, id: i64) -> String {
@@ -92,7 +93,7 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn list_notifications(&self, viewer: &Viewer, limit: u32, cursor: Option<&str>, reasons: &[String]) -> ViewResult<Value> {
+    pub async fn list_notifications(&self, viewer: &Viewer, req: &Requester, limit: u32, cursor: Option<&str>, reasons: &[String]) -> ViewResult<Value> {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
@@ -113,7 +114,7 @@ impl Hydrator {
         .await?;
         let seen = self.seen_at(me).await?;
         let authors: Vec<String> = rows.iter().map(|r| r.author_did.clone()).collect();
-        let ctx = self.profile_context(viewer, &authors, None).await?;
+        let ctx = self.profile_context(viewer, req, &authors, None).await?;
         let records = self.notification_records(&rows).await?;
         let labels = self.load_labels(&rows.iter().map(|r| r.record_uri.clone()).collect::<Vec<_>>()).await?;
         let notifications: Vec<Value> = rows
@@ -270,7 +271,8 @@ mod tests {
             did: Some(ALICE.into()),
             hydrate: true,
         };
-        let l = h.list_notifications(&me, 100, None, &[]).await.expect("db").expect("view");
+        let req = Requester::test();
+        let l = h.list_notifications(&me, &req,100, None, &[]).await.expect("db").expect("view");
         let list = l.inner()["notifications"].as_array().expect("list");
         let by_reason: std::collections::HashMap<&str, &Value> = list.iter().map(|n| (n["reason"].as_str().expect("reason"), n)).collect();
         assert_eq!(list.len(), 6, "blocked authors (both directions) are excluded: {list:?}");
@@ -286,10 +288,10 @@ mod tests {
         assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 6, "the count uses the same exclusions");
 
         // Paging with the indexed_at::id cursor.
-        let first = h.list_notifications(&me, 4, None, &[]).await.expect("db").expect("view");
+        let first = h.list_notifications(&me, &req,4, None, &[]).await.expect("db").expect("view");
         let cursor = first.inner()["cursor"].as_str().expect("cursor").to_string();
         assert!(cursor.contains("::"));
-        let rest = h.list_notifications(&me, 4, Some(&cursor), &[]).await.expect("db").expect("view");
+        let rest = h.list_notifications(&me, &req,4, Some(&cursor), &[]).await.expect("db").expect("view");
         assert_eq!(rest.inner()["notifications"].as_array().map(Vec::len), Some(2));
         db.drop_db().await;
     }
@@ -314,7 +316,8 @@ mod tests {
             did: Some(ALICE.into()),
             hydrate: true,
         };
-        let l = h.list_notifications(&me, 50, None, &[]).await.expect("db").expect("view");
+        let req = Requester::test();
+        let l = h.list_notifications(&me, &req,50, None, &[]).await.expect("db").expect("view");
         let n = l.inner()["notifications"].as_array().expect("list");
         assert_eq!(n.len(), 2);
         assert!(n.iter().any(|x| x["reason"] == "like" && x["record"]["$type"] == "app.bsky.feed.like"));
@@ -322,7 +325,7 @@ mod tests {
         assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 2);
 
         // Reason filter.
-        let only = h.list_notifications(&me, 50, None, &["reply".into()]).await.expect("db").expect("view");
+        let only = h.list_notifications(&me, &req,50, None, &["reply".into()]).await.expect("db").expect("view");
         assert_eq!(only.inner()["notifications"].as_array().map(Vec::len), Some(1));
 
         // updateSeen clamps to now and never moves back.
@@ -339,12 +342,12 @@ mod tests {
         };
         assert_eq!(since("2000-01-01T00:00:00Z").await, 2);
         assert_eq!(since("2099-01-01T00:00:00Z").await, 0);
-        let l = h.list_notifications(&me, 50, None, &[]).await.expect("db").expect("view");
+        let l = h.list_notifications(&me, &req,50, None, &[]).await.expect("db").expect("view");
         assert!(l.inner()["notifications"].as_array().expect("list").iter().all(|x| x["isRead"] == true));
 
         // Muting Bob hides his notifications.
         exec(p, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{ALICE}', '{BOB}')")).await;
-        let l = h.list_notifications(&me, 50, None, &[]).await.expect("db").expect("view");
+        let l = h.list_notifications(&me, &req,50, None, &[]).await.expect("db").expect("view");
         assert_eq!(l.inner()["notifications"], json!([]));
 
         // Scoped mutes (B-34): a repost mute excludes only the repost
