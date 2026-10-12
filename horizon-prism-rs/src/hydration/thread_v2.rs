@@ -588,6 +588,34 @@ mod tests {
         };
         let v = h.get_post_thread_v2(&author, &req, &second, &options).await.expect("db").expect("view");
         assert_eq!(v.inner()["thread"].as_array().map(Vec::len), Some(3));
+
+        // `viewer.replyDisabled` on the anchor, from the root's gate.
+        let disabled = |who: Viewer| {
+            let (h, req, second, options) = (&h, &req, &second, &options);
+            async move {
+                let v = h.get_post_thread_v2(&who, req, second, options).await.expect("db").expect("view");
+                v.inner()["thread"][1]["value"]["post"]["viewer"].get("replyDisabled").cloned()
+            }
+        };
+        let op = Viewer {
+            did: Some(OP.into()),
+            hydrate: true,
+        };
+        // `allow = []`: nobody but the root's author.
+        assert_eq!(disabled(me.clone()).await, Some(json!(true)));
+        assert_eq!(disabled(op).await, Some(json!(false)));
+        assert_eq!(disabled(anon.clone()).await, None);
+        // Followers may reply: not a follower, then a follower.
+        exec(p, &format!("UPDATE threadgates SET allow = '[{{\"$type\": \"app.bsky.feed.threadgate#followerRule\"}}]' WHERE uri = '{gate}'")).await;
+        assert_eq!(disabled(me.clone()).await, Some(json!(true)));
+        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ME}/app.bsky.graph.follow/1', '{ME}', '{OP}', '3k', now())")).await;
+        assert_eq!(disabled(me.clone()).await, Some(json!(false)));
+        // A rule whose input this AppView does not hold in full: unknown.
+        exec(p, &format!("UPDATE threadgates SET allow = '[{{\"$type\": \"app.bsky.feed.threadgate#listRule\", \"list\": \"at://{BOB}/app.bsky.graph.list/l\"}}]' WHERE uri = '{gate}'")).await;
+        assert_eq!(disabled(me.clone()).await, None);
+        // No `allow` at all: anyone may reply, and the field is left out.
+        exec(p, &format!("UPDATE threadgates SET allow = NULL WHERE uri = '{gate}'")).await;
+        assert_eq!(disabled(me).await, None);
         db.drop_db().await;
     }
 }

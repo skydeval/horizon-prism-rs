@@ -15,6 +15,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use super::feed::{NSID_POST, PostContext};
+use super::lists::is_list_uri;
 use super::normalize::is_private_uri;
 use super::{CountMode, Hydrator, ViewError, ViewResult, Viewer};
 use crate::db::locks::uri_author;
@@ -39,6 +40,17 @@ struct Hidden {
     uris: HashSet<String>,
     /// Keep them in the tree, marked, instead of leaving them out.
     keep: bool,
+}
+
+/// The root's valid threadgate, as one thread needs it.
+struct RootGate {
+    /// The `threadgateView`.
+    view: Value,
+    /// The replies it hides from this viewer.
+    hidden: HashSet<String>,
+    /// Its `allow` rules: `None` when the field is absent (anyone may
+    /// reply), an empty array when nobody may.
+    allow: Option<Value>,
 }
 
 /// A `threadgates` row: URI, CID, record, hidden replies, `allow`.
@@ -170,7 +182,7 @@ impl Hydrator {
     /// hides. A gate counts only when its record key is its post's and its
     /// author is the post's author. A hidden reply is not hidden from its
     /// own author.
-    async fn threadgate(&self, viewer: &Viewer, req: &Requester, root: &str) -> Result<Option<(Value, HashSet<String>)>, sqlx::Error> {
+    async fn threadgate(&self, viewer: &Viewer, req: &Requester, root: &str) -> Result<Option<RootGate>, sqlx::Error> {
         let rows: Vec<GateRow> =
             sqlx::query_as("SELECT uri, cid, record, hidden_replies, allow FROM threadgates WHERE post_uri = $1")
                 .bind(root)
@@ -201,8 +213,78 @@ impl Hydrator {
         }
         let view = json!({"uri": uri, "cid": cid, "record": record, "lists": lists});
         let me = viewer.did.as_deref();
-        let hidden = hidden.into_iter().filter(|reply| uri_author(reply) != me || me.is_none()).collect();
-        Ok(Some((view, hidden)))
+        let hidden = hidden.into_iter().filter(|reply| me.is_none() || uri_author(reply) != me).collect();
+        Ok(Some(RootGate { view, hidden, allow }))
+    }
+
+    /// `viewer.replyDisabled` for a post in the thread rooted at `root`
+    /// (design-v3 §8.3), for a ready member. `None` leaves the field out:
+    /// no gate, no `allow`, or an answer this AppView cannot know.
+    async fn reply_disabled(&self, viewer: &Viewer, root: &str, allow: Option<&Value>) -> Result<Option<bool>, sqlx::Error> {
+        let (Some(me), Some(rules)) = (viewer.state_did(), allow.and_then(Value::as_array)) else {
+            return Ok(None);
+        };
+        let author = uri_author(root).unwrap_or_default();
+        if me == author {
+            return Ok(Some(false));
+        }
+        if rules.is_empty() {
+            return Ok(Some(true));
+        }
+        // Whether every rule's input was complete.
+        let mut complete = true;
+        for rule in rules {
+            let allowed = match rule.get("$type").and_then(Value::as_str).unwrap_or_default() {
+                "app.bsky.feed.threadgate#mentionRule" => {
+                    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM posts WHERE uri = $1 AND $2 = ANY(mention_dids))")
+                        .bind(root)
+                        .bind(me)
+                        .fetch_one(self.pool())
+                        .await?
+                }
+                "app.bsky.feed.threadgate#followerRule" => {
+                    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+                        .bind(me)
+                        .bind(author)
+                        .fetch_one(self.pool())
+                        .await?
+                }
+                "app.bsky.feed.threadgate#followingRule" => {
+                    let follows: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+                        .bind(author)
+                        .bind(me)
+                        .fetch_one(self.pool())
+                        .await?;
+                    // A follow not stored here may still exist.
+                    complete &= follows;
+                    follows
+                }
+                "app.bsky.feed.threadgate#listRule" => {
+                    let list = rule.get("list").and_then(Value::as_str).unwrap_or_default();
+                    // Only a list served from this AppView's own rows is a
+                    // complete input.
+                    if is_list_uri(list) && self.is_ready_member(uri_author(list).unwrap_or_default()).await? {
+                        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_items WHERE list_uri = $1 AND subject_did = $2)")
+                            .bind(list)
+                            .bind(me)
+                            .fetch_one(self.pool())
+                            .await?
+                    } else {
+                        complete = false;
+                        false
+                    }
+                }
+                // A rule this version does not know.
+                _ => {
+                    complete = false;
+                    false
+                }
+            };
+            if allowed {
+                return Ok(Some(false));
+            }
+        }
+        Ok(complete.then_some(true))
     }
 
     /// The tree of `getPostThread`, with the root's threadgate view. With
@@ -378,10 +460,16 @@ impl Hydrator {
             return Ok(Err(not_found()));
         };
         let root = anchor_row.reply_root_uri.clone().unwrap_or_else(|| uri.to_string());
-        let (gate, hidden) = match self.threadgate(viewer, req, &root).await? {
-            Some((view, uris)) => (Some(view), Hidden { uris, keep: keep_hidden }),
+        let root_gate = self.threadgate(viewer, req, &root).await?;
+        let reply_disabled = self.reply_disabled(viewer, &root, root_gate.as_ref().and_then(|g| g.allow.as_ref())).await?;
+        let (gate, hidden) = match root_gate {
+            Some(g) => (Some(g.view), Hidden { uris: g.hidden, keep: keep_hidden }),
             None => (None, Hidden::default()),
         };
+        let mut post = post;
+        if let Some(disabled) = reply_disabled {
+            post["viewer"]["replyDisabled"] = json!(disabled);
+        }
         let mut thread = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": post});
         if parent_height > 0
             && let Some(parent) = &anchor_row.reply_parent_uri

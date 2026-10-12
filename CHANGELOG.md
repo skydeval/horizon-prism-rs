@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **Item 13: `viewer.replyDisabled` on the thread anchor (#675).** For a
+  ready member, from the root post's threadgate (design-v3 §8.3). The
+  root's author may always reply. `allow = []` disables replies. Otherwise
+  a rule that lets the viewer in (mentioned in the root, follows the
+  root's author, is followed by the root's author, is on a list this
+  AppView serves from its own rows) enables them. When no rule lets the
+  viewer in and every rule could be checked in full, replies are disabled;
+  when one could not (a list held elsewhere, a follow not stored here), the
+  field is left out, since the answer is not known. With no gate or no
+  `allow`, the field is left out.
 - **Item 13: `viewer.embeddingDisabled` (#675).** A ready member sees
   `embeddingDisabled: true` on a post whose author turned quoting off (a
   valid postgate with a `disableRule`, design-v3 §8.3). The author's own
