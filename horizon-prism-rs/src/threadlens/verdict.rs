@@ -101,6 +101,21 @@ impl Judge {
         }
     }
 
+    /// A judge that has already judged: the viewer blocks `by_viewer`,
+    /// `of_viewer` block the viewer, and `others` have no known block and
+    /// are not vouched for. It never reaches a database or Farsight.
+    #[cfg(test)]
+    pub(crate) fn judged(viewer: &str, by_viewer: &[&str], of_viewer: &[&str], others: &[&str]) -> Self {
+        let pool = PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").expect("lazy pool");
+        let mut judge = Self::new(pool, viewer, None, &ThreadLensConfig::default());
+        let own = |dids: &[&str]| dids.iter().map(ToString::to_string).collect::<HashSet<String>>();
+        judge.out_local = own(by_viewer);
+        judge.in_local = own(of_viewer);
+        judge.judged = own(by_viewer).into_iter().chain(own(of_viewer)).chain(own(others)).collect();
+        judge.baseline_done = true;
+        judge
+    }
+
     /// The viewer the verdicts are for.
     #[must_use]
     pub fn viewer(&self) -> &str {

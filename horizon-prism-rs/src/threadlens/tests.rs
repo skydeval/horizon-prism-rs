@@ -354,3 +354,59 @@ async fn a_response_is_paged_by_a_sealed_cursor() {
     assert_eq!(marker(&off.nodes, &gapped), Some(Some(cursor)));
     db.drop_db().await;
 }
+
+/// B-83: the walk up the parents goes through a blocked author's post,
+/// taking the link above it from the stored row, and stops with a marker
+/// at `parentHeight`.
+#[tokio::test]
+async fn the_parent_walk_goes_past_a_blocked_author() {
+    let Some(db) = fresh_db("threadlens_parents").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(AUTHOR, "author.test"), (R1, "r1.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    let root = post(p, AUTHOR, "3kroot222222", "root", None, None).await;
+    let middle = post(p, R1, "3kmiddle2222", "middle", Some(&root), Some(&root)).await;
+    let leaf = post(p, AUTHOR, "3kleaf222222", "leaf", Some(&middle), Some(&root)).await;
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
+    let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
+    let base = fake_upstream(Arc::new(Calls::default()), None).await;
+    let l = ladder(h, &base, Arc::new(StubLookup::default()));
+    let (req, viewer, key, cfg) = (Requester::test(), member(VIEWER_A), CursorKey::generated(), ThreadLensConfig::default());
+    let shape = |nodes: &[LensNode]| -> Vec<(String, Option<&'static str>)> {
+        nodes
+            .iter()
+            .map(|n| match n {
+                LensNode::Post { uri, .. } => (uri.clone(), None),
+                LensNode::Gap { uri, gap, .. } => (uri.clone(), Some(gap.label())),
+            })
+            .collect()
+    };
+
+    // The ordinary view ends at the blocked parent. Thread Lens goes on
+    // above it: the root is still there.
+    let request = thread::Request { viewer: &viewer, req: &req, anchor: &leaf, depth: 0, parent_height: 80 };
+    let got = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    assert_eq!(shape(&got.nodes), [(root.clone(), None), (middle.clone(), Some("blocked-by-you")), (leaf.clone(), None)]);
+    assert_eq!(got.nodes[1].parent_uri(), Some(root.as_str()));
+    assert!(got.nodes.iter().all(|n| !n.markers().more_parents));
+    assert_eq!(got.bridging, Bridging::Full);
+
+    // `parentHeight` bounds the chain; the top node says there is more.
+    let short = thread::Request { parent_height: 1, ..request };
+    let got = thread::get_thread(&l, &cfg, &key, short, None).await.expect("thread");
+    assert_eq!(shape(&got.nodes), [(middle.clone(), Some("blocked-by-you")), (leaf.clone(), None)]);
+    assert!(got.nodes[0].markers().more_parents);
+
+    // With bridging off the response is the ordinary view: it ends at the
+    // blocked parent, and says nothing more.
+    *fake.level.lock().expect("level") = "partial";
+    let got = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    assert_eq!(shape(&got.nodes), [(middle, Some("blocked-by-you")), (leaf, None)]);
+    assert_eq!(got.bridging, Bridging::Off);
+    db.drop_db().await;
+}

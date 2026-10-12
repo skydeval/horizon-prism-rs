@@ -865,6 +865,94 @@ pub async fn resolve(
 mod tests {
     use super::*;
 
+    const V: &str = "did:plc:vvvvvvvvvvvvvvvvvvvvvvvv";
+    const A: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+    const C: &str = "did:plc:cccccccccccccccccccccccc";
+
+    fn uri(did: &str, rkey: &str) -> String {
+        format!("at://{did}/app.bsky.feed.post/{rkey}")
+    }
+
+    fn view(did: &str, rkey: &str, parent: Option<&str>) -> Value {
+        let mut record = json!({"text": rkey});
+        if let Some(p) = parent {
+            record["reply"] = json!({"parent": {"uri": p}, "root": {"uri": p}});
+        }
+        json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": {"uri": uri(did, rkey), "cid": "c", "author": {"did": did}, "record": record}})
+    }
+
+    /// The ordinary view's tree becomes parents, the anchor, then replies
+    /// level by level; a stub the viewer is a party to says which way.
+    #[tokio::test]
+    async fn the_baseline_tree_is_flattened_in_order() {
+        let judge = Judge::judged(V, &[B], &[C], &[A]);
+        let mut tree = view(A, "anchor", Some(&uri(A, "root")));
+        tree["parent"] = view(A, "root", None);
+        let mut first = view(A, "r1", Some(&uri(A, "anchor")));
+        first["replies"] = json!([view(A, "r1a", Some(&uri(A, "r1")))]);
+        tree["replies"] = json!([
+            first,
+            {"$type": "app.bsky.feed.defs#blockedPost", "uri": uri(B, "mine"), "blocked": true},
+            {"$type": "app.bsky.feed.defs#blockedPost", "uri": uri(C, "theirs"), "blocked": true},
+            {"$type": "app.bsky.feed.defs#blockedPost", "uri": uri(A, "others"), "blocked": true},
+            {"$type": "app.bsky.feed.defs#notFoundPost", "uri": uri(A, "gone"), "notFound": true},
+        ]);
+        let (nodes, levels) = flatten(&tree, &judge);
+        let got: Vec<(String, Option<&str>)> = nodes
+            .iter()
+            .map(|n| match n {
+                LensNode::Post { uri, .. } => (uri.clone(), None),
+                LensNode::Gap { uri, gap, .. } => (uri.clone(), Some(gap.label())),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (uri(A, "root"), None),
+                (uri(A, "anchor"), None),
+                (uri(A, "r1"), None),
+                (uri(B, "mine"), Some("blocked-by-you")),
+                (uri(C, "theirs"), Some("blocking-you")),
+                (uri(A, "others"), Some("blocked")),
+                (uri(A, "gone"), Some("not-found")),
+                (uri(A, "r1a"), None),
+            ]
+        );
+        assert_eq!((levels[&uri(A, "anchor")], levels[&uri(A, "r1")], levels[&uri(A, "r1a")]), (0, 1, 2));
+        // A stub keeps the parent the tree placed it under.
+        assert_eq!(nodes[3].parent_uri(), Some(uri(A, "anchor").as_str()));
+    }
+
+    /// An embedded record by an author the viewer has a block with
+    /// becomes `#viewBlocked`, at any depth; any other is left alone.
+    #[tokio::test]
+    async fn embedded_records_by_blocked_authors_are_replaced() {
+        let judge = Judge::judged(V, &[B], &[C], &[A]);
+        let record = |did: &str, rkey: &str| json!({"$type": "app.bsky.embed.record#viewRecord", "uri": uri(did, rkey), "author": {"did": did, "handle": "h"}, "value": {"text": "secret"}});
+        let mut nested = record(A, "outer");
+        nested["value"] = json!({"text": "kept too"});
+        nested["embeds"] = json!([{"$type": "app.bsky.embed.record#view", "record": record(C, "inner")}]);
+        let mut embed = json!({
+            "$type": "app.bsky.embed.recordWithMedia#view",
+            "media": {"$type": "app.bsky.embed.images#view", "images": []},
+            "record": {"record": nested},
+            "also": [
+                record(B, "quoted"),
+                {"$type": "app.bsky.graph.defs#listView", "uri": format!("at://{B}/app.bsky.graph.list/l"), "creator": {"did": B}, "name": "secret list"},
+                {"$type": "app.bsky.feed.defs#generatorView", "uri": format!("at://{A}/app.bsky.feed.generator/g"), "creator": {"did": A}, "displayName": "kept"},
+            ],
+        });
+        enforce_embeds(&mut embed, &judge);
+        let text = embed.to_string();
+        assert!(!text.contains("secret"), "{text}");
+        assert!(text.contains("kept") && text.contains(&uri(A, "outer")));
+        // The viewer blocks B; C blocks the viewer.
+        assert_eq!(embed["also"][0], json!({"$type": "app.bsky.embed.record#viewBlocked", "uri": uri(B, "quoted"), "blocked": true, "author": {"did": B, "viewer": {"blockedBy": false}}}));
+        assert_eq!(embed["record"]["record"]["embeds"][0]["record"]["author"]["viewer"]["blockedBy"], json!(true));
+        assert_eq!(embed["also"][1]["$type"], "app.bsky.embed.record#viewBlocked");
+    }
+
     #[test]
     fn a_uris_form_decides_before_anything_else() {
         let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
