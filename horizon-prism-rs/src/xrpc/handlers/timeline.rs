@@ -21,5 +21,5 @@ pub async fn get_timeline(
     let access = Access::Member { ready: true, enroll: true };
     let req = prepare(&s, &headers, peer, GET_TIMELINE, access, false).await?;
     let p = Params::parse(q.as_deref());
-    respond(s.hydrator.get_timeline(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+    respond(&req.req, s.hydrator.get_timeline(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
 }

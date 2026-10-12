@@ -26,7 +26,31 @@ commit.
   that accepts anonymous calls is a startup error. `service_proxy_member`
   and `service_proxy_ip` are accepted and validated; nothing charges them
   until service proxying is built.
-- **Item 10: pools and fair shares, not yet wired (#669).** `xrpc::pools`
+- **Item 10: upstream calls draw on pools and shares (#669).** Every
+  request carries a handle naming who is charged (a ready member by DID,
+  everyone else by IP key) and one 6 s deadline that all its cascades
+  share, in place of 6 s per cascade (design-v3 §II-8.3). Each outbound
+  network's `rate_per_sec`/`burst` bucket, Slingshot
+  (`microcosm.slingshot_rate_per_sec`) and request-origin Constellation
+  (`microcosm.constellation_rate_per_sec`) are now split into a member pool
+  and a non-member pool with per-requester shares. With the defaults a
+  single non-member address gets 2.5 calls a second (burst 5) to Bluesky's
+  AppView, where every caller shared 20 a second before. An empty share or
+  pool is no answer: it stops the cascade and its fallbacks for that item,
+  is never recorded by a breaker, and never turns into a not-found.
+  - A single-subject request that then finds nothing (`getProfile`,
+    `getPostThread`, an actor that does not resolve) answers
+    `429 RateLimitExceeded` with `ratelimit-reset`, not "not found".
+  - `getLikes`, `getRepostedBy`, `getQuotes` and `getFollowers` answer 429
+    when there is no budget for the Constellation listing, and no longer
+    fall back to local rows in that case.
+  - Posts and profiles inside a list are left out; a thread's parent chain
+    stops without a not-found item; counts use the stored or local value;
+    Thread Lens reports `upstream-unavailable`.
+  - A cascade cut by the request's deadline is no answer too.
+  Not yet charged: PLC and handle resolution, author-PDS listings, and the
+  rule that a cascade or PDS listing with nothing to show answers 429.
+- **Item 10: pools and fair shares (#669).** `xrpc::pools`
   holds the shared upstream bucket of design-v3 §II-8.3: a member pool and
   a non-member pool (`constellation.nonmember_fraction`, default 0.5), and
   inside each a per-requester share (`constellation.requester_share`,
@@ -37,8 +61,7 @@ commit.
   `microcosm.slingshot_rate_per_sec`/`_burst`,
   `microcosm.constellation_rate_per_sec`/`_burst`,
   `identity.plc_request_rate_per_sec`/`_burst` and
-  `identity.requester_resolutions_per_sec`/`_burst`. No upstream call draws
-  on these buckets yet.
+  `identity.requester_resolutions_per_sec`/`_burst`.
 - **Item 10: IPv6 callers are limited per `/64`.** Every IP-keyed rate
   limit (anonymous reads and search, `resolve`, the per-IP backstop) keys
   an IPv6 address by its `/64`, and an IPv4-mapped address by its IPv4

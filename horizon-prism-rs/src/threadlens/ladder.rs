@@ -133,12 +133,12 @@ impl Ladder {
                         cascade = CascadeOutcome::Answered;
                     }
                     exhausted if exhausted.all_transient() => cascade = CascadeOutcome::AllTransient,
-                    Fetched::Exhausted(_) => cascade = CascadeOutcome::Answered,
+                    Fetched::Exhausted(_) | Fetched::NoAnswer(_) => cascade = CascadeOutcome::Answered,
                 }
             }
         }
         // 4. Slingshot.
-        let slingshot = match self.slingshot.get_record(uri).await {
+        let slingshot = match self.slingshot.get_record(req, uri).await {
             Ok(record) => {
                 let handle = self
                     .router
@@ -151,7 +151,9 @@ impl Ladder {
                 return self.upstream_view(uri, view).await;
             }
             Err(SlingshotError::NotFound) => SlingshotOutcome::NotFound,
-            Err(SlingshotError::Transient(_) | SlingshotError::Invalid(_)) => SlingshotOutcome::Unavailable,
+            Err(SlingshotError::Transient(_) | SlingshotError::Invalid(_) | SlingshotError::NoBudget) => {
+                SlingshotOutcome::Unavailable
+            }
         };
         // 5. Classify.
         let active = self.hydrator.account_known_active(&author).await?;

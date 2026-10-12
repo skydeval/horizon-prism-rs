@@ -28,7 +28,7 @@ pub async fn get_mutes(
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, GET_MUTES, MEMBER, false).await?;
     let p = Params::parse(q.as_deref());
-    respond(s.hydrator.get_mutes(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+    respond(&req.req, s.hydrator.get_mutes(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
 }
 
 fn input(body: &[u8]) -> Result<(String, Value), XrpcError> {
@@ -64,7 +64,7 @@ pub async fn mute_actor(
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, MUTE_ACTOR, MEMBER, true).await?;
     let (actor, v) = input(&body)?;
-    respond(s.hydrator.set_mute(&req.viewer, &req.req, &actor,Some(scope_of(&v)?)).await)
+    respond(&req.req, s.hydrator.set_mute(&req.viewer, &req.req, &actor,Some(scope_of(&v)?)).await)
 }
 
 pub async fn unmute_actor(
@@ -74,5 +74,5 @@ pub async fn unmute_actor(
     body: axum::body::Bytes,
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, UNMUTE_ACTOR, MEMBER, true).await?;
-    respond(s.hydrator.set_mute(&req.viewer, &req.req, &actor_of(&body)?, None).await)
+    respond(&req.req, s.hydrator.set_mute(&req.viewer, &req.req, &actor_of(&body)?, None).await)
 }

@@ -5,9 +5,11 @@
 //! classified (§8.3); the first `hit` ends the cascade.
 //!
 //! **Limits.**
-//! - 3 s per call (the client's), 6 s for the whole cascade.
-//! - A per-network token bucket (`rate_per_sec`/`burst`). An empty bucket
-//!   counts as transient and skips the network; requests never queue.
+//! - 3 s per call (the client's), and the request's 6 s deadline, which
+//!   every cascade of one request shares (design-v3 §II-8.3).
+//! - A per-network request bucket (`rate_per_sec`/`burst`), split into a
+//!   member pool and a non-member pool with per-requester shares. An empty
+//!   share or pool is no answer and stops the plan; requests never queue.
 //! - A per-network breaker: 5 consecutive `transient`/`auth-refused` calls
 //!   open it for 30 s; then one half-open probe is let through. A probe that
 //!   fails re-opens it; any other answer closes it. An open breaker skips
@@ -17,21 +19,17 @@
 //!   gives the slot back, so the next call probes instead.
 
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde_json::Value;
 
 use super::classifier::{Class, classify};
 use super::routing::RoutingTable;
 use crate::appview_clients::AppViewClient;
 use crate::net::{NetError, NetResponse};
-use crate::xrpc::pools::Requester;
+use crate::xrpc::pools::{Requester, SharedBucket, Shares};
 
-/// The whole cascade's budget per request (§8.3).
-pub const CASCADE_BUDGET: Duration = Duration::from_secs(6);
 /// Consecutive failures that open a breaker.
 pub const BREAKER_THRESHOLD: u32 = 5;
 /// How long an open breaker stays open.
@@ -204,6 +202,10 @@ pub enum Fetched {
     Hit { network: String, body: Value },
     /// No hit; every network tried (or skipped) with its class.
     Exhausted(Vec<(String, Class)>),
+    /// The plan stopped early: the requester's share or pool was empty, or
+    /// the request's deadline passed. The networks tried before that are
+    /// listed, but the result is no answer whatever they said.
+    NoAnswer(Vec<(String, Class)>),
 }
 
 impl Fetched {
@@ -211,24 +213,26 @@ impl Fetched {
     pub fn hit(self) -> Option<Value> {
         match self {
             Self::Hit { body, .. } => Some(body),
-            Self::Exhausted(_) => None,
+            Self::Exhausted(_) | Self::NoAnswer(_) => None,
         }
     }
 
     /// No network answered with a miss or a withheld response: every one was
-    /// transient, auth-refused, rate-limited or behind an open breaker.
+    /// transient, auth-refused or behind an open breaker, or the plan
+    /// stopped early.
     #[must_use]
     pub fn all_transient(&self) -> bool {
         match self {
             Self::Hit { .. } => false,
             Self::Exhausted(attempts) => attempts.iter().all(|(_, c)| c.is_failure()),
+            Self::NoAnswer(_) => true,
         }
     }
 }
 
 struct NetworkState {
     client: AppViewClient,
-    limiter: Option<DefaultDirectRateLimiter>,
+    bucket: Option<SharedBucket>,
     breaker: SharedBreaker,
 }
 
@@ -240,23 +244,22 @@ pub struct Cascade {
 }
 
 impl Cascade {
-    /// One state per client; the token bucket comes from the table.
+    /// One state per client; the request bucket comes from the table and is
+    /// split into pools and shares (design-v3 §II-8.3).
     #[must_use]
-    pub fn new(table: Arc<RoutingTable>, clients: Vec<AppViewClient>) -> Self {
+    pub fn new(table: Arc<RoutingTable>, clients: Vec<AppViewClient>, shares: &Shares) -> Self {
         let networks = clients
             .into_iter()
             .map(|client| {
-                let limiter = table.network(client.network()).and_then(|n| n.rate).map(|(rate, burst)| {
-                    RateLimiter::direct(
-                        Quota::per_second(NonZeroU32::new(rate).unwrap_or(NonZeroU32::MIN))
-                            .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::MIN)),
-                    )
-                });
+                let bucket = table
+                    .network(client.network())
+                    .and_then(|n| n.rate)
+                    .map(|(rate, burst)| shares.bucket("network", f64::from(rate), burst));
                 (
                     client.network().to_string(),
                     NetworkState {
                         client,
-                        limiter,
+                        bucket,
                         breaker: SharedBreaker::default(),
                     },
                 )
@@ -289,8 +292,8 @@ impl Cascade {
     }
 
     /// Run `call` through the plan for a DID whose home network is `home`.
-    pub async fn fetch(&self, _req: &Requester, home: Option<&str>, call: Call<'_>) -> Fetched {
-        let deadline = Instant::now() + CASCADE_BUDGET;
+    pub async fn fetch(&self, req: &Requester, home: Option<&str>, call: Call<'_>) -> Fetched {
+        let deadline = req.deadline();
         let mut attempts = Vec::new();
         for name in self.table.plan(home) {
             let Some(state) = self.networks.get(&name) else {
@@ -298,7 +301,8 @@ impl Cascade {
             };
             let now = Instant::now();
             if now >= deadline {
-                break;
+                metrics::counter!(METRIC_SKIPPED, "network" => name, "reason" => "deadline").increment(1);
+                return Fetched::NoAnswer(attempts);
             }
             // The admission is the probe-slot guard (design-v3 §II-8.3):
             // every exit below that does not record an outcome, and a drop
@@ -308,11 +312,13 @@ impl Cascade {
                 attempts.push((name, Class::Transient));
                 continue;
             };
-            if state.limiter.as_ref().is_some_and(|l| l.check().is_err()) {
-                metrics::counter!(METRIC_SKIPPED, "network" => name.clone(), "reason" => "rate_limited").increment(1);
+            // An empty share or pool is "no answer" and stops the plan: it
+            // is no breaker record, and no later network's miss may turn it
+            // into a not-found.
+            if state.bucket.as_ref().is_some_and(|b| !req.draw(b)) {
+                metrics::counter!(METRIC_SKIPPED, "network" => name, "reason" => "rate_limited").increment(1);
                 drop(admission);
-                attempts.push((name, Class::Transient));
-                continue;
+                return Fetched::NoAnswer(attempts);
             }
             let result = match tokio::time::timeout(deadline - now, call.invoke(&state.client)).await {
                 Ok(r) => r,
@@ -488,7 +494,7 @@ pub(crate) mod tests {
             .filter(|n| n.callable())
             .map(|n| AppViewClient::new(&n.name, n.appview_url.as_deref().unwrap_or_default(), AppViewAuth::Unauth, net.clone()))
             .collect();
-        Cascade::new(table, clients)
+        Cascade::new(table, clients, &Shares::for_tests())
     }
 
     #[tokio::test]
@@ -546,15 +552,36 @@ pub(crate) mod tests {
         }
         let table = Arc::new(RoutingTable::from_config(&cfg));
         let client = AppViewClient::new("bluesky", &hit, AppViewAuth::Unauth, NetClient::loopback_for_tests());
-        let cascade = Cascade::new(table, vec![client]);
-        let req = Requester::test();
+        let cascade = Cascade::new(table, vec![client], &Shares::for_tests());
+        // Burst 2 is one token in each pool. A ready member takes its own
+        // pool's, then the non-member pool's.
+        let member = Requester::new(crate::xrpc::pools::ChargeKey::member("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"));
         let mut hits = 0;
         for _ in 0..5 {
-            if cascade.fetch(&req, None, Call::Profile("x")).await.hit().is_some() {
+            if cascade.fetch(&member, None, Call::Profile("x")).await.hit().is_some() {
                 hits += 1;
             }
         }
-        assert_eq!((hits, calls.load(Ordering::SeqCst)), (2, 2), "burst 2, then skipped as transient without a call");
+        assert_eq!((hits, calls.load(Ordering::SeqCst)), (2, 2), "burst 2, then no answer without a call");
+        assert!(member.spent());
+        // Anyone else finds the non-member pool empty: no answer, the plan
+        // stops, and the request remembers it.
+        let req = Requester::test();
+        assert!(!req.spent());
+        let r = cascade.fetch(&req, None, Call::Profile("x")).await;
+        assert_eq!(r, Fetched::NoAnswer(Vec::new()));
+        assert!(r.all_transient() && req.spent());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(!cascade.breaker_open("bluesky"), "rate limiting is not an upstream failure");
+    }
+
+    #[tokio::test]
+    async fn a_passed_deadline_is_no_answer() {
+        let (missing, calls) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound", "message": "x"})).await;
+        let cascade = cascade_for(&[("bluesky", &missing), ("community-a", &missing)]);
+        let req = Requester::test().with_deadline(Instant::now());
+        let r = cascade.fetch(&req, None, Call::Profile("x")).await;
+        assert_eq!(r, Fetched::NoAnswer(Vec::new()));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

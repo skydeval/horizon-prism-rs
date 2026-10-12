@@ -250,6 +250,13 @@ impl Shares {
         }
     }
 
+    /// Shares for tests: one requester may use a whole pool.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_tests() -> Self {
+        Self::new(1.0, 0.5, 10_000)
+    }
+
     /// Live share entries (tests, metrics).
     #[must_use]
     pub fn entries(&self) -> u64 {
@@ -288,6 +295,12 @@ struct Inner {
 #[derive(Clone)]
 pub struct SharedBucket {
     inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for SharedBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedBucket").field("target_kind", &self.inner.target_kind).finish_non_exhaustive()
+    }
 }
 
 impl SharedBucket {
@@ -391,6 +404,13 @@ impl Requester {
         Self::of(None, IpAddr::from([192, 0, 2, 1]))
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     #[must_use]
     pub fn key(&self) -> &ChargeKey {
         &self.key
@@ -406,16 +426,29 @@ impl Requester {
     /// (§II-8.3 "Exhaustion"), and the request remembers it.
     #[must_use]
     pub fn draw(&self, bucket: &SharedBucket) -> bool {
-        match bucket.draw(&self.key) {
-            Ok(_) => true,
-            Err(e) => {
-                let mut seen = self.exhausted.lock().unwrap_or_else(PoisonError::into_inner);
-                if seen.is_none_or(|s| s.retry_after < e.retry_after) {
-                    *seen = Some(e);
-                }
-                false
+        self.try_draw(bucket).is_ok()
+    }
+
+    /// [`Requester::draw`], with what ran out.
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] when the share or pool is empty.
+    pub fn try_draw(&self, bucket: &SharedBucket) -> Result<(), Exhausted> {
+        bucket.draw(&self.key).map(|_| ()).inspect_err(|e| {
+            let mut seen = self.exhausted.lock().unwrap_or_else(PoisonError::into_inner);
+            if seen.is_none_or(|s| s.retry_after < e.retry_after) {
+                *seen = Some(*e);
             }
-        }
+        })
+    }
+
+    /// Whether any draw of this request found nothing. Once it has, the
+    /// request tries no further network or fallback tier for the item it
+    /// was fetching (§II-8.3 "Exhaustion").
+    #[must_use]
+    pub fn spent(&self) -> bool {
+        self.exhausted().is_some()
     }
 
     /// The longest wait among the draws of this request that found nothing.

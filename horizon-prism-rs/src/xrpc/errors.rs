@@ -7,6 +7,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use super::pools::Exhausted;
 use super::rate_limit::Limited;
 use crate::hydration::{HydrationError, ViewError};
 use crate::kryphocron_glue::AuthError;
@@ -97,8 +98,20 @@ impl From<ViewError> for XrpcError {
     }
 }
 
+impl From<Exhausted> for XrpcError {
+    fn from(e: Exhausted) -> Self {
+        Limited {
+            reset_epoch_secs: e.reset_epoch_secs(),
+        }
+        .into()
+    }
+}
+
 impl From<HydrationError> for XrpcError {
     fn from(e: HydrationError) -> Self {
+        if let HydrationError::NoBudget(exhausted) = e {
+            return exhausted.into();
+        }
         tracing::error!(event = "xrpc_internal_error", error = %e, "request failed");
         Self::internal()
     }

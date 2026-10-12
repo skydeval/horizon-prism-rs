@@ -9,7 +9,11 @@
 //!   anything else (including an oversized body) is
 //!   [`SlingshotError::Invalid`].
 
-use std::time::Duration;
+//! - Every call is charged to its request: it draws on the shared Slingshot
+//!   request bucket (design-v3 §II-8.3) and is not made once the request's
+//!   deadline has passed ([`SlingshotError::NoBudget`]).
+
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +21,7 @@ use url::Url;
 
 use crate::db::locks::uri_author;
 use crate::net::{BodyCap, NetClient, RequestOptions};
+use crate::xrpc::pools::{Requester, SharedBucket};
 
 /// Per-call timeout (§8.3).
 pub const TIMEOUT: Duration = Duration::from_secs(3);
@@ -42,6 +47,11 @@ pub enum SlingshotError {
     /// A malformed URI, an unexpected status, or an unusable body.
     #[error("slingshot answer unusable: {0}")]
     Invalid(String),
+    /// No call was made: the requester's share or pool of the Slingshot
+    /// request bucket is empty, or the request's deadline has passed
+    /// (design-v3 §II-8.3). No answer, like `Transient`.
+    #[error("no slingshot budget for this request")]
+    NoBudget,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +73,7 @@ fn parts(uri: &str) -> Option<(&str, &str, &str)> {
 pub struct SlingshotClient {
     net: NetClient,
     base: String,
+    bucket: Option<SharedBucket>,
 }
 
 impl SlingshotClient {
@@ -71,16 +82,28 @@ impl SlingshotClient {
         Self {
             net,
             base: base_url.trim_end_matches('/').to_string(),
+            bucket: None,
         }
     }
 
-    /// `getRecord` for an at-uri.
+    /// Draw every call on `bucket`, the shared Slingshot request bucket
+    /// (`microcosm.slingshot_rate_per_sec`).
+    #[must_use]
+    pub fn metered(mut self, bucket: SharedBucket) -> Self {
+        self.bucket = Some(bucket);
+        self
+    }
+
+    /// `getRecord` for an at-uri, charged to `req`.
     ///
     /// # Errors
     ///
     /// [`SlingshotError`].
-    pub async fn get_record(&self, uri: &str) -> Result<SlingshotRecord, SlingshotError> {
+    pub async fn get_record(&self, req: &Requester, uri: &str) -> Result<SlingshotRecord, SlingshotError> {
         let (repo, collection, rkey) = parts(uri).ok_or_else(|| SlingshotError::Invalid(format!("not a record URI: {uri}")))?;
+        if Instant::now() >= req.deadline() || self.bucket.as_ref().is_some_and(|b| !req.draw(b)) {
+            return Err(SlingshotError::NoBudget);
+        }
         let url = Url::parse_with_params(
             &format!("{}/xrpc/com.atproto.repo.getRecord", self.base),
             &[("repo", repo), ("collection", collection), ("rkey", rkey)],
@@ -138,17 +161,37 @@ mod tests {
         let client = SlingshotClient::new(NetClient::loopback_for_tests(), &base);
         let post = |rkey: &str| format!("at://{DID}/app.bsky.feed.post/{rkey}");
 
-        let hit = client.get_record(&post("hit")).await.expect("hit");
+        let req = &Requester::test();
+
+        let hit = client.get_record(req, &post("hit")).await.expect("hit");
         assert_eq!(hit.uri, post("hit"));
         assert_eq!(hit.cid.as_deref(), Some("bafyhit"));
         assert_eq!(hit.value["text"], "hi");
 
-        assert_eq!(client.get_record(&post("miss")).await, Err(SlingshotError::NotFound));
-        assert!(matches!(client.get_record(&post("down")).await, Err(SlingshotError::Transient(_))));
+        assert_eq!(client.get_record(req, &post("miss")).await, Err(SlingshotError::NotFound));
+        assert!(matches!(client.get_record(req, &post("down")).await, Err(SlingshotError::Transient(_))));
         // 300 KiB exceeds the 256 KiB getRecord cap.
-        assert!(matches!(client.get_record(&post("huge")).await, Err(SlingshotError::Invalid(e)) if e.contains("cap")));
-        assert!(matches!(client.get_record(&post("teapot")).await, Err(SlingshotError::Invalid(_))));
-        assert!(matches!(client.get_record("https://not-at-uri").await, Err(SlingshotError::Invalid(_))));
+        assert!(matches!(client.get_record(req, &post("huge")).await, Err(SlingshotError::Invalid(e)) if e.contains("cap")));
+        assert!(matches!(client.get_record(req, &post("teapot")).await, Err(SlingshotError::Invalid(_))));
+        assert!(matches!(client.get_record(req, "https://not-at-uri").await, Err(SlingshotError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn calls_draw_on_the_request_bucket_and_respect_the_deadline() {
+        let base = serve_fake(Router::new().route("/xrpc/com.atproto.repo.getRecord", get(fake))).await;
+        // 1/s, burst 2: one token in the non-member pool.
+        let bucket = crate::xrpc::pools::Shares::for_tests().bucket("slingshot", 1.0, 2);
+        let client = SlingshotClient::new(NetClient::loopback_for_tests(), &base).metered(bucket);
+        let uri = format!("at://{DID}/app.bsky.feed.post/hit");
+        let req = Requester::test();
+        client.get_record(&req, &uri).await.expect("the one token");
+        assert_eq!(client.get_record(&req, &uri).await, Err(SlingshotError::NoBudget));
+        assert!(req.spent());
+
+        let late = Requester::test().with_deadline(Instant::now());
+        let unmetered = SlingshotClient::new(NetClient::loopback_for_tests(), &base);
+        assert_eq!(unmetered.get_record(&late, &uri).await, Err(SlingshotError::NoBudget));
+        assert!(!late.spent(), "a passed deadline is not an empty pool");
     }
 
     #[test]

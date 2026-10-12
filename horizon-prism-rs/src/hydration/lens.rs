@@ -191,7 +191,10 @@ impl Hydrator {
                 .bind(i64::from(limit))
                 .fetch_all(self.pool())
                 .await?;
-        if let Some(page) = self.links_page(req, uri, super::feed::NSID_POST, ".reply.parent.uri", limit, None).await {
+        // With no budget for the listing, the remote replies are left out
+        // (design-v3 §II-8.3: a reply is omitted).
+        let remote = self.links_page(req, uri, super::feed::NSID_POST, ".reply.parent.uri", limit, None).await;
+        if let Ok(Some(page)) = remote {
             for r in page.linking_records {
                 let reply = format!("at://{}/{}/{}", r.did, r.collection, r.rkey);
                 if !out.contains(&reply) {

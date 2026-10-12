@@ -35,6 +35,7 @@ pub async fn list_notifications(
         return Err(XrpcError::invalid("Error: seenAt is not supported on listNotifications"));
     }
     respond(
+        &req.req,
         s.hydrator
             .list_notifications(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor"), &p.all("reasons"))
             .await,
@@ -58,7 +59,7 @@ pub async fn get_unread_count(
                 .with_timezone(&Utc),
         ),
     };
-    respond(s.hydrator.unread_count_since(&req.viewer, seen_at).await)
+    respond(&req.req, s.hydrator.unread_count_since(&req.viewer, seen_at).await)
 }
 
 pub async fn update_seen(
@@ -73,5 +74,5 @@ pub async fn update_seen(
         .ok()
         .and_then(|v| v.get("seenAt").and_then(Value::as_str).map(str::to_string))
         .ok_or_else(|| XrpcError::invalid("Error: Input must have the property \"seenAt\""))?;
-    respond(s.hydrator.update_seen(&req.viewer, &seen_at).await)
+    respond(&req.req, s.hydrator.update_seen(&req.viewer, &seen_at).await)
 }

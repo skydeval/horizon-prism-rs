@@ -43,6 +43,7 @@ use crate::kryphocron_glue::GlueContext;
 use crate::private_tier::handlers::PrivateState;
 use crate::private_tier::retention::PrivateRetention;
 use crate::private_tier::{KryphocronPrivateTier, PrivateTier};
+use crate::xrpc::pools::Shares;
 use crate::xrpc::{AppState, RateLimits};
 use health::{AuditLatch, HealthState};
 
@@ -287,12 +288,21 @@ pub async fn run() -> Result<(), StartupError> {
     // the upstream source behind hydration's seam.
     let table = Arc::new(RoutingTable::from_config(&cfg.file.constellation));
     let did_router = DidRouter::new(Arc::clone(&table), Arc::new(resolver.clone()) as Arc<dyn DidLookup>);
+    // Every upstream a public request reaches has one request bucket,
+    // split into pools and per-requester shares (design-v3 §II-8.3).
+    let shares = Shares::from_config(&cfg.file);
+    let microcosm = &cfg.file.microcosm;
     let cascade = Cascade::new(
         Arc::clone(&table),
         crate::appview_clients::from_config(&cfg.file.constellation, &net, &glue.service_key),
+        &shares,
     );
     let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes);
-    let slingshot = SlingshotClient::new(net.clone(), &cfg.file.microcosm.slingshot_url);
+    let slingshot = SlingshotClient::new(net.clone(), &microcosm.slingshot_url).metered(shares.bucket(
+        "slingshot",
+        microcosm.slingshot_rate_per_sec.0,
+        microcosm.slingshot_burst,
+    ));
     let upstream = RealUpstreamSource::new(
         did_router.clone(),
         cascade.clone(),
@@ -312,6 +322,11 @@ pub async fn run() -> Result<(), StartupError> {
         HydrationConfig {
             labeler_did: glue.service_key.did().to_string(),
             counts: cfg.file.counts.clone(),
+            constellation_bucket: Some(shares.bucket(
+                "constellation",
+                microcosm.constellation_rate_per_sec.0,
+                microcosm.constellation_burst,
+            )),
         },
     );
     let limits = RateLimits::from_config(&cfg.file.rate_limits);

@@ -21,7 +21,7 @@ pub async fn get_follows(
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, GET_FOLLOWS, Access::Opt, false).await?;
     let p = Params::parse(q.as_deref());
-    respond(s.hydrator.get_follows(&req.viewer, &req.req, p.required("actor")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+    respond(&req.req, s.hydrator.get_follows(&req.viewer, &req.req, p.required("actor")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
 }
 
 pub async fn get_followers(
@@ -33,6 +33,7 @@ pub async fn get_followers(
     let req = prepare(&s, &headers, peer, GET_FOLLOWERS, Access::Opt, false).await?;
     let p = Params::parse(q.as_deref());
     respond(
+        &req.req,
         s.hydrator
             .get_followers(&req.viewer, &req.req, p.required("actor")?, clamp_limit(p.u32("limit")?), p.one("cursor"))
             .await,

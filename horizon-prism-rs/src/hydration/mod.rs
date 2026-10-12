@@ -40,7 +40,7 @@ use crate::aggregations::counts::{self, Counts, Freshness};
 use crate::config::{CountsConfig, CountsSource};
 use crate::db::locks::uri_author;
 use crate::microcosm::ConstellationClient;
-use crate::xrpc::pools::Requester;
+use crate::xrpc::pools::{Exhausted, Requester, SharedBucket};
 
 /// Placeholder handle for DIDs without a verified handle (ATProto convention).
 pub const INVALID_HANDLE: &str = "handle.invalid";
@@ -54,6 +54,10 @@ pub const SYNC_BUDGET: Duration = Duration::from_secs(1);
 pub enum HydrationError {
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
+    /// A listing had no upstream budget before it produced anything
+    /// (design-v3 §II-8.3): `429 RateLimitExceeded`, never an empty page.
+    #[error("no upstream budget for this request")]
+    NoBudget(Exhausted),
 }
 
 /// A lexicon-level failure a handler returns as a 400.
@@ -112,6 +116,9 @@ pub struct HydrationConfig {
     /// `did:web:<host>`: the `src` of local labels (§7.8).
     pub labeler_did: String,
     pub counts: CountsConfig,
+    /// The shared bucket for request-origin Constellation calls
+    /// (`microcosm.constellation_rate_per_sec`); `None` leaves them unmetered.
+    pub constellation_bucket: Option<SharedBucket>,
 }
 
 struct Inner {
@@ -275,6 +282,15 @@ impl Hydrator {
 
     fn backlinks(&self) -> Option<&ConstellationClient> {
         self.inner.constellation.as_ref()
+    }
+
+    fn constellation_bucket(&self) -> Option<&SharedBucket> {
+        self.inner.cfg.constellation_bucket.as_ref()
+    }
+
+    /// Charge one request-origin Constellation listing call to `req`.
+    pub(super) fn draw_constellation(&self, req: &Requester) -> Result<(), Exhausted> {
+        self.constellation_bucket().map_or(Ok(()), |b| req.try_draw(b))
     }
 
     fn upstream(&self) -> &dyn UpstreamSource {
@@ -527,7 +543,7 @@ impl Hydrator {
 
     /// Constellation counts for targets under the §9.6 rule. Targets with no
     /// usable value are absent (the caller uses local counts).
-    pub async fn constellation_counts(&self, _req: &Requester, targets: &[String], mode: CountMode) -> HashMap<String, Counts> {
+    pub async fn constellation_counts(&self, req: &Requester, targets: &[String], mode: CountMode) -> HashMap<String, Counts> {
         let mut out = HashMap::new();
         let Some(client) = self.constellation() else {
             return out;
@@ -558,6 +574,12 @@ impl Hydrator {
                 let fetched: Vec<(String, Option<Counts>)> = futures::stream::iter(misses)
                     .map(|t| async move {
                         if started.elapsed() >= SYNC_BUDGET {
+                            return (t, None);
+                        }
+                        // No budget: the stored or local count is used, and
+                        // the request is not marked (design-v3 §II-8.3:
+                        // counts never turn a response into a 429).
+                        if self.constellation_bucket().is_some_and(|b| b.draw(req.key()).is_err()) {
                             return (t, None);
                         }
                         let result = tokio::time::timeout(SYNC_TIMEOUT, counts::fetch(client, &t)).await;
@@ -625,6 +647,7 @@ pub(crate) mod testing {
             HydrationConfig {
                 labeler_did: LABELER.into(),
                 counts: CountsConfig::default(),
+                constellation_bucket: None,
             },
         )
     }

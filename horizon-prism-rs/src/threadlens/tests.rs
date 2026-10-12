@@ -93,7 +93,7 @@ fn ladder(pool: &PgPool, base: &str, lookup: Arc<StubLookup>) -> Ladder {
     Ladder::new(
         hydrator(pool, ScopeSets::default()),
         DidRouter::new(Arc::clone(&table), lookup as Arc<dyn DidLookup>),
-        Cascade::new(table, clients),
+        Cascade::new(table, clients, &crate::xrpc::pools::Shares::for_tests()),
         SlingshotClient::new(net, base),
     )
 }

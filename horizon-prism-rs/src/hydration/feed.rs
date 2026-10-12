@@ -14,7 +14,8 @@ use crate::aggregations::counts::Counts;
 use crate::db::locks::uri_author;
 use crate::firehose::normalize::blob_cid;
 use crate::moderation::{self, Gate};
-use crate::xrpc::pools::Requester;
+use crate::hydration::HydrationError;
+use crate::xrpc::pools::{Exhausted, Requester};
 
 pub const NSID_LIKE: &str = "app.bsky.feed.like";
 pub const NSID_REPOST: &str = "app.bsky.feed.repost";
@@ -591,29 +592,39 @@ impl Hydrator {
         Ok(Ok(Self::emit(out)))
     }
 
-    /// A Constellation `/links` page through the read-time cache.
+    /// A Constellation `/links` page through the read-time cache. `Ok(None)`
+    /// is Constellation unavailable, where the caller falls back to local
+    /// rows.
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] when the requester has no budget for the call. That is
+    /// no answer, and never the local fallback (design-v3 §II-8.3).
     pub(super) async fn links_page(
         &self,
-        _req: &Requester,
+        req: &Requester,
         target: &str,
         collection: &str,
         path: &str,
         limit: u32,
         cursor: Option<&str>,
-    ) -> Option<crate::microcosm::LinksPage> {
-        let client = self.backlinks()?;
+    ) -> Result<Option<crate::microcosm::LinksPage>, Exhausted> {
+        let Some(client) = self.backlinks() else {
+            return Ok(None);
+        };
         let key = format!("links|{target}|{collection}|{path}|{limit}|{}", cursor.unwrap_or_default());
         if let Some(page) = self.cache().get_json(&key).await {
-            return Some(page);
+            return Ok(Some(page));
         }
+        self.draw_constellation(req)?;
         match client.links(target, collection, path, limit, cursor).await {
             Ok(page) => {
                 self.cache().put_json(&key, &page).await;
-                Some(page)
+                Ok(Some(page))
             }
             Err(error) => {
                 tracing::debug!(event = "constellation_links_failed", %error, target, "falling back to local rows");
-                None
+                Ok(None)
             }
         }
     }
@@ -628,11 +639,16 @@ impl Hydrator {
         collection: &str,
         limit: u32,
         cursor: Option<&str>,
-    ) -> Result<(Vec<(String, DateTime<Utc>)>, Option<String>), sqlx::Error> {
+    ) -> Result<(Vec<(String, DateTime<Utc>)>, Option<String>), HydrationError> {
         let remote_cursor = cursor.and_then(|c| c.strip_prefix("C:"));
-        if !cursor.is_some_and(|c| c.starts_with("L:"))
-            && let Some(page) = self.links_page(req, uri, collection, ".subject.uri", limit, remote_cursor).await
-        {
+        let remote = if cursor.is_some_and(|c| c.starts_with("L:")) {
+            None
+        } else {
+            self.links_page(req, uri, collection, ".subject.uri", limit, remote_cursor)
+                .await
+                .map_err(HydrationError::NoBudget)?
+        };
+        if let Some(page) = remote {
             let mut seen = HashSet::new();
             let actors = page
                 .linking_records
@@ -735,13 +751,19 @@ impl Hydrator {
         let remote = if cursor.is_some_and(|c| c.starts_with("L:")) {
             None
         } else {
+            // No budget for either listing is a 429 for the page: a partial
+            // page would lose the other listing's cursor.
             let a = if cursor.is_none() || c1.is_some() {
-                self.links_page(req, uri, NSID_POST, ".embed.record.uri", limit, c1).await
+                self.links_page(req, uri, NSID_POST, ".embed.record.uri", limit, c1)
+                    .await
+                    .map_err(HydrationError::NoBudget)?
             } else {
                 None
             };
             let b = if cursor.is_none() || c2.is_some() {
-                self.links_page(req, uri, NSID_POST, ".embed.record.record.uri", limit, c2).await
+                self.links_page(req, uri, NSID_POST, ".embed.record.record.uri", limit, c2)
+                    .await
+                    .map_err(HydrationError::NoBudget)?
             } else {
                 None
             };

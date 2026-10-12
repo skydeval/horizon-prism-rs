@@ -9,6 +9,7 @@ use super::actor::ProfileKind;
 use super::feed::{local_cursor, parse_local_cursor};
 use super::{Hydrator, ViewError, ViewResult, Viewer};
 use crate::moderation::{self, Gate};
+use crate::hydration::HydrationError;
 use crate::xrpc::pools::Requester;
 
 pub const NSID_FOLLOW: &str = "app.bsky.graph.follow";
@@ -132,6 +133,9 @@ impl Hydrator {
             && let Some(client) = self.backlinks()
         {
             let remote = cursor.and_then(|c| c.strip_prefix("C:"));
+            // No budget is a 429, never the local fallback (design-v3
+            // §II-8.3).
+            self.draw_constellation(req).map_err(HydrationError::NoBudget)?;
             match client.distinct_dids_page(&did, NSID_FOLLOW, ".subject", limit, remote).await {
                 Ok(page) => {
                     let next = page.cursor.map(|c| format!("C:{c}"));

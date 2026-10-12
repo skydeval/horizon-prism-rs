@@ -328,7 +328,7 @@ impl RealUpstreamSource {
         if let Some(v) = self.cache.get_json::<Value>(&key).await {
             return Some(v);
         }
-        let record = self.slingshot.get_record(uri).await.ok()?;
+        let record = self.slingshot.get_record(req, uri).await.ok()?;
         let handle = self.handle_of(req, uri_author(uri)?).await;
         let view = post_from_record(uri, record.cid.as_deref(), &handle, &record.value);
         self.cache.put_json(&key, &view).await;
@@ -439,9 +439,11 @@ impl UpstreamSource for RealUpstreamSource {
         }
         let view = match self.cascade(req, actor, Call::Profile(actor)).await {
             Some(v) => v,
+            // An empty share or pool stops the plan (design-v3 §II-8.3).
+            None if req.spent() => return None,
             None => {
                 // Slingshot profile record (§7.1).
-                let record = self.slingshot.get_record(&format!("at://{actor}/{NSID_PROFILE}/self")).await.ok()?;
+                let record = self.slingshot.get_record(req, &format!("at://{actor}/{NSID_PROFILE}/self")).await.ok()?;
                 let summary = self.router.lookup().summary(req, actor).await.unwrap_or_default();
                 let handle = summary.handle.unwrap_or_else(|| INVALID_HANDLE.to_string());
                 profile_from_record(actor, &handle, summary.pds.as_deref(), &record.value)
@@ -462,6 +464,11 @@ impl UpstreamSource for RealUpstreamSource {
             }
         }
         for (author, group) in &by_author {
+            // Once a share or pool is empty, the remaining posts are left
+            // out (design-v3 §II-8.3: list items are omitted).
+            if req.spent() {
+                break;
+            }
             if let Some(body) = self.cascade(req, author, Call::Posts(group)).await {
                 for post in body.get("posts").and_then(Value::as_array).into_iter().flatten() {
                     if let Some(uri) = post.get("uri").and_then(Value::as_str).filter(|u| group.iter().any(|g| g == u)) {
@@ -474,7 +481,7 @@ impl UpstreamSource for RealUpstreamSource {
         let missing: Vec<String> = by_author.into_values().flatten().filter(|u| !found.contains_key(u)).collect();
         let fetched: Vec<(String, Option<Value>)> = futures::stream::iter(missing)
             .map(|uri| async move {
-                let v = self.slingshot_post(req, &uri).await;
+                let v = if req.spent() { None } else { self.slingshot_post(req, &uri).await };
                 (uri, v)
             })
             .buffer_unordered(SLINGSHOT_CONCURRENCY)
@@ -496,6 +503,9 @@ impl UpstreamSource for RealUpstreamSource {
         if let Some(v) = self.cascade(req, author, Call::PostThread { uri, depth, parent_height }).await {
             return Some(v);
         }
+        if req.spent() {
+            return None;
+        }
         // Slingshot: the anchor and its parent chain (§7.1).
         let anchor = self.slingshot_post(req, uri).await?;
         let mut chain: Vec<Value> = Vec::new();
@@ -513,6 +523,9 @@ impl UpstreamSource for RealUpstreamSource {
                     next = post.pointer("/record/reply/parent/uri").and_then(Value::as_str).map(str::to_string);
                     chain.push(json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": post}));
                 }
+                // The chain stops at a parent it had no budget to fetch,
+                // without calling it not-found (design-v3 §II-8.3).
+                None if req.spent() => break,
                 None => {
                     chain.push(json!({"$type": "app.bsky.feed.defs#notFoundPost", "uri": p, "notFound": true}));
                     break;
@@ -541,6 +554,9 @@ impl UpstreamSource for RealUpstreamSource {
         {
             return Some(v);
         }
+        if req.spent() {
+            return None;
+        }
         self.pds_feed(req, actor, limit, cursor, filter).await
     }
 
@@ -549,6 +565,9 @@ impl UpstreamSource for RealUpstreamSource {
             && let Some(v) = self.cascade(req, actor, Call::Follows { actor, limit, cursor }).await
         {
             return Some(v);
+        }
+        if req.spent() {
+            return None;
         }
         // The author PDS `listRecords app.bsky.graph.follow` (§7.1).
         let pds = self.router.lookup().summary(req, actor).await?.pds?;
