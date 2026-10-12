@@ -3,8 +3,9 @@
 //! - Both are procedures (POST, JSON input).
 //! - **Auth** is required (a service JWT, §6.8). The authenticated DID is
 //!   used for the auth gate and the rate-limit key (2/s, burst 10) and is
-//!   then dropped: [`gate`] returns only a charge handle keyed by the client
-//!   address, so no later step can hydrate, filter or classify by it.
+//!   then dropped: [`gate`] returns only the request's charge handle (a
+//!   rate-limit key), which no later step hydrates, filters or classifies
+//!   by.
 //! - **Non-enumeration:** every per-URI failure is a typed gap. Request-level
 //!   failures (malformed body, bad parameters, too many URIs) are
 //!   `400 InvalidRequest` and depend only on the input.
@@ -27,7 +28,7 @@ use crate::hydration::PublicEmit;
 use crate::hydration::lens::{LensNode, lens_items, lens_thread};
 use crate::xrpc::AppState;
 use crate::xrpc::errors::XrpcError;
-use crate::xrpc::auth::request_ip;
+use crate::xrpc::auth::{authenticate, request_handle, request_ip};
 use crate::xrpc::pools::Requester;
 use crate::xrpc::rate_limit::Family;
 
@@ -51,15 +52,16 @@ pub fn router(state: ThreadLensState) -> Router {
         .with_state(state)
 }
 
-/// Authenticate and rate-limit. Returns only the request's charge handle,
-/// keyed by the client address, so the caller's identity still does not
-/// leave this function (§10.1, §10.3).
+/// Authenticate and rate-limit. Returns only the request's charge handle:
+/// the key its upstream calls are rate-limited under (the client address,
+/// or a ready member's DID when the backstop matched one). Nothing reads it
+/// to hydrate, filter or classify (§10.1, §10.3).
 async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method: &str) -> Result<Requester, XrpcError> {
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let caller = s.app.auth.verify(authorization, method).await?;
+    let caller = authenticate(&s.app, authorization, method).await?;
     let ip = request_ip(&s.app, headers, peer);
     s.app.limits.charge(method, Family::ThreadLens, Some(&caller.did), ip)?;
-    Ok(Requester::of(None, ip))
+    Ok(request_handle(None, ip))
 }
 
 fn at_uri(u: &str) -> bool {

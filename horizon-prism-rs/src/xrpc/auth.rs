@@ -11,23 +11,37 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 
 use super::AppState;
+use super::backstop::{self, Claims};
 use super::errors::XrpcError;
-use super::pools::Requester;
+use super::member_keys::KeyAge;
+use super::pools::{ChargeKey, Requester};
 use super::rate_limit::{Family, client_ip};
 use crate::aggregations::enroll::Enrollment;
 use crate::hydration::Viewer;
-use crate::kryphocron_glue::jwt::IssuerRefresh;
+use crate::kryphocron_glue::jwt::{IssuerRefresh, MemoryVerdict};
 use crate::kryphocron_glue::{AuthError, JwtVerifier, VerifiedCaller};
 
 /// Verifies `Authorization` headers for a method.
 #[async_trait]
 pub trait Authenticator: Send + Sync {
     async fn verify(&self, authorization: Option<&str>, method: &str) -> Result<VerifiedCaller, AuthError>;
+
+    /// The backstop's claims pre-check on the token's unverified payload
+    /// ([`backstop::precheck`]). `None` by default: nothing is pre-verified.
+    fn precheck(&self, _authorization: &str, _method: &str) -> Option<Claims> {
+        None
+    }
+
+    /// Verify against one in-memory DID document, with no network call.
+    async fn verify_in_memory(&self, _authorization: &str, _method: &str, _document: &[u8]) -> MemoryVerdict {
+        MemoryVerdict::NotVerified
+    }
 }
 
 #[async_trait]
@@ -35,6 +49,56 @@ impl<F: IssuerRefresh> Authenticator for JwtVerifier<F> {
     async fn verify(&self, authorization: Option<&str>, method: &str) -> Result<VerifiedCaller, AuthError> {
         self.verify_request_jwt(authorization, method).await
     }
+
+    fn precheck(&self, authorization: &str, method: &str) -> Option<Claims> {
+        backstop::precheck(authorization, self.service_did(), method, self.config(), SystemTime::now())
+    }
+
+    async fn verify_in_memory(&self, authorization: &str, method: &str, document: &[u8]) -> MemoryVerdict {
+        JwtVerifier::verify_in_memory(self, authorization, method, document).await
+    }
+}
+
+/// Authenticate a request's token for `method` (§6.8).
+///
+/// - A caller the backstop already verified with a fresh in-memory key is
+///   returned as is: the token is not verified twice.
+/// - Otherwise the verifier runs, under §II-6.7's freshness rule. If the
+///   issuer lookup found no budget, the answer is `429`, never `401`
+///   (design-v3 §II-8.3, R3-212).
+///
+/// # Errors
+///
+/// `AuthRequired`, `InvalidToken` or `RateLimitExceeded`.
+pub async fn authenticate(state: &AppState, authorization: Option<&str>, method: &str) -> Result<VerifiedCaller, XrpcError> {
+    let selected = backstop::selected();
+    if let (Some(s), Some(a)) = (&selected, authorization)
+        && let Some(caller) = s.verified(a)
+    {
+        return Ok(caller);
+    }
+    match state.auth.verify(authorization, method).await {
+        Ok(caller) => {
+            // A verification here with a fresh key is a recent success for
+            // the caller at this IP key (R3-233).
+            if let (Some(b), Some(ChargeKey::Ip(ip))) = (state.limits.backstop(), selected.as_ref().map(|s| s.req.key()))
+                && let Some(key) = b.keys.get(&caller.did)
+                && key.age(chrono::Utc::now()) == Some(KeyAge::Fresh)
+            {
+                b.limits.record_prepare_success(*ip, &caller.did, key.print);
+            }
+            Ok(caller)
+        }
+        Err(e) => Err(selected.and_then(|s| s.req.exhausted()).map_or_else(|| e.into(), Into::into)),
+    }
+}
+
+/// The handle a request's upstream calls are charged to: the one the
+/// backstop selected, or, where no backstop ran (tests), a ready member's
+/// DID or the IP key.
+#[must_use]
+pub fn request_handle(ready_member: Option<&str>, ip: IpAddr) -> Requester {
+    backstop::selected().map_or_else(|| Requester::of(ready_member, ip), |s| s.req)
 }
 
 /// The viewer column of §7.1.
@@ -130,7 +194,7 @@ pub async fn prepare(
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
     let caller = match (access, authorization) {
         (Access::Opt, None) => None,
-        _ => Some(state.auth.verify(authorization, method).await?),
+        _ => Some(authenticate(state, authorization, method).await?),
     };
     let family = if write { Family::Write } else { Family::Read };
     state.limits.charge(method, family, caller.as_ref().map(|c| c.did.as_str()), ip)?;
@@ -155,7 +219,7 @@ pub async fn prepare(
         }
     }
     let viewer = state.hydrator.viewer(caller_did.as_deref()).await?;
-    let req = Requester::of(viewer.state_did(), ip);
+    let req = request_handle(viewer.state_did(), ip);
     // Mute management works before readiness: act as the caller.
     let viewer = if matches!(access, Access::Member { ready: false, .. }) && !viewer.hydrate {
         Viewer {
@@ -185,7 +249,7 @@ pub async fn prepare_private(
     method: &str,
 ) -> Result<VerifiedCaller, XrpcError> {
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let caller = state.auth.verify(authorization, method).await?;
+    let caller = authenticate(state, authorization, method).await?;
     let ip = request_ip(state, headers, peer);
     state.limits.charge(method, Family::Private, Some(&caller.did), ip)?;
     match member_state(state, &caller.did).await? {

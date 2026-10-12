@@ -33,6 +33,7 @@ use governor::clock::{Clock, DefaultClock};
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use tokio::task::JoinHandle;
 
+use super::backstop::Backstop;
 use crate::config::{RateClassConfig, RateLimitsConfig};
 
 /// A bucket class.
@@ -234,6 +235,9 @@ pub struct RateLimits {
     /// The family of each served method: the compiled default, or the
     /// operator's `endpoint_class` override.
     families: Arc<HashMap<String, Family>>,
+    /// The pre-auth backstop (design-v3 §II-8.3); `None` charges every
+    /// request to its IP key (tests).
+    backstop: Option<Backstop>,
 }
 
 impl Default for RateLimits {
@@ -262,7 +266,20 @@ impl RateLimits {
         Self {
             buckets: Arc::new(buckets),
             families: Arc::new(families),
+            backstop: None,
         }
+    }
+
+    /// Select each request's charge key with `backstop`.
+    #[must_use]
+    pub fn with_backstop(mut self, backstop: Backstop) -> Self {
+        self.backstop = Some(backstop);
+        self
+    }
+
+    #[must_use]
+    pub fn backstop(&self) -> Option<&Backstop> {
+        self.backstop.as_ref()
     }
 
     /// Take one token for `key` in `class`.

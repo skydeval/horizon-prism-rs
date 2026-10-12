@@ -31,7 +31,7 @@ use crate::hydration::normalize::is_private_uri;
 use crate::hydration::actor::ProfileContext;
 use crate::kryphocron_glue::VerifiedCaller;
 use crate::xrpc::AppState;
-use crate::xrpc::auth::{Params, prepare_private, request_ip};
+use crate::xrpc::auth::{Params, prepare_private, request_handle, request_ip};
 use crate::xrpc::errors::XrpcError;
 use crate::xrpc::pools::Requester;
 
@@ -185,7 +185,7 @@ async fn posts_body(
     let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted).await?.into_iter().collect();
     let candidates: Vec<String> = wanted.into_iter().filter(|u| passing.contains(u)).collect();
     let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
-    let req = Requester::of(viewer.state_did(), ip);
+    let req = request_handle(viewer.state_did(), ip);
     let authors = profiles(s, &viewer, &req, &candidates).await?;
     let rs = RequestState::new(s.env.max_head_fetches);
     let posts = read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
@@ -241,7 +241,7 @@ async fn thread_body(
 ) -> Result<Option<PrivateResponse>, XrpcError> {
     let rs = RequestState::new(s.env.max_head_fetches);
     let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
-    let req = Requester::of(viewer.state_did(), ip);
+    let req = request_handle(viewer.state_did(), ip);
     let anchor_uri = vec![uri.to_string()];
     let authors = profiles(s, &viewer, &req, &anchor_uri).await?;
     let Ok(anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
@@ -399,7 +399,7 @@ async fn feed_body(
     candidates.truncate(max_binds);
     let uris: Vec<String> = candidates.iter().map(|(u, _, _)| u.clone()).collect();
     let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
-    let req = Requester::of(viewer.state_did(), ip);
+    let req = request_handle(viewer.state_did(), ip);
     let authors = profiles(s, &viewer, &req, &uris).await?;
     let rs = RequestState::new(s.env.max_head_fetches);
 

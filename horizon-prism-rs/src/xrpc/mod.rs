@@ -7,6 +7,7 @@ pub mod auth;
 pub mod backstop;
 pub mod errors;
 pub mod handlers;
+pub mod member_keys;
 pub mod pools;
 pub mod rate_limit;
 pub mod router;

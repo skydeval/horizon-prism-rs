@@ -44,10 +44,13 @@ use moka::policy::EvictionPolicy;
 use moka::sync::Cache;
 use serde_json::Value;
 
-use super::pools::{Bucket, Rate};
-use super::rate_limit::class_problem;
+use super::auth::Authenticator;
+use super::member_keys::{KeyAge, MemberKeys};
+use super::pools::{Bucket, ChargeKey, Rate, Requester};
+use super::rate_limit::{class_problem, ip_key};
 use crate::config::{AuthConfig, RateClassConfig};
-use crate::kryphocron_glue::jwt::APPVIEW_FRAGMENT;
+use crate::kryphocron_glue::VerifiedCaller;
+use crate::kryphocron_glue::jwt::{APPVIEW_FRAGMENT, MemoryVerdict};
 
 /// `auth_verify_ceiling_exhausted_total{ceiling = "ip" | "member"}`.
 pub const METRIC_CEILING: &str = "auth_verify_ceiling_exhausted_total";
@@ -399,6 +402,120 @@ impl VerifyLimits {
     }
 }
 
+/// What the backstop decided for one request: who is charged, and the
+/// caller if a fresh key already authenticated it.
+#[derive(Debug, Clone)]
+pub struct Selected {
+    /// The request's handle: its charge key, deadline and exhaustion record.
+    pub req: Requester,
+    /// The `Authorization` value and the caller it verified to.
+    pre: Option<Arc<(String, VerifiedCaller)>>,
+}
+
+impl Selected {
+    /// A request charged to `ip`'s key, not verified.
+    #[must_use]
+    pub fn by_ip(ip: IpAddr) -> Self {
+        Self {
+            req: Requester::new(ChargeKey::ip(ip)),
+            pre: None,
+        }
+    }
+
+    /// The caller the backstop verified `authorization` to, so a handler
+    /// does not verify the token twice.
+    #[must_use]
+    pub fn verified(&self, authorization: &str) -> Option<VerifiedCaller> {
+        self.pre.as_ref().filter(|p| p.0 == authorization).map(|p| p.1.clone())
+    }
+}
+
+tokio::task_local! {
+    /// The running request's selection. The backstop middleware sets it
+    /// around the rest of the request, which runs in the same task; it is
+    /// read where a handler authenticates and where the token path fetches
+    /// an issuer's document. Outside a request there is none.
+    static SELECTED: Selected;
+}
+
+/// The running request's selection, if a backstop set one.
+#[must_use]
+pub fn selected() -> Option<Selected> {
+    SELECTED.try_with(Clone::clone).ok()
+}
+
+/// Run `f` as the rest of a request with selection `s`.
+pub async fn scope<F: Future>(s: Selected, f: F) -> F::Output {
+    SELECTED.scope(s, f).await
+}
+
+/// The outcome of [`Backstop::select`].
+#[derive(Debug)]
+pub enum Selection {
+    Charge(Selected),
+    /// The member's own verification ceiling is empty: `429`.
+    Limited { retry_after: Duration },
+}
+
+/// The pre-auth backstop's state. Cheap to clone.
+#[derive(Clone)]
+pub struct Backstop {
+    pub limits: VerifyLimits,
+    pub keys: MemberKeys,
+}
+
+impl Backstop {
+    /// Choose the key a request is charged to (§II-8.3 items 1–3). Reads no
+    /// database and makes no network call.
+    ///
+    /// A request is charged to a member's DID only when its token passes
+    /// the claims pre-check, names a ready member whose key is in memory,
+    /// is admitted by the verification limits, and its signature verifies
+    /// against that key. Everything else is charged to its IP key.
+    pub async fn select(&self, auth: &dyn Authenticator, authorization: Option<&str>, method: Option<&str>, ip: IpAddr) -> Selection {
+        let by_ip = || Selection::Charge(Selected::by_ip(ip));
+        let (Some(authorization), Some(method)) = (authorization, method) else {
+            return by_ip();
+        };
+        let Some(claims) = auth.precheck(authorization, method) else {
+            return by_ip();
+        };
+        let Some(key) = self.keys.get(&claims.iss) else {
+            return by_ip();
+        };
+        let Some(age) = key.age(chrono::Utc::now()) else {
+            return by_ip();
+        };
+        let ticket = match self.limits.admit(ip_key(ip), &claims.iss, key.print) {
+            Admission::Verify(ticket) => ticket,
+            Admission::Unverified => return by_ip(),
+            Admission::Limited { retry_after } => return Selection::Limited { retry_after },
+        };
+        let fresh = age == KeyAge::Fresh;
+        let member = |pre| {
+            Selection::Charge(Selected {
+                req: Requester::new(ChargeKey::member(&claims.iss)),
+                pre,
+            })
+        };
+        match auth.verify_in_memory(authorization, method, &key.doc).await {
+            MemoryVerdict::Verified(caller) if caller.did == claims.iss => {
+                self.limits.settle(ticket, Outcome::SignatureVerified { fresh });
+                // A stale key only selects the member: the handler verifies.
+                member(fresh.then(|| Arc::new((authorization.to_string(), *caller))))
+            }
+            MemoryVerdict::Verified(_) | MemoryVerdict::NotVerified => {
+                self.limits.settle(ticket, Outcome::NotVerified);
+                by_ip()
+            }
+            MemoryVerdict::SignatureOnly => {
+                self.limits.settle(ticket, Outcome::SignatureVerified { fresh: false });
+                member(None)
+            }
+        }
+    }
+}
+
 /// Every problem in `[auth]` (design-v3 §13).
 pub fn problems(cfg: &AuthConfig, out: &mut Vec<String>) {
     let rates = [
@@ -654,6 +771,80 @@ mod tests {
         assert!(l.recent_success(MEMBER, ip("203.0.113.3"), 1, later));
         l.forget(MEMBER);
         assert!(!l.recent_success(MEMBER, ip("203.0.113.3"), 1, later));
+    }
+
+    #[tokio::test]
+    async fn a_request_is_charged_to_a_member_only_when_its_key_verifies() {
+        use crate::kryphocron_glue::jwt::tests::{StubFetcher, mint, signing_key, verifier};
+        use crate::kryphocron_glue::service_key::multikey;
+
+        // The verifier's own fetcher must never be asked: the gate uses the
+        // in-memory document only.
+        let fetcher = StubFetcher::default();
+        let (v, _drainer) = verifier(fetcher.clone(), 100, 16);
+        let key = signing_key(3);
+        let compressed = key.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+        let doc = json!({"id": MEMBER, "verificationMethod": [{
+            "id": format!("{MEMBER}#atproto"), "type": "Multikey", "controller": MEMBER,
+            "publicKeyMultibase": multikey(&compressed),
+        }]});
+        let backstop = Backstop {
+            limits: limits(""),
+            keys: MemberKeys::default(),
+        };
+        let now = chrono::Utc::now();
+        backstop.keys.insert(MEMBER, &doc, now);
+        let pds = ip("203.0.113.1");
+        let select = |authorization: Option<String>, method: &'static str| {
+            let (backstop, v) = (backstop.clone(), v.clone());
+            async move {
+                match backstop.select(&v, authorization.as_deref(), Some(method), pds).await {
+                    Selection::Charge(s) => s,
+                    Selection::Limited { .. } => panic!("limited"),
+                }
+            }
+        };
+        let member = ChargeKey::member(MEMBER);
+        let by_ip = ChargeKey::ip(pds);
+
+        // A fresh key authenticates: charged by DID, and the caller is
+        // handed on so the handler does not verify again.
+        let good = format!("Bearer {}", mint(&key, MEMBER, SERVICE, Some(METHOD)));
+        let s = select(Some(good.clone()), METHOD).await;
+        assert_eq!(s.req.key(), &member);
+        assert_eq!(s.verified(&good).map(|c| c.did), Some(MEMBER.to_string()));
+        assert!(s.verified("Bearer other").is_none());
+
+        // A forged token naming the member: the IP key.
+        let forged = format!("Bearer {}", mint(&signing_key(9), MEMBER, SERVICE, Some(METHOD)));
+        let s = select(Some(forged.clone()), METHOD).await;
+        assert_eq!(s.req.key(), &by_ip);
+        assert!(s.verified(&forged).is_none());
+
+        // A token the member signed for another method or another service
+        // fails the pre-check: the IP key, and no verification at all.
+        let s = select(Some(good.clone()), "app.bsky.feed.getPosts").await;
+        assert_eq!(s.req.key(), &by_ip);
+        let elsewhere = format!("Bearer {}", mint(&key, MEMBER, "did:web:feeds.example.com", Some(METHOD)));
+        assert_eq!(select(Some(elsewhere), METHOD).await.req.key(), &by_ip);
+
+        // Anonymous, and a non-member with a valid token of its own.
+        assert_eq!(select(None, METHOD).await.req.key(), &by_ip);
+        let outsider = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        let theirs = format!("Bearer {}", mint(&signing_key(4), outsider, SERVICE, Some(METHOD)));
+        assert_eq!(select(Some(theirs), METHOD).await.req.key(), &by_ip);
+
+        // A stale key (2 h old) only selects the member: not verified.
+        backstop.keys.insert(MEMBER, &doc, now - chrono::Duration::hours(2));
+        let s = select(Some(good.clone()), METHOD).await;
+        assert_eq!(s.req.key(), &member);
+        assert!(s.verified(&good).is_none());
+
+        // A key older than a day is no key.
+        backstop.keys.insert(MEMBER, &doc, now - chrono::Duration::hours(25));
+        assert_eq!(select(Some(good), METHOD).await.req.key(), &by_ip);
+
+        assert_eq!(fetcher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

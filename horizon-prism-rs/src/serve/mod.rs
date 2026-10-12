@@ -43,6 +43,8 @@ use crate::kryphocron_glue::GlueContext;
 use crate::private_tier::handlers::PrivateState;
 use crate::private_tier::retention::PrivateRetention;
 use crate::private_tier::{KryphocronPrivateTier, PrivateTier};
+use crate::xrpc::backstop::{Backstop, VerifyLimits};
+use crate::xrpc::member_keys::MemberKeys;
 use crate::xrpc::pools::{HostBuckets, RequesterLimit, Shares};
 use crate::xrpc::{AppState, RateLimits};
 use health::{AuditLatch, HealthState};
@@ -349,7 +351,23 @@ pub async fn run() -> Result<(), StartupError> {
             )),
         },
     );
-    let limits = RateLimits::from_config(&cfg.file.rate_limits);
+    // The pre-auth backstop (design-v3 §II-8.3): ready members' keys in
+    // memory, and the limits on verifying against them.
+    let backstop = Backstop {
+        limits: VerifyLimits::from_config(&cfg.file.auth),
+        keys: MemberKeys::default(),
+    };
+    if let Err(error) = backstop.keys.reload(&pool).await {
+        tracing::warn!(event = "member_keys_reload_failed", %error, "member keys not loaded at startup");
+    }
+    let verify_limits = backstop.limits.clone();
+    tasks.push(
+        backstop
+            .keys
+            .clone()
+            .spawn(pool.clone(), resolver.clone(), move |did| verify_limits.forget(did)),
+    );
+    let limits = RateLimits::from_config(&cfg.file.rate_limits).with_backstop(backstop);
     tasks.push(limits.spawn_housekeeping());
     let app = AppState {
         hydrator,

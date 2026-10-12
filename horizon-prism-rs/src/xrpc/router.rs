@@ -18,6 +18,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 use super::AppState;
 use super::auth::request_ip;
+use super::backstop::{self, Selected, Selection};
+use super::pools::{ChargeKey, Exhausted, Pool};
 use super::errors::{NotReadyHint, XrpcError};
 use super::handlers::{actor, did_web, feed, graph, index, mutes, notifications, timeline};
 use super::rate_limit::Class;
@@ -52,8 +54,32 @@ async fn global_limit(
         return next.run(request).await;
     }
     let ip = request_ip(&s, &headers, peer);
-    match s.limits.check_ip(Class::Global, ip) {
-        Ok(()) => next.run(request).await,
+    // Who is charged (design-v3 §II-8.3): a ready member whose token
+    // verifies against its in-memory key, by DID; everyone else by IP key.
+    let selected = match s.limits.backstop() {
+        Some(backstop) => {
+            let authorization = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+            let method = request.uri().path().strip_prefix("/xrpc/");
+            match backstop.select(s.auth.as_ref(), authorization, method, ip).await {
+                Selection::Charge(selected) => selected,
+                // The member's own ceiling is empty: neither key is charged.
+                Selection::Limited { retry_after } => {
+                    let exhausted = Exhausted {
+                        pool: Pool::Member,
+                        retry_after,
+                    };
+                    return XrpcError::from(exhausted).into_response();
+                }
+            }
+        }
+        None => Selected::by_ip(ip),
+    };
+    let charged = match selected.req.key() {
+        ChargeKey::Member(did) => s.limits.check(Class::Global, did),
+        ChargeKey::Ip(key) => s.limits.check_ip(Class::Global, *key),
+    };
+    match charged {
+        Ok(()) => backstop::scope(selected, next.run(request)).await,
         Err(limited) => XrpcError::from(limited).into_response(),
     }
 }

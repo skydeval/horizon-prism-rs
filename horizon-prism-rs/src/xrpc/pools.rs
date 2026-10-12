@@ -304,6 +304,30 @@ impl Shares {
     /// place of `constellation.requester_share`.
     #[must_use]
     pub fn bucket_with_share(&self, target_kind: &'static str, per_sec: f64, burst: u32, share: f64) -> SharedBucket {
+        self.build(target_kind, per_sec, burst, share, 1.0 - self.nonmember_fraction)
+    }
+
+    /// PLC's bucket, whose member pool gives half of its rate and burst to
+    /// an **issuer-refresh slice** (§II-8.3 "Pools"). Resolving a member's
+    /// DID to check a token on a request charged to an IP key may draw on
+    /// the slice, once per member per `refresh`, and on nothing else of the
+    /// member pool. So however many keys a flood has, it takes at most the
+    /// slice, and only to resolve members.
+    #[must_use]
+    pub fn bucket_with_slice(&self, target_kind: &'static str, per_sec: f64, burst: u32, refresh: Duration) -> (SharedBucket, IssuerSlice) {
+        let half = (1.0 - self.nonmember_fraction) / 2.0;
+        let rate = Rate::new(per_sec, burst).scaled(half);
+        let slice = IssuerSlice {
+            inner: Arc::new(SliceInner {
+                rate,
+                state: Mutex::new(Bucket::full(rate, Instant::now())),
+                used: Cache::builder().max_capacity(1_000_000).time_to_live(refresh).build(),
+            }),
+        };
+        (self.build(target_kind, per_sec, burst, self.share, half), slice)
+    }
+
+    fn build(&self, target_kind: &'static str, per_sec: f64, burst: u32, share: f64, member_fraction: f64) -> SharedBucket {
         let whole = Rate {
             per_sec,
             burst: f64::from(burst),
@@ -324,7 +348,7 @@ impl Shares {
             inner: Arc::new(Inner {
                 target: TargetId(self.next_target.fetch_add(1, Ordering::Relaxed)),
                 target_kind,
-                member: side(Pool::Member, 1.0 - self.nonmember_fraction),
+                member: side(Pool::Member, member_fraction),
                 nonmember: side(Pool::NonMember, self.nonmember_fraction),
                 shares: self.cache.clone(),
             }),
@@ -343,6 +367,43 @@ impl Shares {
     pub fn entries(&self) -> u64 {
         self.cache.run_pending_tasks();
         self.cache.entry_count()
+    }
+}
+
+struct SliceInner {
+    rate: Rate,
+    state: Mutex<Bucket>,
+    /// Members whose allowance for this window is used.
+    used: Cache<String, ()>,
+}
+
+/// The issuer-refresh slice of PLC's member pool
+/// ([`Shares::bucket_with_slice`]). Cheap to clone.
+#[derive(Clone)]
+pub struct IssuerSlice {
+    inner: Arc<SliceInner>,
+}
+
+impl IssuerSlice {
+    /// Take the slice token for resolving member `did`, if its allowance
+    /// for this window is unused and the slice has a token. The allowance
+    /// is spent only when a token is taken.
+    #[must_use]
+    pub fn take(&self, did: &str) -> bool {
+        if self.inner.used.contains_key(did) {
+            return false;
+        }
+        let taken = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(self.inner.rate, Instant::now())
+            .is_ok();
+        if taken {
+            self.inner.used.insert(did.to_string(), ());
+        }
+        taken
     }
 }
 

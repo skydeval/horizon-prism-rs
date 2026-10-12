@@ -32,7 +32,7 @@ use crate::firehose::writer::Writer;
 use crate::hydration::hint::index_status;
 use crate::xrpc::AppState;
 use crate::xrpc::errors::XrpcError;
-use crate::xrpc::auth::request_ip;
+use crate::xrpc::auth::{authenticate, request_ip};
 use crate::xrpc::rate_limit::Family;
 
 pub const REQUEST_RECORD: &str = "app.nearhorizon.index.requestRecord";
@@ -66,7 +66,7 @@ pub async fn request_record(
     body: Bytes,
 ) -> XrpcResult {
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let caller = s.app.auth.verify(authorization, REQUEST_RECORD).await?;
+    let caller = authenticate(&s.app, authorization, REQUEST_RECORD).await?;
     let ip = request_ip(&s.app, &headers, peer);
     s.app.limits.charge(REQUEST_RECORD, Family::IndexRequest, Some(&caller.did), ip)?;
     let uri = serde_json::from_slice::<Value>(&body)

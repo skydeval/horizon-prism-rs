@@ -26,7 +26,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use kryphocron::resolver::{DefaultDidResolver, DidResolver, HttpDidFetcher};
+use kryphocron::resolver::{ContentType, DefaultDidResolver, DidResolutionError, DidResolver, HttpDidFetcher, RawDidDoc};
 use kryphocron::verification::{JwtVerificationConfig, JwtVerificationError, VerifiedJwt, verify_jwt};
 use kryphocron::{Did, ServiceIdentity, TraceId};
 use moka::notification::RemovalCause;
@@ -227,6 +227,51 @@ impl<F: IssuerRefresh> JwtVerifier<F> {
         result
     }
 
+    /// This service's DID, the `aud` a token must name.
+    #[must_use]
+    pub fn service_did(&self) -> &Did {
+        self.identity.service_did()
+    }
+
+    /// The verifier's skew and validity window.
+    #[must_use]
+    pub fn config(&self) -> &JwtVerificationConfig {
+        &self.config
+    }
+
+    /// Verify a token against one DID document held in memory (design-v3
+    /// §II-8.3 "The ready-member gate"): no network call, no cache, and no
+    /// key-rotation retry. The `aud` fragment and `lxm` checks of
+    /// [`JwtVerifier::verify_request_jwt`] apply.
+    pub async fn verify_in_memory(&self, authorization: &str, method: &str, document: &[u8]) -> MemoryVerdict {
+        let raw = authorization.trim();
+        let token = raw.strip_prefix("Bearer ").unwrap_or(raw).trim();
+        if !times_fit(token, self.config.max_clock_skew) {
+            return MemoryVerdict::NotVerified;
+        }
+        let resolver = DefaultDidResolver::new(OneDocument(RawDidDoc {
+            bytes: document.to_vec(),
+            content_type: ContentType::ApplicationJson,
+        }));
+        let deadline = Instant::now() + AUTH_DEADLINE;
+        match verify_jwt(token, &self.identity, &resolver, &self.config, deadline, trace_id()).await {
+            Ok(verified) => match host_checks(verified, method) {
+                Ok(caller) => MemoryVerdict::Verified(Box::new(caller)),
+                Err(_) => MemoryVerdict::SignatureOnly,
+            },
+            // Raised only after the signature verified.
+            Err(
+                JwtVerificationError::WrongAudience { .. }
+                | JwtVerificationError::Expired { .. }
+                | JwtVerificationError::NotYetValid { .. }
+                | JwtVerificationError::ValidityWindowTooLong { .. }
+                | JwtVerificationError::NonceMissing,
+            ) => MemoryVerdict::SignatureOnly,
+            // Everything else, and any variant a later kryphocron adds.
+            Err(_) => MemoryVerdict::NotVerified,
+        }
+    }
+
     /// `verify_request_jwt` (§6.7, §6.8). `authorization` is the raw header
     /// value, if any; `method` is the called XRPC method NSID.
     ///
@@ -263,21 +308,53 @@ impl<F: IssuerRefresh> JwtVerifier<F> {
             }
             (Err(e), _) => return Err(invalid(&e.to_string())),
         };
-        match verified.audience_fragment() {
-            None => {}
-            Some(APPVIEW_FRAGMENT) => {}
-            Some(other) => return Err(invalid(&format!("aud fragment #{other} is not served here"))),
-        }
-        match verified.lxm() {
-            Some(lxm) if lxm == method => {}
-            Some(lxm) => return Err(invalid(&format!("lxm {lxm} does not match {method}"))),
-            None => return Err(invalid("missing lxm")),
-        }
-        metrics::counter!(METRIC_AUTH, "result" => "ok").increment(1);
-        Ok(VerifiedCaller {
-            did: verified.issuer().as_str().to_string(),
-            jwt: verified,
-        })
+        host_checks(verified, method)
+    }
+}
+
+/// The checks this host adds to kryphocron's (§6.8): the `aud` fragment is
+/// absent or `#bsky_appview`, and `lxm` is the called method.
+fn host_checks(verified: VerifiedJwt, method: &str) -> Result<VerifiedCaller, AuthError> {
+    match verified.audience_fragment() {
+        None => {}
+        Some(APPVIEW_FRAGMENT) => {}
+        Some(other) => return Err(invalid(&format!("aud fragment #{other} is not served here"))),
+    }
+    match verified.lxm() {
+        Some(lxm) if lxm == method => {}
+        Some(lxm) => return Err(invalid(&format!("lxm {lxm} does not match {method}"))),
+        None => return Err(invalid("missing lxm")),
+    }
+    metrics::counter!(METRIC_AUTH, "result" => "ok").increment(1);
+    Ok(VerifiedCaller {
+        did: verified.issuer().as_str().to_string(),
+        jwt: verified,
+    })
+}
+
+/// How [`JwtVerifier::verify_in_memory`] ended (design-v3 §II-8.3, R3-250).
+#[derive(Debug, Clone)]
+pub enum MemoryVerdict {
+    /// The token verified in full.
+    Verified(Box<VerifiedCaller>),
+    /// The signature verified against the document's key, and a claim or
+    /// host check then failed.
+    SignatureOnly,
+    /// Everything else: a forger without the key can only get this.
+    NotVerified,
+}
+
+/// A fetcher that answers every lookup with one document.
+struct OneDocument(RawDidDoc);
+
+#[async_trait]
+impl HttpDidFetcher for OneDocument {
+    async fn fetch_plc(&self, _did: &Did, _deadline: Instant) -> Result<RawDidDoc, DidResolutionError> {
+        Ok(self.0.clone())
+    }
+
+    async fn fetch_web(&self, _did: &Did, _deadline: Instant) -> Result<RawDidDoc, DidResolutionError> {
+        Ok(self.0.clone())
     }
 }
 
@@ -331,7 +408,6 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use k256::ecdsa::{Signature, SigningKey, signature::Signer};
-    use kryphocron::resolver::{ContentType, DidResolutionError, RawDidDoc};
     use serde_json::json;
 
     use super::*;

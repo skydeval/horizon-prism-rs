@@ -53,7 +53,33 @@ commit.
     anything. A PDS feed that runs out while fetching a reposted post ends
     the page before that item and keeps its cursor behind it, so the next
     page resumes there.
-- **Item 10: pre-auth backstop parts, not yet wired (#669).**
+- **Item 10: the pre-auth backstop chooses who a request is charged to
+  (#669).** Before the per-requester backstop, a request whose token passes
+  the claims pre-check, names a ready member whose signing key is held in
+  memory, is admitted by the verification limits and verifies against that
+  key is charged to the member's DID: the `global` backstop, and every
+  upstream pool and share. Everything else is charged to its IP key
+  (design-v3 §II-8.3). So members behind one PDS no longer share that
+  PDS's address for the backstop or for upstream budgets, and a forged
+  token naming a member spends none of the member's limits. That step
+  reads no database and makes no network call.
+  - A key under 1 h old authenticates, and the handler does not verify the
+    token a second time. A key 1 h to 24 h old only selects the member;
+    the handler verifies as before.
+  - Ready members' DID documents are held in a table reloaded from
+    `did_cache` every 30 s; documents older than 12 h, or missing, are
+    re-resolved in the background (`member_key_refresh_failed_total`,
+    gauge `member_keys`).
+  - A member whose own verification ceiling is empty gets 429 and is
+    charged to neither key.
+  - Thread Lens, the private endpoints and `index.requestRecord` use the
+    same selection.
+  Differences from the design text, recorded on #669: the selection is
+  passed to handlers through a task-local, not request extensions; the key
+  table follows `did_cache` with up to 30 s delay instead of being updated
+  on each write; only the table counts as an in-memory key (not
+  kryphocron's own cache or the fetch cell).
+- **Item 10: pre-auth backstop parts (#669).**
   `xrpc::backstop` holds the two parts of design-v3 §II-8.3's backstop
   that need no I/O. The claims pre-check reads a token's unverified
   payload and applies the claim checks the verifier makes after the
@@ -63,8 +89,7 @@ commit.
   pre-backstop verification: failed-verification limits per (IP key,
   issuer) and per IP key, an exemption for a member that verified from
   that IP key against the same key within a day, a per-member ceiling and
-  a per-IP-key ceiling. New `[auth]` settings, validated at startup. No
-  request goes through them yet.
+  a per-IP-key ceiling. New `[auth]` settings, validated at startup.
 - **Item 10: identity lookups and author-PDS listings are charged
   (#669).** Resolving a DID or a handle for a request costs one token of
   the requester's identity share
