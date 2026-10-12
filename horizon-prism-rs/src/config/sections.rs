@@ -690,10 +690,101 @@ pub struct ServiceConfig {
     pub methods: Option<BTreeMap<String, String>>,
 }
 
+/// One rate-limit class (design-v3 §10): `per_sec` tokens a second, `burst`
+/// at most. A class table gives both keys.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateClassConfig {
+    pub per_sec: f64,
+    pub burst: u32,
+}
+
+impl RateClassConfig {
+    #[must_use]
+    pub const fn new(per_sec: f64, burst: u32) -> Self {
+        Self { per_sec, burst }
+    }
+}
+
+// Bitwise on the float, so the config stays `Eq` (a NaN equals itself here;
+// validation rejects one anyway).
+impl PartialEq for RateClassConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.per_sec.to_bits() == other.per_sec.to_bits() && self.burst == other.burst
+    }
+}
+
+impl Eq for RateClassConfig {}
+
+/// `[rate_limits]` (design-v3 §10): every number is operator config. The
+/// defaults are the rates that used to be constants.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitsConfig {
+    pub anon_read: RateClassConfig,
+    pub auth_read: RateClassConfig,
+    pub search_anon: RateClassConfig,
+    pub search_auth: RateClassConfig,
+    pub write: RateClassConfig,
+    pub private: RateClassConfig,
+    pub thread_lens: RateClassConfig,
+    pub index_request: RateClassConfig,
+    pub resolve: RateClassConfig,
+    pub global: RateClassConfig,
+    /// The two members of the `service_proxy` family (§6.7.6.2). Read once
+    /// the proxy handler is built.
+    pub service_proxy_member: RateClassConfig,
+    pub service_proxy_ip: RateClassConfig,
+    /// NSID to family name: moves one served endpoint to another family.
+    pub endpoint_class: BTreeMap<String, String>,
+}
+
+impl Default for RateLimitsConfig {
+    fn default() -> Self {
+        Self {
+            anon_read: RateClassConfig::new(30.0, 60),
+            auth_read: RateClassConfig::new(60.0, 120),
+            search_anon: RateClassConfig::new(10.0, 20),
+            search_auth: RateClassConfig::new(30.0, 60),
+            write: RateClassConfig::new(5.0, 20),
+            private: RateClassConfig::new(10.0, 20),
+            thread_lens: RateClassConfig::new(2.0, 10),
+            index_request: RateClassConfig::new(0.5, 30),
+            resolve: RateClassConfig::new(10.0, 20),
+            global: RateClassConfig::new(100.0, 200),
+            service_proxy_member: RateClassConfig::new(5.0, 20),
+            service_proxy_ip: RateClassConfig::new(10.0, 20),
+            endpoint_class: BTreeMap::new(),
+        }
+    }
+}
+
+impl RateLimitsConfig {
+    /// Every class with its config key, in §10's order.
+    #[must_use]
+    pub fn classes(&self) -> [(&'static str, RateClassConfig); 12] {
+        [
+            ("anon_read", self.anon_read),
+            ("auth_read", self.auth_read),
+            ("search_anon", self.search_anon),
+            ("search_auth", self.search_auth),
+            ("write", self.write),
+            ("private", self.private),
+            ("thread_lens", self.thread_lens),
+            ("index_request", self.index_request),
+            ("resolve", self.resolve),
+            ("global", self.global),
+            ("service_proxy_member", self.service_proxy_member),
+            ("service_proxy_ip", self.service_proxy_ip),
+        ]
+    }
+}
+
 /// Everything read from `app.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
+    pub rate_limits: RateLimitsConfig,
     pub features: FeaturesConfig,
     pub honest_501: Honest501Config,
     pub services: BTreeMap<String, ServiceConfig>,

@@ -314,7 +314,7 @@ pub async fn run() -> Result<(), StartupError> {
             counts: cfg.file.counts.clone(),
         },
     );
-    let limits = RateLimits::new();
+    let limits = RateLimits::from_config(&cfg.file.rate_limits);
     tasks.push(limits.spawn_housekeeping());
     let app = AppState {
         hydrator,

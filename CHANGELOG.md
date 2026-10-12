@@ -12,6 +12,20 @@ commit.
 
 ### Added
 
+- **Item 10: rate limits are config (#669).** Every limit is
+  `[rate_limits.<class>]` with `per_sec` (a decimal) and `burst`, with the
+  former constants as defaults (design-v3 §10). Startup refuses a `per_sec`
+  that is not finite or is outside 0.000001 to 1 000 000, a `burst` below 1,
+  and a pair that would overflow the bucket arithmetic. New classes
+  `search_anon` (10/s, burst 20) and `search_auth` (30/s, burst 60) now
+  charge `searchActors`, which used the read classes before. `resolve` has
+  one bucket per endpoint and IP. `rate_limits.endpoint_class.<nsid>` moves
+  one served endpoint to another class family (`read`, `search`, `write`,
+  `private`, `thread_lens`, `index_request`, `resolve`); an unknown family,
+  an NSID this AppView does not serve, or a DID-keyed family on an endpoint
+  that accepts anonymous calls is a startup error. `service_proxy_member`
+  and `service_proxy_ip` are accepted and validated; nothing charges them
+  until service proxying is built.
 - **Item 10: gallery embeds.** `app.bsky.embed.gallery` is rendered wherever
   an embed is: as a post's embed, as the media of `recordWithMedia` (which
   no longer loses its quoted record), and inside a quoted post's `embeds`

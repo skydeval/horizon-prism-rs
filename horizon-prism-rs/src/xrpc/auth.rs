@@ -17,7 +17,7 @@ use axum::http::HeaderMap;
 
 use super::AppState;
 use super::errors::XrpcError;
-use super::rate_limit::{Class, client_ip};
+use super::rate_limit::{Family, client_ip};
 use crate::aggregations::enroll::Enrollment;
 use crate::hydration::Viewer;
 use crate::kryphocron_glue::jwt::IssuerRefresh;
@@ -128,11 +128,8 @@ pub async fn prepare(
         (Access::Opt, None) => None,
         _ => Some(state.auth.verify(authorization, method).await?),
     };
-    match (&caller, write) {
-        (Some(c), true) => state.limits.check(Class::Write, &c.did)?,
-        (Some(c), false) => state.limits.check(Class::AuthRead, &c.did)?,
-        (None, _) => state.limits.check_ip(Class::AnonRead, ip)?,
-    }
+    let family = if write { Family::Write } else { Family::Read };
+    state.limits.charge(method, family, caller.as_ref().map(|c| c.did.as_str()), ip)?;
     let caller_did = caller.map(|c| c.did);
     if let Access::Member { ready, enroll } = access {
         let did = caller_did.as_deref().ok_or_else(|| XrpcError::from(AuthError::Required))?;
@@ -167,7 +164,8 @@ pub async fn prepare(
 }
 
 /// The private-endpoint gate (§6.3 steps 1–2, §7.4): authentication
-/// required, the `private` per-DID bucket, and a ready member. Returns the
+/// required, the `private` per-DID bucket (or the endpoint's configured
+/// family), and a ready member. Returns the
 /// verified caller, whose JWT feeds the kryphocron `AuthContext`. Failures
 /// here are ordinary errors, outside the timing floor.
 ///
@@ -178,11 +176,13 @@ pub async fn prepare(
 pub async fn prepare_private(
     state: &AppState,
     headers: &HeaderMap,
+    peer: SocketAddr,
     method: &str,
 ) -> Result<VerifiedCaller, XrpcError> {
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
     let caller = state.auth.verify(authorization, method).await?;
-    state.limits.check(Class::Private, &caller.did)?;
+    let ip = request_ip(state, headers, peer);
+    state.limits.charge(method, Family::Private, Some(&caller.did), ip)?;
     match member_state(state, &caller.did).await? {
         Enrollment::Member { ready: true } => Ok(caller),
         Enrollment::Member { ready: false } | Enrollment::Enrolled | Enrollment::Purging => Err(XrpcError::not_ready()),

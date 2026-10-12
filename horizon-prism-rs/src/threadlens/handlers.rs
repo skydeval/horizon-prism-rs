@@ -27,7 +27,8 @@ use crate::hydration::PublicEmit;
 use crate::hydration::lens::{LensNode, lens_items, lens_thread};
 use crate::xrpc::AppState;
 use crate::xrpc::errors::XrpcError;
-use crate::xrpc::rate_limit::Class;
+use crate::xrpc::auth::request_ip;
+use crate::xrpc::rate_limit::Family;
 
 pub const GET_THREAD: &str = "app.nearhorizon.threadLens.getThread";
 pub const RESOLVE: &str = "app.nearhorizon.threadLens.resolve";
@@ -51,10 +52,11 @@ pub fn router(state: ThreadLensState) -> Router {
 
 /// Authenticate and rate-limit. Returns nothing: the caller's identity does
 /// not leave this function (§10.1, §10.3).
-async fn gate(s: &ThreadLensState, headers: &HeaderMap, method: &str) -> Result<(), XrpcError> {
+async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method: &str) -> Result<(), XrpcError> {
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
     let caller = s.app.auth.verify(authorization, method).await?;
-    s.app.limits.check(Class::ThreadLens, &caller.did)?;
+    let ip = request_ip(&s.app, headers, peer);
+    s.app.limits.charge(method, Family::ThreadLens, Some(&caller.did), ip)?;
     Ok(())
 }
 
@@ -81,11 +83,11 @@ struct ResolveInput {
 
 pub async fn get_thread(
     State(s): State<ThreadLensState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Result<Json<PublicEmit<Value>>, XrpcError> {
-    gate(&s, &headers, GET_THREAD).await?;
+    gate(&s, &headers, peer, GET_THREAD).await?;
     let input: GetThreadInput = body(&bytes)?;
     if !at_uri(&input.anchor) {
         return Err(XrpcError::invalid("Error: anchor must be an at-uri"));
@@ -101,11 +103,11 @@ pub async fn get_thread(
 
 pub async fn resolve(
     State(s): State<ThreadLensState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Result<Json<PublicEmit<Value>>, XrpcError> {
-    gate(&s, &headers, RESOLVE).await?;
+    gate(&s, &headers, peer, RESOLVE).await?;
     let input: ResolveInput = body(&bytes)?;
     if input.uris.is_empty() || input.uris.len() > MAX_URIS {
         return Err(XrpcError::invalid("Error: uris must have between 1 and 25 items"));

@@ -208,6 +208,31 @@ feed_generators = false
 embed_external_view = false
 verification = false
 
+# Request rate limits. Each class is a token bucket: `per_sec` tokens are
+# added per second, up to `burst`. Read and search classes are keyed by IP
+# for anonymous callers and by account for signed-in callers; `resolve` has
+# one bucket per endpoint and IP; `global` is the per-IP backstop.
+[rate_limits]
+anon_read = { per_sec = 30.0, burst = 60 }
+auth_read = { per_sec = 60.0, burst = 120 }
+search_anon = { per_sec = 10.0, burst = 20 }
+search_auth = { per_sec = 30.0, burst = 60 }
+write = { per_sec = 5.0, burst = 20 }
+private = { per_sec = 10.0, burst = 20 }
+thread_lens = { per_sec = 2.0, burst = 10 }
+index_request = { per_sec = 0.5, burst = 30 }
+resolve = { per_sec = 10.0, burst = 20 }
+global = { per_sec = 100.0, burst = 200 }
+service_proxy_member = { per_sec = 5.0, burst = 20 }
+service_proxy_ip = { per_sec = 10.0, burst = 20 }
+
+# Move one served endpoint to another class family: "read", "search",
+# "write", "private", "thread_lens", "index_request" or "resolve". An
+# endpoint that accepts anonymous calls can only take "read", "search" or
+# "resolve".
+# [rate_limits.endpoint_class]
+# "app.bsky.feed.getTimeline" = "search"
+
 # Deferred external services. Each is "disabled" (the default), "proxy" or
 # "serve". This version accepts only "disabled": the endpoints answer 501.
 # Built-in blocks: [services.contact], [services.age_assurance],

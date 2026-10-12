@@ -19,7 +19,7 @@ use crate::hydration::hint::{RoutingHint, routing_hint};
 use crate::xrpc::AppState;
 use crate::xrpc::auth::{Params, request_ip};
 use crate::xrpc::errors::XrpcError;
-use crate::xrpc::rate_limit::Class;
+use crate::xrpc::rate_limit::Family;
 
 pub const RESOLVE_DID: &str = "app.nearhorizon.constellation.resolveDid";
 /// `cache-control` on every answer (§8.7).
@@ -45,7 +45,7 @@ pub async fn resolve_did(
     headers: HeaderMap,
     RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
-    s.app.limits.check_ip(Class::ResolveDid, request_ip(&s.app, &headers, peer))?;
+    s.app.limits.charge(RESOLVE_DID, Family::Resolve, None, request_ip(&s.app, &headers, peer))?;
     let params = Params::parse(q.as_deref());
     let did = params.required("did")?;
     if !proto_blue::syntax::Did::is_valid(did) {

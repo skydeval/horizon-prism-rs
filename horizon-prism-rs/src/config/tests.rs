@@ -203,6 +203,20 @@ status_url = ""
 feed_generators = false
 embed_external_view = false
 verification = false
+
+[rate_limits]
+anon_read = { per_sec = 30.0, burst = 60 }
+auth_read = { per_sec = 60.0, burst = 120 }
+search_anon = { per_sec = 10.0, burst = 20 }
+search_auth = { per_sec = 30.0, burst = 60 }
+write = { per_sec = 5.0, burst = 20 }
+private = { per_sec = 10.0, burst = 20 }
+thread_lens = { per_sec = 2.0, burst = 10 }
+index_request = { per_sec = 0.5, burst = 30 }
+resolve = { per_sec = 10.0, burst = 20 }
+global = { per_sec = 100.0, burst = 200 }
+service_proxy_member = { per_sec = 5.0, burst = 20 }
+service_proxy_ip = { per_sec = 10.0, burst = 20 }
 "#;
 
 #[test]

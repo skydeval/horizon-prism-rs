@@ -152,12 +152,12 @@ fn ok(body: PrivateResponse) -> Response {
 
 pub async fn get_posts(
     State(s): State<PrivateState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
-    let caller = prepare_private(&s.app, &headers, GET_POSTS).await?;
+    let caller = prepare_private(&s.app, &headers, peer,GET_POSTS).await?;
     let requested = Params::parse(q.as_deref()).all("uris");
     if requested.is_empty() || requested.len() > 25 {
         return Err(XrpcError::invalid("Error: uris must have between 1 and 25 items"));
@@ -202,12 +202,12 @@ fn bounded(p: &Params, key: &str, default: u32, max: u32) -> Result<u32, XrpcErr
 
 pub async fn get_post_thread(
     State(s): State<PrivateState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
-    let caller = prepare_private(&s.app, &headers, GET_POST_THREAD).await?;
+    let caller = prepare_private(&s.app, &headers, peer,GET_POST_THREAD).await?;
     let p = Params::parse(q.as_deref());
     let uri = p.required("uri")?.to_string();
     let depth = bounded(&p, "depth", 6, 10)?;
@@ -352,12 +352,12 @@ fn parse_cursor(c: Option<&str>) -> Result<Option<(DateTime<Utc>, String)>, Xrpc
 
 pub async fn get_author_feed(
     State(s): State<PrivateState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
-    let caller = prepare_private(&s.app, &headers, GET_AUTHOR_FEED).await?;
+    let caller = prepare_private(&s.app, &headers, peer,GET_AUTHOR_FEED).await?;
     let p = Params::parse(q.as_deref());
     let actor = p.required("actor")?.to_string();
     if !actor.starts_with("did:") {

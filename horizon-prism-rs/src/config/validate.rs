@@ -26,6 +26,7 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     urls(cfg, &mut out);
     numbers(cfg, &mut out);
     crate::services::problems(cfg, public_hostname, &mut out);
+    crate::xrpc::rate_limit::problems(&cfg.rate_limits, &mut out);
     out
 }
 

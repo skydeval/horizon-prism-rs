@@ -32,7 +32,8 @@ use crate::firehose::writer::Writer;
 use crate::hydration::hint::index_status;
 use crate::xrpc::AppState;
 use crate::xrpc::errors::XrpcError;
-use crate::xrpc::rate_limit::Class;
+use crate::xrpc::auth::request_ip;
+use crate::xrpc::rate_limit::Family;
 
 pub const REQUEST_RECORD: &str = "app.nearhorizon.index.requestRecord";
 /// §5.9: the URI must name a record in the caller's own repo.
@@ -60,13 +61,14 @@ fn parts(uri: &str) -> Option<(&str, &str, &str)> {
 
 pub async fn request_record(
     State(s): State<IndexState>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> XrpcResult {
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
     let caller = s.app.auth.verify(authorization, REQUEST_RECORD).await?;
-    s.app.limits.check(Class::IndexRequest, &caller.did)?;
+    let ip = request_ip(&s.app, &headers, peer);
+    s.app.limits.charge(REQUEST_RECORD, Family::IndexRequest, Some(&caller.did), ip)?;
     let uri = serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|v| v.get("uri").and_then(Value::as_str).map(str::to_string))
