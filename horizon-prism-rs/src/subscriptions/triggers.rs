@@ -130,6 +130,15 @@ pub async fn recovery_sweep(pool: &PgPool, waiting: &Waiting, min_interval_secs:
         enqueue(pool, &owner, if owed { jobs::HIGH } else { jobs::LOW }, min_interval_secs, false).await?;
         n += 1;
     }
+    // Tombstones are kept when an owner's last list is released, so a
+    // quick return finds them; an hour covers a lagging relay many times
+    // over. After that an owner with no list keeps none.
+    sqlx::query(
+        "DELETE FROM subscription_tombstones t WHERE t.deleted_at < now() - interval '1 hour' \
+           AND NOT EXISTS (SELECT 1 FROM subscribed_lists l WHERE l.owner_did = t.owner_did)",
+    )
+    .execute(pool)
+    .await?;
     Ok(n)
 }
 

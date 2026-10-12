@@ -218,6 +218,25 @@ impl ScopeState {
         Ok(())
     }
 
+    /// Read every tracked owner's tombstone count again, after rows were
+    /// deleted by age (design-v3 §4.3 "Per-owner tombstone cap"). The
+    /// table is read under the write guard, so no writer's own count is
+    /// lost between the read and the set.
+    ///
+    /// # Errors
+    ///
+    /// Any database error; the counts are unchanged on error.
+    pub async fn reload_tombstone_counts(&self, pool: &PgPool) -> Result<(), sqlx::Error> {
+        let mut sets = self.write_guard().await;
+        let (_, tracked) = read_subscribed(pool, None).await?;
+        for (owner, count) in &mut sets.subscribed.owners {
+            if let Some(fresh) = tracked.get(owner) {
+                *count = *fresh;
+            }
+        }
+        Ok(())
+    }
+
     /// Replace every set with a fresh load (after a rebuild).
     ///
     /// # Errors

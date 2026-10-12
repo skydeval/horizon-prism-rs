@@ -92,6 +92,10 @@ impl RetentionInputs for ScopeRetentionInputs {
     async fn private_row_authors(&self) -> Result<Vec<String>, sqlx::Error> {
         crate::private_tier::retention::row_authors(&self.pool).await
     }
+
+    async fn subscription_tombstones_aged(&self) -> Result<(), sqlx::Error> {
+        self.scope.reload_tombstone_counts(&self.pool).await
+    }
 }
 
 fn init_tracing(level: &str) {
@@ -303,6 +307,17 @@ pub async fn run() -> Result<(), StartupError> {
     // the `list_sync` lanes.
     let lists = &cfg.file.lists;
     tasks.push(tokio::spawn(applier.clone().run()));
+    // The budget may have changed since the references were admitted.
+    tasks.push(tokio::spawn({
+        let (pool, applier) = (pool.clone(), applier.clone());
+        async move {
+            match subscriptions::references::recompute_all(&pool, list_budget).await {
+                Ok(true) => applier.signal(),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(event = "list_references_recompute_failed", %error, "recomputing list references at startup failed"),
+            }
+        }
+    }));
     let list_sync = ListSync::new(
         pool.clone(),
         scope.clone(),

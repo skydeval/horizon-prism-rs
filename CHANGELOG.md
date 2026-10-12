@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 12: budget changes and tombstone clean-up (#673).** At startup
+  every member's references are checked again against the configured
+  budget, so raising `lists.subscribed_max_per_member` or
+  `lists.max_owners_per_member` admits references that waited and
+  lowering them stops the newest. Rule 4's tombstones now expire with
+  `retention.tombstone_days`, and the recovery sweep deletes those older
+  than an hour whose owner no longer has a subscribed list (design-v3
+  §4.3 "Tombstones").
 - **Item 12: references follow membership (#673).** Adding a member
   (by `admin member add` or auto-enrolment) gives it references for the
   list mutes and list blocks it already has stored, in the order they

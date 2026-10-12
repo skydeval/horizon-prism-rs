@@ -155,6 +155,12 @@ pub trait RetentionInputs: Send + Sync {
     /// DIDs that still author private-tier rows after the private retention
     /// task ran. Their `actors` rows are kept (class M identity rows).
     async fn private_row_authors(&self) -> Result<Vec<String>, sqlx::Error>;
+
+    /// Called after rule 4's tombstones were deleted by age, so in-memory
+    /// counts of them can be read again (design-v3 §4.3).
+    async fn subscription_tombstones_aged(&self) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
 }
 
 /// A bind parameter for one retention statement.
@@ -399,6 +405,14 @@ fn time_steps(settings: &RetentionSettings) -> Vec<Step> {
     vec![
         batched(
             "record_tombstones",
+            "uri",
+            "t",
+            "t.deleted_at < now() - make_interval(days => $1)",
+            days(settings.tombstone_days),
+        ),
+        // Rule 4's own tombstones (design-v3 §4.3), on the same clock.
+        batched(
+            "subscription_tombstones",
             "uri",
             "t",
             "t.deleted_at < now() - make_interval(days => $1)",
@@ -667,6 +681,7 @@ impl RetentionTask for PublicRetention {
         steps.extend(age_cap_steps(settings.max_age_days));
         steps.extend(time_steps(settings));
         let mut report = run_steps(pool, scope, &steps).await?;
+        self.inputs.subscription_tombstones_aged().await?;
         report.deleted.push(("activity_subscriptions", sweep_subscriptions(pool).await?));
         Ok(report)
     }
@@ -898,6 +913,7 @@ mod tests {
         let t = time_steps(&settings);
         let bind = |table: &str| t.iter().find(|s| s.table == table).map(|s| s.bind.clone());
         assert_eq!(bind("record_tombstones"), Some(Bind::Days(7)));
+        assert_eq!(bind("subscription_tombstones"), Some(Bind::Days(7)));
         assert_eq!(bind("notifications"), Some(Bind::Days(90)));
         assert_eq!(bind("constellation_counts"), Some(Bind::Days(7)));
         assert_eq!(bind("did_cache"), Some(Bind::Days(7)));

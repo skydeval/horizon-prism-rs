@@ -276,6 +276,29 @@ async fn drop_reference(conn: &mut PgConnection, member: &str, list: &str, sourc
     Ok(if admitted == Some(true) { vec![list.to_string()] } else { Vec::new() })
 }
 
+/// The startup recompute: every member's `admitted` flags are derived
+/// again under the budget now configured, one member per transaction. A
+/// budget that was raised admits references that waited; one that was
+/// lowered stops the newest. Returns whether markers were written.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn recompute_all(pool: &PgPool, budget: Budget) -> Result<bool, sqlx::Error> {
+    let members: Vec<String> = sqlx::query_scalar("SELECT DISTINCT member_did FROM list_references ORDER BY member_did").fetch_all(pool).await?;
+    let mut marked = false;
+    for member in members {
+        let mut tx = pool.begin().await?;
+        lock_member(&mut tx, &member).await?;
+        let mut changed = recompute(&mut tx, &member, Source::Mute, budget).await?;
+        changed.extend(recompute(&mut tx, &member, Source::Block, budget).await?);
+        insert_markers(&mut tx, &changed).await?;
+        tx.commit().await?;
+        marked |= !changed.is_empty();
+    }
+    Ok(marked)
+}
+
 /// The member phase of member add: references for the list mutes and list
 /// blocks the new member already has stored, in the order they were made.
 /// Runs in the caller's transaction. Returns whether markers were written.
@@ -495,6 +518,15 @@ mod tests {
         assert_eq!(markers(p).await, vec![list('a', 2), list('a', 3), list('b', 1)]);
         // Again: nothing new.
         assert!(!adopt_member(&mut conn, ME, budget).await.expect("again"));
+        // A raised budget admits the mute that waited; lowered, the
+        // newest two stop being admitted. Each change is marked.
+        assert!(recompute_all(p, Budget { max_references: 3, max_owners: 5 }).await.expect("raised"));
+        assert_eq!(markers(p).await, vec![list('a', 1)]);
+        assert!(recompute_all(p, Budget { max_references: 1, max_owners: 5 }).await.expect("lowered"));
+        assert_eq!(markers(p).await, vec![list('a', 1), list('a', 3)]);
+        assert!(!recompute_all(p, Budget { max_references: 1, max_owners: 5 }).await.expect("same"));
+        assert!(recompute_all(p, budget).await.expect("back"));
+        assert_eq!(markers(p).await, vec![list('a', 3)]);
 
         // Removal: every reference goes; only admitted ones are marked.
         assert!(drop_member(&mut conn, ME).await.expect("drop"));
