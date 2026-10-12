@@ -6,8 +6,12 @@
 //! its members reference, in tables no public read path reads, and uses it
 //! only to apply those members' own mutes and blocks.
 //!
-//! Built so far: the member's side ([`references`]). The list phase, the
-//! `list_sync` job, the copy rule and the views that apply a reference are
-//! not built yet, so a stored reference has no effect on any view.
+//! Built so far: the member's side ([`references`]), the list phase and
+//! the release of an unreferenced list ([`list_phase`]), and the job row's
+//! enqueue rules ([`jobs`]). Nothing runs them yet. The `list_sync` job,
+//! the copy rule and the views that apply a reference are not built, so a
+//! stored reference has no effect on any view.
 
+pub mod jobs;
+pub mod list_phase;
 pub mod references;

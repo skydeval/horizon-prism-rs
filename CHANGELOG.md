@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **Item 12: the list phase, release, and sync enqueue rules (#673).**
+  `subscriptions::list_phase` turns a change marker into the list's
+  `subscribed_lists` row (active while an admitted reference exists,
+  unreferenced otherwise), takes the owner's row, and queues the owner's
+  `list_sync` when a reference waits on one; it never waits on a list
+  row. An unreferenced list is released at once: items in batches, then
+  the row, then the owner's queued job if it was the owner's last list.
+  `subscriptions::jobs` holds the earliest start an owner's next sync
+  may have and the rule that an enqueue never supersedes a running job.
+  Nothing runs these yet (design-v3 §4.3).
 - **Item 12: list references and the member phase (#673).** New module
   `subscriptions::references`: a member's list mute or list block is a
   reference to a list, admitted while it is inside the member's budget
