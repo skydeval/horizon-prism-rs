@@ -1,0 +1,240 @@
+//! Running `list_sync` jobs on the backfill workers (design-v3 §4.3
+//! "Lanes", "A separate claim").
+//!
+//! A backfill worker tries the fast lane, then the slow lane, before its
+//! ordinary work. Each lane has a fixed number of permits, so list syncs
+//! can never take every worker, and an owner whose server answers slowly
+//! can only ever hold a slow permit. A permit is tried, never waited for;
+//! a permit whose lane has nothing due is given back at once, and a held
+//! permit is dropped when the run ends by any path.
+//!
+//! A row left `running` with no run behind it (a run that panicked, or
+//! whose settling failed) is found by the stuck-row check and queued again
+//! at a new generation.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use sqlx::PgPool;
+use tokio::sync::Semaphore;
+
+use super::applier::Waiting;
+use super::claim::{self, Lane, LaneTime};
+use super::jobs;
+use super::run::{self, Outcome, OwnerSource, Settings};
+use crate::aggregations::ScopeState;
+
+pub const METRIC_RUNNING_AGE: &str = "list_sync_running_age_seconds";
+pub const METRIC_STUCK: &str = "list_sync_stuck_requeued_total";
+
+/// The lanes' sizes and the stuck-row bound.
+#[derive(Debug, Clone, Copy)]
+pub struct Lanes {
+    pub fast: u32,
+    pub slow: u32,
+    /// A row `running` this long with no live run is queued again.
+    pub stuck_secs: u32,
+    /// `lists.sync_max_wall_secs`: sets the fairness window.
+    pub max_wall_secs: u32,
+}
+
+/// The owners with a run in progress in this process.
+type Live = Arc<Mutex<HashSet<String>>>;
+
+/// Removes its owner from the live set when dropped.
+struct Registered {
+    live: Live,
+    owner: String,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.owner);
+    }
+}
+
+#[derive(Clone)]
+pub struct ListSync {
+    pool: PgPool,
+    scope: ScopeState,
+    source: Arc<dyn OwnerSource>,
+    waiting: Waiting,
+    time: LaneTime,
+    settings: Settings,
+    window: Duration,
+    stuck: Duration,
+    fast: Arc<Semaphore>,
+    slow: Arc<Semaphore>,
+    live: Live,
+}
+
+impl ListSync {
+    #[must_use]
+    pub fn new(pool: PgPool, scope: ScopeState, source: Arc<dyn OwnerSource>, waiting: Waiting, settings: Settings, lanes: Lanes) -> Self {
+        Self {
+            pool,
+            scope,
+            source,
+            waiting,
+            time: LaneTime::default(),
+            settings,
+            window: Duration::from_secs(u64::from(lanes.max_wall_secs).saturating_mul(2).max(3600)),
+            stuck: Duration::from_secs(u64::from(lanes.stuck_secs)),
+            fast: Arc::new(Semaphore::new(lanes.fast as usize)),
+            slow: Arc::new(Semaphore::new(lanes.slow as usize)),
+            live: Live::default(),
+        }
+    }
+
+    /// The fairness account, for a purge to forget a member.
+    #[must_use]
+    pub fn lane_time(&self) -> &LaneTime {
+        &self.time
+    }
+
+    /// Run one due sync, if a lane has both a free permit and a due row:
+    /// the fast lane first, then the slow lane.
+    ///
+    /// # Errors
+    ///
+    /// The claim failed (database).
+    pub async fn run_once(&self) -> Result<Option<(String, Outcome)>, sqlx::Error> {
+        for (lane, permits) in [(Lane::Fast, &self.fast), (Lane::Slow, &self.slow)] {
+            let Ok(_permit) = Arc::clone(permits).try_acquire_owned() else {
+                continue;
+            };
+            let Some(claimed) = claim::claim(&self.pool, lane, &self.waiting, &self.time, self.window).await? else {
+                continue;
+            };
+            self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(claimed.owner.clone());
+            let _registered = Registered { live: Arc::clone(&self.live), owner: claimed.owner.clone() };
+            let _holding = self.time.begin(lane, &claimed.participant);
+            let outcome = run::run(&self.pool, &self.scope, self.source.as_ref(), &claimed.owner, claimed.generation, self.settings, lane.as_str()).await;
+            tracing::info!(event = "list_sync_run", owner = %claimed.owner, lane = lane.as_str(), outcome = outcome.label(), "list sync run finished");
+            return Ok(Some((claimed.owner, outcome)));
+        }
+        Ok(None)
+    }
+
+    /// Queue again, at a new generation, every row `running` longer than
+    /// the stuck bound with no live run in this process. Returns how many.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn requeue_stuck(&self) -> Result<u64, sqlx::Error> {
+        let live: Vec<String> = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect();
+        let n = sqlx::query(
+            "UPDATE backfill_jobs SET state = 'queued', generation = generation + 1, not_before = now(), updated_at = now() \
+             WHERE depth = $1 AND state = 'running' AND updated_at < now() - make_interval(secs => $2) AND NOT (did = ANY($3))",
+        )
+        .bind(jobs::DEPTH)
+        .bind(self.stuck.as_secs_f64())
+        .bind(&live)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if n > 0 {
+            tracing::warn!(event = "list_sync_stuck_requeued", jobs = n, "re-queued list sync rows left running");
+            metrics::counter!(METRIC_STUCK).increment(n);
+        }
+        Ok(n)
+    }
+
+    /// The stuck-row check, every quarter of the stuck bound, and the age
+    /// of the oldest `running` row as a gauge.
+    pub async fn stuck_loop(self) {
+        let every = (self.stuck / 4).max(Duration::from_secs(1));
+        loop {
+            tokio::time::sleep(every).await;
+            if let Err(error) = self.requeue_stuck().await {
+                tracing::warn!(event = "list_sync_stuck_check_failed", %error, "the list sync stuck-row check failed");
+            }
+            let age: Result<Option<f64>, sqlx::Error> = sqlx::query_scalar(
+                "SELECT EXTRACT(EPOCH FROM now() - min(updated_at))::float8 FROM backfill_jobs WHERE depth = $1 AND state = 'running'",
+            )
+            .bind(jobs::DEPTH)
+            .fetch_one(&self.pool)
+            .await;
+            if let Ok(age) = age {
+                metrics::gauge!(METRIC_RUNNING_AGE).set(age.unwrap_or(0.0));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::aggregations::ScopeSets;
+    use crate::config::ScopePolicy;
+    use crate::subscriptions::fetch::{Bounds, OwnerRecords};
+    use crate::subscriptions::list_phase;
+    use crate::subscriptions::references::{Budget, mute_list};
+    use crate::subscriptions::run::OwnerStatus;
+    use crate::test_support::fresh_db;
+
+    const A: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const M1: &str = "did:plc:mmmmmmmmmmmmmmmmmmmmmmm1";
+
+    /// An owner whose identity was deleted: the run needs no listing.
+    struct Tombstoned;
+
+    #[async_trait]
+    impl OwnerSource for Tombstoned {
+        async fn status(&self, _owner: &str) -> Result<OwnerStatus, String> {
+            Ok(OwnerStatus::Tombstoned)
+        }
+        async fn records(&self, _owner: &str, _generation: i64) -> Result<Box<dyn OwnerRecords>, String> {
+            Err("not listed".to_string())
+        }
+    }
+
+    fn list_sync(pool: &PgPool, scope: ScopeState, fast: u32) -> ListSync {
+        let bounds = Bounds { max_records: 1000, max_pages: 10, probe_call: Duration::from_secs(5), min_records_per_call_sec: 1, max_call: Duration::from_secs(60), max_wall: Duration::from_secs(60) };
+        let settings = Settings { max_items: 100, min_interval_secs: 600, bounds };
+        let lanes = Lanes { fast, slow: 1, stuck_secs: 5400, max_wall_secs: 3600 };
+        ListSync::new(pool.clone(), scope, Arc::new(Tombstoned), Waiting::default(), settings, lanes)
+    }
+
+    /// A worker runs a due sync and frees its lane; a lane with no permit
+    /// runs nothing; a row left `running` with no run behind it is queued
+    /// again at a new generation, and a live run's row is left alone.
+    #[tokio::test]
+    async fn a_lane_runs_a_due_sync_and_stuck_rows_come_back() {
+        let Some(db) = fresh_db("subscriptions_runner").await else {
+            return;
+        };
+        let p = &db.pool;
+        let scope = ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10_000);
+        let list = format!("at://{A}/app.bsky.graph.list/3klist1");
+        mute_list(p, M1, &list, Budget { max_references: 5, max_owners: 5 }).await.expect("mute");
+        list_phase::apply(p, &list, 600).await.expect("apply");
+
+        // No fast permit: nothing runs (the owner is not slow).
+        assert_eq!(list_sync(p, scope.clone(), 0).run_once().await.expect("run"), None);
+        let sync = list_sync(p, scope, 1);
+        let (owner, outcome) = sync.run_once().await.expect("run").expect("a run");
+        assert_eq!((owner.as_str(), outcome), (A, Outcome::OwnerGone));
+        assert_eq!(sync.fast.available_permits(), 1);
+        assert!(sync.live.lock().expect("live").is_empty());
+        assert_eq!(sync.run_once().await.expect("run"), None);
+
+        // A row left running: young, it stays; old, it comes back, unless
+        // a run for it is live.
+        sqlx::query("UPDATE backfill_jobs SET state = 'running', updated_at = now() - interval '1 hour'").execute(p).await.expect("running");
+        assert_eq!(sync.requeue_stuck().await.expect("stuck"), 0);
+        sqlx::query("UPDATE backfill_jobs SET updated_at = now() - interval '2 hours'").execute(p).await.expect("old");
+        sync.live.lock().expect("live").insert(A.to_string());
+        assert_eq!(sync.requeue_stuck().await.expect("stuck"), 0);
+        sync.live.lock().expect("live").clear();
+        let before: i64 = sqlx::query_scalar("SELECT generation FROM backfill_jobs").fetch_one(p).await.expect("generation");
+        assert_eq!(sync.requeue_stuck().await.expect("stuck"), 1);
+        let after: (String, i64) = sqlx::query_as("SELECT state, generation FROM backfill_jobs").fetch_one(p).await.expect("job");
+        assert_eq!(after, ("queued".to_string(), before + 1));
+        db.drop_db().await;
+    }
+}

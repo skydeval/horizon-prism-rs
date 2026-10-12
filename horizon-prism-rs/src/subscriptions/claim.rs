@@ -62,8 +62,9 @@ pub enum Participant {
     None,
 }
 
-/// Each participant's runs on a lane: when each began and how long it took.
-type Held = HashMap<(Lane, Participant), Vec<(Instant, Duration)>>;
+/// Each participant's runs on a lane: when each began and how long it
+/// took, or `None` while it still runs.
+type Held = HashMap<(Lane, Participant), Vec<(Instant, Option<Duration>)>>;
 
 /// Lane time each participant has held lately. In-process only.
 #[derive(Debug, Default, Clone)]
@@ -71,23 +72,52 @@ pub struct LaneTime {
     held: Arc<Mutex<Held>>,
 }
 
+/// A run in progress. Dropping it, by any path, ends the run's lane time.
+#[derive(Debug)]
+pub struct Holding {
+    time: LaneTime,
+    key: (Lane, Participant),
+    started: Instant,
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        let mut held = self.time.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(run) = held.get_mut(&self.key).and_then(|runs| runs.iter_mut().find(|(started, lasted)| *started == self.started && lasted.is_none())) {
+            run.1 = Some(self.started.elapsed());
+        }
+    }
+}
+
 impl LaneTime {
     /// Record a run of `participant` on `lane` that began at `started` and
     /// lasted `lasted`.
     pub fn record(&self, lane: Lane, participant: &Participant, started: Instant, lasted: Duration) {
         let mut held = self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        held.entry((lane, participant.clone())).or_default().push((started, lasted));
+        held.entry((lane, participant.clone())).or_default().push((started, Some(lasted)));
     }
 
-    /// The time `participant` held `lane` within the last `window`, and
-    /// when it last began a run.
+    /// Begin a run of `participant` on `lane`. Its time counts from now,
+    /// while it runs and after.
+    #[must_use]
+    pub fn begin(&self, lane: Lane, participant: &Participant) -> Holding {
+        let started = Instant::now();
+        let key = (lane, participant.clone());
+        let mut held = self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.entry(key.clone()).or_default().push((started, None));
+        Holding { time: self.clone(), key, started }
+    }
+
+    /// The time `participant` held `lane` within the last `window`, a run
+    /// still in progress included, and when it last began a run.
     fn usage(&self, lane: Lane, participant: &Participant, window: Duration, now: Instant) -> (Duration, Option<Instant>) {
         let mut held = self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(runs) = held.get_mut(&(lane, participant.clone())) else {
             return (Duration::ZERO, None);
         };
-        runs.retain(|(started, lasted)| now.saturating_duration_since(*started + *lasted) < window);
-        (runs.iter().map(|(_, lasted)| *lasted).sum(), runs.iter().map(|(started, _)| *started).max())
+        runs.retain(|(started, lasted)| lasted.is_none_or(|lasted| now.saturating_duration_since(*started + lasted) < window));
+        let total = runs.iter().map(|(started, lasted)| lasted.unwrap_or_else(|| now.saturating_duration_since(*started))).sum();
+        (total, runs.iter().map(|(started, _)| *started).max())
     }
 
     /// Drop everything recorded for `member` (a purge of that member).

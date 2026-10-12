@@ -53,6 +53,7 @@ use crate::identity::eligibility::{self, Confirmation};
 use crate::identity::{IdentityResolver, ResolveIntent};
 use crate::microcosm::{ConstellationClient, LinksPage};
 use crate::net::{BodyCap, NetClient, RequestOptions};
+use crate::subscriptions::runner::ListSync;
 
 /// `listRecords` page size.
 pub const PAGE_LIMIT: u32 = 100;
@@ -568,6 +569,8 @@ pub struct Backfill {
     community_patterns: Arc<Vec<String>>,
     /// The block-list index to prime on a member job, when configured.
     farsight: Option<Farsight>,
+    /// The `list_sync` lanes the workers serve before their own claim.
+    list_sync: Option<ListSync>,
 }
 
 impl Backfill {
@@ -586,7 +589,15 @@ impl Backfill {
                 .build(),
             community_patterns: Arc::new(Vec::new()),
             farsight: None,
+            list_sync: None,
         }
+    }
+
+    /// Serve the `list_sync` lanes from these workers.
+    #[must_use]
+    pub fn with_list_sync(mut self, list_sync: Option<ListSync>) -> Self {
+        self.list_sync = list_sync;
+        self
     }
 
     /// Prime `farsight` on every member job.
@@ -606,17 +617,20 @@ impl Backfill {
 
     /// Start the workers, the retry scheduler, the daily `authz` schedule and
     /// the metrics sampler. Jobs left `running` by a previous process are
-    /// re-queued first. `list_sync` rows are not this worker's: they have
-    /// their own claim (`subscriptions::claim`).
+    /// re-queued first; a `list_sync` row also gets a new generation, so
+    /// nothing of the run it was in can still settle it.
     ///
     /// # Errors
     ///
     /// The startup re-queue failed.
     pub async fn spawn(self) -> Result<Vec<JoinHandle<()>>, sqlx::Error> {
-        let n = sqlx::query("UPDATE backfill_jobs SET state = 'queued', updated_at = now() WHERE state = 'running' AND depth <> 'list_sync'")
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+        let n = sqlx::query(
+            "UPDATE backfill_jobs SET state = 'queued', updated_at = now(), \
+               generation = generation + CASE WHEN depth = 'list_sync' THEN 1 ELSE 0 END WHERE state = 'running'",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
         if n > 0 {
             tracing::info!(event = "backfill_requeued_interrupted", jobs = n, "re-queued jobs left running");
         }
@@ -629,6 +643,9 @@ impl Backfill {
         handles.push(tokio::spawn(async move { this.retry_loop().await }));
         let this = self.clone();
         handles.push(tokio::spawn(async move { this.daily_loop().await }));
+        if let Some(list_sync) = self.list_sync.clone() {
+            handles.push(tokio::spawn(list_sync.stuck_loop()));
+        }
         let this = self;
         handles.push(tokio::spawn(async move { this.metrics_loop().await }));
         Ok(handles)
@@ -636,6 +653,16 @@ impl Backfill {
 
     async fn worker_loop(self, worker: u32) {
         loop {
+            // A list sync first, when a lane has a free permit and a due
+            // row; the lanes are smaller than the worker pool, so ordinary
+            // work always keeps workers.
+            if let Some(list_sync) = &self.list_sync {
+                match list_sync.run_once().await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(event = "list_sync_claim_failed", worker, %error, "claiming a list sync failed"),
+                }
+            }
             match self.run_once().await {
                 Ok(Some(_)) => {}
                 Ok(None) => tokio::time::sleep(IDLE_POLL).await,
