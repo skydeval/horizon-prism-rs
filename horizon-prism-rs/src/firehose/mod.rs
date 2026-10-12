@@ -17,5 +17,6 @@ pub mod router;
 pub mod rows;
 pub mod scripts;
 pub mod stream;
+pub mod v3_resync;
 pub mod watermark;
 pub mod writer;

@@ -82,6 +82,23 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 11: backfills fetch the new collections (#671).** The depth
+  table gains them (design-v3 §II-5.10): a member's lists, list items, list
+  blocks, opt-outs and starter packs are listed whole, its thread and post
+  gates and poll posts with the same limit as its posts; a scoped DID gets
+  25 starter packs, 100 poll posts and the gates of its 100 posts; the
+  labeler declaration and the three self records are fetched with
+  `getRecord`, like the profile. A gate is kept only when its post is
+  among the posts the job selected. `private` and `authz` jobs never list
+  them, so readiness is unaffected. Reconcile deletes a stored record of
+  these collections that the repo no longer has, as it does for posts.
+- **Item 11: one-time re-sync after the upgrade (#671).** Once, after
+  the upgrade, `serve` enqueues a `resync` job for every member and then
+  for every other in-scope DID, one a second, so the new collections and
+  each profile's CID are fetched for accounts known before it
+  (design-v3 §12.3). Progress is kept in
+  `worker_state['v3_collections_resync']`; a restart resumes, and a
+  finished pass never runs again.
 - **Item 11: the post-migration backfill task (#671).** `serve` starts a
   background task once migrations are applied (design-v3 §12.2).
   - Phase 1 fills the new `posts` columns from each stored record, and the

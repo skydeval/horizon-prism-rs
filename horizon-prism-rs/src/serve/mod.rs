@@ -416,6 +416,9 @@ pub async fn run() -> Result<(), StartupError> {
     let schema_backfill = SchemaBackfill::new(pool.clone(), schema_backfill::Settings::from_config(&cfg.file));
     let schema_status = schema_backfill.status();
     tasks.push(schema_backfill.spawn());
+    // The one-time re-sync that fetches the new collections of DIDs known
+    // before the upgrade (design-v3 §12.3).
+    tasks.push(crate::firehose::v3_resync::spawn(pool.clone()));
     let state = HealthState {
         pool: pool.clone(),
         redis,

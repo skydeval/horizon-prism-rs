@@ -37,8 +37,10 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use super::classifier::{
-    NSID_AUDIENCE, NSID_BLOCK, NSID_FOLLOW, NSID_LIKE, NSID_POST, NSID_POST_PRIVATE, NSID_PRIVATE_BLOCK,
-    NSID_PROFILE, NSID_REPOST,
+    NSID_ACTOR_STATUS, NSID_AUDIENCE, NSID_BLOCK, NSID_CONTENT_VISIBILITY, NSID_FOLLOW, NSID_LABELER_SERVICE, NSID_LIKE,
+    NSID_LIST, NSID_LIST_OPTOUT, NSID_LISTBLOCK, NSID_LISTITEM, NSID_NOTIFICATION_DECLARATION, NSID_POLL_POST,
+    NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_PROFILE, NSID_REPOST, NSID_STARTER_PACK,
+    NSID_THREADGATE,
 };
 use super::gap;
 use super::jobs::Depth;
@@ -107,6 +109,8 @@ pub struct CollectionPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepthPlan {
     pub profile: bool,
+    /// Fetch [`SELF_RECORDS`] too.
+    pub self_records: bool,
     pub collections: Vec<CollectionPlan>,
     pub inbound_blocks: bool,
 }
@@ -134,13 +138,40 @@ const AUTHORIZATION: [CollectionPlan; 4] = [
     authorization(NSID_POST_PRIVATE),
 ];
 
-const SCOPE_PUBLIC: [CollectionPlan; 2] = [public(NSID_POST, Limit::Top(100)), public(NSID_REPOST, Limit::Top(100))];
+// Gates are listed after posts, with the posts' limit, and only gates of the
+// job's selected posts are kept (design-v3 §3.2, §II-5.10).
+const SCOPE_PUBLIC: [CollectionPlan; 6] = [
+    public(NSID_POST, Limit::Top(100)),
+    public(NSID_REPOST, Limit::Top(100)),
+    public(NSID_THREADGATE, Limit::Top(100)),
+    public(NSID_POSTGATE, Limit::Top(100)),
+    public(NSID_STARTER_PACK, Limit::Top(25)),
+    public(NSID_POLL_POST, Limit::Top(100)),
+];
 
-const MEMBER_PUBLIC: [CollectionPlan; 4] = [
+// The list collections are listed whole, up to the ceiling. A truncated
+// listing only logs: they are not authorization facts.
+const MEMBER_PUBLIC: [CollectionPlan; 12] = [
     public(NSID_POST, Limit::Top(1000)),
     public(NSID_REPOST, Limit::Top(1000)),
     public(NSID_FOLLOW, Limit::Top(10_000)),
     public(NSID_LIKE, Limit::Top(1000)),
+    public(NSID_THREADGATE, Limit::Top(1000)),
+    public(NSID_POSTGATE, Limit::Top(1000)),
+    public(NSID_LIST, Limit::All),
+    public(NSID_LISTITEM, Limit::All),
+    public(NSID_LISTBLOCK, Limit::All),
+    public(NSID_LIST_OPTOUT, Limit::All),
+    public(NSID_STARTER_PACK, Limit::All),
+    public(NSID_POLL_POST, Limit::Top(1000)),
+];
+
+/// The rkey-self records fetched with `getRecord`, like the profile (§3.2).
+pub const SELF_RECORDS: [&str; 4] = [
+    NSID_LABELER_SERVICE,
+    NSID_NOTIFICATION_DECLARATION,
+    NSID_ACTOR_STATUS,
+    NSID_CONTENT_VISIBILITY,
 ];
 
 /// The §5.10 depth table. `resync` uses the member limits for a member and
@@ -150,26 +181,31 @@ pub fn plan(depth: Depth, is_member: bool) -> DepthPlan {
     match depth {
         Depth::Scope => DepthPlan {
             profile: true,
+            self_records: true,
             collections: SCOPE_PUBLIC.to_vec(),
             inbound_blocks: false,
         },
         Depth::Member => DepthPlan {
             profile: true,
+            self_records: true,
             collections: MEMBER_PUBLIC.iter().chain(AUTHORIZATION.iter()).copied().collect(),
             inbound_blocks: true,
         },
         Depth::Private => DepthPlan {
             profile: true,
+            self_records: false,
             collections: AUTHORIZATION.to_vec(),
             inbound_blocks: false,
         },
         Depth::Authz => DepthPlan {
             profile: false,
+            self_records: false,
             collections: AUTHORIZATION.to_vec(),
             inbound_blocks: is_member,
         },
         Depth::Resync => DepthPlan {
             profile: true,
+            self_records: true,
             collections: if is_member { MEMBER_PUBLIC.to_vec() } else { SCOPE_PUBLIC.to_vec() },
             inbound_blocks: false,
         },
@@ -497,16 +533,25 @@ impl Ord for ByRkey {
     }
 }
 
-/// The public table of an ecosystem collection that is listed and reconciled.
-fn public_table(nsid: &str) -> Option<&'static str> {
-    match nsid {
-        NSID_POST => Some("posts"),
-        NSID_LIKE => Some("likes"),
-        NSID_REPOST => Some("reposts"),
-        NSID_FOLLOW => Some("follows"),
-        NSID_BLOCK => Some("blocks"),
-        _ => None,
-    }
+/// The public table, and its author column, of an ecosystem collection that
+/// is listed and reconciled.
+fn public_table(nsid: &str) -> Option<(&'static str, &'static str)> {
+    Some(match nsid {
+        NSID_POST => ("posts", "author_did"),
+        NSID_LIKE => ("likes", "author_did"),
+        NSID_REPOST => ("reposts", "author_did"),
+        NSID_FOLLOW => ("follows", "author_did"),
+        NSID_BLOCK => ("blocks", "author_did"),
+        NSID_THREADGATE => ("threadgates", "author_did"),
+        NSID_POSTGATE => ("postgates", "author_did"),
+        NSID_LIST => ("lists", "creator_did"),
+        NSID_LISTITEM => ("list_items", "author_did"),
+        NSID_LISTBLOCK => ("list_blocks", "author_did"),
+        NSID_LIST_OPTOUT => ("list_optouts", "author_did"),
+        NSID_STARTER_PACK => ("starter_packs", "creator_did"),
+        NSID_POLL_POST => ("nearhorizon_poll_posts", "author_did"),
+        _ => return None,
+    })
 }
 
 /// The worker.
@@ -672,11 +717,22 @@ impl Backfill {
             ..RunResult::default()
         };
         let mut budget = self.settings.reconcile_confirm_limit;
+        // rkeys of the posts this job selected: a gate is kept only when
+        // its post is among them (a gate's rkey is its post's rkey).
+        let mut post_rkeys: HashSet<String> = HashSet::new();
         for c in &plan.collections {
             if let Step::Superseded = self.still_running(job).await? {
                 return Ok(None);
             }
-            let listing = self.list_collection(&pds, &job.did, c).await?;
+            let mut listing = self.list_collection(&pds, &job.did, c).await?;
+            if c.nsid == NSID_POST {
+                post_rkeys = listing.selected.iter().map(|r| r.rkey().to_string()).collect();
+            } else if matches!(c.nsid, NSID_THREADGATE | NSID_POSTGATE) {
+                listing.selected.retain(|r| post_rkeys.contains(r.rkey()));
+            }
+            if listing.ceiling_hit && !c.authorization {
+                tracing::warn!(event = "backfill_listing_truncated", did = %job.did, collection = c.nsid, "listing hit the ceiling; continuing");
+            }
             for record in &listing.selected {
                 if let Some(error) = self.write_record(&job.did, &result.rev, c.nsid, record).await?
                     && c.authorization
@@ -706,6 +762,16 @@ impl Backfill {
                     self.write_record(&job.did, &result.rev, NSID_PROFILE, &record).await?;
                 }
                 None => self.delete_record(&job.did, &result.rev, NSID_PROFILE, "self").await?,
+            }
+        }
+        if plan.self_records {
+            for nsid in SELF_RECORDS {
+                match self.source.get_record(&pds, &job.did, nsid, "self").await? {
+                    Some(record) => {
+                        self.write_record(&job.did, &result.rev, nsid, &record).await?;
+                    }
+                    None => self.delete_record(&job.did, &result.rev, nsid, "self").await?,
+                }
             }
         }
         if plan.inbound_blocks {
@@ -868,8 +934,8 @@ impl Backfill {
     /// Local URIs of `did` in `nsid` with `rev < R` (reconcile candidates
     /// before the listing filter).
     async fn local_uris(&self, did: &str, nsid: &str, rev: &str) -> Result<Vec<String>, sqlx::Error> {
-        if let Some(table) = public_table(nsid) {
-            return sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE author_did = $1 AND rev < $2"))
+        if let Some((table, author)) = public_table(nsid) {
+            return sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE {author} = $1 AND rev < $2"))
                 .bind(did)
                 .bind(rev)
                 .fetch_all(&self.pool)
@@ -1229,22 +1295,40 @@ mod tests {
     #[test]
     fn depth_table() {
         let scope = plan(Depth::Scope, false);
-        assert!(scope.profile && !scope.inbound_blocks);
+        assert!(scope.profile && scope.self_records && !scope.inbound_blocks);
         assert_eq!(scope.collections.iter().map(|c| (c.nsid, c.limit)).collect::<Vec<_>>(), [
             (NSID_POST, Limit::Top(100)),
-            (NSID_REPOST, Limit::Top(100))
+            (NSID_REPOST, Limit::Top(100)),
+            (NSID_THREADGATE, Limit::Top(100)),
+            (NSID_POSTGATE, Limit::Top(100)),
+            (NSID_STARTER_PACK, Limit::Top(25)),
+            (NSID_POLL_POST, Limit::Top(100)),
         ]);
         let member = plan(Depth::Member, true);
-        assert!(member.inbound_blocks);
-        assert_eq!(member.collections.len(), 8);
+        assert!(member.inbound_blocks && member.self_records);
+        assert_eq!(member.collections.len(), 16);
         assert_eq!(member.collections.iter().filter(|c| c.authorization).count(), 4);
         assert!(member.collections.iter().filter(|c| c.authorization).all(|c| c.limit == Limit::All));
+        // A member's list collections are listed whole.
+        for nsid in [NSID_LIST, NSID_LISTITEM, NSID_LISTBLOCK, NSID_LIST_OPTOUT, NSID_STARTER_PACK] {
+            assert_eq!(member.collections.iter().find(|c| c.nsid == nsid).map(|c| c.limit), Some(Limit::All), "{nsid}");
+        }
+        // Gates come after posts, with the posts' limit.
+        let position = |nsid: &str| member.collections.iter().position(|c| c.nsid == nsid).expect("listed");
+        assert!(position(NSID_POST) < position(NSID_THREADGATE) && position(NSID_POST) < position(NSID_POSTGATE));
         let authz = plan(Depth::Authz, false);
-        assert!(!authz.profile && !authz.inbound_blocks);
+        assert!(!authz.profile && !authz.self_records && !authz.inbound_blocks);
         assert!(plan(Depth::Authz, true).inbound_blocks);
-        assert_eq!(plan(Depth::Resync, true).collections.len(), 4);
-        assert_eq!(plan(Depth::Resync, false).collections.len(), 2);
-        assert!(plan(Depth::Private, false).collections.iter().all(|c| c.authorization));
+        assert_eq!(plan(Depth::Resync, true).collections.len(), 12);
+        assert_eq!(plan(Depth::Resync, false).collections.len(), 6);
+        // The new collections are no authorization facts: `private` and
+        // `authz` never list them.
+        let private = plan(Depth::Private, false);
+        assert!(private.collections.iter().all(|c| c.authorization) && !private.self_records);
+        // Every listed public collection has a table to reconcile against.
+        for c in member.collections.iter().filter(|c| !c.authorization) {
+            assert!(public_table(c.nsid).is_some(), "{}", c.nsid);
+        }
     }
 
     #[test]
@@ -1355,6 +1439,77 @@ mod tests {
             .fetch_all(pool)
             .await
             .expect("posts")
+    }
+
+    /// design-v3 §3.2, §II-5.10: the v3 collections are backfilled.
+    #[tokio::test]
+    async fn the_v3_collections_are_listed_fetched_and_reconciled() {
+        let Some(db) = fresh_db("backfill_v3_collections").await else {
+            return;
+        };
+        let p = &db.pool;
+        let post = |rkey: &str| format!("at://{DID}/{NSID_POST}/{rkey}");
+        let list = format!("at://{DID}/{NSID_LIST}/3klist");
+        let mut source = FakeSource {
+            rev: "3kzzzzzzzzzzz".to_string(),
+            ..FakeSource::default()
+        };
+        let mut listing = |nsid: &str, records: Vec<ListedRecord>| {
+            source.listings.insert(nsid.to_string(), records);
+        };
+        listing(NSID_POST, vec![rec(DID, NSID_POST, "3kpost", json!({"text": "gated"}))]);
+        // One gate for the selected post, one for a post the job did not
+        // select: only the first is kept.
+        listing(
+            NSID_THREADGATE,
+            vec![
+                rec(DID, NSID_THREADGATE, "3kpost", json!({"post": post("3kpost"), "allow": []})),
+                rec(DID, NSID_THREADGATE, "3kother", json!({"post": post("3kother")})),
+            ],
+        );
+        listing(NSID_LIST, vec![rec(DID, NSID_LIST, "3klist", json!({"name": "Mods", "purpose": "app.bsky.graph.defs#modlist"}))]);
+        listing(
+            NSID_LISTITEM,
+            vec![
+                rec(DID, NSID_LISTITEM, "3ka", json!({"list": list, "subject": "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"})),
+                rec(DID, NSID_LISTITEM, "3kb", json!({"list": list, "subject": "did:plc:cccccccccccccccccccccccc"})),
+                rec(DID, NSID_LISTITEM, "3kc", json!({"list": list, "subject": "did:plc:dddddddddddddddddddddddd"})),
+            ],
+        );
+        listing(NSID_LISTBLOCK, vec![rec(DID, NSID_LISTBLOCK, "3kblock", json!({"subject": "at://did:plc:x/app.bsky.graph.list/1"}))]);
+        listing(NSID_STARTER_PACK, vec![rec(DID, NSID_STARTER_PACK, "3kpack", json!({"name": "Start", "list": list}))]);
+        // A self record is fetched, not listed.
+        listing(NSID_ACTOR_STATUS, vec![rec(DID, NSID_ACTOR_STATUS, "self", json!({"status": "app.bsky.actor.status#live"}))]);
+        // A list item stored earlier that the repo no longer has, and a
+        // declaration the repo no longer has.
+        for sql in [
+            "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) \
+             VALUES ('at://' || $1 || '/app.bsky.graph.listitem/3kgone', $1, '3kgone', 'c', '3kaaaaaaaaaaa', 'l', 'did:plc:x', now())",
+            "INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) \
+             VALUES ('at://' || $1 || '/app.bsky.notification.declaration/self', $1, 'app.bsky.notification.declaration', 'c', '3kaaaaaaaaaaa', '{}')",
+        ] {
+            sqlx::query(sql).bind(DID).execute(p).await.expect(sql);
+        }
+        let writer = Writer::new(p.clone(), state(true), Arc::new(DisabledPrivateTier));
+        let backfill = Backfill::new(writer, Arc::new(source), BackfillConfig::default(), 5);
+        let mut conn = p.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Resync).await.expect("enqueue");
+        drop(conn);
+        let (_, outcome) = backfill.run_once().await.expect("run").expect("a job");
+        assert_eq!(outcome, JobOutcome::Done);
+
+        let uris = |table: &'static str| async move {
+            let v: Vec<String> = sqlx::query_scalar(&format!("SELECT uri FROM {table} ORDER BY uri")).fetch_all(p).await.expect(table);
+            v
+        };
+        assert_eq!(uris("threadgates").await, [format!("at://{DID}/{NSID_THREADGATE}/3kpost")]);
+        assert_eq!(uris("lists").await, std::slice::from_ref(&list));
+        // The three listed items, and the one the repo no longer has is gone.
+        assert_eq!(uris("list_items").await.len(), 3);
+        assert_eq!(uris("list_blocks").await.len(), 1);
+        assert_eq!(uris("starter_packs").await.len(), 1);
+        assert_eq!(uris("actor_self_records").await, [format!("at://{DID}/{NSID_ACTOR_STATUS}/self")]);
+        db.drop_db().await;
     }
 
     #[tokio::test]
