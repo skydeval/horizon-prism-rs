@@ -264,6 +264,11 @@ pub struct SyncConfig {
     pub divergence_grace_secs: u64,
     pub max_probe_rate_per_host: u32,
     pub read_fetch_rate_per_host: u32,
+    /// Each PDS host's bucket for listings made while serving public
+    /// requests (design-v3 §II-6.11.3).
+    pub public_fallback_rate_per_host: Float,
+    /// How many hosts have such a bucket at once.
+    pub max_public_fallback_hosts: u64,
 }
 
 impl Default for SyncConfig {
@@ -275,6 +280,8 @@ impl Default for SyncConfig {
             divergence_grace_secs: 300,
             max_probe_rate_per_host: 25,
             read_fetch_rate_per_host: 25,
+            public_fallback_rate_per_host: Float(25.0),
+            max_public_fallback_hosts: 100_000,
         }
     }
 }

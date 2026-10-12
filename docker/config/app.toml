@@ -103,6 +103,10 @@ divergence_grace_secs = 300
 max_probe_rate_per_host = 25
 # Synchronous read-time fetches never wait: no token = immediate miss.
 read_fetch_rate_per_host = 25
+# Listings read from another account's PDS while serving public requests:
+# calls per second to one PDS host, and how many hosts are tracked at once.
+public_fallback_rate_per_host = 25.0
+max_public_fallback_hosts = 100000
 
 [db]
 # Backstop against lock waits (design §6.11.7); a timeout is a transient failure.

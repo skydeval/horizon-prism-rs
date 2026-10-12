@@ -376,6 +376,22 @@ impl IdentityResolver {
     ///
     /// As [`IdentityResolver::refresh_now`].
     pub async fn resolve(&self, did: &str, intent: ResolveIntent) -> Result<Arc<Value>, IdentityError> {
+        self.resolve_admitted(did, intent, &|_| true).await
+    }
+
+    /// [`IdentityResolver::resolve`] for a request: `admit` is asked once
+    /// with the DID, just before a synchronous network fetch, and a `false`
+    /// ends the resolution without one. A cached entry costs nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`IdentityResolver::resolve`], plus [`IdentityError::NoBudget`].
+    pub async fn resolve_admitted(
+        &self,
+        did: &str,
+        intent: ResolveIntent,
+        admit: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Result<Arc<Value>, IdentityError> {
         parse_did(did)?;
         match self.inner.cache.lookup(did).await {
             Ok(Some((entry, Freshness::Fresh))) => return Ok(entry.doc),
@@ -388,7 +404,25 @@ impl IdentityResolver {
                 tracing::warn!(event = "did_cache_read_failed", did, %error, "did_cache read failed; fetching");
             }
         }
+        if !admit(did) {
+            return Err(IdentityError::NoBudget(did.to_string()));
+        }
         Ok(self.refresh_now(did, intent).await?.doc)
+    }
+
+    /// [`IdentityResolver::resolve_admitted`] plus extraction.
+    ///
+    /// # Errors
+    ///
+    /// As [`IdentityResolver::resolve_admitted`].
+    pub async fn resolve_info_admitted(
+        &self,
+        did: &str,
+        intent: ResolveIntent,
+        admit: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Result<DidDocInfo, IdentityError> {
+        let doc = self.resolve_admitted(did, intent, admit).await?;
+        Ok(extract_info(&doc, did))
     }
 
     /// [`IdentityResolver::resolve`] plus extraction.
@@ -404,9 +438,15 @@ impl IdentityResolver {
     /// The DID for `handle`, verified bidirectionally (the DID document
     /// claims the handle back), or `None`.
     pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
+        self.resolve_handle_admitted(handle, &|_| true).await
+    }
+
+    /// [`IdentityResolver::resolve_handle`] for a request; `admit` as in
+    /// [`IdentityResolver::resolve_admitted`].
+    pub async fn resolve_handle_admitted(&self, handle: &str, admit: &(dyn Fn(&str) -> bool + Sync)) -> Option<String> {
         let handle = handle.trim().trim_start_matches('@').to_ascii_lowercase();
         let did = self.inner.handles.resolve_handle(&handle).await?;
-        let info = self.resolve_info(&did, ResolveIntent::Lookup).await.ok()?;
+        let info = self.resolve_info_admitted(&did, ResolveIntent::Lookup, admit).await.ok()?;
         verify_bidirectional(&did, info.claimed_handle.as_deref(), Some(&did)).filter(|h| h.eq_ignore_ascii_case(&handle))?;
         Some(did)
     }

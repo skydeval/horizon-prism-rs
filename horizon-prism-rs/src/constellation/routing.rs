@@ -21,7 +21,7 @@ use moka::future::Cache;
 use super::matcher::{first_match, pds_host};
 use crate::config::{COMMUNITY_NETWORK, ConstellationConfig, LOCAL_APPVIEW, NetworkAuth};
 use crate::identity::{IdentityResolver, ResolveIntent};
-use crate::xrpc::pools::Requester;
+use crate::xrpc::pools::{Requester, RequesterLimit, SharedBucket};
 
 /// `route` cache capacity and TTL (§7.6).
 pub const ROUTE_CACHE_CAPACITY: u64 = 200_000;
@@ -198,6 +198,76 @@ impl DidLookup for IdentityResolver {
     }
 }
 
+/// How long a request-side summary is reused, and how many are kept.
+pub const SUMMARY_TTL: Duration = Duration::from_secs(300);
+pub const SUMMARY_CAPACITY: u64 = 100_000;
+
+/// The request path's DID lookup: [`IdentityResolver`] behind the identity
+/// budget of design-v3 §II-8.3.
+///
+/// - A resolution is charged one token of the requester's identity share
+///   (`identity.requester_resolutions_per_sec`), per DID or handle, however
+///   many network calls it takes.
+/// - A PLC fetch it causes also draws on PLC's shared request bucket
+///   (`identity.plc_request_rate_per_sec`). A cached document costs nothing.
+/// - Summaries are kept for [`SUMMARY_TTL`], so one DID named many times
+///   (the author of every post in a page) is resolved and charged once.
+/// - With no budget, or past the request's deadline, the answer is `None`
+///   and nothing is cached.
+#[derive(Clone)]
+pub struct RequestLookup {
+    resolver: IdentityResolver,
+    own: RequesterLimit,
+    plc: SharedBucket,
+    summaries: Cache<String, DidSummary>,
+}
+
+impl RequestLookup {
+    #[must_use]
+    pub fn new(resolver: IdentityResolver, own: RequesterLimit, plc: SharedBucket) -> Self {
+        Self {
+            resolver,
+            own,
+            plc,
+            summaries: Cache::builder().max_capacity(SUMMARY_CAPACITY).time_to_live(SUMMARY_TTL).build(),
+        }
+    }
+
+    /// One identity token for a resolution that is about to start.
+    fn admitted(&self, req: &Requester) -> bool {
+        std::time::Instant::now() < req.deadline() && req.draw_own(&self.own)
+    }
+}
+
+#[async_trait]
+impl DidLookup for RequestLookup {
+    async fn summary(&self, req: &Requester, did: &str) -> Option<DidSummary> {
+        if let Some(s) = self.summaries.get(did).await {
+            return Some(s);
+        }
+        if !self.admitted(req) {
+            return None;
+        }
+        let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
+        let info = self.resolver.resolve_info_admitted(did, ResolveIntent::Lookup, &plc).await.ok()?;
+        let handle = self.resolver.verify_handle(did, info.claimed_handle.as_deref()).await;
+        let summary = DidSummary {
+            pds: info.pds_endpoint,
+            handle,
+        };
+        self.summaries.insert(did.to_string(), summary.clone()).await;
+        Some(summary)
+    }
+
+    async fn did_for_handle(&self, req: &Requester, handle: &str) -> Option<String> {
+        if !self.admitted(req) {
+            return None;
+        }
+        let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
+        self.resolver.resolve_handle_admitted(handle, &plc).await
+    }
+}
+
 /// DID → routing decision, with the `route` cache. Cheap to clone.
 #[derive(Clone)]
 pub struct Router {
@@ -277,6 +347,97 @@ pub(crate) mod tests {
             n.pds_patterns = community.iter().map(|p| (*p).to_string()).collect();
         }
         RoutingTable::from_config(&cfg)
+    }
+
+    struct NoHandles;
+
+    #[async_trait]
+    impl crate::identity::resolver::HandleLookup for NoHandles {
+        async fn resolve_handle(&self, _handle: &str) -> Option<String> {
+            None
+        }
+    }
+
+    struct NeverPersist;
+
+    impl crate::identity::PersistencePolicy for NeverPersist {
+        fn in_persistence_set(&self, _did: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn request_lookups_are_charged_once_per_did() {
+        use axum::extract::{Path, State};
+        use axum::routing::get;
+
+        let Some(db) = crate::test_support::fresh_db("request_lookups_are_charged_once_per_did").await else {
+            return;
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        async fn plc(State(calls): State<Arc<AtomicUsize>>, Path(did): Path<String>) -> axum::Json<serde_json::Value> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            axum::Json(serde_json::json!({
+                "id": did,
+                "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://pds.example.com"}],
+            }))
+        }
+        let base = crate::test_support::serve_fake(axum::Router::new().route("/{did}", get(plc)).with_state(Arc::clone(&calls))).await;
+        let resolver = IdentityResolver::with_handles(
+            crate::net::NetClient::loopback_for_tests(),
+            db.pool.clone(),
+            crate::identity::IdentitySettings {
+                plc_url: base,
+                fresh: Duration::from_secs(3600),
+                stale_max: Duration::from_secs(86_400),
+            },
+            Arc::new(NeverPersist),
+            Arc::new(NoHandles),
+        );
+        // Identity share: burst 3. PLC: burst 2, so one token per pool.
+        let lookup = RequestLookup::new(
+            resolver,
+            RequesterLimit::new("identity", 1.0, 3, 1000),
+            crate::xrpc::pools::Shares::for_tests().bucket("plc", 1.0, 2),
+        );
+        let (a, b, c, d) = (
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+            "did:plc:cccccccccccccccccccccccc",
+            "did:plc:dddddddddddddddddddddddd",
+        );
+
+        let req = Requester::test();
+        let found = lookup.summary(&req, a).await.expect("resolved");
+        assert_eq!(found.pds.as_deref(), Some("https://pds.example.com"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The same DID again costs nothing, for this requester or another.
+        for _ in 0..5 {
+            assert!(lookup.summary(&req, a).await.is_some());
+        }
+        let other = Requester::of(None, "198.51.100.7".parse().expect("ip"));
+        assert!(lookup.summary(&other, a).await.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!req.spent() && !other.spent());
+
+        // PLC's non-member pool is empty: no answer, no fetch, nothing cached.
+        assert!(lookup.summary(&req, b).await.is_none());
+        assert!(req.spent());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // That used the requester's second identity token; the third is its
+        // last, and after it no PLC token is even asked for.
+        assert!(lookup.summary(&req, c).await.is_none());
+        assert!(lookup.summary(&req, d).await.is_none());
+        assert!(lookup.did_for_handle(&req, "alice.example.com").await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Past its deadline a request resolves nothing new, and is not charged.
+        let late = Requester::of(None, "198.51.100.9".parse().expect("ip")).with_deadline(std::time::Instant::now());
+        assert!(lookup.summary(&late, b).await.is_none());
+        assert!(!late.spent());
+        assert!(lookup.summary(&late, a).await.is_some(), "a cached summary is still served");
+        db.drop_db().await;
     }
 
     #[test]

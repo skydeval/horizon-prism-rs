@@ -124,6 +124,8 @@ head_fetch_timeout_ms = 500
 divergence_grace_secs = 300
 max_probe_rate_per_host = 25
 read_fetch_rate_per_host = 25
+public_fallback_rate_per_host = 25.0
+max_public_fallback_hosts = 100000
 
 [db]
 lock_timeout_secs = 30

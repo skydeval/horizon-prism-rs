@@ -54,7 +54,13 @@ pub async fn resolve_did(
     if !proto_blue::syntax::Did::is_valid(did) {
         return Err(XrpcError::invalid("Error: did must be a valid did"));
     }
-    let summary = s.router.lookup().summary(&req, did).await.unwrap_or_default();
+    let summary = s.router.lookup().summary(&req, did).await;
+    // No budget for the lookup is a 429, never the unresolvable shape
+    // (design-v3 §II-8.3: the DID is this request's primary subject).
+    if let (None, Some(exhausted)) = (&summary, req.exhausted()) {
+        return Err(exhausted.into());
+    }
+    let summary = summary.unwrap_or_default();
     let decision = summary
         .pds
         .as_deref()

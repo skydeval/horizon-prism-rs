@@ -10,4 +10,4 @@ pub mod routing;
 
 pub use cascade::{Call, Cascade, Fetched};
 pub use classifier::Class;
-pub use routing::{DidLookup, DidSummary, Router, RoutingDecision, RoutingTable};
+pub use routing::{DidLookup, DidSummary, RequestLookup, Router, RoutingDecision, RoutingTable};

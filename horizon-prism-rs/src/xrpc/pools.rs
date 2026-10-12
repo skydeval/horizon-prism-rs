@@ -21,7 +21,7 @@
 //! for its item. It is never a breaker record.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -151,7 +151,7 @@ impl Bucket {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct TargetId(u32);
+struct TargetId(u64);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ShareKey {
@@ -168,13 +168,75 @@ struct Share {
 
 struct IdleExpiry;
 
-impl Expiry<ShareKey, Share> for IdleExpiry {
-    fn expire_after_create(&self, _: &ShareKey, share: &Share, _: Instant) -> Option<Duration> {
+impl<K> Expiry<K, Share> for IdleExpiry {
+    fn expire_after_create(&self, _: &K, share: &Share, _: Instant) -> Option<Duration> {
         Some(share.idle)
     }
 
-    fn expire_after_update(&self, _: &ShareKey, share: &Share, _: Instant, _: Option<Duration>) -> Option<Duration> {
+    fn expire_after_update(&self, _: &K, share: &Share, _: Instant, _: Option<Duration>) -> Option<Duration> {
         Some(share.idle)
+    }
+}
+
+/// A per-requester rate with no pool behind it: the identity share
+/// (`identity.requester_resolutions_per_sec`), one token per DID or handle
+/// resolved for a request. Cheap to clone.
+#[derive(Clone)]
+pub struct RequesterLimit {
+    cache: Cache<ChargeKey, Share>,
+    rate: Rate,
+    idle: Duration,
+    target_kind: &'static str,
+}
+
+impl RequesterLimit {
+    #[must_use]
+    pub fn new(target_kind: &'static str, per_sec: f64, burst: u32, max_entries: u64) -> Self {
+        let rate = Rate {
+            per_sec,
+            burst: f64::from(burst),
+        };
+        Self {
+            cache: Cache::builder()
+                .max_capacity(max_entries)
+                .eviction_policy(EvictionPolicy::lru())
+                .expire_after(IdleExpiry)
+                .build(),
+            rate,
+            idle: rate.idle(),
+            target_kind,
+        }
+    }
+
+    /// Take one token for `requester`. Never waits.
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] when the requester's bucket is empty.
+    pub fn draw(&self, requester: &ChargeKey) -> Result<(), Exhausted> {
+        self.draw_at(requester, Instant::now())
+    }
+
+    fn draw_at(&self, requester: &ChargeKey, now: Instant) -> Result<(), Exhausted> {
+        let pool = match requester {
+            ChargeKey::Member(_) => Pool::Member,
+            ChargeKey::Ip(_) => Pool::NonMember,
+        };
+        let mut outcome = Ok(());
+        let _ = self.cache.entry(requester.clone()).and_compute_with(|entry| {
+            let mut bucket = entry.map_or_else(|| Bucket::full(self.rate, now), |e| e.into_value().bucket);
+            match bucket.take(self.rate, now) {
+                Ok(()) => Op::Put(Share { bucket, idle: self.idle }),
+                Err(retry_after) => {
+                    outcome = Err(Exhausted { pool, retry_after });
+                    Op::Nop
+                }
+            }
+        });
+        if outcome.is_err() {
+            metrics::counter!(METRIC_EXHAUSTED, "target_kind" => self.target_kind, "pool" => pool.label()).increment(1);
+        }
+        outcome
     }
 }
 
@@ -183,7 +245,7 @@ impl Expiry<ShareKey, Share> for IdleExpiry {
 #[derive(Clone)]
 pub struct Shares {
     cache: Cache<ShareKey, Share>,
-    next_target: Arc<AtomicU32>,
+    next_target: Arc<AtomicU64>,
     /// `constellation.requester_share`.
     share: f64,
     /// `constellation.nonmember_fraction`.
@@ -206,7 +268,7 @@ impl Shares {
                 .eviction_policy(EvictionPolicy::lru())
                 .expire_after(IdleExpiry)
                 .build(),
-            next_target: Arc::new(AtomicU32::new(0)),
+            next_target: Arc::new(AtomicU64::new(0)),
             share,
             nonmember_fraction,
         }
@@ -364,6 +426,53 @@ impl SharedBucket {
     }
 }
 
+/// `public_fallback_hosts`: host buckets alive now.
+pub const METRIC_HOSTS: &str = "public_fallback_hosts";
+
+/// The public-fallback bucket of every PDS host a public request reads
+/// (design-v3 §II-6.11.3): one [`SharedBucket`] per host, created on first
+/// use. Any did:web or PDS host can be named anonymously, so the buckets
+/// live in an LRU cache of `sync.max_public_fallback_hosts` entries with a
+/// time-to-idle of `max(2 s, 2 / rate)`: an evicted bucket has refilled, and
+/// a new host always gets one. Cheap to clone.
+#[derive(Clone)]
+pub struct HostBuckets {
+    hosts: Cache<String, SharedBucket>,
+    shares: Shares,
+    per_sec: f64,
+    burst: u32,
+}
+
+impl HostBuckets {
+    /// Buckets of `per_sec` per host, for at most `max_hosts` hosts.
+    #[must_use]
+    pub fn new(shares: &Shares, per_sec: f64, max_hosts: u64) -> Self {
+        let idle = Duration::try_from_secs_f64(2.0 / per_sec).map_or(Duration::MAX, |d| d.max(Duration::from_secs(2)));
+        Self {
+            hosts: Cache::builder()
+                .max_capacity(max_hosts)
+                .eviction_policy(EvictionPolicy::lru())
+                .time_to_idle(idle)
+                .build(),
+            shares: shares.clone(),
+            per_sec,
+            // A second's worth, and at least one token in each pool.
+            burst: (per_sec.ceil() as u32).max(2),
+        }
+    }
+
+    /// Take one token of `host`'s bucket for `req`. `false` is "no answer",
+    /// and the request remembers it.
+    #[must_use]
+    pub fn draw(&self, req: &Requester, host: &str) -> bool {
+        let bucket = self
+            .hosts
+            .get_with_by_ref(host, || self.shares.bucket("host", self.per_sec, self.burst));
+        metrics::gauge!(METRIC_HOSTS).set(self.hosts.entry_count() as f64);
+        req.draw(&bucket)
+    }
+}
+
 /// The time one XRPC request may spend on synchronous upstream work
 /// (§II-8.3 "Limits"): every cascade of the request shares it.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(6);
@@ -435,12 +544,21 @@ impl Requester {
     ///
     /// [`Exhausted`] when the share or pool is empty.
     pub fn try_draw(&self, bucket: &SharedBucket) -> Result<(), Exhausted> {
-        bucket.draw(&self.key).map(|_| ()).inspect_err(|e| {
-            let mut seen = self.exhausted.lock().unwrap_or_else(PoisonError::into_inner);
-            if seen.is_none_or(|s| s.retry_after < e.retry_after) {
-                *seen = Some(*e);
-            }
-        })
+        bucket.draw(&self.key).map(|_| ()).inspect_err(|e| self.note(*e))
+    }
+
+    /// Take one token of this requester's own `limit`. `false` is "no
+    /// answer", and the request remembers it.
+    #[must_use]
+    pub fn draw_own(&self, limit: &RequesterLimit) -> bool {
+        limit.draw(&self.key).inspect_err(|e| self.note(*e)).is_ok()
+    }
+
+    fn note(&self, e: Exhausted) {
+        let mut seen = self.exhausted.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.is_none_or(|s| s.retry_after < e.retry_after) {
+            *seen = Some(e);
+        }
     }
 
     /// Whether any draw of this request found nothing. Once it has, the
@@ -482,6 +600,13 @@ pub fn problems(cfg: &FileConfig, out: &mut Vec<String>) {
             cfg.identity.requester_resolutions_burst,
         ),
     ];
+    let hosts = cfg.sync.public_fallback_rate_per_host.0;
+    if let Some(p) = class_problem(RateClassConfig::new(hosts, 2)) {
+        out.push(format!("sync.public_fallback_rate_per_host: {p}"));
+    }
+    if cfg.sync.max_public_fallback_hosts < 1000 {
+        out.push("sync.max_public_fallback_hosts must be at least 1000".to_string());
+    }
     for (name, per_sec, burst) in rates {
         if let Some(p) = class_problem(RateClassConfig::new(per_sec.0, burst)) {
             out.push(format!("{name}: {p}"));
@@ -595,6 +720,38 @@ mod tests {
     }
 
     #[test]
+    fn each_host_has_its_own_bucket_and_new_hosts_always_get_one() {
+        // 4/s per host: two tokens in the non-member pool.
+        let hosts = HostBuckets::new(&Shares::for_tests(), 4.0, 1000);
+        let req = Requester::test();
+        assert!(hosts.draw(&req, "pds.a.example"));
+        assert!(hosts.draw(&req, "pds.a.example"));
+        assert!(!hosts.draw(&req, "pds.a.example"));
+        assert!(req.spent());
+        // Another host is unaffected, and so are hosts past the capacity
+        // (LRU eviction, no refusal).
+        let other = Requester::of(None, "198.51.100.7".parse().expect("ip"));
+        for i in 0..3000 {
+            assert!(hosts.draw(&other, &format!("pds{i}.example")), "host {i}");
+        }
+        assert!(!other.spent());
+    }
+
+    #[test]
+    fn the_identity_share_is_per_requester() {
+        let limit = RequesterLimit::new("identity", 1.0, 2, 1000);
+        let now = Instant::now();
+        let a = ip("203.0.113.1");
+        limit.draw_at(&a, now).expect("first");
+        limit.draw_at(&a, now).expect("second");
+        let e = limit.draw_at(&a, now).expect_err("empty");
+        assert_eq!((e.pool, e.retry_after), (Pool::NonMember, Duration::from_secs(1)));
+        limit.draw_at(&ip("203.0.113.2"), now).expect("another requester");
+        limit.draw_at(&ChargeKey::member("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"), now).expect("a member");
+        limit.draw_at(&a, now + Duration::from_secs(1)).expect("refilled");
+    }
+
+    #[test]
     fn a_small_share_still_has_a_token() {
         // 1/s, burst 2 at a 1% share: the share's burst is raised to 1.
         let bucket = Shares::new(0.01, 0.5, 1000).bucket("network", 1.0, 2);
@@ -625,6 +782,8 @@ mod tests {
             ("[microcosm]\nconstellation_burst = 0\n", "microcosm.constellation"),
             ("[identity]\nplc_request_rate_per_sec = inf\n", "identity.plc_request"),
             ("[identity]\nrequester_resolutions_burst = 0\n", "identity.requester_resolutions"),
+            ("[sync]\npublic_fallback_rate_per_host = 0.0\n", "sync.public_fallback_rate_per_host"),
+            ("[sync]\nmax_public_fallback_hosts = 10\n", "sync.max_public_fallback_hosts"),
         ] {
             let out = check(toml);
             assert!(out.iter().any(|p| p.contains(needle)), "{needle:?} not in {out:?}");

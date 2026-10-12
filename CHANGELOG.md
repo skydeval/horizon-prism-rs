@@ -48,8 +48,24 @@ commit.
     stops without a not-found item; counts use the stored or local value;
     Thread Lens reports `upstream-unavailable`.
   - A cascade cut by the request's deadline is no answer too.
-  Not yet charged: PLC and handle resolution, author-PDS listings, and the
-  rule that a cascade or PDS listing with nothing to show answers 429.
+  Not yet done: the rule that a cascade or PDS listing with nothing to
+  show answers 429 instead of an empty page.
+- **Item 10: identity lookups and author-PDS listings are charged
+  (#669).** Resolving a DID or a handle for a request costs one token of
+  the requester's identity share
+  (`identity.requester_resolutions_per_sec`, default 5/s, burst 25), and a
+  PLC directory fetch it causes also draws on PLC's request bucket
+  (`identity.plc_request_rate_per_sec`). A summary (PDS and verified
+  handle) is reused for 5 minutes, so a DID named many times is resolved
+  and charged once; before, every use repeated the handle check over the
+  network. Without budget the lookup has no answer, and `resolveDid`
+  answers 429 instead of the unresolvable shape. Every `listRecords` call
+  made for a public request draws on its PDS host's own bucket
+  (`sync.public_fallback_rate_per_host`, default 25/s, for up to
+  `sync.max_public_fallback_hosts` hosts), split into pools and shares
+  like the others. It no longer uses the private tier's read-fetch bucket,
+  so public traffic cannot drain the private tier's head fetches. Token
+  issuer lookups during authentication are not charged yet.
 - **Item 10: pools and fair shares (#669).** `xrpc::pools`
   holds the shared upstream bucket of design-v3 §II-8.3: a member pool and
   a non-member pool (`constellation.nonmember_fraction`, default 0.5), and

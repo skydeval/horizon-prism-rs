@@ -36,8 +36,8 @@ use crate::firehose::backfill::{ListOrder, ListPage, ListedRecord, detect_order}
 use crate::firehose::normalize::{blob_cid, normalize_record};
 use crate::microcosm::SlingshotClient;
 use crate::net::{BodyCap, NetClient, RequestOptions};
-use crate::sync::{Class as BudgetClass, HostBudgets};
-use crate::xrpc::pools::Requester;
+use crate::sync::HostBudgets;
+use crate::xrpc::pools::{HostBuckets, Requester};
 
 /// Upstream lookups for subjects this AppView does not index.
 #[async_trait]
@@ -193,29 +193,38 @@ const NSID_POST: &str = "app.bsky.feed.post";
 const NSID_REPOST: &str = "app.bsky.feed.repost";
 const NSID_FOLLOW: &str = "app.bsky.graph.follow";
 
-/// Author-PDS listings on the read path: the host's read-fetch bucket
-/// (never queued), and the §5.10 order cache.
+/// Author-PDS listings on the read path: the host's public-fallback bucket
+/// (design-v3 §II-6.11.3; never queued, and separate from the private
+/// tier's read-fetch bucket), and the §5.10 order cache.
 #[derive(Clone)]
 pub struct PdsLister {
     net: NetClient,
-    budgets: HostBudgets,
+    hosts: HostBuckets,
     orders: moka::future::Cache<String, ListOrder>,
 }
 
 impl PdsLister {
     #[must_use]
-    pub fn new(net: NetClient, budgets: HostBudgets) -> Self {
+    pub fn new(net: NetClient, hosts: HostBuckets) -> Self {
         Self {
             net,
-            budgets,
+            hosts,
             orders: moka::future::Cache::builder().max_capacity(100_000).time_to_live(ORDER_TTL).build(),
         }
     }
 
-    /// One `listRecords` page, or `None` (no budget, transport or status
-    /// failure).
-    pub async fn list(&self, pds: &str, did: &str, collection: &str, limit: u32, cursor: Option<&str>) -> Option<ListPage> {
-        if !self.budgets.try_acquire(&HostBudgets::host_of(pds), BudgetClass::ReadFetch) {
+    /// One `listRecords` page charged to `req`, or `None` (no budget, a
+    /// passed deadline, a transport or status failure).
+    pub async fn list(
+        &self,
+        req: &Requester,
+        pds: &str,
+        did: &str,
+        collection: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Option<ListPage> {
+        if std::time::Instant::now() >= req.deadline() || !self.hosts.draw(req, &HostBudgets::host_of(pds)) {
             return None;
         }
         let limit = limit.to_string();
@@ -230,12 +239,12 @@ impl PdsLister {
 
     /// The host's listing order, probed once with a `limit=2` listing and
     /// cached 24 h. `None` when undetermined.
-    pub async fn order(&self, pds: &str, did: &str) -> Option<ListOrder> {
+    pub async fn order(&self, req: &Requester, pds: &str, did: &str) -> Option<ListOrder> {
         let host = HostBudgets::host_of(pds);
         if let Some(o) = self.orders.get(&host).await {
             return Some(o);
         }
-        let page = self.list(pds, did, NSID_POST, 2, None).await?;
+        let page = self.list(req, pds, did, NSID_POST, 2, None).await?;
         let order = detect_order(&page.records)?;
         self.orders.insert(host, order).await;
         Some(order)
@@ -339,7 +348,7 @@ impl RealUpstreamSource {
     /// merged by rkey (TID order), filtered, at most `limit`.
     async fn pds_feed(&self, req: &Requester, did: &str, limit: u32, cursor: Option<&str>, filter: &str) -> Option<Value> {
         let pds = self.router.lookup().summary(req, did).await?.pds?;
-        let order = self.pds.order(&pds, did).await?;
+        let order = self.pds.order(req, &pds, did).await?;
         let (post_cursor, repost_cursor) = match cursor.and_then(|c| c.strip_prefix("P:")) {
             Some(c) => {
                 let (p, r) = c.split_once(':').unwrap_or((c, ""));
@@ -350,8 +359,8 @@ impl RealUpstreamSource {
         let limit_usize = usize::try_from(limit).unwrap_or(50);
         let (posts, reposts, paged) = match order {
             ListOrder::Descending => {
-                let posts = self.pds.list(&pds, did, NSID_POST, limit, post_cursor.as_deref()).await?.records;
-                let reposts = self.pds.list(&pds, did, NSID_REPOST, limit, repost_cursor.as_deref()).await?.records;
+                let posts = self.pds.list(req, &pds, did, NSID_POST, limit, post_cursor.as_deref()).await?.records;
+                let reposts = self.pds.list(req, &pds, did, NSID_REPOST, limit, repost_cursor.as_deref()).await?.records;
                 (posts, reposts, true)
             }
             // An ascending PDS: only the first page, the newest `limit` of a
@@ -410,11 +419,11 @@ impl RealUpstreamSource {
 
     /// The newest `n` records of an ascending listing, paging at most
     /// [`ASCENDING_MAX_PAGES`].
-    async fn newest_ascending(&self, _req: &Requester, pds: &str, did: &str, collection: &str, n: usize) -> Vec<ListedRecord> {
+    async fn newest_ascending(&self, req: &Requester, pds: &str, did: &str, collection: &str, n: usize) -> Vec<ListedRecord> {
         let mut all: Vec<ListedRecord> = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..ASCENDING_MAX_PAGES {
-            let Some(page) = self.pds.list(pds, did, collection, PDS_PAGE, cursor.as_deref()).await else {
+            let Some(page) = self.pds.list(req, pds, did, collection, PDS_PAGE, cursor.as_deref()).await else {
                 break;
             };
             let done = page.cursor.is_none() || page.records.is_empty();
@@ -573,7 +582,7 @@ impl UpstreamSource for RealUpstreamSource {
         let pds = self.router.lookup().summary(req, actor).await?.pds?;
         let page = self
             .pds
-            .list(&pds, actor, NSID_FOLLOW, limit, cursor.and_then(|c| c.strip_prefix("P:")))
+            .list(req, &pds, actor, NSID_FOLLOW, limit, cursor.and_then(|c| c.strip_prefix("P:")))
             .await?;
         let subjects: Vec<String> = page
             .records
@@ -616,18 +625,14 @@ mod tests {
     use crate::constellation::cascade::tests::{cascade_for, fake_appview};
     use crate::constellation::routing::tests::{StubLookup, table_with_community};
     use crate::constellation::{DidLookup, Router as DidRouter};
-    use crate::sync::BudgetRates;
     use crate::test_support::serve_fake;
+    use crate::xrpc::pools::Shares;
 
     const OUTSIDER: &str = "did:plc:oooooooooooooooooooooooo";
 
-    fn budgets() -> HostBudgets {
-        HostBudgets::new(BudgetRates {
-            max_probe_per_host: 25.0,
-            head_max_age_secs: 60.0,
-            read_fetch_per_host: 10.0,
-            backfill_per_host: 5.0,
-        })
+    /// Host buckets of `per_sec`: a non-member address gets half of it.
+    fn hosts(per_sec: f64) -> HostBuckets {
+        HostBuckets::new(&Shares::for_tests(), per_sec, 1000)
     }
 
     async fn fake_slingshot() -> (String, Arc<AtomicUsize>) {
@@ -662,7 +667,7 @@ mod tests {
             router,
             cascade,
             SlingshotClient::new(net.clone(), slingshot),
-            PdsLister::new(net, budgets()),
+            PdsLister::new(net, hosts(20.0)),
             ReadCache::new(1024 * 1024),
         )
     }
@@ -708,17 +713,11 @@ mod tests {
         lookup.pds.lock().expect("lock").insert(OUTSIDER.into(), pds.to_string());
         let router = DidRouter::new(Arc::new(table_with_community(&[])), lookup as Arc<dyn DidLookup>);
         let net = NetClient::loopback_for_tests();
-        let generous = HostBudgets::new(BudgetRates {
-            max_probe_per_host: 25.0,
-            head_max_age_secs: 60.0,
-            read_fetch_per_host: 100.0,
-            backfill_per_host: 5.0,
-        });
         RealUpstreamSource::new(
             router,
             cascade_for(&[("bluesky", cascade_base), ("community-a", cascade_base)]),
             SlingshotClient::new(net.clone(), cascade_base),
-            PdsLister::new(net, generous),
+            PdsLister::new(net, hosts(200.0)),
             ReadCache::new(1024 * 1024),
         )
     }

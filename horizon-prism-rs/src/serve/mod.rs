@@ -34,7 +34,7 @@ use crate::microcosm::ConstellationClient;
 use crate::net::{NetClient, NetConfig};
 use crate::aggregations::enroll::AutoEnroller;
 use crate::constellation::resolve_did::ResolveDidState;
-use crate::constellation::{Cascade, DidLookup, Router as DidRouter, RoutingTable};
+use crate::constellation::{Cascade, DidLookup, RequestLookup, Router as DidRouter, RoutingTable};
 use crate::hydration::upstream::{PdsLister, RealUpstreamSource};
 use crate::hydration::{HydrationConfig, Hydrator, ReadCache};
 use crate::microcosm::SlingshotClient;
@@ -43,7 +43,7 @@ use crate::kryphocron_glue::GlueContext;
 use crate::private_tier::handlers::PrivateState;
 use crate::private_tier::retention::PrivateRetention;
 use crate::private_tier::{KryphocronPrivateTier, PrivateTier};
-use crate::xrpc::pools::Shares;
+use crate::xrpc::pools::{HostBuckets, RequesterLimit, Shares};
 use crate::xrpc::{AppState, RateLimits};
 use health::{AuditLatch, HealthState};
 
@@ -287,11 +287,24 @@ pub async fn run() -> Result<(), StartupError> {
     // identity resolver, one client per outbound network, the cascade, and
     // the upstream source behind hydration's seam.
     let table = Arc::new(RoutingTable::from_config(&cfg.file.constellation));
-    let did_router = DidRouter::new(Arc::clone(&table), Arc::new(resolver.clone()) as Arc<dyn DidLookup>);
     // Every upstream a public request reaches has one request bucket,
     // split into pools and per-requester shares (design-v3 §II-8.3).
     let shares = Shares::from_config(&cfg.file);
     let microcosm = &cfg.file.microcosm;
+    let identity = &cfg.file.identity;
+    // Request-path identity work: one token of the requester's identity
+    // share per DID or handle, and PLC's request bucket per PLC fetch.
+    let lookup = RequestLookup::new(
+        resolver.clone(),
+        RequesterLimit::new(
+            "identity",
+            identity.requester_resolutions_per_sec.0,
+            identity.requester_resolutions_burst,
+            cfg.file.constellation.requester_share_max_entries,
+        ),
+        shares.bucket("plc", identity.plc_request_rate_per_sec.0, identity.plc_request_burst),
+    );
+    let did_router = DidRouter::new(Arc::clone(&table), Arc::new(lookup) as Arc<dyn DidLookup>);
     let cascade = Cascade::new(
         Arc::clone(&table),
         crate::appview_clients::from_config(&cfg.file.constellation, &net, &glue.service_key),
@@ -307,7 +320,14 @@ pub async fn run() -> Result<(), StartupError> {
         did_router.clone(),
         cascade.clone(),
         slingshot.clone(),
-        PdsLister::new(net.clone(), budgets),
+        PdsLister::new(
+            net.clone(),
+            HostBuckets::new(
+                &shares,
+                cfg.file.sync.public_fallback_rate_per_host.0,
+                cfg.file.sync.max_public_fallback_hosts,
+            ),
+        ),
         read_cache.clone(),
     );
 

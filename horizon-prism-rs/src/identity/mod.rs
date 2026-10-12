@@ -49,6 +49,10 @@ pub enum IdentityError {
     Net(#[from] NetError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    /// No fetch was made: the request had no budget for it (design-v3
+    /// §II-8.3). No answer, and nothing to cache.
+    #[error("no request budget to resolve {0}")]
+    NoBudget(String),
 }
 
 impl IdentityError {
