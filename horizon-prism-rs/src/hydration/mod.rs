@@ -138,6 +138,10 @@ pub struct HydrationConfig {
     pub activity_subscriptions_max: u32,
     /// `bookmarks.max_per_actor`.
     pub bookmarks_max: u32,
+    /// `bookmarks.emit_count`.
+    pub bookmarks_emit_count: crate::config::BookmarkCount,
+    /// `bookmarks.count_floor`.
+    pub bookmarks_count_floor: u32,
     /// `drafts.max_per_actor`.
     pub drafts_max: u32,
     /// `drafts.max_bytes`.
@@ -830,23 +834,47 @@ pub(crate) mod testing {
             Arc::new(NoUpstream),
             ReadCache::new(1024 * 1024),
             HydrationConfig {
-                labeler_did: LABELER.into(),
-                counts: CountsConfig::default(),
-                thread: ThreadConfig::default(),
-                thread_mutes_max: 3,
-                activity_subscriptions_max: 2,
-                bookmarks_max: 3,
-                drafts_max: 2,
-                drafts_max_bytes: 2000,
-                labels_query_max_patterns: 25,
-                known_followers_scan_max_pages: 2,
-                known_followers_profile_scan_pages: 2,
-                known_likers_scan_max_pages: 2,
-                thread_v2_max_parents: 80,
-                op_thread_max_walk: 4,
                 farsight: Some(farsight),
-                constellation_bucket: None,
+                ..test_config()
             },
+        )
+    }
+
+    /// The settings test hydrators run with: small caps, so a test can
+    /// reach them.
+    pub(crate) fn test_config() -> HydrationConfig {
+        HydrationConfig {
+            labeler_did: LABELER.into(),
+            counts: CountsConfig::default(),
+            thread: ThreadConfig::default(),
+            thread_mutes_max: 3,
+            activity_subscriptions_max: 2,
+            bookmarks_max: 3,
+            bookmarks_emit_count: crate::config::BookmarkCount::Never,
+            bookmarks_count_floor: 2,
+            drafts_max: 2,
+            drafts_max_bytes: 2000,
+            labels_query_max_patterns: 25,
+            known_followers_scan_max_pages: 2,
+            known_followers_profile_scan_pages: 2,
+            known_likers_scan_max_pages: 2,
+            thread_v2_max_parents: 80,
+            op_thread_max_walk: 4,
+            farsight: None,
+            constellation_bucket: None,
+        }
+    }
+
+    /// A hydrator with no upstream and settings of the test's choosing.
+    pub(crate) fn hydrator_configured(pool: &PgPool, sets: ScopeSets, cfg: HydrationConfig) -> Hydrator {
+        Hydrator::new(
+            pool.clone(),
+            ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000),
+            None,
+            None,
+            Arc::new(NoUpstream),
+            ReadCache::new(1024 * 1024),
+            cfg,
         )
     }
 
@@ -864,24 +892,7 @@ pub(crate) mod testing {
             None,
             upstream,
             ReadCache::new(1024 * 1024),
-            HydrationConfig {
-                labeler_did: LABELER.into(),
-                counts: CountsConfig::default(),
-                thread: ThreadConfig::default(),
-                thread_mutes_max: 3,
-                activity_subscriptions_max: 2,
-                bookmarks_max: 3,
-                drafts_max: 2,
-                drafts_max_bytes: 2000,
-                labels_query_max_patterns: 25,
-                known_followers_scan_max_pages: 2,
-                known_followers_profile_scan_pages: 2,
-                known_likers_scan_max_pages: 2,
-                thread_v2_max_parents: 80,
-                op_thread_max_walk: 4,
-                farsight: None,
-                constellation_bucket: None,
-            },
+            test_config(),
         )
     }
 

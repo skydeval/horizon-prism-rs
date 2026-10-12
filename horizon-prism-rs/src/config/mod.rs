@@ -20,7 +20,7 @@ pub use env::{
     SecretToken, SecretUrl, config_path, validate_hostname,
 };
 pub use sections::{
-    ActivitySubscriptionsConfig, AdminConfig, AuthConfig, BookmarksConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
+    ActivitySubscriptionsConfig, AdminConfig, AuthConfig, BookmarkCount, BookmarksConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
     CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, DraftsConfig, FeaturesConfig,
     FarsightConfig, FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
     KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig,

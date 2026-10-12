@@ -12,6 +12,11 @@ commit.
 
 ### Added
 
+- **Item 15: `bookmarkCount` (#675).** Post views can carry how many
+  members bookmarked the post, by `[bookmarks] emit_count`: `never` (the
+  default, safe for a small community where a count of 1 points at one
+  person), `above_floor` (only from `count_floor`, default 10, never
+  shown as a lower number) or `always` (design-v3 §8.2).
 - **Item 15: `app.nearhorizon.feed.getAuthorPolls` (#675).** An
   account's public polls, newest first, with a basic author view.
   Non-public polls are never returned. An indexed author's polls come

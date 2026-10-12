@@ -827,17 +827,38 @@ impl Default for ActivitySubscriptionsConfig {
     }
 }
 
-/// `[bookmarks]` (design-v3 §5.8).
+/// `bookmarks.emit_count` (design-v3 §8.2, locked decision 27): when a
+/// post view carries `bookmarkCount`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BookmarkCount {
+    /// Never: safe at any size.
+    #[default]
+    Never,
+    /// Only when the count is at least `bookmarks.count_floor`.
+    AboveFloor,
+    /// Always, zero included.
+    Always,
+}
+
+/// `[bookmarks]` (design-v3 §5.8, §8.2).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BookmarksConfig {
     /// Posts one member may bookmark; another past it is a 400.
     pub max_per_actor: u32,
+    pub emit_count: BookmarkCount,
+    /// The smallest count `above_floor` shows.
+    pub count_floor: u32,
 }
 
 impl Default for BookmarksConfig {
     fn default() -> Self {
-        Self { max_per_actor: 50_000 }
+        Self {
+            max_per_actor: 50_000,
+            emit_count: BookmarkCount::Never,
+            count_floor: 10,
+        }
     }
 }
 

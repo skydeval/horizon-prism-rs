@@ -11,6 +11,7 @@ use super::actor::{ProfileContext, ProfileKind};
 use super::normalize::is_private_uri;
 use super::{CountMode, Hydrator, PostRow, PublicEmit, ViewError, ViewResult, Viewer, blob_url, ts};
 use crate::aggregations::counts::Counts;
+use crate::config::BookmarkCount;
 use crate::db::locks::uri_author;
 use crate::firehose::normalize::blob_cid;
 use crate::moderation::{self, Gate};
@@ -95,6 +96,9 @@ pub struct PostContext {
     pub gates: HashMap<String, Gate>,
     /// By post: its own valid threadgate, as a `threadgateView`.
     pub threadgates: HashMap<String, Value>,
+    /// By post: the `bookmarkCount` to emit. A post with no entry carries
+    /// none (`bookmarks.emit_count`).
+    pub bookmark_counts: HashMap<String, i64>,
     /// By quoted post: the quoting posts its author detached (its valid
     /// postgate's `detachedEmbeddingUris`).
     pub detached: HashMap<String, HashSet<String>>,
@@ -131,6 +135,9 @@ impl PostContext {
         v.insert("repostCount".into(), pick(c.and_then(|c| c.reposts), row.repost_count));
         v.insert("likeCount".into(), pick(c.and_then(|c| c.likes), row.like_count));
         v.insert("quoteCount".into(), pick(c.and_then(|c| c.quotes), row.quote_count));
+        if let Some(n) = self.bookmark_counts.get(uri) {
+            v.insert("bookmarkCount".into(), json!(n));
+        }
         v.insert("indexedAt".into(), json!(ts(row.indexed_at)));
         v.insert("viewer".into(), self.viewers.get(uri).cloned().unwrap_or_else(|| json!({})));
         v.insert("labels".into(), Value::Array(self.labels.get(uri).cloned().unwrap_or_default()));
@@ -393,6 +400,25 @@ impl Hydrator {
             let view = self.threadgate_view(viewer.unwrap_or(&anonymous), req, &uri, &cid, record, allow.as_ref()).await?;
             threadgates.insert(post, view);
         }
+        // `bookmarkCount`, when the operator lets it be shown (§8.2). In a
+        // small community a low count points at one member's private
+        // bookmark, so by default it is never emitted.
+        let emit = self.inner.cfg.bookmarks_emit_count;
+        let mut bookmark_counts: HashMap<String, i64> = HashMap::new();
+        if emit != BookmarkCount::Never {
+            let rows: Vec<(String, i64)> =
+                sqlx::query_as("SELECT post_uri, count(*) FROM bookmarks WHERE post_uri = ANY($1) GROUP BY post_uri")
+                    .bind(&all_uris)
+                    .fetch_all(self.pool())
+                    .await?;
+            if emit == BookmarkCount::Always {
+                bookmark_counts.extend(all_uris.iter().map(|u| (u.clone(), 0)));
+                bookmark_counts.extend(rows);
+            } else {
+                let floor = i64::from(self.inner.cfg.bookmarks_count_floor);
+                bookmark_counts.extend(rows.into_iter().filter(|(_, n)| *n >= floor));
+            }
+        }
         Ok(PostContext {
             posts,
             profiles,
@@ -401,6 +427,7 @@ impl Hydrator {
             counts,
             gates,
             threadgates,
+            bookmark_counts,
             detached: detached.into_iter().map(|(post, quotes)| (post, quotes.into_iter().collect())).collect(),
         })
     }

@@ -263,6 +263,8 @@ subscribed_post_max_age_secs = 86400
 
 [bookmarks]
 max_per_actor = 50000
+emit_count = "never"
+count_floor = 10
 
 [drafts]
 max_per_actor = 1000

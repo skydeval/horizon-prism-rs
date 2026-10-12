@@ -65,6 +65,9 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if !(1024..=16 * 1024 * 1024).contains(&cfg.drafts.max_bytes) {
         out.push("drafts.max_bytes must be 1024 to 16777216".to_string());
     }
+    if cfg.bookmarks.count_floor == 0 {
+        out.push("bookmarks.count_floor must be at least 1".to_string());
+    }
     if cfg.bookmarks.max_per_actor == 0 {
         out.push("bookmarks.max_per_actor must be at least 1".to_string());
     }

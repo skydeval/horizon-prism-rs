@@ -293,6 +293,12 @@ subscribed_post_max_age_secs = 86400
 # refused.
 [bookmarks]
 max_per_actor = 50000
+# Whether a post shows how many members bookmarked it. Bookmarks are private,
+# and in a small community a count of 1 points at one person, so the default
+# is "never". "above_floor" shows the number only once it reaches count_floor;
+# "always" shows it every time, zero included.
+emit_count = "never"
+count_floor = 10
 
 # Unfinished posts a member saves to finish later: how many one member may
 # keep, and the largest one (in bytes; 1 MiB).

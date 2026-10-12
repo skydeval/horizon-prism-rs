@@ -211,6 +211,32 @@ mod tests {
         }
         let l = h.get_bookmarks(&me, &req, 50, None).await.expect("db").expect("view");
         assert_eq!(l.inner()["bookmarks"].as_array().map(Vec::len), Some(2));
+        // `bookmarkCount` is not shown by default. With a floor of 2 it
+        // appears only once two members bookmarked the post; with "always"
+        // a post nobody bookmarked says 0.
+        use crate::config::BookmarkCount;
+        use crate::hydration::testing::{hydrator_configured, test_config};
+        exec(p, "DELETE FROM labels").await;
+        let anon = Viewer::anonymous();
+        let count = |h: &Hydrator, uri: &String| {
+            let (h, uri, anon, req) = (h.clone(), uri.clone(), anon.clone(), req.clone());
+            async move {
+                let v = h.get_posts(&anon, &req, std::slice::from_ref(&uri)).await.expect("db").expect("view");
+                v.inner()["posts"][0].get("bookmarkCount").cloned()
+            }
+        };
+        let with = |emit: BookmarkCount| {
+            hydrator_configured(p, ScopeSets::default(), crate::hydration::HydrationConfig { bookmarks_emit_count: emit, ..test_config() })
+        };
+        assert_eq!(count(&h, &second).await, None);
+        let floor = with(BookmarkCount::AboveFloor);
+        assert_eq!(count(&floor, &second).await, None);
+        exec(p, &format!("INSERT INTO bookmarks (viewer_did, post_uri, post_cid) VALUES ('{BOB}', '{second}', 'bafy')")).await;
+        assert_eq!(count(&floor, &second).await, Some(json!(2)));
+        let always = with(BookmarkCount::Always);
+        assert_eq!(count(&always, &first).await, Some(json!(0)));
+        exec(p, &format!("DELETE FROM bookmarks WHERE viewer_did = '{BOB}'")).await;
+
         // Another member's bookmarks are its own.
         let other = Viewer {
             did: Some(BOB.into()),
