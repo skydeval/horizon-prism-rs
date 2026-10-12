@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 12: a member's list block becomes a reference (#673).** When a
+  member's own `app.bsky.graph.listblock` record is written, changed to
+  name another list, or deleted, the writer derives that member's
+  reference to the list again and tells the list phase, on every write
+  path, `requestRecord` included. A list block past the member's budget
+  is stored and has no effect (design-v3 §4.3 "Callers of the member
+  phase").
 - **Item 12: the copy rule and the purpose rule in the writer (#673).**
   When the owner of a list that a member mutes or blocks changes the
   list, the writer now keeps the private copy current: a list item is

@@ -152,7 +152,14 @@ pub async fn run() -> Result<(), StartupError> {
     .map_err(|e| StartupError::new(1, format!("loading scope state: {e}")))?;
     let policy: Arc<dyn PersistencePolicy> = Arc::new(scope.clone());
     let resolver = IdentityResolver::new(net.clone(), pool.clone(), IdentitySettings::from_app(&cfg), policy);
+    // Rule 4 (§4.3): the applier runs list phases and releases.
+    let applier = Applier::new(pool.clone(), scope.clone(), cfg.file.lists.sync_min_interval_secs);
+    let list_budget = subscriptions::references::Budget {
+        max_references: cfg.file.lists.subscribed_max_per_member,
+        max_owners: cfg.file.lists.max_owners_per_member,
+    };
     let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private))
+        .with_list_references(list_budget, applier.clone())
         .with_subscribed_post_max_age_secs(cfg.file.notifications.subscribed_post_max_age_secs)
         .with_subscription_limits(subscriptions::copy::Limits {
             max_items: cfg.file.lists.subscribed_max_items,
@@ -291,10 +298,9 @@ pub async fn run() -> Result<(), StartupError> {
     ));
     let community_patterns: Vec<String> =
         cfg.file.constellation.community().map(|n| n.pds_patterns.clone()).unwrap_or_default();
-    // Rule 4 (§4.3): the applier runs list phases and releases; the backfill
-    // workers serve the `list_sync` lanes.
+    // Rule 4 (§4.3): the applier's loop, and the backfill workers serving
+    // the `list_sync` lanes.
     let lists = &cfg.file.lists;
-    let applier = Applier::new(pool.clone(), scope.clone(), lists.sync_min_interval_secs);
     tasks.push(tokio::spawn(applier.clone().run()));
     let list_sync = ListSync::new(
         pool.clone(),

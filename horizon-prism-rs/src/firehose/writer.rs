@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{Connection, PgConnection, PgPool};
 
-use super::classifier::{EcosystemKind, RecordClass, classify, skip_reason};
+use super::classifier::{EcosystemKind, NSID_LISTBLOCK, RecordClass, classify, skip_reason};
 use super::jobs::{self, Depth};
 use super::normalize::normalize_record;
 use super::records::{GraphRecord, PostRecord, ProfileRecord, RecordError, SubjectRecord, private_subjects};
@@ -28,8 +28,10 @@ use crate::aggregations::growth::{self, GrowthPlan};
 use crate::aggregations::{Admission, AdmissionInput, RecordKind, ScopeSets, ScopeState, admit};
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
 use crate::private_tier::{IngestError, PrivateOp, PrivateTier};
+use crate::subscriptions::applier::Applier;
 use crate::subscriptions::copy;
 use crate::subscriptions::fetch::{NSID_LIST, NSID_LISTITEM};
+use crate::subscriptions::references::{Budget, rederive_block};
 
 /// The lowest possible TID string: inbound-block rows lose to any real rev
 /// under LWW (§5.10).
@@ -375,10 +377,13 @@ struct MemoryEffects {
     member_follow_removed: Option<String>,
     owners_joined: Vec<String>,
     owners_left: Vec<String>,
+    /// A member's list-block references were derived again.
+    list_references: bool,
 }
 
 impl MemoryEffects {
     fn merge(&mut self, other: Self) {
+        self.list_references |= other.list_references;
         self.growth_added.extend(other.growth_added);
         if other.new_member_follow.is_some() {
             self.new_member_follow = other.new_member_follow;
@@ -451,6 +456,12 @@ pub struct Writer {
     /// Rule 4's caps (`lists.subscribed_max_items`,
     /// `lists.subscription_tombstones_max_per_owner`).
     subscription_limits: copy::Limits,
+    /// A member's budget of list blocks (`lists.subscribed_max_per_member`,
+    /// `lists.max_owners_per_member`).
+    list_budget: Budget,
+    /// Told after a commit that changed a member's list-block references,
+    /// so the list phase follows at once rather than at its next poll.
+    applier: Option<Applier>,
 }
 
 impl Writer {
@@ -462,7 +473,18 @@ impl Writer {
             private,
             subscribed_post_max_age: chrono::Duration::seconds(86_400),
             subscription_limits: copy::Limits { max_items: 50_000, tombstones_max_per_owner: 10_000 },
+            list_budget: Budget { max_references: 25, max_owners: 10 },
+            applier: None,
         }
+    }
+
+    /// Set a member's list-block budget, and the applier to tell when a
+    /// member's references change.
+    #[must_use]
+    pub fn with_list_references(mut self, budget: Budget, applier: Applier) -> Self {
+        self.list_budget = budget;
+        self.applier = Some(applier);
+        self
     }
 
     /// Set rule 4's caps.
@@ -837,6 +859,11 @@ impl Writer {
             metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "tombstoned").increment(1);
             return Ok((OpOutcome::Unchanged, eff));
         }
+        // Rule 4 (§4.3): a member's list block is a reference to the list.
+        // An update may name another list, so the one it named is read
+        // before the write.
+        let member_list_block = u.collection == NSID_LISTBLOCK && sets.is_member(author);
+        let list_before = if member_list_block { list_block_target(conn, &u.uri).await? } else { None };
         let written = match &u.body {
             Body::Post(p) => upsert_post(conn, u, p, rev).await?,
             Body::Like(s) => upsert_subject(conn, "likes", u, s, rev).await?,
@@ -856,6 +883,13 @@ impl Writer {
         if !written {
             metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "older_rev").increment(1);
             return Ok((OpOutcome::Unchanged, eff));
+        }
+        if member_list_block {
+            let list_after = list_block_target(conn, &u.uri).await?;
+            for list in [&list_before, &list_after].into_iter().flatten() {
+                rederive_block(conn, author, list, self.list_budget).await?;
+            }
+            eff.list_references = true;
         }
         // §5.12: feed items only for public records whose author is in S.
         if sets.in_scope(author) {
@@ -975,6 +1009,17 @@ impl Writer {
                 removed
             }
             RecordKind::Block => delete_row(conn, "blocks", &d.uri, rev).await?,
+            // Rule 4 (§4.3): the reference a member's list block stood for
+            // is derived again from the member's remaining list blocks.
+            RecordKind::Table("list_blocks") if sets.is_member(repo) => {
+                let list = list_block_target(conn, &d.uri).await?;
+                let removed = delete_row(conn, "list_blocks", &d.uri, rev).await?;
+                if removed && let Some(list) = list {
+                    rederive_block(conn, repo, &list, self.list_budget).await?;
+                    eff.list_references = true;
+                }
+                removed
+            }
             RecordKind::Table(table) => delete_row(conn, table, &d.uri, rev).await?,
         };
         // Tombstone iff a row was removed, or the author is in S (§5.5).
@@ -1001,6 +1046,11 @@ impl Writer {
 
     /// Apply post-commit in-memory changes under a brief write guard.
     async fn commit_effects(&self, eff: MemoryEffects) {
+        if eff.list_references
+            && let Some(applier) = &self.applier
+        {
+            applier.signal();
+        }
         growth::commit_in_memory(&self.scope, &eff.growth_added, eff.new_member_follow.as_deref()).await;
         if eff.owners_joined.is_empty() && eff.owners_left.is_empty() && eff.member_follow_removed.is_none() {
             return;
@@ -1018,6 +1068,11 @@ impl Writer {
             *n = n.saturating_sub(1);
         }
     }
+}
+
+/// The list a stored list block names.
+async fn list_block_target(conn: &mut PgConnection, uri: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT list_uri FROM list_blocks WHERE uri = $1").bind(uri).fetch_optional(conn).await
 }
 
 async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
@@ -1658,6 +1713,50 @@ mod tests {
             // Someone who owns no subscribed list is untouched by all this.
             w.apply(SUBJECT, &rev(1), &[op(Action::Delete, "app.bsky.graph.listitem", "3kx", Value::Null)], OPTIONS).await.expect("apply");
             assert_eq!(count("SELECT count(*) FROM subscription_tombstones").await, 1);
+            db.drop_db().await;
+        }
+
+        /// design-v3 §4.3: a member's list block is a reference to the
+        /// list, on every write path; it follows the record when the
+        /// record is changed to name another list, and goes with it.
+        #[tokio::test]
+        async fn a_members_list_block_is_a_reference() {
+            let Some(db) = fresh_db("writer_list_block_reference").await else {
+                return;
+            };
+            let p = &db.pool;
+            let mut sets = ScopeSets::default();
+            sets.scope.insert(AUTHOR.into());
+            sets.members.insert(AUTHOR.into());
+            let w = Writer::new(p.clone(), ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000), Arc::new(DisabledPrivateTier));
+            let list = |n: u32| format!("at://{SUBJECT}/app.bsky.graph.list/3klist{n}");
+            let block = |action: Action, n: u32| RawOp {
+                action,
+                collection: "app.bsky.graph.listblock".into(),
+                rkey: "3kblock".into(),
+                cid: (action != Action::Delete).then(|| format!("bafy{n}")),
+                record: (action != Action::Delete).then(|| json!({"subject": list(n), "createdAt": "2026-09-26T00:00:00Z"})),
+            };
+            let references = || async move {
+                sqlx::query_as::<_, (String, String, bool)>("SELECT list_uri, source, admitted FROM list_references ORDER BY list_uri")
+                    .fetch_all(p)
+                    .await
+                    .expect("references")
+            };
+            // `requestRecord` runs the member phase too.
+            let request = ApplyOptions { subscription_rules: false, ..OPTIONS };
+            w.apply(AUTHOR, &rev(1), &[block(Action::Create, 1)], request).await.expect("apply");
+            assert_eq!(references().await, vec![(list(1), "block".to_string(), true)]);
+            w.apply(AUTHOR, &rev(2), &[block(Action::Update, 2)], OPTIONS).await.expect("apply");
+            assert_eq!(references().await, vec![(list(2), "block".to_string(), true)]);
+            w.apply(AUTHOR, &rev(3), &[block(Action::Delete, 2)], OPTIONS).await.expect("apply");
+            assert!(references().await.is_empty());
+            // Each change left a marker for the list phase.
+            let marked: i64 = sqlx::query_scalar("SELECT count(DISTINCT list_uri) FROM list_reference_changes").fetch_one(p).await.expect("markers");
+            assert_eq!(marked, 2);
+            // Someone who is not a member gets no reference.
+            w.apply(SUBJECT, &rev(1), &[block(Action::Create, 1)], OPTIONS).await.expect("apply");
+            assert!(references().await.is_empty());
             db.drop_db().await;
         }
 
