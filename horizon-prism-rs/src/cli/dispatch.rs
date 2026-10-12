@@ -73,8 +73,26 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: CommandsAction,
     },
+    /// The block-list index, Farsight (design-v3 §5.14.11).
+    Farsight {
+        #[command(subcommand)]
+        action: FarsightAction,
+    },
     /// Print a fresh service signing key, its did:key and a correlation key.
     Keygen,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FarsightAction {
+    /// Farsight's own status, in brief.
+    Status,
+    /// Ask Farsight to read an account's repository again.
+    Prime {
+        did: String,
+        /// Run even if Farsight read it recently.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -186,6 +204,11 @@ impl AdminCmd {
             Self::Resync { .. } => AdminCommand::Resync,
             Self::Deadletter { action: DeadletterAction::Replay { id } } => AdminCommand::DeadletterReplay { id: id.clone() },
             Self::Deadletter { action: DeadletterAction::Drop { id } } => AdminCommand::DeadletterDrop { id: id.clone() },
+            Self::Farsight { action: FarsightAction::Status } => AdminCommand::FarsightStatus,
+            Self::Farsight { action: FarsightAction::Prime { did, force } } => AdminCommand::FarsightPrime {
+                did: did.clone(),
+                force: *force,
+            },
         };
         let (command, args) = cmd.to_row();
         AdminCommand::parse(command, &args).map_err(|e| e.to_string())

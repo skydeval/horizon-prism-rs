@@ -249,6 +249,26 @@ impl Farsight {
         }
     }
 
+    /// Farsight's status in brief, for `admin farsight status`: its
+    /// version, firehose, sweep and coverage as it reports them, and
+    /// whether this AppView's read breaker is open.
+    ///
+    /// # Errors
+    ///
+    /// A short reason when Farsight did not answer.
+    pub async fn status(&self) -> Result<serde_json::Value, &'static str> {
+        let stats = self.inner.client.get_stats().await?;
+        let mut brief = serde_json::Map::new();
+        for key in ["version", "firehose", "sweep", "coverage", "freshness"] {
+            if let Some(v) = stats.get(key) {
+                brief.insert(key.to_string(), v.clone());
+            }
+        }
+        brief.insert("read_breaker_open".to_string(), serde_json::Value::Bool(self.breaker_open()));
+        brief.insert("cached_pair_answers".to_string(), serde_json::json!(self.cached()));
+        Ok(serde_json::Value::Object(brief))
+    }
+
     /// Whether enrolling a member should prime Farsight
     /// (`farsight.prime_on_enroll`).
     #[must_use]

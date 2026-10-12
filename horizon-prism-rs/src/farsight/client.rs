@@ -104,6 +104,31 @@ impl FarsightClient {
     }
 }
 
+/// Farsight's own status report.
+pub const GET_STATS_PATH: &str = "/xrpc/app.nearhorizon.farsight.query.getStats";
+
+impl FarsightClient {
+    /// `query.getStats`, as Farsight returns it.
+    ///
+    /// # Errors
+    ///
+    /// A short reason: `timeout`, `transport`, `forbidden`, `status` or
+    /// `parse`.
+    pub async fn get_stats(&self) -> Result<Value, &'static str> {
+        let url = format!("{}{GET_STATS_PATH}", self.base);
+        let options = RequestOptions::new(BodyCap::REPO_STATUS).header(AUTHORIZATION, self.authorization.clone());
+        let response = self.net.get(&url, &options).await.map_err(|e| match e {
+            NetError::Timeout => "timeout",
+            _ => "transport",
+        })?;
+        match response.status.as_u16() {
+            200 => serde_json::from_slice(&response.body).map_err(|_| "parse"),
+            401 | 403 => Err("forbidden"),
+            _ => Err("status"),
+        }
+    }
+}
+
 /// The method that asks Farsight to read an account's repository.
 pub const REQUEST_BACKFILL_PATH: &str = "/xrpc/app.nearhorizon.farsight.admin.requestBackfill";
 

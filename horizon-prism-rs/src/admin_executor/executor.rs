@@ -259,6 +259,7 @@ mod tests {
             dead_letter_stream: dead_letter_stream.to_string(),
             deterministic_attempts: 5,
             community_patterns: Arc::new(vec!["*.community.example".to_string()]),
+            farsight: None,
         };
         Some((db, AdminExecutor::new(handlers), scope))
     }

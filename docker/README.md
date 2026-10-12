@@ -146,11 +146,26 @@ Commands that change state are executed by the running `app` service, not by the
 - `member add` and `member remove`;
 - `label add` and `label remove`;
 - `scope rebuild`, `backfill` and `resync`;
-- `deadletter replay` and `deadletter drop`.
+- `deadletter replay` and `deadletter drop`;
+- `farsight status` and `farsight prime` (below).
 
 The CLI queues the command and waits up to `admin.command_timeout_secs` (600 s) for the result. If it times out, the command keeps running, and `admin commands list` shows its state. `app` must be running for these commands to take effect.
 
 Read-only commands (`… list`, `stream info`, `migrate status`, `keygen`) run directly.
+
+### Farsight (block lists)
+
+Farsight is the block-list index of this stack. When `[farsight] url` is set in `config/app.toml` and `FARSIGHT_TOKEN` in `.env`, the app asks it, as a member loads a page, which accounts on that page block the member through a block list, and hides them as it hides a direct block. When Farsight does not answer, pages load as usual without those blocks. Whoever runs that Farsight sees which accounts each member's pages contain, so use an instance you run or trust.
+
+```sh
+docker compose exec app /app/horizon-prism-rs admin farsight status
+docker compose exec app /app/horizon-prism-rs admin farsight prime <did> [--force]
+```
+
+- `status` prints Farsight's own report in brief, and whether the app has stopped calling it after repeated failures (`read_breaker_open`; it tries again after 30 s).
+- `prime` asks Farsight to read one account's repository again. Use it when a member's own blocks look out of date. The app does this by itself when a member is enrolled.
+
+Watch `farsight_calls_total{outcome}` for failures, `farsight_auth_failed_total` for a revoked or under-scoped key, and `farsight_coverage_total{level}`: at `partial`, Farsight is still catching up and some list blocks may be missing.
 
 ## Log inspection
 

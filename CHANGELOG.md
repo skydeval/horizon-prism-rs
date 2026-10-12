@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 12: `admin farsight status` and `admin farsight prime` (#673).**
+  `status` prints Farsight's own report in brief, with whether this
+  AppView's read breaker is open and how many answers it has cached.
+  `prime <did> [--force]` asks Farsight to read one account's repository
+  again (design-v3 §5.14.11, §14.3). Both run in `serve` through the
+  command queue and fail with a reason when `farsight.url` is not set.
+  Operator notes are in `docker/README.md`, "Farsight (block lists)".
 - **Item 12: Farsight is primed when a member is enrolled (#673).** With
   `farsight.prime_on_enroll` (default true), each `member` backfill job
   asks Farsight to read the member's own repository, so the member's blocks

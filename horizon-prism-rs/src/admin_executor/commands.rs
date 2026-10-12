@@ -15,6 +15,7 @@ use sqlx::PgPool;
 use crate::aggregations::{PurgeKind, Purger, Rebuild, ScopeState};
 use crate::aggregations::membership::{AddOutcome, add_member};
 use crate::db::locks::uri_author;
+use crate::farsight::Farsight;
 use crate::firehose::backfill::BackfillSource;
 use crate::firehose::gap::{self, GapCause};
 use crate::firehose::index_request::{IndexError, index_record};
@@ -39,6 +40,10 @@ pub enum AdminCommand {
     Resync,
     DeadletterReplay { id: String },
     DeadletterDrop { id: String },
+    /// `farsight status`: Farsight's own report, in brief.
+    FarsightStatus,
+    /// `farsight prime <did> [--force]`: ask Farsight to read a repository.
+    FarsightPrime { did: String, force: bool },
 }
 
 /// A command that cannot be parsed or is invalid.
@@ -69,6 +74,8 @@ impl AdminCommand {
             Self::Resync => ("resync", json!({ "private_and_members": true })),
             Self::DeadletterReplay { id } => ("deadletter replay", json!({ "id": id })),
             Self::DeadletterDrop { id } => ("deadletter drop", json!({ "id": id })),
+            Self::FarsightStatus => ("farsight status", json!({})),
+            Self::FarsightPrime { did, force } => ("farsight prime", json!({ "did": did, "force": force })),
         }
     }
 
@@ -127,6 +134,11 @@ impl AdminCommand {
             "resync" => Self::Resync,
             "deadletter replay" => Self::DeadletterReplay { id: id()? },
             "deadletter drop" => Self::DeadletterDrop { id: id()? },
+            "farsight status" => Self::FarsightStatus,
+            "farsight prime" => Self::FarsightPrime {
+                did: did()?,
+                force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
+            },
             other => return Err(InvalidCommand(format!("unknown command {other:?}"))),
         })
     }
@@ -139,7 +151,13 @@ impl AdminCommand {
             Self::LabelAdd { subject, .. } | Self::LabelRemove { subject, .. } => {
                 if is_did(subject) { Some(subject) } else { uri_author(subject) }
             }
-            Self::ScopeRebuild { .. } | Self::Resync | Self::DeadletterReplay { .. } | Self::DeadletterDrop { .. } => None,
+            Self::ScopeRebuild { .. }
+            | Self::Resync
+            | Self::DeadletterReplay { .. }
+            | Self::DeadletterDrop { .. }
+            | Self::FarsightStatus
+            // A prime writes nothing here, so it waits on no purge.
+            | Self::FarsightPrime { .. } => None,
         }
     }
 }
@@ -168,6 +186,8 @@ pub struct Handlers {
     pub deterministic_attempts: u32,
     /// The `community` network's `pds_patterns` (owner eligibility, §6.11.1).
     pub community_patterns: Arc<Vec<String>>,
+    /// The block-list index, when `farsight.url` is set.
+    pub farsight: Option<Farsight>,
 }
 
 impl Handlers {
@@ -195,8 +215,30 @@ impl Handlers {
             AdminCommand::Resync => self.resync().await,
             AdminCommand::DeadletterReplay { id } => self.deadletter_replay(id).await,
             AdminCommand::DeadletterDrop { id } => self.deadletter_drop(id).await,
+            AdminCommand::FarsightStatus => self.farsight_status().await,
+            AdminCommand::FarsightPrime { did, force } => self.farsight_prime(did, *force).await,
         };
         result.unwrap_or_else(Outcome::Failed)
+    }
+
+    fn farsight(&self) -> Result<&Farsight, String> {
+        self.farsight.as_ref().ok_or_else(|| "farsight.url is not set".to_string())
+    }
+
+    /// `farsight status` (design-v3 §5.14.11, §14.3).
+    async fn farsight_status(&self) -> Result<Outcome, String> {
+        let status = self.farsight()?.status().await.map_err(|reason| format!("Farsight did not answer: {reason}"))?;
+        Ok(Outcome::Done(status))
+    }
+
+    /// `farsight prime`: for a member whose block state on Farsight is
+    /// suspected stale.
+    async fn farsight_prime(&self, did: &str, force: bool) -> Result<Outcome, String> {
+        self.farsight()?
+            .prime(did, force)
+            .await
+            .map_err(|reason| format!("Farsight was not primed: {reason}"))?;
+        Ok(Outcome::Done(json!({ "did": did, "requested": true, "force": force })))
     }
 
     /// `member add` (§9.2, §6.11.1): under the write guard and the DID's
@@ -440,6 +482,13 @@ mod tests {
     #[test]
     fn invalid_commands_are_rejected() {
         assert!(AdminCommand::parse("member add", &json!({"did": "bob"})).is_err());
+        // The Farsight commands round-trip, and neither waits on a purge.
+        for cmd in [AdminCommand::FarsightStatus, AdminCommand::FarsightPrime { did: DID.to_string(), force: true }] {
+            let (name, args) = cmd.to_row();
+            assert_eq!(AdminCommand::parse(name, &args), Ok(cmd.clone()));
+            assert_eq!(cmd.did(), None);
+        }
+        assert!(AdminCommand::parse("farsight prime", &json!({"did": "bob"})).is_err());
         assert!(AdminCommand::parse("label add", &json!({"subject": DID, "val": "spam"})).is_err());
         assert!(AdminCommand::parse("label add", &json!({"subject": "https://x", "val": "porn"})).is_err());
         assert!(AdminCommand::parse("backfill", &json!({"did": DID, "depth": "deep"})).is_err());
