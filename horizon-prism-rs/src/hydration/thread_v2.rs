@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
+use super::thread::{HIDDEN_MARK, Tree};
 use super::{Hydrator, ViewResult, Viewer};
 use crate::xrpc::pools::Requester;
 
@@ -96,6 +97,16 @@ fn muted(node: &Value) -> bool {
     node.pointer("/post/author/viewer/muted").and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Hidden by the root's threadgate (marked by the tree builder).
+fn hidden(node: &Value) -> bool {
+    node.get(HIDDEN_MARK).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Left out of the main list: hidden by the gate, or by a muted author.
+fn set_aside(node: &Value) -> bool {
+    muted(node) || hidden(node)
+}
+
 /// The post replies of a node: blocked and missing replies are not items.
 fn replies(node: &Value) -> Vec<&Value> {
     node.get("replies")
@@ -119,15 +130,15 @@ struct Flattener<'a> {
 }
 
 impl Flattener<'_> {
-    fn post_item(&self, node: &Value, depth: i64, more_parents: bool, more_replies: usize, muted: bool) -> Value {
+    fn post_item(&self, node: &Value, depth: i64, more_parents: bool, more_replies: usize, aside: bool) -> Value {
         let mut value = json!({
             "$type": "app.bsky.unspecced.defs#threadItemPost",
             "post": node["post"],
             "moreParents": more_parents,
             "moreReplies": more_replies,
             "opThread": false,
-            "hiddenByThreadgate": false,
-            "mutedByViewer": muted,
+            "hiddenByThreadgate": aside && hidden(node),
+            "mutedByViewer": aside && muted(node),
         });
         // Marked only when the OP's thread has at least two posts.
         if self.op.len() >= 2
@@ -171,7 +182,7 @@ impl Flattener<'_> {
         if depth >= below {
             return Vec::new();
         }
-        let kept: Vec<&Value> = replies(node).into_iter().filter(|n| !muted(n)).collect();
+        let kept: Vec<&Value> = replies(node).into_iter().filter(|n| !set_aside(n)).collect();
         let mut kept = self.ordered(kept);
         // Every direct reply of the anchor; a bounded number deeper down.
         if depth >= 1 {
@@ -189,8 +200,9 @@ impl Flattener<'_> {
 
     fn walk(&mut self, node: &Value, depth: i64) {
         if depth == 0 {
-            // A direct reply by a fully muted account goes to "other".
-            let moved: Vec<&Value> = replies(node).into_iter().filter(|n| muted(n)).collect();
+            // A direct reply the gate hides, or by a fully muted account,
+            // goes to "other".
+            let moved: Vec<&Value> = replies(node).into_iter().filter(|n| set_aside(n)).collect();
             for reply in self.ordered(moved) {
                 let more = count(reply, "replyCount").max(replies(reply).len());
                 let value = self.post_item(reply, 1, false, more, true);
@@ -278,13 +290,11 @@ pub fn flatten(thread: &Value, options: &Options, viewer: Option<&str>) -> (Vec<
 }
 
 impl Hydrator {
-    /// The tree both V2 endpoints are built from, or `None` for an anchor
-    /// that misses (nonexistent, private-tier, hidden or collapsed).
-    async fn thread_tree(&self, viewer: &Viewer, req: &Requester, anchor: &str, below: u32) -> Result<Option<Value>, super::HydrationError> {
-        Ok(match self.get_post_thread(viewer, req, anchor, below, MAX_PARENTS).await? {
-            Ok(view) => Some(view.inner()["thread"].clone()),
-            Err(_) => None,
-        })
+    /// The tree both V2 endpoints are built from, with replies the root's
+    /// threadgate hides kept and marked, and the gate's view. `None` for an
+    /// anchor that misses (nonexistent, private-tier, hidden or collapsed).
+    async fn v2_tree(&self, viewer: &Viewer, req: &Requester, anchor: &str, below: u32) -> Result<Option<Tree>, super::HydrationError> {
+        Ok(self.thread_tree(viewer, req, anchor, below, MAX_PARENTS, true).await?.ok())
     }
 
     /// `app.bsky.unspecced.getPostThreadV2`. The lexicon declares no errors:
@@ -294,12 +304,16 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn get_post_thread_v2(&self, viewer: &Viewer, req: &Requester, anchor: &str, options: &Options) -> ViewResult<Value> {
-        let Some(tree) = self.thread_tree(viewer, req, anchor, options.below).await? else {
+        let Some((tree, gate)) = self.v2_tree(viewer, req, anchor, options.below).await? else {
             let missing = item(anchor, 0, json!({"$type": "app.bsky.unspecced.defs#threadItemNotFound"}));
             return Ok(Ok(Self::emit(json!({"thread": [missing], "hasOtherReplies": false}))));
         };
         let (thread, other) = flatten(&tree, options, viewer.state_did());
-        Ok(Ok(Self::emit(json!({"thread": thread, "hasOtherReplies": !other.is_empty()}))))
+        let mut out = json!({"thread": thread, "hasOtherReplies": !other.is_empty()});
+        if let Some(gate) = gate {
+            out["threadgate"] = gate;
+        }
+        Ok(Ok(Self::emit(out)))
     }
 
     /// `app.bsky.unspecced.getPostThreadOtherV2`: the anchor's direct
@@ -316,8 +330,8 @@ impl Hydrator {
             branching: 0,
             sort: Sort::Oldest,
         };
-        let other = match self.thread_tree(viewer, req, anchor, 1).await? {
-            Some(tree) => flatten(&tree, &options, viewer.state_did()).1,
+        let other = match self.v2_tree(viewer, req, anchor, 1).await? {
+            Some((tree, _)) => flatten(&tree, &options, viewer.state_did()).1,
             None => Vec::new(),
         };
         Ok(Ok(Self::emit(json!({ "thread": other }))))
@@ -515,6 +529,42 @@ mod tests {
             let o = h.get_post_thread_other_v2(&anon, &req, &missing).await.expect("db").expect("view");
             assert_eq!(o.inner()["thread"], json!([]));
         }
+
+        // The root's threadgate hides the reply: gone from the thread, in
+        // "other" with its flag, and still shown to its own author. A gate
+        // whose record key is not the post's is ignored.
+        let gate = format!("at://{OP}/app.bsky.feed.threadgate/3kaaaaaaaaaa2");
+        for (uri, rkey, hides) in [(gate.as_str(), "3kaaaaaaaaaa2", reply.as_str()), ("at://x/app.bsky.feed.threadgate/other", "other", second.as_str())] {
+            sqlx::query(
+                "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, hidden_replies, record, created_at) \
+                 VALUES ($1, $2, $3, 'bafygate', '3k', $4, '[]', $5, '{\"$type\": \"app.bsky.feed.threadgate\"}', now())",
+            )
+            .bind(uri)
+            .bind(OP)
+            .bind(rkey)
+            .bind(&root)
+            .bind(vec![hides.to_string()])
+            .execute(p)
+            .await
+            .expect("gate");
+        }
+        let v = h.get_post_thread_v2(&anon, &req, &second, &options).await.expect("db").expect("view");
+        assert_eq!(shape(v.inner()["thread"].as_array().expect("thread")), pairs(&[(root.as_str(), -1), (second.as_str(), 0)]));
+        assert_eq!(v.inner()["hasOtherReplies"], true);
+        assert_eq!((&v.inner()["threadgate"]["uri"], &v.inner()["threadgate"]["lists"]), (&json!(gate), &json!([])));
+        let o = h.get_post_thread_other_v2(&anon, &req, &second).await.expect("db").expect("view");
+        let hidden_item = &o.inner()["thread"][0]["value"];
+        assert_eq!((&hidden_item["hiddenByThreadgate"], &hidden_item["mutedByViewer"]), (&json!(true), &json!(false)));
+        let v1 = h.get_post_thread(&anon, &req, &second, 6, 80).await.expect("db").expect("view");
+        assert_eq!(v1.inner()["thread"]["replies"], json!([]));
+        assert_eq!(v1.inner()["threadgate"]["cid"], "bafygate");
+        assert!(!v1.inner().to_string().contains("hiddenByThreadgate"));
+        let author = Viewer {
+            did: Some(BOB.into()),
+            hydrate: true,
+        };
+        let v = h.get_post_thread_v2(&author, &req, &second, &options).await.expect("db").expect("view");
+        assert_eq!(v.inner()["thread"].as_array().map(Vec::len), Some(3));
         db.drop_db().await;
     }
 }

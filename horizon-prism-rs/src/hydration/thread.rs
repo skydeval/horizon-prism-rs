@@ -8,7 +8,7 @@
 //! here come from Slingshot (design-v3 §5.1, §11 G-6), within
 //! `thread.max_remote_fetches`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use futures::StreamExt;
@@ -28,6 +28,25 @@ pub const MAX_NODES: usize = 200;
 pub const LISTING_CONCURRENCY: usize = 8;
 pub const DEFAULT_DEPTH: u32 = 6;
 pub const DEFAULT_PARENT_HEIGHT: u32 = 80;
+
+/// Set on a reply node that the root's threadgate hides, on the tree the V2
+/// endpoints are built from. Never part of a response.
+pub(super) const HIDDEN_MARK: &str = "hiddenByThreadgate";
+
+/// The replies the root's threadgate hides from this viewer.
+#[derive(Default)]
+struct Hidden {
+    uris: HashSet<String>,
+    /// Keep them in the tree, marked, instead of leaving them out.
+    keep: bool,
+}
+
+/// A `threadgates` row: URI, CID, record, hidden replies, `allow`.
+type GateRow = (String, String, Value, Vec<String>, Option<Value>);
+
+/// A thread tree and the root's `threadgateView`, if the root has a valid
+/// threadgate.
+pub(super) type Tree = (Value, Option<Value>);
 
 fn not_found() -> ViewError {
     ViewError::new("NotFound", "Post not found")
@@ -100,16 +119,23 @@ impl PostContext {
         Some(node)
     }
 
-    fn reply_nodes(&self, uri: &str, children: &HashMap<String, Vec<String>>, remote: &Remote) -> Vec<Value> {
+    /// The reply nodes under `uri`. A reply the root's threadgate hides is
+    /// left out, or, with `hidden.keep`, kept and marked for the V2
+    /// endpoints to sort out.
+    fn reply_nodes(&self, uri: &str, children: &HashMap<String, Vec<String>>, remote: &Remote, hidden: &Hidden) -> Vec<Value> {
         children
             .get(uri)
             .map(|kids| {
                 kids.iter()
                     .filter(|k| self.listable(k) && self.blocked_post(k).is_none())
+                    .filter(|k| hidden.keep || !hidden.uris.contains(*k))
                     .filter_map(|k| {
                         let post = self.node_post(k, remote)?;
                         let mut node = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": post});
-                        let replies = self.reply_nodes(k, children, remote);
+                        if hidden.uris.contains(k) {
+                            node[HIDDEN_MARK] = json!(true);
+                        }
+                        let replies = self.reply_nodes(k, children, remote, hidden);
                         if children.contains_key(k.as_str()) {
                             node["replies"] = Value::Array(replies);
                         }
@@ -128,6 +154,72 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn get_post_thread(&self, viewer: &Viewer, req: &Requester, uri: &str, depth: u32, parent_height: u32) -> ViewResult<Value> {
+        Ok(match self.thread_tree(viewer, req, uri, depth, parent_height, false).await? {
+            Ok((thread, gate)) => {
+                let mut out = json!({ "thread": thread });
+                if let Some(gate) = gate {
+                    out["threadgate"] = gate;
+                }
+                Ok(Self::emit(out))
+            }
+            Err(e) => Err(e),
+        })
+    }
+
+    /// The root's threadgate (design-v3 §8.3): its view, and the replies it
+    /// hides. A gate counts only when its record key is its post's and its
+    /// author is the post's author. A hidden reply is not hidden from its
+    /// own author.
+    async fn threadgate(&self, viewer: &Viewer, req: &Requester, root: &str) -> Result<Option<(Value, HashSet<String>)>, sqlx::Error> {
+        let rows: Vec<GateRow> =
+            sqlx::query_as("SELECT uri, cid, record, hidden_replies, allow FROM threadgates WHERE post_uri = $1")
+                .bind(root)
+                .fetch_all(self.pool())
+                .await?;
+        let rkey = |uri: &str| uri.rsplit('/').next().unwrap_or_default().to_string();
+        let Some((uri, cid, record, hidden, allow)) = rows
+            .into_iter()
+            .find(|(gate, ..)| uri_author(gate) == uri_author(root) && rkey(gate) == rkey(root))
+        else {
+            return Ok(None);
+        };
+        // The lists its rules name, as `listViewBasic`, under the
+        // locally-servable rule.
+        let mut lists = Vec::new();
+        let named = allow
+            .as_ref()
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|rule| rule.get("$type").and_then(Value::as_str) == Some("app.bsky.feed.threadgate#listRule"))
+            .filter_map(|rule| rule.get("list").and_then(Value::as_str));
+        for list in named {
+            if let Some((row, local)) = self.load_list(req, list).await? {
+                let count = if local { Some(self.list_item_count(list).await?) } else { None };
+                lists.push(self.list_basic(viewer, &row, None, count).await?);
+            }
+        }
+        let view = json!({"uri": uri, "cid": cid, "record": record, "lists": lists});
+        let me = viewer.did.as_deref();
+        let hidden = hidden.into_iter().filter(|reply| uri_author(reply) != me || me.is_none()).collect();
+        Ok(Some((view, hidden)))
+    }
+
+    /// The tree of `getPostThread`, with the root's threadgate view. With
+    /// `keep_hidden`, replies the gate hides stay in the tree, marked.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(super) async fn thread_tree(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        uri: &str,
+        depth: u32,
+        parent_height: u32,
+        keep_hidden: bool,
+    ) -> Result<Result<Tree, ViewError>, super::HydrationError> {
         let started = Instant::now();
         if is_private_uri(uri) {
             return Ok(Err(not_found()));
@@ -141,7 +233,11 @@ impl Hydrator {
                 && !moderation::gate(self.pool(), uri).await?.is_hidden()
                 && let Some(v) = self.upstream().post_thread(req, uri, depth, parent_height).await
             {
-                return Ok(Ok(Self::emit(self.normalized(viewer, v).await?.0)));
+                // An upstream AppView's thread, with whatever gate view it
+                // gave.
+                let mut v = self.normalized(viewer, v).await?.0;
+                let gate = v.get("threadgate").cloned().filter(|g| !g.is_null());
+                return Ok(Ok((v["thread"].take(), gate)));
             }
             return Ok(Err(not_found()));
         };
@@ -276,10 +372,15 @@ impl Hydrator {
             return Ok(Err(not_found()));
         }
         if let Some(blocked) = ctx.blocked_post(uri) {
-            return Ok(Ok(Self::emit(json!({ "thread": blocked }))));
+            return Ok(Ok((blocked, None)));
         }
         let Some(post) = ctx.post_view(uri) else {
             return Ok(Err(not_found()));
+        };
+        let root = anchor_row.reply_root_uri.clone().unwrap_or_else(|| uri.to_string());
+        let (gate, hidden) = match self.threadgate(viewer, req, &root).await? {
+            Some((view, uris)) => (Some(view), Hidden { uris, keep: keep_hidden }),
+            None => (None, Hidden::default()),
         };
         let mut thread = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": post});
         if parent_height > 0
@@ -288,8 +389,8 @@ impl Hydrator {
         {
             thread["parent"] = above;
         }
-        thread["replies"] = Value::Array(ctx.reply_nodes(uri, &children, &remote));
-        Ok(Ok(Self::emit(json!({ "thread": thread }))))
+        thread["replies"] = Value::Array(ctx.reply_nodes(uri, &children, &remote, &hidden));
+        Ok(Ok((thread, gate)))
     }
 
     /// Post views for URIs not stored here, built from their Slingshot

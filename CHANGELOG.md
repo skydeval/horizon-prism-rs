@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 13: threadgates in thread views (#675).** `getPostThread` and
+  `getPostThreadV2` carry the root post's `threadgate` view, with the lists
+  its rules name as `listViewBasic` (design-v3 §5.1, §8.3). A gate counts
+  only when its record key is its post's and its author is the post's
+  author. A reply the gate hides is left out of both thread views; when it
+  is a direct reply of the anchor, `getPostThreadOtherV2` returns it with
+  `hiddenByThreadgate`. A hidden reply is not hidden from its own author.
+  Replies that break the gate's `allow` rules are not removed.
 - **Item 13: `getPostThreadV2` and `getPostThreadOtherV2` (#675).** The
   flat thread view (design-v3 §5.1), built from the same tree
   `getPostThread` assembles, so the endpoints agree on what a thread holds.
