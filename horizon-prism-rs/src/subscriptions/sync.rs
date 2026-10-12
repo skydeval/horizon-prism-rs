@@ -511,6 +511,89 @@ pub async fn complete(
     Ok(())
 }
 
+/// Items deleted per transaction when an owner is gone.
+const GONE_BATCH: i64 = 10_000;
+
+/// The owner-gone completion: the owner's account no longer exists, so its
+/// lists are emptied and kept empty.
+///
+/// - Delete batches: each list's copied items, 10 000 per short
+///   transaction, stopping if the job was superseded.
+/// - A final transaction: every list gets its count, `synced_at`, and no
+///   purpose (a gone owner's lists are not moderation lists); the owner's
+///   row says it is gone; the waiting references become effective, on
+///   empty lists, so nothing waits on an owner that will never answer; and
+///   the job ends.
+///
+/// # Errors
+///
+/// [`Stopped`].
+pub async fn owner_gone(pool: &PgPool, snap: &Snapshot, min_interval_secs: u32) -> Result<(), Stopped> {
+    for list in &snap.lists {
+        loop {
+            let mut tx = pool.begin().await?;
+            if !same_instance(&mut tx, list).await? {
+                break;
+            }
+            if !current(&mut tx, snap).await? {
+                return Err(Stopped::Superseded);
+            }
+            let deleted = sqlx::query(
+                "DELETE FROM subscribed_list_items WHERE ctid IN (SELECT ctid FROM subscribed_list_items WHERE list_uri = $1 LIMIT $2)",
+            )
+            .bind(&list.uri)
+            .bind(GONE_BATCH)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            if deleted == 0 {
+                break;
+            }
+        }
+    }
+    let mut tx = pool.begin().await?;
+    let mut done: HashSet<&str> = HashSet::new();
+    for list in &snap.lists {
+        if !same_instance(&mut tx, list).await? {
+            continue;
+        }
+        sqlx::query(
+            "UPDATE subscribed_lists SET item_count = (SELECT count(*) FROM subscribed_list_items WHERE list_uri = $1), \
+               synced_at = now(), purpose = NULL, purpose_rev = NULL, unlisted_since = NULL WHERE list_uri = $1",
+        )
+        .bind(&list.uri)
+        .execute(&mut *tx)
+        .await?;
+        done.insert(list.uri.as_str());
+    }
+    // The suspicion's start is kept: it says since when.
+    sqlx::query(
+        "INSERT INTO subscribed_owners (owner_did, owner_gone, last_completed_at, last_run_ended_at) VALUES ($1, true, now(), now()) \
+         ON CONFLICT (owner_did) DO UPDATE SET owner_gone = true, last_completed_at = now(), last_run_ended_at = now()",
+    )
+    .bind(&snap.owner)
+    .execute(&mut *tx)
+    .await?;
+    for waiting in snap.waiting.iter().filter(|w| done.contains(w.list.as_str())) {
+        sqlx::query(
+            "UPDATE list_references SET effective = true \
+             WHERE member_did = $1 AND list_uri = $2 AND source = $3 AND admitted AND admitted_at IS NOT DISTINCT FROM $4",
+        )
+        .bind(&waiting.member)
+        .bind(&waiting.list)
+        .bind(&waiting.source)
+        .bind(waiting.admitted_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if !jobs::settle(&mut tx, &snap.owner, snap.generation, jobs::RunEnd::Done, min_interval_secs).await? {
+        return Err(Stopped::Superseded);
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

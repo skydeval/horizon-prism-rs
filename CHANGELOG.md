@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **Item 12: a whole list sync run, and owners that are gone (#673).**
+  `subscriptions::run` takes one run from start to end. An owner being
+  purged is not listed. An owner whose account does not answer is first
+  only suspected: nothing changes for members, and the run comes back a
+  day later; the same answer a day or more after the suspicion began, or
+  a tombstone in the PLC directory, confirms it, and the owner's lists
+  are then emptied. A move to another PDS starts the suspicion over. A
+  listing cut short keeps what was read and retries a day later. Runs
+  are counted in `list_sync_runs_total{outcome, lane}`. Nothing starts a
+  run yet (design-v3 §4.3 "The run").
 - **Item 12: reading a list owner's records within bounds (#673).**
   `subscriptions::fetch` reads the owner's list records, then its list
   items, page by page, and stops at the first limit reached: records,
