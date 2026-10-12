@@ -20,7 +20,7 @@ use super::{Hydrator, ViewError, ViewResult, Viewer};
 use crate::xrpc::pools::Requester;
 
 pub const NSID_DECLARATION: &str = "app.bsky.notification.declaration";
-const METRIC_OUT_OF_SCOPE: &str = "activity_subscriptions_out_of_scope_total";
+const METRIC_OUT_OF_SCOPE: &str = crate::db::retention::METRIC_SUBSCRIPTIONS_OUT_OF_SCOPE;
 
 fn invalid(message: &str) -> ViewError {
     ViewError::new("InvalidRequest", message)

@@ -12,6 +12,11 @@ commit.
 
 ### Added
 
+- **Item 14: sweep of subscriptions that can no longer notify (#675).**
+  The daily retention run deletes activity subscriptions whose subject is
+  no longer indexed here, so they are not shown as active
+  (`activity_subscriptions_out_of_scope_total{action="swept"}`;
+  design-v3 §5.6).
 - **Item 14: `subscribed-post` notifications (#675).** When a post by an
   in-scope, once-backfilled author arrives from the firehose, each member
   subscribed to that author for that kind of post gets a `subscribed-post`

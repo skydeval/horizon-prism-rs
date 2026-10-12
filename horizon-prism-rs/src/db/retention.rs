@@ -64,6 +64,9 @@ pub const TREND_AGGREGATE_HOURS: i32 = 72;
 pub const METRIC_DELETED_ROWS: &str = "retention_deleted_rows_total";
 /// Metric: retention task failures, labelled by task.
 pub const METRIC_TASK_FAILURES: &str = "retention_task_failures_total";
+/// Activity subscriptions to a subject outside the indexed set, by what
+/// happened to them (`rejected` at the endpoint, `swept` here).
+pub const METRIC_SUBSCRIPTIONS_OUT_OF_SCOPE: &str = "activity_subscriptions_out_of_scope_total";
 /// Metric: candidate DIDs with nothing left to delete once locked, because
 /// they re-entered scope (or became protected) meanwhile. Counts how often
 /// the retention/growth race actually fires.
@@ -663,7 +666,36 @@ impl RetentionTask for PublicRetention {
         let mut steps = scope_steps(owners, private_authors);
         steps.extend(age_cap_steps(settings.max_age_days));
         steps.extend(time_steps(settings));
-        run_steps(pool, scope, &steps).await
+        let mut report = run_steps(pool, scope, &steps).await?;
+        report.deleted.push(("activity_subscriptions", sweep_subscriptions(pool).await?));
+        Ok(report)
+    }
+}
+
+/// Delete activity subscriptions whose subject is no longer indexed
+/// (design-v3 §5.6 "Subjects that leave S"): such a subscription can never
+/// notify, so it is removed, not shown as active. In batches, until none is
+/// left.
+async fn sweep_subscriptions(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let mut total = 0;
+    loop {
+        let n = sqlx::query(
+            "DELETE FROM activity_subscriptions a WHERE a.ctid IN ( \
+               SELECT a2.ctid FROM activity_subscriptions a2 \
+               WHERE NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = a2.subject_did) \
+               LIMIT 10000)",
+        )
+        .execute(pool)
+        .await?
+        .rows_affected();
+        total += n;
+        if n == 0 {
+            if total > 0 {
+                metrics::counter!(METRIC_SUBSCRIPTIONS_OUT_OF_SCOPE, "action" => "swept").increment(total);
+            }
+            return Ok(total);
+        }
+        tokio::time::sleep(BATCH_PAUSE).await;
     }
 }
 
@@ -1098,6 +1130,34 @@ mod tests {
             let uri = insert_post(&db.pool).await;
             run_public(&db.pool).await;
             assert!(!post_exists(&db.pool, &uri).await);
+            db.drop_db().await;
+        }
+
+        /// B-75: a subscription whose subject left the indexed set is
+        /// swept; one whose subject is still in it stays.
+        #[tokio::test]
+        async fn subscriptions_to_subjects_out_of_scope_are_swept() {
+            let Some(db) = fresh_db().await else { return };
+            let gone = "did:plc:gggggggggggggggggggggggg";
+            sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)")
+                .bind(DID)
+                .execute(&db.pool)
+                .await
+                .expect("insert scope");
+            for subject in [DID, gone] {
+                sqlx::query("INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply) VALUES ('did:plc:m', $1, true, false)")
+                    .bind(subject)
+                    .execute(&db.pool)
+                    .await
+                    .expect("subscription");
+            }
+            let report = run_public(&db.pool).await;
+            assert!(report.deleted.contains(&("activity_subscriptions", 1)));
+            let left: Vec<String> = sqlx::query_scalar("SELECT subject_did FROM activity_subscriptions")
+                .fetch_all(&db.pool)
+                .await
+                .expect("left");
+            assert_eq!(left, [DID]);
             db.drop_db().await;
         }
 
