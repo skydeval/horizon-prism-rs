@@ -12,6 +12,40 @@ use crate::moderation::{self, Gate};
 
 pub const NSID_FOLLOW: &str = "app.bsky.graph.follow";
 
+/// What a direct mute covers (design-v3 §5.3): `mutes.scope`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuteScope {
+    Full,
+    Reposts,
+    Quotes,
+    RepostsAndQuotes,
+}
+
+impl MuteScope {
+    /// From `muteActor`'s `onlyReposts` and `onlyQuoteposts` flags: full
+    /// when neither is set.
+    #[must_use]
+    pub fn from_flags(only_reposts: bool, only_quoteposts: bool) -> Self {
+        match (only_reposts, only_quoteposts) {
+            (false, false) => Self::Full,
+            (true, false) => Self::Reposts,
+            (false, true) => Self::Quotes,
+            (true, true) => Self::RepostsAndQuotes,
+        }
+    }
+
+    /// The stored value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Reposts => "reposts",
+            Self::Quotes => "quotes",
+            Self::RepostsAndQuotes => "reposts_and_quotes",
+        }
+    }
+}
+
 fn not_found() -> ViewError {
     ViewError::new("InvalidRequest", "Profile not found")
 }
@@ -135,7 +169,8 @@ impl Hydrator {
         };
         let (at, after) = parse_local_cursor(cursor);
         let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT subject_did, created_at FROM mutes WHERE viewer_did = $1 \
+            // Full mutes only: the lexicon excludes scoped ones (§5.3).
+            "SELECT subject_did, created_at FROM mutes WHERE viewer_did = $1 AND scope = 'full' \
              AND ($2::timestamptz IS NULL OR (created_at, subject_did) < ($2, $3)) \
              ORDER BY created_at DESC, subject_did DESC LIMIT $4",
         )
@@ -157,13 +192,15 @@ impl Hydrator {
         Ok(Ok(Self::emit(out)))
     }
 
-    /// `app.bsky.graph.muteActor` / `unmuteActor` for the (member) viewer.
-    /// Mutes are local AppView state; any valid DID may be muted.
+    /// `app.bsky.graph.muteActor` (`Some(scope)`) / `unmuteActor` (`None`)
+    /// for the (member) viewer. Mutes are local AppView state; any valid DID
+    /// may be muted. A repeat mute replaces the scope and keeps the row's
+    /// `created_at`; an unmute deletes the row whatever its scope (§5.3).
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn set_mute(&self, viewer: &Viewer, actor: &str, mute: bool) -> ViewResult<Value> {
+    pub async fn set_mute(&self, viewer: &Viewer, actor: &str, mute: Option<MuteScope>) -> ViewResult<Value> {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
@@ -173,12 +210,27 @@ impl Hydrator {
         if did == me {
             return Ok(Err(ViewError::new("InvalidRequest", "Cannot mute oneself")));
         }
-        let sql = if mute {
-            "INSERT INTO mutes (viewer_did, subject_did) VALUES ($1, $2) ON CONFLICT DO NOTHING"
-        } else {
-            "DELETE FROM mutes WHERE viewer_did = $1 AND subject_did = $2"
-        };
-        sqlx::query(sql).bind(me).bind(&did).execute(self.pool()).await?;
+        match mute {
+            Some(scope) => {
+                sqlx::query(
+                    "INSERT INTO mutes (viewer_did, subject_did, scope) VALUES ($1, $2, $3) \
+                     ON CONFLICT (viewer_did, subject_did) \
+                     DO UPDATE SET scope = EXCLUDED.scope, created_at = mutes.created_at",
+                )
+                .bind(me)
+                .bind(&did)
+                .bind(scope.as_str())
+                .execute(self.pool())
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM mutes WHERE viewer_did = $1 AND subject_did = $2")
+                    .bind(me)
+                    .bind(&did)
+                    .execute(self.pool())
+                    .await?;
+            }
+        }
         Ok(Ok(Self::emit(json!({}))))
     }
 }
@@ -220,16 +272,60 @@ mod tests {
             did: Some(ALICE.into()),
             hydrate: true,
         };
-        h.set_mute(&me, "bob.test", true).await.expect("db").expect("muted");
-        h.set_mute(&me, "bob.test", true).await.expect("db").expect("idempotent");
+        let full = Some(MuteScope::Full);
+        h.set_mute(&me, "bob.test", full).await.expect("db").expect("muted");
+        h.set_mute(&me, "bob.test", full).await.expect("db").expect("idempotent");
         let m = h.get_mutes(&me, 50, None).await.expect("db").expect("view");
         assert_eq!(m.inner()["mutes"][0]["did"], BOB);
         assert_eq!(m.inner()["mutes"][0]["viewer"]["muted"], true);
-        assert!(h.set_mute(&me, ALICE, true).await.expect("db").is_err());
-        h.set_mute(&me, BOB, false).await.expect("db").expect("unmuted");
-        h.set_mute(&me, BOB, false).await.expect("db").expect("unmute is idempotent");
+        assert!(h.set_mute(&me, ALICE, full).await.expect("db").is_err());
+        h.set_mute(&me, BOB, None).await.expect("db").expect("unmuted");
+        h.set_mute(&me, BOB, None).await.expect("db").expect("unmute is idempotent");
         let m = h.get_mutes(&me, 50, None).await.expect("db").expect("view");
         assert_eq!(m.inner()["mutes"], json!([]));
+
+        // B-34: scoped mutes. A repeat call replaces the scope and keeps the
+        // row's created_at; `getMutes` lists full mutes only.
+        let viewer_of_bob = || async {
+            let ctx = h.profile_context(&me, &[BOB.to_string()], None).await.expect("ctx");
+            ctx.view(BOB, ProfileKind::View)["viewer"].clone()
+        };
+        let created = || async {
+            sqlx::query_scalar::<_, DateTime<Utc>>("SELECT created_at FROM mutes WHERE subject_did = $1")
+                .bind(BOB)
+                .fetch_one(p)
+                .await
+                .expect("row")
+        };
+        h.set_mute(&me, BOB, Some(MuteScope::Reposts)).await.expect("db").expect("scoped");
+        let first = created().await;
+        let v = viewer_of_bob().await;
+        assert_eq!((&v["muted"], &v["mutedOnlyReposts"]), (&json!(false), &json!(true)));
+        assert!(v.get("mutedOnlyQuoteposts").is_none());
+        let m = h.get_mutes(&me, 50, None).await.expect("db").expect("view");
+        assert_eq!(m.inner()["mutes"], json!([]));
+
+        h.set_mute(&me, BOB, Some(MuteScope::RepostsAndQuotes)).await.expect("db").expect("both");
+        let v = viewer_of_bob().await;
+        assert_eq!((&v["mutedOnlyReposts"], &v["mutedOnlyQuoteposts"]), (&json!(true), &json!(true)));
+
+        // No flags: a full mute, and the scoped flags are suppressed.
+        h.set_mute(&me, BOB, full).await.expect("db").expect("widened by request");
+        let v = viewer_of_bob().await;
+        assert_eq!(v["muted"], true);
+        assert!(v.get("mutedOnlyReposts").is_none() && v.get("mutedOnlyQuoteposts").is_none());
+        let m = h.get_mutes(&me, 50, None).await.expect("db").expect("view");
+        assert_eq!(m.inner()["mutes"][0]["did"], BOB);
+
+        // Narrowed again; still one row, with its first created_at.
+        h.set_mute(&me, BOB, Some(MuteScope::Quotes)).await.expect("db").expect("narrowed");
+        let v = viewer_of_bob().await;
+        assert_eq!((&v["muted"], &v["mutedOnlyQuoteposts"]), (&json!(false), &json!(true)));
+        assert!(v.get("mutedOnlyReposts").is_none());
+        assert_eq!(created().await, first);
+        h.set_mute(&me, BOB, None).await.expect("db").expect("unmute deletes a scoped row");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mutes").fetch_one(p).await.expect("count");
+        assert_eq!(rows, 0);
         db.drop_db().await;
     }
 }

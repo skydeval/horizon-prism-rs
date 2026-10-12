@@ -51,7 +51,7 @@ mod tests {
             return;
         };
         let out = render(&db.pool).await.expect("render");
-        assert_eq!(out, "0001_initial  applied\n0002_private_reply_cids  applied\n0003_eligibility_failures  applied\nstatus: up to date");
+        assert_eq!(out, "0001_initial  applied\n0002_private_reply_cids  applied\n0003_eligibility_failures  applied\n0012_mute_scope  applied\nstatus: up to date");
         db.drop_db().await;
     }
 }

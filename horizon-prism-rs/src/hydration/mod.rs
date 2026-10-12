@@ -172,15 +172,31 @@ pub struct ActorViewer {
     pub followed_by: HashMap<String, String>,
     pub blocking: HashMap<String, String>,
     pub blocked_by: HashSet<String>,
+    /// Subjects with a `full` direct mute.
     pub muted: HashSet<String>,
+    /// Subjects whose direct mute covers reposts (`reposts`,
+    /// `reposts_and_quotes`).
+    pub muted_reposts: HashSet<String>,
+    /// Subjects whose direct mute covers quote posts (`quotes`,
+    /// `reposts_and_quotes`).
+    pub muted_quotes: HashSet<String>,
 }
 
 impl ActorViewer {
-    /// The lexicon `viewerState` for one actor.
+    /// The lexicon `viewerState` for one actor. `muted` is the full mute;
+    /// the scoped flags are emitted only when it is false (design-v3 §5.3,
+    /// "Viewer mute flags"). List mutes join `muted` with §II-15 item 12.
     #[must_use]
     pub fn view(&self, did: &str) -> Value {
         let mut v = serde_json::Map::new();
-        v.insert("muted".into(), json!(self.muted.contains(did)));
+        let muted = self.muted.contains(did);
+        v.insert("muted".into(), json!(muted));
+        if !muted && self.muted_reposts.contains(did) {
+            v.insert("mutedOnlyReposts".into(), json!(true));
+        }
+        if !muted && self.muted_quotes.contains(did) {
+            v.insert("mutedOnlyQuoteposts".into(), json!(true));
+        }
         v.insert("blockedBy".into(), json!(self.blocked_by.contains(did)));
         if let Some(u) = self.blocking.get(did) {
             v.insert("blocking".into(), json!(u));
@@ -420,19 +436,37 @@ impl Hydrator {
                 .bind(dids)
                 .fetch_all(p)
                 .await?;
-        let muted: Vec<String> =
-            sqlx::query_scalar("SELECT subject_did FROM mutes WHERE viewer_did = $1 AND subject_did = ANY($2)")
+        let mutes: Vec<(String, String)> =
+            sqlx::query_as("SELECT subject_did, scope FROM mutes WHERE viewer_did = $1 AND subject_did = ANY($2)")
                 .bind(me)
                 .bind(dids)
                 .fetch_all(p)
                 .await?;
-        Ok(ActorViewer {
+        let mut out = ActorViewer {
             following: following.into_iter().collect(),
             followed_by: followed_by.into_iter().collect(),
             blocking: blocking.into_iter().collect(),
             blocked_by: blocked_by.into_iter().collect(),
-            muted: muted.into_iter().collect(),
-        })
+            ..ActorViewer::default()
+        };
+        for (did, scope) in mutes {
+            match scope.as_str() {
+                "reposts" => {
+                    out.muted_reposts.insert(did);
+                }
+                "quotes" => {
+                    out.muted_quotes.insert(did);
+                }
+                "reposts_and_quotes" => {
+                    out.muted_reposts.insert(did.clone());
+                    out.muted_quotes.insert(did);
+                }
+                _ => {
+                    out.muted.insert(did);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Normalize an upstream view for `viewer` (§8.6): local viewer state

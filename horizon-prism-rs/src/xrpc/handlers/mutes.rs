@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::{XrpcResult, respond};
 use crate::hydration::feed::clamp_limit;
+use crate::hydration::graph::MuteScope;
 use crate::xrpc::AppState;
 use crate::xrpc::auth::{Access, Params, prepare};
 use crate::xrpc::errors::XrpcError;
@@ -30,11 +31,29 @@ pub async fn get_mutes(
     respond(s.hydrator.get_mutes(&req.viewer, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
 }
 
+fn input(body: &[u8]) -> Result<(String, Value), XrpcError> {
+    let v = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+    let actor = v
+        .get("actor")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| XrpcError::invalid("Error: Input must have the property \"actor\""))?;
+    Ok((actor, v))
+}
+
 fn actor_of(body: &[u8]) -> Result<String, XrpcError> {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("actor").and_then(Value::as_str).map(str::to_string))
-        .ok_or_else(|| XrpcError::invalid("Error: Input must have the property \"actor\""))
+    input(body).map(|(actor, _)| actor)
+}
+
+/// `muteActor`'s optional `onlyReposts` / `onlyQuoteposts` (design-v3 §5.3).
+/// A flag that is present must be a boolean.
+fn scope_of(v: &Value) -> Result<MuteScope, XrpcError> {
+    let flag = |name: &str| match v.get(name) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(XrpcError::invalid(format!("Error: {name} must be a boolean"))),
+    };
+    Ok(MuteScope::from_flags(flag("onlyReposts")?, flag("onlyQuoteposts")?))
 }
 
 pub async fn mute_actor(
@@ -44,7 +63,8 @@ pub async fn mute_actor(
     body: axum::body::Bytes,
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, MUTE_ACTOR, MEMBER, true).await?;
-    respond(s.hydrator.set_mute(&req.viewer, &actor_of(&body)?, true).await)
+    let (actor, v) = input(&body)?;
+    respond(s.hydrator.set_mute(&req.viewer, &actor, Some(scope_of(&v)?)).await)
 }
 
 pub async fn unmute_actor(
@@ -54,5 +74,5 @@ pub async fn unmute_actor(
     body: axum::body::Bytes,
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, UNMUTE_ACTOR, MEMBER, true).await?;
-    respond(s.hydrator.set_mute(&req.viewer, &actor_of(&body)?, false).await)
+    respond(s.hydrator.set_mute(&req.viewer, &actor_of(&body)?, None).await)
 }

@@ -133,7 +133,11 @@ impl OracleSnapshot {
             AudienceState::NoAudienceConfigured
         };
         let (requester_blocks_owner, owner_blocks_requester) = schema::blocks_between(pool, input.requester, owner).await?;
-        let muted: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM mutes WHERE viewer_did = $1 AND subject_did = $2)")
+        // A full mute only: a mute scoped to reposts or quote posts
+        // (design-v3 §5.3) is not a mute of the account.
+        let muted: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM mutes WHERE viewer_did = $1 AND subject_did = $2 AND scope = 'full')",
+        )
             .bind(input.requester)
             .bind(owner)
             .fetch_one(pool)

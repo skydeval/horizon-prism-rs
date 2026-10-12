@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **Item 10: scoped mutes.** `muteActor` takes `onlyReposts` and
+  `onlyQuoteposts` and stores `mutes.scope` (`full`, `reposts`, `quotes`,
+  `reposts_and_quotes`; migration 0012). A repeat call replaces the scope
+  and keeps the row's `created_at`; `unmuteActor` deletes the row whatever
+  its scope; `getMutes` lists full mutes only (design-v3 §5.3; locked
+  decision 32). A repost mute removes the subject's reposts from the
+  timeline and their `repost` notifications; a quote mute removes their
+  quote posts and `quote` notifications. `viewer.muted` is the full mute;
+  `mutedOnlyReposts` and `mutedOnlyQuoteposts` are set only when it is
+  false. The private-tier mute oracle reads full mutes only.
 - **Item 10: the final router, with CORS.** Every route is merged into one
   router, which then gets its fallbacks, the per-IP backstop and, outermost,
   a CORS layer (design-v3 §6.3, §6.5). Every `/xrpc/*` response, errors

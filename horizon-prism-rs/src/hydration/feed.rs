@@ -506,8 +506,13 @@ impl Hydrator {
             "SELECT f.uri, f.originator_did, f.post_uri, f.kind, f.sort_at FROM feed_items f \
              WHERE (f.originator_did = $1 OR f.originator_did IN (SELECT subject_did FROM follows WHERE author_did = $1)) \
                AND ($2::timestamptz IS NULL OR (f.sort_at, f.uri) < ($2, $3)) \
-               AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
+               AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.scope = 'full' \
                    AND m.subject_did IN (f.originator_did, split_part(f.post_uri, '/', 3))) \
+               AND NOT (f.kind = 'repost' AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
+                   AND m.subject_did = f.originator_did AND m.scope IN ('reposts', 'reposts_and_quotes'))) \
+               AND NOT EXISTS (SELECT 1 FROM mutes m JOIN posts p ON p.author_did = m.subject_did \
+                   WHERE m.viewer_did = $1 AND m.scope IN ('quotes', 'reposts_and_quotes') \
+                     AND p.uri = f.post_uri AND p.quote_uri IS NOT NULL) \
                AND NOT EXISTS (SELECT 1 FROM blocks b WHERE \
                    (b.author_did = $1 AND b.subject_did IN (f.originator_did, split_part(f.post_uri, '/', 3))) \
                 OR (b.subject_did = $1 AND b.author_did IN (f.originator_did, split_part(f.post_uri, '/', 3)))) \
@@ -872,6 +877,56 @@ mod tests {
         exec(p, "INSERT INTO mutes (viewer_did, subject_did) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb')").await;
         let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
         assert_eq!(tl.inner()["feed"].as_array().map(Vec::len), Some(1));
+        // Scoped mutes (B-34). Bob reposts Alice's reply and writes a quote
+        // post: the timeline holds Alice's reply, Bob's root, his repost and
+        // his quote post.
+        exec(p, "DELETE FROM mutes").await;
+        let quote = post(p, BOB, "3kaaaaaaaaaa6", "quoting", None, None).await;
+        exec(p, &format!("UPDATE posts SET quote_uri = '{reply}' WHERE uri = '{quote}'")).await;
+        exec(p, &format!(
+            "INSERT INTO feed_items (uri, originator_did, post_uri, kind, sort_at) VALUES \
+             ('at://{BOB}/app.bsky.feed.repost/1', '{BOB}', '{reply}', 'repost', now())"
+        )).await;
+        let kinds = |v: &Value| -> Vec<(String, bool)> {
+            v["feed"]
+                .as_array()
+                .expect("feed")
+                .iter()
+                .map(|i| (i["post"]["uri"].as_str().expect("uri").to_string(), i.get("reason").is_some()))
+                .collect()
+        };
+        let all = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        assert_eq!(kinds(all.inner()).len(), 4);
+        let mute = |scope: &'static str| async move {
+            exec(p, "DELETE FROM mutes").await;
+            exec(p, &format!(
+                "INSERT INTO mutes (viewer_did, subject_did, scope) VALUES ('{ALICE}', '{BOB}', '{scope}')"
+            )).await;
+        };
+        // reposts: only Bob's repost item goes.
+        mute("reposts").await;
+        let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let k = kinds(tl.inner());
+        assert_eq!(k.len(), 3, "{k:?}");
+        assert!(k.iter().all(|(_, repost)| !repost));
+        assert!(k.iter().any(|(u, _)| *u == root) && k.iter().any(|(u, _)| *u == quote));
+        // quotes: only Bob's quote post goes.
+        mute("quotes").await;
+        let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let k = kinds(tl.inner());
+        assert_eq!(k.len(), 3, "{k:?}");
+        assert!(k.iter().all(|(u, _)| *u != quote) && k.iter().any(|(_, repost)| *repost));
+        // both: the repost and the quote post go; Bob's plain post stays.
+        mute("reposts_and_quotes").await;
+        let tl = h.get_timeline(&me, 50, None).await.expect("db").expect("view");
+        let k = kinds(tl.inner());
+        assert_eq!(k.len(), 2, "{k:?}");
+        assert!(k.iter().any(|(u, _)| *u == root) && k.iter().any(|(u, _)| *u == reply));
+        exec(p, &format!(
+            "DELETE FROM feed_items WHERE uri = 'at://{BOB}/app.bsky.feed.repost/1' OR post_uri = '{quote}'"
+        )).await;
+        exec(p, &format!("DELETE FROM posts WHERE uri = '{quote}'")).await;
+
         // Paging.
         exec(p, "DELETE FROM mutes").await;
         let page = h.get_timeline(&me, 1, None).await.expect("db").expect("view");

@@ -24,7 +24,12 @@ fn parse_cursor(c: Option<&str>) -> (Option<DateTime<Utc>>, i64) {
         .map_or((None, 0), |(t, id)| (Some(t), id))
 }
 
-const EXCLUSIONS: &str = "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did) \
+// Mutes by scope (design-v3 §5.3, "Where mutes apply"): a full mute excludes
+// every reason, a repost mute the repost reasons, a quote mute `quote`.
+const EXCLUSIONS: &str = "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did \
+       AND (m.scope = 'full' \
+         OR (m.scope IN ('reposts', 'reposts_and_quotes') AND n.reason IN ('repost', 'repost-via-repost')) \
+         OR (m.scope IN ('quotes', 'reposts_and_quotes') AND n.reason = 'quote'))) \
      AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = n.author_did) \
                      OR (b.author_did = n.author_did AND b.subject_did = $1))";
 
@@ -319,6 +324,27 @@ mod tests {
         exec(p, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{ALICE}', '{BOB}')")).await;
         let l = h.list_notifications(&me, 50, None, &[]).await.expect("db").expect("view");
         assert_eq!(l.inner()["notifications"], json!([]));
+
+        // Scoped mutes (B-34): a repost mute excludes only the repost
+        // reasons, a quote mute only `quote`.
+        exec(p, "DELETE FROM mutes").await;
+        exec(p, &format!("INSERT INTO notifications (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) VALUES \
+                 ('{ALICE}', '{BOB}', 'repost', '{root}', 'at://{BOB}/app.bsky.feed.repost/1', 'bafyp'), \
+                 ('{ALICE}', '{BOB}', 'quote', '{root}', 'at://{BOB}/app.bsky.feed.post/3kaaaaaaaaaa9', 'bafyq')")).await;
+        let unread = || async {
+            h.unread_count(&me).await.expect("db").expect("view").inner()["count"]
+                .as_i64()
+                .expect("count")
+        };
+        let base = unread().await;
+        assert!(base >= 2, "{base}");
+        for (scope, hidden) in [("reposts", 1), ("quotes", 1), ("reposts_and_quotes", 2)] {
+            exec(p, "DELETE FROM mutes").await;
+            exec(p, &format!("INSERT INTO mutes (viewer_did, subject_did, scope) VALUES ('{ALICE}', '{BOB}', '{scope}')")).await;
+            assert_eq!(unread().await, base - hidden, "{scope}");
+        }
+        exec(p, &format!("UPDATE mutes SET scope = 'full' WHERE viewer_did = '{ALICE}'")).await;
+        assert_eq!(unread().await, 0);
         db.drop_db().await;
     }
 }
