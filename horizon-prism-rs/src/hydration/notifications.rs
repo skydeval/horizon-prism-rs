@@ -210,6 +210,49 @@ impl Hydrator {
         .bind(seen_at)
         .fetch_one(self.pool())
         .await?;
+        // An inbound list block cannot be joined in SQL, so the count is
+        // corrected (design-v3 §5.14.7): the unread rows' authors, newest
+        // first, as many as the request may ask Farsight about, taken
+        // before the viewer's mutes so that what is asked does not depend
+        // on them; then the rows of the authors that block the viewer
+        // through a list are subtracted, under the count's own exclusions.
+        let mut count = count;
+        if count > 0
+            && let Some(lookup) = crate::xrpc::backstop::farsight()
+        {
+            let authors: Vec<String> = sqlx::query_scalar(
+                "SELECT n.author_did FROM notifications n WHERE n.recipient_did = $1 \
+                   AND n.indexed_at > COALESCE($2::timestamptz, \
+                       (SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity') \
+                   AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = n.author_did) \
+                                   OR (b.author_did = n.author_did AND b.subject_did = $1)) \
+                 GROUP BY n.author_did ORDER BY max(n.indexed_at) DESC LIMIT $3",
+            )
+            .bind(me)
+            .bind(seen_at)
+            .bind(i64::try_from(lookup.capacity()).unwrap_or(i64::MAX))
+            .fetch_all(self.pool())
+            .await?;
+            let blockers: Vec<String> = lookup
+                .inbound_list_blocks(me, &authors, &std::collections::HashSet::new())
+                .await
+                .into_keys()
+                .collect();
+            if !blockers.is_empty() {
+                let hidden: i64 = sqlx::query_scalar(&format!(
+                    "SELECT count(*) FROM notifications n WHERE n.recipient_did = $1 AND {EXCLUSIONS} \
+                       AND n.indexed_at > COALESCE($2::timestamptz, \
+                           (SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity') \
+                       AND n.author_did = ANY($3)"
+                ))
+                .bind(me)
+                .bind(seen_at)
+                .bind(&blockers)
+                .fetch_one(self.pool())
+                .await?;
+                count = (count - hidden).max(0);
+            }
+        }
         Ok(Ok(Self::emit(json!({ "count": count }))))
     }
 
@@ -332,6 +375,53 @@ mod tests {
         let end = h.list_notifications(&me, &req,4, Some(&cursor), &[]).await.expect("db").expect("view");
         assert_eq!(end.inner()["notifications"], json!([]));
         assert!(end.inner().get("cursor").is_none());
+        db.drop_db().await;
+    }
+
+    /// B-77: an author who blocks the viewer through a list sends it no
+    /// notifications, in the list and in the unread count.
+    #[tokio::test]
+    async fn an_inbound_list_blocker_is_left_out_of_the_list_and_the_count() {
+        use crate::farsight::lookup::tests::engine;
+        use crate::hydration::testing::hydrator_with_farsight;
+        use crate::xrpc::backstop::{self, Selected};
+
+        let Some(db) = fresh_db("hydration_notifications_list_block").await else {
+            return;
+        };
+        let p = &db.pool;
+        for (d, h) in [(ALICE, "alice.test"), (BOB, "bob.test"), (CAROL, "carol.test")] {
+            actor(p, d, h, h).await;
+        }
+        for (author, n) in [(BOB, 1), (BOB, 2), (CAROL, 3)] {
+            exec(p, &format!(
+                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
+                 ('at://{author}/app.bsky.graph.follow/{n}', '{author}', '{ALICE}', '3k', now())"
+            )).await;
+            exec(p, &format!(
+                "INSERT INTO notifications (recipient_did, author_did, reason, record_uri, record_cid) VALUES \
+                 ('{ALICE}', '{author}', 'follow', 'at://{author}/app.bsky.graph.follow/{n}', 'bafy')"
+            )).await;
+        }
+        let (farsight, fake) = engine("").await;
+        fake.blockers.lock().expect("blockers").insert(BOB.to_string());
+        let h = hydrator_with_farsight(p, ScopeSets::default(), farsight.clone());
+        let me = Viewer {
+            did: Some(ALICE.into()),
+            hydrate: true,
+        };
+        let req = Requester::test();
+        // Without a handle nothing is known of the list block.
+        assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 3);
+        let selected = Selected::by_ip("203.0.113.9".parse().expect("ip"));
+        selected.attach_farsight(farsight.request(&req));
+        backstop::scope(selected, async {
+            assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 1);
+            let l = h.list_notifications(&me, &req, 50, None, &[]).await.expect("db").expect("view");
+            let authors: Vec<&str> = l.inner()["notifications"].as_array().expect("list").iter().map(|n| n["author"]["did"].as_str().expect("did")).collect();
+            assert_eq!(authors, [CAROL]);
+        })
+        .await;
         db.drop_db().await;
     }
 

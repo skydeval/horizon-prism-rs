@@ -263,6 +263,12 @@ impl Lookup {
         self.cache_only.store(true, Ordering::Relaxed);
     }
 
+    /// How many accounts this request may still ask about, at most.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        usize::try_from(self.state().calls_left).unwrap_or(usize::MAX).saturating_mul(super::chunks::MAX_ACCOUNTS)
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }

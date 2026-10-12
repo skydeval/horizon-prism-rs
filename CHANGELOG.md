@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 12: inbound list blocks in notifications (#673).** An account that
+  blocks the viewer through a list sends it no notifications: it is left
+  out of `listNotifications`, and `getUnreadCount` subtracts its unread rows
+  (design-v3 §5.14.7). The count asks Farsight about the unread rows'
+  authors, newest first, up to what one request may ask; authors past that
+  are not checked. A member that stops being ready loses its cached
+  Farsight answers.
 - **Item 12: `getRelationships.blockedByList` (#673).** For a ready-member
   `actor`, each other account that blocks it through a list gets
   `blockedByList`, the list's URI, from one Farsight lookup on the caller's

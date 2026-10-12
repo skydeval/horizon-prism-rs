@@ -373,7 +373,7 @@ pub async fn run() -> Result<(), StartupError> {
             thread: cfg.file.thread.clone(),
             thread_mutes_max: cfg.file.thread_mutes.max_per_actor,
             known_followers_scan_max_pages: cfg.file.known_followers.scan_max_pages,
-            farsight,
+            farsight: farsight.clone(),
             constellation_bucket: Some(shares.bucket(
                 "constellation",
                 microcosm.constellation_rate_per_sec.0,
@@ -395,7 +395,14 @@ pub async fn run() -> Result<(), StartupError> {
         backstop
             .keys
             .clone()
-            .spawn(pool.clone(), resolver.clone(), move |did| verify_limits.forget(did)),
+            // A member that left the ready set loses its in-process state:
+            // its verification limits and its cached Farsight answers.
+            .spawn(pool.clone(), resolver.clone(), move |did| {
+                verify_limits.forget(did);
+                if let Some(farsight) = &farsight {
+                    farsight.forget(did);
+                }
+            }),
     );
     let limits = RateLimits::from_config(&cfg.file.rate_limits).with_backstop(backstop);
     tasks.push(limits.spawn_housekeeping());
