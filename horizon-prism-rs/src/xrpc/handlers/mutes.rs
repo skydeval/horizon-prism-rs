@@ -13,6 +13,7 @@ use crate::hydration::feed::clamp_limit;
 use crate::hydration::graph::MuteScope;
 use crate::xrpc::AppState;
 use crate::xrpc::auth::{Access, Params, prepare};
+use crate::xrpc::backstop;
 use crate::xrpc::errors::XrpcError;
 
 pub const GET_MUTES: &str = "app.bsky.graph.getMutes";
@@ -31,6 +32,12 @@ pub async fn get_mutes(
     RawQuery(q): RawQuery,
 ) -> XrpcResult {
     let req = prepare(&s, &headers, peer, GET_MUTES, MEMBER, false).await?;
+    // The listed accounts are the viewer's private mutes: Farsight is not
+    // asked about them, so it never sees a viewer beside its mutes
+    // (design-v3 §5.14.5, viewer-private mode).
+    if let Some(lookup) = backstop::farsight() {
+        lookup.set_cache_only();
+    }
     let p = Params::parse(q.as_deref());
     respond(&req.req, s.hydrator.get_mutes(&req.viewer, &req.req, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
 }

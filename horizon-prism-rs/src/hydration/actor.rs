@@ -311,6 +311,57 @@ mod tests {
     }
 
     /// design-v3 §11 G-1: `getProfiles` fetches out-of-scope actors upstream.
+    /// B-77: an account that blocks the viewer through a list shows as
+    /// `blockedBy`, but only on a request that carries a Farsight handle.
+    #[tokio::test]
+    async fn an_inbound_list_block_reads_as_blocked_by() {
+        use std::sync::atomic::Ordering;
+
+        use crate::farsight::lookup::tests::{V, engine};
+        use crate::hydration::testing::hydrator_with_farsight;
+        use crate::xrpc::backstop::{self, Selected};
+
+        let Some(db) = fresh_db("hydration_inbound_list_block").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let (farsight, fake) = engine("").await;
+        fake.blockers.lock().expect("blockers").insert(ALICE.to_string());
+        let h = hydrator_with_farsight(p, sets(), farsight.clone());
+        let me = Viewer {
+            did: Some(V.into()),
+            hydrate: true,
+        };
+        let req = Requester::test();
+        let dids = [ALICE.to_string(), BOB.to_string()];
+
+        // No handle (a private read, a background path): no call, no block.
+        let ctx = h.profile_context(&me, &req, &dids, None).await.expect("ctx");
+        assert_eq!(ctx.view(ALICE, ProfileKind::View)["viewer"]["blockedBy"], false);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+
+        // With the handle a public handler attaches.
+        let selected = Selected::by_ip("203.0.113.9".parse().expect("ip"));
+        selected.attach_farsight(farsight.request(&req));
+        backstop::scope(selected, async {
+            let ctx = h.profile_context(&me, &req, &dids, None).await.expect("ctx");
+            assert_eq!(ctx.view(ALICE, ProfileKind::View)["viewer"]["blockedBy"], true);
+            assert_eq!(ctx.view(BOB, ProfileKind::View)["viewer"]["blockedBy"], false);
+            assert!(ctx.viewer.blocked_either_way(ALICE));
+            // A second hydration step of the request asks nothing new.
+            h.profile_context(&me, &req, &dids, None).await.expect("ctx");
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            // Anyone but a ready member has no viewer state, and no call.
+            let ctx = h.profile_context(&Viewer::anonymous(), &req, &dids, None).await.expect("ctx");
+            assert_eq!(ctx.view(ALICE, ProfileKind::View)["viewer"]["blockedBy"], false);
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
+        db.drop_db().await;
+    }
+
     #[tokio::test]
     async fn get_profiles_fetches_out_of_scope_actors_upstream() {
         use std::sync::Arc;

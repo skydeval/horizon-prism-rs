@@ -348,6 +348,17 @@ pub async fn run() -> Result<(), StartupError> {
         read_cache.clone(),
     );
 
+    // The block-list index (design-v3 §5.14), only when configured.
+    let farsight = match (&cfg.file.farsight.url, &cfg.env.farsight_token) {
+        (Some(url), Some(token)) => {
+            let client = crate::farsight::FarsightClient::new(net.clone(), url, token.expose())
+                .ok_or_else(|| StartupError::new(78, "FARSIGHT_TOKEN is not a usable header value".to_string()))?;
+            tracing::info!(event = "farsight_enabled", "inbound list blocks are read from Farsight");
+            Some(crate::farsight::Farsight::new(client, &cfg.file.farsight, &shares))
+        }
+        _ => None,
+    };
+
     // HTTP.
     let hydrator = Hydrator::new(
         pool.clone(),
@@ -362,6 +373,7 @@ pub async fn run() -> Result<(), StartupError> {
             thread: cfg.file.thread.clone(),
             thread_mutes_max: cfg.file.thread_mutes.max_per_actor,
             known_followers_scan_max_pages: cfg.file.known_followers.scan_max_pages,
+            farsight,
             constellation_bucket: Some(shares.bucket(
                 "constellation",
                 microcosm.constellation_rate_per_sec.0,

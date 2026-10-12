@@ -12,6 +12,35 @@ commit.
 
 ### Added
 
+- **Item 12: inbound list blocks from Farsight (#673).** With
+  `farsight.url` set, a ready member's public requests ask Farsight which
+  accounts on the page block the member through a list, and such an account
+  is treated as one that blocks the member directly: `viewer.blockedBy` is
+  true, and every surface that already hides a direct inbound block hides
+  this one (design-v3 §5.14.5). Accounts with a direct block are not asked
+  about, and neither is the member itself.
+  - Answers are kept per viewer for `farsight.cache_ttl_secs`, and a
+    request never asks twice about one account. An answer Farsight does not
+    vouch for never removes a cached block; a vouched clean answer does.
+  - A request asks about at most `farsight.max_calls_per_request` chunks of
+    100 accounts and waits at most `farsight.timeout_ms` in all. Calls draw
+    on a bucket of their own, with member and non-member pools and a
+    per-requester share. Five failed calls open a breaker, after which no
+    call is made for 30 s; an anonymous caller's failures do not count
+    toward it. An answer over the size cap is asked again once, as two
+    halves.
+  - When Farsight gives no answer, for any reason, the page is rendered
+    with the blocks this AppView holds itself. Nothing here slows a request
+    beyond the allowance or turns it into an error.
+  - Private-tier reads never ask Farsight. `getMutes` reads the member's
+    cached answers only, so Farsight never sees a member beside its mutes.
+  - `farsight_calls_total{outcome}`, `farsight_coverage_total{level}`,
+    `farsight_partial_total{reason}`, `farsight_auth_failed_total`.
+  - Not built yet: the post-scan filters that drop a blocker's items from
+    the timeline, list feeds and notifications before views are built, the
+    unread-count correction, `getRelationships.blockedByList`, clearing a
+    removed member's cached answers, the prime on enrollment, and the
+    `admin farsight` commands.
 - **Item 12: the Farsight client (#673).** `[farsight]` config and the
   `FARSIGHT_TOKEN` environment variable (design-v3 §5.14.4). With
   `farsight.url` unset, the default, nothing changes. Startup refuses a

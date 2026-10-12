@@ -256,6 +256,15 @@ pub async fn prepare(
     }
     let viewer = state.hydrator.viewer(caller_did.as_deref()).await?;
     let req = request_handle(viewer.state_did(), ip);
+    // A ready member's public request gets its Farsight handle here
+    // (design-v3 §5.14.5). The private-tier gate below attaches none, so
+    // private reads never reach Farsight.
+    if viewer.state_did().is_some()
+        && let Some(farsight) = state.hydrator.farsight()
+        && let Some(selected) = backstop::selected()
+    {
+        selected.attach_farsight(farsight.request(&req));
+    }
     // Mute management works before readiness: act as the caller.
     let viewer = if matches!(access, Access::Member { ready: false, .. }) && !viewer.hydrate {
         Viewer {

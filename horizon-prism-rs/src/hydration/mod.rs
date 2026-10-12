@@ -42,6 +42,7 @@ use crate::aggregations::ScopeState;
 use crate::aggregations::counts::{self, Counts, Freshness};
 use crate::config::{CountsConfig, CountsSource, ThreadConfig};
 use crate::db::locks::uri_author;
+use crate::farsight::Farsight;
 use crate::microcosm::ConstellationClient;
 use crate::xrpc::pools::{Exhausted, Requester, SharedBucket};
 
@@ -124,6 +125,8 @@ pub struct HydrationConfig {
     pub thread_mutes_max: u32,
     /// `known_followers.scan_max_pages`.
     pub known_followers_scan_max_pages: u32,
+    /// The block-list index, when `farsight.url` is set.
+    pub farsight: Option<Farsight>,
     /// The shared bucket for request-origin Constellation calls
     /// (`microcosm.constellation_rate_per_sec`); `None` leaves them unmetered.
     pub constellation_bucket: Option<SharedBucket>,
@@ -301,6 +304,12 @@ impl Hydrator {
         self.constellation_bucket().map_or(Ok(()), |b| req.try_draw(b))
     }
 
+    /// The block-list index, when one is configured.
+    #[must_use]
+    pub fn farsight(&self) -> Option<&Farsight> {
+        self.inner.cfg.farsight.as_ref()
+    }
+
     fn upstream(&self) -> &dyn UpstreamSource {
         self.inner.upstream.as_ref()
     }
@@ -474,6 +483,15 @@ impl Hydrator {
             blocked_by: blocked_by.into_iter().collect(),
             ..ActorViewer::default()
         };
+        // Inbound list blocks, from Farsight (design-v3 §5.14.5): asked only
+        // when this request carries a handle, about the accounts with no
+        // direct block. An account that blocks the viewer through a list is
+        // treated as one that blocks it directly.
+        if let Some(lookup) = crate::xrpc::backstop::farsight() {
+            let direct: HashSet<String> = out.blocking.keys().chain(&out.blocked_by).cloned().collect();
+            let by_list = lookup.inbound_list_blocks(me, dids, &direct).await;
+            out.blocked_by.extend(by_list.into_keys());
+        }
         for (did, scope) in mutes {
             match scope.as_str() {
                 "reposts" => {
@@ -733,6 +751,27 @@ pub(crate) mod testing {
         hydrator_with(pool, sets, Arc::new(NoUpstream))
     }
 
+    /// A hydrator that asks `farsight` about inbound list blocks.
+    pub(crate) fn hydrator_with_farsight(pool: &PgPool, sets: ScopeSets, farsight: Farsight) -> Hydrator {
+        Hydrator::new(
+            pool.clone(),
+            ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000),
+            None,
+            None,
+            Arc::new(NoUpstream),
+            ReadCache::new(1024 * 1024),
+            HydrationConfig {
+                labeler_did: LABELER.into(),
+                counts: CountsConfig::default(),
+                thread: ThreadConfig::default(),
+                thread_mutes_max: 3,
+                known_followers_scan_max_pages: 2,
+                farsight: Some(farsight),
+                constellation_bucket: None,
+            },
+        )
+    }
+
     pub(crate) fn hydrator_with(pool: &PgPool, sets: ScopeSets, upstream: Arc<dyn UpstreamSource>) -> Hydrator {
         hydrator_full(pool, sets, upstream, None)
     }
@@ -753,6 +792,7 @@ pub(crate) mod testing {
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
                 known_followers_scan_max_pages: 2,
+                farsight: None,
                 constellation_bucket: None,
             },
         )

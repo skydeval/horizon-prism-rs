@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
@@ -49,6 +49,7 @@ use super::member_keys::{KeyAge, MemberKeys};
 use super::pools::{Bucket, ChargeKey, Rate, Requester};
 use super::rate_limit::{class_problem, ip_key};
 use crate::config::{AuthConfig, RateClassConfig};
+use crate::farsight::Lookup;
 use crate::kryphocron_glue::VerifiedCaller;
 use crate::kryphocron_glue::jwt::{APPVIEW_FRAGMENT, MemoryVerdict};
 
@@ -410,6 +411,10 @@ pub struct Selected {
     pub req: Requester,
     /// The `Authorization` value and the caller it verified to.
     pre: Option<Arc<(String, VerifiedCaller)>>,
+    /// The request's handle on Farsight, once a public handler has
+    /// attached one for a ready-member viewer (design-v3 §5.14.5). Empty
+    /// for every other request, which then makes no lookup.
+    farsight: Arc<OnceLock<Lookup>>,
 }
 
 impl Selected {
@@ -419,7 +424,19 @@ impl Selected {
         Self {
             req: Requester::new(ChargeKey::ip(ip)),
             pre: None,
+            farsight: Arc::default(),
         }
+    }
+
+    /// Give the request its Farsight handle. The first one stays.
+    pub fn attach_farsight(&self, lookup: Lookup) {
+        let _ = self.farsight.set(lookup);
+    }
+
+    /// The request's Farsight handle, if one was attached.
+    #[must_use]
+    pub fn farsight(&self) -> Option<Lookup> {
+        self.farsight.get().cloned()
     }
 
     /// The caller the backstop verified `authorization` to, so a handler
@@ -442,6 +459,14 @@ tokio::task_local! {
 #[must_use]
 pub fn selected() -> Option<Selected> {
     SELECTED.try_with(Clone::clone).ok()
+}
+
+/// The running request's Farsight handle: present only when a public
+/// handler attached one. A path with no request (a background job, the
+/// CLI) and the private tier have none, and so never reach Farsight.
+#[must_use]
+pub fn farsight() -> Option<Lookup> {
+    SELECTED.try_with(Selected::farsight).ok().flatten()
 }
 
 /// Run `f` as the rest of a request with selection `s`.
@@ -496,6 +521,7 @@ impl Backstop {
             Selection::Charge(Selected {
                 req: Requester::new(ChargeKey::member(&claims.iss)),
                 pre,
+                farsight: Arc::default(),
             })
         };
         match auth.verify_in_memory(authorization, method, &key.doc).await {
