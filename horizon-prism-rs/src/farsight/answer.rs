@@ -45,6 +45,16 @@ impl Relation {
     }
 }
 
+/// Who wrote a cache entry. A field of the entry, not of the pair answer:
+/// the request memo and a remembered block carry none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Farsight,
+    /// The fallback AppView (design-v3 §5.14.17). Such an entry always
+    /// names an inbound list block, and never stands in for Farsight.
+    Fallback,
+}
+
 /// Farsight's answer for (viewer, other).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairAnswer {
@@ -82,20 +92,63 @@ impl PairAnswer {
     ///   not vouched from then on. If the live entry named no block, the
     ///   new answer replaces it.
     ///
+    /// An entry the fallback wrote (design-v3 §5.14.17.6) holds an inbound
+    /// list block a third party reported, and is treated apart:
+    /// - if the new answer itself names an inbound list block, the entry
+    ///   becomes Farsight's: Farsight's list, any other block the entry
+    ///   held, Farsight's lifetime;
+    /// - if it does not (and does not vouch), the fallback's block stays
+    ///   with the fallback's lifetime, the entry stays the fallback's, and
+    ///   any other block the answer names is added.
+    ///
+    /// So an entry is Farsight's only when every block in it came from
+    /// Farsight, and a non-vouching answer never removes a block.
+    ///
     /// The second value is whether the entry's expiry restarts: it does
-    /// when the entry is replaced, and not when it is merged.
+    /// when the entry is replaced, and not when it is merged. The third is
+    /// the source of the result.
     #[must_use]
-    pub fn written_over(new: &Self, live: Option<&Self>) -> (Self, bool) {
+    pub fn written_over(new: &Self, live: Option<(&Self, Source)>) -> (Self, bool, Source) {
         match live {
-            Some(live) if !new.vouched && live.any_block() => (
+            Some((live, Source::Fallback)) if !new.vouched && new.inbound.list.is_some() => (
+                Self {
+                    inbound: Relation { direct: new.inbound.direct || live.inbound.direct, list: new.inbound.list.clone() },
+                    outbound: new.outbound.with(&live.outbound),
+                    vouched: false,
+                },
+                true,
+                Source::Farsight,
+            ),
+            Some((live, Source::Fallback)) if !new.vouched => (
+                Self {
+                    inbound: Relation { direct: live.inbound.direct || new.inbound.direct, list: live.inbound.list.clone() },
+                    outbound: live.outbound.with(&new.outbound),
+                    vouched: false,
+                },
+                false,
+                Source::Fallback,
+            ),
+            Some((live, Source::Farsight)) if !new.vouched && live.any_block() => (
                 Self {
                     inbound: live.inbound.with(&new.inbound),
                     outbound: live.outbound.with(&new.outbound),
                     vouched: false,
                 },
                 false,
+                Source::Farsight,
             ),
-            _ => (new.clone(), true),
+            _ => (new.clone(), true, Source::Farsight),
+        }
+    }
+
+    /// The pair answer a fallback result "blocked" becomes: an inbound
+    /// list block and nothing else, never vouched.
+    #[must_use]
+    pub fn from_fallback(list: String) -> Self {
+        Self {
+            inbound: Relation { direct: false, list: Some(list) },
+            outbound: Relation::default(),
+            vouched: false,
         }
     }
 }
@@ -306,19 +359,45 @@ mod tests {
 
     #[test]
     fn a_vouched_answer_replaces_and_an_unvouched_one_never_removes_a_block() {
+        use Source::{Fallback, Farsight};
         // Nothing cached: the answer is stored as it is.
-        assert_eq!(PairAnswer::written_over(&pair(Some(L1), false), None), (pair(Some(L1), false), true));
-        // A vouched clean answer removes a cached block.
-        assert_eq!(PairAnswer::written_over(&pair(None, true), Some(&pair(Some(L1), true))), (pair(None, true), true));
+        assert_eq!(PairAnswer::written_over(&pair(Some(L1), false), None), (pair(Some(L1), false), true, Farsight));
+        // A vouched clean answer removes a cached block, whoever wrote it.
+        for source in [Farsight, Fallback] {
+            assert_eq!(PairAnswer::written_over(&pair(None, true), Some((&pair(Some(L1), false), source))), (pair(None, true), true, Farsight));
+        }
         // An unvouched clean answer keeps the block and its expiry, and the
         // entry no longer vouches.
-        assert_eq!(PairAnswer::written_over(&pair(None, false), Some(&pair(Some(L1), true))), (pair(Some(L1), false), false));
+        assert_eq!(PairAnswer::written_over(&pair(None, false), Some((&pair(Some(L1), true), Farsight))), (pair(Some(L1), false), false, Farsight));
         // An unvouched answer adds its own blocks to the entry's.
         let mut outbound = pair(None, false);
         outbound.outbound.direct = true;
-        let (merged, restart) = PairAnswer::written_over(&outbound, Some(&pair(Some(L1), false)));
+        let (merged, restart, _) = PairAnswer::written_over(&outbound, Some((&pair(Some(L1), false), Farsight)));
         assert_eq!((merged.inbound.list.as_deref(), merged.outbound.direct, merged.vouched, restart), (Some(L1), true, false, false));
         // The entry named no block: the new answer replaces it.
-        assert_eq!(PairAnswer::written_over(&pair(Some(L2), false), Some(&pair(None, true))), (pair(Some(L2), false), true));
+        assert_eq!(PairAnswer::written_over(&pair(Some(L2), false), Some((&pair(None, true), Farsight))), (pair(Some(L2), false), true, Farsight));
+    }
+
+    /// design-v3 §5.14.17.6, the last two rows of the merge table.
+    #[test]
+    fn an_entry_the_fallback_wrote_is_merged_by_its_own_rules() {
+        use Source::{Fallback, Farsight};
+        let fallback = PairAnswer::from_fallback(L1.to_string());
+        assert!(!fallback.vouched && fallback.inbound.list.as_deref() == Some(L1) && !fallback.outbound.is_block());
+        // Farsight, not vouching, reports an inbound list block itself: the
+        // entry becomes Farsight's, with Farsight's list and lifetime.
+        let (merged, restart, source) = PairAnswer::written_over(&pair(Some(L2), false), Some((&fallback, Fallback)));
+        assert_eq!((merged.inbound.list.as_deref(), restart, source), (Some(L2), true, Farsight));
+        // Farsight, not vouching, reports no inbound list block: the
+        // fallback's block and lifetime stay, the entry stays the
+        // fallback's, and another block the answer names is added.
+        let mut other = pair(None, false);
+        other.outbound.direct = true;
+        let (merged, restart, source) = PairAnswer::written_over(&other, Some((&fallback, Fallback)));
+        assert_eq!((merged.inbound.list.as_deref(), merged.outbound.direct, merged.vouched), (Some(L1), true, false));
+        assert_eq!((restart, source), (false, Fallback));
+        // That added block is kept when Farsight later names the list.
+        let (again, _, source) = PairAnswer::written_over(&pair(Some(L2), false), Some((&merged, Fallback)));
+        assert_eq!((again.inbound.list.as_deref(), again.outbound.direct, source), (Some(L2), true, Farsight));
     }
 }

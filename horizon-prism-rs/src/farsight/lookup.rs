@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, join_all};
 
-use super::answer::{Coverage, PairAnswer};
+use super::answer::{Coverage, PairAnswer, Source};
 use super::chunks::{chunks, halves};
 use super::client::{CallError, FarsightClient};
 use super::did::canonical;
@@ -57,6 +57,8 @@ struct Settings {
 struct Entry {
     answer: PairAnswer,
     expires: Instant,
+    /// Who wrote it: Farsight, or the fallback (§5.14.17.6).
+    source: Source,
 }
 
 /// One viewer's entries, with the order they were first written in.
@@ -77,9 +79,14 @@ struct Cache {
 
 impl Cache {
     fn get(&mut self, viewer: &str, other: &str, now: Instant) -> Option<PairAnswer> {
+        self.entry(viewer, other, now).map(|(answer, _)| answer)
+    }
+
+    /// The live entry for the pair, with who wrote it.
+    fn entry(&mut self, viewer: &str, other: &str, now: Instant) -> Option<(PairAnswer, Source)> {
         let v = self.viewers.get_mut(viewer)?;
         match v.entries.get(other) {
-            Some(e) if e.expires > now => Some(e.answer.clone()),
+            Some(e) if e.expires > now => Some((e.answer.clone(), e.source)),
             Some(_) => {
                 v.entries.remove(other);
                 self.total -= 1;
@@ -92,8 +99,8 @@ impl Cache {
     /// Write `new` for the pair under the merge rule, and return what the
     /// entry now holds.
     fn write(&mut self, viewer: &str, other: &str, new: &PairAnswer, now: Instant, s: &Settings) -> PairAnswer {
-        let live = self.get(viewer, other, now);
-        let (merged, restart) = PairAnswer::written_over(new, live.as_ref());
+        let live = self.entry(viewer, other, now);
+        let (merged, restart, source) = PairAnswer::written_over(new, live.as_ref().map(|(answer, source)| (answer, *source)));
         let v = self.viewers.entry(viewer.to_string()).or_default();
         let expires = match v.entries.get(other) {
             Some(e) if !restart => e.expires,
@@ -106,6 +113,7 @@ impl Cache {
                 Entry {
                     answer: merged.clone(),
                     expires,
+                    source,
                 },
             )
             .is_none();
