@@ -21,11 +21,11 @@ pub use env::{
 };
 pub use sections::{
     AdminConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
-    CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, FileConfig,
-    FirehoseConfig, HttpConfig, IdentityConfig, IndexingConfig, KryphocronConfig,
-    LOCAL_APPVIEW, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig,
+    CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, FeaturesConfig,
+    FileConfig, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
+    KryphocronConfig, LOCAL_APPVIEW, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig,
     PrivateReadConfig, PrivateReadFloors, PublicScope, RetentionConfig, ScopeConfig,
-    ScopePolicy, StorageConfig, SyncConfig, UtcTimeOfDay,
+    ScopePolicy, ServiceConfig, ServiceState, StorageConfig, SyncConfig, UtcTimeOfDay,
 };
 pub use validate::{OTHER_RELAY_LABEL, pds_pattern};
 
@@ -137,7 +137,7 @@ impl AppConfig {
     ///
     /// [`ConfigError::Invalid`] listing every problem found.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let problems = validate::problems(&self.file);
+        let problems = validate::problems(&self.file, &self.env.public_hostname);
         if problems.is_empty() {
             Ok(())
         } else {

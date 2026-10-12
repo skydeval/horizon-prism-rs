@@ -11,6 +11,15 @@ use super::rate_limit::Limited;
 use crate::hydration::{HydrationError, ViewError};
 use crate::kryphocron_glue::AuthError;
 
+/// The lexicon error name of the readiness gate.
+pub const NOT_READY: &str = "NotReady";
+
+/// Response extension set on every `400 NotReady`. The final router's layer
+/// turns it into `Retry-After` (design-v3 §II-7.1), so no handler needs the
+/// configured value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotReadyHint;
+
 /// An XRPC error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrpcError {
@@ -18,6 +27,8 @@ pub struct XrpcError {
     pub error: &'static str,
     pub message: String,
     pub reset: Option<u64>,
+    /// Whether this is the `NotReady` gate error (see [`NotReadyHint`]).
+    pub not_ready: bool,
 }
 
 impl XrpcError {
@@ -27,6 +38,7 @@ impl XrpcError {
             error,
             message: message.into(),
             reset: None,
+            not_ready: false,
         }
     }
 
@@ -41,7 +53,10 @@ impl XrpcError {
 
     #[must_use]
     pub fn not_ready() -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "NotReady", "Account indexing in progress")
+        Self {
+            not_ready: true,
+            ..Self::new(StatusCode::BAD_REQUEST, NOT_READY, "Account indexing in progress")
+        }
     }
 
     #[must_use]
@@ -66,13 +81,19 @@ impl From<Limited> for XrpcError {
             error: "RateLimitExceeded",
             message: "Rate Limit Exceeded".into(),
             reset: Some(l.reset_epoch_secs),
+            not_ready: false,
         }
     }
 }
 
 impl From<ViewError> for XrpcError {
     fn from(e: ViewError) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, e.error, e.message)
+        // The timeline's own readiness check raises `NotReady` as a view
+        // error; it carries the retry hint like the gate's.
+        Self {
+            not_ready: e.error == NOT_READY,
+            ..Self::new(StatusCode::BAD_REQUEST, e.error, e.message)
+        }
     }
 }
 
@@ -96,6 +117,9 @@ impl IntoResponse for XrpcError {
             && let Ok(v) = HeaderValue::from_str(&reset.to_string())
         {
             response.headers_mut().insert("ratelimit-reset", v);
+        }
+        if self.not_ready {
+            response.extensions_mut().insert(NotReadyHint);
         }
         response
     }

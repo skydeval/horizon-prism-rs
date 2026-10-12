@@ -15,14 +15,17 @@ use super::sections::{
 pub const OTHER_RELAY_LABEL: &str = "other";
 
 /// Validate a parsed file config, returning every problem found.
+/// `public_hostname` is `APP_PUBLIC_HOSTNAME`, which a proxied service's
+/// URL must not name (design-v3 §6.7.2.3 rule 4).
 #[must_use]
-pub fn problems(cfg: &FileConfig) -> Vec<String> {
+pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     let mut out = Vec::new();
     indexing(cfg, &mut out);
     firehose(cfg, &mut out);
     networks(cfg, &mut out);
     urls(cfg, &mut out);
     numbers(cfg, &mut out);
+    crate::services::problems(cfg, public_hostname, &mut out);
     out
 }
 

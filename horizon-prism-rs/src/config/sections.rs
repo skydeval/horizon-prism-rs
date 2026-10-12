@@ -102,6 +102,9 @@ pub struct CommunityConfig {
     pub enroll_refusal_cache_secs: u64,
     /// Empty means the `community` network's `pds_patterns`.
     pub enroll_pds_patterns: Vec<String>,
+    /// `Retry-After` on every `400 NotReady` (design-v3 §II-7.1): a constant,
+    /// not an estimate of indexing progress.
+    pub not_ready_retry_secs: u64,
 }
 
 impl Default for CommunityConfig {
@@ -113,6 +116,7 @@ impl Default for CommunityConfig {
             never_ready_expiry_days: 7,
             enroll_refusal_cache_secs: 3600,
             enroll_pds_patterns: Vec::new(),
+            not_ready_retry_secs: 5,
         }
     }
 }
@@ -602,10 +606,97 @@ impl ConstellationConfig {
     }
 }
 
+/// `[features]` (design-v3 §6.6). Every flag is `false` in v0.1, and a flag
+/// may be `true` only for a surface this build implements.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FeaturesConfig {
+    pub feed_generators: bool,
+    pub embed_external_view: bool,
+    pub verification: bool,
+    /// Removed: `[services.push].state` replaces it (§6.7.2.5). Still parsed
+    /// so that validation can name the replacement key.
+    pub push: Option<bool>,
+    /// Removed: `[services.age_assurance].state` replaces it.
+    pub age_assurance: Option<bool>,
+    /// Removed: `[services.contact].state` replaces it.
+    pub contact: Option<bool>,
+}
+
+impl FeaturesConfig {
+    /// Whether the named feature flag is on. An unknown name is off.
+    #[must_use]
+    pub fn enabled(&self, feature: &str) -> bool {
+        match feature {
+            "feed_generators" => self.feed_generators,
+            "embed_external_view" => self.embed_external_view,
+            "verification" => self.verification,
+            _ => false,
+        }
+    }
+}
+
+/// `[honest_501]` (design-v3 §6.1, §6.6).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Honest501Config {
+    /// The `<link>` of every 501 message. Empty drops the sentence that
+    /// contains it.
+    pub status_url: String,
+    /// Per-NSID message overrides, merged over the compiled defaults.
+    pub messages: BTreeMap<String, String>,
+}
+
+/// The state of a `[services.<name>]` block (design-v3 §6.7.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceState {
+    #[default]
+    Disabled,
+    Proxy,
+    Serve,
+}
+
+impl ServiceState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Proxy => "proxy",
+            Self::Serve => "serve",
+        }
+    }
+}
+
+/// One `[services.<name>]` block (design-v3 §6.7.2). Every key but `state`
+/// and `methods` is accepted only with `state = "proxy"`; `crate::services`
+/// validates the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServiceConfig {
+    pub state: ServiceState,
+    pub proxy_url: Option<String>,
+    pub aud_fragments: Option<Vec<String>>,
+    pub timeout_ms: Option<u64>,
+    pub body_read_timeout_ms: Option<u64>,
+    pub max_request_bytes: Option<u64>,
+    pub max_response_bytes: Option<u64>,
+    pub max_in_flight: Option<u64>,
+    pub rate_per_sec: Option<u32>,
+    pub burst: Option<u32>,
+    pub allow_private_network: Option<bool>,
+    /// NSID to `"GET"` or `"POST"`: required on a custom service, rejected
+    /// on a built-in one.
+    pub methods: Option<BTreeMap<String, String>>,
+}
+
 /// Everything read from `app.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
+    pub features: FeaturesConfig,
+    pub honest_501: Honest501Config,
+    pub services: BTreeMap<String, ServiceConfig>,
     pub http: HttpConfig,
     pub metrics: MetricsConfig,
     pub indexing: IndexingConfig,

@@ -12,6 +12,42 @@ commit.
 
 ### Added
 
+- **Item 10: the final router, with CORS.** Every route is merged into one
+  router, which then gets its fallbacks, the per-IP backstop and, outermost,
+  a CORS layer (design-v3 §6.3, §6.5). Every `/xrpc/*` response, errors
+  included, carries `Access-Control-Allow-Origin: *`; preflights allow `GET`
+  and `POST` with `authorization`, `content-type`, `atproto-proxy` and
+  `atproto-accept-labelers`; `X-Prism-Sort-Fallback`, `ratelimit-reset`,
+  `Retry-After` and `atproto-content-labelers` are exposed. This covers the
+  private, index, Thread Lens, resolve-DID and health routes, so a browser
+  client can call the AppView directly with a bearer token.
+- **Item 10: router fallback and wrong-verb answers.** An unregistered
+  `/xrpc/<nsid>` answers `501 MethodNotImplemented`, a malformed NSID
+  `400 InvalidRequest`, and a registered method asked with the wrong verb
+  `400 InvalidRequest` "Incorrect HTTP method (X) expected Y". Before, these
+  were a bare 404 and an empty 405. Both are charged to `anon_read`.
+- **Item 10: honest-501 routes.** The 36 deferred endpoints (feed
+  generators, push, preferences, reports, video, external embed views, age
+  assurance, contact) answer `501 NotImplemented` from registered routes,
+  for their lexicon verb, without authentication (§6.1, §6.2).
+  `honest_501.status_url` fills the "See <link> for status." pointer, and an
+  empty one drops that sentence; `honest_501.messages.<nsid>` overrides one
+  message. `honest_501_total{nsid}`.
+- **Item 10: `[services.*]` and `[features]` config.** Deferred external
+  services (`contact`, `age_assurance`, `push`, and operator-defined ones
+  with their own `methods`) are `disabled`, `proxy` or `serve` (§6.7). This
+  build accepts only `disabled`: `proxy`, `serve` and any `features.* = true`
+  stop startup with exit 78 and say why. The whole of §6.7.2.3's validation
+  is in, including the reserved namespaces and the one-owner-per-NSID check
+  for custom services. `features.push`, `features.age_assurance` and
+  `features.contact` are removed and name their replacement key.
+- **Item 10: `Retry-After` on `NotReady`.** Every `400 NotReady` carries
+  `Retry-After` from `community.not_ready_retry_secs` (default 5): a constant
+  hint for clients, not an estimate of indexing progress.
+- **Item 10: `#bsky_notif` and `/did.json`.** The did:web document lists the
+  notification service beside `#bsky_appview`, so a PDS proxying push
+  registration reaches the honest 501. `/did.json` serves the same bytes as
+  `/.well-known/did.json`, both with `Cache-Control: public, max-age=300`.
 - **Item 8.5: pre-Phase B verification tests.** Ascending-PDS author-feed
   fallback (newest `limit` records from at most 10 listing pages, no cursor,
   a `P:` cursor ends the feed) against a mock ascending PDS; eligibility
@@ -179,6 +215,11 @@ commit.
 
 ### Changed
 
+- The per-IP backstop is one layer on the final router instead of one per
+  sub-router. `GET` and `HEAD` on `/xrpc/_health` stay exempt.
+- `app.nearhorizon.private.getAuthorFeed`'s lexicon description names its
+  ordering field (`record.createdAt`, clamped to indexing time plus five
+  minutes).
 - Design-v2 §6.11.3: read-fetch budget 25 per host (ascending-PDS worst
   case); §13 row 185.
 - `sync.read_fetch_rate_per_host` defaults to 25 (was 20), in code and in

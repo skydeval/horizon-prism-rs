@@ -76,6 +76,7 @@ max_members = 1000
 never_ready_expiry_days = 7
 enroll_refusal_cache_secs = 3600
 enroll_pds_patterns = []
+not_ready_retry_secs = 5
 
 [firehose]
 stream_key = "firehose:events"
@@ -194,6 +195,14 @@ enabled = true
 
 [constellation.cascade]
 order = ["bluesky", "community-a", "community-b"]
+
+[honest_501]
+status_url = ""
+
+[features]
+feed_generators = false
+embed_external_view = false
+verification = false
 "#;
 
 #[test]
@@ -390,6 +399,40 @@ fn load_with_reports_missing_file() {
 }
 
 // ---- validation rules ----
+
+/// design-v3 §6.6, §6.7.2.3: nothing but `disabled` loads in this build.
+#[test]
+fn services_and_features_are_validated_at_load() {
+    // The item-10 check: proxying is not built yet (rule 9).
+    let p = invalid_problems(load("[services.contact]\nstate = \"proxy\"\nproxy_url = \"https://c.example\"\n"));
+    assert!(has(&p, "services.contact.state = \"proxy\""), "{p:?}");
+    // B-28's last sentence.
+    for text in [
+        "[services.push]\nstate = \"serve\"\n",
+        "[services.push]\nstate = \"proxy\"\nproxy_url = \"https://p.example\"\n",
+    ] {
+        assert!(has(&invalid_problems(load(text)), "services.push.state"), "{text}");
+    }
+    let p = invalid_problems(load("[features]\npush = true\n"));
+    assert!(has(&p, "features.push is removed: set services.push.state"), "{p:?}");
+    // Rule 4 reads APP_PUBLIC_HOSTNAME.
+    let p = invalid_problems(load(
+        "[services.contact]\nstate = \"proxy\"\nproxy_url = \"https://appview.example.com\"\n",
+    ));
+    assert!(has(&p, "own hostname"), "{p:?}");
+    // An unknown state is a parse error, like any bad enum value.
+    assert!(matches!(
+        load("[services.contact]\nstate = \"on\"\n"),
+        Err(ConfigError::Parse(_))
+    ));
+    // Disabled blocks, built-in or custom, load.
+    let cfg = load(concat!(
+        "[services.contact]\nstate = \"disabled\"\n",
+        "[services.eu]\nstate = \"disabled\"\nmethods = { \"eu.example.region.getNotices\" = \"GET\" }\n",
+    ))
+    .expect("loads");
+    assert_eq!(cfg.file.services.len(), 2);
+}
 
 #[test]
 fn full_public_scope_is_refused() {

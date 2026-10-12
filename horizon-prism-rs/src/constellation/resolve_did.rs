@@ -12,7 +12,7 @@ use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router, middleware};
+use axum::{Json, Router};
 
 use super::routing::{RoutingDecision, Router as DidRouter};
 use crate::hydration::hint::{RoutingHint, routing_hint};
@@ -20,7 +20,6 @@ use crate::xrpc::AppState;
 use crate::xrpc::auth::{Params, request_ip};
 use crate::xrpc::errors::XrpcError;
 use crate::xrpc::rate_limit::Class;
-use crate::xrpc::router::global_limit;
 
 pub const RESOLVE_DID: &str = "app.nearhorizon.constellation.resolveDid";
 /// `cache-control` on every answer (§8.7).
@@ -37,7 +36,6 @@ pub struct ResolveDidState {
 pub fn router(state: ResolveDidState) -> Router {
     Router::new()
         .route(&format!("/xrpc/{RESOLVE_DID}"), get(resolve_did))
-        .layer(middleware::from_fn_with_state(state.app.clone(), global_limit))
         .with_state(state)
 }
 

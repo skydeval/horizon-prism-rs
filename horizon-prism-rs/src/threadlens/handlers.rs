@@ -15,7 +15,7 @@ use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::routing::post;
-use axum::{Json, Router, middleware};
+use axum::{Json, Router};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
@@ -28,7 +28,6 @@ use crate::hydration::lens::{LensNode, lens_items, lens_thread};
 use crate::xrpc::AppState;
 use crate::xrpc::errors::XrpcError;
 use crate::xrpc::rate_limit::Class;
-use crate::xrpc::router::global_limit;
 
 pub const GET_THREAD: &str = "app.nearhorizon.threadLens.getThread";
 pub const RESOLVE: &str = "app.nearhorizon.threadLens.resolve";
@@ -47,7 +46,6 @@ pub fn router(state: ThreadLensState) -> Router {
     Router::new()
         .route(&format!("/xrpc/{GET_THREAD}"), post(get_thread))
         .route(&format!("/xrpc/{RESOLVE}"), post(resolve))
-        .layer(middleware::from_fn_with_state(state.app.clone(), global_limit))
         .with_state(state)
 }
 

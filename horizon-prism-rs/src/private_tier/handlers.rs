@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -34,7 +33,6 @@ use crate::kryphocron_glue::VerifiedCaller;
 use crate::xrpc::AppState;
 use crate::xrpc::auth::{Params, prepare_private};
 use crate::xrpc::errors::XrpcError;
-use crate::xrpc::router::global_limit;
 
 pub const GET_POSTS: &str = "app.nearhorizon.private.getPosts";
 pub const GET_POST_THREAD: &str = "app.nearhorizon.private.getPostThread";
@@ -108,7 +106,6 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(GET_POSTS), get(get_posts))
         .route(&xrpc(GET_POST_THREAD), get(get_post_thread))
         .route(&xrpc(GET_AUTHOR_FEED), get(get_author_feed))
-        .layer(middleware::from_fn_with_state(state.app.clone(), global_limit))
         .with_state(state)
 }
 

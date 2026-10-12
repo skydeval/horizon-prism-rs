@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["trace", "timeout", "limit", "request-id"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "limit", "request-id", "cors"] }
 # Postgres only (lock #2): the default `any` feature is off. Runtime-checked
 # queries only; no query!/query_as! macros, so builds need no database.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "chrono", "json"] }

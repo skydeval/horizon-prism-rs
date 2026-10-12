@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Get an author's private-tier posts that the requester is authorized to read, newest first. Requires auth by a ready community member. An unknown actor and an actor with no visible posts both return an empty feed with no cursor.",
+      "description": "Get an author's private-tier posts that the requester is authorized to read, newest first. The ordering field is each post's `record.createdAt` (descending, ties broken by record key); a `createdAt` later than the time of indexing plus five minutes is clamped to that bound, and the view carries the clamped value. Requires auth by a ready community member. An unknown actor and an actor with no visible posts both return an empty feed with no cursor.",
       "parameters": {
         "type": "params",
         "required": ["actor"],

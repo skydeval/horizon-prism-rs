@@ -369,12 +369,22 @@ pub async fn run() -> Result<(), StartupError> {
         app: app.clone(),
         router: did_router,
     };
-    let routes = crate::xrpc::router(app)
+    // §6.3's order: merge every route, then the fallbacks, the rate limit
+    // and CORS outermost. Nothing is merged after `finalize`.
+    let merged = crate::xrpc::router(app.clone())
+        .merge(crate::honest_501::router(&app, &cfg.file))
         .merge(crate::private_tier::handlers::router(private_state))
         .merge(crate::constellation::resolve_did::router(resolve_did))
         .merge(crate::threadlens::router(thread_lens))
         .merge(crate::xrpc::router::index_router(index))
         .merge(health::router(state));
+    let routes = crate::xrpc::router::finalize(
+        merged,
+        app,
+        crate::xrpc::router::FinalConfig {
+            not_ready_retry_secs: cfg.file.community.not_ready_retry_secs,
+        },
+    );
     axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await

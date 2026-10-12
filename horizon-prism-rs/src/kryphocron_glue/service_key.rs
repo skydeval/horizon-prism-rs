@@ -137,11 +137,20 @@ impl ServiceKey {
                 "controller": did,
                 "publicKeyMultibase": self.public_key_multibase(),
             }],
-            "service": [{
-                "id": "#bsky_appview",
-                "type": "BskyAppView",
-                "serviceEndpoint": format!("https://{}", self.hostname),
-            }],
+            // design-v3 §6.4: the notification service is published so that a
+            // PDS proxying push registration reaches this AppView's honest 501.
+            "service": [
+                {
+                    "id": "#bsky_appview",
+                    "type": "BskyAppView",
+                    "serviceEndpoint": format!("https://{}", self.hostname),
+                },
+                {
+                    "id": "#bsky_notif",
+                    "type": "BskyNotificationService",
+                    "serviceEndpoint": format!("https://{}", self.hostname),
+                },
+            ],
         })
     }
 
@@ -214,7 +223,12 @@ mod tests {
         let mb = doc["verificationMethod"][0]["publicKeyMultibase"].as_str().expect("mb");
         assert!(mb.starts_with("zQ3s"), "{mb}");
         assert_eq!(doc["service"][0]["id"], "#bsky_appview");
+        assert_eq!(doc["service"][0]["type"], "BskyAppView");
         assert_eq!(doc["service"][0]["serviceEndpoint"], "https://appview.example.com");
+        assert_eq!(doc["service"][1]["id"], "#bsky_notif");
+        assert_eq!(doc["service"][1]["type"], "BskyNotificationService");
+        assert_eq!(doc["service"][1]["serviceEndpoint"], "https://appview.example.com");
+        assert_eq!(doc["service"].as_array().map(Vec::len), Some(2));
         // §6.8: the audience identity's DID equals the did.json id.
         let identity = key.service_identity().expect("identity");
         assert_eq!(identity.service_did().as_str(), doc["id"].as_str().expect("id"));

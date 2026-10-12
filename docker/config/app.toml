@@ -37,6 +37,9 @@ enroll_refusal_cache_secs = 3600
 # PDS hosts eligible for auto-enroll (exact host or *.suffix). Empty = the
 # community network's pds_patterns below. Others need `admin member add`.
 enroll_pds_patterns = []
+# Seconds sent as `Retry-After` on every `400 NotReady` (account indexing in
+# progress). A constant hint for clients, not an estimate of progress.
+not_ready_retry_secs = 5
 
 [firehose]
 stream_key = "firehose:events"
@@ -186,3 +189,33 @@ enabled = true
 
 [constellation.cascade]
 order = ["bluesky", "community-a", "community-b"]
+
+# Endpoints this AppView does not serve yet (feed generators, push,
+# preferences, reports, video, age assurance, contact import) answer
+# `501 NotImplemented` from registered routes. The set is fixed in the build.
+[honest_501]
+# Shown as the "See <link> for status." pointer. Empty drops that sentence.
+status_url = ""
+# Per-endpoint message overrides, keyed by NSID; `<link>` is replaced by
+# status_url. Only deferred endpoints of this AppView are accepted.
+# [honest_501.messages]
+# "app.bsky.feed.getFeed" = "Feeds are coming. See <link>."
+
+# Surfaces this build does not implement cannot be switched on: any `true`
+# here is a startup error in this version.
+[features]
+feed_generators = false
+embed_external_view = false
+verification = false
+
+# Deferred external services. Each is "disabled" (the default), "proxy" or
+# "serve". This version accepts only "disabled": the endpoints answer 501.
+# Built-in blocks: [services.contact], [services.age_assurance],
+# [services.push]. They never need to appear in this file.
+#
+# A custom service declares its own NSIDs and verbs. While disabled it
+# registers nothing. NSIDs in com.atproto.*, app.bsky.*, chat.bsky.*,
+# tools.ozone.*, tools.kryphocron.* and app.nearhorizon.* are refused.
+# [services.eu_region_notices]
+# state = "disabled"
+# methods = { "eu.example.region.getNotices" = "GET" }
