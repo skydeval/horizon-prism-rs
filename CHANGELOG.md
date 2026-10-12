@@ -12,6 +12,15 @@ commit.
 
 ### Added
 
+- **Item 15: bookmarks (#675).** `app.bsky.bookmark.createBookmark`,
+  `deleteBookmark` and `getBookmarks`. Only posts can be bookmarked;
+  any other collection, private-tier URIs included, is
+  `UnsupportedCollection`, decided from the URI alone. A member holds at
+  most `[bookmarks] max_per_actor` (default 50 000). The listing reads
+  stored posts only and makes no fetch and no count refresh; a post not
+  stored here, gone or hidden shows as `notFoundPost`, and one with a
+  block as `blockedPost`. Post views carry `viewer.bookmarked`
+  (design-v3 §5.8, §8.2).
 - **Item 14: subscription state on profiles (#675).** Profile views
   carry `viewer.activitySubscription` for a ready member subscribed to
   the account, and detailed profile views carry

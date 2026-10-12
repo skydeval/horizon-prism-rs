@@ -21,7 +21,7 @@ use super::auth::request_ip;
 use super::backstop::{self, Selected, Selection};
 use super::pools::{ChargeKey, Exhausted, Pool};
 use super::errors::{NotReadyHint, XrpcError};
-use super::handlers::{actor, did_web, feed, graph, index, mutes, notifications, timeline};
+use super::handlers::{actor, bookmarks, did_web, feed, graph, index, mutes, notifications, timeline};
 use super::rate_limit::Class;
 
 /// The health route: exempt from the backstop for `GET` and `HEAD` (§6.3;
@@ -239,6 +239,9 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(notifications::GET_PREFERENCES), get(notifications::get_preferences))
         .route(&xrpc(notifications::PUT_PREFERENCES), post(notifications::put_preferences))
         .route(&xrpc(notifications::PUT_PREFERENCES_V2), post(notifications::put_preferences_v2))
+        .route(&xrpc(bookmarks::CREATE_BOOKMARK), post(bookmarks::create_bookmark))
+        .route(&xrpc(bookmarks::DELETE_BOOKMARK), post(bookmarks::delete_bookmark))
+        .route(&xrpc(bookmarks::GET_BOOKMARKS), get(bookmarks::get_bookmarks))
         .route(&xrpc(notifications::LIST_ACTIVITY_SUBSCRIPTIONS), get(notifications::list_activity_subscriptions))
         .route(&xrpc(notifications::PUT_ACTIVITY_SUBSCRIPTION), post(notifications::put_activity_subscription))
         .route("/.well-known/did.json", get(did_web::did_json))

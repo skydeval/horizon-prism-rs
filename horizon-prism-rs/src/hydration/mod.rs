@@ -11,6 +11,7 @@
 //!   single-object views, cached values plus `cc:refresh` for lists.
 
 pub mod activity_subscriptions;
+pub mod bookmarks;
 pub mod actor;
 pub mod cache;
 pub mod emit;
@@ -115,6 +116,9 @@ pub enum CountMode {
     Sync { started: Instant },
     /// List views: cached rows only; misses are enqueued.
     List,
+    /// Viewer-private listings (bookmarks): cached rows only, and nothing
+    /// is enqueued, so the read leaves no trace in shared state.
+    Quiet,
 }
 
 /// Static hydration settings.
@@ -128,6 +132,8 @@ pub struct HydrationConfig {
     pub thread_mutes_max: u32,
     /// `activity_subscriptions.max_per_actor`.
     pub activity_subscriptions_max: u32,
+    /// `bookmarks.max_per_actor`.
+    pub bookmarks_max: u32,
     /// `known_followers.scan_max_pages`.
     pub known_followers_scan_max_pages: u32,
     /// `known_followers.profile_scan_pages`.
@@ -609,6 +615,15 @@ impl Hydrator {
                 out.entry(uri).or_insert_with(|| json!({}))["embeddingDisabled"] = json!(true);
             }
         }
+        // A post the viewer bookmarked (design-v3 §8.2).
+        let bookmarked: Vec<String> = sqlx::query_scalar("SELECT post_uri FROM bookmarks WHERE viewer_did = $1 AND post_uri = ANY($2)")
+            .bind(me)
+            .bind(uris)
+            .fetch_all(self.pool())
+            .await?;
+        for uri in bookmarked {
+            out.entry(uri).or_insert_with(|| json!({}))["bookmarked"] = json!(true);
+        }
         // A post in a thread the viewer muted (design-v3 §5.3, §8.2).
         for uri in self.in_muted_threads(viewer, uris).await? {
             out.entry(uri).or_insert_with(|| json!({}))["threadMuted"] = json!(true);
@@ -632,7 +647,9 @@ impl Hydrator {
                 }
                 Ok(Some((c, _))) => {
                     out.insert(t.clone(), c);
-                    self.enqueue_refresh(t).await;
+                    if !matches!(mode, CountMode::Quiet) {
+                        self.enqueue_refresh(t).await;
+                    }
                 }
                 Ok(None) => misses.push(t.clone()),
                 Err(error) => tracing::debug!(event = "constellation_counts_read_failed", %error, "counts read failed"),
@@ -644,6 +661,7 @@ impl Hydrator {
                     self.enqueue_refresh(t).await;
                 }
             }
+            CountMode::Quiet => {}
             CountMode::Sync { started } => {
                 use futures::StreamExt;
                 let fetched: Vec<(String, Option<Counts>)> = futures::stream::iter(misses)
@@ -807,6 +825,7 @@ pub(crate) mod testing {
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
                 activity_subscriptions_max: 2,
+                bookmarks_max: 3,
                 known_followers_scan_max_pages: 2,
                 known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,
@@ -838,6 +857,7 @@ pub(crate) mod testing {
                 thread: ThreadConfig::default(),
                 thread_mutes_max: 3,
                 activity_subscriptions_max: 2,
+                bookmarks_max: 3,
                 known_followers_scan_max_pages: 2,
                 known_followers_profile_scan_pages: 2,
                 known_likers_scan_max_pages: 2,

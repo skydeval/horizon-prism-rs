@@ -827,6 +827,20 @@ impl Default for ActivitySubscriptionsConfig {
     }
 }
 
+/// `[bookmarks]` (design-v3 §5.8).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BookmarksConfig {
+    /// Posts one member may bookmark; another past it is a 400.
+    pub max_per_actor: u32,
+}
+
+impl Default for BookmarksConfig {
+    fn default() -> Self {
+        Self { max_per_actor: 50_000 }
+    }
+}
+
 /// `[notifications]` (design-v3 §5.6).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1119,6 +1133,7 @@ pub struct FileConfig {
     pub thread_mutes: ThreadMutesConfig,
     pub activity_subscriptions: ActivitySubscriptionsConfig,
     pub notifications: NotificationsConfig,
+    pub bookmarks: BookmarksConfig,
     pub starter_packs: StarterPacksConfig,
     pub known_followers: KnownFollowersConfig,
     pub known_likers: KnownLikersConfig,

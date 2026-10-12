@@ -2,6 +2,7 @@
 //! `Json<PublicEmit<_>>` (§7.2): it can hold the type but not construct it.
 
 pub mod actor;
+pub mod bookmarks;
 pub mod did_web;
 pub mod feed;
 pub mod graph;

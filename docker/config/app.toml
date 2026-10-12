@@ -289,6 +289,11 @@ max_per_actor = 1000
 [notifications]
 subscribed_post_max_age_secs = 86400
 
+# How many posts one member may bookmark. Past it, bookmarking another is
+# refused.
+[bookmarks]
+max_per_actor = 50000
+
 # How often the "joined through this starter pack" numbers are recounted.
 [starter_packs]
 counts_refresh_secs = 3600

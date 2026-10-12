@@ -56,6 +56,9 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if !(60..=2_592_000).contains(&cfg.notifications.subscribed_post_max_age_secs) {
         out.push("notifications.subscribed_post_max_age_secs must be 60 to 2592000".to_string());
     }
+    if cfg.bookmarks.max_per_actor == 0 {
+        out.push("bookmarks.max_per_actor must be at least 1".to_string());
+    }
     if cfg.activity_subscriptions.max_per_actor == 0 {
         out.push("activity_subscriptions.max_per_actor must be at least 1".to_string());
     }
