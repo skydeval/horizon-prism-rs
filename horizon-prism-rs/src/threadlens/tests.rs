@@ -1,5 +1,5 @@
-//! Thread Lens end to end: the block-party rule, `tier-hidden` without
-//! lookups, and upstream-structure classification.
+//! Thread Lens end to end: viewer-relative threads, `tier-hidden` without
+//! lookups, and the refusals of a member endpoint.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -23,7 +23,10 @@ use crate::appview_clients::{AppViewAuth, AppViewClient};
 use crate::config::ConstellationConfig;
 use crate::constellation::routing::tests::StubLookup;
 use crate::constellation::{Cascade, DidLookup, Router as DidRouter, RoutingTable};
-use crate::hydration::testing::{actor, exec, hydrator, post};
+use crate::config::ThreadLensConfig;
+use crate::hydration::lens::{Bridging, LensNode};
+use crate::hydration::testing::{actor, exec, hydrator, hydrator_with_farsight, post};
+use crate::hydration::{Hydrator, Viewer};
 use crate::kryphocron_glue::jwt::tests::{AUDIENCE_HOST, StubFetcher, mint, signing_key, verifier};
 use crate::microcosm::SlingshotClient;
 use crate::net::NetClient;
@@ -34,7 +37,7 @@ use crate::xrpc::{AppState, RateLimits};
 const AUTHOR: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 const R1: &str = "did:plc:rrrrrrrrrrrrrrrrrrrrrrr1";
 const R2: &str = "did:plc:rrrrrrrrrrrrrrrrrrrrrrr2";
-const VIEWER_A: &str = "did:plc:vvvvvvvvvvvvvvvvvvvvvvva";
+const VIEWER_A: &str = crate::farsight::lookup::tests::V;
 const VIEWER_B: &str = "did:plc:vvvvvvvvvvvvvvvvvvvvvvvb";
 const STRANGER: &str = "did:plc:ssssssssssssssssssssssss";
 const PRIVATE: &str = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/tools.kryphocron.feed.postPrivate/3kpriv";
@@ -75,7 +78,7 @@ async fn fake_upstream(calls: Arc<Calls>, thread: Option<Value>) -> String {
     serve_fake(app).await
 }
 
-fn ladder(pool: &PgPool, base: &str, lookup: Arc<StubLookup>) -> Ladder {
+fn ladder(hydrator: Hydrator, base: &str, lookup: Arc<StubLookup>) -> Ladder {
     let mut cfg = ConstellationConfig::default();
     for n in &mut cfg.networks {
         if n.name == "bluesky" || n.name == "community-a" {
@@ -91,11 +94,18 @@ fn ladder(pool: &PgPool, base: &str, lookup: Arc<StubLookup>) -> Ladder {
         .map(|n| AppViewClient::new(&n.name, base, AppViewAuth::Unauth, net.clone()))
         .collect();
     Ladder::new(
-        hydrator(pool, ScopeSets::default()),
+        hydrator,
         DidRouter::new(Arc::clone(&table), lookup as Arc<dyn DidLookup>),
         Cascade::new(table, clients, &crate::xrpc::pools::Shares::for_tests()),
         SlingshotClient::new(net, base),
     )
+}
+
+fn member(did: &str) -> Viewer {
+    Viewer {
+        did: Some(did.to_string()),
+        hydrate: true,
+    }
 }
 
 #[tokio::test]
@@ -105,14 +115,19 @@ async fn tier_hidden_is_emitted_without_any_lookup() {
     let calls = Arc::new(Calls::default());
     let base = fake_upstream(Arc::clone(&calls), None).await;
     let lookup = Arc::new(StubLookup::default());
-    let l = ladder(&pool, &base, Arc::clone(&lookup));
-    let req = Requester::test();
+    let l = ladder(hydrator(&pool, ScopeSets::default()), &base, Arc::clone(&lookup));
+    let (req, viewer) = (Requester::test(), member(VIEWER_A));
     for mode in [Mode::Full, Mode::BlockedStub] {
-        assert_eq!(l.resolve(&req, PRIVATE, mode).await.expect("no database call"), Resolved::Gap(Gap::TierHidden));
+        assert_eq!(l.resolve(&viewer, &req, PRIVATE, mode).await.expect("no database call"), Resolved::Gap(Gap::TierHidden));
     }
-    let nodes = thread::get_thread(&l, &req, PRIVATE, 6, 30).await.expect("no database call");
-    assert_eq!(nodes.len(), 1);
-    assert!(matches!(&nodes[0], crate::hydration::lens::LensNode::Gap { gap: Gap::TierHidden, .. }));
+    let request = thread::Request { viewer: &viewer, req: &req, anchor: PRIVATE, depth: 6, parent_height: 80 };
+    let got = thread::get_thread(&l, &ThreadLensConfig::default(), request).await.expect("no database call");
+    assert_eq!(got.nodes.len(), 1);
+    assert!(matches!(&got.nodes[0], LensNode::Gap { gap: Gap::TierHidden, .. }));
+    // Decided by the URI's form: no round ran, so bridging reads "off".
+    assert_eq!(got.bridging, Bridging::Off);
+    let resolved = thread::resolve(&l, &ThreadLensConfig::default(), &viewer, &req, &[PRIVATE.to_string()]).await.expect("no database call");
+    assert!(matches!(&resolved.nodes[0], LensNode::Gap { gap: Gap::TierHidden, .. }));
     assert_eq!(calls.appview.load(Ordering::SeqCst), 0, "no AppView call");
     assert_eq!(calls.slingshot.load(Ordering::SeqCst), 0, "no Slingshot call");
     assert_eq!(lookup.calls.load(Ordering::SeqCst), 0, "no DID resolution");
@@ -129,14 +144,16 @@ async fn serve(state: ThreadLensState) -> String {
     format!("http://{addr}")
 }
 
-fn state(pool: &PgPool, l: Ladder) -> ThreadLensState {
+fn state(h: Hydrator, l: Ladder) -> ThreadLensState {
     let fetcher = StubFetcher::default();
     fetcher.set_key(VIEWER_A, signing_key(3));
     fetcher.set_key(VIEWER_B, signing_key(4));
+    fetcher.set_key(STRANGER, signing_key(5));
+    fetcher.set_key(R2, signing_key(6));
     let (auth, _d) = verifier(fetcher, 10, 4);
     ThreadLensState {
         app: AppState {
-            hydrator: hydrator(pool, ScopeSets::default()),
+            hydrator: h,
             auth: Arc::new(auth),
             limits: RateLimits::new(),
             enroller: None,
@@ -144,6 +161,7 @@ fn state(pool: &PgPool, l: Ladder) -> ThreadLensState {
             did_document: Arc::new(json!({})),
         },
         ladder: l,
+        cfg: ThreadLensConfig::default(),
     }
 }
 
@@ -159,128 +177,122 @@ async fn call(base: &str, method: &str, caller: &str, key: u8, body: &Value) -> 
     (r.status().as_u16(), r.text().await.expect("body"))
 }
 
+/// `(uri, gap kind or None for a post)` of each node.
+fn summary(v: &Value, key: &str) -> Vec<(String, Option<String>)> {
+    v[key]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .map(|n| (n["uri"].as_str().unwrap_or_default().to_string(), n["gap"].as_str().map(str::to_string)))
+        .collect()
+}
+
+/// B-82, B-83: a block hides one author's posts and nothing around them;
+/// nothing by a blocked author is sent; with Farsight not vouching the
+/// response is the ordinary view; only a ready member may call.
 #[tokio::test]
-async fn responses_are_byte_identical_whatever_the_viewer_blocks() {
-    let Some(db) = fresh_db("threadlens_block_party").await else {
+async fn threads_are_viewer_relative_and_blocks_are_enforced() {
+    let Some(db) = fresh_db("threadlens_viewer_relative").await else {
         return;
     };
     let p = &db.pool;
     for (did, handle) in [(AUTHOR, "author.test"), (R1, "r1.test"), (R2, "r2.test"), (VIEWER_A, "a.test"), (VIEWER_B, "b.test")] {
         actor(p, did, handle, handle).await;
     }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now()), ('{VIEWER_B}', 'admin', now()), ('{R2}', 'admin', NULL)")).await;
     let anchor = post(p, AUTHOR, "3kanchor2222", "anchor", None, None).await;
     let reply1 = post(p, R1, "3kreply12222", "one", Some(&anchor), Some(&anchor)).await;
-    let _reply2 = post(p, R2, "3kreply22222", "two", Some(&anchor), Some(&anchor)).await;
-    // Viewer A blocks the author and R1; R2 blocks viewer A; viewer B has
-    // no blocks. The server must not care.
-    for (i, (author, subject)) in [(VIEWER_A, AUTHOR), (VIEWER_A, R1), (R2, VIEWER_A)].into_iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) \
-             VALUES ($1, $2, $3, '3kaaaaaaaaaa2', now())",
-        )
-        .bind(format!("at://{author}/app.bsky.graph.block/3kblock{i}"))
-        .bind(author)
-        .bind(subject)
-        .execute(p)
-        .await
-        .expect("block");
+    let reply2 = post(p, R2, "3kreply22222", "two", Some(&anchor), Some(&anchor)).await;
+    // Beneath the reply of an author viewer A blocks, a reply by someone
+    // A has no block with.
+    let beneath = post(p, AUTHOR, "3kbeneath222", "beneath", Some(&reply1), Some(&anchor)).await;
+    // Viewer A blocks R1; R2 blocks viewer A. Viewer B has no blocks.
+    for (i, (author, subject)) in [(VIEWER_A, R1), (R2, VIEWER_A)].into_iter().enumerate() {
+        sqlx::query("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, '3kaaaaaaaaaa2', now())")
+            .bind(format!("at://{author}/app.bsky.graph.block/3kblock{i}"))
+            .bind(author)
+            .bind(subject)
+            .execute(p)
+            .await
+            .expect("block");
     }
     exec(p, "INSERT INTO record_tombstones (uri, rev) VALUES ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kdeleted', '3kaaaaaaaaaa2')").await;
+    let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
+    let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
     let calls = Arc::new(Calls::default());
     let base = fake_upstream(Arc::clone(&calls), None).await;
-    let url = serve(state(p, ladder(p, &base, Arc::new(StubLookup::default())))).await;
+    let url = serve(state(h.clone(), ladder(h, &base, Arc::new(StubLookup::default())))).await;
 
+    // Farsight vouches: bridging is on. The ordinary view leaves out both
+    // blocked replies and what is beneath them. Thread Lens puts a gap in
+    // each one's place and keeps the reply beneath.
     let thread_input = json!({"anchor": anchor, "depth": 6});
-    let (status_a, body_a) = call(&url, GET_THREAD, VIEWER_A, 3, &thread_input).await;
-    let (status_b, body_b) = call(&url, GET_THREAD, VIEWER_B, 4, &thread_input).await;
-    assert_eq!((status_a, status_b), (200, 200), "{body_a}");
-    assert_eq!(body_a, body_b, "byte-identical across viewers");
-    let v: Value = serde_json::from_str(&body_a).expect("json");
-    let uris: Vec<&str> = v["nodes"].as_array().expect("nodes").iter().filter_map(|n| n["uri"].as_str()).collect();
-    assert_eq!(uris[0], anchor);
-    assert!(uris.contains(&reply1.as_str()), "a reply by someone the viewer blocks is still served");
-    for forbidden in ["blocked-by-you", "blocking-you", "\"blocking\"", "\"blockedBy\"", "\"following\""] {
-        assert!(!body_a.contains(forbidden), "{forbidden} in {body_a}");
+    let (status, body) = call(&url, GET_THREAD, VIEWER_A, 3, &thread_input).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        summary(&v, "nodes"),
+        [
+            (anchor.clone(), None),
+            (reply1.clone(), Some("blocked-by-you".to_string())),
+            (reply2.clone(), Some("blocking-you".to_string())),
+            (beneath.clone(), None),
+        ],
+        "{body}"
+    );
+    assert_eq!(v["bridging"], "full", "{body}");
+    // A gap carries nothing of its author but the URI.
+    assert_eq!(v["nodes"][1].as_object().map(|m| m.keys().filter(|k| !k.starts_with("more")).count()), Some(4));
+    for leaked in ["\"one\"", "\"two\"", "r1.test", "r2.test"] {
+        assert!(!body.contains(leaked), "{leaked} in {body}");
     }
-    assert!(body_a.contains("\"viewer\":{}"));
+    // The views are the caller's own.
+    assert_eq!(v["nodes"][0]["post"]["author"]["viewer"]["blockedBy"], json!(false));
 
+    // Viewer B has no block: every post, as posts.
+    let (status, body_b) = call(&url, GET_THREAD, VIEWER_B, 4, &thread_input).await;
+    assert_eq!(status, 200, "{body_b}");
+    let b: Value = serde_json::from_str(&body_b).expect("json");
+    assert!(summary(&b, "nodes").iter().all(|(_, gap)| gap.is_none()), "{body_b}");
+    assert_eq!(b["nodes"].as_array().map(Vec::len), Some(4));
+
+    // `resolve`: a post, a private URI, a blocked author, a deleted post,
+    // a post nobody has.
     let resolve_input = json!({"uris": [
         anchor,
         PRIVATE,
+        reply1,
         "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kdeleted",
         format!("at://{STRANGER}/app.bsky.feed.post/3kmissing")
     ]});
-    let (_, body_a) = call(&url, RESOLVE, VIEWER_A, 3, &resolve_input).await;
-    let (_, body_b) = call(&url, RESOLVE, VIEWER_B, 4, &resolve_input).await;
-    assert_eq!(body_a, body_b);
-    let v: Value = serde_json::from_str(&body_a).expect("json");
-    let gaps: Vec<Value> = v["items"].as_array().expect("items").iter().map(|i| i["gap"].clone()).collect();
-    assert_eq!(gaps, [Value::Null, json!("tier-hidden"), json!("deleted"), json!("not-found")]);
+    let (status, body) = call(&url, RESOLVE, VIEWER_A, 3, &resolve_input).await;
+    assert_eq!(status, 200, "{body}");
+    let r: Value = serde_json::from_str(&body).expect("json");
+    let gaps: Vec<Value> = r["items"].as_array().expect("items").iter().map(|i| i["gap"].clone()).collect();
+    assert_eq!(gaps, [Value::Null, json!("tier-hidden"), json!("blocked-by-you"), json!("deleted"), json!("not-found")], "{body}");
 
-    // Request-level failures are InvalidRequest; auth is required.
+    // Farsight answers without vouching: bridging is off and the response
+    // is the ordinary view, which for viewer A is the anchor alone.
+    *fake.level.lock().expect("level") = "partial";
+    let (_, body) = call(&url, GET_THREAD, VIEWER_A, 3, &thread_input).await;
+    let off: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!((summary(&off, "nodes"), &off["bridging"]), (vec![(anchor.clone(), None)], &json!("off")), "{body}");
+    // `resolve` then fetches nothing it cannot check: a known block is
+    // still a gap of its kind, everything else is "block-state-unknown".
+    let (_, body) = call(&url, RESOLVE, VIEWER_A, 3, &json!({"uris": [anchor, reply1]})).await;
+    let r: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!((&r["items"][0]["gap"], &r["items"][1]["gap"], &r["bridging"]), (&json!("block-state-unknown"), &json!("blocked-by-you"), &json!("off")), "{body}");
+
+    // Request-level failures; a member endpoint.
     let (status, body) = call(&url, RESOLVE, VIEWER_A, 3, &json!({"uris": []})).await;
-    assert_eq!(status, 400, "{body}");
-    assert!(body.contains("InvalidRequest"));
-    let (status, _) = call(&url, GET_THREAD, VIEWER_A, 3, &json!({"anchor": anchor, "depth": 11})).await;
+    assert!(status == 400 && body.contains("InvalidRequest"), "{body}");
+    let (status, _) = call(&url, GET_THREAD, VIEWER_A, 3, &json!({"anchor": anchor, "depth": 1001})).await;
     assert_eq!(status, 400);
+    let (status, body) = call(&url, GET_THREAD, STRANGER, 5, &thread_input).await;
+    assert!(status == 400 && body.contains("NotEnrolled"), "{body}");
+    let (status, body) = call(&url, GET_THREAD, R2, 6, &thread_input).await;
+    assert!(status == 400 && body.contains("NotReady"), "{body}");
     let r = reqwest::Client::new().post(format!("{url}/xrpc/{GET_THREAD}")).json(&thread_input).send().await.expect("request");
     assert_eq!(r.status().as_u16(), 401);
-    db.drop_db().await;
-}
-
-#[tokio::test]
-async fn upstream_structure_stubs_become_typed_gaps() {
-    let Some(db) = fresh_db("threadlens_structure").await else {
-        return;
-    };
-    let p = &db.pool;
-    let uri = |rkey: &str| format!("at://{STRANGER}/app.bsky.feed.post/{rkey}");
-    let view = |rkey: &str, parent: Option<&str>, labels: Value| {
-        let mut record = json!({"$type": "app.bsky.feed.post", "text": format!("text {rkey}"), "createdAt": "2026-09-26T00:00:00Z"});
-        if let Some(p) = parent {
-            record["reply"] = json!({"root": {"uri": uri("3kroot"), "cid": "c"}, "parent": {"uri": p, "cid": "c"}});
-        }
-        json!({"uri": uri(rkey), "cid": "bafy", "author": {"did": STRANGER, "handle": "s.test", "viewer": {"blockedBy": true, "muted": true}},
-               "record": record, "labels": labels, "viewer": {"like": "at://upstream-like"}, "indexedAt": "2026-09-26T00:00:00Z"})
-    };
-    let structure = json!({
-        "$type": "app.bsky.feed.defs#threadViewPost",
-        "post": view("3kanchor", Some(&uri("3kroot")), json!([])),
-        "parent": {"$type": "app.bsky.feed.defs#threadViewPost", "post": view("3kroot", None, json!([]))},
-        "replies": [
-            {"$type": "app.bsky.feed.defs#threadViewPost", "post": view("3kok", Some(&uri("3kanchor")), json!([]))},
-            {"$type": "app.bsky.feed.defs#threadViewPost", "post": view("3kwarned", Some(&uri("3kanchor")), json!([{"val": "!warn", "src": "did:web:x", "uri": uri("3kwarned"), "cts": "c"}]))},
-            {"$type": "app.bsky.feed.defs#blockedPost", "uri": uri("3kblocked"), "blocked": true, "author": {"did": R1}},
-            {"$type": "app.bsky.feed.defs#notFoundPost", "uri": uri("3kgone"), "notFound": true}
-        ]
-    });
-    let calls = Arc::new(Calls::default());
-    let base = fake_upstream(Arc::clone(&calls), Some(structure)).await;
-    let l = ladder(p, &base, Arc::new(StubLookup::default()));
-    let nodes = thread::get_thread(&l, &Requester::test(), &uri("3kanchor"), 6, 30).await.expect("thread");
-    let summary: Vec<(String, Option<&'static str>)> = nodes
-        .iter()
-        .map(|n| match n {
-            crate::hydration::lens::LensNode::Post { uri, .. } => (uri.clone(), None),
-            crate::hydration::lens::LensNode::Gap { uri, gap, .. } => (uri.clone(), Some(gap.label())),
-        })
-        .collect();
-    assert_eq!(
-        summary,
-        [
-            (uri("3kroot"), None),
-            (uri("3kanchor"), None),
-            (uri("3kok"), None),
-            (uri("3kwarned"), Some("content-stripped")),
-            (uri("3kblocked"), Some("blocked")),
-            (uri("3kgone"), Some("not-found")),
-        ]
-    );
-    let out = crate::hydration::lens::lens_thread(&uri("3kanchor"), &nodes);
-    let text = serde_json::to_string(out.inner()).expect("json");
-    assert!(!text.contains("blockedBy") && !text.contains("upstream-like"), "{text}");
-    // The blocked stub skipped the cascade (steps 1, 2, 4): Slingshot was
-    // asked for it and for the not-found stub.
-    assert_eq!(calls.slingshot.load(Ordering::SeqCst), 2);
     db.drop_db().await;
 }

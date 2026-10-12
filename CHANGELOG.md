@@ -1121,6 +1121,24 @@ commit.
 
 ### Changed
 
+- **Item 12a: Thread Lens is viewer-relative, and enforces the viewer's
+  blocks on the server (#674).** `threadLens.getThread` and `.resolve`
+  are now for members whose account is ready, and answer for the caller.
+  A block between the caller and an author hides that author's posts,
+  as `blocked-by-you` or `blocking-you` gaps, and nothing around them:
+  the replies beneath a blocked author's post stay, and a block between
+  two other people changes nothing. Nothing by a blocked author is
+  sent, in a post or in an embed. The response always holds the
+  ordinary thread view, never cut; it adds to it only while Farsight
+  vouches for the caller's blocks, and says so in `bridging` (`off`,
+  `limited`, `full`). A post whose author cannot be checked is not
+  fetched (`block-state-unknown`). `depth` and `parentHeight` go to
+  1000; one response adds at most `threadlens.page_nodes` nodes and
+  marks where it stopped (`moreParents`, `moreReplies`, `truncated`).
+  Post views carry the caller's viewer state. The lexicons are edited in
+  place. Not yet built: paging cursors (`repliesCursor` is refused, so a
+  node with more replies than one response reads cannot be read past
+  that point) (design-v3 §5.15; proposed locked decision 38).
 - **Item 12: Farsight call outcomes are named (#673).**
   `farsight_calls_total{outcome}` now says `rate_limited` (this key's
   allowance on Farsight is spent), `overloaded` (Farsight is up and

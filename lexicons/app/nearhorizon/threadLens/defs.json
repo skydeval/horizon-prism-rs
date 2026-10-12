@@ -2,28 +2,56 @@
   "lexicon": 1,
   "id": "app.nearhorizon.threadLens.defs",
   "defs": {
+    "moreReplies": {
+      "type": "object",
+      "description": "The node's replies were not read to their end. Call getThread again with this node as the anchor, parentHeight 0, depth at least 1, and repliesCursor set to the cursor when there is one. A marker says that work was not done, never that there is a block; it can turn out empty.",
+      "properties": {
+        "cursor": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Opaque position to resume from, valid only for this node. Absent when none of the node's replies was read."
+        }
+      }
+    },
     "postNode": {
       "type": "object",
-      "description": "A resolved post in a Thread Lens response. Hydrated anonymously: viewer state is always empty.",
+      "description": "A post in a Thread Lens response, hydrated for the caller: viewer state is the caller's own.",
       "required": ["uri", "post"],
       "properties": {
         "uri": { "type": "string", "format": "at-uri" },
         "parentUri": { "type": "string", "format": "at-uri" },
         "rootUri": { "type": "string", "format": "at-uri" },
-        "post": { "type": "ref", "ref": "app.bsky.feed.defs#postView" }
+        "post": { "type": "ref", "ref": "app.bsky.feed.defs#postView" },
+        "moreParents": {
+          "type": "boolean",
+          "description": "Present and true when this node has a parent the response does not include. Call getThread again with this node as the anchor, depth 0 and parentHeight at least 1."
+        },
+        "moreReplies": { "type": "ref", "ref": "#moreReplies" }
       }
     },
     "gapNode": {
       "type": "object",
-      "description": "A post that could not be shown, with a typed reason. Every per-URI failure is expressed as a gap rather than an error.",
+      "description": "A post that is not shown, with a typed reason. Every per-URI failure is a gap rather than an error. A gap never carries a handle, a name, text, counts or a time: the URI is all there is.",
       "required": ["uri", "gap"],
       "properties": {
         "uri": { "type": "string", "format": "at-uri" },
         "parentUri": { "type": "string", "format": "at-uri" },
+        "moreParents": {
+          "type": "boolean",
+          "description": "As on postNode. Only on a 'blocked-by-you' or 'blocking-you' gap."
+        },
+        "moreReplies": {
+          "type": "ref",
+          "ref": "#moreReplies",
+          "description": "As on postNode. Only on a 'blocked-by-you' or 'blocking-you' gap."
+        },
         "gap": {
           "type": "string",
-          "description": "Why the post is not shown. 'blocked' reflects a block between other parties, never the viewer; 'tier-hidden' is emitted for every private-tier URI regardless of existence or viewer.",
+          "description": "Why the post is not shown. 'blocked-by-you': the caller blocks the author. 'blocking-you': the author blocks the caller. 'block-state-unknown': the server did not fetch the post because it could not check the caller's blocks for its author. 'blocked': a block between other parties, reported by another server, that was not looked past. 'tier-hidden': every private-tier URI, whether or not it exists. An open set: treat an unknown value as a gap with no content.",
           "knownValues": [
+            "blocked-by-you",
+            "blocking-you",
+            "block-state-unknown",
             "blocked",
             "deleted",
             "not-found",

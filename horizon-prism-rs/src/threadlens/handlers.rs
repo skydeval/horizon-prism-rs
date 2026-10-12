@@ -1,14 +1,15 @@
-//! `app.nearhorizon.threadLens.getThread` and `.resolve` (design-v2 §10.1).
+//! `app.nearhorizon.threadLens.getThread` and `.resolve` (design-v3 §5.15).
 //!
 //! - Both are procedures (POST, JSON input).
-//! - **Auth** is required (a service JWT, §6.8). The authenticated DID is
-//!   used for the auth gate and the rate-limit key (2/s, burst 10) and is
-//!   then dropped: [`gate`] returns only the request's charge handle (a
-//!   rate-limit key), which no later step hydrates, filters or classifies
-//!   by.
+//! - **A member endpoint** (§5.15.2): the caller must be a ready member,
+//!   because only a ready member's own block state is complete here. A
+//!   member that is not ready and a non-member get the refusals every
+//!   member-only endpoint gives (`NotReady`, `NotEnrolled`). Responses are
+//!   for the caller: [`gate`] returns who is asking.
 //! - **Non-enumeration:** every per-URI failure is a typed gap. Request-level
 //!   failures (malformed body, bad parameters, too many URIs) are
-//!   `400 InvalidRequest` and depend only on the input.
+//!   `400 InvalidRequest` and depend only on the input and on the caller's
+//!   membership and readiness.
 
 use std::net::SocketAddr;
 
@@ -17,18 +18,18 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::ladder::{Ladder, Mode, Resolved};
-use super::thread::{LADDER_CONCURRENCY, get_thread as assemble};
+use super::ladder::Ladder;
+use super::thread::{Request, get_thread as assemble, resolve as resolve_each};
+use crate::config::ThreadLensConfig;
 use crate::db::locks::uri_author;
-use crate::hydration::PublicEmit;
-use crate::hydration::lens::{LensNode, lens_items, lens_thread};
+use crate::hydration::lens::{lens_items, lens_thread};
+use crate::hydration::{PublicEmit, Viewer};
 use crate::xrpc::AppState;
-use crate::xrpc::errors::XrpcError;
 use crate::xrpc::auth::{authenticate, request_handle, request_ip};
+use crate::xrpc::errors::XrpcError;
 use crate::xrpc::pools::Requester;
 use crate::xrpc::rate_limit::Family;
 
@@ -36,12 +37,17 @@ pub const GET_THREAD: &str = "app.nearhorizon.threadLens.getThread";
 pub const RESOLVE: &str = "app.nearhorizon.threadLens.resolve";
 /// `resolve` accepts 1–25 URIs.
 pub const MAX_URIS: usize = 25;
+/// `depth` and `parentHeight` take the range `getPostThread` takes.
+pub const MAX_DEPTH: u32 = 1000;
+pub const DEFAULT_DEPTH: u32 = 6;
+pub const DEFAULT_PARENT_HEIGHT: u32 = 80;
 
 /// Handler state.
 #[derive(Clone)]
 pub struct ThreadLensState {
     pub app: AppState,
     pub ladder: Ladder,
+    pub cfg: ThreadLensConfig,
 }
 
 /// The Thread Lens routes, merged into the app by `serve`.
@@ -52,16 +58,28 @@ pub fn router(state: ThreadLensState) -> Router {
         .with_state(state)
 }
 
-/// Authenticate and rate-limit. Returns only the request's charge handle:
-/// the key its upstream calls are rate-limited under (the client address,
-/// or a ready member's DID when the backstop matched one). Nothing reads it
-/// to hydrate, filter or classify (§10.1, §10.3).
-async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method: &str) -> Result<Requester, XrpcError> {
+/// Authenticate, rate-limit, and require a ready member. Returns the
+/// request's charge handle (its upstream calls are charged to the member)
+/// and the viewer the response is built for.
+async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method: &str) -> Result<(Requester, Viewer), XrpcError> {
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
     let caller = authenticate(&s.app, authorization, method).await?;
     let ip = request_ip(&s.app, headers, peer);
     s.app.limits.charge(method, Family::ThreadLens, Some(&caller.did), ip)?;
-    Ok(request_handle(None, ip))
+    let ready: Option<bool> = sqlx::query_scalar("SELECT ready_at IS NOT NULL FROM members WHERE did = $1")
+        .bind(&caller.did)
+        .fetch_optional(s.app.hydrator.pool())
+        .await?;
+    match ready {
+        Some(true) => {}
+        Some(false) => return Err(XrpcError::not_ready()),
+        None => return Err(XrpcError::not_enrolled()),
+    }
+    let viewer = Viewer {
+        did: Some(caller.did.clone()),
+        hydrate: true,
+    };
+    Ok((request_handle(Some(&caller.did), ip), viewer))
 }
 
 fn at_uri(u: &str) -> bool {
@@ -78,6 +96,7 @@ struct GetThreadInput {
     anchor: String,
     depth: Option<u32>,
     parent_height: Option<u32>,
+    replies_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -91,18 +110,30 @@ pub async fn get_thread(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Result<Json<PublicEmit<Value>>, XrpcError> {
-    let req = gate(&s, &headers, peer, GET_THREAD).await?;
+    let (req, viewer) = gate(&s, &headers, peer, GET_THREAD).await?;
     let input: GetThreadInput = body(&bytes)?;
     if !at_uri(&input.anchor) {
         return Err(XrpcError::invalid("Error: anchor must be an at-uri"));
     }
-    let depth = input.depth.unwrap_or(6);
-    let parent_height = input.parent_height.unwrap_or(30);
-    if depth > 10 || parent_height > 30 {
-        return Err(XrpcError::invalid("Error: depth must be 0-10 and parentHeight 0-30"));
+    let depth = input.depth.unwrap_or(DEFAULT_DEPTH);
+    let parent_height = input.parent_height.unwrap_or(DEFAULT_PARENT_HEIGHT);
+    if depth > MAX_DEPTH || parent_height > MAX_DEPTH {
+        return Err(XrpcError::invalid("Error: depth and parentHeight must be 0-1000"));
     }
-    let nodes = assemble(&s.ladder, &req, &input.anchor, depth, parent_height).await?;
-    Ok(Json(lens_thread(&input.anchor, &nodes)))
+    // No cursor is issued yet, so none can be valid: the client restarts
+    // that node without one.
+    if input.replies_cursor.is_some() {
+        return Err(XrpcError::invalid("Error: repliesCursor is not valid for this anchor"));
+    }
+    let request = Request {
+        viewer: &viewer,
+        req: &req,
+        anchor: &input.anchor,
+        depth,
+        parent_height,
+    };
+    let thread = assemble(&s.ladder, &s.cfg, request).await?;
+    Ok(Json(lens_thread(&input.anchor, &thread.nodes, thread.bridging)))
 }
 
 pub async fn resolve(
@@ -111,7 +142,7 @@ pub async fn resolve(
     headers: HeaderMap,
     bytes: Bytes,
 ) -> Result<Json<PublicEmit<Value>>, XrpcError> {
-    let req = gate(&s, &headers, peer, RESOLVE).await?;
+    let (req, viewer) = gate(&s, &headers, peer, RESOLVE).await?;
     let input: ResolveInput = body(&bytes)?;
     if input.uris.is_empty() || input.uris.len() > MAX_URIS {
         return Err(XrpcError::invalid("Error: uris must have between 1 and 25 items"));
@@ -119,19 +150,6 @@ pub async fn resolve(
     if !input.uris.iter().all(|u| at_uri(u)) {
         return Err(XrpcError::invalid("Error: uris must be at-uris"));
     }
-    let ladder = &s.ladder;
-    let req = &req;
-    let resolved: Vec<Result<LensNode, sqlx::Error>> = futures::stream::iter(input.uris)
-        .map(|uri| async move {
-            let r = ladder.resolve(req, &uri, Mode::Full).await?;
-            Ok(match r {
-                Resolved::Post(post) => LensNode::post(post),
-                Resolved::Gap(gap) => LensNode::Gap { uri, parent_uri: None, gap },
-            })
-        })
-        .buffered(LADDER_CONCURRENCY)
-        .collect()
-        .await;
-    let items = resolved.into_iter().collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(lens_items(&items)))
+    let resolved = resolve_each(&s.ladder, &s.cfg, &viewer, &req, &input.uris).await?;
+    Ok(Json(lens_items(&resolved.nodes, resolved.bridging)))
 }

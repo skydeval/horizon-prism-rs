@@ -5,23 +5,25 @@
 //!    upstream (§10.5).
 //! 2. **Local.** The §7.10 gate (a hidden or `!hide` post is not shown and
 //!    no source is consulted), `record_tombstones` (`deleted`), then local
-//!    `posts`, hydrated with no viewer.
+//!    `posts`, hydrated for the viewer.
 //! 3. **Home AppView, then the cascade**, via unauthenticated
 //!    `app.bsky.feed.getPosts` (skipped for the `community` network and for
 //!    `#blockedPost` stubs).
 //! 4. **Slingshot** `getRecord`.
 //! 5. **Classify** (§10.4 table, [`super::gaps::classify`]).
 //!
-//! Upstream and Slingshot views are normalized with no viewer; a view that
-//! normalization flags as content-stripped becomes that gap. No step reads
-//! the caller's identity: the ladder is not given one.
+//! Upstream and Slingshot views are normalized for the viewer (design-v3
+//! §5.15.17); a view that normalization flags as content-stripped becomes
+//! that gap. The sources themselves are still asked with no user identity:
+//! none of them learns who is asking. Thread Lens calls the ladder only
+//! for an author whose verdict is `Clear` (§5.15.10).
 
 use serde_json::Value;
 
 use super::gaps::{CascadeOutcome, Gap, SlingshotOutcome, classify};
 use crate::constellation::{Call, Cascade, Fetched, Router};
 use crate::db::locks::uri_author;
-use crate::hydration::Hydrator;
+use crate::hydration::{Hydrator, Viewer};
 use crate::hydration::normalize::is_private_uri;
 use crate::hydration::upstream::post_from_record;
 use crate::microcosm::{SlingshotClient, SlingshotError};
@@ -39,7 +41,7 @@ pub enum Mode {
 /// A resolved URI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolved {
-    /// A `postView` with viewer state `{}`.
+    /// A `postView`, with the viewer's state.
     Post(Value),
     Gap(Gap),
 }
@@ -81,8 +83,8 @@ impl Ladder {
 
     /// Normalize an upstream or Slingshot view; content-stripped views
     /// become that gap.
-    async fn upstream_view(&self, uri: &str, view: Value) -> Result<Resolved, sqlx::Error> {
-        let (view, report) = self.hydrator.lens_normalize(view).await?;
+    async fn upstream_view(&self, viewer: &Viewer, uri: &str, view: Value) -> Result<Resolved, sqlx::Error> {
+        let (view, report) = self.hydrator.lens_normalize(viewer, view).await?;
         Ok(if report.content_stripped.contains(uri) {
             Resolved::Gap(Gap::ContentStripped)
         } else {
@@ -95,7 +97,7 @@ impl Ladder {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn resolve(&self, req: &Requester, uri: &str, mode: Mode) -> Result<Resolved, sqlx::Error> {
+    pub async fn resolve(&self, viewer: &Viewer, req: &Requester, uri: &str, mode: Mode) -> Result<Resolved, sqlx::Error> {
         // 1. Private tier: nothing else runs.
         if is_private_uri(uri) {
             return Ok(Resolved::Gap(Gap::TierHidden));
@@ -110,7 +112,7 @@ impl Ladder {
         if self.hydrator.tombstoned(uri).await? {
             return Ok(Resolved::Gap(Gap::Deleted));
         }
-        if let Some(view) = self.hydrator.lens_local_posts(req, &[uri.to_string()]).await?.remove(uri) {
+        if let Some(view) = self.hydrator.lens_local_posts(viewer, req, &[uri.to_string()]).await?.remove(uri) {
             return Ok(Resolved::Post(view));
         }
         // 3. Home AppView and the cascade.
@@ -127,7 +129,7 @@ impl Ladder {
                             .and_then(|posts| posts.iter().find(|p| p.get("uri").and_then(Value::as_str) == Some(uri)))
                             .cloned();
                         if let Some(view) = found {
-                            return self.upstream_view(uri, view).await;
+                            return self.upstream_view(viewer, uri, view).await;
                         }
                         // `getPosts` omits what it cannot show: a miss.
                         cascade = CascadeOutcome::Answered;
@@ -148,7 +150,7 @@ impl Ladder {
                     .and_then(|s| s.handle)
                     .unwrap_or_else(|| crate::hydration::INVALID_HANDLE.to_string());
                 let view = post_from_record(uri, record.cid.as_deref(), &handle, &record.value);
-                return self.upstream_view(uri, view).await;
+                return self.upstream_view(viewer, uri, view).await;
             }
             Err(SlingshotError::NotFound) => SlingshotOutcome::NotFound,
             Err(SlingshotError::Transient(_) | SlingshotError::Invalid(_) | SlingshotError::NoBudget) => {

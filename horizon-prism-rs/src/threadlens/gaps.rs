@@ -1,16 +1,22 @@
-//! The server gap taxonomy (design-v2 §10.2, §10.4).
+//! The server gap taxonomy (design-v3 §5.15.15; design-v2 §10.4).
 //!
-//! The block-party rule (§10.3) is enforced by construction: there is no
-//! `blocked-by-you` or `blocking-you` variant. Those are client-side
-//! classifications made from the client's own block graph; the server never
-//! knows the viewer's blocks. `Blocked` means a block between **other**
-//! parties, visible in an upstream structure fetched with no viewer.
+//! Thread Lens is viewer-relative (proposed locked decision 38): the
+//! server enforces the viewer's blocks, so a gap can say which way a block
+//! runs. A gap never carries a handle, a name, text, counts or a time:
+//! the URI, which names the author's DID, is all a client gets.
 
 /// Why a post is not shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Gap {
-    /// Produced only by `getThread`: an upstream `#blockedPost` that local
-    /// data and Slingshot did not resolve.
+    /// The viewer blocks the author, directly or through a list.
+    BlockedByYou,
+    /// The author blocks the viewer, directly or through a list.
+    BlockingYou,
+    /// The server did not fetch the post because it could not check the
+    /// viewer's blocks for its author.
+    BlockStateUnknown,
+    /// A block between other parties, reported by an upstream, that was
+    /// not bridged.
     Blocked,
     /// A local tombstone, or Slingshot `RecordNotFound` for an author whose
     /// account is locally known to be `active`.
@@ -28,7 +34,10 @@ pub enum Gap {
 
 impl Gap {
     /// Every variant (the complete server taxonomy).
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 9] = [
+        Self::BlockedByYou,
+        Self::BlockingYou,
+        Self::BlockStateUnknown,
         Self::Blocked,
         Self::Deleted,
         Self::NotFound,
@@ -37,10 +46,20 @@ impl Gap {
         Self::TierHidden,
     ];
 
+    /// A block between the viewer and the author. The walks go through
+    /// such a gap: the thread around a blocked author's post stays.
+    #[must_use]
+    pub fn known_block(self) -> bool {
+        matches!(self, Self::BlockedByYou | Self::BlockingYou)
+    }
+
     /// The lexicon value.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
+            Self::BlockedByYou => "blocked-by-you",
+            Self::BlockingYou => "blocking-you",
+            Self::BlockStateUnknown => "block-state-unknown",
             Self::Blocked => "blocked",
             Self::Deleted => "deleted",
             Self::NotFound => "not-found",
@@ -89,15 +108,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn taxonomy_excludes_viewer_relative_blocks() {
+    fn the_taxonomy() {
         let labels: Vec<&str> = Gap::ALL.iter().map(|g| g.label()).collect();
         assert_eq!(
             labels,
-            ["blocked", "deleted", "not-found", "upstream-unavailable", "content-stripped", "tier-hidden"]
+            [
+                "blocked-by-you",
+                "blocking-you",
+                "block-state-unknown",
+                "blocked",
+                "deleted",
+                "not-found",
+                "upstream-unavailable",
+                "content-stripped",
+                "tier-hidden"
+            ]
         );
-        for forbidden in ["blocked-by-you", "blocking-you"] {
-            assert!(!labels.contains(&forbidden));
-        }
+        assert!(Gap::BlockedByYou.known_block() && Gap::BlockingYou.known_block());
+        assert!(!Gap::Blocked.known_block() && !Gap::BlockStateUnknown.known_block());
     }
 
     #[test]

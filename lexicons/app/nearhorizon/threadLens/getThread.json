@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Assemble a thread around an anchor post, expressing every unavailable post as a typed gap. Requires auth; the caller's identity is used only for the auth gate and rate limiting, never for hydration or filtering. At most 200 nodes.",
+      "description": "A thread around an anchor post, for the caller. A block between the caller and an author hides that author's posts, as gaps, and nothing around them; a block between two other people changes nothing. Nothing by an author the caller has a block with is returned. The response always holds what getPostThread would return; it adds more only while the server can check the caller's blocks (see 'bridging'). Requires auth as a member whose account is ready. Merge responses by URI: a continuation can return a node the client already has.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -21,14 +21,19 @@
               "description": "How many levels of replies to include.",
               "default": 6,
               "minimum": 0,
-              "maximum": 10
+              "maximum": 1000
             },
             "parentHeight": {
               "type": "integer",
               "description": "How many levels of parent posts to include.",
-              "default": 30,
+              "default": 80,
               "minimum": 0,
-              "maximum": 30
+              "maximum": 1000
+            },
+            "repliesCursor": {
+              "type": "string",
+              "maxLength": 1024,
+              "description": "A cursor from a moreReplies marker on this same anchor."
             }
           }
         }
@@ -37,11 +42,12 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["anchor", "nodes"],
+          "required": ["anchor", "nodes", "truncated", "bridging"],
           "properties": {
             "anchor": { "type": "string", "format": "at-uri" },
             "nodes": {
               "type": "array",
+              "description": "The parent chain, root-most first; the anchor; then replies, level by level.",
               "items": {
                 "type": "union",
                 "refs": [
@@ -49,12 +55,23 @@
                   "app.nearhorizon.threadLens.defs#gapNode"
                 ]
               }
+            },
+            "truncated": {
+              "type": "boolean",
+              "description": "True when some node carries moreParents or moreReplies."
+            },
+            "bridging": {
+              "type": "string",
+              "description": "'off': the server could not check the caller's blocks, and the response is what getPostThread would return. 'limited': it could, but at least one post was held back because its author could not be checked. 'full': nothing was held back for that reason. Tells the reader that a thread may be incomplete for want of a check, as opposed to a real block.",
+              "knownValues": ["off", "limited", "full"]
             }
           }
         }
       },
       "errors": [
-        { "name": "InvalidRequest", "description": "Malformed request body." }
+        { "name": "InvalidRequest", "description": "Malformed request body, a parameter out of range, or a repliesCursor that is not valid for this anchor." },
+        { "name": "NotEnrolled", "description": "The caller is not a member." },
+        { "name": "NotReady", "description": "The caller's account is not ready yet." }
       ]
     }
   }

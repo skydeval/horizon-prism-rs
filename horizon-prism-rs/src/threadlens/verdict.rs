@@ -25,7 +25,7 @@ use sqlx::PgPool;
 use crate::config::ThreadLensConfig;
 use crate::farsight::lookup::{PairAnswers, PairBudget};
 use crate::farsight::{Lookup, PairAnswer};
-use crate::hydration::APPLIES;
+use crate::hydration::{APPLIES, KnownBlocks};
 
 /// What the server knows about blocks between the viewer and one author.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -122,6 +122,35 @@ impl Judge {
         self.judged
             .contains(did)
             .then(|| decide(false, self.out_local.contains(did), self.in_local.contains(did), self.pairs.get(did), self.bridging))
+    }
+
+    /// Which way a block with `did` runs, as `(the author blocks the
+    /// viewer, the viewer blocks the author)`: from the local rows and the
+    /// pair answer's fields, not from which rule spoke first.
+    #[must_use]
+    pub fn directions(&self, did: &str) -> (bool, bool) {
+        let pair = self.pairs.get(did);
+        (
+            self.in_local.contains(did) || pair.is_some_and(|p| p.inbound.is_block()),
+            self.out_local.contains(did) || pair.is_some_and(|p| p.outbound.is_block()),
+        )
+    }
+
+    /// Every block the request knows so far, for the views it builds
+    /// (§5.15.12).
+    #[must_use]
+    pub fn known_blocks(&self) -> KnownBlocks {
+        let mut known = KnownBlocks::default();
+        for did in &self.judged {
+            let (inbound, outbound) = self.directions(did);
+            if inbound {
+                known.of_viewer.insert(did.clone());
+            }
+            if outbound {
+                known.by_viewer.insert(did.clone());
+            }
+        }
+        known
     }
 
     /// Rule 2 for `authors`: the viewer's direct blocks, its list-block

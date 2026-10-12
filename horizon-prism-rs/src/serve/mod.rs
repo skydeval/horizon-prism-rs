@@ -557,6 +557,7 @@ pub async fn run() -> Result<(), StartupError> {
     let thread_lens = ThreadLensState {
         app: app.clone(),
         ladder: Ladder::new(app.hydrator.clone(), did_router.clone(), cascade, slingshot),
+        cfg: cfg.file.threadlens.clone(),
     };
     let index = crate::xrpc::handlers::index::IndexState {
         app: app.clone(),

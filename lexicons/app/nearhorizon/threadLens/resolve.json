@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Resolve a batch of post URIs, expressing every unavailable post as a typed gap. Requires auth; the caller's identity is used only for the auth gate and rate limiting, never for hydration or filtering. Never produces the 'blocked' gap.",
+      "description": "Resolve a batch of post URIs for the caller, one item per URI. A post is returned only when the server can check that its author and the caller have no block; an author the caller has a block with gives a gap that says which way, and one the server cannot check gives 'block-state-unknown'. Requires auth as a member whose account is ready. Items carry no continuation markers.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -24,7 +24,7 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["items"],
+          "required": ["items", "bridging"],
           "properties": {
             "items": {
               "type": "array",
@@ -36,12 +36,19 @@
                   "app.nearhorizon.threadLens.defs#gapNode"
                 ]
               }
+            },
+            "bridging": {
+              "type": "string",
+              "description": "As in getThread.",
+              "knownValues": ["off", "limited", "full"]
             }
           }
         }
       },
       "errors": [
-        { "name": "InvalidRequest", "description": "Malformed request body, or too many URIs." }
+        { "name": "InvalidRequest", "description": "Malformed request body, or too many URIs." },
+        { "name": "NotEnrolled", "description": "The caller is not a member." },
+        { "name": "NotReady", "description": "The caller's account is not ready yet." }
       ]
     }
   }
