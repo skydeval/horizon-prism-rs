@@ -201,11 +201,25 @@ impl Hydrator {
         else {
             return Ok(None);
         };
-        // The lists its rules name, as `listViewBasic`, under the
-        // locally-servable rule.
+        let view = self.threadgate_view(viewer, req, &uri, &cid, record, allow.as_ref()).await?;
+        let me = viewer.did.as_deref();
+        let hidden = hidden.into_iter().filter(|reply| me.is_none() || uri_author(reply) != me).collect();
+        Ok(Some(RootGate { view, hidden, allow }))
+    }
+
+    /// A `threadgateView`: the gate's record and the lists its rules name,
+    /// as `listViewBasic`, under the locally-servable rule.
+    pub(super) async fn threadgate_view(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        uri: &str,
+        cid: &str,
+        record: Value,
+        allow: Option<&Value>,
+    ) -> Result<Value, sqlx::Error> {
         let mut lists = Vec::new();
         let named = allow
-            .as_ref()
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
@@ -217,10 +231,7 @@ impl Hydrator {
                 lists.push(self.list_basic(viewer, &row, None, count).await?);
             }
         }
-        let view = json!({"uri": uri, "cid": cid, "record": record, "lists": lists});
-        let me = viewer.did.as_deref();
-        let hidden = hidden.into_iter().filter(|reply| me.is_none() || uri_author(reply) != me).collect();
-        Ok(Some(RootGate { view, hidden, allow }))
+        Ok(json!({"uri": uri, "cid": cid, "record": record, "lists": lists}))
     }
 
     /// `viewer.knownLikers` for a thread's anchor (design-v3 §8.2): the

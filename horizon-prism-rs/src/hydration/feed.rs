@@ -93,6 +93,8 @@ pub struct PostContext {
     pub labels: HashMap<String, Vec<Value>>,
     pub counts: HashMap<String, Counts>,
     pub gates: HashMap<String, Gate>,
+    /// By post: its own valid threadgate, as a `threadgateView`.
+    pub threadgates: HashMap<String, Value>,
     /// By quoted post: the quoting posts its author detached (its valid
     /// postgate's `detachedEmbeddingUris`).
     pub detached: HashMap<String, HashSet<String>>,
@@ -132,6 +134,9 @@ impl PostContext {
         v.insert("indexedAt".into(), json!(ts(row.indexed_at)));
         v.insert("viewer".into(), self.viewers.get(uri).cloned().unwrap_or_else(|| json!({})));
         v.insert("labels".into(), Value::Array(self.labels.get(uri).cloned().unwrap_or_default()));
+        if let Some(gate) = self.threadgates.get(uri) {
+            v.insert("threadgate".into(), gate.clone());
+        }
         Some(Value::Object(v))
     }
 
@@ -374,6 +379,20 @@ impl Hydrator {
         .bind(&all_uris)
         .fetch_all(self.pool())
         .await?;
+        // A post's own valid threadgate, as its view (design-v3 §8.2).
+        let gate_rows: Vec<(String, String, String, Value, Option<Value>)> = sqlx::query_as(
+            "SELECT post_uri, uri, cid, record, allow FROM threadgates WHERE post_uri = ANY($1) \
+               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
+        )
+        .bind(&all_uris)
+        .fetch_all(self.pool())
+        .await?;
+        let anonymous = Viewer::anonymous();
+        let mut threadgates = HashMap::new();
+        for (post, uri, cid, record, allow) in gate_rows {
+            let view = self.threadgate_view(viewer.unwrap_or(&anonymous), req, &uri, &cid, record, allow.as_ref()).await?;
+            threadgates.insert(post, view);
+        }
         Ok(PostContext {
             posts,
             profiles,
@@ -381,6 +400,7 @@ impl Hydrator {
             labels,
             counts,
             gates,
+            threadgates,
             detached: detached.into_iter().map(|(post, quotes)| (post, quotes.into_iter().collect())).collect(),
         })
     }

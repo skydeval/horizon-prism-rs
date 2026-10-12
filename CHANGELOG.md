@@ -12,6 +12,9 @@ commit.
 
 ### Added
 
+- **Item 13: `threadgate` on post views (#675).** A post with a valid
+  threadgate of its own carries it as `threadgate` wherever the post view
+  appears, with the lists its rules name (design-v3 §8.2).
 - **Item 13: detached quotes (#675).** When the author of a quoted post
   has detached a quote (the post's valid postgate lists the quoting post in
   `detachedEmbeddingUris`), the quote's embedded record renders as

@@ -575,6 +575,9 @@ mod tests {
         assert_eq!(shape(v.inner()["thread"].as_array().expect("thread")), pairs(&[(root.as_str(), -1), (second.as_str(), 0)]));
         assert_eq!(v.inner()["hasOtherReplies"], true);
         assert_eq!((&v.inner()["threadgate"]["uri"], &v.inner()["threadgate"]["lists"]), (&json!(gate), &json!([])));
+        // The root's own post view carries its gate; a reply's does not.
+        assert_eq!(v.inner()["thread"][0]["value"]["post"]["threadgate"]["uri"], json!(gate));
+        assert!(v.inner()["thread"][1]["value"]["post"].get("threadgate").is_none());
         let o = h.get_post_thread_other_v2(&anon, &req, &second).await.expect("db").expect("view");
         let hidden_item = &o.inner()["thread"][0]["value"];
         assert_eq!((&hidden_item["hiddenByThreadgate"], &hidden_item["mutedByViewer"]), (&json!(true), &json!(false)));
