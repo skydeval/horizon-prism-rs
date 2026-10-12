@@ -12,6 +12,10 @@ commit.
 
 ### Added
 
+- **Item 12: purposes survive a failed item listing (#673).** When a
+  list sync reads all of an owner's list records and then fails while
+  reading the list items, what the list records said about each list's
+  purpose is still written before the run is retried.
 - **Item 12: a list sync's batches retry after a deadlock (#673).** A
   batch that loses a deadlock or a serialization conflict, for instance
   to a firehose write by the same owner, is run again in place, up to

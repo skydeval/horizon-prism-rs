@@ -94,6 +94,10 @@ impl CutReason {
 pub enum FetchError {
     /// A call failed: the run fails and is retried.
     Failed(String),
+    /// A call of the item listing failed after the list records were
+    /// listed whole. The run fails and is retried, but what the list
+    /// records said about each list's purpose is still written (step 3a).
+    ItemsFailed { error: String, listing: Box<Listing> },
     /// The job was superseded between two pages.
     Superseded,
 }
@@ -207,7 +211,11 @@ pub async fn fetch(source: &dyn OwnerRecords, rev: &str, bounds: Bounds) -> Resu
         })
         .collect();
     listing.lists = Some(purposes);
-    let (items, cut) = read(source, NSID_LISTITEM, &mut meter).await?;
+    let (items, cut) = match read(source, NSID_LISTITEM, &mut meter).await {
+        Ok(read) => read,
+        Err(FetchError::Failed(error)) => return Err(FetchError::ItemsFailed { error, listing: Box::new(listing) }),
+        Err(other) => return Err(other),
+    };
     listing.items = items
         .into_iter()
         .filter_map(|record| {
@@ -360,7 +368,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_call_fails_the_fetch() {
-        let failing = Fake { fail_at: Some(2), ..Fake::new(3, 25, 10) };
+        // In the list-record listing: nothing usable.
+        let failing = Fake { fail_at: Some(1), ..Fake::new(3, 25, 10) };
         assert_eq!(fetch(&failing, "r", bounds()).await, Err(FetchError::Failed("503".into())));
+        // In the item listing, after the list records were listed whole:
+        // the purposes are handed back with the failure, and no item.
+        let later = Fake { fail_at: Some(3), ..Fake::new(3, 25, 10) };
+        match fetch(&later, "r", bounds()).await {
+            Err(FetchError::ItemsFailed { error, listing }) => {
+                assert_eq!(error, "503");
+                assert_eq!(listing.lists.as_ref().map(HashMap::len), Some(3));
+                assert!(listing.items.is_empty() && !listing.items_complete);
+            }
+            other => panic!("expected the item listing to fail, got {other:?}"),
+        }
     }
 }

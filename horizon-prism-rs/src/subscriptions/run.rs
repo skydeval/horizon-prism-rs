@@ -205,6 +205,14 @@ async fn attempt(
             jobs::end_run(pool, owner, generation, RunEnd::Failed(&error), None, pause).await?;
             return Ok(Outcome::Failed(error));
         }
+        // The list records were listed whole before the failure: what
+        // they say about each list's purpose is written (step 3a), and
+        // the run fails and is retried for the items.
+        Err(FetchError::ItemsFailed { error, listing }) => {
+            sync::write_purposes(pool, &snap, &listing).await?;
+            jobs::end_run(pool, owner, generation, RunEnd::Failed(&error), None, pause).await?;
+            return Ok(Outcome::Failed(error));
+        }
     };
     // 4. After the last request to the owner's server: the purposes, then
     // the items.
