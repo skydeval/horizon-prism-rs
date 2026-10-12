@@ -539,7 +539,9 @@ impl Lookup {
             // of Farsight. One cut short by earlier calls is not. Decided
             // from the allowance this round began with: time has already
             // passed since `started`, so what remains is never the whole.
-            let whole = allowance >= inner.settings.timeout;
+            // A half asked again after an over-cap answer (`!split`) only
+            // has what the first call left, so it is never the whole.
+            let whole = split && allowance >= inner.settings.timeout;
             match inner.client.check_blocks(actor, &chunk, remaining.min(inner.settings.timeout)).await {
                 Ok(mut answer) => {
                     admission.record(Class::Hit, Instant::now());

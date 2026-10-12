@@ -809,7 +809,9 @@ commit.
   towards pausing Farsight calls, but the check compared the time left
   after the clock had started against the full timeout, so it never did:
   with Farsight hanging, every member request waited the full timeout.
-  The check now uses the time the request started with.
+  The check now uses the time the request started with. A half of a
+  request asked again after a too-large answer only has the time the
+  first call left, so its timeout does not count.
 - **Item 10: an upstream network could stay unreachable until restart
   (#669).** After a breaker's open period one probing call is let through
   and every other call is refused until that call's result is recorded. A
