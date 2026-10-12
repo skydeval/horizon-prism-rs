@@ -94,9 +94,231 @@ pub async fn enqueue(conn: &mut PgConnection, owner: &str, priority: i16, min_in
     Ok(())
 }
 
+/// How a run ended, for its job row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEnd<'a> {
+    /// A completion (also the owner-gone one), or a run that found no
+    /// active list: `done`, unless a rerun was asked for meanwhile.
+    Done,
+    /// A cut, or a run that stood down (the owner is suspected gone, or is
+    /// being purged): queued again at the owner's earliest start.
+    Requeue,
+    /// A failure: retried with backoff, like any backfill job.
+    Failed(&'a str),
+}
+
+/// What a cut does to the owner's pacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    /// Too many records, too long: the owner is large. A week of daily
+    /// runs at most.
+    Large,
+    /// Slow answers or tiny pages: the same, on the slow lane.
+    Slow,
+}
+
+/// Record a run's end on the owner's row (lock step 3): always, whether or
+/// not the owner still has a list, so a later subscription finds the same
+/// earliest start whoever held the lists before. A completion writes its
+/// own, fuller row instead.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn record_run_end(conn: &mut PgConnection, owner: &str, cut: Option<Cut>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO subscribed_owners AS o (owner_did, last_run_ended_at, cut_until, slow_until) \
+         VALUES ($1, now(), CASE WHEN $2 THEN now() + interval '7 days' END, CASE WHEN $3 THEN now() + interval '7 days' END) \
+         ON CONFLICT (owner_did) DO UPDATE SET last_run_ended_at = now(), \
+           cut_until = COALESCE(EXCLUDED.cut_until, o.cut_until), slow_until = COALESCE(EXCLUDED.slow_until, o.slow_until)",
+    )
+    .bind(owner)
+    .bind(cut.is_some())
+    .bind(cut == Some(Cut::Slow))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Settle the job row of a run that ended (lock step 6), after the owner's
+/// row was written in the same transaction. Only a row still `running` at
+/// `generation` is touched: a superseded run settles nothing. Returns
+/// whether it was.
+///
+/// - Every `not_before` written is at or after the owner's earliest start.
+/// - A re-queue happens only while the owner still has a list row.
+/// - A rerun asked for during the run is honoured by a completion, an empty
+///   run and a failure; a cut's or a stand-down's own re-queue stands in
+///   for it. The priority a waiting reference raised is kept.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn settle(
+    conn: &mut PgConnection,
+    owner: &str,
+    generation: i64,
+    end: RunEnd<'_>,
+    min_interval_secs: u32,
+) -> Result<bool, sqlx::Error> {
+    let running: Option<(bool, i32)> = sqlx::query_as(
+        "SELECT rerun_requested, attempts FROM backfill_jobs WHERE did = $1 AND depth = $2 AND state = 'running' AND generation = $3 FOR UPDATE",
+    )
+    .bind(owner)
+    .bind(DEPTH)
+    .bind(generation)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((rerun, attempts)) = running else {
+        return Ok(false);
+    };
+    let pacing: OwnerPacing = sqlx::query_as(
+        "SELECT last_run_ended_at, gone_suspect_at, owner_gone, slow_until, cut_until FROM subscribed_owners WHERE owner_did = $1",
+    )
+    .bind(owner)
+    .fetch_optional(&mut *conn)
+    .await?
+    .unwrap_or_default();
+    let now = Utc::now();
+    let earliest = earliest_start(&pacing, min_interval_secs, now);
+    let has_list: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM subscribed_lists WHERE owner_did = $1)")
+        .bind(owner)
+        .fetch_one(&mut *conn)
+        .await?;
+    // (state, not_before, attempts, last_error)
+    let (state, not_before, attempts, error): (&str, DateTime<Utc>, i32, Option<String>) = match end {
+        RunEnd::Done if rerun && has_list => ("queued", earliest, 0, None),
+        RunEnd::Done => ("done", now, 0, None),
+        RunEnd::Requeue if has_list => ("queued", earliest, 0, None),
+        RunEnd::Requeue => ("done", now, 0, None),
+        RunEnd::Failed(_) if rerun && has_list => ("queued", earliest, 0, None),
+        RunEnd::Failed(error) => {
+            let attempt = attempts + 1;
+            let state = if attempt >= crate::firehose::backfill::MAX_ATTEMPTS { "failed" } else { "queued" };
+            let retry = now + crate::firehose::backfill::backoff(attempt);
+            (state, retry.max(earliest), attempt, Some(error.chars().take(512).collect()))
+        }
+    };
+    sqlx::query(
+        "UPDATE backfill_jobs SET state = $3, not_before = $4, attempts = $5, last_error = $6, rerun_requested = false, updated_at = now() \
+         WHERE did = $1 AND depth = $2",
+    )
+    .bind(owner)
+    .bind(DEPTH)
+    .bind(state)
+    .bind(not_before)
+    .bind(attempts)
+    .bind(error)
+    .execute(conn)
+    .await?;
+    Ok(true)
+}
+
+/// End a run that is not a completion: the owner's row, then the job row,
+/// in one transaction.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn end_run(
+    pool: &sqlx::PgPool,
+    owner: &str,
+    generation: i64,
+    end: RunEnd<'_>,
+    cut: Option<Cut>,
+    min_interval_secs: u32,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    record_run_end(&mut tx, owner, cut).await?;
+    let settled = settle(&mut tx, owner, generation, end, min_interval_secs).await?;
+    tx.commit().await?;
+    Ok(settled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::fresh_db;
+
+    const OWNER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// Every run end writes the owner's row; the job row follows the rules
+    /// for that kind of end, and a superseded run settles nothing.
+    #[tokio::test]
+    async fn run_ends_settle_the_job_row() {
+        let Some(db) = fresh_db("subscriptions_run_ends").await else {
+            return;
+        };
+        let p = &db.pool;
+        let running = |rerun: bool| async move {
+            sqlx::query(
+                "INSERT INTO backfill_jobs (did, depth, state, rerun_requested, attempts) VALUES ($1, 'list_sync', 'running', $2, 0) \
+                 ON CONFLICT (did, depth) DO UPDATE SET state = 'running', rerun_requested = $2, attempts = 0, not_before = now()",
+            )
+            .bind(OWNER)
+            .bind(rerun)
+            .execute(p)
+            .await
+            .expect("job");
+        };
+        let job = || async {
+            sqlx::query_as::<_, (String, bool, i32, f64)>(
+                "SELECT state, rerun_requested, attempts, extract(epoch FROM not_before - now())::float8 FROM backfill_jobs WHERE did = $1",
+            )
+            .bind(OWNER)
+            .fetch_one(p)
+            .await
+            .expect("job")
+        };
+        let list = |present: bool| async move {
+            sqlx::query("DELETE FROM subscribed_lists").execute(p).await.expect("clear");
+            if present {
+                sqlx::query("INSERT INTO subscribed_lists (list_uri, owner_did, state) VALUES ('at://x/app.bsky.graph.list/1', $1, 'active')")
+                    .bind(OWNER)
+                    .execute(p)
+                    .await
+                    .expect("list");
+            }
+        };
+
+        // Done with no rerun asked for: done. With one, and a list: queued
+        // an interval after the run's end, the flag cleared.
+        list(true).await;
+        running(false).await;
+        assert!(end_run(p, OWNER, 0, RunEnd::Done, None, 600).await.expect("db"));
+        assert_eq!(job().await.0, "done");
+        running(true).await;
+        end_run(p, OWNER, 0, RunEnd::Done, None, 600).await.expect("db");
+        let (state, rerun, _, wait) = job().await;
+        assert!(state == "queued" && !rerun && (590.0..=600.0).contains(&wait), "{state} {rerun} {wait}");
+        // A cut: queued a day after the run's end, and the owner backs off
+        // for a week; a slow cut also marks it slow.
+        running(false).await;
+        end_run(p, OWNER, 0, RunEnd::Requeue, Some(Cut::Slow), 600).await.expect("db");
+        let (state, _, _, wait) = job().await;
+        assert!(state == "queued" && (86_300.0..=86_400.0).contains(&wait), "{state} {wait}");
+        let (cut, slow): (bool, bool) = sqlx::query_as("SELECT cut_until > now() + interval '6 days', slow_until > now() + interval '6 days' FROM subscribed_owners")
+            .fetch_one(p)
+            .await
+            .expect("owner");
+        assert!(cut && slow);
+        // A failure: retried no sooner than the owner's earliest start, and
+        // counted; with no list left, a stand-down just ends.
+        sqlx::query("UPDATE subscribed_owners SET cut_until = NULL, slow_until = NULL").execute(p).await.expect("clear");
+        running(false).await;
+        end_run(p, OWNER, 0, RunEnd::Failed("boom"), None, 600).await.expect("db");
+        let (state, _, attempts, wait) = job().await;
+        assert!(state == "queued" && attempts == 1 && (590.0..=600.0).contains(&wait), "{state} {attempts} {wait}");
+        list(false).await;
+        running(true).await;
+        end_run(p, OWNER, 0, RunEnd::Requeue, None, 600).await.expect("db");
+        assert_eq!(job().await.0, "done");
+        // A run whose job moved on settles nothing, but its end is recorded.
+        running(false).await;
+        assert!(!end_run(p, OWNER, 7, RunEnd::Done, None, 600).await.expect("db"));
+        assert_eq!(job().await.0, "running");
+        db.drop_db().await;
+    }
 
     #[test]
     fn the_earliest_start_follows_owner_state_only() {

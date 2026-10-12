@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Item 12: how a list sync run ends (#673).** Every end of a run
+  records its time on the list owner's row first, then settles the job:
+  a completion is done (or queued again if a sync was asked for while it
+  ran); a run cut short is queued a day later and the owner backs off
+  for a week; a failure is retried with the usual backoff. No retry is
+  ever scheduled earlier than the owner's earliest start, and a run that
+  was superseded settles nothing (design-v3 §4.3 "Pacing and claiming").
 - **Item 12: what a list sync writes (#673).** `subscriptions::sync`
   takes an owner's listings and brings the private copy in line: it
   keeps each list's oldest entries up to the cap, removes an entry that

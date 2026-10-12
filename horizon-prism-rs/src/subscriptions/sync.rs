@@ -441,6 +441,9 @@ async fn write_batch(
 ///   record was not listed is stamped, once: it waits for the owner's next
 ///   run and is no cause for one.
 ///
+/// The job row is settled in the same transaction, after the owner's row:
+/// `done`, or queued again when a rerun was asked for during the run.
+///
 /// # Errors
 ///
 /// [`Stopped`].
@@ -451,6 +454,7 @@ pub async fn complete(
     served: &HashSet<String>,
     listed: &HashSet<String>,
     max_items: u32,
+    min_interval_secs: u32,
 ) -> Result<(), Stopped> {
     let mut tx = pool.begin().await?;
     let mut done: HashSet<&str> = HashSet::new();
@@ -479,9 +483,6 @@ pub async fn complete(
     .bind(snap.resync_requested_at)
     .execute(&mut *tx)
     .await?;
-    if !current(&mut tx, snap).await? {
-        return Err(Stopped::Superseded);
-    }
     // In primary-key order, the order the member phase writes them in.
     for waiting in &snap.waiting {
         let statement = if !listed.contains(&waiting.list) {
@@ -500,6 +501,11 @@ pub async fn complete(
             .bind(waiting.admitted_at)
             .execute(&mut *tx)
             .await?;
+    }
+    // The job row last (lock step 6). A run that was superseded settles
+    // nothing, and none of the above is kept.
+    if !jobs::settle(&mut tx, &snap.owner, snap.generation, jobs::RunEnd::Done, min_interval_secs).await? {
+        return Err(Stopped::Superseded);
     }
     tx.commit().await?;
     Ok(())
@@ -547,7 +553,8 @@ mod tests {
 
     /// A whole run over `listing`, as the job will make it.
     async fn run(pool: &PgPool, listing: &Listing, max_items: u32) -> Snapshot {
-        let generation: i64 = sqlx::query_scalar("SELECT generation FROM backfill_jobs WHERE did = $1 AND depth = 'list_sync'")
+        // As a claim leaves it.
+        let generation: i64 = sqlx::query_scalar("UPDATE backfill_jobs SET state = 'running' WHERE did = $1 AND depth = 'list_sync' RETURNING generation")
             .bind(OWNER)
             .fetch_one(pool)
             .await
@@ -556,7 +563,9 @@ mod tests {
         let listed = write_purposes(pool, &snap, listing).await.expect("purposes");
         let served = reconcile(pool, &snap, listing, max_items).await.expect("reconcile");
         if listing.items_complete && listing.lists.is_some() {
-            complete(pool, &snap, listing, &served, &listed, max_items).await.expect("complete");
+            complete(pool, &snap, listing, &served, &listed, max_items, 600).await.expect("complete");
+        } else {
+            jobs::end_run(pool, OWNER, generation, jobs::RunEnd::Requeue, Some(jobs::Cut::Large), 600).await.expect("cut");
         }
         snap
     }
@@ -692,18 +701,23 @@ mod tests {
 
         // A reference admitted again while a run is under way is not made
         // effective by that run: it is another admission.
-        let generation: i64 = sqlx::query_scalar("SELECT generation FROM backfill_jobs").fetch_one(p).await.expect("job");
+        let generation: i64 = sqlx::query_scalar("UPDATE backfill_jobs SET state = 'running' RETURNING generation").fetch_one(p).await.expect("job");
         sqlx::query("UPDATE list_references SET effective = false WHERE list_uri = $1").bind(&a).execute(p).await.expect("waiting");
         let snap = snapshot(p, OWNER, generation).await.expect("snapshot");
         sqlx::query("UPDATE list_references SET admitted_at = now() + interval '1 second' WHERE list_uri = $1").bind(&a).execute(p).await.expect("re-admitted");
         let again = listing("3kaaa7", &[(&a, Some(MODLIST)), (&b, Some(MODLIST))], vec![]);
         let listed = write_purposes(p, &snap, &again).await.expect("purposes");
         let served = reconcile(p, &snap, &again, 10).await.expect("reconcile");
-        complete(p, &snap, &again, &served, &listed, 10).await.expect("complete");
+        complete(p, &snap, &again, &served, &listed, 10, 600).await.expect("complete");
         assert!(!reference(p, &a).await.0);
-        // A superseded run stops.
-        sqlx::query("UPDATE backfill_jobs SET generation = generation + 1").execute(p).await.expect("bump");
+        let state: String = sqlx::query_scalar("SELECT state FROM backfill_jobs").fetch_one(p).await.expect("state");
+        assert_eq!(state, "done");
+        // A superseded run stops, and its completion keeps nothing.
+        sqlx::query("UPDATE backfill_jobs SET state = 'running', generation = generation + 1").execute(p).await.expect("bump");
         assert!(matches!(write_purposes(p, &snap, &again).await, Err(Stopped::Superseded)));
+        sqlx::query("UPDATE subscribed_lists SET synced_at = NULL").execute(p).await.expect("unsynced");
+        assert!(matches!(complete(p, &snap, &again, &served, &listed, 10, 600).await, Err(Stopped::Superseded)));
+        assert!(!list_row(p, &a).await.3);
         db.drop_db().await;
     }
 }
