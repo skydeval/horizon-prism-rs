@@ -380,20 +380,29 @@ impl RealUpstreamSource {
         let (mut last_post, mut last_repost) = (post_cursor, repost_cursor);
         for (is_repost, r) in merged.into_iter().take(limit_usize) {
             if is_repost {
-                last_repost = Some(r.rkey().to_string());
-                let Some(subject) = r.value.pointer("/subject/uri").and_then(Value::as_str) else {
+                let rkey = r.rkey().to_string();
+                let subject = r
+                    .value
+                    .pointer("/subject/uri")
+                    .and_then(Value::as_str)
+                    .filter(|s| !is_private_uri(s) && !matches!(filter, "posts_with_media" | "posts_with_video"));
+                let Some(subject) = subject else {
+                    last_repost = Some(rkey);
                     continue;
                 };
-                if is_private_uri(subject) || matches!(filter, "posts_with_media" | "posts_with_video") {
-                    continue;
-                }
-                if let Some(post) = self.posts(req, &[subject.to_string()]).await.into_iter().next() {
-                    feed.push(json!({
+                match self.posts(req, &[subject.to_string()]).await.into_iter().next() {
+                    Some(post) => feed.push(json!({
                         "post": post,
                         "reason": {"$type": "app.bsky.feed.defs#reasonRepost", "by": {"did": did, "handle": handle, "viewer": {}, "labels": []},
                                    "indexedAt": r.value.get("createdAt").cloned().unwrap_or(Value::Null)},
-                    }));
+                    })),
+                    // No budget to fetch the reposted post: the page ends
+                    // before this item and the cursor stays behind it, so
+                    // nothing is skipped (design-v3 §II-8.3).
+                    None if req.spent() => break,
+                    None => {}
                 }
+                last_repost = Some(rkey);
             } else {
                 last_post = Some(r.rkey().to_string());
                 let reply_root = r.value.pointer("/reply/root/uri").and_then(Value::as_str);
@@ -409,6 +418,11 @@ impl RealUpstreamSource {
                     feed.push(json!({"post": post_from_record(&r.uri, Some(&r.cid), &handle, &r.value)}));
                 }
             }
+        }
+        // A listing that ran out of budget before it produced anything is no
+        // answer (a 429), never an empty page.
+        if feed.is_empty() && req.spent() {
+            return None;
         }
         let mut out = json!({ "feed": feed });
         if paged && (last_post.is_some() || last_repost.is_some()) && !out["feed"].as_array().is_some_and(Vec::is_empty) {
@@ -709,6 +723,10 @@ mod tests {
     }
 
     fn pds_source(pds: &str, cascade_base: &str) -> RealUpstreamSource {
+        pds_source_with(pds, cascade_base, 200.0)
+    }
+
+    fn pds_source_with(pds: &str, cascade_base: &str, per_host: f64) -> RealUpstreamSource {
         let lookup = Arc::new(StubLookup::default());
         lookup.pds.lock().expect("lock").insert(OUTSIDER.into(), pds.to_string());
         let router = DidRouter::new(Arc::new(table_with_community(&[])), lookup as Arc<dyn DidLookup>);
@@ -717,9 +735,25 @@ mod tests {
             router,
             cascade_for(&[("bluesky", cascade_base), ("community-a", cascade_base)]),
             SlingshotClient::new(net.clone(), cascade_base),
-            PdsLister::new(net, hosts(200.0)),
+            PdsLister::new(net, hosts(per_host)),
             ReadCache::new(1024 * 1024),
         )
+    }
+
+    #[tokio::test]
+    async fn a_pds_feed_with_no_budget_is_no_answer_not_an_empty_page() {
+        let (missing, _) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound"})).await;
+        let (pds, calls) = ascending_pds(250).await;
+        // 2/s per host: one token for a non-member, which the order probe
+        // takes. The listing itself then has none.
+        let up = pds_source_with(&pds, &missing, 2.0);
+        let req = Requester::test();
+        assert_eq!(up.author_feed(&req, OUTSIDER, 5, None, "posts_with_replies").await, None);
+        assert!(req.spent());
+        assert_eq!(calls.lock().expect("lock").get(NSID_POST).copied(), Some(1));
+        // Once spent, the request tries no fallback at all.
+        assert_eq!(up.follows(&req, OUTSIDER, 5, None).await, None);
+        assert_eq!(calls.lock().expect("lock").len(), 1);
     }
 
     #[tokio::test]

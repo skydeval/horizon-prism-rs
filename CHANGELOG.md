@@ -48,8 +48,11 @@ commit.
     stops without a not-found item; counts use the stored or local value;
     Thread Lens reports `upstream-unavailable`.
   - A cascade cut by the request's deadline is no answer too.
-  Not yet done: the rule that a cascade or PDS listing with nothing to
-  show answers 429 instead of an empty page.
+  - An author feed or follows list read from another AppView or the
+    author's PDS answers 429 when it ran out of budget before producing
+    anything. A PDS feed that runs out while fetching a reposted post ends
+    the page before that item and keeps its cursor behind it, so the next
+    page resumes there.
 - **Item 10: identity lookups and author-PDS listings are charged
   (#669).** Resolving a DID or a handle for a request costs one token of
   the requester's identity share
