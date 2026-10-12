@@ -536,8 +536,10 @@ impl Lookup {
                 return none(chunk, "allowance_spent");
             }
             // A call that has its whole timeout and reaches it is a failure
-            // of Farsight. One cut short by earlier calls is not.
-            let whole = remaining >= inner.settings.timeout;
+            // of Farsight. One cut short by earlier calls is not. Decided
+            // from the allowance this round began with: time has already
+            // passed since `started`, so what remains is never the whole.
+            let whole = allowance >= inner.settings.timeout;
             match inner.client.check_blocks(actor, &chunk, remaining.min(inner.settings.timeout)).await {
                 Ok(mut answer) => {
                     admission.record(Class::Hit, Instant::now());
@@ -871,6 +873,23 @@ pub(crate) mod tests {
         // The allowance is spent: the request makes no further call.
         request.inbound_list_blocks(V, &page(&[B]), &none).await;
         assert_eq!(calls(&fake), 1);
+    }
+
+    /// A Farsight that hangs is a failing Farsight: each member request's
+    /// first call has its whole timeout, and reaching it counts.
+    #[tokio::test]
+    async fn a_hung_farsight_opens_the_breaker() {
+        let (farsight, fake) = engine("timeout_ms = 50\n").await;
+        *fake.delay_ms.lock().expect("delay") = 400;
+        let none = HashSet::new();
+        for i in 0..5 {
+            let account = format!("did:plc:{:e>24}", format!("{i:x}").replace(['0', '1', '8', '9'], "f"));
+            farsight.request(&member()).inbound_list_blocks(V, &[account], &none).await;
+        }
+        assert!(farsight.breaker_open());
+        let before = calls(&fake);
+        farsight.request(&member()).inbound_list_blocks(V, &page(&[A]), &none).await;
+        assert_eq!(calls(&fake), before);
     }
 
     #[tokio::test]

@@ -781,6 +781,12 @@ commit.
 
 ### Fixed
 
+- **Item 12: a Farsight that hangs now counts as failing (#673).** A
+  `checkBlocks` call that ran out its whole timeout was meant to count
+  towards pausing Farsight calls, but the check compared the time left
+  after the clock had started against the full timeout, so it never did:
+  with Farsight hanging, every member request waited the full timeout.
+  The check now uses the time the request started with.
 - **Item 10: an upstream network could stay unreachable until restart
   (#669).** After a breaker's open period one probing call is let through
   and every other call is refused until that call's result is recorded. A
