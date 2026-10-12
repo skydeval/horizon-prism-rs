@@ -12,6 +12,10 @@ commit.
 
 ### Added
 
+- **Item 13: detached quotes (#675).** When the author of a quoted post
+  has detached a quote (the post's valid postgate lists the quoting post in
+  `detachedEmbeddingUris`), the quote's embedded record renders as
+  `app.bsky.embed.record#viewDetached` (design-v3 §8.3).
 - **Item 13: `viewer.knownLikers` on the thread anchor (#675).** For a
   ready member: the accounts it follows that liked the post, with a count
   and up to 5 profiles (design-v3 §8.2). Stored likes are joined with a

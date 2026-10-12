@@ -93,6 +93,9 @@ pub struct PostContext {
     pub labels: HashMap<String, Vec<Value>>,
     pub counts: HashMap<String, Counts>,
     pub gates: HashMap<String, Gate>,
+    /// By quoted post: the quoting posts its author detached (its valid
+    /// postgate's `detachedEmbeddingUris`).
+    pub detached: HashMap<String, HashSet<String>>,
 }
 
 impl PostContext {
@@ -132,11 +135,16 @@ impl PostContext {
         Some(Value::Object(v))
     }
 
-    /// The view of an embedded record: a local post, or not-found / blocked.
-    fn record_view(&self, uri: &str, depth: u8) -> Value {
+    /// The view of the record that post `quoting` embeds: a local post, or
+    /// not-found, blocked, or detached by the quoted post's author
+    /// (design-v3 §8.3).
+    fn record_view(&self, uri: &str, quoting: &str, depth: u8) -> Value {
         let author = uri_author(uri).unwrap_or_default();
         if is_private_uri(uri) || !uri.contains(&format!("/{}/", super::feed::NSID_POST)) {
             return json!({"$type": "app.bsky.embed.record#viewNotFound", "uri": uri, "notFound": true});
+        }
+        if self.detached.get(uri).is_some_and(|quotes| quotes.contains(quoting)) {
+            return json!({"$type": "app.bsky.embed.record#viewDetached", "uri": uri, "detached": true});
         }
         if self.author_blocked(author) {
             return json!({
@@ -253,7 +261,7 @@ impl PostContext {
                     return None;
                 }
                 let uri = embed.get("record")?.get("uri")?.as_str()?;
-                Some(json!({"$type": "app.bsky.embed.record#view", "record": self.record_view(uri, depth)}))
+                Some(json!({"$type": "app.bsky.embed.record#view", "record": self.record_view(uri, &row.uri, depth)}))
             }
             "app.bsky.embed.recordWithMedia" => {
                 let media = self.media_view(row, embed.get("media")?)?;
@@ -263,7 +271,7 @@ impl PostContext {
                 let uri = embed.get("record")?.get("record")?.get("uri")?.as_str()?;
                 Some(json!({
                     "$type": "app.bsky.embed.recordWithMedia#view",
-                    "record": {"$type": "app.bsky.embed.record#view", "record": self.record_view(uri, depth)},
+                    "record": {"$type": "app.bsky.embed.record#view", "record": self.record_view(uri, &row.uri, depth)},
                     "media": media,
                 }))
             }
@@ -357,6 +365,15 @@ impl Hydrator {
         let labels = self.load_labels(&all_uris).await?;
         let counts = self.constellation_counts(req, &uris, mode).await;
         let gates = moderation::gate_many(self.pool(), &all_uris).await?;
+        // A postgate counts only under its post's record key and author.
+        let detached: Vec<(String, Vec<String>)> = sqlx::query_as(
+            "SELECT post_uri, detached_embedding_uris FROM postgates WHERE post_uri = ANY($1) \
+               AND cardinality(detached_embedding_uris) > 0 \
+               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
+        )
+        .bind(&all_uris)
+        .fetch_all(self.pool())
+        .await?;
         Ok(PostContext {
             posts,
             profiles,
@@ -364,6 +381,7 @@ impl Hydrator {
             labels,
             counts,
             gates,
+            detached: detached.into_iter().map(|(post, quotes)| (post, quotes.into_iter().collect())).collect(),
         })
     }
 
@@ -1168,6 +1186,54 @@ mod tests {
 
     /// design-v3 §8.4 and §11 G-2: gallery views, and the media and video
     /// filters of `getAuthorFeed`.
+    /// B-42: a quote its target's author detached renders as `viewDetached`.
+    #[tokio::test]
+    async fn a_detached_quote_shows_no_record() {
+        let Some(db) = fresh_db("hydration_detached_quote").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let quoted = post(p, ALICE, "3kaaaaaaaaaa2", "original", None, None).await;
+        let detached = post(p, BOB, "3kaaaaaaaaaa3", "detached quote", None, None).await;
+        let kept = post(p, BOB, "3kaaaaaaaaaa4", "kept quote", None, None).await;
+        for quoting in [&detached, &kept] {
+            sqlx::query("UPDATE posts SET quote_uri = $1, embed = $2 WHERE uri = $3")
+                .bind(&quoted)
+                .bind(json!({"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "bafyq"}}))
+                .bind(quoting)
+                .execute(p)
+                .await
+                .expect("embed");
+        }
+        // The valid gate detaches one quote. A gate under another record
+        // key names the other, and is ignored.
+        for (rkey, names) in [("3kaaaaaaaaaa2", &detached), ("other", &kept)] {
+            sqlx::query(
+                "INSERT INTO postgates (uri, author_did, rkey, cid, rev, post_uri, detached_embedding_uris, record, created_at) \
+                 VALUES ($1, $2, $3, 'bafypg', '3k', $4, $5, '{}', now())",
+            )
+            .bind(format!("at://{ALICE}/app.bsky.feed.postgate/{rkey}"))
+            .bind(ALICE)
+            .bind(rkey)
+            .bind(&quoted)
+            .bind(vec![names.clone()])
+            .execute(p)
+            .await
+            .expect("postgate");
+        }
+        let h = hydrator(p, ScopeSets::default());
+        let v = h.get_posts(&Viewer::anonymous(), &Requester::test(), &[detached.clone(), kept.clone()]).await.expect("db").expect("view");
+        let posts = v.inner()["posts"].as_array().expect("posts");
+        assert_eq!(
+            posts[0]["embed"]["record"],
+            json!({"$type": "app.bsky.embed.record#viewDetached", "uri": quoted, "detached": true})
+        );
+        assert_eq!(posts[1]["embed"]["record"]["$type"], "app.bsky.embed.record#viewRecord");
+        db.drop_db().await;
+    }
+
     #[tokio::test]
     async fn gallery_views_and_media_filters() {
         let Some(db) = fresh_db("hydration_gallery").await else {
