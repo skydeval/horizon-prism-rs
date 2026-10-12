@@ -585,6 +585,14 @@ mod tests {
         assert_eq!(count(p, "SELECT count(*) FROM backfill_jobs WHERE depth = 'list_sync' AND state = 'queued' AND priority = 0").await, 1);
         assert_eq!(count(p, "SELECT count(*) FROM subscribed_owners WHERE resync_requested_at IS NOT NULL").await, 1);
         assert!(matches!(run(&exec, p, AdminCommand::ListsSync { uri: unknown }).await, Finished::Failed(_)));
+
+        // `lists purge`: the member's list mutes and references go, and
+        // the list it referenced is marked for the list phase.
+        sqlx::query("DELETE FROM list_reference_changes").execute(p).await.expect("markers");
+        let result = done(run(&exec, p, AdminCommand::ListsPurge { did: PURGING.into() }).await);
+        assert_eq!(result["deleted"]["list_mutes"], 1);
+        assert_eq!(count(p, "SELECT count(*) FROM list_references").await, 0);
+        assert_eq!(count(p, "SELECT count(*) FROM list_reference_changes").await, 1);
         db.drop_db().await;
     }
 

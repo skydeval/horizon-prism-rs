@@ -14,7 +14,7 @@ use sqlx::PgPool;
 
 use crate::aggregations::{PurgeKind, Purger, Rebuild, ScopeState};
 use crate::aggregations::membership::{AddOutcome, add_member};
-use crate::db::locks::uri_author;
+use crate::db::locks::{lock_did_exclusive, uri_author};
 use crate::farsight::Farsight;
 use crate::firehose::backfill::BackfillSource;
 use crate::firehose::gap::{self, GapCause};
@@ -23,7 +23,7 @@ use crate::firehose::jobs::{self, Depth};
 use crate::firehose::writer::Writer;
 use crate::identity::eligibility::{self, Confirmation};
 use crate::private_tier::PrivateTier;
-use crate::subscriptions::references::Budget;
+use crate::subscriptions::references::{Budget, drop_member};
 use crate::subscriptions::{jobs as list_sync, triggers};
 
 /// Label values accepted by `label add` (§7.8). Anything else is rejected.
@@ -48,6 +48,9 @@ pub enum AdminCommand {
     FarsightPrime { did: String, force: bool },
     /// `lists sync <list-uri>`: sync a subscribed list's owner now.
     ListsSync { uri: String },
+    /// `lists purge <did>`: delete the DID's list mutes and the list
+    /// records it authored.
+    ListsPurge { did: String },
 }
 
 /// A command that cannot be parsed or is invalid.
@@ -81,6 +84,7 @@ impl AdminCommand {
             Self::FarsightStatus => ("farsight status", json!({})),
             Self::FarsightPrime { did, force } => ("farsight prime", json!({ "did": did, "force": force })),
             Self::ListsSync { uri } => ("lists sync", json!({ "uri": uri })),
+            Self::ListsPurge { did } => ("lists purge", json!({ "did": did })),
         }
     }
 
@@ -152,6 +156,7 @@ impl AdminCommand {
                 }
                 Self::ListsSync { uri }
             }
+            "lists purge" => Self::ListsPurge { did: did()? },
             other => return Err(InvalidCommand(format!("unknown command {other:?}"))),
         })
     }
@@ -160,7 +165,7 @@ impl AdminCommand {
     #[must_use]
     pub fn did(&self) -> Option<&str> {
         match self {
-            Self::MemberAdd { did } | Self::MemberRemove { did } | Self::Backfill { did, .. } => Some(did),
+            Self::MemberAdd { did } | Self::MemberRemove { did } | Self::Backfill { did, .. } | Self::ListsPurge { did } => Some(did),
             Self::LabelAdd { subject, .. } | Self::LabelRemove { subject, .. } => {
                 if is_did(subject) { Some(subject) } else { uri_author(subject) }
             }
@@ -238,8 +243,47 @@ impl Handlers {
             AdminCommand::FarsightStatus => self.farsight_status().await,
             AdminCommand::FarsightPrime { did, force } => self.farsight_prime(did, *force).await,
             AdminCommand::ListsSync { uri } => self.lists_sync(uri).await,
+            AdminCommand::ListsPurge { did } => self.lists_purge(did).await,
         };
         result.unwrap_or_else(Outcome::Failed)
+    }
+
+    /// `lists purge` (design-v3 §14.3): deletes the DID's list mutes and
+    /// the list records it authored (lists, list items, list blocks,
+    /// opt-outs), and with them its references; the lists it referenced
+    /// are marked, and the list phase releases those nobody else
+    /// references. A local cleanup, not a takedown: records still in the
+    /// DID's repository come back at its next re-sync.
+    async fn lists_purge(&self, did: &str) -> Result<Outcome, String> {
+        if self.purging(did).await.map_err(|e| e.to_string())? {
+            return Ok(Outcome::Defer);
+        }
+        let db = |e: sqlx::Error| e.to_string();
+        // §II-6.11.7: the read guard, then the DID's lock, before any row.
+        let guard = self.scope.read_guard().await;
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        lock_did_exclusive(&mut tx, did).await.map_err(db)?;
+        let mut deleted = serde_json::Map::new();
+        for (table, column) in [
+            ("list_mutes", "viewer_did"),
+            ("list_blocks", "author_did"),
+            ("list_optouts", "author_did"),
+            ("list_items", "author_did"),
+            ("lists", "creator_did"),
+        ] {
+            let n = sqlx::query(&format!("DELETE FROM {table} WHERE {column} = $1"))
+                .bind(did)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?
+                .rows_affected();
+            deleted.insert(table.to_string(), json!(n));
+        }
+        // Both kinds of reference lost their source rows.
+        drop_member(&mut tx, did).await.map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        drop(guard);
+        Ok(Outcome::Done(json!({ "did": did, "deleted": deleted })))
     }
 
     /// `lists sync` (design-v3 §4.3, §14.3): a high-priority list sync for

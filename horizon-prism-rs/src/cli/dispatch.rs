@@ -94,6 +94,9 @@ pub enum ListsAction {
         /// The list's at-uri.
         uri: String,
     },
+    /// Delete an account's list mutes and the list records it authored
+    /// (a local cleanup: records still in its repository come back).
+    Purge { did: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -224,6 +227,7 @@ impl AdminCmd {
                 force: *force,
             },
             Self::Lists { action: ListsAction::Sync { uri } } => AdminCommand::ListsSync { uri: uri.clone() },
+            Self::Lists { action: ListsAction::Purge { did } } => AdminCommand::ListsPurge { did: did.clone() },
         };
         let (command, args) = cmd.to_row();
         AdminCommand::parse(command, &args).map_err(|e| e.to_string())

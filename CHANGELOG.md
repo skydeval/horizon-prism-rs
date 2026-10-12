@@ -12,6 +12,11 @@ commit.
 
 ### Added
 
+- **Item 12: `admin lists purge <did>` (#673).** Deletes an account's
+  list mutes and the list records it authored (lists, list items, list
+  blocks, opt-outs), and its references with them. A local cleanup, not
+  a takedown: records still in the account's repository come back at
+  its next re-sync (design-v3 §14.3).
 - **Item 12: `muteActorList`, `unmuteActorList`, `getListMutes`,
   `getListBlocks` (#673).** A member can mute a moderation list, up to
   `lists.subscribed_max_per_member` lists from at most
