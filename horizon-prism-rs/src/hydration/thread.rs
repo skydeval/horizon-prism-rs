@@ -209,6 +209,27 @@ impl Hydrator {
         Ok(Some(RootGate { view, hidden, allow }))
     }
 
+    /// `viewer.replyDisabled` for a post of the thread rooted at `root`, from
+    /// the root's valid threadgate stored here (single-object views other
+    /// than a thread, design-v3 §8.2).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(super) async fn reply_disabled_in(&self, viewer: &Viewer, req: &Requester, root: &str) -> Result<Option<bool>, sqlx::Error> {
+        if viewer.state_did().is_none() {
+            return Ok(None);
+        }
+        let allow: Option<Option<Value>> = sqlx::query_scalar(
+            "SELECT allow FROM threadgates WHERE post_uri = $1 \
+               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
+        )
+        .bind(root)
+        .fetch_optional(self.pool())
+        .await?;
+        self.reply_disabled(viewer, req, root, allow.flatten().as_ref()).await
+    }
+
     /// A `threadgateView`: the gate's record and the lists its rules name,
     /// as `listViewBasic`, under the locally-servable rule.
     pub(super) async fn threadgate_view(

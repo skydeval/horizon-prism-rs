@@ -436,6 +436,25 @@ impl Hydrator {
         }
         let ctx = self.post_context(viewer, req, &wanted, CountMode::Sync { started }).await?;
         let mut posts: Vec<Value> = wanted.iter().filter_map(|u| ctx.post_view(u)).collect();
+        // `viewer.replyDisabled`, from each stored post's root (§8.2: a
+        // single-object view). Decided once per root.
+        let mut by_root: HashMap<String, Option<bool>> = HashMap::new();
+        for post in &mut posts {
+            let Some(uri) = post.get("uri").and_then(Value::as_str) else { continue };
+            let Some(row) = ctx.posts.get(uri) else { continue };
+            let root = row.reply_root_uri.clone().unwrap_or_else(|| row.uri.clone());
+            let disabled = match by_root.get(&root) {
+                Some(known) => *known,
+                None => {
+                    let found = self.reply_disabled_in(viewer, req, &root).await?;
+                    by_root.insert(root, found);
+                    found
+                }
+            };
+            if let Some(disabled) = disabled {
+                post["viewer"]["replyDisabled"] = json!(disabled);
+            }
+        }
         let missing: Vec<String> = wanted.iter().filter(|u| !ctx.posts.contains_key(*u)).cloned().collect();
         if !missing.is_empty() {
             // §8.3 step 0: the moderation gate before any upstream source.

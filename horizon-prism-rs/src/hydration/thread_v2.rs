@@ -750,6 +750,14 @@ mod tests {
         assert_eq!(disabled(me.clone()).await, Some(json!(true)));
         assert_eq!(disabled(op).await, Some(json!(false)));
         assert_eq!(disabled(anon.clone()).await, None);
+        // `getPosts` carries it too, for the root and a reply alike.
+        let both = [root.clone(), second.clone()];
+        let v = h.get_posts(&me, &req, &both).await.expect("db").expect("view");
+        for i in 0..2 {
+            assert_eq!(v.inner()["posts"][i]["viewer"]["replyDisabled"], true);
+        }
+        let v = h.get_posts(&anon, &req, &both).await.expect("db").expect("view");
+        assert!(v.inner()["posts"][0]["viewer"].get("replyDisabled").is_none());
         // Followers may reply: not a follower, then a follower.
         exec(p, &format!("UPDATE threadgates SET allow = '[{{\"$type\": \"app.bsky.feed.threadgate#followerRule\"}}]' WHERE uri = '{gate}'")).await;
         assert_eq!(disabled(me.clone()).await, Some(json!(true)));

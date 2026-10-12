@@ -12,6 +12,10 @@ commit.
 
 ### Added
 
+- **Item 13: `viewer.replyDisabled` on `getPosts` (#675).** Stored posts
+  returned by `getPosts` carry `viewer.replyDisabled` for a member, from
+  the threadgate of each post's thread root, by the same rules as on an
+  opened thread (design-v3 §8.2, §8.3).
 - **Item 13: `!no-unauthenticated` in the newer thread view (#675).** A
   signed-out viewer of `getPostThreadV2` is not shown posts by an account
   whose profile carries the `!no-unauthenticated` label: the opened post
