@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 14: notification preferences (#675).**
+  `app.bsky.notification.getPreferences` and `putPreferencesV2` store a
+  member's preferences (13 keys; `chat` is always its default), and they
+  are applied: a reason with `list: false` leaves `listNotifications` and
+  `getUnreadCount`, and `include: "follows"` keeps a reason only from
+  accounts the member follows. `push` has no effect. The legacy
+  `putPreferences {priority}` is accepted and stores nothing
+  (design-v3 §5.6).
 - **Item 13: `viewer.replyDisabled` on `getPosts` (#675).** Stored posts
   returned by `getPosts` carry `viewer.replyDisabled` for a member, from
   the threadgate of each post's thread root, by the same rules as on an

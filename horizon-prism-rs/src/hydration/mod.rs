@@ -19,6 +19,7 @@ pub mod hint;
 pub mod lens;
 pub mod lists;
 pub mod normalize;
+pub mod notification_prefs;
 pub mod notifications;
 pub mod relationships;
 pub mod starter_packs;

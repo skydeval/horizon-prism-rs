@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 
 use axum::extract::{ConnectInfo, RawQuery, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -17,8 +17,13 @@ use crate::xrpc::errors::XrpcError;
 pub const LIST_NOTIFICATIONS: &str = "app.bsky.notification.listNotifications";
 pub const GET_UNREAD_COUNT: &str = "app.bsky.notification.getUnreadCount";
 pub const UPDATE_SEEN: &str = "app.bsky.notification.updateSeen";
+pub const GET_PREFERENCES: &str = "app.bsky.notification.getPreferences";
+pub const PUT_PREFERENCES: &str = "app.bsky.notification.putPreferences";
+pub const PUT_PREFERENCES_V2: &str = "app.bsky.notification.putPreferencesV2";
 
 const TRIGGER: Access = Access::Member { ready: true, enroll: true };
+/// Preferences are the member's own state here: no readiness needed.
+const MEMBER: Access = Access::Member { ready: false, enroll: false };
 
 pub async fn list_notifications(
     State(s): State<AppState>,
@@ -75,4 +80,44 @@ pub async fn update_seen(
         .and_then(|v| v.get("seenAt").and_then(Value::as_str).map(str::to_string))
         .ok_or_else(|| XrpcError::invalid("Error: Input must have the property \"seenAt\""))?;
     respond(&req.req, s.hydrator.update_seen(&req.viewer, &seen_at).await)
+}
+
+pub async fn get_preferences(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_PREFERENCES, MEMBER, false).await?;
+    respond(&req.req, s.hydrator.get_notification_preferences(&req.viewer).await)
+}
+
+pub async fn put_preferences_v2(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, PUT_PREFERENCES_V2, MEMBER, true).await?;
+    let input = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .filter(Value::is_object)
+        .ok_or_else(|| XrpcError::invalid("Error: Input must be an object"))?;
+    respond(&req.req, s.hydrator.put_notification_preferences(&req.viewer, &input).await)
+}
+
+/// The legacy `putPreferences {priority}` (design-v3 §5.6): accepted so old
+/// clients do not fail, and nothing is stored, because `priority` no longer
+/// means anything. The lexicon defines no output.
+pub async fn put_preferences(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, XrpcError> {
+    prepare(&s, &headers, peer, PUT_PREFERENCES, MEMBER, true).await?;
+    serde_json::from_slice::<Value>(&body)
+        .ok()
+        .filter(|v| v.get("priority").is_some_and(Value::is_boolean))
+        .ok_or_else(|| XrpcError::invalid("Error: Input must have the property \"priority\""))?;
+    Ok(StatusCode::OK)
 }

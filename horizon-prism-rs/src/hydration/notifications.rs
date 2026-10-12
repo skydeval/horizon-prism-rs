@@ -45,6 +45,16 @@ const EXCLUSIONS: &str = "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did =
                        (SELECT p.reply_root_uri FROM posts p WHERE p.uri = n.record_uri), \
                        (SELECT p.reply_root_uri FROM posts p WHERE p.uri = n.reason_subject)))";
 
+/// The member's notification preferences as a condition on `n` (design-v3
+/// §5.6): `hidden` and `follows` are the placeholders of the reasons with
+/// `list: false` and of those kept only from accounts the member follows.
+fn preference_clause(hidden: usize, follows: usize) -> String {
+    format!(
+        "n.reason <> ALL(${hidden}::text[]) AND (n.reason <> ALL(${follows}::text[]) \
+           OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = n.author_did))"
+    )
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct NotificationRow {
     id: i64,
@@ -139,9 +149,25 @@ impl Hydrator {
             .cloned()
             .collect();
         let muted_threads = self.in_muted_threads(viewer, &threads).await?;
+        // The member's preferences are private state too, applied here and
+        // not in the scan.
+        let prefs = self.reason_filter(me).await?;
+        let followed: std::collections::HashSet<String> = if prefs.follows_only.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            sqlx::query_scalar("SELECT subject_did FROM follows WHERE author_did = $1 AND subject_did = ANY($2)")
+                .bind(me)
+                .bind(&authors)
+                .fetch_all(self.pool())
+                .await?
+                .into_iter()
+                .collect()
+        };
         let dropped = |r: &NotificationRow| {
             let who = &ctx.viewer;
             who.blocked_either_way(&r.author_did)
+                || prefs.hidden.contains(&r.reason)
+                || (prefs.follows_only.contains(&r.reason) && !followed.contains(&r.author_did))
                 || who.muted.contains(&r.author_did)
                 || (who.muted_reposts.contains(&r.author_did) && matches!(r.reason.as_str(), "repost" | "repost-via-repost"))
                 || (who.muted_quotes.contains(&r.author_did) && r.reason == "quote")
@@ -201,13 +227,17 @@ impl Hydrator {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
+        let prefs = self.reason_filter(me).await?;
         let count: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*) FROM notifications n WHERE n.recipient_did = $1 AND {EXCLUSIONS} \
+            "SELECT count(*) FROM notifications n WHERE n.recipient_did = $1 AND {EXCLUSIONS} AND {} \
                AND n.indexed_at > COALESCE($2::timestamptz, \
-                   (SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity')"
+                   (SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity')",
+            preference_clause(3, 4)
         ))
         .bind(me)
         .bind(seen_at)
+        .bind(&prefs.hidden)
+        .bind(&prefs.follows_only)
         .fetch_one(self.pool())
         .await?;
         // An inbound list block cannot be joined in SQL, so the count is
@@ -240,14 +270,17 @@ impl Hydrator {
                 .collect();
             if !blockers.is_empty() {
                 let hidden: i64 = sqlx::query_scalar(&format!(
-                    "SELECT count(*) FROM notifications n WHERE n.recipient_did = $1 AND {EXCLUSIONS} \
+                    "SELECT count(*) FROM notifications n WHERE n.recipient_did = $1 AND {EXCLUSIONS} AND {} \
                        AND n.indexed_at > COALESCE($2::timestamptz, \
                            (SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity') \
-                       AND n.author_did = ANY($3)"
+                       AND n.author_did = ANY($3)",
+                    preference_clause(4, 5)
                 ))
                 .bind(me)
                 .bind(seen_at)
                 .bind(&blockers)
+                .bind(&prefs.hidden)
+                .bind(&prefs.follows_only)
                 .fetch_one(self.pool())
                 .await?;
                 count = (count - hidden).max(0);
@@ -456,6 +489,42 @@ mod tests {
         // Reason filter.
         let only = h.list_notifications(&me, &req,50, None, &["reply".into()]).await.expect("db").expect("view");
         assert_eq!(only.inner()["notifications"].as_array().map(Vec::len), Some(1));
+
+        // B-42: preferences are consulted. With no row, the defaults.
+        let prefs = h.get_notification_preferences(&me).await.expect("db").expect("view");
+        assert_eq!(prefs.inner()["preferences"], crate::hydration::notification_prefs::defaults());
+        let reasons = |v: &Value| -> Vec<String> {
+            v["notifications"].as_array().expect("list").iter().map(|x| x["reason"].as_str().expect("reason").to_string()).collect()
+        };
+        // `list: false` takes likes out of the list and the count; `chat`
+        // in the input is ignored.
+        let put = json!({"like": {"include": "all", "list": false, "push": true}, "chat": {"include": "accepted", "push": false}});
+        let stored = h.put_notification_preferences(&me, &put).await.expect("db").expect("stored");
+        assert_eq!(stored.inner()["preferences"]["like"]["list"], false);
+        assert_eq!(stored.inner()["preferences"]["chat"], json!({"include": "all", "push": true}));
+        assert_eq!(stored.inner()["preferences"].as_object().map(serde_json::Map::len), Some(13));
+        let l = h.list_notifications(&me, &req, 50, None, &[]).await.expect("db").expect("view");
+        assert_eq!(reasons(l.inner()), ["reply"]);
+        assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 1);
+        // `include: follows` keeps a reason only from accounts the member
+        // follows; another key's put leaves the first one stored.
+        let put = json!({"reply": {"include": "follows", "list": true, "push": true}});
+        let stored = h.put_notification_preferences(&me, &put).await.expect("db").expect("stored");
+        assert_eq!(stored.inner()["preferences"]["like"]["list"], false);
+        assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 0);
+        let l = h.list_notifications(&me, &req, 50, None, &[]).await.expect("db").expect("view");
+        assert_eq!(l.inner()["notifications"], json!([]));
+        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ALICE}/app.bsky.graph.follow/9', '{ALICE}', '{BOB}', '3k', now())")).await;
+        assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 1);
+        let l = h.list_notifications(&me, &req, 50, None, &[]).await.expect("db").expect("view");
+        assert_eq!(reasons(l.inner()), ["reply"]);
+        // A bad value is refused and changes nothing.
+        let bad = json!({"quote": {"include": "mutuals", "list": true, "push": true}});
+        assert_eq!(h.put_notification_preferences(&me, &bad).await.expect("db").expect_err("bad").error, "InvalidRequest");
+        let prefs = h.get_notification_preferences(&me).await.expect("db").expect("view");
+        assert_eq!(prefs.inner()["preferences"]["reply"]["include"], "follows");
+        exec(p, "DELETE FROM notification_preferences_v2").await;
+        exec(p, "DELETE FROM follows").await;
 
         // B-59: a muted thread sends no notifications (the reply under the
         // root, and the like of the root), and its posts say so.
