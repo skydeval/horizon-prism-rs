@@ -20,9 +20,11 @@ pub mod answer;
 pub mod chunks;
 pub mod client;
 pub mod did;
+pub mod lookup;
 
 pub use answer::{ChunkAnswer, Coverage, PairAnswer, Relation};
 pub use client::{CallError, FarsightClient};
+pub use lookup::{Farsight, Lookup};
 
 use crate::config::{FarsightConfig, RateClassConfig};
 use crate::xrpc::rate_limit::class_problem;
