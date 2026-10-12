@@ -742,6 +742,18 @@ fn zero_values_that_break_runtime_are_rejected() {
     }
 }
 
+/// design-v3 §4.3 "Budgets": a config that still carries a key the
+/// admission model removed is told what replaced it.
+#[test]
+fn removed_list_keys_point_at_what_replaced_them() {
+    let p = invalid_problems(load("[lists]\nsubscribed_max_total = 5000\n"));
+    assert!(has(&p, "subscribed_max_total was removed") && has(&p, "locked decision 36"), "{p:?}");
+    let p = invalid_problems(load("[retention]\nsubscribed_list_grace_days = 7\n"));
+    assert!(has(&p, "subscribed_list_grace_days was removed"), "{p:?}");
+    // Any other unknown key is still the parser's own error.
+    assert!(matches!(load("[lists]\nno_such_key = 1\n"), Err(ConfigError::Parse(_))));
+}
+
 /// design-v3 §4.3, §13: the list-sync lanes leave two backfill workers
 /// free, and the wall bound cannot cut what the other bounds allow.
 #[test]

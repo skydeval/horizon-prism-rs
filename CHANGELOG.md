@@ -12,6 +12,11 @@ commit.
 
 ### Added
 
+- **Item 12: removed list settings say what replaced them (#673).** A
+  config that still has `lists.subscribed_max_total` or
+  `retention.subscribed_list_grace_days` is refused at startup with a
+  message naming the per-member budget keys and the immediate release,
+  instead of only "unknown field".
 - **Item 12: the tombstone cap covers a sync's own tombstones (#673).**
   The tombstones a list sync writes for items moved out of a list now
   count against `lists.subscription_tombstones_max_per_owner`: after a

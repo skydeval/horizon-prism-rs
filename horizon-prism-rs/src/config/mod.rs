@@ -57,6 +57,15 @@ impl From<toml::de::Error> for ConfigError {
     }
 }
 
+/// Keys that older configs may still hold, and what stands in their place.
+const REMOVED_KEYS: [(&str, &str); 2] = [
+    (
+        "subscribed_max_total",
+        "there is no total any more; each member has its own budget, lists.subscribed_max_per_member and lists.max_owners_per_member",
+    ),
+    ("subscribed_list_grace_days", "a list no member references is released at once"),
+];
+
 /// The complete runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -73,7 +82,18 @@ impl FileConfig {
     ///
     /// [`ConfigError::Parse`] on malformed TOML, a wrong type, or an unknown key.
     pub fn parse(toml_text: &str) -> Result<Self, ConfigError> {
-        Ok(toml::from_str(toml_text)?)
+        toml::from_str(toml_text).map_err(|e: toml::de::Error| {
+            // Two keys of older configs were removed with the
+            // subscribed-list admission model: say so, and what replaced
+            // them, instead of only "unknown field".
+            let message = e.to_string();
+            match REMOVED_KEYS.iter().find(|(key, _)| message.contains(&format!("`{key}`"))) {
+                Some((key, instead)) => ConfigError::Invalid(vec![format!(
+                    "{key} was removed (proposed locked decision 36; design §4.3, §4.7): {instead}. Delete the key"
+                )]),
+                None => e.into(),
+            }
+        })
     }
 }
 
