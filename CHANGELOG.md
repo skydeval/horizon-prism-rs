@@ -82,6 +82,18 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 11: the writer fills the new columns (#671).** Every post
+  written from now on stores `tags`, `link_domains`, `link_urls`,
+  `lang_prefixes`, `embed_type`, `media_type` and `search_tsv`
+  (design-v3 §3.1, §9.0): tags are lowercased NFC without `#`, sorted and
+  distinct; links are `http`/`https` only, with each link's host and its
+  parent domains; languages carry their primary subtag. The arrays are
+  `{}`, never NULL, on a written row. Likes, reposts and follows store
+  their `via` reference. Profiles store `profile_cid`, `pronouns`,
+  `website`, `joinedViaStarterPack` and a clamped `createdAt`; a profile
+  write at the stored rev fills a missing `profile_cid` and changes
+  nothing else. Rows written before this stay unfilled until the
+  post-migration task runs. New dependency: `unicode-normalization`.
 - **Item 11: migrations 0004–0011 and 0013–0017 (#671).** The schema of
   design-v3 §3.1: lists, list items, list blocks and opt-outs; the rule-4
   subscription tables with `subscribed_lists.item_count` kept by

@@ -52,3 +52,4 @@ anyhow = "1"
 # kryphocron's HttpDidFetcher and proto-blue's FetchHandler are #[async_trait].
 async-trait = "0.1"
 url = "2"
+unicode-normalization = "0.1"

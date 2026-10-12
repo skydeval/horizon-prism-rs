@@ -8,8 +8,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 
 use super::classifier::KryphocronKind;
+use super::extract::PostExtract;
 use super::normalize::{blob_cid, cid_link};
 use crate::db::locks::uri_author;
+use crate::hydration::feed::media_type;
 
 /// Future-dated records are clamped to this far past indexing (§5.12).
 pub const MAX_FUTURE_SKEW: TimeDelta = TimeDelta::minutes(5);
@@ -69,6 +71,10 @@ pub struct PostRecord {
     pub facets: Option<Value>,
     pub mention_dids: Vec<String>,
     pub self_labels: Vec<String>,
+    /// Search and trend inputs (design-v3 §3.1).
+    pub extract: PostExtract,
+    /// `images`, `video` or `gallery` (§8.4).
+    pub media_type: Option<&'static str>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -121,6 +127,8 @@ impl PostRecord {
             facets,
             mention_dids,
             self_labels,
+            extract: PostExtract::of(record),
+            media_type: media_type(record),
             created_at: created_at(record, now),
         })
     }
@@ -154,10 +162,18 @@ fn mentions(facets: &Value) -> Vec<String> {
     out
 }
 
+/// An optional strong reference: absent, or unusable, is `None`. A broken
+/// optional field does not fail its record.
+fn optional_ref(v: Option<&Value>) -> Option<StrongRef> {
+    strong_ref(v.filter(|v| !v.is_null()), "ref").ok()
+}
+
 /// `app.bsky.feed.like` / `app.bsky.feed.repost`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubjectRecord {
     pub subject: StrongRef,
+    /// The repost this like or repost came through (design-v3 §3.1).
+    pub via: Option<StrongRef>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -168,6 +184,7 @@ impl SubjectRecord {
     pub fn parse(record: &Value, now: DateTime<Utc>) -> Result<Self, RecordError> {
         Ok(Self {
             subject: strong_ref(record.get("subject"), "subject")?,
+            via: optional_ref(record.get("via")),
             created_at: created_at(record, now),
         })
     }
@@ -177,6 +194,8 @@ impl SubjectRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphRecord {
     pub subject_did: String,
+    /// The starter pack that led to this follow (design-v3 §3.1).
+    pub via: Option<StrongRef>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -192,6 +211,7 @@ impl GraphRecord {
             .ok_or_else(|| err("subject is not a DID"))?;
         Ok(Self {
             subject_did: subject.to_string(),
+            via: optional_ref(record.get("via")),
             created_at: created_at(record, now),
         })
     }
@@ -204,17 +224,31 @@ pub struct ProfileRecord {
     pub description: Option<String>,
     pub avatar_cid: Option<String>,
     pub banner_cid: Option<String>,
+    pub pronouns: Option<String>,
+    pub website: Option<String>,
+    pub joined_via_starter_pack: Option<StrongRef>,
+    /// The record's `createdAt`, clamped as for posts; `None` when the
+    /// record has none or it does not parse.
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 impl ProfileRecord {
     #[must_use]
-    pub fn parse(record: &Value) -> Self {
+    pub fn parse(record: &Value, now: DateTime<Utc>) -> Self {
         let text = |k: &str| record.get(k).and_then(Value::as_str).map(str::to_string);
         Self {
             display_name: text("displayName"),
             description: text("description"),
             avatar_cid: record.get("avatar").and_then(blob_cid),
             banner_cid: record.get("banner").and_then(blob_cid),
+            pronouns: text("pronouns"),
+            website: text("website"),
+            joined_via_starter_pack: optional_ref(record.get("joinedViaStarterPack")),
+            created_at: record
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc).min(now + MAX_FUTURE_SKEW)),
         }
     }
 }
@@ -323,11 +357,33 @@ mod tests {
         assert_eq!(follow.subject_did, "did:plc:b");
         assert!(GraphRecord::parse(&json!({"subject": "bob"}), now()).is_err());
 
-        let profile = ProfileRecord::parse(&json!({
-            "displayName": "B",
-            "avatar": {"$type": "blob", "ref": "bafyavatar"},
-            "banner": {"$type": "blob", "ref": {"$link": "bafybanner"}}
-        }));
+        // `via` is optional, and a broken one does not fail the record.
+        assert_eq!(like.via, None);
+        let via = json!({"uri": "at://did:plc:r/app.bsky.feed.repost/9", "cid": "bafyvia"});
+        let through = SubjectRecord::parse(&json!({"subject": {"uri": "at://did:plc:a/app.bsky.feed.post/1"}, "via": via}), now()).expect("like");
+        assert_eq!(through.via.as_ref().map(|v| (v.uri.as_str(), v.cid.as_deref())), Some(("at://did:plc:r/app.bsky.feed.repost/9", Some("bafyvia"))));
+        let pack = json!({"uri": "at://did:plc:p/app.bsky.graph.starterpack/1", "cid": "bafypack"});
+        let joined = GraphRecord::parse(&json!({"subject": "did:plc:b", "via": pack}), now()).expect("follow");
+        assert_eq!(joined.via.map(|v| v.uri), Some("at://did:plc:p/app.bsky.graph.starterpack/1".to_string()));
+        assert_eq!(GraphRecord::parse(&json!({"subject": "did:plc:b", "via": "junk"}), now()).expect("follow").via, None);
+
+        let profile = ProfileRecord::parse(
+            &json!({
+                "displayName": "B",
+                "avatar": {"$type": "blob", "ref": "bafyavatar"},
+                "banner": {"$type": "blob", "ref": {"$link": "bafybanner"}},
+                "pronouns": "it/its",
+                "website": "https://b.example",
+                "joinedViaStarterPack": pack,
+                "createdAt": "2030-01-01T00:00:00Z"
+            }),
+            now(),
+        );
+        assert_eq!(profile.pronouns.as_deref(), Some("it/its"));
+        assert_eq!(profile.website.as_deref(), Some("https://b.example"));
+        assert_eq!(profile.joined_via_starter_pack.as_ref().and_then(|p| p.cid.as_deref()), Some("bafypack"));
+        assert_eq!(profile.created_at, Some(now() + MAX_FUTURE_SKEW), "clamped like a post's");
+        assert_eq!(ProfileRecord::parse(&json!({}), now()).created_at, None);
         assert_eq!(profile.display_name.as_deref(), Some("B"));
         assert_eq!(profile.avatar_cid.as_deref(), Some("bafyavatar"));
         assert_eq!(profile.banner_cid.as_deref(), Some("bafybanner"));

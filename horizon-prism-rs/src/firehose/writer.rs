@@ -304,7 +304,7 @@ fn build_upsert(
             let subjects = vec![g.subject_did.clone()];
             (Body::Block(g), subjects)
         }
-        RecordClass::Ecosystem(EcosystemKind::Profile) => (Body::Profile(ProfileRecord::parse(record)), Vec::new()),
+        RecordClass::Ecosystem(EcosystemKind::Profile) => (Body::Profile(ProfileRecord::parse(record, now)), Vec::new()),
         RecordClass::Kryphocron { kind: Some(k), .. } => (Body::Private, private_subjects(k, record)?),
         RecordClass::Kryphocron { kind: None, .. } | RecordClass::Unindexed => {
             return Err(RecordError("not an indexed class".to_string()));
@@ -789,15 +789,20 @@ async fn upsert_post(conn: &mut PgConnection, u: &Upsert, p: &PostRecord, rev: &
     let n = sqlx::query(
         "INSERT INTO posts (uri, author_did, rkey, cid, rev, text, langs, \
            reply_root_uri, reply_root_cid, reply_parent_uri, reply_parent_cid, quote_uri, \
-           embed, facets, mention_dids, self_labels, record, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+           embed, facets, mention_dids, self_labels, record, created_at, \
+           tags, link_domains, link_urls, lang_prefixes, embed_type, media_type, search_tsv) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
+           $19, $20, $21, $22, $23, $24, to_tsvector('simple', $6)) \
          ON CONFLICT (uri) DO UPDATE SET author_did = EXCLUDED.author_did, rkey = EXCLUDED.rkey, \
            cid = EXCLUDED.cid, rev = EXCLUDED.rev, text = EXCLUDED.text, langs = EXCLUDED.langs, \
            reply_root_uri = EXCLUDED.reply_root_uri, reply_root_cid = EXCLUDED.reply_root_cid, \
            reply_parent_uri = EXCLUDED.reply_parent_uri, reply_parent_cid = EXCLUDED.reply_parent_cid, \
            quote_uri = EXCLUDED.quote_uri, embed = EXCLUDED.embed, facets = EXCLUDED.facets, \
            mention_dids = EXCLUDED.mention_dids, self_labels = EXCLUDED.self_labels, \
-           record = EXCLUDED.record, created_at = EXCLUDED.created_at \
+           record = EXCLUDED.record, created_at = EXCLUDED.created_at, \
+           tags = EXCLUDED.tags, link_domains = EXCLUDED.link_domains, link_urls = EXCLUDED.link_urls, \
+           lang_prefixes = EXCLUDED.lang_prefixes, embed_type = EXCLUDED.embed_type, \
+           media_type = EXCLUDED.media_type, search_tsv = EXCLUDED.search_tsv \
          WHERE posts.rev < EXCLUDED.rev",
     )
     .bind(&u.uri)
@@ -818,6 +823,12 @@ async fn upsert_post(conn: &mut PgConnection, u: &Upsert, p: &PostRecord, rev: &
     .bind(&p.self_labels)
     .bind(&u.record)
     .bind(p.created_at)
+    .bind(&p.extract.tags)
+    .bind(&p.extract.link_domains)
+    .bind(&p.extract.link_urls)
+    .bind(&p.extract.lang_prefixes)
+    .bind(p.extract.embed_type.as_deref())
+    .bind(p.media_type)
     .execute(conn)
     .await?
     .rows_affected();
@@ -832,10 +843,11 @@ async fn upsert_subject(
     rev: &str,
 ) -> Result<bool, sqlx::Error> {
     let sql = format!(
-        "INSERT INTO {table} (uri, author_did, subject_uri, subject_cid, rev, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+        "INSERT INTO {table} (uri, author_did, subject_uri, subject_cid, rev, created_at, via_uri, via_cid) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (uri) DO UPDATE SET author_did = EXCLUDED.author_did, subject_uri = EXCLUDED.subject_uri, \
-           subject_cid = EXCLUDED.subject_cid, rev = EXCLUDED.rev, created_at = EXCLUDED.created_at \
+           subject_cid = EXCLUDED.subject_cid, rev = EXCLUDED.rev, created_at = EXCLUDED.created_at, \
+           via_uri = EXCLUDED.via_uri, via_cid = EXCLUDED.via_cid \
          WHERE {table}.rev < EXCLUDED.rev"
     );
     let n = sqlx::query(&sql)
@@ -845,6 +857,8 @@ async fn upsert_subject(
         .bind(s.subject.cid.as_deref())
         .bind(rev)
         .bind(s.created_at)
+        .bind(s.via.as_ref().map(|v| v.uri.as_str()))
+        .bind(s.via.as_ref().and_then(|v| v.cid.as_deref()))
         .execute(conn)
         .await?
         .rows_affected();
@@ -860,21 +874,34 @@ async fn upsert_graph(
     g: &GraphRecord,
     rev: &str,
 ) -> Result<Option<bool>, sqlx::Error> {
+    // Only follows carry `via` (the starter pack that led to them); blocks
+    // have no such columns.
+    let (via_columns, via_values, via_set) = if table == "follows" {
+        (", via_uri, via_cid", ", $6, $7", ", via_uri = EXCLUDED.via_uri, via_cid = EXCLUDED.via_cid")
+    } else {
+        ("", "", "")
+    };
     let sql = format!(
-        "INSERT INTO {table} (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO {table} (uri, author_did, subject_did, rev, created_at{via_columns}) VALUES ($1, $2, $3, $4, $5{via_values}) \
          ON CONFLICT (uri) DO UPDATE SET author_did = EXCLUDED.author_did, subject_did = EXCLUDED.subject_did, \
-           rev = EXCLUDED.rev, created_at = EXCLUDED.created_at \
+           rev = EXCLUDED.rev, created_at = EXCLUDED.created_at{via_set} \
          WHERE {table}.rev < EXCLUDED.rev \
          RETURNING (xmax = 0)"
     );
-    sqlx::query_scalar(&sql)
+    let query = sqlx::query_scalar(&sql)
         .bind(&u.uri)
         .bind(&u.input.author)
         .bind(&g.subject_did)
         .bind(rev)
-        .bind(g.created_at)
-        .fetch_optional(conn)
-        .await
+        .bind(g.created_at);
+    let query = if table == "follows" {
+        query
+            .bind(g.via.as_ref().map(|v| v.uri.as_str()))
+            .bind(g.via.as_ref().and_then(|v| v.cid.as_deref()))
+    } else {
+        query
+    };
+    query.fetch_optional(conn).await
 }
 
 async fn upsert_profile(
@@ -883,14 +910,31 @@ async fn upsert_profile(
     p: &ProfileRecord,
     rev: &str,
 ) -> Result<bool, sqlx::Error> {
+    // A newer rev replaces the profile. An equal rev only fills a missing
+    // `profile_cid` (design-v3 §12.2): rows written before the column
+    // existed get their CID from a re-sync whose rev equals the stored one,
+    // and nothing else of the row changes in that case.
     let n = sqlx::query(
-        "INSERT INTO actors (did, display_name, description, avatar_cid, banner_cid, profile_rev, profile_record) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         ON CONFLICT (did) DO UPDATE SET display_name = EXCLUDED.display_name, \
-           description = EXCLUDED.description, avatar_cid = EXCLUDED.avatar_cid, \
-           banner_cid = EXCLUDED.banner_cid, profile_rev = EXCLUDED.profile_rev, \
-           profile_record = EXCLUDED.profile_record \
-         WHERE actors.profile_rev IS NULL OR actors.profile_rev < EXCLUDED.profile_rev",
+        "INSERT INTO actors AS a (did, display_name, description, avatar_cid, banner_cid, profile_rev, profile_record, \
+           profile_cid, pronouns, website, joined_via_starter_pack_uri, joined_via_starter_pack_cid, profile_created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+         ON CONFLICT (did) DO UPDATE SET \
+           display_name = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.display_name ELSE EXCLUDED.display_name END, \
+           description = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.description ELSE EXCLUDED.description END, \
+           avatar_cid = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.avatar_cid ELSE EXCLUDED.avatar_cid END, \
+           banner_cid = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.banner_cid ELSE EXCLUDED.banner_cid END, \
+           profile_record = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.profile_record ELSE EXCLUDED.profile_record END, \
+           pronouns = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.pronouns ELSE EXCLUDED.pronouns END, \
+           website = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.website ELSE EXCLUDED.website END, \
+           joined_via_starter_pack_uri = CASE WHEN a.profile_rev = EXCLUDED.profile_rev \
+             THEN a.joined_via_starter_pack_uri ELSE EXCLUDED.joined_via_starter_pack_uri END, \
+           joined_via_starter_pack_cid = CASE WHEN a.profile_rev = EXCLUDED.profile_rev \
+             THEN a.joined_via_starter_pack_cid ELSE EXCLUDED.joined_via_starter_pack_cid END, \
+           profile_created_at = CASE WHEN a.profile_rev = EXCLUDED.profile_rev \
+             THEN a.profile_created_at ELSE EXCLUDED.profile_created_at END, \
+           profile_cid = EXCLUDED.profile_cid, profile_rev = EXCLUDED.profile_rev \
+         WHERE a.profile_rev IS NULL OR a.profile_rev < EXCLUDED.profile_rev \
+            OR (a.profile_cid IS NULL AND a.profile_record IS NOT NULL AND a.profile_rev = EXCLUDED.profile_rev)",
     )
     .bind(&u.input.author)
     .bind(p.display_name.as_deref())
@@ -899,6 +943,12 @@ async fn upsert_profile(
     .bind(p.banner_cid.as_deref())
     .bind(rev)
     .bind(&u.record)
+    .bind(&u.cid)
+    .bind(p.pronouns.as_deref())
+    .bind(p.website.as_deref())
+    .bind(p.joined_via_starter_pack.as_ref().map(|s| s.uri.as_str()))
+    .bind(p.joined_via_starter_pack.as_ref().and_then(|s| s.cid.as_deref()))
+    .bind(p.created_at)
     .execute(conn)
     .await?
     .rows_affected();
@@ -919,7 +969,9 @@ async fn delete_row(conn: &mut PgConnection, table: &'static str, uri: &str, rev
 async fn delete_profile(conn: &mut PgConnection, did: &str, rev: &str) -> Result<bool, sqlx::Error> {
     Ok(sqlx::query(
         "UPDATE actors SET display_name = NULL, description = NULL, avatar_cid = NULL, \
-           banner_cid = NULL, profile_record = NULL, profile_rev = $2 \
+           banner_cid = NULL, profile_record = NULL, profile_cid = NULL, pronouns = NULL, website = NULL, \
+           joined_via_starter_pack_uri = NULL, joined_via_starter_pack_cid = NULL, profile_created_at = NULL, \
+           profile_rev = $2 \
          WHERE did = $1 AND profile_record IS NOT NULL AND (profile_rev IS NULL OR profile_rev <= $2)",
     )
     .bind(did)
@@ -1088,6 +1140,7 @@ mod tests {
                 uri: format!("at://{MEMBER}/app.bsky.feed.post/1"),
                 cid: None,
             },
+            via: None,
             created_at: Utc::now(),
         });
         let n = notifications_for("did:plc:x", &like, &s);
@@ -1171,6 +1224,101 @@ mod tests {
                 .fetch_optional(pool)
                 .await
                 .expect("query post")
+        }
+
+        /// design-v3 §3.1, §3.2: the columns the v3 migrations added.
+        #[tokio::test]
+        async fn new_columns_are_extracted_on_write() {
+            let Some(db) = fresh_db("writer_new_columns").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, false);
+            let raw = |collection: &str, rkey: &str, cid: &str, record: Value| RawOp {
+                action: Action::Create,
+                collection: collection.into(),
+                rkey: rkey.into(),
+                cid: Some(cid.into()),
+                record: Some(record),
+            };
+            let via = json!({"uri": "at://did:plc:pack/app.bsky.graph.starterpack/1", "cid": "bafyvia"});
+            let ops = [
+                raw(
+                    "app.bsky.feed.post",
+                    RKEY,
+                    "bafypost",
+                    json!({
+                        "text": "Hello Rust world", "langs": ["en-US"], "tags": ["Cats"],
+                        "facets": [{"features": [
+                            {"$type": "app.bsky.richtext.facet#tag", "tag": "rust"},
+                            {"$type": "app.bsky.richtext.facet#link", "uri": "https://News.Example.com/a#x"},
+                        ]}],
+                        "embed": {"$type": "app.bsky.embed.video", "video": {}},
+                    }),
+                ),
+                raw("app.bsky.feed.like", "3kl", "bafylike", json!({"subject": {"uri": format!("at://{SUBJECT}/app.bsky.feed.post/1"), "cid": "c"}, "via": via})),
+                raw("app.bsky.graph.follow", "3kf", "bafyfollow", json!({"subject": SUBJECT, "via": via})),
+                raw("app.bsky.graph.block", "3kb", "bafyblock", json!({"subject": SUBJECT})),
+                raw(
+                    "app.bsky.actor.profile",
+                    "self",
+                    "bafyprofile",
+                    json!({"displayName": "A", "pronouns": "it/its", "website": "https://a.example",
+                           "joinedViaStarterPack": via, "createdAt": "2026-01-01T00:00:00Z"}),
+                ),
+            ];
+            let report = w.apply(AUTHOR, &rev(1), &ops, OPTIONS).await.expect("apply");
+            assert!(report.failed.is_empty(), "{:?}", report.failed);
+
+            type PostRow = (Vec<String>, Vec<String>, Vec<String>, Vec<String>, Option<String>, Option<String>, bool);
+            let post: PostRow = sqlx::query_as(
+                "SELECT tags, link_domains, link_urls, lang_prefixes, embed_type, media_type, \
+                        search_tsv @@ websearch_to_tsquery('simple', 'rust world') FROM posts",
+            )
+            .fetch_one(p)
+            .await
+            .expect("post");
+            assert_eq!(post.0, ["cats", "rust"]);
+            assert_eq!(post.1, ["example.com", "news.example.com"]);
+            assert_eq!(post.2, ["https://news.example.com/a"]);
+            assert_eq!(post.3, ["en", "en-us"]);
+            assert_eq!((post.4.as_deref(), post.5.as_deref(), post.6), (Some("app.bsky.embed.video"), Some("video"), true));
+            // The tag trigger saw the tags the writer stored.
+            let tagged: i64 = sqlx::query_scalar("SELECT count(*) FROM tag_activity_hourly WHERE posts = 1")
+                .fetch_one(p)
+                .await
+                .expect("tags");
+            assert_eq!(tagged, 2);
+
+            let like_via: (Option<String>, Option<String>) = sqlx::query_as("SELECT via_uri, via_cid FROM likes").fetch_one(p).await.expect("like");
+            assert_eq!(like_via, (Some("at://did:plc:pack/app.bsky.graph.starterpack/1".into()), Some("bafyvia".into())));
+            let follow_via: Option<String> = sqlx::query_scalar("SELECT via_uri FROM follows").fetch_one(p).await.expect("follow");
+            assert_eq!(follow_via.as_deref(), Some("at://did:plc:pack/app.bsky.graph.starterpack/1"));
+            let blocks: i64 = sqlx::query_scalar("SELECT count(*) FROM blocks").fetch_one(p).await.expect("block");
+            assert_eq!(blocks, 1);
+
+            type ProfileRow = (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, bool);
+            let profile_sql = "SELECT profile_cid, pronouns, website, joined_via_starter_pack_uri, display_name, \
+                               profile_created_at = '2026-01-01T00:00:00Z' FROM actors WHERE did = $1";
+            let profile: ProfileRow = sqlx::query_as(profile_sql).bind(AUTHOR).fetch_one(p).await.expect("profile");
+            assert_eq!(profile.0.as_deref(), Some("bafyprofile"));
+            assert_eq!((profile.1.as_deref(), profile.2.as_deref()), (Some("it/its"), Some("https://a.example")));
+            assert_eq!(profile.3.as_deref(), Some("at://did:plc:pack/app.bsky.graph.starterpack/1"));
+            assert!(profile.5);
+
+            // A row written before `profile_cid` existed gets it from a
+            // re-sync at the same rev, and nothing else of the row changes.
+            sqlx::query("UPDATE actors SET profile_cid = NULL WHERE did = $1").bind(AUTHOR).execute(p).await.expect("clear");
+            let resync = [raw("app.bsky.actor.profile", "self", "bafyprofile", json!({"displayName": "Changed"}))];
+            w.apply(AUTHOR, &rev(1), &resync, OPTIONS).await.expect("apply");
+            let profile: ProfileRow = sqlx::query_as(profile_sql).bind(AUTHOR).fetch_one(p).await.expect("profile");
+            assert_eq!((profile.0.as_deref(), profile.4.as_deref(), profile.1.as_deref()), (Some("bafyprofile"), Some("A"), Some("it/its")));
+            // With the CID present, an equal rev changes nothing.
+            let again = [raw("app.bsky.actor.profile", "self", "bafyother", json!({"displayName": "Changed"}))];
+            w.apply(AUTHOR, &rev(1), &again, OPTIONS).await.expect("apply");
+            let profile: ProfileRow = sqlx::query_as(profile_sql).bind(AUTHOR).fetch_one(p).await.expect("profile");
+            assert_eq!((profile.0.as_deref(), profile.4.as_deref()), (Some("bafyprofile"), Some("A")));
+            db.drop_db().await;
         }
 
         #[tokio::test]
