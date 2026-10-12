@@ -122,6 +122,18 @@ docker compose ps app
 
 `app` must report `healthy`.
 
+### After the 0004–0017 upgrade
+
+Migrations 0004 to 0017 ship together. They add tables and columns and build no index on the large tables, so the downtime in step 2 is short. The rest of the upgrade runs in the background while `app` serves and ingests:
+
+1. **Old rows are filled.** A task fills the new search and trend columns for posts written before the upgrade, in batches. Until it finishes, search and trends miss those posts.
+2. **The search indexes are built**, one at a time, without blocking writes. Until they exist, search runs slowly.
+3. **Known accounts are re-synced** once, one a second, to fetch the record types this version adds (lists, starter packs, gates and others).
+
+Watch progress with the authenticated `_health` detail (`schema_backfill_done`, `search_indexes_ready`) or the metrics `schema_backfill_remaining{table}` and `schema_index_pending`. A failed index build is retried by itself; `schema_index_build_failures_total{index}` counts the failures.
+
+**Disk.** Step 1 rewrites every old `posts` row. Expect the `posts` table and its existing indexes to grow, up to about twice their size, and leave that much free space before upgrading. Postgres reuses the space afterwards but does not return it to the filesystem.
+
 **Restore a backup** (destructive to current data):
 
 ```sh
