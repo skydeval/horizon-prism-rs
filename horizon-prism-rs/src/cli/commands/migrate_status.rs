@@ -69,6 +69,7 @@ mod tests {
             "0015_drafts",
             "0016_search_and_trends",
             "0017_backfill_generation",
+            "0018_subscribed_list_purpose",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

@@ -12,6 +12,14 @@ commit.
 
 ### Added
 
+- **Item 12: migration `0018_subscribed_list_purpose` (#673).** Four
+  optional columns for the rule that a member's own list block or list
+  mute has an effect only on a moderation list: a subscribed list's
+  purpose, the revision it was read at, since when its record has been
+  missing, and a mark on a reference whose list record was not found.
+  Nothing reads or writes them yet; the migration ships before the code
+  that fills those tables, so it has no data to convert
+  (design-v3 §4.3 "List purpose", §12.1).
 - **Item 15: `com.atproto.identity.resolveHandle` (#675).** The account a
   handle belongs to. Bad syntax is refused before anything is looked up.
   An indexed account's stored handle is answered at once. Otherwise the
