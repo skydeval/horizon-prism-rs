@@ -33,6 +33,10 @@ const MAX_PURPOSE_BYTES: usize = 512;
 const UNLISTED_CLEARS_AFTER_HOURS: i32 = 24;
 
 pub const METRIC_PURPOSE_WRITE_ERRORS: &str = "list_purpose_write_errors_total";
+pub const METRIC_BATCH_RETRIES: &str = "list_sync_batch_retries_total";
+/// A batch that keeps losing to other transactions fails the run after
+/// this many more tries.
+const BATCH_ATTEMPTS: u32 = 5;
 
 /// One active list of the owner as the run found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,18 +339,23 @@ pub async fn reconcile(pool: &PgPool, snap: &Snapshot, listing: &Listing, limits
         acts.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let mut whole = true;
         for batch in acts.chunks(BATCH) {
-            let mut tx = pool.begin().await?;
-            let uris: Vec<String> = batch.iter().map(|(uri, _)| (*uri).to_string()).collect();
-            lock_uris(&mut tx, &uris).await?;
-            if !same_instance(&mut tx, list).await? {
+            // A deadlock with a firehose write of the same owner is re-run
+            // from the batch's run check; it never fails the job.
+            let mut attempt = 0;
+            let same = loop {
+                match one_batch(pool, snap, list, listing, batch).await {
+                    Err(Stopped::Db(error)) if retryable(&error) && attempt < BATCH_ATTEMPTS => {
+                        attempt += 1;
+                        metrics::counter!(METRIC_BATCH_RETRIES).increment(1);
+                        tokio::time::sleep(std::time::Duration::from_millis(50 * u64::from(attempt))).await;
+                    }
+                    other => break other?,
+                }
+            };
+            if !same {
                 whole = false;
                 break;
             }
-            if !current(&mut tx, snap).await? {
-                return Err(Stopped::Superseded);
-            }
-            write_batch(&mut tx, snap, list, listing, batch).await?;
-            tx.commit().await?;
         }
         if whole {
             served.insert(list.uri.clone());
@@ -367,6 +376,29 @@ pub async fn reconcile(pool: &PgPool, snap: &Snapshot, listing: &Listing, limits
         metrics::counter!(METRIC_TOMBSTONES_EVICTED).increment(evicted);
     }
     Ok(served)
+}
+
+/// A deadlock or a serialization failure: the transaction lost to another
+/// and can be run again as it is.
+fn retryable(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if matches!(db.code().as_deref(), Some("40P01" | "40001")))
+}
+
+/// One batch, in one transaction. Returns whether the list is still the
+/// row instance the run began with; if not, nothing was written.
+async fn one_batch(pool: &PgPool, snap: &Snapshot, list: &SnapList, listing: &Listing, batch: &[(&str, Act<'_>)]) -> Result<bool, Stopped> {
+    let mut tx = pool.begin().await?;
+    let uris: Vec<String> = batch.iter().map(|(uri, _)| (*uri).to_string()).collect();
+    lock_uris(&mut tx, &uris).await?;
+    if !same_instance(&mut tx, list).await? {
+        return Ok(false);
+    }
+    if !current(&mut tx, snap).await? {
+        return Err(Stopped::Superseded);
+    }
+    write_batch(&mut tx, snap, list, listing, batch).await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Whether `uri` is among the `max` smallest record keys of `items`.
