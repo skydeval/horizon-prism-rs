@@ -82,6 +82,22 @@ commit.
   table follows `did_cache` with up to 30 s delay instead of being updated
   on each write; only the table counts as an in-memory key (not
   kryphocron's own cache or the fetch cell).
+- **Item 11: migrations 0004–0011 and 0013–0017 (#671).** The schema of
+  design-v3 §3.1: lists, list items, list blocks and opt-outs; the rule-4
+  subscription tables with `subscribed_lists.item_count` kept by
+  triggers; list and thread mutes; starter packs and their counts;
+  labeler declarations and the other rkey-self actor records; thread and
+  post gates; poll posts; bookmarks, drafts, activity subscriptions and
+  notification preferences v2; `via` references on follows, likes and
+  reposts; profile columns on `actors`; search and trend columns on
+  `posts`; `tag_activity_hourly` with its `posts`, `likes` and `reposts`
+  triggers; backfill job generations. Every change is additive, and none
+  builds an index on `posts`, `likes` or `reposts`. Nothing writes or
+  reads the new tables and columns yet. With 0012 they ship as one
+  upgrade.
+  - The startup check that every member can refresh its key once per
+    window from PLC's issuer-refresh slice is added (`community.max_members`
+    against `identity.member_pool_refresh_secs`, design-v3 §13).
 - **Item 10: an in-scope author's feed continues from its PDS (G-3,
   #670).** When `getAuthorFeed` runs out of stored rows for an in-scope
   author whose PDS lists records newest first, it emits a

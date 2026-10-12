@@ -241,6 +241,70 @@ mod tests {
         }
     }
 
+    /// Migration 0016's triggers (design-v3 §7.5): `tag_activity_hourly`
+    /// follows posts, replies, likes and reposts.
+    #[tokio::test]
+    async fn tag_activity_follows_posts_and_engagement() {
+        let Some(db) = crate::test_support::fresh_db("tag_activity_triggers").await else {
+            return;
+        };
+        let p = &db.pool;
+        let exec = |sql: String| async move { sqlx::query(&sql).execute(p).await.unwrap_or_else(|e| panic!("{sql}: {e}")) };
+        let post = |rkey: &str, tags: &str, age: &str, parent: &str| {
+            format!(
+                "INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at, tags, reply_parent_uri) VALUES \
+                 ('at://did:plc:a/app.bsky.feed.post/{rkey}', 'did:plc:a', '{rkey}', 'c', '3k', '{{}}', now() - interval '{age}', {tags}, {parent})"
+            )
+        };
+        let engage = |table: &str, rkey: &str, subject: &str| {
+            format!(
+                "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES \
+                 ('at://did:plc:b/x/{rkey}', 'did:plc:b', 'at://did:plc:a/app.bsky.feed.post/{subject}', '3k', now())"
+            )
+        };
+        // (posts, likes, reposts, replies) summed over hours, per tag.
+        let totals = || async {
+            let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
+                "SELECT tag, sum(posts)::bigint, sum(likes)::bigint, sum(reposts)::bigint, sum(replies)::bigint \
+                 FROM tag_activity_hourly GROUP BY tag ORDER BY tag",
+            )
+            .fetch_all(p)
+            .await
+            .expect("totals");
+            rows
+        };
+        let row = |tag: &str, n: (i64, i64, i64, i64)| (tag.to_string(), n.0, n.1, n.2, n.3);
+
+        exec(post("root", "ARRAY['cats','rust']", "1 minute", "NULL")).await;
+        // A post with no tags, and one too old to aggregate.
+        exec(post("plain", "NULL", "1 minute", "NULL")).await;
+        exec(post("old", "ARRAY['old']", "100 hours", "NULL")).await;
+        assert_eq!(totals().await, [row("cats", (1, 0, 0, 0)), row("rust", (1, 0, 0, 0))]);
+
+        // A reply counts for its parent's tags and for its own.
+        exec(post("reply", "ARRAY['rust']", "0 minutes", "'at://did:plc:a/app.bsky.feed.post/root'")).await;
+        exec(engage("likes", "l1", "root")).await;
+        exec(engage("likes", "l2", "root")).await;
+        exec(engage("reposts", "r1", "root")).await;
+        // Engagement on an old post, or on one not stored here, adds nothing.
+        exec(engage("likes", "l3", "old")).await;
+        exec(engage("likes", "l4", "missing")).await;
+        assert_eq!(totals().await, [row("cats", (1, 2, 1, 1)), row("rust", (2, 2, 1, 1))]);
+
+        // Deletes take their contribution back.
+        exec("DELETE FROM likes WHERE uri = 'at://did:plc:b/x/l1'".into()).await;
+        exec("DELETE FROM posts WHERE rkey = 'reply'".into()).await;
+        assert_eq!(totals().await, [row("cats", (1, 1, 1, 0)), row("rust", (1, 1, 1, 0))]);
+
+        // Retagging a post moves its own count.
+        exec("UPDATE posts SET tags = ARRAY['dogs','rust'] WHERE rkey = 'root'".into()).await;
+        assert_eq!(
+            totals().await,
+            [row("cats", (0, 1, 1, 0)), row("dogs", (1, 0, 0, 0)), row("rust", (1, 1, 1, 0))]
+        );
+        db.drop_db().await;
+    }
+
     #[test]
     fn empty_database_has_everything_pending() {
         let p = plan(&[known(1, 1), known(2, 2)], &[]);

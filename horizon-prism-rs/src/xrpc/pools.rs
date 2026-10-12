@@ -686,6 +686,19 @@ pub fn problems(cfg: &FileConfig, out: &mut Vec<String>) {
     }
     if cfg.identity.member_pool_refresh_secs < 60 {
         out.push("identity.member_pool_refresh_secs must be at least 60".to_string());
+    } else {
+        // Every member must be able to refresh once per window from the
+        // issuer-refresh slice: half of PLC's member pool (§13, R3-209).
+        let slice_rate = 0.5 * (1.0 - fraction) * cfg.identity.plc_request_rate_per_sec.0;
+        let needed = f64::from(cfg.community.max_members) / cfg.identity.member_pool_refresh_secs as f64;
+        if needed > slice_rate {
+            out.push(format!(
+                "community.max_members ({}) / identity.member_pool_refresh_secs ({}) must be at most \
+                 0.5 x (1 - constellation.nonmember_fraction ({fraction})) x identity.plc_request_rate_per_sec ({}), \
+                 the rate of PLC's issuer-refresh slice",
+                cfg.community.max_members, cfg.identity.member_pool_refresh_secs, cfg.identity.plc_request_rate_per_sec.0
+            ));
+        }
     }
     if cfg.sync.max_public_fallback_hosts < 1000 {
         out.push("sync.max_public_fallback_hosts must be at least 1000".to_string());
@@ -868,6 +881,7 @@ mod tests {
             ("[sync]\npublic_fallback_rate_per_host = 0.0\n", "sync.public_fallback_rate_per_host"),
             ("[sync]\nmax_public_fallback_hosts = 10\n", "sync.max_public_fallback_hosts"),
             ("[identity]\nmember_pool_refresh_secs = 5\n", "identity.member_pool_refresh_secs"),
+            ("[community]\nmax_members = 5000\n", "issuer-refresh slice"),
         ] {
             let out = check(toml);
             assert!(out.iter().any(|p| p.contains(needle)), "{needle:?} not in {out:?}");

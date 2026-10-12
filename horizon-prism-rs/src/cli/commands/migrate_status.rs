@@ -51,7 +51,27 @@ mod tests {
             return;
         };
         let out = render(&db.pool).await.expect("render");
-        assert_eq!(out, "0001_initial  applied\n0002_private_reply_cids  applied\n0003_eligibility_failures  applied\n0012_mute_scope  applied\nstatus: up to date");
+        let names = [
+            "0001_initial",
+            "0002_private_reply_cids",
+            "0003_eligibility_failures",
+            "0004_lists_and_starter_packs",
+            "0005_thread_mutes",
+            "0006_bookmarks",
+            "0007_activity_subscriptions",
+            "0008_notification_prefs_v2",
+            "0009_labeler_services",
+            "0010_poll_posts",
+            "0011_actor_view_completeness",
+            "0012_mute_scope",
+            "0013_via_refs",
+            "0014_threadgates_and_postgates",
+            "0015_drafts",
+            "0016_search_and_trends",
+            "0017_backfill_generation",
+        ];
+        let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
+        assert_eq!(out, expected.join("\n"));
         db.drop_db().await;
     }
 }
