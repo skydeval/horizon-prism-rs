@@ -12,6 +12,15 @@ commit.
 
 ### Added
 
+- **Item 12: the reference applier and the in-memory subscribed sets
+  (#673).** `subscriptions::applier` is the background task that runs the
+  list phase (on a signal, at startup with a full reconcile, and every
+  60 s), retries a busy list after a second, gives one that stays busy a
+  task that waits for it, and releases unreferenced lists in tasks of
+  their own. `ScopeState` now holds which lists are subscribed and whose
+  changes are tracked, set from the rows after each commit. The pairs of
+  members waiting on an owner's sync are kept in memory only. Not started
+  by `serve` yet (design-v3 §4.3).
 - **Item 12: `[lists]` settings for members' list mutes and blocks
   (#673).** The per-member budget (`subscribed_max_per_member` 25,
   `max_owners_per_member` 10, `subscribed_max_items` 50 000), the

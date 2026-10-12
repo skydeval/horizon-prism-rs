@@ -15,6 +15,7 @@ use sqlx::PgPool;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::config::ScopePolicy;
+use crate::db::locks::uri_author;
 use crate::db::{ScopeGuard, ScopeReadGuard};
 use crate::identity::PersistencePolicy;
 use crate::private_tier::PrivateTier;
@@ -58,6 +59,33 @@ pub struct ScopeSets {
     pub purging: HashMap<String, PurgeKind>,
     /// Follow rows authored by each member (§9.4 follow cap).
     pub member_follows: HashMap<String, u32>,
+    /// Rule 4's in-memory sets (design-v3 §4.3 "The copy rule").
+    pub subscribed: Subscribed,
+}
+
+/// What the copy rule looks up for every list-item write: which lists are
+/// subscribed, whose changes are tracked, and how full each is. Set only
+/// from the `subscribed_lists` rows themselves, after the commit that
+/// changed them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Subscribed {
+    /// `L_sub`: each `active` list, with its copied-item count.
+    pub lists: HashMap<String, u32>,
+    /// `O_sub`: each owner with at least one `subscribed_lists` row
+    /// (active or being released), with its tombstone count.
+    pub owners: HashMap<String, u32>,
+}
+
+impl Subscribed {
+    #[must_use]
+    pub fn is_active(&self, list: &str) -> bool {
+        self.lists.contains_key(list)
+    }
+
+    #[must_use]
+    pub fn tracks(&self, owner: &str) -> bool {
+        self.owners.contains_key(owner)
+    }
 }
 
 impl ScopeSets {
@@ -157,6 +185,39 @@ impl ScopeState {
         self.sets.read().await.clone()
     }
 
+    /// Set `L_sub` and `O_sub` for `lists` and their owners from the rows as
+    /// they are now (design-v3 §4.3): called after a commit that changed a
+    /// `subscribed_lists` row. The rows are re-read under the write guard,
+    /// not taken from the caller's transaction, so commits that finish in
+    /// another order still end at the same sets.
+    ///
+    /// # Errors
+    ///
+    /// Any database error; the sets are unchanged on error.
+    pub async fn refresh_subscribed(&self, pool: &PgPool, lists: &[String]) -> Result<(), sqlx::Error> {
+        if lists.is_empty() {
+            return Ok(());
+        }
+        let owners: Vec<String> = lists.iter().filter_map(|l| uri_author(l).map(str::to_string)).collect();
+        let mut sets = self.write_guard().await;
+        let (active, tracked) = read_subscribed(pool, Some((lists, &owners))).await?;
+        for list in lists {
+            sets.subscribed.lists.remove(list);
+        }
+        sets.subscribed.lists.extend(active);
+        for owner in &owners {
+            if !tracked.contains_key(owner) {
+                sets.subscribed.owners.remove(owner);
+            }
+        }
+        // An owner already tracked keeps its in-memory tombstone count; one
+        // that enters gets its count from the table.
+        for (owner, tombstones) in tracked {
+            sets.subscribed.owners.entry(owner).or_insert(tombstones);
+        }
+        Ok(())
+    }
+
     /// Replace every set with a fresh load (after a rebuild).
     ///
     /// # Errors
@@ -167,6 +228,33 @@ impl ScopeState {
         *self.write_guard().await = fresh;
         Ok(())
     }
+}
+
+/// The active lists with their item counts, and the tracked owners with
+/// their tombstone counts: all of them, or those among `only`'s lists and
+/// owners.
+async fn read_subscribed(
+    pool: &PgPool,
+    only: Option<(&[String], &[String])>,
+) -> Result<(HashMap<String, u32>, HashMap<String, u32>), sqlx::Error> {
+    let (lists, owners) = only.map_or((None, None), |(l, o)| (Some(l), Some(o)));
+    let active: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT list_uri, item_count FROM subscribed_lists WHERE state = 'active' AND ($1::text[] IS NULL OR list_uri = ANY($1))",
+    )
+    .bind(lists)
+    .fetch_all(pool)
+    .await?;
+    let tracked: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT o.owner_did, (SELECT count(*) FROM subscription_tombstones t WHERE t.owner_did = o.owner_did) \
+         FROM (SELECT DISTINCT owner_did FROM subscribed_lists WHERE $1::text[] IS NULL OR owner_did = ANY($1)) o",
+    )
+    .bind(owners)
+    .fetch_all(pool)
+    .await?;
+    Ok((
+        active.into_iter().map(|(l, n)| (l, u32::try_from(n).unwrap_or(0))).collect(),
+        tracked.into_iter().map(|(o, n)| (o, u32::try_from(n).unwrap_or(u32::MAX))).collect(),
+    ))
 }
 
 async fn load_sets(pool: &PgPool, private: &dyn PrivateTier) -> Result<ScopeSets, sqlx::Error> {
@@ -182,7 +270,9 @@ async fn load_sets(pool: &PgPool, private: &dyn PrivateTier) -> Result<ScopeSets
     .fetch_all(pool)
     .await?;
     let private_owners = private.load_owners(pool).await?;
+    let (lists, owners) = read_subscribed(pool, None).await?;
     let mut sets = ScopeSets {
+        subscribed: Subscribed { lists, owners },
         members: members.into_iter().collect(),
         scope: scope.into_iter().collect(),
         private_owners,

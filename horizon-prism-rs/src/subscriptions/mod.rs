@@ -12,6 +12,7 @@
 //! the copy rule and the views that apply a reference are not built, so a
 //! stored reference has no effect on any view.
 
+pub mod applier;
 pub mod jobs;
 pub mod list_phase;
 pub mod references;

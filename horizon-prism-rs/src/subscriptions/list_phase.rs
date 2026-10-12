@@ -48,14 +48,33 @@ pub enum Applied {
     Busy,
 }
 
-/// The list-phase transaction for `list`.
+/// The list-phase transaction for `list`, never waiting on its row.
 ///
 /// # Errors
 ///
 /// Database errors.
 pub async fn apply(pool: &PgPool, list: &str, sync_min_interval_secs: u32) -> Result<Applied, sqlx::Error> {
+    apply_taking(pool, list, sync_min_interval_secs, false).await
+}
+
+/// The same transaction for a list that has been busy for a while: it
+/// waits for the row, up to 5 s (`55P03` past that, for the caller to
+/// retry). Run outside the applier's loop, by a task of its own, it holds
+/// nothing a member's request can wait on.
+///
+/// # Errors
+///
+/// Database errors, a lock timeout among them.
+pub async fn apply_waiting(pool: &PgPool, list: &str, sync_min_interval_secs: u32) -> Result<Applied, sqlx::Error> {
+    apply_taking(pool, list, sync_min_interval_secs, true).await
+}
+
+async fn apply_taking(pool: &PgPool, list: &str, sync_min_interval_secs: u32, wait: bool) -> Result<Applied, sqlx::Error> {
     let owner = uri_author(list).unwrap_or_default();
     let mut tx = pool.begin().await?;
+    if wait {
+        sqlx::query("SET LOCAL lock_timeout = '5s'").execute(&mut *tx).await?;
+    }
     // 1. The markers this pass answers for. Read before the `EXISTS` below,
     // so every change they stand for is visible to it.
     let markers: Vec<i64> = sqlx::query_scalar("SELECT seq FROM list_reference_changes WHERE list_uri = $1")
@@ -63,11 +82,12 @@ pub async fn apply(pool: &PgPool, list: &str, sync_min_interval_secs: u32) -> Re
         .fetch_all(&mut *tx)
         .await?;
     // 2. The row, without waiting for it.
-    let row: Option<String> = sqlx::query_scalar("SELECT state FROM subscribed_lists WHERE list_uri = $1 FOR UPDATE SKIP LOCKED")
+    let take = if wait { "FOR UPDATE" } else { "FOR UPDATE SKIP LOCKED" };
+    let row: Option<String> = sqlx::query_scalar(&format!("SELECT state FROM subscribed_lists WHERE list_uri = $1 {take}"))
         .bind(list)
         .fetch_optional(&mut *tx)
         .await?;
-    if row.is_none() {
+    if row.is_none() && !wait {
         // "No row" or "row locked": a plain read tells which.
         let held: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM subscribed_lists WHERE list_uri = $1)")
             .bind(list)
@@ -158,6 +178,28 @@ pub async fn marked(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar("SELECT list_uri FROM list_reference_changes GROUP BY list_uri ORDER BY min(seq)")
         .fetch_all(pool)
         .await
+}
+
+/// The lists a full reconcile must look at, marker or not (design-v3 §4.3
+/// "Crash safety"): a list with an admitted reference and no row; a row
+/// whose state disagrees with whether an admitted reference exists; and
+/// every `unreferenced` row, whose release may not be running.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn unreconciled(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT r.list_uri FROM list_references r \
+           WHERE r.admitted AND NOT EXISTS (SELECT 1 FROM subscribed_lists s WHERE s.list_uri = r.list_uri AND s.state = 'active') \
+         UNION \
+         SELECT s.list_uri FROM subscribed_lists s \
+           WHERE s.state = 'unreferenced' \
+              OR NOT EXISTS (SELECT 1 FROM list_references r WHERE r.list_uri = s.list_uri AND r.admitted) \
+         ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 /// How a release ended.
