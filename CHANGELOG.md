@@ -379,6 +379,12 @@ commit.
 
 ### Security
 
+- A service token whose `iat`, `exp` or `nbf` is too large to be a time is
+  rejected as `InvalidToken` before verification (#682). kryphocron 0.4.0
+  turns those claims into times with an addition that panics on overflow,
+  after the signature has verified, and anyone can sign a token for a DID
+  of their own. Such a request used to end in a panicked request task
+  instead of a 401.
 - `/xrpc/_health` answers anonymous callers with `{"ok","version"}` only;
   the db/redis/audit flags, per-relay watermarks, `private_watermark` and
   `gap_blocked` need a service JWT that verifies with `lxm` `_health` (no

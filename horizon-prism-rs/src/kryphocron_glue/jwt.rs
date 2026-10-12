@@ -101,6 +101,29 @@ fn unverified_iss(token: &str) -> Option<String> {
     Some(iss.to_string())
 }
 
+/// Whether a token's `iat`, `exp` and `nbf` can be turned into times.
+///
+/// kryphocron 0.4.0 builds them with `SystemTime + Duration`, which panics
+/// on overflow, after the signature has verified (#682). Anyone can sign a
+/// token for a DID of their own, so a value near `u64::MAX` must not reach
+/// it. A payload that does not parse is left for the verifier to reject.
+fn times_fit(token: &str, skew: Duration) -> bool {
+    let Some(payload) = token.split('.').nth(1).and_then(|p| URL_SAFE_NO_PAD.decode(p).ok()) else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&payload) else {
+        return true;
+    };
+    ["iat", "exp", "nbf"].iter().all(|claim| {
+        value.get(claim).and_then(serde_json::Value::as_u64).is_none_or(|secs| {
+            std::time::SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(secs))
+                .and_then(|t| t.checked_add(skew))
+                .is_some()
+        })
+    })
+}
+
 fn trace_id() -> TraceId {
     TraceId::from_bytes(rand::random())
 }
@@ -216,6 +239,9 @@ impl<F: IssuerRefresh> JwtVerifier<F> {
             return Err(AuthError::Required);
         };
         let token = raw.strip_prefix("Bearer ").unwrap_or(raw).trim();
+        if !times_fit(token, self.config.max_clock_skew) {
+            return Err(invalid("a time claim is out of range"));
+        }
         let iss = unverified_iss(token);
         let resolver = self.resolver.load_full();
         let deadline = Instant::now() + AUTH_DEADLINE;
@@ -372,12 +398,17 @@ pub(crate) mod tests {
     /// Mint an ES256K service JWT.
     pub(crate) fn mint(key: &SigningKey, iss: &str, aud: &str, lxm: Option<&str>) -> String {
         let now = chrono::Utc::now().timestamp();
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256K","typ":"JWT"}"#);
         let mut claims = json!({"iss": iss, "aud": aud, "iat": now, "exp": now + 60});
         if let Some(lxm) = lxm {
             claims["lxm"] = json!(lxm);
         }
-        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("json"));
+        mint_claims(key, &claims)
+    }
+
+    /// Mint an ES256K JWT with exactly these claims.
+    pub(crate) fn mint_claims(key: &SigningKey, claims: &serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256K","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("json"));
         let signing_input = format!("{header}.{payload}");
         let sig: Signature = key.sign(signing_input.as_bytes());
         let sig = sig.normalize_s().unwrap_or(sig);
@@ -425,6 +456,33 @@ pub(crate) mod tests {
         assert!(matches!(v.verify_request_jwt(Some(&other_aud), METHOD).await, Err(AuthError::Invalid(_))));
         let forged = mint(&signing_key(9), did, &aud(), Some(METHOD));
         assert!(matches!(v.verify_request_jwt(Some(&forged), METHOD).await, Err(AuthError::Invalid(_))));
+    }
+
+    /// #682: a correctly signed token whose time claims are too large to be
+    /// times is rejected here. Passed on, it would panic kryphocron 0.4.0.
+    #[tokio::test]
+    async fn time_claims_out_of_range_are_rejected_before_the_verifier() {
+        let fetcher = StubFetcher::default();
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let key = signing_key(3);
+        fetcher.set_key(did, key.clone());
+        let (v, _drainer) = verifier(fetcher.clone(), 100, 16);
+        let now = chrono::Utc::now().timestamp();
+        // The largest second count `SystemTime` holds, which `exp + skew`
+        // then overflows.
+        let edge = i64::MAX.unsigned_abs();
+        for (claim, value) in [("exp", u64::MAX), ("iat", u64::MAX), ("nbf", u64::MAX), ("exp", edge)] {
+            let mut claims = json!({"iss": did, "aud": aud(), "lxm": METHOD, "iat": now, "exp": now + 60});
+            claims[claim] = json!(value);
+            let token = mint_claims(&key, &claims);
+            let v = v.clone();
+            let joined = tokio::spawn(async move { v.verify_request_jwt(Some(&token), METHOD).await }).await;
+            assert!(matches!(joined, Ok(Err(AuthError::Invalid(_)))), "{claim} = {value}: {joined:?}");
+        }
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0, "rejected before any resolution");
+        // Ordinary tokens are unaffected.
+        let ok = mint(&key, did, &aud(), Some(METHOD));
+        assert!(v.verify_request_jwt(Some(&ok), METHOD).await.is_ok());
     }
 
     #[tokio::test]
