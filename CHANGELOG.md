@@ -24,7 +24,8 @@ commit.
   `retention_hours` after it was last confirmed. A pair that is
   remembered is not sent to the fallback. Bounded by `max_per_viewer` and
   `max_total`. Removing a member or deleting an account clears its blocks
-  at once, from the purge itself; the daily job deletes rows past the
+  at once, from the purge itself, and a request that was in flight at
+  that moment adds nothing afterwards; the daily job deletes rows past the
   retention and rows of accounts that are no longer members.
   `admin farsight forget <viewer-did>` clears one member, and
   `admin farsight status` now also prints `answered_since_start`,

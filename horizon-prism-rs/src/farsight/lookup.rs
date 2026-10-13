@@ -108,9 +108,20 @@ impl Cache {
 
     /// Write `new` for the pair under the merge rule, and return what the
     /// entry now holds.
+    #[cfg(test)]
     fn write(&mut self, viewer: &str, other: &str, new: &PairAnswer, now: Instant, s: &Settings) -> PairAnswer {
+        self.merge(viewer, other, new, now, s, true)
+    }
+
+    /// The merge rule, with the write only if `keep`: a request begun
+    /// before a purge gets the answer it would have had and leaves no
+    /// entry behind (§5.14.18.2 "One count for everyone").
+    fn merge(&mut self, viewer: &str, other: &str, new: &PairAnswer, now: Instant, s: &Settings, keep: bool) -> PairAnswer {
         let live = self.entry(viewer, other, now);
         let (merged, restart, source) = PairAnswer::written_over(new, live.as_ref().map(|(answer, source)| (answer, *source)));
+        if !keep {
+            return merged;
+        }
         let expires = match self.viewers.get(viewer).and_then(|v| v.entries.get(other)) {
             Some(e) if !restart => e.expires,
             _ => now + s.ttl,
@@ -1072,6 +1083,7 @@ impl Lookup {
             let mut state = self.state();
             state.allowance = state.allowance.saturating_sub(started.elapsed());
             let mut cache = self.farsight.cache();
+            let keep = inner.purges.load(Ordering::SeqCst) == self.purges;
             for call in called {
                 eligible.extend(call.eligible);
                 for (other, outcome) in call.outcomes {
@@ -1083,7 +1095,7 @@ impl Lookup {
                     // The memo holds the merged entry, so a block the cache
                     // already named is not lost to an answer that does not
                     // vouch; with no answer, a block in hand stands.
-                    let merged = outcome.map(|answer| cache.write(actor, &other, &answer, now, &inner.settings));
+                    let merged = outcome.map(|answer| cache.merge(actor, &other, &answer, now, &inner.settings, keep));
                     let held = merged.or_else(|| found.get(&other).cloned());
                     if let Some(answer) = &held {
                         found.insert(other.clone(), answer.clone());
@@ -1307,8 +1319,9 @@ impl Lookup {
             let now = Instant::now();
             let mut state = self.state();
             let mut cache = self.farsight.cache();
+            let keep = inner.purges.load(Ordering::SeqCst) == self.purges;
             out.calls = called.len();
-            out.vouches = !called.is_empty() && called.iter().all(|call| call.answered && call.levels.iter().all(|level| level.vouches()));
+            out.vouches =!called.is_empty() && called.iter().all(|call| call.answered && call.levels.iter().all(|level| level.vouches()));
             for call in called {
                 out.levels.extend(call.levels);
                 for (other, outcome) in call.outcomes {
@@ -1325,7 +1338,7 @@ impl Lookup {
                         forgotten.push(other.clone());
                     }
                     let held = match outcome {
-                        Some(answer) => Some(cache.write(&actor, &other, &answer, now, &inner.settings)),
+                        Some(answer) => Some(cache.merge(&actor, &other, &answer, now, &inner.settings, keep)),
                         None => standing.remove(&other).or_else(|| state.memo.get(&other).cloned().flatten()),
                     };
                     state.memo.insert(other, held);
@@ -1847,7 +1860,7 @@ pub(crate) mod tests {
         loaded.hook().run(V, false, true).await;
         assert_eq!((entries(&farsight), rows(A).await), (0, 0));
         let blocked = old.inbound_list_blocks(V, &page(&[A]), &none).await;
-        assert_eq!((blocked.len(), entries(&farsight)), (1, 0));
+        assert_eq!((blocked.len(), entries(&farsight), farsight.cached()), (1, 0, 0));
         // A request begun after it learns as before.
         fake.blockers.lock().expect("blockers").insert(B.to_string());
         farsight.request(&member()).inbound_list_blocks(V, &page(&[B]), &none).await;
