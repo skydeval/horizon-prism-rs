@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **Profile views carry `status` (#675).** An account's stored
+  `app.bsky.actor.status` record is shown on its profile views as a
+  `statusView`: the status, the record, the `external#view` of its
+  embed, and, when the record sets `durationMinutes`, `expiresAt` and
+  `isActive`. The duration is clamped to 5 minutes – 4 hours and counted
+  from the record's `createdAt` or from when it was indexed, whichever
+  is earlier, so a status dated in the future cannot stay live. With
+  `unspecced.live_now` set, a live status is shown only for an account
+  on that list whose embed links to a domain listed for it (design-v3
+  §8.1, §7.6).
 - **Item 17: trending topics and trends (#675).**
   `app.bsky.unspecced.getTrendingTopics` ranks hashtags by posts in the
   last `trends.topics_window_hours`; `getTrends` ranks them by

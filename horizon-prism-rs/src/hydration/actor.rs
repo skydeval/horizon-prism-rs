@@ -34,6 +34,9 @@ pub struct ProfileContext {
     /// By actor: `allowSubscriptions` of its stored notification
     /// declaration. No entry means no record, which reads as `followers`.
     pub declarations: HashMap<String, String>,
+    /// By actor: its `statusView` (design-v3 §8.1), for the actors whose
+    /// status is shown.
+    pub statuses: HashMap<String, Value>,
 }
 
 impl ProfileContext {
@@ -79,6 +82,9 @@ impl ProfileContext {
                 let allow = self.declarations.get(did).map_or("followers", String::as_str);
                 v.insert("associated".into(), json!({"activitySubscription": {"allowSubscriptions": allow}}));
             }
+        }
+        if let Some(status) = self.statuses.get(did) {
+            v.insert("status".into(), status.clone());
         }
         v.insert("viewer".into(), self.viewer.view(did));
         v.insert("labels".into(), Value::Array(self.labels.get(did).cloned().unwrap_or_default()));
@@ -137,12 +143,30 @@ impl Hydrator {
         .bind(super::activity_subscriptions::NSID_DECLARATION)
         .fetch_all(self.pool())
         .await?;
+        let stored: Vec<(String, String, String, Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT did, uri, cid, record, indexed_at FROM actor_self_records WHERE did = ANY($1) AND collection = $2",
+        )
+        .bind(dids)
+        .bind(NSID_STATUS)
+        .fetch_all(self.pool())
+        .await?;
+        let now = chrono::Utc::now();
+        let live_now = &self.inner.cfg.unspecced.live_now;
+        let statuses = stored
+            .into_iter()
+            .filter_map(|(did, uri, cid, record, indexed_at)| {
+                let pds = rows.get(&did).and_then(|r| r.pds_endpoint.as_deref());
+                let view = status_view(&did, &uri, &cid, &record, indexed_at, now, pds, live_now)?;
+                Some((did, view))
+            })
+            .collect();
         Ok(ProfileContext {
             rows,
             viewer: actor_viewer,
             labels,
             followers,
             declarations: declarations.into_iter().filter_map(|(did, allow)| Some((did, allow?))).collect(),
+            statuses,
         })
     }
 
@@ -158,6 +182,7 @@ impl Hydrator {
             labels: self.load_labels(dids).await?,
             followers: HashMap::new(),
             declarations: HashMap::new(),
+            statuses: HashMap::new(),
         })
     }
 
@@ -393,6 +418,68 @@ impl Hydrator {
         let actors: Vec<Value> = visible.iter().map(|d| ctx.view(d, ProfileKind::Basic)).collect();
         Ok(Ok(Self::emit(json!({ "actors": actors }))))
     }
+}
+
+pub const NSID_STATUS: &str = "app.bsky.actor.status";
+const STATUS_LIVE: &str = "app.bsky.actor.status#live";
+
+/// The `statusView` of a stored `app.bsky.actor.status` record (design-v3
+/// §8.1), or `None` when it is not shown.
+///
+/// - `embed` is the `external#view` of the record's external embed.
+/// - `expiresAt` and `isActive` are present only when the record sets
+///   `durationMinutes`. The duration is clamped to 5 minutes – 4 hours and
+///   counted from the record's `createdAt`, which is itself clamped to
+///   when the record was indexed, so a status dated in the future cannot
+///   stay live indefinitely.
+/// - With `unspecced.live_now` set, a **live** status is shown only for an
+///   account on that list whose embed links to one of the domains listed
+///   for it; otherwise it is left out whole. Other statuses are untouched.
+#[allow(clippy::too_many_arguments)]
+fn status_view(
+    did: &str,
+    uri: &str,
+    cid: &str,
+    record: &Value,
+    indexed_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    pds: Option<&str>,
+    live_now: &[crate::config::LiveNow],
+) -> Option<Value> {
+    let status = record.get("status")?.as_str()?;
+    let external = record.get("embed").filter(|e| e.get("$type").and_then(Value::as_str) == Some("app.bsky.embed.external")).and_then(|e| e.get("external"));
+    let link = external.and_then(|x| x.get("uri")).and_then(Value::as_str);
+    if status == STATUS_LIVE && !live_now.is_empty() {
+        let host = link.and_then(crate::firehose::extract::normalize_domain)?;
+        let allowed = live_now.iter().filter(|l| l.did == did).flat_map(|l| l.domains.iter());
+        let mut allowed = allowed.filter_map(|d| crate::firehose::extract::normalize_domain(d));
+        if !allowed.any(|d| host == d || host.ends_with(&format!(".{d}"))) {
+            return None;
+        }
+    }
+    let mut view = json!({ "uri": uri, "cid": cid, "status": status, "record": record });
+    if let Some(x) = external {
+        let mut shown = json!({
+            "uri": link.unwrap_or_default(),
+            "title": x.get("title").and_then(Value::as_str).unwrap_or_default(),
+            "description": x.get("description").and_then(Value::as_str).unwrap_or_default(),
+        });
+        if let Some(url) = x.get("thumb").and_then(crate::firehose::normalize::blob_cid).and_then(|c| blob_url(pds, did, &c)) {
+            shown["thumb"] = json!(url);
+        }
+        view["embed"] = json!({ "$type": "app.bsky.embed.external#view", "external": shown });
+    }
+    if let Some(minutes) = record.get("durationMinutes").and_then(Value::as_i64) {
+        let created = record
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map_or(indexed_at, |t| t.with_timezone(&chrono::Utc).min(indexed_at));
+        let expires = created + chrono::TimeDelta::minutes(minutes.clamp(5, 240));
+        view["expiresAt"] = json!(ts(expires));
+        view["isActive"] = json!(now < expires);
+    }
+    Some(view)
 }
 
 /// The accounts a search may find: active, and in scope or a member.
@@ -632,6 +719,34 @@ mod tests {
         exec(p, "INSERT INTO scope_dids (did, reasons) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 2)").await;
         assert_eq!(search("ali").await, [ALICE]);
         db.drop_db().await;
+    }
+
+    /// B-32 (design-v3 §8.1): a status is shown with its embed and its
+    /// expiry; a live status needs the operator's leave when a list is set.
+    #[test]
+    fn a_status_view_follows_its_record_and_the_live_list() {
+        let indexed = chrono::DateTime::parse_from_rfc3339("2026-10-12T10:00:00Z").expect("t").with_timezone(&chrono::Utc);
+        let now = indexed + chrono::TimeDelta::minutes(30);
+        let record = json!({
+            "$type": "app.bsky.actor.status", "status": "app.bsky.actor.status#live",
+            // Dated in the future: counted from when it was indexed.
+            "createdAt": "2027-01-01T00:00:00Z", "durationMinutes": 100_000,
+            "embed": {"$type": "app.bsky.embed.external", "external": {"uri": "https://www.twitch.tv/alice", "title": "Live", "description": "now"}},
+        });
+        let view = |live_now: &[crate::config::LiveNow]| status_view(ALICE, "at://a/app.bsky.actor.status/self", "bafys", &record, indexed, now, None, live_now);
+        let shown = view(&[]).expect("no list: shown");
+        assert_eq!(shown["embed"]["external"]["uri"], "https://www.twitch.tv/alice");
+        // Clamped to four hours from the indexing time.
+        assert_eq!((shown["expiresAt"].clone(), shown["isActive"].clone()), (json!("2026-10-12T14:00:00.000Z"), json!(true)));
+        let list = |did: &str, domain: &str| vec![crate::config::LiveNow { did: did.to_string(), domains: vec![domain.to_string()] }];
+        assert!(view(&list(ALICE, "twitch.tv")).is_some());
+        assert!(view(&list(ALICE, "example.com")).is_none(), "another domain");
+        assert!(view(&list(BOB, "twitch.tv")).is_none(), "another account");
+        // A status that is not live is never gated, and has no expiry
+        // unless it sets one.
+        let away = json!({"status": "app.example.away", "createdAt": "2026-10-12T09:00:00Z"});
+        let shown = status_view(ALICE, "u", "c", &away, indexed, now, None, &list(BOB, "twitch.tv")).expect("shown");
+        assert!(shown.get("expiresAt").is_none() && shown.get("embed").is_none());
     }
 
     /// B-41 / #679 (design-v3 §9.3, §9.4): the corpus is scope and
