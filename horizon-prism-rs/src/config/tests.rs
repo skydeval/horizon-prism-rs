@@ -336,6 +336,66 @@ pause_ms = 100
 
 [schema_index]
 retry_backoff_secs = 300
+
+[farsight.fallback]
+enabled = false
+network = "bluesky"
+timeout_ms = 1000
+max_calls_per_request = 2
+cache_ttl_secs = 300
+rate_per_sec = 10.0
+burst = 20
+requester_share = 0.25
+
+[farsight.memory]
+enabled = false
+retention_hours = 24
+max_per_viewer = 1000
+max_total = 100000
+
+[search]
+statement_timeout_ms = 2000
+hits_total_max = 10000
+hits_total_timeout_ms = 500
+max_offset = 1000
+recent_window_days = 30
+top_window_days = 30
+max_filter_values = 25
+top_candidates = 2000
+typeahead_candidates = 200
+
+[suggestions]
+active_days = 14
+refresh_secs = 600
+pool_size = 1000
+fof_max_follows = 500
+fof_cache_ttl_secs = 600
+fof_cache_max = 10000
+see_more_offset = 25
+cofollow_sample_followers = 1000
+cofollow_cache_ttl_secs = 600
+cofollow_cache_max = 10000
+cofollow_min = 5
+tagged_count = 10
+
+[trends]
+topics_window_hours = 6
+window_hours = 24
+candidate_count = 50
+min_posts = 3
+min_authors = 2
+decay_half_life_hours = 6.0
+subject_lookback_hours = 72
+aggregate_retention_hours = 72
+refresh_timeout_ms = 10000
+started_ratio = 2.0
+hot_ratio = 2.0
+cache_ttl_secs = 300
+topic_link_template = "/hashtag/{tag}"
+
+[unspecced]
+check_email_confirmed = false
+live_now = []
 "#;
 
 #[test]
