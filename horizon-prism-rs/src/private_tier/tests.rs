@@ -472,6 +472,106 @@ async fn the_private_timeline_holds_readable_posts_of_followed_authors() {
     db.drop_db().await;
 }
 
+/// docs/internal/design/private-audience-modes.md §2, §5, §10: `followers`
+/// admits by the reader's own follow, `everyone` admits every ready
+/// member, and `nobody`, `following` and an unknown mode admit only the
+/// author; a block keeps a reader out; and under another account's
+/// audience that account reads, and its blocks count.
+#[tokio::test]
+async fn audience_modes_admit_by_follow_and_respect_blocks() {
+    let Some(db) = fresh_db("private_modes").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "modes").await;
+    let audience = |rkey: &str| format!("at://{ALICE}/{NSID_AUDIENCE}/{rkey}");
+    for (i, mode) in ["followers", "everyone", "nobody", "following", "Followers"].into_iter().enumerate() {
+        let (aud, post) = (format!("3kaudmode22{i}"), format!("3kpostmode2{i}"));
+        // Bob is listed in each: `members` counts for `list` alone.
+        f.ingest(ALICE, NSID_AUDIENCE, &aud, json!({"$type": NSID_AUDIENCE, "mode": mode, "members": [BOB], "createdAt": "2026-09-26T00:00:00Z"}))
+            .await;
+        let record = f.encoded_post(ALICE, &post, mode, Some(&audience(&aud))).await;
+        f.ingest(ALICE, NSID_POST_PRIVATE, &post, record).await;
+    }
+    f.ready(ALICE).await;
+    f.ready(BOB).await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+    let texts = |body: &str, key: &str| {
+        let v: Value = serde_json::from_str(body).expect("json");
+        let mut texts: Vec<String> = v[key].as_array().expect(key).iter().map(|p| p["record"]["text"].as_str().expect("text").to_string()).collect();
+        texts.sort();
+        texts
+    };
+    let feed = |did: &'static str, key: u8| {
+        let base = base.clone();
+        async move { get(&base, FEED, &format!("actor={ALICE}"), did, key).await.1 }
+    };
+    let follow = |from: &str, to: &str| {
+        format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{from}/app.bsky.graph.follow/1', '{from}', '{to}', '3k', now())")
+    };
+    let block = |from: &str, to: &str| {
+        format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{from}/app.bsky.graph.block/1', '{from}', '{to}', '3k', now())")
+    };
+
+    // The author reads all five. A member that does not follow reads
+    // `everyone` alone, though `members` names it.
+    assert_eq!(texts(&feed(ALICE, ALICE_KEY).await, "feed"), ["Followers", "everyone", "followers", "following", "nobody"]);
+    assert_eq!(texts(&feed(BOB, BOB_KEY).await, "feed"), ["everyone"]);
+    // Its timeline is of followed authors, so it holds nothing yet.
+    let (_, body, _) = get(&base, TIMELINE, "", BOB, BOB_KEY).await;
+    assert_eq!(body, r#"{"feed":[]}"#);
+
+    // Following: `followers` joins, from every endpoint.
+    exec(&f.pool, &follow(BOB, ALICE)).await;
+    assert_eq!(texts(&feed(BOB, BOB_KEY).await, "feed"), ["everyone", "followers"]);
+    let (_, body, _) = get(&base, TIMELINE, "", BOB, BOB_KEY).await;
+    assert_eq!(texts(&body, "feed"), ["everyone", "followers"]);
+    let followers_post = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3kpostmode20");
+    let (_, body, _) = get(&base, POSTS, &format!("uris={followers_post}"), BOB, BOB_KEY).await;
+    assert_eq!(texts(&body, "posts"), ["followers"]);
+    // A miss for it is the miss of a post that does not exist.
+    let (_, miss, _) = get(&base, POSTS, &format!("uris={followers_post}"), CAROL, CAROL_KEY).await;
+    assert_eq!(miss, r#"{"posts":[]}"#);
+
+    // Unfollowing ends it.
+    exec(&f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}'")).await;
+    assert_eq!(texts(&feed(BOB, BOB_KEY).await, "feed"), ["everyone"]);
+    exec(&f.pool, &follow(BOB, ALICE)).await;
+
+    // A block either way keeps the follower out of everything.
+    exec(&f.pool, &block(ALICE, BOB)).await;
+    assert_eq!(feed(BOB, BOB_KEY).await, r#"{"feed":[]}"#);
+    exec(&f.pool, "DELETE FROM blocks").await;
+    exec(&f.pool, &block(BOB, ALICE)).await;
+    assert_eq!(feed(BOB, BOB_KEY).await, r#"{"feed":[]}"#);
+    exec(&f.pool, "DELETE FROM blocks").await;
+
+    // Bob replies, in his own repository, under Alice's `followers`
+    // audience. Alice reads it as the audience's owner; Carol reads it once
+    // she follows Alice, and not when Alice blocks her.
+    let mut reply = f.encoded_post(BOB, "3kbobreply22", "bob replies", Some(&audience("3kaudmode220"))).await;
+    reply["reply"] = json!({"root": {"uri": followers_post, "cid": "bafyroot"}, "parent": {"uri": followers_post, "cid": "bafyparent"}});
+    f.ingest(BOB, NSID_POST_PRIVATE, "3kbobreply22", reply).await;
+    // Bob became a private owner with this record.
+    f.ready(BOB).await;
+    let reply_uri = format!("at://{BOB}/{NSID_POST_PRIVATE}/3kbobreply22");
+    let read = |did: &'static str, key: u8| {
+        let (base, query) = (base.clone(), format!("uris={reply_uri}"));
+        async move { get(&base, POSTS, &query, did, key).await.1 }
+    };
+    assert_eq!(texts(&read(ALICE, ALICE_KEY).await, "posts"), ["bob replies"]);
+    assert_eq!(read(CAROL, CAROL_KEY).await, r#"{"posts":[]}"#);
+    exec(&f.pool, &follow(CAROL, ALICE)).await;
+    assert_eq!(texts(&read(CAROL, CAROL_KEY).await, "posts"), ["bob replies"]);
+    exec(&f.pool, &block(ALICE, CAROL)).await;
+    assert_eq!(read(CAROL, CAROL_KEY).await, r#"{"posts":[]}"#);
+    exec(&f.pool, "DELETE FROM blocks").await;
+    // Alice blocks the replier: his reply is his alone.
+    exec(&f.pool, &block(ALICE, BOB)).await;
+    assert_eq!(read(CAROL, CAROL_KEY).await, r#"{"posts":[]}"#);
+    assert_eq!(texts(&read(BOB, BOB_KEY).await, "posts"), ["bob replies"]);
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn migration_0002_adds_nullable_reply_cids() {
     let Some(db) = crate::test_support::empty_db("migration_0002").await else {

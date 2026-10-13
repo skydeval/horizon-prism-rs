@@ -4,14 +4,19 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Get private-tier posts by AT-URI. Requires auth by a ready community member. A URI that does not exist, is not authorized for the requester, or cannot be served is omitted from the response; other URIs are unaffected.",
+      "description": "Get private-tier posts by AT-URI. Requires auth by a ready community member. A URI that does not exist, is not authorized for the requester, or cannot be served is omitted from the response; other URIs are unaffected. Audiences this AppView resolves: `list` (the audience record's members); `followers` (followers of the audience's owner who are ready members of this AppView, by the follow records it has indexed, which reflect a new follow or an unfollow within about a minute); `everyone` (every ready member of this AppView, not the network); and `nobody`. A `following` audience is not resolved yet and is served to its author only, as is any other mode. A block record or a private block between the reader and the author, or the audience's owner, in either direction, keeps the reader out; a block through a list does not.",
       "parameters": {
         "type": "params",
-        "required": ["uris"],
+        "required": [
+          "uris"
+        ],
         "properties": {
           "uris": {
             "type": "array",
-            "items": { "type": "string", "format": "at-uri" },
+            "items": {
+              "type": "string",
+              "format": "at-uri"
+            },
             "minLength": 1,
             "maxLength": 25
           }
@@ -21,18 +26,29 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["posts"],
+          "required": [
+            "posts"
+          ],
           "properties": {
             "posts": {
               "type": "array",
-              "items": { "type": "ref", "ref": "app.nearhorizon.private.defs#privatePostView" }
+              "items": {
+                "type": "ref",
+                "ref": "app.nearhorizon.private.defs#privatePostView"
+              }
             }
           }
         }
       },
       "errors": [
-        { "name": "NotEnrolled", "description": "The caller is not a community member of this AppView." },
-        { "name": "NotReady", "description": "The caller's account indexing is still in progress." }
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
       ]
     }
   }

@@ -168,14 +168,66 @@ pub(super) async fn plaintext(pool: &PgPool, rauth: &RecordAuthz) -> Result<Opti
         .map(Option::flatten)
 }
 
-/// The §6.9 candidate prefilter, mirroring §6.4 rules 1–7 for the requester:
-/// self-authored, or an audience row present, same owner or same PDS
-/// endpoint, `mode` NULL or `list`, requester ∈ `members`. A candidate filter
-/// only: `bind` stays authoritative.
-const PREFILTER: &str = "(p.author_did = $1 OR ( \
-       a.uri IS NOT NULL AND (a.mode IS NULL OR a.mode = 'list') AND $1 = ANY(a.members) \
-       AND (a.owner_did = p.author_did \
-            OR (ao.pds_endpoint IS NOT NULL AND ao.pds_endpoint = po.pds_endpoint))))";
+/// A block in either direction between `x` and `y` (SQL expressions), over
+/// the two sources [`blocks_between`] reads.
+fn blocked(x: &str, y: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM blocks b WHERE b.author_did = {x} AND b.subject_did = {y}) \
+          OR EXISTS (SELECT 1 FROM blocks b WHERE b.author_did = {y} AND b.subject_did = {x}) \
+          OR EXISTS (SELECT 1 FROM private_blocks b WHERE b.author_did = {x} AND b.subject_did = {y}) \
+          OR EXISTS (SELECT 1 FROM private_blocks b WHERE b.author_did = {y} AND b.subject_did = {x}))"
+    )
+}
+
+/// The §6.9 candidate prefilter, mirroring §6.4's rules for the requester
+/// (`$1`), as the audience-modes design amends them:
+/// - the author is active (the moderation gate denies a non-active
+///   author's posts to everyone);
+/// - self-authored; or an audience row is present, of the same owner or of
+///   an active account on the same PDS endpoint, and its mode admits the
+///   requester: `list` (or none) by `members`, `followers` by the
+///   requester's stored follow of the audience's owner (who is in its own
+///   audience), `everyone` always, and nothing else;
+/// - no block between the requester and the author; and, for `followers`
+///   and `everyone` under another account's audience, none between that
+///   account and the requester or the author.
+///
+/// A candidate filter only: `bind` stays authoritative. Blocked pairs are
+/// left out so that posts nobody can read do not fill a page's window.
+fn prefilter() -> String {
+    format!(
+        "(COALESCE(po.account_status, 'active') = 'active' AND (p.author_did = $1 OR ( \
+           a.uri IS NOT NULL \
+           AND (a.owner_did = p.author_did \
+                OR (ao.pds_endpoint IS NOT NULL AND ao.pds_endpoint = po.pds_endpoint AND ao.account_status = 'active')) \
+           AND CASE COALESCE(a.mode, 'list') \
+                 WHEN 'list' THEN $1 = ANY(a.members) \
+                 WHEN 'followers' THEN a.owner_did = $1 OR EXISTS ( \
+                   SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = a.owner_did) \
+                 WHEN 'everyone' THEN true \
+                 ELSE false END \
+           AND NOT {viewer_author} \
+           AND (COALESCE(a.mode, 'list') NOT IN ('followers', 'everyone') \
+                OR a.owner_did = p.author_did \
+                OR NOT ((a.owner_did <> $1 AND {viewer_owner}) OR {author_owner})))))",
+        viewer_author = blocked("$1", "p.author_did"),
+        viewer_owner = blocked("$1", "a.owner_did"),
+        author_owner = blocked("p.author_did", "a.owner_did"),
+    )
+}
+
+/// Whether a follow record by `author` naming `subject` is stored.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn follows(pool: &PgPool, author: &str, subject: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+        .bind(author)
+        .bind(subject)
+        .fetch_one(pool)
+        .await
+}
 
 const PREFILTER_FROM: &str = "private_posts p \
      LEFT JOIN private_audiences a ON a.uri = p.audience_uri \
@@ -189,7 +241,8 @@ const PREFILTER_FROM: &str = "private_posts p \
 /// Database errors.
 pub(super) async fn prefilter_uris(pool: &PgPool, requester: &str, uris: &[String]) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(&format!(
-        "SELECT p.uri FROM {PREFILTER_FROM} WHERE p.uri = ANY($2) AND {PREFILTER}"
+        "SELECT p.uri FROM {PREFILTER_FROM} WHERE p.uri = ANY($2) AND {pre}",
+        pre = prefilter()
     ))
     .bind(requester)
     .bind(uris)
@@ -204,8 +257,9 @@ pub(super) async fn prefilter_uris(pool: &PgPool, requester: &str, uris: &[Strin
 /// Database errors.
 pub(super) async fn reply_candidates(pool: &PgPool, requester: &str, parent: &str, limit: i64) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(&format!(
-        "SELECT p.uri FROM {PREFILTER_FROM} WHERE p.reply_parent_uri = $2 AND {PREFILTER} \
-         ORDER BY p.created_at, p.uri LIMIT $3"
+        "SELECT p.uri FROM {PREFILTER_FROM} WHERE p.reply_parent_uri = $2 AND {pre} \
+         ORDER BY p.created_at, p.uri LIMIT $3",
+        pre = prefilter()
     ))
     .bind(requester)
     .bind(parent)
@@ -233,9 +287,10 @@ pub(super) async fn author_candidates(
     let (at, rkey) = after.map_or((None, String::new()), |(a, r)| (Some(a), r));
     sqlx::query_as(&format!(
         "SELECT p.uri, p.created_at, p.rkey FROM {PREFILTER_FROM} \
-         WHERE p.author_did = $2 AND {PREFILTER} \
+         WHERE p.author_did = $2 AND {pre} \
            AND ($3::timestamptz IS NULL OR (p.created_at, p.rkey) < ($3, $4)) \
-         ORDER BY p.created_at DESC, p.rkey DESC LIMIT $5"
+         ORDER BY p.created_at DESC, p.rkey DESC LIMIT $5",
+        pre = prefilter()
     ))
     .bind(requester)
     .bind(author)
@@ -269,7 +324,7 @@ pub(super) async fn timeline_candidates(
     sqlx::query_as(&format!(
         "SELECT p.uri, p.created_at, p.uri FROM {PREFILTER_FROM} \
          WHERE (p.author_did = $1 OR p.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
-           AND {PREFILTER} \
+           AND {pre} \
            AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = p.author_did AND m.scope = 'full') \
            AND NOT EXISTS (SELECT 1 FROM list_references r \
                            JOIN subscribed_lists l ON l.list_uri = r.list_uri \
@@ -278,6 +333,7 @@ pub(super) async fn timeline_candidates(
            AND ($2::timestamptz IS NULL OR (p.created_at, p.uri) < ($2, $3)) \
          ORDER BY p.created_at DESC, p.uri DESC LIMIT $4",
         applies = crate::hydration::APPLIES,
+        pre = prefilter(),
     ))
     .bind(requester)
     .bind(at)

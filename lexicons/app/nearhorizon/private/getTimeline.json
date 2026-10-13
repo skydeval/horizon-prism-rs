@@ -4,11 +4,16 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Get the private-tier posts the requester is authorized to read, authored by the requester or by accounts the requester follows, newest first. The ordering field is each post's `record.createdAt` (descending, ties broken by post URI); a `createdAt` later than the time of indexing plus five minutes is clamped to that bound, and the view carries the clamped value. Requires auth by a ready community member. Posts the requester may not read are omitted without distinction, as are posts by accounts the requester mutes.",
+      "description": "Get the private-tier posts the requester is authorized to read, authored by the requester or by accounts the requester follows, newest first. The ordering field is each post's `record.createdAt` (descending, ties broken by post URI); a `createdAt` later than the time of indexing plus five minutes is clamped to that bound, and the view carries the clamped value. Requires auth by a ready community member. Posts the requester may not read are omitted without distinction, as are posts by accounts the requester mutes. Audiences this AppView resolves: `list` (the audience record's members); `followers` (followers of the audience's owner who are ready members of this AppView, by the follow records it has indexed, which reflect a new follow or an unfollow within about a minute); `everyone` (every ready member of this AppView, not the network); and `nobody`. A `following` audience is not resolved yet and is served to its author only, as is any other mode. A block record or a private block between the reader and the author, or the audience's owner, in either direction, keeps the reader out; a block through a list does not.",
       "parameters": {
         "type": "params",
         "properties": {
-          "limit": { "type": "integer", "default": 30, "minimum": 1, "maximum": 50 },
+          "limit": {
+            "type": "integer",
+            "default": 30,
+            "minimum": 1,
+            "maximum": 50
+          },
           "cursor": {
             "type": "string",
             "description": "Opaque pagination cursor from a previous response."
@@ -19,11 +24,16 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["feed"],
+          "required": [
+            "feed"
+          ],
           "properties": {
             "feed": {
               "type": "array",
-              "items": { "type": "ref", "ref": "app.nearhorizon.private.defs#privatePostView" }
+              "items": {
+                "type": "ref",
+                "ref": "app.nearhorizon.private.defs#privatePostView"
+              }
             },
             "cursor": {
               "type": "string",
@@ -33,8 +43,14 @@
         }
       },
       "errors": [
-        { "name": "NotEnrolled", "description": "The caller is not a community member of this AppView." },
-        { "name": "NotReady", "description": "The caller's account indexing is still in progress." }
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
       ]
     }
   }

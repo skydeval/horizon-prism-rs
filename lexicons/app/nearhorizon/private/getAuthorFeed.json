@@ -4,12 +4,17 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Get an author's private-tier posts that the requester is authorized to read, newest first. The ordering field is each post's `record.createdAt` (descending, ties broken by record key); a `createdAt` later than the time of indexing plus five minutes is clamped to that bound, and the view carries the clamped value. Requires auth by a ready community member. An unknown actor and an actor with no visible posts both return an empty feed with no cursor.",
+      "description": "Get an author's private-tier posts that the requester is authorized to read, newest first. The ordering field is each post's `record.createdAt` (descending, ties broken by record key); a `createdAt` later than the time of indexing plus five minutes is clamped to that bound, and the view carries the clamped value. Requires auth by a ready community member. An unknown actor and an actor with no visible posts both return an empty feed with no cursor. Audiences this AppView resolves: `list` (the audience record's members); `followers` (followers of the audience's owner who are ready members of this AppView, by the follow records it has indexed, which reflect a new follow or an unfollow within about a minute); `everyone` (every ready member of this AppView, not the network); and `nobody`. A `following` audience is not resolved yet and is served to its author only, as is any other mode. A block record or a private block between the reader and the author, or the audience's owner, in either direction, keeps the reader out; a block through a list does not.",
       "parameters": {
         "type": "params",
-        "required": ["actor"],
+        "required": [
+          "actor"
+        ],
         "properties": {
-          "actor": { "type": "string", "format": "did" },
+          "actor": {
+            "type": "string",
+            "format": "did"
+          },
           "limit": {
             "type": "integer",
             "default": 30,
@@ -26,11 +31,16 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["feed"],
+          "required": [
+            "feed"
+          ],
           "properties": {
             "feed": {
               "type": "array",
-              "items": { "type": "ref", "ref": "app.nearhorizon.private.defs#privatePostView" }
+              "items": {
+                "type": "ref",
+                "ref": "app.nearhorizon.private.defs#privatePostView"
+              }
             },
             "cursor": {
               "type": "string",
@@ -40,8 +50,14 @@
         }
       },
       "errors": [
-        { "name": "NotEnrolled", "description": "The caller is not a community member of this AppView." },
-        { "name": "NotReady", "description": "The caller's account indexing is still in progress." }
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
       ]
     }
   }

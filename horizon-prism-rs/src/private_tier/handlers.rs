@@ -410,9 +410,21 @@ pub async fn get_timeline(
     result.map(ok)
 }
 
+/// Windows of candidates one feed request may read.
+const FEED_WINDOWS: usize = 2;
+/// A second window is begun only this soon after the handler started.
+const SECOND_WINDOW_BY: Duration = Duration::from_millis(600);
+
 /// One page of a feed: `actor`'s posts, or with no actor the caller's
 /// home timeline. The candidates only narrow the work; `pipeline::read`
 /// decides each post.
+///
+/// A window is `limit × 4` candidates. If it ends short of `limit` and
+/// candidates remain, one more is read, from after the last row the first
+/// examined, so that a run of posts nobody can read (content that does
+/// not decode, say) does not end the feed. The cursor is always that of
+/// the last readable post: it never carries the position of a post the
+/// caller may not read.
 async fn feed_body(
     s: &PrivateState,
     caller: &VerifiedCaller,
@@ -425,35 +437,53 @@ async fn feed_body(
     let max_binds = limit * 4;
     // One lookahead row tells whether prefiltered candidates remain.
     let wanted = i64::try_from(max_binds + 1).unwrap_or(i64::MAX);
-    let mut candidates = match actor {
-        Some(actor) => schema::author_candidates(&s.env.pool, &caller.did, actor, after, wanted).await?,
-        None => schema::timeline_candidates(&s.env.pool, &caller.did, after, wanted).await?,
-    };
-    let beyond = candidates.len() > max_binds;
-    candidates.truncate(max_binds);
-    let uris: Vec<String> = candidates.iter().map(|(u, _, _)| u.clone()).collect();
     let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
     let req = request_handle(viewer.state_did(), ip);
-    let authors = profiles(s, &viewer, &req, &uris).await?;
+    // One state for the whole request: the head-fetch budget is per
+    // request, not per window.
     let rs = RequestState::new(s.env.max_head_fetches);
 
     let mut feed = Vec::new();
-    let mut last: Option<usize> = None;
-    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
-    let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
-    while let Some((i, hit)) = reads.next().await {
-        if let Ok(post) = hit {
-            feed.push(post);
-            last = Some(i);
-            if feed.len() == limit {
-                break;
+    let mut last_hit: Option<(DateTime<Utc>, String)> = None;
+    let mut more = false;
+    let mut after = after;
+    for window in 0..FEED_WINDOWS {
+        let mut candidates = match actor {
+            Some(actor) => schema::author_candidates(&s.env.pool, &caller.did, actor, after.clone(), wanted).await?,
+            None => schema::timeline_candidates(&s.env.pool, &caller.did, after.clone(), wanted).await?,
+        };
+        let beyond = candidates.len() > max_binds;
+        candidates.truncate(max_binds);
+        let uris: Vec<String> = candidates.iter().map(|(u, _, _)| u.clone()).collect();
+        let authors = profiles(s, &viewer, &req, &uris).await?;
+        let mut full_at: Option<usize> = None;
+        let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+        let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
+        while let Some((i, hit)) = reads.next().await {
+            if let Ok(post) = hit {
+                feed.push(post);
+                last_hit = Some((candidates[i].1, candidates[i].2.clone()));
+                if feed.len() == limit {
+                    full_at = Some(i);
+                    break;
+                }
             }
         }
+        drop(reads);
+        if let Some(i) = full_at {
+            more = i + 1 < candidates.len() || beyond;
+            break;
+        }
+        // The window ended short. What it held is examined; candidates
+        // remain only behind the lookahead row.
+        more = beyond;
+        let Some(tail) = candidates.last() else { break };
+        if !beyond || window + 1 == FEED_WINDOWS || start.elapsed() >= SECOND_WINDOW_BY {
+            break;
+        }
+        after = Some((tail.1, tail.2.clone()));
     }
-    drop(reads);
-    let cursor = last
-        .filter(|&i| i + 1 < candidates.len() || beyond)
-        .map(|i| cursor(candidates[i].1, &candidates[i].2));
+    let cursor = last_hit.filter(|_| more).map(|(at, key)| cursor(at, &key));
     Ok(PrivateResponse::feed(feed, cursor))
 }
 

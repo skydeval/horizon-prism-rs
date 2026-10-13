@@ -4,10 +4,12 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Get a private-tier post thread. Requires auth by a ready community member. At most 200 nodes (anchor, parents and replies); unauthorized or missing children and parents are omitted, and the parent chain stops at the first missed parent.",
+      "description": "Get a private-tier post thread. Requires auth by a ready community member. At most 200 nodes (anchor, parents and replies); unauthorized or missing children and parents are omitted, and the parent chain stops at the first missed parent. Audiences this AppView resolves: `list` (the audience record's members); `followers` (followers of the audience's owner who are ready members of this AppView, by the follow records it has indexed, which reflect a new follow or an unfollow within about a minute); `everyone` (every ready member of this AppView, not the network); and `nobody`. A `following` audience is not resolved yet and is served to its author only, as is any other mode. A block record or a private block between the reader and the author, or the audience's owner, in either direction, keeps the reader out; a block through a list does not.",
       "parameters": {
         "type": "params",
-        "required": ["uri"],
+        "required": [
+          "uri"
+        ],
         "properties": {
           "uri": {
             "type": "string",
@@ -34,16 +36,30 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["thread"],
+          "required": [
+            "thread"
+          ],
           "properties": {
-            "thread": { "type": "ref", "ref": "app.nearhorizon.private.defs#privateThreadView" }
+            "thread": {
+              "type": "ref",
+              "ref": "app.nearhorizon.private.defs#privateThreadView"
+            }
           }
         }
       },
       "errors": [
-        { "name": "NotFound", "description": "Post not found. Returned identically whether the anchor does not exist or is not visible to the requester." },
-        { "name": "NotEnrolled", "description": "The caller is not a community member of this AppView." },
-        { "name": "NotReady", "description": "The caller's account indexing is still in progress." }
+        {
+          "name": "NotFound",
+          "description": "Post not found. Returned identically whether the anchor does not exist or is not visible to the requester."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
       ]
     }
   }

@@ -12,6 +12,31 @@ commit.
 
 ### Added
 
+- **Private audiences: `followers`, `everyone` and `nobody` (#663).**
+  Until now a private post was served to anyone but its author only
+  when its audience was a `list`. Now:
+  - `followers`: a ready member who follows the audience's owner reads
+    it, by the follow records this AppView has indexed. A new follow or
+    an unfollow takes effect within about a minute.
+  - `everyone`: every ready member of this AppView reads it.
+  - `nobody`, `following` and any other mode: the author only.
+    `following` is not resolved yet.
+  - A block record or a private block, in either direction, between the
+    reader and the author keeps the reader out, as before. For a reply
+    written under another account's `followers` or `everyone` audience,
+    that account reads the reply, and its blocks count too: with the
+    reader, and with the reply's author. A block through a list does not
+    keep a reader out of a private post.
+  - Posts by a deactivated author, and posts between blocked accounts,
+    are no longer candidates for a page, and a feed page now looks at a
+    second window of candidates when the first holds too few readable
+    posts, so a run of unreadable posts does not end a feed early.
+  This applies to `getPosts`, `getPostThread`, `getAuthorFeed` and
+  `getTimeline`; their lexicon descriptions say which audiences are
+  resolved. The PDS still refuses every mode but `list` on a direct
+  read. Two indexes, `follows_pair` and `blocks_pair`, are built in the
+  background after startup; `_health`'s `search_indexes_ready` is false
+  until they exist (docs/internal/design/private-audience-modes.md).
 - **The private home timeline (#663).**
   `app.nearhorizon.private.getTimeline` returns the private posts the
   caller may read whose author is the caller or an account the caller

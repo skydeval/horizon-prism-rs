@@ -107,7 +107,10 @@ pub struct Health {
     /// The column backfill has visited every old row. Until then search
     /// and trends are incomplete for old rows.
     pub schema_backfill_done: bool,
-    /// Every search index is built. Until then search runs degraded.
+    /// Every index the post-migration task builds exists: the search
+    /// indexes, and the pair indexes on follows and blocks. Until then
+    /// search runs degraded and the private tier's pair lookups read a
+    /// wider index.
     pub search_indexes_ready: bool,
 }
 

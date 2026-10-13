@@ -13,8 +13,19 @@
 //!    audience owner `active`) → `NotInAudience`; an unknown endpoint denies
 //!    and re-queues the identity refresher for both DIDs;
 //! 5. no `private_audiences` row → `NotInAudience`;
-//! 6. `mode` neither NULL nor `list` → `NotInAudience`;
-//! 7. viewer ∈ `members` → `InAudience`, else `NotInAudience`.
+//! 6. for `followers` and `everyone` under an audience whose owner is not
+//!    the post's owner: a block either way between that owner and the
+//!    viewer (unless the viewer is that owner), or between that owner and
+//!    the post's owner → `NotInAudience`;
+//! 7. by `mode`, matched exactly: `list` or none, viewer ∈ `members`;
+//!    `followers`, the viewer is the audience's owner or a follow record by
+//!    the viewer naming that owner is stored; `everyone`, always; anything
+//!    else (`nobody`, `following`, an unknown value) → `NotInAudience`.
+//!
+//! Rules 1–5 and `list` mirror Aurora-Locus `authorize_private_read`.
+//! `followers` and `everyone` go beyond it: the PDS denies every mode but
+//! `list`, having no follow graph to ask
+//! (docs/internal/design/private-audience-modes.md).
 
 use std::time::{Duration, SystemTime};
 
@@ -113,6 +124,13 @@ impl OracleSnapshot {
             Some(u) => schema::audience_row(pool, u).await?,
             None => None,
         };
+        // The facts rules 6 and 7 read, loaded whatever the mode so that
+        // the mode adds no difference of its own. With no usable audience
+        // URI the post's owner stands in, and the answers go unread.
+        let relation_owner = audience_uri.as_deref().and_then(uri_author).filter(|d| !d.is_empty()).unwrap_or(owner).to_string();
+        let viewer_follows = schema::follows(pool, input.requester, &relation_owner).await?;
+        let viewer_block = schema::blocks_between(pool, input.requester, &relation_owner).await?;
+        let author_block = schema::blocks_between(pool, owner, &relation_owner).await?;
         let audience = if input.requester == owner {
             AudienceState::InAudience
         } else if facts.as_ref().is_none_or(|f| f.owner != owner) {
@@ -124,9 +142,23 @@ impl OracleSnapshot {
             } else {
                 match &audience_row {
                     None => AudienceState::NotInAudience,
-                    Some(a) if a.mode.as_deref().is_some_and(|m| m != "list") => AudienceState::NotInAudience,
-                    Some(a) if a.members.iter().any(|m| m == input.requester) => AudienceState::InAudience,
-                    Some(_) => AudienceState::NotInAudience,
+                    Some(a) => {
+                        let mode = a.mode.as_deref().unwrap_or("list");
+                        // Rule 6: under these modes a block is the audience
+                        // owner's only way to keep one reader out.
+                        let blocked = matches!(mode, "followers" | "everyone")
+                            && audience_owner != owner
+                            && ((input.requester != audience_owner && (viewer_block.0 || viewer_block.1))
+                                || author_block.0
+                                || author_block.1);
+                        let inside = match mode {
+                            "list" => a.members.iter().any(|m| m == input.requester),
+                            "followers" => input.requester == audience_owner || viewer_follows,
+                            "everyone" => true,
+                            _ => false,
+                        };
+                        if inside && !blocked { AudienceState::InAudience } else { AudienceState::NotInAudience }
+                    }
                 }
             }
         } else {

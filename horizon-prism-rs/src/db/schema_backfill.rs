@@ -55,7 +55,7 @@ const LOCK_RETRY: Duration = Duration::from_millis(500);
 
 /// The large-table indexes, by name, with the one statement that builds
 /// each (§3.1: the names and definitions are normative).
-pub const INDEXES: [(&str, &str); 9] = [
+pub const INDEXES: [(&str, &str); 11] = [
     ("posts_search", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_search ON posts USING gin (search_tsv)"),
     ("posts_tags", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_tags ON posts USING gin (tags)"),
     ("posts_domains", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_domains ON posts USING gin (link_domains)"),
@@ -65,6 +65,10 @@ pub const INDEXES: [(&str, &str); 9] = [
     ("posts_created", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_created ON posts (created_at DESC, uri DESC)"),
     ("likes_via", "CREATE INDEX CONCURRENTLY IF NOT EXISTS likes_via ON likes (via_uri) WHERE via_uri IS NOT NULL"),
     ("reposts_via", "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_via ON reposts (via_uri) WHERE via_uri IS NOT NULL"),
+    // The pair lookups of the private tier's audience rules and candidate
+    // filter (docs/internal/design/private-audience-modes.md §6).
+    ("follows_pair", "CREATE INDEX CONCURRENTLY IF NOT EXISTS follows_pair ON follows (author_did, subject_did)"),
+    ("blocks_pair", "CREATE INDEX CONCURRENTLY IF NOT EXISTS blocks_pair ON blocks (author_did, subject_did)"),
 ];
 
 /// The task's settings.
@@ -594,7 +598,7 @@ mod tests {
             .fetch_one(p)
             .await
             .expect("recorded");
-        assert_eq!(recorded, 9);
+        assert_eq!(recorded, 11);
         // A second pass finds every index valid and builds nothing.
         t.run_index_builds().await.expect("again");
         db.drop_db().await;
