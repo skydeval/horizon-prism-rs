@@ -332,7 +332,10 @@ pub async fn run() -> Result<(), StartupError> {
         pool.clone(),
         guard,
         retention,
-        RetentionSettings::from(&cfg.file.retention),
+        RetentionSettings {
+            trend_aggregate_hours: cfg.file.trends.aggregate_retention_hours,
+            ..RetentionSettings::from(&cfg.file.retention)
+        },
         cfg.file.retention.run_at_utc,
     ));
     tasks.push(

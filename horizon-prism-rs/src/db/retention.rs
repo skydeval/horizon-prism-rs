@@ -55,10 +55,10 @@ pub const CONSTELLATION_COUNTS_DAYS: i32 = 7;
 pub const DID_CACHE_GRACE_DAYS: i32 = 7;
 /// Finished `backfill_jobs` and `admin_commands` are kept this long (§4.4).
 pub const FINISHED_WORK_DAYS: i32 = 30;
-/// How long `tag_activity_hourly` rows are kept (design-v3 §7.5): the
-/// default of `trends.aggregate_retention_hours`, which becomes a config key
-/// with the trend endpoints. It matches the triggers' own default cutoff.
-pub const TREND_AGGREGATE_HOURS: i32 = 72;
+/// How long `tag_activity_hourly` rows are kept unless
+/// `trends.aggregate_retention_hours` says otherwise (design-v3 §7.5). It
+/// matches the triggers' own default cutoff.
+pub const TREND_AGGREGATE_HOURS: u32 = 72;
 
 /// Metric: rows deleted by retention, labelled by table.
 pub const METRIC_DELETED_ROWS: &str = "retention_deleted_rows_total";
@@ -79,6 +79,9 @@ pub struct RetentionSettings {
     pub notification_days: u32,
     /// 0 disables the optional age cap.
     pub max_age_days: u32,
+    /// `trends.aggregate_retention_hours`: how long `tag_activity_hourly`
+    /// rows are kept.
+    pub trend_aggregate_hours: u32,
 }
 
 impl From<&RetentionConfig> for RetentionSettings {
@@ -87,6 +90,7 @@ impl From<&RetentionConfig> for RetentionSettings {
             tombstone_days: c.tombstone_days,
             notification_days: c.notification_days,
             max_age_days: c.max_age_days,
+            trend_aggregate_hours: TREND_AGGREGATE_HOURS,
         }
     }
 }
@@ -430,7 +434,7 @@ fn time_steps(settings: &RetentionSettings) -> Vec<Step> {
             "tag_activity_hourly",
             "ctid",
             "ta",
-            &format!("ta.hour < now() - make_interval(hours => {TREND_AGGREGATE_HOURS})"),
+            &format!("ta.hour < now() - make_interval(hours => {})", settings.trend_aggregate_hours),
             Bind::None,
         ),
         batched(
@@ -792,6 +796,7 @@ mod tests {
             tombstone_days: 7,
             notification_days: 90,
             max_age_days: 30,
+            trend_aggregate_hours: 72,
         };
         let mut steps = scope_steps(vec!["did:plc:owner".into()], vec!["did:plc:author".into()]);
         steps.extend(age_cap_steps(settings.max_age_days));
@@ -909,6 +914,7 @@ mod tests {
             tombstone_days: 7,
             notification_days: 90,
             max_age_days: 0,
+            trend_aggregate_hours: 72,
         };
         let t = time_steps(&settings);
         let bind = |table: &str| t.iter().find(|s| s.table == table).map(|s| s.bind.clone());
@@ -934,6 +940,7 @@ mod tests {
             tombstone_days: 7,
             notification_days: 90,
             max_age_days: 0,
+            trend_aggregate_hours: 72,
         };
         let t = time_steps(&settings);
         let jobs = t.iter().find(|s| s.table == "backfill_jobs").expect("jobs step");
@@ -1004,6 +1011,7 @@ mod tests {
             tombstone_days: 7,
             notification_days: 90,
             max_age_days: 0,
+            trend_aggregate_hours: 72,
         })
         .remove(0);
         assert!(run_batch(&pool, &scope, &step).await.is_err());
@@ -1022,6 +1030,7 @@ mod tests {
             tombstone_days: 7,
             notification_days: 90,
             max_age_days: 30,
+            trend_aggregate_hours: 72,
         };
         for step in time_steps(&settings).into_iter().chain(age_cap_steps(30)) {
             assert!(step.candidates.is_none(), "{} uses row batches", step.table);
@@ -1133,6 +1142,7 @@ mod tests {
                 tombstone_days: 7,
                 notification_days: 90,
                 max_age_days: 0,
+                trend_aggregate_hours: 72,
             };
             PublicRetention::new(Arc::new(NoPrivate))
                 .run(pool, &lock_scope(), &settings)
@@ -1231,7 +1241,8 @@ mod tests {
             RetentionSettings {
                 tombstone_days: 7,
                 notification_days: 90,
-                max_age_days: 0
+                max_age_days: 0,
+                trend_aggregate_hours: 72,
             }
         );
     }

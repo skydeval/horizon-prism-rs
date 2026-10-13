@@ -1187,6 +1187,9 @@ pub struct TrendsConfig {
     pub decay_half_life_hours: Float,
     /// Engagement counts only on a post made at most this long before it.
     pub subject_lookback_hours: u32,
+    /// How long the hourly aggregate's rows are kept, and how old a post,
+    /// like or repost may be and still be added to it.
+    pub aggregate_retention_hours: u32,
     /// The longest a trend refresh may run; past it the previous list
     /// keeps being served.
     pub refresh_timeout_ms: u64,
@@ -1216,6 +1219,7 @@ impl Default for TrendsConfig {
             min_authors: 2,
             decay_half_life_hours: Float(6.0),
             subject_lookback_hours: 72,
+            aggregate_retention_hours: 72,
             refresh_timeout_ms: 10_000,
             started_ratio: Float(2.0),
             hot_ratio: Float(2.0),

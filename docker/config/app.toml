@@ -337,6 +337,7 @@ min_posts = 3
 min_authors = 2
 decay_half_life_hours = 6.0      # engagement this old counts half
 subject_lookback_hours = 72      # likes on posts older than this are ignored
+aggregate_retention_hours = 72   # how long the hourly tallies are kept
 refresh_timeout_ms = 10000       # past this, the previous list keeps being shown
 started_ratio = 2.0
 hot_ratio = 2.0                  # "hot": the last hour at this many times the average

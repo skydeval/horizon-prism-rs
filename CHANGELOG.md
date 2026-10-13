@@ -28,7 +28,10 @@ commit.
   computed again every `cache_ttl_secs`; a trend refresh that passes
   `refresh_timeout_ms` keeps the previous list and counts in
   `trends_refresh_timeout_total`. New `[trends]` section (design-v3
-  §7.4, §7.5).
+  §7.4, §7.5). `trends.subject_lookback_hours` and the new
+  `trends.aggregate_retention_hours` are set on every database
+  connection, so the triggers that keep the hourly aggregate follow
+  them, and the daily job deletes aggregate rows past the latter.
 - **Item 17: suggestions and `getConfig` (#675).** Computed from what
   this AppView stores, with no placeholder accounts and no network call
   while ranking. An account can be suggested when it is in scope, active,

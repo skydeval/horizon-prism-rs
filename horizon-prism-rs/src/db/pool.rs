@@ -47,8 +47,17 @@ pub fn pool_options() -> PgPoolOptions {
 /// # Errors
 ///
 /// Any [`sqlx::Error`] from parsing the URL or opening the first connection.
+///
+/// Every connection also carries the two settings the trend triggers read
+/// (design-v3 §7.5): how old a row may be and still be aggregated, and how
+/// long after a post its engagement still counts. A session without them,
+/// an operator's `psql` say, gets the triggers' own defaults.
 pub async fn connect(cfg: &AppConfig) -> Result<PgPool, sqlx::Error> {
-    let options = connect_options(cfg.env.database_url.expose(), cfg.file.db.lock_timeout_secs)?;
+    let trends = &cfg.file.trends;
+    let options = connect_options(cfg.env.database_url.expose(), cfg.file.db.lock_timeout_secs)?.options([
+        ("prism.trends_retention_hours", trends.aggregate_retention_hours.to_string()),
+        ("prism.trends_subject_lookback_hours", trends.subject_lookback_hours.to_string()),
+    ]);
     pool_options().connect_with(options).await
 }
 
