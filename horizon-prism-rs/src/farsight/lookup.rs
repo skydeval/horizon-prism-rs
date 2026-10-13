@@ -574,6 +574,7 @@ impl Farsight {
             cache_only: Arc::new(AtomicBool::new(false)),
             no_fallback: Arc::new(AtomicBool::new(false)),
             purges: self.inner.purges.load(Ordering::SeqCst),
+            deadline: req.deadline(),
         }
     }
 
@@ -732,6 +733,9 @@ pub struct Lookup {
     no_fallback: Arc<AtomicBool>,
     /// The purge count when the request began.
     purges: u64,
+    /// The request's deadline (`Requester::deadline`): the fallback's calls
+    /// end by it.
+    deadline: Instant,
 }
 
 impl std::fmt::Debug for Lookup {
@@ -1161,6 +1165,13 @@ impl Lookup {
             (plan, state.fallback_allowance)
         };
         if plan.is_empty() || allowance.is_zero() {
+            return HashMap::new();
+        }
+        // The fallback comes last in a request, and never holds it past
+        // the request's own deadline.
+        let allowance = allowance.min(self.deadline.saturating_duration_since(Instant::now()));
+        if allowance.is_zero() {
+            skip("deadline");
             return HashMap::new();
         }
         let started = Instant::now();
@@ -1885,6 +1896,21 @@ pub(crate) mod tests {
 
         writer.abort();
         db.drop_db().await;
+    }
+
+    /// design-v3 §5.14.17: the fallback comes last in a request and never
+    /// holds it past the request's own deadline.
+    #[tokio::test]
+    async fn a_request_past_its_deadline_asks_the_fallback_nothing() {
+        let none = HashSet::new();
+        let (farsight, _fake, upstream) = down("").await;
+        let before = upstream.asked.lock().expect("asked").len();
+        let late = member().with_deadline(Instant::now());
+        farsight.request(&late).inbound_list_blocks(V, &[numbered(60)], &none).await;
+        assert_eq!(upstream.asked.lock().expect("asked").len(), before);
+        // A request with time left asks about the same account.
+        farsight.request(&member()).inbound_list_blocks(V, &[numbered(60)], &none).await;
+        assert_eq!(upstream.asked.lock().expect("asked").len(), before + 1);
     }
 
     /// B-91: the per-request cap bounds the calls; an `ActorNotFound`

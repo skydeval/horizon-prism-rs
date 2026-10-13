@@ -1351,6 +1351,11 @@ commit.
 
 ### Fixed
 
+- **The fallback ends by the request's deadline (#683).** A fallback
+  call could run its whole timeout even when the request it belonged to
+  had less time left. Its calls are now cut to the time the request has
+  left, and a request with none left asks nothing
+  (`farsight_fallback_skipped_total{reason="deadline"}`).
 - **`searchActors` now keeps to its corpus and to the viewer's blocks
   (#679).** It searched every stored identity row, which included
   accounts stored only because of a private reply to a member, so a
