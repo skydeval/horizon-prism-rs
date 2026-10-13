@@ -12,6 +12,18 @@ commit.
 
 ### Added
 
+- **Item 16: typeahead and starter-pack search (#675).**
+  `app.bsky.actor.searchActorsTypeahead` matches the start of a handle
+  or display name, and from three characters a word inside the display
+  name. Each branch reads at most `search.typeahead_candidates` rows in
+  index order before ranking, so one character costs a bounded scan.
+  Order: members, accounts the viewer follows, the exact handle, then
+  the shortest handle. It makes no Farsight call: an inbound list block
+  applies from what is already known. `app.bsky.graph.searchStarterPacks`
+  and `searchStarterPacksV2` search stored packs of in-scope creators by
+  text, most joined first; V2 adds an exact `hitsTotal` when small. V2's
+  views carry no `list` or `listItemsSample`. All three are in the
+  Search rate class (design-v3 §9.4, §9.5).
 - **Item 16: post search (#675).** `app.bsky.feed.searchPosts` and
   `app.bsky.feed.searchPostsV2`, two parameter parsers over one search
   of the posts stored here whose author is in scope. Text is matched
@@ -1278,6 +1290,15 @@ commit.
 
 ### Fixed
 
+- **`searchActors` now keeps to its corpus and to the viewer's blocks
+  (#679).** It searched every stored identity row, which included
+  accounts stored only because of a private reply to a member, so a
+  search could reveal that such an interaction exists. It now finds only
+  active accounts that are in scope or members. A signed-in member's
+  mutes and blocks, list mutes and inbound list blocks included, now
+  leave accounts out; signed out, accounts with `!no-unauthenticated`
+  are left out. A search that passes `search.statement_timeout_ms` is
+  `InvalidRequest` "query too expensive" (design-v3 §9.3).
 - **Item 12: a Farsight that hangs now counts as failing (#673).** A
   `checkBlocks` call that ran out its whole timeout was meant to count
   towards pausing Farsight calls, but the check compared the time left

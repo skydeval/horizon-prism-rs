@@ -16,8 +16,11 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-use super::actor::{ProfileContext, ProfileKind};
+use sqlx::Acquire;
+
+use super::actor::{ProfileContext, ProfileKind, SHOWN_SIGNED_OUT, too_expensive};
 use super::feed::{local_cursor, parse_local_cursor};
+use super::search::{METRIC_TIMEOUT, set_timeout, timed_out, viewer_exclusions};
 use super::{Hydrator, ViewError, ViewResult, Viewer, ts};
 use crate::db::locks::uri_author;
 use crate::moderation::{self, Gate};
@@ -179,6 +182,107 @@ impl Hydrator {
             .map(|r| Self::pack_basic(r, &ctx, counts.get(&r.list_uri).copied(), &joined, &labels))
             .collect();
         Ok(Ok(Self::emit(json!({ "starterPacks": views }))))
+    }
+
+    /// `app.bsky.graph.searchStarterPacks` and `searchStarterPacksV2`
+    /// (design-v3 §9.5): stored packs whose name or description matches
+    /// `q`, of creators that are in scope and active, most joined first and
+    /// then by text rank. The viewer's mutes and blocks apply to the
+    /// creator, as in every search.
+    ///
+    /// V1 gives `starterPackViewBasic`s. V2 gives `starterPackView`s
+    /// (without `list` and `listItemsSample`, which the lexicon leaves
+    /// optional and which would cost a lookup per pack) and `hitsTotal`,
+    /// exact and only when small. The cursor is an offset, capped at
+    /// `search.max_offset`.
+    ///
+    /// # Errors
+    ///
+    /// Database errors other than the search's own timeout.
+    pub async fn search_starter_packs(&self, viewer: &Viewer, req: &Requester, q: &str, limit: u32, cursor: Option<&str>, v2: bool) -> ViewResult<Value> {
+        let cfg = self.inner.cfg.search.clone();
+        let endpoint = if v2 { "searchStarterPacksV2" } else { "searchStarterPacks" };
+        let q = q.trim();
+        let max_offset = i64::from(cfg.max_offset);
+        let offset: i64 = cursor.and_then(|c| c.parse().ok()).unwrap_or(0).max(0);
+        if q.is_empty() || offset > max_offset {
+            return Ok(Ok(Self::emit(json!({ "starterPacks": [] }))));
+        }
+        let limit = i64::from(limit.clamp(1, 100));
+        let from = format!(
+            " FROM starter_packs sp CROSS JOIN LATERAL (SELECT sp.creator_did AS author_did) n \
+              LEFT JOIN actors a ON a.did = sp.creator_did \
+              WHERE ($1::text IS NULL OR ({exclusions})) \
+                AND sp.search_tsv @@ websearch_to_tsquery('simple', $2) \
+                AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = sp.creator_did) \
+                AND COALESCE(a.account_status, 'active') = 'active' AND ($3 OR {SHOWN_SIGNED_OUT})",
+            exclusions = viewer_exclusions(),
+        );
+        let page = format!(
+            "SELECT sp.uri{from} \
+             ORDER BY COALESCE((SELECT c.joined_all_time_count FROM starter_pack_counts c WHERE c.pack_uri = sp.uri), 0) DESC, \
+                      ts_rank_cd(sp.search_tsv, websearch_to_tsquery('simple', $2)) DESC, sp.uri \
+             LIMIT $4 OFFSET $5"
+        );
+        let me = viewer.state_did();
+        let signed_in = viewer.did.is_some();
+        let mut tx = self.pool().begin().await?;
+        set_timeout(&mut tx, cfg.statement_timeout_ms).await?;
+        let found = sqlx::query_scalar(&page).bind(me).bind(q).bind(signed_in).bind(limit).bind(offset).fetch_all(&mut *tx).await;
+        let uris: Vec<String> = match found {
+            Ok(uris) => uris,
+            Err(error) if timed_out(&error) => {
+                metrics::counter!(METRIC_TIMEOUT, "endpoint" => endpoint).increment(1);
+                return Ok(Err(too_expensive()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // After the page, under a savepoint: its timeout costs the count
+        // and nothing else.
+        let cap = i64::from(cfg.hits_total_max);
+        let mut hits: Option<i64> = None;
+        if v2 {
+            let count = format!("SELECT count(*) FROM (SELECT 1{from} LIMIT $4) s");
+            let mut savepoint = tx.begin().await?;
+            set_timeout(&mut savepoint, cfg.hits_total_timeout_ms).await?;
+            let counted: Result<i64, sqlx::Error> =
+                sqlx::query_scalar(&count).bind(me).bind(q).bind(signed_in).bind(cap + 1).fetch_one(&mut *savepoint).await;
+            match counted {
+                Ok(n) => {
+                    savepoint.commit().await?;
+                    hits = Some(n).filter(|n| *n <= cap);
+                }
+                Err(error) if timed_out(&error) => savepoint.rollback().await?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        tx.commit().await?;
+
+        // Stored rows, the moderation gate, and what only a lookup knows
+        // of the viewer's blocks.
+        let packs = self.load_packs(req, &uris).await?;
+        let found: Vec<&PackRow> = uris.iter().filter_map(|u| packs.get(u)).collect();
+        let creators: Vec<String> = found.iter().filter_map(|r| uri_author(&r.uri).map(str::to_string)).collect();
+        let ctx = self.profile_context(viewer, req, &creators, None).await?;
+        let pack_uris: Vec<String> = found.iter().map(|r| r.uri.clone()).collect();
+        let (joined, labels) = (self.joined_counts(&pack_uris).await?, self.load_labels(&pack_uris).await?);
+        let counts = if v2 { HashMap::new() } else { self.local_list_counts(&found).await? };
+        let views: Vec<Value> = found
+            .iter()
+            .filter(|r| {
+                let creator = uri_author(&r.uri).unwrap_or_default();
+                !ctx.viewer.blocked_either_way(creator) && !ctx.viewer.muted.contains(creator)
+            })
+            .map(|r| Self::pack_basic(r, &ctx, counts.get(&r.list_uri).copied(), &joined, &labels))
+            .collect();
+        let mut out = json!({ "starterPacks": views });
+        if i64::try_from(uris.len()).unwrap_or(0) == limit && offset + limit <= max_offset {
+            out["cursor"] = json!((offset + limit).to_string());
+        }
+        if let Some(hits) = hits {
+            out["hitsTotal"] = json!(hits);
+        }
+        Ok(Ok(Self::emit(out)))
     }
 
     /// `app.bsky.graph.getStarterPack`: the pack with its list and a sample
@@ -423,6 +527,55 @@ mod tests {
         .await
         .expect("pack");
         uri
+    }
+
+    /// B-42 (design-v3 §9.5): packs are found by their text, of creators in
+    /// scope only, most joined first; V2 adds the exact total; a member's
+    /// mute of the creator leaves the pack out.
+    #[tokio::test]
+    async fn packs_are_searched_by_text_within_scope() {
+        let Some(db) = fresh_db("hydration_packs_search").await else {
+            return;
+        };
+        let p = &db.pool;
+        let outside = "did:plc:oooooooooooooooooooooooo";
+        for (did, handle) in [(ALICE, "alice.test"), (BOB, "bob.test"), (outside, "out.test")] {
+            actor(p, did, handle, handle).await;
+        }
+        for did in [ALICE, BOB] {
+            sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)").bind(did).execute(p).await.expect("scope");
+        }
+        exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
+        let list = format!("at://{ALICE}/{NSID_LIST}/sp");
+        let a = pack(p, ALICE, "a", "Rust people", &list, 3).await;
+        let b = pack(p, BOB, "b", "More rust people", &list, 2).await;
+        pack(p, BOB, "c", "Gardeners", &list, 1).await;
+        pack(p, outside, "d", "Rust outside the scope", &list, 1).await;
+        exec(p, &format!("INSERT INTO starter_pack_counts (pack_uri, joined_week_count, joined_all_time_count, all_time_source, refreshed_at) VALUES ('{b}', 1, 9, 'local', now())")).await;
+
+        let h = hydrator(p, ScopeSets::default());
+        let req = Requester::test();
+        let found = |view: &Value| view["starterPacks"].as_array().expect("packs").iter().map(|s| s["uri"].as_str().expect("uri").to_string()).collect::<Vec<_>>();
+        let anon = Viewer::anonymous();
+        let v1 = h.search_starter_packs(&anon, &req, "rust", 25, None, false).await.expect("db").expect("view");
+        assert_eq!(found(v1.inner()), [b.clone(), a.clone()]);
+        assert!(v1.inner().get("hitsTotal").is_none());
+        assert_eq!(v1.inner()["starterPacks"][0]["creator"]["did"], BOB);
+        let v2 = h.search_starter_packs(&anon, &req, "rust", 1, None, true).await.expect("db").expect("view");
+        assert_eq!((found(v2.inner()), &v2.inner()["hitsTotal"], &v2.inner()["cursor"]), (vec![b.clone()], &json!(2), &json!("1")));
+        let next = h.search_starter_packs(&anon, &req, "rust", 1, Some("1"), true).await.expect("db").expect("view");
+        assert_eq!(found(next.inner()), std::slice::from_ref(&a));
+        // Past the deepest offset there is nothing, and an empty query
+        // finds nothing.
+        let deep = h.search_starter_packs(&anon, &req, "rust", 1, Some("5000"), true).await.expect("db").expect("view");
+        assert!(found(deep.inner()).is_empty());
+        assert!(found(h.search_starter_packs(&anon, &req, " ", 25, None, false).await.expect("db").expect("view").inner()).is_empty());
+
+        let me = Viewer { did: Some(ALICE.to_string()), hydrate: true };
+        exec(p, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{ALICE}', '{BOB}')")).await;
+        let mine = h.search_starter_packs(&me, &req, "rust", 25, None, true).await.expect("db").expect("view");
+        assert_eq!((found(mine.inner()), &mine.inner()["hitsTotal"]), (vec![a], &json!(1)));
+        db.drop_db().await;
     }
 
     /// B-37: packs of a ready member, with the list's count and sample from

@@ -249,7 +249,7 @@ fn operators(query: &str) -> Result<Operators, ViewError> {
 /// The viewer's own mutes and blocks as a condition on `n`, with the
 /// viewer as `$1`: a full mute, a block either way, and a list mute or
 /// list block of the viewer's that applies (design-v3 §5.0).
-fn viewer_exclusions() -> String {
+pub(super) fn viewer_exclusions() -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did AND m.scope = 'full') \
          AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = n.author_did) \

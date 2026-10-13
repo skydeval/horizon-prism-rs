@@ -7,6 +7,9 @@ use std::time::Instant;
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
 
+use sqlx::{Postgres, QueryBuilder};
+
+use super::search::{METRIC_TIMEOUT, set_timeout, timed_out, viewer_exclusions};
 use super::{ActorRow, ActorViewer, CountMode, Hydrator, INVALID_HANDLE, ViewError, ViewResult, Viewer, blob_url, ts};
 use crate::moderation::{self, Gate};
 use crate::xrpc::pools::Requester;
@@ -240,12 +243,19 @@ impl Hydrator {
         Ok(Ok(Self::emit(json!({ "profiles": profiles }))))
     }
 
-    /// `app.bsky.actor.searchActors`: trigram match over indexed actors'
-    /// handles and display names (§7.1). The cursor is an offset.
+    /// `app.bsky.actor.searchActors` (design-v3 §9.3): trigram match over
+    /// the handles and display names of active accounts that are in scope
+    /// or members. The corpus stops there because an identity row can exist
+    /// for an account whose only tie to this AppView is a private reply to
+    /// a member, and a search over every row would reveal it.
+    ///
+    /// A ready member's mutes and blocks apply, in the query and, with
+    /// inbound list blocks, after hydration. The cursor is an offset that
+    /// follows the scan, so a page can be short.
     ///
     /// # Errors
     ///
-    /// Database errors.
+    /// Database errors other than the search's own timeout.
     pub async fn search_actors(&self, viewer: &Viewer, req: &Requester, q: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
         let q = q.trim().trim_start_matches('@').to_lowercase();
         if q.is_empty() {
@@ -253,26 +263,36 @@ impl Hydrator {
         }
         let offset: i64 = cursor.and_then(|c| c.parse().ok()).unwrap_or(0).max(0);
         let limit = i64::from(limit.clamp(1, 100));
-        let pattern = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-        let dids: Vec<String> = sqlx::query_scalar(
-            "SELECT did FROM actors \
-             WHERE account_status = 'active' AND (handle ILIKE $1 OR display_name ILIKE $1) \
-             ORDER BY GREATEST(similarity(coalesce(handle, ''), $2), similarity(coalesce(display_name, ''), $2)) DESC, did \
-             LIMIT $3 OFFSET $4",
-        )
-        .bind(&pattern)
-        .bind(&q)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(self.pool())
-        .await?;
-        let gates = moderation::gate_many(self.pool(), &dids).await?;
-        let visible: Vec<String> = dids
-            .iter()
-            .filter(|d| !gates.get(*d).copied().unwrap_or(Gate::Visible).is_hidden())
-            .cloned()
-            .collect();
-        let ctx = self.profile_context(viewer, req, &visible, None).await?;
+        let pattern = format!("%{}%", like_escape(&q));
+        let sql = format!(
+            "SELECT a.did FROM actors a CROSS JOIN LATERAL (SELECT a.did AS author_did) n \
+             WHERE ($1::text IS NULL OR ({exclusions})) AND {IN_CORPUS} AND ($5 OR {SHOWN_SIGNED_OUT}) \
+               AND (a.handle ILIKE $2 OR a.display_name ILIKE $2) \
+             ORDER BY GREATEST(similarity(coalesce(a.handle, ''), $3), similarity(coalesce(a.display_name, ''), $3)) DESC, a.did \
+             LIMIT $4 OFFSET $6",
+            exclusions = viewer_exclusions(),
+        );
+        let mut tx = self.pool().begin().await?;
+        set_timeout(&mut tx, self.inner.cfg.search.statement_timeout_ms).await?;
+        let found = sqlx::query_scalar(&sql)
+            .bind(viewer.state_did())
+            .bind(&pattern)
+            .bind(&q)
+            .bind(limit)
+            .bind(viewer.did.is_some())
+            .bind(offset)
+            .fetch_all(&mut *tx)
+            .await;
+        let dids: Vec<String> = match found {
+            Ok(dids) => dids,
+            Err(error) if timed_out(&error) => {
+                metrics::counter!(METRIC_TIMEOUT, "endpoint" => "searchActors").increment(1);
+                return Ok(Err(too_expensive()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        tx.commit().await?;
+        let (visible, ctx) = self.searchable(viewer, req, &dids).await?;
         let actors: Vec<Value> = visible.iter().map(|d| ctx.view(d, ProfileKind::View)).collect();
         let mut out = json!({ "actors": actors });
         if i64::try_from(dids.len()).unwrap_or(0) == limit {
@@ -280,6 +300,135 @@ impl Hydrator {
         }
         Ok(Ok(Self::emit(out)))
     }
+
+    /// Of the accounts a search found: those the moderation gate shows and
+    /// the viewer neither blocks, is blocked by, nor fully mutes, with
+    /// their profile context. An inbound list block is known only here.
+    async fn searchable(&self, viewer: &Viewer, req: &Requester, dids: &[String]) -> Result<(Vec<String>, ProfileContext), sqlx::Error> {
+        let gates = moderation::gate_many(self.pool(), dids).await?;
+        let shown: Vec<String> = dids
+            .iter()
+            .filter(|d| !gates.get(*d).copied().unwrap_or(Gate::Visible).is_hidden())
+            .cloned()
+            .collect();
+        let ctx = self.profile_context(viewer, req, &shown, None).await?;
+        let visible = shown
+            .into_iter()
+            .filter(|d| !ctx.viewer.blocked_either_way(d) && !ctx.viewer.muted.contains(d))
+            .collect();
+        Ok((visible, ctx))
+    }
+
+    /// `app.bsky.actor.searchActorsTypeahead` (design-v3 §9.4): accounts
+    /// whose handle or display name starts with `q`, or (from three
+    /// characters) whose display name holds a word that does.
+    ///
+    /// Each branch takes a bounded number of rows in index order before
+    /// anything is ranked, so one character costs a bounded range scan. The
+    /// prefix branches use the pattern operators, the only ones a
+    /// `text_pattern_ops` index serves, between `q` and `q` with its last
+    /// code point raised by one. An exact handle always takes part.
+    ///
+    /// Order: members, then accounts the viewer follows, then the exact
+    /// handle, then the shortest handle. The corpus and the exclusions are
+    /// `searchActors`'s; the caller makes the block lookup cache-only.
+    ///
+    /// # Errors
+    ///
+    /// Database errors other than the search's own timeout.
+    pub async fn search_actors_typeahead(&self, viewer: &Viewer, req: &Requester, q: &str, limit: u32) -> ViewResult<Value> {
+        let q = q.trim().trim_start_matches('@').to_lowercase();
+        if q.is_empty() {
+            return Ok(Ok(Self::emit(json!({ "actors": [] }))));
+        }
+        let cfg = &self.inner.cfg.search;
+        let candidates = i64::from(cfg.typeahead_candidates);
+        let upper = successor(&q);
+        let prefix = format!("{}%", like_escape(&q));
+
+        let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new("WITH v AS (SELECT ");
+        qb.push_bind(viewer.state_did().map(str::to_string)).push("::text AS did)");
+        for (name, column) in [("h", "a.handle"), ("d", "lower(a.display_name)")] {
+            qb.push(format!(", {name} AS (SELECT a.did FROM actors a WHERE {column} ~>=~ ")).push_bind(q.clone());
+            if let Some(upper) = &upper {
+                qb.push(format!(" AND {column} ~<~ ")).push_bind(upper.clone());
+            }
+            qb.push(format!(" AND {column} LIKE ")).push_bind(prefix.clone());
+            qb.push(format!(" AND {IN_CORPUS} ORDER BY {column} USING ~<~ LIMIT ")).push_bind(candidates).push(")");
+        }
+        qb.push(", e AS (SELECT a.did FROM actors a WHERE a.handle = ").push_bind(q.clone()).push(format!(" AND {IN_CORPUS})"));
+        let mut branches = "SELECT did FROM h UNION SELECT did FROM d UNION SELECT did FROM e".to_string();
+        if q.chars().count() >= 3 {
+            qb.push(", w AS (SELECT a.did FROM actors a WHERE a.display_name ILIKE ").push_bind(format!("% {}%", like_escape(&q)));
+            qb.push(format!(" AND {IN_CORPUS} LIMIT ")).push_bind(candidates).push(")");
+            branches.push_str(" UNION SELECT did FROM w");
+        }
+        qb.push(format!(
+            " SELECT a.did FROM actors a CROSS JOIN LATERAL (SELECT a.did AS author_did) n \
+              WHERE a.did IN ({branches}) AND ($1::text IS NULL OR ({exclusions}))",
+            exclusions = viewer_exclusions(),
+        ));
+        if viewer.did.is_none() {
+            qb.push(format!(" AND {SHOWN_SIGNED_OUT}"));
+        }
+        qb.push(
+            " ORDER BY EXISTS (SELECT 1 FROM members m WHERE m.did = a.did) DESC, \
+                       EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = a.did) DESC, \
+                       (a.handle = ",
+        );
+        qb.push_bind(q.clone()).push(") DESC, length(a.handle), a.handle LIMIT ").push_bind(i64::from(limit.clamp(1, 100)));
+
+        let mut tx = self.pool().begin().await?;
+        set_timeout(&mut tx, cfg.statement_timeout_ms).await?;
+        let dids: Vec<String> = match qb.build_query_scalar().fetch_all(&mut *tx).await {
+            Ok(dids) => dids,
+            Err(error) if timed_out(&error) => {
+                metrics::counter!(METRIC_TIMEOUT, "endpoint" => "searchActorsTypeahead").increment(1);
+                return Ok(Err(too_expensive()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        tx.commit().await?;
+        let (visible, ctx) = self.searchable(viewer, req, &dids).await?;
+        let actors: Vec<Value> = visible.iter().map(|d| ctx.view(d, ProfileKind::Basic)).collect();
+        Ok(Ok(Self::emit(json!({ "actors": actors }))))
+    }
+}
+
+/// The accounts a search may find: active, and in scope or a member.
+pub(super) const IN_CORPUS: &str = "a.account_status = 'active' \
+     AND (EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = a.did) OR EXISTS (SELECT 1 FROM members m WHERE m.did = a.did))";
+
+/// What a signed-out search leaves out: an account whose profile asks not
+/// to be shown to signed-out viewers.
+pub(super) const SHOWN_SIGNED_OUT: &str =
+    "NOT COALESCE(a.profile_record -> 'labels' -> 'values' @> '[{\"val\": \"!no-unauthenticated\"}]'::jsonb, false)";
+
+/// The error of a search that passed its statement timeout, for the
+/// methods that declare no error of their own (design-v3 §9.0).
+pub(super) fn too_expensive() -> ViewError {
+    ViewError::new("InvalidRequest", "query too expensive")
+}
+
+/// `q` with `LIKE`'s own characters escaped.
+pub(super) fn like_escape(q: &str) -> String {
+    q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// The least string greater than every string that starts with `q`: `q`
+/// with its last code point raised by one, past the surrogate range.
+/// `None` when there is none to raise. UTF-8 byte order is code-point
+/// order, so this bounds a byte-wise index range; raising the last byte
+/// instead could leave text that is not UTF-8.
+fn successor(q: &str) -> Option<String> {
+    let mut chars: Vec<char> = q.chars().collect();
+    let next = match u32::from(chars.pop()?) {
+        0x0010_FFFF => return None,
+        0xD7FF => 0xE000,
+        n => n + 1,
+    };
+    chars.push(char::from_u32(next)?);
+    Some(chars.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -471,8 +620,79 @@ mod tests {
             .expect_err("miss");
         assert_eq!(e.error, "InvalidRequest");
 
-        let found = h.search_actors(&Viewer::anonymous(), &req, "ali", 10, None).await.expect("db").expect("view");
-        assert_eq!(found.inner()["actors"][0]["did"], ALICE);
+        // Search finds accounts in scope, and no others.
+        let search = |q: &'static str| {
+            let (h, req) = (h.clone(), req.clone());
+            async move {
+                let found = h.search_actors(&Viewer::anonymous(), &req, q, 10, None).await.expect("db").expect("view");
+                found.inner()["actors"].as_array().expect("actors").iter().map(|a| a["did"].as_str().expect("did").to_string()).collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(search("ali").await, Vec::<String>::new());
+        exec(p, "INSERT INTO scope_dids (did, reasons) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 2)").await;
+        assert_eq!(search("ali").await, [ALICE]);
+        db.drop_db().await;
+    }
+
+    /// B-41 / #679 (design-v3 §9.3, §9.4): the corpus is scope and
+    /// members; a member's mutes and blocks apply; typeahead matches
+    /// prefixes and orders members, follows, the exact handle, then the
+    /// shortest handle.
+    #[tokio::test]
+    async fn actor_search_and_typeahead_keep_to_the_corpus_and_the_viewers_blocks() {
+        const CAROL: &str = "did:plc:cccccccccccccccccccccccc";
+        const DAVE: &str = "did:plc:dddddddddddddddddddddddd";
+        const OUTSIDE: &str = "did:plc:oooooooooooooooooooooooo";
+        let Some(db) = fresh_db("hydration_actor_search").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "al.test", "Bob Alston").await;
+        actor(p, CAROL, "alfred.test", "Carol").await;
+        actor(p, DAVE, "dave.test", "Dave").await;
+        actor(p, OUTSIDE, "alien.test", "Alien").await;
+        for did in [BOB, CAROL, DAVE] {
+            sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)").bind(did).execute(p).await.expect("scope");
+        }
+        exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
+        let h = hydrator(p, sets());
+        let req = Requester::test();
+        let dids = |view: Value| view["actors"].as_array().expect("actors").iter().map(|a| a["did"].as_str().expect("did").to_string()).collect::<Vec<_>>();
+        let anon = Viewer::anonymous();
+        let me = Viewer { did: Some(DAVE.to_string()), hydrate: true };
+        exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{DAVE}', 'admin', now())")).await;
+
+        // Prefixes of the handle or of the display name; a member first,
+        // then the shortest handle. The account outside the corpus is
+        // never found.
+        let found = h.search_actors_typeahead(&anon, &req, "@AL", 10).await.expect("db").expect("view");
+        assert_eq!(dids(found.inner().clone()), [ALICE, BOB, CAROL]);
+        // A word inside the display name, from three characters.
+        let found = h.search_actors_typeahead(&anon, &req, "als", 10).await.expect("db").expect("view");
+        assert_eq!(dids(found.inner().clone()), [BOB]);
+        // `%` and `_` are characters, not wildcards.
+        let found = h.search_actors_typeahead(&anon, &req, "a%", 10).await.expect("db").expect("view");
+        assert_eq!(dids(found.inner().clone()), Vec::<String>::new());
+        assert_eq!(successor("al").as_deref(), Some("am"));
+        assert_eq!(successor("a\u{d7ff}").as_deref(), Some("a\u{e000}"));
+        assert_eq!(successor("\u{10ffff}"), None);
+
+        // An account the viewer follows comes before the others; one it
+        // mutes or blocks is left out of both searches.
+        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{DAVE}/app.bsky.graph.follow/1', '{DAVE}', '{CAROL}', '3k', now())")).await;
+        let found = h.search_actors_typeahead(&me, &req, "al", 10).await.expect("db").expect("view");
+        assert_eq!(dids(found.inner().clone()), [ALICE, CAROL, BOB]);
+        exec(p, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{DAVE}', '{BOB}')")).await;
+        exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ALICE}/app.bsky.graph.block/1', '{ALICE}', '{DAVE}', '3k', now())")).await;
+        let found = h.search_actors_typeahead(&me, &req, "al", 10).await.expect("db").expect("view");
+        assert_eq!(dids(found.inner().clone()), [CAROL]);
+        let found = h.search_actors(&me, &req, "al", 10, None).await.expect("db").expect("view");
+        assert_eq!(dids(found.inner().clone()), [CAROL]);
+        // Signed out, an account that asks not to be shown is left out.
+        exec(p, &format!("UPDATE actors SET profile_record = '{{\"labels\": {{\"values\": [{{\"val\": \"!no-unauthenticated\"}}]}}}}' WHERE did = '{CAROL}'")).await;
+        let found = h.search_actors(&anon, &req, "alf", 10, None).await.expect("db").expect("view");
+        assert_eq!(dids(found.inner().clone()), Vec::<String>::new());
         db.drop_db().await;
     }
 }

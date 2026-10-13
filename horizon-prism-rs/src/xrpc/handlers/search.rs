@@ -1,5 +1,6 @@
-//! `app.bsky.feed.searchPosts` and `app.bsky.feed.searchPostsV2` (design-v3
-//! §9.1, §9.2): two parameter parsers over one search.
+//! Search (design-v3 §9): `searchPosts` and `searchPostsV2`, two parameter
+//! parsers over one search; `searchActorsTypeahead`; and `searchStarterPacks`
+//! with its V2.
 
 use std::net::SocketAddr;
 
@@ -101,4 +102,60 @@ pub async fn search_posts_v2(
         cursor: owned(p.one("cursor")),
     };
     respond(&req.req, s.hydrator.search_posts(&req.viewer, &req.req, &params).await)
+}
+
+pub const SEARCH_ACTORS_TYPEAHEAD: &str = "app.bsky.actor.searchActorsTypeahead";
+pub const SEARCH_STARTER_PACKS: &str = "app.bsky.graph.searchStarterPacks";
+pub const SEARCH_STARTER_PACKS_V2: &str = "app.bsky.graph.searchStarterPacksV2";
+
+/// Typeahead runs on every keystroke, so an inbound list block applies
+/// from the viewer's cache only, with no Farsight call (design-v3 §5.14.7).
+pub async fn search_actors_typeahead(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, SEARCH_ACTORS_TYPEAHEAD, Access::Opt, false).await?;
+    if let Some(lookup) = crate::xrpc::backstop::farsight() {
+        lookup.set_cache_only();
+    }
+    let p = Params::parse(q.as_deref());
+    let term = p.one("q").or_else(|| p.one("term")).unwrap_or_default();
+    let limit = match p.u32("limit")? {
+        None => 10,
+        Some(n) if (1..=100).contains(&n) => n,
+        Some(_) => return Err(XrpcError::invalid("Error: limit must be between 1 and 100")),
+    };
+    respond(&req.req, s.hydrator.search_actors_typeahead(&req.viewer, &req.req, term, limit).await)
+}
+
+async fn starter_packs(s: AppState, peer: SocketAddr, headers: HeaderMap, q: Option<String>, nsid: &'static str, v2: bool) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, nsid, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    let query = p.required("q")?;
+    respond(
+        &req.req,
+        s.hydrator
+            .search_starter_packs(&req.viewer, &req.req, query, limit(&p)?, p.one("cursor"), v2)
+            .await,
+    )
+}
+
+pub async fn search_starter_packs(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    starter_packs(s, peer, headers, q, SEARCH_STARTER_PACKS, false).await
+}
+
+pub async fn search_starter_packs_v2(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    starter_packs(s, peer, headers, q, SEARCH_STARTER_PACKS_V2, true).await
 }
