@@ -120,6 +120,7 @@ bind_concurrency = 8
 get_posts = 800
 get_post_thread = 1000
 get_author_feed = 1000
+get_timeline = 1000
 
 [sync]
 head_max_age_secs = 60

@@ -12,6 +12,19 @@ commit.
 
 ### Added
 
+- **The private home timeline (#663).**
+  `app.nearhorizon.private.getTimeline` returns the private posts the
+  caller may read whose author is the caller or an account the caller
+  follows, newest first by `createdAt`, as `{feed, cursor?}` in
+  `getAuthorFeed`'s shape (`limit` 1 – 50, default 30). Pages are keyed
+  on `createdAt` and then the post's URI, so posts by different authors
+  that share a time are each returned once. A post the caller may not
+  read leaves no trace, and an empty page takes as long as a full one
+  (`private_read.floor_ms.get_timeline`, default 1000). An author the
+  caller fully mutes, directly or through a moderation list, is left
+  out. Same sign-in gate, errors and rate class as the other private
+  queries. Lexicon `app/nearhorizon/private/getTimeline.json` (Horizon
+  R-2; design-v3 §1.7 item 12).
 - **Profile views carry `status` (#675).** An account's stored
   `app.bsky.actor.status` record is shown on its profile views as a
   `statusView`: the status, the record, the `external#view` of its

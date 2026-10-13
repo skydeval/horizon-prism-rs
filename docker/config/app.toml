@@ -101,6 +101,7 @@ bind_concurrency = 8
 get_posts = 800
 get_post_thread = 1000
 get_author_feed = 1000
+get_timeline = 1000
 
 # Repo-head check for tracked DIDs (design §6.11.3).
 [sync]

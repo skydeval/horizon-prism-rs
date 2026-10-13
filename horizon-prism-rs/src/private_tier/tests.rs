@@ -142,6 +142,7 @@ impl Fixture {
                 get_posts: u64::try_from(FLOOR.as_millis()).expect("ms"),
                 get_post_thread: u64::try_from(FLOOR.as_millis()).expect("ms"),
                 get_author_feed: u64::try_from(FLOOR.as_millis()).expect("ms"),
+                get_timeline: u64::try_from(FLOOR.as_millis()).expect("ms"),
             },
         };
         PrivateState::new(
@@ -385,6 +386,89 @@ async fn private_reads_round_trip_and_every_miss_is_uniform() {
     assert_eq!(status, 400);
     assert!(body.contains("NotReady"), "{body}");
     assert!(took < FLOOR, "gate errors are not floored: {took:?}");
+    db.drop_db().await;
+}
+
+const TIMELINE: &str = "app.nearhorizon.private.getTimeline";
+
+/// Horizon R-2 (design-v3 §1.7 item 12): the private home timeline holds
+/// the posts the caller may read, by the caller and by the accounts it
+/// follows; a post it may not read leaves no trace; a mute applies; and
+/// paging returns each post once though every post shares one `createdAt`.
+#[tokio::test]
+async fn the_private_timeline_holds_readable_posts_of_followed_authors() {
+    let Some(db) = fresh_db("private_timeline").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "timeline").await;
+    let audience = |rkey: &str| format!("at://{ALICE}/{NSID_AUDIENCE}/{rkey}");
+    for (rkey, members) in [("3kaudboth222", json!([BOB, CAROL])), ("3kaudbob2222", json!([BOB]))] {
+        f.ingest(ALICE, NSID_AUDIENCE, rkey, json!({"$type": NSID_AUDIENCE, "mode": "list", "members": members, "createdAt": "2026-09-26T00:00:00Z"}))
+            .await;
+    }
+    for (rkey, text, aud) in [("3kpostboth22", "for both", "3kaudboth222"), ("3kpostbob222", "for bob alone", "3kaudbob2222")] {
+        let record = f.encoded_post(ALICE, rkey, text, Some(&audience(aud))).await;
+        f.ingest(ALICE, NSID_POST_PRIVATE, rkey, record).await;
+    }
+    // Bob's own post, to an audience that has no row: his alone.
+    let orphan = format!("at://{BOB}/{NSID_AUDIENCE}/3knoaudience");
+    let record = f.encoded_post(BOB, "3kbobsown222", "bob's note", Some(&orphan)).await;
+    f.ingest(BOB, NSID_POST_PRIVATE, "3kbobsown222", record).await;
+    f.ready(ALICE).await;
+    f.ready(BOB).await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+    let follow = |from: &str, to: &str| {
+        format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{from}/app.bsky.graph.follow/1', '{from}', '{to}', '3k', now())")
+    };
+    let texts = |body: &str| {
+        let v: Value = serde_json::from_str(body).expect("json");
+        let mut texts: Vec<String> = v["feed"].as_array().expect("feed").iter().map(|p| p["record"]["text"].as_str().expect("text").to_string()).collect();
+        texts.sort();
+        texts
+    };
+
+    // A member of the audience that does not follow the author: nothing,
+    // in the time a page with posts takes.
+    let (status, body, took) = get(&base, TIMELINE, "", CAROL, CAROL_KEY).await;
+    assert_eq!((status, body.as_str()), (200, r#"{"feed":[]}"#));
+    assert!(took >= FLOOR, "an empty page took {took:?}");
+    // Following the author: the post Carol may read, and no trace of the
+    // one she may not.
+    exec(&f.pool, &follow(CAROL, ALICE)).await;
+    let (status, body, _) = get(&base, TIMELINE, "", CAROL, CAROL_KEY).await;
+    assert_eq!((status, texts(&body)), (200, vec!["for both".to_string()]));
+    assert!(!body.contains("3kpostbob222") && !body.contains("cursor"), "{body}");
+
+    // The author's own timeline holds its posts, followed or not.
+    let (_, body, _) = get(&base, TIMELINE, "", ALICE, ALICE_KEY).await;
+    assert_eq!(texts(&body), ["for bob alone", "for both"]);
+
+    // Bob follows Alice: her two posts and his own. All three share one
+    // `createdAt`; one at a time, each comes exactly once.
+    exec(&f.pool, &follow(BOB, ALICE)).await;
+    let mut seen: Vec<String> = Vec::new();
+    let mut query = "limit=1".to_string();
+    for _ in 0..5 {
+        let (status, body, _) = get(&base, TIMELINE, &query, BOB, BOB_KEY).await;
+        assert_eq!(status, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).expect("json");
+        seen.extend(v["feed"].as_array().expect("feed").iter().map(|p| p["record"]["text"].as_str().expect("text").to_string()));
+        match v["cursor"].as_str() {
+            Some(cursor) => query = format!("limit=1&cursor={cursor}"),
+            None => break,
+        }
+    }
+    seen.sort();
+    assert_eq!(seen, ["bob's note", "for bob alone", "for both"]);
+
+    // A mute hides the author's private posts as it hides the public ones.
+    exec(&f.pool, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{BOB}', '{ALICE}')")).await;
+    let (_, body, _) = get(&base, TIMELINE, "", BOB, BOB_KEY).await;
+    assert_eq!(texts(&body), ["bob's note"]);
+
+    // No credentials: 401.
+    let anonymous = reqwest::get(format!("{base}/xrpc/{TIMELINE}")).await.expect("request");
+    assert_eq!(anonymous.status().as_u16(), 401);
     db.drop_db().await;
 }
 

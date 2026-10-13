@@ -237,6 +237,7 @@ pub struct PrivateReadFloors {
     pub get_posts: u64,
     pub get_post_thread: u64,
     pub get_author_feed: u64,
+    pub get_timeline: u64,
 }
 
 impl Default for PrivateReadFloors {
@@ -245,6 +246,7 @@ impl Default for PrivateReadFloors {
             get_posts: 800,
             get_post_thread: 1000,
             get_author_feed: 1000,
+            get_timeline: 1000,
         }
     }
 }

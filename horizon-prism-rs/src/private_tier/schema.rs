@@ -245,3 +245,44 @@ pub(super) async fn author_candidates(
     .fetch_all(pool)
     .await
 }
+
+/// The home timeline's candidates (design-v3 §1.7 item 12): posts passing
+/// the prefilter whose author is the requester or an account the requester
+/// follows, as this AppView has indexed the follows, newest first, after
+/// the `created_at::uri` cursor. The third value is the URI again: across
+/// authors a record key is not unique, so the URI breaks ties.
+///
+/// A mute applies here as it does on the public timeline: an author the
+/// requester fully mutes, directly or through a moderation list that
+/// applies, is left out.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn timeline_candidates(
+    pool: &PgPool,
+    requester: &str,
+    after: Option<(DateTime<Utc>, String)>,
+    limit: i64,
+) -> Result<Vec<FeedCandidate>, sqlx::Error> {
+    let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
+    sqlx::query_as(&format!(
+        "SELECT p.uri, p.created_at, p.uri FROM {PREFILTER_FROM} \
+         WHERE (p.author_did = $1 OR p.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
+           AND {PREFILTER} \
+           AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = p.author_did AND m.scope = 'full') \
+           AND NOT EXISTS (SELECT 1 FROM list_references r \
+                           JOIN subscribed_lists l ON l.list_uri = r.list_uri \
+                           JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
+                           WHERE r.member_did = $1 AND i.subject_did = p.author_did AND {applies}) \
+           AND ($2::timestamptz IS NULL OR (p.created_at, p.uri) < ($2, $3)) \
+         ORDER BY p.created_at DESC, p.uri DESC LIMIT $4",
+        applies = crate::hydration::APPLIES,
+    ))
+    .bind(requester)
+    .bind(at)
+    .bind(uri)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}

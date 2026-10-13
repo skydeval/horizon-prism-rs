@@ -1,0 +1,41 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getTimeline",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the private-tier posts the requester is authorized to read, authored by the requester or by accounts the requester follows, newest first. The ordering field is each post's `record.createdAt` (descending, ties broken by post URI); a `createdAt` later than the time of indexing plus five minutes is clamped to that bound, and the view carries the clamped value. Requires auth by a ready community member. Posts the requester may not read are omitted without distinction, as are posts by accounts the requester mutes.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "limit": { "type": "integer", "default": 30, "minimum": 1, "maximum": 50 },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor from a previous response."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["feed"],
+          "properties": {
+            "feed": {
+              "type": "array",
+              "items": { "type": "ref", "ref": "app.nearhorizon.private.defs#privatePostView" }
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Present only when the page returned at least one item and more candidates remain."
+            }
+          }
+        }
+      },
+      "errors": [
+        { "name": "NotEnrolled", "description": "The caller is not a community member of this AppView." },
+        { "name": "NotReady", "description": "The caller's account indexing is still in progress." }
+      ]
+    }
+  }
+}

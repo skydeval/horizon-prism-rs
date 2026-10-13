@@ -38,6 +38,7 @@ use crate::xrpc::pools::Requester;
 pub const GET_POSTS: &str = "app.nearhorizon.private.getPosts";
 pub const GET_POST_THREAD: &str = "app.nearhorizon.private.getPostThread";
 pub const GET_AUTHOR_FEED: &str = "app.nearhorizon.private.getAuthorFeed";
+pub const GET_TIMELINE: &str = "app.nearhorizon.private.getTimeline";
 
 /// Metric: handler time before the floor.
 const METRIC_UNFLOORED: &str = "private_read_unfloored_seconds";
@@ -52,6 +53,7 @@ pub struct Floors {
     pub get_posts: Duration,
     pub get_post_thread: Duration,
     pub get_author_feed: Duration,
+    pub get_timeline: Duration,
 }
 
 /// State for the private router.
@@ -91,6 +93,7 @@ impl PrivateState {
                 get_posts: Duration::from_millis(cfg.floor_ms.get_posts),
                 get_post_thread: Duration::from_millis(cfg.floor_ms.get_post_thread),
                 get_author_feed: Duration::from_millis(cfg.floor_ms.get_author_feed),
+                get_timeline: Duration::from_millis(cfg.floor_ms.get_timeline),
             },
             concurrency: usize::try_from(cfg.bind_concurrency).unwrap_or(8).max(1),
         }
@@ -107,6 +110,7 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(GET_POSTS), get(get_posts))
         .route(&xrpc(GET_POST_THREAD), get(get_post_thread))
         .route(&xrpc(GET_AUTHOR_FEED), get(get_author_feed))
+        .route(&xrpc(GET_TIMELINE), get(get_timeline))
         .with_state(state)
 }
 
@@ -343,7 +347,8 @@ fn build(
     }
 }
 
-/// `created_at::rkey`.
+/// `created_at::rkey` for one author's feed; `created_at::uri` for the
+/// timeline, where a record key is not unique.
 fn cursor(at: DateTime<Utc>, rkey: &str) -> String {
     format!("{}::{rkey}", at.to_rfc3339_opts(SecondsFormat::Micros, true))
 }
@@ -376,25 +381,54 @@ pub async fn get_author_feed(
     };
     let after = parse_cursor(p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let result = feed_body(&s, &caller, ip, &actor, limit as usize, after, start).await;
+    let result = feed_body(&s, &caller, ip, Some(&actor), limit as usize, after, start).await;
     floor("getAuthorFeed", start, s.floors.get_author_feed).await;
     result.map(ok)
 }
 
+/// `app.nearhorizon.private.getTimeline`: the private posts the caller may
+/// read, by the caller and by the accounts the caller follows, newest
+/// first. A post the caller may not read leaves no trace, and a page with
+/// none takes as long as a page with some.
+pub async fn get_timeline(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, peer, GET_TIMELINE).await?;
+    let p = Params::parse(q.as_deref());
+    let limit = match p.u32("limit")?.unwrap_or(30) {
+        l @ 1..=50 => l,
+        _ => return Err(XrpcError::invalid("Error: limit must be between 1 and 50")),
+    };
+    let after = parse_cursor(p.one("cursor"))?;
+    let ip = request_ip(&s.app, &headers, peer);
+    let result = feed_body(&s, &caller, ip, None, limit as usize, after, start).await;
+    floor("getTimeline", start, s.floors.get_timeline).await;
+    result.map(ok)
+}
+
+/// One page of a feed: `actor`'s posts, or with no actor the caller's
+/// home timeline. The candidates only narrow the work; `pipeline::read`
+/// decides each post.
 async fn feed_body(
     s: &PrivateState,
     caller: &VerifiedCaller,
     ip: IpAddr,
-    actor: &str,
+    actor: Option<&str>,
     limit: usize,
     after: Option<(DateTime<Utc>, String)>,
     start: Instant,
 ) -> Result<PrivateResponse, XrpcError> {
     let max_binds = limit * 4;
     // One lookahead row tells whether prefiltered candidates remain.
-    let mut candidates =
-        schema::author_candidates(&s.env.pool, &caller.did, actor, after, i64::try_from(max_binds + 1).unwrap_or(i64::MAX))
-            .await?;
+    let wanted = i64::try_from(max_binds + 1).unwrap_or(i64::MAX);
+    let mut candidates = match actor {
+        Some(actor) => schema::author_candidates(&s.env.pool, &caller.did, actor, after, wanted).await?,
+        None => schema::timeline_candidates(&s.env.pool, &caller.did, after, wanted).await?,
+    };
     let beyond = candidates.len() > max_binds;
     candidates.truncate(max_binds);
     let uris: Vec<String> = candidates.iter().map(|(u, _, _)| u.clone()).collect();
