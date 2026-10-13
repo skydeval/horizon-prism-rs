@@ -1898,6 +1898,58 @@ pub(crate) mod tests {
         db.drop_db().await;
     }
 
+    /// B-95 (design-v3 §5.14.18.3): the purge itself calls the module. A
+    /// member's removal clears its remembered blocks, copy and rows, in
+    /// the marker step; the purge of an account that was no member leaves
+    /// every viewer's in-flight additions alone.
+    #[tokio::test]
+    async fn a_purge_clears_the_removed_members_remembered_blocks() {
+        use crate::aggregations::scope_state::PurgeKind;
+        use crate::aggregations::{Purger, ScopeSets, ScopeState};
+        use crate::private_tier::{KryphocronPrivateTier, PrivateTier};
+
+        let Some(db) = crate::test_support::fresh_db("farsight_memory_purge").await else {
+            return;
+        };
+        sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())").bind(V).execute(&db.pool).await.expect("member");
+        sqlx::query("INSERT INTO learned_inbound_blocks (viewer_did, other_did, list_uri, source, confirmed_at) VALUES ($1, $2, $3, 'farsight', now())")
+            .bind(V)
+            .bind(A)
+            .bind(LIST)
+            .execute(&db.pool)
+            .await
+            .expect("row");
+        let (farsight, _fake) = engine("").await;
+        let cfg = crate::config::FileConfig::parse("[farsight]\nurl = \"https://farsight.example.net\"\n[farsight.memory]\nenabled = true\n")
+            .expect("parse")
+            .farsight
+            .memory;
+        let loaded = farsight.load_memory(&db.pool, &cfg).await;
+        assert_eq!(loaded.entries, Some(1));
+        let private: Arc<dyn PrivateTier> = Arc::new(KryphocronPrivateTier);
+        let scope = ScopeState::new(ScopeSets::default(), crate::config::ScopePolicy::MembersAndOneHop, 10_000);
+        let purger = Purger::new(db.pool.clone(), scope, private);
+        purger.set_hook(loaded.hook());
+        let rows = || {
+            let pool = db.pool.clone();
+            async move { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM learned_inbound_blocks").fetch_one(&pool).await.expect("count") }
+        };
+        let entries = |farsight: &Farsight| farsight.memory_stats().expect("memory on")["entries"].clone();
+
+        // A deleted account that was no member: the count does not rise,
+        // so a request in flight still learns.
+        let in_flight = farsight.request(&member());
+        purger.marker(B, PurgeKind::AccountDeleted).await.expect("marker");
+        assert_eq!(in_flight.purges, farsight.inner.purges.load(Ordering::SeqCst));
+        assert_eq!((rows().await, entries(&farsight)), (1, json!(1)));
+
+        // The member's removal: the marker step alone clears both.
+        purger.marker(V, PurgeKind::MemberRemoved).await.expect("marker");
+        assert_eq!((rows().await, entries(&farsight)), (0, json!(0)));
+        assert_ne!(in_flight.purges, farsight.inner.purges.load(Ordering::SeqCst));
+        db.drop_db().await;
+    }
+
     /// design-v3 §5.14.17: the fallback comes last in a request and never
     /// holds it past the request's own deadline.
     #[tokio::test]
