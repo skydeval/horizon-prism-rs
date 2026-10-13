@@ -12,6 +12,27 @@ commit.
 
 ### Added
 
+- **Item 16: post search (#675).** `app.bsky.feed.searchPosts` and
+  `app.bsky.feed.searchPostsV2`, two parameter parsers over one search
+  of the posts stored here whose author is in scope. Text is matched
+  with quoted phrases, `OR` and `-term`. The operators `from:`, `to:`,
+  `mentions:`, `lang:`, `domain:`, `since:`, `until:` and `#tag` are read
+  out of the query text and joined to the parameters with AND. V2's
+  include and exclude filters (authors, mentions, domains, URLs, embedded
+  records, hashtags, languages, media, replies, thread, `following`) are
+  all served. Handles resolve from this AppView's own rows only; one
+  that does not resolve matches nothing. A private-tier URI in a filter
+  is never compared with anything. Without `since`, a search looks back
+  `recent_window_days` (V2: unless `allTime`). `latest` / `recent` pages
+  by time; `top` ranks the newest `top_candidates` matches by stored
+  engagement and text rank. `hitsTotal` is exact and given only up to
+  `hits_total_max`. A search that passes `statement_timeout_ms` is
+  `BadQueryString` "query too expensive" and counts in
+  `search_timeout_total{endpoint}`. A signed-in member's mutes and
+  blocks apply, list mutes and inbound list blocks included; signed out,
+  authors with `!no-unauthenticated` are left out. New `[search]`
+  section. Both endpoints are in the Search rate class (design-v3 §9.0
+  – §9.2).
 - **Item 12c: the memory of learned blocks (#684).** With
   `farsight.memory.enabled`, an inbound list block that Farsight or the
   fallback reports for a ready member is remembered, in the new table

@@ -296,6 +296,20 @@ max_per_actor = 1000
 [notifications]
 subscribed_post_max_age_secs = 86400
 
+# Search over the posts this AppView stores. A search that runs longer than
+# statement_timeout_ms is refused as too expensive, so that one heavy query
+# cannot hold the database; raise it on faster hardware.
+[search]
+statement_timeout_ms = 2000
+hits_total_max = 10000           # the total is shown only up to this many matches
+hits_total_timeout_ms = 500      # past this the page comes back without a total
+max_offset = 1000                # how deep "top" results can be paged
+recent_window_days = 30          # how far back a search looks unless it says otherwise
+top_window_days = 30             # the same, for searchPosts sorted by "top"
+max_filter_values = 25           # values one filter may list
+top_candidates = 2000            # the newest matches a "top" search ranks
+typeahead_candidates = 200       # rows a typeahead looks at before ranking
+
 # How many posts one member may bookmark. Past it, bookmarking another is
 # refused.
 [bookmarks]

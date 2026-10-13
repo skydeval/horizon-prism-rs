@@ -515,6 +515,7 @@ pub async fn run() -> Result<(), StartupError> {
             known_likers_scan_max_pages: cfg.file.known_likers.scan_max_pages,
             thread_v2_max_parents: cfg.file.thread_v2.max_parents,
             op_thread_max_walk: cfg.file.op_thread.max_walk,
+            search: cfg.file.search.clone(),
             farsight: farsight.clone(),
             list_budget,
             list_applier: Some(applier.clone()),

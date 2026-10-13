@@ -21,7 +21,7 @@ use super::auth::request_ip;
 use super::backstop::{self, Selected, Selection};
 use super::pools::{ChargeKey, Exhausted, Pool};
 use super::errors::{NotReadyHint, XrpcError};
-use super::handlers::{actor, bookmarks, did_web, drafts, feed, graph, index, labels, mutes, notifications, repo, timeline};
+use super::handlers::{actor, bookmarks, did_web, drafts, feed, graph, index, labels, mutes, notifications, repo, search, timeline};
 use super::rate_limit::Class;
 
 /// The health route: exempt from the backstop for `GET` and `HEAD` (§6.3;
@@ -206,6 +206,8 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(actor::GET_PROFILE), get(actor::get_profile))
         .route(&xrpc(actor::GET_PROFILES), get(actor::get_profiles))
         .route(&xrpc(actor::SEARCH_ACTORS), get(actor::search_actors))
+        .route(&xrpc(search::SEARCH_POSTS), get(search::search_posts))
+        .route(&xrpc(search::SEARCH_POSTS_V2), get(search::search_posts_v2))
         .route(&xrpc(feed::GET_POSTS), get(feed::get_posts))
         .route(&xrpc(feed::GET_POST_THREAD), get(feed::get_post_thread))
         .route(&xrpc(feed::GET_POST_THREAD_V2), get(feed::get_post_thread_v2))

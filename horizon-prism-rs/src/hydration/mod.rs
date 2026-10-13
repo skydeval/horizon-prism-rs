@@ -31,6 +31,7 @@ pub mod notifications;
 pub mod polls;
 pub mod relationships;
 pub mod repo;
+pub mod search;
 pub mod starter_packs;
 pub mod thread;
 pub mod thread_v2;
@@ -169,6 +170,8 @@ pub struct HydrationConfig {
     pub thread_v2_max_parents: u32,
     /// `op_thread.max_walk`.
     pub op_thread_max_walk: u32,
+    /// `[search]`.
+    pub search: crate::config::SearchConfig,
     /// The block-list index, when `farsight.url` is set.
     pub farsight: Option<Farsight>,
     /// A member's budget of list mutes (`lists.subscribed_max_per_member`,
@@ -1043,6 +1046,7 @@ pub(crate) mod testing {
             known_likers_scan_max_pages: 2,
             thread_v2_max_parents: 80,
             op_thread_max_walk: 4,
+            search: crate::config::SearchConfig::default(),
             farsight: None,
             list_budget: Budget { max_references: 2, max_owners: 5 },
             list_applier: None,

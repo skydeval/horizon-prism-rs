@@ -12,6 +12,7 @@ pub mod labels;
 pub mod mutes;
 pub mod notifications;
 pub mod repo;
+pub mod search;
 pub mod timeline;
 
 use axum::Json;

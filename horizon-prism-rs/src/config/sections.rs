@@ -1095,6 +1095,48 @@ impl Default for OpThreadConfig {
     }
 }
 
+/// `[search]` (design-v3 §9.0, §13).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SearchConfig {
+    /// The longest one search statement may run; past it the search is
+    /// refused as too expensive.
+    pub statement_timeout_ms: u64,
+    /// `hitsTotal` is given only up to this many matches.
+    pub hits_total_max: u32,
+    /// The longest the count behind `hitsTotal` may run; past it the page
+    /// is returned without the count.
+    pub hits_total_timeout_ms: u64,
+    /// How deep an offset cursor may go (`top`, starter packs).
+    pub max_offset: u32,
+    /// The default window of V1 `top`, in days.
+    pub top_window_days: u32,
+    /// The default window of V1 `latest` and of V2, in days.
+    pub recent_window_days: u32,
+    /// Values one array filter may carry.
+    pub max_filter_values: u32,
+    /// The newest matches a `top` search scores.
+    pub top_candidates: u32,
+    /// Rows each branch of a typeahead takes before ranking.
+    pub typeahead_candidates: u32,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            statement_timeout_ms: 2000,
+            hits_total_max: 10_000,
+            hits_total_timeout_ms: 500,
+            max_offset: 1000,
+            top_window_days: 30,
+            recent_window_days: 30,
+            max_filter_values: 25,
+            top_candidates: 2000,
+            typeahead_candidates: 200,
+        }
+    }
+}
+
 /// `[threadlens]` (design-v3 §5.15, §13): the bounds of one Thread Lens
 /// response.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1359,6 +1401,7 @@ pub struct FileConfig {
     pub activity_subscriptions: ActivitySubscriptionsConfig,
     pub notifications: NotificationsConfig,
     pub bookmarks: BookmarksConfig,
+    pub search: SearchConfig,
     pub drafts: DraftsConfig,
     pub labels: LabelsConfig,
     pub labelers: LabelersConfig,
