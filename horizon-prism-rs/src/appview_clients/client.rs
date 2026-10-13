@@ -54,6 +54,12 @@ impl AppViewClient {
         &self.network
     }
 
+    /// The base URL calls go to.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     /// `GET {base}/xrpc/{method}?params`.
     ///
     /// # Errors

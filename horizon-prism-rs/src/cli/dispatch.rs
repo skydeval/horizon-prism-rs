@@ -110,6 +110,8 @@ pub enum FarsightAction {
         #[arg(long)]
         force: bool,
     },
+    /// Drop every block remembered for one member (farsight.memory).
+    Forget { viewer_did: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -222,6 +224,7 @@ impl AdminCmd {
             Self::Deadletter { action: DeadletterAction::Replay { id } } => AdminCommand::DeadletterReplay { id: id.clone() },
             Self::Deadletter { action: DeadletterAction::Drop { id } } => AdminCommand::DeadletterDrop { id: id.clone() },
             Self::Farsight { action: FarsightAction::Status } => AdminCommand::FarsightStatus,
+            Self::Farsight { action: FarsightAction::Forget { viewer_did } } => AdminCommand::FarsightForget { did: viewer_did.clone() },
             Self::Farsight { action: FarsightAction::Prime { did, force } } => AdminCommand::FarsightPrime {
                 did: did.clone(),
                 force: *force,

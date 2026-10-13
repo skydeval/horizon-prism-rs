@@ -105,6 +105,15 @@ impl ReadGate {
         }
     }
 
+    /// The run as it stands, for the operator: whether Farsight has
+    /// answered this process, and whether nothing but service failures
+    /// came since its last answer.
+    #[must_use]
+    pub fn run(&self) -> (bool, bool) {
+        let run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
+        (run.answers > 0, run.clean)
+    }
+
     /// One read: whether Farsight is down now, and the answer count.
     #[must_use]
     pub fn read(&self, now: Instant) -> GateRead {

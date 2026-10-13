@@ -12,15 +12,28 @@ commit.
 
 ### Added
 
-- **Item 12c: the memory's table and settings (#684).** Migration
-  `0019_learned_inbound_blocks` adds one empty table, and a
-  `[farsight.memory]` section (off by default) adds `enabled`,
-  `retention_hours`, `max_per_viewer` and `max_total`, checked at startup
-  only when enabled. With the memory off, `serve` empties the table at
-  startup, best effort. **Nothing is remembered yet**: with it on,
-  `serve` says so at startup. An upgrade to this build needs
+- **Item 12c: the memory of learned blocks (#684).** With
+  `farsight.memory.enabled`, an inbound list block that Farsight or the
+  fallback reports for a ready member is remembered, in the new table
+  `learned_inbound_blocks` and in a copy held in the process. A
+  remembered block applies to a pair whenever the answer in hand does not
+  vouch for it: when Farsight gave no answer, on a cache-only read, past
+  the call cap, in the unread count, and in Thread Lens (as a block,
+  never as a complete answer). A complete Farsight answer that names no
+  block forgets the pair on that very request. Otherwise a block expires
+  `retention_hours` after it was last confirmed. A pair that is
+  remembered is not sent to the fallback. Bounded by `max_per_viewer` and
+  `max_total`. Removing a member or deleting an account clears its blocks
+  at once, from the purge itself; the daily job deletes rows past the
+  retention and rows of accounts that are no longer members.
+  `admin farsight forget <viewer-did>` clears one member, and
+  `admin farsight status` now also prints `answered_since_start`,
+  `run_clean`, `down`, a `fallback` block and a `memory` block (counts
+  only), whether or not Farsight answers. Off by default; with it off,
+  `serve` empties the table at startup and nothing is stored or read.
+  Migration `0019_learned_inbound_blocks`: an upgrade to this build needs
   `APP_ALLOW_STARTUP_MIGRATE=1` for one start, as for any migration
-  (design-v3 §5.14.18.1; proposed locked decision 39).
+  (design-v3 §5.14.18; proposed locked decision 39).
 - **Item 12b: the fallback for inbound list blocks (#683).** With
   `farsight.fallback.enabled`, and only while Farsight is down, a ready
   member's ordinary page asks the AppView that `farsight.fallback.network`

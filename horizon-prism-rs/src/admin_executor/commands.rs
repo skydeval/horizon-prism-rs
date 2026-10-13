@@ -46,6 +46,8 @@ pub enum AdminCommand {
     FarsightStatus,
     /// `farsight prime <did> [--force]`: ask Farsight to read a repository.
     FarsightPrime { did: String, force: bool },
+    /// `farsight forget <viewer-did>`: drop one viewer's remembered blocks.
+    FarsightForget { did: String },
     /// `lists sync <list-uri>`: sync a subscribed list's owner now.
     ListsSync { uri: String },
     /// `lists purge <did>`: delete the DID's list mutes and the list
@@ -83,6 +85,7 @@ impl AdminCommand {
             Self::DeadletterDrop { id } => ("deadletter drop", json!({ "id": id })),
             Self::FarsightStatus => ("farsight status", json!({})),
             Self::FarsightPrime { did, force } => ("farsight prime", json!({ "did": did, "force": force })),
+            Self::FarsightForget { did } => ("farsight forget", json!({ "did": did })),
             Self::ListsSync { uri } => ("lists sync", json!({ "uri": uri })),
             Self::ListsPurge { did } => ("lists purge", json!({ "did": did })),
         }
@@ -148,6 +151,7 @@ impl AdminCommand {
                 did: did()?,
                 force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
             },
+            "farsight forget" => Self::FarsightForget { did: did()? },
             "lists sync" => {
                 let uri = s("uri")?;
                 let is_list = uri_author(&uri).is_some_and(is_did) && uri.split('/').nth(3) == Some("app.bsky.graph.list");
@@ -178,7 +182,9 @@ impl AdminCommand {
             | Self::DeadletterDrop { .. }
             | Self::FarsightStatus
             // A prime writes nothing here, so it waits on no purge.
-            | Self::FarsightPrime { .. } => None,
+            | Self::FarsightPrime { .. }
+            // Its handler waits on a purge of the viewer itself.
+            | Self::FarsightForget { .. } => None,
         }
     }
 }
@@ -242,6 +248,7 @@ impl Handlers {
             AdminCommand::DeadletterDrop { id } => self.deadletter_drop(id).await,
             AdminCommand::FarsightStatus => self.farsight_status().await,
             AdminCommand::FarsightPrime { did, force } => self.farsight_prime(did, *force).await,
+            AdminCommand::FarsightForget { did } => self.farsight_forget(did).await,
             AdminCommand::ListsSync { uri } => self.lists_sync(uri).await,
             AdminCommand::ListsPurge { did } => self.lists_purge(did).await,
         };
@@ -315,10 +322,30 @@ impl Handlers {
         self.farsight.as_ref().ok_or_else(|| "farsight.url is not set".to_string())
     }
 
-    /// `farsight status` (design-v3 §5.14.11, §14.3).
+    /// `farsight status` (design-v3 §5.14.11, §14.3). What this AppView
+    /// holds itself is printed whether or not Farsight answers.
     async fn farsight_status(&self) -> Result<Outcome, String> {
-        let status = self.farsight()?.status().await.map_err(|reason| format!("Farsight did not answer: {reason}"))?;
-        Ok(Outcome::Done(status))
+        let farsight = self.farsight()?;
+        let mut status = match farsight.status().await {
+            Ok(Value::Object(brief)) => brief,
+            Ok(_) => serde_json::Map::new(),
+            Err(reason) => serde_json::Map::from_iter([("farsight_did_not_answer".to_string(), json!(reason))]),
+        };
+        status.extend(farsight.local_status());
+        Ok(Outcome::Done(Value::Object(status)))
+    }
+
+    /// `farsight forget` (design-v3 §14.3): removes every remembered pair
+    /// of one viewer, as a purge does for a removed member. It waits on a
+    /// running purge of the viewer, and a failed delete fails the command:
+    /// the pairs are pending by then, so the writer goes on deleting them.
+    async fn farsight_forget(&self, did: &str) -> Result<Outcome, String> {
+        let farsight = self.farsight()?;
+        if self.purging(did).await.map_err(|e| e.to_string())? {
+            return Ok(Outcome::Defer);
+        }
+        let forgotten = farsight.forget_memory(did).await?;
+        Ok(Outcome::Done(json!({ "did": did, "forgotten": forgotten })))
     }
 
     /// `farsight prime`: for a member whose block state on Farsight is
@@ -573,7 +600,11 @@ mod tests {
     fn invalid_commands_are_rejected() {
         assert!(AdminCommand::parse("member add", &json!({"did": "bob"})).is_err());
         // The Farsight commands round-trip, and neither waits on a purge.
-        for cmd in [AdminCommand::FarsightStatus, AdminCommand::FarsightPrime { did: DID.to_string(), force: true }] {
+        for cmd in [
+            AdminCommand::FarsightStatus,
+            AdminCommand::FarsightPrime { did: DID.to_string(), force: true },
+            AdminCommand::FarsightForget { did: DID.to_string() },
+        ] {
             let (name, args) = cmd.to_row();
             assert_eq!(AdminCommand::parse(name, &args), Ok(cmd.clone()));
             assert_eq!(cmd.did(), None);

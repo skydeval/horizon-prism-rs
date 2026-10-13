@@ -151,9 +151,6 @@ pub async fn run() -> Result<(), StartupError> {
         {
             tracing::warn!(event = "farsight_memory_config", %problem, "this value would be rejected if farsight.memory.enabled were true");
         }
-    } else {
-        // The table and the settings exist; the reads and writes do not.
-        tracing::warn!(event = "farsight_memory_not_built", "farsight.memory.enabled is set, but this build does not remember blocks yet: nothing is stored or read");
     }
     let redis = redis_manager(&cfg.env.redis_url).await?;
     let consumer_redis = redis_manager(&cfg.env.redis_url).await?;
@@ -234,6 +231,16 @@ pub async fn run() -> Result<(), StartupError> {
         }
         _ => None,
     };
+    // The memory's load (§5.14.18.1), before the first task: the purge
+    // hook is made from what it returns, so no purge can clear a viewer
+    // while rows are read and not yet installed.
+    if let Some(farsight) = &farsight {
+        let loaded = farsight.load_memory(&pool, &cfg.file.farsight.memory).await;
+        purger.set_hook(loaded.hook());
+        if loaded.entries.is_some() {
+            tasks.push(tokio::spawn(farsight.clone().run_memory_writer()));
+        }
+    }
     let microcosm = &cfg.file.microcosm;
     let identity = &cfg.file.identity;
     // Identity work for requests: the requester's identity share, and PLC's
@@ -317,6 +324,8 @@ pub async fn run() -> Result<(), StartupError> {
             scope: scope.clone(),
             pool: pool.clone(),
         }))),
+        // The memory's table (§5.14.18.1), with or without an engine.
+        Arc::new(crate::farsight::retention::MemoryRetention::new(&cfg.file.farsight.memory, farsight.clone())),
     ];
     let guard: Arc<dyn ScopeGuard> = Arc::new(scope.clone());
     tasks.push(spawn_scheduler(

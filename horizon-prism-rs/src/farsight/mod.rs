@@ -24,10 +24,11 @@ pub mod fallback;
 pub mod gate;
 pub mod lookup;
 pub mod memory;
+pub mod retention;
 
 pub use answer::{ChunkAnswer, Coverage, PairAnswer, Relation};
 pub use client::{CallError, FarsightClient};
-pub use lookup::{Farsight, Lookup, PairAnswers, PairBudget};
+pub use lookup::{Farsight, Loaded, Lookup, PairAnswers, PairBudget, PurgeHook};
 
 use crate::config::{FarsightConfig, LOCAL_APPVIEW, NetworkAuth, NetworkConfig, RateClassConfig};
 use crate::xrpc::rate_limit::class_problem;

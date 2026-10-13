@@ -15,7 +15,7 @@
 //! A purge interrupted by a crash leaves `purging_dids` set; `serve` resumes
 //! the batches at startup ([`Purger::resume_all`]).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,6 +23,7 @@ use sqlx::{PgConnection, PgPool};
 
 use super::scope_state::{PurgeKind, ScopeState};
 use crate::db::locks::{lock_did_exclusive, lock_dids_shared};
+use crate::farsight::PurgeHook;
 use crate::firehose::jobs::{self, Depth};
 use crate::firehose::writer::SENTINEL_REV;
 use crate::identity::AccountLifecycle;
@@ -56,12 +57,15 @@ pub struct Purger {
     sync_min_interval_secs: u32,
     /// Told when a purge removes a member's list references.
     applier: Option<Applier>,
+    /// The `farsight` module's hook (§5.14.18.3), shared by every clone
+    /// and set once. Empty, no hook runs.
+    hook: Arc<OnceLock<PurgeHook>>,
 }
 
 impl Purger {
     #[must_use]
     pub fn new(pool: PgPool, scope: ScopeState, private: Arc<dyn PrivateTier>) -> Self {
-        Self { pool, scope, private, sync_min_interval_secs: 600, applier: None }
+        Self { pool, scope, private, sync_min_interval_secs: 600, applier: None, hook: Arc::default() }
     }
 
     /// Set the applier to tell when a purge removes a member's list
@@ -70,6 +74,12 @@ impl Purger {
     pub fn with_applier(mut self, applier: Applier) -> Self {
         self.applier = Some(applier);
         self
+    }
+
+    /// Set the hook the marker step runs at its tail. Only the first
+    /// call counts.
+    pub fn set_hook(&self, hook: PurgeHook) {
+        let _ = self.hook.set(hook);
     }
 
     /// Set `lists.sync_min_interval_secs`.
@@ -132,16 +142,20 @@ impl Purger {
             .bind(kind.as_str())
             .execute(&mut *tx)
             .await?;
+        // Whether this step deleted a `members` row: the hook's question.
+        let mut member_removed = false;
         match kind {
             PurgeKind::MemberRemoved => {
-                sqlx::query("DELETE FROM members WHERE did = $1").bind(did).execute(&mut *tx).await?;
+                let gone = sqlx::query("DELETE FROM members WHERE did = $1").bind(did).execute(&mut *tx).await?;
+                member_removed = gone.rows_affected() > 0;
             }
             PurgeKind::AccountDeleted => {
                 for table in ["members", "scope_dids", "sync_state"] {
-                    sqlx::query(&format!("DELETE FROM {table} WHERE did = $1"))
+                    let gone = sqlx::query(&format!("DELETE FROM {table} WHERE did = $1"))
                         .bind(did)
                         .execute(&mut *tx)
                         .await?;
+                    member_removed |= table == "members" && gone.rows_affected() > 0;
                 }
             }
             PurgeKind::OutOfScope => {
@@ -196,6 +210,14 @@ impl Purger {
             if dropped {
                 applier.signal();
             }
+        }
+        // After the commit and after the guard is dropped: the hook waits
+        // on a lock nothing holding the guard may wait on. It returns
+        // nothing, so it cannot fail this step.
+        if kind != PurgeKind::OutOfScope
+            && let Some(hook) = self.hook.get()
+        {
+            hook.run(did, kind == PurgeKind::AccountDeleted, member_removed).await;
         }
         tracing::info!(event = "purge_marked", did, kind = kind.as_str(), "purge marker committed");
         Ok(())
@@ -263,6 +285,7 @@ impl Purger {
                 n += delete_batch(conn, "notifications", "id", "author_did = $1 OR recipient_did = $1", did).await?;
                 n += delete_batch(conn, "mutes", "ctid", "viewer_did = $1", did).await?;
                 n += viewer_private_batch(conn, did).await?;
+                n += remembered_batch(conn, did, "viewer_did = $1 OR other_did = $1").await?;
                 // Subscriptions others hold on the deleted account go too.
                 n += delete_batch(conn, "activity_subscriptions", "ctid", "subject_did = $1", did).await?;
                 for table in ["notification_seen", "actor_counts"] {
@@ -293,6 +316,7 @@ impl Purger {
             PurgeKind::MemberRemoved => {
                 n += delete_batch(conn, "mutes", "ctid", "viewer_did = $1", did).await?;
                 n += viewer_private_batch(conn, did).await?;
+                n += remembered_batch(conn, did, "viewer_did = $1").await?;
                 n += sqlx::query("DELETE FROM notification_seen WHERE did = $1")
                     .bind(did)
                     .execute(&mut *conn)
@@ -400,6 +424,15 @@ async fn viewer_private_batch(conn: &mut PgConnection, did: &str) -> Result<u64,
         n += delete_batch(conn, table, "ctid", predicate, did).await?;
     }
     Ok(n)
+}
+
+/// One batch over the remembered blocks (§5.14.18.3): the net behind the
+/// hook, for a hook whose delete failed and for a crash before it. The
+/// table holds DIDs in Farsight's canonical form, which `members.did` may
+/// spell otherwise, so that form is bound here.
+async fn remembered_batch(conn: &mut PgConnection, did: &str, predicate: &str) -> Result<u64, sqlx::Error> {
+    let canonical = crate::farsight::did::canonical(did).unwrap_or_else(|| did.to_string());
+    delete_batch(conn, "learned_inbound_blocks", "ctid", predicate, &canonical).await
 }
 
 /// `DELETE FROM table WHERE key IN (SELECT key … LIMIT BATCH)`.

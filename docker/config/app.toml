@@ -452,8 +452,8 @@ requester_share = 0.25           # the most one member may use of that rate
 # applying while Farsight gives no answer, and across a restart. Off unless
 # you turn it on, and it needs farsight.url above. What it stores says
 # which accounts a member's pages showed, and roughly when, so it is kept
-# only this long and only for members. This build has the settings and the
-# table but does not remember anything yet.
+# only this long and only for members. A block Farsight later confirms is
+# gone is forgotten at once; `admin farsight forget <did>` clears one member.
 [farsight.memory]
 enabled = false
 retention_hours = 24             # a remembered block applies this long

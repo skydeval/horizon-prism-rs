@@ -27,8 +27,9 @@ use super::client::{CallError, FarsightClient};
 use super::did::canonical;
 use super::fallback::{self, Found, Ledger};
 use super::gate::{Effect, GateRead, ReadGate};
+use super::memory::{self, Caps};
 use crate::appview_clients::AppViewClient;
-use crate::config::{FarsightConfig, FarsightFallbackConfig};
+use crate::config::{FarsightConfig, FarsightFallbackConfig, FarsightMemoryConfig};
 use crate::net::NetError;
 use crate::constellation::Class;
 use crate::constellation::cascade::SharedBreaker;
@@ -81,6 +82,9 @@ struct Cache {
     /// The fallback's ledger (§5.14.17.6), under the cache's lock so that
     /// applying a fallback answer is one step.
     ledger: Ledger,
+    /// The memory's copy (§5.14.18.1), under the same lock. Empty and
+    /// unread while the memory is off.
+    remembered: memory::Copy,
 }
 
 impl Cache {
@@ -174,7 +178,52 @@ struct Fallback {
     breaker: SharedBreaker,
 }
 
+/// What [`Farsight::load_memory`] returns. The purge hook is made from it
+/// and from nothing else, so a hook cannot exist before the copy is loaded
+/// (§5.14.18.3).
+pub struct Loaded {
+    farsight: Farsight,
+    /// Entries loaded; `None` while the memory is off.
+    pub entries: Option<usize>,
+}
+
+impl Loaded {
+    #[must_use]
+    pub fn hook(&self) -> PurgeHook {
+        PurgeHook(self.farsight.clone())
+    }
+}
+
+/// What a purge's marker step calls at its tail for a removed member and
+/// for a deleted account (§5.14.18.3).
+#[derive(Clone)]
+pub struct PurgeHook(Farsight);
+
+impl PurgeHook {
+    /// Returns nothing: the hook cannot fail a purge.
+    pub async fn run(&self, did: &str, account_deleted: bool, member_removed: bool) {
+        self.0.purged(did, account_deleted, member_removed).await;
+    }
+}
+
+/// One row of `learned_inbound_blocks`: viewer, other, list, source and
+/// the time it was last confirmed.
+type MemoryRow = (String, String, Option<String>, String, chrono::DateTime<chrono::Utc>);
+
+/// The memory's parts (§5.14.18): its bounds, the database it is kept
+/// in, and the table lock that orders the writes to its table.
+struct Memory {
+    pool: sqlx::PgPool,
+    caps: Caps,
+    /// Held by every write to the table but the purge's batches and the
+    /// daily time step. Never taken while the cache's lock is held.
+    table: tokio::sync::Mutex<()>,
+}
+
 struct Inner {
+    /// Set once at startup when `farsight.memory.enabled`, after the copy
+    /// was loaded.
+    memory: OnceLock<Memory>,
     /// Set once at startup when `farsight.fallback.enabled`.
     fallback: OnceLock<Fallback>,
     /// Raised by every purge of a viewer, so that a request begun before
@@ -211,6 +260,7 @@ impl Farsight {
         let size = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
         Self {
             inner: Arc::new(Inner {
+                memory: OnceLock::new(),
                 fallback: OnceLock::new(),
                 purges: AtomicU64::new(0),
                 client,
@@ -258,6 +308,236 @@ impl Farsight {
         self.cache().ledger.len()
     }
 
+    /// The memory's load (design-v3 §5.14.18.1). With the memory on, the
+    /// table is loaded into the copy, and from then on blocks are learned,
+    /// confirmed, forgotten and read. Called once, at startup, before any
+    /// task of `serve` is spawned, so nothing can clear a viewer while
+    /// rows read here are not installed: the purge hook is made only from
+    /// the value this returns.
+    ///
+    /// If the load fails the memory stays off for this start, and the rows
+    /// stay in the table for the next.
+    pub async fn load_memory(&self, pool: &sqlx::PgPool, cfg: &FarsightMemoryConfig) -> Loaded {
+        let entries = if cfg.enabled {
+            match self.load_rows(pool, cfg).await {
+                Ok(entries) => {
+                    tracing::info!(event = "farsight_memory_loaded", entries, "remembered blocks loaded");
+                    Some(entries)
+                }
+                Err(error) => {
+                    metrics::counter!(memory::METRIC_DROPPED, "reason" => "startup_load").increment(1);
+                    tracing::error!(event = "farsight_memory_load_failed", %error, "remembered blocks could not be loaded: the memory is off until the next start");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Loaded { farsight: self.clone(), entries }
+    }
+
+    /// Rows are loaded for current members, within the retention, newest
+    /// first, up to the caps. A row the caps leave out is deleted.
+    async fn load_rows(&self, pool: &sqlx::PgPool, cfg: &FarsightMemoryConfig) -> Result<usize, sqlx::Error> {
+        let positive = |n: i64| usize::try_from(n).unwrap_or(0);
+        let caps = Caps {
+            per_viewer: positive(cfg.max_per_viewer),
+            total: positive(cfg.max_total),
+            retention: chrono::TimeDelta::hours(cfg.retention_hours),
+        };
+        // `members.did` may spell a did:web otherwise than the table does.
+        let members: HashSet<String> = sqlx::query_scalar::<_, String>("SELECT did FROM members")
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .filter_map(|did| canonical(did))
+            .collect();
+        let rows: Vec<MemoryRow> = sqlx::query_as(
+            "SELECT viewer_did, other_did, list_uri, source, confirmed_at FROM learned_inbound_blocks \
+             WHERE confirmed_at > now() - make_interval(hours => $1) ORDER BY confirmed_at DESC",
+        )
+        .bind(i32::try_from(cfg.retention_hours).unwrap_or(i32::MAX))
+        .fetch_all(pool)
+        .await?;
+        let mut over: (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        let loaded = {
+            let mut cache = self.cache();
+            for (viewer, other, list_uri, source, confirmed_at) in rows {
+                // A viewer that is no longer a member: its rows are the
+                // purge's and the daily job's to delete.
+                if !members.contains(&viewer) {
+                    continue;
+                }
+                let source = if source == "fallback" { Source::Fallback } else { Source::Farsight };
+                if !cache.remembered.install(&viewer, &other, list_uri, source, confirmed_at, caps) {
+                    over.0.push(viewer);
+                    over.1.push(other);
+                }
+            }
+            cache.remembered.len()
+        };
+        if !over.0.is_empty() {
+            sqlx::query("DELETE FROM learned_inbound_blocks b USING unnest($1::text[], $2::text[]) AS o(viewer, other) WHERE b.viewer_did = o.viewer AND b.other_did = o.other")
+                .bind(&over.0)
+                .bind(&over.1)
+                .execute(pool)
+                .await?;
+        }
+        let _ = self.inner.memory.set(Memory { pool: pool.clone(), caps, table: tokio::sync::Mutex::new(()) });
+        Ok(loaded)
+    }
+
+    /// The memory's writer (§5.14.18.1): it makes the table match the
+    /// copy, one pending pair at a time. It is not a queue of operations:
+    /// under the table lock it reads what the copy holds for the pair now
+    /// and writes that, so it never applies an old value. Each pair is its
+    /// own statement. It also sweeps expired entries once an hour.
+    pub async fn run_memory_writer(self) {
+        let Some(m) = self.inner.memory.get() else {
+            return;
+        };
+        let mut swept = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if swept.elapsed() >= Duration::from_secs(3600) {
+                swept = Instant::now();
+                self.cache().remembered.sweep(chrono::Utc::now(), m.caps);
+            }
+            let due = self.cache().remembered.due(Instant::now(), 256);
+            for pair in due {
+                let _table = m.table.lock().await;
+                let Some((row, failures)) = self.cache().remembered.take(&pair) else {
+                    continue;
+                };
+                let write = async {
+                    match &row {
+                        Some(entry) => {
+                            sqlx::query(
+                                "INSERT INTO learned_inbound_blocks (viewer_did, other_did, list_uri, source, confirmed_at) VALUES ($1, $2, $3, $4, $5) \
+                                 ON CONFLICT (viewer_did, other_did) DO UPDATE SET list_uri = EXCLUDED.list_uri, source = EXCLUDED.source, confirmed_at = EXCLUDED.confirmed_at",
+                            )
+                            .bind(&pair.0)
+                            .bind(&pair.1)
+                            .bind(&entry.list_uri)
+                            .bind(if entry.source == Source::Fallback { "fallback" } else { "farsight" })
+                            .bind(entry.confirmed_at)
+                            .execute(&m.pool)
+                            .await
+                        }
+                        None => {
+                            sqlx::query("DELETE FROM learned_inbound_blocks WHERE viewer_did = $1 AND other_did = $2")
+                                .bind(&pair.0)
+                                .bind(&pair.1)
+                                .execute(&m.pool)
+                                .await
+                        }
+                    }
+                };
+                match tokio::time::timeout(Duration::from_secs(5), write).await {
+                    Ok(Ok(_)) => {}
+                    // The table refused the row itself: never again.
+                    Ok(Err(sqlx::Error::Database(db))) if row.is_some() && db.code().is_some_and(|c| c.starts_with("22") || c.starts_with("23")) => {
+                        self.cache().remembered.rejected(&pair);
+                    }
+                    _ => self.cache().remembered.failed(&pair, row.is_some(), failures, Instant::now()),
+                }
+            }
+        }
+    }
+
+    /// The purge hook (§5.14.18.3), run at the tail of a purge's marker
+    /// step for a removed member and for a deleted account. It cannot
+    /// fail the purge: a failed delete is logged, and the rows are left
+    /// to the writer and to the purge's batches.
+    ///
+    /// - If the step removed a member: the purge count rises (so a
+    ///   request of the old membership adds nothing afterwards), and the
+    ///   viewer's cache entries, ledger, stop and remembered blocks go,
+    ///   with their rows.
+    /// - For a deleted account: it also goes as the blocker of anyone.
+    pub async fn purged(&self, did: &str, account_deleted: bool, member_removed: bool) {
+        let did = canonical(did).unwrap_or_else(|| did.to_string());
+        let memory = self.inner.memory.get();
+        if member_removed {
+            {
+                let mut cache = self.cache();
+                self.inner.purges.fetch_add(1, Ordering::SeqCst);
+                cache.forget(&did);
+                cache.remembered.clear_viewer(&did);
+            }
+            if let Some(m) = memory {
+                self.delete_rows(m, "viewer_did", &did).await;
+            }
+        }
+        if account_deleted {
+            self.cache().remembered.clear_other(&did);
+            if let Some(m) = memory {
+                self.delete_rows(m, "other_did", &did).await;
+            }
+        }
+    }
+
+    /// `admin farsight forget`: what the purge hook does for a removed
+    /// member, without raising the purge count. The viewer's cache
+    /// entries, ledger and stop go, and every remembered pair with its
+    /// row. Returns how many pairs were remembered.
+    ///
+    /// # Errors
+    ///
+    /// The delete's error; the pairs then stay pending for the writer.
+    pub async fn forget_memory(&self, viewer: &str) -> Result<usize, String> {
+        let viewer = canonical(viewer).unwrap_or_else(|| viewer.to_string());
+        let cleared = {
+            let mut cache = self.cache();
+            cache.forget(&viewer);
+            cache.remembered.clear_viewer(&viewer)
+        };
+        let Some(m) = self.inner.memory.get() else {
+            return Ok(0);
+        };
+        let _table = m.table.lock().await;
+        sqlx::query("DELETE FROM learned_inbound_blocks WHERE viewer_did = $1")
+            .bind(&viewer)
+            .execute(&m.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(cleared)
+    }
+
+    /// One `DELETE` of a DID's rows under the table lock, the statement
+    /// within 5 s.
+    async fn delete_rows(&self, m: &Memory, column: &'static str, did: &str) {
+        let _table = m.table.lock().await;
+        let sql = format!("DELETE FROM learned_inbound_blocks WHERE {column} = $1");
+        let delete = sqlx::query(&sql).bind(did).execute(&m.pool);
+        match tokio::time::timeout(Duration::from_secs(5), delete).await {
+            Ok(Ok(_)) => {}
+            _ => {
+                metrics::counter!(memory::METRIC_DROPPED, "reason" => "purge_delete").increment(1);
+                tracing::warn!(event = "farsight_memory_purge_delete_failed", column, "a purge's delete of remembered blocks failed; the writer and the purge's batches follow");
+            }
+        }
+    }
+
+    /// The memory in brief, with no DID: `None` when it is off.
+    #[must_use]
+    pub fn memory_stats(&self) -> Option<serde_json::Value> {
+        let m = self.inner.memory.get()?;
+        let cache = self.cache();
+        let (farsight, fallback) = cache.remembered.by_source();
+        Some(serde_json::json!({
+            "entries": cache.remembered.len(),
+            "viewers": cache.remembered.viewers(),
+            "from_farsight": farsight,
+            "from_fallback": fallback,
+            "oldest_confirmed_at": cache.remembered.oldest(),
+            "pending": cache.remembered.pending(),
+            "retention_hours": m.caps.retention.num_hours(),
+            "max_per_viewer": m.caps.per_viewer,
+            "max_total": m.caps.total,
+        }))
+    }
+
     fn cache(&self) -> std::sync::MutexGuard<'_, Cache> {
         self.inner.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -284,9 +564,10 @@ impl Farsight {
     /// Drop a viewer's cached answers (a removed member, a deleted account).
     pub fn forget(&self, viewer: &str) {
         let viewer = canonical(viewer).unwrap_or_else(|| viewer.to_string());
-        let mut cache = self.cache();
-        self.inner.purges.fetch_add(1, Ordering::SeqCst);
-        cache.forget(&viewer);
+        // Never the memory's copy: this is called for every member whose
+        // key left the in-memory table, a member that only lost readiness
+        // included. The purge hook clears the copy.
+        self.cache().forget(&viewer);
     }
 
     /// Ask Farsight to read a member's own repository (design-v3 §5.14.11),
@@ -340,6 +621,41 @@ impl Farsight {
         brief.insert("read_breaker_open".to_string(), serde_json::Value::Bool(self.breaker_open()));
         brief.insert("cached_pair_answers".to_string(), serde_json::json!(self.cached()));
         Ok(serde_json::Value::Object(brief))
+    }
+
+    /// What this AppView itself holds about Farsight, for `admin farsight
+    /// status` (§14.3): printed whether or not Farsight answers. Counts
+    /// only, and no DID.
+    #[must_use]
+    pub fn local_status(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::json;
+        let (answered, clean) = self.inner.gate.run();
+        let fallback = match self.inner.fallback.get() {
+            Some(fb) => json!({
+                "network": fb.client.network(),
+                "appview_url": fb.client.base_url(),
+                "breaker_open": fb.breaker.is_open(Instant::now()),
+                "ledger_entries": self.ledger_notes(),
+            }),
+            None => json!("disabled"),
+        };
+        let mut out = serde_json::Map::new();
+        out.insert("answered_since_start".to_string(), json!(answered));
+        out.insert("run_clean".to_string(), json!(clean));
+        out.insert("down".to_string(), json!(self.gate().down));
+        out.insert("fallback".to_string(), fallback);
+        out.insert("memory".to_string(), self.memory_stats().unwrap_or_else(|| json!("disabled")));
+        out
+    }
+
+    /// The memory's table lock, for the daily membership step: `None`
+    /// while the memory is off. Taken after a DID's advisory lock, never
+    /// before (§5.14.18.1 "One lock order").
+    pub(crate) async fn table_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        match self.inner.memory.get() {
+            Some(m) => Some(m.table.lock().await),
+            None => None,
+        }
     }
 
     /// Whether enrolling a member should prime Farsight
@@ -589,15 +905,120 @@ impl Lookup {
         (lists, complete)
     }
 
-    /// Pair answers for `others` (canonical DIDs, in page order): from the
-    /// request's memo, then the viewer's cache, then Farsight. An account
-    /// with no answer is absent.
+    /// What an applied Farsight answer does to the memory (§5.14.18.2):
+    /// an inbound list block is learned or confirmed, unless a member was
+    /// purged since the request began; a vouched answer that names none
+    /// forgets the pair at once, whatever the purge count. Returns whether
+    /// a pair was forgotten.
+    fn remember(&self, cache: &mut Cache, actor: &str, other: &str, answer: &PairAnswer) -> bool {
+        let Some(m) = self.farsight.inner.memory.get() else {
+            return false;
+        };
+        match &answer.inbound.list {
+            Some(list) => {
+                if self.farsight.inner.purges.load(Ordering::SeqCst) == self.purges {
+                    cache.remembered.learn(actor, other, Some(list), Source::Farsight, chrono::Utc::now(), m.caps);
+                }
+                false
+            }
+            None => answer.vouched && cache.remembered.forget(actor, other),
+        }
+    }
+
+    /// The read rule (§5.14.18.2): a remembered block applies to a pair
+    /// whenever the pair answer in hand does not vouch. `held` gains the
+    /// block; whether anything changed is returned.
+    fn recall(&self, cache: &mut Cache, actor: &str, other: &str, held: &mut Option<PairAnswer>) -> bool {
+        let Some(m) = self.farsight.inner.memory.get() else {
+            return false;
+        };
+        if held.as_ref().is_some_and(|a| a.vouched || a.inbound.list.is_some()) {
+            return false;
+        }
+        let Some(list) = cache.remembered.get(actor, other, chrono::Utc::now(), m.caps) else {
+            return false;
+        };
+        let mut answer = held.take().unwrap_or_default();
+        answer.inbound.list = Some(list);
+        answer.vouched = false;
+        *held = Some(answer);
+        true
+    }
+
+    /// The request's own delete of the rows of the pairs it forgot
+    /// (§5.14.18.1 "Forget"): so that an unblock Farsight vouched for is
+    /// not left to the writer. One `DELETE`, under one deadline of 1 s
+    /// that covers the table lock, the connection and the statement. A
+    /// pair learned again meanwhile is left alone. If the deadline passes
+    /// or the delete fails, the pairs stay pending.
+    async fn delete_forgotten(&self, actor: &str, forgotten: Vec<String>) {
+        let Some(m) = self.farsight.inner.memory.get() else {
+            return;
+        };
+        if forgotten.is_empty() {
+            return;
+        }
+        let delete = async {
+            let _table = m.table.lock().await;
+            let gone: Vec<String> = {
+                let cache = self.farsight.cache();
+                forgotten.into_iter().filter(|other| !cache.remembered.holds(actor, other)).collect()
+            };
+            sqlx::query("DELETE FROM learned_inbound_blocks WHERE viewer_did = $1 AND other_did = ANY($2)")
+                .bind(actor)
+                .bind(&gone)
+                .execute(&m.pool)
+                .await
+                .map(|_| gone)
+        };
+        if let Ok(Ok(gone)) = tokio::time::timeout(Duration::from_secs(1), delete).await {
+            let mut cache = self.farsight.cache();
+            for other in gone {
+                if !cache.remembered.holds(actor, &other) {
+                    cache.remembered.take(&(actor.to_string(), other));
+                }
+            }
+        }
+    }
+
+    /// Pair answers for `others` (canonical DIDs, in page order): the
+    /// live answers of [`Self::live_pairs`], then the memory's read rule
+    /// for every account whose answer does not vouch.
+    async fn pairs(&self, actor: &str, others: &[String]) -> HashMap<String, PairAnswer> {
+        let (mut found, forgotten) = self.live_pairs(actor, others).await;
+        if self.farsight.inner.memory.get().is_some() {
+            let cache_only = self.cache_only.load(Ordering::Relaxed);
+            {
+                let mut state = self.state();
+                let mut cache = self.farsight.cache();
+                for other in others {
+                    let mut held = found.get(other).cloned();
+                    if self.recall(&mut cache, actor, other, &mut held)
+                        && let Some(answer) = held
+                    {
+                        // A cache-only read memoizes nothing.
+                        if !cache_only {
+                            state.memo.insert(other.clone(), Some(answer.clone()));
+                        }
+                        found.insert(other.clone(), answer);
+                    }
+                }
+            }
+            self.delete_forgotten(actor, forgotten).await;
+        }
+        found
+    }
+
+    /// Live pair answers for `others`: from the request's memo, then the
+    /// viewer's cache, then Farsight. An account with no answer is absent.
+    /// The second value is the pairs whose remembered block a vouched
+    /// answer forgot.
     ///
     /// A cached entry the fallback wrote is a block in hand, but never
     /// stands in for Farsight: its account is still asked about. When the
     /// calls are done and Farsight turns out to be down, the fallback is
     /// asked about the accounts whose calls never got through.
-    async fn pairs(&self, actor: &str, others: &[String]) -> HashMap<String, PairAnswer> {
+    async fn live_pairs(&self, actor: &str, others: &[String]) -> (HashMap<String, PairAnswer>, Vec<String>) {
         let inner = &self.farsight.inner;
         let cache_only = self.cache_only.load(Ordering::Relaxed);
         let mut found: HashMap<String, PairAnswer> = HashMap::new();
@@ -628,7 +1049,7 @@ impl Lookup {
             // A cache-only miss is not memoized, so it never suppresses a
             // real lookup later in the request.
             if ask.is_empty() || cache_only {
-                return found;
+                return (found, Vec::new());
             }
             let mut plan = chunks(actor, &ask);
             let allowed = usize::try_from(state.calls_left).unwrap_or(usize::MAX);
@@ -645,6 +1066,7 @@ impl Lookup {
         let per_call = inner.settings.timeout;
         let called: Vec<Called> = join_all(plan.into_iter().map(|chunk| self.call(actor, chunk, allowance, started, true, per_call))).await;
         let mut eligible: Vec<String> = Vec::new();
+        let mut forgotten: Vec<String> = Vec::new();
         {
             let now = Instant::now();
             let mut state = self.state();
@@ -653,6 +1075,11 @@ impl Lookup {
             for call in called {
                 eligible.extend(call.eligible);
                 for (other, outcome) in call.outcomes {
+                    if let Some(answer) = &outcome
+                        && self.remember(&mut cache, actor, &other, answer)
+                    {
+                        forgotten.push(other.clone());
+                    }
                     // The memo holds the merged entry, so a block the cache
                     // already named is not lost to an answer that does not
                     // vouch; with no answer, a block in hand stands.
@@ -677,7 +1104,7 @@ impl Lookup {
                 found.extend(self.ask_fallback(fb, actor, &eligible, read.answers).await);
             }
         }
-        found
+        (found, forgotten)
     }
 
     /// Ask the fallback about `eligible`, less what the reductions of
@@ -700,7 +1127,10 @@ impl Lookup {
             // pair told "nothing" lately.
             let mut send: Vec<String> = Vec::new();
             for other in eligible {
-                let held = cache.entry(actor, other, now).is_some() || cache.ledger.noted(actor, other, now, fb.ttl);
+                // A remembered block is in hand too: the memory never goes
+                // to the other AppView, though it can leave a pair out.
+                let remembered = inner.memory.get().is_some_and(|m| cache.remembered.get(actor, other, chrono::Utc::now(), m.caps).is_some());
+                let held = remembered || cache.entry(actor, other, now).is_some() || cache.ledger.noted(actor, other, now, fb.ttl);
                 if !held && !send.contains(other) {
                     send.push(other.clone());
                 }
@@ -745,6 +1175,9 @@ impl Lookup {
                         let answer = PairAnswer::from_fallback(list);
                         if !purged {
                             cache.store(actor, &other, answer.clone(), now + fb.ttl, Source::Fallback, &inner.settings);
+                            if let Some(m) = inner.memory.get() {
+                                cache.remembered.learn(actor, &other, answer.inbound.list.as_deref(), Source::Fallback, chrono::Utc::now(), m.caps);
+                            }
                         }
                         state.memo.insert(other.clone(), Some(answer.clone()));
                         learned.insert(other, answer);
@@ -842,6 +1275,7 @@ impl Lookup {
         // settles one only if it vouches; one that does not is sent, and
         // stands (with any block it names) if Farsight gives no answer.
         let mut ask: Vec<String> = Vec::new();
+        let mut forgotten: Vec<String> = Vec::new();
         let mut standing: HashMap<String, PairAnswer> = HashMap::new();
         {
             let now = Instant::now();
@@ -885,6 +1319,11 @@ impl Lookup {
                     // the cache already named is not lost to one that does
                     // not vouch. With no answer the entry as it stood when
                     // the round was built is held, or "no answer".
+                    if let Some(answer) = &outcome
+                        && self.remember(&mut cache, &actor, &other, answer)
+                    {
+                        forgotten.push(other.clone());
+                    }
                     let held = match outcome {
                         Some(answer) => Some(cache.write(&actor, &other, &answer, now, &inner.settings)),
                         None => standing.remove(&other).or_else(|| state.memo.get(&other).cloned().flatten()),
@@ -893,16 +1332,26 @@ impl Lookup {
                 }
             }
         }
-        let state = self.state();
-        for did in others {
-            if let Some(c) = canonical(did)
-                && c != actor
-                && let Some(Some(answer)) = state.memo.get(&c)
-            {
-                out.answers.insert(did.clone(), answer.clone());
+        {
+            let mut state = self.state();
+            let mut cache = self.farsight.cache();
+            for did in others {
+                let Some(c) = canonical(did).filter(|c| *c != actor) else {
+                    continue;
+                };
+                // The memory's read rule, applied here too: the ordinary
+                // lookup does not run during a Thread Lens request. A
+                // remembered block is a block and never a vouch.
+                let mut held = state.memo.get(&c).cloned().flatten();
+                if self.recall(&mut cache, &actor, &c, &mut held) {
+                    state.memo.insert(c.clone(), held.clone());
+                }
+                if let Some(answer) = held {
+                    out.answers.insert(did.clone(), answer);
+                }
             }
         }
-        drop(state);
+        self.delete_forgotten(&actor, forgotten).await;
         out
     }
 
@@ -1306,6 +1755,115 @@ pub(crate) mod tests {
         // A purge of the viewer clears its blocks in hand and its notes.
         farsight.forget(V);
         assert_eq!((farsight.cached(), farsight.ledger_notes()), (0, 0));
+    }
+
+    /// B-93 (design-v3 §5.14.18): a block a live answer named is
+    /// remembered and applies whenever the answer in hand does not vouch;
+    /// a vouched clean answer forgets it at once, row included; a purge
+    /// and `admin farsight forget` clear a viewer; a request begun before
+    /// a purge learns nothing after it.
+    #[tokio::test]
+    async fn a_learned_block_applies_until_farsight_vouches_it_away() {
+        let Some(db) = crate::test_support::fresh_db("farsight_memory_engine").await else {
+            return;
+        };
+        let other_viewer = "did:plc:wwwwwwwwwwwwwwwwwwwwwwww";
+        sqlx::query("INSERT INTO members (did, source) VALUES ($1, 'admin')").bind(V).execute(&db.pool).await.expect("member");
+        // What an earlier run left: a row of the member, and one of an
+        // account that is no longer a member.
+        for viewer in [V, other_viewer] {
+            sqlx::query("INSERT INTO learned_inbound_blocks (viewer_did, other_did, list_uri, source, confirmed_at) VALUES ($1, $2, $3, 'farsight', now())")
+                .bind(viewer)
+                .bind(C)
+                .bind(LIST)
+                .execute(&db.pool)
+                .await
+                .expect("row");
+        }
+        let rows = |other: &'static str| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM learned_inbound_blocks WHERE viewer_did = $1 AND other_did = $2")
+                    .bind(V)
+                    .bind(other)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count")
+            }
+        };
+        let entries = |farsight: &Farsight| farsight.memory_stats().expect("memory on")["entries"].as_u64().expect("entries");
+
+        let (farsight, fake) = engine("").await;
+        let cfg = crate::config::FileConfig::parse("[farsight]\nurl = \"https://farsight.example.net\"\n[farsight.memory]\nenabled = true\n")
+            .expect("parse")
+            .farsight
+            .memory;
+        let loaded = farsight.load_memory(&db.pool, &cfg).await;
+        assert_eq!(loaded.entries, Some(1), "the member's row, and not the other's");
+        let none = HashSet::new();
+
+        // A cache-only read with nothing cached: the block applies, and
+        // nobody is asked.
+        let cached = farsight.request(&member());
+        cached.set_cache_only();
+        let blocked = cached.inbound_list_blocks(V, &page(&[C]), &none).await;
+        assert_eq!((blocked.get(C).map(String::as_str), calls(&fake)), (Some(LIST), 0));
+
+        // Farsight answers: A blocks and is learned; C is vouched clean
+        // and is forgotten on this very request, its row deleted by it.
+        fake.blockers.lock().expect("blockers").insert(A.to_string());
+        let blocked = farsight.request(&member()).inbound_list_blocks(V, &page(&[A, C]), &none).await;
+        assert_eq!(blocked.keys().collect::<Vec<_>>(), [A]);
+        assert_eq!((entries(&farsight), rows(C).await), (1, 0));
+
+        // The 30 s reload clears the cache and never the memory. With
+        // Farsight failing, A's block still applies; B has none.
+        farsight.forget(V);
+        *fake.status.lock().expect("status") = 500;
+        let blocked = farsight.request(&member()).inbound_list_blocks(V, &page(&[A, B]), &none).await;
+        assert_eq!(blocked, HashMap::from([(A.to_string(), LIST.to_string())]));
+        // Thread Lens reads it as a block and never as a vouch.
+        let budget = PairBudget { max_calls: 1, timeout: Duration::from_millis(200) };
+        let pairs = farsight.request(&member()).pair_answers(V, &page(&[A, B]), budget, None).await;
+        assert!(pairs.answers[A].inbound.list.is_some() && !pairs.answers[A].vouched && !pairs.answers.contains_key(B));
+
+        // The writer makes the table match the copy.
+        let writer = tokio::spawn(farsight.clone().run_memory_writer());
+        for _ in 0..50 {
+            if rows(A).await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(rows(A).await, 1);
+        // The operator's view holds counts and no DID.
+        let status = serde_json::Value::Object(farsight.local_status()).to_string();
+        assert!(status.contains("\"entries\":1") && !status.contains("did:"), "{status}");
+
+        // A purge that removed the member: the copy and the rows go, and
+        // a request of the old membership learns nothing afterwards.
+        *fake.status.lock().expect("status") = 200;
+        let old = farsight.request(&member());
+        loaded.hook().run(V, false, true).await;
+        assert_eq!((entries(&farsight), rows(A).await), (0, 0));
+        let blocked = old.inbound_list_blocks(V, &page(&[A]), &none).await;
+        assert_eq!((blocked.len(), entries(&farsight)), (1, 0));
+        // A request begun after it learns as before.
+        fake.blockers.lock().expect("blockers").insert(B.to_string());
+        farsight.request(&member()).inbound_list_blocks(V, &page(&[B]), &none).await;
+        assert_eq!(entries(&farsight), 1);
+
+        // `admin farsight forget` clears the viewer; a deleted account
+        // goes as the blocker of anyone.
+        assert_eq!(farsight.forget_memory(V).await, Ok(1));
+        assert_eq!(entries(&farsight), 0);
+        farsight.request(&member()).inbound_list_blocks(V, &page(&[B]), &none).await;
+        assert_eq!(entries(&farsight), 1);
+        loaded.hook().run(B, true, false).await;
+        assert_eq!(entries(&farsight), 0);
+
+        writer.abort();
+        db.drop_db().await;
     }
 
     /// B-91: the per-request cap bounds the calls; an `ActorNotFound`
