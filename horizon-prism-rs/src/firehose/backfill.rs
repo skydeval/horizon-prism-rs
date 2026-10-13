@@ -89,6 +89,36 @@ pub fn backoff(attempt: i32) -> TimeDelta {
     }
 }
 
+/// `backfill_optional_record_unclear_total{collection}`: profile or
+/// `self` record fetches a PDS answered with 404 `NotFound` instead of
+/// the lexicon's `RecordNotFound`.
+pub const METRIC_OPTIONAL_UNCLEAR: &str = "backfill_optional_record_unclear_total";
+
+/// What a fetch of an optional record found.
+#[derive(Debug)]
+pub enum Optional {
+    Found(Box<ListedRecord>),
+    /// The PDS said `RecordNotFound`: the record does not exist.
+    Absent,
+    /// The PDS said 404 `NotFound`: probably absent, not provably.
+    Unclear,
+}
+
+/// How an unsuccessful `getRecord` answer reads for an optional record, or
+/// `None` for a failure.
+///
+/// A 404 `NotFound` is how some PDSes answer a missing record. It is not
+/// proof of absence (a wrong route answers the same), so it is
+/// [`Optional::Unclear`] and nothing stored is deleted on it. A missing
+/// repository (`RepoNotFound`) stays a failure.
+fn optional_miss(status: u16, error: Option<&str>) -> Option<Optional> {
+    match (status, error) {
+        (_, Some("RecordNotFound")) => Some(Optional::Absent),
+        (404, Some("NotFound")) => Some(Optional::Unclear),
+        _ => None,
+    }
+}
+
 /// How many records of a collection a depth takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
@@ -290,6 +320,17 @@ pub trait BackfillSource: Send + Sync {
     /// `getRecord`; `Ok(None)` only for an explicit `RecordNotFound`.
     async fn get_record(&self, pds: &str, did: &str, collection: &str, rkey: &str)
     -> Result<Option<ListedRecord>, String>;
+    /// `getRecord` for a record an account may simply not have (its
+    /// profile, a `self` record). Beside found and absent it can answer
+    /// [`Optional::Unclear`]: the PDS said 404 `NotFound`, which is not the
+    /// lexicon's `RecordNotFound` and does not say whether the record or
+    /// something else is missing.
+    async fn get_optional_record(&self, pds: &str, did: &str, collection: &str, rkey: &str) -> Result<Optional, String> {
+        Ok(match self.get_record(pds, did, collection, rkey).await? {
+            Some(record) => Optional::Found(Box::new(record)),
+            None => Optional::Absent,
+        })
+    }
     /// One Constellation page of `app.bsky.graph.block` records at `.subject`
     /// linking to `member`.
     async fn inbound_blocks(&self, member: &str, cursor: Option<&str>) -> Result<LinksPage, String>;
@@ -459,6 +500,23 @@ impl BackfillSource for NetSource {
             return Ok(None);
         }
         Err(format!("getRecord: HTTP {} {error:?}", r.status.as_u16()))
+    }
+
+    async fn get_optional_record(&self, pds: &str, did: &str, collection: &str, rkey: &str) -> Result<Optional, String> {
+        let r = self
+            .pds_get(
+                pds,
+                "com.atproto.repo.getRecord",
+                &[("repo", did), ("collection", collection), ("rkey", rkey)],
+                BodyCap::GET_RECORD,
+            )
+            .await?;
+        if r.is_success() {
+            return r.json().map(|record| Optional::Found(Box::new(record))).map_err(|e| format!("getRecord: {e}"));
+        }
+        let error = serde_json::from_slice::<XrpcError>(&r.body).ok().and_then(|e| e.error);
+        let status = r.status.as_u16();
+        optional_miss(status, error.as_deref()).ok_or_else(|| format!("getRecord: HTTP {status} {error:?}"))
     }
 
     async fn inbound_blocks(&self, member: &str, cursor: Option<&str>) -> Result<LinksPage, String> {
@@ -810,21 +868,25 @@ impl Backfill {
                 }
             }
         }
-        if plan.profile {
-            match self.source.get_record(&pds, &job.did, NSID_PROFILE, "self").await? {
-                Some(record) => {
-                    self.write_record(&job.did, &result.rev, NSID_PROFILE, &record).await?;
+        // The profile and the `self` records are optional: a new account
+        // has none. An unclear answer neither writes nor deletes, and never
+        // fails the job, so that a PDS which answers a missing record with
+        // a bare 404 does not keep its members from being set up.
+        let optional: Vec<&str> = plan
+            .profile
+            .then_some(NSID_PROFILE)
+            .into_iter()
+            .chain(plan.self_records.then_some(SELF_RECORDS).into_iter().flatten())
+            .collect();
+        for nsid in optional {
+            match self.source.get_optional_record(&pds, &job.did, nsid, "self").await? {
+                Optional::Found(record) => {
+                    self.write_record(&job.did, &result.rev, nsid, &record).await?;
                 }
-                None => self.delete_record(&job.did, &result.rev, NSID_PROFILE, "self").await?,
-            }
-        }
-        if plan.self_records {
-            for nsid in SELF_RECORDS {
-                match self.source.get_record(&pds, &job.did, nsid, "self").await? {
-                    Some(record) => {
-                        self.write_record(&job.did, &result.rev, nsid, &record).await?;
-                    }
-                    None => self.delete_record(&job.did, &result.rev, nsid, "self").await?,
+                Optional::Absent => self.delete_record(&job.did, &result.rev, nsid, "self").await?,
+                Optional::Unclear => {
+                    metrics::counter!(METRIC_OPTIONAL_UNCLEAR, "collection" => nsid).increment(1);
+                    tracing::debug!(event = "backfill_optional_record_unclear", did = %job.did, collection = nsid, "the PDS answered 404 NotFound; nothing written or deleted");
                 }
             }
         }
@@ -1333,6 +1395,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A missing optional record: `RecordNotFound` is absence; a PDS's
+    /// bare 404 `NotFound` is unclear, so nothing is deleted on it; a
+    /// missing repository and every other answer are failures.
+    #[test]
+    fn a_bare_404_for_an_optional_record_is_unclear_not_absent() {
+        assert!(matches!(optional_miss(400, Some("RecordNotFound")), Some(Optional::Absent)));
+        assert!(matches!(optional_miss(404, Some("NotFound")), Some(Optional::Unclear)));
+        for (status, error) in [(404, Some("RepoNotFound")), (400, Some("NotFound")), (404, None), (500, Some("InternalServerError"))] {
+            assert!(optional_miss(status, error).is_none(), "{status} {error:?}");
+        }
+    }
     use crate::aggregations::{ScopeSets, ScopeState};
     use crate::config::ScopePolicy;
     use crate::firehose::jobs;

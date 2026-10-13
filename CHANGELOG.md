@@ -1389,6 +1389,19 @@ commit.
 
 ### Fixed
 
+- **A new member on a PDS that answers a missing record with 404 was
+  never fully set up.** A member's setup fetches its profile and a few
+  optional `self` records, which a new account does not have. Prism took
+  only the lexicon's `RecordNotFound` as "absent"; a PDS that answers
+  HTTP 404 `NotFound` instead (Aurora-Locus does) failed the whole job,
+  which then retried after 1 minute, 10 minutes and hourly without ever
+  succeeding, so the member waited minutes to become ready and its
+  posts, likes and follows were not backfilled. For those optional
+  records a 404 `NotFound` now writes nothing, deletes nothing and does
+  not fail the job; it counts in
+  `backfill_optional_record_unclear_total{collection}`. Where Prism
+  confirms a record is gone before deleting its copy, only
+  `RecordNotFound` still counts.
 - **The fallback ends by the request's deadline (#683).** A fallback
   call could run its whole timeout even when the request it belonged to
   had less time left. Its calls are now cut to the time the request has
