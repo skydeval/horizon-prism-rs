@@ -33,6 +33,7 @@ pub mod relationships;
 pub mod repo;
 pub mod search;
 pub mod starter_packs;
+pub mod suggestions;
 pub mod thread;
 pub mod thread_v2;
 pub mod upstream;
@@ -172,6 +173,10 @@ pub struct HydrationConfig {
     pub op_thread_max_walk: u32,
     /// `[search]`.
     pub search: crate::config::SearchConfig,
+    /// `[suggestions]`.
+    pub suggestions: crate::config::SuggestionsConfig,
+    /// `[unspecced]`.
+    pub unspecced: crate::config::UnspeccedConfig,
     /// The block-list index, when `farsight.url` is set.
     pub farsight: Option<Farsight>,
     /// A member's budget of list mutes (`lists.subscribed_max_per_member`,
@@ -192,6 +197,8 @@ struct Inner {
     redis: Option<ConnectionManager>,
     upstream: Arc<dyn UpstreamSource>,
     cache: ReadCache,
+    /// The suggestion pools and their per-viewer caches (§7.1).
+    suggestions: suggestions::State,
     cfg: HydrationConfig,
 }
 
@@ -388,6 +395,7 @@ impl Hydrator {
                 redis,
                 upstream,
                 cache,
+                suggestions: suggestions::State::new(&cfg.suggestions),
                 cfg,
             }),
         }
@@ -1047,6 +1055,10 @@ pub(crate) mod testing {
             thread_v2_max_parents: 80,
             op_thread_max_walk: 4,
             search: crate::config::SearchConfig::default(),
+            // Every request computes the pools again, so a test sees
+            // what it just wrote.
+            suggestions: crate::config::SuggestionsConfig { refresh_secs: 0, ..Default::default() },
+            unspecced: crate::config::UnspeccedConfig::default(),
             farsight: None,
             list_budget: Budget { max_references: 2, max_owners: 5 },
             list_applier: None,

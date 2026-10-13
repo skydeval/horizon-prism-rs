@@ -1095,6 +1095,69 @@ impl Default for OpThreadConfig {
     }
 }
 
+/// `[suggestions]` (design-v3 §7.1 – §7.3, §13).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SuggestionsConfig {
+    /// An account is suggested only if it posted within this many days.
+    pub active_days: u32,
+    /// How long a computed pool is served before it is computed again.
+    pub refresh_secs: u64,
+    /// Accounts (or packs) one pool holds.
+    pub pool_size: u32,
+    /// The member's most recent follows that friends-of-friends reads.
+    pub fof_max_follows: u32,
+    pub fof_cache_ttl_secs: u64,
+    pub fof_cache_max: u64,
+    /// Results the "see more" page skips.
+    pub see_more_offset: u32,
+    /// The actor's most recent in-scope followers that co-follow reads.
+    pub cofollow_sample_followers: u32,
+    pub cofollow_cache_ttl_secs: u64,
+    pub cofollow_cache_max: u64,
+    /// Below this many co-follow results, the popular order pads the list.
+    pub cofollow_min: u32,
+    /// Accounts `getTaggedSuggestions` names.
+    pub tagged_count: u32,
+}
+
+impl Default for SuggestionsConfig {
+    fn default() -> Self {
+        Self {
+            active_days: 14,
+            refresh_secs: 600,
+            pool_size: 1000,
+            fof_max_follows: 500,
+            fof_cache_ttl_secs: 600,
+            fof_cache_max: 10_000,
+            see_more_offset: 25,
+            cofollow_sample_followers: 1000,
+            cofollow_cache_ttl_secs: 600,
+            cofollow_cache_max: 10_000,
+            cofollow_min: 5,
+            tagged_count: 10,
+        }
+    }
+}
+
+/// One entry of `unspecced.live_now`: an account whose live status may
+/// link to these domains.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveNow {
+    pub did: String,
+    pub domains: Vec<String>,
+}
+
+/// `[unspecced]` (design-v3 §7.6): what `getConfig` answers.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UnspeccedConfig {
+    /// An operator policy switch: the AppView holds no account's email.
+    pub check_email_confirmed: bool,
+    pub live_now: Vec<LiveNow>,
+}
+
 /// `[search]` (design-v3 §9.0, §13).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1402,6 +1465,8 @@ pub struct FileConfig {
     pub notifications: NotificationsConfig,
     pub bookmarks: BookmarksConfig,
     pub search: SearchConfig,
+    pub suggestions: SuggestionsConfig,
+    pub unspecced: UnspeccedConfig,
     pub drafts: DraftsConfig,
     pub labels: LabelsConfig,
     pub labelers: LabelersConfig,

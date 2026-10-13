@@ -304,7 +304,7 @@ impl Hydrator {
     /// Of the accounts a search found: those the moderation gate shows and
     /// the viewer neither blocks, is blocked by, nor fully mutes, with
     /// their profile context. An inbound list block is known only here.
-    async fn searchable(&self, viewer: &Viewer, req: &Requester, dids: &[String]) -> Result<(Vec<String>, ProfileContext), sqlx::Error> {
+    pub(super) async fn searchable(&self, viewer: &Viewer, req: &Requester, dids: &[String]) -> Result<(Vec<String>, ProfileContext), sqlx::Error> {
         let gates = moderation::gate_many(self.pool(), dids).await?;
         let shown: Vec<String> = dids
             .iter()

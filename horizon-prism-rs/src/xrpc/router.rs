@@ -21,7 +21,7 @@ use super::auth::request_ip;
 use super::backstop::{self, Selected, Selection};
 use super::pools::{ChargeKey, Exhausted, Pool};
 use super::errors::{NotReadyHint, XrpcError};
-use super::handlers::{actor, bookmarks, did_web, drafts, feed, graph, index, labels, mutes, notifications, repo, search, timeline};
+use super::handlers::{actor, bookmarks, did_web, drafts, feed, graph, index, labels, mutes, notifications, repo, search, timeline, unspecced};
 use super::rate_limit::Class;
 
 /// The health route: exempt from the backstop for `GET` and `HEAD` (§6.3;
@@ -211,6 +211,17 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(search::SEARCH_ACTORS_TYPEAHEAD), get(search::search_actors_typeahead))
         .route(&xrpc(search::SEARCH_STARTER_PACKS), get(search::search_starter_packs))
         .route(&xrpc(search::SEARCH_STARTER_PACKS_V2), get(search::search_starter_packs_v2))
+        .route(&xrpc(unspecced::GET_SUGGESTED_USERS), get(unspecced::get_suggested_users))
+        .route(&xrpc(unspecced::GET_SUGGESTIONS), get(unspecced::get_suggestions))
+        .route(&xrpc(unspecced::GET_SUGGESTED_USERS_FOR_DISCOVER), get(unspecced::get_suggested_users_for_discover))
+        .route(&xrpc(unspecced::GET_SUGGESTED_USERS_FOR_EXPLORE), get(unspecced::get_suggested_users_for_explore))
+        .route(&xrpc(unspecced::GET_SUGGESTED_USERS_FOR_SEE_MORE), get(unspecced::get_suggested_users_for_see_more))
+        .route(&xrpc(unspecced::GET_SUGGESTED_ONBOARDING_USERS), get(unspecced::get_suggested_onboarding_users))
+        .route(&xrpc(unspecced::GET_SUGGESTED_FOLLOWS_BY_ACTOR), get(unspecced::get_suggested_follows_by_actor))
+        .route(&xrpc(unspecced::GET_TAGGED_SUGGESTIONS), get(unspecced::get_tagged_suggestions))
+        .route(&xrpc(unspecced::GET_CONFIG), get(unspecced::get_config))
+        .route(&xrpc(unspecced::GET_SUGGESTED_STARTER_PACKS), get(unspecced::get_suggested_starter_packs))
+        .route(&xrpc(unspecced::GET_ONBOARDING_SUGGESTED_STARTER_PACKS), get(unspecced::get_onboarding_suggested_starter_packs))
         .route(&xrpc(feed::GET_POSTS), get(feed::get_posts))
         .route(&xrpc(feed::GET_POST_THREAD), get(feed::get_post_thread))
         .route(&xrpc(feed::GET_POST_THREAD_V2), get(feed::get_post_thread_v2))

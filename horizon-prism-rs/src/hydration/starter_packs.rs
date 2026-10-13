@@ -285,6 +285,28 @@ impl Hydrator {
         Ok(Ok(Self::emit(out)))
     }
 
+    /// Up to `limit` `starterPackView`s for stored packs, in the order
+    /// given, without the packs whose creator the viewer blocks, is blocked
+    /// by, or mutes. No `list` and no sample: both are optional, and each
+    /// would cost a lookup per pack.
+    pub(super) async fn pack_views(&self, viewer: &Viewer, req: &Requester, uris: &[String], limit: usize) -> Result<Vec<Value>, sqlx::Error> {
+        let packs = self.load_packs(req, uris).await?;
+        let found: Vec<&PackRow> = uris.iter().filter_map(|u| packs.get(u)).collect();
+        let creators: Vec<String> = found.iter().filter_map(|r| uri_author(&r.uri).map(str::to_string)).collect();
+        let ctx = self.profile_context(viewer, req, &creators, None).await?;
+        let pack_uris: Vec<String> = found.iter().map(|r| r.uri.clone()).collect();
+        let (joined, labels) = (self.joined_counts(&pack_uris).await?, self.load_labels(&pack_uris).await?);
+        Ok(found
+            .iter()
+            .filter(|r| {
+                let creator = uri_author(&r.uri).unwrap_or_default();
+                !ctx.viewer.blocked_either_way(creator) && !ctx.viewer.muted.contains(creator)
+            })
+            .take(limit)
+            .map(|r| Self::pack_basic(r, &ctx, None, &joined, &labels))
+            .collect())
+    }
+
     /// `app.bsky.graph.getStarterPack`: the pack with its list and a sample
     /// of at most 12 list items.
     ///

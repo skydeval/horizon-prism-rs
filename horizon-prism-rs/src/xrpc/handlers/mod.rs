@@ -14,6 +14,7 @@ pub mod notifications;
 pub mod repo;
 pub mod search;
 pub mod timeline;
+pub mod unspecced;
 
 use axum::Json;
 use serde_json::Value;

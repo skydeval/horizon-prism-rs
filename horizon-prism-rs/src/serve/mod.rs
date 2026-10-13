@@ -516,6 +516,8 @@ pub async fn run() -> Result<(), StartupError> {
             thread_v2_max_parents: cfg.file.thread_v2.max_parents,
             op_thread_max_walk: cfg.file.op_thread.max_walk,
             search: cfg.file.search.clone(),
+            suggestions: cfg.file.suggestions.clone(),
+            unspecced: cfg.file.unspecced.clone(),
             farsight: farsight.clone(),
             list_budget,
             list_applier: Some(applier.clone()),

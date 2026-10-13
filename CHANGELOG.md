@@ -12,6 +12,28 @@ commit.
 
 ### Added
 
+- **Item 17: suggestions and `getConfig` (#675).** Computed from what
+  this AppView stores, with no placeholder accounts and no network call
+  while ranking. An account can be suggested when it is in scope, active,
+  has a real handle, is not hidden by a label, has not set
+  `hideFromAlgorithmicRecommendations`, and posted in the last
+  `suggestions.active_days`. Served: `getSuggestedUsers` and
+  `app.bsky.actor.getSuggestions` (newest; the latter pages by offset),
+  `getSuggestedUsersForExplore` and `getSuggestedOnboardingUsers`
+  (most followed), `getSuggestedUsersForDiscover` and `…ForSeeMore`
+  (for a ready member, the accounts most followed by the accounts it
+  follows; most followed for anyone else),
+  `app.bsky.graph.getSuggestedFollowsByActor` (the accounts most followed
+  by the actor's followers, padded with the most followed),
+  `getTaggedSuggestions`, `getSuggestedStarterPacks` and
+  `getOnboardingSuggestedStarterPacks` (most joined this week), and
+  `getConfig` (`[unspecced]`). A ready member is never shown itself, an
+  account it follows, one it blocks or is blocked by, or one it mutes.
+  The per-member and per-actor queries run under the search statement
+  timeout and are cached; a timeout falls back to the most followed and
+  counts in `suggestions_timeout_total{endpoint}`. Responses carry
+  `recIdStr`. New `[suggestions]` and `[unspecced]` sections (design-v3
+  §7.1 – §7.3, §7.6).
 - **Item 16: typeahead and starter-pack search (#675).**
   `app.bsky.actor.searchActorsTypeahead` matches the start of a handle
   or display name, and from three characters a word inside the display

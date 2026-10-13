@@ -310,6 +310,30 @@ max_filter_values = 25           # values one filter may list
 top_candidates = 2000            # the newest matches a "top" search ranks
 typeahead_candidates = 200       # rows a typeahead looks at before ranking
 
+# Who and what gets suggested. Everything is worked out from the accounts
+# and posts stored here; nothing is made up.
+[suggestions]
+active_days = 14                 # only accounts that posted this recently
+refresh_secs = 600               # how long a computed list is reused
+pool_size = 1000                 # accounts (or starter packs) kept per list
+fof_max_follows = 500            # of a member's follows, the newest this many are read
+fof_cache_ttl_secs = 600
+fof_cache_max = 10000
+see_more_offset = 25             # results the "see more" page skips
+cofollow_sample_followers = 1000 # of an account's followers, the newest this many are read
+cofollow_cache_ttl_secs = 600
+cofollow_cache_max = 10000
+cofollow_min = 5                 # below this, the most followed accounts fill the list
+tagged_count = 10
+
+# What app.bsky.unspecced.getConfig answers. This service holds nobody's
+# email, so check_email_confirmed is your policy, not a fact about anyone.
+# live_now lists accounts whose "live" status may link to the domains named:
+#   live_now = [{ did = "did:plc:...", domains = ["twitch.tv"] }]
+[unspecced]
+check_email_confirmed = false
+live_now = []
+
 # How many posts one member may bookmark. Past it, bookmarking another is
 # refused.
 [bookmarks]
