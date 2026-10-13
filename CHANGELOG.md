@@ -122,6 +122,10 @@ commit.
   `run_clean`, `down`, a `fallback` block and a `memory` block (counts
   only), whether or not Farsight answers. Off by default; with it off,
   `serve` empties the table at startup and nothing is stored or read.
+  Metrics: `farsight_memory_entries`, `farsight_memory_changes_total{op}`
+  (`learn`, `confirm`, `forget`, `evict`, `expire`),
+  `farsight_memory_blocks_applied_total` and
+  `farsight_memory_dropped_total{reason}`.
   Migration `0019_learned_inbound_blocks`: an upgrade to this build needs
   `APP_ALLOW_STARTUP_MIGRATE=1` for one start, as for any migration
   (design-v3 §5.14.18; proposed locked decision 39).

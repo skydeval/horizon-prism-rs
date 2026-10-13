@@ -41,6 +41,18 @@ const MAX_PENDING_ABSENT: usize = 100_000;
 pub const PUT_ATTEMPTS: u32 = 3;
 
 pub const METRIC_DROPPED: &str = super::METRIC_MEMORY_DROPPED;
+/// `farsight_memory_changes_total{op}`: `learn`, `confirm`, `forget`,
+/// `evict`, `expire`.
+pub const METRIC_CHANGES: &str = "farsight_memory_changes_total";
+/// `farsight_memory_entries`: pairs in the in-memory copy.
+pub const METRIC_ENTRIES: &str = "farsight_memory_entries";
+/// `farsight_memory_blocks_applied_total`: inbound list blocks applied
+/// from the memory.
+pub const METRIC_APPLIED: &str = "farsight_memory_blocks_applied_total";
+
+fn changed(op: &'static str) {
+    metrics::counter!(METRIC_CHANGES, "op" => op).increment(1);
+}
 
 /// The memory's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +178,7 @@ impl Copy {
         let entry = self.viewers.get(viewer)?.get(other)?;
         if entry.confirmed_at + caps.retention <= now {
             self.remove(viewer, other);
+            changed("expire");
             return None;
         }
         Some(entry.list_uri.clone().unwrap_or_else(|| PLACEHOLDER_LIST.to_string()))
@@ -199,6 +212,7 @@ impl Copy {
                 entry.persisted_at = now;
                 self.mark(viewer, other);
             }
+            self::changed("confirm");
             return;
         }
         let held = self.viewers.get(viewer).map_or(0, HashMap::len);
@@ -210,6 +224,7 @@ impl Copy {
                 return;
             };
             self.remove(viewer, &evicted);
+            changed("evict");
         } else if self.total >= caps.total {
             metrics::counter!(METRIC_DROPPED, "reason" => "total_cap").increment(1);
             return;
@@ -218,11 +233,16 @@ impl Copy {
         self.viewers.entry(viewer.to_string()).or_default().insert(other.to_string(), entry);
         self.total += 1;
         self.mark(viewer, other);
+        changed("learn");
     }
 
     /// Forget a pair Farsight vouched as clean. Returns whether it was held.
     pub fn forget(&mut self, viewer: &str, other: &str) -> bool {
-        self.remove(viewer, other)
+        let held = self.remove(viewer, other);
+        if held {
+            changed("forget");
+        }
+        held
     }
 
     /// Clear a viewer's part of the copy (a purge of that member, or
@@ -255,6 +275,7 @@ impl Copy {
             .collect();
         for (viewer, other) in &expired {
             self.remove(viewer, other);
+            changed("expire");
         }
         expired.len()
     }

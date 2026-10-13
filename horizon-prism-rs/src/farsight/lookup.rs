@@ -414,7 +414,12 @@ impl Farsight {
                 swept = Instant::now();
                 self.cache().remembered.sweep(chrono::Utc::now(), m.caps);
             }
-            let due = self.cache().remembered.due(Instant::now(), 256);
+            let (entries, due) = {
+                let cache = self.cache();
+                (cache.remembered.len(), cache.remembered.due(Instant::now(), 256))
+            };
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!(memory::METRIC_ENTRIES).set(entries as f64);
             for pair in due {
                 let _table = m.table.lock().await;
                 let Some((row, failures)) = self.cache().remembered.take(&pair) else {
@@ -929,6 +934,8 @@ impl Lookup {
             Some(list) => {
                 if self.farsight.inner.purges.load(Ordering::SeqCst) == self.purges {
                     cache.remembered.learn(actor, other, Some(list), Source::Farsight, chrono::Utc::now(), m.caps);
+                } else {
+                    metrics::counter!(memory::METRIC_DROPPED, "reason" => "purge_count").increment(1);
                 }
                 false
             }
@@ -953,6 +960,7 @@ impl Lookup {
         answer.inbound.list = Some(list);
         answer.vouched = false;
         *held = Some(answer);
+        metrics::counter!(memory::METRIC_APPLIED).increment(1);
         true
     }
 
