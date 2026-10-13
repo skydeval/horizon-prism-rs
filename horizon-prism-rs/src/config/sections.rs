@@ -1158,6 +1158,75 @@ pub struct UnspeccedConfig {
     pub live_now: Vec<LiveNow>,
 }
 
+/// One entry of `trends.suggested_topics`, in the lexicon's shape. An
+/// entry without `topic` and `link` does not parse.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestedTopic {
+    pub topic: String,
+    pub link: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+}
+
+/// `[trends]` (design-v3 §7.4, §7.5, §13).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrendsConfig {
+    /// The window trending topics count posts over.
+    pub topics_window_hours: u32,
+    /// The window trends measure engagement over.
+    pub window_hours: u32,
+    /// Tags the hourly aggregate hands to the exact recount.
+    pub candidate_count: u32,
+    /// A tag needs this many posts in the window,
+    pub min_posts: u32,
+    /// by this many distinct authors.
+    pub min_authors: u32,
+    /// Engagement this old counts half.
+    pub decay_half_life_hours: Float,
+    /// Engagement counts only on a post made at most this long before it.
+    pub subject_lookback_hours: u32,
+    /// The longest a trend refresh may run; past it the previous list
+    /// keeps being served.
+    pub refresh_timeout_ms: u64,
+    /// A trend started in the first hour at this many times its hourly
+    /// mean.
+    pub started_ratio: Float,
+    /// A trend is "hot" when its last full hour is at this many times its
+    /// hourly mean.
+    pub hot_ratio: Float,
+    /// How long a computed list is served.
+    pub cache_ttl_secs: u64,
+    /// Where a topic links to; `{tag}` is the tag, percent-encoded.
+    pub topic_link_template: String,
+    /// Descriptions the operator gives to tags.
+    pub descriptions: BTreeMap<String, String>,
+    /// Topics the operator suggests, served as `suggested`.
+    pub suggested_topics: Vec<SuggestedTopic>,
+}
+
+impl Default for TrendsConfig {
+    fn default() -> Self {
+        Self {
+            topics_window_hours: 6,
+            window_hours: 24,
+            candidate_count: 50,
+            min_posts: 3,
+            min_authors: 2,
+            decay_half_life_hours: Float(6.0),
+            subject_lookback_hours: 72,
+            refresh_timeout_ms: 10_000,
+            started_ratio: Float(2.0),
+            hot_ratio: Float(2.0),
+            cache_ttl_secs: 300,
+            topic_link_template: "/hashtag/{tag}".to_string(),
+            descriptions: BTreeMap::new(),
+            suggested_topics: Vec::new(),
+        }
+    }
+}
+
 /// `[search]` (design-v3 §9.0, §13).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1466,6 +1535,7 @@ pub struct FileConfig {
     pub bookmarks: BookmarksConfig,
     pub search: SearchConfig,
     pub suggestions: SuggestionsConfig,
+    pub trends: TrendsConfig,
     pub unspecced: UnspeccedConfig,
     pub drafts: DraftsConfig,
     pub labels: LabelsConfig,

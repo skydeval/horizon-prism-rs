@@ -326,6 +326,29 @@ cofollow_cache_max = 10000
 cofollow_min = 5                 # below this, the most followed accounts fill the list
 tagged_count = 10
 
+# Trending hashtags, worked out from the posts and the likes, reposts and
+# replies stored here. A tag needs min_posts posts by min_authors different
+# accounts, so one account cannot make a tag trend.
+[trends]
+topics_window_hours = 6          # "trending topics" counts posts over this long
+window_hours = 24                # "trends" measures engagement over this long
+candidate_count = 50
+min_posts = 3
+min_authors = 2
+decay_half_life_hours = 6.0      # engagement this old counts half
+subject_lookback_hours = 72      # likes on posts older than this are ignored
+refresh_timeout_ms = 10000       # past this, the previous list keeps being shown
+started_ratio = 2.0
+hot_ratio = 2.0                  # "hot": the last hour at this many times the average
+cache_ttl_secs = 300
+topic_link_template = "/hashtag/{tag}"
+# Your own text for a tag, and topics you want to suggest:
+#   [trends.descriptions]
+#   rust = "The programming language"
+#   [[trends.suggested_topics]]
+#   topic = "#introductions"
+#   link = "/hashtag/introductions"
+
 # What app.bsky.unspecced.getConfig answers. This service holds nobody's
 # email, so check_email_confirmed is your policy, not a fact about anyone.
 # live_now lists accounts whose "live" status may link to the domains named:

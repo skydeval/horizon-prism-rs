@@ -12,6 +12,23 @@ commit.
 
 ### Added
 
+- **Item 17: trending topics and trends (#675).**
+  `app.bsky.unspecced.getTrendingTopics` ranks hashtags by posts in the
+  last `trends.topics_window_hours`; `getTrends` ranks them by
+  engagement over `trends.window_hours`, each like, repost and reply
+  weighted by how recently it was made, and counted only on a post made
+  within `trends.subject_lookback_hours` before it. In both, only posts
+  by in-scope, visible authors who have not opted out count, and a tag
+  needs `min_posts` posts by `min_authors` authors, so one account
+  cannot carry a tag. A trend carries `startedAt`, `postCount`, `"hot"`
+  when its last full hour is at `hot_ratio` times its hourly mean, up to
+  five authors (after the viewer's mutes and blocks), and `recIdStr`.
+  Links come from `trends.topic_link_template`; descriptions and
+  `suggested` topics only from the operator's config. Each list is
+  computed again every `cache_ttl_secs`; a trend refresh that passes
+  `refresh_timeout_ms` keeps the previous list and counts in
+  `trends_refresh_timeout_total`. New `[trends]` section (design-v3
+  §7.4, §7.5).
 - **Item 17: suggestions and `getConfig` (#675).** Computed from what
   this AppView stores, with no placeholder accounts and no network call
   while ranking. An account can be suggested when it is in scope, active,

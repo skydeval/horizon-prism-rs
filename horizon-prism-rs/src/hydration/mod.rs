@@ -36,6 +36,7 @@ pub mod starter_packs;
 pub mod suggestions;
 pub mod thread;
 pub mod thread_v2;
+pub mod trends;
 pub mod upstream;
 
 use std::collections::{HashMap, HashSet};
@@ -177,6 +178,8 @@ pub struct HydrationConfig {
     pub suggestions: crate::config::SuggestionsConfig,
     /// `[unspecced]`.
     pub unspecced: crate::config::UnspeccedConfig,
+    /// `[trends]`.
+    pub trends: crate::config::TrendsConfig,
     /// The block-list index, when `farsight.url` is set.
     pub farsight: Option<Farsight>,
     /// A member's budget of list mutes (`lists.subscribed_max_per_member`,
@@ -199,6 +202,8 @@ struct Inner {
     cache: ReadCache,
     /// The suggestion pools and their per-viewer caches (§7.1).
     suggestions: suggestions::State,
+    /// The trend snapshots (§7.4, §7.5).
+    trends: trends::State,
     cfg: HydrationConfig,
 }
 
@@ -396,6 +401,7 @@ impl Hydrator {
                 upstream,
                 cache,
                 suggestions: suggestions::State::new(&cfg.suggestions),
+                trends: trends::State::default(),
                 cfg,
             }),
         }
@@ -1059,6 +1065,7 @@ pub(crate) mod testing {
             // what it just wrote.
             suggestions: crate::config::SuggestionsConfig { refresh_secs: 0, ..Default::default() },
             unspecced: crate::config::UnspeccedConfig::default(),
+            trends: crate::config::TrendsConfig { cache_ttl_secs: 0, ..Default::default() },
             farsight: None,
             list_budget: Budget { max_references: 2, max_owners: 5 },
             list_applier: None,

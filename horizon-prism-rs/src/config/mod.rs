@@ -25,7 +25,7 @@ pub use sections::{
     FarsightConfig, FileConfig, Float, FirehoseConfig, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
     KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelersConfig, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig, ThreadLensConfig, FarsightFallbackConfig, FarsightMemoryConfig,
     PrivateReadConfig, PrivateReadFloors, PublicScope, RateClassConfig, RateLimitsConfig,
-    RetentionConfig, SchemaBackfillConfig, SearchConfig, SuggestionsConfig, LiveNow, UnspeccedConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
+    RetentionConfig, SchemaBackfillConfig, SearchConfig, SuggestionsConfig, LiveNow, UnspeccedConfig, SuggestedTopic, TrendsConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
     StarterPacksConfig, SyncConfig, ThreadConfig, ThreadMutesConfig, ThreadV2Config, UtcTimeOfDay,
 };
 pub use validate::{OTHER_RELAY_LABEL, pds_pattern};

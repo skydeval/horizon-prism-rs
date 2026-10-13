@@ -1,4 +1,4 @@
-//! Suggestions and `getConfig` (design-v3 §7.1, §7.3, §7.6).
+//! Suggestions, trends and `getConfig` (design-v3 §7).
 
 use std::net::SocketAddr;
 
@@ -21,6 +21,8 @@ pub const GET_SUGGESTED_ONBOARDING_USERS: &str = "app.bsky.unspecced.getSuggeste
 pub const GET_SUGGESTED_FOLLOWS_BY_ACTOR: &str = "app.bsky.graph.getSuggestedFollowsByActor";
 pub const GET_TAGGED_SUGGESTIONS: &str = "app.bsky.unspecced.getTaggedSuggestions";
 pub const GET_CONFIG: &str = "app.bsky.unspecced.getConfig";
+pub const GET_TRENDING_TOPICS: &str = "app.bsky.unspecced.getTrendingTopics";
+pub const GET_TRENDS: &str = "app.bsky.unspecced.getTrends";
 pub const GET_SUGGESTED_STARTER_PACKS: &str = "app.bsky.unspecced.getSuggestedStarterPacks";
 pub const GET_ONBOARDING_SUGGESTED_STARTER_PACKS: &str = "app.bsky.unspecced.getOnboardingSuggestedStarterPacks";
 
@@ -116,4 +118,26 @@ pub async fn get_onboarding_suggested_starter_packs(
     RawQuery(q): RawQuery,
 ) -> XrpcResult {
     packs(s, peer, headers, q, GET_ONBOARDING_SUGGESTED_STARTER_PACKS).await
+}
+
+pub async fn get_trending_topics(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_TRENDING_TOPICS, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(&req.req, s.hydrator.trending_topics(limit(&p, 10, 25)?).await)
+}
+
+pub async fn get_trends(
+    State(s): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> XrpcResult {
+    let req = prepare(&s, &headers, peer, GET_TRENDS, Access::Opt, false).await?;
+    let p = Params::parse(q.as_deref());
+    respond(&req.req, s.hydrator.trends(&req.viewer, &req.req, limit(&p, 10, 25)?).await)
 }

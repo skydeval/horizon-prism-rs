@@ -162,6 +162,8 @@ pub const SERVED: &[Served] = &[
     served("app.bsky.graph.getSuggestedFollowsByActor", Family::Read, true),
     served("app.bsky.unspecced.getTaggedSuggestions", Family::Read, true),
     served("app.bsky.unspecced.getConfig", Family::Read, true),
+    served("app.bsky.unspecced.getTrendingTopics", Family::Read, true),
+    served("app.bsky.unspecced.getTrends", Family::Read, true),
     served("app.bsky.unspecced.getSuggestedStarterPacks", Family::Read, true),
     served("app.bsky.unspecced.getOnboardingSuggestedStarterPacks", Family::Read, true),
     served("app.bsky.feed.getPosts", Family::Read, true),

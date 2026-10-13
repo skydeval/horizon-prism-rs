@@ -220,6 +220,8 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(unspecced::GET_SUGGESTED_FOLLOWS_BY_ACTOR), get(unspecced::get_suggested_follows_by_actor))
         .route(&xrpc(unspecced::GET_TAGGED_SUGGESTIONS), get(unspecced::get_tagged_suggestions))
         .route(&xrpc(unspecced::GET_CONFIG), get(unspecced::get_config))
+        .route(&xrpc(unspecced::GET_TRENDING_TOPICS), get(unspecced::get_trending_topics))
+        .route(&xrpc(unspecced::GET_TRENDS), get(unspecced::get_trends))
         .route(&xrpc(unspecced::GET_SUGGESTED_STARTER_PACKS), get(unspecced::get_suggested_starter_packs))
         .route(&xrpc(unspecced::GET_ONBOARDING_SUGGESTED_STARTER_PACKS), get(unspecced::get_onboarding_suggested_starter_packs))
         .route(&xrpc(feed::GET_POSTS), get(feed::get_posts))

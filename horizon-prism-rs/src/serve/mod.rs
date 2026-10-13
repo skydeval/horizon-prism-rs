@@ -518,6 +518,7 @@ pub async fn run() -> Result<(), StartupError> {
             search: cfg.file.search.clone(),
             suggestions: cfg.file.suggestions.clone(),
             unspecced: cfg.file.unspecced.clone(),
+            trends: cfg.file.trends.clone(),
             farsight: farsight.clone(),
             list_budget,
             list_applier: Some(applier.clone()),
