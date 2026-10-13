@@ -32,6 +32,11 @@ commit.
   `trends.aggregate_retention_hours` are set on every database
   connection, so the triggers that keep the hourly aggregate follow
   them, and the daily job deletes aggregate rows past the latter.
+  Startup now rejects `[search]`, `[suggestions]` and `[trends]` values
+  that could not work: a zero timeout, window or pool; `max_offset`
+  above `top_candidates`; a ratio or half-life that is not above 0; an
+  aggregate retention shorter than a trend window; a link template
+  without `{tag}`.
 - **Item 17: suggestions and `getConfig` (#675).** Computed from what
   this AppView stores, with no placeholder accounts and no network call
   while ranking. An account can be suggested when it is in scope, active,

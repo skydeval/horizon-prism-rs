@@ -107,7 +107,55 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if cfg.thread.max_nodes == 0 {
         out.push("thread.max_nodes must be at least 1".to_string());
     }
+    discovery(cfg, &mut out);
     out
+}
+
+/// `[search]`, `[suggestions]` and `[trends]` (design-v3 §7, §9, §13):
+/// values with which a search or a refresh could not run at all.
+fn discovery(cfg: &FileConfig, out: &mut Vec<String>) {
+    let (search, suggestions, trends) = (&cfg.search, &cfg.suggestions, &cfg.trends);
+    for (key, value) in [
+        ("search.statement_timeout_ms", search.statement_timeout_ms),
+        ("search.hits_total_timeout_ms", search.hits_total_timeout_ms),
+        ("search.max_filter_values", u64::from(search.max_filter_values)),
+        ("search.top_candidates", u64::from(search.top_candidates)),
+        ("search.typeahead_candidates", u64::from(search.typeahead_candidates)),
+        ("search.recent_window_days", u64::from(search.recent_window_days)),
+        ("search.top_window_days", u64::from(search.top_window_days)),
+        ("suggestions.active_days", u64::from(suggestions.active_days)),
+        ("suggestions.pool_size", u64::from(suggestions.pool_size)),
+        ("trends.topics_window_hours", u64::from(trends.topics_window_hours)),
+        ("trends.window_hours", u64::from(trends.window_hours)),
+        ("trends.candidate_count", u64::from(trends.candidate_count)),
+        ("trends.subject_lookback_hours", u64::from(trends.subject_lookback_hours)),
+        ("trends.aggregate_retention_hours", u64::from(trends.aggregate_retention_hours)),
+        ("trends.refresh_timeout_ms", trends.refresh_timeout_ms),
+    ] {
+        if value == 0 {
+            out.push(format!("{key} must be at least 1"));
+        }
+    }
+    // The offset cursor of `top` pages over the candidates and no further.
+    if search.max_offset > search.top_candidates {
+        out.push(format!("search.max_offset = {} is above search.top_candidates = {}", search.max_offset, search.top_candidates));
+    }
+    for (key, value) in [
+        ("trends.decay_half_life_hours", trends.decay_half_life_hours.0),
+        ("trends.started_ratio", trends.started_ratio.0),
+        ("trends.hot_ratio", trends.hot_ratio.0),
+    ] {
+        if !(value.is_finite() && value > 0.0) {
+            out.push(format!("{key} must be a number above 0"));
+        }
+    }
+    // The aggregate must hold every hour a trend reads.
+    if trends.aggregate_retention_hours < trends.window_hours.max(trends.topics_window_hours) {
+        out.push("trends.aggregate_retention_hours must cover trends.window_hours and trends.topics_window_hours".to_string());
+    }
+    if !trends.topic_link_template.contains("{tag}") {
+        out.push("trends.topic_link_template must contain {tag}".to_string());
+    }
 }
 
 /// `[lists]` rule-4 keys (design-v3 §4.3, §13).
@@ -350,4 +398,34 @@ fn https_url(value: &str) -> Result<(), String> {
 pub fn pds_pattern(pattern: &str) -> Result<(), String> {
     let host = pattern.strip_prefix("*.").unwrap_or(pattern);
     super::env::validate_hostname(host).map_err(|e| format!("{pattern:?}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// design-v3 §13: the search, suggestion and trend defaults are valid,
+    /// and a value a search or a refresh could not run with is named.
+    #[test]
+    fn discovery_settings_are_checked() {
+        let found = |toml: &str| {
+            let mut out = Vec::new();
+            discovery(&FileConfig::parse(toml).expect("parse"), &mut out);
+            out
+        };
+        assert_eq!(found(""), Vec::<String>::new());
+        for (toml, needle) in [
+            ("[search]\nstatement_timeout_ms = 0\n", "search.statement_timeout_ms must be at least 1"),
+            ("[search]\nmax_offset = 5000\n", "search.max_offset = 5000 is above search.top_candidates = 2000"),
+            ("[suggestions]\npool_size = 0\n", "suggestions.pool_size must be at least 1"),
+            ("[trends]\ndecay_half_life_hours = 0.0\n", "trends.decay_half_life_hours must be a number above 0"),
+            ("[trends]\nwindow_hours = 100\n", "trends.aggregate_retention_hours must cover"),
+            ("[trends]\ntopic_link_template = \"/hashtag\"\n", "trends.topic_link_template must contain {tag}"),
+        ] {
+            let out = found(toml);
+            assert!(out.iter().any(|p| p.contains(needle)), "{needle:?} not in {out:?}");
+        }
+        // A suggested topic needs its topic and its link.
+        assert!(FileConfig::parse("[[trends.suggested_topics]]\ntopic = \"#x\"\n").is_err());
+    }
 }
