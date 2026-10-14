@@ -305,7 +305,7 @@ impl Hydrator {
             let Some(found) = self.upstream().list_items(req, list, limit, cursor).await else {
                 return Ok(Err(list_not_found()));
             };
-            let (found, _) = self.normalized(viewer, found).await?;
+            let (found, _) = self.normalized(viewer, req, found).await?;
             let items = found["items"]
                 .as_array()
                 .into_iter()
@@ -465,7 +465,7 @@ impl Hydrator {
             let Some(found) = self.upstream().lists(req, &did, limit, cursor, &tokens).await else {
                 return Ok(Err(ViewError::new("InvalidRequest", "Profile not found")));
             };
-            let (mut found, _) = self.normalized(viewer, found).await?;
+            let (mut found, _) = self.normalized(viewer, req, found).await?;
             // Hidden lists go, and the viewer's own state replaces upstream's.
             let uris: Vec<String> = found["lists"]
                 .as_array()

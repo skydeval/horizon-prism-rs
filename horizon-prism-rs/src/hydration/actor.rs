@@ -37,6 +37,25 @@ pub struct ProfileContext {
     /// By actor: its `statusView` (design-v3 §8.1), for the actors whose
     /// status is shown.
     pub statuses: HashMap<String, Value>,
+    /// By actor: what only `getProfile` and `getProfiles` add to a
+    /// detailed view. Empty everywhere else.
+    pub details: HashMap<String, Detail>,
+}
+
+/// The parts of a detailed view that `getProfile` and `getProfiles` load
+/// for their subjects alone (design-v3 §8.1). `None` leaves a field out.
+#[derive(Debug, Clone, Default)]
+pub struct Detail {
+    /// `associated.lists`.
+    pub lists: Option<i64>,
+    /// `associated.starterPacks`.
+    pub starter_packs: Option<i64>,
+    /// `associated.labeler`.
+    pub labeler: Option<bool>,
+    /// `joinedViaStarterPack`, a `starterPackViewBasic`.
+    pub joined_via: Option<Value>,
+    /// `viewer.knownFollowers`.
+    pub known_followers: Option<Value>,
 }
 
 impl ProfileContext {
@@ -61,6 +80,9 @@ impl ProfileContext {
             if let Some(created) = r.profile_record.as_ref().and_then(|p| p.get("createdAt")).cloned() {
                 v.insert("createdAt".into(), created);
             }
+            if let Some(p) = &r.pronouns {
+                v.insert("pronouns".into(), json!(p));
+            }
             if kind != ProfileKind::Basic {
                 if let Some(d) = &r.description {
                     v.insert("description".into(), json!(d));
@@ -78,15 +100,39 @@ impl ProfileContext {
                 if let Some(pinned) = r.profile_record.as_ref().and_then(|p| p.get("pinnedPost")).cloned() {
                     v.insert("pinnedPost".into(), pinned);
                 }
+                if let Some(w) = &r.website {
+                    v.insert("website".into(), json!(w));
+                }
                 // Who may subscribe to this account's posts (design-v3 §8.1).
                 let allow = self.declarations.get(did).map_or("followers", String::as_str);
-                v.insert("associated".into(), json!({"activitySubscription": {"allowSubscriptions": allow}}));
+                let mut associated = json!({"activitySubscription": {"allowSubscriptions": allow}});
+                if let Some(d) = self.details.get(did) {
+                    if let Some(n) = d.lists {
+                        associated["lists"] = json!(n);
+                    }
+                    if let Some(n) = d.starter_packs {
+                        associated["starterPacks"] = json!(n);
+                    }
+                    if let Some(b) = d.labeler {
+                        associated["labeler"] = json!(b);
+                    }
+                    if let Some(pack) = &d.joined_via {
+                        v.insert("joinedViaStarterPack".into(), pack.clone());
+                    }
+                }
+                v.insert("associated".into(), associated);
             }
         }
         if let Some(status) = self.statuses.get(did) {
             v.insert("status".into(), status.clone());
         }
-        v.insert("viewer".into(), self.viewer.view(did));
+        let mut viewer = self.viewer.view(did);
+        if kind == ProfileKind::Detailed
+            && let Some(known) = self.details.get(did).and_then(|d| d.known_followers.as_ref())
+        {
+            viewer["knownFollowers"] = known.clone();
+        }
+        v.insert("viewer".into(), viewer);
         v.insert("labels".into(), Value::Array(self.labels.get(did).cloned().unwrap_or_default()));
         Value::Object(v)
     }
@@ -107,25 +153,7 @@ impl Hydrator {
     ) -> Result<ProfileContext, sqlx::Error> {
         let rows = self.load_actors(dids).await?;
         let mut actor_viewer = self.actor_viewer(viewer, dids).await?;
-        // `mutedByList` and `blockingByList` carry a list view (design-v3
-        // §5.3), hydrated like any other: a list that is not locally
-        // servable is read from its record. One that cannot be read leaves
-        // the field out; the mute or block applies all the same.
-        let mut unseen: Vec<String> = actor_viewer
-            .muted_by_list
-            .values()
-            .chain(actor_viewer.blocking_by_list.values())
-            .filter(|list| !actor_viewer.list_views.contains_key(*list))
-            .cloned()
-            .collect();
-        unseen.sort_unstable();
-        unseen.dedup();
-        for list in unseen {
-            if let Some((row, _)) = self.load_list(req, &list).await? {
-                let view = self.list_basic(viewer, &row, None, None).await?;
-                actor_viewer.list_views.insert(list, view);
-            }
-        }
+        self.fill_list_views(viewer, req, &mut actor_viewer).await?;
         let labels = self.load_labels(dids).await?;
         let followers = match followers {
             Some(mode) => self
@@ -167,7 +195,94 @@ impl Hydrator {
             followers,
             declarations: declarations.into_iter().filter_map(|(did, allow)| Some((did, allow?))).collect(),
             statuses,
+            details: HashMap::new(),
         })
+    }
+
+    /// The list views behind `viewer`'s `mutedByList` and `blockingByList`
+    /// (design-v3 §5.3), hydrated like any other: a list that is not
+    /// locally servable is read from its record. One that cannot be read
+    /// leaves the field out; the mute or block applies all the same. The
+    /// views carry the viewer's own state, so they stay in `viewer`, which
+    /// lives for one request.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(super) async fn fill_list_views(&self, viewer: &Viewer, req: &Requester, state: &mut ActorViewer) -> Result<(), sqlx::Error> {
+        let mut unseen: Vec<String> = state
+            .muted_by_list
+            .values()
+            .chain(state.blocking_by_list.values())
+            .filter(|list| !state.list_views.contains_key(*list))
+            .cloned()
+            .collect();
+        unseen.sort_unstable();
+        unseen.dedup();
+        for list in unseen {
+            if let Some((row, _)) = self.load_list(req, &list).await? {
+                let view = self.list_basic(viewer, &row, None, None).await?;
+                state.list_views.insert(list, view);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fill `ctx.details` for the actors of `ctx` with a local row, each
+    /// part in one batch (design-v3 §8.1):
+    /// - `associated.lists` and `associated.starterPacks` for a ready
+    ///   member, whose backfill holds all of its lists and packs. For
+    ///   anyone else a local count would be an undercount stated as fact.
+    /// - `associated.labeler` for an account in scope, whose labeler
+    ///   declaration is fetched at every depth.
+    /// - `joinedViaStarterPack` as a `starterPackViewBasic`.
+    /// - `viewer.knownFollowers` for a ready-member viewer.
+    async fn profile_details(&self, viewer: &Viewer, req: &Requester, ctx: &mut ProfileContext, started: Instant) -> Result<(), sqlx::Error> {
+        let dids: Vec<String> = ctx.rows.keys().cloned().collect();
+        if dids.is_empty() {
+            return Ok(());
+        }
+        let p = self.pool();
+        let ready: Vec<String> = sqlx::query_scalar("SELECT did FROM members WHERE did = ANY($1) AND ready_at IS NOT NULL")
+            .bind(&dids)
+            .fetch_all(p)
+            .await?;
+        let mut counts: Vec<HashMap<String, i64>> = Vec::new();
+        for table in ["lists", "starter_packs"] {
+            let rows: Vec<(String, i64)> =
+                sqlx::query_as(&format!("SELECT creator_did, count(*) FROM {table} WHERE creator_did = ANY($1) GROUP BY creator_did"))
+                    .bind(&ready)
+                    .fetch_all(p)
+                    .await?;
+            counts.push(rows.into_iter().collect());
+        }
+        let pack_counts = counts.pop().unwrap_or_default();
+        let list_counts = counts.pop().unwrap_or_default();
+        let labelers: std::collections::HashSet<String> = sqlx::query_scalar("SELECT creator_did FROM labeler_services WHERE creator_did = ANY($1)")
+            .bind(&dids)
+            .fetch_all(p)
+            .await?
+            .into_iter()
+            .collect();
+        let in_scope: Vec<String> = {
+            let sets = self.scope().read_guard().await;
+            dids.iter().filter(|d| sets.in_scope(d)).cloned().collect()
+        };
+        let packs: Vec<String> = ctx.rows.values().filter_map(|r| r.joined_via_starter_pack_uri.clone()).collect();
+        let packs = self.pack_basics(viewer, req, &packs).await?;
+        let mut known = self.profile_known_followers(viewer, req, &dids, started).await?;
+        for did in dids {
+            let member = ready.contains(&did);
+            let detail = Detail {
+                lists: member.then(|| list_counts.get(&did).copied().unwrap_or(0)),
+                starter_packs: member.then(|| pack_counts.get(&did).copied().unwrap_or(0)),
+                labeler: in_scope.contains(&did).then(|| labelers.contains(&did)),
+                joined_via: ctx.rows.get(&did).and_then(|r| r.joined_via_starter_pack_uri.as_ref()).and_then(|u| packs.get(u).cloned()),
+                known_followers: known.remove(&did),
+            };
+            ctx.details.insert(did, detail);
+        }
+        Ok(())
     }
 
     /// Profiles with no viewer state computed (Thread Lens, §10.3).
@@ -183,6 +298,7 @@ impl Hydrator {
             followers: HashMap::new(),
             declarations: HashMap::new(),
             statuses: HashMap::new(),
+            details: HashMap::new(),
         })
     }
 
@@ -200,16 +316,17 @@ impl Hydrator {
         if let Some((error, message)) = gate.profile_error() {
             return Ok(Err(ViewError::new(error, message)));
         }
-        let ctx = self
+        let mut ctx = self
             .profile_context(viewer, req, std::slice::from_ref(&did), Some(CountMode::Sync { started }))
             .await?;
         if !ctx.rows.contains_key(&did) && !self.in_scope(&did).await {
             // Out-of-scope subject: the §8.3 cascade, then Slingshot.
             return Ok(match self.upstream().profile(req, &did).await {
-                Some(v) => Ok(Self::emit(self.normalized(viewer, v).await?.0)),
+                Some(v) => Ok(Self::emit(self.normalized(viewer, req, v).await?.0)),
                 None => Err(ViewError::new("InvalidRequest", "Profile not found")),
             });
         }
+        self.profile_details(viewer, req, &mut ctx, started).await?;
         Ok(Ok(Self::emit(ctx.view(&did, ProfileKind::Detailed))))
     }
 
@@ -231,7 +348,8 @@ impl Hydrator {
         }
         let gates = moderation::gate_many(self.pool(), &dids).await?;
         dids.retain(|d| !gates.get(d).copied().unwrap_or(Gate::Visible).is_hidden());
-        let ctx = self.profile_context(viewer, req, &dids, Some(CountMode::Sync { started })).await?;
+        let mut ctx = self.profile_context(viewer, req, &dids, Some(CountMode::Sync { started })).await?;
+        self.profile_details(viewer, req, &mut ctx, started).await?;
         // Out-of-scope actors take `getProfile`'s path: the cascade, then
         // the Slingshot profile record (design-v3 §11 G-1). One that no
         // source resolves, or that there is no budget to fetch, is omitted.
@@ -252,7 +370,7 @@ impl Hydrator {
         let mut remote: HashMap<String, Value> = HashMap::new();
         for (d, view) in fetched {
             if let Some(v) = view {
-                remote.insert(d, self.normalized(viewer, v).await?.0);
+                remote.insert(d, self.normalized(viewer, req, v).await?.0);
             }
         }
         let profiles: Vec<Value> = dids
@@ -718,6 +836,94 @@ mod tests {
         assert_eq!(search("ali").await, Vec::<String>::new());
         exec(p, "INSERT INTO scope_dids (did, reasons) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 2)").await;
         assert_eq!(search("ali").await, [ALICE]);
+        db.drop_db().await;
+    }
+
+    /// B-32 (design-v3 §8.1): the detailed view carries pronouns, website,
+    /// `joinedViaStarterPack`, a ready member's list and pack counts, the
+    /// labeler flag, and, for a ready-member viewer, the followers of the
+    /// subject that the viewer follows.
+    #[tokio::test]
+    async fn the_detailed_view_is_complete() {
+        const CAROL: &str = "did:plc:cccccccccccccccccccccccc";
+        const DAVE: &str = "did:plc:dddddddddddddddddddddddd";
+        const ERIN: &str = "did:plc:eeeeeeeeeeeeeeeeeeeeeeee";
+        let Some(db) = fresh_db("hydration_detailed_view").await else {
+            return;
+        };
+        let p = &db.pool;
+        for (did, handle) in [(ALICE, "alice.test"), (BOB, "bob.test"), (CAROL, "carol.test"), (DAVE, "dave.test"), (ERIN, "erin.test")] {
+            actor(p, did, handle, handle).await;
+        }
+        let pack = format!("at://{CAROL}/app.bsky.graph.starterpack/3kpack");
+        exec(p, &format!(
+            "UPDATE actors SET pronouns = 'they/them', website = 'https://bob.example', joined_via_starter_pack_uri = '{pack}' WHERE did = '{BOB}'"
+        )).await;
+        exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now()), ('{BOB}', 'admin', now())")).await;
+        // Bob: two lists, a starter pack and a labeler. Carol made the pack
+        // Bob joined through.
+        for rkey in ["3kl1", "3kl2"] {
+            exec(p, &format!(
+                "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES \
+                 ('at://{BOB}/app.bsky.graph.list/{rkey}', '{BOB}', '{rkey}', 'bafyl', '3k', 'L', 'app.bsky.graph.defs#curatelist', '{{}}', now())"
+            )).await;
+        }
+        for (author, rkey) in [(BOB, "3kmine"), (CAROL, "3kpack")] {
+            exec(p, &format!(
+                "INSERT INTO starter_packs (uri, creator_did, rkey, cid, rev, name, list_uri, record, created_at) VALUES \
+                 ('at://{author}/app.bsky.graph.starterpack/{rkey}', '{author}', '{rkey}', 'bafyp', '3k', 'P', \
+                  'at://{author}/app.bsky.graph.list/3kl1', '{{\"name\": \"P\"}}', now())"
+            )).await;
+        }
+        exec(p, &format!(
+            "INSERT INTO labeler_services (uri, creator_did, cid, rev, policies, record, created_at) VALUES \
+             ('at://{BOB}/app.bsky.labeler.service/self', '{BOB}', 'bafys', '3k', '{{}}', '{{}}', now())"
+        )).await;
+        // Alice follows Carol and Dave; Carol, Dave and Erin follow Bob.
+        let mut n = 0;
+        for (author, subject) in [(ALICE, CAROL), (ALICE, DAVE), (CAROL, BOB), (DAVE, BOB), (ERIN, BOB)] {
+            n += 1;
+            exec(p, &format!(
+                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
+                 ('at://{author}/app.bsky.graph.follow/{n}', '{author}', '{subject}', '3k', now())"
+            )).await;
+        }
+        let mut sets = ScopeSets::default();
+        for d in [ALICE, BOB, CAROL] {
+            sets.scope.insert(d.into());
+        }
+        sets.members.insert(ALICE.into());
+        sets.members.insert(BOB.into());
+        let h = hydrator(p, sets);
+        let req = Requester::test();
+        let me = h.viewer(Some(ALICE)).await.expect("viewer");
+
+        let v = h.get_profile(&me, &req, BOB).await.expect("db").expect("view");
+        let v = v.inner();
+        assert_eq!((v["pronouns"].clone(), v["website"].clone()), (json!("they/them"), json!("https://bob.example")));
+        assert_eq!(v["joinedViaStarterPack"]["uri"], pack);
+        assert_eq!(v["joinedViaStarterPack"]["creator"]["did"], CAROL);
+        assert_eq!(
+            v["associated"],
+            json!({"lists": 2, "starterPacks": 1, "labeler": true, "activitySubscription": {"allowSubscriptions": "followers"}})
+        );
+        assert!(v.get("verification").is_none());
+        assert_eq!(v["viewer"]["knownFollowers"]["count"], 2);
+        let mut known: Vec<&str> = v["viewer"]["knownFollowers"]["followers"].as_array().expect("followers").iter().map(|f| f["did"].as_str().expect("did")).collect();
+        known.sort_unstable();
+        assert_eq!(known, [CAROL, DAVE]);
+
+        // getProfiles: the same, in one batch. Carol is in scope but not a
+        // member: no counts, and no labeler; nobody Alice follows follows
+        // her. Anonymous viewers get no known followers.
+        let many = h.get_profiles(&me, &req, &[BOB.into(), CAROL.into()]).await.expect("db").expect("view");
+        let profiles = many.inner()["profiles"].as_array().expect("profiles").clone();
+        assert_eq!(profiles[0]["associated"]["lists"], 2);
+        assert_eq!(profiles[0]["viewer"]["knownFollowers"]["count"], 2);
+        assert_eq!(profiles[1]["associated"], json!({"labeler": false, "activitySubscription": {"allowSubscriptions": "followers"}}));
+        assert!(profiles[1]["viewer"].get("knownFollowers").is_none());
+        let anon = h.get_profile(&Viewer::anonymous(), &req, BOB).await.expect("db").expect("view");
+        assert!(anon.inner()["viewer"].get("knownFollowers").is_none());
         db.drop_db().await;
     }
 

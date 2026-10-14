@@ -501,7 +501,7 @@ impl Hydrator {
                 .filter(|u| !gates.get(u).copied().unwrap_or(Gate::Visible).is_hidden() && !deleted.contains(u))
                 .collect();
             let upstream = Value::Array(self.upstream().posts(req, &allowed).await);
-            if let Value::Array(views) = self.normalized(viewer, upstream).await?.0 {
+            if let Value::Array(views) = self.normalized(viewer, req, upstream).await?.0 {
                 posts.extend(views);
             }
         }
@@ -661,7 +661,7 @@ impl Hydrator {
             // Out-of-scope subject: the cascade (item 7).
             return Ok(
                 match self.upstream().author_feed(req, &did, limit, cursor, filter).await {
-                    Some(v) => Ok(Self::emit(self.normalized(viewer, v).await?.0)),
+                    Some(v) => Ok(Self::emit(self.normalized(viewer, req, v).await?.0)),
                     None => Err(ViewError::new("InvalidRequest", "Profile not found")),
                 },
             );
@@ -670,7 +670,7 @@ impl Hydrator {
         // PDS, below the records stored here (design-v3 §11 G-3).
         if cursor.is_some_and(|c| c.starts_with("P:")) {
             return match self.upstream().author_feed(req, &did, limit, cursor, filter).await {
-                Some(v) => Ok(Ok(Self::emit(self.normalized(viewer, v).await?.0))),
+                Some(v) => Ok(Ok(Self::emit(self.normalized(viewer, req, v).await?.0))),
                 None => match req.exhausted() {
                     // No budget for the listing: a 429, never an empty page.
                     Some(exhausted) => Err(HydrationError::NoBudget(exhausted)),
@@ -841,7 +841,7 @@ impl Hydrator {
         let partial_cursor = cursor.filter(|c| c.starts_with("PL:")).map(|c| &c[1..]);
         if !complete && partial_cursor.is_none() {
             if let Some(found) = self.upstream().list_feed(req, list, limit, cursor).await {
-                let (mut found, _) = self.normalized(viewer, found).await?;
+                let (mut found, _) = self.normalized(viewer, req, found).await?;
                 if let Some(feed) = found.get_mut("feed").and_then(Value::as_array_mut) {
                     *feed = self.without_excluded(viewer, std::mem::take(feed)).await?;
                 }
@@ -1140,7 +1140,7 @@ impl Hydrator {
         let mut remote: HashMap<String, Value> = HashMap::new();
         if !missing.is_empty() {
             let fetched = Value::Array(self.upstream().post_records(req, &missing).await);
-            if let Value::Array(views) = self.normalized(viewer, fetched).await?.0 {
+            if let Value::Array(views) = self.normalized(viewer, req, fetched).await?.0 {
                 for v in views {
                     if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string) {
                         remote.insert(u, v);
@@ -1211,7 +1211,7 @@ impl Hydrator {
         let mut remote: HashMap<String, Value> = HashMap::new();
         if !missing.is_empty() {
             let fetched = Value::Array(self.upstream().post_records(req, &missing).await);
-            if let Value::Array(views) = self.normalized(viewer, fetched).await?.0 {
+            if let Value::Array(views) = self.normalized(viewer, req, fetched).await?.0 {
                 for v in views {
                     if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string) {
                         remote.insert(u, v);

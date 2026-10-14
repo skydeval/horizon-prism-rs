@@ -225,6 +225,9 @@ pub struct ActorRow {
     pub pds_endpoint: Option<String>,
     pub indexed_at: DateTime<Utc>,
     pub profile_record: Option<Value>,
+    pub pronouns: Option<String>,
+    pub website: Option<String>,
+    pub joined_via_starter_pack_uri: Option<String>,
     pub followers_count: Option<i32>,
     pub follows_count: Option<i32>,
     pub posts_count: Option<i32>,
@@ -539,7 +542,8 @@ impl Hydrator {
         }
         let rows: Vec<ActorRow> = sqlx::query_as(
             "SELECT a.did, a.handle, a.display_name, a.description, a.avatar_cid, a.banner_cid, a.pds_endpoint, \
-               a.indexed_at, a.profile_record, c.followers_count, c.follows_count, c.posts_count \
+               a.indexed_at, a.profile_record, a.pronouns, a.website, a.joined_via_starter_pack_uri, \
+               c.followers_count, c.follows_count, c.posts_count \
              FROM actors a LEFT JOIN actor_counts c ON c.did = a.did WHERE a.did = ANY($1)",
         )
         .bind(dids)
@@ -794,15 +798,19 @@ impl Hydrator {
     /// Normalize an upstream view for `viewer` (§8.6): local viewer state
     /// (§7.5) and local labels replace upstream's, and private-tier
     /// references become not-found. Returns what normalization observed.
+    /// `mutedByList` and `blockingByList` carry their list views, loaded
+    /// as for a local profile; they live in this request's viewer state
+    /// only.
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn normalized(&self, viewer: &Viewer, mut view: Value) -> Result<(Value, normalize::NormalizeReport), sqlx::Error> {
+    pub async fn normalized(&self, viewer: &Viewer, req: &Requester, mut view: Value) -> Result<(Value, normalize::NormalizeReport), sqlx::Error> {
         let (dids, uris) = normalize::subjects(&view);
         let dids: Vec<String> = dids.into_iter().collect();
         let uris: Vec<String> = uris.into_iter().collect();
-        let actors = self.actor_viewer(viewer, &dids).await?;
+        let mut actors = self.actor_viewer(viewer, &dids).await?;
+        self.fill_list_views(viewer, req, &mut actors).await?;
         let post_viewers = self.post_viewer(viewer, &uris).await?;
         // An upstream reply is not stored, so its root comes from its record.
         let roots: Vec<String> = normalize::thread_roots(&view).into_iter().collect();

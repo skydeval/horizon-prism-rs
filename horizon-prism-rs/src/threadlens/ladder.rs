@@ -83,8 +83,8 @@ impl Ladder {
 
     /// Normalize an upstream or Slingshot view; content-stripped views
     /// become that gap.
-    async fn upstream_view(&self, viewer: &Viewer, uri: &str, view: Value) -> Result<Resolved, sqlx::Error> {
-        let (view, report) = self.hydrator.lens_normalize(viewer, view).await?;
+    async fn upstream_view(&self, viewer: &Viewer, req: &Requester, uri: &str, view: Value) -> Result<Resolved, sqlx::Error> {
+        let (view, report) = self.hydrator.lens_normalize(viewer, req, view).await?;
         Ok(if report.content_stripped.contains(uri) {
             Resolved::Gap(Gap::ContentStripped)
         } else {
@@ -132,7 +132,7 @@ impl Ladder {
                             .and_then(|posts| posts.iter().find(|p| p.get("uri").and_then(Value::as_str) == Some(uri)))
                             .cloned();
                         if let Some(view) = found {
-                            return self.upstream_view(viewer, uri, view).await;
+                            return self.upstream_view(viewer, req, uri, view).await;
                         }
                         // `getPosts` omits what it cannot show: a miss.
                         cascade = CascadeOutcome::Answered;
@@ -153,7 +153,7 @@ impl Ladder {
                     .and_then(|s| s.handle)
                     .unwrap_or_else(|| crate::hydration::INVALID_HANDLE.to_string());
                 let view = post_from_record(uri, record.cid.as_deref(), &handle, &record.value);
-                return self.upstream_view(viewer, uri, view).await;
+                return self.upstream_view(viewer, req, uri, view).await;
             }
             Err(SlingshotError::NotFound) => SlingshotOutcome::NotFound,
             Err(SlingshotError::Transient(_) | SlingshotError::Invalid(_) | SlingshotError::NoBudget) => {

@@ -321,6 +321,52 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// B-36: an out-of-scope subject on a list the viewer mutes, seen
+    /// through an upstream view (its profile, or as a post's author), names
+    /// the list in `mutedByList` as a local profile does.
+    #[tokio::test]
+    async fn an_upstream_view_names_the_list_that_mutes_its_subject() {
+        const FAR: &str = "did:plc:ffffffffffffffffffffffff";
+        const OWNER: &str = "did:plc:oooooooooooooooooooooooo";
+        let Some(db) = fresh_db("hydration_list_mutes_upstream").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
+        let outside = format!("at://{OWNER}/app.bsky.graph.list/3kout");
+        let post = format!("at://{FAR}/app.bsky.feed.post/3kfar");
+        let mut up = FixedUpstream::default();
+        up.records.insert(
+            outside.clone(),
+            json!({"uri": outside, "cid": "bafyout", "value": {"$type": "app.bsky.graph.list", "name": "Outside", "purpose": PURPOSE_MOD, "createdAt": "2026-01-01T00:00:00Z"}}),
+        );
+        up.profiles.insert(FAR.into(), json!({"did": FAR, "handle": "far.example", "viewer": {}, "labels": []}));
+        let h = hydrator_with(p, ScopeSets::default(), std::sync::Arc::new(up));
+        exec(p, &format!("INSERT INTO subscribed_lists (list_uri, owner_did, state, purpose) VALUES ('{outside}', '{OWNER}', 'active', '{PURPOSE_MOD}')")).await;
+        exec(p, &format!(
+            "INSERT INTO subscribed_list_items (uri, list_uri, owner_did, rkey, cid, rev, subject_did) VALUES \
+             ('at://{OWNER}/app.bsky.graph.listitem/3kf', '{outside}', '{OWNER}', '3kf', 'c', '3k', '{FAR}')"
+        )).await;
+        exec(p, &format!(
+            "INSERT INTO list_references (member_did, list_uri, source, admitted, effective) VALUES ('{ALICE}', '{outside}', 'mute', true, true)"
+        )).await;
+        let me = Viewer { did: Some(ALICE.into()), hydrate: true };
+        let req = Requester::test();
+
+        let profile = h.get_profile(&me, &req, FAR).await.expect("db").expect("view");
+        let viewer = &profile.inner()["viewer"];
+        assert_eq!(viewer["muted"], json!(true));
+        assert_eq!((&viewer["mutedByList"]["uri"], &viewer["mutedByList"]["name"]), (&json!(outside), &json!("Outside")));
+        let view = json!({"uri": post, "cid": "bafyfar", "author": {"did": FAR, "handle": "far.example"}, "record": {"text": "far"}});
+        let (view, _) = h.normalized(&me, &req, view).await.expect("db");
+        assert_eq!(view["author"]["viewer"]["mutedByList"]["uri"], json!(outside));
+        // Another viewer's view of the same subject names no list.
+        let (view, _) = h.normalized(&Viewer::anonymous(), &req, view).await.expect("db");
+        assert!(view["author"]["viewer"].get("mutedByList").is_none());
+        db.drop_db().await;
+    }
+
     /// A Thread Lens visitor (signed in, not a ready member): inside a
     /// request that supplies its blocks, `actor_viewer` returns those
     /// blocks and nothing else, and reads no table. Outside one, and for

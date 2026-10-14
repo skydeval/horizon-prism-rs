@@ -1514,7 +1514,9 @@ async fn insert_via_notification(
 /// `subscribed-post` notifications for a post by `author` just written from
 /// the firehose (design-v3 §5.6): one for each member subscribed to the
 /// author for this kind of post (`reply` or a top-level post), where
-/// - the subscription is older than the post;
+/// - the subscription is older than the post, at the second precision
+///   clients stamp `createdAt` with: one made during the post's second
+///   counts;
 /// - the author has been backfilled once, so its declaration is stored if
 ///   it has one;
 /// - the author's declaration still allows the subscriber (no record means
@@ -1537,7 +1539,7 @@ async fn insert_subscribed_post(
                                      'followers') AS allow) d \
          WHERE s.subject_did = $1 AND s.subscriber_did <> $1 \
            AND CASE WHEN $4 THEN s.reply ELSE s.post END \
-           AND s.created_at < $5 \
+           AND s.created_at < date_trunc('second', $5::timestamptz) + interval '1 second' \
            AND EXISTS (SELECT 1 FROM members m WHERE m.did = s.subscriber_did) \
            AND EXISTS (SELECT 1 FROM sync_state y WHERE y.did = $1 AND y.last_resync_at IS NOT NULL) \
            AND d.allow IN ('followers', 'mutuals') \
@@ -2051,6 +2053,58 @@ mod tests {
             exec("UPDATE sync_state SET last_resync_at = NULL".into()).await;
             w.apply(AUTHOR, &rev(6), &[post("3kunsynced", fresh(), false)], OPTIONS).await.expect("apply");
             assert_eq!(notified().await.len(), 1);
+            db.drop_db().await;
+        }
+
+        /// B-43: clients stamp `createdAt` to the second, so a post made in
+        /// the second its subscription was created in is announced; one
+        /// from the second before is not.
+        #[tokio::test]
+        async fn a_post_in_the_subscriptions_own_second_is_announced() {
+            let Some(db) = fresh_db("writer_subscribed_same_second").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, false);
+            let exec = |sql: String| async move {
+                sqlx::query(&sql).execute(p).await.expect("setup");
+            };
+            exec(format!("INSERT INTO members (did, source, ready_at) VALUES ('{SUBJECT}', 'admin', now())")).await;
+            exec(format!("INSERT INTO sync_state (did, last_resync_at) VALUES ('{AUTHOR}', now())")).await;
+            exec(format!(
+                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
+                 ('at://{SUBJECT}/app.bsky.graph.follow/1', '{SUBJECT}', '{AUTHOR}', '3k', now())"
+            ))
+            .await;
+            // The subscription is made 700 ms into a whole second.
+            let second = DateTime::from_timestamp(Utc::now().timestamp() - 10, 0).expect("second");
+            let subscribed = second + chrono::TimeDelta::milliseconds(700);
+            exec(format!(
+                "INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply, created_at) VALUES \
+                 ('{SUBJECT}', '{AUTHOR}', true, false, '{}')",
+                subscribed.to_rfc3339()
+            ))
+            .await;
+            let post = |rkey: &str, created: DateTime<Utc>| RawOp {
+                action: Action::Create,
+                collection: "app.bsky.feed.post".into(),
+                rkey: rkey.into(),
+                cid: Some(format!("bafy{rkey}")),
+                record: Some(json!({"text": rkey, "createdAt": created.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)})),
+            };
+            let notified = || async {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT record_uri FROM notifications WHERE recipient_did = $1 AND reason = 'subscribed-post' ORDER BY id",
+                )
+                .bind(SUBJECT)
+                .fetch_all(p)
+                .await
+                .expect("notifications")
+            };
+            w.apply(AUTHOR, &rev(1), &[post("3kbefore", second - chrono::TimeDelta::seconds(1))], OPTIONS).await.expect("apply");
+            assert!(notified().await.is_empty(), "a post from the second before is not announced");
+            w.apply(AUTHOR, &rev(2), &[post("3ksame", second)], OPTIONS).await.expect("apply");
+            assert_eq!(notified().await, [format!("at://{AUTHOR}/app.bsky.feed.post/3ksame")]);
             db.drop_db().await;
         }
 

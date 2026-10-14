@@ -1154,7 +1154,7 @@ mod tests {
             "posts": [post(&fresh), post(&stale), post(&unknown)],
             "profile": {"did": OUTSIDER, "handle": "o.test", "followersCount": 10, "followsCount": 4}
         });
-        let (v, _) = h.normalized(&crate::hydration::Viewer::anonymous(), view).await.expect("normalize");
+        let (v, _) = h.normalized(&crate::hydration::Viewer::anonymous(), &Requester::test(), view).await.expect("normalize");
         assert_eq!(v["posts"][0]["likeCount"], 200, "a fresh Constellation value overrides upstream");
         assert_eq!(v["posts"][0]["repostCount"], 5, "a count Constellation does not carry is untouched");
         assert_eq!(v["posts"][1]["likeCount"], 7, "a stale value is still used");

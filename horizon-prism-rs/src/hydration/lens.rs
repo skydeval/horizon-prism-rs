@@ -290,8 +290,8 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn lens_normalize(&self, viewer: &Viewer, view: Value) -> Result<(Value, NormalizeReport), sqlx::Error> {
-        let (mut view, report) = self.normalized(viewer, view).await?;
+    pub async fn lens_normalize(&self, viewer: &Viewer, req: &Requester, view: Value) -> Result<(Value, NormalizeReport), sqlx::Error> {
+        let (mut view, report) = self.normalized(viewer, req, view).await?;
         self.enrich_counts(&mut view).await?;
         Ok((view, report))
     }

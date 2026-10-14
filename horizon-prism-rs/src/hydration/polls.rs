@@ -40,7 +40,7 @@ impl Hydrator {
         }
         if !self.stores_public_of(&did).await || cursor.is_some_and(|c| c.starts_with("P:")) {
             return match self.upstream().author_polls(req, &did, limit, cursor).await {
-                Some(v) => Ok(Ok(Self::emit(self.normalized(viewer, v).await?.0))),
+                Some(v) => Ok(Ok(Self::emit(self.normalized(viewer, req, v).await?.0))),
                 None => match req.exhausted() {
                     // No budget for the listing: a 429, never an empty page.
                     Some(exhausted) => Err(HydrationError::NoBudget(exhausted)),

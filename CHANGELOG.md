@@ -1515,6 +1515,19 @@ commit.
 
 ### Fixed
 
+- **Profiles were missing fields (#676, Phase B B-32, B-36, B-43).**
+  - `getProfile` / `getProfiles` now return `pronouns`, `website` and
+    `joinedViaStarterPack`; `associated.lists` and `starterPacks` for a
+    ready member and `associated.labeler` for an account in scope; and,
+    for a ready-member viewer, `viewer.knownFollowers` (bounded as
+    `getKnownFollowers` is). The writer had stored these; the views never
+    read them. `pronouns` also appears on the basic and standard views.
+  - An account outside scope that the viewer mutes or blocks through a
+    list now carries `viewer.mutedByList` / `blockingByList`, as one in
+    scope already did.
+  - A post made in the same second as the activity subscription to its
+    author is announced (`createdAt` is stamped to the second).
+
 - **`getPosts` served a deleted post from upstream (#676).** A post not
   stored here is fetched from upstream, and those copies are cached. A
   post whose delete this AppView had already seen was fetched all the

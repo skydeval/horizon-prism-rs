@@ -612,9 +612,9 @@ mod tests {
         let far = json!({"uri": "at://did:plc:zzzzzzzzzzzzzzzzzzzzzzzz/app.bsky.feed.post/3kfar", "cid": "bafyfar",
             "author": {"did": "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz", "handle": "far.example"},
             "record": {"text": "far reply", "reply": {"root": {"uri": root, "cid": "bafyroot"}, "parent": {"uri": root, "cid": "bafyroot"}}}});
-        let (mine, _) = h.normalized(&me, far.clone()).await.expect("db");
+        let (mine, _) = h.normalized(&me, &req, far.clone()).await.expect("db");
         assert_eq!(mine["viewer"]["threadMuted"], true);
-        let (theirs, _) = h.normalized(&other, far).await.expect("db");
+        let (theirs, _) = h.normalized(&other, &req, far).await.expect("db");
         assert!(theirs["viewer"].get("threadMuted").is_none());
         h.set_thread_mute(&me, &root, false).await.expect("db").expect("unmuted");
         h.set_thread_mute(&me, &root, false).await.expect("db").expect("unmute is idempotent");

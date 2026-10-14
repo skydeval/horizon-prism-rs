@@ -168,20 +168,29 @@ impl Hydrator {
         if uris.len() > MAX_URIS {
             return Ok(Err(ViewError::new("InvalidRequest", "Error: uris must not have more than 25 elements")));
         }
+        let mut packs = self.pack_basics(viewer, req, uris).await?;
+        let views: Vec<Value> = uris.iter().filter_map(|u| packs.remove(u)).collect();
+        Ok(Ok(Self::emit(json!({ "starterPacks": views }))))
+    }
+
+    /// `starterPackViewBasic`s for `uris`, by URI. A pack that is not
+    /// found, or is hidden, has no entry.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(super) async fn pack_basics(&self, viewer: &Viewer, req: &Requester, uris: &[String]) -> Result<HashMap<String, Value>, sqlx::Error> {
         let packs = self.load_packs(req, uris).await?;
-        let found: Vec<&PackRow> = uris.iter().filter_map(|u| packs.get(u)).collect();
+        let found: Vec<&PackRow> = packs.values().collect();
         let creators: Vec<String> = found.iter().filter_map(|r| uri_author(&r.uri).map(str::to_string)).collect();
         let ctx = self.profile_context(viewer, req, &creators, None).await?;
         let pack_uris: Vec<String> = found.iter().map(|r| r.uri.clone()).collect();
         let (joined, labels) = (self.joined_counts(&pack_uris).await?, self.load_labels(&pack_uris).await?);
         let counts = self.local_list_counts(&found).await?;
-        let mut seen = std::collections::HashSet::new();
-        let views: Vec<Value> = found
+        Ok(found
             .iter()
-            .filter(|r| seen.insert(r.uri.as_str()))
-            .map(|r| Self::pack_basic(r, &ctx, counts.get(&r.list_uri).copied(), &joined, &labels))
-            .collect();
-        Ok(Ok(Self::emit(json!({ "starterPacks": views }))))
+            .map(|r| (r.uri.clone(), Self::pack_basic(r, &ctx, counts.get(&r.list_uri).copied(), &joined, &labels)))
+            .collect())
     }
 
     /// `app.bsky.graph.searchStarterPacks` and `searchStarterPacksV2`
@@ -348,7 +357,7 @@ impl Hydrator {
         } else if list.is_some()
             && let Some(up) = self.upstream().starter_pack(req, uri).await
         {
-            let (up, _) = self.normalized(viewer, up).await?;
+            let (up, _) = self.normalized(viewer, req, up).await?;
             let sample: Vec<Value> = up
                 .pointer("/starterPack/listItemsSample")
                 .and_then(Value::as_array)
@@ -456,7 +465,7 @@ impl Hydrator {
             let Some(found) = self.upstream().actor_starter_packs(req, &did, limit, cursor).await else {
                 return Ok(Err(ViewError::new("InvalidRequest", "Profile not found")));
             };
-            let (mut found, _) = self.normalized(viewer, found).await?;
+            let (mut found, _) = self.normalized(viewer, req, found).await?;
             let uris: Vec<String> = found["starterPacks"]
                 .as_array()
                 .into_iter()

@@ -2,14 +2,15 @@
 //! (Constellation first), `getMutes`, `muteActor`, `unmuteActor` (local
 //! `mutes`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use super::actor::ProfileKind;
 use super::feed::{local_cursor, parse_local_cursor};
-use super::{Hydrator, ViewError, ViewResult, Viewer};
+use super::{Hydrator, SYNC_BUDGET, ViewError, ViewResult, Viewer};
 use crate::moderation::{self, Gate};
 use crate::hydration::HydrationError;
 use crate::xrpc::pools::Requester;
@@ -20,6 +21,8 @@ pub const NSID_FOLLOW: &str = "app.bsky.graph.follow";
 pub const METRIC_KNOWN_FOLLOWERS_TRUNCATED: &str = "known_followers_scan_truncated_total";
 /// Followers asked of Constellation per page of a known-followers scan.
 const KNOWN_FOLLOWERS_PAGE: u32 = 100;
+/// Followers a profile's `viewer.knownFollowers` shows (lexicon maximum).
+const KNOWN_FOLLOWERS_SHOWN: usize = 5;
 
 /// What a direct mute covers (design-v3 §5.3): `mutes.scope`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +105,7 @@ impl Hydrator {
         };
         if !self.in_scope(&did).await {
             return Ok(match self.upstream().follows(req, &did, limit, cursor).await {
-                Some(v) => Ok(Self::emit(self.normalized(viewer, v).await?.0)),
+                Some(v) => Ok(Self::emit(self.normalized(viewer, req, v).await?.0)),
                 None => Err(not_found()),
             });
         }
@@ -288,59 +291,131 @@ impl Hydrator {
         Ok(Ok(Self::emit(out)))
     }
 
-    /// The followers of `subject` that the viewer follows, with blocked
-    /// accounts removed: those with a stored follow first, newest first,
-    /// then the rest by DID.
-    async fn known_followers_of(&self, viewer: &Viewer, req: &Requester, me: &str, subject: &str) -> Result<Vec<String>, sqlx::Error> {
+    /// For each of `subjects`, its followers that the viewer follows, with
+    /// blocked accounts removed: those with a stored follow first, newest
+    /// first, then the rest by DID. The stored follows are read in one
+    /// query; Constellation is scanned for at most `pages` pages a subject.
+    /// A subject reached after `deadline` has no entry.
+    async fn known_followers_of(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        me: &str,
+        subjects: &[String],
+        pages: u32,
+        deadline: Option<Instant>,
+    ) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
         let mine: HashSet<String> = sqlx::query_scalar("SELECT subject_did FROM follows WHERE author_did = $1")
             .bind(me)
             .fetch_all(self.pool())
             .await?
             .into_iter()
             .collect();
-        let mut known: Vec<String> = sqlx::query_scalar(
-            "SELECT author_did FROM follows WHERE subject_did = $2 \
+        let stored: Vec<(String, String)> = sqlx::query_as(
+            "SELECT subject_did, author_did FROM follows WHERE subject_did = ANY($2) \
                AND author_did IN (SELECT subject_did FROM follows WHERE author_did = $1) \
              ORDER BY created_at DESC, author_did",
         )
         .bind(me)
-        .bind(subject)
+        .bind(subjects)
         .fetch_all(self.pool())
         .await?;
-        // Followers this AppView does not store, from Constellation: a
-        // bounded scan, each page charged to the caller's share.
-        let mut remote: Vec<String> = Vec::new();
-        if let Some(client) = self.backlinks() {
-            let mut cursor: Option<String> = None;
-            let mut truncated = false;
-            for page in 0..self.inner.cfg.known_followers_scan_max_pages {
-                if self.draw_constellation(req).is_err() {
-                    truncated = true;
-                    break;
-                }
-                let Ok(found) = client.distinct_dids_page(subject, NSID_FOLLOW, ".subject", KNOWN_FOLLOWERS_PAGE, cursor.as_deref()).await else {
-                    break;
-                };
-                remote.extend(found.linking_dids.into_iter().filter(|d| mine.contains(d)));
-                cursor = found.cursor;
-                if cursor.is_none() {
-                    break;
-                }
-                truncated = page + 1 == self.inner.cfg.known_followers_scan_max_pages;
-            }
-            if truncated {
-                metrics::counter!(METRIC_KNOWN_FOLLOWERS_TRUNCATED).increment(1);
-            }
+        let mut by_subject: HashMap<String, Vec<String>> = HashMap::new();
+        for (subject, author) in stored {
+            by_subject.entry(subject).or_default().push(author);
         }
-        let stored: HashSet<String> = known.iter().cloned().collect();
-        remote.retain(|d| !stored.contains(d));
-        remote.sort_unstable();
-        remote.dedup();
-        known.extend(remote);
-        known.dedup();
-        let state = self.actor_viewer(viewer, &known).await?;
-        known.retain(|d| d != me && d != subject && !state.blocked_either_way(d));
-        Ok(known)
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for subject in subjects {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                continue;
+            }
+            let mut known = by_subject.remove(subject).unwrap_or_default();
+            // Followers this AppView does not store, from Constellation: a
+            // bounded scan, each page charged to the caller's share.
+            let mut remote: Vec<String> = Vec::new();
+            if let Some(client) = self.backlinks() {
+                let mut cursor: Option<String> = None;
+                let mut truncated = false;
+                for page in 0..pages {
+                    if self.draw_constellation(req).is_err() {
+                        truncated = true;
+                        break;
+                    }
+                    let Ok(found) = client.distinct_dids_page(subject, NSID_FOLLOW, ".subject", KNOWN_FOLLOWERS_PAGE, cursor.as_deref()).await else {
+                        break;
+                    };
+                    remote.extend(found.linking_dids.into_iter().filter(|d| mine.contains(d)));
+                    cursor = found.cursor;
+                    if cursor.is_none() {
+                        break;
+                    }
+                    truncated = page + 1 == pages;
+                }
+                if truncated {
+                    metrics::counter!(METRIC_KNOWN_FOLLOWERS_TRUNCATED).increment(1);
+                }
+            }
+            let stored: HashSet<String> = known.iter().cloned().collect();
+            remote.retain(|d| !stored.contains(d));
+            remote.sort_unstable();
+            remote.dedup();
+            known.extend(remote);
+            known.dedup();
+            out.insert(subject.clone(), known);
+        }
+        let mut all: Vec<String> = out.values().flatten().cloned().collect();
+        all.sort_unstable();
+        all.dedup();
+        let state = self.actor_viewer(viewer, &all).await?;
+        for (subject, known) in &mut out {
+            known.retain(|d| d != me && d != subject && !state.blocked_either_way(d));
+        }
+        Ok(out)
+    }
+
+    /// `viewer.knownFollowers` for a ready-member viewer on the detailed
+    /// views of `subjects` (design-v3 §8.1): `getKnownFollowers`' set, with
+    /// the Constellation scan cut to `known_followers.profile_scan_pages`
+    /// and no subject begun once the request's single-object budget is
+    /// spent. `count` is the whole set; `followers` shows at most five. A
+    /// subject with none, and the viewer itself, have no entry.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(super) async fn profile_known_followers(&self, viewer: &Viewer, req: &Requester, subjects: &[String], started: Instant) -> Result<HashMap<String, Value>, sqlx::Error> {
+        let Some(me) = viewer.state_did() else {
+            return Ok(HashMap::new());
+        };
+        let subjects: Vec<String> = subjects.iter().filter(|s| s.as_str() != me).cloned().collect();
+        if subjects.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let pages = self.inner.cfg.known_followers_profile_scan_pages;
+        let found = self.known_followers_of(viewer, req, me, &subjects, pages, Some(started + SYNC_BUDGET)).await?;
+        let mut all: Vec<String> = found.values().flatten().cloned().collect();
+        all.sort_unstable();
+        all.dedup();
+        let gates = moderation::gate_many(self.pool(), &all).await?;
+        let found: Vec<(String, Vec<String>)> = found
+            .into_iter()
+            .map(|(subject, mut known)| {
+                known.retain(|d| !gates.get(d).copied().unwrap_or(Gate::Visible).is_hidden());
+                (subject, known)
+            })
+            .filter(|(_, known)| !known.is_empty())
+            .collect();
+        let mut shown: Vec<String> = found.iter().flat_map(|(_, known)| known.iter().take(KNOWN_FOLLOWERS_SHOWN)).cloned().collect();
+        shown.sort_unstable();
+        shown.dedup();
+        let ctx = self.profile_context(viewer, req, &shown, None).await?;
+        Ok(found
+            .into_iter()
+            .map(|(subject, known)| {
+                let followers: Vec<Value> = known.iter().take(KNOWN_FOLLOWERS_SHOWN).map(|d| ctx.view(d, ProfileKind::Basic)).collect();
+                (subject, json!({"count": known.len(), "followers": followers}))
+            })
+            .collect())
     }
 
     /// `app.bsky.graph.getKnownFollowers` for a ready-member viewer
@@ -366,7 +441,12 @@ impl Hydrator {
         let all = match snapshot {
             Some(all) => all,
             None => {
-                let all = self.known_followers_of(viewer, req, &me, &did).await?;
+                let pages = self.inner.cfg.known_followers_scan_max_pages;
+                let all = self
+                    .known_followers_of(viewer, req, &me, std::slice::from_ref(&did), pages, None)
+                    .await?
+                    .remove(&did)
+                    .unwrap_or_default();
                 self.cache().put_json(&key, &all).await;
                 all
             }

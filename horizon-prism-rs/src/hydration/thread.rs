@@ -442,7 +442,7 @@ impl Hydrator {
             {
                 // An upstream AppView's thread, with whatever gate view it
                 // gave.
-                let mut v = self.normalized(viewer, v).await?.0;
+                let mut v = self.normalized(viewer, req, v).await?.0;
                 let gate = v.get("threadgate").cloned().filter(|g| !g.is_null());
                 return Ok(Ok((v["thread"].take(), gate)));
             }
@@ -630,7 +630,7 @@ impl Hydrator {
             return Ok(out);
         }
         let fetched = Value::Array(self.upstream().post_records(req, &allowed).await);
-        if let Value::Array(views) = self.normalized(viewer, fetched).await?.0 {
+        if let Value::Array(views) = self.normalized(viewer, req, fetched).await?.0 {
             for v in views {
                 if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string) {
                     out.insert(u, v);
