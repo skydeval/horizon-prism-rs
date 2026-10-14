@@ -92,7 +92,7 @@ pub async fn get_config(
     headers: HeaderMap,
 ) -> XrpcResult {
     prepare(&s, &headers, peer, GET_CONFIG, Access::Opt, false).await?;
-    Ok(Json(crate::hydration::Hydrator::emit(s.hydrator.unspecced_config())))
+    Ok(Json(s.hydrator.unspecced_config()))
 }
 
 /// Both starter-pack suggestion endpoints share one pool (design-v3 §7.2).

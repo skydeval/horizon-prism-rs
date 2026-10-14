@@ -113,6 +113,12 @@ async fn global_limit(
         }
         None => Selected::by_ip(ip),
     };
+    // The method served labels the request's outbound calls (design-v3
+    // §14.2). Only a routed handler makes such calls, so the label takes
+    // the values of the routes, never of an arbitrary path.
+    let mut selected = selected;
+    let path = request.uri().path();
+    selected.req = selected.req.for_endpoint(path.strip_prefix("/xrpc/").unwrap_or(path));
     let charged = match selected.req.key() {
         ChargeKey::Member(did) => s.limits.check(Class::Global, did),
         ChargeKey::Ip(key) => s.limits.check_ip(Class::Global, *key),

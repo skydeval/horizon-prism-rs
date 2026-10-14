@@ -1525,6 +1525,30 @@ commit.
 
 ### Fixed
 
+- **Phase B, B-50 to B-63 (#676).**
+  - **Muted threads write no notifications.** A reply or like in a
+    thread the recipient muted is no longer written at all (it was
+    written and only hidden while the mute lasted, so it reappeared after
+    unmuting). The same for `subscribed-post`.
+  - **`getKnownFollowers` keeps to the request deadline.** For a large
+    account the Constellation scan ran every page (about 60 s); it now
+    stops at the deadline and returns the followers found so far
+    (`known_followers_scan_truncated_total`).
+  - **Private-context hydration (design-v4 §8.1, R3-179).** The private
+    handlers reach the hydrator only through `HydrationContext::Private`:
+    authors and a private thread's public parent render from local rows
+    only, with no upstream, Slingshot or Constellation call, no shared or
+    identity cache read or written, and no Farsight lookup.
+  - **`PublicEmit` is made only in `hydration`.** `getConfig`'s view moved
+    there; a `compile_fail` doctest covers the constructor.
+  - **Metrics:** `microcosm_requests_total{service, origin, endpoint}`, and
+    `origin` and `endpoint` labels on `upstream_calls_total`.
+  - **Stored accounts outside scope and members are not read** by
+    `resolveHandle`'s stored answer, `getRecord`'s profile branch, Thread
+    Lens' account check, or `getProfile`/`getProfiles`, which now choose
+    local or cascade by scope and membership rather than by whether a row
+    exists (G-9, R3-96).
+
 - **Viewer-private fetches (#709; design-v4 §8.1, R3-188, R3-208).** A
   fetch whose subjects come from a viewer's own mutes, list mutes,
   bookmarks or activity subscriptions warmed the shared caches, so an

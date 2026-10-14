@@ -35,6 +35,8 @@ pub const BREAKER_THRESHOLD: u32 = 5;
 /// How long an open breaker stays open.
 pub const BREAKER_OPEN: Duration = Duration::from_secs(30);
 
+/// `upstream_calls_total{network, class, origin, endpoint}`: cascade calls
+/// made, by the request-context labels of design-v3 §14.2.
 pub const METRIC_CALLS: &str = "upstream_calls_total";
 pub const METRIC_AUTH_REFUSED: &str = "upstream_auth_refused_total";
 pub const METRIC_SKIPPED: &str = "upstream_skipped_total";
@@ -373,7 +375,9 @@ impl Cascade {
             };
             let (class, body) = classify(&result);
             admission.record(class, Instant::now());
-            metrics::counter!(METRIC_CALLS, "network" => name.clone(), "class" => class.label()).increment(1);
+            let (origin, endpoint) = req.labels();
+            metrics::counter!(METRIC_CALLS, "network" => name.clone(), "class" => class.label(), "origin" => origin, "endpoint" => endpoint)
+                .increment(1);
             if class == Class::AuthRefused {
                 metrics::counter!(METRIC_AUTH_REFUSED, "network" => name.clone()).increment(1);
             }
@@ -598,6 +602,23 @@ pub(crate) mod tests {
         assert!(cascade.fetch(&req, None, Call::Profile("x.test")).await.hit().is_some());
         assert_eq!(down_calls.load(Ordering::SeqCst), 5);
         assert_eq!(hit_calls.load(Ordering::SeqCst), 7);
+    }
+
+    /// B-53 (design-v3 §14.2): a cascade call carries its request's
+    /// `origin` and `endpoint`.
+    #[tokio::test]
+    async fn calls_are_counted_with_the_request_labels() {
+        use crate::test_support::series;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let (hit, _) = fake_appview(StatusCode::OK, json!({"did": "did:plc:x", "handle": "x.test"})).await;
+        let cascade = cascade_for(&[("bluesky", &hit)]);
+        let req = Requester::test().for_endpoint("app.bsky.actor.getProfile");
+        assert!(cascade.fetch(&req, Some("bluesky"), Call::Profile("x.test")).await.hit().is_some());
+        let labels = [r#"network="bluesky""#, r#"origin="request""#, r#"endpoint="app.bsky.actor.getProfile""#];
+        assert_eq!(series(&handle.render(), "upstream_calls_total", &labels), Some(1.0));
     }
 
     #[tokio::test]

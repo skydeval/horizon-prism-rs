@@ -640,7 +640,12 @@ mod tests {
             "INSERT INTO starter_pack_counts (pack_uri, joined_week_count, joined_all_time_count, all_time_source, refreshed_at) \
              VALUES ('{first}', 3, 40, 'local', now())"
         )).await;
-        let h = hydrator(p, ScopeSets::default());
+        // Alice is a member and Bob is in scope: their handles resolve
+        // locally (§11 G-9).
+        let mut members = ScopeSets::default();
+        members.members.insert(ALICE.into());
+        members.scope.insert(BOB.into());
+        let h = hydrator(p, members);
         let (anon, req) = (Viewer::anonymous(), Requester::test());
 
         let v = h.get_starter_pack(&anon, &req, &first).await.expect("db").expect("view");

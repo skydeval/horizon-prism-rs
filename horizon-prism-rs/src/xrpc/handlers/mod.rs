@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn a_sort_other_than_latest_falls_back_and_says_so() {
         let req = Requester::test();
-        let ok = || Ok(Ok(crate::hydration::Hydrator::emit(serde_json::json!({"followers": []}))));
+        let ok = || Ok(Ok(crate::hydration::testing::emitted(serde_json::json!({"followers": []}))));
         for (sort, header) in [(Some("top"), Some("latest")), (Some("bogus"), Some("latest")), (Some("latest"), None), (None, None)] {
             let response = respond_sorted(&req, sort, ok()).expect("served").into_response();
             assert_eq!(response.status(), StatusCode::OK, "{sort:?}");

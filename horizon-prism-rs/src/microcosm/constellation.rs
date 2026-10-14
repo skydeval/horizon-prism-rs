@@ -108,6 +108,10 @@ impl ConstellationClient {
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, ConstellationError> {
+        // No request handle reaches this client: the running request, if
+        // any, labels the call (design-v3 §14.2).
+        let (origin, endpoint) = crate::xrpc::pools::ambient_labels();
+        metrics::counter!(super::METRIC_REQUESTS, "service" => "constellation", "origin" => origin, "endpoint" => endpoint).increment(1);
         let options = RequestOptions::new(BodyCap::CONSTELLATION).timeout(TIMEOUT);
         match self.net.get_json::<T>(url, &options).await? {
             Ok(v) => Ok(v),
@@ -211,5 +215,39 @@ mod tests {
             })
         );
         assert_eq!(all.get("app.bsky.feed.repost", ".subject.uri"), None);
+    }
+
+    /// B-53 (design-v3 §14.2): a call made while serving a request is
+    /// counted with that request's method; any other is `background`.
+    #[tokio::test]
+    async fn requests_are_counted_by_origin_and_endpoint() {
+        use axum::routing::get;
+
+        use crate::test_support::{serve_fake, series};
+        use crate::xrpc::backstop::{self, Selected};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let router = axum::Router::new().route("/links/count/distinct-dids", get(|| async { axum::Json(serde_json::json!({"total": 3})) }));
+        let client = ConstellationClient::new(NetClient::loopback_for_tests(), &serve_fake(router).await);
+        let count = || client.distinct_dids("at://did:plc:x/app.bsky.feed.post/1", "app.bsky.feed.like", ".subject.uri");
+        // The count refresher: no request.
+        assert_eq!(count().await.expect("count"), 3);
+        // Serving `getPosts`.
+        let mut selected = Selected::by_ip("203.0.113.9".parse().expect("ip"));
+        selected.req = selected.req.for_endpoint("app.bsky.feed.getPosts");
+        backstop::scope(selected, async {
+            count().await.expect("count");
+            count().await.expect("count");
+        })
+        .await;
+        let text = handle.render();
+        let of = |origin: &str, endpoint: &str| {
+            let (origin, endpoint) = (format!(r#"origin="{origin}""#), format!(r#"endpoint="{endpoint}""#));
+            series(&text, "microcosm_requests_total", &[r#"service="constellation""#, &origin, &endpoint])
+        };
+        assert_eq!(of("background", ""), Some(1.0));
+        assert_eq!(of("request", "app.bsky.feed.getPosts"), Some(2.0));
     }
 }

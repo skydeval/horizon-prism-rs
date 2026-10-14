@@ -331,7 +331,9 @@ impl Hydrator {
         let mut ctx = self
             .profile_context(viewer, req, std::slice::from_ref(&did), Some(CountMode::Sync { started }))
             .await?;
-        if !ctx.rows.contains_key(&did) && !self.in_scope(&did).await {
+        // Local or cascade by scope and membership only, never by whether a
+        // row is stored (§11 G-9).
+        if !self.in_scope_or_member(&did).await {
             // Out-of-scope subject: the §8.3 cascade, then Slingshot.
             return Ok(match self.upstream().profile(req, &did).await {
                 Some(v) => Ok(Self::emit(self.normalized(viewer, req, v).await?.0)),
@@ -365,13 +367,14 @@ impl Hydrator {
         // Out-of-scope actors take `getProfile`'s path: the cascade, then
         // the Slingshot profile record (design-v3 §11 G-1). One that no
         // source resolves, or that there is no budget to fetch, is omitted.
+        // As for `getProfile`, by scope and membership only (§11 G-9).
         let mut outside: Vec<String> = Vec::new();
         for d in &dids {
-            if !ctx.rows.contains_key(d) && !self.in_scope(d).await {
+            if !self.in_scope_or_member(d).await {
                 outside.push(d.clone());
             }
         }
-        let fetched: Vec<(String, Option<Value>)> = futures::stream::iter(outside)
+        let fetched: Vec<(String, Option<Value>)> = futures::stream::iter(outside.clone())
             .map(|d| async move {
                 let view = self.upstream().profile(req, &d).await;
                 (d, view)
@@ -388,10 +391,10 @@ impl Hydrator {
         let profiles: Vec<Value> = dids
             .iter()
             .filter_map(|d| {
-                if ctx.rows.contains_key(d) {
-                    Some(ctx.view(d, ProfileKind::Detailed))
-                } else {
+                if outside.contains(d) {
                     remote.remove(d)
+                } else {
+                    ctx.rows.contains_key(d).then(|| ctx.view(d, ProfileKind::Detailed))
                 }
             })
             .collect();
@@ -799,6 +802,43 @@ mod tests {
         assert_eq!(profiles[1]["handle"], "alice.test");
         // Only the two visible out-of-scope actors were asked for.
         assert_eq!(up.calls.load(Ordering::SeqCst), 2);
+        db.drop_db().await;
+    }
+
+    /// design-v3 §11 G-9 (R3-96): the `actors` row of an account neither in
+    /// scope nor a member (a private owner, a private reply's author) is
+    /// never observable: its handle resolves through the network only, and
+    /// its profile comes from the cascade, as for an account with no row.
+    #[tokio::test]
+    async fn a_row_outside_scope_and_members_is_never_read() {
+        use std::sync::Arc;
+
+        use crate::hydration::testing::{FixedUpstream, hydrator_with};
+
+        let Some(db) = fresh_db("hydration_g9_rows").await else {
+            return;
+        };
+        let p = &db.pool;
+        let private_owner = "did:plc:pppppppppppppppppppppppp";
+        actor(p, private_owner, "owner.test", "Stored").await;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        let mut up = FixedUpstream::default();
+        up.profiles.insert(private_owner.into(), json!({"did": private_owner, "handle": "owner.test", "displayName": "Upstream", "viewer": {}, "labels": []}));
+        let up = Arc::new(up);
+        let h = hydrator_with(p, sets(), up.clone());
+        let req = Requester::test();
+        let anon = Viewer::anonymous();
+        // By handle: the stored row does not resolve it, and the network
+        // does not know it.
+        let e = h.get_profile(&anon, &req, "owner.test").await.expect("db").expect_err("unresolved");
+        assert_eq!(e.error, "InvalidRequest");
+        assert_eq!(up.take_modes(), [("resolve_handle owner.test".to_string(), false)]);
+        // By DID: the cascade's view, for one and for many.
+        let v = h.get_profile(&anon, &req, private_owner).await.expect("db").expect("view");
+        assert_eq!(v.inner()["displayName"], "Upstream");
+        let many = h.get_profiles(&anon, &req, &[private_owner.into(), ALICE.into()]).await.expect("db").expect("view");
+        assert_eq!(many.inner()["profiles"][0]["displayName"], "Upstream");
+        assert_eq!(many.inner()["profiles"][1]["handle"], "alice.test");
         db.drop_db().await;
     }
 

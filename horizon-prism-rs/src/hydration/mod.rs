@@ -29,6 +29,7 @@ pub mod normalize;
 pub mod notification_prefs;
 pub mod notifications;
 pub mod polls;
+pub mod private_context;
 pub mod relationships;
 pub mod repo;
 pub mod search;
@@ -52,6 +53,7 @@ use sqlx::PgPool;
 
 pub use cache::ReadCache;
 pub use emit::PublicEmit;
+pub use private_context::HydrationContext;
 pub use upstream::{NoUpstream, UpstreamSource};
 
 use crate::aggregations::ScopeState;
@@ -513,6 +515,13 @@ impl Hydrator {
             .bind(actor.to_ascii_lowercase())
             .fetch_optional(self.pool())
             .await?;
+        // Only the row of an account in scope or a member answers; any
+        // other is treated as absent, so a row kept for a private owner or
+        // the author of a private reply is never observable (§11 G-9).
+        let local = match local {
+            Some(did) if self.in_scope_or_member(&did).await => Some(did),
+            _ => None,
+        };
         if local.is_some() || !proto_blue::syntax::Handle::is_valid(actor) {
             return Ok(local);
         }
@@ -523,6 +532,15 @@ impl Hydrator {
     /// Whether a DID is an in-scope subject (§7.1).
     pub async fn in_scope(&self, did: &str) -> bool {
         self.scope().read_guard().await.in_scope(did)
+    }
+
+    /// Whether a DID's per-DID state (`actors`, `actor_counts`) may be read
+    /// on a public path: it is in `scope_dids` or a member (§11 G-9). Any
+    /// other DID's rows exist only because of private facts, and are
+    /// treated as absent.
+    pub async fn in_scope_or_member(&self, did: &str) -> bool {
+        let scope = self.scope().read_guard().await;
+        scope.in_scope(did) || scope.is_member(did)
     }
 
     /// Whether every public record of `did` is stored here: the
@@ -985,7 +1003,15 @@ impl Hydrator {
             .collect()
     }
 
-    pub(crate) fn emit<T>(value: T) -> PublicEmit<T> {
+    /// Seal a view built here as a public response (design-v3 §II-7.2).
+    /// Only `hydration` may call it (B-54, R3-76): a handler gets a
+    /// [`PublicEmit`] from a hydration builder, never by wrapping a value
+    /// itself.
+    ///
+    /// ```compile_fail
+    /// let _ = horizon_prism_rs::hydration::Hydrator::emit(serde_json::json!({}));
+    /// ```
+    pub(in crate::hydration) fn emit<T>(value: T) -> PublicEmit<T> {
         PublicEmit::new(value)
     }
 }
@@ -998,6 +1024,12 @@ pub(crate) mod testing {
     use crate::config::ScopePolicy;
 
     pub(crate) const LABELER: &str = "did:web:appview.example.com";
+
+    /// A public response body, for tests of what handlers do with one.
+    /// Hydration builds it, as in production; only tests see this door.
+    pub(crate) fn emitted<T>(value: T) -> PublicEmit<T> {
+        Hydrator::emit(value)
+    }
 
     /// An upstream answering from fixed maps, counting its calls.
     #[derive(Default)]

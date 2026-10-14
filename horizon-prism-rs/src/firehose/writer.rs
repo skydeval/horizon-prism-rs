@@ -981,8 +981,13 @@ impl Writer {
     /// §5.6).
     async fn notify(&self, conn: &mut PgConnection, u: &Upsert, sets: &ScopeSets, live: bool) -> Result<(), OpError> {
         let author = u.input.author.as_str();
+        // The thread a reply belongs to, for the recipients' thread mutes.
+        let root = match &u.body {
+            Body::Post(p) => p.reply_root.as_ref().map(|r| r.uri.as_str()),
+            _ => None,
+        };
         for n in notifications_for(author, &u.body, sets) {
-            insert_notification(conn, &n, author, &u.uri, &u.cid).await?;
+            insert_notification(conn, &n, author, &u.uri, &u.cid, root).await?;
         }
         // After the reasons above, which take precedence (§8.6).
         match &u.body {
@@ -1028,7 +1033,7 @@ impl Writer {
                         reason: "starterpack-joined",
                         reason_subject: Some(pack.uri.clone()),
                     };
-                    insert_notification(conn, &n, author, &u.uri, &u.cid).await?;
+                    insert_notification(conn, &n, author, &u.uri, &u.cid, None).await?;
                 }
             }
             _ => {}
@@ -1038,7 +1043,7 @@ impl Writer {
             && sets.in_scope(author)
             && Utc::now().signed_duration_since(p.created_at) <= self.subscribed_post_max_age
         {
-            insert_subscribed_post(conn, author, &u.uri, &u.cid, p.reply_parent.is_some(), p.created_at).await?;
+            insert_subscribed_post(conn, author, &u.uri, &u.cid, p.reply_parent.is_some(), p.created_at, root).await?;
         }
         Ok(())
     }
@@ -1458,22 +1463,35 @@ async fn upsert_feed_item(
     Ok(())
 }
 
+/// Whether recipient `$1` muted the thread of a notification whose record
+/// is `$2`, whose record's thread root is `$3` and whose subject is `$4`:
+/// the record or the subject is the muted root, or a post under it
+/// (design-v3 §5.3 `muteThread`; B-59). The same rule as the read-time
+/// exclusion in `hydration::notifications`.
+const THREAD_MUTED: &str = "EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
+       $2::text, $3::text, $4::text, (SELECT p.reply_root_uri FROM posts p WHERE p.uri = $4::text)))";
+
+/// Insert one notification, unless its recipient muted the thread it is in
+/// (`record_root`: the thread root a reply names). A muted thread writes
+/// nothing, so unmuting it brings back nothing (B-59).
 async fn insert_notification(
     conn: &mut PgConnection,
     n: &Notification,
     author: &str,
     record_uri: &str,
     record_cid: &str,
+    record_root: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query(&format!(
         "INSERT INTO notifications (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
-         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
-    )
+         SELECT $1, $5, $6, $4, $2, $7 WHERE NOT {THREAD_MUTED} ON CONFLICT DO NOTHING"
+    ))
     .bind(&n.recipient)
+    .bind(record_uri)
+    .bind(record_root)
+    .bind(n.reason_subject.as_deref())
     .bind(author)
     .bind(n.reason)
-    .bind(n.reason_subject.as_deref())
-    .bind(record_uri)
     .bind(record_cid)
     .execute(conn)
     .await?;
@@ -1529,6 +1547,7 @@ async fn insert_subscribed_post(
     record_cid: &str,
     reply: bool,
     created_at: DateTime<Utc>,
+    record_root: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO notifications (recipient_did, author_did, reason, record_uri, record_cid) \
@@ -1547,6 +1566,7 @@ async fn insert_subscribed_post(
            AND (d.allow <> 'mutuals' \
                 OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = s.subscriber_did)) \
            AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.recipient_did = s.subscriber_did AND n.record_uri = $2) \
+           AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = s.subscriber_did AND t.root_uri IN ($2, $6::text)) \
          ON CONFLICT DO NOTHING",
     )
     .bind(author)
@@ -1554,6 +1574,7 @@ async fn insert_subscribed_post(
     .bind(record_cid)
     .bind(reply)
     .bind(created_at)
+    .bind(record_root)
     .execute(conn)
     .await?;
     Ok(())
@@ -1976,6 +1997,68 @@ mod tests {
             w.apply(liker, &rev(5), &[profile("again", Action::Create)], OPTIONS).await.expect("apply");
             assert_eq!(joined().await, 1);
             db.drop_db().await;
+        }
+
+        /// B-59 (design-v3 §5.3): a reply in, and a like of a post in, a
+        /// thread the member muted writes no notification row, so unmuting
+        /// brings none back; a reply after the unmute notifies again.
+        #[tokio::test]
+        async fn a_muted_thread_writes_no_notification() {
+            let Some(db) = fresh_db("writer_thread_mute").await else {
+                return;
+            };
+            let p = &db.pool;
+            let other = "did:plc:cccccccccccccccccccccccc";
+            let mut sets = ScopeSets::default();
+            sets.scope.insert(AUTHOR.into());
+            sets.scope.insert(other.into());
+            sets.members.insert(AUTHOR.into());
+            let w = Writer::new(p.clone(), ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000), Arc::new(DisabledPrivateTier));
+            let op = |collection: &str, rkey: &str, record: Value| RawOp {
+                action: Action::Create,
+                collection: collection.into(),
+                rkey: rkey.into(),
+                cid: Some(format!("bafy{rkey}")),
+                record: Some(record),
+            };
+            let now = "2026-09-26T00:00:00Z";
+            let root = format!("at://{AUTHOR}/app.bsky.feed.post/3kroot");
+            let mine = format!("at://{AUTHOR}/app.bsky.feed.post/3kmine");
+            let strong = |uri: &str| json!({"uri": uri, "cid": "bafyx"});
+            let reply_to = |rkey: &str, parent: &str| {
+                op("app.bsky.feed.post", rkey, json!({"text": rkey, "createdAt": now, "reply": {"root": strong(&root), "parent": strong(parent)}}))
+            };
+            w.apply(AUTHOR, &rev(1), &[op("app.bsky.feed.post", "3kroot", json!({"text": "root", "createdAt": now}))], OPTIONS).await.expect("apply");
+            // The member's own reply under its root, then the mute.
+            w.apply(AUTHOR, &rev(2), &[reply_to("3kmine", &root)], OPTIONS).await.expect("apply");
+            exec_sql(p, &format!("INSERT INTO thread_mutes (viewer_did, root_uri) VALUES ('{AUTHOR}', '{root}')")).await;
+            // A reply to the root, a reply to the member's reply, a like of
+            // the member's reply and a like of the root.
+            let muted = [
+                reply_to("3kreply", &root),
+                reply_to("3kdeep", &mine),
+                op("app.bsky.feed.like", "3klike", json!({"subject": strong(&mine), "createdAt": now})),
+                op("app.bsky.feed.like", "3krootlike", json!({"subject": strong(&root), "createdAt": now})),
+            ];
+            w.apply(other, &rev(1), &muted, OPTIONS).await.expect("apply");
+            let rows = || async {
+                sqlx::query_scalar::<_, String>("SELECT record_uri FROM notifications WHERE recipient_did = $1 ORDER BY id")
+                    .bind(AUTHOR)
+                    .fetch_all(p)
+                    .await
+                    .expect("notifications")
+            };
+            assert_eq!(rows().await, Vec::<String>::new());
+            // Unmuted: nothing comes back, and a new reply notifies.
+            exec_sql(p, "DELETE FROM thread_mutes").await;
+            assert_eq!(rows().await, Vec::<String>::new());
+            w.apply(other, &rev(2), &[reply_to("3kafter", &root)], OPTIONS).await.expect("apply");
+            assert_eq!(rows().await, [format!("at://{other}/app.bsky.feed.post/3kafter")]);
+            db.drop_db().await;
+        }
+
+        async fn exec_sql(pool: &PgPool, sql: &str) {
+            sqlx::query(sql).execute(pool).await.expect("exec");
         }
 
         /// B-43: `subscribed-post` comes only from a live write of a fresh

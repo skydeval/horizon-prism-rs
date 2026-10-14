@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 
 use super::actor::ProfileKind;
 use super::search::{set_timeout, timed_out};
-use super::{Hydrator, ViewError, ViewResult, Viewer};
+use super::{Hydrator, PublicEmit, ViewError, ViewResult, Viewer};
 use crate::config::SuggestionsConfig;
 use crate::xrpc::pools::Requester;
 
@@ -404,10 +404,10 @@ impl Hydrator {
     /// settings. Email belongs to the PDS, so `checkEmailConfirmed` is a
     /// policy switch and not a fact about any account.
     #[must_use]
-    pub fn unspecced_config(&self) -> Value {
+    pub fn unspecced_config(&self) -> PublicEmit<Value> {
         let cfg = &self.inner.cfg.unspecced;
         let live: Vec<Value> = cfg.live_now.iter().map(|l| json!({"did": l.did, "domains": l.domains})).collect();
-        json!({ "checkEmailConfirmed": cfg.check_email_confirmed, "liveNow": live })
+        Self::emit(json!({ "checkEmailConfirmed": cfg.check_email_confirmed, "liveNow": live }))
     }
 }
 
@@ -511,7 +511,7 @@ mod tests {
         // The users tag, for the first accounts of the popular order.
         let tagged = h.tagged_suggestions().await.expect("db").expect("view").inner().clone();
         assert_eq!(tagged["suggestions"][0], json!({"tag": "suggested-users", "subjectType": "actor", "subject": c}));
-        assert_eq!(h.unspecced_config(), json!({"checkEmailConfirmed": false, "liveNow": []}));
+        assert_eq!(h.unspecced_config().inner(), &json!({"checkEmailConfirmed": false, "liveNow": []}));
 
         // Packs: of eligible creators, most joined this week first; never
         // the viewer's own, nor one whose creator the viewer mutes.

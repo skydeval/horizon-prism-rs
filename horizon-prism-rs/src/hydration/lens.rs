@@ -309,11 +309,17 @@ impl Hydrator {
     }
 
     /// Whether the author's account is locally known to be `active`.
+    /// "Locally known" needs the author in scope or a member: the row of any
+    /// other DID (a private owner, the author of a private reply) is
+    /// treated as absent (design-v3 §11 G-9, §II-10.4; R3-142).
     ///
     /// # Errors
     ///
     /// Database errors.
     pub async fn account_known_active(&self, did: &str) -> Result<bool, sqlx::Error> {
+        if !self.in_scope_or_member(did).await {
+            return Ok(false);
+        }
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM actors WHERE did = $1 AND account_status = 'active')")
             .bind(did)
             .fetch_one(self.pool())

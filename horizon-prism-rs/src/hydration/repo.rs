@@ -75,7 +75,13 @@ impl Hydrator {
             return Ok(None);
         }
         if collection == NSID_PROFILE {
-            // A profile whose CID is not known yet is not served.
+            // An `actors` row is per-DID state: served for an account in
+            // scope or a member only, so a row kept for a private owner or
+            // the author of a private reply is never seen (design-v3 §11
+            // G-9). A profile whose CID is not known yet is not served.
+            if !self.in_scope_or_member(did).await {
+                return Ok(None);
+            }
             return sqlx::query_as("SELECT profile_cid, profile_record FROM actors WHERE did = $1 AND profile_cid IS NOT NULL AND profile_record IS NOT NULL")
                 .bind(did)
                 .fetch_optional(self.pool())
@@ -183,6 +189,9 @@ mod tests {
         let v = get(ALICE, "app.bsky.actor.profile", "self", None).await.expect("profile");
         assert_eq!(v.inner()["cid"], "bafyprofile");
         assert_eq!(error(get(ALICE, "app.bsky.actor.profile", "other", None).await), "RecordNotFound");
+        // G-9: Bob's row is kept, but Bob is neither in scope nor a member.
+        exec(p, &format!("UPDATE actors SET profile_cid = 'bafyprofile' WHERE did = '{BOB}'")).await;
+        assert_eq!(error(get(BOB, "app.bsky.actor.profile", "self", None).await), "RecordNotFound");
 
         // A list is served only when its owner is a ready member.
         exec(p, &format!(

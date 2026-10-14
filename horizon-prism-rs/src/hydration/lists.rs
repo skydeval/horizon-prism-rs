@@ -171,7 +171,8 @@ impl Hydrator {
 
     /// A list by URI under the locally-servable rule: its row when the
     /// owner is a ready member, else its record from Slingshot. The flag
-    /// says which.
+    /// says which. Private-context hydration fetches nothing: a list that
+    /// is not locally servable has no view there (design-v4 §8.1).
     pub(super) async fn load_list(&self, req: &Requester, list: &str) -> Result<Option<(ListRow, bool)>, sqlx::Error> {
         if !is_list_uri(list) {
             return Ok(None);
@@ -182,6 +183,8 @@ impl Hydrator {
                 .bind(list)
                 .fetch_optional(self.pool())
                 .await?
+        } else if req.is_local_only() {
+            None
         } else {
             self.upstream().record(req, list).await.as_ref().and_then(ListRow::from_record)
         };
@@ -609,7 +612,12 @@ mod tests {
             "INSERT INTO list_optouts (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES \
              ('at://{CAROL}/app.bsky.graph.referencelistoptout/o1', '{CAROL}', 'o1', 'bafy', '3k', '{refs}', now())"
         )).await;
-        let h = hydrator(p, ScopeSets::default());
+        // Alice is a member and Bob is in scope: their handles resolve
+        // locally (§11 G-9).
+        let mut members = ScopeSets::default();
+        members.members.insert(ALICE.into());
+        members.scope.insert(BOB.into());
+        let h = hydrator(p, members);
         let (anon, req) = (Viewer::anonymous(), Requester::test());
 
         let v = h.get_list(&anon, &req, &mods, 50, None).await.expect("db").expect("view");

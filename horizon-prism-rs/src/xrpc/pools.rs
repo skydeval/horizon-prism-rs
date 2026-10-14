@@ -610,6 +610,28 @@ pub struct Requester {
     exhausted: Arc<Mutex<Option<Exhausted>>>,
     /// The viewer a viewer-private fetch is made for, if this is one.
     private_viewer: Option<Arc<str>>,
+    /// Private-context hydration (design-v4 §8.1): local rows only.
+    local_only: bool,
+    /// The XRPC method being served, for the `endpoint` label of outbound
+    /// call metrics (design-v3 §14.2).
+    endpoint: Option<Arc<str>>,
+}
+
+/// `origin` of an outbound call made while serving an XRPC request
+/// (design-v3 §14.2).
+pub const ORIGIN_REQUEST: &str = "request";
+/// `origin` of an outbound call made by background work: the count
+/// refresher, backfill, `list_sync` and other jobs.
+pub const ORIGIN_BACKGROUND: &str = "background";
+
+/// The `(origin, endpoint)` labels of an outbound call made with no request
+/// handle in hand (Constellation): the running request's, if the call is
+/// made while serving one, else `background` with an empty endpoint. The
+/// request context carries the label, so background work never moves a
+/// request-origin series.
+#[must_use]
+pub fn ambient_labels() -> (&'static str, String) {
+    super::backstop::selected().map_or_else(|| (ORIGIN_BACKGROUND, String::new()), |s| s.req.labels())
 }
 
 impl Requester {
@@ -621,7 +643,45 @@ impl Requester {
             deadline: Instant::now() + REQUEST_DEADLINE,
             exhausted: Arc::new(Mutex::new(None)),
             private_viewer: None,
+            local_only: false,
+            endpoint: None,
         }
+    }
+
+    /// This request, serving the XRPC method `endpoint`.
+    #[must_use]
+    pub fn for_endpoint(mut self, endpoint: &str) -> Self {
+        self.endpoint = Some(Arc::from(endpoint));
+        self
+    }
+
+    /// The `(origin, endpoint)` labels of an outbound call charged to this
+    /// request: a request handle exists only while serving a request.
+    #[must_use]
+    pub fn labels(&self) -> (&'static str, String) {
+        (ORIGIN_REQUEST, self.endpoint.as_deref().unwrap_or_default().to_string())
+    }
+
+    /// This request, for **private-context hydration** (design-v4 §8.1
+    /// "Private-context hydration", R3-179): the private handlers' view of
+    /// the public parts of a private view. It is viewer-private for
+    /// `viewer` (no shared cache is read or written, counts are read-only
+    /// and nothing is queued), and it is local only: no cascade, Slingshot
+    /// or Constellation call is made on its behalf. Only
+    /// `hydration::HydrationContext::Private` builds one.
+    #[must_use]
+    pub(crate) fn private_context(&self, viewer: &str) -> Self {
+        Self {
+            local_only: true,
+            ..self.viewer_private(viewer)
+        }
+    }
+
+    /// Whether this is private-context hydration
+    /// ([`Requester::private_context`]): local rows only.
+    #[must_use]
+    pub fn is_local_only(&self) -> bool {
+        self.local_only
     }
 
     /// This request, for an upstream fetch or hydration whose subject set

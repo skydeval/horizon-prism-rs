@@ -146,6 +146,77 @@ async fn covered_call_sites_fetch_viewer_private() {
     db.drop_db().await;
 }
 
+/// B-53 "Private-context hydration", B-54 (design-v4 §8.1; R3-113,
+/// R3-179): what the private handlers render through
+/// `HydrationContext::Private` comes from local rows only. A list behind
+/// `mutedByList`, or named by a stored parent's threadgate, that is not
+/// locally servable is left out rather than fetched, so no upstream, `rt`
+/// or `route` access follows from a private read.
+#[tokio::test]
+async fn private_context_hydration_fetches_nothing() {
+    use super::HydrationContext;
+    use super::actor::ProfileKind;
+
+    let Some(db) = fresh_db("hydration_private_context").await else {
+        return;
+    };
+    let p = &db.pool;
+    actor(p, ALICE, "alice.test", "Alice").await;
+    actor(p, BOB, "bob.test", "Bob").await;
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
+    let muted = format!("at://{OWNER}/app.bsky.graph.list/3kmuted");
+    let gate_list = format!("at://{OWNER}/app.bsky.graph.list/3kgate");
+    let mut up = FixedUpstream::default();
+    up.records.insert(muted.clone(), list_record(&muted, "Muted"));
+    up.records.insert(gate_list.clone(), list_record(&gate_list, "Gate"));
+    let up = Arc::new(up);
+    let h = hydrator_with(p, ScopeSets::default(), Arc::clone(&up) as Arc<dyn UpstreamSource>);
+    let me = Viewer { did: Some(ALICE.into()), hydrate: true };
+    let req = Requester::test();
+    // Alice's mute of L applies, and FAR is on L.
+    h.set_list_mute(&me, &req, &muted, true).await.expect("db").expect("muted");
+    exec(p, &format!("UPDATE list_references SET effective = true WHERE member_did = '{ALICE}' AND list_uri = '{muted}'")).await;
+    exec(p, &format!("INSERT INTO subscribed_lists (list_uri, owner_did, state, purpose) VALUES ('{muted}', '{OWNER}', 'active', '{PURPOSE_MOD}')")).await;
+    exec(
+        p,
+        &format!(
+            "INSERT INTO subscribed_list_items (uri, list_uri, owner_did, rkey, cid, rev, subject_did) VALUES \
+             ('at://{OWNER}/app.bsky.graph.listitem/3kf', '{muted}', '{OWNER}', '3kf', 'c', '3k', '{FAR}')"
+        ),
+    )
+    .await;
+    // A stored public post whose threadgate names G.
+    let gated = post(p, BOB, "3kgated", "gated", None, None).await;
+    sqlx::query(
+        "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, hidden_replies, record, created_at) \
+         VALUES ($1, $2, '3kgated', 'bafygate', '3k', $3, $4, $5, '{\"$type\": \"app.bsky.feed.threadgate\"}', now())",
+    )
+    .bind(format!("at://{BOB}/app.bsky.feed.threadgate/3kgated"))
+    .bind(BOB)
+    .bind(&gated)
+    .bind(json!([{"$type": "app.bsky.feed.threadgate#listRule", "list": gate_list}]))
+    .bind(Vec::<String>::new())
+    .execute(p)
+    .await
+    .expect("gate");
+    up.take_modes();
+
+    let ctx = HydrationContext::private(&h, me.clone(), &req);
+    let authors = ctx.profiles(&[FAR.to_string(), BOB.to_string()]).await.expect("db");
+    let far = authors.view(FAR, ProfileKind::Basic);
+    assert_eq!(far["viewer"]["muted"], json!(true), "the mute applies");
+    assert!(far["viewer"].get("mutedByList").is_none(), "the list is not fetched: {far}");
+    assert_eq!(authors.view(BOB, ProfileKind::Basic)["handle"], "bob.test");
+    let parent = ctx.public_post(&gated).await.expect("db").expect("stored");
+    assert_eq!(parent.inner()["threadgate"]["lists"], json!([]));
+    assert_eq!(up.take_modes(), Vec::<(String, bool)>::new(), "no upstream call");
+    // Viewer-private mode alone still fetches (from Slingshot, past the
+    // shared caches): private-context hydration is more than that.
+    h.profile_context(&me, &req.viewer_private(ALICE), &[FAR.to_string()], None).await.expect("db");
+    assert_eq!(up.take_modes(), [(format!("record {muted}"), true)]);
+    db.drop_db().await;
+}
+
 /// B-53 (R3-201), in-crate: a viewer-private count read uses stored rows
 /// but stores none and asks Constellation nothing, whatever mode the
 /// caller names; an ordinary one fetches and stores.

@@ -109,6 +109,8 @@ impl SlingshotClient {
             &[("repo", repo), ("collection", collection), ("rkey", rkey)],
         )
         .map_err(|e| SlingshotError::Invalid(e.to_string()))?;
+        let (origin, endpoint) = req.labels();
+        metrics::counter!(super::METRIC_REQUESTS, "service" => "slingshot", "origin" => origin, "endpoint" => endpoint).increment(1);
         let options = RequestOptions::new(BodyCap::GET_RECORD).timeout(TIMEOUT);
         let response = match self.net.get(url.as_str(), &options).await {
             Ok(r) => r,
@@ -192,6 +194,28 @@ mod tests {
         let unmetered = SlingshotClient::new(NetClient::loopback_for_tests(), &base);
         assert_eq!(unmetered.get_record(&late, &uri).await, Err(SlingshotError::NoBudget));
         assert!(!late.spent(), "a passed deadline is not an empty pool");
+    }
+
+    /// B-53 (design-v3 §14.2): every request is counted in
+    /// `microcosm_requests_total` with its request's labels; a call not
+    /// made (no budget) is not.
+    #[tokio::test]
+    async fn requests_are_counted_by_origin_and_endpoint() {
+        use crate::test_support::series;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let base = serve_fake(Router::new().route("/xrpc/com.atproto.repo.getRecord", get(fake))).await;
+        let client = SlingshotClient::new(NetClient::loopback_for_tests(), &base);
+        let uri = format!("at://{DID}/app.bsky.feed.post/hit");
+        let req = Requester::test().for_endpoint("app.bsky.graph.muteActorList");
+        client.get_record(&req, &uri).await.expect("hit");
+        client.get_record(&req, &format!("at://{DID}/app.bsky.feed.post/miss")).await.expect_err("miss");
+        let late = Requester::test().for_endpoint("app.bsky.graph.muteActorList").with_deadline(Instant::now());
+        assert_eq!(client.get_record(&late, &uri).await, Err(SlingshotError::NoBudget));
+        let labels = [r#"service="slingshot""#, r#"origin="request""#, r#"endpoint="app.bsky.graph.muteActorList""#];
+        assert_eq!(series(&handle.render(), "microcosm_requests_total", &labels), Some(2.0));
     }
 
     #[test]

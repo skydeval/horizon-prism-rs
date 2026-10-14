@@ -433,12 +433,13 @@ impl Hydrator {
     }
 
     /// One public `postView`, for a private thread's `publicParent`
-    /// (§7.2): local and not hidden, else `None`.
+    /// (§7.2): local and not hidden, else `None`. Reached only through
+    /// [`super::HydrationContext::Private`] (design-v4 §8.1).
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn public_post_view(&self, viewer: &Viewer, req: &Requester, uri: &str) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
+    pub(super) async fn public_post_view(&self, viewer: &Viewer, req: &Requester, uri: &str) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
         if is_private_uri(uri) {
             return Ok(None);
         }
@@ -1515,7 +1516,10 @@ mod tests {
                  ('at://{ALICE}/app.bsky.feed.like/{n}', '{ALICE}', '{subject}', 'bafy', '3k', now() + interval '{n} seconds')"
             )).await;
         }
-        let h = hydrator(p, ScopeSets::default());
+        // Alice is a member: her handle resolves locally (§11 G-9).
+        let mut members = ScopeSets::default();
+        members.members.insert(ALICE.into());
+        let h = hydrator(p, members);
         let me = Viewer {
             did: Some(ALICE.into()),
             hydrate: true,

@@ -45,6 +45,19 @@ pub async fn serve_fake(router: axum::Router) -> String {
     format!("http://{addr}")
 }
 
+/// In a Prometheus rendering, the value of the series `name` whose labels
+/// include every one of `labels` (each `key="value"`), if there is one.
+/// Read metrics with a recorder set by `metrics::set_default_local_recorder`
+/// in a `#[tokio::test]`, whose runtime runs on the test's thread.
+#[must_use]
+pub fn series(text: &str, name: &str, labels: &[&str]) -> Option<f64> {
+    text.lines()
+        .filter(|l| l.strip_prefix(name).is_some_and(|rest| rest.starts_with('{')))
+        .find(|l| labels.iter().all(|label| l.contains(label)))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+}
+
 /// A fresh database with no migrations applied (migration tests).
 pub async fn empty_db(test: &str) -> Option<TestDb> {
     let Ok(admin_url) = std::env::var(ENV) else {

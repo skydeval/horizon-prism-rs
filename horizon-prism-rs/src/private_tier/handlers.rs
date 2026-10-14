@@ -26,14 +26,13 @@ use super::pipeline::{self, PipelineEnv, RequestState};
 use super::schema;
 use crate::config::PrivateReadConfig;
 use crate::db::locks::uri_author;
-use crate::hydration::Viewer;
+use crate::hydration::HydrationContext;
 use crate::hydration::normalize::is_private_uri;
 use crate::hydration::actor::ProfileContext;
 use crate::kryphocron_glue::VerifiedCaller;
 use crate::xrpc::AppState;
 use crate::xrpc::auth::{Params, prepare_private, request_handle, request_ip};
 use crate::xrpc::errors::XrpcError;
-use crate::xrpc::pools::Requester;
 
 pub const GET_POSTS: &str = "app.nearhorizon.private.getPosts";
 pub const GET_POST_THREAD: &str = "app.nearhorizon.private.getPostThread";
@@ -120,8 +119,17 @@ async fn floor(endpoint: &'static str, start: Instant, target: Duration) {
     kryphocron::equalize_timing(start, target).await;
 }
 
+/// The private-context hydration of a request by `caller` (design-v4 §8.1
+/// "Private-context hydration"): the only way these handlers reach the
+/// `Hydrator`, so no shared cache, upstream or Farsight is touched.
+async fn private_hydration(s: &PrivateState, caller: &VerifiedCaller, ip: IpAddr) -> Result<HydrationContext, XrpcError> {
+    let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
+    let req = request_handle(viewer.state_did(), ip);
+    Ok(HydrationContext::private(&s.app.hydrator, viewer, &req))
+}
+
 /// Profiles for the owners of `uris` (public data, viewer-relative).
-async fn profiles(s: &PrivateState, viewer: &Viewer, req: &Requester, uris: &[String]) -> Result<ProfileContext, XrpcError> {
+async fn profiles(hydration: &HydrationContext, uris: &[String]) -> Result<ProfileContext, XrpcError> {
     let mut dids: Vec<String> = Vec::new();
     for u in uris {
         if let Some(a) = uri_author(u)
@@ -130,7 +138,7 @@ async fn profiles(s: &PrivateState, viewer: &Viewer, req: &Requester, uris: &[St
             dids.push(a.to_string());
         }
     }
-    Ok(s.app.hydrator.profile_context(viewer, req, &dids, None).await?)
+    Ok(hydration.profiles(&dids).await?)
 }
 
 /// Read `uris` in order with the configured concurrency; misses are `None`.
@@ -188,9 +196,8 @@ async fn posts_body(
     }
     let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted).await?.into_iter().collect();
     let candidates: Vec<String> = wanted.into_iter().filter(|u| passing.contains(u)).collect();
-    let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
-    let req = request_handle(viewer.state_did(), ip);
-    let authors = profiles(s, &viewer, &req, &candidates).await?;
+    let hydration = private_hydration(s, caller, ip).await?;
+    let authors = profiles(&hydration, &candidates).await?;
     let rs = RequestState::new(s.env.max_head_fetches);
     let posts = read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
     Ok(PrivateResponse::posts(posts))
@@ -244,10 +251,9 @@ async fn thread_body(
     start: Instant,
 ) -> Result<Option<PrivateResponse>, XrpcError> {
     let rs = RequestState::new(s.env.max_head_fetches);
-    let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
-    let req = request_handle(viewer.state_did(), ip);
+    let hydration = private_hydration(s, caller, ip).await?;
     let anchor_uri = vec![uri.to_string()];
-    let authors = profiles(s, &viewer, &req, &anchor_uri).await?;
+    let authors = profiles(&hydration, &anchor_uri).await?;
     let Ok(anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
         return Ok(None);
     };
@@ -262,7 +268,7 @@ async fn thread_body(
             break;
         }
         if is_private_uri(&parent) {
-            let authors = profiles(s, &viewer, &req, std::slice::from_ref(&parent)).await?;
+            let authors = profiles(&hydration, std::slice::from_ref(&parent)).await?;
             let Ok(p) = pipeline::read(&s.env, &rs, caller, &parent, &authors, start).await else {
                 break;
             };
@@ -270,7 +276,7 @@ async fn thread_body(
             next = view_parent(&p);
             chain.push(p);
         } else {
-            if let Some(post) = s.app.hydrator.public_post_view(&viewer, &req, &parent).await? {
+            if let Some(post) = hydration.public_post(&parent).await? {
                 budget -= 1;
                 public_top = Some(post);
             }
@@ -300,7 +306,7 @@ async fn thread_body(
             }
         }
         let uris: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
-        let authors = profiles(s, &viewer, &req, &uris).await?;
+        let authors = profiles(&hydration, &uris).await?;
         let results = read_many(s, &rs, caller, &uris, &authors, start).await;
         level = Vec::new();
         for ((parent, child), hit) in batch.into_iter().zip(results) {
@@ -437,8 +443,7 @@ async fn feed_body(
     let max_binds = limit * 4;
     // One lookahead row tells whether prefiltered candidates remain.
     let wanted = i64::try_from(max_binds + 1).unwrap_or(i64::MAX);
-    let viewer = s.app.hydrator.viewer(Some(&caller.did)).await?;
-    let req = request_handle(viewer.state_did(), ip);
+    let hydration = private_hydration(s, caller, ip).await?;
     // One state for the whole request: the head-fetch budget is per
     // request, not per window.
     let rs = RequestState::new(s.env.max_head_fetches);
@@ -455,7 +460,7 @@ async fn feed_body(
         let beyond = candidates.len() > max_binds;
         candidates.truncate(max_binds);
         let uris: Vec<String> = candidates.iter().map(|(u, _, _)| u.clone()).collect();
-        let authors = profiles(s, &viewer, &req, &uris).await?;
+        let authors = profiles(&hydration, &uris).await?;
         let mut full_at: Option<usize> = None;
         let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
         let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();

@@ -341,11 +341,22 @@ impl Hydrator {
                 let mut cursor: Option<String> = None;
                 let mut truncated = false;
                 for page in 0..pages {
-                    if self.draw_constellation(req).is_err() {
+                    // The deadline cuts the scan between pages and inside
+                    // one: what was found so far is the answer (B-55).
+                    if deadline.is_some_and(|d| Instant::now() >= d) || self.draw_constellation(req).is_err() {
                         truncated = true;
                         break;
                     }
-                    let Ok(found) = client.distinct_dids_page(subject, NSID_FOLLOW, ".subject", KNOWN_FOLLOWERS_PAGE, cursor.as_deref()).await else {
+                    let call = client.distinct_dids_page(subject, NSID_FOLLOW, ".subject", KNOWN_FOLLOWERS_PAGE, cursor.as_deref());
+                    let answer = match deadline {
+                        Some(d) => tokio::time::timeout_at(d.into(), call).await.ok(),
+                        None => Some(call.await),
+                    };
+                    let Some(answer) = answer else {
+                        truncated = true;
+                        break;
+                    };
+                    let Ok(found) = answer else {
                         break;
                     };
                     remote.extend(found.linking_dids.into_iter().filter(|d| mine.contains(d)));
@@ -445,9 +456,13 @@ impl Hydrator {
         let all = match snapshot {
             Some(all) => all,
             None => {
+                // At most `known_followers.scan_max_pages` pages, within the
+                // request's deadline (design-v3 §5.3, §II-8.3): a scan the
+                // deadline cuts gives the followers found so far, paged as
+                // usual, and counts as truncated.
                 let pages = self.inner.cfg.known_followers_scan_max_pages;
                 let all = self
-                    .known_followers_of(viewer, req, &me, std::slice::from_ref(&did), pages, None)
+                    .known_followers_of(viewer, req, &me, std::slice::from_ref(&did), pages, Some(req.deadline()))
                     .await?
                     .remove(&did)
                     .unwrap_or_default();
@@ -577,7 +592,10 @@ mod tests {
             )).await;
         }
         exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{erin}/app.bsky.graph.block/1', '{erin}', '{ALICE}', '3k', now())")).await;
-        let h = hydrator(p, ScopeSets::default());
+        // Dave is in scope: his handle resolves locally (§11 G-9).
+        let mut sets = ScopeSets::default();
+        sets.scope.insert(dave.into());
+        let h = hydrator(p, sets);
         let me = Viewer {
             did: Some(ALICE.into()),
             hydrate: true,
@@ -596,6 +614,60 @@ mod tests {
         assert!(second.inner().get("cursor").is_none());
         // Only a ready member has follows to compare.
         assert!(h.get_known_followers(&Viewer::anonymous(), &req, dave, 50, None).await.expect("db").is_err());
+        db.drop_db().await;
+    }
+
+    /// B-55 (design-v3 §5.3, §II-8.3): the Constellation scan ends at the
+    /// request's deadline, also inside a slow page, and the followers found
+    /// before it are the answer.
+    #[tokio::test]
+    async fn the_known_followers_scan_ends_at_the_request_deadline() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use axum::extract::Query;
+        use axum::routing::get;
+
+        use crate::hydration::testing::{FixedUpstream, hydrator_full};
+
+        let Some(db) = fresh_db("hydration_known_followers_deadline").await else {
+            return;
+        };
+        let p = &db.pool;
+        let carol = "did:plc:cccccccccccccccccccccccc";
+        for (d, h) in [(ALICE, "alice.test"), (BOB, "bob.test"), (carol, "carol.test")] {
+            actor(p, d, h, h).await;
+        }
+        // Alice follows Carol, whom only Constellation knows as Bob's
+        // follower, on the first page. Every later page takes a minute.
+        exec(p, &format!(
+            "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ALICE}/app.bsky.graph.follow/1', '{ALICE}', '{carol}', '3k', now())"
+        )).await;
+        let router = axum::Router::new().route(
+            "/links/distinct-dids",
+            get(move |Query(q): Query<HashMap<String, String>>| async move {
+                let page: u32 = q.get("cursor").and_then(|c| c.parse().ok()).unwrap_or(0);
+                if page > 0 {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                axum::Json(json!({"total": 999, "linking_dids": [if page == 0 { carol } else { "did:plc:xxxxxxxxxxxxxxxxxxxxxxxx" }], "cursor": (page + 1).to_string()}))
+            }),
+        );
+        let base = crate::test_support::serve_fake(router).await;
+        let h = hydrator_full(p, ScopeSets::default(), Arc::new(FixedUpstream::default()), Some(&base));
+        let me = Viewer {
+            did: Some(ALICE.into()),
+            hydrate: true,
+        };
+        let req = Requester::test().with_deadline(Instant::now() + Duration::from_millis(500));
+        let started = Instant::now();
+        let v = tokio::time::timeout(Duration::from_secs(10), h.get_known_followers(&me, &req, BOB, 50, None))
+            .await
+            .expect("the scan ends at the deadline")
+            .expect("db")
+            .expect("view");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(v.inner()["followers"][0]["did"], carol);
         db.drop_db().await;
     }
 
