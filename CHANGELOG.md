@@ -1515,6 +1515,13 @@ commit.
 
 ### Fixed
 
+- **`getPosts` served a deleted post from upstream (#676).** A post not
+  stored here is fetched from upstream, and those copies are cached. A
+  post whose delete this AppView had already seen was fetched all the
+  same, so it stayed visible for as long as the upstream copy or the
+  cache lasted (over 90 s in a Phase B check). A post with a local
+  tombstone is no longer fetched.
+
 - **`sort=top` said nothing about being served as `latest` (#676,
   Phase B B-31 / B-51).** `getFollows`, `getFollowers` and `getQuotes`
   read every source in `latest` order, and locked decision 30 has a

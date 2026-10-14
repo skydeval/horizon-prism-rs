@@ -486,9 +486,19 @@ impl Hydrator {
         if !missing.is_empty() {
             // §8.3 step 0: the moderation gate before any upstream source.
             let gates = moderation::gate_many(self.pool(), &missing).await?;
+            // A post this AppView saw deleted is not fetched from upstream,
+            // whose copies (and the read-time cache of them) can outlive the
+            // delete.
+            let deleted: HashSet<String> =
+                sqlx::query_scalar("SELECT uri FROM record_tombstones WHERE uri = ANY($1)")
+                    .bind(&missing)
+                    .fetch_all(self.pool())
+                    .await?
+                    .into_iter()
+                    .collect();
             let allowed: Vec<String> = missing
                 .into_iter()
-                .filter(|u| !gates.get(u).copied().unwrap_or(Gate::Visible).is_hidden())
+                .filter(|u| !gates.get(u).copied().unwrap_or(Gate::Visible).is_hidden() && !deleted.contains(u))
                 .collect();
             let upstream = Value::Array(self.upstream().posts(req, &allowed).await);
             if let Value::Array(views) = self.normalized(viewer, upstream).await?.0 {
@@ -1618,6 +1628,39 @@ mod tests {
         assert_eq!(uris("posts_with_media").await, [images, with_gallery, quote_gallery]);
         assert_eq!(uris("posts_with_video").await, [video]);
         assert_eq!(uris("posts_with_replies").await.len(), 5);
+        db.drop_db().await;
+    }
+
+    /// A post this AppView saw deleted is not fetched from upstream, whose
+    /// copy can outlive the delete (Phase B, 2026-10-14); one it holds no
+    /// tombstone for still is.
+    #[tokio::test]
+    async fn get_posts_does_not_fetch_a_deleted_post_upstream() {
+        let Some(db) = fresh_db("hydration_get_posts_tombstoned").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        let deleted = format!("at://{ALICE}/{NSID_POST}/3kdeleted222");
+        let elsewhere = format!("at://{ALICE}/{NSID_POST}/3kelsewhere2");
+        let view = |uri: &str| {
+            json!({"$type": "app.bsky.feed.defs#postView", "uri": uri, "cid": "bafyup",
+                "author": {"did": ALICE, "handle": "alice.test", "viewer": {}, "labels": []},
+                "record": {"$type": NSID_POST, "text": "upstream copy", "createdAt": "2026-10-14T00:00:00Z"},
+                "indexedAt": "2026-10-14T00:00:00Z", "viewer": {}, "labels": []})
+        };
+        let mut up = crate::hydration::testing::FixedUpstream::default();
+        up.posts.insert(deleted.clone(), view(&deleted));
+        up.posts.insert(elsewhere.clone(), view(&elsewhere));
+        exec(p, &format!("INSERT INTO record_tombstones (uri, rev) VALUES ('{deleted}', '3kaaaaaaaaaa9')")).await;
+        let h = crate::hydration::testing::hydrator_with(p, sets(), std::sync::Arc::new(up));
+        let v = h
+            .get_posts(&Viewer::anonymous(), &Requester::test(), &[deleted.clone(), elsewhere.clone()])
+            .await
+            .expect("db")
+            .expect("view");
+        let uris: Vec<&str> = v.inner()["posts"].as_array().expect("posts").iter().filter_map(|x| x["uri"].as_str()).collect();
+        assert_eq!(uris, [elsewhere.as_str()]);
         db.drop_db().await;
     }
 
