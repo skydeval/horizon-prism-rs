@@ -39,6 +39,14 @@ commit.
   - **Removing a member under the off rule** also removes the rows kept
     only because it was a member.
 
+- **Backfill claim order (#708, part 2).** Worker 0 claims the earliest
+  due job of any depth, as before, and no longer runs list syncs when
+  there are two or more workers. Workers 1 and up claim due `member`,
+  `private` and `authz` jobs before `scope` and `resync` jobs. New
+  members and gap recovery no longer wait behind resync waves, and worker
+  0 keeps resyncs moving. Both claims are served by the partial indexes
+  of migration 0022. Metric `backfill_claims_total{order, depth}`.
+
 - **Thread Lens for every signed-in account (#685).**
   Thread Lens (`app.nearhorizon.threadLens.getThread` and `.resolve`)
   was for ready members only. Now any signed-in account may call it,

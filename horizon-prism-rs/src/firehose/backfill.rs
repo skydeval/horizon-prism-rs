@@ -79,6 +79,60 @@ pub const METRIC_JOBS: &str = "backfill_jobs";
 pub const METRIC_MEMBERS_NOT_READY: &str = "members_not_ready_total";
 /// An authorization record failed every deterministic attempt (§5.10).
 pub const METRIC_AUTHZ_STUCK: &str = "authz_backfill_stuck_total";
+/// `backfill_claims_total{order, depth}`: jobs claimed, by claim order.
+pub const METRIC_CLAIMS: &str = "backfill_claims_total";
+
+/// The order a worker claims due jobs in (public-indexing §8.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOrder {
+    /// The earliest `not_before` of any depth (worker 0).
+    Plain,
+    /// Due `member`, `private` and `authz` jobs first, each part by
+    /// `not_before` (workers 1 and up).
+    Priority,
+}
+
+impl ClaimOrder {
+    #[must_use]
+    pub fn for_worker(worker: u32) -> Self {
+        if worker == 0 { Self::Plain } else { Self::Priority }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Priority => "priority",
+        }
+    }
+
+    /// The row select, served by `backfill_jobs_claim_plain` or
+    /// `backfill_jobs_claim_priority` (migration 0022).
+    fn select(self) -> &'static str {
+        match self {
+            Self::Plain => {
+                "SELECT did, depth FROM backfill_jobs \
+                 WHERE state = 'queued' AND depth <> 'list_sync' AND not_before <= now() \
+                 ORDER BY not_before LIMIT 1 FOR UPDATE SKIP LOCKED"
+            }
+            Self::Priority => {
+                "SELECT did, depth FROM backfill_jobs \
+                 WHERE state = 'queued' AND depth <> 'list_sync' AND not_before <= now() \
+                 ORDER BY (depth IN ('member', 'private', 'authz')) DESC, not_before \
+                 LIMIT 1 FOR UPDATE SKIP LOCKED"
+            }
+        }
+    }
+}
+
+/// What one pass of a worker's loop did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    ListSync,
+    Job,
+    /// Nothing due, or the claim failed.
+    Idle,
+}
 
 /// Retry delay after the `attempt`-th consecutive failure (1-based).
 #[must_use]
@@ -746,34 +800,54 @@ impl Backfill {
 
     async fn worker_loop(self, worker: u32) {
         loop {
-            // A list sync first, when a lane has a free permit and a due
-            // row; the lanes are smaller than the worker pool, so ordinary
-            // work always keeps workers.
-            if let Some(list_sync) = &self.list_sync {
-                match list_sync.run_once().await {
-                    Ok(Some(_)) => continue,
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(event = "list_sync_claim_failed", worker, %error, "claiming a list sync failed"),
-                }
-            }
-            match self.run_once().await {
-                Ok(Some(_)) => {}
-                Ok(None) => tokio::time::sleep(IDLE_POLL).await,
-                Err(error) => {
-                    tracing::warn!(event = "backfill_claim_failed", worker, %error, "claiming a backfill job failed");
-                    tokio::time::sleep(IDLE_POLL).await;
-                }
+            if self.worker_turn(worker).await == Turn::Idle {
+                tokio::time::sleep(IDLE_POLL).await;
             }
         }
     }
 
-    /// Claim and run one due job, if any.
+    /// One pass of worker `worker`'s loop.
+    async fn worker_turn(&self, worker: u32) -> Turn {
+        // A list sync first, when a lane has a free permit and a due row;
+        // the lanes are smaller than the worker pool, so ordinary work
+        // always keeps workers. With two or more workers, worker 0 never
+        // serves the lanes, so a long list sync cannot hold it
+        // (public-indexing §8.4).
+        if let Some(list_sync) = self.list_sync.as_ref().filter(|_| worker != 0 || self.settings.concurrency < 2) {
+            match list_sync.run_once().await {
+                Ok(Some(_)) => return Turn::ListSync,
+                Ok(None) => {}
+                Err(error) => tracing::warn!(event = "list_sync_claim_failed", worker, %error, "claiming a list sync failed"),
+            }
+        }
+        match self.run_once_as(worker).await {
+            Ok(Some(_)) => Turn::Job,
+            Ok(None) => Turn::Idle,
+            Err(error) => {
+                tracing::warn!(event = "backfill_claim_failed", worker, %error, "claiming a backfill job failed");
+                Turn::Idle
+            }
+        }
+    }
+
+    /// Claim and run one due job, if any, as worker 0.
     ///
     /// # Errors
     ///
     /// Claiming or settling failed (database).
     pub async fn run_once(&self) -> Result<Option<(Job, JobOutcome)>, sqlx::Error> {
-        let Some(job) = self.claim().await? else {
+        self.run_once_as(0).await
+    }
+
+    /// Claim and run one due job, if any, as worker `worker`: worker 0
+    /// claims in plain order, every other worker in priority order
+    /// (public-indexing §8.4).
+    ///
+    /// # Errors
+    ///
+    /// Claiming or settling failed (database).
+    pub async fn run_once_as(&self, worker: u32) -> Result<Option<(Job, JobOutcome)>, sqlx::Error> {
+        let Some(job) = self.claim(ClaimOrder::for_worker(worker)).await? else {
             return Ok(None);
         };
         let outcome = match self.run(&job).await {
@@ -788,20 +862,23 @@ impl Backfill {
         Ok(Some((job, outcome)))
     }
 
-    /// Claim the next due job, recording the current gap epoch (§6.11.2).
-    async fn claim(&self) -> Result<Option<Job>, sqlx::Error> {
-        let row: Option<(String, String, i32)> = sqlx::query_as(
-            "WITH next AS ( \
-               SELECT did, depth FROM backfill_jobs WHERE state = 'queued' AND depth <> 'list_sync' AND not_before <= now() \
-               ORDER BY not_before LIMIT 1 FOR UPDATE SKIP LOCKED) \
+    /// Claim the next due job in `order`, recording the current gap epoch
+    /// (§6.11.2).
+    async fn claim(&self, order: ClaimOrder) -> Result<Option<Job>, sqlx::Error> {
+        let row: Option<(String, String, i32)> = sqlx::query_as(&format!(
+            "WITH next AS ({}) \
              UPDATE backfill_jobs j SET state = 'running', updated_at = now(), \
-               gap_epoch = COALESCE((SELECT (value #>> '{}')::bigint FROM worker_state WHERE key = $1), 0) \
+               gap_epoch = COALESCE((SELECT (value #>> '{{}}')::bigint FROM worker_state WHERE key = $1), 0) \
              FROM next WHERE j.did = next.did AND j.depth = next.depth \
              RETURNING j.did, j.depth, j.attempts",
-        )
+            order.select()
+        ))
         .bind(gap::KEY_GAP_EPOCH)
         .fetch_optional(&self.pool)
         .await?;
+        if let Some((_, depth, _)) = &row {
+            metrics::counter!(METRIC_CLAIMS, "order" => order.as_str(), "depth" => depth.clone()).increment(1);
+        }
         Ok(row.and_then(|(did, depth, attempts)| {
             Depth::parse(&depth).map(|depth| Job {
                 did,
@@ -1879,7 +1956,7 @@ mod tests {
         let mut conn = db.pool.acquire().await.expect("conn");
         jobs::enqueue(&mut conn, DID, Depth::Member).await.expect("enqueue");
         drop(conn);
-        let job = backfill.claim().await.expect("claim").expect("job");
+        let job = backfill.claim(ClaimOrder::Plain).await.expect("claim").expect("job");
         let result = backfill.run(&job).await.expect("run").expect("not superseded");
         sqlx::query("INSERT INTO worker_state (key, value) VALUES ('gap_epoch', '7'::jsonb)")
             .execute(&db.pool)
@@ -2019,6 +2096,223 @@ mod tests {
             assert_eq!(state, if attempt == MAX_ATTEMPTS { "failed" } else { "queued" });
         }
         drop(conn);
+        db.drop_db().await;
+    }
+
+    /// A PDS that never answers: every job that reaches it fails, so a
+    /// claimed job leaves the due set.
+    struct Unreachable;
+
+    #[async_trait]
+    impl BackfillSource for Unreachable {
+        async fn prepare(&self, _did: &str) -> Result<String, PrepareError> {
+            Err(PrepareError::Failed("pds down".to_string()))
+        }
+        async fn latest_rev(&self, _: &str, _: &str) -> Result<String, String> {
+            unreachable!()
+        }
+        async fn list_records(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<ListPage, String> {
+            unreachable!()
+        }
+        async fn get_record(&self, _: &str, _: &str, _: &str, _: &str) -> Result<Option<ListedRecord>, String> {
+            unreachable!()
+        }
+        async fn inbound_blocks(&self, _: &str, _: Option<&str>) -> Result<LinksPage, String> {
+            unreachable!()
+        }
+    }
+
+    const MEMBER_JOB: &str = "did:plc:readymember";
+    const AUTHZ_JOB: &str = "did:plc:readyauthz";
+    const PRIVATE_JOB: &str = "did:plc:readyprivate";
+
+    /// The T-23 seed: 600 due resyncs (`did:plc:r0000` oldest), 300 `authz`
+    /// jobs over the next 24 h, one due `member`, `authz` and `private`
+    /// job each younger than every resync, and 100 old `done` rows; then
+    /// `ANALYZE`.
+    async fn seed_claims(pool: &PgPool) {
+        for sql in [
+            "INSERT INTO backfill_jobs (did, depth, state, not_before) \
+             SELECT 'did:plc:r' || lpad(i::text, 4, '0'), 'resync', 'queued', now() - interval '2 hours' + i * interval '1 second' \
+             FROM generate_series(0, 599) AS i",
+            "INSERT INTO backfill_jobs (did, depth, state, not_before) \
+             SELECT 'did:plc:f' || lpad(i::text, 4, '0'), 'authz', 'queued', now() + i * interval '288 seconds' \
+             FROM generate_series(1, 300) AS i",
+            "INSERT INTO backfill_jobs (did, depth, state, not_before) VALUES \
+             ('did:plc:readymember', 'member', 'queued', now() - interval '30 minutes'), \
+             ('did:plc:readyauthz', 'authz', 'queued', now() - interval '20 minutes'), \
+             ('did:plc:readyprivate', 'private', 'queued', now() - interval '10 minutes')",
+            "INSERT INTO backfill_jobs (did, depth, state, not_before) \
+             SELECT 'did:plc:d' || lpad(i::text, 4, '0'), 'scope', 'done', now() - interval '3 hours' \
+             FROM generate_series(0, 99) AS i",
+            "ANALYZE backfill_jobs",
+        ] {
+            sqlx::query(sql).execute(pool).await.expect(sql);
+        }
+    }
+
+    fn claim_backfill(pool: &PgPool, concurrency: u32) -> Backfill {
+        let writer = Writer::new(pool.clone(), state(false), Arc::new(DisabledPrivateTier));
+        let settings = BackfillConfig { concurrency, ..BackfillConfig::default() };
+        Backfill::new(writer, Arc::new(Unreachable), settings, 5)
+    }
+
+    async fn claimed(backfill: &Backfill, order: ClaimOrder) -> (String, Depth) {
+        let job = backfill.claim(order).await.expect("claim").expect("a due job");
+        (job.did, job.depth)
+    }
+
+    /// public-indexing T-23: the two claim orders, starvation, and the
+    /// plans.
+    #[tokio::test]
+    async fn claims_take_readiness_first_on_workers_one_and_up_and_the_oldest_on_worker_zero() {
+        let Some(db) = fresh_db("backfill_claim_order").await else {
+            return;
+        };
+        let p = &db.pool;
+        seed_claims(p).await;
+        // A due list sync, older than everything: no claim takes it.
+        sqlx::query("INSERT INTO backfill_jobs (did, depth, state, not_before) VALUES ('did:plc:owner', 'list_sync', 'queued', now() - interval '4 hours')")
+            .execute(p)
+            .await
+            .expect("list sync");
+
+        // Each order's select is served by its index.
+        for (order, index) in [(ClaimOrder::Plain, "backfill_jobs_claim_plain"), (ClaimOrder::Priority, "backfill_jobs_claim_priority")] {
+            let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {}", order.select())).fetch_all(p).await.expect("explain");
+            let plan = plan.join("\n");
+            assert!(plan.contains(index), "{order:?} plan:\n{plan}");
+        }
+
+        let backfill = claim_backfill(p, 4);
+        // Worker 0: the oldest due resync.
+        assert_eq!(claimed(&backfill, ClaimOrder::for_worker(0)).await, ("did:plc:r0000".to_string(), Depth::Resync));
+        // Workers 1 and up: the three due readiness jobs in `not_before`
+        // order, then resyncs, never a future `authz`.
+        let worker1 = ClaimOrder::for_worker(1);
+        assert_eq!(worker1, ClaimOrder::Priority);
+        assert_eq!(claimed(&backfill, worker1).await, (MEMBER_JOB.to_string(), Depth::Member));
+        assert_eq!(claimed(&backfill, worker1).await, (AUTHZ_JOB.to_string(), Depth::Authz));
+        assert_eq!(claimed(&backfill, worker1).await, (PRIVATE_JOB.to_string(), Depth::Private));
+        for i in 1..=5 {
+            assert_eq!(claimed(&backfill, worker1).await, (format!("did:plc:r{i:04}"), Depth::Resync));
+        }
+
+        // Starvation: four readiness jobs are queued again at `now()`
+        // before every claim, as `reconcile_incomplete` does. Workers 1–3
+        // take them; worker 0 still takes the oldest due resync.
+        let requeue = "UPDATE backfill_jobs SET state = 'queued', not_before = now() \
+                       WHERE did IN (SELECT did FROM backfill_jobs WHERE depth = 'authz' AND did LIKE 'did:plc:f%' ORDER BY did LIMIT 4) \
+                         AND depth = 'authz'";
+        for worker in 1..=3 {
+            sqlx::query(requeue).execute(p).await.expect("requeue");
+            let (did, depth) = claimed(&backfill, ClaimOrder::for_worker(worker)).await;
+            assert_eq!(depth, Depth::Authz, "worker {worker} took {did}");
+        }
+        sqlx::query(requeue).execute(p).await.expect("requeue");
+        assert_eq!(claimed(&backfill, ClaimOrder::for_worker(0)).await, ("did:plc:r0006".to_string(), Depth::Resync));
+
+        // The list sync was never claimed, nor any `done` row.
+        let left: (String, i64) = sqlx::query_as(
+            "SELECT (SELECT state FROM backfill_jobs WHERE depth = 'list_sync'), \
+                    (SELECT count(*) FROM backfill_jobs WHERE state <> 'done' AND did LIKE 'did:plc:d%')",
+        )
+        .fetch_one(p)
+        .await
+        .expect("left");
+        assert_eq!(left, ("queued".to_string(), 0));
+        db.drop_db().await;
+    }
+
+    /// public-indexing T-23: with 4 workers worker 0 never serves the
+    /// lanes and worker 1 does; one worker serves them and claims in plain
+    /// order; `run_once()` is `run_once_as(0)`.
+    #[tokio::test]
+    async fn worker_zero_skips_the_lanes_unless_it_is_the_only_worker() {
+        use crate::subscriptions::applier::Applier;
+        use crate::subscriptions::fetch::{Bounds, OwnerRecords};
+        use crate::subscriptions::list_phase;
+        use crate::subscriptions::references::{Budget, mute_list};
+        use crate::subscriptions::run::{OwnerSource, OwnerStatus, Settings};
+        use crate::subscriptions::runner::Lanes;
+
+        /// An owner whose identity was deleted: the run needs no listing.
+        struct Tombstoned;
+
+        #[async_trait]
+        impl OwnerSource for Tombstoned {
+            async fn status(&self, _owner: &str) -> Result<OwnerStatus, String> {
+                Ok(OwnerStatus::Tombstoned)
+            }
+            async fn records(&self, _owner: &str, _generation: i64) -> Result<Box<dyn OwnerRecords>, String> {
+                Err("not listed".to_string())
+            }
+        }
+
+        let Some(db) = fresh_db("backfill_claim_lanes").await else {
+            return;
+        };
+        let p = &db.pool;
+        seed_claims(p).await;
+        // Two owners' list syncs, both due.
+        let member = "did:plc:mmmmmmmmmmmmmmmmmmmmmmm1";
+        for owner in ["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"] {
+            let list = format!("at://{owner}/app.bsky.graph.list/3klist1");
+            mute_list(p, member, &list, Budget { max_references: 5, max_owners: 5 }).await.expect("mute");
+            list_phase::apply(p, &list, 600).await.expect("apply");
+        }
+        let list_syncs_queued = || async move {
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM backfill_jobs WHERE depth = 'list_sync' AND state = 'queued' AND not_before <= now()")
+                .fetch_one(p)
+                .await
+                .expect("list syncs");
+            n
+        };
+        assert_eq!(list_syncs_queued().await, 2);
+        let list_sync = || {
+            let scope = ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10_000);
+            let bounds = Bounds { max_records: 1000, max_pages: 10, probe_call: Duration::from_secs(5), min_records_per_call_sec: 1, max_call: Duration::from_secs(60), max_wall: Duration::from_secs(60) };
+            let settings = Settings { max_items: 100, tombstones_max_per_owner: 10_000, min_interval_secs: 600, bounds };
+            let lanes = Lanes { fast: 1, slow: 1, stuck_secs: 5400, max_wall_secs: 3600 };
+            let applier = Applier::new(p.clone(), scope.clone(), 600);
+            Some(ListSync::new(p.clone(), scope, Arc::new(Tombstoned), &applier, settings, lanes))
+        };
+        // The jobs a worker ran (each failed once on the unreachable PDS).
+        let ran = || async move {
+            let v: Vec<String> = sqlx::query_scalar("SELECT did FROM backfill_jobs WHERE attempts > 0 ORDER BY updated_at, did")
+                .fetch_all(p)
+                .await
+                .expect("ran");
+            v
+        };
+
+        // Four workers: worker 0 runs jobs, oldest first, and never the
+        // due list syncs; worker 1 runs a list sync first.
+        let four = claim_backfill(p, 4).with_list_sync(list_sync());
+        for _ in 0..3 {
+            assert_eq!(four.worker_turn(0).await, Turn::Job);
+        }
+        assert_eq!(ran().await, ["did:plc:r0000", "did:plc:r0001", "did:plc:r0002"]);
+        assert_eq!(list_syncs_queued().await, 2);
+        assert_eq!(four.worker_turn(1).await, Turn::ListSync);
+        assert_eq!(list_syncs_queued().await, 1);
+
+        // `run_once()` claims as worker 0: the next resync, although
+        // readiness jobs are due; `run_once_as(1)` takes the member job.
+        let (job, _) = four.run_once().await.expect("run").expect("a job");
+        assert_eq!((job.did.as_str(), job.depth), ("did:plc:r0003", Depth::Resync));
+        let (job, _) = four.run_once_as(0).await.expect("run").expect("a job");
+        assert_eq!((job.did.as_str(), job.depth), ("did:plc:r0004", Depth::Resync));
+        let (job, _) = four.run_once_as(1).await.expect("run").expect("a job");
+        assert_eq!((job.did.as_str(), job.depth), (MEMBER_JOB, Depth::Member));
+
+        // One worker (test-only): it serves the lanes, then claims in
+        // plain order.
+        let one = claim_backfill(p, 1).with_list_sync(list_sync());
+        assert_eq!(one.worker_turn(0).await, Turn::ListSync);
+        assert_eq!(list_syncs_queued().await, 0);
+        assert_eq!(one.worker_turn(0).await, Turn::Job);
+        assert_eq!(ran().await.last().map(String::as_str), Some("did:plc:r0005"));
         db.drop_db().await;
     }
 }

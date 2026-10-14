@@ -106,6 +106,39 @@ pub async fn enqueue_many(conn: &mut PgConnection, dids: &[String], depth: Depth
     Ok(n)
 }
 
+/// Enqueue one `resync` per DID, the i-th due at `not_befores[i]`, in one
+/// statement (the off → on fill, public-indexing §8.3). Unlike the other
+/// enqueues it leaves a `queued` resync alone, due time, attempts and
+/// error included: that job builds today's plan when it is claimed. A
+/// `running`, `done` or `failed` one is reset. Returns the rows written.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn enqueue_staggered(
+    conn: &mut PgConnection,
+    dids: &[String],
+    not_befores: &[DateTime<Utc>],
+) -> Result<u64, sqlx::Error> {
+    debug_assert_eq!(dids.len(), not_befores.len(), "one due time per DID");
+    if dids.is_empty() {
+        return Ok(0);
+    }
+    let n = sqlx::query(
+        "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error, updated_at) \
+         SELECT d, 'resync', 'queued', 0, nb, NULL, now() FROM unnest($1::text[], $2::timestamptz[]) AS t(d, nb) \
+         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, \
+           not_before = EXCLUDED.not_before, last_error = NULL, updated_at = now() \
+         WHERE backfill_jobs.state <> 'queued'",
+    )
+    .bind(dids)
+    .bind(not_befores)
+    .execute(conn)
+    .await?
+    .rows_affected();
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +158,61 @@ mod tests {
         assert!(Depth::Authz.is_full_authorization());
         assert!(!Depth::Scope.is_full_authorization());
         assert!(!Depth::Resync.is_full_authorization());
+    }
+
+    /// public-indexing §8.3, T-23: a queued resync keeps its due time,
+    /// attempts and error; a running, done or failed one is reset; a new
+    /// DID is inserted.
+    #[tokio::test]
+    async fn enqueue_staggered_leaves_a_queued_resync_alone() {
+        let Some(db) = crate::test_support::fresh_db("jobs_enqueue_staggered").await else {
+            return;
+        };
+        let p = &db.pool;
+        sqlx::query(
+            "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error) VALUES \
+             ('did:plc:queued', 'resync', 'queued', 2, '2026-01-01T00:00:00Z', 'boom'), \
+             ('did:plc:running', 'resync', 'running', 1, '2026-01-01T00:00:00Z', NULL), \
+             ('did:plc:done', 'resync', 'done', 0, '2026-01-01T00:00:00Z', NULL), \
+             ('did:plc:failed', 'resync', 'failed', 5, '2026-01-01T00:00:00Z', 'gone'), \
+             ('did:plc:done', 'scope', 'done', 0, '2026-01-01T00:00:00Z', NULL)",
+        )
+        .execute(p)
+        .await
+        .expect("seed");
+        let dids: Vec<String> = ["did:plc:queued", "did:plc:running", "did:plc:done", "did:plc:failed", "did:plc:new"]
+            .map(String::from)
+            .to_vec();
+        let base = DateTime::from_timestamp(1_800_000_000, 0).expect("time");
+        let due: Vec<DateTime<Utc>> = (0..5).map(|i| base + chrono::TimeDelta::seconds(i)).collect();
+        let mut conn = p.acquire().await.expect("conn");
+        assert_eq!(enqueue_staggered(&mut conn, &dids, &due).await.expect("enqueue"), 4);
+        assert_eq!(enqueue_staggered(&mut conn, &[], &[]).await.expect("empty"), 0);
+        drop(conn);
+
+        type Row = (String, String, String, i32, DateTime<Utc>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT did, depth, state, attempts, not_before, last_error FROM backfill_jobs ORDER BY did, depth",
+        )
+        .fetch_all(p)
+        .await
+        .expect("rows");
+        let old = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").expect("old").with_timezone(&Utc);
+        let row = |did: &str, depth: &str, state: &str, attempts: i32, not_before: DateTime<Utc>, error: Option<&str>| {
+            (did.to_string(), depth.to_string(), state.to_string(), attempts, not_before, error.map(String::from))
+        };
+        assert_eq!(
+            rows,
+            [
+                row("did:plc:done", "resync", "queued", 0, due[2], None),
+                // Another depth of the same DID is untouched.
+                row("did:plc:done", "scope", "done", 0, old, None),
+                row("did:plc:failed", "resync", "queued", 0, due[3], None),
+                row("did:plc:new", "resync", "queued", 0, due[4], None),
+                row("did:plc:queued", "resync", "queued", 2, old, Some("boom")),
+                row("did:plc:running", "resync", "queued", 0, due[1], None),
+            ]
+        );
+        db.drop_db().await;
     }
 }

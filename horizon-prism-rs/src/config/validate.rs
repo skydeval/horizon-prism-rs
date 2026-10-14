@@ -184,7 +184,9 @@ fn lists_problems(cfg: &FileConfig, out: &mut Vec<String>) {
     if l.sync_probe_call_secs > l.sync_max_call_secs {
         out.push("lists.sync_probe_call_secs must be at most lists.sync_max_call_secs".to_string());
     }
-    // Two backfill workers always stay free for readiness jobs.
+    // Two backfill workers always stay free for readiness jobs. Worker 0
+    // never serves the lanes (public-indexing §8.4), so it is one of the
+    // two: the lanes take at most `concurrency - 2` of the other workers.
     let lanes = u64::from(l.sync_max_concurrent) + u64::from(l.sync_slow_max_concurrent);
     if lanes + 2 > u64::from(cfg.backfill.concurrency) {
         out.push(format!(
