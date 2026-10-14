@@ -351,7 +351,7 @@ fn urls(cfg: &FileConfig, out: &mut Vec<String>) {
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 18] = [
+    let nonzero: [(&str, u64); 21] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
         ("firehose.deterministic_attempts", u64::from(cfg.firehose.deterministic_attempts)),
         ("identity.did_fresh_secs", cfg.identity.did_fresh_secs),
@@ -369,6 +369,9 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
         ("counts.refresh_rate_per_sec", u64::from(cfg.counts.refresh_rate_per_sec)),
         ("retention.tombstone_days", u64::from(cfg.retention.tombstone_days)),
         ("cache.read_time_bytes", cfg.cache.read_time_bytes),
+        ("cache.viewer_private_ttl_secs", cfg.cache.viewer_private_ttl_secs),
+        ("cache.viewer_private_max", cfg.cache.viewer_private_max),
+        ("cache.viewer_private_per_viewer_max", cfg.cache.viewer_private_per_viewer_max),
         ("storage.budget_bytes", cfg.storage.budget_bytes),
     ];
     for (key, value) in nonzero {

@@ -1515,6 +1515,22 @@ commit.
 
 ### Fixed
 
+- **Viewer-private fetches (#709; design-v4 §8.1, R3-188, R3-208).** A
+  fetch whose subjects come from a viewer's own mutes, list mutes,
+  bookmarks or activity subscriptions warmed the shared caches, so an
+  anonymous caller could time requests and learn what a member had muted
+  or bookmarked. Such fetches now run viewer-private: they never read or
+  write the shared read-time cache, the routing cache, the identity
+  caches or the resolveHandle cache, write no stored counts and queue no
+  count refresh. They use a per-viewer private cache instead, cleared when
+  the viewer leaves the ready set. New config `cache.viewer_private_ttl_secs`
+  (3600), `viewer_private_max` (50 000) and `viewer_private_per_viewer_max`
+  (500). Covers `getMutes`, `muteActor`/`unmuteActor`, `muteActorList`,
+  `getListMutes`, `getBookmarks`, `listActivitySubscriptions` and the lists
+  behind `viewer.mutedByList`. A source-scanning test keeps new call sites
+  on those tables viewer-private. Not yet built: the separate network
+  client the design names for these fetches (#711).
+
 - **Profiles were missing fields (#676, Phase B B-32, B-36, B-43).**
   - `getProfile` / `getProfiles` now return `pronouns`, `website` and
     `joinedViaStarterPack`; `associated.lists` and `starterPacks` for a

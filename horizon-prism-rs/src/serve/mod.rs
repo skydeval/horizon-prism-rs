@@ -488,7 +488,11 @@ pub async fn run() -> Result<(), StartupError> {
         crate::appview_clients::from_config(&cfg.file.constellation, &net, &glue.service_key),
         &shares,
     );
-    let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes);
+    let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes).with_private(crate::hydration::cache::PrivateCacheSettings {
+        ttl: Duration::from_secs(cfg.file.cache.viewer_private_ttl_secs),
+        max_entries: cfg.file.cache.viewer_private_max,
+        per_viewer_max: usize::try_from(cfg.file.cache.viewer_private_per_viewer_max).unwrap_or(usize::MAX),
+    });
     let slingshot = SlingshotClient::new(net.clone(), &microcosm.slingshot_url).metered(shares.bucket(
         "slingshot",
         microcosm.slingshot_rate_per_sec.0,
@@ -518,7 +522,7 @@ pub async fn run() -> Result<(), StartupError> {
         Some(ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url)),
         Some(redis.clone()),
         Arc::new(upstream),
-        read_cache,
+        read_cache.clone(),
         HydrationConfig {
             labeler_did: glue.service_key.did().to_string(),
             counts: cfg.file.counts.clone(),
@@ -566,9 +570,11 @@ pub async fn run() -> Result<(), StartupError> {
             .keys
             .clone()
             // A member that left the ready set loses its in-process state:
-            // its verification limits and its cached Farsight answers.
+            // its verification limits, its cached Farsight answers and its
+            // viewer-private cache entries (design-v4 §8.1).
             .spawn(pool.clone(), resolver.clone(), move |did| {
                 verify_limits.forget(did);
+                read_cache.forget_viewer(did);
                 if let Some(farsight) = &farsight {
                     farsight.forget(did);
                 }

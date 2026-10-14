@@ -182,6 +182,8 @@ impl Hydrator {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
+        // The listed accounts come from the viewer's mutes (design-v4 §8.1).
+        let req = &req.viewer_private(me);
         let (at, after) = parse_local_cursor(cursor);
         let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
             // Full mutes only: the lexicon excludes scoped ones (§5.3).
@@ -219,6 +221,8 @@ impl Hydrator {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
+        // The actor is the subject of a write to `mutes` (design-v4 §8.1).
+        let req = &req.viewer_private(me);
         let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(ViewError::new("InvalidRequest", "Actor not found")));
         };
@@ -437,7 +441,7 @@ impl Hydrator {
         let key = format!("rt:known-followers:{me}:{did}");
         let offset = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
         // A first page always rebuilds; later pages read the snapshot.
-        let snapshot = if offset > 0 { self.cache().get_json::<Vec<String>>(&key).await } else { None };
+        let snapshot = if offset > 0 { self.cache().get_json::<Vec<String>>(req, &key).await } else { None };
         let all = match snapshot {
             Some(all) => all,
             None => {
@@ -447,7 +451,7 @@ impl Hydrator {
                     .await?
                     .remove(&did)
                     .unwrap_or_default();
-                self.cache().put_json(&key, &all).await;
+                self.cache().put_json(req, &key, &all).await;
                 all
             }
         };

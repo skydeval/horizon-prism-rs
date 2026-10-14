@@ -129,6 +129,8 @@ impl Hydrator {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
+        // The subjects come from the viewer's subscriptions (design-v4 §8.1).
+        let req = &req.viewer_private(me);
         let (at, after) = parse_local_cursor(cursor);
         let rows: Vec<(String, bool, bool, DateTime<Utc>)> = sqlx::query_as(
             "SELECT subject_did, post, reply, updated_at FROM activity_subscriptions WHERE subscriber_did = $1 \

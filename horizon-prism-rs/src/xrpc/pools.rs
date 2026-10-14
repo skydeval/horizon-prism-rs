@@ -599,11 +599,17 @@ pub const REQUEST_DEADLINE: Duration = Duration::from_secs(6);
 /// or pool empty. A handler creates one and passes it down; a path that is
 /// given none (a background job, the CLI) cannot draw on a request bucket.
 /// Cheap to clone; clones share the exhaustion record.
+///
+/// It also carries **viewer-private mode** (design-v4 §8.1 "Viewer-private
+/// fetches"; R3-188, R3-200, R3-201, R3-208): see
+/// [`Requester::viewer_private`].
 #[derive(Debug, Clone)]
 pub struct Requester {
     key: ChargeKey,
     deadline: Instant,
     exhausted: Arc<Mutex<Option<Exhausted>>>,
+    /// The viewer a viewer-private fetch is made for, if this is one.
+    private_viewer: Option<Arc<str>>,
 }
 
 impl Requester {
@@ -614,7 +620,45 @@ impl Requester {
             key,
             deadline: Instant::now() + REQUEST_DEADLINE,
             exhausted: Arc::new(Mutex::new(None)),
+            private_viewer: None,
         }
+    }
+
+    /// This request, for an upstream fetch or hydration whose subject set
+    /// comes from, or is the subject of a write to, one of `viewer`'s
+    /// AppView-private rows (§4.5: `mutes`, `list_mutes`, `thread_mutes`,
+    /// `bookmarks`, `drafts`, `activity_subscriptions`,
+    /// `notification_preferences_v2`). Every layer below reads the mode
+    /// from here:
+    /// - the shared in-process caches (`rt`, `route`, the request-side
+    ///   identity summaries, the resolveHandle cache and its negative
+    ///   entries, the PDS listing-order cache) are neither read nor written;
+    ///   `rt` reads and writes go to `viewer`'s own private cache instead;
+    /// - identity documents are fetched without a `did_cache` read or write;
+    /// - stored counts are read but never written, and nothing is put on
+    ///   `cc:refresh`.
+    ///
+    /// The clone shares this request's deadline, charge key and exhaustion
+    /// record, so a viewer-private call draws on the viewer's fair share
+    /// like any other (design-v4 §8.1).
+    #[must_use]
+    pub fn viewer_private(&self, viewer: &str) -> Self {
+        Self {
+            private_viewer: Some(Arc::from(viewer)),
+            ..self.clone()
+        }
+    }
+
+    /// The viewer of a viewer-private fetch; `None` for an ordinary one.
+    #[must_use]
+    pub fn private_viewer(&self) -> Option<&str> {
+        self.private_viewer.as_deref()
+    }
+
+    /// Whether this is a viewer-private fetch ([`Requester::viewer_private`]).
+    #[must_use]
+    pub fn is_viewer_private(&self) -> bool {
+        self.private_viewer.is_some()
     }
 
     /// A ready member's request when `member` is given, else `ip`'s.

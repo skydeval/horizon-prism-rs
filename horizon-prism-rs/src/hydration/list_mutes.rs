@@ -42,7 +42,9 @@ impl Hydrator {
         }
         let budget = self.inner.cfg.list_budget;
         let changed = if mute {
-            let Some((row, _)) = self.load_list(req, list).await? else {
+            // The check's list is the subject of a write to `list_mutes`
+            // (design-v4 §8.1, R3-188).
+            let Some((row, _)) = self.load_list(&req.viewer_private(me), list).await? else {
                 return Ok(Err(invalid("List not found")));
             };
             if row.purpose != PURPOSE_MOD {
@@ -133,7 +135,10 @@ impl Hydrator {
         let sql = "SELECT list_uri, created_at FROM list_mutes WHERE viewer_did = $1 \
                      AND ($2::timestamptz IS NULL OR (created_at, list_uri) < ($2, $3)) \
                    ORDER BY created_at DESC, list_uri DESC LIMIT $4";
-        self.own_lists(viewer, req, sql, limit, cursor).await
+        // The lists, and their creators, come from the viewer's list mutes
+        // (design-v4 §8.1). With no viewer `own_lists` refuses.
+        let req = viewer.did.as_deref().map_or_else(|| req.clone(), |me| req.viewer_private(me));
+        self.own_lists(viewer, &req, sql, limit, cursor).await
     }
 
     /// `app.bsky.graph.getListBlocks`: the lists the viewer blocks, by its

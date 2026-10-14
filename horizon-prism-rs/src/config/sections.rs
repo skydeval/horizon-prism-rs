@@ -361,12 +361,20 @@ impl Default for AdminConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     pub read_time_bytes: u64,
+    /// The per-viewer private cache of viewer-private fetches (design-v4
+    /// §8.1): entry lifetime, entries over all viewers, entries per viewer.
+    pub viewer_private_ttl_secs: u64,
+    pub viewer_private_max: u64,
+    pub viewer_private_per_viewer_max: u64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             read_time_bytes: 256 * 1024 * 1024,
+            viewer_private_ttl_secs: 3600,
+            viewer_private_max: 50_000,
+            viewer_private_per_viewer_max: 500,
         }
     }
 }

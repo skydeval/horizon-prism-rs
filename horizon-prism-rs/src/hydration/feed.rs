@@ -934,13 +934,13 @@ impl Hydrator {
             return Ok(None);
         };
         let key = format!("links|{target}|{collection}|{path}|{limit}|{}", cursor.unwrap_or_default());
-        if let Some(page) = self.cache().get_json(&key).await {
+        if let Some(page) = self.cache().get_json(req, &key).await {
             return Ok(Some(page));
         }
         self.draw_constellation(req)?;
         match client.links(target, collection, path, limit, cursor).await {
             Ok(page) => {
-                self.cache().put_json(&key, &page).await;
+                self.cache().put_json(req, &key, &page).await;
                 Ok(Some(page))
             }
             Err(error) => {

@@ -1007,6 +1007,8 @@ impl Lookup {
         let inner = &self.farsight.inner;
         let ttl_ms = i64::try_from(inner.settings.ttl.as_millis()).unwrap_or(i64::MAX);
         let key = |other: &str| format!("rt:farsight-pair:{canonical_actor}:{other}");
+        // Shared entries only, so an ordinary (never viewer-private) handle.
+        let shared = Requester::new(self.key.clone());
         let mut wanted: Vec<String> = Vec::new();
         for other in others {
             if let Some(c) = canonical(other)
@@ -1020,7 +1022,7 @@ impl Lookup {
         let mut found: HashMap<String, PairAnswer> = HashMap::new();
         let mut ask: Vec<String> = Vec::new();
         for other in &wanted {
-            match rt.get_json::<(i64, PairAnswer)>(&key(other)).await {
+            match rt.get_json::<(i64, PairAnswer)>(&shared, &key(other)).await {
                 Some((at, answer)) if now_ms.saturating_sub(at) < ttl_ms => {
                     found.insert(other.clone(), answer);
                 }
@@ -1053,7 +1055,7 @@ impl Lookup {
             for (other, outcome) in outcomes {
                 match outcome {
                     Some(answer) => {
-                        rt.put_json(&key(&other), &(at, &answer)).await;
+                        rt.put_json(&shared, &key(&other), &(at, &answer)).await;
                         found.insert(other, answer);
                     }
                     None => complete = false,

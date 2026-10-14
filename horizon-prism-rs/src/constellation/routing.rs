@@ -21,6 +21,7 @@ use moka::future::Cache;
 use super::matcher::{first_match, pds_host};
 use crate::config::{COMMUNITY_NETWORK, ConstellationConfig, LOCAL_APPVIEW, NetworkAuth};
 use crate::identity::handle_lookup::{HandleOutcome, TxtSource};
+use crate::identity::resolver::Caches;
 use crate::identity::{IdentityResolver, ResolveIntent};
 use crate::xrpc::pools::{Requester, RequesterLimit, SharedBucket};
 
@@ -215,8 +216,12 @@ pub const METRIC_HANDLE_RESOLUTIONS: &str = "handle_resolutions_total";
 
 #[async_trait]
 impl DidLookup for IdentityResolver {
-    async fn summary(&self, _req: &Requester, did: &str) -> Option<DidSummary> {
-        let info = self.resolve_info(did, ResolveIntent::Lookup).await.ok()?;
+    async fn summary(&self, req: &Requester, did: &str) -> Option<DidSummary> {
+        let info = if req.is_viewer_private() {
+            self.resolve_info_uncached(did, &|_| true).await.ok()?
+        } else {
+            self.resolve_info(did, ResolveIntent::Lookup).await.ok()?
+        };
         let handle = self.verify_handle(did, info.claimed_handle.as_deref()).await;
         Some(DidSummary {
             pds: info.pds_endpoint,
@@ -224,9 +229,15 @@ impl DidLookup for IdentityResolver {
         })
     }
 
-    async fn did_for_handle(&self, _req: &Requester, handle: &str) -> Option<String> {
-        self.resolve_handle(handle).await
+    async fn did_for_handle(&self, req: &Requester, handle: &str) -> Option<String> {
+        self.resolve_handle_with(handle, &|_| true, caches_for(req)).await
     }
+}
+
+/// The document caches `req` may use: none for a viewer-private fetch
+/// (design-v4 §8.1, R3-208).
+fn caches_for(req: &Requester) -> Caches {
+    if req.is_viewer_private() { Caches::Bypass } else { Caches::Shared }
 }
 
 /// How long a request-side summary is reused, and how many are kept.
@@ -287,21 +298,30 @@ impl RequestLookup {
 
 #[async_trait]
 impl DidLookup for RequestLookup {
+    /// A viewer-private request (design-v4 §8.1, R3-208) neither reads nor
+    /// writes the summaries or the document caches.
     async fn summary(&self, req: &Requester, did: &str) -> Option<DidSummary> {
-        if let Some(s) = self.summaries.get(did).await {
+        let shared = !req.is_viewer_private();
+        if shared && let Some(s) = self.summaries.get(did).await {
             return Some(s);
         }
         if !self.admitted(req) {
             return None;
         }
         let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
-        let info = self.resolver.resolve_info_admitted(did, ResolveIntent::Lookup, &plc).await.ok()?;
+        let info = if shared {
+            self.resolver.resolve_info_admitted(did, ResolveIntent::Lookup, &plc).await.ok()?
+        } else {
+            self.resolver.resolve_info_uncached(did, &plc).await.ok()?
+        };
         let handle = self.resolver.verify_handle(did, info.claimed_handle.as_deref()).await;
         let summary = DidSummary {
             pds: info.pds_endpoint,
             handle,
         };
-        self.summaries.insert(did.to_string(), summary.clone()).await;
+        if shared {
+            self.summaries.insert(did.to_string(), summary.clone()).await;
+        }
         Some(summary)
     }
 
@@ -310,7 +330,7 @@ impl DidLookup for RequestLookup {
             return None;
         }
         let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
-        self.resolver.resolve_handle_admitted(handle, &plc).await
+        self.resolver.resolve_handle_with(handle, &plc, caches_for(req)).await
     }
 
     async fn handle_outcome(&self, req: &Requester, handle: &str) -> HandleOutcome {
@@ -321,11 +341,14 @@ impl DidLookup for RequestLookup {
             };
         };
         let count = |result: &'static str| metrics::counter!(METRIC_HANDLE_RESOLUTIONS, "result" => result).increment(1);
-        if let Some(did) = handles.found.get(handle).await {
+        // A viewer-private request neither reads nor writes either cache,
+        // negative entries included (design-v4 §8.1, R3-208).
+        let shared = !req.is_viewer_private();
+        if shared && let Some(did) = handles.found.get(handle).await {
             count("cache");
             return HandleOutcome::Found(did);
         }
-        if handles.absent.get(handle).await.is_some() {
+        if shared && handles.absent.get(handle).await.is_some() {
             count("cache");
             return HandleOutcome::NotFound;
         }
@@ -333,15 +356,19 @@ impl DidLookup for RequestLookup {
             return HandleOutcome::Unavailable;
         }
         let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
-        let outcome = self.resolver.resolve_handle_typed(handles.txt.as_ref(), handle, &plc).await;
+        let outcome = self.resolver.resolve_handle_typed(handles.txt.as_ref(), handle, &plc, caches_for(req)).await;
         match &outcome {
             HandleOutcome::Found(did) => {
                 count("network_ok");
-                handles.found.insert(handle.to_string(), did.clone()).await;
+                if shared {
+                    handles.found.insert(handle.to_string(), did.clone()).await;
+                }
             }
             HandleOutcome::NotFound => {
                 count("network_not_found");
-                handles.absent.insert(handle.to_string(), ()).await;
+                if shared {
+                    handles.absent.insert(handle.to_string(), ()).await;
+                }
             }
             HandleOutcome::Unavailable => count("network_error"),
         }
@@ -380,17 +407,31 @@ impl Router {
         self.lookup.as_ref()
     }
 
-    /// The home network of `did` (§8.3 steps 2–3).
+    /// The home network of `did` (§8.3 steps 2–3). A viewer-private request
+    /// neither reads nor writes the `route` cache (design-v4 §8.1, R3-208).
     pub async fn resolve_did(&self, req: &Requester, did: &str) -> RoutingDecision {
-        if let Some(d) = self.cache.get(did).await {
+        let shared = !req.is_viewer_private();
+        if shared && let Some(d) = self.cache.get(did).await {
             return d;
         }
         let Some(pds) = self.lookup.summary(req, did).await.and_then(|s| s.pds) else {
             return RoutingDecision::unknown();
         };
         let decision = self.table.decide(&pds);
-        self.cache.insert(did.to_string(), decision.clone()).await;
+        if shared {
+            self.cache.insert(did.to_string(), decision.clone()).await;
+        }
         decision
+    }
+
+    /// The `route` cache's keys, without touching their LRU or frequency
+    /// state (tests).
+    #[cfg(test)]
+    pub(crate) async fn cached_routes(&self) -> Vec<String> {
+        self.cache.run_pending_tasks().await;
+        let mut keys: Vec<String> = self.cache.iter().map(|(k, _)| k.as_ref().clone()).collect();
+        keys.sort();
+        keys
     }
 }
 

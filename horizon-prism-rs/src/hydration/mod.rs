@@ -38,6 +38,8 @@ pub mod thread;
 pub mod thread_v2;
 pub mod trends;
 pub mod upstream;
+#[cfg(test)]
+mod viewer_private_tests;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -823,7 +825,7 @@ impl Hydrator {
             labels: self.load_labels(&labelled).await?,
         };
         let report = normalize::normalize_upstream(&mut view, &overlay);
-        self.enrich_counts(&mut view).await?;
+        self.enrich_counts(req, &mut view).await?;
         Ok((view, report))
     }
 
@@ -891,8 +893,12 @@ impl Hydrator {
     }
 
     /// Constellation counts for targets under the §9.6 rule. Targets with no
-    /// usable value are absent (the caller uses local counts).
+    /// usable value are absent (the caller uses local counts). A
+    /// viewer-private request always counts in [`CountMode::Quiet`]: stored
+    /// rows are read, and nothing is fetched, stored or queued (design-v4
+    /// §8.1, R3-201).
     pub async fn constellation_counts(&self, req: &Requester, targets: &[String], mode: CountMode) -> HashMap<String, Counts> {
+        let mode = if req.is_viewer_private() { CountMode::Quiet } else { mode };
         let mut out = HashMap::new();
         let Some(client) = self.constellation() else {
             return out;
@@ -907,7 +913,7 @@ impl Hydrator {
                 Ok(Some((c, _))) => {
                     out.insert(t.clone(), c);
                     if !matches!(mode, CountMode::Quiet) {
-                        self.enqueue_refresh(t).await;
+                        self.enqueue_refresh(req, t).await;
                     }
                 }
                 Ok(None) => misses.push(t.clone()),
@@ -917,7 +923,7 @@ impl Hydrator {
         match mode {
             CountMode::List => {
                 for t in &misses {
-                    self.enqueue_refresh(t).await;
+                    self.enqueue_refresh(req, t).await;
                 }
             }
             CountMode::Quiet => {}
@@ -948,7 +954,7 @@ impl Hydrator {
                             }
                             out.insert(t, c);
                         }
-                        None => self.enqueue_refresh(&t).await,
+                        None => self.enqueue_refresh(req, &t).await,
                     }
                 }
             }
@@ -956,7 +962,12 @@ impl Hydrator {
         out
     }
 
-    async fn enqueue_refresh(&self, target: &str) {
+    /// Put `target` on `cc:refresh`, unless `req` is viewer-private, whose
+    /// reads leave no trace in shared state (design-v4 §8.1, R3-201).
+    async fn enqueue_refresh(&self, req: &Requester, target: &str) {
+        if req.is_viewer_private() {
+            return;
+        }
         if let Some(redis) = &self.inner.redis {
             let mut conn = redis.clone();
             counts::enqueue_refresh(&mut conn, target, self.inner.cfg.counts.refresh_queue_max).await;
@@ -1017,24 +1028,47 @@ pub(crate) mod testing {
         pub threads: HashMap<String, Value>,
         /// DID → `getAuthorPolls` output.
         pub polls: HashMap<String, Value>,
+        /// Handle → DID, for `resolve_handle`.
+        pub handles: HashMap<String, String>,
         pub calls: std::sync::atomic::AtomicUsize,
+        /// `(call, whether it was viewer-private)` for `profile`, `posts`,
+        /// `record` and `resolve_handle`, in call order (design-v4 §8.1).
+        pub modes: std::sync::Mutex<Vec<(String, bool)>>,
+    }
+
+    impl FixedUpstream {
+        fn note(&self, req: &Requester, call: String) {
+            self.modes.lock().expect("modes").push((call, req.is_viewer_private()));
+        }
+
+        /// The calls seen so far, emptied.
+        pub(crate) fn take_modes(&self) -> Vec<(String, bool)> {
+            std::mem::take(&mut *self.modes.lock().expect("modes"))
+        }
     }
 
     #[async_trait::async_trait]
     impl UpstreamSource for FixedUpstream {
-        async fn profile(&self, _req: &Requester, actor: &str) -> Option<Value> {
+        async fn profile(&self, req: &Requester, actor: &str) -> Option<Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.note(req, format!("profile {actor}"));
             self.profiles.get(actor).cloned()
         }
-        async fn posts(&self, _req: &Requester, uris: &[String]) -> Vec<Value> {
+        async fn posts(&self, req: &Requester, uris: &[String]) -> Vec<Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.note(req, format!("posts {}", uris.join(" ")));
             uris.iter().filter_map(|u| self.posts.get(u).cloned()).collect()
         }
         async fn post_records(&self, req: &Requester, uris: &[String]) -> Vec<Value> {
             self.posts(req, uris).await
         }
-        async fn record(&self, _req: &Requester, uri: &str) -> Option<Value> {
+        async fn record(&self, req: &Requester, uri: &str) -> Option<Value> {
+            self.note(req, format!("record {uri}"));
             self.records.get(uri).cloned()
+        }
+        async fn resolve_handle(&self, req: &Requester, handle: &str) -> Option<String> {
+            self.note(req, format!("resolve_handle {handle}"));
+            self.handles.get(handle).cloned()
         }
         async fn list_items(&self, _req: &Requester, list: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
             self.list_items.get(list).cloned()

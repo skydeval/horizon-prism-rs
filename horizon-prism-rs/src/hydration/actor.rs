@@ -206,6 +206,11 @@ impl Hydrator {
     /// views carry the viewer's own state, so they stay in `viewer`, which
     /// lives for one request.
     ///
+    /// A list behind `mutedByList` comes from the viewer's private list
+    /// mutes, so it is read viewer-private (design-v4 §8.1, R3-188); one
+    /// the viewer also blocks by a public `listblock` record is not
+    /// private, and is read as any other.
+    ///
     /// # Errors
     ///
     /// Database errors.
@@ -219,12 +224,19 @@ impl Hydrator {
             .collect();
         unseen.sort_unstable();
         unseen.dedup();
+        let blocked: std::collections::HashSet<&String> = state.blocking_by_list.values().collect();
+        let private = viewer.did.as_deref().map(|me| req.viewer_private(me));
+        let mut views = Vec::new();
         for list in unseen {
+            let req = match &private {
+                Some(private) if !blocked.contains(&list) => private,
+                _ => req,
+            };
             if let Some((row, _)) = self.load_list(req, &list).await? {
-                let view = self.list_basic(viewer, &row, None, None).await?;
-                state.list_views.insert(list, view);
+                views.push((list, self.list_basic(viewer, &row, None, None).await?));
             }
         }
+        state.list_views.extend(views);
         Ok(())
     }
 

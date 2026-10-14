@@ -133,6 +133,11 @@ command_timeout_secs = 600
 [cache]
 # In-process read-time cache budget (design §7.6).
 read_time_bytes = 268435456
+# The per-viewer private cache of viewer-private fetches (design-v4 §8.1):
+# entry lifetime, entries over all viewers, entries per viewer.
+viewer_private_ttl_secs = 3600
+viewer_private_max = 50000
+viewer_private_per_viewer_max = 500
 
 [counts]
 # local | local_then_constellation

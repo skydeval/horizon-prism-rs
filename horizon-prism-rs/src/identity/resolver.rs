@@ -34,6 +34,16 @@ pub const HANDLE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Cap for `/.well-known/atproto-did` bodies.
 pub const HANDLE_BODY_CAP: BodyCap = BodyCap(64 * 1024);
 
+/// Whether a request-path lookup may use the document caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caches {
+    /// `did_cache` and the in-process document cache, read and written.
+    Shared,
+    /// Neither read nor written: a viewer-private lookup (design-v4 §8.1,
+    /// R3-208).
+    Bypass,
+}
+
 /// A supported DID method and its lookup target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DidTarget {
@@ -425,6 +435,31 @@ impl IdentityResolver {
         Ok(extract_info(&doc, did))
     }
 
+    /// [`IdentityResolver::resolve_info_admitted`] with no cache read and no
+    /// cache write: a viewer-private lookup (design-v4 §8.1) leaves neither
+    /// `did_cache` nor the in-process document cache touched, even for an
+    /// in-scope DID. `admit` is asked just before the fetch.
+    ///
+    /// # Errors
+    ///
+    /// As [`IdentityResolver::fetch_document`], plus
+    /// [`IdentityError::NoBudget`].
+    pub async fn resolve_info_uncached(&self, did: &str, admit: &(dyn Fn(&str) -> bool + Sync)) -> Result<DidDocInfo, IdentityError> {
+        parse_did(did)?;
+        if !admit(did) {
+            return Err(IdentityError::NoBudget(did.to_string()));
+        }
+        Ok(extract_info(&self.fetch_document(did).await?.doc, did))
+    }
+
+    /// A document's info for `did` under `caches` (design-v4 §8.1).
+    async fn info_with(&self, did: &str, admit: &(dyn Fn(&str) -> bool + Sync), caches: Caches) -> Result<DidDocInfo, IdentityError> {
+        match caches {
+            Caches::Shared => self.resolve_info_admitted(did, ResolveIntent::Lookup, admit).await,
+            Caches::Bypass => self.resolve_info_uncached(did, admit).await,
+        }
+    }
+
     /// [`IdentityResolver::resolve`] plus extraction.
     ///
     /// # Errors
@@ -444,9 +479,15 @@ impl IdentityResolver {
     /// [`IdentityResolver::resolve_handle`] for a request; `admit` as in
     /// [`IdentityResolver::resolve_admitted`].
     pub async fn resolve_handle_admitted(&self, handle: &str, admit: &(dyn Fn(&str) -> bool + Sync)) -> Option<String> {
+        self.resolve_handle_with(handle, admit, Caches::Shared).await
+    }
+
+    /// [`IdentityResolver::resolve_handle_admitted`], with the document read
+    /// under `caches`.
+    pub async fn resolve_handle_with(&self, handle: &str, admit: &(dyn Fn(&str) -> bool + Sync), caches: Caches) -> Option<String> {
         let handle = handle.trim().trim_start_matches('@').to_ascii_lowercase();
         let did = self.inner.handles.resolve_handle(&handle).await?;
-        let info = self.resolve_info_admitted(&did, ResolveIntent::Lookup, admit).await.ok()?;
+        let info = self.info_with(&did, admit, caches).await.ok()?;
         verify_bidirectional(&did, info.claimed_handle.as_deref(), Some(&did)).filter(|h| h.eq_ignore_ascii_case(&handle))?;
         Some(did)
     }
@@ -455,12 +496,14 @@ impl IdentityResolver {
     /// (design-v3 §5.11): the TXT record and the well-known file are both
     /// asked, a DID found is verified against its document, and "no such
     /// handle" is told apart from "could not find out". `admit` as in
-    /// [`IdentityResolver::resolve_admitted`].
+    /// [`IdentityResolver::resolve_admitted`]; the document is read under
+    /// `caches`.
     pub async fn resolve_handle_typed(
         &self,
         txt: &dyn super::handle_lookup::TxtSource,
         handle: &str,
         admit: &(dyn Fn(&str) -> bool + Sync),
+        caches: Caches,
     ) -> super::handle_lookup::HandleOutcome {
         use super::handle_lookup::{HandleOutcome, HandleProbe, Step, candidate, neither_found};
 
@@ -474,7 +517,7 @@ impl IdentityResolver {
         };
         // The document must name the handle back. A document that could
         // not be fetched decides nothing.
-        match self.resolve_info_admitted(did, ResolveIntent::Lookup, admit).await {
+        match self.info_with(did, admit, caches).await {
             Ok(info) if info.claimed_handle.as_deref().is_some_and(|claimed| claimed.eq_ignore_ascii_case(handle)) => {
                 HandleOutcome::Found(did.to_string())
             }

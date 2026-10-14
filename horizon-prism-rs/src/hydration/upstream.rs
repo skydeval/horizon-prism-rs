@@ -207,12 +207,14 @@ impl super::Hydrator {
     /// `constellation_counts` row overrides the upstream count (stale rows
     /// are also queued for refresh); with no usable row the upstream count
     /// stays (never a local zero) and the target is queued on `cc:refresh`.
-    /// A count Constellation does not carry is never touched.
+    /// A count Constellation does not carry is never touched. A
+    /// viewer-private request reads the rows and queues nothing (design-v4
+    /// §8.1).
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub(crate) async fn enrich_counts(&self, view: &mut Value) -> Result<(), sqlx::Error> {
+    pub(crate) async fn enrich_counts(&self, req: &Requester, view: &mut Value) -> Result<(), sqlx::Error> {
         let mut targets = Vec::new();
         count_targets(view, &mut targets);
         targets.sort();
@@ -225,12 +227,12 @@ impl super::Hydrator {
                     "fresh"
                 }
                 Some((c, _)) => {
-                    self.enqueue_refresh(&t).await;
+                    self.enqueue_refresh(req, &t).await;
                     found.insert(t, c);
                     "stale"
                 }
                 None => {
-                    self.enqueue_refresh(&t).await;
+                    self.enqueue_refresh(req, &t).await;
                     "upstream"
                 }
             };
@@ -307,15 +309,20 @@ impl PdsLister {
     }
 
     /// The host's listing order, probed once with a `limit=2` listing and
-    /// cached 24 h. `None` when undetermined.
+    /// cached 24 h. `None` when undetermined. A viewer-private request
+    /// neither reads nor writes the cache, whose keys are subject-named
+    /// hosts (design-v4 §8.1).
     pub async fn order(&self, req: &Requester, pds: &str, did: &str) -> Option<ListOrder> {
         let host = HostBudgets::host_of(pds);
-        if let Some(o) = self.orders.get(&host).await {
+        let shared = !req.is_viewer_private();
+        if shared && let Some(o) = self.orders.get(&host).await {
             return Some(o);
         }
         let page = self.list(req, pds, did, NSID_POST, 2, None).await?;
         let order = detect_order(&page.records)?;
-        self.orders.insert(host, order).await;
+        if shared {
+            self.orders.insert(host, order).await;
+        }
         Some(order)
     }
 }
@@ -455,13 +462,13 @@ impl RealUpstreamSource {
     /// One post through Slingshot, cached.
     async fn slingshot_post(&self, req: &Requester, uri: &str) -> Option<Value> {
         let key = format!("rt:post:{uri}");
-        if let Some(v) = self.cache.get_json::<Value>(&key).await {
+        if let Some(v) = self.cache.get_json::<Value>(req, &key).await {
             return Some(v);
         }
         let record = self.slingshot.get_record(req, uri).await.ok()?;
         let handle = self.handle_of(req, uri_author(uri)?).await;
         let view = post_from_record(uri, record.cid.as_deref(), &handle, &record.value);
-        self.cache.put_json(&key, &view).await;
+        self.cache.put_json(req, &key, &view).await;
         Some(view)
     }
 
@@ -585,7 +592,7 @@ impl RealUpstreamSource {
 impl UpstreamSource for RealUpstreamSource {
     async fn profile(&self, req: &Requester, actor: &str) -> Option<Value> {
         let key = format!("rt:profile:{actor}");
-        if let Some(v) = self.cache.get_json::<Value>(&key).await {
+        if let Some(v) = self.cache.get_json::<Value>(req, &key).await {
             return Some(v);
         }
         let view = match self.cascade(req, actor, Call::Profile(actor)).await {
@@ -600,7 +607,7 @@ impl UpstreamSource for RealUpstreamSource {
                 profile_from_record(actor, &handle, summary.pds.as_deref(), &record.value)
             }
         };
-        self.cache.put_json(&key, &view).await;
+        self.cache.put_json(req, &key, &view).await;
         Some(view)
     }
 
@@ -608,7 +615,7 @@ impl UpstreamSource for RealUpstreamSource {
         let mut found: HashMap<String, Value> = HashMap::new();
         let mut by_author: HashMap<String, Vec<String>> = HashMap::new();
         for uri in uris.iter().filter(|u| !is_private_uri(u)) {
-            if let Some(v) = self.cache.get_json::<Value>(&format!("rt:post:{uri}")).await {
+            if let Some(v) = self.cache.get_json::<Value>(req, &format!("rt:post:{uri}")).await {
                 found.insert(uri.clone(), v);
             } else if let Some(a) = uri_author(uri) {
                 by_author.entry(a.to_string()).or_default().push(uri.clone());
@@ -623,7 +630,7 @@ impl UpstreamSource for RealUpstreamSource {
             if let Some(body) = self.cascade(req, author, Call::Posts(group)).await {
                 for post in body.get("posts").and_then(Value::as_array).into_iter().flatten() {
                     if let Some(uri) = post.get("uri").and_then(Value::as_str).filter(|u| group.iter().any(|g| g == u)) {
-                        self.cache.put_json(&format!("rt:post:{uri}"), post).await;
+                        self.cache.put_json(req, &format!("rt:post:{uri}"), post).await;
                         found.insert(uri.to_string(), post.clone());
                     }
                 }
@@ -769,12 +776,12 @@ impl UpstreamSource for RealUpstreamSource {
 
     async fn record(&self, req: &Requester, uri: &str) -> Option<Value> {
         let key = format!("rt:record:{uri}");
-        if let Some(v) = self.cache.get_json::<Value>(&key).await {
+        if let Some(v) = self.cache.get_json::<Value>(req, &key).await {
             return Some(v);
         }
         let record = self.slingshot.get_record(req, uri).await.ok()?;
         let view = json!({"uri": uri, "cid": record.cid, "value": record.value});
-        self.cache.put_json(&key, &view).await;
+        self.cache.put_json(req, &key, &view).await;
         Some(view)
     }
 
@@ -1224,6 +1231,43 @@ mod tests {
             assert_eq!(up.profile(&req, LOCAL).await.expect("profile")["displayName"], "From AppView", "{mode:?}");
             assert_eq!(calls.load(Ordering::SeqCst), i + 1, "{mode:?}");
         }
+    }
+
+    /// B-53 "No shared-cache reads", B-54 (design-v4 §8.1; R3-188, R3-208),
+    /// in-crate: a viewer-private fetch neither reads nor writes `rt` or
+    /// `route`, and its repeats come from the viewer's own cache. An
+    /// ordinary fetch of the same subjects still writes both.
+    #[tokio::test]
+    async fn a_viewer_private_fetch_leaves_rt_and_route_untouched() {
+        let (notfound, _) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound"})).await;
+        let (slingshot, slingshot_calls) = fake_slingshot().await;
+        let up = source(cascade_for(&[("bluesky", &notfound), ("community-a", &notfound)]), &slingshot);
+        let public = Requester::test();
+        let private = public.viewer_private("did:plc:vvvvvvvvvvvvvvvvvvvvvvvv");
+        let post = format!("at://{OUTSIDER}/{NSID_POST}/3kaaa");
+        let list = format!("at://{OUTSIDER}/{NSID_LIST}/3klist");
+
+        assert!(up.record(&private, &list).await.is_some());
+        assert!(up.profile(&private, OUTSIDER).await.is_some());
+        assert_eq!(up.posts(&private, std::slice::from_ref(&post)).await.len(), 1);
+        assert!(up.cache.shared_keys().await.is_empty(), "rt was written");
+        assert!(up.router.cached_routes().await.is_empty(), "route was written");
+        // A repeat is served from the viewer's own cache.
+        let calls = slingshot_calls.load(Ordering::SeqCst);
+        assert!(up.record(&private, &list).await.is_some());
+        assert_eq!(slingshot_calls.load(Ordering::SeqCst), calls);
+
+        // An ordinary request does not see the viewer's entries, and fills
+        // the shared caches.
+        assert!(up.record(&public, &list).await.is_some());
+        assert_eq!(slingshot_calls.load(Ordering::SeqCst), calls + 1);
+        assert!(up.profile(&public, OUTSIDER).await.is_some());
+        assert_eq!(up.cache.shared_keys().await, [format!("rt:profile:{OUTSIDER}"), format!("rt:record:{list}")]);
+        assert_eq!(up.router.cached_routes().await, [OUTSIDER]);
+        // The shared entries are invisible to the viewer-private request.
+        let calls = slingshot_calls.load(Ordering::SeqCst);
+        assert!(up.profile(&private.viewer_private("did:plc:wwwwwwwwwwwwwwwwwwwwwwww"), OUTSIDER).await.is_some());
+        assert!(slingshot_calls.load(Ordering::SeqCst) > calls);
     }
 
     #[tokio::test]

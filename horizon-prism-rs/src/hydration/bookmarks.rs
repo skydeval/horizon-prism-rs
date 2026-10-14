@@ -95,6 +95,8 @@ impl Hydrator {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
+        // The items come from the viewer's bookmarks (design-v4 §8.1).
+        let req = &req.viewer_private(me);
         let (at, after) = parse_local_cursor(cursor);
         let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
             "SELECT post_uri, post_cid, created_at FROM bookmarks WHERE viewer_did = $1 \

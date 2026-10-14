@@ -143,6 +143,9 @@ command_timeout_secs = 600
 
 [cache]
 read_time_bytes = 268435456
+viewer_private_ttl_secs = 3600
+viewer_private_max = 50000
+viewer_private_per_viewer_max = 500
 
 [counts]
 public_source = "local_then_constellation"
