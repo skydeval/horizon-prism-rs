@@ -17,6 +17,7 @@ use super::commands;
 use crate::admin_executor::{AdminCommand, CHANNEL};
 use crate::config::AppConfig;
 use crate::firehose::jobs::Depth;
+use crate::indexing::ScopeValue;
 
 /// Poll interval while waiting for `serve` (§3.3).
 pub const POLL: Duration = Duration::from_millis(500);
@@ -83,8 +84,25 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: ListsAction,
     },
+    /// Public indexing as an operator switch (public-indexing design §3.4).
+    Indexing {
+        #[command(subcommand)]
+        action: IndexingAction,
+    },
     /// Print a fresh service signing key, its did:key and a correlation key.
     Keygen,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IndexingAction {
+    /// Turn public indexing off (its data is deleted in the background) or
+    /// back on (it is refilled to backfill depth).
+    PublicScope {
+        /// off | community_scoped
+        value: String,
+    },
+    /// The setting, the running mode and phase, progress and any error.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -231,6 +249,10 @@ impl AdminCmd {
             },
             Self::Lists { action: ListsAction::Sync { uri } } => AdminCommand::ListsSync { uri: uri.clone() },
             Self::Lists { action: ListsAction::Purge { did } } => AdminCommand::ListsPurge { did: did.clone() },
+            Self::Indexing { action: IndexingAction::PublicScope { value } } => AdminCommand::IndexingPublicScope {
+                value: ScopeValue::parse(value).ok_or_else(|| format!("public-scope takes off or community_scoped, not {value:?}"))?,
+            },
+            Self::Indexing { action: IndexingAction::Status } => AdminCommand::IndexingStatus,
         };
         let (command, args) = cmd.to_row();
         AdminCommand::parse(command, &args).map_err(|e| e.to_string())
@@ -442,5 +464,11 @@ mod tests {
                 depth: Some(Depth::Authz)
             })
         );
+        let off = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "off".into() } };
+        assert_eq!(off.to_command(), Ok(AdminCommand::IndexingPublicScope { value: ScopeValue::Off }));
+        let full = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "full".into() } };
+        assert!(full.to_command().is_err());
+        let status = AdminCmd::Indexing { action: IndexingAction::Status };
+        assert_eq!(status.to_command(), Ok(AdminCommand::IndexingStatus));
     }
 }

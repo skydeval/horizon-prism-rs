@@ -216,42 +216,13 @@ impl Rebuild {
         .await
     }
 
-    /// §9.5 repair: recompute both count tables from the base tables. The
-    /// share-row-exclusive locks hold count-trigger writers for the duration,
-    /// so no increment is lost or doubled.
+    /// §9.5 repair; see [`repair_counts`].
     ///
     /// # Errors
     ///
     /// Database errors.
     pub async fn repair_counts(&self) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("LOCK TABLE post_counts, actor_counts IN SHARE ROW EXCLUSIVE MODE")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM post_counts").execute(&mut *tx).await?;
-        sqlx::query(
-            "INSERT INTO post_counts (post_uri, like_count, repost_count, reply_count, quote_count) \
-             SELECT u, sum(l)::int, sum(r)::int, sum(p)::int, sum(q)::int FROM ( \
-               SELECT subject_uri AS u, 1 AS l, 0 AS r, 0 AS p, 0 AS q FROM likes \
-               UNION ALL SELECT subject_uri, 0, 1, 0, 0 FROM reposts \
-               UNION ALL SELECT reply_parent_uri, 0, 0, 1, 0 FROM posts WHERE reply_parent_uri IS NOT NULL \
-               UNION ALL SELECT quote_uri, 0, 0, 0, 1 FROM posts WHERE quote_uri IS NOT NULL \
-             ) t GROUP BY u",
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM actor_counts").execute(&mut *tx).await?;
-        sqlx::query(
-            "INSERT INTO actor_counts (did, followers_count, follows_count, posts_count) \
-             SELECT d, sum(fr)::int, sum(fs)::int, sum(p)::int FROM ( \
-               SELECT subject_did AS d, 1 AS fr, 0 AS fs, 0 AS p FROM follows \
-               UNION ALL SELECT author_did, 0, 1, 0 FROM follows \
-               UNION ALL SELECT author_did, 0, 0, 1 FROM posts \
-             ) t GROUP BY d",
-        )
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await
+        repair_counts(&self.pool).await
     }
 
     async fn reload_follow_counts(&self) -> Result<(), sqlx::Error> {
@@ -355,6 +326,45 @@ impl Rebuild {
         .await?;
         Ok(())
     }
+}
+
+/// §9.5 repair: recompute both count tables from the base tables. The
+/// share-row-exclusive locks hold count-trigger writers for the duration,
+/// so no increment is lost or doubled. A function of the pool, so the end
+/// of a public-indexing fill runs it too (public-indexing design §8.5).
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn repair_counts(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE post_counts, actor_counts IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM post_counts").execute(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO post_counts (post_uri, like_count, repost_count, reply_count, quote_count) \
+         SELECT u, sum(l)::int, sum(r)::int, sum(p)::int, sum(q)::int FROM ( \
+           SELECT subject_uri AS u, 1 AS l, 0 AS r, 0 AS p, 0 AS q FROM likes \
+           UNION ALL SELECT subject_uri, 0, 1, 0, 0 FROM reposts \
+           UNION ALL SELECT reply_parent_uri, 0, 0, 1, 0 FROM posts WHERE reply_parent_uri IS NOT NULL \
+           UNION ALL SELECT quote_uri, 0, 0, 0, 1 FROM posts WHERE quote_uri IS NOT NULL \
+         ) t GROUP BY u",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM actor_counts").execute(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO actor_counts (did, followers_count, follows_count, posts_count) \
+         SELECT d, sum(fr)::int, sum(fs)::int, sum(p)::int FROM ( \
+           SELECT subject_did AS d, 1 AS fr, 0 AS fs, 0 AS p FROM follows \
+           UNION ALL SELECT author_did, 0, 1, 0 FROM follows \
+           UNION ALL SELECT author_did, 0, 0, 1 FROM posts \
+         ) t GROUP BY d",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
 }
 
 #[cfg(test)]

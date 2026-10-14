@@ -2,7 +2,7 @@
 //! `{"ok","version"}`; a caller whose service JWT verifies (`lxm` `_health`,
 //! no membership check) gets the detail:
 //! `{"ok","version","db","redis","audit_ok","watermarks":{label: rfc3339|null},
-//! "private_watermark","gap_blocked"}`. 200 when db and redis are reachable
+//! "private_watermark","gap_blocked","public_indexing"}`. 200 when db and redis are reachable
 //! and the audit guard has not latched (§6.5), else 503. An invalid token is
 //! answered as anonymous.
 //!
@@ -25,9 +25,11 @@ use axum::routing::get;
 use chrono::{DateTime, SecondsFormat, Utc};
 use redis::aio::ConnectionManager;
 use serde::Serialize;
+use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::db::schema_backfill::SchemaStatus;
+use crate::indexing::PublicIndexing;
 use crate::firehose::consumer::ConsumerStatus;
 use crate::firehose::watermark::Watermarks;
 use crate::xrpc::errors::XrpcError;
@@ -75,6 +77,8 @@ pub struct HealthState {
     pub trusted_proxy: IpAddr,
     /// The post-migration task's progress (design-v3 §12.2).
     pub schema: SchemaStatus,
+    /// The public-indexing switch (public-indexing design §10).
+    pub public: PublicIndexing,
 }
 
 /// The anonymous response body.
@@ -112,6 +116,11 @@ pub struct Health {
     /// search runs degraded and the private tier's pair lookups read a
     /// wider index.
     pub search_indexes_ready: bool,
+    /// The public-indexing switch (public-indexing design §10): the value,
+    /// mode, phase, generation, `pending`, the file value, the sweep's and
+    /// the fill's progress, and `error` (`"held"`, `"sweep_stalled"` or
+    /// null). Null until read. It never fails health.
+    pub public_indexing: Value,
 }
 
 fn rfc3339(t: DateTime<Utc>) -> String {
@@ -136,6 +145,7 @@ pub fn body(db: bool, redis: bool, audit_ok: bool, watermarks: &Watermarks, gap_
         gap_blocked,
         schema_backfill_done: schema.backfill_done(),
         search_indexes_ready: schema.indexes_ready(),
+        public_indexing: Value::Null,
     }
 }
 
@@ -174,9 +184,14 @@ async fn health(State(state): State<HealthState>, ConnectInfo(peer): ConnectInfo
         probe_db(&state.pool),
         probe_redis(&state.redis)
     );
-    let h = body(db, redis, !state.audit.latched(), &state.watermarks, state.status.gap_blocked(), &state.schema);
+    let mut h = body(db, redis, !state.audit.latched(), &state.watermarks, state.status.gap_blocked(), &state.schema);
     let code = if h.ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     if detail {
+        h.public_indexing = match tokio::time::timeout(PROBE_TIMEOUT, state.public.status()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => serde_json::json!({ "read_error": error.to_string() }),
+            Err(_) => serde_json::json!({ "read_error": "timed out" }),
+        };
         (code, Json(h)).into_response()
     } else {
         (code, Json(Summary::from(&h))).into_response()
@@ -263,6 +278,11 @@ mod tests {
             limits: RateLimits::new(),
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
             schema: SchemaStatus::default(),
+            public: PublicIndexing::new(
+                db.pool.clone(),
+                crate::aggregations::ScopeState::new(Default::default(), crate::config::ScopePolicy::MembersAndOneHop, 10),
+                crate::indexing::PublicModeSettings::from_config(&crate::config::IndexingConfig::default()),
+            ),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -303,6 +323,12 @@ mod tests {
         }
         assert_eq!(v["db"], true);
         assert_eq!(v["redis"], true);
+        // The public-indexing block (public-indexing design §10).
+        let public = &v["public_indexing"];
+        for key in ["value", "mode", "phase", "generation", "pending", "since", "last_fill_since", "file", "sweep", "fill", "error"] {
+            assert!(public.get(key).is_some(), "{key}: {public}");
+        }
+        assert_eq!(public["mode"], "on");
         db.drop_db().await;
     }
 }

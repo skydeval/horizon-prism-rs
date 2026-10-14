@@ -32,6 +32,7 @@ use crate::firehose::coverage::CoverageTracker;
 use crate::firehose::watermark::Watermarks;
 use crate::firehose::writer::Writer;
 use crate::identity::fetch_cell::AuthBudget;
+use crate::indexing::{PublicIndexing, PublicModeSettings};
 use crate::identity::{IdentityRefresher, IdentityResolver, IdentitySettings, PersistencePolicy};
 use crate::microcosm::ConstellationClient;
 use crate::net::{NetClient, NetConfig};
@@ -165,6 +166,14 @@ pub async fn run() -> Result<(), StartupError> {
     )
     .await
     .map_err(|e| StartupError::new(1, format!("loading scope state: {e}")))?;
+    // The public-indexing switch (public-indexing design §3.5): its startup
+    // sequence runs before the first writer (`purger.resume_all` below) and
+    // hands back the one task the state needs, spawned here.
+    let public = PublicIndexing::new(pool.clone(), scope.clone(), PublicModeSettings::from_config(&cfg.file.indexing));
+    let public_task = public
+        .startup(&cfg.file.indexing)
+        .await
+        .map_err(|e| StartupError::new(1, format!("public indexing startup: {e}")))?;
     let policy: Arc<dyn PersistencePolicy> = Arc::new(scope.clone());
     let resolver = IdentityResolver::new(net.clone(), pool.clone(), IdentitySettings::from_app(&cfg), policy);
     // Rule 4 (§4.3): the applier runs list phases and releases.
@@ -186,6 +195,9 @@ pub async fn run() -> Result<(), StartupError> {
     let constellation = ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url);
 
     let mut tasks = Vec::new();
+    if let Some(task) = public_task {
+        tasks.push(public.spawn(task));
+    }
 
     // Every upstream a public request reaches has one request bucket,
     // split into pools and per-requester shares (design-v3 §II-8.3).
@@ -448,6 +460,7 @@ pub async fn run() -> Result<(), StartupError> {
             farsight: farsight.clone(),
             sync_min_interval_secs: lists.sync_min_interval_secs,
             list_budget,
+            public: public.clone(),
         })
         .spawn(),
     );
@@ -615,6 +628,7 @@ pub async fn run() -> Result<(), StartupError> {
         limits: app.limits.clone(),
         trusted_proxy: app.trusted_proxy,
         schema: schema_status,
+        public,
     };
     let listener = TcpListener::bind(cfg.file.http.bind)
         .await

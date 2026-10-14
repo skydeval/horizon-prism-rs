@@ -262,6 +262,11 @@ mod tests {
             farsight: None,
             sync_min_interval_secs: 600,
             list_budget: crate::subscriptions::references::Budget { max_references: 25, max_owners: 10 },
+            public: crate::indexing::PublicIndexing::new(
+                db.pool.clone(),
+                scope.clone(),
+                crate::indexing::PublicModeSettings::from_config(&crate::config::IndexingConfig::default()),
+            ),
         };
         Some((db, AdminExecutor::new(handlers), scope))
     }
@@ -499,6 +504,34 @@ mod tests {
         assert_eq!(remaining.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(), [gone_id]);
         assert!(matches!(run(&exec, p, AdminCommand::DeadletterDrop { id: keep_id }).await, Finished::Failed(_)));
         let _: i64 = redis::cmd("DEL").arg(&stream).query_async(&mut redis).await.expect("del");
+        db.drop_db().await;
+    }
+
+    /// `indexing public-scope` and `indexing status` go through the queue:
+    /// the command changes the phase and spawns the sweep, which ends Off.
+    #[tokio::test]
+    async fn indexing_commands_through_the_queue() {
+        use crate::indexing::ScopeValue;
+
+        let Some((db, exec, scope)) = setup("admin_indexing", ScopeSets::default()).await else {
+            return;
+        };
+        let p = &db.pool;
+        let r = done(run(&exec, p, AdminCommand::IndexingPublicScope { value: ScopeValue::Off }).await);
+        assert_eq!((&r["action"], &r["mode"], &r["generation"], &r["task"]), (&json!("draining"), &json!("draining"), &json!(1), &json!("sweep")));
+        let r = done(run(&exec, p, AdminCommand::IndexingStatus).await);
+        assert_eq!(r["value"], "off");
+        assert_eq!(r["updated_by"], "cli");
+        // The empty database's sweep ends by itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while scope.public_mode() != crate::indexing::PublicMode::Off {
+            assert!(std::time::Instant::now() < deadline, "the sweep did not end");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let r = done(run(&exec, p, AdminCommand::IndexingStatus).await);
+        assert_eq!((&r["mode"], &r["phase"], &r["generation"], &r["error"]), (&json!("off"), &json!("off"), &json!(2), &Value::Null));
+        let r = done(run(&exec, p, AdminCommand::IndexingPublicScope { value: ScopeValue::Off }).await);
+        assert_eq!((&r["action"], &r["task"]), (&json!("no_op"), &Value::Null));
         db.drop_db().await;
     }
 

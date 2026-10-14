@@ -22,6 +22,7 @@ use crate::firehose::index_request::{IndexError, index_record};
 use crate::firehose::jobs::{self, Depth};
 use crate::firehose::writer::Writer;
 use crate::identity::eligibility::{self, Confirmation};
+use crate::indexing::{PublicIndexing, ScopeValue};
 use crate::private_tier::PrivateTier;
 use crate::subscriptions::references::{Budget, drop_member};
 use crate::subscriptions::{jobs as list_sync, triggers};
@@ -53,6 +54,11 @@ pub enum AdminCommand {
     /// `lists purge <did>`: delete the DID's list mutes and the list
     /// records it authored.
     ListsPurge { did: String },
+    /// `indexing public-scope <off|community_scoped>`: the public-indexing
+    /// switch (public-indexing design §3.4).
+    IndexingPublicScope { value: ScopeValue },
+    /// `indexing status`: the switch's row, mode, phase and progress.
+    IndexingStatus,
 }
 
 /// A command that cannot be parsed or is invalid.
@@ -88,6 +94,8 @@ impl AdminCommand {
             Self::FarsightForget { did } => ("farsight forget", json!({ "did": did })),
             Self::ListsSync { uri } => ("lists sync", json!({ "uri": uri })),
             Self::ListsPurge { did } => ("lists purge", json!({ "did": did })),
+            Self::IndexingPublicScope { value } => ("indexing public-scope", json!({ "value": value.as_str() })),
+            Self::IndexingStatus => ("indexing status", json!({})),
         }
     }
 
@@ -161,6 +169,14 @@ impl AdminCommand {
                 Self::ListsSync { uri }
             }
             "lists purge" => Self::ListsPurge { did: did()? },
+            "indexing public-scope" => {
+                let value = s("value")?;
+                Self::IndexingPublicScope {
+                    value: ScopeValue::parse(&value)
+                        .ok_or_else(|| InvalidCommand(format!("{command}: {value:?} is not off or community_scoped")))?,
+                }
+            }
+            "indexing status" => Self::IndexingStatus,
             other => return Err(InvalidCommand(format!("unknown command {other:?}"))),
         })
     }
@@ -181,6 +197,8 @@ impl AdminCommand {
             | Self::DeadletterReplay { .. }
             | Self::DeadletterDrop { .. }
             | Self::FarsightStatus
+            | Self::IndexingPublicScope { .. }
+            | Self::IndexingStatus
             // A prime writes nothing here, so it waits on no purge.
             | Self::FarsightPrime { .. }
             // Its handler waits on a purge of the viewer itself.
@@ -219,6 +237,9 @@ pub struct Handlers {
     pub sync_min_interval_secs: u32,
     /// A member's budget of list references (design-v3 §4.3).
     pub list_budget: Budget,
+    /// The public-indexing switch, which also spawns the task a phase
+    /// change needs (public-indexing design §3.4).
+    pub public: PublicIndexing,
 }
 
 impl Handlers {
@@ -251,8 +272,28 @@ impl Handlers {
             AdminCommand::FarsightForget { did } => self.farsight_forget(did).await,
             AdminCommand::ListsSync { uri } => self.lists_sync(uri).await,
             AdminCommand::ListsPurge { did } => self.lists_purge(did).await,
+            AdminCommand::IndexingPublicScope { value } => self.indexing_public_scope(*value).await,
+            AdminCommand::IndexingStatus => self.public.status().await.map(Outcome::Done).map_err(|e| e.to_string()),
         };
         result.unwrap_or_else(Outcome::Failed)
+    }
+
+    /// `indexing public-scope` (public-indexing design §3.4): the command's
+    /// transaction, then the task its phase change needs.
+    async fn indexing_public_scope(&self, value: ScopeValue) -> Result<Outcome, String> {
+        let applied = self.public.apply_scope(value, "cli").await.map_err(|e| e.to_string())?;
+        let task = applied.spawn.map(|task| {
+            let kind = task.kind();
+            drop(self.public.spawn(task));
+            kind
+        });
+        Ok(Outcome::Done(json!({
+            "value": value.as_str(),
+            "action": applied.action,
+            "mode": applied.mode.as_str(),
+            "generation": applied.generation,
+            "task": task,
+        })))
     }
 
     /// `lists purge` (design-v3 §14.3): deletes the DID's list mutes and
@@ -622,6 +663,18 @@ mod tests {
         assert!(AdminCommand::parse("backfill", &json!({"did": DID, "depth": "deep"})).is_err());
         assert!(AdminCommand::parse("deadletter drop", &json!({"id": "x"})).is_err());
         assert!(AdminCommand::parse("purge everything", &json!({})).is_err());
+        // The public-indexing commands round-trip, wait on no purge, and
+        // refuse `full`.
+        for cmd in [
+            AdminCommand::IndexingPublicScope { value: ScopeValue::Off },
+            AdminCommand::IndexingPublicScope { value: ScopeValue::CommunityScoped },
+            AdminCommand::IndexingStatus,
+        ] {
+            let (name, args) = cmd.to_row();
+            assert_eq!(AdminCommand::parse(name, &args), Ok(cmd.clone()));
+            assert_eq!(cmd.did(), None);
+        }
+        assert!(AdminCommand::parse("indexing public-scope", &json!({"value": "full"})).is_err());
     }
 
     #[test]

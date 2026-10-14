@@ -147,7 +147,8 @@ Commands that change state are executed by the running `app` service, not by the
 - `label add` and `label remove`;
 - `scope rebuild`, `backfill` and `resync`;
 - `deadletter replay` and `deadletter drop`;
-- `farsight status` and `farsight prime` (below).
+- `farsight status` and `farsight prime` (below);
+- `indexing public-scope` and `indexing status` (below).
 
 The CLI queues the command and waits up to `admin.command_timeout_secs` (600 s) for the result. If it times out, the command keeps running, and `admin commands list` shows its state. `app` must be running for these commands to take effect.
 
@@ -166,6 +167,26 @@ docker compose exec app /app/horizon-prism-rs admin farsight prime <did> [--forc
 - `prime` asks Farsight to read one account's repository again. Use it when a member's own blocks look out of date. The app does this by itself when a member is enrolled.
 
 Watch `farsight_calls_total{outcome}` for failures, `farsight_auth_failed_total` for a revoked or under-scoped key, and `farsight_coverage_total{level}`: at `partial`, Farsight is still catching up and some list blocks may be missing.
+
+### Public indexing (on or off)
+
+`indexing.public_scope` decides whether the app also serves as a public AppView. With it `off`, the app indexes and serves only what the private tier, Thread Lens and Horizon features need, and the client uses a public AppView (Bluesky or another) for everything else.
+
+```sh
+docker compose exec app /app/horizon-prism-rs admin indexing status
+docker compose exec app /app/horizon-prism-rs admin indexing public-scope off
+docker compose exec app /app/horizon-prism-rs admin indexing public-scope community_scoped
+```
+
+- **What off keeps:** every block; follows with a member at either end; members' own likes, reposts, lists, list items, list blocks and opt-outs; profiles and identity of accounts in scope; labels, tombstones, mutes, bookmarks, drafts; the whole private tier; and, for each member's post, only whom it replies to and quotes. **What off drops:** posts, feeds, notifications, everyone else's likes, reposts, follows and lists, gates, starter packs, polls, labeler services, and the count and trend tables. Public endpoints answer 501.
+- **An upgrade never turns it off.** A deployment that already holds public data stays `community_scoped` after the upgrade, whatever `app.toml` says, and logs `public_scope_file_not_applied`. A fresh install with no public data starts `off`. To turn an upgraded deployment off, run `admin indexing public-scope off`, or uncomment `public_scope = "off"` in `config/app.toml` and restart once the upgraded build has started at least once. An edit made in the same deploy as the upgrade is only recorded.
+- **The template line stays a comment.** Only a key written in `app.toml` is ever applied, and only when it changed since the last start. Commenting it out again changes nothing.
+- **Turning off deletes.** The app deletes the dropped data in the background, table by table, in small batches; `status` shows the table, the rows deleted and when it last advanced. **Turning on refills only to backfill depth:** recent posts and interactions of each account in scope, not the full history, and no old notifications. **Take a `pg_dump` first** (see "Back up first" above).
+- **Disk space comes back through autovacuum**, not through the switch: deleted rows become reusable space inside Postgres, and the data stays in WAL and backups until they age out. No `VACUUM FULL` is run.
+- **Turning on:** while the resyncs run, public endpoints answer 501 with a "being turned on" message. The fill ends when its jobs are done, or after `indexing.fill_max_wait_hours` (24) at most. **Its end recomputes the count tables, which stalls writers for as long as the weekly scope rebuild's repair does.**
+- **Backfill claims:** worker 0 claims jobs in plain due order and runs no list syncs; workers 1 and up give `member`, `private` and `authz` jobs first claim, so new members and gap recovery do not wait behind a resync wave.
+- **Notifications:** a record that a backfill writes, and that was created before the most recent fill began, does not notify. Live records always do.
+- `status` reports `error: "held"` when the stored state is unreadable (the off rule applies and nothing is deleted or filled until the next `public-scope` command), and `"sweep_stalled"` when the deletion has not advanced for 30 minutes. The same block is in the authenticated `_health` detail as `public_indexing`. Watch `public_indexing_phase{phase}`, `public_sweep_stalled`, `public_sweep_deleted_rows_total{table}`, `public_sweep_retries_total{table,reason}`, `public_fill_jobs_remaining` and `public_fill_incomplete_jobs`.
 
 ## Log inspection
 

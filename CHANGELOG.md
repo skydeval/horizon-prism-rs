@@ -39,6 +39,29 @@ commit.
   - **Removing a member under the off rule** also removes the rows kept
     only because it was a member.
 
+- **Public indexing switch, part 3: the switch (#708).**
+  - **Commands:** `admin indexing public-scope <off|community_scoped>`
+    and `admin indexing status`. The live value is held in
+    `operator_settings`; the running state in
+    `worker_state['public_transition']`.
+  - **Startup** never deletes anything by itself. A database with public
+    data and no setting row is an upgrade: it stays `community_scoped`,
+    and the file's value is only recorded. After that, an explicit
+    `public_scope` in `app.toml` is applied only when it changed since
+    the last start. An unreadable state is held: the off rule applies,
+    nothing is deleted or filled, and health reports `held`.
+  - **Turning off** deletes stored public data in the background, table
+    by table, in short batches that resume after a restart and keep
+    members' rows. Health shows progress and raises `sweep_stalled` after
+    30 minutes without progress.
+  - **Turning on** queues a resync for every scoped account, staggered one
+    second apart. When they are done, or after
+    `indexing.fill_max_wait_hours`, counts are repaired and the mode
+    becomes On. A request to turn on while deleting waits for the delete
+    to end.
+  - **Health** gains a `public_indexing` block; `docker/README.md` gains
+    the operator note.
+
 - **Backfill claim order (#708, part 2).** Worker 0 claims the earliest
   due job of any depth, as before, and no longer runs list syncs when
   there are two or more workers. Workers 1 and up claim due `member`,
