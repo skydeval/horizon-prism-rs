@@ -80,10 +80,26 @@ impl ReadGate {
         self.breaker.admit(now)
     }
 
+    /// Admit one read call that must never be the half-open probe: a
+    /// visitor's (a Thread Lens caller that is not a ready member). Its
+    /// failures are not recorded, so as the probe it could only give the
+    /// slot back, and visitors would hold the breaker half-open through an
+    /// outage: never open, so never "down". A closed breaker admits it;
+    /// an open or half-open one refuses it.
+    pub fn admit_unless_probe(&self) -> Option<Admission<'_>> {
+        self.breaker.admit_unless_probe()
+    }
+
     /// Whether the read breaker is open now.
     #[must_use]
     pub fn is_open(&self, now: Instant) -> bool {
         self.breaker.is_open(now)
+    }
+
+    /// Put the read breaker in the half-open state, with no probe out.
+    #[cfg(test)]
+    pub(crate) fn force_half_open(&self) {
+        self.breaker.force_half_open();
     }
 
     /// Record one call's outcome: on the run, and (with `class`) on the
@@ -189,5 +205,27 @@ mod tests {
         outcome(&gate, Some(Class::Hit), Effect::Answer);
         fail(&gate, 5);
         assert_eq!(gate.read(Instant::now()), GateRead { down: true, answers: 2 });
+    }
+
+    /// A call that must not probe leaves the probe to a call whose outcome
+    /// is recorded: with the breaker half-open it is refused, an ordinary
+    /// call made at the same time is the probe, and that probe's failure
+    /// re-opens the breaker.
+    #[test]
+    fn a_half_open_gate_refuses_a_call_that_must_not_probe() {
+        let gate = ReadGate::default();
+        assert!(gate.admit_unless_probe().is_some(), "closed: admitted");
+        outcome(&gate, Some(Class::Hit), Effect::Answer);
+        fail(&gate, 5);
+        assert!(gate.read(Instant::now()).down);
+        assert!(gate.admit_unless_probe().is_none(), "open: refused");
+
+        gate.force_half_open();
+        let now = Instant::now();
+        assert!(gate.admit_unless_probe().is_none(), "half-open: refused");
+        let probe = gate.admit(now).expect("the slot was not taken");
+        assert!(gate.admit_unless_probe().is_none() && gate.admit(now).is_none());
+        gate.record(probe, Some(Class::Transient), Effect::ServiceFailure, now);
+        assert!(gate.is_open(now) && gate.read(now).down, "a failed probe re-opens");
     }
 }

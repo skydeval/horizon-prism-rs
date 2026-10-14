@@ -274,6 +274,28 @@ fn known_blocks() -> Option<Arc<KnownBlocks>> {
     KNOWN_BLOCKS.try_with(Arc::clone).ok()
 }
 
+/// Add the blocks the request itself knows (Thread Lens, §5.15.12) to
+/// `out`, for those of `dids` that are not `me`. The direction is the one
+/// the request found, not a guess from which source spoke. Outside
+/// [`with_known_blocks`] this does nothing.
+///
+/// Both sets are filled for every caller. `blocked_by` is emitted as
+/// `viewer.blockedBy`. `blocking_unrecorded` emits no field, and is what
+/// makes a view treat the author as blocked by the viewer.
+fn apply_known_blocks(out: &mut ActorViewer, me: &str, dids: &[String]) {
+    let Some(known) = known_blocks() else {
+        return;
+    };
+    for did in dids.iter().filter(|did| did.as_str() != me) {
+        if known.of_viewer.contains(did) {
+            out.blocked_by.insert(did.clone());
+        }
+        if known.by_viewer.contains(did) && !out.blocking.contains_key(did) {
+            out.blocking_unrecorded.insert(did.clone());
+        }
+    }
+}
+
 /// A locally servable list, for a `listViewBasic`: uri, cid, name,
 /// purpose, avatar CID, indexed time, and its creator's PDS.
 type LocalListRow = (String, String, String, String, Option<String>, DateTime<Utc>, Option<String>);
@@ -565,14 +587,24 @@ impl Hydrator {
         Ok(out)
     }
 
-    /// Viewer relationships to `dids` (§7.5). Empty for a non-hydrated viewer.
+    /// Viewer relationships to `dids` (§7.5). Empty for a non-hydrated
+    /// viewer, with one exception: a signed-in caller that is not a ready
+    /// member, inside a request that supplies its own blocks (a Thread
+    /// Lens visitor), gets those blocks and nothing else. No table is read
+    /// for it and Farsight is not asked again.
     ///
     /// # Errors
     ///
     /// Database errors.
     pub async fn actor_viewer(&self, viewer: &Viewer, dids: &[String]) -> Result<ActorViewer, sqlx::Error> {
         let Some(me) = viewer.state_did() else {
-            return Ok(ActorViewer::default());
+            let mut out = ActorViewer::default();
+            // `state_did` is `None` for a visitor, so the caller's own DID
+            // is taken from the viewer itself.
+            if let Some(visitor) = viewer.did.as_deref() {
+                apply_known_blocks(&mut out, visitor, dids);
+            }
+            return Ok(out);
         };
         if dids.is_empty() {
             return Ok(ActorViewer::default());
@@ -681,19 +713,7 @@ impl Hydrator {
             }
         }
         out.list_views = self.local_list_basics(me, out.muted_by_list.values().chain(out.blocking_by_list.values())).await?;
-        // Blocks the request itself knows (Thread Lens, §5.15.12). The
-        // direction is the one the request found, not a guess from which
-        // source spoke.
-        if let Some(known) = known_blocks() {
-            for did in dids.iter().filter(|did| did.as_str() != me) {
-                if known.of_viewer.contains(did) {
-                    out.blocked_by.insert(did.clone());
-                }
-                if known.by_viewer.contains(did) && !out.blocking.contains_key(did) {
-                    out.blocking_unrecorded.insert(did.clone());
-                }
-            }
-        }
+        apply_known_blocks(&mut out, me, dids);
         Ok(out)
     }
 

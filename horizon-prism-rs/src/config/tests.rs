@@ -297,6 +297,7 @@ max_parents = 80
 max_walk = 50
 
 [threadlens]
+access = "signed_in"
 page_nodes = 200
 listing_calls = 60
 verdict_round_timeout_ms = 500
@@ -820,6 +821,18 @@ fn threadlens_bounds_have_floors() {
     let cfg = load("[threadlens]\npage_nodes = 2\nlisting_calls = 2\nparent_rounds = 1\n").expect("the floors themselves are valid");
     assert_eq!((cfg.file.threadlens.verdict_max_dids, cfg.file.threadlens.verdict_round_timeout_ms), (600, 500));
     assert!(cfg.env.threadlens_cursor_key.is_none());
+}
+
+/// `threadlens.access`: every signed-in account by default, members only
+/// on request, and any other value does not parse.
+#[test]
+fn threadlens_access_is_members_or_signed_in() {
+    assert_eq!(load("").expect("defaults").file.threadlens.access, ThreadLensAccess::SignedIn);
+    let cfg = load("[threadlens]\naccess = \"members\"\n").expect("members");
+    assert_eq!(cfg.file.threadlens.access, ThreadLensAccess::Members);
+    let cfg = load("[threadlens]\naccess = \"signed_in\"\n").expect("signed_in");
+    assert_eq!(cfg.file.threadlens.access, ThreadLensAccess::SignedIn);
+    assert!(!matches!(load("[threadlens]\naccess = \"everyone\"\n"), Ok(_) | Err(ConfigError::Invalid(_))), "an unknown value is a parse error");
 }
 
 /// design-v3 §4.3 "Budgets": a config that still carries a key the

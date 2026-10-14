@@ -424,7 +424,16 @@ max_walk = 50
 # bound the block checks one response makes: the time one round of checks
 # may take, how many rounds the walk up the parents may make, and how many
 # different authors are checked.
+# access says who may use it:
+#   "signed_in"  every signed-in account, members or not (the default)
+#   "members"    members of this server whose account is ready; anyone else
+#                is refused
+# Nobody may use it without signing in. An account that is not a ready
+# member gets the same thread with its own blocks applied, but no likes,
+# follows or mutes in it, and its block checks come out of the non-member
+# part of the [farsight] rate below ([constellation] nonmember_fraction).
 [threadlens]
+access = "signed_in"
 page_nodes = 200
 listing_calls = 60
 verdict_round_timeout_ms = 500
@@ -480,7 +489,12 @@ sync_max_wall_secs = 3600
 # url must be https and reach Farsight at a public address. Set
 # FARSIGHT_TOKEN in .env to a Farsight API key with the read and backfill
 # scopes. Whoever runs that Farsight sees which accounts each member's pages
-# contain, so point this at an instance you run or trust.
+# contain, and which accounts are in the threads that anyone opens with
+# Thread Lens (see [threadlens] access), so point this at an instance you
+# run or trust.
+# Answers are kept for cache_ttl_secs, at most cache_entries_per_viewer for
+# one account and cache_entries_total in all. When the total is reached,
+# answers kept for accounts that are not ready members go first.
 [farsight]
 # url = "https://farsight.example.net"
 timeout_ms = 500                 # one call, and all one request may wait
@@ -490,8 +504,10 @@ cache_entries_total = 200000
 max_calls_per_request = 3        # each call covers up to 100 accounts
 rate_per_sec = 50.0              # keep at or below the key's limit on Farsight
 burst = 100
-requester_share = 0.25           # the most one member may use of that rate
-prime_on_enroll = true           # ask Farsight to read a new member's repo
+# The most one account may use of that rate: a ready member of the members'
+# part of it, and any other signed-in account of the non-member part.
+requester_share = 0.25
+prime_on_enroll = true          # ask Farsight to read a new member's repo
 
 # A stand-in for when Farsight is down. Off unless you turn it on, and it
 # needs farsight.url above. While Farsight has stopped answering, a ready

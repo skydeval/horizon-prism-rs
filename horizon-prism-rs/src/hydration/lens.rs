@@ -1,8 +1,11 @@
 //! Thread Lens hydration (design-v3 §5.15; proposed locked decision 38).
 //!
-//! Thread Lens is a member endpoint and its responses are for the caller:
+//! Thread Lens is for signed-in callers (ready members only, or every
+//! signed-in account, by `threadlens.access`) and its responses are for the
+//! caller:
 //! - post views carry the caller's viewer state, as ordinary member views
-//!   do;
+//!   do. For a caller that is not a ready member (a visitor) that is
+//!   `blockedBy` from the request's verdicts and nothing else;
 //! - the blocks the request knows (its verdicts) are supplied to every
 //!   hydration step through [`super::with_known_blocks`], so local and
 //!   upstream views agree with the gaps the response shows;

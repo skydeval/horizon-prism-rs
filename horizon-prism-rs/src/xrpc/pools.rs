@@ -469,6 +469,25 @@ impl SharedBucket {
         self.take(requester, Instant::now())
     }
 
+    /// [`Self::quiet_draw`] on the non-member pool only, whatever the
+    /// key's variant. For a caller that is known by its account and is not
+    /// a ready member (a Thread Lens visitor, charged to its DID): it has a
+    /// share of its own there, the one a member's overflow uses, and it
+    /// never touches the member pool. On success the pool is always
+    /// [`Pool::NonMember`].
+    ///
+    /// # Errors
+    ///
+    /// [`Exhausted`] when the requester's share of the non-member pool, or
+    /// that pool, is empty.
+    pub fn quiet_draw_nonmember(&self, requester: &ChargeKey) -> Result<Pool, Exhausted> {
+        self.take_nonmember(requester, Instant::now())
+    }
+
+    fn take_nonmember(&self, requester: &ChargeKey, now: Instant) -> Result<Pool, Exhausted> {
+        self.draw_in(&self.inner.nonmember, requester, now)
+    }
+
     fn take(&self, requester: &ChargeKey, now: Instant) -> Result<Pool, Exhausted> {
         let inner = &self.inner;
         match requester {
@@ -816,6 +835,45 @@ mod tests {
             assert_eq!(bucket.draw_at(&m, now), Ok(Pool::NonMember));
         }
         assert!(bucket.draw_at(&m, now).is_err());
+    }
+
+    /// A draw on the non-member pool by account: each account has a share
+    /// of its own there, and the member pool is never touched, also when
+    /// the key is a member key.
+    #[test]
+    fn a_nonmember_draw_by_account_has_its_own_share_and_leaves_the_member_pool() {
+        // As above: the non-member pool is 10/s, burst 20; a share, burst 5.
+        let bucket = shares().bucket("farsight", 20.0, 40);
+        let now = Instant::now();
+        let a = ChargeKey::member("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa");
+        let b = ChargeKey::member("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb");
+        // Two accounts behind one address each have a whole share.
+        for key in [&a, &b] {
+            for _ in 0..5 {
+                assert_eq!(bucket.take_nonmember(key, now), Ok(Pool::NonMember));
+            }
+            assert_eq!(bucket.take_nonmember(key, now).expect_err("its share is empty").pool, Pool::NonMember);
+        }
+        // The address they came from has its own share too.
+        assert_eq!(bucket.take_nonmember(&ip("203.0.113.1"), now), Ok(Pool::NonMember));
+        // The member pool is whole: the same key, drawn the ordinary way,
+        // takes its five member tokens. Its non-member share is the one
+        // already emptied above, so nothing is left for it after that.
+        for _ in 0..5 {
+            assert_eq!(bucket.draw_at(&a, now), Ok(Pool::Member));
+        }
+        assert!(bucket.draw_at(&a, now).is_err());
+        // With the non-member pool empty, a non-member draw fails though
+        // the member pool has tokens.
+        for other in ["203.0.113.2", "203.0.113.3"] {
+            while bucket.draw_at(&ip(other), now).is_ok() {}
+        }
+        let c = ChargeKey::member("did:plc:cccccccccccccccccccccccc");
+        assert!(bucket.take_nonmember(&c, now).is_err());
+        assert_eq!(bucket.draw_at(&c, now), Ok(Pool::Member));
+        // The public entry point draws on the same pool.
+        let fresh = shares().bucket("farsight", 20.0, 40);
+        assert_eq!(fresh.quiet_draw_nonmember(&a), Ok(Pool::NonMember));
     }
 
     #[test]

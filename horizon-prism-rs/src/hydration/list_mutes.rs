@@ -308,6 +308,44 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// A Thread Lens visitor (signed in, not a ready member): inside a
+    /// request that supplies its blocks, `actor_viewer` returns those
+    /// blocks and nothing else, and reads no table. Outside one, and for
+    /// an anonymous viewer, it returns nothing, as before.
+    #[tokio::test]
+    async fn a_visitor_gets_the_requests_blocks_and_no_other_state() {
+        const CAROL: &str = "did:plc:cccccccccccccccccccccccc";
+        // A pool that cannot connect: any table read would be an error.
+        let pool = sqlx::PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").expect("lazy pool");
+        let h = hydrator(&pool, ScopeSets::default());
+        let visitor = Viewer { did: Some(ALICE.into()), hydrate: false };
+        let dids = [CAROL.to_string(), BOB.to_string(), ALICE.to_string()];
+        // The visitor blocks Carol; Bob blocks the visitor. The visitor's
+        // own DID among the blockers is left out, as for a member.
+        let known = || {
+            std::sync::Arc::new(crate::hydration::KnownBlocks {
+                by_viewer: [CAROL.to_string()].into(),
+                of_viewer: [BOB.to_string(), ALICE.to_string()].into(),
+            })
+        };
+
+        let s = crate::hydration::with_known_blocks(known(), h.actor_viewer(&visitor, &dids)).await.expect("no table is read");
+        // The inbound blocker is named; the outbound one is treated as
+        // blocked without a `blocking` field, which needs a record's URI.
+        assert_eq!(s.view(BOB), json!({"muted": false, "blockedBy": true}));
+        assert_eq!(s.view(CAROL), json!({"muted": false, "blockedBy": false}));
+        assert!(s.blocked_either_way(BOB) && s.blocked_either_way(CAROL) && !s.blocked_either_way(ALICE));
+        assert!(s.blocking.is_empty() && s.following.is_empty() && s.followed_by.is_empty() && s.muted.is_empty());
+
+        // Outside such a request a non-member has no viewer state at all.
+        let s = h.actor_viewer(&visitor, &dids).await.expect("no table is read");
+        assert!(s.blocked_by.is_empty() && !s.blocked_either_way(BOB) && !s.blocked_either_way(CAROL));
+        assert_eq!(s.view(BOB), json!({"muted": false, "blockedBy": false}));
+        // An anonymous viewer has none inside one either.
+        let s = crate::hydration::with_known_blocks(known(), h.actor_viewer(&Viewer::anonymous(), &dids)).await.expect("no table is read");
+        assert!(s.blocked_by.is_empty() && !s.blocked_either_way(BOB) && !s.blocked_either_way(CAROL));
+    }
+
     /// A moderation list can be muted, up to the member's budget; any
     /// other list, or anything that is not a list, is refused; the mutes
     /// and the blocks are listed newest first.

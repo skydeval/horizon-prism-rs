@@ -76,6 +76,21 @@ impl Breaker {
         }
     }
 
+    /// [`Breaker::admit`] for a call that must never be the half-open
+    /// probe: a closed breaker admits it as normal, and an open or
+    /// half-open one refuses it, whether or not a probe is out. The probe
+    /// flag is never set, so the slot stays free for a call whose outcome
+    /// is recorded. A probe whose outcome is not recorded only gives the
+    /// slot back, and a run of such calls would keep the breaker half-open
+    /// for as long as they came.
+    #[must_use]
+    pub fn admit_unless_probe(&self) -> Admit {
+        match self.open_until {
+            None => Admit::Normal,
+            Some(_) => Admit::Refused,
+        }
+    }
+
     /// Whether a call may go out now ([`Breaker::admit`] as a boolean).
     pub fn allow(&mut self, now: Instant) -> bool {
         self.admit(now) != Admit::Refused
@@ -129,6 +144,19 @@ impl SharedBreaker {
                 breaker: self,
                 holds_probe: true,
             }),
+        }
+    }
+
+    /// [`Self::admit`] for a call that must never be the half-open probe
+    /// ([`Breaker::admit_unless_probe`]). The decision is made under the
+    /// breaker's lock, and the admission it returns holds no probe slot.
+    pub fn admit_unless_probe(&self) -> Option<Admission<'_>> {
+        match self.lock().admit_unless_probe() {
+            Admit::Normal => Some(Admission {
+                breaker: self,
+                holds_probe: false,
+            }),
+            Admit::Refused | Admit::Probe => None,
         }
     }
 
@@ -440,6 +468,36 @@ pub(crate) mod tests {
         assert!(first.is_some() && second.is_some());
         drop((first, second));
         assert!(b.admit(t2).is_some());
+    }
+
+    /// A call that must not probe is admitted by a closed breaker only,
+    /// and never takes or blocks the probe slot.
+    #[test]
+    fn a_call_that_must_not_probe_never_takes_the_slot() {
+        let b = SharedBreaker::default();
+        let t0 = Instant::now();
+        // Closed: admitted, and recording works as for any call.
+        b.admit_unless_probe().expect("closed").record(Class::Transient, t0);
+        for _ in 1..BREAKER_THRESHOLD {
+            b.admit(t0).expect("closed").record(Class::Transient, t0);
+        }
+        // Open: refused.
+        assert!(b.is_open(t0));
+        assert!(b.admit_unless_probe().is_none());
+        // Half-open with no probe out: refused, and the slot is still
+        // there for the next ordinary call.
+        b.force_half_open();
+        let t1 = Instant::now();
+        assert!(b.admit_unless_probe().is_none());
+        let probe = b.admit(t1).expect("the probe");
+        // Half-open with the probe out: refused too.
+        assert!(b.admit_unless_probe().is_none());
+        // A failing probe re-opens; a later one that succeeds closes.
+        probe.record(Class::Transient, t1);
+        assert!(b.is_open(t1) && b.admit_unless_probe().is_none());
+        let t2 = t1 + BREAKER_OPEN;
+        b.admit(t2).expect("the probe").record(Class::Hit, t2);
+        assert!(b.admit_unless_probe().is_some());
     }
 
     /// B-79's network-breaker case: a request dropped while it holds the

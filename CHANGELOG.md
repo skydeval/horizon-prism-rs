@@ -12,6 +12,48 @@ commit.
 
 ### Added
 
+- **Thread Lens for every signed-in account (#685).**
+  Thread Lens (`app.nearhorizon.threadLens.getThread` and `.resolve`)
+  was for ready members only. Now any signed-in account may call it,
+  unless the operator says otherwise. A caller with no token, or one that
+  does not verify, still gets 401.
+  - **Config:** `threadlens.access`, read at startup.
+    `"signed_in"` (the default) serves members and signed-in
+    non-members. `"members"` is the behaviour until now: anyone else is
+    refused `NotEnrolled` or `NotReady`. Any other value is a parse
+    error. An operator who wants no change sets `access = "members"`.
+  - **What a non-member gets.** The same thread, with its own blocks
+    applied: a post by an author it blocks, or who blocks it, is a gap,
+    and nothing by that author is sent. Its blocks come from Farsight,
+    and from the block rows this AppView holds for it (a member's block
+    of it, its block of a member). The views carry `viewer.blockedBy`
+    and `viewer.muted: false` and no other viewer state: no like,
+    repost, follow, bookmark or thread-mute state, and no
+    `viewer.blocking`. A member whose account is not ready is served the
+    same way until it is, instead of being refused. Other endpoints
+    answer a non-member as before.
+  - **Farsight.** A non-member's lens draws on the non-member part of
+    `farsight.rate_per_sec`, with a share per account
+    (`farsight.requester_share`), so the accounts behind one PDS do not
+    share one. Members' own part is never drawn on. An operator with
+    many signed-in non-members may need to raise
+    `farsight.rate_per_sec`. A non-member's failed calls never count
+    toward the read breaker, and while the breaker is half-open its
+    calls are refused rather than used as the probe, so non-members
+    cannot keep the fallback from members during an outage. Until a
+    member's call or a public `getRelationships` finds Farsight
+    answering again, non-members get the ordinary thread view.
+  - **Cache and memory.** The memory of learned blocks
+    (`[farsight.memory]`) stays for members only: nothing is stored for
+    a non-member. In the cache of Farsight's answers, a non-member's
+    entries go first when `farsight.cache_entries_total` is reached, and
+    a new sweep, once per `farsight.cache_ttl_secs`, removes expired
+    entries, so an account that never returns leaves nothing behind.
+  - No new metric. Refused and unbudgeted calls are counted as before in
+    `farsight_calls_total{outcome="breaker_open"|"no_budget"}`.
+  - The lexicons' descriptions say who may call under each setting;
+    their shapes and errors are unchanged.
+  (docs/internal/design/threadlens-access.md)
 - **Private audiences: `followers`, `everyone` and `nobody` (#663).**
   Until now a private post was served to anyone but its author only
   when its audience was a `list`. Now:

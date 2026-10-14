@@ -65,19 +65,47 @@ struct Entry {
     source: Source,
 }
 
-/// One viewer's entries, with the order they were first written in.
+/// One viewer's entries (its part of the cache), with the order they were
+/// first written in.
 #[derive(Default)]
 struct ViewerCache {
     entries: HashMap<String, Entry>,
     order: VecDeque<String>,
+    /// A ready member's request has written here. A part that only
+    /// visitors' requests wrote is a visitor part, and gives way to
+    /// members' parts when the cache is full.
+    member: bool,
 }
+
+/// Whose part of the cache a write goes to, and what kind of request
+/// writes it.
+#[derive(Debug, Clone, Copy)]
+struct Owner<'a> {
+    viewer: &'a str,
+    /// The request's handle is a ready member's ([`Lookup::set_visitor`]
+    /// was not called on it).
+    member: bool,
+}
+
+/// Viewer parts one sweep step looks at under one hold of the cache's
+/// lock, which every lookup takes.
+const SWEEP_SLICE: usize = 256;
 
 /// The per-viewer cache of pair answers (§5.14.6). An entry is read only
 /// for the viewer it was written for. Its lifetime runs from Farsight's
 /// answer: a read does not extend it.
+///
+/// - A part is a member's or a visitor's. Past the bound across viewers,
+///   visitors' parts go first.
+/// - A read removes the expired entry it finds, and nothing else. The
+///   sweep ([`Farsight::run_cache_sweeper`]) removes the rest, and the
+///   parts they leave empty.
 #[derive(Default)]
 struct Cache {
     viewers: HashMap<String, ViewerCache>,
+    /// The viewers whose part is a visitor part. Kept in step with
+    /// `viewers` by every place that creates, upgrades or removes a part.
+    visitors: HashSet<String>,
     total: usize,
     /// The fallback's ledger (§5.14.17.6), under the cache's lock so that
     /// applying a fallback answer is one step.
@@ -106,17 +134,18 @@ impl Cache {
         }
     }
 
-    /// Write `new` for the pair under the merge rule, and return what the
-    /// entry now holds.
+    /// Write `new` for the pair under the merge rule, as a member's
+    /// request does, and return what the entry now holds.
     #[cfg(test)]
     fn write(&mut self, viewer: &str, other: &str, new: &PairAnswer, now: Instant, s: &Settings) -> PairAnswer {
-        self.merge(viewer, other, new, now, s, true)
+        self.merge(Owner { viewer, member: true }, other, new, now, s, true)
     }
 
     /// The merge rule, with the write only if `keep`: a request begun
     /// before a purge gets the answer it would have had and leaves no
     /// entry behind (§5.14.18.2 "One count for everyone").
-    fn merge(&mut self, viewer: &str, other: &str, new: &PairAnswer, now: Instant, s: &Settings, keep: bool) -> PairAnswer {
+    fn merge(&mut self, owner: Owner<'_>, other: &str, new: &PairAnswer, now: Instant, s: &Settings, keep: bool) -> PairAnswer {
+        let viewer = owner.viewer;
         let live = self.entry(viewer, other, now);
         let (merged, restart, source) = PairAnswer::written_over(new, live.as_ref().map(|(answer, source)| (answer, *source)));
         if !keep {
@@ -126,13 +155,29 @@ impl Cache {
             Some(e) if !restart => e.expires,
             _ => now + s.ttl,
         };
-        self.store(viewer, other, merged.clone(), expires, source, s);
+        self.store(owner, other, merged.clone(), expires, source, s);
         merged
     }
 
     /// Put an entry for the pair, within the cache's two bounds.
-    fn store(&mut self, viewer: &str, other: &str, answer: PairAnswer, expires: Instant, source: Source, s: &Settings) {
+    ///
+    /// The part's mark follows the writer. A member's write marks the part
+    /// member, so an account that becomes a ready member is upgraded by
+    /// its next write. A visitor's write creates a part as a visitor part
+    /// and never demotes one: a member that loses readiness has its part
+    /// dropped by the key reload's [`Cache::forget`] anyway.
+    fn store(&mut self, owner: Owner<'_>, other: &str, answer: PairAnswer, expires: Instant, source: Source, s: &Settings) {
+        let viewer = owner.viewer;
+        let created = !self.viewers.contains_key(viewer);
         let v = self.viewers.entry(viewer.to_string()).or_default();
+        if owner.member {
+            if !v.member {
+                v.member = true;
+                self.visitors.remove(viewer);
+            }
+        } else if created {
+            self.visitors.insert(viewer.to_string());
+        }
         let fresh = v
             .entries
             .insert(
@@ -155,24 +200,67 @@ impl Cache {
         if v.order.len() > 2 * s.per_viewer + 16 {
             v.order.retain(|k| v.entries.contains_key(k));
         }
-        // The bound across viewers: other viewers' entries go, in no
-        // particular order. An evicted entry is simply absent.
+        // The bound across viewers: other viewers' parts go whole, the
+        // visitors' first. A member's part goes only when no visitor's is
+        // left, and among the parts of one kind in no particular order. An
+        // evicted entry is simply absent.
         while self.total > s.total {
-            let Some(victim) = self.viewers.keys().find(|k| k.as_str() != viewer).cloned() else {
+            let other_than = |k: &&String| k.as_str() != viewer;
+            let Some(victim) = self.visitors.iter().find(other_than).or_else(|| self.viewers.keys().find(other_than)).cloned() else {
                 break;
             };
-            if let Some(gone) = self.viewers.remove(&victim) {
-                self.total -= gone.entries.len();
-            }
+            self.remove_part(&victim);
         }
+    }
+
+    /// Remove a viewer's part whole, keeping the entry total and the
+    /// index of visitor parts in step.
+    fn remove_part(&mut self, viewer: &str) {
+        if let Some(gone) = self.viewers.remove(viewer) {
+            self.total -= gone.entries.len();
+        }
+        self.visitors.remove(viewer);
     }
 
     /// A viewer's entries, notes and stop go together.
     fn forget(&mut self, viewer: &str) {
-        if let Some(gone) = self.viewers.remove(viewer) {
-            self.total -= gone.entries.len();
-        }
+        self.remove_part(viewer);
         self.ledger.forget(viewer);
+    }
+
+    /// Every viewer that has a part now, for a sweep to work through.
+    fn viewer_keys(&self) -> Vec<String> {
+        self.viewers.keys().cloned().collect()
+    }
+
+    /// One step of the sweep, over the parts of `viewers` that still
+    /// exist: every expired entry goes, with its key in the part's
+    /// `order`, and a part left empty is deleted. Without that deletion
+    /// the cache would keep an empty part, with up to
+    /// `cache_entries_per_viewer` key strings, for every account ever
+    /// seen, uncounted by `cache_entries_total`. Returns how many entries
+    /// went.
+    fn sweep(&mut self, viewers: &[String], now: Instant) -> usize {
+        let mut swept = 0;
+        for viewer in viewers {
+            // A part removed since the keys were copied is skipped.
+            let Some(v) = self.viewers.get_mut(viewer) else {
+                continue;
+            };
+            let before = v.entries.len();
+            v.entries.retain(|_, entry| entry.expires > now);
+            let gone = before - v.entries.len();
+            self.total -= gone;
+            swept += gone;
+            // Keys of entries a read removed are still in `order` too.
+            if v.order.len() != v.entries.len() {
+                v.order.retain(|k| v.entries.contains_key(k));
+            }
+            if v.entries.is_empty() {
+                self.remove_part(viewer);
+            }
+        }
+        swept
     }
 }
 
@@ -461,6 +549,37 @@ impl Farsight {
         }
     }
 
+    /// One pass of the cache's sweep (§5.14.6): every expired entry goes,
+    /// and every part left empty. Returns how many entries went.
+    ///
+    /// The cache's lock is taken by every lookup, so a pass never holds it
+    /// throughout: once to copy the viewer keys, then once for each slice
+    /// of them, with other tasks let in between. A part written after the
+    /// keys were copied waits for the next pass.
+    pub async fn sweep_cache(&self) -> usize {
+        let viewers = self.cache().viewer_keys();
+        let mut swept = 0;
+        for slice in viewers.chunks(SWEEP_SLICE) {
+            swept += self.cache().sweep(slice, Instant::now());
+            tokio::task::yield_now().await;
+        }
+        swept
+    }
+
+    /// The cache's sweeper: one pass per `farsight.cache_ttl_secs`, for as
+    /// long as the process runs. Nothing else removes an entry that is
+    /// never read again, which is what a visitor that does not come back
+    /// leaves behind.
+    pub async fn run_cache_sweeper(self) {
+        // Validation keeps the lifetime at a second or more. The floor
+        // guards against a busy loop should that ever change.
+        let every = self.inner.settings.ttl.max(Duration::from_secs(1));
+        loop {
+            tokio::time::sleep(every).await;
+            self.sweep_cache().await;
+        }
+    }
+
     /// The purge hook (§5.14.18.3), run at the tail of a purge's marker
     /// step for a removed member and for a deleted account. It cannot
     /// fail the purge: a failed delete is logged, and the rows are left
@@ -573,6 +692,7 @@ impl Farsight {
             })),
             cache_only: Arc::new(AtomicBool::new(false)),
             no_fallback: Arc::new(AtomicBool::new(false)),
+            member: Arc::new(AtomicBool::new(true)),
             purges: self.inner.purges.load(Ordering::SeqCst),
             deadline: req.deadline(),
         }
@@ -731,6 +851,10 @@ pub struct Lookup {
     cache_only: Arc<AtomicBool>,
     /// This request never starts a fallback call (§5.14.17.2).
     no_fallback: Arc<AtomicBool>,
+    /// The request is a ready member's, or a public one about a member.
+    /// True unless [`Lookup::set_visitor`] was called. It is never derived
+    /// from `key`: a ready member can be charged by address.
+    member: Arc<AtomicBool>,
     /// The purge count when the request began.
     purges: u64,
     /// The request's deadline (`Requester::deadline`): the fallback's calls
@@ -801,6 +925,27 @@ impl Lookup {
     /// Thread Lens rounds, and the unread count's correction.
     pub fn set_no_fallback(&self) {
         self.no_fallback.store(true, Ordering::Relaxed);
+    }
+
+    /// From here on this request is a visitor's: the viewer it asks about
+    /// is a signed-in account that is not a ready member (Thread Lens,
+    /// under `threadlens.access = "signed_in"`). For such a request:
+    /// - nothing is learned, recalled or forgotten in the memory of
+    ///   learned blocks, which is for members only;
+    /// - its calls draw on the non-member pool, on a share of the viewer's
+    ///   own, so their failures never count on the read breaker;
+    /// - its calls are never the half-open probe;
+    /// - what it caches is marked as a visitor's, and goes first when the
+    ///   cache is full.
+    ///
+    /// There is no way back: a handle is a visitor's for the rest of its
+    /// request.
+    pub fn set_visitor(&self) {
+        self.member.store(false, Ordering::Relaxed);
+    }
+
+    fn member(&self) -> bool {
+        self.member.load(Ordering::Relaxed)
     }
 
     /// How many accounts this request may still ask about, at most.
@@ -929,8 +1074,11 @@ impl Lookup {
     /// an inbound list block is learned or confirmed, unless a member was
     /// purged since the request began; a vouched answer that names none
     /// forgets the pair at once, whatever the purge count. Returns whether
-    /// a pair was forgotten.
+    /// a pair was forgotten. A visitor's request does none of it.
     fn remember(&self, cache: &mut Cache, actor: &str, other: &str, answer: &PairAnswer) -> bool {
+        if !self.member() {
+            return false;
+        }
         let Some(m) = self.farsight.inner.memory.get() else {
             return false;
         };
@@ -949,8 +1097,12 @@ impl Lookup {
 
     /// The read rule (§5.14.18.2): a remembered block applies to a pair
     /// whenever the pair answer in hand does not vouch. `held` gains the
-    /// block; whether anything changed is returned.
+    /// block; whether anything changed is returned. Nothing is recalled
+    /// for a visitor's request.
     fn recall(&self, cache: &mut Cache, actor: &str, other: &str, held: &mut Option<PairAnswer>) -> bool {
+        if !self.member() {
+            return false;
+        }
         let Some(m) = self.farsight.inner.memory.get() else {
             return false;
         };
@@ -973,8 +1125,12 @@ impl Lookup {
     /// not left to the writer. One `DELETE`, under one deadline of 1 s
     /// that covers the table lock, the connection and the statement. A
     /// pair learned again meanwhile is left alone. If the deadline passes
-    /// or the delete fails, the pairs stay pending.
+    /// or the delete fails, the pairs stay pending. A visitor's request
+    /// forgets nothing, and deletes nothing.
     async fn delete_forgotten(&self, actor: &str, forgotten: Vec<String>) {
+        if !self.member() {
+            return;
+        }
         let Some(m) = self.farsight.inner.memory.get() else {
             return;
         };
@@ -1096,6 +1252,7 @@ impl Lookup {
             state.allowance = state.allowance.saturating_sub(started.elapsed());
             let mut cache = self.farsight.cache();
             let keep = inner.purges.load(Ordering::SeqCst) == self.purges;
+            let owner = Owner { viewer: actor, member: self.member() };
             for call in called {
                 eligible.extend(call.eligible);
                 for (other, outcome) in call.outcomes {
@@ -1107,7 +1264,7 @@ impl Lookup {
                     // The memo holds the merged entry, so a block the cache
                     // already named is not lost to an answer that does not
                     // vouch; with no answer, a block in hand stands.
-                    let merged = outcome.map(|answer| cache.merge(actor, &other, &answer, now, &inner.settings, keep));
+                    let merged = outcome.map(|answer| cache.merge(owner, &other, &answer, now, &inner.settings, keep));
                     let held = merged.or_else(|| found.get(&other).cloned());
                     if let Some(answer) = &held {
                         found.insert(other.clone(), answer.clone());
@@ -1205,7 +1362,9 @@ impl Lookup {
                         }
                         let answer = PairAnswer::from_fallback(list);
                         if !purged {
-                            cache.store(actor, &other, answer.clone(), now + fb.ttl, Source::Fallback, &inner.settings);
+                            // The fallback only ever runs for a member.
+                            let owner = Owner { viewer: actor, member: true };
+                            cache.store(owner, &other, answer.clone(), now + fb.ttl, Source::Fallback, &inner.settings);
                             if let Some(m) = inner.memory.get() {
                                 cache.remembered.learn(actor, &other, answer.inbound.list.as_deref(), Source::Fallback, chrono::Utc::now(), m.caps);
                             }
@@ -1339,6 +1498,7 @@ impl Lookup {
             let mut state = self.state();
             let mut cache = self.farsight.cache();
             let keep = inner.purges.load(Ordering::SeqCst) == self.purges;
+            let owner = Owner { viewer: &actor, member: self.member() };
             out.calls = called.len();
             out.vouches =!called.is_empty() && called.iter().all(|call| call.answered && call.levels.iter().all(|level| level.vouches()));
             for call in called {
@@ -1357,7 +1517,7 @@ impl Lookup {
                         forgotten.push(other.clone());
                     }
                     let held = match outcome {
-                        Some(answer) => Some(cache.merge(&actor, &other, &answer, now, &inner.settings, keep)),
+                        Some(answer) => Some(cache.merge(owner, &other, &answer, now, &inner.settings, keep)),
                         None => standing.remove(&other).or_else(|| state.memo.get(&other).cloned().flatten()),
                     };
                     state.memo.insert(other, held);
@@ -1411,14 +1571,32 @@ impl Lookup {
                     answered: false,
                 }
             };
+            let member = self.member();
             // The admission is the probe-slot guard: dropped on any exit
             // below without a recorded outcome, it gives the slot back.
-            let Some(admission) = inner.gate.admit(Instant::now()) else {
+            //
+            // A visitor's call is never the half-open probe. Its failure
+            // is not recorded (it draws on the non-member pool), so as the
+            // probe it would only give the slot back: during an outage
+            // visitors would take the probe one after another, the breaker
+            // would stay half-open, and members would never get the
+            // fallback, which needs it open. So a visitor's call goes out
+            // only through a closed breaker.
+            let admitted = if member { inner.gate.admit(Instant::now()) } else { inner.gate.admit_unless_probe() };
+            let Some(admission) = admitted else {
                 return none(chunk, "breaker_open", true);
             };
             // An empty share is counted here, as "no_budget", and nowhere
             // else.
-            let Ok(pool) = inner.bucket.quiet_draw(&self.key) else {
+            //
+            // The pool follows the handle's member flag, never its key. A
+            // visitor draws on the non-member pool, on a share named by
+            // the viewer's own DID: visitors behind one address (a PDS)
+            // would otherwise have one share between them. That holds
+            // also for a member that is not ready and is still charged by
+            // DID, whose key would otherwise reach the member pool.
+            let drawn = if member { inner.bucket.quiet_draw(&self.key) } else { inner.bucket.quiet_draw_nonmember(&ChargeKey::member(actor)) };
+            let Ok(pool) = drawn else {
                 return none(chunk, "no_budget", false);
             };
             let remaining = allowance.saturating_sub(started.elapsed());
@@ -2230,5 +2408,315 @@ pub(crate) mod tests {
         assert_eq!(calls(&fake), 3);
         assert!(!farsight.breaker_open());
         assert_eq!(farsight.cached(), 4);
+    }
+
+    const W: &str = "did:plc:wwwwwwwwwwwwwwwwwwwwwwww";
+    const X: &str = "did:plc:xxxxxxxxxxxxxxxxxxxxxxxx";
+
+    /// A visitor's handle: a Thread Lens caller that is not a ready
+    /// member, charged to `req`.
+    fn visitor(farsight: &Farsight, req: &Requester) -> Lookup {
+        let lookup = farsight.request(req);
+        lookup.set_visitor();
+        lookup
+    }
+
+    fn lens_budget() -> PairBudget {
+        PairBudget { max_calls: 2, timeout: Duration::from_millis(1000) }
+    }
+
+    /// An account Farsight's grammar accepts, by number below 400. Unlike
+    /// [`numbered`], no two numbers give the same account.
+    fn distinct(i: usize) -> String {
+        let letter = |n: usize| char::from(b'b' + u8::try_from(n % 20).unwrap_or(0));
+        format!("did:plc:{:a>24}", format!("{}{}", letter(i / 20), letter(i)))
+    }
+
+    /// Whether `viewer`'s part is in the index of visitor parts, and how
+    /// the part itself is marked (`None`: there is no part).
+    fn marks(farsight: &Farsight, viewer: &str) -> (bool, Option<bool>) {
+        let cache = farsight.cache();
+        (cache.visitors.contains(viewer), cache.viewers.get(viewer).map(|part| part.member))
+    }
+
+    /// Thread Lens access §4.6: a part is a member's or a visitor's by who
+    /// wrote it; a member's write upgrades a visitor part and a visitor's
+    /// never demotes; at the bound across viewers the visitors' parts go
+    /// before any member's.
+    #[tokio::test]
+    async fn visitors_parts_are_marked_and_evicted_first() {
+        let (farsight, _fake) = engine("cache_entries_total = 4\n").await;
+        let s = farsight.inner.settings;
+        let later = Instant::now() + Duration::from_secs(60);
+        let put = |viewer: &str, member: bool, other: &str| {
+            farsight.cache().store(Owner { viewer, member }, other, PairAnswer::clean(true), later, Source::Farsight, &s);
+        };
+        let (m1, m2) = (distinct(1), distinct(2));
+        let visitors = || {
+            let mut dids: Vec<String> = farsight.cache().visitors.iter().cloned().collect();
+            dids.sort();
+            dids
+        };
+        let parts = || farsight.cache().viewers.len();
+
+        // Two visitors and two members, one entry each: the bound.
+        put(W, false, A);
+        put(&m1, true, A);
+        put(X, false, A);
+        put(&m2, true, A);
+        assert_eq!((visitors(), farsight.cached()), (vec![W.to_string(), X.to_string()], 4));
+        // Each further entry of a member removes one visitor's part, and
+        // no member's.
+        put(&m1, true, B);
+        assert_eq!((visitors().len(), parts(), farsight.cached()), (1, 3, 4));
+        put(&m2, true, B);
+        assert_eq!((visitors().len(), parts(), farsight.cached()), (0, 2, 4));
+        assert_eq!((marks(&farsight, &m1), marks(&farsight, &m2)), ((false, Some(true)), (false, Some(true))));
+        // With no visitor's part left but the writer's own, a member's
+        // part goes: today's rule.
+        put(W, false, A);
+        assert_eq!((visitors(), parts(), farsight.cached()), (vec![W.to_string()], 2, 3));
+
+        // A member's write upgrades the part a visitor's write created,
+        // and takes it out of the index. A later visitor's write does not
+        // demote it.
+        let (farsight, _fake) = engine("").await;
+        let s = farsight.inner.settings;
+        let put = |viewer: &str, member: bool, other: &str| {
+            farsight.cache().store(Owner { viewer, member }, other, PairAnswer::clean(true), later, Source::Farsight, &s);
+        };
+        put(W, false, A);
+        assert_eq!(marks(&farsight, W), (true, Some(false)));
+        put(W, true, B);
+        assert_eq!(marks(&farsight, W), (false, Some(true)));
+        put(W, false, C);
+        assert_eq!(marks(&farsight, W), (false, Some(true)));
+        // A part a member's write created is a member's from the start.
+        put(X, true, A);
+        assert_eq!(marks(&farsight, X), (false, Some(true)));
+        // Forgetting a viewer keeps the index in step.
+        put(V, false, A);
+        assert_eq!(marks(&farsight, V), (true, Some(false)));
+        farsight.forget(V);
+        assert_eq!(marks(&farsight, V), (false, None));
+        assert_eq!(farsight.cached(), 4);
+    }
+
+    /// Thread Lens access §4.6, the sweep: expired entries go with their
+    /// keys, a part left empty is deleted, a part that is gone is
+    /// skipped, and the entry total stays exact.
+    #[tokio::test]
+    async fn the_sweep_removes_expired_entries_and_empty_parts() {
+        let (farsight, _fake) = engine("").await;
+        let s = farsight.inner.settings;
+        let now = Instant::now();
+        let later = now + Duration::from_secs(60);
+        let put = |viewer: &str, member: bool, other: &str, expires: Instant| {
+            farsight.cache().store(Owner { viewer, member }, other, PairAnswer::clean(true), expires, Source::Farsight, &s);
+        };
+        // A visitor whose entries have all expired; a member with one
+        // expired and one live; a visitor with one live.
+        put(W, false, A, now);
+        put(W, false, B, now);
+        put(V, true, A, now);
+        put(V, true, B, later);
+        put(X, false, A, later);
+        assert_eq!(farsight.cached(), 5);
+        let mut keys = farsight.cache().viewer_keys();
+        keys.push("did:plc:gggggggggggggggggggggggg".to_string());
+        assert_eq!(farsight.cache().sweep(&keys, now), 3);
+        {
+            let cache = farsight.cache();
+            assert_eq!(cache.total, 2);
+            assert!(!cache.viewers.contains_key(W) && !cache.visitors.contains(W), "no part at all");
+            assert_eq!(cache.viewers[V].order, [B]);
+            assert_eq!(cache.viewers[V].entries.len(), 1);
+            assert_eq!(cache.visitors.iter().collect::<Vec<_>>(), [X]);
+        }
+        // An entry a read removed leaves its part empty and its key in
+        // `order`; the sweep deletes that part too.
+        assert!(farsight.cache().get(X, A, later).is_none());
+        assert_eq!((farsight.cached(), farsight.cache().viewers[X].order.len()), (1, 1));
+        assert_eq!(farsight.cache().sweep(&keys, later), 1);
+        {
+            let cache = farsight.cache();
+            assert!(cache.viewers.is_empty() && cache.visitors.is_empty());
+            assert_eq!(cache.total, 0);
+        }
+
+        // The whole pass, on an engine whose entries expire at once: a
+        // visitor that never returned has no part afterwards. More
+        // viewers than one slice holds, so the pass takes the lock more
+        // than once.
+        let (farsight, _fake) = engine("cache_ttl_secs = 0\n").await;
+        visitor(&farsight, &Requester::test()).pair_answers(W, &page(&[A, B]), lens_budget(), None).await;
+        assert!(farsight.cache().visitors.contains(W));
+        let s = farsight.inner.settings;
+        let past = Instant::now();
+        for i in 0..(SWEEP_SLICE + 10) {
+            farsight.cache().store(Owner { viewer: &distinct(i), member: i % 2 == 0 }, A, PairAnswer::clean(true), past, Source::Farsight, &s);
+        }
+        assert_eq!(farsight.cached(), SWEEP_SLICE + 12);
+        assert_eq!(farsight.sweep_cache().await, SWEEP_SLICE + 12);
+        let cache = farsight.cache();
+        assert!(cache.viewers.is_empty() && cache.visitors.is_empty());
+        assert_eq!(cache.total, 0);
+    }
+
+    /// Thread Lens access §4.7: a visitor's calls draw on the non-member
+    /// pool, on a share of the viewer's own, whatever key its handle
+    /// carries. The member pool is never touched.
+    #[tokio::test]
+    async fn a_visitor_draws_on_the_nonmember_pool_by_account() {
+        // Each pool: burst 4. A share of one: burst 1.
+        let (farsight, fake) = engine("rate_per_sec = 0.1\nburst = 8\nrequester_share = 0.25\n").await;
+        let address = Requester::test();
+        let ask = |lookup: Lookup, viewer: &'static str, i: usize| async move {
+            lookup.pair_answers(viewer, &[distinct(i)], lens_budget(), None).await.calls
+        };
+        // Two visitors behind one address each have a share.
+        ask(visitor(&farsight, &address), W, 2).await;
+        ask(visitor(&farsight, &address), X, 3).await;
+        assert_eq!(calls(&fake), 2);
+        // A visitor's share is spent after one call: no answer, no call.
+        let spent = visitor(&farsight, &address).pair_answers(W, &[distinct(4)], lens_budget(), None).await;
+        assert!(spent.answers.is_empty() && !spent.vouches);
+        assert_eq!(calls(&fake), 2);
+        // A visitor whose handle carries a member key (a member that lost
+        // readiness and is still charged by DID) draws there too.
+        let y = "did:plc:yyyyyyyyyyyyyyyyyyyyyyyy";
+        let z = "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz";
+        ask(visitor(&farsight, &Requester::new(ChargeKey::member(y))), y, 5).await;
+        ask(visitor(&farsight, &address), z, 6).await;
+        assert_eq!(calls(&fake), 4);
+        // The non-member pool is empty now: a fifth visitor makes no call.
+        ask(visitor(&farsight, &address), "did:plc:uuuuuuuuuuuuuuuuuuuuuuuu", 7).await;
+        assert_eq!(calls(&fake), 4);
+        // The member pool is whole: four members take its four tokens,
+        // and a fifth finds both pools empty.
+        for (i, did) in [V, A, B, C].into_iter().enumerate() {
+            ask(farsight.request(&Requester::new(ChargeKey::member(did))), did, 10 + i).await;
+        }
+        assert_eq!(calls(&fake), 8);
+        let d = "did:plc:dddddddddddddddddddddddd";
+        ask(farsight.request(&Requester::new(ChargeKey::member(d))), d, 20).await;
+        assert_eq!(calls(&fake), 8);
+    }
+
+    /// Thread Lens access §4.8: a visitor's failures never count on the
+    /// read breaker, also when its handle carries a member key; and a
+    /// visitor's call is never the half-open probe.
+    #[tokio::test]
+    async fn a_visitor_never_counts_on_the_breaker_and_never_probes() {
+        let (farsight, fake) = engine("timeout_ms = 100\n").await;
+        let keyed = Requester::new(ChargeKey::member(W));
+        let asked = |did: &str| fake.asked.lock().expect("asked").iter().any(|chunk| chunk.iter().any(|d| d == did));
+        // Closed: a visitor's call is admitted.
+        visitor(&farsight, &keyed).pair_answers(W, &[distinct(2)], lens_budget(), None).await;
+        assert_eq!(calls(&fake), 1);
+
+        // Its failures are not recorded, however many.
+        *fake.status.lock().expect("status") = 503;
+        for i in 0..8 {
+            visitor(&farsight, &keyed).pair_answers(W, &[distinct(10 + i)], lens_budget(), None).await;
+        }
+        assert_eq!(calls(&fake), 9);
+        assert!(!farsight.breaker_open());
+        // Five failed member calls open it. Then a visitor makes no call.
+        for i in 0..5 {
+            farsight.request(&member()).pair_answers(V, &[distinct(20 + i)], lens_budget(), None).await;
+        }
+        assert!(farsight.breaker_open() && farsight.gate().down);
+        visitor(&farsight, &keyed).pair_answers(W, &[distinct(30)], lens_budget(), None).await;
+        assert_eq!(calls(&fake), 14);
+
+        // Half-open: the visitor's call is refused and leaves the probe.
+        // The member's call that follows is the probe; it fails, and the
+        // breaker is open again, so Farsight is still "down".
+        farsight.inner.gate.force_half_open();
+        assert!(!farsight.breaker_open());
+        visitor(&farsight, &keyed).pair_answers(W, &[distinct(31)], lens_budget(), None).await;
+        assert!(!asked(&distinct(31)) && !farsight.breaker_open(), "refused, and still half-open");
+        farsight.request(&member()).pair_answers(V, &[distinct(32)], lens_budget(), None).await;
+        assert!(asked(&distinct(32)), "the member's call took the probe");
+        assert!(farsight.breaker_open() && farsight.gate().down);
+
+        // Half-open with a member's probe in flight: the visitor's call
+        // made meanwhile is refused. The probe succeeds and closes the
+        // breaker, and the visitor's next call is admitted.
+        farsight.inner.gate.force_half_open();
+        *fake.status.lock().expect("status") = 200;
+        *fake.delay_ms.lock().expect("delay") = 300;
+        let probing = farsight.request(&member());
+        let probe_account = [distinct(33)];
+        let probe = probing.pair_answers(V, &probe_account, lens_budget(), None);
+        let meanwhile = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            visitor(&farsight, &keyed).pair_answers(W, &[distinct(34)], lens_budget(), None).await
+        };
+        let (probed, refused) = futures::join!(probe, meanwhile);
+        assert!(probed.vouches && asked(&distinct(33)));
+        assert!(refused.answers.is_empty() && !asked(&distinct(34)));
+        *fake.delay_ms.lock().expect("delay") = 0;
+        let admitted = visitor(&farsight, &keyed).pair_answers(W, &[distinct(35)], lens_budget(), None).await;
+        assert!(admitted.vouches && asked(&distinct(35)));
+    }
+
+    /// Thread Lens access §4.5: the memory of learned blocks is for
+    /// members only. A visitor's request learns nothing, is shown nothing
+    /// that was remembered, and forgets nothing. A ready member that is
+    /// charged by address still learns and recalls.
+    #[tokio::test]
+    async fn the_memory_is_for_members_only() {
+        let Some(db) = crate::test_support::fresh_db("farsight_memory_visitors").await else {
+            return;
+        };
+        sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())").bind(V).execute(&db.pool).await.expect("member");
+        let (farsight, fake) = engine("").await;
+        let cfg = crate::config::FileConfig::parse("[farsight]\nurl = \"https://farsight.example.net\"\n[farsight.memory]\nenabled = true\n")
+            .expect("parse")
+            .farsight
+            .memory;
+        assert_eq!(farsight.load_memory(&db.pool, &cfg).await.entries, Some(0));
+        let stats = |farsight: &Farsight| {
+            let stats = farsight.memory_stats().expect("memory on");
+            (stats["entries"].clone(), stats["pending"].clone())
+        };
+        let rows = || {
+            let pool = db.pool.clone();
+            async move { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM learned_inbound_blocks").fetch_one(&pool).await.expect("count") }
+        };
+        let address = Requester::test();
+        fake.blockers.lock().expect("blockers").insert(A.to_string());
+
+        // A visitor's lens sees an inbound list block: it applies to that
+        // request, and leaves no entry and nothing to write.
+        let seen = visitor(&farsight, &address).pair_answers(W, &page(&[A]), lens_budget(), None).await;
+        assert_eq!(seen.answers[A].inbound.list.as_deref(), Some(LIST));
+        assert_eq!(stats(&farsight), (json!(0), json!(0)));
+        assert_eq!(rows().await, 0);
+
+        // A ready member charged by address learns it.
+        let seen = farsight.request(&address).pair_answers(V, &page(&[A]), lens_budget(), None).await;
+        assert!(seen.answers[A].inbound.list.is_some());
+        assert_eq!(stats(&farsight).0, json!(1));
+
+        // Farsight fails and the cache is cleared. The member, still
+        // charged by address, recalls the block. A visitor's request for
+        // the same account (the member, had it lost readiness) does not.
+        farsight.forget(V);
+        *fake.status.lock().expect("status") = 500;
+        let recalled = farsight.request(&address).pair_answers(V, &page(&[A]), lens_budget(), None).await;
+        assert!(recalled.answers[A].inbound.list.is_some() && !recalled.answers[A].vouched);
+        let unseen = visitor(&farsight, &address).pair_answers(V, &page(&[A]), lens_budget(), None).await;
+        assert!(!unseen.answers.contains_key(A));
+
+        // A vouched clean answer to a visitor's request forgets nothing.
+        *fake.status.lock().expect("status") = 200;
+        fake.blockers.lock().expect("blockers").clear();
+        let clean = visitor(&farsight, &address).pair_answers(V, &page(&[A]), lens_budget(), None).await;
+        assert!(clean.answers[A].vouched && !clean.answers[A].any_block());
+        assert_eq!(stats(&farsight).0, json!(1));
+        db.drop_db().await;
     }
 }

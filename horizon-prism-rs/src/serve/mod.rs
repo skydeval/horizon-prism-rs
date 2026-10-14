@@ -240,6 +240,11 @@ pub async fn run() -> Result<(), StartupError> {
         if loaded.entries.is_some() {
             tasks.push(tokio::spawn(farsight.clone().run_memory_writer()));
         }
+        // The cache's sweep runs whenever Farsight is configured, with
+        // the memory on or off: an entry that is never read again (a
+        // Thread Lens visitor that does not come back) is removed by
+        // nothing else.
+        tasks.push(tokio::spawn(farsight.clone().run_cache_sweeper()));
     }
     let microcosm = &cfg.file.microcosm;
     let identity = &cfg.file.identity;

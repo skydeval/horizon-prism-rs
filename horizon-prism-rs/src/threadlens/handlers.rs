@@ -1,15 +1,24 @@
 //! `app.nearhorizon.threadLens.getThread` and `.resolve` (design-v3 §5.15).
 //!
 //! - Both are procedures (POST, JSON input).
-//! - **A member endpoint** (§5.15.2): the caller must be a ready member,
-//!   because only a ready member's own block state is complete here. A
-//!   member that is not ready and a non-member get the refusals every
-//!   member-only endpoint gives (`NotReady`, `NotEnrolled`). Responses are
-//!   for the caller: [`gate`] returns who is asking.
+//! - **For signed-in callers** (§5.15.2, `threadlens.access`). A token
+//!   that verifies is always required. Who is served then depends on the
+//!   setting:
+//!   - `members`: ready members only. A member that is not ready and a
+//!     non-member get the refusals every member-only endpoint gives
+//!     (`NotReady`, `NotEnrolled`).
+//!   - `signed_in`: everyone. A ready member is served as a **member**.
+//!     Anyone else, a member that is not ready included, is served as a
+//!     **visitor**: its verdicts come from Farsight and from the block rows
+//!     held here for it, it has no viewer state but `blockedBy`, nothing
+//!     is remembered for it, and its Farsight calls draw on the non-member
+//!     pool.
+//!
+//!   Responses are for the caller: [`gate`] returns who is asking.
 //! - **Non-enumeration:** every per-URI failure is a typed gap. Request-level
 //!   failures (malformed body, bad parameters, too many URIs) are
-//!   `400 InvalidRequest` and depend only on the input and on the caller's
-//!   membership and readiness.
+//!   `400 InvalidRequest` and depend only on the input and, under
+//!   `members`, on the caller's membership and readiness.
 
 use std::net::SocketAddr;
 
@@ -24,7 +33,7 @@ use serde_json::Value;
 use super::cursor::CursorKey;
 use super::ladder::Ladder;
 use super::thread::{Request, get_thread as assemble, resolve as resolve_each};
-use crate::config::ThreadLensConfig;
+use crate::config::{ThreadLensAccess, ThreadLensConfig};
 use crate::db::locks::uri_author;
 use crate::hydration::lens::{lens_items, lens_thread};
 use crate::hydration::{PublicEmit, Viewer};
@@ -61,9 +70,19 @@ pub fn router(state: ThreadLensState) -> Router {
         .with_state(state)
 }
 
-/// Authenticate, rate-limit, and require a ready member. Returns the
-/// request's charge handle (its upstream calls are charged to the member)
-/// and the viewer the response is built for.
+/// Authenticate, rate-limit, and sort the caller by `threadlens.access`.
+/// Returns the request's charge handle and the viewer the response is
+/// built for.
+///
+/// - A ready member is a member: `hydrate` is true.
+/// - Under `members` anyone else is refused. Under `signed_in` anyone else
+///   is a visitor: `hydrate` is false, which is what every later step reads
+///   to tell the two apart.
+///
+/// The rate class is charged to the caller's DID for both kinds. The
+/// charge handle is the one the backstop selected before the handler ran.
+/// Where none ran (tests), a visitor is charged by address and never given
+/// a member key.
 async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method: &str) -> Result<(Requester, Viewer), XrpcError> {
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
     let caller = authenticate(&s.app, authorization, method).await?;
@@ -73,16 +92,17 @@ async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method
         .bind(&caller.did)
         .fetch_optional(s.app.hydrator.pool())
         .await?;
-    match ready {
-        Some(true) => {}
-        Some(false) => return Err(XrpcError::not_ready()),
-        None => return Err(XrpcError::not_enrolled()),
-    }
+    let hydrate = match (ready, s.cfg.access) {
+        (Some(true), _) => true,
+        (Some(false), ThreadLensAccess::Members) => return Err(XrpcError::not_ready()),
+        (None, ThreadLensAccess::Members) => return Err(XrpcError::not_enrolled()),
+        (Some(false) | None, ThreadLensAccess::SignedIn) => false,
+    };
     let viewer = Viewer {
         did: Some(caller.did.clone()),
-        hydrate: true,
+        hydrate,
     };
-    Ok((request_handle(Some(&caller.did), ip), viewer))
+    Ok((request_handle(viewer.state_did(), ip), viewer))
 }
 
 fn at_uri(u: &str) -> bool {

@@ -1,5 +1,5 @@
 //! Thread Lens end to end: viewer-relative threads, `tier-hidden` without
-//! lookups, and the refusals of a member endpoint.
+//! lookups, and who is served under each `threadlens.access`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -24,7 +24,7 @@ use crate::appview_clients::{AppViewAuth, AppViewClient};
 use crate::config::ConstellationConfig;
 use crate::constellation::routing::tests::StubLookup;
 use crate::constellation::{Cascade, DidLookup, Router as DidRouter, RoutingTable};
-use crate::config::ThreadLensConfig;
+use crate::config::{ThreadLensAccess, ThreadLensConfig};
 use crate::hydration::lens::{Bridging, LensNode};
 use crate::hydration::testing::{actor, exec, hydrator, hydrator_with_farsight, post};
 use crate::hydration::{Hydrator, Viewer};
@@ -145,7 +145,7 @@ async fn serve(state: ThreadLensState) -> String {
     format!("http://{addr}")
 }
 
-fn state(h: Hydrator, l: Ladder) -> ThreadLensState {
+fn state(h: Hydrator, l: Ladder, access: ThreadLensAccess) -> ThreadLensState {
     let fetcher = StubFetcher::default();
     fetcher.set_key(VIEWER_A, signing_key(3));
     fetcher.set_key(VIEWER_B, signing_key(4));
@@ -162,7 +162,7 @@ fn state(h: Hydrator, l: Ladder) -> ThreadLensState {
             did_document: Arc::new(json!({})),
         },
         ladder: l,
-        cfg: ThreadLensConfig::default(),
+        cfg: ThreadLensConfig { access, ..ThreadLensConfig::default() },
         cursor_key: CursorKey::new(&[9; 32]),
     }
 }
@@ -191,7 +191,9 @@ fn summary(v: &Value, key: &str) -> Vec<(String, Option<String>)> {
 
 /// B-82, B-83: a block hides one author's posts and nothing around them;
 /// nothing by a blocked author is sent; with Farsight not vouching the
-/// response is the ordinary view; only a ready member may call.
+/// response is the ordinary view. With `access = "members"` only a ready
+/// member may call. With `access = "signed_in"` every signed-in account
+/// may, and one that is not a ready member is served as a visitor.
 #[tokio::test]
 async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     let Some(db) = fresh_db("threadlens_viewer_relative").await else {
@@ -209,7 +211,9 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     // A has no block with.
     let beneath = post(p, AUTHOR, "3kbeneath222", "beneath", Some(&reply1), Some(&anchor)).await;
     // Viewer A blocks R1; R2 blocks viewer A. Viewer B has no blocks.
-    for (i, (author, subject)) in [(VIEWER_A, R1), (R2, VIEWER_A)].into_iter().enumerate() {
+    // The stranger, who is no member, has the same two: rows this AppView
+    // holds for it.
+    for (i, (author, subject)) in [(VIEWER_A, R1), (R2, VIEWER_A), (STRANGER, R1), (R2, STRANGER)].into_iter().enumerate() {
         sqlx::query("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, '3kaaaaaaaaaa2', now())")
             .bind(format!("at://{author}/app.bsky.graph.block/3kblock{i}"))
             .bind(author)
@@ -219,11 +223,20 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
             .expect("block");
     }
     exec(p, "INSERT INTO record_tombstones (uri, rev) VALUES ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kdeleted', '3kaaaaaaaaaa2')").await;
+    // A ready member and a member that is not ready both follow the
+    // anchor's author: viewer state only a ready member is shown.
+    for follower in [VIEWER_B, R2] {
+        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{follower}/app.bsky.graph.follow/3kf', '{follower}', '{AUTHOR}', '3k', now())")).await;
+    }
     let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
     let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
     let calls = Arc::new(Calls::default());
     let base = fake_upstream(Arc::clone(&calls), None).await;
-    let url = serve(state(h.clone(), ladder(h, &base, Arc::new(StubLookup::default())))).await;
+    // Two servers over the same state: one for members only, as before
+    // the setting existed, and one for every signed-in account.
+    let l = ladder(h.clone(), &base, Arc::new(StubLookup::default()));
+    let url = serve(state(h.clone(), l.clone(), ThreadLensAccess::Members)).await;
+    let open = serve(state(h, l, ThreadLensAccess::SignedIn)).await;
 
     // Farsight vouches: bridging is on. The ordinary view leaves out both
     // blocked replies and what is beneath them. Thread Lens puts a gap in
@@ -257,6 +270,49 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     let b: Value = serde_json::from_str(&body_b).expect("json");
     assert!(summary(&b, "nodes").iter().all(|(_, gap)| gap.is_none()), "{body_b}");
     assert_eq!(b["nodes"].as_array().map(Vec::len), Some(4));
+    assert!(b["nodes"][0]["post"]["author"]["viewer"]["following"].is_string(), "{body_b}");
+
+    // `access = "signed_in"`: the stranger, who is no member, is served
+    // as a visitor. Its verdicts are a member's: the author it blocks is
+    // `blocked-by-you`, the one that blocks it `blocking-you`, and with
+    // Farsight vouching everyone else is clear, so the reply beneath is
+    // bridged in.
+    let (status, body_s) = call(&open, GET_THREAD, STRANGER, 5, &thread_input).await;
+    assert_eq!(status, 200, "{body_s}");
+    let s: Value = serde_json::from_str(&body_s).expect("json");
+    assert_eq!(
+        summary(&s, "nodes"),
+        [
+            (anchor.clone(), None),
+            (reply1.clone(), Some("blocked-by-you".to_string())),
+            (reply2.clone(), Some("blocking-you".to_string())),
+            (beneath.clone(), None),
+        ],
+        "{body_s}"
+    );
+    assert_eq!(s["bridging"], "full", "{body_s}");
+    // Nothing by a blocked author is sent to a visitor either.
+    for leaked in ["\"one\"", "\"two\"", "r1.test", "r2.test"] {
+        assert!(!body_s.contains(leaked), "{leaked} in {body_s}");
+    }
+    // A visitor's views carry `blockedBy` and `muted: false`, and no
+    // other viewer state: no `blocking`, though it blocks an author.
+    assert_eq!(s["nodes"][0]["post"]["author"]["viewer"], json!({"muted": false, "blockedBy": false}), "{body_s}");
+    for field in ["\"blocking\"", "\"following\"", "\"like\""] {
+        assert!(!body_s.contains(field), "{field} in {body_s}");
+    }
+    let (status, body) = call(&open, RESOLVE, STRANGER, 5, &json!({"uris": [anchor, reply1, reply2]})).await;
+    assert_eq!(status, 200, "{body}");
+    let r: Value = serde_json::from_str(&body).expect("json");
+    let gaps: Vec<Value> = r["items"].as_array().expect("items").iter().map(|i| i["gap"].clone()).collect();
+    assert_eq!(gaps, [Value::Null, json!("blocked-by-you"), json!("blocking-you")], "{body}");
+    // A member that is not ready is served as a visitor until it is: it
+    // follows the author, and is shown no `following`.
+    let (status, body) = call(&open, GET_THREAD, R2, 6, &thread_input).await;
+    assert_eq!(status, 200, "{body}");
+    let n: Value = serde_json::from_str(&body).expect("json");
+    assert!(summary(&n, "nodes").iter().all(|(_, gap)| gap.is_none()), "{body}");
+    assert_eq!(n["nodes"][0]["post"]["author"]["viewer"], json!({"muted": false, "blockedBy": false}), "{body}");
 
     // `resolve`: a post, a private URI, a blocked author, a deleted post,
     // a post nobody has.
@@ -284,8 +340,20 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     let (_, body) = call(&url, RESOLVE, VIEWER_A, 3, &json!({"uris": [anchor, reply1]})).await;
     let r: Value = serde_json::from_str(&body).expect("json");
     assert_eq!((&r["items"][0]["gap"], &r["items"][1]["gap"], &r["bridging"]), (&json!("block-state-unknown"), &json!("blocked-by-you"), &json!("off")), "{body}");
+    // The same for a visitor: nobody is clear, nothing is bridged, and
+    // the ordinary view is cut under the authors it has a block with.
+    let (_, body) = call(&open, GET_THREAD, STRANGER, 5, &thread_input).await;
+    let off: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!((summary(&off, "nodes"), &off["bridging"]), (vec![(anchor.clone(), None)], &json!("off")), "{body}");
+    // And with no answer from Farsight at all.
+    *fake.status.lock().expect("status") = 503;
+    let (_, body) = call(&open, RESOLVE, STRANGER, 5, &json!({"uris": [anchor, reply1]})).await;
+    *fake.status.lock().expect("status") = 200;
+    let r: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!((&r["items"][0]["gap"], &r["items"][1]["gap"], &r["bridging"]), (&json!("block-state-unknown"), &json!("blocked-by-you"), &json!("off")), "{body}");
 
-    // Request-level failures; a member endpoint.
+    // Request-level failures; with `access = "members"`, the refusals of
+    // a member endpoint.
     let (status, body) = call(&url, RESOLVE, VIEWER_A, 3, &json!({"uris": []})).await;
     assert!(status == 400 && body.contains("InvalidRequest"), "{body}");
     let (status, _) = call(&url, GET_THREAD, VIEWER_A, 3, &json!({"anchor": anchor, "depth": 1001})).await;
@@ -296,6 +364,28 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     assert!(status == 400 && body.contains("NotReady"), "{body}");
     let r = reqwest::Client::new().post(format!("{url}/xrpc/{GET_THREAD}")).json(&thread_input).send().await.expect("request");
     assert_eq!(r.status().as_u16(), 401);
+    // `access = "signed_in"` still needs a token.
+    let r = reqwest::Client::new().post(format!("{open}/xrpc/{GET_THREAD}")).json(&thread_input).send().await.expect("request");
+    assert_eq!(r.status().as_u16(), 401);
+
+    // A block of a visitor applies at once. Farsight vouches again, and
+    // the visitor's lens caches a vouching clean answer for the anchor's
+    // author. Then that author blocks the visitor: the row here decides,
+    // whatever the cached answer says, and the anchor is a gap.
+    *fake.level.lock().expect("level") = "complete";
+    let (_, body) = call(&open, GET_THREAD, STRANGER, 5, &thread_input).await;
+    let before: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!((summary(&before, "nodes")[0].clone(), &before["bridging"]), ((anchor.clone(), None), &json!("full")), "{body}");
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{AUTHOR}/app.bsky.graph.block/3kblocknew', '{AUTHOR}', '{STRANGER}', '3kaaaaaaaaaa2', now())")).await;
+    let (status, body) = call(&open, GET_THREAD, STRANGER, 5, &thread_input).await;
+    assert_eq!(status, 200, "{body}");
+    let after: Value = serde_json::from_str(&body).expect("json");
+    let nodes = summary(&after, "nodes");
+    assert!(nodes.contains(&(anchor.clone(), Some("blocking-you".to_string()))), "{body}");
+    assert!(nodes.iter().all(|(_, gap)| gap.is_some()) && !body.contains("author.test"), "{body}");
+    let (_, body) = call(&open, RESOLVE, STRANGER, 5, &json!({"uris": [anchor]})).await;
+    let r: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(r["items"][0]["gap"], json!("blocking-you"), "{body}");
     db.drop_db().await;
 }
 

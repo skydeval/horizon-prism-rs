@@ -39,6 +39,7 @@ use super::ladder::{Ladder, Mode, Resolved};
 use super::verdict::{Judge, Verdict};
 use crate::config::ThreadLensConfig;
 use crate::db::locks::uri_author;
+use crate::farsight::{Farsight, Lookup};
 use crate::hydration::lens::{Bridging, LensNode, named_accounts};
 use crate::hydration::normalize::is_private_uri;
 use crate::hydration::{HydrationError, KnownBlocks, Viewer, with_known_blocks};
@@ -53,7 +54,7 @@ const NSID_POST: &str = "app.bsky.feed.post";
 /// One `getThread` request, after its input was checked.
 #[derive(Debug, Clone, Copy)]
 pub struct Request<'a> {
-    /// The caller: a ready member.
+    /// The caller: a ready member (`hydrate` true), or a visitor.
     pub viewer: &'a Viewer,
     pub req: &'a Requester,
     pub anchor: &'a str,
@@ -93,6 +94,19 @@ pub fn gap_by_form(uri: &str) -> Option<Gap> {
     } else {
         None
     }
+}
+
+/// The request's handle on Farsight. For a caller that is not a ready
+/// member it is a visitor's handle: nothing is remembered or recalled for
+/// it, and its calls draw on the non-member pool and never probe. The mark
+/// comes from the viewer, never from the charge key: a ready member can be
+/// charged by address, and that must not switch its memory off.
+fn lens_lookup(farsight: &Farsight, viewer: &Viewer, req: &Requester) -> Lookup {
+    let lookup = farsight.request(req);
+    if !viewer.hydrate {
+        lookup.set_visitor();
+    }
+    lookup
 }
 
 fn block_gap(verdict: Option<Verdict>) -> Option<Gap> {
@@ -699,7 +713,7 @@ pub async fn get_thread(
     }
     let h = ladder.hydrator();
     let me = r.viewer.did.clone().unwrap_or_default();
-    let lookup = h.farsight().map(|farsight| farsight.request(r.req));
+    let lookup = h.farsight().map(|farsight| lens_lookup(farsight, r.viewer, r.req));
     let mut judge = Judge::new(h.pool().clone(), &me, lookup, cfg);
 
     // A request with a cursor evaluates its anchor as any request does,
@@ -803,7 +817,7 @@ pub async fn resolve(
         let nodes = uris.iter().map(|uri| LensNode::gap(uri, None, gap_by_form(uri).unwrap_or(Gap::NotFound))).collect();
         return Ok(Thread { nodes, bridging: Bridging::Off });
     }
-    let lookup = h.farsight().map(|farsight| farsight.request(req));
+    let lookup = h.farsight().map(|farsight| lens_lookup(farsight, viewer, req));
     let mut judge = Judge::new(h.pool().clone(), &me, lookup, cfg);
     judge.baseline(&judged).await?;
     let bridging = judge.bridging();

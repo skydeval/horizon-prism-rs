@@ -1275,11 +1275,27 @@ impl Default for SearchConfig {
     }
 }
 
-/// `[threadlens]` (design-v3 §5.15, §13): the bounds of one Thread Lens
-/// response.
+/// `threadlens.access`: who may call Thread Lens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadLensAccess {
+    /// Ready members only. Anyone else is refused `NotEnrolled` or
+    /// `NotReady`.
+    Members,
+    /// Every caller whose token verifies. A caller that is not a ready
+    /// member is served as a visitor: its verdicts come from Farsight and
+    /// from the block rows this AppView happens to hold for it.
+    #[default]
+    SignedIn,
+}
+
+/// `[threadlens]` (design-v3 §5.15, §13): who may call Thread Lens, and the
+/// bounds of one response.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThreadLensConfig {
+    /// Who may call. An anonymous caller is refused under either value.
+    pub access: ThreadLensAccess,
     /// The most nodes one response adds beyond the ordinary thread view.
     /// The ordinary view itself is never cut and does not count.
     pub page_nodes: u32,
@@ -1298,6 +1314,7 @@ pub struct ThreadLensConfig {
 impl Default for ThreadLensConfig {
     fn default() -> Self {
         Self {
+            access: ThreadLensAccess::default(),
             page_nodes: 200,
             listing_calls: 60,
             verdict_round_timeout_ms: 500,
