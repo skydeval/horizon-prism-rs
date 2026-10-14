@@ -39,6 +39,25 @@ commit.
   - **Removing a member under the off rule** also removes the rows kept
     only because it was a member.
 
+- **Public indexing switch, part 4: endpoints and Thread Lens (#708).**
+  - **Public endpoints answer an honest 501** unless public indexing is
+    on: 56 public `app.bsky.*` methods answer
+    `501 {"error":"NotImplemented","message":…}` with their registered
+    verb, saying to use the public AppView (or, while turning on, that
+    the method comes back when the backfill completes). A wrong verb
+    keeps its 400, and preflights are answered as before. The private
+    tier, Thread Lens, mutes, list mutes and blocks, drafts, labels,
+    `resolveHandle`, polls, `requestRecord` and `resolveDid` (25 methods)
+    stay served. Messages can be overridden with
+    `honest_501.public_off_message` / `public_filling_message`. Metric
+    `public_off_501_total{nsid}`.
+  - **Thread Lens** builds its baseline upstream when public data is not
+    stored, and community authors' public reads go to the configured
+    networks unless public indexing is on. `resolveDid` reports
+    `localIndexed: false` unless it is on.
+  - Viewer `bookmarked` and `activitySubscription` are left out unless
+    public indexing is on.
+
 - **Public indexing switch, part 3: the switch (#708).**
   - **Commands:** `admin indexing public-scope <off|community_scoped>`
     and `admin indexing status`. The live value is held in

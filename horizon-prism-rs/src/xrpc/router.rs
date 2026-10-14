@@ -23,6 +23,7 @@ use super::pools::{ChargeKey, Exhausted, Pool};
 use super::errors::{NotReadyHint, XrpcError};
 use super::handlers::{actor, bookmarks, did_web, drafts, feed, graph, index, labels, mutes, notifications, repo, search, timeline, unspecced};
 use super::rate_limit::Class;
+use crate::honest_501::{self, PublicMessages, Verb};
 
 /// The health route: exempt from the backstop for `GET` and `HEAD` (§6.3;
 /// `serve::health` charges it itself when a token is presented).
@@ -31,10 +32,48 @@ const HEALTH_PATH: &str = "/xrpc/_health";
 const CORS_MAX_AGE: Duration = Duration::from_secs(600);
 
 /// Settings of the final router.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalConfig {
     /// `community.not_ready_retry_secs`.
     pub not_ready_retry_secs: u64,
+    /// The public-method messages unless the mode is On (public-indexing
+    /// design §6).
+    pub public: PublicMessages,
+}
+
+/// The endpoint gate's state.
+#[derive(Clone)]
+struct PublicGate {
+    app: AppState,
+    messages: PublicMessages,
+}
+
+/// The endpoint gate (public-indexing design §6): unless the mode is On, a
+/// public method called with its registered verb (`HEAD` counts as `GET`)
+/// answers 501 before dispatch. Anything else passes through, so a wrong
+/// verb keeps its 400 and the CORS layer outside answers preflights.
+async fn public_gate(
+    State(g): State<PublicGate>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(message) = g.messages.for_mode(g.app.hydrator.scope().public_mode()) else {
+        return next.run(request).await;
+    };
+    let Some(method) = request.uri().path().strip_prefix("/xrpc/").and_then(honest_501::public_method) else {
+        return next.run(request).await;
+    };
+    let registered = match method.verb {
+        Verb::Get => matches!(*request.method(), Method::GET | Method::HEAD),
+        Verb::Post => *request.method() == Method::POST,
+    };
+    if !registered {
+        return next.run(request).await;
+    }
+    let ip = request_ip(&g.app, &headers, peer);
+    honest_501::public_off_answer(&g.app, method.nsid, message, ip)
 }
 
 /// Response extension set by the wrong-verb fallback. [`finish`] writes the
@@ -157,12 +196,17 @@ fn cors() -> CorsLayer {
 }
 
 /// Build the final router from every merged route (§6.3's order): set the
-/// two fallbacks, then the rate limit, then CORS outermost. Nothing may be
+/// two fallbacks, then the endpoint gate (public-indexing design §6) inside
+/// the rate limit, then CORS outermost. Nothing may be
 /// merged into the result, and no route is served from outside it (§6.5).
 /// The caller serves it with
 /// `into_make_service_with_connect_info::<SocketAddr>()`.
 pub fn finalize(routes: Router, state: AppState, cfg: FinalConfig) -> Router {
     let (wrong, missing) = (state.clone(), state.clone());
+    let gate = PublicGate {
+        app: state.clone(),
+        messages: cfg.public.clone(),
+    };
     routes
         .method_not_allowed_fallback(
             move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, method: Method| {
@@ -191,6 +235,7 @@ pub fn finalize(routes: Router, state: AppState, cfg: FinalConfig) -> Router {
             },
         )
         .layer(middleware::from_fn_with_state(cfg, finish))
+        .layer(middleware::from_fn_with_state(gate, public_gate))
         .layer(middleware::from_fn_with_state(state, global_limit))
         .layer(cors())
 }
@@ -308,7 +353,7 @@ mod tests {
     const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
 
     async fn serve(state: AppState) -> String {
-        let cfg = FinalConfig { not_ready_retry_secs: 7 };
+        let cfg = FinalConfig { not_ready_retry_secs: 7, public: PublicMessages::default() };
         serve_app(finalize(router(state.clone()), state, cfg)).await
     }
 
@@ -408,7 +453,7 @@ mod tests {
         // Merging panics on an overlapping route, so this also shows that no
         // deferral shadows a core handler (§6.6).
         let merged = router(state.clone()).merge(crate::honest_501::router(&state, &cfg));
-        let base = serve_app(finalize(merged, state, FinalConfig { not_ready_retry_secs: 5 })).await;
+        let base = serve_app(finalize(merged, state, FinalConfig { not_ready_retry_secs: 5, public: PublicMessages::from_config(&cfg) })).await;
         let client = reqwest::Client::new();
         let linked = "This endpoint is planned for a future release. See https://status.example for status.";
 
@@ -529,7 +574,7 @@ mod tests {
         let health = Router::new().route(HEALTH_PATH, get(|| async { "ok" }));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let app = finalize(router(state.clone()).merge(health), state, FinalConfig { not_ready_retry_secs: 5 });
+        let app = finalize(router(state.clone()).merge(health), state, FinalConfig { not_ready_retry_secs: 5, public: PublicMessages::default() });
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
@@ -560,6 +605,156 @@ mod tests {
             }
         }
         assert!(limited, "wrong-verb burst limited");
+        db.drop_db().await;
+    }
+
+    /// Rate limits no gate test reaches.
+    fn roomy_limits() -> RateLimits {
+        let cfg = crate::config::FileConfig::parse(concat!(
+            "[rate_limits.anon_read]\nper_sec = 1000.0\nburst = 10000\n",
+            "[rate_limits.search_anon]\nper_sec = 1000.0\nburst = 10000\n",
+            "[rate_limits.global]\nper_sec = 1000.0\nburst = 10000\n",
+        ))
+        .expect("parse");
+        RateLimits::from_config(&cfg.rate_limits)
+    }
+
+    async fn send(client: &reqwest::Client, method: reqwest::Method, url: &str, bearer: Option<&str>) -> (u16, Vec<u8>) {
+        let mut req = client.request(method, url);
+        if let Some(t) = bearer {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let r = req.send().await.expect("request");
+        (r.status().as_u16(), r.bytes().await.expect("body").to_vec())
+    }
+
+    fn verbs(m: &honest_501::PublicMethod) -> (reqwest::Method, reqwest::Method) {
+        match m.verb {
+            Verb::Get => (reqwest::Method::GET, reqwest::Method::POST),
+            Verb::Post => (reqwest::Method::POST, reqwest::Method::GET),
+        }
+    }
+
+    /// T-6 and T-7 (public-indexing design §6): each public method's verb
+    /// is its route's; unless the mode is On, every public method answers
+    /// the 501 of its mode for its verb (and `HEAD` for `GET`), whoever
+    /// asks; a wrong verb keeps its 400 and a preflight its 200; On never
+    /// answers 501.
+    #[tokio::test]
+    async fn the_public_gate_follows_the_mode() {
+        use crate::hydration::testing::set_mode;
+        use crate::indexing::PublicMode;
+
+        let Some(db) = fresh_db("xrpc_public_gate").await else {
+            return;
+        };
+        let (mut state, _drainer) = bare_state(&db.pool);
+        state.limits = roomy_limits();
+        let scope = state.hydrator.scope().clone();
+        let base = serve(state).await;
+        let client = reqwest::Client::new();
+        let body = |message: &str| serde_json::to_vec(&json!({"error": "NotImplemented", "message": message})).expect("json");
+
+        // On: the verbs are the routes', and nothing is gated.
+        for m in honest_501::PUBLIC_METHODS {
+            let url = format!("{base}/xrpc/{}", m.nsid);
+            let (right, wrong) = verbs(m);
+            let (status, bytes) = send(&client, wrong.clone(), &url, None).await;
+            let v: Value = serde_json::from_slice(&bytes).expect("json");
+            assert_eq!(status, 400, "{}", m.nsid);
+            assert_eq!(v["message"], format!("Incorrect HTTP method ({wrong}) expected {right}"), "{}", m.nsid);
+            let (status, _) = send(&client, right, &url, None).await;
+            assert_ne!(status, 501, "{}", m.nsid);
+        }
+
+        for (mode, message) in [
+            (PublicMode::Off, honest_501::PUBLIC_OFF_MESSAGE),
+            (PublicMode::Draining, honest_501::PUBLIC_OFF_MESSAGE),
+            (PublicMode::Held, honest_501::PUBLIC_OFF_MESSAGE),
+            (PublicMode::Filling, honest_501::PUBLIC_FILLING_MESSAGE),
+        ] {
+            set_mode(&scope, mode).await;
+            for m in honest_501::PUBLIC_METHODS {
+                let url = format!("{base}/xrpc/{}", m.nsid);
+                let (right, wrong) = verbs(m);
+                // Unauthenticated: the same bytes with a garbage bearer.
+                for bearer in [None, Some("garbage")] {
+                    let (status, bytes) = send(&client, right.clone(), &url, bearer).await;
+                    assert_eq!((status, bytes), (501, body(message)), "{mode:?} {} {bearer:?}", m.nsid);
+                }
+                if m.verb == Verb::Get {
+                    let (status, _) = send(&client, reqwest::Method::HEAD, &url, None).await;
+                    assert_eq!(status, 501, "{mode:?} HEAD {}", m.nsid);
+                }
+                let (status, _) = send(&client, wrong, &url, None).await;
+                assert_eq!(status, 400, "{mode:?} wrong verb {}", m.nsid);
+                let r = client
+                    .request(reqwest::Method::OPTIONS, &url)
+                    .header("origin", "https://client.example")
+                    .header("access-control-request-method", right.as_str())
+                    .header("access-control-request-headers", "authorization")
+                    .send()
+                    .await
+                    .expect("preflight");
+                assert_eq!(r.status().as_u16(), 200, "{mode:?} preflight {}", m.nsid);
+            }
+        }
+
+        // On again: served.
+        set_mode(&scope, PublicMode::On).await;
+        for m in honest_501::PUBLIC_METHODS {
+            let (status, _) = send(&client, verbs(m).0, &format!("{base}/xrpc/{}", m.nsid), None).await;
+            assert_ne!(status, 501, "{}", m.nsid);
+        }
+        db.drop_db().await;
+    }
+
+    /// T-8 (public-indexing design §6): with the mode Off, the kept methods
+    /// pass the gate: the member's own mutes and the operator's labels are
+    /// served, and a kept NSID with no route here reaches the fallback.
+    #[tokio::test]
+    async fn kept_methods_pass_the_gate_when_public_is_off() {
+        use crate::hydration::testing::set_mode;
+        use crate::indexing::PublicMode;
+
+        let Some(db) = fresh_db("xrpc_public_gate_kept").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        exec(p, "INSERT INTO members (did, source, ready_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin', now())").await;
+        let mut sets = ScopeSets::default();
+        sets.members.insert(ALICE.into());
+        sets.scope.insert(ALICE.into());
+        let fetcher = StubFetcher::default();
+        fetcher.set_key(ALICE, signing_key(3));
+        let (auth, _drainer) = verifier(fetcher, 100, 16);
+        let state = AppState {
+            hydrator: hydrator(p, sets),
+            auth: Arc::new(auth),
+            limits: roomy_limits(),
+            enroller: None,
+            trusted_proxy: "172.30.0.10".parse().expect("ip"),
+            did_document: Arc::new(json!({})),
+        };
+        set_mode(state.hydrator.scope(), PublicMode::Off).await;
+        let base = serve(state).await;
+        let client = reqwest::Client::new();
+        let aud = format!("did:web:{AUDIENCE_HOST}");
+
+        let mutes = "app.bsky.graph.getMutes";
+        let token = mint(&signing_key(3), ALICE, &aud, Some(mutes));
+        let (status, v) = get_json(&client, &format!("{base}/xrpc/{mutes}"), Some(&token)).await;
+        assert_eq!((status, &v["mutes"]), (200, &json!([])), "{v}");
+        let (status, _) = get_json(&client, &format!("{base}/xrpc/{mutes}"), None).await;
+        assert_eq!(status, 401, "authentication is still the handler's");
+        let (status, v) = get_json(&client, &format!("{base}/xrpc/com.atproto.label.queryLabels?uriPatterns={ALICE}"), None).await;
+        assert_eq!((status, v["labels"].is_array()), (200, true), "{v}");
+        let (status, v) = get_json(&client, &format!("{base}/xrpc/app.nearhorizon.private.getPosts"), None).await;
+        assert_eq!((status, v["error"].as_str()), (501, Some("MethodNotImplemented")), "not the gate's answer");
+        for nsid in honest_501::KEPT_METHODS {
+            assert!(honest_501::public_method(nsid).is_none(), "{nsid}");
+        }
         db.drop_db().await;
     }
 

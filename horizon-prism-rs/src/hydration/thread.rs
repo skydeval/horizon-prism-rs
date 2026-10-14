@@ -436,7 +436,7 @@ impl Hydrator {
         let anchor = self.load_posts(&[uri.to_string()]).await?;
         let Some(anchor_row) = anchor.get(uri) else {
             let author = uri_author(uri).unwrap_or_default().to_string();
-            if !self.in_scope(&author).await
+            if !self.stores_public_of(&author).await
                 && !moderation::gate(self.pool(), uri).await?.is_hidden()
                 && let Some(v) = self.upstream().post_thread(req, uri, depth, parent_height).await
             {
@@ -471,8 +471,9 @@ impl Hydrator {
                 uris.push(p);
                 continue;
             }
-            // An in-scope author's posts are all stored: this one is gone.
-            if self.in_scope(uri_author(&p).unwrap_or_default()).await {
+            // An in-scope author's posts are all stored while the mode is
+            // On: this one is gone.
+            if self.stores_public_of(uri_author(&p).unwrap_or_default()).await {
                 uris.push(p);
                 break;
             }
@@ -546,8 +547,9 @@ impl Hydrator {
                     if wanted.len() >= room {
                         break;
                     }
-                    // A reply by an in-scope author would be a local row.
-                    if uris.contains(&kid) || wanted.iter().any(|(_, k)| *k == kid) || self.in_scope(uri_author(&kid).unwrap_or_default()).await {
+                    // A reply by an in-scope author would be a local row
+                    // while the mode is On.
+                    if uris.contains(&kid) || wanted.iter().any(|(_, k)| *k == kid) || self.stores_public_of(uri_author(&kid).unwrap_or_default()).await {
                         continue;
                     }
                     wanted.push((parent.clone(), kid));
@@ -777,6 +779,47 @@ mod tests {
         assert_eq!(uris, [local.as_str(), far("reply").as_str()]);
         // A fetched reply's own replies are listed and fetched too.
         assert_eq!(replies[1]["replies"][0]["post"]["uri"], json!(far("deep")));
+        db.drop_db().await;
+    }
+
+    /// T-16 (public-indexing design §9.1): while the mode is On, an S
+    /// author's missing parent is gone; in Filling it is fetched, since
+    /// the fill may not have stored it yet.
+    #[tokio::test]
+    async fn a_missing_s_author_parent_is_fetched_unless_the_mode_is_on() {
+        use std::sync::Arc;
+
+        use crate::hydration::testing::{FixedUpstream, hydrator_with, set_mode};
+        use crate::indexing::PublicMode;
+
+        let Some(db) = fresh_db("hydration_thread_filling").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let mut sets = ScopeSets::default();
+        sets.scope.insert(ALICE.into());
+        sets.scope.insert(BOB.into());
+        let parent = format!("at://{BOB}/app.bsky.feed.post/3kparent2222");
+        let anchor = post(p, ALICE, "3kanchor2222", "anchor", Some(&parent), Some(&parent)).await;
+        let mut up = FixedUpstream::default();
+        up.posts.insert(
+            parent.clone(),
+            json!({"$type": "app.bsky.feed.defs#postView", "uri": parent, "cid": "bafy",
+                   "author": {"did": BOB, "handle": "bob.test", "viewer": {}, "labels": []},
+                   "record": {"$type": "app.bsky.feed.post", "text": "parent", "createdAt": "2026-09-26T00:00:00Z"},
+                   "indexedAt": "2026-09-26T00:00:00Z", "viewer": {}, "labels": []}),
+        );
+        let h = hydrator_with(p, sets, Arc::new(up));
+        let (anon, req) = (Viewer::anonymous(), Requester::test());
+
+        let t = h.get_post_thread(&anon, &req, &anchor, 0, 80).await.expect("db").expect("view");
+        assert_eq!(t.inner()["thread"]["parent"]["$type"], "app.bsky.feed.defs#notFoundPost", "On: stored if it exists");
+        assert_eq!(t.inner()["thread"]["parent"]["uri"], json!(parent));
+        set_mode(h.scope(), PublicMode::Filling).await;
+        let t = h.get_post_thread(&anon, &req, &anchor, 0, 80).await.expect("db").expect("view");
+        assert_eq!(t.inner()["thread"]["parent"]["post"]["record"]["text"], "parent", "Filling: fetched");
         db.drop_db().await;
     }
 

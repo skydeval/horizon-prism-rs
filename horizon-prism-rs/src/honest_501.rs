@@ -6,7 +6,7 @@
 //! status link, never the set: that keeps each route's verb known and keeps
 //! an operator key from overlapping a core handler.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Json;
@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use serde_json::json;
 
 use crate::config::{FileConfig, ServiceState};
+use crate::indexing::PublicMode;
 use crate::xrpc::AppState;
 use crate::xrpc::auth::request_ip;
 use crate::xrpc::errors::XrpcError;
@@ -194,6 +195,185 @@ pub fn message(d: &Deferral, cfg: &FileConfig) -> String {
     render(template, &cfg.honest_501.status_url)
 }
 
+/// `public_off_501_total{nsid}`: public methods answered 501 because the
+/// public-indexing mode is not On (public-indexing design §6, §10).
+pub const PUBLIC_OFF_METRIC: &str = "public_off_501_total";
+/// The message of a public method in the off modes (public-indexing design
+/// §6; override `honest_501.public_off_message`).
+pub const PUBLIC_OFF_MESSAGE: &str =
+    "This AppView serves the private tier and Horizon features only. Use your public AppView for this method.";
+/// The same in Filling (override `honest_501.public_filling_message`).
+pub const PUBLIC_FILLING_MESSAGE: &str =
+    "Public indexing is being turned on. This method is served when its backfill completes.";
+
+/// A served method that answers 501 unless the public-indexing mode is On,
+/// with the verb it is registered for (public-indexing design §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicMethod {
+    pub nsid: &'static str,
+    pub verb: Verb,
+}
+
+const fn public(nsid: &'static str, verb: Verb) -> PublicMethod {
+    PublicMethod { nsid, verb }
+}
+
+/// The 56 methods of public-indexing design §6 that answer 501 unless the
+/// mode is On. Every other served method is in [`KEPT_METHODS`].
+pub const PUBLIC_METHODS: &[PublicMethod] = &[
+    public("app.bsky.actor.getProfile", Verb::Get),
+    public("app.bsky.actor.getProfiles", Verb::Get),
+    public("app.bsky.actor.searchActors", Verb::Get),
+    public("app.bsky.feed.searchPosts", Verb::Get),
+    public("app.bsky.feed.searchPostsV2", Verb::Get),
+    public("app.bsky.actor.searchActorsTypeahead", Verb::Get),
+    public("app.bsky.graph.searchStarterPacks", Verb::Get),
+    public("app.bsky.graph.searchStarterPacksV2", Verb::Get),
+    public("app.bsky.unspecced.getSuggestedUsers", Verb::Get),
+    public("app.bsky.actor.getSuggestions", Verb::Get),
+    public("app.bsky.unspecced.getSuggestedUsersForDiscover", Verb::Get),
+    public("app.bsky.unspecced.getSuggestedUsersForExplore", Verb::Get),
+    public("app.bsky.unspecced.getSuggestedUsersForSeeMore", Verb::Get),
+    public("app.bsky.unspecced.getSuggestedOnboardingUsers", Verb::Get),
+    public("app.bsky.graph.getSuggestedFollowsByActor", Verb::Get),
+    public("app.bsky.unspecced.getTaggedSuggestions", Verb::Get),
+    public("app.bsky.unspecced.getConfig", Verb::Get),
+    public("app.bsky.unspecced.getTrendingTopics", Verb::Get),
+    public("app.bsky.unspecced.getTrends", Verb::Get),
+    public("app.bsky.unspecced.getSuggestedStarterPacks", Verb::Get),
+    public("app.bsky.unspecced.getOnboardingSuggestedStarterPacks", Verb::Get),
+    public("app.bsky.feed.getPosts", Verb::Get),
+    public("app.bsky.feed.getPostThread", Verb::Get),
+    public("app.bsky.unspecced.getPostThreadV2", Verb::Get),
+    public("app.bsky.unspecced.getPostThreadOtherV2", Verb::Get),
+    public("app.bsky.feed.getAuthorFeed", Verb::Get),
+    public("app.bsky.feed.getLikes", Verb::Get),
+    public("app.bsky.feed.getRepostedBy", Verb::Get),
+    public("app.bsky.feed.getQuotes", Verb::Get),
+    public("app.bsky.feed.getTimeline", Verb::Get),
+    public("app.bsky.feed.getActorLikes", Verb::Get),
+    public("app.bsky.feed.getListFeed", Verb::Get),
+    public("app.bsky.graph.getFollows", Verb::Get),
+    public("app.bsky.graph.getFollowers", Verb::Get),
+    public("app.bsky.graph.getList", Verb::Get),
+    public("app.bsky.graph.getLists", Verb::Get),
+    public("app.bsky.graph.getKnownFollowers", Verb::Get),
+    public("app.bsky.graph.getRelationships", Verb::Get),
+    public("app.bsky.graph.getListsWithMembership", Verb::Get),
+    public("app.bsky.graph.getStarterPacksWithMembership", Verb::Get),
+    public("app.bsky.graph.getStarterPack", Verb::Get),
+    public("app.bsky.graph.getStarterPacks", Verb::Get),
+    public("app.bsky.graph.getActorStarterPacks", Verb::Get),
+    public("app.bsky.notification.listNotifications", Verb::Get),
+    public("app.bsky.notification.getUnreadCount", Verb::Get),
+    public("app.bsky.notification.updateSeen", Verb::Post),
+    public("app.bsky.notification.getPreferences", Verb::Get),
+    public("app.bsky.notification.putPreferences", Verb::Post),
+    public("app.bsky.notification.putPreferencesV2", Verb::Post),
+    public("app.bsky.notification.listActivitySubscriptions", Verb::Get),
+    public("app.bsky.notification.putActivitySubscription", Verb::Post),
+    public("app.bsky.bookmark.createBookmark", Verb::Post),
+    public("app.bsky.bookmark.deleteBookmark", Verb::Post),
+    public("app.bsky.bookmark.getBookmarks", Verb::Get),
+    public("app.bsky.labeler.getServices", Verb::Get),
+    public("com.atproto.repo.getRecord", Verb::Get),
+];
+
+/// The 25 served methods of public-indexing design §6 answered in every
+/// mode: the private tier, Thread Lens, Horizon features, and the member's
+/// own moderation state.
+pub const KEPT_METHODS: &[&str] = &[
+    "app.bsky.graph.getMutes",
+    "app.bsky.graph.muteActor",
+    "app.bsky.graph.unmuteActor",
+    "app.bsky.graph.muteThread",
+    "app.bsky.graph.unmuteThread",
+    "app.bsky.graph.getBlocks",
+    "app.bsky.graph.muteActorList",
+    "app.bsky.graph.unmuteActorList",
+    "app.bsky.graph.getListMutes",
+    "app.bsky.graph.getListBlocks",
+    "app.bsky.draft.createDraft",
+    "app.bsky.draft.updateDraft",
+    "app.bsky.draft.deleteDraft",
+    "app.bsky.draft.getDrafts",
+    "com.atproto.label.queryLabels",
+    "com.atproto.identity.resolveHandle",
+    "app.nearhorizon.feed.getAuthorPolls",
+    "app.nearhorizon.private.getPosts",
+    "app.nearhorizon.private.getPostThread",
+    "app.nearhorizon.private.getAuthorFeed",
+    "app.nearhorizon.private.getTimeline",
+    "app.nearhorizon.threadLens.getThread",
+    "app.nearhorizon.threadLens.resolve",
+    "app.nearhorizon.index.requestRecord",
+    "app.nearhorizon.constellation.resolveDid",
+];
+
+/// The public method for an NSID.
+#[must_use]
+pub fn public_method(nsid: &str) -> Option<&'static PublicMethod> {
+    PUBLIC_METHODS.iter().find(|m| m.nsid == nsid)
+}
+
+/// The two messages of a public method unless the mode is On, with the
+/// operator's overrides and the link rule applied. Cheap to clone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicMessages {
+    off: Arc<str>,
+    filling: Arc<str>,
+}
+
+impl PublicMessages {
+    #[must_use]
+    pub fn from_config(cfg: &FileConfig) -> Self {
+        let h = &cfg.honest_501;
+        let off = h.public_off_message.as_deref().unwrap_or(PUBLIC_OFF_MESSAGE);
+        let filling = h.public_filling_message.as_deref().unwrap_or(PUBLIC_FILLING_MESSAGE);
+        Self {
+            off: Arc::from(render(off, &h.status_url)),
+            filling: Arc::from(render(filling, &h.status_url)),
+        }
+    }
+
+    /// The message for `mode`; `None` when the mode is On.
+    #[must_use]
+    pub fn for_mode(&self, mode: PublicMode) -> Option<&str> {
+        match mode {
+            PublicMode::On => None,
+            PublicMode::Filling => Some(&self.filling),
+            PublicMode::Draining | PublicMode::Off | PublicMode::Held => Some(&self.off),
+        }
+    }
+}
+
+/// The compiled messages with no status URL.
+impl Default for PublicMessages {
+    fn default() -> Self {
+        Self::from_config(&FileConfig::default())
+    }
+}
+
+/// A public method's answer unless the mode is On (public-indexing design
+/// §6): shaped, charged and unauthenticated as a deferral's.
+pub fn public_off_answer(app: &AppState, nsid: &'static str, message: &str, ip: IpAddr) -> Response {
+    not_implemented(app, PUBLIC_OFF_METRIC, nsid, message, ip)
+}
+
+/// `501 NotImplemented` with `message`, charged `anon_read` by IP and
+/// counted in `metric{nsid}`.
+fn not_implemented(app: &AppState, metric: &'static str, nsid: &'static str, message: &str, ip: IpAddr) -> Response {
+    if let Err(limited) = app.limits.check_ip(Class::AnonRead, ip) {
+        return XrpcError::from(limited).into_response();
+    }
+    metrics::counter!(metric, "nsid" => nsid).increment(1);
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({ "error": "NotImplemented", "message": message })),
+    )
+        .into_response()
+}
+
 #[derive(Clone)]
 struct Route {
     app: AppState,
@@ -205,15 +385,7 @@ struct Route {
 /// class `anon_read` by IP for every caller.
 async fn answer(State(r): State<Route>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
     let ip = request_ip(&r.app, &headers, peer);
-    if let Err(limited) = r.app.limits.check_ip(Class::AnonRead, ip) {
-        return XrpcError::from(limited).into_response();
-    }
-    metrics::counter!(METRIC, "nsid" => r.nsid).increment(1);
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "error": "NotImplemented", "message": &*r.message })),
-    )
-        .into_response()
+    not_implemented(&r.app, METRIC, r.nsid, &r.message, ip)
 }
 
 /// The 501 routes this config registers, each for its lexicon verb. Merged
@@ -260,6 +432,58 @@ mod tests {
             // No deferral sits in this AppView's own namespace.
             assert!(!d.nsid.starts_with("app.nearhorizon."), "{}", d.nsid);
         }
+    }
+
+    /// T-6 (public-indexing design §6): every served method is in exactly
+    /// one of the two sets, 56 public and 25 kept. Their verbs are checked
+    /// against the routes in `xrpc::router`'s tests.
+    #[test]
+    fn public_and_kept_methods_classify_every_served_method() {
+        use crate::xrpc::rate_limit::SERVED;
+
+        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 25));
+        let public: BTreeSet<&str> = PUBLIC_METHODS.iter().map(|m| m.nsid).collect();
+        let kept: BTreeSet<&str> = KEPT_METHODS.iter().copied().collect();
+        assert_eq!((public.len(), kept.len()), (56, 25), "no NSID twice");
+        assert!(public.is_disjoint(&kept));
+        let served: BTreeSet<&str> = SERVED.iter().map(|s| s.nsid).collect();
+        assert_eq!(served.len(), 81);
+        assert_eq!(public.union(&kept).copied().collect::<BTreeSet<&str>>(), served);
+        // No deferral is gated: the two kinds of 501 never meet.
+        assert!(DEFERRALS.iter().all(|d| public_method(d.nsid).is_none()));
+        // Writes are the POST ones.
+        let posts: Vec<&str> = PUBLIC_METHODS.iter().filter(|m| m.verb == Verb::Post).map(|m| m.nsid).collect();
+        assert_eq!(
+            posts,
+            [
+                "app.bsky.notification.updateSeen",
+                "app.bsky.notification.putPreferences",
+                "app.bsky.notification.putPreferencesV2",
+                "app.bsky.notification.putActivitySubscription",
+                "app.bsky.bookmark.createBookmark",
+                "app.bsky.bookmark.deleteBookmark",
+            ]
+        );
+    }
+
+    /// The messages per mode, with the overrides and the link rule.
+    #[test]
+    fn public_messages_follow_the_mode_and_the_config() {
+        let m = PublicMessages::default();
+        assert_eq!(m.for_mode(PublicMode::On), None);
+        assert_eq!(m.for_mode(PublicMode::Filling), Some(PUBLIC_FILLING_MESSAGE));
+        for mode in [PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
+            assert_eq!(m.for_mode(mode), Some(PUBLIC_OFF_MESSAGE), "{mode:?}");
+        }
+        let cfg = FileConfig::parse(
+            "[honest_501]\npublic_off_message = \"Off. See <link>.\"\npublic_filling_message = \"Soon. Ask at <link>. Thanks.\"\n",
+        )
+        .expect("parse");
+        let m = PublicMessages::from_config(&cfg);
+        assert_eq!((m.for_mode(PublicMode::Off), m.for_mode(PublicMode::Filling)), (Some("Off."), Some("Soon. Thanks.")));
+        let cfg = FileConfig::parse("[honest_501]\nstatus_url = \"https://s.example\"\npublic_off_message = \"Off. See <link>.\"\n").expect("parse");
+        let m = PublicMessages::from_config(&cfg);
+        assert_eq!((m.for_mode(PublicMode::Held), m.for_mode(PublicMode::Filling)), (Some("Off. See https://s.example."), Some(PUBLIC_FILLING_MESSAGE)));
     }
 
     #[test]

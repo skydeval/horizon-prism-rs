@@ -16,11 +16,14 @@ pub struct RoutingHint {
     pub handle: Option<String>,
     /// Network name, `community`, or `None` when unknown.
     pub home_network: Option<String>,
-    /// `None` for `community` (use this AppView) and for unknown.
+    /// `None` for `community` (use this AppView) and for unknown. Unless
+    /// the public-indexing mode is On, a `community` DID names the first
+    /// cascade AppView instead (C4).
     pub home_appview: Option<String>,
     /// Enabled network names in fallback order.
     pub cascade: Vec<String>,
-    /// The DID is in `scope_dids`.
+    /// `Hydrator::stores_public_of`: the mode is On and the DID is in
+    /// `scope_dids`.
     pub local_indexed: bool,
 }
 

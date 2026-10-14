@@ -132,7 +132,7 @@ async fn start(test: &str, toml: &str, backstop: Option<Backstop>) -> Option<Har
     let routes = crate::xrpc::router(state.clone())
         .merge(crate::honest_501::router(&state, &cfg))
         .merge(proxy::router(&state, &cfg, &Shares::for_tests(), AUDIENCE_HOST).expect("proxy routes"));
-    let app = finalize(routes, state, FinalConfig { not_ready_retry_secs: 5 });
+    let app = finalize(routes, state, FinalConfig { not_ready_retry_secs: 5, public: crate::honest_501::PublicMessages::from_config(&cfg) });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {

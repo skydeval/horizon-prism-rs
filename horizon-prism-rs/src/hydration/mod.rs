@@ -520,6 +520,14 @@ impl Hydrator {
         self.scope().read_guard().await.in_scope(did)
     }
 
+    /// Whether every public record of `did` is stored here: the
+    /// public-indexing mode is On and `did` is in S (public-indexing design
+    /// §9.1). Filling is not On, so a fill in progress reads upstream.
+    pub async fn stores_public_of(&self, did: &str) -> bool {
+        let sets = self.scope().read_guard().await;
+        sets.public.mode.is_on() && sets.in_scope(did)
+    }
+
     /// Local actor rows.
     ///
     /// # Errors
@@ -642,13 +650,19 @@ impl Hydrator {
                 .bind(dids)
                 .fetch_all(p)
                 .await?;
-        let subscribed: Vec<(String, bool, bool)> = sqlx::query_as(
-            "SELECT subject_did, post, reply FROM activity_subscriptions WHERE subscriber_did = $1 AND subject_did = ANY($2)",
-        )
-        .bind(me)
-        .bind(dids)
-        .fetch_all(p)
-        .await?;
+        // Activity subscriptions feed only a 501 surface unless the
+        // public-indexing mode is On (public-indexing design §9.2).
+        let subscribed: Vec<(String, bool, bool)> = if self.scope().public_mode().is_on() {
+            sqlx::query_as(
+                "SELECT subject_did, post, reply FROM activity_subscriptions WHERE subscriber_did = $1 AND subject_did = ANY($2)",
+            )
+            .bind(me)
+            .bind(dids)
+            .fetch_all(p)
+            .await?
+        } else {
+            Vec::new()
+        };
         let mut out = ActorViewer {
             subscribed: subscribed.into_iter().map(|(did, post, reply)| (did, (post, reply))).collect(),
             following: following.into_iter().collect(),
@@ -848,14 +862,18 @@ impl Hydrator {
                 out.entry(uri).or_insert_with(|| json!({}))["embeddingDisabled"] = json!(true);
             }
         }
-        // A post the viewer bookmarked (design-v3 §8.2).
-        let bookmarked: Vec<String> = sqlx::query_scalar("SELECT post_uri FROM bookmarks WHERE viewer_did = $1 AND post_uri = ANY($2)")
-            .bind(me)
-            .bind(uris)
-            .fetch_all(self.pool())
-            .await?;
-        for uri in bookmarked {
-            out.entry(uri).or_insert_with(|| json!({}))["bookmarked"] = json!(true);
+        // A post the viewer bookmarked (design-v3 §8.2). Bookmarks are a 501
+        // surface unless the public-indexing mode is On, so the field is
+        // left out (public-indexing design §9.2).
+        if self.scope().public_mode().is_on() {
+            let bookmarked: Vec<String> = sqlx::query_scalar("SELECT post_uri FROM bookmarks WHERE viewer_did = $1 AND post_uri = ANY($2)")
+                .bind(me)
+                .bind(uris)
+                .fetch_all(self.pool())
+                .await?;
+            for uri in bookmarked {
+                out.entry(uri).or_insert_with(|| json!({}))["bookmarked"] = json!(true);
+            }
         }
         // A post in a thread the viewer muted (design-v3 §5.3, §8.2).
         for uri in self.in_muted_threads(viewer, uris).await? {
@@ -987,6 +1005,10 @@ pub(crate) mod testing {
         pub starter_packs: HashMap<String, Value>,
         /// DID → `getActorStarterPacks` output.
         pub actor_packs: HashMap<String, Value>,
+        /// Anchor URI → `getPostThread` output.
+        pub threads: HashMap<String, Value>,
+        /// DID → `getAuthorPolls` output.
+        pub polls: HashMap<String, Value>,
         pub calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -1024,8 +1046,12 @@ pub(crate) mod testing {
         async fn actor_starter_packs(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
             self.actor_packs.get(actor).cloned()
         }
-        async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
-            None
+        async fn post_thread(&self, _req: &Requester, uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
+            self.threads.get(uri).cloned()
+        }
+        async fn author_polls(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.polls.get(actor).cloned()
         }
         async fn author_feed(&self, _req: &Requester, actor: &str, _limit: u32, cursor: Option<&str>, _filter: &str) -> Option<Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1045,12 +1071,17 @@ pub(crate) mod testing {
 
     /// A hydrator that asks `farsight` about inbound list blocks.
     pub(crate) fn hydrator_with_farsight(pool: &PgPool, sets: ScopeSets, farsight: Farsight) -> Hydrator {
+        hydrator_with_upstream_and_farsight(pool, sets, Arc::new(NoUpstream), farsight)
+    }
+
+    /// The same, with an upstream.
+    pub(crate) fn hydrator_with_upstream_and_farsight(pool: &PgPool, sets: ScopeSets, upstream: Arc<dyn UpstreamSource>, farsight: Farsight) -> Hydrator {
         Hydrator::new(
             pool.clone(),
             ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000),
             None,
             None,
-            Arc::new(NoUpstream),
+            upstream,
             ReadCache::new(1024 * 1024),
             HydrationConfig {
                 farsight: Some(farsight),
@@ -1122,6 +1153,14 @@ pub(crate) mod testing {
             ReadCache::new(1024 * 1024),
             test_config(),
         )
+    }
+
+    /// Set the public-indexing mode, as the switch does: under the write
+    /// guard, with the mirror in step.
+    pub(crate) async fn set_mode(scope: &ScopeState, mode: crate::indexing::PublicMode) {
+        let mut sets = scope.write_guard().await;
+        let public = crate::indexing::PublicState { mode, ..sets.public };
+        scope.set_public(&mut sets, public);
     }
 
     pub(crate) async fn exec(pool: &PgPool, sql: &str) {

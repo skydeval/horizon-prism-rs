@@ -38,7 +38,7 @@ impl Hydrator {
         if let Some((error, message)) = moderation::gate(self.pool(), &did).await?.profile_error() {
             return Ok(Err(ViewError::new(error, message)));
         }
-        if !self.in_scope(&did).await || cursor.is_some_and(|c| c.starts_with("P:")) {
+        if !self.stores_public_of(&did).await || cursor.is_some_and(|c| c.starts_with("P:")) {
             return match self.upstream().author_polls(req, &did, limit, cursor).await {
                 Some(v) => Ok(Ok(Self::emit(self.normalized(viewer, v).await?.0))),
                 None => match req.exhausted() {
@@ -122,6 +122,46 @@ mod tests {
         // The limit is bounded.
         for bad in [0, 101] {
             assert_eq!(h.get_author_polls(&anon, &req, ALICE, bad, None).await.expect("db").expect_err("limit").error, "InvalidRequest");
+        }
+        db.drop_db().await;
+    }
+
+    /// T-16 (public-indexing design §9.1): unless the mode is On, an S
+    /// author's polls take the PDS path, whatever rows are stored here.
+    #[tokio::test]
+    async fn polls_take_the_pds_path_unless_the_mode_is_on() {
+        use std::sync::Arc;
+
+        use crate::hydration::testing::{FixedUpstream, hydrator_with, set_mode};
+        use crate::indexing::PublicMode;
+
+        let Some(db) = fresh_db("hydration_author_polls_off").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        exec(p, &format!(
+            "INSERT INTO nearhorizon_poll_posts (uri, author_did, rkey, cid, rev, text, options, visibility, record, created_at) VALUES \
+             ('at://{ALICE}/app.nearhorizon.poll.post/3kpoll1', '{ALICE}', '3kpoll1', 'bafy1', '3k', 'local', '[]', 'public', \
+              '{{\"text\": \"local\", \"visibility\": \"public\"}}', now())"
+        )).await;
+        let mut up = FixedUpstream::default();
+        let listed = json!({"uri": format!("at://{ALICE}/app.nearhorizon.poll.post/3kpoll2"), "cid": "bafy2",
+                            "author": {"did": ALICE, "handle": "alice.test"}, "record": {"text": "from the pds"}});
+        up.polls.insert(ALICE.into(), json!({"polls": [listed]}));
+        let mut sets = ScopeSets::default();
+        sets.scope.insert(ALICE.into());
+        let h = hydrator_with(p, sets, Arc::new(up));
+        let (anon, req) = (Viewer::anonymous(), Requester::test());
+        let texts = |v: &Value| -> Vec<String> {
+            v["polls"].as_array().expect("polls").iter().map(|x| x["record"]["text"].as_str().expect("text").to_string()).collect()
+        };
+        let on = h.get_author_polls(&anon, &req, ALICE, 25, None).await.expect("db").expect("view");
+        assert_eq!(texts(on.inner()), ["local"]);
+        for mode in [PublicMode::Filling, PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
+            set_mode(h.scope(), mode).await;
+            let off = h.get_author_polls(&anon, &req, ALICE, 25, None).await.expect("db").expect("view");
+            assert_eq!(texts(off.inner()), ["from the pds"], "{mode:?}");
         }
         db.drop_db().await;
     }

@@ -358,6 +358,12 @@ fn custom<'a>(name: &'a str, s: &'a ServiceConfig, claimed: &mut BTreeMap<&'a st
                 "services.{name}.methods: {nsid:?} is in the reserved namespace {reserved}*"
             ));
         }
+        // The endpoint gate owns these (public-indexing design §6, §10).
+        if honest_501::public_method(nsid).is_some() {
+            out.push(format!(
+                "services.{name}.methods: {nsid:?} is a public method of this AppView, gated by indexing.public_scope"
+            ));
+        }
         if let Some(other) = claimed.insert(nsid.as_str(), name) {
             out.push(format!("services.{name}.methods: {nsid:?} is also claimed by services.{other}"));
         }
@@ -500,6 +506,17 @@ mod tests {
             "[services.eu]\nmethods = { \"eu.example.a.b\" = \"GET\" }\n[services.uk]\nmethods = { \"eu.example.a.b\" = \"GET\" }\n",
             "also claimed by services.eu",
         );
+        // No service overlaps the gated public methods (public-indexing
+        // design §10): a custom one is refused, and no built-in claims one.
+        one(
+            "[services.eu]\nmethods = { \"app.bsky.feed.getTimeline\" = \"GET\" }\n",
+            "gated by indexing.public_scope",
+        );
+        for s in table(&FileConfig::default()) {
+            for (nsid, _) in &s.methods {
+                assert!(honest_501::public_method(nsid).is_none(), "{nsid}");
+            }
+        }
     }
 
     #[test]

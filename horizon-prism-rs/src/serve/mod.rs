@@ -508,7 +508,8 @@ pub async fn run() -> Result<(), StartupError> {
         ),
         read_cache.clone(),
     )
-    .with_list_read_pages(cfg.file.lists.read_listing_pages);
+    .with_list_read_pages(cfg.file.lists.read_listing_pages)
+    .with_scope(scope.clone());
 
     // HTTP.
     let hydrator = Hydrator::new(
@@ -673,6 +674,7 @@ pub async fn run() -> Result<(), StartupError> {
         app,
         crate::xrpc::router::FinalConfig {
             not_ready_retry_secs: cfg.file.community.not_ready_retry_secs,
+            public: crate::honest_501::PublicMessages::from_config(&cfg.file),
         },
     );
     axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())

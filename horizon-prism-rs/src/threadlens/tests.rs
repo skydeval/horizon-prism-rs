@@ -445,6 +445,94 @@ async fn a_response_is_paged_by_a_sealed_cursor() {
     db.drop_db().await;
 }
 
+/// T-15 (public-indexing design §9.2): unless the mode is On, an S author's
+/// thread that is not stored here takes the upstream baseline, normalized
+/// for the viewer. `threadMuted` holds on the root and its posts, and
+/// `bookmarked` and `activitySubscription` are left out. The chain above a
+/// blocked anchor is as the baseline names it.
+#[tokio::test]
+async fn an_s_authors_thread_takes_the_upstream_baseline_unless_the_mode_is_on() {
+    use crate::hydration::testing::{FixedUpstream, hydrator_with_upstream_and_farsight, set_mode};
+    use crate::indexing::PublicMode;
+
+    let Some(db) = fresh_db("threadlens_public_off").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(AUTHOR, "author.test"), (R1, "r1.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    let at = |did: &str, rkey: &str| format!("at://{did}/app.bsky.feed.post/{rkey}");
+    let (root, anchor, blocked) = (at(AUTHOR, "3kroot222222"), at(AUTHOR, "3kanchor2222"), at(R1, "3kblocked222"));
+    let view = |uri: &str, did: &str, handle: &str, parent: Option<&str>| {
+        let mut record = json!({"$type": "app.bsky.feed.post", "text": uri, "createdAt": "2026-09-26T00:00:00Z"});
+        if let Some(parent) = parent {
+            record["reply"] = json!({"parent": {"uri": parent, "cid": "c"}, "root": {"uri": root, "cid": "c"}});
+        }
+        json!({"$type": "app.bsky.feed.defs#postView", "uri": uri, "cid": "bafy",
+               "author": {"did": did, "handle": handle, "viewer": {}, "labels": []},
+               "record": record, "indexedAt": "2026-09-26T00:00:00Z", "viewer": {}, "labels": []})
+    };
+    let top = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&root, AUTHOR, "author.test", None), "replies": []});
+    let mut up = FixedUpstream::default();
+    for (uri, did, handle) in [(&anchor, AUTHOR, "author.test"), (&blocked, R1, "r1.test")] {
+        let thread = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": view(uri, did, handle, Some(&root)), "parent": top, "replies": []});
+        up.threads.insert(uri.clone(), json!({"thread": thread}));
+    }
+    // The viewer muted the thread, bookmarked the anchor, subscribed to its
+    // author, and blocks R1.
+    exec(p, &format!("INSERT INTO thread_mutes (viewer_did, root_uri) VALUES ('{VIEWER_A}', '{root}')")).await;
+    exec(p, &format!("INSERT INTO bookmarks (viewer_did, post_uri, post_cid) VALUES ('{VIEWER_A}', '{anchor}', 'bafy')")).await;
+    exec(p, &format!("INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply) VALUES ('{VIEWER_A}', '{AUTHOR}', true, true)")).await;
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    let mut sets = ScopeSets::default();
+    for did in [AUTHOR, R1] {
+        sets.scope.insert(did.into());
+    }
+    let (farsight, _fake) = crate::farsight::lookup::tests::engine("").await;
+    let h = hydrator_with_upstream_and_farsight(p, sets, Arc::new(up), farsight);
+    let base = fake_upstream(Arc::new(Calls::default()), None).await;
+    let l = ladder(h.clone(), &base, Arc::new(StubLookup::default()));
+    let (req, viewer, key, cfg) = (Requester::test(), member(VIEWER_A), CursorKey::generated(), ThreadLensConfig::default());
+
+    // On: an S author's posts are all stored here, so a missing anchor has
+    // no baseline. The viewer fields are there.
+    assert_eq!(h.lens_baseline(&viewer, &req, &anchor, 0, 80).await.expect("db"), None);
+    assert_eq!(h.post_viewer(&viewer, std::slice::from_ref(&anchor)).await.expect("db")[&anchor]["bookmarked"], true);
+    assert!(h.actor_viewer(&viewer, &[AUTHOR.to_string()]).await.expect("db").view(AUTHOR).get("activitySubscription").is_some());
+
+    set_mode(h.scope(), PublicMode::Off).await;
+    let request = thread::Request { viewer: &viewer, req: &req, anchor: &anchor, depth: 0, parent_height: 80 };
+    let got = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    let posts: Vec<&Value> = got
+        .nodes
+        .iter()
+        .map(|n| match n {
+            LensNode::Post { post, .. } => post,
+            LensNode::Gap { uri, gap, .. } => panic!("{uri} is a {} gap", gap.label()),
+        })
+        .collect();
+    assert_eq!(posts.iter().map(|v| v["uri"].clone()).collect::<Vec<_>>(), [json!(root), json!(anchor)]);
+    for post in &posts {
+        assert_eq!(post["viewer"]["threadMuted"], true, "{post}");
+        assert!(post["viewer"].get("bookmarked").is_none(), "{post}");
+        assert!(post["author"]["viewer"].get("activitySubscription").is_none(), "{post}");
+    }
+    assert!(h.post_viewer(&viewer, std::slice::from_ref(&anchor)).await.expect("db")[&anchor].get("bookmarked").is_none());
+    assert!(h.actor_viewer(&viewer, &[AUTHOR.to_string()]).await.expect("db").view(AUTHOR).get("activitySubscription").is_none());
+
+    // A blocked anchor: a gap, with the chain above it as the baseline
+    // names it.
+    let request = thread::Request { anchor: &blocked, ..request };
+    let got = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    assert_eq!(got.nodes.len(), 2, "{:?}", got.nodes);
+    assert!(matches!(&got.nodes[0], LensNode::Post { uri, .. } if *uri == root), "{:?}", got.nodes);
+    assert!(matches!(&got.nodes[1], LensNode::Gap { uri, gap: Gap::BlockedByYou, .. } if *uri == blocked), "{:?}", got.nodes);
+    assert_eq!(got.nodes[1].parent_uri(), Some(root.as_str()));
+    db.drop_db().await;
+}
+
 /// B-83: the walk up the parents goes through a blocked author's post,
 /// taking the link above it from the stored row, and stops with a marker
 /// at `parentHeight`.

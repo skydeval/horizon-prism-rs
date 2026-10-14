@@ -3,7 +3,8 @@
 //! [`RealUpstreamSource`] serves subjects this AppView does not index:
 //! 1. the subject DID's home network (§8.2, via the `route` cache);
 //! 2. the home AppView, then the cascade (§8.3 steps 4–5), skipped entirely
-//!    for the `community` network (local data only, then Slingshot);
+//!    for the `community` network (local data only, then Slingshot) while
+//!    the public-indexing mode is On (C4);
 //! 3. record-level fallback: Slingshot `getRecord` for single records and
 //!    threads; the author PDS `listRecords` for author feeds (continuing
 //!    only on PDSes that list descending, §7.1, §5.10) and follows.
@@ -29,6 +30,7 @@ use super::cache::ReadCache;
 use super::feed::media_type;
 use super::normalize::is_private_uri;
 use super::{INVALID_HANDLE, blob_url};
+use crate::aggregations::ScopeState;
 use crate::aggregations::counts::{self, Counts, Freshness};
 use crate::constellation::{Call, Cascade, Router};
 use crate::db::locks::uri_author;
@@ -328,6 +330,9 @@ pub struct RealUpstreamSource {
     cache: ReadCache,
     /// `lists.read_listing_pages`.
     list_read_pages: usize,
+    /// Whose public-indexing mode decides C4 (public-indexing design §11).
+    /// `None` reads as On: the community network is skipped.
+    scope: Option<ScopeState>,
 }
 
 /// A `postView` synthesized from a Slingshot or PDS record: no counts, no
@@ -398,7 +403,16 @@ impl RealUpstreamSource {
             pds,
             cache,
             list_read_pages: LIST_READ_PAGES,
+            scope: None,
         }
+    }
+
+    /// Read the public-indexing mode from `scope` (C4): unless it is On, a
+    /// community DID's public reads go to the cascade too.
+    #[must_use]
+    pub fn with_scope(mut self, scope: ScopeState) -> Self {
+        self.scope = Some(scope);
+        self
     }
 
     /// Set `lists.read_listing_pages`: the owner-PDS pages one `getList`
@@ -416,10 +430,14 @@ impl RealUpstreamSource {
         (d.network_name, community)
     }
 
-    /// Cascade call for a subject DID, skipped for the community network.
+    /// Cascade call for a subject DID, skipped for the community network
+    /// while the public-indexing mode is On. Unless it is On, a community
+    /// author's public records are not stored here, so the networks in
+    /// cascade order are asked (C4, public-indexing design §11).
     async fn cascade(&self, req: &Requester, did: &str, call: Call<'_>) -> Option<Value> {
         let (home, community) = self.home(req, did).await;
-        if community {
+        let on = self.scope.as_ref().is_none_or(|s| s.public_mode().is_on());
+        if community && on {
             return None;
         }
         self.cascade.fetch(req, home.as_deref(), call).await.hit()
@@ -1160,6 +1178,52 @@ mod tests {
         // Cached for the next request.
         assert_eq!(up.profile(&req, OUTSIDER).await.expect("cached")["displayName"], "From AppView");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// C4 (public-indexing design §11): a community DID's public reads skip
+    /// the cascade while the mode is On, and go to it otherwise.
+    #[tokio::test]
+    async fn community_reads_go_to_the_cascade_unless_the_mode_is_on() {
+        use crate::aggregations::ScopeSets;
+        use crate::config::ScopePolicy;
+        use crate::indexing::{PublicMode, PublicState};
+
+        const LOCAL: &str = "did:plc:cccccccccccccccccccccccc";
+        let (appview, calls) = fake_appview(StatusCode::OK, json!({"did": LOCAL, "handle": "local.example", "displayName": "From AppView"})).await;
+        let (slingshot, _) = fake_slingshot().await;
+        let community = |scope: Option<ScopeState>| {
+            let lookup = Arc::new(StubLookup::default());
+            lookup.pds.lock().expect("lock").insert(LOCAL.into(), "https://pds1.community.example".into());
+            let router = DidRouter::new(Arc::new(table_with_community(&["*.community.example"])), lookup as Arc<dyn DidLookup>);
+            let net = NetClient::loopback_for_tests();
+            let up = RealUpstreamSource::new(
+                router,
+                cascade_for(&[("bluesky", &appview), ("community-a", &appview)]),
+                SlingshotClient::new(net.clone(), &slingshot),
+                PdsLister::new(net, hosts(20.0)),
+                ReadCache::new(1024 * 1024),
+            );
+            match scope {
+                Some(scope) => up.with_scope(scope),
+                None => up,
+            }
+        };
+        let scope_in = |mode: PublicMode| {
+            let sets = ScopeSets { public: PublicState { mode, generation: 1, last_fill_since: None }, ..ScopeSets::default() };
+            ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000)
+        };
+        let req = Requester::test();
+        // On, or no scope given: the record from Slingshot, no AppView call.
+        for up in [community(None), community(Some(scope_in(PublicMode::On)))] {
+            assert_eq!(up.profile(&req, LOCAL).await.expect("profile")["displayName"], "Outsider");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // Any other mode: the cascade answers.
+        for (i, mode) in [PublicMode::Filling, PublicMode::Draining, PublicMode::Off, PublicMode::Held].into_iter().enumerate() {
+            let up = community(Some(scope_in(mode)));
+            assert_eq!(up.profile(&req, LOCAL).await.expect("profile")["displayName"], "From AppView", "{mode:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), i + 1, "{mode:?}");
+        }
     }
 
     #[tokio::test]

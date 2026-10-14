@@ -7,8 +7,8 @@
 //!    no source is consulted), `record_tombstones` (`deleted`), then local
 //!    `posts`, hydrated for the viewer.
 //! 3. **Home AppView, then the cascade**, via unauthenticated
-//!    `app.bsky.feed.getPosts` (skipped for the `community` network and for
-//!    `#blockedPost` stubs).
+//!    `app.bsky.feed.getPosts` (skipped for `#blockedPost` stubs, and for
+//!    the `community` network while the public-indexing mode is On).
 //! 4. **Slingshot** `getRecord`.
 //! 5. **Classify** (§10.4 table, [`super::gaps::classify`]).
 //!
@@ -119,7 +119,10 @@ impl Ladder {
         let mut cascade = CascadeOutcome::Skipped;
         if mode == Mode::Full {
             let home = self.router.resolve_did(req, &author).await;
-            if !home.is_community() {
+            // C4 (public-indexing design §11): unless the mode is On, a
+            // community author's posts are not stored, so the cascade is
+            // asked for them too.
+            if !home.is_community() || !self.hydrator.scope().public_mode().is_on() {
                 let uris = [uri.to_string()];
                 match self.cascade.fetch(req, home.network_name.as_deref(), Call::Posts(&uris)).await {
                     Fetched::Hit { body, .. } => {

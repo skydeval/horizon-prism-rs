@@ -158,7 +158,8 @@ mod tests {
     use super::*;
     use crate::aggregations::ScopeSets;
     use crate::hydration::lists::PURPOSE_CURATE;
-    use crate::hydration::testing::{FixedUpstream, actor, exec, hydrator, hydrator_with};
+    use crate::hydration::testing::{FixedUpstream, actor, exec, hydrator, hydrator_with, set_mode};
+    use crate::indexing::PublicMode;
     use crate::test_support::fresh_db;
 
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -181,9 +182,20 @@ mod tests {
     /// applies: admitted, served by a sync, on an active moderation list.
     #[tokio::test]
     async fn only_a_reference_that_applies_hides_anyone() {
+        only_a_reference_that_applies_hides_anyone_in(PublicMode::On, "hydration_list_mutes_apply").await;
+    }
+
+    /// T-8 (public-indexing design §6): the same under the off rule, so
+    /// `viewer.blockingByList` still carries a member's list view.
+    #[tokio::test]
+    async fn only_a_reference_that_applies_hides_anyone_when_public_is_off() {
+        only_a_reference_that_applies_hides_anyone_in(PublicMode::Off, "hydration_list_mutes_apply_off").await;
+    }
+
+    async fn only_a_reference_that_applies_hides_anyone_in(mode: PublicMode, name: &str) {
         const CAROL: &str = "did:plc:cccccccccccccccccccccccc";
         const OWNER: &str = "did:plc:oooooooooooooooooooooooo";
-        let Some(db) = fresh_db("hydration_list_mutes_apply").await else {
+        let Some(db) = fresh_db(name).await else {
             return;
         };
         let p = &db.pool;
@@ -201,6 +213,7 @@ mod tests {
             json!({"uri": outside, "cid": "bafyout", "value": {"$type": "app.bsky.graph.list", "name": "Outside", "purpose": PURPOSE_MOD, "createdAt": "2026-01-01T00:00:00Z"}}),
         );
         let h = hydrator_with(p, ScopeSets::default(), std::sync::Arc::new(up));
+        set_mode(h.scope(), mode).await;
         let me = Viewer { did: Some(ALICE.into()), hydrate: true };
         for (uri, owner) in [(&local, BOB), (&outside, OWNER)] {
             exec(p, &format!("INSERT INTO subscribed_lists (list_uri, owner_did, state, purpose) VALUES ('{uri}', '{owner}', 'active', '{PURPOSE_MOD}')")).await;
@@ -351,7 +364,18 @@ mod tests {
     /// and the blocks are listed newest first.
     #[tokio::test]
     async fn list_mutes_and_list_blocks() {
-        let Some(db) = fresh_db("hydration_list_mutes").await else {
+        list_mutes_and_list_blocks_in(PublicMode::On, "hydration_list_mutes").await;
+    }
+
+    /// T-8 (public-indexing design §6): `muteActorList` and `getListBlocks`
+    /// work the same under the off rule, on a member's moderation lists.
+    #[tokio::test]
+    async fn list_mutes_and_list_blocks_when_public_is_off() {
+        list_mutes_and_list_blocks_in(PublicMode::Off, "hydration_list_mutes_off").await;
+    }
+
+    async fn list_mutes_and_list_blocks_in(mode: PublicMode, name: &str) {
+        let Some(db) = fresh_db(name).await else {
             return;
         };
         let p = &db.pool;
@@ -365,6 +389,7 @@ mod tests {
             sets.scope.insert(did.into());
         }
         let h = hydrator(p, sets);
+        set_mode(h.scope(), mode).await;
         let req = Requester::test();
         let me = Viewer { did: Some(ALICE.into()), hydrate: true };
         let mods = list(p, "3kmods", PURPOSE_MOD).await;
@@ -418,9 +443,22 @@ mod tests {
             )
             .await;
         }
+        // Two subjects on the member's `mods` list.
+        for (rkey, subject) in [("3ki1", ALICE), ("3ki2", "did:plc:cccccccccccccccccccccccc")] {
+            exec(
+                p,
+                &format!(
+                    "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES \
+                     ('at://{BOB}/app.bsky.graph.listitem/{rkey}', '{BOB}', '{rkey}', 'c', '3k', '{mods}', '{subject}', now())"
+                ),
+            )
+            .await;
+        }
         let blocked = h.get_list_blocks(&me, &req, 50, None).await.expect("db").expect("blocks").inner().clone();
         assert_eq!(blocked["lists"].as_array().map(Vec::len), Some(2));
         assert!(blocked["lists"][0]["viewer"]["blocked"].is_string());
+        let counted = blocked["lists"].as_array().expect("lists").iter().find(|l| l["uri"] == json!(mods)).expect("mods");
+        assert_eq!(counted["listItemCount"], 2, "{counted}");
         // Someone else's mutes are their own.
         let bob = h.get_list_mutes(&Viewer { did: Some(BOB.into()), hydrate: true }, &req, 50, None).await.expect("db").expect("mutes").inner().clone();
         assert_eq!(bob["lists"], json!([]));

@@ -64,14 +64,24 @@ pub async fn resolve_did(
         .pds
         .as_deref()
         .map_or_else(RoutingDecision::unknown, |pds| s.router.table().decide(pds));
+    let table = s.router.table();
+    let cascade = table.cascade();
+    // C4 (public-indexing design §11): unless the mode is On, a community
+    // author's public reads go to the cascade, so the hint names its first
+    // AppView rather than this one.
+    let home_appview = if decision.is_community() && !s.app.hydrator.scope().public_mode().is_on() {
+        cascade.first().and_then(|name| table.network(name)).and_then(|n| n.appview_url.clone())
+    } else {
+        decision.appview_url
+    };
     let hint = RoutingHint {
         did: did.to_string(),
         pds: summary.pds,
         handle: summary.handle,
         home_network: decision.network_name,
-        home_appview: decision.appview_url,
-        cascade: s.router.table().cascade(),
-        local_indexed: s.app.hydrator.in_scope(did).await,
+        home_appview,
+        cascade,
+        local_indexed: s.app.hydrator.stores_public_of(did).await,
     };
     let mut response = Json(routing_hint(&hint)).into_response();
     response
@@ -91,7 +101,8 @@ mod tests {
     use crate::aggregations::ScopeSets;
     use crate::constellation::routing::DidLookup;
     use crate::constellation::routing::tests::{StubLookup, table_with_community};
-    use crate::hydration::testing::hydrator;
+    use crate::hydration::testing::{hydrator, set_mode};
+    use crate::indexing::PublicMode;
     use crate::kryphocron_glue::jwt::tests::{StubFetcher, verifier};
     use crate::test_support::fresh_db;
     use crate::xrpc::RateLimits;
@@ -118,6 +129,7 @@ mod tests {
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
             did_document: Arc::new(json!({})),
         };
+        let hydrator_handle = app.hydrator.clone();
         let state = ResolveDidState {
             app,
             router: DidRouter::new(
@@ -161,6 +173,21 @@ mod tests {
         assert_eq!(v["cascade"], json!(["bluesky", "community-a"]));
         let (status, _, v) = get("not-a-did").await;
         assert_eq!((status, v["error"].as_str()), (400, Some("InvalidRequest")));
+
+        // T-16, C4 (public-indexing design §9.1, §11): unless the mode is
+        // On nothing is `localIndexed`, and a community DID's hint names
+        // the first cascade AppView, which its public reads go to.
+        for mode in [PublicMode::Filling, PublicMode::Off, PublicMode::Held] {
+            set_mode(hydrator_handle.scope(), mode).await;
+            let (_, _, v) = get("did:plc:cccccccccccccccccccccccc").await;
+            assert_eq!(v["capabilities"]["localIndexed"], false, "{mode:?}");
+            assert_eq!((v["homeNetwork"].clone(), v["homeAppview"].clone()), (json!("community"), json!("https://public.api.bsky.app")), "{mode:?}");
+            let (_, _, v) = get("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").await;
+            assert_eq!(v["homeAppview"], "https://public.api.bsky.app", "{mode:?}");
+        }
+        set_mode(hydrator_handle.scope(), PublicMode::On).await;
+        let (_, _, v) = get("did:plc:cccccccccccccccccccccccc").await;
+        assert_eq!((v["homeAppview"].clone(), v["capabilities"]["localIndexed"].clone()), (Value::Null, json!(true)));
 
         // 10/s, burst 20 per IP.
         let mut limited = false;
