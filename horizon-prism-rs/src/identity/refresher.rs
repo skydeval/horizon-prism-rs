@@ -64,6 +64,9 @@ pub const DID_WEB_SUSPECT: &str = "did:web";
 
 /// Metric: refresh outcomes, labelled by outcome.
 pub const METRIC_OUTCOMES: &str = "identity_refresh_total";
+/// Metric: applied `actors.account_status` changes, labelled by the new
+/// status.
+pub const METRIC_STATUS_CHANGES: &str = "account_status_changes_total";
 
 /// Retry delay after the `attempt`-th consecutive failure (1-based): 30 s,
 /// 2 m, 10 m, then 1 h.
@@ -400,14 +403,30 @@ impl IdentityRefresher {
         if response.is_success() {
             let repo: RepoStatus = response.json()?;
             let account = account_status(&repo);
-            sqlx::query(
-                "UPDATE actors SET account_status = $2, status_checked_at = now(), \
-                 deletion_suspect_at = NULL, deletion_suspect_pds = NULL WHERE did = $1",
+            let before: Option<Option<String>> = sqlx::query_scalar(
+                "UPDATE actors a SET account_status = $2, status_checked_at = now(), \
+                 deletion_suspect_at = NULL, deletion_suspect_pds = NULL \
+                 FROM (SELECT did, account_status FROM actors WHERE did = $1 FOR UPDATE) old \
+                 WHERE a.did = old.did RETURNING old.account_status",
             )
             .bind(did)
             .bind(&account)
-            .execute(&self.pool)
+            .fetch_optional(&self.pool)
             .await?;
+            // Each applied change is logged, so a PDS operator's status
+            // events can be matched to what this AppView did with them.
+            if let Some(before) = before
+                && before.as_deref() != Some(account.as_str())
+            {
+                metrics::counter!(METRIC_STATUS_CHANGES, "to" => account.clone()).increment(1);
+                tracing::info!(
+                    event = "account_status_changed",
+                    did,
+                    from = before.as_deref().unwrap_or("unknown"),
+                    to = %account,
+                    "account status changed"
+                );
+            }
             if account == "deleted" {
                 return self.mark_deleted(did, "pds_status_deleted").await;
             }

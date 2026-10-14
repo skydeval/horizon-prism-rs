@@ -12,6 +12,13 @@ commit.
 
 ### Added
 
+- **Account status changes are logged.** When a re-check after an
+  `#account` event changes an account's stored status, the identity
+  refresher logs `account_status_changed` with the DID and the old and
+  new status, and counts `account_status_changes_total{to}`. A PDS
+  operator's status events can now be matched to what the AppView did
+  with them; until now only the final status was visible.
+
 - **Public indexing switch, part 1: the off rule and its data path (#708).**
   Groundwork for `indexing.public_scope = "off"`. Nothing switches yet:
   the mode is held in memory and starts On, so behaviour is unchanged
