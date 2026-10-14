@@ -1508,6 +1508,14 @@ commit.
 
 ### Fixed
 
+- **`sort=top` said nothing about being served as `latest` (#676,
+  Phase B B-31 / B-51).** `getFollows`, `getFollowers` and `getQuotes`
+  read every source in `latest` order, and locked decision 30 has a
+  `sort` other than `latest` answered that way with
+  `X-Prism-Sort-Fallback: latest`. The header was exposed to browsers but
+  never sent. It is now, for `top` and any other value; `sort=latest`
+  and no `sort` send none.
+
 - **A new member on a PDS that answers a missing record with 404 was
   never fully set up.** A member's setup fetches its profile and a few
   optional `self` records, which a new account does not have. Prism took

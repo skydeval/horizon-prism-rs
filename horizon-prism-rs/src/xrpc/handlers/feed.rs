@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::HeaderMap;
 
-use super::{XrpcResult, respond};
+use super::{SortedResult, XrpcResult, respond, respond_sorted};
 use crate::hydration::feed::clamp_limit;
 use crate::hydration::thread::{DEFAULT_DEPTH, DEFAULT_PARENT_HEIGHT};
 use crate::xrpc::AppState;
@@ -161,10 +161,14 @@ pub async fn get_quotes(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     RawQuery(q): RawQuery,
-) -> XrpcResult {
+) -> SortedResult {
     let req = prepare(&s, &headers, peer, GET_QUOTES, Access::Opt, false).await?;
     let p = Params::parse(q.as_deref());
-    respond(&req.req, s.hydrator.get_quotes(&req.viewer, &req.req, p.required("uri")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await)
+    respond_sorted(
+        &req.req,
+        p.one("sort"),
+        s.hydrator.get_quotes(&req.viewer, &req.req, p.required("uri")?, clamp_limit(p.u32("limit")?), p.one("cursor")).await,
+    )
 }
 
 /// `limit` is not clamped here: past 100 is a 400 (design-v3 §5.13).

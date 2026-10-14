@@ -17,6 +17,8 @@ pub mod timeline;
 pub mod unspecced;
 
 use axum::Json;
+use axum::http::{HeaderName, HeaderValue};
+use axum::response::AppendHeaders;
 use serde_json::Value;
 
 use super::errors::XrpcError;
@@ -25,6 +27,28 @@ use crate::hydration::{PublicEmit, ViewResult};
 
 /// A handler's response.
 pub type XrpcResult = Result<Json<PublicEmit<Value>>, XrpcError>;
+
+/// The response header naming the order a `sort` request was served in
+/// (locked decision 30, design-v4 §5.2).
+pub const SORT_FALLBACK: &str = "x-prism-sort-fallback";
+
+/// A sortable listing's response: [`XrpcResult`] plus, when the caller
+/// asked for an order other than `latest`, `X-Prism-Sort-Fallback: latest`.
+pub type SortedResult = Result<(AppendHeaders<Option<(HeaderName, HeaderValue)>>, Json<PublicEmit<Value>>), XrpcError>;
+
+/// [`respond`] for `getFollows`, `getFollowers` and `getQuotes`: every
+/// source is read in `latest` order, so any other `sort` (`top`, or an
+/// unknown value) is served as `latest` and says so (locked decision 30).
+///
+/// # Errors
+///
+/// As [`respond`].
+pub fn respond_sorted(req: &Requester, sort: Option<&str>, result: ViewResult<Value>) -> SortedResult {
+    let fallback = sort
+        .filter(|s| *s != "latest")
+        .map(|_| (HeaderName::from_static(SORT_FALLBACK), HeaderValue::from_static("latest")));
+    respond(req, result).map(|json| (AppendHeaders(fallback), json))
+}
 
 /// Map a hydration outcome to a response.
 ///
@@ -62,6 +86,20 @@ mod tests {
 
     fn status(r: XrpcResult) -> StatusCode {
         failed(r).status()
+    }
+
+    /// B-51 (locked decision 30): `sort=top`, or any value but `latest`,
+    /// is served as `latest` and says so; `latest` and no `sort` say
+    /// nothing.
+    #[test]
+    fn a_sort_other_than_latest_falls_back_and_says_so() {
+        let req = Requester::test();
+        let ok = || Ok(Ok(crate::hydration::Hydrator::emit(serde_json::json!({"followers": []}))));
+        for (sort, header) in [(Some("top"), Some("latest")), (Some("bogus"), Some("latest")), (Some("latest"), None), (None, None)] {
+            let response = respond_sorted(&req, sort, ok()).expect("served").into_response();
+            assert_eq!(response.status(), StatusCode::OK, "{sort:?}");
+            assert_eq!(response.headers().get(SORT_FALLBACK).map(|v| v.to_str().expect("ascii")), header, "{sort:?}");
+        }
     }
 
     #[test]
