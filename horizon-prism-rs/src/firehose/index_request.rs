@@ -8,7 +8,7 @@
 //!    create/update, `RecordNotFound` → delete.
 
 use super::backfill::BackfillSource;
-use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, Writer};
+use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer};
 
 /// What the write path did (`requestRecord` output `status`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,14 +93,35 @@ pub async fn index_record(
         attempts,
         live: false,
         subscription_rules,
+        source: WriteSource::IndexRequest,
     };
     let report = writer.apply(repo, &rev, &[op], options).await.map_err(|e| IndexError::Write(e.0))?;
-    let status = match report.outcomes.first() {
-        Some(OpOutcome::Written) if record.is_some() => IndexStatus::Indexed,
+    Ok(Indexed { rev, status: status(report.outcomes.first(), record.is_some())? })
+}
+
+/// The `status` of one op's outcome. A member's post under the off rule
+/// stores no post, so it is out of scope here (public-indexing design §4.1).
+fn status(outcome: Option<&OpOutcome>, found: bool) -> Result<IndexStatus, IndexError> {
+    Ok(match outcome {
+        Some(OpOutcome::Written) if found => IndexStatus::Indexed,
         Some(OpOutcome::Written) => IndexStatus::Deleted,
-        Some(OpOutcome::Rejected(_) | OpOutcome::Skipped(_)) => IndexStatus::OutOfScope,
+        Some(OpOutcome::Rejected(_) | OpOutcome::Skipped(_) | OpOutcome::GrowOnly) => IndexStatus::OutOfScope,
         Some(OpOutcome::Failed(e)) => return Err(IndexError::Write(e.clone())),
         Some(OpOutcome::Unchanged) | None => IndexStatus::Unchanged,
-    };
-    Ok(Indexed { rev, status })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-22: a grow-only post answers `out_of_scope`.
+    #[test]
+    fn grow_only_is_out_of_scope() {
+        assert_eq!(status(Some(&OpOutcome::GrowOnly), true), Ok(IndexStatus::OutOfScope));
+        assert_eq!(status(Some(&OpOutcome::Written), true), Ok(IndexStatus::Indexed));
+        assert_eq!(status(Some(&OpOutcome::Written), false), Ok(IndexStatus::Deleted));
+        assert_eq!(status(Some(&OpOutcome::Unchanged), true), Ok(IndexStatus::Unchanged));
+        assert!(status(Some(&OpOutcome::Failed("x".into())), true).is_err());
+    }
 }

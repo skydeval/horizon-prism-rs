@@ -12,6 +12,33 @@ commit.
 
 ### Added
 
+- **Public indexing switch, part 1: the off rule and its data path (#708).**
+  Groundwork for `indexing.public_scope = "off"`. Nothing switches yet:
+  the mode is held in memory and starts On, so behaviour is unchanged
+  until the switch itself lands.
+  - **Config:** `public_scope` gains `"off"`, the default for a fresh
+    install; an absent key means off. The shipped `app.toml` leaves the
+    key commented out, so an upgrade or a template pull never changes it.
+    New `indexing.fill_max_wait_hours` (24) and
+    `honest_501.public_off_message` / `public_filling_message`.
+  - **Migrations 0020–0022:** `operator_settings`; `member_post_refs`
+    (who a member's posts reply to and quote, no content), filled from
+    stored posts; two partial claim indexes on `backfill_jobs`.
+  - **The off rule** (in the draining, off and held modes): blocks,
+    profiles, follows with a member at either end, and members' own
+    likes, reposts and lists are stored; a member's post writes only its
+    reference and grows scope; everything else is skipped as
+    `public_off`. No notifications or feed items are written.
+  - **References in every mode.** The weekly scope rebuild reads
+    `member_post_refs` instead of `posts`, so scope no longer depends on
+    stored posts. Deletes and the `account_deleted` / `member_removed`
+    purges remove references.
+  - **Backfill** takes the mode: off plans list only what the off rule
+    keeps, and never the labeler service record. A backfilled record
+    created before the last fill began writes no notification.
+  - **Removing a member under the off rule** also removes the rows kept
+    only because it was a member.
+
 - **Thread Lens for every signed-in account (#685).**
   Thread Lens (`app.nearhorizon.threadLens.getThread` and `.resolve`)
   was for ready members only. Now any signed-in account may call it,

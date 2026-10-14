@@ -13,8 +13,10 @@ trusted_proxy = "172.30.0.10"
 bind = "0.0.0.0:9091"
 
 [indexing]
-# community_scoped | full. full is recognized but not implemented in v1 (lock #4).
-public_scope = "community_scoped"
+# off | community_scoped | full (full is refused). Default: off.
+# Set this, or run `admin indexing public-scope`, to change it (design §3.3).
+# public_scope = "off"
+fill_max_wait_hours = 24
 
 [scope]
 # members_only | members_and_follows | members_and_interactions | members_and_one_hop

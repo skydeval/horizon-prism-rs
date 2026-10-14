@@ -71,6 +71,9 @@ mod tests {
             "0017_backfill_generation",
             "0018_subscribed_list_purpose",
             "0019_learned_inbound_blocks",
+            "0020_operator_settings",
+            "0021_member_post_refs",
+            "0022_backfill_claim_indexes",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

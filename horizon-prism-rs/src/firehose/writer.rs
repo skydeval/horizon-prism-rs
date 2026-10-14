@@ -108,6 +108,21 @@ pub struct ApplyOptions {
     /// does not, so what it does for a list owner is the same whether or
     /// not any member subscribes to one of the owner's lists.
     pub subscription_rules: bool,
+    /// Which path writes. A `Backfill` write of a record created before
+    /// the last fill began writes no notification (public-indexing design
+    /// §8.3).
+    pub source: WriteSource,
+}
+
+/// The write path an [`ApplyOptions`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteSource {
+    /// The firehose worker.
+    Firehose,
+    /// `index.requestRecord` and dead-letter replay.
+    IndexRequest,
+    /// The backfill worker.
+    Backfill,
 }
 
 /// What happened to one op.
@@ -116,6 +131,10 @@ pub enum OpOutcome {
     Written,
     /// LWW kept the existing state (older or equal rev, or tombstoned).
     Unchanged,
+    /// Under the off rule, a member's post: its reference and its scope
+    /// growth were written, and no `posts` row (public-indexing design
+    /// §4.1).
+    GrowOnly,
     Rejected(&'static str),
     Skipped(&'static str),
     Failed(String),
@@ -208,6 +227,8 @@ enum Body {
 #[derive(Clone, Copy)]
 enum OpTarget<'a> {
     Upsert(&'a Upsert, &'a GrowthPlan),
+    /// A member's post under the off rule (public-indexing design §4.1).
+    GrowOnly(&'a Upsert, &'a GrowthPlan),
     Delete(&'a Delete),
 }
 
@@ -222,6 +243,8 @@ struct Upsert {
     record: Value,
     /// The op created the record (not an update).
     created: bool,
+    /// The record's `createdAt` as `records::created_at` parses it.
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -344,6 +367,7 @@ fn build_upsert(
         collection: op.collection.clone(),
         body,
         created: op.action == Action::Create,
+        created_at: super::records::created_at(record, now),
         input: AdmissionInput {
             author: repo.to_string(),
             kind,
@@ -543,7 +567,9 @@ impl Writer {
         for p in &prepared {
             if let Prepared::Upsert(u) = p {
                 let a = admit(&u.input, sets);
-                let plan = if a.is_admitted() {
+                // A grow-only post grows scope as an admitted one does, so
+                // its subjects' shared locks join the same sorted pass.
+                let plan = if matches!(a, Admission::Admit(_) | Admission::GrowOnly) {
                     growth::plan(
                         &u.input,
                         sets,
@@ -603,6 +629,12 @@ impl Writer {
                         metrics::counter!(METRIC_SKIPPED, "reason" => reason.as_str()).increment(1);
                         OpOutcome::Rejected(reason.as_str())
                     }
+                    Some(Admission::GrowOnly) => {
+                        let target = OpTarget::GrowOnly(u, &plans[i]);
+                        self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
+                            .await?
+                    }
+                    // Reached by `Admit` only.
                     _ => {
                         let target = OpTarget::Upsert(u, &plans[i]);
                         self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
@@ -753,14 +785,9 @@ impl Writer {
             if !proto_blue::syntax::Did::is_valid(did) || !proto_blue::syntax::RecordKey::is_valid(rkey) {
                 continue;
             }
-            match admit(&input, sets) {
-                Admission::Admit(_) => {
-                    dids.push(did.clone());
-                    uris.push(format!("at://{did}/{}/{rkey}", super::classifier::NSID_BLOCK));
-                }
-                Admission::Reject(reason) => {
-                    metrics::counter!(METRIC_SKIPPED, "reason" => reason.as_str()).increment(1);
-                }
+            if inbound_block_admitted(admit(&input, sets)) {
+                dids.push(did.clone());
+                uris.push(format!("at://{did}/{}/{rkey}", super::classifier::NSID_BLOCK));
             }
         }
         if uris.is_empty() {
@@ -804,7 +831,8 @@ impl Writer {
         for _ in 0..options.attempts.max(1) {
             let mut sp = tx.begin().await?;
             let result = match target {
-                OpTarget::Upsert(u, plan) => self.apply_upsert(&mut sp, u, plan, rev, sets, options.live).await,
+                OpTarget::Upsert(u, plan) => self.apply_upsert(&mut sp, u, plan, rev, sets, options).await,
+                OpTarget::GrowOnly(u, plan) => self.apply_grow_only(&mut sp, u, plan, rev).await,
                 OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets).await,
             };
             match result {
@@ -823,6 +851,29 @@ impl Writer {
         Ok(OpOutcome::Failed(last_error))
     }
 
+    /// A member's post under the off rule (public-indexing design §4.1):
+    /// its reference and its growth, no `posts` row, no feed item and no
+    /// notification. There is no not-newer return, so growth always runs;
+    /// it is idempotent.
+    async fn apply_grow_only(
+        &self,
+        conn: &mut PgConnection,
+        u: &Upsert,
+        plan: &GrowthPlan,
+        rev: &str,
+    ) -> Result<(OpOutcome, MemoryEffects), OpError> {
+        let mut eff = MemoryEffects::default();
+        if tombstoned(conn, &u.uri, rev).await? {
+            metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "tombstoned").increment(1);
+            return Ok((OpOutcome::Unchanged, eff));
+        }
+        if let Body::Post(p) = &u.body {
+            upsert_post_ref(conn, u, p, rev).await?;
+        }
+        eff.growth_added = growth::apply(conn, plan).await?;
+        Ok((OpOutcome::GrowOnly, eff))
+    }
+
     async fn apply_upsert(
         &self,
         conn: &mut PgConnection,
@@ -830,8 +881,9 @@ impl Writer {
         plan: &GrowthPlan,
         rev: &str,
         sets: &ScopeSets,
-        live: bool,
+        options: ApplyOptions,
     ) -> Result<(OpOutcome, MemoryEffects), OpError> {
+        let live = options.live;
         let mut eff = MemoryEffects::default();
         let author = u.input.author.as_str();
         if u.body == Body::Private {
@@ -880,10 +932,24 @@ impl Writer {
             Body::Row(row) => upsert_row(conn, u, row, rev).await?,
             Body::Private => false,
         };
+        // A member's post has a reference in every mode, whatever became
+        // of the row (public-indexing design §4.1); it has its own rev check.
+        if let Body::Post(p) = &u.body
+            && sets.is_member(author)
+        {
+            upsert_post_ref(conn, u, p, rev).await?;
+        }
         if !written {
             metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "older_rev").increment(1);
             return Ok((OpOutcome::Unchanged, eff));
         }
+        // Under the off rule nothing notifies and no feed item is written
+        // (public-indexing design §5). A backfilled record created before
+        // the last fill began notifies nobody, in every mode (§8.3).
+        let off = sets.public.mode.off_rule();
+        let before_fill = options.source == WriteSource::Backfill
+            && sets.public.last_fill_since.is_some_and(|since| u.created_at < since);
+        let notify = !off && !before_fill;
         if member_list_block {
             let list_after = list_block_target(conn, &u.uri).await?;
             for list in [&list_before, &list_after].into_iter().flatten() {
@@ -892,7 +958,7 @@ impl Writer {
             eff.list_references = true;
         }
         // §5.12: feed items only for public records whose author is in S.
-        if sets.in_scope(author) {
+        if !off && sets.in_scope(author) {
             match &u.body {
                 Body::Post(p) => {
                     let kind = if p.reply_parent.is_some() { "reply" } else { "post" };
@@ -904,6 +970,17 @@ impl Writer {
                 _ => {}
             }
         }
+        if notify {
+            self.notify(conn, u, sets, live).await?;
+        }
+        eff.growth_added = growth::apply(conn, plan).await?;
+        Ok((OpOutcome::Written, eff))
+    }
+
+    /// Every notification an applied upsert writes (§7.7, §8.6, design-v3
+    /// §5.6).
+    async fn notify(&self, conn: &mut PgConnection, u: &Upsert, sets: &ScopeSets, live: bool) -> Result<(), OpError> {
+        let author = u.input.author.as_str();
         for n in notifications_for(author, &u.body, sets) {
             insert_notification(conn, &n, author, &u.uri, &u.cid).await?;
         }
@@ -963,8 +1040,7 @@ impl Writer {
         {
             insert_subscribed_post(conn, author, &u.uri, &u.cid, p.reply_parent.is_some(), p.created_at).await?;
         }
-        eff.growth_added = growth::apply(conn, plan).await?;
-        Ok((OpOutcome::Written, eff))
+        Ok(())
     }
 
     async fn apply_delete(
@@ -987,6 +1063,9 @@ impl Writer {
             }
             RecordKind::Profile => delete_profile(conn, repo, rev).await?,
             RecordKind::Post => {
+                // The reference goes by its own rev, whatever became of the
+                // row (public-indexing design §4.1).
+                delete_row(conn, "member_post_refs", &d.uri, rev).await?;
                 let removed = delete_row(conn, "posts", &d.uri, rev).await?;
                 if removed {
                     // The gates of a post that is gone gate nothing.
@@ -1070,6 +1149,21 @@ impl Writer {
     }
 }
 
+/// Whether the inbound-block pass writes a block with this admission, a
+/// rejection being counted. A block is never grow-only (public-indexing
+/// design §4.1); were it one, it would not be written.
+fn inbound_block_admitted(admission: Admission) -> bool {
+    debug_assert!(admission != Admission::GrowOnly, "a block is never grow-only");
+    match admission {
+        Admission::Admit(_) => true,
+        Admission::Reject(reason) => {
+            metrics::counter!(METRIC_SKIPPED, "reason" => reason.as_str()).increment(1);
+            false
+        }
+        Admission::GrowOnly => false,
+    }
+}
+
 /// The list a stored list block names. A subject in any other collection
 /// makes no reference.
 async fn list_block_target(conn: &mut PgConnection, uri: &str) -> Result<Option<String>, sqlx::Error> {
@@ -1133,6 +1227,30 @@ async fn upsert_post(conn: &mut PgConnection, u: &Upsert, p: &PostRecord, rev: &
     .await?
     .rows_affected();
     Ok(n > 0)
+}
+
+/// The last-writer-wins upsert of a member's post reference
+/// (public-indexing design §4.1): the DIDs the post replies to and quotes,
+/// as the scope rebuild reads them.
+async fn upsert_post_ref(conn: &mut PgConnection, u: &Upsert, p: &PostRecord, rev: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO member_post_refs (uri, author_did, rev, reply_parent_did, reply_root_did, quote_did, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (uri) DO UPDATE SET author_did = EXCLUDED.author_did, rev = EXCLUDED.rev, \
+           reply_parent_did = EXCLUDED.reply_parent_did, reply_root_did = EXCLUDED.reply_root_did, \
+           quote_did = EXCLUDED.quote_did, created_at = EXCLUDED.created_at \
+         WHERE member_post_refs.rev < EXCLUDED.rev",
+    )
+    .bind(&u.uri)
+    .bind(&u.input.author)
+    .bind(rev)
+    .bind(p.reply_parent.as_ref().and_then(|r| uri_author(&r.uri)))
+    .bind(p.reply_root.as_ref().and_then(|r| uri_author(&r.uri)))
+    .bind(p.quote_uri.as_deref().and_then(uri_author))
+    .bind(p.created_at)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 async fn upsert_subject(
@@ -1592,6 +1710,14 @@ mod tests {
         assert!(!is_deterministic(&sqlx::Error::PoolTimedOut));
     }
 
+    /// T-3 (public-indexing design §4.1): the inbound-block pass never
+    /// writes a block it was told is grow-only. A debug build stops there.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "a block is never grow-only"))]
+    fn a_grow_only_block_is_never_written() {
+        assert!(!inbound_block_admitted(Admission::GrowOnly));
+    }
+
     /// Postgres-backed tests (see `crate::test_support`).
     mod pg {
         use std::time::Duration;
@@ -1599,6 +1725,7 @@ mod tests {
         use super::*;
         use crate::config::ScopePolicy;
         use crate::db::locks::lock_did_exclusive;
+        use crate::indexing::{PublicMode, PublicState};
         use crate::private_tier::DisabledPrivateTier;
         use crate::test_support::fresh_db;
 
@@ -1612,6 +1739,7 @@ mod tests {
             attempts: 5,
             live: true,
             subscription_rules: true,
+            source: WriteSource::Firehose,
         };
 
         fn writer(pool: &PgPool, member: bool) -> Writer {
@@ -1838,7 +1966,7 @@ mod tests {
                     .await
                     .expect("count")
             };
-            let backfill = ApplyOptions { live: false, ..OPTIONS };
+            let backfill = ApplyOptions { live: false, source: WriteSource::Backfill, ..OPTIONS };
             w.apply(liker, &rev(3), &[profile("first", Action::Create)], backfill).await.expect("apply");
             assert_eq!(joined().await, 0);
             w.apply(liker, &rev(4), &[profile("edited", Action::Update)], OPTIONS).await.expect("apply");
@@ -1896,7 +2024,7 @@ mod tests {
                 .await
                 .expect("notifications")
             };
-            let backfill = ApplyOptions { live: false, ..OPTIONS };
+            let backfill = ApplyOptions { live: false, source: WriteSource::Backfill, ..OPTIONS };
 
             // Not from the firehose; a reply, which the subscription leaves
             // out; a post older than the limit: nothing.
@@ -2326,6 +2454,218 @@ mod tests {
             .await
             .expect("query");
             assert_eq!(left, 0);
+            db.drop_db().await;
+        }
+
+        async fn set_public(w: &Writer, mode: PublicMode, last_fill_since: Option<DateTime<Utc>>) {
+            let mut sets = w.scope().write_guard().await;
+            w.scope().set_public(&mut sets, PublicState { mode, generation: 1, last_fill_since });
+        }
+
+        async fn count(pool: &PgPool, sql: &str) -> i64 {
+            sqlx::query_scalar(sql).fetch_one(pool).await.expect(sql)
+        }
+
+        /// T-3, T-17 (public-indexing design §4.1): under the off rule a
+        /// member's reply writes its reference and grows scope under the
+        /// subject's shared DID lock, and writes no post.
+        #[tokio::test]
+        async fn a_members_post_under_the_off_rule_is_grow_only() {
+            let Some(db) = fresh_db("writer_grow_only").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, true);
+            set_public(&w, PublicMode::Off, None).await;
+            let reply = |rkey: &str| RawOp {
+                action: Action::Create,
+                collection: "app.bsky.feed.post".into(),
+                rkey: rkey.into(),
+                cid: Some(format!("bafy{rkey}")),
+                record: Some(json!({"text": "hi", "createdAt": "2026-09-26T00:00:00Z", "reply": {
+                    "root": {"uri": format!("at://{SUBJECT}/app.bsky.feed.post/1"), "cid": "c"},
+                    "parent": {"uri": format!("at://{SUBJECT}/app.bsky.feed.post/1"), "cid": "c"}}})),
+            };
+            // Retention's exclusive lock on the subject, held open: the
+            // writer waits for it.
+            let mut holder = p.begin().await.expect("begin");
+            lock_did_exclusive(&mut holder, SUBJECT).await.expect("lock");
+            let task = {
+                let w = w.clone();
+                let op = reply(RKEY);
+                tokio::spawn(async move { w.apply(AUTHOR, &rev(2), &[op], OPTIONS).await })
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!task.is_finished(), "a grow-only write waits for the subject's DID lock");
+            holder.rollback().await.expect("release");
+            let report = task.await.expect("join").expect("apply");
+            assert_eq!(report.outcomes, [OpOutcome::GrowOnly]);
+
+            assert_eq!(count(p, "SELECT count(*) FROM posts").await, 0);
+            let r: (String, String, Option<String>, Option<String>, Option<String>) =
+                sqlx::query_as("SELECT author_did, rev, reply_parent_did, reply_root_did, quote_did FROM member_post_refs")
+                    .fetch_one(p)
+                    .await
+                    .expect("ref");
+            assert_eq!(r, (AUTHOR.to_string(), rev(2), Some(SUBJECT.to_string()), Some(SUBJECT.to_string()), None));
+            let reasons: i16 = sqlx::query_scalar("SELECT reasons FROM scope_dids WHERE did = $1").bind(SUBJECT).fetch_one(p).await.expect("scope");
+            assert_eq!(reasons, crate::aggregations::REASON_INTERACTED);
+            assert_eq!(count(p, "SELECT count(*) FROM backfill_jobs WHERE depth = 'scope'").await, 1);
+            assert!(w.scope().snapshot().await.in_scope(SUBJECT));
+            assert_eq!(count(p, "SELECT (SELECT count(*) FROM notifications) + (SELECT count(*) FROM feed_items)").await, 0);
+
+            // An equal rev runs growth again, as a no-op.
+            let r = w.apply(AUTHOR, &rev(2), &[reply(RKEY)], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::GrowOnly]);
+            assert_eq!(count(p, "SELECT count(*) FROM member_post_refs").await, 1);
+            // A tombstoned URI writes no reference.
+            sqlx::query("INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2)")
+                .bind(format!("at://{AUTHOR}/app.bsky.feed.post/3kgone"))
+                .bind(rev(9))
+                .execute(p)
+                .await
+                .expect("tombstone");
+            let r = w.apply(AUTHOR, &rev(3), &[reply("3kgone")], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
+            assert_eq!(count(p, "SELECT count(*) FROM member_post_refs").await, 1);
+            // A stranger's post is not stored at all.
+            let r = w.apply(SUBJECT, &rev(1), &[reply("3kstranger")], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Rejected("public_off")]);
+            // `requestRecord` sees the same grow-only write (T-18).
+            let request = ApplyOptions { live: false, subscription_rules: false, source: WriteSource::IndexRequest, ..OPTIONS };
+            let r = w.apply(AUTHOR, &rev(4), &[reply("3krequested")], request).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::GrowOnly]);
+            assert_eq!(count(p, "SELECT count(*) FROM posts").await, 0);
+
+            // A delete with an older rev leaves the reference; a newer one
+            // deletes it (T-17).
+            let delete = RawOp { action: Action::Delete, collection: "app.bsky.feed.post".into(), rkey: RKEY.into(), cid: None, record: None };
+            w.apply(AUTHOR, &rev(1), std::slice::from_ref(&delete), OPTIONS).await.expect("apply");
+            assert_eq!(count(p, &format!("SELECT count(*) FROM member_post_refs WHERE uri = 'at://{AUTHOR}/app.bsky.feed.post/{RKEY}'")).await, 1);
+            w.apply(AUTHOR, &rev(5), &[delete], OPTIONS).await.expect("apply");
+            assert_eq!(count(p, &format!("SELECT count(*) FROM member_post_refs WHERE uri = 'at://{AUTHOR}/app.bsky.feed.post/{RKEY}'")).await, 0);
+            db.drop_db().await;
+        }
+
+        /// public-indexing design §4.1: in On a member's post writes its row
+        /// and its reference; a non-member's writes no reference.
+        #[tokio::test]
+        async fn a_members_post_has_a_reference_in_every_mode() {
+            let Some(db) = fresh_db("writer_post_refs_on").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, true);
+            w.apply(AUTHOR, &rev(1), &[post_op(Action::Create, "mine")], OPTIONS).await.expect("apply");
+            assert_eq!(count(p, "SELECT count(*) FROM posts").await, 1);
+            assert_eq!(count(p, "SELECT count(*) FROM member_post_refs").await, 1);
+            // A not-newer write still keeps the reference current with its
+            // own rev check, which an older rev does not pass.
+            w.apply(AUTHOR, &rev(0), &[post_op(Action::Update, "older")], OPTIONS).await.expect("apply");
+            let r: String = sqlx::query_scalar("SELECT rev FROM member_post_refs").fetch_one(p).await.expect("ref");
+            assert_eq!(r, rev(1));
+            // The same author, in S but no member.
+            let other = writer(p, false);
+            let theirs = RawOp {
+                action: Action::Create,
+                collection: "app.bsky.feed.post".into(),
+                rkey: "3ktheirs".into(),
+                cid: Some("bafytheirs".into()),
+                record: Some(json!({"text": "theirs"})),
+            };
+            let r = other.apply(AUTHOR, &rev(2), &[theirs], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written]);
+            assert_eq!(count(p, "SELECT count(*) FROM posts").await, 2);
+            assert_eq!(count(p, "SELECT count(*) FROM member_post_refs").await, 1);
+            db.drop_db().await;
+        }
+
+        /// T-4 (public-indexing design §5, §8.3): what notifies, by mode,
+        /// source and `createdAt` against the last fill.
+        #[tokio::test]
+        async fn side_effects_follow_the_mode_and_the_last_fill() {
+            let Some(db) = fresh_db("writer_side_effects_by_mode").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, true);
+            let liker = "did:plc:cccccccccccccccccccccccc";
+            w.scope().write_guard().await.scope.insert(liker.into());
+            let firehose = OPTIONS;
+            let backfill = ApplyOptions { live: false, source: WriteSource::Backfill, ..OPTIONS };
+            let request = ApplyOptions { live: false, subscription_rules: false, source: WriteSource::IndexRequest, ..OPTIONS };
+            let fill = Utc::now() - chrono::Duration::hours(1);
+            let day_before = (fill - chrono::Duration::days(1)).to_rfc3339();
+            let minute_after = (fill + chrono::Duration::minutes(1)).to_rfc3339();
+            let like = |rkey: &str, created: Option<&str>| {
+                let mut record = json!({"subject": {"uri": format!("at://{AUTHOR}/app.bsky.feed.post/1"), "cid": "c"}});
+                if let Some(at) = created {
+                    record["createdAt"] = json!(at);
+                }
+                RawOp { action: Action::Create, collection: "app.bsky.feed.like".into(), rkey: rkey.into(), cid: Some(format!("bafy{rkey}")), record: Some(record) }
+            };
+            let notified = |rkey: &'static str| async move {
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notifications WHERE record_uri = $1")
+                    .bind(format!("at://{liker}/app.bsky.feed.like/{rkey}"))
+                    .fetch_one(p)
+                    .await
+                    .expect("count")
+            };
+
+            // Off: a stranger's follow of a member is stored and notifies
+            // nobody; a member's repost writes no feed item.
+            set_public(&w, PublicMode::Off, None).await;
+            let follow = RawOp {
+                action: Action::Create,
+                collection: "app.bsky.graph.follow".into(),
+                rkey: "3kfollow".into(),
+                cid: Some("bafyfollow".into()),
+                record: Some(json!({"subject": AUTHOR, "createdAt": Utc::now().to_rfc3339()})),
+            };
+            let r = w.apply(SUBJECT, &rev(1), &[follow], firehose).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written]);
+            let repost = RawOp {
+                action: Action::Create,
+                collection: "app.bsky.feed.repost".into(),
+                rkey: "3krepost".into(),
+                cid: Some("bafyrepost".into()),
+                record: Some(json!({"subject": {"uri": format!("at://{SUBJECT}/app.bsky.feed.post/1"), "cid": "c"}, "createdAt": Utc::now().to_rfc3339()})),
+            };
+            let r = w.apply(AUTHOR, &rev(1), &[repost], firehose).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written]);
+            assert_eq!(count(p, "SELECT count(*) FROM follows").await + count(p, "SELECT count(*) FROM reposts").await, 2);
+            assert_eq!(count(p, "SELECT (SELECT count(*) FROM notifications) + (SELECT count(*) FROM feed_items)").await, 0);
+
+            // Filling, with last_fill_since = fill.since = T.
+            set_public(&w, PublicMode::Filling, Some(fill)).await;
+            w.apply(liker, &rev(1), &[like("3kold", Some(&day_before))], backfill).await.expect("apply");
+            assert_eq!(notified("3kold").await, 0);
+            w.apply(liker, &rev(1), &[like("3knew", Some(&minute_after))], backfill).await.expect("apply");
+            assert_eq!(notified("3knew").await, 1);
+            // Backfilled first, then the firehose at an equal rev: once.
+            w.apply(liker, &rev(1), &[like("3kboth", Some(&minute_after))], backfill).await.expect("apply");
+            let r = w.apply(liker, &rev(1), &[like("3kboth", Some(&minute_after))], firehose).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
+            assert_eq!(notified("3kboth").await, 1);
+            w.apply(liker, &rev(1), &[like("3klive", Some(&day_before))], firehose).await.expect("apply");
+            w.apply(liker, &rev(1), &[like("3kasked", Some(&day_before))], request).await.expect("apply");
+            assert_eq!((notified("3klive").await, notified("3kasked").await), (1, 1));
+
+            // On after a fill.
+            set_public(&w, PublicMode::On, Some(fill)).await;
+            w.apply(liker, &rev(1), &[like("3konold", Some(&day_before))], backfill).await.expect("apply");
+            w.apply(liker, &rev(1), &[like("3konnew", Some(&minute_after))], backfill).await.expect("apply");
+            w.apply(liker, &rev(1), &[like("3konlive", Some(&day_before))], firehose).await.expect("apply");
+            w.apply(liker, &rev(1), &[like("3kondate", None)], backfill).await.expect("apply");
+            assert_eq!(
+                (notified("3konold").await, notified("3konnew").await, notified("3konlive").await, notified("3kondate").await),
+                (0, 1, 1, 1)
+            );
+
+            // On, never filled: as today.
+            set_public(&w, PublicMode::On, None).await;
+            w.apply(liker, &rev(1), &[like("3knever", Some(&day_before))], backfill).await.expect("apply");
+            assert_eq!(notified("3knever").await, 1);
             db.drop_db().await;
         }
 

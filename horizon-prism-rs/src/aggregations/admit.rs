@@ -68,6 +68,8 @@ pub enum RejectReason {
     Purging(PurgeKind),
     /// No rule admits it.
     NotInScope,
+    /// The off rule (public-indexing design §5) stores no such record.
+    PublicOff,
 }
 
 impl RejectReason {
@@ -77,6 +79,7 @@ impl RejectReason {
         match self {
             Self::Purging(k) => k.as_str(),
             Self::NotInScope => "not_in_scope",
+            Self::PublicOff => "public_off",
         }
     }
 }
@@ -86,6 +89,9 @@ impl RejectReason {
 pub enum Admission {
     Admit(AdmitRule),
     Reject(RejectReason),
+    /// Under the off rule, a member's post: no `posts` row, only its
+    /// reference and its scope growth (public-indexing design §4.1).
+    GrowOnly,
 }
 
 impl Admission {
@@ -110,6 +116,12 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
             return Admission::Reject(RejectReason::Purging(PurgeKind::OutOfScope));
         }
         _ => {}
+    }
+    // The off rule, in the off modes only (public-indexing design §5).
+    if sets.public.mode.off_rule()
+        && let Some(decision) = off_rule(input, sets)
+    {
+        return decision;
     }
     // Rule 1.
     if sets.in_scope(&input.author) {
@@ -138,9 +150,42 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     Admission::Reject(RejectReason::NotInScope)
 }
 
+/// The off rule's table (public-indexing design §5): `Some` decides the op,
+/// `None` leaves it to the rules as they stand. Blocks, profiles, the self
+/// records other than the labeler service, and the private kinds are
+/// decided as always.
+fn off_rule(input: &AdmissionInput, sets: &ScopeSets) -> Option<Admission> {
+    let off = Some(Admission::Reject(RejectReason::PublicOff));
+    let author_member = sets.is_member(&input.author);
+    match input.kind {
+        RecordKind::Block
+        | RecordKind::Profile
+        | RecordKind::Table("actor_self_records")
+        | RecordKind::PrivatePost
+        | RecordKind::PrivateAudience
+        | RecordKind::PrivateBlock => None,
+        RecordKind::Follow => {
+            let subject_member = input.subjects.iter().any(|s| sets.is_member(s));
+            if author_member || subject_member { None } else { off }
+        }
+        RecordKind::Like
+        | RecordKind::Repost
+        | RecordKind::Table("lists" | "list_items" | "list_optouts" | "list_blocks") => {
+            if author_member { None } else { off }
+        }
+        RecordKind::Post => {
+            if author_member { Some(Admission::GrowOnly) } else { off }
+        }
+        // Threadgates, postgates, starter packs, the labeler service and
+        // poll posts.
+        RecordKind::Table(_) => off,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexing::PublicMode;
 
     const MEMBER: &str = "did:plc:member";
     const SCOPED: &str = "did:plc:scoped";
@@ -248,6 +293,97 @@ mod tests {
             admit(&input(STRANGER, RecordKind::Like, &[MEMBER]), &s),
             Admission::Admit(AdmitRule::InboundToMember)
         );
+    }
+
+    fn with_mode(mode: PublicMode) -> ScopeSets {
+        let mut s = sets();
+        s.public.mode = mode;
+        s
+    }
+
+    const OFF: Admission = Admission::Reject(RejectReason::PublicOff);
+
+    /// T-2: the off rule's table, in each of the off modes.
+    #[test]
+    fn the_off_rule_keeps_only_the_needed_set() {
+        for mode in [PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
+            let s = with_mode(mode);
+            let a = |author: &str, kind: RecordKind, subjects: &[&str]| admit(&input(author, kind, subjects), &s);
+            // Posts: a member's grows only; anyone else's is not stored.
+            assert_eq!(a(MEMBER, RecordKind::Post, &[STRANGER]), Admission::GrowOnly, "{mode:?}");
+            assert_eq!(a(SCOPED, RecordKind::Post, &[MEMBER]), OFF);
+            assert_eq!(a(STRANGER, RecordKind::Post, &[MEMBER]), OFF);
+            // Likes and reposts: a member's only.
+            assert_eq!(a(MEMBER, RecordKind::Like, &[STRANGER]), Admission::Admit(AdmitRule::AuthorInScope));
+            assert_eq!(a(SCOPED, RecordKind::Like, &[MEMBER]), OFF);
+            assert_eq!(a(SCOPED, RecordKind::Repost, &[OTHER]), OFF);
+            // Follows: a member at either end.
+            assert_eq!(a(STRANGER, RecordKind::Follow, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember));
+            assert_eq!(a(MEMBER, RecordKind::Follow, &[STRANGER]), Admission::Admit(AdmitRule::AuthorInScope));
+            assert_eq!(a(SCOPED, RecordKind::Follow, &[OTHER]), OFF);
+            // Blocks and S profiles, as today.
+            assert_eq!(a(SCOPED, RecordKind::Block, &[OTHER]), Admission::Admit(AdmitRule::AuthorInScope));
+            assert_eq!(a(STRANGER, RecordKind::Block, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember));
+            assert_eq!(a(OWNER, RecordKind::Block, &[STRANGER]), Admission::Admit(AdmitRule::OwnerBlock));
+            assert_eq!(a(SCOPED, RecordKind::Profile, &[]), Admission::Admit(AdmitRule::AuthorInScope));
+            assert_eq!(a(STRANGER, RecordKind::Profile, &[]), Admission::Reject(RejectReason::NotInScope));
+            assert_eq!(a(SCOPED, RecordKind::Table("actor_self_records"), &[]), Admission::Admit(AdmitRule::AuthorInScope));
+            // Members' list rows only.
+            for table in ["lists", "list_items", "list_optouts", "list_blocks"] {
+                assert_eq!(a(MEMBER, RecordKind::Table(table), &[]), Admission::Admit(AdmitRule::AuthorInScope), "{table}");
+                assert_eq!(a(SCOPED, RecordKind::Table(table), &[]), OFF, "{table}");
+            }
+            // Never stored, a member's included.
+            for table in ["threadgates", "postgates", "starter_packs", "labeler_services", "nearhorizon_poll_posts"] {
+                assert_eq!(a(MEMBER, RecordKind::Table(table), &[]), OFF, "{table}");
+            }
+            // Private kinds are unchanged.
+            assert_eq!(a(SCOPED, RecordKind::PrivatePost, &[]), Admission::Admit(AdmitRule::AuthorInScope));
+            assert_eq!(a(STRANGER, RecordKind::PrivatePost, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember));
+            assert_eq!(a(STRANGER, RecordKind::PrivateAudience, &[]), Admission::Reject(RejectReason::NotInScope));
+            // The rejection is counted under its own label.
+            assert_eq!(RejectReason::PublicOff.as_str(), "public_off");
+        }
+    }
+
+    /// T-2: purge-kind rejections come before the off rule.
+    #[test]
+    fn purge_rejections_come_before_the_off_rule() {
+        let mut s = with_mode(PublicMode::Off);
+        s.purging.insert(MEMBER.into(), PurgeKind::AccountDeleted);
+        assert_eq!(
+            admit(&input(MEMBER, RecordKind::Post, &[]), &s),
+            Admission::Reject(RejectReason::Purging(PurgeKind::AccountDeleted))
+        );
+        assert!(!Admission::GrowOnly.is_admitted());
+    }
+
+    /// T-2: in Filling and On every input gets today's answer.
+    #[test]
+    fn filling_and_on_admit_as_today() {
+        let kinds = [
+            RecordKind::Post,
+            RecordKind::Like,
+            RecordKind::Repost,
+            RecordKind::Follow,
+            RecordKind::Block,
+            RecordKind::Profile,
+            RecordKind::Table("threadgates"),
+            RecordKind::Table("labeler_services"),
+            RecordKind::Table("lists"),
+            RecordKind::PrivatePost,
+        ];
+        for mode in [PublicMode::Filling, PublicMode::On] {
+            let s = with_mode(mode);
+            for author in [MEMBER, SCOPED, OWNER, STRANGER] {
+                for kind in kinds {
+                    for subjects in [&[][..], &[MEMBER][..], &[OTHER][..]] {
+                        let i = input(author, kind, subjects);
+                        assert_eq!(admit(&i, &s), admit(&i, &sets()), "{mode:?} {author} {kind:?} {subjects:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

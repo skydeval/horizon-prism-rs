@@ -44,9 +44,10 @@ use super::classifier::{
 };
 use super::gap;
 use super::jobs::Depth;
-use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, Writer};
+use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer};
 use crate::config::BackfillConfig;
 use crate::farsight::Farsight;
+use crate::indexing::PublicMode;
 use crate::identity::refresher::{RefreshReason, RepoStatus, account_status, is_repo_not_found};
 use crate::identity::resolver::extract_info;
 use crate::identity::eligibility::{self, Confirmation};
@@ -141,8 +142,9 @@ pub struct CollectionPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepthPlan {
     pub profile: bool,
-    /// Fetch [`SELF_RECORDS`] too.
-    pub self_records: bool,
+    /// The rkey-self records fetched too: [`SELF_RECORDS`], those of
+    /// [`OFF_SELF_RECORDS`], or none.
+    pub self_records: &'static [&'static str],
     pub collections: Vec<CollectionPlan>,
     pub inbound_blocks: bool,
 }
@@ -198,6 +200,20 @@ const MEMBER_PUBLIC: [CollectionPlan; 12] = [
     public(NSID_POLL_POST, Limit::Top(1000)),
 ];
 
+// Under the off rule (public-indexing design §5): what a member's job lists.
+// Posts are listed so that members' references and scope growth follow
+// them; no post is stored.
+const MEMBER_OFF: [CollectionPlan; 8] = [
+    public(NSID_POST, Limit::Top(1000)),
+    public(NSID_FOLLOW, Limit::Top(10_000)),
+    public(NSID_LIKE, Limit::Top(1000)),
+    public(NSID_REPOST, Limit::Top(1000)),
+    public(NSID_LIST, Limit::All),
+    public(NSID_LISTITEM, Limit::All),
+    public(NSID_LISTBLOCK, Limit::All),
+    public(NSID_LIST_OPTOUT, Limit::All),
+];
+
 /// The rkey-self records fetched with `getRecord`, like the profile (§3.2).
 pub const SELF_RECORDS: [&str; 4] = [
     NSID_LABELER_SERVICE,
@@ -206,39 +222,56 @@ pub const SELF_RECORDS: [&str; 4] = [
     NSID_CONTENT_VISIBILITY,
 ];
 
+/// The self records the off plans fetch: all but the labeler service,
+/// which the off rule does not store (public-indexing design §5).
+pub const OFF_SELF_RECORDS: [&str; 3] = [NSID_NOTIFICATION_DECLARATION, NSID_ACTOR_STATUS, NSID_CONTENT_VISIBILITY];
+
 /// The §5.10 depth table. `resync` uses the member limits for a member and
-/// the scope limits otherwise ("as the DID's last depth").
+/// the scope limits otherwise ("as the DID's last depth"). In the off modes
+/// the public parts are the off plans (public-indexing design §5); in On
+/// and Filling they are today's.
 #[must_use]
-pub fn plan(depth: Depth, is_member: bool) -> DepthPlan {
+pub fn plan(depth: Depth, is_member: bool, mode: PublicMode) -> DepthPlan {
+    let off = mode.off_rule();
+    let self_records: &'static [&'static str] = if off { &OFF_SELF_RECORDS } else { &SELF_RECORDS };
     match depth {
         Depth::Scope => DepthPlan {
             profile: true,
-            self_records: true,
-            collections: SCOPE_PUBLIC.to_vec(),
+            self_records,
+            collections: if off { Vec::new() } else { SCOPE_PUBLIC.to_vec() },
             inbound_blocks: false,
         },
         Depth::Member => DepthPlan {
             profile: true,
-            self_records: true,
-            collections: MEMBER_PUBLIC.iter().chain(AUTHORIZATION.iter()).copied().collect(),
+            self_records,
+            collections: if off { MEMBER_OFF.as_slice() } else { MEMBER_PUBLIC.as_slice() }
+                .iter()
+                .chain(AUTHORIZATION.iter())
+                .copied()
+                .collect(),
             inbound_blocks: true,
         },
         Depth::Private => DepthPlan {
             profile: true,
-            self_records: false,
+            self_records: &[],
             collections: AUTHORIZATION.to_vec(),
             inbound_blocks: false,
         },
         Depth::Authz => DepthPlan {
             profile: false,
-            self_records: false,
+            self_records: &[],
             collections: AUTHORIZATION.to_vec(),
             inbound_blocks: is_member,
         },
         Depth::Resync => DepthPlan {
             profile: true,
-            self_records: true,
-            collections: if is_member { MEMBER_PUBLIC.to_vec() } else { SCOPE_PUBLIC.to_vec() },
+            self_records,
+            collections: match (off, is_member) {
+                (false, true) => MEMBER_PUBLIC.to_vec(),
+                (false, false) => SCOPE_PUBLIC.to_vec(),
+                (true, true) => MEMBER_OFF.to_vec(),
+                (true, false) => Vec::new(),
+            },
             inbound_blocks: false,
         },
     }
@@ -792,7 +825,10 @@ impl Backfill {
 
     /// Steps 1–5. `Ok(None)` when superseded part-way.
     async fn run(&self, job: &Job) -> Result<Option<RunResult>, String> {
-        let is_member = self.writer.scope().read_guard().await.is_member(&job.did);
+        let (is_member, mode) = {
+            let sets = self.writer.scope().read_guard().await;
+            (sets.is_member(&job.did), sets.public.mode)
+        };
         // A member job asks Farsight to read the member's repository
         // (design-v3 §5.14.11). Best effort, on a task of its own: its
         // outcome never affects the job or readiness.
@@ -823,7 +859,7 @@ impl Backfill {
         }
         let pds = prepared.map_err(|e| e.to_string())?;
         let rev = self.source.latest_rev(&pds, &job.did).await?;
-        let plan = plan(job.depth, is_member);
+        let plan = plan(job.depth, is_member, mode);
         let mut result = RunResult {
             rev,
             ..RunResult::default()
@@ -861,7 +897,7 @@ impl Backfill {
             }
             if let Some(listed) = listing.complete {
                 let unconfirmed = self
-                    .reconcile(&pds, job, c.nsid, &result.rev, &listed, &mut budget)
+                    .reconcile(&pds, job, c.nsid, &result.rev, &listed, &mut budget, mode.off_rule())
                     .await?;
                 if unconfirmed > 0 && c.authorization {
                     result.auth_reconcile_incomplete = true;
@@ -876,7 +912,7 @@ impl Backfill {
             .profile
             .then_some(NSID_PROFILE)
             .into_iter()
-            .chain(plan.self_records.then_some(SELF_RECORDS).into_iter().flatten())
+            .chain(plan.self_records.iter().copied())
             .collect();
         for nsid in optional {
             match self.source.get_optional_record(&pds, &job.did, nsid, "self").await? {
@@ -983,6 +1019,7 @@ impl Backfill {
             attempts: self.attempts,
             live: false,
             subscription_rules: true,
+            source: WriteSource::Backfill,
         }
     }
 
@@ -1050,9 +1087,11 @@ impl Backfill {
     }
 
     /// Local URIs of `did` in `nsid` with `rev < R` (reconcile candidates
-    /// before the listing filter).
-    async fn local_uris(&self, did: &str, nsid: &str, rev: &str) -> Result<Vec<String>, sqlx::Error> {
-        if let Some((table, author)) = public_table(nsid) {
+    /// before the listing filter). Under the off rule no post is stored, so
+    /// a member's posts are its references (public-indexing design §4.1).
+    async fn local_uris(&self, did: &str, nsid: &str, rev: &str, off_rule: bool) -> Result<Vec<String>, sqlx::Error> {
+        let table = if off_rule && nsid == NSID_POST { Some(("member_post_refs", "author_did")) } else { public_table(nsid) };
+        if let Some((table, author)) = table {
             return sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE {author} = $1 AND rev < $2"))
                 .bind(did)
                 .bind(rev)
@@ -1065,6 +1104,7 @@ impl Backfill {
 
     /// Reconcile one fully listed collection (§5.10). Returns the number of
     /// candidates left unconfirmed when the per-job bound ran out.
+    #[allow(clippy::too_many_arguments)]
     async fn reconcile(
         &self,
         pds: &str,
@@ -1073,9 +1113,10 @@ impl Backfill {
         rev: &str,
         listed: &HashSet<String>,
         budget: &mut u32,
+        off_rule: bool,
     ) -> Result<usize, String> {
         let mut candidates: Vec<String> = self
-            .local_uris(&job.did, nsid, rev)
+            .local_uris(&job.did, nsid, rev, off_rule)
             .await
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -1424,8 +1465,9 @@ mod tests {
 
     #[test]
     fn depth_table() {
+        let plan = |depth, is_member| plan(depth, is_member, PublicMode::On);
         let scope = plan(Depth::Scope, false);
-        assert!(scope.profile && scope.self_records && !scope.inbound_blocks);
+        assert!(scope.profile && scope.self_records == SELF_RECORDS && !scope.inbound_blocks);
         assert_eq!(scope.collections.iter().map(|c| (c.nsid, c.limit)).collect::<Vec<_>>(), [
             (NSID_POST, Limit::Top(100)),
             (NSID_REPOST, Limit::Top(100)),
@@ -1435,7 +1477,7 @@ mod tests {
             (NSID_POLL_POST, Limit::Top(100)),
         ]);
         let member = plan(Depth::Member, true);
-        assert!(member.inbound_blocks && member.self_records);
+        assert!(member.inbound_blocks && member.self_records == SELF_RECORDS);
         assert_eq!(member.collections.len(), 16);
         assert_eq!(member.collections.iter().filter(|c| c.authorization).count(), 4);
         assert!(member.collections.iter().filter(|c| c.authorization).all(|c| c.limit == Limit::All));
@@ -1447,17 +1489,58 @@ mod tests {
         let position = |nsid: &str| member.collections.iter().position(|c| c.nsid == nsid).expect("listed");
         assert!(position(NSID_POST) < position(NSID_THREADGATE) && position(NSID_POST) < position(NSID_POSTGATE));
         let authz = plan(Depth::Authz, false);
-        assert!(!authz.profile && !authz.self_records && !authz.inbound_blocks);
+        assert!(!authz.profile && authz.self_records.is_empty() && !authz.inbound_blocks);
         assert!(plan(Depth::Authz, true).inbound_blocks);
         assert_eq!(plan(Depth::Resync, true).collections.len(), 12);
         assert_eq!(plan(Depth::Resync, false).collections.len(), 6);
         // The new collections are no authorization facts: `private` and
         // `authz` never list them.
         let private = plan(Depth::Private, false);
-        assert!(private.collections.iter().all(|c| c.authorization) && !private.self_records);
+        assert!(private.collections.iter().all(|c| c.authorization) && private.self_records.is_empty());
         // Every listed public collection has a table to reconcile against.
         for c in member.collections.iter().filter(|c| !c.authorization) {
             assert!(public_table(c.nsid).is_some(), "{}", c.nsid);
+        }
+    }
+
+    /// T-5 (public-indexing design §5): the off plans in the off modes, and
+    /// today's plans in Filling and On.
+    #[test]
+    fn off_plans() {
+        let nsids = |p: &DepthPlan| p.collections.iter().map(|c| c.nsid).collect::<Vec<_>>();
+        let authz: Vec<&str> = AUTHORIZATION.iter().map(|c| c.nsid).collect();
+        for mode in [PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
+            let member = plan(Depth::Member, true, mode);
+            let public = [NSID_POST, NSID_FOLLOW, NSID_LIKE, NSID_REPOST, NSID_LIST, NSID_LISTITEM, NSID_LISTBLOCK, NSID_LIST_OPTOUT];
+            let expected: Vec<&str> = public.iter().copied().chain(authz.iter().copied()).collect();
+            assert_eq!(nsids(&member), expected, "{mode:?}");
+            assert_eq!(member.collections.iter().find(|c| c.nsid == NSID_POST).map(|c| c.limit), Some(Limit::Top(1000)));
+            assert_eq!(member.collections.iter().find(|c| c.nsid == NSID_FOLLOW).map(|c| c.limit), Some(Limit::Top(10_000)));
+            assert!(member.profile && member.inbound_blocks);
+            assert_eq!(member.self_records, OFF_SELF_RECORDS);
+            assert!(!member.self_records.contains(&NSID_LABELER_SERVICE));
+            let scope = plan(Depth::Scope, false, mode);
+            assert!(scope.collections.is_empty() && scope.profile && !scope.inbound_blocks);
+            assert_eq!(scope.self_records, OFF_SELF_RECORDS);
+            let resync = plan(Depth::Resync, true, mode);
+            assert_eq!(nsids(&resync), public);
+            assert_eq!(resync.self_records, OFF_SELF_RECORDS);
+            let other = plan(Depth::Resync, false, mode);
+            assert!(other.collections.is_empty() && other.profile);
+            assert_eq!(other.self_records, OFF_SELF_RECORDS);
+            for (depth, is_member) in [(Depth::Private, false), (Depth::Authz, true), (Depth::Authz, false)] {
+                assert_eq!(plan(depth, is_member, mode), plan(depth, is_member, PublicMode::On), "{depth:?}");
+            }
+        }
+        for mode in [PublicMode::Filling, PublicMode::On] {
+            for depth in [Depth::Scope, Depth::Member, Depth::Private, Depth::Authz, Depth::Resync] {
+                for is_member in [true, false] {
+                    let p = plan(depth, is_member, mode);
+                    assert_eq!(p, plan(depth, is_member, PublicMode::On));
+                    assert!(p.self_records.is_empty() || p.self_records == SELF_RECORDS);
+                }
+            }
+            assert_eq!(nsids(&plan(Depth::Member, true, mode)).len(), 16);
         }
     }
 
@@ -1710,6 +1793,61 @@ mod tests {
             .await
             .expect("job");
         assert_eq!(state, "done");
+        db.drop_db().await;
+    }
+
+    /// public-indexing design §4.1, §5 (T-5, T-22): under the off rule a
+    /// member's resync writes references and growth for its posts and no
+    /// post, counts the grow-only writes as success, reconciles the
+    /// references, and never fetches the labeler service.
+    #[tokio::test]
+    async fn an_off_member_resync_writes_references_and_reconciles_them() {
+        let Some(db) = fresh_db("backfill_off_member_resync").await else {
+            return;
+        };
+        let p = &db.pool;
+        let rev = "3kzzzzzzzzzzz";
+        let subject = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        let gone = format!("at://{DID}/{NSID_POST}/3kgone");
+        sqlx::query("INSERT INTO member_post_refs (uri, author_did, rev, created_at) VALUES ($1, $2, '3kaaaaaaaaaaa', now())")
+            .bind(&gone)
+            .bind(DID)
+            .execute(p)
+            .await
+            .expect("ref");
+        let mut source = FakeSource { rev: rev.to_string(), ..FakeSource::default() };
+        let reply = json!({"text": "hi", "reply": {
+            "root": {"uri": format!("at://{subject}/{NSID_POST}/1"), "cid": "c"},
+            "parent": {"uri": format!("at://{subject}/{NSID_POST}/1"), "cid": "c"}}});
+        source.listings.insert(NSID_POST.to_string(), vec![rec(DID, NSID_POST, "3kreply", reply)]);
+        source.listings.insert(NSID_LABELER_SERVICE.to_string(), vec![rec(DID, NSID_LABELER_SERVICE, "self", json!({"policies": {}}))]);
+        let source = Arc::new(source);
+        let scope = state(true);
+        {
+            let mut sets = scope.write_guard().await;
+            let off = crate::indexing::PublicState { mode: PublicMode::Off, ..Default::default() };
+            scope.set_public(&mut sets, off);
+        }
+        let writer = Writer::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier));
+        let backfill = Backfill::new(writer, source.clone(), BackfillConfig::default(), 5);
+        let mut conn = p.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Resync).await.expect("enqueue");
+        drop(conn);
+        let (_, outcome) = backfill.run_once().await.expect("run").expect("a job");
+        assert_eq!(outcome, JobOutcome::Done);
+
+        assert!(post_uris(p).await.is_empty());
+        let refs: Vec<(String, Option<String>)> = sqlx::query_as("SELECT uri, reply_parent_did FROM member_post_refs ORDER BY uri")
+            .fetch_all(p)
+            .await
+            .expect("refs");
+        assert_eq!(refs, [(format!("at://{DID}/{NSID_POST}/3kreply"), Some(subject.to_string()))]);
+        assert!(scope.snapshot().await.in_scope(subject));
+        let calls = source.get_record_calls.lock().expect("lock").clone();
+        assert!(calls.contains(&gone), "the stale reference was confirmed");
+        assert!(!calls.iter().any(|u| u.contains(NSID_LABELER_SERVICE)), "{calls:?}");
+        let labelers: i64 = sqlx::query_scalar("SELECT count(*) FROM labeler_services").fetch_one(p).await.expect("count");
+        assert_eq!(labelers, 0);
         db.drop_db().await;
     }
 

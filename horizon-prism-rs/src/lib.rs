@@ -19,6 +19,7 @@ pub mod firehose;
 pub mod honest_501;
 pub mod hydration;
 pub mod identity;
+pub mod indexing;
 pub(crate) mod kryphocron_glue;
 pub mod microcosm;
 pub mod moderation;

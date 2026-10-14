@@ -103,14 +103,19 @@ impl Rebuild {
             }
         }
         if grows_on_interaction(policy) {
+            // Members' replies and quotes come from their post references,
+            // which exist in every public-indexing mode (public-indexing
+            // design §4.1); `posts` holds none while it is off.
             let interacted: Vec<String> = sqlx::query_scalar(
-                "SELECT DISTINCT split_part(u, '/', 3) FROM ( \
-                   SELECT l.subject_uri AS u FROM likes l JOIN members m ON m.did = l.author_did \
-                   UNION ALL SELECT r.subject_uri FROM reposts r JOIN members m ON m.did = r.author_did \
-                   UNION ALL SELECT p.reply_parent_uri FROM posts p JOIN members m ON m.did = p.author_did \
-                   UNION ALL SELECT p.reply_root_uri FROM posts p JOIN members m ON m.did = p.author_did \
-                   UNION ALL SELECT p.quote_uri FROM posts p JOIN members m ON m.did = p.author_did \
-                 ) t WHERE u LIKE 'at://%'",
+                "SELECT DISTINCT d FROM ( \
+                   SELECT split_part(l.subject_uri, '/', 3) AS d FROM likes l JOIN members m ON m.did = l.author_did \
+                     WHERE l.subject_uri LIKE 'at://%' \
+                   UNION ALL SELECT split_part(r.subject_uri, '/', 3) FROM reposts r JOIN members m ON m.did = r.author_did \
+                     WHERE r.subject_uri LIKE 'at://%' \
+                   UNION ALL SELECT p.reply_parent_did FROM member_post_refs p JOIN members m ON m.did = p.author_did \
+                   UNION ALL SELECT p.reply_root_did FROM member_post_refs p JOIN members m ON m.did = p.author_did \
+                   UNION ALL SELECT p.quote_did FROM member_post_refs p JOIN members m ON m.did = p.author_did \
+                 ) t WHERE d IS NOT NULL",
             )
             .fetch_all(&self.pool)
             .await?;
@@ -431,6 +436,137 @@ mod tests {
         // Nobody has been re-synced: every in-scope DID gets a resync job.
         exec(p, "UPDATE backfill_jobs SET state = 'done', updated_at = now() - interval '8 days'").await;
         assert_eq!(rebuild.enqueue_stale_resyncs().await.expect("resync"), 3);
+        db.drop_db().await;
+    }
+
+    /// T-17 (public-indexing design §4.1): under the off rule a member's
+    /// reply, written grow-only, puts its subject in S, and the rebuild
+    /// keeps it there past the grace period from the reference alone.
+    #[tokio::test]
+    async fn a_reply_justifies_its_subject_from_the_reference() {
+        use serde_json::json;
+
+        use crate::firehose::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer};
+        use crate::indexing::{PublicMode, PublicState};
+
+        let Some(db) = fresh_db("scope_rebuild_refs").await else {
+            return;
+        };
+        let p = &db.pool;
+        exec(p, "INSERT INTO members (did, source) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin')").await;
+        let mut sets = ScopeSets::default();
+        sets.members.insert(MEMBER.into());
+        sets.scope.insert(MEMBER.into());
+        let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10);
+        {
+            let mut s = scope.write_guard().await;
+            scope.set_public(&mut s, PublicState { mode: PublicMode::Off, generation: 1, last_fill_since: None });
+        }
+        let writer = Writer::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier));
+        let parent = format!("at://{LIKED}/app.bsky.feed.post/1");
+        let quoted = format!("at://{FOLLOWED}/app.bsky.feed.post/1");
+        let reply = RawOp {
+            action: Action::Create,
+            collection: "app.bsky.feed.post".into(),
+            rkey: "3kreply".into(),
+            cid: Some("bafyreply".into()),
+            record: Some(json!({"text": "hi", "reply": {"root": {"uri": parent, "cid": "c"}, "parent": {"uri": parent, "cid": "c"}},
+                                "embed": {"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "c"}}})),
+        };
+        let options = ApplyOptions {
+            advance_applied_rev: false,
+            dead_letter_readiness: false,
+            attempts: 1,
+            live: true,
+            subscription_rules: true,
+            source: WriteSource::Firehose,
+        };
+        let report = writer.apply(MEMBER, "3kaaaaaaaaaaa", &[reply], options).await.expect("apply");
+        assert_eq!(report.outcomes, [OpOutcome::GrowOnly]);
+        let posts: i64 = sqlx::query_scalar("SELECT count(*) FROM posts").fetch_one(p).await.expect("count");
+        assert_eq!(posts, 0);
+        assert!(scope.snapshot().await.in_scope(LIKED));
+
+        // Long past the grace period, only the reference justifies them.
+        exec(p, "UPDATE scope_dids SET justified_at = now() - interval '30 days'").await;
+        let rebuild = Rebuild::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier), 7);
+        let computed = rebuild.compute().await.expect("compute");
+        assert_eq!(computed.get(LIKED), Some(&REASON_INTERACTED));
+        assert_eq!(computed.get(FOLLOWED), Some(&REASON_INTERACTED));
+        let report = rebuild.run(false).await.expect("rebuild");
+        assert_eq!(report.purged, 0);
+        let snap = scope.snapshot().await;
+        assert!(snap.in_scope(LIKED) && snap.in_scope(FOLLOWED));
+        // The mode survives a reload of the sets.
+        scope.reload(p, &DisabledPrivateTier).await.expect("reload");
+        assert_eq!(scope.snapshot().await.public.mode, PublicMode::Off);
+        db.drop_db().await;
+    }
+
+    /// T-17: migration 0021 fills the references from members' stored
+    /// posts, and the rebuild reads from them the DIDs it read from `posts`.
+    #[tokio::test]
+    async fn migration_0021_refs_match_the_old_query() {
+        let Some(db) = crate::test_support::empty_db("migration_0021").await else {
+            return;
+        };
+        let p = &db.pool;
+        let migrations: Vec<_> = crate::db::migrations::MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()).collect();
+        let at = migrations.iter().position(|m| m.version == 21).expect("0021");
+        for m in &migrations[..at] {
+            sqlx::raw_sql(&m.sql).execute(p).await.unwrap_or_else(|e| panic!("{}: {e}", m.version));
+        }
+        exec(p, "INSERT INTO members (did, source) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin')").await;
+        let post = |author: &str, rkey: &str, parent: Option<&str>, root: Option<&str>, quote: Option<&str>| {
+            let q = |v: Option<&str>| v.map_or("NULL".to_string(), |u| format!("'{u}'"));
+            format!(
+                "INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at, reply_parent_uri, reply_root_uri, quote_uri) VALUES \
+                 ('at://{author}/app.bsky.feed.post/{rkey}', '{author}', '{rkey}', 'c', '3k{rkey}', '{{}}', now(), {}, {}, {})",
+                q(parent),
+                q(root),
+                q(quote)
+            )
+        };
+        let liked = format!("at://{LIKED}/app.bsky.feed.post/1");
+        let followed = format!("at://{FOLLOWED}/app.bsky.feed.post/1");
+        let stale = format!("at://{STALE}/app.bsky.feed.post/1");
+        for sql in [
+            post(MEMBER, "1", Some(&liked), Some(&followed), None),
+            post(MEMBER, "2", None, None, Some(&stale)),
+            post(MEMBER, "3", None, None, None),
+            // A handle in a reference is kept as written, as before.
+            post(MEMBER, "4", Some("at://alice.example/app.bsky.feed.post/1"), None, None),
+            // Not a member's: no reference.
+            post(STALE, "5", Some(&liked), None, None),
+        ] {
+            exec(p, &sql).await;
+        }
+        let old: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT split_part(u, '/', 3) FROM ( \
+               SELECT p.reply_parent_uri AS u FROM posts p JOIN members m ON m.did = p.author_did \
+               UNION ALL SELECT p.reply_root_uri FROM posts p JOIN members m ON m.did = p.author_did \
+               UNION ALL SELECT p.quote_uri FROM posts p JOIN members m ON m.did = p.author_did \
+             ) t WHERE u LIKE 'at://%' ORDER BY 1",
+        )
+        .fetch_all(p)
+        .await
+        .expect("old");
+        sqlx::raw_sql(&migrations[at].sql).execute(p).await.expect("0021 applies over existing rows");
+        let new: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT d FROM ( \
+               SELECT p.reply_parent_did AS d FROM member_post_refs p JOIN members m ON m.did = p.author_did \
+               UNION ALL SELECT p.reply_root_did FROM member_post_refs p JOIN members m ON m.did = p.author_did \
+               UNION ALL SELECT p.quote_did FROM member_post_refs p JOIN members m ON m.did = p.author_did \
+             ) t WHERE d IS NOT NULL ORDER BY 1",
+        )
+        .fetch_all(p)
+        .await
+        .expect("new");
+        assert_eq!(new, old);
+        assert_eq!(old.len(), 4);
+        let refs: Vec<(String, String)> = sqlx::query_as("SELECT uri, rev FROM member_post_refs ORDER BY uri").fetch_all(p).await.expect("refs");
+        assert_eq!(refs.len(), 4);
+        assert!(refs.iter().all(|(u, r)| u.starts_with(&format!("at://{MEMBER}/")) && r.starts_with("3k")));
         db.drop_db().await;
     }
 }

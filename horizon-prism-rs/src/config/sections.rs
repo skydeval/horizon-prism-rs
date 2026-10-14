@@ -44,21 +44,47 @@ impl Default for MetricsConfig {
     }
 }
 
-/// `indexing.public_scope` (§9.1).
+/// `indexing.public_scope` (§9.1; public-indexing design §3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicScope {
+    /// Only what the private tier and Horizon features need is stored, and
+    /// public endpoints answer 501.
     #[default]
+    Off,
     CommunityScoped,
     /// Recognized so the config parses, then rejected by validation (lock #4).
     Full,
 }
 
 /// `[indexing]`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexingConfig {
-    pub public_scope: PublicScope,
+    /// `None` when the key is absent. The effective value is then `off`,
+    /// but only a key written in the file is ever applied (public-indexing
+    /// design §3.3).
+    pub public_scope: Option<PublicScope>,
+    /// How long, in whole hours, a fill waits on its last jobs before
+    /// public endpoints are served anyway (public-indexing design §8.5).
+    pub fill_max_wait_hours: u32,
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        Self {
+            public_scope: None,
+            fill_max_wait_hours: 24,
+        }
+    }
+}
+
+impl IndexingConfig {
+    /// The effective `public_scope`: the file's value, or `off`.
+    #[must_use]
+    pub fn public_scope(&self) -> PublicScope {
+        self.public_scope.unwrap_or_default()
+    }
 }
 
 /// `scope.policy` (§9.2).
@@ -694,6 +720,11 @@ pub struct Honest501Config {
     pub status_url: String,
     /// Per-NSID message overrides, merged over the compiled defaults.
     pub messages: BTreeMap<String, String>,
+    /// The message of a public endpoint while public indexing is off
+    /// (public-indexing design §6). `None` keeps the compiled one.
+    pub public_off_message: Option<String>,
+    /// The same while public indexing is being turned on.
+    pub public_filling_message: Option<String>,
 }
 
 /// The state of a `[services.<name>]` block (design-v3 §6.7.2.1).

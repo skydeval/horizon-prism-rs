@@ -23,7 +23,7 @@ use crate::aggregations::{ScopeSets, ScopeState};
 use crate::config::{PrivateReadConfig, PrivateReadFloors, ScopePolicy, SyncConfig};
 use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE};
 use crate::firehose::watermark::Watermarks;
-use crate::firehose::writer::{Action, ApplyOptions, RawOp, Writer};
+use crate::firehose::writer::{Action, ApplyOptions, RawOp, WriteSource, Writer};
 use crate::hydration::testing::{actor, exec, hydrator};
 use crate::kryphocron_glue::audit::GlueSinks;
 use crate::kryphocron_glue::jwt::tests::{AUDIENCE_HOST, StubFetcher, mint, signing_key, verifier};
@@ -217,6 +217,7 @@ impl Fixture {
                     attempts: 1,
                     live: false,
                     subscription_rules: false,
+                    source: WriteSource::Firehose,
                 },
             )
             .await

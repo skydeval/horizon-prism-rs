@@ -62,7 +62,10 @@ trusted_proxy = "172.30.0.10"
 bind = "0.0.0.0:9091"
 
 [indexing]
-public_scope = "community_scoped"
+# off | community_scoped | full (full is refused). Default: off.
+# Set this, or run `admin indexing public-scope`, to change it (design §3.3).
+# public_scope = "off"
+fill_max_wait_hours = 24
 
 [scope]
 policy = "members_and_one_hop"
@@ -633,6 +636,34 @@ fn services_and_features_are_validated_at_load() {
 fn full_public_scope_is_refused() {
     let p = invalid_problems(load("[indexing]\npublic_scope = \"full\"\n"));
     assert!(has(&p, "public_scope=full is not implemented in v1"));
+}
+
+/// T-1 (public-indexing design §3.1, §3.3): `off` parses; an absent key is
+/// `None`, which is effectively `off`; the fill bound defaults to 24 hours.
+#[test]
+fn public_scope_off_and_an_absent_key() {
+    let cfg = load("[indexing]\npublic_scope = \"off\"\n").expect("valid");
+    assert_eq!(cfg.file.indexing.public_scope, Some(PublicScope::Off));
+    let cfg = load("[indexing]\npublic_scope = \"community_scoped\"\n").expect("valid");
+    assert_eq!(cfg.file.indexing.public_scope(), PublicScope::CommunityScoped);
+    let cfg = load("").expect("valid");
+    assert_eq!(cfg.file.indexing.public_scope, None);
+    assert_eq!(cfg.file.indexing.public_scope(), PublicScope::Off);
+    assert_eq!(cfg.file.indexing.fill_max_wait_hours, 24);
+    let cfg = load("[indexing]\nfill_max_wait_hours = 2\n").expect("valid");
+    assert_eq!(cfg.file.indexing.fill_max_wait_hours, 2);
+    assert_eq!(cfg.file.honest_501.public_off_message, None);
+    let cfg = load("[honest_501]\npublic_off_message = \"off\"\npublic_filling_message = \"soon\"\n").expect("valid");
+    assert_eq!(cfg.file.honest_501.public_off_message.as_deref(), Some("off"));
+    assert_eq!(cfg.file.honest_501.public_filling_message.as_deref(), Some("soon"));
+}
+
+/// T-14 (template): the shipped copy writes no `public_scope` line, so an
+/// upgrade never applies one from it.
+#[test]
+fn the_template_carries_no_explicit_public_scope() {
+    assert!(!DOCKER_APP_TOML.lines().any(|l| l.trim_start().starts_with("public_scope") && l.contains('=')));
+    assert!(DOCKER_APP_TOML.contains("# public_scope = \"off\""));
 }
 
 #[test]

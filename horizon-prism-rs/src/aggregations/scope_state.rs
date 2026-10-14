@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -18,6 +19,7 @@ use crate::config::ScopePolicy;
 use crate::db::locks::uri_author;
 use crate::db::{ScopeGuard, ScopeReadGuard};
 use crate::identity::PersistencePolicy;
+use crate::indexing::{PublicMode, PublicState};
 use crate::private_tier::PrivateTier;
 
 /// A purge kind (§6.11.7).
@@ -61,6 +63,10 @@ pub struct ScopeSets {
     pub member_follows: HashMap<String, u32>,
     /// Rule 4's in-memory sets (design-v3 §4.3 "The copy rule").
     pub subscribed: Subscribed,
+    /// The public-indexing mode, its generation and the start of the last
+    /// fill (public-indexing design §3.5). Set only under the write guard,
+    /// through [`ScopeState::set_public`], which keeps the mirror in step.
+    pub public: PublicState,
 }
 
 /// What the copy rule looks up for every list-item write: which lists are
@@ -132,16 +138,34 @@ pub struct ScopeState {
     sets: Arc<RwLock<ScopeSets>>,
     policy: ScopePolicy,
     max_follow_scope_per_member: u32,
+    /// `ScopeSets.public.mode`, readable without the guard (the endpoint
+    /// gate, public-indexing design §3.5). Stored under the write guard.
+    public_mirror: Arc<AtomicU8>,
 }
 
 impl ScopeState {
     #[must_use]
     pub fn new(sets: ScopeSets, policy: ScopePolicy, max_follow_scope_per_member: u32) -> Self {
+        let mirror = AtomicU8::new(sets.public.mode.as_u8());
         Self {
             sets: Arc::new(RwLock::new(sets)),
             policy,
             max_follow_scope_per_member,
+            public_mirror: Arc::new(mirror),
         }
+    }
+
+    /// Set the public-indexing state and its mirror. `sets` is the write
+    /// guard the caller holds.
+    pub fn set_public(&self, sets: &mut ScopeSets, public: PublicState) {
+        sets.public = public;
+        self.public_mirror.store(public.mode.as_u8(), Ordering::Release);
+    }
+
+    /// The public-indexing mode, read from the mirror without the guard.
+    #[must_use]
+    pub fn public_mode(&self) -> PublicMode {
+        PublicMode::from_u8(self.public_mirror.load(Ordering::Acquire))
     }
 
     /// Load the sets from the database at startup (§9.3).
@@ -255,14 +279,17 @@ impl ScopeState {
         Ok(())
     }
 
-    /// Replace every set with a fresh load (after a rebuild).
+    /// Replace every set with a fresh load (after a rebuild). The
+    /// public-indexing state is not a set and is kept.
     ///
     /// # Errors
     ///
     /// Any database error; the sets are unchanged on error.
     pub async fn reload(&self, pool: &PgPool, private: &dyn PrivateTier) -> Result<(), sqlx::Error> {
-        let fresh = load_sets(pool, private).await?;
-        *self.write_guard().await = fresh;
+        let mut fresh = load_sets(pool, private).await?;
+        let mut sets = self.write_guard().await;
+        fresh.public = sets.public;
+        *sets = fresh;
         Ok(())
     }
 }
@@ -321,6 +348,7 @@ async fn load_sets(pool: &PgPool, private: &dyn PrivateTier) -> Result<ScopeSets
             .into_iter()
             .map(|(did, n)| (did, u32::try_from(n).unwrap_or(u32::MAX)))
             .collect(),
+        public: PublicState::default(),
     };
     // Members are always in S (reason bit 1), even before a rebuild wrote it.
     let members: Vec<String> = sets.members.iter().cloned().collect();
@@ -395,6 +423,22 @@ mod tests {
         assert!(!st.in_persistence_set("did:plc:m"));
         drop(w);
         assert!(st.in_persistence_set("did:plc:m"));
+    }
+
+    /// T-1: `ScopeSets::default().public` is `(On, 0, None)`, and the
+    /// mirror follows every set.
+    #[tokio::test]
+    async fn public_state_defaults_to_on_and_the_mirror_follows() {
+        assert_eq!(ScopeSets::default().public, PublicState { mode: PublicMode::On, generation: 0, last_fill_since: None });
+        let st = state();
+        assert_eq!(st.public_mode(), PublicMode::On);
+        let off = PublicState { mode: PublicMode::Off, generation: 3, last_fill_since: None };
+        {
+            let mut sets = st.write_guard().await;
+            st.set_public(&mut sets, off);
+        }
+        assert_eq!(st.public_mode(), PublicMode::Off);
+        assert_eq!(st.snapshot().await.public, off);
     }
 
     #[tokio::test]

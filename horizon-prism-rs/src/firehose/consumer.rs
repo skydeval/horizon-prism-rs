@@ -29,7 +29,7 @@ use super::router::route_identity;
 use super::scripts::{self, CheckedRead, ScriptError};
 use super::stream::{Commit, Event, IdentityKind, StreamEntry, decode, parse_read_reply, repo_hint};
 use super::watermark::{Watermarks, contribution};
-use super::writer::{ApplyOptions, Transient, Writer};
+use super::writer::{ApplyOptions, Transient, WriteSource, Writer};
 use crate::config::FirehoseConfig;
 use crate::subscriptions::triggers;
 
@@ -141,6 +141,7 @@ impl Consumer {
             attempts: self.cfg.deterministic_attempts,
             live: true,
             subscription_rules: true,
+            source: WriteSource::Firehose,
         }
     }
 

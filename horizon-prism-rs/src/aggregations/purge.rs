@@ -233,9 +233,11 @@ impl Purger {
         loop {
             let guard = self.scope.read_guard().await;
             let owners: Vec<String> = guard.private_owners.iter().cloned().collect();
+            // Read per batch: a switch between batches decides the rest.
+            let off_rule = guard.public.mode.off_rule();
             let mut tx = self.pool.begin().await?;
             lock_dids_shared(&mut tx, &[did.to_string()]).await?;
-            let n = self.batch(&mut tx, did, kind, &owners).await?;
+            let n = self.batch(&mut tx, did, kind, &owners, off_rule).await?;
             tx.commit().await?;
             drop(guard);
             total += n;
@@ -248,13 +250,15 @@ impl Purger {
     }
 
     /// One batch: up to [`BATCH`] rows per statement, returning the rows
-    /// deleted by this transaction.
+    /// deleted by this transaction. `off_rule` is the public-indexing mode's
+    /// off rule as this batch's guard read it.
     async fn batch(
         &self,
         conn: &mut PgConnection,
         did: &str,
         kind: PurgeKind,
         owners: &[String],
+        off_rule: bool,
     ) -> Result<u64, sqlx::Error> {
         let mut n = 0;
         match kind {
@@ -262,6 +266,7 @@ impl Purger {
                 for (table, column) in [
                     ("feed_items", "originator_did"),
                     ("posts", "author_did"),
+                    ("member_post_refs", "author_did"),
                     ("likes", "author_did"),
                     ("reposts", "author_did"),
                     ("follows", "author_did"),
@@ -323,7 +328,13 @@ impl Purger {
                     .await?
                     .rows_affected();
                 n += delete_batch(conn, "notifications", "id", "recipient_did = $1", did).await?;
+                // A non-member's posts have no references (public-indexing
+                // design §4.1).
+                n += delete_batch(conn, "member_post_refs", "uri", "author_did = $1", did).await?;
                 n += member_removed_public_batch(conn, did, owners).await?;
+                if off_rule {
+                    n += member_removed_off_batch(conn, did).await?;
+                }
                 n += self.private.purge_member_removed_batch(conn, did, BATCH).await?;
             }
         }
@@ -501,6 +512,33 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str, owners:
         .execute(&mut *conn)
         .await?
         .rows_affected();
+    Ok(n)
+}
+
+/// Under the off rule only (public-indexing design §5): the rows that were
+/// stored only because `did` was a member. Its likes, reposts and list
+/// records; its follows of non-members; and non-members' follows of it.
+/// In Filling and On these rows are stored for anyone in S, so they stay.
+async fn member_removed_off_batch(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
+    let mut n = 0;
+    for (table, column) in [
+        ("likes", "author_did"),
+        ("reposts", "author_did"),
+        ("list_blocks", "author_did"),
+        ("lists", "creator_did"),
+        ("list_items", "author_did"),
+        ("list_optouts", "author_did"),
+    ] {
+        n += delete_batch(conn, table, "uri", &format!("{column} = $1"), did).await?;
+    }
+    let non_member = |col: &str| format!("NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.{col})");
+    for (own, other) in [("author_did", "subject_did"), ("subject_did", "author_did")] {
+        let sql = format!(
+            "DELETE FROM follows WHERE uri IN (SELECT uri FROM follows t WHERE t.{own} = $1 AND {} LIMIT {BATCH})",
+            non_member(other)
+        );
+        n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
+    }
     Ok(n)
 }
 
@@ -750,6 +788,155 @@ mod tests {
 
         // Idempotent through the lifecycle hook.
         PurgeLifecycle::new(purger).account_deleted(SCOPED).await.expect("again");
+        db.drop_db().await;
+    }
+
+    /// What a removed member left behind, by kind (T-19).
+    async fn seed_removed_member(p: &PgPool) {
+        for did in [MEMBER, OTHER_MEMBER] {
+            sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())").bind(did).execute(p).await.expect("member");
+        }
+        for did in [MEMBER, OTHER_MEMBER, SCOPED] {
+            sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 1)").bind(did).execute(p).await.expect("scope");
+        }
+        let follow = |rkey: &str, author: &str, subject: &str| {
+            format!(
+                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
+                 ('at://{author}/app.bsky.graph.follow/{rkey}', '{author}', '{subject}', '3k', now())"
+            )
+        };
+        let subject = |table: &str, rkey: &str| {
+            format!(
+                "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES \
+                 ('at://{MEMBER}/x/{rkey}', '{MEMBER}', 'at://{OUTSIDER}/app.bsky.feed.post/1', '3k', now())"
+            )
+        };
+        let authored = |sql: &str| sql.replace("$1", &format!("'{MEMBER}'"));
+        for sql in [
+            follow("1", OTHER_MEMBER, MEMBER),
+            follow("2", MEMBER, OTHER_MEMBER),
+            follow("3", MEMBER, OUTSIDER),
+            follow("4", OUTSIDER, MEMBER),
+            follow("5", SCOPED, MEMBER),
+            subject("likes", "l1"),
+            subject("reposts", "r1"),
+            authored("INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES ('at://' || $1 || '/l/1', $1, '1', 'c', '3k', 'n', 'p', '{}', now())"),
+            authored("INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES ('at://' || $1 || '/li/1', $1, '1', 'c', '3k', 'l', 'did:plc:x', now())"),
+            authored("INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lb/1', $1, '1', 'c', '3k', 'l', now())"),
+            authored("INSERT INTO list_optouts (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lo/1', $1, '1', 'c', '3k', 'l', now())"),
+            authored("INSERT INTO member_post_refs (uri, author_did, rev, created_at) VALUES ('at://' || $1 || '/app.bsky.feed.post/1', $1, '3k', now())"),
+            authored("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://' || $1 || '/app.bsky.graph.block/1', $1, 'did:plc:x', '3k', now())"),
+            authored("INSERT INTO actors (did, display_name, profile_record, profile_rev) VALUES ($1, 'M', '{}'::jsonb, '3k')"),
+        ] {
+            exec(p, &sql).await;
+        }
+    }
+
+    fn purger_in(p: &PgPool, mode: crate::indexing::PublicMode) -> (ScopeState, Purger) {
+        let mut sets = ScopeSets::default();
+        for d in [MEMBER, OTHER_MEMBER] {
+            sets.members.insert(d.into());
+        }
+        for d in [MEMBER, OTHER_MEMBER, SCOPED] {
+            sets.scope.insert(d.into());
+        }
+        sets.public.mode = mode;
+        let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10);
+        let purger = Purger::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier));
+        (scope, purger)
+    }
+
+    /// The removed member's rows that are left: its likes, reposts, list
+    /// rows and references; the follows by `uri` rkey; its blocks and
+    /// profile.
+    async fn left(p: &PgPool) -> (i64, i64, Vec<String>, i64) {
+        let own = count(
+            p,
+            "SELECT (SELECT count(*) FROM likes) + (SELECT count(*) FROM reposts) + (SELECT count(*) FROM lists) \
+             + (SELECT count(*) FROM list_items) + (SELECT count(*) FROM list_blocks) + (SELECT count(*) FROM list_optouts)",
+        )
+        .await;
+        let refs = count(p, "SELECT count(*) FROM member_post_refs").await;
+        let follows: Vec<String> = sqlx::query_scalar("SELECT split_part(uri, '/', 5) FROM follows ORDER BY 1").fetch_all(p).await.expect("follows");
+        let kept = count(p, "SELECT (SELECT count(*) FROM blocks) + (SELECT count(*) FROM actors WHERE profile_record IS NOT NULL)").await;
+        (own, refs, follows, kept)
+    }
+
+    /// T-19 (public-indexing design §5): under the off rule a removed
+    /// member's likes, reposts, list rows and references go, with its
+    /// follows of non-members and non-members' follows of it.
+    #[tokio::test]
+    async fn member_removed_under_the_off_rule() {
+        use crate::indexing::PublicMode;
+
+        let Some(db) = fresh_db("purge_member_removed_off").await else {
+            return;
+        };
+        let p = &db.pool;
+        seed_removed_member(p).await;
+        let (_, purger) = purger_in(p, PublicMode::Off);
+        purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("purge");
+        // Another member's follow of it, and its follow of another member,
+        // stay; its blocks and profile stay.
+        assert_eq!(left(p).await, (0, 0, vec!["1".to_string(), "2".to_string()], 2));
+        db.drop_db().await;
+    }
+
+    /// T-19: in Filling only what `member_removed` always deletes goes, and
+    /// the references.
+    #[tokio::test]
+    async fn member_removed_while_filling() {
+        use crate::indexing::PublicMode;
+
+        let Some(db) = fresh_db("purge_member_removed_filling").await else {
+            return;
+        };
+        let p = &db.pool;
+        seed_removed_member(p).await;
+        let (_, purger) = purger_in(p, PublicMode::Filling);
+        purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("purge");
+        // Only the outsider's follow of it goes: its author is outside S.
+        assert_eq!(left(p).await, (6, 0, vec!["1".to_string(), "2".to_string(), "3".to_string(), "5".to_string()], 2));
+        db.drop_db().await;
+    }
+
+    /// T-19: the mode is read per batch. A switch to Filling after the
+    /// marker, before the batches, skips the off-only steps.
+    #[tokio::test]
+    async fn member_removed_reads_the_mode_per_batch() {
+        use crate::indexing::{PublicMode, PublicState};
+
+        let Some(db) = fresh_db("purge_member_removed_switch").await else {
+            return;
+        };
+        let p = &db.pool;
+        seed_removed_member(p).await;
+        let (scope, purger) = purger_in(p, PublicMode::Off);
+        purger.marker(MEMBER, PurgeKind::MemberRemoved).await.expect("marker");
+        {
+            let mut sets = scope.write_guard().await;
+            scope.set_public(&mut sets, PublicState { mode: PublicMode::Filling, generation: 2, last_fill_since: None });
+        }
+        purger.run_batches(MEMBER, PurgeKind::MemberRemoved).await.expect("batches");
+        purger.end(MEMBER).await.expect("end");
+        assert_eq!(left(p).await, (6, 0, vec!["1".to_string(), "2".to_string(), "3".to_string(), "5".to_string()], 2));
+        db.drop_db().await;
+    }
+
+    /// `account_deleted` deletes the account's references in every mode.
+    #[tokio::test]
+    async fn account_deleted_deletes_references() {
+        let Some(db) = fresh_db("purge_account_deleted_refs").await else {
+            return;
+        };
+        let p = &db.pool;
+        exec(p, "INSERT INTO member_post_refs (uri, author_did, rev, created_at) VALUES \
+                 ('at://did:plc:dddddddddddddddddddddddd/app.bsky.feed.post/1', 'did:plc:dddddddddddddddddddddddd', '3k', now()), \
+                 ('at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/1', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '3k', now())").await;
+        let scope = ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10);
+        let purger = Purger::new(p.clone(), scope, Arc::new(DisabledPrivateTier));
+        purger.purge(SCOPED, PurgeKind::AccountDeleted).await.expect("purge");
+        assert_eq!(count(p, "SELECT count(*) FROM member_post_refs").await, 1);
         db.drop_db().await;
     }
 
