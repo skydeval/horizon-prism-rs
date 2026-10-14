@@ -12,6 +12,16 @@ commit.
 
 ### Added
 
+- **List subscription and reference gauges (#710; design-v4 §4.7.6).**
+  Sampled every 300 s with the storage gauges:
+  `list_subscriptions_total` (active subscribed lists),
+  `list_references_unadmitted{source}`, `list_reference_changes_pending`,
+  `list_references_dormant{source}` (references on a list that is not a
+  moderation list), `list_records_unlisted` and
+  `list_references_unlisted{source}`. `list_subscription_rows_bound`
+  (members × 2 × `subscribed_max_per_member` × `subscribed_max_items`) is
+  also logged at startup.
+
 - **Account status changes are logged.** When a re-check after an
   `#account` event changes an account's stored status, the identity
   refresher logs `account_status_changed` with the DID and the old and

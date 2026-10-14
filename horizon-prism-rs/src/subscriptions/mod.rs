@@ -58,6 +58,7 @@ pub mod applier;
 pub mod claim;
 pub mod copy;
 pub mod fetch;
+pub mod gauges;
 pub mod jobs;
 pub mod list_phase;
 pub mod pds;

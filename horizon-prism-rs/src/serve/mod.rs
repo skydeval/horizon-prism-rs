@@ -178,6 +178,17 @@ pub async fn run() -> Result<(), StartupError> {
     let resolver = IdentityResolver::new(net.clone(), pool.clone(), IdentitySettings::from_app(&cfg), policy);
     // Rule 4 (§4.3): the applier runs list phases and releases.
     let applier = Applier::new(pool.clone(), scope.clone(), cfg.file.lists.sync_min_interval_secs);
+    // The storage bound for the member count now (§4.7.6); the storage
+    // sampler keeps the gauge current.
+    let members: i64 = sqlx::query_scalar("SELECT count(*) FROM members")
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| StartupError::new(1, format!("counting members: {e}")))?;
+    subscriptions::gauges::log_rows_bound(
+        u64::try_from(members).unwrap_or(0),
+        cfg.file.lists.subscribed_max_per_member,
+        cfg.file.lists.subscribed_max_items,
+    );
     let list_budget = subscriptions::references::Budget {
         max_references: cfg.file.lists.subscribed_max_per_member,
         max_owners: cfg.file.lists.max_owners_per_member,
@@ -361,6 +372,8 @@ pub async fn run() -> Result<(), StartupError> {
             redis: redis.clone(),
             stream_key: fh.stream_key.clone(),
             budget_bytes: cfg.file.storage.budget_bytes,
+            subscribed_max_per_member: cfg.file.lists.subscribed_max_per_member,
+            subscribed_max_items: cfg.file.lists.subscribed_max_items,
         }
         .spawn(),
     );

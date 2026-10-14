@@ -1,7 +1,8 @@
 //! Storage sampler (design-v2 §4.6).
 //!
 //! Every 300 s: per-table rows and bytes, database size and budget ratio, the
-//! firehose stream length, and the scope and member counts. Every 30 s: Redis
+//! firehose stream length, the scope and member counts, and rule 4's row
+//! counts and storage bound ([`gauges`]). Every 30 s: Redis
 //! `INFO memory`. Budget and Redis-memory warnings are logged once per sample.
 
 use std::time::Duration;
@@ -11,6 +12,8 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
+
+use crate::subscriptions::gauges;
 
 pub const DB_SAMPLE_INTERVAL: Duration = Duration::from_secs(300);
 pub const REDIS_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
@@ -197,15 +200,32 @@ pub struct StorageSampler {
     pub stream_key: String,
     /// `storage.budget_bytes`.
     pub budget_bytes: u64,
+    /// `lists.subscribed_max_per_member`, for `list_subscription_rows_bound`.
+    pub subscribed_max_per_member: u32,
+    /// `lists.subscribed_max_items`, for `list_subscription_rows_bound`.
+    pub subscribed_max_items: u32,
 }
 
 impl StorageSampler {
     async fn db_tick(&self) {
         match sample_db(&self.pool, self.budget_bytes).await {
-            Ok(sample) => record_db_sample(&sample, self.budget_bytes),
+            Ok(sample) => {
+                record_db_sample(&sample, self.budget_bytes);
+                let members = u64::try_from(sample.members_total).unwrap_or(0);
+                let bound = gauges::rows_bound(members, self.subscribed_max_per_member, self.subscribed_max_items);
+                metrics::gauge!(gauges::METRIC_ROWS_BOUND).set(bound as f64);
+            }
             Err(error) => {
                 metrics::counter!(METRIC_SAMPLE_ERRORS, "source" => "postgres").increment(1);
                 tracing::warn!(event = "storage_sample_failed", source = "postgres", %error, "storage sample failed");
+            }
+        }
+        // Rule 4's row counts (design-v3 §14.2).
+        match gauges::sample(&self.pool).await {
+            Ok(sample) => gauges::record(&sample),
+            Err(error) => {
+                metrics::counter!(METRIC_SAMPLE_ERRORS, "source" => "list_subscriptions").increment(1);
+                tracing::warn!(event = "storage_sample_failed", source = "list_subscriptions", %error, "list subscription sample failed");
             }
         }
         let mut conn = self.redis.clone();
