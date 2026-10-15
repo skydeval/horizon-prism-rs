@@ -121,7 +121,7 @@ pub trait HostLookup: Send + Sync + 'static {
     fn lookup(&self, host: String) -> BoxFuture<'static, Result<Vec<IpAddr>, BoxError>>;
 }
 
-/// hickory-resolver backed lookup using the system resolver configuration.
+/// hickory-resolver backed lookup, with its own answer cache.
 #[derive(Clone)]
 pub struct HickoryLookup {
     resolver: hickory_resolver::TokioResolver,
@@ -137,6 +137,51 @@ impl HickoryLookup {
     pub fn from_system() -> Result<Self, hickory_resolver::net::NetError> {
         let resolver = hickory_resolver::TokioResolver::builder_tokio()?.build()?;
         Ok(Self { resolver })
+    }
+
+    /// A resolver forwarding to `nameservers` (UDP and TCP, port 53), or to
+    /// `/etc/resolv.conf`'s when the list is empty (design-v4 §11 G-9
+    /// "Upstream DNS"). `cache_size` replaces hickory's answer-cache size
+    /// when given: `Some(0)` keeps no answer at all (the `viewer_private`
+    /// intent, §8.1).
+    ///
+    /// # Errors
+    ///
+    /// As [`HickoryLookup::from_system`].
+    pub fn forwarding(nameservers: &[IpAddr], cache_size: Option<u64>) -> Result<Self, hickory_resolver::net::NetError> {
+        use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+
+        let mut builder = if nameservers.is_empty() {
+            hickory_resolver::TokioResolver::builder_tokio()?
+        } else {
+            let servers = nameservers.iter().map(|ip| NameServerConfig::udp_and_tcp(*ip)).collect();
+            hickory_resolver::TokioResolver::builder_with_config(ResolverConfig::from_parts(None, vec![], servers), TokioRuntimeProvider::default())
+        };
+        if let Some(size) = cache_size {
+            builder.options_mut().cache_size = size;
+        }
+        Ok(Self { resolver: builder.build()? })
+    }
+
+    /// The size of this resolver's answer cache.
+    #[must_use]
+    pub fn cache_size(&self) -> u64 {
+        self.resolver.options().cache_size
+    }
+}
+
+/// A source of TXT records (DNS in production). Each `net` intent has its
+/// own ([`super::Transport::dns`]).
+#[async_trait::async_trait]
+pub trait TxtSource: Send + Sync {
+    async fn txt(&self, name: &str) -> TxtAnswer;
+}
+
+#[async_trait::async_trait]
+impl TxtSource for HickoryLookup {
+    async fn txt(&self, name: &str) -> TxtAnswer {
+        HickoryLookup::txt(self, name).await
     }
 }
 

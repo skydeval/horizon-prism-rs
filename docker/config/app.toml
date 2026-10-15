@@ -12,6 +12,20 @@ trusted_proxy = "172.30.0.10"
 [metrics]
 bind = "0.0.0.0:9091"
 
+# The DNS resolvers this server asks, as IP addresses (port 53). Empty means
+# the ones in /etc/resolv.conf. Lookups made while serving public requests,
+# and lookups of names that a member's mutes, bookmarks or subscriptions
+# point at, go to public_nameservers. Background work, such as reading the
+# accounts this server stores, goes to internal_nameservers. A shared
+# resolver lets anyone who queries it see which names were looked up
+# lately, so internal_nameservers should be a resolver that only this
+# deployment uses and that resolves from the root itself (for example an
+# unbound container), not a public one or Docker's 127.0.0.11. The server
+# logs a warning at startup when it plainly is not.
+[net]
+public_nameservers = []
+internal_nameservers = []
+
 [indexing]
 # off | community_scoped | full (full is refused). Default: off.
 # Set this, or run `admin indexing public-scope`, to change it (design §3.3).

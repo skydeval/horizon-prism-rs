@@ -29,6 +29,20 @@ impl Default for HttpConfig {
     }
 }
 
+/// `[net]`: the recursive resolvers each `net` intent forwards to
+/// (design-v4 §11 G-9 "Upstream DNS", §13; R3-177, R3-181). Empty means
+/// `/etc/resolv.conf`. The `viewer_private` intent forwards to
+/// `public_nameservers`; a `service_proxy` client always uses the system
+/// resolver (§6.7.8).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetSectionConfig {
+    pub public_nameservers: Vec<IpAddr>,
+    /// Should name a recursive-from-root resolver only this deployment
+    /// queries; `serve` warns when it plainly does not.
+    pub internal_nameservers: Vec<IpAddr>,
+}
+
 /// `[metrics]`: the Prometheus listener (§11.2).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1613,6 +1627,7 @@ pub struct FileConfig {
     pub honest_501: Honest501Config,
     pub services: BTreeMap<String, ServiceConfig>,
     pub http: HttpConfig,
+    pub net: NetSectionConfig,
     pub metrics: MetricsConfig,
     pub indexing: IndexingConfig,
     pub scope: ScopeConfig,

@@ -1453,6 +1453,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -16,11 +16,11 @@
 use std::error::Error;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use proto_blue::syntax::Did;
 
-use crate::net::resolver::{AllAddressesBlocked, HickoryLookup, TxtAnswer, no_such_name};
-use crate::net::{BodyCap, NetClient, NetError, RequestOptions};
+pub use crate::net::resolver::TxtSource;
+use crate::net::resolver::{AllAddressesBlocked, TxtAnswer, no_such_name};
+use crate::net::{BodyCap, NetClient, NetError, RequestOptions, Transport};
 
 /// The well-known file is one line.
 const WELL_KNOWN_BODY_CAP: BodyCap = BodyCap(2048);
@@ -45,19 +45,6 @@ pub enum Step {
     Found(String),
     Confirmed,
     Transient,
-}
-
-/// A source of TXT records (DNS in production).
-#[async_trait]
-pub trait TxtSource: Send + Sync {
-    async fn txt(&self, name: &str) -> TxtAnswer;
-}
-
-#[async_trait]
-impl TxtSource for HickoryLookup {
-    async fn txt(&self, name: &str) -> TxtAnswer {
-        HickoryLookup::txt(self, name).await
-    }
 }
 
 /// The TXT lookup's outcome. One `did=` record with a valid DID is found.
@@ -156,6 +143,18 @@ pub fn neither_found(txt: &Step, well_known: &Step) -> Step {
 pub struct HandleProbe<'a> {
     pub txt: &'a dyn TxtSource,
     pub net: &'a NetClient,
+}
+
+impl<'a> HandleProbe<'a> {
+    /// Both lookups through one `net` intent: its resolver for the TXT
+    /// record and its client for the well-known file (design-v4 §11 G-9).
+    #[must_use]
+    pub fn through(transport: &'a Transport) -> Self {
+        Self {
+            txt: transport.dns(),
+            net: transport.client(),
+        }
+    }
 }
 
 impl HandleProbe<'_> {

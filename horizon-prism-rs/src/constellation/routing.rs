@@ -20,7 +20,7 @@ use moka::future::Cache;
 
 use super::matcher::{first_match, pds_host};
 use crate::config::{COMMUNITY_NETWORK, ConstellationConfig, LOCAL_APPVIEW, NetworkAuth};
-use crate::identity::handle_lookup::{HandleOutcome, TxtSource};
+use crate::identity::handle_lookup::HandleOutcome;
 use crate::identity::resolver::Caches;
 use crate::identity::{IdentityResolver, ResolveIntent};
 use crate::xrpc::pools::{Requester, RequesterLimit, SharedBucket};
@@ -203,26 +203,28 @@ pub struct HandleCacheSettings {
     pub negative_ttl: Duration,
 }
 
-/// The typed handle lookup of a [`RequestLookup`] and its two caches. A
-/// "could not find out" is never kept.
+/// The two caches of a [`RequestLookup`]'s typed handle lookup. A "could
+/// not find out" is never kept.
 #[derive(Clone)]
 struct Handles {
-    txt: Arc<dyn TxtSource>,
     found: Cache<String, String>,
     absent: Cache<String, ()>,
 }
 
 pub const METRIC_HANDLE_RESOLUTIONS: &str = "handle_resolutions_total";
 
+/// Every call goes through the request's `net` intent
+/// ([`IdentityResolver::for_request`]; design-v4 §11 G-9).
 #[async_trait]
 impl DidLookup for IdentityResolver {
     async fn summary(&self, req: &Requester, did: &str) -> Option<DidSummary> {
+        let resolver = self.for_request(req);
         let info = if req.is_viewer_private() {
-            self.resolve_info_uncached(did, &|_| true).await.ok()?
+            resolver.resolve_info_uncached(did, &|_| true).await.ok()?
         } else {
-            self.resolve_info(did, ResolveIntent::Lookup).await.ok()?
+            resolver.resolve_info(did, ResolveIntent::Lookup).await.ok()?
         };
-        let handle = self.verify_handle(did, info.claimed_handle.as_deref()).await;
+        let handle = resolver.verify_handle(did, info.claimed_handle.as_deref()).await;
         Some(DidSummary {
             pds: info.pds_endpoint,
             handle,
@@ -230,7 +232,7 @@ impl DidLookup for IdentityResolver {
     }
 
     async fn did_for_handle(&self, req: &Requester, handle: &str) -> Option<String> {
-        self.resolve_handle_with(handle, &|_| true, caches_for(req)).await
+        self.for_request(req).resolve_handle_with(handle, &|_| true, caches_for(req)).await
     }
 }
 
@@ -256,6 +258,10 @@ pub const SUMMARY_CAPACITY: u64 = 100_000;
 ///   (the author of every post in a page) is resolved and charged once.
 /// - With no budget, or past the request's deadline, the answer is `None`
 ///   and nothing is cached.
+/// - Every network call goes through the request's `net` intent
+///   ([`IdentityResolver::for_request`]; design-v4 §11 G-9): a
+///   viewer-private lookup's DNS, well-known and `did:web` fetches go
+///   through the `viewer_private` transport (R3-213).
 #[derive(Clone)]
 pub struct RequestLookup {
     resolver: IdentityResolver,
@@ -278,12 +284,12 @@ impl RequestLookup {
         }
     }
 
-    /// Resolve handles through `txt` and the well-known file, telling "no
-    /// such handle" from "could not find out", with the answers cached.
+    /// Resolve handles through the TXT record and the well-known file of
+    /// the request's transport, telling "no such handle" from "could not
+    /// find out", with the answers cached.
     #[must_use]
-    pub fn with_handle_lookup(mut self, txt: Arc<dyn TxtSource>, cache: HandleCacheSettings) -> Self {
+    pub fn with_handle_lookup(mut self, cache: HandleCacheSettings) -> Self {
         self.handles = Some(Handles {
-            txt,
             found: Cache::builder().max_capacity(cache.capacity).time_to_live(cache.ttl).build(),
             absent: Cache::builder().max_capacity(cache.capacity).time_to_live(cache.negative_ttl).build(),
         });
@@ -309,12 +315,13 @@ impl DidLookup for RequestLookup {
             return None;
         }
         let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
+        let resolver = self.resolver.for_request(req);
         let info = if shared {
-            self.resolver.resolve_info_admitted(did, ResolveIntent::Lookup, &plc).await.ok()?
+            resolver.resolve_info_admitted(did, ResolveIntent::Lookup, &plc).await.ok()?
         } else {
-            self.resolver.resolve_info_uncached(did, &plc).await.ok()?
+            resolver.resolve_info_uncached(did, &plc).await.ok()?
         };
-        let handle = self.resolver.verify_handle(did, info.claimed_handle.as_deref()).await;
+        let handle = resolver.verify_handle(did, info.claimed_handle.as_deref()).await;
         let summary = DidSummary {
             pds: info.pds_endpoint,
             handle,
@@ -330,7 +337,7 @@ impl DidLookup for RequestLookup {
             return None;
         }
         let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
-        self.resolver.resolve_handle_with(handle, &plc, caches_for(req)).await
+        self.resolver.for_request(req).resolve_handle_with(handle, &plc, caches_for(req)).await
     }
 
     async fn handle_outcome(&self, req: &Requester, handle: &str) -> HandleOutcome {
@@ -356,7 +363,7 @@ impl DidLookup for RequestLookup {
             return HandleOutcome::Unavailable;
         }
         let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
-        let outcome = self.resolver.resolve_handle_typed(handles.txt.as_ref(), handle, &plc, caches_for(req)).await;
+        let outcome = self.resolver.for_request(req).resolve_handle_typed(handle, &plc, caches_for(req)).await;
         match &outcome {
             HandleOutcome::Found(did) => {
                 count("network_ok");
@@ -475,7 +482,7 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl crate::identity::resolver::HandleLookup for NoHandles {
-        async fn resolve_handle(&self, _handle: &str) -> Option<String> {
+        async fn resolve_handle(&self, _transport: &crate::net::Transport, _handle: &str) -> Option<String> {
             None
         }
     }
@@ -506,7 +513,7 @@ pub(crate) mod tests {
         }
         let base = crate::test_support::serve_fake(axum::Router::new().route("/{did}", get(plc)).with_state(Arc::clone(&calls))).await;
         let resolver = IdentityResolver::with_handles(
-            crate::net::NetClient::loopback_for_tests(),
+            crate::net::Transports::loopback_for_tests(),
             db.pool.clone(),
             crate::identity::IdentitySettings {
                 plc_url: base,
@@ -515,6 +522,7 @@ pub(crate) mod tests {
             },
             Arc::new(NeverPersist),
             Arc::new(NoHandles),
+            crate::net::Intent::Public,
         );
         // Identity share: burst 3. PLC: burst 2, so one token per pool.
         let lookup = RequestLookup::new(
@@ -559,6 +567,110 @@ pub(crate) mod tests {
         assert!(lookup.summary(&late, b).await.is_none());
         assert!(!late.spent());
         assert!(lookup.summary(&late, a).await.is_some(), "a cached summary is still served");
+        db.drop_db().await;
+    }
+
+    /// A resolver that records the names asked of it and names `did` for
+    /// every one.
+    struct RecordingTxt {
+        did: &'static str,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl RecordingTxt {
+        fn new(did: &'static str) -> Arc<Self> {
+            Arc::new(Self { did, asked: Mutex::new(Vec::new()) })
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.lock().expect("asked").len()
+        }
+    }
+
+    #[async_trait]
+    impl crate::net::TxtSource for RecordingTxt {
+        async fn txt(&self, name: &str) -> crate::net::resolver::TxtAnswer {
+            self.asked.lock().expect("asked").push(name.to_string());
+            crate::net::resolver::TxtAnswer::Records(vec![format!("did={}", self.did)])
+        }
+    }
+
+    /// B-53 "Transport" and B-54 (design-v4 §8.1, §11 G-9; R3-168, R3-213),
+    /// in-crate: a viewer-private handle resolution and summary ask DNS only
+    /// through the `viewer_private` resolver, never the public one, and
+    /// keep nothing for the next lookup; PLC, a fixed upstream, is asked
+    /// through the public client. A public lookup of the same handle uses
+    /// the public resolver.
+    #[tokio::test]
+    async fn viewer_private_lookups_use_only_the_viewer_private_resolver() {
+        use axum::extract::{Path, State};
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+
+        use crate::net::client::test_user_agent;
+        use crate::net::{Intent, Transports};
+
+        const T: &str = "did:plc:tttttttttttttttttttttttt";
+        const HANDLE: &str = "t.example.com";
+        type Agents = Arc<Mutex<Vec<String>>>;
+
+        let Some(db) = crate::test_support::fresh_db("viewer_private_lookups_resolver").await else {
+            return;
+        };
+        async fn plc(State(agents): State<Agents>, headers: HeaderMap, Path(did): Path<String>) -> axum::Json<serde_json::Value> {
+            let agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+            agents.lock().expect("agents").push(agent);
+            axum::Json(serde_json::json!({
+                "id": did,
+                "alsoKnownAs": [format!("at://{HANDLE}")],
+                "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://pds.example.com"}],
+            }))
+        }
+        let agents = Agents::default();
+        let base = crate::test_support::serve_fake(axum::Router::new().route("/{did}", get(plc)).with_state(Arc::clone(&agents))).await;
+        let (public_dns, private_dns) = (RecordingTxt::new(T), RecordingTxt::new(T));
+        let nets = Transports::loopback_for_tests()
+            .with_dns_for_tests(Intent::Public, Arc::clone(&public_dns) as Arc<dyn crate::net::TxtSource>)
+            .with_dns_for_tests(Intent::ViewerPrivate, Arc::clone(&private_dns) as Arc<dyn crate::net::TxtSource>);
+        let resolver = IdentityResolver::new(
+            nets,
+            db.pool.clone(),
+            crate::identity::IdentitySettings {
+                plc_url: base,
+                fresh: Duration::from_secs(3600),
+                stale_max: Duration::from_secs(86_400),
+            },
+            Arc::new(NeverPersist),
+            Intent::Public,
+        );
+        let lookup = RequestLookup::new(
+            resolver,
+            RequesterLimit::new("identity", 1000.0, 1000, 1000),
+            crate::xrpc::pools::Shares::for_tests().bucket("plc", 1000.0, 1000),
+        )
+        .with_handle_lookup(HandleCacheSettings {
+            capacity: 100,
+            ttl: Duration::from_secs(300),
+            negative_ttl: Duration::from_secs(60),
+        });
+        let public = Requester::test();
+        let private = public.viewer_private("did:plc:vvvvvvvvvvvvvvvvvvvvvvvv");
+
+        // Twice: nothing a viewer-private lookup did is kept for the next.
+        for round in 1..=2 {
+            assert_eq!(lookup.handle_outcome(&private, HANDLE).await, HandleOutcome::Found(T.to_string()));
+            assert_eq!(private_dns.asked(), round);
+        }
+        let summary = lookup.summary(&private, T).await.expect("summary");
+        assert_eq!(summary.handle.as_deref(), Some(HANDLE));
+        assert_eq!(private_dns.asked(), 3, "the handle check of the summary asks the viewer_private resolver");
+        assert_eq!(public_dns.asked(), 0, "a viewer-private lookup never asks the public resolver");
+        let public_agent = test_user_agent(Intent::Public);
+        assert_eq!(*agents.lock().expect("agents"), vec![public_agent.clone(); 3], "PLC is asked through the public client");
+
+        // The same handle for an ordinary request: the public resolver.
+        assert_eq!(lookup.handle_outcome(&public, HANDLE).await, HandleOutcome::Found(T.to_string()));
+        assert_eq!((public_dns.asked(), private_dns.asked()), (1, 3));
         db.drop_db().await;
     }
 

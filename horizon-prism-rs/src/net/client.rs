@@ -1,7 +1,8 @@
-//! The one outbound HTTP client (design-v2 §8.5).
+//! The outbound HTTP client (design-v2 §8.5; design-v4 §II-8.5).
 //!
 //! Every outbound call (AppViews, PDSes, PLC, did:web, Slingshot, Constellation)
-//! goes through [`NetClient`]:
+//! goes through a [`NetClient`] of one [`Intent`] (design-v4 §11 G-9; built
+//! as a set by [`super::Transports`]):
 //! - `https` only, except the configured `identity.plc_url` origin when it is
 //!   plain `http` (a test PLC);
 //! - DNS answers pass the SSRF guard, and IP-literal hosts are checked directly;
@@ -25,7 +26,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::{Host, Url};
 
-use super::resolver::{AllAddressesBlocked, GuardedResolver, HickoryLookup, HostLookup, is_blocked};
+use super::resolver::{AllAddressesBlocked, GuardedResolver, HostLookup, is_blocked};
 use crate::config::AppConfig;
 
 /// Redirects followed per call (§8.5).
@@ -34,6 +35,38 @@ pub const MAX_REDIRECTS: usize = 3;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Default total timeout per call (§8.3).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Whose work an outbound call does (design-v4 §11 G-9 "Transport"; R3-168,
+/// R3-213). Each intent has its own client, connection pool and DNS
+/// resolver, so one intent's work leaves no in-process state another can
+/// time. The fourth intent, `service_proxy`, is a type of its own
+/// ([`super::service_proxy::ServiceProxyClient`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Intent {
+    /// Public request handlers: actor-parameter resolution, `resolveHandle`,
+    /// cascade calls, PDS fallbacks, the auth middleware's issuer lookups
+    /// and the background profile refresh.
+    Public,
+    /// Background work and the private tier: backfill, `authz`, identity
+    /// refresh, `list_sync`, the private handlers and pipeline, the prober.
+    Internal,
+    /// Viewer-private fetches (§8.1) to hosts the subject names: handle DNS
+    /// and well-known files, `did:web` documents, subject PDSes. It keeps no
+    /// reusable state: no DNS cache, no idle connection, no TLS session.
+    ViewerPrivate,
+}
+
+impl Intent {
+    /// The intent's name, as the design writes it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+            Self::ViewerPrivate => "viewer_private",
+        }
+    }
+}
 
 /// A response-body size cap (§8.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +134,14 @@ pub fn user_agent(public_hostname: &str) -> String {
         "horizon-prism-rs/{} (+https://{public_hostname})",
         env!("CARGO_PKG_VERSION")
     )
+}
+
+/// The `User-Agent` of [`NetClient::loopback_for_tests_as`]'s client of
+/// `intent`, which a fake upstream records to tell which client called.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn test_user_agent(intent: Intent) -> String {
+    format!("prism-test/{}", intent.as_str())
 }
 
 /// Outbound call failures.
@@ -293,30 +334,41 @@ impl UrlPolicy {
     }
 }
 
-/// The shared, SSRF-guarded HTTP client. Cheap to clone.
+/// The SSRF-guarded HTTP client of one [`Intent`]. Cheap to clone; clones
+/// share the connection pool.
 #[derive(Debug, Clone)]
 pub struct NetClient {
     http: reqwest::Client,
     policy: UrlPolicy,
+    intent: Intent,
+}
+
+/// TLS for the `viewer_private` intent (design-v4 §8.1, R3-213): reqwest's
+/// own settings (ring, the webpki roots, HTTP/1.1), with session resumption
+/// disabled, so no ticket or session ID outlives its connection.
+fn no_resumption_tls() -> Result<rustls::ClientConfig, NetError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| NetError::Build(e.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.resumption = rustls::client::Resumption::disabled();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(tls)
 }
 
 impl NetClient {
-    /// Build the client with the system DNS configuration.
-    ///
-    /// # Errors
-    ///
-    /// [`NetError::Build`] when DNS configuration or TLS setup fails.
-    pub fn new(config: &NetConfig) -> Result<Self, NetError> {
-        let lookup = HickoryLookup::from_system().map_err(|e| NetError::Build(e.to_string()))?;
-        Self::with_lookup(config, lookup)
-    }
-
-    /// Build the client with a specific DNS backend.
+    /// Build the client of `intent` over a specific DNS backend. The
+    /// `viewer_private` client keeps no idle connection and resumes no TLS
+    /// session (design-v4 §8.1); its lookup must keep no answers either
+    /// ([`super::Transports`] builds it so).
     ///
     /// # Errors
     ///
     /// [`NetError::Build`] when TLS setup fails.
-    pub fn with_lookup<L: HostLookup>(config: &NetConfig, lookup: L) -> Result<Self, NetError> {
+    pub fn with_lookup<L: HostLookup>(config: &NetConfig, intent: Intent, lookup: L) -> Result<Self, NetError> {
         let policy = UrlPolicy {
             http_allowed_origins: Arc::new(config.http_allowed_origins.clone()),
             allow_loopback: false,
@@ -336,8 +388,12 @@ impl NetClient {
                 }
             })
         };
-        let http = reqwest::Client::builder()
-            .use_rustls_tls()
+        let builder = reqwest::Client::builder();
+        let builder = match intent {
+            Intent::ViewerPrivate => builder.use_preconfigured_tls(no_resumption_tls()?).pool_max_idle_per_host(0),
+            Intent::Public | Intent::Internal => builder.use_rustls_tls(),
+        };
+        let http = builder
             .no_proxy()
             .dns_resolver(Arc::new(GuardedResolver::new(lookup)))
             .redirect(redirect_policy)
@@ -345,11 +401,18 @@ impl NetClient {
             .user_agent(config.user_agent.clone())
             .build()
             .map_err(|e| NetError::Build(e.to_string()))?;
-        Ok(Self { http, policy })
+        Ok(Self { http, policy, intent })
+    }
+
+    /// The intent this client serves.
+    #[must_use]
+    pub fn intent(&self) -> Intent {
+        self.intent
     }
 
     /// Test-only client for fake upstreams on `http://127.0.0.1:<port>`: no
-    /// scheme or address guard, but the same timeouts and body caps.
+    /// scheme or address guard, but the same timeouts and body caps. It is
+    /// a `public` client.
     #[cfg(test)]
     pub(crate) fn loopback_for_tests() -> Self {
         let http = reqwest::Client::builder()
@@ -363,6 +426,39 @@ impl NetClient {
                 http_allowed_origins: Arc::new(Vec::new()),
                 allow_loopback: true,
             },
+            intent: Intent::Public,
+        }
+    }
+
+    /// Test-only loopback client of `intent`, telling its calls apart by
+    /// its `User-Agent` ([`test_user_agent`]). Every hostname resolves to
+    /// 127.0.0.1, so a subject-named host is reached (and refused) locally.
+    #[cfg(test)]
+    pub(crate) fn loopback_for_tests_as(intent: Intent) -> Self {
+        struct Loopback;
+        impl reqwest::dns::Resolve for Loopback {
+            fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async {
+                    let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
+                    Ok::<_, super::resolver::BoxError>(addrs)
+                })
+            }
+        }
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(Loopback))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(test_user_agent(intent));
+        if intent == Intent::ViewerPrivate {
+            builder = builder.pool_max_idle_per_host(0);
+        }
+        Self {
+            http: builder.build().expect("test client"),
+            policy: UrlPolicy {
+                http_allowed_origins: Arc::new(Vec::new()),
+                allow_loopback: true,
+            },
+            intent,
         }
     }
 
@@ -500,8 +596,27 @@ mod tests {
     }
 
     fn client(plc_url: &str) -> NetClient {
-        NetClient::with_lookup(&NetConfig::new("appview.example.com", plc_url), NoDns)
+        NetClient::with_lookup(&NetConfig::new("appview.example.com", plc_url), Intent::Public, NoDns)
             .expect("client builds")
+    }
+
+    /// Every intent builds, the `viewer_private` one with its own TLS
+    /// configuration, and each says which it is.
+    #[test]
+    fn every_intent_builds_and_names_itself() {
+        let config = NetConfig::new("appview.example.com", "https://plc.directory");
+        for intent in [Intent::Public, Intent::Internal, Intent::ViewerPrivate] {
+            let c = NetClient::with_lookup(&config, intent, NoDns).expect("client builds");
+            assert_eq!(c.intent(), intent);
+        }
+        let tls = no_resumption_tls().expect("tls");
+        let resumption = format!("{:?}", tls.resumption);
+        assert!(resumption.contains("NoClientSessionStorage") && resumption.contains("Disabled"), "{resumption}");
+        assert_eq!(tls.alpn_protocols, [b"http/1.1".to_vec()]);
+        assert_eq!(
+            [Intent::Public, Intent::Internal, Intent::ViewerPrivate].map(Intent::as_str),
+            ["public", "internal", "viewer_private"]
+        );
     }
 
     #[test]
@@ -623,7 +738,7 @@ mod tests {
     /// blocked literal, not a connect error (B-81).
     #[tokio::test]
     async fn a_hostname_the_guard_refuses_is_a_blocked_address() {
-        let c = NetClient::with_lookup(&NetConfig::new("appview.example.com", "https://plc.directory"), PrivateDns)
+        let c = NetClient::with_lookup(&NetConfig::new("appview.example.com", "https://plc.directory"), Intent::Public, PrivateDns)
             .expect("client builds");
         let err = c
             .get("https://internal.example/x", &RequestOptions::new(BodyCap::GET_RECORD))

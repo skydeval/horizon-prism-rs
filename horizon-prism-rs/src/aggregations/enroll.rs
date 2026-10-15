@@ -24,7 +24,7 @@ use super::membership::{AddOutcome, add_member};
 use crate::config::AppConfig;
 use crate::identity::refresher::RepoStatus;
 use crate::identity::{IdentityResolver, ResolveIntent};
-use crate::net::{BodyCap, NetClient, RequestOptions};
+use crate::net::{BodyCap, Intent, NetClient, RequestOptions};
 use crate::private_tier::PrivateTier;
 use crate::subscriptions::references::Budget;
 
@@ -64,15 +64,13 @@ pub struct AutoEnroller {
 }
 
 impl AutoEnroller {
+    /// The enroller. Enrolment runs inside a member's public request, so
+    /// its DID resolution and `getRepoStatus` go through the public intent,
+    /// whatever `resolver` was built with (design-v4 §11 G-9).
     #[must_use]
-    pub fn new(
-        cfg: &AppConfig,
-        pool: PgPool,
-        scope: ScopeState,
-        private: Arc<dyn PrivateTier>,
-        resolver: IdentityResolver,
-        net: NetClient,
-    ) -> Self {
+    pub fn new(cfg: &AppConfig, pool: PgPool, scope: ScopeState, private: Arc<dyn PrivateTier>, resolver: IdentityResolver) -> Self {
+        let resolver = resolver.with_intent(Intent::Public);
+        let net = resolver.net().clone();
         let c = &cfg.file.community;
         let patterns = if c.enroll_pds_patterns.is_empty() {
             cfg.file

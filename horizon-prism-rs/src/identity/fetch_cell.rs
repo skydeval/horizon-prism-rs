@@ -199,10 +199,13 @@ pub struct GuardedDidFetcher {
 }
 
 impl GuardedDidFetcher {
+    /// The fetcher. JWT issuer resolution is the auth middleware's, a public
+    /// path (design-v4 §11 G-9; R3-167): its fetches go through the public
+    /// intent, whatever `resolver` was built with.
     #[must_use]
     pub fn new(resolver: IdentityResolver, cell: JwtFetchCell) -> Self {
         Self {
-            resolver,
+            resolver: resolver.with_intent(crate::net::Intent::Public),
             cell,
             budget: None,
         }

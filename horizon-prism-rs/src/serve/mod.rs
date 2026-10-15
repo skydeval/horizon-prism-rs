@@ -1,6 +1,11 @@
 //! `serve` (design-v2 §3.3): configuration, the migration gate, the shared
-//! `PgPool` / Redis / `NetClient` / `IdentityResolver` / `ScopeState`, the
-//! background tasks, and the HTTP listener.
+//! `PgPool` / Redis / `net` transports / `IdentityResolver` / `ScopeState`,
+//! the background tasks, and the HTTP listener.
+//!
+//! Every `net` user is given its intent here (design-v4 §11 G-9): request
+//! paths the public transport (or, for subject-named hosts, the transport
+//! of the request's mode, through `Transports::for_request`), background
+//! work and the private tier the internal one.
 //!
 //! HTTP: the `app.bsky.*` surface (§7.1), the `app.nearhorizon.private.*`
 //! endpoints (§7.9), Thread Lens (§10), `resolveDid` (§8.7), `requestRecord` (§5.9),
@@ -35,7 +40,7 @@ use crate::identity::fetch_cell::AuthBudget;
 use crate::indexing::{PublicIndexing, PublicModeSettings};
 use crate::identity::{IdentityRefresher, IdentityResolver, IdentitySettings, PersistencePolicy};
 use crate::microcosm::ConstellationClient;
-use crate::net::{NetClient, NetConfig};
+use crate::net::{Intent, NetConfig, Transports};
 use crate::aggregations::enroll::AutoEnroller;
 use crate::constellation::resolve_did::ResolveDidState;
 use crate::constellation::{Cascade, DidLookup, RequestLookup, Router as DidRouter, RoutingTable};
@@ -155,7 +160,12 @@ pub async fn run() -> Result<(), StartupError> {
     }
     let redis = redis_manager(&cfg.env.redis_url).await?;
     let consumer_redis = redis_manager(&cfg.env.redis_url).await?;
-    let net = NetClient::new(&NetConfig::from_app(&cfg)).map_err(|e| StartupError::new(1, format!("net client: {e}")))?;
+    // The three `net` transports (design-v4 §II-8.5), and what the startup
+    // warning says of the internal resolver (§11 G-9 "Upstream DNS").
+    let nets = Transports::new(&NetConfig::from_app(&cfg), &cfg.file.net).map_err(|e| StartupError::new(1, format!("net client: {e}")))?;
+    for warning in crate::net::transport::warnings(&cfg.file.net) {
+        tracing::warn!(event = "net_nameservers_config", %warning, "internal lookups may be visible to others who query the same resolver");
+    }
 
     let private: Arc<dyn PrivateTier> = Arc::new(KryphocronPrivateTier);
     let scope = ScopeState::load(
@@ -175,7 +185,8 @@ pub async fn run() -> Result<(), StartupError> {
         .await
         .map_err(|e| StartupError::new(1, format!("public indexing startup: {e}")))?;
     let policy: Arc<dyn PersistencePolicy> = Arc::new(scope.clone());
-    let resolver = IdentityResolver::new(net.clone(), pool.clone(), IdentitySettings::from_app(&cfg), policy);
+    // Internal by default; each request-path user takes its own view.
+    let resolver = IdentityResolver::new(nets.clone(), pool.clone(), IdentitySettings::from_app(&cfg), policy, Intent::Internal);
     // Rule 4 (§4.3): the applier runs list phases and releases.
     let applier = Applier::new(pool.clone(), scope.clone(), cfg.file.lists.sync_min_interval_secs);
     // The storage bound for the member count now (§4.7.6); the storage
@@ -203,7 +214,9 @@ pub async fn run() -> Result<(), StartupError> {
     let purger = Purger::new(pool.clone(), scope.clone(), Arc::clone(&private))
         .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
         .with_applier(applier.clone());
-    let constellation = ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url);
+    // Constellation for background work: backfill, the count refresher and
+    // the starter-pack counts.
+    let constellation = ConstellationClient::new(nets.internal().client().clone(), &cfg.file.microcosm.constellation_url);
 
     let mut tasks = Vec::new();
     if let Some(task) = public_task {
@@ -226,7 +239,7 @@ pub async fn run() -> Result<(), StartupError> {
     // The block-list index (design-v3 §5.14), only when configured.
     let farsight = match (&cfg.file.farsight.url, &cfg.env.farsight_token) {
         (Some(url), Some(token)) => {
-            let client = crate::farsight::FarsightClient::new(net.clone(), url, token.expose())
+            let client = crate::farsight::FarsightClient::new(&nets, url, token.expose())
                 .ok_or_else(|| StartupError::new(78, "FARSIGHT_TOKEN is not a usable header value".to_string()))?;
             tracing::info!(event = "farsight_enabled", "inbound list blocks are read from Farsight");
             let farsight = crate::farsight::Farsight::new(client, &cfg.file.farsight, &shares);
@@ -240,7 +253,7 @@ pub async fn run() -> Result<(), StartupError> {
                     &network.name,
                     &network.appview_url,
                     crate::appview_clients::AppViewAuth::Unauth,
-                    net.clone(),
+                    nets.public().client().clone(),
                 );
                 farsight.enable_fallback(upstream, fallback, &shares);
                 tracing::warn!(
@@ -294,7 +307,7 @@ pub async fn run() -> Result<(), StartupError> {
         slice: issuer_slice,
         members: member_keys.clone(),
     };
-    let (glue, issuer_drainer) = GlueContext::new(&cfg, resolver.clone(), auth_budget)
+    let (glue, issuer_drainer) = GlueContext::new(&cfg, resolver.with_intent(Intent::Public), auth_budget)
         .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
     tasks.push(issuer_drainer);
 
@@ -450,7 +463,7 @@ pub async fn run() -> Result<(), StartupError> {
         pool.clone(),
         scope.clone(),
         Arc::clone(&private),
-        Arc::new(NetHeadSource::new(net.clone())),
+        Arc::new(NetHeadSource::new(&nets)),
         budgets.clone(),
         cfg.file.sync.clone(),
     );
@@ -485,10 +498,9 @@ pub async fn run() -> Result<(), StartupError> {
     // Request-path identity work: one token of the requester's identity
     // share per DID or handle, and PLC's request bucket per PLC fetch.
     // `resolveHandle` asks DNS for the handle's TXT record itself, to tell
-    // "no such handle" from a lookup that failed (design-v3 §5.11).
-    let handle_dns = crate::net::HickoryLookup::from_system().map_err(|e| StartupError::new(1, format!("dns resolver: {e}")))?;
-    let lookup = RequestLookup::new(resolver.clone(), identity_share, plc_bucket).with_handle_lookup(
-        Arc::new(handle_dns),
+    // "no such handle" from a lookup that failed (design-v3 §5.11). Every
+    // lookup goes through the transport of the request's mode.
+    let lookup = RequestLookup::new(resolver.with_intent(Intent::Public), identity_share, plc_bucket).with_handle_lookup(
         crate::constellation::routing::HandleCacheSettings {
             capacity: cfg.file.identity.resolve_handle_cache_max,
             ttl: Duration::from_secs(cfg.file.identity.resolve_handle_ttl_secs),
@@ -498,7 +510,7 @@ pub async fn run() -> Result<(), StartupError> {
     let did_router = DidRouter::new(Arc::clone(&table), Arc::new(lookup) as Arc<dyn DidLookup>);
     let cascade = Cascade::new(
         Arc::clone(&table),
-        crate::appview_clients::from_config(&cfg.file.constellation, &net, &glue.service_key),
+        crate::appview_clients::from_config(&cfg.file.constellation, nets.public().client(), &glue.service_key),
         &shares,
     );
     let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes).with_private(crate::hydration::cache::PrivateCacheSettings {
@@ -506,7 +518,7 @@ pub async fn run() -> Result<(), StartupError> {
         max_entries: cfg.file.cache.viewer_private_max,
         per_viewer_max: usize::try_from(cfg.file.cache.viewer_private_per_viewer_max).unwrap_or(usize::MAX),
     });
-    let slingshot = SlingshotClient::new(net.clone(), &microcosm.slingshot_url).metered(shares.bucket(
+    let slingshot = SlingshotClient::new(nets.public().client().clone(), &microcosm.slingshot_url).metered(shares.bucket(
         "slingshot",
         microcosm.slingshot_rate_per_sec.0,
         microcosm.slingshot_burst,
@@ -516,7 +528,7 @@ pub async fn run() -> Result<(), StartupError> {
         cascade.clone(),
         slingshot.clone(),
         PdsLister::new(
-            net.clone(),
+            nets.clone(),
             HostBuckets::new(
                 &shares,
                 cfg.file.sync.public_fallback_rate_per_host.0,
@@ -532,7 +544,7 @@ pub async fn run() -> Result<(), StartupError> {
     let hydrator = Hydrator::new(
         pool.clone(),
         scope.clone(),
-        Some(ConstellationClient::new(net.clone(), &cfg.file.microcosm.constellation_url)),
+        Some(ConstellationClient::new(nets.public().client().clone(), &cfg.file.microcosm.constellation_url)),
         Some(redis.clone()),
         Arc::new(upstream),
         read_cache.clone(),
@@ -604,8 +616,7 @@ pub async fn run() -> Result<(), StartupError> {
             pool.clone(),
             scope.clone(),
             Arc::clone(&private),
-            resolver.clone(),
-            net.clone(),
+            resolver.with_intent(Intent::Public),
         )),
         trusted_proxy: cfg.file.http.trusted_proxy,
         did_document: Arc::new(glue.service_key.did_document()),

@@ -1754,7 +1754,7 @@ pub(crate) mod tests {
         let fake = Arc::new(Fake::default());
         let base = serve_fake(Router::new().route(CHECK_BLOCKS_PATH, get(answer)).with_state(Arc::clone(&fake))).await;
         let cfg = crate::config::FileConfig::parse(&format!("[farsight]\n{toml}")).expect("parse").farsight;
-        let client = FarsightClient::new(NetClient::loopback_for_tests(), &base, "fsk_test").expect("client");
+        let client = FarsightClient::new(&crate::net::Transports::loopback_for_tests(), &base, "fsk_test").expect("client");
         (Farsight::new(client, &cfg, &Shares::for_tests()), fake)
     }
 
@@ -2205,7 +2205,7 @@ pub(crate) mod tests {
         );
         let base = serve_fake(app).await;
         let cfg = crate::config::FarsightConfig::default();
-        let client = FarsightClient::new(NetClient::loopback_for_tests(), &base, "fsk_test").expect("client");
+        let client = FarsightClient::new(&crate::net::Transports::loopback_for_tests(), &base, "fsk_test").expect("client");
         let farsight = Farsight::new(client, &cfg, &Shares::for_tests());
         assert!(farsight.prime_on_enroll());
         assert_eq!(farsight.prime(A, false).await, Ok(()));

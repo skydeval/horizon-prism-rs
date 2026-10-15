@@ -6,22 +6,28 @@
 //! - The PDS is the service `#atproto_pds` of type `AtprotoPersonalDataServer`.
 //! - Handles are verified bidirectionally: the handle must resolve back to the
 //!   DID, otherwise it is not used.
+//! - Every network call goes through the transport of the resolver's `net`
+//!   intent (design-v4 §11 G-9): handle DNS and well-known files, `did:web`
+//!   documents and PLC. A request path takes the intent from its request
+//!   ([`IdentityResolver::for_request`]); a background job pins its own
+//!   ([`IdentityResolver::with_intent`]). The one substitution: a
+//!   viewer-private PLC fetch uses the public client, as PLC's host is the
+//!   same for every subject (§8.1).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use proto_blue::common::fetch::{FetchError, FetchHandler, HttpMethod, HttpRequest, HttpResponse};
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 
 use super::cache::{CachedDoc, DidCache, Freshness};
+use super::handle_lookup::{HandleProbe, candidate};
 use super::{IdentityError, IdentitySettings, PersistencePolicy, ResolveIntent, should_persist};
-use crate::net::{BodyCap, NetClient, RequestOptions};
+use crate::net::{BodyCap, FetchMode, Intent, NetClient, RequestOptions, Transport, Transports};
 
 /// PDS service id fragment (§6.7).
 pub const PDS_SERVICE_ID: &str = "#atproto_pds";
@@ -29,10 +35,6 @@ pub const PDS_SERVICE_ID: &str = "#atproto_pds";
 pub const PDS_SERVICE_TYPE: &str = "AtprotoPersonalDataServer";
 /// Concurrent background refreshes of stale rows.
 pub const BACKGROUND_REFRESH_PERMITS: usize = 8;
-/// Handle resolution timeout.
-pub const HANDLE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Cap for `/.well-known/atproto-did` bodies.
-pub const HANDLE_BODY_CAP: BodyCap = BodyCap(64 * 1024);
 
 /// Whether a request-path lookup may use the document caches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,52 +195,27 @@ impl FetchedDoc {
     }
 }
 
-/// Resolves handles to DIDs.
+/// Resolves handles to DIDs, through the transport it is given.
 #[async_trait]
 pub trait HandleLookup: Send + Sync {
-    async fn resolve_handle(&self, handle: &str) -> Option<String>;
+    async fn resolve_handle(&self, transport: &Transport, handle: &str) -> Option<String>;
 }
 
-/// proto-blue `HandleResolver` (DNS TXT and HTTPS), with the HTTPS path
-/// carried by `net`.
-struct ProtoBlueHandles(proto_blue::identity::HandleResolver);
+/// The `_atproto` TXT record and the well-known file, both asked through
+/// the caller's transport (its resolver and its client). The TXT record
+/// wins when both name a DID, as in the reference resolver.
+struct ProbeHandles;
 
 #[async_trait]
-impl HandleLookup for ProtoBlueHandles {
-    async fn resolve_handle(&self, handle: &str) -> Option<String> {
-        self.0.resolve(handle).await.ok().flatten()
-    }
-}
-
-/// proto-blue fetch backend over the SSRF-guarded client.
-struct NetFetchHandler(NetClient);
-
-#[async_trait]
-impl FetchHandler for NetFetchHandler {
-    async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse, FetchError> {
-        if req.method != HttpMethod::Get {
-            return Err(FetchError::Other("only GET is supported".to_string()));
-        }
-        let options = RequestOptions::new(HANDLE_BODY_CAP).timeout(HANDLE_TIMEOUT);
-        let response = self
-            .0
-            .get(&req.url, &options)
-            .await
-            .map_err(|e| FetchError::Network(e.to_string()))?;
-        let mut headers = BTreeMap::new();
-        if let Some(ct) = response.content_type {
-            headers.insert("content-type".to_string(), ct);
-        }
-        Ok(HttpResponse {
-            status: response.status.as_u16(),
-            headers,
-            body: response.body,
-        })
+impl HandleLookup for ProbeHandles {
+    async fn resolve_handle(&self, transport: &Transport, handle: &str) -> Option<String> {
+        let (txt, well_known) = HandleProbe::through(transport).run(handle).await;
+        candidate(&txt, &well_known).map(str::to_string)
     }
 }
 
 struct Inner {
-    net: NetClient,
+    nets: Transports,
     cache: DidCache,
     settings: IdentitySettings,
     policy: Arc<dyn PersistencePolicy>,
@@ -247,42 +224,41 @@ struct Inner {
     refresh_permits: Arc<Semaphore>,
 }
 
-/// The cached DID resolver. Cheap to clone.
+/// The cached DID resolver, making its network calls through one `net`
+/// intent. Cheap to clone; every intent's view shares the caches.
 #[derive(Clone)]
 pub struct IdentityResolver {
     inner: Arc<Inner>,
+    intent: Intent,
 }
 
 impl IdentityResolver {
+    /// A resolver over `nets`, making its calls as `intent`.
     #[must_use]
     pub fn new(
-        net: NetClient,
+        nets: Transports,
         pool: PgPool,
         settings: IdentitySettings,
         policy: Arc<dyn PersistencePolicy>,
+        intent: Intent,
     ) -> Self {
-        let handles = Arc::new(ProtoBlueHandles(
-            proto_blue::identity::HandleResolver::with_fetch_handler(
-                u64::try_from(HANDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
-                Arc::new(NetFetchHandler(net.clone())),
-            ),
-        ));
-        Self::with_handles(net, pool, settings, policy, handles)
+        Self::with_handles(nets, pool, settings, policy, Arc::new(ProbeHandles), intent)
     }
 
     /// Construct with a specific handle backend.
     #[must_use]
     pub fn with_handles(
-        net: NetClient,
+        nets: Transports,
         pool: PgPool,
         settings: IdentitySettings,
         policy: Arc<dyn PersistencePolicy>,
         handles: Arc<dyn HandleLookup>,
+        intent: Intent,
     ) -> Self {
         let cache = DidCache::new(pool, settings.clone());
         Self {
             inner: Arc::new(Inner {
-                net,
+                nets,
                 cache,
                 settings,
                 policy,
@@ -290,7 +266,37 @@ impl IdentityResolver {
                 refreshing: Mutex::new(HashSet::new()),
                 refresh_permits: Arc::new(Semaphore::new(BACKGROUND_REFRESH_PERMITS)),
             }),
+            intent,
         }
+    }
+
+    /// This resolver, making its network calls as `intent` (design-v4
+    /// §11 G-9). The caches are the same.
+    #[must_use]
+    pub fn with_intent(&self, intent: Intent) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            intent,
+        }
+    }
+
+    /// This resolver for a fetch made for `req`: the intent is the
+    /// request's ([`crate::net::Transports::for_request`]), whatever this
+    /// one's is, so a viewer-private lookup never goes through the public
+    /// transport (design-v4 §8.1, R3-213).
+    #[must_use]
+    pub fn for_request(&self, req: &impl FetchMode) -> Self {
+        self.with_intent(req.intent())
+    }
+
+    /// The intent of this resolver's network calls.
+    #[must_use]
+    pub fn intent(&self) -> Intent {
+        self.intent
+    }
+
+    fn transport(&self) -> &Transport {
+        self.inner.nets.get(self.intent)
     }
 
     #[must_use]
@@ -298,9 +304,20 @@ impl IdentityResolver {
         &self.inner.cache
     }
 
+    /// The HTTP client of this resolver's intent.
     #[must_use]
     pub fn net(&self) -> &NetClient {
-        &self.inner.net
+        self.transport().client()
+    }
+
+    /// The client a document of `target` is fetched with: this resolver's,
+    /// except that a viewer-private PLC fetch uses the public client, as
+    /// PLC is a fixed upstream (design-v4 §8.1).
+    fn document_client(&self, target: &DidTarget) -> &NetClient {
+        match (self.intent, target) {
+            (Intent::ViewerPrivate, DidTarget::Plc) => self.inner.nets.public().client(),
+            _ => self.net(),
+        }
     }
 
     /// Fetch `did`'s document from the network, bypassing every cache.
@@ -314,8 +331,7 @@ impl IdentityResolver {
         let target = parse_did(did)?;
         let url = document_url(did, &target, &self.inner.settings.plc_url);
         let response = self
-            .inner
-            .net
+            .document_client(&target)
             .get(&url, &RequestOptions::new(BodyCap::DID_DOCUMENT))
             .await?;
         match response.status {
@@ -486,7 +502,7 @@ impl IdentityResolver {
     /// under `caches`.
     pub async fn resolve_handle_with(&self, handle: &str, admit: &(dyn Fn(&str) -> bool + Sync), caches: Caches) -> Option<String> {
         let handle = handle.trim().trim_start_matches('@').to_ascii_lowercase();
-        let did = self.inner.handles.resolve_handle(&handle).await?;
+        let did = self.inner.handles.resolve_handle(self.transport(), &handle).await?;
         let info = self.info_with(&did, admit, caches).await.ok()?;
         verify_bidirectional(&did, info.claimed_handle.as_deref(), Some(&did)).filter(|h| h.eq_ignore_ascii_case(&handle))?;
         Some(did)
@@ -494,21 +510,20 @@ impl IdentityResolver {
 
     /// The DID of `handle` with the reason kept when there is none
     /// (design-v3 §5.11): the TXT record and the well-known file are both
-    /// asked, a DID found is verified against its document, and "no such
-    /// handle" is told apart from "could not find out". `admit` as in
+    /// asked, through this resolver's transport, a DID found is verified
+    /// against its document, and "no such handle" is told apart from
+    /// "could not find out". `admit` as in
     /// [`IdentityResolver::resolve_admitted`]; the document is read under
     /// `caches`.
     pub async fn resolve_handle_typed(
         &self,
-        txt: &dyn super::handle_lookup::TxtSource,
         handle: &str,
         admit: &(dyn Fn(&str) -> bool + Sync),
         caches: Caches,
     ) -> super::handle_lookup::HandleOutcome {
-        use super::handle_lookup::{HandleOutcome, HandleProbe, Step, candidate, neither_found};
+        use super::handle_lookup::{HandleOutcome, Step, neither_found};
 
-        let probe = HandleProbe { txt, net: &self.inner.net };
-        let (from_txt, from_file) = probe.run(handle).await;
+        let (from_txt, from_file) = HandleProbe::through(self.transport()).run(handle).await;
         let Some(did) = candidate(&from_txt, &from_file) else {
             return match neither_found(&from_txt, &from_file) {
                 Step::Confirmed => HandleOutcome::NotFound,
@@ -529,7 +544,7 @@ impl IdentityResolver {
     /// The verified handle for `did`, or `None`.
     pub async fn verify_handle(&self, did: &str, claimed: Option<&str>) -> Option<String> {
         let claimed = claimed?;
-        let resolved = self.inner.handles.resolve_handle(claimed).await;
+        let resolved = self.inner.handles.resolve_handle(self.transport(), claimed).await;
         verify_bidirectional(did, Some(claimed), resolved.as_deref())
     }
 
@@ -678,6 +693,51 @@ mod tests {
         check_document_id(&json!({"id": PLC}), PLC).expect("matches");
         assert!(check_document_id(&json!({"id": "did:plc:other"}), PLC).is_err());
         assert!(check_document_id(&json!({}), PLC).is_err());
+    }
+
+    struct NeverPersist;
+
+    impl PersistencePolicy for NeverPersist {
+        fn in_persistence_set(&self, _did: &str) -> bool {
+            false
+        }
+    }
+
+    /// B-54 "Every `net` call site names its intent": each view of the
+    /// resolver fetches through its own intent's client, a request's view
+    /// takes the request's intent, and a viewer-private view uses the public
+    /// client for PLC only (design-v4 §8.1, §11 G-9; R3-168, R3-213).
+    #[tokio::test]
+    async fn each_intent_fetches_through_its_own_client() {
+        use crate::xrpc::pools::Requester;
+
+        let pool = PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").expect("lazy pool");
+        let settings = IdentitySettings {
+            plc_url: "https://plc.directory".to_string(),
+            fresh: std::time::Duration::from_secs(3600),
+            stale_max: std::time::Duration::from_secs(86_400),
+        };
+        let resolver = IdentityResolver::new(Transports::loopback_for_tests(), pool, settings, Arc::new(NeverPersist), Intent::Internal);
+        assert_eq!(resolver.intent(), Intent::Internal);
+        let web = DidTarget::Web {
+            host: "w.example.com".to_string(),
+        };
+        for (intent, plc, did_web) in [
+            (Intent::Public, Intent::Public, Intent::Public),
+            (Intent::Internal, Intent::Internal, Intent::Internal),
+            (Intent::ViewerPrivate, Intent::Public, Intent::ViewerPrivate),
+        ] {
+            let view = resolver.with_intent(intent);
+            assert_eq!((view.intent(), view.net().intent(), view.transport().intent()), (intent, intent, intent));
+            assert_eq!(view.document_client(&DidTarget::Plc).intent(), plc, "{intent:?}");
+            assert_eq!(view.document_client(&web).intent(), did_web, "{intent:?}");
+        }
+        // A request's view ignores the intent it was built from.
+        let req = Requester::test();
+        assert_eq!(resolver.for_request(&req).intent(), Intent::Public);
+        let private = req.viewer_private("did:plc:vvvvvvvvvvvvvvvvvvvvvvvv");
+        assert_eq!(resolver.for_request(&private).intent(), Intent::ViewerPrivate);
+        assert_eq!(resolver.with_intent(Intent::Public).for_request(&private).intent(), Intent::ViewerPrivate);
     }
 
     #[test]

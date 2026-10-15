@@ -61,6 +61,10 @@ trusted_proxy = "172.30.0.10"
 [metrics]
 bind = "0.0.0.0:9091"
 
+[net]
+public_nameservers = []
+internal_nameservers = []
+
 [indexing]
 # off | community_scoped | full (full is refused). Default: off.
 # Set this, or run `admin indexing public-scope`, to change it (design §3.3).

@@ -38,7 +38,7 @@ use crate::firehose::backfill::{ListOrder, ListPage, ListedRecord, detect_order}
 use crate::firehose::normalize::{blob_cid, normalize_record};
 use crate::identity::handle_lookup::HandleOutcome;
 use crate::microcosm::SlingshotClient;
-use crate::net::{BodyCap, NetClient, RequestOptions};
+use crate::net::{BodyCap, RequestOptions, Transports};
 use crate::sync::HostBudgets;
 use crate::xrpc::pools::{HostBuckets, Requester};
 
@@ -266,19 +266,22 @@ pub const LIST_READ_PAGES: usize = 5;
 
 /// Author-PDS listings on the read path: the host's public-fallback bucket
 /// (design-v3 §II-6.11.3; never queued, and separate from the private
-/// tier's read-fetch bucket), and the §5.10 order cache.
+/// tier's read-fetch bucket), and the §5.10 order cache. A PDS is a host
+/// the subject names, so each listing goes through the request's `net`
+/// intent: `viewer_private` for a viewer-private fetch (design-v4 §8.1,
+/// R3-213).
 #[derive(Clone)]
 pub struct PdsLister {
-    net: NetClient,
+    nets: Transports,
     hosts: HostBuckets,
     orders: moka::future::Cache<String, ListOrder>,
 }
 
 impl PdsLister {
     #[must_use]
-    pub fn new(net: NetClient, hosts: HostBuckets) -> Self {
+    pub fn new(nets: Transports, hosts: HostBuckets) -> Self {
         Self {
-            net,
+            nets,
             hosts,
             orders: moka::future::Cache::builder().max_capacity(100_000).time_to_live(ORDER_TTL).build(),
         }
@@ -305,7 +308,7 @@ impl PdsLister {
         }
         let url = Url::parse_with_params(&format!("{}/xrpc/com.atproto.repo.listRecords", pds.trim_end_matches('/')), &params).ok()?;
         let options = RequestOptions::new(BodyCap::LIST_RECORDS).timeout(PDS_TIMEOUT);
-        self.net.get_json::<ListPage>(url.as_str(), &options).await.ok()?.ok()
+        self.nets.for_request(req).client().get_json::<ListPage>(url.as_str(), &options).await.ok()?.ok()
     }
 
     /// The host's listing order, probed once with a `limit=2` listing and
@@ -985,10 +988,49 @@ mod tests {
     use crate::constellation::cascade::tests::{cascade_for, fake_appview};
     use crate::constellation::routing::tests::{StubLookup, table_with_community};
     use crate::constellation::{DidLookup, Router as DidRouter};
+    use crate::net::NetClient;
     use crate::test_support::serve_fake;
     use crate::xrpc::pools::Shares;
 
     const OUTSIDER: &str = "did:plc:oooooooooooooooooooooooo";
+
+    /// B-54 "Every `net` call site names its intent", in-crate (design-v4
+    /// §8.1, §11 G-9; R3-213): a PDS listing goes through the transport of
+    /// the request's mode, so a viewer-private listing reaches the subject's
+    /// PDS only through the `viewer_private` client, and private-context
+    /// hydration only through the internal one.
+    #[tokio::test]
+    async fn pds_listings_go_through_the_request_modes_transport() {
+        use axum::http::HeaderMap;
+
+        use crate::net::Intent;
+        use crate::net::client::test_user_agent;
+
+        let agents: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let router = AxumRouter::new()
+            .route(
+                "/xrpc/com.atproto.repo.listRecords",
+                get(|State(agents): State<Arc<std::sync::Mutex<Vec<String>>>>, headers: HeaderMap| async move {
+                    let agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                    agents.lock().expect("agents").push(agent);
+                    axum::Json(json!({"records": []}))
+                }),
+            )
+            .with_state(Arc::clone(&agents));
+        let pds = serve_fake(router).await;
+        let lister = PdsLister::new(Transports::loopback_for_tests(), hosts(200.0));
+        let public = Requester::test();
+        let private = public.viewer_private("did:plc:vvvvvvvvvvvvvvvvvvvvvvvv");
+        let context = public.private_context("did:plc:vvvvvvvvvvvvvvvvvvvvvvvv");
+        for req in [&public, &private, &context] {
+            assert!(lister.list(req, &pds, OUTSIDER, NSID_POST, 2, None).await.is_some());
+        }
+        let expected: Vec<String> = [Intent::Public, Intent::ViewerPrivate, Intent::Internal].into_iter().map(test_user_agent).collect();
+        assert_eq!(*agents.lock().expect("agents"), expected);
+        // The order probe of a viewer-private request uses its transport too.
+        lister.order(&private, &pds, OUTSIDER).await;
+        assert_eq!(agents.lock().expect("agents").last(), Some(&test_user_agent(Intent::ViewerPrivate)));
+    }
 
     /// Host buckets of `per_sec`: a non-member address gets half of it.
     fn hosts(per_sec: f64) -> HostBuckets {
@@ -1026,8 +1068,8 @@ mod tests {
         RealUpstreamSource::new(
             router,
             cascade,
-            SlingshotClient::new(net.clone(), slingshot),
-            PdsLister::new(net, hosts(20.0)),
+            SlingshotClient::new(net, slingshot),
+            PdsLister::new(Transports::loopback_for_tests(), hosts(20.0)),
             ReadCache::new(1024 * 1024),
         )
     }
@@ -1080,8 +1122,8 @@ mod tests {
         RealUpstreamSource::new(
             router,
             cascade_for(&[("bluesky", cascade_base), ("community-a", cascade_base)]),
-            SlingshotClient::new(net.clone(), cascade_base),
-            PdsLister::new(net, hosts(per_host)),
+            SlingshotClient::new(net, cascade_base),
+            PdsLister::new(Transports::loopback_for_tests(), hosts(per_host)),
             ReadCache::new(1024 * 1024),
         )
     }
@@ -1206,8 +1248,8 @@ mod tests {
             let up = RealUpstreamSource::new(
                 router,
                 cascade_for(&[("bluesky", &appview), ("community-a", &appview)]),
-                SlingshotClient::new(net.clone(), &slingshot),
-                PdsLister::new(net, hosts(20.0)),
+                SlingshotClient::new(net, &slingshot),
+                PdsLister::new(Transports::loopback_for_tests(), hosts(20.0)),
                 ReadCache::new(1024 * 1024),
             );
             match scope {

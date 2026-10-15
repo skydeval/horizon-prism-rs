@@ -12,7 +12,7 @@ use url::Url;
 
 use super::answer::ChunkAnswer;
 use super::chunks::CHECK_BLOCKS_PATH;
-use crate::net::{BodyCap, NetClient, NetError, RequestOptions};
+use crate::net::{BodyCap, NetClient, NetError, RequestOptions, Transports};
 
 /// Why a call has no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,10 +62,14 @@ impl CallError {
     }
 }
 
-/// The client. Cheap to clone.
+/// The client. Cheap to clone. `checkBlocks` is asked while serving a
+/// request, so through the public transport; `requestBackfill` and
+/// `getStats` are background and admin work, so through the internal one
+/// (design-v4 §II-8.5).
 #[derive(Clone)]
 pub struct FarsightClient {
-    net: NetClient,
+    public: NetClient,
+    internal: NetClient,
     base: String,
     authorization: HeaderValue,
 }
@@ -80,11 +84,12 @@ impl FarsightClient {
     /// A client for the instance at `base_url`, sending `token` as its API
     /// key. `None` when the token cannot be a header value.
     #[must_use]
-    pub fn new(net: NetClient, base_url: &str, token: &str) -> Option<Self> {
+    pub fn new(nets: &Transports, base_url: &str, token: &str) -> Option<Self> {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
         authorization.set_sensitive(true);
         Some(Self {
-            net,
+            public: nets.public().client().clone(),
+            internal: nets.internal().client().clone(),
             base: base_url.trim_end_matches('/').to_string(),
             authorization,
         })
@@ -131,7 +136,7 @@ impl FarsightClient {
         let options = RequestOptions::new(BodyCap::APPVIEW)
             .timeout(timeout)
             .header(AUTHORIZATION, self.authorization.clone());
-        let response = self.net.get(url.as_str(), &options).await.map_err(|e| match e {
+        let response = self.public.get(url.as_str(), &options).await.map_err(|e| match e {
             NetError::Timeout => CallError::Timeout,
             NetError::BodyTooLarge { .. } => CallError::TooLarge,
             e if self.refused(&e, "checkBlocks") => CallError::RefusedAddress,
@@ -166,7 +171,7 @@ impl FarsightClient {
     pub async fn get_stats(&self) -> Result<Value, &'static str> {
         let url = format!("{}{GET_STATS_PATH}", self.base);
         let options = RequestOptions::new(BodyCap::REPO_STATUS).header(AUTHORIZATION, self.authorization.clone());
-        let response = self.net.get(&url, &options).await.map_err(|e| match e {
+        let response = self.internal.get(&url, &options).await.map_err(|e| match e {
             NetError::Timeout => "timeout",
             e if self.refused(&e, "getStats") => "refused_address",
             _ => "transport",
@@ -198,7 +203,7 @@ impl FarsightClient {
             body["force"] = Value::Bool(true);
         }
         let options = RequestOptions::new(BodyCap::REPO_STATUS).header(AUTHORIZATION, self.authorization.clone());
-        let response = self.net.post_json(&url, &body, &options).await.map_err(|e| match e {
+        let response = self.internal.post_json(&url, &body, &options).await.map_err(|e| match e {
             NetError::Timeout => "timeout",
             e if self.refused(&e, "requestBackfill") => "refused_address",
             _ => "transport",
@@ -276,7 +281,7 @@ mod tests {
     async fn client() -> (FarsightClient, Seen) {
         let seen = Seen::default();
         let base = serve_fake(Router::new().route(CHECK_BLOCKS_PATH, get(fake)).with_state(Arc::clone(&seen))).await;
-        (FarsightClient::new(NetClient::loopback_for_tests(), &base, "fsk_test").expect("client"), seen)
+        (FarsightClient::new(&Transports::loopback_for_tests(), &base, "fsk_test").expect("client"), seen)
     }
 
     #[tokio::test]
@@ -314,12 +319,23 @@ mod tests {
         assert_eq!(labels, ["rate_limited", "overloaded", "auth", "status"]);
         assert_eq!(ask("garbage", 2000).await, Some(CallError::Parse));
         assert_eq!(ask("huge", 5000).await, Some(CallError::TooLarge));
-        let dead = FarsightClient::new(NetClient::loopback_for_tests(), "http://127.0.0.1:9", "fsk_test").expect("client");
+        let dead = FarsightClient::new(&Transports::loopback_for_tests(), "http://127.0.0.1:9", "fsk_test").expect("client");
         assert_eq!(dead.check_blocks(V, &[A.to_string()], Duration::from_secs(2)).await.err(), Some(CallError::Transport));
-        assert!(FarsightClient::new(NetClient::loopback_for_tests(), "http://x", "bad\nkey").is_none());
+        assert!(FarsightClient::new(&Transports::loopback_for_tests(), "http://x", "bad\nkey").is_none());
+    }
+
+    /// design-v4 §II-8.5: `checkBlocks` goes through the public client,
+    /// `requestBackfill` and `getStats` through the internal one.
+    #[test]
+    fn each_method_uses_its_intents_client() {
+        use crate::net::Intent;
+
+        let c = FarsightClient::new(&Transports::loopback_for_tests(), "https://farsight.example.net", "fsk_test").expect("client");
+        assert_eq!((c.public.intent(), c.internal.intent()), (Intent::Public, Intent::Internal));
     }
 
     /// Every name resolves to a private address.
+    #[derive(Clone)]
     struct PrivateDns;
 
     impl crate::net::HostLookup for PrivateDns {
@@ -355,9 +371,8 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        let net = NetClient::with_lookup(&crate::net::NetConfig::new("appview.example.com", "https://plc.directory"), PrivateDns)
-            .expect("net");
-        let c = FarsightClient::new(net, "https://farsight.internal", "fsk_test").expect("client");
+        let nets = Transports::with_lookup_for_tests(&crate::net::NetConfig::new("appview.example.com", "https://plc.directory"), PrivateDns);
+        let c = FarsightClient::new(&nets, "https://farsight.internal", "fsk_test").expect("client");
 
         for _ in 0..2 {
             let err = c.check_blocks(V, &[A.to_string()], Duration::from_secs(2)).await.err();

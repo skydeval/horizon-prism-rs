@@ -184,9 +184,11 @@ impl MemberKeys {
     }
 
     /// Keep the table current (see the module doc). `forget` is told about
-    /// members that left it.
+    /// members that left it. The refreshes are background work, made
+    /// through the internal intent (design-v4 §11 G-9).
     #[must_use]
     pub fn spawn(self, pool: PgPool, resolver: IdentityResolver, forget: impl Fn(&str) + Send + 'static) -> JoinHandle<()> {
+        let resolver = resolver.with_intent(crate::net::Intent::Internal);
         tokio::spawn(async move {
             // DID → (failures so far, earliest next attempt).
             let mut failed: HashMap<String, (usize, Instant)> = HashMap::new();

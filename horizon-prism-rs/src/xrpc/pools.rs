@@ -797,6 +797,23 @@ impl Requester {
     }
 }
 
+/// The `net` intent of a fetch made for this request (design-v4 §8.1,
+/// §11 G-9): private-context hydration uses the internal transport, a
+/// viewer-private fetch the `viewer_private` one, and any other request the
+/// public one. Request paths take their transport from here
+/// ([`crate::net::Transports::for_request`]), never by naming one.
+impl crate::net::FetchMode for Requester {
+    fn intent(&self) -> crate::net::Intent {
+        if self.local_only {
+            crate::net::Intent::Internal
+        } else if self.is_viewer_private() {
+            crate::net::Intent::ViewerPrivate
+        } else {
+            crate::net::Intent::Public
+        }
+    }
+}
+
 /// Every problem in the pool and shared-bucket settings (design-v3 §13).
 pub fn problems(cfg: &FileConfig, out: &mut Vec<String>) {
     let c = &cfg.constellation;

@@ -53,7 +53,7 @@ use crate::identity::resolver::extract_info;
 use crate::identity::eligibility::{self, Confirmation};
 use crate::identity::{IdentityResolver, ResolveIntent};
 use crate::microcosm::{ConstellationClient, LinksPage};
-use crate::net::{BodyCap, NetClient, RequestOptions};
+use crate::net::{BodyCap, Intent, NetClient, RequestOptions};
 use crate::subscriptions::runner::ListSync;
 
 /// `listRecords` page size.
@@ -426,6 +426,8 @@ pub trait BackfillSource: Send + Sync {
 /// The production source: `net` for PDS calls under the host's backfill
 /// bucket (§6.11.3: independent of the probe and read-fetch buckets), the
 /// identity resolver, and Constellation (which does not use the PDS budget).
+/// Backfill is internal work: the resolver and the PDS client are the
+/// internal intent's whatever `resolver` was built with (design-v4 §11 G-9).
 pub struct NetSource {
     pool: PgPool,
     resolver: IdentityResolver,
@@ -437,6 +439,7 @@ pub struct NetSource {
 impl NetSource {
     #[must_use]
     pub fn new(pool: PgPool, resolver: IdentityResolver, constellation: ConstellationClient, budgets: HostBudgets) -> Self {
+        let resolver = resolver.with_intent(Intent::Internal);
         let net = resolver.net().clone();
         Self {
             pool,

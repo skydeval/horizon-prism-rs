@@ -25,9 +25,12 @@ redis = { version = "0.27", features = ["tokio-comp", "aio", "streams", "connect
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # Same line as proto-blue-identity 0.3.3, so one hickory is in the graph.
 hickory-resolver = "0.26"
-# Named only to recognise a certificate failure in a connection error
-# (handle resolution, design-v3 §5.11); reqwest already brings it in.
-rustls = { version = "0.23", default-features = false, features = ["std"] }
+# Named to recognise a certificate failure in a connection error (handle
+# resolution, design-v3 §5.11), and to build the `viewer_private` client's
+# TLS without session resumption (design-v4 §8.1) from reqwest's own
+# provider and roots. reqwest already brings both in.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+webpki-roots = "1"
 ipnet = "2"
 kryphocron = "0.4"
 kryphocron-lexicons = "0.3"

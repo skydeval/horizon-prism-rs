@@ -82,7 +82,9 @@ fn classify_repo_status(pds: &str, answer: Result<(u16, &[u8]), &NetError>) -> R
     }
 }
 
-/// The production source. Cheap to clone.
+/// The production source. Cheap to clone. `list_sync` is internal work: it
+/// resolves owners and reads their PDSes through the internal intent,
+/// whatever `resolver` was built with (design-v4 §11 G-9).
 #[derive(Clone)]
 pub struct PdsOwners {
     pool: PgPool,
@@ -97,6 +99,7 @@ pub struct PdsOwners {
 impl PdsOwners {
     #[must_use]
     pub fn new(pool: PgPool, resolver: IdentityResolver, budgets: HostBudgets) -> Self {
+        let resolver = resolver.with_intent(crate::net::Intent::Internal);
         let net = resolver.net().clone();
         Self {
             pool,

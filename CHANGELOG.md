@@ -1525,6 +1525,22 @@ commit.
 
 ### Fixed
 
+- **Network clients by intent (#711; design-v4 §8.1, R3-168, R3-179,
+  R3-213).** Outbound HTTP and DNS now go through one of three transports,
+  each a client with its own resolver: `public` (upstream AppViews,
+  Slingshot, Constellation for requests, Farsight lookups, JWT issuers),
+  `internal` (backfill, list syncs, the identity refresher, repo-head
+  checks, member keys, Farsight `requestBackfill`/`getStats`) and
+  `viewer_private` (fetches made for a viewer's own private state: no DNS
+  cache, no idle connections, no TLS session resumption). A request's
+  mode picks the transport; background jobs pin theirs. The service proxy
+  keeps its own client. New config `[net] public_nameservers` and
+  `internal_nameservers` (both default to the system resolver, so nothing
+  changes unless set; invalid entries refuse startup, doubtful ones warn).
+  Handle TXT lookups now go through the chosen transport's resolver
+  instead of the system one. A source-scanning test keeps request paths
+  from pinning a transport.
+
 - **Phase B, B-64 to B-81 (#676).**
   - **`subscribed-post` for accounts that are not tracked.** The "backfilled
     once" fact (`sync_state.last_resync_at`) was written only for tracked

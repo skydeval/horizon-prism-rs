@@ -196,11 +196,14 @@ fn secs(d: Duration) -> f64 {
 }
 
 impl IdentityRefresher {
+    /// The refresher. Identity refresh is internal work: its fetches go
+    /// through the internal intent, whatever `resolver` was built with
+    /// (design-v4 §11 G-9).
     #[must_use]
     pub fn new(pool: PgPool, resolver: IdentityResolver, lifecycle: Arc<dyn AccountLifecycle>) -> Self {
         Self {
             pool,
-            resolver,
+            resolver: resolver.with_intent(crate::net::Intent::Internal),
             lifecycle,
         }
     }

@@ -26,7 +26,7 @@ use super::budgets::{Class, HostBudgets};
 use crate::aggregations::ScopeState;
 use crate::config::SyncConfig;
 use crate::firehose::writer::clear_readiness;
-use crate::net::{BodyCap, NetClient, RequestOptions};
+use crate::net::{BodyCap, NetClient, RequestOptions, Transports};
 use crate::private_tier::PrivateTier;
 
 pub const METRIC_CHECKS: &str = "sync_head_check_total";
@@ -50,15 +50,19 @@ struct LatestCommit {
     rev: String,
 }
 
-/// `net`-backed head source.
+/// `net`-backed head source. The prober and the private handlers' head
+/// fetches are internal work: it uses the internal transport (design-v4
+/// §8.1 "Private-context hydration", §11 G-9).
 pub struct NetHeadSource {
     net: NetClient,
 }
 
 impl NetHeadSource {
     #[must_use]
-    pub fn new(net: NetClient) -> Self {
-        Self { net }
+    pub fn new(nets: &Transports) -> Self {
+        Self {
+            net: nets.internal().client().clone(),
+        }
     }
 }
 
