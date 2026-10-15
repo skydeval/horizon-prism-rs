@@ -1460,6 +1460,11 @@ commit.
 
 ### Changed
 
+- **kryphocron-lexicons 0.3.1.** Brings the private-post media embeds
+  (gallery, video, quote with media), aspect ratios, link thumbnails,
+  `langs` and self-labels to `postPrivate`. No behaviour change yet; the
+  private views use them once private posting (Phase 2) lands.
+
 - **Item 12a: Thread Lens is viewer-relative, and enforces the viewer's
   blocks on the server (#674).** `threadLens.getThread` and `.resolve`
   are now for members whose account is ready, and answer for the caller.
