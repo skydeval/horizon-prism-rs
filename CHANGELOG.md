@@ -1558,6 +1558,12 @@ commit.
   holds the scope read guard while it adds waiting pairs and skips
   members being purged, so a purge cannot fall between its read and its
   add.
+- **Purge end's list sync is high priority and puts its waiters back.**
+  The end of a purge of a list owner queued its `list_sync` at low
+  priority and added no waiting pairs, so members whose list references
+  were owed a run waited behind weekly work. It is now high priority, and
+  the owner's owed `(member, source)` pairs are added to its fair-claim
+  set after the commit, skipping members being purged (design-v4 §4.3).
 - Tests that silenced the panic hook for the whole process now silence
   only their own thread, so other tests' failures print their message.
 

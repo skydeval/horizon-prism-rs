@@ -361,8 +361,23 @@ impl Purger {
             .await?;
         // Rule 4 (§4.3): while the marker stood nothing the DID did to its
         // lists was copied, so a DID that still owns a subscribed list is
-        // owed a list sync. Its owner row is taken before any job row.
-        triggers::request_if_active(&mut tx, did, list_sync::LOW, self.sync_min_interval_secs).await?;
+        // owed a list sync, at high priority: a reference may wait on it.
+        // Its owner row is taken before any job row.
+        let requested = triggers::request_if_active(&mut tx, did, list_sync::HIGH, self.sync_min_interval_secs).await?;
+        // The pairs of the references owed a run to the DID's active lists,
+        // for its waiting set once the enqueue commits (design-v4 §4.3
+        // "Fair claims"). The DID is the owner here, not the member.
+        let owed: Vec<(String, String)> = if requested && self.applier.is_some() {
+            sqlx::query_as(
+                "SELECT DISTINCT r.member_did, r.source FROM subscribed_lists l JOIN list_references r ON r.list_uri = l.list_uri \
+                 WHERE l.owner_did = $1 AND l.state = 'active' AND r.admitted AND NOT r.effective AND r.unlisted_at IS NULL",
+            )
+            .bind(did)
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            Vec::new()
+        };
         sqlx::query(
             "UPDATE backfill_jobs SET state = 'queued', generation = generation + 1, not_before = now(), updated_at = now() \
              WHERE did = $1 AND depth IN ('member', 'private', 'authz') AND state IN ('queued', 'running')",
@@ -380,6 +395,16 @@ impl Purger {
             jobs::enqueue(&mut tx, did, Depth::Authz).await?;
         }
         tx.commit().await?;
+        // Still under the read guard, so no member's marker step falls
+        // between the read and the add; a member being purged is skipped.
+        // Each add refreshes the pair's time.
+        if let Some(applier) = &self.applier {
+            for (member, source) in &owed {
+                if guard.purge_kind(member).is_none() {
+                    applier.waiting().add(did, member, source);
+                }
+            }
+        }
         drop(guard);
 
         let mut sets = self.scope.write_guard().await;
@@ -964,7 +989,10 @@ mod tests {
         purger.marker(SCOPED, PurgeKind::AccountDeleted).await.expect("marker");
         assert_eq!(count(p, "SELECT count(*) FROM backfill_jobs WHERE depth = 'list_sync' AND state = 'cancelled'").await, 1);
         assert_eq!(purger.resume_all().await.expect("resume"), 1);
-        assert_eq!(count(p, "SELECT count(*) FROM backfill_jobs WHERE depth = 'list_sync' AND state = 'queued'").await, 1);
+        assert_eq!(
+            count(p, &format!("SELECT count(*) FROM backfill_jobs WHERE depth = 'list_sync' AND state = 'queued' AND priority = {}", list_sync::HIGH)).await,
+            1
+        );
         assert_eq!(count(p, "SELECT count(*) FROM subscribed_owners WHERE owner_did = 'did:plc:dddddddddddddddddddddddd' AND resync_requested_at IS NOT NULL").await, 1);
 
         // An account with no subscribed list is owed nothing.
@@ -978,6 +1006,44 @@ mod tests {
         purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("purge");
         assert_eq!(count(p, "SELECT count(*) FROM list_references").await, 0);
         assert_eq!(count(p, "SELECT count(*) FROM list_reference_changes").await, 1);
+        db.drop_db().await;
+    }
+
+    /// Purge end of an owner (design-v4 §4.3 "Fair claims"): the
+    /// high-priority run it requests puts the pair of every reference owed
+    /// a run to the owner's active list in its waiting set, except a member
+    /// being purged.
+    #[tokio::test]
+    async fn purge_end_adds_the_owners_owed_pairs_to_its_waiting_set() {
+        use crate::subscriptions::list_phase;
+        use crate::subscriptions::references::{Budget, mute_list};
+
+        let Some(db) = fresh_db("purge_end_waiting").await else {
+            return;
+        };
+        let p = &db.pool;
+        let list = format!("at://{SCOPED}/app.bsky.graph.list/3klist1");
+        let budget = Budget { max_references: 5, max_owners: 5 };
+        for member in [MEMBER, OTHER_MEMBER] {
+            mute_list(p, member, &list, budget).await.expect("mute");
+        }
+        list_phase::apply(p, &list, 600).await.expect("apply");
+        exec(p, "DELETE FROM backfill_jobs").await;
+        let mut sets = ScopeSets::default();
+        sets.purging.insert(OTHER_MEMBER.into(), PurgeKind::MemberRemoved);
+        let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10);
+        let applier = Applier::new(p.clone(), scope.clone(), 600);
+        let purger = Purger::new(p.clone(), scope, Arc::new(DisabledPrivateTier)).with_applier(applier.clone());
+
+        purger.purge(SCOPED, PurgeKind::OutOfScope).await.expect("purge");
+        let job: (String, i16) = sqlx::query_as("SELECT state, priority FROM backfill_jobs WHERE did = $1 AND depth = 'list_sync'")
+            .bind(SCOPED)
+            .fetch_one(p)
+            .await
+            .expect("job");
+        assert_eq!(job, ("queued".to_string(), list_sync::HIGH));
+        assert_eq!(count(p, "SELECT count(*) FROM subscribed_owners WHERE owner_did = 'did:plc:dddddddddddddddddddddddd' AND resync_requested_at IS NOT NULL").await, 1);
+        assert_eq!(applier.waiting().of(SCOPED), [(MEMBER.to_string(), "mute".to_string())]);
         db.drop_db().await;
     }
 
