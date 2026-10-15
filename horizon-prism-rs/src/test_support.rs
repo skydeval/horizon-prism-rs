@@ -73,6 +73,20 @@ pub async fn idle_in_transaction_pid(pool: &PgPool, last_statement: &str) -> Opt
     .expect("pg_stat_activity")
 }
 
+/// Whether a backend in this test's database is waiting on a lock in a
+/// statement that began with `statement`.
+pub async fn waits_on_lock(pool: &PgPool, statement: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid() \
+           AND starts_with(query, $1))",
+    )
+    .bind(statement)
+    .fetch_one(pool)
+    .await
+    .expect("pg_stat_activity")
+}
+
 /// The relations on which backend `pid` holds a lock of any mode. A row
 /// lock shows here too: taking one also takes a lock on its relation.
 pub async fn locked_relations(pool: &PgPool, pid: i32) -> Vec<String> {
@@ -133,6 +147,14 @@ pub mod hooks {
     /// B-74 LM-10: a release between two committed item batches. Key: the
     /// list.
     pub const RELEASE_BETWEEN_BATCHES: &str = "b74_lm_10_release_between_batches";
+    /// B-65 owner-row race (R3-159): the daily sweep's owner-row delete,
+    /// after its `FOR UPDATE` of the owner's row and before its delete.
+    /// Key: the owner.
+    pub const SWEEP_OWNER_LOCKED: &str = "b65_r3_159_sweep_owner_locked";
+    /// B-65 owner-row race (R3-159), the reverse order: a list-phase
+    /// transaction, its writes done (the owner's row taken), before its
+    /// commit. Key: the list.
+    pub const LIST_PHASE_BEFORE_COMMIT: &str = "b65_r3_159_list_phase_before_commit";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);

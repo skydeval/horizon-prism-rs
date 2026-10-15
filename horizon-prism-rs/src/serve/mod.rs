@@ -367,6 +367,8 @@ pub async fn run() -> Result<(), StartupError> {
         }))),
         // The memory's table (§5.14.18.1), with or without an engine.
         Arc::new(crate::farsight::retention::MemoryRetention::new(&cfg.file.farsight.memory, farsight.clone())),
+        // Rule 4's daily safety net (design-v4 §14.1 R4).
+        Arc::new(crate::subscriptions::sweep::OrphanSweep::new(applier.clone(), cfg.file.lists.sync_min_interval_secs)),
     ];
     let guard: Arc<dyn ScopeGuard> = Arc::new(scope.clone());
     tasks.push(spawn_scheduler(

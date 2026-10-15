@@ -259,7 +259,7 @@ impl Rebuild {
                    AND j.depth IN ('member', 'scope', 'resync') AND j.state = 'done' \
                    AND j.updated_at > now() - interval '7 days') \
                AND NOT EXISTS (SELECT 1 FROM purging_dids p WHERE p.did = s.did) \
-             ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, \
+             ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
                not_before = EXCLUDED.not_before, last_error = NULL, updated_at = now() \
              WHERE backfill_jobs.state NOT IN ('queued', 'running')",
         )

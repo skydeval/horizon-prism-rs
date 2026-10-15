@@ -179,8 +179,8 @@ async fn enqueue_private(conn: &mut PgConnection, did: &str) -> Result<(), sqlx:
     sqlx::query(
         "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, updated_at) \
          VALUES ($1, $2, 'queued', 0, now(), now()) \
-         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, not_before = now(), \
-           last_error = NULL, updated_at = now() \
+         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
+           not_before = now(), last_error = NULL, updated_at = now() \
          WHERE backfill_jobs.state NOT IN ('queued', 'running')",
     )
     .bind(did)

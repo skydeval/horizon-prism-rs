@@ -18,6 +18,11 @@
 //!    inbound-block pass;
 //! 6. the readiness (or done) transaction.
 //!
+//! A claim carries the row's `generation` (design-v4 §II-5.10
+//! "Generations"); every statement the run issues on its row is conditioned
+//! on it, and every reset of the row by anyone else moves it on, so a run
+//! whose row was reset meanwhile settles as superseded and writes nothing.
+//!
 //! Failures back off 1 m, 10 m, 1 h, and the job is `failed` after 5
 //! attempts. A retry scheduler re-queues failed jobs of tracked DIDs every
 //! `retry_every_hours`; every tracked DID gets a daily `authz` job.
@@ -624,6 +629,14 @@ pub struct Job {
     pub depth: Depth,
     pub attempts: i32,
     pub run_id: u64,
+    /// The row's generation when this run claimed it (design-v4 §II-5.10
+    /// "Generations"). Every statement the run issues on its row is
+    /// conditioned on it, so a run whose row was reset meanwhile writes
+    /// nothing more to it.
+    pub generation: i64,
+    /// The gap epoch the claim recorded. `settle` compares it with the
+    /// current one and never reads it back from the row.
+    pub gap_epoch: i64,
 }
 
 /// What a run found, for the final transaction.
@@ -772,7 +785,10 @@ impl Backfill {
     ///
     /// The startup re-queue failed.
     pub async fn spawn(self) -> Result<Vec<JoinHandle<()>>, sqlx::Error> {
-        let mut n = sqlx::query("UPDATE backfill_jobs SET state = 'queued', updated_at = now() WHERE state = 'running' AND depth <> 'list_sync'")
+        let mut n = sqlx::query(
+            "UPDATE backfill_jobs SET state = 'queued', generation = generation + 1, updated_at = now() \
+             WHERE state = 'running' AND depth <> 'list_sync'",
+        )
             .execute(&self.pool)
             .await?
             .rows_affected();
@@ -857,8 +873,11 @@ impl Backfill {
             Ok(Some(result)) => self.settle(&job, &result).await?,
             Ok(None) => JobOutcome::Superseded,
             Err(error) => {
-                self.fail(&job, &error).await?;
-                JobOutcome::Failed(error)
+                if self.fail(&job, &error).await? {
+                    JobOutcome::Failed(error)
+                } else {
+                    JobOutcome::Superseded
+                }
             }
         };
         tracing::info!(event = "backfill_job", did = %job.did, depth = job.depth.as_str(), outcome = ?outcome, "backfill job finished");
@@ -866,41 +885,48 @@ impl Backfill {
     }
 
     /// Claim the next due job in `order`, recording the current gap epoch
-    /// (§6.11.2).
+    /// (§6.11.2). The run carries the row's generation and that epoch
+    /// (§II-5.10 "Generations").
     async fn claim(&self, order: ClaimOrder) -> Result<Option<Job>, sqlx::Error> {
-        let row: Option<(String, String, i32)> = sqlx::query_as(&format!(
+        let row: Option<(String, String, i32, i64, i64)> = sqlx::query_as(&format!(
             "WITH next AS ({}) \
              UPDATE backfill_jobs j SET state = 'running', updated_at = now(), \
                gap_epoch = COALESCE((SELECT (value #>> '{{}}')::bigint FROM worker_state WHERE key = $1), 0) \
              FROM next WHERE j.did = next.did AND j.depth = next.depth \
-             RETURNING j.did, j.depth, j.attempts",
+             RETURNING j.did, j.depth, j.attempts, j.generation, j.gap_epoch",
             order.select()
         ))
         .bind(gap::KEY_GAP_EPOCH)
         .fetch_optional(&self.pool)
         .await?;
-        if let Some((_, depth, _)) = &row {
+        if let Some((_, depth, ..)) = &row {
             metrics::counter!(METRIC_CLAIMS, "order" => order.as_str(), "depth" => depth.clone()).increment(1);
         }
-        Ok(row.and_then(|(did, depth, attempts)| {
+        Ok(row.and_then(|(did, depth, attempts, generation, gap_epoch)| {
             Depth::parse(&depth).map(|depth| Job {
                 did,
                 depth,
                 attempts,
                 run_id: rand::random(),
+                generation,
+                gap_epoch,
             })
         }))
     }
 
-    /// Still ours: not reset by a later enqueue and not cancelled.
+    /// Still ours: not reset by a later enqueue, not cancelled, and not
+    /// claimed since by another run.
     async fn still_running(&self, job: &Job) -> Result<Step, String> {
-        let state: Option<String> = sqlx::query_scalar("SELECT state FROM backfill_jobs WHERE did = $1 AND depth = $2")
-            .bind(&job.did)
-            .bind(job.depth.as_str())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(if state.as_deref() == Some("running") { Step::Continue } else { Step::Superseded })
+        let ours: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM backfill_jobs WHERE did = $1 AND depth = $2 AND state = 'running' AND generation = $3)",
+        )
+        .bind(&job.did)
+        .bind(job.depth.as_str())
+        .bind(job.generation)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(if ours { Step::Continue } else { Step::Superseded })
     }
 
     /// Steps 1–5. `Ok(None)` when superseded part-way.
@@ -1272,10 +1298,11 @@ impl Backfill {
             // §5.10 #182: re-queue immediately, readiness and applied_rev untouched.
             let n = sqlx::query(
                 "UPDATE backfill_jobs SET state = 'queued', not_before = now(), updated_at = now() \
-                 WHERE did = $1 AND depth = $2 AND state = 'running'",
+                 WHERE did = $1 AND depth = $2 AND state = 'running' AND generation = $3",
             )
             .bind(&job.did)
             .bind(job.depth.as_str())
+            .bind(job.generation)
             .execute(&self.pool)
             .await?
             .rows_affected();
@@ -1293,16 +1320,17 @@ impl Backfill {
         // `subscribed-post` needs for an author that is not tracked.
         let in_scope = guard.in_scope(&job.did);
         let mut tx = self.pool.begin().await?;
-        let row: Option<(String, Option<i64>)> =
-            sqlx::query_as("SELECT state, gap_epoch FROM backfill_jobs WHERE did = $1 AND depth = $2 FOR UPDATE")
-                .bind(&job.did)
-                .bind(job.depth.as_str())
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((state, recorded_epoch)) = row else {
-            return Ok(JobOutcome::Superseded);
-        };
-        if state != "running" {
+        // Ours only while `running` at the claim's generation (§II-5.10):
+        // otherwise the run was superseded and writes nothing.
+        let ours: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM backfill_jobs WHERE did = $1 AND depth = $2 AND state = 'running' AND generation = $3 FOR UPDATE",
+        )
+        .bind(&job.did)
+        .bind(job.depth.as_str())
+        .bind(job.generation)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if ours.is_none() {
             return Ok(JobOutcome::Superseded);
         }
         let outcome = if may_set_readiness {
@@ -1314,7 +1342,7 @@ impl Backfill {
             if purging {
                 requeue(&mut tx, job, PURGING_REQUEUE_SECS).await?;
                 JobOutcome::Requeued("purging")
-            } else if recorded_epoch != Some(epoch) {
+            } else if job.gap_epoch != epoch {
                 requeue(&mut tx, job, 0).await?;
                 JobOutcome::Requeued("gap_epoch_changed")
             } else {
@@ -1362,15 +1390,17 @@ impl Backfill {
         Ok(outcome)
     }
 
-    async fn fail(&self, job: &Job, error: &str) -> Result<(), sqlx::Error> {
+    /// Record a failed run on its row, with backoff. Returns whether the row
+    /// was still the run's: a superseded run's failure touches nothing.
+    async fn fail(&self, job: &Job, error: &str) -> Result<bool, sqlx::Error> {
         let attempt = job.attempts + 1;
         let state = if attempt >= MAX_ATTEMPTS { "failed" } else { "queued" };
         let delay = backoff(attempt).num_seconds();
         let error: String = error.chars().take(512).collect();
-        sqlx::query(
+        let n = sqlx::query(
             "UPDATE backfill_jobs SET attempts = $3, state = $4, last_error = $5, updated_at = now(), \
                not_before = now() + make_interval(secs => $6) \
-             WHERE did = $1 AND depth = $2 AND state = 'running'",
+             WHERE did = $1 AND depth = $2 AND state = 'running' AND generation = $7",
         )
         .bind(&job.did)
         .bind(job.depth.as_str())
@@ -1378,14 +1408,21 @@ impl Backfill {
         .bind(state)
         .bind(&error)
         .bind(delay as f64)
+        .bind(job.generation)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected();
+        if n == 0 {
+            tracing::info!(event = "backfill_job_failed_superseded", did = %job.did, depth = job.depth.as_str(), %error, "a superseded backfill run failed; its row is left alone");
+            return Ok(false);
+        }
         tracing::warn!(event = "backfill_job_failed", did = %job.did, depth = job.depth.as_str(), attempt, state, %error, "backfill job failed");
-        Ok(())
+        Ok(true)
     }
 
     /// Every `retry_every_hours`: re-queue failed `member`, `private`, `authz`
-    /// and `resync` jobs of DIDs still tracked, resetting attempts.
+    /// and `resync` jobs of DIDs still tracked, resetting attempts, at a new
+    /// generation.
     async fn retry_loop(self) {
         let every = Duration::from_secs(u64::from(self.settings.retry_every_hours.max(1)) * 3600);
         let mut tick = tokio::time::interval(every);
@@ -1394,7 +1431,7 @@ impl Backfill {
             tick.tick().await;
             let tracked = self.writer.scope().read_guard().await.tracked();
             let result = sqlx::query(
-                "UPDATE backfill_jobs SET state = 'queued', attempts = 0, not_before = now(), updated_at = now() \
+                "UPDATE backfill_jobs SET state = 'queued', attempts = 0, generation = generation + 1, not_before = now(), updated_at = now() \
                  WHERE state = 'failed' AND depth IN ('member', 'private', 'authz', 'resync') AND did = ANY($1)",
             )
             .bind(&tracked)
@@ -1420,7 +1457,7 @@ impl Backfill {
                 "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, updated_at) \
                  SELECT d, 'authz', 'queued', 0, now() + make_interval(secs => o), now() \
                  FROM unnest($1::text[], $2::float8[]) AS t(d, o) \
-                 ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, \
+                 ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
                    not_before = EXCLUDED.not_before, last_error = NULL, updated_at = now() \
                  WHERE backfill_jobs.state NOT IN ('queued', 'running')",
             )
@@ -1478,26 +1515,31 @@ fn daily_offset_secs(did: &str) -> f64 {
     secs
 }
 
+/// The run's own re-queue, only while the row is still the run's
+/// (§II-5.10).
 async fn requeue(conn: &mut PgConnection, job: &Job, delay_secs: i32) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE backfill_jobs SET state = 'queued', not_before = now() + make_interval(secs => $3), updated_at = now() \
-         WHERE did = $1 AND depth = $2",
+         WHERE did = $1 AND depth = $2 AND generation = $4",
     )
     .bind(&job.did)
     .bind(job.depth.as_str())
     .bind(f64::from(delay_secs))
+    .bind(job.generation)
     .execute(conn)
     .await?;
     Ok(())
 }
 
+/// The run's completion, only while the row is still the run's (§II-5.10).
 async fn mark_done(conn: &mut PgConnection, job: &Job) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE backfill_jobs SET state = 'done', attempts = 0, last_error = NULL, updated_at = now() \
-         WHERE did = $1 AND depth = $2",
+         WHERE did = $1 AND depth = $2 AND generation = $3",
     )
     .bind(&job.did)
     .bind(job.depth.as_str())
+    .bind(job.generation)
     .execute(conn)
     .await?;
     Ok(())
@@ -2444,7 +2486,6 @@ mod tests {
     /// `ready_at`, no `applied_rev`, no row change) and returns Superseded;
     /// only the second run sets readiness.
     #[tokio::test]
-    #[ignore = "chainlink #712: member jobs carry no generation; a stale run's settle passes once a second claim sets the row running again"]
     async fn b65_a_superseded_member_run_settles_nothing() {
         let Some(db) = fresh_db("b65_member_generation").await else {
             return;
@@ -2482,7 +2523,6 @@ mod tests {
     /// after a second worker has claimed the re-enqueued job. Its `fail()`
     /// updates no row, and the second run's row is untouched.
     #[tokio::test]
-    #[ignore = "chainlink #712: member jobs carry no generation; a stale run's fail() rewrites the live run's row"]
     async fn b65_a_superseded_member_run_that_fails_leaves_the_live_row_alone() {
         let Some(db) = fresh_db("b65_member_generation_fail").await else {
             return;
@@ -2519,7 +2559,6 @@ mod tests {
     /// settles. The stale run settles nothing and the live row is left as
     /// the second run has it.
     #[tokio::test]
-    #[ignore = "chainlink #712: member jobs carry no generation; the purge cancel and the ingest re-queue leave a stale private run able to settle"]
     async fn b65_a_private_run_cancelled_by_a_purge_and_requeued_settles_nothing() {
         use crate::aggregations::{PurgeKind, Purger};
 

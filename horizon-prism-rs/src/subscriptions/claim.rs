@@ -386,12 +386,13 @@ mod tests {
         let ended: bool = sqlx::query_scalar("SELECT last_run_ended_at IS NULL FROM subscribed_owners").fetch_one(p).await.expect("owner");
         assert!(ended, "no run end is recorded for a row that had no cause");
 
-        // A reference that waits is a cause.
+        // A reference that waits is a cause. Its enqueue queues the `done`
+        // row again at a new generation (design-v4 §II-5.10).
         mute_list(p, M2, &list(A), budget).await.expect("mute");
         list_phase::apply(p, &list(A), 600).await.expect("apply");
         waiting.add(A, M2, "mute");
         let claimed = take(Lane::Fast).await.expect("claimed");
-        assert_eq!((claimed.owner.as_str(), claimed.generation, &claimed.participant), (A, 1, &pair(M2)));
+        assert_eq!((claimed.owner.as_str(), claimed.generation, &claimed.participant), (A, 2, &pair(M2)));
         assert_eq!(job(A).await.0, "running");
         // A running row is not claimed twice.
         assert_eq!(take(Lane::Fast).await, None);

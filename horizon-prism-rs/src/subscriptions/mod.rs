@@ -67,5 +67,6 @@ pub mod pds;
 pub mod references;
 pub mod run;
 pub mod runner;
+pub mod sweep;
 pub mod sync;
 pub mod triggers;

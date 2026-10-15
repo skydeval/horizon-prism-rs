@@ -57,8 +57,9 @@ pub fn earliest_start(owner: &OwnerPacing, min_interval_secs: u32, now: DateTime
 /// - Queued: `not_before` moves no later than the earliest start.
 /// - Done, failed or cancelled: queued again at the earliest start.
 ///
-/// The priority only ever rises on a live row. The generation is never
-/// changed here.
+/// The priority only ever rises on a live row. A live row's generation is
+/// never changed here; a done, failed or cancelled row queued again moves
+/// to a new one (design-v4 §II-5.10 "Generations").
 ///
 /// # Errors
 ///
@@ -82,6 +83,7 @@ pub async fn enqueue(conn: &mut PgConnection, owner: &str, priority: i16, min_in
                         ELSE EXCLUDED.not_before END, \
            attempts = CASE WHEN j.state IN ('running', 'queued') THEN j.attempts ELSE 0 END, \
            last_error = CASE WHEN j.state IN ('running', 'queued') THEN j.last_error END, \
+           generation = CASE WHEN j.state IN ('running', 'queued') THEN j.generation ELSE j.generation + 1 END, \
            state = CASE j.state WHEN 'running' THEN 'running' ELSE 'queued' END, \
            updated_at = now()",
     )

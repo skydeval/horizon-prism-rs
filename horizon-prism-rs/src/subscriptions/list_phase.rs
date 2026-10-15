@@ -20,8 +20,11 @@
 //! An `unreferenced` list is released at once: its items are deleted in
 //! batches, then its row. There is no grace period.
 
+use std::time::Instant;
+
 use sqlx::PgPool;
 
+use super::applier::Waiting;
 use super::jobs;
 use crate::db::locks::uri_author;
 
@@ -165,6 +168,8 @@ async fn apply_taking(pool: &PgPool, list: &str, sync_min_interval_secs: u32, wa
         .bind(&markers)
         .execute(&mut *tx)
         .await?;
+    #[cfg(test)]
+    crate::test_support::hooks::pause(crate::test_support::hooks::LIST_PHASE_BEFORE_COMMIT, list).await;
     tx.commit().await?;
     Ok(Applied::Done { state, waiting })
 }
@@ -216,14 +221,30 @@ pub enum Released {
 /// batch re-locks the row and stops if the row is `active` again, if an
 /// admitted reference to the list exists, or if a marker for it is pending
 /// (the list phase may not have flipped the row back yet). The last
-/// transaction also cancels the owner's queued `list_sync` when this was
-/// the owner's last list. The owner's row is kept: it carries the pacing a
-/// later subscription must find unchanged.
+/// transaction also cancels the owner's queued `list_sync`, at a new
+/// generation, when this was the owner's last list (R3-151). The owner's
+/// row is kept: it carries the pacing a later subscription must find
+/// unchanged.
+///
+/// This leaves no waiting set to trim; the applier's release is
+/// [`release_with`].
 ///
 /// # Errors
 ///
 /// Database errors.
 pub async fn release(pool: &PgPool, list: &str) -> Result<Released, sqlx::Error> {
+    release_with(pool, list, &Waiting::default()).await
+}
+
+/// [`release`], which also drops from `waiting` the owner's pairs last
+/// added before the cancel when this was the owner's last list (N-1501):
+/// their references no longer wait on a sync. A pair added after the
+/// cancel belongs to an enqueue that queues the row again, and is kept.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn release_with(pool: &PgPool, list: &str, waiting: &Waiting) -> Result<Released, sqlx::Error> {
     let owner = uri_author(list).unwrap_or_default();
     let mut items = 0;
     loop {
@@ -269,17 +290,29 @@ pub async fn release(pool: &PgPool, list: &str) -> Result<Released, sqlx::Error>
             .bind(list)
             .execute(&mut *tx)
             .await?;
-        // A new statement: its snapshot follows the owner lock.
-        sqlx::query(
-            "UPDATE backfill_jobs SET state = 'cancelled', updated_at = now() \
-             WHERE did = $1 AND depth = $2 AND state = 'queued' \
-               AND NOT EXISTS (SELECT 1 FROM subscribed_lists WHERE owner_did = $1)",
-        )
-        .bind(owner)
-        .bind(jobs::DEPTH)
-        .execute(&mut *tx)
-        .await?;
+        // A new statement: its snapshot follows the owner lock. A list of
+        // the owner committed while this waited for the lock is seen here.
+        let last: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM subscribed_lists WHERE owner_did = $1)")
+            .bind(owner)
+            .fetch_one(&mut *tx)
+            .await?;
+        // Taken before the cancel: a pair added later belongs to an enqueue
+        // that waited on the owner's row and commits after this.
+        let cancelled_at = Instant::now();
+        if last {
+            sqlx::query(
+                "UPDATE backfill_jobs SET state = 'cancelled', generation = generation + 1, updated_at = now() \
+                 WHERE did = $1 AND depth = $2 AND state = 'queued'",
+            )
+            .bind(owner)
+            .bind(jobs::DEPTH)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
+        if last {
+            waiting.forget_before(owner, cancelled_at);
+        }
         return Ok(Released::Gone { items });
     }
 }

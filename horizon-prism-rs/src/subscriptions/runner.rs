@@ -63,6 +63,8 @@ pub struct ListSync {
     pool: PgPool,
     scope: ScopeState,
     source: Arc<dyn OwnerSource>,
+    /// The reference applier, whose full reconcile the recovery sweep runs.
+    applier: Applier,
     waiting: Waiting,
     time: LaneTime,
     settings: Settings,
@@ -80,6 +82,7 @@ impl ListSync {
             pool,
             scope,
             source,
+            applier: applier.clone(),
             waiting: applier.waiting().clone(),
             time: applier.lane_time().clone(),
             settings,
@@ -166,13 +169,33 @@ impl ListSync {
         Ok(n)
     }
 
+    /// One recovery sweep (design-v4 §4.3 "Crash safety", §II-5.10 retry
+    /// scheduler): the applier's full reconcile, which corrects every list
+    /// whose row and references disagree and restarts any release a crash
+    /// left undone, then the sweep's own enqueues
+    /// ([`triggers::recovery_sweep`]). Returns how many owners the sweep
+    /// enqueued.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn sweep_once(&self) -> Result<u64, sqlx::Error> {
+        let busy = self.applier.reconcile().await?;
+        if !busy.is_empty() {
+            // The applier's own passes take a busy list that has a marker;
+            // one without is looked at again by the next sweep.
+            tracing::info!(event = "list_reconcile_busy", lists = busy.len(), "lists busy during the full reconcile");
+        }
+        triggers::recovery_sweep(&self.pool, &self.waiting, self.settings.min_interval_secs).await
+    }
+
     /// The recovery sweep, now and then every `every` (the retry
     /// scheduler's period), each followed by the weekly run when a week
     /// has passed.
     pub async fn sweep_loop(self, every: Duration) {
         let pause = self.settings.min_interval_secs;
         loop {
-            match triggers::recovery_sweep(&self.pool, &self.waiting, pause).await {
+            match self.sweep_once().await {
                 Ok(n) => tracing::info!(event = "list_sync_recovery_sweep", owners = n, "list sync recovery sweep"),
                 Err(error) => tracing::warn!(event = "list_sync_recovery_sweep_failed", %error, "the list sync recovery sweep failed"),
             }

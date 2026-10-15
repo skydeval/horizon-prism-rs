@@ -391,31 +391,50 @@ pub(crate) mod tests {
         }
     }
 
+    /// Run `f` with the panic messages of this thread silenced, and only
+    /// those: the hook is process-wide and the suite runs in parallel, so
+    /// a hook that silenced every thread would also hide the message of any
+    /// other test that failed meanwhile. Callers are serialized, so each
+    /// restores the hook it found.
+    fn quietly<R>(f: impl FnOnce() -> R) -> R {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let me = std::thread::current().id();
+        let previous: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send> = Arc::from(std::panic::take_hook());
+        let others = Arc::clone(&previous);
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() != me {
+                others(info);
+            }
+        }));
+        let result = f();
+        drop(std::panic::take_hook());
+        std::panic::set_hook(Box::new(move |info| previous(info)));
+        result
+    }
+
     #[test]
     fn contained_sinks_swallow_panics_and_return_ok() {
-        let quiet = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let substrate = PanicContained(PanickingSubstrate);
-        assert!(SubstrateAuditSink::record(&substrate, substrate_event()).is_ok());
-        let fallback = PanicContainedFallback(PanickingFallback);
-        fallback.record_panic(SinkKind::User, TraceId::from_bytes([2; 16]), CapabilityKind::ViewPrivate, SystemTime::now());
-        fallback.record_composite_failure(
-            TraceId::from_bytes([2; 16]),
-            CompositeOpId::from_bytes([3; 16]),
-            &[SinkKind::User],
-            &[SinkKind::Substrate],
-            SystemTime::now(),
-        );
-        let _channel = PanicContained(PanickingChannel);
-        std::panic::set_hook(quiet);
+        quietly(|| {
+            let substrate = PanicContained(PanickingSubstrate);
+            assert!(SubstrateAuditSink::record(&substrate, substrate_event()).is_ok());
+            let fallback = PanicContainedFallback(PanickingFallback);
+            fallback.record_panic(SinkKind::User, TraceId::from_bytes([2; 16]), CapabilityKind::ViewPrivate, SystemTime::now());
+            fallback.record_composite_failure(
+                TraceId::from_bytes([2; 16]),
+                CompositeOpId::from_bytes([3; 16]),
+                &[SinkKind::User],
+                &[SinkKind::Substrate],
+                SystemTime::now(),
+            );
+            let _channel = PanicContained(PanickingChannel);
+        });
         // The inner log sinks themselves never fail.
         assert!(SubstrateAuditSink::record(&PanicContained(LogSubstrateSink), substrate_event()).is_ok());
     }
 
     #[test]
     fn user_sink_panic_latches_the_flag_and_the_guard() {
-        let quiet = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let sinks = GlueSinks::with(
             Box::new(PanickingUser),
             Box::new(PanicContained(LogSubstrateSink)),
@@ -437,8 +456,8 @@ pub(crate) mod tests {
             error_class: kryphocron::CodecErrorClass::UnknownOrWrongCodec,
             at: SystemTime::now(),
         };
-        assert_eq!(sinks.user_sink().record(event.clone()), Err(AuditError::Unavailable));
-        std::panic::set_hook(quiet);
+        let first = quietly(|| sinks.user_sink().record(event.clone()));
+        assert_eq!(first, Err(AuditError::Unavailable));
         assert!(latch.load(Ordering::SeqCst), "the host latch records the panic");
         // Every later record fails closed without reaching the inner sink.
         assert_eq!(sinks.user_sink().record(event), Err(AuditError::Unavailable));

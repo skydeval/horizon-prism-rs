@@ -1536,6 +1536,24 @@ commit.
 
 ### Fixed
 
+- **Backfill job generations (#713; design-v4 §II-5.10).** A job's run
+  could settle, fail or re-queue the row after the job had been reset
+  under it (re-enqueued, cancelled by a purge, re-queued at startup), and
+  so overwrite the newer run's state. Claims now carry the job's
+  generation and gap epoch; every settle, fail, still-running, re-queue
+  and done write acts only while the generation matches (a stale run
+  settles as superseded), and every reset site bumps it, `list_sync`
+  rows included.
+- **List release and recovery (#714).** Releasing an owner's last list
+  cancels its sync with a new generation (R3-151) and drops the owner's
+  waiting pairs (N-1501). The retry scheduler's recovery sweep now runs
+  the full reconcile every `retry_every_hours`, not only at startup. The
+  daily orphan sweep of §14.1 is built: leftover `unreferenced` rows are
+  released, list-less items and owner rows removed (race-safe against a
+  new reference, R3-159), and missing owner rows created.
+- Tests that silenced the panic hook for the whole process now silence
+  only their own thread, so other tests' failures print their message.
+
 - **Network clients by intent (#711; design-v4 §8.1, R3-168, R3-179,
   R3-213).** Outbound HTTP and DNS now go through one of three transports,
   each a client with its own resolver: `public` (upstream AppViews,

@@ -194,7 +194,7 @@ impl Applier {
 
     /// Release `list` and set the in-memory sets from what is left.
     async fn release(&self, list: &str) {
-        let result = list_phase::release(&self.pool, list).await;
+        let result = list_phase::release_with(&self.pool, list, &self.waiting).await;
         self.releasing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(list);
         match result {
             Ok(_) => {
@@ -205,6 +205,30 @@ impl Applier {
             // The full reconcile finds the row again.
             Err(error) => tracing::warn!(event = "list_release_failed", %error, "releasing a list failed; the reconcile retries it"),
         }
+    }
+
+    /// The daily R4 job's safety net (design-v4 §14.1 R4, §4.3 Release):
+    /// release every `unreferenced` row, whatever its age, here and now,
+    /// except one whose release is already queued or running. Returns how
+    /// many lists it released.
+    ///
+    /// # Errors
+    ///
+    /// Database errors listing the rows; a failed release is logged, and
+    /// the next reconcile or daily run tries it again.
+    pub async fn release_unreferenced(&self) -> Result<u64, sqlx::Error> {
+        let lists: Vec<String> = sqlx::query_scalar("SELECT list_uri FROM subscribed_lists WHERE state = 'unreferenced' ORDER BY list_uri")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut n = 0;
+        for list in lists {
+            let fresh = self.releasing.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(list.clone());
+            if fresh {
+                self.release(&list).await;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// Run the list phase for each of `lists`. Returns the lists whose row

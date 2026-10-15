@@ -24,7 +24,7 @@ use super::{retryable, retrying};
 use crate::aggregations::{ScopeSets, ScopeState};
 use crate::config::ScopePolicy;
 use crate::firehose::backfill::ListedRecord;
-use crate::test_support::{fresh_db, holds_advisory, hooks, idle_in_transaction_pid, locked_relations};
+use crate::test_support::{fresh_db, holds_advisory, hooks, idle_in_transaction_pid, locked_relations, waits_on_lock};
 
 const BUDGET: Budget = Budget { max_references: 5, max_owners: 5 };
 /// A request on a held list must answer within this (B-74).
@@ -478,7 +478,6 @@ async fn b65_a_mute_during_a_weekly_run_is_synced_ahead_of_the_weekly_rows() {
 /// referenced list is released, its queued `list_sync` is cancelled and
 /// its generation moves on.
 #[tokio::test]
-#[ignore = "chainlink #712: release() cancels the queued list_sync without bumping its generation (list_phase.rs final transaction)"]
 async fn b65_releasing_an_owners_last_list_cancels_its_sync_with_a_new_generation() {
     const OWNER: &str = "did:plc:b65releaseowner";
     const M: &str = "did:plc:b65releasemember";
@@ -495,6 +494,152 @@ async fn b65_releasing_an_owners_last_list_cancels_its_sync_with_a_new_generatio
     assert_eq!(list_phase::release(p, &list).await.expect("release"), list_phase::Released::Gone { items: 0 });
     let (state, _, _, _, _, after) = job(p, OWNER).await;
     assert_eq!((state.as_str(), after), ("cancelled", before + 1));
+    db.drop_db().await;
+}
+
+/// An owner whose only list was subscribed and then released: its owner
+/// row is left with no list and no backoff, and its `list_sync` cancelled.
+async fn listless_owner(pool: &PgPool, member: &str, owner: &str) {
+    let list = list_of(owner);
+    subscribe(pool, member, &list).await;
+    assert!(unmute_list(pool, member, &list, BUDGET).await.expect("unmute"));
+    assert!(matches!(list_phase::apply(pool, &list, 0).await.expect("list phase"), Applied::Done { state: Some(ListState::Unreferenced), .. }));
+    assert_eq!(list_phase::release(pool, &list).await.expect("release"), list_phase::Released::Gone { items: 0 });
+    assert_eq!(job(pool, owner).await.0, "cancelled");
+}
+
+/// The owner's new first list, a second list of `owner`.
+fn second_list_of(owner: &str) -> String {
+    format!("at://{owner}/{NSID_LIST}/3klist2")
+}
+
+async fn owner_row(pool: &PgPool, owner: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM subscribed_owners WHERE owner_did = $1)")
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .expect("owner")
+}
+
+/// B-65 owner-row race (R3-159), the sweep first: with the daily sweep's
+/// owner-row delete paused after its `FOR UPDATE`, a list phase adds the
+/// owner's new first list and waits on the owner's row. The sweep's delete
+/// does not see that uncommitted list and removes the row; the list
+/// phase's upsert then re-creates it. The owner row is present and the new
+/// list's `list_sync` queued.
+#[tokio::test]
+async fn b65_an_owner_row_deleted_under_a_waiting_list_phase_is_recreated() {
+    const OWNER: &str = "did:plc:b65sweepfirstowner";
+    const M: &str = "did:plc:b65sweepfirstmember";
+    let Some(db) = fresh_db("b65_sweep_first").await else {
+        return;
+    };
+    let p = &db.pool;
+    listless_owner(p, M, OWNER).await;
+    let new = second_list_of(OWNER);
+    assert_eq!(mute_list(p, M, &new, BUDGET).await.expect("mute"), Muted::Added);
+
+    let paused = hooks::arm(hooks::SWEEP_OWNER_LOCKED, OWNER);
+    let sweep = tokio::spawn({
+        let p = p.clone();
+        async move { super::sweep::orphan_owners(&p, &super::applier::Waiting::default(), 0).await }
+    });
+    paused.reached().await;
+    let phase = tokio::spawn({
+        let (p, new) = (p.clone(), new.clone());
+        async move { list_phase::apply(&p, &new, 0).await }
+    });
+    until(Duration::from_secs(10), "the list phase waits on the owner's row", || async {
+        waits_on_lock(p, "INSERT INTO subscribed_owners").await
+    })
+    .await;
+    paused.release();
+    assert_eq!(sweep.await.expect("task").expect("sweep"), 1, "the sweep deleted the row it locked");
+    let applied = phase.await.expect("task").expect("list phase");
+    assert!(matches!(applied, Applied::Done { state: Some(ListState::Active), .. }), "{applied:?}");
+    assert!(owner_row(p, OWNER).await, "the list phase re-created the owner row");
+    assert_eq!(job(p, OWNER).await.0, "queued");
+    drop(paused);
+    db.drop_db().await;
+}
+
+/// B-65 owner-row race (R3-159), the list phase first: a list phase adding
+/// the owner's new first list holds the owner's row, paused before its
+/// commit. The sweep's `FOR UPDATE` waits on it; its delete, a new
+/// statement, then sees the committed list and deletes nothing. The owner
+/// row is present and the new list's `list_sync` queued.
+#[tokio::test]
+async fn b65_a_sweep_waiting_on_a_list_phase_deletes_nothing() {
+    const OWNER: &str = "did:plc:b65phasefirstowner";
+    const M: &str = "did:plc:b65phasefirstmember";
+    let Some(db) = fresh_db("b65_phase_first").await else {
+        return;
+    };
+    let p = &db.pool;
+    listless_owner(p, M, OWNER).await;
+    let new = second_list_of(OWNER);
+    assert_eq!(mute_list(p, M, &new, BUDGET).await.expect("mute"), Muted::Added);
+
+    let paused = hooks::arm(hooks::LIST_PHASE_BEFORE_COMMIT, &new);
+    let phase = tokio::spawn({
+        let (p, new) = (p.clone(), new.clone());
+        async move { list_phase::apply(&p, &new, 0).await }
+    });
+    paused.reached().await;
+    let sweep = tokio::spawn({
+        let p = p.clone();
+        async move { super::sweep::orphan_owners(&p, &super::applier::Waiting::default(), 0).await }
+    });
+    until(Duration::from_secs(10), "the sweep waits on the owner's row", || async {
+        waits_on_lock(p, "SELECT 1 FROM subscribed_owners").await
+    })
+    .await;
+    paused.release();
+    let applied = phase.await.expect("task").expect("list phase");
+    assert!(matches!(applied, Applied::Done { state: Some(ListState::Active), .. }), "{applied:?}");
+    assert_eq!(sweep.await.expect("task").expect("sweep"), 0, "the sweep saw the committed list");
+    assert!(owner_row(p, OWNER).await);
+    assert_eq!(job(p, OWNER).await.0, "queued");
+    drop(paused);
+    db.drop_db().await;
+}
+
+/// N-1501: the release of an owner's last list drops the owner's waiting
+/// pairs added before its cancel; while another list of the owner is
+/// left, they stay. Other owners' pairs are untouched.
+#[tokio::test]
+async fn b65_releasing_an_owners_last_list_drops_its_waiting_pairs() {
+    const OWNER: &str = "did:plc:b65pairsowner";
+    const OTHER: &str = "did:plc:b65pairsother";
+    const M: &str = "did:plc:b65pairsmember";
+    let Some(db) = fresh_db("b65_release_pairs").await else {
+        return;
+    };
+    let p = &db.pool;
+    let waiting = super::applier::Waiting::default();
+    let (first, second) = (list_of(OWNER), second_list_of(OWNER));
+    for list in [&first, &second] {
+        subscribe(p, M, list).await;
+    }
+    waiting.add(OWNER, M, "mute");
+    waiting.add(OTHER, M, "mute");
+    let drop_list = |list: String| {
+        let waiting = waiting.clone();
+        async move {
+            assert!(unmute_list(p, M, &list, BUDGET).await.expect("unmute"));
+            list_phase::apply(p, &list, 0).await.expect("list phase");
+            list_phase::release_with(p, &list, &waiting).await.expect("release")
+        }
+    };
+    // Not the owner's last list: the pairs stay, and so does the job.
+    assert_eq!(drop_list(first).await, list_phase::Released::Gone { items: 0 });
+    assert_eq!(waiting.of(OWNER), [(M.to_string(), "mute".to_string())]);
+    assert_eq!(job(p, OWNER).await.0, "queued");
+    // The last one: cancelled, and the owner's pairs are gone.
+    assert_eq!(drop_list(second).await, list_phase::Released::Gone { items: 0 });
+    assert_eq!(job(p, OWNER).await.0, "cancelled");
+    assert!(waiting.of(OWNER).is_empty());
+    assert_eq!(waiting.of(OTHER), [(M.to_string(), "mute".to_string())]);
     db.drop_db().await;
 }
 
@@ -662,8 +807,8 @@ async fn b74_a_held_list_row_never_slows_a_members_mute() {
 /// and the list phase leaves the change marker; the next process's applier
 /// processes it at startup and the reference takes effect after one sync.
 /// The kill is a dropped applier that never ran; the restart a new one.
-/// The applier's full reconcile also corrects a hand-made `unreferenced`
-/// row that has an admitted reference.
+/// The recovery sweep's full reconcile also corrects a hand-made
+/// `unreferenced` row that has an admitted reference.
 #[tokio::test]
 async fn b74_a_marker_left_by_a_kill_is_applied_after_restart() {
     const OWNER: &str = "did:plc:b74killowner";
@@ -689,9 +834,9 @@ async fn b74_a_marker_left_by_a_kill_is_applied_after_restart() {
     assert!(effective(p, M, &list).await);
 
     // A row set `unreferenced` by hand, with no marker, while an admitted
-    // reference exists.
+    // reference exists: the recovery sweep's full reconcile corrects it.
     sqlx::query("UPDATE subscribed_lists SET state = 'unreferenced' WHERE list_uri = $1").bind(&list).execute(p).await.expect("by hand");
-    assert!(after.reconcile().await.expect("reconcile").is_empty());
+    sync.sweep_once().await.expect("recovery sweep");
     let (state, unsynced): (String, bool) = sqlx::query_as("SELECT state, synced_at IS NULL FROM subscribed_lists WHERE list_uri = $1")
         .bind(&list)
         .fetch_one(p)

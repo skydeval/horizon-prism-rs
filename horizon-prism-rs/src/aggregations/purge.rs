@@ -175,8 +175,10 @@ impl Purger {
             .bind(did)
             .execute(&mut *tx)
             .await?;
+        // A new generation (§II-5.10): a run cancelled here can settle
+        // nothing, even once a later insert has queued its row again.
         sqlx::query(
-            "UPDATE backfill_jobs SET state = 'cancelled', updated_at = now() \
+            "UPDATE backfill_jobs SET state = 'cancelled', generation = generation + 1, updated_at = now() \
              WHERE did = $1 AND state IN ('queued', 'running')",
         )
         .bind(did)
@@ -360,7 +362,7 @@ impl Purger {
         // owed a list sync. Its owner row is taken before any job row.
         triggers::request_if_active(&mut tx, did, list_sync::LOW, self.sync_min_interval_secs).await?;
         sqlx::query(
-            "UPDATE backfill_jobs SET state = 'queued', not_before = now(), updated_at = now() \
+            "UPDATE backfill_jobs SET state = 'queued', generation = generation + 1, not_before = now(), updated_at = now() \
              WHERE did = $1 AND depth IN ('member', 'private', 'authz') AND state IN ('queued', 'running')",
         )
         .bind(did)

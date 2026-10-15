@@ -3,6 +3,9 @@
 //! Every enqueue upserts `(did, depth)` to `queued` with `attempts = 0`, even
 //! when a job is `running`: a readiness-clearing event must make the running
 //! job's final epoch/state check fail, so it cannot restore stale readiness.
+//! Every reset of an existing row also moves its `generation` on
+//! (design-v4 §II-5.10 "Generations"), so a run that began before it can
+//! write nothing more to the row, even once another worker has claimed it.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
@@ -51,7 +54,7 @@ impl Depth {
 
 const UPSERT: &str = "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error, updated_at) \
      VALUES ($1, $2, 'queued', 0, $3, NULL, now()) \
-     ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, \
+     ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
        not_before = EXCLUDED.not_before, last_error = NULL, updated_at = now()";
 
 /// Enqueue (or reset to queued) one job, due now.
@@ -95,7 +98,7 @@ pub async fn enqueue_many(conn: &mut PgConnection, dids: &[String], depth: Depth
     let n = sqlx::query(
         "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error, updated_at) \
          SELECT d, $2, 'queued', 0, now(), NULL, now() FROM unnest($1::text[]) AS d \
-         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, \
+         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
            not_before = now(), last_error = NULL, updated_at = now()",
     )
     .bind(dids)
@@ -127,7 +130,7 @@ pub async fn enqueue_staggered(
     let n = sqlx::query(
         "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error, updated_at) \
          SELECT d, 'resync', 'queued', 0, nb, NULL, now() FROM unnest($1::text[], $2::timestamptz[]) AS t(d, nb) \
-         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, \
+         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
            not_before = EXCLUDED.not_before, last_error = NULL, updated_at = now() \
          WHERE backfill_jobs.state <> 'queued'",
     )
