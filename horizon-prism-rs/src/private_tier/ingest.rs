@@ -190,6 +190,12 @@ async fn enqueue_private(conn: &mut PgConnection, did: &str) -> Result<(), sqlx:
     Ok(())
 }
 
+/// The private-ingest insert, for tests that race it against a run.
+#[cfg(test)]
+pub(crate) async fn enqueue_private_for_tests(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+    enqueue_private(conn, did).await
+}
+
 /// `ingest::apply`: LWW create/update (§5.5) of an admitted private record.
 ///
 /// A `postPrivate` or `audience` row for a DID with no prior rows re-evaluates

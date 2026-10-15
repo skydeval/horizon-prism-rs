@@ -161,6 +161,10 @@ pub async fn settle(
     end: RunEnd<'_>,
     min_interval_secs: u32,
 ) -> Result<bool, sqlx::Error> {
+    #[cfg(test)]
+    if crate::test_support::hooks::injected(crate::test_support::hooks::SETTLE_FAILS, owner) {
+        return Err(sqlx::Error::Protocol("injected settle failure".into()));
+    }
     let running: Option<(bool, i32)> = sqlx::query_as(
         "SELECT rerun_requested, attempts FROM backfill_jobs WHERE did = $1 AND depth = $2 AND state = 'running' AND generation = $3 FOR UPDATE",
     )

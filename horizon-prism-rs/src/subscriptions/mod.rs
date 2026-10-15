@@ -56,6 +56,8 @@ where
 
 pub mod applier;
 pub mod claim;
+#[cfg(test)]
+mod concurrency_tests;
 pub mod copy;
 pub mod fetch;
 pub mod gauges;

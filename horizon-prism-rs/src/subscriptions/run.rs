@@ -146,6 +146,8 @@ async fn attempt(
         end(RunEnd::Done, None).await?;
         return Ok(Outcome::Empty);
     }
+    #[cfg(test)]
+    crate::test_support::hooks::pause(crate::test_support::hooks::RUN_AFTER_SNAPSHOT, owner).await;
     // 2. The owner's status, once.
     let rev = match source.status(owner).await {
         Err(error) => {

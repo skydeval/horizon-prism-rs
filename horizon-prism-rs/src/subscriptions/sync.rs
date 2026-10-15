@@ -385,6 +385,8 @@ async fn one_batch(pool: &PgPool, snap: &Snapshot, list: &SnapList, listing: &Li
     if !current(&mut tx, snap).await? {
         return Err(Stopped::Superseded);
     }
+    #[cfg(test)]
+    crate::test_support::hooks::pause(crate::test_support::hooks::BATCH_HOLDS_LIST_ROW, &list.uri).await;
     write_batch(&mut tx, snap, list, listing, batch).await?;
     tx.commit().await?;
     Ok(true)

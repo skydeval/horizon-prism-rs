@@ -696,6 +696,40 @@ pub(crate) mod tests {
         assert!(!cascade.breaker_open("bluesky"));
     }
 
+    /// B-65 breaker (R3-174; R3-67, R3-91, R3-107): with an upstream that
+    /// answers in 900 ms, 20 responses whose 800 ms budget
+    /// (`hydration::SYNC_TIMEOUT`) cuts the call leave the network's breaker
+    /// closed, and each cut is counted in `upstream_budget_cutoff_total`.
+    #[tokio::test]
+    async fn b65_twenty_budget_cuts_leave_the_breaker_closed_and_are_counted() {
+        use crate::test_support::series;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let router = Router::new().route(
+            "/xrpc/{method}",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                axum::Json(json!({"did": "did:plc:x", "handle": "x.test"})).into_response()
+            }),
+        );
+        let base = serve_fake(router).await;
+        let cascade = cascade_for(&[("bluesky", &base)]);
+        let responses = (0..20).map(|_| {
+            let cascade = &cascade;
+            async move {
+                let req = Requester::test().with_deadline(Instant::now() + crate::hydration::SYNC_TIMEOUT);
+                cascade.fetch(&req, Some("bluesky"), Call::Profile("x.test")).await
+            }
+        });
+        for fetched in futures::future::join_all(responses).await {
+            assert_eq!(fetched, Fetched::NoAnswer(Vec::new()));
+        }
+        assert!(!cascade.breaker_open("bluesky"));
+        assert_eq!(series(&handle.render(), METRIC_BUDGET_CUTOFF, &[r#"network="bluesky""#]), Some(20.0));
+    }
+
     #[tokio::test]
     async fn a_passed_deadline_is_no_answer() {
         let (missing, calls) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound", "message": "x"})).await;

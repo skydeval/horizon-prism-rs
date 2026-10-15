@@ -2352,4 +2352,207 @@ mod tests {
         assert_eq!(ran().await.last().map(String::as_str), Some("did:plc:r0005"));
         db.drop_db().await;
     }
+
+    /// A PDS with nothing listed whose `getLatestCommit` answers only when
+    /// the test lets it: the n-th call waits for `gates[n]`. With
+    /// `first_fails` the first call then fails.
+    struct Gated {
+        calls: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::watch::Sender<usize>,
+        gates: [tokio::sync::Semaphore; 2],
+        first_fails: bool,
+    }
+
+    impl Gated {
+        fn new(first_fails: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                entered: tokio::sync::watch::Sender::new(0),
+                gates: [tokio::sync::Semaphore::new(0), tokio::sync::Semaphore::new(0)],
+                first_fails,
+            })
+        }
+
+        /// Wait until `n` runs are inside `getLatestCommit`.
+        async fn entered(&self, n: usize) {
+            let mut entered = self.entered.subscribe();
+            tokio::time::timeout(Duration::from_secs(20), entered.wait_for(|e| *e >= n))
+                .await
+                .expect("the run reached the PDS")
+                .expect("gate");
+        }
+
+        fn release(&self, n: usize) {
+            self.gates[n].add_permits(1);
+        }
+    }
+
+    #[async_trait]
+    impl BackfillSource for Gated {
+        async fn prepare(&self, _did: &str) -> Result<String, PrepareError> {
+            Ok("https://pds.example".to_string())
+        }
+        async fn latest_rev(&self, _pds: &str, _did: &str) -> Result<String, String> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.send_modify(|e| *e += 1);
+            if let Some(gate) = self.gates.get(n) {
+                gate.acquire().await.expect("gate").forget();
+            }
+            if n == 0 && self.first_fails {
+                return Err("the PDS went away".to_string());
+            }
+            Ok("3kzzzzzzzzzzz".to_string())
+        }
+        async fn list_records(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<ListPage, String> {
+            Ok(ListPage { records: Vec::new(), cursor: None })
+        }
+        async fn get_record(&self, _: &str, _: &str, _: &str, _: &str) -> Result<Option<ListedRecord>, String> {
+            Ok(None)
+        }
+        async fn inbound_blocks(&self, _: &str, _: Option<&str>) -> Result<LinksPage, String> {
+            Ok(LinksPage { total: 0, linking_records: Vec::new(), cursor: None })
+        }
+    }
+
+    /// A member, its `member` (or `private`) job queued, and a backfill
+    /// over `source`.
+    async fn gated_backfill(pool: &PgPool, source: Arc<Gated>, depth: Depth) -> Backfill {
+        sqlx::query("INSERT INTO members (did, source) VALUES ($1, 'admin')").bind(DID).execute(pool).await.expect("member");
+        let mut conn = pool.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, depth).await.expect("enqueue");
+        let writer = Writer::new(pool.clone(), state(true), Arc::new(DisabledPrivateTier));
+        Backfill::new(writer, source, BackfillConfig::default(), 5)
+    }
+
+    /// `(state, attempts, last_error)` of the DID's job of `depth`, and
+    /// whether the member is ready.
+    async fn job_and_readiness(pool: &PgPool, depth: Depth) -> (String, i32, Option<String>, bool) {
+        sqlx::query_as(
+            "SELECT j.state, j.attempts, j.last_error, m.ready_at IS NOT NULL FROM backfill_jobs j JOIN members m ON m.did = j.did \
+             WHERE j.did = $1 AND j.depth = $2",
+        )
+        .bind(DID)
+        .bind(depth.as_str())
+        .fetch_one(pool)
+        .await
+        .expect("job")
+    }
+
+    /// B-65 member-job generations (design-v4 §II-5.10 "Generations";
+    /// R3-67, R3-91): a `member` job is re-enqueued while it runs and a
+    /// second worker claims it. The first run's `settle` writes nothing (no
+    /// `ready_at`, no `applied_rev`, no row change) and returns Superseded;
+    /// only the second run sets readiness.
+    #[tokio::test]
+    #[ignore = "chainlink #712: member jobs carry no generation; a stale run's settle passes once a second claim sets the row running again"]
+    async fn b65_a_superseded_member_run_settles_nothing() {
+        let Some(db) = fresh_db("b65_member_generation").await else {
+            return;
+        };
+        let p = &db.pool;
+        let source = Gated::new(false);
+        let backfill = gated_backfill(p, Arc::clone(&source), Depth::Member).await;
+        let run = |backfill: &Backfill| {
+            let backfill = backfill.clone();
+            tokio::spawn(async move { backfill.run_once_as(1).await })
+        };
+        let first = run(&backfill);
+        source.entered(1).await;
+        let mut conn = p.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Member).await.expect("re-enqueue");
+        drop(conn);
+        let second = run(&backfill);
+        source.entered(2).await;
+
+        source.release(0);
+        let (_, outcome) = first.await.expect("task").expect("db").expect("a job");
+        assert_eq!(outcome, JobOutcome::Superseded);
+        assert_eq!(job_and_readiness(p, Depth::Member).await, ("running".to_string(), 0, None, false));
+        let applied: Option<String> = sqlx::query_scalar("SELECT applied_rev FROM sync_state WHERE did = $1").bind(DID).fetch_optional(p).await.expect("sync_state").flatten();
+        assert_eq!(applied, None);
+
+        source.release(1);
+        let (_, outcome) = second.await.expect("task").expect("db").expect("a job");
+        assert_eq!(outcome, JobOutcome::Ready);
+        assert_eq!(job_and_readiness(p, Depth::Member).await, ("done".to_string(), 0, None, true));
+        db.drop_db().await;
+    }
+
+    /// B-65 member-job generations, the failing case: the first run fails
+    /// after a second worker has claimed the re-enqueued job. Its `fail()`
+    /// updates no row, and the second run's row is untouched.
+    #[tokio::test]
+    #[ignore = "chainlink #712: member jobs carry no generation; a stale run's fail() rewrites the live run's row"]
+    async fn b65_a_superseded_member_run_that_fails_leaves_the_live_row_alone() {
+        let Some(db) = fresh_db("b65_member_generation_fail").await else {
+            return;
+        };
+        let p = &db.pool;
+        let source = Gated::new(true);
+        let backfill = gated_backfill(p, Arc::clone(&source), Depth::Member).await;
+        let first = {
+            let backfill = backfill.clone();
+            tokio::spawn(async move { backfill.run_once_as(1).await })
+        };
+        source.entered(1).await;
+        let mut conn = p.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Member).await.expect("re-enqueue");
+        drop(conn);
+        let second = {
+            let backfill = backfill.clone();
+            tokio::spawn(async move { backfill.run_once_as(1).await })
+        };
+        source.entered(2).await;
+
+        source.release(0);
+        let (_, outcome) = first.await.expect("task").expect("db").expect("a job");
+        assert!(matches!(outcome, JobOutcome::Failed(_) | JobOutcome::Superseded), "{outcome:?}");
+        assert_eq!(job_and_readiness(p, Depth::Member).await, ("running".to_string(), 0, None, false));
+        source.release(1);
+        assert_eq!(second.await.expect("task").expect("db").expect("a job").1, JobOutcome::Ready);
+        db.drop_db().await;
+    }
+
+    /// B-65 member-job generations, the purge case: a purge's marker
+    /// cancels a running `private` job, the private-ingest insert queues it
+    /// again and a second worker claims it, all before the first run
+    /// settles. The stale run settles nothing and the live row is left as
+    /// the second run has it.
+    #[tokio::test]
+    #[ignore = "chainlink #712: member jobs carry no generation; the purge cancel and the ingest re-queue leave a stale private run able to settle"]
+    async fn b65_a_private_run_cancelled_by_a_purge_and_requeued_settles_nothing() {
+        use crate::aggregations::{PurgeKind, Purger};
+
+        let Some(db) = fresh_db("b65_private_generation").await else {
+            return;
+        };
+        let p = &db.pool;
+        let source = Gated::new(false);
+        let backfill = gated_backfill(p, Arc::clone(&source), Depth::Private).await;
+        let first = {
+            let backfill = backfill.clone();
+            tokio::spawn(async move { backfill.run_once_as(1).await })
+        };
+        source.entered(1).await;
+        let purger = Purger::new(p.clone(), backfill.writer.scope().clone(), Arc::new(DisabledPrivateTier));
+        purger.marker(DID, PurgeKind::OutOfScope).await.expect("purge marker");
+        assert_eq!(job_and_readiness(p, Depth::Private).await.0, "cancelled");
+        let mut conn = p.acquire().await.expect("conn");
+        crate::private_tier::ingest::enqueue_private_for_tests(&mut conn, DID).await.expect("ingest insert");
+        drop(conn);
+        assert_eq!(job_and_readiness(p, Depth::Private).await.0, "queued");
+        let second = {
+            let backfill = backfill.clone();
+            tokio::spawn(async move { backfill.run_once_as(1).await })
+        };
+        source.entered(2).await;
+
+        source.release(0);
+        let (_, outcome) = first.await.expect("task").expect("db").expect("a job");
+        assert_eq!(outcome, JobOutcome::Superseded);
+        assert_eq!(job_and_readiness(p, Depth::Private).await.0, "running", "the live run's row is untouched");
+        source.release(1);
+        second.await.expect("task").expect("db").expect("a job");
+        db.drop_db().await;
+    }
 }

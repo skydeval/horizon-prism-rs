@@ -12,6 +12,17 @@ commit.
 
 ### Added
 
+- **Concurrency tests for jobs and list subscriptions (#712; Phase B
+  B-65, B-74).** Test-only pause and fault-injection hooks
+  (`test_support::hooks`, compiled only for tests) and `pg_locks` helpers,
+  with 19 tests: a mute never waits on a batch holding its list, a lost
+  deadlock is retried in place, a reference admitted mid-run waits for the
+  rerun, the list-sync lane cap, priority raise, a stuck row's recovery
+  bound, the breaker under budget cuts, a held list row never slows a
+  mute, a marker left by a kill is applied after restart, a 50 000-item
+  list released within 60 s, and the 35 s unreferenced bound. Four tests
+  are ignored until the bugs they found are fixed (#713, #714).
+
 - **List subscription and reference gauges (#710; design-v4 §4.7.6).**
   Sampled every 300 s with the storage gauges:
   `list_subscriptions_total` (active subscribed lists),

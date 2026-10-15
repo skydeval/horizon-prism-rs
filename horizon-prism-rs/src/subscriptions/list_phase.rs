@@ -255,6 +255,8 @@ pub async fn release(pool: &PgPool, list: &str) -> Result<Released, sqlx::Error>
         items += deleted;
         if deleted > 0 {
             tx.commit().await?;
+            #[cfg(test)]
+            crate::test_support::hooks::pause(crate::test_support::hooks::RELEASE_BETWEEN_BATCHES, list).await;
             continue;
         }
         // The final transaction: the owner's row (lock step 3), the list's

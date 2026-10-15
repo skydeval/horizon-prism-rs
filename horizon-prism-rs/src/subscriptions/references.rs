@@ -235,6 +235,8 @@ pub async fn mute_list(pool: &PgPool, member: &str, list: &str, budget: Budget) 
     .await?;
     let changed = recompute(&mut tx, member, Source::Mute, budget).await?;
     insert_markers(&mut tx, &changed).await?;
+    #[cfg(test)]
+    crate::test_support::hooks::pause(crate::test_support::hooks::MEMBER_PHASE_BEFORE_COMMIT, member).await;
     tx.commit().await?;
     Ok(Muted::Added)
 }
@@ -259,6 +261,8 @@ pub async fn unmute_list(pool: &PgPool, member: &str, list: &str, budget: Budget
     let mut changed = drop_reference(&mut tx, member, list, Source::Mute).await?;
     changed.extend(recompute(&mut tx, member, Source::Mute, budget).await?);
     insert_markers(&mut tx, &changed).await?;
+    #[cfg(test)]
+    crate::test_support::hooks::pause(crate::test_support::hooks::MEMBER_PHASE_BEFORE_COMMIT, member).await;
     tx.commit().await?;
     Ok(removed)
 }
