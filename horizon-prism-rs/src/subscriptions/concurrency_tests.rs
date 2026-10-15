@@ -21,9 +21,10 @@ use super::references::{Budget, Muted, mute_list, unmute_list};
 use super::run::{Outcome, OwnerSource, OwnerStatus, Settings};
 use super::runner::{Lanes, ListSync};
 use super::{retryable, retrying};
-use crate::aggregations::{ScopeSets, ScopeState};
+use crate::aggregations::{PurgeKind, Purger, ScopeSets, ScopeState};
 use crate::config::ScopePolicy;
 use crate::firehose::backfill::ListedRecord;
+use crate::private_tier::DisabledPrivateTier;
 use crate::test_support::{fresh_db, holds_advisory, hooks, idle_in_transaction_pid, locked_relations, waits_on_lock};
 
 const BUDGET: Budget = Budget { max_references: 5, max_owners: 5 };
@@ -108,6 +109,11 @@ fn lanes(fast: u32, stuck_secs: u32) -> Lanes {
 
 /// A `ListSync` over [`Owners`], with no pause between runs of an owner.
 fn list_sync(pool: &PgPool, applier: &Applier, items: usize, lanes: Lanes) -> ListSync {
+    list_sync_in(pool, scope(), applier, items, lanes)
+}
+
+/// [`list_sync`] over the given `ScopeState`.
+fn list_sync_in(pool: &PgPool, scope: ScopeState, applier: &Applier, items: usize, lanes: Lanes) -> ListSync {
     let bounds = Bounds {
         max_records: 1_000_000,
         max_pages: 10_000,
@@ -118,7 +124,7 @@ fn list_sync(pool: &PgPool, applier: &Applier, items: usize, lanes: Lanes) -> Li
     };
     let settings = Settings { max_items: 100_000, tombstones_max_per_owner: 10_000, min_interval_secs: 0, bounds };
     let source = Arc::new(Owners { items, revs: AtomicU64::new(0) });
-    ListSync::new(pool.clone(), scope(), source, applier, settings, lanes)
+    ListSync::new(pool.clone(), scope, source, applier, settings, lanes)
 }
 
 /// A member's mute of `list`, then the list phase.
@@ -1002,5 +1008,83 @@ async fn b74_a_skipped_list_becomes_unreferenced_soon_after_its_row_is_free() {
     assert_eq!(markers(p, &list).await, 0);
     eprintln!("b74: a skipped list unreferenced {took:?} after its row was let go");
     task.abort();
+    db.drop_db().await;
+}
+
+/// #715 (design-v4 §4.3 "Fair claims"): the recovery sweep reads and adds
+/// its pairs under the `ScopeState` read guard. A member purge whose marker
+/// step comes while the sweep is between its read and its add waits for
+/// the sweep, so the purge's clearing of that member's pairs comes after
+/// the sweep's add and the pair does not come back.
+#[tokio::test]
+async fn i715_a_purge_cannot_fall_between_the_sweeps_read_and_add() {
+    const OWNER: &str = "did:plc:i715guardowner";
+    const M: &str = "did:plc:i715guardpurged";
+    const KEPT: &str = "did:plc:i715guardkept";
+    let Some(db) = fresh_db("i715_sweep_guard").await else {
+        return;
+    };
+    let p = &db.pool;
+    let list = list_of(OWNER);
+    subscribe(p, M, &list).await;
+    subscribe(p, KEPT, &list).await;
+    let scope = scope();
+    let applier = Applier::new(p.clone(), scope.clone(), 0);
+    let sync = list_sync_in(p, scope.clone(), &applier, 3, lanes(1, 5400));
+    let purger = Purger::new(p.clone(), scope, Arc::new(DisabledPrivateTier)).with_applier(applier.clone());
+
+    // The sweep has read both references owed a run, and adds nothing yet.
+    let paused = hooks::arm(hooks::RECOVERY_SWEEP_BEFORE_ADD, OWNER);
+    let sweep = tokio::spawn({
+        let sync = sync.clone();
+        async move { sync.sweep_once().await }
+    });
+    paused.reached().await;
+    let mut purge = tokio::spawn(async move { purger.purge(M, PurgeKind::MemberRemoved).await });
+    // The purge's marker step waits on the sweep's guard.
+    assert!(tokio::time::timeout(Duration::from_millis(500), &mut purge).await.is_err(), "the purge ran while the sweep held its read");
+    assert_eq!(count(p, "SELECT count(*) FROM purging_dids WHERE did = $1", M).await, 0);
+    paused.release();
+    sweep.await.expect("task").expect("sweep");
+    purge.await.expect("task").expect("purge");
+    assert_eq!(applier.waiting().of(OWNER), [(KEPT.to_string(), "mute".to_string())]);
+    drop(paused);
+    db.drop_db().await;
+}
+
+/// #715 (design-v4 §4.3 "Fair claims"): while a purge of a member is in
+/// flight, the recovery sweep adds none of its pairs, though its
+/// references are still owed a run (an `out_of_scope` purge keeps them).
+/// Once the purge ends, the next sweep adds them.
+#[tokio::test]
+async fn i715_the_sweep_skips_members_being_purged() {
+    const OWNER: &str = "did:plc:i715skipowner";
+    const M: &str = "did:plc:i715skippurged";
+    const KEPT: &str = "did:plc:i715skipkept";
+    let Some(db) = fresh_db("i715_sweep_skip").await else {
+        return;
+    };
+    let p = &db.pool;
+    let list = list_of(OWNER);
+    subscribe(p, M, &list).await;
+    subscribe(p, KEPT, &list).await;
+    let scope = scope();
+    let applier = Applier::new(p.clone(), scope.clone(), 0);
+    let sync = list_sync_in(p, scope.clone(), &applier, 3, lanes(1, 5400));
+    let purger = Purger::new(p.clone(), scope, Arc::new(DisabledPrivateTier)).with_applier(applier.clone());
+
+    // A purge of M, its batches done, held before its end.
+    let paused = hooks::arm(hooks::PURGE_BEFORE_END, M);
+    let purge = tokio::spawn(async move { purger.purge(M, PurgeKind::OutOfScope).await });
+    paused.reached().await;
+    sync.sweep_once().await.expect("sweep");
+    assert_eq!(applier.waiting().of(OWNER), [(KEPT.to_string(), "mute".to_string())]);
+    assert!(!effective(p, M, &list).await, "M's reference is still owed a run");
+
+    paused.release();
+    purge.await.expect("task").expect("purge");
+    sync.sweep_once().await.expect("sweep");
+    assert_eq!(applier.waiting().of(OWNER), [(KEPT.to_string(), "mute".to_string()), (M.to_string(), "mute".to_string())]);
+    drop(paused);
     db.drop_db().await;
 }

@@ -261,6 +261,54 @@ pub async fn interrupt(pool: &sqlx::PgPool, owner: &str, min_interval_secs: u32,
     Ok(true)
 }
 
+/// The retry scheduler's re-queue (design-v4 §II-5.10 "Retry scheduler",
+/// §4.3 "Retries"): every `failed` row whose owner still has an active
+/// list and is not gone goes back to `queued` with its attempts reset, at a
+/// new generation, no sooner than the owner's earliest start. Its priority
+/// is kept. Returns how many rows were re-queued.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn retry_failed(pool: &sqlx::PgPool, min_interval_secs: u32) -> Result<u64, sqlx::Error> {
+    let failed: Vec<String> = sqlx::query_scalar("SELECT did FROM backfill_jobs WHERE depth = $1 AND state = 'failed' ORDER BY did")
+        .bind(DEPTH)
+        .fetch_all(pool)
+        .await?;
+    let mut n = 0;
+    for owner in failed {
+        let mut tx = pool.begin().await?;
+        // Lock step 3 in its own statement, so the pacing read next is not
+        // a stale copy of the row.
+        sqlx::query("SELECT 1 FROM subscribed_owners WHERE owner_did = $1 FOR SHARE").bind(&owner).execute(&mut *tx).await?;
+        let pacing: OwnerPacing =
+            sqlx::query_as("SELECT last_run_ended_at, gone_suspect_at, owner_gone, slow_until, cut_until FROM subscribed_owners WHERE owner_did = $1")
+                .bind(&owner)
+                .fetch_optional(&mut *tx)
+                .await?
+                .unwrap_or_default();
+        if pacing.owner_gone {
+            continue;
+        }
+        // The scheduler's `now()`, clamped to the earliest start.
+        let earliest = earliest_start(&pacing, min_interval_secs, Utc::now());
+        n += sqlx::query(
+            "UPDATE backfill_jobs SET state = 'queued', attempts = 0, generation = generation + 1, rerun_requested = false, \
+               not_before = $3, updated_at = now() \
+             WHERE did = $1 AND depth = $2 AND state = 'failed' \
+               AND EXISTS (SELECT 1 FROM subscribed_lists WHERE owner_did = $1 AND state = 'active')",
+        )
+        .bind(&owner)
+        .bind(DEPTH)
+        .bind(earliest)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+    }
+    Ok(n)
+}
+
 /// End a run that is not a completion: the owner's row, then the job row,
 /// in one transaction.
 ///
@@ -364,6 +412,64 @@ mod tests {
         running(false).await;
         assert!(!end_run(p, OWNER, 7, RunEnd::Done, None, 600).await.expect("db"));
         assert_eq!(job().await.0, "running");
+        db.drop_db().await;
+    }
+
+    /// #715: the retry scheduler re-queues a failed row whose owner has an
+    /// active list and is not gone: attempts reset, a new generation, the
+    /// priority kept, not before the owner's earliest start. A gone owner,
+    /// an owner with no active list and other depths are left alone.
+    #[tokio::test]
+    async fn the_retry_scheduler_requeues_failed_list_syncs() {
+        const GONE: &str = "did:plc:gggggggggggggggggggggggg";
+        const UNLISTED: &str = "did:plc:uuuuuuuuuuuuuuuuuuuuuuuu";
+        let Some(db) = fresh_db("subscriptions_retry_failed").await else {
+            return;
+        };
+        let p = &db.pool;
+        for (n, (owner, state)) in [(OWNER, "active"), (GONE, "active"), (UNLISTED, "unreferenced")].into_iter().enumerate() {
+            sqlx::query("INSERT INTO subscribed_lists (list_uri, owner_did, state) VALUES ($1, $2, $3)")
+                .bind(format!("at://{owner}/app.bsky.graph.list/{n}"))
+                .bind(owner)
+                .bind(state)
+                .execute(p)
+                .await
+                .expect("list");
+            sqlx::query(
+                "INSERT INTO backfill_jobs (did, depth, state, attempts, priority, generation, last_error) \
+                 VALUES ($1, 'list_sync', 'failed', 5, 1, 3, 'boom')",
+            )
+            .bind(owner)
+            .execute(p)
+            .await
+            .expect("job");
+        }
+        sqlx::query("INSERT INTO backfill_jobs (did, depth, state, attempts) VALUES ($1, 'member', 'failed', 5)").bind(OWNER).execute(p).await.expect("member job");
+        sqlx::query("INSERT INTO subscribed_owners (owner_did, last_run_ended_at) VALUES ($1, now() - interval '100 seconds')").bind(OWNER).execute(p).await.expect("owner");
+        sqlx::query("INSERT INTO subscribed_owners (owner_did, owner_gone) VALUES ($1, true)").bind(GONE).execute(p).await.expect("gone");
+
+        assert_eq!(retry_failed(p, 600).await.expect("retry"), 1);
+        let row = |owner: &'static str, depth: &'static str| async move {
+            sqlx::query_as::<_, (String, i32, i16, i64, f64)>(
+                "SELECT state, attempts, priority, generation, extract(epoch FROM not_before - now())::float8 FROM backfill_jobs WHERE did = $1 AND depth = $2",
+            )
+            .bind(owner)
+            .bind(depth)
+            .fetch_one(p)
+            .await
+            .expect("job")
+        };
+        let (state, attempts, priority, generation, wait) = row(OWNER, DEPTH).await;
+        assert!(
+            state == "queued" && attempts == 0 && priority == LOW && generation == 4 && (490.0..=500.0).contains(&wait),
+            "{state} {attempts} {priority} {generation} {wait}"
+        );
+        for owner in [GONE, UNLISTED] {
+            assert_eq!((row(owner, DEPTH).await.0, row(owner, DEPTH).await.3), ("failed".to_string(), 3));
+        }
+        assert_eq!(row(OWNER, "member").await.0, "failed");
+        // Queued now, it is not re-queued again.
+        assert_eq!(retry_failed(p, 600).await.expect("retry"), 0);
         db.drop_db().await;
     }
 

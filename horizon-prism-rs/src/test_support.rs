@@ -155,6 +155,11 @@ pub mod hooks {
     /// transaction, its writes done (the owner's row taken), before its
     /// commit. Key: the list.
     pub const LIST_PHASE_BEFORE_COMMIT: &str = "b65_r3_159_list_phase_before_commit";
+    /// #715: the recovery sweep, its owed references read, before it adds
+    /// a pair to the owner's waiting set. Key: the owner.
+    pub const RECOVERY_SWEEP_BEFORE_ADD: &str = "i715_recovery_sweep_before_add";
+    /// #715: a purge, its batches done, before its end. Key: the DID.
+    pub const PURGE_BEFORE_END: &str = "i715_purge_before_end";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);

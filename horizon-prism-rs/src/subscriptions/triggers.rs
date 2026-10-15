@@ -13,6 +13,7 @@ use sqlx::{PgConnection, PgPool};
 
 use super::applier::Waiting;
 use super::jobs;
+use crate::aggregations::ScopeState;
 
 /// `worker_state` key recording the last weekly run.
 const WEEKLY_KEY: &str = "list_sync_weekly_ran_at";
@@ -93,7 +94,11 @@ pub async fn owner_event(pool: &PgPool, owner: &str, min_interval_secs: u32) -> 
 ///
 /// It rebuilds the waiting sets from the tables: the pair of every
 /// reference that is owed a run to an active list, whatever its owner's
-/// state. A pair already there keeps its time.
+/// state. A pair already there keeps its time. It reads and adds under the
+/// `ScopeState` read guard and skips members being purged, so a purge's
+/// marker step cannot fall between the read and the add, and the sweep
+/// never adds back a pair a purge just cleared (design-v4 §4.3 "Fair
+/// claims").
 ///
 /// It then enqueues every owner that is not gone, not suspected (its own
 /// re-queue covers it) and not recently cut, and that has an active list
@@ -103,15 +108,23 @@ pub async fn owner_event(pool: &PgPool, owner: &str, min_interval_secs: u32) -> 
 /// # Errors
 ///
 /// Database errors.
-pub async fn recovery_sweep(pool: &PgPool, waiting: &Waiting, min_interval_secs: u32) -> Result<u64, sqlx::Error> {
-    let owed: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT DISTINCT l.owner_did, r.member_did, r.source FROM subscribed_lists l JOIN list_references r ON r.list_uri = l.list_uri \
-         WHERE l.state = 'active' AND r.admitted AND NOT r.effective AND r.unlisted_at IS NULL",
-    )
-    .fetch_all(pool)
-    .await?;
-    for (owner, member, source) in &owed {
-        waiting.add_if_absent(owner, member, source);
+pub async fn recovery_sweep(pool: &PgPool, scope: &ScopeState, waiting: &Waiting, min_interval_secs: u32) -> Result<u64, sqlx::Error> {
+    {
+        // Taken before the read's connection, given up before any enqueue.
+        let sets = scope.read_guard().await;
+        let owed: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT DISTINCT l.owner_did, r.member_did, r.source FROM subscribed_lists l JOIN list_references r ON r.list_uri = l.list_uri \
+             WHERE l.state = 'active' AND r.admitted AND NOT r.effective AND r.unlisted_at IS NULL",
+        )
+        .fetch_all(pool)
+        .await?;
+        for (owner, member, source) in &owed {
+            #[cfg(test)]
+            crate::test_support::hooks::pause(crate::test_support::hooks::RECOVERY_SWEEP_BEFORE_ADD, owner).await;
+            if sets.purge_kind(member).is_none() {
+                waiting.add_if_absent(owner, member, source);
+            }
+        }
     }
     let owners: Vec<(String, bool)> = sqlx::query_as(
         "SELECT l.owner_did, bool_or(EXISTS (SELECT 1 FROM list_references r WHERE r.list_uri = l.list_uri \
@@ -195,6 +208,8 @@ pub async fn weekly(pool: &PgPool, min_interval_secs: u32, spacing: Duration) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregations::ScopeSets;
+    use crate::config::ScopePolicy;
     use crate::subscriptions::list_phase;
     use crate::subscriptions::references::{Budget, mute_list};
     use crate::test_support::fresh_db;
@@ -229,7 +244,8 @@ mod tests {
         // The sweep finds both owners' waiting references again, and
         // rebuilds the waiting sets.
         let waiting = Waiting::default();
-        assert_eq!(recovery_sweep(p, &waiting, 600).await.expect("sweep"), 2);
+        let scope = ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10_000);
+        assert_eq!(recovery_sweep(p, &scope, &waiting, 600).await.expect("sweep"), 2);
         assert_eq!(job(A).await, Some(("queued".to_string(), jobs::HIGH)));
         assert_eq!(waiting.of(B), vec![(M1.to_string(), "mute".to_string())]);
 
@@ -238,11 +254,11 @@ mod tests {
         clear().await;
         sqlx::query("UPDATE subscribed_owners SET gone_suspect_at = now() WHERE owner_did = $1").bind(A).execute(p).await.expect("suspect");
         sqlx::query("UPDATE list_references SET effective = true").execute(p).await.expect("effective");
-        assert_eq!(recovery_sweep(p, &waiting, 600).await.expect("sweep"), 1);
+        assert_eq!(recovery_sweep(p, &scope, &waiting, 600).await.expect("sweep"), 1);
         assert_eq!((job(A).await, job(B).await), (None, Some(("queued".to_string(), jobs::LOW))));
         clear().await;
         sqlx::query("UPDATE subscribed_owners SET cut_until = now() + interval '1 day' WHERE owner_did = $1").bind(B).execute(p).await.expect("cut");
-        assert_eq!(recovery_sweep(p, &waiting, 600).await.expect("sweep"), 0);
+        assert_eq!(recovery_sweep(p, &scope, &waiting, 600).await.expect("sweep"), 0);
 
         // An event enqueues only an owner that looks gone.
         assert!(owner_event(p, A, 600).await.expect("event"));

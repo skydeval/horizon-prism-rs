@@ -102,6 +102,8 @@ impl Purger {
             Err(e) => return Err(e),
         }
         self.run_batches(did, kind).await?;
+        #[cfg(test)]
+        crate::test_support::hooks::pause(crate::test_support::hooks::PURGE_BEFORE_END, did).await;
         self.end(did).await
     }
 

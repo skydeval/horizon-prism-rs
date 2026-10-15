@@ -1551,6 +1551,13 @@ commit.
   daily orphan sweep of §14.1 is built: leftover `unreferenced` rows are
   released, list-less items and owner rows removed (race-safe against a
   new reference, R3-159), and missing owner rows created.
+- **List sync retries and the recovery sweep's purge guard (#715).**
+  Failed `list_sync` jobs are re-queued every `retry_every_hours` with
+  their attempts reset, a new generation and the owner's pacing (an owner
+  that is gone, or has no active list, is left alone). The recovery sweep
+  holds the scope read guard while it adds waiting pairs and skips
+  members being purged, so a purge cannot fall between its read and its
+  add.
 - Tests that silenced the panic hook for the whole process now silence
   only their own thread, so other tests' failures print their message.
 

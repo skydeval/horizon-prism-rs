@@ -1422,7 +1422,8 @@ impl Backfill {
 
     /// Every `retry_every_hours`: re-queue failed `member`, `private`, `authz`
     /// and `resync` jobs of DIDs still tracked, resetting attempts, at a new
-    /// generation.
+    /// generation. Failed `list_sync` jobs are re-queued on the same period
+    /// by the list sync's own loop (`ListSync::sweep_loop`), paced by owner.
     async fn retry_loop(self) {
         let every = Duration::from_secs(u64::from(self.settings.retry_every_hours.max(1)) * 3600);
         let mut tick = tokio::time::interval(every);

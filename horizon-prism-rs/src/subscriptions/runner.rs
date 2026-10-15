@@ -186,15 +186,34 @@ impl ListSync {
             // one without is looked at again by the next sweep.
             tracing::info!(event = "list_reconcile_busy", lists = busy.len(), "lists busy during the full reconcile");
         }
-        triggers::recovery_sweep(&self.pool, &self.waiting, self.settings.min_interval_secs).await
+        triggers::recovery_sweep(&self.pool, &self.scope, &self.waiting, self.settings.min_interval_secs).await
     }
 
-    /// The recovery sweep, now and then every `every` (the retry
-    /// scheduler's period), each followed by the weekly run when a week
-    /// has passed.
+    /// The retry scheduler's re-queue of failed `list_sync` rows
+    /// ([`jobs::retry_failed`]). Returns how many.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn retry_once(&self) -> Result<u64, sqlx::Error> {
+        jobs::retry_failed(&self.pool, self.settings.min_interval_secs).await
+    }
+
+    /// The recovery sweep now, then the retry scheduler's `list_sync` work
+    /// every `every` (its period): the re-queue of failed rows, then the
+    /// sweep. Each sweep is followed by the weekly run when a week has
+    /// passed.
     pub async fn sweep_loop(self, every: Duration) {
         let pause = self.settings.min_interval_secs;
+        let mut first = true;
         loop {
+            // The scheduler re-queues on its period, not at startup.
+            if !std::mem::take(&mut first) {
+                match self.retry_once().await {
+                    Ok(n) => tracing::info!(event = "list_sync_retry_scheduled", jobs = n, "failed list syncs re-queued"),
+                    Err(error) => tracing::warn!(event = "list_sync_retry_failed", %error, "re-queueing failed list syncs failed"),
+                }
+            }
             match self.sweep_once().await {
                 Ok(n) => tracing::info!(event = "list_sync_recovery_sweep", owners = n, "list sync recovery sweep"),
                 Err(error) => tracing::warn!(event = "list_sync_recovery_sweep_failed", %error, "the list sync recovery sweep failed"),
