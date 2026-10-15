@@ -166,6 +166,12 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
                 m.insert("viewer".into(), json!({}));
             }
             for (k, child) in m.iter_mut() {
+                // Every `viewer` here is local now (or `{}`): walking it would
+                // strip the labels and viewer state of the list views behind
+                // `mutedByList` and `blockingByList` (B-73).
+                if k == "viewer" {
+                    continue;
+                }
                 // Record bodies are the author's data: labels inside them
                 // (self-labels) are part of the record, not upstream labels.
                 if k == "record" && !child.get("$type").and_then(Value::as_str).is_some_and(|t| t.starts_with("app.bsky.embed")) && post_like {
@@ -281,6 +287,31 @@ mod tests {
         assert_eq!(v["posts"][0]["author"]["viewer"], json!({}), "anonymous-equivalent viewer");
         assert_eq!(v["posts"][0]["author"]["labels"][0]["src"], "did:web:here");
         assert!(v["posts"][0].get("labels").is_none());
+    }
+
+    /// B-73: the list view behind a local `blockingByList` keeps its labels
+    /// and the viewer's `blocked`, as on a local profile; the upstream's
+    /// viewer and its list view are gone.
+    #[test]
+    fn a_local_list_view_in_the_viewer_survives_normalization() {
+        let did = "did:plc:subject";
+        let list = "at://did:plc:owner/app.bsky.graph.list/1";
+        let local_list = json!({
+            "uri": list, "cid": "c", "name": "Mods", "purpose": "app.bsky.graph.defs#modlist",
+            "labels": [], "viewer": {"muted": false, "blocked": "at://did:plc:me/app.bsky.graph.listblock/1"},
+            "indexedAt": "2026-01-01T00:00:00Z"
+        });
+        let local_viewer = json!({"muted": false, "blockingByList": local_list, "blockedBy": false});
+        let mut v = json!({
+            "did": did, "handle": "s.example", "labels": [label("spam")],
+            "viewer": {"blockingByList": {"uri": "at://did:plc:up/app.bsky.graph.list/9", "viewer": {"muted": true}, "labels": [label("x")]}}
+        });
+        let mut overlay = Overlay::default();
+        overlay.profile_viewers.insert(did.into(), local_viewer.clone());
+        normalize_upstream(&mut v, &overlay);
+        assert_eq!(v["viewer"], local_viewer);
+        assert_eq!(v["viewer"]["blockingByList"]["labels"], json!([]));
+        assert!(v.get("labels").is_none());
     }
 
     #[test]

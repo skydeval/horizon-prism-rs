@@ -90,6 +90,30 @@ impl FarsightClient {
         })
     }
 
+    /// Whether `error` means the call never left: an address the §II-8.5
+    /// resolver guard refused (a literal, or every address of a hostname),
+    /// a scheme that is not allowed, or a URL that does not build. That is
+    /// a configuration fault, logged as an error at each refusal
+    /// (§5.14.4). The log names the method and `farsight.url`'s host only:
+    /// a `checkBlocks` URL carries the accounts asked about.
+    fn refused(&self, error: &NetError, method: &'static str) -> bool {
+        let reason = match error {
+            NetError::BlockedAddress { .. } => "blocked_address",
+            NetError::SchemeNotAllowed { .. } => "scheme_not_allowed",
+            NetError::InvalidUrl { .. } => "invalid_url",
+            _ => return false,
+        };
+        let host = Url::parse(&self.base).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+        tracing::error!(
+            event = "farsight_address_refused",
+            method,
+            host,
+            reason,
+            "the Farsight call was refused under the outbound guard; farsight.url must resolve to a public address"
+        );
+        true
+    }
+
     /// `checkBlocks(actor, others)`, read into pair answers. `others` are
     /// canonical DIDs that fit one call. `includeInactive` is never sent, so
     /// hidden blockers and hidden list owners contribute nothing.
@@ -100,14 +124,17 @@ impl FarsightClient {
     pub async fn check_blocks(&self, actor: &str, others: &[String], timeout: Duration) -> Result<ChunkAnswer, CallError> {
         let mut params: Vec<(&str, &str)> = vec![("actor", actor)];
         params.extend(others.iter().map(|o| ("others", o.as_str())));
-        let url = Url::parse_with_params(&format!("{}{CHECK_BLOCKS_PATH}", self.base), &params).map_err(|_| CallError::RefusedAddress)?;
+        let url = Url::parse_with_params(&format!("{}{CHECK_BLOCKS_PATH}", self.base), &params).map_err(|e| {
+            self.refused(&NetError::InvalidUrl { url: String::new(), reason: e.to_string() }, "checkBlocks");
+            CallError::RefusedAddress
+        })?;
         let options = RequestOptions::new(BodyCap::APPVIEW)
             .timeout(timeout)
             .header(AUTHORIZATION, self.authorization.clone());
         let response = self.net.get(url.as_str(), &options).await.map_err(|e| match e {
             NetError::Timeout => CallError::Timeout,
             NetError::BodyTooLarge { .. } => CallError::TooLarge,
-            NetError::BlockedAddress { .. } | NetError::SchemeNotAllowed { .. } | NetError::InvalidUrl { .. } => CallError::RefusedAddress,
+            e if self.refused(&e, "checkBlocks") => CallError::RefusedAddress,
             _ => CallError::Transport,
         })?;
         if response.status.as_u16() != 200 {
@@ -134,13 +161,14 @@ impl FarsightClient {
     ///
     /// # Errors
     ///
-    /// A short reason: `timeout`, `transport`, `forbidden`, `status` or
-    /// `parse`.
+    /// A short reason: `timeout`, `transport`, `refused_address`,
+    /// `forbidden`, `status` or `parse`.
     pub async fn get_stats(&self) -> Result<Value, &'static str> {
         let url = format!("{}{GET_STATS_PATH}", self.base);
         let options = RequestOptions::new(BodyCap::REPO_STATUS).header(AUTHORIZATION, self.authorization.clone());
         let response = self.net.get(&url, &options).await.map_err(|e| match e {
             NetError::Timeout => "timeout",
+            e if self.refused(&e, "getStats") => "refused_address",
             _ => "transport",
         })?;
         match response.status.as_u16() {
@@ -162,7 +190,7 @@ impl FarsightClient {
     /// # Errors
     ///
     /// A short reason, for counting: `queue_full`, `rate_limited`,
-    /// `forbidden`, `status`, `timeout` or `transport`.
+    /// `forbidden`, `status`, `timeout`, `refused_address` or `transport`.
     pub async fn request_backfill(&self, actor: &str, force: bool) -> Result<(), &'static str> {
         let url = format!("{}{REQUEST_BACKFILL_PATH}", self.base);
         let mut body = serde_json::json!({"actor": actor, "priority": "normal"});
@@ -172,6 +200,7 @@ impl FarsightClient {
         let options = RequestOptions::new(BodyCap::REPO_STATUS).header(AUTHORIZATION, self.authorization.clone());
         let response = self.net.post_json(&url, &body, &options).await.map_err(|e| match e {
             NetError::Timeout => "timeout",
+            e if self.refused(&e, "requestBackfill") => "refused_address",
             _ => "transport",
         })?;
         if response.status.is_success() {
@@ -288,5 +317,61 @@ mod tests {
         let dead = FarsightClient::new(NetClient::loopback_for_tests(), "http://127.0.0.1:9", "fsk_test").expect("client");
         assert_eq!(dead.check_blocks(V, &[A.to_string()], Duration::from_secs(2)).await.err(), Some(CallError::Transport));
         assert!(FarsightClient::new(NetClient::loopback_for_tests(), "http://x", "bad\nkey").is_none());
+    }
+
+    /// Every name resolves to a private address.
+    struct PrivateDns;
+
+    impl crate::net::HostLookup for PrivateDns {
+        fn lookup(&self, _host: String) -> futures::future::BoxFuture<'static, Result<Vec<std::net::IpAddr>, crate::net::resolver::BoxError>> {
+            Box::pin(async { Ok(vec![std::net::IpAddr::from([192, 168, 1, 7])]) })
+        }
+    }
+
+    /// The log lines written while a test runs.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// B-81: `farsight.url` naming a host that resolves to a private
+    /// address is refused at each call, counted `refused_address` (not
+    /// `transport`), and logged as an error each time, naming no account.
+    #[tokio::test]
+    async fn a_hostname_resolving_privately_is_refused_and_logged_at_each_call() {
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let net = NetClient::with_lookup(&crate::net::NetConfig::new("appview.example.com", "https://plc.directory"), PrivateDns)
+            .expect("net");
+        let c = FarsightClient::new(net, "https://farsight.internal", "fsk_test").expect("client");
+
+        for _ in 0..2 {
+            let err = c.check_blocks(V, &[A.to_string()], Duration::from_secs(2)).await.err();
+            assert_eq!(err, Some(CallError::RefusedAddress));
+            assert_eq!(err.map(CallError::label), Some("refused_address"));
+        }
+        assert_eq!(c.request_backfill(V, false).await, Err("refused_address"));
+        assert_eq!(c.get_stats().await.err(), Some("refused_address"));
+
+        let text = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("utf-8");
+        let refusals: Vec<&str> = text.lines().filter(|l| l.contains("farsight_address_refused")).collect();
+        assert_eq!(refusals.len(), 4, "{text}");
+        assert!(refusals.iter().all(|l| l.contains("ERROR") && l.contains("farsight.internal")), "{text}");
+        // Neither the accounts asked about nor the key are logged.
+        assert!(!text.contains(A) && !text.contains("fsk_test"), "{text}");
     }
 }

@@ -1525,6 +1525,26 @@ commit.
 
 ### Fixed
 
+- **Phase B, B-64 to B-81 (#676).**
+  - **`subscribed-post` for accounts that are not tracked.** The "backfilled
+    once" fact (`sync_state.last_resync_at`) was written only for tracked
+    DIDs and was deleted with a removed member's repo-head state, so an
+    activity subscription to a followed non-member, or to a removed member
+    still in scope, never produced a notification. Every backfill job of a
+    DID in scope now records it, and removing a member keeps it while the
+    DID stays in scope.
+  - **A refused Farsight address is logged and counted as refused.** A
+    hostname that resolves only to non-public addresses was counted as a
+    transport error and not logged. The network client now reports a guard
+    refusal as `BlockedAddress` for hostnames as well as IP literals, and
+    Farsight logs `farsight_address_refused` at each refusal and counts
+    `refused_address` (also for `requestBackfill` and `getStats`).
+  - A `proxy_url` naming this AppView's own host with a trailing dot or in
+    another case is refused at startup, as the plain form already was.
+  - List views under `viewer.blockingByList` / `mutedByList` keep their
+    `labels` and `viewer` when the profile came from upstream, and both list
+    builders produce the same shape.
+
 - **Phase B, B-50 to B-63 (#676).**
   - **Muted threads write no notifications.** A reply or like in a
     thread the recipient muted is no longer written at all (it was

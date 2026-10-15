@@ -312,7 +312,10 @@ fn proxy_url(value: &str, allow_private_network: bool, public_hostname: &str) ->
     if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
         return Err(format!("{value:?} must be a scheme, host and optional port only"));
     }
-    if host.eq_ignore_ascii_case(public_hostname) {
+    // One name, however written: case, the URL's port and one trailing
+    // dot (the absolute form of the same name) do not tell them apart.
+    let bare = |h: &str| h.strip_suffix('.').unwrap_or(h).to_ascii_lowercase();
+    if bare(host) == bare(public_hostname) {
         return Err(format!("{value:?} is this AppView's own hostname"));
     }
     Ok(())
@@ -438,6 +441,11 @@ mod tests {
         assert!(p("https://contact.example.net?x=1", false).is_err());
         assert!(p("https://contact.example.net#f", false).is_err());
         assert!(p("https://APPVIEW.example.com", false).is_err());
+        // B-71: the absolute form, with or without a port, is the same name.
+        assert!(p("https://appview.example.com.", false).is_err());
+        assert!(p("https://APPVIEW.example.com.:8443/", false).is_err());
+        assert!(proxy_url("https://appview.example.com", false, "appview.example.com.").is_err());
+        assert!(p("https://appview.example.com.evil.net", false).is_ok());
         assert!(p("not a url", false).is_err());
     }
 

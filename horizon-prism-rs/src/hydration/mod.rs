@@ -773,37 +773,20 @@ impl Hydrator {
         .bind(&uris)
         .fetch_all(self.pool())
         .await?;
-        let muted: HashSet<String> = sqlx::query_scalar("SELECT list_uri FROM list_mutes WHERE viewer_did = $1 AND list_uri = ANY($2)")
-            .bind(me)
-            .bind(&uris)
-            .fetch_all(self.pool())
-            .await?
-            .into_iter()
-            .collect();
-        let blocked: HashMap<String, String> = sqlx::query_as(
-            "SELECT DISTINCT ON (list_uri) list_uri, uri FROM list_blocks WHERE author_did = $1 AND list_uri = ANY($2) ORDER BY list_uri, created_at, uri",
-        )
-        .bind(me)
-        .bind(&uris)
-        .fetch_all(self.pool())
-        .await?
-        .into_iter()
-        .collect();
+        // The viewer's state on each list as `list_basic` builds it, so a
+        // list view is the same whichever path rendered it (B-73).
+        let list_viewer = self.list_viewer_of(me, &uris).await?;
         let labels = self.load_labels(&uris).await?;
         Ok(rows
             .into_iter()
             .map(|(uri, cid, name, purpose, avatar_cid, indexed_at, pds)| {
-                let mut viewer = json!({ "muted": muted.contains(&uri) });
-                if let Some(record) = blocked.get(&uri) {
-                    viewer["blocked"] = json!(record);
-                }
                 let mut view = json!({
                     "uri": uri,
                     "cid": cid,
                     "name": name,
                     "purpose": purpose,
                     "labels": labels.get(&uri).cloned().unwrap_or_default(),
-                    "viewer": viewer,
+                    "viewer": list_viewer.view(&uri),
                     "indexedAt": ts(indexed_at),
                 });
                 let creator = uri_author(&uri).unwrap_or_default();

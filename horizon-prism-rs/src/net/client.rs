@@ -25,7 +25,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::{Host, Url};
 
-use super::resolver::{GuardedResolver, HickoryLookup, HostLookup, is_blocked};
+use super::resolver::{AllAddressesBlocked, GuardedResolver, HickoryLookup, HostLookup, is_blocked};
 use crate::config::AppConfig;
 
 /// Redirects followed per call (§8.5).
@@ -143,6 +143,12 @@ impl NetError {
     }
 
     fn from_reqwest(e: reqwest::Error) -> Self {
+        // A hostname whose every address the resolver guard refused fails
+        // inside reqwest as a connect error. The guard's typed error is in
+        // its source chain: the same refusal as an IP literal's.
+        if let Some(blocked) = guard_refusal(&e) {
+            return Self::BlockedAddress { host: blocked.host.clone() };
+        }
         if e.is_timeout() {
             Self::Timeout
         } else if e.is_redirect() {
@@ -153,6 +159,26 @@ impl NetError {
             Self::Transport(e)
         }
     }
+}
+
+/// The resolver guard's refusal, if it is what failed `error`.
+fn guard_refusal(error: &reqwest::Error) -> Option<&AllAddressesBlocked> {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = cause {
+        if let Some(blocked) = e.downcast_ref::<AllAddressesBlocked>() {
+            return Some(blocked);
+        }
+        // An `io::Error` can carry its cause inside, off the chain.
+        if let Some(blocked) = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .and_then(|inner| inner.downcast_ref::<AllAddressesBlocked>())
+        {
+            return Some(blocked);
+        }
+        cause = e.source();
+    }
+    None
 }
 
 /// A buffered response. Non-2xx statuses are not errors at this layer.
@@ -582,5 +608,31 @@ mod tests {
             .await
             .expect_err("blocked");
         assert!(matches!(err, NetError::BlockedAddress { .. }));
+    }
+
+    /// Every name resolves to a private address.
+    struct PrivateDns;
+
+    impl HostLookup for PrivateDns {
+        fn lookup(&self, _host: String) -> BoxFuture<'static, Result<Vec<IpAddr>, BoxError>> {
+            Box::pin(async { Ok(vec![IpAddr::from([10, 0, 0, 5])]) })
+        }
+    }
+
+    /// A hostname the resolver guard refuses is the same refusal as a
+    /// blocked literal, not a connect error (B-81).
+    #[tokio::test]
+    async fn a_hostname_the_guard_refuses_is_a_blocked_address() {
+        let c = NetClient::with_lookup(&NetConfig::new("appview.example.com", "https://plc.directory"), PrivateDns)
+            .expect("client builds");
+        let err = c
+            .get("https://internal.example/x", &RequestOptions::new(BodyCap::GET_RECORD))
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(&err, NetError::BlockedAddress { host } if host == "internal.example"),
+            "{err:?}"
+        );
+        assert!(err.is_transient());
     }
 }

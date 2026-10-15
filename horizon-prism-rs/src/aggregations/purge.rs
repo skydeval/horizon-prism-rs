@@ -976,4 +976,46 @@ mod tests {
         assert_eq!(count(p, "SELECT count(*) FROM list_reference_changes").await, 1);
         db.drop_db().await;
     }
+
+    /// B-75: a removed member stays in S with its authored rows, so its
+    /// "backfilled once" fact (`last_resync_at`, which `subscribed-post`
+    /// needs) stays; only the repo-head state of a tracked DID goes. Once
+    /// it leaves S the whole row goes.
+    #[tokio::test]
+    async fn a_removed_member_in_scope_keeps_last_resync_at() {
+        use crate::private_tier::KryphocronPrivateTier;
+
+        let Some(db) = fresh_db("purge_member_removed_sync_state").await else {
+            return;
+        };
+        let p = &db.pool;
+        exec(p, "INSERT INTO scope_dids (did, reasons) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 1)").await;
+        exec(p, "INSERT INTO members (did, source, ready_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin', now())").await;
+        exec(
+            p,
+            "INSERT INTO sync_state (did, applied_rev, head_rev, head_checked_at, last_resync_at) \
+             VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', '3kaaaaaaaaaaa', '3kaaaaaaaaaaa', now(), now())",
+        )
+        .await;
+        let mut sets = ScopeSets::default();
+        sets.members.insert(MEMBER.into());
+        sets.scope.insert(MEMBER.into());
+        let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10);
+        let purger = Purger::new(p.clone(), scope, Arc::new(KryphocronPrivateTier));
+
+        purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("member removed");
+        assert_eq!(
+            count(
+                p,
+                "SELECT count(*) FROM sync_state WHERE last_resync_at IS NOT NULL AND applied_rev IS NULL \
+                 AND head_rev IS NULL AND head_checked_at IS NULL",
+            )
+            .await,
+            1
+        );
+
+        purger.purge(MEMBER, PurgeKind::OutOfScope).await.expect("out of scope");
+        assert_eq!(count(p, "SELECT count(*) FROM sync_state").await, 0);
+        db.drop_db().await;
+    }
 }

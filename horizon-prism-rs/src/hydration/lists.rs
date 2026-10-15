@@ -111,7 +111,7 @@ pub(super) struct ListViewer {
 }
 
 impl ListViewer {
-    fn view(&self, list: &str) -> Value {
+    pub(super) fn view(&self, list: &str) -> Value {
         let mut v = Map::new();
         if self.known {
             v.insert("muted".into(), json!(self.muted.contains(list)));
@@ -143,6 +143,11 @@ impl Hydrator {
         let Some(me) = viewer.state_did() else {
             return Ok(ListViewer::default());
         };
+        self.list_viewer_of(me, lists).await
+    }
+
+    /// [`Self::list_viewer`] for the viewer `me`, whose state is hydrated.
+    pub(super) async fn list_viewer_of(&self, me: &str, lists: &[String]) -> Result<ListViewer, sqlx::Error> {
         let muted: Vec<String> = sqlx::query_scalar("SELECT list_uri FROM list_mutes WHERE viewer_did = $1 AND list_uri = ANY($2)")
             .bind(me)
             .bind(lists)

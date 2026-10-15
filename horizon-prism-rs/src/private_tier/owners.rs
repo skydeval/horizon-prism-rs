@@ -4,8 +4,9 @@
 //! `private_audiences` row **and** it is eligible: a community member, or a
 //! DID whose community-PDS hosting was confirmed (`private_owner_eligible`).
 //! On leaving the set, the same transaction deletes `private_owner_ready` and
-//! `private_owner_eligible` (unless still a member) and the `sync_state` row
-//! if the DID is no longer tracked.
+//! `private_owner_eligible` (unless still a member) and, if the DID is no
+//! longer tracked, its `sync_state` repo-head state (the whole row once it
+//! is outside S too).
 
 use std::collections::HashSet;
 
@@ -90,16 +91,41 @@ pub(crate) async fn reevaluate(conn: &mut PgConnection, did: &str) -> Result<App
             .bind(did)
             .execute(&mut *conn)
             .await?;
-        sqlx::query("DELETE FROM sync_state WHERE did = $1")
-            .bind(did)
-            .execute(&mut *conn)
-            .await?;
+        forget_tracked_sync_state(&mut *conn, did).await?;
     }
     Ok(Applied {
         changed: false,
         owners_joined: Vec::new(),
         owners_left: vec![did.to_string()],
     })
+}
+
+/// The `sync_state` part of leaving the tracked set. The repo-head columns
+/// belong to tracked DIDs only (§6.11.3), so they go. `last_resync_at` is
+/// also design-v3 §5.6's "backfilled once" fact for every DID in S, which
+/// `subscribed-post` needs: a DID that stays in S (a removed member keeps
+/// its authored rows and stays until the next rebuild, §6.11.7) keeps it.
+/// A DID outside S loses the whole row.
+async fn forget_tracked_sync_state(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+    let in_scope: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM scope_dids WHERE did = $1)")
+        .bind(did)
+        .fetch_one(&mut *conn)
+        .await?;
+    if in_scope {
+        sqlx::query(
+            "UPDATE sync_state SET applied_rev = NULL, head_rev = NULL, head_checked_at = NULL, \
+             diverged_since = NULL WHERE did = $1",
+        )
+        .bind(did)
+        .execute(&mut *conn)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM sync_state WHERE did = $1")
+            .bind(did)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Record a community-PDS confirmation, or remove eligibility after a failed

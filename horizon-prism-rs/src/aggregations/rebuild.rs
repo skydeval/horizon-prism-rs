@@ -242,7 +242,8 @@ impl Rebuild {
 
     /// Enqueue `resync` for in-scope DIDs not re-synced for 7 days, spaced
     /// 1 s apart. A DID's last re-sync is its `sync_state.last_resync_at`
-    /// (tracked DIDs) or its last completed `member`/`scope`/`resync` job.
+    /// (tracked DIDs and DIDs in S) or its last completed
+    /// `member`/`scope`/`resync` job.
     /// Jobs already queued or running are left alone.
     ///
     /// # Errors

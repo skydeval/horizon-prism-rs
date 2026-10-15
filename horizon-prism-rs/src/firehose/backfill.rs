@@ -1285,6 +1285,10 @@ impl Backfill {
         let is_member = guard.is_member(&job.did);
         let is_owner = guard.is_owner(&job.did);
         let tracked = guard.is_tracked(&job.did);
+        // Every job sets `last_resync_at` (§5.10) for a DID in S as well:
+        // it is design-v3 §5.6's "backfilled once" fact, which
+        // `subscribed-post` needs for an author that is not tracked.
+        let in_scope = guard.in_scope(&job.did);
         let mut tx = self.pool.begin().await?;
         let row: Option<(String, Option<i64>)> =
             sqlx::query_as("SELECT state, gap_epoch FROM backfill_jobs WHERE did = $1 AND depth = $2 FOR UPDATE")
@@ -1337,12 +1341,14 @@ impl Backfill {
                     .bind(&result.rev)
                     .execute(&mut *tx)
                     .await?;
+                } else if in_scope {
+                    touch_last_resync(&mut tx, &job.did).await?;
                 }
                 mark_done(&mut tx, job).await?;
                 if ready { JobOutcome::Ready } else { JobOutcome::Done }
             }
         } else {
-            if tracked {
+            if tracked || in_scope {
                 touch_last_resync(&mut tx, &job.did).await?;
             }
             mark_done(&mut tx, job).await?;
@@ -2096,6 +2102,34 @@ mod tests {
             assert_eq!(state, if attempt == MAX_ATTEMPTS { "failed" } else { "queued" });
         }
         drop(conn);
+        db.drop_db().await;
+    }
+
+    /// B-75 (design-v3 §5.6, §5.10): a `scope` job for a DID in S that is
+    /// not tracked records `last_resync_at`, the "backfilled once" fact
+    /// `subscribed-post` needs, and leaves `applied_rev` alone.
+    #[tokio::test]
+    async fn a_scope_job_for_an_untracked_did_in_s_sets_last_resync_at() {
+        let Some(db) = fresh_db("backfill_scope_last_resync").await else {
+            return;
+        };
+        let source = FakeSource { rev: "3kzzzzzzzzzzz".to_string(), ..FakeSource::default() };
+        let writer = Writer::new(db.pool.clone(), state(false), Arc::new(DisabledPrivateTier));
+        let backfill = Backfill::new(writer, Arc::new(source), BackfillConfig::default(), 5);
+        let mut conn = db.pool.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Scope).await.expect("enqueue");
+        drop(conn);
+        let (_, outcome) = backfill.run_once().await.expect("run").expect("job");
+        assert_eq!(outcome, JobOutcome::Done);
+        let row: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+            sqlx::query_as("SELECT applied_rev, last_resync_at FROM sync_state WHERE did = $1")
+                .bind(DID)
+                .fetch_optional(&db.pool)
+                .await
+                .expect("sync_state");
+        let (applied, last) = row.expect("a sync_state row");
+        assert_eq!(applied, None);
+        assert!(last.is_some());
         db.drop_db().await;
     }
 
