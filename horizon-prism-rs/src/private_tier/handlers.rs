@@ -21,13 +21,15 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-use super::emit::{BookmarkView, PrivateEmit, PrivateResponse, ThreadNode, ThreadParent};
+use super::emit::{BookmarkView, PrivateEmit, PrivateResponse, QuoteItem, ThreadNode, ThreadParent};
 use super::pipeline::{self, PipelineEnv, RequestState};
-use super::schema;
+use super::schema::{self, Interaction};
+use super::cursor as sealed;
 use crate::config::PrivateReadConfig;
+use crate::cursor_key::CursorKey;
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::NSID_POST_PRIVATE;
-use crate::hydration::actor::ProfileContext;
+use crate::hydration::actor::{ProfileContext, ProfileKind};
 use crate::hydration::embeds::{EMBED_RECORD_WITH_MEDIA, media_view, normalize_embed, quoted_uri};
 use crate::hydration::normalize::is_private_uri;
 use crate::hydration::{HydrationContext, ts};
@@ -43,6 +45,9 @@ pub const GET_TIMELINE: &str = "app.nearhorizon.private.getTimeline";
 pub const CREATE_BOOKMARK: &str = "app.nearhorizon.private.createBookmark";
 pub const DELETE_BOOKMARK: &str = "app.nearhorizon.private.deleteBookmark";
 pub const GET_BOOKMARKS: &str = "app.nearhorizon.private.getBookmarks";
+pub const GET_LIKES: &str = "app.nearhorizon.private.getLikes";
+pub const GET_REPOSTED_BY: &str = "app.nearhorizon.private.getRepostedBy";
+pub const GET_QUOTES: &str = "app.nearhorizon.private.getQuotes";
 
 /// Metric: handler time before the floor.
 const METRIC_UNFLOORED: &str = "private_read_unfloored_seconds";
@@ -59,6 +64,9 @@ pub struct Floors {
     pub get_author_feed: Duration,
     pub get_timeline: Duration,
     pub get_bookmarks: Duration,
+    pub get_likes: Duration,
+    pub get_reposted_by: Duration,
+    pub get_quotes: Duration,
 }
 
 /// State for the private router.
@@ -71,6 +79,8 @@ pub struct PrivateState {
     /// `bookmarks.max_per_actor`, counted over private bookmarks alone
     /// (private posting C-12).
     pub(super) bookmarks_max: u32,
+    /// The private cursor key (`APP_PRIVATE_CURSOR_KEY_HEX`, §3.6, C-14).
+    pub(super) cursor_key: CursorKey,
 }
 
 impl PrivateState {
@@ -83,6 +93,7 @@ impl PrivateState {
         freshness_bound: Duration,
         max_head_fetches: usize,
         cfg: &PrivateReadConfig,
+        cursor_key: CursorKey,
     ) -> Self {
         let pool = app.hydrator.pool().clone();
         let video = app.hydrator.video().clone();
@@ -104,9 +115,13 @@ impl PrivateState {
                 get_author_feed: Duration::from_millis(cfg.floor_ms.get_author_feed),
                 get_timeline: Duration::from_millis(cfg.floor_ms.get_timeline),
                 get_bookmarks: Duration::from_millis(cfg.floor_ms.get_bookmarks),
+                get_likes: Duration::from_millis(cfg.floor_ms.get_likes),
+                get_reposted_by: Duration::from_millis(cfg.floor_ms.get_reposted_by),
+                get_quotes: Duration::from_millis(cfg.floor_ms.get_quotes),
             },
             concurrency: usize::try_from(cfg.bind_concurrency).unwrap_or(8).max(1),
             bookmarks_max,
+            cursor_key,
         }
     }
 }
@@ -125,6 +140,9 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(CREATE_BOOKMARK), post(create_bookmark))
         .route(&xrpc(DELETE_BOOKMARK), post(delete_bookmark))
         .route(&xrpc(GET_BOOKMARKS), get(get_bookmarks))
+        .route(&xrpc(GET_LIKES), get(get_likes))
+        .route(&xrpc(GET_REPOSTED_BY), get(get_reposted_by))
+        .route(&xrpc(GET_QUOTES), get(get_quotes))
         .with_state(state)
 }
 
@@ -228,6 +246,12 @@ fn view_record(s: &PrivateState, quoted: &PrivateEmit<Value>, authors: &ProfileC
         "labels": v["labels"],
         "indexedAt": v["indexedAt"],
     });
+    // The four counts, as on every private post view (§4.6).
+    for key in COUNT_KEYS {
+        if let Some(n) = v.get(key) {
+            record[key] = n.clone();
+        }
+    }
     let media = match v.get("embed") {
         Some(media) => Some(media.clone()),
         None => stored_embed(quoted)
@@ -240,17 +264,58 @@ fn view_record(s: &PrivateState, quoted: &PrivateEmit<Value>, authors: &ProfileC
     record
 }
 
-/// `viewer` on each hit (private-posting design §4.6): `bookmarked`, from
-/// the caller's own private bookmarks (§4.3).
+/// The count fields of a private post view, in the order they are added.
+const COUNT_KEYS: [&str; 4] = ["replyCount", "repostCount", "likeCount", "quoteCount"];
+
+/// The counts on each hit (private-posting design §3.4, §4.6): integers,
+/// always present, 0 when none, each counting only what the caller is
+/// entitled to know exists, matched by URI.
+async fn counts(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&mut PrivateEmit<Value>]) -> Result<(), XrpcError> {
+    let uris: Vec<String> = posts.iter().filter_map(|p| view_uri(p)).collect();
+    if uris.is_empty() {
+        return Ok(());
+    }
+    let counts = schema::counts(&s.env.pool, &caller.did, &uris).await?;
+    for post in posts.iter_mut() {
+        let c = view_uri(post).and_then(|u| counts.get(&u).copied()).unwrap_or_default();
+        for (key, n) in COUNT_KEYS.into_iter().zip([c.reply, c.repost, c.like, c.quote]) {
+            post.decorate(key, json!(n));
+        }
+    }
+    Ok(())
+}
+
+/// `viewer` on each hit (private-posting design §4.6):
+/// - `bookmarked`, from the caller's own private bookmarks (§4.3);
+/// - `like` and `repost`: the caller's own newest like or repost of the
+///   post, by URI, so a refetch and a CID change keep them;
+/// - `threadMuted`, when the caller muted the thread root the post claims
+///   (C-18): its `reply.root`, or the post itself when top-level. Left out
+///   otherwise, as on public views.
 async fn viewer_state(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&mut PrivateEmit<Value>]) -> Result<(), XrpcError> {
     let uris: Vec<String> = posts.iter().filter_map(|p| view_uri(p)).collect();
     if uris.is_empty() {
         return Ok(());
     }
-    let marked: HashSet<String> = schema::bookmarked(&s.env.pool, &caller.did, &uris).await?.into_iter().collect();
+    let pool = &s.env.pool;
+    let marked: HashSet<String> = schema::bookmarked(pool, &caller.did, &uris).await?.into_iter().collect();
+    let likes = schema::own_interactions(pool, &caller.did, Interaction::Like, &uris).await?;
+    let reposts = schema::own_interactions(pool, &caller.did, Interaction::Repost, &uris).await?;
+    let roots: Vec<String> = posts.iter().filter_map(|p| claimed_root(p)).collect();
+    let muted: HashSet<String> = schema::muted_roots(pool, &caller.did, &roots).await?.into_iter().collect();
     for post in posts.iter_mut() {
-        let bookmarked = view_uri(post).is_some_and(|u| marked.contains(&u));
-        post.decorate("viewer", json!({"bookmarked": bookmarked}));
+        let uri = view_uri(post).unwrap_or_default();
+        let mut viewer = json!({"bookmarked": marked.contains(&uri)});
+        if let Some(like) = likes.get(&uri) {
+            viewer["like"] = json!(like);
+        }
+        if let Some(repost) = reposts.get(&uri) {
+            viewer["repost"] = json!(repost);
+        }
+        if claimed_root(post).is_some_and(|r| muted.contains(&r)) {
+            viewer["threadMuted"] = json!(true);
+        }
+        post.decorate("viewer", viewer);
     }
     Ok(())
 }
@@ -390,13 +455,14 @@ async fn gate_state(
 }
 
 /// The decoration pass of a page (private-posting design §3.3), over hits
-/// only: the operator labels, `viewer`, the gates (§4.4), then the record
-/// part of each `embed`. `roots_read` are the roots a thread handler read
-/// for the caller beyond the hits.
+/// only: the operator labels, the counts (§3.4), `viewer`, the gates
+/// (§4.4), then the record part of each `embed`. `roots_read` are the roots
+/// a thread handler read for the caller beyond the hits.
 ///
 /// - A quoted private post is read through the pipeline for the same reader
 ///   and the same `RequestState`, all of the page's at once: readable gives
-///   `#viewRecord`; anything else, a block with its author included, gives
+///   `#viewRecord`, with its counts; anything else, a block with its author
+///   included, gives
 ///   `#viewNotFound`, the answer for a URI that names nothing.
 /// - A quoted public post comes from local rows, in On mode only. With
 ///   nothing there the view carries no `embed`, for `record` and
@@ -417,6 +483,7 @@ async fn decorate(
     start: Instant,
 ) -> Result<(), XrpcError> {
     operator_labels(hydration, posts).await?;
+    counts(s, caller, posts).await?;
     viewer_state(s, caller, posts).await?;
     let read: HashSet<String> = posts.iter().filter_map(|p| view_uri(p)).chain(roots_read.iter().cloned()).collect();
     gate_state(s, caller, hydration, posts, &read).await?;
@@ -443,6 +510,7 @@ async fn decorate(
             read_many(s, rs, caller, &private, &quoted_authors, start).await.into_iter().flatten().collect();
         let mut refs: Vec<&mut PrivateEmit<Value>> = hits.iter_mut().collect();
         operator_labels(hydration, &mut refs).await?;
+        counts(s, caller, &mut refs).await?;
         for q in &hits {
             if let Some(uri) = view_uri(q) {
                 records.insert(uri, view_record(s, q, &quoted_authors));
@@ -803,15 +871,20 @@ const FEED_WINDOWS: usize = 2;
 const SECOND_WINDOW_BY: Duration = Duration::from_millis(600);
 
 /// One page of a feed: `actor`'s posts, or with no actor the caller's
-/// home timeline. The candidates only narrow the work; `pipeline::read`
-/// decides each post.
+/// home timeline, each with its repost items (§4.7). The candidates only
+/// narrow the work; `pipeline::read` decides each post.
 ///
 /// A window is `limit × 4` candidates. If it ends short of `limit` and
 /// candidates remain, one more is read, from after the last row the first
 /// examined, so that a run of posts nobody can read (content that does
 /// not decode, say) does not end the feed. The cursor is always that of
-/// the last readable post: it never carries the position of a post the
+/// the last readable item: it never carries the position of a post the
 /// caller may not read.
+///
+/// A repost item is its subject read for the caller, with `reason`
+/// (`app.bsky.feed.defs#reasonRepost`: `by` the reposter, `uri` the
+/// repost, `indexedAt` its time). A subject that misses leaves no trace of
+/// the repost.
 async fn feed_body(
     s: &PrivateState,
     caller: &VerifiedCaller,
@@ -829,7 +902,9 @@ async fn feed_body(
     // request, not per window.
     let rs = RequestState::new(s.env.max_head_fetches);
 
-    let mut feed = Vec::new();
+    let mut feed: Vec<PrivateEmit<Value>> = Vec::new();
+    // By feed item: the repost it stands for, `(uri, reposter, time)`.
+    let mut reposts: Vec<Option<(String, String, DateTime<Utc>)>> = Vec::new();
     let mut last_hit: Option<(DateTime<Utc>, String)> = None;
     let mut more = false;
     let mut after = after;
@@ -840,15 +915,17 @@ async fn feed_body(
         };
         let beyond = candidates.len() > max_binds;
         candidates.truncate(max_binds);
-        let uris: Vec<String> = candidates.iter().map(|(u, _, _)| u.clone()).collect();
+        let uris: Vec<String> = candidates.iter().map(|c| c.uri.clone()).collect();
         let authors = profiles(&hydration, &uris).await?;
         let mut full_at: Option<usize> = None;
         let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
         let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
         while let Some((i, hit)) = reads.next().await {
             if let Ok(post) = hit {
+                let c = &candidates[i];
                 feed.push(post);
-                last_hit = Some((candidates[i].1, candidates[i].2.clone()));
+                reposts.push(c.repost_uri.clone().zip(c.reposter.clone()).map(|(u, by)| (u, by, c.created_at)));
+                last_hit = Some((c.created_at, c.key.clone()));
                 if feed.len() == limit {
                     full_at = Some(i);
                     break;
@@ -867,11 +944,29 @@ async fn feed_body(
         if !beyond || window + 1 == FEED_WINDOWS || start.elapsed() >= SECOND_WINDOW_BY {
             break;
         }
-        after = Some((tail.1, tail.2.clone()));
+        after = Some((tail.created_at, tail.key.clone()));
     }
     let cursor = last_hit.filter(|_| more).map(|(at, key)| cursor(at, &key));
     let mut refs: Vec<&mut PrivateEmit<Value>> = feed.iter_mut().collect();
     decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
+    let mut reposters: Vec<String> = Vec::new();
+    for (_, by, _) in reposts.iter().flatten() {
+        if !reposters.contains(by) {
+            reposters.push(by.clone());
+        }
+    }
+    if !reposters.is_empty() {
+        let by = hydration.profiles(&reposters).await?;
+        for (post, repost) in feed.iter_mut().zip(&reposts) {
+            if let Some((uri, reposter, at)) = repost {
+                post.decorate(
+                    "reason",
+                    json!({"$type": "app.bsky.feed.defs#reasonRepost", "by": by.view(reposter, ProfileKind::Basic),
+                           "uri": uri, "indexedAt": ts(*at)}),
+                );
+            }
+        }
+    }
     Ok(PrivateResponse::feed(feed, cursor))
 }
 
@@ -1008,6 +1103,230 @@ async fn bookmarks_body(
     let mut refs: Vec<&mut PrivateEmit<Value>> = bookmarks.iter_mut().map(|b| &mut b.item).collect();
     decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::bookmarks(bookmarks, next))
+}
+
+/// `limit` 1–100, default 50 (private posting §4.7).
+fn page_limit(p: &Params) -> Result<usize, XrpcError> {
+    match p.u32("limit")?.unwrap_or(50) {
+        l @ 1..=100 => Ok(l as usize),
+        _ => Err(XrpcError::invalid("Error: limit must be between 1 and 100")),
+    }
+}
+
+/// Whether `uri` reads for the caller: the anchor of `getLikes`,
+/// `getRepostedBy` and `getQuotes` (private posting §4.7), read through the
+/// pipeline as any private post is. A miss, whatever its reason (not
+/// readable, not private, unknown), gives the same empty answer.
+async fn anchor_readable(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    uri: &str,
+    start: Instant,
+) -> Result<bool, XrpcError> {
+    let authors = profiles(hydration, &[uri.to_string()]).await?;
+    Ok(pipeline::read(&s.env, rs, caller, uri, &authors, start).await.is_ok())
+}
+
+/// `app.nearhorizon.private.getLikes {uri, limit 1-100 default 50, cursor}`
+/// (private posting §4.7): `app.bsky.feed.getLikes`'s output for a private
+/// post the caller reads, by member likers with no block either way with
+/// the caller (C-2), newest first. On a miss, `{uri, likes: []}`, the same
+/// bytes whatever the reason. The cursor walks the like rows, which are
+/// public records. Floored (`get_likes`).
+pub async fn get_likes(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    interactions(&s, peer, &headers, q.as_deref(), Interaction::Like).await
+}
+
+/// `app.nearhorizon.private.getRepostedBy`: [`get_likes`] over reposts,
+/// `{uri, cursor?, repostedBy: profileView[]}`. Floored (`get_reposted_by`).
+pub async fn get_reposted_by(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    interactions(&s, peer, &headers, q.as_deref(), Interaction::Repost).await
+}
+
+async fn interactions(
+    s: &PrivateState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    q: Option<&str>,
+    kind: Interaction,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let (method, endpoint, target) = match kind {
+        Interaction::Like => (GET_LIKES, "getLikes", s.floors.get_likes),
+        Interaction::Repost => (GET_REPOSTED_BY, "getRepostedBy", s.floors.get_reposted_by),
+    };
+    let caller = prepare_private(&s.app, headers, peer, method).await?;
+    let p = Params::parse(q);
+    let uri = p.required("uri")?.to_string();
+    let limit = page_limit(&p)?;
+    let after = parse_cursor(p.one("cursor"))?;
+    let ip = request_ip(&s.app, headers, peer);
+    let result = interactions_body(s, &caller, ip, kind, &uri, limit, after, start).await;
+    floor(endpoint, start, target).await;
+    result.map(ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn interactions_body(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    ip: IpAddr,
+    kind: Interaction,
+    uri: &str,
+    limit: usize,
+    after: Option<(DateTime<Utc>, String)>,
+    start: Instant,
+) -> Result<PrivateResponse, XrpcError> {
+    let respond = |items: Vec<Value>, cursor: Option<String>| match kind {
+        Interaction::Like => PrivateResponse::likes(uri.to_string(), items, cursor),
+        Interaction::Repost => PrivateResponse::reposted_by(uri.to_string(), items, cursor),
+    };
+    let hydration = private_hydration(s, caller, ip).await?;
+    let rs = RequestState::new(s.env.max_head_fetches);
+    if !anchor_readable(s, &rs, caller, &hydration, uri, start).await? {
+        return Ok(respond(Vec::new(), None));
+    }
+    let rows = schema::interactions(&s.env.pool, &caller.did, kind, uri, after, i64::try_from(limit).unwrap_or(i64::MAX)).await?;
+    let next = (rows.len() == limit)
+        .then(|| rows.last().map(|(_, at, _, row)| cursor(*at, row)))
+        .flatten();
+    let mut dids: Vec<String> = Vec::new();
+    for (did, ..) in &rows {
+        if !dids.contains(did) {
+            dids.push(did.clone());
+        }
+    }
+    let actors = hydration.profiles(&dids).await?;
+    let items = rows
+        .iter()
+        .map(|(did, created, indexed, _)| match kind {
+            Interaction::Like => {
+                json!({"indexedAt": ts(*indexed), "createdAt": ts(*created), "actor": actors.view(did, ProfileKind::View)})
+            }
+            Interaction::Repost => actors.view(did, ProfileKind::View),
+        })
+        .collect();
+    Ok(respond(items, next))
+}
+
+/// `app.nearhorizon.private.getQuotes {uri, limit 1-100 default 50, cursor}`
+/// (private posting §4.7) → `{uri, cursor?, posts}`, for a private post the
+/// caller reads; on a miss `{uri, posts: []}`. Newest first, merged by
+/// `(createdAt, uri)`:
+/// - private quoting posts passing the prefilter, each read through the
+///   pipeline, as `#privatePostView`;
+/// - members' public quoting posts whose author has no block either way
+///   with the caller, as `#publicPostRef {uri, cid}` (C-3): Prism may not
+///   fetch their bodies from a private handler, and the client hydrates
+///   them through its public AppView.
+///
+/// Windows and the lookahead as [`feed_body`]. The cursor is sealed (§3.6),
+/// bound to the method, the caller and `uri`, and holds the last examined
+/// candidate's position: it is present whenever candidates remain, so a
+/// short or empty page can carry one. Floored (`get_quotes`).
+pub async fn get_quotes(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, peer, GET_QUOTES).await?;
+    let p = Params::parse(q.as_deref());
+    let uri = p.required("uri")?.to_string();
+    let limit = page_limit(&p)?;
+    let aad = sealed::aad(GET_QUOTES, &caller.did, &uri, "");
+    let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
+    let ip = request_ip(&s.app, &headers, peer);
+    let result = quotes_body(&s, &caller, ip, &uri, limit, after, &aad, start).await;
+    floor("getQuotes", start, s.floors.get_quotes).await;
+    result.map(ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn quotes_body(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    ip: IpAddr,
+    uri: &str,
+    limit: usize,
+    after: Option<(DateTime<Utc>, String)>,
+    aad: &str,
+    start: Instant,
+) -> Result<PrivateResponse, XrpcError> {
+    let hydration = private_hydration(s, caller, ip).await?;
+    let rs = RequestState::new(s.env.max_head_fetches);
+    if !anchor_readable(s, &rs, caller, &hydration, uri, start).await? {
+        return Ok(PrivateResponse::quotes(uri.to_string(), Vec::new(), None));
+    }
+    let max_binds = limit * 4;
+    let wanted = i64::try_from(max_binds + 1).unwrap_or(i64::MAX);
+    let mut items: Vec<QuoteItem> = Vec::new();
+    // The last examined candidate's position.
+    let mut last: Option<(DateTime<Utc>, String)> = None;
+    let mut more = false;
+    let mut after = after;
+    for window in 0..FEED_WINDOWS {
+        let mut candidates = schema::quote_candidates(&s.env.pool, &caller.did, uri, after.clone(), wanted).await?;
+        let beyond = candidates.len() > max_binds;
+        candidates.truncate(max_binds);
+        let private: Vec<String> = candidates.iter().filter(|c| c.cid.is_none()).map(|c| c.uri.clone()).collect();
+        let authors = profiles(&hydration, &private).await?;
+        let reads: Vec<_> = private.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+        let mut reads = futures::stream::iter(reads).buffered(s.concurrency);
+        let mut full_at: Option<usize> = None;
+        for (i, c) in candidates.iter().enumerate() {
+            last = Some((c.created_at, c.uri.clone()));
+            match &c.cid {
+                Some(cid) => items.push(QuoteItem::Public {
+                    uri: c.uri.clone(),
+                    cid: cid.clone(),
+                }),
+                None => {
+                    if let Some(Ok(post)) = reads.next().await {
+                        items.push(QuoteItem::Private(post));
+                    }
+                }
+            }
+            if items.len() == limit {
+                full_at = Some(i);
+                break;
+            }
+        }
+        drop(reads);
+        if let Some(i) = full_at {
+            more = i + 1 < candidates.len() || beyond;
+            break;
+        }
+        more = beyond;
+        let Some(tail) = candidates.last() else { break };
+        if !beyond || window + 1 == FEED_WINDOWS || start.elapsed() >= SECOND_WINDOW_BY {
+            break;
+        }
+        after = Some((tail.created_at, tail.uri.clone()));
+    }
+    let cursor = last.filter(|_| more).and_then(|(at, key)| sealed::seal(&s.cursor_key, aad, at, &key));
+    let mut refs: Vec<&mut PrivateEmit<Value>> = items
+        .iter_mut()
+        .filter_map(|item| match item {
+            QuoteItem::Private(post) => Some(post),
+            QuoteItem::Public { .. } => None,
+        })
+        .collect();
+    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
+    Ok(PrivateResponse::quotes(uri.to_string(), items, cursor))
 }
 
 #[cfg(test)]

@@ -132,6 +132,9 @@ get_post_thread = 1200
 get_author_feed = 1200
 get_timeline = 1200
 get_bookmarks = 1200
+get_likes = 800
+get_reposted_by = 800
+get_quotes = 1200
 
 [sync]
 head_max_age_secs = 60

@@ -548,7 +548,10 @@ impl Hydrator {
     }
 }
 
-/// Whether `uri` is `at://<did>/app.bsky.feed.post/<rkey>`.
+/// Whether `uri` is `at://<did>/app.bsky.feed.post/<rkey>`, or the same for
+/// a private post, `tools.kryphocron.feed.postPrivate` (private posting
+/// §4.11, P-16): a private root is muted as a public one is, without a
+/// lookup, so the answer is the same whether it exists or not.
 fn is_post_uri(uri: &str) -> bool {
     let Some(rest) = uri.strip_prefix("at://") else {
         return false;
@@ -557,7 +560,9 @@ fn is_post_uri(uri: &str) -> bool {
     let (Some(did), Some(collection), Some(rkey), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
         return false;
     };
-    did.starts_with("did:") && collection == "app.bsky.feed.post" && !rkey.is_empty()
+    did.starts_with("did:")
+        && matches!(collection, crate::firehose::classifier::NSID_POST | crate::firehose::classifier::NSID_POST_PRIVATE)
+        && !rkey.is_empty()
 }
 
 #[cfg(test)]

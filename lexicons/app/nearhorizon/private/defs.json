@@ -4,8 +4,8 @@
   "defs": {
     "privatePostView": {
       "type": "object",
-      "description": "View of one private-tier post (tools.kryphocron.feed.postPrivate) that the requester is authorized to read. Carries no counts: a reply count would disclose replies the viewer cannot see.",
-      "required": ["uri", "cid", "author", "record", "indexedAt", "labels"],
+      "description": "View of one private-tier post (tools.kryphocron.feed.postPrivate) that the requester is authorized to read. Its counts count only what the requester is entitled to know exists, matched by post URI (never CID), so they survive an audience edit that changes the CID: a reply or private quote the requester could not read, or one by an account with a block either way with the requester, is not counted. Likes and reposts are counted from community members only, in every mode. No bookmarkCount is emitted.",
+      "required": ["uri", "cid", "author", "record", "indexedAt", "labels", "replyCount", "repostCount", "likeCount", "quoteCount"],
       "properties": {
         "uri": { "type": "string", "format": "at-uri" },
         "cid": { "type": "string", "format": "cid" },
@@ -32,6 +32,22 @@
           "description": "Labels on the post: its author's self-labels (src the author's DID, cts the post's createdAt), then the labels this AppView's operator applied.",
           "items": { "type": "ref", "ref": "com.atproto.label.defs#label" }
         },
+        "replyCount": {
+          "type": "integer",
+          "description": "Private replies to this post that the requester's audience rules admit, not taken down or hidden by moderation, by accounts with no block either way with the requester. A reply that is temporarily unreadable for every reader alike (its author's indexing in progress, content that does not decode) is counted. Replies the root's threadgate hides are counted, as on public posts."
+        },
+        "repostCount": {
+          "type": "integer",
+          "description": "Reposts by community members with no block either way with the requester."
+        },
+        "likeCount": {
+          "type": "integer",
+          "description": "Likes by community members with no block either way with the requester."
+        },
+        "quoteCount": {
+          "type": "integer",
+          "description": "Private posts quoting this post that the requester's audience rules admit (as replyCount), plus community members' public posts quoting it whose author has no block either way with the requester."
+        },
         "audience": {
           "type": "ref",
           "ref": "#audienceView",
@@ -40,13 +56,27 @@
         "viewer": {
           "type": "ref",
           "ref": "app.bsky.feed.defs#viewerState",
-          "description": "The requester's state on the post. Carries bookmarked (the requester's private bookmark, app.nearhorizon.private.createBookmark), always present. replyDisabled comes from the threadgate of the thread root the post's record claims (reply.root, or the post itself when top-level), and only when that root was read for the requester in the same request: the post itself, a parent in the thread, another post of the page, or the root a thread request reads. So a feed reply usually carries none, and a thread does; a followingRule or listRule this AppView cannot answer from its own rows also leaves it out (fail open). embeddingDisabled is true when the post's own postgate disables embedding and the requester is not its author. Other fields are not emitted yet."
+          "description": "The requester's state on the post. Carries bookmarked (the requester's private bookmark, app.nearhorizon.private.createBookmark), always present. like and repost are the URIs of the requester's own newest like and repost of the post, matched by URI, present when they exist. threadMuted is true when the requester muted (app.bsky.graph.muteThread) the thread root the post's record claims (reply.root, or the post itself when top-level), and absent otherwise. replyDisabled comes from the threadgate of the thread root the post's record claims (reply.root, or the post itself when top-level), and only when that root was read for the requester in the same request: the post itself, a parent in the thread, another post of the page, or the root a thread request reads. So a feed reply usually carries none, and a thread does; a followingRule or listRule this AppView cannot answer from its own rows also leaves it out (fail open). embeddingDisabled is true when the post's own postgate disables embedding and the requester is not its author. pinned and knownLikers are not emitted."
+        },
+        "reason": {
+          "type": "union",
+          "description": "On a feed item of getTimeline or getAuthorFeed only: present when the item is a community member's repost of this post, which then sorts by the repost's time. by is the reposter, uri the repost record; cid is not emitted. The same post can appear as itself and as a repost.",
+          "refs": ["app.bsky.feed.defs#reasonRepost"]
         },
         "threadgate": {
           "type": "ref",
           "ref": "app.bsky.feed.defs#threadgateView",
           "description": "On a top-level post: its threadgate (an app.bsky.feed.threadgate record with the post's record key, in the post author's repository). lists holds only the lists this AppView serves from its own rows. A gate only flags and hides replies; it never admits a reader the audience does not."
         }
+      }
+    },
+    "publicPostRef": {
+      "type": "object",
+      "description": "A public post (app.bsky.feed.post) by a community member, given by reference: hydrate it through a public AppView. This AppView does not serve public post bodies from a private method.",
+      "required": ["uri", "cid"],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "cid": { "type": "string", "format": "cid" }
       }
     },
     "bookmarkView": {

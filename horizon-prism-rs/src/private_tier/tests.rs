@@ -23,6 +23,7 @@ use super::oracle::{OracleSnapshot, SnapshotInputs};
 use super::{KryphocronPrivateTier, PrivateTier, readiness, schema};
 use crate::aggregations::{ScopeSets, ScopeState};
 use crate::config::{PrivateReadConfig, PrivateReadFloors, ScopePolicy, SyncConfig, VideoConfig, VideoPlayback};
+use crate::cursor_key::CursorKey;
 use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE};
 use crate::firehose::watermark::Watermarks;
 use crate::firehose::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer};
@@ -43,6 +44,8 @@ const DAVE: &str = "did:plc:dddddddddddddddddddddddd";
 const REV: &str = "3kaaaaaaaaaa2";
 const FLOOR: Duration = Duration::from_millis(400);
 const RELAY: &str = "private-relay";
+/// The private cursor key of every test state.
+const TEST_CURSOR_KEY: [u8; 32] = [7; 32];
 
 struct NoHeads;
 
@@ -176,6 +179,9 @@ impl Fixture {
                 get_author_feed: ms,
                 get_timeline: ms,
                 get_bookmarks: ms,
+                get_likes: ms,
+                get_reposted_by: ms,
+                get_quotes: ms,
             },
         };
         PrivateState::new(
@@ -186,6 +192,7 @@ impl Fixture {
             Duration::from_secs(120),
             16,
             &cfg,
+            CursorKey::new(&TEST_CURSOR_KEY),
         )
     }
 
@@ -867,8 +874,13 @@ async fn unanchored_cross_owner_posts(test: &str, layout: Layout) {
     let ghost = format!("at://{NOBODY}/{NSID_POST_PRIVATE}/x");
     let forged = w.f.private_post(BOB, "3kforged2222", &aud, Some((&ghost, &ghost))).await;
     let below = w.f.private_post(BOB, "3kbelow22222", &aud, Some((&ghost, &forged))).await;
+    // T-38 (S5): Bob's second reply in his own thread, quoting Alice's root.
+    let mut quoting = w.f.post_record(BOB, "3kownquote22", &aud, Some((&top, &top))).await;
+    quoting["embed"] = json!({"$type": "app.bsky.embed.record", "record": {"uri": root, "cid": "bafyroot"}});
+    w.f.ingest(BOB, NSID_POST_PRIVATE, "3kownquote22", quoting).await;
+    let own_quote = format!("at://{BOB}/{NSID_POST_PRIVATE}/3kownquote22");
     w.f.ready_all().await;
-    for (case, uri) in [("T-32", &top), ("T-38", &own_thread), ("T-39", &forged), ("T-39 reply", &below)] {
+    for (case, uri) in [("T-32", &top), ("T-38", &own_thread), ("T-38 quote", &own_quote), ("T-39", &forged), ("T-39 reply", &below)] {
         w.expect(case, BOB, uri, true).await;
         for reader in [ALICE, CAROL, DAVE] {
             w.expect(case, reader, uri, false).await;
@@ -876,6 +888,19 @@ async fn unanchored_cross_owner_posts(test: &str, layout: Layout) {
     }
     for reader in [ALICE, BOB, CAROL, DAVE] {
         w.expect("T-38 in Alice's thread", reader, &in_thread, true).await;
+    }
+    // T-38's counts (S5): the replies in Bob's own thread count in no one
+    // else's replyCount of his post, and the quote in no one else's
+    // quoteCount of Alice's root; for Bob, their reader, they count.
+    for reader in [ALICE, BOB, CAROL, DAVE] {
+        let counts = schema::counts(&w.f.pool, reader, std::slice::from_ref(&top)).await.expect("counts");
+        let replies = counts.get(&top).map_or(0, |c| c.reply);
+        let (_, view) = one_post(&w.base, reader, &root).await;
+        let quotes = view["quoteCount"].as_i64();
+        let expected = if reader == BOB { (2, Some(1)) } else { (0, Some(0)) };
+        if (replies, quotes) != expected {
+            w.failures.push(format!("T-38 counts for {reader}: replies to T {replies}, Alice's quoteCount {quotes:?}"));
+        }
     }
     w.finish().await;
 }
@@ -1028,14 +1053,27 @@ enum Middle {
     Throttled,
 }
 
-/// Dave's `getPosts([R])`, `getPostThread(R)` and timeline, as bytes.
+/// Dave's `getPosts([R])`, `getPostThread(R)` and timeline, as bytes, and
+/// (private posting S5) `getPosts([T])` with T's `replyCount` and
+/// `quoteCount`.
 async fn reader_outputs(w: &Walk, r: &str) -> Vec<(u16, String)> {
     let mut out = Vec::new();
-    for (method, query) in [(POSTS, format!("uris={r}")), (THREAD, format!("uri={r}")), (TIMELINE, String::new())] {
+    for (method, query) in [
+        (POSTS, format!("uris={r}")),
+        (THREAD, format!("uri={r}")),
+        (TIMELINE, String::new()),
+        (POSTS, format!("uris={}", w.root)),
+    ] {
         let (status, body, _) = get(&w.base, method, &query, DAVE, DAVE_KEY).await;
         out.push((status, body));
     }
     out
+}
+
+/// `reader`'s `(replyCount, quoteCount)` on the fixture's root.
+async fn root_counts(w: &Walk, reader: &str) -> (Option<i64>, Option<i64>) {
+    let (_, t) = one_post(&w.base, reader, &w.root).await;
+    (t["replyCount"].as_i64(), t["quoteCount"].as_i64())
 }
 
 /// T-23 pair 2, S0's part: the walk is reader-relative. A step Dave cannot
@@ -1050,7 +1088,12 @@ async fn pair_two(test: &str, middle: Middle) {
     };
     // Dave follows Carol, so his timeline would carry R if R were served.
     exec(&w.f.pool, &follow_sql(DAVE, CAROL)).await;
-    let m = w.reply(BOB, "3kmiddle2222", &w.root.clone()).await;
+    // M replies to T and quotes it, so it would count in both of T's
+    // counts if Dave were entitled to it (S5).
+    let mut m_record = w.f.post_record(BOB, "3kmiddle2222", &w.aud, Some((&w.root, &w.root))).await;
+    m_record["embed"] = json!({"$type": "app.bsky.embed.record", "record": {"uri": w.root, "cid": "bafyroot"}});
+    w.f.ingest(BOB, NSID_POST_PRIVATE, "3kmiddle2222", m_record).await;
+    let m = format!("at://{BOB}/{NSID_POST_PRIVATE}/3kmiddle2222");
     let r = w.reply(CAROL, "3kleaf222222", &m).await;
     match middle {
         Middle::BlocksReader => exec(&w.f.pool, &block_sql(BOB, DAVE)).await,
@@ -1064,11 +1107,21 @@ async fn pair_two(test: &str, middle: Middle) {
         // passes the walk, and R is served by the oracle and the prefilter.
         w.expect("throttled M", DAVE, &m, true).await;
         w.expect("R below a throttled M", DAVE, &r, true).await;
+        // A readable M counts in T's counts, so the comparison below can
+        // fail (S5).
+        let counts = root_counts(&w, DAVE).await;
+        if counts != (Some(1), Some(1)) {
+            w.failures.push(format!("throttled M: T's (replyCount, quoteCount) for Dave {counts:?}"));
+        }
         w.finish().await;
         return;
     }
     w.expect("(a) R's author", CAROL, &r, true).await;
     w.expect("(a) R", DAVE, &r, false).await;
+    let counts = root_counts(&w, DAVE).await;
+    if counts != (Some(0), Some(0)) {
+        w.failures.push(format!("(a): T's (replyCount, quoteCount) for Dave {counts:?}"));
+    }
     let with_m = reader_outputs(&w, &r).await;
     // (b): M does not exist.
     w.f.apply_op(BOB, Action::Delete, NSID_POST_PRIVATE, "3kmiddle2222", REV2, None).await;
@@ -1969,7 +2022,7 @@ async fn private_router_methods_are_routed_in_every_mode() {
         .copied()
         .filter(|(n, _)| n.starts_with("app.nearhorizon.private."))
         .collect();
-    assert_eq!(methods.len(), 3);
+    assert_eq!(methods.len(), 6);
     for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
         set_mode(app.hydrator.scope(), mode).await;
         for &(nsid, verb) in &methods {
@@ -1990,7 +2043,7 @@ async fn private_router_methods_are_routed_in_every_mode() {
             assert_eq!(v["message"], format!("Incorrect HTTP method ({wrong}) expected {right}"), "{mode:?} {nsid}");
             // A ready member is served.
             let status = match verb {
-                crate::honest_501::Verb::Get => get(&base, nsid, "", BOB, BOB_KEY).await.0,
+                crate::honest_501::Verb::Get => get(&base, nsid, &format!("uri={uri}"), BOB, BOB_KEY).await.0,
                 crate::honest_501::Verb::Post => post(&base, nsid, &json!({"uri": uri, "cid": "bafy"}), BOB).await.0,
             };
             assert_eq!(status, 200, "{mode:?} {nsid}");
@@ -2299,4 +2352,389 @@ async fn out_of_scope_purge_takes_gates_with_posts() {
     drop(conn);
     assert_eq!(gate_rows(&f.pool, "private_threadgates").await, [format!("at://{DAVE}/{THREADGATE}/3kkept222222")]);
     db.drop_db().await;
+}
+
+// ---- Private posting S5: counts, viewer state, likes, reposts, quotes,
+// repost items and thread mutes (P-2, P-5, P-16) ----
+
+/// An account in no fixture set: not a member, not in S. In On its likes
+/// and reposts of a member's post are stored (rule 2); in Off they are not.
+const EVE: &str = "did:plc:eeeeeeeeeeeeeeeeeeeeeeee";
+const LIKE: &str = "app.bsky.feed.like";
+const REPOST: &str = "app.bsky.feed.repost";
+const PUBLIC_POST: &str = "app.bsky.feed.post";
+const GET_LIKES: &str = "app.nearhorizon.private.getLikes";
+const GET_REPOSTED_BY: &str = "app.nearhorizon.private.getRepostedBy";
+const GET_QUOTES: &str = "app.nearhorizon.private.getQuotes";
+
+/// A like or repost record of `uri`, made at `at`.
+fn subject_record(collection: &str, uri: &str, at: &str) -> Value {
+    json!({"$type": collection, "subject": {"uri": uri, "cid": "bafysubject"}, "createdAt": at})
+}
+
+/// A public post quoting `uri`, made at `at`.
+fn public_quote(uri: &str, at: &str) -> Value {
+    json!({"$type": PUBLIC_POST, "text": "quoting", "createdAt": at,
+           "embed": {"$type": "app.bsky.embed.record", "record": {"uri": uri, "cid": "bafyany"}}})
+}
+
+/// GET `method?query` for `reader`: status 200, the raw body, the JSON and
+/// the time taken.
+async fn json_of(base: &str, method: &str, query: &str, reader: &str) -> (String, Value, Duration) {
+    let (status, body, took) = get(base, method, query, reader, key_of(reader)).await;
+    assert_eq!(status, 200, "{method}?{query}: {body}");
+    let v = serde_json::from_str(&body).expect("json");
+    (body, v, took)
+}
+
+fn counts_of(view: &Value) -> [i64; 4] {
+    ["replyCount", "repostCount", "likeCount", "quoteCount"].map(|k| view[k].as_i64().unwrap_or(-1))
+}
+
+/// The actor DIDs of a `getLikes` or `getRepostedBy` page.
+fn actor_dids(page: &Value, key: &str) -> Vec<String> {
+    page[key]
+        .as_array()
+        .expect(key)
+        .iter()
+        .map(|i| i.get("actor").unwrap_or(i)["did"].as_str().expect("did").to_string())
+        .collect()
+}
+
+/// T-11, T-12, T-13, T-17 (the read half) and T-38's counts, in On and in
+/// Off (T-1). Alice's post T is under her `list` audience of Bob, Carol and
+/// Dave; Carol, the main reader, blocks Dave.
+///
+/// - Counts disclose no hidden item: Carol's view of T and her three lists
+///   are byte-identical before and after a hidden reply, a hidden private
+///   quote, a taken-down reply, a blocked account's reply, like, repost and
+///   public quote, a non-member's like, repost and public quote, and Bob's
+///   reply and quote that only Bob reads are written. A reply that fails
+///   decode counts. Other readers' counts show the same rows counted.
+/// - Counts and `viewer.like`/`repost` match by URI after T's CID changes.
+/// - `threadMuted` follows the claimed root; muting a private root that
+///   exists and one that does not answer alike.
+/// - The lists: member likers newest first, paged; misses are uniform and
+///   floored; `getQuotes` mixes the two item types with a sealed cursor.
+async fn interactions_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL, DAVE]).await;
+    let aud_dave = f.audience(ALICE, "3kauddave222", Some("list"), &[DAVE]).await;
+    let aud_bob = f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL]).await;
+    let t = f.private_post(ALICE, "3ktpost22222", &aud, None).await;
+    let hidden_post = f.private_post(ALICE, "3khiddenpost", &aud_dave, None).await;
+    exec(&f.pool, &block_sql(CAROL, DAVE)).await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    // What Carol may know of: Bob's reply, a reply that does not decode,
+    // Bob's and her own likes and reposts, Bob's private and public quotes.
+    let reply_ok = f.private_post(BOB, "3kreplyok222", &aud, Some((&t, &t))).await;
+    let undecodable_record = f.post_record(BOB, "3kencodedfor", &aud, Some((&t, &t))).await;
+    f.ingest(BOB, NSID_POST_PRIVATE, "3kundecode22", undecodable_record).await;
+    let undecodable = format!("at://{BOB}/{NSID_POST_PRIVATE}/3kundecode22");
+    for (who, rkey, at) in [(BOB, "3klikebob222", "2026-10-01T10:00:00Z"), (CAROL, "3klikecarol2", "2026-10-01T12:00:00Z")] {
+        f.ingest(who, LIKE, rkey, subject_record(LIKE, &t, at)).await;
+        f.ingest(who, REPOST, rkey, subject_record(REPOST, &t, at)).await;
+    }
+    let private_quote = f.post_with(BOB, "3kprivquote2", &aud_bob, quote_of(&t)).await;
+    f.ingest(BOB, PUBLIC_POST, "3kpubquote22", public_quote(&t, "2026-09-27T00:00:00Z")).await;
+    let bob_public = format!("at://{BOB}/{PUBLIC_POST}/3kpubquote22");
+    f.ready_all().await;
+    // The undecodable reply is stored and passes the prefilter, but no one
+    // reads it, its author included.
+    assert_eq!(posts_of(&base, BOB, &[&undecodable]).await.1.len(), 0, "the reply does not decode");
+    assert_eq!(schema::prefilter_uris(&f.pool, CAROL, std::slice::from_ref(&undecodable)).await.expect("prefilter").len(), 1);
+
+    let carols_answers = || async {
+        let mut out = Vec::new();
+        for (method, query) in [
+            (POSTS, format!("uris={t}")),
+            (GET_LIKES, format!("uri={t}")),
+            (GET_REPOSTED_BY, format!("uri={t}")),
+            (GET_QUOTES, format!("uri={t}")),
+        ] {
+            out.push(json_of(&base, method, &query, CAROL).await.0);
+        }
+        out
+    };
+    let before = carols_answers().await;
+
+    // What Carol may not know of.
+    f.private_post(ALICE, "3khiddenrep2", &aud_dave, Some((&t, &t))).await;
+    f.post_with(ALICE, "3khiddenquo2", &aud_dave, quote_of(&t)).await;
+    let taken_down = f.private_post(BOB, "3ktakendown2", &aud, Some((&t, &t))).await;
+    exec(&f.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{taken_down}', '!takedown')")).await;
+    f.private_post(DAVE, "3kdavereply2", &aud, Some((&t, &t))).await;
+    f.ingest(DAVE, LIKE, "3klikedave22", subject_record(LIKE, &t, "2026-10-01T11:00:00Z")).await;
+    f.ingest(DAVE, REPOST, "3klikedave22", subject_record(REPOST, &t, "2026-10-01T11:00:00Z")).await;
+    f.ingest(DAVE, PUBLIC_POST, "3kdavequote2", public_quote(&t, "2026-09-28T00:00:00Z")).await;
+    f.ingest(EVE, LIKE, "3klikeeve222", subject_record(LIKE, &t, "2026-10-01T13:00:00Z")).await;
+    f.ingest(EVE, REPOST, "3klikeeve222", subject_record(REPOST, &t, "2026-10-01T13:00:00Z")).await;
+    f.ingest(EVE, PUBLIC_POST, "3kevequote22", public_quote(&t, "2026-09-29T00:00:00Z")).await;
+    // T-38: Bob's top-level post under Alice's audience and his reply to it
+    // quoting T are read by Bob alone.
+    let own_top = f.private_post(BOB, "3kowntop2222", &aud, None).await;
+    let mut own_reply = f.post_record(BOB, "3kownreply22", &aud, Some((&own_top, &own_top))).await;
+    own_reply["embed"] = quote_of(&t)["embed"].clone();
+    f.ingest(BOB, NSID_POST_PRIVATE, "3kownreply22", own_reply).await;
+    f.ready_all().await;
+    let eve_rows: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM likes WHERE author_did = $1) + (SELECT count(*) FROM reposts WHERE author_did = $1)")
+        .bind(EVE)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count");
+    assert_eq!(eve_rows, if mode.is_on() { 2 } else { 0 }, "a non-member's like and repost are stored in On only");
+    let refs: Vec<String> = sqlx::query_scalar("SELECT uri FROM private_quote_refs ORDER BY uri").fetch_all(&f.pool).await.expect("refs");
+    assert_eq!(refs, [bob_public.clone(), format!("at://{DAVE}/{PUBLIC_POST}/3kdavequote2")], "members' public quotes only");
+    assert_eq!(carols_answers().await, before, "no hidden item shows in Carol's counts or lists");
+
+    // The counts, reader by reader: [reply, repost, like, quote].
+    let (_, p) = posts_of(&base, CAROL, &[&t]).await;
+    assert_eq!(counts_of(&p[0]), [2, 2, 2, 2], "{}", p[0]);
+    // Bob: no block; he reads Dave's reply and his own reply-quote.
+    let (_, p) = posts_of(&base, BOB, &[&t]).await;
+    assert_eq!(counts_of(&p[0]), [3, 3, 3, 4], "{}", p[0]);
+    // Alice reads her own hidden reply and quote. She is not listed in her
+    // own `list` audience, so others' replies under it are not hers to read
+    // and not counted, as `getPostThread` would not show them; nor are
+    // Bob's private quote (his audience is Carol) and his own-thread reply.
+    let (_, p) = posts_of(&base, ALICE, &[&t]).await;
+    assert_eq!(counts_of(&p[0]), [1, 3, 3, 3], "{}", p[0]);
+    let (_, thread) = thread_of(&base, ALICE, &format!("uri={t}")).await;
+    assert_eq!(reply_uris(&thread).len(), 1, "the count matches what Alice reads");
+    // A view with nothing to count says 0.
+    let (_, p) = posts_of(&base, CAROL, &[&reply_ok]).await;
+    assert_eq!(counts_of(&p[0]), [0, 0, 0, 0]);
+
+    // T-12: the reader's own like and repost, and the counts, by URI after
+    // the CID changes.
+    let carol_like = format!("at://{CAROL}/{LIKE}/3klikecarol2");
+    let carol_repost = format!("at://{CAROL}/{REPOST}/3klikecarol2");
+    let (_, p) = posts_of(&base, CAROL, &[&t]).await;
+    assert_eq!(p[0]["viewer"], json!({"bookmarked": false, "like": carol_like, "repost": carol_repost}));
+    let (_, p) = posts_of(&base, DAVE, &[&t]).await;
+    assert_eq!(p[0]["viewer"]["like"], format!("at://{DAVE}/{LIKE}/3klikedave22"));
+    let record = f.post_record(ALICE, "3ktpost22222", &aud, None).await;
+    f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3ktpost22222", REV2, Some(record)).await;
+    let (_, p) = posts_of(&base, CAROL, &[&t]).await;
+    assert_ne!(p[0]["cid"], "bafy3ktpost22222", "the CID changed");
+    assert_eq!(counts_of(&p[0]), [2, 2, 2, 2]);
+    assert_eq!(p[0]["viewer"], json!({"bookmarked": false, "like": carol_like, "repost": carol_repost}));
+
+    // T-17 (the read half): a private root mutes as a public one does,
+    // without a lookup; `threadMuted` follows the claimed root.
+    let carol = crate::hydration::Viewer {
+        did: Some(CAROL.into()),
+        hydrate: true,
+    };
+    let nowhere = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3knothere222");
+    let existing = f.app.hydrator.set_thread_mute(&carol, &t, true).await.expect("db").expect("muted");
+    let missing = f.app.hydrator.set_thread_mute(&carol, &nowhere, true).await.expect("db").expect("muted");
+    assert_eq!(existing.inner(), missing.inner());
+    let (_, p) = posts_of(&base, CAROL, &[&t, &reply_ok, &private_quote]).await;
+    assert_eq!(p[0]["viewer"]["threadMuted"], true);
+    assert_eq!(p[1]["viewer"]["threadMuted"], true, "a reply claiming T");
+    assert!(p[2]["viewer"].get("threadMuted").is_none(), "another thread");
+    let (_, p) = posts_of(&base, BOB, &[&t]).await;
+    assert!(p[0]["viewer"].get("threadMuted").is_none(), "Carol's mute is hers");
+    f.app.hydrator.set_thread_mute(&carol, &t, false).await.expect("db").expect("unmuted");
+    let (_, p) = posts_of(&base, CAROL, &[&t]).await;
+    assert!(p[0]["viewer"].get("threadMuted").is_none());
+
+    // T-13: getLikes and getRepostedBy, member likers newest first, paged.
+    for (method, key) in [(GET_LIKES, "likes"), (GET_REPOSTED_BY, "repostedBy")] {
+        let (_, page, took) = json_of(&base, method, &format!("uri={t}"), CAROL).await;
+        assert!(took >= FLOOR, "{method} took {took:?}");
+        assert_eq!(page["uri"], t.as_str());
+        assert_eq!(actor_dids(&page, key), [CAROL, BOB], "{method}");
+        assert!(page.get("cursor").is_none());
+        let (_, page, _) = json_of(&base, method, &format!("uri={t}"), BOB).await;
+        assert_eq!(actor_dids(&page, key), [CAROL, DAVE, BOB], "{method}: a non-member never");
+        let mut seen = Vec::new();
+        let mut query = format!("uri={t}&limit=1");
+        for _ in 0..5 {
+            let (_, page, _) = json_of(&base, method, &query, CAROL).await;
+            seen.extend(actor_dids(&page, key));
+            match page["cursor"].as_str() {
+                Some(c) => query = format!("uri={t}&limit=1&cursor={}", urlencoding(c)),
+                None => break,
+            }
+        }
+        assert_eq!(seen, [CAROL, BOB], "{method} paged");
+    }
+    let (_, page, _) = json_of(&base, GET_LIKES, &format!("uri={t}"), CAROL).await;
+    let like = &page["likes"][0];
+    assert_eq!(like["createdAt"], "2026-10-01T12:00:00.000Z");
+    assert!(like["indexedAt"].is_string() && like["actor"]["handle"] == "carol.test", "{like}");
+
+    // T-13: getQuotes mixes the two item types, newest first, with a
+    // sealed cursor bound to its caller and its uri.
+    let (_, page, took) = json_of(&base, GET_QUOTES, &format!("uri={t}"), CAROL).await;
+    assert!(took >= FLOOR);
+    let posts = page["posts"].as_array().expect("posts");
+    assert_eq!(posts.len(), 2, "{page}");
+    assert_eq!(posts[0], json!({"$type": "app.nearhorizon.private.defs#publicPostRef", "uri": bob_public, "cid": "bafy3kpubquote22"}));
+    assert_eq!(posts[1]["$type"], "app.nearhorizon.private.defs#privatePostView");
+    assert_eq!((posts[1]["uri"].as_str(), posts[1]["record"]["text"].as_str()), (Some(private_quote.as_str()), Some("3kprivquote2")));
+    assert_eq!(posts[1]["embed"]["record"]["uri"], t.as_str(), "the quoting post's own view");
+    let (_, first, _) = json_of(&base, GET_QUOTES, &format!("uri={t}&limit=1"), CAROL).await;
+    let cursor = first["cursor"].as_str().expect("more candidates remain").to_string();
+    assert_eq!(cursor.len(), 720, "a sealed, padded cursor");
+    let (_, second, _) = json_of(&base, GET_QUOTES, &format!("uri={t}&limit=1&cursor={cursor}"), CAROL).await;
+    assert_eq!(second["posts"][0]["uri"], private_quote.as_str());
+    assert!(second.get("cursor").is_none(), "{second}");
+    for (reader, uri) in [(BOB, t.as_str()), (CAROL, reply_ok.as_str())] {
+        let (status, body, _) = get(&base, GET_QUOTES, &format!("uri={uri}&limit=1&cursor={cursor}"), reader, key_of(reader)).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("cursor is not valid"), "{body}");
+    }
+    let (_, page, _) = json_of(&base, GET_QUOTES, &format!("uri={t}"), BOB).await;
+    assert_eq!(page["posts"].as_array().map(Vec::len), Some(4), "Bob reads Dave's quote and his own-thread reply: {page}");
+
+    // T-13: misses. A post Carol cannot read gives the answer of the same
+    // URI once nothing is there, floored; so does a public URI.
+    f.ingest(DAVE, LIKE, "3klikehidden", subject_record(LIKE, &hidden_post, "2026-10-01T00:00:00Z")).await;
+    let (_, page, _) = json_of(&base, GET_LIKES, &format!("uri={hidden_post}"), DAVE).await;
+    assert_eq!(actor_dids(&page, "likes"), [DAVE], "readable to its audience");
+    let misses = || async {
+        let mut out = Vec::new();
+        for method in [GET_LIKES, GET_REPOSTED_BY, GET_QUOTES] {
+            let (body, _, took) = json_of(&base, method, &format!("uri={hidden_post}"), CAROL).await;
+            assert!(took >= FLOOR, "{method} miss took {took:?}");
+            out.push(body);
+        }
+        out
+    };
+    let unreadable = misses().await;
+    assert_eq!(unreadable[0], format!(r#"{{"uri":"{hidden_post}","likes":[]}}"#));
+    assert_eq!(unreadable[1], format!(r#"{{"uri":"{hidden_post}","repostedBy":[]}}"#));
+    assert_eq!(unreadable[2], format!(r#"{{"uri":"{hidden_post}","posts":[]}}"#));
+    f.apply_op(ALICE, Action::Delete, NSID_POST_PRIVATE, "3khiddenpost", REV3, None).await;
+    assert_eq!(misses().await, unreadable, "unreadable and nonexistent alike");
+    let (body, _, _) = json_of(&base, GET_LIKES, &format!("uri={bob_public}"), CAROL).await;
+    assert_eq!(body, format!(r#"{{"uri":"{bob_public}","likes":[]}}"#), "not a private post");
+    for query in ["", "uri=x&limit=0", "uri=x&limit=101"] {
+        let (status, _, _) = get(&base, GET_LIKES, query, CAROL, CAROL_KEY).await;
+        assert_eq!(status, 400, "{query}");
+    }
+
+    // The lifecycle: a public post's delete takes its quote reference; the
+    // purges take a member's.
+    f.apply_op(BOB, Action::Delete, PUBLIC_POST, "3kpubquote22", REV3, None).await;
+    let refs: Vec<String> = sqlx::query_scalar("SELECT uri FROM private_quote_refs").fetch_all(&f.pool).await.expect("refs");
+    assert_eq!(refs, [format!("at://{DAVE}/{PUBLIC_POST}/3kdavequote2")]);
+    let mut conn = f.pool.acquire().await.expect("conn");
+    KryphocronPrivateTier.purge_member_removed_batch(&mut conn, DAVE, 100).await.expect("purge");
+    drop(conn);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM private_quote_refs").fetch_one(&f.pool).await.expect("count");
+    assert_eq!(left, 0);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_interactions_on() {
+    interactions_in(PublicMode::On, "s5-interactions-on").await;
+}
+
+#[tokio::test]
+async fn private_interactions_off() {
+    interactions_in(PublicMode::Off, "s5-interactions-off").await;
+}
+
+/// Every page of Carol's timeline, one item a page, as bytes.
+async fn timeline_pages(base: &str) -> Vec<String> {
+    let mut pages = Vec::new();
+    let mut query = "limit=1".to_string();
+    for _ in 0..6 {
+        let (body, v, _) = json_of(base, TIMELINE, &query, CAROL).await;
+        pages.push(body);
+        match v["cursor"].as_str() {
+            Some(c) => query = format!("limit=1&cursor={}", urlencoding(c)),
+            None => break,
+        }
+    }
+    pages
+}
+
+/// T-14 (P-5 reposts), in On and in Off (T-1): a followed member's repost
+/// of a post Carol reads is a timeline item with `reason`, ordered by the
+/// repost's time; a repost of a post she cannot read, and a followed
+/// non-member's repost, leave no item and no cursor difference; a muted
+/// reposter's item is absent. The reposter's author feed carries it too.
+async fn repost_items_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL]).await;
+    let aud_dave = f.audience(ALICE, "3kauddave222", Some("list"), &[DAVE, BOB]).await;
+    let aud_bob = f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL]).await;
+    let t = f.private_post(ALICE, "3ktpost22222", &aud, None).await;
+    let hidden = f.private_post(ALICE, "3khiddenpost", &aud_dave, None).await;
+    let bobs = f.private_post(BOB, "3kbobspost22", &aud_bob, None).await;
+    // Carol follows Bob and Eve, not Alice.
+    exec(&f.pool, &follow_sql(CAROL, BOB)).await;
+    exec(&f.pool, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) \
+                            VALUES ('at://{CAROL}/app.bsky.graph.follow/eve', '{CAROL}', '{EVE}', '3k', now())")).await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+    let before = timeline_pages(&base).await;
+    assert_eq!(before.len(), 1, "Bob's post alone: {before:?}");
+
+    // A repost of a post Carol cannot read, and a non-member's repost of
+    // one she can: no item, no cursor difference.
+    f.ingest(BOB, REPOST, "3krephidden2", subject_record(REPOST, &hidden, "2026-09-28T00:00:00Z")).await;
+    f.ingest(EVE, REPOST, "3krepeve2222", subject_record(REPOST, &t, "2026-09-29T00:00:00Z")).await;
+    assert_eq!(timeline_pages(&base).await, before);
+
+    // Bob's repost of T, newer than his own post though T is not.
+    f.ingest(BOB, REPOST, "3kreptpost22", subject_record(REPOST, &t, "2026-09-28T12:00:00Z")).await;
+    let repost_uri = format!("at://{BOB}/{REPOST}/3kreptpost22");
+    let (_, v, _) = json_of(&base, TIMELINE, "", CAROL).await;
+    let feed = v["feed"].as_array().expect("feed");
+    assert_eq!(feed.len(), 2, "{v}");
+    assert_eq!(feed[0]["uri"], t.as_str());
+    let reason = &feed[0]["reason"];
+    assert_eq!(reason["$type"], "app.bsky.feed.defs#reasonRepost");
+    assert_eq!((reason["by"]["did"].as_str(), reason["uri"].as_str()), (Some(BOB), Some(repost_uri.as_str())));
+    assert_eq!(reason["indexedAt"], "2026-09-28T12:00:00.000Z");
+    assert_eq!(feed[0]["record"]["text"], "3ktpost22222", "the subject read for Carol");
+    assert!(feed[0]["likeCount"].is_i64(), "decorated as any item");
+    assert_eq!(feed[1]["uri"], bobs.as_str());
+    assert!(feed[1].get("reason").is_none());
+    // Paged one at a time, each item once.
+    let pages = timeline_pages(&base).await;
+    assert_eq!(pages.len(), 2, "{pages:?}");
+    assert!(pages[0].contains("reasonRepost") && pages[1].contains("3kbobspost22"), "{pages:?}");
+    // Bob's author feed carries his repost too.
+    let (_, v, _) = json_of(&base, FEED, &format!("actor={BOB}"), CAROL).await;
+    let uris: Vec<&str> = v["feed"].as_array().expect("feed").iter().filter_map(|i| i["uri"].as_str()).collect();
+    assert_eq!(uris, [t.as_str(), bobs.as_str()]);
+    assert_eq!(v["feed"][0]["reason"]["uri"], repost_uri.as_str());
+    // Reader-relative: Dave cannot read T or Bob's post, but reads the
+    // post Carol cannot, so Bob's author feed gives him that repost alone.
+    let (_, v, _) = json_of(&base, FEED, &format!("actor={BOB}"), DAVE).await;
+    let feed = v["feed"].as_array().expect("feed");
+    assert_eq!(feed.len(), 1, "{v}");
+    assert_eq!((feed[0]["uri"].as_str(), feed[0]["reason"]["by"]["did"].as_str()), (Some(hidden.as_str()), Some(BOB)));
+
+    // A muted reposter's items are absent.
+    exec(&f.pool, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{CAROL}', '{BOB}')")).await;
+    let (body, _, _) = json_of(&base, TIMELINE, "", CAROL).await;
+    assert_eq!(body, r#"{"feed":[]}"#);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_repost_items_on() {
+    repost_items_in(PublicMode::On, "s5-reposts-on").await;
+}
+
+#[tokio::test]
+async fn private_repost_items_off() {
+    repost_items_in(PublicMode::Off, "s5-reposts-off").await;
 }

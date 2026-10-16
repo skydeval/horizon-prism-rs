@@ -27,6 +27,7 @@
 //! use horizon_prism_rs::private_tier::emit::PrivateEmit;
 //! ```
 
+mod cursor;
 mod emit;
 pub(crate) mod handlers;
 pub(crate) mod ingest;
@@ -59,6 +60,21 @@ pub struct PrivateOp {
     pub rev: String,
     /// The record as received; `firehose::normalize` helpers decode its fields.
     pub record: serde_json::Value,
+}
+
+/// A member's public post and the private post it quotes (private posting
+/// §4.7), as the writer hands it to [`PrivateTier::upsert_quote_ref`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteRef {
+    /// The quoting `app.bsky.feed.post`.
+    pub uri: String,
+    pub author_did: String,
+    pub cid: String,
+    /// Commit rev (LWW).
+    pub rev: String,
+    /// The `postPrivate` URI it quotes; `None` when it quotes none.
+    pub quoted_uri: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// What an ingest call changed.
@@ -96,6 +112,9 @@ pub const FEATURES: &[&str] = &[
     "private.bookmarks",
     // P-18 threadgates and postgates on private posts (S4).
     "private.gates",
+    // P-2 counts and viewer state, P-5 likes, reposts, quotes and repost
+    // reasons, P-16 thread mutes (S5).
+    "private.interactions",
     // Rule 4's anchored walk (S0, listed from S1).
     "private.crossPdsReplies",
 ];
@@ -142,6 +161,17 @@ pub trait PrivateTier: Send + Sync {
     /// The record keys of `did`'s stored private posts: backfill keeps the
     /// gates of these (private posting §4.4).
     async fn post_rkeys(&self, pool: &PgPool, did: &str) -> Result<HashSet<String>, sqlx::Error>;
+
+    /// `ingest::upsert_quote_ref` (private posting §4.7): a member's public
+    /// post at `quote.uri` that quotes the `postPrivate` post
+    /// `quote.quoted_uri`, last writer winning on rev. `quoted_uri` `None`
+    /// (the post quotes no private post, or no longer does) removes an
+    /// older reference.
+    async fn upsert_quote_ref(&self, conn: &mut PgConnection, quote: &QuoteRef) -> Result<(), sqlx::Error>;
+
+    /// `ingest::delete_quote_ref`: a public post's delete takes its quote
+    /// reference with it, by rev, as `member_post_refs`.
+    async fn delete_quote_ref(&self, conn: &mut PgConnection, uri: &str, rev: &str) -> Result<(), sqlx::Error>;
 
     /// `readiness::clear_all`: the gap transaction's owner-readiness wipe (§6.11.4).
     async fn clear_all_readiness(&self, conn: &mut PgConnection) -> Result<(), sqlx::Error>;
@@ -241,6 +271,14 @@ impl PrivateTier for KryphocronPrivateTier {
 
     async fn post_rkeys(&self, pool: &PgPool, did: &str) -> Result<HashSet<String>, sqlx::Error> {
         ingest::post_rkeys(pool, did).await
+    }
+
+    async fn upsert_quote_ref(&self, conn: &mut PgConnection, quote: &QuoteRef) -> Result<(), sqlx::Error> {
+        ingest::upsert_quote_ref(conn, quote).await
+    }
+
+    async fn delete_quote_ref(&self, conn: &mut PgConnection, uri: &str, rev: &str) -> Result<(), sqlx::Error> {
+        ingest::delete_quote_ref(conn, uri, rev).await
     }
 
     async fn clear_all_readiness(&self, conn: &mut PgConnection) -> Result<(), sqlx::Error> {
@@ -359,6 +397,14 @@ impl PrivateTier for DisabledPrivateTier {
 
     async fn post_rkeys(&self, _pool: &PgPool, _did: &str) -> Result<HashSet<String>, sqlx::Error> {
         Ok(HashSet::new())
+    }
+
+    async fn upsert_quote_ref(&self, _conn: &mut PgConnection, _quote: &QuoteRef) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    async fn delete_quote_ref(&self, _conn: &mut PgConnection, _uri: &str, _rev: &str) -> Result<(), sqlx::Error> {
+        Ok(())
     }
 
     async fn clear_all_readiness(&self, _conn: &mut PgConnection) -> Result<(), sqlx::Error> {

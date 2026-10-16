@@ -1,0 +1,58 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getQuotes",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the posts that quote a private-tier post (tools.kryphocron.feed.postPrivate) that the requester is authorized to read, newest first: private posts quoting it that the requester may read, as #privatePostView, and community members' public posts quoting it, by authors with no block either way with the requester, as #publicPostRef. A public quoting post is given by reference only: hydrate it through a public AppView. Each item carries its $type. The post is read for the requester as getPosts reads it; a post the requester may not read, one that does not exist and a URI that names no private post all give the same answer, {uri, posts: []}. Requires auth by a ready community member.",
+      "parameters": {
+        "type": "params",
+        "required": ["uri"],
+        "properties": {
+          "uri": { "type": "string", "format": "at-uri", "description": "The private post." },
+          "limit": {
+            "type": "integer",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque, sealed pagination cursor from a previous response to the same requester for the same uri. Any other cursor is rejected with InvalidRequest."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "posts"],
+          "properties": {
+            "uri": { "type": "string", "format": "at-uri" },
+            "cursor": {
+              "type": "string",
+              "description": "Present whenever more candidates remain; a page may be short or empty and still carry one."
+            },
+            "posts": {
+              "type": "array",
+              "items": {
+                "type": "union",
+                "refs": ["app.nearhorizon.private.defs#privatePostView", "app.nearhorizon.private.defs#publicPostRef"]
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

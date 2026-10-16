@@ -280,6 +280,12 @@ pub struct PrivateReadFloors {
     pub get_timeline: u64,
     /// `private.getBookmarks` (private posting S3, §3.2).
     pub get_bookmarks: u64,
+    /// `private.getLikes` (private posting S5, §3.2).
+    pub get_likes: u64,
+    /// `private.getRepostedBy` (S5).
+    pub get_reposted_by: u64,
+    /// `private.getQuotes` (S5).
+    pub get_quotes: u64,
 }
 
 impl Default for PrivateReadFloors {
@@ -292,6 +298,9 @@ impl Default for PrivateReadFloors {
             get_author_feed: 1200,
             get_timeline: 1200,
             get_bookmarks: 1200,
+            get_likes: 800,
+            get_reposted_by: 800,
+            get_quotes: 1200,
         }
     }
 }

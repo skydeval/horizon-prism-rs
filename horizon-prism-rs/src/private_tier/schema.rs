@@ -6,6 +6,8 @@
 //! - **Non-content** queries (oracle facts, candidate prefilters) take DIDs
 //!   and URIs and return no private content.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
@@ -650,11 +652,58 @@ pub(super) async fn mentions(pool: &PgPool, uri: &str, did: &str) -> Result<bool
         .await
 }
 
-/// A feed candidate: `(uri, created_at, rkey)`.
-pub(super) type FeedCandidate = (String, DateTime<Utc>, String);
+/// A feed candidate (private posting §4.7): the private post to read, its
+/// sort time and tie key, and for a repost item the repost's URI and its
+/// author. A post's own item sorts by the post's `created_at` and its key
+/// (the rkey on an author feed, the URI on the timeline); a repost item by
+/// the repost's `created_at` and the repost's URI.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(super) struct FeedCandidate {
+    pub uri: String,
+    pub created_at: DateTime<Utc>,
+    pub key: String,
+    pub repost_uri: Option<String>,
+    pub reposter: Option<String>,
+}
 
-/// The actor's posts passing the prefilter, newest first, after the
-/// `created_at::rkey` cursor.
+/// The repost items' rows: a repost of a stored private post, with the
+/// post's prefilter joins. The `subject_uri` test matches the partial index
+/// `reposts_private_subject`.
+const REPOST_FROM: &str = "reposts rp \
+     JOIN private_posts p ON p.uri = rp.subject_uri \
+     LEFT JOIN private_audiences a ON a.uri = p.audience_uri \
+     LEFT JOIN actors po ON po.did = p.author_did \
+     LEFT JOIN actors ao ON ao.did = a.owner_did";
+
+/// The conditions on a repost item's repost `rp` for the requester `$1`
+/// (private posting §4.7, C-2): it reposts a `postPrivate` URI, its author
+/// is a member, and no block stands between that author and the requester.
+fn repost_item() -> String {
+    format!(
+        "rp.subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%' \
+         AND EXISTS (SELECT 1 FROM members m WHERE m.did = rp.author_did) \
+         AND NOT {blocked}",
+        blocked = blocked("$1", "rp.author_did")
+    )
+}
+
+/// `$1` does not fully mute `did` (an SQL expression), directly or through
+/// a moderation list that applies, as on the public timeline.
+fn not_muted(did: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = {did} AND m.scope = 'full') \
+         AND NOT EXISTS (SELECT 1 FROM list_references r \
+                         JOIN subscribed_lists l ON l.list_uri = r.list_uri \
+                         JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
+                         WHERE r.member_did = $1 AND i.subject_did = {did} AND {applies})",
+        applies = crate::hydration::APPLIES,
+    )
+}
+
+/// The actor's posts passing the prefilter, and the actor's reposts of
+/// private posts that pass it (private posting §4.7) when the actor is a
+/// member with no block either way with the requester, newest first, after
+/// the `created_at::key` cursor.
 ///
 /// # Errors
 ///
@@ -666,32 +715,45 @@ pub(super) async fn author_candidates(
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
 ) -> Result<Vec<FeedCandidate>, sqlx::Error> {
-    let (at, rkey) = after.map_or((None, String::new()), |(a, r)| (Some(a), r));
+    let (at, key) = after.map_or((None, String::new()), |(a, k)| (Some(a), k));
     sqlx::query_as(&format!(
-        "SELECT p.uri, p.created_at, p.rkey FROM {PREFILTER_FROM} \
-         WHERE p.author_did = $2 AND {pre} \
-           AND ($3::timestamptz IS NULL OR (p.created_at, p.rkey) < ($3, $4)) \
-         ORDER BY p.created_at DESC, p.rkey DESC LIMIT $5",
-        pre = prefilter()
+        "(SELECT p.uri, p.created_at, p.rkey COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
+          FROM {PREFILTER_FROM} \
+          WHERE p.author_did = $2 AND {pre} \
+            AND ($3::timestamptz IS NULL OR (p.created_at, p.rkey COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+          ORDER BY p.created_at DESC, p.rkey COLLATE \"C\" DESC LIMIT $5) \
+         UNION ALL \
+         (SELECT p.uri, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
+          FROM {REPOST_FROM} \
+          WHERE rp.author_did = $2 AND {repost} AND {pre} \
+            AND ($3::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+          ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $5) \
+         ORDER BY created_at DESC, key DESC LIMIT $5",
+        pre = prefilter(),
+        repost = repost_item(),
     ))
     .bind(requester)
     .bind(author)
     .bind(at)
-    .bind(rkey)
+    .bind(key)
     .bind(limit)
     .fetch_all(pool)
     .await
 }
 
-/// The home timeline's candidates (design-v3 §1.7 item 12): posts passing
-/// the prefilter whose author is the requester or an account the requester
-/// follows, as this AppView has indexed the follows, newest first, after
-/// the `created_at::uri` cursor. The third value is the URI again: across
-/// authors a record key is not unique, so the URI breaks ties.
+/// The home timeline's candidates (design-v3 §1.7 item 12; private posting
+/// §4.7), newest first, after the `created_at::key` cursor:
+/// - posts passing the prefilter whose author is the requester or an
+///   account the requester follows, as this AppView has indexed the
+///   follows, keyed by URI (across authors a record key is not unique);
+/// - repost items: reposts by the requester or an account it follows, a
+///   member (C-2), of a private post passing the prefilter, keyed by the
+///   repost's URI.
 ///
-/// A mute applies here as it does on the public timeline: an author the
-/// requester fully mutes, directly or through a moderation list that
-/// applies, is left out.
+/// A mute applies here as it does on the public timeline: a post's author,
+/// or a reposter, that the requester fully mutes, directly or through a
+/// moderation list that applies, is left out. So is a reposter with a block
+/// either way.
 ///
 /// # Errors
 ///
@@ -702,22 +764,262 @@ pub(super) async fn timeline_candidates(
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
 ) -> Result<Vec<FeedCandidate>, sqlx::Error> {
-    let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
+    let (at, key) = after.map_or((None, String::new()), |(a, k)| (Some(a), k));
     sqlx::query_as(&format!(
-        "SELECT p.uri, p.created_at, p.uri FROM {PREFILTER_FROM} \
-         WHERE (p.author_did = $1 OR p.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
-           AND {pre} \
-           AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = p.author_did AND m.scope = 'full') \
-           AND NOT EXISTS (SELECT 1 FROM list_references r \
-                           JOIN subscribed_lists l ON l.list_uri = r.list_uri \
-                           JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
-                           WHERE r.member_did = $1 AND i.subject_did = p.author_did AND {applies}) \
-           AND ($2::timestamptz IS NULL OR (p.created_at, p.uri) < ($2, $3)) \
-         ORDER BY p.created_at DESC, p.uri DESC LIMIT $4",
-        applies = crate::hydration::APPLIES,
+        "(SELECT p.uri, p.created_at, p.uri COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
+          FROM {PREFILTER_FROM} \
+          WHERE (p.author_did = $1 OR p.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
+            AND {pre} AND {post_muted} \
+            AND ($2::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
+          ORDER BY p.created_at DESC, p.uri COLLATE \"C\" DESC LIMIT $4) \
+         UNION ALL \
+         (SELECT p.uri, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
+          FROM {REPOST_FROM} \
+          WHERE (rp.author_did = $1 OR rp.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
+            AND {repost} AND {reposter_muted} AND {pre} \
+            AND ($2::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
+          ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $4) \
+         ORDER BY created_at DESC, key DESC LIMIT $4",
         pre = prefilter(),
+        post_muted = not_muted("p.author_did"),
+        repost = repost_item(),
+        reposter_muted = not_muted("rp.author_did"),
     ))
     .bind(requester)
+    .bind(at)
+    .bind(key)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// The counts on a private post view (private posting §3.4, P-2): each
+/// counts only what the reader is entitled to know exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Counts {
+    pub reply: i64,
+    pub repost: i64,
+    pub like: i64,
+    pub quote: i64,
+}
+
+/// A like or a repost: the public interaction tables the private views read
+/// (by member likers only, C-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Interaction {
+    Like,
+    Repost,
+}
+
+impl Interaction {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Like => "likes",
+            Self::Repost => "reposts",
+        }
+    }
+}
+
+/// An interaction row `l` that counts for the reader `$1`: by a member,
+/// with no block either way with the reader (§3.4, C-2).
+fn counted_interaction() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM members m WHERE m.did = l.author_did) AND NOT {blocked}",
+        blocked = blocked("$1", "l.author_did")
+    )
+}
+
+/// A quote reference `q` that counts for the reader `$1`: no block either
+/// way between its author and the reader (§3.4).
+fn counted_quote_ref() -> String {
+    format!("NOT {}", blocked("$1", "q.author_did"))
+}
+
+/// The counts of `uris` for `reader`, one query per kind (§3.4). Every join
+/// is on a URI (§3.5), so a post's counts survive a CID change.
+/// - `replyCount`: private replies passing the prefilter, which carries the
+///   moderation test; a reply that fails decode or waits on its owner's
+///   readiness counts, since that fails for every reader alike.
+/// - `likeCount`, `repostCount`: by member likers with no block either way.
+/// - `quoteCount`: private quotes passing the prefilter, and members'
+///   public quotes whose author has no block either way.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn counts(pool: &PgPool, reader: &str, uris: &[String]) -> Result<HashMap<String, Counts>, sqlx::Error> {
+    let mut out: HashMap<String, Counts> = HashMap::new();
+    if uris.is_empty() {
+        return Ok(out);
+    }
+    let replies: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT p.reply_parent_uri, count(*) FROM {PREFILTER_FROM} \
+         WHERE p.reply_parent_uri = ANY($2) AND {pre} GROUP BY p.reply_parent_uri",
+        pre = prefilter()
+    ))
+    .bind(reader)
+    .bind(uris)
+    .fetch_all(pool)
+    .await?;
+    for (uri, n) in replies {
+        out.entry(uri).or_default().reply = n;
+    }
+    for kind in [Interaction::Like, Interaction::Repost] {
+        let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+            "SELECT l.subject_uri, count(*) FROM {table} l WHERE l.subject_uri = ANY($2) AND {counted} GROUP BY l.subject_uri",
+            table = kind.table(),
+            counted = counted_interaction(),
+        ))
+        .bind(reader)
+        .bind(uris)
+        .fetch_all(pool)
+        .await?;
+        for (uri, n) in rows {
+            let c = out.entry(uri).or_default();
+            match kind {
+                Interaction::Like => c.like = n,
+                Interaction::Repost => c.repost = n,
+            }
+        }
+    }
+    let quotes: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT quoted, count(*) FROM ( \
+           SELECT p.quote_uri AS quoted FROM {PREFILTER_FROM} WHERE p.quote_uri = ANY($2) AND {pre} \
+           UNION ALL \
+           SELECT q.quoted_uri FROM private_quote_refs q WHERE q.quoted_uri = ANY($2) AND {counted} \
+         ) x GROUP BY quoted",
+        pre = prefilter(),
+        counted = counted_quote_ref(),
+    ))
+    .bind(reader)
+    .bind(uris)
+    .fetch_all(pool)
+    .await?;
+    for (uri, n) in quotes {
+        out.entry(uri).or_default().quote = n;
+    }
+    Ok(out)
+}
+
+/// The URI of `viewer`'s own like or repost of each of `uris`, the newest
+/// when there are several (`viewer.like`, `viewer.repost`, §4.6). The
+/// viewer is a member, so its likes are stored in every mode.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn own_interactions(
+    pool: &PgPool,
+    viewer: &str,
+    kind: Interaction,
+    uris: &[String],
+) -> Result<HashMap<String, String>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+        "SELECT DISTINCT ON (subject_uri) subject_uri, uri FROM {table} \
+         WHERE author_did = $1 AND subject_uri = ANY($2) \
+         ORDER BY subject_uri, created_at DESC, uri DESC",
+        table = kind.table()
+    ))
+    .bind(viewer)
+    .bind(uris)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// The thread roots among `roots` that `viewer` muted (`thread_mutes`, the
+/// viewer's own rows; §4.6, §4.11).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn muted_roots(pool: &PgPool, viewer: &str, roots: &[String]) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT root_uri FROM thread_mutes WHERE viewer_did = $1 AND root_uri = ANY($2)")
+        .bind(viewer)
+        .bind(roots)
+        .fetch_all(pool)
+        .await
+}
+
+/// A liker or reposter of a readable private post: `(author, created_at,
+/// indexed_at, uri)`.
+pub(super) type InteractionRow = (String, DateTime<Utc>, DateTime<Utc>, String);
+
+/// `getLikes` and `getRepostedBy` (private posting §4.7): the rows on
+/// `subject` that count for `reader` (as [`counts`] counts them), newest
+/// first, after the plain `created_at::uri` cursor. They are public records
+/// of members; the caller has read `subject`.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn interactions(
+    pool: &PgPool,
+    reader: &str,
+    kind: Interaction,
+    subject: &str,
+    after: Option<(DateTime<Utc>, String)>,
+    limit: i64,
+) -> Result<Vec<InteractionRow>, sqlx::Error> {
+    let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
+    sqlx::query_as(&format!(
+        "SELECT l.author_did, l.created_at, l.indexed_at, l.uri FROM {table} l \
+         WHERE l.subject_uri = $2 AND {counted} \
+           AND ($3::timestamptz IS NULL OR (l.created_at, l.uri) < ($3, $4)) \
+         ORDER BY l.created_at DESC, l.uri DESC LIMIT $5",
+        table = kind.table(),
+        counted = counted_interaction(),
+    ))
+    .bind(reader)
+    .bind(subject)
+    .bind(at)
+    .bind(uri)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// A `getQuotes` candidate (private posting §4.7): a private quoting post
+/// to read (`cid` `None`), or a member's public quoting post, emitted as a
+/// reference (`cid` its CID).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(super) struct QuoteCandidate {
+    pub uri: String,
+    pub created_at: DateTime<Utc>,
+    pub cid: Option<String>,
+}
+
+/// The posts quoting `quoted`, newest first, merged by `(created_at, uri)`
+/// after the cursor: private posts passing the prefilter, and public quote
+/// references whose author has no block either way with `reader`.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn quote_candidates(
+    pool: &PgPool,
+    reader: &str,
+    quoted: &str,
+    after: Option<(DateTime<Utc>, String)>,
+    limit: i64,
+) -> Result<Vec<QuoteCandidate>, sqlx::Error> {
+    let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
+    sqlx::query_as(&format!(
+        "(SELECT p.uri COLLATE \"C\" AS uri, p.created_at, NULL::text AS cid FROM {PREFILTER_FROM} \
+          WHERE p.quote_uri = $2 AND {pre} \
+            AND ($3::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+          ORDER BY p.created_at DESC, p.uri COLLATE \"C\" DESC LIMIT $5) \
+         UNION ALL \
+         (SELECT q.uri COLLATE \"C\", q.created_at, q.cid FROM private_quote_refs q \
+          WHERE q.quoted_uri = $2 AND {counted} \
+            AND ($3::timestamptz IS NULL OR (q.created_at, q.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+          ORDER BY q.created_at DESC, q.uri COLLATE \"C\" DESC LIMIT $5) \
+         ORDER BY created_at DESC, uri DESC LIMIT $5",
+        pre = prefilter(),
+        counted = counted_quote_ref(),
+    ))
+    .bind(reader)
+    .bind(quoted)
     .bind(at)
     .bind(uri)
     .bind(limit)

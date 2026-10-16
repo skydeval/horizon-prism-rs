@@ -27,7 +27,8 @@ use super::rows::{self, Cell, Row};
 use crate::aggregations::growth::{self, GrowthPlan};
 use crate::aggregations::{Admission, AdmissionInput, RecordKind, ScopeSets, ScopeState, admit};
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
-use crate::private_tier::{IngestError, PrivateOp, PrivateTier};
+use crate::hydration::normalize::is_private_uri;
+use crate::private_tier::{IngestError, PrivateOp, PrivateTier, QuoteRef};
 use crate::subscriptions::applier::Applier;
 use crate::subscriptions::copy;
 use crate::subscriptions::fetch::{NSID_LIST, NSID_LISTITEM};
@@ -903,6 +904,7 @@ impl Writer {
         }
         if let Body::Post(p) = &u.body {
             upsert_post_ref(conn, u, p, rev).await?;
+            self.private.upsert_quote_ref(conn, &quote_ref(u, p, rev)).await?;
         }
         eff.growth_added = growth::apply(conn, plan).await?;
         Ok((OpOutcome::GrowOnly, eff))
@@ -967,10 +969,12 @@ impl Writer {
         };
         // A member's post has a reference in every mode, whatever became
         // of the row (public-indexing design §4.1); it has its own rev check.
+        // So does its quote of a private post (private posting §4.7).
         if let Body::Post(p) = &u.body
             && sets.is_member(author)
         {
             upsert_post_ref(conn, u, p, rev).await?;
+            self.private.upsert_quote_ref(conn, &quote_ref(u, p, rev)).await?;
         }
         if !written {
             metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "older_rev").increment(1);
@@ -1105,6 +1109,7 @@ impl Writer {
                 // The reference goes by its own rev, whatever became of the
                 // row (public-indexing design §4.1).
                 delete_row(conn, "member_post_refs", &d.uri, rev).await?;
+                self.private.delete_quote_ref(conn, &d.uri, rev).await?;
                 let removed = delete_row(conn, "posts", &d.uri, rev).await?;
                 if removed {
                     // The gates of a post that is gone gate nothing.
@@ -1296,6 +1301,20 @@ async fn upsert_post_ref(conn: &mut PgConnection, u: &Upsert, p: &PostRecord, re
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// A member's post as the private tier keeps its quote of a private post
+/// (private posting §4.7): the quoted `postPrivate` URI, or `None` when it
+/// quotes none, so an update that drops the quote removes the reference.
+fn quote_ref(u: &Upsert, p: &PostRecord, rev: &str) -> QuoteRef {
+    QuoteRef {
+        uri: u.uri.clone(),
+        author_did: u.input.author.clone(),
+        cid: u.cid.clone(),
+        rev: rev.to_string(),
+        quoted_uri: p.quote_uri.clone().filter(|q| is_private_uri(q)),
+        created_at: p.created_at,
+    }
 }
 
 async fn upsert_subject(

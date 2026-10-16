@@ -645,6 +645,8 @@ pub async fn run() -> Result<(), StartupError> {
         Duration::from_secs(cfg.file.kryphocron.oracle_freshness_bound_secs),
         usize::try_from(cfg.file.sync.max_head_fetches_per_request).unwrap_or(16),
         &cfg.file.private_read,
+        // Required and never generated (private posting §3.6, C-14).
+        crate::cursor_key::CursorKey::new(cfg.env.private_cursor_key.expose()),
     );
     // The post-migration task (design-v3 §12.2): every migration is applied
     // and ingest is running, so old rows can be filled and the large

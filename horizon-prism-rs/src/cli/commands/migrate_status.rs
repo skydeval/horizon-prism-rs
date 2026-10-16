@@ -80,6 +80,8 @@ mod tests {
             "0024_bookmarks_private_tier",
             // Private posting S4.
             "0025_private_gates",
+            // Private posting S5.
+            "0026_quote_refs_private_tier",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

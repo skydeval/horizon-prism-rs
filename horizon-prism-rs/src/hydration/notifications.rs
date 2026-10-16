@@ -622,12 +622,16 @@ mod tests {
         assert_eq!(l.inner()["notifications"].as_array().map(Vec::len), Some(2));
         assert!(h.post_viewer(&me, std::slice::from_ref(&root)).await.expect("db")[&root].get("threadMuted").is_none());
 
-        // The root is not looked up, must be a post's at-uri, and the cap
-        // (3 in tests) refuses a new thread but not a repeat.
+        // The root is not looked up, must be a post's at-uri, public or
+        // private (private posting §4.11), and the cap (3 in tests) refuses
+        // a new thread but not a repeat.
+        let private_root = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/tools.kryphocron.feed.postPrivate/1";
+        assert_eq!(h.set_thread_mute(&me, private_root, true).await.expect("db").expect("a private root").inner(), &json!({}));
+        h.set_thread_mute(&me, private_root, false).await.expect("db").expect("unmuted");
         for bad in [
             "not a uri",
             "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.like/1",
-            "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/tools.kryphocron.feed.postPrivate/1",
+            "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/tools.kryphocron.feed.postPrivate",
             "at://alice.test/app.bsky.feed.post/1",
             "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/1/extra",
         ] {

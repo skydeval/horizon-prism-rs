@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 
-use super::{Applied, IngestError, PrivateOp, owners};
+use super::{Applied, IngestError, PrivateOp, QuoteRef, owners};
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_THREADGATE};
 use crate::firehose::jobs::Depth;
@@ -596,6 +596,56 @@ pub(crate) async fn post_rkeys(pool: &PgPool, did: &str) -> Result<std::collecti
     Ok(rkeys.into_iter().collect())
 }
 
+/// `ingest::upsert_quote_ref` (private posting §4.7): a member's public post
+/// that quotes a private post, into `private_quote_refs`, last writer winning
+/// on rev. A post that quotes no private post (or no longer does) removes
+/// an older reference instead.
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn upsert_quote_ref(conn: &mut PgConnection, quote: &QuoteRef) -> Result<(), sqlx::Error> {
+    let Some(quoted) = &quote.quoted_uri else {
+        sqlx::query("DELETE FROM private_quote_refs WHERE uri = $1 AND rev < $2")
+            .bind(&quote.uri)
+            .bind(&quote.rev)
+            .execute(conn)
+            .await?;
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO private_quote_refs (uri, author_did, cid, rev, quoted_uri, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (uri) DO UPDATE SET author_did = EXCLUDED.author_did, cid = EXCLUDED.cid, rev = EXCLUDED.rev, \
+           quoted_uri = EXCLUDED.quoted_uri, created_at = EXCLUDED.created_at \
+         WHERE private_quote_refs.rev < EXCLUDED.rev",
+    )
+    .bind(&quote.uri)
+    .bind(&quote.author_did)
+    .bind(&quote.cid)
+    .bind(&quote.rev)
+    .bind(quoted)
+    .bind(quote.created_at)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// `ingest::delete_quote_ref`: the quote reference of a deleted public post,
+/// when its rev is not newer than the delete's.
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn delete_quote_ref(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM private_quote_refs WHERE uri = $1 AND rev <= $2")
+        .bind(uri)
+        .bind(rev)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 async fn tombstone(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO private_tombstones (uri, rev) VALUES ($1, $2) \
@@ -727,6 +777,7 @@ pub(crate) async fn purge_did(conn: &mut PgConnection, did: &str, limit: i64) ->
         ("private_blocks", "author_did"),
         ("private_threadgates", "author_did"),
         ("private_postgates", "author_did"),
+        ("private_quote_refs", "author_did"),
     ] {
         n += sqlx::query(&format!(
             "DELETE FROM {table} WHERE uri IN (SELECT uri FROM {table} WHERE {col} = $1 LIMIT $2)"
@@ -794,14 +845,23 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
 /// The private part of a `member_removed` purge (§6.11.7): private replies by
 /// authors outside S admitted only because `did` was a member (no other
 /// member among parent and root authors), rule-2 private blocks of `did`
-/// by authors outside S that are not private owners, and the member's
-/// private bookmarks.
+/// by authors outside S that are not private owners, the member's private
+/// bookmarks, and the member's quote references (private posting §3.1: its
+/// later deletes are no longer tracked).
 ///
 /// # Errors
 ///
 /// Database errors.
 pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
     let mut n = purge_bookmarks(conn, did, limit).await?;
+    n += sqlx::query(
+        "DELETE FROM private_quote_refs WHERE uri IN (SELECT uri FROM private_quote_refs WHERE author_did = $1 LIMIT $2)",
+    )
+    .bind(did)
+    .bind(limit)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
     n += sqlx::query(
         "DELETE FROM private_posts WHERE uri IN (SELECT p.uri FROM private_posts p \
          WHERE NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = p.author_did) \

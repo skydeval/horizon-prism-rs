@@ -55,7 +55,7 @@ const LOCK_RETRY: Duration = Duration::from_millis(500);
 
 /// The large-table indexes, by name, with the one statement that builds
 /// each (§3.1: the names and definitions are normative).
-pub const INDEXES: [(&str, &str); 11] = [
+pub const INDEXES: [(&str, &str); 12] = [
     ("posts_search", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_search ON posts USING gin (search_tsv)"),
     ("posts_tags", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_tags ON posts USING gin (tags)"),
     ("posts_domains", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_domains ON posts USING gin (link_domains)"),
@@ -69,6 +69,13 @@ pub const INDEXES: [(&str, &str); 11] = [
     // filter (docs/internal/design/private-audience-modes.md §6).
     ("follows_pair", "CREATE INDEX CONCURRENTLY IF NOT EXISTS follows_pair ON follows (author_did, subject_did)"),
     ("blocks_pair", "CREATE INDEX CONCURRENTLY IF NOT EXISTS blocks_pair ON blocks (author_did, subject_did)"),
+    // The repost items of the private timeline and author feed
+    // (docs/internal/design/private-posting.md §3.1, §4.7).
+    (
+        "reposts_private_subject",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_private_subject ON reposts (author_did, created_at DESC) \
+         WHERE subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%'",
+    ),
 ];
 
 /// The task's settings.
@@ -598,7 +605,7 @@ mod tests {
             .fetch_one(p)
             .await
             .expect("recorded");
-        assert_eq!(recorded, 11);
+        assert_eq!(recorded, 12);
         // A second pass finds every index valid and builds nothing.
         t.run_index_builds().await.expect("again");
         db.drop_db().await;

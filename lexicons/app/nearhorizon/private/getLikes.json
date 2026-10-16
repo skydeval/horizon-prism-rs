@@ -1,0 +1,55 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getLikes",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the likes of a private-tier post (tools.kryphocron.feed.postPrivate) that the requester is authorized to read, newest first: likes by community members with no block either way with the requester. A like by an account that is not a member is not listed, in any mode. The post is read for the requester as getPosts reads it; a post the requester may not read, one that does not exist and a URI that names no private post all give the same answer, {uri, likes: []}. Requires auth by a ready community member. The output is app.bsky.feed.getLikes's.",
+      "parameters": {
+        "type": "params",
+        "required": ["uri"],
+        "properties": {
+          "uri": { "type": "string", "format": "at-uri", "description": "The private post." },
+          "limit": {
+            "type": "integer",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor from a previous response."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "likes"],
+          "properties": {
+            "uri": { "type": "string", "format": "at-uri" },
+            "cursor": {
+              "type": "string",
+              "description": "Present when a full page was returned and more likes may follow."
+            },
+            "likes": {
+              "type": "array",
+              "items": { "type": "ref", "ref": "app.bsky.feed.getLikes#like" }
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

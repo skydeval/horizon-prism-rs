@@ -50,9 +50,16 @@ impl CursorKey {
     /// longer than a cursor may be.
     #[must_use]
     pub fn seal<P: Serialize>(&self, aad: &str, position: &P) -> Option<String> {
-        let plain = serde_json::to_vec(position).ok()?;
+        self.seal_bytes(aad, &serde_json::to_vec(position).ok()?)
+    }
+
+    /// Seal `plain` as it is, bound to `aad`: a caller that pads its
+    /// plaintext to a fixed length gets cursors of one length (private
+    /// posting §3.6). `None` when the cursor would be too long.
+    #[must_use]
+    pub fn seal_bytes(&self, aad: &str, plain: &[u8]) -> Option<String> {
         let nonce: [u8; NONCE_LEN] = rand::random();
-        let sealed = self.cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: &plain, aad: aad.as_bytes() }).ok()?;
+        let sealed = self.cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad: aad.as_bytes() }).ok()?;
         let mut bytes = nonce.to_vec();
         bytes.extend(sealed);
         let cursor = URL_SAFE_NO_PAD.encode(bytes);
@@ -64,6 +71,13 @@ impl CursorKey {
     /// key, or is not a cursor at all.
     #[must_use]
     pub fn open<P: DeserializeOwned>(&self, aad: &str, cursor: &str) -> Option<P> {
+        serde_json::from_slice(&self.open_bytes(aad, cursor)?).ok()
+    }
+
+    /// [`Self::open`] for a cursor sealed with [`Self::seal_bytes`]: the
+    /// plaintext as it was sealed.
+    #[must_use]
+    pub fn open_bytes(&self, aad: &str, cursor: &str) -> Option<Vec<u8>> {
         if cursor.len() > MAX_CURSOR_LEN {
             return None;
         }
@@ -72,8 +86,7 @@ impl CursorKey {
             return None;
         }
         let (nonce, sealed) = bytes.split_at(NONCE_LEN);
-        let plain = self.cipher.decrypt(Nonce::from_slice(nonce), Payload { msg: sealed, aad: aad.as_bytes() }).ok()?;
-        serde_json::from_slice(&plain).ok()
+        self.cipher.decrypt(Nonce::from_slice(nonce), Payload { msg: sealed, aad: aad.as_bytes() }).ok()
     }
 }
 

@@ -132,6 +132,37 @@ impl Serialize for BookmarkView {
     }
 }
 
+/// One item of `app.nearhorizon.private.getQuotes` (private posting §4.7),
+/// each with its `$type`: a private quoting post read through the pipeline,
+/// or a public one as `#publicPostRef {uri, cid}` (C-3).
+#[derive(Debug)]
+pub enum QuoteItem {
+    Private(PrivateEmit<Value>),
+    Public { uri: String, cid: String },
+}
+
+impl Serialize for QuoteItem {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        match self {
+            Self::Private(post) => {
+                m.serialize_entry("$type", "app.nearhorizon.private.defs#privatePostView")?;
+                if let Value::Object(view) = post.view() {
+                    for (k, v) in view {
+                        m.serialize_entry(k, v)?;
+                    }
+                }
+            }
+            Self::Public { uri, cid } => {
+                m.serialize_entry("$type", "app.nearhorizon.private.defs#publicPostRef")?;
+                m.serialize_entry("uri", uri)?;
+                m.serialize_entry("cid", cid)?;
+            }
+        }
+        m.end()
+    }
+}
+
 /// The body of every private handler response.
 #[derive(Debug)]
 pub enum PrivateResponse {
@@ -139,11 +170,29 @@ pub enum PrivateResponse {
     Thread(ThreadNode),
     Feed { feed: Vec<PrivateEmit<Value>>, cursor: Option<String> },
     Bookmarks { bookmarks: Vec<BookmarkView>, cursor: Option<String> },
+    /// `getLikes`: `likes` are `{indexedAt, createdAt, actor}` of member
+    /// likers, public data.
+    Likes { uri: String, likes: Vec<Value>, cursor: Option<String> },
+    /// `getRepostedBy`: `profileView`s of member reposters, public data.
+    RepostedBy { uri: String, reposted_by: Vec<Value>, cursor: Option<String> },
+    Quotes { uri: String, posts: Vec<QuoteItem>, cursor: Option<String> },
     /// `{}`: a write's answer.
     Empty,
 }
 
 impl PrivateResponse {
+    pub(in crate::private_tier) fn likes(uri: String, likes: Vec<Value>, cursor: Option<String>) -> Self {
+        Self::Likes { uri, likes, cursor }
+    }
+
+    pub(in crate::private_tier) fn reposted_by(uri: String, reposted_by: Vec<Value>, cursor: Option<String>) -> Self {
+        Self::RepostedBy { uri, reposted_by, cursor }
+    }
+
+    pub(in crate::private_tier) fn quotes(uri: String, posts: Vec<QuoteItem>, cursor: Option<String>) -> Self {
+        Self::Quotes { uri, posts, cursor }
+    }
+
     pub(in crate::private_tier) fn bookmarks(bookmarks: Vec<BookmarkView>, cursor: Option<String>) -> Self {
         Self::Bookmarks { bookmarks, cursor }
     }
@@ -182,6 +231,27 @@ impl Serialize for PrivateResponse {
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
                 }
+            }
+            Self::Likes { uri, likes, cursor } => {
+                m.serialize_entry("uri", uri)?;
+                if let Some(c) = cursor {
+                    m.serialize_entry("cursor", c)?;
+                }
+                m.serialize_entry("likes", likes)?;
+            }
+            Self::RepostedBy { uri, reposted_by, cursor } => {
+                m.serialize_entry("uri", uri)?;
+                if let Some(c) = cursor {
+                    m.serialize_entry("cursor", c)?;
+                }
+                m.serialize_entry("repostedBy", reposted_by)?;
+            }
+            Self::Quotes { uri, posts, cursor } => {
+                m.serialize_entry("uri", uri)?;
+                if let Some(c) = cursor {
+                    m.serialize_entry("cursor", c)?;
+                }
+                m.serialize_entry("posts", posts)?;
             }
             Self::Empty => {}
         }

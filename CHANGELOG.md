@@ -12,6 +12,27 @@ commit.
 
 ### Added
 
+- **Counts, viewer state, likes, reposts and quotes of private posts
+  (private posting S5, #719; Horizon P-2, P-5, P-16).**
+  - Private post views carry `replyCount`, `likeCount`, `repostCount` and
+    `quoteCount`, counting only what the reader may see: replies and
+    private quotes the reader may read, public quotes, and likes and
+    reposts by members with no block either way (C-2). `viewer` gains
+    `like`, `repost` and `threadMuted`. Everything is matched by URI, so a
+    changed CID (an audience edit) keeps them.
+  - New `app.nearhorizon.private.getLikes`, `getRepostedBy` and
+    `getQuotes`, empty uniformly when the caller may not read the post.
+    `getQuotes` returns private quoting posts as `privatePostView` and
+    public ones as `#publicPostRef {uri, cid}`, with a sealed cursor.
+  - A member's repost of a private post the caller may read appears in
+    the private timeline and the reposter's author feed, with
+    `reason: #reasonRepost` (no `cid`: reposts are stored without it).
+  - `muteThread` / `unmuteThread` accept a private root.
+  - Migration 0026 (`private_quote_refs`); a post-migration index on
+    reposts by subject. New floors `get_likes`, `get_reposted_by` (800)
+    and `get_quotes` (1200). `getMembership`'s `features` gains
+    `private.interactions`.
+
 - **Reply and quote gates on private posts (private posting S4, #719;
   Horizon P-18).** A stock `app.bsky.feed.threadgate` or `postgate` whose
   `post` is a `postPrivate` URI (same author and rkey as the post) is now
