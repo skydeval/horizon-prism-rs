@@ -25,7 +25,7 @@ use crate::aggregations::{ScopeSets, ScopeState};
 use crate::config::{PrivateReadConfig, PrivateReadFloors, ScopePolicy, SyncConfig, VideoConfig, VideoPlayback};
 use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE};
 use crate::firehose::watermark::Watermarks;
-use crate::firehose::writer::{Action, ApplyOptions, RawOp, WriteSource, Writer};
+use crate::firehose::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer};
 use crate::hydration::HydrationConfig;
 use crate::hydration::testing::{actor, exec, hydrator, hydrator_configured, test_config};
 use crate::indexing::{PublicMode, PublicState};
@@ -1996,5 +1996,307 @@ async fn private_router_methods_are_routed_in_every_mode() {
             assert_eq!(status, 200, "{mode:?} {nsid}");
         }
     }
+    db.drop_db().await;
+}
+
+const THREADGATE: &str = "app.bsky.feed.threadgate";
+const POSTGATE: &str = "app.bsky.feed.postgate";
+const MENTION_RULE: &str = "app.bsky.feed.threadgate#mentionRule";
+const FOLLOWING_RULE: &str = "app.bsky.feed.threadgate#followingRule";
+const DISABLE_RULE: &str = "app.bsky.feed.postgate#disableRule";
+
+/// A facet mentioning `did`.
+fn mention(did: &str) -> Value {
+    json!({"index": {"byteStart": 0, "byteEnd": 1}, "features": [{"$type": "app.bsky.richtext.facet#mention", "did": did}]})
+}
+
+/// A stock record embed of `uri`.
+fn quote_of(uri: &str) -> Value {
+    json!({"embed": {"$type": "app.bsky.embed.record", "record": {"uri": uri, "cid": "bafyany"}}})
+}
+
+/// The URIs stored in a private gate table, sorted.
+async fn gate_rows(pool: &PgPool, table: &str) -> Vec<String> {
+    sqlx::query_scalar(&format!("SELECT uri FROM {table} ORDER BY uri"))
+        .fetch_all(pool)
+        .await
+        .expect(table)
+}
+
+async fn public_gate_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT (SELECT count(*) FROM threadgates) + (SELECT count(*) FROM postgates)")
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
+/// `getPosts(uris)` for `reader`: the raw body and the posts.
+async fn posts_of(base: &str, reader: &str, uris: &[&str]) -> (String, Vec<Value>) {
+    let query: Vec<String> = uris.iter().map(|u| format!("uris={u}")).collect();
+    let (status, body, _) = get(base, POSTS, &query.join("&"), reader, key_of(reader)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    (body.clone(), v["posts"].as_array().cloned().unwrap_or_default())
+}
+
+/// `getPostThread` for `reader` with `query`: the raw body and the thread.
+async fn thread_of(base: &str, reader: &str, query: &str) -> (String, Value) {
+    let (status, body, _) = get(base, THREAD, query, reader, key_of(reader)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    (body, v["thread"].clone())
+}
+
+/// Every reply URI under a thread node, depth first.
+fn reply_uris(node: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for child in node["replies"].as_array().into_iter().flatten() {
+        out.push(child["post"]["uri"].as_str().expect("uri").to_string());
+        out.extend(reply_uris(child));
+    }
+    out
+}
+
+/// T-9 and T-10 (P-18), in On and in Off (T-1), with the request's "Done
+/// when": Alice posts to her `followers` audience with a threadgate
+/// `allow: [mentionRule]` naming Carol; Bob, a follower she does not
+/// mention, gets `replyDisabled: true` and Carol `false`; her postgate's
+/// `disableRule` gives Bob `embeddingDisabled: true`.
+///
+/// Storage: the gates are written by the private tier in both modes (not
+/// `public_off`), a write answers as `requestRecord`'s `indexed` does, a
+/// gate with another rkey or author is stored and ignored, a gate delete
+/// and a post delete remove them. Reads: `replyDisabled` only when the
+/// claimed root was read in the request (a feed reply carries none; a
+/// thread reads its root); `hiddenReplies` hides from others, not from the
+/// reply's author; `allow: []`; `followingRule` with no stored follow is
+/// left out; detached quotes, checked only after the quoted read; no gate
+/// admits a reader the oracle denies; and review 1's LB3 case.
+async fn gates_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("followers"), &[]).await;
+    for who in [BOB, CAROL] {
+        exec(&f.pool, &follow_sql(who, ALICE)).await;
+    }
+    // Alice's root mentions Carol and Dave; Dave does not follow her.
+    let root = f.post_with(ALICE, "3kroot222222", &aud, json!({"facets": [mention(CAROL), mention(DAVE)]})).await;
+    let reply = f.private_post(BOB, "3kreply22222", &aud, Some((&root, &root))).await;
+    let hidden = f.private_post(CAROL, "3khidden2222", &aud, Some((&root, &reply))).await;
+    let bob_aud = f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL, DAVE]).await;
+    let detached_quote = f.post_with(BOB, "3kdetached22", &bob_aud, quote_of(&root)).await;
+    let kept_quote = f.post_with(BOB, "3kkeptquote2", &bob_aud, quote_of(&root)).await;
+    let following = f.post_with(ALICE, "3kfollowing2", &aud, json!({})).await;
+
+    // The threadgate, written as `requestRecord` writes it: `indexed`.
+    let gate = json!({"$type": THREADGATE, "post": root, "allow": [{"$type": MENTION_RULE}], "hiddenReplies": [hidden],
+        "createdAt": "2026-09-26T12:00:00Z"});
+    let report = f
+        .writer
+        .apply(
+            ALICE,
+            REV,
+            &[RawOp {
+                action: Action::Create,
+                collection: THREADGATE.into(),
+                rkey: "3kroot222222".into(),
+                cid: Some("bafygate".into()),
+                record: Some(gate),
+            }],
+            ApplyOptions {
+                advance_applied_rev: false,
+                dead_letter_readiness: false,
+                attempts: 1,
+                live: false,
+                subscription_rules: false,
+                source: WriteSource::IndexRequest,
+            },
+        )
+        .await
+        .expect("apply");
+    assert!(matches!(report.outcomes[..], [OpOutcome::Written]), "{report:?}");
+    f.ingest(ALICE, POSTGATE, "3kroot222222", json!({"$type": POSTGATE, "post": root,
+        "embeddingRules": [{"$type": DISABLE_RULE}], "detachedEmbeddingUris": [detached_quote], "createdAt": "2026-09-26T12:00:00Z"}))
+        .await;
+    f.ingest(ALICE, THREADGATE, "3kfollowing2", json!({"$type": THREADGATE, "post": following, "allow": [{"$type": FOLLOWING_RULE}]}))
+        .await;
+    // Stored and ignored: another rkey, and another author.
+    f.ingest(ALICE, THREADGATE, "3kotherkey22", json!({"$type": THREADGATE, "post": root, "allow": []})).await;
+    f.ingest(BOB, THREADGATE, "3kroot222222", json!({"$type": THREADGATE, "post": root, "allow": []})).await;
+    let canonical = format!("at://{ALICE}/{THREADGATE}/3kroot222222");
+    assert_eq!(gate_rows(&f.pool, "private_threadgates").await, [
+        format!("at://{ALICE}/{THREADGATE}/3kfollowing2"),
+        format!("at://{ALICE}/{THREADGATE}/3kotherkey22"),
+        canonical.clone(),
+        format!("at://{BOB}/{THREADGATE}/3kroot222222"),
+    ]);
+    assert_eq!(gate_rows(&f.pool, "private_postgates").await, [format!("at://{ALICE}/{POSTGATE}/3kroot222222")]);
+    assert_eq!(public_gate_count(&f.pool).await, 0, "a private post's gates are not public rows");
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    // Done when: Bob is not mentioned, Carol is; Bob may not embed.
+    let (_, p) = posts_of(&base, BOB, &[&root]).await;
+    assert_eq!(p[0]["viewer"], json!({"bookmarked": false, "replyDisabled": true, "embeddingDisabled": true}), "{p:?}");
+    let tg = &p[0]["threadgate"];
+    assert_eq!((tg["uri"].as_str(), tg["cid"].as_str()), (Some(canonical.as_str()), Some("bafygate")));
+    assert_eq!((&tg["record"]["allow"], &tg["lists"]), (&json!([{"$type": MENTION_RULE}]), &json!([])));
+    let (_, p) = posts_of(&base, CAROL, &[&root]).await;
+    assert_eq!(p[0]["viewer"], json!({"bookmarked": false, "replyDisabled": false, "embeddingDisabled": true}));
+    // The author: never disabled.
+    let (_, p) = posts_of(&base, ALICE, &[&root]).await;
+    assert_eq!(p[0]["viewer"], json!({"bookmarked": false, "replyDisabled": false}));
+    // Dave is mentioned but not a follower: the gate admits no one the
+    // oracle denies, and his answer is a nonexistent post's.
+    let (denied, p) = posts_of(&base, DAVE, &[&root]).await;
+    assert!(p.is_empty());
+    let (nothing, _) = posts_of(&base, DAVE, &[&format!("at://{ALICE}/{NSID_POST_PRIVATE}/3knothere222")]).await;
+    assert_eq!(denied, nothing);
+
+    // A reply whose root was not read in the request: no field. Read with
+    // its root: the root's gate applies.
+    let (_, p) = posts_of(&base, CAROL, &[&reply]).await;
+    assert_eq!(p[0]["viewer"], json!({"bookmarked": false}));
+    let (_, body, _) = get(&base, FEED, &format!("actor={BOB}"), CAROL, CAROL_KEY).await;
+    let feed: Value = serde_json::from_str(&body).expect("json");
+    let item = feed["feed"].as_array().expect("feed").iter().find(|i| i["uri"] == reply.as_str()).expect("in the feed");
+    assert!(item["viewer"].get("replyDisabled").is_none(), "{item}");
+    let (_, p) = posts_of(&base, BOB, &[&reply, &root]).await;
+    assert_eq!(p[0]["viewer"]["replyDisabled"], true);
+    assert!(p[0].get("threadgate").is_none(), "a reply carries no threadgate");
+    let (_, p) = posts_of(&base, CAROL, &[&reply, &root]).await;
+    assert_eq!(p[0]["viewer"]["replyDisabled"], false);
+
+    // A thread reads its root: with no parents shown, the handler reads it
+    // itself. The hidden reply is left out for Bob, not for Carol, its
+    // author.
+    let (_, t) = thread_of(&base, BOB, &format!("uri={reply}&parentHeight=0")).await;
+    assert!(t.get("parent").is_none(), "{t}");
+    assert_eq!(t["post"]["viewer"]["replyDisabled"], true);
+    assert_eq!(reply_uris(&t), Vec::<String>::new(), "hidden from Bob");
+    let (_, t) = thread_of(&base, CAROL, &format!("uri={reply}&parentHeight=0")).await;
+    assert_eq!(t["post"]["viewer"]["replyDisabled"], false);
+    assert_eq!(reply_uris(&t), std::slice::from_ref(&hidden), "not hidden from its author");
+    let (_, t) = thread_of(&base, BOB, &format!("uri={root}")).await;
+    assert_eq!(reply_uris(&t), std::slice::from_ref(&reply));
+    assert_eq!(t["post"]["threadgate"]["uri"], canonical.as_str());
+    assert_eq!(t["replies"][0]["post"]["viewer"]["replyDisabled"], true);
+    let (_, t) = thread_of(&base, CAROL, &format!("uri={root}")).await;
+    assert_eq!(reply_uris(&t), [reply.clone(), hidden.clone()]);
+
+    // `followingRule` with no stored follow: left out; with one: allowed.
+    let (_, p) = posts_of(&base, BOB, &[&following]).await;
+    assert_eq!(p[0]["viewer"], json!({"bookmarked": false}));
+    exec(&f.pool, &follow_sql(ALICE, BOB)).await;
+    let (_, p) = posts_of(&base, BOB, &[&following]).await;
+    assert_eq!(p[0]["viewer"], json!({"bookmarked": false, "replyDisabled": false}));
+
+    // Detached: only the quote the postgate names, and only for a reader
+    // who can read the quoted post. Dave cannot: both quotes are the same
+    // `#viewNotFound`.
+    let (_, p) = posts_of(&base, CAROL, &[&detached_quote, &kept_quote]).await;
+    assert_eq!(p[0]["embed"]["record"], json!({"$type": "app.bsky.embed.record#viewDetached", "uri": root, "detached": true}));
+    assert_eq!(p[1]["embed"]["record"]["$type"], "app.bsky.embed.record#viewRecord");
+    let (_, p) = posts_of(&base, DAVE, &[&detached_quote, &kept_quote]).await;
+    assert_eq!(p[0]["embed"], p[1]["embed"]);
+    assert_eq!(p[0]["embed"]["record"]["$type"], "app.bsky.embed.record#viewNotFound");
+
+    // Deleting the postgate: quoting and embedding are open again.
+    f.apply_op(ALICE, Action::Delete, POSTGATE, "3kroot222222", REV2, None).await;
+    assert!(gate_rows(&f.pool, "private_postgates").await.is_empty());
+    let (_, p) = posts_of(&base, BOB, &[&root]).await;
+    assert_eq!(p[0]["viewer"], json!({"bookmarked": false, "replyDisabled": true}));
+    let (_, p) = posts_of(&base, CAROL, &[&detached_quote]).await;
+    assert_eq!(p[0]["embed"]["record"]["$type"], "app.bsky.embed.record#viewRecord");
+
+    // Review 1, LB3: Dave reads Carol's reply R, which claims Alice's root X
+    // that Dave cannot read. X's gate (`allow: []`, hiding R's child) never
+    // shows in Dave's answers: byte-identical before X is written, while it
+    // and its gate exist, and after X is deleted (its gate with it).
+    let list_aud = f.audience(ALICE, "3kaudlist222", Some("list"), &[BOB, CAROL]).await;
+    let carol_aud = f.audience(CAROL, "3kaudcarol22", Some("list"), &[DAVE, BOB]).await;
+    let x = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3klb3root222");
+    let r = f.private_post(CAROL, "3klb3reply22", &carol_aud, Some((&x, &x))).await;
+    let child = f.private_post(BOB, "3klb3child22", &carol_aud, Some((&x, &r))).await;
+    let dave_sees = || async {
+        let (posts, p) = posts_of(&base, DAVE, &[&r]).await;
+        assert_eq!(p[0]["viewer"], json!({"bookmarked": false}));
+        let (thread, t) = thread_of(&base, DAVE, &format!("uri={r}")).await;
+        assert_eq!(reply_uris(&t), std::slice::from_ref(&child));
+        assert!(t["post"]["viewer"].get("replyDisabled").is_none(), "{t}");
+        (posts, thread)
+    };
+    let never_written = dave_sees().await;
+    assert_eq!(f.private_post(ALICE, "3klb3root222", &list_aud, None).await, x);
+    f.ingest(ALICE, THREADGATE, "3klb3root222", json!({"$type": THREADGATE, "post": x, "allow": [], "hiddenReplies": [child]}))
+        .await;
+    assert_eq!(dave_sees().await, never_written);
+    // `allow: []`: disabled for others, not for the author.
+    let (_, p) = posts_of(&base, BOB, &[&x]).await;
+    assert_eq!(p[0]["viewer"]["replyDisabled"], true);
+    let (_, p) = posts_of(&base, ALICE, &[&x]).await;
+    assert_eq!(p[0]["viewer"]["replyDisabled"], false);
+    // Carol reads X, so in the thread of R its gate hides Bob's reply from
+    // her; Bob, its author, still sees it.
+    let (_, t) = thread_of(&base, CAROL, &format!("uri={r}")).await;
+    assert_eq!(reply_uris(&t), Vec::<String>::new());
+    assert_eq!(t["post"]["viewer"]["replyDisabled"], true);
+    let (_, t) = thread_of(&base, BOB, &format!("uri={r}")).await;
+    assert_eq!(reply_uris(&t), std::slice::from_ref(&child));
+    f.apply_op(ALICE, Action::Delete, NSID_POST_PRIVATE, "3klb3root222", REV2, None).await;
+    assert!(!gate_rows(&f.pool, "private_threadgates").await.contains(&format!("at://{ALICE}/{THREADGATE}/3klb3root222")));
+    assert_eq!(dave_sees().await, never_written);
+
+    // A deleted post deletes its canonical gate; the ignored ones stay.
+    f.apply_op(ALICE, Action::Delete, NSID_POST_PRIVATE, "3kroot222222", REV2, None).await;
+    assert_eq!(gate_rows(&f.pool, "private_threadgates").await, [
+        format!("at://{ALICE}/{THREADGATE}/3kfollowing2"),
+        format!("at://{ALICE}/{THREADGATE}/3kotherkey22"),
+        format!("at://{BOB}/{THREADGATE}/3kroot222222"),
+    ]);
+    // The account purge removes the rest of an author's gates.
+    let mut conn = f.pool.acquire().await.expect("conn");
+    KryphocronPrivateTier.purge_did_batch(&mut conn, ALICE, 100).await.expect("purge");
+    drop(conn);
+    assert_eq!(gate_rows(&f.pool, "private_threadgates").await, [format!("at://{BOB}/{THREADGATE}/3kroot222222")]);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_gates_on() {
+    gates_in(PublicMode::On, "s4-gates-on").await;
+}
+
+#[tokio::test]
+async fn private_gates_off() {
+    gates_in(PublicMode::Off, "s4-gates-off").await;
+}
+
+/// §3.1's lifecycle: an `out_of_scope` purge takes the DID's gates with its
+/// private posts, and keeps the gate of a kept class-M reply.
+#[tokio::test]
+async fn out_of_scope_purge_takes_gates_with_posts() {
+    let Some(db) = fresh_db("s4_gates_purge").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "s4-gates-purge").await;
+    let aud = f.audience(DAVE, "3kauddave222", Some("list"), &[BOB]).await;
+    let own = f.private_post(DAVE, "3kown2222222", &aud, None).await;
+    // A reply to a member (class M) stays, and so does its gate. The
+    // fixture's members are Alice to Dave, so the parent's author is made a
+    // member and Dave is not.
+    exec(&f.pool, &format!("DELETE FROM members WHERE did = '{DAVE}'")).await;
+    let alices = f.audience(ALICE, "3kaudalice22", Some("list"), &[DAVE]).await;
+    let parent = f.private_post(ALICE, "3kparent2222", &alices, None).await;
+    let kept = f.private_post(DAVE, "3kkept222222", &aud, Some((&parent, &parent))).await;
+    for (rkey, post) in [("3kown2222222", &own), ("3kkept222222", &kept)] {
+        f.ingest(DAVE, THREADGATE, rkey, json!({"$type": THREADGATE, "post": post, "allow": []})).await;
+    }
+    let mut conn = f.pool.acquire().await.expect("conn");
+    while KryphocronPrivateTier.purge_out_of_scope_batch(&mut conn, DAVE, 100).await.expect("purge") > 0 {}
+    drop(conn);
+    assert_eq!(gate_rows(&f.pool, "private_threadgates").await, [format!("at://{DAVE}/{THREADGATE}/3kkept222222")]);
     db.drop_db().await;
 }

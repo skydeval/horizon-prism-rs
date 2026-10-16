@@ -575,6 +575,81 @@ pub(super) async fn bookmarked(pool: &PgPool, viewer: &str, uris: &[String]) -> 
         .await
 }
 
+/// A private post's valid threadgate (private posting §4.4): the gate in
+/// the post author's repo with the post's rkey.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub(super) struct ThreadgateRow {
+    pub post_uri: String,
+    pub uri: String,
+    pub cid: String,
+    pub record: serde_json::Value,
+    /// `None`: the field is absent (anyone may reply); `[]`: nobody.
+    pub allow: Option<serde_json::Value>,
+    pub hidden_replies: Vec<String>,
+}
+
+/// A gate counts only when its author is its post's author and its rkey is
+/// its post's rkey (`hydration/thread.rs`'s rule), over the gate row `g`.
+const VALID_GATE: &str = "g.author_did = split_part(g.post_uri, '/', 3) AND g.rkey = split_part(g.post_uri, '/', 5)";
+
+/// The valid private threadgates of `posts` (non-content: a gate is a stock
+/// public record). Callers use a gate only for a root read for the reader
+/// in the request (C-17).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn threadgates(pool: &PgPool, posts: &[String]) -> Result<Vec<ThreadgateRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT g.post_uri, g.uri, g.cid, g.record, g.allow, g.hidden_replies FROM private_threadgates g \
+         WHERE g.post_uri = ANY($1) AND {VALID_GATE}"
+    ))
+    .bind(posts)
+    .fetch_all(pool)
+    .await
+}
+
+/// A private post's valid postgate: whether it turns embedding off
+/// (`app.bsky.feed.postgate#disableRule`) and the quoting URIs it detaches.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(super) struct PostgateRow {
+    pub post_uri: String,
+    pub embedding_disabled: bool,
+    pub detached: Vec<String>,
+}
+
+/// The valid private postgates of `posts`.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn postgates(pool: &PgPool, posts: &[String]) -> Result<Vec<PostgateRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT g.post_uri, \
+           COALESCE(g.embedding_rules @> '[{{\"$type\": \"app.bsky.feed.postgate#disableRule\"}}]'::jsonb, false) AS embedding_disabled, \
+           g.detached_embedding_uris AS detached \
+         FROM private_postgates g WHERE g.post_uri = ANY($1) AND {VALID_GATE}"
+    ))
+    .bind(posts)
+    .fetch_all(pool)
+    .await
+}
+
+/// Whether `did` is among the DIDs the private post `uri` mentions
+/// (`mention_dids`, a structural fact, §3.1): a `mentionRule`'s input, for a
+/// root read for the reader in the request.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn mentions(pool: &PgPool, uri: &str, did: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM private_posts WHERE uri = $1 AND $2 = ANY(mention_dids))")
+        .bind(uri)
+        .bind(did)
+        .fetch_one(pool)
+        .await
+}
+
 /// A feed candidate: `(uri, created_at, rkey)`.
 pub(super) type FeedCandidate = (String, DateTime<Utc>, String);
 

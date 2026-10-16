@@ -241,6 +241,13 @@ impl Hydrator {
         record: Value,
         allow: Option<&Value>,
     ) -> Result<Value, sqlx::Error> {
+        let lists = self.threadgate_lists(viewer, req, allow).await?;
+        Ok(json!({"uri": uri, "cid": cid, "record": record, "lists": lists}))
+    }
+
+    /// The lists a threadgate's `listRule`s name, as `listViewBasic`, under
+    /// the locally-servable rule (a private-context request fetches none).
+    pub(super) async fn threadgate_lists(&self, viewer: &Viewer, req: &Requester, allow: Option<&Value>) -> Result<Vec<Value>, sqlx::Error> {
         let mut lists = Vec::new();
         let named = allow
             .and_then(Value::as_array)
@@ -254,7 +261,7 @@ impl Hydrator {
                 lists.push(self.list_basic(viewer, &row, None, count).await?);
             }
         }
-        Ok(json!({"uri": uri, "cid": cid, "record": record, "lists": lists}))
+        Ok(lists)
     }
 
     /// `viewer.knownLikers` for a thread's anchor (design-v3 §8.2): the

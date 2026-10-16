@@ -29,6 +29,7 @@ use serde_json::Value;
 
 use super::actor::ProfileContext;
 use super::{Hydrator, PublicEmit, Viewer};
+use crate::db::locks::uri_author;
 use crate::xrpc::pools::Requester;
 
 /// A hydration context. Private handlers hold the one variant there is.
@@ -87,6 +88,39 @@ impl HydrationContext {
     pub async fn public_record_view(&self, uri: &str, quoting: &str) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
         let Self::Private { hydrator, viewer, req } = self;
         hydrator.public_record_view(viewer, req, uri, quoting).await
+    }
+
+    /// The `lists` of a private root's `threadgateView` (private-posting
+    /// design §4.4): the lists its `listRule`s name, as `listViewBasic`,
+    /// from local rows only. A list that is not locally servable (owned by a
+    /// ready member) is left out, never fetched.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn threadgate_lists(&self, allow: Option<&Value>) -> Result<Vec<Value>, sqlx::Error> {
+        let Self::Private { hydrator, viewer, req } = self;
+        hydrator.threadgate_lists(viewer, req, allow).await
+    }
+
+    /// A threadgate `listRule`'s input for `did` (§4.4): whether `did` is an
+    /// item of `list` when the list is locally servable, else `None` (the
+    /// input is incomplete).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn list_rule_allows(&self, list: &str, did: &str) -> Result<Option<bool>, sqlx::Error> {
+        let Self::Private { hydrator, .. } = self;
+        if !super::lists::is_list_uri(list) || !hydrator.is_ready_member(uri_author(list).unwrap_or_default()).await? {
+            return Ok(None);
+        }
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_items WHERE list_uri = $1 AND subject_did = $2)")
+            .bind(list)
+            .bind(did)
+            .fetch_one(hydrator.pool())
+            .await
+            .map(Some)
     }
 
     /// The labels stored for `subjects` (the `labels` table), by subject, in

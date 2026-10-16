@@ -17,7 +17,7 @@ use sqlx::{PgConnection, PgPool};
 
 use super::{Applied, IngestError, PrivateOp, owners};
 use crate::db::locks::uri_author;
-use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE, NSID_PRIVATE_BLOCK};
+use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_THREADGATE};
 use crate::firehose::jobs::Depth;
 use crate::firehose::normalize::{bytes_field, strong_ref_cid};
 use crate::firehose::records::created_at;
@@ -470,6 +470,156 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
     Ok(applied)
 }
 
+/// A text field of a gate record that must be an at-uri.
+fn gate_post(record: &Value) -> Result<String, IngestError> {
+    at_uri(record.get("post").unwrap_or(&Value::Null), "post")
+}
+
+/// The strings of an array field; anything else is empty, as the public
+/// gate rows read it (`firehose::rows`).
+fn gate_strings(record: &Value, key: &str) -> Vec<String> {
+    record
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// `ingest::apply_gate` (private posting §4.4): LWW create/update of an
+/// admitted `app.bsky.feed.threadgate` or `postgate` whose `post` is a
+/// `postPrivate` URI, into `private_threadgates` or `private_postgates`,
+/// with `private_tombstones` checked. A gate whose rkey or author is not its
+/// post's is stored as received and ignored on read.
+///
+/// # Errors
+///
+/// [`IngestError::Malformed`] for a gate with no at-uri `post`, or of another
+/// collection; database errors.
+pub(crate) async fn apply_gate(conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError> {
+    if tombstoned(&mut *conn, &op.uri, &op.rev).await? {
+        return Ok(Applied::default());
+    }
+    let post = gate_post(&op.record)?;
+    let at = created_at(&op.record, Utc::now());
+    let field = |key: &str| op.record.get(key).filter(|v| !v.is_null()).cloned();
+    let changed = match op.nsid.as_str() {
+        NSID_THREADGATE => sqlx::query(
+            "INSERT INTO private_threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, hidden_replies, record, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             ON CONFLICT (uri) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, post_uri = EXCLUDED.post_uri, \
+               allow = EXCLUDED.allow, hidden_replies = EXCLUDED.hidden_replies, record = EXCLUDED.record, \
+               created_at = EXCLUDED.created_at, indexed_at = now() \
+             WHERE private_threadgates.rev < EXCLUDED.rev",
+        )
+        .bind(&op.uri)
+        .bind(&op.author_did)
+        .bind(&op.rkey)
+        .bind(&op.cid)
+        .bind(&op.rev)
+        .bind(&post)
+        .bind(field("allow"))
+        .bind(gate_strings(&op.record, "hiddenReplies"))
+        .bind(&op.record)
+        .bind(at),
+        NSID_POSTGATE => sqlx::query(
+            "INSERT INTO private_postgates (uri, author_did, rkey, cid, rev, post_uri, embedding_rules, \
+               detached_embedding_uris, record, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             ON CONFLICT (uri) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, post_uri = EXCLUDED.post_uri, \
+               embedding_rules = EXCLUDED.embedding_rules, detached_embedding_uris = EXCLUDED.detached_embedding_uris, \
+               record = EXCLUDED.record, created_at = EXCLUDED.created_at, indexed_at = now() \
+             WHERE private_postgates.rev < EXCLUDED.rev",
+        )
+        .bind(&op.uri)
+        .bind(&op.author_did)
+        .bind(&op.rkey)
+        .bind(&op.cid)
+        .bind(&op.rev)
+        .bind(&post)
+        .bind(field("embeddingRules"))
+        .bind(gate_strings(&op.record, "detachedEmbeddingUris"))
+        .bind(&op.record)
+        .bind(at),
+        other => return Err(malformed(format!("not a gate NSID: {other}"))),
+    }
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        > 0;
+    Ok(Applied {
+        changed,
+        ..Applied::default()
+    })
+}
+
+/// `ingest::delete_gate`: delete the private copy of a threadgate or
+/// postgate at `uri` with `rev <= R`. Tombstone iff a row was removed or the
+/// author is in S (§5.5), as [`delete`] does.
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn delete_gate(conn: &mut PgConnection, uri: &str, rev: &str, author_in_scope: bool) -> Result<Applied, sqlx::Error> {
+    let collection = uri.strip_prefix("at://").and_then(|r| r.split('/').nth(1));
+    let table = match collection {
+        Some(NSID_THREADGATE) => "private_threadgates",
+        Some(NSID_POSTGATE) => "private_postgates",
+        _ => return Ok(Applied::default()),
+    };
+    let removed = sqlx::query(&format!("DELETE FROM {table} WHERE uri = $1 AND rev <= $2"))
+        .bind(uri)
+        .bind(rev)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected()
+        > 0;
+    if removed || author_in_scope {
+        tombstone(&mut *conn, uri, rev).await?;
+    }
+    Ok(Applied {
+        changed: removed,
+        ..Applied::default()
+    })
+}
+
+/// The record keys of `did`'s stored private posts (backfill keeps their
+/// gates, private posting §4.4).
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn post_rkeys(pool: &PgPool, did: &str) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let rkeys: Vec<String> = sqlx::query_scalar("SELECT rkey FROM private_posts WHERE author_did = $1")
+        .bind(did)
+        .fetch_all(pool)
+        .await?;
+    Ok(rkeys.into_iter().collect())
+}
+
+async fn tombstone(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO private_tombstones (uri, rev) VALUES ($1, $2) \
+         ON CONFLICT (uri) DO UPDATE SET rev = GREATEST(private_tombstones.rev, EXCLUDED.rev), deleted_at = now()",
+    )
+    .bind(uri)
+    .bind(rev)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// The canonical private gates of a `postPrivate` post: the threadgate and
+/// postgate in its author's repo with its rkey. Deleted with the post (the
+/// public rule, `writer.rs`'s post delete).
+fn canonical_private_gates(post_uri: &str) -> Option<[(&'static str, String); 2]> {
+    let (prefix, rkey) = post_uri.rsplit_once('/')?;
+    let repo = prefix.strip_suffix(NSID_POST_PRIVATE)?.strip_suffix('/')?;
+    Some([
+        ("private_threadgates", format!("{repo}/{NSID_THREADGATE}/{rkey}")),
+        ("private_postgates", format!("{repo}/{NSID_POSTGATE}/{rkey}")),
+    ])
+}
+
 /// The private table and its author column for an at-uri, by NSID.
 fn table_of(uri: &str) -> Option<(&'static str, &'static str)> {
     let collection = uri.strip_prefix("at://")?.split('/').nth(1)?;
@@ -500,14 +650,16 @@ pub(crate) async fn delete(conn: &mut PgConnection, uri: &str, rev: &str, author
         .rows_affected()
         > 0;
     if removed || author_in_scope {
-        sqlx::query(
-            "INSERT INTO private_tombstones (uri, rev) VALUES ($1, $2) \
-             ON CONFLICT (uri) DO UPDATE SET rev = GREATEST(private_tombstones.rev, EXCLUDED.rev), deleted_at = now()",
-        )
-        .bind(uri)
-        .bind(rev)
-        .execute(&mut *conn)
-        .await?;
+        tombstone(&mut *conn, uri, rev).await?;
+    }
+    // The gates of a private post that is gone gate nothing (§3.1).
+    if removed && let Some(gates) = canonical_private_gates(uri) {
+        for (gate_table, gate) in gates {
+            sqlx::query(&format!("DELETE FROM {gate_table} WHERE uri = $1"))
+                .bind(gate)
+                .execute(&mut *conn)
+                .await?;
+        }
     }
     let mut applied = Applied {
         changed: removed,
@@ -531,7 +683,12 @@ pub(crate) async fn delete(conn: &mut PgConnection, uri: &str, rev: &str, author
 ///
 /// Database errors.
 pub(crate) async fn local_uris(conn: &mut PgConnection, did: &str, nsid: &str, below_rev: &str) -> Result<Vec<String>, sqlx::Error> {
-    let Some((table, col)) = table_of(&format!("at://{did}/{nsid}/x")) else {
+    let gate = match nsid {
+        NSID_THREADGATE => Some(("private_threadgates", "author_did")),
+        NSID_POSTGATE => Some(("private_postgates", "author_did")),
+        _ => None,
+    };
+    let Some((table, col)) = gate.or_else(|| table_of(&format!("at://{did}/{nsid}/x"))) else {
         return Ok(Vec::new());
     };
     sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE {col} = $1 AND rev < $2"))
@@ -568,6 +725,8 @@ pub(crate) async fn purge_did(conn: &mut PgConnection, did: &str, limit: i64) ->
         ("private_posts", "author_did"),
         ("private_audiences", "owner_did"),
         ("private_blocks", "author_did"),
+        ("private_threadgates", "author_did"),
+        ("private_postgates", "author_did"),
     ] {
         n += sqlx::query(&format!(
             "DELETE FROM {table} WHERE uri IN (SELECT uri FROM {table} WHERE {col} = $1 LIMIT $2)"
@@ -616,6 +775,19 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
     .execute(&mut *conn)
     .await?
     .rows_affected();
+    // The DID's gates go with its private posts (private posting §3.1): any
+    // whose post is no longer stored, the kept class-M replies' gates aside.
+    for table in ["private_threadgates", "private_postgates"] {
+        n += sqlx::query(&format!(
+            "DELETE FROM {table} WHERE uri IN (SELECT g.uri FROM {table} g WHERE g.author_did = $1 \
+               AND NOT EXISTS (SELECT 1 FROM private_posts p WHERE p.uri = g.post_uri) LIMIT $2)"
+        ))
+        .bind(did)
+        .bind(limit)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    }
     Ok(n)
 }
 

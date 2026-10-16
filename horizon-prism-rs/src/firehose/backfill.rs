@@ -242,15 +242,22 @@ const SCOPE_PUBLIC: [CollectionPlan; 6] = [
     public(NSID_POLL_POST, Limit::Top(100)),
 ];
 
+// Gates of a member's or a private owner's posts, public and private, listed
+// after `AUTHORIZATION` so that the rkeys of both kinds of post are known
+// when they are kept (private posting §4.4). Not authorization collections.
+const GATES: [CollectionPlan; 2] = [
+    public(NSID_THREADGATE, Limit::Top(1000)),
+    public(NSID_POSTGATE, Limit::Top(1000)),
+];
+
 // The list collections are listed whole, up to the ceiling. A truncated
-// listing only logs: they are not authorization facts.
-const MEMBER_PUBLIC: [CollectionPlan; 12] = [
+// listing only logs: they are not authorization facts. The gates are in
+// [`GATES`].
+const MEMBER_PUBLIC: [CollectionPlan; 10] = [
     public(NSID_POST, Limit::Top(1000)),
     public(NSID_REPOST, Limit::Top(1000)),
     public(NSID_FOLLOW, Limit::Top(10_000)),
     public(NSID_LIKE, Limit::Top(1000)),
-    public(NSID_THREADGATE, Limit::Top(1000)),
-    public(NSID_POSTGATE, Limit::Top(1000)),
     public(NSID_LIST, Limit::All),
     public(NSID_LISTITEM, Limit::All),
     public(NSID_LISTBLOCK, Limit::All),
@@ -306,6 +313,7 @@ pub fn plan(depth: Depth, is_member: bool, mode: PublicMode) -> DepthPlan {
             collections: if off { MEMBER_OFF.as_slice() } else { MEMBER_PUBLIC.as_slice() }
                 .iter()
                 .chain(AUTHORIZATION.iter())
+                .chain(GATES.iter())
                 .copied()
                 .collect(),
             inbound_blocks: true,
@@ -313,20 +321,20 @@ pub fn plan(depth: Depth, is_member: bool, mode: PublicMode) -> DepthPlan {
         Depth::Private => DepthPlan {
             profile: true,
             self_records: &[],
-            collections: AUTHORIZATION.to_vec(),
+            collections: AUTHORIZATION.iter().chain(GATES.iter()).copied().collect(),
             inbound_blocks: false,
         },
         Depth::Authz => DepthPlan {
             profile: false,
             self_records: &[],
-            collections: AUTHORIZATION.to_vec(),
+            collections: AUTHORIZATION.iter().chain(GATES.iter()).copied().collect(),
             inbound_blocks: is_member,
         },
         Depth::Resync => DepthPlan {
             profile: true,
             self_records,
             collections: match (off, is_member) {
-                (false, true) => MEMBER_PUBLIC.to_vec(),
+                (false, true) => MEMBER_PUBLIC.iter().chain(GATES.iter()).copied().collect(),
                 (false, false) => SCOPE_PUBLIC.to_vec(),
                 (true, true) => MEMBER_OFF.to_vec(),
                 (true, false) => Vec::new(),
@@ -973,7 +981,12 @@ impl Backfill {
         let mut budget = self.settings.reconcile_confirm_limit;
         // rkeys of the posts this job selected: a gate is kept only when
         // its post is among them (a gate's rkey is its post's rkey).
+        // The private posts' rkeys count too: those listed in this run and
+        // those already stored (private posting §4.4), read once when the
+        // first gate collection is reached.
         let mut post_rkeys: HashSet<String> = HashSet::new();
+        let mut private_rkeys: HashSet<String> = HashSet::new();
+        let mut stored_private_read = false;
         for c in &plan.collections {
             if let Step::Superseded = self.still_running(job).await? {
                 return Ok(None);
@@ -981,8 +994,15 @@ impl Backfill {
             let mut listing = self.list_collection(&pds, &job.did, c).await?;
             if c.nsid == NSID_POST {
                 post_rkeys = listing.selected.iter().map(|r| r.rkey().to_string()).collect();
+            } else if c.nsid == NSID_POST_PRIVATE {
+                private_rkeys.extend(listing.selected.iter().map(|r| r.rkey().to_string()));
             } else if matches!(c.nsid, NSID_THREADGATE | NSID_POSTGATE) {
-                listing.selected.retain(|r| post_rkeys.contains(r.rkey()));
+                if !stored_private_read {
+                    let stored = self.writer.private().post_rkeys(&self.pool, &job.did).await.map_err(|e| e.to_string())?;
+                    private_rkeys.extend(stored);
+                    stored_private_read = true;
+                }
+                listing.selected.retain(|r| post_rkeys.contains(r.rkey()) || private_rkeys.contains(r.rkey()));
             }
             if listing.ceiling_hit && !c.authorization {
                 tracing::warn!(event = "backfill_listing_truncated", did = %job.did, collection = c.nsid, "listing hit the ceiling; continuing");
@@ -1197,15 +1217,22 @@ impl Backfill {
     /// a member's posts are its references (public-indexing design §4.1).
     async fn local_uris(&self, did: &str, nsid: &str, rev: &str, off_rule: bool) -> Result<Vec<String>, sqlx::Error> {
         let table = if off_rule && nsid == NSID_POST { Some(("member_post_refs", "author_did")) } else { public_table(nsid) };
+        let mut uris = Vec::new();
         if let Some((table, author)) = table {
-            return sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE {author} = $1 AND rev < $2"))
+            uris = sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE {author} = $1 AND rev < $2"))
                 .bind(did)
                 .bind(rev)
                 .fetch_all(&self.pool)
-                .await;
+                .await?;
+            // A gate may be stored by the private tier instead (private
+            // posting §4.4).
+            if !matches!(nsid, NSID_THREADGATE | NSID_POSTGATE) {
+                return Ok(uris);
+            }
         }
         let mut conn = self.pool.acquire().await?;
-        self.writer.private().local_uris(&mut conn, did, nsid, rev).await
+        uris.extend(self.writer.private().local_uris(&mut conn, did, nsid, rev).await?);
+        Ok(uris)
     }
 
     /// Reconcile one fully listed collection (§5.10). Returns the number of
@@ -1614,18 +1641,27 @@ mod tests {
         for nsid in [NSID_LIST, NSID_LISTITEM, NSID_LISTBLOCK, NSID_LIST_OPTOUT, NSID_STARTER_PACK] {
             assert_eq!(member.collections.iter().find(|c| c.nsid == nsid).map(|c| c.limit), Some(Limit::All), "{nsid}");
         }
-        // Gates come after posts, with the posts' limit.
+        // Gates come after posts, with the posts' limit, and after every
+        // authorization collection, `postPrivate` included (private posting
+        // §4.4).
         let position = |nsid: &str| member.collections.iter().position(|c| c.nsid == nsid).expect("listed");
         assert!(position(NSID_POST) < position(NSID_THREADGATE) && position(NSID_POST) < position(NSID_POSTGATE));
+        assert!(position(NSID_POST_PRIVATE) < position(NSID_THREADGATE) && position(NSID_POST_PRIVATE) < position(NSID_POSTGATE));
         let authz = plan(Depth::Authz, false);
         assert!(!authz.profile && authz.self_records.is_empty() && !authz.inbound_blocks);
         assert!(plan(Depth::Authz, true).inbound_blocks);
         assert_eq!(plan(Depth::Resync, true).collections.len(), 12);
         assert_eq!(plan(Depth::Resync, false).collections.len(), 6);
-        // The new collections are no authorization facts: `private` and
-        // `authz` never list them.
-        let private = plan(Depth::Private, false);
-        assert!(private.collections.iter().all(|c| c.authorization) && private.self_records.is_empty());
+        // The other new collections are no authorization facts: `private`
+        // and `authz` list the authorization collections, then the gates,
+        // which are not authorization collections.
+        let gates = [(NSID_THREADGATE, Limit::Top(1000), false), (NSID_POSTGATE, Limit::Top(1000), false)];
+        for p in [plan(Depth::Private, false), authz] {
+            let (head, tail) = p.collections.split_at(AUTHORIZATION.len());
+            assert!(head.iter().all(|c| c.authorization));
+            assert_eq!(tail.iter().map(|c| (c.nsid, c.limit, c.authorization)).collect::<Vec<_>>(), gates);
+        }
+        assert!(plan(Depth::Private, false).self_records.is_empty());
         // Every listed public collection has a table to reconcile against.
         for c in member.collections.iter().filter(|c| !c.authorization) {
             assert!(public_table(c.nsid).is_some(), "{}", c.nsid);
@@ -1641,7 +1677,8 @@ mod tests {
         for mode in [PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
             let member = plan(Depth::Member, true, mode);
             let public = [NSID_POST, NSID_FOLLOW, NSID_LIKE, NSID_REPOST, NSID_LIST, NSID_LISTITEM, NSID_LISTBLOCK, NSID_LIST_OPTOUT];
-            let expected: Vec<&str> = public.iter().copied().chain(authz.iter().copied()).collect();
+            let expected: Vec<&str> =
+                public.iter().copied().chain(authz.iter().copied()).chain([NSID_THREADGATE, NSID_POSTGATE]).collect();
             assert_eq!(nsids(&member), expected, "{mode:?}");
             assert_eq!(member.collections.iter().find(|c| c.nsid == NSID_POST).map(|c| c.limit), Some(Limit::Top(1000)));
             assert_eq!(member.collections.iter().find(|c| c.nsid == NSID_FOLLOW).map(|c| c.limit), Some(Limit::Top(10_000)));
@@ -1851,6 +1888,49 @@ mod tests {
         assert_eq!(uris("list_blocks").await.len(), 1);
         assert_eq!(uris("starter_packs").await.len(), 1);
         assert_eq!(uris("actor_self_records").await, [format!("at://{DID}/{NSID_ACTOR_STATUS}/self")]);
+        db.drop_db().await;
+    }
+
+    /// Private posting T-9 (§4.4): a `private` job lists the gates after
+    /// `postPrivate`, and keeps those of the private posts listed in the run
+    /// and of those already stored; a gate of a post it knows nothing of is
+    /// not kept. Read through `PrivateTier`, so this module names no private
+    /// table.
+    #[tokio::test]
+    async fn the_private_plan_keeps_gates_of_postprivate_records() {
+        use crate::private_tier::{KryphocronPrivateTier, PrivateTier};
+        let Some(db) = fresh_db("backfill_private_gates").await else {
+            return;
+        };
+        let p = &db.pool;
+        let private = |rkey: &str| format!("at://{DID}/{NSID_POST_PRIVATE}/{rkey}");
+        let gate = |rkey: &str| rec(DID, NSID_THREADGATE, rkey, json!({"post": private(rkey), "allow": []}));
+        let mut source = FakeSource {
+            rev: "3kzzzzzzzzzzz".to_string(),
+            ..FakeSource::default()
+        };
+        source.listings.insert(NSID_POST_PRIVATE.to_string(), vec![rec(DID, NSID_POST_PRIVATE, "3klisted", json!({"text": "listed"}))]);
+        source.listings.insert(NSID_THREADGATE.to_string(), vec![gate("3klisted"), gate("3kstored"), gate("3kunknown")]);
+        // Stored before the run, and still in the repo (not listed here).
+        source.hidden.insert(private("3kstored"));
+        let writer = Writer::new(p.clone(), state(true), Arc::new(KryphocronPrivateTier));
+        let backfill = Backfill::new(writer, Arc::new(source), BackfillConfig::default(), 5);
+        let stored = rec(DID, NSID_POST_PRIVATE, "3kstored", json!({"text": "stored"}));
+        assert_eq!(backfill.write_record(DID, "3kaaaaaaaaaaa", NSID_POST_PRIVATE, &stored).await.expect("write"), None);
+        let mut conn = p.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Private).await.expect("enqueue");
+        drop(conn);
+        loop {
+            let (job, outcome) = backfill.run_once().await.expect("run").expect("a job");
+            if job.depth == Depth::Private {
+                assert_eq!(outcome, JobOutcome::Done);
+                break;
+            }
+        }
+        let mut conn = p.acquire().await.expect("conn");
+        let mut kept = KryphocronPrivateTier.local_uris(&mut conn, DID, NSID_THREADGATE, "zzzzzzzzzzzzz").await.expect("gates");
+        kept.sort();
+        assert_eq!(kept, [format!("at://{DID}/{NSID_THREADGATE}/3klisted"), format!("at://{DID}/{NSID_THREADGATE}/3kstored")]);
         db.drop_db().await;
     }
 

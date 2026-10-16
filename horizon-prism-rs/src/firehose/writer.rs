@@ -221,6 +221,9 @@ enum Body {
     Row(Row),
     /// A private-tier record; the facade parses it.
     Private,
+    /// A threadgate or postgate naming a `postPrivate` URI (private posting
+    /// §4.4): the private tier stores it, in every public-indexing mode.
+    PrivateGate,
 }
 
 /// The op a savepoint attempt runs.
@@ -297,11 +300,28 @@ fn prepare(repo: &str, op: &RawOp, now: DateTime<Utc>) -> Prepared {
     }
 }
 
+/// The author of the `postPrivate` post a gate row names (private posting
+/// §4.4): the gate's one admission subject. `None` for any other row,
+/// including a gate on a public post.
+fn private_gate_subject(row: &Row) -> Option<String> {
+    if !matches!(row.table, "threadgates" | "postgates") {
+        return None;
+    }
+    let post = row.cells.iter().find_map(|(name, cell)| match (name, cell) {
+        (&"post_uri", Cell::Text(Some(uri))) => Some(uri.as_str()),
+        _ => None,
+    })?;
+    if post.split('/').nth(3) != Some(super::classifier::NSID_POST_PRIVATE) {
+        return None;
+    }
+    uri_author(post).map(str::to_string)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_upsert(
     repo: &str,
     class: RecordClass,
-    kind: RecordKind,
+    mut kind: RecordKind,
     uri: String,
     op: &RawOp,
     cid: &str,
@@ -352,7 +372,15 @@ fn build_upsert(
         RecordClass::Ecosystem(EcosystemKind::Profile) => (Body::Profile(ProfileRecord::parse(record, now)), Vec::new()),
         // The v3 record tables: rule 1 only, so no subjects.
         RecordClass::Ecosystem(other) => match rows::row(other, repo, &op.collection, record, &normalized, now)? {
-            Some(row) => (Body::Row(row), Vec::new()),
+            // A gate on a private post goes to the private tier, admitted
+            // with the post's author as its one subject (rule 3, §4.4).
+            Some(row) => match private_gate_subject(&row) {
+                Some(author) => {
+                    kind = RecordKind::PrivateGate;
+                    (Body::PrivateGate, vec![author])
+                }
+                None => (Body::Row(row), Vec::new()),
+            },
             None => return Ok(None),
         },
         RecordClass::Kryphocron { kind: Some(k), .. } => (Body::Private, private_subjects(k, record)?),
@@ -378,13 +406,17 @@ fn build_upsert(
 }
 
 /// The canonical gates of a post: the threadgate and postgate in the post
-/// author's repo with the post's rkey (design-v3 §3.2). Empty when `post_uri`
-/// is not a post URI.
+/// author's repo with the post's rkey (design-v3 §3.2), for a public or a
+/// `postPrivate` post (private posting §4.4). Empty when `post_uri` is
+/// neither.
 fn canonical_gates(post_uri: &str) -> Vec<String> {
     let Some((prefix, rkey)) = post_uri.rsplit_once('/') else {
         return Vec::new();
     };
-    let Some(repo) = prefix.strip_suffix(super::classifier::NSID_POST).and_then(|p| p.strip_suffix('/')) else {
+    let Some(repo) = [super::classifier::NSID_POST, super::classifier::NSID_POST_PRIVATE]
+        .into_iter()
+        .find_map(|nsid| prefix.strip_suffix(nsid).and_then(|p| p.strip_suffix('/')))
+    else {
         return Vec::new();
     };
     [super::classifier::NSID_THREADGATE, super::classifier::NSID_POSTGATE]
@@ -464,7 +496,7 @@ fn notifications_for(author: &str, body: &Body, sets: &ScopeSets) -> Vec<Notific
                 push(Some(m), "mention", None);
             }
         }
-        Body::Block(_) | Body::Profile(_) | Body::Row(_) | Body::Private => {}
+        Body::Block(_) | Body::Profile(_) | Body::Row(_) | Body::Private | Body::PrivateGate => {}
     }
     out
 }
@@ -590,9 +622,11 @@ impl Writer {
         let mut lock_uri_list: Vec<String> = prepared.iter().filter_map(|p| p.uri().map(str::to_string)).collect();
         // A post delete also deletes the post's canonical gates (design-v3
         // §14.1), so their URIs are locked with it, in the same sorted pass.
+        // A private post's delete deletes its private gates (private posting
+        // §4.4).
         for p in &prepared {
             if let Prepared::Delete(d) = p
-                && d.kind == RecordKind::Post
+                && matches!(d.kind, RecordKind::Post | RecordKind::PrivatePost)
             {
                 lock_uri_list.extend(canonical_gates(&d.uri));
             }
@@ -886,22 +920,21 @@ impl Writer {
         let live = options.live;
         let mut eff = MemoryEffects::default();
         let author = u.input.author.as_str();
-        if u.body == Body::Private {
-            let applied = self
-                .private
-                .apply(
-                    conn,
-                    &PrivateOp {
-                        uri: u.uri.clone(),
-                        author_did: author.to_string(),
-                        nsid: u.collection.clone(),
-                        rkey: u.rkey.clone(),
-                        cid: u.cid.clone(),
-                        rev: rev.to_string(),
-                        record: u.record.clone(),
-                    },
-                )
-                .await?;
+        if matches!(u.body, Body::Private | Body::PrivateGate) {
+            let op = PrivateOp {
+                uri: u.uri.clone(),
+                author_did: author.to_string(),
+                nsid: u.collection.clone(),
+                rkey: u.rkey.clone(),
+                cid: u.cid.clone(),
+                rev: rev.to_string(),
+                record: u.record.clone(),
+            };
+            let applied = if u.body == Body::PrivateGate {
+                self.private.apply_gate(conn, &op).await?
+            } else {
+                self.private.apply(conn, &op).await?
+            };
             eff.owners_joined = applied.owners_joined;
             eff.owners_left = applied.owners_left;
             let outcome = if applied.changed { OpOutcome::Written } else { OpOutcome::Unchanged };
@@ -930,7 +963,7 @@ impl Writer {
             Body::Block(g) => upsert_graph(conn, "blocks", u, g, rev).await?.is_some(),
             Body::Profile(p) => upsert_profile(conn, u, p, rev).await?,
             Body::Row(row) => upsert_row(conn, u, row, rev).await?,
-            Body::Private => false,
+            Body::Private | Body::PrivateGate => false,
         };
         // A member's post has a reference in every mode, whatever became
         // of the row (public-indexing design §4.1); it has its own rev check.
@@ -1059,7 +1092,8 @@ impl Writer {
         let mut eff = MemoryEffects::default();
         let author_in_scope = sets.in_scope(repo);
         let removed = match d.kind {
-            RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock => {
+            // A delete carries no record, so it never classifies as a gate.
+            RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock | RecordKind::PrivateGate => {
                 let applied = self.private.delete(conn, &d.uri, rev, author_in_scope).await?;
                 eff.owners_joined = applied.owners_joined;
                 eff.owners_left = applied.owners_left;
@@ -1103,6 +1137,12 @@ impl Writer {
                     eff.list_references = true;
                 }
                 removed
+            }
+            // A gate delete does not say which post kind it gated, so the
+            // private tier deletes its copy too (private posting §4.4).
+            RecordKind::Table(table @ ("threadgates" | "postgates")) => {
+                let private = self.private.delete_gate(conn, &d.uri, rev, author_in_scope).await?;
+                delete_row(conn, table, &d.uri, rev).await? || private.changed
             }
             RecordKind::Table(table) => delete_row(conn, table, &d.uri, rev).await?,
         };

@@ -94,6 +94,8 @@ pub const FEATURES: &[&str] = &[
     "private.embeds",
     // P-8 bookmarks and `viewer.bookmarked` (S3).
     "private.bookmarks",
+    // P-18 threadgates and postgates on private posts (S4).
+    "private.gates",
     // Rule 4's anchored walk (S0, listed from S1).
     "private.crossPdsReplies",
 ];
@@ -122,6 +124,24 @@ pub trait PrivateTier: Send + Sync {
         rev: &str,
         author_in_scope: bool,
     ) -> Result<Applied, sqlx::Error>;
+
+    /// `ingest::apply_gate` (private posting §4.4): LWW create/update of an
+    /// admitted threadgate or postgate whose `post` is a `postPrivate` URI.
+    async fn apply_gate(&self, conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError>;
+
+    /// `ingest::delete_gate`: the private copy of a deleted threadgate or
+    /// postgate, if any (a delete does not say which post kind it gated).
+    async fn delete_gate(
+        &self,
+        conn: &mut PgConnection,
+        uri: &str,
+        rev: &str,
+        author_in_scope: bool,
+    ) -> Result<Applied, sqlx::Error>;
+
+    /// The record keys of `did`'s stored private posts: backfill keeps the
+    /// gates of these (private posting §4.4).
+    async fn post_rkeys(&self, pool: &PgPool, did: &str) -> Result<HashSet<String>, sqlx::Error>;
 
     /// `readiness::clear_all`: the gap transaction's owner-readiness wipe (§6.11.4).
     async fn clear_all_readiness(&self, conn: &mut PgConnection) -> Result<(), sqlx::Error>;
@@ -203,6 +223,24 @@ impl PrivateTier for KryphocronPrivateTier {
         author_in_scope: bool,
     ) -> Result<Applied, sqlx::Error> {
         ingest::delete(conn, uri, rev, author_in_scope).await
+    }
+
+    async fn apply_gate(&self, conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError> {
+        ingest::apply_gate(conn, op).await
+    }
+
+    async fn delete_gate(
+        &self,
+        conn: &mut PgConnection,
+        uri: &str,
+        rev: &str,
+        author_in_scope: bool,
+    ) -> Result<Applied, sqlx::Error> {
+        ingest::delete_gate(conn, uri, rev, author_in_scope).await
+    }
+
+    async fn post_rkeys(&self, pool: &PgPool, did: &str) -> Result<HashSet<String>, sqlx::Error> {
+        ingest::post_rkeys(pool, did).await
     }
 
     async fn clear_all_readiness(&self, conn: &mut PgConnection) -> Result<(), sqlx::Error> {
@@ -302,6 +340,25 @@ impl PrivateTier for DisabledPrivateTier {
     ) -> Result<Applied, sqlx::Error> {
         metrics::counter!(METRIC_PRIVATE_SKIPPED, "op" => "delete").increment(1);
         Ok(Applied::default())
+    }
+
+    async fn apply_gate(&self, _conn: &mut PgConnection, _op: &PrivateOp) -> Result<Applied, IngestError> {
+        metrics::counter!(METRIC_PRIVATE_SKIPPED, "op" => "apply_gate").increment(1);
+        Ok(Applied::default())
+    }
+
+    async fn delete_gate(
+        &self,
+        _conn: &mut PgConnection,
+        _uri: &str,
+        _rev: &str,
+        _author_in_scope: bool,
+    ) -> Result<Applied, sqlx::Error> {
+        Ok(Applied::default())
+    }
+
+    async fn post_rkeys(&self, _pool: &PgPool, _did: &str) -> Result<HashSet<String>, sqlx::Error> {
+        Ok(HashSet::new())
     }
 
     async fn clear_all_readiness(&self, _conn: &mut PgConnection) -> Result<(), sqlx::Error> {

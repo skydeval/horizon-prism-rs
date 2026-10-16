@@ -255,9 +255,144 @@ async fn viewer_state(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&m
     Ok(())
 }
 
+/// The thread root a post claims (private-posting design §3.1, C-18): its
+/// record's `reply.root.uri`, or the post itself when it is top-level. The
+/// claim is in the record the reader already reads.
+fn claimed_root(post: &PrivateEmit<Value>) -> Option<String> {
+    post.view()
+        .pointer("/record/reply/root/uri")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| view_uri(post))
+}
+
+/// `viewer.replyDisabled` for the posts of the thread rooted at the private
+/// post `root`, from its valid private threadgate (§4.4), for the caller.
+/// The public rules of design-v3 §8.3 with the private tier's inputs; `None`
+/// leaves the field out: no gate, no `allow`, or an answer not known here.
+/// The caller has read `root` in this request (C-17).
+/// - `followingRule` reads the stored follow only: no Constellation scan in
+///   private context, so a missing row makes the input incomplete.
+/// - `listRule` reads a locally servable list only; any other is incomplete.
+async fn reply_disabled(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    root: &str,
+    gate: Option<&schema::ThreadgateRow>,
+) -> Result<Option<bool>, XrpcError> {
+    let Some(rules) = gate.and_then(|g| g.allow.as_ref()).and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let me = caller.did.as_str();
+    let author = uri_author(root).unwrap_or_default();
+    if me == author {
+        return Ok(Some(false));
+    }
+    if rules.is_empty() {
+        return Ok(Some(true));
+    }
+    let pool = &s.env.pool;
+    // Whether every rule's input was complete.
+    let mut complete = true;
+    for rule in rules {
+        let allowed = match rule.get("$type").and_then(Value::as_str).unwrap_or_default() {
+            "app.bsky.feed.threadgate#mentionRule" => schema::mentions(pool, root, me).await?,
+            "app.bsky.feed.threadgate#followerRule" => schema::follows(pool, me, author).await?,
+            "app.bsky.feed.threadgate#followingRule" => {
+                let follows = schema::follows(pool, author, me).await?;
+                complete &= follows;
+                follows
+            }
+            "app.bsky.feed.threadgate#listRule" => {
+                let list = rule.get("list").and_then(Value::as_str).unwrap_or_default();
+                match hydration.list_rule_allows(list, me).await? {
+                    Some(listed) => listed,
+                    None => {
+                        complete = false;
+                        false
+                    }
+                }
+            }
+            // A rule this version does not know.
+            _ => {
+                complete = false;
+                false
+            }
+        };
+        if allowed {
+            return Ok(Some(false));
+        }
+    }
+    Ok(complete.then_some(true))
+}
+
+/// The gate pass of a page (private-posting design §4.4), over hits only.
+/// `read` holds every URI read through the pipeline for this caller in this
+/// request: the page's hits and any root a thread handler read.
+/// - `viewer.replyDisabled`, from the post's claimed root's private
+///   threadgate, **only when that root is in `read`** (C-17). An unread root
+///   gives the answer a missing one does: no field.
+/// - `viewer.embeddingDisabled`: the post's own valid postgate has a
+///   `disableRule` and the caller is not its author.
+/// - `threadgate` on a top-level post's view, with its locally servable lists.
+///
+/// A gate only sets flags: the oracle already decided every hit.
+async fn gate_state(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    posts: &mut [&mut PrivateEmit<Value>],
+    read: &HashSet<String>,
+) -> Result<(), XrpcError> {
+    let uris: Vec<String> = posts.iter().filter_map(|p| view_uri(p)).collect();
+    if uris.is_empty() {
+        return Ok(());
+    }
+    let mut roots: Vec<String> = Vec::new();
+    for root in posts.iter().filter_map(|p| claimed_root(p)) {
+        if read.contains(&root) && is_private_uri(&root) && !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    let mut gated = roots.clone();
+    gated.extend(uris.iter().filter(|u| !roots.contains(u)).cloned());
+    let threadgates: HashMap<String, schema::ThreadgateRow> =
+        schema::threadgates(&s.env.pool, &gated).await?.into_iter().map(|g| (g.post_uri.clone(), g)).collect();
+    let postgates: HashMap<String, schema::PostgateRow> =
+        schema::postgates(&s.env.pool, &uris).await?.into_iter().map(|g| (g.post_uri.clone(), g)).collect();
+    let mut disabled: HashMap<String, bool> = HashMap::new();
+    for root in &roots {
+        if let Some(d) = reply_disabled(s, caller, hydration, root, threadgates.get(root)).await? {
+            disabled.insert(root.clone(), d);
+        }
+    }
+    for post in posts.iter_mut() {
+        let Some(uri) = view_uri(post) else {
+            continue;
+        };
+        let mut viewer = post.view().get("viewer").cloned().unwrap_or_else(|| json!({}));
+        if let Some(d) = claimed_root(post).and_then(|r| disabled.get(&r).copied()) {
+            viewer["replyDisabled"] = json!(d);
+        }
+        if postgates.get(&uri).is_some_and(|g| g.embedding_disabled) && uri_author(&uri) != Some(caller.did.as_str()) {
+            viewer["embeddingDisabled"] = json!(true);
+        }
+        post.decorate("viewer", viewer);
+        if post.view().pointer("/record/reply").is_none()
+            && let Some(g) = threadgates.get(&uri)
+        {
+            let lists = hydration.threadgate_lists(g.allow.as_ref()).await?;
+            post.decorate("threadgate", json!({"uri": g.uri, "cid": g.cid, "record": g.record, "lists": lists}));
+        }
+    }
+    Ok(())
+}
+
 /// The decoration pass of a page (private-posting design §3.3), over hits
-/// only: the operator labels, `viewer`, then the record part of each
-/// `embed`.
+/// only: the operator labels, `viewer`, the gates (§4.4), then the record
+/// part of each `embed`. `roots_read` are the roots a thread handler read
+/// for the caller beyond the hits.
 ///
 /// - A quoted private post is read through the pipeline for the same reader
 ///   and the same `RequestState`, all of the page's at once: readable gives
@@ -267,17 +402,24 @@ async fn viewer_state(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&m
 ///   nothing there the view carries no `embed`, for `record` and
 ///   `recordWithMedia` alike, and the client builds the quote from
 ///   `record.embed`.
+/// - A readable quoted private post whose own postgate detaches the quoting
+///   post gives `#viewDetached`. Detachment is checked only after the read
+///   succeeds, so it says nothing about an unreadable post (§4.2).
 /// - Quotes are not followed past one level.
+#[allow(clippy::too_many_arguments)]
 async fn decorate(
     s: &PrivateState,
     rs: &RequestState,
     caller: &VerifiedCaller,
     hydration: &HydrationContext,
     posts: &mut [&mut PrivateEmit<Value>],
+    roots_read: &[String],
     start: Instant,
 ) -> Result<(), XrpcError> {
     operator_labels(hydration, posts).await?;
     viewer_state(s, caller, posts).await?;
+    let read: HashSet<String> = posts.iter().filter_map(|p| view_uri(p)).chain(roots_read.iter().cloned()).collect();
+    gate_state(s, caller, hydration, posts, &read).await?;
     let quotes: Vec<Option<(Value, String)>> = posts
         .iter()
         .map(|p| {
@@ -293,6 +435,8 @@ async fn decorate(
         }
     }
     let mut records: HashMap<String, Value> = HashMap::new();
+    // By readable quoted post: the quoting URIs its postgate detaches.
+    let mut detached: HashMap<String, Vec<String>> = HashMap::new();
     if !private.is_empty() {
         let quoted_authors = profiles(hydration, &private).await?;
         let mut hits: Vec<PrivateEmit<Value>> =
@@ -303,6 +447,10 @@ async fn decorate(
             if let Some(uri) = view_uri(q) {
                 records.insert(uri, view_record(s, q, &quoted_authors));
             }
+        }
+        let readable: Vec<String> = records.keys().cloned().collect();
+        for gate in schema::postgates(&s.env.pool, &readable).await? {
+            detached.insert(gate.post_uri, gate.detached);
         }
     }
     // Authors' PDS endpoints, for the media of `recordWithMedia` embeds.
@@ -322,7 +470,13 @@ async fn decorate(
             continue;
         };
         let record = if is_private_uri(&quoted) {
-            records.get(&quoted).cloned().unwrap_or_else(|| not_found_record(&quoted))
+            match records.get(&quoted) {
+                Some(_) if detached.get(&quoted).is_some_and(|d| d.contains(&uri)) => {
+                    json!({"$type": "app.bsky.embed.record#viewDetached", "uri": &quoted, "detached": true})
+                }
+                Some(record) => record.clone(),
+                None => not_found_record(&quoted),
+            }
         } else {
             match hydration.public_record_view(&quoted, &uri).await? {
                 Some(view) => view.inner().clone(),
@@ -388,7 +542,7 @@ async fn posts_body(
     let mut posts: Vec<PrivateEmit<Value>> =
         read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
     let mut refs: Vec<&mut PrivateEmit<Value>> = posts.iter_mut().collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, start).await?;
+    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::posts(posts))
 }
 
@@ -473,6 +627,34 @@ async fn thread_body(
         }
     }
 
+    // The thread's root, the anchor's claimed one (§3.1, C-18), read once
+    // for the caller unless the anchor or the chain already read it, so
+    // that its gate applies (§4.4, C-17). A root the caller cannot read
+    // hides nothing and disables nothing.
+    let root = claimed_root(&anchor).unwrap_or_else(|| uri.to_string());
+    let chain_has_root = chain.iter().any(|p| view_uri(p).as_deref() == Some(root.as_str()));
+    let root_read = if root == uri || chain_has_root {
+        true
+    } else if is_private_uri(&root) {
+        let authors = profiles(&hydration, std::slice::from_ref(&root)).await?;
+        pipeline::read(&s.env, &rs, caller, &root, &authors, start).await.is_ok()
+    } else {
+        false
+    };
+    let roots_read: Vec<String> = if root_read && root != uri && !chain_has_root { vec![root.clone()] } else { Vec::new() };
+    // The replies the read root's private threadgate hides, except from
+    // their own author, left out before they are read (`thread.rs:207-208`).
+    let hidden: HashSet<String> = if root_read && is_private_uri(&root) {
+        schema::threadgates(&s.env.pool, std::slice::from_ref(&root))
+            .await?
+            .into_iter()
+            .flat_map(|g| g.hidden_replies)
+            .filter(|reply| uri_author(reply) != Some(caller.did.as_str()))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
     // Replies, breadth-first, up to `depth` levels and the node cap.
     let mut replies: HashMap<String, Vec<PrivateEmit<Value>>> = HashMap::new();
     let mut expanded: HashSet<String> = HashSet::new();
@@ -490,6 +672,9 @@ async fn thread_body(
             for c in schema::reply_candidates(&s.env.pool, &caller.did, parent, REPLIES_PER_NODE).await? {
                 if batch.len() >= budget {
                     break;
+                }
+                if hidden.contains(&c) {
+                    continue;
                 }
                 batch.push((parent.clone(), c));
             }
@@ -512,7 +697,7 @@ async fn thread_body(
         .chain(chain.iter_mut())
         .chain(replies.values_mut().flatten())
         .collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, start).await?;
+    decorate(s, &rs, caller, &hydration, &mut refs, &roots_read, start).await?;
 
     let mut root = build(anchor, uri, &mut replies, &expanded);
     // Nest the parent chain above the anchor, nearest first.
@@ -686,7 +871,7 @@ async fn feed_body(
     }
     let cursor = last_hit.filter(|_| more).map(|(at, key)| cursor(at, &key));
     let mut refs: Vec<&mut PrivateEmit<Value>> = feed.iter_mut().collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, start).await?;
+    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::feed(feed, cursor))
 }
 
@@ -821,7 +1006,7 @@ async fn bookmarks_body(
         })
         .collect();
     let mut refs: Vec<&mut PrivateEmit<Value>> = bookmarks.iter_mut().map(|b| &mut b.item).collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, start).await?;
+    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::bookmarks(bookmarks, next))
 }
 

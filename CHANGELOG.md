@@ -12,6 +12,20 @@ commit.
 
 ### Added
 
+- **Reply and quote gates on private posts (private posting S4, #719;
+  Horizon P-18).** A stock `app.bsky.feed.threadgate` or `postgate` whose
+  `post` is a `postPrivate` URI (same author and rkey as the post) is now
+  stored in every public-indexing mode and applied on private reads:
+  `threadgate` on the root's view, `viewer.replyDisabled` (only when the
+  thread root was read for that reader in the same request, so a reply in
+  a feed usually carries none), hidden replies left out of threads except
+  for their author, `viewer.embeddingDisabled` from a `disableRule`, and a
+  detached quote shown as `app.bsky.embed.record#viewDetached`. The
+  audience stays the outer bound. Gates are removed with their post and
+  with the owner's purges. Backfill lists them after the authorization
+  collections. Migration 0025. `getMembership`'s `features` gains
+  `private.gates`.
+
 - **Private bookmarks (private posting S3, #719; Horizon P-8).**
   `app.nearhorizon.private.createBookmark {uri, cid}`, `deleteBookmark
   {uri}` and `getBookmarks {limit, cursor}`, served in every

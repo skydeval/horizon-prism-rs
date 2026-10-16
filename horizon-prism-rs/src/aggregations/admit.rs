@@ -19,15 +19,19 @@ pub enum RecordKind {
     PrivatePost,
     PrivateAudience,
     PrivateBlock,
+    /// A stock `app.bsky.feed.threadgate` or `postgate` whose `post` is a
+    /// `postPrivate` URI (private posting §4.4, P-18). Its one subject is the
+    /// gated post's author.
+    PrivateGate,
 }
 
 impl RecordKind {
-    /// Private-tier kinds (`Kryphocron(Private)`).
+    /// Private-tier kinds (`Kryphocron(Private)`, and gates of private posts).
     #[must_use]
     pub fn is_private(self) -> bool {
         matches!(
             self,
-            Self::PrivatePost | Self::PrivateAudience | Self::PrivateBlock
+            Self::PrivatePost | Self::PrivateAudience | Self::PrivateBlock | Self::PrivateGate
         )
     }
 
@@ -59,6 +63,9 @@ pub enum AdmitRule {
     InboundToMember,
     /// Rule 3: a block by a private owner.
     OwnerBlock,
+    /// Rule 3: a private owner's gate on its own private post (private
+    /// posting §4.4).
+    OwnerGate,
 }
 
 /// Why an op was rejected.
@@ -111,7 +118,10 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
             return Admission::Reject(RejectReason::Purging(PurgeKind::AccountDeleted));
         }
         Some(PurgeKind::OutOfScope)
-            if matches!(input.kind, RecordKind::PrivatePost | RecordKind::PrivateAudience) =>
+            if matches!(
+                input.kind,
+                RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateGate
+            ) =>
         {
             return Admission::Reject(RejectReason::Purging(PurgeKind::OutOfScope));
         }
@@ -144,6 +154,15 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     if input.kind.is_block() && sets.is_owner(&input.author) {
         return Admission::Admit(AdmitRule::OwnerBlock);
     }
+    // Rule 3 for gates (private posting §4.4): an owner's gate naming the
+    // owner's own private post, whose author is the op's one subject.
+    if input.kind == RecordKind::PrivateGate
+        && sets.is_owner(&input.author)
+        && input.subjects.len() == 1
+        && input.subjects[0] == input.author
+    {
+        return Admission::Admit(AdmitRule::OwnerGate);
+    }
     if removed_subject {
         return Admission::Reject(RejectReason::Purging(PurgeKind::MemberRemoved));
     }
@@ -163,7 +182,8 @@ fn off_rule(input: &AdmissionInput, sets: &ScopeSets) -> Option<Admission> {
         | RecordKind::Table("actor_self_records")
         | RecordKind::PrivatePost
         | RecordKind::PrivateAudience
-        | RecordKind::PrivateBlock => None,
+        | RecordKind::PrivateBlock
+        | RecordKind::PrivateGate => None,
         RecordKind::Follow => {
             let subject_member = input.subjects.iter().any(|s| sets.is_member(s));
             if author_member || subject_member { None } else { off }
@@ -253,6 +273,49 @@ mod tests {
             admit(&input(OWNER, RecordKind::Like, &[STRANGER]), &sets()),
             Admission::Reject(RejectReason::NotInScope)
         );
+    }
+
+    /// Private posting §4.4 (review 11, finding 6): an owner's gate on its
+    /// own private post is admitted by rule 3; on another's post it is not.
+    /// The off rule leaves gates of private posts to the rules, and an
+    /// `out_of_scope` purge rejects them.
+    #[test]
+    fn rule_3_owner_gates_on_own_posts() {
+        for mode in [PublicMode::On, PublicMode::Off] {
+            let s = with_mode(mode);
+            assert_eq!(
+                admit(&input(OWNER, RecordKind::PrivateGate, &[OWNER]), &s),
+                Admission::Admit(AdmitRule::OwnerGate),
+                "{mode:?}"
+            );
+            assert_eq!(
+                admit(&input(OWNER, RecordKind::PrivateGate, &[STRANGER]), &s),
+                Admission::Reject(RejectReason::NotInScope),
+                "{mode:?}"
+            );
+            assert_eq!(
+                admit(&input(STRANGER, RecordKind::PrivateGate, &[STRANGER]), &s),
+                Admission::Reject(RejectReason::NotInScope),
+                "{mode:?}"
+            );
+            // Rule 1, in the off modes too.
+            assert_eq!(
+                admit(&input(SCOPED, RecordKind::PrivateGate, &[SCOPED]), &s),
+                Admission::Admit(AdmitRule::AuthorInScope),
+                "{mode:?}"
+            );
+            // The public gate tables stay off under the off rule.
+            if mode == PublicMode::Off {
+                assert_eq!(admit(&input(MEMBER, RecordKind::Table("threadgates"), &[]), &s), OFF);
+            }
+        }
+        let mut s = sets();
+        s.purging.insert(OWNER.into(), PurgeKind::OutOfScope);
+        assert_eq!(
+            admit(&input(OWNER, RecordKind::PrivateGate, &[OWNER]), &s),
+            Admission::Reject(RejectReason::Purging(PurgeKind::OutOfScope))
+        );
+        assert!(RecordKind::PrivateGate.is_private());
     }
 
     #[test]

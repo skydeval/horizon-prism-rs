@@ -16,7 +16,7 @@
         },
         "embed": {
           "type": "union",
-          "description": "The stock view of the record's embed, built from either $type form. A quoted private post is read for the requester as any private post is: readable gives #viewRecord with the decoded record as its value; unreadable, blocked or nonexistent all give the same #viewNotFound. A quoted public post is shown only when this AppView stores it; otherwise, for record and recordWithMedia embeds alike, embed is absent and the client renders the quote from record.embed. Quotes are not followed beyond one level. A video plays from the video CDN (playlist and thumbnail) or from the author's PDS (playlist only), as the operator configures.",
+          "description": "The stock view of the record's embed, built from either $type form. A quoted private post is read for the requester as any private post is: readable gives #viewRecord with the decoded record as its value, or #viewDetached when the quoted post's postgate detaches this post; unreadable, blocked or nonexistent all give the same #viewNotFound. A quoted public post is shown only when this AppView stores it; otherwise, for record and recordWithMedia embeds alike, embed is absent and the client renders the quote from record.embed. Quotes are not followed beyond one level. A video plays from the video CDN (playlist and thumbnail) or from the author's PDS (playlist only), as the operator configures.",
           "refs": [
             "app.bsky.embed.images#view",
             "app.bsky.embed.external#view",
@@ -40,7 +40,12 @@
         "viewer": {
           "type": "ref",
           "ref": "app.bsky.feed.defs#viewerState",
-          "description": "The requester's state on the post. Carries bookmarked (the requester's private bookmark, app.nearhorizon.private.createBookmark), always present; other fields are not emitted yet."
+          "description": "The requester's state on the post. Carries bookmarked (the requester's private bookmark, app.nearhorizon.private.createBookmark), always present. replyDisabled comes from the threadgate of the thread root the post's record claims (reply.root, or the post itself when top-level), and only when that root was read for the requester in the same request: the post itself, a parent in the thread, another post of the page, or the root a thread request reads. So a feed reply usually carries none, and a thread does; a followingRule or listRule this AppView cannot answer from its own rows also leaves it out (fail open). embeddingDisabled is true when the post's own postgate disables embedding and the requester is not its author. Other fields are not emitted yet."
+        },
+        "threadgate": {
+          "type": "ref",
+          "ref": "app.bsky.feed.defs#threadgateView",
+          "description": "On a top-level post: its threadgate (an app.bsky.feed.threadgate record with the post's record key, in the post author's repository). lists holds only the lists this AppView serves from its own rows. A gate only flags and hides replies; it never admits a reader the audience does not."
         }
       }
     },
@@ -85,7 +90,7 @@
         },
         "replies": {
           "type": "array",
-          "description": "Authorized private replies to this post, ordered by createdAt ascending, at most 50 per node.",
+          "description": "Authorized private replies to this post, ordered by createdAt ascending, at most 50 per node. When the thread's root (the anchor's claimed reply.root) was read for the requester, replies its threadgate lists in hiddenReplies are left out, except for their own author.",
           "items": { "type": "ref", "ref": "#privateThreadView" }
         }
       }
