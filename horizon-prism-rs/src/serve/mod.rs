@@ -699,6 +699,7 @@ pub async fn run() -> Result<(), StartupError> {
         source,
         writer: writer.clone(),
         attempts: fh.deterministic_attempts,
+        catch_up: crate::firehose::index_request::CatchUp::new(crate::firehose::index_request::CatchUpConfig::from_app(&cfg)),
     };
     let resolve_did = ResolveDidState {
         app: app.clone(),

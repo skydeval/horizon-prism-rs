@@ -11,6 +11,8 @@
 //! `encodedContent` is [`IngestError::Malformed`], which the firehose
 //! dead-letters. Nothing here panics on record content.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
@@ -908,6 +910,26 @@ pub(crate) async fn local_uris(conn: &mut PgConnection, did: &str, nsid: &str, b
         .bind(below_rev)
         .fetch_all(conn)
         .await
+}
+
+/// `ingest::stored_cids`: URI → CID of `did`'s stored rows in `nsid`, for the
+/// collections whose rows keep a CID (private posts and audiences). Catch-up
+/// skips a listed record whose CID is stored (private posting §3.8).
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn stored_cids(conn: &mut PgConnection, did: &str, nsid: &str) -> Result<HashMap<String, String>, sqlx::Error> {
+    let (table, col) = match nsid {
+        NSID_POST_PRIVATE => ("private_posts", "author_did"),
+        NSID_AUDIENCE => ("private_audiences", "owner_did"),
+        _ => return Ok(HashMap::new()),
+    };
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!("SELECT uri, cid FROM {table} WHERE {col} = $1"))
+        .bind(did)
+        .fetch_all(conn)
+        .await?;
+    Ok(rows.into_iter().filter_map(|(uri, cid)| cid.map(|c| (uri, c))).collect())
 }
 
 /// The viewer's own private bookmarks, at most `limit` rows (private posting

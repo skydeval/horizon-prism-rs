@@ -224,11 +224,15 @@ const fn authorization(nsid: &'static str) -> CollectionPlan {
     }
 }
 
+/// The four authorization collections (§6.11.3), in listing order. Also
+/// what `requestRecord`'s catch-up lists (private posting §3.8).
+pub const AUTHORIZATION_NSIDS: [&str; 4] = [NSID_BLOCK, NSID_PRIVATE_BLOCK, NSID_AUDIENCE, NSID_POST_PRIVATE];
+
 const AUTHORIZATION: [CollectionPlan; 4] = [
-    authorization(NSID_BLOCK),
-    authorization(NSID_PRIVATE_BLOCK),
-    authorization(NSID_AUDIENCE),
-    authorization(NSID_POST_PRIVATE),
+    authorization(AUTHORIZATION_NSIDS[0]),
+    authorization(AUTHORIZATION_NSIDS[1]),
+    authorization(AUTHORIZATION_NSIDS[2]),
+    authorization(AUTHORIZATION_NSIDS[3]),
 ];
 
 // Gates are listed after posts, with the posts' limit, and only gates of the
@@ -417,6 +421,12 @@ pub trait BackfillSource: Send + Sync {
     async fn latest_rev(&self, pds: &str, did: &str) -> Result<String, String>;
     async fn list_records(&self, pds: &str, did: &str, collection: &str, cursor: Option<&str>)
     -> Result<ListPage, String>;
+    /// [`Self::list_records`] under the host's catch-up budget, which never
+    /// waits: `Ok(None)` when no token is left (private posting §3.8).
+    async fn list_records_now(&self, pds: &str, did: &str, collection: &str, cursor: Option<&str>)
+    -> Result<Option<ListPage>, String> {
+        self.list_records(pds, did, collection, cursor).await.map(Some)
+    }
     /// `getRecord`; `Ok(None)` only for an explicit `RecordNotFound`.
     async fn get_record(&self, pds: &str, did: &str, collection: &str, rkey: &str)
     -> Result<Option<ListedRecord>, String>;
@@ -464,14 +474,63 @@ impl NetSource {
     }
 
     async fn pds_get(&self, pds: &str, method: &str, params: &[(&str, &str)], cap: BodyCap) -> Result<crate::net::NetResponse, String> {
+        // The backfill class waits for its token, so `None` never comes.
+        self.pds_get_in(pds, method, params, cap, Class::Backfill)
+            .await?
+            .ok_or_else(|| format!("{method}: no budget token"))
+    }
+
+    /// A PDS call under `class`'s budget. A class that waits always gets a
+    /// token; `Class::CatchUp` never waits, and `Ok(None)` means no token.
+    async fn pds_get_in(
+        &self,
+        pds: &str,
+        method: &str,
+        params: &[(&str, &str)],
+        cap: BodyCap,
+        class: Class,
+    ) -> Result<Option<crate::net::NetResponse>, String> {
         let url = Url::parse_with_params(&format!("{}/xrpc/{method}", pds.trim_end_matches('/')), params)
             .map_err(|e| format!("{method} url: {e}"))?;
         let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-        self.budgets.acquire(&host, Class::Backfill).await;
+        if class == Class::CatchUp {
+            if !self.budgets.try_acquire(&host, class) {
+                return Ok(None);
+            }
+        } else {
+            self.budgets.acquire(&host, class).await;
+        }
         self.net
             .get(url.as_str(), &RequestOptions::new(cap).timeout(PDS_TIMEOUT))
             .await
+            .map(Some)
             .map_err(|e| format!("{method}: {e}"))
+    }
+
+    /// One `listRecords` page under `class`'s budget.
+    async fn list_page(
+        &self,
+        pds: &str,
+        did: &str,
+        collection: &str,
+        cursor: Option<&str>,
+        class: Class,
+    ) -> Result<Option<ListPage>, String> {
+        let limit = PAGE_LIMIT.to_string();
+        let mut params = vec![("repo", did), ("collection", collection), ("limit", limit.as_str())];
+        if let Some(c) = cursor {
+            params.push(("cursor", c));
+        }
+        let Some(r) = self
+            .pds_get_in(pds, "com.atproto.repo.listRecords", &params, BodyCap::LIST_RECORDS, class)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !r.is_success() {
+            return Err(format!("listRecords {collection}: HTTP {}", r.status.as_u16()));
+        }
+        r.json().map(Some).map_err(|e| format!("listRecords {collection}: {e}"))
     }
 }
 
@@ -566,18 +625,19 @@ impl BackfillSource for NetSource {
         collection: &str,
         cursor: Option<&str>,
     ) -> Result<ListPage, String> {
-        let limit = PAGE_LIMIT.to_string();
-        let mut params = vec![("repo", did), ("collection", collection), ("limit", limit.as_str())];
-        if let Some(c) = cursor {
-            params.push(("cursor", c));
-        }
-        let r = self
-            .pds_get(pds, "com.atproto.repo.listRecords", &params, BodyCap::LIST_RECORDS)
-            .await?;
-        if !r.is_success() {
-            return Err(format!("listRecords {collection}: HTTP {}", r.status.as_u16()));
-        }
-        r.json().map_err(|e| format!("listRecords {collection}: {e}"))
+        self.list_page(pds, did, collection, cursor, Class::Backfill)
+            .await?
+            .ok_or_else(|| format!("listRecords {collection}: no budget token"))
+    }
+
+    async fn list_records_now(
+        &self,
+        pds: &str,
+        did: &str,
+        collection: &str,
+        cursor: Option<&str>,
+    ) -> Result<Option<ListPage>, String> {
+        self.list_page(pds, did, collection, cursor, Class::CatchUp).await
     }
 
     async fn get_record(
@@ -1212,27 +1272,9 @@ impl Backfill {
         Ok(())
     }
 
-    /// Local URIs of `did` in `nsid` with `rev < R` (reconcile candidates
-    /// before the listing filter). Under the off rule no post is stored, so
-    /// a member's posts are its references (public-indexing design §4.1).
+    /// [`local_uris`] through this job's writer.
     async fn local_uris(&self, did: &str, nsid: &str, rev: &str, off_rule: bool) -> Result<Vec<String>, sqlx::Error> {
-        let table = if off_rule && nsid == NSID_POST { Some(("member_post_refs", "author_did")) } else { public_table(nsid) };
-        let mut uris = Vec::new();
-        if let Some((table, author)) = table {
-            uris = sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE {author} = $1 AND rev < $2"))
-                .bind(did)
-                .bind(rev)
-                .fetch_all(&self.pool)
-                .await?;
-            // A gate may be stored by the private tier instead (private
-            // posting §4.4).
-            if !matches!(nsid, NSID_THREADGATE | NSID_POSTGATE) {
-                return Ok(uris);
-            }
-        }
-        let mut conn = self.pool.acquire().await?;
-        uris.extend(self.writer.private().local_uris(&mut conn, did, nsid, rev).await?);
-        Ok(uris)
+        local_uris(&self.writer, did, nsid, rev, off_rule).await
     }
 
     /// Reconcile one fully listed collection (§5.10). Returns the number of
@@ -1534,6 +1576,34 @@ impl Backfill {
 }
 
 /// Seconds into the day for a DID's daily job.
+/// Local URIs of `did` in `nsid` with `rev < R`: the reconcile candidates
+/// before the listing filter (§5.10), for a job and for `requestRecord`'s
+/// catch-up (private posting §3.8). Under the off rule no post is stored, so
+/// a member's posts are its references (public-indexing design §4.1).
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn local_uris(writer: &Writer, did: &str, nsid: &str, rev: &str, off_rule: bool) -> Result<Vec<String>, sqlx::Error> {
+    let table = if off_rule && nsid == NSID_POST { Some(("member_post_refs", "author_did")) } else { public_table(nsid) };
+    let mut uris = Vec::new();
+    if let Some((table, author)) = table {
+        uris = sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE {author} = $1 AND rev < $2"))
+            .bind(did)
+            .bind(rev)
+            .fetch_all(writer.pool())
+            .await?;
+        // A gate may be stored by the private tier instead (private
+        // posting §4.4).
+        if !matches!(nsid, NSID_THREADGATE | NSID_POSTGATE) {
+            return Ok(uris);
+        }
+    }
+    let mut conn = writer.pool().acquire().await?;
+    uris.extend(writer.private().local_uris(&mut conn, did, nsid, rev).await?);
+    Ok(uris)
+}
+
 fn daily_offset_secs(did: &str) -> f64 {
     let h = blake3::hash(did.as_bytes());
     let mut b = [0u8; 8];

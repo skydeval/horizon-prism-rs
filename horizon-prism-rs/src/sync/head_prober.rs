@@ -401,6 +401,7 @@ mod tests {
             head_max_age_secs: 60.0,
             read_fetch_per_host: 20.0,
             backfill_per_host: 5.0,
+            catch_up_per_host: 10.0,
         }
     }
 

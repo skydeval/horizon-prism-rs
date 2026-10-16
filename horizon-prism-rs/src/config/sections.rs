@@ -364,6 +364,9 @@ pub struct SyncConfig {
     pub public_fallback_rate_per_host: Float,
     /// How many hosts have such a bucket at once.
     pub max_public_fallback_hosts: u64,
+    /// Each PDS host's bucket for `requestRecord`'s catch-up listings
+    /// (private posting §3.8). It never waits: no token stops the catch-up.
+    pub catch_up_rate_per_host: u32,
 }
 
 impl Default for SyncConfig {
@@ -377,6 +380,27 @@ impl Default for SyncConfig {
             read_fetch_rate_per_host: 25,
             public_fallback_rate_per_host: Float(25.0),
             max_public_fallback_hosts: 100_000,
+            catch_up_rate_per_host: 10,
+        }
+    }
+}
+
+/// `[index_request]`: `requestRecord`'s catch-up of the caller's
+/// authorization collections (private posting §3.8).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexRequestConfig {
+    /// At most one catch-up per DID within this many seconds.
+    pub catch_up_min_interval_secs: u64,
+    /// `listRecords` pages one catch-up may fetch, over every collection.
+    pub catch_up_max_pages: u32,
+}
+
+impl Default for IndexRequestConfig {
+    fn default() -> Self {
+        Self {
+            catch_up_min_interval_secs: 10,
+            catch_up_max_pages: 8,
         }
     }
 }
@@ -1711,6 +1735,7 @@ pub struct FileConfig {
     pub private_read: PrivateReadConfig,
     pub private_notify: PrivateNotifyConfig,
     pub sync: SyncConfig,
+    pub index_request: IndexRequestConfig,
     pub db: DbConfig,
     pub admin: AdminConfig,
     pub cache: CacheConfig,

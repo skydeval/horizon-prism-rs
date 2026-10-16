@@ -134,6 +134,7 @@ async fn fixture_in(pool: &PgPool, test: &str, mode: PublicMode) -> Fixture {
             head_max_age_secs: 60.0,
             read_fetch_per_host: 10.0,
             backfill_per_host: 5.0,
+            catch_up_per_host: 10.0,
         }),
         SyncConfig::default(),
     );
@@ -3159,4 +3160,326 @@ async fn private_notification_reads_on() {
 #[tokio::test]
 async fn private_notification_reads_off() {
     notification_reads_in(PublicMode::Off, "s6-reads-off").await;
+}
+
+// ---- S7: `requestRecord`'s catch-up and `caughtUp` (P-11, §3.8, T-18) ----
+
+const REQUEST_RECORD: &str = "app.nearhorizon.index.requestRecord";
+const R1: &str = "3kbbbbbbbbbb2";
+const R2: &str = "3kcccccccccc2";
+const R3: &str = "3kdddddddddd2";
+
+/// Alice's repository as her PDS serves it: `latest_rev`, `listRecords` in
+/// pages of `page_size`, and `getRecord`.
+struct Repo {
+    pool: PgPool,
+    rev: std::sync::Mutex<String>,
+    records: std::sync::Mutex<Vec<crate::firehose::backfill::ListedRecord>>,
+    page_size: usize,
+    /// `listRecords` calls.
+    lists: std::sync::atomic::AtomicUsize,
+    /// Bump the gap epoch on the next `listRecords` call.
+    bump_epoch: std::sync::atomic::AtomicBool,
+}
+
+impl Repo {
+    fn new(pool: &PgPool, page_size: usize) -> Arc<Self> {
+        Arc::new(Self {
+            pool: pool.clone(),
+            rev: std::sync::Mutex::new(R1.into()),
+            records: std::sync::Mutex::new(Vec::new()),
+            page_size,
+            lists: std::sync::atomic::AtomicUsize::new(0),
+            bump_epoch: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Serve `record` at `at://alice/collection/rkey` with `cid`, replacing
+    /// any record at that URI.
+    fn put(&self, collection: &str, rkey: &str, cid: &str, value: Value) {
+        let uri = format!("at://{ALICE}/{collection}/{rkey}");
+        let mut records = self.records.lock().expect("records");
+        records.retain(|r| r.uri != uri);
+        records.push(crate::firehose::backfill::ListedRecord {
+            uri,
+            cid: cid.into(),
+            value,
+        });
+    }
+
+    fn remove(&self, collection: &str, rkey: &str) {
+        let uri = format!("at://{ALICE}/{collection}/{rkey}");
+        self.records.lock().expect("records").retain(|r| r.uri != uri);
+    }
+
+    fn set_rev(&self, rev: &str) {
+        *self.rev.lock().expect("rev") = rev.into();
+    }
+
+    fn lists(&self) -> usize {
+        self.lists.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl crate::firehose::backfill::BackfillSource for Repo {
+    async fn prepare(&self, _: &str) -> Result<String, crate::firehose::backfill::PrepareError> {
+        Ok("https://pds.example.com".into())
+    }
+    async fn latest_rev(&self, _: &str, _: &str) -> Result<String, String> {
+        Ok(self.rev.lock().expect("rev").clone())
+    }
+    async fn list_records(
+        &self,
+        _: &str,
+        did: &str,
+        collection: &str,
+        cursor: Option<&str>,
+    ) -> Result<crate::firehose::backfill::ListPage, String> {
+        self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.bump_epoch.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            exec(&self.pool, "INSERT INTO worker_state (key, value) VALUES ('gap_epoch', '7'::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value").await;
+        }
+        let prefix = format!("at://{did}/{collection}/");
+        let all: Vec<_> = self.records.lock().expect("records").iter().filter(|r| r.uri.starts_with(&prefix)).cloned().collect();
+        let start = cursor.map_or(0, |c| c.parse::<usize>().expect("cursor"));
+        let end = (start + self.page_size).min(all.len());
+        Ok(crate::firehose::backfill::ListPage {
+            records: all[start.min(end)..end].to_vec(),
+            cursor: (end < all.len()).then(|| end.to_string()),
+        })
+    }
+    async fn get_record(
+        &self,
+        _: &str,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Option<crate::firehose::backfill::ListedRecord>, String> {
+        let uri = format!("at://{did}/{collection}/{rkey}");
+        Ok(self.records.lock().expect("records").iter().find(|r| r.uri == uri).cloned())
+    }
+    async fn inbound_blocks(&self, _: &str, _: Option<&str>) -> Result<crate::microcosm::LinksPage, String> {
+        Err("unused".into())
+    }
+}
+
+/// `requestRecord` over `repo`, with a catch-up whose interval no earlier
+/// call has started.
+async fn index_server(f: &Fixture, repo: &Arc<Repo>) -> String {
+    use crate::firehose::index_request::{CATCH_UP_DEADLINE, CatchUp, CatchUpConfig};
+    let state = crate::xrpc::handlers::index::IndexState {
+        app: f.app.clone(),
+        source: Arc::clone(repo) as Arc<dyn crate::firehose::backfill::BackfillSource>,
+        writer: f.writer.clone(),
+        attempts: 1,
+        catch_up: CatchUp::new(CatchUpConfig {
+            min_interval: Duration::from_secs(10),
+            max_pages: 8,
+            reconcile_confirm_limit: 50,
+            attempts: 1,
+            deadline: CATCH_UP_DEADLINE,
+        }),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            crate::xrpc::router::index_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("serve");
+    });
+    format!("http://{addr}")
+}
+
+/// Alice's `requestRecord` for `uri`: `(status, caughtUp)`.
+async fn request_record(base: &str, uri: &str) -> (String, bool) {
+    let (status, body) = post(base, REQUEST_RECORD, &json!({ "uri": uri }), ALICE).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    (v["status"].as_str().expect("status").to_string(), v["caughtUp"].as_bool().expect("caughtUp"))
+}
+
+async fn applied_rev_of(pool: &PgPool, did: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT applied_rev FROM sync_state WHERE did = $1")
+        .bind(did)
+        .fetch_one(pool)
+        .await
+        .expect("sync_state")
+}
+
+/// Force the prober's fresh head for `did` (the head check reads it).
+async fn set_head(pool: &PgPool, did: &str, head: &str) {
+    sqlx::query("UPDATE sync_state SET head_rev = $2, head_checked_at = now() WHERE did = $1")
+        .bind(did)
+        .bind(head)
+        .execute(pool)
+        .await
+        .expect("head");
+}
+
+/// The URIs `reader`'s `getPosts(uris)` returns.
+async fn readable(base: &str, reader: &str, uris: &[&str]) -> Vec<String> {
+    let (_, posts) = posts_of(base, reader, uris).await;
+    posts.iter().map(|p| p["uri"].as_str().expect("uri").to_string()).collect()
+}
+
+/// Alice's audience listing Bob and her post under it, both stored and
+/// served by `repo` with their stored CIDs; Alice's `applied_rev` behind
+/// her head, as after she writes.
+async fn alice_behind(f: &Fixture, repo: &Repo) -> (String, String) {
+    let aud = f.audience(ALICE, "3kaudience01", Some("list"), &[BOB]).await;
+    let p1 = f.private_post(ALICE, "3kpostone001", &aud, None).await;
+    f.ready_all().await;
+    repo.put(NSID_AUDIENCE, "3kaudience01", "bafy3kaudience01", json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [BOB], "createdAt": "2026-09-26T00:00:00Z"}));
+    repo.put(NSID_POST_PRIVATE, "3kpostone001", "bafy3kpostone001", f.post_record(ALICE, "3kpostone001", &aud, None).await);
+    exec(&f.pool, &format!("UPDATE sync_state SET applied_rev = '{REV}' WHERE did = '{ALICE}'")).await;
+    set_head(&f.pool, ALICE, R1).await;
+    (aud, p1)
+}
+
+/// T-18 and P-11's contract (§4.9): after `requestRecord` answers `indexed`
+/// or `deleted` with `caughtUp: true`, the author's and a reader's
+/// `getPosts` reflect the record at once and the author's other posts stay
+/// readable. A second call within the interval does not list.
+#[tokio::test]
+async fn request_record_catches_up_and_the_record_reads_at_once() {
+    let Some(db) = fresh_db("s7_catch_up").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "s7-catch-up").await;
+    let repo = Repo::new(&f.pool, 100);
+    let (aud, p1) = alice_behind(&f, &repo).await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+    // Alice's head moved past her applied rev: her posts miss.
+    assert!(readable(&base, BOB, &[&p1]).await.is_empty());
+
+    // A new post, indexed and caught up: both read it, and the old one.
+    let p2 = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3kposttwo001");
+    repo.put(NSID_POST_PRIVATE, "3kposttwo001", "bafy3kposttwo001", f.post_record(ALICE, "3kposttwo001", &aud, None).await);
+    let index = index_server(&f, &repo).await;
+    assert_eq!(request_record(&index, &p2).await, ("indexed".to_string(), true));
+    assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(R1));
+    assert_eq!(repo.lists(), 4, "the four authorization collections, one page each");
+    for reader in [BOB, ALICE] {
+        assert_eq!(readable(&base, reader, &[&p1, &p2]).await, [p1.clone(), p2.clone()], "{reader}");
+    }
+
+    // A second call within 10 s does not list and answers as it stands.
+    repo.set_rev(R2);
+    set_head(&f.pool, ALICE, R2).await;
+    let (_, caught_up) = request_record(&index, &p1).await;
+    assert!(!caught_up);
+    assert_eq!(repo.lists(), 4, "no listing");
+    assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(R1));
+
+    // A delete, once the interval has passed (a new process's interval).
+    repo.remove(NSID_POST_PRIVATE, "3kposttwo001");
+    repo.set_rev(R3);
+    set_head(&f.pool, ALICE, R3).await;
+    let index = index_server(&f, &repo).await;
+    assert_eq!(request_record(&index, &p2).await, ("deleted".to_string(), true));
+    assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(R3));
+    for reader in [BOB, ALICE] {
+        assert_eq!(readable(&base, reader, &[&p1, &p2]).await, std::slice::from_ref(&p1), "{reader}");
+    }
+    db.drop_db().await;
+}
+
+/// T-18, review 1 LB2: a listed audience that fails to write clears
+/// readiness and queues `authz`, as on the firehose; nothing settles, and
+/// Bob's read is a uniform miss, never a read under the stale audience row.
+#[tokio::test]
+async fn a_failed_catch_up_write_clears_readiness_and_settles_nothing() {
+    let Some(db) = fresh_db("s7_catch_up_failed").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "s7-catch-up-failed").await;
+    let repo = Repo::new(&f.pool, 100);
+    let (_, p1) = alice_behind(&f, &repo).await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+    let (missing, _) = posts_of(&base, BOB, &[&format!("at://{ALICE}/{NSID_POST_PRIVATE}/3knothere001")]).await;
+    // Alice removes Bob, and the edit carries a malformed field.
+    repo.put(NSID_AUDIENCE, "3kaudience01", "bafyaudnew", json!({"$type": NSID_AUDIENCE, "mode": "list", "members": "not a list", "createdAt": "2026-09-26T00:00:00Z"}));
+    let index = index_server(&f, &repo).await;
+    let (status, caught_up) = request_record(&index, &p1).await;
+    assert_eq!((status.as_str(), caught_up), ("indexed", false));
+    assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(REV), "no advance");
+    let member_ready: bool = sqlx::query_scalar("SELECT ready_at IS NOT NULL FROM members WHERE did = $1")
+        .bind(ALICE)
+        .fetch_one(&f.pool)
+        .await
+        .expect("member");
+    assert!(!member_ready, "ready_at cleared");
+    assert!(!readiness::owner_ready(&f.pool, ALICE).await.expect("owner"), "owner readiness cleared");
+    let authz: i64 = sqlx::query_scalar("SELECT count(*) FROM backfill_jobs WHERE did = $1 AND depth = 'authz' AND state = 'queued'")
+        .bind(ALICE)
+        .fetch_one(&f.pool)
+        .await
+        .expect("jobs");
+    assert_eq!(authz, 1, "authz queued");
+    // Even with the head where the catch-up left it, Bob's read is a miss
+    // byte-identical to a nonexistent post.
+    set_head(&f.pool, ALICE, REV).await;
+    let (body, posts) = posts_of(&base, BOB, &[&p1]).await;
+    assert!(posts.is_empty(), "{body}");
+    assert_eq!(body, missing, "a uniform miss");
+    db.drop_db().await;
+}
+
+/// T-18's bounds: a DID that is not ready is not listed; over the page cap,
+/// or with a gap during the catch-up, nothing settles.
+#[tokio::test]
+async fn catch_up_is_bounded_and_settles_only_a_clean_listing() {
+    let Some(db) = fresh_db("s7_catch_up_bounds").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "s7-catch-up-bounds").await;
+    let repo = Repo::new(&f.pool, 1);
+    let (_, p1) = alice_behind(&f, &repo).await;
+
+    // Not ready: no catch-up at all.
+    exec(&f.pool, &format!("UPDATE members SET ready_at = NULL WHERE did = '{ALICE}'")).await;
+    let index = index_server(&f, &repo).await;
+    assert!(!request_record(&index, &p1).await.1);
+    assert_eq!(repo.lists(), 0, "not listed");
+    exec(&f.pool, &format!("UPDATE members SET ready_at = now() WHERE did = '{ALICE}'")).await;
+
+    // A gap between the epoch read and the settle: no advance.
+    repo.set_rev(R2);
+    set_head(&f.pool, ALICE, R2).await;
+    repo.bump_epoch.store(true, std::sync::atomic::Ordering::SeqCst);
+    let index = index_server(&f, &repo).await;
+    assert!(!request_record(&index, &p1).await.1);
+    assert_eq!(repo.lists(), 4, "listed in pages of one");
+    assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(REV));
+
+    // Over the page cap (six private blocks in pages of one, nine pages in
+    // all): no advance.
+    for i in 0..6 {
+        repo.put(
+            crate::firehose::classifier::NSID_PRIVATE_BLOCK,
+            &format!("3kblock00000{i}"),
+            &format!("bafyblock{i}"),
+            json!({"$type": crate::firehose::classifier::NSID_PRIVATE_BLOCK, "subject": CAROL, "createdAt": "2026-09-26T00:00:00Z"}),
+        );
+    }
+    repo.set_rev(R3);
+    set_head(&f.pool, ALICE, R3).await;
+    let before = repo.lists();
+    let index = index_server(&f, &repo).await;
+    assert!(!request_record(&index, &p1).await.1);
+    assert_eq!(repo.lists() - before, 8, "stopped at the cap");
+    assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(REV));
+
+    // Within the cap, the same repository catches up.
+    let listed_before = repo.lists();
+    repo.records.lock().expect("records").retain(|r| !r.uri.contains("3kblock00000"));
+    let index = index_server(&f, &repo).await;
+    assert!(request_record(&index, &p1).await.1);
+    assert!(repo.lists() > listed_before);
+    assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(R3));
+    db.drop_db().await;
 }

@@ -59,3 +59,16 @@ pub(crate) async fn owner_ready(pool: &PgPool, did: &str) -> Result<bool, sqlx::
         .fetch_one(pool)
         .await
 }
+
+/// `readiness::owner_ready` on a caller's connection (private posting §3.8:
+/// catch-up's checks and its settle transaction).
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn owner_ready_on(conn: &mut PgConnection, did: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM private_owner_ready WHERE did = $1)")
+        .bind(did)
+        .fetch_one(conn)
+        .await
+}

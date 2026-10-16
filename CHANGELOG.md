@@ -12,6 +12,22 @@ commit.
 
 ### Added
 
+- **A just-indexed record is readable at once (private posting S7, #719;
+  Horizon P-11).** `app.nearhorizon.index.requestRecord` now also catches
+  the caller's own repository up inline: it lists the private-tier
+  collections (up to `[index_request] catch_up_max_pages`, 8 pages, and
+  1.5 s), writes what changed through the normal writer, confirms deletes,
+  and advances the account's applied revision only if every write
+  succeeded. The answer gains `caughtUp: boolean`; when `true`, private
+  reads reflect the record immediately and the author's other private
+  posts stay readable. A failed write answers `false` and clears the
+  account's readiness, as the firehose does. One catch-up per account per
+  `catch_up_min_interval_secs` (10). This is a third way the applied
+  revision advances, beside backfill and the firehose. New
+  `sync.catch_up_rate_per_host` (10), metric
+  `index_request_catch_up_total{outcome}`. `getMembership`'s `features`
+  gains `private.freshIndex`.
+
 - **Private notifications (private posting S6, #719; Horizon P-9).**
   `app.nearhorizon.private.listNotifications {limit, cursor, reasons?}`,
   `getUnreadCount` and `updateSeen`, served in every public-indexing mode

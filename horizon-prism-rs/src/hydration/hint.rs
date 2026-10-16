@@ -29,10 +29,11 @@ pub struct RoutingHint {
 }
 
 /// The `app.nearhorizon.index.requestRecord` output (§5.9): the outcome for
-/// the caller's own record only.
+/// the caller's own record only, and whether the caller's repository is
+/// applied up to the fetched rev (`caughtUp`, private posting §3.8).
 #[must_use]
-pub fn index_status(status: crate::firehose::index_request::IndexStatus) -> PublicEmit<Value> {
-    PublicEmit::new(json!({ "status": status.as_str() }))
+pub fn index_status(status: crate::firehose::index_request::IndexStatus, caught_up: bool) -> PublicEmit<Value> {
+    PublicEmit::new(json!({ "status": status.as_str(), "caughtUp": caught_up }))
 }
 
 /// The caller's membership as `app.nearhorizon.actor.getMembership`

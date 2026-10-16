@@ -149,6 +149,17 @@ read_fetch_rate_per_host = 25
 # calls per second to one PDS host, and how many hosts are tracked at once.
 public_fallback_rate_per_host = 25.0
 max_public_fallback_hosts = 100000
+# requestRecord's catch-up listings (private posting §3.8). Never waits: no
+# token stops the catch-up and the answer says caughtUp: false.
+catch_up_rate_per_host = 10
+
+# requestRecord's catch-up (private posting §3.8): after indexing the record,
+# a ready member or private owner's authorization collections are listed and
+# applied_rev advanced, so the caller's private posts read at once. At most
+# one catch-up per account in this interval, and this many pages in all.
+[index_request]
+catch_up_min_interval_secs = 10
+catch_up_max_pages = 8
 
 [db]
 # Backstop against lock waits (design §6.11.7); a timeout is a transient failure.

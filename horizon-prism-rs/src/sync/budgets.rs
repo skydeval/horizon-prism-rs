@@ -1,11 +1,12 @@
-//! Per-PDS-host request budgets (design-v2 §6.11.3): three independent token
-//! buckets per host, so no class can starve or delay another (#158).
+//! Per-PDS-host request budgets (design-v2 §6.11.3): independent token
+//! buckets per host and class, so no class can starve or delay another (#158).
 //!
 //! | Class | Rate | When empty |
 //! |---|---|---|
 //! | [`Class::Probe`] | `ceil(tracked_on_host / (0.75 × head_max_age_secs))`, capped at `sync.max_probe_rate_per_host` | waits |
 //! | [`Class::ReadFetch`] | `sync.read_fetch_rate_per_host` | never waits: the caller misses |
 //! | [`Class::Backfill`] | `backfill.per_pds_rate_per_sec` | waits |
+//! | [`Class::CatchUp`] | `sync.catch_up_rate_per_host` | never waits: the catch-up stops (private posting §3.8) |
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,6 +18,8 @@ pub enum Class {
     Probe,
     ReadFetch,
     Backfill,
+    /// `requestRecord`'s catch-up listing (private posting §3.8).
+    CatchUp,
 }
 
 /// One token bucket. Capacity equals the per-second rate (at least 1).
@@ -70,6 +73,8 @@ pub struct BudgetRates {
     pub read_fetch_per_host: f64,
     /// `backfill.per_pds_rate_per_sec`.
     pub backfill_per_host: f64,
+    /// `sync.catch_up_rate_per_host`.
+    pub catch_up_per_host: f64,
 }
 
 impl BudgetRates {
@@ -82,6 +87,7 @@ impl BudgetRates {
             head_max_age_secs: sync.head_max_age_secs as f64,
             read_fetch_per_host: f64::from(sync.read_fetch_rate_per_host),
             backfill_per_host: f64::from(cfg.file.backfill.per_pds_rate_per_sec),
+            catch_up_per_host: f64::from(sync.catch_up_rate_per_host),
         }
     }
 }
@@ -154,6 +160,7 @@ impl HostBudgets {
                 .unwrap_or(1.0),
             Class::ReadFetch => self.rates.read_fetch_per_host,
             Class::Backfill => self.rates.backfill_per_host,
+            Class::CatchUp => self.rates.catch_up_per_host,
         }
     }
 
@@ -194,6 +201,7 @@ mod tests {
             head_max_age_secs: 60.0,
             read_fetch_per_host: 20.0,
             backfill_per_host: 5.0,
+            catch_up_per_host: 10.0,
         }
     }
 
@@ -220,6 +228,13 @@ mod tests {
         assert!(b.try_acquire("pds.a", Class::Backfill));
         assert!(b.try_acquire("pds.a", Class::Probe));
         assert!(b.try_acquire("pds.b", Class::ReadFetch));
+        // The catch-up class never waits either (private posting §3.8).
+        let mut granted = 0;
+        while b.try_acquire("pds.a", Class::CatchUp) {
+            granted += 1;
+        }
+        assert_eq!(granted, 10);
+        assert!(b.try_acquire("pds.a", Class::Backfill));
     }
 
     #[tokio::test]

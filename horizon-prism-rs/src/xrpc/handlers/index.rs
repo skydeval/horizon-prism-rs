@@ -10,9 +10,12 @@
 //! - Validation, each its own `400 InvalidRequest` message (#232): the URI's
 //!   repo must be the caller's DID; its collection must classify as
 //!   `Ecosystem(_)` or `Kryphocron(_)`.
-//! - Output: `{status: "indexed" | "deleted" | "out_of_scope" | "unchanged"}`.
-//!   The answer concerns only the caller's own record, so it is not an
-//!   enumeration surface.
+//! - Output: `{status: "indexed" | "deleted" | "out_of_scope" | "unchanged",
+//!   caughtUp}`. `caughtUp` (private posting §3.8): after indexing, the
+//!   caller's authorization collections are listed by `catch_up`, which may
+//!   advance the caller's `applied_rev` to the rev fetched; true when it is
+//!   there afterwards. The answer concerns only the caller's own record and
+//!   repository, so it is not an enumeration surface.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,7 +30,7 @@ use super::XrpcResult;
 use crate::db::locks::uri_author;
 use crate::firehose::backfill::BackfillSource;
 use crate::firehose::classifier::{RecordClass, classify};
-use crate::firehose::index_request::{IndexError, index_record};
+use crate::firehose::index_request::{CatchUp, IndexError, catch_up, index_record};
 use crate::firehose::writer::Writer;
 use crate::hydration::hint::index_status;
 use crate::xrpc::AppState;
@@ -49,6 +52,8 @@ pub struct IndexState {
     pub writer: Writer,
     /// `firehose.deterministic_attempts`.
     pub attempts: u32,
+    /// The catch-up after the record is indexed (private posting §3.8).
+    pub catch_up: CatchUp,
 }
 
 /// `at://did/collection/rkey` → its three parts.
@@ -81,7 +86,10 @@ pub async fn request_record(
         return Err(XrpcError::invalid(UNSUPPORTED_COLLECTION));
     }
     match index_record(s.source.as_ref(), &s.writer, repo, collection, rkey, s.attempts, false).await {
-        Ok(indexed) => Ok(Json(index_status(indexed.status))),
+        Ok(indexed) => {
+            let caught_up = catch_up(s.source.as_ref(), &s.writer, &s.catch_up, repo, &indexed.pds, &indexed.rev).await;
+            Ok(Json(index_status(indexed.status, caught_up)))
+        }
         Err(IndexError::Fetch(error)) => {
             tracing::info!(event = "request_record_fetch_failed", repo, %error, "the caller's PDS did not answer");
             Err(XrpcError::new(StatusCode::BAD_GATEWAY, "UpstreamFailure", "Could not fetch the record from its PDS"))
@@ -103,6 +111,7 @@ mod tests {
     use crate::aggregations::{ScopeSets, ScopeState};
     use crate::config::ScopePolicy;
     use crate::firehose::backfill::{ListPage, ListedRecord, PrepareError};
+    use crate::firehose::index_request::{CATCH_UP_DEADLINE, CatchUpConfig};
     use crate::hydration::testing::{hydrator, post};
     use crate::kryphocron_glue::jwt::tests::{AUDIENCE_HOST, StubFetcher, mint, signing_key, verifier};
     use crate::microcosm::LinksPage;
@@ -170,6 +179,13 @@ mod tests {
             source: Arc::new(Pds),
             writer: Writer::new(p.clone(), scope, Arc::new(DisabledPrivateTier)),
             attempts: 3,
+            catch_up: CatchUp::new(CatchUpConfig {
+                min_interval: std::time::Duration::from_secs(10),
+                max_pages: 8,
+                reconcile_confirm_limit: 50,
+                attempts: 3,
+                deadline: CATCH_UP_DEADLINE,
+            }),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -198,6 +214,8 @@ mod tests {
         // Happy path: fetched from the PDS, admitted, indexed.
         let (status, v) = call(MEMBER, 3, post_uri(MEMBER, "keep1")).await;
         assert_eq!((status, v["status"].as_str()), (200, Some("indexed")), "{v}");
+        // A member that is not ready gets no catch-up (private posting §3.8).
+        assert_eq!(v["caughtUp"], json!(false), "{v}");
         let text: String = sqlx::query_scalar("SELECT text FROM posts WHERE uri = $1")
             .bind(post_uri(MEMBER, "keep1"))
             .fetch_one(p)

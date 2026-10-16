@@ -40,7 +40,7 @@ mod schema;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -158,6 +158,8 @@ pub const FEATURES: &[&str] = &[
     "private.interactions",
     // P-9 private notifications (S6).
     "private.notifications",
+    // P-11 `requestRecord` catch-up and `caughtUp` (S7).
+    "private.freshIndex",
     // Rule 4's anchored walk (S0, listed from S1).
     "private.crossPdsReplies",
 ];
@@ -235,6 +237,10 @@ pub trait PrivateTier: Send + Sync {
     /// `readiness::mark_owner_ready` (§5.10). A no-op for a non-owner.
     async fn mark_owner_ready(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error>;
 
+    /// Whether `did`'s owner readiness is set, on the caller's connection
+    /// (private posting §3.8: catch-up's checks and settle).
+    async fn owner_ready(&self, conn: &mut PgConnection, did: &str) -> Result<bool, sqlx::Error>;
+
     /// URIs of `did`'s local rows in `nsid` with `rev < below_rev`: the
     /// reconcile candidates for a private collection (§5.10).
     async fn local_uris(
@@ -244,6 +250,12 @@ pub trait PrivateTier: Send + Sync {
         nsid: &str,
         below_rev: &str,
     ) -> Result<Vec<String>, sqlx::Error>;
+
+    /// URI → CID of `did`'s stored rows in `nsid` where the row keeps a CID
+    /// (private posts and audiences); empty for any other collection.
+    /// Catch-up skips a listed record whose CID is stored (private posting
+    /// §3.8).
+    async fn stored_cids(&self, conn: &mut PgConnection, did: &str, nsid: &str) -> Result<HashMap<String, String>, sqlx::Error>;
 
     /// `ingest::purge_did` (account deletion), at most `limit` rows. Returns
     /// the rows deleted; the caller repeats until 0.
@@ -354,6 +366,10 @@ impl PrivateTier for KryphocronPrivateTier {
         readiness::mark_owner_ready(conn, did).await
     }
 
+    async fn owner_ready(&self, conn: &mut PgConnection, did: &str) -> Result<bool, sqlx::Error> {
+        readiness::owner_ready_on(conn, did).await
+    }
+
     async fn local_uris(
         &self,
         conn: &mut PgConnection,
@@ -362,6 +378,10 @@ impl PrivateTier for KryphocronPrivateTier {
         below_rev: &str,
     ) -> Result<Vec<String>, sqlx::Error> {
         ingest::local_uris(conn, did, nsid, below_rev).await
+    }
+
+    async fn stored_cids(&self, conn: &mut PgConnection, did: &str, nsid: &str) -> Result<HashMap<String, String>, sqlx::Error> {
+        ingest::stored_cids(conn, did, nsid).await
     }
 
     async fn purge_did_batch(&self, conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
@@ -488,6 +508,10 @@ impl PrivateTier for DisabledPrivateTier {
         Ok(())
     }
 
+    async fn owner_ready(&self, _conn: &mut PgConnection, _did: &str) -> Result<bool, sqlx::Error> {
+        Ok(false)
+    }
+
     async fn local_uris(
         &self,
         _conn: &mut PgConnection,
@@ -496,6 +520,10 @@ impl PrivateTier for DisabledPrivateTier {
         _below_rev: &str,
     ) -> Result<Vec<String>, sqlx::Error> {
         Ok(Vec::new())
+    }
+
+    async fn stored_cids(&self, _conn: &mut PgConnection, _did: &str, _nsid: &str) -> Result<HashMap<String, String>, sqlx::Error> {
+        Ok(HashMap::new())
     }
 
     async fn purge_did_batch(&self, _conn: &mut PgConnection, _did: &str, _limit: i64) -> Result<u64, sqlx::Error> {

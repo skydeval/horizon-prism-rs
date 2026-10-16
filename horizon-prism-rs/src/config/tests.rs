@@ -150,6 +150,11 @@ max_probe_rate_per_host = 25
 read_fetch_rate_per_host = 25
 public_fallback_rate_per_host = 25.0
 max_public_fallback_hosts = 100000
+catch_up_rate_per_host = 10
+
+[index_request]
+catch_up_min_interval_secs = 10
+catch_up_max_pages = 8
 
 [db]
 lock_timeout_secs = 30
@@ -879,6 +884,9 @@ fn zero_values_that_break_runtime_are_rejected() {
         ("private_read", "membership_retry_after_secs"),
         ("backfill", "concurrency"),
         ("sync", "read_fetch_rate_per_host"),
+        ("sync", "catch_up_rate_per_host"),
+        ("index_request", "catch_up_min_interval_secs"),
+        ("index_request", "catch_up_max_pages"),
         ("storage", "budget_bytes"),
         ("identity", "jwt_issuer_tracker_max"),
     ] {

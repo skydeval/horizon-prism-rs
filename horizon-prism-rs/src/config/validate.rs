@@ -353,7 +353,7 @@ fn urls(cfg: &FileConfig, out: &mut Vec<String>) {
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 28] = [
+    let nonzero: [(&str, u64); 31] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
         ("firehose.deterministic_attempts", u64::from(cfg.firehose.deterministic_attempts)),
         ("identity.did_fresh_secs", cfg.identity.did_fresh_secs),
@@ -373,6 +373,9 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
         ("private_read.floor_ms.get_unread_count", cfg.private_read.floor_ms.get_unread_count),
         ("sync.max_probe_rate_per_host", u64::from(cfg.sync.max_probe_rate_per_host)),
         ("sync.read_fetch_rate_per_host", u64::from(cfg.sync.read_fetch_rate_per_host)),
+        ("sync.catch_up_rate_per_host", u64::from(cfg.sync.catch_up_rate_per_host)),
+        ("index_request.catch_up_min_interval_secs", cfg.index_request.catch_up_min_interval_secs),
+        ("index_request.catch_up_max_pages", u64::from(cfg.index_request.catch_up_max_pages)),
         ("backfill.concurrency", u64::from(cfg.backfill.concurrency)),
         ("backfill.per_pds_rate_per_sec", u64::from(cfg.backfill.per_pds_rate_per_sec)),
         ("counts.refresh_rate_per_sec", u64::from(cfg.counts.refresh_rate_per_sec)),
