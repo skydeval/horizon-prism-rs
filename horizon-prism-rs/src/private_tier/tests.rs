@@ -166,6 +166,10 @@ impl Fixture {
     }
 
     fn state_of(&self, app: AppState, watermark_age: Option<Duration>, floor: Duration) -> PrivateState {
+        self.state_of_keyed(app, watermark_age, floor, &TEST_CURSOR_KEY)
+    }
+
+    fn state_of_keyed(&self, app: AppState, watermark_age: Option<Duration>, floor: Duration, cursor_key: &[u8; 32]) -> PrivateState {
         let watermarks = Watermarks::new(BTreeMap::new(), vec![RELAY.into()]);
         if let Some(age) = watermark_age {
             watermarks.observe(RELAY, Utc::now() - chrono::Duration::from_std(age).expect("age"));
@@ -185,6 +189,7 @@ impl Fixture {
                 get_quotes: ms,
                 list_notifications: ms,
                 get_unread_count: ms,
+                get_replies: ms,
             },
         };
         PrivateState::new(
@@ -195,8 +200,13 @@ impl Fixture {
             Duration::from_secs(120),
             16,
             &cfg,
-            CursorKey::new(&TEST_CURSOR_KEY),
+            CursorKey::new(cursor_key),
         )
+    }
+
+    /// [`Self::state`] with another private cursor key (a rotated key, T-19).
+    fn state_keyed(&self, cursor_key: &[u8; 32]) -> PrivateState {
+        self.state_of_keyed(self.app.clone(), Some(Duration::from_secs(1)), FLOOR, cursor_key)
     }
 
     /// Encode `text` with the real hooks, as Aurora-Locus would write it.
@@ -1065,24 +1075,77 @@ enum Middle {
     Throttled,
 }
 
-/// Dave's `getPosts([R])`, `getPostThread(R)` and timeline, as bytes,
-/// (private posting S5) `getPosts([T])` with T's `replyCount` and
-/// `quoteCount`, and (S6) his private `listNotifications` and
-/// `getUnreadCount` after R mentions him.
-async fn reader_outputs(w: &Walk, r: &str) -> Vec<(u16, String)> {
+/// Labelled outputs: label, status, body.
+type Outputs = Vec<(&'static str, u16, String)>;
+/// [`Outputs`] by mute state.
+type MuteRuns = Vec<(String, Outputs)>;
+
+/// T-23's outputs (§7.1), each labelled, as status and bytes: Dave's
+/// `getPosts([R])`, `getPostThread(R)`, `getReplies(T)`, `getPosts([T])`
+/// (with T's `replyCount` and `quoteCount`), `getPostThread(T)`, timeline,
+/// **Carol's** author feed under both filters, `listNotifications` and
+/// `getUnreadCount` (R mentions him); and, with `alice`, Alice's
+/// notifications for R.
+async fn reader_outputs(w: &Walk, r: &str, alice: bool) -> Outputs {
     let mut out = Vec::new();
-    for (method, query) in [
-        (POSTS, format!("uris={r}")),
-        (THREAD, format!("uri={r}")),
-        (TIMELINE, String::new()),
-        (POSTS, format!("uris={}", w.root)),
-        (LIST_NOTIFICATIONS, String::new()),
-        (GET_UNREAD_COUNT, String::new()),
+    for (label, method, query) in [
+        ("getPosts([R])", POSTS, format!("uris={r}")),
+        ("getPostThread(R)", THREAD, format!("uri={r}")),
+        ("getReplies(T)", GET_REPLIES, format!("uri={}", w.root)),
+        ("getPosts([T])", POSTS, format!("uris={}", w.root)),
+        ("getPostThread(T)", THREAD, format!("uri={}", w.root)),
+        ("timeline", TIMELINE, String::new()),
+        ("Carol's posts_and_author_threads", FEED, format!("actor={CAROL}&filter=posts_and_author_threads")),
+        ("Carol's posts_with_replies", FEED, format!("actor={CAROL}&filter=posts_with_replies")),
+        ("listNotifications", LIST_NOTIFICATIONS, String::new()),
+        ("getUnreadCount", GET_UNREAD_COUNT, String::new()),
     ] {
         let (status, body, _) = get(&w.base, method, &query, DAVE, DAVE_KEY).await;
-        out.push((status, body));
+        out.push((label, status, body));
+    }
+    if alice {
+        let (status, body, _) = get(&w.base, LIST_NOTIFICATIONS, "", ALICE, ALICE_KEY).await;
+        let v: Value = serde_json::from_str(&body).expect("json");
+        let for_r: Vec<&Value> = v["notifications"].as_array().expect("notifications").iter().filter(|n| n["uri"] == r).collect();
+        out.push(("Alice's notifications for R", status, json!(for_r).to_string()));
     }
     out
+}
+
+/// One output of [`reader_outputs`] by its label.
+fn output<'a>(outputs: &'a [(&'static str, u16, String)], label: &str) -> &'a str {
+    outputs.iter().find(|(l, ..)| *l == label).map(|(_, _, body)| body.as_str()).expect(label)
+}
+
+/// [`reader_outputs`] under each mute state of T-23: none; Dave has muted
+/// T; Dave has muted M's URI; Alice has muted M's claimed root, T. Each
+/// mute is lifted after its run.
+async fn outputs_under_mutes(w: &Walk, r: &str, m: &str, alice: bool) -> MuteRuns {
+    let viewer = |did: &str| crate::hydration::Viewer {
+        did: Some(did.into()),
+        hydrate: true,
+    };
+    let mut runs = vec![("no mute".to_string(), reader_outputs(w, r, alice).await)];
+    for (who, root, label) in [(DAVE, w.root.as_str(), "Dave mutes T"), (DAVE, m, "Dave mutes M"), (ALICE, w.root.as_str(), "Alice mutes M's root")] {
+        let h = &w.f.app.hydrator;
+        h.set_thread_mute(&viewer(who), root, true).await.expect("db").expect("muted");
+        runs.push((label.to_string(), reader_outputs(w, r, alice).await));
+        h.set_thread_mute(&viewer(who), root, false).await.expect("db").expect("unmuted");
+    }
+    runs
+}
+
+/// Records each output that differs between (a) and (b).
+fn compare_fixtures(failures: &mut Vec<String>, a: &MuteRuns, b: &MuteRuns) {
+    assert_eq!(a.len(), b.len());
+    for ((state, with_m), (_, without_m)) in a.iter().zip(b) {
+        assert_eq!(with_m.len(), without_m.len());
+        for (x, y) in with_m.iter().zip(without_m) {
+            if x != y {
+                failures.push(format!("{state}, {}: (a) and (b) differ:\n{x:?}\n{y:?}", x.0));
+            }
+        }
+    }
 }
 
 /// `reader`'s `(replyCount, quoteCount)` on the fixture's root.
@@ -1091,8 +1154,14 @@ async fn root_counts(w: &Walk, reader: &str) -> (Option<i64>, Option<i64>) {
     (t["replyCount"].as_i64(), t["quoteCount"].as_i64())
 }
 
-/// T-23 pair 2, S0's part: the walk is reader-relative. A step Dave cannot
-/// read ends the walk exactly as a missing step does.
+/// T-23 pair 2, run in full (S8): the walk is reader-relative. A step Dave
+/// cannot read ends the walk exactly as a missing step does, in every
+/// output of [`reader_outputs`] under every mute state.
+///
+/// Alice's notifications for R are compared only where M is unreadable to
+/// her too (`Takedown`, `Unlisted`): when only Dave is blocked, Alice reads
+/// M, so R hangs from her post for her in (a) and is hers to read, and
+/// not in (b).
 async fn pair_two(test: &str, middle: Middle) {
     let (mode, members): (&str, &[&str]) = match middle {
         Middle::Unlisted => ("list", &[DAVE, CAROL]),
@@ -1136,25 +1205,131 @@ async fn pair_two(test: &str, middle: Middle) {
         w.finish().await;
         return;
     }
+    // Alice reads R in (a) only when she reads M (see above).
+    let alice = middle != Middle::BlocksReader;
     w.expect("(a) R's author", CAROL, &r, true).await;
     w.expect("(a) R", DAVE, &r, false).await;
+    w.expect("(a) R for Alice", ALICE, &r, !alice).await;
     let counts = root_counts(&w, DAVE).await;
     if counts != (Some(0), Some(0)) {
         w.failures.push(format!("(a): T's (replyCount, quoteCount) for Dave {counts:?}"));
     }
-    let with_m = reader_outputs(&w, &r).await;
-    // R's mention of Dave is neither listed nor counted (S6).
-    let notified = (with_m[4].1.as_str(), with_m[5].1.as_str());
+    let with_m = outputs_under_mutes(&w, &r, &m, alice).await;
+    // R's mention of Dave is neither listed nor counted (S6), and nothing
+    // of R shows in his reads of T or Carol's feed (S8).
+    let unmuted = &with_m[0].1;
+    let notified = (output(unmuted, "listNotifications"), output(unmuted, "getUnreadCount"));
     if notified != (r#"{"notifications":[]}"#, r#"{"count":0}"#) {
         w.failures.push(format!("(a): Dave's notifications show R: {notified:?}"));
+    }
+    for label in ["getReplies(T)", "Carol's posts_and_author_threads", "Carol's posts_with_replies"] {
+        let body = output(unmuted, label);
+        if body.contains(&r) || body.contains("cursor") {
+            w.failures.push(format!("(a): {label} shows R or a cursor: {body}"));
+        }
     }
     // (b): M does not exist.
     w.f.apply_op(BOB, Action::Delete, NSID_POST_PRIVATE, "3kmiddle2222", REV2, None).await;
     w.expect("(b) R's author", CAROL, &r, true).await;
     w.expect("(b) R", DAVE, &r, false).await;
-    let without_m = reader_outputs(&w, &r).await;
-    if with_m != without_m {
-        w.failures.push(format!("(a) and (b) differ for Dave:\n{with_m:?}\n{without_m:?}"));
+    w.expect("(b) R for Alice", ALICE, &r, false).await;
+    let without_m = outputs_under_mutes(&w, &r, &m, alice).await;
+    compare_fixtures(&mut w.failures, &with_m, &without_m);
+    w.finish().await;
+}
+
+/// T-23 pair 1, in full (S8): another audience, the root rule. Alice's
+/// root T is readable by Dave. Carol's reply R, under Carol's own audience
+/// of Dave and Alice, has `reply.parent = M` and `reply.root = T`.
+/// - (a) M is Bob's reply to T under Bob's `list` audience, which excludes
+///   Dave (and Alice); (b) M does not exist. Every output of
+///   [`reader_outputs`], Alice's notifications for R included, is
+///   byte-identical between them under every mute state, and
+///   `threadMuted` follows the claimed root T in both.
+/// - A forged root: Carol's R' replies to T claiming `reply.root = X`, Bob's
+///   post. Bob gets the root notification; a mute of T misses R'; X's gate
+///   (`allow: []`, hiding Carol's reply K to R') sets `replyDisabled` and
+///   hides K in views anchored at R' for Dave, who reads X, and not for
+///   Alice, who does not, nor for Carol, K's author.
+#[tokio::test]
+async fn t23_pair_one_root_rule() {
+    let Some(mut w) = Walk::new("t23-pair1", Layout::SamePds, Some("followers"), &[]).await else {
+        return;
+    };
+    let root = w.root.clone();
+    for did in [BOB, CAROL] {
+        exec(&w.f.pool, &follow_sql(DAVE, did)).await;
+    }
+    let bob_aud = w.f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL]).await;
+    let carol_aud = w.f.audience(CAROL, "3kaudcarol22", Some("list"), &[DAVE, ALICE]).await;
+    // M replies to T and quotes it, so it would count in T's counts.
+    let mut m_extra = quote_of(&root);
+    m_extra["reply"] = json!({"root": {"uri": root, "cid": "bafyroot"}, "parent": {"uri": root, "cid": "bafyparent"}});
+    let m = w.f.post_with(BOB, "3kmiddle2222", &bob_aud, m_extra).await;
+    let mut r_record = w.f.post_record(CAROL, "3kleaf222222", &carol_aud, Some((&root, &m))).await;
+    r_record["facets"] = json!([mention(DAVE)]);
+    w.f.ingest(CAROL, NSID_POST_PRIVATE, "3kleaf222222", r_record).await;
+    let r = format!("at://{CAROL}/{NSID_POST_PRIVATE}/3kleaf222222");
+    // The forged root: Bob's X, read by Dave and Carol, not Alice.
+    let x_aud = w.f.audience(BOB, "3kaudbobx222", Some("list"), &[DAVE, CAROL]).await;
+    let x = w.f.private_post(BOB, "3kxroot22222", &x_aud, None).await;
+    let r_forged = w.f.private_post(CAROL, "3kforgedroot", &carol_aud, Some((&x, &root))).await;
+    let k = w.f.private_post(CAROL, "3kforgedkid2", &carol_aud, Some((&x, &r_forged))).await;
+    w.f.ingest(BOB, THREADGATE, "3kxroot22222", json!({"$type": THREADGATE, "post": x, "allow": [], "hiddenReplies": [k]})).await;
+    w.f.ready_all().await;
+
+    for reader in [CAROL, DAVE, ALICE] {
+        w.expect("(a) R", reader, &r, true).await;
+    }
+    w.expect("(a) M", DAVE, &m, false).await;
+    w.expect("(a) M", ALICE, &m, false).await;
+    let with_m = outputs_under_mutes(&w, &r, &m, true).await;
+    // Dave reads R: it is listed, and his mute of T reaches it through the
+    // claimed root.
+    let unmuted = &with_m[0].1;
+    assert!(output(unmuted, "listNotifications").contains(&r), "{unmuted:?}");
+    assert!(output(&with_m[0].1, "Alice's notifications for R").contains(&r), "Alice reads R");
+    let muted_t = &with_m[1].1;
+    let posts: Value = serde_json::from_str(output(muted_t, "getPosts([R])")).expect("json");
+    if posts["posts"][0]["viewer"]["threadMuted"] != true {
+        w.failures.push(format!("(a): Dave's mute of T does not reach R: {posts}"));
+    }
+    // (b): M does not exist.
+    w.f.apply_op(BOB, Action::Delete, NSID_POST_PRIVATE, "3kmiddle2222", REV2, None).await;
+    w.expect("(b) R", DAVE, &r, true).await;
+    let without_m = outputs_under_mutes(&w, &r, &m, true).await;
+    let posts: Value = serde_json::from_str(output(&without_m[1].1, "getPosts([R])")).expect("json");
+    if posts["posts"][0]["viewer"]["threadMuted"] != true {
+        w.failures.push(format!("(b): Dave's mute of T does not reach R: {posts}"));
+    }
+    compare_fixtures(&mut w.failures, &with_m, &without_m);
+
+    // The forged root. X's author is notified as the root's.
+    let bobs = private_rows(&w.f.pool, BOB).await;
+    assert!(bobs.contains(&notified("reply", CAROL, Some(&x), &r_forged, false)), "{bobs:?}");
+    // A mute of T misses R'.
+    let dave = crate::hydration::Viewer {
+        did: Some(DAVE.into()),
+        hydrate: true,
+    };
+    w.f.app.hydrator.set_thread_mute(&dave, &root, true).await.expect("db").expect("muted");
+    let (_, p) = posts_of(&w.base, DAVE, &[&r_forged]).await;
+    assert!(p[0]["viewer"].get("threadMuted").is_none(), "{}", p[0]);
+    w.f.app.hydrator.set_thread_mute(&dave, &root, false).await.expect("db").expect("unmuted");
+    // X's gate, in views anchored at R': for Dave, who reads X, K is
+    // hidden and replies are disabled; for Alice, who does not read X, and
+    // for Carol, K's author, K shows.
+    let (_, t) = thread_of(&w.base, DAVE, &format!("uri={r_forged}")).await;
+    assert_eq!(reply_uris(&t), Vec::<String>::new(), "{t}");
+    assert_eq!(t["post"]["viewer"]["replyDisabled"], true, "{t}");
+    let (body, _, _) = json_of(&w.base, GET_REPLIES, &format!("uri={r_forged}"), DAVE).await;
+    assert_eq!(body, r#"{"replies":[]}"#);
+    let (_, t) = thread_of(&w.base, ALICE, &format!("uri={r_forged}")).await;
+    assert_eq!(reply_uris(&t), std::slice::from_ref(&k));
+    assert!(t["post"]["viewer"].get("replyDisabled").is_none(), "{t}");
+    for reader in [ALICE, CAROL] {
+        let (_, v, _) = json_of(&w.base, GET_REPLIES, &format!("uri={r_forged}"), reader).await;
+        assert_eq!(v["replies"][0]["post"]["uri"], k.as_str(), "{reader}: {v}");
     }
     w.finish().await;
 }
@@ -2047,7 +2222,7 @@ async fn private_router_methods_are_routed_in_every_mode() {
         .copied()
         .filter(|(n, _)| n.starts_with("app.nearhorizon.private."))
         .collect();
-    assert_eq!(methods.len(), 9);
+    assert_eq!(methods.len(), 10);
     for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
         set_mode(app.hydrator.scope(), mode).await;
         for &(nsid, verb) in &methods {
@@ -3482,4 +3657,336 @@ async fn catch_up_is_bounded_and_settles_only_a_clean_listing() {
     assert!(repo.lists() > listed_before);
     assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(R3));
     db.drop_db().await;
+}
+
+// Sealed feed cursors, the author feed filter and paged replies (private
+// posting §3.6, §4.12-§4.14; S8: P-17, P-20, P-6/P-14).
+
+const GET_REPLIES: &str = "app.nearhorizon.private.getReplies";
+
+impl Fixture {
+    /// A post by `author` under `audience` that no one can read, its author
+    /// included: content encoded for another rkey. It passes the prefilter
+    /// and misses in the pipeline.
+    async fn undecodable(&self, author: &str, rkey: &str, audience: &str, reply: Option<(&str, &str)>) -> String {
+        let record = self.post_record(author, "3kencodedfor", audience, reply).await;
+        self.ingest(author, NSID_POST_PRIVATE, rkey, record).await;
+        format!("at://{author}/{NSID_POST_PRIVATE}/{rkey}")
+    }
+}
+
+/// Every page of `method?query` for `reader`, following the cursor, at
+/// most `max` pages.
+async fn pages(base: &str, method: &str, query: &str, reader: &str, max: usize) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut next = query.to_string();
+    for _ in 0..max {
+        let (_, page, _) = json_of(base, method, &next, reader).await;
+        let cursor = page["cursor"].as_str().map(|c| format!("{query}&cursor={c}"));
+        out.push(page);
+        match cursor {
+            Some(c) => next = c,
+            None => break,
+        }
+    }
+    out
+}
+
+/// The URIs of a feed page's items.
+fn feed_uris(page: &Value) -> Vec<String> {
+    page["feed"].as_array().expect("feed").iter().map(|i| i["uri"].as_str().expect("uri").to_string()).collect()
+}
+
+/// The URIs of a `getReplies` page's top-level nodes.
+fn replies_uris(page: &Value) -> Vec<String> {
+    page["replies"].as_array().expect("replies").iter().map(|n| n["post"]["uri"].as_str().expect("uri").to_string()).collect()
+}
+
+/// T-19 (P-17), in On and in Off (T-1).
+/// - An author with `limit × 8 + 1` posts that do not decode before three
+///   readable ones: on the author feed and on the timeline, the first page
+///   is empty and carries a cursor, and paging reaches every readable post
+///   once, in order. Exhausted candidates: no cursor. Every cursor is 720
+///   characters (a `did:web` author's: `cursor.rs`'s test).
+/// - A cursor opened by another caller, for another actor, method or
+///   filter, under a rotated key, or an unsealed one from before: 400. An
+///   absent filter and the explicit default bind alike.
+/// - An author whose only posts are taken down: empty, no cursor, the
+///   bytes of an unknown actor.
+async fn sealed_paging_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL]).await;
+    // Every post has one `createdAt`, so the record key orders them: the
+    // undecodable ones are the newest.
+    let mut readable = Vec::new();
+    for i in 0..3 {
+        readable.push(f.private_post(ALICE, &format!("3kread0000{i}2"), &aud, None).await);
+    }
+    readable.reverse();
+    for i in 0..9 {
+        f.undecodable(ALICE, &format!("3kundec000{i}2"), &aud, None).await;
+    }
+    exec(&f.pool, &follow_sql(BOB, ALICE)).await;
+    let dave_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[BOB]).await;
+    let mut taken_down = Vec::new();
+    for rkey in ["3kdown000012", "3kdown000022"] {
+        taken_down.push(f.private_post(DAVE, rkey, &dave_aud, None).await);
+    }
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    for (method, query) in [(FEED, format!("actor={ALICE}&limit=1")), (TIMELINE, "limit=1".to_string())] {
+        let all = pages(&base, method, &query, BOB, 20).await;
+        assert!(feed_uris(&all[0]).is_empty(), "{method}: {}", all[0]);
+        assert!(all[0]["cursor"].is_string(), "{method}: an empty page carries a cursor while candidates remain");
+        let seen: Vec<String> = all.iter().flat_map(feed_uris).collect();
+        assert_eq!(seen, readable, "{method}: paging reaches the readable posts");
+        let (last, before) = all.split_last().expect("pages");
+        assert!(last.get("cursor").is_none(), "{method}: exhausted, no cursor: {last}");
+        for page in before {
+            assert_eq!(page["cursor"].as_str().map(str::len), Some(720), "{method}: sealed and padded");
+        }
+    }
+
+    // Rejected cursors.
+    let (_, first, _) = json_of(&base, FEED, &format!("actor={ALICE}&limit=1"), BOB).await;
+    let cursor = first["cursor"].as_str().expect("cursor").to_string();
+    let rotated = serve(f.state_keyed(&[8; 32])).await;
+    let unsealed = urlencoding("2026-09-26T12:00:00.000000Z::3kundec00082");
+    for (case, at, method, query, reader) in [
+        ("another caller", &base, FEED, format!("actor={ALICE}&limit=1&cursor={cursor}"), CAROL),
+        ("another actor", &base, FEED, format!("actor={DAVE}&limit=1&cursor={cursor}"), BOB),
+        ("another method", &base, TIMELINE, format!("limit=1&cursor={cursor}"), BOB),
+        ("another filter", &base, FEED, format!("actor={ALICE}&limit=1&filter=posts_and_author_threads&cursor={cursor}"), BOB),
+        ("a rotated key", &rotated, FEED, format!("actor={ALICE}&limit=1&cursor={cursor}"), BOB),
+        ("unsealed, from before", &base, FEED, format!("actor={ALICE}&limit=1&cursor={unsealed}"), BOB),
+    ] {
+        let (status, body, _) = get(at, method, &query, reader, key_of(reader)).await;
+        assert_eq!(status, 400, "{case}: {body}");
+        assert!(body.contains("Error: cursor is not valid"), "{case}: {body}");
+    }
+    let (_, page, _) = json_of(&base, FEED, &format!("actor={ALICE}&limit=1&filter=posts_with_replies&cursor={cursor}"), BOB).await;
+    assert!(page["feed"].is_array(), "the explicit default opens the absent filter's cursor");
+
+    // Only taken-down posts: what an unknown actor gives, floored. Before
+    // the takedown Bob reads them.
+    let (_, before, _) = json_of(&base, FEED, &format!("actor={DAVE}"), BOB).await;
+    assert_eq!(feed_uris(&before).len(), 2);
+    for uri in &taken_down {
+        exec(&f.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{uri}', '!takedown')")).await;
+    }
+    let (down, _, took) = json_of(&base, FEED, &format!("actor={DAVE}&limit=1"), BOB).await;
+    let (unknown, _, _) = json_of(&base, FEED, &format!("actor={NOBODY}&limit=1"), BOB).await;
+    assert_eq!((down.as_str(), unknown.as_str()), (r#"{"feed":[]}"#, r#"{"feed":[]}"#));
+    assert!(took >= FLOOR, "{took:?}");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn sealed_feed_cursors_on() {
+    sealed_paging_in(PublicMode::On, "s8-paging-on").await;
+}
+
+#[tokio::test]
+async fn sealed_feed_cursors_off() {
+    sealed_paging_in(PublicMode::Off, "s8-paging-off").await;
+}
+
+/// T-20 (P-20), in On and in Off (T-1): `posts_and_author_threads` gives
+/// Bob's top-level posts and his replies in his own threads, never his
+/// replies in Alice's thread, in full pages though nine such replies are
+/// newer; his repost item shows under both filters. `posts_with_replies`,
+/// and the absent filter, give everything. A cursor fails across filters;
+/// an unknown filter is a 400.
+async fn author_filter_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let alice_aud = f.audience(ALICE, "3kaudalice22", Some("list"), &[BOB, CAROL]).await;
+    let bob_aud = f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL]).await;
+    let t = f.private_post(ALICE, "3ktpost22222", &alice_aud, None).await;
+    let p1 = f.private_post(BOB, "3kbtop000012", &bob_aud, None).await;
+    let p2 = f.private_post(BOB, "3kbtop000022", &bob_aud, None).await;
+    let q1 = f.private_post(BOB, "3kbown000012", &bob_aud, Some((&p1, &p1))).await;
+    let q2 = f.private_post(BOB, "3kbown000022", &bob_aud, Some((&p1, &q1))).await;
+    let mut others = Vec::new();
+    for i in 0..9 {
+        others.push(f.private_post(BOB, &format!("3kzother000{i}"), &bob_aud, Some((&t, &t))).await);
+    }
+    others.reverse();
+    f.ingest(BOB, REPOST, "3krepostt222", subject_record(REPOST, &t, "2026-09-25T00:00:00Z")).await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    let threads = pages(&base, FEED, &format!("actor={BOB}&limit=2&filter=posts_and_author_threads"), CAROL, 10).await;
+    let sizes: Vec<usize> = threads.iter().map(|p| feed_uris(p).len()).collect();
+    assert_eq!(sizes, [2, 2, 1], "full pages: {threads:?}");
+    let seen: Vec<String> = threads.iter().flat_map(feed_uris).collect();
+    assert_eq!(seen, [p2.clone(), p1.clone(), q2.clone(), q1.clone(), t.clone()]);
+    assert_eq!(threads[2]["feed"][0]["reason"]["$type"], "app.bsky.feed.defs#reasonRepost");
+
+    let mut everything = others.clone();
+    everything.extend([p2, p1, q2, q1, t]);
+    let (explicit, v, _) = json_of(&base, FEED, &format!("actor={BOB}&filter=posts_with_replies"), CAROL).await;
+    assert_eq!(feed_uris(&v), everything);
+    let (absent, _, _) = json_of(&base, FEED, &format!("actor={BOB}"), CAROL).await;
+    assert_eq!(absent, explicit);
+
+    let cursor = threads[0]["cursor"].as_str().expect("cursor");
+    for query in [format!("actor={BOB}&limit=2&filter=posts_with_replies&cursor={cursor}"), format!("actor={BOB}&limit=2&cursor={cursor}")] {
+        let (status, body, _) = get(&base, FEED, &query, CAROL, CAROL_KEY).await;
+        assert_eq!(status, 400, "{query}: {body}");
+        assert!(body.contains("Error: cursor is not valid"), "{body}");
+    }
+    for filter in ["posts_no_replies", "posts_with_media", ""] {
+        let (status, body, _) = get(&base, FEED, &format!("actor={BOB}&filter={filter}"), CAROL, CAROL_KEY).await;
+        assert_eq!(status, 400, "{filter}: {body}");
+        assert!(body.contains("Error: filter must be posts_with_replies or posts_and_author_threads"), "{body}");
+    }
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn author_feed_filter_on() {
+    author_filter_in(PublicMode::On, "s8-filter-on").await;
+}
+
+#[tokio::test]
+async fn author_feed_filter_off() {
+    author_filter_in(PublicMode::Off, "s8-filter-off").await;
+}
+
+/// T-21 (P-6/P-14, D-8) and T-10's `getReplies` case, in On and in Off
+/// (T-1).
+/// - A public post, never stored here: its readable private replies,
+///   oldest first, paged; `limit × 8 + 1` undecodable ones first give an
+///   empty first page with a cursor; one Carol cannot read never shows.
+///   The cursor is bound to its `uri`.
+/// - A private post Carol cannot read: `{replies: []}`, floored, the bytes
+///   of a nonexistent post, though her own reply to it exists.
+/// - `depth` 0, 1 and the default 2; bounds.
+/// - The read root's `hiddenReplies` and `replyDisabled` apply to a reply's
+///   replies, except for the hidden reply's author.
+async fn replies_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let alice_aud = f.audience(ALICE, "3kaudalice22", Some("list"), &[BOB, CAROL]).await;
+    let bob_aud = f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL]).await;
+    let carol_aud = f.audience(CAROL, "3kaudcarol22", Some("list"), &[BOB]).await;
+    let dave_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[]).await;
+    let public = format!("at://{ALICE}/{PUBLIC_POST}/3kpublic2222");
+    for i in 0..9 {
+        f.undecodable(BOB, &format!("3kaundec000{i}"), &bob_aud, Some((&public, &public))).await;
+    }
+    let mut readable = Vec::new();
+    for i in 0..3 {
+        readable.push(f.private_post(BOB, &format!("3kreply0000{i}"), &bob_aud, Some((&public, &public))).await);
+    }
+    f.private_post(DAVE, "3kdavereply2", &dave_aud, Some((&public, &public))).await;
+    let dave_post = f.private_post(DAVE, "3kdavepost22", &dave_aud, None).await;
+    let carol_reply = f.private_post(CAROL, "3kcarolreply", &carol_aud, Some((&dave_post, &dave_post))).await;
+    let p = f.private_post(ALICE, "3kprootpost2", &alice_aud, None).await;
+    let r1 = f.private_post(BOB, "3kpr1reply22", &alice_aud, Some((&p, &p))).await;
+    let r2 = f.private_post(CAROL, "3kpr2reply22", &alice_aud, Some((&p, &r1))).await;
+    let r3 = f.private_post(BOB, "3kpr3reply22", &alice_aud, Some((&p, &r2))).await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    // The public post's private replies, paged past the undecodable ones.
+    let all = pages(&base, GET_REPLIES, &format!("uri={public}&limit=1"), CAROL, 20).await;
+    assert!(replies_uris(&all[0]).is_empty() && all[0]["cursor"].is_string(), "{}", all[0]);
+    let seen: Vec<String> = all.iter().flat_map(replies_uris).collect();
+    assert_eq!(seen, readable);
+    assert!(all.last().expect("pages").get("cursor").is_none());
+    let node = &all.iter().find(|p| !replies_uris(p).is_empty()).expect("a hit")["replies"][0];
+    assert_eq!(node["$type"], "app.nearhorizon.private.defs#privateThreadView");
+    assert!(node.get("parent").is_none(), "nothing about the public post: {node}");
+    let cursor = all[0]["cursor"].as_str().expect("cursor");
+    let (status, body, _) = get(&base, GET_REPLIES, &format!("uri={p}&limit=1&cursor={cursor}"), CAROL, CAROL_KEY).await;
+    assert_eq!((status, body.contains("Error: cursor is not valid")), (400, true), "{body}");
+
+    // A private post Carol cannot read: nonexistent, though her reply reads.
+    assert_eq!(posts_of(&base, CAROL, &[&carol_reply]).await.1.len(), 1);
+    let (unreadable, _, took) = json_of(&base, GET_REPLIES, &format!("uri={dave_post}"), CAROL).await;
+    assert!(took >= FLOOR, "{took:?}");
+    let nowhere = format!("at://{DAVE}/{NSID_POST_PRIVATE}/3knothere222");
+    let (nonexistent, _, _) = json_of(&base, GET_REPLIES, &format!("uri={nowhere}"), CAROL).await;
+    assert_eq!((unreadable.as_str(), nonexistent.as_str()), (r#"{"replies":[]}"#, r#"{"replies":[]}"#));
+
+    // Depth.
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={p}&depth=0"), CAROL).await;
+    assert_eq!(replies_uris(&v), std::slice::from_ref(&r1));
+    assert!(v["replies"][0].get("replies").is_none(), "{v}");
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={p}&depth=1"), CAROL).await;
+    assert_eq!(v["replies"][0]["replies"][0]["post"]["uri"], r2.as_str());
+    assert!(v["replies"][0]["replies"][0].get("replies").is_none(), "{v}");
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={p}"), CAROL).await;
+    assert_eq!(v["replies"][0]["replies"][0]["replies"][0]["post"]["uri"], r3.as_str());
+    for query in [format!("uri={p}&depth=7"), format!("uri={p}&limit=0"), format!("uri={p}&limit=51"), String::new()] {
+        let (status, body, _) = get(&base, GET_REPLIES, &query, CAROL, CAROL_KEY).await;
+        assert_eq!(status, 400, "{query}: {body}");
+    }
+
+    // The root's gate: `allow: []`, hiding r2. Read with r1, its claimed
+    // root P is read too.
+    f.ingest(ALICE, THREADGATE, "3kprootpost2", json!({"$type": THREADGATE, "post": p, "allow": [], "hiddenReplies": [r2]})).await;
+    let (body, _, _) = json_of(&base, GET_REPLIES, &format!("uri={r1}"), BOB).await;
+    assert_eq!(body, r#"{"replies":[]}"#, "hidden from Bob");
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={r1}"), CAROL).await;
+    assert_eq!(replies_uris(&v), std::slice::from_ref(&r2), "not from its author");
+    assert_eq!(v["replies"][0]["post"]["viewer"]["replyDisabled"], true);
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={p}"), BOB).await;
+    assert_eq!(replies_uris(&v), std::slice::from_ref(&r1));
+    assert_eq!(v["replies"][0]["replies"], json!([]), "expanded, r2 hidden: {v}");
+    assert_eq!(v["replies"][0]["post"]["viewer"]["replyDisabled"], true);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_replies_on() {
+    replies_in(PublicMode::On, "s8-replies-on").await;
+}
+
+#[tokio::test]
+async fn private_replies_off() {
+    replies_in(PublicMode::Off, "s8-replies-off").await;
+}
+
+/// T-21's caps, in On and in Off (T-1): four replies with 51 children
+/// each, at `depth` 1, give at most 50 children a node and 200 nodes.
+async fn replies_cap_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let root = f.private_post(ALICE, "3kcaproot222", &aud, None).await;
+    for i in 0..4 {
+        let hit = f.private_post(ALICE, &format!("3kcaphit{i}222"), &aud, Some((&root, &root))).await;
+        for j in 0..51 {
+            f.private_post(ALICE, &format!("3kcap{i}kid{j:02}2"), &aud, Some((&root, &hit))).await;
+        }
+    }
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={root}&depth=1"), BOB).await;
+    let children: Vec<usize> = v["replies"].as_array().expect("replies").iter().map(|n| n["replies"].as_array().map_or(0, Vec::len)).collect();
+    assert_eq!(children, [50, 50, 50, 46], "50 a node, 200 nodes in all");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_replies_caps_on() {
+    replies_cap_in(PublicMode::On, "s8-replies-cap-on").await;
+}
+
+#[tokio::test]
+async fn private_replies_caps_off() {
+    replies_cap_in(PublicMode::Off, "s8-replies-cap-off").await;
 }

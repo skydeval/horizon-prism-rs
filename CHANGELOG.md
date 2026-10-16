@@ -12,6 +12,21 @@ commit.
 
 ### Added
 
+- **Sealed feed cursors, an author-feed filter and paged replies
+  (private posting S8, #719; Horizon P-17, P-20, P-6/P-14).**
+  - `getTimeline` and `getAuthorFeed` cursors are sealed and fixed-length,
+    bound to the caller, method, actor and filter. A short or empty page
+    carries a cursor whenever candidates remain; an absent cursor means
+    the end (except when the last examined author's `did:web` is
+    extremely long). Old unsealed cursors get one 400: start the feed over.
+  - `getAuthorFeed` takes `filter`: `posts_with_replies` (default) or
+    `posts_and_author_threads`; any other value is a 400.
+  - New `app.nearhorizon.private.getReplies {uri, limit, cursor, depth}`:
+    the private replies the caller may read to a private or a public post,
+    oldest first, paged, each expanded to `depth`. A private `uri` the
+    caller may not read gives `{replies: []}`. Floor `get_replies` 1200 ms.
+  - `getMembership`'s `features` gains `private.paging`.
+
 - **A just-indexed record is readable at once (private posting S7, #719;
   Horizon P-11).** `app.nearhorizon.index.requestRecord` now also catches
   the caller's own repository up inline: it lists the private-tier

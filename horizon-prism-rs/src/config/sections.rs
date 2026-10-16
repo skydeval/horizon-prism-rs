@@ -290,6 +290,8 @@ pub struct PrivateReadFloors {
     pub list_notifications: u64,
     /// `private.getUnreadCount` (S6).
     pub get_unread_count: u64,
+    /// `private.getReplies` (S8).
+    pub get_replies: u64,
 }
 
 impl Default for PrivateReadFloors {
@@ -307,6 +309,7 @@ impl Default for PrivateReadFloors {
             get_quotes: 1200,
             list_notifications: 1200,
             get_unread_count: 300,
+            get_replies: 1200,
         }
     }
 }

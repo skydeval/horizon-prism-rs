@@ -232,6 +232,7 @@ pub const SERVED: &[Served] = &[
     served("app.nearhorizon.private.listNotifications", Family::Private, false),
     served("app.nearhorizon.private.getUnreadCount", Family::Private, false),
     served("app.nearhorizon.private.updateSeen", Family::Private, false),
+    served("app.nearhorizon.private.getReplies", Family::Private, false),
     served("app.nearhorizon.threadLens.getThread", Family::ThreadLens, false),
     served("app.nearhorizon.threadLens.resolve", Family::ThreadLens, false),
     served("app.nearhorizon.index.requestRecord", Family::IndexRequest, false),

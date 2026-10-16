@@ -467,6 +467,39 @@ pub(super) async fn prefilter_uris(pool: &PgPool, requester: &str, uris: &[Strin
     .await
 }
 
+/// `getReplies`'s candidates (private posting §4.12): up to `limit` private
+/// replies to `parent` passing the prefilter, except `hidden`, oldest first
+/// by `(created_at, uri)`, after the position `after`.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn reply_page_candidates(
+    pool: &PgPool,
+    requester: &str,
+    parent: &str,
+    hidden: &[String],
+    after: Option<(DateTime<Utc>, String)>,
+    limit: i64,
+) -> Result<Vec<(String, DateTime<Utc>)>, sqlx::Error> {
+    let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
+    sqlx::query_as(&format!(
+        "SELECT p.uri, p.created_at FROM {PREFILTER_FROM} \
+         WHERE p.reply_parent_uri = $2 AND NOT (p.uri = ANY($3)) AND {pre} \
+           AND ($4::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") > ($4, $5 COLLATE \"C\")) \
+         ORDER BY p.created_at, p.uri COLLATE \"C\" LIMIT $6",
+        pre = prefilter()
+    ))
+    .bind(requester)
+    .bind(parent)
+    .bind(hidden)
+    .bind(at)
+    .bind(uri)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Up to `limit` replies to `parent` passing the prefilter, oldest first.
 ///
 /// # Errors
@@ -703,7 +736,12 @@ fn not_muted(did: &str) -> String {
 /// The actor's posts passing the prefilter, and the actor's reposts of
 /// private posts that pass it (private posting §4.7) when the actor is a
 /// member with no block either way with the requester, newest first, after
-/// the `created_at::key` cursor.
+/// the position `(created_at, key)`.
+///
+/// With `own_threads` (P-20's `posts_and_author_threads`, §4.14) the
+/// actor's own posts are its top-level posts and its replies in threads
+/// whose **claimed** root is the actor's (C-18); repost items are kept
+/// under both filters, as on the stock feed.
 ///
 /// # Errors
 ///
@@ -712,14 +750,20 @@ pub(super) async fn author_candidates(
     pool: &PgPool,
     requester: &str,
     author: &str,
+    own_threads: bool,
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
 ) -> Result<Vec<FeedCandidate>, sqlx::Error> {
     let (at, key) = after.map_or((None, String::new()), |(a, k)| (Some(a), k));
+    let threads = if own_threads {
+        "AND (p.reply_parent_uri IS NULL OR split_part(p.reply_root_uri, '/', 3) = $2)"
+    } else {
+        ""
+    };
     sqlx::query_as(&format!(
         "(SELECT p.uri, p.created_at, p.rkey COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
           FROM {PREFILTER_FROM} \
-          WHERE p.author_did = $2 AND {pre} \
+          WHERE p.author_did = $2 {threads} AND {pre} \
             AND ($3::timestamptz IS NULL OR (p.created_at, p.rkey COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
           ORDER BY p.created_at DESC, p.rkey COLLATE \"C\" DESC LIMIT $5) \
          UNION ALL \

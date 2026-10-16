@@ -353,7 +353,7 @@ fn urls(cfg: &FileConfig, out: &mut Vec<String>) {
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 31] = [
+    let nonzero: [(&str, u64); 32] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
         ("firehose.deterministic_attempts", u64::from(cfg.firehose.deterministic_attempts)),
         ("identity.did_fresh_secs", cfg.identity.did_fresh_secs),
@@ -371,6 +371,7 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
         ("private_read.floor_ms.get_quotes", cfg.private_read.floor_ms.get_quotes),
         ("private_read.floor_ms.list_notifications", cfg.private_read.floor_ms.list_notifications),
         ("private_read.floor_ms.get_unread_count", cfg.private_read.floor_ms.get_unread_count),
+        ("private_read.floor_ms.get_replies", cfg.private_read.floor_ms.get_replies),
         ("sync.max_probe_rate_per_host", u64::from(cfg.sync.max_probe_rate_per_host)),
         ("sync.read_fetch_rate_per_host", u64::from(cfg.sync.read_fetch_rate_per_host)),
         ("sync.catch_up_rate_per_host", u64::from(cfg.sync.catch_up_rate_per_host)),

@@ -243,6 +243,9 @@ pub enum PrivateResponse {
     /// `getRepostedBy`: `profileView`s of member reposters, public data.
     RepostedBy { uri: String, reposted_by: Vec<Value>, cursor: Option<String> },
     Quotes { uri: String, posts: Vec<QuoteItem>, cursor: Option<String> },
+    /// `getReplies`: one `#privateThreadView` a reply, each with its own
+    /// expanded replies (private posting §4.12).
+    Replies { replies: Vec<ThreadNode>, cursor: Option<String> },
     /// `listNotifications`: the caller's private notifications.
     Notifications { notifications: Vec<NotificationView>, cursor: Option<String>, seen_at: Option<String> },
     /// `getUnreadCount`.
@@ -274,6 +277,10 @@ impl PrivateResponse {
 
     pub(in crate::private_tier) fn quotes(uri: String, posts: Vec<QuoteItem>, cursor: Option<String>) -> Self {
         Self::Quotes { uri, posts, cursor }
+    }
+
+    pub(in crate::private_tier) fn replies(replies: Vec<ThreadNode>, cursor: Option<String>) -> Self {
+        Self::Replies { replies, cursor }
     }
 
     pub(in crate::private_tier) fn bookmarks(bookmarks: Vec<BookmarkView>, cursor: Option<String>) -> Self {
@@ -335,6 +342,12 @@ impl Serialize for PrivateResponse {
                     m.serialize_entry("cursor", c)?;
                 }
                 m.serialize_entry("posts", posts)?;
+            }
+            Self::Replies { replies, cursor } => {
+                m.serialize_entry("replies", replies)?;
+                if let Some(c) = cursor {
+                    m.serialize_entry("cursor", c)?;
+                }
             }
             Self::Notifications { notifications, cursor, seen_at } => {
                 m.serialize_entry("notifications", notifications)?;

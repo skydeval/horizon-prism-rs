@@ -1,0 +1,69 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getReplies",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the private-tier replies to a post that the requester is authorized to read, oldest first, each as a thread node with its own replies expanded `depth` levels below it. The post may be a private-tier post (tools.kryphocron.feed.postPrivate) or a public app.bsky.feed.post. A private post is read for the requester as getPosts reads it; a private post the requester may not read and one that does not exist give the same answer, {replies: []}. A public post is not read: only its private replies are listed, and nothing about the public post is returned. When the thread's root, as the post's record claims it, is a private post the requester may read, the replies its threadgate hides are left out, except for the requester's own. At most 200 nodes; at most 50 replies a node below the first level; deeper levels are reached by calling getReplies on a node. Requires auth by a ready community member. Audiences this AppView resolves: `list` (the audience record's members); `followers` (followers of the audience's owner who are ready members of this AppView, by the follow records it has indexed, which reflect a new follow or an unfollow within about a minute); `everyone` (every ready member of this AppView, not the network); and `nobody`. A `following` audience is not resolved yet and is served to its author only, as is any other mode. A block record or a private block between the reader and the author, or the audience's owner, in either direction, keeps the reader out; a block through a list does not. A post under another account's audience, on any PDS, is served to anyone but its author only when one of its 8 nearest ancestors, walked through stored private posts under the same audience that the reader could read, is that account's post; its author may write there (`list` or no mode: listed in `members`; `followers`: a stored follow of that account; `everyone`: always; any other mode: never); under `followers` and `everyone`, neither its author nor that account blocks the other; and that account is active. A reply more than 8 levels below that account's nearest post is served to its author only.",
+      "parameters": {
+        "type": "params",
+        "required": ["uri"],
+        "properties": {
+          "uri": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "The post whose replies to list: a private-tier post or a public app.bsky.feed.post."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "How many direct replies a page holds.",
+            "default": 30,
+            "minimum": 1,
+            "maximum": 50
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque, sealed pagination cursor from a previous response to the same requester for the same uri. Any other cursor is rejected with InvalidRequest."
+          },
+          "depth": {
+            "type": "integer",
+            "description": "How many levels of replies to include below each direct reply; 0 includes none.",
+            "default": 2,
+            "minimum": 0,
+            "maximum": 6
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["replies"],
+          "properties": {
+            "replies": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "app.nearhorizon.private.defs#privateThreadView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Present whenever more candidates remain; a page may be short or empty and still carry one. Absent at the end, and also, exceptionally, when the last examined position is too long to seal (a reply whose author's did:web is several hundred characters), where the list ends early."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

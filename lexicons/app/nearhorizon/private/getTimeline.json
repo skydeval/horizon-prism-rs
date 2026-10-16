@@ -16,7 +16,7 @@
           },
           "cursor": {
             "type": "string",
-            "description": "Opaque pagination cursor from a previous response."
+            "description": "Opaque, sealed pagination cursor from a previous response to the same requester. Any other cursor, including the unsealed createdAt::key form of earlier versions, is rejected with InvalidRequest; start the feed over."
           }
         }
       },
@@ -37,7 +37,7 @@
             },
             "cursor": {
               "type": "string",
-              "description": "Present only when the page returned at least one item and more candidates remain."
+              "description": "Present whenever more candidates remain; a page may be short or empty and still carry one. Absent at the end of the feed, and also, exceptionally, when the last examined position is too long to seal (an author whose did:web is several hundred characters), where the feed ends early."
             }
           }
         }

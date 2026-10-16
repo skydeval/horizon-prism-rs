@@ -53,6 +53,11 @@ pub const GET_QUOTES: &str = "app.nearhorizon.private.getQuotes";
 pub const LIST_NOTIFICATIONS: &str = "app.nearhorizon.private.listNotifications";
 pub const GET_UNREAD_COUNT: &str = "app.nearhorizon.private.getUnreadCount";
 pub const UPDATE_SEEN: &str = "app.nearhorizon.private.updateSeen";
+pub const GET_REPLIES: &str = "app.nearhorizon.private.getReplies";
+
+/// `getAuthorFeed`'s `filter` values (P-20, §4.14); the first is the default.
+const POSTS_WITH_REPLIES: &str = "posts_with_replies";
+const POSTS_AND_AUTHOR_THREADS: &str = "posts_and_author_threads";
 
 /// Metric: handler time before the floor.
 const METRIC_UNFLOORED: &str = "private_read_unfloored_seconds";
@@ -74,6 +79,7 @@ pub struct Floors {
     pub get_quotes: Duration,
     pub list_notifications: Duration,
     pub get_unread_count: Duration,
+    pub get_replies: Duration,
 }
 
 /// State for the private router.
@@ -127,6 +133,7 @@ impl PrivateState {
                 get_quotes: Duration::from_millis(cfg.floor_ms.get_quotes),
                 list_notifications: Duration::from_millis(cfg.floor_ms.list_notifications),
                 get_unread_count: Duration::from_millis(cfg.floor_ms.get_unread_count),
+                get_replies: Duration::from_millis(cfg.floor_ms.get_replies),
             },
             concurrency: usize::try_from(cfg.bind_concurrency).unwrap_or(8).max(1),
             bookmarks_max,
@@ -155,6 +162,7 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(LIST_NOTIFICATIONS), get(list_notifications))
         .route(&xrpc(GET_UNREAD_COUNT), get(get_unread_count))
         .route(&xrpc(UPDATE_SEEN), post(update_seen))
+        .route(&xrpc(GET_REPLIES), get(get_replies))
         .with_state(state)
 }
 
@@ -724,53 +732,9 @@ async fn thread_body(
     let roots_read: Vec<String> = if root_read && root != uri && !chain_has_root { vec![root.clone()] } else { Vec::new() };
     // The replies the read root's private threadgate hides, except from
     // their own author, left out before they are read (`thread.rs:207-208`).
-    let hidden: HashSet<String> = if root_read && is_private_uri(&root) {
-        schema::threadgates(&s.env.pool, std::slice::from_ref(&root))
-            .await?
-            .into_iter()
-            .flat_map(|g| g.hidden_replies)
-            .filter(|reply| uri_author(reply) != Some(caller.did.as_str()))
-            .collect()
-    } else {
-        HashSet::new()
-    };
+    let hidden = if root_read { hidden_replies(s, caller, &root).await? } else { HashSet::new() };
 
-    // Replies, breadth-first, up to `depth` levels and the node cap.
-    let mut replies: HashMap<String, Vec<PrivateEmit<Value>>> = HashMap::new();
-    let mut expanded: HashSet<String> = HashSet::new();
-    let mut level: Vec<String> = anchor_uri;
-    for _ in 0..depth {
-        if level.is_empty() || budget == 0 {
-            break;
-        }
-        let mut batch: Vec<(String, String)> = Vec::new();
-        for parent in &level {
-            if batch.len() >= budget {
-                break;
-            }
-            expanded.insert(parent.clone());
-            for c in schema::reply_candidates(&s.env.pool, &caller.did, parent, REPLIES_PER_NODE).await? {
-                if batch.len() >= budget {
-                    break;
-                }
-                if hidden.contains(&c) {
-                    continue;
-                }
-                batch.push((parent.clone(), c));
-            }
-        }
-        let uris: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
-        let authors = profiles(&hydration, &uris).await?;
-        let results = read_many(s, &rs, caller, &uris, &authors, start).await;
-        level = Vec::new();
-        for ((parent, child), hit) in batch.into_iter().zip(results) {
-            if let Some(post) = hit {
-                budget -= 1;
-                level.push(child);
-                replies.entry(parent).or_default().push(post);
-            }
-        }
-    }
+    let (mut replies, expanded) = expand(s, &rs, caller, &hydration, anchor_uri, depth, &mut budget, &hidden, start).await?;
 
     // Every node is read; decorate them all at once.
     let mut refs: Vec<&mut PrivateEmit<Value>> = std::iter::once(&mut anchor)
@@ -791,6 +755,74 @@ async fn thread_body(
     }
     root.parent = parent.map(Box::new);
     Ok(Some(PrivateResponse::thread(root)))
+}
+
+/// The replies the private threadgate of `root`, a root the caller read in
+/// this request (C-17), hides from the caller: all it lists except the
+/// caller's own (`thread.rs:207-208`). None for a public root.
+async fn hidden_replies(s: &PrivateState, caller: &VerifiedCaller, root: &str) -> Result<HashSet<String>, XrpcError> {
+    if !is_private_uri(root) {
+        return Ok(HashSet::new());
+    }
+    Ok(schema::threadgates(&s.env.pool, &[root.to_string()])
+        .await?
+        .into_iter()
+        .flat_map(|g| g.hidden_replies)
+        .filter(|reply| uri_author(reply) != Some(caller.did.as_str()))
+        .collect())
+}
+
+/// The replies below `level`, breadth-first, up to `depth` levels, at most
+/// [`REPLIES_PER_NODE`] candidates a node, each read for the caller, while
+/// `budget` nodes remain. `hidden` are left out before they are read.
+/// Returns the hits by parent URI and the URIs that were expanded.
+#[allow(clippy::too_many_arguments)]
+async fn expand(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    mut level: Vec<String>,
+    depth: u32,
+    budget: &mut usize,
+    hidden: &HashSet<String>,
+    start: Instant,
+) -> Result<(HashMap<String, Vec<PrivateEmit<Value>>>, HashSet<String>), XrpcError> {
+    let mut replies: HashMap<String, Vec<PrivateEmit<Value>>> = HashMap::new();
+    let mut expanded: HashSet<String> = HashSet::new();
+    for _ in 0..depth {
+        if level.is_empty() || *budget == 0 {
+            break;
+        }
+        let mut batch: Vec<(String, String)> = Vec::new();
+        for parent in &level {
+            if batch.len() >= *budget {
+                break;
+            }
+            expanded.insert(parent.clone());
+            for c in schema::reply_candidates(&s.env.pool, &caller.did, parent, REPLIES_PER_NODE).await? {
+                if batch.len() >= *budget {
+                    break;
+                }
+                if hidden.contains(&c) {
+                    continue;
+                }
+                batch.push((parent.clone(), c));
+            }
+        }
+        let uris: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
+        let authors = profiles(hydration, &uris).await?;
+        let results = read_many(s, rs, caller, &uris, &authors, start).await;
+        level = Vec::new();
+        for ((parent, child), hit) in batch.into_iter().zip(results) {
+            if let Some(post) = hit {
+                *budget -= 1;
+                level.push(child);
+                replies.entry(parent).or_default().push(post);
+            }
+        }
+    }
+    Ok((replies, expanded))
 }
 
 fn build(
@@ -814,8 +846,9 @@ fn build(
     }
 }
 
-/// `created_at::rkey` for one author's feed; `created_at::uri` for the
-/// timeline, where a record key is not unique.
+/// A plain `created_at::key` cursor, for the lists that walk the caller's
+/// own rows or public rows (private posting §3.6): bookmarks, likes,
+/// reposts and notifications. The feeds' cursors are sealed.
 fn cursor(at: DateTime<Utc>, rkey: &str) -> String {
     format!("{}::{rkey}", at.to_rfc3339_opts(SecondsFormat::Micros, true))
 }
@@ -842,15 +875,31 @@ pub async fn get_author_feed(
     if !actor.starts_with("did:") {
         return Err(XrpcError::invalid("Error: actor must be a valid did"));
     }
-    let limit = match p.u32("limit")?.unwrap_or(30) {
-        l @ 1..=50 => l,
-        _ => return Err(XrpcError::invalid("Error: limit must be between 1 and 50")),
+    let limit = feed_limit(&p)?;
+    // P-20 (§4.14): normalized, so an absent and an explicit default give
+    // the same cursor binding (§3.6).
+    let filter = match p.one("filter").unwrap_or(POSTS_WITH_REPLIES) {
+        f @ (POSTS_WITH_REPLIES | POSTS_AND_AUTHOR_THREADS) => f,
+        _ => return Err(XrpcError::invalid("Error: filter must be posts_with_replies or posts_and_author_threads")),
     };
-    let after = parse_cursor(p.one("cursor"))?;
+    let aad = sealed::aad(GET_AUTHOR_FEED, &caller.did, &actor, filter);
+    let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let result = feed_body(&s, &caller, ip, Some(&actor), limit as usize, after, start).await;
+    let of = FeedOf::Author {
+        actor: &actor,
+        own_threads: filter == POSTS_AND_AUTHOR_THREADS,
+    };
+    let result = feed_body(&s, &caller, ip, of, limit, after, &aad, start).await;
     floor("getAuthorFeed", start, s.floors.get_author_feed).await;
     result.map(ok)
+}
+
+/// `limit` 1–50, default 30: the feeds and `getReplies`.
+fn feed_limit(p: &Params) -> Result<usize, XrpcError> {
+    match p.u32("limit")?.unwrap_or(30) {
+        l @ 1..=50 => Ok(l as usize),
+        _ => Err(XrpcError::invalid("Error: limit must be between 1 and 50")),
+    }
 }
 
 /// `app.nearhorizon.private.getTimeline`: the private posts the caller may
@@ -866,15 +915,22 @@ pub async fn get_timeline(
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, GET_TIMELINE).await?;
     let p = Params::parse(q.as_deref());
-    let limit = match p.u32("limit")?.unwrap_or(30) {
-        l @ 1..=50 => l,
-        _ => return Err(XrpcError::invalid("Error: limit must be between 1 and 50")),
-    };
-    let after = parse_cursor(p.one("cursor"))?;
+    let limit = feed_limit(&p)?;
+    let aad = sealed::aad(GET_TIMELINE, &caller.did, "", "");
+    let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let result = feed_body(&s, &caller, ip, None, limit as usize, after, start).await;
+    let result = feed_body(&s, &caller, ip, FeedOf::Timeline, limit, after, &aad, start).await;
     floor("getTimeline", start, s.floors.get_timeline).await;
     result.map(ok)
+}
+
+/// Whose feed [`feed_body`] pages.
+#[derive(Debug, Clone, Copy)]
+enum FeedOf<'a> {
+    /// The caller's home timeline.
+    Timeline,
+    /// `actor`'s feed; `own_threads` is `posts_and_author_threads`.
+    Author { actor: &'a str, own_threads: bool },
 }
 
 /// Windows of candidates one feed request may read.
@@ -889,21 +945,28 @@ const SECOND_WINDOW_BY: Duration = Duration::from_millis(600);
 /// A window is `limit × 4` candidates. If it ends short of `limit` and
 /// candidates remain, one more is read, from after the last row the first
 /// examined, so that a run of posts nobody can read (content that does
-/// not decode, say) does not end the feed. The cursor is always that of
-/// the last readable item: it never carries the position of a post the
-/// caller may not read.
+/// not decode, say) does not end the feed.
+///
+/// The cursor is sealed (private posting §3.6, P-17), bound to `aad`, and
+/// holds the last **examined** candidate's position. It is present
+/// whenever candidates remain past that row, so a short or empty page can
+/// carry one (C-9). Candidates are rows that passed the prefilter, so only
+/// posts the caller is entitled to can produce one; a taken-down or hidden
+/// post cannot. A position too long to seal (§11) gives no cursor.
 ///
 /// A repost item is its subject read for the caller, with `reason`
 /// (`app.bsky.feed.defs#reasonRepost`: `by` the reposter, `uri` the
 /// repost, `indexedAt` its time). A subject that misses leaves no trace of
 /// the repost.
+#[allow(clippy::too_many_arguments)]
 async fn feed_body(
     s: &PrivateState,
     caller: &VerifiedCaller,
     ip: IpAddr,
-    actor: Option<&str>,
+    of: FeedOf<'_>,
     limit: usize,
     after: Option<(DateTime<Utc>, String)>,
+    aad: &str,
     start: Instant,
 ) -> Result<PrivateResponse, XrpcError> {
     let max_binds = limit * 4;
@@ -917,13 +980,16 @@ async fn feed_body(
     let mut feed: Vec<PrivateEmit<Value>> = Vec::new();
     // By feed item: the repost it stands for, `(uri, reposter, time)`.
     let mut reposts: Vec<Option<(String, String, DateTime<Utc>)>> = Vec::new();
-    let mut last_hit: Option<(DateTime<Utc>, String)> = None;
+    // The last examined candidate's position.
+    let mut last: Option<(DateTime<Utc>, String)> = None;
     let mut more = false;
     let mut after = after;
     for window in 0..FEED_WINDOWS {
-        let mut candidates = match actor {
-            Some(actor) => schema::author_candidates(&s.env.pool, &caller.did, actor, after.clone(), wanted).await?,
-            None => schema::timeline_candidates(&s.env.pool, &caller.did, after.clone(), wanted).await?,
+        let mut candidates = match of {
+            FeedOf::Author { actor, own_threads } => {
+                schema::author_candidates(&s.env.pool, &caller.did, actor, own_threads, after.clone(), wanted).await?
+            }
+            FeedOf::Timeline => schema::timeline_candidates(&s.env.pool, &caller.did, after.clone(), wanted).await?,
         };
         let beyond = candidates.len() > max_binds;
         candidates.truncate(max_binds);
@@ -933,11 +999,11 @@ async fn feed_body(
         let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
         let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
         while let Some((i, hit)) = reads.next().await {
+            let c = &candidates[i];
+            last = Some((c.created_at, c.key.clone()));
             if let Ok(post) = hit {
-                let c = &candidates[i];
                 feed.push(post);
                 reposts.push(c.repost_uri.clone().zip(c.reposter.clone()).map(|(u, by)| (u, by, c.created_at)));
-                last_hit = Some((c.created_at, c.key.clone()));
                 if feed.len() == limit {
                     full_at = Some(i);
                     break;
@@ -958,7 +1024,7 @@ async fn feed_body(
         }
         after = Some((tail.created_at, tail.key.clone()));
     }
-    let cursor = last_hit.filter(|_| more).map(|(at, key)| cursor(at, &key));
+    let cursor = last.filter(|_| more).and_then(|(at, key)| sealed::seal(&s.cursor_key, aad, at, &key));
     let mut refs: Vec<&mut PrivateEmit<Value>> = feed.iter_mut().collect();
     decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
     let mut reposters: Vec<String> = Vec::new();
@@ -1339,6 +1405,136 @@ async fn quotes_body(
         .collect();
     decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::quotes(uri.to_string(), items, cursor))
+}
+
+/// `app.nearhorizon.private.getReplies {uri, limit 1-50 default 30, cursor,
+/// depth 0-6 default 2}` (private posting §4.12, P-6, P-14) →
+/// `{replies: #privateThreadView[], cursor?}`: the private replies to
+/// `uri`, oldest first.
+/// - A private `uri` is read for the caller first. A miss, whatever its
+///   reason, gives `{replies: []}`, the answer for a post that does not
+///   exist (C-15), as `getPostThread`'s anchor miss ends the thread. Its
+///   claimed root (C-18) is read too, which is the anchor itself when it is
+///   top-level, so that the root's private threadgate hides its
+///   `hiddenReplies` and sets `replyDisabled` (§4.4, C-17).
+/// - A public `uri` is not read or fetched: only its private replies are
+///   listed, and nothing about the public post is emitted.
+/// - Candidates pass the prefilter. Windows, the lookahead and the sealed
+///   cursor (§3.6), bound to the method, the caller and `uri`, as
+///   [`feed_body`].
+/// - Each reply is expanded breadth-first `depth` levels below it, at most
+///   [`REPLIES_PER_NODE`] children a node and [`THREAD_NODE_CAP`] nodes in
+///   the response, as `getPostThread`; deeper levels are reached by calling
+///   `getReplies` on a node.
+///
+/// Floored (`get_replies`).
+pub async fn get_replies(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, peer, GET_REPLIES).await?;
+    let p = Params::parse(q.as_deref());
+    let uri = p.required("uri")?.to_string();
+    let limit = feed_limit(&p)?;
+    let depth = bounded(&p, "depth", 2, 6)?;
+    let aad = sealed::aad(GET_REPLIES, &caller.did, &uri, "");
+    let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
+    let ip = request_ip(&s.app, &headers, peer);
+    let result = replies_body(&s, &caller, ip, &uri, limit, depth, after, &aad, start).await;
+    floor("getReplies", start, s.floors.get_replies).await;
+    result.map(ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replies_body(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    ip: IpAddr,
+    uri: &str,
+    limit: usize,
+    depth: u32,
+    after: Option<(DateTime<Utc>, String)>,
+    aad: &str,
+    start: Instant,
+) -> Result<PrivateResponse, XrpcError> {
+    let hydration = private_hydration(s, caller, ip).await?;
+    let rs = RequestState::new(s.env.max_head_fetches);
+    // The thread's root, when it was read for the caller in this request.
+    let mut roots_read: Vec<String> = Vec::new();
+    if is_private_uri(uri) {
+        let authors = profiles(&hydration, &[uri.to_string()]).await?;
+        let Ok(anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
+            return Ok(PrivateResponse::replies(Vec::new(), None));
+        };
+        let root = claimed_root(&anchor).unwrap_or_else(|| uri.to_string());
+        if root == uri || (is_private_uri(&root) && anchor_readable(s, &rs, caller, &hydration, &root, start).await?) {
+            roots_read.push(root);
+        }
+    }
+    let hidden = match roots_read.first() {
+        Some(root) => hidden_replies(s, caller, root).await?,
+        None => HashSet::new(),
+    };
+    let hidden_list: Vec<String> = hidden.iter().cloned().collect();
+
+    let max_binds = limit * 4;
+    let wanted = i64::try_from(max_binds + 1).unwrap_or(i64::MAX);
+    let mut hits: Vec<PrivateEmit<Value>> = Vec::new();
+    // The last examined candidate's position.
+    let mut last: Option<(DateTime<Utc>, String)> = None;
+    let mut more = false;
+    let mut after = after;
+    for window in 0..FEED_WINDOWS {
+        let mut candidates =
+            schema::reply_page_candidates(&s.env.pool, &caller.did, uri, &hidden_list, after.clone(), wanted).await?;
+        let beyond = candidates.len() > max_binds;
+        candidates.truncate(max_binds);
+        let uris: Vec<String> = candidates.iter().map(|(u, _)| u.clone()).collect();
+        let authors = profiles(&hydration, &uris).await?;
+        let mut full_at: Option<usize> = None;
+        let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+        let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
+        while let Some((i, hit)) = reads.next().await {
+            let (u, at) = &candidates[i];
+            last = Some((*at, u.clone()));
+            if let Ok(post) = hit {
+                hits.push(post);
+                if hits.len() == limit {
+                    full_at = Some(i);
+                    break;
+                }
+            }
+        }
+        drop(reads);
+        if let Some(i) = full_at {
+            more = i + 1 < candidates.len() || beyond;
+            break;
+        }
+        more = beyond;
+        let Some((tail, at)) = candidates.last() else { break };
+        if !beyond || window + 1 == FEED_WINDOWS || start.elapsed() >= SECOND_WINDOW_BY {
+            break;
+        }
+        after = Some((*at, tail.clone()));
+    }
+    let cursor = last.filter(|_| more).and_then(|(at, key)| sealed::seal(&s.cursor_key, aad, at, &key));
+
+    let mut budget = THREAD_NODE_CAP.saturating_sub(hits.len());
+    let level: Vec<String> = hits.iter().filter_map(view_uri).collect();
+    let (mut replies, expanded) = expand(s, &rs, caller, &hydration, level, depth, &mut budget, &hidden, start).await?;
+    let mut refs: Vec<&mut PrivateEmit<Value>> = hits.iter_mut().chain(replies.values_mut().flatten()).collect();
+    decorate(s, &rs, caller, &hydration, &mut refs, &roots_read, start).await?;
+    let nodes = hits
+        .into_iter()
+        .map(|hit| {
+            let hit_uri = view_uri(&hit).unwrap_or_default();
+            build(hit, &hit_uri, &mut replies, &expanded)
+        })
+        .collect();
+    Ok(PrivateResponse::replies(nodes, cursor))
 }
 
 /// The `indexed_at::id` cursor of a notification page (plain: it walks the

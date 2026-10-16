@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Get an author's private-tier posts that the requester is authorized to read, and, when the author is a community member with no block either way with the requester, the author's reposts of private posts the requester may read, newest first. A repost item carries `reason` (app.bsky.feed.defs#reasonRepost) and sorts by the repost's time, ties broken by the repost's URI. The ordering field of a post's own item is its `record.createdAt` (descending, ties broken by record key); a `createdAt` later than the time of indexing plus five minutes is clamped to that bound, and the view carries the clamped value. Requires auth by a ready community member. An unknown actor and an actor with no visible posts both return an empty feed with no cursor. Audiences this AppView resolves: `list` (the audience record's members); `followers` (followers of the audience's owner who are ready members of this AppView, by the follow records it has indexed, which reflect a new follow or an unfollow within about a minute); `everyone` (every ready member of this AppView, not the network); and `nobody`. A `following` audience is not resolved yet and is served to its author only, as is any other mode. A block record or a private block between the reader and the author, or the audience's owner, in either direction, keeps the reader out; a block through a list does not. A post under another account's audience, on any PDS, is served to anyone but its author only when one of its 8 nearest ancestors, walked through stored private posts under the same audience that the reader could read, is that account's post; its author may write there (`list` or no mode: listed in `members`; `followers`: a stored follow of that account; `everyone`: always; any other mode: never); under `followers` and `everyone`, neither its author nor that account blocks the other; and that account is active. A reply more than 8 levels below that account's nearest post is served to its author only.",
+      "description": "Get an author's private-tier posts that the requester is authorized to read, and, when the author is a community member with no block either way with the requester, the author's reposts of private posts the requester may read, newest first. A repost item carries `reason` (app.bsky.feed.defs#reasonRepost) and sorts by the repost's time, ties broken by the repost's URI. The ordering field of a post's own item is its `record.createdAt` (descending, ties broken by record key); a `createdAt` later than the time of indexing plus five minutes is clamped to that bound, and the view carries the clamped value. Requires auth by a ready community member. An unknown actor and an actor with no posts the requester is entitled to both return an empty feed with no cursor; posts the requester is entitled to that fail later (content that does not decode, say) are paged past, so a page may be empty and still carry a cursor. Audiences this AppView resolves: `list` (the audience record's members); `followers` (followers of the audience's owner who are ready members of this AppView, by the follow records it has indexed, which reflect a new follow or an unfollow within about a minute); `everyone` (every ready member of this AppView, not the network); and `nobody`. A `following` audience is not resolved yet and is served to its author only, as is any other mode. A block record or a private block between the reader and the author, or the audience's owner, in either direction, keeps the reader out; a block through a list does not. A post under another account's audience, on any PDS, is served to anyone but its author only when one of its 8 nearest ancestors, walked through stored private posts under the same audience that the reader could read, is that account's post; its author may write there (`list` or no mode: listed in `members`; `followers`: a stored follow of that account; `everyone`: always; any other mode: never); under `followers` and `everyone`, neither its author nor that account blocks the other; and that account is active. A reply more than 8 levels below that account's nearest post is served to its author only.",
       "parameters": {
         "type": "params",
         "required": [
@@ -21,9 +21,15 @@
             "minimum": 1,
             "maximum": 50
           },
+          "filter": {
+            "type": "string",
+            "description": "Which of the actor's own posts to include. posts_with_replies (the default): all of them. posts_and_author_threads: top-level posts, and replies in threads whose root, as each reply's record claims it, is the actor's own post. The actor's repost items appear under both. Any other value is rejected with InvalidRequest.",
+            "knownValues": ["posts_with_replies", "posts_and_author_threads"],
+            "default": "posts_with_replies"
+          },
           "cursor": {
             "type": "string",
-            "description": "Opaque pagination cursor from a previous response (createdAt::key of the last returned item: a post's record key, or a repost item's repost URI)."
+            "description": "Opaque, sealed pagination cursor from a previous response to the same requester for the same actor and filter (an absent filter and posts_with_replies are the same). Any other cursor, including the unsealed createdAt::key form of earlier versions, is rejected with InvalidRequest; start the feed over."
           }
         }
       },
@@ -44,7 +50,7 @@
             },
             "cursor": {
               "type": "string",
-              "description": "Present only when the page returned at least one item and more candidates remain."
+              "description": "Present whenever more candidates remain; a page may be short or empty and still carry one. Absent at the end of the feed, and also, exceptionally, when the last examined position is too long to seal (an author whose did:web is several hundred characters), where the feed ends early."
             }
           }
         }

@@ -160,6 +160,8 @@ pub const FEATURES: &[&str] = &[
     "private.notifications",
     // P-11 `requestRecord` catch-up and `caughtUp` (S7).
     "private.freshIndex",
+    // P-17 sealed cursors, P-20 `filter`, P-6/P-14 `getReplies` (S8).
+    "private.paging",
     // Rule 4's anchored walk (S0, listed from S1).
     "private.crossPdsReplies",
 ];
