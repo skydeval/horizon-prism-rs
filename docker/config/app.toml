@@ -117,10 +117,10 @@ membership_retry_after_secs = 5
 # Whole-handler latency floors, sized above each endpoint's worst case including
 # one synchronous repo-head fetch round (design §6.9, §6.11.3).
 [private_read.floor_ms]
-get_posts = 800
-get_post_thread = 1000
-get_author_feed = 1000
-get_timeline = 1000
+get_posts = 1000
+get_post_thread = 1200
+get_author_feed = 1200
+get_timeline = 1200
 
 # Repo-head check for tracked DIDs (design §6.11.3).
 [sync]
@@ -393,6 +393,16 @@ max_per_actor = 50000
 # "always" shows it every time, zero included.
 emit_count = "never"
 count_floor = 10
+
+# How a video embed's view is built, for public and private posts alike
+# (private posting, Addendum A). "bsky_cdn": HLS and a thumbnail from the
+# video CDN at cdn_url; the URLs are computed, and Prism makes no request to
+# the CDN. A video the CDN never processed (uploaded straight to a PDS) does
+# not play this way. "pds_blob": the MP4 blob on the author's PDS, with no
+# thumbnail.
+[video]
+playback = "bsky_cdn"
+cdn_url = "https://video.bsky.app"
 
 # Unfinished posts a member saves to finish later: how many one member may
 # keep, and the largest one (in bytes; 1 MiB).

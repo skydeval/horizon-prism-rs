@@ -344,6 +344,7 @@ fn urls(cfg: &FileConfig, out: &mut Vec<String>) {
     for (key, value) in [
         ("microcosm.slingshot_url", &cfg.microcosm.slingshot_url),
         ("microcosm.constellation_url", &cfg.microcosm.constellation_url),
+        ("video.cdn_url", &cfg.video.cdn_url),
     ] {
         if let Err(e) = https_url(value) {
             out.push(format!("{key}: {e}"));

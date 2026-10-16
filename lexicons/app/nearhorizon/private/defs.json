@@ -12,14 +12,45 @@
         "author": { "type": "ref", "ref": "app.bsky.actor.defs#profileViewBasic" },
         "record": {
           "type": "unknown",
-          "description": "The decoded private record, with $type 'tools.kryphocron.feed.postPrivate'. Carries text, createdAt, audienceList (at-uri) and, for replies, reply ({root, parent} strong refs). audienceList may be absent when the record was written without one; that represents a self-only post, returned only to its owner. Encoded-content fields are never emitted."
+          "description": "The decoded private record, with $type 'tools.kryphocron.feed.postPrivate'. Carries text, createdAt, audienceList (at-uri) and, for replies, reply ({root, parent} strong refs), and facets, embed, langs and labels as the record stored them (embed and facet features in either the tools.kryphocron.feed.postPublic or the app.bsky form). audienceList may be absent when the record was written without one; that represents a self-only post, returned only to its owner. Encoded-content fields are never emitted."
+        },
+        "embed": {
+          "type": "union",
+          "description": "The stock view of the record's embed, built from either $type form. A quoted private post is read for the requester as any private post is: readable gives #viewRecord with the decoded record as its value; unreadable, blocked or nonexistent all give the same #viewNotFound. A quoted public post is shown only when this AppView stores it; otherwise, for record and recordWithMedia embeds alike, embed is absent and the client renders the quote from record.embed. Quotes are not followed beyond one level. A video plays from the video CDN (playlist and thumbnail) or from the author's PDS (playlist only), as the operator configures.",
+          "refs": [
+            "app.bsky.embed.images#view",
+            "app.bsky.embed.external#view",
+            "app.bsky.embed.video#view",
+            "app.bsky.embed.gallery#view",
+            "app.bsky.embed.record#view",
+            "app.bsky.embed.recordWithMedia#view"
+          ]
         },
         "indexedAt": { "type": "string", "format": "datetime" },
         "labels": {
           "type": "array",
-          "description": "Labels on the post. Empty in v1.",
+          "description": "Labels on the post: its author's self-labels (src the author's DID, cts the post's createdAt), then the labels this AppView's operator applied.",
           "items": { "type": "ref", "ref": "com.atproto.label.defs#label" }
+        },
+        "audience": {
+          "type": "ref",
+          "ref": "#audienceView",
+          "description": "The audience the post names, while this AppView holds its record. Absent when the post names none or the record is gone; the author still sees record.audienceList."
         }
+      }
+    },
+    "audienceView": {
+      "type": "object",
+      "description": "A post's audience (tools.kryphocron.policy.audience). Its member list is never included. A rename shows once the audience record is next indexed.",
+      "required": ["uri"],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "mode": {
+          "type": "string",
+          "description": "The audience's mode as stored. Absent when the record has none, which reads as 'list'.",
+          "knownValues": ["list", "followers", "following", "everyone", "nobody"]
+        },
+        "name": { "type": "string", "description": "The audience's label, as its owner wrote it." }
       }
     },
     "privateThreadView": {

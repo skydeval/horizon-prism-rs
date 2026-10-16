@@ -101,6 +101,10 @@ pub(super) struct ViewMeta {
     pub reply_parent_cid: Option<String>,
     pub created_at: DateTime<Utc>,
     pub indexed_at: DateTime<Utc>,
+    /// The audience row's presence, `mode` and `name` (P-3, §4.10).
+    pub audience_found: bool,
+    pub audience_mode: Option<String>,
+    pub audience_name: Option<String>,
 }
 
 /// # Errors
@@ -108,12 +112,36 @@ pub(super) struct ViewMeta {
 /// Database errors.
 pub(super) async fn view_meta(pool: &PgPool, rauth: &RecordAuthz) -> Result<Option<ViewMeta>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT cid, audience_uri, reply_root_uri, reply_parent_uri, reply_root_cid, reply_parent_cid, created_at, indexed_at \
-         FROM private_posts WHERE uri = $1",
+        "SELECT p.cid, p.audience_uri, p.reply_root_uri, p.reply_parent_uri, p.reply_root_cid, p.reply_parent_cid, \
+           p.created_at, p.indexed_at, a.uri IS NOT NULL AS audience_found, a.mode AS audience_mode, a.name AS audience_name \
+         FROM private_posts p LEFT JOIN private_audiences a ON a.uri = p.audience_uri WHERE p.uri = $1",
     )
     .bind(rauth.uri())
     .fetch_optional(pool)
     .await
+}
+
+/// A post's display fields as stored (private-posting design §3.1): content,
+/// read only behind the witness.
+#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
+pub(super) struct Display {
+    pub facets: Option<serde_json::Value>,
+    pub embed: Option<serde_json::Value>,
+    pub langs: Option<Vec<String>>,
+    pub self_labels: Option<serde_json::Value>,
+}
+
+/// `schema::display(&rauth)`: the record's facets, embed, langs and
+/// self-labels.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn display(pool: &PgPool, rauth: &RecordAuthz) -> Result<Option<Display>, sqlx::Error> {
+    sqlx::query_as("SELECT facets, embed, langs, self_labels FROM private_posts WHERE uri = $1")
+        .bind(rauth.uri())
+        .fetch_optional(pool)
+        .await
 }
 
 /// Field presence for `RecordValidation::post_private` (§6.3 step 10):

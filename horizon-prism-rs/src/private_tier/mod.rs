@@ -90,6 +90,8 @@ pub enum IngestError {
 pub const FEATURES: &[&str] = &[
     // The private read methods (served before S1).
     "private",
+    // P-1 and P-3 fields on views (S2).
+    "private.embeds",
     // Rule 4's anchored walk (S0, listed from S1).
     "private.crossPdsReplies",
 ];
@@ -166,6 +168,11 @@ pub trait PrivateTier: Send + Sync {
     /// When the DID's community-PDS eligibility was last confirmed.
     async fn eligibility_confirmed_at(&self, conn: &mut PgConnection, did: &str)
     -> Result<Option<DateTime<Utc>>, sqlx::Error>;
+
+    /// `ingest::enqueue_display_refill` (private posting §3.1): once, under
+    /// the `worker_state` key `marker`, a `private` job for every DID with
+    /// rows stored before migration 0023. `None` when already done.
+    async fn enqueue_display_refill(&self, pool: &PgPool, marker: &str) -> Result<Option<u64>, sqlx::Error>;
 }
 
 /// The private tier.
@@ -254,6 +261,10 @@ impl PrivateTier for KryphocronPrivateTier {
         did: &str,
     ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
         owners::eligibility_confirmed_at(conn, did).await
+    }
+
+    async fn enqueue_display_refill(&self, pool: &PgPool, marker: &str) -> Result<Option<u64>, sqlx::Error> {
+        ingest::enqueue_display_refill(pool, marker).await
     }
 }
 
@@ -348,6 +359,10 @@ impl PrivateTier for DisabledPrivateTier {
         _conn: &mut PgConnection,
         _did: &str,
     ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        Ok(None)
+    }
+
+    async fn enqueue_display_refill(&self, _pool: &PgPool, _marker: &str) -> Result<Option<u64>, sqlx::Error> {
         Ok(None)
     }
 }

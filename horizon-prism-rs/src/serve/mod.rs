@@ -62,6 +62,9 @@ use health::{AuditLatch, HealthState};
 pub const EXIT_CONFIG: u8 = 78;
 /// Timeout for the startup Redis connection.
 pub const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The `worker_state` key marking the private display refill as queued
+/// (private posting §3.1).
+pub const PRIVATE_DISPLAY_REFILL: &str = "private_display_refill";
 
 /// A startup failure, with the process exit code to use.
 #[derive(Debug, thiserror::Error)]
@@ -396,6 +399,15 @@ pub async fn run() -> Result<(), StartupError> {
     // Per-host PDS budgets (§6.11.3): probe, read-fetch and backfill buckets.
     let budgets = HostBudgets::new(BudgetRates::from_app(&cfg));
 
+    // The private display refill (private posting §3.1, S2): once, at the
+    // first start after migration 0023, a `private` job for each DID whose
+    // rows predate it. A failure records nothing, so the next start retries.
+    match private.enqueue_display_refill(&pool, PRIVATE_DISPLAY_REFILL).await {
+        Ok(Some(queued)) => tracing::info!(event = "private_display_refill_queued", queued, "private jobs queued to fill display fields"),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(event = "private_display_refill_failed", %error, "queuing the private display refill failed; retried at the next start"),
+    }
+
     // Backfill, count refresher, weekly rebuild.
     let source: Arc<dyn BackfillSource> = Arc::new(NetSource::new(
         pool.clone(),
@@ -559,6 +571,7 @@ pub async fn run() -> Result<(), StartupError> {
             bookmarks_max: cfg.file.bookmarks.max_per_actor,
             bookmarks_emit_count: cfg.file.bookmarks.emit_count,
             bookmarks_count_floor: cfg.file.bookmarks.count_floor,
+            video: cfg.file.video.clone(),
             drafts_max: cfg.file.drafts.max_per_actor,
             drafts_max_bytes: cfg.file.drafts.max_bytes,
             labels_query_max_patterns: cfg.file.labels.query_max_patterns,

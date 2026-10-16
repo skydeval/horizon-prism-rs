@@ -74,6 +74,8 @@ mod tests {
             "0020_operator_settings",
             "0021_member_post_refs",
             "0022_backfill_claim_indexes",
+            // Private posting S2.
+            "0023_private_post_display",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

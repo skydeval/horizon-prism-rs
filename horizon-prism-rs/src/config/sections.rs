@@ -283,10 +283,12 @@ pub struct PrivateReadFloors {
 impl Default for PrivateReadFloors {
     fn default() -> Self {
         Self {
-            get_posts: 800,
-            get_post_thread: 1000,
-            get_author_feed: 1000,
-            get_timeline: 1000,
+            // Raised in private posting S2 (§3.2, §4.2): quoted reads add up
+            // to one bind per hit.
+            get_posts: 1000,
+            get_post_thread: 1200,
+            get_author_feed: 1200,
+            get_timeline: 1200,
         }
     }
 }
@@ -925,6 +927,37 @@ impl Default for BookmarksConfig {
             max_per_actor: 50_000,
             emit_count: BookmarkCount::Never,
             count_floor: 10,
+        }
+    }
+}
+
+/// `video.playback` (private-posting design, Addendum A): how a video
+/// embed's view is built, for public and private posts alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoPlayback {
+    /// HLS on the video CDN (`video.cdn_url`), with a thumbnail. The URLs
+    /// are computed; no request is made to the CDN.
+    #[default]
+    BskyCdn,
+    /// The MP4 blob on the author's PDS, with no thumbnail.
+    PdsBlob,
+}
+
+/// `[video]` (private-posting design, Addendum A).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VideoConfig {
+    pub playback: VideoPlayback,
+    /// The CDN base under `bsky_cdn`: an `https` URL.
+    pub cdn_url: String,
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            playback: VideoPlayback::BskyCdn,
+            cdn_url: "https://video.bsky.app".to_string(),
         }
     }
 }
@@ -1613,6 +1646,7 @@ pub struct FileConfig {
     pub activity_subscriptions: ActivitySubscriptionsConfig,
     pub notifications: NotificationsConfig,
     pub bookmarks: BookmarksConfig,
+    pub video: VideoConfig,
     pub search: SearchConfig,
     pub suggestions: SuggestionsConfig,
     pub trends: TrendsConfig,

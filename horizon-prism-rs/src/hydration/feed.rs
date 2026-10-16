@@ -9,11 +9,10 @@ use serde_json::{Map, Value, json};
 
 use super::actor::{ProfileContext, ProfileKind};
 use super::normalize::is_private_uri;
-use super::{CountMode, Hydrator, PostRow, PublicEmit, ViewError, ViewResult, Viewer, blob_url, ts};
+use super::{CountMode, Hydrator, PostRow, PublicEmit, ViewError, ViewResult, Viewer, ts};
 use crate::aggregations::counts::Counts;
 use crate::config::BookmarkCount;
 use crate::db::locks::uri_author;
-use crate::firehose::normalize::blob_cid;
 use crate::moderation::{self, Gate};
 use crate::hydration::HydrationError;
 use crate::xrpc::pools::{Exhausted, Requester};
@@ -102,6 +101,8 @@ pub struct PostContext {
     /// By quoted post: the quoting posts its author detached (its valid
     /// postgate's `detachedEmbeddingUris`).
     pub detached: HashMap<String, HashSet<String>>,
+    /// `[video]`: how a video embed's view is built.
+    pub video: crate::config::VideoConfig,
 }
 
 impl PostContext {
@@ -190,80 +191,8 @@ impl PostContext {
 
     fn media_view(&self, row: &PostRow, embed: &Value) -> Option<Value> {
         let did = &row.author_did;
-        let pds = self.profiles.rows.get(did).and_then(|r| r.pds_endpoint.clone());
-        match embed.get("$type").and_then(Value::as_str)? {
-            "app.bsky.embed.images" => {
-                let images: Vec<Value> = embed
-                    .get("images")?
-                    .as_array()?
-                    .iter()
-                    .filter_map(|img| {
-                        let cid = img.get("image").and_then(blob_cid)?;
-                        let mut i = json!({
-                            "thumb": blob_url(pds.as_deref(), did, &cid)?,
-                            "fullsize": blob_url(pds.as_deref(), did, &cid)?,
-                            "alt": img.get("alt").and_then(Value::as_str).unwrap_or_default(),
-                        });
-                        if let Some(ar) = img.get("aspectRatio") {
-                            i["aspectRatio"] = ar.clone();
-                        }
-                        Some(i)
-                    })
-                    .collect();
-                Some(json!({"$type": "app.bsky.embed.images#view", "images": images}))
-            }
-            "app.bsky.embed.external" => {
-                let ext = embed.get("external")?;
-                let mut e = json!({
-                    "uri": ext.get("uri").and_then(Value::as_str).unwrap_or_default(),
-                    "title": ext.get("title").and_then(Value::as_str).unwrap_or_default(),
-                    "description": ext.get("description").and_then(Value::as_str).unwrap_or_default(),
-                });
-                if let Some(url) = ext.get("thumb").and_then(blob_cid).and_then(|c| blob_url(pds.as_deref(), did, &c)) {
-                    e["thumb"] = json!(url);
-                }
-                Some(json!({"$type": "app.bsky.embed.external#view", "external": e}))
-            }
-            "app.bsky.embed.video" => {
-                let cid = embed.get("video").and_then(blob_cid)?;
-                let mut v = json!({
-                    "$type": "app.bsky.embed.video#view",
-                    "cid": cid,
-                    "playlist": blob_url(pds.as_deref(), did, &cid)?,
-                });
-                if let Some(alt) = embed.get("alt") {
-                    v["alt"] = alt.clone();
-                }
-                if let Some(ar) = embed.get("aspectRatio") {
-                    v["aspectRatio"] = ar.clone();
-                }
-                Some(v)
-            }
-            // design-v3 §8.4. `items` is a union in the lexicon, so every
-            // view item carries its `$type` (images#view items do not). Only
-            // `#image` record items are read, and an item missing its
-            // required `alt` or `aspectRatio` is dropped, not invented.
-            "app.bsky.embed.gallery" => {
-                let items: Vec<Value> = embed
-                    .get("items")?
-                    .as_array()?
-                    .iter()
-                    .filter(|item| item.get("$type").and_then(Value::as_str) == Some("app.bsky.embed.gallery#image"))
-                    .filter_map(|item| {
-                        let cid = item.get("image").and_then(blob_cid)?;
-                        Some(json!({
-                            "$type": "app.bsky.embed.gallery#viewImage",
-                            "thumbnail": blob_url(pds.as_deref(), did, &cid)?,
-                            "fullsize": blob_url(pds.as_deref(), did, &cid)?,
-                            "alt": item.get("alt").and_then(Value::as_str)?,
-                            "aspectRatio": item.get("aspectRatio").filter(|ar| ar.is_object())?.clone(),
-                        }))
-                    })
-                    .collect();
-                Some(json!({"$type": "app.bsky.embed.gallery#view", "items": items}))
-            }
-            _ => None,
-        }
+        let pds = self.profiles.rows.get(did).and_then(|r| r.pds_endpoint.as_deref());
+        super::embeds::media_view(did, pds, embed, &self.video)
     }
 
     fn embed_view(&self, row: &PostRow, embed: &Value, depth: u8) -> Option<Value> {
@@ -429,6 +358,7 @@ impl Hydrator {
             threadgates,
             bookmark_counts,
             detached: detached.into_iter().map(|(post, quotes)| (post, quotes.into_iter().collect())).collect(),
+            video: self.inner.cfg.video.clone(),
         })
     }
 
@@ -446,6 +376,35 @@ impl Hydrator {
         let wanted = [uri.to_string()];
         let ctx = self.post_context(viewer, req, &wanted, CountMode::List).await?;
         Ok(ctx.post_view(uri).map(PublicEmit::new))
+    }
+
+    /// The record view (`app.bsky.embed.record#viewRecord`, or blocked,
+    /// detached or not found) of a public post that the private post
+    /// `quoting` embeds (private-posting design §4.2), built from local rows
+    /// only. It answers only in On mode, where public posts are stored, and
+    /// only for a stored post: otherwise `None`, and the quoting view
+    /// carries no `embed`. Nothing is fetched upstream. Reached only through
+    /// [`super::HydrationContext::Private`].
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(super) async fn public_record_view(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        uri: &str,
+        quoting: &str,
+    ) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
+        if is_private_uri(uri) || !self.scope().read_guard().await.public.mode.is_on() {
+            return Ok(None);
+        }
+        let wanted = [uri.to_string()];
+        let ctx = self.post_context(viewer, req, &wanted, CountMode::List).await?;
+        if !ctx.posts.contains_key(uri) {
+            return Ok(None);
+        }
+        Ok(Some(PublicEmit::new(ctx.record_view(uri, quoting, 0))))
     }
 
     /// `app.bsky.feed.getPosts` (≤ 25): private-tier, hidden and unknown

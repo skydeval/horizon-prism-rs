@@ -13,7 +13,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgPool};
 
 use super::{Applied, IngestError, PrivateOp, owners};
 use crate::db::locks::uri_author;
@@ -36,6 +36,92 @@ pub(crate) struct PostPrivateFields {
     pub reply_root_cid: Option<String>,
     pub reply_parent_cid: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// The display fields (private-posting design §4.2, migration 0023),
+    /// as received: `facets` an array, `embed` and `labels` objects,
+    /// `langs` strings. Not encoded by the PDS.
+    pub display: DisplayFields,
+}
+
+/// A `postPrivate` record's display fields and what is derived from them
+/// (private-posting design §3.1, §4.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DisplayFields {
+    pub facets: Option<Value>,
+    pub embed: Option<Value>,
+    pub langs: Option<Vec<String>>,
+    /// The record's `labels` (`#selfLabels`) object.
+    pub self_labels: Option<Value>,
+    /// The quoted URI, from `embed` in either `$type` form.
+    pub quote_uri: Option<String>,
+    /// DIDs of the `#mention` facet features, in either form.
+    pub mention_dids: Vec<String>,
+    /// Fields dropped as the wrong type or too large (C-16), for
+    /// [`METRIC_FIELD_DROPPED`].
+    pub dropped: Vec<&'static str>,
+}
+
+/// Metric: a display field dropped at ingest, by `field` (C-16).
+pub(crate) const METRIC_FIELD_DROPPED: &str = "private_ingest_field_dropped_total";
+/// A display field larger than this, serialized, is dropped (§4.2).
+pub(crate) const DISPLAY_FIELD_MAX_BYTES: usize = 64 * 1024;
+
+/// The mention feature types `mention_dids` reads (§3.1).
+const MENTION_TYPES: [&str; 3] = [
+    "app.bsky.richtext.facet#mention",
+    "tools.kryphocron.feed.postPublic#mention",
+    "#mention",
+];
+
+impl DisplayFields {
+    /// Read the display fields defensively. A field of the wrong type or over
+    /// [`DISPLAY_FIELD_MAX_BYTES`] is dropped and named in `dropped`; it
+    /// never makes the record malformed (C-16).
+    pub(crate) fn parse(record: &Value) -> Self {
+        let mut dropped = Vec::new();
+        let mut keep = |key: &'static str, ok: fn(&Value) -> bool| -> Option<Value> {
+            let v = record.get(key).filter(|v| !v.is_null())?;
+            let fits = serde_json::to_vec(v).is_ok_and(|b| b.len() <= DISPLAY_FIELD_MAX_BYTES);
+            if ok(v) && fits {
+                Some(v.clone())
+            } else {
+                dropped.push(key);
+                None
+            }
+        };
+        let facets = keep("facets", Value::is_array);
+        let embed = keep("embed", Value::is_object);
+        let langs = keep("langs", |v| v.as_array().is_some_and(|a| a.iter().all(Value::is_string)))
+            .map(|v| v.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect());
+        let self_labels = keep("labels", Value::is_object);
+        let quote_uri = embed
+            .as_ref()
+            .map(crate::hydration::embeds::normalize_embed)
+            .and_then(|e| crate::hydration::embeds::quoted_uri(&e).map(str::to_string))
+            .filter(|u| u.starts_with("at://") && uri_author(u).is_some_and(proto_blue::syntax::Did::is_valid));
+        let mut mention_dids: Vec<String> = Vec::new();
+        for feature in facets
+            .iter()
+            .flat_map(|f| f.as_array().into_iter().flatten())
+            .flat_map(|facet| facet.get("features").and_then(Value::as_array).into_iter().flatten())
+        {
+            if feature.get("$type").and_then(Value::as_str).is_some_and(|t| MENTION_TYPES.contains(&t))
+                && let Some(did) = feature.get("did").and_then(Value::as_str)
+                && proto_blue::syntax::Did::is_valid(did)
+                && !mention_dids.iter().any(|d| d == did)
+            {
+                mention_dids.push(did.to_string());
+            }
+        }
+        Self {
+            facets,
+            embed,
+            langs,
+            self_labels,
+            quote_uri,
+            mention_dids,
+            dropped,
+        }
+    }
 }
 
 fn malformed(msg: impl Into<String>) -> IngestError {
@@ -112,6 +198,7 @@ impl PostPrivateFields {
             reply_root_cid,
             reply_parent_cid,
             created_at: created_at(record, now),
+            display: DisplayFields::parse(record),
         })
     }
 }
@@ -121,6 +208,9 @@ impl PostPrivateFields {
 pub(crate) struct AudienceFields {
     pub mode: Option<String>,
     pub members: Vec<String>,
+    /// The operator-facing label (P-3): a string, else `None`. A `name` of
+    /// another type is dropped and counted, never malformed (C-16).
+    pub name: Option<String>,
 }
 
 impl AudienceFields {
@@ -132,6 +222,14 @@ impl AudienceFields {
     /// [`IngestError::Malformed`].
     pub(crate) fn parse(record: &Value) -> Result<Self, IngestError> {
         let mode = opt_string(record, "mode")?;
+        let name = match record.get("name") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if s.len() <= DISPLAY_FIELD_MAX_BYTES => Some(s.clone()),
+            Some(_) => {
+                metrics::counter!(METRIC_FIELD_DROPPED, "field" => "name").increment(1);
+                None
+            }
+        };
         let members = match record.get("members") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(a)) => a
@@ -142,7 +240,7 @@ impl AudienceFields {
                 .collect(),
             Some(_) => return Err(malformed("members is not an array")),
         };
-        Ok(Self { mode, members })
+        Ok(Self { mode, members, name })
     }
 }
 
@@ -190,6 +288,52 @@ async fn enqueue_private(conn: &mut PgConnection, did: &str) -> Result<(), sqlx:
     Ok(())
 }
 
+/// The display refill (private-posting design §3.1, S2): once, at the first
+/// start after migration 0023, a `private` job for every DID with a private
+/// post or audience row stored before it (`display_filled` false), queued
+/// as [`enqueue_private`] queues one. The job lists the DID's private
+/// records to the end and writes them at the repo's latest rev, which fills
+/// those rows; an equal or older rev never overwrites a filled row.
+///
+/// `marker` is the `worker_state` key, written in the same transaction, so
+/// the refill is queued exactly once. Returns the jobs queued, or `None`
+/// when the marker was already there.
+///
+/// # Errors
+///
+/// Database errors; nothing is recorded, and the next start tries again.
+pub(crate) async fn enqueue_display_refill(pool: &PgPool, marker: &str) -> Result<Option<u64>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let first = sqlx::query(
+        "INSERT INTO worker_state (key, value, updated_at) VALUES ($1, to_jsonb(now()::text), now()) \
+         ON CONFLICT (key) DO NOTHING",
+    )
+    .bind(marker)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if !first {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let queued = sqlx::query(
+        "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, updated_at) \
+         SELECT d.did, $1, 'queued', 0, now(), now() FROM ( \
+           SELECT author_did AS did FROM private_posts WHERE NOT display_filled \
+           UNION SELECT owner_did FROM private_audiences WHERE NOT display_filled) d \
+         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
+           not_before = now(), last_error = NULL, updated_at = now() \
+         WHERE backfill_jobs.state NOT IN ('queued', 'running')",
+    )
+    .bind(Depth::Private.as_str())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(Some(queued))
+}
+
 /// The private-ingest insert, for tests that race it against a run.
 #[cfg(test)]
 pub(crate) async fn enqueue_private_for_tests(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
@@ -217,18 +361,28 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
     let changed = match op.nsid.as_str() {
         NSID_POST_PRIVATE => {
             let f = PostPrivateFields::parse(&op.record, now)?;
+            for field in &f.display.dropped {
+                metrics::counter!(METRIC_FIELD_DROPPED, "field" => *field).increment(1);
+            }
+            // A row stored before migration 0023 (`display_filled` false)
+            // also takes an op at its own rev: the refill (§3.1).
             sqlx::query(
                 "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, audience_uri, reply_root_uri, \
                    reply_parent_uri, encoded_content, encoded_codec, encoded_generation, plaintext_text, created_at, \
-                   reply_root_cid, reply_parent_cid) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                   reply_root_cid, reply_parent_cid, facets, embed, langs, self_labels, quote_uri, mention_dids, \
+                   display_filled) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, true) \
                  ON CONFLICT (uri) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, \
                    audience_uri = EXCLUDED.audience_uri, reply_root_uri = EXCLUDED.reply_root_uri, \
                    reply_parent_uri = EXCLUDED.reply_parent_uri, reply_root_cid = EXCLUDED.reply_root_cid, \
                    reply_parent_cid = EXCLUDED.reply_parent_cid, encoded_content = EXCLUDED.encoded_content, \
                    encoded_codec = EXCLUDED.encoded_codec, encoded_generation = EXCLUDED.encoded_generation, \
-                   plaintext_text = EXCLUDED.plaintext_text, created_at = EXCLUDED.created_at \
-                 WHERE private_posts.rev < EXCLUDED.rev",
+                   plaintext_text = EXCLUDED.plaintext_text, created_at = EXCLUDED.created_at, \
+                   facets = EXCLUDED.facets, embed = EXCLUDED.embed, langs = EXCLUDED.langs, \
+                   self_labels = EXCLUDED.self_labels, quote_uri = EXCLUDED.quote_uri, \
+                   mention_dids = EXCLUDED.mention_dids, display_filled = true \
+                 WHERE private_posts.rev < EXCLUDED.rev \
+                    OR (NOT private_posts.display_filled AND private_posts.rev <= EXCLUDED.rev)",
             )
             .bind(&op.uri)
             .bind(author)
@@ -245,6 +399,12 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .bind(f.created_at)
             .bind(&f.reply_root_cid)
             .bind(&f.reply_parent_cid)
+            .bind(&f.display.facets)
+            .bind(&f.display.embed)
+            .bind(&f.display.langs)
+            .bind(&f.display.self_labels)
+            .bind(&f.display.quote_uri)
+            .bind(&f.display.mention_dids)
             .execute(&mut *conn)
             .await?
             .rows_affected()
@@ -253,11 +413,12 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
         NSID_AUDIENCE => {
             let f = AudienceFields::parse(&op.record)?;
             sqlx::query(
-                "INSERT INTO private_audiences (uri, owner_did, rkey, cid, rev, mode, members) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                "INSERT INTO private_audiences (uri, owner_did, rkey, cid, rev, mode, members, name, display_filled) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true) \
                  ON CONFLICT (uri) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, \
-                   mode = EXCLUDED.mode, members = EXCLUDED.members \
-                 WHERE private_audiences.rev < EXCLUDED.rev",
+                   mode = EXCLUDED.mode, members = EXCLUDED.members, name = EXCLUDED.name, display_filled = true \
+                 WHERE private_audiences.rev < EXCLUDED.rev \
+                    OR (NOT private_audiences.display_filled AND private_audiences.rev <= EXCLUDED.rev)",
             )
             .bind(&op.uri)
             .bind(author)
@@ -266,6 +427,7 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .bind(&op.rev)
             .bind(&f.mode)
             .bind(&f.members)
+            .bind(&f.name)
             .execute(&mut *conn)
             .await?
             .rows_affected()
@@ -539,6 +701,47 @@ mod tests {
         assert!(PostPrivateFields::parse(&json!({}), now()).is_ok());
         // An unparseable createdAt falls back to now.
         assert!(PostPrivateFields::parse(&json!({"text": "t", "createdAt": 5}), now()).is_ok());
+    }
+
+    /// Private posting §3.1, §4.2, C-16: display fields are kept as received
+    /// when well typed, dropped (and named) otherwise, and `quote_uri` and
+    /// `mention_dids` are derived from either `$type` form.
+    #[test]
+    fn display_fields_are_read_defensively() {
+        let quoted = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/tools.kryphocron.feed.postPrivate/3kq";
+        for (embed, expected) in [
+            (json!({"$type": "tools.kryphocron.feed.postPublic#embedRecord", "record": {"uri": quoted, "cid": "c"}}), Some(quoted)),
+            (json!({"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "c"}}), Some(quoted)),
+            (json!({"$type": "app.bsky.embed.recordWithMedia", "record": {"record": {"uri": quoted}}, "media": {}}), Some(quoted)),
+            (json!({"$type": "app.bsky.embed.record", "record": {"uri": "https://not.an.at-uri"}}), None),
+            (json!({"$type": "app.bsky.embed.images", "images": []}), None),
+        ] {
+            let d = DisplayFields::parse(&json!({"embed": embed}));
+            assert_eq!(d.quote_uri.as_deref(), expected, "{embed}");
+            assert!(d.dropped.is_empty());
+        }
+        let mention = |t: &str, did: &str| json!({"$type": t, "did": did});
+        let d = DisplayFields::parse(&json!({
+            "facets": [{"features": [mention("tools.kryphocron.feed.postPublic#mention", "did:plc:cccccccccccccccccccccccc"),
+                                     mention("app.bsky.richtext.facet#mention", "did:plc:dddddddddddddddddddddddd"),
+                                     mention("app.bsky.richtext.facet#mention", "did:plc:cccccccccccccccccccccccc"),
+                                     mention("app.bsky.richtext.facet#mention", "not a did"),
+                                     mention("app.bsky.richtext.facet#link", "did:plc:eeeeeeeeeeeeeeeeeeeeeeee")]}],
+            "langs": ["en", "fr"],
+            "labels": {"values": [{"val": "porn"}]},
+        }));
+        assert_eq!(d.mention_dids, ["did:plc:cccccccccccccccccccccccc", "did:plc:dddddddddddddddddddddddd"]);
+        assert_eq!(d.langs, Some(vec!["en".to_string(), "fr".to_string()]));
+        assert!(d.self_labels.is_some() && d.dropped.is_empty());
+        // Wrong types: dropped, never malformed.
+        let bad = json!({"text": "t", "facets": "x", "embed": [1], "langs": ["en", 2], "labels": "porn"});
+        assert_eq!(DisplayFields::parse(&bad).dropped, ["facets", "embed", "langs", "labels"]);
+        let parsed = PostPrivateFields::parse(&bad, now()).expect("still readable");
+        assert_eq!(parsed.display, DisplayFields { dropped: vec!["facets", "embed", "langs", "labels"], ..DisplayFields::default() });
+        // Over 64 KiB serialized: dropped. Null: absent, not dropped.
+        let big = json!({"embed": {"$type": "app.bsky.embed.external", "external": {"uri": "x", "title": "t", "description": "d".repeat(70_000)}}, "langs": null});
+        let d = DisplayFields::parse(&big);
+        assert_eq!((d.embed, d.dropped), (None, vec!["embed"]));
     }
 
     #[test]

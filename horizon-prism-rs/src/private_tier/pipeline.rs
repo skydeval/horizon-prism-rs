@@ -24,10 +24,12 @@ use tokio::sync::Mutex;
 use super::emit::PrivateEmit;
 use super::oracle::{OracleSnapshot, SnapshotInputs};
 use super::{readiness, schema};
+use crate::config::VideoConfig;
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::NSID_POST_PRIVATE;
 use crate::firehose::watermark::Watermarks;
 use crate::hydration::actor::{ProfileContext, ProfileKind};
+use crate::hydration::embeds::{media_view, normalize_embed};
 use crate::hydration::ts;
 use crate::kryphocron_glue::{PipelineGlue, VerifiedCaller};
 use crate::moderation::{self, Gate};
@@ -135,6 +137,8 @@ pub(super) struct PipelineEnv {
     pub freshness_bound: Duration,
     /// `sync.max_head_fetches_per_request`.
     pub max_head_fetches: usize,
+    /// `[video]`: how a video embed's view is built (Addendum A).
+    pub video: VideoConfig,
 }
 
 /// Per-request state: repo-head results by DID, and the synchronous head
@@ -343,11 +347,23 @@ async fn read_inner(
 
     // 12. The view, emitted through the witness.
     let meta = schema::view_meta(&env.pool, &rauth).await?.ok_or(Miss::NoRow)?;
+    let display = schema::display(&env.pool, &rauth).await?.unwrap_or_default();
     let mut record = json!({
         "$type": NSID_POST_PRIVATE,
         "text": text,
         "createdAt": ts(meta.created_at),
     });
+    // The display fields as stored (§4.2): not encoded by the PDS.
+    for (key, value) in [
+        ("facets", display.facets.clone()),
+        ("embed", display.embed.clone()),
+        ("langs", display.langs.as_ref().map(|l| json!(l))),
+        ("labels", display.self_labels.clone()),
+    ] {
+        if let Some(v) = value {
+            record[key] = v;
+        }
+    }
     if let Some(a) = &meta.audience_uri {
         record["audienceList"] = json!(a);
     }
@@ -363,13 +379,51 @@ async fn read_inner(
             "parent": strong_ref(parent, &meta.reply_parent_cid),
         });
     }
-    let view = json!({
+    // The self-labels as label objects (§3.3); the handler adds the
+    // operator labels stored for the URI.
+    let cts = ts(meta.created_at);
+    let labels: Vec<Value> = self_label_values(display.self_labels.as_ref())
+        .map(|val| json!({"src": owner_s, "uri": uri, "cid": meta.cid, "val": val, "cts": cts}))
+        .collect();
+    let mut view = json!({
         "uri": rauth.uri(),
         "cid": meta.cid,
         "author": authors.view(owner_s, ProfileKind::Basic),
         "record": record,
         "indexedAt": ts(meta.indexed_at),
-        "labels": [],
+        "labels": labels,
     });
+    // The media part of `embed` (§4.2); the handler adds the record part.
+    let pds = authors.rows.get(owner_s).and_then(|r| r.pds_endpoint.as_deref());
+    if let Some(media) = display
+        .embed
+        .as_ref()
+        .map(normalize_embed)
+        .and_then(|e| media_view(owner_s, pds, &e, &env.video))
+    {
+        view["embed"] = media;
+    }
+    // The audience (P-3, §4.10): present while its row exists. `mode` is
+    // left out when NULL, which reads as `list`; `members` never appears.
+    if let (true, Some(a)) = (meta.audience_found, &meta.audience_uri) {
+        let mut audience = json!({"uri": a});
+        if let Some(mode) = &meta.audience_mode {
+            audience["mode"] = json!(mode);
+        }
+        if let Some(name) = &meta.audience_name {
+            audience["name"] = json!(name);
+        }
+        view["audience"] = audience;
+    }
     Ok(PrivateEmit::new(&rauth, view))
+}
+
+/// The `val`s of a stored `#selfLabels` object.
+fn self_label_values(labels: Option<&Value>) -> impl Iterator<Item = &str> {
+    labels
+        .and_then(|l| l.get("values"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("val").and_then(Value::as_str))
 }

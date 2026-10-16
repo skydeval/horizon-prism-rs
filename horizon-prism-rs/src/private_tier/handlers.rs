@@ -19,7 +19,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::emit::{PrivateEmit, PrivateResponse, ThreadNode, ThreadParent};
 use super::pipeline::{self, PipelineEnv, RequestState};
@@ -27,8 +27,9 @@ use super::schema;
 use crate::config::PrivateReadConfig;
 use crate::db::locks::uri_author;
 use crate::hydration::HydrationContext;
-use crate::hydration::normalize::is_private_uri;
 use crate::hydration::actor::ProfileContext;
+use crate::hydration::embeds::{EMBED_RECORD_WITH_MEDIA, media_view, normalize_embed, quoted_uri};
+use crate::hydration::normalize::is_private_uri;
 use crate::kryphocron_glue::VerifiedCaller;
 use crate::xrpc::AppState;
 use crate::xrpc::auth::{Params, prepare_private, request_handle, request_ip};
@@ -76,6 +77,7 @@ impl PrivateState {
         cfg: &PrivateReadConfig,
     ) -> Self {
         let pool = app.hydrator.pool().clone();
+        let video = app.hydrator.video().clone();
         Self {
             app,
             env: PipelineEnv {
@@ -85,6 +87,7 @@ impl PrivateState {
                 watermarks,
                 freshness_bound,
                 max_head_fetches,
+                video,
             },
             floors: Floors {
                 get_posts: Duration::from_millis(cfg.floor_ms.get_posts),
@@ -157,6 +160,160 @@ async fn read_many(
         .await
 }
 
+/// Add the operator labels stored for each post (the `labels` table) after
+/// its self-labels (private-posting design §3.3).
+async fn operator_labels(hydration: &HydrationContext, posts: &mut [&mut PrivateEmit<Value>]) -> Result<(), XrpcError> {
+    let uris: Vec<String> = posts.iter().filter_map(|p| view_uri(p)).collect();
+    if uris.is_empty() {
+        return Ok(());
+    }
+    let stored = hydration.labels(&uris).await?;
+    for post in posts.iter_mut() {
+        let Some(extra) = view_uri(post).and_then(|u| stored.get(&u)) else {
+            continue;
+        };
+        let mut labels = post.view().get("labels").and_then(Value::as_array).cloned().unwrap_or_default();
+        labels.extend(extra.iter().cloned());
+        post.decorate("labels", Value::Array(labels));
+    }
+    Ok(())
+}
+
+fn view_uri(post: &PrivateEmit<Value>) -> Option<String> {
+    post.view().get("uri").and_then(Value::as_str).map(str::to_string)
+}
+
+/// The stored embed of a post's record, `$type` normalized (§4.2).
+fn stored_embed(post: &PrivateEmit<Value>) -> Option<Value> {
+    post.view().pointer("/record/embed").map(normalize_embed)
+}
+
+/// The media view of a `recordWithMedia` embed's `media`, on the author's
+/// PDS from `authors`.
+fn embedded_media(s: &PrivateState, post: &PrivateEmit<Value>, embed: &Value, authors: &ProfileContext) -> Option<Value> {
+    let did = post.view().pointer("/author/did").and_then(Value::as_str)?;
+    let pds = authors.rows.get(did).and_then(|r| r.pds_endpoint.as_deref());
+    media_view(did, pds, embed.get("media")?, &s.env.video)
+}
+
+fn not_found_record(uri: &str) -> Value {
+    json!({"$type": "app.bsky.embed.record#viewNotFound", "uri": uri, "notFound": true})
+}
+
+/// A readable quoted private post as `app.bsky.embed.record#viewRecord`
+/// (§4.2): the decoded record as `value`, and its media one level deep, as
+/// `record_view` does for public posts.
+fn view_record(s: &PrivateState, quoted: &PrivateEmit<Value>, authors: &ProfileContext) -> Value {
+    let v = quoted.view();
+    let mut record = json!({
+        "$type": "app.bsky.embed.record#viewRecord",
+        "uri": v["uri"],
+        "cid": v["cid"],
+        "author": v["author"],
+        "value": v["record"],
+        "labels": v["labels"],
+        "indexedAt": v["indexedAt"],
+    });
+    let media = match v.get("embed") {
+        Some(media) => Some(media.clone()),
+        None => stored_embed(quoted)
+            .filter(|e| e.get("$type").and_then(Value::as_str) == Some(EMBED_RECORD_WITH_MEDIA))
+            .and_then(|e| embedded_media(s, quoted, &e, authors)),
+    };
+    if let Some(media) = media {
+        record["embeds"] = json!([media]);
+    }
+    record
+}
+
+/// The decoration pass of a page (private-posting design §3.3), over hits
+/// only: the operator labels, then the record part of each `embed`.
+///
+/// - A quoted private post is read through the pipeline for the same reader
+///   and the same `RequestState`, all of the page's at once: readable gives
+///   `#viewRecord`; anything else, a block with its author included, gives
+///   `#viewNotFound`, the answer for a URI that names nothing.
+/// - A quoted public post comes from local rows, in On mode only. With
+///   nothing there the view carries no `embed`, for `record` and
+///   `recordWithMedia` alike, and the client builds the quote from
+///   `record.embed`.
+/// - Quotes are not followed past one level.
+async fn decorate(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    posts: &mut [&mut PrivateEmit<Value>],
+    start: Instant,
+) -> Result<(), XrpcError> {
+    operator_labels(hydration, posts).await?;
+    let quotes: Vec<Option<(Value, String)>> = posts
+        .iter()
+        .map(|p| {
+            let embed = stored_embed(p)?;
+            let quoted = quoted_uri(&embed)?.to_string();
+            Some((embed, quoted))
+        })
+        .collect();
+    let mut private: Vec<String> = Vec::new();
+    for (_, uri) in quotes.iter().flatten() {
+        if is_private_uri(uri) && !private.contains(uri) {
+            private.push(uri.clone());
+        }
+    }
+    let mut records: HashMap<String, Value> = HashMap::new();
+    if !private.is_empty() {
+        let quoted_authors = profiles(hydration, &private).await?;
+        let mut hits: Vec<PrivateEmit<Value>> =
+            read_many(s, rs, caller, &private, &quoted_authors, start).await.into_iter().flatten().collect();
+        let mut refs: Vec<&mut PrivateEmit<Value>> = hits.iter_mut().collect();
+        operator_labels(hydration, &mut refs).await?;
+        for q in &hits {
+            if let Some(uri) = view_uri(q) {
+                records.insert(uri, view_record(s, q, &quoted_authors));
+            }
+        }
+    }
+    // Authors' PDS endpoints, for the media of `recordWithMedia` embeds.
+    let with_media: Vec<String> = posts
+        .iter()
+        .zip(&quotes)
+        .filter(|(_, q)| q.as_ref().is_some_and(|(e, _)| e.get("$type").and_then(Value::as_str) == Some(EMBED_RECORD_WITH_MEDIA)))
+        .filter_map(|(p, _)| view_uri(p))
+        .collect();
+    let media_authors = if with_media.is_empty() {
+        None
+    } else {
+        Some(profiles(hydration, &with_media).await?)
+    };
+    for (post, quote) in posts.iter_mut().zip(quotes) {
+        let (Some((embed, quoted)), Some(uri)) = (quote, view_uri(post)) else {
+            continue;
+        };
+        let record = if is_private_uri(&quoted) {
+            records.get(&quoted).cloned().unwrap_or_else(|| not_found_record(&quoted))
+        } else {
+            match hydration.public_record_view(&quoted, &uri).await? {
+                Some(view) => view.inner().clone(),
+                None => continue,
+            }
+        };
+        let record = json!({"$type": "app.bsky.embed.record#view", "record": record});
+        if embed.get("$type").and_then(Value::as_str) == Some(EMBED_RECORD_WITH_MEDIA) {
+            let Some(media) = media_authors.as_ref().and_then(|a| embedded_media(s, post, &embed, a)) else {
+                continue;
+            };
+            post.decorate(
+                "embed",
+                json!({"$type": "app.bsky.embed.recordWithMedia#view", "record": record, "media": media}),
+            );
+        } else {
+            post.decorate("embed", record);
+        }
+    }
+    Ok(())
+}
+
 fn ok(body: PrivateResponse) -> Response {
     Json(body).into_response()
 }
@@ -197,7 +354,10 @@ async fn posts_body(
     let hydration = private_hydration(s, caller, ip).await?;
     let authors = profiles(&hydration, &candidates).await?;
     let rs = RequestState::new(s.env.max_head_fetches);
-    let posts = read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
+    let mut posts: Vec<PrivateEmit<Value>> =
+        read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
+    let mut refs: Vec<&mut PrivateEmit<Value>> = posts.iter_mut().collect();
+    decorate(s, &rs, caller, &hydration, &mut refs, start).await?;
     Ok(PrivateResponse::posts(posts))
 }
 
@@ -252,7 +412,7 @@ async fn thread_body(
     let hydration = private_hydration(s, caller, ip).await?;
     let anchor_uri = vec![uri.to_string()];
     let authors = profiles(&hydration, &anchor_uri).await?;
-    let Ok(anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
+    let Ok(mut anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
         return Ok(None);
     };
     let mut budget = THREAD_NODE_CAP - 1;
@@ -315,6 +475,13 @@ async fn thread_body(
             }
         }
     }
+
+    // Every node is read; decorate them all at once.
+    let mut refs: Vec<&mut PrivateEmit<Value>> = std::iter::once(&mut anchor)
+        .chain(chain.iter_mut())
+        .chain(replies.values_mut().flatten())
+        .collect();
+    decorate(s, &rs, caller, &hydration, &mut refs, start).await?;
 
     let mut root = build(anchor, uri, &mut replies, &expanded);
     // Nest the parent chain above the anchor, nearest first.
@@ -487,6 +654,8 @@ async fn feed_body(
         after = Some((tail.1, tail.2.clone()));
     }
     let cursor = last_hit.filter(|_| more).map(|(at, key)| cursor(at, &key));
+    let mut refs: Vec<&mut PrivateEmit<Value>> = feed.iter_mut().collect();
+    decorate(s, &rs, caller, &hydration, &mut refs, start).await?;
     Ok(PrivateResponse::feed(feed, cursor))
 }
 

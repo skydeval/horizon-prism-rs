@@ -1,7 +1,7 @@
 //! Private-context hydration (design-v4 §8.1 "Private-context hydration";
 //! R3-179, B-54): how the private handlers (`src/private_tier/handlers.rs`)
-//! render the public parts of a private view, meaning authors and
-//! `publicParent`.
+//! render the public parts of a private view, meaning authors,
+//! `publicParent`, a quoted public post and the labels stored for a post.
 //!
 //! [`HydrationContext::Private`] is the private handlers' only door to the
 //! [`Hydrator`]. It is a distinct type, so they cannot reach a public entry
@@ -22,6 +22,8 @@
 //!
 //! So the private pipeline leaves no trace in any state a public request
 //! reads.
+
+use std::collections::HashMap;
 
 use serde_json::Value;
 
@@ -72,5 +74,29 @@ impl HydrationContext {
     pub async fn public_post(&self, uri: &str) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
         let Self::Private { hydrator, viewer, req } = self;
         hydrator.public_post_view(viewer, req, uri).await
+    }
+
+    /// The record view of a public post that the private post `quoting`
+    /// embeds (private-posting design §4.2): local rows only, in On mode
+    /// only, else `None`. Nothing is fetched upstream, so the read leaves no
+    /// trace in a shared cache.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn public_record_view(&self, uri: &str, quoting: &str) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
+        let Self::Private { hydrator, viewer, req } = self;
+        hydrator.public_record_view(viewer, req, uri, quoting).await
+    }
+
+    /// The labels stored for `subjects` (the `labels` table), by subject, in
+    /// the shape public views carry them (design-v4 §II-7.8).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn labels(&self, subjects: &[String]) -> Result<HashMap<String, Vec<Value>>, sqlx::Error> {
+        let Self::Private { hydrator, .. } = self;
+        hydrator.load_labels(subjects).await
     }
 }

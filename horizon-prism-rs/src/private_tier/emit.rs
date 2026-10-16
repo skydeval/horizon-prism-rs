@@ -38,6 +38,26 @@ impl PrivateEmit<Value> {
     pub(in crate::private_tier) fn view(&self) -> &Value {
         &self.0
     }
+
+    /// Add `key` to the view after the page's reads (private-posting design
+    /// §3.3): a value computed for a URI that is already a hit, such as the
+    /// record part of `embed` or the operator labels. Content of another
+    /// private record reaches it only through that record's own
+    /// `PrivateEmit`.
+    ///
+    /// # Panics
+    ///
+    /// On `uri`, `cid`, `author`, `record` or `indexedAt`: what the witness
+    /// emitted is never replaced.
+    pub(in crate::private_tier) fn decorate(&mut self, key: &str, value: Value) {
+        assert!(
+            !matches!(key, "uri" | "cid" | "author" | "record" | "indexedAt"),
+            "PrivateEmit::decorate may not replace {key}"
+        );
+        if let Value::Object(view) = &mut self.0 {
+            view.insert(key.to_string(), value);
+        }
+    }
 }
 
 impl<T: Serialize> Serialize for PrivateEmit<T> {

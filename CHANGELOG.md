@@ -12,6 +12,30 @@ commit.
 
 ### Added
 
+- **Private post views carry their content (private posting S2, #719;
+  Horizon P-1, P-3).** `privatePostView.record` now carries `facets`,
+  `embed`, `langs` and `labels` as stored, and the view has a top-level
+  `embed` in the stock `app.bsky.embed.*#view` shapes (images, external,
+  video, gallery, record, recordWithMedia; both the kryphocron and the
+  stock `$type` forms are read). A quoted private post is read through the
+  private pipeline for the same reader (`#viewRecord` if readable, else
+  `#viewNotFound`); a quoted public post is a `#viewRecord` only when
+  public indexing is on. `labels` holds self-labels and operator labels.
+  The view gains `audience: {uri, mode?, name?}`; audience names are
+  stored and follow renames. A display field of the wrong type is dropped
+  and counted (`private_ingest_field_dropped_total{field}`), never the
+  post. Migration 0023 adds the columns; on first start a `private` job is
+  queued for each account whose rows predate it, to fill them.
+  - **Video playback** (new `[video] playback`, default `bsky_cdn`): video
+    views, public and private, use Bluesky's HLS playlist and thumbnail
+    (`[video] cdn_url`, default `https://video.bsky.app`); tested to work
+    for a video no post references. `pds_blob` keeps the MP4 blob on the
+    author's PDS and no thumbnail.
+  - Private read floors rise: `getPosts` 1000 ms, `getPostThread`,
+    `getAuthorFeed` and `getTimeline` 1200 ms. A deployment that pins the
+    old values in `[private_read.floor_ms]` keeps them until updated.
+  - `getMembership`'s `features` gains `private.embeds`.
+
 - **`app.nearhorizon.actor.getMembership` (private posting S1, #719;
   Horizon P-10).** A signed-in account asks whether it is a member, in
   every public-indexing mode; an eligible account is enrolled exactly as

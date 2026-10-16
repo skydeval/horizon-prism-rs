@@ -127,10 +127,10 @@ bind_concurrency = 8
 membership_retry_after_secs = 5
 
 [private_read.floor_ms]
-get_posts = 800
-get_post_thread = 1000
-get_author_feed = 1000
-get_timeline = 1000
+get_posts = 1000
+get_post_thread = 1200
+get_author_feed = 1200
+get_timeline = 1200
 
 [sync]
 head_max_age_secs = 60
@@ -282,6 +282,10 @@ subscribed_post_max_age_secs = 86400
 max_per_actor = 50000
 emit_count = "never"
 count_floor = 10
+
+[video]
+playback = "bsky_cdn"
+cdn_url = "https://video.bsky.app"
 
 [drafts]
 max_per_actor = 1000
@@ -835,6 +839,18 @@ fn pds_patterns_are_checked() {
 fn microcosm_urls_must_be_https() {
     let p = invalid_problems(load("[microcosm]\nslingshot_url = \"http://slingshot.example\"\n"));
     assert!(has(&p, "microcosm.slingshot_url"));
+}
+
+/// Private posting, Addendum A: `[video]` takes the two playback values and
+/// an `https` CDN base.
+#[test]
+fn video_playback_and_cdn_url_are_checked() {
+    assert_eq!(load("").expect("defaults").file.video.playback, VideoPlayback::BskyCdn);
+    let cfg = load("[video]\nplayback = \"pds_blob\"\n").expect("valid");
+    assert_eq!(cfg.file.video.playback, VideoPlayback::PdsBlob);
+    assert!(matches!(load("[video]\nplayback = \"hls\"\n"), Err(ConfigError::Parse(_))));
+    let p = invalid_problems(load("[video]\ncdn_url = \"http://video.example\"\n"));
+    assert!(has(&p, "video.cdn_url"));
 }
 
 #[test]

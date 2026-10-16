@@ -22,11 +22,13 @@ use super::handlers::{PrivateState, router};
 use super::oracle::{OracleSnapshot, SnapshotInputs};
 use super::{KryphocronPrivateTier, PrivateTier, readiness, schema};
 use crate::aggregations::{ScopeSets, ScopeState};
-use crate::config::{PrivateReadConfig, PrivateReadFloors, ScopePolicy, SyncConfig};
+use crate::config::{PrivateReadConfig, PrivateReadFloors, ScopePolicy, SyncConfig, VideoConfig, VideoPlayback};
 use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE};
 use crate::firehose::watermark::Watermarks;
 use crate::firehose::writer::{Action, ApplyOptions, RawOp, WriteSource, Writer};
-use crate::hydration::testing::{actor, exec, hydrator};
+use crate::hydration::HydrationConfig;
+use crate::hydration::testing::{actor, exec, hydrator, hydrator_configured, test_config};
+use crate::indexing::{PublicMode, PublicState};
 use crate::kryphocron_glue::audit::GlueSinks;
 use crate::kryphocron_glue::jwt::tests::{AUDIENCE_HOST, StubFetcher, mint, signing_key, verifier};
 use crate::kryphocron_glue::{PipelineGlue, at_rest_hooks};
@@ -57,6 +59,7 @@ struct Fixture {
     glue: PipelineGlue,
     app: AppState,
     prober: HeadProber,
+    sets: ScopeSets,
 }
 
 fn data_dir(test: &str) -> std::path::PathBuf {
@@ -66,6 +69,11 @@ fn data_dir(test: &str) -> std::path::PathBuf {
 }
 
 async fn fixture(pool: &PgPool, test: &str) -> Fixture {
+    fixture_in(pool, test, PublicMode::On).await
+}
+
+/// The fixture with public indexing in `mode` (T-1: every mode).
+async fn fixture_in(pool: &PgPool, test: &str, mode: PublicMode) -> Fixture {
     for (did, handle) in [(ALICE, "alice.test"), (BOB, "bob.test"), (CAROL, "carol.test"), (DAVE, "dave.test")] {
         actor(pool, did, handle, handle).await;
         sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())")
@@ -93,6 +101,7 @@ async fn fixture(pool: &PgPool, test: &str) -> Fixture {
         sets.scope.insert(d.into());
         sets.members.insert(d.into());
     }
+    sets.public = PublicState { mode, ..PublicState::default() };
     let scope = ScopeState::new(sets.clone(), ScopePolicy::MembersAndOneHop, 10_000);
     let private: Arc<dyn PrivateTier> = Arc::new(KryphocronPrivateTier);
     let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private));
@@ -104,7 +113,7 @@ async fn fixture(pool: &PgPool, test: &str) -> Fixture {
     }
     let (auth, _drainer) = verifier(fetcher, 100, 16);
     let app = AppState {
-        hydrator: hydrator(pool, sets),
+        hydrator: hydrator(pool, sets.clone()),
         auth: Arc::new(auth),
         limits: RateLimits::new(),
         enroller: None,
@@ -131,6 +140,7 @@ async fn fixture(pool: &PgPool, test: &str) -> Fixture {
         glue,
         app,
         prober,
+        sets,
     }
 }
 
@@ -140,6 +150,18 @@ impl Fixture {
     }
 
     fn state_floored(&self, watermark_age: Option<Duration>, floor: Duration) -> PrivateState {
+        self.state_of(self.app.clone(), watermark_age, floor)
+    }
+
+    /// A fresh watermark, the test floor, and video views built per `video`
+    /// (Addendum A).
+    fn state_with_video(&self, video: VideoConfig) -> PrivateState {
+        let mut app = self.app.clone();
+        app.hydrator = hydrator_configured(&self.pool, self.sets.clone(), HydrationConfig { video, ..test_config() });
+        self.state_of(app, Some(Duration::from_secs(1)), FLOOR)
+    }
+
+    fn state_of(&self, app: AppState, watermark_age: Option<Duration>, floor: Duration) -> PrivateState {
         let watermarks = Watermarks::new(BTreeMap::new(), vec![RELAY.into()]);
         if let Some(age) = watermark_age {
             watermarks.observe(RELAY, Utc::now() - chrono::Duration::from_std(age).expect("age"));
@@ -156,7 +178,7 @@ impl Fixture {
             },
         };
         PrivateState::new(
-            self.app.clone(),
+            app,
             self.glue.clone(),
             self.prober.clone(),
             watermarks,
@@ -213,6 +235,22 @@ impl Fixture {
 
     /// Apply one op through the firehose writer at `rev`.
     async fn apply_op(&self, repo: &str, action: Action, collection: &str, rkey: &str, rev: &str, record: Option<Value>) {
+        self.apply_from(WriteSource::Firehose, repo, action, collection, rkey, rev, record).await;
+    }
+
+    /// [`Self::apply_op`] as `source` writes it (a backfill job writes every
+    /// listed record at the repo's latest rev).
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_from(
+        &self,
+        source: WriteSource,
+        repo: &str,
+        action: Action,
+        collection: &str,
+        rkey: &str,
+        rev: &str,
+        record: Option<Value>,
+    ) {
         let cid = record.as_ref().map(|_| if rev == REV { format!("bafy{rkey}") } else { format!("bafy{rkey}{rev}") });
         let report = self
             .writer
@@ -232,7 +270,7 @@ impl Fixture {
                     attempts: 1,
                     live: false,
                     subscription_rules: false,
-                    source: WriteSource::Firehose,
+                    source,
                 },
             )
             .await
@@ -1124,11 +1162,14 @@ async fn pre_s0_count_query_counts_each_kind() {
 #[tokio::test]
 #[ignore = "B-5 measurement; run with --ignored --nocapture"]
 async fn b5_private_floors_with_eight_step_chains() {
-    b5_floors("b5-floors-walk", false).await;
-    b5_floors("b5-floors-baseline", true).await;
+    b5_floors("b5-floors-walk", false, false).await;
+    b5_floors("b5-floors-baseline", true, false).await;
+    // Private posting S2: every reply also quotes its parent, read in the
+    // page's second round: one more bind per hit, none deduplicated.
+    b5_floors("b5-floors-quotes", false, true).await;
 }
 
-async fn b5_floors(test: &str, baseline: bool) {
+async fn b5_floors(test: &str, baseline: bool, quotes: bool) {
     let Some(w) = Walk::new(test, Layout::SamePds, Some("followers"), &[]).await else {
         return;
     };
@@ -1138,7 +1179,15 @@ async fn b5_floors(test: &str, baseline: bool) {
         let mut parent = w.root.clone();
         for level in 1..=8 {
             let author = if level % 2 == 1 { odd } else { even };
-            parent = w.reply(author, &format!("3kc{chain:02}l{level}22222"), &parent).await;
+            let rkey = format!("3kc{chain:02}l{level}22222");
+            parent = if quotes {
+                let mut record = w.f.post_record(author, &rkey, &w.aud, Some((&w.root, &parent))).await;
+                record["embed"] = json!({"$type": format!("{KLEX}#embedRecord"), "record": {"uri": parent, "cid": "bafyany"}});
+                w.f.ingest(author, NSID_POST_PRIVATE, &rkey, record).await;
+                format!("at://{author}/{NSID_POST_PRIVATE}/{rkey}")
+            } else {
+                w.reply(author, &rkey, &parent).await
+            };
         }
         leaves.push(parent);
     }
@@ -1150,7 +1199,11 @@ async fn b5_floors(test: &str, baseline: bool) {
     w.f.ready_all().await;
     let mut posts_query: Vec<String> = leaves.iter().map(|u| format!("uris={u}")).collect();
     posts_query.push(format!("uris={}", w.root));
-    let run = if baseline { "baseline, one author" } else { "8-step walks" };
+    let run = match (baseline, quotes) {
+        (true, _) => "baseline, one author",
+        (false, false) => "8-step walks",
+        (false, true) => "8-step walks, each reply quoting its parent",
+    };
     let cases = [
         ("getPosts (24 leaves at depth 8, the root)", POSTS, posts_query.join("&"), "posts", 25),
         ("getPostThread (root, depth 10, 193 nodes)", THREAD, format!("uri={}&depth=10", w.root), "", 0),
@@ -1158,12 +1211,13 @@ async fn b5_floors(test: &str, baseline: bool) {
         ("getTimeline (limit 50)", TIMELINE, "limit=50".to_string(), "feed", 50),
     ];
     for (name, method, query, key, items) in cases {
-        // Fresh heads and watermark for each endpoint: the fixture's
-        // heads age out after 60 s, and a stale head is a miss.
-        exec(&w.f.pool, "UPDATE sync_state SET head_checked_at = now()").await;
+        // A fresh watermark for each endpoint and fresh heads for each run:
+        // the fixture's heads age out after 60 s, a stale head is a miss,
+        // and 40 thread runs with quotes take longer than that.
         let base = serve(w.f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
         let mut took = Vec::new();
         for _ in 0..40 {
+            exec(&w.f.pool, "UPDATE sync_state SET head_checked_at = now()").await;
             let (status, body, t) = get(&base, method, &query, DAVE, DAVE_KEY).await;
             assert_eq!(status, 200, "{name}: {body}");
             if !key.is_empty() {
@@ -1182,4 +1236,414 @@ async fn b5_floors(test: &str, baseline: bool) {
         );
     }
     w.finish().await;
+}
+
+// ---- Private posting S2: display fields, embeds, quotes, audience (P-1, P-3) ----
+
+/// kryphocron-lexicons 0.3.1's embed and facet namespace.
+const KLEX: &str = "tools.kryphocron.feed.postPublic";
+/// A rev below every fixture record's [`REV`].
+const OLD_REV: &str = "3kaaaaaaaaa22";
+/// A rev above [`REV2`].
+const REV3: &str = "3kaaaaaaaaac2";
+
+fn blob(cid: &str) -> Value {
+    json!({"$type": "blob", "ref": {"$link": cid}, "mimeType": "image/jpeg", "size": 1})
+}
+
+fn blob_on_pds(did: &str, cid: &str) -> String {
+    format!("https://pds.example.com/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}")
+}
+
+impl Fixture {
+    /// An encoded private post by `author` whose text is its rkey, with the
+    /// fields of `extra` added to the record as Aurora-Locus stores them.
+    async fn post_with(&self, author: &str, rkey: &str, audience: &str, extra: Value) -> String {
+        let record = self.record_with(author, rkey, audience, &extra).await;
+        self.ingest(author, NSID_POST_PRIVATE, rkey, record).await;
+        format!("at://{author}/{NSID_POST_PRIVATE}/{rkey}")
+    }
+
+    async fn record_with(&self, author: &str, rkey: &str, audience: &str, extra: &Value) -> Value {
+        let mut record = self.encoded_post(author, rkey, rkey, Some(audience)).await;
+        for (k, v) in extra.as_object().expect("an object") {
+            record[k] = v.clone();
+        }
+        record
+    }
+}
+
+/// `getPosts([uri])` for `reader`: the raw body and the one post, or
+/// `Null` when it was omitted.
+async fn one_post(base: &str, reader: &str, uri: &str) -> (String, Value) {
+    let (status, body, _) = get(base, POSTS, &format!("uris={uri}"), reader, key_of(reader)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    let post = v["posts"].get(0).cloned().unwrap_or(Value::Null);
+    (body, post)
+}
+
+/// T-4 (P-1), run in On and in Off (T-1): every `$type` form of §4.2's
+/// table gives the stock view; four images give four URLs on the author's
+/// PDS; facets, langs and self-labels are carried as stored; the operator's
+/// labels follow the self-labels; a display field of the wrong type or over
+/// 64 KiB is dropped (and counted), and the post still reads. Addendum A: a
+/// video under each playback setting.
+async fn display_fields_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let images: Vec<Value> = (1..=4)
+        .map(|i| json!({"image": blob(&format!("bafyimg{i}")), "alt": format!("image {i}"), "aspectRatio": {"width": 4, "height": 3}}))
+        .collect();
+    let facets = json!([
+        {"index": {"byteStart": 0, "byteEnd": 5}, "features": [{"$type": format!("{KLEX}#mention"), "did": CAROL}]},
+        {"index": {"byteStart": 6, "byteEnd": 9}, "features": [{"$type": "app.bsky.richtext.facet#mention", "did": DAVE},
+                                                                {"$type": "app.bsky.richtext.facet#link", "uri": "https://example.com"}]},
+    ]);
+    let self_labels = json!({"$type": format!("{KLEX}#selfLabels"), "values": [{"val": "nudity"}]});
+    let gallery_item = |cid: &str, alt: &str| json!({"$type": format!("{KLEX}#galleryImage"), "image": blob(cid), "alt": alt, "aspectRatio": {"width": 2, "height": 1}});
+    let cases: Vec<(&str, Value)> = vec![
+        ("3kimagesk222", json!({"embed": {"$type": format!("{KLEX}#embedImage"), "images": images}, "facets": facets, "langs": ["en"], "labels": self_labels})),
+        ("3kimagess222", json!({"embed": {"$type": "app.bsky.embed.images", "images": [images[0]]}})),
+        ("3kexternal22", json!({"embed": {"$type": format!("{KLEX}#embedExternal"),
+            "external": {"uri": "https://example.com", "title": "t", "description": "d", "thumb": blob("bafythumb")}}})),
+        ("3kvideo22222", json!({"embed": {"$type": format!("{KLEX}#embedVideo"), "video": blob("bafyvideo"), "alt": "a clip"}})),
+        ("3kgallery222", json!({"embed": {"$type": format!("{KLEX}#embedGallery"), "items": [gallery_item("bafyg1", "g1"), gallery_item("bafyg2", "g2")]}})),
+        ("3kwrongtype2", json!({"embed": "not an object", "langs": [1], "facets": {"x": 1}})),
+        ("3koversize22", json!({"facets": [{"index": {"byteStart": 0, "byteEnd": 1}, "features": [], "pad": "x".repeat(70_000)}]})),
+    ];
+    let mut uris = Vec::new();
+    for (rkey, extra) in &cases {
+        let record = f.record_with(ALICE, rkey, &aud, extra).await;
+        // C-16: a wrong-typed or oversized field is dropped and counted;
+        // the record is not malformed.
+        let dropped = super::ingest::DisplayFields::parse(&record).dropped;
+        match *rkey {
+            "3kwrongtype2" => assert_eq!(dropped, ["facets", "embed", "langs"]),
+            "3koversize22" => assert_eq!(dropped, ["facets"]),
+            _ => assert!(dropped.is_empty(), "{rkey}: {dropped:?}"),
+        }
+        f.ingest(ALICE, NSID_POST_PRIVATE, rkey, record).await;
+        uris.push(format!("at://{ALICE}/{NSID_POST_PRIVATE}/{rkey}"));
+    }
+    exec(&f.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{}', 'spam')", uris[0])).await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    let query: Vec<String> = uris.iter().map(|u| format!("uris={u}")).collect();
+    let (status, body, _) = get(&base, POSTS, &query.join("&"), BOB, BOB_KEY).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("encodedContent"), "encoded fields never appear: {body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    let posts = v["posts"].as_array().expect("posts");
+    assert_eq!(posts.len(), cases.len(), "{body}");
+
+    // The kryphocron image form: four images on Alice's PDS, and the record
+    // as stored.
+    let p = &posts[0];
+    assert_eq!(p["embed"]["$type"], "app.bsky.embed.images#view");
+    let shown = p["embed"]["images"].as_array().expect("images");
+    assert_eq!(shown.len(), 4);
+    for (i, img) in shown.iter().enumerate() {
+        let url = blob_on_pds(ALICE, &format!("bafyimg{}", i + 1));
+        assert_eq!((img["thumb"].as_str(), img["fullsize"].as_str()), (Some(url.as_str()), Some(url.as_str())));
+        assert_eq!(img["alt"], format!("image {}", i + 1));
+        assert_eq!(img["aspectRatio"], json!({"width": 4, "height": 3}));
+    }
+    assert_eq!(p["record"]["embed"]["$type"], format!("{KLEX}#embedImage"), "record.embed is as stored");
+    assert_eq!(p["record"]["facets"], facets);
+    assert_eq!(p["record"]["langs"], json!(["en"]));
+    assert_eq!(p["record"]["labels"], self_labels);
+    assert_eq!(p["record"]["text"], "3kimagesk222");
+    assert_eq!(
+        p["labels"][0],
+        json!({"src": ALICE, "uri": uris[0], "cid": "bafy3kimagesk222", "val": "nudity", "cts": "2026-09-26T12:00:00.000Z"})
+    );
+    assert_eq!((p["labels"][1]["val"].as_str(), p["labels"][1]["uri"].as_str()), (Some("spam"), Some(uris[0].as_str())));
+    assert_ne!(p["labels"][1]["src"], ALICE, "an operator label is the AppView's");
+    let derived: (Vec<String>, Option<String>) =
+        sqlx::query_as("SELECT mention_dids, quote_uri FROM private_posts WHERE uri = $1")
+            .bind(&uris[0])
+            .fetch_one(&f.pool)
+            .await
+            .expect("row");
+    assert_eq!(derived, (vec![CAROL.to_string(), DAVE.to_string()], None), "mentions in either form");
+
+    // The stock image form.
+    assert_eq!(posts[1]["embed"]["images"][0]["thumb"], blob_on_pds(ALICE, "bafyimg1"));
+    // External, with its thumb on the PDS.
+    assert_eq!(posts[2]["embed"]["$type"], "app.bsky.embed.external#view");
+    assert_eq!(posts[2]["embed"]["external"]["thumb"], blob_on_pds(ALICE, "bafythumb"));
+    assert_eq!(posts[2]["embed"]["external"]["title"], "t");
+    // Video, by default from the CDN with a thumbnail.
+    let cdn = format!("https://video.bsky.app/watch/did%3Aplc%3A{}/bafyvideo", &ALICE[8..]);
+    assert_eq!(posts[3]["embed"]["$type"], "app.bsky.embed.video#view");
+    assert_eq!(posts[3]["embed"]["playlist"], format!("{cdn}/playlist.m3u8"));
+    assert_eq!(posts[3]["embed"]["thumbnail"], format!("{cdn}/thumbnail.jpg"));
+    assert_eq!(posts[3]["embed"]["alt"], "a clip");
+    // Gallery: `#galleryImage` items read as `app.bsky.embed.gallery#image`.
+    assert_eq!(posts[4]["embed"]["$type"], "app.bsky.embed.gallery#view");
+    let items = posts[4]["embed"]["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[1], json!({"$type": "app.bsky.embed.gallery#viewImage", "thumbnail": blob_on_pds(ALICE, "bafyg2"),
+        "fullsize": blob_on_pds(ALICE, "bafyg2"), "alt": "g2", "aspectRatio": {"width": 2, "height": 1}}));
+    // Dropped fields: the post still reads, without them.
+    for p in &posts[5..] {
+        assert!(p.get("embed").is_none(), "{p}");
+        for key in ["embed", "langs", "facets"] {
+            assert!(p["record"].get(key).is_none(), "{key}: {p}");
+        }
+        assert!(p["record"]["text"].is_string());
+    }
+
+    // Addendum A: `pds_blob` plays the MP4 blob, with no thumbnail.
+    let blob_base = serve(f.state_with_video(VideoConfig {
+        playback: VideoPlayback::PdsBlob,
+        ..VideoConfig::default()
+    }))
+    .await;
+    let (_, video) = one_post(&blob_base, BOB, &uris[3]).await;
+    assert_eq!(video["embed"]["playlist"], blob_on_pds(ALICE, "bafyvideo"));
+    assert!(video["embed"].get("thumbnail").is_none(), "{video}");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn display_fields_and_media_views_on() {
+    display_fields_in(PublicMode::On, "s2-display-on").await;
+}
+
+#[tokio::test]
+async fn display_fields_and_media_views_off() {
+    display_fields_in(PublicMode::Off, "s2-display-off").await;
+}
+
+/// T-5 (P-1 quotes), in On and in Off (T-1): a quoted private post is read
+/// for the same reader; unreadable, blocked and nonexistent quoted posts
+/// give byte-identical answers; a quoted public post shows only in On.
+async fn quoted_posts_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let for_bob = f.audience(ALICE, "3kaudbob2222", Some("list"), &[BOB]).await;
+    let for_carol = f.audience(ALICE, "3kaudcarol22", Some("list"), &[CAROL]).await;
+    let daves_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[BOB]).await;
+    let image = |cid: &str| json!({"$type": format!("{KLEX}#embedImage"), "images": [{"image": blob(cid), "alt": cid}]});
+    let quote = |uri: &str| json!({"embed": {"$type": format!("{KLEX}#embedRecord"), "record": {"uri": uri, "cid": "bafyany"}}});
+    let quoted = f.post_with(ALICE, "3kquoted2222", &for_bob, json!({"embed": image("bafyq")})).await;
+    let hidden = f.post_with(ALICE, "3khidden2222", &for_carol, json!({})).await;
+    let daves = f.post_with(DAVE, "3kdaves22222", &daves_aud, json!({})).await;
+    let public = crate::hydration::testing::post(&f.pool, BOB, "3kpublic2222", "public text", None, None).await;
+    let quotes_readable = f.post_with(ALICE, "3kquotesq222", &for_bob, quote(&quoted)).await;
+    let quotes_hidden = f.post_with(ALICE, "3kquotesh222", &for_bob, quote(&hidden)).await;
+    let quotes_daves = f.post_with(ALICE, "3kquotesd222", &for_bob, quote(&daves)).await;
+    let with_media = f
+        .post_with(ALICE, "3kquotesm222", &for_bob, json!({"embed": {"$type": format!("{KLEX}#embedRecordWithMedia"),
+            "record": {"record": {"uri": quoted, "cid": "bafyany"}}, "media": image("bafym")}}))
+        .await;
+    let quotes_public = f
+        .post_with(ALICE, "3kquotesp222", &for_bob, json!({"embed": {"$type": "app.bsky.embed.record", "record": {"uri": public, "cid": "bafyany"}}}))
+        .await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+    let stored: Option<String> = sqlx::query_scalar("SELECT quote_uri FROM private_posts WHERE uri = $1")
+        .bind(&with_media)
+        .fetch_one(&f.pool)
+        .await
+        .expect("row");
+    assert_eq!(stored.as_deref(), Some(quoted.as_str()), "quote_uri from recordWithMedia");
+
+    // Readable: `#viewRecord` with the decoded value and its media.
+    let (_, p) = one_post(&base, BOB, &quotes_readable).await;
+    assert_eq!(p["embed"]["$type"], "app.bsky.embed.record#view");
+    let r = &p["embed"]["record"];
+    assert_eq!(r["$type"], "app.bsky.embed.record#viewRecord");
+    assert_eq!((r["uri"].as_str(), r["value"]["text"].as_str()), (Some(quoted.as_str()), Some("3kquoted2222")));
+    assert_eq!(r["author"]["did"], ALICE);
+    assert_eq!(r["embeds"][0]["images"][0]["thumb"], blob_on_pds(ALICE, "bafyq"));
+    assert!(r["value"].get("encodedContent").is_none());
+    // The same through the thread and the author feed.
+    let (_, body, _) = get(&base, THREAD, &format!("uri={quotes_readable}"), BOB, BOB_KEY).await;
+    let t: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(t["thread"]["post"]["embed"]["record"]["value"]["text"], "3kquoted2222", "{body}");
+    let (_, body, _) = get(&base, FEED, &format!("actor={ALICE}"), BOB, BOB_KEY).await;
+    let feed: Value = serde_json::from_str(&body).expect("json");
+    let item = feed["feed"].as_array().expect("feed").iter().find(|i| i["uri"] == quotes_readable.as_str()).expect("in the feed");
+    assert_eq!(item["embed"]["record"]["$type"], "app.bsky.embed.record#viewRecord");
+
+    // recordWithMedia: the quote and the post's own media.
+    let (_, p) = one_post(&base, BOB, &with_media).await;
+    assert_eq!(p["embed"]["$type"], "app.bsky.embed.recordWithMedia#view");
+    assert_eq!(p["embed"]["record"]["record"]["value"]["text"], "3kquoted2222");
+    assert_eq!(p["embed"]["media"]["images"][0]["thumb"], blob_on_pds(ALICE, "bafym"));
+
+    // Not readable by Bob: `#viewNotFound`, byte-identical to the same post
+    // quoting a URI that names nothing.
+    let (unreadable, p) = one_post(&base, BOB, &quotes_hidden).await;
+    assert_eq!(p["embed"]["record"], json!({"$type": "app.bsky.embed.record#viewNotFound", "uri": hidden, "notFound": true}));
+    f.apply_op(ALICE, Action::Delete, NSID_POST_PRIVATE, "3khidden2222", REV2, None).await;
+    let (nonexistent, _) = one_post(&base, BOB, &quotes_hidden).await;
+    assert_eq!(unreadable, nonexistent);
+
+    // A block between the reader and the quoted author: the same miss.
+    let (_, p) = one_post(&base, BOB, &quotes_daves).await;
+    assert_eq!(p["embed"]["record"]["$type"], "app.bsky.embed.record#viewRecord", "readable before the block");
+    exec(&f.pool, &block_sql(DAVE, BOB)).await;
+    let (blocked, p) = one_post(&base, BOB, &quotes_daves).await;
+    assert_eq!(p["embed"]["record"]["$type"], "app.bsky.embed.record#viewNotFound");
+    f.apply_op(DAVE, Action::Delete, NSID_POST_PRIVATE, "3kdaves22222", REV2, None).await;
+    let (gone, _) = one_post(&base, BOB, &quotes_daves).await;
+    assert_eq!(blocked, gone);
+
+    // A quoted public post: from local rows in On; in Off no `embed`, and
+    // the client builds the quote from `record.embed`.
+    let (_, p) = one_post(&base, BOB, &quotes_public).await;
+    assert_eq!(p["record"]["embed"]["record"]["uri"], public.as_str());
+    if mode.is_on() {
+        assert_eq!(p["embed"]["record"]["$type"], "app.bsky.embed.record#viewRecord", "{p}");
+        assert_eq!(p["embed"]["record"]["value"]["text"], "public text");
+    } else {
+        assert!(p.get("embed").is_none(), "{p}");
+    }
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn quoted_posts_are_read_for_the_same_reader_on() {
+    quoted_posts_in(PublicMode::On, "s2-quotes-on").await;
+}
+
+#[tokio::test]
+async fn quoted_posts_are_read_for_the_same_reader_off() {
+    quoted_posts_in(PublicMode::Off, "s2-quotes-off").await;
+}
+
+/// T-6 (P-1 refill): a row stored before migration 0023 is filled by the
+/// `private` job's write at the same rev; the refill is queued once; an
+/// older rev never overwrites a newer row, and an equal one never
+/// overwrites a filled row.
+#[tokio::test]
+async fn display_refill_fills_rows_stored_before_0023() {
+    let Some(db) = fresh_db("s2-refill").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "s2-refill").await;
+    let aud_record = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [BOB], "name": "Friends", "createdAt": "2026-09-26T00:00:00Z"});
+    f.ingest(ALICE, NSID_AUDIENCE, "3kaudience22", aud_record.clone()).await;
+    let aud = format!("at://{ALICE}/{NSID_AUDIENCE}/3kaudience22");
+    let extra = json!({"embed": {"$type": format!("{KLEX}#embedImage"), "images": [{"image": blob("bafyimg"), "alt": ""}]}, "langs": ["en"]});
+    let record = f.record_with(ALICE, "3kpost222222", &aud, &extra).await;
+    f.ingest(ALICE, NSID_POST_PRIVATE, "3kpost222222", record.clone()).await;
+    // As rows stored before 0023.
+    let unfill_posts = "UPDATE private_posts SET facets = NULL, embed = NULL, langs = NULL, self_labels = NULL, \
+                        quote_uri = NULL, mention_dids = '{}', display_filled = false";
+    exec(&f.pool, unfill_posts).await;
+    exec(&f.pool, "UPDATE private_audiences SET name = NULL, display_filled = false").await;
+    let post_row = async || -> (Option<Value>, Option<Vec<String>>, bool) {
+        sqlx::query_as("SELECT embed, langs, display_filled FROM private_posts")
+            .fetch_one(&f.pool)
+            .await
+            .expect("post row")
+    };
+    let audience_row = async || -> (Option<String>, bool) {
+        sqlx::query_as("SELECT name, display_filled FROM private_audiences")
+            .fetch_one(&f.pool)
+            .await
+            .expect("audience row")
+    };
+
+    // The refill is queued once, for the DID with unfilled rows.
+    let tier = KryphocronPrivateTier;
+    exec(&f.pool, "DELETE FROM backfill_jobs").await;
+    assert_eq!(tier.enqueue_display_refill(&f.pool, "private_display_refill").await.expect("refill"), Some(1));
+    let jobs: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT did, depth, state FROM backfill_jobs").fetch_all(&f.pool).await.expect("jobs");
+    assert_eq!(jobs, [(ALICE.to_string(), "private".to_string(), "queued".to_string())]);
+    assert_eq!(tier.enqueue_display_refill(&f.pool, "private_display_refill").await.expect("again"), None);
+
+    // An older rev fills nothing, even an unfilled row.
+    let mut older = record.clone();
+    older["langs"] = json!(["fr"]);
+    f.apply_from(WriteSource::Backfill, ALICE, Action::Update, NSID_POST_PRIVATE, "3kpost222222", OLD_REV, Some(older)).await;
+    assert_eq!(post_row().await, (None, None, false));
+
+    // The job writes each listed record at the repo's latest rev: here the
+    // rev the rows already carry.
+    f.apply_from(WriteSource::Backfill, ALICE, Action::Update, NSID_AUDIENCE, "3kaudience22", REV, Some(aud_record)).await;
+    f.apply_from(WriteSource::Backfill, ALICE, Action::Update, NSID_POST_PRIVATE, "3kpost222222", REV, Some(record.clone())).await;
+    let (embed, langs, filled) = post_row().await;
+    assert_eq!(embed.as_ref().and_then(|e| e["images"][0]["image"]["ref"]["$link"].as_str()), Some("bafyimg"));
+    assert_eq!((langs, filled), (Some(vec!["en".to_string()]), true));
+    assert_eq!(audience_row().await, (Some("Friends".to_string()), true));
+
+    // Filled: neither an equal nor an older rev overwrites it.
+    for rev in [REV, OLD_REV] {
+        let mut other = record.clone();
+        other["langs"] = json!(["de"]);
+        f.apply_from(WriteSource::Backfill, ALICE, Action::Update, NSID_POST_PRIVATE, "3kpost222222", rev, Some(other)).await;
+        assert_eq!(post_row().await.1, Some(vec!["en".to_string()]), "rev {rev}");
+    }
+    // A newer rev does.
+    let mut newer = record;
+    newer["langs"] = json!(["de"]);
+    f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3kpost222222", REV2, Some(newer)).await;
+    assert_eq!(post_row().await.1, Some(vec!["de".to_string()]));
+    db.drop_db().await;
+}
+
+/// T-7 (P-3), in On and in Off (T-1): `audience` with `mode` and `name`; a
+/// rename shows after ingest; no `audience` without a row; `members` never
+/// appears.
+async fn audience_view_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    exec(&f.pool, &follow_sql(BOB, ALICE)).await;
+    let named = |name: Value| json!({"$type": NSID_AUDIENCE, "mode": "followers", "members": [CAROL], "name": name, "createdAt": "2026-09-26T00:00:00Z"});
+    f.ingest(ALICE, NSID_AUDIENCE, "3kaudfollow2", named(json!("Close friends"))).await;
+    let followers = format!("at://{ALICE}/{NSID_AUDIENCE}/3kaudfollow2");
+    let listed = f.audience(ALICE, "3kaudlist222", None, &[BOB]).await;
+    let orphan = format!("at://{ALICE}/{NSID_AUDIENCE}/3knoaudience");
+    let p_followers = f.private_post(ALICE, "3kpostfollow", &followers, None).await;
+    let p_listed = f.private_post(ALICE, "3kpostlist22", &listed, None).await;
+    let p_orphan = f.private_post(ALICE, "3kpostself22", &orphan, None).await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    let (body, p) = one_post(&base, BOB, &p_followers).await;
+    assert_eq!(p["audience"], json!({"uri": followers, "mode": "followers", "name": "Close friends"}));
+    assert!(!body.contains("members") && !body.contains(CAROL), "members never appear: {body}");
+    // No mode and no name: neither field.
+    let (_, p) = one_post(&base, BOB, &p_listed).await;
+    assert_eq!(p["audience"], json!({"uri": listed}));
+    // No audience row: no `audience`; the author still sees audienceList.
+    let (_, p) = one_post(&base, ALICE, &p_orphan).await;
+    assert!(p.get("audience").is_none(), "{p}");
+    assert_eq!(p["record"]["audienceList"], orphan.as_str());
+
+    // A rename reaches the view at the audience record's next ingest.
+    f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, "3kaudfollow2", REV2, Some(named(json!("Inner circle")))).await;
+    let (_, p) = one_post(&base, BOB, &p_followers).await;
+    assert_eq!(p["audience"]["name"], "Inner circle");
+    // A `name` that is not a string is dropped; the audience still applies.
+    assert_eq!(super::ingest::AudienceFields::parse(&named(json!(5))).expect("not malformed").name, None);
+    f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, "3kaudfollow2", REV3, Some(named(json!(5)))).await;
+    let (_, p) = one_post(&base, BOB, &p_followers).await;
+    assert_eq!(p["audience"], json!({"uri": followers, "mode": "followers"}));
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn the_audience_view_carries_mode_and_name_on() {
+    audience_view_in(PublicMode::On, "s2-audience-on").await;
+}
+
+#[tokio::test]
+async fn the_audience_view_carries_mode_and_name_off() {
+    audience_view_in(PublicMode::Off, "s2-audience-off").await;
 }
