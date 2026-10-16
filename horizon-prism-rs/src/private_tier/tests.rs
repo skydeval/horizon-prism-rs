@@ -999,7 +999,8 @@ async fn rule4_walk_limits_off_pds() {
     walk_limits("rule4-limits-off", Layout::OffPds).await;
 }
 
-/// T-37: every mode, conditions 2 to 4 for the writer, and rule 6 as today.
+/// T-37: every mode, conditions 2 to 4 for the writer, and rule 6, in
+/// S9's C-6 = yes version (condition 3 and rule 6 under every mode).
 async fn modes_and_writers(test: &str, layout: Layout) {
     let Some(mut w) = Walk::new(test, layout, Some("followers"), &[]).await else {
         return;
@@ -1029,23 +1030,35 @@ async fn modes_and_writers(test: &str, layout: Layout) {
         w.expect(case, BOB, reply, true).await;
     }
     let reply_of = |case: &str| replies.iter().find(|(c, _)| *c == case).map(|(_, r)| r.clone()).expect("case");
-    let (listed, everyone) = (reply_of("list, writer listed"), reply_of("everyone"));
+    let (listed, null_mode, everyone) =
+        (reply_of("list, writer listed"), reply_of("NULL mode, writer listed"), reply_of("everyone"));
 
-    // Condition 3: the writer blocks the audience's owner. It denies under
-    // `followers` and `everyone`; under `list` it waits for C-6 (S9).
-    exec(&w.f.pool, &block_sql(BOB, ALICE)).await;
-    w.expect("writer blocks owner, followers", DAVE, &main_reply, false).await;
-    w.expect("writer blocks owner, everyone", DAVE, &everyone, false).await;
-    w.expect("writer blocks owner, list (S0)", DAVE, &listed, true).await;
-    w.expect("writer blocks owner, its author", BOB, &main_reply, true).await;
-    exec(&w.f.pool, "DELETE FROM blocks").await;
+    // Condition 3, either way between the writer and the audience's owner.
+    // Since S9 (C-6 yes) it denies under every mode, `list` and NULL too;
+    // the writer still reads its own reply.
+    for (blocker, blocked, way) in [(BOB, ALICE, "writer blocks owner"), (ALICE, BOB, "owner blocks writer")] {
+        exec(&w.f.pool, &block_sql(blocker, blocked)).await;
+        w.expect(&format!("{way}, followers"), DAVE, &main_reply, false).await;
+        w.expect(&format!("{way}, everyone"), DAVE, &everyone, false).await;
+        w.expect(&format!("{way}, list (S9)"), DAVE, &listed, false).await;
+        w.expect(&format!("{way}, NULL mode (S9)"), DAVE, &null_mode, false).await;
+        for uri in [&main_reply, &everyone, &listed, &null_mode] {
+            w.expect(&format!("{way}, its author"), BOB, uri, true).await;
+        }
+        exec(&w.f.pool, "DELETE FROM blocks").await;
+    }
 
-    // The owner blocks the reader: rule 6 under `followers`; under `list`
-    // the owner's post cannot anchor for that reader (step test (i)).
-    exec(&w.f.pool, &block_sql(ALICE, DAVE)).await;
-    w.expect("owner blocks reader, followers", DAVE, &main_reply, false).await;
-    w.expect("owner blocks reader, list", DAVE, &listed, false).await;
-    exec(&w.f.pool, "DELETE FROM blocks").await;
+    // Rule 6 for the reader, either way with the audience's owner: since S9
+    // in every mode. (Under `list` the owner's post already could not anchor
+    // for that reader, step test (i).) Bob, the writer, still reads.
+    for (blocker, blocked, way) in [(ALICE, DAVE, "owner blocks reader"), (DAVE, ALICE, "reader blocks owner")] {
+        exec(&w.f.pool, &block_sql(blocker, blocked)).await;
+        for (mode, uri) in [("followers", &main_reply), ("everyone", &everyone), ("list", &listed), ("NULL mode", &null_mode)] {
+            w.expect(&format!("{way}, {mode}"), DAVE, uri, false).await;
+            w.expect(&format!("{way}, {mode}, the writer"), BOB, uri, true).await;
+        }
+        exec(&w.f.pool, "DELETE FROM blocks").await;
+    }
 
     // Condition 4: an audience owner with no `actors` row is not active.
     exec(&w.f.pool, &format!("DELETE FROM actors WHERE did = '{ALICE}'")).await;
@@ -1073,6 +1086,9 @@ enum Middle {
     Takedown,
     Unlisted,
     Throttled,
+    /// T-34's intermediate step (S9, C-6 yes): under Alice's `list`
+    /// audience, Bob is listed and blocks Alice.
+    BlocksOwner,
 }
 
 /// Labelled outputs: label, status, body.
@@ -1159,12 +1175,13 @@ async fn root_counts(w: &Walk, reader: &str) -> (Option<i64>, Option<i64>) {
 /// output of [`reader_outputs`] under every mute state.
 ///
 /// Alice's notifications for R are compared only where M is unreadable to
-/// her too (`Takedown`, `Unlisted`): when only Dave is blocked, Alice reads
+/// her too (`Takedown`, `Unlisted`, `BlocksOwner`): when only Dave is blocked, Alice reads
 /// M, so R hangs from her post for her in (a) and is hers to read, and
 /// not in (b).
 async fn pair_two(test: &str, middle: Middle) {
     let (mode, members): (&str, &[&str]) = match middle {
         Middle::Unlisted => ("list", &[DAVE, CAROL]),
+        Middle::BlocksOwner => ("list", &[DAVE, CAROL, BOB]),
         _ => ("followers", &[]),
     };
     let Some(mut w) = Walk::new(test, Layout::SamePds, Some(mode), members).await else {
@@ -1188,6 +1205,7 @@ async fn pair_two(test: &str, middle: Middle) {
         Middle::BlocksReader => exec(&w.f.pool, &block_sql(BOB, DAVE)).await,
         Middle::Takedown => exec(&w.f.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{m}', '!takedown')")).await,
         Middle::Unlisted => {}
+        Middle::BlocksOwner => exec(&w.f.pool, &block_sql(BOB, ALICE)).await,
         Middle::Throttled => exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'throttled' WHERE did = '{BOB}'")).await,
     }
     w.f.ready_all().await;
@@ -1354,6 +1372,43 @@ async fn rule4_walk_step_throttled_author() {
     pair_two("rule4-pair2-throttled", Middle::Throttled).await;
 }
 
+/// T-34's intermediate-step pair (S9, C-6 yes): under Alice's `list`
+/// audience with Dave and Carol listed, (a) M by a listed Bob who blocks
+/// Alice, with Carol's reply R to M, and (b) no M. Dave's outputs are
+/// byte-identical, and R is read by Carol only in both. It fails on either
+/// half-change: `step_ok` keeping S8's `list` scoping (R anchors through
+/// M) or the prefilter keeping it (M counts in T's counts for Dave).
+#[tokio::test]
+async fn t34_list_step_by_a_writer_who_blocks_the_owner() {
+    pair_two("t34-pair", Middle::BlocksOwner).await;
+}
+
+/// T-34 (S9, C-6 yes): under Alice's `list` audience, a listed reader she
+/// blocks does not read Bob's reply, and a reply by a listed author she
+/// blocks is read by its author only.
+#[tokio::test]
+async fn t34_list_blocks_with_the_owner() {
+    let Some(mut w) = Walk::new("t34-blocks", Layout::SamePds, Some("list"), &[BOB, CAROL, DAVE]).await else {
+        return;
+    };
+    let root = w.root.clone();
+    let reply = w.reply(BOB, "3kt34reply22", &root).await;
+    w.f.ready_all().await;
+    for reader in [BOB, CAROL, DAVE] {
+        w.expect("no block", reader, &reply, true).await;
+    }
+    exec(&w.f.pool, &block_sql(ALICE, DAVE)).await;
+    for (reader, reads) in [(BOB, true), (CAROL, true), (DAVE, false)] {
+        w.expect("owner blocks a listed reader", reader, &reply, reads).await;
+    }
+    exec(&w.f.pool, "DELETE FROM blocks").await;
+    exec(&w.f.pool, &block_sql(ALICE, BOB)).await;
+    for (reader, reads) in [(BOB, true), (CAROL, false), (DAVE, false)] {
+        w.expect("owner blocks the listed author", reader, &reply, reads).await;
+    }
+    w.finish().await;
+}
+
 /// T-37: the oracle's walk statement and the prefilter's walk term are each
 /// `anchored()`'s output for their arguments, with the literal cap 8.
 #[test]
@@ -1405,6 +1460,37 @@ async fn pre_s0_count_query_counts_each_kind() {
             sqlx::query_as(&sql).fetch_one(&w.f.pool).await.expect("count query");
         assert_eq!(counts, (1, 1, 1, 0, 0, 0, 1, 3));
     }
+    w.finish().await;
+}
+
+/// Prints the pre-S9 count query (private-posting design §5 S9, C-6) for
+/// skydeval to run read-only in `psql` against the deployed database:
+/// `cargo test pre_s9_count_query -- --ignored --nocapture`.
+#[test]
+#[ignore = "prints the pre-S9 count query; run with --ignored --nocapture"]
+fn pre_s9_count_query() {
+    println!("-- S9 pre-release count: cross-owner list/NULL posts S9 stops serving\n{}", schema::pre_s9_count_sql());
+}
+
+/// The pre-S9 count query runs, and counts each kind once.
+#[tokio::test]
+async fn pre_s9_count_query_counts_each_kind() {
+    let Some(w) = Walk::new("pre-s9-count", Layout::SamePds, Some("list"), &[BOB, CAROL, DAVE]).await else {
+        return;
+    };
+    let root = w.root.clone();
+    // Bob, listed, blocks Alice: his reply stops, and so does Carol's reply
+    // to it, whose chain passes through his.
+    let blocked = w.reply(BOB, "3kblocked222", &root).await;
+    w.reply(CAROL, "3kbelowblock", &blocked).await;
+    // Served before and after.
+    w.reply(CAROL, "3kfine222222", &root).await;
+    exec(&w.f.pool, &block_sql(BOB, ALICE)).await;
+    // Alice blocks Dave, a reader only: S8 already denies him the anchor,
+    // so no pair (nor for Bob as a reader of Carol's replies).
+    exec(&w.f.pool, &block_sql(ALICE, DAVE)).await;
+    let counts: (i64, i64, i64, i64) = sqlx::query_as(&schema::pre_s9_count_sql()).fetch_one(&w.f.pool).await.expect("count query");
+    assert_eq!(counts, (1, 1, 0, 0));
     w.finish().await;
 }
 

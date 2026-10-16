@@ -240,14 +240,14 @@ pub(super) const RULE4_MAX_HOPS: u32 = 8;
 /// - (i) no block either way between the reader and the step's author;
 /// - (ii) the moderation gate shows the step;
 /// - (iii) a step not by the audience's owner is by a writer who passes
-///   conditions 2 and 3 under the audience (condition 3 not under `list`
-///   or NULL until S9; `following` is `false` until S10).
+///   conditions 2 and 3 under the audience (condition 3 under every mode
+///   since S9, C-6; `following` is `false` until S10).
 fn step_ok(owner: &str, mode: &str, members: &str, reader: &str) -> String {
     format!(
         "NOT {reader_author} \
          AND {gate} \
          AND (s.author_did = {owner} OR ( \
-               (COALESCE({mode}, 'list') = 'list' OR NOT {author_owner}) \
+               NOT {author_owner} \
                AND CASE COALESCE({mode}, 'list') \
                      WHEN 'list' THEN s.author_did = ANY({members}) \
                      WHEN 'followers' THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = s.author_did AND f.subject_did = {owner}) \
@@ -337,11 +337,12 @@ pub(super) async fn account_active(pool: &PgPool, did: &str) -> Result<bool, sql
 ///   requester: `list` (or none) by `members`, `followers` by the
 ///   requester's stored follow of the audience's owner (who is in its own
 ///   audience), `everyone` always, and nothing else;
-/// - no block between the requester and the author; and, for `followers`
-///   and `everyone` under another account's audience, none between that
-///   account and the requester or the author (rule 6);
+/// - no block between the requester and the author; and, under another
+///   account's audience in any mode (S9, C-6), none between that account
+///   and the requester or the author (rule 6);
 /// - under another account's audience, rule 4 (private-posting §3.7): that
-///   account is active, the author may write there, and the post hangs
+///   account is active, the author may write there and is not blocked
+///   either way with that account (condition 3), and the post hangs
 ///   from that account's post within [`RULE4_MAX_HOPS`] rows. The walk is
 ///   last, so it runs only for rows that pass everything else.
 ///
@@ -358,12 +359,11 @@ pub(super) fn prefilter() -> String {
                  WHEN 'everyone' THEN true \
                  ELSE false END \
            AND NOT {viewer_author} \
-           AND (COALESCE(a.mode, 'list') NOT IN ('followers', 'everyone') \
-                OR a.owner_did = p.author_did \
+           AND (a.owner_did = p.author_did \
                 OR NOT ((a.owner_did <> $1 AND {viewer_owner}) OR {author_owner})) \
            AND (a.owner_did = p.author_did \
                 OR (ao.account_status = 'active' \
-                    AND (COALESCE(a.mode, 'list') IN ('list') OR NOT {author_owner}) \
+                    AND NOT {author_owner} \
                     AND CASE COALESCE(a.mode, 'list') \
                           WHEN 'list' THEN p.author_did = ANY(a.members) \
                           WHEN 'followers' THEN EXISTS ( \
@@ -430,6 +430,74 @@ SELECT
     AS starts_serving_status
 FROM y;",
         walk = anchored_with_cap("x.reply_parent_uri", "x.audience_uri", "x.owner_did", "x.mode", "x.members", "''", cap),
+    )
+}
+
+/// [`anchored`] as it stood before S9, for a `list` or NULL audience only:
+/// there, S8's `step_ok` (iii) had no condition 3, so a step by a listed
+/// writer blocked either way with the owner still passed.
+#[cfg(test)]
+fn anchored_before_s9_list(parent: &str, audience: &str, owner: &str, mode: &str, members: &str, reader: &str) -> String {
+    let condition3 = format!("NOT {} AND CASE", blocked("s.author_did", owner));
+    let walk = anchored(parent, audience, owner, mode, members, reader);
+    assert_eq!(walk.matches(&condition3).count(), 2, "condition 3 once in each step test");
+    walk.replace(&condition3, "CASE")
+}
+
+/// The pre-S9 count (private-posting design §5 S9, C-6), run read-only
+/// against the deployed database before S9 ships: the cross-owner posts
+/// under `list` or NULL audiences that S8 serves and S9 stops serving.
+/// Each kind is a post S8 serves to the audience (listed writer, active
+/// owner, anchored by S8's walk with reader `''`):
+/// - `stops_author_owner_block`: its author and the audience's owner block
+///   each other either way; read by its author only after S9;
+/// - `stops_blocked_step`: its author is not blocked, but its chain passes
+///   through a step by a writer who is, so S9's walk no longer anchors it;
+/// - `stops_reader_pairs` and `stops_reader_posts`: (post, listed reader)
+///   pairs, and their posts, where the reader and the owner block each
+///   other and S8's walk anchored the post for that reader. Expected 0:
+///   since S0 the owner's own post fails step test (i) for such a reader.
+///
+/// S9 starts serving nothing. Printed by the ignored test
+/// `pre_s9_count_query`.
+#[cfg(test)]
+pub(super) fn pre_s9_count_sql() -> String {
+    format!(
+        "WITH x AS (
+  SELECT p.uri, p.author_did, p.audience_uri, p.reply_parent_uri,
+         a.owner_did, COALESCE(a.mode, 'list') AS mode, a.members,
+         {author_owner} AS author_owner_blocked
+  FROM private_posts p
+  JOIN private_audiences a ON a.uri = p.audience_uri
+  JOIN actors ao ON ao.did = a.owner_did AND ao.account_status = 'active'
+  WHERE a.owner_did <> p.author_did
+    AND COALESCE(a.mode, 'list') = 'list'
+    AND p.author_did = ANY(a.members)
+), y AS (
+  SELECT x.*, {before} AS served_s8, {after} AS anchored_s9
+  FROM x
+), r AS (
+  SELECT y.uri, m.reader
+  FROM y CROSS JOIN LATERAL unnest(y.members) AS m(reader)
+  WHERE y.served_s8 AND y.anchored_s9 AND NOT y.author_owner_blocked
+    AND m.reader <> y.owner_did AND m.reader <> y.author_did
+    AND {reader_owner}
+    AND {before_for_reader}
+)
+SELECT
+  count(*) FILTER (WHERE served_s8 AND author_owner_blocked)
+    AS stops_author_owner_block,
+  count(*) FILTER (WHERE served_s8 AND NOT author_owner_blocked AND NOT anchored_s9)
+    AS stops_blocked_step,
+  (SELECT count(*) FROM r) AS stops_reader_pairs,
+  (SELECT count(DISTINCT uri) FROM r) AS stops_reader_posts
+FROM y;",
+        author_owner = blocked("p.author_did", "a.owner_did"),
+        before = anchored_before_s9_list("x.reply_parent_uri", "x.audience_uri", "x.owner_did", "x.mode", "x.members", "''"),
+        after = anchored("x.reply_parent_uri", "x.audience_uri", "x.owner_did", "x.mode", "x.members", "''"),
+        reader_owner = blocked("m.reader", "y.owner_did"),
+        before_for_reader =
+            anchored_before_s9_list("y.reply_parent_uri", "y.audience_uri", "y.owner_did", "y.mode", "y.members", "m.reader"),
     )
 }
 

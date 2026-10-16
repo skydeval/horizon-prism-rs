@@ -59,6 +59,19 @@ commit.
   Migration 0027. Floors `list_notifications` 1200 ms, `get_unread_count`
   300 ms. `getMembership`'s `features` gains `private.notifications`.
 
+### Changed (private posting S9)
+
+- **Blocks apply under `list` audiences too (#719; Horizon P-13,
+  choice C-6).** Under another account's `list` audience, or one with no
+  mode, a block either way between a reply's author and the audience's
+  owner now keeps the reply out (it is read by its author only),
+  including replies whose chain passes through such an author's post. A
+  reader blocked either way with the audience's owner no longer reads
+  replies there (S0's walk already denied this). Rule 6 also covers
+  `following`, which has no effect until that mode is built. Nothing
+  starts being served. Pre-release count on prism (2026-10-16): the 2
+  posts under another account's audience are both `followers`, so 0 stop.
+
 ### Fixed (private posting S6)
 
 - **Public notifications could name a private post (#717).** With public

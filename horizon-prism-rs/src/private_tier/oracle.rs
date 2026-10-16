@@ -16,11 +16,11 @@
 //!    (`schema::anchored`); (2) the post's owner may write there by
 //!    aurora's write rule: `list` or none, listed in `members`;
 //!    `followers`, a stored follow of the audience's owner; `everyone`,
-//!    always; anything else, no; (3) under `followers` and `everyone`, no
+//!    always; anything else, no; (3) in every mode (since S9, C-6), no
 //!    block either way between the post's owner and the audience's owner;
 //!    (4) the audience's owner has an `actors` row with status `active`;
 //! 5. no `private_audiences` row → `NotInAudience`;
-//! 6. for `followers` and `everyone` under an audience whose owner is not
+//! 6. in every mode (since S9, C-6) under an audience whose owner is not
 //!    the post's owner: a block either way between that owner and the
 //!    viewer (unless the viewer is that owner), or between that owner and
 //!    the post's owner → `NotInAudience`;
@@ -29,9 +29,11 @@
 //!    the viewer naming that owner is stored; `everyone`, always; anything
 //!    else (`nobody`, `following`, an unknown value) → `NotInAudience`.
 //!
-//! Rules 1–3, 5 and `list` mirror Aurora-Locus `authorize_private_read`.
-//! Rule 4 is stricter: aurora trusts a same-PDS reply whatever it replies
-//! to, and Prism ingests from any PDS. `followers` and `everyone` go beyond
+//! Rules 1–3, 5 and `list`'s membership test mirror Aurora-Locus
+//! `authorize_private_read`. Rule 4 is stricter: aurora trusts a same-PDS
+//! reply whatever it replies to, and Prism ingests from any PDS. Rule 6 is
+//! stricter under `list` too: aurora's list check ignores blocks
+//! (private-posting design §3.7, C-6). `followers` and `everyone` go beyond
 //! it: the PDS denies every mode but `list`, having no follow graph to ask
 //! (docs/internal/design/private-audience-modes.md).
 
@@ -120,19 +122,20 @@ impl OracleSnapshot {
                     let author_blocked = author_block.0 || author_block.1;
                     // Rule 4, on any PDS: anchored (1), the post's owner
                     // may write here (2) and is not blocked either way
-                    // with the audience's owner outside `list` (3), and
-                    // that owner is active (4).
+                    // with the audience's owner, in every mode (3; S9,
+                    // C-6), and that owner is active (4).
                     let may_write = match mode {
                         "list" => a.members.iter().any(|m| m == owner),
-                        "followers" => author_follows && !author_blocked,
-                        "everyone" => !author_blocked,
+                        "followers" => author_follows,
+                        "everyone" => true,
                         _ => false,
                     };
-                    let rule4 = audience_owner == owner || (anchored && may_write && relation_owner_active);
-                    // Rule 6: under these modes a block is the audience
-                    // owner's only way to keep one reader out.
-                    let blocked = matches!(mode, "followers" | "everyone")
-                        && audience_owner != owner
+                    let rule4 = audience_owner == owner || (anchored && may_write && !author_blocked && relation_owner_active);
+                    // Rule 6, in every mode (S9, C-6): a block is the
+                    // audience owner's one tool against a reader or writer
+                    // it did not remove, and under `followers` and
+                    // `everyone` its only one.
+                    let blocked = audience_owner != owner
                         && ((input.requester != audience_owner && (viewer_block.0 || viewer_block.1)) || author_blocked);
                     let inside = match mode {
                         "list" => a.members.iter().any(|m| m == input.requester),
