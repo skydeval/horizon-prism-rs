@@ -164,6 +164,8 @@ pub const FEATURES: &[&str] = &[
     "private.paging",
     // Rule 4's anchored walk (S0, listed from S1).
     "private.crossPdsReplies",
+    // P-4 the `following` audience mode (S10).
+    "private.following",
     // P-7 `searchPosts`, a bounded scan at query time (S11).
     "private.search",
 ];
@@ -294,6 +296,17 @@ pub trait PrivateTier: Send + Sync {
     /// the `worker_state` key `marker`, a `private` job for every DID with
     /// rows stored before migration 0023. `None` when already done.
     async fn enqueue_display_refill(&self, pool: &PgPool, marker: &str) -> Result<Option<u64>, sqlx::Error>;
+
+    /// `owners::owns_following_audience` (following-audience design §3.5):
+    /// `did` is a private owner now and has a `following` audience row, on
+    /// the caller's connection.
+    async fn owns_following_audience(&self, conn: &mut PgConnection, did: &str) -> Result<bool, sqlx::Error>;
+
+    /// `owners::enqueue_following_verification` (following-audience design
+    /// §3.6): at each start, an `authz` job for every DID that owns a
+    /// `following` audience and whose follows are not verified. Returns the
+    /// jobs written.
+    async fn enqueue_following_verification(&self, pool: &PgPool) -> Result<u64, sqlx::Error>;
 }
 
 /// The private tier.
@@ -428,6 +441,14 @@ impl PrivateTier for KryphocronPrivateTier {
 
     async fn enqueue_display_refill(&self, pool: &PgPool, marker: &str) -> Result<Option<u64>, sqlx::Error> {
         ingest::enqueue_display_refill(pool, marker).await
+    }
+
+    async fn owns_following_audience(&self, conn: &mut PgConnection, did: &str) -> Result<bool, sqlx::Error> {
+        owners::owns_following_audience(conn, did).await
+    }
+
+    async fn enqueue_following_verification(&self, pool: &PgPool) -> Result<u64, sqlx::Error> {
+        owners::enqueue_following_verification(pool).await
     }
 }
 
@@ -570,5 +591,13 @@ impl PrivateTier for DisabledPrivateTier {
 
     async fn enqueue_display_refill(&self, _pool: &PgPool, _marker: &str) -> Result<Option<u64>, sqlx::Error> {
         Ok(None)
+    }
+
+    async fn owns_following_audience(&self, _conn: &mut PgConnection, _did: &str) -> Result<bool, sqlx::Error> {
+        Ok(false)
+    }
+
+    async fn enqueue_following_verification(&self, _pool: &PgPool) -> Result<u64, sqlx::Error> {
+        Ok(0)
     }
 }

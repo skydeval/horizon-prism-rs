@@ -220,6 +220,10 @@ full_listing_ceiling = 1000000
 retry_every_hours = 6
 # Reconcile deletions confirmed per job via getRecord (design §5.10).
 reconcile_confirm_limit = 1000
+# Follows a `following` audience's owner may have and still be verified; over
+# it, that owner's `following` audiences are read by the owner alone
+# (following-audience design §3.5, C-F2).
+follows_pass_ceiling = 50000
 
 [retention]
 # Out-of-scope grace is scope.rebuild_grace_days (design §9.4); retention deletes

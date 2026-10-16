@@ -48,6 +48,50 @@ pub(crate) async fn is_owner(conn: &mut PgConnection, did: &str) -> Result<bool,
     sqlx::query_scalar(OWNER_SQL).bind(did).fetch_one(conn).await
 }
 
+/// Whether `did` owns a `following` audience (following-audience design
+/// §3.5): an owner now, by both halves of [`OWNER_SQL`], with a
+/// `private_audiences` row whose mode is exactly `following`. Leaving the
+/// owner set keeps the rows, so the eligibility half is what keeps an
+/// ineligible DID from "owning" one. The one definition every caller uses:
+/// the pass decision, the settle re-check, catch-up and the rollout.
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn owns_following_audience(conn: &mut PgConnection, did: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT ({OWNER_SQL}) AND EXISTS (SELECT 1 FROM private_audiences WHERE owner_did = $1 AND mode = 'following')"
+    ))
+    .bind(did)
+    .fetch_one(conn)
+    .await
+}
+
+/// The rollout (following-audience design §3.6), at each start: an `authz`
+/// job, leaving a queued or running one alone, for every DID that owns a
+/// `following` audience (as [`owns_following_audience`] says) and whose
+/// follow-verification flag is not set. Returns the jobs written.
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn enqueue_following_verification(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, updated_at) \
+         SELECT o.did, 'authz', 'queued', 0, now(), now() \
+         FROM (SELECT DISTINCT owner_did AS did FROM private_audiences WHERE mode = 'following') o \
+         WHERE (EXISTS (SELECT 1 FROM members m WHERE m.did = o.did) \
+                OR EXISTS (SELECT 1 FROM private_owner_eligible e WHERE e.did = o.did)) \
+           AND NOT EXISTS (SELECT 1 FROM sync_state s WHERE s.did = o.did AND s.follows_verified_at IS NOT NULL) \
+         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
+           not_before = now(), last_error = NULL, updated_at = now() \
+         WHERE backfill_jobs.state NOT IN ('queued', 'running')",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 /// Whether `did` is eligible (member, or confirmed on a community PDS).
 ///
 /// # Errors
@@ -105,7 +149,9 @@ pub(crate) async fn reevaluate(conn: &mut PgConnection, did: &str) -> Result<App
 /// also design-v3 §5.6's "backfilled once" fact for every DID in S, which
 /// `subscribed-post` needs: a DID that stays in S (a removed member keeps
 /// its authored rows and stays until the next rebuild, §6.11.7) keeps it.
-/// A DID outside S loses the whole row.
+/// A DID outside S loses the whole row; a row created later has a fresh
+/// follow counter and no flag. One that stays clears its flag and replaces
+/// its counter (following-audience design §3.3).
 async fn forget_tracked_sync_state(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
     let in_scope: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM scope_dids WHERE did = $1)")
         .bind(did)
@@ -114,7 +160,8 @@ async fn forget_tracked_sync_state(conn: &mut PgConnection, did: &str) -> Result
     if in_scope {
         sqlx::query(
             "UPDATE sync_state SET applied_rev = NULL, head_rev = NULL, head_checked_at = NULL, \
-             diverged_since = NULL WHERE did = $1",
+             diverged_since = NULL, follows_verified_at = NULL, follows_clears = nextval('follows_clears_seq') \
+             WHERE did = $1",
         )
         .bind(did)
         .execute(&mut *conn)

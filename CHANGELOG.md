@@ -12,6 +12,43 @@ commit.
 
 ### Added
 
+- **The `following` audience mode (private posting S10, #719; Horizon
+  P-4).** A post under a `following` audience is read by its owner and by
+  the ready members the owner follows, by the follow records indexed
+  here; a reply under it by another account is read by others only while
+  the owner follows that account. Blocks apply as in every mode. A
+  `following` post reaches a reader's timeline only when the reader also
+  follows its owner.
+  - The owner's follows are trusted only once verified: an
+    `authz`, `private` or `member` job (or `requestRecord`'s catch-up) of an
+    owner of a `following` audience lists its follows to the end, writes
+    what is missing or changed, confirms every stored follow the listing
+    lacks, and only then sets a flag beside the applied revision. The flag
+    counts only once the firehose has applied the owner's commits that far,
+    usually seconds later. Until then, and for an owner over
+    `[backfill] follows_pass_ceiling` (50 000) follows, those audiences
+    are read by the owner alone, and replies under them by their authors.
+  - The flag is cleared by everything that clears readiness (a gap, a
+    failed op, the prober's divergence, a purge, leaving the tracked set)
+    and by any follow written by a job, catch-up or `requestRecord` that
+    adds a row or changes its subject; a run that overlapped a clear sets
+    nothing. Each start queues `authz` for owners not yet verified, and a
+    new `following` audience queues one.
+  - An unfollow written as an edit that admission rejects now deletes the
+    old row and tombstones the record, from every source; a deleted
+    follow of a tracked account is always tombstoned.
+  - `requestRecord`'s `caughtUp: true` leaves the caller's `following`
+    audiences waiting for the firehose; its follows count toward the
+    catch-up's page cap.
+  - Migration 0028 (`sync_state` columns, metadata only; seeds
+    `gap_epoch`). Metrics `follows_pass_total{outcome}`,
+    `follows_pass_skipped_total` and the gauge
+    `following_owners_waiting_firehose` (a floor that never drains names
+    owners on a PDS no relay crawls). `getMembership`'s `features` gains
+    `private.following`. Pre-release count: run
+    `cargo test pre_s10_count_query -- --ignored --nocapture` and the
+    printed query read-only before migration 0028; not yet run on prism.
+
 - **Private search (private posting S11, #719; Horizon P-7).**
   `app.nearhorizon.private.searchPosts {q, sort, limit, cursor}` searches
   the posts the caller may read, at query time: no index of decoded text
@@ -72,6 +109,18 @@ commit.
   Deleting the record removes its notification. Rows are kept 90 days.
   Migration 0027. Floors `list_notifications` 1200 ms, `get_unread_count`
   300 ms. `getMembership`'s `features` gains `private.notifications`.
+
+### Fixed (private posting S10)
+
+- **Readiness could be set after a gap (#722).** A job's or catch-up's
+  settle read the gap epoch without a lock, so a gap committing between
+  that read and the settle's writes could be undone: `ready_at`, owner
+  readiness or the applied revision set after the gap cleared them. Every
+  settle now takes a shared advisory lock and reads the epoch under it as
+  its first statements, and the gap takes the same lock exclusively
+  first: a settle that holds it commits before the gap, which then clears
+  it; one that comes after sees the new epoch and settles nothing. A
+  waiting gap is not starved by later settles.
 
 ### Changed (private posting S9)
 

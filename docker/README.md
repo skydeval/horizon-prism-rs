@@ -386,6 +386,15 @@ groups:
         for: 5m
         annotations:
           summary: "Member {{ $labels.did }} is wedged on a bad authz record — investigate and remove from PDS to unwedge."
+      # Owners of a `following` audience whose follows are verified but whose
+      # latest commit the firehose has not applied yet: their `following`
+      # audiences are read by the owner alone meanwhile. A short spike after
+      # commits is normal. A floor that never drains names owners on a PDS no
+      # configured relay crawls, or owners waiting on a `#sync`, a hole or a
+      # trim gap; each opens at its next commit the firehose applies.
+      - alert: FollowingOwnersWaitingFirehose
+        expr: following_owners_waiting_firehose > 0
+        for: 6h
 ```
 
 A latched audit guard (design §6.5) makes `/xrpc/_health` return 503. `docker compose ps` then shows `app` as unhealthy. Restart `app` after investigating the logged panic.

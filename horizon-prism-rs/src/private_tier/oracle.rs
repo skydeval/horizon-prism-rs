@@ -16,7 +16,9 @@
 //!    (`schema::anchored`); (2) the post's owner may write there by
 //!    aurora's write rule: `list` or none, listed in `members`;
 //!    `followers`, a stored follow of the audience's owner; `everyone`,
-//!    always; anything else, no; (3) in every mode (since S9, C-6), no
+//!    always; `following` (since S10), a stored follow by the audience's
+//!    owner naming the post's owner, with the owner's follow-verification
+//!    flag holding; anything else, no; (3) in every mode (since S9, C-6), no
 //!    block either way between the post's owner and the audience's owner;
 //!    (4) the audience's owner has an `actors` row with status `active`;
 //! 5. no `private_audiences` row → `NotInAudience`;
@@ -26,8 +28,11 @@
 //!    the post's owner → `NotInAudience`;
 //! 7. by `mode`, matched exactly: `list` or none, viewer ∈ `members`;
 //!    `followers`, the viewer is the audience's owner or a follow record by
-//!    the viewer naming that owner is stored; `everyone`, always; anything
-//!    else (`nobody`, `following`, an unknown value) → `NotInAudience`.
+//!    the viewer naming that owner is stored; `everyone`, always;
+//!    `following` (since S10), the viewer is the audience's owner, or a
+//!    follow record by that owner naming the viewer is stored and the
+//!    owner's follow-verification flag holds; anything else (`nobody`, an
+//!    unknown value) → `NotInAudience`.
 //!
 //! Rules 1–3, 5 and `list`'s membership test mirror Aurora-Locus
 //! `authorize_private_read`. Rule 4 is stricter: aurora trusts a same-PDS
@@ -35,7 +40,9 @@
 //! stricter under `list` too: aurora's list check ignores blocks
 //! (private-posting design §3.7, C-6). `followers` and `everyone` go beyond
 //! it: the PDS denies every mode but `list`, having no follow graph to ask
-//! (docs/internal/design/private-audience-modes.md).
+//! (docs/internal/design/private-audience-modes.md). `following`'s write
+//! condition mirrors aurora's write rule for the mode, and is stricter in
+//! asking for the flag (docs/internal/design/following-audience.md §4.3).
 
 use std::time::{Duration, SystemTime};
 
@@ -98,6 +105,11 @@ impl OracleSnapshot {
         let viewer_block = schema::blocks_between(pool, input.requester, &relation_owner).await?;
         let author_block = schema::blocks_between(pool, owner, &relation_owner).await?;
         let author_follows = schema::follows(pool, owner, &relation_owner).await?;
+        // Facts 10–12 (S10), one statement: the audience's owner follows the
+        // requester, and the post's owner, and its follow-verification flag
+        // holds.
+        let (owner_follows_viewer, owner_follows_author) =
+            schema::following_facts(pool, &relation_owner, input.requester, owner).await?;
         let relation_owner_active = schema::account_active(pool, &relation_owner).await?;
         let anchored = schema::anchored_for(
             pool,
@@ -128,6 +140,7 @@ impl OracleSnapshot {
                         "list" => a.members.iter().any(|m| m == owner),
                         "followers" => author_follows,
                         "everyone" => true,
+                        "following" => owner_follows_author,
                         _ => false,
                     };
                     let rule4 = audience_owner == owner || (anchored && may_write && !author_blocked && relation_owner_active);
@@ -141,6 +154,7 @@ impl OracleSnapshot {
                         "list" => a.members.iter().any(|m| m == input.requester),
                         "followers" => input.requester == audience_owner || viewer_follows,
                         "everyone" => true,
+                        "following" => input.requester == audience_owner || owner_follows_viewer,
                         _ => false,
                     };
                     if rule4 && inside && !blocked { AudienceState::InAudience } else { AudienceState::NotInAudience }

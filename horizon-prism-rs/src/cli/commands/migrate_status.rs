@@ -84,6 +84,8 @@ mod tests {
             "0026_quote_refs_private_tier",
             // Private posting S6.
             "0027_notify_private_tier",
+            // Private posting S10 (the `following` audience).
+            "0028_follows_verified",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

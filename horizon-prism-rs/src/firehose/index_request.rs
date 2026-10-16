@@ -17,11 +17,17 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use sqlx::PgConnection;
 
-use super::backfill::{AUTHORIZATION_NSIDS, BackfillSource, ListPage, ListedRecord, local_uris};
+use super::backfill::{AUTHORIZATION_NSIDS, BackfillSource, ListPage, ListedRecord, MEMBER_FOLLOWS, local_uris};
+use super::classifier::NSID_FOLLOW;
+use super::follows_pass::{self, Fetched, FollowsLister, PassSettings};
 use super::gap;
-use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer, advance_applied_rev};
+use super::jobs::{self, Depth};
+use super::writer::{
+    Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer, advance_applied_rev_with_follows, read_follows_clears,
+};
 use crate::private_tier::PrivateTier;
 
 /// What the write path did (`requestRecord` output `status`).
@@ -131,8 +137,7 @@ pub struct CatchUpConfig {
     /// `index_request.catch_up_min_interval_secs`.
     pub min_interval: Duration,
     /// `index_request.catch_up_max_pages`: `listRecords` pages over every
-    /// collection. The follows pass of a `following` owner (S10) will share
-    /// it.
+    /// collection, the follows pass of a `following` owner's included.
     pub max_pages: u32,
     /// `backfill.reconcile_confirm_limit`.
     pub reconcile_confirm_limit: u32,
@@ -199,18 +204,27 @@ enum Ended {
 ///
 /// 1. Only for a tracked, ready DID that is not purging, whose `applied_rev`
 ///    is below `rev`, and that ran no catch-up within the interval.
-/// 2. The gap epoch is read.
+/// 2. The gap epoch is read; the `sync_state` row is made sure of and its
+///    follow counter read, in one statement (following-audience design
+///    §3.2), before any listing.
 /// 3. The four authorization collections are listed to the end and each
 ///    record whose CID is not stored is written at `rev` as
 ///    [`WriteSource::CatchUp`], with `dead_letter_readiness`: a failed write
 ///    clears the DID's readiness and queues `authz` in its own transaction,
 ///    as on the firehose. Then each fully listed collection is reconciled,
 ///    deletes confirmed with `getRecord`.
-/// 4. The follows pass of a `following` owner comes with S10.
-/// 5. Settle, under the scope read guard: `applied_rev = GREATEST(…, rev)`
-///    only with the epoch unchanged, the DID not purging and still ready,
-///    every listing complete, no reconcile candidate unconfirmed, and no
-///    write failed. Catch-up never sets readiness.
+/// 4. For an owner of a `following` audience (one listed in step 3
+///    included), the follows pass (§3.5), from the same page budget and
+///    deadline with its own reconcile budget, its writes without
+///    `dead_letter_readiness`. An incomplete pass settles nothing; a
+///    contradiction has cleared the flag and queues `authz` a minute on.
+/// 5. Settle, under the scope read guard, the gap lock and the epoch read
+///    under it first (§3.2, #722): `applied_rev = GREATEST(…, rev)` only
+///    with the epoch unchanged, the DID not purging and still ready, every
+///    listing complete, no reconcile candidate unconfirmed, and no write
+///    failed; the follow-verification flag set beside it after a complete
+///    pass whose counter did not move, NULL otherwise. Catch-up never sets
+///    readiness.
 /// 6. Pages come from the host's catch-up budget, which never waits; at
 ///    most `max_pages` in all; the whole run stops at the deadline.
 pub async fn catch_up(
@@ -279,6 +293,12 @@ async fn run_catch_up(
     if !catch_up.claim(did) {
         return Ok(Ended::Skipped("interval"));
     }
+    // 2. The follow counter, before any listing: a clear from now on
+    // replaces it, and this catch-up then sets no flag.
+    let clears = {
+        let mut conn = writer.pool().acquire().await.map_err(db)?;
+        read_follows_clears(&mut conn, did).await.map_err(db)?
+    };
 
     // 3. List and write.
     let mut pages: u32 = 0;
@@ -362,11 +382,50 @@ async fn run_catch_up(
         }
     }
 
-    // 5. Settle: the read guard before the connection (§6.11.7).
+    // 4. The follows pass, for an owner of a `following` audience, one
+    // listed above included (following-audience design §3.2 step 4, §3.5).
+    let owns = {
+        let mut conn = writer.pool().acquire().await.map_err(db)?;
+        writer.private().owns_following_audience(&mut conn, did).await.map_err(db)?
+    };
+    let pass = if owns {
+        let mut lister = CatchUpLister { source, pds, did, pages: &mut pages, max_pages: cfg.max_pages, deadline };
+        let settings = PassSettings {
+            ceiling: usize::MAX,
+            newest_only: is_member.then_some(MEMBER_FOLLOWS),
+            budget: cfg.reconcile_confirm_limit,
+            run_id: u64::from_le_bytes(run),
+        };
+        let outcome = follows_pass::run(writer, pass_options(cfg.attempts), &mut lister, did, rev, settings).await?;
+        if outcome.contradiction {
+            // The flag is down already; an `authz` run a minute on puts it
+            // back, leaving one queued or running alone.
+            let mut conn = writer.pool().acquire().await.map_err(db)?;
+            jobs::enqueue_if_idle(&mut conn, did, Depth::Authz, chrono::Utc::now() + chrono::TimeDelta::minutes(1))
+                .await
+                .map_err(db)?;
+        }
+        if !outcome.complete {
+            // Nothing settles: neither `applied_rev` nor the flag moves, so
+            // a catch-up never darkens a following owner's audiences.
+            return Ok(Ended::Unsettled("follows_incomplete"));
+        }
+        Some(clears)
+    } else {
+        None
+    };
+
+    // 5. Settle: the read guard before the connection (§6.11.7), then the
+    // gap lock and the epoch read under it, before anything else (§3.2).
+    #[cfg(test)]
+    crate::test_support::hooks::pause_in(crate::test_support::hooks::SETTLE_BEFORE_GAP_LOCK, writer.pool(), did).await;
     let sets = writer.scope().read_guard().await;
     let (is_member, is_owner) = (sets.is_member(did), sets.is_owner(did));
     let mut tx = writer.pool().begin().await.map_err(db)?;
-    if gap::current_epoch(&mut tx).await.map_err(db)? != epoch {
+    let settled_epoch = gap::current_epoch_locked(&mut tx).await.map_err(db)?;
+    #[cfg(test)]
+    crate::test_support::hooks::pause_in(crate::test_support::hooks::SETTLE_HOLDS_GAP_LOCK, writer.pool(), did).await;
+    if settled_epoch != epoch {
         return Ok(Ended::Unsettled("gap_epoch_changed"));
     }
     if purging(&mut tx, did).await.map_err(db)? {
@@ -375,10 +434,64 @@ async fn run_catch_up(
     if !(is_member || is_owner) || !ready(&mut tx, writer.private().as_ref(), did, is_member, is_owner).await.map_err(db)? {
         return Ok(Ended::Unsettled("not_ready"));
     }
-    advance_applied_rev(&mut tx, did, rev).await.map_err(db)?;
+    advance_applied_rev_with_follows(&mut tx, did, rev, pass).await.map_err(db)?;
     tx.commit().await.map_err(db)?;
     drop(sets);
     Ok(Ended::Settled)
+}
+
+/// Catch-up's follows-pass lister (following-audience design §3.5): the
+/// pages left of the call's `max_pages`, from the host's catch-up budget,
+/// within the call's deadline. A stop leaves the pass incomplete.
+struct CatchUpLister<'a> {
+    source: &'a dyn BackfillSource,
+    pds: &'a str,
+    did: &'a str,
+    pages: &'a mut u32,
+    max_pages: u32,
+    deadline: Instant,
+}
+
+#[async_trait]
+impl FollowsLister for CatchUpLister<'_> {
+    async fn page(&mut self, cursor: Option<&str>) -> Result<Fetched<ListPage>, String> {
+        if *self.pages >= self.max_pages {
+            return Ok(Fetched::Stopped("page_cap"));
+        }
+        let Some(left) = self.deadline.checked_duration_since(Instant::now()) else {
+            return Ok(Fetched::Stopped("deadline"));
+        };
+        match tokio::time::timeout(left, self.source.list_records_now(self.pds, self.did, NSID_FOLLOW, cursor)).await {
+            Err(_) => Ok(Fetched::Stopped("deadline")),
+            Ok(Ok(None)) => Ok(Fetched::Stopped("no_token")),
+            Ok(Ok(Some(page))) => {
+                *self.pages += 1;
+                Ok(Fetched::Got(page))
+            }
+            Ok(Err(error)) => Err(error),
+        }
+    }
+
+    async fn get_record(&mut self, rkey: &str) -> Result<Fetched<Option<ListedRecord>>, String> {
+        let Some(left) = self.deadline.checked_duration_since(Instant::now()) else {
+            return Ok(Fetched::Stopped("deadline"));
+        };
+        match tokio::time::timeout(left, self.source.get_record(self.pds, self.did, NSID_FOLLOW, rkey)).await {
+            Err(_) => Ok(Fetched::Stopped("deadline")),
+            Ok(found) => found.map(Fetched::Got),
+        }
+    }
+}
+
+/// The follows pass's writes in catch-up (following-audience design §3.5):
+/// as [`catch_up_options`], but a failed follow write does not clear the
+/// DID's readiness. It makes the pass incomplete, or a contradiction, and
+/// the catch-up then settles nothing.
+fn pass_options(attempts: u32) -> ApplyOptions {
+    ApplyOptions {
+        dead_letter_readiness: false,
+        ..catch_up_options(attempts)
+    }
 }
 
 /// Catch-up's writes (private posting §3.8 step 3): not live, no

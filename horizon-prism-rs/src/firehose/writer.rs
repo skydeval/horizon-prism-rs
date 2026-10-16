@@ -237,6 +237,10 @@ enum OpTarget<'a> {
     /// A member's post under the off rule (public-indexing design §4.1).
     GrowOnly(&'a Upsert, &'a GrowthPlan),
     Delete(&'a Delete),
+    /// A follow of a tracked repo that admission rejected, with the reason
+    /// (following-audience design §4.2): the old row goes, and a tombstone
+    /// at the op's rev refuses any older write of it.
+    RejectedFollow(&'a Upsert, &'static str),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -680,7 +684,16 @@ impl Writer {
                 Prepared::Upsert(u) => match admissions[i] {
                     Some(Admission::Reject(reason)) => {
                         metrics::counter!(METRIC_SKIPPED, "reason" => reason.as_str()).increment(1);
-                        OpOutcome::Rejected(reason.as_str())
+                        // A follow of a tracked repo, from any source: an
+                        // unfollow written as an edit must not leave the old
+                        // subject stored (following-audience design §4.2).
+                        if matches!(u.body, Body::Follow(_)) && sets.is_tracked(repo) {
+                            let target = OpTarget::RejectedFollow(u, reason.as_str());
+                            self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
+                                .await?
+                        } else {
+                            OpOutcome::Rejected(reason.as_str())
+                        }
                     }
                     Some(Admission::GrowOnly) => {
                         let target = OpTarget::GrowOnly(u, &plans[i]);
@@ -722,7 +735,7 @@ impl Writer {
         // §6.11.3: the worker advances applied_rev for a tracked repo once
         // every op committed or failed, whatever the ops were.
         if options.advance_applied_rev && sets.is_tracked(repo) {
-            advance_applied_rev(&mut tx, repo, rev).await?;
+            advance_applied_rev(&mut tx, repo, rev, true).await?;
         }
         tx.commit().await?;
         drop(guard);
@@ -887,6 +900,7 @@ impl Writer {
                 OpTarget::Upsert(u, plan) => self.apply_upsert(&mut sp, u, plan, rev, sets, options).await,
                 OpTarget::GrowOnly(u, plan) => self.apply_grow_only(&mut sp, u, plan, rev, options).await,
                 OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets).await,
+                OpTarget::RejectedFollow(u, reason) => self.apply_rejected_follow(&mut sp, u, reason, repo, rev, sets).await,
             };
             match result {
                 Ok((outcome, eff)) => {
@@ -1020,9 +1034,34 @@ impl Writer {
             Body::Like(s) => upsert_subject(conn, "likes", u, s, rev).await?,
             Body::Repost(s) => upsert_subject(conn, "reposts", u, s, rev).await?,
             Body::Follow(g) => {
+                #[cfg(test)]
+                if crate::test_support::hooks::injected(crate::test_support::hooks::FOLLOW_WRITE_FAILS, &u.uri) {
+                    return Err(OpError::Deterministic("injected follow write failure".into()));
+                }
+                // A write from anything but the firehose may come from a
+                // listing older than a newer fact that left no tombstone
+                // (following-audience design §4.4): the stored subject is
+                // read first, on the URI already locked.
+                let verifies = options.source != WriteSource::Firehose && sets.is_tracked(author);
+                let before: Option<String> = if verifies {
+                    sqlx::query_scalar("SELECT subject_did FROM follows WHERE uri = $1")
+                        .bind(&u.uri)
+                        .fetch_optional(&mut *conn)
+                        .await?
+                } else {
+                    None
+                };
                 let inserted = upsert_graph(conn, "follows", u, g, rev).await?;
                 if inserted == Some(true) && sets.is_member(author) {
                     eff.new_member_follow = Some(author.to_string());
+                }
+                let changed = match inserted {
+                    Some(true) => true,
+                    Some(false) => before.as_deref() != Some(g.subject_did.as_str()),
+                    None => false,
+                };
+                if verifies && changed {
+                    self.follows_changed(conn, author).await?;
                 }
                 inserted.is_some()
             }
@@ -1197,6 +1236,10 @@ impl Writer {
             RecordKind::Like => delete_row(conn, "likes", &d.uri, rev).await?,
             RecordKind::Repost => delete_row(conn, "reposts", &d.uri, rev).await?,
             RecordKind::Follow => {
+                #[cfg(test)]
+                if crate::test_support::hooks::injected(crate::test_support::hooks::FOLLOW_WRITE_FAILS, &d.uri) {
+                    return Err(OpError::Deterministic("injected follow write failure".into()));
+                }
                 let removed = delete_row(conn, "follows", &d.uri, rev).await?;
                 if removed && sets.is_member(repo) {
                     eff.member_follow_removed = Some(repo.to_string());
@@ -1223,8 +1266,11 @@ impl Writer {
             }
             RecordKind::Table(table) => delete_row(conn, table, &d.uri, rev).await?,
         };
-        // Tombstone iff a row was removed, or the author is in S (§5.5).
-        if removed || author_in_scope {
+        // Tombstone iff a row was removed, or the author is in S (§5.5); a
+        // follow of any tracked repo too, so that a listing's older write
+        // cannot restore an unfollow that found no row (following-audience
+        // design §4.1).
+        if removed || author_in_scope || (d.kind == RecordKind::Follow && sets.is_tracked(repo)) {
             sqlx::query(
                 "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
                  ON CONFLICT (uri) DO UPDATE SET rev = GREATEST(record_tombstones.rev, EXCLUDED.rev), deleted_at = now()",
@@ -1246,6 +1292,65 @@ impl Writer {
         // rollback undoes both (private posting §4.8).
         self.private.delete_notifications(conn, &d.uri).await?;
         Ok((if removed { OpOutcome::Written } else { OpOutcome::Unchanged }, eff))
+    }
+
+    /// A follow write of a tracked repo from anything but the firehose that
+    /// inserted a row or changed its subject (following-audience design
+    /// §4.4), in the write's savepoint, `jobs` before `sync_state` (§3.3):
+    /// for a following owner, an `authz` a minute on, leaving a queued or
+    /// running one alone; then the flag cleared and the counter replaced, so
+    /// a newer pass that never saw this row cannot leave the flag set
+    /// beside it.
+    async fn follows_changed(&self, conn: &mut PgConnection, author: &str) -> Result<(), sqlx::Error> {
+        if self.private.owns_following_audience(&mut *conn, author).await? {
+            jobs::enqueue_if_idle(&mut *conn, author, Depth::Authz, Utc::now() + chrono::TimeDelta::minutes(1)).await?;
+        }
+        clear_follows_verified(conn, author).await
+    }
+
+    /// A follow of a tracked repo that admission rejected, at its rev U
+    /// (following-audience design §4.2), from any source: the stored row
+    /// goes by last-writer-wins, with its notifications, and a tombstone at
+    /// U refuses every write of the URI at or below U, so an older listing
+    /// cannot store the old subject again. The tombstone only moves
+    /// forward, so a pass at an unchanged rev writes nothing. The outcome
+    /// stays `Rejected`: the rule only removes rows and refuses older
+    /// writes.
+    async fn apply_rejected_follow(
+        &self,
+        conn: &mut PgConnection,
+        u: &Upsert,
+        reason: &'static str,
+        repo: &str,
+        rev: &str,
+        sets: &ScopeSets,
+    ) -> Result<(OpOutcome, MemoryEffects), OpError> {
+        let mut eff = MemoryEffects::default();
+        #[cfg(test)]
+        if crate::test_support::hooks::injected(crate::test_support::hooks::FOLLOW_WRITE_FAILS, &u.uri) {
+            return Err(OpError::Deterministic("injected follow write failure".into()));
+        }
+        let removed = delete_row(conn, "follows", &u.uri, rev).await?;
+        if removed && sets.is_member(repo) {
+            eff.member_follow_removed = Some(repo.to_string());
+        }
+        sqlx::query(
+            "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
+             ON CONFLICT (uri) DO UPDATE SET rev = EXCLUDED.rev, deleted_at = now() \
+             WHERE record_tombstones.rev < EXCLUDED.rev",
+        )
+        .bind(&u.uri)
+        .bind(rev)
+        .execute(&mut *conn)
+        .await?;
+        if removed {
+            sqlx::query("DELETE FROM notifications WHERE record_uri = $1")
+                .bind(&u.uri)
+                .execute(&mut *conn)
+                .await?;
+            self.private.delete_notifications(conn, &u.uri).await?;
+        }
+        Ok((OpOutcome::Rejected(reason), eff))
     }
 
     /// Apply post-commit in-memory changes under a brief write guard.
@@ -1729,24 +1834,104 @@ pub async fn clear_readiness(
         .execute(&mut *conn)
         .await?;
     private.clear_owner_readiness(&mut *conn, did).await?;
-    jobs::enqueue(&mut *conn, did, Depth::Authz).await
+    jobs::enqueue(&mut *conn, did, Depth::Authz).await?;
+    // Last, after the job row: the order every writer of these rows uses
+    // (`members` → jobs → `sync_state`; following-audience design §3.3).
+    clear_follows_verified(conn, did).await
 }
 
-/// `applied_rev = GREATEST(applied_rev, rev)` (§6.11.3).
+/// Clear one DID's follow-verification flag and replace its counter with a
+/// fresh sequence value (following-audience design §3.3), so a run that
+/// read the counter before this can set nothing. A DID with no row has
+/// nothing to stop: a run in flight created its row before reading.
 ///
 /// # Errors
 ///
 /// Any database error.
-pub async fn advance_applied_rev(conn: &mut PgConnection, did: &str, rev: &str) -> Result<(), sqlx::Error> {
+pub async fn clear_follows_verified(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO sync_state (did, applied_rev) VALUES ($1, $2) \
-         ON CONFLICT (did) DO UPDATE SET applied_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev)",
+        "UPDATE sync_state SET follows_verified_at = NULL, follows_clears = nextval('follows_clears_seq') WHERE did = $1",
     )
     .bind(did)
-    .bind(rev)
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// Make sure the DID's `sync_state` row exists and read its counter, in one
+/// statement that always returns a row (following-audience design §3.2): a
+/// run that may verify follows reads it before its first listing. The
+/// no-op update locks the row for the statement and makes `RETURNING`
+/// yield the stored row.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn read_follows_clears(conn: &mut PgConnection, did: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO sync_state (did) VALUES ($1) \
+         ON CONFLICT (did) DO UPDATE SET did = EXCLUDED.did \
+         RETURNING follows_clears",
+    )
+    .bind(did)
+    .fetch_one(conn)
+    .await
+}
+
+/// `applied_rev = GREATEST(applied_rev, rev)` (§6.11.3). `firehose`: the
+/// firehose's own advance, which also raises `firehose_rev`, the position
+/// a follow-verification flag waits for (following-audience design §3.2).
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn advance_applied_rev(conn: &mut PgConnection, did: &str, rev: &str, firehose: bool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO sync_state (did, applied_rev, firehose_rev) VALUES ($1, $2, CASE WHEN $3 THEN $2 END) \
+         ON CONFLICT (did) DO UPDATE SET applied_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev), \
+           firehose_rev = CASE WHEN $3 THEN GREATEST(sync_state.firehose_rev, EXCLUDED.applied_rev) \
+                               ELSE sync_state.firehose_rev END",
+    )
+    .bind(did)
+    .bind(rev)
+    .bind(firehose)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// A settle's `applied_rev` advance with the follow-verification flag
+/// (following-audience design §3.2), as catch-up writes it. `pass`:
+/// `Some(clears)` for a complete follows pass whose run read `clears` at its
+/// start; `None` for no complete pass. The flag is set only when the stored
+/// counter still equals that reading, compared under the row lock; every
+/// other case, the `INSERT` branch included, writes NULL.
+/// `follows_verified_rev` is the `applied_rev` this leaves behind. Returns
+/// whether the flag was set.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn advance_applied_rev_with_follows(
+    conn: &mut PgConnection,
+    did: &str,
+    rev: &str,
+    pass: Option<i64>,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO sync_state (did, applied_rev) VALUES ($1, $2) \
+         ON CONFLICT (did) DO UPDATE SET \
+           applied_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev), \
+           follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 THEN now() END, \
+           follows_verified_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev) \
+         RETURNING follows_verified_at IS NOT NULL",
+    )
+    .bind(did)
+    .bind(rev)
+    .bind(pass.is_some())
+    .bind(pass.unwrap_or(0))
+    .fetch_one(conn)
+    .await
 }
 
 #[cfg(test)]

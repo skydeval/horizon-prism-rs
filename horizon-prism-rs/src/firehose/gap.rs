@@ -7,7 +7,18 @@
 //! - deletes all owner readiness (through the private-tier facade);
 //! - enqueues, resetting to `queued`, `authz` for every tracked DID and
 //!   `resync` for every member;
-//! - sets `last_gap`.
+//! - sets `last_gap`;
+//! - clears every follow-verification flag (following-audience design §3.3),
+//!   as its last write.
+//!
+//! The epoch is ordered against every settle by one transaction-scoped
+//! advisory key (following-audience design §3.2, #722): the gap takes it
+//! exclusively as its first statement, and a settle takes it shared and
+//! reads the epoch under it ([`current_epoch_locked`]). A settle that holds
+//! it commits before the gap can, and the gap then clears what it wrote; a
+//! settle that takes it after the gap reads the new epoch. A request that
+//! conflicts with one already waiting queues behind it, so later settles
+//! wait behind a waiting gap and cannot starve it.
 
 use chrono::Utc;
 use sqlx::{PgConnection, PgPool};
@@ -22,6 +33,12 @@ pub const METRIC_GAPS: &str = "firehose_trim_gap_total";
 pub const KEY_GAP_EPOCH: &str = "gap_epoch";
 pub const KEY_LAST_GAP: &str = "last_gap";
 pub const KEY_CLAIM_IN_PROGRESS: &str = "claim_in_progress";
+
+/// The gap's exclusive hold on the epoch key (§3.2), in the style of the
+/// crate's other advisory keys (`db::locks`).
+pub const GAP_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended('epoch:gap', 0))";
+/// A settle's shared hold on the same key.
+pub const SETTLE_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock_shared(hashtextextended('epoch:gap', 0))";
 
 /// What evidence produced a gap (log and metric label).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +90,9 @@ pub async fn run_gap_transaction(
     members.sort();
 
     let mut tx = pool.begin().await?;
+    // First, before any row: no transaction holding a row lock waits for
+    // this key, so it closes no cycle (§3.2 "Lock order").
+    sqlx::query(GAP_LOCK_SQL).execute(&mut *tx).await?;
     let epoch = increment_epoch(&mut tx).await?;
     sqlx::query("UPDATE members SET ready_at = NULL WHERE ready_at IS NOT NULL")
         .execute(&mut *tx)
@@ -84,6 +104,12 @@ pub async fn run_gap_transaction(
     if clear_claim {
         set_json(&mut tx, KEY_CLAIM_IN_PROGRESS, &serde_json::json!(false)).await?;
     }
+    // Last, in the firehose writer's order (`members` → jobs →
+    // `sync_state`, §3.3). No counter: a settle holding the key commits
+    // first and is cleared here; one after it reads the new epoch.
+    sqlx::query("UPDATE sync_state SET follows_verified_at = NULL WHERE follows_verified_at IS NOT NULL")
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     drop(guard);
 
@@ -110,7 +136,8 @@ async fn increment_epoch(conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
     .await
 }
 
-/// The current gap epoch (0 before the first gap).
+/// The current gap epoch (0 before the first gap), unlocked: for readers that
+/// settle nothing on it.
 ///
 /// # Errors
 ///
@@ -121,6 +148,23 @@ pub async fn current_epoch(conn: &mut PgConnection) -> Result<i64, sqlx::Error> 
         .fetch_optional(conn)
         .await?;
     Ok(v.unwrap_or(0))
+}
+
+/// A settle's first two statements (following-audience design §3.2, #722):
+/// the shared hold on the gap key, then the epoch read under it, which
+/// lasts until the settle's transaction ends. A missing row is an error,
+/// which ends the settle with nothing written: migration 0028 seeds it, so
+/// only a hand-changed database lacks it.
+///
+/// # Errors
+///
+/// Any database error, the missing row included.
+pub async fn current_epoch_locked(conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
+    sqlx::query(SETTLE_LOCK_SQL).execute(&mut *conn).await?;
+    sqlx::query_scalar("SELECT (value #>> '{}')::bigint FROM worker_state WHERE key = $1")
+        .bind(KEY_GAP_EPOCH)
+        .fetch_one(conn)
+        .await
 }
 
 async fn set_json(conn: &mut PgConnection, key: &str, value: &serde_json::Value) -> Result<(), sqlx::Error> {

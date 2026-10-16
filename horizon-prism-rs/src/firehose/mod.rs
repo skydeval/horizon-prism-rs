@@ -8,6 +8,7 @@ pub mod consumer;
 pub mod coverage;
 pub mod deadletter;
 pub mod extract;
+pub mod follows_pass;
 pub mod gap;
 pub mod index_request;
 pub mod jobs;

@@ -197,6 +197,7 @@ per_pds_rate_per_sec = 5
 full_listing_ceiling = 1000000
 retry_every_hours = 6
 reconcile_confirm_limit = 1000
+follows_pass_ceiling = 50000
 
 [retention]
 max_age_days = 0
@@ -890,6 +891,7 @@ fn zero_values_that_break_runtime_are_rejected() {
         ("private_read", "bind_concurrency"),
         ("private_read", "membership_retry_after_secs"),
         ("backfill", "concurrency"),
+        ("backfill", "follows_pass_ceiling"),
         ("sync", "read_fetch_rate_per_host"),
         ("sync", "catch_up_rate_per_host"),
         ("index_request", "catch_up_min_interval_secs"),

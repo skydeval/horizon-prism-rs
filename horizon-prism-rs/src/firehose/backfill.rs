@@ -14,9 +14,12 @@
 //!    `rev < R` absent from the listing are confirmed with `getRecord` (at
 //!    most `reconcile_confirm_limit` per job, in `hash(uri ‖ run id)` order)
 //!    and deleted through the delete path with rev R;
-//! 5. for `member` jobs and members' `authz` jobs, the Constellation
-//!    inbound-block pass;
-//! 6. the readiness (or done) transaction.
+//! 5. for an owner of a `following` audience, after the authorization
+//!    listings, the follows pass (following-audience design §3.5, S10), its
+//!    counter read before the first listing; for `member` jobs and members'
+//!    `authz` jobs, the Constellation inbound-block pass;
+//! 6. the readiness (or done) transaction, which takes the gap lock first
+//!    and writes the follow-verification flag beside `applied_rev`.
 //!
 //! A claim carries the row's `generation` (design-v4 §II-5.10
 //! "Generations"); every statement the run issues on its row is conditioned
@@ -47,9 +50,10 @@ use super::classifier::{
     NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_PROFILE, NSID_REPOST, NSID_STARTER_PACK,
     NSID_THREADGATE,
 };
+use super::follows_pass::{self, Fetched, FollowsLister, PassOutcome, PassSettings};
 use super::gap;
-use super::jobs::Depth;
-use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer};
+use super::jobs::{self, Depth};
+use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer, read_follows_clears};
 use crate::config::BackfillConfig;
 use crate::farsight::Farsight;
 use crate::indexing::PublicMode;
@@ -86,6 +90,9 @@ pub const METRIC_MEMBERS_NOT_READY: &str = "members_not_ready_total";
 pub const METRIC_AUTHZ_STUCK: &str = "authz_backfill_stuck_total";
 /// `backfill_claims_total{order, depth}`: jobs claimed, by claim order.
 pub const METRIC_CLAIMS: &str = "backfill_claims_total";
+/// DIDs whose follow-verification flag is set and waits for the firehose
+/// (following-audience design §3.2).
+pub const METRIC_FOLLOWING_WAITING: &str = "following_owners_waiting_firehose";
 
 /// The order a worker claims due jobs in (public-indexing §8.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,13 +261,17 @@ const GATES: [CollectionPlan; 2] = [
     public(NSID_POSTGATE, Limit::Top(1000)),
 ];
 
+/// How many of a member's follows its plans take, newest first by rkey; a
+/// following owner's pass writes no missing follow beyond them (C-F1).
+pub const MEMBER_FOLLOWS: usize = 10_000;
+
 // The list collections are listed whole, up to the ceiling. A truncated
 // listing only logs: they are not authorization facts. The gates are in
 // [`GATES`].
 const MEMBER_PUBLIC: [CollectionPlan; 10] = [
     public(NSID_POST, Limit::Top(1000)),
     public(NSID_REPOST, Limit::Top(1000)),
-    public(NSID_FOLLOW, Limit::Top(10_000)),
+    public(NSID_FOLLOW, Limit::Top(MEMBER_FOLLOWS)),
     public(NSID_LIKE, Limit::Top(1000)),
     public(NSID_LIST, Limit::All),
     public(NSID_LISTITEM, Limit::All),
@@ -275,7 +286,7 @@ const MEMBER_PUBLIC: [CollectionPlan; 10] = [
 // them; no post is stored.
 const MEMBER_OFF: [CollectionPlan; 8] = [
     public(NSID_POST, Limit::Top(1000)),
-    public(NSID_FOLLOW, Limit::Top(10_000)),
+    public(NSID_FOLLOW, Limit::Top(MEMBER_FOLLOWS)),
     public(NSID_LIKE, Limit::Top(1000)),
     public(NSID_REPOST, Limit::Top(1000)),
     public(NSID_LIST, Limit::All),
@@ -690,6 +701,25 @@ impl BackfillSource for NetSource {
     }
 }
 
+/// A job's follows-pass lister (following-audience design §3.5): the job's
+/// own source, under the host's backfill budget, which waits.
+struct JobLister<'a> {
+    source: &'a dyn BackfillSource,
+    pds: &'a str,
+    did: &'a str,
+}
+
+#[async_trait]
+impl FollowsLister for JobLister<'_> {
+    async fn page(&mut self, cursor: Option<&str>) -> Result<Fetched<ListPage>, String> {
+        self.source.list_records(self.pds, self.did, NSID_FOLLOW, cursor).await.map(Fetched::Got)
+    }
+
+    async fn get_record(&mut self, rkey: &str) -> Result<Fetched<Option<ListedRecord>>, String> {
+        self.source.get_record(self.pds, self.did, NSID_FOLLOW, rkey).await.map(Fetched::Got)
+    }
+}
+
 /// A claimed job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
@@ -705,7 +735,15 @@ pub struct Job {
     /// The gap epoch the claim recorded. `settle` compares it with the
     /// current one and never reads it back from the row.
     pub gap_epoch: i64,
+    /// The row's `last_error` at the claim: [`FOLLOWS_RETRY`] when the
+    /// previous `authz` run met a follows contradiction too.
+    pub last_error: Option<String>,
 }
+
+/// The `last_error` marker of an `authz` row re-queued after a follows
+/// pass that met a contradiction or whose settle wrote the flag NULL
+/// (following-audience design §3.5): the next such re-queue waits an hour.
+pub const FOLLOWS_RETRY: &str = "follows_retry";
 
 /// What a run found, for the final transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -717,6 +755,28 @@ struct RunResult {
     auth_write_failed: bool,
     /// Authorization reconcile candidates remain unconfirmed.
     auth_reconcile_incomplete: bool,
+    /// The run ended on the ineligible path, with no listing.
+    ineligible: bool,
+    /// The follow counter read at run start (following-audience design
+    /// §3.2), for a tracked DID's full-authorization run.
+    clears: Option<i64>,
+    /// The follows pass, when the run decided the DID owns a `following`
+    /// audience (§3.5).
+    pass: Option<PassOutcome>,
+}
+
+/// What a settle queues after a follows pass, or after its re-check
+/// (following-audience design §3.5): an `authz` run must follow. An
+/// `authz` run re-queues its own row instead of `mark_done`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowUp {
+    /// The DID owns a `following` audience the run did not verify: now.
+    Now,
+    /// Reconcile candidates left on budget: a minute on.
+    Minute,
+    /// A contradiction, or a complete pass whose settle wrote NULL: a
+    /// minute on, then an hour once the marker is already there.
+    Retry,
 }
 
 /// How a job ended.
@@ -937,6 +997,37 @@ impl Backfill {
         let Some(job) = self.claim(ClaimOrder::for_worker(worker)).await? else {
             return Ok(None);
         };
+        self.run_claimed(job).await.map(Some)
+    }
+
+    /// Claim and run the queued job `(did, depth)`, due or not (tests that
+    /// drive one job at a time, a re-queued run included).
+    ///
+    /// # Errors
+    ///
+    /// Claiming or settling failed (database).
+    #[cfg(test)]
+    pub async fn run_job(&self, did: &str, depth: Depth) -> Result<Option<(Job, JobOutcome)>, sqlx::Error> {
+        let row: Option<(i32, i64, i64, Option<String>)> = sqlx::query_as(
+            "UPDATE backfill_jobs SET state = 'running', updated_at = now(), \
+               gap_epoch = COALESCE((SELECT (value #>> '{}')::bigint FROM worker_state WHERE key = $3), 0) \
+             WHERE did = $1 AND depth = $2 AND state = 'queued' \
+             RETURNING attempts, generation, gap_epoch, last_error",
+        )
+        .bind(did)
+        .bind(depth.as_str())
+        .bind(gap::KEY_GAP_EPOCH)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((attempts, generation, gap_epoch, last_error)) = row else {
+            return Ok(None);
+        };
+        let job = Job { did: did.to_string(), depth, attempts, run_id: rand::random(), generation, gap_epoch, last_error };
+        self.run_claimed(job).await.map(Some)
+    }
+
+    /// Run a claimed job and settle it.
+    async fn run_claimed(&self, job: Job) -> Result<(Job, JobOutcome), sqlx::Error> {
         let outcome = match self.run(&job).await {
             Ok(Some(result)) => self.settle(&job, &result).await?,
             Ok(None) => JobOutcome::Superseded,
@@ -949,19 +1040,19 @@ impl Backfill {
             }
         };
         tracing::info!(event = "backfill_job", did = %job.did, depth = job.depth.as_str(), outcome = ?outcome, "backfill job finished");
-        Ok(Some((job, outcome)))
+        Ok((job, outcome))
     }
 
     /// Claim the next due job in `order`, recording the current gap epoch
     /// (§6.11.2). The run carries the row's generation and that epoch
     /// (§II-5.10 "Generations").
     async fn claim(&self, order: ClaimOrder) -> Result<Option<Job>, sqlx::Error> {
-        let row: Option<(String, String, i32, i64, i64)> = sqlx::query_as(&format!(
+        let row: Option<(String, String, i32, i64, i64, Option<String>)> = sqlx::query_as(&format!(
             "WITH next AS ({}) \
              UPDATE backfill_jobs j SET state = 'running', updated_at = now(), \
                gap_epoch = COALESCE((SELECT (value #>> '{{}}')::bigint FROM worker_state WHERE key = $1), 0) \
              FROM next WHERE j.did = next.did AND j.depth = next.depth \
-             RETURNING j.did, j.depth, j.attempts, j.generation, j.gap_epoch",
+             RETURNING j.did, j.depth, j.attempts, j.generation, j.gap_epoch, j.last_error",
             order.select()
         ))
         .bind(gap::KEY_GAP_EPOCH)
@@ -970,7 +1061,7 @@ impl Backfill {
         if let Some((_, depth, ..)) = &row {
             metrics::counter!(METRIC_CLAIMS, "order" => order.as_str(), "depth" => depth.clone()).increment(1);
         }
-        Ok(row.and_then(|(did, depth, attempts, generation, gap_epoch)| {
+        Ok(row.and_then(|(did, depth, attempts, generation, gap_epoch, last_error)| {
             Depth::parse(&depth).map(|depth| Job {
                 did,
                 depth,
@@ -978,6 +1069,7 @@ impl Backfill {
                 run_id: rand::random(),
                 generation,
                 gap_epoch,
+                last_error,
             })
         }))
     }
@@ -999,9 +1091,9 @@ impl Backfill {
 
     /// Steps 1–5. `Ok(None)` when superseded part-way.
     async fn run(&self, job: &Job) -> Result<Option<RunResult>, String> {
-        let (is_member, mode) = {
+        let (is_member, mode, tracked) = {
             let sets = self.writer.scope().read_guard().await;
-            (sets.is_member(&job.did), sets.public.mode)
+            (sets.is_member(&job.did), sets.public.mode, sets.is_tracked(&job.did))
         };
         // A member job asks Farsight to read the member's repository
         // (design-v3 §5.14.11). Best effort, on a task of its own: its
@@ -1028,14 +1120,24 @@ impl Backfill {
                 .map_err(|e| e.to_string())?;
             if !owner {
                 tracing::info!(event = "backfill_owner_ineligible", did = %job.did, ?confirmation, "not a private owner; job ends without listings");
-                return Ok(Some(RunResult::default()));
+                return Ok(Some(RunResult { ineligible: true, ..RunResult::default() }));
             }
         }
         let pds = prepared.map_err(|e| e.to_string())?;
+        // A run that may verify follows reads the counter before its first
+        // listing, creating the row if need be, in one statement
+        // (following-audience design §3.2): a clear from now on replaces it.
+        let clears = if job.depth.is_full_authorization() && tracked {
+            let mut conn = self.pool.acquire().await.map_err(|e| e.to_string())?;
+            Some(read_follows_clears(&mut conn, &job.did).await.map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
         let rev = self.source.latest_rev(&pds, &job.did).await?;
         let plan = plan(job.depth, is_member, mode);
         let mut result = RunResult {
             rev,
+            clears,
             ..RunResult::default()
         };
         let mut budget = self.settings.reconcile_confirm_limit;
@@ -1088,6 +1190,31 @@ impl Backfill {
                 if unconfirmed > 0 && c.authorization {
                     result.auth_reconcile_incomplete = true;
                 }
+            }
+        }
+        // The follows pass, for an owner of a `following` audience only
+        // (C-F4), decided after the authorization listings, which wrote any
+        // `following` audience listed in this run (following-audience
+        // design §3.5). It leaves readiness as it was decided.
+        if result.clears.is_some() {
+            if let Step::Superseded = self.still_running(job).await? {
+                return Ok(None);
+            }
+            let owns = {
+                let mut conn = self.pool.acquire().await.map_err(|e| e.to_string())?;
+                self.writer.private().owns_following_audience(&mut conn, &job.did).await.map_err(|e| e.to_string())?
+            };
+            if owns {
+                let settings = PassSettings {
+                    ceiling: usize::try_from(self.settings.follows_pass_ceiling).unwrap_or(usize::MAX),
+                    newest_only: is_member.then_some(MEMBER_FOLLOWS),
+                    budget: self.settings.reconcile_confirm_limit,
+                    run_id: job.run_id,
+                };
+                let mut lister = JobLister { source: self.source.as_ref(), pds: &pds, did: &job.did };
+                let outcome = follows_pass::run(&self.writer, self.options(), &mut lister, &job.did, &result.rev, settings).await?;
+                tracing::info!(event = "follows_pass", did = %job.did, outcome = outcome.label(), "follows pass");
+                result.pass = Some(outcome);
             }
         }
         // The profile and the `self` records are optional: a new account
@@ -1379,6 +1506,8 @@ impl Backfill {
         }
         let may_set_readiness = readiness_capable && !result.ceiling_hit && !result.auth_write_failed;
 
+        #[cfg(test)]
+        crate::test_support::hooks::pause_in(crate::test_support::hooks::SETTLE_BEFORE_GAP_LOCK, &self.pool, &job.did).await;
         // Read guard before the connection (§6.11.7).
         let guard = self.writer.scope().read_guard().await;
         let is_member = guard.is_member(&job.did);
@@ -1389,6 +1518,13 @@ impl Backfill {
         // `subscribed-post` needs for an author that is not tracked.
         let in_scope = guard.in_scope(&job.did);
         let mut tx = self.pool.begin().await?;
+        // The gap lock, shared, and the epoch read under it, before any row
+        // (following-audience design §3.2, #722): a gap that commits first
+        // is seen here; one that comes later waits for this commit and then
+        // clears what it wrote.
+        let epoch = gap::current_epoch_locked(&mut tx).await?;
+        #[cfg(test)]
+        crate::test_support::hooks::pause_in(crate::test_support::hooks::SETTLE_HOLDS_GAP_LOCK, &self.pool, &job.did).await;
         // Ours only while `running` at the claim's generation (§II-5.10):
         // otherwise the run was superseded and writes nothing.
         let ours: Option<i32> = sqlx::query_scalar(
@@ -1402,8 +1538,16 @@ impl Backfill {
         if ours.is_none() {
             return Ok(JobOutcome::Superseded);
         }
+        // What must follow this run for its follows (§3.5), queued right
+        // after the own row's lock and before `members`, so the settle
+        // takes rows in the order the writer does (§3.3).
+        let mut follow_up = self.follow_up(&mut tx, job, result, tracked).await?;
+        if let Some(f) = follow_up {
+            self.queue_follow_up(&mut tx, job, f).await?;
+        }
+        #[cfg(test)]
+        crate::test_support::hooks::pause_in(crate::test_support::hooks::SETTLE_AFTER_FOLLOW_UP, &self.pool, &job.did).await;
         let outcome = if may_set_readiness {
-            let epoch = gap::current_epoch(&mut tx).await?;
             let purging: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM purging_dids WHERE did = $1)")
                 .bind(&job.did)
                 .fetch_one(&mut *tx)
@@ -1431,32 +1575,103 @@ impl Backfill {
                     ready = true;
                 }
                 if tracked {
-                    sqlx::query(
+                    // The flag moves only here, with `applied_rev`
+                    // (following-audience design §3.2): set when this run
+                    // made a complete pass and no clear replaced the
+                    // counter it read at its start, compared under the row
+                    // lock; NULL otherwise, the `INSERT` branch included.
+                    // `follows_verified_rev` is the `applied_rev` this
+                    // leaves behind, which the firehose must reach before
+                    // the flag holds.
+                    let pass = result.pass.filter(|p| p.complete).and(result.clears);
+                    let verified: bool = sqlx::query_scalar(
                         "INSERT INTO sync_state (did, applied_rev, last_resync_at) VALUES ($1, $2, now()) \
                          ON CONFLICT (did) DO UPDATE SET \
                            applied_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev), \
-                           last_resync_at = now()",
+                           last_resync_at = now(), \
+                           follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 THEN now() END, \
+                           follows_verified_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev) \
+                         RETURNING follows_verified_at IS NOT NULL",
                     )
                     .bind(&job.did)
                     .bind(&result.rev)
-                    .execute(&mut *tx)
+                    .bind(pass.is_some())
+                    .bind(pass.unwrap_or(0))
+                    .fetch_one(&mut *tx)
                     .await?;
+                    // A complete pass whose counter moved during the run:
+                    // an `authz` run must follow (§3.5). Usually the
+                    // follow-up was queued above, the move already seen.
+                    if pass.is_some() && !verified && follow_up != Some(FollowUp::Retry) {
+                        follow_up = Some(FollowUp::Retry);
+                        self.queue_follow_up(&mut tx, job, FollowUp::Retry).await?;
+                    }
                 } else if in_scope {
                     touch_last_resync(&mut tx, &job.did).await?;
                 }
-                mark_done(&mut tx, job).await?;
+                finish(&mut tx, job, follow_up).await?;
                 if ready { JobOutcome::Ready } else { JobOutcome::Done }
             }
         } else {
             if tracked || in_scope {
                 touch_last_resync(&mut tx, &job.did).await?;
             }
-            mark_done(&mut tx, job).await?;
+            finish(&mut tx, job, follow_up).await?;
             JobOutcome::Done
         };
         tx.commit().await?;
         drop(guard);
         Ok(outcome)
+    }
+
+    /// What must follow this run for a `following` audience (following-
+    /// audience design §3.5), decided on the settle's transaction after the
+    /// own row's lock:
+    /// - a contradiction: a retry, a minute on, then an hour;
+    /// - a complete pass whose counter has already moved (read without a
+    ///   lock; the settle statement catches a later move): the same;
+    /// - candidates left on budget: a minute on;
+    /// - no pass, and the DID owns a `following` audience now (the
+    ///   re-check), unless the run ended ineligible or the DID is not
+    ///   tracked: now.
+    async fn follow_up(&self, conn: &mut PgConnection, job: &Job, result: &RunResult, tracked: bool) -> Result<Option<FollowUp>, sqlx::Error> {
+        if !job.depth.is_full_authorization() {
+            return Ok(None);
+        }
+        if let Some(pass) = result.pass {
+            if pass.contradiction {
+                return Ok(Some(FollowUp::Retry));
+            }
+            if pass.complete
+                && let Some(clears) = result.clears
+            {
+                let now: Option<i64> = sqlx::query_scalar("SELECT follows_clears FROM sync_state WHERE did = $1")
+                    .bind(&job.did)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                return Ok((now != Some(clears)).then_some(FollowUp::Retry));
+            }
+            return Ok(pass.unconfirmed.then_some(FollowUp::Minute));
+        }
+        if result.ineligible || !tracked {
+            return Ok(None);
+        }
+        let owns = self.writer.private().owns_following_audience(conn, &job.did).await?;
+        Ok(owns.then_some(FollowUp::Now))
+    }
+
+    /// A `member` or `private` run queues the `authz` follow-up, leaving a
+    /// queued or running one alone; an `authz` run re-queues its own row
+    /// instead, in [`finish`].
+    async fn queue_follow_up(&self, conn: &mut PgConnection, job: &Job, f: FollowUp) -> Result<(), sqlx::Error> {
+        if job.depth == Depth::Authz {
+            return Ok(());
+        }
+        let at = match f {
+            FollowUp::Now => chrono::Utc::now(),
+            FollowUp::Minute | FollowUp::Retry => chrono::Utc::now() + backoff(1),
+        };
+        jobs::enqueue_if_idle(conn, &job.did, Depth::Authz, at).await
     }
 
     /// Record a failed run on its row, with backoff. Returns whether the row
@@ -1551,7 +1766,13 @@ impl Backfill {
         }
     }
 
-    async fn sample_metrics(&self) -> Result<(), sqlx::Error> {
+    /// One sample of the backfill gauges, as `metrics_loop` takes it every
+    /// [`METRICS_INTERVAL`].
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn sample_metrics(&self) -> Result<(), sqlx::Error> {
         let rows: Vec<(String, String, i64)> =
             sqlx::query_as("SELECT depth, state, count(*) FROM backfill_jobs GROUP BY depth, state")
                 .fetch_all(&self.pool)
@@ -1571,11 +1792,32 @@ impl Backfill {
             .await?;
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(METRIC_MEMBERS_NOT_READY).set(not_ready as f64);
+        let waiting = following_owners_waiting_firehose(&self.pool).await?;
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!(METRIC_FOLLOWING_WAITING).set(waiting as f64);
         Ok(())
     }
 }
 
-/// Seconds into the day for a DID's daily job.
+/// DIDs whose follow-verification flag is set but does not hold yet: the
+/// firehose has not applied their commits through `follows_verified_rev`
+/// (following-audience design §3.2). A short spike after commits is
+/// normal; a floor names owners on PDSes no relay crawls, or waiting on a
+/// `#sync`, a hole or a trim gap.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn following_owners_waiting_firehose(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM sync_state \
+         WHERE follows_verified_at IS NOT NULL \
+           AND (firehose_rev IS NULL OR firehose_rev < follows_verified_rev)",
+    )
+    .fetch_one(pool)
+    .await
+}
+
 /// Local URIs of `did` in `nsid` with `rev < R`: the reconcile candidates
 /// before the listing filter (§5.10), for a job and for `requestRecord`'s
 /// catch-up (private posting §3.8). Under the off rule no post is stored, so
@@ -1604,6 +1846,7 @@ pub async fn local_uris(writer: &Writer, did: &str, nsid: &str, rev: &str, off_r
     Ok(uris)
 }
 
+/// Seconds into the day for a DID's daily job.
 fn daily_offset_secs(did: &str) -> f64 {
     let h = blake3::hash(did.as_bytes());
     let mut b = [0u8; 8];
@@ -1624,6 +1867,42 @@ async fn requeue(conn: &mut PgConnection, job: &Job, delay_secs: i32) -> Result<
     .bind(job.depth.as_str())
     .bind(f64::from(delay_secs))
     .bind(job.generation)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// The run's end: `mark_done`, or for an `authz` run with a follows
+/// follow-up (following-audience design §3.5), its own row re-queued,
+/// since a guarded enqueue would find it `running` and do nothing.
+async fn finish(conn: &mut PgConnection, job: &Job, follow_up: Option<FollowUp>) -> Result<(), sqlx::Error> {
+    match (job.depth, follow_up) {
+        (Depth::Authz, Some(FollowUp::Now)) => requeue(conn, job, 0).await,
+        (Depth::Authz, Some(FollowUp::Minute)) => requeue(conn, job, 60).await,
+        (Depth::Authz, Some(FollowUp::Retry)) => retry_requeue(conn, job).await,
+        _ => mark_done(conn, job).await,
+    }
+}
+
+/// An `authz` run's re-queue after a follows contradiction, or a complete
+/// pass whose settle wrote the flag NULL (following-audience design §3.5):
+/// a minute on, or an hour on when the previous run ended so too (the
+/// [`FOLLOWS_RETRY`] marker it read at its claim). It did not fail, so
+/// `attempts` is reset; `mark_done` clears the marker, and a `fail()`
+/// overwrites it. Only while the row is still the run's.
+async fn retry_requeue(conn: &mut PgConnection, job: &Job) -> Result<(), sqlx::Error> {
+    let delay = if job.last_error.as_deref() == Some(FOLLOWS_RETRY) { backoff(3) } else { backoff(1) };
+    #[allow(clippy::cast_precision_loss)]
+    let secs = delay.num_seconds() as f64;
+    sqlx::query(
+        "UPDATE backfill_jobs SET state = 'queued', not_before = now() + make_interval(secs => $3), attempts = 0, \
+           last_error = $4, updated_at = now() \
+         WHERE did = $1 AND depth = 'authz' AND generation = $2",
+    )
+    .bind(&job.did)
+    .bind(job.generation)
+    .bind(secs)
+    .bind(FOLLOWS_RETRY)
     .execute(conn)
     .await?;
     Ok(())
@@ -2160,7 +2439,7 @@ mod tests {
         drop(conn);
         let job = backfill.claim(ClaimOrder::Plain).await.expect("claim").expect("job");
         let result = backfill.run(&job).await.expect("run").expect("not superseded");
-        sqlx::query("INSERT INTO worker_state (key, value) VALUES ('gap_epoch', '7'::jsonb)")
+        sqlx::query("UPDATE worker_state SET value = '7'::jsonb WHERE key = 'gap_epoch'")
             .execute(&db.pool)
             .await
             .expect("epoch");

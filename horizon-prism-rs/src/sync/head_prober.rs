@@ -275,6 +275,8 @@ impl HeadProber {
             tx.commit().await?;
             return Ok(ProbeResult::DivergenceAwaitingAuthz);
         }
+        #[cfg(test)]
+        crate::test_support::hooks::pause_in(crate::test_support::hooks::PROBER_HOLDS_SYNC_STATE, &self.pool, did).await;
         clear_readiness(&mut tx, self.private.as_ref(), did).await?;
         // Re-arm: a divergence that persists after this authz is detected
         // again one grace period later.

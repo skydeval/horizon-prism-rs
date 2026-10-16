@@ -86,6 +86,35 @@ pub async fn enqueue_at(
     Ok(())
 }
 
+/// Enqueue one job due at `not_before`, leaving a `queued` or `running` one
+/// alone (following-audience design §3.5, §4.4): a burst of follow-ups does
+/// not keep resetting it, and a running run is not superseded. A `done`,
+/// `failed` or `cancelled` row is queued again at a new generation.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn enqueue_if_idle(
+    conn: &mut PgConnection,
+    did: &str,
+    depth: Depth,
+    not_before: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error, updated_at) \
+         VALUES ($1, $2, 'queued', 0, $3, NULL, now()) \
+         ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
+           not_before = EXCLUDED.not_before, last_error = NULL, updated_at = now() \
+         WHERE backfill_jobs.state NOT IN ('queued', 'running')",
+    )
+    .bind(did)
+    .bind(depth.as_str())
+    .bind(not_before)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Enqueue (or reset) one job per DID, all due now, in one statement.
 ///
 /// # Errors

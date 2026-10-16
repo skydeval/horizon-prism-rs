@@ -2,6 +2,9 @@
 //! encoded with the real at-rest hooks, ingested through the firehose writer,
 //! then read over HTTP through the private router.
 
+// S10, the `following` audience mode, on this module's fixtures.
+mod following;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -960,6 +963,22 @@ async fn walk_limits(test: &str, layout: Layout) {
         chain.push((author, uri.clone()));
         parent = uri;
     }
+    // S10: nine levels below Alice's root under her `following` audience,
+    // every step by an author she follows; Bob's step at level 3 only.
+    let follow_aud = w.f.audience(ALICE, "3kaudfollow2", Some("following"), &[]).await;
+    let follow_root = w.f.private_post(ALICE, "3krootfollow", &follow_aud, None).await;
+    let mut follow_chain = Vec::new();
+    let mut parent = follow_root.clone();
+    for level in 1..=9 {
+        let author = if level == 3 { BOB } else { CAROL };
+        let uri = w.f.private_post(author, &format!("3kfollow{level}2222"), &follow_aud, Some((&follow_root, &parent))).await;
+        follow_chain.push((author, uri.clone()));
+        parent = uri;
+    }
+    for did in [BOB, CAROL, DAVE] {
+        exec(&w.f.pool, &follow_sql(ALICE, did)).await;
+    }
+    set_follows_verified(&w.f.pool, ALICE, true).await;
     // Two posts naming each other as parent, and a reply into the cycle.
     let cycle_a = format!("at://{BOB}/{NSID_POST_PRIVATE}/3kcyclea2222");
     let cycle_b = format!("at://{CAROL}/{NSID_POST_PRIVATE}/3kcycleb2222");
@@ -982,6 +1001,20 @@ async fn walk_limits(test: &str, layout: Layout) {
     }
     for uri in [&cycle_a, &cycle_b, &into_cycle] {
         w.expect("cycle", DAVE, uri, false).await;
+    }
+    // S10: under `following`, served at level 8 and not at 9; once Alice
+    // unfollows the level-3 author, levels 3 to 9 are read by their authors
+    // only (the step at level 3 fails condition 2).
+    for (i, (author, uri)) in follow_chain.iter().enumerate() {
+        let level = i + 1;
+        w.expect(&format!("following, level {level}"), DAVE, uri, level <= 8).await;
+        w.expect(&format!("following, level {level}, its author"), author, uri, true).await;
+    }
+    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{ALICE}' AND subject_did = '{BOB}'")).await;
+    for (i, (author, uri)) in follow_chain.iter().enumerate() {
+        let level = i + 1;
+        w.expect(&format!("following, level-3 author unfollowed, level {level}"), DAVE, uri, level < 3).await;
+        w.expect(&format!("following, level-3 author unfollowed, level {level}, its author"), author, uri, true).await;
     }
     w.expect("A-9, before the move", DAVE, &left, true).await;
     let moved = w.f.post_record(ALICE, "3kroot222222", &other, None).await;
@@ -1009,13 +1042,12 @@ async fn modes_and_writers(test: &str, layout: Layout) {
         return;
     };
     let main_reply = w.reply(BOB, "3kmainreply2", &w.root.clone()).await;
-    let cases: [(&str, Option<&str>, &[&str], bool); 7] = [
+    let cases: [(&str, Option<&str>, &[&str], bool); 6] = [
         ("list, writer listed", Some("list"), &[BOB, DAVE], true),
         ("NULL mode, writer listed", None, &[BOB, DAVE], true),
         ("list, writer not listed", Some("list"), &[DAVE], false),
         ("NULL mode, writer not listed", None, &[DAVE], false),
         ("everyone", Some("everyone"), &[], true),
-        ("following, before S10", Some("following"), &[BOB, DAVE], false),
         ("nobody", Some("nobody"), &[BOB, DAVE], false),
     ];
     let mut replies = Vec::new();
@@ -1036,6 +1068,38 @@ async fn modes_and_writers(test: &str, layout: Layout) {
     let (listed, null_mode, everyone) =
         (reply_of("list, writer listed"), reply_of("NULL mode, writer listed"), reply_of("everyone"));
 
+    // S10 (following-audience design §2, §11 T-37): `following` reads
+    // Alice's own follows and her follow-verification flag, for the reader
+    // (rule 7) and for the writer (condition 2). Each state has her flag
+    // holding unless named; Bob, the writer, always reads his reply.
+    let follow_aud = w.f.audience(ALICE, "3kaudfollow2", Some("following"), &[]).await;
+    let follow_root = w.f.private_post(ALICE, "3krootfollow", &follow_aud, None).await;
+    let following = w.f.private_post(BOB, "3kreplyfollo", &follow_aud, Some((&follow_root, &follow_root))).await;
+    w.f.ready_all().await;
+    let states: [(&str, &[&str], bool, bool, bool); 4] = [
+        // (case, Alice follows, flag holds, Dave reads, Alice reads)
+        ("following, Alice follows Bob and Dave", &[BOB, DAVE], true, true, true),
+        ("following, writer not followed", &[DAVE], true, false, false),
+        ("following, reader not followed", &[BOB], true, false, true),
+        ("following, flag NULL", &[BOB, DAVE], false, false, false),
+    ];
+    for (case, follows, holds, dave_reads, alice_reads) in states {
+        exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{ALICE}'")).await;
+        for did in follows {
+            exec(&w.f.pool, &follow_sql(ALICE, did)).await;
+        }
+        set_follows_verified(&w.f.pool, ALICE, holds).await;
+        w.expect(case, DAVE, &following, dave_reads).await;
+        w.expect(case, ALICE, &following, alice_reads).await;
+        w.expect(case, BOB, &following, true).await;
+    }
+    // The blocks below run with the first state.
+    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{ALICE}'")).await;
+    for did in [BOB, DAVE] {
+        exec(&w.f.pool, &follow_sql(ALICE, did)).await;
+    }
+    set_follows_verified(&w.f.pool, ALICE, true).await;
+
     // Condition 3, either way between the writer and the audience's owner.
     // Since S9 (C-6 yes) it denies under every mode, `list` and NULL too;
     // the writer still reads its own reply.
@@ -1045,7 +1109,8 @@ async fn modes_and_writers(test: &str, layout: Layout) {
         w.expect(&format!("{way}, everyone"), DAVE, &everyone, false).await;
         w.expect(&format!("{way}, list (S9)"), DAVE, &listed, false).await;
         w.expect(&format!("{way}, NULL mode (S9)"), DAVE, &null_mode, false).await;
-        for uri in [&main_reply, &everyone, &listed, &null_mode] {
+        w.expect(&format!("{way}, following (S10)"), DAVE, &following, false).await;
+        for uri in [&main_reply, &everyone, &listed, &null_mode, &following] {
             w.expect(&format!("{way}, its author"), BOB, uri, true).await;
         }
         exec(&w.f.pool, "DELETE FROM blocks").await;
@@ -1056,7 +1121,9 @@ async fn modes_and_writers(test: &str, layout: Layout) {
     // for that reader, step test (i).) Bob, the writer, still reads.
     for (blocker, blocked, way) in [(ALICE, DAVE, "owner blocks reader"), (DAVE, ALICE, "reader blocks owner")] {
         exec(&w.f.pool, &block_sql(blocker, blocked)).await;
-        for (mode, uri) in [("followers", &main_reply), ("everyone", &everyone), ("list", &listed), ("NULL mode", &null_mode)] {
+        for (mode, uri) in
+            [("followers", &main_reply), ("everyone", &everyone), ("list", &listed), ("NULL mode", &null_mode), ("following", &following)]
+        {
             w.expect(&format!("{way}, {mode}"), DAVE, uri, false).await;
             w.expect(&format!("{way}, {mode}, the writer"), BOB, uri, true).await;
         }
@@ -1067,7 +1134,21 @@ async fn modes_and_writers(test: &str, layout: Layout) {
     exec(&w.f.pool, &format!("DELETE FROM actors WHERE did = '{ALICE}'")).await;
     w.expect("owner has no actors row, followers", DAVE, &main_reply, false).await;
     w.expect("owner has no actors row, everyone", DAVE, &everyone, false).await;
+    w.expect("owner has no actors row, following", DAVE, &following, false).await;
     w.finish().await;
+}
+
+/// Set `did`'s follow-verification flag so that it holds (verified at the
+/// stored `applied_rev`, which the firehose has reached), or clear it
+/// (following-audience design §3.1).
+async fn set_follows_verified(pool: &PgPool, did: &str, holds: bool) {
+    let sql = if holds {
+        "UPDATE sync_state SET follows_verified_at = now(), follows_verified_rev = applied_rev, \
+           firehose_rev = GREATEST(firehose_rev, applied_rev) WHERE did = $1"
+    } else {
+        "UPDATE sync_state SET follows_verified_at = NULL WHERE did = $1"
+    };
+    sqlx::query(sql).bind(did).execute(pool).await.expect("flag");
 }
 
 #[tokio::test]

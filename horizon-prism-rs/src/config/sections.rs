@@ -559,6 +559,10 @@ pub struct BackfillConfig {
     pub full_listing_ceiling: u64,
     pub retry_every_hours: u32,
     pub reconcile_confirm_limit: u32,
+    /// The follows a `following` owner's pass lists at most (S10, C-F2).
+    /// Over it, the owner's `following` audiences are read by the owner
+    /// alone.
+    pub follows_pass_ceiling: u64,
 }
 
 impl Default for BackfillConfig {
@@ -569,6 +573,7 @@ impl Default for BackfillConfig {
             full_listing_ceiling: 1_000_000,
             retry_every_hours: 6,
             reconcile_confirm_limit: 1000,
+            follows_pass_ceiling: 50_000,
         }
     }
 }

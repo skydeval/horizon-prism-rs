@@ -186,6 +186,10 @@ impl Purger {
         .bind(did)
         .execute(&mut *tx)
         .await?;
+        // The follow-verification flag, after the jobs as every writer
+        // orders them (following-audience design §3.3). For
+        // `account_deleted` the row is already gone.
+        crate::firehose::writer::clear_follows_verified(&mut tx, did).await?;
         tx.commit().await?;
 
         sets.purging.insert(did.to_string(), kind);

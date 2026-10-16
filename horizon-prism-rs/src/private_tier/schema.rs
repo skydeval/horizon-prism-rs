@@ -231,6 +231,25 @@ fn gate_shows(uri: &str, author: &str, status: &str) -> String {
     )
 }
 
+/// A follow by `owner` naming `subject` is stored (SQL expressions;
+/// following-audience design §5.1).
+fn owner_follows(owner: &str, subject: &str) -> String {
+    format!("EXISTS (SELECT 1 FROM follows fo WHERE fo.author_did = {owner} AND fo.subject_did = {subject})")
+}
+
+/// The follow-verification flag holds for `owner` (SQL expression;
+/// following-audience design §3.1, §5.1): verified, and the firehose has
+/// applied its commits through the verified rev. The three columns come
+/// from one `sync_state` row inside one `EXISTS`, so they are read together;
+/// no row, or a NULL column, reads as not. The one builder the oracle, the
+/// prefilter and the walk's step test use.
+fn follows_verified(owner: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM sync_state fv WHERE fv.did = {owner} \
+           AND fv.follows_verified_at IS NOT NULL AND fv.firehose_rev >= fv.follows_verified_rev)"
+    )
+}
+
 /// Rule 4's cap (private-posting design §3.7): the walk examines at most
 /// this many rows. Inlined into the SQL text as a literal.
 pub(super) const RULE4_MAX_HOPS: u32 = 8;
@@ -241,7 +260,8 @@ pub(super) const RULE4_MAX_HOPS: u32 = 8;
 /// - (ii) the moderation gate shows the step;
 /// - (iii) a step not by the audience's owner is by a writer who passes
 ///   conditions 2 and 3 under the audience (condition 3 under every mode
-///   since S9, C-6; `following` is `false` until S10).
+///   since S9, C-6; `following` since S10: the owner's stored follow of
+///   the step's author, and the owner's flag).
 fn step_ok(owner: &str, mode: &str, members: &str, reader: &str) -> String {
     format!(
         "NOT {reader_author} \
@@ -252,10 +272,13 @@ fn step_ok(owner: &str, mode: &str, members: &str, reader: &str) -> String {
                      WHEN 'list' THEN s.author_did = ANY({members}) \
                      WHEN 'followers' THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = s.author_did AND f.subject_did = {owner}) \
                      WHEN 'everyone' THEN true \
+                     WHEN 'following' THEN {owner_follows_author} AND {verified} \
                      ELSE false END))",
         reader_author = blocked(reader, "s.author_did"),
         gate = gate_shows("s.uri", "s.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = s.author_did)"),
         author_owner = blocked("s.author_did", owner),
+        owner_follows_author = owner_follows(owner, "s.author_did"),
+        verified = follows_verified(owner),
     )
 }
 
@@ -336,7 +359,9 @@ pub(super) async fn account_active(pool: &PgPool, did: &str) -> Result<bool, sql
 /// - self-authored; or an audience row is present and its mode admits the
 ///   requester: `list` (or none) by `members`, `followers` by the
 ///   requester's stored follow of the audience's owner (who is in its own
-///   audience), `everyone` always, and nothing else;
+///   audience), `everyone` always, `following` by the owner's stored
+///   follow of the requester with the owner's flag holding (S10; the owner
+///   is in its own audience), and nothing else;
 /// - no block between the requester and the author; and, under another
 ///   account's audience in any mode (S9, C-6), none between that account
 ///   and the requester or the author (rule 6);
@@ -357,6 +382,7 @@ pub(super) fn prefilter() -> String {
                  WHEN 'followers' THEN a.owner_did = $1 OR EXISTS ( \
                    SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = a.owner_did) \
                  WHEN 'everyone' THEN true \
+                 WHEN 'following' THEN a.owner_did = $1 OR ({owner_follows_viewer} AND {owner_verified}) \
                  ELSE false END \
            AND NOT {viewer_author} \
            AND (a.owner_did = p.author_did \
@@ -369,12 +395,16 @@ pub(super) fn prefilter() -> String {
                           WHEN 'followers' THEN EXISTS ( \
                             SELECT 1 FROM follows f WHERE f.author_did = p.author_did AND f.subject_did = a.owner_did) \
                           WHEN 'everyone' THEN true \
+                          WHEN 'following' THEN {owner_follows_author} AND {owner_verified} \
                           ELSE false END \
                     AND {walk})))))",
         gate = gate_shows("p.uri", "p.author_did", "po.account_status"),
         viewer_author = blocked("$1", "p.author_did"),
         viewer_owner = blocked("$1", "a.owner_did"),
         author_owner = blocked("p.author_did", "a.owner_did"),
+        owner_follows_viewer = owner_follows("a.owner_did", "$1"),
+        owner_follows_author = owner_follows("a.owner_did", "p.author_did"),
+        owner_verified = follows_verified("a.owner_did"),
         walk = anchored("p.reply_parent_uri", "p.audience_uri", "a.owner_did", "a.mode", "a.members", "$1"),
     )
 }
@@ -498,6 +528,97 @@ FROM y;",
         reader_owner = blocked("m.reader", "y.owner_did"),
         before_for_reader =
             anchored_before_s9_list("y.reply_parent_uri", "y.audience_uri", "y.owner_did", "y.mode", "y.members", "m.reader"),
+    )
+}
+
+/// Facts 10–12 (following-audience design §5.4): (the audience's owner
+/// `$1` follows the requester `$2` and its flag holds, the owner follows
+/// the post's owner `$3` and its flag holds), in one statement so that both
+/// pairs come from one snapshot. No committed snapshot holds a stale row
+/// beside a flag that holds (invariant F).
+pub(super) fn following_facts_statement() -> String {
+    format!(
+        "SELECT {v} AND {fv}, {a} AND {fv}",
+        v = owner_follows("$1", "$2"),
+        a = owner_follows("$1", "$3"),
+        fv = follows_verified("$1"),
+    )
+}
+
+/// [`following_facts_statement`] for `owner`, `requester` and the post's
+/// owner `author`.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn following_facts(pool: &PgPool, owner: &str, requester: &str, author: &str) -> Result<(bool, bool), sqlx::Error> {
+    sqlx::query_as(&following_facts_statement())
+        .bind(owner)
+        .bind(requester)
+        .bind(author)
+        .fetch_one(pool)
+        .await
+}
+
+/// [`anchored`] before migration 0028 (following-audience design §10): the
+/// flag's columns do not exist yet, so `follows_verified(owner)` reads as
+/// `true`, an upper bound that assumes every owner's flag gets set. It
+/// appears once in each step test.
+#[cfg(test)]
+fn anchored_assuming_verified(parent: &str, audience: &str, owner: &str, mode: &str, members: &str, reader: &str) -> String {
+    let verified = follows_verified(owner);
+    let walk = anchored(parent, audience, owner, mode, members, reader);
+    assert_eq!(walk.matches(&verified).count(), 2, "the flag once in each step test");
+    walk.replace(&verified, "true")
+}
+
+/// The pre-S10 count (following-audience design §10), run read-only against
+/// the deployed database before migration 0028. S10 starts serving and
+/// stops nothing; each column is an upper bound on what starts:
+/// - `following_audiences`, `following_owners` (members, and eligible
+///   non-members);
+/// - `owners_10k_stored_follows`: owners with at least 10 000 stored
+///   follows, a lower bound on those near or over the pass's ceiling;
+/// - `own_posts` and `cross_owner_posts` under a `following` audience;
+/// - `cross_owner_posts_starting`: cross-owner posts whose writer the owner
+///   follows, with no block either way, anchored by the walk;
+/// - `own_post_reader_pairs_starting`: (owner's post, ready member the
+///   owner follows) pairs with no block either way.
+///
+/// Printed by the ignored test `pre_s10_count_query`.
+#[cfg(test)]
+pub(super) fn pre_s10_count_sql() -> String {
+    format!(
+        "WITH a AS (
+  SELECT uri, owner_did FROM private_audiences WHERE mode = 'following'
+), o AS (
+  SELECT DISTINCT owner_did FROM a
+), x AS (
+  SELECT p.uri, p.author_did, p.reply_parent_uri, p.audience_uri, a.owner_did
+  FROM private_posts p JOIN a ON a.uri = p.audience_uri
+)
+SELECT
+  (SELECT count(*) FROM a) AS following_audiences,
+  (SELECT count(*) FROM o) AS following_owners,
+  (SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM members m WHERE m.did = o.owner_did)) AS following_owners_members,
+  (SELECT count(*) FROM o WHERE NOT EXISTS (SELECT 1 FROM members m WHERE m.did = o.owner_did)
+                            AND EXISTS (SELECT 1 FROM private_owner_eligible e WHERE e.did = o.owner_did)) AS following_owners_nonmembers,
+  (SELECT count(*) FROM o WHERE (SELECT count(*) FROM follows f WHERE f.author_did = o.owner_did) >= 10000)
+    AS owners_10k_stored_follows,
+  (SELECT count(*) FROM x WHERE x.author_did = x.owner_did) AS own_posts,
+  (SELECT count(*) FROM x WHERE x.author_did <> x.owner_did) AS cross_owner_posts,
+  (SELECT count(*) FROM x WHERE x.author_did <> x.owner_did
+      AND {writer_followed}
+      AND NOT {writer_blocked}
+      AND {walk}) AS cross_owner_posts_starting,
+  (SELECT count(*) FROM x JOIN members m ON m.ready_at IS NOT NULL AND m.did <> x.owner_did
+     WHERE x.author_did = x.owner_did AND {reader_followed}
+       AND NOT {reader_blocked}) AS own_post_reader_pairs_starting;",
+        writer_followed = owner_follows("x.owner_did", "x.author_did"),
+        writer_blocked = blocked("x.author_did", "x.owner_did"),
+        walk = anchored_assuming_verified("x.reply_parent_uri", "x.audience_uri", "x.owner_did", "'following'", "'{}'::text[]", "''"),
+        reader_followed = owner_follows("x.owner_did", "m.did"),
+        reader_blocked = blocked("m.did", "x.owner_did"),
     )
 }
 

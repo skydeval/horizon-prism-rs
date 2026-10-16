@@ -15,6 +15,13 @@ pub struct TestDb {
 }
 
 impl TestDb {
+    /// The database's name: with a DID, the key of a [`hooks::pause_in`]
+    /// site (`<name>/<did>`).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub async fn drop_db(self) {
         self.pool.close().await;
         let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name))
@@ -160,6 +167,29 @@ pub mod hooks {
     pub const RECOVERY_SWEEP_BEFORE_ADD: &str = "i715_recovery_sweep_before_add";
     /// #715: a purge, its batches done, before its end. Key: the DID.
     pub const PURGE_BEFORE_END: &str = "i715_purge_before_end";
+    /// S10, #722: a job's or catch-up's settle, before its transaction and
+    /// the gap lock. Key: `<database>/<did>` ([`pause_in`]).
+    pub const SETTLE_BEFORE_GAP_LOCK: &str = "s10_settle_before_gap_lock";
+    /// S10, #722: a job's or catch-up's settle holding the gap lock shared,
+    /// its epoch read, before anything else. Key: `<database>/<did>`.
+    pub const SETTLE_HOLDS_GAP_LOCK: &str = "s10_settle_holds_gap_lock";
+    /// S10: a job's settle, its own row locked and its follow-up decided
+    /// (the re-check read and queued), before it writes readiness or the
+    /// flag. Key: `<database>/<did>`.
+    pub const SETTLE_AFTER_FOLLOW_UP: &str = "s10_settle_after_follow_up";
+    /// S10: a follow write or delete fails deterministically, on every
+    /// attempt. Key: the follow's URI (tests use rkeys of their own).
+    pub const FOLLOW_WRITE_FAILS: &str = "s10_follow_write_fails";
+    /// S10: the head prober's divergence path, its `sync_state` row written,
+    /// before it clears readiness. Key: `<database>/<did>`.
+    pub const PROBER_HOLDS_SYNC_STATE: &str = "s10_prober_holds_sync_state";
+    /// S10: the follows pass, its listing done, before it writes. Key:
+    /// `<database>/<did>`.
+    pub const PASS_AFTER_LISTING: &str = "s10_pass_after_listing";
+    /// S10: the follows pass, a reconcile candidate confirmed with
+    /// `getRecord`, before it re-reads the stored row. Key:
+    /// `<database>/<did>`.
+    pub const PASS_BEFORE_REREAD: &str = "s10_pass_before_reread";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);
@@ -185,6 +215,17 @@ pub mod hooks {
         }
         let points = points().lock().unwrap_or_else(PoisonError::into_inner);
         points.get(name).and_then(|keys| keys.get(key)).cloned()
+    }
+
+    /// A pause site keyed `<database>/<did>`: S10's sites name DIDs every
+    /// fixture shares, so each test's database tells them apart. Unarmed,
+    /// it reads nothing.
+    pub async fn pause_in(name: &'static str, pool: &sqlx::PgPool, did: &str) {
+        if ARMED.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let db: String = sqlx::query_scalar("SELECT current_database()::text").fetch_one(pool).await.unwrap_or_default();
+        pause(name, &format!("{db}/{did}")).await;
     }
 
     /// A pause site: when `name` is armed for `key`, count the hit and wait

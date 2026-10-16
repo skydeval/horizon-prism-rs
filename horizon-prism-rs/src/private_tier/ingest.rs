@@ -22,9 +22,10 @@ use crate::db::locks::uri_author;
 use crate::firehose::classifier::{
     NSID_AUDIENCE, NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_THREADGATE,
 };
-use crate::firehose::jobs::Depth;
+use crate::firehose::jobs::{self, Depth};
 use crate::firehose::normalize::{bytes_field, strong_ref_cid};
 use crate::firehose::records::created_at;
+use crate::firehose::writer::WriteSource;
 
 /// The stored fields of a `postPrivate` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +363,8 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
     let author = op.author_did.as_str();
     let owner_record = op.nsid == NSID_POST_PRIVATE || op.nsid == NSID_AUDIENCE;
     let had_rows = owner_record && has_owner_rows(&mut *conn, author).await?;
+    // An audience written with mode exactly `following` (S10 §3.6).
+    let mut following = false;
     let changed = match op.nsid.as_str() {
         NSID_POST_PRIVATE => {
             let f = PostPrivateFields::parse(&op.record, now)?;
@@ -422,6 +425,7 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
         }
         NSID_AUDIENCE => {
             let f = AudienceFields::parse(&op.record)?;
+            following = f.mode.as_deref() == Some("following");
             sqlx::query(
                 "INSERT INTO private_audiences (uri, owner_did, rkey, cid, rev, mode, members, name, display_filled) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true) \
@@ -477,7 +481,23 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
         }
         enqueue_private(&mut *conn, author).await?;
     }
+    // A `following` audience written for an existing owner (following-
+    // audience design §3.6): an `authz` run verifies its follows, queued
+    // as `enqueue_private` queues a job, with no reset. It tests no flag, so
+    // a settle writing NULL beside it cannot leave the owner unqueued. A
+    // job's own write is skipped: its pass decision follows its
+    // authorization listings, and its settle re-checks. A DID that becomes
+    // an owner with this record gets its `private` job above.
+    if changed && following && had_rows && op.source != WriteSource::Backfill && owners::is_owner(&mut *conn, author).await? {
+        enqueue_authz(&mut *conn, author).await?;
+    }
     Ok(applied)
+}
+
+/// Enqueue an `authz` job unless one is already queued or running, as
+/// [`enqueue_private`] does for `private`.
+async fn enqueue_authz(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+    jobs::enqueue_if_idle(conn, did, Depth::Authz, Utc::now()).await
 }
 
 /// A text field of a gate record that must be an at-uri.

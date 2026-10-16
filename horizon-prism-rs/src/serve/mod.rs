@@ -408,6 +408,14 @@ pub async fn run() -> Result<(), StartupError> {
         Ok(None) => {}
         Err(error) => tracing::warn!(event = "private_display_refill_failed", %error, "queuing the private display refill failed; retried at the next start"),
     }
+    // The `following` rollout (following-audience design §3.6): at each
+    // start, an `authz` job for every owner of a `following` audience whose
+    // follows are not verified. Until it settles, those audiences are read
+    // by their owners alone.
+    match private.enqueue_following_verification(&pool).await {
+        Ok(queued) => tracing::info!(event = "following_verification_queued", queued, "authz jobs queued to verify following owners' follows"),
+        Err(error) => tracing::warn!(event = "following_verification_failed", %error, "queuing following owners' verification failed; retried at the next start"),
+    }
 
     // Backfill, count refresher, weekly rebuild.
     let source: Arc<dyn BackfillSource> = Arc::new(NetSource::new(
