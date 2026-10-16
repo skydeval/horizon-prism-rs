@@ -1,0 +1,39 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.actor.getMembership",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the requester's membership of this AppView, and the private-tier features it serves. Requires auth. An eligible requester (an active account on a community PDS this AppView serves, while it has room) is enrolled by this call, as by loading the timeline, whether or not this AppView indexes public data. The answer concerns only the requester.",
+      "parameters": {
+        "type": "params",
+        "properties": {}
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["status", "features"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "description": "'member': a ready member; the private read methods serve the requester. 'indexing': enrolled, and the account's initial indexing is still running; the response carries a Retry-After header, a polling hint rather than an estimate. 'notEligible': not enrolled now. It means \"not now\", not \"never\": a refusal is remembered for up to an hour (for example while the requester's PDS is unreachable, or while this AppView is full), and the requester may ask again on a later session.",
+              "knownValues": ["member", "indexing", "notEligible"]
+            },
+            "features": {
+              "type": "array",
+              "description": "The private-tier feature families this AppView serves, whatever the requester's status. Empty when the private tier is disabled. Known values: 'private' (the app.nearhorizon.private read methods); 'private.crossPdsReplies' (replies under another account's audience are served when anchored to that account's post in the thread, on any PDS). Later values name further families; a client ignores values it does not know.",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "RateLimitExceeded",
+          "description": "This AppView's hourly enrolment limit is reached. The response carries Retry-After; ask again after it."
+        }
+      ]
+    }
+  }
+}

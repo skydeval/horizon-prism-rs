@@ -296,6 +296,9 @@ impl Default for PrivateReadFloors {
 #[serde(default, deny_unknown_fields)]
 pub struct PrivateReadConfig {
     pub bind_concurrency: u32,
+    /// `Retry-After` on a `getMembership` answer of `indexing`: a polling
+    /// hint, not an estimate (private posting §4.1).
+    pub membership_retry_after_secs: u64,
     pub floor_ms: PrivateReadFloors,
 }
 
@@ -303,6 +306,7 @@ impl Default for PrivateReadConfig {
     fn default() -> Self {
         Self {
             bind_concurrency: 8,
+            membership_retry_after_secs: 5,
             floor_ms: PrivateReadFloors::default(),
         }
     }

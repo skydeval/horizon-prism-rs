@@ -128,6 +128,7 @@ async fn start(test: &str, toml: &str, backstop: Option<Backstop>) -> Option<Har
         enroller: None,
         trusted_proxy: "172.30.0.10".parse().expect("ip"),
         did_document: Arc::new(json!({})),
+        membership: Default::default(),
     };
     let routes = crate::xrpc::router(state.clone())
         .merge(crate::honest_501::router(&state, &cfg))

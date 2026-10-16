@@ -1,25 +1,19 @@
 //! The sealed paging cursor (design-v3 §5.15.14).
 //!
 //! A `moreReplies` marker can carry a cursor: where in a node's reply
-//! sequence to go on reading. It is encrypted and authenticated with a
-//! server key and bound to the URI of the node it was issued for, so a
-//! client can neither read it, nor alter it, nor use it under another
-//! anchor. A cursor grants nothing: every reply it leads to goes through
-//! the same verdicts and rules as on a first request.
+//! sequence to go on reading. It is sealed with [`CursorKey`] and bound to
+//! the URI of the node it was issued for, so a client can neither read it,
+//! nor alter it, nor use it under another anchor. A cursor grants nothing:
+//! every reply it leads to goes through the same verdicts and rules as on a
+//! first request.
 //!
 //! The key is `APP_THREADLENS_CURSOR_KEY_HEX`. Without one, a key is made
 //! at start, and cursors do not outlive the process.
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// A cursor is at most this long as sent.
-pub const MAX_CURSOR_LEN: usize = 1024;
-const NONCE_LEN: usize = 12;
+pub use crate::cursor_key::{CursorKey, MAX_CURSOR_LEN};
 
 /// A position in a node's reply sequence: what was read last.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,64 +26,6 @@ pub enum Position {
     /// is the listing's start.
     #[serde(rename = "c")]
     Listed { cursor: Option<String> },
-}
-
-/// Seals and opens cursors. Cheap to clone.
-#[derive(Clone)]
-pub struct CursorKey {
-    cipher: ChaCha20Poly1305,
-}
-
-impl std::fmt::Debug for CursorKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CursorKey(<redacted>)")
-    }
-}
-
-impl CursorKey {
-    #[must_use]
-    pub fn new(key: &[u8; 32]) -> Self {
-        Self {
-            cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
-        }
-    }
-
-    /// A key that lives as long as the process.
-    #[must_use]
-    pub fn generated() -> Self {
-        Self::new(&rand::random::<[u8; 32]>())
-    }
-
-    /// Seal `position` for the node `node_uri`. `None` when the cursor
-    /// would be longer than a cursor may be: the marker then has none,
-    /// and the node is read again from its start.
-    #[must_use]
-    pub fn seal(&self, node_uri: &str, position: &Position) -> Option<String> {
-        let plain = serde_json::to_vec(position).ok()?;
-        let nonce: [u8; NONCE_LEN] = rand::random();
-        let sealed = self.cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: &plain, aad: node_uri.as_bytes() }).ok()?;
-        let mut bytes = nonce.to_vec();
-        bytes.extend(sealed);
-        let cursor = URL_SAFE_NO_PAD.encode(bytes);
-        (cursor.len() <= MAX_CURSOR_LEN).then_some(cursor)
-    }
-
-    /// Open a cursor presented with the anchor `node_uri`. `None` when it
-    /// fails authentication, was issued for another node, or is not a
-    /// cursor at all.
-    #[must_use]
-    pub fn open(&self, node_uri: &str, cursor: &str) -> Option<Position> {
-        if cursor.len() > MAX_CURSOR_LEN {
-            return None;
-        }
-        let bytes = URL_SAFE_NO_PAD.decode(cursor).ok()?;
-        if bytes.len() <= NONCE_LEN {
-            return None;
-        }
-        let (nonce, sealed) = bytes.split_at(NONCE_LEN);
-        let plain = self.cipher.decrypt(Nonce::from_slice(nonce), Payload { msg: sealed, aad: node_uri.as_bytes() }).ok()?;
-        serde_json::from_slice(&plain).ok()
-    }
 }
 
 #[cfg(test)]
@@ -111,18 +47,18 @@ mod tests {
             assert!(cursor.len() <= MAX_CURSOR_LEN && !cursor.contains("3kreply"));
             assert_eq!(key.open(NODE, &cursor), Some(position.clone()));
             // Another anchor, another key, an altered cursor: refused.
-            assert_eq!(key.open(&format!("{NODE}x"), &cursor), None);
-            assert_eq!(CursorKey::new(&[8; 32]).open(NODE, &cursor), None);
+            assert_eq!(key.open::<Position>(&format!("{NODE}x"), &cursor), None);
+            assert_eq!(CursorKey::new(&[8; 32]).open::<Position>(NODE, &cursor), None);
             let mut altered = cursor.clone().into_bytes();
             altered[20] = if altered[20] == b'A' { b'B' } else { b'A' };
-            assert_eq!(key.open(NODE, &String::from_utf8(altered).expect("ascii")), None);
+            assert_eq!(key.open::<Position>(NODE, &String::from_utf8(altered).expect("ascii")), None);
             // Two cursors for one position differ.
             assert_ne!(key.seal(NODE, &position), Some(cursor));
         }
-        assert_eq!(key.open(NODE, "not a cursor"), None);
-        assert_eq!(key.open(NODE, ""), None);
+        assert_eq!(key.open::<Position>(NODE, "not a cursor"), None);
+        assert_eq!(key.open::<Position>(NODE, ""), None);
         // A position too long to send has no cursor.
         assert_eq!(key.seal(NODE, &Position::Listed { cursor: Some("x".repeat(2000)) }), None);
-        assert!(CursorKey::generated().open(NODE, &key.seal(NODE, &Position::Listed { cursor: None }).expect("sealed")).is_none());
+        assert!(CursorKey::generated().open::<Position>(NODE, &key.seal(NODE, &Position::Listed { cursor: None }).expect("sealed")).is_none());
     }
 }

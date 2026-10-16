@@ -44,6 +44,14 @@ docker compose run --rm --no-deps app admin keygen
 
 Copy the printed `APP_SERVICE_SIGNING_KEY_HEX` and `APP_CORRELATION_KEY_HEX` into `.env`. Keep them secret. Changing the signing key changes the AppView's published DID key.
 
+Then make the private-tier cursor key and put it in `.env` as `APP_PRIVATE_CURSOR_KEY_HEX`:
+
+```sh
+openssl rand -hex 32
+```
+
+It is required: without it, or with a value that is not 64 hex characters, `app` refuses to start (exit 78). It is never generated at start, because a generated key would break every private-feed cursor at each restart and between replicas. Give every replica the same value. Rotating it makes open private-feed cursors fail once, and clients start those feeds over.
+
 **5. Community PDS hosts.** Add your community PDS hostnames to the `community` network's `pds_patterns` in `config/app.toml`.
 
 **6. First start with migrations enabled.** On an empty database every migration is pending, and `app` refuses to start (exit 78) unless the gate is open. In `.env`, set:
@@ -95,6 +103,8 @@ docker compose exec app /app/horizon-prism-rs admin member add did:plc:yourdid
 Private-tier records reach this AppView only through the relays. Each community PDS must have federation enabled and must have requested a crawl from `bsky.network` and `relay.fire.hose.cam`.
 
 Check it by watching `private_tier_last_event_age_seconds` on `127.0.0.1:9091/metrics` after creating a private post.
+
+**Upgrading to a build with `app.nearhorizon.actor.getMembership`:** set `APP_PRIVATE_CURSOR_KEY_HEX` in `.env` (`openssl rand -hex 32`, see "Generate keys") **before** upgrading. That build refuses to start without it (exit 78). A deployment with its own compose override must pass the variable to `app` too.
 
 ## Schema migrations (operator-gated)
 

@@ -165,6 +165,7 @@ mod tests {
                 enroller: None,
                 trusted_proxy: "172.30.0.10".parse().expect("ip"),
                 did_document: Arc::new(json!({})),
+                membership: Default::default(),
             },
             source: Arc::new(Pds),
             writer: Writer::new(p.clone(), scope, Arc::new(DisabledPrivateTier)),

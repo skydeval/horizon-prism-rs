@@ -110,6 +110,7 @@ async fn fixture(pool: &PgPool, test: &str) -> Fixture {
         enroller: None,
         trusted_proxy: "172.30.0.10".parse().expect("ip"),
         did_document: Arc::new(json!({})),
+        membership: Default::default(),
     };
     let prober = HeadProber::new(
         pool.clone(),
@@ -146,6 +147,7 @@ impl Fixture {
         let ms = u64::try_from(floor.as_millis()).expect("ms");
         let cfg = PrivateReadConfig {
             bind_concurrency: 8,
+            membership_retry_after_secs: 5,
             floor_ms: PrivateReadFloors {
                 get_posts: ms,
                 get_post_thread: ms,

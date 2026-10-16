@@ -279,9 +279,10 @@ pub const PUBLIC_METHODS: &[PublicMethod] = &[
     public("com.atproto.repo.getRecord", Verb::Get),
 ];
 
-/// The 25 served methods of public-indexing design §6 answered in every
-/// mode: the private tier, Thread Lens, Horizon features, and the member's
-/// own moderation state.
+/// The served methods of public-indexing design §6 answered in every mode:
+/// the private tier, Thread Lens, Horizon features, and the member's own
+/// moderation state. Private posting (§3.2) adds its methods slice by
+/// slice: 26 as of S1 (`getMembership`).
 pub const KEPT_METHODS: &[&str] = &[
     "app.bsky.graph.getMutes",
     "app.bsky.graph.muteActor",
@@ -304,11 +305,18 @@ pub const KEPT_METHODS: &[&str] = &[
     "app.nearhorizon.private.getPostThread",
     "app.nearhorizon.private.getAuthorFeed",
     "app.nearhorizon.private.getTimeline",
+    "app.nearhorizon.actor.getMembership",
     "app.nearhorizon.threadLens.getThread",
     "app.nearhorizon.threadLens.resolve",
     "app.nearhorizon.index.requestRecord",
     "app.nearhorizon.constellation.resolveDid",
 ];
+
+/// The methods private posting has added so far (§3.2), each with its
+/// verb: T-3 checks each is kept, routed and never 501. Each slice adds
+/// its own.
+#[cfg(test)]
+pub(crate) const PRIVATE_POSTING_METHODS: &[(&str, Verb)] = &[("app.nearhorizon.actor.getMembership", Verb::Get)];
 
 /// The public method for an NSID.
 #[must_use]
@@ -434,20 +442,27 @@ mod tests {
         }
     }
 
-    /// T-6 (public-indexing design §6): every served method is in exactly
-    /// one of the two sets, 56 public and 25 kept. Their verbs are checked
+    /// T-6 (public-indexing design §6) and T-3 (private posting §3.2, at
+    /// S1's running totals): every served method is in exactly one of the
+    /// two sets, 56 public and 26 kept, 82 served. Their verbs are checked
     /// against the routes in `xrpc::router`'s tests.
     #[test]
     fn public_and_kept_methods_classify_every_served_method() {
         use crate::xrpc::rate_limit::SERVED;
 
-        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 25));
+        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 26));
         let public: BTreeSet<&str> = PUBLIC_METHODS.iter().map(|m| m.nsid).collect();
         let kept: BTreeSet<&str> = KEPT_METHODS.iter().copied().collect();
-        assert_eq!((public.len(), kept.len()), (56, 25), "no NSID twice");
+        assert_eq!((public.len(), kept.len()), (56, 26), "no NSID twice");
         assert!(public.is_disjoint(&kept));
         let served: BTreeSet<&str> = SERVED.iter().map(|s| s.nsid).collect();
-        assert_eq!(served.len(), 81);
+        assert_eq!(served.len(), 82);
+        // Private posting's methods are kept, in the `private` family.
+        for &(nsid, _) in PRIVATE_POSTING_METHODS {
+            assert!(kept.contains(nsid), "{nsid}");
+            let s = SERVED.iter().find(|s| s.nsid == nsid).expect("served");
+            assert_eq!((s.family, s.anonymous), (crate::xrpc::rate_limit::Family::Private, false), "{nsid}");
+        }
         assert_eq!(public.union(&kept).copied().collect::<BTreeSet<&str>>(), served);
         // No deferral is gated: the two kinds of 501 never meet.
         assert!(DEFERRALS.iter().all(|d| public_method(d.nsid).is_none()));

@@ -110,6 +110,9 @@ oracle_freshness_bound_secs = 120
 
 [private_read]
 bind_concurrency = 8
+# Retry-After on a getMembership answer of `indexing`: a polling hint, not an
+# estimate (private posting §4.1).
+membership_retry_after_secs = 5
 
 # Whole-handler latency floors, sized above each endpoint's worst case including
 # one synchronous repo-head fetch round (design §6.9, §6.11.3).

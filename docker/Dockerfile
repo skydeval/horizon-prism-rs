@@ -21,10 +21,14 @@ COPY horizon-prism-rs/ ./
 
 # Private-table source check (design §4.2): private tables may only be named
 # under src/private_tier/. Any other source file naming one fails the build.
+# The match is on substrings of any identifier, so no config key, function,
+# metric, index or test outside src/private_tier/ may contain a table name, and
+# no migration file name may contain one either (cli/commands/migrate_status.rs
+# lists every name as a literal; private posting §3.1).
 # grep exits 0 (matches), 1 (no matches) or 2 (error); anything but 0/1 fails.
 RUN set -e; \
     test -d src; \
-    rc=0; grep -rlE 'private_(posts|audiences|blocks|tombstones|owner_ready|owner_eligible)' --include='*.rs' src > /tmp/private_refs || rc=$?; \
+    rc=0; grep -rlE 'private_(posts|audiences|blocks|tombstones|owner_ready|owner_eligible|bookmarks|threadgates|postgates|quote_refs|notifications|notification_seen)' --include='*.rs' src > /tmp/private_refs || rc=$?; \
     if [ "$rc" -gt 1 ]; then echo "private-table source check: grep failed ($rc)"; exit 1; fi; \
     leaks="$(grep -v '^src/private_tier/' /tmp/private_refs || true)"; \
     if [ -n "$leaks" ]; then echo "private-tier table referenced outside src/private_tier/:"; echo "$leaks"; exit 1; fi

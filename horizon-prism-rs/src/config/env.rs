@@ -20,6 +20,10 @@ pub const ENV_CORRELATION_KEY_HEX: &str = "APP_CORRELATION_KEY_HEX";
 /// The key Thread Lens seals its paging cursors with (design-v3 §5.15.14).
 /// Optional: without it a key is made at each start.
 pub const ENV_THREADLENS_CURSOR_KEY_HEX: &str = "APP_THREADLENS_CURSOR_KEY_HEX";
+/// The key the private tier seals its paging cursors with (private posting
+/// §3.6, C-14). Required: a generated key would break every private cursor
+/// at each restart and between replicas, so it is never made at start.
+pub const ENV_PRIVATE_CURSOR_KEY_HEX: &str = "APP_PRIVATE_CURSOR_KEY_HEX";
 pub const ENV_ALLOW_STARTUP_MIGRATE: &str = "APP_ALLOW_STARTUP_MIGRATE";
 pub const ENV_LOG_LEVEL: &str = "APP_LOG_LEVEL";
 /// The one variable without the `APP_` prefix: Farsight's API key.
@@ -118,6 +122,9 @@ pub struct EnvConfig {
     /// `None` means a key is generated at start, and cursors do not
     /// outlive the process.
     pub threadlens_cursor_key: Option<Secret32>,
+    /// `APP_PRIVATE_CURSOR_KEY_HEX`: seals private-tier paging cursors.
+    /// Separate from Thread Lens's key, so either can rotate alone.
+    pub private_cursor_key: Secret32,
 }
 
 impl EnvConfig {
@@ -156,6 +163,8 @@ impl EnvConfig {
             .map_err(|r| invalid(ENV_SERVICE_SIGNING_KEY_HEX, r))?;
         let correlation_key = Secret32::from_hex(&required(ENV_CORRELATION_KEY_HEX)?)
             .map_err(|r| invalid(ENV_CORRELATION_KEY_HEX, r))?;
+        let private_cursor_key = Secret32::from_hex(&required(ENV_PRIVATE_CURSOR_KEY_HEX)?)
+            .map_err(|r| invalid(ENV_PRIVATE_CURSOR_KEY_HEX, r))?;
 
         let allow_startup_migrate = match lookup(ENV_ALLOW_STARTUP_MIGRATE).as_deref().map(str::trim) {
             None | Some("") | Some("0") => false,
@@ -183,6 +192,7 @@ impl EnvConfig {
 
         Ok(Self {
             threadlens_cursor_key,
+            private_cursor_key,
             public_hostname,
             database_url: SecretUrl(database_url),
             redis_url,

@@ -23,6 +23,7 @@ pub use router::router;
 
 use crate::aggregations::enroll::AutoEnroller;
 use crate::hydration::Hydrator;
+use handlers::membership::MembershipSettings;
 
 /// Shared handler state. Cheap to clone.
 #[derive(Clone)]
@@ -36,4 +37,6 @@ pub struct AppState {
     pub trusted_proxy: IpAddr,
     /// The `/.well-known/did.json` document (§6.8).
     pub did_document: Arc<Value>,
+    /// `getMembership`'s features and polling hint (private posting §4.1).
+    pub membership: MembershipSettings,
 }

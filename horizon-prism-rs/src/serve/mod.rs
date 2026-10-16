@@ -622,6 +622,7 @@ pub async fn run() -> Result<(), StartupError> {
         )),
         trusted_proxy: cfg.file.http.trusted_proxy,
         did_document: Arc::new(glue.service_key.did_document()),
+        membership: crate::xrpc::handlers::membership::MembershipSettings::new(private.as_ref(), &cfg.file.private_read),
     };
     let private_state = PrivateState::new(
         app.clone(),
@@ -675,7 +676,7 @@ pub async fn run() -> Result<(), StartupError> {
             .env
             .threadlens_cursor_key
             .as_ref()
-            .map_or_else(crate::threadlens::cursor::CursorKey::generated, |key| crate::threadlens::cursor::CursorKey::new(key.expose())),
+            .map_or_else(crate::cursor_key::CursorKey::generated, |key| crate::cursor_key::CursorKey::new(key.expose())),
     };
     let index = crate::xrpc::handlers::index::IndexState {
         app: app.clone(),

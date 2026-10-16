@@ -1,5 +1,7 @@
 //! Auto-enroll (design-v2 §9.2). Triggered only by authenticated calls to
-//! `getTimeline`, `listNotifications` and `getUnreadCount`.
+//! `getTimeline`, `listNotifications`, `getUnreadCount` and
+//! `app.nearhorizon.actor.getMembership` (private posting §4.1), the last
+//! in every public-indexing mode.
 //!
 //! Checked before inserting, in order:
 //! 0. the DID is not being purged (else `NotReady`, nothing inserted);
@@ -29,6 +31,8 @@ use crate::private_tier::PrivateTier;
 use crate::subscriptions::references::Budget;
 
 pub const METRIC_REFUSED: &str = "auto_enroll_refused_total";
+/// The refusal of the hourly enrolment cap: transient, never cached.
+pub const REFUSED_RATE: &str = "rate";
 
 /// The caller's membership state for a `member` endpoint (§7.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +157,11 @@ impl AutoEnroller {
         if !active {
             return Ok(self.refuse(did, "not_hosted").await);
         }
+        self.admit(did).await
+    }
+
+    /// Steps 2 and 3, then the insert, for a DID whose PDS passed step 1.
+    async fn admit(&self, did: &str) -> Result<Enrollment, sqlx::Error> {
         // 2 and 3. Bounds.
         let (members, recent): (i64, i64) = sqlx::query_as(
             "SELECT count(*), count(*) FILTER (WHERE source = 'auto_enroll' AND added_at > now() - interval '1 hour') FROM members",
@@ -164,8 +173,8 @@ impl AutoEnroller {
         }
         if recent >= self.max_per_hour {
             // Transient: do not cache the refusal for an hour.
-            metrics::counter!(METRIC_REFUSED, "reason" => "rate").increment(1);
-            return Ok(Enrollment::Refused("rate"));
+            metrics::counter!(METRIC_REFUSED, "reason" => REFUSED_RATE).increment(1);
+            return Ok(Enrollment::Refused(REFUSED_RATE));
         }
         Ok(match add_member(&self.pool, &self.scope, &self.private, did, "auto_enroll", self.list_budget).await? {
             AddOutcome::Added { .. } => {
@@ -175,6 +184,25 @@ impl AutoEnroller {
             AddOutcome::AlreadyMember => Enrollment::Member { ready: false },
             AddOutcome::Purging => Enrollment::Purging,
         })
+    }
+
+    /// Steps 2 and 3 and the insert, as if step 1's network checks had
+    /// passed (tests: no PDS answers here).
+    #[cfg(test)]
+    pub(crate) async fn admit_for_tests(&self, did: &str) -> Result<Enrollment, sqlx::Error> {
+        self.admit(did).await
+    }
+
+    /// Cache a refusal for `did`, as [`AutoEnroller::check`] does (tests).
+    #[cfg(test)]
+    pub(crate) async fn cache_refusal_for_tests(&self, did: &str, reason: &'static str) {
+        self.refused.insert(did.to_string(), reason).await;
+    }
+
+    /// The cached refusal for `did`, if any (tests).
+    #[cfg(test)]
+    pub(crate) async fn cached_refusal_for_tests(&self, did: &str) -> Option<&'static str> {
+        self.refused.get(did).await
     }
 }
 

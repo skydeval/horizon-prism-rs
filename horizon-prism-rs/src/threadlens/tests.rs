@@ -160,6 +160,7 @@ fn state(h: Hydrator, l: Ladder, access: ThreadLensAccess) -> ThreadLensState {
             enroller: None,
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
             did_document: Arc::new(json!({})),
+            membership: Default::default(),
         },
         ladder: l,
         cfg: ThreadLensConfig { access, ..ThreadLensConfig::default() },
@@ -425,8 +426,8 @@ async fn a_response_is_paged_by_a_sealed_cursor() {
     assert_eq!(uris(&first.nodes), [anchor.clone(), gapped.clone(), beneath[0].clone(), beneath[1].clone()]);
     let cursor = marker(&first.nodes, &gapped).expect("a marker on the gap").expect("with a cursor");
     // The cursor is bound to its node.
-    assert!(key.open(&anchor, &cursor).is_none());
-    let position = key.open(&gapped, &cursor).expect("opens for its node");
+    assert!(key.open::<super::cursor::Position>(&anchor, &cursor).is_none());
+    let position: super::cursor::Position = key.open(&gapped, &cursor).expect("opens for its node");
 
     // The continuation: the gap as the anchor, no parents, the rest of
     // its sequence, and no marker left.

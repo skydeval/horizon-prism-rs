@@ -12,6 +12,22 @@ commit.
 
 ### Added
 
+- **`app.nearhorizon.actor.getMembership` (private posting S1, #719;
+  Horizon P-10).** A signed-in account asks whether it is a member, in
+  every public-indexing mode; an eligible account is enrolled exactly as
+  `getTimeline` enrolls it. Answers `{status: "member" | "indexing" |
+  "notEligible", features}`; `indexing` carries `Retry-After`
+  (`private_read.membership_retry_after_secs`, default 5), and the hourly
+  enrollment cap answers 429 with `Retry-After`. `features` lists the
+  private method families this deployment serves (today `private` and
+  `private.crossPdsReplies`); later slices add theirs. Lexicon
+  `lexicons/app/nearhorizon/actor/getMembership.json`.
+  - **Operators must set `APP_PRIVATE_CURSOR_KEY_HEX`** (`openssl rand
+    -hex 32`, the same on every replica) before upgrading; without it the
+    app exits 78. It keys the private tier's sealed cursors in later
+    slices. The Thread Lens cursor key code moved to a shared module,
+    unchanged.
+
 - **Concurrency tests for jobs and list subscriptions (#712; Phase B
   B-65, B-74).** Test-only pause and fault-injection hooks
   (`test_support::hooks`, compiled only for tests) and `pg_locks` helpers,

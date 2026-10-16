@@ -21,7 +21,7 @@ use super::auth::request_ip;
 use super::backstop::{self, Selected, Selection};
 use super::pools::{ChargeKey, Exhausted, Pool};
 use super::errors::{NotReadyHint, XrpcError};
-use super::handlers::{actor, bookmarks, did_web, drafts, feed, graph, index, labels, mutes, notifications, repo, search, timeline, unspecced};
+use super::handlers::{actor, bookmarks, did_web, drafts, feed, graph, index, labels, membership, mutes, notifications, repo, search, timeline, unspecced};
 use super::rate_limit::Class;
 use crate::honest_501::{self, PublicMessages, Verb};
 
@@ -327,6 +327,7 @@ pub fn router(state: AppState) -> Router {
         .route(&xrpc(feed::GET_AUTHOR_POLLS), get(feed::get_author_polls))
         .route(&xrpc(notifications::LIST_ACTIVITY_SUBSCRIPTIONS), get(notifications::list_activity_subscriptions))
         .route(&xrpc(notifications::PUT_ACTIVITY_SUBSCRIPTION), post(notifications::put_activity_subscription))
+        .route(&xrpc(membership::GET_MEMBERSHIP), get(membership::get_membership))
         .route("/.well-known/did.json", get(did_web::did_json))
         .route("/did.json", get(did_web::did_json))
         .with_state(state)
@@ -385,6 +386,7 @@ mod tests {
             enroller: None,
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
             did_document: Arc::new(json!({})),
+            membership: Default::default(),
         };
         (state, drainer)
     }
@@ -742,6 +744,7 @@ mod tests {
             enroller: None,
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
             did_document: Arc::new(json!({})),
+            membership: Default::default(),
         };
         set_mode(state.hydrator.scope(), PublicMode::Off).await;
         let base = serve(state).await;
@@ -760,6 +763,47 @@ mod tests {
         assert_eq!((status, v["error"].as_str()), (501, Some("MethodNotImplemented")), "not the gate's answer");
         for nsid in honest_501::KEPT_METHODS {
             assert!(honest_501::public_method(nsid).is_none(), "{nsid}");
+        }
+        db.drop_db().await;
+    }
+
+    /// T-3 (private posting §3.2, P-19): every method private posting has
+    /// added so far is kept, is routed for its verb, and never answers 501,
+    /// in each of the five public-indexing modes.
+    #[tokio::test]
+    async fn private_posting_methods_are_kept_and_routed_in_every_mode() {
+        use crate::hydration::testing::set_mode;
+        use crate::indexing::PublicMode;
+
+        let Some(db) = fresh_db("xrpc_private_posting_kept").await else {
+            return;
+        };
+        let (mut state, _drainer) = bare_state(&db.pool);
+        state.limits = roomy_limits();
+        let scope = state.hydrator.scope().clone();
+        let base = serve(state).await;
+        let client = reqwest::Client::new();
+        for &(nsid, _) in honest_501::PRIVATE_POSTING_METHODS {
+            assert!(honest_501::KEPT_METHODS.contains(&nsid), "{nsid}");
+            assert!(honest_501::public_method(nsid).is_none(), "{nsid}");
+        }
+        for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
+            set_mode(&scope, mode).await;
+            for &(nsid, verb) in honest_501::PRIVATE_POSTING_METHODS {
+                let url = format!("{base}/xrpc/{nsid}");
+                let (right, wrong) = match verb {
+                    Verb::Get => (reqwest::Method::GET, reqwest::Method::POST),
+                    Verb::Post => (reqwest::Method::POST, reqwest::Method::GET),
+                };
+                // Routed: the handler's own authentication answers.
+                let (status, bytes) = send(&client, right.clone(), &url, None).await;
+                let v: Value = serde_json::from_slice(&bytes).expect("json");
+                assert_eq!((status, v["error"].as_str()), (401, Some("AuthRequired")), "{mode:?} {nsid}");
+                let (status, bytes) = send(&client, wrong.clone(), &url, None).await;
+                let v: Value = serde_json::from_slice(&bytes).expect("json");
+                assert_eq!(status, 400, "{mode:?} wrong verb {nsid}");
+                assert_eq!(v["message"], format!("Incorrect HTTP method ({wrong}) expected {right}"), "{mode:?} {nsid}");
+            }
         }
         db.drop_db().await;
     }
@@ -799,6 +843,7 @@ mod tests {
             enroller: None,
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
             did_document: Arc::new(key.did_document()),
+            membership: Default::default(),
         };
         let base = serve(state).await;
         let client = reqwest::Client::new();
@@ -935,6 +980,7 @@ mod tests {
             enroller: None,
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
             did_document: Arc::new(json!({})),
+            membership: Default::default(),
         };
         let base = serve(state).await;
         let client = reqwest::Client::new();

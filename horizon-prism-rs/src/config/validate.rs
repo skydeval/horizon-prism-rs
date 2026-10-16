@@ -352,13 +352,14 @@ fn urls(cfg: &FileConfig, out: &mut Vec<String>) {
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 21] = [
+    let nonzero: [(&str, u64); 22] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
         ("firehose.deterministic_attempts", u64::from(cfg.firehose.deterministic_attempts)),
         ("identity.did_fresh_secs", cfg.identity.did_fresh_secs),
         ("identity.jwt_issuer_tracker_max", cfg.identity.jwt_issuer_tracker_max),
         ("kryphocron.oracle_freshness_bound_secs", cfg.kryphocron.oracle_freshness_bound_secs),
         ("private_read.bind_concurrency", u64::from(cfg.private_read.bind_concurrency)),
+        ("private_read.membership_retry_after_secs", cfg.private_read.membership_retry_after_secs),
         ("private_read.floor_ms.get_posts", cfg.private_read.floor_ms.get_posts),
         ("private_read.floor_ms.get_post_thread", cfg.private_read.floor_ms.get_post_thread),
         ("private_read.floor_ms.get_author_feed", cfg.private_read.floor_ms.get_author_feed),

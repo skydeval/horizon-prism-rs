@@ -4,6 +4,7 @@ use super::*;
 
 const SIGNING_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 const CORRELATION_HEX: &str = "0202020202020202020202020202020202020202020202020202020202020202";
+const PRIVATE_CURSOR_HEX: &str = "0303030303030303030303030303030303030303030303030303030303030303";
 
 fn base_env() -> HashMap<&'static str, String> {
     HashMap::from([
@@ -15,6 +16,7 @@ fn base_env() -> HashMap<&'static str, String> {
         (ENV_REDIS_URL, "redis://redis:6379".to_string()),
         (ENV_SERVICE_SIGNING_KEY_HEX, SIGNING_HEX.to_string()),
         (ENV_CORRELATION_KEY_HEX, CORRELATION_HEX.to_string()),
+        (ENV_PRIVATE_CURSOR_KEY_HEX, PRIVATE_CURSOR_HEX.to_string()),
     ])
 }
 
@@ -122,6 +124,7 @@ oracle_freshness_bound_secs = 120
 
 [private_read]
 bind_concurrency = 8
+membership_retry_after_secs = 5
 
 [private_read.floor_ms]
 get_posts = 800
@@ -509,6 +512,9 @@ fn env_overlay_defaults() {
     assert_eq!(cfg.env.data_dir, std::path::PathBuf::from(DEFAULT_DATA_DIR));
     assert_eq!(cfg.env.log_level, DEFAULT_LOG_LEVEL);
     assert!(!cfg.env.allow_startup_migrate);
+    // The private cursor key is read, and it is not Thread Lens's.
+    assert_eq!(cfg.env.private_cursor_key.expose(), &[3u8; 32]);
+    assert!(cfg.env.threadlens_cursor_key.is_none());
 }
 
 #[test]
@@ -528,6 +534,7 @@ fn missing_required_env_is_reported() {
         ENV_REDIS_URL,
         ENV_SERVICE_SIGNING_KEY_HEX,
         ENV_CORRELATION_KEY_HEX,
+        ENV_PRIVATE_CURSOR_KEY_HEX,
     ] {
         let mut env = base_env();
         env.remove(var);
@@ -544,6 +551,11 @@ fn malformed_env_is_reported() {
         (ENV_SERVICE_SIGNING_KEY_HEX, "abcd"),
         (
             ENV_CORRELATION_KEY_HEX,
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ),
+        (ENV_PRIVATE_CURSOR_KEY_HEX, "abcd"),
+        (
+            ENV_PRIVATE_CURSOR_KEY_HEX,
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
         ),
         (ENV_PUBLIC_HOSTNAME, "https://appview.example.com"),
@@ -575,6 +587,7 @@ fn secrets_are_redacted_in_debug() {
     let cfg = load("").expect("valid");
     let debug = format!("{cfg:?}");
     assert!(!debug.contains(SIGNING_HEX));
+    assert!(!debug.contains(PRIVATE_CURSOR_HEX));
     assert!(!debug.contains("secret@db"));
     assert!(debug.contains("<redacted>"));
 }
@@ -838,6 +851,7 @@ fn zero_values_that_break_runtime_are_rejected() {
         ("firehose", "batch_size"),
         ("firehose", "deterministic_attempts"),
         ("private_read", "bind_concurrency"),
+        ("private_read", "membership_retry_after_secs"),
         ("backfill", "concurrency"),
         ("sync", "read_fetch_rate_per_host"),
         ("storage", "budget_bytes"),

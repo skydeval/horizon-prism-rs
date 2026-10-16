@@ -9,6 +9,7 @@ pub mod feed;
 pub mod graph;
 pub mod index;
 pub mod labels;
+pub mod membership;
 pub mod mutes;
 pub mod notifications;
 pub mod repo;

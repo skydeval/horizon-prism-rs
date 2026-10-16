@@ -7,7 +7,8 @@
 //! - `member`: auth required and the caller must be a member (`NotEnrolled`),
 //!   and ready unless the endpoint is mute management (`NotReady`).
 //!   `getTimeline`, `listNotifications` and `getUnreadCount` trigger
-//!   auto-enroll.
+//!   auto-enroll, as does `actor.getMembership` (`handlers::membership`),
+//!   which has no member gate.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -304,7 +305,8 @@ pub async fn prepare_private(
     }
 }
 
-async fn member_state(state: &AppState, did: &str) -> Result<Enrollment, sqlx::Error> {
+/// The caller's membership without enrolling it.
+pub(crate) async fn member_state(state: &AppState, did: &str) -> Result<Enrollment, sqlx::Error> {
     let ready: Option<bool> = sqlx::query_scalar("SELECT ready_at IS NOT NULL FROM members WHERE did = $1")
         .bind(did)
         .fetch_optional(state.hydrator.pool())

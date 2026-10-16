@@ -1,8 +1,9 @@
 //! Small public views built here so their handlers return a sealed
 //! [`PublicEmit`] (§7.2): the `app.nearhorizon.constellation.resolveDid`
-//! view (§8.7) and the `index.requestRecord` status (§5.9). Every input is
-//! public: the DID document, the routing table, scope membership, and the
-//! caller's own write outcome.
+//! view (§8.7), the `index.requestRecord` status (§5.9) and the
+//! `actor.getMembership` answer (private posting §4.1). Every input is
+//! public: the DID document, the routing table, scope membership, the
+//! caller's own write outcome and the caller's own membership.
 
 use serde_json::{Value, json};
 
@@ -32,6 +33,36 @@ pub struct RoutingHint {
 #[must_use]
 pub fn index_status(status: crate::firehose::index_request::IndexStatus) -> PublicEmit<Value> {
     PublicEmit::new(json!({ "status": status.as_str() }))
+}
+
+/// The caller's membership as `app.nearhorizon.actor.getMembership`
+/// answers it (private posting §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipStatus {
+    /// A ready member.
+    Member,
+    /// Enrolled, not ready yet (or being purged).
+    Indexing,
+    /// Not enrolled now: "not now", not "never".
+    NotEligible,
+}
+
+impl MembershipStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Member => "member",
+            Self::Indexing => "indexing",
+            Self::NotEligible => "notEligible",
+        }
+    }
+}
+
+/// The `getMembership` output: the caller's own state and the private
+/// families this build serves. No private fact is in it.
+#[must_use]
+pub fn membership(status: MembershipStatus, features: &[&str]) -> PublicEmit<Value> {
+    PublicEmit::new(json!({ "status": status.as_str(), "features": features }))
 }
 
 /// The `resolveDid` output.

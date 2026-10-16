@@ -222,6 +222,7 @@ pub const SERVED: &[Served] = &[
     served("app.nearhorizon.private.getPostThread", Family::Private, false),
     served("app.nearhorizon.private.getAuthorFeed", Family::Private, false),
     served("app.nearhorizon.private.getTimeline", Family::Private, false),
+    served("app.nearhorizon.actor.getMembership", Family::Private, false),
     served("app.nearhorizon.threadLens.getThread", Family::ThreadLens, false),
     served("app.nearhorizon.threadLens.resolve", Family::ThreadLens, false),
     served("app.nearhorizon.index.requestRecord", Family::IndexRequest, false),

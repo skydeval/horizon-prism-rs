@@ -128,6 +128,7 @@ mod tests {
             enroller: None,
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
             did_document: Arc::new(json!({})),
+            membership: Default::default(),
         };
         let hydrator_handle = app.hydrator.clone();
         let state = ResolveDidState {

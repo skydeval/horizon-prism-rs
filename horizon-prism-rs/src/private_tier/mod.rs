@@ -84,9 +84,23 @@ pub enum IngestError {
     Malformed(String),
 }
 
+/// The `features` strings `app.nearhorizon.actor.getMembership` lists
+/// (private posting §4.1): one per private family this build serves. Each
+/// slice appends its own string when it ships, in the order of §4.1's table.
+pub const FEATURES: &[&str] = &[
+    // The private read methods (served before S1).
+    "private",
+    // Rule 4's anchored walk (S0, listed from S1).
+    "private.crossPdsReplies",
+];
+
 /// The private tier as the rest of the crate may use it.
 #[async_trait]
 pub trait PrivateTier: Send + Sync {
+    /// The `features` this tier serves: [`FEATURES`], or none when the
+    /// tier is disabled.
+    fn features(&self) -> &'static [&'static str];
+
     /// `owners::load`: the private-owner set for `ScopeState` (§9.3 rule 3).
     /// DIDs only.
     async fn load_owners(&self, pool: &PgPool) -> Result<HashSet<String>, sqlx::Error>;
@@ -160,6 +174,10 @@ pub struct KryphocronPrivateTier;
 
 #[async_trait]
 impl PrivateTier for KryphocronPrivateTier {
+    fn features(&self) -> &'static [&'static str] {
+        FEATURES
+    }
+
     async fn load_owners(&self, pool: &PgPool) -> Result<HashSet<String>, sqlx::Error> {
         owners::load(pool).await
     }
@@ -249,6 +267,10 @@ pub const METRIC_PRIVATE_SKIPPED: &str = "private_tier_ops_skipped_total";
 
 #[async_trait]
 impl PrivateTier for DisabledPrivateTier {
+    fn features(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     async fn load_owners(&self, _pool: &PgPool) -> Result<HashSet<String>, sqlx::Error> {
         Ok(HashSet::new())
     }

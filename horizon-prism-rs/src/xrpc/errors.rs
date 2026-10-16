@@ -3,6 +3,7 @@
 //! lexicons' public semantics; none reveals private-tier facts.
 
 use axum::Json;
+use axum::http::header::RETRY_AFTER;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -28,6 +29,8 @@ pub struct XrpcError {
     pub error: &'static str,
     pub message: String,
     pub reset: Option<u64>,
+    /// `Retry-After` in seconds, when the error names one itself.
+    pub retry_after: Option<u64>,
     /// Whether this is the `NotReady` gate error (see [`NotReadyHint`]).
     pub not_ready: bool,
 }
@@ -39,7 +42,17 @@ impl XrpcError {
             error,
             message: message.into(),
             reset: None,
+            retry_after: None,
             not_ready: false,
+        }
+    }
+
+    /// The same error with `Retry-After: secs`.
+    #[must_use]
+    pub fn with_retry_after(self, secs: u64) -> Self {
+        Self {
+            retry_after: Some(secs),
+            ..self
         }
     }
 
@@ -82,6 +95,7 @@ impl From<Limited> for XrpcError {
             error: "RateLimitExceeded",
             message: "Rate Limit Exceeded".into(),
             reset: Some(l.reset_epoch_secs),
+            retry_after: None,
             not_ready: false,
         }
     }
@@ -133,6 +147,9 @@ impl IntoResponse for XrpcError {
             && let Ok(v) = HeaderValue::from_str(&reset.to_string())
         {
             response.headers_mut().insert("ratelimit-reset", v);
+        }
+        if let Some(secs) = self.retry_after {
+            response.headers_mut().insert(RETRY_AFTER, HeaderValue::from(secs));
         }
         if self.not_ready {
             response.extensions_mut().insert(NotReadyHint);
