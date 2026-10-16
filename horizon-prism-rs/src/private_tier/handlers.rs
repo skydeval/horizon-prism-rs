@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
@@ -27,7 +27,7 @@ use super::emit::{
 use super::pipeline::{self, PipelineEnv, RequestState};
 use super::schema::{self, Interaction};
 use super::cursor as sealed;
-use crate::config::PrivateReadConfig;
+use crate::config::{PrivateReadConfig, PrivateSearchConfig};
 use crate::cursor_key::CursorKey;
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::NSID_POST_PRIVATE;
@@ -54,6 +54,7 @@ pub const LIST_NOTIFICATIONS: &str = "app.nearhorizon.private.listNotifications"
 pub const GET_UNREAD_COUNT: &str = "app.nearhorizon.private.getUnreadCount";
 pub const UPDATE_SEEN: &str = "app.nearhorizon.private.updateSeen";
 pub const GET_REPLIES: &str = "app.nearhorizon.private.getReplies";
+pub const SEARCH_POSTS: &str = "app.nearhorizon.private.searchPosts";
 
 /// `getAuthorFeed`'s `filter` values (P-20, §4.14); the first is the default.
 const POSTS_WITH_REPLIES: &str = "posts_with_replies";
@@ -80,6 +81,28 @@ pub struct Floors {
     pub list_notifications: Duration,
     pub get_unread_count: Duration,
     pub get_replies: Duration,
+    pub search_posts: Duration,
+}
+
+/// `searchPosts`'s bounded scan (`[private_search]`, private posting §4.17).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SearchBounds {
+    /// Prefilter-passing rows a page reads at most.
+    pub(super) scan_candidates: i64,
+    /// The span below the cursor a page scans.
+    pub(super) span: TimeDelta,
+    /// How far back from the first page's request time a search reaches.
+    pub(super) max_age: TimeDelta,
+}
+
+impl From<&PrivateSearchConfig> for SearchBounds {
+    fn from(cfg: &PrivateSearchConfig) -> Self {
+        Self {
+            scan_candidates: i64::from(cfg.scan_candidates),
+            span: TimeDelta::try_hours(i64::from(cfg.span_hours)).unwrap_or(TimeDelta::MAX),
+            max_age: TimeDelta::try_days(i64::from(cfg.max_age_days)).unwrap_or(TimeDelta::MAX),
+        }
+    }
 }
 
 /// State for the private router.
@@ -94,6 +117,8 @@ pub struct PrivateState {
     pub(super) bookmarks_max: u32,
     /// The private cursor key (`APP_PRIVATE_CURSOR_KEY_HEX`, §3.6, C-14).
     pub(super) cursor_key: CursorKey,
+    /// `[private_search]` (§4.17).
+    pub(super) search: SearchBounds,
 }
 
 impl PrivateState {
@@ -134,11 +159,21 @@ impl PrivateState {
                 list_notifications: Duration::from_millis(cfg.floor_ms.list_notifications),
                 get_unread_count: Duration::from_millis(cfg.floor_ms.get_unread_count),
                 get_replies: Duration::from_millis(cfg.floor_ms.get_replies),
+                search_posts: Duration::from_millis(cfg.floor_ms.search_posts),
             },
             concurrency: usize::try_from(cfg.bind_concurrency).unwrap_or(8).max(1),
             bookmarks_max,
             cursor_key,
+            search: SearchBounds::from(&PrivateSearchConfig::default()),
         }
+    }
+
+    /// `searchPosts` scans by `cfg` (`[private_search]`) rather than the
+    /// defaults.
+    #[must_use]
+    pub(crate) fn with_search(mut self, cfg: &PrivateSearchConfig) -> Self {
+        self.search = SearchBounds::from(cfg);
+        self
     }
 }
 
@@ -163,6 +198,7 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(GET_UNREAD_COUNT), get(get_unread_count))
         .route(&xrpc(UPDATE_SEEN), post(update_seen))
         .route(&xrpc(GET_REPLIES), get(get_replies))
+        .route(&xrpc(SEARCH_POSTS), get(search_posts))
         .with_state(state)
 }
 
@@ -1535,6 +1571,169 @@ async fn replies_body(
         })
         .collect();
     Ok(PrivateResponse::replies(nodes, cursor))
+}
+
+/// A search's `q` (private posting §4.17): the case-folded words a post's
+/// decoded text must all contain, and the `from:<did>` authors it must have.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SearchQuery {
+    words: Vec<String>,
+    from: Vec<String>,
+}
+
+impl SearchQuery {
+    fn parse(q: &str) -> Result<Self, XrpcError> {
+        let mut query = Self::default();
+        for token in q.split_whitespace() {
+            match token.strip_prefix("from:") {
+                Some(did) if did.starts_with("did:") => query.from.push(did.to_string()),
+                Some(_) => return Err(XrpcError::invalid("Error: from: must name a did")),
+                None => query.words.push(token.to_lowercase()),
+            }
+        }
+        if query.words.is_empty() && query.from.is_empty() {
+            return Err(XrpcError::invalid("Error: q must hold at least one word"));
+        }
+        Ok(query)
+    }
+
+    /// Whether a post at `uri` can match at all: its author is every
+    /// `from:` DID. Decided from the URI, before any read.
+    fn may_match(&self, uri: &str) -> bool {
+        self.from.iter().all(|did| uri_author(uri) == Some(did.as_str()))
+    }
+
+    /// Whether a post read for the caller matches. The decoded text lives
+    /// only here, in the handler, for this request.
+    fn matches(&self, post: &PrivateEmit<Value>) -> bool {
+        let text = post.view().pointer("/record/text").and_then(Value::as_str).unwrap_or_default().to_lowercase();
+        self.words.iter().all(|w| text.contains(w.as_str()))
+    }
+}
+
+/// `t` at the microsecond, the precision a cursor and the database keep.
+fn micros(t: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(t.timestamp_micros()).unwrap_or(t)
+}
+
+/// `at − by`, clamped to the earliest time the database stores well.
+fn before(at: DateTime<Utc>, by: TimeDelta) -> DateTime<Utc> {
+    let year_one = DateTime::from_timestamp(-62_135_596_800, 0).unwrap_or(DateTime::<Utc>::MIN_UTC);
+    at.checked_sub_signed(by).unwrap_or(year_one).max(year_one)
+}
+
+/// `app.nearhorizon.private.searchPosts {q, sort: latest|top, limit 1-100
+/// default 25, cursor}` (private posting §4.17, P-7, C-8) → `{posts:
+/// #privatePostView[], cursor?}`: a bounded scan at query time. No index of
+/// decoded text exists; each candidate is read through the pipeline and
+/// matched in the handler.
+/// - A page scans the next `scan_candidates` rows that pass the prefilter
+///   for the caller, newest first, strictly below the cursor's
+///   `(created_at, uri)` pair and no older than `span` below its
+///   `created_at`, nor than the search's bound. The first page starts at
+///   `(request time, '')`, and fixes the bound at `request time −
+///   max_age`; the sealed cursor carries it on (§3.6).
+/// - Rows are read newest first and kept when their text contains every
+///   word of `q`, case-folded, and their author is every `from:` DID, up to
+///   `limit`.
+/// - The cursor is the last returned row when the page reached `limit`;
+///   else the last scanned row when `scan_candidates` were found; else the
+///   span's lower edge `(at − span, '')`. It is absent exactly when fewer
+///   than `scan_candidates` were found and that edge reached the bound. So
+///   where a page ends, and whether a cursor follows, depend only on rows
+///   the caller is entitled to and on the clock.
+/// - `sort: "top"` is answered in `latest` order: there is nothing to rank.
+///
+/// The AAD binds the cursor to the caller and `q` as given. Floored
+/// (`search_posts`); charged 5 tokens of the `private` bucket
+/// (`rate_limit::COSTS`).
+pub async fn search_posts(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, peer, SEARCH_POSTS).await?;
+    let p = Params::parse(q.as_deref());
+    let q = p.required("q")?.to_string();
+    let query = SearchQuery::parse(&q)?;
+    if !matches!(p.one("sort").unwrap_or("latest"), "latest" | "top") {
+        return Err(XrpcError::invalid("Error: sort must be latest or top"));
+    }
+    let limit = match p.u32("limit")?.unwrap_or(25) {
+        l @ 1..=100 => l as usize,
+        _ => return Err(XrpcError::invalid("Error: limit must be between 1 and 100")),
+    };
+    let aad = sealed::aad(SEARCH_POSTS, &caller.did, &q, "");
+    let from = sealed::open_search(&s.cursor_key, &aad, p.one("cursor"))?;
+    let ip = request_ip(&s.app, &headers, peer);
+    let result = search_body(&s, &caller, ip, &query, limit, from, &aad, start).await;
+    floor("searchPosts", start, s.floors.search_posts).await;
+    result.map(ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_body(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    ip: IpAddr,
+    query: &SearchQuery,
+    limit: usize,
+    from: Option<sealed::SearchPosition>,
+    aad: &str,
+    start: Instant,
+) -> Result<PrivateResponse, XrpcError> {
+    let bounds = s.search;
+    let pos = from.unwrap_or_else(|| {
+        let now = micros(Utc::now());
+        sealed::SearchPosition {
+            at: now,
+            uri: String::new(),
+            bound: before(now, bounds.max_age),
+        }
+    });
+    let lower = before(pos.at, bounds.span).max(pos.bound);
+    let candidates =
+        schema::search_candidates(&s.env.pool, &caller.did, pos.at, &pos.uri, lower, bounds.scan_candidates).await?;
+    let scanned_all = i64::try_from(candidates.len()).unwrap_or(i64::MAX) >= bounds.scan_candidates;
+
+    let hydration = private_hydration(s, caller, ip).await?;
+    let rs = RequestState::new(s.env.max_head_fetches);
+    let wanted: Vec<&(String, DateTime<Utc>)> = candidates.iter().filter(|(u, _)| query.may_match(u)).collect();
+    let uris: Vec<String> = wanted.iter().map(|(u, _)| u.clone()).collect();
+    let authors = profiles(&hydration, &uris).await?;
+    let mut posts: Vec<PrivateEmit<Value>> = Vec::new();
+    // The last returned row, once the page holds `limit`.
+    let mut full_at: Option<(DateTime<Utc>, String)> = None;
+    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+    let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
+    while let Some((i, hit)) = reads.next().await {
+        if let Ok(post) = hit
+            && query.matches(&post)
+        {
+            posts.push(post);
+            if posts.len() == limit {
+                let (uri, at) = wanted[i];
+                full_at = Some((*at, uri.clone()));
+                break;
+            }
+        }
+    }
+    drop(reads);
+
+    let next = match (full_at, candidates.last()) {
+        (Some((at, uri)), _) => Some((at, uri)),
+        (None, Some((uri, at))) if scanned_all => Some((*at, uri.clone())),
+        _ if lower > pos.bound => Some((lower, String::new())),
+        _ => None,
+    };
+    let cursor = next.and_then(|(at, uri)| {
+        sealed::seal_search(&s.cursor_key, aad, &sealed::SearchPosition { at, uri, bound: pos.bound })
+    });
+    let mut refs: Vec<&mut PrivateEmit<Value>> = posts.iter_mut().collect();
+    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
+    Ok(PrivateResponse::search(posts, cursor))
 }
 
 /// The `indexed_at::id` cursor of a notification page (plain: it walks the

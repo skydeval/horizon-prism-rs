@@ -568,6 +568,39 @@ pub(super) async fn reply_page_candidates(
     .await
 }
 
+/// `searchPosts`'s candidates (private posting §4.17): up to `limit` posts
+/// passing the prefilter for `requester`, newest first by
+/// `(created_at, uri)`, strictly below the pair `(at, uri)` and no older
+/// than `lower`. The order is `private_posts_recent`'s, with the column's
+/// own collation, so the index serves the scan. Rows that fail the
+/// prefilter are read here and skipped; they never count toward `limit`.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn search_candidates(
+    pool: &PgPool,
+    requester: &str,
+    at: DateTime<Utc>,
+    uri: &str,
+    lower: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<(String, DateTime<Utc>)>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT p.uri, p.created_at FROM {PREFILTER_FROM} \
+         WHERE (p.created_at, p.uri) < ($2, $3) AND p.created_at >= $4 AND {pre} \
+         ORDER BY p.created_at DESC, p.uri DESC LIMIT $5",
+        pre = prefilter()
+    ))
+    .bind(requester)
+    .bind(at)
+    .bind(uri)
+    .bind(lower)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Up to `limit` replies to `parent` passing the prefilter, oldest first.
 ///
 /// # Errors

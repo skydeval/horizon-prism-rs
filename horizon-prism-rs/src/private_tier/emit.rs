@@ -250,6 +250,9 @@ pub enum PrivateResponse {
     Notifications { notifications: Vec<NotificationView>, cursor: Option<String>, seen_at: Option<String> },
     /// `getUnreadCount`.
     UnreadCount(i64),
+    /// `searchPosts` (private posting §4.17): the page's matches, and the
+    /// sealed cursor while the search has span left.
+    Search { posts: Vec<PrivateEmit<Value>>, cursor: Option<String> },
     /// `{}`: a write's answer.
     Empty,
 }
@@ -265,6 +268,10 @@ impl PrivateResponse {
 
     pub(in crate::private_tier) fn unread_count(count: i64) -> Self {
         Self::UnreadCount(count)
+    }
+
+    pub(in crate::private_tier) fn search(posts: Vec<PrivateEmit<Value>>, cursor: Option<String>) -> Self {
+        Self::Search { posts, cursor }
     }
 
     pub(in crate::private_tier) fn likes(uri: String, likes: Vec<Value>, cursor: Option<String>) -> Self {
@@ -359,6 +366,12 @@ impl Serialize for PrivateResponse {
                 }
             }
             Self::UnreadCount(count) => m.serialize_entry("count", count)?,
+            Self::Search { posts, cursor } => {
+                m.serialize_entry("posts", posts)?;
+                if let Some(c) = cursor {
+                    m.serialize_entry("cursor", c)?;
+                }
+            }
             Self::Empty => {}
         }
         m.end()

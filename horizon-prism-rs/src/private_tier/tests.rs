@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use kryphocron::oracle::{AudienceOracle, BlockOracle};
 use kryphocron::{
     AtUri, AudienceState, BlockState, CorrelationKey, Did, Nsid, RecordContentContext, RecordKey, ResourceId,
@@ -22,7 +22,9 @@ use super::handlers::{PrivateState, router};
 use super::oracle::{OracleSnapshot, SnapshotInputs};
 use super::{KryphocronPrivateTier, PrivateTier, readiness, schema};
 use crate::aggregations::{ScopeSets, ScopeState};
-use crate::config::{PrivateReadConfig, PrivateReadFloors, ScopePolicy, SyncConfig, VideoConfig, VideoPlayback};
+use crate::config::{
+    PrivateReadConfig, PrivateReadFloors, PrivateSearchConfig, ScopePolicy, SyncConfig, VideoConfig, VideoPlayback,
+};
 use crate::cursor_key::CursorKey;
 use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE};
 use crate::firehose::watermark::Watermarks;
@@ -190,6 +192,7 @@ impl Fixture {
                 list_notifications: ms,
                 get_unread_count: ms,
                 get_replies: ms,
+                search_posts: ms,
             },
         };
         PrivateState::new(
@@ -2308,7 +2311,7 @@ async fn private_router_methods_are_routed_in_every_mode() {
         .copied()
         .filter(|(n, _)| n.starts_with("app.nearhorizon.private."))
         .collect();
-    assert_eq!(methods.len(), 10);
+    assert_eq!(methods.len(), 11);
     for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
         set_mode(app.hydrator.scope(), mode).await;
         for &(nsid, verb) in &methods {
@@ -2329,7 +2332,8 @@ async fn private_router_methods_are_routed_in_every_mode() {
             assert_eq!(v["message"], format!("Incorrect HTTP method ({wrong}) expected {right}"), "{mode:?} {nsid}");
             // A ready member is served.
             let status = match verb {
-                crate::honest_501::Verb::Get => get(&base, nsid, &format!("uri={uri}"), BOB, BOB_KEY).await.0,
+                // `q` for `searchPosts`; the other methods ignore it.
+                crate::honest_501::Verb::Get => get(&base, nsid, &format!("uri={uri}&q=post"), BOB, BOB_KEY).await.0,
                 crate::honest_501::Verb::Post => {
                     post(&base, nsid, &json!({"uri": uri, "cid": "bafy", "seenAt": "2026-10-01T00:00:00Z"}), BOB).await.0
                 }
@@ -4075,4 +4079,424 @@ async fn private_replies_caps_on() {
 #[tokio::test]
 async fn private_replies_caps_off() {
     replies_cap_in(PublicMode::Off, "s8-replies-cap-off").await;
+}
+
+// Private search: a bounded scan at query time (private posting §4.17; S11:
+// P-7, C-8).
+
+const SEARCH: &str = "app.nearhorizon.private.searchPosts";
+/// A floor short enough to walk a year of weekly spans quickly; the floor
+/// itself is checked with [`FLOOR`].
+const SEARCH_FLOOR: Duration = Duration::from_millis(30);
+
+impl Fixture {
+    /// A private post by `author` under `audience` saying `text`, created at
+    /// `at`: encoded with the real hooks when `encoded`, else plaintext,
+    /// which the lexicon's XOR rule permits.
+    async fn post_saying(&self, author: &str, rkey: &str, audience: &str, text: &str, at: DateTime<Utc>, encoded: bool) -> String {
+        let mut record = if encoded {
+            self.encoded_post(author, rkey, text, Some(audience)).await
+        } else {
+            json!({"$type": NSID_POST_PRIVATE, "text": text, "audienceList": audience})
+        };
+        record["createdAt"] = json!(at.to_rfc3339_opts(SecondsFormat::Millis, true));
+        self.ingest(author, NSID_POST_PRIVATE, rkey, record).await;
+        format!("at://{author}/{NSID_POST_PRIVATE}/{rkey}")
+    }
+
+    /// A search server: roomy rate limits (a page costs 5 tokens), fresh
+    /// heads and watermark, `floor`, and `bounds`.
+    async fn search_server(&self, floor: Duration, bounds: &PrivateSearchConfig) -> String {
+        exec(&self.pool, "UPDATE sync_state SET head_checked_at = now()").await;
+        let mut app = self.app.clone();
+        app.limits = roomy_limits();
+        serve(self.state_of(app, Some(Duration::from_secs(1)), floor).with_search(bounds)).await
+    }
+}
+
+/// The URIs of a search page's posts.
+fn post_uris(page: &Value) -> Vec<String> {
+    page["posts"].as_array().expect("posts").iter().map(|p| p["uri"].as_str().expect("uri").to_string()).collect()
+}
+
+/// Where a search page's cursor leads (§4.17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Next {
+    /// No cursor: the span reached the search's bound.
+    End,
+    /// Below a row: the last returned one, or the last of a full scan.
+    Row(String),
+    /// The span's lower edge.
+    Edge,
+}
+
+/// Each page of a search for `q` by `reader` as `(posts, next)`. On the way
+/// it checks that every cursor carries the first page's bound, that each
+/// edge lies one span below where its page began (the first page at the
+/// request time, `bound + max_age`), and that the last page's span reached
+/// the bound. So two traces that are equal had equal cursors.
+fn search_trace(pages: &[Value], q: &str, reader: &str, bounds: &PrivateSearchConfig) -> Vec<(Vec<String>, Next)> {
+    let key = CursorKey::new(&TEST_CURSOR_KEY);
+    let binding = super::cursor::aad(SEARCH, reader, q, "");
+    let span = chrono::Duration::hours(i64::from(bounds.span_hours));
+    let max_age = chrono::Duration::days(i64::from(bounds.max_age_days));
+    let mut bound: Option<DateTime<Utc>> = None;
+    let mut start: Option<DateTime<Utc>> = None;
+    let mut trace = Vec::new();
+    for page in pages {
+        let next = match page["cursor"].as_str() {
+            None => {
+                if let (Some(s), Some(b)) = (start, bound) {
+                    assert!(s - span <= b, "the last page's span reached the bound");
+                }
+                Next::End
+            }
+            Some(c) => {
+                let p = super::cursor::open_search(&key, &binding, Some(c)).expect("opens").expect("a position");
+                let b = *bound.get_or_insert(p.bound);
+                assert_eq!(p.bound, b, "every cursor carries the first page's bound");
+                let began = start.unwrap_or(b + max_age);
+                start = Some(p.at);
+                if p.uri.is_empty() {
+                    assert_eq!(p.at, began - span, "an edge lies one span below its page's start");
+                    Next::Edge
+                } else {
+                    Next::Row(p.uri)
+                }
+            }
+        };
+        trace.push((post_uris(page), next));
+    }
+    trace
+}
+
+/// T-22 (P-7), in On and in Off (T-1), at the default bounds:
+/// - a match on page 1, case-folded, from encoded content; a match ten days
+///   back, beyond the first week's span, reached by cursor; Dave's post,
+///   which Bob cannot read, never matches for him;
+/// - with nothing else to find, the search pages through every weekly span
+///   down to 365 days: 53 pages, each but the last with a sealed cursor at
+///   its span's edge;
+/// - `top` answers as `latest`; `from:<did>`; the views are decorated;
+/// - a cursor is refused for another caller, another `q` and another
+///   method's cursor; bad parameters are 400; a page is floored.
+async fn search_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL]).await;
+    let dave_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[]).await;
+    let now = Utc::now();
+    let hours = |h: i64| now - chrono::Duration::hours(h);
+    let cats = f.post_saying(ALICE, "3kcats000012", &aud, "Cats are GREAT", hours(1), true).await;
+    let dogs = f.post_saying(ALICE, "3kdogs000012", &aud, "dogs only", hours(2), true).await;
+    let secret = f.post_saying(DAVE, "3kdavecats12", &dave_aud, "cats, secretly", hours(3), true).await;
+    let later = f.post_saying(ALICE, "3kcats000022", &aud, "more cats in week two", hours(240), true).await;
+    f.ready_all().await;
+    let bounds = PrivateSearchConfig::default();
+    let base = f.search_server(SEARCH_FLOOR, &bounds).await;
+
+    let all = pages(&base, SEARCH, "q=CATS", BOB, 80).await;
+    let trace = search_trace(&all, "CATS", BOB, &bounds);
+    assert_eq!(trace.len(), 53, "53 weekly spans reach back 365 days");
+    assert_eq!(trace[0].0, std::slice::from_ref(&cats), "a match on page 1");
+    assert_eq!(trace[1].0, std::slice::from_ref(&later), "a match beyond the first span");
+    assert!(trace[2..].iter().all(|(posts, _)| posts.is_empty()));
+    for (k, (_, next)) in trace.iter().enumerate() {
+        assert_eq!(*next, if k < 52 { Next::Edge } else { Next::End }, "page {k}");
+    }
+    for page in &all[..52] {
+        assert_eq!(page["cursor"].as_str().map(str::len), Some(720), "sealed and padded");
+    }
+    let view = &all[0]["posts"][0];
+    assert_eq!(view["record"]["text"], "Cats are GREAT");
+    assert_eq!(counts_of(view), [0, 0, 0, 0], "decorated as every view: {view}");
+    assert_eq!(view["viewer"]["bookmarked"], false);
+
+    // Dave reads his own post; Bob never matches it.
+    let (_, v, _) = json_of(&base, SEARCH, "q=secretly", DAVE).await;
+    assert_eq!(post_uris(&v), std::slice::from_ref(&secret));
+    let (_, v, _) = json_of(&base, SEARCH, "q=secretly", BOB).await;
+    assert!(post_uris(&v).is_empty(), "{v}");
+
+    // `top` in `latest` order; every word; `from:`.
+    let (_, latest, _) = json_of(&base, SEARCH, "q=cats", CAROL).await;
+    let (_, top, _) = json_of(&base, SEARCH, "q=cats&sort=top", CAROL).await;
+    assert_eq!(post_uris(&top), post_uris(&latest));
+    assert_eq!(post_uris(&latest), std::slice::from_ref(&cats));
+    let q = urlencoding("great CATS");
+    assert_eq!(post_uris(&json_of(&base, SEARCH, &format!("q={q}"), BOB).await.1), std::slice::from_ref(&cats));
+    let q = urlencoding("cats dogs");
+    assert!(post_uris(&json_of(&base, SEARCH, &format!("q={q}"), BOB).await.1).is_empty());
+    let q = urlencoding(&format!("cats from:{ALICE}"));
+    assert_eq!(post_uris(&json_of(&base, SEARCH, &format!("q={q}"), BOB).await.1), std::slice::from_ref(&cats));
+    let q = urlencoding(&format!("cats from:{DAVE}"));
+    assert!(post_uris(&json_of(&base, SEARCH, &format!("q={q}"), BOB).await.1).is_empty());
+    let q = urlencoding(&format!("from:{ALICE}"));
+    assert_eq!(post_uris(&json_of(&base, SEARCH, &format!("q={q}"), BOB).await.1), [cats.clone(), dogs]);
+
+    // Cursors open only where they were issued.
+    let cursor = all[0]["cursor"].as_str().expect("cursor");
+    let (_, feed, _) = json_of(&base, FEED, &format!("actor={ALICE}&limit=1"), BOB).await;
+    let feed_cursor = feed["cursor"].as_str().expect("a feed cursor");
+    for (case, query, reader) in [
+        ("another caller", format!("q=CATS&cursor={cursor}"), CAROL),
+        ("another q", format!("q=cats&cursor={cursor}"), BOB),
+        ("another method's cursor", format!("q=CATS&cursor={feed_cursor}"), BOB),
+    ] {
+        let (status, body, _) = get(&base, SEARCH, &query, reader, key_of(reader)).await;
+        assert_eq!((status, body.contains("Error: cursor is not valid")), (400, true), "{case}: {body}");
+    }
+
+    // Bad parameters.
+    for query in ["", "q=", "q=%20%20", "q=from:alice.test", "q=cats&limit=0", "q=cats&limit=101", "q=cats&sort=hot"] {
+        let (status, body, _) = get(&base, SEARCH, query, BOB, BOB_KEY).await;
+        assert_eq!(status, 400, "{query}: {body}");
+    }
+
+    // Floored, hit or miss.
+    let floored = f.search_server(FLOOR, &bounds).await;
+    for query in ["q=cats", "q=nothinghere"] {
+        let (_, _, took) = json_of(&floored, SEARCH, query, BOB).await;
+        assert!(took >= FLOOR, "{query}: {took:?}");
+    }
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_search_on() {
+    search_in(PublicMode::On, "s11-search-on").await;
+}
+
+#[tokio::test]
+async fn private_search_off() {
+    search_in(PublicMode::Off, "s11-search-off").await;
+}
+
+/// Bob's searches for `token` with `limit` 2 and 5, at `bounds`.
+async fn token_traces(f: &Fixture, bounds: &PrivateSearchConfig) -> Vec<Vec<(Vec<String>, Next)>> {
+    let base = f.search_server(SEARCH_FLOOR, bounds).await;
+    let mut traces = Vec::new();
+    for limit in [2, 5] {
+        let all = pages(&base, SEARCH, &format!("q=token&limit={limit}"), BOB, 20).await;
+        traces.push(search_trace(&all, "token", BOB, bounds));
+    }
+    traces
+}
+
+/// T-22's invariance (review 7, LB2; review 8), in On and in Off (T-1), at
+/// bounds small enough to reach every cursor rule in a few pages: 3 rows a
+/// page, a 24-hour span, 3 days back.
+/// - With `limit` 2: a cursor at the last returned row, a span's edge, and
+///   the end once the span reaches the bound. With `limit` 5: a cursor at
+///   the last row of a full scan. No match is skipped or repeated.
+/// - Posts Bob cannot read, added between his token posts in any number
+///   (under an audience without him, by an author who blocks him), the
+///   deletion of the deployment's oldest private post, and a readable
+///   post backdated to year 1 change no page's contents and no cursor.
+async fn search_invariance_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL, DAVE]).await;
+    let dave_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[]).await;
+    let carol_aud = f.audience(CAROL, "3kaudcarol22", Some("list"), &[ALICE]).await;
+    let now = Utc::now();
+    let minutes = |m: i64| now - chrono::Duration::minutes(m);
+    let mut token = Vec::new();
+    for h in [1, 2, 3, 5, 30, 50] {
+        token.push(f.post_saying(ALICE, &format!("3ktok{h:07}"), &aud, "a TOKEN here", minutes(h * 60), false).await);
+    }
+    for h in [6, 40] {
+        f.post_saying(ALICE, &format!("3kplain{h:05}"), &aud, "nothing to see", minutes(h * 60), false).await;
+    }
+    f.ready_all().await;
+    let bounds = PrivateSearchConfig {
+        scan_candidates: 3,
+        span_hours: 24,
+        max_age_days: 3,
+    };
+    let row = |i: usize| Next::Row(token[i].clone());
+    let expected = vec![
+        vec![
+            (vec![token[0].clone(), token[1].clone()], row(1)),
+            (vec![token[2].clone(), token[3].clone()], row(3)),
+            (vec![], Next::Edge),
+            (vec![token[4].clone(), token[5].clone()], row(5)),
+            (vec![], Next::End),
+        ],
+        vec![
+            (token[..3].to_vec(), row(2)),
+            (vec![token[3].clone()], Next::Edge),
+            (vec![token[4].clone(), token[5].clone()], row(5)),
+            (vec![], Next::End),
+        ],
+    ];
+    let before = token_traces(&f, &bounds).await;
+    assert_eq!(before, expected);
+
+    // Posts Bob cannot read, between his: under Dave's audience, which
+    // names nobody; under Carol's, without him; and by Dave under Alice's
+    // audience, after Dave blocks Bob.
+    for m in [90, 132, 150, 240, 270, 330, 1770, 1830, 1860, 2940, 4200, 12_000] {
+        f.post_saying(DAVE, &format!("3kdave{m:06}"), &dave_aud, "token, unreadable", minutes(m), false).await;
+    }
+    for m in [100, 1810] {
+        f.post_saying(CAROL, &format!("3kcarol{m:05}"), &carol_aud, "token for Alice", minutes(m), false).await;
+    }
+    exec(&f.pool, &block_sql(DAVE, BOB)).await;
+    for m in [70, 175, 2950] {
+        f.post_saying(DAVE, &format!("3kdblk{m:06}"), &aud, "token, blocked", minutes(m), false).await;
+    }
+    assert_eq!(token_traces(&f, &bounds).await, expected, "posts Bob cannot read change nothing");
+    // Carol's are stored, and match for Carol.
+    let carols = pages(&f.search_server(SEARCH_FLOOR, &bounds).await, SEARCH, "q=alice", CAROL, 20).await;
+    assert_eq!(carols.iter().flat_map(post_uris).count(), 2, "{carols:?}");
+
+    // The deployment's oldest private post, which Bob cannot read, and one
+    // within the search's reach, deleted.
+    for m in [12_000, 4200] {
+        f.apply_op(DAVE, Action::Delete, NSID_POST_PRIVATE, &format!("3kdave{m:06}"), REV2, None).await;
+    }
+    assert_eq!(token_traces(&f, &bounds).await, expected, "a deletion Bob cannot see changes nothing");
+
+    // A readable post backdated to year 1 is below every bound.
+    let year_one = DateTime::parse_from_rfc3339("0001-01-01T00:00:00Z").expect("ts").with_timezone(&Utc);
+    let old = f.post_saying(ALICE, "3kancient222", &aud, "an ancient token", year_one, false).await;
+    let stored: DateTime<Utc> = sqlx::query_scalar("SELECT created_at FROM private_posts WHERE uri = $1")
+        .bind(&old)
+        .fetch_one(&f.pool)
+        .await
+        .expect("stored");
+    assert_eq!(stored, year_one);
+    assert_eq!(token_traces(&f, &bounds).await, expected, "a backdated post adds no page");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_search_pages_ignore_unreadable_posts_on() {
+    search_invariance_in(PublicMode::On, "s11-invariance-on").await;
+}
+
+#[tokio::test]
+async fn private_search_pages_ignore_unreadable_posts_off() {
+    search_invariance_in(PublicMode::Off, "s11-invariance-off").await;
+}
+
+/// T-22's paging at the default bounds (reviews 9, 10 and 11), in On and in
+/// Off (T-1):
+/// - 400 matching readable posts in the first week, `limit` 100: four pages
+///   of 100, each with its cursor at its last returned row; then empty
+///   pages one span on each, down to the bound, each with a cursor but the
+///   last; every match once, newest first;
+/// - `limit` 25: the second page starts after the 25th;
+/// - a caller whose only match is 51 weeks back sees 51 empty pages with
+///   cursors first, then the match.
+async fn search_full_pages_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let far_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[CAROL]).await;
+    let now = Utc::now();
+    let mut needles = Vec::new();
+    for i in 0..400 {
+        let at = now - chrono::Duration::minutes(i + 1);
+        needles.push(f.post_saying(ALICE, &format!("3kn{i:09}"), &aud, &format!("needle {i}"), at, false).await);
+    }
+    let far_at = now - chrono::Duration::hours(51 * 168 + 24);
+    let far = f.post_saying(DAVE, "3kfaraway222", &far_aud, "faraway", far_at, false).await;
+    f.ready_all().await;
+    let bounds = PrivateSearchConfig::default();
+    let base = f.search_server(SEARCH_FLOOR, &bounds).await;
+
+    let all = pages(&base, SEARCH, "q=needle&limit=100", BOB, 80).await;
+    let trace = search_trace(&all, "needle", BOB, &bounds);
+    let sizes: Vec<usize> = trace.iter().map(|(p, _)| p.len()).collect();
+    assert_eq!(sizes[..4], [100; 4], "{sizes:?}");
+    assert!(sizes[4..].iter().all(|n| *n == 0), "{sizes:?}");
+    for (posts, next) in &trace[..4] {
+        assert_eq!(*next, Next::Row(posts.last().cloned().expect("full")));
+    }
+    let (last, middle) = trace[4..].split_last().expect("an end");
+    assert!(!middle.is_empty() && middle.iter().all(|(_, n)| *n == Next::Edge), "{middle:?}");
+    assert_eq!(last.1, Next::End);
+    assert!(trace.len() <= 4 + 54, "{}", trace.len());
+    let seen: Vec<String> = trace.iter().flat_map(|(p, _)| p.clone()).collect();
+    assert_eq!(seen, needles, "every match once, newest first");
+
+    let two = pages(&base, SEARCH, "q=needle&limit=25", BOB, 2).await;
+    assert_eq!(post_uris(&two[0]), needles[..25]);
+    assert_eq!(post_uris(&two[1]), needles[25..50], "the next page starts after the 25th");
+
+    let all = pages(&base, SEARCH, "q=faraway", CAROL, 80).await;
+    let trace = search_trace(&all, "faraway", CAROL, &bounds);
+    assert_eq!(trace.len(), 53);
+    assert!(trace[..51].iter().all(|(p, n)| p.is_empty() && *n == Next::Edge), "{trace:?}");
+    assert_eq!(trace[51].0, std::slice::from_ref(&far));
+    assert_eq!(trace[52], (vec![], Next::End));
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_search_full_pages_on() {
+    search_full_pages_in(PublicMode::On, "s11-full-on").await;
+}
+
+#[tokio::test]
+async fn private_search_full_pages_off() {
+    search_full_pages_in(PublicMode::Off, "s11-full-off").await;
+}
+
+/// B-5 for `searchPosts` (§4.17 "Cost and floor"): a seeded week of 3000
+/// private posts, half readable by Bob and encoded with the real hooks,
+/// half under an audience he is not in. With no floor, a page that matches
+/// nothing (300 binds and decodes) and a page that fills `limit` 100 are
+/// timed over 20 runs each. Prints the numbers.
+#[tokio::test]
+#[ignore = "B-5 measurement; run with --ignored --nocapture"]
+async fn b5_search_floor_on_a_seeded_week() {
+    let test = "b5-search";
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture(&db.pool, test).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let dave_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[]).await;
+    let now = Utc::now();
+    let seeded = Instant::now();
+    for i in 0..1500 {
+        let at = now - chrono::Duration::seconds(i * 403 + 30);
+        f.post_saying(ALICE, &format!("3kw{i:09}"), &aud, &format!("week post {i}"), at, true).await;
+        let unread = at - chrono::Duration::seconds(100);
+        f.post_saying(DAVE, &format!("3kx{i:09}"), &dave_aud, &format!("week post {i}"), unread, false).await;
+    }
+    f.ready_all().await;
+    println!("B-5 searchPosts: seeded 3000 posts in one week in {:?}", seeded.elapsed());
+    let bounds = PrivateSearchConfig::default();
+    for (name, query) in [("no match, 300 binds and decodes", "q=zzzz&limit=100"), ("limit 100 filled", "q=week&limit=100")] {
+        let base = f.search_server(Duration::ZERO, &bounds).await;
+        let mut took = Vec::new();
+        let mut items = Vec::new();
+        for _ in 0..20 {
+            exec(&f.pool, "UPDATE sync_state SET head_checked_at = now()").await;
+            let (_, v, t) = json_of(&base, SEARCH, query, BOB).await;
+            items.push(post_uris(&v).len());
+            took.push(t);
+        }
+        took.sort();
+        println!(
+            "B-5 searchPosts, {name}: p50 {:?}, p95 {:?}, max {:?} over {} runs; posts per page {:?}..{:?}",
+            took[took.len() / 2],
+            took[took.len() * 95 / 100],
+            took[took.len() - 1],
+            took.len(),
+            items.iter().min(),
+            items.iter().max()
+        );
+    }
+    db.drop_db().await;
 }

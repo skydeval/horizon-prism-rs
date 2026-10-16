@@ -233,11 +233,35 @@ pub const SERVED: &[Served] = &[
     served("app.nearhorizon.private.getUnreadCount", Family::Private, false),
     served("app.nearhorizon.private.updateSeen", Family::Private, false),
     served("app.nearhorizon.private.getReplies", Family::Private, false),
+    served("app.nearhorizon.private.searchPosts", Family::Private, false),
     served("app.nearhorizon.threadLens.getThread", Family::ThreadLens, false),
     served("app.nearhorizon.threadLens.resolve", Family::ThreadLens, false),
     served("app.nearhorizon.index.requestRecord", Family::IndexRequest, false),
     served("app.nearhorizon.constellation.resolveDid", Family::Resolve, true),
 ];
+
+/// Methods charged more than one token of their bucket. A private search
+/// page costs up to 300 binds and decodes (private posting §4.17).
+pub const COSTS: &[(&str, u32)] = &[("app.nearhorizon.private.searchPosts", 5)];
+
+/// The tokens one call of `method` takes: its [`COSTS`] entry, else 1.
+#[must_use]
+pub fn cost(method: &str) -> u32 {
+    COSTS.iter().find(|(m, _)| *m == method).map_or(1, |(_, c)| *c)
+}
+
+/// The class an authenticated call in `family` is charged to.
+fn authenticated_class(family: Family) -> Class {
+    match family {
+        Family::Read => Class::AuthRead,
+        Family::Search => Class::SearchAuth,
+        Family::Write => Class::Write,
+        Family::Private => Class::Private,
+        Family::ThreadLens => Class::ThreadLens,
+        Family::IndexRequest => Class::IndexRequest,
+        Family::Resolve => Class::Resolve,
+    }
+}
 
 /// The smallest and largest accepted `per_sec` (§10).
 pub const MIN_PER_SEC: f64 = 0.000_001;
@@ -287,6 +311,19 @@ pub fn problems(cfg: &RateLimitsConfig, out: &mut Vec<String>) {
                 "rate_limits.endpoint_class[{nsid}]: {family:?} is keyed by DID, and this endpoint accepts anonymous calls"
             )),
             Some(_) => {}
+        }
+    }
+    // A call that costs more than its bucket's burst could never succeed.
+    for &(nsid, n) in COSTS {
+        let family = cfg
+            .endpoint_class
+            .get(nsid)
+            .and_then(|f| Family::parse(f))
+            .or_else(|| SERVED.iter().find(|s| s.nsid == nsid).map(|s| s.family))
+            .unwrap_or(Family::Read);
+        let class = authenticated_class(family);
+        if class.config(cfg).burst < n {
+            out.push(format!("rate_limits: {nsid} costs {n} tokens, more than its class's burst"));
         }
     }
 }
@@ -364,16 +401,30 @@ impl RateLimits {
     ///
     /// [`Limited`] when the bucket is empty.
     pub fn check(&self, class: Class, key: &str) -> Result<(), Limited> {
+        self.check_n(class, key, 1)
+    }
+
+    /// Take `n` tokens for `key` in `class` at once.
+    ///
+    /// # Errors
+    ///
+    /// [`Limited`] when the bucket holds fewer than `n`, or can never hold
+    /// them (more than its burst; validation refuses such a config).
+    pub fn check_n(&self, class: Class, key: &str, n: u32) -> Result<(), Limited> {
         let Some(bucket) = self.buckets.get(&class) else {
             return Ok(());
         };
-        bucket.check_key(&key.to_string()).map_err(|not_until| {
-            let wait = not_until.wait_time_from(DefaultClock::default().now());
+        let limited = |wait: Duration| {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
             Limited {
                 reset_epoch_secs: (now + wait + Duration::from_millis(999)).as_secs(),
             }
-        })
+        };
+        match bucket.check_key_n(&key.to_string(), NonZeroU32::new(n).unwrap_or(NonZeroU32::MIN)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(not_until)) => Err(limited(not_until.wait_time_from(DefaultClock::default().now()))),
+            Err(_) => Err(limited(Duration::from_secs(1))),
+        }
     }
 
     /// Per-IP check (anonymous reads, global backstop).
@@ -403,13 +454,9 @@ impl RateLimits {
     pub fn charge(&self, method: &str, default: Family, did: Option<&str>, ip: IpAddr) -> Result<(), Limited> {
         match (self.family(method, default), did) {
             (Family::Resolve, _) => self.check(Class::Resolve, &format!("{method}|{}", ip_key(ip))),
-            (Family::Read, Some(did)) => self.check(Class::AuthRead, did),
-            (Family::Search, Some(did)) => self.check(Class::SearchAuth, did),
             (Family::Search, None) => self.check_ip(Class::SearchAnon, ip),
-            (Family::Write, Some(did)) => self.check(Class::Write, did),
-            (Family::Private, Some(did)) => self.check(Class::Private, did),
-            (Family::ThreadLens, Some(did)) => self.check(Class::ThreadLens, did),
-            (Family::IndexRequest, Some(did)) => self.check(Class::IndexRequest, did),
+            // An authenticated call takes its method's cost ([`COSTS`]).
+            (family, Some(did)) => self.check_n(authenticated_class(family), did, cost(method)),
             // An anonymous read. A DID-keyed family never reaches here with
             // no caller: validation keeps it off endpoints that accept
             // anonymous calls, and its handlers authenticate first.
@@ -541,6 +588,24 @@ mod tests {
         let mut out = Vec::new();
         problems(&cfg.rate_limits, &mut out);
         out
+    }
+
+    /// Private posting §4.17: a private search page takes 5 tokens of the
+    /// `private` bucket, and a burst below that is refused at load.
+    #[test]
+    fn a_private_search_takes_five_tokens() {
+        const SEARCH: &str = "app.nearhorizon.private.searchPosts";
+        let limits = RateLimits::new();
+        let ip: IpAddr = "203.0.113.7".parse().expect("ip");
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!((cost(SEARCH), cost("app.nearhorizon.private.getPosts")), (5, 1));
+        for _ in 0..4 {
+            limits.charge(SEARCH, Family::Private, Some(did), ip).expect("burst 20 holds four");
+        }
+        assert!(limits.charge(SEARCH, Family::Private, Some(did), ip).is_err());
+        limits.charge(SEARCH, Family::Private, Some("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"), ip).expect("another DID");
+        assert!(check("[rate_limits.private]\nper_sec = 10.0\nburst = 4\n").iter().any(|p| p.contains("costs 5 tokens")));
+        assert!(check("[rate_limits.private]\nper_sec = 10.0\nburst = 5\n").is_empty());
     }
 
     #[test]

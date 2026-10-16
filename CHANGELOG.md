@@ -12,6 +12,20 @@ commit.
 
 ### Added
 
+- **Private search (private posting S11, #719; Horizon P-7).**
+  `app.nearhorizon.private.searchPosts {q, sort, limit, cursor}` searches
+  the posts the caller may read, at query time: no index of decoded text
+  is stored. Each page scans up to `[private_search] scan_candidates`
+  (300) readable candidates within `span_hours` (168) below its cursor
+  and returns up to `limit` matches; search reaches back `max_age_days`
+  (365) from the first page. A page can be empty and still carry a
+  cursor, so keep requesting while one comes back; where a page ends
+  depends only on posts the caller may read. `sort: "top"` is answered in
+  `latest` order. The cursor is sealed. A search page costs 5 tokens of
+  the `private` rate bucket (a `private` burst below 5 is refused at
+  startup). Floor `search_posts` 1500 ms. `getMembership`'s `features`
+  gains `private.search`.
+
 - **Sealed feed cursors, an author-feed filter and paged replies
   (private posting S8, #719; Horizon P-17, P-20, P-6/P-14).**
   - `getTimeline` and `getAuthorFeed` cursors are sealed and fixed-length,

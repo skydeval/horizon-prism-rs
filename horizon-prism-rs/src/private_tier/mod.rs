@@ -164,6 +164,8 @@ pub const FEATURES: &[&str] = &[
     "private.paging",
     // Rule 4's anchored walk (S0, listed from S1).
     "private.crossPdsReplies",
+    // P-7 `searchPosts`, a bounded scan at query time (S11).
+    "private.search",
 ];
 
 /// The private tier as the rest of the crate may use it.

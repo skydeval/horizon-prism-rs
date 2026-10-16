@@ -648,7 +648,8 @@ pub async fn run() -> Result<(), StartupError> {
         &cfg.file.private_read,
         // Required and never generated (private posting §3.6, C-14).
         crate::cursor_key::CursorKey::new(cfg.env.private_cursor_key.expose()),
-    );
+    )
+    .with_search(&cfg.file.private_search);
     // The post-migration task (design-v3 §12.2): every migration is applied
     // and ingest is running, so old rows can be filled and the large
     // indexes built while the app serves.

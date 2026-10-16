@@ -1,0 +1,67 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.searchPosts",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Search the private-tier posts the requester is authorized to read, newest first. There is no index of post text: each page scans, at query time, the next posts the requester may read below its cursor (at most 300 by default, within one week by default), reads each as getPosts does, and keeps those whose text contains every word of q, case-folded, up to limit. A search reaches back a fixed number of days from its first page (365 by default); older posts are not searched. Because a page scans a bounded span, a page may hold fewer than limit posts, or none, and still carry a cursor: the client should keep requesting while a cursor comes back. Before the first match there can be about one empty page per week searched, plus one per 300 posts scanned. sort 'top' is accepted and answered in 'latest' order: there is no corpus to rank. Requires auth by a ready community member. Audiences are resolved as getPosts resolves them.",
+      "parameters": {
+        "type": "params",
+        "required": ["q"],
+        "properties": {
+          "q": {
+            "type": "string",
+            "description": "Words, each of which a post's text must contain, case-folded. A word 'from:<did>' is not matched against the text: it keeps only that account's posts. At least one word is required; a 'from:' word whose value is not a DID is rejected with InvalidRequest."
+          },
+          "sort": {
+            "type": "string",
+            "knownValues": ["latest", "top"],
+            "default": "latest",
+            "description": "'top' is answered in 'latest' order."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "How many posts a page holds at most.",
+            "default": 25,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque, sealed pagination cursor from a previous response to the same requester for the same q. Any other cursor is rejected with InvalidRequest."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["posts"],
+          "properties": {
+            "posts": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "app.nearhorizon.private.defs#privatePostView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Present until the search has reached back its full span; a page may be short or empty and still carry one. Absent at the end, and also, exceptionally, when the last scanned position is too long to seal (a post whose author's did:web is several hundred characters), where the search ends early."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

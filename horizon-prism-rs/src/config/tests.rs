@@ -138,9 +138,15 @@ get_quotes = 1200
 list_notifications = 1200
 get_unread_count = 300
 get_replies = 1200
+search_posts = 1500
 
 [private_notify]
 backfill_max_age_hours = 48
+
+[private_search]
+scan_candidates = 300
+span_hours = 168
+max_age_days = 365
 
 [sync]
 head_max_age_secs = 60
@@ -888,6 +894,9 @@ fn zero_values_that_break_runtime_are_rejected() {
         ("sync", "catch_up_rate_per_host"),
         ("index_request", "catch_up_min_interval_secs"),
         ("index_request", "catch_up_max_pages"),
+        ("private_search", "scan_candidates"),
+        ("private_search", "span_hours"),
+        ("private_search", "max_age_days"),
         ("storage", "budget_bytes"),
         ("identity", "jwt_issuer_tracker_max"),
     ] {
@@ -951,6 +960,16 @@ fn list_sync_bounds_are_checked_against_each_other() {
     assert!(has(&p, "lists.subscribed_max_per_member must be at least 1") && has(&p, "lists.max_owners_per_member must be at least 1"));
     // The removed aggregate cap is an unknown key.
     assert!(load("[lists]\nsubscribed_max_total = 5\n").is_err());
+}
+
+/// Private posting §8: a search span no longer than the search's reach.
+#[test]
+fn private_search_span_fits_its_reach() {
+    let p = invalid_problems(load("[private_search]\nspan_hours = 25\nmax_age_days = 1\n"));
+    assert!(has(&p, "private_search.span_hours must be at most 24 × private_search.max_age_days"), "{p:?}");
+    let cfg = load("[private_search]\nspan_hours = 24\nmax_age_days = 1\n").expect("one day of one day");
+    assert_eq!(cfg.file.private_search.scan_candidates, 300);
+    assert_eq!(cfg.file.private_read.floor_ms.search_posts, 1500);
 }
 
 #[test]

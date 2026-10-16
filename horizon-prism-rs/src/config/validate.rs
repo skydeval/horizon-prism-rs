@@ -353,7 +353,7 @@ fn urls(cfg: &FileConfig, out: &mut Vec<String>) {
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 32] = [
+    let nonzero: [(&str, u64); 36] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
         ("firehose.deterministic_attempts", u64::from(cfg.firehose.deterministic_attempts)),
         ("identity.did_fresh_secs", cfg.identity.did_fresh_secs),
@@ -372,6 +372,10 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
         ("private_read.floor_ms.list_notifications", cfg.private_read.floor_ms.list_notifications),
         ("private_read.floor_ms.get_unread_count", cfg.private_read.floor_ms.get_unread_count),
         ("private_read.floor_ms.get_replies", cfg.private_read.floor_ms.get_replies),
+        ("private_read.floor_ms.search_posts", cfg.private_read.floor_ms.search_posts),
+        ("private_search.scan_candidates", u64::from(cfg.private_search.scan_candidates)),
+        ("private_search.span_hours", u64::from(cfg.private_search.span_hours)),
+        ("private_search.max_age_days", u64::from(cfg.private_search.max_age_days)),
         ("sync.max_probe_rate_per_host", u64::from(cfg.sync.max_probe_rate_per_host)),
         ("sync.read_fetch_rate_per_host", u64::from(cfg.sync.read_fetch_rate_per_host)),
         ("sync.catch_up_rate_per_host", u64::from(cfg.sync.catch_up_rate_per_host)),
@@ -397,6 +401,11 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     }
     if cfg.counts.fresh_secs > cfg.counts.stale_max_secs {
         out.push("counts.fresh_secs must not exceed counts.stale_max_secs".to_string());
+    }
+    // A span no longer than the search's reach (private posting §8).
+    let search = &cfg.private_search;
+    if u64::from(search.span_hours) > 24 * u64::from(search.max_age_days) {
+        out.push("private_search.span_hours must be at most 24 × private_search.max_age_days".to_string());
     }
 }
 

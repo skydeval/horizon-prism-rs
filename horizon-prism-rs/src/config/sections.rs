@@ -292,6 +292,8 @@ pub struct PrivateReadFloors {
     pub get_unread_count: u64,
     /// `private.getReplies` (S8).
     pub get_replies: u64,
+    /// `private.searchPosts` (S11).
+    pub search_posts: u64,
 }
 
 impl Default for PrivateReadFloors {
@@ -310,6 +312,7 @@ impl Default for PrivateReadFloors {
             list_notifications: 1200,
             get_unread_count: 300,
             get_replies: 1200,
+            search_posts: 1500,
         }
     }
 }
@@ -349,6 +352,32 @@ pub struct PrivateNotifyConfig {
 impl Default for PrivateNotifyConfig {
     fn default() -> Self {
         Self { backfill_max_age_hours: 48 }
+    }
+}
+
+/// `[private_search]` (private posting §4.17, C-8): the bounded scan of
+/// `private.searchPosts`. No index of decoded text exists; each page reads
+/// at most `scan_candidates` prefilter-passing rows within `span_hours`
+/// below its cursor, and the search reaches back `max_age_days` from its
+/// first page. All positive, and `span_hours ≤ 24 × max_age_days`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivateSearchConfig {
+    /// Prefilter-passing rows a page reads at most.
+    pub scan_candidates: u32,
+    /// The time span below the cursor a page scans.
+    pub span_hours: u32,
+    /// How far back from its first page's request time a search reaches.
+    pub max_age_days: u32,
+}
+
+impl Default for PrivateSearchConfig {
+    fn default() -> Self {
+        Self {
+            scan_candidates: 300,
+            span_hours: 168,
+            max_age_days: 365,
+        }
     }
 }
 
@@ -1737,6 +1766,7 @@ pub struct FileConfig {
     pub kryphocron: KryphocronConfig,
     pub private_read: PrivateReadConfig,
     pub private_notify: PrivateNotifyConfig,
+    pub private_search: PrivateSearchConfig,
     pub sync: SyncConfig,
     pub index_request: IndexRequestConfig,
     pub db: DbConfig,

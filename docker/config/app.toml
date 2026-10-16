@@ -128,12 +128,24 @@ get_quotes = 1200
 list_notifications = 1200
 get_unread_count = 300
 get_replies = 1200
+search_posts = 1500
 
 # Private notifications (private posting §4.8): a write that is not live
 # (backfill, catch-up, requestRecord, dead-letter replay) notifies only for a
 # record created within this many hours, so old likes are not announced as new.
 [private_notify]
 backfill_max_age_hours = 48
+
+# Private search (private posting §4.17): a bounded scan at query time, with no
+# index of decoded text. A page reads at most scan_candidates private posts the
+# requester may read, within span_hours below its cursor; a search reaches back
+# max_age_days from its first page. span_hours must be at most 24 × max_age_days.
+# If searchPosts nears its floor on the busiest week, lower span_hours or raise
+# private_read.floor_ms.search_posts.
+[private_search]
+scan_candidates = 300
+span_hours = 168
+max_age_days = 365
 
 # Repo-head check for tracked DIDs (design §6.11.3).
 [sync]
