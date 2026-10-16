@@ -175,6 +175,7 @@ impl Fixture {
                 get_post_thread: ms,
                 get_author_feed: ms,
                 get_timeline: ms,
+                get_bookmarks: ms,
             },
         };
         PrivateState::new(
@@ -1646,4 +1647,354 @@ async fn the_audience_view_carries_mode_and_name_on() {
 #[tokio::test]
 async fn the_audience_view_carries_mode_and_name_off() {
     audience_view_in(PublicMode::Off, "s2-audience-off").await;
+}
+
+const CREATE_BOOKMARK: &str = "app.nearhorizon.private.createBookmark";
+const DELETE_BOOKMARK: &str = "app.nearhorizon.private.deleteBookmark";
+const GET_BOOKMARKS: &str = "app.nearhorizon.private.getBookmarks";
+
+/// Counts `private_read_outcome_total` increments: every pipeline read
+/// counts one. Installed as this thread's recorder, it sees the reads of
+/// the handlers a current-thread test runtime serves.
+#[derive(Default)]
+struct PipelineReads(Arc<std::sync::atomic::AtomicU64>);
+
+struct ReadIncrements(Arc<std::sync::atomic::AtomicU64>);
+
+impl metrics::CounterFn for ReadIncrements {
+    fn increment(&self, value: u64) {
+        self.0.fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn absolute(&self, _value: u64) {}
+}
+
+impl metrics::Recorder for PipelineReads {
+    fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+    fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        if key.name() == super::pipeline::METRIC_OUTCOMES {
+            metrics::Counter::from_arc(Arc::new(ReadIncrements(Arc::clone(&self.0))))
+        } else {
+            metrics::Counter::noop()
+        }
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+impl PipelineReads {
+    fn count(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Rate limits no test here reaches.
+fn roomy_limits() -> RateLimits {
+    let cfg = crate::config::FileConfig::parse(concat!(
+        "[rate_limits.anon_read]\nper_sec = 1000.0\nburst = 10000\n",
+        "[rate_limits.private]\nper_sec = 1000.0\nburst = 10000\n",
+        "[rate_limits.global]\nper_sec = 1000.0\nburst = 10000\n",
+    ))
+    .expect("parse");
+    RateLimits::from_config(&cfg.rate_limits)
+}
+
+/// POST `body` to `method` with a token for `did`: status and raw body.
+async fn post(base: &str, method: &str, body: &Value, did: &str) -> (u16, String) {
+    let token = mint(&signing_key(key_of(did)), did, &format!("did:web:{AUDIENCE_HOST}"), Some(method));
+    let r = reqwest::Client::new()
+        .post(format!("{base}/xrpc/{method}"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("request");
+    let status = r.status().as_u16();
+    (status, r.text().await.expect("body"))
+}
+
+/// `getBookmarks` for `reader` with `query`: the body as JSON, and the time
+/// taken.
+async fn bookmarks_of(base: &str, reader: &str, query: &str) -> (Value, Duration) {
+    let (status, body, took) = get(base, GET_BOOKMARKS, query, reader, key_of(reader)).await;
+    assert_eq!(status, 200, "{body}");
+    (serde_json::from_str(&body).expect("json"), took)
+}
+
+fn subjects(page: &Value) -> Vec<String> {
+    page["bookmarks"]
+        .as_array()
+        .expect("bookmarks")
+        .iter()
+        .map(|b| b["subject"]["uri"].as_str().expect("uri").to_string())
+        .collect()
+}
+
+/// T-8 (P-8), in On and in Off (T-1): `createBookmark` answers an existing
+/// unreadable and a nonexistent private URI with identical bytes and no
+/// pipeline read; a URI that is not a private post's is 400; writes are
+/// idempotent; the cap counts private bookmarks alone (C-12);
+/// `getBookmarks` is newest first, floored, and omits a post once its
+/// audience drops the caller while its cursor still advances;
+/// `viewer.bookmarked` is the reader's own; the public `createBookmark`
+/// still refuses a private URI; the purges remove a member's rows.
+async fn bookmarks_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let first = f.private_post(ALICE, "3kfirst22222", &aud, None).await;
+    let second = f.private_post(ALICE, "3ksecond2222", &aud, None).await;
+    // Carol's post exists, and Bob is not in its audience.
+    let carols = f.audience(CAROL, "3kaudcarol22", Some("list"), &[DAVE]).await;
+    let hidden = f.private_post(CAROL, "3khidden2222", &carols, None).await;
+    let missing = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3knothere222");
+    f.ready_all().await;
+    let mut app = f.app.clone();
+    app.limits = roomy_limits();
+    let base = serve(f.state_of(app, Some(Duration::from_secs(1)), FLOOR)).await;
+
+    // The cap counts private bookmarks alone: Bob's three public ones (the
+    // test cap is 3) leave room.
+    let bob = crate::hydration::Viewer {
+        did: Some(BOB.into()),
+        hydrate: true,
+    };
+    for rkey in ["3kpub1", "3kpub2", "3kpub3"] {
+        let public = format!("at://{ALICE}/app.bsky.feed.post/{rkey}");
+        f.app.hydrator.create_bookmark(&bob, &public, "bafy").await.expect("db").expect("public bookmark");
+    }
+    // The public method still refuses a private URI.
+    let refused = f.app.hydrator.create_bookmark(&bob, &first, "bafy").await.expect("db").expect_err("private");
+    assert_eq!(refused.error, "UnsupportedCollection");
+
+    // No post is read on a write: an existing post Bob cannot read and a
+    // URI that names nothing get the same bytes.
+    let reads = PipelineReads::default();
+    let guard = metrics::set_default_local_recorder(&reads);
+    let unreadable = post(&base, CREATE_BOOKMARK, &json!({"uri": hidden, "cid": "bafyhidden"}), BOB).await;
+    let nonexistent = post(&base, CREATE_BOOKMARK, &json!({"uri": missing, "cid": "bafymissing"}), BOB).await;
+    assert_eq!(unreadable, (200, "{}".to_string()));
+    assert_eq!(unreadable, nonexistent);
+    let readable = post(&base, CREATE_BOOKMARK, &json!({"uri": first, "cid": "bafyold"}), BOB).await;
+    assert_eq!(readable, unreadable);
+    assert_eq!(post(&base, DELETE_BOOKMARK, &json!({"uri": missing}), BOB).await, nonexistent);
+    assert_eq!(reads.count(), 0, "no write reads a post");
+    // The counter does see a read.
+    one_post(&base, BOB, &first).await;
+    assert!(reads.count() > 0, "getPosts reads through the pipeline");
+    drop(guard);
+    post(&base, CREATE_BOOKMARK, &json!({"uri": missing, "cid": "bafymissing"}), BOB).await;
+
+    // Only a postPrivate record URI, decided from the URI alone.
+    for bad in [
+        format!("at://{ALICE}/app.bsky.feed.post/3kfirst22222"),
+        aud.clone(),
+        format!("at://alice.test/{NSID_POST_PRIVATE}/3kfirst22222"),
+        format!("{first}/extra"),
+        "nonsense".to_string(),
+    ] {
+        for method in [CREATE_BOOKMARK, DELETE_BOOKMARK] {
+            let (status, body) = post(&base, method, &json!({"uri": bad, "cid": "bafy"}), BOB).await;
+            assert_eq!(status, 400, "{method} {bad}: {body}");
+            assert!(body.contains("InvalidRequest"), "{body}");
+        }
+    }
+    let (status, body) = post(&base, CREATE_BOOKMARK, &json!({"uri": second}), BOB).await;
+    assert_eq!((status, body.contains("cid")), (400, true), "{body}");
+
+    // Bob holds three (hidden, missing, first): a repeat is allowed at the
+    // cap and replaces the CID; a fourth post is not.
+    assert_eq!(post(&base, CREATE_BOOKMARK, &json!({"uri": first, "cid": "bafyfirst"}), BOB).await.0, 200);
+    let (status, body) = post(&base, CREATE_BOOKMARK, &json!({"uri": second, "cid": "bafysecond"}), BOB).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("InvalidRequest") && body.contains("bookmark limit reached"), "{body}");
+    // Deleting is idempotent and makes room.
+    for _ in 0..2 {
+        assert_eq!(post(&base, DELETE_BOOKMARK, &json!({"uri": missing}), BOB).await, (200, "{}".to_string()));
+    }
+    assert_eq!(post(&base, CREATE_BOOKMARK, &json!({"uri": second, "cid": "bafysecond"}), BOB).await.0, 200);
+    // Fixed times, so the order is known: hidden, then first, then second.
+    for (uri, at) in [(&hidden, "2026-10-01T00:00:00Z"), (&first, "2026-10-02T00:00:00Z"), (&second, "2026-10-03T00:00:00Z")] {
+        sqlx::query("UPDATE private_bookmarks SET created_at = $2::timestamptz WHERE viewer_did = $1 AND post_uri = $3")
+            .bind(BOB)
+            .bind(at)
+            .bind(uri)
+            .execute(&f.pool)
+            .await
+            .expect("time");
+    }
+
+    // Newest first; the unreadable post is omitted; floored.
+    let (page, took) = bookmarks_of(&base, BOB, "").await;
+    assert!(took >= FLOOR, "getBookmarks took {took:?}");
+    assert_eq!(subjects(&page), [second.clone(), first.clone()]);
+    assert!(page.get("cursor").is_none(), "{page}");
+    let b = &page["bookmarks"][1];
+    assert_eq!(b["subject"], json!({"uri": first, "cid": "bafyfirst"}));
+    assert_eq!(b["createdAt"], "2026-10-02T00:00:00.000Z");
+    assert_eq!((&b["item"]["uri"], &b["item"]["record"]["text"]), (&json!(first), &json!("3kfirst22222")));
+    assert_eq!(b["item"]["viewer"], json!({"bookmarked": true}));
+
+    // `viewer.bookmarked` is the reader's own.
+    assert_eq!(one_post(&base, BOB, &first).await.1["viewer"], json!({"bookmarked": true}));
+    assert_eq!(one_post(&base, ALICE, &first).await.1["viewer"], json!({"bookmarked": false}));
+
+    // The cursor walks Bob's rows: the page holding only the unreadable
+    // row is empty and still carries a cursor; then the rows end.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let query = cursor.as_ref().map_or("limit=1".to_string(), |c| format!("limit=1&cursor={}", urlencoding(c)));
+        let (page, _) = bookmarks_of(&base, BOB, &query).await;
+        pages += 1;
+        seen.extend(subjects(&page));
+        match page.get("cursor").and_then(Value::as_str) {
+            Some(c) => cursor = Some(c.to_string()),
+            None => {
+                assert_eq!(page["bookmarks"], json!([]), "the last page is past the last row");
+                break;
+            }
+        }
+        assert!(pages < 10, "the cursor advances");
+    }
+    assert_eq!((seen, pages), (vec![second.clone(), first.clone()], 4));
+
+    // Alice moves her audience to Carol: both of Bob's posts leave his
+    // list, and a full page of rows still carries a cursor.
+    let moved = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [CAROL], "createdAt": "2026-09-26T00:00:00Z"});
+    f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, "3kaudience22", REV2, Some(moved)).await;
+    let (page, _) = bookmarks_of(&base, BOB, "").await;
+    assert_eq!(page, json!({"bookmarks": []}));
+    let (page, _) = bookmarks_of(&base, BOB, "limit=2").await;
+    assert_eq!(page["bookmarks"], json!([]));
+    assert!(page["cursor"].is_string(), "{page}");
+    let (page, _) = bookmarks_of(&base, BOB, &format!("limit=2&cursor={}", urlencoding(page["cursor"].as_str().expect("cursor")))).await;
+    assert_eq!(page, json!({"bookmarks": []}), "one row left");
+
+    // Bad parameters.
+    for query in ["limit=0", "limit=101", "cursor=garbage"] {
+        let (status, body, _) = get(&base, GET_BOOKMARKS, query, BOB, BOB_KEY).await;
+        assert_eq!(status, 400, "{query}: {body}");
+    }
+
+    // Another member's bookmarks are its own; the purges remove a member's.
+    let (page, _) = bookmarks_of(&base, CAROL, "").await;
+    assert_eq!(page, json!({"bookmarks": []}));
+    post(&base, CREATE_BOOKMARK, &json!({"uri": first, "cid": "bafy"}), CAROL).await;
+    let held = |did: &'static str| {
+        let pool = f.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM private_bookmarks WHERE viewer_did = $1")
+                .bind(did)
+                .fetch_one(&pool)
+                .await
+                .expect("count")
+        }
+    };
+    assert_eq!((held(BOB).await, held(CAROL).await), (3, 1));
+    let mut conn = f.pool.acquire().await.expect("conn");
+    KryphocronPrivateTier.purge_member_removed_batch(&mut conn, BOB, 100).await.expect("purge");
+    KryphocronPrivateTier.purge_did_batch(&mut conn, CAROL, 100).await.expect("purge");
+    drop(conn);
+    assert_eq!((held(BOB).await, held(CAROL).await), (0, 0));
+    db.drop_db().await;
+}
+
+/// A cursor as a query value (it holds `:` and `/`).
+fn urlencoding(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn private_bookmarks_on() {
+    bookmarks_in(PublicMode::On, "s3-bookmarks-on").await;
+}
+
+#[tokio::test]
+async fn private_bookmarks_off() {
+    bookmarks_in(PublicMode::Off, "s3-bookmarks-off").await;
+}
+
+/// T-3 (P-19) for the methods routed here: with the private router merged
+/// into the app as `serve` merges it, each private-posting method in
+/// `app.nearhorizon.private.*` is kept, answers its own authentication
+/// error for its verb and the wrong-verb 400 for the other, and serves a
+/// ready member, in each of the five public-indexing modes.
+#[tokio::test]
+async fn private_router_methods_are_routed_in_every_mode() {
+    use crate::hydration::testing::set_mode;
+    use crate::xrpc::router::{FinalConfig, finalize};
+
+    let Some(db) = fresh_db("s3_private_routes").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "s3-routes").await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let uri = f.private_post(ALICE, "3kpost222222", &aud, None).await;
+    f.ready_all().await;
+    let mut app = f.app.clone();
+    app.limits = roomy_limits();
+    let merged = crate::xrpc::router(app.clone()).merge(router(f.state_of(app.clone(), Some(Duration::from_secs(1)), FLOOR)));
+    let routes = finalize(merged, app.clone(), FinalConfig {
+        not_ready_retry_secs: 5,
+        public: crate::honest_501::PublicMessages::default(),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>()).await.expect("serve");
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let methods: Vec<(&str, crate::honest_501::Verb)> = crate::honest_501::PRIVATE_POSTING_METHODS
+        .iter()
+        .copied()
+        .filter(|(n, _)| n.starts_with("app.nearhorizon.private."))
+        .collect();
+    assert_eq!(methods.len(), 3);
+    for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
+        set_mode(app.hydrator.scope(), mode).await;
+        for &(nsid, verb) in &methods {
+            assert!(crate::honest_501::KEPT_METHODS.contains(&nsid), "{nsid}");
+            let url = format!("{base}/xrpc/{nsid}");
+            let (right, wrong) = match verb {
+                crate::honest_501::Verb::Get => (reqwest::Method::GET, reqwest::Method::POST),
+                crate::honest_501::Verb::Post => (reqwest::Method::POST, reqwest::Method::GET),
+            };
+            let r = client.request(right.clone(), &url).send().await.expect("request");
+            let status = r.status().as_u16();
+            let v: Value = r.json().await.expect("json");
+            assert_eq!((status, v["error"].as_str()), (401, Some("AuthRequired")), "{mode:?} {nsid}");
+            let r = client.request(wrong.clone(), &url).send().await.expect("request");
+            let status = r.status().as_u16();
+            let v: Value = r.json().await.expect("json");
+            assert_eq!(status, 400, "{mode:?} wrong verb {nsid}");
+            assert_eq!(v["message"], format!("Incorrect HTTP method ({wrong}) expected {right}"), "{mode:?} {nsid}");
+            // A ready member is served.
+            let status = match verb {
+                crate::honest_501::Verb::Get => get(&base, nsid, "", BOB, BOB_KEY).await.0,
+                crate::honest_501::Verb::Post => post(&base, nsid, &json!({"uri": uri, "cid": "bafy"}), BOB).await.0,
+            };
+            assert_eq!(status, 200, "{mode:?} {nsid}");
+        }
+    }
+    db.drop_db().await;
 }

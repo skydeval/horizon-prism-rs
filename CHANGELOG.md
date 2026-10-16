@@ -12,6 +12,19 @@ commit.
 
 ### Added
 
+- **Private bookmarks (private posting S3, #719; Horizon P-8).**
+  `app.nearhorizon.private.createBookmark {uri, cid}`, `deleteBookmark
+  {uri}` and `getBookmarks {limit, cursor}`, served in every
+  public-indexing mode. `createBookmark` accepts a `postPrivate` URI
+  without reading the post (the answer says nothing about it), and is
+  idempotent; the cap is the public bookmark cap, counted separately.
+  `getBookmarks` lists, newest first, only the bookmarked posts the
+  caller may read now (others are left out; the cursor is unaffected),
+  under its own floor (`private_read.floor_ms.get_bookmarks`, default
+  1200). Private post views gain `viewer.bookmarked`. Bookmarks are
+  removed with the account's purge and when a member is removed.
+  Migration 0024. `getMembership`'s `features` gains `private.bookmarks`.
+
 - **Private post views carry their content (private posting S2, #719;
   Horizon P-1, P-3).** `privatePostView.record` now carries `facets`,
   `embed`, `langs` and `labels` as stored, and the view has a top-level

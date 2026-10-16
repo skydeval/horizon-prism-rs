@@ -541,14 +541,29 @@ pub(crate) async fn local_uris(conn: &mut PgConnection, did: &str, nsid: &str, b
         .await
 }
 
+/// The viewer's own private bookmarks, at most `limit` rows (private posting
+/// §3.1: deleted by the `account_deleted` and `member_removed` purges, as
+/// `bookmarks` is).
+async fn purge_bookmarks(conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "DELETE FROM private_bookmarks WHERE ctid IN (SELECT ctid FROM private_bookmarks WHERE viewer_did = $1 LIMIT $2)",
+    )
+    .bind(did)
+    .bind(limit)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
 /// `ingest::purge_did` (account deletion): every private row authored by the
-/// DID and its owner state, at most `limit` rows per table.
+/// DID, its owner state and its private bookmarks, at most `limit` rows per
+/// table.
 ///
 /// # Errors
 ///
 /// Database errors.
 pub(crate) async fn purge_did(conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
-    let mut n = 0;
+    let mut n = purge_bookmarks(conn, did, limit).await?;
     for (table, col) in [
         ("private_posts", "author_did"),
         ("private_audiences", "owner_did"),
@@ -606,14 +621,16 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
 
 /// The private part of a `member_removed` purge (§6.11.7): private replies by
 /// authors outside S admitted only because `did` was a member (no other
-/// member among parent and root authors), and rule-2 private blocks of `did`
-/// by authors outside S that are not private owners.
+/// member among parent and root authors), rule-2 private blocks of `did`
+/// by authors outside S that are not private owners, and the member's
+/// private bookmarks.
 ///
 /// # Errors
 ///
 /// Database errors.
 pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
-    let mut n = sqlx::query(
+    let mut n = purge_bookmarks(conn, did, limit).await?;
+    n += sqlx::query(
         "DELETE FROM private_posts WHERE uri IN (SELECT p.uri FROM private_posts p \
          WHERE NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = p.author_did) \
            AND $1 IN (split_part(p.reply_parent_uri, '/', 3), split_part(p.reply_root_uri, '/', 3)) \

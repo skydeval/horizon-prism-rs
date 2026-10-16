@@ -458,6 +458,13 @@ impl Hydrator {
         &self.inner.cfg.video
     }
 
+    /// `bookmarks.max_per_actor`: the private tier counts its own bookmarks
+    /// against the same value (private posting C-12).
+    #[must_use]
+    pub fn bookmarks_max(&self) -> u32 {
+        self.inner.cfg.bookmarks_max
+    }
+
     fn constellation(&self) -> Option<&ConstellationClient> {
         if self.inner.cfg.counts.public_source == CountsSource::Local {
             None

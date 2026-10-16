@@ -121,6 +121,7 @@ get_posts = 1000
 get_post_thread = 1200
 get_author_feed = 1200
 get_timeline = 1200
+get_bookmarks = 1200
 
 # Repo-head check for tracked DIDs (design §6.11.3).
 [sync]

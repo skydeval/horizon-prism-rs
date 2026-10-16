@@ -36,7 +36,26 @@
           "type": "ref",
           "ref": "#audienceView",
           "description": "The audience the post names, while this AppView holds its record. Absent when the post names none or the record is gone; the author still sees record.audienceList."
+        },
+        "viewer": {
+          "type": "ref",
+          "ref": "app.bsky.feed.defs#viewerState",
+          "description": "The requester's state on the post. Carries bookmarked (the requester's private bookmark, app.nearhorizon.private.createBookmark), always present; other fields are not emitted yet."
         }
+      }
+    },
+    "bookmarkView": {
+      "type": "object",
+      "description": "One of the requester's private bookmarks, with the post as the requester may read it now.",
+      "required": ["createdAt", "subject", "item"],
+      "properties": {
+        "createdAt": { "type": "string", "format": "datetime", "description": "When the bookmark was first made; a repeat keeps it." },
+        "subject": {
+          "type": "ref",
+          "ref": "com.atproto.repo.strongRef",
+          "description": "The bookmarked post, with the cid given when it was last bookmarked."
+        },
+        "item": { "type": "ref", "ref": "#privatePostView" }
       }
     },
     "audienceView": {

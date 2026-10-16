@@ -15,21 +15,22 @@ use std::time::{Duration, Instant};
 use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-use super::emit::{PrivateEmit, PrivateResponse, ThreadNode, ThreadParent};
+use super::emit::{BookmarkView, PrivateEmit, PrivateResponse, ThreadNode, ThreadParent};
 use super::pipeline::{self, PipelineEnv, RequestState};
 use super::schema;
 use crate::config::PrivateReadConfig;
 use crate::db::locks::uri_author;
-use crate::hydration::HydrationContext;
+use crate::firehose::classifier::NSID_POST_PRIVATE;
 use crate::hydration::actor::ProfileContext;
 use crate::hydration::embeds::{EMBED_RECORD_WITH_MEDIA, media_view, normalize_embed, quoted_uri};
 use crate::hydration::normalize::is_private_uri;
+use crate::hydration::{HydrationContext, ts};
 use crate::kryphocron_glue::VerifiedCaller;
 use crate::xrpc::AppState;
 use crate::xrpc::auth::{Params, prepare_private, request_handle, request_ip};
@@ -39,6 +40,9 @@ pub const GET_POSTS: &str = "app.nearhorizon.private.getPosts";
 pub const GET_POST_THREAD: &str = "app.nearhorizon.private.getPostThread";
 pub const GET_AUTHOR_FEED: &str = "app.nearhorizon.private.getAuthorFeed";
 pub const GET_TIMELINE: &str = "app.nearhorizon.private.getTimeline";
+pub const CREATE_BOOKMARK: &str = "app.nearhorizon.private.createBookmark";
+pub const DELETE_BOOKMARK: &str = "app.nearhorizon.private.deleteBookmark";
+pub const GET_BOOKMARKS: &str = "app.nearhorizon.private.getBookmarks";
 
 /// Metric: handler time before the floor.
 const METRIC_UNFLOORED: &str = "private_read_unfloored_seconds";
@@ -54,6 +58,7 @@ pub struct Floors {
     pub get_post_thread: Duration,
     pub get_author_feed: Duration,
     pub get_timeline: Duration,
+    pub get_bookmarks: Duration,
 }
 
 /// State for the private router.
@@ -63,6 +68,9 @@ pub struct PrivateState {
     pub(super) env: PipelineEnv,
     pub(super) floors: Floors,
     pub(super) concurrency: usize,
+    /// `bookmarks.max_per_actor`, counted over private bookmarks alone
+    /// (private posting C-12).
+    pub(super) bookmarks_max: u32,
 }
 
 impl PrivateState {
@@ -78,6 +86,7 @@ impl PrivateState {
     ) -> Self {
         let pool = app.hydrator.pool().clone();
         let video = app.hydrator.video().clone();
+        let bookmarks_max = app.hydrator.bookmarks_max();
         Self {
             app,
             env: PipelineEnv {
@@ -94,8 +103,10 @@ impl PrivateState {
                 get_post_thread: Duration::from_millis(cfg.floor_ms.get_post_thread),
                 get_author_feed: Duration::from_millis(cfg.floor_ms.get_author_feed),
                 get_timeline: Duration::from_millis(cfg.floor_ms.get_timeline),
+                get_bookmarks: Duration::from_millis(cfg.floor_ms.get_bookmarks),
             },
             concurrency: usize::try_from(cfg.bind_concurrency).unwrap_or(8).max(1),
+            bookmarks_max,
         }
     }
 }
@@ -111,6 +122,9 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(GET_POST_THREAD), get(get_post_thread))
         .route(&xrpc(GET_AUTHOR_FEED), get(get_author_feed))
         .route(&xrpc(GET_TIMELINE), get(get_timeline))
+        .route(&xrpc(CREATE_BOOKMARK), post(create_bookmark))
+        .route(&xrpc(DELETE_BOOKMARK), post(delete_bookmark))
+        .route(&xrpc(GET_BOOKMARKS), get(get_bookmarks))
         .with_state(state)
 }
 
@@ -226,8 +240,24 @@ fn view_record(s: &PrivateState, quoted: &PrivateEmit<Value>, authors: &ProfileC
     record
 }
 
+/// `viewer` on each hit (private-posting design §4.6): `bookmarked`, from
+/// the caller's own private bookmarks (§4.3).
+async fn viewer_state(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&mut PrivateEmit<Value>]) -> Result<(), XrpcError> {
+    let uris: Vec<String> = posts.iter().filter_map(|p| view_uri(p)).collect();
+    if uris.is_empty() {
+        return Ok(());
+    }
+    let marked: HashSet<String> = schema::bookmarked(&s.env.pool, &caller.did, &uris).await?.into_iter().collect();
+    for post in posts.iter_mut() {
+        let bookmarked = view_uri(post).is_some_and(|u| marked.contains(&u));
+        post.decorate("viewer", json!({"bookmarked": bookmarked}));
+    }
+    Ok(())
+}
+
 /// The decoration pass of a page (private-posting design §3.3), over hits
-/// only: the operator labels, then the record part of each `embed`.
+/// only: the operator labels, `viewer`, then the record part of each
+/// `embed`.
 ///
 /// - A quoted private post is read through the pipeline for the same reader
 ///   and the same `RequestState`, all of the page's at once: readable gives
@@ -247,6 +277,7 @@ async fn decorate(
     start: Instant,
 ) -> Result<(), XrpcError> {
     operator_labels(hydration, posts).await?;
+    viewer_state(s, caller, posts).await?;
     let quotes: Vec<Option<(Value, String)>> = posts
         .iter()
         .map(|p| {
@@ -657,6 +688,141 @@ async fn feed_body(
     let mut refs: Vec<&mut PrivateEmit<Value>> = feed.iter_mut().collect();
     decorate(s, &rs, caller, &hydration, &mut refs, start).await?;
     Ok(PrivateResponse::feed(feed, cursor))
+}
+
+/// Whether `uri` is `at://<did>/tools.kryphocron.feed.postPrivate/<rkey>`,
+/// decided from the URI alone (private posting §4.3).
+fn is_post_private_uri(uri: &str) -> bool {
+    let mut parts = uri.strip_prefix("at://").unwrap_or_default().split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(did), Some(NSID_POST_PRIVATE), Some(rkey), None)
+            if kryphocron::Did::new(did).is_ok() && kryphocron::RecordKey::new(rkey).is_ok()
+    )
+}
+
+/// A required string field of a write's JSON input.
+fn field<'a>(input: &'a Value, name: &str) -> Result<&'a str, XrpcError> {
+    input
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| XrpcError::invalid(format!("Error: Input must have the property \"{name}\"")))
+}
+
+/// The bookmark URI of a write, checked from the URI alone.
+fn bookmark_uri(input: &Value) -> Result<&str, XrpcError> {
+    let uri = field(input, "uri")?;
+    if !is_post_private_uri(uri) {
+        return Err(XrpcError::invalid(format!("Error: uri must be a {NSID_POST_PRIVATE} record")));
+    }
+    Ok(uri)
+}
+
+/// `app.nearhorizon.private.createBookmark {uri, cid}` (private posting
+/// §4.3): the post is **not** read, so the answer and its time are the same
+/// whether it exists or not. Idempotent: a repeat replaces the stored CID
+/// and keeps the bookmark's place. The cap is `bookmarks.max_per_actor`,
+/// counted over private bookmarks alone (C-12). No floor: nothing here
+/// depends on a private post.
+pub async fn create_bookmark(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private(&s.app, &headers, peer, CREATE_BOOKMARK).await?;
+    let input = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let uri = bookmark_uri(&input)?;
+    let cid = field(&input, "cid")?;
+    let (held, existing) = schema::bookmarks_held(&s.env.pool, &caller.did, uri).await?;
+    if !existing && held >= i64::from(s.bookmarks_max) {
+        return Err(XrpcError::invalid("bookmark limit reached"));
+    }
+    schema::put_bookmark(&s.env.pool, &caller.did, uri, cid).await?;
+    Ok(ok(PrivateResponse::empty()))
+}
+
+/// `app.nearhorizon.private.deleteBookmark {uri}`: idempotent, with
+/// `createBookmark`'s URI check.
+pub async fn delete_bookmark(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private(&s.app, &headers, peer, DELETE_BOOKMARK).await?;
+    let input = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let uri = bookmark_uri(&input)?;
+    schema::delete_bookmark(&s.env.pool, &caller.did, uri).await?;
+    Ok(ok(PrivateResponse::empty()))
+}
+
+/// `app.nearhorizon.private.getBookmarks {limit 1-100 default 50, cursor}`:
+/// the caller's bookmarks, newest first, each post read through the
+/// pipeline. An unreadable one is omitted. The cursor is
+/// `created_at::post_uri` of the last **row** scanned, present when the
+/// row page was full, so omissions do not move it: it walks the caller's own
+/// rows, which say nothing about any post. Floored (`get_bookmarks`).
+pub async fn get_bookmarks(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, peer, GET_BOOKMARKS).await?;
+    let p = Params::parse(q.as_deref());
+    let limit = match p.u32("limit")?.unwrap_or(50) {
+        l @ 1..=100 => l,
+        _ => return Err(XrpcError::invalid("Error: limit must be between 1 and 100")),
+    };
+    let after = parse_cursor(p.one("cursor"))?;
+    let ip = request_ip(&s.app, &headers, peer);
+    let result = bookmarks_body(&s, &caller, ip, limit as usize, after, start).await;
+    floor("getBookmarks", start, s.floors.get_bookmarks).await;
+    result.map(ok)
+}
+
+async fn bookmarks_body(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    ip: IpAddr,
+    limit: usize,
+    after: Option<(DateTime<Utc>, String)>,
+    start: Instant,
+) -> Result<PrivateResponse, XrpcError> {
+    let rows = schema::bookmark_rows(&s.env.pool, &caller.did, after, i64::try_from(limit).unwrap_or(i64::MAX)).await?;
+    let next = (rows.len() == limit)
+        .then(|| rows.last().map(|(uri, _, at)| cursor(*at, uri)))
+        .flatten();
+    // SQL narrows; the pipeline decides each post (§2 rule 1).
+    let uris: Vec<String> = rows.iter().map(|(uri, ..)| uri.clone()).collect();
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &uris).await?.into_iter().collect();
+    let candidates: Vec<String> = uris.into_iter().filter(|u| passing.contains(u)).collect();
+    let hydration = private_hydration(s, caller, ip).await?;
+    let authors = profiles(&hydration, &candidates).await?;
+    let rs = RequestState::new(s.env.max_head_fetches);
+    let mut hits: HashMap<String, PrivateEmit<Value>> = HashMap::new();
+    for (uri, hit) in candidates.iter().zip(read_many(s, &rs, caller, &candidates, &authors, start).await) {
+        if let Some(post) = hit {
+            hits.insert(uri.clone(), post);
+        }
+    }
+    let mut bookmarks: Vec<BookmarkView> = rows
+        .into_iter()
+        .filter_map(|(uri, cid, at)| {
+            let item = hits.remove(&uri)?;
+            Some(BookmarkView {
+                created_at: ts(at),
+                uri,
+                cid,
+                item,
+            })
+        })
+        .collect();
+    let mut refs: Vec<&mut PrivateEmit<Value>> = bookmarks.iter_mut().map(|b| &mut b.item).collect();
+    decorate(s, &rs, caller, &hydration, &mut refs, start).await?;
+    Ok(PrivateResponse::bookmarks(bookmarks, next))
 }
 
 #[cfg(test)]

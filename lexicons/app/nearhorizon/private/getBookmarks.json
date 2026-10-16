@@ -1,0 +1,55 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getBookmarks",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the requester's bookmarks of private-tier posts, newest bookmark first. Each post is read for the requester as getPosts reads it: a bookmarked post the requester may not read now (its audience no longer includes the requester, it was deleted, or it never existed) is omitted without distinction. Requires auth by a ready community member.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor from a previous response."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["bookmarks"],
+          "properties": {
+            "bookmarks": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "app.nearhorizon.private.defs#bookmarkView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Present when more of the requester's bookmarks may follow. It walks the requester's bookmarks, not the posts, so a page may hold fewer than limit items, or none, and still carry a cursor."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

@@ -483,6 +483,98 @@ pub(super) async fn reply_candidates(pool: &PgPool, requester: &str, parent: &st
     .await
 }
 
+/// `(held, existing)`: how many private bookmarks `viewer` holds, and
+/// whether one of them is `uri` (P-8's cap, C-12: over `private_bookmarks`
+/// alone). The viewer's own rows, which say nothing about any post.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn bookmarks_held(pool: &PgPool, viewer: &str, uri: &str) -> Result<(i64, bool), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT count(*), COALESCE(bool_or(post_uri = $2), false) FROM private_bookmarks WHERE viewer_did = $1",
+    )
+    .bind(viewer)
+    .bind(uri)
+    .fetch_one(pool)
+    .await
+}
+
+/// Keep `viewer`'s bookmark of `uri`: a repeat replaces the CID and keeps
+/// the bookmark's place.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn put_bookmark(pool: &PgPool, viewer: &str, uri: &str, cid: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO private_bookmarks (viewer_did, post_uri, post_cid) VALUES ($1, $2, $3) \
+         ON CONFLICT (viewer_did, post_uri) DO UPDATE SET post_cid = EXCLUDED.post_cid",
+    )
+    .bind(viewer)
+    .bind(uri)
+    .bind(cid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Remove `viewer`'s bookmark of `uri`, if any.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn delete_bookmark(pool: &PgPool, viewer: &str, uri: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM private_bookmarks WHERE viewer_did = $1 AND post_uri = $2")
+        .bind(viewer)
+        .bind(uri)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A bookmark row: `(post_uri, post_cid, created_at)`.
+pub(super) type BookmarkRow = (String, String, DateTime<Utc>);
+
+/// Up to `limit` of `viewer`'s bookmarks, newest first, after the
+/// `created_at::post_uri` cursor.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn bookmark_rows(
+    pool: &PgPool,
+    viewer: &str,
+    after: Option<(DateTime<Utc>, String)>,
+    limit: i64,
+) -> Result<Vec<BookmarkRow>, sqlx::Error> {
+    let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
+    sqlx::query_as(
+        "SELECT post_uri, post_cid, created_at FROM private_bookmarks WHERE viewer_did = $1 \
+           AND ($2::timestamptz IS NULL OR (created_at, post_uri) < ($2, $3)) \
+         ORDER BY created_at DESC, post_uri DESC LIMIT $4",
+    )
+    .bind(viewer)
+    .bind(at)
+    .bind(uri)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// The URIs among `uris` that `viewer` bookmarked (`viewer.bookmarked`).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn bookmarked(pool: &PgPool, viewer: &str, uris: &[String]) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT post_uri FROM private_bookmarks WHERE viewer_did = $1 AND post_uri = ANY($2)")
+        .bind(viewer)
+        .bind(uris)
+        .fetch_all(pool)
+        .await
+}
+
 /// A feed candidate: `(uri, created_at, rkey)`.
 pub(super) type FeedCandidate = (String, DateTime<Utc>, String);
 

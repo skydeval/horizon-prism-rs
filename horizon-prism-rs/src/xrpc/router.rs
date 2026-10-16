@@ -789,7 +789,9 @@ mod tests {
         }
         for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
             set_mode(&scope, mode).await;
-            for &(nsid, verb) in honest_501::PRIVATE_POSTING_METHODS {
+            // The private router's methods are checked in `private_tier`'s
+            // tests, against that router merged with this one.
+            for &(nsid, verb) in honest_501::PRIVATE_POSTING_METHODS.iter().filter(|(n, _)| !n.starts_with("app.nearhorizon.private.")) {
                 let url = format!("{base}/xrpc/{nsid}");
                 let (right, wrong) = match verb {
                     Verb::Get => (reqwest::Method::GET, reqwest::Method::POST),

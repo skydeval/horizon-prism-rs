@@ -22,7 +22,7 @@
             },
             "features": {
               "type": "array",
-              "description": "The private-tier feature families this AppView serves, whatever the requester's status. Empty when the private tier is disabled. Known values: 'private' (the app.nearhorizon.private read methods); 'private.crossPdsReplies' (replies under another account's audience are served when anchored to that account's post in the thread, on any PDS). Later values name further families; a client ignores values it does not know.",
+              "description": "The private-tier feature families this AppView serves, whatever the requester's status. Empty when the private tier is disabled. Known values: 'private' (the app.nearhorizon.private read methods); 'private.embeds' (facets, embeds, langs, labels and audience on private post views); 'private.bookmarks' (the app.nearhorizon.private bookmark methods and viewer.bookmarked); 'private.crossPdsReplies' (replies under another account's audience are served when anchored to that account's post in the thread, on any PDS). Later values name further families; a client ignores values it does not know.",
               "items": { "type": "string" }
             }
           }

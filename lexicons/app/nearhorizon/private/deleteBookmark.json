@@ -1,0 +1,42 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.deleteBookmark",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Remove the requester's bookmark of a private-tier post. Idempotent: removing a bookmark that does not exist succeeds. Requires auth by a ready community member.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of a tools.kryphocron.feed.postPrivate record."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": { "type": "object", "properties": {} }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "The URI is not a tools.kryphocron.feed.postPrivate record URI."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

@@ -112,15 +112,46 @@ impl Serialize for ThreadParent {
     }
 }
 
+/// `app.nearhorizon.private.defs#bookmarkView` (private posting §4.3): one
+/// of the caller's bookmark rows and its post, read through the pipeline.
+#[derive(Debug)]
+pub struct BookmarkView {
+    pub(in crate::private_tier) created_at: String,
+    pub(in crate::private_tier) uri: String,
+    pub(in crate::private_tier) cid: String,
+    pub(in crate::private_tier) item: PrivateEmit<Value>,
+}
+
+impl Serialize for BookmarkView {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(3))?;
+        m.serialize_entry("createdAt", &self.created_at)?;
+        m.serialize_entry("subject", &serde_json::json!({"uri": self.uri, "cid": self.cid}))?;
+        m.serialize_entry("item", &self.item)?;
+        m.end()
+    }
+}
+
 /// The body of every private handler response.
 #[derive(Debug)]
 pub enum PrivateResponse {
     Posts(Vec<PrivateEmit<Value>>),
     Thread(ThreadNode),
     Feed { feed: Vec<PrivateEmit<Value>>, cursor: Option<String> },
+    Bookmarks { bookmarks: Vec<BookmarkView>, cursor: Option<String> },
+    /// `{}`: a write's answer.
+    Empty,
 }
 
 impl PrivateResponse {
+    pub(in crate::private_tier) fn bookmarks(bookmarks: Vec<BookmarkView>, cursor: Option<String>) -> Self {
+        Self::Bookmarks { bookmarks, cursor }
+    }
+
+    pub(in crate::private_tier) fn empty() -> Self {
+        Self::Empty
+    }
+
     pub(in crate::private_tier) fn posts(posts: Vec<PrivateEmit<Value>>) -> Self {
         Self::Posts(posts)
     }
@@ -146,6 +177,13 @@ impl Serialize for PrivateResponse {
                     m.serialize_entry("cursor", c)?;
                 }
             }
+            Self::Bookmarks { bookmarks, cursor } => {
+                m.serialize_entry("bookmarks", bookmarks)?;
+                if let Some(c) = cursor {
+                    m.serialize_entry("cursor", c)?;
+                }
+            }
+            Self::Empty => {}
         }
         m.end()
     }

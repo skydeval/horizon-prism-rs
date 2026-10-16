@@ -92,6 +92,8 @@ pub const FEATURES: &[&str] = &[
     "private",
     // P-1 and P-3 fields on views (S2).
     "private.embeds",
+    // P-8 bookmarks and `viewer.bookmarked` (S3).
+    "private.bookmarks",
     // Rule 4's anchored walk (S0, listed from S1).
     "private.crossPdsReplies",
 ];

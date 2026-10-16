@@ -278,6 +278,8 @@ pub struct PrivateReadFloors {
     pub get_post_thread: u64,
     pub get_author_feed: u64,
     pub get_timeline: u64,
+    /// `private.getBookmarks` (private posting S3, §3.2).
+    pub get_bookmarks: u64,
 }
 
 impl Default for PrivateReadFloors {
@@ -289,6 +291,7 @@ impl Default for PrivateReadFloors {
             get_post_thread: 1200,
             get_author_feed: 1200,
             get_timeline: 1200,
+            get_bookmarks: 1200,
         }
     }
 }

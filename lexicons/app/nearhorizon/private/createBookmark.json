@@ -1,0 +1,43 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.createBookmark",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Bookmark a private-tier post for the requester. The bookmark is the requester's state on this AppView, not a repository record. The post is not looked up: the answer is the same whether or not it exists or the requester may read it, and getBookmarks shows it only while the requester may read it. Idempotent: a repeat replaces the stored cid and keeps the bookmark's place. Private bookmarks have their own limit, separate from app.bsky.bookmark's. Requires auth by a ready community member.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid"],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "at-uri",
+              "description": "AT-URI of a tools.kryphocron.feed.postPrivate record."
+            },
+            "cid": { "type": "string", "format": "cid" }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": { "type": "object", "properties": {} }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "The URI is not a tools.kryphocron.feed.postPrivate record URI, or the requester's bookmark limit is reached ('bookmark limit reached')."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}
