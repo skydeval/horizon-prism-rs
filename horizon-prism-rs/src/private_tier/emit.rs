@@ -163,6 +163,73 @@ impl Serialize for QuoteItem {
     }
 }
 
+/// What a private notification is about (private posting §4.8).
+#[derive(Debug)]
+pub enum NotificationRecord {
+    /// A private post, read through the pipeline for the recipient: its
+    /// `uri`, `cid`, `record` and `labels` come from the witness's view.
+    Private(PrivateEmit<Value>),
+    /// A member's public like, repost, quote or reply: the stored public
+    /// record, and its labels.
+    Public { uri: String, cid: String, record: Value, labels: Value },
+}
+
+/// One item of `app.nearhorizon.private.listNotifications`, in the shape of
+/// `app.bsky.notification.listNotifications#notification`.
+#[derive(Debug)]
+pub struct NotificationView {
+    pub(in crate::private_tier) record: NotificationRecord,
+    /// The record author's `profileView` (public data).
+    pub(in crate::private_tier) author: Value,
+    pub(in crate::private_tier) reason: String,
+    pub(in crate::private_tier) reason_subject: Option<String>,
+    pub(in crate::private_tier) is_read: bool,
+    pub(in crate::private_tier) indexed_at: String,
+}
+
+impl Serialize for NotificationView {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match &self.record {
+            NotificationRecord::Private(post) => {
+                let v = post.view();
+                self.serialize_with(s, &v["uri"], &v["cid"], &v["record"], v.get("labels").unwrap_or(&Value::Null))
+            }
+            NotificationRecord::Public { uri, cid, record, labels } => {
+                self.serialize_with(s, &Value::from(uri.as_str()), &Value::from(cid.as_str()), record, labels)
+            }
+        }
+    }
+}
+
+impl NotificationView {
+    fn serialize_with<S: serde::Serializer>(
+        &self,
+        s: S,
+        uri: &Value,
+        cid: &Value,
+        record: &Value,
+        labels: &Value,
+    ) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("uri", uri)?;
+        m.serialize_entry("cid", cid)?;
+        m.serialize_entry("author", &self.author)?;
+        m.serialize_entry("reason", &self.reason)?;
+        if let Some(subject) = &self.reason_subject {
+            m.serialize_entry("reasonSubject", subject)?;
+        }
+        m.serialize_entry("record", record)?;
+        m.serialize_entry("isRead", &self.is_read)?;
+        m.serialize_entry("indexedAt", &self.indexed_at)?;
+        if labels.is_null() {
+            m.serialize_entry("labels", &Value::Array(Vec::new()))?;
+        } else {
+            m.serialize_entry("labels", labels)?;
+        }
+        m.end()
+    }
+}
+
 /// The body of every private handler response.
 #[derive(Debug)]
 pub enum PrivateResponse {
@@ -176,11 +243,27 @@ pub enum PrivateResponse {
     /// `getRepostedBy`: `profileView`s of member reposters, public data.
     RepostedBy { uri: String, reposted_by: Vec<Value>, cursor: Option<String> },
     Quotes { uri: String, posts: Vec<QuoteItem>, cursor: Option<String> },
+    /// `listNotifications`: the caller's private notifications.
+    Notifications { notifications: Vec<NotificationView>, cursor: Option<String>, seen_at: Option<String> },
+    /// `getUnreadCount`.
+    UnreadCount(i64),
     /// `{}`: a write's answer.
     Empty,
 }
 
 impl PrivateResponse {
+    pub(in crate::private_tier) fn notifications(
+        notifications: Vec<NotificationView>,
+        cursor: Option<String>,
+        seen_at: Option<String>,
+    ) -> Self {
+        Self::Notifications { notifications, cursor, seen_at }
+    }
+
+    pub(in crate::private_tier) fn unread_count(count: i64) -> Self {
+        Self::UnreadCount(count)
+    }
+
     pub(in crate::private_tier) fn likes(uri: String, likes: Vec<Value>, cursor: Option<String>) -> Self {
         Self::Likes { uri, likes, cursor }
     }
@@ -253,6 +336,16 @@ impl Serialize for PrivateResponse {
                 }
                 m.serialize_entry("posts", posts)?;
             }
+            Self::Notifications { notifications, cursor, seen_at } => {
+                m.serialize_entry("notifications", notifications)?;
+                if let Some(c) = cursor {
+                    m.serialize_entry("cursor", c)?;
+                }
+                if let Some(at) = seen_at {
+                    m.serialize_entry("seenAt", at)?;
+                }
+            }
+            Self::UnreadCount(count) => m.serialize_entry("count", count)?,
             Self::Empty => {}
         }
         m.end()

@@ -286,6 +286,10 @@ pub struct PrivateReadFloors {
     pub get_reposted_by: u64,
     /// `private.getQuotes` (S5).
     pub get_quotes: u64,
+    /// `private.listNotifications` (S6).
+    pub list_notifications: u64,
+    /// `private.getUnreadCount` (S6).
+    pub get_unread_count: u64,
 }
 
 impl Default for PrivateReadFloors {
@@ -301,6 +305,8 @@ impl Default for PrivateReadFloors {
             get_likes: 800,
             get_reposted_by: 800,
             get_quotes: 1200,
+            list_notifications: 1200,
+            get_unread_count: 300,
         }
     }
 }
@@ -323,6 +329,23 @@ impl Default for PrivateReadConfig {
             membership_retry_after_secs: 5,
             floor_ms: PrivateReadFloors::default(),
         }
+    }
+}
+
+/// `[private_notify]` (private posting §4.8, C-11). The section is never
+/// named after the private table (§3.1's names table).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivateNotifyConfig {
+    /// A write that is not live (backfill, catch-up, `requestRecord`,
+    /// dead-letter replay) notifies only for a record created within this
+    /// many hours.
+    pub backfill_max_age_hours: u32,
+}
+
+impl Default for PrivateNotifyConfig {
+    fn default() -> Self {
+        Self { backfill_max_age_hours: 48 }
     }
 }
 
@@ -1686,6 +1709,7 @@ pub struct FileConfig {
     pub identity: IdentityConfig,
     pub kryphocron: KryphocronConfig,
     pub private_read: PrivateReadConfig,
+    pub private_notify: PrivateNotifyConfig,
     pub sync: SyncConfig,
     pub db: DbConfig,
     pub admin: AdminConfig,

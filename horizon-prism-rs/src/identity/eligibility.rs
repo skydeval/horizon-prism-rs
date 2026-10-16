@@ -226,6 +226,9 @@ mod tests {
                     cid: "bafy".into(),
                     rev: "3kaaaaaaaaaa2".into(),
                     record: serde_json::json!({"text": "t", "createdAt": "2026-09-26T00:00:00Z"}),
+                    source: crate::firehose::writer::WriteSource::Firehose,
+                    created_at: chrono::Utc::now(),
+                    notify_max_age: chrono::Duration::hours(48),
                 },
             )
             .await

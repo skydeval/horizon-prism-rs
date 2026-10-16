@@ -28,7 +28,7 @@ use crate::aggregations::growth::{self, GrowthPlan};
 use crate::aggregations::{Admission, AdmissionInput, RecordKind, ScopeSets, ScopeState, admit};
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
 use crate::hydration::normalize::is_private_uri;
-use crate::private_tier::{IngestError, PrivateOp, PrivateTier, QuoteRef};
+use crate::private_tier::{IngestError, PrivateOp, PrivateTier, PublicNotify, QuoteRef};
 use crate::subscriptions::applier::Applier;
 use crate::subscriptions::copy;
 use crate::subscriptions::fetch::{NSID_LIST, NSID_LISTITEM};
@@ -124,6 +124,9 @@ pub enum WriteSource {
     IndexRequest,
     /// The backfill worker.
     Backfill,
+    /// `requestRecord`'s catch-up listing (private posting §3.8). Not live:
+    /// private notifications follow the 48 h rule (§4.8).
+    CatchUp,
 }
 
 /// What happened to one op.
@@ -463,11 +466,14 @@ pub struct Notification {
 
 /// Notifications for an admitted public record written by `author` (§7.7):
 /// recipients are members other than the author, one reason per recipient,
-/// with reply taking precedence over quote, and quote over mention.
+/// with reply taking precedence over quote, and quote over mention. A
+/// subject that is a private post is skipped: such a record notifies only
+/// in the private tier (private posting §4.8, #717).
 fn notifications_for(author: &str, body: &Body, sets: &ScopeSets) -> Vec<Notification> {
     let mut out: Vec<Notification> = Vec::new();
     let mut push = |recipient: Option<&str>, reason: &'static str, subject: Option<String>| {
         if let Some(r) = recipient
+            && !subject.as_deref().is_some_and(is_private_uri)
             && r != author
             && sets.is_member(r)
             && !out.iter().any(|n| n.recipient == r)
@@ -510,6 +516,8 @@ pub struct Writer {
     private: Arc<dyn PrivateTier>,
     /// `notifications.subscribed_post_max_age_secs`.
     subscribed_post_max_age: chrono::Duration,
+    /// `private_notify.backfill_max_age_hours` (private posting §4.8, C-11).
+    private_notify_max_age: chrono::Duration,
     /// Rule 4's caps (`lists.subscribed_max_items`,
     /// `lists.subscription_tombstones_max_per_owner`).
     subscription_limits: copy::Limits,
@@ -529,6 +537,7 @@ impl Writer {
             scope,
             private,
             subscribed_post_max_age: chrono::Duration::seconds(86_400),
+            private_notify_max_age: chrono::Duration::hours(48),
             subscription_limits: copy::Limits { max_items: 50_000, tombstones_max_per_owner: 10_000 },
             list_budget: Budget { max_references: 25, max_owners: 10 },
             applier: None,
@@ -556,6 +565,15 @@ impl Writer {
     #[must_use]
     pub fn with_subscribed_post_max_age_secs(mut self, secs: u32) -> Self {
         self.subscribed_post_max_age = chrono::Duration::seconds(i64::from(secs));
+        self
+    }
+
+    /// How old a record written by any path but the live firehose may be
+    /// and still notify privately (`private_notify.backfill_max_age_hours`,
+    /// private posting §4.8, C-11).
+    #[must_use]
+    pub fn with_private_notify_max_age_hours(mut self, hours: u32) -> Self {
+        self.private_notify_max_age = chrono::Duration::hours(i64::from(hours));
         self
     }
 
@@ -867,7 +885,7 @@ impl Writer {
             let mut sp = tx.begin().await?;
             let result = match target {
                 OpTarget::Upsert(u, plan) => self.apply_upsert(&mut sp, u, plan, rev, sets, options).await,
-                OpTarget::GrowOnly(u, plan) => self.apply_grow_only(&mut sp, u, plan, rev).await,
+                OpTarget::GrowOnly(u, plan) => self.apply_grow_only(&mut sp, u, plan, rev, options).await,
                 OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets).await,
             };
             match result {
@@ -888,14 +906,16 @@ impl Writer {
 
     /// A member's post under the off rule (public-indexing design §4.1):
     /// its reference and its growth, no `posts` row, no feed item and no
-    /// notification. There is no not-newer return, so growth always runs;
-    /// it is idempotent.
+    /// public notification. Its quote of or reply to a private post notifies
+    /// privately (private posting §4.8). There is no not-newer return, so
+    /// growth always runs; it is idempotent.
     async fn apply_grow_only(
         &self,
         conn: &mut PgConnection,
         u: &Upsert,
         plan: &GrowthPlan,
         rev: &str,
+        options: ApplyOptions,
     ) -> Result<(OpOutcome, MemoryEffects), OpError> {
         let mut eff = MemoryEffects::default();
         if tombstoned(conn, &u.uri, rev).await? {
@@ -906,8 +926,49 @@ impl Writer {
             upsert_post_ref(conn, u, p, rev).await?;
             self.private.upsert_quote_ref(conn, &quote_ref(u, p, rev)).await?;
         }
+        if let Some(n) = self.public_notify(u, options) {
+            self.private.notify_public(conn, &n).await?;
+        }
         eff.growth_added = growth::apply(conn, plan).await?;
         Ok((OpOutcome::GrowOnly, eff))
+    }
+
+    /// What a public record naming a private post hands the private tier
+    /// (private posting §4.8): a like or repost of one, or a post replying
+    /// to or quoting one. `None` when it names none. The private tier
+    /// checks that the author and each recipient are members.
+    fn public_notify(&self, u: &Upsert, options: ApplyOptions) -> Option<PublicNotify> {
+        let private = |uri: &str| is_private_uri(uri).then(|| uri.to_string());
+        let (reasons, record_root, public_record): (Vec<(&'static str, String)>, Option<String>, Option<Value>) = match &u.body {
+            Body::Like(s) => (private(&s.subject.uri).map(|s| ("like", s)).into_iter().collect(), None, None),
+            Body::Repost(s) => (private(&s.subject.uri).map(|s| ("repost", s)).into_iter().collect(), None, None),
+            Body::Post(p) => {
+                let reasons = [
+                    ("reply", p.reply_parent.as_ref().map(|r| r.uri.as_str())),
+                    ("reply", p.reply_root.as_ref().map(|r| r.uri.as_str())),
+                    ("quote", p.quote_uri.as_deref()),
+                ]
+                .into_iter()
+                .filter_map(|(reason, uri)| uri.and_then(private).map(|s| (reason, s)))
+                .collect();
+                (reasons, p.reply_root.as_ref().map(|r| r.uri.clone()), Some(u.record.clone()))
+            }
+            _ => return None,
+        };
+        if reasons.is_empty() {
+            return None;
+        }
+        Some(PublicNotify {
+            record_uri: u.uri.clone(),
+            record_cid: u.cid.clone(),
+            author_did: u.input.author.clone(),
+            reasons,
+            record_root,
+            public_record,
+            source: options.source,
+            created_at: u.created_at,
+            notify_max_age: self.private_notify_max_age,
+        })
     }
 
     async fn apply_upsert(
@@ -931,6 +992,9 @@ impl Writer {
                 cid: u.cid.clone(),
                 rev: rev.to_string(),
                 record: u.record.clone(),
+                source: options.source,
+                created_at: u.created_at,
+                notify_max_age: self.private_notify_max_age,
             };
             let applied = if u.body == Body::PrivateGate {
                 self.private.apply_gate(conn, &op).await?
@@ -980,6 +1044,11 @@ impl Writer {
             metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "older_rev").increment(1);
             return Ok((OpOutcome::Unchanged, eff));
         }
+        // A public record naming a private post notifies privately, in
+        // every mode, outside the `notify` flag below (private posting §4.8).
+        if let Some(n) = self.public_notify(u, options) {
+            self.private.notify_public(conn, &n).await?;
+        }
         // Under the off rule nothing notifies and no feed item is written
         // (public-indexing design §5). A backfilled record created before
         // the last fill began notifies nobody, in every mode (§8.3).
@@ -1026,11 +1095,14 @@ impl Writer {
         for n in notifications_for(author, &u.body, sets) {
             insert_notification(conn, &n, author, &u.uri, &u.cid, root).await?;
         }
-        // After the reasons above, which take precedence (§8.6).
+        // After the reasons above, which take precedence (§8.6). No via
+        // reason is written for a private subject: its record would name the
+        // private post (private posting §4.8, #717).
         match &u.body {
             Body::Like(s) | Body::Repost(s) => {
                 let reason = if matches!(u.body, Body::Like(_)) { "like-via-repost" } else { "repost-via-repost" };
-                if let Some(via) = &s.via
+                if !is_private_uri(&s.subject.uri)
+                    && let Some(via) = &s.via
                     && via.uri.contains("/app.bsky.feed.repost/")
                     && let Some(reposter) = uri_author(&via.uri)
                     && reposter != author
@@ -1170,6 +1242,9 @@ impl Writer {
             .bind(&d.uri)
             .execute(&mut *conn)
             .await?;
+        // Its private notifications too, in the same savepoint, so a
+        // rollback undoes both (private posting §4.8).
+        self.private.delete_notifications(conn, &d.uri).await?;
         Ok((if removed { OpOutcome::Written } else { OpOutcome::Unchanged }, eff))
     }
 

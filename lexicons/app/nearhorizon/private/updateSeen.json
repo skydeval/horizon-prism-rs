@@ -1,0 +1,38 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.updateSeen",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Notify the AppView that the requester has seen its private notifications up to seenAt. The stored time never moves back, and a time in the future is taken as now. Separate from app.bsky.notification.updateSeen. Requires auth by a ready community member.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["seenAt"],
+          "properties": {
+            "seenAt": { "type": "string", "format": "datetime" }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": { "type": "object", "properties": {} }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "seenAt is missing or not a datetime."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

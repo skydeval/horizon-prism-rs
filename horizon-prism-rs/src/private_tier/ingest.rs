@@ -15,9 +15,11 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 
-use super::{Applied, IngestError, PrivateOp, QuoteRef, owners};
+use super::{Applied, IngestError, PrivateOp, PublicNotify, QuoteRef, owners};
 use crate::db::locks::uri_author;
-use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_THREADGATE};
+use crate::firehose::classifier::{
+    NSID_AUDIENCE, NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_THREADGATE,
+};
 use crate::firehose::jobs::Depth;
 use crate::firehose::normalize::{bytes_field, strong_ref_cid};
 use crate::firehose::records::created_at;
@@ -366,7 +368,7 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             }
             // A row stored before migration 0023 (`display_filled` false)
             // also takes an op at its own rev: the refill (§3.1).
-            sqlx::query(
+            let changed = sqlx::query(
                 "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, audience_uri, reply_root_uri, \
                    reply_parent_uri, encoded_content, encoded_codec, encoded_generation, plaintext_text, created_at, \
                    reply_root_cid, reply_parent_cid, facets, embed, langs, self_labels, quote_uri, mention_dids, \
@@ -408,7 +410,13 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .execute(&mut *conn)
             .await?
             .rows_affected()
-                > 0
+                > 0;
+            // Its notifications, when the row is written: an update that
+            // adds recipients adds rows, and the others are kept (§4.8).
+            if changed && super::notifies(op.source, op.created_at, op.notify_max_age) {
+                notify_post(&mut *conn, op, &f).await?;
+            }
+            changed
         }
         NSID_AUDIENCE => {
             let f = AudienceFields::parse(&op.record)?;
@@ -646,6 +654,155 @@ pub(crate) async fn delete_quote_ref(conn: &mut PgConnection, uri: &str, rev: &s
     Ok(())
 }
 
+/// Whether `uri` names a post, public or private: a reply's or quote's
+/// subject must, so that each recipient's subject is its own post (§4.8).
+fn is_post(uri: &str) -> bool {
+    matches!(uri.strip_prefix("at://").and_then(|r| r.split('/').nth(1)), Some(NSID_POST | NSID_POST_PRIVATE))
+}
+
+/// One private notification to write: `(recipient, reason, reason_subject)`.
+type Recipient = (String, &'static str, Option<String>);
+
+/// The recipients of a private post by `author` (§4.8), one reason each, in
+/// precedence order: `reply` to the parent's author (subject: the parent),
+/// `reply` to the claimed root's author (subject: the root), `quote` to the
+/// quoted post's author (subject: the quoted post), `mention` to each
+/// mentioned DID (no subject). The author is never one; membership and
+/// thread mutes are tested on insert.
+fn post_recipients(author: &str, f: &PostPrivateFields) -> Vec<Recipient> {
+    let mut out: Vec<Recipient> = Vec::new();
+    let mut push = |recipient: Option<&str>, reason: &'static str, subject: Option<&String>| {
+        if let Some(r) = recipient
+            && r != author
+            && !out.iter().any(|(d, ..)| d == r)
+        {
+            out.push((r.to_string(), reason, subject.cloned()));
+        }
+    };
+    for (reason, uri) in [
+        ("reply", f.reply_parent_uri.as_ref()),
+        ("reply", f.reply_root_uri.as_ref()),
+        ("quote", f.display.quote_uri.as_ref()),
+    ] {
+        if let Some(uri) = uri.filter(|u| is_post(u)) {
+            push(uri_author(uri), reason, Some(uri));
+        }
+    }
+    for did in &f.display.mention_dids {
+        push(Some(did), "mention", None);
+    }
+    out
+}
+
+/// Insert one private notification for recipient `$1` unless the recipient
+/// is the author, is not a member, or muted the thread: the record (`$5`),
+/// the root it claims (`$7`), the subject (`$4`) or the subject's own
+/// claimed root is a muted root (`insert_notification`'s rule, §4.8). A
+/// muted thread writes nothing, so unmuting brings nothing back.
+const INSERT_NOTIFICATION: &str = "INSERT INTO private_notifications \
+       (recipient_did, author_did, reason, reason_subject, record_uri, record_cid, record_root, public_record) \
+     SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+     WHERE $1 <> $2 \
+       AND EXISTS (SELECT 1 FROM members m WHERE m.did = $1) \
+       AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
+             $5::text, $7::text, $4::text, \
+             (SELECT p.reply_root_uri FROM private_posts p WHERE p.uri = $4::text), \
+             (SELECT p.reply_root_uri FROM posts p WHERE p.uri = $4::text))) \
+     ON CONFLICT DO NOTHING";
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_notification(
+    conn: &mut PgConnection,
+    recipient: &Recipient,
+    author: &str,
+    record_uri: &str,
+    record_cid: &str,
+    record_root: Option<&str>,
+    public_record: Option<&Value>,
+) -> Result<(), sqlx::Error> {
+    let (did, reason, subject) = recipient;
+    sqlx::query(INSERT_NOTIFICATION)
+        .bind(did)
+        .bind(author)
+        .bind(*reason)
+        .bind(subject.as_deref())
+        .bind(record_uri)
+        .bind(record_cid)
+        .bind(record_root)
+        .bind(public_record)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// The private notifications of a written private post (§4.8): see
+/// [`post_recipients`]. The thread root is the reply's claimed one (C-18).
+async fn notify_post(conn: &mut PgConnection, op: &PrivateOp, f: &PostPrivateFields) -> Result<(), sqlx::Error> {
+    for r in post_recipients(&op.author_did, f) {
+        insert_notification(&mut *conn, &r, &op.author_did, &op.uri, &op.cid, f.reply_root_uri.as_deref(), None).await?;
+    }
+    Ok(())
+}
+
+/// `ingest::notify_public` (§4.8): the private notifications of a public
+/// record naming a private post, written in every public-indexing mode when
+/// its author is a member and the write notifies ([`super::notifies`]).
+/// Each recipient is the subject's author, a member other than the author,
+/// one reason each in the given precedence; the subject is the recipient's
+/// own private post.
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn notify_public(conn: &mut PgConnection, n: &PublicNotify) -> Result<(), sqlx::Error> {
+    if !super::notifies(n.source, n.created_at, n.notify_max_age) {
+        return Ok(());
+    }
+    let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM members WHERE did = $1)")
+        .bind(&n.author_did)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !member {
+        return Ok(());
+    }
+    let mut done: Vec<&str> = Vec::new();
+    for (reason, subject) in &n.reasons {
+        let Some(recipient) = uri_author(subject) else {
+            continue;
+        };
+        if done.contains(&recipient) {
+            continue;
+        }
+        done.push(recipient);
+        let r: Recipient = (recipient.to_string(), *reason, Some(subject.clone()));
+        insert_notification(
+            &mut *conn,
+            &r,
+            &n.author_did,
+            &n.record_uri,
+            &n.record_cid,
+            n.record_root.as_deref(),
+            n.public_record.as_ref(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// `ingest::delete_notifications`: the private notifications whose record is
+/// `record_uri` (a deleted record, §4.8).
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn delete_notifications(conn: &mut PgConnection, record_uri: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM private_notifications WHERE record_uri = $1")
+        .bind(record_uri)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 async fn tombstone(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO private_tombstones (uri, rev) VALUES ($1, $2) \
@@ -701,6 +858,11 @@ pub(crate) async fn delete(conn: &mut PgConnection, uri: &str, rev: &str, author
         > 0;
     if removed || author_in_scope {
         tombstone(&mut *conn, uri, rev).await?;
+    }
+    // A deleted private post's notifications go with it, as a public
+    // record's do (private posting §4.8).
+    if table == "private_posts" {
+        delete_notifications(&mut *conn, uri).await?;
     }
     // The gates of a private post that is gone gate nothing (§3.1).
     if removed && let Some(gates) = canonical_private_gates(uri) {
@@ -762,15 +924,38 @@ async fn purge_bookmarks(conn: &mut PgConnection, did: &str, limit: i64) -> Resu
     .rows_affected())
 }
 
+/// The private notifications `did` received and those it authored, and its
+/// last-seen row, at most `limit` rows (private posting §3.1: the
+/// `account_deleted` and `member_removed` purges). An authored row may hold
+/// `public_record`, a copy of the DID's public post.
+async fn purge_notifications(conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
+    let mut n = sqlx::query(
+        "DELETE FROM private_notifications WHERE id IN (SELECT id FROM private_notifications \
+         WHERE recipient_did = $1 OR author_did = $1 LIMIT $2)",
+    )
+    .bind(did)
+    .bind(limit)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    n += sqlx::query("DELETE FROM private_notification_seen WHERE did = $1")
+        .bind(did)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    Ok(n)
+}
+
 /// `ingest::purge_did` (account deletion): every private row authored by the
-/// DID, its owner state and its private bookmarks, at most `limit` rows per
-/// table.
+/// DID, its owner state, its private bookmarks and its private
+/// notifications, at most `limit` rows per table.
 ///
 /// # Errors
 ///
 /// Database errors.
 pub(crate) async fn purge_did(conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
     let mut n = purge_bookmarks(conn, did, limit).await?;
+    n += purge_notifications(conn, did, limit).await?;
     for (table, col) in [
         ("private_posts", "author_did"),
         ("private_audiences", "owner_did"),
@@ -846,14 +1031,16 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
 /// authors outside S admitted only because `did` was a member (no other
 /// member among parent and root authors), rule-2 private blocks of `did`
 /// by authors outside S that are not private owners, the member's private
-/// bookmarks, and the member's quote references (private posting §3.1: its
-/// later deletes are no longer tracked).
+/// bookmarks, the member's quote references (private posting §3.1: its
+/// later deletes are no longer tracked), and the private notifications it
+/// received and authored, for the same reason.
 ///
 /// # Errors
 ///
 /// Database errors.
 pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
     let mut n = purge_bookmarks(conn, did, limit).await?;
+    n += purge_notifications(conn, did, limit).await?;
     n += sqlx::query(
         "DELETE FROM private_quote_refs WHERE uri IN (SELECT uri FROM private_quote_refs WHERE author_did = $1 LIMIT $2)",
     )

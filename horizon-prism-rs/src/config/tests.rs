@@ -135,6 +135,11 @@ get_bookmarks = 1200
 get_likes = 800
 get_reposted_by = 800
 get_quotes = 1200
+list_notifications = 1200
+get_unread_count = 300
+
+[private_notify]
+backfill_max_age_hours = 48
 
 [sync]
 head_max_age_secs = 60

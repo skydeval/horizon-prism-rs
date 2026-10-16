@@ -12,6 +12,30 @@ commit.
 
 ### Added
 
+- **Private notifications (private posting S6, #719; Horizon P-9).**
+  `app.nearhorizon.private.listNotifications {limit, cursor, reasons?}`,
+  `getUnreadCount` and `updateSeen`, served in every public-indexing mode
+  (the off mode writes them too). Reasons: `reply`, `mention` and `quote`
+  (listed only if the recipient may read the post), and `like` and
+  `repost` of the recipient's private post by a member. A member's public
+  quote or reply of a private post notifies its author privately, with the
+  public post as `uri`. No `*-via-repost` reasons; records indexed late
+  (backfill, catch-up, `requestRecord`, replay) and older than
+  `[private_notify] backfill_max_age_hours` (48) do not notify;
+  notification preferences do not apply (use `reasons`). Thread mutes use
+  the reply's own root; blocks and mutes apply as on public notifications.
+  Deleting the record removes its notification. Rows are kept 90 days.
+  Migration 0027. Floors `list_notifications` 1200 ms, `get_unread_count`
+  300 ms. `getMembership`'s `features` gains `private.notifications`.
+
+### Fixed (private posting S6)
+
+- **Public notifications could name a private post (#717).** With public
+  indexing on, likes, reposts, replies and quotes of a private post wrote
+  public notification rows naming the private URI. They are no longer
+  written (via reasons included), and rows left from before are neither
+  listed nor counted by the public notification methods.
+
 - **Counts, viewer state, likes, reposts and quotes of private posts
   (private posting S5, #719; Horizon P-2, P-5, P-16).**
   - Private post views carry `replyCount`, `likeCount`, `repostCount` and

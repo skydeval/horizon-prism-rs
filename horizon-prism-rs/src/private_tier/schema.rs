@@ -1026,3 +1026,194 @@ pub(super) async fn quote_candidates(
     .fetch_all(pool)
     .await
 }
+
+/// A private notification row (private posting §4.8): the caller's own.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub(super) struct NotificationRow {
+    pub id: i64,
+    pub author_did: String,
+    pub reason: String,
+    pub reason_subject: Option<String>,
+    pub record_uri: String,
+    pub record_cid: String,
+    /// A public post's record; `None` for a private post, a like or a repost.
+    pub public_record: Option<serde_json::Value>,
+    pub indexed_at: DateTime<Utc>,
+}
+
+impl NotificationRow {
+    /// The row's record is a private post (`reply`, `quote`, `mention`),
+    /// read through the pipeline; any other is a member's public record.
+    pub(super) fn is_from_private_post(&self) -> bool {
+        self.record_uri.split('/').nth(3) == Some(crate::firehose::classifier::NSID_POST_PRIVATE)
+    }
+}
+
+/// Up to `limit` of `recipient`'s private notifications, newest first, after
+/// the plain `indexed_at::id` cursor, with the `reasons` filter (none: every
+/// reason). The scan applies none of the recipient's other state, as the
+/// public scan does (`hydration/notifications.rs`).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn notification_rows(
+    pool: &PgPool,
+    recipient: &str,
+    after: Option<(DateTime<Utc>, i64)>,
+    reasons: &[String],
+    limit: i64,
+) -> Result<Vec<NotificationRow>, sqlx::Error> {
+    let (at, id) = after.map_or((None, 0), |(a, i)| (Some(a), i));
+    sqlx::query_as(
+        "SELECT n.id, n.author_did, n.reason, n.reason_subject, n.record_uri, n.record_cid, n.public_record, n.indexed_at \
+         FROM private_notifications n WHERE n.recipient_did = $1 \
+           AND ($2::timestamptz IS NULL OR (n.indexed_at, n.id) < ($2, $3)) \
+           AND (cardinality($5::text[]) = 0 OR n.reason = ANY($5)) \
+         ORDER BY n.indexed_at DESC, n.id DESC LIMIT $4",
+    )
+    .bind(recipient)
+    .bind(at)
+    .bind(id)
+    .bind(limit)
+    .bind(reasons)
+    .fetch_all(pool)
+    .await
+}
+
+/// What a private notification `n` of the recipient `$1` must pass (§4.8,
+/// "Reading", step 2), in the list and the count alike:
+/// - no block either way with its author, in `blocks` or `private_blocks`;
+/// - no full mute of its author, and no scoped mute of its reason (a repost
+///   mute: `repost`; a quote mute: `quote`);
+/// - no moderation list of the recipient's that applies names its author;
+/// - no muted thread: the record, the root it claims, the subject, or the
+///   subject's own claimed root is a muted root.
+fn notification_kept() -> String {
+    format!(
+        "NOT {blocked} \
+         AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did \
+               AND (m.scope = 'full' \
+                 OR (m.scope IN ('reposts', 'reposts_and_quotes') AND n.reason = 'repost') \
+                 OR (m.scope IN ('quotes', 'reposts_and_quotes') AND n.reason = 'quote'))) \
+         AND NOT EXISTS (SELECT 1 FROM list_references r \
+                         JOIN subscribed_lists l ON l.list_uri = r.list_uri \
+                         JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
+                         WHERE r.member_did = $1 AND i.subject_did = n.author_did AND {applies}) \
+         AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
+               n.record_uri, n.record_root, n.reason_subject, \
+               (SELECT s.reply_root_uri FROM private_posts s WHERE s.uri = n.reason_subject), \
+               (SELECT s.reply_root_uri FROM posts s WHERE s.uri = n.reason_subject)))",
+        blocked = blocked("$1", "n.author_did"),
+        applies = crate::hydration::APPLIES,
+    )
+}
+
+/// The ids among `ids`, rows of `recipient`, that pass [`notification_kept`].
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn notifications_kept(pool: &PgPool, recipient: &str, ids: &[i64]) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT n.id FROM private_notifications n WHERE n.recipient_did = $1 AND n.id = ANY($2) AND {kept}",
+        kept = notification_kept()
+    ))
+    .bind(recipient)
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// The URIs among `uris` that name a stored private post: a notification
+/// from a public record is listed and counted only while its subject is
+/// one (§4.8, step 4).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn stored_posts(pool: &PgPool, uris: &[String]) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT uri FROM private_posts WHERE uri = ANY($1)")
+        .bind(uris)
+        .fetch_all(pool)
+        .await
+}
+
+/// A like or repost row as a notification's record is rebuilt from it:
+/// `(uri, subject_uri, subject_cid, created_at)`.
+pub(super) type InteractionRecordRow = (String, String, Option<String>, DateTime<Utc>);
+
+/// The like or repost rows among `uris` (public records).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn interaction_records(
+    pool: &PgPool,
+    kind: Interaction,
+    uris: &[String],
+) -> Result<Vec<InteractionRecordRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT uri, subject_uri, subject_cid, created_at FROM {table} WHERE uri = ANY($1)",
+        table = kind.table()
+    ))
+    .bind(uris)
+    .fetch_all(pool)
+    .await
+}
+
+/// When `did` last saw its private notifications.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn notification_seen(pool: &PgPool, did: &str) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar("SELECT seen_at FROM private_notification_seen WHERE did = $1")
+        .bind(did)
+        .fetch_optional(pool)
+        .await
+}
+
+/// `updateSeen`: `seen_at = GREATEST(existing, seen_at)`, clamped to now, as
+/// the public method does.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn update_seen(pool: &PgPool, did: &str, seen_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO private_notification_seen (did, seen_at) VALUES ($1, LEAST($2, now())) \
+         ON CONFLICT (did) DO UPDATE SET seen_at = GREATEST(private_notification_seen.seen_at, LEAST(EXCLUDED.seen_at, now()))",
+    )
+    .bind(did)
+    .bind(seen_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `getUnreadCount` (§4.8): the recipient's rows after its last-seen time,
+/// under [`notification_kept`], counting only what the list would show:
+/// - a row from a private post when the post passes the prefilter for the
+///   recipient, which carries the moderation test (§3.4), so a mention in a
+///   post the recipient cannot read is never counted;
+/// - a row from a public record while its subject private post is stored.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn unread_count(pool: &PgPool, recipient: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM private_notifications n WHERE n.recipient_did = $1 AND {kept} \
+           AND n.indexed_at > COALESCE((SELECT seen_at FROM private_notification_seen WHERE did = $1), '-infinity') \
+           AND CASE WHEN split_part(n.record_uri, '/', 4) = '{post_private}' \
+                 THEN EXISTS (SELECT 1 FROM {PREFILTER_FROM} WHERE p.uri = n.record_uri AND {pre}) \
+                 ELSE EXISTS (SELECT 1 FROM private_posts s WHERE s.uri = n.reason_subject) END",
+        kept = notification_kept(),
+        post_private = crate::firehose::classifier::NSID_POST_PRIVATE,
+        pre = prefilter(),
+    ))
+    .bind(recipient)
+    .fetch_one(pool)
+    .await
+}

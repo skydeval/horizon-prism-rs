@@ -335,6 +335,9 @@ mod tests {
                         cid: "bafy".into(),
                         rev: "3kaaaaaaaaaa2".into(),
                         record: json!({"text": "t"}),
+                        source: crate::firehose::writer::WriteSource::Firehose,
+                        created_at: chrono::Utc::now(),
+                        notify_max_age: chrono::Duration::hours(48),
                     },
                 )
                 .await

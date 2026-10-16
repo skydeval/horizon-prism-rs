@@ -12,6 +12,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 
 use super::actor::ProfileKind;
+use super::normalize::is_private_uri;
 use super::{Hydrator, ViewError, ViewResult, Viewer, ts};
 use crate::xrpc::pools::Requester;
 
@@ -36,7 +37,16 @@ fn parse_cursor(c: Option<&str>) -> (Option<DateTime<Utc>>, i64) {
 //   §4.3 "List purpose"): as a full mute, and as a direct block.
 // - Muted threads: the notification's record or its subject post is the
 //   muted root, or a post under it.
-const EXCLUSIONS: &str = "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did \
+// - A row naming a private post (private posting §4.8, #717): its subject
+//   is one, by collection, or its record is a like or repost of one. Such
+//   rows were written in On or Filling before the writer stopped writing
+//   them; they age out with retention.
+const EXCLUSIONS: &str = "NOT COALESCE(n.reason_subject LIKE 'at://%/tools.kryphocron.feed.postPrivate/%', false) \
+     AND NOT EXISTS (SELECT 1 FROM likes l WHERE l.uri = n.record_uri \
+                     AND l.subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%') \
+     AND NOT EXISTS (SELECT 1 FROM reposts l WHERE l.uri = n.record_uri \
+                     AND l.subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%') \
+     AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did \
        AND (m.scope = 'full' \
          OR (m.scope IN ('reposts', 'reposts_and_quotes') AND n.reason IN ('repost', 'repost-via-repost')) \
          OR (m.scope IN ('quotes', 'reposts_and_quotes') AND n.reason = 'quote'))) \
@@ -234,6 +244,14 @@ impl Hydrator {
                 || (who.muted_quotes.contains(&r.author_did) && r.reason == "quote")
                 || muted_threads.contains(&r.record_uri)
                 || r.reason_subject.as_ref().is_some_and(|s| muted_threads.contains(s))
+                // A row naming a private post (#717; private posting §4.8),
+                // as `EXCLUSIONS` leaves it out of the count.
+                || r.reason_subject.as_deref().is_some_and(is_private_uri)
+                || records
+                    .get(&r.record_uri)
+                    .and_then(|record| record.pointer("/subject/uri"))
+                    .and_then(Value::as_str)
+                    .is_some_and(is_private_uri)
         };
         let notifications: Vec<Value> = rows
             .iter()

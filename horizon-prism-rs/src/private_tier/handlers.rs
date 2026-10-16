@@ -21,7 +21,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-use super::emit::{BookmarkView, PrivateEmit, PrivateResponse, QuoteItem, ThreadNode, ThreadParent};
+use super::emit::{
+    BookmarkView, NotificationRecord, NotificationView, PrivateEmit, PrivateResponse, QuoteItem, ThreadNode, ThreadParent,
+};
 use super::pipeline::{self, PipelineEnv, RequestState};
 use super::schema::{self, Interaction};
 use super::cursor as sealed;
@@ -48,6 +50,9 @@ pub const GET_BOOKMARKS: &str = "app.nearhorizon.private.getBookmarks";
 pub const GET_LIKES: &str = "app.nearhorizon.private.getLikes";
 pub const GET_REPOSTED_BY: &str = "app.nearhorizon.private.getRepostedBy";
 pub const GET_QUOTES: &str = "app.nearhorizon.private.getQuotes";
+pub const LIST_NOTIFICATIONS: &str = "app.nearhorizon.private.listNotifications";
+pub const GET_UNREAD_COUNT: &str = "app.nearhorizon.private.getUnreadCount";
+pub const UPDATE_SEEN: &str = "app.nearhorizon.private.updateSeen";
 
 /// Metric: handler time before the floor.
 const METRIC_UNFLOORED: &str = "private_read_unfloored_seconds";
@@ -67,6 +72,8 @@ pub struct Floors {
     pub get_likes: Duration,
     pub get_reposted_by: Duration,
     pub get_quotes: Duration,
+    pub list_notifications: Duration,
+    pub get_unread_count: Duration,
 }
 
 /// State for the private router.
@@ -118,6 +125,8 @@ impl PrivateState {
                 get_likes: Duration::from_millis(cfg.floor_ms.get_likes),
                 get_reposted_by: Duration::from_millis(cfg.floor_ms.get_reposted_by),
                 get_quotes: Duration::from_millis(cfg.floor_ms.get_quotes),
+                list_notifications: Duration::from_millis(cfg.floor_ms.list_notifications),
+                get_unread_count: Duration::from_millis(cfg.floor_ms.get_unread_count),
             },
             concurrency: usize::try_from(cfg.bind_concurrency).unwrap_or(8).max(1),
             bookmarks_max,
@@ -143,6 +152,9 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(GET_LIKES), get(get_likes))
         .route(&xrpc(GET_REPOSTED_BY), get(get_reposted_by))
         .route(&xrpc(GET_QUOTES), get(get_quotes))
+        .route(&xrpc(LIST_NOTIFICATIONS), get(list_notifications))
+        .route(&xrpc(GET_UNREAD_COUNT), get(get_unread_count))
+        .route(&xrpc(UPDATE_SEEN), post(update_seen))
         .with_state(state)
 }
 
@@ -1327,6 +1339,182 @@ async fn quotes_body(
         .collect();
     decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::quotes(uri.to_string(), items, cursor))
+}
+
+/// The `indexed_at::id` cursor of a notification page (plain: it walks the
+/// caller's own rows, private posting §3.6).
+fn notification_cursor(c: Option<&str>) -> Result<Option<(DateTime<Utc>, i64)>, XrpcError> {
+    let Some((at, id)) = parse_cursor(c)? else {
+        return Ok(None);
+    };
+    let id = id.parse().map_err(|_| XrpcError::invalid("Error: malformed cursor"))?;
+    Ok(Some((at, id)))
+}
+
+/// `app.nearhorizon.private.listNotifications {limit 1-100 default 50,
+/// cursor, reasons?}` (private posting §4.8) → `{notifications, cursor?,
+/// seenAt?}`, each item in the shape of
+/// `app.bsky.notification.listNotifications#notification`:
+/// 1. the caller's rows are scanned, newest first, with the `reasons`
+///    filter and the plain `indexed_at::id` cursor;
+/// 2. after the scan, a row is dropped for a block either way with its
+///    author (`blocks` and `private_blocks`), a mute of its author (full,
+///    or scoped by reason), a moderation list that applies, or a muted
+///    thread;
+/// 3. a row from a private post reads the post through the pipeline for
+///    the caller: a miss drops it, and `record` is the decoded record;
+/// 4. a row from a member's public record carries that record (a post's
+///    as stored, a like or repost rebuilt from its row), and is dropped
+///    once its subject private post is no longer stored.
+///
+/// Notification preferences are not applied; `reasons` filters (C-13). The
+/// cursor follows the scan, so a page may be short. Floored
+/// (`list_notifications`).
+pub async fn list_notifications(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, peer, LIST_NOTIFICATIONS).await?;
+    let p = Params::parse(q.as_deref());
+    let limit = page_limit(&p)?;
+    let after = notification_cursor(p.one("cursor"))?;
+    let reasons = p.all("reasons");
+    let ip = request_ip(&s.app, &headers, peer);
+    let result = notifications_body(&s, &caller, ip, limit, after, &reasons, start).await;
+    floor("listNotifications", start, s.floors.list_notifications).await;
+    result.map(ok)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn notifications_body(
+    s: &PrivateState,
+    caller: &VerifiedCaller,
+    ip: IpAddr,
+    limit: usize,
+    after: Option<(DateTime<Utc>, i64)>,
+    reasons: &[String],
+    start: Instant,
+) -> Result<PrivateResponse, XrpcError> {
+    let pool = &s.env.pool;
+    let me = caller.did.as_str();
+    let rows = schema::notification_rows(pool, me, after, reasons, i64::try_from(limit).unwrap_or(i64::MAX)).await?;
+    let next = (rows.len() == limit)
+        .then(|| rows.last().map(|r| cursor(r.indexed_at, &r.id.to_string())))
+        .flatten();
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let kept: HashSet<i64> = schema::notifications_kept(pool, me, &ids).await?.into_iter().collect();
+    let rows: Vec<schema::NotificationRow> = rows.into_iter().filter(|r| kept.contains(&r.id)).collect();
+    let hydration = private_hydration(s, caller, ip).await?;
+
+    // Rows from a private post: each post read for the caller, after the
+    // prefilter narrows them (§2 rule 1).
+    let post_uris: Vec<String> = rows.iter().filter(|r| r.is_from_private_post()).map(|r| r.record_uri.clone()).collect();
+    let passing: HashSet<String> = schema::prefilter_uris(pool, me, &post_uris).await?.into_iter().collect();
+    let candidates: Vec<String> = post_uris.into_iter().filter(|u| passing.contains(u)).collect();
+    let authors = profiles(&hydration, &candidates).await?;
+    let rs = RequestState::new(s.env.max_head_fetches);
+    let mut posts: Vec<PrivateEmit<Value>> = read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
+    let mut refs: Vec<&mut PrivateEmit<Value>> = posts.iter_mut().collect();
+    operator_labels(&hydration, &mut refs).await?;
+    let mut hits: HashMap<String, Vec<PrivateEmit<Value>>> = HashMap::new();
+    for post in posts {
+        if let Some(uri) = view_uri(&post) {
+            hits.entry(uri).or_default().push(post);
+        }
+    }
+
+    // Rows from a public record: the subject must still be stored.
+    let public: Vec<&schema::NotificationRow> = rows.iter().filter(|r| !r.is_from_private_post()).collect();
+    let subjects: Vec<String> = public.iter().filter_map(|r| r.reason_subject.clone()).collect();
+    let stored: HashSet<String> = schema::stored_posts(pool, &subjects).await?.into_iter().collect();
+    let rebuild: Vec<String> = public.iter().filter(|r| r.public_record.is_none()).map(|r| r.record_uri.clone()).collect();
+    let mut records: HashMap<String, Value> = HashMap::new();
+    for (kind, ty) in [(Interaction::Like, "app.bsky.feed.like"), (Interaction::Repost, "app.bsky.feed.repost")] {
+        for (uri, subject, cid, created) in schema::interaction_records(pool, kind, &rebuild).await? {
+            let record = json!({"$type": ty, "subject": {"uri": subject, "cid": cid.unwrap_or_default()}, "createdAt": ts(created)});
+            records.insert(uri, record);
+        }
+    }
+    let public_uris: Vec<String> = public.iter().map(|r| r.record_uri.clone()).collect();
+    let labels = hydration.labels(&public_uris).await?;
+
+    let mut dids: Vec<String> = Vec::new();
+    for r in &rows {
+        if !dids.contains(&r.author_did) {
+            dids.push(r.author_did.clone());
+        }
+    }
+    let actors = hydration.profiles(&dids).await?;
+    let seen = schema::notification_seen(pool, me).await?;
+    let mut notifications: Vec<NotificationView> = Vec::new();
+    for r in rows {
+        let record = if r.is_from_private_post() {
+            match hits.get_mut(&r.record_uri).and_then(Vec::pop) {
+                Some(post) => NotificationRecord::Private(post),
+                None => continue,
+            }
+        } else {
+            if !r.reason_subject.as_ref().is_some_and(|s| stored.contains(s)) {
+                continue;
+            }
+            let Some(record) = r.public_record.clone().or_else(|| records.get(&r.record_uri).cloned()) else {
+                continue;
+            };
+            NotificationRecord::Public {
+                labels: json!(labels.get(&r.record_uri).cloned().unwrap_or_default()),
+                uri: r.record_uri,
+                cid: r.record_cid,
+                record,
+            }
+        };
+        notifications.push(NotificationView {
+            record,
+            author: actors.view(&r.author_did, ProfileKind::View),
+            reason: r.reason,
+            reason_subject: r.reason_subject,
+            is_read: seen.is_some_and(|at| r.indexed_at <= at),
+            indexed_at: ts(r.indexed_at),
+        });
+    }
+    Ok(PrivateResponse::notifications(notifications, next, seen.map(ts)))
+}
+
+/// `app.nearhorizon.private.getUnreadCount` (private posting §4.8) →
+/// `{count}`: the caller's rows after its last-seen time, under the list's
+/// exclusions, counting a private post's row only when the post passes the
+/// prefilter for the caller, and a public record's only while its subject
+/// is stored. Floored (`get_unread_count`): the scan's time depends on rows
+/// the caller cannot read.
+pub async fn get_unread_count(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, XrpcError> {
+    let start = Instant::now();
+    let caller = prepare_private(&s.app, &headers, peer, GET_UNREAD_COUNT).await?;
+    let result = schema::unread_count(&s.env.pool, &caller.did).await;
+    floor("getUnreadCount", start, s.floors.get_unread_count).await;
+    Ok(ok(PrivateResponse::unread_count(result?)))
+}
+
+/// `app.nearhorizon.private.updateSeen {seenAt}` → `{}`: the caller's
+/// last-seen time moves to `GREATEST(stored, seenAt)`, clamped to now, as
+/// the public method does. No floor: nothing here depends on a post.
+pub async fn update_seen(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private(&s.app, &headers, peer, UPDATE_SEEN).await?;
+    let input = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let seen_at = DateTime::parse_from_rfc3339(field(&input, "seenAt")?)
+        .map_err(|_| XrpcError::invalid("Error: seenAt must be a datetime"))?;
+    schema::update_seen(&s.env.pool, &caller.did, seen_at.with_timezone(&Utc)).await?;
+    Ok(ok(PrivateResponse::empty()))
 }
 
 #[cfg(test)]

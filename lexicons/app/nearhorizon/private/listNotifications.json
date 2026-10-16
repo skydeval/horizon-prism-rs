@@ -1,0 +1,61 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.listNotifications",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List the requester's private notifications, newest first. They come from private posts (reply, quote, mention: the uri and record are the private post, read for the requester as getPosts reads it, and omitted when the requester may not read it) and from community members' public records naming one of the requester's private posts (like and repost of it; quote and reply: the uri and record are the public post). reasonSubject is always one of the requester's own posts. Authors the requester blocks, is blocked by or mutes, and threads the requester muted, are left out. Notification preferences do not apply; reasons filters. Requires auth by a ready community member.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "reasons": {
+            "type": "array",
+            "description": "Notification reasons to include (like, repost, reply, quote, mention). All when absent.",
+            "items": { "type": "string" }
+          },
+          "limit": {
+            "type": "integer",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor from a previous response."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["notifications"],
+          "properties": {
+            "notifications": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "app.bsky.notification.listNotifications#notification"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Present when more of the requester's notifications may follow. It walks the requester's notifications, so a page may hold fewer than limit items, or none, and still carry a cursor."
+            },
+            "seenAt": { "type": "string", "format": "datetime" }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

@@ -10,7 +10,8 @@
 //!   - `private_audiences`: owner out of scope;
 //!   - `private_blocks`: author out of scope, unless the subject is a member
 //!     or the author is a private owner (§9.3 rule 3).
-//! - Class T: `private_tombstones` older than `retention.tombstone_days`.
+//! - Class T: `private_tombstones` older than `retention.tombstone_days`;
+//!   `private_notifications` older than `retention.notification_days`.
 //! - Every DID that lost `private_posts`/`private_audiences` rows is
 //!   re-evaluated as an owner in the same transaction as its last batch, and
 //!   the in-memory owner set follows after commit.
@@ -196,6 +197,30 @@ impl RetentionTask for PrivateRetention {
             metrics::counter!(METRIC_DELETED_ROWS, "table" => "private_tombstones").increment(tombstones);
         }
         report.deleted.push(("private_tombstones", tombstones));
+        // Class T: private notifications, on the public ones' clock
+        // (private posting §3.1).
+        let mut notifications = 0u64;
+        loop {
+            let guard = scope.read().await;
+            let n = sqlx::query(&format!(
+                "DELETE FROM private_notifications WHERE id IN (SELECT id FROM private_notifications \
+                 WHERE indexed_at < now() - make_interval(days => $1) LIMIT {BATCH_SIZE})"
+            ))
+            .bind(i32::try_from(settings.notification_days).unwrap_or(i32::MAX))
+            .execute(pool)
+            .await?
+            .rows_affected();
+            drop(guard);
+            notifications += n;
+            if n < BATCH_SIZE {
+                break;
+            }
+            tokio::time::sleep(BATCH_PAUSE).await;
+        }
+        if notifications > 0 {
+            metrics::counter!(METRIC_DELETED_ROWS, "table" => "private_notifications").increment(notifications);
+        }
+        report.deleted.push(("private_notifications", notifications));
         Ok(report)
     }
 }

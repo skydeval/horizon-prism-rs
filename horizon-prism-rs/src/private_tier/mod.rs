@@ -46,6 +46,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
+use crate::firehose::writer::WriteSource;
+
 /// A private-tier record op that passed admission (§9.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrivateOp {
@@ -60,6 +62,45 @@ pub struct PrivateOp {
     pub rev: String,
     /// The record as received; `firehose::normalize` helpers decode its fields.
     pub record: serde_json::Value,
+    /// The write path (private posting §4.8): only the live firehose
+    /// notifies for a record of any age.
+    pub source: WriteSource,
+    /// The record's `createdAt` as `records::created_at` parses it.
+    pub created_at: DateTime<Utc>,
+    /// `private_notify.backfill_max_age_hours` (C-11): a write that is not
+    /// live notifies only for a record created within it.
+    pub notify_max_age: chrono::Duration,
+}
+
+/// Whether a write notifies (private posting §4.8, C-11): a live firehose
+/// write always does; any other source (backfill, catch-up, `requestRecord`,
+/// dead-letter replay) only for a record created within `max_age`.
+#[must_use]
+pub fn notifies(source: WriteSource, created_at: DateTime<Utc>, max_age: chrono::Duration) -> bool {
+    source == WriteSource::Firehose || Utc::now().signed_duration_since(created_at) <= max_age
+}
+
+/// A public record naming a private post (private posting §4.8), as the
+/// writer hands it to [`PrivateTier::notify_public`]: a like or repost of a
+/// private post, or a public post replying to or quoting one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublicNotify {
+    /// The like, repost or `app.bsky.feed.post`.
+    pub record_uri: String,
+    pub record_cid: String,
+    pub author_did: String,
+    /// `(reason, subject)` in precedence order, each subject a `postPrivate`
+    /// URI: `like` or `repost`; or `reply` (parent, then root) and `quote`.
+    /// The recipient is the subject's author.
+    pub reasons: Vec<(&'static str, String)>,
+    /// The thread root the post claims, for thread mutes.
+    pub record_root: Option<String>,
+    /// A post's record, kept with the row: under the off rule no `posts`
+    /// row exists to rebuild it from. `None` for a like or repost.
+    pub public_record: Option<serde_json::Value>,
+    pub source: WriteSource,
+    pub created_at: DateTime<Utc>,
+    pub notify_max_age: chrono::Duration,
 }
 
 /// A member's public post and the private post it quotes (private posting
@@ -115,6 +156,8 @@ pub const FEATURES: &[&str] = &[
     // P-2 counts and viewer state, P-5 likes, reposts, quotes and repost
     // reasons, P-16 thread mutes (S5).
     "private.interactions",
+    // P-9 private notifications (S6).
+    "private.notifications",
     // Rule 4's anchored walk (S0, listed from S1).
     "private.crossPdsReplies",
 ];
@@ -172,6 +215,16 @@ pub trait PrivateTier: Send + Sync {
     /// `ingest::delete_quote_ref`: a public post's delete takes its quote
     /// reference with it, by rev, as `member_post_refs`.
     async fn delete_quote_ref(&self, conn: &mut PgConnection, uri: &str, rev: &str) -> Result<(), sqlx::Error>;
+
+    /// `ingest::notify_public` (private posting §4.8): the private
+    /// notifications of a member's public record naming a private post, on
+    /// the op's own connection, in every public-indexing mode. Each
+    /// recipient is a member other than the author.
+    async fn notify_public(&self, conn: &mut PgConnection, n: &PublicNotify) -> Result<(), sqlx::Error>;
+
+    /// `ingest::delete_notifications`: the private notifications of a
+    /// deleted public record, on the op's own connection and savepoint.
+    async fn delete_notifications(&self, conn: &mut PgConnection, record_uri: &str) -> Result<(), sqlx::Error>;
 
     /// `readiness::clear_all`: the gap transaction's owner-readiness wipe (§6.11.4).
     async fn clear_all_readiness(&self, conn: &mut PgConnection) -> Result<(), sqlx::Error>;
@@ -279,6 +332,14 @@ impl PrivateTier for KryphocronPrivateTier {
 
     async fn delete_quote_ref(&self, conn: &mut PgConnection, uri: &str, rev: &str) -> Result<(), sqlx::Error> {
         ingest::delete_quote_ref(conn, uri, rev).await
+    }
+
+    async fn notify_public(&self, conn: &mut PgConnection, n: &PublicNotify) -> Result<(), sqlx::Error> {
+        ingest::notify_public(conn, n).await
+    }
+
+    async fn delete_notifications(&self, conn: &mut PgConnection, record_uri: &str) -> Result<(), sqlx::Error> {
+        ingest::delete_notifications(conn, record_uri).await
     }
 
     async fn clear_all_readiness(&self, conn: &mut PgConnection) -> Result<(), sqlx::Error> {
@@ -404,6 +465,14 @@ impl PrivateTier for DisabledPrivateTier {
     }
 
     async fn delete_quote_ref(&self, _conn: &mut PgConnection, _uri: &str, _rev: &str) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    async fn notify_public(&self, _conn: &mut PgConnection, _n: &PublicNotify) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    async fn delete_notifications(&self, _conn: &mut PgConnection, _record_uri: &str) -> Result<(), sqlx::Error> {
         Ok(())
     }
 

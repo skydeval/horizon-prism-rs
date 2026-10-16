@@ -1,0 +1,30 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getUnreadCount",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Count the requester's private notifications newer than its last updateSeen, under the exclusions listNotifications applies. A notification from a private post the requester may not read, or about a private post that no longer exists, is not counted. Requires auth by a ready community member.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["count"],
+          "properties": {
+            "count": { "type": "integer" }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

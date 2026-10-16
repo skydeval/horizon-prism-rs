@@ -182,6 +182,8 @@ impl Fixture {
                 get_likes: ms,
                 get_reposted_by: ms,
                 get_quotes: ms,
+                list_notifications: ms,
+                get_unread_count: ms,
             },
         };
         PrivateState::new(
@@ -902,6 +904,15 @@ async fn unanchored_cross_owner_posts(test: &str, layout: Layout) {
             w.failures.push(format!("T-38 counts for {reader}: replies to T {replies}, Alice's quoteCount {quotes:?}"));
         }
     }
+    // T-38's unread counts (S6): Bob's quote of Alice's root writes her a
+    // `quote` row, which she cannot read, so it counts nowhere; her one
+    // unread row is Bob's reply in her thread.
+    for (reader, expected) in [(ALICE, 1), (BOB, 0), (CAROL, 0), (DAVE, 0)] {
+        let unread = schema::unread_count(&w.f.pool, reader).await.expect("count");
+        if unread != expected {
+            w.failures.push(format!("T-38 unread count for {reader}: {unread}, expected {expected}"));
+        }
+    }
     w.finish().await;
 }
 
@@ -1053,9 +1064,10 @@ enum Middle {
     Throttled,
 }
 
-/// Dave's `getPosts([R])`, `getPostThread(R)` and timeline, as bytes, and
+/// Dave's `getPosts([R])`, `getPostThread(R)` and timeline, as bytes,
 /// (private posting S5) `getPosts([T])` with T's `replyCount` and
-/// `quoteCount`.
+/// `quoteCount`, and (S6) his private `listNotifications` and
+/// `getUnreadCount` after R mentions him.
 async fn reader_outputs(w: &Walk, r: &str) -> Vec<(u16, String)> {
     let mut out = Vec::new();
     for (method, query) in [
@@ -1063,6 +1075,8 @@ async fn reader_outputs(w: &Walk, r: &str) -> Vec<(u16, String)> {
         (THREAD, format!("uri={r}")),
         (TIMELINE, String::new()),
         (POSTS, format!("uris={}", w.root)),
+        (LIST_NOTIFICATIONS, String::new()),
+        (GET_UNREAD_COUNT, String::new()),
     ] {
         let (status, body, _) = get(&w.base, method, &query, DAVE, DAVE_KEY).await;
         out.push((status, body));
@@ -1094,7 +1108,12 @@ async fn pair_two(test: &str, middle: Middle) {
     m_record["embed"] = json!({"$type": "app.bsky.embed.record", "record": {"uri": w.root, "cid": "bafyroot"}});
     w.f.ingest(BOB, NSID_POST_PRIVATE, "3kmiddle2222", m_record).await;
     let m = format!("at://{BOB}/{NSID_POST_PRIVATE}/3kmiddle2222");
-    let r = w.reply(CAROL, "3kleaf222222", &m).await;
+    // R mentions Dave, so his notifications would hold it if he could read
+    // it (S6).
+    let mut r_record = w.f.post_record(CAROL, "3kleaf222222", &w.aud, Some((&w.root, &m))).await;
+    r_record["facets"] = json!([mention(DAVE)]);
+    w.f.ingest(CAROL, NSID_POST_PRIVATE, "3kleaf222222", r_record).await;
+    let r = format!("at://{CAROL}/{NSID_POST_PRIVATE}/3kleaf222222");
     match middle {
         Middle::BlocksReader => exec(&w.f.pool, &block_sql(BOB, DAVE)).await,
         Middle::Takedown => exec(&w.f.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{m}', '!takedown')")).await,
@@ -1123,6 +1142,11 @@ async fn pair_two(test: &str, middle: Middle) {
         w.failures.push(format!("(a): T's (replyCount, quoteCount) for Dave {counts:?}"));
     }
     let with_m = reader_outputs(&w, &r).await;
+    // R's mention of Dave is neither listed nor counted (S6).
+    let notified = (with_m[4].1.as_str(), with_m[5].1.as_str());
+    if notified != (r#"{"notifications":[]}"#, r#"{"count":0}"#) {
+        w.failures.push(format!("(a): Dave's notifications show R: {notified:?}"));
+    }
     // (b): M does not exist.
     w.f.apply_op(BOB, Action::Delete, NSID_POST_PRIVATE, "3kmiddle2222", REV2, None).await;
     w.expect("(b) R's author", CAROL, &r, true).await;
@@ -2022,7 +2046,7 @@ async fn private_router_methods_are_routed_in_every_mode() {
         .copied()
         .filter(|(n, _)| n.starts_with("app.nearhorizon.private."))
         .collect();
-    assert_eq!(methods.len(), 6);
+    assert_eq!(methods.len(), 9);
     for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
         set_mode(app.hydrator.scope(), mode).await;
         for &(nsid, verb) in &methods {
@@ -2044,7 +2068,9 @@ async fn private_router_methods_are_routed_in_every_mode() {
             // A ready member is served.
             let status = match verb {
                 crate::honest_501::Verb::Get => get(&base, nsid, &format!("uri={uri}"), BOB, BOB_KEY).await.0,
-                crate::honest_501::Verb::Post => post(&base, nsid, &json!({"uri": uri, "cid": "bafy"}), BOB).await.0,
+                crate::honest_501::Verb::Post => {
+                    post(&base, nsid, &json!({"uri": uri, "cid": "bafy", "seenAt": "2026-10-01T00:00:00Z"}), BOB).await.0
+                }
             };
             assert_eq!(status, 200, "{mode:?} {nsid}");
         }
@@ -2737,4 +2763,400 @@ async fn private_repost_items_on() {
 #[tokio::test]
 async fn private_repost_items_off() {
     repost_items_in(PublicMode::Off, "s5-reposts-off").await;
+}
+
+const LIST_NOTIFICATIONS: &str = "app.nearhorizon.private.listNotifications";
+const GET_UNREAD_COUNT: &str = "app.nearhorizon.private.getUnreadCount";
+const UPDATE_SEEN: &str = "app.nearhorizon.private.updateSeen";
+
+/// A private notification row as the tests compare it: reason, author,
+/// subject, record, and whether it holds the public record.
+type NotifiedRow = (String, String, Option<String>, String, bool);
+
+fn notified(reason: &str, author: &str, subject: Option<&String>, record: &str, public_record: bool) -> NotifiedRow {
+    (reason.into(), author.into(), subject.cloned(), record.into(), public_record)
+}
+
+/// `recipient`'s private notification rows, in the order they were written.
+async fn private_rows(pool: &PgPool, recipient: &str) -> Vec<NotifiedRow> {
+    sqlx::query_as(
+        "SELECT reason, author_did, reason_subject, record_uri, public_record IS NOT NULL FROM private_notifications \
+         WHERE recipient_did = $1 ORDER BY id",
+    )
+    .bind(recipient)
+    .fetch_all(pool)
+    .await
+    .expect("rows")
+}
+
+/// A public post replying to `parent` (its own root), made at `at`,
+/// mentioning `mentioned` when given.
+fn public_reply(parent: &str, at: &str, mentioned: Option<&str>) -> Value {
+    let mut record = json!({"$type": PUBLIC_POST, "text": "replying", "createdAt": at,
+        "reply": {"root": {"uri": parent, "cid": "bafyroot"}, "parent": {"uri": parent, "cid": "bafyparent"}}});
+    if let Some(did) = mentioned {
+        record["facets"] = json!([mention(did)]);
+    }
+    record
+}
+
+/// `who`'s public `listNotifications`, from the hydrator.
+async fn public_notifications(f: &Fixture, who: &str) -> Vec<Value> {
+    let viewer = crate::hydration::Viewer {
+        did: Some(who.into()),
+        hydrate: true,
+    };
+    let page = f
+        .app
+        .hydrator
+        .list_notifications(&viewer, &crate::xrpc::pools::Requester::test(), 100, None, &[])
+        .await
+        .expect("db")
+        .expect("view");
+    page.inner()["notifications"].as_array().cloned().unwrap_or_default()
+}
+
+/// `who`'s public `getUnreadCount`, from the hydrator.
+async fn public_unread(f: &Fixture, who: &str) -> i64 {
+    let viewer = crate::hydration::Viewer {
+        did: Some(who.into()),
+        hydrate: true,
+    };
+    f.app.hydrator.unread_count(&viewer).await.expect("db").expect("view").inner()["count"].as_i64().expect("count")
+}
+
+/// The fields of a public notification Prism derives (T-15): `uri`,
+/// `reasonSubject`, `record.subject.uri` and `record.via.uri`.
+fn derived_uris(n: &Value) -> Vec<String> {
+    [&n["uri"], &n["reasonSubject"], &n["record"]["subject"]["uri"], &n["record"]["via"]["uri"]]
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// No member's public notifications name a private post in a field Prism
+/// derives, and no member's public unread count counts one.
+async fn no_public_notification_names_a_private_post(f: &Fixture, case: &str) {
+    for who in [ALICE, BOB, CAROL, DAVE] {
+        for n in public_notifications(f, who).await {
+            for uri in derived_uris(&n) {
+                assert!(!crate::hydration::normalize::is_private_uri(&uri), "{case}: {who}'s public notification names {uri}: {n}");
+            }
+        }
+    }
+}
+
+/// T-15 (P-9 writes), T-17's notify half and chainlink #717, in On and in
+/// Off (T-1). Alice's post T is under her `list` audience of Bob, Carol and
+/// Dave; Eve is no member.
+/// - Private posts notify: a reply its parent's and its claimed root's
+///   authors, a quote the quoted post's author, a mention the mentioned
+///   member; never a non-member.
+/// - Members' public likes, reposts, quotes and replies of T notify Alice
+///   privately, in every mode; a quote or reply keeps its public record. A
+///   non-member's notify nobody. No `like-via-repost` is written.
+/// - In On, no public notification names T in a field Prism derives, and
+///   public rows left from before S6 that name it are neither listed nor
+///   counted (#717). A public record's own content is left as written.
+/// - A muted thread writes nothing; deletes remove rows; a 3-day-old like
+///   written by backfill, catch-up or `requestRecord` writes nothing.
+async fn notification_writes_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL, DAVE]).await;
+    let t = f.private_post(ALICE, "3ktpost22222", &aud, None).await;
+
+    // From private posts.
+    let r1 = f.private_post(BOB, "3kreplybob22", &aud, Some((&t, &t))).await;
+    let r2 = f.private_post(CAROL, "3kreplycar22", &aud, Some((&t, &r1))).await;
+    let m = f.post_with(BOB, "3kmention222", &aud, json!({"facets": [mention(CAROL), mention(EVE)]})).await;
+    let q = f.post_with(DAVE, "3kquote22222", &aud, quote_of(&t)).await;
+    let eve_post = format!("at://{EVE}/{PUBLIC_POST}/3kevepost222");
+    f.private_post(BOB, "3kreplyeve22", &aud, Some((&eve_post, &eve_post))).await;
+    assert_eq!(
+        private_rows(&f.pool, ALICE).await,
+        [notified("reply", BOB, Some(&t), &r1, false), notified("reply", CAROL, Some(&t), &r2, false), notified("quote", DAVE, Some(&t), &q, false)]
+    );
+    assert_eq!(private_rows(&f.pool, BOB).await, [notified("reply", CAROL, Some(&r1), &r2, false)]);
+    assert_eq!(private_rows(&f.pool, CAROL).await, [notified("mention", BOB, None, &m, false)]);
+    assert!(private_rows(&f.pool, EVE).await.is_empty(), "a non-member is never notified");
+
+    // From public records naming T.
+    let at = "2026-10-01T10:00:00Z";
+    f.ingest(BOB, LIKE, "3klikebob222", subject_record(LIKE, &t, at)).await;
+    f.ingest(BOB, REPOST, "3krepostbob2", subject_record(REPOST, &t, at)).await;
+    let (bob_like, bob_repost) = (format!("at://{BOB}/{LIKE}/3klikebob222"), format!("at://{BOB}/{REPOST}/3krepostbob2"));
+    let mut through = subject_record(LIKE, &t, at);
+    through["via"] = json!({"uri": bob_repost, "cid": "bafy3krepostbob2"});
+    f.ingest(CAROL, LIKE, "3klikecarol2", through).await;
+    let carol_like = format!("at://{CAROL}/{LIKE}/3klikecarol2");
+    f.ingest(BOB, PUBLIC_POST, "3kpubquote22", public_quote(&t, at)).await;
+    f.ingest(BOB, PUBLIC_POST, "3kpubreply22", public_reply(&t, at, Some(CAROL))).await;
+    let (bob_quote, bob_reply) = (format!("at://{BOB}/{PUBLIC_POST}/3kpubquote22"), format!("at://{BOB}/{PUBLIC_POST}/3kpubreply22"));
+    f.ingest(EVE, LIKE, "3klikeeve222", subject_record(LIKE, &t, at)).await;
+    f.ingest(EVE, REPOST, "3krepeve2222", subject_record(REPOST, &t, at)).await;
+    f.ingest(EVE, PUBLIC_POST, "3kevereply22", public_reply(&t, at, None)).await;
+    let from_public = [
+        notified("like", BOB, Some(&t), &bob_like, false),
+        notified("repost", BOB, Some(&t), &bob_repost, false),
+        notified("like", CAROL, Some(&t), &carol_like, false),
+        notified("quote", BOB, Some(&t), &bob_quote, true),
+        notified("reply", BOB, Some(&t), &bob_reply, true),
+    ];
+    assert_eq!(private_rows(&f.pool, ALICE).await[3..], from_public, "{mode:?}");
+    assert_eq!(private_rows(&f.pool, BOB).await.len(), 1, "no via reason is written");
+    let stored: Value = sqlx::query_scalar("SELECT public_record FROM private_notifications WHERE record_uri = $1")
+        .bind(&bob_reply)
+        .fetch_one(&f.pool)
+        .await
+        .expect("record");
+    assert_eq!(stored["reply"]["parent"]["uri"], t.as_str(), "the public record as written");
+
+    // #717: no public row names T, written or hydrated.
+    let (written, via): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE reason_subject LIKE '%/tools.kryphocron.feed.postPrivate/%'), \
+           count(*) FILTER (WHERE reason IN ('like-via-repost', 'repost-via-repost')) FROM notifications",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .expect("count");
+    assert_eq!((written, via), (0, 0));
+    no_public_notification_names_a_private_post(&f, "written").await;
+    if mode.is_on() {
+        // Carol's public mention in Bob's public reply is listed, its record
+        // as written, naming T in `record.reply`.
+        let carols = public_notifications(&f, CAROL).await;
+        let mention_row = carols.iter().find(|n| n["reason"] == "mention").expect("Carol's public mention");
+        assert_eq!((mention_row["uri"].as_str(), mention_row["record"]["reply"]["parent"]["uri"].as_str()), (Some(bob_reply.as_str()), Some(t.as_str())));
+    }
+    // Rows left from before S6: one names T as its subject, one is a like
+    // of T through Bob's repost. Neither is listed or counted.
+    let unread_before = (public_unread(&f, ALICE).await, public_unread(&f, BOB).await);
+    sqlx::query(
+        "INSERT INTO notifications (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
+         VALUES ($1, $2, 'like', $3, $4, 'bafy'), ($2, $5, 'like-via-repost', $6, $7, 'bafy')",
+    )
+    .bind(ALICE)
+    .bind(BOB)
+    .bind(&t)
+    .bind(&bob_like)
+    .bind(CAROL)
+    .bind(&bob_repost)
+    .bind(&carol_like)
+    .execute(&f.pool)
+    .await
+    .expect("leftover rows");
+    no_public_notification_names_a_private_post(&f, "leftover").await;
+    assert_eq!((public_unread(&f, ALICE).await, public_unread(&f, BOB).await), unread_before, "leftover rows are not counted");
+    let bobs = public_notifications(&f, BOB).await;
+    assert!(bobs.iter().all(|n| n["reason"] != "like-via-repost"), "{bobs:?}");
+
+    // T-17's notify half: once Alice mutes T, a reply in it notifies her
+    // no more, private or public.
+    let alice = crate::hydration::Viewer {
+        did: Some(ALICE.into()),
+        hydrate: true,
+    };
+    f.app.hydrator.set_thread_mute(&alice, &t, true).await.expect("db").expect("muted");
+    let before = private_rows(&f.pool, ALICE).await;
+    f.private_post(DAVE, "3kreplydave2", &aud, Some((&t, &t))).await;
+    f.private_post(CAROL, "3kreplycar32", &aud, Some((&t, &r1))).await;
+    f.ingest(DAVE, PUBLIC_POST, "3kpubreply32", public_reply(&t, at, None)).await;
+    assert_eq!(private_rows(&f.pool, ALICE).await, before, "a muted thread writes nothing");
+    assert_eq!(private_rows(&f.pool, BOB).await.len(), 2, "Bob did not mute it");
+    f.app.hydrator.set_thread_mute(&alice, &t, false).await.expect("db").expect("unmuted");
+
+    // Deletes take their rows: the public like, repost, quote and reply,
+    // and a private reply (its rows for Alice and Bob).
+    for (collection, rkey) in [(LIKE, "3klikebob222"), (REPOST, "3krepostbob2"), (PUBLIC_POST, "3kpubquote22"), (PUBLIC_POST, "3kpubreply22")] {
+        f.apply_op(BOB, Action::Delete, collection, rkey, REV2, None).await;
+    }
+    f.apply_op(CAROL, Action::Delete, NSID_POST_PRIVATE, "3kreplycar22", REV2, None).await;
+    assert_eq!(
+        private_rows(&f.pool, ALICE).await,
+        [notified("reply", BOB, Some(&t), &r1, false), notified("quote", DAVE, Some(&t), &q, false), notified("like", CAROL, Some(&t), &carol_like, false)]
+    );
+    assert_eq!(private_rows(&f.pool, BOB).await.len(), 1, "only Carol's second reply");
+
+    // C-11: a 3-day-old like written by backfill, catch-up or
+    // `requestRecord` writes nothing; live, or new, it notifies.
+    let old = (Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+    let new = Utc::now().to_rfc3339();
+    for (source, rkey, created) in [
+        (WriteSource::Backfill, "3koldlike001", &old),
+        (WriteSource::CatchUp, "3koldlike002", &old),
+        (WriteSource::IndexRequest, "3koldlike003", &old),
+        (WriteSource::Firehose, "3koldlike004", &old),
+        (WriteSource::Backfill, "3knewlike005", &new),
+    ] {
+        f.apply_from(source, DAVE, Action::Create, LIKE, rkey, REV, Some(subject_record(LIKE, &t, created))).await;
+    }
+    let daves: Vec<String> = private_rows(&f.pool, ALICE).await.into_iter().filter(|r| r.0 == "like" && r.1 == DAVE).map(|r| r.3).collect();
+    assert_eq!(daves, [format!("at://{DAVE}/{LIKE}/3koldlike004"), format!("at://{DAVE}/{LIKE}/3knewlike005")]);
+
+    // The purges take what a member received and what it wrote.
+    let mut conn = f.pool.acquire().await.expect("conn");
+    KryphocronPrivateTier.purge_member_removed_batch(&mut conn, BOB, 100).await.expect("purge");
+    drop(conn);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM private_notifications WHERE recipient_did = $1 OR author_did = $1")
+        .bind(BOB)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count");
+    assert_eq!(left, 0);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_notification_writes_on() {
+    notification_writes_in(PublicMode::On, "s6-writes-on").await;
+}
+
+#[tokio::test]
+async fn private_notification_writes_off() {
+    notification_writes_in(PublicMode::Off, "s6-writes-off").await;
+}
+
+/// `reader`'s private notifications with `query`: the page and the time
+/// taken.
+async fn notifications_of(base: &str, reader: &str, query: &str) -> (Value, Duration) {
+    let (_, page, took) = json_of(base, LIST_NOTIFICATIONS, query, reader).await;
+    (page, took)
+}
+
+async fn unread_of(base: &str, reader: &str) -> i64 {
+    let (_, v, took) = json_of(base, GET_UNREAD_COUNT, "", reader).await;
+    assert!(took >= FLOOR, "getUnreadCount took {took:?}");
+    v["count"].as_i64().expect("count")
+}
+
+/// T-16 (P-9 reads), in On and in Off (T-1).
+/// - A mention in a post the recipient cannot read is neither listed nor
+///   counted; once the post's audience admits the recipient, it is.
+/// - A blocked author, either way and in either block table, is dropped.
+/// - `updateSeen` clamps to now and never moves back; `isRead`, `seenAt`.
+/// - A like of a post its author then deletes, and a member's public reply
+///   naming a private post that never existed, are neither counted nor
+///   listed (review 10).
+/// - `reasons` filters; the cursor walks the caller's rows; floored.
+async fn notification_reads_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL, DAVE]).await;
+    let aud_bob = f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL]).await;
+    let t = f.private_post(ALICE, "3ktpost22222", &aud, None).await;
+    let m = f.post_with(BOB, "3kmention222", &aud_bob, json!({"facets": [mention(DAVE), mention(CAROL)]})).await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    // Dave cannot read Bob's post: his mention is not listed or counted.
+    let (page, took) = notifications_of(&base, DAVE, "").await;
+    assert!(took >= FLOOR, "listNotifications took {took:?}");
+    assert_eq!(page, json!({"notifications": []}));
+    assert_eq!(unread_of(&base, DAVE).await, 0);
+    // Carol can.
+    let (page, _) = notifications_of(&base, CAROL, "").await;
+    let n = &page["notifications"][0];
+    assert_eq!((n["uri"].as_str(), n["reason"].as_str(), n["author"]["did"].as_str()), (Some(m.as_str()), Some("mention"), Some(BOB)));
+    assert_eq!((&n["record"]["text"], &n["isRead"], &n["cid"]), (&json!("3kmention222"), &json!(false), &json!("bafy3kmention222")));
+    assert!(n.get("reasonSubject").is_none() && n["labels"] == json!([]) && n["indexedAt"].is_string(), "{n}");
+    assert_eq!(unread_of(&base, CAROL).await, 1);
+
+    // The audience admits Dave: listed and counted.
+    let widened = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [CAROL, DAVE], "createdAt": "2026-09-26T00:00:00Z"});
+    f.apply_op(BOB, Action::Update, NSID_AUDIENCE, "3kaudbob2222", REV2, Some(widened)).await;
+    f.ready_all().await;
+    let (page, _) = notifications_of(&base, DAVE, "").await;
+    assert_eq!(page["notifications"][0]["uri"], m.as_str(), "{page}");
+    assert_eq!(unread_of(&base, DAVE).await, 1);
+
+    // A blocked author is dropped, either way, public or private block.
+    for sql in [
+        block_sql(DAVE, BOB),
+        block_sql(BOB, DAVE),
+        format!("INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
+                 VALUES ('at://{DAVE}/tools.kryphocron.graph.block/1', '{DAVE}', '{BOB}', '3k', now())"),
+    ] {
+        exec(&f.pool, &sql).await;
+        let (page, _) = notifications_of(&base, DAVE, "").await;
+        assert_eq!(page, json!({"notifications": []}), "{sql}");
+        assert_eq!(unread_of(&base, DAVE).await, 0, "{sql}");
+        exec(&f.pool, "DELETE FROM blocks").await;
+        exec(&f.pool, "DELETE FROM private_blocks").await;
+    }
+    // A full mute drops it too.
+    exec(&f.pool, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{DAVE}', '{BOB}')")).await;
+    assert_eq!(unread_of(&base, DAVE).await, 0);
+    exec(&f.pool, "DELETE FROM mutes").await;
+    assert_eq!(unread_of(&base, DAVE).await, 1);
+
+    // updateSeen clamps to now and never moves back.
+    assert_eq!(post(&base, UPDATE_SEEN, &json!({"seenAt": "2099-01-01T00:00:00Z"}), DAVE).await, (200, "{}".to_string()));
+    assert_eq!(unread_of(&base, DAVE).await, 0);
+    let (page, _) = notifications_of(&base, DAVE, "").await;
+    assert_eq!(page["notifications"][0]["isRead"], true);
+    let seen = page["seenAt"].as_str().expect("seenAt").to_string();
+    assert!(seen.as_str() < "2099", "clamped to now: {seen}");
+    assert_eq!(post(&base, UPDATE_SEEN, &json!({"seenAt": "2000-01-01T00:00:00Z"}), DAVE).await.0, 200);
+    assert_eq!(unread_of(&base, DAVE).await, 0);
+    assert_eq!(notifications_of(&base, DAVE, "").await.0["seenAt"], seen.as_str(), "never moves back");
+    for bad in [json!({}), json!({"seenAt": "yesterday"})] {
+        let (status, body) = post(&base, UPDATE_SEEN, &bad, DAVE).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("InvalidRequest"), "{body}");
+    }
+
+    // Review 10: Dave likes T and Alice deletes T; Bob's public reply names
+    // a private post of Alice's that never existed.
+    f.ingest(DAVE, LIKE, "3klikedave22", subject_record(LIKE, &t, "2026-10-01T10:00:00Z")).await;
+    let ghost = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3knothere222");
+    f.ingest(BOB, PUBLIC_POST, "3kghostreply", public_reply(&ghost, "2026-10-01T11:00:00Z", None)).await;
+    assert_eq!(private_rows(&f.pool, ALICE).await.len(), 2, "both rows are written");
+    let (page, _) = notifications_of(&base, ALICE, "").await;
+    let like = format!("at://{DAVE}/{LIKE}/3klikedave22");
+    assert_eq!(page["notifications"].as_array().map(Vec::len), Some(1), "{page}");
+    let n = &page["notifications"][0];
+    assert_eq!((n["uri"].as_str(), n["reason"].as_str(), n["reasonSubject"].as_str()), (Some(like.as_str()), Some("like"), Some(t.as_str())));
+    assert_eq!(n["record"], json!({"$type": LIKE, "subject": {"uri": t, "cid": "bafysubject"}, "createdAt": "2026-10-01T10:00:00.000Z"}));
+    assert_eq!(unread_of(&base, ALICE).await, 1);
+    // `reasons` filters.
+    assert_eq!(notifications_of(&base, ALICE, "reasons=reply").await.0, json!({"notifications": []}));
+    assert_eq!(notifications_of(&base, ALICE, "reasons=like&reasons=reply").await.0["notifications"].as_array().map(Vec::len), Some(1));
+    f.apply_op(ALICE, Action::Delete, NSID_POST_PRIVATE, "3ktpost22222", REV2, None).await;
+    assert_eq!(notifications_of(&base, ALICE, "").await.0, json!({"notifications": []}));
+    assert_eq!(unread_of(&base, ALICE).await, 0);
+
+    // The cursor walks the caller's rows: Bob's second mention of Carol.
+    let second = f.post_with(BOB, "3kmention333", &aud_bob, json!({"facets": [mention(CAROL)]})).await;
+    f.ready_all().await;
+    let mut seen_uris = Vec::new();
+    let mut query = "limit=1".to_string();
+    for _ in 0..4 {
+        let (page, _) = notifications_of(&base, CAROL, &query).await;
+        seen_uris.extend(page["notifications"].as_array().into_iter().flatten().filter_map(|n| n["uri"].as_str().map(str::to_string)));
+        match page["cursor"].as_str() {
+            Some(c) => query = format!("limit=1&cursor={}", urlencoding(c)),
+            None => break,
+        }
+    }
+    assert_eq!(seen_uris, [second, m]);
+    for query in ["limit=0", "limit=101", "cursor=garbage", "cursor=2026-10-01T00:00:00Z::x"] {
+        let (status, body, _) = get(&base, LIST_NOTIFICATIONS, query, CAROL, CAROL_KEY).await;
+        assert_eq!(status, 400, "{query}: {body}");
+    }
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_notification_reads_on() {
+    notification_reads_in(PublicMode::On, "s6-reads-on").await;
+}
+
+#[tokio::test]
+async fn private_notification_reads_off() {
+    notification_reads_in(PublicMode::Off, "s6-reads-off").await;
 }

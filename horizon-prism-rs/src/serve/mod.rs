@@ -210,6 +210,7 @@ pub async fn run() -> Result<(), StartupError> {
     let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private))
         .with_list_references(list_budget, applier.clone())
         .with_subscribed_post_max_age_secs(cfg.file.notifications.subscribed_post_max_age_secs)
+        .with_private_notify_max_age_hours(cfg.file.private_notify.backfill_max_age_hours)
         .with_subscription_limits(subscriptions::copy::Limits {
             max_items: cfg.file.lists.subscribed_max_items,
             tombstones_max_per_owner: cfg.file.lists.subscription_tombstones_max_per_owner,
