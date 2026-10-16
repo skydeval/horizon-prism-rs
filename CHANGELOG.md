@@ -1541,6 +1541,32 @@ commit.
 
 ### Fixed
 
+- **A reply could enter another account's audience (#718; private
+  posting S0, #719).** A private post under an audience owned by someone
+  else was served to that audience whenever its author and the owner
+  shared a PDS, with no thread check, and the community PDS's
+  `participatePrivate` accepted such a reply with an invented parent. Such
+  a post is now served, on any PDS, only when its parent chain under the
+  same audience reaches a post by the audience's owner within 8 steps,
+  every step being one the reader could read (no block either way, not
+  hidden by moderation, its writer allowed in the audience), and its
+  author may write there by the audience's rule (`everyone`: no block;
+  `followers`: a stored follow of the owner; `list` or no mode: listed)
+  with no block between author and owner (except under `list` or no mode
+  for now). Prism no longer uses a same-PDS shortcut.
+  - **Stops serving, to anyone but the author:** such posts that do not
+    hang from the owner's post; replies more than 8 levels below it;
+    others' replies left under an old audience after the root's audience
+    moved; under `list` or no mode, replies by writers not listed; under
+    `followers`, replies whose writer's follow of the owner is not stored;
+    a reply below a step the reader cannot read.
+  - **Starts serving:** posts by authors whose account status is neither
+    `active` nor one of the four hiding statuses (`deactivated`,
+    `takendown`, `suspended`, `deleted`), e.g. `throttled`. Taken-down and
+    hidden posts now also leave the private feed prefilter.
+  - **Pre-release count on prism (2026-10-15):** 11 private posts, 2 under
+    another account's audience; 0 stop being served, 0 start.
+
 - **Backfill job generations (#713; design-v4 §II-5.10).** A job's run
   could settle, fail or re-queue the row after the job had been reset
   under it (re-enqueued, cancelled by a purge, re-queued at startup), and

@@ -484,7 +484,7 @@ pub async fn run() -> Result<(), StartupError> {
             source: Arc::clone(&source),
             dead_letter_stream: fh.dead_letter_stream.clone(),
             deterministic_attempts: fh.deterministic_attempts,
-            community_patterns: Arc::new(community_patterns.clone()),
+            community_patterns: Arc::new(community_patterns),
             farsight: farsight.clone(),
             sync_min_interval_secs: lists.sync_min_interval_secs,
             list_budget,
@@ -629,7 +629,6 @@ pub async fn run() -> Result<(), StartupError> {
         prober,
         watermarks.clone(),
         Duration::from_secs(cfg.file.kryphocron.oracle_freshness_bound_secs),
-        community_patterns,
         usize::try_from(cfg.file.sync.max_head_fetches_per_request).unwrap_or(16),
         &cfg.file.private_read,
     );

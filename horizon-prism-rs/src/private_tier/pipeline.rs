@@ -7,7 +7,6 @@
 //! server-side reason that never reaches the wire.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -134,7 +133,6 @@ pub(super) struct PipelineEnv {
     pub watermarks: Watermarks,
     /// `kryphocron.oracle_freshness_bound_secs`.
     pub freshness_bound: Duration,
-    pub community_patterns: Arc<Vec<String>>,
     /// `sync.max_head_fetches_per_request`.
     pub max_head_fetches: usize,
 }
@@ -263,7 +261,6 @@ async fn read_inner(
             uri,
             watermark,
             bound: env.freshness_bound,
-            community_patterns: &env.community_patterns,
         },
     )
     .await?;

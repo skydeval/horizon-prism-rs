@@ -3,15 +3,22 @@
 //! synchronous `BlockOracle`, `AudienceOracle` and `MuteOracle` calls from
 //! memory.
 //!
-//! `AudienceOracle::audience_state` mirrors Aurora-Locus
-//! `authorize_private_read` exactly (first matching rule wins):
+//! `AudienceOracle::audience_state` follows Aurora-Locus
+//! `authorize_private_read` (first matching rule wins), with rule 4
+//! stricter than it (docs/internal/design/private-posting.md §3.7):
 //! 1. viewer == owner → `InAudience` (self-read);
 //! 2. no `private_posts` row → `NoAudienceConfigured`;
 //! 3. no `audience_uri` → `NoAudienceConfigured`;
-//! 4. audience owner ≠ post owner and not on the same PDS (both endpoints
-//!    known and equal, host matching the `community` network's patterns,
-//!    audience owner `active`) → `NotInAudience`; an unknown endpoint denies
-//!    and re-queues the identity refresher for both DIDs;
+//! 4. audience owner ≠ post owner, on any PDS → `NotInAudience` unless all
+//!    of: (1) the post hangs from a post by the audience's owner under the
+//!    same audience, found by walking stored parents at most
+//!    `RULE4_MAX_HOPS` rows, each step one the viewer could read
+//!    (`schema::anchored`); (2) the post's owner may write there by
+//!    aurora's write rule: `list` or none, listed in `members`;
+//!    `followers`, a stored follow of the audience's owner; `everyone`,
+//!    always; anything else, no; (3) under `followers` and `everyone`, no
+//!    block either way between the post's owner and the audience's owner;
+//!    (4) the audience's owner has an `actors` row with status `active`;
 //! 5. no `private_audiences` row → `NotInAudience`;
 //! 6. for `followers` and `everyone` under an audience whose owner is not
 //!    the post's owner: a block either way between that owner and the
@@ -22,9 +29,10 @@
 //!    the viewer naming that owner is stored; `everyone`, always; anything
 //!    else (`nobody`, `following`, an unknown value) → `NotInAudience`.
 //!
-//! Rules 1–5 and `list` mirror Aurora-Locus `authorize_private_read`.
-//! `followers` and `everyone` go beyond it: the PDS denies every mode but
-//! `list`, having no follow graph to ask
+//! Rules 1–3, 5 and `list` mirror Aurora-Locus `authorize_private_read`.
+//! Rule 4 is stricter: aurora trusts a same-PDS reply whatever it replies
+//! to, and Prism ingests from any PDS. `followers` and `everyone` go beyond
+//! it: the PDS denies every mode but `list`, having no follow graph to ask
 //! (docs/internal/design/private-audience-modes.md).
 
 use std::time::{Duration, SystemTime};
@@ -36,9 +44,7 @@ use kryphocron::{
 use sqlx::PgPool;
 
 use super::schema;
-use crate::aggregations::enroll::{host_matches, pds_host};
 use crate::db::locks::uri_author;
-use crate::identity::RefreshReason;
 
 /// Every snapshot answer is in memory (§6.4).
 pub(super) const WORST_CASE_LATENCY: Duration = Duration::from_millis(1);
@@ -64,54 +70,13 @@ pub(super) struct SnapshotInputs<'a> {
     /// `private_watermark`; `None` (no watermark yet) is infinitely stale.
     pub watermark: Option<SystemTime>,
     pub bound: Duration,
-    pub community_patterns: &'a [String],
-}
-
-#[derive(sqlx::FromRow)]
-struct ActorEndpoint {
-    pds_endpoint: Option<String>,
-    account_status: String,
-}
-
-async fn endpoint(pool: &PgPool, did: &str) -> Result<Option<ActorEndpoint>, sqlx::Error> {
-    sqlx::query_as("SELECT pds_endpoint, account_status FROM actors WHERE did = $1")
-        .bind(did)
-        .fetch_optional(pool)
-        .await
-}
-
-async fn requeue_identity(pool: &PgPool, dids: [&str; 2]) -> Result<(), sqlx::Error> {
-    // Both DIDs already have rows here, so this is bounded by existing rows.
-    sqlx::query(
-        "INSERT INTO identity_refresh (did, reasons) SELECT d, $2 FROM unnest($1::text[]) AS d \
-         ON CONFLICT (did) DO UPDATE SET reasons = identity_refresh.reasons | EXCLUDED.reasons",
-    )
-    .bind(dids.map(str::to_string).to_vec())
-    .bind(RefreshReason::STALE)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Rule 4's same-PDS condition.
-async fn same_pds(pool: &PgPool, owner: &str, audience_owner: &str, patterns: &[String]) -> Result<bool, sqlx::Error> {
-    let (Some(o), Some(a)) = (endpoint(pool, owner).await?, endpoint(pool, audience_owner).await?) else {
-        requeue_identity(pool, [owner, audience_owner]).await?;
-        return Ok(false);
-    };
-    let (Some(oh), Some(ah)) = (
-        o.pds_endpoint.as_deref().and_then(pds_host),
-        a.pds_endpoint.as_deref().and_then(pds_host),
-    ) else {
-        requeue_identity(pool, [owner, audience_owner]).await?;
-        return Ok(false);
-    };
-    Ok(oh == ah && patterns.iter().any(|p| host_matches(&oh, p)) && a.account_status == "active")
 }
 
 impl OracleSnapshot {
-    /// Load the snapshot: the same fixed set of queries whether or not rows
-    /// exist (§6.4), so latency varies little with existence.
+    /// Load the snapshot: the same fixed set of statements for every post
+    /// (no audience, its owner's audience or another's, any mode), whether
+    /// or not rows exist (§6.4; private-posting §3.7 "The statement set is
+    /// fixed"), so latency varies little with existence.
     ///
     /// # Errors
     ///
@@ -120,45 +85,62 @@ impl OracleSnapshot {
         let owner = input.resource.did().as_str();
         let facts = schema::post_facts(pool, input.uri).await?;
         let audience_uri = facts.as_ref().and_then(|f| f.audience_uri.clone());
-        let audience_row = match &audience_uri {
-            Some(u) => schema::audience_row(pool, u).await?,
-            None => None,
-        };
-        // The facts rules 6 and 7 read, loaded whatever the mode so that
+        let parent = facts.as_ref().and_then(|f| f.reply_parent_uri.clone());
+        // Loaded on every load, with `''` when the post names no audience.
+        let audience_row = schema::audience_row(pool, audience_uri.as_deref().unwrap_or("")).await?;
+        // The facts rules 4, 6 and 7 read, loaded whatever the mode so that
         // the mode adds no difference of its own. With no usable audience
         // URI the post's owner stands in, and the answers go unread.
         let relation_owner = audience_uri.as_deref().and_then(uri_author).filter(|d| !d.is_empty()).unwrap_or(owner).to_string();
         let viewer_follows = schema::follows(pool, input.requester, &relation_owner).await?;
         let viewer_block = schema::blocks_between(pool, input.requester, &relation_owner).await?;
         let author_block = schema::blocks_between(pool, owner, &relation_owner).await?;
+        let author_follows = schema::follows(pool, owner, &relation_owner).await?;
+        let relation_owner_active = schema::account_active(pool, &relation_owner).await?;
+        let anchored = schema::anchored_for(
+            pool,
+            parent.as_deref(),
+            audience_uri.as_deref().unwrap_or(""),
+            &relation_owner,
+            audience_row.as_ref().and_then(|a| a.mode.as_deref()),
+            audience_row.as_ref().map_or(&[][..], |a| a.members.as_slice()),
+            input.requester,
+        )
+        .await?;
         let audience = if input.requester == owner {
             AudienceState::InAudience
         } else if facts.as_ref().is_none_or(|f| f.owner != owner) {
             AudienceState::NoAudienceConfigured
         } else if let Some(uri) = &audience_uri {
             let audience_owner = uri_author(uri).unwrap_or_default();
-            if audience_owner != owner && !same_pds(pool, owner, audience_owner, input.community_patterns).await? {
-                AudienceState::NotInAudience
-            } else {
-                match &audience_row {
-                    None => AudienceState::NotInAudience,
-                    Some(a) => {
-                        let mode = a.mode.as_deref().unwrap_or("list");
-                        // Rule 6: under these modes a block is the audience
-                        // owner's only way to keep one reader out.
-                        let blocked = matches!(mode, "followers" | "everyone")
-                            && audience_owner != owner
-                            && ((input.requester != audience_owner && (viewer_block.0 || viewer_block.1))
-                                || author_block.0
-                                || author_block.1);
-                        let inside = match mode {
-                            "list" => a.members.iter().any(|m| m == input.requester),
-                            "followers" => input.requester == audience_owner || viewer_follows,
-                            "everyone" => true,
-                            _ => false,
-                        };
-                        if inside && !blocked { AudienceState::InAudience } else { AudienceState::NotInAudience }
-                    }
+            match &audience_row {
+                None => AudienceState::NotInAudience,
+                Some(a) => {
+                    let mode = a.mode.as_deref().unwrap_or("list");
+                    let author_blocked = author_block.0 || author_block.1;
+                    // Rule 4, on any PDS: anchored (1), the post's owner
+                    // may write here (2) and is not blocked either way
+                    // with the audience's owner outside `list` (3), and
+                    // that owner is active (4).
+                    let may_write = match mode {
+                        "list" => a.members.iter().any(|m| m == owner),
+                        "followers" => author_follows && !author_blocked,
+                        "everyone" => !author_blocked,
+                        _ => false,
+                    };
+                    let rule4 = audience_owner == owner || (anchored && may_write && relation_owner_active);
+                    // Rule 6: under these modes a block is the audience
+                    // owner's only way to keep one reader out.
+                    let blocked = matches!(mode, "followers" | "everyone")
+                        && audience_owner != owner
+                        && ((input.requester != audience_owner && (viewer_block.0 || viewer_block.1)) || author_blocked);
+                    let inside = match mode {
+                        "list" => a.members.iter().any(|m| m == input.requester),
+                        "followers" => input.requester == audience_owner || viewer_follows,
+                        "everyone" => true,
+                        _ => false,
+                    };
+                    if rule4 && inside && !blocked { AudienceState::InAudience } else { AudienceState::NotInAudience }
                 }
             }
         } else {

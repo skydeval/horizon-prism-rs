@@ -72,7 +72,6 @@ impl PrivateState {
         prober: crate::sync::HeadProber,
         watermarks: crate::firehose::watermark::Watermarks,
         freshness_bound: Duration,
-        community_patterns: Vec<String>,
         max_head_fetches: usize,
         cfg: &PrivateReadConfig,
     ) -> Self {
@@ -85,7 +84,6 @@ impl PrivateState {
                 prober,
                 watermarks,
                 freshness_bound,
-                community_patterns: std::sync::Arc::new(community_patterns),
                 max_head_fetches,
             },
             floors: Floors {

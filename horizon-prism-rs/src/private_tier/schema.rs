@@ -11,23 +11,29 @@ use sqlx::PgPool;
 
 use super::pipeline::RecordAuthz;
 
-/// Pre-bind facts about a post (non-content): owner and audience URI.
+/// Pre-bind facts about a post (non-content): owner, audience URI and the
+/// parent it replies to (rule 4's walk starts there).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PostFacts {
     pub owner: String,
     pub audience_uri: Option<String>,
+    pub reply_parent_uri: Option<String>,
 }
 
 /// # Errors
 ///
 /// Database errors.
 pub(super) async fn post_facts(pool: &PgPool, uri: &str) -> Result<Option<PostFacts>, sqlx::Error> {
-    let row: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT author_did, audience_uri FROM private_posts WHERE uri = $1")
+    let row: Option<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT author_did, audience_uri, reply_parent_uri FROM private_posts WHERE uri = $1")
             .bind(uri)
             .fetch_optional(pool)
             .await?;
-    Ok(row.map(|(owner, audience_uri)| PostFacts { owner, audience_uri }))
+    Ok(row.map(|(owner, audience_uri, reply_parent_uri)| PostFacts {
+        owner,
+        audience_uri,
+        reply_parent_uri,
+    }))
 }
 
 /// An audience row (oracle facts).
@@ -179,27 +185,142 @@ fn blocked(x: &str, y: &str) -> String {
     )
 }
 
+/// The account statuses the moderation gate hides
+/// (`moderation::status_reason`), as an SQL list.
+const HIDING_STATUSES: &str = "('deactivated', 'takendown', 'suspended', 'deleted')";
+
+/// The moderation gate's rule (`moderation::gate_many`) for the post `uri`
+/// by `author` (SQL expressions): no `!takedown` or `!hide` label on the
+/// post, no `!takedown` on the author, and an author status the gate does
+/// not hide (no `actors` row reads as visible).
+fn gate_shows(uri: &str, author: &str, status: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM labels l WHERE (l.subject = {uri} AND l.val IN ('!takedown', '!hide')) \
+                                              OR (l.subject = {author} AND l.val = '!takedown')) \
+         AND COALESCE({status}, 'active') NOT IN {HIDING_STATUSES}"
+    )
+}
+
+/// Rule 4's cap (private-posting design §3.7): the walk examines at most
+/// this many rows. Inlined into the SQL text as a literal.
+pub(super) const RULE4_MAX_HOPS: u32 = 8;
+
+/// Rule 4's step test `step_ok(s)` (§3.7) for the walk row `s`: the reader
+/// could read the step, so it may anchor or be walked past.
+/// - (i) no block either way between the reader and the step's author;
+/// - (ii) the moderation gate shows the step;
+/// - (iii) a step not by the audience's owner is by a writer who passes
+///   conditions 2 and 3 under the audience (condition 3 not under `list`
+///   or NULL until S9; `following` is `false` until S10).
+fn step_ok(owner: &str, mode: &str, members: &str, reader: &str) -> String {
+    format!(
+        "NOT {reader_author} \
+         AND {gate} \
+         AND (s.author_did = {owner} OR ( \
+               (COALESCE({mode}, 'list') = 'list' OR NOT {author_owner}) \
+               AND CASE COALESCE({mode}, 'list') \
+                     WHEN 'list' THEN s.author_did = ANY({members}) \
+                     WHEN 'followers' THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = s.author_did AND f.subject_did = {owner}) \
+                     WHEN 'everyone' THEN true \
+                     ELSE false END))",
+        reader_author = blocked(reader, "s.author_did"),
+        gate = gate_shows("s.uri", "s.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = s.author_did)"),
+        author_owner = blocked("s.author_did", owner),
+    )
+}
+
+/// Rule 4's walk (§3.7) as an SQL boolean. Every argument is an SQL
+/// expression; the cap is inlined, so every caller's text carries the same literal.
+pub(super) fn anchored(parent: &str, audience: &str, owner: &str, mode: &str, members: &str, reader: &str) -> String {
+    anchored_with_cap(parent, audience, owner, mode, members, reader, RULE4_MAX_HOPS)
+}
+
+/// [`anchored`] with another cap: only the pre-S0 count query uses one
+/// other than [`RULE4_MAX_HOPS`], to separate over-cap chains.
+fn anchored_with_cap(parent: &str, audience: &str, owner: &str, mode: &str, members: &str, reader: &str, cap: u32) -> String {
+    let step = step_ok(owner, mode, members, reader);
+    format!(
+        "EXISTS ( \
+           WITH RECURSIVE walk(uri, parent, author, audience, hop) AS ( \
+             SELECT s.uri, s.reply_parent_uri, s.author_did, s.audience_uri, 1 \
+             FROM private_posts s WHERE s.uri = {parent} AND {step} \
+             UNION ALL \
+             SELECT s.uri, s.reply_parent_uri, s.author_did, s.audience_uri, w.hop + 1 \
+             FROM walk w JOIN private_posts s ON s.uri = w.parent \
+             WHERE w.hop < {cap} AND w.audience = {audience} AND w.author <> {owner} AND {step} \
+           ) \
+           SELECT 1 FROM walk w WHERE w.audience = {audience} AND w.author = {owner})"
+    )
+}
+
+/// The oracle's walk statement (snapshot fact 8): `$1` the post's parent,
+/// `$2` its audience URI, `$3` the audience's owner, `$4` and `$5` the
+/// audience row's `mode` and `members`, `$6` the requester.
+pub(super) fn walk_statement() -> String {
+    format!("SELECT {}", anchored("$1", "$2", "$3", "$4", "$5", "$6"))
+}
+
+/// Whether the post hangs from a post by `owner` under `audience`, as
+/// `reader` may see the chain (§3.7, fact 8). With no parent the walk
+/// starts nowhere and the answer is `false`.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn anchored_for(
+    pool: &PgPool,
+    parent: Option<&str>,
+    audience: &str,
+    owner: &str,
+    mode: Option<&str>,
+    members: &[String],
+    reader: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&walk_statement())
+        .bind(parent)
+        .bind(audience)
+        .bind(owner)
+        .bind(mode)
+        .bind(members)
+        .bind(reader)
+        .fetch_one(pool)
+        .await
+}
+
+/// Whether `did` has an `actors` row with status `active` (condition 4: no
+/// row is not active).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn account_active(pool: &PgPool, did: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM actors WHERE did = $1 AND account_status = 'active')")
+        .bind(did)
+        .fetch_one(pool)
+        .await
+}
+
 /// The §6.9 candidate prefilter, mirroring §6.4's rules for the requester
-/// (`$1`), as the audience-modes design amends them:
-/// - the author is active (the moderation gate denies a non-active
-///   author's posts to everyone);
-/// - self-authored; or an audience row is present, of the same owner or of
-///   an active account on the same PDS endpoint, and its mode admits the
+/// (`$1`), as the audience-modes and private-posting designs amend them:
+/// - the moderation gate shows the post (labels and author status);
+/// - self-authored; or an audience row is present and its mode admits the
 ///   requester: `list` (or none) by `members`, `followers` by the
 ///   requester's stored follow of the audience's owner (who is in its own
 ///   audience), `everyone` always, and nothing else;
 /// - no block between the requester and the author; and, for `followers`
 ///   and `everyone` under another account's audience, none between that
-///   account and the requester or the author.
+///   account and the requester or the author (rule 6);
+/// - under another account's audience, rule 4 (private-posting §3.7): that
+///   account is active, the author may write there, and the post hangs
+///   from that account's post within [`RULE4_MAX_HOPS`] rows. The walk is
+///   last, so it runs only for rows that pass everything else.
 ///
 /// A candidate filter only: `bind` stays authoritative. Blocked pairs are
 /// left out so that posts nobody can read do not fill a page's window.
-fn prefilter() -> String {
+pub(super) fn prefilter() -> String {
     format!(
-        "(COALESCE(po.account_status, 'active') = 'active' AND (p.author_did = $1 OR ( \
+        "({gate} AND (p.author_did = $1 OR ( \
            a.uri IS NOT NULL \
-           AND (a.owner_did = p.author_did \
-                OR (ao.pds_endpoint IS NOT NULL AND ao.pds_endpoint = po.pds_endpoint AND ao.account_status = 'active')) \
            AND CASE COALESCE(a.mode, 'list') \
                  WHEN 'list' THEN $1 = ANY(a.members) \
                  WHEN 'followers' THEN a.owner_did = $1 OR EXISTS ( \
@@ -209,10 +330,76 @@ fn prefilter() -> String {
            AND NOT {viewer_author} \
            AND (COALESCE(a.mode, 'list') NOT IN ('followers', 'everyone') \
                 OR a.owner_did = p.author_did \
-                OR NOT ((a.owner_did <> $1 AND {viewer_owner}) OR {author_owner})))))",
+                OR NOT ((a.owner_did <> $1 AND {viewer_owner}) OR {author_owner})) \
+           AND (a.owner_did = p.author_did \
+                OR (ao.account_status = 'active' \
+                    AND (COALESCE(a.mode, 'list') IN ('list') OR NOT {author_owner}) \
+                    AND CASE COALESCE(a.mode, 'list') \
+                          WHEN 'list' THEN p.author_did = ANY(a.members) \
+                          WHEN 'followers' THEN EXISTS ( \
+                            SELECT 1 FROM follows f WHERE f.author_did = p.author_did AND f.subject_did = a.owner_did) \
+                          WHEN 'everyone' THEN true \
+                          ELSE false END \
+                    AND {walk})))))",
+        gate = gate_shows("p.uri", "p.author_did", "po.account_status"),
         viewer_author = blocked("$1", "p.author_did"),
         viewer_owner = blocked("$1", "a.owner_did"),
         author_owner = blocked("p.author_did", "a.owner_did"),
+        walk = anchored("p.reply_parent_uri", "p.audience_uri", "a.owner_did", "a.mode", "a.members", "$1"),
+    )
+}
+
+/// The pre-S0 count (private-posting design §5, "S0's pre-release count"),
+/// run read-only against the deployed database before S0 ships. The reader
+/// is `''`, so step test (i) never denies. Printed by the ignored test
+/// `pre_s0_count_query`.
+#[cfg(test)]
+pub(super) fn pre_s0_count_sql() -> String {
+    pre_s0_count_sql_with_cap(RULE4_MAX_HOPS)
+}
+
+/// [`pre_s0_count_sql`] with another walk cap (64 separates over-cap
+/// chains from the rest of `stops_unanchored`).
+#[cfg(test)]
+pub(super) fn pre_s0_count_sql_with_cap(cap: u32) -> String {
+    format!(
+        "WITH x AS (
+  SELECT p.uri, p.author_did, p.audience_uri, p.reply_parent_uri,
+         a.owner_did, COALESCE(a.mode, 'list') AS mode, a.members,
+         (ao.pds_endpoint IS NOT NULL AND ao.pds_endpoint = po.pds_endpoint
+          AND ao.account_status = 'active') AS served_today,
+         EXISTS (SELECT 1 FROM members m WHERE m.did = p.author_did) AS writer_member,
+         EXISTS (SELECT 1 FROM members m WHERE m.did = a.owner_did) AS owner_member,
+         EXISTS (SELECT 1 FROM follows f WHERE f.author_did = p.author_did AND f.subject_did = a.owner_did) AS writer_follows
+  FROM private_posts p
+  JOIN private_audiences a ON a.uri = p.audience_uri
+  LEFT JOIN actors po ON po.did = p.author_did
+  LEFT JOIN actors ao ON ao.did = a.owner_did
+  WHERE a.owner_did <> p.author_did
+), y AS (
+  SELECT x.*, {walk} AS anchored
+  FROM x
+)
+SELECT
+  count(*) FILTER (WHERE served_today AND NOT anchored)
+    AS stops_unanchored,
+  count(*) FILTER (WHERE served_today AND anchored AND mode = 'list' AND NOT author_did = ANY(members))
+    AS stops_list_writer_unlisted,
+  count(*) FILTER (WHERE served_today AND anchored AND mode = 'followers' AND NOT writer_follows AND writer_member AND owner_member)
+    AS stops_followers_member_writer_member_owner,
+  count(*) FILTER (WHERE served_today AND anchored AND mode = 'followers' AND NOT writer_follows AND writer_member AND NOT owner_member)
+    AS stops_followers_member_writer_nonmember_owner,
+  count(*) FILTER (WHERE served_today AND anchored AND mode = 'followers' AND NOT writer_follows AND NOT writer_member AND owner_member)
+    AS stops_followers_nonmember_writer_member_owner,
+  count(*) FILTER (WHERE served_today AND anchored AND mode = 'followers' AND NOT writer_follows AND NOT writer_member AND NOT owner_member)
+    AS stops_followers_nonmember_writer_nonmember_owner,
+  count(*) FILTER (WHERE anchored AND mode = 'followers' AND NOT writer_follows AND writer_member)
+    AS c5c_member_writer_residual,
+  (SELECT count(*) FROM private_posts p2 JOIN actors ac ON ac.did = p2.author_did
+    WHERE ac.account_status NOT IN ('active', 'deactivated', 'takendown', 'suspended', 'deleted'))
+    AS starts_serving_status
+FROM y;",
+        walk = anchored_with_cap("x.reply_parent_uri", "x.audience_uri", "x.owner_did", "x.mode", "x.members", "''", cap),
     )
 }
 
