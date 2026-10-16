@@ -61,3 +61,7 @@ anyhow = "1"
 async-trait = "0.1"
 url = "2"
 unicode-normalization = "0.1"
+
+[dev-dependencies]
+# tokio::time::pause for the lag sampler's hang test (firehose throughput §4.5).
+tokio = { version = "1", features = ["test-util"] }

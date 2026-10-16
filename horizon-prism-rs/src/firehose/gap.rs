@@ -8,6 +8,8 @@
 //! - enqueues, resetting to `queued`, `authz` for every tracked DID and
 //!   `resync` for every member;
 //! - sets `last_gap`;
+//! - clears `claim_in_progress` (pending evidence at startup) or
+//!   `recreation_gap_owed` (stream evidence), when asked;
 //! - clears every follow-verification flag (following-audience design §3.3),
 //!   as its last write.
 //!
@@ -33,6 +35,9 @@ pub const METRIC_GAPS: &str = "firehose_trim_gap_total";
 pub const KEY_GAP_EPOCH: &str = "gap_epoch";
 pub const KEY_LAST_GAP: &str = "last_gap";
 pub const KEY_CLAIM_IN_PROGRESS: &str = "claim_in_progress";
+/// Set before the group is recreated while watermarks exist, cleared by the
+/// recreation gap's own transaction (firehose throughput design §6.2).
+pub const KEY_RECREATION_GAP_OWED: &str = "recreation_gap_owed";
 
 /// The gap's exclusive hold on the epoch key (§3.2), in the style of the
 /// crate's other advisory keys (`db::locks`).
@@ -84,6 +89,30 @@ pub async fn run_gap_transaction(
     cause: GapCause,
     clear_claim: bool,
 ) -> Result<i64, sqlx::Error> {
+    run_gap_transaction_clearing(pool, scope, private, cause, clear_claim, false).await
+}
+
+/// [`run_gap_transaction`], which with `clear_owed` also clears
+/// `recreation_gap_owed` in the same transaction (firehose throughput design
+/// §6.2): only a gap transaction ever clears it.
+///
+/// # Errors
+///
+/// Any database error; nothing is changed on error.
+pub async fn run_gap_transaction_clearing(
+    pool: &PgPool,
+    scope: &ScopeState,
+    private: &dyn PrivateTier,
+    cause: GapCause,
+    clear_claim: bool,
+    clear_owed: bool,
+) -> Result<i64, sqlx::Error> {
+    #[cfg(test)]
+    if let Some(db) = pool.connect_options().get_database()
+        && crate::test_support::hooks::injected(crate::test_support::hooks::GAP_TX_FAILS, db)
+    {
+        return Err(sqlx::Error::Protocol("injected gap transaction failure".into()));
+    }
     let guard = scope.read_guard().await;
     let tracked = guard.tracked();
     let mut members: Vec<String> = guard.members.iter().cloned().collect();
@@ -103,6 +132,9 @@ pub async fn run_gap_transaction(
     set_json(&mut tx, KEY_LAST_GAP, &serde_json::json!(Utc::now().to_rfc3339())).await?;
     if clear_claim {
         set_json(&mut tx, KEY_CLAIM_IN_PROGRESS, &serde_json::json!(false)).await?;
+    }
+    if clear_owed {
+        set_json(&mut tx, KEY_RECREATION_GAP_OWED, &serde_json::json!(false)).await?;
     }
     // Last, in the firehose writer's order (`members` → jobs →
     // `sync_state`, §3.3). No counter: a settle holding the key commits
@@ -195,9 +227,33 @@ pub async fn set_claim_in_progress(pool: &PgPool, value: bool) -> Result<(), sql
 ///
 /// Any database error.
 pub async fn claim_in_progress(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    flag(pool, KEY_CLAIM_IN_PROGRESS).await
+}
+
+/// Durably mark the recreation gap owed (§6.11.4 item 3). There is no
+/// standalone clear: the gap transaction clears it.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn set_recreation_gap_owed(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    set_json(&mut conn, KEY_RECREATION_GAP_OWED, &serde_json::json!(true)).await
+}
+
+/// Whether a recreation gap is owed.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn recreation_gap_owed(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    flag(pool, KEY_RECREATION_GAP_OWED).await
+}
+
+async fn flag(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
     let v: Option<bool> =
         sqlx::query_scalar("SELECT (value #>> '{}')::boolean FROM worker_state WHERE key = $1")
-            .bind(KEY_CLAIM_IN_PROGRESS)
+            .bind(key)
             .fetch_optional(pool)
             .await?;
     Ok(v.unwrap_or(false))

@@ -110,6 +110,46 @@ commit.
   Migration 0027. Floors `list_notifications` 1200 ms, `get_unread_count`
   300 ms. `getMembership`'s `features` gains `private.notifications`.
 
+### Fixed (firehose throughput)
+
+- **The consumer could fall into a trim-gap loop (#724).** A commit that
+  can write nothing (an untracked repo, every op skipped, invalid or
+  rejected, no delete, no rule-4 list it owns, no invalid
+  `tools.kryphocron.*` op) now opens no transaction and takes no locks; it
+  returns the same report, failed ops and skip counters. That is about
+  95 % of entries on prism's mix.
+- **Re-anchoring after a trim gap** stays at the oldest entry unless the
+  worker has measured itself slower than its input: a repeat gap within
+  one stream length, 30 s of samples with no failed step, at least 90 %
+  busy, and fewer entries processed per busy second than the stream
+  gained. Then it anchors at the stream's tail as read when the gap was
+  detected, so every skipped entry predates the gap's jobs; if an entry
+  after that tail was trimmed meanwhile, it falls back to oldest. The
+  script also reads the first batch. Each decision is logged and counted
+  with its reason (`firehose_reanchor_total{mode}`,
+  `firehose_reanchor_decisions_total{reason}`).
+- **A recreation gap could be lost (#726), and a group lost in pending
+  mode was never recreated.** A missing group is now recognised on every
+  read, the pending and blocking reads and `reanchor` included, in either
+  mode. While watermarks exist, `worker_state['recreation_gap_owed']` is
+  set before the group is created and cleared only by the gap's own
+  transaction; nothing is read while it is set, startup runs an owed gap
+  first, and `/xrpc/_health`'s `gap_blocked` stays true meanwhile.
+- **Throughput metrics and alerts.** New: `firehose_entries_processed_total{path}`,
+  `firehose_consumer_busy_seconds_total`, the backlog pair
+  `firehose_entries_processed_backlog_total` and
+  `firehose_consumer_backlog_busy_seconds_total` (full, gap-free steps
+  only: backlog capacity is their rate ratio, target ≥ 9 000/s),
+  `firehose_stream_entries_added_total`, `firehose_consumer_group_present`,
+  and `firehose_lag_sample_calls_total{call}` /
+  `firehose_lag_sample_failures_total{call}`. The lag sampler's three
+  calls are independent, each with a 3 s timeout; a missing group sets
+  the lag gauge to the stream's length. `firehose_headroom_warn` logs a
+  backlog fraction above 0.5 for 15 min. `docker/README.md` gains
+  `FirehoseBacklogPersistent`, `FirehoseConsumerSlowerThanInput`,
+  `FirehoseGroupMissing` and `FirehoseSamplerFailing`, kept equal to
+  `firehose::alert_rules` by tests.
+
 ### Fixed (private posting S10)
 
 - **Readiness could be set after a gap (#722).** A job's or catch-up's

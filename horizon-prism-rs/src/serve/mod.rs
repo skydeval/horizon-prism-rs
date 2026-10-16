@@ -32,7 +32,7 @@ use crate::admin_executor::{AdminExecutor, Handlers};
 use crate::firehose::backfill::{Backfill, BackfillSource, NetSource};
 use crate::subscriptions::{self, applier::Applier, fetch::Bounds, pds::PdsOwners, runner::{Lanes, ListSync}};
 use crate::sync::{BudgetRates, HeadProber, HostBudgets, NetHeadSource};
-use crate::firehose::consumer::{Consumer, ConsumerStatus, spawn_lag_sampler};
+use crate::firehose::consumer::{Consumer, ConsumerStatus, LAG_SAMPLE_INTERVAL, spawn_lag_sampler};
 use crate::firehose::coverage::CoverageTracker;
 use crate::firehose::watermark::Watermarks;
 use crate::firehose::writer::Writer;
@@ -346,19 +346,18 @@ pub async fn run() -> Result<(), StartupError> {
     .spawn();
     tasks.push(coverage_task);
     let status = Arc::new(ConsumerStatus::default());
-    tasks.push(
-        Consumer::new(
-            fh.clone(),
-            consumer_redis,
-            writer.clone(),
-            watermarks.clone(),
-            coverage,
-            Arc::clone(&status),
-        )
-        .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
-        .spawn(),
-    );
-    tasks.push(spawn_lag_sampler(redis.clone(), fh.clone()));
+    let consumer = Consumer::new(
+        fh.clone(),
+        consumer_redis,
+        writer.clone(),
+        watermarks.clone(),
+        coverage,
+        Arc::clone(&status),
+    )
+    .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs);
+    let throughput = consumer.throughput_shared();
+    tasks.push(consumer.spawn());
+    tasks.push(spawn_lag_sampler(redis.clone(), fh.clone(), throughput, LAG_SAMPLE_INTERVAL));
 
     // Retention and the storage sampler.
     // Private retention runs first (§3.2), so the public `actors` step sees

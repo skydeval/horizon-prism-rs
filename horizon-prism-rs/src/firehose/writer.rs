@@ -160,6 +160,9 @@ pub struct ApplyReport {
     pub failed: Vec<FailedOp>,
     /// Readiness was cleared and `authz` enqueued (§6.11.6).
     pub readiness_cleared: bool,
+    /// The call opened a transaction: false for a commit with nothing to
+    /// write (§5.5 "Nothing to write").
+    pub transaction: bool,
 }
 
 /// A failure that must abort the call and retry it later (§5.3 transient).
@@ -306,6 +309,78 @@ fn prepare(repo: &str, op: &RawOp, now: DateTime<Utc>) -> Prepared {
         Ok(None) => Prepared::Skip("unindexed"),
         Err(e) => Prepared::Invalid(e.0),
     }
+}
+
+/// One op's outcome when it runs no SQL, or `None` when it needs the
+/// transaction. A skip or a rejection bumps `firehose_ops_skipped_total`
+/// here, exactly once. A rejected follow by a tracked repo is counted and
+/// still returns `None`: it takes the rejected-follow path (following-audience
+/// design §4.2).
+fn outcome_without_sql(p: &Prepared, a: Option<Admission>, tracked: bool) -> Option<OpOutcome> {
+    match (p, a) {
+        (Prepared::Skip(reason), _) => {
+            metrics::counter!(METRIC_SKIPPED, "reason" => *reason).increment(1);
+            Some(OpOutcome::Skipped(reason))
+        }
+        (Prepared::Invalid(e), _) => Some(OpOutcome::Failed(e.clone())),
+        (Prepared::Upsert(u), Some(Admission::Reject(reason))) => {
+            metrics::counter!(METRIC_SKIPPED, "reason" => reason.as_str()).increment(1);
+            if matches!(u.body, Body::Follow(_)) && tracked {
+                None
+            } else {
+                Some(OpOutcome::Rejected(reason.as_str()))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// §5.5 "Nothing to write" (firehose throughput design §1.2): the repo is
+/// not tracked and owns no subscribed list under rule 4, every op is
+/// skipped, invalid or rejected, and no invalid op has a `tools.kryphocron.*`
+/// path that would clear readiness. Such a transaction would run nothing
+/// but its locks.
+fn nothing_to_write(
+    prepared: &[Prepared],
+    admissions: &[Option<Admission>],
+    ops: &[RawOp],
+    owner_side: bool,
+    tracked: bool,
+    options: ApplyOptions,
+) -> bool {
+    let clears_readiness = options.dead_letter_readiness
+        && prepared
+            .iter()
+            .zip(ops)
+            .any(|(p, op)| matches!(p, Prepared::Invalid(_)) && op.path().starts_with("tools.kryphocron."));
+    !owner_side
+        && !tracked
+        && !clears_readiness
+        && prepared.iter().zip(admissions).all(|(p, a)| match p {
+            Prepared::Skip(_) | Prepared::Invalid(_) => true,
+            Prepared::Upsert(_) => matches!(a, Some(Admission::Reject(_))),
+            Prepared::Delete(_) => false,
+        })
+}
+
+/// The report the transaction would have returned for a commit with nothing
+/// to write: the same outcomes, failed ops and skip counters.
+fn report_without_writes(prepared: &[Prepared], admissions: &[Option<Admission>], ops: &[RawOp]) -> ApplyReport {
+    let mut report = ApplyReport::default();
+    for (i, (p, op)) in prepared.iter().zip(ops).enumerate() {
+        // An untracked repo: every op is decided here.
+        let outcome = outcome_without_sql(p, admissions[i], false).unwrap_or_else(|| unreachable!("nothing to write"));
+        if let OpOutcome::Failed(error) = &outcome {
+            report.failed.push(FailedOp {
+                index: i,
+                action: op.action,
+                path: op.path(),
+                error: error.clone(),
+            });
+        }
+        report.outcomes.push(outcome);
+    }
+    report
 }
 
 /// The author of the `postPrivate` post a gate row names (private posting
@@ -608,6 +683,14 @@ impl Writer {
         ops: &[RawOp],
         options: ApplyOptions,
     ) -> Result<ApplyReport, Transient> {
+        // Firehose throughput design §2.4: a hung database, before the
+        // nothing-to-write check so it holds every entry alike.
+        #[cfg(test)]
+        if let Some(db) = self.pool.connect_options().get_database()
+            && crate::test_support::hooks::delay(crate::test_support::hooks::WRITER_HANG, db).await
+        {
+            return Err(Transient("injected hang".into()));
+        }
         let now = Utc::now();
         let prepared: Vec<Prepared> = ops.iter().map(|op| prepare(repo, op, now)).collect();
 
@@ -663,37 +746,45 @@ impl Writer {
             lock_uri_list.extend(items.map(|op| format!("at://{repo}/{NSID_LISTITEM}/{}", op.rkey)));
         }
 
+        // §5.5 "Nothing to write": a commit whose transaction would run no
+        // statement besides its locks opens none.
+        let tracked = sets.is_tracked(repo);
+        #[cfg(test)]
+        let forced = crate::test_support::hooks::injected(crate::test_support::hooks::WRITER_FORCE_TX, repo)
+            || crate::test_support::hooks::injected(crate::test_support::hooks::WRITER_FORCE_TX, "*");
+        #[cfg(not(test))]
+        let forced = false;
+        if !forced && nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options) {
+            let report = report_without_writes(&prepared, &admissions, ops);
+            drop(guard);
+            return Ok(report);
+        }
+
         let mut tx = self.pool.begin().await?;
         // 2 and 3: DID locks, then per-URI locks.
         lock_dids_shared(&mut tx, &lock_dids).await?;
         lock_uris(&mut tx, &lock_uri_list).await?;
 
-        let mut report = ApplyReport::default();
+        let mut report = ApplyReport { transaction: true, ..ApplyReport::default() };
         let mut effects = MemoryEffects::default();
         let mut copied = copy::Effects::default();
         for (i, (p, op)) in prepared.iter().zip(ops).enumerate() {
             if owner_side {
                 self.owner_side(&mut tx, repo, rev, op, sets, &mut copied).await?;
             }
-            let outcome = match p {
-                Prepared::Skip(reason) => {
-                    metrics::counter!(METRIC_SKIPPED, "reason" => *reason).increment(1);
-                    OpOutcome::Skipped(reason)
-                }
-                Prepared::Invalid(e) => OpOutcome::Failed(e.clone()),
-                Prepared::Upsert(u) => match admissions[i] {
+            let decided = outcome_without_sql(p, admissions[i], tracked);
+            let outcome = match (p, decided) {
+                (_, Some(outcome)) => outcome,
+                (Prepared::Skip(_) | Prepared::Invalid(_), None) => unreachable!("decided without SQL"),
+                (Prepared::Upsert(u), None) => match admissions[i] {
+                    // `outcome_without_sql` left it here: a follow of a
+                    // tracked repo, from any source. An unfollow written as
+                    // an edit must not leave the old subject stored
+                    // (following-audience design §4.2). Already counted.
                     Some(Admission::Reject(reason)) => {
-                        metrics::counter!(METRIC_SKIPPED, "reason" => reason.as_str()).increment(1);
-                        // A follow of a tracked repo, from any source: an
-                        // unfollow written as an edit must not leave the old
-                        // subject stored (following-audience design §4.2).
-                        if matches!(u.body, Body::Follow(_)) && sets.is_tracked(repo) {
-                            let target = OpTarget::RejectedFollow(u, reason.as_str());
-                            self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
-                                .await?
-                        } else {
-                            OpOutcome::Rejected(reason.as_str())
-                        }
+                        let target = OpTarget::RejectedFollow(u, reason.as_str());
+                        self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
+                            .await?
                     }
                     Some(Admission::GrowOnly) => {
                         let target = OpTarget::GrowOnly(u, &plans[i]);
@@ -707,7 +798,7 @@ impl Writer {
                             .await?
                     }
                 },
-                Prepared::Delete(d) => {
+                (Prepared::Delete(d), None) => {
                     self.run_with_attempts(&mut tx, options, OpTarget::Delete(d), repo, rev, sets, &mut effects)
                         .await?
                 }
@@ -3155,6 +3246,359 @@ mod tests {
             assert_eq!(ready, None);
             let depth: String = sqlx::query_scalar("SELECT depth FROM backfill_jobs WHERE did = $1")
                 .bind(AUTHOR)
+                .fetch_one(&db.pool)
+                .await
+                .expect("job");
+            assert_eq!(depth, "authz");
+            db.drop_db().await;
+        }
+
+        // Firehose throughput F1 (§1.6): no transaction for a commit that
+        // can write nothing.
+
+        fn raw(action: Action, collection: &str, rkey: &str, record: Option<Value>) -> RawOp {
+            RawOp {
+                action,
+                collection: collection.into(),
+                rkey: rkey.into(),
+                cid: record.as_ref().map(|_| format!("bafy{rkey}")),
+                record,
+            }
+        }
+
+        fn like_of(uri: &str) -> Value {
+            json!({"subject": {"uri": uri, "cid": "c"}, "createdAt": "2026-09-26T00:00:00Z"})
+        }
+
+        fn follow_of(did: &str) -> Value {
+            json!({"subject": did, "createdAt": "2026-09-26T00:00:00Z"})
+        }
+
+        /// Every `firehose_ops_skipped_total` series, as rendered.
+        fn skipped_series(handle: &metrics_exporter_prometheus::PrometheusHandle) -> Vec<String> {
+            let mut lines: Vec<String> = handle
+                .render()
+                .lines()
+                .filter(|l| l.starts_with("firehose_ops_skipped_total{"))
+                .map(str::to_string)
+                .collect();
+            lines.sort();
+            lines
+        }
+
+        /// T-F1-a: the pool's only connection is held, so any `begin()`
+        /// would wait; the call returns at once with the transaction path's
+        /// report and counters.
+        #[tokio::test]
+        async fn nothing_to_write_opens_no_transaction() {
+            let Some(db) = fresh_db("f1_nothing_to_write_opens_no_transaction").await else {
+                return;
+            };
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = metrics::set_default_local_recorder(&recorder);
+            let one = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with((*db.pool.connect_options()).clone())
+                .await
+                .expect("pool");
+            let held = one.acquire().await.expect("hold the only connection");
+            let w = Writer::new(one.clone(), ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10_000), Arc::new(DisabledPrivateTier));
+            set_public(&w, PublicMode::Off, None).await;
+            let stranger = "did:plc:f1aaaaaaaaaaaaaaaaaaaaaa";
+            let ops = [
+                raw(Action::Create, "app.bsky.feed.post", "3kpost", Some(json!({"text": "t", "createdAt": "2026-09-26T00:00:00Z"}))),
+                raw(Action::Create, "app.bsky.feed.like", "3klike", Some(like_of(&format!("at://{SUBJECT}/app.bsky.feed.post/1")))),
+                raw(Action::Create, "app.bsky.graph.follow", "3kfollow", Some(follow_of(SUBJECT))),
+                raw(Action::Create, "app.bsky.feed.generator", "3kgen", Some(json!({}))),
+            ];
+            let report = tokio::time::timeout(Duration::from_secs(1), w.apply(stranger, &rev(1), &ops, OPTIONS))
+                .await
+                .expect("returns without a connection")
+                .expect("apply");
+            assert!(!report.transaction);
+            assert_eq!(
+                report.outcomes,
+                [
+                    OpOutcome::Rejected("public_off"),
+                    OpOutcome::Rejected("public_off"),
+                    OpOutcome::Rejected("public_off"),
+                    OpOutcome::Skipped("unindexed")
+                ]
+            );
+            let text = handle.render();
+            assert_eq!(crate::test_support::series(&text, METRIC_SKIPPED, &["reason=\"public_off\""]), Some(3.0));
+            assert_eq!(crate::test_support::series(&text, METRIC_SKIPPED, &["reason=\"unindexed\""]), Some(1.0));
+            drop(held);
+            one.close().await;
+            db.drop_db().await;
+        }
+
+        /// One case of the equivalence table.
+        struct Case {
+            name: &'static str,
+            repo: &'static str,
+            members: &'static [&'static str],
+            owners: &'static [&'static str],
+            scope: &'static [&'static str],
+            off: bool,
+            /// The repo owns a list a member subscribes to (rule 4).
+            subscribed: bool,
+            ops: Vec<RawOp>,
+            transaction: bool,
+        }
+
+        const COUNTED: [&str; 12] = [
+            "SELECT count(*) FROM posts",
+            "SELECT count(*) FROM likes",
+            "SELECT count(*) FROM follows",
+            "SELECT count(*) FROM record_tombstones",
+            "SELECT count(*) FROM member_post_refs",
+            "SELECT count(*) FROM notifications",
+            "SELECT count(*) FROM feed_items",
+            "SELECT count(*) FROM scope_dids",
+            "SELECT count(*) FROM sync_state",
+            "SELECT count(*) FROM backfill_jobs",
+            "SELECT count(*) FROM subscribed_list_items",
+            "SELECT count(*) FROM members WHERE ready_at IS NULL",
+        ];
+
+        /// Run a case on a fresh database, normally or under
+        /// `WRITER_FORCE_TX` for its repo: the report, the skip series and
+        /// the row counts.
+        async fn run_case(case: &Case, force: bool) -> Option<(ApplyReport, Vec<String>, Vec<i64>)> {
+            use crate::subscriptions::list_phase;
+            use crate::subscriptions::references::{Budget, mute_list};
+            use crate::test_support::hooks;
+
+            let db = fresh_db(&format!("f1_case_{}", case.name)).await?;
+            let p = &db.pool;
+            for m in case.members {
+                sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())")
+                    .bind(m)
+                    .execute(p)
+                    .await
+                    .expect("member");
+            }
+            let mut sets = ScopeSets::default();
+            for m in case.members {
+                sets.members.insert((*m).into());
+                sets.scope.insert((*m).into());
+            }
+            for o in case.owners {
+                sets.private_owners.insert((*o).into());
+            }
+            for s in case.scope {
+                sets.scope.insert((*s).into());
+            }
+            let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000);
+            if case.subscribed {
+                let list = format!("at://{}/app.bsky.graph.list/3klist", case.repo);
+                mute_list(p, AUTHOR, &list, Budget { max_references: 5, max_owners: 5 }).await.expect("mute");
+                list_phase::apply(p, &list, 600).await.expect("apply");
+                scope.refresh_subscribed(p, std::slice::from_ref(&list)).await.expect("subscribed");
+            }
+            let w = Writer::new(p.clone(), scope, Arc::new(DisabledPrivateTier));
+            if case.off {
+                set_public(&w, PublicMode::Off, None).await;
+            }
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let report = {
+                let _local = metrics::set_default_local_recorder(&recorder);
+                let _force = force.then(|| hooks::arm(hooks::WRITER_FORCE_TX, case.repo));
+                w.apply(case.repo, &rev(2), &case.ops, OPTIONS).await.expect("apply")
+            };
+            let mut counts = Vec::new();
+            for sql in COUNTED {
+                counts.push(count(p, sql).await);
+            }
+            let skipped = skipped_series(&handle);
+            db.drop_db().await;
+            Some((report, skipped, counts))
+        }
+
+        /// T-F1-b: each case once normally and once on the transaction path
+        /// (`WRITER_FORCE_TX`), against fresh databases: the same report,
+        /// counters and rows.
+        #[tokio::test]
+        async fn nothing_to_write_matches_the_transaction_path() {
+            const MEMBER_CASE: &str = "did:plc:f1caselllllllllllllllll";
+            let post = |rkey: &str| raw(Action::Create, "app.bsky.feed.post", rkey, Some(json!({"text": "t", "createdAt": "2026-09-26T00:00:00Z"})));
+            let cases = vec![
+                Case { name: "out_of_scope_create", repo: "did:plc:f1caseaaaaaaaaaaaaaaaaaa", members: &[], owners: &[], scope: &[], off: false, subscribed: false, ops: vec![post("3kone")], transaction: false },
+                Case { name: "unindexed_only", repo: "did:plc:f1casebbbbbbbbbbbbbbbbbb", members: &[], owners: &[], scope: &[], off: false, subscribed: false, ops: vec![raw(Action::Create, "app.bsky.feed.generator", "3kgen", Some(json!({})))], transaction: false },
+                Case { name: "empty_commit", repo: "did:plc:f1casecccccccccccccccccc", members: &[], owners: &[], scope: &[], off: false, subscribed: false, ops: vec![], transaction: false },
+                Case { name: "invalid_like_rkey", repo: "did:plc:f1caseddddddddddddddddddd", members: &[], owners: &[], scope: &[], off: false, subscribed: false, ops: vec![raw(Action::Create, "app.bsky.feed.like", "bad rkey!", Some(like_of("at://did:plc:x/app.bsky.feed.post/1")))], transaction: false },
+                Case { name: "invalid_kryphocron_rkey", repo: "did:plc:f1caseeeeeeeeeeeeeeeeeee", members: &[], owners: &[], scope: &[], off: false, subscribed: false, ops: vec![raw(Action::Create, "tools.kryphocron.feed.postPrivate", "bad rkey!", Some(json!({})))], transaction: true },
+                Case { name: "out_of_scope_delete", repo: "did:plc:f1caseffffffffffffffffff", members: &[], owners: &[], scope: &[], off: false, subscribed: false, ops: vec![raw(Action::Delete, "app.bsky.feed.post", "3kone", None)], transaction: true },
+                Case {
+                    name: "members_rejected_op",
+                    repo: MEMBER_CASE,
+                    members: &[MEMBER_CASE],
+                    owners: &[],
+                    scope: &[],
+                    off: true,
+                    subscribed: false,
+                    ops: vec![raw(Action::Create, "app.bsky.feed.threadgate", "3kgate", Some(json!({"post": format!("at://{MEMBER_CASE}/app.bsky.feed.post/3kgate"), "createdAt": "2026-09-26T00:00:00Z"})))],
+                    transaction: true,
+                },
+                Case { name: "owners_unindexed_only", repo: "did:plc:f1casegggggggggggggggggg", members: &[], owners: &["did:plc:f1casegggggggggggggggggg"], scope: &[], off: false, subscribed: false, ops: vec![raw(Action::Create, "app.bsky.feed.generator", "3kgen", Some(json!({})))], transaction: true },
+                Case {
+                    name: "listitem_by_subscribed_owner",
+                    repo: "did:plc:f1casehhhhhhhhhhhhhhhhhh",
+                    members: &[],
+                    owners: &[],
+                    scope: &[],
+                    off: false,
+                    subscribed: true,
+                    ops: vec![raw(
+                        Action::Create,
+                        "app.bsky.graph.listitem",
+                        "3kitem",
+                        Some(json!({"list": "at://did:plc:f1casehhhhhhhhhhhhhhhhhh/app.bsky.graph.list/3klist", "subject": SUBJECT, "createdAt": "2026-09-26T00:00:00Z"})),
+                    )],
+                    transaction: true,
+                },
+                Case {
+                    name: "grow_only_reply",
+                    repo: "did:plc:f1caseiiiiiiiiiiiiiiiiii",
+                    members: &["did:plc:f1caseiiiiiiiiiiiiiiiiii"],
+                    owners: &[],
+                    scope: &[],
+                    off: true,
+                    subscribed: false,
+                    ops: vec![raw(Action::Create, "app.bsky.feed.post", "3kreply", Some(json!({"text": "r", "createdAt": "2026-09-26T00:00:00Z", "reply": {
+                        "root": {"uri": format!("at://{SUBJECT}/app.bsky.feed.post/1"), "cid": "c"},
+                        "parent": {"uri": format!("at://{SUBJECT}/app.bsky.feed.post/1"), "cid": "c"}}})))],
+                    transaction: true,
+                },
+                Case {
+                    name: "admitted_like",
+                    repo: "did:plc:f1casejjjjjjjjjjjjjjjjjj",
+                    members: &["did:plc:f1casekkkkkkkkkkkkkkkkkk"],
+                    owners: &[],
+                    scope: &[],
+                    off: false,
+                    subscribed: false,
+                    ops: vec![raw(Action::Create, "app.bsky.feed.like", "3klike", Some(like_of("at://did:plc:f1casekkkkkkkkkkkkkkkkkk/app.bsky.feed.post/1")))],
+                    transaction: true,
+                },
+            ];
+            for case in &cases {
+                let Some((normal, skipped, rows)) = run_case(case, false).await else {
+                    return;
+                };
+                let (forced, forced_skipped, forced_rows) = run_case(case, true).await.expect("database");
+                assert_eq!(normal.transaction, case.transaction, "{}", case.name);
+                assert!(forced.transaction, "{}", case.name);
+                assert_eq!(
+                    ApplyReport { transaction: false, ..normal.clone() },
+                    ApplyReport { transaction: false, ..forced },
+                    "{}",
+                    case.name
+                );
+                assert_eq!(skipped, forced_skipped, "{}", case.name);
+                assert_eq!(rows, forced_rows, "{}", case.name);
+                if case.name == "invalid_kryphocron_rkey" {
+                    assert!(normal.readiness_cleared, "{}", case.name);
+                }
+            }
+        }
+
+        /// T-F1-c: a private owner (tracked, not in scope) whose follow
+        /// admission rejects still takes S10's path: the row goes, a
+        /// tombstone refuses the older rev, and the skip is counted once.
+        #[tokio::test]
+        async fn a_tracked_repos_rejected_follow_still_takes_the_s10_path() {
+            let Some(db) = fresh_db("f1_rejected_follow_s10").await else {
+                return;
+            };
+            let p = &db.pool;
+            let owner = "did:plc:f1ownermmmmmmmmmmmmmmmmm";
+            let mut sets = ScopeSets::default();
+            sets.members.insert(SUBJECT.into());
+            sets.scope.insert(SUBJECT.into());
+            sets.private_owners.insert(owner.into());
+            let w = Writer::new(p.clone(), ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000), Arc::new(DisabledPrivateTier));
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = metrics::set_default_local_recorder(&recorder);
+            let follow = |subject: &str| raw(Action::Create, "app.bsky.graph.follow", "3kfollow", Some(follow_of(subject)));
+            let uri = format!("at://{owner}/app.bsky.graph.follow/3kfollow");
+
+            // 1. Following a member: admitted and stored.
+            let r = w.apply(owner, &rev(1), &[follow(SUBJECT)], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written]);
+            assert_eq!(count(p, "SELECT count(*) FROM follows").await, 1);
+            let skipped = |h: &metrics_exporter_prometheus::PrometheusHandle| {
+                crate::test_support::series(&h.render(), METRIC_SKIPPED, &["reason=\"not_in_scope\""]).unwrap_or(0.0)
+            };
+            let before = skipped(&handle);
+
+            // 2. The same URI at rev 2 names someone out of scope.
+            let mut update = follow("did:plc:f1outsideoooooooooooooo");
+            update.action = Action::Update;
+            let r = w.apply(owner, &rev(2), &[update], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Rejected("not_in_scope")]);
+            assert!(r.transaction);
+            assert_eq!(count(p, "SELECT count(*) FROM follows").await, 0);
+            let tomb: String = sqlx::query_scalar("SELECT rev FROM record_tombstones WHERE uri = $1").bind(&uri).fetch_one(p).await.expect("tombstone");
+            assert_eq!(tomb, rev(2));
+            let verified: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT follows_verified_at FROM sync_state WHERE did = $1")
+                .bind(owner)
+                .fetch_one(p)
+                .await
+                .expect("sync_state");
+            assert_eq!(verified, None);
+            assert_eq!(skipped(&handle) - before, 1.0);
+
+            // 3. Replaying rev 1 stores nothing.
+            w.apply(owner, &rev(1), &[follow(SUBJECT)], OPTIONS).await.expect("apply");
+            assert_eq!(count(p, "SELECT count(*) FROM follows").await, 0);
+            db.drop_db().await;
+        }
+
+        /// T-F1-d: a member's commit with nothing admitted still advances
+        /// both revs.
+        #[tokio::test]
+        async fn tracked_repo_with_nothing_admitted_still_advances_firehose_rev() {
+            let Some(db) = fresh_db("f1_tracked_advances_firehose_rev").await else {
+                return;
+            };
+            let w = writer(&db.pool, true);
+            let r = w
+                .apply(AUTHOR, &rev(7), &[raw(Action::Create, "app.bsky.feed.generator", "3kgen", Some(json!({})))], OPTIONS)
+                .await
+                .expect("apply");
+            assert!(r.transaction);
+            let revs: (Option<String>, Option<String>) = sqlx::query_as("SELECT applied_rev, firehose_rev FROM sync_state WHERE did = $1")
+                .bind(AUTHOR)
+                .fetch_one(&db.pool)
+                .await
+                .expect("sync_state");
+            assert_eq!(revs, (Some(rev(7)), Some(rev(7))));
+            db.drop_db().await;
+        }
+
+        /// T-F1-e: an untracked repo's invalid kryphocron op clears its
+        /// readiness and enqueues `authz`, in a transaction.
+        #[tokio::test]
+        async fn kryphocron_invalid_op_still_clears_readiness() {
+            let Some(db) = fresh_db("f1_kryphocron_invalid_clears").await else {
+                return;
+            };
+            let w = writer(&db.pool, false);
+            let stranger = "did:plc:f1kryphocronnnnnnnnnnnnn";
+            let r = w
+                .apply(stranger, &rev(1), &[raw(Action::Create, "tools.kryphocron.feed.postPrivate", "bad rkey!", Some(json!({})))], OPTIONS)
+                .await
+                .expect("apply");
+            assert!(r.transaction);
+            assert!(r.readiness_cleared);
+            assert_eq!(r.failed.len(), 1);
+            let depth: String = sqlx::query_scalar("SELECT depth FROM backfill_jobs WHERE did = $1")
+                .bind(stranger)
                 .fetch_one(&db.pool)
                 .await
                 .expect("job");

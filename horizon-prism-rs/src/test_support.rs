@@ -54,12 +54,16 @@ pub async fn serve_fake(router: axum::Router) -> String {
 
 /// In a Prometheus rendering, the value of the series `name` whose labels
 /// include every one of `labels` (each `key="value"`), if there is one.
+/// With no `labels`, an unlabelled series matches too.
 /// Read metrics with a recorder set by `metrics::set_default_local_recorder`
 /// in a `#[tokio::test]`, whose runtime runs on the test's thread.
 #[must_use]
 pub fn series(text: &str, name: &str, labels: &[&str]) -> Option<f64> {
     text.lines()
-        .filter(|l| l.strip_prefix(name).is_some_and(|rest| rest.starts_with('{')))
+        .filter(|l| {
+            l.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('{') || (labels.is_empty() && rest.starts_with(' ')))
+        })
         .find(|l| labels.iter().all(|label| l.contains(label)))
         .and_then(|l| l.rsplit(' ').next())
         .and_then(|v| v.parse().ok())
@@ -190,6 +194,32 @@ pub mod hooks {
     /// `getRecord`, before it re-reads the stored row. Key:
     /// `<database>/<did>`.
     pub const PASS_BEFORE_REREAD: &str = "s10_pass_before_reread";
+    /// Firehose throughput F1: `Writer::apply` opens its transaction even
+    /// for a commit with nothing to write. Key: the repo, or `*` for every
+    /// repo (the solo bench only).
+    pub const WRITER_FORCE_TX: &str = "fh_writer_force_tx";
+    /// Firehose throughput §2.4: `Writer::apply`, before anything else,
+    /// sleeps for the armed delay and fails transiently ([`delay`]). Key:
+    /// the database.
+    pub const WRITER_HANG: &str = "fh_writer_hang";
+    /// Firehose throughput §2.4: the consumer sleeps for the armed delay
+    /// before it processes an entry ([`delay`]). Key: the database.
+    pub const CONSUMER_STALL: &str = "fh_consumer_stall";
+    /// Firehose throughput §2.4: a trim gap's transaction committed and its
+    /// anchor decided, before `reanchor`. Key: the database.
+    pub const BEFORE_REANCHOR: &str = "fh_before_reanchor";
+    /// Firehose throughput F6: the gap transaction fails before it begins.
+    /// Key: the database.
+    pub const GAP_TX_FAILS: &str = "fh_gap_tx_fails";
+    /// Firehose throughput F6: the recreation gap marked owed, before the
+    /// group is created. Key: the database.
+    pub const AFTER_RECREATION_FLAG: &str = "fh_after_recreation_flag";
+    /// Firehose throughput F6: the group created, before the recreation
+    /// gap. Key: the database.
+    pub const AFTER_RECREATION_CREATE: &str = "fh_after_recreation_create";
+    /// Firehose throughput F6: the group-creation script fails. Key: the
+    /// database.
+    pub const GROUP_CREATE_FAILS: &str = "fh_group_create_fails";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);
@@ -200,6 +230,25 @@ pub mod hooks {
         hits: watch::Sender<usize>,
         /// Closed on release: every wait at the site then passes.
         gate: Semaphore,
+        /// A [`delay`] site's sleep.
+        delay: Option<Duration>,
+        /// The site fires this many times at most.
+        limit: Option<usize>,
+    }
+
+    impl Point {
+        /// Count a hit unless the limit is reached; whether it was counted.
+        fn hit(&self) -> bool {
+            let mut fired = false;
+            self.hits.send_if_modified(|n| {
+                fired = self.limit.is_none_or(|limit| *n < limit);
+                if fired {
+                    *n += 1;
+                }
+                fired
+            });
+            fired
+        }
     }
 
     type Points = HashMap<&'static str, HashMap<String, Arc<Point>>>;
@@ -234,18 +283,36 @@ pub mod hooks {
         let Some(point) = lookup(name, key) else {
             return;
         };
-        point.hits.send_modify(|n| *n += 1);
-        let _ = point.gate.acquire().await;
+        if point.hit() {
+            let _ = point.gate.acquire().await;
+        }
     }
 
     /// An error site: whether `name` is armed for `key`, so the site fails
-    /// as if its statement had. Counts the hit.
+    /// as if its statement had. Counts the hit. Armed with [`arm_times`],
+    /// it fires that many times and then no more.
     #[must_use]
     pub fn injected(name: &'static str, key: &str) -> bool {
-        lookup(name, key).is_some_and(|point| {
-            point.hits.send_modify(|n| *n += 1);
-            true
-        })
+        lookup(name, key).is_some_and(|point| point.hit())
+    }
+
+    /// A delay site: when `name` is armed for `key` with [`arm_delay`],
+    /// count the hit, then sleep for the armed delay with
+    /// `tokio::time::sleep`, so other tasks on the test's thread run. The
+    /// hit is counted when the sleep begins, so [`Armed::reached`] tells the
+    /// test it has. Returns whether it slept.
+    pub async fn delay(name: &'static str, key: &str) -> bool {
+        let Some(point) = lookup(name, key) else {
+            return false;
+        };
+        let Some(d) = point.delay else {
+            return false;
+        };
+        if !point.hit() {
+            return false;
+        }
+        tokio::time::sleep(d).await;
+        true
     }
 
     /// An armed hook. Dropping it, a failed test's unwinding included,
@@ -259,7 +326,24 @@ pub mod hooks {
     /// Arm `name` for `key`. One arming per name and key at a time.
     #[must_use]
     pub fn arm(name: &'static str, key: &str) -> Armed {
-        let point = Arc::new(Point { hits: watch::Sender::new(0), gate: Semaphore::new(0) });
+        arm_point(name, key, None, None)
+    }
+
+    /// Arm `name` for `key` to fire `times` times and then no more.
+    #[must_use]
+    pub fn arm_times(name: &'static str, key: &str, times: usize) -> Armed {
+        arm_point(name, key, None, Some(times))
+    }
+
+    /// Arm the [`delay`] site `name` for `key` with a sleep of `d`, `times`
+    /// times at most (`None`: while armed).
+    #[must_use]
+    pub fn arm_delay(name: &'static str, key: &str, d: Duration, times: Option<usize>) -> Armed {
+        arm_point(name, key, Some(d), times)
+    }
+
+    fn arm_point(name: &'static str, key: &str, delay: Option<Duration>, limit: Option<usize>) -> Armed {
+        let point = Arc::new(Point { hits: watch::Sender::new(0), gate: Semaphore::new(0), delay, limit });
         let mut points = points().lock().unwrap_or_else(PoisonError::into_inner);
         let fresh = points.entry(name).or_default().insert(key.to_string(), Arc::clone(&point)).is_none();
         assert!(fresh, "{name} is already armed for {key}");

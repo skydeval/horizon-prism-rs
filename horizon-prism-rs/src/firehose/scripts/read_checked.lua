@@ -6,9 +6,13 @@
 --
 -- Returns one of:
 --   {'nogroup'}
---   {'gap', first_entry_id, entries_added, length}   (group state unchanged)
---   {'ok'}                                            (no entries)
---   {'ok', <XREADGROUP reply>}
+--   {'gap', first_entry_id, entries_added, length, last_generated_id}
+--                                      (group state unchanged)
+--   {'ok', entries_added}                (no entries)
+--   {'ok', entries_added, <XREADGROUP reply>}
+--
+-- entries_added rides on every reply but 'nogroup', for the worker's input
+-- rate (firehose throughput design §2.2).
 
 local stream, group, consumer, count = KEYS[1], ARGV[1], ARGV[2], ARGV[3]
 
@@ -84,11 +88,11 @@ elseif first_id and cmp_id(first_id, last_delivered) > 0
   gap = true
 end
 if gap then
-  return {'gap', first_id or '', tostring(added), tostring(length)}
+  return {'gap', first_id or '', tostring(added), tostring(length), field(info, 'last-generated-id')}
 end
 
 local reply = redis.call('XREADGROUP', 'GROUP', group, consumer, 'COUNT', count, 'STREAMS', stream, '>')
 if not reply then
-  return {'ok'}
+  return {'ok', tostring(added)}
 end
-return {'ok', reply}
+return {'ok', tostring(added), reply}

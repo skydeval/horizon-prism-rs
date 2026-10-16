@@ -395,6 +395,30 @@ groups:
       - alert: FollowingOwnersWaitingFirehose
         expr: following_owners_waiting_firehose > 0
         for: 6h
+      # The consumer has spent more than half its time on full, gap-free
+      # batches for 15 min: its input is at or near its capacity, or it is
+      # recovering from a long stall, and it has no margin for a burst. The
+      # same condition logs `firehose_headroom_warn`. Backlog capacity, while
+      # there is a backlog to measure, is
+      # rate(firehose_entries_processed_backlog_total[5m]) / rate(firehose_consumer_backlog_busy_seconds_total[5m]);
+      # it should stay at least twice the input.
+      - alert: FirehoseBacklogPersistent
+        expr: rate(firehose_consumer_backlog_busy_seconds_total[5m]) > 0.5
+        for: 15m
+      # The consumer processes less than its stream gains, or does not run.
+      - alert: FirehoseConsumerSlowerThanInput
+        expr: sum without (path) (rate(firehose_entries_processed_total[5m])) < 0.95 * rate(firehose_stream_entries_added_total[5m])
+        for: 5m
+      # The consumer group is still missing after the worker should have
+      # recreated it, for example a create that keeps failing under `noeviction`.
+      - alert: FirehoseGroupMissing
+        expr: firehose_consumer_group_present == 0
+        for: 2m
+      # More than half of the lag sampler's calls failed or timed out: Redis
+      # is unreachable, hung or stuck (`LOADING`, `BUSY`).
+      - alert: FirehoseSamplerFailing
+        expr: sum without (call) (rate(firehose_lag_sample_failures_total[5m])) / sum without (call) (rate(firehose_lag_sample_calls_total[5m])) > 0.5
+        for: 5m
 ```
 
 A latched audit guard (design §6.5) makes `/xrpc/_health` return 503. `docker compose ps` then shows `app` as unhealthy. Restart `app` after investigating the logged panic.

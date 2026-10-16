@@ -2,6 +2,7 @@
 //! normalization, the LWW writer, watermarks, gap handling, relay coverage,
 //! dead letters and backfill jobs.
 
+pub mod alert_rules;
 pub mod backfill;
 pub mod classifier;
 pub mod consumer;
