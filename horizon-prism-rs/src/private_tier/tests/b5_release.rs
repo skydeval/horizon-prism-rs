@@ -236,6 +236,14 @@ async fn load(which: Which) -> Option<Loaded> {
         "INSERT INTO sync_state (did, applied_rev, head_rev, head_checked_at) SELECT did, '{APPLIED}', '{APPLIED}', now() FROM actors \
          ON CONFLICT (did) DO UPDATE SET applied_rev = '{APPLIED}', head_rev = '{APPLIED}', head_checked_at = now()"
     )).await;
+    // A deployment past its first day: the one-time v3 re-sync is done, and
+    // every tracked DID's daily `authz` is queued for later, so `serve`
+    // starts no backfill (each would fail against plc.invalid and write to
+    // the database during the measurements).
+    exec(&pool, "INSERT INTO worker_state (key, value) VALUES ('v3_collections_resync', '{\"phase\": \"done\"}'::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value").await;
+    exec(&pool, "INSERT INTO backfill_jobs (did, depth, state, not_before) \
+                 SELECT did, d, 'queued', now() + interval '30 days' FROM scope_dids, unnest(ARRAY['authz', 'resync']) d \
+                 ON CONFLICT (did, depth) DO NOTHING").await;
     // Every member's DID document (amendment 1 §2.2).
     let dids: Vec<String> = sqlx::query_scalar("SELECT did FROM members").fetch_all(&pool).await.expect("members");
     let docs: Vec<Value> = dids.iter().map(|d| document(d, &key_for(d, &extra))).collect();
@@ -672,6 +680,11 @@ async fn run(db: &Loaded, bin: &Path, concurrency: usize, samples_c8: usize) -> 
         failures.push(format!("{}: {fetch_failures} JWT fetch failures at the end, {expected_failures} after the auth check", db.title));
     }
     failures.extend(validity(db, &text, "at the end").await.into_iter().map(|v| format!("void: {v}")));
+    let failed_jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM backfill_jobs WHERE last_error IS NOT NULL")
+        .fetch_one(&db.pool)
+        .await
+        .expect("jobs");
+    println!("  B-5 (3) {:<52} backfill jobs that ran and failed during the run: {failed_jobs}", db.title);
     stop.store(true, Ordering::SeqCst);
     serve.stop().await;
     let _ = feeder.await;
@@ -775,31 +788,45 @@ async fn b5_stale_head_chain() {
     assert!(failures.is_empty(), "{} failing cases:\n{}", failures.len(), failures.join("\n"));
 }
 
-/// Diagnosis: the plans of the unread count (on the distinct-parents
-/// fixture) and the timeline (on the V-outside fixture) as a fresh session
-/// plans them, and as a generic plan, timed with `EXPLAIN ANALYZE`.
+/// Diagnosis: the full `EXPLAIN (ANALYZE, BUFFERS)` of the statements behind
+/// part (3)'s slow cases, each on its fixture's freshly loaded database:
+/// the unread count (distinct parents), the timeline's first batch (V
+/// outside G, and posts that fail the prefilter), the reply counts of the
+/// node flood, and the quote counts of X. `HPRS_B5_ONLY` picks fixtures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "B-5 part (3) plan diagnosis; run by hand"]
 async fn b5_release_plans() {
+    let only = std::env::var("HPRS_B5_ONLY").ok();
     let none: Option<DateTime<Utc>> = None;
-    for (fixture, what) in [(Part3::Distinct, "unread"), (Part3::Outside, "timeline")] {
+    for fixture in [Part3::Distinct, Part3::Outside, Part3::PrefilterFails, Part3::Floods, Part3::FailingQuotes] {
+        if only.as_deref().is_some_and(|o| !o.split(',').any(|s| s == fixture.slug())) {
+            continue;
+        }
         let Some(db) = load(Which::Fixture(fixture, CAP)).await else {
             return;
         };
-        let sql = if what == "unread" { schema::unread_statement(CAP) } else { schema::timeline_statement(CAP) };
-        for mode in ["auto", "force_generic_plan"] {
-            let mut conn = db.pool.acquire().await.expect("conn");
-            exec_on(&mut conn, &format!("SET plan_cache_mode = {mode}")).await;
-            let text = format!("EXPLAIN (ANALYZE, BUFFERS) {sql}");
-            let q = sqlx::query_scalar::<_, String>(&text).bind(DAVE);
-            let q = if what == "unread" { q } else { q.bind(none).bind("").bind(51i64) };
-            let plan: Vec<String> = q.fetch_all(&mut *conn).await.expect("explain");
-            println!("==== {what}, plan_cache_mode {mode}: {}\n{}", plan.last().cloned().unwrap_or_default(), plan.iter().take(80).cloned().collect::<Vec<_>>().join("\n"));
-        }
+        // The URIs of the fixture's first getPosts case.
+        let uris: Vec<String> = db
+            .cases
+            .iter()
+            .find(|c| c.1 == POSTS)
+            .map(|c| c.2.split('&').filter_map(|p| p.strip_prefix("uris=")).map(String::from).collect())
+            .unwrap_or_default();
+        let (what, sql) = match fixture {
+            Part3::Distinct => ("unread", schema::unread_statement(CAP)),
+            Part3::Floods => ("reply counts", schema::reply_counts_statement(CAP)),
+            Part3::FailingQuotes => ("quote counts", schema::quote_counts_statement(CAP)),
+            _ => ("timeline", schema::timeline_statement(CAP)),
+        };
+        let text = format!("EXPLAIN (ANALYZE, BUFFERS) {sql}");
+        let q = sqlx::query_scalar::<_, String>(&text).bind(DAVE);
+        let q = match what {
+            "unread" => q,
+            "timeline" => q.bind(none).bind("").bind(51i64),
+            _ => q.bind(&uris),
+        };
+        let plan: Vec<String> = q.fetch_all(&db.pool).await.expect("explain");
+        println!("==== {}, {what}: {}\n{}", fixture.title(), plan.last().cloned().unwrap_or_default(), plan.join("\n"));
         db.drop_db().await;
     }
-}
-
-async fn exec_on(conn: &mut sqlx::PgConnection, sql: &str) {
-    sqlx::query(sql).execute(conn).await.expect("exec");
 }

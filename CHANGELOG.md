@@ -235,7 +235,11 @@ commit.
     failures, 5 000 failing quotes, `limit × 8 + 1` undecodable
     candidates, 48 undecodable children per thread node, 50 000 likes,
     and 5 000 posts that fail the prefilter. Nothing is added to the
-    binary.
+    binary. Each loaded database is a deployment past its first day (the
+    one-time re-sync done, daily `authz` queued for later), so `serve`
+    runs no backfill during a measurement, and the runner reports any
+    that did. `b5_release_plans` prints the full plans of the slow
+    statements.
 - Pre-release count: run `cargo test pre_s12_count_query -- --ignored
   --nocapture` and the two printed queries read-only on the deployed
   database before S12 ships; not yet run on prism.
