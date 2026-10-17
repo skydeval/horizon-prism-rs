@@ -7,6 +7,8 @@ mod following;
 // S12, private threads and branches, on this module's fixtures: the read
 // rule, the one builder, the head round, and B-5's release gate.
 mod b5;
+// B-5 part (3) on the deploy build (private-threads amendment 1 §2).
+mod b5_release;
 mod builder;
 mod round;
 mod threads;

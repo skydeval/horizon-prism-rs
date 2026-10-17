@@ -186,6 +186,15 @@ commit.
   whose reader is outside the audience still pay one primary-key lookup
   per row up to the branch root (about 4×, 6× and 10× HEAD's cost at
   depths 4, 8 and 16), as does a chain past the cap.
+- **Accepted walk costs (#720).** Two costs ship as measured, with no
+  index or config change: a branch reply whose reader is outside the
+  audience, under distinct parents, costs about 4.1×, 6.3× and 10.4×
+  HEAD's statement at depths 4, 8 and 16; and a branch chain deeper than
+  `max_chain` under an audience the reader is outside costs about 7.5×
+  HEAD's at `max_chain` 16 and 42× at 100 (Prism runs 100). A flood needs
+  one stored branch post per row in one long chain, under the attacker's
+  own audience, and is bounded by the cap. #720's set-based branch-root
+  walk is the fix for both. T-54 holds them at the measured ratio × 1.1.
 - **The B-5 bench.** A cargo feature `bench-heads` (never in a deploy
   build: the Dockerfile passes no features, a featureless build refuses a
   `[bench]` section, and a feature build refuses to start without a
@@ -193,6 +202,19 @@ commit.
   and runs no background head prober. The ignored tests
   `b5_row_class_ratios`, `b5_absolute_floors` and `b5_stale_head_chain`
   build the synthetic snapshot and measure the gate.
+  - B-5 part (3) runs against the deploy build itself (`b5_release`):
+    one fresh database per fixture and configuration, every member's
+    DID document seeded in `did_cache` so readers' tokens verify with no
+    network fetch (PLC points at an unresolvable host, so a miss fails
+    closed), a feeder that keeps the private watermark and heads fresh,
+    checks that the run saw no gap and that a wrong-key token is refused
+    after exactly one failed fetch, and each case gated on the server's
+    own `private_read_unfloored_seconds`. Only the stale-head chain uses
+    the `bench-heads` build. Six more fixtures: T-58's self-service
+    failures, 5 000 failing quotes, `limit × 8 + 1` undecodable
+    candidates, 48 undecodable children per thread node, 50 000 likes,
+    and 5 000 posts that fail the prefilter. Nothing is added to the
+    binary.
 - Pre-release count: run `cargo test pre_s12_count_query -- --ignored
   --nocapture` and the two printed queries read-only on the deployed
   database before S12 ships; not yet run on prism.

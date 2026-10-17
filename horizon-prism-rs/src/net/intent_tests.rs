@@ -21,10 +21,16 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Files that are test modules as a whole.
+/// Files that are test modules as a whole: a `tests.rs`, and every file
+/// under a `tests/` directory (the submodules of a `#[cfg(test)] mod
+/// tests`, such as B-5's release runner, which drives `serve` over HTTP).
 fn test_only(relative: &str) -> bool {
     let file = relative.rsplit('/').next().unwrap_or_default();
-    file == "tests.rs" || file.ends_with("_tests.rs") || file == "test_support.rs" || relative == "services/e2e.rs"
+    file == "tests.rs"
+        || file.ends_with("_tests.rs")
+        || relative.contains("/tests/")
+        || file == "test_support.rs"
+        || relative == "services/e2e.rs"
 }
 
 /// The non-test code of every source file, as `(path under src/, code)`:
