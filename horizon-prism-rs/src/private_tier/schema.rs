@@ -442,46 +442,83 @@ fn other_anchor(br: &str) -> String {
     )
 }
 
+/// The key of a `(parent, root)` pair in a statement's maps (`brm`, `pvm`):
+/// the two URIs joined by a space, which no URI contains.
+fn pair_key(parent: &str, root: &str) -> String {
+    format!("({parent} || ' ' || {root})")
+}
+
+/// The branch root of `c`'s `(parent, root)` key, from the `brm` map.
+const BR_OF_C: &str = "((SELECT m FROM brm) ->> (c.reply_parent_uri || ' ' || c.reply_root_uri))";
+
+/// Why the per-key results are maps (B-5 part (3), 2026-10-17): a statement's
+/// CTEs carry the planner's estimate of `c`, which a shape's filters can put
+/// at 1 row when thousands come back. Joined back to `c` by equality, a CTE
+/// is then scanned once per row (a nested loop over two CTE scans, 25M
+/// comparisons for 5 000 rows). Each per-key result is instead folded into
+/// one `jsonb` object, read once as an init plan, and looked up per row by
+/// key, a binary search whatever the estimate.
+///
 /// The anchors of a statement's rows that do not anchor on themselves, each
-/// looked up once with its audience (the `ak` CTE): rows sharing a root or a
-/// branch root share one lookup.
+/// looked up once (the `akm` map, by the anchor's URI): rows sharing a root
+/// or a branch root share one lookup. Their audiences are the `gm` map.
 fn anchor_keys(s1_filter: &str) -> String {
     format!(
-        "SELECT an.uri, an.author_did, an.audience_uri, an.reply_parent_uri, an.reply_root_uri, \
-                a.uri AS a_uri, a.owner_did AS a_owner_did, a.mode AS a_mode, a.members AS a_members \
-         FROM (SELECT DISTINCT {other} AS k FROM c \
-               LEFT JOIN br ON br.parent = c.reply_parent_uri AND br.root = c.reply_root_uri {s1_filter}) d \
-         JOIN private_posts an ON an.uri = d.k \
-         LEFT JOIN private_audiences a ON a.uri = an.audience_uri",
-        other = other_anchor("br.branch_root"),
+        "SELECT COALESCE(jsonb_object_agg(an.uri, jsonb_build_object( \
+                  'author_did', an.author_did, 'audience_uri', an.audience_uri, \
+                  'reply_parent_uri', an.reply_parent_uri, 'reply_root_uri', an.reply_root_uri)), '{{}}'::jsonb) AS m \
+         FROM (SELECT DISTINCT {other} AS k FROM c {s1_filter}) d \
+         JOIN private_posts an ON an.uri = d.k",
+        other = other_anchor(BR_OF_C),
     )
 }
 
+/// The governing audiences of the anchors in `akm` (the `gm` map, by the
+/// audience's URI).
+const AUDIENCE_KEYS: &str = "SELECT COALESCE(jsonb_object_agg(g.uri, jsonb_build_object( \
+       'owner_did', g.owner_did, 'mode', g.mode, 'members', to_jsonb(g.members))), '{}'::jsonb) AS m \
+     FROM private_audiences g \
+     WHERE g.uri IN (SELECT DISTINCT v.value ->> 'audience_uri' FROM akm, jsonb_each(akm.m) v)";
+
+/// `d` is listed in G's `members`: G's own array for a row that anchors on
+/// itself, else the `gm` entry's (`a.members_j`); `mapped` is false where `a`
+/// is a `private_audiences` row (the walk).
+fn listed(d: &str, mapped: bool) -> String {
+    if mapped {
+        format!("COALESCE({d} = ANY(a.members), a.members_j ? {d})")
+    } else {
+        format!("{d} = ANY(a.members)")
+    }
+}
+
 /// The FROM fragment joining `c`'s author (`po`), its anchor (`an`) and the
-/// governing audience G (`a`) (§3.1), after `br`. A row that anchors on
-/// itself is its own anchor (its row as `c` read it) and G is its own
-/// audience, looked up directly; any other row's anchor and G come from
-/// `ak`, by the anchor's URI. `an` and `a` are the columns either way, as a
-/// lookup by the anchor's URI gives them.
+/// governing audience G (`a`) (§3.1). A row that anchors on itself is its
+/// own anchor (its row as `c` read it) and G is its own audience, looked up
+/// directly; any other row's anchor and G come from the `akm` and `gm` maps,
+/// by the anchor's URI. `an` and `a` are the columns either way, as a lookup
+/// by the anchor's URI gives them; G's members are `a.members` for the
+/// first and `a.members_j` for the second.
 fn anchor_join() -> String {
     let own = self_anchored();
-    let pick = |own_col: &str, ak_col: &str, name: &str| format!("CASE WHEN {own} THEN {own_col} ELSE {ak_col} END AS {name}");
+    let pick = |own_col: &str, map_col: &str, name: &str| format!("CASE WHEN {own} THEN {own_col} ELSE {map_col} END AS {name}");
     format!(
         "LEFT JOIN actors po ON po.did = c.author_did \
-         LEFT JOIN ak ON ak.uri = {other} \
+         CROSS JOIN LATERAL (SELECT (SELECT m FROM akm) -> {other} AS v) ak \
+         CROSS JOIN LATERAL (SELECT (SELECT m FROM gm) -> (ak.v ->> 'audience_uri') AS v) gk \
          LEFT JOIN private_audiences a0 ON a0.uri = CASE WHEN {own} THEN c.audience_uri END \
          CROSS JOIN LATERAL (SELECT {an_uri}, {an_author}, {an_audience}, {an_parent}, {an_root}) an \
-         CROSS JOIN LATERAL (SELECT {a_uri}, {a_owner}, {a_mode}, {a_members}) a",
-        other = other_anchor("br.branch_root"),
-        an_uri = pick("c.uri", "ak.uri", "uri"),
-        an_author = pick("c.author_did", "ak.author_did", "author_did"),
-        an_audience = pick("c.audience_uri", "ak.audience_uri", "audience_uri"),
-        an_parent = pick("c.reply_parent_uri", "ak.reply_parent_uri", "reply_parent_uri"),
-        an_root = pick("c.reply_root_uri", "ak.reply_root_uri", "reply_root_uri"),
-        a_uri = pick("a0.uri", "ak.a_uri", "uri"),
-        a_owner = pick("a0.owner_did", "ak.a_owner_did", "owner_did"),
-        a_mode = pick("a0.mode", "ak.a_mode", "mode"),
-        a_members = pick("a0.members", "ak.a_members", "members"),
+         CROSS JOIN LATERAL (SELECT {a_uri}, {a_owner}, {a_mode}, {a_members}, \
+           CASE WHEN {own} THEN NULL ELSE gk.v -> 'members' END AS members_j) a",
+        other = other_anchor(BR_OF_C),
+        an_uri = pick("c.uri", &format!("CASE WHEN ak.v IS NOT NULL THEN {} END", other_anchor(BR_OF_C)), "uri"),
+        an_author = pick("c.author_did", "ak.v ->> 'author_did'", "author_did"),
+        an_audience = pick("c.audience_uri", "ak.v ->> 'audience_uri'", "audience_uri"),
+        an_parent = pick("c.reply_parent_uri", "ak.v ->> 'reply_parent_uri'", "reply_parent_uri"),
+        an_root = pick("c.reply_root_uri", "ak.v ->> 'reply_root_uri'", "reply_root_uri"),
+        a_uri = pick("a0.uri", "CASE WHEN gk.v IS NOT NULL THEN ak.v ->> 'audience_uri' END", "uri"),
+        a_owner = pick("a0.owner_did", "gk.v ->> 'owner_did'", "owner_did"),
+        a_mode = pick("a0.mode", "gk.v ->> 'mode'", "mode"),
+        a_members = pick("a0.members", "NULL::text[]", "members"),
     )
 }
 
@@ -495,15 +532,16 @@ fn ao_status() -> &'static str {
 /// `d` stands under G (`a` in scope) as O's (`o`) writer (§2.4): by the
 /// PDS's write rule for the mode. `verified` is O's follow-verification
 /// flag, used only under `following`.
-fn standing(d: &str, o: &str, verified: &str) -> String {
+fn standing(d: &str, o: &str, verified: &str, mapped: bool) -> String {
     format!(
         "CASE COALESCE(a.mode, 'list') \
-           WHEN 'list' THEN {d} = ANY(a.members) \
+           WHEN 'list' THEN {listed} \
            WHEN 'followers' THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = {d} AND f.subject_did = {o}) \
            WHEN 'everyone' THEN true \
            WHEN 'following' THEN {follows} AND {verified} \
            ELSE false END",
         follows = owner_follows(o, d),
+        listed = listed(d, mapped),
     )
 }
 
@@ -513,7 +551,7 @@ fn standing(d: &str, o: &str, verified: &str) -> String {
 fn reader_inside() -> String {
     format!(
         "CASE COALESCE(a.mode, 'list') \
-           WHEN 'list' THEN $1 = ANY(a.members) \
+           WHEN 'list' THEN {listed} \
            WHEN 'followers' THEN a.owner_did = $1 OR EXISTS ( \
              SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = a.owner_did) \
            WHEN 'everyone' THEN true \
@@ -521,6 +559,7 @@ fn reader_inside() -> String {
            ELSE false END",
         follows = owner_follows("a.owner_did", "$1"),
         verified = follows_verified("a.owner_did"),
+        listed = listed("$1", true),
     )
 }
 
@@ -563,7 +602,7 @@ fn stage1_terms(inside: bool) -> Vec<String> {
         format!(
             "(c.author_did = an.author_did OR (({}) = 'active' AND {}))",
             ao_status(),
-            standing("c.author_did", "an.author_did", &follows_verified("an.author_did"))
+            standing("c.author_did", "an.author_did", &follows_verified("an.author_did"), true)
         ),
     ]);
     terms
@@ -631,7 +670,7 @@ fn parent_verdict(cap: u32) -> String {
         ),
         reader_author = blocked("$1", "s.author_did"),
         author_owner = blocked("s.author_did", "k.owner"),
-        standing = standing("s.author_did", "k.owner", "COALESCE(fv.ok, false)"),
+        standing = standing("s.author_did", "k.owner", "COALESCE(fv.ok, false)", false),
     );
     // A thread's walk stops at the root or at the first thread reply by O
     // (a "none"-kind row by O is not one); a branch's at the branch root,
@@ -660,8 +699,8 @@ fn parent_verdict(cap: u32) -> String {
 }
 
 /// `s1` joined to its key's walk, for a shape's final SELECT.
-pub(super) const PV_JOIN: &str =
-    "s1 LEFT JOIN pv ON pv.reply_parent_uri = s1.reply_parent_uri AND pv.reply_root_uri = s1.reply_root_uri";
+pub(super) const PV_JOIN: &str = "s1 CROSS JOIN LATERAL (SELECT CASE WHEN s1.reply_parent_uri IS NOT NULL AND s1.reply_root_uri IS NOT NULL \
+     THEN ((SELECT m FROM pvm) -> (s1.reply_parent_uri || ' ' || s1.reply_root_uri))::boolean END AS ok) pv";
 
 /// A row's verdict `{pass}` (§3.2): stage 1 (the gate alone for the
 /// reader's own row), and the walk when the row is walked.
@@ -686,19 +725,24 @@ fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -
            SELECT k.parent, k.root, {branch_root} AS branch_root \
            FROM (SELECT DISTINCT c.reply_parent_uri AS parent, c.reply_root_uri AS root \
                  FROM c WHERE {branch_reply}) k), \
-         ak AS MATERIALIZED ({anchors}), \
+         brm AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg({br_key}, br.branch_root), '{{}}'::jsonb) AS m FROM br), \
+         akm AS MATERIALIZED ({anchors}), \
+         gm AS MATERIALIZED ({AUDIENCE_KEYS}), \
          s1 AS MATERIALIZED ( \
            SELECT c.*, an.uri AS anchor, an.author_did AS owner, an.audience_uri AS gov, \
                   COALESCE(CASE WHEN c.author_did = $1 THEN {gate} ELSE {stage1} END, false) AS s1ok, \
                   COALESCE({walks}, true) AS walks \
-           FROM c LEFT JOIN br ON br.parent = c.reply_parent_uri AND br.root = c.reply_root_uri \
-           {join} {s1_filter}), \
+           FROM c {join} {s1_filter}), \
          pv AS MATERIALIZED ( \
            SELECT k.reply_parent_uri, k.reply_root_uri, COALESCE({verdict}, false) AS ok \
            FROM (SELECT DISTINCT s1.reply_parent_uri, s1.reply_root_uri, s1.owner, s1.gov \
                  FROM s1 WHERE s1.s1ok AND s1.walks AND s1.author_did <> $1) k \
            LEFT JOIN private_audiences a ON a.uri = k.gov \
-           LEFT JOIN LATERAL (SELECT CASE WHEN a.mode = 'following' THEN {owner_verified} END AS ok) fv ON true) \
+           LEFT JOIN LATERAL (SELECT CASE WHEN a.mode = 'following' THEN {owner_verified} END AS ok) fv ON true), \
+         pvm AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg({pv_key}, pv.ok), '{{}}'::jsonb) AS m FROM pv \
+           WHERE pv.reply_parent_uri IS NOT NULL AND pv.reply_root_uri IS NOT NULL) \
          {final_}",
         branch_root = branch_root_of("k.parent", "k.root", cap),
         branch_reply = is_branch_reply("c"),
@@ -708,6 +752,8 @@ fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -
         join = anchor_join(),
         verdict = parent_verdict(cap),
         owner_verified = follows_verified("k.owner"),
+        br_key = pair_key("br.parent", "br.root"),
+        pv_key = pair_key("pv.reply_parent_uri", "pv.reply_root_uri"),
     )
 }
 

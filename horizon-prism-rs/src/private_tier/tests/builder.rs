@@ -48,7 +48,7 @@ async fn t52_every_statement_prepares() {
     // Both feed arms meet one anchor join through `c`, and fact 8's final
     // reads the same `s1` and `pv`.
     for (name, sql) in statements(CAP) {
-        assert_eq!(sql.matches("LEFT JOIN ak ON ak.uri = CASE").count(), 1, "{name}");
+        assert_eq!(sql.matches("(SELECT m FROM akm) -> CASE").count(), 1, "{name}");
     }
     drop(conn);
     db.drop_db().await;
@@ -326,7 +326,8 @@ async fn t52_the_reorder_is_an_equivalence() {
     let reference = format!("COALESCE(CASE WHEN c.author_did = $1 THEN {gate} ELSE ({gate}) AND {} END, false)", terms.join(" AND "));
     let final_ = format!(
         "SELECT s1.uri, s1.s1ok, {reference} FROM s1 c \
-         LEFT JOIN private_posts an ON an.uri = c.anchor LEFT JOIN private_audiences a ON a.uri = an.audience_uri \
+         LEFT JOIN private_posts an ON an.uri = c.anchor \
+         LEFT JOIN LATERAL (SELECT g.*, NULL::jsonb AS members_j FROM private_audiences g WHERE g.uri = an.audience_uri) a ON true \
          LEFT JOIN actors po ON po.did = c.author_did JOIN s1 ON s1.uri = c.uri"
     );
     let sql = schema::walked(&format!("SELECT {} FROM private_posts p WHERE p.uri = ANY($2)", schema::COLS), "", &final_, CAP);

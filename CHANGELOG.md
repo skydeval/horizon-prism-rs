@@ -186,6 +186,14 @@ commit.
   whose reader is outside the audience still pay one primary-key lookup
   per row up to the branch root (about 4×, 6× and 10× HEAD's cost at
   depths 4, 8 and 16), as does a chain past the cap.
+- **Private reads no longer go quadratic when the planner underestimates
+  (#719).** A private read statement's per-key results (branch roots,
+  anchors with their audiences, walk verdicts) are folded into one map
+  each and looked up per row by key, instead of being joined back to the
+  candidates. When the planner put the candidates at one row and thousands
+  came back, those joins became nested loops over the whole result: an
+  unread count over 5 000 notifications took 22 s, and now takes about
+  1.9 s under `EXPLAIN ANALYZE`. Results are unchanged.
 - **Accepted walk costs (#720).** Two costs ship as measured, with no
   index or config change: a branch reply whose reader is outside the
   audience, under distinct parents, costs about 4.1×, 6.3× and 10.4×
