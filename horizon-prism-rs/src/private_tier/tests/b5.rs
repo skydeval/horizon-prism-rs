@@ -360,6 +360,18 @@ async fn b5_row_class_ratios() {
             c.bound,
             if ratio <= c.bound { "ok" } else { "OVER" }
         );
+        // A class over its bound prints both plans, for the record.
+        if ratio > c.bound {
+            for (which, sql) in [("S12", schema::prefilter_uris_statement(c.cap)), ("HEAD", head(c.rows.len()))] {
+                let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, BUFFERS) {sql}"))
+                    .bind(DAVE)
+                    .bind(&c.rows)
+                    .fetch_all(&pool)
+                    .await
+                    .expect("plan");
+                println!("---- {which} plan, {}\n{}", c.name, plan.join("\n"));
+            }
+        }
         w.check(ratio <= c.bound, format!("{}: ratio {ratio:.2} over its bound {}", c.name, c.bound));
         w.check((served == c.rows.len()) == c.passes && (served == 0) != c.passes, format!("{}: {served} of {} served", c.name, c.rows.len()));
     }

@@ -176,6 +176,16 @@ commit.
   when `sync.max_head_fetches_per_request` exceeds
   `sync.read_fetch_rate_per_host`. `private_read_unfloored_seconds` is a
   histogram (20 buckets, 5 ms to 5 s).
+- **Private read statements cost less (#719).** A top-level post or a
+  branch root is its own anchor and is not looked up again; every other
+  row's anchor and governing audience are looked up once per distinct
+  anchor and hashed in; the moderation gate's two label lookups are
+  separate, so each hashes; a walk step by the root's author skips the
+  status lookup stage 1 already made. Results are unchanged. On B-5's
+  row classes most now cost at or below HEAD's statement; branch replies
+  whose reader is outside the audience still pay one primary-key lookup
+  per row up to the branch root (about 4×, 6× and 10× HEAD's cost at
+  depths 4, 8 and 16), as does a chain past the cap.
 - **The B-5 bench.** A cargo feature `bench-heads` (never in a deploy
   build: the Dockerfile passes no features, a featureless build refuses a
   `[bench]` section, and a feature build refuses to start without a

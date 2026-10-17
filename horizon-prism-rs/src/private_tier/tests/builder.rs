@@ -48,7 +48,7 @@ async fn t52_every_statement_prepares() {
     // Both feed arms meet one anchor join through `c`, and fact 8's final
     // reads the same `s1` and `pv`.
     for (name, sql) in statements(CAP) {
-        assert_eq!(sql.matches("LEFT JOIN private_posts an ON an.uri = CASE").count(), 1, "{name}");
+        assert_eq!(sql.matches("LEFT JOIN ak ON ak.uri = CASE").count(), 1, "{name}");
     }
     drop(conn);
     db.drop_db().await;
@@ -321,7 +321,7 @@ async fn t52_the_reorder_is_an_equivalence() {
                 OR (l.subject = c.author_did AND l.val = '!takedown')) \
                 AND COALESCE(po.account_status, 'active') NOT IN ('deactivated', 'takendown', 'suspended', 'deleted')";
     let mut terms = schema::stage1_terms_for_tests();
-    terms.retain(|t| !t.starts_with("NOT EXISTS (SELECT 1 FROM labels l WHERE (l.subject = c.uri"));
+    terms.retain(|t| !t.starts_with("NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = c.uri"));
     terms.reverse();
     let reference = format!("COALESCE(CASE WHEN c.author_did = $1 THEN {gate} ELSE ({gate}) AND {} END, false)", terms.join(" AND "));
     let final_ = format!(

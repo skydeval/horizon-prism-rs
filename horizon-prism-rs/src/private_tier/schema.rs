@@ -232,11 +232,25 @@ const HIDING_STATUSES: &str = "('deactivated', 'takendown', 'suspended', 'delete
 /// The moderation gate's rule (`moderation::gate_many`) for the post `uri`
 /// by `author` (SQL expressions): no `!takedown` or `!hide` label on the
 /// post, no `!takedown` on the author, and an author status the gate does
-/// not hide (no `actors` row reads as visible).
+/// not hide (no `actors` row reads as visible). The walk's step test uses
+/// this form, which PostgreSQL probes through `labels`' subject index inside
+/// the recursion; stage 1 uses [`gate`].
 fn gate_shows(uri: &str, author: &str, status: &str) -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM labels l WHERE (l.subject = {uri} AND l.val IN ('!takedown', '!hide')) \
                                               OR (l.subject = {author} AND l.val = '!takedown')) \
+         AND COALESCE({status}, 'active') NOT IN {HIDING_STATUSES}"
+    )
+}
+
+/// [`gate_shows`]'s rule as S12's statements test it: the post's labels and
+/// its author's in two lookups, each on one subject, so PostgreSQL can hash
+/// each (or probe `labels`' subject index) where one lookup over both
+/// subjects scans the table per row. The same predicate.
+fn gate(uri: &str, author: &str, status: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = {uri} AND l.val IN ('!takedown', '!hide')) \
+         AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = {author} AND l.val = '!takedown') \
          AND COALESCE({status}, 'active') NOT IN {HIDING_STATUSES}"
     )
 }
@@ -412,20 +426,62 @@ fn role_kind(c: &str, an: &str) -> String {
     )
 }
 
-/// The FROM fragment joining `c`'s author (`po`), its anchor (`an`) and the
-/// governing audience G (`a`) (§3.1). `br` is the branch-root expression.
-fn anchor_join(br: &str) -> String {
+/// `c` anchors on itself: a top-level post or a branch root (§2.1).
+fn self_anchored() -> String {
+    format!("({} OR {})", is_top_level("c"), is_branch_root("c"))
+}
+
+/// The anchor of a `c` row that does not anchor on itself: a thread
+/// reply's root, a branch reply's branch root (`br` is its expression);
+/// NULL otherwise.
+fn other_anchor(br: &str) -> String {
     format!(
-        "LEFT JOIN actors po ON po.did = c.author_did \
-         LEFT JOIN private_posts an ON an.uri = CASE \
-             WHEN {tl} OR {brt} THEN c.uri \
-             WHEN {tr} THEN c.reply_root_uri \
-             WHEN {brr} THEN {br} END \
-         LEFT JOIN private_audiences a ON a.uri = an.audience_uri",
-        tl = is_top_level("c"),
-        brt = is_branch_root("c"),
+        "CASE WHEN {tr} THEN c.reply_root_uri WHEN {brr} THEN {br} END",
         tr = is_thread_reply("c"),
         brr = is_branch_reply("c"),
+    )
+}
+
+/// The anchors of a statement's rows that do not anchor on themselves, each
+/// looked up once with its audience (the `ak` CTE): rows sharing a root or a
+/// branch root share one lookup.
+fn anchor_keys(s1_filter: &str) -> String {
+    format!(
+        "SELECT an.uri, an.author_did, an.audience_uri, an.reply_parent_uri, an.reply_root_uri, \
+                a.uri AS a_uri, a.owner_did AS a_owner_did, a.mode AS a_mode, a.members AS a_members \
+         FROM (SELECT DISTINCT {other} AS k FROM c \
+               LEFT JOIN br ON br.parent = c.reply_parent_uri AND br.root = c.reply_root_uri {s1_filter}) d \
+         JOIN private_posts an ON an.uri = d.k \
+         LEFT JOIN private_audiences a ON a.uri = an.audience_uri",
+        other = other_anchor("br.branch_root"),
+    )
+}
+
+/// The FROM fragment joining `c`'s author (`po`), its anchor (`an`) and the
+/// governing audience G (`a`) (§3.1), after `br`. A row that anchors on
+/// itself is its own anchor (its row as `c` read it) and G is its own
+/// audience, looked up directly; any other row's anchor and G come from
+/// `ak`, by the anchor's URI. `an` and `a` are the columns either way, as a
+/// lookup by the anchor's URI gives them.
+fn anchor_join() -> String {
+    let own = self_anchored();
+    let pick = |own_col: &str, ak_col: &str, name: &str| format!("CASE WHEN {own} THEN {own_col} ELSE {ak_col} END AS {name}");
+    format!(
+        "LEFT JOIN actors po ON po.did = c.author_did \
+         LEFT JOIN ak ON ak.uri = {other} \
+         LEFT JOIN private_audiences a0 ON a0.uri = CASE WHEN {own} THEN c.audience_uri END \
+         CROSS JOIN LATERAL (SELECT {an_uri}, {an_author}, {an_audience}, {an_parent}, {an_root}) an \
+         CROSS JOIN LATERAL (SELECT {a_uri}, {a_owner}, {a_mode}, {a_members}) a",
+        other = other_anchor("br.branch_root"),
+        an_uri = pick("c.uri", "ak.uri", "uri"),
+        an_author = pick("c.author_did", "ak.author_did", "author_did"),
+        an_audience = pick("c.audience_uri", "ak.audience_uri", "audience_uri"),
+        an_parent = pick("c.reply_parent_uri", "ak.reply_parent_uri", "reply_parent_uri"),
+        an_root = pick("c.reply_root_uri", "ak.reply_root_uri", "reply_root_uri"),
+        a_uri = pick("a0.uri", "ak.a_uri", "uri"),
+        a_owner = pick("a0.owner_did", "ak.a_owner_did", "owner_did"),
+        a_mode = pick("a0.mode", "ak.a_mode", "mode"),
+        a_members = pick("a0.members", "ak.a_members", "members"),
     )
 }
 
@@ -496,10 +552,10 @@ fn stage1_terms(inside: bool) -> Vec<String> {
     }
     terms.extend([
         // (3) the gate on P, then rule 4.
-        gate_shows("c.uri", "c.author_did", "po.account_status"),
+        gate("c.uri", "c.author_did", "po.account_status"),
         format!("NOT {}", blocked("$1", "c.author_did")),
         // (4) the anchor's gate; skipped when the anchor is P.
-        format!("(an.uri = c.uri OR {})", gate_shows("an.uri", "an.author_did", &format!("({})", ao_status()))),
+        format!("(an.uri = c.uri OR {})", gate("an.uri", "an.author_did", &format!("({})", ao_status()))),
         // (5) rule 7 against O (V–O, then W–O, also W's condition 3),
         // condition 4 and W's standing.
         format!("(an.author_did = $1 OR an.author_did = c.author_did OR NOT {})", blocked("$1", "an.author_did")),
@@ -564,7 +620,15 @@ fn parent_verdict(cap: u32) -> String {
                AND NOT {author_owner} \
                AND {standing}))",
         owned = owned("s.audience_uri", "k.owner"),
-        gate = gate_shows("s.uri", "s.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = s.author_did)"),
+        // A key reaches the walk only from a row whose stage 1 passed, and a
+        // walked row's anchor is not the row itself, so stage 1 gated the
+        // anchor and with it O's status, in this statement's snapshot: a
+        // step by O needs no status lookup of its own.
+        gate = gate_shows(
+            "s.uri",
+            "s.author_did",
+            "CASE WHEN s.author_did = k.owner THEN NULL ELSE (SELECT x.account_status FROM actors x WHERE x.did = s.author_did) END"
+        ),
         reader_author = blocked("$1", "s.author_did"),
         author_owner = blocked("s.author_did", "k.owner"),
         standing = standing("s.author_did", "k.owner", "COALESCE(fv.ok, false)"),
@@ -622,6 +686,7 @@ fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -
            SELECT k.parent, k.root, {branch_root} AS branch_root \
            FROM (SELECT DISTINCT c.reply_parent_uri AS parent, c.reply_root_uri AS root \
                  FROM c WHERE {branch_reply}) k), \
+         ak AS MATERIALIZED ({anchors}), \
          s1 AS MATERIALIZED ( \
            SELECT c.*, an.uri AS anchor, an.author_did AS owner, an.audience_uri AS gov, \
                   COALESCE(CASE WHEN c.author_did = $1 THEN {gate} ELSE {stage1} END, false) AS s1ok, \
@@ -637,9 +702,10 @@ fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -
          {final_}",
         branch_root = branch_root_of("k.parent", "k.root", cap),
         branch_reply = is_branch_reply("c"),
-        gate = gate_shows("c.uri", "c.author_did", "po.account_status"),
+        gate = gate("c.uri", "c.author_did", "po.account_status"),
         walks = needs_walk(),
-        join = anchor_join("br.branch_root"),
+        anchors = anchor_keys(s1_filter),
+        join = anchor_join(),
         verdict = parent_verdict(cap),
         owner_verified = follows_verified("k.owner"),
     )
@@ -668,7 +734,7 @@ pub(super) fn fact8_statement(cap: u32) -> String {
         role = role_kind("s1", "an"),
         anchor_owned = owned("an.audience_uri", "an.author_did"),
         post_owned = owned("s1.audience_uri", "an.author_did"),
-        anchor_gate = gate_shows("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
+        anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
     );
     walked(&c, "", &final_, cap)
 }
