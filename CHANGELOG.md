@@ -201,6 +201,12 @@ commit.
   is outside, quote and reply counts at 4 s, and 5 s+ tails under load.
   With JIT off, those requests take 45 to 320 ms alone. Nothing to
   configure.
+- **The thread parent chain reads its rows together (#719).** Once the
+  head round has checked every ancestor's heads, `getPostThread` reads the
+  anchor and its ancestors at `bind_concurrency` at a time instead of one
+  by one. Results above the first miss are discarded, so the response is
+  unchanged. A 16-deep chain with every head stale drops from about
+  1 220 ms to about 1 020 ms.
 - **Accepted walk costs (#720).** Two costs ship as measured, with no
   index or config change: a branch reply whose reader is outside the
   audience, under distinct parents, costs about 4.1×, 6.3× and 10.4×

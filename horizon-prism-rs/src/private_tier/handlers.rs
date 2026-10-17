@@ -831,7 +831,12 @@ async fn thread_body(
     // 4. One head round, in HEAD's charge order. The claimed root is not in
     // it.
     let db_failed = head_round(s, &rs, caller, &covered).await;
-    // 5. The reads, in order, stopping at the first miss of any kind.
+    // 5. The reads, stopping at the first miss of any kind. Every head of
+    // the prefix is in the request's cache now, so the reads run together
+    // (§3.4's named fallback, `read_many`'s `buffered(concurrency)`), up to
+    // the first row that lists a `db_failed` DID, which is not read; then
+    // they are taken in order, and every result above the first miss is
+    // discarded. The response is the sequential one.
     let touches_failed = |row: &Covered| row.head_dids(caller).iter().any(|d| db_failed.contains(d));
     let uris: Vec<String> = covered.iter().map(|r| r.uri.clone()).collect();
     let authors = profiles(&hydration, &uris).await?;
@@ -840,7 +845,10 @@ async fn thread_body(
         pipeline::count_db_miss();
         return Ok(None);
     }
-    let Ok(anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
+    let readable = covered.iter().take_while(|r| !touches_failed(r)).count().min(parent_height as usize + 1).min(THREAD_NODE_CAP);
+    let reads: Vec<_> = covered[..readable].iter().map(|r| pipeline::read(&s.env, &rs, caller, &r.uri, &authors, start)).collect();
+    let mut reads = futures::stream::iter(reads).buffered(s.concurrency.max(1));
+    let Some(Ok(anchor)) = reads.next().await else {
         return Ok(None);
     };
     let mut budget = THREAD_NODE_CAP - 1;
@@ -854,13 +862,14 @@ async fn thread_body(
             pipeline::count_db_miss();
             break;
         }
-        let Ok(p) = pipeline::read(&s.env, &rs, caller, &row.uri, &authors, start).await else {
+        let Some(Ok(p)) = reads.next().await else {
             break;
         };
         budget -= 1;
         next = view_parent(&p);
         chain.push(p);
     }
+    drop(reads);
     #[cfg(test)]
     tests::record_chain_state(uri, &rs).await;
     // The public top (review 15, m2): the last structural row's public
