@@ -22,6 +22,11 @@ pub const APPLICATION_NAME: &str = "horizon-prism-rs";
 /// `lock_timeout = '30s'`"); as the session default it applies to every
 /// transaction without a per-transaction statement.
 ///
+/// JIT compilation is off on every pooled connection. The request paths are
+/// short indexed statements, but the planner's cost for a large private
+/// read batch passes `jit_above_cost`, and compiling it took about 3 s a
+/// statement (B-5 part (3), 2026-10-17), far more than running it.
+///
 /// # Errors
 ///
 /// [`sqlx::Error::Configuration`] when the URL does not parse.
@@ -31,7 +36,7 @@ pub fn connect_options(
 ) -> Result<PgConnectOptions, sqlx::Error> {
     Ok(PgConnectOptions::from_str(database_url)?
         .application_name(APPLICATION_NAME)
-        .options([("lock_timeout", format!("{lock_timeout_secs}s"))]))
+        .options([("lock_timeout", format!("{lock_timeout_secs}s")), ("jit", "off".to_string())]))
 }
 
 /// Pool options with the §4.1 settings.
@@ -71,7 +76,7 @@ mod tests {
         assert_eq!(opts.get_host(), "db");
         assert_eq!(opts.get_port(), 5432);
         assert_eq!(opts.get_database(), Some("prism"));
-        assert_eq!(opts.get_options(), Some("-c lock_timeout=30s"));
+        assert_eq!(opts.get_options(), Some("-c lock_timeout=30s -c jit=off"));
     }
 
     #[test]

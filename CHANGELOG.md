@@ -194,6 +194,13 @@ commit.
   came back, those joins became nested loops over the whole result: an
   unread count over 5 000 notifications took 22 s, and now takes about
   1.9 s under `EXPLAIN ANALYZE`. Results are unchanged.
+- **JIT compilation is off on every database connection.** The planner
+  priced large private read batches above `jit_above_cost`, and compiling
+  them took about 3 s a statement, far longer than running them. That
+  showed as `getTimeline` at 4.5 s over branch conversations the reader
+  is outside, quote and reply counts at 4 s, and 5 s+ tails under load.
+  With JIT off, those requests take 45 to 320 ms alone. Nothing to
+  configure.
 - **Accepted walk costs (#720).** Two costs ship as measured, with no
   index or config change: a branch reply whose reader is outside the
   audience, under distinct parents, costs about 4.1×, 6.3× and 10.4×
