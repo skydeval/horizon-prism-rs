@@ -416,9 +416,13 @@ async fn run_fixture(w: &mut Walk, fixture: &str, read: &PrivateReadConfig, head
         exec(&w.f.pool, "UPDATE sync_state SET head_checked_at = now()").await;
         let took = sample(&base, method, query, DAVE, n, 8).await;
         let (p50, p99) = (percentile(&took, 50), percentile(&took, 99));
+        // One request at a time: what the request costs without the
+        // in-process harness's own queueing.
+        let alone = sample(&base, method, query, DAVE, n.min(100), 1).await;
         let floor = floor_of(method);
         println!(
-            "  B-5 (3) {fixture:<46} {label:<34} p50 {:>7.1} ms  p99 {:>7.1} ms  floor {:>5} ms  {}",
+            "  B-5 (3) {fixture:<46} {label:<34} alone p50 {:>6.1} ms  c8 p50 {:>7.1} ms  p99 {:>7.1} ms  floor {:>5} ms  {}",
+            percentile(&alone, 50).as_secs_f64() * 1000.0,
             p50.as_secs_f64() * 1000.0,
             p99.as_secs_f64() * 1000.0,
             floor.as_millis(),
@@ -459,11 +463,13 @@ async fn ready_dids(pool: &PgPool, dids: &[String]) {
 /// Part (3): each endpoint's p99 under its floor on the base snapshot, the
 /// new shapes and the non-adversarial fixtures, and the named adversarial
 /// fixtures reported (gated where §4 gates them).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "B-5 part (3); run with --release --ignored --nocapture"]
 async fn b5_absolute_floors() {
     let default_read = PrivateReadConfig::default();
     println!("B-5 part (3): {} samples per endpoint, concurrency 8, heads fresh", samples());
+    // Every fixture runs, and the failures are reported together.
+    let mut failures: Vec<String> = Vec::new();
 
     // 1. The base snapshot: all twelve floored endpoints.
     let Some((mut w, heads)) = part3_walk("b5-base").await else {
@@ -512,7 +518,7 @@ async fn b5_absolute_floors() {
         ("getPostThread (a reply)", THREAD, format!("uri={p1_reply}"), true),
     ];
     run_fixture(&mut w, "base snapshot", &default_read, &heads, &cases).await;
-    w.finish().await;
+    failures.extend(w.drain().await);
 
     // 2. A 16-deep thread and a 16-deep branch of readable posts by 16
     // authors, read at the bottom.
@@ -546,7 +552,7 @@ async fn b5_absolute_floors() {
         ("getPostThread, branch bottom", THREAD, format!("uri={branch_bottom}"), true),
     ];
     run_fixture(&mut w, "16-deep thread and branch, 16 authors", &default_read, &heads, &cases).await;
-    w.finish().await;
+    failures.extend(w.drain().await);
 
     // 3. An 8-deep thread with a feed page, a search page and a getReplies
     // page on it.
@@ -574,7 +580,7 @@ async fn b5_absolute_floors() {
         ("getReplies (60 at depth 8)", GET_REPLIES, format!("uri={node}"), true),
     ];
     run_fixture(&mut w, "8-deep thread", &default_read, &heads, &cases).await;
-    w.finish().await;
+    failures.extend(w.drain().await);
 
     // 4. A `list` G of 10 000 members.
     let Some((mut w, heads)) = part3_walk("b5-big-list").await else {
@@ -603,7 +609,7 @@ async fn b5_absolute_floors() {
         ("getPostThread", THREAD, format!("uri={}", uris[3]), true),
     ];
     run_fixture(&mut w, "a list G of 10 000 members", &default_read, &heads, &cases).await;
-    w.finish().await;
+    failures.extend(w.drain().await);
 
     // 5. A timeline and an author feed over branch conversations by followed
     // authors, V outside each branch root's audience, every class row at
@@ -632,7 +638,7 @@ async fn b5_absolute_floors() {
         ("getAuthorFeed", FEED, format!("actor={}", writers[0]), true),
     ];
     run_fixture(&mut w, "branch conversations, V outside, k = 16", &default_read, &heads, &cases).await;
-    w.finish().await;
+    failures.extend(w.drain().await);
 
     // 6. O's author feed and a timeline following O, over 8-deep branch
     // conversations alternating O and B, V inside G, every O row at depth 8.
@@ -651,13 +657,12 @@ async fn b5_absolute_floors() {
     }
     b.write(&pool).await;
     ready_dids(&pool, &[ALICE.into(), BOB.into()]).await;
-    exec(&pool, &follow_sql(DAVE, ALICE)).await;
     let cases = [
         ("getAuthorFeed of O", FEED, format!("actor={ALICE}"), true),
         ("getTimeline following O", TIMELINE, String::new(), true),
     ];
     run_fixture(&mut w, "8-deep branches alternating O and B, V inside", &default_read, &heads, &cases).await;
-    w.finish().await;
+    failures.extend(w.drain().await);
 
     // Adversarial: 5 000 owner branch replies under one node, each notifying
     // V; and 5 000 under distinct parents at depth 8 under V's own public
@@ -690,7 +695,7 @@ async fn b5_absolute_floors() {
         ("getPostThread of the branch root", THREAD, format!("uri={top}&depth=2"), false),
     ];
     run_fixture(&mut w, "5 000 owner branch replies under one node", &default_read, &heads, &cases).await;
-    w.finish().await;
+    failures.extend(w.drain().await);
 
     let Some((mut w, heads)) = part3_walk("b5-distinct").await else {
         return;
@@ -720,7 +725,7 @@ async fn b5_absolute_floors() {
     exec(&pool, "ANALYZE").await;
     let cases = [("getUnreadCount (gated)", GET_UNREAD_COUNT, String::new(), true)];
     run_fixture(&mut w, "5 000 owner branch replies, distinct parents", &default_read, &heads, &cases).await;
-    w.finish().await;
+    failures.extend(w.drain().await);
 
     // Adversarial, named: a 5 000-row branch chain under an audience V is
     // outside, at `max_chain` 16 and 100.
@@ -748,7 +753,17 @@ async fn b5_absolute_floors() {
         ];
         run_fixture(&mut w, &format!("5 000-row branch chain, V outside, cap {cap}"), &read, &heads, &cases).await;
     }
-    w.finish().await;
+    failures.extend(w.drain().await);
+    assert!(failures.is_empty(), "{} failing cases:\n{}", failures.len(), failures.join("\n"));
+}
+
+impl Walk {
+    /// This walk's failures, its database dropped.
+    async fn drain(self) -> Vec<String> {
+        let failures = self.failures;
+        self.db.drop_db().await;
+        failures
+    }
 }
 
 /// The stale-head chain (§4 part (3), `bench-heads` only): Alice's root and
