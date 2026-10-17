@@ -284,6 +284,19 @@ commit.
   `FirehoseGroupMissing` and `FirehoseSamplerFailing`, kept equal to
   `firehose::alert_rules` by tests.
 
+### Fixed (record consistency)
+
+- **A late duplicate delete wiped a re-created record's feed items and
+  notifications (#725).** A delete took the URI's feed items, public
+  notifications and private notifications whatever its rev, so a record
+  deleted at rev 2 and created again at rev 3 lost them when a slower
+  relay's copy of the rev-2 delete arrived; the row itself survived. They
+  now go only when no newer record is stored at the URI: a row of the
+  kind's table above the delete's rev (for a post, its row or its
+  member reference; for a profile, the repo's stored profile; for a
+  private post, its `private_posts` row). A delete that finds no row
+  still cleans up, as before.
+
 ### Fixed (private posting S10)
 
 - **Readiness could be set after a gap (#722).** A job's or catch-up's

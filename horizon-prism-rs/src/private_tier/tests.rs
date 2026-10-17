@@ -3516,6 +3516,62 @@ async fn private_notification_writes_off() {
     notification_writes_in(PublicMode::Off, "s6-writes-off").await;
 }
 
+/// #725, in On and in Off: a private reply, a public like and a public
+/// reply of Alice's post T, each deleted at REV2 and created again at REV3,
+/// keep Alice's private notifications when a late copy of the REV2 delete
+/// arrives; a delete above REV3 still takes them.
+async fn late_delete_keeps_newer_notifications_in(mode: PublicMode, test: &str) {
+    const REV4: &str = "3kaaaaaaaaad2";
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL]).await;
+    let t = f.private_post(ALICE, "3ktpost22222", &aud, None).await;
+    let at = "2026-10-01T10:00:00Z";
+    let records = [
+        (NSID_POST_PRIVATE, "3kreplybob22", f.post_record(BOB, "3kreplybob22", &aud, Some((&t, &t))).await),
+        (LIKE, "3klikebob222", subject_record(LIKE, &t, at)),
+        (PUBLIC_POST, "3kpubreply22", public_reply(&t, at, None)),
+    ];
+    let alices = |pool: &PgPool| {
+        let pool = pool.clone();
+        async move { private_rows(&pool, ALICE).await.into_iter().map(|r| (r.0, r.3)).collect::<Vec<_>>() }
+    };
+    for (collection, rkey, record) in &records {
+        f.ingest(BOB, collection, rkey, record.clone()).await;
+    }
+    let written = alices(&f.pool).await;
+    assert_eq!(written.len(), 3, "{mode:?}: {written:?}");
+    for (collection, rkey, _) in &records {
+        f.apply_op(BOB, Action::Delete, collection, rkey, REV2, None).await;
+    }
+    assert!(alices(&f.pool).await.is_empty(), "{mode:?}: the deletes in order take them");
+    for (collection, rkey, record) in &records {
+        f.apply_op(BOB, Action::Create, collection, rkey, REV3, Some(record.clone())).await;
+    }
+    assert_eq!(alices(&f.pool).await, written, "{mode:?}: the newer records write them again");
+    for (collection, rkey, _) in &records {
+        f.apply_op(BOB, Action::Delete, collection, rkey, REV2, None).await;
+    }
+    assert_eq!(alices(&f.pool).await, written, "{mode:?}: the late deletes leave the newer records'");
+    for (collection, rkey, _) in &records {
+        f.apply_op(BOB, Action::Delete, collection, rkey, REV4, None).await;
+    }
+    assert!(alices(&f.pool).await.is_empty(), "{mode:?}: newer deletes take them");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn late_delete_keeps_newer_private_notifications_on() {
+    late_delete_keeps_newer_notifications_in(PublicMode::On, "late-delete-on").await;
+}
+
+#[tokio::test]
+async fn late_delete_keeps_newer_private_notifications_off() {
+    late_delete_keeps_newer_notifications_in(PublicMode::Off, "late-delete-off").await;
+}
+
 /// `reader`'s private notifications with `query`: the page and the time
 /// taken.
 async fn notifications_of(base: &str, reader: &str, query: &str) -> (Value, Duration) {

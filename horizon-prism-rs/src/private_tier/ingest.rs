@@ -882,9 +882,18 @@ pub(crate) async fn delete(conn: &mut PgConnection, uri: &str, rev: &str, author
         tombstone(&mut *conn, uri, rev).await?;
     }
     // A deleted private post's notifications go with it, as a public
-    // record's do (private posting §4.8).
+    // record's do (private posting §4.8), unless a newer post lives at the
+    // URI: they are its own then, and a late copy of an older delete leaves
+    // them (#725).
     if table == "private_posts" {
-        delete_notifications(&mut *conn, uri).await?;
+        let newer: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM private_posts WHERE uri = $1 AND rev > $2)")
+            .bind(uri)
+            .bind(rev)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !newer {
+            delete_notifications(&mut *conn, uri).await?;
+        }
     }
     // The gates of a private post that is gone gate nothing (§3.1).
     if removed && let Some(gates) = canonical_private_gates(uri) {

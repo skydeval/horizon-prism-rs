@@ -1371,17 +1371,23 @@ impl Writer {
             .execute(&mut *conn)
             .await?;
         }
-        sqlx::query("DELETE FROM feed_items WHERE uri = $1")
-            .bind(&d.uri)
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query("DELETE FROM notifications WHERE record_uri = $1")
-            .bind(&d.uri)
-            .execute(&mut *conn)
-            .await?;
-        // Its private notifications too, in the same savepoint, so a
-        // rollback undoes both (private posting §4.8).
-        self.private.delete_notifications(conn, &d.uri).await?;
+        // The URI's feed items and notifications go with the record, unless
+        // a newer record lives at the URI: they are its own then, and a late
+        // copy of an older delete leaves them (#725). A delete that found no
+        // row still cleans up, for records whose row was never stored.
+        if !newer_record(conn, d.kind, &d.uri, repo, rev).await? {
+            sqlx::query("DELETE FROM feed_items WHERE uri = $1")
+                .bind(&d.uri)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("DELETE FROM notifications WHERE record_uri = $1")
+                .bind(&d.uri)
+                .execute(&mut *conn)
+                .await?;
+            // Its private notifications too, in the same savepoint, so a
+            // rollback undoes both (private posting §4.8).
+            self.private.delete_notifications(conn, &d.uri).await?;
+        }
         Ok((if removed { OpOutcome::Written } else { OpOutcome::Unchanged }, eff))
     }
 
@@ -1752,6 +1758,40 @@ async fn delete_row(conn: &mut PgConnection, table: &'static str, uri: &str, rev
         .await?
         .rows_affected()
         > 0)
+}
+
+/// Whether a public record newer than a delete at `rev` is stored at `uri`
+/// (#725): a row of the kind's table above `rev`, or for a post its member
+/// reference, which a post under the off rule has without a row (public
+/// indexing design §4.1). A profile's is the repo's stored profile.
+async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo: &str, rev: &str) -> Result<bool, sqlx::Error> {
+    let tables: Vec<&str> = match kind {
+        RecordKind::Profile => {
+            return sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM actors WHERE did = $1 AND profile_record IS NOT NULL AND profile_rev > $2)",
+            )
+            .bind(repo)
+            .bind(rev)
+            .fetch_one(conn)
+            .await;
+        }
+        RecordKind::Post => vec!["posts", "member_post_refs"],
+        RecordKind::Like => vec!["likes"],
+        RecordKind::Repost => vec!["reposts"],
+        RecordKind::Follow => vec!["follows"],
+        RecordKind::Block => vec!["blocks"],
+        RecordKind::Table(table) => vec![table],
+        // The private tier keeps its own (`ingest::delete`).
+        RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock | RecordKind::PrivateGate => {
+            return Ok(false);
+        }
+    };
+    let sql = tables
+        .iter()
+        .map(|t| format!("EXISTS (SELECT 1 FROM {t} WHERE uri = $1 AND rev > $2)"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    sqlx::query_scalar(&format!("SELECT {sql}")).bind(uri).bind(rev).fetch_one(conn).await
 }
 
 async fn delete_profile(conn: &mut PgConnection, did: &str, rev: &str) -> Result<bool, sqlx::Error> {
@@ -3001,6 +3041,48 @@ mod tests {
             .await
             .expect("query");
             assert_eq!(left, 0);
+            db.drop_db().await;
+        }
+
+        /// #725: a post deleted at rev 2 and created again at rev 3 keeps
+        /// its feed item and notification when a late copy of the rev-2
+        /// delete arrives; a delete at a newer rev still takes them.
+        #[tokio::test]
+        async fn a_late_delete_leaves_a_newer_posts_feed_item_and_notification() {
+            let Some(db) = fresh_db("late_delete_newer_post").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, true);
+            let other = "did:plc:cccccccccccccccccccccccc";
+            {
+                let mut s = w.scope().write_guard().await;
+                s.scope.insert(other.into());
+            }
+            let op = |action: Action| RawOp {
+                action,
+                collection: "app.bsky.feed.post".into(),
+                rkey: RKEY.into(),
+                cid: (action != Action::Delete).then(|| "bafyreply".into()),
+                record: (action != Action::Delete).then(|| {
+                    json!({"text": "hi", "reply": {
+                        "root": {"uri": format!("at://{AUTHOR}/app.bsky.feed.post/1"), "cid": "c"},
+                        "parent": {"uri": format!("at://{AUTHOR}/app.bsky.feed.post/1"), "cid": "c"}}})
+                }),
+            };
+            let state = "SELECT (SELECT count(*) FROM posts) * 100 + (SELECT count(*) FROM feed_items) * 10 \
+                         + (SELECT count(*) FROM notifications)";
+            w.apply(other, &rev(1), &[op(Action::Create)], OPTIONS).await.expect("create");
+            assert_eq!(count(p, state).await, 111, "post, feed item, notification");
+            w.apply(other, &rev(2), &[op(Action::Delete)], OPTIONS).await.expect("delete");
+            assert_eq!(count(p, state).await, 0, "the delete in order takes all three");
+            w.apply(other, &rev(3), &[op(Action::Create)], OPTIONS).await.expect("re-create");
+            assert_eq!(count(p, state).await, 111, "the newer post writes them again");
+            let r = w.apply(other, &rev(2), &[op(Action::Delete)], OPTIONS).await.expect("late delete");
+            assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
+            assert_eq!(count(p, state).await, 111, "the late delete leaves the newer post's");
+            w.apply(other, &rev(4), &[op(Action::Delete)], OPTIONS).await.expect("newer delete");
+            assert_eq!(count(p, state).await, 0, "a newer delete takes them");
             db.drop_db().await;
         }
 
