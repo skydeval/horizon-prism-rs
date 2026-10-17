@@ -1877,7 +1877,8 @@ fn counted_quote_ref() -> String {
 /// - `replyCount`: private replies passing the prefilter (§3.2), which
 ///   carries the moderation test; a reply that fails decode or waits on its
 ///   owner's readiness counts, since that fails for every reader alike.
-/// - `likeCount`, `repostCount`: by member likers with no block either way.
+/// - `likeCount`, `repostCount`: member likers (reposters) with no block
+///   either way, each account once however many records it has (#727).
 /// - `quoteCount`: private quotes passing the prefilter, and members'
 ///   public quotes whose author has no block either way.
 ///
@@ -1899,7 +1900,7 @@ pub(super) async fn counts(pool: &PgPool, reader: &str, uris: &[String], cap: u3
     }
     for kind in [Interaction::Like, Interaction::Repost] {
         let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
-            "SELECT l.subject_uri, count(*) FROM {table} l WHERE l.subject_uri = ANY($2) AND {counted} GROUP BY l.subject_uri",
+            "SELECT l.subject_uri, count(DISTINCT l.author_did) FROM {table} l WHERE l.subject_uri = ANY($2) AND {counted} GROUP BY l.subject_uri",
             table = kind.table(),
             counted = counted_interaction(),
         ))
@@ -1998,10 +1999,20 @@ pub(super) async fn muted_roots(pool: &PgPool, viewer: &str, roots: &[String]) -
 /// indexed_at, uri)`.
 pub(super) type InteractionRow = (String, DateTime<Utc>, DateTime<Utc>, String);
 
+/// An interaction row `l` that is its author's newest of its subject, so a
+/// listing shows each account once, as [`counts`] counts it (#727).
+fn newest_of_account(table: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM {table} x WHERE x.subject_uri = l.subject_uri AND x.author_did = l.author_did \
+           AND (x.created_at, x.uri) > (l.created_at, l.uri))"
+    )
+}
+
 /// `getLikes` and `getRepostedBy` (private posting §4.7): the rows on
-/// `subject` that count for `reader` (as [`counts`] counts them), newest
-/// first, after the plain `created_at::uri` cursor. They are public records
-/// of members; the caller has read `subject`.
+/// `subject` that count for `reader` (as [`counts`] counts them), one per
+/// account, its newest, newest first, after the plain `created_at::uri`
+/// cursor. They are public records of members; the caller has read
+/// `subject`.
 ///
 /// # Errors
 ///
@@ -2017,11 +2028,12 @@ pub(super) async fn interactions(
     let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
     sqlx::query_as(&format!(
         "SELECT l.author_did, l.created_at, l.indexed_at, l.uri FROM {table} l \
-         WHERE l.subject_uri = $2 AND {counted} \
+         WHERE l.subject_uri = $2 AND {counted} AND {newest} \
            AND ($3::timestamptz IS NULL OR (l.created_at, l.uri) < ($3, $4)) \
          ORDER BY l.created_at DESC, l.uri DESC LIMIT $5",
         table = kind.table(),
         counted = counted_interaction(),
+        newest = newest_of_account(kind.table()),
     ))
     .bind(reader)
     .bind(subject)

@@ -109,20 +109,25 @@ impl Hydrator {
         let (first, rest) = shown_uris.split_at(shown_uris.len().min(SYNC_COUNTS));
         let mut remote = self.constellation_counts(req, first, CountMode::Sync { started }).await;
         remote.extend(self.constellation_counts(req, rest, CountMode::List).await);
-        let local: HashMap<String, i64> = sqlx::query_as("SELECT subject_uri, count(*) FROM likes WHERE subject_uri = ANY($1) GROUP BY subject_uri")
-            .bind(&shown_uris)
-            .fetch_all(self.pool())
-            .await?
-            .into_iter()
-            .collect();
-        let mine: HashMap<String, String> = match viewer.state_did() {
-            Some(me) => sqlx::query_as("SELECT subject_uri, uri FROM likes WHERE author_did = $1 AND subject_uri = ANY($2)")
-                .bind(me)
+        // By account, and the viewer's newest like, as for posts (#727).
+        let local: HashMap<String, i64> =
+            sqlx::query_as("SELECT subject_uri, count(DISTINCT author_did) FROM likes WHERE subject_uri = ANY($1) GROUP BY subject_uri")
                 .bind(&shown_uris)
                 .fetch_all(self.pool())
                 .await?
                 .into_iter()
-                .collect(),
+                .collect();
+        let mine: HashMap<String, String> = match viewer.state_did() {
+            Some(me) => sqlx::query_as(
+                "SELECT DISTINCT ON (subject_uri) subject_uri, uri FROM likes WHERE author_did = $1 AND subject_uri = ANY($2) \
+                 ORDER BY subject_uri, created_at DESC, uri DESC",
+            )
+            .bind(me)
+            .bind(&shown_uris)
+            .fetch_all(self.pool())
+            .await?
+            .into_iter()
+            .collect(),
             None => HashMap::new(),
         };
         let views: Vec<Value> = shown

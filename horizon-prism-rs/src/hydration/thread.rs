@@ -276,7 +276,7 @@ impl Hydrator {
         let mut likers: Vec<String> = sqlx::query_scalar(
             "SELECT author_did FROM likes WHERE subject_uri = $2 \
                AND author_did IN (SELECT subject_did FROM follows WHERE author_did = $1) \
-             ORDER BY created_at DESC, author_did",
+             GROUP BY author_did ORDER BY max(created_at) DESC, author_did",
         )
         .bind(me)
         .bind(post)

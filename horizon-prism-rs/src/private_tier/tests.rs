@@ -3572,6 +3572,49 @@ async fn late_delete_keeps_newer_private_notifications_off() {
     late_delete_keeps_newer_notifications_in(PublicMode::Off, "late-delete-off").await;
 }
 
+/// #727: Bob's three likes and three reposts of Alice's post T count once
+/// for Carol, are listed once, and his newest is his `viewer.like` and
+/// `viewer.repost`; deleting two still counts 1, the third 0.
+#[tokio::test]
+async fn an_accounts_duplicate_interactions_count_once() {
+    let test = "duplicate-interactions";
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, PublicMode::On).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL]).await;
+    let t = f.private_post(ALICE, "3ktpost22222", &aud, None).await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+    let rkeys = ["3kdupone2222", "3kduptwo2222", "3kdupthree22"];
+    for (rkey, at) in rkeys.iter().zip(["2026-10-01T10:00:00Z", "2026-10-01T12:00:00Z", "2026-10-01T11:00:00Z"]) {
+        f.ingest(BOB, LIKE, rkey, subject_record(LIKE, &t, at)).await;
+        f.ingest(BOB, REPOST, rkey, subject_record(REPOST, &t, at)).await;
+    }
+    let (_, p) = posts_of(&base, CAROL, &[&t]).await;
+    assert_eq!(counts_of(&p[0]), [0, 1, 1, 0], "{}", p[0]);
+    for (method, key) in [(GET_LIKES, "likes"), (GET_REPOSTED_BY, "repostedBy")] {
+        let (_, page, _) = json_of(&base, method, &format!("uri={t}"), CAROL).await;
+        assert_eq!(actor_dids(&page, key), [BOB], "{method}: one entry per account");
+    }
+    let (_, p) = posts_of(&base, BOB, &[&t]).await;
+    assert_eq!(p[0]["viewer"]["like"], format!("at://{BOB}/{LIKE}/3kduptwo2222"), "the newest");
+    assert_eq!(p[0]["viewer"]["repost"], format!("at://{BOB}/{REPOST}/3kduptwo2222"));
+    for rkey in &rkeys[..2] {
+        f.apply_op(BOB, Action::Delete, LIKE, rkey, REV2, None).await;
+        f.apply_op(BOB, Action::Delete, REPOST, rkey, REV2, None).await;
+    }
+    let (_, p) = posts_of(&base, CAROL, &[&t]).await;
+    assert_eq!(counts_of(&p[0]), [0, 1, 1, 0], "two of three deleted: {}", p[0]);
+    let (_, p) = posts_of(&base, BOB, &[&t]).await;
+    assert_eq!(p[0]["viewer"]["like"], format!("at://{BOB}/{LIKE}/3kdupthree22"), "the one left");
+    f.apply_op(BOB, Action::Delete, LIKE, rkeys[2], REV2, None).await;
+    f.apply_op(BOB, Action::Delete, REPOST, rkeys[2], REV2, None).await;
+    let (_, p) = posts_of(&base, CAROL, &[&t]).await;
+    assert_eq!(counts_of(&p[0]), [0, 0, 0, 0], "the last deleted: {}", p[0]);
+    db.drop_db().await;
+}
+
 /// `reader`'s private notifications with `query`: the page and the time
 /// taken.
 async fn notifications_of(base: &str, reader: &str, query: &str) -> (Value, Duration) {

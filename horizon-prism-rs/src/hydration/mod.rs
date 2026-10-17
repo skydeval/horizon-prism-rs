@@ -849,7 +849,8 @@ impl Hydrator {
         Ok((view, report))
     }
 
-    /// The viewer's likes and reposts of `uris` (§7.5).
+    /// The viewer's likes and reposts of `uris` (§7.5): the newest when it
+    /// has several (#727).
     ///
     /// # Errors
     ///
@@ -858,18 +859,22 @@ impl Hydrator {
         let Some(me) = viewer.state_did() else {
             return Ok(HashMap::new());
         };
-        let likes: Vec<(String, String)> =
-            sqlx::query_as("SELECT subject_uri, uri FROM likes WHERE author_did = $1 AND subject_uri = ANY($2)")
-                .bind(me)
-                .bind(uris)
-                .fetch_all(self.pool())
-                .await?;
-        let reposts: Vec<(String, String)> =
-            sqlx::query_as("SELECT subject_uri, uri FROM reposts WHERE author_did = $1 AND subject_uri = ANY($2)")
-                .bind(me)
-                .bind(uris)
-                .fetch_all(self.pool())
-                .await?;
+        let likes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT ON (subject_uri) subject_uri, uri FROM likes WHERE author_did = $1 AND subject_uri = ANY($2) \
+             ORDER BY subject_uri, created_at DESC, uri DESC",
+        )
+        .bind(me)
+        .bind(uris)
+        .fetch_all(self.pool())
+        .await?;
+        let reposts: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT ON (subject_uri) subject_uri, uri FROM reposts WHERE author_did = $1 AND subject_uri = ANY($2) \
+             ORDER BY subject_uri, created_at DESC, uri DESC",
+        )
+        .bind(me)
+        .bind(uris)
+        .fetch_all(self.pool())
+        .await?;
         let mut out: HashMap<String, Value> = uris.iter().map(|u| (u.clone(), json!({}))).collect();
         for (subject, like) in likes {
             out.entry(subject).or_insert_with(|| json!({}))["like"] = json!(like);

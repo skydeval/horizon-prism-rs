@@ -329,7 +329,8 @@ impl Rebuild {
     }
 }
 
-/// §9.5 repair: recompute both count tables from the base tables. The
+/// §9.5 repair: recompute both count tables from the base tables, likes
+/// and reposts by account (#727). The
 /// share-row-exclusive locks hold count-trigger writers for the duration,
 /// so no increment is lost or doubled. A function of the pool, so the end
 /// of a public-indexing fill runs it too (public-indexing design §8.5).
@@ -346,8 +347,8 @@ pub async fn repair_counts(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO post_counts (post_uri, like_count, repost_count, reply_count, quote_count) \
          SELECT u, sum(l)::int, sum(r)::int, sum(p)::int, sum(q)::int FROM ( \
-           SELECT subject_uri AS u, 1 AS l, 0 AS r, 0 AS p, 0 AS q FROM likes \
-           UNION ALL SELECT subject_uri, 0, 1, 0, 0 FROM reposts \
+           SELECT subject_uri AS u, count(DISTINCT author_did) AS l, 0 AS r, 0 AS p, 0 AS q FROM likes GROUP BY subject_uri \
+           UNION ALL SELECT subject_uri, 0, count(DISTINCT author_did), 0, 0 FROM reposts GROUP BY subject_uri \
            UNION ALL SELECT reply_parent_uri, 0, 0, 1, 0 FROM posts WHERE reply_parent_uri IS NOT NULL \
            UNION ALL SELECT quote_uri, 0, 0, 0, 1 FROM posts WHERE quote_uri IS NOT NULL \
          ) t GROUP BY u",
@@ -578,6 +579,53 @@ mod tests {
         let refs: Vec<(String, String)> = sqlx::query_as("SELECT uri, rev FROM member_post_refs ORDER BY uri").fetch_all(p).await.expect("refs");
         assert_eq!(refs.len(), 4);
         assert!(refs.iter().all(|(u, r)| u.starts_with(&format!("at://{MEMBER}/")) && r.starts_with("3k")));
+        db.drop_db().await;
+    }
+
+    /// #727: migration 0029 recounts the likes and reposts the old triggers
+    /// counted by record, by account, and its triggers keep them so.
+    #[tokio::test]
+    async fn migration_0029_recounts_by_account() {
+        let Some(db) = crate::test_support::empty_db("migration_0029").await else {
+            return;
+        };
+        let p = &db.pool;
+        let migrations: Vec<_> = crate::db::migrations::MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()).collect();
+        let at = migrations.iter().position(|m| m.version == 29).expect("0029");
+        for m in &migrations[..at] {
+            sqlx::raw_sql(&m.sql).execute(p).await.unwrap_or_else(|e| panic!("{}: {e}", m.version));
+        }
+        let liked = format!("at://{LIKED}/app.bsky.feed.post/1");
+        let other = format!("at://{LIKED}/app.bsky.feed.post/2");
+        for (table, n) in [("likes", 3), ("reposts", 2)] {
+            for i in 0..n {
+                exec(p, &format!(
+                    "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES \
+                     ('at://{MEMBER}/{table}/{i}', '{MEMBER}', '{liked}', '3k', now())"
+                ))
+                .await;
+            }
+            exec(p, &format!(
+                "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES \
+                 ('at://{FOLLOWED}/{table}/1', '{FOLLOWED}', '{liked}', '3k', now()), \
+                 ('at://{FOLLOWED}/{table}/2', '{FOLLOWED}', '{other}', '3k', now())"
+            ))
+            .await;
+        }
+        let counts = || async {
+            let rows: Vec<(String, i32, i32)> = sqlx::query_as("SELECT post_uri, like_count, repost_count FROM post_counts ORDER BY post_uri")
+                .fetch_all(p)
+                .await
+                .expect("counts");
+            rows
+        };
+        assert_eq!(counts().await, [(liked.clone(), 4, 3), (other.clone(), 1, 1)], "the old triggers count records");
+        // A row the old triggers never wrote is written too.
+        exec(p, &format!("DELETE FROM post_counts WHERE post_uri = '{other}'")).await;
+        sqlx::raw_sql(&migrations[at].sql).execute(p).await.expect("0029 applies over existing rows");
+        assert_eq!(counts().await, [(liked.clone(), 2, 2), (other.clone(), 1, 1)], "by account");
+        exec(p, &format!("DELETE FROM likes WHERE author_did = '{MEMBER}'")).await;
+        assert_eq!(counts().await, [(liked, 1, 2), (other, 1, 1)], "one statement takes three of one account's likes");
         db.drop_db().await;
     }
 }

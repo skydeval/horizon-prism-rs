@@ -939,12 +939,16 @@ impl Hydrator {
                 .collect();
             return Ok((actors, page.cursor.map(|c| format!("C:{c}"))));
         }
+        // One entry per account, at its newest record of the subject, as
+        // the counts count accounts (#727).
         let table = if collection == NSID_LIKE { "likes" } else { "reposts" };
         let (at, after) = parse_local_cursor(cursor);
         let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(&format!(
-            "SELECT author_did, uri, created_at FROM {table} WHERE subject_uri = $1 \
-             AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-             ORDER BY created_at DESC, uri DESC LIMIT $4"
+            "SELECT l.author_did, l.uri, l.created_at FROM {table} l WHERE l.subject_uri = $1 \
+             AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.subject_uri = l.subject_uri AND x.author_did = l.author_did \
+               AND (x.created_at, x.uri) > (l.created_at, l.uri)) \
+             AND ($2::timestamptz IS NULL OR (l.created_at, l.uri) < ($2, $3)) \
+             ORDER BY l.created_at DESC, l.uri DESC LIMIT $4"
         ))
         .bind(uri)
         .bind(at)
@@ -1798,6 +1802,81 @@ mod tests {
         let likes = h.get_likes(&anon, &req, &root, 50, None).await.expect("db").expect("view");
         assert_eq!(likes.inner()["likes"][0]["actor"]["did"], ALICE);
         let _ = reply;
+        db.drop_db().await;
+    }
+
+    /// #727: one account's three likes (reposts) of a post count once, list
+    /// once at the newest, and are the viewer's newest; deleting two still
+    /// counts 1, the third 0. Multi-row statements, an upsert that keeps
+    /// the subject and one that moves it, and the repair agree.
+    #[tokio::test]
+    async fn an_accounts_duplicate_likes_and_reposts_count_once() {
+        let Some(db) = fresh_db("hydration_duplicate_interactions").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        exec(p, "INSERT INTO members (did, source, ready_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin', now())").await;
+        let root = post(p, BOB, "3kaaaaaaaaaa2", "root", None, None).await;
+        let other = post(p, BOB, "3kaaaaaaaaaa3", "other", None, None).await;
+        let h = hydrator(p, sets());
+        let anon = Viewer::anonymous();
+        let req = Requester::test();
+        let me = h.viewer(Some(ALICE)).await.expect("viewer");
+        for (table, column, collection) in [("likes", "like_count", NSID_LIKE), ("reposts", "repost_count", NSID_REPOST)] {
+            let uri = |n: u32| format!("at://{ALICE}/{collection}/{n}");
+            let counts = || async {
+                let n: Vec<(String, i32)> = sqlx::query_as(&format!("SELECT post_uri, {column} FROM post_counts ORDER BY post_uri"))
+                    .fetch_all(p)
+                    .await
+                    .expect("counts");
+                let of = |u: &str| n.iter().find(|(q, _)| q == u).map_or(0, |(_, c)| *c);
+                (of(&root), of(&other))
+            };
+            exec(p, &format!(
+                "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES \
+                 ('{}', '{ALICE}', '{root}', '3k', now() - interval '3 minutes'), \
+                 ('{}', '{ALICE}', '{root}', '3k', now() - interval '1 minute'), \
+                 ('{}', '{ALICE}', '{root}', '3k', now() - interval '2 minutes')",
+                uri(1), uri(2), uri(3)
+            )).await;
+            assert_eq!(counts().await, (1, 0), "{table}: three records, one account");
+            let v = h.get_posts(&anon, &req, std::slice::from_ref(&root)).await.expect("db").expect("view");
+            let key = if table == "likes" { "likeCount" } else { "repostCount" };
+            assert_eq!(v.inner()["posts"][0][key], 1, "{table}");
+            let (list, list_key) = if table == "likes" {
+                (h.get_likes(&anon, &req, &root, 50, None).await.expect("db").expect("view"), "likes")
+            } else {
+                (h.get_reposted_by(&anon, &req, &root, 50, None).await.expect("db").expect("view"), "repostedBy")
+            };
+            let listed = list.inner()[list_key].as_array().expect("list");
+            assert_eq!(listed.len(), 1, "{table}: one entry per account: {listed:?}");
+            let state = h.post_viewer(&me, std::slice::from_ref(&root)).await.expect("db");
+            let viewer_key = if table == "likes" { "like" } else { "repost" };
+            assert_eq!(state[&root][viewer_key], uri(2), "{table}: the newest");
+
+            // The LWW upsert keeps the subject: nothing moves.
+            exec(p, &format!(
+                "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES ('{}', '{ALICE}', '{root}', '3l', now()) \
+                 ON CONFLICT (uri) DO UPDATE SET subject_uri = EXCLUDED.subject_uri, rev = EXCLUDED.rev",
+                uri(1)
+            )).await;
+            assert_eq!(counts().await, (1, 0), "{table}");
+            // One record moves to another post, and back.
+            exec(p, &format!("UPDATE {table} SET subject_uri = '{other}' WHERE uri = '{}'", uri(1))).await;
+            assert_eq!(counts().await, (1, 1), "{table}");
+            exec(p, &format!("UPDATE {table} SET subject_uri = '{root}' WHERE uri = '{}'", uri(1))).await;
+            assert_eq!(counts().await, (1, 0), "{table}");
+
+            // Two go in one statement; the third remains.
+            exec(p, &format!("DELETE FROM {table} WHERE uri IN ('{}', '{}')", uri(1), uri(2))).await;
+            assert_eq!(counts().await, (1, 0), "{table}: two of three deleted");
+            crate::aggregations::rebuild::repair_counts(p).await.expect("repair");
+            assert_eq!(counts().await, (1, 0), "{table}: the repair agrees");
+            exec(p, &format!("DELETE FROM {table} WHERE uri = '{}'", uri(3))).await;
+            assert_eq!(counts().await, (0, 0), "{table}: the last deleted");
+        }
         db.drop_db().await;
     }
 }

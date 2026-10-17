@@ -296,6 +296,22 @@ commit.
   member reference; for a profile, the repo's stored profile; for a
   private post, its `private_posts` row). A delete that finds no row
   still cleans up, as before.
+- **One account's duplicate likes or reposts inflated the counts (#727).**
+  `likeCount` and `repostCount` now count accounts, not records; every
+  record is still stored. Migration 0029 replaces the row-level count
+  triggers on `likes` and `reposts` with statement-level ones: a count
+  moves only when an account's first live like (repost) of a post arrives
+  or its last one goes, also when one statement writes or deletes several
+  of one account's records. It adds `(subject_uri, author_did)` indexes on
+  both tables and recounts every existing `post_counts` row by account.
+  The weekly repair, the private tier's counts and labelers' local
+  `likeCount` count accounts too.
+  - `getLikes` and `getRepostedBy` (public, from stored rows, and
+    `private.getLikes` / `private.getRepostedBy`) list each account once,
+    at its newest record of the post; Constellation's pages were already
+    deduplicated. `viewer.like` and `viewer.repost` name the viewer's
+    newest record, so the post shows as liked until the last one is
+    deleted. A thread's `knownLikers` lists each account once.
 
 ### Fixed (private posting S10)
 
