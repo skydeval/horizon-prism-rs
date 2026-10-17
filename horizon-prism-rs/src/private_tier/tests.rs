@@ -4833,3 +4833,122 @@ async fn b5_search_floor_on_a_seeded_week() {
     }
     db.drop_db().await;
 }
+
+/// T-TF2 (timing-floors design §6): one fixture served at floor 0 and at
+/// [`FLOOR`] answers with the same content, only sooner. Bodies are
+/// byte-identical, except `cursor`: a sealed cursor carries a fresh nonce
+/// on every seal, so both cursors are opened with the test key and their
+/// positions compared. At 0 each answer takes less than [`FLOOR`]; at
+/// [`FLOOR`], at least that.
+async fn floors_change_no_content_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let aud_carol = f.audience(ALICE, "3kaudcarol22", Some("list"), &[CAROL]).await;
+    let aud_bob = f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL]).await;
+    let hit = f.private_post(ALICE, "3kread0000a2", &aud, None).await;
+    f.private_post(ALICE, "3kread0000b2", &aud, None).await;
+    let hidden = f.private_post(ALICE, "3khidden2222", &aud_carol, None).await;
+    let missing = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3knothere222");
+    // Carol may read Bob's mention of her and Dave; Dave may not.
+    f.post_with(BOB, "3kmention222", &aud_bob, json!({"facets": [mention(CAROL), mention(DAVE)]})).await;
+    f.ready_all().await;
+    let zero = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let floored = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    let feed_aad = super::cursor::aad(FEED, BOB, ALICE, "posts_with_replies");
+    let cursor_key = CursorKey::new(&TEST_CURSOR_KEY);
+    let mut cursors = 0;
+    for (case, method, query, reader) in [
+        ("getPosts, a hit", POSTS, format!("uris={hit}"), BOB),
+        ("getPosts, an unreadable post", POSTS, format!("uris={hidden}"), BOB),
+        ("getPosts, a nonexistent URI", POSTS, format!("uris={missing}"), BOB),
+        ("getPosts, all three", POSTS, format!("uris={hit}&uris={hidden}&uris={missing}"), BOB),
+        ("getPostThread, an unreadable anchor", THREAD, format!("uri={hidden}"), BOB),
+        ("getAuthorFeed, a page with a cursor", FEED, format!("actor={ALICE}&limit=1"), BOB),
+        ("getUnreadCount, one readable mention", GET_UNREAD_COUNT, String::new(), CAROL),
+        ("getUnreadCount, one unreadable mention", GET_UNREAD_COUNT, String::new(), DAVE),
+    ] {
+        exec(&f.pool, "UPDATE sync_state SET head_checked_at = now()").await;
+        let (status_0, body_0, mut took_0) = get(&zero, method, &query, reader, key_of(reader)).await;
+        let (status_f, body_f, took_f) = get(&floored, method, &query, reader, key_of(reader)).await;
+        assert_eq!(status_0, status_f, "{case}: {body_0} / {body_f}");
+        assert!(took_f >= FLOOR, "{case}: at the floor took {took_f:?}");
+        // At 0 nothing waits: the fastest of a few answers, each the same,
+        // is under the floor (one answer alone can be slower on a loaded
+        // host; a floor would hold every one).
+        for _ in 0..4 {
+            if took_0 < FLOOR {
+                break;
+            }
+            let (status, body, took) = get(&zero, method, &query, reader, key_of(reader)).await;
+            assert_eq!(status, status_0, "{case}: {body}");
+            took_0 = took_0.min(took);
+        }
+        assert!(took_0 < FLOOR, "{case}: at 0 the fastest of five took {took_0:?}");
+        let mut v_0: Value = serde_json::from_str(&body_0).expect("json");
+        let mut v_f: Value = serde_json::from_str(&body_f).expect("json");
+        match (v_0.as_object_mut().and_then(|o| o.remove("cursor")), v_f.as_object_mut().and_then(|o| o.remove("cursor"))) {
+            (None, None) => assert_eq!(body_0, body_f, "{case}: byte-identical"),
+            (Some(c_0), Some(c_f)) => {
+                assert_eq!(v_0.to_string(), v_f.to_string(), "{case}: identical but for the cursor");
+                let open = |c: &Value| {
+                    super::cursor::open(&cursor_key, &feed_aad, c.as_str())
+                        .expect("the cursor opens")
+                        .expect("a position")
+                };
+                assert_eq!(open(&c_0), open(&c_f), "{case}: the cursors hold one position");
+                cursors += 1;
+            }
+            (c_0, c_f) => panic!("{case}: a cursor on one side only: {c_0:?} / {c_f:?}"),
+        }
+        // Each case answers what it is meant to, so the comparison is not
+        // of two empty answers.
+        match case {
+            "getPosts, a hit" | "getPosts, all three" => assert_eq!(v_0["posts"].as_array().map(Vec::len), Some(1), "{case}: {v_0}"),
+            "getPosts, an unreadable post" | "getPosts, a nonexistent URI" => assert_eq!(body_0, r#"{"posts":[]}"#, "{case}"),
+            "getPostThread, an unreadable anchor" => assert!(status_0 == 400 && body_0.contains("NotFound"), "{case}: {body_0}"),
+            "getAuthorFeed, a page with a cursor" => assert_eq!(v_0["feed"].as_array().map(Vec::len), Some(1), "{case}: {v_0}"),
+            "getUnreadCount, one readable mention" => assert_eq!(v_0["count"], 1, "{case}: {v_0}"),
+            _ => assert_eq!(v_0["count"], 0, "{case}: {v_0}"),
+        }
+    }
+    assert_eq!(cursors, 1, "the feed page's cursors were compared");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn floors_change_no_content_on() {
+    floors_change_no_content_in(PublicMode::On, "tf2-identity-on").await;
+}
+
+#[tokio::test]
+async fn floors_change_no_content_off() {
+    floors_change_no_content_in(PublicMode::Off, "tf2-identity-off").await;
+}
+
+/// T-TF3 (timing-floors design §6): at floor 0 a private read still
+/// records its time in `private_read_unfloored_seconds{endpoint}`.
+#[tokio::test]
+async fn unfloored_time_is_recorded_at_zero() {
+    let Some(db) = fresh_db("tf3_unfloored_metric").await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let f = fixture(&db.pool, "tf3-metric").await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let post = f.private_post(ALICE, "3kpost222222", &aud, None).await;
+    f.ready_all().await;
+    let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let count = |text: &str| crate::test_support::series(text, "private_read_unfloored_seconds_count", &[r#"endpoint="getPosts""#]);
+    assert_eq!(count(&handle.render()), None, "nothing recorded before the read");
+    let (status, body, _) = get(&base, POSTS, &format!("uris={post}"), BOB, BOB_KEY).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("3kpost222222"), "{body}");
+    assert_eq!(count(&handle.render()), Some(1.0), "{}", handle.render());
+    db.drop_db().await;
+}

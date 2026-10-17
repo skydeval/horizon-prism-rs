@@ -2,9 +2,10 @@
 //! per-record witness `RecordAuthz` (§3.2).
 //!
 //! Steps 3–12 run here; the handler owns steps 1–2 (clock, auth gate) and
-//! 13 (the whole-handler floor). Every failure in steps 3–11 is the same
-//! uniform miss, and increments `private_read_outcome_total{outcome}` with a
-//! server-side reason that never reaches the wire.
+//! 13 (the whole-handler floor, when configured; 0 by default). Every
+//! failure in steps 3–11 is the same uniform miss, and increments
+//! `private_read_outcome_total{outcome}` with a server-side reason that
+//! never reaches the wire.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};

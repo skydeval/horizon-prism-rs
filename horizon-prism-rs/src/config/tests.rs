@@ -130,18 +130,18 @@ page_reads_factor = 2
 walk_batch_max = 1000
 
 [private_read.floor_ms]
-get_posts = 1000
-get_post_thread = 1200
-get_author_feed = 1200
-get_timeline = 1200
-get_bookmarks = 1200
-get_likes = 800
-get_reposted_by = 800
-get_quotes = 1200
-list_notifications = 1200
-get_unread_count = 300
-get_replies = 1200
-search_posts = 1500
+get_posts = 0
+get_post_thread = 0
+get_author_feed = 0
+get_timeline = 0
+get_bookmarks = 0
+get_likes = 0
+get_reposted_by = 0
+get_quotes = 0
+list_notifications = 0
+get_unread_count = 0
+get_replies = 0
+search_posts = 0
 
 [private_notify]
 backfill_max_age_hours = 48
@@ -974,7 +974,70 @@ fn private_search_span_fits_its_reach() {
     assert!(has(&p, "private_search.span_hours must be at most 24 × private_search.max_age_days"), "{p:?}");
     let cfg = load("[private_search]\nspan_hours = 24\nmax_age_days = 1\n").expect("one day of one day");
     assert_eq!(cfg.file.private_search.scan_candidates, 300);
-    assert_eq!(cfg.file.private_read.floor_ms.search_posts, 1500);
+    // Floors are 0 by default (timing-floors design §3.3).
+    assert_eq!(cfg.file.private_read.floor_ms.search_posts, 0);
+}
+
+/// T-TF1 (timing-floors design §6): every floor defaults to 0, 0 is
+/// accepted, and a floor is at most 10 000 ms.
+#[test]
+fn floors_default_to_zero_and_are_at_most_ten_seconds() {
+    let cfg = load("").expect("defaults");
+    assert!(cfg.file.private_read.floor_ms.entries().iter().all(|(_, ms)| *ms == 0));
+    let zeros = "[private_read.floor_ms]\nget_posts = 0\nget_post_thread = 0\nget_author_feed = 0\nget_timeline = 0\nget_bookmarks = 0\nget_likes = 0\nget_reposted_by = 0\nget_quotes = 0\nlist_notifications = 0\nget_unread_count = 0\nget_replies = 0\nsearch_posts = 0\n";
+    let cfg = load(zeros).expect("every floor 0 loads");
+    assert_eq!(cfg.file.private_read.floor_ms, crate::config::PrivateReadFloors::default());
+    let p = invalid_problems(load("[private_read.floor_ms]\nget_posts = 10001\n"));
+    assert!(has(&p, "private_read.floor_ms.get_posts must be at most 10000"), "{p:?}");
+    let cfg = load("[private_read.floor_ms]\nget_posts = 10000\n").expect("10 000 ms loads");
+    assert_eq!(cfg.file.private_read.floor_ms.get_posts, 10_000);
+}
+
+/// T-TF4 (timing-floors design §6): the startup log's level is decided by
+/// a pure function of the floors: all zero is off, all non-zero is on, a
+/// mix is partial with the zero keys listed.
+#[test]
+fn floors_setting_is_off_on_or_partial() {
+    use crate::config::{FloorsSetting, PrivateReadFloors};
+    assert_eq!(PrivateReadFloors::default().setting(), FloorsSetting::Off);
+    let all = PrivateReadFloors {
+        get_posts: 1000,
+        get_post_thread: 1200,
+        get_author_feed: 1200,
+        get_timeline: 1200,
+        get_bookmarks: 1200,
+        get_likes: 800,
+        get_reposted_by: 800,
+        get_quotes: 1200,
+        list_notifications: 1200,
+        get_unread_count: 300,
+        get_replies: 1200,
+        search_posts: 1500,
+    };
+    assert_eq!(all.setting(), FloorsSetting::On);
+    // The four keys a host file may still set, the rest at the default.
+    let some = PrivateReadFloors {
+        get_posts: 1000,
+        get_post_thread: 1200,
+        get_author_feed: 1200,
+        get_timeline: 1200,
+        ..PrivateReadFloors::default()
+    };
+    assert_eq!(
+        some.setting(),
+        FloorsSetting::Partial {
+            zero: vec![
+                "get_bookmarks",
+                "get_likes",
+                "get_reposted_by",
+                "get_quotes",
+                "list_notifications",
+                "get_unread_count",
+                "get_replies",
+                "search_posts",
+            ]
+        }
+    );
 }
 
 /// Private-threads design §5: `max_chain` is 1 to 100 (16 by default, 100

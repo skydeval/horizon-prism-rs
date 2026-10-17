@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use super::sections::{
-    COMMUNITY_NETWORK, FileConfig, LOCAL_APPVIEW, NetworkAuth, PublicScope,
+    COMMUNITY_NETWORK, FileConfig, LOCAL_APPVIEW, NetworkAuth, PrivateReadFloors, PublicScope,
 };
 
 /// Metrics label for relays absent from `firehose.relay_labels` (§5.11).
@@ -358,7 +358,7 @@ fn urls(cfg: &FileConfig, out: &mut Vec<String>) {
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 37] = [
+    let nonzero: [(&str, u64); 25] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
         ("firehose.deterministic_attempts", u64::from(cfg.firehose.deterministic_attempts)),
         ("identity.did_fresh_secs", cfg.identity.did_fresh_secs),
@@ -366,18 +366,6 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
         ("kryphocron.oracle_freshness_bound_secs", cfg.kryphocron.oracle_freshness_bound_secs),
         ("private_read.bind_concurrency", u64::from(cfg.private_read.bind_concurrency)),
         ("private_read.membership_retry_after_secs", cfg.private_read.membership_retry_after_secs),
-        ("private_read.floor_ms.get_posts", cfg.private_read.floor_ms.get_posts),
-        ("private_read.floor_ms.get_post_thread", cfg.private_read.floor_ms.get_post_thread),
-        ("private_read.floor_ms.get_author_feed", cfg.private_read.floor_ms.get_author_feed),
-        ("private_read.floor_ms.get_timeline", cfg.private_read.floor_ms.get_timeline),
-        ("private_read.floor_ms.get_bookmarks", cfg.private_read.floor_ms.get_bookmarks),
-        ("private_read.floor_ms.get_likes", cfg.private_read.floor_ms.get_likes),
-        ("private_read.floor_ms.get_reposted_by", cfg.private_read.floor_ms.get_reposted_by),
-        ("private_read.floor_ms.get_quotes", cfg.private_read.floor_ms.get_quotes),
-        ("private_read.floor_ms.list_notifications", cfg.private_read.floor_ms.list_notifications),
-        ("private_read.floor_ms.get_unread_count", cfg.private_read.floor_ms.get_unread_count),
-        ("private_read.floor_ms.get_replies", cfg.private_read.floor_ms.get_replies),
-        ("private_read.floor_ms.search_posts", cfg.private_read.floor_ms.search_posts),
         ("private_search.scan_candidates", u64::from(cfg.private_search.scan_candidates)),
         ("private_search.span_hours", u64::from(cfg.private_search.span_hours)),
         ("private_search.max_age_days", u64::from(cfg.private_search.max_age_days)),
@@ -400,6 +388,12 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     for (key, value) in nonzero {
         if value == 0 {
             out.push(format!("{key} must be greater than 0"));
+        }
+    }
+    // Floors are 0 (off) by default and at most 10 s (timing-floors design §2).
+    for (key, ms) in cfg.private_read.floor_ms.entries() {
+        if ms > PrivateReadFloors::MAX_MS {
+            out.push(format!("private_read.floor_ms.{key} must be at most {}", PrivateReadFloors::MAX_MS));
         }
     }
     if cfg.identity.did_fresh_secs >= cfg.identity.did_stale_max_secs {

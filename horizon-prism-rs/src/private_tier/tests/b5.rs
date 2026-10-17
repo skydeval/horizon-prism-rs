@@ -12,8 +12,8 @@
 //!   bounds of amendment 1 §1 for the five classes handed to #720.
 //! - **Part (3)'s fixtures** ([`Part3`]): built here, run on the deploy build
 //!   by `b5_release` (amendment 1 §2), and in process by
-//!   `b5_absolute_floors` (each endpoint's p99 at the client, at
-//!   concurrency 8, heads fresh, and no head fetched).
+//!   `b5_absolute_floors` (each endpoint's p99 at the client against its
+//!   B-5 budget, at concurrency 8, heads fresh, and no head fetched).
 //! - **The stale-head chain** runs on the `bench-heads` build, in
 //!   `b5_release::b5_stale_head_chain`.
 //! - **Part (2)**, per request against a HEAD build, is not run here: it
@@ -25,7 +25,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures::StreamExt;
 
 use super::*;
-use crate::config::PrivateReadFloors;
 
 /// The base snapshot (§4, "Host and data").
 const BASE_MEMBERS: i64 = 5_000;
@@ -442,29 +441,37 @@ pub(super) fn percentile(sorted: &[Duration], p: usize) -> Duration {
     sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
 }
 
-/// An endpoint's floor from the default `[private_read.floor_ms]`.
-pub(super) fn floor_of(method: &str) -> Duration {
-    let f = PrivateReadFloors::default();
-    let ms = match method {
-        POSTS => f.get_posts,
-        THREAD => f.get_post_thread,
-        FEED => f.get_author_feed,
-        TIMELINE => f.get_timeline,
-        GET_BOOKMARKS => f.get_bookmarks,
-        GET_LIKES => f.get_likes,
-        GET_REPOSTED_BY => f.get_reposted_by,
-        GET_QUOTES => f.get_quotes,
-        LIST_NOTIFICATIONS => f.list_notifications,
-        GET_UNREAD_COUNT => f.get_unread_count,
-        GET_REPLIES => f.get_replies,
-        _ => f.search_posts,
-    };
-    Duration::from_millis(ms)
+/// B-5's latency budget per endpoint, in milliseconds (timing-floors design
+/// §3.2): the floors' previous defaults, kept as the bound part (3) gates
+/// on now that floors are 0 by default. C-T14's absolute bound guards
+/// latency at these numbers.
+pub(super) const B5_BUDGET_MS: [(&str, u64); 12] = [
+    (POSTS, 1000),
+    (THREAD, 1200),
+    (FEED, 1200),
+    (TIMELINE, 1200),
+    (GET_BOOKMARKS, 1200),
+    (GET_LIKES, 800),
+    (GET_REPOSTED_BY, 800),
+    (GET_QUOTES, 1200),
+    (LIST_NOTIFICATIONS, 1200),
+    (GET_UNREAD_COUNT, 300),
+    (GET_REPLIES, 1200),
+    (SEARCH, 1500),
+];
+
+/// An endpoint's budget from [`B5_BUDGET_MS`].
+pub(super) fn budget_of(method: &str) -> Duration {
+    let (_, ms) = B5_BUDGET_MS
+        .iter()
+        .find(|(m, _)| *m == method)
+        .unwrap_or_else(|| panic!("no B-5 budget for {method}"));
+    Duration::from_millis(*ms)
 }
 
 /// One part (3) fixture's run: each `(label, method, query, gated)` sampled
-/// against a fresh server, printed with its floor; a gated p99 over its
-/// floor is a failure.
+/// against a fresh server, printed with its budget; a gated p99 over its
+/// budget is a failure.
 async fn run_fixture(w: &mut Walk, fixture: &str, read: &PrivateReadConfig, heads: &Counting, cases: &[(&str, &str, String, bool)]) {
     let base = serve_live(w.f.state_bounded(read)).await;
     let n = samples();
@@ -475,21 +482,21 @@ async fn run_fixture(w: &mut Walk, fixture: &str, read: &PrivateReadConfig, head
         // One request at a time: what the request costs without the
         // in-process harness's own queueing.
         let alone = sample(&base, method, query, DAVE, n.min(100), 1).await;
-        let floor = floor_of(method);
+        let budget = budget_of(method);
         println!(
-            "  B-5 (3) {fixture:<46} {label:<34} alone p50 {:>6.1} ms  c8 p50 {:>7.1} ms  p99 {:>7.1} ms  floor {:>5} ms  {}",
+            "  B-5 (3) {fixture:<46} {label:<34} alone p50 {:>6.1} ms  c8 p50 {:>7.1} ms  p99 {:>7.1} ms  budget {:>5} ms  {}",
             percentile(&alone, 50).as_secs_f64() * 1000.0,
             p50.as_secs_f64() * 1000.0,
             p99.as_secs_f64() * 1000.0,
-            floor.as_millis(),
-            match (gated, p99 < floor) {
+            budget.as_millis(),
+            match (gated, p99 < budget) {
                 (false, _) => "reported",
                 (true, true) => "ok",
                 (true, false) => "OVER",
             }
         );
         if *gated {
-            w.check(p99 < floor, format!("{fixture}, {label}: p99 {p99:?} over its floor {floor:?}"));
+            w.check(p99 < budget, format!("{fixture}, {label}: p99 {p99:?} over its budget {budget:?}"));
         }
     }
     let calls = heads.0.load(Ordering::SeqCst);
@@ -517,7 +524,7 @@ pub(super) async fn ready_dids(pool: &PgPool, dids: &[String]) {
 }
 
 /// One part (3) case: its label, method, query, and whether its p99 is
-/// gated at the endpoint's floor (otherwise reported).
+/// gated at the endpoint's budget (otherwise reported).
 pub(super) type Case = (&'static str, &'static str, String, bool);
 
 /// Part (3)'s fixtures (§4; amendment 1 §2.4), each loaded into its own
@@ -801,7 +808,7 @@ impl Part3 {
                 ]
             }
             // 5 000 under distinct parents at depth 8 under V's own public
-            // post, each notifying V (gated at getUnreadCount's floor).
+            // post, each notifying V (gated at getUnreadCount's budget).
             Self::Distinct => {
                 let g = audience_row(pool, ALICE, "b5dist", &[DAVE.into(), BOB.into(), CAROL.into()]).await;
                 let mut b = Bulk::new("b5t");
@@ -1046,7 +1053,7 @@ pub(super) async fn make_undecodable(pool: &PgPool, pattern: &str) {
     .expect("undecodable");
 }
 
-/// Part (3) in process (§4): each endpoint's p99 under its floor on the
+/// Part (3) in process (§4): each endpoint's p99 under its budget on the
 /// base snapshot, the new shapes and the non-adversarial fixtures, and the
 /// named adversarial fixtures reported (gated where §4 gates them). Since
 /// amendment 1, B-5's part (3) runs on the deploy build

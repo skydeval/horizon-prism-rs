@@ -110,6 +110,26 @@ commit.
   Migration 0027. Floors `list_notifications` 1200 ms, `get_unread_count`
   300 ms. `getMembership`'s `features` gains `private.notifications`.
 
+### Changed (private-read timing floors)
+
+- **Private-read timing floors are off by default (Horizon P-24).** Every
+  key of `[private_read.floor_ms]` now defaults to 0, so private reads
+  answer as soon as they are ready. The floors hid whether a private post
+  exists; since a private post is a public record under another NSID, that
+  is not secret. Uniform omission is unchanged: an unreadable post is
+  still left out exactly like a missing one. **If your `app.toml` lists
+  `[private_read.floor_ms]` (the shipped template did), those floors stay
+  until you delete the section or set the keys to 0.** An operator who
+  wants floors sets **every** key above that endpoint's measured p99 in
+  `private_read_unfloored_seconds{endpoint}`, since a post can be timed
+  through any endpoint that reads it; serve warns at startup when only
+  some are set. The previous defaults were `get_posts` 1000,
+  `get_post_thread`, `get_author_feed`, `get_timeline`, `get_bookmarks`,
+  `get_quotes`, `list_notifications` and `get_replies` 1200, `get_likes`
+  and `get_reposted_by` 800, `get_unread_count` 300, `search_posts` 1500.
+  0 is now accepted, and each floor is at most 10000: a config with a
+  larger floor no longer starts.
+
 ### Changed (private threads S12)
 
 - **A private reply is read by its thread root's current audience

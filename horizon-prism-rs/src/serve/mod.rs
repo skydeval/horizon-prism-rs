@@ -697,6 +697,7 @@ pub async fn run() -> Result<(), StartupError> {
         crate::cursor_key::CursorKey::new(cfg.env.private_cursor_key.expose()),
     )
     .with_search(&cfg.file.private_search);
+    log_floors(&cfg.file.private_read.floor_ms);
     // The post-migration task (design-v3 §12.2): every migration is applied
     // and ingest is running, so old rows can be filled and the large
     // indexes built while the app serves.
@@ -783,6 +784,31 @@ pub async fn run() -> Result<(), StartupError> {
     }
     tracing::info!(event = "serve_stopped", "shutdown complete");
     Ok(())
+}
+
+/// The private-read floors, once at startup (timing-floors design §2): `info`
+/// with each value, and `warn` naming the zero keys when only some are set,
+/// since a post can be timed through any endpoint that reads it.
+fn log_floors(floors: &crate::config::PrivateReadFloors) {
+    use crate::config::FloorsSetting;
+    let values = floors
+        .entries()
+        .iter()
+        .map(|(key, ms)| format!("{key}={ms}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    match floors.setting() {
+        FloorsSetting::Off => tracing::info!(event = "private_read_floors", "private read floors: off"),
+        FloorsSetting::On => tracing::info!(event = "private_read_floors", floors = %values, "private read floors: on"),
+        FloorsSetting::Partial { zero } => {
+            tracing::info!(event = "private_read_floors", floors = %values, "private read floors: partial");
+            tracing::warn!(
+                event = "private_read_floors_partial",
+                zero = %zero.join(" "),
+                "private read floors are set on only some endpoints; response time still shows what they hide through the others"
+            );
+        }
+    }
 }
 
 async fn shutdown_signal() {

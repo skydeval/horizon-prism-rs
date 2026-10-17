@@ -31,7 +31,7 @@ use k256::ecdsa::SigningKey;
 use redis::aio::ConnectionManager;
 
 use super::b5::{
-    Bulk, Case, Part3, audience_mode_row, base_snapshot, floor_of, member, percentile, ready_dids, samples,
+    Bulk, Case, Part3, audience_mode_row, base_snapshot, budget_of, member, percentile, ready_dids, samples,
 };
 use super::*;
 use crate::firehose::gap;
@@ -288,34 +288,16 @@ async fn gap_epoch(pool: &PgPool) -> Option<String> {
 }
 
 /// The run's `app.toml` (amendment 1 §2.3): no PLC, heads up to 600 s,
-/// rate limits above the load, the `bench` relay, floors of 1 ms so the
-/// client's samples are not padded (the gate reads the server's unfloored
-/// histogram), and for the stale-head chain its heads file.
+/// rate limits above the load, the `bench` relay, the default floors of 0
+/// so the client's samples are not padded (the gate reads the server's
+/// unfloored histogram), and for the stale-head chain its heads file.
 fn app_toml(cap: u32, heads_file: Option<&Path>) -> String {
-    let floors: String = [
-        "get_posts",
-        "get_post_thread",
-        "get_author_feed",
-        "get_timeline",
-        "get_bookmarks",
-        "get_likes",
-        "get_reposted_by",
-        "get_quotes",
-        "list_notifications",
-        "get_unread_count",
-        "get_replies",
-        "search_posts",
-    ]
-    .iter()
-    .map(|k| format!("{k} = 1\n"))
-    .collect();
     let mut toml = format!(
         "[http]\nbind = \"127.0.0.1:3030\"\n\n\
          [metrics]\nbind = \"127.0.0.1:9091\"\n\n\
          [identity]\nplc_url = \"https://plc.invalid\"\n\n\
          [sync]\nhead_max_age_secs = 600\n\n\
          [private_read]\nmax_chain = {cap}\n\n\
-         [private_read.floor_ms]\n{floors}\n\
          [firehose]\nstream_key = \"{STREAM_KEY}\"\nprivate_relays = [\"bench\"]\n\n\
          [firehose.relay_labels]\n\"{BENCH_RELAY}\" = \"bench\"\n\n\
          [rate_limits]\nprivate = {{ per_sec = 10000.0, burst = 20000 }}\nglobal = {{ per_sec = 10000.0, burst = 20000 }}\n\n\
@@ -610,7 +592,7 @@ async fn run(db: &Loaded, bin: &Path, concurrency: usize, samples_c8: usize) -> 
 
     for (label, method, query, gated) in &db.cases {
         let endpoint = method.rsplit('.').next().expect("method");
-        let floor = floor_of(method);
+        let budget = budget_of(method);
         let before = buckets(&metrics(&client).await, endpoint);
         let (took, alone) = if db.stale.is_empty() {
             let took = sample_as(&client, method, query, samples_c8, concurrency).await;
@@ -649,7 +631,7 @@ async fn run(db: &Loaded, bin: &Path, concurrency: usize, samples_c8: usize) -> 
         let next_bound = after.iter().map(|(le, _)| *le).find(|le| *le > upper).unwrap_or(f64::INFINITY);
         let overhead = client_p99.as_secs_f64() > next_bound;
         println!(
-            "  B-5 (3) {:<52} {label:<36} alone p50 {:>6.1} ms  c{concurrency} p50 {:>7.1} ms  server p99 {:>7.1} ms [{:.0}, {:.0}]  client p99 {:>7.1} ms{}  floor {:>5} ms  {}",
+            "  B-5 (3) {:<52} {label:<36} alone p50 {:>6.1} ms  c{concurrency} p50 {:>7.1} ms  server p99 {:>7.1} ms [{:.0}, {:.0}]  client p99 {:>7.1} ms{}  budget {:>5} ms  {}",
             db.title,
             ms(percentile(&alone, 50)),
             ms(percentile(&took, 50)),
@@ -658,15 +640,15 @@ async fn run(db: &Loaded, bin: &Path, concurrency: usize, samples_c8: usize) -> 
             upper * 1000.0,
             ms(client_p99),
             if overhead { " (harness overhead)" } else { "" },
-            floor.as_millis(),
-            match (gated, p99 < floor) {
+            budget.as_millis(),
+            match (gated, p99 < budget) {
                 (false, _) => "reported",
                 (true, true) => "ok",
                 (true, false) => "OVER",
             }
         );
-        if *gated && p99 >= floor {
-            failures.push(format!("{}, {label}: server p99 {p99:?} over its floor {floor:?}", db.title));
+        if *gated && p99 >= budget {
+            failures.push(format!("{}, {label}: server p99 {p99:?} over its budget {budget:?}", db.title));
         }
     }
 
@@ -768,7 +750,7 @@ async fn b5_release_floors() {
 /// `bench-heads` build: Alice's root and a chain of 15 replies by 15
 /// authors, 17 DIDs against a budget of 16, every head stale before each
 /// sample and answered by `BenchHeadSource` after 450 ms. `getPostThread` at
-/// the bottom, at concurrency 1, under its 1 200 ms floor; answering, and
+/// the bottom, at concurrency 1, under its 1 200 ms budget; answering, and
 /// with parent 5's author failing. `HPRS_B5_STALE_SAMPLES` samples (default
 /// `HPRS_B5_SAMPLES`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

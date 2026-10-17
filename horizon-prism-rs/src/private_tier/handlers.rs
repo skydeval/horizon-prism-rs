@@ -5,8 +5,10 @@
 //! - Candidates come from the §6.9 prefilter. Each is read through the
 //!   per-record pipeline with in-task concurrency `bind_concurrency`.
 //! - Step 13: every response, hit or miss, waits until the endpoint's floor
-//!   measured from handler entry. The unfloored time is exported as
-//!   `private_read_unfloored_seconds{endpoint}`.
+//!   measured from handler entry, when one is configured: floors are 0 by
+//!   default, and at 0 nothing waits (timing-floors design). The response
+//!   is built before the floor and returned unchanged. The unfloored time
+//!   is exported as `private_read_unfloored_seconds{endpoint}`.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};

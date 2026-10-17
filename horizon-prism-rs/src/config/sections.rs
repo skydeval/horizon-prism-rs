@@ -270,7 +270,9 @@ impl Default for KryphocronConfig {
     }
 }
 
-/// `[private_read.floor_ms]`: whole-handler latency floors (§6.9).
+/// `[private_read.floor_ms]`: whole-handler latency floors (§6.9), per
+/// deployment, 0 (off) by default (timing-floors design). Each key is 0 to
+/// [`PrivateReadFloors::MAX_MS`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrivateReadFloors {
@@ -297,22 +299,75 @@ pub struct PrivateReadFloors {
 }
 
 impl Default for PrivateReadFloors {
+    /// Every floor 0: off (timing-floors design). A private post is a public
+    /// post under another NSID and its existence is not secret (skydeval,
+    /// 2026-10-15), so a private read answers as soon as it is ready. An
+    /// operator who wants floors sets every key.
     fn default() -> Self {
         Self {
-            // Raised in private posting S2 (§3.2, §4.2): quoted reads add up
-            // to one bind per hit.
-            get_posts: 1000,
-            get_post_thread: 1200,
-            get_author_feed: 1200,
-            get_timeline: 1200,
-            get_bookmarks: 1200,
-            get_likes: 800,
-            get_reposted_by: 800,
-            get_quotes: 1200,
-            list_notifications: 1200,
-            get_unread_count: 300,
-            get_replies: 1200,
-            search_posts: 1500,
+            get_posts: 0,
+            get_post_thread: 0,
+            get_author_feed: 0,
+            get_timeline: 0,
+            get_bookmarks: 0,
+            get_likes: 0,
+            get_reposted_by: 0,
+            get_quotes: 0,
+            list_notifications: 0,
+            get_unread_count: 0,
+            get_replies: 0,
+            search_posts: 0,
+        }
+    }
+}
+
+/// How a deployment's floors are set, for serve's startup log
+/// (timing-floors design §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorsSetting {
+    /// Every key 0.
+    Off,
+    /// Every key above 0.
+    On,
+    /// Some keys above 0 and these at 0: a post can still be timed through
+    /// the unfloored endpoints that read it.
+    Partial { zero: Vec<&'static str> },
+}
+
+impl PrivateReadFloors {
+    /// The largest floor a key may take, in milliseconds.
+    pub const MAX_MS: u64 = 10_000;
+
+    /// Every key with its value, in declaration order.
+    pub fn entries(&self) -> [(&'static str, u64); 12] {
+        [
+            ("get_posts", self.get_posts),
+            ("get_post_thread", self.get_post_thread),
+            ("get_author_feed", self.get_author_feed),
+            ("get_timeline", self.get_timeline),
+            ("get_bookmarks", self.get_bookmarks),
+            ("get_likes", self.get_likes),
+            ("get_reposted_by", self.get_reposted_by),
+            ("get_quotes", self.get_quotes),
+            ("list_notifications", self.list_notifications),
+            ("get_unread_count", self.get_unread_count),
+            ("get_replies", self.get_replies),
+            ("search_posts", self.search_posts),
+        ]
+    }
+
+    /// Off, on, or partial with the zero keys named.
+    pub fn setting(&self) -> FloorsSetting {
+        let zero: Vec<&'static str> = self
+            .entries()
+            .into_iter()
+            .filter(|(_, ms)| *ms == 0)
+            .map(|(key, _)| key)
+            .collect();
+        match zero.len() {
+            0 => FloorsSetting::On,
+            12 => FloorsSetting::Off,
+            _ => FloorsSetting::Partial { zero },
         }
     }
 }
