@@ -352,7 +352,7 @@ impl H {
     async fn reads(&self, reader: &str, uri: &str) -> bool {
         let served = self.served(reader, uri).await;
         let oracle = oracle_admits(self.pool(), reader, uri).await;
-        let prefilter = !schema::prefilter_uris(self.pool(), reader, &[uri.to_string()]).await.expect("prefilter").is_empty();
+        let prefilter = !schema::prefilter_uris(self.pool(), reader, &[uri.to_string()], super::CAP).await.expect("prefilter").is_empty();
         assert_eq!((oracle, prefilter), (served, served), "{reader} on {uri}: oracle {oracle}, prefilter {prefilter}, getPosts {served}");
         served
     }

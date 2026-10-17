@@ -31,7 +31,7 @@ use crate::db::{GateError, ScopeGuard, StorageSampler, enforce_gate};
 use crate::admin_executor::{AdminExecutor, Handlers};
 use crate::firehose::backfill::{Backfill, BackfillSource, NetSource};
 use crate::subscriptions::{self, applier::Applier, fetch::Bounds, pds::PdsOwners, runner::{Lanes, ListSync}};
-use crate::sync::{BudgetRates, HeadProber, HostBudgets, NetHeadSource};
+use crate::sync::{BudgetRates, HeadProber, HostBudgets};
 use crate::firehose::consumer::{Consumer, ConsumerStatus, LAG_SAMPLE_INTERVAL, spawn_lag_sampler};
 use crate::firehose::coverage::CoverageTracker;
 use crate::firehose::watermark::Watermarks;
@@ -137,8 +137,40 @@ pub async fn run() -> Result<(), StartupError> {
     init_tracing(&cfg.env.log_level);
     PrometheusBuilder::new()
         .with_http_listener(cfg.file.metrics.bind)
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(crate::private_tier::handlers::METRIC_UNFLOORED.to_string()),
+            &crate::private_tier::handlers::unfloored_buckets(),
+        )
+        .map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?
         .install()
         .map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?;
+    // A bench build refuses to start without its heads file (private-threads
+    // design §4), and says what it is.
+    #[cfg(feature = "bench-heads")]
+    let bench_heads = {
+        let source = crate::sync::bench_heads::BenchHeadSource::from_config(&cfg.file)
+            .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
+        tracing::warn!(
+            event = "bench_heads",
+            "built with the bench-heads feature: repo heads come from bench.heads_file and the background head prober is off; never deploy this build"
+        );
+        source
+    };
+    // The effective head age, for the release check (private-threads design
+    // §5), and the bucket note of §3.4.
+    tracing::info!(
+        event = "config_head_max_age",
+        "config: sync.head_max_age_secs={}",
+        cfg.file.sync.head_max_age_secs
+    );
+    if cfg.file.sync.max_head_fetches_per_request > cfg.file.sync.read_fetch_rate_per_host {
+        tracing::warn!(
+            event = "config_head_fetches_over_host_rate",
+            max_head_fetches_per_request = cfg.file.sync.max_head_fetches_per_request,
+            read_fetch_rate_per_host = cfg.file.sync.read_fetch_rate_per_host,
+            "sync.max_head_fetches_per_request is above sync.read_fetch_rate_per_host: a private thread's head round can find a host's bucket empty and miss"
+        );
+    }
 
     let pool = crate::db::connect(&cfg)
         .await
@@ -480,16 +512,24 @@ pub async fn run() -> Result<(), StartupError> {
         .with_sync_min_interval_secs(lists.sync_min_interval_secs);
     tasks.push(rebuild.clone().spawn_weekly());
 
-    // Repo-head prober (§6.11.3); the private pipeline shares it.
+    // Repo-head prober (§6.11.3); the private pipeline shares it. Under the
+    // B-5 bench's feature its source is the bench file, read at startup,
+    // and no background pass runs (private-threads design §4).
+    #[cfg(feature = "bench-heads")]
+    let head_source: Arc<dyn crate::sync::HeadSource> = Arc::new(bench_heads);
+    #[cfg(not(feature = "bench-heads"))]
+    let head_source: Arc<dyn crate::sync::HeadSource> = Arc::new(crate::sync::NetHeadSource::new(&nets));
     let prober = HeadProber::new(
         pool.clone(),
         scope.clone(),
         Arc::clone(&private),
-        Arc::new(NetHeadSource::new(&nets)),
+        head_source,
         budgets.clone(),
         cfg.file.sync.clone(),
     );
-    tasks.push(prober.clone().spawn());
+    if crate::sync::SPAWNS_PROBER {
+        tasks.push(prober.clone().spawn());
+    }
 
     // Admin executor (§3.3).
     tasks.push(

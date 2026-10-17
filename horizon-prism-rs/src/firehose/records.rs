@@ -253,8 +253,10 @@ impl ProfileRecord {
     }
 }
 
-/// Rule-2 subjects of a private-tier record (§9.3): a private reply's parent
-/// and root authors, a private block's subject.
+/// Rule-2 subjects of a private-tier record (§9.3): a private post's reply
+/// parent and root authors and its `audienceList`'s author (the
+/// private-threads design §2.5: a branch reply names its branch root's
+/// audience, whose owner is named nowhere else), a private block's subject.
 ///
 /// # Errors
 ///
@@ -262,20 +264,22 @@ impl ProfileRecord {
 pub fn private_subjects(kind: KryphocronKind, record: &Value) -> Result<Vec<String>, RecordError> {
     match kind {
         KryphocronKind::PostPrivate => {
-            let mut out = Vec::new();
+            let mut out: Vec<String> = Vec::new();
+            let mut push = |a: Option<&str>| {
+                if let Some(a) = a
+                    && !out.iter().any(|d| d == a)
+                {
+                    out.push(a.to_string());
+                }
+            };
             if let Some(reply) = record.get("reply").filter(|r| !r.is_null()) {
                 for part in ["parent", "root"] {
-                    if let Some(a) = reply
-                        .get(part)
-                        .and_then(|p| p.get("uri"))
-                        .and_then(Value::as_str)
-                        .and_then(uri_author)
-                        && !out.iter().any(|d: &String| d == a)
-                    {
-                        out.push(a.to_string());
-                    }
+                    push(reply.get(part).and_then(|p| p.get("uri")).and_then(Value::as_str).and_then(uri_author));
                 }
             }
+            // `audienceList`: an at-uri, or a strong ref `{uri}`.
+            let audience = record.get("audienceList").and_then(|a| a.as_str().or_else(|| a.get("uri").and_then(Value::as_str)));
+            push(audience.and_then(uri_author));
             Ok(out)
         }
         KryphocronKind::PrivateBlock => Ok(vec![GraphRecord::parse(record, Utc::now())?.subject_did]),
@@ -399,6 +403,15 @@ mod tests {
             ["did:plc:p", "did:plc:r"]
         );
         assert!(private_subjects(KryphocronKind::PostPrivate, &json!({})).expect("ok").is_empty());
+        // Private threads §2.5: the audience's author, in either form, once.
+        let branch = json!({"reply": {"parent": {"uri": "at://did:plc:p/tools.kryphocron.feed.postPrivate/1"},
+                                      "root": {"uri": "at://did:plc:r/app.bsky.feed.post/1"}},
+                            "audienceList": "at://did:plc:o/tools.kryphocron.policy.audience/1"});
+        assert_eq!(private_subjects(KryphocronKind::PostPrivate, &branch).expect("ok"), ["did:plc:p", "did:plc:r", "did:plc:o"]);
+        let referenced = json!({"audienceList": {"uri": "at://did:plc:p/tools.kryphocron.policy.audience/1", "cid": "c"},
+                                "reply": {"parent": {"uri": "at://did:plc:p/tools.kryphocron.feed.postPrivate/1"},
+                                          "root": {"uri": "at://did:plc:p/tools.kryphocron.feed.postPrivate/0"}}});
+        assert_eq!(private_subjects(KryphocronKind::PostPrivate, &referenced).expect("ok"), ["did:plc:p"]);
         assert_eq!(
             private_subjects(KryphocronKind::PrivateBlock, &json!({"subject": "did:plc:s"})).expect("ok"),
             ["did:plc:s"]

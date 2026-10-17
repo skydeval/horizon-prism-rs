@@ -1025,9 +1025,11 @@ pub(crate) async fn purge_did(conn: &mut PgConnection, did: &str, limit: i64) ->
     Ok(n)
 }
 
-/// A reply whose parent or root author is a community member (class M).
-const REPLY_TO_MEMBER: &str = "EXISTS (SELECT 1 FROM members m WHERE m.did IN \
-     (split_part(p.reply_parent_uri, '/', 3), split_part(p.reply_root_uri, '/', 3)))";
+/// A post whose reply parent or root author, or whose audience's author, is
+/// a community member (class M; the audience's author since the
+/// private-threads design §2.5, as admission's subjects).
+pub(super) const REPLY_TO_MEMBER: &str = "EXISTS (SELECT 1 FROM members m WHERE m.did IN \
+     (split_part(p.reply_parent_uri, '/', 3), split_part(p.reply_root_uri, '/', 3), split_part(p.audience_uri, '/', 3)))";
 
 /// `ingest::purge_out_of_scope`: the DID's own private posts and audiences,
 /// except class-M replies to members (§6.11.7, §9.4).
@@ -1069,9 +1071,9 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
     Ok(n)
 }
 
-/// The private part of a `member_removed` purge (§6.11.7): private replies by
+/// The private part of a `member_removed` purge (§6.11.7): private posts by
 /// authors outside S admitted only because `did` was a member (no other
-/// member among parent and root authors), rule-2 private blocks of `did`
+/// member among the parent, root and audience authors), rule-2 private blocks of `did`
 /// by authors outside S that are not private owners, the member's private
 /// bookmarks, the member's quote references (private posting §3.1: its
 /// later deletes are no longer tracked), and the private notifications it
@@ -1094,9 +1096,11 @@ pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, lim
     n += sqlx::query(
         "DELETE FROM private_posts WHERE uri IN (SELECT p.uri FROM private_posts p \
          WHERE NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = p.author_did) \
-           AND $1 IN (split_part(p.reply_parent_uri, '/', 3), split_part(p.reply_root_uri, '/', 3)) \
+           AND $1 IN (split_part(p.reply_parent_uri, '/', 3), split_part(p.reply_root_uri, '/', 3), \
+                      split_part(p.audience_uri, '/', 3)) \
            AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did <> $1 AND m.did IN \
-               (split_part(p.reply_parent_uri, '/', 3), split_part(p.reply_root_uri, '/', 3))) \
+               (split_part(p.reply_parent_uri, '/', 3), split_part(p.reply_root_uri, '/', 3), \
+                split_part(p.audience_uri, '/', 3))) \
          LIMIT $2)",
     )
     .bind(did)

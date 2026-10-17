@@ -51,7 +51,7 @@
         "audience": {
           "type": "ref",
           "ref": "#audienceView",
-          "description": "The audience the post names, while this AppView holds its record. Absent when the post names none or the record is gone; the author still sees record.audienceList."
+          "description": "The governing audience: the current audience of the post's thread root, or of its branch root for a reply in a private branch under a public post (the post itself when top-level), while this AppView holds its record. On the author's own read it appears only when the author is that audience's owner or may read under it. Absent otherwise, and when the record is gone; the author still sees record.audienceList, the audience the post names."
         },
         "viewer": {
           "type": "ref",

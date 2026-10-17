@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use super::pipeline::RecordAuthz;
+use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE};
 
 /// Pre-bind facts about a post (non-content): owner, audience URI and the
 /// parent it replies to (rule 4's walk starts there).
@@ -103,10 +104,6 @@ pub(super) struct ViewMeta {
     pub reply_parent_cid: Option<String>,
     pub created_at: DateTime<Utc>,
     pub indexed_at: DateTime<Utc>,
-    /// The audience row's presence, `mode` and `name` (P-3, §4.10).
-    pub audience_found: bool,
-    pub audience_mode: Option<String>,
-    pub audience_name: Option<String>,
 }
 
 /// # Errors
@@ -115,12 +112,25 @@ pub(super) struct ViewMeta {
 pub(super) async fn view_meta(pool: &PgPool, rauth: &RecordAuthz) -> Result<Option<ViewMeta>, sqlx::Error> {
     sqlx::query_as(
         "SELECT p.cid, p.audience_uri, p.reply_root_uri, p.reply_parent_uri, p.reply_root_cid, p.reply_parent_cid, \
-           p.created_at, p.indexed_at, a.uri IS NOT NULL AS audience_found, a.mode AS audience_mode, a.name AS audience_name \
-         FROM private_posts p LEFT JOIN private_audiences a ON a.uri = p.audience_uri WHERE p.uri = $1",
+           p.created_at, p.indexed_at FROM private_posts p WHERE p.uri = $1",
     )
     .bind(rauth.uri())
     .fetch_optional(pool)
     .await
+}
+
+/// The view's audience (P-3, §4.10; private-threads design §2.6): the
+/// governing audience's `(mode, name)` while its row is stored. Never its
+/// members.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn audience_view(pool: &PgPool, uri: &str) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
+    sqlx::query_as("SELECT mode, name FROM private_audiences WHERE uri = $1")
+        .bind(uri)
+        .fetch_optional(pool)
+        .await
 }
 
 /// A post's display fields as stored (private-posting design §3.1): content,
@@ -250,18 +260,23 @@ fn follows_verified(owner: &str) -> String {
     )
 }
 
-/// Rule 4's cap (private-posting design §3.7): the walk examines at most
-/// this many rows. Inlined into the SQL text as a literal.
+/// HEAD's rule-4 cap before S12 (private-posting design §3.7): the walk
+/// examined at most this many rows. Kept with HEAD's builders below for the
+/// pre-release counts and the B-5 comparisons (private-threads design §4,
+/// §8).
+#[cfg(test)]
 pub(super) const RULE4_MAX_HOPS: u32 = 8;
 
-/// Rule 4's step test `step_ok(s)` (§3.7) for the walk row `s`: the reader
-/// could read the step, so it may anchor or be walked past.
+/// HEAD's rule-4 step test `step_ok(s)` (§3.7) for the walk row `s`, as it
+/// stood before S12: the reader could read the step, so it may anchor or be
+/// walked past.
 /// - (i) no block either way between the reader and the step's author;
 /// - (ii) the moderation gate shows the step;
 /// - (iii) a step not by the audience's owner is by a writer who passes
 ///   conditions 2 and 3 under the audience (condition 3 under every mode
 ///   since S9, C-6; `following` since S10: the owner's stored follow of
 ///   the step's author, and the owner's flag).
+#[cfg(test)]
 fn step_ok(owner: &str, mode: &str, members: &str, reader: &str) -> String {
     format!(
         "NOT {reader_author} \
@@ -282,14 +297,17 @@ fn step_ok(owner: &str, mode: &str, members: &str, reader: &str) -> String {
     )
 }
 
-/// Rule 4's walk (§3.7) as an SQL boolean. Every argument is an SQL
-/// expression; the cap is inlined, so every caller's text carries the same literal.
+/// HEAD's rule-4 walk (§3.7) as an SQL boolean, before S12. Every argument
+/// is an SQL expression; the cap is inlined.
+#[cfg(test)]
 pub(super) fn anchored(parent: &str, audience: &str, owner: &str, mode: &str, members: &str, reader: &str) -> String {
     anchored_with_cap(parent, audience, owner, mode, members, reader, RULE4_MAX_HOPS)
 }
 
-/// [`anchored`] with another cap: only the pre-S0 count query uses one
-/// other than [`RULE4_MAX_HOPS`], to separate over-cap chains.
+/// [`anchored`] with another cap: the pre-S0 count query uses one other
+/// than [`RULE4_MAX_HOPS`], to separate over-cap chains, and the pre-S12
+/// count one to separate depth from every other reason.
+#[cfg(test)]
 fn anchored_with_cap(parent: &str, audience: &str, owner: &str, mode: &str, members: &str, reader: &str, cap: u32) -> String {
     let step = step_ok(owner, mode, members, reader);
     format!(
@@ -306,40 +324,6 @@ fn anchored_with_cap(parent: &str, audience: &str, owner: &str, mode: &str, memb
     )
 }
 
-/// The oracle's walk statement (snapshot fact 8): `$1` the post's parent,
-/// `$2` its audience URI, `$3` the audience's owner, `$4` and `$5` the
-/// audience row's `mode` and `members`, `$6` the requester.
-pub(super) fn walk_statement() -> String {
-    format!("SELECT {}", anchored("$1", "$2", "$3", "$4", "$5", "$6"))
-}
-
-/// Whether the post hangs from a post by `owner` under `audience`, as
-/// `reader` may see the chain (§3.7, fact 8). With no parent the walk
-/// starts nowhere and the answer is `false`.
-///
-/// # Errors
-///
-/// Database errors.
-pub(super) async fn anchored_for(
-    pool: &PgPool,
-    parent: Option<&str>,
-    audience: &str,
-    owner: &str,
-    mode: Option<&str>,
-    members: &[String],
-    reader: &str,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(&walk_statement())
-        .bind(parent)
-        .bind(audience)
-        .bind(owner)
-        .bind(mode)
-        .bind(members)
-        .bind(reader)
-        .fetch_one(pool)
-        .await
-}
-
 /// Whether `did` has an `actors` row with status `active` (condition 4: no
 /// row is not active).
 ///
@@ -353,8 +337,416 @@ pub(super) async fn account_active(pool: &PgPool, did: &str) -> Result<bool, sql
         .await
 }
 
-/// The §6.9 candidate prefilter, mirroring §6.4's rules for the requester
-/// (`$1`), as the audience-modes and private-posting designs amend them:
+// ---- The read rule of the private-threads design (S12, §2, §3.1-§3.2) ----
+//
+// Every reader-relative statement binds the reader as `$1`. Each candidate
+// query is one statement over its own `c` (the key columns `{COLS}` and the
+// shape's order keys and outputs), with four CTEs: `br`, one branch-root
+// lookup per distinct key; `s1`, stage 1 per row; `pv`, one walk per
+// distinct key; and the shape's final SELECT. The oracle's fact 8 is the
+// one-row case of the same statement.
+
+/// The key columns every shape's `c` selects (§3.2), from `private_posts p`.
+pub(super) const COLS: &str = "p.uri, p.author_did, p.audience_uri, p.reply_parent_uri, p.reply_root_uri";
+
+/// `x` (an SQL expression, an at-uri or NULL) names a `postPrivate` record,
+/// by its collection, `split_part(x, '/', 4)`. NULL does not.
+fn is_private(x: &str) -> String {
+    format!("COALESCE(split_part({x}, '/', 4) = '{NSID_POST_PRIVATE}', false)")
+}
+
+/// The row `r` (an alias with `reply_parent_uri` and `reply_root_uri`) is a
+/// top-level post (§2.1).
+fn is_top_level(r: &str) -> String {
+    format!("({r}.reply_parent_uri IS NULL AND {r}.reply_root_uri IS NULL)")
+}
+
+/// `r` is a branch root: a reply whose parent and root are not
+/// `postPrivate` records.
+fn is_branch_root(r: &str) -> String {
+    format!(
+        "({r}.reply_parent_uri IS NOT NULL AND {r}.reply_root_uri IS NOT NULL \
+          AND NOT {} AND NOT {})",
+        is_private(&format!("{r}.reply_parent_uri")),
+        is_private(&format!("{r}.reply_root_uri"))
+    )
+}
+
+/// `r` is a thread reply: its parent and root are `postPrivate` records.
+fn is_thread_reply(r: &str) -> String {
+    format!(
+        "({} AND {})",
+        is_private(&format!("{r}.reply_parent_uri")),
+        is_private(&format!("{r}.reply_root_uri"))
+    )
+}
+
+/// `r` is a branch reply: its parent is a `postPrivate` record and its root
+/// is not.
+fn is_branch_reply(r: &str) -> String {
+    format!(
+        "({} AND {r}.reply_root_uri IS NOT NULL AND NOT {})",
+        is_private(&format!("{r}.reply_parent_uri")),
+        is_private(&format!("{r}.reply_root_uri"))
+    )
+}
+
+/// The URI `x` names an audience record in `o`'s repository.
+fn owned(x: &str, o: &str) -> String {
+    format!("(split_part({x}, '/', 3) = {o} AND split_part({x}, '/', 4) = '{NSID_AUDIENCE}')")
+}
+
+/// The anchor `an` is of `c`'s role's kind (review 13, m1): a top-level
+/// post and a branch root anchor on themselves, a thread reply on a
+/// top-level post, a branch reply on a branch root. So a thread reply naming
+/// itself as its root has no valid anchor.
+fn role_kind(c: &str, an: &str) -> String {
+    format!(
+        "((({tl} OR {brt}) AND {an}.uri = {c}.uri) OR ({tr} AND {an_tl}) OR ({brr} AND {an_brt}))",
+        tl = is_top_level(c),
+        brt = is_branch_root(c),
+        tr = is_thread_reply(c),
+        an_tl = is_top_level(an),
+        brr = is_branch_reply(c),
+        an_brt = is_branch_root(an),
+    )
+}
+
+/// The FROM fragment joining `c`'s author (`po`), its anchor (`an`) and the
+/// governing audience G (`a`) (§3.1). `br` is the branch-root expression.
+fn anchor_join(br: &str) -> String {
+    format!(
+        "LEFT JOIN actors po ON po.did = c.author_did \
+         LEFT JOIN private_posts an ON an.uri = CASE \
+             WHEN {tl} OR {brt} THEN c.uri \
+             WHEN {tr} THEN c.reply_root_uri \
+             WHEN {brr} THEN {br} END \
+         LEFT JOIN private_audiences a ON a.uri = an.audience_uri",
+        tl = is_top_level("c"),
+        brt = is_branch_root("c"),
+        tr = is_thread_reply("c"),
+        brr = is_branch_reply("c"),
+    )
+}
+
+/// O's account status: the joined author's when O wrote `c`, else one
+/// lookup.
+fn ao_status() -> &'static str {
+    "CASE WHEN an.author_did = c.author_did THEN po.account_status \
+     ELSE (SELECT x.account_status FROM actors x WHERE x.did = an.author_did) END"
+}
+
+/// `d` stands under G (`a` in scope) as O's (`o`) writer (§2.4): by the
+/// PDS's write rule for the mode. `verified` is O's follow-verification
+/// flag, used only under `following`.
+fn standing(d: &str, o: &str, verified: &str) -> String {
+    format!(
+        "CASE COALESCE(a.mode, 'list') \
+           WHEN 'list' THEN {d} = ANY(a.members) \
+           WHEN 'followers' THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = {d} AND f.subject_did = {o}) \
+           WHEN 'everyone' THEN true \
+           WHEN 'following' THEN {follows} AND {verified} \
+           ELSE false END",
+        follows = owner_follows(o, d),
+    )
+}
+
+/// Rule 8 (§2.2): the reader `$1` is inside G (`a`), by HEAD's reader arms
+/// verbatim: in memory for `list`, one probe for `followers`, two for
+/// `following`.
+fn reader_inside() -> String {
+    format!(
+        "CASE COALESCE(a.mode, 'list') \
+           WHEN 'list' THEN $1 = ANY(a.members) \
+           WHEN 'followers' THEN a.owner_did = $1 OR EXISTS ( \
+             SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = a.owner_did) \
+           WHEN 'everyone' THEN true \
+           WHEN 'following' THEN a.owner_did = $1 OR ({follows} AND {verified}) \
+           ELSE false END",
+        follows = owner_follows("a.owner_did", "$1"),
+        verified = follows_verified("a.owner_did"),
+    )
+}
+
+/// Stage 1 (§3.1) for a row `c` by W ≠ V, cheapest term first (review 13,
+/// LB1): the anchor and its kind, the owned audiences and G's row, all in
+/// memory; rule 8; the gate on the post and rule 4; the anchor's gate;
+/// rule 7 against O; condition 4 and W's standing. One `AND` of terms with
+/// no side effects, wrapped in `COALESCE(…, false)` by its caller, so its
+/// order changes only which terms PostgreSQL evaluates, never its value.
+fn stage1_ok() -> String {
+    stage1_terms(true).join(" AND ")
+}
+
+/// [`stage1_ok`]'s terms, in its order; without rule 8 when `inside` is
+/// false (the pre-release count asks with no reader).
+fn stage1_terms(inside: bool) -> Vec<String> {
+    let mut terms = vec![
+        // (1) in memory: a stored anchor of its role's kind (review 13,
+        // m1), under its own author's audience; P under O's (5.2); rule 6.
+        "an.uri IS NOT NULL".to_string(),
+        role_kind("c", "an"),
+        owned("an.audience_uri", "an.author_did"),
+        owned("c.audience_uri", "an.author_did"),
+        "a.uri IS NOT NULL".to_string(),
+    ];
+    if inside {
+        // (2) rule 8, HEAD's reader arms.
+        terms.push(reader_inside());
+    }
+    terms.extend([
+        // (3) the gate on P, then rule 4.
+        gate_shows("c.uri", "c.author_did", "po.account_status"),
+        format!("NOT {}", blocked("$1", "c.author_did")),
+        // (4) the anchor's gate; skipped when the anchor is P.
+        format!("(an.uri = c.uri OR {})", gate_shows("an.uri", "an.author_did", &format!("({})", ao_status()))),
+        // (5) rule 7 against O (V–O, then W–O, also W's condition 3),
+        // condition 4 and W's standing.
+        format!("(an.author_did = $1 OR an.author_did = c.author_did OR NOT {})", blocked("$1", "an.author_did")),
+        format!("(c.author_did = an.author_did OR NOT {})", blocked("c.author_did", "an.author_did")),
+        format!(
+            "(c.author_did = an.author_did OR (({}) = 'active' AND {}))",
+            ao_status(),
+            standing("c.author_did", "an.author_did", &follows_verified("an.author_did"))
+        ),
+    ]);
+    terms
+}
+
+/// [`stage1_terms`] for the T-52 like-with-like check, which re-orders them.
+#[cfg(test)]
+pub(super) fn stage1_terms_for_tests() -> Vec<String> {
+    stage1_terms(true)
+}
+
+/// `c` is walked (§3.1): every reply but an owner thread reply.
+fn needs_walk() -> String {
+    format!(
+        "NOT ({} OR {} OR ({} AND c.author_did = an.author_did))",
+        is_top_level("c"),
+        is_branch_root("c"),
+        is_thread_reply("c")
+    )
+}
+
+/// The branch root the chain from `parent` reaches under `root` (§3.1):
+/// the structural lookup, primary keys and the root column only, at most
+/// `cap` rows. NULL when none is found.
+fn branch_root_of(parent: &str, root: &str, cap: u32) -> String {
+    format!(
+        "(WITH RECURSIVE up(uri, parent, hop) AS ( \
+            SELECT s.uri, s.reply_parent_uri, 1 FROM private_posts s \
+            WHERE s.uri = {parent} AND s.reply_root_uri = {root} \
+            UNION ALL \
+            SELECT s.uri, s.reply_parent_uri, u.hop + 1 \
+            FROM up u JOIN private_posts s ON s.uri = u.parent \
+            WHERE u.hop < {cap} AND {up_private} AND s.reply_root_uri = {root} \
+          ) \
+          SELECT up.uri FROM up WHERE NOT {top_private} LIMIT 1)",
+        up_private = is_private("u.parent"),
+        top_private = is_private("up.parent"),
+    )
+}
+
+/// The walk (§2.3, §2.4) for the key row `k` (`reply_parent_uri`,
+/// `reply_root_uri`, `owner`), with G (`a`) and O's flag (`fv.ok`) in scope:
+/// from `k`'s parent through stored rows, at most `cap`, each tested inside
+/// the recursion, so the walk ends at its first failing row; true when it
+/// reaches its stop. A cycle fails at the cap.
+fn parent_verdict(cap: u32) -> String {
+    let thread = is_private("k.reply_root_uri");
+    let step = format!(
+        "(s.reply_root_uri = k.reply_root_uri OR ({thread} AND s.uri = k.reply_root_uri)) \
+         AND {owned} \
+         AND {gate} \
+         AND (s.author_did = k.owner OR ( \
+               NOT {reader_author} \
+               AND NOT {author_owner} \
+               AND {standing}))",
+        owned = owned("s.audience_uri", "k.owner"),
+        gate = gate_shows("s.uri", "s.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = s.author_did)"),
+        reader_author = blocked("$1", "s.author_did"),
+        author_owner = blocked("s.author_did", "k.owner"),
+        standing = standing("s.author_did", "k.owner", "COALESCE(fv.ok, false)"),
+    );
+    // A thread's walk stops at the root or at the first thread reply by O
+    // (a "none"-kind row by O is not one); a branch's at the branch root,
+    // the first row whose parent is not a `postPrivate` record.
+    let stop = |u: &str| {
+        let parent_private = is_private(&format!("{u}.parent"));
+        format!(
+            "CASE WHEN {thread} THEN {u}.uri = k.reply_root_uri OR ({u}.author = k.owner AND {parent_private}) \
+                  ELSE NOT {parent_private} END"
+        )
+    };
+    format!(
+        "EXISTS ( \
+           WITH RECURSIVE up(uri, parent, author, hop) AS ( \
+             SELECT s.uri, s.reply_parent_uri, s.author_did, 1 FROM private_posts s \
+             WHERE s.uri = k.reply_parent_uri AND {step} \
+             UNION ALL \
+             SELECT s.uri, s.reply_parent_uri, s.author_did, u.hop + 1 \
+             FROM up u JOIN private_posts s ON s.uri = u.parent \
+             WHERE u.hop < {cap} AND NOT ({stop_u}) AND {step} \
+           ) \
+           SELECT 1 FROM up WHERE {stop_up})",
+        stop_u = stop("u"),
+        stop_up = stop("up"),
+    )
+}
+
+/// `s1` joined to its key's walk, for a shape's final SELECT.
+pub(super) const PV_JOIN: &str =
+    "s1 LEFT JOIN pv ON pv.reply_parent_uri = s1.reply_parent_uri AND pv.reply_root_uri = s1.reply_root_uri";
+
+/// A row's verdict `{pass}` (§3.2): stage 1 (the gate alone for the
+/// reader's own row), and the walk when the row is walked.
+pub(super) const PASS: &str = "(s1.s1ok AND (s1.author_did = $1 OR NOT s1.walks OR COALESCE(pv.ok, false)))";
+
+/// One candidate statement (§3.2): `c` is the shape's own SELECT of
+/// [`COLS`] and its order keys and outputs, `s1_filter` restricts the rows
+/// stage 1 reads (`getQuotes`' refs arm is not prefiltered), and `final_`
+/// reads [`PV_JOIN`]. The walk runs once per distinct `(parent, root)` key,
+/// last, over the rows that pass stage 1: PostgreSQL does not pull a
+/// `DISTINCT` subquery up, so the SubPlan in its parent's select list runs
+/// once per key.
+pub(super) fn walked(c: &str, s1_filter: &str, final_: &str, cap: u32) -> String {
+    walked_with(c, s1_filter, final_, cap, &stage1_ok())
+}
+
+/// [`walked`] with stage 1's text given.
+fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -> String {
+    format!(
+        "WITH c AS MATERIALIZED ({c}), \
+         br AS MATERIALIZED ( \
+           SELECT k.parent, k.root, {branch_root} AS branch_root \
+           FROM (SELECT DISTINCT c.reply_parent_uri AS parent, c.reply_root_uri AS root \
+                 FROM c WHERE {branch_reply}) k), \
+         s1 AS MATERIALIZED ( \
+           SELECT c.*, an.uri AS anchor, an.author_did AS owner, an.audience_uri AS gov, \
+                  COALESCE(CASE WHEN c.author_did = $1 THEN {gate} ELSE {stage1} END, false) AS s1ok, \
+                  COALESCE({walks}, true) AS walks \
+           FROM c LEFT JOIN br ON br.parent = c.reply_parent_uri AND br.root = c.reply_root_uri \
+           {join} {s1_filter}), \
+         pv AS MATERIALIZED ( \
+           SELECT k.reply_parent_uri, k.reply_root_uri, COALESCE({verdict}, false) AS ok \
+           FROM (SELECT DISTINCT s1.reply_parent_uri, s1.reply_root_uri, s1.owner, s1.gov \
+                 FROM s1 WHERE s1.s1ok AND s1.walks AND s1.author_did <> $1) k \
+           LEFT JOIN private_audiences a ON a.uri = k.gov \
+           LEFT JOIN LATERAL (SELECT CASE WHEN a.mode = 'following' THEN {owner_verified} END AS ok) fv ON true) \
+         {final_}",
+        branch_root = branch_root_of("k.parent", "k.root", cap),
+        branch_reply = is_branch_reply("c"),
+        gate = gate_shows("c.uri", "c.author_did", "po.account_status"),
+        walks = needs_walk(),
+        join = anchor_join("br.branch_root"),
+        verdict = parent_verdict(cap),
+        owner_verified = follows_verified("k.owner"),
+    )
+}
+
+/// The facts the oracle reads from fact 8 (§3.2): O, G, stage 1, the
+/// verdict without the reader's own arm, and whether the post has a valid
+/// anchor of which its own audience is O's (§2.1, §2.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Fact8 {
+    pub owner: Option<String>,
+    pub gov: Option<String>,
+    pub s1ok: bool,
+    pub verdict: bool,
+    pub anchored: bool,
+}
+
+/// Fact 8's statement (§3.2): `$1` the reader, `$2` the post. One row
+/// whenever the post is stored, with no WHERE on the verdict.
+pub(super) fn fact8_statement(cap: u32) -> String {
+    let c = format!("SELECT {COLS} FROM private_posts p WHERE p.uri = $2");
+    let final_ = format!(
+        "SELECT s1.owner, s1.gov, s1.s1ok, COALESCE(s1.s1ok AND (NOT s1.walks OR pv.ok), false), \
+           COALESCE(an.uri IS NOT NULL AND {role} AND {anchor_owned} AND {post_owned} AND {anchor_gate}, false) \
+         FROM {PV_JOIN} LEFT JOIN private_posts an ON an.uri = s1.anchor",
+        role = role_kind("s1", "an"),
+        anchor_owned = owned("an.audience_uri", "an.author_did"),
+        post_owned = owned("s1.audience_uri", "an.author_did"),
+        anchor_gate = gate_shows("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
+    );
+    walked(&c, "", &final_, cap)
+}
+
+/// Fact 8 for `reader` and the post `uri`; the default when no row is
+/// stored.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn fact8(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> Result<Fact8, sqlx::Error> {
+    type Row = (Option<String>, Option<String>, bool, bool, bool);
+    let row: Option<Row> = sqlx::query_as(&fact8_statement(cap)).bind(reader).bind(uri).fetch_optional(pool).await?;
+    Ok(row.map_or_else(Fact8::default, |(owner, gov, s1ok, verdict, anchored)| Fact8 {
+        owner,
+        gov,
+        s1ok,
+        verdict,
+        anchored,
+    }))
+}
+
+/// The batch loop (§3.2.1): a batched shape's `c` rows are evaluated in
+/// batches, in the shape's key order, until `need` rows pass or the rows run
+/// out. The first batch is `first` rows, and each later one twice the last,
+/// up to `max`; the next batch starts after the last `c` row examined, whether
+/// it passed or not. Every row passes or fails by the predicate it would face
+/// alone, so the rows returned are the first `need` that pass, as
+/// row-at-a-time evaluation gives.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn passing<R, K, F, Fut>(
+    need: usize,
+    first: i64,
+    max: i64,
+    mut after: Option<K>,
+    key: impl Fn(&R) -> K,
+    mut batch: F,
+) -> Result<Vec<R>, sqlx::Error>
+where
+    F: FnMut(Option<K>, i64) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<(R, bool)>, sqlx::Error>>,
+{
+    let mut out = Vec::new();
+    let mut size = first.max(1);
+    while out.len() < need {
+        let rows = batch(after.take(), size).await?;
+        let examined = rows.len();
+        after = rows.last().map(|(r, _)| key(r));
+        for (row, pass) in rows {
+            if pass && out.len() < need {
+                out.push(row);
+            }
+        }
+        if i64::try_from(examined).unwrap_or(i64::MAX) < size || after.is_none() {
+            break;
+        }
+        size = size.saturating_mul(2).min(max.max(1));
+    }
+    Ok(out)
+}
+
+/// The batch sizes of a batched read (`[private_read]`, §3.2.1) and the
+/// walk's cap (§2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReadBounds {
+    /// `private_read.max_chain`.
+    pub max_chain: u32,
+    /// `private_read.walk_batch_max`.
+    pub batch_max: i64,
+}
+
+/// HEAD's §6.9 candidate prefilter before S12, kept for the B-5 and T-54
+/// comparisons (private-threads design §4 part (1)), mirroring §6.4's rules
+/// for the requester (`$1`), as the audience-modes and private-posting
+/// designs amend them:
 /// - the moderation gate shows the post (labels and author status);
 /// - self-authored; or an audience row is present and its mode admits the
 ///   requester: `list` (or none) by `members`, `followers` by the
@@ -373,7 +765,8 @@ pub(super) async fn account_active(pool: &PgPool, did: &str) -> Result<bool, sql
 ///
 /// A candidate filter only: `bind` stays authoritative. Blocked pairs are
 /// left out so that posts nobody can read do not fill a page's window.
-pub(super) fn prefilter() -> String {
+#[cfg(test)]
+pub(super) fn head_prefilter() -> String {
     format!(
         "({gate} AND (p.author_did = $1 OR ( \
            a.uri IS NOT NULL \
@@ -622,6 +1015,126 @@ SELECT
     )
 }
 
+/// The pre-S12 count (private-threads design §8), run read-only against the
+/// deployed database before S12 ships. It compares, post by post, HEAD's
+/// verdict and S12's for the audience as a whole, with no reader (`''`,
+/// so no reader block denies, and rule 8 is left out): HEAD's is its
+/// prefilter's gate and rule 4 at the cap of 8; S12's is stage 1 without
+/// rule 8 and the walk at `max_chain` 16, and again at 100.
+/// - **Stops** (HEAD serves, S12 does not), each row in the first that
+///   fits: `stops_public_parent_private_root` (a public parent and a
+///   private root); `stops_deeper_than_cap` (served by S12 at 100);
+///   `stops_invalid_anchor` (no valid anchor: a missing, hidden or
+///   wrong-kind root or branch root, or one under another account's
+///   audience); `stops_own_audience_in_others_thread` (the post names an
+///   audience not of the root's author); `stops_not_standing` (the rest: a
+///   writer in the chain who does not stand under the root's current
+///   audience, or a block with its author).
+/// - **Starts** (S12 serves, HEAD does not): `starts_deep` (HEAD serves it
+///   at a cap of 100); `starts_moved_thread` (the rest: the post or a step
+///   names another of the owner's audiences than its root's current one).
+/// - `starts_owner_reply_parent_independent`: owner thread replies S12
+///   serves whose parent is missing, hidden by the gate, or of another
+///   thread. Their read no longer depends on the parent.
+///
+/// Printed, with [`pre_s12_owner_audience_sql`], by the ignored test
+/// `pre_s12_count_query`.
+#[cfg(test)]
+pub(super) fn pre_s12_count_sql() -> String {
+    let head_may_write = "CASE COALESCE(a0.mode, 'list') \
+           WHEN 'list' THEN p.author_did = ANY(a0.members) \
+           WHEN 'followers' THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = p.author_did AND f.subject_did = a0.owner_did) \
+           WHEN 'everyone' THEN true \
+           WHEN 'following' THEN {owner_follows} AND {verified} \
+           ELSE false END"
+        .replace("{owner_follows}", &owner_follows("a0.owner_did", "p.author_did"))
+        .replace("{verified}", &follows_verified("a0.owner_did"));
+    let head = |cap: u32| {
+        format!(
+            "(a0.uri IS NOT NULL AND {gate} AND (a0.owner_did = p.author_did OR (ao0.account_status = 'active' \
+               AND NOT {author_owner} AND {head_may_write} AND {walk})))",
+            gate = gate_shows("p.uri", "p.author_did", "po0.account_status"),
+            author_owner = blocked("p.author_did", "a0.owner_did"),
+            walk = anchored_with_cap("p.reply_parent_uri", "p.audience_uri", "a0.owner_did", "a0.mode", "a0.members", "''", cap),
+        )
+    };
+    let c = format!(
+        "SELECT {COLS}, {head8} AS head_ok, {head100} AS head_deep \
+         FROM private_posts p LEFT JOIN private_audiences a0 ON a0.uri = p.audience_uri \
+         LEFT JOIN actors po0 ON po0.did = p.author_did LEFT JOIN actors ao0 ON ao0.did = a0.owner_did",
+        head8 = head(RULE4_MAX_HOPS),
+        head100 = head(100),
+    );
+    let stage1 = stage1_terms(false).join(" AND ");
+    let s12 = "COALESCE(s1.s1ok AND (NOT s1.walks OR pv.ok), false)";
+    let at16 = walked_with(
+        &c,
+        "",
+        &format!(
+            "SELECT s1.uri, s1.head_ok, s1.head_deep, {s12} AS s12, \
+               (NOT {none_parent} AND {none_root}) AS none_kind, \
+               COALESCE(an.uri IS NOT NULL AND {role} AND {anchor_owned} AND {anchor_gate}, false) AS anchor_valid, \
+               COALESCE({post_owned}, false) AS post_owned, \
+               ({thread_reply} AND s1.author_did = s1.owner) AS owner_thread_reply, \
+               NOT EXISTS (SELECT 1 FROM private_posts pp WHERE pp.uri = s1.reply_parent_uri \
+                 AND (pp.reply_root_uri = s1.reply_root_uri OR pp.uri = s1.reply_root_uri) AND {parent_gate}) AS parent_independent \
+             FROM {PV_JOIN} LEFT JOIN private_posts an ON an.uri = s1.anchor",
+            none_parent = is_private("s1.reply_parent_uri"),
+            none_root = is_private("s1.reply_root_uri"),
+            role = role_kind("s1", "an"),
+            anchor_owned = owned("an.audience_uri", "an.author_did"),
+            anchor_gate = gate_shows("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
+            post_owned = owned("s1.audience_uri", "an.author_did"),
+            thread_reply = is_thread_reply("s1"),
+            parent_gate = gate_shows("pp.uri", "pp.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = pp.author_did)"),
+        ),
+        16,
+        &stage1,
+    );
+    let at100 = walked_with(&c, "", &format!("SELECT s1.uri, {s12} AS s12 FROM {PV_JOIN}"), 100, &stage1);
+    format!(
+        "WITH x AS ({at16}), deep AS ({at100}), y AS (
+  SELECT x.*, deep.s12 AS s12_at_100,
+         x.head_ok AND NOT x.s12 AS stop, NOT x.head_ok AND x.s12 AS start
+  FROM x JOIN deep ON deep.uri = x.uri
+)
+SELECT
+  count(*) FILTER (WHERE stop AND NOT none_kind AND NOT s12_at_100 AND anchor_valid AND post_owned) AS stops_not_standing,
+  count(*) FILTER (WHERE stop AND NOT none_kind AND NOT s12_at_100 AND anchor_valid AND NOT post_owned) AS stops_own_audience_in_others_thread,
+  count(*) FILTER (WHERE stop AND NOT none_kind AND NOT s12_at_100 AND NOT anchor_valid) AS stops_invalid_anchor,
+  count(*) FILTER (WHERE stop AND none_kind) AS stops_public_parent_private_root,
+  count(*) FILTER (WHERE stop AND NOT none_kind AND s12_at_100) AS stops_deeper_than_cap,
+  count(*) FILTER (WHERE start AND NOT head_deep) AS starts_moved_thread,
+  count(*) FILTER (WHERE start AND head_deep) AS starts_deep,
+  count(*) FILTER (WHERE s12 AND owner_thread_reply AND parent_independent) AS starts_owner_reply_parent_independent
+FROM y;"
+    )
+    .replace("$1", "''")
+}
+
+/// The pre-S12 owner-audience count (private-threads design §8), verbatim:
+/// owner thread replies naming another of the owner's audiences than their
+/// root's, and of those under `list` audiences, the narrower and the wider.
+#[cfg(test)]
+pub(super) fn pre_s12_owner_audience_sql() -> String {
+    format!(
+        "SELECT
+  count(*) AS owner_replies_other_audience,
+  count(*) FILTER (WHERE ra.mode IS NOT DISTINCT FROM 'list' AND ta.mode IS NOT DISTINCT FROM 'list'
+                     AND cardinality(ra.members) < cardinality(ta.members)) AS list_narrower,
+  count(*) FILTER (WHERE ra.mode IS NOT DISTINCT FROM 'list' AND ta.mode IS NOT DISTINCT FROM 'list'
+                     AND cardinality(ra.members) > cardinality(ta.members)) AS list_wider
+FROM private_posts r
+JOIN private_posts t ON t.uri = r.reply_root_uri AND t.reply_parent_uri IS NULL
+LEFT JOIN private_audiences ra ON ra.uri = r.audience_uri
+LEFT JOIN private_audiences ta ON ta.uri = t.audience_uri
+WHERE r.author_did = t.author_did
+  AND split_part(r.reply_parent_uri, '/', 4) = '{NSID_POST_PRIVATE}'
+  AND r.audience_uri IS DISTINCT FROM t.audience_uri
+  AND split_part(r.audience_uri, '/', 3) = t.author_did;"
+    )
+}
+
 /// Whether a follow record by `author` naming `subject` is stored.
 ///
 /// # Errors
@@ -635,109 +1148,226 @@ pub(super) async fn follows(pool: &PgPool, author: &str, subject: &str) -> Resul
         .await
 }
 
-const PREFILTER_FROM: &str = "private_posts p \
+/// HEAD's prefilter joins before S12 (B-5 and T-54 comparisons).
+#[cfg(test)]
+pub(super) const PREFILTER_FROM: &str = "private_posts p \
      LEFT JOIN private_audiences a ON a.uri = p.audience_uri \
      LEFT JOIN actors po ON po.did = p.author_did \
      LEFT JOIN actors ao ON ao.did = a.owner_did";
 
-/// The URIs among `uris` that pass the prefilter.
-///
-/// # Errors
-///
-/// Database errors.
-pub(super) async fn prefilter_uris(pool: &PgPool, requester: &str, uris: &[String]) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(&format!(
-        "SELECT p.uri FROM {PREFILTER_FROM} WHERE p.uri = ANY($2) AND {pre}",
-        pre = prefilter()
-    ))
-    .bind(requester)
-    .bind(uris)
-    .fetch_all(pool)
-    .await
+/// `prefilter_uris`' statement (§3.2): `$1` the reader, `$2` the URIs.
+pub(super) fn prefilter_uris_statement(cap: u32) -> String {
+    walked(
+        &format!("SELECT {COLS} FROM private_posts p WHERE p.uri = ANY($2)"),
+        "",
+        &format!("SELECT s1.uri FROM {PV_JOIN} WHERE {PASS}"),
+        cap,
+    )
 }
 
-/// `getReplies`'s candidates (private posting §4.12): up to `limit` private
-/// replies to `parent` passing the prefilter, except `hidden`, oldest first
-/// by `(created_at, uri)`, after the position `after`.
+/// The URIs among `uris` that pass the read rule's SQL mirror for
+/// `requester` (the prefilter, §3.2).
 ///
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn reply_page_candidates(
+pub(super) async fn prefilter_uris(pool: &PgPool, requester: &str, uris: &[String], cap: u32) -> Result<Vec<String>, sqlx::Error> {
+    if uris.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_scalar(&prefilter_uris_statement(cap)).bind(requester).bind(uris).fetch_all(pool).await
+}
+
+/// `getReplies`' page statement (§3.2): `$1` the reader, `$2` the parent,
+/// `$3` the hidden replies, `$4`/`$5` the position, `$6` the batch.
+pub(super) fn reply_page_statement(cap: u32) -> String {
+    walked(
+        &format!(
+            "SELECT {COLS}, p.created_at FROM private_posts p \
+             WHERE p.reply_parent_uri = $2 AND NOT (p.uri = ANY($3)) \
+               AND ($4::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") > ($4, $5 COLLATE \"C\")) \
+             ORDER BY p.created_at, p.uri COLLATE \"C\" LIMIT $6"
+        ),
+        "",
+        &format!("SELECT s1.uri, s1.created_at, {PASS} FROM {PV_JOIN} ORDER BY s1.created_at, s1.uri COLLATE \"C\""),
+        cap,
+    )
+}
+
+/// One batch of `getReplies`' page (private posting §4.12): up to `limit`
+/// private replies to `parent`, except `hidden`, oldest first by
+/// `(created_at, uri)`, after the position `after`, each with its verdict.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn reply_page_batch(
     pool: &PgPool,
     requester: &str,
     parent: &str,
     hidden: &[String],
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
-) -> Result<Vec<(String, DateTime<Utc>)>, sqlx::Error> {
+    cap: u32,
+) -> Result<Vec<((String, DateTime<Utc>), bool)>, sqlx::Error> {
     let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
-    sqlx::query_as(&format!(
-        "SELECT p.uri, p.created_at FROM {PREFILTER_FROM} \
-         WHERE p.reply_parent_uri = $2 AND NOT (p.uri = ANY($3)) AND {pre} \
-           AND ($4::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") > ($4, $5 COLLATE \"C\")) \
-         ORDER BY p.created_at, p.uri COLLATE \"C\" LIMIT $6",
-        pre = prefilter()
-    ))
-    .bind(requester)
-    .bind(parent)
-    .bind(hidden)
-    .bind(at)
-    .bind(uri)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
+    let rows: Vec<(String, DateTime<Utc>, bool)> = sqlx::query_as(&reply_page_statement(cap))
+        .bind(requester)
+        .bind(parent)
+        .bind(hidden)
+        .bind(at)
+        .bind(uri)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(u, at, pass)| ((u, at), pass)).collect())
 }
 
-/// `searchPosts`'s candidates (private posting §4.17): up to `limit` posts
-/// passing the prefilter for `requester`, newest first by
-/// `(created_at, uri)`, strictly below the pair `(at, uri)` and no older
-/// than `lower`. The order is `private_posts_recent`'s, with the column's
-/// own collation, so the index serves the scan. Rows that fail the
-/// prefilter are read here and skipped; they never count toward `limit`.
+/// `searchPosts`' statement (§3.2): `$1` the reader, `$2`/`$3` the pair,
+/// `$4` the lower bound, `$5` the batch. The order is
+/// `private_posts_recent`'s, with the column's own collation.
+pub(super) fn search_statement(cap: u32) -> String {
+    walked(
+        &format!(
+            "SELECT {COLS}, p.created_at FROM private_posts p \
+             WHERE (p.created_at, p.uri) < ($2, $3) AND p.created_at >= $4 \
+             ORDER BY p.created_at DESC, p.uri DESC LIMIT $5"
+        ),
+        "",
+        &format!("SELECT s1.uri, s1.created_at, {PASS} FROM {PV_JOIN} ORDER BY s1.created_at DESC, s1.uri DESC"),
+        cap,
+    )
+}
+
+/// One batch of `searchPosts`' candidates (private posting §4.17): up to
+/// `limit` posts newest first by `(created_at, uri)`, strictly below the
+/// pair `(at, uri)` and no older than `lower`, each with its verdict.
 ///
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn search_candidates(
+pub(super) async fn search_batch(
     pool: &PgPool,
     requester: &str,
-    at: DateTime<Utc>,
-    uri: &str,
+    (at, uri): (DateTime<Utc>, String),
     lower: DateTime<Utc>,
     limit: i64,
-) -> Result<Vec<(String, DateTime<Utc>)>, sqlx::Error> {
-    sqlx::query_as(&format!(
-        "SELECT p.uri, p.created_at FROM {PREFILTER_FROM} \
-         WHERE (p.created_at, p.uri) < ($2, $3) AND p.created_at >= $4 AND {pre} \
-         ORDER BY p.created_at DESC, p.uri DESC LIMIT $5",
-        pre = prefilter()
-    ))
-    .bind(requester)
-    .bind(at)
-    .bind(uri)
-    .bind(lower)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
+    cap: u32,
+) -> Result<Vec<((String, DateTime<Utc>), bool)>, sqlx::Error> {
+    let rows: Vec<(String, DateTime<Utc>, bool)> = sqlx::query_as(&search_statement(cap))
+        .bind(requester)
+        .bind(at)
+        .bind(uri)
+        .bind(lower)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(u, at, pass)| ((u, at), pass)).collect())
 }
 
-/// Up to `limit` replies to `parent` passing the prefilter, oldest first.
+/// The thread expansion's statement (§3.2): `$1` the reader, `$2` the
+/// parent, `$3`/`$4` the position, `$5` the batch; HEAD's order.
+pub(super) fn reply_candidates_statement(cap: u32) -> String {
+    walked(
+        &format!(
+            "SELECT {COLS}, p.created_at FROM private_posts p \
+             WHERE p.reply_parent_uri = $2 \
+               AND ($3::timestamptz IS NULL OR (p.created_at, p.uri) > ($3, $4)) \
+             ORDER BY p.created_at, p.uri LIMIT $5"
+        ),
+        "",
+        &format!("SELECT s1.uri, s1.created_at, {PASS} FROM {PV_JOIN} ORDER BY s1.created_at, s1.uri"),
+        cap,
+    )
+}
+
+/// One batch of the replies to `parent`, oldest first, after `after`, each
+/// with its verdict.
 ///
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn reply_candidates(pool: &PgPool, requester: &str, parent: &str, limit: i64) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(&format!(
-        "SELECT p.uri FROM {PREFILTER_FROM} WHERE p.reply_parent_uri = $2 AND {pre} \
-         ORDER BY p.created_at, p.uri LIMIT $3",
-        pre = prefilter()
+pub(super) async fn reply_candidates_batch(
+    pool: &PgPool,
+    requester: &str,
+    parent: &str,
+    after: Option<(DateTime<Utc>, String)>,
+    limit: i64,
+    cap: u32,
+) -> Result<Vec<((String, DateTime<Utc>), bool)>, sqlx::Error> {
+    let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
+    let rows: Vec<(String, DateTime<Utc>, bool)> = sqlx::query_as(&reply_candidates_statement(cap))
+        .bind(requester)
+        .bind(parent)
+        .bind(at)
+        .bind(uri)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(u, at, pass)| ((u, at), pass)).collect())
+}
+
+/// Up to `limit` replies to `parent` that pass for `requester`, oldest
+/// first, in batches (§3.2.1).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn reply_candidates(
+    pool: &PgPool,
+    requester: &str,
+    parent: &str,
+    limit: usize,
+    bounds: ReadBounds,
+) -> Result<Vec<String>, sqlx::Error> {
+    let first = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = passing(limit, first, bounds.batch_max, None, |(u, at): &(String, DateTime<Utc>)| (*at, u.clone()), move |after, n| {
+        reply_candidates_batch(pool, requester, parent, after, n, bounds.max_chain)
+    })
+    .await?;
+    Ok(rows.into_iter().map(|(u, _)| u).collect())
+}
+
+/// The structural chain of `getPostThread` (§3.4 step 1): the anchor `$1`
+/// and its stored ancestors by `reply_parent_uri`, at most `$2` of them,
+/// nearest first, as `(uri, parent, root, hop)`. No reader; the anchor's
+/// stored `reply_root_uri` comes with hop 0 only. Never exposed.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn ancestors(pool: &PgPool, anchor: &str, height: u32) -> Result<Vec<Ancestor>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "WITH RECURSIVE up(uri, parent, root, hop) AS ( \
+           SELECT s.uri, s.reply_parent_uri, s.reply_root_uri, 0 FROM private_posts s WHERE s.uri = $1 \
+           UNION ALL \
+           SELECT s.uri, s.reply_parent_uri, NULL::text, u.hop + 1 FROM up u JOIN private_posts s ON s.uri = u.parent \
+           WHERE u.hop < $2 AND {private} \
+         ) \
+         SELECT uri, parent, root, hop FROM up ORDER BY hop",
+        private = is_private("u.parent"),
     ))
-    .bind(requester)
-    .bind(parent)
-    .bind(limit)
+    .bind(anchor)
+    .bind(i32::try_from(height).unwrap_or(i32::MAX))
     .fetch_all(pool)
     .await
+}
+
+/// A row of [`ancestors`]: `(uri, parent, root, hop)`.
+pub(super) type Ancestor = (String, Option<String>, Option<String>, i32);
+
+/// `getReplies`' claimed-root lookup (§3.4): the stored `reply_root_uri` of
+/// `uri`, with no reader. `None` when no row is stored; `Some(None)` for a
+/// top-level post.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn stored_root(pool: &PgPool, uri: &str) -> Result<Option<Option<String>>, sqlx::Error> {
+    sqlx::query_scalar("SELECT reply_root_uri FROM private_posts WHERE uri = $1")
+        .bind(uri)
+        .fetch_optional(pool)
+        .await
 }
 
 /// `(held, existing)`: how many private bookmarks `viewer` holds, and
@@ -921,14 +1551,25 @@ pub(super) struct FeedCandidate {
     pub reposter: Option<String>,
 }
 
-/// The repost items' rows: a repost of a stored private post, with the
-/// post's prefilter joins. The `subject_uri` test matches the partial index
-/// `reposts_private_subject`.
-const REPOST_FROM: &str = "reposts rp \
-     JOIN private_posts p ON p.uri = rp.subject_uri \
-     LEFT JOIN private_audiences a ON a.uri = p.audience_uri \
-     LEFT JOIN actors po ON po.did = p.author_did \
-     LEFT JOIN actors ao ON ao.did = a.owner_did";
+/// A feed shape's final SELECT (§3.2): every `c` row, its verdict, in the
+/// merged key order.
+fn feed_final() -> String {
+    format!(
+        "SELECT s1.uri, s1.created_at, s1.key, s1.repost_uri, s1.reposter, {PASS} FROM {PV_JOIN} \
+         ORDER BY s1.created_at DESC, s1.key COLLATE \"C\" DESC"
+    )
+}
+
+/// A feed row with its verdict.
+type FeedRow = (String, DateTime<Utc>, String, Option<String>, Option<String>, bool);
+
+fn judged_feed(rows: Vec<FeedRow>) -> Vec<(FeedCandidate, bool)> {
+    rows.into_iter()
+        .map(|(uri, created_at, key, repost_uri, reposter, pass)| {
+            (FeedCandidate { uri, created_at, key, repost_uri, reposter }, pass)
+        })
+        .collect()
+}
 
 /// The conditions on a repost item's repost `rp` for the requester `$1`
 /// (private posting §4.7, C-2): it reposts a `postPrivate` URI, its author
@@ -955,10 +1596,37 @@ fn not_muted(did: &str) -> String {
     )
 }
 
-/// The actor's posts passing the prefilter, and the actor's reposts of
-/// private posts that pass it (private posting §4.7) when the actor is a
-/// member with no block either way with the requester, newest first, after
-/// the position `(created_at, key)`.
+/// `getAuthorFeed`'s statement (§3.2): `$1` the reader, `$2` the actor,
+/// `$3`/`$4` the position, `$5` the batch. `c` is HEAD's two arms, each with
+/// its own conditions, keyset, order and limit, under the merged key.
+pub(super) fn author_statement(own_threads: bool, cap: u32) -> String {
+    let threads = if own_threads {
+        "AND (p.reply_parent_uri IS NULL OR split_part(p.reply_root_uri, '/', 3) = $2)"
+    } else {
+        ""
+    };
+    let c = format!(
+        "(SELECT {COLS}, p.created_at, p.rkey COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
+          FROM private_posts p \
+          WHERE p.author_did = $2 {threads} \
+            AND ($3::timestamptz IS NULL OR (p.created_at, p.rkey COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+          ORDER BY p.created_at DESC, p.rkey COLLATE \"C\" DESC LIMIT $5) \
+         UNION ALL \
+         (SELECT {COLS}, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
+          FROM reposts rp JOIN private_posts p ON p.uri = rp.subject_uri \
+          WHERE rp.author_did = $2 AND {repost} \
+            AND ($3::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+          ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $5) \
+         ORDER BY created_at DESC, key DESC LIMIT $5",
+        repost = repost_item(),
+    );
+    walked(&c, "", &feed_final(), cap)
+}
+
+/// One batch of the actor's posts, and the actor's reposts of private posts
+/// (private posting §4.7) when the actor is a member with no block either
+/// way with the requester, newest first, after the position
+/// `(created_at, key)`, each with its verdict (§3.2).
 ///
 /// With `own_threads` (P-20's `posts_and_author_threads`, §4.14) the
 /// actor's own posts are its top-level posts and its replies in threads
@@ -968,53 +1636,61 @@ fn not_muted(did: &str) -> String {
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn author_candidates(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn author_batch(
     pool: &PgPool,
     requester: &str,
     author: &str,
     own_threads: bool,
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
-) -> Result<Vec<FeedCandidate>, sqlx::Error> {
+    cap: u32,
+) -> Result<Vec<(FeedCandidate, bool)>, sqlx::Error> {
     let (at, key) = after.map_or((None, String::new()), |(a, k)| (Some(a), k));
-    let threads = if own_threads {
-        "AND (p.reply_parent_uri IS NULL OR split_part(p.reply_root_uri, '/', 3) = $2)"
-    } else {
-        ""
-    };
-    sqlx::query_as(&format!(
-        "(SELECT p.uri, p.created_at, p.rkey COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
-          FROM {PREFILTER_FROM} \
-          WHERE p.author_did = $2 {threads} AND {pre} \
-            AND ($3::timestamptz IS NULL OR (p.created_at, p.rkey COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
-          ORDER BY p.created_at DESC, p.rkey COLLATE \"C\" DESC LIMIT $5) \
-         UNION ALL \
-         (SELECT p.uri, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
-          FROM {REPOST_FROM} \
-          WHERE rp.author_did = $2 AND {repost} AND {pre} \
-            AND ($3::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
-          ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $5) \
-         ORDER BY created_at DESC, key DESC LIMIT $5",
-        pre = prefilter(),
-        repost = repost_item(),
-    ))
-    .bind(requester)
-    .bind(author)
-    .bind(at)
-    .bind(key)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
+    let rows: Vec<FeedRow> = sqlx::query_as(&author_statement(own_threads, cap))
+        .bind(requester)
+        .bind(author)
+        .bind(at)
+        .bind(key)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(judged_feed(rows))
 }
 
-/// The home timeline's candidates (design-v3 §1.7 item 12; private posting
-/// §4.7), newest first, after the `created_at::key` cursor:
-/// - posts passing the prefilter whose author is the requester or an
-///   account the requester follows, as this AppView has indexed the
-///   follows, keyed by URI (across authors a record key is not unique);
+/// `getTimeline`'s statement (§3.2): `$1` the reader, `$2`/`$3` the
+/// position, `$4` the batch.
+pub(super) fn timeline_statement(cap: u32) -> String {
+    let c = format!(
+        "(SELECT {COLS}, p.created_at, p.uri COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
+          FROM private_posts p \
+          WHERE (p.author_did = $1 OR p.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
+            AND {post_muted} \
+            AND ($2::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
+          ORDER BY p.created_at DESC, p.uri COLLATE \"C\" DESC LIMIT $4) \
+         UNION ALL \
+         (SELECT {COLS}, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
+          FROM reposts rp JOIN private_posts p ON p.uri = rp.subject_uri \
+          WHERE (rp.author_did = $1 OR rp.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
+            AND {repost} AND {reposter_muted} \
+            AND ($2::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
+          ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $4) \
+         ORDER BY created_at DESC, key DESC LIMIT $4",
+        post_muted = not_muted("p.author_did"),
+        repost = repost_item(),
+        reposter_muted = not_muted("rp.author_did"),
+    );
+    walked(&c, "", &feed_final(), cap)
+}
+
+/// One batch of the home timeline's candidates (design-v3 §1.7 item 12;
+/// private posting §4.7), newest first, after the `created_at::key` cursor,
+/// each with its verdict (§3.2):
+/// - posts whose author is the requester or an account the requester
+///   follows, as this AppView has indexed the follows, keyed by URI (across
+///   authors a record key is not unique);
 /// - repost items: reposts by the requester or an account it follows, a
-///   member (C-2), of a private post passing the prefilter, keyed by the
-///   repost's URI.
+///   member (C-2), of a stored private post, keyed by the repost's URI.
 ///
 /// A mute applies here as it does on the public timeline: a post's author,
 /// or a reposter, that the requester fully mutes, directly or through a
@@ -1024,39 +1700,22 @@ pub(super) async fn author_candidates(
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn timeline_candidates(
+pub(super) async fn timeline_batch(
     pool: &PgPool,
     requester: &str,
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
-) -> Result<Vec<FeedCandidate>, sqlx::Error> {
+    cap: u32,
+) -> Result<Vec<(FeedCandidate, bool)>, sqlx::Error> {
     let (at, key) = after.map_or((None, String::new()), |(a, k)| (Some(a), k));
-    sqlx::query_as(&format!(
-        "(SELECT p.uri, p.created_at, p.uri COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
-          FROM {PREFILTER_FROM} \
-          WHERE (p.author_did = $1 OR p.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
-            AND {pre} AND {post_muted} \
-            AND ($2::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
-          ORDER BY p.created_at DESC, p.uri COLLATE \"C\" DESC LIMIT $4) \
-         UNION ALL \
-         (SELECT p.uri, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
-          FROM {REPOST_FROM} \
-          WHERE (rp.author_did = $1 OR rp.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
-            AND {repost} AND {reposter_muted} AND {pre} \
-            AND ($2::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
-          ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $4) \
-         ORDER BY created_at DESC, key DESC LIMIT $4",
-        pre = prefilter(),
-        post_muted = not_muted("p.author_did"),
-        repost = repost_item(),
-        reposter_muted = not_muted("rp.author_did"),
-    ))
-    .bind(requester)
-    .bind(at)
-    .bind(key)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
+    let rows: Vec<FeedRow> = sqlx::query_as(&timeline_statement(cap))
+        .bind(requester)
+        .bind(at)
+        .bind(key)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(judged_feed(rows))
 }
 
 /// The counts on a private post view (private posting §3.4, P-2): each
@@ -1103,9 +1762,9 @@ fn counted_quote_ref() -> String {
 
 /// The counts of `uris` for `reader`, one query per kind (§3.4). Every join
 /// is on a URI (§3.5), so a post's counts survive a CID change.
-/// - `replyCount`: private replies passing the prefilter, which carries the
-///   moderation test; a reply that fails decode or waits on its owner's
-///   readiness counts, since that fails for every reader alike.
+/// - `replyCount`: private replies passing the prefilter (§3.2), which
+///   carries the moderation test; a reply that fails decode or waits on its
+///   owner's readiness counts, since that fails for every reader alike.
 /// - `likeCount`, `repostCount`: by member likers with no block either way.
 /// - `quoteCount`: private quotes passing the prefilter, and members'
 ///   public quotes whose author has no block either way.
@@ -1113,20 +1772,16 @@ fn counted_quote_ref() -> String {
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn counts(pool: &PgPool, reader: &str, uris: &[String]) -> Result<HashMap<String, Counts>, sqlx::Error> {
+pub(super) async fn counts(pool: &PgPool, reader: &str, uris: &[String], cap: u32) -> Result<HashMap<String, Counts>, sqlx::Error> {
     let mut out: HashMap<String, Counts> = HashMap::new();
     if uris.is_empty() {
         return Ok(out);
     }
-    let replies: Vec<(String, i64)> = sqlx::query_as(&format!(
-        "SELECT p.reply_parent_uri, count(*) FROM {PREFILTER_FROM} \
-         WHERE p.reply_parent_uri = ANY($2) AND {pre} GROUP BY p.reply_parent_uri",
-        pre = prefilter()
-    ))
-    .bind(reader)
-    .bind(uris)
-    .fetch_all(pool)
-    .await?;
+    let replies: Vec<(String, i64)> = sqlx::query_as(&reply_counts_statement(cap))
+        .bind(reader)
+        .bind(uris)
+        .fetch_all(pool)
+        .await?;
     for (uri, n) in replies {
         out.entry(uri).or_default().reply = n;
     }
@@ -1148,23 +1803,43 @@ pub(super) async fn counts(pool: &PgPool, reader: &str, uris: &[String]) -> Resu
             }
         }
     }
-    let quotes: Vec<(String, i64)> = sqlx::query_as(&format!(
-        "SELECT quoted, count(*) FROM ( \
-           SELECT p.quote_uri AS quoted FROM {PREFILTER_FROM} WHERE p.quote_uri = ANY($2) AND {pre} \
-           UNION ALL \
-           SELECT q.quoted_uri FROM private_quote_refs q WHERE q.quoted_uri = ANY($2) AND {counted} \
-         ) x GROUP BY quoted",
-        pre = prefilter(),
-        counted = counted_quote_ref(),
-    ))
-    .bind(reader)
-    .bind(uris)
-    .fetch_all(pool)
-    .await?;
+    let quotes: Vec<(String, i64)> = sqlx::query_as(&quote_counts_statement(cap))
+        .bind(reader)
+        .bind(uris)
+        .fetch_all(pool)
+        .await?;
     for (uri, n) in quotes {
         out.entry(uri).or_default().quote = n;
     }
     Ok(out)
+}
+
+/// `replyCount`'s statement (§3.2): `$1` the reader, `$2` the parents; one
+/// walk per distinct key, so siblings share it.
+pub(super) fn reply_counts_statement(cap: u32) -> String {
+    walked(
+        &format!("SELECT {COLS} FROM private_posts p WHERE p.reply_parent_uri = ANY($2)"),
+        "",
+        &format!("SELECT s1.reply_parent_uri, count(*) FROM {PV_JOIN} WHERE {PASS} GROUP BY s1.reply_parent_uri"),
+        cap,
+    )
+}
+
+/// `quoteCount`'s statement (§3.2): `$1` the reader, `$2` the quoted posts.
+pub(super) fn quote_counts_statement(cap: u32) -> String {
+    walked(
+        &format!("SELECT {COLS}, p.quote_uri FROM private_posts p WHERE p.quote_uri = ANY($2)"),
+        "",
+        &format!(
+            "SELECT quoted, count(*) FROM ( \
+               SELECT s1.quote_uri AS quoted FROM {PV_JOIN} WHERE {PASS} \
+               UNION ALL \
+               SELECT q.quoted_uri FROM private_quote_refs q WHERE q.quoted_uri = ANY($2) AND {counted} \
+             ) x GROUP BY quoted",
+            counted = counted_quote_ref(),
+        ),
+        cap,
+    )
 }
 
 /// The URI of `viewer`'s own like or repost of each of `uris`, the newest
@@ -1255,42 +1930,64 @@ pub(super) struct QuoteCandidate {
     pub cid: Option<String>,
 }
 
-/// The posts quoting `quoted`, newest first, merged by `(created_at, uri)`
-/// after the cursor: private posts passing the prefilter, and public quote
-/// references whose author has no block either way with `reader`.
+/// `getQuotes`' statement (§3.2): `$1` the reader, `$2` the quoted post,
+/// `$3`/`$4` the position, `$5` the batch. `c` is HEAD's two arms under a
+/// tag `src`: the private arm (`'p'`) goes through stage 1 and the walk, and
+/// the refs arm (`'q'`) keeps HEAD's own test and is not prefiltered. The
+/// refs are merged in SQL.
+pub(super) fn quote_statement(cap: u32) -> String {
+    let c = format!(
+        "(SELECT 'p' AS src, {COLS}, p.created_at, p.uri COLLATE \"C\" AS key, NULL::text AS cid \
+          FROM private_posts p WHERE p.quote_uri = $2 \
+            AND ($3::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+          ORDER BY p.created_at DESC, p.uri COLLATE \"C\" DESC LIMIT $5) \
+         UNION ALL \
+         (SELECT 'q', NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, q.created_at, q.uri COLLATE \"C\", q.cid \
+          FROM private_quote_refs q WHERE q.quoted_uri = $2 AND {counted} \
+            AND ($3::timestamptz IS NULL OR (q.created_at, q.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+          ORDER BY q.created_at DESC, q.uri COLLATE \"C\" DESC LIMIT $5) \
+         ORDER BY created_at DESC, key DESC LIMIT $5",
+        counted = counted_quote_ref(),
+    );
+    let final_ = format!(
+        "SELECT x.key AS uri, x.created_at, x.cid, x.pass FROM ( \
+           SELECT s1.key, s1.created_at, s1.cid, {PASS} AS pass FROM {PV_JOIN} \
+           UNION ALL \
+           SELECT c.key, c.created_at, c.cid, true FROM c WHERE c.src = 'q') x \
+         ORDER BY x.created_at DESC, x.key COLLATE \"C\" DESC"
+    );
+    walked(&c, "WHERE c.src = 'p'", &final_, cap)
+}
+
+/// One batch of the posts quoting `quoted`, newest first, merged by
+/// `(created_at, uri)` after the cursor, each with its verdict: private
+/// posts by the read rule (§3.2), and public quote references whose author
+/// has no block either way with `reader`.
 ///
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn quote_candidates(
+pub(super) async fn quote_batch(
     pool: &PgPool,
     reader: &str,
     quoted: &str,
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
-) -> Result<Vec<QuoteCandidate>, sqlx::Error> {
+    cap: u32,
+) -> Result<Vec<(QuoteCandidate, bool)>, sqlx::Error> {
     let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
-    sqlx::query_as(&format!(
-        "(SELECT p.uri COLLATE \"C\" AS uri, p.created_at, NULL::text AS cid FROM {PREFILTER_FROM} \
-          WHERE p.quote_uri = $2 AND {pre} \
-            AND ($3::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
-          ORDER BY p.created_at DESC, p.uri COLLATE \"C\" DESC LIMIT $5) \
-         UNION ALL \
-         (SELECT q.uri COLLATE \"C\", q.created_at, q.cid FROM private_quote_refs q \
-          WHERE q.quoted_uri = $2 AND {counted} \
-            AND ($3::timestamptz IS NULL OR (q.created_at, q.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
-          ORDER BY q.created_at DESC, q.uri COLLATE \"C\" DESC LIMIT $5) \
-         ORDER BY created_at DESC, uri DESC LIMIT $5",
-        pre = prefilter(),
-        counted = counted_quote_ref(),
-    ))
-    .bind(reader)
-    .bind(quoted)
-    .bind(at)
-    .bind(uri)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
+    let rows: Vec<(String, DateTime<Utc>, Option<String>, bool)> = sqlx::query_as(&quote_statement(cap))
+        .bind(reader)
+        .bind(quoted)
+        .bind(at)
+        .bind(uri)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(uri, created_at, cid, pass)| (QuoteCandidate { uri, created_at, cid }, pass))
+        .collect())
 }
 
 /// A private notification row (private posting §4.8): the caller's own.
@@ -1458,28 +2155,41 @@ pub(super) async fn update_seen(pool: &PgPool, did: &str, seen_at: DateTime<Utc>
     Ok(())
 }
 
+/// The unseen-row condition of `getUnreadCount` for the recipient `$1`.
+const UNSEEN: &str = "n.indexed_at > COALESCE((SELECT seen_at FROM private_notification_seen WHERE did = $1), '-infinity')";
+
+/// `getUnreadCount`'s statement (§3.2): `$1` the recipient. `c` is the
+/// private-post rows of the unseen notifications, one per notification;
+/// the second term is HEAD's public-record arm unchanged.
+pub(super) fn unread_statement(cap: u32) -> String {
+    let kept = notification_kept();
+    walked(
+        &format!(
+            "SELECT {COLS}, n.id FROM private_notifications n JOIN private_posts p ON p.uri = n.record_uri \
+             WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN} \
+               AND split_part(n.record_uri, '/', 4) = '{NSID_POST_PRIVATE}'"
+        ),
+        "",
+        &format!(
+            "SELECT (SELECT count(*) FROM {PV_JOIN} WHERE {PASS}) \
+               + (SELECT count(*) FROM private_notifications n WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN} \
+                    AND split_part(n.record_uri, '/', 4) IS DISTINCT FROM '{NSID_POST_PRIVATE}' \
+                    AND EXISTS (SELECT 1 FROM private_posts s WHERE s.uri = n.reason_subject))"
+        ),
+        cap,
+    )
+}
+
 /// `getUnreadCount` (§4.8): the recipient's rows after its last-seen time,
 /// under [`notification_kept`], counting only what the list would show:
 /// - a row from a private post when the post passes the prefilter for the
-///   recipient, which carries the moderation test (§3.4), so a mention in a
-///   post the recipient cannot read is never counted;
+///   recipient (§3.2), which carries the moderation test (§3.4), so a
+///   mention in a post the recipient cannot read is never counted;
 /// - a row from a public record while its subject private post is stored.
 ///
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn unread_count(pool: &PgPool, recipient: &str) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM private_notifications n WHERE n.recipient_did = $1 AND {kept} \
-           AND n.indexed_at > COALESCE((SELECT seen_at FROM private_notification_seen WHERE did = $1), '-infinity') \
-           AND CASE WHEN split_part(n.record_uri, '/', 4) = '{post_private}' \
-                 THEN EXISTS (SELECT 1 FROM {PREFILTER_FROM} WHERE p.uri = n.record_uri AND {pre}) \
-                 ELSE EXISTS (SELECT 1 FROM private_posts s WHERE s.uri = n.reason_subject) END",
-        kept = notification_kept(),
-        post_private = crate::firehose::classifier::NSID_POST_PRIVATE,
-        pre = prefilter(),
-    ))
-    .bind(recipient)
-    .fetch_one(pool)
-    .await
+pub(super) async fn unread_count(pool: &PgPool, recipient: &str, cap: u32) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(&unread_statement(cap)).bind(recipient).fetch_one(pool).await
 }

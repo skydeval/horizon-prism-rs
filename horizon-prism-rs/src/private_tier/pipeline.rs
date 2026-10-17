@@ -6,10 +6,11 @@
 //! uniform miss, and increments `private_read_outcome_total{outcome}` with a
 //! server-side reason that never reaches the wire.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::StreamExt;
 use kryphocron::authority::{ViewPrivate, issue_user};
 use kryphocron::ingress::from_xrpc_request;
 use kryphocron::{
@@ -137,8 +138,19 @@ pub(super) struct PipelineEnv {
     pub freshness_bound: Duration,
     /// `sync.max_head_fetches_per_request`.
     pub max_head_fetches: usize,
+    /// `private_read.max_chain`: the walk's cap (private-threads §2.3).
+    pub max_chain: u32,
     /// `[video]`: how a video embed's view is built (Addendum A).
     pub video: VideoConfig,
+}
+
+impl PipelineEnv {
+    /// Step 5's test (§6.3): the private watermark is within
+    /// `freshness_bound` of now. Global, and reads nothing.
+    pub(super) fn watermark_fresh(&self) -> bool {
+        let watermark = self.watermarks.private_watermark().map(SystemTime::from);
+        watermark.is_some_and(|w| SystemTime::now().duration_since(w).unwrap_or(Duration::ZERO) <= self.freshness_bound)
+    }
 }
 
 /// Per-request state: repo-head results by DID, and the synchronous head
@@ -155,6 +167,23 @@ impl RequestState {
             fetch_budget: AtomicUsize::new(max_head_fetches),
         }
     }
+
+    /// The head fetches this request may still make (T-56).
+    #[cfg(test)]
+    pub(super) fn budget_left(&self) -> usize {
+        self.fetch_budget.load(Ordering::SeqCst)
+    }
+
+    /// The DIDs whose head results this request holds (T-56).
+    #[cfg(test)]
+    pub(super) async fn cached(&self) -> HashMap<String, bool> {
+        self.heads.lock().await.clone()
+    }
+
+    /// One charge of the per-request budget: whether a fetch is funded.
+    fn charge(&self) -> bool {
+        self.fetch_budget.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+    }
 }
 
 /// The repo-head check (§6.11.3): `applied_rev ≥ head_rev`, with the head no
@@ -163,11 +192,22 @@ async fn head_ok(env: &PipelineEnv, rs: &RequestState, did: &str) -> Result<bool
     if let Some(ok) = rs.heads.lock().await.get(did) {
         return Ok(*ok);
     }
-    let allow = rs
-        .fetch_budget
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-        .is_ok();
-    let ok = match env.prober.read_head_with(did, allow).await? {
+    let allow = rs.charge();
+    let ok = head_check(env, did, allow).await?;
+    rs.heads.lock().await.insert(did.to_string(), ok);
+    Ok(ok)
+}
+
+/// `head_ok`'s check from the head read on (private-threads design §3.4):
+/// the stored head when fresh, else one fetched when `allow`, against
+/// `applied_rev`. Shared with [`prefetch_heads`], so both compare the same
+/// way.
+async fn head_check(env: &PipelineEnv, did: &str, allow: bool) -> Result<bool, sqlx::Error> {
+    #[cfg(test)]
+    if crate::test_support::hooks::injected(crate::test_support::hooks::HEAD_CHECK_FAILS, did) {
+        return Err(sqlx::Error::PoolTimedOut);
+    }
+    Ok(match env.prober.read_head_with(did, allow).await? {
         None => false,
         Some(head) => {
             let applied: Option<String> = sqlx::query_scalar("SELECT applied_rev FROM sync_state WHERE did = $1")
@@ -177,9 +217,85 @@ async fn head_ok(env: &PipelineEnv, rs: &RequestState, did: &str) -> Result<bool
                 .flatten();
             applied.is_some_and(|a| a >= head)
         }
-    };
-    rs.heads.lock().await.insert(did.to_string(), ok);
-    Ok(ok)
+    })
+}
+
+/// What a head round left behind (§3.4).
+#[derive(Debug, Default)]
+pub(super) struct Prefetch {
+    /// DIDs whose `head_check` returned a database error. Each keeps its one
+    /// charge and stays uncached, as `head_ok` leaves it.
+    pub db_failed: HashSet<String>,
+}
+
+/// One head round (private-threads design §3.4): check the heads of `dids`
+/// with at most `concurrency` in flight, charging the per-request budget in
+/// list order before any check starts, so which DIDs the budget funds never
+/// depends on poll order. Results land in `rs`'s cache, so later `head_ok`
+/// calls for these DIDs spend nothing. DIDs already cached, and repeats, are
+/// dropped. Infallible: a database error on one DID is returned in
+/// `db_failed` and leaves that DID uncached. Nothing is refunded.
+pub(super) async fn prefetch_heads(env: &PipelineEnv, rs: &RequestState, dids: &[String], concurrency: usize) -> Prefetch {
+    let mut funded: Vec<(String, bool)> = Vec::new();
+    {
+        let cached = rs.heads.lock().await;
+        for did in dids {
+            if cached.contains_key(did) || funded.iter().any(|(d, _)| d == did) {
+                continue;
+            }
+            funded.push((did.clone(), false));
+        }
+    }
+    for entry in &mut funded {
+        entry.1 = rs.charge();
+    }
+    let checks: Vec<_> = funded
+        .into_iter()
+        .map(|(did, allow)| async move {
+            let result = head_check(env, &did, allow).await;
+            (did, result)
+        })
+        .collect();
+    let results: Vec<(String, Result<bool, sqlx::Error>)> =
+        futures::stream::iter(checks).buffered(concurrency.max(1)).collect().await;
+    let mut out = Prefetch::default();
+    let mut cached = rs.heads.lock().await;
+    for (did, result) in results {
+        match result {
+            Ok(ok) => {
+                cached.insert(did, ok);
+            }
+            Err(e) => {
+                tracing::warn!(event = "private_read_db_error", error = %e, "a head check in the round failed on the database");
+                out.db_failed.insert(did);
+            }
+        }
+    }
+    out
+}
+
+/// Count a read the handler decides without the pipeline (§3.4: a row
+/// whose head check failed on the database in the round), as
+/// [`read`] counts its own.
+pub(super) fn count_db_miss() {
+    metrics::counter!(METRIC_OUTCOMES, "outcome" => Miss::Db.label()).increment(1);
+}
+
+/// Step 3's readiness for a post by `author` under an audience of
+/// `audience_owner` (§6.3): the author's owner readiness, and the
+/// audience owner's when it differs, as [`read`] tests them.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn ready(env: &PipelineEnv, author: &str, audience_owner: Option<&str>) -> Result<bool, sqlx::Error> {
+    if !readiness::owner_ready(&env.pool, author).await? {
+        return Ok(false);
+    }
+    match audience_owner.filter(|a| *a != author) {
+        Some(a) => readiness::owner_ready(&env.pool, a).await,
+        None => Ok(true),
+    }
 }
 
 fn trace_id() -> TraceId {
@@ -196,6 +312,8 @@ pub(super) async fn read(
     authors: &ProfileContext,
     start: Instant,
 ) -> Result<PrivateEmit<Value>, Miss> {
+    #[cfg(test)]
+    crate::test_support::hooks::delay(crate::test_support::hooks::PRIVATE_READ, uri_author(uri).unwrap_or_default()).await;
     // Boxed: the bind and decode futures are large, and a page holds up to
     // `bind_concurrency` of them.
     let result = Box::pin(read_inner(env, rs, caller, uri, authors, start)).await;
@@ -265,6 +383,7 @@ async fn read_inner(
             uri,
             watermark,
             bound: env.freshness_bound,
+            max_chain: env.max_chain,
         },
     )
     .await?;
@@ -275,6 +394,7 @@ async fn read_inner(
     if !fresh {
         return Err(Miss::Stale);
     }
+    let view_audience = snap.view_audience().map(str::to_string);
 
     // 6–8. Context, issue, bind. `ctx` borrows `snap` and the glue's sinks.
     let trace = trace_id();
@@ -403,14 +523,18 @@ async fn read_inner(
     {
         view["embed"] = media;
     }
-    // The audience (P-3, §4.10): present while its row exists. `mode` is
+    // The audience (P-3, §4.10): the governing audience G (private-threads
+    // design §2.6), present while its row exists; on the author's own read
+    // only when the author is G's owner or passes rules 6 to 8. `mode` is
     // left out when NULL, which reads as `list`; `members` never appears.
-    if let (true, Some(a)) = (meta.audience_found, &meta.audience_uri) {
+    if let Some(a) = &view_audience
+        && let Some((mode, name)) = schema::audience_view(&env.pool, a).await?
+    {
         let mut audience = json!({"uri": a});
-        if let Some(mode) = &meta.audience_mode {
+        if let Some(mode) = mode {
             audience["mode"] = json!(mode);
         }
-        if let Some(name) = &meta.audience_name {
+        if let Some(name) = name {
             audience["name"] = json!(name);
         }
         view["audience"] = audience;

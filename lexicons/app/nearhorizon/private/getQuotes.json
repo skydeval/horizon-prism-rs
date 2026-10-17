@@ -31,7 +31,7 @@
             "uri": { "type": "string", "format": "at-uri" },
             "cursor": {
               "type": "string",
-              "description": "Present whenever more candidates remain; a page may be short or empty and still carry one."
+              "description": "Present whenever more candidates remain. A page reads at most twice its `limit` in candidates. It can be short or empty and still carry a cursor; keep paging while a cursor is present."
             },
             "posts": {
               "type": "array",

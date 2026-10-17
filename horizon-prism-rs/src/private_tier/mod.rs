@@ -162,12 +162,17 @@ pub const FEATURES: &[&str] = &[
     "private.freshIndex",
     // P-17 sealed cursors, P-20 `filter`, P-6/P-14 `getReplies` (S8).
     "private.paging",
-    // Rule 4's anchored walk (S0, listed from S1).
+    // Rule 4's anchored walk (S0, listed from S1; the read rule of S12
+    // since).
     "private.crossPdsReplies",
     // P-4 the `following` audience mode (S10).
     "private.following",
     // P-7 `searchPosts`, a bounded scan at query time (S11).
     "private.search",
+    // P-21 to P-23: a reply is read by its thread root's (or branch root's)
+    // current audience, walked up to `private_read.max_chain` rows; paged
+    // reads capped at twice their limit (S12).
+    "private.threadAudience",
 ];
 
 /// The private tier as the rest of the crate may use it.

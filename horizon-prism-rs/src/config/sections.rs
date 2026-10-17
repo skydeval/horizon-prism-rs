@@ -325,6 +325,18 @@ pub struct PrivateReadConfig {
     /// `Retry-After` on a `getMembership` answer of `indexing`: a polling
     /// hint, not an estimate (private posting §4.1).
     pub membership_retry_after_secs: u64,
+    /// The private-threads walk's bound (private-threads design §2.3,
+    /// C-T12): a reply's chain of parents is walked at most this many
+    /// stored rows. 1 to 100.
+    pub max_chain: u32,
+    /// A paged read (`getAuthorFeed`, `getTimeline`, `getQuotes`,
+    /// `getReplies`' page) reads at most this many times its `limit` in
+    /// candidates through the pipeline (private-threads design §3.3).
+    pub page_reads_factor: u32,
+    /// The largest batch of candidate rows one statement evaluates when a
+    /// batched read asks for more after a short batch (private-threads
+    /// design §3.2.1).
+    pub walk_batch_max: u32,
     pub floor_ms: PrivateReadFloors,
 }
 
@@ -333,9 +345,24 @@ impl Default for PrivateReadConfig {
         Self {
             bind_concurrency: 8,
             membership_retry_after_secs: 5,
+            max_chain: 16,
+            page_reads_factor: 2,
+            walk_batch_max: 1000,
             floor_ms: PrivateReadFloors::default(),
         }
     }
+}
+
+/// `[bench]` (private-threads design §4, §5): the B-5 bench's head source.
+/// Exists only under the `bench-heads` feature, so a deploy build refuses a
+/// config that names it.
+#[cfg(feature = "bench-heads")]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BenchConfig {
+    /// The heads `BenchHeadSource` answers: one `did rev` or `did fail`
+    /// per line. Required under the feature.
+    pub heads_file: Option<std::path::PathBuf>,
 }
 
 /// `[private_notify]` (private posting §4.8, C-11). The section is never
@@ -1783,4 +1810,7 @@ pub struct FileConfig {
     pub retention: RetentionConfig,
     pub storage: StorageConfig,
     pub constellation: ConstellationConfig,
+    /// The B-5 bench's head source; only under `bench-heads`.
+    #[cfg(feature = "bench-heads")]
+    pub bench: BenchConfig,
 }

@@ -113,6 +113,15 @@ bind_concurrency = 8
 # Retry-After on a getMembership answer of `indexing`: a polling hint, not an
 # estimate (private posting §4.1).
 membership_retry_after_secs = 5
+# Private threads (private-threads design §2.3, §3.2.1, §3.3). A reply's chain
+# of parents is walked at most max_chain stored posts (1 to 100); a reply
+# deeper than that is read by its author only. A paged read (author feed,
+# timeline, quotes, replies) reads at most page_reads_factor × limit posts.
+# A short batch of candidates is followed by one twice its size, up to
+# walk_batch_max rows.
+max_chain = 16
+page_reads_factor = 2
+walk_batch_max = 1000
 
 # Whole-handler latency floors, sized above each endpoint's worst case including
 # one synchronous repo-head fetch round (design §6.9, §6.11.3).
@@ -147,7 +156,8 @@ scan_candidates = 300
 span_hours = 168
 max_age_days = 365
 
-# Repo-head check for tracked DIDs (design §6.11.3).
+# Repo-head check for tracked DIDs (design §6.11.3). head_max_age_secs is at
+# most 600; a larger value refuses to start.
 [sync]
 head_max_age_secs = 60
 max_head_fetches_per_request = 16

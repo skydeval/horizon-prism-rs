@@ -125,6 +125,9 @@ oracle_freshness_bound_secs = 120
 [private_read]
 bind_concurrency = 8
 membership_retry_after_secs = 5
+max_chain = 16
+page_reads_factor = 2
+walk_batch_max = 1000
 
 [private_read.floor_ms]
 get_posts = 1000
@@ -972,6 +975,47 @@ fn private_search_span_fits_its_reach() {
     let cfg = load("[private_search]\nspan_hours = 24\nmax_age_days = 1\n").expect("one day of one day");
     assert_eq!(cfg.file.private_search.scan_candidates, 300);
     assert_eq!(cfg.file.private_read.floor_ms.search_posts, 1500);
+}
+
+/// Private-threads design §5: `max_chain` is 1 to 100 (16 by default, 100
+/// accepted), the paging keys are positive, and T-57's head-age cap: a
+/// `sync.head_max_age_secs` above 600 is refused on every build.
+#[test]
+fn private_threads_keys_and_the_head_age_cap_are_checked() {
+    let cfg = load("").expect("defaults");
+    let read = &cfg.file.private_read;
+    assert_eq!((read.max_chain, read.page_reads_factor, read.walk_batch_max), (16, 2, 1000));
+    for ok in [1, 16, 100] {
+        let cfg = load(&format!("[private_read]\nmax_chain = {ok}\n")).expect("in range");
+        assert_eq!(cfg.file.private_read.max_chain, ok);
+    }
+    for bad in [0, 101] {
+        let p = invalid_problems(load(&format!("[private_read]\nmax_chain = {bad}\n")));
+        assert!(has(&p, "private_read.max_chain must be 1 to 100"), "{bad}: {p:?}");
+    }
+    for key in ["page_reads_factor", "walk_batch_max"] {
+        let p = invalid_problems(load(&format!("[private_read]\n{key} = 0\n")));
+        assert!(has(&p, &format!("private_read.{key} must be greater than 0")), "{p:?}");
+    }
+    assert_eq!(load("[sync]\nhead_max_age_secs = 600\n").expect("at the cap").file.sync.head_max_age_secs, 600);
+    let p = invalid_problems(load("[sync]\nhead_max_age_secs = 601\n"));
+    assert!(has(&p, "sync.head_max_age_secs must be at most 600"), "{p:?}");
+}
+
+/// T-57: without the `bench-heads` feature a `[bench]` section is an
+/// unknown key, so a bench config cannot load on a deploy build.
+#[cfg(not(feature = "bench-heads"))]
+#[test]
+fn a_bench_section_is_refused_without_the_feature() {
+    assert!(matches!(load("[bench]\nheads_file = \"/tmp/heads\"\n"), Err(ConfigError::Parse(_))));
+}
+
+/// Under `bench-heads` the section parses (serve then requires the file).
+#[cfg(feature = "bench-heads")]
+#[test]
+fn a_bench_section_parses_under_the_feature() {
+    let cfg = load("[bench]\nheads_file = \"/tmp/heads\"\n").expect("parses");
+    assert_eq!(cfg.file.bench.heads_file.as_deref(), Some(std::path::Path::new("/tmp/heads")));
 }
 
 #[test]

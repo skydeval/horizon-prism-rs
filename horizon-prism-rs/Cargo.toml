@@ -13,6 +13,12 @@ path = "src/lib.rs"
 name = "horizon-prism-rs"
 path = "src/main.rs"
 
+[features]
+# The B-5 bench's in-process head source (private-threads design §4). Never
+# in a deploy build: serve refuses to start under it without
+# `bench.heads_file`, and a featureless build refuses a `[bench]` section.
+bench-heads = []
+
 # Versions pinned major/minor per design-v2 §3.1.
 [dependencies]
 tokio = { version = "1", features = ["full"] }

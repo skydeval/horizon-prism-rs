@@ -6,7 +6,7 @@
 //!   guard, then a transaction holding the DID's exclusive advisory lock. The
 //!   delete re-checks scope and membership inside that transaction.
 //!   - `private_posts`: author out of scope, unless the reply parent or root
-//!     author is a member (§9.3 rule 2);
+//!     author, or the audience's author, is a member (§9.3 rule 2);
 //!   - `private_audiences`: owner out of scope;
 //!   - `private_blocks`: author out of scope, unless the subject is a member
 //!     or the author is a private owner (§9.3 rule 3).
@@ -45,9 +45,7 @@ struct Step {
 }
 
 fn steps() -> Vec<Step> {
-    let reply_to_member = "EXISTS (SELECT 1 FROM members m WHERE m.did IN \
-         (split_part(p.reply_parent_uri, '/', 3), split_part(p.reply_root_uri, '/', 3)))";
-    let posts = format!("{} AND NOT {reply_to_member}", not_in_scope("p.author_did"));
+    let posts = format!("{} AND NOT {}", not_in_scope("p.author_did"), super::ingest::REPLY_TO_MEMBER);
     let audiences = not_in_scope("a.owner_did");
     let blocks = format!(
         "{} AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = b.subject_did) AND NOT (b.author_did = ANY($1))",

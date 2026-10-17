@@ -14,6 +14,11 @@ use super::sections::{
 /// Metrics label for relays absent from `firehose.relay_labels` (§5.11).
 pub const OTHER_RELAY_LABEL: &str = "other";
 
+/// The largest `sync.head_max_age_secs` (private-threads design §5): a
+/// runner or test config copied to a deploy cannot stretch the read path's
+/// head check (§6.11.3) past this.
+pub const MAX_HEAD_AGE_SECS: u64 = 600;
+
 /// Validate a parsed file config, returning every problem found.
 /// `public_hostname` is `APP_PUBLIC_HOSTNAME`, which a proxied service's
 /// URL must not name (design-v3 §6.7.2.3 rule 4).
@@ -407,6 +412,20 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     let search = &cfg.private_search;
     if u64::from(search.span_hours) > 24 * u64::from(search.max_age_days) {
         out.push("private_search.span_hours must be at most 24 × private_search.max_age_days".to_string());
+    }
+    // The private-threads walk and paging (private-threads design §5).
+    let read = &cfg.private_read;
+    if !(1..=100).contains(&read.max_chain) {
+        out.push("private_read.max_chain must be 1 to 100".to_string());
+    }
+    if read.page_reads_factor == 0 {
+        out.push("private_read.page_reads_factor must be greater than 0".to_string());
+    }
+    if read.walk_batch_max == 0 {
+        out.push("private_read.walk_batch_max must be greater than 0".to_string());
+    }
+    if cfg.sync.head_max_age_secs > MAX_HEAD_AGE_SECS {
+        out.push(format!("sync.head_max_age_secs must be at most {MAX_HEAD_AGE_SECS}"));
     }
 }
 

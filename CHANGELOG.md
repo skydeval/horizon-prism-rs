@@ -110,6 +110,83 @@ commit.
   Migration 0027. Floors `list_notifications` 1200 ms, `get_unread_count`
   300 ms. `getMembership`'s `features` gains `private.notifications`.
 
+### Changed (private threads S12)
+
+- **A private reply is read by its thread root's current audience
+  (#719; Horizon P-21, P-22, P-23).** A thread reply is read by the readers
+  of its root's audience as it is now, and a reply in a private branch
+  under a public post by those of its branch root's. It is served only
+  when its root (or branch root) is stored, names an audience of its own
+  author and is visible; the reply names an audience of that author; its
+  author, and the author of every post above it in its chain other than
+  the root's author, may write under the root's current audience now (the
+  PDS's rule for the mode) with no block either way with the root's
+  author; and its chain of parents, through stored private posts agreeing
+  on its root, reaches a post by the root's author (or the branch root)
+  within `[private_read] max_chain` posts, each visible to the reader. The
+  root author's own thread replies are not walked and are read by the
+  root's audience whatever audience of theirs they name. A post is never
+  served to a reader where either has blocked the other; its author always
+  reads it unless moderation hides it, even when the thread's owner has
+  blocked the author or removed them from the audience. `audience` on a
+  post's view is now the governing audience (left out of the author's own
+  read when the author no longer stands under it).
+  - **Starts being served:** replies in moved threads, under any of the
+    owner's audiences, whose writers stand; replies 9 to 16 deep; owner
+    thread replies whose parent is hidden, missing or in another thread;
+    owner thread replies naming a narrower owner audience, to the root's
+    readers.
+  - **Stops being served:** replies by writers who do not stand under the
+    root's current audience, with everything below them except the owner's
+    thread replies; replies in another account's thread under the
+    replier's own audience; owner thread replies naming a wider owner
+    audience, beyond the root's readers; replies under an invalid root or
+    branch root (deleted, never stored, a reply, under another account's
+    audience, moderated, or by an account with a hiding status); posts with
+    a public parent and a private root; replies deeper than `max_chain`.
+  - Admission takes a private post's `audienceList` author as a subject
+    beside its reply parent and root authors, and the `member_removed`
+    purge, the out-of-scope purge and retention keep and drop by the same
+    three.
+- **Paging (#719).** `getAuthorFeed`, `getTimeline`, `getQuotes` and
+  `getReplies` read at most `[private_read] page_reads_factor` (2) times
+  their `limit` in candidates a page, in one window, and end with a cursor
+  at the last row read; a page can be short or empty and still carry a
+  cursor, so keep paging while one comes back. No page end depends on
+  elapsed time any more. Candidates are evaluated in batches of up to
+  `walk_batch_max` (1 000) rows.
+- **Thread reads (#719).** `getPostThread` reads its parent chain with one
+  head round charged in the order sequential reads would charge, at most
+  `bind_concurrency` fetches at a time; parents, the claimed root and
+  quoted private posts that the reader may not read are no longer read
+  and spend no head budget. `getReplies` finds its claimed root with a
+  one-row lookup.
+- **Contracts.** The lexicons of `getPosts`, `getPostThread`,
+  `getAuthorFeed`, `getTimeline` and `getReplies` state the new rule;
+  `getAuthorFeed`, `getTimeline`, `getQuotes` and `getReplies` state the
+  read cap on their cursor; `defs#privatePostView.audience` is the
+  governing audience. `getMembership`'s `features` gains
+  `private.threadAudience`.
+- **Configuration.** New `[private_read]` keys `max_chain` (16, 1 to 100;
+  an operator may raise it to 100, accepting longer walks under floods),
+  `page_reads_factor` (2) and `walk_batch_max` (1 000).
+  **`sync.head_max_age_secs` above 600 is now rejected: `serve` and `admin`
+  refuse to start with such a config, so lower it before upgrading.**
+  `serve` logs `config: sync.head_max_age_secs=<n>` at startup, and warns
+  when `sync.max_head_fetches_per_request` exceeds
+  `sync.read_fetch_rate_per_host`. `private_read_unfloored_seconds` is a
+  histogram (20 buckets, 5 ms to 5 s).
+- **The B-5 bench.** A cargo feature `bench-heads` (never in a deploy
+  build: the Dockerfile passes no features, a featureless build refuses a
+  `[bench]` section, and a feature build refuses to start without a
+  readable `bench.heads_file`) answers repo heads from a file after 450 ms
+  and runs no background head prober. The ignored tests
+  `b5_row_class_ratios`, `b5_absolute_floors` and `b5_stale_head_chain`
+  build the synthetic snapshot and measure the gate.
+- Pre-release count: run `cargo test pre_s12_count_query -- --ignored
+  --nocapture` and the two printed queries read-only on the deployed
+  database before S12 ships; not yet run on prism.
+
 ### Fixed (firehose throughput)
 
 - **The consumer could fall into a trim-gap loop (#724).** A commit that

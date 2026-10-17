@@ -220,6 +220,17 @@ pub mod hooks {
     /// Firehose throughput F6: the group-creation script fails. Key: the
     /// database.
     pub const GROUP_CREATE_FAILS: &str = "fh_group_create_fails";
+    /// Private threads T-56: the private pipeline's `head_check` fails on
+    /// the database for a DID. Key: the DID (tests use DIDs of their own).
+    pub const HEAD_CHECK_FAILS: &str = "s12_head_check_fails";
+    /// Private threads T-56: a read through the private pipeline, counted
+    /// ([`delay`] with no delay). Key: the post's author (tests use DIDs of
+    /// their own).
+    pub const PRIVATE_READ: &str = "s12_private_read";
+    /// Private threads T-56: `getPostThread`, its structural chain and
+    /// prefilter done, before the round and the reads. Key: the anchor's
+    /// URI.
+    pub const THREAD_AFTER_STRUCTURE: &str = "s12_thread_after_structure";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);

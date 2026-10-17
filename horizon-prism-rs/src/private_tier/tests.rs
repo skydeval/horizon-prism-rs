@@ -4,6 +4,12 @@
 
 // S10, the `following` audience mode, on this module's fixtures.
 mod following;
+// S12, private threads and branches, on this module's fixtures: the read
+// rule, the one builder, the head round, and B-5's release gate.
+mod b5;
+mod builder;
+mod round;
+mod threads;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -49,6 +55,9 @@ const DAVE: &str = "did:plc:dddddddddddddddddddddddd";
 const REV: &str = "3kaaaaaaaaaa2";
 const FLOOR: Duration = Duration::from_millis(400);
 const RELAY: &str = "private-relay";
+/// `private_read.max_chain`'s default, the walk's cap (private-threads
+/// design §2.3), for the statements tests run directly.
+const CAP: u32 = 16;
 /// The private cursor key of every test state.
 const TEST_CURSOR_KEY: [u8; 32] = [7; 32];
 
@@ -68,7 +77,12 @@ struct Fixture {
     app: AppState,
     prober: HeadProber,
     sets: ScopeSets,
+    /// The prober's per-host buckets (T-56: a refused token).
+    budgets: HostBudgets,
 }
+
+/// The first signing key of a [`fixture_custom`] extra member.
+const EXTRA_KEYS: u8 = 10;
 
 fn data_dir(test: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("hprs-{test}-{}", rand::random::<u64>()));
@@ -82,7 +96,17 @@ async fn fixture(pool: &PgPool, test: &str) -> Fixture {
 
 /// The fixture with public indexing in `mode` (T-1: every mode).
 async fn fixture_in(pool: &PgPool, test: &str, mode: PublicMode) -> Fixture {
-    for (did, handle) in [(ALICE, "alice.test"), (BOB, "bob.test"), (CAROL, "carol.test"), (DAVE, "dave.test")] {
+    fixture_custom(pool, test, mode, &[], Arc::new(NoHeads)).await
+}
+
+/// The fixture with `extra` members beside the four (each its own handle),
+/// and heads from `heads` (private-threads T-56: a recording source).
+async fn fixture_custom(pool: &PgPool, test: &str, mode: PublicMode, extra: &[String], heads: Arc<dyn HeadSource>) -> Fixture {
+    let mut everyone: Vec<(String, String)> =
+        [(ALICE, "alice.test"), (BOB, "bob.test"), (CAROL, "carol.test"), (DAVE, "dave.test")].map(|(d, h)| (d.to_string(), h.to_string())).into();
+    everyone.extend(extra.iter().map(|d| (d.clone(), format!("{}.test", &d[8..]))));
+    for (did, handle) in &everyone {
+        let (did, handle) = (did.as_str(), handle.as_str());
         actor(pool, did, handle, handle).await;
         sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())")
             .bind(did)
@@ -105,9 +129,9 @@ async fn fixture_in(pool: &PgPool, test: &str, mode: PublicMode) -> Fixture {
         .expect("sync_state");
     }
     let mut sets = ScopeSets::default();
-    for d in [ALICE, BOB, CAROL, DAVE] {
-        sets.scope.insert(d.into());
-        sets.members.insert(d.into());
+    for (d, _) in &everyone {
+        sets.scope.insert(d.clone());
+        sets.members.insert(d.clone());
     }
     sets.public = PublicState { mode, ..PublicState::default() };
     let scope = ScopeState::new(sets.clone(), ScopePolicy::MembersAndOneHop, 10_000);
@@ -119,6 +143,9 @@ async fn fixture_in(pool: &PgPool, test: &str, mode: PublicMode) -> Fixture {
     for (i, d) in [ALICE, BOB, CAROL, DAVE].into_iter().enumerate() {
         fetcher.set_key(d, signing_key(u8::try_from(i).expect("small") + 3));
     }
+    for (i, d) in extra.iter().enumerate() {
+        fetcher.set_key(d, signing_key(u8::try_from(i).expect("small") + EXTRA_KEYS));
+    }
     let (auth, _drainer) = verifier(fetcher, 100, 16);
     let app = AppState {
         hydrator: hydrator(pool, sets.clone()),
@@ -129,20 +156,14 @@ async fn fixture_in(pool: &PgPool, test: &str, mode: PublicMode) -> Fixture {
         did_document: Arc::new(json!({})),
         membership: Default::default(),
     };
-    let prober = HeadProber::new(
-        pool.clone(),
-        scope,
-        private,
-        Arc::new(NoHeads),
-        HostBudgets::new(BudgetRates {
-            max_probe_per_host: 25.0,
-            head_max_age_secs: 60.0,
-            read_fetch_per_host: 10.0,
-            backfill_per_host: 5.0,
-            catch_up_per_host: 10.0,
-        }),
-        SyncConfig::default(),
-    );
+    let budgets = HostBudgets::new(BudgetRates {
+        max_probe_per_host: 25.0,
+        head_max_age_secs: 60.0,
+        read_fetch_per_host: 10.0,
+        backfill_per_host: 5.0,
+        catch_up_per_host: 10.0,
+    });
+    let prober = HeadProber::new(pool.clone(), scope, private, heads, budgets.clone(), SyncConfig::default());
     Fixture {
         pool: pool.clone(),
         writer,
@@ -150,6 +171,7 @@ async fn fixture_in(pool: &PgPool, test: &str, mode: PublicMode) -> Fixture {
         app,
         prober,
         sets,
+        budgets,
     }
 }
 
@@ -175,6 +197,24 @@ impl Fixture {
     }
 
     fn state_of_keyed(&self, app: AppState, watermark_age: Option<Duration>, floor: Duration, cursor_key: &[u8; 32]) -> PrivateState {
+        self.state_read(app, watermark_age, floor, cursor_key, &PrivateReadConfig::default())
+    }
+
+    /// A fresh watermark, no floor, and `[private_read]`'s walk and paging
+    /// keys from `read` (private-threads design §5: the cap, the read
+    /// factor, the batch bound).
+    fn state_bounded(&self, read: &PrivateReadConfig) -> PrivateState {
+        self.state_read(self.app.clone(), Some(Duration::from_secs(1)), Duration::ZERO, &TEST_CURSOR_KEY, read)
+    }
+
+    fn state_read(
+        &self,
+        app: AppState,
+        watermark_age: Option<Duration>,
+        floor: Duration,
+        cursor_key: &[u8; 32],
+        read: &PrivateReadConfig,
+    ) -> PrivateState {
         let watermarks = Watermarks::new(BTreeMap::new(), vec![RELAY.into()]);
         if let Some(age) = watermark_age {
             watermarks.observe(RELAY, Utc::now() - chrono::Duration::from_std(age).expect("age"));
@@ -183,6 +223,9 @@ impl Fixture {
         let cfg = PrivateReadConfig {
             bind_concurrency: 8,
             membership_retry_after_secs: 5,
+            max_chain: read.max_chain,
+            page_reads_factor: read.page_reads_factor,
+            walk_batch_max: read.walk_batch_max,
             floor_ms: PrivateReadFloors {
                 get_posts: ms,
                 get_post_thread: ms,
@@ -341,6 +384,25 @@ impl Fixture {
         }
         record
     }
+}
+
+/// [`serve`], with the private watermark kept a second old and fresh heads
+/// kept fresh while the test runs, so a long test never reads past
+/// `freshness_bound` or `head_max_age_secs`. A head a test made stale on
+/// purpose (checked at the epoch) stays stale.
+async fn serve_live(state: PrivateState) -> String {
+    let watermarks = state.env.watermarks.clone();
+    let pool = state.env.pool.clone();
+    tokio::spawn(async move {
+        loop {
+            watermarks.observe(RELAY, Utc::now() - chrono::Duration::seconds(1));
+            let _ = sqlx::query("UPDATE sync_state SET head_checked_at = now() WHERE head_checked_at > now() - interval '50 seconds'")
+                .execute(&pool)
+                .await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+    serve(state).await
 }
 
 async fn serve(state: PrivateState) -> String {
@@ -775,6 +837,11 @@ fn block_sql(from: &str, to: &str) -> String {
 
 /// The oracle's answer alone: the audience rule and `bind`'s block test.
 async fn oracle_admits(pool: &PgPool, reader: &str, uri: &str) -> bool {
+    oracle_admits_capped(pool, reader, uri, CAP).await
+}
+
+/// [`oracle_admits`] with the walk's cap `cap`.
+async fn oracle_admits_capped(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> bool {
     let mut parts = uri.strip_prefix("at://").expect("at-uri").splitn(3, '/');
     let (Some(owner), Some(nsid), Some(rkey)) = (parts.next(), parts.next(), parts.next()) else {
         panic!("not an at-uri: {uri}");
@@ -792,6 +859,7 @@ async fn oracle_admits(pool: &PgPool, reader: &str, uri: &str) -> bool {
             uri,
             watermark: Some(SystemTime::now()),
             bound: Duration::from_secs(120),
+            max_chain: cap,
         },
     )
     .await
@@ -821,12 +889,31 @@ struct Walk {
     aud: String,
     root: String,
     failures: Vec<String>,
+    /// `private_read.max_chain` for the oracle, the prefilter and the
+    /// server (T-50: a change applies on the next read).
+    cap: u32,
 }
 
 impl Walk {
     async fn new(test: &str, layout: Layout, mode: Option<&str>, members: &[&str]) -> Option<Self> {
+        Self::new_in(test, PublicMode::On, layout, mode, members, &[], Arc::new(NoHeads)).await
+    }
+
+    /// [`Walk::new`] with public indexing in `public`, `extra` members and
+    /// heads from `heads` (private threads, T-46 to T-59), and rate limits no
+    /// test reaches.
+    async fn new_in(
+        test: &str,
+        public: PublicMode,
+        layout: Layout,
+        mode: Option<&str>,
+        members: &[&str],
+        extra: &[String],
+        heads: Arc<dyn HeadSource>,
+    ) -> Option<Self> {
         let db = fresh_db(test).await?;
-        let f = fixture(&db.pool, test).await;
+        let mut f = fixture_custom(&db.pool, test, public, extra, heads).await;
+        f.app.limits = roomy_limits();
         if layout == Layout::OffPds {
             exec(&f.pool, &format!("UPDATE actors SET pds_endpoint = 'https://pds.elsewhere.net' WHERE did <> '{ALICE}'")).await;
         }
@@ -835,7 +922,7 @@ impl Walk {
         for did in [BOB, CAROL, DAVE] {
             exec(&f.pool, &follow_sql(did, ALICE)).await;
         }
-        let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+        let base = serve_live(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
         Some(Self {
             db,
             f,
@@ -843,7 +930,16 @@ impl Walk {
             aud,
             root,
             failures: Vec::new(),
+            cap: CAP,
         })
+    }
+
+    /// Read with the walk's cap `cap` from here on: a new server, and the
+    /// oracle and prefilter at the same cap.
+    async fn set_cap(&mut self, cap: u32) {
+        self.cap = cap;
+        let read = PrivateReadConfig { max_chain: cap, ..PrivateReadConfig::default() };
+        self.base = serve_live(self.f.state_bounded(&read)).await;
     }
 
     /// `author`'s reply to `parent` under Alice's audience, claiming her root.
@@ -854,8 +950,8 @@ impl Walk {
     /// Whether the oracle, the prefilter and `getPosts` each give `reader`
     /// the `expected` answer for `uri` (T-37: one answer from all three).
     async fn expect(&mut self, case: &str, reader: &str, uri: &str, expected: bool) {
-        let oracle = oracle_admits(&self.f.pool, reader, uri).await;
-        let prefilter = !schema::prefilter_uris(&self.f.pool, reader, &[uri.to_string()])
+        let oracle = oracle_admits_capped(&self.f.pool, reader, uri, self.cap).await;
+        let prefilter = !schema::prefilter_uris(&self.f.pool, reader, &[uri.to_string()], self.cap)
             .await
             .expect("prefilter")
             .is_empty();
@@ -912,7 +1008,7 @@ async fn unanchored_cross_owner_posts(test: &str, layout: Layout) {
     // else's replyCount of his post, and the quote in no one else's
     // quoteCount of Alice's root; for Bob, their reader, they count.
     for reader in [ALICE, BOB, CAROL, DAVE] {
-        let counts = schema::counts(&w.f.pool, reader, std::slice::from_ref(&top)).await.expect("counts");
+        let counts = schema::counts(&w.f.pool, reader, std::slice::from_ref(&top), CAP).await.expect("counts");
         let replies = counts.get(&top).map_or(0, |c| c.reply);
         let (_, view) = one_post(&w.base, reader, &root).await;
         let quotes = view["quoteCount"].as_i64();
@@ -925,7 +1021,7 @@ async fn unanchored_cross_owner_posts(test: &str, layout: Layout) {
     // `quote` row, which she cannot read, so it counts nowhere; her one
     // unread row is Bob's reply in her thread.
     for (reader, expected) in [(ALICE, 1), (BOB, 0), (CAROL, 0), (DAVE, 0)] {
-        let unread = schema::unread_count(&w.f.pool, reader).await.expect("count");
+        let unread = schema::unread_count(&w.f.pool, reader, CAP).await.expect("count");
         if unread != expected {
             w.failures.push(format!("T-38 unread count for {reader}: {unread}, expected {expected}"));
         }
@@ -943,9 +1039,10 @@ async fn rule4_unanchored_posts_off_pds() {
     unanchored_cross_owner_posts("rule4-unanchored-off", Layout::OffPds).await;
 }
 
-/// T-33: a parent under another audience, the cap of 8, a cycle of forged
+/// T-33, as S12 restates it (private-threads design §6): a parent under
+/// another of the owner's audiences, the cap from config, a cycle of forged
 /// parents, and a reply left under the old audience when the root moved
-/// (A-9).
+/// (A-9), read while its writer stands.
 async fn walk_limits(test: &str, layout: Layout) {
     let Some(mut w) = Walk::new(test, layout, Some("followers"), &[]).await else {
         return;
@@ -990,36 +1087,48 @@ async fn walk_limits(test: &str, layout: Layout) {
     let own = w.reply(ALICE, "3kownbefore2", &root).await;
     w.f.ready_all().await;
 
-    w.expect("parent under another audience", BOB, &cross, true).await;
-    for reader in [ALICE, DAVE] {
-        w.expect("parent under another audience", reader, &cross, false).await;
+    // S12 (private-threads design §2.2, C-T10 (a)): `cross` names one of
+    // Alice's audiences in her thread, whose root is under `other`; its
+    // writer stands under `other` (Bob follows her), so `other`'s readers
+    // read it.
+    for reader in [ALICE, BOB, DAVE] {
+        w.expect("parent under another audience", reader, &cross, true).await;
     }
-    for (i, (author, uri)) in chain.iter().enumerate() {
-        let level = i + 1;
-        w.expect(&format!("level {level}"), DAVE, uri, level <= 8).await;
-        w.expect(&format!("level {level}, its author"), author, uri, true).await;
+    // The cap comes from config (S12, §2.3): at the default 16 all nine
+    // levels are served; at 8, levels 1 to 8.
+    for (cap, served) in [(CAP, 9), (8, 8)] {
+        w.set_cap(cap).await;
+        for (i, (author, uri)) in chain.iter().enumerate() {
+            let level = i + 1;
+            w.expect(&format!("cap {cap}, level {level}"), DAVE, uri, level <= served).await;
+            w.expect(&format!("cap {cap}, level {level}, its author"), author, uri, true).await;
+        }
+        // S10: under `following`, the same.
+        for (i, (author, uri)) in follow_chain.iter().enumerate() {
+            let level = i + 1;
+            w.expect(&format!("cap {cap}, following, level {level}"), DAVE, uri, level <= served).await;
+            w.expect(&format!("cap {cap}, following, level {level}, its author"), author, uri, true).await;
+        }
     }
+    w.set_cap(CAP).await;
     for uri in [&cycle_a, &cycle_b, &into_cycle] {
         w.expect("cycle", DAVE, uri, false).await;
     }
-    // S10: under `following`, served at level 8 and not at 9; once Alice
-    // unfollows the level-3 author, levels 3 to 9 are read by their authors
-    // only (the step at level 3 fails condition 2).
-    for (i, (author, uri)) in follow_chain.iter().enumerate() {
-        let level = i + 1;
-        w.expect(&format!("following, level {level}"), DAVE, uri, level <= 8).await;
-        w.expect(&format!("following, level {level}, its author"), author, uri, true).await;
-    }
+    // Once Alice unfollows the level-3 author, levels 3 to 9 are read by
+    // their authors only (the step at level 3 no longer stands).
     exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{ALICE}' AND subject_did = '{BOB}'")).await;
     for (i, (author, uri)) in follow_chain.iter().enumerate() {
         let level = i + 1;
         w.expect(&format!("following, level-3 author unfollowed, level {level}"), DAVE, uri, level < 3).await;
         w.expect(&format!("following, level-3 author unfollowed, level {level}, its author"), author, uri, true).await;
     }
+    // A-9 (S12): a reply left under the old audience when the root moves is
+    // read by the new audience while its writer stands under it (Bob
+    // follows Alice, `other` is `followers`).
     w.expect("A-9, before the move", DAVE, &left, true).await;
     let moved = w.f.post_record(ALICE, "3kroot222222", &other, None).await;
     w.f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3kroot222222", REV2, Some(moved)).await;
-    w.expect("A-9, left under the old audience", DAVE, &left, false).await;
+    w.expect("A-9, left under the old audience, its writer standing", DAVE, &left, true).await;
     w.expect("A-9, left under the old audience", BOB, &left, true).await;
     w.expect("A-9, the owner's own reply", DAVE, &own, true).await;
     w.finish().await;
@@ -1340,98 +1449,94 @@ async fn pair_two(test: &str, middle: Middle) {
     w.finish().await;
 }
 
-/// T-23 pair 1, in full (S8): another audience, the root rule. Alice's
-/// root T is readable by Dave. Carol's reply R, under Carol's own audience
-/// of Dave and Alice, has `reply.parent = M` and `reply.root = T`.
-/// - (a) M is Bob's reply to T under Bob's `list` audience, which excludes
-///   Dave (and Alice); (b) M does not exist. Every output of
-///   [`reader_outputs`], Alice's notifications for R included, is
-///   byte-identical between them under every mute state, and
-///   `threadMuted` follows the claimed root T in both.
+/// T-23 pair 1, re-cast for S12 (private-threads design §6, T-51): the root
+/// rule. Alice's root T is under her `followers` audience, which Dave reads.
+/// Carol's reply R names that audience, with `reply.parent = M` and
+/// `reply.root = T`; Carol follows Alice, so she stands.
+/// - (a) M is Bob's reply to T under Bob's own `list` audience: a reply in
+///   another account's thread under the replier's own audience, read by
+///   Bob alone, so it is a step no reader passes and R below it is Carol's
+///   alone; (b) M does not exist. Every output of [`reader_outputs`],
+///   Alice's notifications for R included, is byte-identical between them
+///   under every mute state.
 /// - A forged root: Carol's R' replies to T claiming `reply.root = X`, Bob's
-///   post. Bob gets the root notification; a mute of T misses R'; X's gate
-///   (`allow: []`, hiding Carol's reply K to R') sets `replyDisabled` and
-///   hides K in views anchored at R' for Dave, who reads X, and not for
-///   Alice, who does not, nor for Carol, K's author.
+///   post, under X's audience. Bob gets the root notification. R' and
+///   Carol's reply K to it never anchor (T does not agree on the root X), so
+///   they are Carol's alone: a mute of T misses R' for her, and X's gate
+///   (`allow: []`, hiding K) disables replies in views anchored at R' and
+///   never hides K from its author.
 #[tokio::test]
 async fn t23_pair_one_root_rule() {
     let Some(mut w) = Walk::new("t23-pair1", Layout::SamePds, Some("followers"), &[]).await else {
         return;
     };
-    let root = w.root.clone();
+    let (root, aud) = (w.root.clone(), w.aud.clone());
     for did in [BOB, CAROL] {
         exec(&w.f.pool, &follow_sql(DAVE, did)).await;
     }
-    let bob_aud = w.f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL]).await;
-    let carol_aud = w.f.audience(CAROL, "3kaudcarol22", Some("list"), &[DAVE, ALICE]).await;
+    let bob_aud = w.f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL, DAVE, ALICE]).await;
     // M replies to T and quotes it, so it would count in T's counts.
     let mut m_extra = quote_of(&root);
     m_extra["reply"] = json!({"root": {"uri": root, "cid": "bafyroot"}, "parent": {"uri": root, "cid": "bafyparent"}});
     let m = w.f.post_with(BOB, "3kmiddle2222", &bob_aud, m_extra).await;
-    let mut r_record = w.f.post_record(CAROL, "3kleaf222222", &carol_aud, Some((&root, &m))).await;
+    let mut r_record = w.f.post_record(CAROL, "3kleaf222222", &aud, Some((&root, &m))).await;
     r_record["facets"] = json!([mention(DAVE)]);
     w.f.ingest(CAROL, NSID_POST_PRIVATE, "3kleaf222222", r_record).await;
     let r = format!("at://{CAROL}/{NSID_POST_PRIVATE}/3kleaf222222");
     // The forged root: Bob's X, read by Dave and Carol, not Alice.
     let x_aud = w.f.audience(BOB, "3kaudbobx222", Some("list"), &[DAVE, CAROL]).await;
     let x = w.f.private_post(BOB, "3kxroot22222", &x_aud, None).await;
-    let r_forged = w.f.private_post(CAROL, "3kforgedroot", &carol_aud, Some((&x, &root))).await;
-    let k = w.f.private_post(CAROL, "3kforgedkid2", &carol_aud, Some((&x, &r_forged))).await;
+    let r_forged = w.f.private_post(CAROL, "3kforgedroot", &x_aud, Some((&x, &root))).await;
+    let k = w.f.private_post(CAROL, "3kforgedkid2", &x_aud, Some((&x, &r_forged))).await;
     w.f.ingest(BOB, THREADGATE, "3kxroot22222", json!({"$type": THREADGATE, "post": x, "allow": [], "hiddenReplies": [k]})).await;
     w.f.ready_all().await;
 
-    for reader in [CAROL, DAVE, ALICE] {
-        w.expect("(a) R", reader, &r, true).await;
+    w.expect("(a) R's author", CAROL, &r, true).await;
+    for reader in [DAVE, ALICE] {
+        w.expect("(a) R", reader, &r, false).await;
+        w.expect("(a) M, under Bob's own audience in Alice's thread", reader, &m, false).await;
     }
-    w.expect("(a) M", DAVE, &m, false).await;
-    w.expect("(a) M", ALICE, &m, false).await;
+    w.expect("(a) M's author", BOB, &m, true).await;
     let with_m = outputs_under_mutes(&w, &r, &m, true).await;
-    // Dave reads R: it is listed, and his mute of T reaches it through the
-    // claimed root.
     let unmuted = &with_m[0].1;
-    assert!(output(unmuted, "listNotifications").contains(&r), "{unmuted:?}");
-    assert!(output(&with_m[0].1, "Alice's notifications for R").contains(&r), "Alice reads R");
-    let muted_t = &with_m[1].1;
-    let posts: Value = serde_json::from_str(output(muted_t, "getPosts([R])")).expect("json");
-    if posts["posts"][0]["viewer"]["threadMuted"] != true {
-        w.failures.push(format!("(a): Dave's mute of T does not reach R: {posts}"));
+    if output(unmuted, "listNotifications").contains(&r) || output(unmuted, "Alice's notifications for R").contains(&r) {
+        w.failures.push(format!("(a): R is listed for Dave or Alice: {unmuted:?}"));
     }
     // (b): M does not exist.
     w.f.apply_op(BOB, Action::Delete, NSID_POST_PRIVATE, "3kmiddle2222", REV2, None).await;
-    w.expect("(b) R", DAVE, &r, true).await;
+    w.expect("(b) R's author", CAROL, &r, true).await;
+    w.expect("(b) R", DAVE, &r, false).await;
     let without_m = outputs_under_mutes(&w, &r, &m, true).await;
-    let posts: Value = serde_json::from_str(output(&without_m[1].1, "getPosts([R])")).expect("json");
-    if posts["posts"][0]["viewer"]["threadMuted"] != true {
-        w.failures.push(format!("(b): Dave's mute of T does not reach R: {posts}"));
-    }
     compare_fixtures(&mut w.failures, &with_m, &without_m);
 
     // The forged root. X's author is notified as the root's.
     let bobs = private_rows(&w.f.pool, BOB).await;
     assert!(bobs.contains(&notified("reply", CAROL, Some(&x), &r_forged, false)), "{bobs:?}");
+    for uri in [&r_forged, &k] {
+        w.expect("a forged root's reply, its author", CAROL, uri, true).await;
+        for reader in [DAVE, ALICE, BOB] {
+            w.expect("a forged root's reply: T does not agree on the root", reader, uri, false).await;
+        }
+    }
     // A mute of T misses R'.
-    let dave = crate::hydration::Viewer {
-        did: Some(DAVE.into()),
+    let carol = crate::hydration::Viewer {
+        did: Some(CAROL.into()),
         hydrate: true,
     };
-    w.f.app.hydrator.set_thread_mute(&dave, &root, true).await.expect("db").expect("muted");
-    let (_, p) = posts_of(&w.base, DAVE, &[&r_forged]).await;
+    w.f.app.hydrator.set_thread_mute(&carol, &root, true).await.expect("db").expect("muted");
+    let (_, p) = posts_of(&w.base, CAROL, &[&r_forged]).await;
     assert!(p[0]["viewer"].get("threadMuted").is_none(), "{}", p[0]);
-    w.f.app.hydrator.set_thread_mute(&dave, &root, false).await.expect("db").expect("unmuted");
-    // X's gate, in views anchored at R': for Dave, who reads X, K is
-    // hidden and replies are disabled; for Alice, who does not read X, and
-    // for Carol, K's author, K shows.
-    let (_, t) = thread_of(&w.base, DAVE, &format!("uri={r_forged}")).await;
-    assert_eq!(reply_uris(&t), Vec::<String>::new(), "{t}");
+    w.f.app.hydrator.set_thread_mute(&carol, &root, false).await.expect("db").expect("unmuted");
+    // X's gate, in views anchored at R': Carol reads X, so replies are
+    // disabled for her; K is hers, so it is not hidden from her.
+    let (_, t) = thread_of(&w.base, CAROL, &format!("uri={r_forged}")).await;
+    assert_eq!(reply_uris(&t), std::slice::from_ref(&k), "{t}");
     assert_eq!(t["post"]["viewer"]["replyDisabled"], true, "{t}");
-    let (body, _, _) = json_of(&w.base, GET_REPLIES, &format!("uri={r_forged}"), DAVE).await;
-    assert_eq!(body, r#"{"replies":[]}"#);
-    let (_, t) = thread_of(&w.base, ALICE, &format!("uri={r_forged}")).await;
-    assert_eq!(reply_uris(&t), std::slice::from_ref(&k));
-    assert!(t["post"]["viewer"].get("replyDisabled").is_none(), "{t}");
-    for reader in [ALICE, CAROL] {
-        let (_, v, _) = json_of(&w.base, GET_REPLIES, &format!("uri={r_forged}"), reader).await;
-        assert_eq!(v["replies"][0]["post"]["uri"], k.as_str(), "{reader}: {v}");
+    let (_, v, _) = json_of(&w.base, GET_REPLIES, &format!("uri={r_forged}"), CAROL).await;
+    assert_eq!(v["replies"][0]["post"]["uri"], k.as_str(), "{v}");
+    for reader in [DAVE, ALICE] {
+        let (body, _, _) = json_of(&w.base, GET_REPLIES, &format!("uri={r_forged}"), reader).await;
+        assert_eq!(body, r#"{"replies":[]}"#, "{reader}");
     }
     w.finish().await;
 }
@@ -1493,19 +1598,43 @@ async fn t34_list_blocks_with_the_owner() {
     w.finish().await;
 }
 
-/// T-37: the oracle's walk statement and the prefilter's walk term are each
-/// `anchored()`'s output for their arguments, with the literal cap 8.
+/// T-52 (one builder): fact 8 and every candidate shape are §3.2's one
+/// statement over their own `c`, with the cap inlined from config, so the
+/// oracle and the prefilter cannot drift apart.
 #[test]
-fn rule4_walk_texts_come_from_one_builder() {
-    assert_eq!(schema::RULE4_MAX_HOPS, 8);
-    let oracle = schema::walk_statement();
-    assert_eq!(oracle, format!("SELECT {}", schema::anchored("$1", "$2", "$3", "$4", "$5", "$6")));
-    let walk = schema::anchored("p.reply_parent_uri", "p.audience_uri", "a.owner_did", "a.mode", "a.members", "$1");
-    assert_eq!(schema::prefilter().matches(&walk).count(), 1, "the prefilter carries the builder's walk once");
-    for text in [&oracle, &walk] {
-        assert!(text.contains("w.hop < 8 "), "{text}");
-        assert_eq!(text.matches("w.hop <").count(), 1, "{text}");
+fn every_shape_is_one_walked_statement() {
+    let fact8 = schema::fact8_statement(CAP);
+    let shapes = [
+        ("fact 8", fact8.clone()),
+        ("prefilter_uris", schema::prefilter_uris_statement(CAP)),
+        ("getReplies page", schema::reply_page_statement(CAP)),
+        ("search", schema::search_statement(CAP)),
+        ("expansion", schema::reply_candidates_statement(CAP)),
+        ("author feed", schema::author_statement(false, CAP)),
+        ("author threads", schema::author_statement(true, CAP)),
+        ("timeline", schema::timeline_statement(CAP)),
+        ("getQuotes", schema::quote_statement(CAP)),
+        ("replyCount", schema::reply_counts_statement(CAP)),
+        ("quoteCount", schema::quote_counts_statement(CAP)),
+        ("getUnreadCount", schema::unread_statement(CAP)),
+    ];
+    // Fact 8 is the one-row case: its `c` is the post `$2`.
+    assert!(fact8.contains("WITH c AS MATERIALIZED (SELECT p.uri, p.author_did, p.audience_uri, p.reply_parent_uri, p.reply_root_uri FROM private_posts p WHERE p.uri = $2)"));
+    for (name, text) in &shapes {
+        for cte in ["WITH c AS MATERIALIZED (", "br AS MATERIALIZED (", "s1 AS MATERIALIZED (", "pv AS MATERIALIZED ("] {
+            assert_eq!(text.matches(cte).count(), 1, "{name}: {cte}");
+        }
+        // Both caps inline the configured value, and nothing else walks.
+        assert_eq!(text.matches(&format!("u.hop < {CAP} ")).count(), 2, "{name}");
+        assert_eq!(text.matches("u.hop <").count(), 2, "{name}");
+        // The walk reads only rows that pass stage 1, other than the
+        // reader's own.
+        assert!(text.contains("FROM s1 WHERE s1.s1ok AND s1.walks AND s1.author_did <> $1"), "{name}");
+        // No `:146` skip: nothing passes a post under its author's own
+        // audience without stage 1.
+        assert!(!text.contains("a.owner_did = p.author_did"), "{name}");
     }
+    assert!(schema::fact8_statement(100).contains("u.hop < 100 "));
 }
 
 /// Prints the pre-S0 count query (private-posting design §5) for skydeval
@@ -2637,28 +2766,38 @@ async fn gates_in(mode: PublicMode, test: &str) {
     let (_, p) = posts_of(&base, CAROL, &[&detached_quote]).await;
     assert_eq!(p[0]["embed"]["record"]["$type"], "app.bsky.embed.record#viewRecord");
 
-    // Review 1, LB3: Dave reads Carol's reply R, which claims Alice's root X
-    // that Dave cannot read. X's gate (`allow: []`, hiding R's child) never
-    // shows in Dave's answers: byte-identical before X is written, while it
-    // and its gate exist, and after X is deleted (its gate with it).
-    let list_aud = f.audience(ALICE, "3kaudlist222", Some("list"), &[BOB, CAROL]).await;
-    let carol_aud = f.audience(CAROL, "3kaudcarol22", Some("list"), &[DAVE, BOB]).await;
+    // Review 1, LB3, as S12 restates it (private-threads design §6): Carol's
+    // reply R claims Alice's root X and names X's audience; Bob's reply K to
+    // R names it too. (a) Before X is written and after it is deleted, Dave's
+    // answers for R are byte-identical to a nonexistent post's. (b) While X
+    // exists under an audience holding Dave and Carol, Dave reads R, and X's
+    // gate (`allow: []`, hiding K) applies under C-17. (c) While X exists
+    // without Dave, R is a miss again.
+    let list_aud = f.audience(ALICE, "3kaudlist222", Some("list"), &[BOB, CAROL, DAVE]).await;
     let x = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3klb3root222");
-    let r = f.private_post(CAROL, "3klb3reply22", &carol_aud, Some((&x, &x))).await;
-    let child = f.private_post(BOB, "3klb3child22", &carol_aud, Some((&x, &r))).await;
-    let dave_sees = || async {
-        let (posts, p) = posts_of(&base, DAVE, &[&r]).await;
-        assert_eq!(p[0]["viewer"], json!({"bookmarked": false}));
-        let (thread, t) = thread_of(&base, DAVE, &format!("uri={r}")).await;
-        assert_eq!(reply_uris(&t), std::slice::from_ref(&child));
-        assert!(t["post"]["viewer"].get("replyDisabled").is_none(), "{t}");
-        (posts, thread)
+    let r = f.private_post(CAROL, "3klb3reply22", &list_aud, Some((&x, &x))).await;
+    let child = f.private_post(BOB, "3klb3child22", &list_aud, Some((&x, &r))).await;
+    let nowhere = format!("at://{CAROL}/{NSID_POST_PRIVATE}/3knothere222");
+    let dave_answers = |uri: String| {
+        let base = base.clone();
+        async move {
+            let (posts, _) = posts_of(&base, DAVE, &[&uri]).await;
+            let (status, thread, _) = get(&base, THREAD, &format!("uri={uri}"), DAVE, DAVE_KEY).await;
+            let (replies, _, _) = json_of(&base, GET_REPLIES, &format!("uri={uri}"), DAVE).await;
+            (posts, status, thread, replies)
+        }
     };
-    let never_written = dave_sees().await;
+    let nothing = dave_answers(nowhere.clone()).await;
+    assert_eq!(dave_answers(r.clone()).await, nothing, "(a) before X is written");
     assert_eq!(f.private_post(ALICE, "3klb3root222", &list_aud, None).await, x);
     f.ingest(ALICE, THREADGATE, "3klb3root222", json!({"$type": THREADGATE, "post": x, "allow": [], "hiddenReplies": [child]}))
         .await;
-    assert_eq!(dave_sees().await, never_written);
+    // (b): Dave reads R, and X's gate applies: replies disabled, K hidden.
+    let (_, p) = posts_of(&base, DAVE, &[&r]).await;
+    assert_eq!(p.len(), 1, "(b) Dave reads R");
+    let (_, t) = thread_of(&base, DAVE, &format!("uri={r}")).await;
+    assert_eq!(reply_uris(&t), Vec::<String>::new(), "(b) K hidden from Dave: {t}");
+    assert_eq!(t["post"]["viewer"]["replyDisabled"], true, "{t}");
     // `allow: []`: disabled for others, not for the author.
     let (_, p) = posts_of(&base, BOB, &[&x]).await;
     assert_eq!(p[0]["viewer"]["replyDisabled"], true);
@@ -2671,9 +2810,14 @@ async fn gates_in(mode: PublicMode, test: &str) {
     assert_eq!(t["post"]["viewer"]["replyDisabled"], true);
     let (_, t) = thread_of(&base, BOB, &format!("uri={r}")).await;
     assert_eq!(reply_uris(&t), std::slice::from_ref(&child));
+    // (c): X's audience no longer holds Dave.
+    let without_dave = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [BOB, CAROL], "createdAt": "2026-09-26T00:00:00Z"});
+    f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, "3kaudlist222", REV2, Some(without_dave)).await;
+    assert_eq!(dave_answers(r.clone()).await, nothing, "(c) X without Dave");
+    // (a) again: X deleted, its gate with it.
     f.apply_op(ALICE, Action::Delete, NSID_POST_PRIVATE, "3klb3root222", REV2, None).await;
     assert!(!gate_rows(&f.pool, "private_threadgates").await.contains(&format!("at://{ALICE}/{THREADGATE}/3klb3root222")));
-    assert_eq!(dave_sees().await, never_written);
+    assert_eq!(dave_answers(r.clone()).await, nothing, "(a) after X is deleted");
 
     // A deleted post deletes its canonical gate; the ignored ones stay.
     f.apply_op(ALICE, Action::Delete, NSID_POST_PRIVATE, "3kroot222222", REV2, None).await;
@@ -2816,11 +2960,14 @@ async fn interactions_in(mode: PublicMode, test: &str) {
     let private_quote = f.post_with(BOB, "3kprivquote2", &aud_bob, quote_of(&t)).await;
     f.ingest(BOB, PUBLIC_POST, "3kpubquote22", public_quote(&t, "2026-09-27T00:00:00Z")).await;
     let bob_public = format!("at://{BOB}/{PUBLIC_POST}/3kpubquote22");
+    // S12 (private-threads design §2.2): Alice's own reply in her thread is
+    // read by the root's audience, whatever audience of hers it names.
+    f.private_post(ALICE, "3khiddenrep2", &aud_dave, Some((&t, &t))).await;
     f.ready_all().await;
     // The undecodable reply is stored and passes the prefilter, but no one
     // reads it, its author included.
     assert_eq!(posts_of(&base, BOB, &[&undecodable]).await.1.len(), 0, "the reply does not decode");
-    assert_eq!(schema::prefilter_uris(&f.pool, CAROL, std::slice::from_ref(&undecodable)).await.expect("prefilter").len(), 1);
+    assert_eq!(schema::prefilter_uris(&f.pool, CAROL, std::slice::from_ref(&undecodable), CAP).await.expect("prefilter").len(), 1);
 
     let carols_answers = || async {
         let mut out = Vec::new();
@@ -2837,7 +2984,6 @@ async fn interactions_in(mode: PublicMode, test: &str) {
     let before = carols_answers().await;
 
     // What Carol may not know of.
-    f.private_post(ALICE, "3khiddenrep2", &aud_dave, Some((&t, &t))).await;
     f.post_with(ALICE, "3khiddenquo2", &aud_dave, quote_of(&t)).await;
     let taken_down = f.private_post(BOB, "3ktakendown2", &aud, Some((&t, &t))).await;
     exec(&f.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{taken_down}', '!takedown')")).await;
@@ -2867,10 +3013,12 @@ async fn interactions_in(mode: PublicMode, test: &str) {
 
     // The counts, reader by reader: [reply, repost, like, quote].
     let (_, p) = posts_of(&base, CAROL, &[&t]).await;
-    assert_eq!(counts_of(&p[0]), [2, 2, 2, 2], "{}", p[0]);
-    // Bob: no block; he reads Dave's reply and his own reply-quote.
+    assert_eq!(counts_of(&p[0]), [3, 2, 2, 2], "{}", p[0]);
+    // Carol's three replies are Bob's, the undecodable one and Alice's own
+    // reply under her other audience. Bob: no block; he also reads Dave's
+    // reply and his own reply-quote.
     let (_, p) = posts_of(&base, BOB, &[&t]).await;
-    assert_eq!(counts_of(&p[0]), [3, 3, 3, 4], "{}", p[0]);
+    assert_eq!(counts_of(&p[0]), [4, 3, 3, 4], "{}", p[0]);
     // Alice reads her own hidden reply and quote. She is not listed in her
     // own `list` audience, so others' replies under it are not hers to read
     // and not counted, as `getPostThread` would not show them; nor are
@@ -2895,7 +3043,7 @@ async fn interactions_in(mode: PublicMode, test: &str) {
     f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3ktpost22222", REV2, Some(record)).await;
     let (_, p) = posts_of(&base, CAROL, &[&t]).await;
     assert_ne!(p[0]["cid"], "bafy3ktpost22222", "the CID changed");
-    assert_eq!(counts_of(&p[0]), [2, 2, 2, 2]);
+    assert_eq!(counts_of(&p[0]), [3, 2, 2, 2]);
     assert_eq!(p[0]["viewer"], json!({"bookmarked": false, "like": carol_like, "repost": carol_repost}));
 
     // T-17 (the read half): a private root mutes as a public one does,
@@ -3874,7 +4022,7 @@ fn replies_uris(page: &Value) -> Vec<String> {
 }
 
 /// T-19 (P-17), in On and in Off (T-1).
-/// - An author with `limit × 8 + 1` posts that do not decode before three
+/// - An author with `limit × 2 + 1` posts that do not decode before three
 ///   readable ones: on the author feed and on the timeline, the first page
 ///   is empty and carries a cursor, and paging reaches every readable post
 ///   once, in order. Exhausted candidates: no cursor. Every cursor is 720
@@ -3897,7 +4045,7 @@ async fn sealed_paging_in(mode: PublicMode, test: &str) {
         readable.push(f.private_post(ALICE, &format!("3kread0000{i}2"), &aud, None).await);
     }
     readable.reverse();
-    for i in 0..9 {
+    for i in 0..3 {
         f.undecodable(ALICE, &format!("3kundec000{i}2"), &aud, None).await;
     }
     exec(&f.pool, &follow_sql(BOB, ALICE)).await;
@@ -3984,11 +4132,14 @@ async fn author_filter_in(mode: PublicMode, test: &str) {
     let p2 = f.private_post(BOB, "3kbtop000022", &bob_aud, None).await;
     let q1 = f.private_post(BOB, "3kbown000012", &bob_aud, Some((&p1, &p1))).await;
     let q2 = f.private_post(BOB, "3kbown000022", &bob_aud, Some((&p1, &q1))).await;
+    // Bob's replies in Alice's thread name her audience (S12, private-threads
+    // design §2.2); the one under his own audience is his alone, so absent.
     let mut others = Vec::new();
     for i in 0..9 {
-        others.push(f.private_post(BOB, &format!("3kzother000{i}"), &bob_aud, Some((&t, &t))).await);
+        others.push(f.private_post(BOB, &format!("3kzother000{i}"), &alice_aud, Some((&t, &t))).await);
     }
     others.reverse();
+    f.private_post(BOB, "3kzzownaud22", &bob_aud, Some((&t, &t))).await;
     f.ingest(BOB, REPOST, "3krepostt222", subject_record(REPOST, &t, "2026-09-25T00:00:00Z")).await;
     f.ready_all().await;
     let base = serve(f.state(Some(Duration::from_secs(1)))).await;
@@ -4034,7 +4185,7 @@ async fn author_feed_filter_off() {
 /// T-21 (P-6/P-14, D-8) and T-10's `getReplies` case, in On and in Off
 /// (T-1).
 /// - A public post, never stored here: its readable private replies,
-///   oldest first, paged; `limit × 8 + 1` undecodable ones first give an
+///   oldest first, paged; `limit × 2 + 1` undecodable ones first give an
 ///   empty first page with a cursor; one Carol cannot read never shows.
 ///   The cursor is bound to its `uri`.
 /// - A private post Carol cannot read: `{replies: []}`, floored, the bytes
@@ -4052,7 +4203,7 @@ async fn replies_in(mode: PublicMode, test: &str) {
     let carol_aud = f.audience(CAROL, "3kaudcarol22", Some("list"), &[BOB]).await;
     let dave_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[]).await;
     let public = format!("at://{ALICE}/{PUBLIC_POST}/3kpublic2222");
-    for i in 0..9 {
+    for i in 0..3 {
         f.undecodable(BOB, &format!("3kaundec000{i}"), &bob_aud, Some((&public, &public))).await;
     }
     let mut readable = Vec::new();

@@ -205,6 +205,11 @@ fn record(c: &Consumer) -> std::sync::MutexGuard<'_, Record> {
     c.test.record.lock().expect("record")
 }
 
+/// Commits a run makes outside the op paths: fixture setup, seeding and
+/// teardown. Measured at 33 in both builds (C0: 300 033 commits for 300 000
+/// entries), rounded up to 40.
+const SETUP_XACTS: i64 = 40;
+
 #[tokio::test]
 #[ignore = "M1: the relative bench; set HPRS_BENCH_CORPUS and run alone"]
 async fn throughput_corpus() {
@@ -230,7 +235,7 @@ async fn throughput_corpus() {
                 r.xact,
             );
         }
-        let bound = i64::try_from(c1.by_path[1] + c1.by_path[2]).expect("count") + 10;
+        let bound = i64::try_from(c1.by_path[1] + c1.by_path[2]).expect("count") + SETUP_XACTS;
         println!("M1 {label}: C1/C0 = {:.2}; xact_commit bound for C1 {bound}", c1.capacity / c0.capacity);
         if mode == PublicMode::Off {
             gate = Some((c0, c1, bound));

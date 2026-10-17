@@ -29,7 +29,9 @@ pub use sections::{
     StarterPacksConfig, SyncConfig, ThreadConfig, ThreadMutesConfig, ThreadV2Config, UtcTimeOfDay, VideoConfig,
     VideoPlayback,
 };
-pub use validate::{OTHER_RELAY_LABEL, pds_pattern};
+#[cfg(feature = "bench-heads")]
+pub use sections::BenchConfig;
+pub use validate::{MAX_HEAD_AGE_SECS, OTHER_RELAY_LABEL, pds_pattern};
 
 /// Configuration failures. Every variant aborts startup.
 #[derive(Debug, thiserror::Error)]

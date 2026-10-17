@@ -60,12 +60,19 @@ pub const SEARCH_POSTS: &str = "app.nearhorizon.private.searchPosts";
 const POSTS_WITH_REPLIES: &str = "posts_with_replies";
 const POSTS_AND_AUTHOR_THREADS: &str = "posts_and_author_threads";
 
-/// Metric: handler time before the floor.
-const METRIC_UNFLOORED: &str = "private_read_unfloored_seconds";
+/// Metric: handler time before the floor, a histogram (private-threads
+/// design §4: B-5 reads its p99).
+pub const METRIC_UNFLOORED: &str = "private_read_unfloored_seconds";
+
+/// [`METRIC_UNFLOORED`]'s buckets: 20, logarithmic, from 5 ms to 5 s.
+#[must_use]
+pub fn unfloored_buckets() -> Vec<f64> {
+    (0..20).map(|i| 0.005 * 1000f64.powf(f64::from(i) / 19.0)).collect()
+}
 /// A thread holds at most this many nodes (anchor, parents, replies).
 pub(super) const THREAD_NODE_CAP: usize = 200;
 /// Replies per thread node.
-pub(super) const REPLIES_PER_NODE: i64 = 50;
+pub(super) const REPLIES_PER_NODE: usize = 50;
 
 /// The endpoint floors (`private_read.floor_ms.*`).
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +126,10 @@ pub struct PrivateState {
     pub(super) cursor_key: CursorKey,
     /// `[private_search]` (§4.17).
     pub(super) search: SearchBounds,
+    /// `private_read.page_reads_factor` (private-threads design §3.3).
+    pub(super) reads_factor: usize,
+    /// The walk's cap and the batch bound (`[private_read]`, §3.2.1).
+    pub(super) bounds: schema::ReadBounds,
 }
 
 impl PrivateState {
@@ -145,6 +156,7 @@ impl PrivateState {
                 watermarks,
                 freshness_bound,
                 max_head_fetches,
+                max_chain: cfg.max_chain,
                 video,
             },
             floors: Floors {
@@ -165,6 +177,11 @@ impl PrivateState {
             bookmarks_max,
             cursor_key,
             search: SearchBounds::from(&PrivateSearchConfig::default()),
+            reads_factor: usize::try_from(cfg.page_reads_factor).unwrap_or(2).max(1),
+            bounds: schema::ReadBounds {
+                max_chain: cfg.max_chain,
+                batch_max: i64::from(cfg.walk_batch_max.max(1)),
+            },
         }
     }
 
@@ -331,7 +348,7 @@ async fn counts(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&mut Pri
     if uris.is_empty() {
         return Ok(());
     }
-    let counts = schema::counts(&s.env.pool, &caller.did, &uris).await?;
+    let counts = schema::counts(&s.env.pool, &caller.did, &uris, s.env.max_chain).await?;
     for post in posts.iter_mut() {
         let c = view_uri(post).and_then(|u| counts.get(&u).copied()).unwrap_or_default();
         for (key, n) in COUNT_KEYS.into_iter().zip([c.reply, c.repost, c.like, c.quote]) {
@@ -515,11 +532,13 @@ async fn gate_state(
 /// (§4.4), then the record part of each `embed`. `roots_read` are the roots
 /// a thread handler read for the caller beyond the hits.
 ///
-/// - A quoted private post is read through the pipeline for the same reader
-///   and the same `RequestState`, all of the page's at once: readable gives
-///   `#viewRecord`, with its counts; anything else, a block with its author
-///   included, gives
-///   `#viewNotFound`, the answer for a URI that names nothing.
+/// - A quoted private post passes the prefilter first, once for the page
+///   (private-threads design §3.4), so an unreadable one costs no read and
+///   no head budget. The rest are read through the pipeline for the same
+///   reader and the same `RequestState`, all of the page's at once:
+///   readable gives `#viewRecord`, with its counts; anything else, a block
+///   with its author included, gives `#viewNotFound`, the answer for a URI
+///   that names nothing.
 /// - A quoted public post comes from local rows, in On mode only. With
 ///   nothing there the view carries no `embed`, for `record` and
 ///   `recordWithMedia` alike, and the client builds the quote from
@@ -560,6 +579,8 @@ async fn decorate(
     let mut records: HashMap<String, Value> = HashMap::new();
     // By readable quoted post: the quoting URIs its postgate detaches.
     let mut detached: HashMap<String, Vec<String>> = HashMap::new();
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &private, s.env.max_chain).await?.into_iter().collect();
+    private.retain(|u| passing.contains(u));
     if !private.is_empty() {
         let quoted_authors = profiles(hydration, &private).await?;
         let mut hits: Vec<PrivateEmit<Value>> =
@@ -658,7 +679,7 @@ async fn posts_body(
             wanted.push(u.clone());
         }
     }
-    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
     let candidates: Vec<String> = wanted.into_iter().filter(|u| passing.contains(u)).collect();
     let hydration = private_hydration(s, caller, ip).await?;
     let authors = profiles(&hydration, &candidates).await?;
@@ -708,6 +729,51 @@ fn view_parent(post: &PrivateEmit<Value>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A row a head round covers (private-threads design §3.4): its URI, its
+/// author and its audience's owner, as the pipeline's head stage names
+/// them.
+struct Covered {
+    uri: String,
+    author: String,
+    audience_owner: Option<String>,
+}
+
+impl Covered {
+    /// The stored row's head DIDs, from its non-content facts; `None` when
+    /// no row is stored.
+    async fn of(s: &PrivateState, uri: &str) -> Result<Option<Self>, XrpcError> {
+        Ok(schema::post_facts(&s.env.pool, uri).await?.map(|f| Self {
+            uri: uri.to_string(),
+            audience_owner: f.audience_uri.as_deref().and_then(uri_author).map(str::to_string),
+            author: f.owner,
+        }))
+    }
+
+    /// The DIDs the pipeline's head stage checks for this row and `caller`,
+    /// in its order: the author, the reader, the audience's owner when it
+    /// differs from the author.
+    fn head_dids(&self, caller: &VerifiedCaller) -> Vec<String> {
+        let mut dids = vec![self.author.clone(), caller.did.clone()];
+        if let Some(a) = self.audience_owner.as_ref().filter(|a| **a != self.author) {
+            dids.push(a.clone());
+        }
+        dids
+    }
+
+    /// Whether the pipeline is ready for this row (step 3's readiness).
+    async fn ready(&self, s: &PrivateState) -> Result<bool, XrpcError> {
+        Ok(pipeline::ready(&s.env, &self.author, self.audience_owner.as_deref()).await?)
+    }
+}
+
+/// One head round over `rows`, the anchor first (§3.4 step 4): each row's
+/// head DIDs in the pipeline's order, repeats dropped at their first
+/// position. Returns the DIDs whose check failed on the database.
+async fn head_round(s: &PrivateState, rs: &RequestState, caller: &VerifiedCaller, rows: &[Covered]) -> HashSet<String> {
+    let dids: Vec<String> = rows.iter().flat_map(|r| r.head_dids(caller)).collect();
+    pipeline::prefetch_heads(&s.env, rs, &dids, s.concurrency).await.db_failed
+}
+
 async fn thread_body(
     s: &PrivateState,
     caller: &VerifiedCaller,
@@ -719,9 +785,133 @@ async fn thread_body(
 ) -> Result<Option<PrivateResponse>, XrpcError> {
     let rs = RequestState::new(s.env.max_head_fetches);
     let hydration = private_hydration(s, caller, ip).await?;
+    let pool = &s.env.pool;
+    // 1. The structural chain: the anchor's row and its ancestors, with no
+    // reader. Its rows are not exposed.
+    let rows = schema::ancestors(pool, uri, parent_height).await?;
+    let claimed = match rows.first() {
+        Some((_, _, Some(root), _)) => root.clone(),
+        _ => uri.to_string(),
+    };
+    // 2. One prefilter over the anchor, the ancestors and a private
+    // claimed root.
+    let mut wanted: Vec<String> = rows.iter().map(|(u, ..)| u.clone()).collect();
+    if is_private_uri(&claimed) && !wanted.contains(&claimed) {
+        wanted.push(claimed.clone());
+    }
+    let passing: HashSet<String> = schema::prefilter_uris(pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
+    #[cfg(test)]
+    crate::test_support::hooks::pause(crate::test_support::hooks::THREAD_AFTER_STRUCTURE, uri).await;
+    // 3. The watermark, then readiness. An anchor that fails the
+    // prefilter, a stale watermark or an anchor that is not ready takes
+    // HEAD's sequential path, with no round.
+    let anchor_row = match rows.first() {
+        Some((u, ..)) if passing.contains(u) && s.env.watermark_fresh() => Covered::of(s, u).await?,
+        _ => None,
+    };
+    let Some(anchor_row) = anchor_row else {
+        return thread_sequential(s, &rs, caller, &hydration, uri, depth, parent_height, start).await;
+    };
+    if !anchor_row.ready(s).await? {
+        return thread_sequential(s, &rs, caller, &hydration, uri, depth, parent_height, start).await;
+    }
+    // The prefix: the longest run of ancestors, nearest first, that pass
+    // the prefilter and are ready.
+    let mut covered = vec![anchor_row];
+    for (u, ..) in rows.iter().skip(1) {
+        if !passing.contains(u) {
+            break;
+        }
+        let Some(row) = Covered::of(s, u).await? else { break };
+        if !row.ready(s).await? {
+            break;
+        }
+        covered.push(row);
+    }
+    // 4. One head round, in HEAD's charge order. The claimed root is not in
+    // it.
+    let db_failed = head_round(s, &rs, caller, &covered).await;
+    // 5. The reads, in order, stopping at the first miss of any kind.
+    let touches_failed = |row: &Covered| row.head_dids(caller).iter().any(|d| db_failed.contains(d));
+    let uris: Vec<String> = covered.iter().map(|r| r.uri.clone()).collect();
+    let authors = profiles(&hydration, &uris).await?;
+    if touches_failed(&covered[0]) {
+        // HEAD's `Miss::Db` at the anchor: its not-found.
+        pipeline::count_db_miss();
+        return Ok(None);
+    }
+    let Ok(anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
+        return Ok(None);
+    };
+    let mut budget = THREAD_NODE_CAP - 1;
+    let mut chain: Vec<PrivateEmit<Value>> = Vec::new();
+    let mut next = view_parent(&anchor);
+    for row in covered.iter().skip(1) {
+        if chain.len() >= parent_height as usize || budget == 0 || next.as_deref() != Some(row.uri.as_str()) {
+            break;
+        }
+        if touches_failed(row) {
+            pipeline::count_db_miss();
+            break;
+        }
+        let Ok(p) = pipeline::read(&s.env, &rs, caller, &row.uri, &authors, start).await else {
+            break;
+        };
+        budget -= 1;
+        next = view_parent(&p);
+        chain.push(p);
+    }
+    #[cfg(test)]
+    tests::record_chain_state(uri, &rs).await;
+    // The public top (review 15, m2): the last structural row's public
+    // parent, when every private ancestor was read and fewer than
+    // `parentHeight` of them were, as HEAD's loop tests before it looks at
+    // the next parent.
+    let mut public_top = None;
+    let all_read = chain.len() + 1 == rows.len();
+    if let Some(parent) = next.filter(|p| !is_private_uri(p))
+        && all_read
+        && rows.last().and_then(|(_, p, ..)| p.as_deref()) == Some(parent.as_str())
+        && chain.len() < parent_height as usize
+        && budget > 0
+        && let Some(post) = hydration.public_post(&parent).await?
+    {
+        budget -= 1;
+        public_top = Some(post);
+    }
+    // 6. The claimed root, read after the chain only if the prefilter
+    // passed it. An unreadable root is not read.
+    let chain_has_root = chain.iter().any(|p| view_uri(p).as_deref() == Some(claimed.as_str()));
+    let root_read = if claimed == uri || chain_has_root {
+        true
+    } else if is_private_uri(&claimed) && passing.contains(&claimed) {
+        let authors = profiles(&hydration, std::slice::from_ref(&claimed)).await?;
+        pipeline::read(&s.env, &rs, caller, &claimed, &authors, start).await.is_ok()
+    } else {
+        false
+    };
+    thread_tail(s, &rs, caller, &hydration, uri, anchor, chain, public_top, (claimed, root_read), depth, budget, start).await
+}
+
+/// `getPostThread` as HEAD reads it (private-threads design §3.4 step 2):
+/// the anchor through the pipeline with its sequential heads, then each
+/// parent one at a time, then the claimed root, with no round. Taken when
+/// the anchor fails the prefilter, the watermark is stale or the anchor is
+/// not ready, so the bytes and the budget of a miss are HEAD's.
+#[allow(clippy::too_many_arguments)]
+async fn thread_sequential(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    uri: &str,
+    depth: u32,
+    parent_height: u32,
+    start: Instant,
+) -> Result<Option<PrivateResponse>, XrpcError> {
     let anchor_uri = vec![uri.to_string()];
-    let authors = profiles(&hydration, &anchor_uri).await?;
-    let Ok(mut anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
+    let authors = profiles(hydration, &anchor_uri).await?;
+    let Ok(anchor) = pipeline::read(&s.env, rs, caller, uri, &authors, start).await else {
         return Ok(None);
     };
     let mut budget = THREAD_NODE_CAP - 1;
@@ -735,8 +925,8 @@ async fn thread_body(
             break;
         }
         if is_private_uri(&parent) {
-            let authors = profiles(&hydration, std::slice::from_ref(&parent)).await?;
-            let Ok(p) = pipeline::read(&s.env, &rs, caller, &parent, &authors, start).await else {
+            let authors = profiles(hydration, std::slice::from_ref(&parent)).await?;
+            let Ok(p) = pipeline::read(&s.env, rs, caller, &parent, &authors, start).await else {
                 break;
             };
             budget -= 1;
@@ -760,24 +950,46 @@ async fn thread_body(
     let root_read = if root == uri || chain_has_root {
         true
     } else if is_private_uri(&root) {
-        let authors = profiles(&hydration, std::slice::from_ref(&root)).await?;
-        pipeline::read(&s.env, &rs, caller, &root, &authors, start).await.is_ok()
+        let authors = profiles(hydration, std::slice::from_ref(&root)).await?;
+        pipeline::read(&s.env, rs, caller, &root, &authors, start).await.is_ok()
     } else {
         false
     };
+    thread_tail(s, rs, caller, hydration, uri, anchor, chain, public_top, (root, root_read), depth, budget, start).await
+}
+
+/// The rest of `getPostThread` once the anchor, the parents and the root
+/// are read: the root's hidden replies, the expansion, the decoration and
+/// the nesting. `root` is the claimed root and whether it was read.
+#[allow(clippy::too_many_arguments)]
+async fn thread_tail(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    uri: &str,
+    mut anchor: PrivateEmit<Value>,
+    mut chain: Vec<PrivateEmit<Value>>,
+    public_top: Option<crate::hydration::PublicEmit<Value>>,
+    (root, root_read): (String, bool),
+    depth: u32,
+    mut budget: usize,
+    start: Instant,
+) -> Result<Option<PrivateResponse>, XrpcError> {
+    let chain_has_root = chain.iter().any(|p| view_uri(p).as_deref() == Some(root.as_str()));
     let roots_read: Vec<String> = if root_read && root != uri && !chain_has_root { vec![root.clone()] } else { Vec::new() };
     // The replies the read root's private threadgate hides, except from
     // their own author, left out before they are read (`thread.rs:207-208`).
     let hidden = if root_read { hidden_replies(s, caller, &root).await? } else { HashSet::new() };
 
-    let (mut replies, expanded) = expand(s, &rs, caller, &hydration, anchor_uri, depth, &mut budget, &hidden, start).await?;
+    let (mut replies, expanded) = expand(s, rs, caller, hydration, vec![uri.to_string()], depth, &mut budget, &hidden, start).await?;
 
     // Every node is read; decorate them all at once.
     let mut refs: Vec<&mut PrivateEmit<Value>> = std::iter::once(&mut anchor)
         .chain(chain.iter_mut())
         .chain(replies.values_mut().flatten())
         .collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, &roots_read, start).await?;
+    decorate(s, rs, caller, hydration, &mut refs, &roots_read, start).await?;
 
     let mut root = build(anchor, uri, &mut replies, &expanded);
     // Nest the parent chain above the anchor, nearest first.
@@ -836,7 +1048,8 @@ async fn expand(
                 break;
             }
             expanded.insert(parent.clone());
-            for c in schema::reply_candidates(&s.env.pool, &caller.did, parent, REPLIES_PER_NODE).await? {
+            let candidates = schema::reply_candidates(&s.env.pool, &caller.did, parent, REPLIES_PER_NODE, s.bounds).await?;
+            for c in candidates {
                 if batch.len() >= *budget {
                     break;
                 }
@@ -969,19 +1182,16 @@ enum FeedOf<'a> {
     Author { actor: &'a str, own_threads: bool },
 }
 
-/// Windows of candidates one feed request may read.
-const FEED_WINDOWS: usize = 2;
-/// A second window is begun only this soon after the handler started.
-const SECOND_WINDOW_BY: Duration = Duration::from_millis(600);
-
 /// One page of a feed: `actor`'s posts, or with no actor the caller's
 /// home timeline, each with its repost items (§4.7). The candidates only
 /// narrow the work; `pipeline::read` decides each post.
 ///
-/// A window is `limit × 4` candidates. If it ends short of `limit` and
-/// candidates remain, one more is read, from after the last row the first
-/// examined, so that a run of posts nobody can read (content that does
-/// not decode, say) does not end the feed.
+/// The read cap (private-threads design §3.3): a page reads at most
+/// `page_reads_factor × limit` candidates through the pipeline, the first
+/// rows that pass the prefilter, in batches (§3.2.1), plus one row of
+/// lookahead that tells whether more remain. When the reads run out before
+/// the page is full, the page ends there with a cursor. No outcome depends
+/// on elapsed time.
 ///
 /// The cursor is sealed (private posting §3.6, P-17), bound to `aad`, and
 /// holds the last **examined** candidate's position. It is present
@@ -1005,61 +1215,57 @@ async fn feed_body(
     aad: &str,
     start: Instant,
 ) -> Result<PrivateResponse, XrpcError> {
-    let max_binds = limit * 4;
+    let max_reads = limit * s.reads_factor;
     // One lookahead row tells whether prefiltered candidates remain.
-    let wanted = i64::try_from(max_binds + 1).unwrap_or(i64::MAX);
+    let need = max_reads + 1;
     let hydration = private_hydration(s, caller, ip).await?;
-    // One state for the whole request: the head-fetch budget is per
-    // request, not per window.
     let rs = RequestState::new(s.env.max_head_fetches);
+    let (pool, me, bounds) = (&s.env.pool, caller.did.as_str(), s.bounds);
+    let first = i64::try_from(need).unwrap_or(i64::MAX);
+    let key = |c: &schema::FeedCandidate| (c.created_at, c.key.clone());
+    let mut candidates = match of {
+        FeedOf::Author { actor, own_threads } => {
+            schema::passing(need, first, bounds.batch_max, after, key, move |after, n| {
+                schema::author_batch(pool, me, actor, own_threads, after, n, bounds.max_chain)
+            })
+            .await?
+        }
+        FeedOf::Timeline => {
+            schema::passing(need, first, bounds.batch_max, after, key, move |after, n| {
+                schema::timeline_batch(pool, me, after, n, bounds.max_chain)
+            })
+            .await?
+        }
+    };
+    let beyond = candidates.len() > max_reads;
+    candidates.truncate(max_reads);
 
     let mut feed: Vec<PrivateEmit<Value>> = Vec::new();
     // By feed item: the repost it stands for, `(uri, reposter, time)`.
     let mut reposts: Vec<Option<(String, String, DateTime<Utc>)>> = Vec::new();
     // The last examined candidate's position.
     let mut last: Option<(DateTime<Utc>, String)> = None;
-    let mut more = false;
-    let mut after = after;
-    for window in 0..FEED_WINDOWS {
-        let mut candidates = match of {
-            FeedOf::Author { actor, own_threads } => {
-                schema::author_candidates(&s.env.pool, &caller.did, actor, own_threads, after.clone(), wanted).await?
-            }
-            FeedOf::Timeline => schema::timeline_candidates(&s.env.pool, &caller.did, after.clone(), wanted).await?,
-        };
-        let beyond = candidates.len() > max_binds;
-        candidates.truncate(max_binds);
-        let uris: Vec<String> = candidates.iter().map(|c| c.uri.clone()).collect();
-        let authors = profiles(&hydration, &uris).await?;
-        let mut full_at: Option<usize> = None;
-        let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
-        let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
-        while let Some((i, hit)) = reads.next().await {
-            let c = &candidates[i];
-            last = Some((c.created_at, c.key.clone()));
-            if let Ok(post) = hit {
-                feed.push(post);
-                reposts.push(c.repost_uri.clone().zip(c.reposter.clone()).map(|(u, by)| (u, by, c.created_at)));
-                if feed.len() == limit {
-                    full_at = Some(i);
-                    break;
-                }
+    let uris: Vec<String> = candidates.iter().map(|c| c.uri.clone()).collect();
+    let authors = profiles(&hydration, &uris).await?;
+    let mut full_at: Option<usize> = None;
+    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+    let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
+    while let Some((i, hit)) = reads.next().await {
+        let c = &candidates[i];
+        last = Some((c.created_at, c.key.clone()));
+        if let Ok(post) = hit {
+            feed.push(post);
+            reposts.push(c.repost_uri.clone().zip(c.reposter.clone()).map(|(u, by)| (u, by, c.created_at)));
+            if feed.len() == limit {
+                full_at = Some(i);
+                break;
             }
         }
-        drop(reads);
-        if let Some(i) = full_at {
-            more = i + 1 < candidates.len() || beyond;
-            break;
-        }
-        // The window ended short. What it held is examined; candidates
-        // remain only behind the lookahead row.
-        more = beyond;
-        let Some(tail) = candidates.last() else { break };
-        if !beyond || window + 1 == FEED_WINDOWS || start.elapsed() >= SECOND_WINDOW_BY {
-            break;
-        }
-        after = Some((tail.created_at, tail.key.clone()));
     }
+    drop(reads);
+    // A short page examined every candidate it read; candidates remain
+    // only behind the lookahead row.
+    let more = full_at.map_or(beyond, |i| i + 1 < candidates.len() || beyond);
     let cursor = last.filter(|_| more).and_then(|(at, key)| sealed::seal(&s.cursor_key, aad, at, &key));
     let mut refs: Vec<&mut PrivateEmit<Value>> = feed.iter_mut().collect();
     decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
@@ -1191,7 +1397,7 @@ async fn bookmarks_body(
         .flatten();
     // SQL narrows; the pipeline decides each post (§2 rule 1).
     let uris: Vec<String> = rows.iter().map(|(uri, ..)| uri.clone()).collect();
-    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &uris).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &uris, s.env.max_chain).await?.into_iter().collect();
     let candidates: Vec<String> = uris.into_iter().filter(|u| passing.contains(u)).collect();
     let hydration = private_hydration(s, caller, ip).await?;
     let authors = profiles(&hydration, &candidates).await?;
@@ -1346,7 +1552,7 @@ async fn interactions_body(
 ///   fetch their bodies from a private handler, and the client hydrates
 ///   them through its public AppView.
 ///
-/// Windows and the lookahead as [`feed_body`]. The cursor is sealed (§3.6),
+/// The read cap and the lookahead as [`feed_body`]. The cursor is sealed (§3.6),
 /// bound to the method, the caller and `uri`, and holds the last examined
 /// candidate's position: it is present whenever candidates remain, so a
 /// short or empty page can carry one. Floored (`get_quotes`).
@@ -1385,52 +1591,47 @@ async fn quotes_body(
     if !anchor_readable(s, &rs, caller, &hydration, uri, start).await? {
         return Ok(PrivateResponse::quotes(uri.to_string(), Vec::new(), None));
     }
-    let max_binds = limit * 4;
-    let wanted = i64::try_from(max_binds + 1).unwrap_or(i64::MAX);
+    // The read cap (private-threads design §3.3), with one row of
+    // lookahead.
+    let max_reads = limit * s.reads_factor;
+    let need = max_reads + 1;
+    let (pool, me, bounds) = (&s.env.pool, caller.did.as_str(), s.bounds);
+    let first = i64::try_from(need).unwrap_or(i64::MAX);
+    let key = |c: &schema::QuoteCandidate| (c.created_at, c.uri.clone());
+    let mut candidates = schema::passing(need, first, bounds.batch_max, after, key, move |after, n| {
+        schema::quote_batch(pool, me, uri, after, n, bounds.max_chain)
+    })
+    .await?;
+    let beyond = candidates.len() > max_reads;
+    candidates.truncate(max_reads);
     let mut items: Vec<QuoteItem> = Vec::new();
     // The last examined candidate's position.
     let mut last: Option<(DateTime<Utc>, String)> = None;
-    let mut more = false;
-    let mut after = after;
-    for window in 0..FEED_WINDOWS {
-        let mut candidates = schema::quote_candidates(&s.env.pool, &caller.did, uri, after.clone(), wanted).await?;
-        let beyond = candidates.len() > max_binds;
-        candidates.truncate(max_binds);
-        let private: Vec<String> = candidates.iter().filter(|c| c.cid.is_none()).map(|c| c.uri.clone()).collect();
-        let authors = profiles(&hydration, &private).await?;
-        let reads: Vec<_> = private.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
-        let mut reads = futures::stream::iter(reads).buffered(s.concurrency);
-        let mut full_at: Option<usize> = None;
-        for (i, c) in candidates.iter().enumerate() {
-            last = Some((c.created_at, c.uri.clone()));
-            match &c.cid {
-                Some(cid) => items.push(QuoteItem::Public {
-                    uri: c.uri.clone(),
-                    cid: cid.clone(),
-                }),
-                None => {
-                    if let Some(Ok(post)) = reads.next().await {
-                        items.push(QuoteItem::Private(post));
-                    }
+    let private: Vec<String> = candidates.iter().filter(|c| c.cid.is_none()).map(|c| c.uri.clone()).collect();
+    let authors = profiles(&hydration, &private).await?;
+    let reads: Vec<_> = private.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+    let mut reads = futures::stream::iter(reads).buffered(s.concurrency);
+    let mut full_at: Option<usize> = None;
+    for (i, c) in candidates.iter().enumerate() {
+        last = Some((c.created_at, c.uri.clone()));
+        match &c.cid {
+            Some(cid) => items.push(QuoteItem::Public {
+                uri: c.uri.clone(),
+                cid: cid.clone(),
+            }),
+            None => {
+                if let Some(Ok(post)) = reads.next().await {
+                    items.push(QuoteItem::Private(post));
                 }
             }
-            if items.len() == limit {
-                full_at = Some(i);
-                break;
-            }
         }
-        drop(reads);
-        if let Some(i) = full_at {
-            more = i + 1 < candidates.len() || beyond;
+        if items.len() == limit {
+            full_at = Some(i);
             break;
         }
-        more = beyond;
-        let Some(tail) = candidates.last() else { break };
-        if !beyond || window + 1 == FEED_WINDOWS || start.elapsed() >= SECOND_WINDOW_BY {
-            break;
-        }
-        after = Some((tail.created_at, tail.uri.clone()));
     }
+    drop(reads);
+    let more = full_at.map_or(beyond, |i| i + 1 < candidates.len() || beyond);
     let cursor = last.filter(|_| more).and_then(|(at, key)| sealed::seal(&s.cursor_key, aad, at, &key));
     let mut refs: Vec<&mut PrivateEmit<Value>> = items
         .iter_mut()
@@ -1450,13 +1651,14 @@ async fn quotes_body(
 /// - A private `uri` is read for the caller first. A miss, whatever its
 ///   reason, gives `{replies: []}`, the answer for a post that does not
 ///   exist (C-15), as `getPostThread`'s anchor miss ends the thread. Its
-///   claimed root (C-18) is read too, which is the anchor itself when it is
-///   top-level, so that the root's private threadgate hides its
-///   `hiddenReplies` and sets `replyDisabled` (§4.4, C-17).
+///   claimed root (C-18), found by a one-row lookup, is read too when it
+///   passes the prefilter, which is the anchor itself when it is top-level,
+///   so that the root's private threadgate hides its `hiddenReplies` and
+///   sets `replyDisabled` (§4.4, C-17) ([`replies_anchor`]).
 /// - A public `uri` is not read or fetched: only its private replies are
 ///   listed, and nothing about the public post is emitted.
-/// - Candidates pass the prefilter. Windows, the lookahead and the sealed
-///   cursor (§3.6), bound to the method, the caller and `uri`, as
+/// - Candidates pass the prefilter. The read cap, the lookahead and the
+///   sealed cursor (§3.6), bound to the method, the caller and `uri`, as
 ///   [`feed_body`].
 /// - Each reply is expanded breadth-first `depth` levels below it, at most
 ///   [`REPLIES_PER_NODE`] children a node and [`THREAD_NODE_CAP`] nodes in
@@ -1484,6 +1686,65 @@ pub async fn get_replies(
     result.map(ok)
 }
 
+/// `getReplies`' private anchor and its claimed root (private-threads
+/// design §3.4): `None` when the anchor misses; otherwise the root, when it
+/// was read for the caller.
+///
+/// A one-row lookup with no reader finds the claimed root, the stored
+/// `reply_root_uri` the anchor's view emits. One prefilter covers the
+/// anchor and a private root. When the anchor passes, the watermark is
+/// fresh and the anchor is ready, one head round covers the anchor's DIDs
+/// before it is read, and the root is read only if it passed the prefilter.
+/// Otherwise the anchor is read as HEAD reads it, and the root is read
+/// after it.
+async fn replies_anchor(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    uri: &str,
+    start: Instant,
+) -> Result<Option<Option<String>>, XrpcError> {
+    let pool = &s.env.pool;
+    let stored = schema::stored_root(pool, uri).await?;
+    let claimed = stored.clone().flatten().unwrap_or_else(|| uri.to_string());
+    let mut wanted = vec![uri.to_string()];
+    if claimed != uri && is_private_uri(&claimed) {
+        wanted.push(claimed.clone());
+    }
+    let passing: HashSet<String> = schema::prefilter_uris(pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
+    let anchor_row = if stored.is_some() && passing.contains(uri) && s.env.watermark_fresh() {
+        Covered::of(s, uri).await?
+    } else {
+        None
+    };
+    let anchor_row = match anchor_row {
+        Some(row) if row.ready(s).await? => Some(row),
+        _ => None,
+    };
+    let authors = profiles(hydration, &[uri.to_string()]).await?;
+    let Some(anchor_row) = anchor_row else {
+        // HEAD's path.
+        let Ok(anchor) = pipeline::read(&s.env, rs, caller, uri, &authors, start).await else {
+            return Ok(None);
+        };
+        let root = claimed_root(&anchor).unwrap_or_else(|| uri.to_string());
+        let read = root == uri || (is_private_uri(&root) && anchor_readable(s, rs, caller, hydration, &root, start).await?);
+        return Ok(Some(read.then_some(root)));
+    };
+    let db_failed = head_round(s, rs, caller, std::slice::from_ref(&anchor_row)).await;
+    if anchor_row.head_dids(caller).iter().any(|d| db_failed.contains(d)) {
+        pipeline::count_db_miss();
+        return Ok(None);
+    }
+    if pipeline::read(&s.env, rs, caller, uri, &authors, start).await.is_err() {
+        return Ok(None);
+    }
+    let read = claimed == uri
+        || (is_private_uri(&claimed) && passing.contains(&claimed) && anchor_readable(s, rs, caller, hydration, &claimed, start).await?);
+    Ok(Some(read.then_some(claimed)))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn replies_body(
     s: &PrivateState,
@@ -1501,13 +1762,9 @@ async fn replies_body(
     // The thread's root, when it was read for the caller in this request.
     let mut roots_read: Vec<String> = Vec::new();
     if is_private_uri(uri) {
-        let authors = profiles(&hydration, &[uri.to_string()]).await?;
-        let Ok(anchor) = pipeline::read(&s.env, &rs, caller, uri, &authors, start).await else {
-            return Ok(PrivateResponse::replies(Vec::new(), None));
-        };
-        let root = claimed_root(&anchor).unwrap_or_else(|| uri.to_string());
-        if root == uri || (is_private_uri(&root) && anchor_readable(s, &rs, caller, &hydration, &root, start).await?) {
-            roots_read.push(root);
+        match replies_anchor(s, &rs, caller, &hydration, uri, start).await? {
+            Some(root) => roots_read.extend(root),
+            None => return Ok(PrivateResponse::replies(Vec::new(), None)),
         }
     }
     let hidden = match roots_read.first() {
@@ -1516,46 +1773,41 @@ async fn replies_body(
     };
     let hidden_list: Vec<String> = hidden.iter().cloned().collect();
 
-    let max_binds = limit * 4;
-    let wanted = i64::try_from(max_binds + 1).unwrap_or(i64::MAX);
+    // The read cap (private-threads design §3.3), with one row of
+    // lookahead.
+    let max_reads = limit * s.reads_factor;
+    let need = max_reads + 1;
+    let (pool, me, bounds) = (&s.env.pool, caller.did.as_str(), s.bounds);
+    let first = i64::try_from(need).unwrap_or(i64::MAX);
+    let key = |(u, at): &(String, DateTime<Utc>)| (*at, u.clone());
+    let hidden_ref = &hidden_list;
+    let mut candidates = schema::passing(need, first, bounds.batch_max, after, key, move |after, n| {
+        schema::reply_page_batch(pool, me, uri, hidden_ref, after, n, bounds.max_chain)
+    })
+    .await?;
+    let beyond = candidates.len() > max_reads;
+    candidates.truncate(max_reads);
     let mut hits: Vec<PrivateEmit<Value>> = Vec::new();
     // The last examined candidate's position.
     let mut last: Option<(DateTime<Utc>, String)> = None;
-    let mut more = false;
-    let mut after = after;
-    for window in 0..FEED_WINDOWS {
-        let mut candidates =
-            schema::reply_page_candidates(&s.env.pool, &caller.did, uri, &hidden_list, after.clone(), wanted).await?;
-        let beyond = candidates.len() > max_binds;
-        candidates.truncate(max_binds);
-        let uris: Vec<String> = candidates.iter().map(|(u, _)| u.clone()).collect();
-        let authors = profiles(&hydration, &uris).await?;
-        let mut full_at: Option<usize> = None;
-        let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
-        let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
-        while let Some((i, hit)) = reads.next().await {
-            let (u, at) = &candidates[i];
-            last = Some((*at, u.clone()));
-            if let Ok(post) = hit {
-                hits.push(post);
-                if hits.len() == limit {
-                    full_at = Some(i);
-                    break;
-                }
+    let uris: Vec<String> = candidates.iter().map(|(u, _)| u.clone()).collect();
+    let authors = profiles(&hydration, &uris).await?;
+    let mut full_at: Option<usize> = None;
+    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+    let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
+    while let Some((i, hit)) = reads.next().await {
+        let (u, at) = &candidates[i];
+        last = Some((*at, u.clone()));
+        if let Ok(post) = hit {
+            hits.push(post);
+            if hits.len() == limit {
+                full_at = Some(i);
+                break;
             }
         }
-        drop(reads);
-        if let Some(i) = full_at {
-            more = i + 1 < candidates.len() || beyond;
-            break;
-        }
-        more = beyond;
-        let Some((tail, at)) = candidates.last() else { break };
-        if !beyond || window + 1 == FEED_WINDOWS || start.elapsed() >= SECOND_WINDOW_BY {
-            break;
-        }
-        after = Some((*at, tail.clone()));
     }
+    drop(reads);
+    let more = full_at.map_or(beyond, |i| i + 1 < candidates.len() || beyond);
     let cursor = last.filter(|_| more).and_then(|(at, key)| sealed::seal(&s.cursor_key, aad, at, &key));
 
     let mut budget = THREAD_NODE_CAP.saturating_sub(hits.len());
@@ -1694,8 +1946,17 @@ async fn search_body(
         }
     });
     let lower = before(pos.at, bounds.span).max(pos.bound);
-    let candidates =
-        schema::search_candidates(&s.env.pool, &caller.did, pos.at, &pos.uri, lower, bounds.scan_candidates).await?;
+    // The next `scan_candidates` rows that pass the prefilter, in batches
+    // (private-threads design §3.2.1).
+    let (pool, me, read) = (&s.env.pool, caller.did.as_str(), s.bounds);
+    let need = usize::try_from(bounds.scan_candidates).unwrap_or(usize::MAX);
+    let start_at = (pos.at, pos.uri.clone());
+    let key = |(u, at): &(String, DateTime<Utc>)| (*at, u.clone());
+    let candidates = schema::passing(need, bounds.scan_candidates, read.batch_max, Some(start_at.clone()), key, move |after, n| {
+        let from = after.unwrap_or_else(|| start_at.clone());
+        schema::search_batch(pool, me, from, lower, n, read.max_chain)
+    })
+    .await?;
     let scanned_all = i64::try_from(candidates.len()).unwrap_or(i64::MAX) >= bounds.scan_candidates;
 
     let hydration = private_hydration(s, caller, ip).await?;
@@ -1807,7 +2068,7 @@ async fn notifications_body(
     // Rows from a private post: each post read for the caller, after the
     // prefilter narrows them (§2 rule 1).
     let post_uris: Vec<String> = rows.iter().filter(|r| r.is_from_private_post()).map(|r| r.record_uri.clone()).collect();
-    let passing: HashSet<String> = schema::prefilter_uris(pool, me, &post_uris).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(pool, me, &post_uris, s.env.max_chain).await?.into_iter().collect();
     let candidates: Vec<String> = post_uris.into_iter().filter(|u| passing.contains(u)).collect();
     let authors = profiles(&hydration, &candidates).await?;
     let rs = RequestState::new(s.env.max_head_fetches);
@@ -1890,7 +2151,7 @@ pub async fn get_unread_count(
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, GET_UNREAD_COUNT).await?;
-    let result = schema::unread_count(&s.env.pool, &caller.did).await;
+    let result = schema::unread_count(&s.env.pool, &caller.did, s.env.max_chain).await;
     floor("getUnreadCount", start, s.floors.get_unread_count).await;
     Ok(ok(PrivateResponse::unread_count(result?)))
 }
@@ -1913,8 +2174,31 @@ pub async fn update_seen(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
+
+    /// What a request's head state was once `getPostThread`'s parent chain
+    /// was read: the budget left and the cached head results.
+    pub(in crate::private_tier) type ChainState = (usize, HashMap<String, bool>);
+
+    fn chain_states() -> &'static Mutex<HashMap<String, ChainState>> {
+        static STATES: OnceLock<Mutex<HashMap<String, ChainState>>> = OnceLock::new();
+        STATES.get_or_init(Mutex::default)
+    }
+
+    /// Record `rs`'s state after the chain of the thread anchored at `uri`
+    /// (private-threads T-56).
+    pub(super) async fn record_chain_state(uri: &str, rs: &RequestState) {
+        let state = (rs.budget_left(), rs.cached().await);
+        chain_states().lock().expect("states").insert(uri.to_string(), state);
+    }
+
+    /// The state the last thread anchored at `uri` recorded.
+    pub(in crate::private_tier) fn chain_state(uri: &str) -> Option<ChainState> {
+        chain_states().lock().expect("states").get(uri).cloned()
+    }
 
     #[test]
     fn cursor_round_trips() {
