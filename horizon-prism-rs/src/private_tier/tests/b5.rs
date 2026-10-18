@@ -231,18 +231,20 @@ fn accepted_depth_bound(k: usize) -> f64 {
     }
 }
 
-/// The past-cap flood's accepted bound at `max_chain` `cap` (amendment 1
-/// §1.2).
-fn accepted_cap_bound(cap: u32) -> f64 {
-    if cap == 16 { 8.3 } else { 45.8 }
+/// The past-cap flood's bound at `max_chain` `cap` under the shared walk
+/// (shared-walk §5.1; amendment 1 §1.2 accepted 8.3 and 45.8).
+fn shared_cap_bound(cap: u32) -> f64 {
+    if cap == 16 { 2.1 } else { 3.3 }
 }
 
 /// Part (1) and T-54 (§3.5, §4): every row class, passing and failing, on
 /// the base snapshot, S12's buffers per row against HEAD's, at the
 /// table's bounds. The branch reply with the reader outside G under
-/// distinct parents (k = 4, 8 and 16) and the past-cap flood (16 and 100)
-/// are accepted costs at their measured bounds (amendment 1 §1, #720):
-/// each prints its ratio, §3.5's predicted ratio and the accepted bound.
+/// distinct parents (k = 4, 8 and 16) is an accepted cost at its measured
+/// bounds (amendment 1 §1, #720): each prints its ratio, §3.5's predicted
+/// ratio and the accepted bound. The shared walk (shared-walk §5.1) bounds
+/// owner branch replies under distinct parents at 3.1, the past-cap flood
+/// at 2.1 and 3.3, and adds the comb and the past-cap thread chain.
 #[tokio::test]
 #[ignore = "B-5 part (1) and T-54; run with --release --ignored --nocapture"]
 async fn b5_row_class_ratios() {
@@ -303,7 +305,9 @@ async fn b5_row_class_ratios() {
         rows.extend((0..50).map(|_| b.post(ALICE, &g_in, Some((&x(1000 + g), &parent)))));
     }
     add("owner branch reply, 50 siblings, depth 8, 7 other authors", rows, true, 1.39, CAP);
-    for (n, ratio, label) in [(4, 8.5, "n = 4, alternating O and B"), (7, 10.9, "n = 7")] {
+    // Shared-walk §5.1: bound 3.1 at both n (were 8.8 and 11.2); §5.1's
+    // ratio is 2.8, and 2.84 + 0.25 rounds up to 3.1.
+    for (n, ratio, label) in [(4, 2.84, "n = 4, alternating O and B"), (7, 2.84, "n = 7")] {
         let rows = (0..N)
             .map(|i| {
                 let xi = x(2000 + i + 1000 * n);
@@ -368,15 +372,56 @@ async fn b5_row_class_ratios() {
             deep.push(parent.clone());
         }
     }
+    // Shared-walk §5.1: 2.1 at 16 and 3.3 at 100 (were the accepted 8.3
+    // and 45.8).
     for cap in [16u32, 100] {
-        accepted.push(Class {
+        classes.push(Class {
             name: format!("failing: past the cap at {cap}, V outside G"),
             rows: deep.clone(),
             passes: false,
-            bound: accepted_cap_bound(cap),
+            bound: shared_cap_bound(cap),
             cap,
-            predicted: Some((4.0 + f64::from(cap)) / 6.0),
+            predicted: None,
         });
+    }
+    // New (shared-walk §5.1): a thread chain of 160 replies by standing
+    // writers under Alice's root, V inside G; rows 121 to 160 are past the
+    // cap at 16 and 100, and fail.
+    let thread_root = b.post(ALICE, &g_in, None);
+    let mut parent = thread_root.clone();
+    let mut thread_deep = Vec::new();
+    for d in 1..=160 {
+        parent = b.post(&others[d % others.len()], &g_in, Some((&thread_root, &parent)));
+        if d > 120 {
+            thread_deep.push(parent.clone());
+        }
+    }
+    for cap in [16u32, 100] {
+        classes.push(Class {
+            name: format!("failing: thread chain past the cap at {cap}, standing writers, V inside G"),
+            rows: thread_deep.clone(),
+            passes: false,
+            bound: 1.0,
+            cap,
+            predicted: None,
+        });
+    }
+    // New (shared-walk §5.1): a comb, V outside G: a spine of 200 below a
+    // branch root, a leaf chain of (i mod 7) + 1 rows off every fifth spine
+    // row, the last leaf row of each a class row. Its bound is computed from
+    // its own climb below.
+    let comb_x = x(95_000);
+    let mut spine = b.post(ALICE, &g_out, Some((&comb_x, &comb_x)));
+    let mut comb = Vec::new();
+    for row in 1..=200 {
+        spine = b.post(&others[row % others.len()], &g_out, Some((&comb_x, &spine)));
+        if row % 5 == 1 {
+            let mut leaf = spine.clone();
+            for _ in 0..=((row - 1) / 5) % 7 {
+                leaf = b.post(BOB, &g_out, Some((&comb_x, &leaf)));
+            }
+            comb.push(leaf);
+        }
     }
     classes.extend(accepted);
     b.write(&pool).await;
@@ -384,6 +429,31 @@ async fn b5_row_class_ratios() {
         exec(&pool, &format!("INSERT INTO labels (subject, val) VALUES ('{uri}', '!hide')")).await;
     }
     exec(&pool, "ANALYZE").await;
+    // The comb's bound (shared-walk §5.1): its climb's primary-key probes
+    // over its rows, in buffers as §5.1 converts the past-cap class (a
+    // failing row's 6.5, about 4 a probe, against HEAD's 6.8), plus 0.25.
+    let plan: Value = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", schema::prefilter_uris_statement(CAP)))
+        .bind(DAVE)
+        .bind(&comb)
+        .fetch_one(&pool)
+        .await
+        .expect("comb plan");
+    fn climb_probes(node: &Value, inside: bool) -> u64 {
+        let inside = inside || node["Subplan Name"] == "CTE bcl";
+        let own = if inside && node["Relation Name"] == "private_posts" { node["Actual Loops"].as_u64().unwrap_or(0) } else { 0 };
+        own + node["Plans"].as_array().into_iter().flatten().map(|c| climb_probes(c, inside)).sum::<u64>()
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let comb_ratio = (6.5 + 4.0 * climb_probes(&plan[0]["Plan"], false) as f64 / comb.len() as f64) / 6.8;
+    println!("T-54 comb: {} rows, climb probes {}, probe ratio {comb_ratio:.2}", comb.len(), climb_probes(&plan[0]["Plan"], false));
+    classes.push(Class {
+        name: "failing: comb, V outside G".into(),
+        rows: comb.clone(),
+        passes: false,
+        bound: bound_of(comb_ratio),
+        cap: CAP,
+        predicted: None,
+    });
 
     let head = |n: usize| format!("SELECT p.uri FROM {} WHERE p.uri = ANY($2) AND {} LIMIT {n}", schema::PREFILTER_FROM, schema::head_prefilter());
     println!("B-5 part (1) / T-54: buffers per row, S12 against HEAD, reader Dave");
@@ -546,11 +616,17 @@ pub(super) enum Part3 {
     UndecodableChildren,
     Likes,
     PrefilterFails,
+    ThreadChain,
+    Comb,
 }
 
 impl Part3 {
+    /// The ordinary fixtures, the shared walk's no-regression gate
+    /// (shared-walk §7).
+    pub(super) const ORDINARY: [Self; 5] = [Self::Base, Self::Deep, Self::Eight, Self::BigList, Self::Alternating];
+
     /// Every fixture but the stale-head chain, which needs `bench-heads`.
-    pub(super) const ALL: [Self; 15] = [
+    pub(super) const ALL: [Self; 17] = [
         Self::Base,
         Self::Deep,
         Self::Eight,
@@ -566,6 +642,8 @@ impl Part3 {
         Self::UndecodableChildren,
         Self::Likes,
         Self::PrefilterFails,
+        Self::ThreadChain,
+        Self::Comb,
     ];
 
     /// A database-safe name.
@@ -586,6 +664,8 @@ impl Part3 {
             Self::UndecodableChildren => "undecchildren",
             Self::Likes => "likes",
             Self::PrefilterFails => "prefilterfails",
+            Self::ThreadChain => "threadchain",
+            Self::Comb => "comb",
         }
     }
 
@@ -606,12 +686,24 @@ impl Part3 {
             Self::UndecodableChildren => "48 undecodable children per expanded node",
             Self::Likes => "50 000 like records",
             Self::PrefilterFails => "5 000 posts that fail the prefilter",
+            Self::ThreadChain => "5 000-row thread chain of a standing writer, V inside",
+            Self::Comb => "a 5 000-row branch spine with 1 000 leaf chains, V outside",
         }
     }
 
     /// The walk caps (`private_read.max_chain`) the fixture runs at.
     pub(super) fn caps(self) -> &'static [u32] {
-        if self == Self::Chain { &[16, 100] } else { &[CAP] }
+        match self {
+            Self::Chain | Self::ThreadChain => &[16, 100],
+            Self::Comb => &[100],
+            _ => &[CAP],
+        }
+    }
+
+    /// The alone p50 the fixture is gated at instead of its p99, which is
+    /// reported (shared-walk §7: `Distinct` at 1.0 s, this design's claim).
+    pub(super) fn alone_gate(self) -> Option<Duration> {
+        (self == Self::Distinct).then_some(Duration::from_secs(1))
     }
 
     /// Write the fixture over the base snapshot and return its cases.
@@ -831,10 +923,13 @@ impl Part3 {
                      WHERE p.uri LIKE 'at://{ALICE}/%/b5t%' AND p.reply_parent_uri IS NOT NULL \
                        AND NOT EXISTS (SELECT 1 FROM private_posts c WHERE c.reply_parent_uri = p.uri)"
                 )).await;
-                vec![("getUnreadCount (gated)", GET_UNREAD_COUNT, String::new(), true)]
+                // The p99 is reported against the 300 ms budget; the alone p50
+                // is gated at 1.0 s ([`Part3::alone_gate`], shared-walk §7).
+                vec![("getUnreadCount", GET_UNREAD_COUNT, String::new(), false)]
             }
             // Adversarial, named: a 5 000-row branch chain under an audience
-            // V is outside, at `max_chain` 16 and 100.
+            // V is outside, at `max_chain` 16 and 100; gated since the shared
+            // walk (§7).
             Self::Chain => {
                 let writer = member(3500);
                 let g = audience_row(pool, &writer, "b5chain", &[BOB.into()]).await;
@@ -848,8 +943,59 @@ impl Part3 {
                 ready_dids(pool, std::slice::from_ref(&writer)).await;
                 exec(pool, &follow_sql(DAVE, &writer)).await;
                 vec![
-                    ("getTimeline", TIMELINE, String::new(), false),
-                    ("getAuthorFeed", FEED, format!("actor={writer}"), false),
+                    ("getTimeline", TIMELINE, String::new(), true),
+                    ("getAuthorFeed", FEED, format!("actor={writer}"), true),
+                ]
+            }
+            // Adversarial (shared-walk §7): a 5 000-row thread chain under
+            // Alice's root, every row by a writer standing under her `list`,
+            // V inside G, no owner reply within the cap; at 16 and 100.
+            Self::ThreadChain => {
+                let writer = member(3700);
+                let g = audience_row(pool, ALICE, "b5tchain", &[DAVE.into(), BOB.into(), writer.clone()]).await;
+                let mut b = Bulk::new("b5w");
+                let root = b.post(ALICE, &g, None);
+                let mut parent = root.clone();
+                for _ in 0..5_000 {
+                    parent = b.post(&writer, &g, Some((&root, &parent)));
+                }
+                // The deepest rows newest: a feed examines the rows past
+                // the cap, which fail, before the ones that pass.
+                b.rows.reverse();
+                b.write(pool).await;
+                ready_dids(pool, &[ALICE.into(), writer.clone()]).await;
+                exec(pool, &follow_sql(DAVE, &writer)).await;
+                vec![
+                    ("getTimeline", TIMELINE, String::new(), true),
+                    ("getAuthorFeed", FEED, format!("actor={writer}"), true),
+                ]
+            }
+            // Adversarial (shared-walk §7): a branch root under Carol's
+            // public post, under an audience of Bob alone, a spine of 5 000
+            // branch replies below it, and off spine row 5i + 1 a leaf chain
+            // of (i mod 7) + 1 rows, all by one writer Dave follows; V
+            // outside. Every row fails, by intent.
+            Self::Comb => {
+                let writer = member(3600);
+                let g = audience_row(pool, &writer, "b5comb", &[BOB.into()]).await;
+                let mut b = Bulk::new("b5m");
+                let x = format!("at://{CAROL}/{PUBLIC_POST}/b5combx");
+                let mut spine = b.post(&writer, &g, Some((&x, &x)));
+                for row in 1..=5_000 {
+                    spine = b.post(&writer, &g, Some((&x, &spine)));
+                    if row % 5 == 1 {
+                        let mut leaf = spine.clone();
+                        for _ in 0..=((row - 1) / 5) % 7 {
+                            leaf = b.post(&writer, &g, Some((&x, &leaf)));
+                        }
+                    }
+                }
+                b.write(pool).await;
+                ready_dids(pool, std::slice::from_ref(&writer)).await;
+                exec(pool, &follow_sql(DAVE, &writer)).await;
+                vec![
+                    ("getTimeline", TIMELINE, String::new(), true),
+                    ("getAuthorFeed", FEED, format!("actor={writer}"), true),
                 ]
             }
             // T-58's self-service failures: 200 threads per top writer, each

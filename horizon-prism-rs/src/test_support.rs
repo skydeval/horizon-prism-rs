@@ -459,6 +459,12 @@ pub async fn empty_db(test: &str) -> Option<TestDb> {
         .execute(&admin)
         .await
         .expect("create test database");
+    // As every deployed pool runs (`db::pool`): no JIT. The shared walk's
+    // recursive CTEs carry estimates far past `jit_above_cost`.
+    sqlx::query(&format!("ALTER DATABASE {name} SET jit = off"))
+        .execute(&admin)
+        .await
+        .expect("jit off");
     let base = admin_url.rsplit_once('/').expect("URL with a database path").0;
     let pool = PgPool::connect(&format!("{base}/{name}"))
         .await
