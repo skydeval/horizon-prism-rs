@@ -23,7 +23,7 @@ use super::feed::{local_cursor, parse_local_cursor};
 use super::search::{METRIC_TIMEOUT, set_timeout, timed_out, viewer_exclusions};
 use super::{Hydrator, ViewError, ViewResult, Viewer, ts};
 use crate::db::locks::uri_author;
-use crate::moderation::{self, Gate};
+use crate::moderation::Gate;
 use crate::xrpc::pools::Requester;
 
 pub const NSID_STARTERPACK: &str = "app.bsky.graph.starterpack";
@@ -115,7 +115,7 @@ impl Hydrator {
         }
         let mut subjects: Vec<String> = out.keys().cloned().collect();
         subjects.extend(out.keys().filter_map(|u| uri_author(u).map(str::to_string)));
-        let gates = moderation::gate_many(self.pool(), &subjects).await?;
+        let gates = self.gate_many(req, &subjects).await?;
         let hidden = |s: &str| gates.get(s).copied().unwrap_or(Gate::Visible).is_hidden();
         out.retain(|uri, _| !hidden(uri) && !uri_author(uri).is_some_and(hidden));
         Ok(out)
@@ -346,7 +346,7 @@ impl Hydrator {
             .fetch_all(self.pool())
             .await?;
             let dids: Vec<String> = rows.iter().map(|(_, d)| d.clone()).collect();
-            let gates = moderation::gate_many(self.pool(), &dids).await?;
+            let gates = self.gate_many(req, &dids).await?;
             let ctx = self.profile_context(viewer, req, &dids, None).await?;
             let sample = rows
                 .iter()
@@ -367,7 +367,7 @@ impl Hydrator {
                 .iter()
                 .filter_map(|i| i.pointer("/subject/did").and_then(Value::as_str).map(str::to_string))
                 .collect();
-            let gates = moderation::gate_many(self.pool(), &dids).await?;
+            let gates = self.gate_many(req, &dids).await?;
             let visible = |item: &Value| {
                 item.pointer("/subject/did")
                     .and_then(Value::as_str)
@@ -472,7 +472,7 @@ impl Hydrator {
                 .flatten()
                 .filter_map(|p| p.get("uri").and_then(Value::as_str).map(str::to_string))
                 .collect();
-            let gates = moderation::gate_many(self.pool(), &uris).await?;
+            let gates = self.gate_many(req, &uris).await?;
             let labels = self.load_labels(&uris).await?;
             if let Some(packs) = found["starterPacks"].as_array_mut() {
                 packs.retain(|p| {
@@ -504,7 +504,7 @@ impl Hydrator {
             .then(|| rows.last().map(|r| local_cursor(r.created_at, &r.uri)))
             .flatten();
         let uris: Vec<String> = rows.iter().map(|r| r.uri.clone()).collect();
-        let gates = moderation::gate_many(self.pool(), &uris).await?;
+        let gates = self.gate_many(req, &uris).await?;
         let ctx = self.profile_context(viewer, req, std::slice::from_ref(&did), None).await?;
         let (joined, labels) = (self.joined_counts(&uris).await?, self.load_labels(&uris).await?);
         let refs: Vec<&PackRow> = rows.iter().collect();

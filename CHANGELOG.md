@@ -10,6 +10,33 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (embedded profile rows, #734)
+
+- **A member could tell whether an account had a private tie (#734).**
+  Embedded profiles rendered from any stored `actors` row, and the
+  moderation gate read any row's `account_status`. Rows exist for private
+  owners (their identity and profile) and for the authors of private
+  replies to members (PDS and handle), so muting or blocking such an
+  account and reading `getMutes` or `getBlocks` showed its handle,
+  display name, avatar, description, pronouns, `createdAt` and
+  `indexedAt`, where an unknown account shows `handle.invalid`. The same
+  held for list creators in `getListMutes` and `getListBlocks` and for
+  Thread Lens authors. A deactivated owner's entry, or its lists, were
+  left out of `getBlocks`, `getListMutes` and `getListBlocks`, its Thread
+  Lens nodes were not found, and `getProfile` answered
+  `AccountDeactivated` instead of the cascade's answer.
+  - As design-v4 §8.1 "Embedded profile views" and §11 G-9 specify
+    (R3-143), a row, its stored status and declaration records, and the
+    gate's status read are used only for accounts in `scope_dids` and
+    members, on every public path. Any other account renders exactly as
+    one never seen, so its rendering no longer depends on private facts.
+  - Private-context hydration (the private tier's own views) still
+    renders every stored row and reads every status, as §8.1 specifies.
+  - Out-of-scope accounts now render in the minimal form on list views
+    until the profile batch and refresh queue of design-v4 §8.1 land
+    (#732). On prism this affects only accounts outside S on the four
+    lists above and on Thread Lens.
+
 ### Added (metrics audit, #730, #731)
 
 - **The Farsight fallback's own series (#730).** As design-v4 §14.2

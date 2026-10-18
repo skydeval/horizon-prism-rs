@@ -11,7 +11,7 @@ use sqlx::{Postgres, QueryBuilder};
 
 use super::search::{METRIC_DURATION, METRIC_TIMEOUT, set_timeout, timed_out, viewer_exclusions};
 use super::{ActorRow, ActorViewer, CountMode, Hydrator, INVALID_HANDLE, ViewError, ViewResult, Viewer, blob_url, ts};
-use crate::moderation::{self, Gate};
+use crate::moderation::Gate;
 use crate::xrpc::pools::Requester;
 
 /// Upstream profile fetches in flight for one `getProfiles`.
@@ -151,7 +151,12 @@ impl Hydrator {
         dids: &[String],
         followers: Option<CountMode>,
     ) -> Result<ProfileContext, sqlx::Error> {
-        let rows = self.load_actors(dids).await?;
+        // Rows and self records only for the DIDs `req` may read (§8.1
+        // "Embedded profile views", §11 G-9, R3-143): any other DID renders
+        // exactly as one never seen. Private-context hydration reads every
+        // row (§8.1, R3-179).
+        let readable = self.readable_for(req, dids).await;
+        let rows = self.load_actor_rows(&readable).await?;
         let mut actor_viewer = self.actor_viewer(viewer, dids).await?;
         self.fill_list_views(viewer, req, &mut actor_viewer).await?;
         let labels = self.load_labels(dids).await?;
@@ -167,14 +172,14 @@ impl Hydrator {
         let declarations: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT did, record->>'allowSubscriptions' FROM actor_self_records WHERE did = ANY($1) AND collection = $2",
         )
-        .bind(dids)
+        .bind(&readable)
         .bind(super::activity_subscriptions::NSID_DECLARATION)
         .fetch_all(self.pool())
         .await?;
         let stored: Vec<(String, String, String, Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
             "SELECT did, uri, cid, record, indexed_at FROM actor_self_records WHERE did = ANY($1) AND collection = $2",
         )
-        .bind(dids)
+        .bind(&readable)
         .bind(NSID_STATUS)
         .fetch_all(self.pool())
         .await?;
@@ -297,7 +302,9 @@ impl Hydrator {
         Ok(())
     }
 
-    /// Profiles with no viewer state computed (Thread Lens, §10.3).
+    /// Profiles with no viewer state computed (Thread Lens, §10.3). Thread
+    /// Lens is a public path, so rows come from [`Hydrator::load_actors`]
+    /// (§11 G-9).
     ///
     /// # Errors
     ///
@@ -324,7 +331,7 @@ impl Hydrator {
         let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(ViewError::new("InvalidRequest", "Profile not found")));
         };
-        let gate = moderation::gate(self.pool(), &did).await?;
+        let gate = self.gate(req, &did).await?;
         if let Some((error, message)) = gate.profile_error() {
             return Ok(Err(ViewError::new(error, message)));
         }
@@ -360,7 +367,7 @@ impl Hydrator {
                 dids.push(d);
             }
         }
-        let gates = moderation::gate_many(self.pool(), &dids).await?;
+        let gates = self.gate_many(req, &dids).await?;
         dids.retain(|d| !gates.get(d).copied().unwrap_or(Gate::Visible).is_hidden());
         let mut ctx = self.profile_context(viewer, req, &dids, Some(CountMode::Sync { started })).await?;
         self.profile_details(viewer, req, &mut ctx, started).await?;
@@ -465,7 +472,7 @@ impl Hydrator {
     /// the viewer neither blocks, is blocked by, nor fully mutes, with
     /// their profile context. An inbound list block is known only here.
     pub(super) async fn searchable(&self, viewer: &Viewer, req: &Requester, dids: &[String]) -> Result<(Vec<String>, ProfileContext), sqlx::Error> {
-        let gates = moderation::gate_many(self.pool(), dids).await?;
+        let gates = self.gate_many(req, dids).await?;
         let shown: Vec<String> = dids
             .iter()
             .filter(|d| !gates.get(*d).copied().unwrap_or(Gate::Visible).is_hidden())

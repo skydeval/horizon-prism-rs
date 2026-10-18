@@ -21,7 +21,7 @@ use super::lists::is_list_uri;
 use super::normalize::is_private_uri;
 use super::{CountMode, Hydrator, ViewError, ViewResult, Viewer};
 use crate::db::locks::uri_author;
-use crate::moderation::{self, Gate};
+use crate::moderation::Gate;
 use crate::xrpc::pools::Requester;
 
 /// Total nodes in one thread response (§7.1): the default of
@@ -444,7 +444,7 @@ impl Hydrator {
         let Some(anchor_row) = anchor.get(uri) else {
             let author = uri_author(uri).unwrap_or_default().to_string();
             if !self.stores_public_of(&author).await
-                && !moderation::gate(self.pool(), uri).await?.is_hidden()
+                && !self.gate(req, uri).await?.is_hidden()
                 && let Some(v) = self.upstream().post_thread(req, uri, depth, parent_height).await
             {
                 // An upstream AppView's thread, with whatever gate view it
@@ -626,7 +626,7 @@ impl Hydrator {
     ///
     /// Database errors.
     async fn remote_posts(&self, viewer: &Viewer, req: &Requester, uris: &[String]) -> Result<HashMap<String, Value>, sqlx::Error> {
-        let gates = moderation::gate_many(self.pool(), uris).await?;
+        let gates = self.gate_many(req, uris).await?;
         let allowed: Vec<String> = uris
             .iter()
             .filter(|u| !gates.get(*u).copied().unwrap_or(Gate::Visible).is_hidden())

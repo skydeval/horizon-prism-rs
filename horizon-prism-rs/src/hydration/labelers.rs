@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 
 use super::actor::ProfileKind;
 use super::{CountMode, Hydrator, ViewError, ViewResult, Viewer, ts};
-use crate::moderation;
 use crate::xrpc::pools::Requester;
 
 const NSID_SERVICE: &str = "app.bsky.labeler.service";
@@ -76,7 +75,7 @@ impl Hydrator {
         // The moderation gate comes before any fetch.
         let uris: Vec<String> = wanted.iter().map(|d| service_uri(d)).collect();
         let gated: Vec<String> = wanted.iter().chain(&uris).cloned().collect();
-        let gates = moderation::gate_many(self.pool(), &gated).await?;
+        let gates = self.gate_many(req, &gated).await?;
         let hidden = |did: &str| [did.to_string(), service_uri(did)].iter().any(|s| gates.get(s).is_some_and(|g| g.is_hidden()));
         for did in &wanted {
             if services.contains_key(did) || hidden(did) {
@@ -199,7 +198,11 @@ mod tests {
             service_uri(FAR),
             json!({"uri": service_uri(FAR), "cid": "bafyfar", "value": {"policies": {"labelValues": ["rude"]}, "subjectTypes": ["account"]}}),
         );
-        let h = hydrator_with(p, ScopeSets::default(), Arc::new(up));
+        // A labeler service is stored for an account in S, whose profile
+        // row public views may read (§11 G-9).
+        let mut sets = ScopeSets::default();
+        sets.scope.insert(LOCAL.into());
+        let h = hydrator_with(p, sets, Arc::new(up));
         let me = Viewer {
             did: Some(ME.into()),
             hydrate: true,

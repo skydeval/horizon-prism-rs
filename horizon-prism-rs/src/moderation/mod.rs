@@ -11,7 +11,10 @@
 //! | otherwise | `Visible` |
 //!
 //! Account status is known only for DIDs with `actors` rows; for other DIDs
-//! the gate is `Visible` unless a label applies.
+//! the gate is `Visible` unless a label applies. Public paths read the
+//! status only of DIDs in `scope_dids` and members ([`gate_many_among`];
+//! design-v4 §11 G-9), so a row kept because of a private tie is treated
+//! as absent there.
 
 use std::collections::{HashMap, HashSet};
 
@@ -80,12 +83,26 @@ fn status_reason(status: &str) -> Option<HiddenReason> {
 ///
 /// Database errors.
 pub async fn gate_many(pool: &PgPool, subjects: &[String]) -> Result<HashMap<String, Gate>, sqlx::Error> {
+    gate_many_among(pool, subjects, None).await
+}
+
+/// [`gate_many`], reading `account_status` only for the authors in
+/// `readable` when it is given: any other author's row is treated as
+/// absent. Public paths pass the DIDs in `scope_dids` and the members
+/// (design-v4 §11 G-9, §II-7.10), through `Hydrator::gate_many`.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn gate_many_among(pool: &PgPool, subjects: &[String], readable: Option<&HashSet<String>>) -> Result<HashMap<String, Gate>, sqlx::Error> {
     let mut authors: HashSet<String> = HashSet::new();
     let mut keys: HashSet<String> = HashSet::new();
     for s in subjects {
         keys.insert(s.clone());
         let did = uri_author(s).unwrap_or(s);
-        authors.insert(did.to_string());
+        if readable.is_none_or(|r| r.contains(did)) {
+            authors.insert(did.to_string());
+        }
         keys.insert(did.to_string());
     }
     let keys: Vec<String> = keys.into_iter().collect();

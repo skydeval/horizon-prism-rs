@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::actor::ProfileKind;
 use super::feed::{local_cursor, parse_local_cursor};
 use super::{Hydrator, SYNC_BUDGET, ViewError, ViewResult, Viewer};
-use crate::moderation::{self, Gate};
+use crate::moderation::Gate;
 use crate::hydration::HydrationError;
 use crate::xrpc::pools::Requester;
 
@@ -67,7 +67,7 @@ impl Hydrator {
         let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(not_found()));
         };
-        if let Some((error, message)) = moderation::gate(self.pool(), &did).await?.profile_error() {
+        if let Some((error, message)) = self.gate(req, &did).await?.profile_error() {
             return Ok(Err(ViewError::new(error, message)));
         }
         Ok(Ok(did))
@@ -76,7 +76,7 @@ impl Hydrator {
     /// Render a subject plus a list of actors as `profileView`s, dropping
     /// hidden actors and blocks in either direction.
     async fn actor_list(&self, viewer: &Viewer, req: &Requester, subject: &str, dids: Vec<String>, key: &str, cursor: Option<String>) -> ViewResult<Value> {
-        let gates = moderation::gate_many(self.pool(), &dids).await?;
+        let gates = self.gate_many(req, &dids).await?;
         let mut all = dids.clone();
         all.push(subject.to_string());
         let ctx = self.profile_context(viewer, req, &all, None).await?;
@@ -281,7 +281,7 @@ impl Hydrator {
             .then(|| rows.last().map(|(_, u, t)| local_cursor(*t, u)))
             .flatten();
         let dids: Vec<String> = rows.into_iter().map(|(d, _, _)| d).collect();
-        let gates = moderation::gate_many(self.pool(), &dids).await?;
+        let gates = self.gate_many(req, &dids).await?;
         let ctx = self.profile_context(viewer, req, &dids, None).await?;
         let blocks: Vec<Value> = dids
             .iter()
@@ -411,7 +411,7 @@ impl Hydrator {
         let mut all: Vec<String> = found.values().flatten().cloned().collect();
         all.sort_unstable();
         all.dedup();
-        let gates = moderation::gate_many(self.pool(), &all).await?;
+        let gates = self.gate_many(req, &all).await?;
         let found: Vec<(String, Vec<String>)> = found
             .into_iter()
             .map(|(subject, mut known)| {

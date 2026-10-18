@@ -22,7 +22,7 @@ use super::feed::{local_cursor, parse_local_cursor};
 use super::{Hydrator, ViewError, ViewResult, Viewer, blob_url, ts};
 use crate::db::locks::uri_author;
 use crate::firehose::normalize::blob_cid;
-use crate::moderation::{self, Gate};
+use crate::moderation::Gate;
 use crate::xrpc::pools::Requester;
 
 pub const NSID_LIST: &str = "app.bsky.graph.list";
@@ -268,10 +268,10 @@ impl Hydrator {
             return Ok(Err(list_not_found()));
         }
         let owner = uri_author(list).unwrap_or_default().to_string();
-        if let Some((error, message)) = moderation::gate(self.pool(), &owner).await?.profile_error() {
+        if let Some((error, message)) = self.gate(req, &owner).await?.profile_error() {
             return Ok(Err(ViewError::new(error, message)));
         }
-        if moderation::gate(self.pool(), list).await?.is_hidden() {
+        if self.gate(req, list).await?.is_hidden() {
             return Ok(Err(list_not_found()));
         }
         let local = self.is_ready_member(&owner).await?;
@@ -328,7 +328,7 @@ impl Hydrator {
 
         // Hidden subjects are omitted.
         let dids: Vec<String> = items.iter().map(|(_, d, _)| d.clone()).collect();
-        let gates = moderation::gate_many(self.pool(), &dids).await?;
+        let gates = self.gate_many(req, &dids).await?;
         items.retain(|(_, d, _)| !gates.get(d).copied().unwrap_or(Gate::Visible).is_hidden());
 
         // A reference list leaves out subjects who opted out, except for
@@ -481,7 +481,7 @@ impl Hydrator {
                 .flatten()
                 .filter_map(|l| l.get("uri").and_then(Value::as_str).map(str::to_string))
                 .collect();
-            let gates = moderation::gate_many(self.pool(), &uris).await?;
+            let gates = self.gate_many(req, &uris).await?;
             let list_viewer = self.list_viewer(viewer, &uris).await?;
             if let Some(lists) = found["lists"].as_array_mut() {
                 lists.retain(|l| {
@@ -522,7 +522,7 @@ impl Hydrator {
                 .await?
                 .into_iter()
                 .collect();
-        let gates = moderation::gate_many(self.pool(), &uris).await?;
+        let gates = self.gate_many(req, &uris).await?;
         let creators = self.profile_context(viewer, req, std::slice::from_ref(&did), None).await?;
         let labels = self.load_labels(&uris).await?;
         let list_viewer = self.list_viewer(viewer, &uris).await?;

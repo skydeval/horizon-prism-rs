@@ -17,7 +17,7 @@ use super::feed::{local_cursor, parse_local_cursor};
 use super::lists::{PURPOSE_MOD, is_list_uri};
 use super::{HydrationError, Hydrator, ViewError, ViewResult, Viewer};
 use crate::db::locks::uri_author;
-use crate::moderation::{self, Gate};
+use crate::moderation::Gate;
 use crate::subscriptions::references::{Muted, OverBudget, mute_list, unmute_list};
 use crate::subscriptions::{retryable, retrying};
 use crate::xrpc::pools::Requester;
@@ -87,7 +87,7 @@ impl Hydrator {
         let mut owners: Vec<String> = uris.iter().filter_map(|u| uri_author(u).map(str::to_string)).collect();
         owners.sort_unstable();
         owners.dedup();
-        let gates = moderation::gate_many(self.pool(), &uris).await?;
+        let gates = self.gate_many(req, &uris).await?;
         let creators = self.profile_context(viewer, req, &owners, None).await?;
         let labels = self.load_labels(&uris).await?;
         let list_viewer = self.list_viewer(viewer, &uris).await?;

@@ -13,7 +13,6 @@ use serde_json::{Value, json};
 use super::actor::ProfileKind;
 use super::feed::{local_cursor, parse_local_cursor};
 use super::{HydrationError, Hydrator, ViewError, ViewResult, Viewer, ts};
-use crate::moderation;
 use crate::xrpc::pools::Requester;
 
 pub const DEFAULT_LIMIT: u32 = 25;
@@ -35,7 +34,7 @@ impl Hydrator {
         let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(ViewError::new("InvalidRequest", "Profile not found")));
         };
-        if let Some((error, message)) = moderation::gate(self.pool(), &did).await?.profile_error() {
+        if let Some((error, message)) = self.gate(req, &did).await?.profile_error() {
             return Ok(Err(ViewError::new(error, message)));
         }
         if !self.stores_public_of(&did).await || cursor.is_some_and(|c| c.starts_with("P:")) {
@@ -65,7 +64,7 @@ impl Hydrator {
             .then(|| rows.last().map(|(_, rkey, _, _, created, _)| local_cursor(*created, rkey)))
             .flatten();
         let labelled: Vec<String> = rows.iter().map(|(uri, ..)| uri.clone()).collect();
-        let gates = moderation::gate_many(self.pool(), &labelled).await?;
+        let gates = self.gate_many(req, &labelled).await?;
         let ctx = self.profile_context(viewer, req, std::slice::from_ref(&did), None).await?;
         let author = ctx.view(&did, ProfileKind::Basic);
         let polls: Vec<Value> = rows

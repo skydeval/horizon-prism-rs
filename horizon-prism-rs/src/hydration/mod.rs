@@ -41,6 +41,8 @@ pub mod thread_v2;
 pub mod trends;
 pub mod upstream;
 #[cfg(test)]
+mod row_filter_tests;
+#[cfg(test)]
 mod viewer_private_tests;
 
 use std::collections::{HashMap, HashSet};
@@ -570,12 +572,73 @@ impl Hydrator {
         sets.public.mode.is_on() && sets.in_scope(did)
     }
 
-    /// Local actor rows.
+    /// Of `dids`, those whose per-DID state a public path may read: the
+    /// DIDs in `scope_dids` and the members (§11 G-9, R3-143). Any other
+    /// DID's rows exist only because of private facts (a private owner,
+    /// the author of a private reply), and are treated as absent.
+    pub(crate) async fn readable_dids(&self, dids: &[String]) -> Vec<String> {
+        let scope = self.scope().read_guard().await;
+        dids.iter().filter(|d| scope.in_scope(d) || scope.is_member(d)).cloned().collect()
+    }
+
+    /// Of `dids`, those whose per-DID state `req` may read: all of them in
+    /// private-context hydration (§8.1, R3-179), which renders local rows
+    /// whatever the DID's scope class, and otherwise
+    /// [`Hydrator::readable_dids`].
+    pub(crate) async fn readable_for(&self, req: &Requester, dids: &[String]) -> Vec<String> {
+        if req.is_local_only() { dids.to_vec() } else { self.readable_dids(dids).await }
+    }
+
+    /// The moderation gate for `subjects` (§II-7.10), with `account_status`
+    /// read only for the authors `req` may read (§11 G-9): any other
+    /// author's status row is treated as absent, so the gate cannot reveal
+    /// a private tie.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(crate) async fn gate_many(&self, req: &Requester, subjects: &[String]) -> Result<HashMap<String, crate::moderation::Gate>, sqlx::Error> {
+        let authors: Vec<String> = subjects.iter().map(|s| uri_author(s).unwrap_or(s).to_string()).collect();
+        let readable: HashSet<String> = self.readable_for(req, &authors).await.into_iter().collect();
+        crate::moderation::gate_many_among(self.pool(), subjects, Some(&readable)).await
+    }
+
+    /// [`Hydrator::gate_many`] for one subject.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(crate) async fn gate(&self, req: &Requester, subject: &str) -> Result<crate::moderation::Gate, sqlx::Error> {
+        let s = subject.to_string();
+        Ok(self
+            .gate_many(req, std::slice::from_ref(&s))
+            .await?
+            .remove(&s)
+            .unwrap_or(crate::moderation::Gate::Visible))
+    }
+
+    /// The local actor rows of `dids` that a public path may read
+    /// ([`Hydrator::readable_dids`]; §8.1 "Embedded profile views", §11
+    /// G-9, R3-143): any other DID has none here, whatever is stored for
+    /// it, and so renders exactly as a DID never seen.
     ///
     /// # Errors
     ///
     /// Database errors.
     pub async fn load_actors(&self, dids: &[String]) -> Result<HashMap<String, ActorRow>, sqlx::Error> {
+        let readable = self.readable_dids(dids).await;
+        self.load_actor_rows(&readable).await
+    }
+
+    /// Every stored actor row of `dids`, with no scope predicate. Only
+    /// private-context hydration may read rows this way
+    /// ([`Hydrator::readable_for`]); public paths use
+    /// [`Hydrator::load_actors`].
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(crate) async fn load_actor_rows(&self, dids: &[String]) -> Result<HashMap<String, ActorRow>, sqlx::Error> {
         if dids.is_empty() {
             return Ok(HashMap::new());
         }

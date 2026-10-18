@@ -13,7 +13,7 @@ use super::{CountMode, Hydrator, PostRow, PublicEmit, ViewError, ViewResult, Vie
 use crate::aggregations::counts::Counts;
 use crate::config::BookmarkCount;
 use crate::db::locks::uri_author;
-use crate::moderation::{self, Gate};
+use crate::moderation::Gate;
 use crate::hydration::HydrationError;
 use crate::xrpc::pools::{Exhausted, Requester};
 
@@ -305,7 +305,7 @@ impl Hydrator {
         };
         let labels = self.load_labels(&all_uris).await?;
         let counts = self.constellation_counts(req, &uris, mode).await;
-        let gates = moderation::gate_many(self.pool(), &all_uris).await?;
+        let gates = self.gate_many(req, &all_uris).await?;
         // A postgate counts only under its post's record key and author.
         let detached: Vec<(String, Vec<String>)> = sqlx::query_as(
             "SELECT post_uri, detached_embedding_uris FROM postgates WHERE post_uri = ANY($1) \
@@ -445,7 +445,7 @@ impl Hydrator {
         let missing: Vec<String> = wanted.iter().filter(|u| !ctx.posts.contains_key(*u)).cloned().collect();
         if !missing.is_empty() {
             // §8.3 step 0: the moderation gate before any upstream source.
-            let gates = moderation::gate_many(self.pool(), &missing).await?;
+            let gates = self.gate_many(req, &missing).await?;
             // A post this AppView saw deleted is not fetched from upstream,
             // whose copies (and the read-time cache of them) can outlive the
             // delete.
@@ -553,7 +553,7 @@ impl Hydrator {
         let ctx = self.post_context(viewer, req, &uris, CountMode::List).await?;
         let originators: Vec<String> = items.iter().map(|i| i.originator_did.clone()).collect();
         let reposters = self.profile_context(viewer, req, &originators, None).await?;
-        let originator_gates = moderation::gate_many(self.pool(), &originators).await?;
+        let originator_gates = self.gate_many(req, &originators).await?;
         let op_paths = self.op_paths(&ctx.posts, &uris).await?;
         let mut out = Vec::new();
         for item in items {
@@ -607,7 +607,7 @@ impl Hydrator {
         let Some(did) = self.resolve_actor(req, actor).await? else {
             return Ok(Err(ViewError::new("InvalidRequest", "Profile not found")));
         };
-        if let Some((error, message)) = moderation::gate(self.pool(), &did).await?.profile_error() {
+        if let Some((error, message)) = self.gate(req, &did).await?.profile_error() {
             return Ok(Err(ViewError::new(error, message)));
         }
         let rel = self.actor_viewer(viewer, std::slice::from_ref(&did)).await?;
@@ -779,7 +779,7 @@ impl Hydrator {
             return Ok(Err(unknown()));
         };
         let owner = uri_author(list).unwrap_or_default().to_string();
-        let gates = moderation::gate_many(self.pool(), &[owner, list.to_string()]).await?;
+        let gates = self.gate_many(req, &[owner, list.to_string()]).await?;
         if gates.values().any(|g| g.is_hidden()) {
             return Ok(Err(unknown()));
         }
@@ -964,7 +964,7 @@ impl Hydrator {
 
     async fn visible_actors(&self, viewer: &Viewer, req: &Requester, actors: Vec<(String, DateTime<Utc>)>) -> Result<(Vec<(String, DateTime<Utc>)>, ProfileContext), sqlx::Error> {
         let dids: Vec<String> = actors.iter().map(|(d, _)| d.clone()).collect();
-        let gates = moderation::gate_many(self.pool(), &dids).await?;
+        let gates = self.gate_many(req, &dids).await?;
         let ctx = self.profile_context(viewer, req, &dids, None).await?;
         let kept = actors
             .into_iter()
@@ -981,7 +981,7 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn get_likes(&self, viewer: &Viewer, req: &Requester, uri: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
-        if is_private_uri(uri) || moderation::gate(self.pool(), uri).await?.is_hidden() {
+        if is_private_uri(uri) || self.gate(req, uri).await?.is_hidden() {
             return Ok(Ok(Self::emit(json!({ "uri": uri, "likes": [] }))));
         }
         let (actors, next) = self.interaction_actors(req, uri, NSID_LIKE, limit, cursor).await?;
@@ -1003,7 +1003,7 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn get_reposted_by(&self, viewer: &Viewer, req: &Requester, uri: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
-        if is_private_uri(uri) || moderation::gate(self.pool(), uri).await?.is_hidden() {
+        if is_private_uri(uri) || self.gate(req, uri).await?.is_hidden() {
             return Ok(Ok(Self::emit(json!({ "uri": uri, "repostedBy": [] }))));
         }
         let (actors, next) = self.interaction_actors(req, uri, NSID_REPOST, limit, cursor).await?;
@@ -1024,7 +1024,7 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn get_quotes(&self, viewer: &Viewer, req: &Requester, uri: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
-        if is_private_uri(uri) || moderation::gate(self.pool(), uri).await?.is_hidden() {
+        if is_private_uri(uri) || self.gate(req, uri).await?.is_hidden() {
             return Ok(Ok(Self::emit(json!({ "uri": uri, "posts": [] }))));
         }
         let (c1, c2) = cursor

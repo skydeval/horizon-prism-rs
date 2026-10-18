@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use super::normalize::NormalizeReport;
 use super::{CountMode, HydrationError, Hydrator, PublicEmit, Viewer};
 use crate::db::locks::uri_author;
-use crate::moderation::{self, Gate};
+use crate::moderation::Gate;
 use crate::threadlens::gaps::Gap;
 use crate::xrpc::pools::Requester;
 
@@ -249,13 +249,14 @@ pub fn named_accounts(view: &Value) -> HashSet<String> {
 
 impl Hydrator {
     /// The §7.10 gate for a lens URI: `Hidden` and `Collapsed` (`!hide`) are
-    /// both not shown, and no source is consulted.
+    /// both not shown, and no source is consulted. The author's status is
+    /// read only if it is in S or a member (§11 G-9).
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn lens_visible(&self, uri: &str) -> Result<bool, sqlx::Error> {
-        Ok(moderation::gate(self.pool(), uri).await? == Gate::Visible)
+    pub async fn lens_visible(&self, req: &Requester, uri: &str) -> Result<bool, sqlx::Error> {
+        Ok(self.gate(req, uri).await? == Gate::Visible)
     }
 
     /// The baseline (§5.15.7): the tree the ordinary thread view returns

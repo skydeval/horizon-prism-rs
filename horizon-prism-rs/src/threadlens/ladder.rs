@@ -106,7 +106,7 @@ impl Ladder {
             return Ok(Resolved::Gap(Gap::NotFound));
         };
         // 2. The gate, tombstones, local posts.
-        if !self.hydrator.lens_visible(uri).await? {
+        if !self.hydrator.lens_visible(req, uri).await? {
             return Ok(Resolved::Gap(Gap::NotFound));
         }
         if self.hydrator.tombstoned(uri).await? {
