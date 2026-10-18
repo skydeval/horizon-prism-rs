@@ -314,7 +314,7 @@ impl Hydrator {
             return Ok(None);
         }
         let shown: Vec<String> = likers.iter().take(KNOWN_LIKERS_SHOWN).cloned().collect();
-        let ctx = self.profile_context(viewer, req, &shown, None).await?;
+        let ctx = self.profile_context(viewer, req, &shown, None, super::Tiers::List).await?;
         let actors: Vec<Value> = shown.iter().map(|d| ctx.view(d, ProfileKind::Basic)).collect();
         Ok(Some(json!({"count": likers.len(), "actors": actors})))
     }
@@ -579,7 +579,7 @@ impl Hydrator {
             }
         }
 
-        let mut ctx = self.post_context(viewer, req, &uris, CountMode::List).await?;
+        let mut ctx = self.thread_post_context(viewer, req, &uris, CountMode::List, uri_author(uri).unwrap_or_default()).await?;
         let anchor_counts = self
             .constellation_counts(req, std::slice::from_ref(&uri.to_string()), CountMode::Sync { started })
             .await;

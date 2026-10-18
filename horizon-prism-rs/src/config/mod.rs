@@ -27,7 +27,7 @@ pub use sections::{
     IndexRequestConfig, PrivateNotifyConfig, PrivateReadConfig, PrivateReadFloors, PrivateSearchConfig, PublicScope, RateClassConfig, RateLimitsConfig,
     RetentionConfig, SchemaBackfillConfig, SearchConfig, SuggestionsConfig, LiveNow, UnspeccedConfig, SuggestedTopic, TrendsConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ServiceConfig, ServiceState, StorageConfig,
     StarterPacksConfig, SyncConfig, ThreadConfig, ThreadMutesConfig, ThreadV2Config, UtcTimeOfDay, VideoConfig,
-    VideoPlayback,
+    VideoPlayback, background_burst, background_rate_per_sec,
 };
 #[cfg(feature = "bench-heads")]
 pub use sections::BenchConfig;

@@ -282,6 +282,9 @@ struct Work<'a> {
     /// URIs of post views fetched by bridging, whose embedded authors are
     /// judged before the response goes out.
     bridged: Vec<String>,
+    /// URIs of post views built from the record alone (Slingshot), whose
+    /// authors the author pass fills in.
+    from_record: HashSet<String>,
     key: &'a CursorKey,
     /// Whether bridging is on for the request.
     bridging: bool,
@@ -305,8 +308,16 @@ impl Work<'_> {
     }
 
     fn ladder_node(&mut self, resolved: Resolved, uri: &str, parent_uri: Option<String>) -> LensNode {
+        let resolved_kind = match &resolved {
+            Resolved::RecordPost(_) => Some(true),
+            Resolved::Post(_) => Some(false),
+            Resolved::Gap(_) => None,
+        };
         match resolved {
-            Resolved::Post(post) => {
+            Resolved::Post(post) | Resolved::RecordPost(post) => {
+                if matches!(&resolved_kind, Some(true)) {
+                    self.from_record.insert(uri.to_string());
+                }
                 self.bridged.push(uri.to_string());
                 let mut node = LensNode::post(post);
                 if let LensNode::Post { parent_uri: own, .. } = &mut node
@@ -360,8 +371,9 @@ impl Work<'_> {
             match self.judge.verdict(uri_author(&uri).unwrap_or_default()) {
                 Some(Verdict::Clear) => {
                     let parent = self.nodes[i].parent_uri().map(str::to_string);
-                    if let Resolved::Post(post) = self.fetch(&uri).await? {
-                        self.nodes[i] = self.ladder_node(Resolved::Post(post), &uri, parent);
+                    let resolved = self.fetch(&uri).await?;
+                    if !matches!(resolved, Resolved::Gap(_)) {
+                        self.nodes[i] = self.ladder_node(resolved, &uri, parent);
                     }
                 }
                 Some(Verdict::Undetermined) | None => self.limited = true,
@@ -690,6 +702,57 @@ impl Work<'_> {
         }
         Ok(())
     }
+
+    /// The author pass (design-v4 §8.1): a post built from its record
+    /// carries `{did, handle}`. Its author, when not readable, takes the
+    /// profile tiers, and a resolved one becomes the batch's
+    /// `profileViewBasic` with the node's own `viewer` and `labels`, which
+    /// carry the request's block state. No viewer state is computed, so no
+    /// Farsight lookup is made outside the judged rounds.
+    async fn author_pass(&mut self) {
+        let mut dids: Vec<String> = self
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                LensNode::Post { uri, .. } if self.from_record.contains(uri) => uri_author(uri).map(str::to_string),
+                _ => None,
+            })
+            .collect();
+        dids.sort_unstable();
+        dids.dedup();
+        if dids.is_empty() {
+            return;
+        }
+        let h = self.ladder.hydrator();
+        let readable = h.readable_dids(&dids).await;
+        dids.retain(|d| !readable.contains(d));
+        let remote = h.remote_profiles(self.r.req, &dids).await;
+        for node in &mut self.nodes {
+            let LensNode::Post { uri, post, .. } = node else {
+                continue;
+            };
+            if !self.from_record.contains(uri) {
+                continue;
+            }
+            let Some(view) = uri_author(uri).and_then(|d| remote.get(d)) else {
+                continue;
+            };
+            set_author(post, view);
+        }
+    }
+}
+
+/// Replace `post.author` with the remote `view` projected to
+/// `profileViewBasic`, keeping the author's own `viewer` and `labels`.
+pub(crate) fn set_author(post: &mut Value, view: &Value) {
+    let mut author = crate::hydration::profile_refresh::project(view, crate::hydration::actor::ProfileKind::Basic);
+    let old = post.get("author");
+    for key in ["did", "viewer", "labels"] {
+        if let Some(v) = old.and_then(|a| a.get(key)) {
+            author.insert(key.to_string(), v.clone());
+        }
+    }
+    post["author"] = Value::Object(author);
 }
 
 /// The nodes for a `getThread` response.
@@ -746,6 +809,7 @@ pub async fn get_thread(
         parent_rounds: cfg.parent_rounds,
         limited: false,
         bridged: Vec::new(),
+        from_record: HashSet::new(),
         key,
         bridging,
         start: cursor,
@@ -786,6 +850,7 @@ pub async fn get_thread(
         }
     }
     work.enforce().await?;
+    work.author_pass().await;
     let bridging = match (bridging, work.limited) {
         (false, _) => Bridging::Off,
         (true, true) => Bridging::Limited,
@@ -833,6 +898,7 @@ pub async fn resolve(
         parent_rounds: 0,
         limited: false,
         bridged: Vec::new(),
+        from_record: HashSet::new(),
         key,
         bridging,
         start: None,
@@ -867,6 +933,7 @@ pub async fn resolve(
         work.nodes.push(node);
     }
     work.enforce().await?;
+    work.author_pass().await;
     let bridging = match (bridging, work.limited) {
         (false, _) => Bridging::Off,
         (true, true) => Bridging::Limited,

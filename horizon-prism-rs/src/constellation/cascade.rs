@@ -28,7 +28,7 @@ use super::classifier::{Class, classify};
 use super::routing::RoutingTable;
 use crate::appview_clients::AppViewClient;
 use crate::net::{NetError, NetResponse};
-use crate::xrpc::pools::{Requester, SharedBucket, Shares};
+use crate::xrpc::pools::{BackgroundBucket, Requester, SharedBucket, Shares};
 
 /// Consecutive failures that open a breaker.
 pub const BREAKER_THRESHOLD: u32 = 5;
@@ -214,6 +214,8 @@ impl Drop for Admission<'_> {
 #[derive(Debug, Clone, Copy)]
 pub enum Call<'a> {
     Profile(&'a str),
+    /// `getProfiles`, at most 25 actors.
+    Profiles(&'a [String]),
     Posts(&'a [String]),
     PostThread { uri: &'a str, depth: u32, parent_height: u32 },
     AuthorFeed { actor: &'a str, limit: u32, cursor: Option<&'a str>, filter: &'a str },
@@ -230,6 +232,7 @@ impl Call<'_> {
     async fn invoke(self, client: &AppViewClient) -> Result<NetResponse, NetError> {
         match self {
             Self::Profile(actor) => client.get_profile(actor).await,
+            Self::Profiles(actors) => client.get_profiles(actors).await,
             Self::Posts(uris) => client.get_posts(uris).await,
             Self::PostThread { uri, depth, parent_height } => client.get_post_thread(uri, depth, parent_height).await,
             Self::AuthorFeed { actor, limit, cursor, filter } => client.get_author_feed(actor, limit, cursor, filter).await,
@@ -281,7 +284,43 @@ impl Fetched {
 struct NetworkState {
     client: AppViewClient,
     bucket: Option<SharedBucket>,
+    /// The background profile refresh's bucket (design-v4 §8.1).
+    background: BackgroundBucket,
     breaker: SharedBreaker,
+}
+
+/// `profile_batch_fetch_total{network, result}`: upstream `getProfiles`
+/// calls of the per-response profile batch and of `getProfiles` (design-v4
+/// §8.1, §14.2). `result` is `ok`, `budget`, `transient` (with
+/// `auth-refused`) or `error`.
+pub const METRIC_PROFILE_BATCH: &str = "profile_batch_fetch_total";
+
+/// Who walks the networks for a batch of profiles (design-v4 §8.1).
+#[derive(Debug, Clone, Copy)]
+pub enum ProfileWalk<'a> {
+    /// A request: one token of each network's request bucket on `req`'s
+    /// share (an empty one ends the walk), and nothing past `until`. A
+    /// network that refuses or fails is passed over.
+    Request { req: &'a Requester, until: Instant },
+    /// The background refresh: each step waits for the network's
+    /// background bucket and calls with `origin="background"`. A transient
+    /// answer, an auth refusal or an open breaker drops the rest of the
+    /// batch.
+    Background,
+}
+
+/// What a profile walk found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProfilesFetched {
+    /// The views found, by DID.
+    pub found: HashMap<String, Value>,
+    /// DIDs that every callable network answered with a 2xx that omitted
+    /// them, there being at least one callable network (design-v4 §8.1
+    /// "Negative entries").
+    pub absent: Vec<String>,
+    /// A background walk that was dropped for a transient answer, an auth
+    /// refusal or an open breaker.
+    pub dropped: bool,
 }
 
 /// The cascade. Cheap to clone.
@@ -303,11 +342,13 @@ impl Cascade {
                     .network(client.network())
                     .and_then(|n| n.rate)
                     .map(|(rate, burst)| shares.bucket("network", f64::from(rate), burst));
+                let (per_sec, burst) = table.network(client.network()).map_or((1.0, 2), |n| (n.background.0.0, n.background.1));
                 (
                     client.network().to_string(),
                     NetworkState {
                         client,
                         bucket,
+                        background: BackgroundBucket::new(per_sec, burst),
                         breaker: SharedBreaker::default(),
                     },
                 )
@@ -337,6 +378,125 @@ impl Cascade {
         if let Some(s) = self.networks.get(network) {
             s.breaker.force_half_open();
         }
+    }
+
+    /// Walk `plan` for the profiles of `dids` (at most 25) with
+    /// `getProfiles`, each network asked only for the DIDs still missing
+    /// (design-v4 §8.1 "Batch routing", "Drain").
+    pub async fn fetch_profiles(&self, walk: ProfileWalk<'_>, plan: &[String], dids: &[String]) -> ProfilesFetched {
+        let mut missing: Vec<String> = Vec::new();
+        for d in dids.iter().take(25) {
+            if !missing.contains(d) {
+                missing.push(d.clone());
+            }
+        }
+        let asked = missing.clone();
+        let mut out = ProfilesFetched::default();
+        // DID → the networks that answered a 2xx without it.
+        let mut absent_from: HashMap<String, Vec<String>> = HashMap::new();
+        let (origin, endpoint) = match walk {
+            ProfileWalk::Request { req, .. } => req.labels(),
+            ProfileWalk::Background => (crate::xrpc::pools::ORIGIN_BACKGROUND, String::new()),
+        };
+        for name in plan {
+            if missing.is_empty() {
+                break;
+            }
+            let Some(state) = self.networks.get(name) else {
+                continue;
+            };
+            let (admission, result) = match walk {
+                ProfileWalk::Request { req, until } => {
+                    let now = Instant::now();
+                    if now >= until {
+                        metrics::counter!(METRIC_SKIPPED, "network" => name.clone(), "reason" => "deadline").increment(1);
+                        if now >= req.deadline() {
+                            metrics::counter!(METRIC_DEADLINE_EXCEEDED).increment(1);
+                        }
+                        break;
+                    }
+                    let Some(admission) = state.breaker.admit(now) else {
+                        metrics::counter!(METRIC_SKIPPED, "network" => name.clone(), "reason" => "breaker_open").increment(1);
+                        continue;
+                    };
+                    // An empty share or pool ends the walk; it is no breaker
+                    // record, and no answer for the DIDs still missing.
+                    if state.bucket.as_ref().is_some_and(|b| !req.draw(b)) {
+                        metrics::counter!(METRIC_SKIPPED, "network" => name.clone(), "reason" => "rate_limited").increment(1);
+                        drop(admission);
+                        break;
+                    }
+                    let Ok(result) = tokio::time::timeout(until - now, Call::Profiles(&missing).invoke(&state.client)).await else {
+                        // The window or the request's deadline cut the call:
+                        // `budget`, never a breaker record (R3-174).
+                        metrics::counter!(METRIC_BUDGET_CUTOFF, "network" => name.clone()).increment(1);
+                        metrics::counter!(METRIC_PROFILE_BATCH, "network" => name.clone(), "result" => "budget").increment(1);
+                        drop(admission);
+                        break;
+                    };
+                    (admission, result)
+                }
+                ProfileWalk::Background => {
+                    state.background.acquire().await;
+                    let Some(admission) = state.breaker.admit(Instant::now()) else {
+                        metrics::counter!(METRIC_SKIPPED, "network" => name.clone(), "reason" => "breaker_open").increment(1);
+                        out.dropped = true;
+                        return out;
+                    };
+                    (admission, Call::Profiles(&missing).invoke(&state.client).await)
+                }
+            };
+            let two_xx = result.as_ref().is_ok_and(NetResponse::is_success);
+            let (class, body) = classify(&result);
+            admission.record(class, Instant::now());
+            metrics::counter!(METRIC_CALLS, "network" => name.clone(), "class" => class.label(), "origin" => origin, "endpoint" => endpoint.clone())
+                .increment(1);
+            if class == Class::AuthRefused {
+                metrics::counter!(METRIC_AUTH_REFUSED, "network" => name.clone()).increment(1);
+            }
+            let profiles = body.as_ref().and_then(|b| b.get("profiles")).and_then(Value::as_array);
+            if matches!(walk, ProfileWalk::Request { .. }) {
+                let label = match (class, profiles.is_some()) {
+                    (Class::Hit, true) => "ok",
+                    // A 2xx that is not a `getProfiles` answer.
+                    _ if two_xx => "error",
+                    (Class::Transient | Class::AuthRefused, _) => "transient",
+                    _ => "error",
+                };
+                metrics::counter!(METRIC_PROFILE_BATCH, "network" => name.clone(), "result" => label).increment(1);
+            }
+            match (class, profiles) {
+                (Class::Hit, Some(profiles)) => {
+                    for p in profiles {
+                        if let Some(did) = p.get("did").and_then(Value::as_str)
+                            && missing.iter().any(|m| m == did)
+                        {
+                            out.found.insert(did.to_string(), p.clone());
+                        }
+                    }
+                    missing.retain(|d| !out.found.contains_key(d));
+                    for d in &missing {
+                        absent_from.entry(d.clone()).or_default().push(name.clone());
+                    }
+                }
+                (Class::Transient | Class::AuthRefused, _) if matches!(walk, ProfileWalk::Background) => {
+                    out.dropped = true;
+                    return out;
+                }
+                // Not found or withheld there, or a 2xx that is no
+                // answer: no 2xx for these DIDs from this network.
+                _ => {}
+            }
+        }
+        let callable: Vec<&str> = self.table.networks().iter().filter(|n| n.callable()).map(|n| n.name.as_str()).collect();
+        if !callable.is_empty() {
+            out.absent = asked
+                .into_iter()
+                .filter(|d| !out.found.contains_key(d))
+                .filter(|d| absent_from.get(d).is_some_and(|answered| callable.iter().all(|c| answered.iter().any(|n| n == c))))
+                .collect();
+        }
+        out
     }
 
     /// Run `call` through the plan for a DID whose home network is `home`.

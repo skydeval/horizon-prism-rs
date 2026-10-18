@@ -195,7 +195,7 @@ impl Hydrator {
         .await?;
         let seen = self.seen_at(me).await?;
         let authors: Vec<String> = rows.iter().map(|r| r.author_did.clone()).collect();
-        let ctx = self.profile_context(viewer, req, &authors, None).await?;
+        let ctx = self.profile_context(viewer, req, &authors, None, super::Tiers::List).await?;
         let records = self.notification_records(&rows).await?;
         let profile_cids = self.profile_cids(&rows).await?;
         let labels = self.load_labels(&rows.iter().map(|r| r.record_uri.clone()).collect::<Vec<_>>()).await?;

@@ -256,12 +256,25 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn post_context(&self, viewer: &Viewer, req: &Requester, uris: &[String], mode: CountMode) -> Result<PostContext, sqlx::Error> {
-        self.post_context_for(Some(viewer), req, uris, mode).await
+        self.post_context_for(Some(viewer), req, uris, mode, &[], &[]).await
+    }
+
+    /// [`Hydrator::post_context`] for a thread: `anchor_author`'s profile,
+    /// when it is not readable, takes the per-DID path (design-v4 §8.1
+    /// single-object views), on a detached exhaustion record.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn thread_post_context(&self, viewer: &Viewer, req: &Requester, uris: &[String], mode: CountMode, anchor_author: &str) -> Result<PostContext, sqlx::Error> {
+        self.post_context_for(Some(viewer), req, uris, mode, &[anchor_author.to_string()], &[]).await
     }
 
     /// [`Hydrator::post_context`]; with `viewer = None` no viewer state is
     /// computed at all (Thread Lens, §10.3: never `actor_viewer` or
-    /// `post_viewer`).
+    /// `post_viewer`). The authors in `single` take the per-DID profile
+    /// path (design-v4 §8.1). The profiles of `also` are loaded with the
+    /// authors', so a feed's reposters share its one profile batch.
     ///
     /// # Errors
     ///
@@ -272,6 +285,8 @@ impl Hydrator {
         req: &Requester,
         uris: &[String],
         mode: CountMode,
+        single: &[String],
+        also: &[String],
     ) -> Result<PostContext, sqlx::Error> {
         let uris: Vec<String> = uris.iter().filter(|u| !is_private_uri(u)).cloned().collect();
         let mut posts = self.load_posts(&uris).await?;
@@ -299,9 +314,14 @@ impl Hydrator {
                 authors.push(a.to_string());
             }
         }
+        for d in also {
+            if !authors.contains(d) {
+                authors.push(d.clone());
+            }
+        }
         let (profiles, viewers) = match viewer {
-            Some(v) => (self.profile_context(v, req, &authors, None).await?, self.post_viewer(v, &all_uris).await?),
-            None => (self.anonymous_profile_context(&authors).await?, HashMap::new()),
+            Some(v) => (self.profile_context(v, req, &authors, None, super::Tiers::ListAnd { single }).await?, self.post_viewer(v, &all_uris).await?),
+            None => (self.anonymous_profile_context(req, &authors).await?, HashMap::new()),
         };
         let labels = self.load_labels(&all_uris).await?;
         let counts = self.constellation_counts(req, &uris, mode).await;
@@ -550,9 +570,11 @@ impl Hydrator {
     /// Database errors.
     pub async fn feed_views(&self, viewer: &Viewer, req: &Requester, items: &[FeedItem]) -> Result<Vec<Value>, sqlx::Error> {
         let uris: Vec<String> = items.iter().map(|i| i.post_uri.clone()).collect();
-        let ctx = self.post_context(viewer, req, &uris, CountMode::List).await?;
         let originators: Vec<String> = items.iter().map(|i| i.originator_did.clone()).collect();
-        let reposters = self.profile_context(viewer, req, &originators, None).await?;
+        // The reposters' profiles come with the authors', in one profile
+        // context: one batch for the response (design-v4 §8.1).
+        let ctx = self.post_context_for(Some(viewer), req, &uris, CountMode::List, &[], &originators).await?;
+        let reposters = &ctx.profiles;
         let originator_gates = self.gate_many(req, &originators).await?;
         let op_paths = self.op_paths(&ctx.posts, &uris).await?;
         let mut out = Vec::new();
@@ -965,7 +987,7 @@ impl Hydrator {
     async fn visible_actors(&self, viewer: &Viewer, req: &Requester, actors: Vec<(String, DateTime<Utc>)>) -> Result<(Vec<(String, DateTime<Utc>)>, ProfileContext), sqlx::Error> {
         let dids: Vec<String> = actors.iter().map(|(d, _)| d.clone()).collect();
         let gates = self.gate_many(req, &dids).await?;
-        let ctx = self.profile_context(viewer, req, &dids, None).await?;
+        let ctx = self.profile_context(viewer, req, &dids, None, super::Tiers::List).await?;
         let kept = actors
             .into_iter()
             .filter(|(d, _)| {

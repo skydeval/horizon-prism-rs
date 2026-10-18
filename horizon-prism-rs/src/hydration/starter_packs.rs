@@ -183,7 +183,7 @@ impl Hydrator {
         let packs = self.load_packs(req, uris).await?;
         let found: Vec<&PackRow> = packs.values().collect();
         let creators: Vec<String> = found.iter().filter_map(|r| uri_author(&r.uri).map(str::to_string)).collect();
-        let ctx = self.profile_context(viewer, req, &creators, None).await?;
+        let ctx = self.profile_context(viewer, req, &creators, None, super::Tiers::List).await?;
         let pack_uris: Vec<String> = found.iter().map(|r| r.uri.clone()).collect();
         let (joined, labels) = (self.joined_counts(&pack_uris).await?, self.load_labels(&pack_uris).await?);
         let counts = self.local_list_counts(&found).await?;
@@ -272,7 +272,7 @@ impl Hydrator {
         let packs = self.load_packs(req, &uris).await?;
         let found: Vec<&PackRow> = uris.iter().filter_map(|u| packs.get(u)).collect();
         let creators: Vec<String> = found.iter().filter_map(|r| uri_author(&r.uri).map(str::to_string)).collect();
-        let ctx = self.profile_context(viewer, req, &creators, None).await?;
+        let ctx = self.profile_context(viewer, req, &creators, None, super::Tiers::List).await?;
         let pack_uris: Vec<String> = found.iter().map(|r| r.uri.clone()).collect();
         let (joined, labels) = (self.joined_counts(&pack_uris).await?, self.load_labels(&pack_uris).await?);
         let counts = if v2 { HashMap::new() } else { self.local_list_counts(&found).await? };
@@ -302,7 +302,7 @@ impl Hydrator {
         let packs = self.load_packs(req, uris).await?;
         let found: Vec<&PackRow> = uris.iter().filter_map(|u| packs.get(u)).collect();
         let creators: Vec<String> = found.iter().filter_map(|r| uri_author(&r.uri).map(str::to_string)).collect();
-        let ctx = self.profile_context(viewer, req, &creators, None).await?;
+        let ctx = self.profile_context(viewer, req, &creators, None, super::Tiers::List).await?;
         let pack_uris: Vec<String> = found.iter().map(|r| r.uri.clone()).collect();
         let (joined, labels) = (self.joined_counts(&pack_uris).await?, self.load_labels(&pack_uris).await?);
         Ok(found
@@ -347,7 +347,7 @@ impl Hydrator {
             .await?;
             let dids: Vec<String> = rows.iter().map(|(_, d)| d.clone()).collect();
             let gates = self.gate_many(req, &dids).await?;
-            let ctx = self.profile_context(viewer, req, &dids, None).await?;
+            let ctx = self.profile_context(viewer, req, &dids, None, super::Tiers::List).await?;
             let sample = rows
                 .iter()
                 .filter(|(_, d)| !gates.get(d).copied().unwrap_or(Gate::Visible).is_hidden())
@@ -379,7 +379,7 @@ impl Hydrator {
             (Vec::new(), None)
         };
 
-        let ctx = self.profile_context(viewer, req, std::slice::from_ref(&creator), None).await?;
+        let ctx = self.profile_context(viewer, req, std::slice::from_ref(&creator), None, super::Tiers::ListAnd { single: std::slice::from_ref(&creator) }).await?;
         let (joined, labels) = (self.joined_counts(&uris).await?, self.load_labels(&uris).await?);
         let mut view = Self::pack_basic(&row, &ctx, None, &joined, &labels);
         if let Some(obj) = view.as_object_mut() {
@@ -428,7 +428,7 @@ impl Hydrator {
         let uris: Vec<String> = rows.iter().map(|r| r.uri.clone()).collect();
         let lists: Vec<String> = rows.iter().map(|r| r.list_uri.clone()).collect();
         let member_of = self.memberships(&lists, &did).await?;
-        let people = self.profile_context(viewer, req, &[me.clone(), did.clone()], None).await?;
+        let people = self.profile_context(viewer, req, &[me.clone(), did.clone()], None, super::Tiers::List).await?;
         let (joined, labels) = (self.joined_counts(&uris).await?, self.load_labels(&uris).await?);
         let pds = people.rows.get(&me).and_then(|r| r.pds_endpoint.clone());
         let mut entries = Vec::with_capacity(rows.len());
@@ -505,7 +505,7 @@ impl Hydrator {
             .flatten();
         let uris: Vec<String> = rows.iter().map(|r| r.uri.clone()).collect();
         let gates = self.gate_many(req, &uris).await?;
-        let ctx = self.profile_context(viewer, req, std::slice::from_ref(&did), None).await?;
+        let ctx = self.profile_context(viewer, req, std::slice::from_ref(&did), None, super::Tiers::List).await?;
         let (joined, labels) = (self.joined_counts(&uris).await?, self.load_labels(&uris).await?);
         let refs: Vec<&PackRow> = rows.iter().collect();
         let counts = self.local_list_counts(&refs).await?;

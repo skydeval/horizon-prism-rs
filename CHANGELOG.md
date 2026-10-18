@@ -10,6 +10,54 @@ commit.
 
 ## [Unreleased]
 
+### Added (embedded profiles and the background refresh, #732, #731)
+
+- **Accounts outside the community show real profiles in list views
+  (#732).** Design-v4 §8.1's three tiers, as the profile refresh design
+  specifies, for every embedded profile of an account outside
+  `scope_dids ∪ members`: `rt` hits, then one synchronous upstream
+  `getProfiles` walk of the cascade, then the minimal form plus the
+  background refresh queue.
+  - One budget per request and mode: 25 accounts and an 800 ms window that
+    the request's first batch opens, shared by every hydration step of the
+    request (a feed's reposters now share its authors' batch). A
+    viewer-private or private-context part of a request has its own.
+  - The batch, and the thread anchor's author and `getList`'s and
+    `getStarterPack`'s top-level creators (which take the per-account
+    path), draw on a detached exhaustion record: an empty share ends that
+    fetch but never cuts a page or turns a response into a 429.
+  - Viewer-private listings (`getMutes`, `getListMutes`' creators,
+    `listActivitySubscriptions`) run the batch on the viewer's share into
+    the viewer's own cache, with no negative entry and no queue (C-P1 a).
+    Private-context hydration fetches nothing, as before.
+  - Thread Lens nodes built from a record, and `getAuthorPolls`' PDS-path
+    author, take the tiers through an author pass that computes no viewer
+    state, so it asks Farsight nothing.
+- **Negative profile entries.** An account every callable network answered
+  without gets `rt:profile-neg:{did}` for `cache.profile_negative_ttl_secs`;
+  list views then show it in the minimal form without asking. `getProfile`
+  and `getProfiles` never read it. `rt` entries now live by key class
+  (`cache.profile_ttl_secs` for profiles, `farsight.cache_ttl_secs` for
+  Farsight pair answers, 300 s otherwise).
+- **`getProfiles` asks once.** Handles resolve four at a time; out-of-scope
+  subjects take positive `rt` hits, then one walk of the cascade for all
+  the rest, and are normalized together (one Farsight lookup per request).
+  A subject no network has is omitted, with no Slingshot fallback. It
+  never queues.
+- **Background profile refresh.** One task drains the queue in batches of
+  25, grouped by a cache-only read of the `route` cache (it never resolves
+  an account), waiting on each network's own background bucket
+  (`background_rate_per_sec`, `background_burst`) with
+  `origin="background"`. A transient answer drops the batch with no retry;
+  a `community` route is walked like an unrouted account (C-P2 b).
+- Config: `cache.profile_ttl_secs` (3600), `cache.profile_negative_ttl_secs`
+  (900, at most the former), `cache.profile_refresh_max` (10 000), and
+  `background_rate_per_sec` (1.0) and `background_burst` (2) on each
+  `[[constellation.networks]]` entry (ignored on `community`).
+- Metrics (finishes #731): `profile_batch_fetch_total{network,result}`,
+  `profile_refresh_queue`, `profile_refresh_dropped_total`,
+  `profile_refresh_completed_total` and `profile_refresh_negative_total`.
+
 ### Fixed (embedded profile rows, #734)
 
 - **A member could tell whether an account had a private tie (#734).**

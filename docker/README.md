@@ -515,6 +515,9 @@ Other series, one line each (the sections above name the rest):
 - `upstream_view_counts_total{source}`: where the counts of a view fetched from another AppView came from.
 - `starter_pack_counts_refreshed_total{source}`: starter-pack counts recounted, by source.
 - `viewer_private_cache_entries` and `viewer_private_cache_evictions_total`: the per-member cache of private lookups, its size and the entries its bounds pushed out.
+- `profile_batch_fetch_total{network,result}`: `getProfiles` calls made for the profiles embedded in a response and for `getProfiles` itself: `ok`, `budget` (cut by the 800 ms window or the request's deadline), `transient` (with refused authentication) or `error`.
+- `profile_refresh_queue`, `profile_refresh_dropped_total` and `profile_refresh_completed_total`: accounts waiting for the background profile refresh, accounts refused because the queue held `cache.profile_refresh_max`, and refresh batches finished. Its calls count in `upstream_calls_total{origin="background"}`, at most `background_rate_per_sec` per network.
+- `profile_refresh_negative_total`: accounts recorded as absent from every network, which list views then show in the minimal form for `cache.profile_negative_ttl_secs` without asking again.
 - `host_budget_buckets`: per-host budget buckets held for the prober, backfill and read fetches.
 - `sync_head_check_seconds`: how long a repository head check took.
 - `sync_divergence_detected_total`: repositories whose head stayed ahead of what was indexed past the grace period; their readiness is cleared and they are checked again.

@@ -154,7 +154,7 @@ async fn surfaces(h: &Hydrator, did: &str) -> Vec<(&'static str, String)> {
 
     // Thread Lens: a node's author (no viewer state) and the gate on a
     // node by `did`.
-    let lens = h.anonymous_profile_context(&[did.to_string()]).await.expect("db");
+    let lens = h.anonymous_profile_context(&Requester::test(), &[did.to_string()]).await.expect("db");
     out.push(("Thread Lens author", masked(&lens.view(did, ProfileKind::Basic), did)));
     let visible = h.lens_visible(&req, &post_uri(did)).await.expect("db");
     out.push(("Thread Lens gate", visible.to_string()));

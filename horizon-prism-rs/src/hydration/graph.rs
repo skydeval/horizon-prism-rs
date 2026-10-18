@@ -79,7 +79,7 @@ impl Hydrator {
         let gates = self.gate_many(req, &dids).await?;
         let mut all = dids.clone();
         all.push(subject.to_string());
-        let ctx = self.profile_context(viewer, req, &all, None).await?;
+        let ctx = self.profile_context(viewer, req, &all, None, super::Tiers::List).await?;
         let list: Vec<Value> = dids
             .iter()
             .filter(|d| !gates.get(*d).copied().unwrap_or(Gate::Visible).is_hidden() && !ctx.viewer.blocked_either_way(d))
@@ -201,7 +201,7 @@ impl Hydrator {
             .then(|| rows.last().map(|(d, t)| local_cursor(*t, d)))
             .flatten();
         let dids: Vec<String> = rows.into_iter().map(|(d, _)| d).collect();
-        let ctx = self.profile_context(viewer, req, &dids, None).await?;
+        let ctx = self.profile_context(viewer, req, &dids, None, super::Tiers::List).await?;
         let mut out = json!({ "mutes": dids.iter().map(|d| ctx.view(d, ProfileKind::View)).collect::<Vec<_>>() });
         if let Some(c) = next {
             out["cursor"] = json!(c);
@@ -282,7 +282,7 @@ impl Hydrator {
             .flatten();
         let dids: Vec<String> = rows.into_iter().map(|(d, _, _)| d).collect();
         let gates = self.gate_many(req, &dids).await?;
-        let ctx = self.profile_context(viewer, req, &dids, None).await?;
+        let ctx = self.profile_context(viewer, req, &dids, None, super::Tiers::List).await?;
         let blocks: Vec<Value> = dids
             .iter()
             .filter(|d| !gates.get(*d).copied().unwrap_or(Gate::Visible).is_hidden())
@@ -423,7 +423,7 @@ impl Hydrator {
         let mut shown: Vec<String> = found.iter().flat_map(|(_, known)| known.iter().take(KNOWN_FOLLOWERS_SHOWN)).cloned().collect();
         shown.sort_unstable();
         shown.dedup();
-        let ctx = self.profile_context(viewer, req, &shown, None).await?;
+        let ctx = self.profile_context(viewer, req, &shown, None, super::Tiers::List).await?;
         Ok(found
             .into_iter()
             .map(|(subject, known)| {
@@ -719,7 +719,7 @@ mod tests {
         // B-34: scoped mutes. A repeat call replaces the scope and keeps the
         // row's created_at; `getMutes` lists full mutes only.
         let viewer_of_bob = || async {
-            let ctx = h.profile_context(&me, &req, &[BOB.to_string()], None).await.expect("ctx");
+            let ctx = h.profile_context(&me, &req, &[BOB.to_string()], None, crate::hydration::Tiers::List).await.expect("ctx");
             ctx.view(BOB, ProfileKind::View)["viewer"].clone()
         };
         let created = || async {

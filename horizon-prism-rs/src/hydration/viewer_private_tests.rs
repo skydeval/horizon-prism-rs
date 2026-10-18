@@ -142,7 +142,8 @@ async fn covered_call_sites_fetch_viewer_private() {
     all_private(&up.take_modes(), "getBookmarks");
     // The same post for an anonymous public request: an ordinary fetch.
     h.get_posts(&Viewer::anonymous(), &req, std::slice::from_ref(&gated)).await.expect("db").expect("posts");
-    assert_eq!(up.take_modes(), [(format!("record {gate_list}"), false)]);
+    // BOB is outside S: a public request's list view takes the tiers.
+    assert_eq!(up.take_modes(), [(format!("profiles {BOB}"), false), (format!("record {gate_list}"), false)]);
     db.drop_db().await;
 }
 
@@ -210,10 +211,11 @@ async fn private_context_hydration_fetches_nothing() {
     let parent = ctx.public_post(&gated).await.expect("db").expect("stored");
     assert_eq!(parent.inner()["threadgate"]["lists"], json!([]));
     assert_eq!(up.take_modes(), Vec::<(String, bool)>::new(), "no upstream call");
-    // Viewer-private mode alone still fetches (from Slingshot, past the
-    // shared caches): private-context hydration is more than that.
-    h.profile_context(&me, &req.viewer_private(ALICE), &[FAR.to_string()], None).await.expect("db");
-    assert_eq!(up.take_modes(), [(format!("record {muted}"), true)]);
+    // Viewer-private mode alone still fetches (the profile batch and
+    // Slingshot, past the shared caches): private-context hydration is
+    // more than that.
+    h.profile_context(&me, &req.viewer_private(ALICE), &[FAR.to_string()], None, super::Tiers::List).await.expect("db");
+    assert_eq!(up.take_modes(), [(format!("profiles {FAR}"), true), (format!("record {muted}"), true)]);
     db.drop_db().await;
 }
 

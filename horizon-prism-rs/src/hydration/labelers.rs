@@ -101,7 +101,7 @@ impl Hydrator {
         }
         let shown: Vec<String> = wanted.iter().filter(|d| services.contains_key(*d) && !hidden(d)).cloned().collect();
         let shown_uris: Vec<String> = shown.iter().map(|d| service_uri(d)).collect();
-        let creators = self.profile_context(viewer, req, &shown, None).await?;
+        let creators = self.profile_context(viewer, req, &shown, None, super::Tiers::List).await?;
         let labels = self.load_labels(&shown_uris).await?;
         // Like counts: the first labelers of the request while it waits,
         // the rest from what is cached; the likes stored here otherwise.

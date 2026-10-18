@@ -613,11 +613,19 @@ pub async fn run() -> Result<(), StartupError> {
         crate::appview_clients::from_config(&cfg.file.constellation, nets.public().client(), &glue.service_key),
         &shares,
     );
-    let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes).with_private(crate::hydration::cache::PrivateCacheSettings {
-        ttl: Duration::from_secs(cfg.file.cache.viewer_private_ttl_secs),
-        max_entries: cfg.file.cache.viewer_private_max,
-        per_viewer_max: usize::try_from(cfg.file.cache.viewer_private_per_viewer_max).unwrap_or(usize::MAX),
-    });
+    let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes)
+        .with_ttls(crate::hydration::cache::RtTtls {
+            profile: Duration::from_secs(cfg.file.cache.profile_ttl_secs),
+            negative: Duration::from_secs(cfg.file.cache.profile_negative_ttl_secs),
+            farsight_pair: Duration::from_secs(cfg.file.farsight.cache_ttl_secs),
+            other: crate::hydration::cache::TTL,
+        })
+        .with_private(crate::hydration::cache::PrivateCacheSettings {
+            ttl: Duration::from_secs(cfg.file.cache.viewer_private_ttl_secs),
+            max_entries: cfg.file.cache.viewer_private_max,
+            per_viewer_max: usize::try_from(cfg.file.cache.viewer_private_per_viewer_max).unwrap_or(usize::MAX),
+        });
+    let profile_queue = crate::hydration::ProfileQueue::new(cfg.file.cache.profile_refresh_max);
     // `viewer_private_cache_entries` and `host_budget_buckets`: sampled
     // once now, so both exist from the start, then every
     // `PROCESS_GAUGES_EVERY`.
@@ -683,8 +691,12 @@ pub async fn run() -> Result<(), StartupError> {
                 microcosm.constellation_rate_per_sec.0,
                 microcosm.constellation_burst,
             )),
+            profile_queue: profile_queue.clone(),
         },
     );
+    // The background profile refresh (design-v4 §8.1): one task, fed only
+    // by the tiers of public requests.
+    tasks.push(crate::hydration::ProfileDrain::new(profile_queue, read_cache.clone(), did_router.clone(), cascade.clone()).spawn());
     // The pre-auth backstop (design-v3 §II-8.3): ready members' keys in
     // memory, and the limits on verifying against them.
     let backstop = Backstop {

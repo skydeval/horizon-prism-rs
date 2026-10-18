@@ -31,6 +31,7 @@ pub mod notification_prefs;
 pub mod notifications;
 pub mod polls;
 pub mod private_context;
+pub mod profile_refresh;
 pub mod relationships;
 pub mod repo;
 pub mod search;
@@ -40,6 +41,8 @@ pub mod thread;
 pub mod thread_v2;
 pub mod trends;
 pub mod upstream;
+#[cfg(test)]
+mod profile_refresh_tests;
 #[cfg(test)]
 mod row_filter_tests;
 #[cfg(test)]
@@ -57,6 +60,7 @@ use sqlx::PgPool;
 pub use cache::ReadCache;
 pub use emit::PublicEmit;
 pub use private_context::HydrationContext;
+pub use profile_refresh::{ProfileDrain, ProfileQueue, Tiers};
 pub use upstream::{NoUpstream, UpstreamSource};
 
 use crate::aggregations::ScopeState;
@@ -201,6 +205,9 @@ pub struct HydrationConfig {
     /// The shared bucket for request-origin Constellation calls
     /// (`microcosm.constellation_rate_per_sec`); `None` leaves them unmetered.
     pub constellation_bucket: Option<SharedBucket>,
+    /// The background profile refresh queue (design-v4 §8.1), fed by the
+    /// tiers of public requests.
+    pub profile_queue: ProfileQueue,
 }
 
 struct Inner {
@@ -1134,8 +1141,19 @@ pub(crate) mod testing {
         pub handles: HashMap<String, String>,
         pub calls: std::sync::atomic::AtomicUsize,
         /// `(call, whether it was viewer-private)` for `profile`, `posts`,
-        /// `record` and `resolve_handle`, in call order (design-v4 §8.1).
+        /// `record`, `resolve_handle` and `fetch_profiles`, in call order
+        /// (design-v4 §8.1).
         pub modes: std::sync::Mutex<Vec<(String, bool)>>,
+        /// `fetch_profiles`: DIDs it does not hold are reported as absent
+        /// from every network (a negative entry), not as unanswered.
+        pub batch_absent: bool,
+        /// A bucket each `fetch_profiles` call draws one token of, on the
+        /// request it is given (a network's request bucket).
+        pub batch_bucket: Option<SharedBucket>,
+        /// A bucket each `profile` call draws one token of.
+        pub profile_bucket: Option<SharedBucket>,
+        /// The DIDs of each `fetch_profiles` call.
+        pub batches: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     impl FixedUpstream {
@@ -1154,7 +1172,29 @@ pub(crate) mod testing {
         async fn profile(&self, req: &Requester, actor: &str) -> Option<Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.note(req, format!("profile {actor}"));
+            if self.profile_bucket.as_ref().is_some_and(|b| !req.draw(b)) {
+                return None;
+            }
             self.profiles.get(actor).cloned()
+        }
+        async fn fetch_profiles(&self, req: &Requester, dids: &[String], until: std::time::Instant) -> crate::constellation::ProfilesFetched {
+            let mut out = crate::constellation::ProfilesFetched::default();
+            if std::time::Instant::now() >= until || self.batch_bucket.as_ref().is_some_and(|b| !req.draw(b)) {
+                return out;
+            }
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.note(req, format!("profiles {}", dids.join(" ")));
+            self.batches.lock().expect("batches").push(dids.to_vec());
+            for d in dids {
+                match self.profiles.get(d) {
+                    Some(v) => {
+                        out.found.insert(d.clone(), v.clone());
+                    }
+                    None if self.batch_absent => out.absent.push(d.clone()),
+                    None => {}
+                }
+            }
+            out
         }
         async fn posts(&self, req: &Requester, uris: &[String]) -> Vec<Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1266,6 +1306,7 @@ pub(crate) mod testing {
             list_budget: Budget { max_references: 2, max_owners: 5 },
             list_applier: None,
             constellation_bucket: None,
+            profile_queue: ProfileQueue::new(10_000),
         }
     }
 

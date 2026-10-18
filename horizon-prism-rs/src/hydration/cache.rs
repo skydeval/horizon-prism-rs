@@ -1,7 +1,12 @@
 //! The `rt` read-time fetch cache (design-v2 §7.6): in-process, never Redis.
 //! A `moka` future cache weighted by value bytes, total `cache.read_time_bytes`
-//! (default 256 MiB), TTL 300 s; values over 256 KiB are not cached. Request
-//! traffic can only evict entries, never grow memory past the bound.
+//! (default 256 MiB); values over 256 KiB are not cached. Request traffic can
+//! only evict entries, never grow memory past the bound.
+//!
+//! Each entry lives for its key's class (design-v4 §8.1, §II-7.6), from its
+//! last write: `rt:profile:` for `cache.profile_ttl_secs`, the negative
+//! entries `rt:profile-neg:` for `cache.profile_negative_ttl_secs`,
+//! `rt:farsight-pair:` for `farsight.cache_ttl_secs`, anything else 300 s.
 //!
 //! Every read and write names the [`Requester`]. A viewer-private one
 //! (design-v4 §8.1; R3-188, R3-208) never touches the shared entries, not
@@ -17,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use moka::Expiry;
 use moka::future::Cache;
 use moka::notification::RemovalCause;
 use moka::policy::EvictionPolicy;
@@ -25,8 +31,77 @@ use serde::de::DeserializeOwned;
 
 use crate::xrpc::pools::Requester;
 
-/// Entry lifetime (§7.6).
+/// Entry lifetime of a key with no class of its own (§7.6).
 pub const TTL: Duration = Duration::from_secs(300);
+/// The positive profile entries (design-v4 §8.1).
+pub const PROFILE_PREFIX: &str = "rt:profile:";
+/// The negative profile entries (design-v4 §8.1; profile refresh D-3).
+pub const PROFILE_NEG_PREFIX: &str = "rt:profile-neg:";
+/// Farsight's pair answers (design-v4 §II-7.6).
+pub const FARSIGHT_PAIR_PREFIX: &str = "rt:farsight-pair:";
+/// `profile_refresh_negative_total`: negative profile entries written, by
+/// any writer (design-v4 §8.1, §14.2).
+pub const METRIC_PROFILE_NEGATIVE: &str = "profile_refresh_negative_total";
+
+/// The lifetime of each class of `rt` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtTtls {
+    /// `cache.profile_ttl_secs`.
+    pub profile: Duration,
+    /// `cache.profile_negative_ttl_secs`.
+    pub negative: Duration,
+    /// `farsight.cache_ttl_secs`.
+    pub farsight_pair: Duration,
+    /// Every other key ([`TTL`]).
+    pub other: Duration,
+}
+
+impl Default for RtTtls {
+    fn default() -> Self {
+        Self {
+            profile: Duration::from_secs(3600),
+            negative: Duration::from_secs(900),
+            farsight_pair: Duration::from_secs(300),
+            other: TTL,
+        }
+    }
+}
+
+impl RtTtls {
+    fn of(&self, key: &str) -> Duration {
+        if key.starts_with(PROFILE_PREFIX) {
+            self.profile
+        } else if key.starts_with(PROFILE_NEG_PREFIX) {
+            self.negative
+        } else if key.starts_with(FARSIGHT_PAIR_PREFIX) {
+            self.farsight_pair
+        } else {
+            self.other
+        }
+    }
+}
+
+/// Per-entry expiry by key class: a write, first or not, restarts the
+/// entry's clock.
+struct RtExpiry(RtTtls);
+
+impl Expiry<String, Arc<Vec<u8>>> for RtExpiry {
+    fn expire_after_create(&self, key: &String, _: &Arc<Vec<u8>>, _: std::time::Instant) -> Option<Duration> {
+        Some(self.0.of(key))
+    }
+
+    fn expire_after_update(&self, key: &String, _: &Arc<Vec<u8>>, _: std::time::Instant, _: Option<Duration>) -> Option<Duration> {
+        Some(self.0.of(key))
+    }
+}
+
+fn shared_cache(capacity_bytes: u64, ttls: RtTtls) -> Cache<String, Arc<Vec<u8>>> {
+    Cache::builder()
+        .max_capacity(capacity_bytes)
+        .weigher(|k: &String, v: &Arc<Vec<u8>>| u32::try_from(k.len() + v.len()).unwrap_or(u32::MAX))
+        .expire_after(RtExpiry(ttls))
+        .build()
+}
 /// Largest cached value (§7.6).
 pub const MAX_VALUE_BYTES: usize = 256 * 1024;
 /// `viewer_private_cache_evictions_total`: per-viewer private entries
@@ -148,6 +223,7 @@ impl PrivateCache {
 #[derive(Clone)]
 pub struct ReadCache {
     cache: Cache<String, Arc<Vec<u8>>>,
+    capacity_bytes: u64,
     private: PrivateCache,
 }
 
@@ -155,13 +231,56 @@ impl ReadCache {
     #[must_use]
     pub fn new(capacity_bytes: u64) -> Self {
         Self {
-            cache: Cache::builder()
-                .max_capacity(capacity_bytes)
-                .weigher(|k: &String, v: &Arc<Vec<u8>>| u32::try_from(k.len() + v.len()).unwrap_or(u32::MAX))
-                .time_to_live(TTL)
-                .build(),
+            cache: shared_cache(capacity_bytes, RtTtls::default()),
+            capacity_bytes,
             private: PrivateCache::new(PrivateCacheSettings::default()),
         }
+    }
+
+    /// Set the lifetime of each class of key. Entries already held are
+    /// dropped, so this is for construction.
+    #[must_use]
+    pub fn with_ttls(mut self, ttls: RtTtls) -> Self {
+        self.cache = shared_cache(self.capacity_bytes, ttls);
+        self
+    }
+
+    /// Whether the shared entries hold `key`, without touching its LRU or
+    /// frequency state. For the background refresh, which has no request.
+    pub fn contains_shared(&self, key: &str) -> bool {
+        self.cache.contains_key(key)
+    }
+
+    /// Cache a value in the shared entries, as [`Self::put_json`] does for
+    /// an ordinary request. For the background refresh only, which has no
+    /// request and only ever writes shared entries.
+    pub async fn put_shared_json<T: Serialize>(&self, key: &str, value: &T) {
+        let Ok(bytes) = serde_json::to_vec(value) else {
+            return;
+        };
+        if bytes.len() <= MAX_VALUE_BYTES {
+            self.cache.insert(key.to_string(), Arc::new(bytes)).await;
+        }
+    }
+
+    /// Whether `did` has a negative profile entry, for `req`. A
+    /// viewer-private request never reads one, nor touches the key
+    /// (design-v4 §8.1, R3-208).
+    pub async fn has_negative(&self, req: &Requester, did: &str) -> bool {
+        if req.is_viewer_private() || req.is_local_only() {
+            return false;
+        }
+        self.cache.get(&format!("{PROFILE_NEG_PREFIX}{did}")).await.is_some()
+    }
+
+    /// Write a negative profile entry for `did` in the shared entries
+    /// (design-v4 §8.1 "Negative entries"), counted in
+    /// `profile_refresh_negative_total`. A positive entry is left alone.
+    /// The caller has checked that every callable network answered a 2xx
+    /// without `did` and that its request may write shared entries.
+    pub async fn put_negative(&self, did: &str) {
+        self.cache.insert(format!("{PROFILE_NEG_PREFIX}{did}"), Arc::new(b"null".to_vec())).await;
+        metrics::counter!(METRIC_PROFILE_NEGATIVE).increment(1);
     }
 
     /// Set the per-viewer private cache's limits.

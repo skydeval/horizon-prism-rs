@@ -588,6 +588,12 @@ pub struct CacheConfig {
     pub viewer_private_ttl_secs: u64,
     pub viewer_private_max: u64,
     pub viewer_private_per_viewer_max: u64,
+    /// Lifetime of a `rt:profile:` entry (design-v4 §8.1, profile refresh).
+    pub profile_ttl_secs: u64,
+    /// Lifetime of a `rt:profile-neg:` entry; at most `profile_ttl_secs`.
+    pub profile_negative_ttl_secs: u64,
+    /// DIDs the background profile refresh queue holds at most.
+    pub profile_refresh_max: u64,
 }
 
 impl Default for CacheConfig {
@@ -597,6 +603,9 @@ impl Default for CacheConfig {
             viewer_private_ttl_secs: 3600,
             viewer_private_max: 50_000,
             viewer_private_per_viewer_max: 500,
+            profile_ttl_secs: 3600,
+            profile_negative_ttl_secs: 900,
+            profile_refresh_max: 10_000,
         }
     }
 }
@@ -807,6 +816,25 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub burst: Option<u32>,
     pub enabled: bool,
+    /// The background profile refresh's own bucket for this network
+    /// (design-v4 §8.1): never drawn by a request. Accepted and ignored on
+    /// the local network.
+    #[serde(default = "background_rate_per_sec")]
+    pub background_rate_per_sec: Float,
+    #[serde(default = "background_burst")]
+    pub background_burst: u32,
+}
+
+/// `background_rate_per_sec`'s default.
+#[must_use]
+pub fn background_rate_per_sec() -> Float {
+    Float(1.0)
+}
+
+/// `background_burst`'s default.
+#[must_use]
+pub fn background_burst() -> u32 {
+    2
 }
 
 /// `[constellation.cascade]` (§8.1).
@@ -864,6 +892,8 @@ impl Default for ConstellationConfig {
             rate_per_sec: rate.map(|(r, _)| r),
             burst: rate.map(|(_, b)| b),
             enabled,
+            background_rate_per_sec: background_rate_per_sec(),
+            background_burst: background_burst(),
         };
         Self {
             networks: vec![

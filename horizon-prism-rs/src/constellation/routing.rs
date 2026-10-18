@@ -39,6 +39,9 @@ pub struct Network {
     pub enabled: bool,
     /// Per-network token bucket (`rate_per_sec`, `burst`).
     pub rate: Option<(u32, u32)>,
+    /// The background profile refresh's bucket (`background_rate_per_sec`,
+    /// `background_burst`).
+    pub background: (crate::config::Float, u32),
 }
 
 impl Network {
@@ -102,6 +105,7 @@ impl RoutingTable {
                 auth: n.auth,
                 enabled: n.enabled,
                 rate: n.rate_per_sec.zip(n.burst),
+                background: (n.background_rate_per_sec, n.background_burst),
             })
             .collect();
         Self {
@@ -434,6 +438,13 @@ impl Router {
         decision
     }
 
+    /// The cached home network of `did`, if the `route` cache holds one: a
+    /// cache-only read that never resolves the DID, asks PLC or writes any
+    /// cache (design-v4 §8.1 "Drain").
+    pub async fn cached_route(&self, did: &str) -> Option<RoutingDecision> {
+        self.cache.get(did).await
+    }
+
     /// The `route` cache's keys, without touching their LRU or frequency
     /// state (tests).
     #[cfg(test)]
@@ -714,6 +725,8 @@ pub(crate) mod tests {
             rate_per_sec: Some(1),
             burst: Some(1),
             enabled: false,
+            background_rate_per_sec: crate::config::background_rate_per_sec(),
+            background_burst: crate::config::background_burst(),
         });
         cfg.cascade.order.push("offline".into());
         let t = RoutingTable::from_config(&cfg);

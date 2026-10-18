@@ -306,7 +306,7 @@ impl Hydrator {
                 .fetch_one(self.pool())
                 .await?;
             let dids: Vec<String> = rows.iter().map(|(_, d, _)| d.clone()).collect();
-            let ctx = self.profile_context(viewer, req, &dids, None).await?;
+            let ctx = self.profile_context(viewer, req, &dids, None, super::Tiers::List).await?;
             let items = rows.into_iter().map(|(uri, did, _)| (uri, did.clone(), ctx.view(&did, ProfileKind::View))).collect();
             (items, next, Some(count))
         } else {
@@ -357,7 +357,7 @@ impl Hydrator {
             })
             .collect();
 
-        let creators = self.profile_context(viewer, req, std::slice::from_ref(&owner), None).await?;
+        let creators = self.profile_context(viewer, req, std::slice::from_ref(&owner), None, super::Tiers::ListAnd { single: std::slice::from_ref(&owner) }).await?;
         let uris = [row.uri.clone()];
         let labels = self.load_labels(&uris).await?;
         let list_viewer = self.list_viewer(viewer, &uris).await?;
@@ -431,7 +431,7 @@ impl Hydrator {
                 .into_iter()
                 .collect();
         let member_of = self.memberships(&uris, &did).await?;
-        let people = self.profile_context(viewer, req, &[me.clone(), did.clone()], None).await?;
+        let people = self.profile_context(viewer, req, &[me.clone(), did.clone()], None, super::Tiers::List).await?;
         let labels = self.load_labels(&uris).await?;
         let list_viewer = self.list_viewer(viewer, &uris).await?;
         let out_lists: Vec<Value> = rows
@@ -523,7 +523,7 @@ impl Hydrator {
                 .into_iter()
                 .collect();
         let gates = self.gate_many(req, &uris).await?;
-        let creators = self.profile_context(viewer, req, std::slice::from_ref(&did), None).await?;
+        let creators = self.profile_context(viewer, req, std::slice::from_ref(&did), None, super::Tiers::List).await?;
         let labels = self.load_labels(&uris).await?;
         let list_viewer = self.list_viewer(viewer, &uris).await?;
         let lists: Vec<Value> = rows

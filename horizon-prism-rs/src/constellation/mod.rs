@@ -8,6 +8,6 @@ pub mod matcher;
 pub mod resolve_did;
 pub mod routing;
 
-pub use cascade::{Call, Cascade, Fetched};
+pub use cascade::{Call, Cascade, Fetched, ProfileWalk, ProfilesFetched};
 pub use classifier::Class;
 pub use routing::{DidLookup, DidSummary, RequestLookup, Router, RoutingDecision, RoutingTable};

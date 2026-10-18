@@ -602,6 +602,68 @@ impl HostBuckets {
 /// The time one XRPC request may spend on synchronous upstream work
 /// (§II-8.3 "Limits"): every cascade of the request shares it.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(6);
+/// DIDs one request and mode may fetch in the synchronous profile batch
+/// (design-v4 §8.1; profile refresh D-2).
+pub const PROFILE_BATCH_DIDS: usize = 25;
+/// The profile batch's window, from the request's first batch.
+pub const PROFILE_WINDOW: Duration = Duration::from_millis(800);
+
+/// What is left of a request's profile batch (design-v4 §8.1; profile
+/// refresh D-2): DIDs, and the end of the window its first batch opened.
+#[derive(Debug)]
+struct ProfileBudget {
+    dids_left: usize,
+    window_ends: Option<Instant>,
+}
+
+impl ProfileBudget {
+    fn fresh() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            dids_left: PROFILE_BATCH_DIDS,
+            window_ends: None,
+        }))
+    }
+}
+
+/// A token bucket for background work (design-v4 §8.1, §II-8.3): one rate
+/// and burst, no pools or shares, and a caller waits for its token rather
+/// than being refused. No request ever draws on one. Cheap to clone.
+#[derive(Debug, Clone)]
+pub struct BackgroundBucket {
+    rate: Rate,
+    state: Arc<Mutex<(f64, tokio::time::Instant)>>,
+}
+
+impl BackgroundBucket {
+    /// A full bucket of `per_sec` and `burst`.
+    #[must_use]
+    pub fn new(per_sec: f64, burst: u32) -> Self {
+        let rate = Rate::new(per_sec, burst.max(1));
+        Self {
+            rate,
+            state: Arc::new(Mutex::new((rate.burst, tokio::time::Instant::now()))),
+        }
+    }
+
+    /// Take one token, sleeping until one is due.
+    pub async fn acquire(&self) {
+        loop {
+            let wait = {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                let now = tokio::time::Instant::now();
+                let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
+                state.0 = (state.0 + elapsed * self.rate.per_sec).min(self.rate.burst);
+                state.1 = now;
+                if state.0 >= 1.0 {
+                    state.0 -= 1.0;
+                    return;
+                }
+                Duration::try_from_secs_f64((1.0 - state.0) / self.rate.per_sec).unwrap_or(Duration::from_secs(1))
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
 
 /// The request-scoped handle: who is charged for the request's upstream
 /// calls, the deadline they share, and whether any of them found its share
@@ -624,6 +686,9 @@ pub struct Requester {
     /// The XRPC method being served, for the `endpoint` label of outbound
     /// call metrics (design-v3 §14.2).
     endpoint: Option<Arc<str>>,
+    /// The profile batch's budget, shared by clones of one mode
+    /// ([`Requester::reserve_profiles`]).
+    profile_budget: Arc<Mutex<ProfileBudget>>,
 }
 
 /// `origin` of an outbound call made while serving an XRPC request
@@ -654,6 +719,7 @@ impl Requester {
             private_viewer: None,
             local_only: false,
             endpoint: None,
+            profile_budget: ProfileBudget::fresh(),
         }
     }
 
@@ -709,13 +775,58 @@ impl Requester {
     ///
     /// The clone shares this request's deadline, charge key and exhaustion
     /// record, so a viewer-private call draws on the viewer's fair share
-    /// like any other (design-v4 §8.1).
+    /// like any other (design-v4 §8.1). It starts a profile batch budget of
+    /// its own: the DIDs a viewer-private part of the request fetches never
+    /// decide which ones a public part fetches (profile refresh D-2).
     #[must_use]
     pub fn viewer_private(&self, viewer: &str) -> Self {
         Self {
             private_viewer: Some(Arc::from(viewer)),
+            profile_budget: ProfileBudget::fresh(),
             ..self.clone()
         }
+    }
+
+    /// This request with an exhaustion record of its own (profile refresh
+    /// D-12): the same key, deadline, mode and profile budget. An empty
+    /// share or pool met through it is counted and ends that walk, but
+    /// never marks the request, so it never cuts the response or turns it
+    /// into a `429`. Embedded profile fetches run on one.
+    #[must_use]
+    pub fn detached(&self) -> Self {
+        Self {
+            exhausted: Arc::new(Mutex::new(None)),
+            ..self.clone()
+        }
+    }
+
+    /// Reserve up to `n` DIDs of this request's profile batch (design-v4
+    /// §8.1): at most [`PROFILE_BATCH_DIDS`] per request and mode, inside
+    /// the [`PROFILE_WINDOW`] its first batch opens. Returns how many were
+    /// reserved and when the window ends, or `None` when nothing is left
+    /// or the window has closed. One lock covers both, so concurrent
+    /// calls never over-spend it.
+    #[must_use]
+    pub fn reserve_profiles(&self, n: usize) -> Option<(usize, Instant)> {
+        let mut budget = self.profile_budget.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if budget.window_ends.is_some_and(|end| now >= end) {
+            return None;
+        }
+        let k = budget.dids_left.min(n);
+        if k == 0 {
+            return None;
+        }
+        budget.dids_left -= k;
+        let end = *budget.window_ends.get_or_insert(now + PROFILE_WINDOW);
+        Some((k, end))
+    }
+
+    /// Whether two handles share one profile budget (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn shares_profile_budget(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.profile_budget, &other.profile_budget)
     }
 
     /// The viewer of a viewer-private fetch; `None` for an ordinary one.
@@ -874,6 +985,33 @@ pub fn problems(cfg: &FileConfig, out: &mut Vec<String>) {
         if let Some(p) = class_problem(RateClassConfig::new(per_sec.0, burst)) {
             out.push(format!("{name}: {p}"));
         }
+    }
+    // The background profile refresh's bucket of every outbound network
+    // (design-v4 §8.1, §13). The local network has no outbound calls, so
+    // its values are accepted and ignored.
+    for n in c.networks.iter().filter(|n| n.appview_url != crate::config::LOCAL_APPVIEW) {
+        if let Some(p) = class_problem(RateClassConfig::new(n.background_rate_per_sec.0, n.background_burst)) {
+            out.push(format!("constellation.networks[{}] background_rate_per_sec/background_burst: {p}", n.name));
+        }
+    }
+    profile_problems(&cfg.cache, out);
+}
+
+/// The profile cache and refresh settings (design-v4 §8.1, §13).
+fn profile_problems(cache: &crate::config::CacheConfig, out: &mut Vec<String>) {
+    for (key, value) in [("cache.profile_ttl_secs", cache.profile_ttl_secs), ("cache.profile_negative_ttl_secs", cache.profile_negative_ttl_secs)] {
+        if !(60..=86_400).contains(&value) {
+            out.push(format!("{key} = {value} must be 60 to 86400"));
+        }
+    }
+    if cache.profile_negative_ttl_secs > cache.profile_ttl_secs {
+        out.push(format!(
+            "cache.profile_negative_ttl_secs ({}) must not exceed cache.profile_ttl_secs ({})",
+            cache.profile_negative_ttl_secs, cache.profile_ttl_secs
+        ));
+    }
+    if !(1..=1_000_000).contains(&cache.profile_refresh_max) {
+        out.push(format!("cache.profile_refresh_max = {} must be 1 to 1000000", cache.profile_refresh_max));
     }
 }
 

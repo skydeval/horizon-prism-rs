@@ -277,7 +277,7 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn lens_local_posts(&self, viewer: &Viewer, req: &Requester, uris: &[String]) -> Result<HashMap<String, Value>, sqlx::Error> {
-        let ctx = self.post_context_for(Some(viewer), req, uris, CountMode::List).await?;
+        let ctx = self.post_context_for(Some(viewer), req, uris, CountMode::List, &[], &[]).await?;
         Ok(uris
             .iter()
             .filter(|u| ctx.gates.get(*u).copied().unwrap_or(Gate::Visible) == Gate::Visible)

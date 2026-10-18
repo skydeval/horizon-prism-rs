@@ -147,7 +147,7 @@ impl Hydrator {
             .then(|| rows.last().map(|(d, _, _, t)| local_cursor(*t, d)))
             .flatten();
         let dids: Vec<String> = rows.iter().map(|(d, ..)| d.clone()).collect();
-        let ctx = self.profile_context(viewer, req, &dids, None).await?;
+        let ctx = self.profile_context(viewer, req, &dids, None, super::Tiers::List).await?;
         let subscriptions: Vec<Value> = rows
             .iter()
             .map(|(did, post, reply, _)| {

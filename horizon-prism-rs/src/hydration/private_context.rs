@@ -63,7 +63,7 @@ impl HydrationContext {
     /// Database errors.
     pub async fn profiles(&self, dids: &[String]) -> Result<ProfileContext, sqlx::Error> {
         let Self::Private { hydrator, viewer, req } = self;
-        hydrator.profile_context(viewer, req, dids, None).await
+        hydrator.profile_context(viewer, req, dids, None, super::Tiers::List).await
     }
 
     /// One public `postView` for a private thread's `publicParent`: stored

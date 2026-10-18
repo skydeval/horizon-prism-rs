@@ -97,6 +97,16 @@ impl AppViewClient {
         self.query("app.bsky.actor.getProfile", &[("actor", actor.to_string())]).await
     }
 
+    /// `app.bsky.actor.getProfiles` (≤ 25 actors).
+    ///
+    /// # Errors
+    ///
+    /// Transport failures.
+    pub async fn get_profiles(&self, actors: &[String]) -> Result<NetResponse, NetError> {
+        let params: Vec<(&str, String)> = actors.iter().take(25).map(|a| ("actors", a.clone())).collect();
+        self.query("app.bsky.actor.getProfiles", &params).await
+    }
+
     /// `app.bsky.feed.getPosts` (≤ 25 URIs).
     ///
     /// # Errors
@@ -321,6 +331,8 @@ mod tests {
             rate_per_sec: Some(1),
             burst: Some(1),
             enabled: true,
+            background_rate_per_sec: crate::config::background_rate_per_sec(),
+            background_burst: crate::config::background_burst(),
         });
         let key = ServiceKey::new("prism.example.com", &[5u8; 32]).expect("key");
         let clients = from_config(&cfg, &NetClient::loopback_for_tests(), &key);

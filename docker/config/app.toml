@@ -205,6 +205,14 @@ read_time_bytes = 268435456
 viewer_private_ttl_secs = 3600
 viewer_private_max = 50000
 viewer_private_per_viewer_max = 500
+# Profiles of accounts outside the community, as embedded in list views
+# (design-v4 §8.1): how long a fetched profile is kept (60 - 86400), how long
+# an account every network answered without is shown in the minimal form
+# without asking again (60 - 86400, at most profile_ttl_secs), and how many
+# accounts the background refresh queue holds.
+# profile_ttl_secs = 3600
+# profile_negative_ttl_secs = 900
+# profile_refresh_max = 10000
 
 [counts]
 # local | local_then_constellation
@@ -270,6 +278,10 @@ auth = "unauth"
 rate_per_sec = 20
 burst = 40
 enabled = true
+# The background profile refresh's own bucket for this network, never drawn
+# by a request (design-v4 §8.1). Each network has one; ignored on `community`.
+# background_rate_per_sec = 1.0
+# background_burst = 2
 
 [[constellation.networks]]
 name = "community-a"

@@ -10,12 +10,13 @@ use serde_json::{Map, Value, json};
 use sqlx::{Postgres, QueryBuilder};
 
 use super::search::{METRIC_DURATION, METRIC_TIMEOUT, set_timeout, timed_out, viewer_exclusions};
-use super::{ActorRow, ActorViewer, CountMode, Hydrator, INVALID_HANDLE, ViewError, ViewResult, Viewer, blob_url, ts};
+use super::{ActorRow, ActorViewer, CountMode, Hydrator, INVALID_HANDLE, Tiers, ViewError, ViewResult, Viewer, blob_url, ts};
 use crate::moderation::Gate;
 use crate::xrpc::pools::Requester;
 
-/// Upstream profile fetches in flight for one `getProfiles`.
-pub const PROFILE_FETCH_CONCURRENCY: usize = 8;
+/// Handle-form actors one `getProfiles` resolves at a time (design-v4
+/// §8.1).
+pub const HANDLE_RESOLVE_CONCURRENCY: usize = 4;
 
 /// Which profile view to build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,9 @@ pub struct ProfileContext {
     /// By actor: what only `getProfile` and `getProfiles` add to a
     /// detailed view. Empty everywhere else.
     pub details: HashMap<String, Detail>,
+    /// By actor without a readable row: the upstream view the profile tiers
+    /// resolved (design-v4 §8.1), as cached.
+    pub remote: HashMap<String, Value>,
 }
 
 /// The parts of a detailed view that `getProfile` and `getProfiles` load
@@ -59,13 +63,26 @@ pub struct Detail {
 }
 
 impl ProfileContext {
-    /// A profile view; an actor without a local row gets the minimal
-    /// `{did, handle: "handle.invalid"}` form.
+    /// A profile view; an actor without a local row gets the remote view
+    /// the tiers resolved, projected to `kind` with the local `viewer` and
+    /// `labels`, or else the minimal `{did, handle: "handle.invalid"}` form.
     #[must_use]
     pub fn view(&self, did: &str, kind: ProfileKind) -> Value {
+        let row = self.rows.get(did);
+        if row.is_none()
+            && let Some(remote) = self.remote.get(did)
+        {
+            let mut v = super::profile_refresh::project(remote, kind);
+            v.insert("did".into(), json!(did));
+            if !v.get("handle").is_some_and(Value::is_string) {
+                v.insert("handle".into(), json!(INVALID_HANDLE));
+            }
+            v.insert("viewer".into(), self.viewer.view(did));
+            v.insert("labels".into(), Value::Array(self.labels.get(did).cloned().unwrap_or_default()));
+            return Value::Object(v);
+        }
         let mut v = Map::new();
         v.insert("did".into(), json!(did));
-        let row = self.rows.get(did);
         v.insert(
             "handle".into(),
             json!(row.and_then(|r| r.handle.as_deref()).unwrap_or(INVALID_HANDLE)),
@@ -150,13 +167,15 @@ impl Hydrator {
         req: &Requester,
         dids: &[String],
         followers: Option<CountMode>,
+        tiers: Tiers<'_>,
     ) -> Result<ProfileContext, sqlx::Error> {
         // Rows and self records only for the DIDs `req` may read (§8.1
         // "Embedded profile views", §11 G-9, R3-143): any other DID renders
-        // exactly as one never seen. Private-context hydration reads every
-        // row (§8.1, R3-179).
+        // exactly as one never seen, from the profile tiers or minimal.
+        // Private-context hydration reads every row (§8.1, R3-179).
         let readable = self.readable_for(req, dids).await;
         let rows = self.load_actor_rows(&readable).await?;
+        let remote = self.tier_profiles(req, dids, &readable, tiers).await;
         let mut actor_viewer = self.actor_viewer(viewer, dids).await?;
         self.fill_list_views(viewer, req, &mut actor_viewer).await?;
         let labels = self.load_labels(dids).await?;
@@ -201,6 +220,7 @@ impl Hydrator {
             declarations: declarations.into_iter().filter_map(|(did, allow)| Some((did, allow?))).collect(),
             statuses,
             details: HashMap::new(),
+            remote,
         })
     }
 
@@ -304,20 +324,24 @@ impl Hydrator {
 
     /// Profiles with no viewer state computed (Thread Lens, §10.3). Thread
     /// Lens is a public path, so rows come from [`Hydrator::load_actors`]
-    /// (§11 G-9).
+    /// (§11 G-9); the DIDs it may not read take the profile tiers (§8.1).
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub(crate) async fn anonymous_profile_context(&self, dids: &[String]) -> Result<ProfileContext, sqlx::Error> {
+    pub(crate) async fn anonymous_profile_context(&self, req: &Requester, dids: &[String]) -> Result<ProfileContext, sqlx::Error> {
+        let readable = self.readable_dids(dids).await;
+        let rows = self.load_actor_rows(&readable).await?;
+        let remote = self.tier_profiles(req, dids, &readable, Tiers::List).await;
         Ok(ProfileContext {
-            rows: self.load_actors(dids).await?,
+            rows,
             viewer: ActorViewer::default(),
             labels: self.load_labels(dids).await?,
             followers: HashMap::new(),
             declarations: HashMap::new(),
             statuses: HashMap::new(),
             details: HashMap::new(),
+            remote,
         })
     }
 
@@ -336,7 +360,7 @@ impl Hydrator {
             return Ok(Err(ViewError::new(error, message)));
         }
         let mut ctx = self
-            .profile_context(viewer, req, std::slice::from_ref(&did), Some(CountMode::Sync { started }))
+            .profile_context(viewer, req, std::slice::from_ref(&did), Some(CountMode::Sync { started }), Tiers::Off)
             .await?;
         // Local or cascade by scope and membership only, never by whether a
         // row is stored (§11 G-9).
@@ -354,14 +378,29 @@ impl Hydrator {
     /// `app.bsky.actor.getProfiles` (≤ 25): unknown or hidden actors are
     /// omitted.
     ///
+    /// Out-of-scope subjects (design-v4 §8.1) take positive `rt` hits, then
+    /// one `getProfiles` walk of the cascade for all the misses, under the
+    /// request's deadline and charged to the request itself: it is the
+    /// subject fetch. One that no network has is omitted, with no Slingshot
+    /// fallback; a negative entry is written when every callable network
+    /// answered without it, and nothing is queued. All remote views are
+    /// normalized together, so the request makes one Farsight lookup.
+    ///
     /// # Errors
     ///
     /// Database errors.
     pub async fn get_profiles(&self, viewer: &Viewer, req: &Requester, actors: &[String]) -> ViewResult<Value> {
         let started = Instant::now();
+        // Handles resolve concurrently, at most four at a time, in order.
+        let wanted: Vec<String> = actors.iter().take(25).cloned().collect();
+        let resolved: Vec<Result<Option<String>, sqlx::Error>> = futures::stream::iter(wanted)
+            .map(|a| async move { self.resolve_actor(req, &a).await })
+            .buffered(HANDLE_RESOLVE_CONCURRENCY)
+            .collect()
+            .await;
         let mut dids: Vec<String> = Vec::new();
-        for a in actors.iter().take(25) {
-            if let Some(d) = self.resolve_actor(req, a).await?
+        for d in resolved {
+            if let Some(d) = d?
                 && !dids.contains(&d)
             {
                 dids.push(d);
@@ -369,30 +408,43 @@ impl Hydrator {
         }
         let gates = self.gate_many(req, &dids).await?;
         dids.retain(|d| !gates.get(d).copied().unwrap_or(Gate::Visible).is_hidden());
-        let mut ctx = self.profile_context(viewer, req, &dids, Some(CountMode::Sync { started })).await?;
+        let mut ctx = self.profile_context(viewer, req, &dids, Some(CountMode::Sync { started }), Tiers::Off).await?;
         self.profile_details(viewer, req, &mut ctx, started).await?;
-        // Out-of-scope actors take `getProfile`'s path: the cascade, then
-        // the Slingshot profile record (design-v3 §11 G-1). One that no
-        // source resolves, or that there is no budget to fetch, is omitted.
         // As for `getProfile`, by scope and membership only (§11 G-9).
-        let mut outside: Vec<String> = Vec::new();
-        for d in &dids {
-            if !self.in_scope_or_member(d).await {
-                outside.push(d.clone());
+        let outside: Vec<String> = {
+            let readable = self.readable_dids(&dids).await;
+            dids.iter().filter(|d| !readable.contains(d)).cloned().collect()
+        };
+        let cache = self.cache();
+        let mut views: Vec<Value> = Vec::new();
+        let mut misses: Vec<String> = Vec::new();
+        for d in &outside {
+            match cache.get_json::<Value>(req, &format!("{}{d}", super::cache::PROFILE_PREFIX)).await {
+                Some(v) => views.push(v),
+                None => misses.push(d.clone()),
             }
         }
-        let fetched: Vec<(String, Option<Value>)> = futures::stream::iter(outside.clone())
-            .map(|d| async move {
-                let view = self.upstream().profile(req, &d).await;
-                (d, view)
-            })
-            .buffer_unordered(PROFILE_FETCH_CONCURRENCY)
-            .collect()
-            .await;
+        if !misses.is_empty() {
+            let fetched = self.upstream().fetch_profiles(req, &misses, req.deadline()).await;
+            for d in &misses {
+                if let Some(v) = fetched.found.get(d) {
+                    cache.put_json(req, &format!("{}{d}", super::cache::PROFILE_PREFIX), v).await;
+                    views.push(v.clone());
+                }
+            }
+            if !req.is_viewer_private() {
+                for d in &fetched.absent {
+                    cache.put_negative(d).await;
+                }
+            }
+        }
         let mut remote: HashMap<String, Value> = HashMap::new();
-        for (d, view) in fetched {
-            if let Some(v) = view {
-                remote.insert(d, self.normalized(viewer, req, v).await?.0);
+        if !views.is_empty() {
+            let (normalized, _) = self.normalized(viewer, req, json!({ "profiles": views })).await?;
+            for v in normalized.get("profiles").and_then(Value::as_array).into_iter().flatten() {
+                if let Some(d) = v.get("did").and_then(Value::as_str) {
+                    remote.insert(d.to_string(), v.clone());
+                }
             }
         }
         let profiles: Vec<Value> = dids
@@ -478,7 +530,8 @@ impl Hydrator {
             .filter(|d| !gates.get(*d).copied().unwrap_or(Gate::Visible).is_hidden())
             .cloned()
             .collect();
-        let ctx = self.profile_context(viewer, req, &shown, None).await?;
+        // The corpus is `scope_dids ∪ members`: every DID is readable.
+        let ctx = self.profile_context(viewer, req, &shown, None, Tiers::Off).await?;
         let visible = shown
             .into_iter()
             .filter(|d| !ctx.viewer.blocked_either_way(d) && !ctx.viewer.muted.contains(d))
@@ -753,7 +806,7 @@ mod tests {
         let dids = [ALICE.to_string(), BOB.to_string()];
 
         // No handle (a private read, a background path): no call, no block.
-        let ctx = h.profile_context(&me, &req, &dids, None).await.expect("ctx");
+        let ctx = h.profile_context(&me, &req, &dids, None, Tiers::List).await.expect("ctx");
         assert_eq!(ctx.view(ALICE, ProfileKind::View)["viewer"]["blockedBy"], false);
         assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
 
@@ -761,15 +814,15 @@ mod tests {
         let selected = Selected::by_ip("203.0.113.9".parse().expect("ip"));
         selected.attach_farsight(farsight.request(&req));
         backstop::scope(selected, async {
-            let ctx = h.profile_context(&me, &req, &dids, None).await.expect("ctx");
+            let ctx = h.profile_context(&me, &req, &dids, None, Tiers::List).await.expect("ctx");
             assert_eq!(ctx.view(ALICE, ProfileKind::View)["viewer"]["blockedBy"], true);
             assert_eq!(ctx.view(BOB, ProfileKind::View)["viewer"]["blockedBy"], false);
             assert!(ctx.viewer.blocked_either_way(ALICE));
             // A second hydration step of the request asks nothing new.
-            h.profile_context(&me, &req, &dids, None).await.expect("ctx");
+            h.profile_context(&me, &req, &dids, None, Tiers::List).await.expect("ctx");
             assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
             // Anyone but a ready member has no viewer state, and no call.
-            let ctx = h.profile_context(&Viewer::anonymous(), &req, &dids, None).await.expect("ctx");
+            let ctx = h.profile_context(&Viewer::anonymous(), &req, &dids, None, Tiers::List).await.expect("ctx");
             assert_eq!(ctx.view(ALICE, ProfileKind::View)["viewer"]["blockedBy"], false);
             assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
         })
@@ -812,8 +865,11 @@ mod tests {
         // The upstream view is normalized: no upstream viewer state leaks.
         assert_ne!(profiles[0]["viewer"]["muted"], json!(true));
         assert_eq!(profiles[1]["handle"], "alice.test");
-        // Only the two visible out-of-scope actors were asked for.
-        assert_eq!(up.calls.load(Ordering::SeqCst), 2);
+        // Only the two visible out-of-scope actors (the hidden one is
+        // gated out) were asked for, in one
+        // batch (design-v4 §8.1).
+        assert_eq!(up.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*up.batches.lock().expect("batches"), [vec![outsider.to_string(), unknown.to_string()]]);
         db.drop_db().await;
     }
 

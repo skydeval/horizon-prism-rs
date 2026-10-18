@@ -88,7 +88,7 @@ impl Hydrator {
         owners.sort_unstable();
         owners.dedup();
         let gates = self.gate_many(req, &uris).await?;
-        let creators = self.profile_context(viewer, req, &owners, None).await?;
+        let creators = self.profile_context(viewer, req, &owners, None, super::Tiers::List).await?;
         let labels = self.load_labels(&uris).await?;
         let list_viewer = self.list_viewer(viewer, &uris).await?;
         Ok(rows
@@ -275,7 +275,7 @@ mod tests {
         let s = state().await;
         assert!(s.muted.contains(CAROL) && !s.blocked_either_way(CAROL));
         assert_eq!(s.view(CAROL)["muted"], json!(true));
-        let profiles = h.profile_context(&me, &Requester::test(), &[CAROL.to_string()], None).await.expect("profiles");
+        let profiles = h.profile_context(&me, &Requester::test(), &[CAROL.to_string()], None, crate::hydration::Tiers::List).await.expect("profiles");
         let by_list = &profiles.viewer.view(CAROL)["mutedByList"];
         assert_eq!((&by_list["uri"], &by_list["name"], &by_list["viewer"]["muted"]), (&json!(outside), &json!("Outside"), &json!(false)));
         // The viewer's own entry on the list does nothing to the viewer.

@@ -32,7 +32,7 @@ use super::normalize::is_private_uri;
 use super::{INVALID_HANDLE, blob_url};
 use crate::aggregations::ScopeState;
 use crate::aggregations::counts::{self, Counts, Freshness};
-use crate::constellation::{Call, Cascade, Router};
+use crate::constellation::{Call, Cascade, ProfileWalk, ProfilesFetched, Router};
 use crate::db::locks::uri_author;
 use crate::firehose::backfill::{ListOrder, ListPage, ListedRecord, detect_order};
 use crate::firehose::normalize::{blob_cid, normalize_record};
@@ -47,6 +47,13 @@ use crate::xrpc::pools::{HostBuckets, Requester};
 pub trait UpstreamSource: Send + Sync {
     /// `app.bsky.actor.getProfile` for a DID or handle.
     async fn profile(&self, req: &Requester, actor: &str) -> Option<Value>;
+    /// One walk of the cascade's `plan(None)` with `getProfiles` for `dids`
+    /// (at most 25), drawing on `req`'s share and ending at `until`
+    /// (design-v4 §8.1 "Batch routing"). Nothing is read from or written to
+    /// `rt`: the caller does that. By default nothing is found.
+    async fn fetch_profiles(&self, _req: &Requester, _dids: &[String], _until: std::time::Instant) -> ProfilesFetched {
+        ProfilesFetched::default()
+    }
     /// Post views for URIs (`getPosts` / Slingshot), in input order.
     async fn posts(&self, req: &Requester, uris: &[String]) -> Vec<Value>;
     /// Post views built from the records alone (Slingshot, §7.1's
@@ -593,6 +600,13 @@ impl RealUpstreamSource {
 
 #[async_trait]
 impl UpstreamSource for RealUpstreamSource {
+    async fn fetch_profiles(&self, req: &Requester, dids: &[String], until: std::time::Instant) -> ProfilesFetched {
+        // `plan(None)` never holds the `community` network, which is not
+        // callable; that skips a network, not a DID (C4 is untouched).
+        let plan = self.cascade.table().plan(None);
+        self.cascade.fetch_profiles(ProfileWalk::Request { req, until }, &plan, dids).await
+    }
+
     async fn profile(&self, req: &Requester, actor: &str) -> Option<Value> {
         let key = format!("rt:profile:{actor}");
         if let Some(v) = self.cache.get_json::<Value>(req, &key).await {

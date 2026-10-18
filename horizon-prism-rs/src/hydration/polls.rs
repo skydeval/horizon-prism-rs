@@ -39,7 +39,11 @@ impl Hydrator {
         }
         if !self.stores_public_of(&did).await || cursor.is_some_and(|c| c.starts_with("P:")) {
             return match self.upstream().author_polls(req, &did, limit, cursor).await {
-                Some(v) => Ok(Ok(Self::emit(self.normalized(viewer, req, v).await?.0))),
+                Some(v) => {
+                    let (mut v, _) = self.normalized(viewer, req, v).await?;
+                    self.poll_author_pass(req, &did, &mut v).await;
+                    Ok(Ok(Self::emit(v)))
+                }
                 None => match req.exhausted() {
                     // No budget for the listing: a 429, never an empty page.
                     Some(exhausted) => Err(HydrationError::NoBudget(exhausted)),
@@ -65,7 +69,7 @@ impl Hydrator {
             .flatten();
         let labelled: Vec<String> = rows.iter().map(|(uri, ..)| uri.clone()).collect();
         let gates = self.gate_many(req, &labelled).await?;
-        let ctx = self.profile_context(viewer, req, std::slice::from_ref(&did), None).await?;
+        let ctx = self.profile_context(viewer, req, std::slice::from_ref(&did), None, super::Tiers::List).await?;
         let author = ctx.view(&did, ProfileKind::Basic);
         let polls: Vec<Value> = rows
             .into_iter()
@@ -77,6 +81,29 @@ impl Hydrator {
             out["cursor"] = json!(c);
         }
         Ok(Ok(Self::emit(out)))
+    }
+
+    /// The author pass of the PDS path (design-v4 §8.1): its author is
+    /// `{did, handle}` from the identity lookup. When the author is not
+    /// readable it takes the profile tiers, and a resolved one becomes the
+    /// batch's `profileViewBasic` with the normalized `viewer` and `labels`.
+    async fn poll_author_pass(&self, req: &Requester, did: &str, out: &mut Value) {
+        if self.in_scope_or_member(did).await {
+            return;
+        }
+        let Some(view) = self.remote_profiles(req, &[did.to_string()]).await.remove(did) else {
+            return;
+        };
+        let mut author = super::profile_refresh::project(&view, ProfileKind::Basic);
+        for poll in out.get_mut("polls").and_then(Value::as_array_mut).into_iter().flatten() {
+            let old = poll.get("author");
+            for key in ["did", "viewer", "labels"] {
+                if let Some(v) = old.and_then(|a| a.get(key)) {
+                    author.insert(key.to_string(), v.clone());
+                }
+            }
+            poll["author"] = Value::Object(author.clone());
+        }
     }
 }
 

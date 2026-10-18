@@ -70,6 +70,8 @@ mod tests {
                 rate_per_sec: Some(1),
                 burst: Some(1),
                 enabled: true,
+                background_rate_per_sec: crate::config::background_rate_per_sec(),
+                background_burst: crate::config::background_burst(),
             },
         );
         assert_eq!(names("pds.community-a.example", &cfg), Some("catchall".into()));

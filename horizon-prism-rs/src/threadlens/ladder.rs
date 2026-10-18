@@ -43,6 +43,10 @@ pub enum Mode {
 pub enum Resolved {
     /// A `postView`, with the viewer's state.
     Post(Value),
+    /// A `postView` built from the record alone (Slingshot): its author is
+    /// `{did, handle}` from the identity lookup, until the author pass
+    /// gives it a profile (design-v4 §8.1).
+    RecordPost(Value),
     Gap(Gap),
 }
 
@@ -153,7 +157,10 @@ impl Ladder {
                     .and_then(|s| s.handle)
                     .unwrap_or_else(|| crate::hydration::INVALID_HANDLE.to_string());
                 let view = post_from_record(uri, record.cid.as_deref(), &handle, &record.value);
-                return self.upstream_view(viewer, req, uri, view).await;
+                return Ok(match self.upstream_view(viewer, req, uri, view).await? {
+                    Resolved::Post(view) => Resolved::RecordPost(view),
+                    other => other,
+                });
             }
             Err(SlingshotError::NotFound) => SlingshotOutcome::NotFound,
             Err(SlingshotError::Transient(_) | SlingshotError::Invalid(_) | SlingshotError::NoBudget) => {
