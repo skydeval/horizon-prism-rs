@@ -885,8 +885,11 @@ impl Writer {
             }
             Err(error) if is_deterministic(&error) => {
                 sp.rollback().await?;
-                let metric = if is_list { copy::METRIC_PURPOSE_ERRORS } else { copy::METRIC_COPY_ERRORS };
-                metrics::counter!(metric).increment(1);
+                if is_list {
+                    metrics::counter!(copy::METRIC_PURPOSE_ERRORS, "path" => "ingest").increment(1);
+                } else {
+                    metrics::counter!(copy::METRIC_COPY_ERRORS).increment(1);
+                }
                 tracing::warn!(event = "subscription_rule_write_failed", %error, "an owner-side subscription write failed");
             }
             Err(error) => return Err(error.into()),
@@ -984,6 +987,21 @@ impl Writer {
         sets: &ScopeSets,
         effects: &mut MemoryEffects,
     ) -> Result<OpOutcome, Transient> {
+        // A private-tier op from the live firehose: the relays deliver the
+        // private tier (`private_tier_last_event_age_seconds`).
+        if options.source == WriteSource::Firehose {
+            let private = match target {
+                OpTarget::Upsert(u, _) => matches!(u.body, Body::Private | Body::PrivateGate),
+                OpTarget::Delete(d) => matches!(
+                    d.kind,
+                    RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock | RecordKind::PrivateGate
+                ),
+                OpTarget::GrowOnly(..) | OpTarget::RejectedFollow(..) => false,
+            };
+            if private {
+                crate::private_tier::gauges::note_event();
+            }
+        }
         let mut last_error = String::new();
         for _ in 0..options.attempts.max(1) {
             let mut sp = tx.begin().await?;

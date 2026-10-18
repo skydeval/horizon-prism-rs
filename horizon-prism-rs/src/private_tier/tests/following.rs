@@ -979,6 +979,63 @@ async fn t36_the_waiting_gauge_counts_set_flags_that_do_not_hold() {
     h.finish().await;
 }
 
+/// design-v4 §II-5.10, §II-6.1, §II-6.11.5, §14.2: the backfill sampler's
+/// other gauges. `private_owners_not_ready_total` follows owner readiness;
+/// a private op from the live firehose sets the last event, so
+/// `private_tier_last_event_age_seconds` is near 0; the oldest due `authz`
+/// job not completed sets `authz_daily_backlog_seconds`; and `list_sync`
+/// rows are in `backfill_jobs{depth}`.
+#[tokio::test]
+async fn the_backfill_sampler_exports_private_readiness_ingest_age_and_job_backlogs() {
+    use crate::private_tier::gauges;
+    use crate::test_support::series;
+    let Some(h) = H::new("metrics-sampler", PublicMode::On).await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let b = h.backfill();
+    let sample = || async {
+        b.sample_metrics().await.expect("sample");
+        handle.render()
+    };
+    let value = |text: &str, name: &str, labels: &[&str]| series(text, name, labels).unwrap_or_else(|| panic!("{name} {labels:?} missing:\n{text}"));
+
+    // Alice owns an audience and a post, ready: then her readiness goes.
+    let before = Utc::now().timestamp_millis();
+    h.alice_following("met").await;
+    assert!(gauges::last_event_ms() >= before, "a firehose private op is the last event");
+    let text = sample().await;
+    let ready = value(&text, gauges::METRIC_OWNERS_NOT_READY, &[]);
+    assert!(value(&text, gauges::METRIC_LAST_EVENT_AGE, &[]) <= 5.0);
+    exec(h.pool(), &format!("DELETE FROM private_owner_ready WHERE did = '{ALICE}'")).await;
+    assert_eq!(value(&sample().await, gauges::METRIC_OWNERS_NOT_READY, &[]), ready + 1.0);
+    h.f.ready_all().await;
+    assert_eq!(value(&sample().await, gauges::METRIC_OWNERS_NOT_READY, &[]), ready);
+
+    // An `authz` job due two days ago and not run: the backlog is two
+    // days. Once it is done, nothing that old is left.
+    let list_sync = |text: &str| value(text, "backfill_jobs", &["depth=\"list_sync\"", "state=\"queued\""]);
+    let queued = list_sync(&sample().await);
+    exec(
+        h.pool(),
+        &format!(
+            "INSERT INTO backfill_jobs (did, depth, state, not_before) VALUES ('{WALT}', 'authz', 'queued', now() - interval '2 days') \
+             ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', not_before = EXCLUDED.not_before"
+        ),
+    )
+    .await;
+    exec(h.pool(), &format!("INSERT INTO backfill_jobs (did, depth, state) VALUES ('{WALT}', 'list_sync', 'queued')")).await;
+    let text = sample().await;
+    let backlog = value(&text, "authz_daily_backlog_seconds", &[]);
+    assert!((172_700.0..173_000.0).contains(&backlog), "{backlog}");
+    assert_eq!(list_sync(&text), queued + 1.0);
+    exec(h.pool(), &format!("UPDATE backfill_jobs SET state = 'done' WHERE did = '{WALT}' AND depth = 'authz'")).await;
+    assert!(value(&sample().await, "authz_daily_backlog_seconds", &[]) < 3600.0);
+    h.finish().await;
+}
+
 // ---- T-41: the pass ----
 
 /// T-41: a complete pass that writes no row sets the flag with

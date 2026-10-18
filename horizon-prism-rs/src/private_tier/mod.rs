@@ -29,6 +29,7 @@
 
 mod cursor;
 mod emit;
+pub(crate) mod gauges;
 pub(crate) mod handlers;
 pub(crate) mod ingest;
 mod oracle;
@@ -325,6 +326,11 @@ pub trait PrivateTier: Send + Sync {
     /// `following` audience and whose follows are not verified. Returns the
     /// jobs written.
     async fn enqueue_following_verification(&self, pool: &PgPool) -> Result<u64, sqlx::Error>;
+
+    /// `gauges::sample`: `private_owners_not_ready_total` and
+    /// `private_tier_last_event_age_seconds`, sampled with the backfill
+    /// gauges.
+    async fn sample_gauges(&self, pool: &PgPool) -> Result<(), sqlx::Error>;
 }
 
 /// The private tier.
@@ -478,6 +484,10 @@ impl PrivateTier for KryphocronPrivateTier {
 
     async fn enqueue_following_verification(&self, pool: &PgPool) -> Result<u64, sqlx::Error> {
         owners::enqueue_following_verification(pool).await
+    }
+
+    async fn sample_gauges(&self, pool: &PgPool) -> Result<(), sqlx::Error> {
+        gauges::sample(pool).await
     }
 }
 
@@ -639,5 +649,12 @@ impl PrivateTier for DisabledPrivateTier {
 
     async fn enqueue_following_verification(&self, _pool: &PgPool) -> Result<u64, sqlx::Error> {
         Ok(0)
+    }
+
+    /// No owners and no events: both gauges are 0.
+    async fn sample_gauges(&self, _pool: &PgPool) -> Result<(), sqlx::Error> {
+        metrics::gauge!(gauges::METRIC_OWNERS_NOT_READY).set(0.0);
+        metrics::gauge!(gauges::METRIC_LAST_EVENT_AGE).set(0.0);
+        Ok(())
     }
 }

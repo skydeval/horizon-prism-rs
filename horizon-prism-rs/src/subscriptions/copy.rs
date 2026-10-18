@@ -32,7 +32,23 @@ use crate::db::locks::uri_author;
 
 pub const METRIC_OVER_CAP: &str = "list_items_over_cap_total";
 pub const METRIC_TOMBSTONES_EVICTED: &str = "subscription_tombstones_evicted_total";
+/// `list_purpose_write_errors_total{path = "ingest" | "sync"}`.
 pub const METRIC_PURPOSE_ERRORS: &str = "list_purpose_write_errors_total";
+/// `list_purpose_writes_total{path = "ingest" | "sync", result = "modlist" |
+/// "other" | "none"}`: each purpose written to a `subscribed_lists` row, by
+/// the purpose stored (design-v4 §4.3 "List purpose").
+pub const METRIC_PURPOSE_WRITES: &str = "list_purpose_writes_total";
+
+/// The `result` label of a stored purpose: `modlist`, `other`, or `none`
+/// for NULL.
+#[must_use]
+pub fn purpose_result(stored: Option<&str>) -> &'static str {
+    match stored {
+        Some(crate::hydration::lists::PURPOSE_MOD) => "modlist",
+        Some(_) => "other",
+        None => "none",
+    }
+}
 pub const METRIC_COPY_ERRORS: &str = "list_copy_write_errors_total";
 
 /// The caps the rules apply.
@@ -262,7 +278,7 @@ pub async fn list_purpose(conn: &mut PgConnection, list_uri: &str, rev: &str, op
         ListOp::Put(record) => (storable(record.get("purpose").and_then(Value::as_str)), true),
         ListOp::Delete => (None, false),
     };
-    sqlx::query(
+    let written = sqlx::query(
         "UPDATE subscribed_lists SET purpose = $2, purpose_rev = $3, unlisted_since = CASE WHEN $4 THEN NULL ELSE unlisted_since END \
          WHERE list_uri = $1 AND (purpose_rev IS NULL OR purpose_rev < $3)",
     )
@@ -271,7 +287,11 @@ pub async fn list_purpose(conn: &mut PgConnection, list_uri: &str, rev: &str, op
     .bind(rev)
     .bind(seen)
     .execute(conn)
-    .await?;
+    .await?
+    .rows_affected();
+    if written > 0 {
+        metrics::counter!(METRIC_PURPOSE_WRITES, "path" => "ingest", "result" => purpose_result(purpose)).increment(written);
+    }
     Ok(())
 }
 
@@ -321,6 +341,9 @@ mod tests {
         let Some(db) = fresh_db("subscriptions_copy").await else {
             return;
         };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let p = &db.pool;
         mute_list(p, M1, &list(1), Budget { max_references: 5, max_owners: 5 }).await.expect("mute");
         list_phase::apply(p, &list(1), 600).await.expect("apply");
@@ -398,8 +421,17 @@ mod tests {
         list_purpose(&mut conn, &list(1), "3kd", ListOp::Put(&modlist)).await.expect("put");
         list_purpose(&mut conn, &list(1), "3ke", ListOp::Delete).await.expect("delete");
         assert_eq!(purpose().await, (None, Some("3ke".to_string())));
+        list_purpose(&mut conn, &list(1), "3kf", ListOp::Put(&json!({ "purpose": "app.bsky.graph.defs#curatelist" }))).await.expect("curate");
         // A list with no row: nothing is written, nothing fails.
         list_purpose(&mut conn, &list(9), "3kb", ListOp::Put(&modlist)).await.expect("no row");
+        // `list_purpose_writes_total{path="ingest"}`: one per row written,
+        // by what it stored; the older delete and the missing row wrote
+        // nothing.
+        let text = handle.render();
+        for (result, n) in [("modlist", 2.0), ("none", 2.0), ("other", 1.0)] {
+            let label = format!("result=\"{result}\"");
+            assert_eq!(crate::test_support::series(&text, METRIC_PURPOSE_WRITES, &["path=\"ingest\"", &label]), Some(n), "{result}:\n{text}");
+        }
         drop(conn);
         db.drop_db().await;
     }

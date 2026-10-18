@@ -100,6 +100,14 @@ pub const METRIC_CLAIMS: &str = "backfill_claims_total";
 /// DIDs whose follow-verification flag is set and waits for the firehose
 /// (following-audience design §3.2).
 pub const METRIC_FOLLOWING_WAITING: &str = "following_owners_waiting_firehose";
+/// `authz_daily_backlog_seconds`: how long the oldest due `authz` job that
+/// has not completed has waited (§II-6.11.5).
+pub const METRIC_AUTHZ_BACKLOG: &str = "authz_daily_backlog_seconds";
+/// The daily `authz` jobs' budget: all complete within a day (§II-6.11.5).
+const AUTHZ_BUDGET: Duration = Duration::from_secs(24 * 3600);
+/// Whether `authz_budget_exceeded` was logged for the backlog now over
+/// budget, so it is logged once per crossing, not once per sample.
+static AUTHZ_OVER_BUDGET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The order a worker claims due jobs in (public-indexing §8.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1862,7 +1870,7 @@ impl Backfill {
             sqlx::query_as("SELECT depth, state, count(*) FROM backfill_jobs GROUP BY depth, state")
                 .fetch_all(&self.pool)
                 .await?;
-        for depth in ["member", "scope", "private", "authz", "resync"] {
+        for depth in ["member", "scope", "private", "authz", "resync", crate::subscriptions::jobs::DEPTH] {
             for state in ["queued", "running", "done", "failed", "cancelled"] {
                 let n = rows
                     .iter()
@@ -1880,8 +1888,38 @@ impl Backfill {
         let waiting = following_owners_waiting_firehose(&self.pool).await?;
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(METRIC_FOLLOWING_WAITING).set(waiting as f64);
+        let backlog = authz_daily_backlog_secs(&self.pool).await?;
+        metrics::gauge!(METRIC_AUTHZ_BACKLOG).set(backlog);
+        let over = backlog > AUTHZ_BUDGET.as_secs_f64();
+        if over && !AUTHZ_OVER_BUDGET.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                event = "authz_budget_exceeded",
+                backlog_secs = backlog,
+                "the daily authz jobs have not all completed within 24 h: raise backfill.per_pds_rate_per_sec or lower community.max_members"
+            );
+        } else if !over {
+            AUTHZ_OVER_BUDGET.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.writer.private().sample_gauges(&self.pool).await?;
         Ok(())
     }
+}
+
+/// `authz_daily_backlog_seconds` (§II-6.11.5): how long the oldest due
+/// `authz` job that has not completed has been due, in seconds; 0 when
+/// none is due. A job is due from its `not_before`, the daily schedule's
+/// slot or a retry's; it is not completed while `queued` or `running`.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn authz_daily_backlog_secs(pool: &PgPool) -> Result<f64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(EXTRACT(EPOCH FROM now() - min(not_before))::float8, 0) FROM backfill_jobs \
+         WHERE depth = 'authz' AND state IN ('queued', 'running') AND not_before <= now()",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 /// DIDs whose follow-verification flag is set but does not hold yet: the

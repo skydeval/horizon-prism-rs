@@ -213,6 +213,9 @@ pub async fn write_purposes(pool: &PgPool, snap: &Snapshot, listing: &Listing) -
     };
     for list in &snap.lists {
         let record = records.get(&list.uri);
+        // The purpose this transaction stored, once it commits: `Some(x)`
+        // for a write of `x` (NULL as `None`).
+        let mut stored: Option<Option<String>> = None;
         let written: Result<bool, sqlx::Error> = async {
             let mut tx = pool.begin().await?;
             if !current(&mut tx, snap).await? {
@@ -230,27 +233,37 @@ pub async fn write_purposes(pool: &PgPool, snap: &Snapshot, listing: &Listing) -
             if !newer_ingest {
                 match record {
                     Some(purpose) => {
+                        let purpose = storable(purpose.as_deref());
                         sqlx::query("UPDATE subscribed_lists SET purpose = $2, purpose_rev = $3, unlisted_since = NULL WHERE list_uri = $1")
                             .bind(&list.uri)
-                            .bind(storable(purpose.as_deref()))
+                            .bind(purpose)
                             .bind(&listing.rev)
                             .execute(&mut *tx)
                             .await?;
+                        stored = Some(purpose.map(str::to_string));
                     }
                     None => {
-                        sqlx::query(
-                            "UPDATE subscribed_lists SET \
+                        // Case 4 clears a stored purpose: the one write
+                        // here. It is told by the row's old purpose.
+                        let cleared: bool = sqlx::query_scalar(
+                            "WITH old AS (SELECT COALESCE(purpose IS NOT NULL AND unlisted_since <= now() - make_interval(hours => $3), false) AS clears \
+                                          FROM subscribed_lists WHERE list_uri = $1) \
+                             UPDATE subscribed_lists SET \
                                purpose_rev = CASE WHEN unlisted_since <= now() - make_interval(hours => $3) AND purpose IS NOT NULL \
                                              THEN $2 ELSE purpose_rev END, \
                                purpose = CASE WHEN unlisted_since <= now() - make_interval(hours => $3) THEN NULL ELSE purpose END, \
                                unlisted_since = COALESCE(unlisted_since, now()) \
-                             WHERE list_uri = $1",
+                             FROM old WHERE list_uri = $1 RETURNING old.clears",
                         )
                         .bind(&list.uri)
                         .bind(&listing.rev)
                         .bind(UNLISTED_CLEARS_AFTER_HOURS)
-                        .execute(&mut *tx)
-                        .await?;
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .unwrap_or(false);
+                        if cleared {
+                            stored = Some(None);
+                        }
                     }
                 }
             }
@@ -260,13 +273,17 @@ pub async fn write_purposes(pool: &PgPool, snap: &Snapshot, listing: &Listing) -
         .await;
         match written {
             Ok(true) => {
+                if let Some(purpose) = &stored {
+                    metrics::counter!(super::copy::METRIC_PURPOSE_WRITES, "path" => "sync", "result" => super::copy::purpose_result(purpose.as_deref()))
+                        .increment(1);
+                }
                 if record.is_some() {
                     listed.insert(list.uri.clone());
                 }
             }
             Ok(false) => return Err(Stopped::Superseded),
             Err(error) if deterministic(&error) => {
-                metrics::counter!(METRIC_PURPOSE_WRITE_ERRORS).increment(1);
+                metrics::counter!(METRIC_PURPOSE_WRITE_ERRORS, "path" => "sync").increment(1);
             }
             Err(error) => return Err(error.into()),
         }
@@ -781,6 +798,9 @@ mod tests {
         let Some(db) = fresh_db("subscriptions_sync_purpose").await else {
             return;
         };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let p = &db.pool;
         let (a, b) = (list(1), list(2));
         subscribe(p, &a).await;
@@ -820,6 +840,14 @@ mod tests {
         let odd = listing("3kaaa6", &[(&a, Some(long.as_str())), (&b, None)], vec![]);
         run(p, &odd, 10).await;
         assert_eq!((list_row(p, &a).await.0, list_row(p, &b).await.0), (None, None));
+        // `list_purpose_writes_total{path="sync"}`: each purpose a listing
+        // wrote, and the one clear a day later; a first stamp writes none.
+        let text = handle.render();
+        for (result, n) in [("other", 1.0), ("modlist", 5.0), ("none", 3.0)] {
+            let label = format!("result=\"{result}\"");
+            let got = crate::test_support::series(&text, super::super::copy::METRIC_PURPOSE_WRITES, &["path=\"sync\"", &label]);
+            assert_eq!(got, Some(n), "{result}:\n{text}");
+        }
 
         // A reference admitted again while a run is under way is not made
         // effective by that run: it is another admission.

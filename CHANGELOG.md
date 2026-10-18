@@ -37,6 +37,25 @@ commit.
   `farsight_answered`, which no longer exists: it is
   `farsight_fallback_discarded_total`. An empty share or pool is still
   one reason, `no_budget`.
+- **Private tier, backfill and list-sync gauges (#731).** Sampled with
+  the backfill gauges every minute: `private_owners_not_ready_total`
+  (private owners with no readiness), `private_tier_last_event_age_seconds`
+  (seconds since the live firehose last delivered a private-tier op;
+  seeded at a start from the newest private row, 0 with none; over 24 h
+  while private rows exist it logs `private_tier_ingest_stale`),
+  `authz_daily_backlog_seconds` (how long the oldest due `authz` job that
+  has not completed has waited; past 24 h it logs `authz_budget_exceeded`
+  once), and `backfill_jobs{depth="list_sync", state}`, which the sampler
+  left out. The storage sampler adds `list_sync_slow_owners`,
+  `list_sync_cut_owners` and `list_sync_weekly_overdue` (owners with a
+  subscribed list whose last complete listing is more than 8 days old).
+- **`index_request_total{status}`**: `requestRecord` calls that completed,
+  by the status returned, beside `index_request_catch_up_total`.
+- **`list_purpose_writes_total{path, result}`**: each purpose written to a
+  subscribed list, from the firehose (`ingest`) or a sync (`sync`), by what
+  was stored (`modlist`, `other`, `none`). Operators:
+  `list_purpose_write_errors_total` now carries the same `path` label; the
+  unlabelled series is gone.
 
 ### Added
 

@@ -43,6 +43,10 @@ pub const REQUEST_RECORD: &str = "app.nearhorizon.index.requestRecord";
 pub const NOT_CALLERS_REPO: &str = "uri must be in the caller's repo";
 /// §5.9: the collection must be one the AppView indexes.
 pub const UNSUPPORTED_COLLECTION: &str = "uri's collection is not supported";
+/// `index_request_total{status}` (§II-5.9): `requestRecord` calls that
+/// completed, by the status returned. `indexed` on a record the firehose
+/// never delivered is the safety net at work.
+pub const METRIC_REQUESTS: &str = "index_request_total";
 
 /// Handler state.
 #[derive(Clone)]
@@ -87,6 +91,7 @@ pub async fn request_record(
     }
     match index_record(s.source.as_ref(), &s.writer, repo, collection, rkey, s.attempts, false).await {
         Ok(indexed) => {
+            metrics::counter!(METRIC_REQUESTS, "status" => indexed.status.as_str()).increment(1);
             let caught_up = catch_up(s.source.as_ref(), &s.writer, &s.catch_up, repo, &indexed.pds, &indexed.rev).await;
             Ok(Json(index_status(indexed.status, caught_up)))
         }
@@ -157,6 +162,9 @@ mod tests {
             return;
         };
         let p = &db.pool;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let mut sets = ScopeSets::default();
         sets.scope.insert(MEMBER.into());
         sets.members.insert(MEMBER.into());
@@ -238,6 +246,12 @@ mod tests {
         // authenticated DID may call).
         let (status, v) = call(OUTSIDER, 4, post_uri(OUTSIDER, "keep2")).await;
         assert_eq!((status, v["status"].as_str()), (200, Some("out_of_scope")), "{v}");
+        // `index_request_total{status}`: one per completed call, by status.
+        let text = handle.render();
+        for status in ["indexed", "unchanged", "deleted", "out_of_scope"] {
+            let label = format!("status=\"{status}\"");
+            assert_eq!(crate::test_support::series(&text, METRIC_REQUESTS, &[&label]), Some(1.0), "{status}:\n{text}");
+        }
 
         // The two validation errors carry distinct messages (#232).
         let (status, v) = call(MEMBER, 3, post_uri(OUTSIDER, "keep3")).await;
