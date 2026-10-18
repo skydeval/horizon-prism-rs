@@ -20,6 +20,12 @@ use super::IdentitySettings;
 pub const NON_PERSISTED_CAPACITY: u64 = 100_000;
 /// In-process cache TTL (§7.6).
 pub const NON_PERSISTED_TTL: Duration = Duration::from_secs(3600);
+/// `identity_cache_requests_total{cache, result}` (design-v4 §14.2,
+/// R3-155): every read of the document caches, `hit` when it serves an
+/// entry (fresh or stale) and `miss` otherwise. These are the internal
+/// caches (`did_cache` and its in-process layer), so `cache` is always
+/// `internal`: there is no separate public identity cache yet.
+pub const METRIC_REQUESTS: &str = "identity_cache_requests_total";
 
 /// A cached DID document.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +129,13 @@ impl DidCache {
     ///
     /// Any database error.
     pub async fn lookup(&self, did: &str) -> Result<Option<(CachedDoc, Freshness)>, sqlx::Error> {
+        let found = self.read(did).await?;
+        let hit = found.as_ref().is_some_and(|(_, freshness)| *freshness != Freshness::Expired);
+        metrics::counter!(METRIC_REQUESTS, "cache" => "internal", "result" => if hit { "hit" } else { "miss" }).increment(1);
+        Ok(found)
+    }
+
+    async fn read(&self, did: &str) -> Result<Option<(CachedDoc, Freshness)>, sqlx::Error> {
         let now = Utc::now();
         if let Some(entry) = self.memory.get(did).await {
             let freshness = classify_age(entry.fetched_at, now, &self.settings);
@@ -237,6 +250,33 @@ mod tests {
     fn clock_skew_counts_as_fresh() {
         let s = settings();
         assert_eq!(classify_age(t(12, 0), t(11, 0), &s), Freshness::Fresh);
+    }
+
+    /// `identity_cache_requests_total{cache="internal"}`: a stored entry is
+    /// a hit, an absent one a miss.
+    #[tokio::test]
+    async fn every_read_is_a_hit_or_a_miss() {
+        let Some(db) = crate::test_support::fresh_db("identity_cache_metric").await else {
+            return;
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let cache = DidCache::new(db.pool.clone(), settings());
+        let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+        assert!(cache.lookup(did).await.expect("db").is_none());
+        let doc = CachedDoc { doc: Arc::new(serde_json::json!({"id": did})), fetched_at: Utc::now() };
+        cache.store(did, doc.clone(), false).await.expect("memory");
+        cache.store("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", doc, true).await.expect("row");
+        assert!(cache.lookup(did).await.expect("db").is_some());
+        assert!(cache.lookup("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await.expect("db").is_some());
+        let text = handle.render();
+        let count = |result: &str| {
+            let label = format!("result=\"{result}\"");
+            crate::test_support::series(&text, METRIC_REQUESTS, &["cache=\"internal\"", &label])
+        };
+        assert_eq!((count("hit"), count("miss")), (Some(2.0), Some(1.0)), "{text}");
+        db.drop_db().await;
     }
 
     #[test]

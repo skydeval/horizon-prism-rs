@@ -64,6 +64,20 @@ commit.
   `429` when an issuer lookup runs out of budget), and the histograms
   `search_duration_seconds{endpoint}` (each search query, timed-out ones
   included), `trends_refresh_seconds` and `suggestions_refresh_seconds`.
+- **Identity, auth and budget metrics (#731).**
+  `identity_cache_requests_total{cache, result}` (every read of the DID
+  document caches, `hit` or `miss`; `cache` is `internal`, as no separate
+  public identity cache exists yet), `cascade_request_deadline_exceeded_total`
+  (cascades that found the request's deadline past),
+  `auth_member_verify_exhausted_total` (the per-member `429`),
+  `auth_claims_precheck_failed_total` (tokens failing the claims pre-check),
+  `member_pool_allowance_exhausted_total` (member issuer lookups whose
+  issuer-refresh allowance was spent), `viewer_private_cache_evictions_total`,
+  and the gauges `viewer_private_cache_entries` and `host_budget_buckets`,
+  sampled at startup and every 15 s. Operators:
+  `handle_resolutions_total` gains the `intent` label, `public` for
+  `resolveHandle` and `internal` for indexing work's handle checks; the
+  series without it are gone.
 
 ### Added
 

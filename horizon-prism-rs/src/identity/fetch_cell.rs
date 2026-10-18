@@ -439,6 +439,9 @@ mod tests {
         const MEMBER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
         const OTHER_MEMBER: &str = "did:plc:cccccccccccccccccccccccc";
         const OUTSIDER: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         // PLC: 8/s, burst 8. Non-member pool 4; the member pool's 4 are 2
         // for members and 2 for the issuer-refresh slice.
         let budget = || {
@@ -465,6 +468,11 @@ mod tests {
         assert_eq!(admitted(MEMBER), 1, "its slice allowance, once per window");
         assert_eq!(admitted(OTHER_MEMBER), 1);
         assert_eq!(admitted(MEMBER), 0);
+        // Every lookup after a member's one slice token found its allowance
+        // spent: 9 + 9 + 10 (R3-209).
+        let text = handle.render();
+        let spent = crate::test_support::series(&text, crate::xrpc::pools::METRIC_ALLOWANCE_EXHAUSTED, &[]);
+        assert_eq!(spent, Some(28.0), "{text}");
         // The members' own half is untouched: a member-keyed request (its
         // refetch in the handler) still draws on it, and never on the slice.
         let member = Requester::new(ChargeKey::member(MEMBER));

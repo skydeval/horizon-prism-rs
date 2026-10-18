@@ -29,6 +29,13 @@ use crate::xrpc::pools::Requester;
 pub const TTL: Duration = Duration::from_secs(300);
 /// Largest cached value (§7.6).
 pub const MAX_VALUE_BYTES: usize = 256 * 1024;
+/// `viewer_private_cache_evictions_total`: per-viewer private entries
+/// pushed out by a bound, the per-viewer cap or the total one (design-v4
+/// §8.1, R3-208). Expiry and a purge are not evictions.
+pub const METRIC_PRIVATE_EVICTIONS: &str = "viewer_private_cache_evictions_total";
+/// Gauge `viewer_private_cache_entries`: entries in the per-viewer private
+/// cache, over every viewer.
+pub const METRIC_PRIVATE_ENTRIES: &str = "viewer_private_cache_entries";
 
 /// The per-viewer private cache's settings (design-v4 §8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +96,9 @@ impl PrivateCache {
                 .time_to_live(settings.ttl)
                 .eviction_policy(EvictionPolicy::lru())
                 .eviction_listener(move |key: Arc<PrivateKey>, _, cause: RemovalCause| {
+                    if cause == RemovalCause::Size {
+                        metrics::counter!(METRIC_PRIVATE_EVICTIONS).increment(1);
+                    }
                     if cause != RemovalCause::Replaced {
                         forget_key(&listener, &key.0, &key.1);
                     }
@@ -118,6 +128,7 @@ impl PrivateCache {
             evict
         };
         if let Some(oldest) = evict {
+            metrics::counter!(METRIC_PRIVATE_EVICTIONS).increment(1);
             self.entries.invalidate(&(Arc::clone(&viewer), oldest));
         }
         self.entries.insert((viewer, key.to_string()), bytes);
@@ -189,6 +200,14 @@ impl ReadCache {
     /// Drop `viewer`'s private entries (its purge, design-v4 §14.1).
     pub fn forget_viewer(&self, viewer: &str) {
         self.private.forget(viewer);
+    }
+
+    /// Set `viewer_private_cache_entries` from the cache as it is now,
+    /// after its pending housekeeping (which also reports evictions).
+    pub fn sample_private(&self) {
+        self.private.entries.run_pending_tasks();
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!(METRIC_PRIVATE_ENTRIES).set(self.private.entries.entry_count() as f64);
     }
 
     /// Current weighted size (tests).
@@ -267,6 +286,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_per_viewer_cap_drops_the_viewers_oldest_entry() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let settings = PrivateCacheSettings { per_viewer_max: 2, ..PrivateCacheSettings::default() };
         let c = ReadCache::new(1024 * 1024).with_private(settings);
         let mine = Requester::test().viewer_private(V);
@@ -281,5 +303,31 @@ mod tests {
         assert_eq!(c.get_json::<usize>(&mine, "c").await, Some(3));
         // Another viewer's entries are untouched.
         assert_eq!(c.get_json::<u32>(&other, "w").await, Some(0));
+        // design-v4 §14.2: one eviction, and three entries left; a purge
+        // is not an eviction.
+        c.forget_viewer(W);
+        c.sample_private();
+        let text = handle.render();
+        assert_eq!(crate::test_support::series(&text, METRIC_PRIVATE_EVICTIONS, &[]), Some(1.0), "{text}");
+        assert_eq!(crate::test_support::series(&text, METRIC_PRIVATE_ENTRIES, &[]), Some(2.0), "{text}");
+    }
+
+    /// The total bound evicts too, and is counted.
+    #[tokio::test]
+    async fn the_total_bound_is_counted_as_an_eviction() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let settings = PrivateCacheSettings { max_entries: 4, ..PrivateCacheSettings::default() };
+        let c = ReadCache::new(1024 * 1024).with_private(settings);
+        let mine = Requester::test().viewer_private(V);
+        for i in 0..20u32 {
+            c.put_json(&mine, &format!("k{i}"), &i).await;
+        }
+        c.sample_private();
+        let text = handle.render();
+        let entries = crate::test_support::series(&text, METRIC_PRIVATE_ENTRIES, &[]).expect("entries");
+        let evicted = crate::test_support::series(&text, METRIC_PRIVATE_EVICTIONS, &[]).expect("evictions");
+        assert!(entries <= 4.0 && evicted + entries >= 20.0, "{text}");
     }
 }

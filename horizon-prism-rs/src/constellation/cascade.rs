@@ -40,6 +40,10 @@ pub const BREAKER_OPEN: Duration = Duration::from_secs(30);
 pub const METRIC_CALLS: &str = "upstream_calls_total";
 pub const METRIC_AUTH_REFUSED: &str = "upstream_auth_refused_total";
 pub const METRIC_SKIPPED: &str = "upstream_skipped_total";
+/// `cascade_request_deadline_exceeded_total`: cascades that found the
+/// request-scoped deadline already past, and so got no answer (design-v4
+/// §II-8.3, R3-165).
+pub const METRIC_DEADLINE_EXCEEDED: &str = "cascade_request_deadline_exceeded_total";
 /// Calls cut short by the request's deadline, by network.
 pub const METRIC_BUDGET_CUTOFF: &str = "upstream_budget_cutoff_total";
 
@@ -346,6 +350,7 @@ impl Cascade {
             let now = Instant::now();
             if now >= deadline {
                 metrics::counter!(METRIC_SKIPPED, "network" => name, "reason" => "deadline").increment(1);
+                metrics::counter!(METRIC_DEADLINE_EXCEEDED).increment(1);
                 return Fetched::NoAnswer(attempts);
             }
             // The admission is the probe-slot guard (design-v3 §II-8.3):
@@ -734,9 +739,15 @@ pub(crate) mod tests {
     async fn a_passed_deadline_is_no_answer() {
         let (missing, calls) = fake_appview(StatusCode::BAD_REQUEST, json!({"error": "NotFound", "message": "x"})).await;
         let cascade = cascade_for(&[("bluesky", &missing), ("community-a", &missing)]);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let req = Requester::test().with_deadline(Instant::now());
         let r = cascade.fetch(&req, None, Call::Profile("x")).await;
         assert_eq!(r, Fetched::NoAnswer(Vec::new()));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // One cascade, past its deadline: counted once (R3-165).
+        let text = handle.render();
+        assert_eq!(crate::test_support::series(&text, METRIC_DEADLINE_EXCEEDED, &[]), Some(1.0), "{text}");
     }
 }

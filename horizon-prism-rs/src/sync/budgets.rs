@@ -101,6 +101,11 @@ pub fn probe_rate(tracked: usize, rates: &BudgetRates) -> f64 {
     needed.clamp(1.0, rates.max_probe_per_host.max(1.0))
 }
 
+/// Gauge `host_budget_buckets`: the internal classes' per-host buckets
+/// held (prober, read fetch, backfill, catch-up), one per (host, class)
+/// (design-v4 §II-6.11.3, R3-176, R3-187).
+pub const METRIC_BUCKETS: &str = "host_budget_buckets";
+
 /// The shared per-host tracker. Cheap to clone.
 #[derive(Clone)]
 pub struct HostBudgets {
@@ -174,6 +179,23 @@ impl HostBudgets {
             .take(now)
     }
 
+    /// Buckets held, one per (host, internal class).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buckets.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Set `host_budget_buckets` from the map as it is now.
+    pub fn sample(&self) {
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!(METRIC_BUCKETS).set(self.len() as f64);
+    }
+
     /// Take a token now or not at all (the read path never waits).
     #[must_use]
     pub fn try_acquire(&self, host: &str, class: Class) -> bool {
@@ -235,6 +257,12 @@ mod tests {
         }
         assert_eq!(granted, 10);
         assert!(b.try_acquire("pds.a", Class::Backfill));
+        // `host_budget_buckets`: pds.a's four classes and pds.b's one.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        b.sample();
+        assert_eq!(crate::test_support::series(&handle.render(), METRIC_BUCKETS, &[]), Some(5.0));
     }
 
     #[tokio::test]

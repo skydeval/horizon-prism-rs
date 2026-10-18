@@ -211,6 +211,9 @@ struct Handles {
     absent: Cache<String, ()>,
 }
 
+/// `handle_resolutions_total{intent, result}` (§5.11, R3-155): `intent` is
+/// `public` for `resolveHandle` and `internal` for internal work, so
+/// internal resolutions never move a public series.
 pub const METRIC_HANDLE_RESOLUTIONS: &str = "handle_resolutions_total";
 
 /// Every call goes through the request's `net` intent
@@ -347,7 +350,7 @@ impl DidLookup for RequestLookup {
                 None => HandleOutcome::NotFound,
             };
         };
-        let count = |result: &'static str| metrics::counter!(METRIC_HANDLE_RESOLUTIONS, "result" => result).increment(1);
+        let count = |result: &'static str| metrics::counter!(METRIC_HANDLE_RESOLUTIONS, "intent" => "public", "result" => result).increment(1);
         // A viewer-private request neither reads nor writes either cache,
         // negative entries included (design-v4 §8.1, R3-208).
         let shared = !req.is_viewer_private();

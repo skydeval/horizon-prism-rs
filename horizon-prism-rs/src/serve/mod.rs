@@ -64,6 +64,18 @@ use health::{AuditLatch, HealthState};
 pub const EXIT_CONFIG: u8 = 78;
 /// Timeout for the startup Redis connection.
 pub const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the in-process gauges `viewer_private_cache_entries` and
+/// `host_budget_buckets` are sampled.
+const PROCESS_GAUGES_EVERY: Duration = Duration::from_secs(15);
+
+/// The in-process gauges' sampler, for as long as the process runs.
+async fn sample_process_gauges(read_cache: ReadCache, budgets: HostBudgets) {
+    loop {
+        read_cache.sample_private();
+        budgets.sample();
+        tokio::time::sleep(PROCESS_GAUGES_EVERY).await;
+    }
+}
 /// The `worker_state` key marking the private display refill as queued
 /// (private posting §3.1).
 pub const PRIVATE_DISPLAY_REFILL: &str = "private_display_refill";
@@ -606,6 +618,10 @@ pub async fn run() -> Result<(), StartupError> {
         max_entries: cfg.file.cache.viewer_private_max,
         per_viewer_max: usize::try_from(cfg.file.cache.viewer_private_per_viewer_max).unwrap_or(usize::MAX),
     });
+    // `viewer_private_cache_entries` and `host_budget_buckets`: sampled
+    // once now, so both exist from the start, then every
+    // `PROCESS_GAUGES_EVERY`.
+    tasks.push(tokio::spawn(sample_process_gauges(read_cache.clone(), budgets.clone())));
     let slingshot = SlingshotClient::new(nets.public().client().clone(), &microcosm.slingshot_url).metered(shares.bucket(
         "slingshot",
         microcosm.slingshot_rate_per_sec.0,

@@ -58,6 +58,12 @@ pub const METRIC_CEILING: &str = "auth_verify_ceiling_exhausted_total";
 /// `auth_failed_verify_limited_total`: requests sent to their IP key
 /// because a failure bucket was empty.
 pub const METRIC_FAILURE_LIMITED: &str = "auth_failed_verify_limited_total";
+/// `auth_member_verify_exhausted_total`: the per-member 429, a request
+/// whose member ceiling was empty (R3-243).
+pub const METRIC_MEMBER_EXHAUSTED: &str = "auth_member_verify_exhausted_total";
+/// `auth_claims_precheck_failed_total`: tokens whose unverified claims
+/// failed the pre-check, charged to their IP key unverified (R3-246).
+pub const METRIC_PRECHECK_FAILED: &str = "auth_claims_precheck_failed_total";
 /// How long an untouched failure or ceiling bucket is kept.
 const STATE_IDLE: Duration = Duration::from_secs(3600);
 
@@ -310,6 +316,7 @@ impl VerifyLimits {
             .take(inner.member, now);
         if let Err(retry_after) = taken {
             metrics::counter!(METRIC_CEILING, "ceiling" => "member").increment(1);
+            metrics::counter!(METRIC_MEMBER_EXHAUSTED).increment(1);
             return Admission::Limited { retry_after };
         }
         // 4. The per-IP-key ceiling.
@@ -503,6 +510,7 @@ impl Backstop {
             return by_ip();
         };
         let Some(claims) = auth.precheck(authorization, method) else {
+            metrics::counter!(METRIC_PRECHECK_FAILED).increment(1);
             return by_ip();
         };
         let Some(key) = self.keys.get(&claims.iss) else {
@@ -693,6 +701,9 @@ mod tests {
 
     #[test]
     fn failures_are_limited_per_pair_and_never_spend_the_member_ceiling() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         // Pair: burst 5. Member ceiling: burst 2.
         let l = limits("[auth]\nmember_verify_rate_per_sec = 1.0\nmember_verify_burst = 2\n");
         let now = Instant::now();
@@ -718,6 +729,9 @@ mod tests {
         let _ = ticket(l.admit_at(home, MEMBER, 1, now + Duration::from_secs(1)));
         // Another member on the first PDS has its own pair bucket.
         let _ = ticket(l.admit_at(pds, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", 1, now));
+        // The two per-member 429s are counted (R3-243).
+        let text = handle.render();
+        assert_eq!(crate::test_support::series(&text, METRIC_MEMBER_EXHAUSTED, &[]), Some(2.0), "{text}");
     }
 
     #[test]
@@ -804,6 +818,9 @@ mod tests {
         use crate::kryphocron_glue::jwt::tests::{StubFetcher, mint, signing_key, verifier};
         use crate::kryphocron_glue::service_key::multikey;
 
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         // The verifier's own fetcher must never be asked: the gate uses the
         // in-memory document only.
         let fetcher = StubFetcher::default();
@@ -853,6 +870,9 @@ mod tests {
         assert_eq!(s.req.key(), &by_ip);
         let elsewhere = format!("Bearer {}", mint(&key, MEMBER, "did:web:feeds.example.com", Some(METHOD)));
         assert_eq!(select(Some(elsewhere), METHOD).await.req.key(), &by_ip);
+        // Both are counted; the forged token passed the pre-check.
+        let text = handle.render();
+        assert_eq!(crate::test_support::series(&text, METRIC_PRECHECK_FAILED, &[]), Some(2.0), "{text}");
 
         // Anonymous, and a non-member with a valid token of its own.
         assert_eq!(select(None, METHOD).await.req.key(), &by_ip);

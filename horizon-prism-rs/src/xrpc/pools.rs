@@ -377,6 +377,12 @@ struct SliceInner {
     used: Cache<String, ()>,
 }
 
+/// `member_pool_allowance_exhausted_total`: issuer resolutions for a ready
+/// member whose allowance on the issuer-refresh slice was already used in
+/// this window, so they draw on the non-member pool (design-v4 §II-8.3,
+/// R3-209).
+pub const METRIC_ALLOWANCE_EXHAUSTED: &str = "member_pool_allowance_exhausted_total";
+
 /// The issuer-refresh slice of PLC's member pool
 /// ([`Shares::bucket_with_slice`]). Cheap to clone.
 #[derive(Clone)]
@@ -391,6 +397,9 @@ impl IssuerSlice {
     #[must_use]
     pub fn take(&self, did: &str) -> bool {
         if self.inner.used.contains_key(did) {
+            // The member's allowance for this window is spent: the lookup
+            // falls to the non-member pool (R3-209).
+            metrics::counter!(METRIC_ALLOWANCE_EXHAUSTED).increment(1);
             return false;
         }
         let taken = self

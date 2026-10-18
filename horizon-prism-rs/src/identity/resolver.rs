@@ -542,9 +542,19 @@ impl IdentityResolver {
     }
 
     /// The verified handle for `did`, or `None`.
+    ///
+    /// A resolution made with the internal intent (backfill, the identity
+    /// refresher) is counted in `handle_resolutions_total{intent =
+    /// "internal"}`: `network_ok` when the handle named a DID, and
+    /// `network_not_found` when it named none (the probe does not tell a
+    /// failure apart from an absence here).
     pub async fn verify_handle(&self, did: &str, claimed: Option<&str>) -> Option<String> {
         let claimed = claimed?;
         let resolved = self.inner.handles.resolve_handle(self.transport(), claimed).await;
+        if self.intent == Intent::Internal {
+            let result = if resolved.is_some() { "network_ok" } else { "network_not_found" };
+            metrics::counter!(crate::constellation::routing::METRIC_HANDLE_RESOLUTIONS, "intent" => "internal", "result" => result).increment(1);
+        }
         verify_bidirectional(did, Some(claimed), resolved.as_deref())
     }
 
@@ -738,6 +748,40 @@ mod tests {
         let private = req.viewer_private("did:plc:vvvvvvvvvvvvvvvvvvvvvvvv");
         assert_eq!(resolver.for_request(&private).intent(), Intent::ViewerPrivate);
         assert_eq!(resolver.with_intent(Intent::Public).for_request(&private).intent(), Intent::ViewerPrivate);
+    }
+
+    /// design-v4 §14.2 (R3-155): an internal handle resolution is counted
+    /// under `intent="internal"`; a public view's `verify_handle` (a
+    /// request path that is not `resolveHandle`) is not counted at all.
+    #[tokio::test]
+    async fn internal_handle_resolutions_are_counted_apart() {
+        struct Fixed;
+        #[async_trait]
+        impl HandleLookup for Fixed {
+            async fn resolve_handle(&self, _transport: &Transport, handle: &str) -> Option<String> {
+                (handle == "alice.example.com").then(|| PLC.to_string())
+            }
+        }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let pool = PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").expect("lazy pool");
+        let settings = IdentitySettings {
+            plc_url: "https://plc.directory".to_string(),
+            fresh: std::time::Duration::from_secs(3600),
+            stale_max: std::time::Duration::from_secs(86_400),
+        };
+        let resolver = IdentityResolver::with_handles(Transports::loopback_for_tests(), pool, settings, Arc::new(NeverPersist), Arc::new(Fixed), Intent::Internal);
+        assert_eq!(resolver.verify_handle(PLC, Some("alice.example.com")).await.as_deref(), Some("alice.example.com"));
+        assert_eq!(resolver.verify_handle(PLC, Some("nobody.example.com")).await, None);
+        resolver.with_intent(Intent::Public).verify_handle(PLC, Some("alice.example.com")).await;
+        let text = handle.render();
+        let count = |result: &str| {
+            let label = format!("result=\"{result}\"");
+            crate::test_support::series(&text, "handle_resolutions_total", &["intent=\"internal\"", &label])
+        };
+        assert_eq!((count("network_ok"), count("network_not_found")), (Some(1.0), Some(1.0)), "{text}");
+        assert!(!text.contains("intent=\"public\""), "{text}");
     }
 
     #[test]

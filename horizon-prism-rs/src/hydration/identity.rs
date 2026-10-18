@@ -40,7 +40,7 @@ impl Hydrator {
                 scope.in_scope(&did) || scope.is_member(&did)
             };
             if indexed {
-                metrics::counter!(METRIC_HANDLE_RESOLUTIONS, "result" => "local").increment(1);
+                metrics::counter!(METRIC_HANDLE_RESOLUTIONS, "intent" => "public", "result" => "local").increment(1);
                 return Ok(Ok(Self::emit(json!({ "did": did }))));
             }
         }
@@ -106,6 +106,9 @@ mod tests {
         let Some(db) = fresh_db("hydration_resolve_handle").await else {
             return;
         };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let p = &db.pool;
         actor(p, ALICE, "alice.test", "Alice").await;
         actor(p, BOB, "bob.test", "Bob").await;
@@ -128,6 +131,10 @@ mod tests {
         let missing = h.resolve_handle(&req, "nobody.example").await.expect("db").expect_err("missing");
         assert_eq!(missing.error, "HandleNotFound");
         assert!(matches!(h.resolve_handle(&req, "down.example").await, Err(HydrationError::Upstream)));
+        // The local answer is a public resolution (§14.2, R3-155).
+        let text = handle.render();
+        let local = crate::test_support::series(&text, METRIC_HANDLE_RESOLUTIONS, &["intent=\"public\"", "result=\"local\""]);
+        assert_eq!(local, Some(1.0), "{text}");
         db.drop_db().await;
     }
 }
