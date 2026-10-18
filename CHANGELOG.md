@@ -78,6 +78,15 @@ commit.
   `handle_resolutions_total` gains the `intent` label, `public` for
   `resolveHandle` and `internal` for indexing work's handle checks; the
   series without it are gone.
+- **`docker/README.md`: the metrics (#730, #731).** The
+  `PrivateTierIngestStale` and `AuthzBudgetExceeded` alert examples now
+  have series to fire on, and say what they measure. New `ListSyncStuck`
+  (`list_sync_running_age_seconds > 6750`) and `SearchTimeouts`
+  (`rate(search_timeout_total[5m]) > 0.1`) examples. A section on
+  Farsight's fallback and memory: off by default, what the fallback
+  discloses, when it asks, measuring Farsight under load first, its load
+  on the other AppView, what the memory stores and for how long, and
+  their metrics. A one-line list of every other series.
 
 ### Added
 

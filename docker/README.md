@@ -178,6 +178,39 @@ docker compose exec app /app/horizon-prism-rs admin farsight prime <did> [--forc
 
 Watch `farsight_calls_total{outcome}` for failures, `farsight_auth_failed_total` for a revoked or under-scoped key, and `farsight_coverage_total{level}`: at `partial`, Farsight is still catching up and some list blocks may be missing. `farsight_down` is 1 while Farsight is down: it has answered since `serve` started, its breaker is open, and nothing but timeouts, transport errors and `5xx` came since its last answer. `farsight_fallback_withheld{reason}` is 1 while its breaker is open but it is not down, with `reason` `never_answered` (it has not answered since `serve` started) or `unclean` (something else came since its last answer, such as a `401`, `429` or `400`). Both are read from the breaker once a second, so they go back to 0 when the 30 s open period ends.
 
+### Farsight's fallback and memory (both off)
+
+`[farsight.fallback]` and `[farsight.memory]` in `config/app.toml` are off by default and need `farsight.url`. All twelve of their keys are read when `app` starts; change them and restart.
+
+- **The fallback** asks one other AppView, while Farsight is down, which accounts on a member's page block that member through a list, so those blocks still apply.
+- **The memory** keeps the list blocks Farsight (or the fallback) reported for each member, so they keep applying while Farsight gives no answer, and across a restart.
+
+**What the fallback discloses.** Each fallback call tells a third party that this deployment is rendering a page for member A that contains accounts B1 … Bn. The call comes from this deployment's own address and carries its `User-Agent`, which names this host. The other AppView's operator, and any CDN in front of it, can log it; if it answers with a redirect, the host it names gets the same query. A page is any ordinary render: a timeline, a thread, a profile, and also the results of a search or of suggestions, so the accounts sent can be the results of a query the member typed.
+
+The other AppView can also join it with the ordinary profile and thread lookups this deployment sends it. With the default network it is the first network those lookups go to, so within about a second it can receive, from one address, a lookup that names no member and the fallback call that names the member and the page's authors, and learn which thread, profile or feed the member loaded. This is the same kind of disclosure Farsight receives, made to a party you do not run. Pointing `network` at an AppView you run removes the third party only if that AppView answers from its own data; this stack's own AppView does not for someone who is not its member, so it passes the question on.
+
+**When it asks.** Only while all three hold: Farsight has answered since `app` started, its breaker is open, and everything since its last answer was a timeout, a transport error or a `5xx`.
+- A Farsight that has never answered this process (a wrong `farsight.url`, a revoked key) never brings it on. After a restart during an outage there is no fallback until Farsight has answered once, so it cannot be switched on in the middle of an outage.
+- One `401`, `403`, `429` or `400` during a real outage keeps it off for the rest of that outage.
+- A long Farsight outage makes it the steady source for that long.
+- Thread Lens and `getRelationships` never ask it, and Thread Lens shows no hidden replies while Farsight is down, with the fallback or without it. Its answers are that AppView's own view, are never treated as complete, and never override Farsight's.
+
+`farsight_down`, `farsight_fallback_withheld` and `farsight_auth_failed_total` show which state you are in (alert examples below).
+
+**Measure Farsight under load before turning the fallback on.** Farsight gives one key 16 calls in progress. A call counts as a timeout when its own time plus its wait for a place passes the limit it was given: `farsight.timeout_ms` for an ordinary page, `threadlens.verdict_round_timeout_ms` for a Thread Lens round, which sends many calls at once. So what matters is one call's worst-case time multiplied by the calls queued ahead of it. Whoever can push five calls in a row past the limit can bring the fallback on. Measure your own instance end to end, through the network and the proxy, under load. A call this app timed out still holds its place until Farsight finishes it, so raising `farsight.timeout_ms` alone is not enough: size Farsight's places for the key against `farsight.rate_per_sec` as well, or accept that risk.
+
+**Its load on the other AppView.** It sees up to the routing entry's own rate plus `farsight.fallback.rate_per_sec` from this deployment, and may have limits of its own. At the default rate the fallback serves a handful of members active at once. Only a routing entry that needs no sign-in (`auth = "unauth"`) can be named.
+
+**What the memory stores.** One row per (member, account that blocks the member through a list): the list, where the block came from, and when it was last confirmed. That shows which accounts appeared on a member's pages, and roughly when.
+- A row is kept `retention_hours` after its last confirmation, so a block lifted meanwhile can keep applying that long; a row can stay on disk up to a day longer before the daily cleanup removes it. A block Farsight later says is gone is forgotten at once.
+- Database backups keep the rows for as long as you keep the backups.
+- `max_per_viewer` bounds one member, `max_total` the whole memory; in a large community the total is reached first, and the oldest blocks go.
+- Rows are kept for members only. `admin farsight forget <did>` clears one member's rows at once.
+- Starting `app` with the memory off empties the table.
+- Migration 0019 adds the table and is applied like any other, even with both features off: `app` does not start with a migration pending. The table then stays empty.
+
+Watch the fallback with `farsight_fallback_requests_total{endpoint,class}` (every call, by the method being served and how it ended), `farsight_fallback_skipped_total{reason}` (calls not made: `no_budget`, `breaker_open`, `call_cap`, `allowance`, `deadline`, `actor_stop`), `farsight_fallback_discarded_total` (answers dropped because Farsight answered meanwhile), `farsight_fallback_pairs_total{result}` (each account of an answered call: `blocked`, `clear`, `invalid`, `not_found`, `missing`, `dropped`), `farsight_fallback_blocks_applied_total` and the gauge `farsight_fallback_ledger_entries` (accounts it said "nothing" for, held back from being asked again for `cache_ttl_secs`). Watch the memory with `farsight_memory_entries`, `farsight_memory_changes_total{op}`, `farsight_memory_dropped_total{reason}` and `farsight_memory_blocks_applied_total`. `inbound_list_blocks_applied_total` counts every list block applied to a page, from any source.
+
 ### Public indexing (on or off)
 
 `indexing.public_scope` decides whether the app also serves as a public AppView. With it `off`, the app indexes and serves only what the private tier, Thread Lens and Horizon features need, and the client uses a public AppView (Bluesky or another) for everything else.
@@ -359,6 +392,10 @@ groups:
       - alert: StorageBudget
         expr: db_budget_ratio > 0.8
         for: 30m
+      # No private-tier record or delete has come from the relays for a day.
+      # The age counts from the last one the live firehose delivered (at a
+      # start, the newest stored private row); it is 0 while there are none.
+      # Check that every private relay crawls the community PDSes.
       - alert: PrivateTierIngestStale
         expr: private_tier_last_event_age_seconds > 86400
       - alert: RelayWatermarkBehind
@@ -374,7 +411,9 @@ groups:
         expr: members_not_ready_total > 0
         for: 24h
       # The daily authorization re-check (design §6.11.5) has fallen behind its
-      # 24 h budget: raise backfill.per_pds_rate_per_sec or lower community.max_members.
+      # 24 h budget: the oldest due `authz` job has waited more than a day
+      # (also logged once as `authz_budget_exceeded`). Raise
+      # backfill.per_pds_rate_per_sec or lower community.max_members.
       - alert: AuthzBudgetExceeded
         expr: authz_daily_backlog_seconds > 86400
       # A member or private owner is permanently not ready: one of its
@@ -434,7 +473,61 @@ groups:
         for: 5m
       - alert: FarsightAuthFailed
         expr: increase(farsight_auth_failed_total[15m]) > 0
+      # A subscribed-list sync has been running longer than the stuck-row
+      # check allows (1.25 × lists.sync_stuck_secs, 5400 by default): it should
+      # have been re-queued. `backfill_jobs{depth="list_sync"}` shows the queue.
+      - alert: ListSyncStuck
+        expr: list_sync_running_age_seconds > 6750
+        for: 15m
+      # Searches are stopped by their statement timeout more than once every
+      # ten seconds: the search indexes may still be building, or the
+      # database is short of resources.
+      - alert: SearchTimeouts
+        expr: rate(search_timeout_total[5m]) > 0.1
+        for: 10m
 ```
+
+Other series, one line each (the sections above name the rest):
+
+- `private_owners_not_ready_total`: private-post owners whose initial indexing has not finished.
+- `private_tier_ops_skipped_total{op}`: private records skipped because the private tier is off in this build.
+- `index_request_total{status}`: `requestRecord` calls by the status returned; `indexed` for a record the relays never delivered means the safety net was needed.
+- `index_request_catch_up_total{outcome}`: the catch-up a `requestRecord` runs after it, by outcome.
+- `settle_uncovered_total{path}`: settles whose revision the listed revisions did not cover, by path.
+- `backfill_optional_record_unclear_total{collection}`: profile or `self` record fetches a PDS answered with a bare 404 instead of `RecordNotFound`.
+- `retention_deleted_rows_total{table}`: rows retention deleted, by table.
+- `retention_task_failures_total{task}`: retention tasks that failed, by task.
+- `storage_sample_errors_total{source}`: storage samples (Postgres, Redis) that failed.
+- `identity_refresh_total{outcome}`: identity refreshes, by outcome.
+- `account_status_changes_total{to}`: account status changes applied, by the new status.
+- `eligibility_cleared_total{reason}`: private-post owners whose community-PDS eligibility was cleared after repeated failures.
+- `identity_cache_requests_total{cache,result}`: reads of the DID-document caches, `hit` or `miss`.
+- `handle_resolutions_total{intent,result}`: handle resolutions; `intent` is `public` for `resolveHandle` and `internal` for indexing work.
+- `jwt_fetch_cell_failures_total`: sign-in token issuer lookups that failed.
+- `xrpc_auth_total{result}`: sign-in token checks, by result.
+- `auth_claims_precheck_failed_total`: tokens whose claims failed the check made before verification; they are charged to their address.
+- `auth_member_verify_exhausted_total`: requests answered 429 because a member's own verification limit was spent.
+- `auth_budget_exhausted_total`: requests answered 429 because looking up the token's issuer ran out of budget.
+- `member_pool_allowance_exhausted_total`: issuer lookups for a member that had used its allowance on the members' part of the PLC budget.
+- `member_keys`: ready members whose signing key is held in memory.
+- `upstream_skipped_total{network,reason}`: upstream calls not made (`deadline`, `breaker_open`, `rate_limited`).
+- `cascade_request_deadline_exceeded_total`: upstream lookups that found the request's 6 s deadline already past.
+- `upstream_view_counts_total{source}`: where the counts of a view fetched from another AppView came from.
+- `starter_pack_counts_refreshed_total{source}`: starter-pack counts recounted, by source.
+- `viewer_private_cache_entries` and `viewer_private_cache_evictions_total`: the per-member cache of private lookups, its size and the entries its bounds pushed out.
+- `host_budget_buckets`: per-host budget buckets held for the prober, backfill and read fetches.
+- `sync_head_check_seconds`: how long a repository head check took.
+- `sync_divergence_detected_total`: repositories whose head stayed ahead of what was indexed past the grace period; their readiness is cleared and they are checked again.
+- `list_subscription_tx_retries_total`: subscribed-list transactions run again after a deadlock or conflict.
+- `list_copy_write_errors_total`: list items that could not be copied for a subscribed list.
+- `list_purpose_writes_total{path,result}` and `list_purpose_write_errors_total{path}`: subscribed lists' purposes written (`modlist`, `other`, `none`) and the writes that failed, from the firehose (`ingest`) or a sync (`sync`).
+- `list_sync_runs_total{outcome,lane}`: subscribed-list syncs, by outcome and lane.
+- `list_sync_stuck_requeued_total`: syncs re-queued by the stuck-row check.
+- `list_sync_slow_owners`, `list_sync_cut_owners` and `list_sync_weekly_overdue`: list owners on the slow lane, backing off after a cut, and not fully synced for more than 8 days.
+- `xrpc_method_not_implemented_total` and `xrpc_wrong_method_total`: requests for a method this AppView does not have, and for one with the wrong HTTP verb.
+- `sort_fallback_total{endpoint}`: listings served in `latest` order because another was asked.
+- `search_duration_seconds{endpoint}`, `trends_refresh_seconds` and `suggestions_refresh_seconds`: how long searches, trend refreshes and suggestion refreshes took.
+- `standin_hosts_build`: 1 in a test build that can reach private addresses; it never appears in a deploy build.
 
 A latched audit guard (design §6.5) makes `/xrpc/_health` return 503. `docker compose ps` then shows `app` as unhealthy. Restart `app` after investigating the logged panic.
 
