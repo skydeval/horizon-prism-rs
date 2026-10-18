@@ -48,8 +48,16 @@ pub fn respond_sorted(req: &Requester, sort: Option<&str>, result: ViewResult<Va
     let fallback = sort
         .filter(|s| *s != "latest")
         .map(|_| (HeaderName::from_static(SORT_FALLBACK), HeaderValue::from_static("latest")));
-    respond(req, result).map(|json| (AppendHeaders(fallback), json))
+    let response = respond(req, result).map(|json| (AppendHeaders(fallback.clone()), json));
+    if response.is_ok() && fallback.is_some() {
+        metrics::counter!(METRIC_SORT_FALLBACK, "endpoint" => req.labels().1).increment(1);
+    }
+    response
 }
+
+/// `sort_fallback_total{endpoint}`: responses served in `latest` order with
+/// `X-Prism-Sort-Fallback` because another order was asked (§5.2).
+pub const METRIC_SORT_FALLBACK: &str = "sort_fallback_total";
 
 /// Map a hydration outcome to a response.
 ///
@@ -94,13 +102,20 @@ mod tests {
     /// nothing.
     #[test]
     fn a_sort_other_than_latest_falls_back_and_says_so() {
-        let req = Requester::test();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let req = Requester::test().for_endpoint("app.bsky.graph.getFollowers");
         let ok = || Ok(Ok(crate::hydration::testing::emitted(serde_json::json!({"followers": []}))));
         for (sort, header) in [(Some("top"), Some("latest")), (Some("bogus"), Some("latest")), (Some("latest"), None), (None, None)] {
             let response = respond_sorted(&req, sort, ok()).expect("served").into_response();
             assert_eq!(response.status(), StatusCode::OK, "{sort:?}");
             assert_eq!(response.headers().get(SORT_FALLBACK).map(|v| v.to_str().expect("ascii")), header, "{sort:?}");
         }
+        // `sort_fallback_total{endpoint}`: the two fallbacks, by method.
+        let text = handle.render();
+        let got = crate::test_support::series(&text, METRIC_SORT_FALLBACK, &["endpoint=\"app.bsky.graph.getFollowers\""]);
+        assert_eq!(got, Some(2.0), "{text}");
     }
 
     #[test]

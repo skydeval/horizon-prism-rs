@@ -37,6 +37,9 @@ use crate::xrpc::pools::Requester;
 /// `suggestions_timeout_total{endpoint}`: per-viewer or per-actor queries
 /// stopped by the statement timeout.
 pub const METRIC_TIMEOUT: &str = "suggestions_timeout_total";
+/// `suggestions_refresh_seconds`: how long each recompute of the pool (one
+/// order) took (§14.2).
+pub const METRIC_REFRESH_SECONDS: &str = "suggestions_refresh_seconds";
 
 /// What `getSuggestedFollowsByActor` returns at most: the lexicon has no
 /// `limit`.
@@ -176,7 +179,10 @@ impl Hydrator {
         let mut slot = slot.lock().await;
         if slot.at.is_none_or(|at| at.elapsed() >= Duration::from_secs(cfg.refresh_secs)) {
             let sql = format!("SELECT a.did FROM actors a WHERE {} ORDER BY {order} LIMIT $1", eligible(Some(cfg.active_days)));
-            let dids: Vec<String> = sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).fetch_all(self.pool()).await?;
+            let started = Instant::now();
+            let found = sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).fetch_all(self.pool()).await;
+            metrics::histogram!(METRIC_REFRESH_SECONDS).record(started.elapsed().as_secs_f64());
+            let dids: Vec<String> = found?;
             slot.ranked = Ranked { dids: Arc::new(dids), rec_id: rec_id("suggestions/v1", &[label.as_bytes(), &computed_at()]) };
             slot.at = Some(Instant::now());
         }
@@ -434,6 +440,9 @@ mod tests {
         let Some(db) = fresh_db("hydration_suggestions").await else {
             return;
         };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let p = &db.pool;
         let (me, a, b, c, hidden, quiet, opted_out, outside) = (did('m'), did('a'), did('b'), did('c'), did('h'), did('q'), did('o'), did('x'));
         for (i, d) in [&me, &a, &b, &c, &hidden, &quiet, &opted_out, &outside].into_iter().enumerate() {
@@ -531,6 +540,12 @@ mod tests {
         assert_eq!(packs(&all), ["pm", "pc", "pb", "pa"]);
         let mine = h.suggested_starter_packs(&member, &req, 10).await.expect("db").expect("view").inner().clone();
         assert_eq!(packs(&mine), ["pc", "pa"]);
+        // `suggestions_refresh_seconds`: every recompute of the pool is
+        // timed. The test config (`refresh_secs = 0`) recomputes on every
+        // read, so there is one per pool read above.
+        let text = handle.render();
+        let timed = crate::test_support::series(&text, "suggestions_refresh_seconds_count", &[]);
+        assert!(timed.is_some_and(|n| n >= 2.0), "{text}");
         db.drop_db().await;
     }
 }

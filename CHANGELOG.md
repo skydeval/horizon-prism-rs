@@ -56,6 +56,14 @@ commit.
   was stored (`modlist`, `other`, `none`). Operators:
   `list_purpose_write_errors_total` now carries the same `path` label; the
   unlabelled series is gone.
+- **XRPC surface and search timings (#731).**
+  `xrpc_method_not_implemented_total` (unknown methods answered by the
+  router's `501`), `xrpc_wrong_method_total` (wrong-verb `400`s),
+  `sort_fallback_total{endpoint}` (listings served `latest` with
+  `X-Prism-Sort-Fallback`), `auth_budget_exhausted_total` (the auth-path
+  `429` when an issuer lookup runs out of budget), and the histograms
+  `search_duration_seconds{endpoint}` (each search query, timed-out ones
+  included), `trends_refresh_seconds` and `suggestions_refresh_seconds`.
 
 ### Added
 

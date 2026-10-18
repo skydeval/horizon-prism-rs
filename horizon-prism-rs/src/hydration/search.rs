@@ -36,6 +36,9 @@ use crate::xrpc::pools::Requester;
 /// `search_timeout_total{endpoint}`: searches stopped by the statement
 /// timeout.
 pub const METRIC_TIMEOUT: &str = "search_timeout_total";
+/// `search_duration_seconds{endpoint}`: how long a search's query ran,
+/// timed-out queries included (§14.2).
+pub const METRIC_DURATION: &str = "search_duration_seconds";
 
 /// The lexicon's error for a query that cannot be run.
 const BAD_QUERY: &str = "BadQueryString";
@@ -622,7 +625,10 @@ impl Hydrator {
 
         let mut tx = self.pool().begin().await?;
         set_timeout(&mut tx, cfg.statement_timeout_ms).await?;
-        let rows: Vec<(String, DateTime<Utc>)> = match qb.build_query_as().fetch_all(&mut *tx).await {
+        let started = std::time::Instant::now();
+        let found = qb.build_query_as().fetch_all(&mut *tx).await;
+        metrics::histogram!(METRIC_DURATION, "endpoint" => endpoint).record(started.elapsed().as_secs_f64());
+        let rows: Vec<(String, DateTime<Utc>)> = match found {
             Ok(rows) => rows,
             Err(error) if timed_out(&error) => {
                 metrics::counter!(METRIC_TIMEOUT, "endpoint" => endpoint).increment(1);
@@ -726,6 +732,9 @@ mod tests {
         let Some(db) = fresh_db("search_posts").await else {
             return;
         };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let p = &db.pool;
         for (did, handle) in [(ALICE, "alice.example.com"), (BOB, "bob.example.com"), (CAROL, "carol.example.com"), (OUTSIDE, "out.example.com")] {
             actor(p, did, handle, handle).await;
@@ -824,6 +833,10 @@ mod tests {
         exec(p, &format!("UPDATE actors SET profile_record = '{{\"labels\": {{\"values\": [{{\"val\": \"!no-unauthenticated\"}}]}}}}' WHERE did = '{BOB}'")).await;
         assert_eq!(uris(&search(anon.clone(), params("rust")).await.expect("view")), ["3ka", "3kd"]);
         assert_eq!(uris(&search(alice, params("tokio")).await.expect("view")), ["3kb"]);
+        // `search_duration_seconds{endpoint}`: every query that ran is timed.
+        let text = handle.render();
+        let timed = crate::test_support::series(&text, "search_duration_seconds_count", &["endpoint=\"searchPosts\""]);
+        assert!(timed.is_some_and(|n| n >= 4.0), "{text}");
         db.drop_db().await;
     }
 }

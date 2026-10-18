@@ -38,6 +38,9 @@ use crate::xrpc::pools::Requester;
 /// `trends_refresh_timeout_total`: trend refreshes stopped by their
 /// statement timeout.
 pub const METRIC_REFRESH_TIMEOUT: &str = "trends_refresh_timeout_total";
+/// `trends_refresh_seconds`: how long each trend refresh took, one that
+/// timed out included (§14.2).
+pub const METRIC_REFRESH_SECONDS: &str = "trends_refresh_seconds";
 
 /// Accounts one trend names.
 const TREND_ACTORS: usize = 5;
@@ -301,7 +304,10 @@ impl Hydrator {
         let cfg = &self.inner.cfg.trends;
         let mut slot = self.inner.trends.trends.lock().await;
         if slot.at.is_none_or(|at| at.elapsed() >= Duration::from_secs(cfg.cache_ttl_secs)) && self.tags_indexed().await? {
-            match self.compute_trends().await? {
+            let started = Instant::now();
+            let computed = self.compute_trends().await;
+            metrics::histogram!(METRIC_REFRESH_SECONDS).record(started.elapsed().as_secs_f64());
+            match computed? {
                 Some(trends) => {
                     let topics: Vec<&[u8]> = trends.iter().map(|t| t.tag.as_bytes()).collect();
                     let mut parts: Vec<&[u8]> = Vec::with_capacity(topics.len() + 1);
@@ -390,6 +396,9 @@ mod tests {
         let Some(db) = fresh_db("hydration_trends").await else {
             return;
         };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let p = &db.pool;
         let did = |c: char| format!("did:plc:{}", c.to_string().repeat(24));
         let (a, b, c, hidden) = (did('a'), did('b'), did('c'), did('h'));
@@ -443,6 +452,11 @@ mod tests {
         assert_eq!(actors, [a.as_str(), b.as_str()]);
         assert!(rust["startedAt"].is_string() && rust.get("category").is_none());
         assert_eq!(trends["recIdStr"].as_str().map(str::len), Some(32));
+        // `trends_refresh_seconds`: every refresh is timed; the test config
+        // (`cache_ttl_secs = 0`) refreshes on both calls.
+        h.trends(&Viewer::anonymous(), &req, 10).await.expect("db").expect("view");
+        let text = handle.render();
+        assert_eq!(crate::test_support::series(&text, "trends_refresh_seconds_count", &[]), Some(2.0), "{text}");
         db.drop_db().await;
     }
 }

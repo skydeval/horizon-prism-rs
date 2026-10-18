@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use sqlx::{Postgres, QueryBuilder};
 
-use super::search::{METRIC_TIMEOUT, set_timeout, timed_out, viewer_exclusions};
+use super::search::{METRIC_DURATION, METRIC_TIMEOUT, set_timeout, timed_out, viewer_exclusions};
 use super::{ActorRow, ActorViewer, CountMode, Hydrator, INVALID_HANDLE, ViewError, ViewResult, Viewer, blob_url, ts};
 use crate::moderation::{self, Gate};
 use crate::xrpc::pools::Requester;
@@ -432,6 +432,7 @@ impl Hydrator {
         );
         let mut tx = self.pool().begin().await?;
         set_timeout(&mut tx, self.inner.cfg.search.statement_timeout_ms).await?;
+        let started = Instant::now();
         let found = sqlx::query_scalar(&sql)
             .bind(viewer.state_did())
             .bind(&pattern)
@@ -441,6 +442,7 @@ impl Hydrator {
             .bind(offset)
             .fetch_all(&mut *tx)
             .await;
+        metrics::histogram!(METRIC_DURATION, "endpoint" => "searchActors").record(started.elapsed().as_secs_f64());
         let dids: Vec<String> = match found {
             Ok(dids) => dids,
             Err(error) if timed_out(&error) => {
@@ -538,7 +540,10 @@ impl Hydrator {
 
         let mut tx = self.pool().begin().await?;
         set_timeout(&mut tx, cfg.statement_timeout_ms).await?;
-        let dids: Vec<String> = match qb.build_query_scalar().fetch_all(&mut *tx).await {
+        let started = Instant::now();
+        let found = qb.build_query_scalar().fetch_all(&mut *tx).await;
+        metrics::histogram!(METRIC_DURATION, "endpoint" => "searchActorsTypeahead").record(started.elapsed().as_secs_f64());
+        let dids: Vec<String> = match found {
             Ok(dids) => dids,
             Err(error) if timed_out(&error) => {
                 metrics::counter!(METRIC_TIMEOUT, "endpoint" => "searchActorsTypeahead").increment(1);

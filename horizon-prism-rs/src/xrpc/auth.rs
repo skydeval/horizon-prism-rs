@@ -126,9 +126,21 @@ pub async fn authenticate_for(
             }
             Ok(caller)
         }
-        Err(e) => Err(selected.and_then(|s| s.req.exhausted()).map_or_else(|| e.into(), Into::into)),
+        Err(e) => match selected.and_then(|s| s.req.exhausted()) {
+            // The auth-path 429 (design-v4 §II-8.3, R3-212).
+            Some(exhausted) => {
+                metrics::counter!(METRIC_AUTH_BUDGET_EXHAUSTED).increment(1);
+                Err(exhausted.into())
+            }
+            None => Err(e.into()),
+        },
     }
 }
+
+/// `auth_budget_exhausted_total`: requests answered `429` because the
+/// budget for resolving the token's issuer ran out (design-v4 §II-8.3,
+/// R3-212), never `401`.
+pub const METRIC_AUTH_BUDGET_EXHAUSTED: &str = "auth_budget_exhausted_total";
 
 /// The handle a request's upstream calls are charged to: the one the
 /// backstop selected, or, where no backstop ran (tests), a ready member's

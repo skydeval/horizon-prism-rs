@@ -145,6 +145,7 @@ fn expected_verb(allow: Option<&HeaderValue>, requested: &Method) -> &'static st
 async fn finish(State(cfg): State<FinalConfig>, request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     if let Some(WrongVerb(requested)) = response.extensions().get::<WrongVerb>().cloned() {
+        metrics::counter!(METRIC_WRONG_METHOD).increment(1);
         let allow = response.headers().get(ALLOW).cloned();
         let expected = expected_verb(allow.as_ref(), &requested);
         let mut fixed =
@@ -162,6 +163,13 @@ async fn finish(State(cfg): State<FinalConfig>, request: Request, next: Next) ->
     response
 }
 
+/// `xrpc_method_not_implemented_total`: unregistered NSIDs answered by the
+/// router fallback's `501 MethodNotImplemented` (§6.3).
+pub const METRIC_NOT_IMPLEMENTED: &str = "xrpc_method_not_implemented_total";
+/// `xrpc_wrong_method_total`: registered NSIDs asked with the wrong verb,
+/// answered `400 InvalidRequest` "Incorrect HTTP method" (§6.3).
+pub const METRIC_WRONG_METHOD: &str = "xrpc_wrong_method_total";
+
 /// The catch-all (§6.3): an unregistered NSID is `501 MethodNotImplemented`,
 /// a malformed one `400 InvalidRequest`, and a non-XRPC path a plain 404.
 fn unrouted(path: &str) -> Response {
@@ -170,6 +178,7 @@ fn unrouted(path: &str) -> Response {
     };
     let nsid = rest.strip_prefix('/').unwrap_or(rest);
     if rest.starts_with('/') && kryphocron_lexicons::Nsid::new(nsid).is_ok() {
+        metrics::counter!(METRIC_NOT_IMPLEMENTED).increment(1);
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({ "error": "MethodNotImplemented", "message": "Method not implemented" })),
@@ -398,6 +407,9 @@ mod tests {
         let Some(db) = fresh_db("xrpc_fallback").await else {
             return;
         };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
         let (state, _drainer) = bare_state(&db.pool);
         let base = serve(state).await;
         let client = reqwest::Client::new();
@@ -440,7 +452,44 @@ mod tests {
         let r = client.get(format!("{base}/health")).send().await.expect("request");
         assert_eq!(r.status().as_u16(), 404);
         assert!(r.bytes().await.expect("body").is_empty());
+
+        // design-v4 §14.2: the three 501s and the two wrong verbs are
+        // counted; a malformed NSID and a plain 404 are neither.
+        let text = handle.render();
+        assert_eq!(crate::test_support::series(&text, METRIC_NOT_IMPLEMENTED, &[]), Some(3.0), "{text}");
+        assert_eq!(crate::test_support::series(&text, METRIC_WRONG_METHOD, &[]), Some(2.0), "{text}");
         db.drop_db().await;
+    }
+
+    /// design-v4 §II-8.3 (R3-212): a token that does not verify on a
+    /// request whose budget ran out is a 429, counted in
+    /// `auth_budget_exhausted_total`; with budget left it is the 401, and
+    /// not counted.
+    #[tokio::test]
+    async fn the_auth_path_429_is_counted() {
+        use crate::xrpc::auth::{METRIC_AUTH_BUDGET_EXHAUSTED, authenticate};
+        use crate::xrpc::backstop::{self, Selected};
+        use crate::xrpc::pools::Shares;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let pool = sqlx::PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").expect("lazy pool");
+        let (state, _drainer) = bare_state(&pool);
+        let ip: std::net::IpAddr = "203.0.113.9".parse().expect("ip");
+        let method = "app.bsky.feed.getTimeline";
+
+        let fresh = Selected::by_ip(ip);
+        let refused = backstop::scope(fresh, authenticate(&state, Some("Bearer not.a.token"), method)).await;
+        assert_eq!(refused.expect_err("refused").into_response().status(), StatusCode::UNAUTHORIZED);
+
+        let spent = Selected::by_ip(ip);
+        let bucket = Shares::for_tests().bucket("plc", 1.0, 2);
+        while spent.req.draw(&bucket) {}
+        let limited = backstop::scope(spent, authenticate(&state, Some("Bearer not.a.token"), method)).await;
+        assert_eq!(limited.expect_err("limited").into_response().status(), StatusCode::TOO_MANY_REQUESTS);
+        let text = handle.render();
+        assert_eq!(crate::test_support::series(&text, METRIC_AUTH_BUDGET_EXHAUSTED, &[]), Some(1.0), "{text}");
     }
 
     /// B-28: deferred endpoints answer an honest 501 from registered routes,
