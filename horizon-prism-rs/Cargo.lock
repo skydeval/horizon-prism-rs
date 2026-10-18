@@ -1858,9 +1858,9 @@ dependencies = [
 
 [[package]]
 name = "kryphocron"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3095c76f38807a5133914a42622003fcb78290331b5fa3a3c72f4bdd903fa355"
+checksum = "59c1deb09ff63ede0ee5e1e206ddf4d30850de2dff1e83772828cd0c0f89ce49"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2743,7 +2743,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2781,7 +2781,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -3778,7 +3778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

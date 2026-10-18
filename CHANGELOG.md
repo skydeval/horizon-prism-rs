@@ -264,6 +264,15 @@ commit.
   --nocapture` and the two printed queries read-only on the deployed
   database before S12 ships; not yet run on prism.
 
+### Fixed (kryphocron 0.4.1)
+
+- **kryphocron 0.4.0 → 0.4.1 (#682).** 0.4.0 panicked instead of erroring
+  when a correctly signed JWT carried an out-of-range `exp`, `iat` or `nbf`
+  (or an `exp` within clock skew of the largest representable time), and in
+  its trust and wire time decoders. 0.4.1 returns `Malformed` there. Prism's
+  own pre-check (`time_claims_out_of_range_are_rejected_before_the_verifier`)
+  stays as a second guard.
+
 ### Fixed (replay below a settle)
 
 - **A replayed, since-deleted audience could grant read access after a
