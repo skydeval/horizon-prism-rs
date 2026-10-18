@@ -231,6 +231,31 @@ pub mod hooks {
     /// prefilter done, before the round and the reads. Key: the anchor's
     /// URI.
     pub const THREAD_AFTER_STRUCTURE: &str = "s12_thread_after_structure";
+    /// #723, the control reruns: ingest refuses no upsert below a listed
+    /// rev (the tombstone check alone, as before). Key: `<database>/<did>`,
+    /// the record's author ([`injected_on`]).
+    pub const LISTED_REV_REFUSAL_OFF: &str = "i723_listed_rev_refusal_off";
+    /// #723 T-75's control: catch-up's raise runs without its check of the
+    /// records it skipped. Key: `<database>/<did>`.
+    pub const LISTED_REV_CHECK_OFF: &str = "i723_listed_rev_check_off";
+    /// #723 T-76's control: a run raises a collection's listed rev though a
+    /// listed write of it failed. Key: `<database>/<did>`.
+    pub const LISTED_REV_FORCE_RAISE: &str = "i723_listed_rev_force_raise";
+    /// #723 T-69: a job or catch-up raises no listed rev, so its settle is
+    /// uncovered. Key: `<database>/<did>`.
+    pub const LISTED_REV_SKIP_RAISE: &str = "i723_listed_rev_skip_raise";
+    /// #723 T-64, T-75, T-77: a job's or catch-up's listings written, before
+    /// its raise. Key: `<database>/<did>`.
+    pub const LISTED_REV_BEFORE_RAISE: &str = "i723_listed_rev_before_raise";
+    /// #723 T-64 (c), T-66: a job's or catch-up's raise committed, before
+    /// the reconcile. Key: `<database>/<did>`.
+    pub const LISTED_REV_AFTER_RAISE: &str = "i723_listed_rev_after_raise";
+    /// #723 T-77: catch-up fails after its listings, before its raise. Key:
+    /// `<database>/<did>`.
+    pub const CATCH_UP_FAILS_BEFORE_RAISE: &str = "i723_catch_up_fails_before_raise";
+    /// #723 T-77: catch-up fails after its raise committed, before its
+    /// reconciles. Key: `<database>/<did>`.
+    pub const CATCH_UP_FAILS_AFTER_RAISE: &str = "i723_catch_up_fails_after_raise";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);
@@ -286,6 +311,27 @@ pub mod hooks {
         }
         let db: String = sqlx::query_scalar("SELECT current_database()::text").fetch_one(pool).await.unwrap_or_default();
         pause(name, &format!("{db}/{did}")).await;
+    }
+
+    /// An error site keyed `<database>/<did>`, the database named by the
+    /// pool's options, as [`injected`].
+    #[must_use]
+    pub fn injected_in(name: &'static str, pool: &sqlx::PgPool, did: &str) -> bool {
+        if ARMED.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let db = pool.connect_options().get_database().unwrap_or_default().to_string();
+        injected(name, &format!("{db}/{did}"))
+    }
+
+    /// An error site keyed `<database>/<did>` on a connection the caller
+    /// holds, its own transaction included. Unarmed, it reads nothing.
+    pub async fn injected_on(name: &'static str, conn: &mut sqlx::PgConnection, did: &str) -> bool {
+        if ARMED.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let db: String = sqlx::query_scalar("SELECT current_database()::text").fetch_one(conn).await.unwrap_or_default();
+        injected(name, &format!("{db}/{did}"))
     }
 
     /// A pause site: when `name` is armed for `key`, count the hit and wait

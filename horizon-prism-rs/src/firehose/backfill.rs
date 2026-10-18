@@ -13,7 +13,11 @@
 //! 4. reconcile every collection that was paged to the end: local rows with
 //!    `rev < R` absent from the listing are confirmed with `getRecord` (at
 //!    most `reconcile_confirm_limit` per job, in `hash(uri ‖ run id)` order)
-//!    and deleted through the delete path with rev R;
+//!    and deleted through the delete path with rev R. Before reconciling a
+//!    grant collection (private posts, audiences) with no failed write, a
+//!    full-authorization run raises its listed rev to R (replay-readiness
+//!    design §4.2), and a lock held past the deadline re-queues the job a
+//!    minute on;
 //! 5. for an owner of a `following` audience, after the authorization
 //!    listings, the follows pass (following-audience design §3.5, S10), its
 //!    counter read before the first listing; for `member` jobs and members'
@@ -53,7 +57,10 @@ use super::classifier::{
 use super::follows_pass::{self, Fetched, FollowsLister, PassOutcome, PassSettings};
 use super::gap;
 use super::jobs::{self, Depth};
-use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer, read_follows_clears};
+use super::writer::{
+    Action, ApplyOptions, LISTED_REV_LOCK_DEADLINE, ListedRevs, METRIC_SETTLE_UNCOVERED, OpOutcome, RawOp, Raise,
+    WriteSource, Writer, raise_listed_rev, read_follows_clears,
+};
 use crate::config::BackfillConfig;
 use crate::farsight::Farsight;
 use crate::indexing::PublicMode;
@@ -763,6 +770,9 @@ struct RunResult {
     /// The follows pass, when the run decided the DID owns a `following`
     /// audience (§3.5).
     pass: Option<PassOutcome>,
+    /// A listed rev's raise found the DID's lock held until its deadline
+    /// (replay-readiness design §4.2): the run stopped there.
+    listed_rev_busy: bool,
 }
 
 /// What a settle queues after a follows pass, or after its re-check
@@ -1169,11 +1179,13 @@ impl Backfill {
             if listing.ceiling_hit && !c.authorization {
                 tracing::warn!(event = "backfill_listing_truncated", did = %job.did, collection = c.nsid, "listing hit the ceiling; continuing");
             }
+            let mut collection_write_failed = false;
             for record in &listing.selected {
                 if let Some(error) = self.write_record(&job.did, &result.rev, c.nsid, record).await?
                     && c.authorization
                 {
                     result.auth_write_failed = true;
+                    collection_write_failed = true;
                     if job.depth.is_full_authorization() {
                         self.authz_stuck(&job.did, &record.uri, &error);
                     }
@@ -1182,6 +1194,16 @@ impl Backfill {
             if listing.ceiling_hit && c.authorization {
                 result.ceiling_hit = true;
                 tracing::warn!(event = "backfill_block_ceiling", did = %job.did, collection = c.nsid, "authorization listing hit the ceiling; readiness not set");
+            }
+            // A grant collection listed to the end with no write failing
+            // raises its listed rev to R before its reconcile (replay-
+            // readiness design §4.2), whatever the run's fate later.
+            if let Some(which) = ListedRevs::of(c.nsid).filter(|_| c.authorization && job.depth.is_full_authorization())
+                && listing.complete.is_some()
+                && self.may_raise(&job.did, collection_write_failed)
+                && let Raise::Busy = self.raise(&job.did, &result.rev, which).await?
+            {
+                return Ok(Some(RunResult { listed_rev_busy: true, ..result }));
             }
             if let Some(listed) = listing.complete {
                 let unconfirmed = self
@@ -1246,6 +1268,40 @@ impl Backfill {
             }
         }
         Ok(Some(result))
+    }
+
+    /// Whether a grant collection's listed rev may rise after its writes:
+    /// never over a failed write (replay-readiness design §4.2), whose
+    /// firehose replay must still fail and clear readiness.
+    #[allow(clippy::unused_self)]
+    fn may_raise(&self, did: &str, write_failed: bool) -> bool {
+        #[cfg(test)]
+        {
+            use crate::test_support::hooks;
+            if hooks::injected_in(hooks::LISTED_REV_SKIP_RAISE, &self.pool, did) {
+                return false;
+            }
+            if write_failed && hooks::injected_in(hooks::LISTED_REV_FORCE_RAISE, &self.pool, did) {
+                return true;
+            }
+        }
+        let _ = did;
+        !write_failed
+    }
+
+    /// Raise one listed rev to R, trying the DID's lock for
+    /// [`LISTED_REV_LOCK_DEADLINE`].
+    async fn raise(&self, did: &str, rev: &str, which: ListedRevs) -> Result<Raise, String> {
+        #[cfg(test)]
+        crate::test_support::hooks::pause_in(crate::test_support::hooks::LISTED_REV_BEFORE_RAISE, &self.pool, did).await;
+        let until = std::time::Instant::now() + LISTED_REV_LOCK_DEADLINE;
+        let raised = raise_listed_rev(&self.writer, did, rev, which, until, None).await.map_err(|e| e.to_string())?;
+        if raised == Raise::Busy {
+            tracing::info!(event = "listed_rev_busy", did, "the DID's lock stayed held; the job re-queues a minute on");
+        }
+        #[cfg(test)]
+        crate::test_support::hooks::pause_in(crate::test_support::hooks::LISTED_REV_AFTER_RAISE, &self.pool, did).await;
+        Ok(raised)
     }
 
     /// List one collection under its limit (§5.10 order detection).
@@ -1490,6 +1546,22 @@ impl Backfill {
     /// Step 6: the readiness or done transaction.
     async fn settle(&self, job: &Job, result: &RunResult) -> Result<JobOutcome, sqlx::Error> {
         let readiness_capable = job.depth.is_full_authorization();
+        if result.listed_rev_busy {
+            // Contention is not a failure (replay-readiness design §4.2):
+            // a minute on, at the same generation, no attempt counted,
+            // nothing settled.
+            let n = sqlx::query(
+                "UPDATE backfill_jobs SET state = 'queued', not_before = now() + interval '1 minute', updated_at = now() \
+                 WHERE did = $1 AND depth = $2 AND state = 'running' AND generation = $3",
+            )
+            .bind(&job.did)
+            .bind(job.depth.as_str())
+            .bind(job.generation)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            return Ok(if n > 0 { JobOutcome::Requeued("listed_rev_busy") } else { JobOutcome::Superseded });
+        }
         if readiness_capable && result.auth_reconcile_incomplete {
             // §5.10 #182: re-queue immediately, readiness and applied_rev untouched.
             let n = sqlx::query(
@@ -1583,15 +1655,24 @@ impl Backfill {
                     // `follows_verified_rev` is the `applied_rev` this
                     // leaves behind, which the firehose must reach before
                     // the flag holds.
+                    // `applied_rev` rises only to a rev both listed revs
+                    // cover (replay-readiness design §4.4, Invariant R):
+                    // the run raised them before its reconciles, so this
+                    // holds unless the row went mid-run. The `INSERT`
+                    // branch writes NULL.
                     let pass = result.pass.filter(|p| p.complete).and(result.clears);
-                    let verified: bool = sqlx::query_scalar(
-                        "INSERT INTO sync_state (did, applied_rev, last_resync_at) VALUES ($1, $2, now()) \
+                    let (verified, covered): (bool, bool) = sqlx::query_as(
+                        "INSERT INTO sync_state (did, applied_rev, last_resync_at) VALUES ($1, NULL, now()) \
                          ON CONFLICT (did) DO UPDATE SET \
-                           applied_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev), \
+                           applied_rev = GREATEST(sync_state.applied_rev, \
+                             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
                            last_resync_at = now(), \
-                           follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 THEN now() END, \
-                           follows_verified_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev) \
-                         RETURNING follows_verified_at IS NOT NULL",
+                           follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 \
+                             AND sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN now() END, \
+                           follows_verified_rev = GREATEST(sync_state.applied_rev, \
+                             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
+                         RETURNING follows_verified_at IS NOT NULL, \
+                           COALESCE(post_listed_rev >= $2 AND audience_listed_rev >= $2, false)",
                     )
                     .bind(&job.did)
                     .bind(&result.rev)
@@ -1599,6 +1680,10 @@ impl Backfill {
                     .bind(pass.unwrap_or(0))
                     .fetch_one(&mut *tx)
                     .await?;
+                    if !covered {
+                        metrics::counter!(METRIC_SETTLE_UNCOVERED, "path" => "job").increment(1);
+                        tracing::warn!(event = "settle_uncovered", did = %job.did, rev = %result.rev, "the listed revs do not cover the settle; applied_rev left where it was");
+                    }
                     // A complete pass whose counter moved during the run:
                     // an `authz` run must follow (§3.5). Usually the
                     // follow-up was queued above, the move already seen.

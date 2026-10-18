@@ -26,7 +26,8 @@ use super::follows_pass::{self, Fetched, FollowsLister, PassSettings};
 use super::gap;
 use super::jobs::{self, Depth};
 use super::writer::{
-    Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer, advance_applied_rev_with_follows, read_follows_clears,
+    Action, ApplyOptions, ListedRevs, METRIC_SETTLE_UNCOVERED, OpOutcome, RawOp, Raise, Skipped, WriteSource, Writer,
+    advance_applied_rev_with_follows, raise_listed_rev, read_follows_clears,
 };
 use crate::private_tier::PrivateTier;
 
@@ -211,15 +212,20 @@ enum Ended {
 ///    record whose CID is not stored is written at `rev` as
 ///    [`WriteSource::CatchUp`], with `dead_letter_readiness`: a failed write
 ///    clears the DID's readiness and queues `authz` in its own transaction,
-///    as on the firehose. Then each fully listed collection is reconciled,
-///    deletes confirmed with `getRecord`.
+///    as on the firehose. Then both listed revs rise to `rev` under the
+///    DID's lock, unless a record skipped by CID is stored in a replayed
+///    older version (`replayed_below`) or the lock stays held
+///    (`listed_rev_busy`), either of which ends it unsettled
+///    (replay-readiness design §4.2). Then each fully listed collection is
+///    reconciled, deletes confirmed with `getRecord`.
 /// 4. For an owner of a `following` audience (one listed in step 3
 ///    included), the follows pass (§3.5), from the same page budget and
 ///    deadline with its own reconcile budget, its writes without
 ///    `dead_letter_readiness`. An incomplete pass settles nothing; a
 ///    contradiction has cleared the flag and queues `authz` a minute on.
 /// 5. Settle, under the scope read guard, the gap lock and the epoch read
-///    under it first (§3.2, #722): `applied_rev = GREATEST(…, rev)` only
+///    under it first (§3.2, #722): `applied_rev = GREATEST(…, rev)`, when
+///    both listed revs cover `rev` (`settle_uncovered` otherwise), only
 ///    with the epoch unchanged, the DID not purging and still ready, every
 ///    listing complete, no reconcile candidate unconfirmed, and no write
 ///    failed; the follow-verification flag set beside it after a complete
@@ -303,11 +309,13 @@ async fn run_catch_up(
     // 3. List and write.
     let mut pages: u32 = 0;
     let mut listings: Vec<(&str, HashSet<String>)> = Vec::with_capacity(AUTHORIZATION_NSIDS.len());
+    let mut skipped: Vec<Skipped> = Vec::new();
     for nsid in AUTHORIZATION_NSIDS {
         let stored = {
             let mut conn = writer.pool().acquire().await.map_err(db)?;
             writer.private().stored_cids(&mut conn, did, nsid).await.map_err(db)?
         };
+        let mut kept = Skipped { nsid, ..Skipped::default() };
         let mut listed: HashSet<String> = HashSet::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -326,7 +334,7 @@ async fn run_catch_up(
             pages += 1;
             let ListPage { records, cursor: next } = page;
             let more = next.is_some() && !records.is_empty();
-            if write_page(writer, cfg.attempts, did, rev, nsid, records, &stored, &mut listed).await? {
+            if write_page(writer, cfg.attempts, did, rev, nsid, records, &stored, &mut listed, &mut kept).await? {
                 return Ok(Ended::Unsettled("write_failed"));
             }
             if !more {
@@ -335,6 +343,48 @@ async fn run_catch_up(
             cursor = next;
         }
         listings.push((nsid, listed));
+        if ListedRevs::of(nsid).is_some() {
+            skipped.push(kept);
+        }
+    }
+    // Every listing complete with no write failing: both listed revs rise
+    // to R before the reconciles (replay-readiness design §4.2), in one
+    // transaction with the check of the records skipped by CID. A stop
+    // anywhere before it commits raises nothing.
+    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+        return Ok(Ended::Unsettled("deadline"));
+    };
+    #[cfg(test)]
+    {
+        use crate::test_support::hooks;
+        hooks::pause_in(hooks::LISTED_REV_BEFORE_RAISE, writer.pool(), did).await;
+        if hooks::injected_in(hooks::CATCH_UP_FAILS_BEFORE_RAISE, writer.pool(), did) {
+            return Err("injected failure before the raise".into());
+        }
+    }
+    #[cfg(test)]
+    let skip = crate::test_support::hooks::injected_in(crate::test_support::hooks::LISTED_REV_SKIP_RAISE, writer.pool(), did);
+    #[cfg(not(test))]
+    let skip = false;
+    let raised = if skip {
+        Raise::Untracked
+    } else {
+        raise_listed_rev(writer, did, rev, ListedRevs::BOTH, Instant::now() + left, Some(&skipped)).await.map_err(db)?
+    };
+    match raised {
+        Raise::Raised | Raise::Untracked => {}
+        Raise::Busy => return Ok(Ended::Unsettled("listed_rev_busy")),
+        // A skipped record holds a replayed older version: nothing raised,
+        // reconciled or settled, so its correcting op still applies.
+        Raise::Replayed => return Ok(Ended::Unsettled("replayed_below")),
+    }
+    #[cfg(test)]
+    {
+        use crate::test_support::hooks;
+        hooks::pause_in(hooks::LISTED_REV_AFTER_RAISE, writer.pool(), did).await;
+        if hooks::injected_in(hooks::CATCH_UP_FAILS_AFTER_RAISE, writer.pool(), did) {
+            return Err("injected failure after the raise".into());
+        }
     }
     // Reconcile each listing: a stored record not listed is deleted once
     // `getRecord` confirms it is gone, within the bound.
@@ -434,9 +484,14 @@ async fn run_catch_up(
     if !(is_member || is_owner) || !ready(&mut tx, writer.private().as_ref(), did, is_member, is_owner).await.map_err(db)? {
         return Ok(Ended::Unsettled("not_ready"));
     }
-    advance_applied_rev_with_follows(&mut tx, did, rev, pass).await.map_err(db)?;
+    let settled = advance_applied_rev_with_follows(&mut tx, did, rev, pass).await.map_err(db)?;
     tx.commit().await.map_err(db)?;
     drop(sets);
+    if !settled.covered {
+        metrics::counter!(METRIC_SETTLE_UNCOVERED, "path" => "catch_up").increment(1);
+        tracing::warn!(event = "settle_uncovered", did, rev, "the listed revs do not cover the settle; applied_rev left where it was");
+        return Ok(Ended::Unsettled("settle_uncovered"));
+    }
     Ok(Ended::Settled)
 }
 
@@ -507,9 +562,9 @@ fn catch_up_options(attempts: u32) -> ApplyOptions {
     }
 }
 
-/// Write one listed page at `rev`, skipping records whose CID is stored.
-/// Returns whether any record failed (or was listed outside the repo and
-/// collection).
+/// Write one listed page at `rev`, skipping records whose CID is stored,
+/// which are kept in `skipped` for the raise's check. Returns whether any
+/// record failed (or was listed outside the repo and collection).
 #[allow(clippy::too_many_arguments)]
 async fn write_page(
     writer: &Writer,
@@ -520,6 +575,7 @@ async fn write_page(
     records: Vec<ListedRecord>,
     stored: &HashMap<String, String>,
     listed: &mut HashSet<String>,
+    skipped: &mut Skipped,
 ) -> Result<bool, String> {
     let expected = format!("at://{did}/{nsid}/");
     let mut failed = false;
@@ -532,6 +588,8 @@ async fn write_page(
             continue;
         }
         if stored.get(&record.uri) == Some(&record.cid) {
+            skipped.uris.push(record.uri);
+            skipped.cids.push(record.cid);
             continue;
         }
         ops.push(RawOp {

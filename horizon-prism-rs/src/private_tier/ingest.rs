@@ -266,6 +266,42 @@ async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<boo
         .await
 }
 
+/// Metric: grant-collection upserts refused below their author's listed rev
+/// (replay-readiness design §4.3), by `collection`.
+pub(crate) const METRIC_BELOW_LISTED: &str = "private_ingest_below_listed_total";
+
+/// Whether an upsert of a grant collection (private posts, audiences) is
+/// history: tombstoned at or above `rev`, or below its author's listed rev
+/// for the collection (replay-readiness design §4.3). The listing at that
+/// rev already holds the op's effect or its undoing, so the op is never
+/// news, from any source. Strictly below: commit L's own op still writes.
+/// One statement, on the writer's transaction after its shared DID lock:
+/// every raise that committed before the lock is seen, and none commits
+/// before the transaction ends.
+async fn superseded(conn: &mut PgConnection, op: &PrivateOp) -> Result<bool, sqlx::Error> {
+    let col = if op.nsid == NSID_POST_PRIVATE { "post_listed_rev" } else { "audience_listed_rev" };
+    let (tombstoned, below): (bool, bool) = sqlx::query_as(&format!(
+        "SELECT EXISTS (SELECT 1 FROM private_tombstones WHERE uri = $1 AND rev >= $2), \
+                EXISTS (SELECT 1 FROM sync_state WHERE did = $3 AND {col} > $2)"
+    ))
+    .bind(&op.uri)
+    .bind(&op.rev)
+    .bind(&op.author_did)
+    .fetch_one(&mut *conn)
+    .await?;
+    if tombstoned {
+        return Ok(true);
+    }
+    #[cfg(test)]
+    if below && crate::test_support::hooks::injected_on(crate::test_support::hooks::LISTED_REV_REFUSAL_OFF, conn, &op.author_did).await {
+        return Ok(false);
+    }
+    if below {
+        metrics::counter!(METRIC_BELOW_LISTED, "collection" => op.nsid.clone()).increment(1);
+    }
+    Ok(below)
+}
+
 async fn has_owner_rows(conn: &mut PgConnection, did: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM private_posts WHERE author_did = $1) \
@@ -357,11 +393,15 @@ pub(crate) async fn enqueue_private_for_tests(conn: &mut PgConnection, did: &str
 /// [`IngestError`].
 pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError> {
     let now = Utc::now();
-    if tombstoned(&mut *conn, &op.uri, &op.rev).await? {
+    let owner_record = op.nsid == NSID_POST_PRIVATE || op.nsid == NSID_AUDIENCE;
+    // A grant collection's op below the listed rev is refused as a
+    // tombstoned one is (replay-readiness design §4.3); a private block only
+    // denies, so it is never refused for it.
+    let refused = if owner_record { superseded(&mut *conn, op).await? } else { tombstoned(&mut *conn, &op.uri, &op.rev).await? };
+    if refused {
         return Ok(Applied::default());
     }
     let author = op.author_did.as_str();
-    let owner_record = op.nsid == NSID_POST_PRIVATE || op.nsid == NSID_AUDIENCE;
     let had_rows = owner_record && has_owner_rows(&mut *conn, author).await?;
     // An audience written with mode exactly `following` (S10 §3.6).
     let mut following = false;
@@ -959,6 +999,43 @@ pub(crate) async fn stored_cids(conn: &mut PgConnection, did: &str, nsid: &str) 
         .fetch_all(conn)
         .await?;
     Ok(rows.into_iter().filter_map(|(uri, cid)| cid.map(|c| (uri, c))).collect())
+}
+
+/// `ingest::replayed_since_listing` (replay-readiness design §4.2 step 2):
+/// whether any record catch-up skipped by CID (`uris[i]` listed with
+/// `cids[i]`) is stored in a version older than its listing at `rev`:
+/// present, below `rev`, with another CID. A row at or above `rev` is a
+/// newer state; a row that is gone only denies. Empty for a collection
+/// other than private posts and audiences.
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn replayed_since_listing(
+    conn: &mut PgConnection,
+    nsid: &str,
+    uris: &[String],
+    cids: &[String],
+    rev: &str,
+) -> Result<bool, sqlx::Error> {
+    let table = match nsid {
+        NSID_POST_PRIVATE => "private_posts",
+        NSID_AUDIENCE => "private_audiences",
+        _ => return Ok(false),
+    };
+    if uris.is_empty() {
+        return Ok(false);
+    }
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM unnest($1::text[], $2::text[]) AS t(uri, cid) \
+                        JOIN {table} p ON p.uri = t.uri \
+                        WHERE p.cid <> t.cid AND p.rev < $3)"
+    ))
+    .bind(uris)
+    .bind(cids)
+    .bind(rev)
+    .fetch_one(conn)
+    .await
 }
 
 /// The viewer's own private bookmarks, at most `limit` rows (private posting

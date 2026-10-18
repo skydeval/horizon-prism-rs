@@ -264,6 +264,45 @@ commit.
   --nocapture` and the two printed queries read-only on the deployed
   database before S12 ships; not yet run on prism.
 
+### Fixed (replay below a settle)
+
+- **A replayed, since-deleted audience could grant read access after a
+  settle (#723).** A job or `requestRecord`'s catch-up moves the applied
+  revision ahead of the firehose; a commit the firehose then replayed
+  from below it (a consumer behind with no gap, a relay re-sending, a
+  second relay lagging) could store an audience or private post the
+  owner had already deleted or changed, and the head check passed while
+  it was read. Each tracked account now keeps a listed revision per
+  grant collection (private posts, audiences): the head revision of the
+  last run that listed that collection to the end with no write failing,
+  raised under the account's advisory lock (tried, never queued) before
+  that run's reconcile. An upsert of either collection below it is
+  refused from every source, as a tombstoned one is: the listing already
+  holds its effect or its undoing. Deletes, private blocks, gates and
+  follows are never refused.
+  - A settle raises the applied revision only to a revision both listed
+    revisions cover; otherwise it leaves it where it was, writes the
+    follow-verification flag NULL and logs `settle_uncovered`. A settle
+    whose `sync_state` row was deleted mid-run writes the applied
+    revision NULL.
+  - Catch-up checks, under the same lock, the records it skipped as
+    unchanged: if one is now stored in an older version below its
+    revision, it raises and settles nothing and answers `caughtUp: false`
+    (`replayed_below`), so the firehose's correcting commit still applies.
+  - Reads are unchanged, and a settle opens reads as soon as before. A
+    lock held past 5 s re-queues the job a minute on without counting an
+    attempt; a catch-up then answers `caughtUp: false`
+    (`listed_rev_busy`).
+  - Migration 0030 (`sync_state.post_listed_rev`,
+    `audience_listed_rev`, metadata only) seeds both from `applied_rev`
+    where a settle had moved it ahead of the firehose. Metrics
+    `private_ingest_below_listed_total{collection}`,
+    `listed_rev_lock_retries_total` and `settle_uncovered_total{path}`.
+    Pre-release count: run
+    `cargo test pre_listed_revs_count_query -- --ignored --nocapture` and
+    the printed query read-only before migration 0030; not yet run on
+    prism.
+
 ### Fixed (firehose throughput)
 
 - **The consumer could fall into a trim-gap loop (#724).** A commit that

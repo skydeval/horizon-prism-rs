@@ -2031,14 +2031,26 @@ pub async fn advance_applied_rev(conn: &mut PgConnection, did: &str, rev: &str, 
     Ok(())
 }
 
+/// What a settle wrote: whether it set the follow-verification flag, and
+/// whether both listed revs covered its rev (replay-readiness design §4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settled {
+    pub verified: bool,
+    pub covered: bool,
+}
+
 /// A settle's `applied_rev` advance with the follow-verification flag
 /// (following-audience design §3.2), as catch-up writes it. `pass`:
 /// `Some(clears)` for a complete follows pass whose run read `clears` at its
 /// start; `None` for no complete pass. The flag is set only when the stored
 /// counter still equals that reading, compared under the row lock; every
 /// other case, the `INSERT` branch included, writes NULL.
-/// `follows_verified_rev` is the `applied_rev` this leaves behind. Returns
-/// whether the flag was set.
+/// `follows_verified_rev` is the `applied_rev` this leaves behind.
+///
+/// `applied_rev` rises only to a rev both listed revs already cover
+/// (replay-readiness design §4.4, Invariant R): an uncovered settle leaves
+/// it where it was and writes the flag NULL, and the `INSERT` branch (a row
+/// deleted mid-run, so no listed revs) writes `applied_rev` NULL.
 ///
 /// # Errors
 ///
@@ -2048,21 +2060,154 @@ pub async fn advance_applied_rev_with_follows(
     did: &str,
     rev: &str,
     pass: Option<i64>,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
-        "INSERT INTO sync_state (did, applied_rev) VALUES ($1, $2) \
+) -> Result<Settled, sqlx::Error> {
+    let (verified, covered): (bool, bool) = sqlx::query_as(
+        "INSERT INTO sync_state (did, applied_rev) VALUES ($1, NULL) \
          ON CONFLICT (did) DO UPDATE SET \
-           applied_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev), \
-           follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 THEN now() END, \
-           follows_verified_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev) \
-         RETURNING follows_verified_at IS NOT NULL",
+           applied_rev = GREATEST(sync_state.applied_rev, \
+             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+           follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 \
+             AND sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN now() END, \
+           follows_verified_rev = GREATEST(sync_state.applied_rev, \
+             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
+         RETURNING follows_verified_at IS NOT NULL, \
+           COALESCE(post_listed_rev >= $2 AND audience_listed_rev >= $2, false)",
     )
     .bind(did)
     .bind(rev)
     .bind(pass.is_some())
     .bind(pass.unwrap_or(0))
     .fetch_one(conn)
-    .await
+    .await?;
+    Ok(Settled { verified, covered })
+}
+
+/// How long a full run tries for a DID's lock to raise a listed rev
+/// (replay-readiness design §4.2). Catch-up tries for what is left of its
+/// own deadline.
+pub const LISTED_REV_LOCK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+/// The pause between two tries of the lock.
+const LISTED_REV_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
+/// Metric: tries of a DID's lock for a raise that found it held.
+pub const METRIC_LISTED_REV_LOCK_RETRIES: &str = "listed_rev_lock_retries_total";
+/// Metric: settles whose rev the listed revs did not cover, by `path`.
+pub const METRIC_SETTLE_UNCOVERED: &str = "settle_uncovered_total";
+
+/// Which listed revs a raise moves (replay-readiness design §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListedRevs {
+    pub post: bool,
+    pub audience: bool,
+}
+
+impl ListedRevs {
+    pub const BOTH: Self = Self { post: true, audience: true };
+
+    /// The listed rev of a grant collection; `None` for any other.
+    #[must_use]
+    pub fn of(nsid: &str) -> Option<Self> {
+        match nsid {
+            super::classifier::NSID_POST_PRIVATE => Some(Self { post: true, audience: false }),
+            super::classifier::NSID_AUDIENCE => Some(Self { post: false, audience: true }),
+            _ => None,
+        }
+    }
+}
+
+/// Records a catch-up skipped by CID in one grant collection: the check its
+/// raise makes (replay-readiness design §4.2 step 1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Skipped {
+    pub nsid: &'static str,
+    pub uris: Vec<String>,
+    pub cids: Vec<String>,
+}
+
+/// How a raise ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Raise {
+    Raised,
+    /// The DID is not tracked: nothing raised, no row made.
+    Untracked,
+    /// The DID's lock stayed held until the deadline: nothing raised.
+    Busy,
+    /// Catch-up's check found a skipped record held in an older version:
+    /// rolled back, nothing raised.
+    Replayed,
+}
+
+/// Raise `did`'s listed revs in `which` to `rev` (replay-readiness design
+/// §4.2): `GREATEST`, so they only rise. Each try takes the read guard, a
+/// fresh connection and a transaction, then the DID's advisory lock
+/// exclusive by `pg_try_advisory_xact_lock`: every writer of the DID holds
+/// it shared from its start, so the raise commits only when no write that
+/// read the old listed rev is in flight, and every later one sees the new
+/// rev. It never waits in the lock's queue, where it would stall every
+/// later shared locker (the consumer); a held lock releases everything and
+/// tries again 20 ms on, until `until` ([`METRIC_LISTED_REV_LOCK_RETRIES`]).
+///
+/// With `skipped` (catch-up), the check runs first under the lock: a
+/// skipped record now stored present, below `rev`, with another CID ends
+/// the raise [`Raise::Replayed`], rolled back.
+///
+/// A row is inserted only for a tracked DID, under the guard the try holds;
+/// for an untracked one nothing is raised.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn raise_listed_rev(
+    writer: &Writer,
+    did: &str,
+    rev: &str,
+    which: ListedRevs,
+    until: std::time::Instant,
+    skipped: Option<&[Skipped]>,
+) -> Result<Raise, sqlx::Error> {
+    loop {
+        let guard = writer.scope().read_guard().await;
+        if !guard.is_tracked(did) {
+            return Ok(Raise::Untracked);
+        }
+        let mut tx = writer.pool().begin().await?;
+        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended('did:' || $1, 0))")
+            .bind(did)
+            .fetch_one(&mut *tx)
+            .await?;
+        if locked {
+            #[cfg(test)]
+            let skipped = skipped.filter(|_| !crate::test_support::hooks::injected_in(crate::test_support::hooks::LISTED_REV_CHECK_OFF, writer.pool(), did));
+            for s in skipped.unwrap_or_default() {
+                if writer.private().replayed_since_listing(&mut tx, s.nsid, &s.uris, &s.cids, rev).await? {
+                    tx.rollback().await?;
+                    return Ok(Raise::Replayed);
+                }
+            }
+            sqlx::query(
+                "INSERT INTO sync_state (did, post_listed_rev, audience_listed_rev) \
+                 VALUES ($1, CASE WHEN $3 THEN $2 END, CASE WHEN $4 THEN $2 END) \
+                 ON CONFLICT (did) DO UPDATE SET \
+                   post_listed_rev = GREATEST(sync_state.post_listed_rev, EXCLUDED.post_listed_rev), \
+                   audience_listed_rev = GREATEST(sync_state.audience_listed_rev, EXCLUDED.audience_listed_rev)",
+            )
+            .bind(did)
+            .bind(rev)
+            .bind(which.post)
+            .bind(which.audience)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            drop(guard);
+            return Ok(Raise::Raised);
+        }
+        tx.rollback().await?;
+        drop(guard);
+        if std::time::Instant::now() + LISTED_REV_RETRY >= until {
+            return Ok(Raise::Busy);
+        }
+        metrics::counter!(METRIC_LISTED_REV_LOCK_RETRIES).increment(1);
+        tokio::time::sleep(LISTED_REV_RETRY).await;
+    }
 }
 
 #[cfg(test)]

@@ -88,6 +88,8 @@ mod tests {
             "0028_follows_verified",
             // Like and repost counts by account (#727).
             "0029_distinct_interaction_counts",
+            // Replay below a settle: the listed revs (#723).
+            "0030_listed_revs",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

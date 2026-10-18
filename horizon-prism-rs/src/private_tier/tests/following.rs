@@ -25,6 +25,10 @@ use crate::test_support::{TestDb, hooks, waits_on_lock};
 
 use super::*;
 
+// #723's tests (replay-readiness design §11), on this module's harness.
+#[path = "replay.rs"]
+mod replay;
+
 const FOLLOW: &str = "app.bsky.graph.follow";
 const PDS: &str = "https://pds.example.com";
 /// Never a member, outside S: a subject admission rejects for a
@@ -1797,8 +1801,16 @@ async fn t42_catch_up_contradictions_and_failures() {
     drop(hook);
     assert!(h.member_ready(ALICE).await && h.owner_ready(ALICE).await);
     assert_eq!(h.applied(ALICE).await.as_deref(), Some(REV));
-    let list = h.audience_of(ALICE, "3kaudt42x01", "list", &[BOB]).await;
-    let other = h.post(ALICE, "3kpstt42x01", &list, None).await;
+    // Written at R2: the catch-ups listed O's repository at R2, so an op
+    // below it is history (replay-readiness design §4.3).
+    let list = format!("at://{ALICE}/{NSID_AUDIENCE}/3kaudt42x01");
+    let audience = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [BOB], "createdAt": "2026-09-26T00:00:00Z"});
+    h.f.apply_op(ALICE, Action::Create, NSID_AUDIENCE, "3kaudt42x01", R2, Some(audience.clone())).await;
+    h.pds.put_cid(ALICE, NSID_AUDIENCE, "3kaudt42x01", &format!("bafy3kaudt42x01{R2}"), audience);
+    let record = h.f.post_record(ALICE, "3kpstt42x01", &list, None).await;
+    h.f.apply_op(ALICE, Action::Create, NSID_POST_PRIVATE, "3kpstt42x01", R2, Some(record.clone())).await;
+    h.pds.put_cid(ALICE, NSID_POST_PRIVATE, "3kpstt42x01", &format!("bafy3kpstt42x01{R2}"), record);
+    let other = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3kpstt42x01");
     assert!(h.served(BOB, &other).await);
     assert!(!h.served(BOB, &p).await);
 
@@ -2717,6 +2729,38 @@ fn t40_s10_names_name_no_private_table() {
         "clear_follows_verified",
         "FOLLOWS_RETRY",
         "follows_retry",
+    ];
+    for name in names {
+        for table in tables {
+            assert!(!name.contains(&format!("private_{table}")), "{name} names private_{table}");
+        }
+    }
+}
+
+/// T-73 (replay-readiness design §10): no #723 name outside
+/// `src/private_tier/` contains a private table's name, by the Dockerfile's
+/// own pattern.
+#[test]
+fn t73_listed_rev_names_name_no_private_table() {
+    let tables = [
+        "posts", "audiences", "blocks", "tombstones", "owner_ready", "owner_eligible", "bookmarks", "threadgates", "postgates",
+        "quote_refs", "notifications", "notification_seen",
+    ];
+    let names = [
+        "post_listed_rev",
+        "audience_listed_rev",
+        "raise_listed_rev",
+        "LISTED_REV_LOCK_DEADLINE",
+        "listed_rev_lock_retries_total",
+        "listed_rev_busy",
+        "replayed_below",
+        "settle_uncovered",
+        "settle_uncovered_total",
+        "0030_listed_revs",
+        "ListedRevs",
+        "Skipped",
+        "Raise",
+        "replayed_since_listing",
     ];
     for name in names {
         for table in tables {

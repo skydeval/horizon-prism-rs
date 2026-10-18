@@ -268,6 +268,19 @@ pub trait PrivateTier: Send + Sync {
     /// §3.8).
     async fn stored_cids(&self, conn: &mut PgConnection, did: &str, nsid: &str) -> Result<HashMap<String, String>, sqlx::Error>;
 
+    /// `ingest::replayed_since_listing` (replay-readiness design §4.2): any
+    /// record catch-up skipped by CID (`uris[i]` with `cids[i]`) is now
+    /// stored present, below `rev`, with another CID. On the caller's
+    /// connection, inside catch-up's raise under the exclusive DID lock.
+    async fn replayed_since_listing(
+        &self,
+        conn: &mut PgConnection,
+        nsid: &str,
+        uris: &[String],
+        cids: &[String],
+        rev: &str,
+    ) -> Result<bool, sqlx::Error>;
+
     /// `ingest::purge_did` (account deletion), at most `limit` rows. Returns
     /// the rows deleted; the caller repeats until 0.
     async fn purge_did_batch(&self, conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error>;
@@ -404,6 +417,17 @@ impl PrivateTier for KryphocronPrivateTier {
 
     async fn stored_cids(&self, conn: &mut PgConnection, did: &str, nsid: &str) -> Result<HashMap<String, String>, sqlx::Error> {
         ingest::stored_cids(conn, did, nsid).await
+    }
+
+    async fn replayed_since_listing(
+        &self,
+        conn: &mut PgConnection,
+        nsid: &str,
+        uris: &[String],
+        cids: &[String],
+        rev: &str,
+    ) -> Result<bool, sqlx::Error> {
+        ingest::replayed_since_listing(conn, nsid, uris, cids, rev).await
     }
 
     async fn purge_did_batch(&self, conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
@@ -554,6 +578,17 @@ impl PrivateTier for DisabledPrivateTier {
 
     async fn stored_cids(&self, _conn: &mut PgConnection, _did: &str, _nsid: &str) -> Result<HashMap<String, String>, sqlx::Error> {
         Ok(HashMap::new())
+    }
+
+    async fn replayed_since_listing(
+        &self,
+        _conn: &mut PgConnection,
+        _nsid: &str,
+        _uris: &[String],
+        _cids: &[String],
+        _rev: &str,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(false)
     }
 
     async fn purge_did_batch(&self, _conn: &mut PgConnection, _did: &str, _limit: i64) -> Result<u64, sqlx::Error> {
