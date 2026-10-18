@@ -339,6 +339,10 @@ pub async fn run() -> Result<(), StartupError> {
         // Thread Lens visitor that does not come back) is removed by
         // nothing else.
         tasks.push(tokio::spawn(farsight.clone().run_cache_sweeper()));
+        // `farsight_down` and `farsight_fallback_withheld{reason}`: set
+        // here first, so every series exists before the first call.
+        farsight.sample_gate();
+        tasks.push(tokio::spawn(farsight.clone().run_gate_sampler()));
     }
     let microcosm = &cfg.file.microcosm;
     let identity = &cfg.file.identity;

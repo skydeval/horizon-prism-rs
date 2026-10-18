@@ -176,7 +176,7 @@ docker compose exec app /app/horizon-prism-rs admin farsight prime <did> [--forc
 - `status` prints Farsight's own report in brief, and whether the app has stopped calling it after repeated failures (`read_breaker_open`; it tries again after 30 s).
 - `prime` asks Farsight to read one account's repository again. Use it when a member's own blocks look out of date. The app does this by itself when a member is enrolled.
 
-Watch `farsight_calls_total{outcome}` for failures, `farsight_auth_failed_total` for a revoked or under-scoped key, and `farsight_coverage_total{level}`: at `partial`, Farsight is still catching up and some list blocks may be missing.
+Watch `farsight_calls_total{outcome}` for failures, `farsight_auth_failed_total` for a revoked or under-scoped key, and `farsight_coverage_total{level}`: at `partial`, Farsight is still catching up and some list blocks may be missing. `farsight_down` is 1 while Farsight is down: it has answered since `serve` started, its breaker is open, and nothing but timeouts, transport errors and `5xx` came since its last answer. `farsight_fallback_withheld{reason}` is 1 while its breaker is open but it is not down, with `reason` `never_answered` (it has not answered since `serve` started) or `unclean` (something else came since its last answer, such as a `401`, `429` or `400`). Both are read from the breaker once a second, so they go back to 0 when the 30 s open period ends.
 
 ### Public indexing (on or off)
 
@@ -419,6 +419,21 @@ groups:
       - alert: FirehoseSamplerFailing
         expr: sum without (call) (rate(firehose_lag_sample_failures_total[5m])) / sum without (call) (rate(firehose_lag_sample_calls_total[5m])) > 0.5
         for: 5m
+      # Farsight has answered since `serve` started, its breaker is open, and
+      # nothing but timeouts, transport errors and 5xx came since its last
+      # answer: an outage. With the fallback on, it is being asked.
+      - alert: FarsightDown
+        expr: farsight_down == 1
+        for: 5m
+      # Farsight's breaker is open and the fallback stays off: it never
+      # answered this process (`never_answered`: a wrong `farsight.url` or a
+      # key it refuses), or something other than a service failure came since
+      # its last answer (`unclean`: a 401, 403, 429 or 400).
+      - alert: FarsightFallbackWithheld
+        expr: farsight_fallback_withheld == 1
+        for: 5m
+      - alert: FarsightAuthFailed
+        expr: increase(farsight_auth_failed_total[15m]) > 0
 ```
 
 A latched audit guard (design §6.5) makes `/xrpc/_health` return 503. `docker compose ps` then shows `app` as unhealthy. Restart `app` after investigating the logged panic.

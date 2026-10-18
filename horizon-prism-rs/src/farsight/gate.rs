@@ -22,6 +22,42 @@ use std::time::Instant;
 use crate::constellation::Class;
 use crate::constellation::cascade::{Admission, SharedBreaker};
 
+/// Gauge `farsight_down`: 1 while Farsight is down (design-v4 §14.2).
+pub const METRIC_DOWN: &str = "farsight_down";
+/// Gauge `farsight_fallback_withheld{reason}`: 1 while the read breaker is
+/// open and Farsight is not down, so the fallback stays off. `reason` is
+/// `never_answered` or `unclean` (design-v4 §14.2).
+pub const METRIC_WITHHELD: &str = "farsight_fallback_withheld";
+
+/// Why an open read breaker does not bring the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Withheld {
+    /// Farsight has not answered this process: there is no run.
+    NeverAnswered,
+    /// Something other than a service failure came since the last answer.
+    Unclean,
+}
+
+impl Withheld {
+    pub const ALL: [Self; 2] = [Self::NeverAnswered, Self::Unclean];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NeverAnswered => "never_answered",
+            Self::Unclean => "unclean",
+        }
+    }
+}
+
+/// The gate's state for its gauges, at one moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateState {
+    pub down: bool,
+    /// `Some` while the breaker is open and Farsight is not down.
+    pub withheld: Option<Withheld>,
+}
+
 /// What one call's outcome does to the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
@@ -139,6 +175,37 @@ impl ReadGate {
             answers: run.answers,
         }
     }
+
+    /// The state the gauges show, read under the run's lock.
+    #[must_use]
+    pub fn state(&self, now: Instant) -> GateState {
+        let run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.breaker.is_open(now) {
+            return GateState { down: false, withheld: None };
+        }
+        if run.answers == 0 {
+            // Before the first answer there is no run, whatever came since.
+            return GateState { down: false, withheld: Some(Withheld::NeverAnswered) };
+        }
+        if run.clean {
+            GateState { down: true, withheld: None }
+        } else {
+            GateState { down: false, withheld: Some(Withheld::Unclean) }
+        }
+    }
+
+    /// Set `farsight_down` and both `farsight_fallback_withheld` series
+    /// from the gate as it is now. The gauges are computed when sampled,
+    /// never set on an outcome: an open period ends by the clock, with no
+    /// call and no event (design-v4 §14.2, FB4-21).
+    pub fn sample(&self, now: Instant) {
+        let state = self.state(now);
+        metrics::gauge!(METRIC_DOWN).set(if state.down { 1.0 } else { 0.0 });
+        for reason in Withheld::ALL {
+            let on = state.withheld == Some(reason);
+            metrics::gauge!(METRIC_WITHHELD, "reason" => reason.as_str()).set(if on { 1.0 } else { 0.0 });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -227,5 +294,78 @@ mod tests {
         assert!(gate.admit_unless_probe().is_none() && gate.admit(now).is_none());
         gate.record(probe, Some(Class::Transient), Effect::ServiceFailure, now);
         assert!(gate.is_open(now) && gate.read(now).down, "a failed probe re-opens");
+    }
+
+    /// `farsight_down` and `farsight_fallback_withheld{reason}` as one
+    /// sample of the gate shows them: (down, never_answered, unclean).
+    fn gauges(gate: &ReadGate, handle: &metrics_exporter_prometheus::PrometheusHandle) -> (f64, f64, f64) {
+        use crate::test_support::series;
+        gate.sample(Instant::now());
+        let text = handle.render();
+        let value = |name: &str, labels: &[&str]| series(&text, name, labels).unwrap_or_else(|| panic!("{name} {labels:?} missing:\n{text}"));
+        (
+            value(METRIC_DOWN, &[]),
+            value(METRIC_WITHHELD, &["reason=\"never_answered\""]),
+            value(METRIC_WITHHELD, &["reason=\"unclean\""]),
+        )
+    }
+
+    /// design-v4 §14.2: the gauges follow the gate. Every series exists
+    /// from the first sample, before any call; never-answered and unclean
+    /// runs are withheld, a clean run after an answer is down; a half-open
+    /// breaker shows neither, with no event in between (FB4-21).
+    #[test]
+    fn the_gauges_follow_the_gate_when_sampled() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+
+        // Before any call: all three series exist, at 0.
+        let gate = ReadGate::default();
+        assert_eq!(gauges(&gate, &handle), (0.0, 0.0, 0.0));
+        // Never answered: five failures open the breaker; withheld.
+        fail(&gate, 5);
+        assert_eq!(gauges(&gate, &handle), (0.0, 1.0, 0.0));
+        // An unclean outcome before the first answer is still "never answered".
+        let gate = ReadGate::default();
+        outcome(&gate, Some(Class::Transient), Effect::Unclean);
+        fail(&gate, 4);
+        assert_eq!(gauges(&gate, &handle), (0.0, 1.0, 0.0));
+        // Half-open, by the clock alone: both off.
+        gate.force_half_open();
+        assert_eq!(gauges(&gate, &handle), (0.0, 0.0, 0.0));
+
+        // Answered, then four failures: closed, nothing.
+        let gate = ReadGate::default();
+        outcome(&gate, Some(Class::Hit), Effect::Answer);
+        fail(&gate, 4);
+        assert_eq!(gauges(&gate, &handle), (0.0, 0.0, 0.0));
+        // The fifth: down.
+        fail(&gate, 1);
+        assert_eq!(gauges(&gate, &handle), (1.0, 0.0, 0.0));
+        // The open period ends: half-open is not down, with no event.
+        gate.force_half_open();
+        assert_eq!(gauges(&gate, &handle), (0.0, 0.0, 0.0));
+        // The probe fails: down again.
+        fail(&gate, 1);
+        assert_eq!(gauges(&gate, &handle), (1.0, 0.0, 0.0));
+        // Half-open, and a probe answered 401: the breaker opens on an
+        // unclean run; withheld.
+        gate.force_half_open();
+        outcome(&gate, Some(Class::Transient), Effect::Unclean);
+        assert_eq!(gauges(&gate, &handle), (0.0, 0.0, 1.0));
+        // Half-open again and a probe answered: closed, nothing.
+        gate.force_half_open();
+        outcome(&gate, Some(Class::Hit), Effect::Answer);
+        assert_eq!(gauges(&gate, &handle), (0.0, 0.0, 0.0));
+
+        // Four timeouts, a 404 the breaker does not record, one more
+        // timeout: open with an unclean run.
+        let gate = ReadGate::default();
+        outcome(&gate, Some(Class::Hit), Effect::Answer);
+        fail(&gate, 4);
+        outcome(&gate, None, Effect::Unclean);
+        fail(&gate, 1);
+        assert_eq!(gauges(&gate, &handle), (0.0, 0.0, 1.0));
     }
 }

@@ -2053,6 +2053,19 @@ commit.
 
 ### Fixed
 
+- **The Farsight gate's gauges were missing (#729).** `farsight_down`
+  (1 while Farsight has answered this process, its read breaker is open
+  and the run is clean) and `farsight_fallback_withheld{reason}` (1 while
+  the breaker is open and Farsight is not down; `reason` =
+  `never_answered` or `unclean`) now exist, as design-v4 §14.2 specifies.
+  They are computed from the gate when sampled, never set on an outcome:
+  `serve` samples once at startup, so every series exists at 0 before
+  the first call, then once a second, so both drop to 0 when an open
+  period ends by the clock. Computed from the gate alone, with the
+  fallback on or off. `docker/README.md` names both and gains the
+  `FarsightDown`, `FarsightFallbackWithheld` and `FarsightAuthFailed`
+  alert examples.
+
 - **A reply could enter another account's audience (#718; private
   posting S0, #719).** A private post under an audience owned by someone
   else was served to that audience whenever its author and the owner

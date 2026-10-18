@@ -49,6 +49,9 @@ pub const METRIC_AUTH_FAILED: &str = "farsight_auth_failed_total";
 /// not succeed, or were skipped while their breaker was open.
 pub const METRIC_PRIME_FAILED: &str = "farsight_prime_failed_total";
 
+/// How often [`Farsight::run_gate_sampler`] samples the gate's gauges.
+const GATE_SAMPLE_EVERY: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone, Copy)]
 struct Settings {
     timeout: Duration,
@@ -577,6 +580,24 @@ impl Farsight {
         loop {
             tokio::time::sleep(every).await;
             self.sweep_cache().await;
+        }
+    }
+
+    /// Set the gate's gauges, `farsight_down` and
+    /// `farsight_fallback_withheld{reason}`, from the gate as it is now.
+    pub fn sample_gate(&self) {
+        self.inner.gate.sample(Instant::now());
+    }
+
+    /// The gate's sampler: the gauges once at once, so every series exists
+    /// before the first call, then once a second for as long as the
+    /// process runs. They are computed from the gate, not set on outcomes,
+    /// because an open period ends by the clock with no event (design-v4
+    /// §14.2, FB4-21).
+    pub async fn run_gate_sampler(self) {
+        loop {
+            self.sample_gate();
+            tokio::time::sleep(GATE_SAMPLE_EVERY).await;
         }
     }
 
@@ -2395,6 +2416,60 @@ pub(crate) mod tests {
             assert!(farsight.breaker_open());
             assert_eq!(farsight.gate().down, !refusal);
         }
+    }
+
+    /// design-v4 §14.2, B-91 "Never answered": `farsight_down` and
+    /// `farsight_fallback_withheld{reason}` as a sample shows them, on an
+    /// engine with the fallback on, beside what the fallback is asked.
+    #[tokio::test]
+    async fn the_gate_gauges_show_down_and_withheld() {
+        use super::super::gate::{METRIC_DOWN, METRIC_WITHHELD};
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let gauges = |farsight: &Farsight| {
+            farsight.sample_gate();
+            let text = handle.render();
+            let value = |name: &str, labels: &[&str]| crate::test_support::series(&text, name, labels).unwrap_or_else(|| panic!("{name} {labels:?} missing:\n{text}"));
+            (
+                value(METRIC_DOWN, &[]),
+                value(METRIC_WITHHELD, &["reason=\"never_answered\""]),
+                value(METRIC_WITHHELD, &["reason=\"unclean\""]),
+            )
+        };
+        let none = HashSet::new();
+
+        // Never answered: every series exists at 0 before any call; a hung
+        // Farsight opens the breaker, the fallback is never asked, and the
+        // gauge says why.
+        let (farsight, fake) = engine("timeout_ms = 50\n").await;
+        let upstream = with_fallback(&farsight).await;
+        assert_eq!(gauges(&farsight), (0.0, 0.0, 0.0));
+        *fake.delay_ms.lock().expect("delay") = 400;
+        for i in 0..5 {
+            farsight.request(&member()).inbound_list_blocks(V, &[numbered(i + 2)], &none).await;
+        }
+        assert!(farsight.breaker_open() && upstream.asked.lock().expect("asked").is_empty());
+        assert_eq!(gauges(&farsight), (0.0, 1.0, 0.0));
+
+        // Down: an answer, then five timeouts.
+        let (farsight, _fake, upstream) = down("").await;
+        assert!(!upstream.asked.lock().expect("asked").is_empty());
+        assert_eq!(gauges(&farsight), (1.0, 0.0, 0.0));
+
+        // Unclean: an answer, then five 401s. The fallback is not asked.
+        let (farsight, fake) = engine("timeout_ms = 50\n").await;
+        let upstream = with_fallback(&farsight).await;
+        farsight.request(&member()).inbound_list_blocks(V, &page(&[A]), &none).await;
+        *fake.status.lock().expect("status") = 401;
+        for i in 0..5 {
+            farsight.request(&member()).inbound_list_blocks(V, &[numbered(i + 2)], &none).await;
+        }
+        assert!(farsight.breaker_open() && upstream.asked.lock().expect("asked").is_empty());
+        assert_eq!(gauges(&farsight), (0.0, 0.0, 1.0));
+        // The open period ends by the clock: no event, and both are off.
+        farsight.inner.gate.force_half_open();
+        assert_eq!(gauges(&farsight), (0.0, 0.0, 0.0));
     }
 
     #[tokio::test]
