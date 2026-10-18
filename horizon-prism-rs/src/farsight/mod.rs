@@ -35,17 +35,11 @@ use crate::xrpc::rate_limit::class_problem;
 
 /// Every problem in `[farsight]` (design-v3 §5.14.4, §13). `token` is
 /// whether `FARSIGHT_TOKEN` is set. With `url` unset the feature is off and
-/// only the numbers are checked.
+/// only the numbers are checked. The URL's own rules are in
+/// `config::validate`, beside the other upstream URLs.
 pub fn config_problems(cfg: &FarsightConfig, token: bool, out: &mut Vec<String>) {
-    if let Some(url) = &cfg.url {
-        match url::Url::parse(url) {
-            Ok(u) if u.scheme() == "https" && u.host_str().is_some() => {}
-            Ok(_) => out.push(format!("farsight.url = {url:?} must be an https URL")),
-            Err(e) => out.push(format!("farsight.url = {url:?} is not a URL: {e}")),
-        }
-        if !token {
-            out.push("farsight.url is set without FARSIGHT_TOKEN: Farsight needs an API key with the read and backfill scopes".to_string());
-        }
+    if cfg.url.is_some() && !token {
+        out.push("farsight.url is set without FARSIGHT_TOKEN: Farsight needs an API key with the read and backfill scopes".to_string());
     }
     for (key, value, min, max) in [
         ("timeout_ms", cfg.timeout_ms, 50, 10_000),
@@ -237,8 +231,6 @@ mod tests {
             assert!(out.iter().any(|p| p.contains(needle)), "{needle:?} not in {out:?}");
         };
         one("[farsight]\nurl = \"https://farsight.example.net\"\n", false, "without FARSIGHT_TOKEN");
-        one("[farsight]\nurl = \"http://farsight.example.net\"\n", true, "must be an https URL");
-        one("[farsight]\nurl = \"farsight\"\n", true, "is not a URL");
         one("[farsight]\ntimeout_ms = 10\n", false, "farsight.timeout_ms");
         one("[farsight]\ncache_ttl_secs = 0\n", false, "farsight.cache_ttl_secs");
         one("[farsight]\nmax_calls_per_request = 0\n", false, "farsight.max_calls_per_request");

@@ -12,6 +12,8 @@
 //! `/.well-known/did.json` and `GET /xrpc/_health`.
 
 pub mod health;
+#[cfg(all(test, feature = "standin-hosts"))]
+mod standin_tests;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -131,9 +133,27 @@ async fn redis_manager(url: &str) -> Result<ConnectionManager, StartupError> {
 ///
 /// A [`StartupError`] carrying the exit code.
 pub async fn run() -> Result<(), StartupError> {
+    // A Phase B test build says what it is before its config loads, so on
+    // every start, a failed one included: on stderr, which no log filter
+    // suppresses, and at error level in the log.
+    #[cfg(feature = "standin-hosts")]
+    {
+        eprintln!("{}: this binary can reach private test origins; never deploy this build", crate::net::standin::MARKER);
+        let level = std::env::var(crate::config::ENV_LOG_LEVEL).ok().filter(|v| !v.trim().is_empty());
+        init_tracing(level.as_deref().unwrap_or(crate::config::DEFAULT_LOG_LEVEL));
+        tracing::error!(event = "standin_hosts_build", marker = crate::net::standin::MARKER, "built with the standin-hosts feature: this binary can reach private test origins; never deploy this build");
+    }
     let cfg = AppConfig::load_from_env().map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
     cfg.validate()
         .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
+    // A test build never serves as an ordinary deployment: it needs its
+    // listed origins, checked before any port is bound.
+    #[cfg(feature = "standin-hosts")]
+    {
+        crate::net::standin::required(&cfg.file.standin).map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
+        let origins: Vec<String> = cfg.file.standin.hosts.iter().map(|h| format!("{} {:?}", h.origin, h.intents)).collect();
+        tracing::error!(event = "standin_hosts_origins", ?origins, "these private test origins are reachable on a request's first hop");
+    }
     init_tracing(&cfg.env.log_level);
     PrometheusBuilder::new()
         .with_http_listener(cfg.file.metrics.bind)
@@ -144,6 +164,8 @@ pub async fn run() -> Result<(), StartupError> {
         .map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?
         .install()
         .map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?;
+    #[cfg(feature = "standin-hosts")]
+    metrics::gauge!("standin_hosts_build").set(1.0);
     // A bench build refuses to start without its heads file (private-threads
     // design §4), and says what it is.
     #[cfg(feature = "bench-heads")]

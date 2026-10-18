@@ -1103,3 +1103,155 @@ fn utc_time_of_day_parses() {
     assert_eq!(t.seconds_after_midnight(), 23 * 3600 + 59 * 60);
     assert!(UtcTimeOfDay::new(24, 0).is_none());
 }
+
+/// Stand-in design T1: without the `standin-hosts` feature a `[standin]`
+/// section is an unknown key, so a test config cannot load on a deploy
+/// build.
+#[cfg(not(feature = "standin-hosts"))]
+#[test]
+fn a_standin_section_is_refused_without_the_feature() {
+    let text = "[standin]\nhosts = [{ origin = \"http://172.29.77.21:8081\", intents = [\"public\"] }]\n";
+    assert!(matches!(load(text), Err(ConfigError::Parse(_))));
+    assert!(matches!(load("[standin]\n"), Err(ConfigError::Parse(_))));
+}
+
+/// Stand-in design T7 and T8, under the feature.
+#[cfg(feature = "standin-hosts")]
+mod standin {
+    use super::*;
+    use crate::net::standin::required;
+
+    fn hosts(entries: &[(&str, &str)]) -> String {
+        let rows: Vec<String> = entries.iter().map(|(origin, intents)| format!("  {{ origin = \"{origin}\", intents = [{intents}] }},")).collect();
+        format!("[standin]\nhosts = [\n{}\n]\n", rows.join("\n"))
+    }
+
+    /// The problems of a config holding only `[standin]` with `entries`.
+    fn standin_problems(entries: &[(&str, &str)]) -> Vec<String> {
+        match load(&hosts(entries)) {
+            Ok(_) => Vec::new(),
+            Err(e) => invalid_problems(Err(e)),
+        }
+    }
+
+    /// T7: the defaults pass validation (rule 1 is `serve`'s), a good
+    /// listing passes, and each bad entry is exactly one problem.
+    #[test]
+    fn standin_hosts_are_validated() {
+        let cfg = load("").expect("no [standin] passes validation");
+        assert_eq!(cfg.file.standin, StandinConfig::default());
+        let missing = required(&cfg.file.standin).expect_err("serve's rule 1");
+        assert!(missing.contains("needs at least one [[standin.hosts]] entry"), "{missing}");
+        let empty = load("[standin]\nhosts = []\n").expect("an empty list passes validation");
+        assert!(required(&empty.file.standin).is_err());
+
+        let good = [
+            ("http://172.29.77.21:8081", "\"public\", \"internal\""),
+            ("http://172.29.77.21:8082", "\"public\""),
+            ("http://10.9.8.7:9000", "\"internal\""),
+            ("http://192.168.4.20:8000", "\"public\""),
+            ("http://[fd00::21]:8083", "\"public\""),
+        ];
+        assert_eq!(standin_problems(&good), Vec::<String>::new());
+        let listed = load(&hosts(&good)).expect("valid");
+        required(&listed.file.standin).expect("rule 1 passes");
+        assert_eq!(listed.file.standin.hosts[0].intents, [StandinIntent::Public, StandinIntent::Internal]);
+
+        for origin in [
+            "http://standin.example:8081",
+            "http://93.184.216.34:8081",
+            "http://127.0.0.1:8081",
+            "http://169.254.169.254:8081",
+            "http://100.64.0.1:8081",
+            "http://172.29.77.1:8081",
+            "http://10.0.0.0:8081",
+            "http://192.168.1.255:8081",
+            "http://[::1]:8081",
+            "http://[fe80::1]:8081",
+            "http://[fd00::1]:8081",
+            "http://[::ffff:172.29.77.21]:8081",
+            "https://172.29.77.21:8081",
+            "http://172.29.77.21",
+            "http://172.29.77.21:80",
+            "http://172.29.77.21:8081/xrpc",
+            "http://172.29.77.21:8081/",
+            "http://user@172.29.77.21:8081",
+            "HTTP://172.29.77.21:8081",
+        ] {
+            let p = standin_problems(&[(origin, "\"public\"")]);
+            assert_eq!(p.len(), 1, "{origin}: {p:?}");
+            assert!(p[0].starts_with("standin.hosts: "), "{p:?}");
+        }
+        for (entries, needle) in [
+            (vec![("http://172.29.77.21:8081", "")], "lists no intents"),
+            (vec![("http://172.29.77.21:8081", "\"public\", \"public\"")], "repeats an intent"),
+            (vec![("http://172.29.77.21:8081", "\"public\""), ("http://172.29.77.21:8081", "\"internal\"")], "is listed twice"),
+        ] {
+            let p = standin_problems(&entries);
+            assert_eq!(p.len(), 1, "{p:?}");
+            assert!(has(&p, needle), "{needle}: {p:?}");
+        }
+        let nine: Vec<String> = (8081..=8089).map(|port| format!("http://172.29.77.21:{port}")).collect();
+        let nine: Vec<(&str, &str)> = nine.iter().map(|o| (o.as_str(), "\"public\"")).collect();
+        let p = standin_problems(&nine);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(has(&p, "9 entries, at most 8"), "{p:?}");
+        assert_eq!(standin_problems(&nine[..8]), Vec::<String>::new());
+        // `viewer_private` is not an intent that can be named.
+        assert!(matches!(load(&hosts(&[("http://172.29.77.21:8081", "\"viewer_private\"")])), Err(ConfigError::Parse(_))));
+        assert!(matches!(load("[standin]\nhosts = [{ origin = \"http://172.29.77.21:8081\", intents = [\"public\"], extra = 1 }]\n"), Err(ConfigError::Parse(_))));
+    }
+
+    /// The problems naming `key` in `file` with `[standin]` from `entries`.
+    fn key_problems(entries: &[(&str, &str)], settings: &str, edit: impl Fn(&mut FileConfig), key: &str) -> Vec<String> {
+        let mut file = FileConfig::parse(&format!("{}{settings}", hosts(entries))).expect("parse");
+        edit(&mut file);
+        crate::config::validate::problems(&file, "appview.example.com").into_iter().filter(|p| p.contains(key)).collect()
+    }
+
+    /// T8: each URL key takes an `http` value only on an origin listed for
+    /// every intent its clients use; `video.cdn_url` never does.
+    #[test]
+    fn url_keys_take_http_only_on_an_origin_listed_for_their_intents() {
+        let both = "\"public\", \"internal\"";
+        let public = "\"public\"";
+        let internal = "\"internal\"";
+        let none = |_: &mut FileConfig| {};
+        let appview = |url: &'static str| {
+            move |f: &mut FileConfig| {
+                let n = f.constellation.networks.iter_mut().find(|n| n.name == "bluesky").expect("bluesky");
+                n.appview_url = url.to_string();
+            }
+        };
+        // (key, settings, the intents it needs)
+        let cases: [(&str, String, &str); 4] = [
+            ("farsight.url", "[farsight]\nurl = \"http://172.29.77.21:8081\"\n".to_string(), both),
+            ("microcosm.slingshot_url", "[microcosm]\nslingshot_url = \"http://172.29.77.21:8081\"\n".to_string(), public),
+            ("microcosm.constellation_url", "[microcosm]\nconstellation_url = \"http://172.29.77.21:8081\"\n".to_string(), both),
+            ("identity.plc_url", "[identity]\nplc_url = \"http://172.29.77.21:8081\"\n".to_string(), both),
+        ];
+        for (key, settings, needs) in &cases {
+            let origin = "http://172.29.77.21:8081";
+            assert_eq!(key_problems(&[(origin, *needs)], settings, none, key), Vec::<String>::new(), "{key} on a listed origin");
+            assert_eq!(key_problems(&[(origin, both)], settings, none, key), Vec::<String>::new(), "{key} listed for both");
+            assert_eq!(key_problems(&[("http://172.29.77.21:8082", both)], settings, none, key).len(), 1, "{key} on an unlisted origin");
+            if *needs == both {
+                assert_eq!(key_problems(&[(origin, public)], settings, none, key).len(), 1, "{key} listed for public only");
+                assert_eq!(key_problems(&[(origin, internal)], settings, none, key).len(), 1, "{key} listed for internal only");
+            } else {
+                assert_eq!(key_problems(&[(origin, internal)], settings, none, key).len(), 1, "{key} listed for internal only");
+            }
+        }
+        let key = "constellation.networks[bluesky].appview_url";
+        let listed = [("http://172.29.77.21:8082", public)];
+        assert_eq!(key_problems(&listed, "", appview("http://172.29.77.21:8082"), key), Vec::<String>::new());
+        assert_eq!(key_problems(&listed, "", appview("http://172.29.77.21:8083"), key).len(), 1);
+        assert_eq!(key_problems(&[("http://172.29.77.21:8082", internal)], "", appview("http://172.29.77.21:8082"), key).len(), 1);
+        // No leave for the video CDN, listed or not.
+        let video = "[video]\ncdn_url = \"http://172.29.77.21:8081\"\n";
+        assert_eq!(key_problems(&[("http://172.29.77.21:8081", both)], video, none, "video.cdn_url").len(), 1);
+        // A hostname PLC over http keeps its old rule: allowed, unlisted.
+        let hostname_plc = "[identity]\nplc_url = \"http://plc.test.internal:2582\"\n";
+        assert_eq!(key_problems(&[("http://172.29.77.21:8086", both)], hostname_plc, none, "identity.plc_url"), Vec::<String>::new());
+    }
+}

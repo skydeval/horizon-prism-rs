@@ -12,6 +12,28 @@ commit.
 
 ### Added
 
+- **The `standin-hosts` test feature (Phase B stand-ins, #676).** Off by
+  default and never in a deploy build. A `[standin]` section lists origins
+  `http://<private IP literal>:<port>` (RFC 1918 or ULA, never `.0`, `.1`
+  or `.255`, at most 8), each with the intents (`public`, `internal`) whose
+  clients may reach it; `viewer_private` cannot be named. On a request's
+  first hop only, the URL policy lets a listed origin through; redirects
+  never use it and the DNS guard is unchanged. `farsight.url`,
+  `microcosm.slingshot_url`, `microcosm.constellation_url`, a network's
+  `appview_url` and a private-literal `identity.plc_url` take `http` only
+  on an origin listed for every intent their clients use.
+  - Locks: the feature does not compile without debug assertions (build
+    it with the new `standin` profile); a featureless build refuses a
+    `[standin]` section; a feature build's `serve` refuses to start
+    without one; it prints `HPRS_STANDIN_HOSTS_BUILD` on stderr and logs
+    `standin_hosts_build` at error level before its config loads, and
+    exports the gauge `standin_hosts_build`. `docker/Dockerfile` clears
+    cargo flags, refuses a repository cargo config, copies the binary to
+    `/out` and fails the image if that binary carries the marker or is
+    missing.
+  - The `farsight.url` scheme rule moved to config validation, its texts
+    unchanged. Outbound clients no longer send a `Referer` on redirects.
+
 - **The `following` audience mode (private posting S10, #719; Horizon
   P-4).** A post under a `following` audience is read by its owner and by
   the ready members the owner follows, by the follow records indexed

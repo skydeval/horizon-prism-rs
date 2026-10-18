@@ -101,13 +101,22 @@ pub struct NetConfig {
     pub user_agent: String,
     /// Origins (`scheme://host[:port]`) allowed over plain `http`.
     pub http_allowed_origins: Vec<String>,
+    /// The listed test origins and their intents (Phase B only).
+    #[cfg(feature = "standin-hosts")]
+    pub standin: Vec<(super::standin::StandinOrigin, Vec<crate::config::StandinIntent>)>,
 }
 
 impl NetConfig {
     /// Settings derived from the app configuration.
     #[must_use]
     pub fn from_app(cfg: &AppConfig) -> Self {
-        Self::new(&cfg.env.public_hostname, &cfg.file.identity.plc_url)
+        #[allow(unused_mut)]
+        let mut config = Self::new(&cfg.env.public_hostname, &cfg.file.identity.plc_url);
+        #[cfg(feature = "standin-hosts")]
+        {
+            config.standin = super::standin::listed(&cfg.file.standin);
+        }
+        config
     }
 
     /// Settings for `public_hostname`, allowing `plc_url` over `http` if it
@@ -123,6 +132,8 @@ impl NetConfig {
         Self {
             user_agent: user_agent(public_hostname),
             http_allowed_origins,
+            #[cfg(feature = "standin-hosts")]
+            standin: Vec::new(),
         }
     }
 }
@@ -282,6 +293,14 @@ impl RequestOptions {
     }
 }
 
+/// Which hop of a call a URL is: the request's own URL, or a redirect's
+/// target. Only the first hop can use a listed test origin (Phase B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hop {
+    First,
+    Redirect,
+}
+
 /// Scheme and literal-address policy shared by requests and redirects.
 #[derive(Debug, Clone)]
 struct UrlPolicy {
@@ -289,12 +308,34 @@ struct UrlPolicy {
     /// Test-only: accept `http` and loopback so fake upstreams can be served
     /// on 127.0.0.1. Never set outside `#[cfg(test)]`.
     allow_loopback: bool,
+    /// The listed test origins this client's intent may reach (Phase B).
+    #[cfg(feature = "standin-hosts")]
+    standin: super::standin::Standins,
+}
+
+/// Refuse credentials in a URL.
+fn no_credentials(url: &Url) -> Result<(), NetError> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(NetError::InvalidUrl {
+            url: url.to_string(),
+            reason: "credentials in URL".to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl UrlPolicy {
-    fn check(&self, url: &Url) -> Result<(), NetError> {
+    fn check(&self, url: &Url, _hop: Hop) -> Result<(), NetError> {
         if self.allow_loopback {
             return Ok(());
+        }
+        // A listed test origin, on the first hop only, skips the scheme and
+        // the literal-address checks (stand-in design §3.4).
+        #[cfg(feature = "standin-hosts")]
+        {
+            if _hop == Hop::First && self.standin.admits(url) {
+                return no_credentials(url);
+            }
         }
         match url.scheme() {
             "https" => {}
@@ -324,13 +365,7 @@ impl UrlPolicy {
                 host: ip.to_string(),
             });
         }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(NetError::InvalidUrl {
-                url: url.to_string(),
-                reason: "credentials in URL".to_string(),
-            });
-        }
-        Ok(())
+        no_credentials(url)
     }
 }
 
@@ -372,6 +407,8 @@ impl NetClient {
         let policy = UrlPolicy {
             http_allowed_origins: Arc::new(config.http_allowed_origins.clone()),
             allow_loopback: false,
+            #[cfg(feature = "standin-hosts")]
+            standin: super::standin::Standins::for_intent(&config.standin, intent),
         };
         let redirect_policy = {
             let policy = policy.clone();
@@ -379,7 +416,7 @@ impl NetClient {
                 if attempt.previous().len() > MAX_REDIRECTS {
                     return attempt.error(format!("more than {MAX_REDIRECTS} redirects"));
                 }
-                match policy.check(attempt.url()) {
+                match policy.check(attempt.url(), Hop::Redirect) {
                     Ok(()) => attempt.follow(),
                     Err(e) => {
                         let reason = e.to_string();
@@ -397,6 +434,8 @@ impl NetClient {
             .no_proxy()
             .dns_resolver(Arc::new(GuardedResolver::new(lookup)))
             .redirect(redirect_policy)
+            // No `Referer` on a redirect: a hop never names the URL before it.
+            .referer(false)
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(config.user_agent.clone())
             .build()
@@ -425,6 +464,8 @@ impl NetClient {
             policy: UrlPolicy {
                 http_allowed_origins: Arc::new(Vec::new()),
                 allow_loopback: true,
+                #[cfg(feature = "standin-hosts")]
+                standin: super::standin::Standins::default(),
             },
             intent: Intent::Public,
         }
@@ -457,6 +498,8 @@ impl NetClient {
             policy: UrlPolicy {
                 http_allowed_origins: Arc::new(Vec::new()),
                 allow_loopback: true,
+                #[cfg(feature = "standin-hosts")]
+                standin: super::standin::Standins::default(),
             },
             intent,
         }
@@ -473,7 +516,7 @@ impl NetClient {
             url: url.to_string(),
             reason: e.to_string(),
         })?;
-        self.policy.check(&parsed)?;
+        self.policy.check(&parsed, Hop::First)?;
         Ok(parsed)
     }
 
@@ -749,5 +792,130 @@ mod tests {
             "{err:?}"
         );
         assert!(err.is_transient());
+    }
+
+    /// The Phase B stand-in exception (stand-in design §5, T3 – T6).
+    #[cfg(feature = "standin-hosts")]
+    mod standin {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::*;
+        use crate::config::StandinIntent;
+        use crate::net::standin::{StandinOrigin, Standins};
+
+        fn origin(ip: &str, port: u16) -> StandinOrigin {
+            StandinOrigin {
+                ip: ip.parse().expect("ip"),
+                port,
+            }
+        }
+
+        fn client_listing(listed: Vec<(StandinOrigin, Vec<StandinIntent>)>, intent: Intent, plc_url: &str) -> NetClient {
+            let mut config = NetConfig::new("appview.example.com", plc_url);
+            config.standin = listed;
+            NetClient::with_lookup(&config, intent, NoDns).expect("client builds")
+        }
+
+        /// T3: the public client, with one origin listed for `public`.
+        #[test]
+        fn a_listed_origin_is_reached_on_its_intent_and_nothing_near_it_is() {
+            let c = client_listing(vec![(origin("172.29.77.21", 8081), vec![StandinIntent::Public])], Intent::Public, "https://plc.directory");
+            c.check_url("http://172.29.77.21:8081/xrpc/app.nearhorizon.farsight.query.checkBlocks?actor=did:plc:a&others=did:plc:b")
+                .expect("the listed origin, any path and query");
+            c.check_url("http://172.29.77.21:8081").expect("the bare origin");
+            for refused in [
+                "http://172.29.77.21:8082/x",
+                "https://172.29.77.21:8081/x",
+                "http://172.29.77.22:8081/x",
+                "http://[::ffff:172.29.77.21]:8081/x",
+                "http://user:pw@172.29.77.21:8081/x",
+                "http://user@172.29.77.21:8081/x",
+                "http://172.29.77.21/x",
+            ] {
+                assert!(c.check_url(refused).is_err(), "{refused}");
+            }
+            assert!(matches!(c.check_url("http://user:pw@172.29.77.21:8081/x"), Err(NetError::InvalidUrl { .. })));
+            let hex = c.check_url("http://0xac.29.77.21:8081/x").expect("the same address, spelled in hex");
+            assert_eq!(hex.host(), Some(Host::Ipv4("172.29.77.21".parse().expect("ip"))));
+        }
+
+        /// T4: an origin listed for `public` is refused on the internal
+        /// client, and the `viewer_private` client never reaches one.
+        #[test]
+        fn other_intents_are_refused() {
+            let internal = client_listing(vec![(origin("172.29.77.21", 8081), vec![StandinIntent::Public])], Intent::Internal, "https://plc.directory");
+            assert!(internal.check_url("http://172.29.77.21:8081/x").is_err());
+            let both = vec![(origin("172.29.77.21", 8081), vec![StandinIntent::Public, StandinIntent::Internal])];
+            let private = client_listing(both.clone(), Intent::ViewerPrivate, "https://plc.directory");
+            assert!(private.check_url("http://172.29.77.21:8081/x").is_err());
+            assert_eq!(Standins::for_intent(&both, Intent::ViewerPrivate), Standins::default());
+            client_listing(both, Intent::Internal, "https://plc.directory")
+                .check_url("http://172.29.77.21:8081/x")
+                .expect("listed for internal");
+        }
+
+        /// T5: a real request reaches a listed origin (loopback here, which
+        /// only the validator refuses), and its redirect to another listed
+        /// origin is refused before the second is contacted.
+        #[tokio::test]
+        async fn a_request_reaches_a_listed_origin_and_its_redirect_does_not() {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let second = {
+                let hits = Arc::clone(&hits);
+                crate::test_support::serve_fake(axum::Router::new().route(
+                    "/x",
+                    axum::routing::get(move || {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        async { "second" }
+                    }),
+                ))
+                .await
+            };
+            let to = format!("{second}/x");
+            let first = crate::test_support::serve_fake(
+                axum::Router::new()
+                    .route("/x", axum::routing::get(|| async { "first" }))
+                    .route(
+                        "/hop",
+                        axum::routing::get(move || {
+                            let to = to.clone();
+                            async move { (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, to)]) }
+                        }),
+                    ),
+            )
+            .await;
+            let port = |base: &str| base.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).expect("port");
+            let listed = vec![
+                (origin("127.0.0.1", port(&first)), vec![StandinIntent::Public]),
+                (origin("127.0.0.1", port(&second)), vec![StandinIntent::Public]),
+            ];
+            let c = client_listing(listed, Intent::Public, "https://plc.directory");
+            let options = RequestOptions::new(BodyCap::GET_RECORD);
+            let reached = c.get(&format!("{first}/x"), &options).await.expect("the listed origin answers");
+            assert_eq!(reached.status, StatusCode::OK);
+            assert_eq!(reached.body, b"first");
+            assert!(c.get(&format!("{first}/hop"), &options).await.is_err(), "a redirect never uses the exception");
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "the redirect target was contacted");
+            // The second origin is reachable as a first hop.
+            assert_eq!(c.get(&format!("{second}/x"), &options).await.expect("first hop").body, b"second");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        /// T6: the policy admits a listed origin on the first hop and
+        /// refuses it on a redirect, the `http` PLC origin included.
+        #[test]
+        fn a_redirect_never_uses_the_exception() {
+            let plc = "http://172.29.77.21:8086";
+            let policy = UrlPolicy {
+                http_allowed_origins: Arc::new(vec![plc.to_string()]),
+                allow_loopback: false,
+                standin: Standins(vec![origin("172.29.77.21", 8081), origin("172.29.77.21", 8086)]),
+            };
+            for url in ["http://172.29.77.21:8081/x", "http://172.29.77.21:8086/did:plc:phaseb"] {
+                let url = Url::parse(url).expect("url");
+                policy.check(&url, Hop::First).expect("first hop");
+                assert!(policy.check(&url, Hop::Redirect).is_err(), "{url}");
+            }
+        }
     }
 }

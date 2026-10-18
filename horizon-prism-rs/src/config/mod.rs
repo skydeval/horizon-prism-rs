@@ -31,6 +31,8 @@ pub use sections::{
 };
 #[cfg(feature = "bench-heads")]
 pub use sections::BenchConfig;
+#[cfg(feature = "standin-hosts")]
+pub use sections::{StandinConfig, StandinHost, StandinIntent};
 pub use validate::{MAX_HEAD_AGE_SECS, OTHER_RELAY_LABEL, pds_pattern};
 
 /// Configuration failures. Every variant aborts startup.

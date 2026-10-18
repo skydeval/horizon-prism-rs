@@ -5,6 +5,8 @@
 pub mod client;
 pub mod resolver;
 pub mod service_proxy;
+#[cfg(feature = "standin-hosts")]
+pub mod standin;
 pub mod transport;
 
 #[cfg(test)]

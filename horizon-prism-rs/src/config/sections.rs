@@ -420,6 +420,35 @@ pub struct BenchConfig {
     pub heads_file: Option<std::path::PathBuf>,
 }
 
+/// `[standin]` (stand-in design §3.2): the Phase B test origins a feature
+/// build may reach. Exists only under its feature, so a deploy build
+/// refuses a config that names it.
+#[cfg(feature = "standin-hosts")]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StandinConfig {
+    pub hosts: Vec<StandinHost>,
+}
+
+/// One listed origin and the intents whose clients may reach it.
+#[cfg(feature = "standin-hosts")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandinHost {
+    /// `http://<private IP literal>:<port>`, in canonical form.
+    pub origin: String,
+    pub intents: Vec<StandinIntent>,
+}
+
+/// The intents an origin can be listed for. `viewer_private` is not one.
+#[cfg(feature = "standin-hosts")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StandinIntent {
+    Public,
+    Internal,
+}
+
 /// `[private_notify]` (private posting §4.8, C-11). The section is never
 /// named after the private table (§3.1's names table).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1868,4 +1897,7 @@ pub struct FileConfig {
     /// The B-5 bench's head source; only under `bench-heads`.
     #[cfg(feature = "bench-heads")]
     pub bench: BenchConfig,
+    /// The Phase B stand-in origins; only under `standin-hosts`.
+    #[cfg(feature = "standin-hosts")]
+    pub standin: StandinConfig,
 }

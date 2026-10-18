@@ -7,6 +7,11 @@
 // `DecodeContext`, `laquna::Codec`) is forbidden by clippy.toml.
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
+// The stand-in exception is test-only (docs/internal/design/
+// standin-guard-exception.md §3.1): it never builds without debug assertions.
+#[cfg(all(feature = "standin-hosts", not(debug_assertions)))]
+compile_error!("standin-hosts is test-only: build it with --profile standin, never --release");
+
 pub mod admin_executor;
 pub mod aggregations;
 pub mod appview_clients;

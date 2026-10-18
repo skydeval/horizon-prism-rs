@@ -18,6 +18,15 @@ path = "src/main.rs"
 # in a deploy build: serve refuses to start under it without
 # `bench.heads_file`, and a featureless build refuses a `[bench]` section.
 bench-heads = []
+# Phase B stand-ins (docs/internal/design/standin-guard-exception.md).
+# Never in a deploy build: it does not compile without debug assertions,
+# docker/Dockerfile refuses a binary that carries it, and serve refuses to
+# start without a [standin] section.
+standin-hosts = []
+
+[profile.standin]
+inherits = "release"
+debug-assertions = true
 
 # Versions pinned major/minor per design-v2 §3.1.
 [dependencies]

@@ -33,9 +33,21 @@ RUN set -e; \
     leaks="$(grep -v '^src/private_tier/' /tmp/private_refs || true)"; \
     if [ -n "$leaks" ]; then echo "private-tier table referenced outside src/private_tier/:"; echo "$leaks"; exit 1; fi
 
+# A deploy image never carries the stand-in exception
+# (docs/internal/design/standin-guard-exception.md): no cargo config or
+# flags that could turn debug assertions on in a release build.
+ENV RUSTFLAGS="" CARGO_ENCODED_RUSTFLAGS="" CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false
+RUN test ! -e .cargo/config.toml && test ! -e .cargo/config
+
 # Enforces the private-tier codec guard (design §6.3); a violation fails the build.
 RUN cargo clippy --release --locked --all-targets -- -D warnings
 RUN cargo build --release --locked --bin horizon-prism-rs
+RUN mkdir -p /out && cp target/release/horizon-prism-rs /out/horizon-prism-rs
+# The lock: the binary that ships is grepped for the feature's marker, and a
+# missing file (grep exit 2) fails the build too.
+RUN rc=0; grep -a -q 'HPRS_STANDIN_HOSTS_BUILD' /out/horizon-prism-rs || rc=$?; \
+    if [ "$rc" -eq 0 ]; then echo 'refusing: this binary carries the standin-hosts feature'; exit 1; fi; \
+    if [ "$rc" -ne 1 ]; then echo "standin check: grep failed ($rc)"; exit 1; fi
 
 # Writable data dir for kryphocron at-rest state, owned by distroless nonroot (65532).
 RUN mkdir -p /out/data
@@ -44,7 +56,7 @@ RUN mkdir -p /out/data
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 WORKDIR /app
-COPY --from=builder /build/target/release/horizon-prism-rs /app/horizon-prism-rs
+COPY --from=builder /out/horizon-prism-rs /app/horizon-prism-rs
 COPY --from=builder --chown=65532:65532 /out/data /app/data
 
 USER nonroot:nonroot

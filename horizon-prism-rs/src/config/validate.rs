@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use super::sections::{
     COMMUNITY_NETWORK, FileConfig, LOCAL_APPVIEW, NetworkAuth, PrivateReadFloors, PublicScope,
 };
+use crate::net::Intent;
 
 /// Metrics label for relays absent from `firehose.relay_labels` (§5.11).
 pub const OTHER_RELAY_LABEL: &str = "other";
@@ -114,6 +115,8 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
         out.push("thread.max_nodes must be at least 1".to_string());
     }
     discovery(cfg, &mut out);
+    #[cfg(feature = "standin-hosts")]
+    crate::net::standin::problems(&cfg.standin, &mut out);
     out
 }
 
@@ -281,7 +284,7 @@ fn networks(cfg: &FileConfig, out: &mut Vec<String>) {
                     "constellation.networks: only {COMMUNITY_NETWORK:?} may use appview_url = {LOCAL_APPVIEW:?} ({:?})",
                     n.name
                 ));
-            } else if let Err(e) = https_url(&n.appview_url) {
+            } else if let Err(e) = with_leave(cfg, &n.appview_url, &[Intent::Public], https_url(&n.appview_url)) {
                 out.push(format!("constellation.networks[{}].appview_url: {e}", n.name));
             }
             if n.enabled && (n.rate_per_sec.unwrap_or(0) == 0 || n.burst.unwrap_or(0) == 0) {
@@ -346,15 +349,58 @@ fn urls(cfg: &FileConfig, out: &mut Vec<String>) {
             cfg.identity.plc_url
         )),
     }
-    for (key, value) in [
-        ("microcosm.slingshot_url", &cfg.microcosm.slingshot_url),
-        ("microcosm.constellation_url", &cfg.microcosm.constellation_url),
-        ("video.cdn_url", &cfg.video.cdn_url),
+    // A PLC on a private literal is reached only as a listed test origin.
+    #[cfg(feature = "standin-hosts")]
+    {
+        let private_literal = url::Url::parse(&cfg.identity.plc_url).ok().is_some_and(|u| {
+            u.scheme() == "http"
+                && match u.host() {
+                    Some(url::Host::Ipv4(v4)) => crate::net::is_blocked(v4.into()),
+                    Some(url::Host::Ipv6(v6)) => crate::net::is_blocked(v6.into()),
+                    _ => false,
+                }
+        });
+        if private_literal && !crate::net::standin::listed_for(&cfg.standin, &cfg.identity.plc_url, &[Intent::Public, Intent::Internal]) {
+            out.push(format!(
+                "identity.plc_url: {:?} names a private address that [standin] does not list for public and internal",
+                cfg.identity.plc_url
+            ));
+        }
+    }
+    // §5.14.4: Farsight over https only (or a listed test origin).
+    if let Some(url) = &cfg.farsight.url {
+        let checked = match url::Url::parse(url) {
+            Ok(u) if u.scheme() == "https" && u.host_str().is_some() => Ok(()),
+            Ok(_) => Err(format!("farsight.url = {url:?} must be an https URL")),
+            Err(e) => Err(format!("farsight.url = {url:?} is not a URL: {e}")),
+        };
+        if let Err(e) = with_leave(cfg, url, &[Intent::Public, Intent::Internal], checked) {
+            out.push(e);
+        }
+    }
+    for (key, value, intents) in [
+        ("microcosm.slingshot_url", &cfg.microcosm.slingshot_url, &[Intent::Public][..]),
+        ("microcosm.constellation_url", &cfg.microcosm.constellation_url, &[Intent::Public, Intent::Internal][..]),
+        // No leave: an empty intent list is never listed.
+        ("video.cdn_url", &cfg.video.cdn_url, &[][..]),
     ] {
-        if let Err(e) = https_url(value) {
+        if let Err(e) = with_leave(cfg, value, intents, https_url(value)) {
             out.push(format!("{key}: {e}"));
         }
     }
+}
+
+/// `checked`, an https rule's result, with the Phase B leave (stand-in
+/// design §3.3 rule 8): in a test build, an `http` value whose origin is
+/// listed for every one of `intents` passes. In any other build, `checked`.
+fn with_leave(_cfg: &FileConfig, _value: &str, _intents: &[Intent], checked: Result<(), String>) -> Result<(), String> {
+    #[cfg(feature = "standin-hosts")]
+    {
+        if checked.is_err() && crate::net::standin::listed_for(&_cfg.standin, _value, _intents) {
+            return Ok(());
+        }
+    }
+    checked
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
@@ -469,5 +515,20 @@ mod tests {
         }
         // A suggested topic needs its topic and its link.
         assert!(FileConfig::parse("[[trends.suggested_topics]]\ntopic = \"#x\"\n").is_err());
+    }
+
+    /// design-v3 §5.14.4: `farsight.url` must be an https URL. The rule
+    /// lives here, beside the other upstream URLs, with its texts as they
+    /// were in `farsight::config_problems`.
+    #[test]
+    fn farsight_url_must_be_https() {
+        let found = |toml: &str| problems(&FileConfig::parse(toml).expect("parse"), "appview.example.com");
+        let has = |toml: &str, needle: &str| {
+            let out = found(toml);
+            assert!(out.iter().any(|p| p.contains(needle)), "{needle:?} not in {out:?}");
+        };
+        assert!(!found("[farsight]\nurl = \"https://farsight.example.net\"\n").iter().any(|p| p.contains("farsight.url")));
+        has("[farsight]\nurl = \"http://farsight.example.net\"\n", "farsight.url = \"http://farsight.example.net\" must be an https URL");
+        has("[farsight]\nurl = \"farsight\"\n", "farsight.url = \"farsight\" is not a URL");
     }
 }
