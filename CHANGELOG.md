@@ -10,6 +10,34 @@ commit.
 
 ## [Unreleased]
 
+### Added (metrics audit, #730, #731)
+
+- **The Farsight fallback's own series (#730).** As design-v4 §14.2
+  specifies: `farsight_fallback_discarded_total` (answered calls whose
+  answer guard 1 discarded because Farsight answered meanwhile),
+  `farsight_fallback_pairs_total{result}` (one per account of an answered
+  call: `blocked`, `clear`, `invalid`, `not_found`, `missing`, or
+  `dropped` by guard 2), `farsight_fallback_blocks_applied_total` (blocks
+  a fallback answer applied) and the gauge
+  `farsight_fallback_ledger_entries` (notes in the ledger, sampled with
+  the gate's gauges once a second). `inbound_list_blocks_applied_total`
+  counts every inbound list block the ordinary reader applies to a
+  response, whatever its source.
+- **Operators: two Farsight renames.** `farsight_fallback_calls_total{class}`
+  is now `farsight_fallback_requests_total{endpoint, class}`, with the XRPC
+  method served as `endpoint`. `farsight_calls_total{outcome}`'s value
+  `refused_address` is now `refused` (`requestBackfill` and `getStats`
+  keep `refused_address` in their own reasons). Update any rule or
+  dashboard that names the old ones.
+- **`farsight_fallback_skipped_total{reason}` follows the design's
+  reasons.** `stopped` is now `actor_stop`. A call past the request's call
+  cap counts `call_cap`, and one not made because the request's fallback
+  allowance was spent counts `allowance`; `deadline` now counts each call
+  not made, not each request. A guard-1 discard was counted here as
+  `farsight_answered`, which no longer exists: it is
+  `farsight_fallback_discarded_total`. An empty share or pool is still
+  one reason, `no_budget`.
+
 ### Added
 
 - **The `standin-hosts` test feature (Phase B stand-ins, #676).** Off by

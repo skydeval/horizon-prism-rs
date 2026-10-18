@@ -32,8 +32,26 @@ const MAX_TARGET_BYTES: usize = 6 * 1024;
 /// A `blockedByList` longer than this is not accepted.
 const MAX_LIST_URI_BYTES: usize = 512;
 
-pub const METRIC_CALLS: &str = "farsight_fallback_calls_total";
+/// `farsight_fallback_requests_total{endpoint, class}`: every fallback
+/// call, by the XRPC method served and the call's [`Class`] (design-v4
+/// §14.2).
+pub const METRIC_REQUESTS: &str = "farsight_fallback_requests_total";
+/// `farsight_fallback_skipped_total{reason}`: Farsight was down and a call
+/// was not made. `reason` ∈ `no_budget` (an empty share or pool; the
+/// bucket does not say which), `breaker_open`, `call_cap`, `allowance`,
+/// `deadline`, `actor_stop`.
 pub const METRIC_SKIPPED: &str = "farsight_fallback_skipped_total";
+/// `farsight_fallback_discarded_total`: answers discarded by guard 1
+/// (Farsight answered meanwhile).
+pub const METRIC_DISCARDED: &str = "farsight_fallback_discarded_total";
+/// `farsight_fallback_pairs_total{result}`: one per account sent in an `ok`
+/// call, by [`Found::label`], or `dropped` by guard 2.
+pub const METRIC_PAIRS: &str = "farsight_fallback_pairs_total";
+/// `farsight_fallback_blocks_applied_total`: inbound list blocks a fallback
+/// result applied to a response.
+pub const METRIC_BLOCKS_APPLIED: &str = "farsight_fallback_blocks_applied_total";
+/// Gauge `farsight_fallback_ledger_entries`: notes in the ledger.
+pub const METRIC_LEDGER_ENTRIES: &str = "farsight_fallback_ledger_entries";
 
 /// The accounts of one request as calls: at most 30 each, and short
 /// enough that long `did:web` identifiers do not overflow the target.
@@ -103,7 +121,36 @@ impl Class {
 pub enum Found {
     /// The account blocks the viewer through this list.
     Blocked(String),
-    Nothing,
+    /// "Nothing", and which of §5.14.17.6's four rows gave it.
+    Nothing(Nothing),
+}
+
+/// The four ways an answered call reports "nothing" for an account. They
+/// differ only in `farsight_fallback_pairs_total{result}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nothing {
+    /// A `relationship` with no `blockedByList`.
+    Clear,
+    /// A `relationship` whose `blockedByList` is not a valid list.
+    Invalid,
+    /// A `notFoundActor`.
+    NotFound,
+    /// No entry for the account.
+    Missing,
+}
+
+impl Found {
+    /// The `result` label of `farsight_fallback_pairs_total`.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Blocked(_) => "blocked",
+            Self::Nothing(Nothing::Clear) => "clear",
+            Self::Nothing(Nothing::Invalid) => "invalid",
+            Self::Nothing(Nothing::NotFound) => "not_found",
+            Self::Nothing(Nothing::Missing) => "missing",
+        }
+    }
 }
 
 /// A `blockedByList` value this AppView accepts from a third party: at
@@ -176,8 +223,17 @@ pub fn read(status: u16, body: &[u8], viewer: &str, sent: &[String]) -> (Class, 
         if !sent.contains(&did) || found.contains_key(&did) {
             continue;
         }
-        let list = entry.get("blockedByList").and_then(Value::as_str).filter(|uri| key == "did" && valid_list(uri, &did));
-        let result = list.map_or(Found::Nothing, |uri| Found::Blocked(uri.to_string()));
+        let result = if key == "actor" {
+            Found::Nothing(Nothing::NotFound)
+        } else {
+            match entry.get("blockedByList") {
+                None | Some(Value::Null) => Found::Nothing(Nothing::Clear),
+                Some(v) => match v.as_str().filter(|uri| valid_list(uri, &did)) {
+                    Some(uri) => Found::Blocked(uri.to_string()),
+                    None => Found::Nothing(Nothing::Invalid),
+                },
+            }
+        };
         found.insert(did, result);
     }
     if found.is_empty() {
@@ -185,7 +241,7 @@ pub fn read(status: u16, body: &[u8], viewer: &str, sent: &[String]) -> (Class, 
     }
     // An account with no entry learned nothing.
     for did in sent {
-        found.entry(did.clone()).or_insert(Found::Nothing);
+        found.entry(did.clone()).or_insert(Found::Nothing(Nothing::Missing));
     }
     (Class::Ok, found)
 }
@@ -336,14 +392,30 @@ mod tests {
         assert_eq!(class, Class::Ok);
         assert_eq!(found[A], Found::Blocked(LIST.to_string()));
         // No block named, and no entry at all: both "nothing".
-        assert_eq!((&found[B], &found[C], found.len()), (&Found::Nothing, &Found::Nothing, 3));
+        assert_eq!(
+            (&found[B], &found[C], found.len()),
+            (&Found::Nothing(Nothing::Clear), &Found::Nothing(Nothing::Missing), 3)
+        );
         // A value that is not a valid list, and an account not found.
         let odd = json!({"relationships": [
             {"$type": "app.bsky.graph.defs#relationship", "did": A, "blockedByList": "at://not-a-did/app.bsky.graph.list/1"},
             {"$type": "app.bsky.graph.defs#notFoundActor", "actor": B, "notFound": true},
         ]});
         let (class, found) = read(200, &body(&odd), V, &sent());
-        assert_eq!((class, &found[A], &found[B]), (Class::Ok, &Found::Nothing, &Found::Nothing));
+        assert_eq!(
+            (class, &found[A], &found[B]),
+            (Class::Ok, &Found::Nothing(Nothing::Invalid), &Found::Nothing(Nothing::NotFound))
+        );
+        // Each row has its own `result` label.
+        let labels = [
+            Found::Blocked(LIST.to_string()),
+            Found::Nothing(Nothing::Clear),
+            Found::Nothing(Nothing::Invalid),
+            Found::Nothing(Nothing::NotFound),
+            Found::Nothing(Nothing::Missing),
+        ]
+        .map(|f| f.label());
+        assert_eq!(labels, ["blocked", "clear", "invalid", "not_found", "missing"]);
     }
 
     #[test]

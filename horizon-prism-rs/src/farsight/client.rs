@@ -51,7 +51,7 @@ impl CallError {
         match self {
             Self::Timeout => "timeout",
             Self::Transport => "transport",
-            Self::RefusedAddress => "refused_address",
+            Self::RefusedAddress => "refused",
             Self::RateLimited => "rate_limited",
             Self::Overloaded => "overloaded",
             Self::Status(401 | 403) => "auth",
@@ -359,7 +359,7 @@ mod tests {
     }
 
     /// B-81: `farsight.url` naming a host that resolves to a private
-    /// address is refused at each call, counted `refused_address` (not
+    /// address is refused at each call, counted `refused` (not
     /// `transport`), and logged as an error each time, naming no account.
     #[tokio::test]
     async fn a_hostname_resolving_privately_is_refused_and_logged_at_each_call() {
@@ -377,7 +377,7 @@ mod tests {
         for _ in 0..2 {
             let err = c.check_blocks(V, &[A.to_string()], Duration::from_secs(2)).await.err();
             assert_eq!(err, Some(CallError::RefusedAddress));
-            assert_eq!(err.map(CallError::label), Some("refused_address"));
+            assert_eq!(err.map(CallError::label), Some("refused"));
         }
         assert_eq!(c.request_backfill(V, false).await, Err("refused_address"));
         assert_eq!(c.get_stats().await.err(), Some("refused_address"));

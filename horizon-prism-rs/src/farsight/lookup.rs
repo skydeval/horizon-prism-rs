@@ -48,6 +48,10 @@ pub const METRIC_AUTH_FAILED: &str = "farsight_auth_failed_total";
 /// `farsight_prime_failed_total{reason}`: `requestBackfill` calls that did
 /// not succeed, or were skipped while their breaker was open.
 pub const METRIC_PRIME_FAILED: &str = "farsight_prime_failed_total";
+/// `inbound_list_blocks_applied_total`: every inbound list block the
+/// ordinary reader applies to a response, whatever its source (Farsight,
+/// the fallback or the memory).
+pub const METRIC_INBOUND_APPLIED: &str = "inbound_list_blocks_applied_total";
 
 /// How often [`Farsight::run_gate_sampler`] samples the gate's gauges.
 const GATE_SAMPLE_EVERY: Duration = Duration::from_secs(1);
@@ -587,6 +591,10 @@ impl Farsight {
     /// `farsight_fallback_withheld{reason}`, from the gate as it is now.
     pub fn sample_gate(&self) {
         self.inner.gate.sample(Instant::now());
+        // The ledger's gauge, sampled with the gate's: 0 with the fallback
+        // off, as the ledger is then always empty.
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!(fallback::METRIC_LEDGER_ENTRIES).set(self.ledger_notes() as f64);
     }
 
     /// The gate's sampler: the gauges once at once, so every series exists
@@ -716,6 +724,7 @@ impl Farsight {
             member: Arc::new(AtomicBool::new(true)),
             purges: self.inner.purges.load(Ordering::SeqCst),
             deadline: req.deadline(),
+            endpoint: Arc::from(req.labels().1),
         }
     }
 
@@ -881,6 +890,9 @@ pub struct Lookup {
     /// The request's deadline (`Requester::deadline`): the fallback's calls
     /// end by it.
     deadline: Instant,
+    /// The XRPC method being served (`Requester::labels`), for the
+    /// `endpoint` label of `farsight_fallback_requests_total`.
+    endpoint: Arc<str>,
 }
 
 impl std::fmt::Debug for Lookup {
@@ -1004,12 +1016,15 @@ impl Lookup {
             }
         }
         let found = self.pairs(&actor, &wanted).await;
-        page.iter()
+        let applied: HashMap<String, String> = page
+            .iter()
             .filter_map(|did| {
                 let list = found.get(&canonical(did)?)?.inbound.list.clone()?;
                 Some((did.clone(), list))
             })
-            .collect()
+            .collect();
+        metrics::counter!(METRIC_INBOUND_APPLIED).increment(applied.len() as u64);
+        applied
     }
 
     /// `getRelationships`'s reader (§5.14.8): for each of `others`, the
@@ -1323,7 +1338,7 @@ impl Lookup {
             let mut cache = self.farsight.cache();
             // The other AppView does not know this viewer: not again yet.
             if cache.ledger.stopped(actor, now, fb.ttl) {
-                skip("stopped");
+                skip("actor_stop");
                 return HashMap::new();
             }
             // Not sent: a pair with a live entry of either source (a block
@@ -1340,18 +1355,31 @@ impl Lookup {
                 }
             }
             let mut plan = fallback::calls(actor, &send);
-            plan.truncate(usize::try_from(state.fallback_calls_left).unwrap_or(usize::MAX));
+            let allowed = usize::try_from(state.fallback_calls_left).unwrap_or(usize::MAX);
+            // Each call past the request's cap is a call not made.
+            for _ in allowed..plan.len() {
+                skip("call_cap");
+            }
+            plan.truncate(allowed);
             state.fallback_calls_left -= u32::try_from(plan.len()).unwrap_or(state.fallback_calls_left).min(state.fallback_calls_left);
             (plan, state.fallback_allowance)
         };
-        if plan.is_empty() || allowance.is_zero() {
+        if plan.is_empty() {
+            return HashMap::new();
+        }
+        if allowance.is_zero() {
+            for _ in &plan {
+                skip("allowance");
+            }
             return HashMap::new();
         }
         // The fallback comes last in a request, and never holds it past
         // the request's own deadline.
         let allowance = allowance.min(self.deadline.saturating_duration_since(Instant::now()));
         if allowance.is_zero() {
-            skip("deadline");
+            for _ in &plan {
+                skip("deadline");
+            }
             return HashMap::new();
         }
         let started = Instant::now();
@@ -1368,7 +1396,8 @@ impl Lookup {
         let purged = inner.purges.load(Ordering::SeqCst) != self.purges;
         // Guard 1: Farsight answered meanwhile. The whole answer goes.
         if inner.gate.read(now).answers != snapshot {
-            skip("farsight_answered");
+            let answered = answers.iter().filter(|(class, _)| *class == fallback::Class::Ok).count();
+            metrics::counter!(fallback::METRIC_DISCARDED).increment(answered as u64);
             return learned;
         }
         for (class, results) in answers {
@@ -1376,13 +1405,17 @@ impl Lookup {
                 cache.ledger.stop(actor, now);
             }
             for (other, result) in results {
+                let pair = |label: &'static str| metrics::counter!(fallback::METRIC_PAIRS, "result" => label).increment(1);
                 match result {
                     Found::Blocked(list) => {
                         // Guard 2: a fallback result never changes an
                         // entry Farsight wrote.
                         if matches!(cache.entry(actor, &other, now), Some((_, Source::Farsight))) {
+                            pair("dropped");
                             continue;
                         }
+                        pair("blocked");
+                        metrics::counter!(fallback::METRIC_BLOCKS_APPLIED).increment(1);
                         let answer = PairAnswer::from_fallback(list);
                         if !purged {
                             // The fallback only ever runs for a member.
@@ -1395,7 +1428,8 @@ impl Lookup {
                         state.memo.insert(other.clone(), Some(answer.clone()));
                         learned.insert(other, answer);
                     }
-                    Found::Nothing => {
+                    nothing @ Found::Nothing(_) => {
+                        pair(nothing.label());
                         if !purged {
                             cache.ledger.note(actor, &other, now, inner.settings.per_viewer, inner.settings.total);
                         }
@@ -1437,7 +1471,7 @@ impl Lookup {
             Fb::Budget => drop(admission),
             _ => admission.record(Class::Transient, Instant::now()),
         }
-        metrics::counter!(fallback::METRIC_CALLS, "class" => class.label()).increment(1);
+        metrics::counter!(fallback::METRIC_REQUESTS, "endpoint" => self.endpoint.to_string(), "class" => class.label()).increment(1);
         (class, results)
     }
 
@@ -1787,6 +1821,8 @@ pub(crate) mod tests {
         /// A status other than 200 to answer with, as `ActorNotFound`.
         pub status: Mutex<u16>,
         pub asked: Mutex<Vec<Vec<String>>>,
+        /// How long to hold each answer.
+        pub delay_ms: Mutex<u64>,
     }
 
     async fn relationships(State(fake): State<Arc<FakeAppView>>, RawQuery(q): RawQuery) -> axum::response::Response {
@@ -1796,6 +1832,10 @@ pub(crate) mod tests {
         };
         let others = param("others");
         fake.asked.lock().expect("asked").push(others.clone());
+        let delay = *fake.delay_ms.lock().expect("delay");
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         let status = *fake.status.lock().expect("status");
         if status != 0 && status != 200 {
             return (StatusCode::from_u16(status).expect("status"), axum::Json(json!({"error": "ActorNotFound"}))).into_response();
@@ -2198,6 +2238,97 @@ pub(crate) mod tests {
         let other = "did:plc:uuuuuuuuuuuuuuuuuuuuuuuu";
         farsight.request(&Requester::new(ChargeKey::member(other))).inbound_list_blocks(other, &[numbered(70)], &none).await;
         assert_eq!(upstream.asked.lock().expect("asked").len(), before);
+    }
+
+    /// design-v4 §14.2, the fallback block: every call by endpoint and
+    /// class, every account of an answered call by result, the blocks it
+    /// applied, its skips, and the ledger gauge; and
+    /// `inbound_list_blocks_applied_total` for every block applied.
+    #[tokio::test]
+    async fn the_fallback_is_counted_call_by_call_and_pair_by_pair() {
+        use crate::test_support::series;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let value = |name: &str, labels: &[&str]| series(&handle.render(), name, labels).unwrap_or(0.0);
+        let none = HashSet::new();
+
+        // The fifth failing request asked about one account: told "clear".
+        let (farsight, _fake, upstream) = down("").await;
+        assert_eq!(value(fallback::METRIC_REQUESTS, &["endpoint=\"\"", "class=\"ok\""]), 1.0);
+        assert_eq!(value(fallback::METRIC_PAIRS, &["result=\"clear\""]), 1.0);
+        // B blocks through a list; C has no entry at all.
+        upstream.blockers.lock().expect("blockers").insert(B.to_string());
+        let timeline = member().for_endpoint("app.bsky.feed.getTimeline");
+        let blocked = farsight.request(&timeline).inbound_list_blocks(V, &page(&[B, C]), &none).await;
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(value(fallback::METRIC_REQUESTS, &["endpoint=\"app.bsky.feed.getTimeline\"", "class=\"ok\""]), 1.0);
+        assert_eq!(value(fallback::METRIC_PAIRS, &["result=\"blocked\""]), 1.0);
+        assert_eq!(value(fallback::METRIC_PAIRS, &["result=\"clear\""]), 2.0);
+        assert_eq!(value(fallback::METRIC_BLOCKS_APPLIED, &[]), 1.0);
+        assert_eq!(value(METRIC_INBOUND_APPLIED, &[]), 1.0);
+        // The same block in hand on the next request is applied again,
+        // from the cache: not a new fallback block.
+        farsight.request(&member()).inbound_list_blocks(V, &page(&[B]), &none).await;
+        assert_eq!((value(METRIC_INBOUND_APPLIED, &[]), value(fallback::METRIC_BLOCKS_APPLIED, &[])), (2.0, 1.0));
+        // The ledger holds the two "nothing" pairs, sampled with the gate.
+        farsight.sample_gate();
+        assert_eq!(value(fallback::METRIC_LEDGER_ENTRIES, &[]), 2.0);
+        farsight.forget(V);
+        farsight.sample_gate();
+        assert_eq!(value(fallback::METRIC_LEDGER_ENTRIES, &[]), 0.0);
+
+        // `ActorNotFound`: counted by class, then the viewer's stop.
+        *upstream.status.lock().expect("status") = 400;
+        farsight.request(&member()).inbound_list_blocks(V, &[numbered(80)], &none).await;
+        farsight.request(&member()).inbound_list_blocks(V, &[numbered(81)], &none).await;
+        assert_eq!(value(fallback::METRIC_REQUESTS, &["class=\"actor_not_found\""]), 1.0);
+        assert_eq!(value(fallback::METRIC_SKIPPED, &["reason=\"actor_stop\""]), 1.0);
+        // A request past its deadline makes no call.
+        let other = "did:plc:wwwwwwwwwwwwwwwwwwwwwwww";
+        let late = Requester::new(ChargeKey::member(other)).with_deadline(Instant::now());
+        farsight.request(&late).inbound_list_blocks(other, &[numbered(82)], &none).await;
+        assert_eq!(value(fallback::METRIC_SKIPPED, &["reason=\"deadline\""]), 1.0);
+        // 90 distinct accounts, three calls of 30, at the cap of two: one
+        // call is not made.
+        *upstream.status.lock().expect("status") = 200;
+        let letter = |n: u8| char::from(b'b' + n);
+        let many: Vec<String> = (0..90u8).map(|i| format!("did:plc:{:a>24}", format!("{}{}", letter(i / 20), letter(i % 20)))).collect();
+        let third = "did:plc:xxxxxxxxxxxxxxxxxxxxxxxx";
+        farsight.request(&Requester::new(ChargeKey::member(third))).inbound_list_blocks(third, &many, &none).await;
+        assert_eq!(value(fallback::METRIC_SKIPPED, &["reason=\"call_cap\""]), 1.0);
+
+        // Guard 1: Farsight answers while a fallback call is held. The
+        // whole answer is discarded.
+        let (farsight, fake, upstream) = down("").await;
+        upstream.blockers.lock().expect("blockers").insert(B.to_string());
+        *upstream.delay_ms.lock().expect("delay") = 300;
+        let held = farsight.request(&member());
+        let call = tokio::spawn(async move { held.inbound_list_blocks(V, &page(&[B]), &HashSet::new()).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        farsight.inner.gate.force_half_open();
+        *fake.delay_ms.lock().expect("delay") = 0;
+        farsight.request(&member()).inbound_list_blocks(V, &[numbered(90)], &none).await;
+        assert!(call.await.expect("call").is_empty());
+        assert_eq!(value(fallback::METRIC_DISCARDED, &[]), 1.0);
+        assert_eq!(value(fallback::METRIC_PAIRS, &["result=\"blocked\""]), 1.0, "nothing new");
+
+        // Guard 2: an entry Farsight wrote meanwhile drops the "blocked".
+        let (farsight, _fake, upstream) = down("").await;
+        upstream.blockers.lock().expect("blockers").insert(C.to_string());
+        *upstream.delay_ms.lock().expect("delay") = 300;
+        let held = farsight.request(&member());
+        let call = tokio::spawn(async move { held.inbound_list_blocks(V, &page(&[C]), &HashSet::new()).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let settings = farsight.inner.settings;
+            let mut cache = farsight.cache();
+            let owner = Owner { viewer: V, member: true };
+            cache.store(owner, C, PairAnswer::default(), Instant::now() + Duration::from_secs(30), Source::Farsight, &settings);
+        }
+        assert!(call.await.expect("call").is_empty());
+        assert_eq!(value(fallback::METRIC_PAIRS, &["result=\"dropped\""]), 1.0);
+        assert_eq!(value(fallback::METRIC_BLOCKS_APPLIED, &[]), 1.0, "nothing new");
     }
 
     /// B-81: the prime is counted, and its breaker is apart from the read
