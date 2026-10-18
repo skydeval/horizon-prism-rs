@@ -180,10 +180,7 @@ impl PrivateState {
             cursor_key,
             search: SearchBounds::from(&PrivateSearchConfig::default()),
             reads_factor: usize::try_from(cfg.page_reads_factor).unwrap_or(2).max(1),
-            bounds: schema::ReadBounds {
-                max_chain: cfg.max_chain,
-                batch_max: i64::from(cfg.walk_batch_max.max(1)),
-            },
+            bounds: schema::ReadBounds::new(cfg.max_chain, cfg.walk_batch_max),
         }
     }
 

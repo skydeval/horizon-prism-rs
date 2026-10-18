@@ -520,10 +520,28 @@ async fn validity(db: &Loaded, text: &str, when: &str) -> Vec<String> {
 const HEAD_FETCHES: [&str; 3] = ["result=\"read_fetch\"", "result=\"error\"", "result=\"read_budget_exhausted\""];
 const FETCH_FAILURES: &str = "jwt_fetch_cell_failures_total";
 
+/// One case's measurements in a run: its label, the server's p99 and the
+/// alone p50.
+struct Measured {
+    label: String,
+    /// From the server's own histogram (its bucket edges are coarse).
+    server_p99: Duration,
+    alone_p50: Duration,
+    client_p99: Duration,
+    c8_p50: Duration,
+}
+
+/// Samples alone per case: `HPRS_B5_ALONE`, else 100 (at most the
+/// concurrent samples).
+fn alone_samples() -> usize {
+    std::env::var("HPRS_B5_ALONE").ok().and_then(|s| s.parse().ok()).unwrap_or(100)
+}
+
 /// The client (amendment 1 §2.3, 3) over one loaded database: its
-/// failures, or why the run is void.
+/// failures, or why the run is void; each case's measurements go to
+/// `measured`.
 #[allow(clippy::too_many_lines)]
-async fn run(db: &Loaded, bin: &Path, concurrency: usize, samples_c8: usize) -> Vec<String> {
+async fn run(db: &Loaded, bin: &Path, concurrency: usize, samples_c8: usize, measured: &mut Vec<Measured>) -> Vec<String> {
     let redis_url = std::env::var("HPRS_TEST_REDIS_URL").expect("HPRS_TEST_REDIS_URL");
     let mut redis = ConnectionManager::new(redis::Client::open(redis_url.clone()).expect("url")).await.expect("redis");
     let _: () = redis::cmd("FLUSHALL").query_async(&mut redis).await.expect("flush");
@@ -597,7 +615,7 @@ async fn run(db: &Loaded, bin: &Path, concurrency: usize, samples_c8: usize) -> 
         let (took, alone) = if db.stale.is_empty() {
             let took = sample_as(&client, method, query, samples_c8, concurrency).await;
             let after = metrics(&client).await;
-            let alone = sample_as(&client, method, query, samples_c8.min(100), 1).await;
+            let alone = sample_as(&client, method, query, samples_c8.min(alone_samples()), 1).await;
             (took, (after, alone))
         } else {
             // The stale-head chain: one at a time, every stale head reset to
@@ -650,6 +668,13 @@ async fn run(db: &Loaded, bin: &Path, concurrency: usize, samples_c8: usize) -> 
         if *gated && p99 >= budget {
             failures.push(format!("{}, {label}: server p99 {p99:?} over its budget {budget:?}", db.title));
         }
+        measured.push(Measured {
+            label: (*label).to_string(),
+            server_p99: p99,
+            alone_p50: percentile(&alone, 50),
+            client_p99,
+            c8_p50: percentile(&took, 50),
+        });
     }
 
     let text = metrics(&client).await;
@@ -720,27 +745,152 @@ async fn b5_release_feed() {
     feeder.await.expect("feeder");
 }
 
+/// The median of `values` (the upper one of an even count).
+fn median(mut values: Vec<Duration>) -> Duration {
+    values.sort();
+    values[values.len() / 2]
+}
+
+/// Each case's medians over `runs`, metric by metric.
+fn medians(runs: &[Vec<Measured>]) -> Vec<Measured> {
+    let Some(first) = runs.first() else {
+        return Vec::new();
+    };
+    first
+        .iter()
+        .map(|m| {
+            let of = |pick: fn(&Measured) -> Duration| {
+                median(runs.iter().filter_map(|r| r.iter().find(|x| x.label == m.label)).map(pick).collect())
+            };
+            Measured {
+                label: m.label.clone(),
+                server_p99: of(|x| x.server_p99),
+                alone_p50: of(|x| x.alone_p50),
+                client_p99: of(|x| x.client_p99),
+                c8_p50: of(|x| x.c8_p50),
+            }
+        })
+        .collect()
+}
+
 /// Part (3) on the deploy build: every fixture of §2.4 but the stale-head
 /// chain, each in its own fresh database, 1 000 samples (`HPRS_B5_SAMPLES`)
-/// at concurrency 8 and 100 alone, gated on the server's histogram.
+/// at concurrency 8 and 100 alone (`HPRS_B5_ALONE`), gated on the server's
+/// histogram; `Distinct` on its alone p50 (shared-walk §7).
+///
+/// With `HPRS_B5_BASE_BIN`, the build before the shared walk serves the
+/// same loaded database before each run of this build, `HPRS_B5_RUNS`
+/// times (default 1); the ordinary fixtures ([`Part3::ORDINARY`]) are then
+/// gated on the median of the runs' server p99 and alone p50, each at most
+/// 1.1 × the base build's (shared-walk §7). The base build's own budget
+/// overruns are printed, not counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "B-5 part (3) on the deploy build; run with --release --ignored --nocapture"]
+#[allow(clippy::too_many_lines)]
 async fn b5_release_floors() {
     let bin = serve_bin();
     assert!(bin.exists(), "no deploy build at {}", bin.display());
+    let base = std::env::var("HPRS_B5_BASE_BIN").ok().map(PathBuf::from);
+    if let Some(b) = &base {
+        assert!(b.exists(), "no base build at {}", b.display());
+    }
+    let runs: usize = std::env::var("HPRS_B5_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
     let only = std::env::var("HPRS_B5_ONLY").ok();
-    println!("B-5 part (3) on {}: {} samples per case at concurrency 8, 100 alone", bin.display(), samples());
+    println!(
+        "B-5 part (3) on {}: {} samples per case at concurrency 8, {} alone, {runs} run(s){}",
+        bin.display(),
+        samples(),
+        samples().min(alone_samples()),
+        base.as_ref().map_or_else(String::new, |b| format!(", base build {}", b.display()))
+    );
     let mut failures = Vec::new();
     for fixture in Part3::ALL {
         if only.as_deref().is_some_and(|o| !o.split(',').any(|s| s == fixture.slug())) {
             continue;
         }
         for cap in fixture.caps() {
-            let Some(db) = load(Which::Fixture(fixture, *cap)).await else {
-                return;
-            };
-            failures.extend(run(&db, &bin, 8, samples()).await);
-            db.drop_db().await;
+            // Each build and run serves its own load of the same fixture: a
+            // second `serve` on a database owes a recreation gap, which
+            // voids the run.
+            let (mut base_runs, mut shared_runs) = (Vec::new(), Vec::new());
+            let mut title = String::new();
+            for r in 0..runs {
+                if let Some(b) = &base {
+                    let Some(db) = load(Which::Fixture(fixture, *cap)).await else {
+                        return;
+                    };
+                    println!("  B-5 (3) {:<52} run {r}: base build", db.title);
+                    let mut m = Vec::new();
+                    for f in run(&db, b, 8, samples(), &mut m).await {
+                        println!("  B-5 (3) base build, not counted: {f}");
+                    }
+                    base_runs.push(m);
+                    db.drop_db().await;
+                }
+                let Some(db) = load(Which::Fixture(fixture, *cap)).await else {
+                    return;
+                };
+                println!("  B-5 (3) {:<52} run {r}: this build", db.title);
+                let mut m = Vec::new();
+                failures.extend(run(&db, &bin, 8, samples(), &mut m).await);
+                shared_runs.push(m);
+                title.clone_from(&db.title);
+                db.drop_db().await;
+            }
+            let shared = medians(&shared_runs);
+            let before = medians(&base_runs);
+            for m in &shared {
+                let label = &m.label;
+                let was = before.iter().find(|b| &b.label == label);
+                // Every metric side by side, base → this build, with the
+                // 1.1 × verdict of each; the gate counts server p99 and alone
+                // p50 (shared-walk §7).
+                let verdict = |now: Duration, then: Duration| if now.as_secs_f64() > then.as_secs_f64() * 1.1 { "FAIL" } else { "pass" };
+                let line = was.map_or_else(
+                    || {
+                        format!(
+                            "server p99 {:.1}  client p99 {:.1}  c8 p50 {:.1}  alone p50 {:.1} ms",
+                            ms(m.server_p99),
+                            ms(m.client_p99),
+                            ms(m.c8_p50),
+                            ms(m.alone_p50)
+                        )
+                    },
+                    |b| {
+                        format!(
+                            "server p99 {:.1} → {:.1} {}  client p99 {:.1} → {:.1} {}  c8 p50 {:.1} → {:.1} {}  alone p50 {:.1} → {:.1} {}",
+                            ms(b.server_p99),
+                            ms(m.server_p99),
+                            verdict(m.server_p99, b.server_p99),
+                            ms(b.client_p99),
+                            ms(m.client_p99),
+                            verdict(m.client_p99, b.client_p99),
+                            ms(b.c8_p50),
+                            ms(m.c8_p50),
+                            verdict(m.c8_p50, b.c8_p50),
+                            ms(b.alone_p50),
+                            ms(m.alone_p50),
+                            verdict(m.alone_p50, b.alone_p50)
+                        )
+                    },
+                );
+                println!("  B-5 (3) median {title:<45} {label:<36} {line}");
+                if let Some(limit) = fixture.alone_gate()
+                    && m.alone_p50 > limit
+                {
+                    failures.push(format!("{title}, {label}: alone p50 {:?} over {limit:?}", m.alone_p50));
+                }
+                if let Some(b) = was
+                    && Part3::ORDINARY.contains(&fixture)
+                {
+                    if m.server_p99.as_secs_f64() > b.server_p99.as_secs_f64() * 1.1 {
+                        failures.push(format!("{title}, {label}: median server p99 {:?} over 1.1 x the base build's {:?}", m.server_p99, b.server_p99));
+                    }
+                    if m.alone_p50.as_secs_f64() > b.alone_p50.as_secs_f64() * 1.1 {
+                        failures.push(format!("{title}, {label}: median alone p50 {:?} over 1.1 x the base build's {:?}", m.alone_p50, b.alone_p50));
+                    }
+                }
+            }
         }
     }
     assert!(failures.is_empty(), "{} failing cases:\n{}", failures.len(), failures.join("\n"));
@@ -764,7 +914,7 @@ async fn b5_stale_head_chain() {
         let Some(db) = load(Which::Stale { failing }).await else {
             return;
         };
-        failures.extend(run(&db, &bin, 1, n).await);
+        failures.extend(run(&db, &bin, 1, n, &mut Vec::new()).await);
         db.drop_db().await;
     }
     assert!(failures.is_empty(), "{} failing cases:\n{}", failures.len(), failures.join("\n"));
@@ -795,6 +945,7 @@ async fn b5_release_plans() {
             .map(|c| c.2.split('&').filter_map(|p| p.strip_prefix("uris=")).map(String::from).collect())
             .unwrap_or_default();
         let (what, sql) = match fixture {
+            // The single statement the slices replaced (shared-walk §2.5).
             Part3::Distinct => ("unread", schema::unread_statement(CAP)),
             Part3::Floods => ("reply counts", schema::reply_counts_statement(CAP)),
             Part3::FailingQuotes => ("quote counts", schema::quote_counts_statement(CAP)),

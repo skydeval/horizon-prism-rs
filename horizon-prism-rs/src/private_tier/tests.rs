@@ -12,6 +12,8 @@ mod b5_release;
 mod builder;
 mod round;
 mod threads;
+// The shared walk (#720): T-60 to T-63.
+mod walk;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -1607,7 +1609,6 @@ async fn t34_list_blocks_with_the_owner() {
 fn every_shape_is_one_walked_statement() {
     let fact8 = schema::fact8_statement(CAP);
     let shapes = [
-        ("fact 8", fact8.clone()),
         ("prefilter_uris", schema::prefilter_uris_statement(CAP)),
         ("getReplies page", schema::reply_page_statement(CAP)),
         ("search", schema::search_statement(CAP)),
@@ -1617,18 +1618,27 @@ fn every_shape_is_one_walked_statement() {
         ("timeline", schema::timeline_statement(CAP)),
         ("getQuotes", schema::quote_statement(CAP)),
         ("replyCount", schema::reply_counts_statement(CAP)),
-        ("quoteCount", schema::quote_counts_statement(CAP)),
-        ("getUnreadCount", schema::unread_statement(CAP)),
+        ("quoteCount slice", schema::quote_counts_slice_statement(CAP)),
+        ("getUnreadCount slice", schema::unread_slice_statement(CAP)),
     ];
-    // Fact 8 is the one-row case: its `c` is the post `$2`.
+    // Fact 8 is the one-row case: its `c` is the post `$2`, in the builder's
+    // one-row form (`walked_one`), the same stage 1 and final, its walk and
+    // branch root inlined at the cap, and the reader's own row skipped.
     assert!(fact8.contains("WITH c AS MATERIALIZED (SELECT p.uri, p.author_did, p.audience_uri, p.reply_parent_uri, p.reply_root_uri FROM private_posts p WHERE p.uri = $2)"));
+    assert_eq!(fact8.matches(&format!("u.hop < {CAP} ")).count(), 2);
+    assert!(fact8.contains("FROM s1 WHERE s1.s1ok AND s1.walks AND s1.author_did <> $1"));
+    assert!(schema::fact8_statement(100).contains("u.hop < 100 "));
+    assert!(fact8.contains(&schema::fact8_final()));
     for (name, text) in &shapes {
-        for cte in ["WITH c AS MATERIALIZED (", "br AS MATERIALIZED (", "s1 AS MATERIALIZED (", "pv AS MATERIALIZED ("] {
+        for cte in ["WITH RECURSIVE c AS MATERIALIZED (", " bcl(uri,", " bd(uri,", "s1 AS MATERIALIZED (", " tcl(uri,", " wd(uri,", "pvm AS MATERIALIZED ("] {
             assert_eq!(text.matches(cte).count(), 1, "{name}: {cte}");
         }
-        // Both caps inline the configured value, and nothing else walks.
-        assert_eq!(text.matches(&format!("u.hop < {CAP} ")).count(), 2, "{name}");
-        assert_eq!(text.matches("u.hop <").count(), 2, "{name}");
+        // Every level and descent bound inlines the configured value (two
+        // climbs, two descents), and nothing else walks.
+        assert_eq!(text.matches(&format!("x.cur < {CAP} ")).count(), 2, "{name}");
+        assert_eq!(text.matches(&format!("x.lvl < {CAP} ")).count(), 2, "{name}");
+        assert_eq!(text.matches(&format!("x.d < {CAP} ")).count(), 2, "{name}");
+        assert_eq!(text.matches("WITH RECURSIVE").count(), 1, "{name}");
         // The walk reads only rows that pass stage 1, other than the
         // reader's own.
         assert!(text.contains("FROM s1 WHERE s1.s1ok AND s1.walks AND s1.author_did <> $1"), "{name}");
@@ -1636,7 +1646,7 @@ fn every_shape_is_one_walked_statement() {
         // audience without stage 1.
         assert!(!text.contains("a.owner_did = p.author_did"), "{name}");
     }
-    assert!(schema::fact8_statement(100).contains("u.hop < 100 "));
+    assert!(schema::prefilter_uris_statement(100).contains("x.cur < 100 "));
 }
 
 /// Prints the pre-S0 count query (private-posting design §5) for skydeval

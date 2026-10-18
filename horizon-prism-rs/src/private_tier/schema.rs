@@ -234,7 +234,8 @@ const HIDING_STATUSES: &str = "('deactivated', 'takendown', 'suspended', 'delete
 /// post, no `!takedown` on the author, and an author status the gate does
 /// not hide (no `actors` row reads as visible). The walk's step test uses
 /// this form, which PostgreSQL probes through `labels`' subject index inside
-/// the recursion; stage 1 uses [`gate`].
+/// the recursion; stage 1 uses [`gate`]. Since the shared walk, the one-row
+/// form ([`walked_one`]) and HEAD's builders.
 fn gate_shows(uri: &str, author: &str, status: &str) -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM labels l WHERE (l.subject = {uri} AND l.val IN ('!takedown', '!hide')) \
@@ -355,10 +356,11 @@ pub(super) async fn account_active(pool: &PgPool, did: &str) -> Result<bool, sql
 //
 // Every reader-relative statement binds the reader as `$1`. Each candidate
 // query is one statement over its own `c` (the key columns `{COLS}` and the
-// shape's order keys and outputs), with four CTEs: `br`, one branch-root
-// lookup per distinct key; `s1`, stage 1 per row; `pv`, one walk per
-// distinct key; and the shape's final SELECT. The oracle's fact 8 is the
-// one-row case of the same statement.
+// shape's order keys and outputs): the climb over every chain key and
+// descent 1, the branch roots (shared-walk §2.1, §2.2); `s1`, stage 1 per
+// row; the walk after stage 1, a thread climb, the author memo and
+// descent 2 (shared-walk §2.4); and the shape's final SELECT. The oracle's
+// fact 8 is the one-row case of the same statement.
 
 /// The key columns every shape's `c` selects (§3.2), from `private_posts p`.
 pub(super) const COLS: &str = "p.uri, p.author_did, p.audience_uri, p.reply_parent_uri, p.reply_root_uri";
@@ -442,14 +444,18 @@ fn other_anchor(br: &str) -> String {
     )
 }
 
-/// The key of a `(parent, root)` pair in a statement's maps (`brm`, `pvm`):
-/// the two URIs joined by a space, which no URI contains.
+/// The key of a `(parent, root)` pair in the per-key statement's maps
+/// (`brm`, `pvm`): the two URIs joined by a space, which no URI contains.
 fn pair_key(parent: &str, root: &str) -> String {
     format!("({parent} || ' ' || {root})")
 }
 
-/// The branch root of `c`'s `(parent, root)` key, from the `brm` map.
-const BR_OF_C: &str = "((SELECT m FROM brm) ->> (c.reply_parent_uri || ' ' || c.reply_root_uri))";
+/// The branch root of `c`'s `(parent, root)` key, from the map `map`
+/// (`bdm`, by a climbed row's URI and context; `brm` in the per-key
+/// reference).
+fn br_of_c(map: &str) -> String {
+    format!("((SELECT m FROM {map}) ->> (c.reply_parent_uri || ' ' || c.reply_root_uri))")
+}
 
 /// Why the per-key results are maps (B-5 part (3), 2026-10-17): a statement's
 /// CTEs carry the planner's estimate of `c`, which a shape's filters can put
@@ -462,14 +468,14 @@ const BR_OF_C: &str = "((SELECT m FROM brm) ->> (c.reply_parent_uri || ' ' || c.
 /// The anchors of a statement's rows that do not anchor on themselves, each
 /// looked up once (the `akm` map, by the anchor's URI): rows sharing a root
 /// or a branch root share one lookup. Their audiences are the `gm` map.
-fn anchor_keys(s1_filter: &str) -> String {
+fn anchor_keys(s1_filter: &str, br: &str) -> String {
     format!(
         "SELECT COALESCE(jsonb_object_agg(an.uri, jsonb_build_object( \
                   'author_did', an.author_did, 'audience_uri', an.audience_uri, \
                   'reply_parent_uri', an.reply_parent_uri, 'reply_root_uri', an.reply_root_uri)), '{{}}'::jsonb) AS m \
          FROM (SELECT DISTINCT {other} AS k FROM c {s1_filter}) d \
          JOIN private_posts an ON an.uri = d.k",
-        other = other_anchor(BR_OF_C),
+        other = other_anchor(br),
     )
 }
 
@@ -498,7 +504,7 @@ fn listed(d: &str, mapped: bool) -> String {
 /// by the anchor's URI. `an` and `a` are the columns either way, as a lookup
 /// by the anchor's URI gives them; G's members are `a.members` for the
 /// first and `a.members_j` for the second.
-fn anchor_join() -> String {
+fn anchor_join(br: &str) -> String {
     let own = self_anchored();
     let pick = |own_col: &str, map_col: &str, name: &str| format!("CASE WHEN {own} THEN {own_col} ELSE {map_col} END AS {name}");
     format!(
@@ -509,8 +515,8 @@ fn anchor_join() -> String {
          CROSS JOIN LATERAL (SELECT {an_uri}, {an_author}, {an_audience}, {an_parent}, {an_root}) an \
          CROSS JOIN LATERAL (SELECT {a_uri}, {a_owner}, {a_mode}, {a_members}, \
            CASE WHEN {own} THEN NULL ELSE gk.v -> 'members' END AS members_j) a",
-        other = other_anchor(BR_OF_C),
-        an_uri = pick("c.uri", &format!("CASE WHEN ak.v IS NOT NULL THEN {} END", other_anchor(BR_OF_C)), "uri"),
+        other = other_anchor(br),
+        an_uri = pick("c.uri", &format!("CASE WHEN ak.v IS NOT NULL THEN {} END", other_anchor(br)), "uri"),
         an_author = pick("c.author_did", "ak.v ->> 'author_did'", "author_did"),
         an_audience = pick("c.audience_uri", "ak.v ->> 'audience_uri'", "audience_uri"),
         an_parent = pick("c.reply_parent_uri", "ak.v ->> 'reply_parent_uri'", "reply_parent_uri"),
@@ -626,7 +632,8 @@ fn needs_walk() -> String {
 
 /// The branch root the chain from `parent` reaches under `root` (§3.1):
 /// the structural lookup, primary keys and the root column only, at most
-/// `cap` rows. NULL when none is found.
+/// `cap` rows. NULL when none is found. The one-row form only
+/// ([`walked_one`]); every other statement uses descent 1.
 fn branch_root_of(parent: &str, root: &str, cap: u32) -> String {
     format!(
         "(WITH RECURSIVE up(uri, parent, hop) AS ( \
@@ -647,7 +654,8 @@ fn branch_root_of(parent: &str, root: &str, cap: u32) -> String {
 /// `reply_root_uri`, `owner`), with G (`a`) and O's flag (`fv.ok`) in scope:
 /// from `k`'s parent through stored rows, at most `cap`, each tested inside
 /// the recursion, so the walk ends at its first failing row; true when it
-/// reaches its stop. A cycle fails at the cap.
+/// reaches its stop. A cycle fails at the cap. The one-row form only
+/// ([`walked_one`]); every other statement uses descent 2.
 fn parent_verdict(cap: u32) -> String {
     let thread = is_private("k.reply_root_uri");
     let step = format!(
@@ -706,19 +714,276 @@ pub(super) const PV_JOIN: &str = "s1 CROSS JOIN LATERAL (SELECT CASE WHEN s1.rep
 /// reader's own row), and the walk when the row is walked.
 pub(super) const PASS: &str = "(s1.s1ok AND (s1.author_did = $1 OR NOT s1.walks OR COALESCE(pv.ok, false)))";
 
-/// One candidate statement (§3.2): `c` is the shape's own SELECT of
-/// [`COLS`] and its order keys and outputs, `s1_filter` restricts the rows
-/// stage 1 reads (`getQuotes`' refs arm is not prefiltered), and `final_`
-/// reads [`PV_JOIN`]. The walk runs once per distinct `(parent, root)` key,
-/// last, over the rows that pass stage 1: PostgreSQL does not pull a
-/// `DISTINCT` subquery up, so the SubPlan in its parent's select list runs
-/// once per key.
+/// The most node rows the climbs of one statement may hold (shared-walk
+/// §2.5): an internal constant, not a config key.
+const CLIMB_NODES_MAX: u32 = 20_000;
+
+/// K (shared-walk §2.5): the most chain start parents one statement may
+/// have at the cap `cap`, so that its climbs hold at most about
+/// [`CLIMB_NODES_MAX`] node rows. 1 250 at 16, 200 at 100.
+pub(super) fn climb_keys(cap: u32) -> usize {
+    usize::try_from((CLIMB_NODES_MAX / cap.max(1)).max(1)).unwrap_or(1)
+}
+
+/// The row `x` (its URI and root expressions) agrees with the context
+/// `ctx` (shared-walk §2, S12 §2.3): a branch's rows claim its root; a
+/// thread's rows claim it or are it.
+fn agree(uri: &str, root: &str, ctx: &str) -> String {
+    format!("({root} = {ctx} OR ({} AND {uri} = {ctx}))", is_private(ctx))
+}
+
+/// A branch's stop: the row whose parent (an expression) is not a
+/// `postPrivate` record, its branch root.
+fn bstop(parent: &str) -> String {
+    format!("NOT {}", is_private(parent))
+}
+
+/// A thread's stop in the context `ctx` with owner `o`, over the climb's
+/// short names of the row `x`: the root itself, or a thread reply by O.
+fn tstop(x: &str, ctx: &str, o: &str) -> String {
+    format!("({x}.uri = {ctx} OR ({x}.author = {o} AND {}))", is_private(&format!("{x}.parent")))
+}
+
+/// The climb (shared-walk §2.1): one recursive CTE `name` from every
+/// distinct start parent of the CTE `starts` (`parent`, `root`, `owner`),
+/// breadth first, by primary key, each fetched row kept once per context
+/// it agrees with, at most `cap` levels; with its maps `{name}_sp` (start
+/// parent to its contexts) and `{name}_sk` (the start keys). Node rows have
+/// `lvl` NULL; one marker row per level carries the level, which a window
+/// over the working table gives every node row of that iteration. It reads
+/// `private_posts` only.
+fn climb(name: &str, starts: &str, thread: bool, cap: u32) -> String {
+    let stop = if thread { tstop("x", "x.ctx", "x.owner") } else { bstop("x.parent") };
+    format!(
+        "{name}_sp AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg(g.parent, g.v), '{{}}'::jsonb) AS m FROM ( \
+             SELECT s.parent, jsonb_agg(jsonb_build_object('root', s.root, 'owner', s.owner)) AS v \
+             FROM {starts} s WHERE s.parent IS NOT NULL AND s.root IS NOT NULL GROUP BY s.parent) g), \
+         {name}_sk AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg(s.parent || ' ' || s.root, true), '{{}}'::jsonb) AS m \
+           FROM {starts} s WHERE s.parent IS NOT NULL AND s.root IS NOT NULL), \
+         {name}(uri, parent, root, author, audience, ctx, owner, lvl) AS ( \
+           SELECT s.uri, s.reply_parent_uri, s.reply_root_uri, s.author_did, s.audience_uri, k.root, k.owner, NULL::int \
+           FROM jsonb_each((SELECT m FROM {name}_sp)) d \
+           CROSS JOIN LATERAL (SELECT p.uri, p.reply_parent_uri, p.reply_root_uri, p.author_did, p.audience_uri \
+                               FROM private_posts p WHERE p.uri = d.key LIMIT 1) s \
+           CROSS JOIN LATERAL jsonb_to_recordset(d.value) AS k(root text, owner text) \
+           WHERE {agree1} \
+           UNION \
+           SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1 \
+           UNION \
+           SELECT n.* FROM ( \
+             SELECT w.*, max(w.lvl) OVER () AS cur, count(w.uri) OVER () AS live FROM {name} w \
+           ) x \
+           CROSS JOIN LATERAL ( \
+             (SELECT p.uri, p.reply_parent_uri, p.reply_root_uri, p.author_did, p.audience_uri, x.ctx, x.owner, NULL::int \
+              FROM private_posts p \
+              WHERE x.uri IS NOT NULL AND x.cur < {cap} AND NOT {stop} \
+                AND NOT ((SELECT m FROM {name}_sk) ? (x.parent || ' ' || x.ctx)) \
+                AND p.uri = x.parent AND {agree_p} \
+              LIMIT 1) \
+             UNION ALL \
+             SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, x.lvl + 1 \
+             WHERE x.uri IS NULL AND x.lvl < {cap} AND x.live > 0 \
+           ) n)",
+        agree1 = agree("s.uri", "s.reply_root_uri", "k.root"),
+        agree_p = agree("p.uri", "p.reply_root_uri", "x.ctx"),
+    )
+}
+
+/// The child map of the climb `name` (`bkids`, `tkids`): by a parent's
+/// URI and context, the node rows below it, over node rows with a parent.
+///
+/// Here and in `wk` and `am`, rows are grouped or made distinct under the
+/// "C" collation (#720, B-5 `Distinct`): the default collation compares
+/// long URIs through the locale, which made sorting 40 000 keys cost more
+/// than climbing to them. Under a deterministic collation equal strings
+/// are equal bytes, so the groups are the same; `wk` and `am` hand their
+/// columns back in the default collation.
+fn kids(name: &str) -> String {
+    format!(
+        "SELECT COALESCE(jsonb_object_agg(g.k, g.v), '{{}}'::jsonb) AS m FROM ( \
+           SELECT (r.parent || ' ' || r.ctx) COLLATE \"C\" AS k, \
+                  jsonb_agg(jsonb_build_object('uri', r.uri, 'parent', r.parent, 'root', r.root, \
+                                               'author', r.author, 'audience', r.audience)) AS v \
+           FROM {name} r WHERE r.uri IS NOT NULL AND r.parent IS NOT NULL AND r.ctx IS NOT NULL GROUP BY 1) g"
+    )
+}
+
+/// The walk's row test `ok` (shared-walk §2.4) for the row `e` (short
+/// names) in the context `ctx` with O `o` and G `g`: agreement and O's
+/// audience in memory, its author's memo entry (`amm`), and the post's own
+/// `!takedown` or `!hide` label. NULL reads as false.
+fn walk_ok(e: &str, ctx: &str, o: &str, g: &str) -> String {
+    format!(
+        "COALESCE({agree} AND {owned} \
+           AND ((SELECT m FROM amm) ->> ({e}.author || ' ' || {o} || ' ' || {g}))::boolean \
+           AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = {e}.uri AND l.val IN ('!takedown', '!hide')), false)",
+        agree = agree(&format!("{e}.uri"), &format!("{e}.root"), ctx),
+        owned = owned(&format!("{e}.audience"), o),
+    )
+}
+
+/// One candidate statement (§3.2; shared-walk §2): `c` is the shape's own
+/// SELECT of [`COLS`] and its order keys and outputs, `s1_filter` restricts
+/// the rows stage 1 reads (`getQuotes`' refs arm is not prefiltered), and
+/// `final_` reads [`PV_JOIN`]. Every chain key of the statement shares one
+/// climb before stage 1 (branch roots, descent 1) and one after it for
+/// walked thread keys; the walk is descent 2 over the climbed rows, with
+/// each author's terms evaluated once per `(author, O, G)`.
 pub(super) fn walked(c: &str, s1_filter: &str, final_: &str, cap: u32) -> String {
+    #[cfg(test)]
+    if PER_KEY.with(std::cell::Cell::get) {
+        return walked_per_key(c, s1_filter, final_, cap);
+    }
     walked_with(c, s1_filter, final_, cap, &stage1_ok())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only (shared-walk T-60): [`walked`] builds the per-key
+    /// reference on this thread while set.
+    pub(super) static PER_KEY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`walked`] with stage 1's text given.
 fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -> String {
+    let thread_root = |r: &str| is_private(&format!("{r}.root"));
+    format!(
+        "WITH RECURSIVE c AS MATERIALIZED ({c}), \
+         bk AS MATERIALIZED ( \
+           SELECT DISTINCT c.reply_parent_uri AS parent, c.reply_root_uri AS root, NULL::text AS owner \
+           FROM c WHERE {branch_reply}), \
+         {bcl}, \
+         bkids AS MATERIALIZED ({bkids}), \
+         bd(uri, parent, root, author, audience, ctx, broot, d) AS ( \
+           SELECT r.uri, r.parent, r.root, r.author, r.audience, r.ctx, r.uri, 1 \
+           FROM bcl r WHERE r.uri IS NOT NULL AND {bstop_r} \
+           UNION ALL \
+           SELECT e.uri, e.parent, e.root, e.author, e.audience, x.ctx, x.broot, x.d + 1 \
+           FROM bd x \
+           CROSS JOIN LATERAL jsonb_to_recordset((SELECT m FROM bkids) -> (x.uri || ' ' || x.ctx)) \
+                AS e(uri text, parent text, root text, author text, audience text) \
+           WHERE x.d < {cap} AND NOT {bstop_e}), \
+         bdm AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg(b.uri || ' ' || b.ctx, b.broot), '{{}}'::jsonb) AS m FROM bd b \
+           WHERE b.uri IS NOT NULL AND b.ctx IS NOT NULL), \
+         akm AS MATERIALIZED ({anchors}), \
+         gm AS MATERIALIZED ({AUDIENCE_KEYS}), \
+         s1 AS MATERIALIZED ( \
+           SELECT c.*, an.uri AS anchor, an.author_did AS owner, an.audience_uri AS gov, \
+                  COALESCE(CASE WHEN c.author_did = $1 THEN {gate} ELSE {stage1} END, false) AS s1ok, \
+                  COALESCE({walks}, true) AS walks \
+           FROM c {join} {s1_filter}), \
+         wk AS MATERIALIZED ( \
+           SELECT {wk_cols} FROM ( \
+             SELECT DISTINCT {wk_c} \
+             FROM s1 WHERE s1.s1ok AND s1.walks AND s1.author_did <> $1) x), \
+         wkm AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg(k.parent || ' ' || k.root, true), '{{}}'::jsonb) AS m FROM wk k \
+           WHERE k.parent IS NOT NULL AND k.root IS NOT NULL), \
+         wbm AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg(k.root || ' ' || k.anchor, jsonb_build_object('owner', k.owner, 'gov', k.gov)), '{{}}'::jsonb) AS m \
+           FROM wk k WHERE k.root IS NOT NULL AND k.anchor IS NOT NULL AND NOT {wk_thread}), \
+         wtm AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg(k.root, jsonb_build_object('owner', k.owner, 'gov', k.gov)), '{{}}'::jsonb) AS m \
+           FROM wk k WHERE k.root IS NOT NULL AND {wk_thread}), \
+         tk AS MATERIALIZED (SELECT DISTINCT k.parent, k.root, k.owner FROM wk k WHERE {wk_thread}), \
+         {tcl}, \
+         tkids AS MATERIALIZED ({tkids}), \
+         am AS MATERIALIZED ( \
+           SELECT q.d, q.o, q.g, COALESCE( \
+             NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = q.d AND l.val = '!takedown') \
+             AND (q.d = q.o OR ( \
+               COALESCE((SELECT x.account_status FROM actors x WHERE x.did = q.d), 'active') NOT IN {HIDING_STATUSES} \
+               AND NOT {reader_author} \
+               AND NOT {author_owner} \
+               AND {standing})), false) AS ok \
+           FROM (SELECT y.d COLLATE \"default\" AS d, y.o COLLATE \"default\" AS o, y.g COLLATE \"default\" AS g FROM ( \
+                 SELECT DISTINCT u.d COLLATE \"C\" AS d, u.o COLLATE \"C\" AS o, u.g COLLATE \"C\" AS g FROM ( \
+                   SELECT b.author AS d, v.v ->> 'owner' AS o, v.v ->> 'gov' AS g \
+                   FROM bd b CROSS JOIN LATERAL (SELECT (SELECT m FROM wbm) -> (b.ctx || ' ' || b.broot) AS v OFFSET 0) v \
+                   WHERE v.v IS NOT NULL \
+                   UNION ALL \
+                   SELECT r.author, r.owner, (SELECT m FROM wtm) -> r.ctx ->> 'gov' FROM tcl r WHERE r.uri IS NOT NULL) u \
+                 WHERE u.d IS NOT NULL AND u.o IS NOT NULL AND u.g IS NOT NULL) y) q \
+           LEFT JOIN private_audiences a ON a.uri = q.g \
+           LEFT JOIN LATERAL (SELECT CASE WHEN a.mode = 'following' THEN {owner_verified} END AS ok) fv ON true), \
+         amm AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg(am.d || ' ' || am.o || ' ' || am.g, am.ok), '{{}}'::jsonb) AS m FROM am), \
+         wd(uri, ctx, owner, gov, d) AS ( \
+           SELECT s.uri, s.ctx, s.owner, s.gov, 1 FROM ( \
+             SELECT * FROM ( \
+               SELECT b.uri, b.root, b.author, b.audience, b.ctx, gv.v ->> 'owner' AS owner, gv.v ->> 'gov' AS gov \
+               FROM bd b CROSS JOIN LATERAL (SELECT (SELECT m FROM wbm) -> (b.ctx || ' ' || b.uri) AS v OFFSET 0) gv \
+               WHERE b.d = 1 AND gv.v IS NOT NULL \
+               UNION ALL \
+               SELECT r.uri, r.root, r.author, r.audience, r.ctx, r.owner, (SELECT m FROM wtm) -> r.ctx ->> 'gov' \
+               FROM tcl r WHERE r.uri IS NOT NULL AND {tstop_r}) u \
+             OFFSET 0) s \
+           WHERE {ok_s} \
+           UNION ALL \
+           SELECT e.uri, x.ctx, x.owner, x.gov, x.d + 1 \
+           FROM wd x \
+           CROSS JOIN LATERAL jsonb_to_recordset( \
+                  (CASE WHEN {x_thread} THEN (SELECT m FROM tkids) ELSE (SELECT m FROM bkids) END) -> (x.uri || ' ' || x.ctx)) \
+                AS e(uri text, parent text, root text, author text, audience text) \
+           WHERE x.d < {cap} \
+             AND NOT (CASE WHEN {x_thread} THEN {tstop_e} ELSE {bstop_e} END) \
+             AND {ok_e}), \
+         pvm AS MATERIALIZED ( \
+           SELECT COALESCE(jsonb_object_agg(w.uri || ' ' || w.ctx, true), '{{}}'::jsonb) AS m FROM wd w \
+           WHERE w.uri IS NOT NULL AND w.ctx IS NOT NULL AND (SELECT m FROM wkm) ? (w.uri || ' ' || w.ctx)) \
+         {final_}",
+        branch_reply = is_branch_reply("c"),
+        wk_c = "s1.reply_parent_uri COLLATE \"C\" AS parent, s1.reply_root_uri COLLATE \"C\" AS root, \
+                s1.anchor COLLATE \"C\" AS anchor, s1.owner COLLATE \"C\" AS owner, s1.gov COLLATE \"C\" AS gov",
+        wk_cols = "x.parent COLLATE \"default\" AS parent, x.root COLLATE \"default\" AS root, \
+                   x.anchor COLLATE \"default\" AS anchor, x.owner COLLATE \"default\" AS owner, x.gov COLLATE \"default\" AS gov",
+        bcl = climb("bcl", "bk", false, cap),
+        bkids = kids("bcl"),
+        bstop_r = bstop("r.parent"),
+        bstop_e = bstop("e.parent"),
+        gate = gate("c.uri", "c.author_did", "po.account_status"),
+        walks = needs_walk(),
+        anchors = anchor_keys(s1_filter, &br_of_c("bdm")),
+        join = anchor_join(&br_of_c("bdm")),
+        wk_thread = thread_root("k"),
+        tcl = climb("tcl", "tk", true, cap),
+        tkids = kids("tcl"),
+        reader_author = blocked("$1", "q.d"),
+        author_owner = blocked("q.d", "q.o"),
+        standing = standing("q.d", "q.o", "COALESCE(fv.ok, false)", false),
+        owner_verified = follows_verified("q.o"),
+        ok_s = walk_ok("s", "s.ctx", "s.owner", "s.gov"),
+        tstop_r = tstop("r", "r.ctx", "r.owner"),
+        x_thread = is_private("x.ctx"),
+        tstop_e = tstop("e", "x.ctx", "x.owner"),
+        ok_e = walk_ok("e", "x.ctx", "x.owner", "x.gov"),
+    )
+}
+
+/// S12's statement as built before the shared walk (shared-walk T-60's
+/// reference): one branch-root lookup and one walk per distinct key, as
+/// correlated SubPlans.
+#[cfg(test)]
+pub(super) fn walked_per_key(c: &str, s1_filter: &str, final_: &str, cap: u32) -> String {
+    walked_per_key_with(c, s1_filter, final_, cap, &stage1_ok())
+}
+
+/// The one-row form of [`walked`], for fact 8 (#720, B-5's ordinary
+/// pages): with at most one row in `c` there is at most one key, so the
+/// shared climb has nothing to share, and S12's per-key form gives the same
+/// verdict (T-60 holds the two equal on every statement) with a smaller
+/// plan. The oracle reads fact 8 once per pipeline read, so the larger
+/// plan's executor start-up cost about 0.2 ms a read. Use only where `c`
+/// holds at most one row: the per-key walk is not bounded by the chunk rule.
+pub(super) fn walked_one(c: &str, s1_filter: &str, final_: &str, cap: u32) -> String {
+    walked_per_key_with(c, s1_filter, final_, cap, &stage1_ok())
+}
+
+/// [`walked_per_key`] with stage 1's text given.
+fn walked_per_key_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -> String {
     format!(
         "WITH c AS MATERIALIZED ({c}), \
          br AS MATERIALIZED ( \
@@ -748,8 +1013,8 @@ fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -
         branch_reply = is_branch_reply("c"),
         gate = gate("c.uri", "c.author_did", "po.account_status"),
         walks = needs_walk(),
-        anchors = anchor_keys(s1_filter),
-        join = anchor_join(),
+        anchors = anchor_keys(s1_filter, &br_of_c("brm")),
+        join = anchor_join(&br_of_c("brm")),
         verdict = parent_verdict(cap),
         owner_verified = follows_verified("k.owner"),
         br_key = pair_key("br.parent", "br.root"),
@@ -773,7 +1038,12 @@ pub(super) struct Fact8 {
 /// whenever the post is stored, with no WHERE on the verdict.
 pub(super) fn fact8_statement(cap: u32) -> String {
     let c = format!("SELECT {COLS} FROM private_posts p WHERE p.uri = $2");
-    let final_ = format!(
+    walked_one(&c, "", &fact8_final(), cap)
+}
+
+/// Fact 8's final SELECT over [`PV_JOIN`], one row per `s1` row.
+pub(super) fn fact8_final() -> String {
+    format!(
         "SELECT s1.owner, s1.gov, s1.s1ok, COALESCE(s1.s1ok AND (NOT s1.walks OR pv.ok), false), \
            COALESCE(an.uri IS NOT NULL AND {role} AND {anchor_owned} AND {post_owned} AND {anchor_gate}, false) \
          FROM {PV_JOIN} LEFT JOIN private_posts an ON an.uri = s1.anchor",
@@ -781,8 +1051,7 @@ pub(super) fn fact8_statement(cap: u32) -> String {
         anchor_owned = owned("an.audience_uri", "an.author_did"),
         post_owned = owned("s1.audience_uri", "an.author_did"),
         anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
-    );
-    walked(&c, "", &final_, cap)
+    )
 }
 
 /// Fact 8 for `reader` and the post `uri`; the default when no row is
@@ -806,7 +1075,7 @@ pub(super) async fn fact8(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> R
 /// The batch loop (§3.2.1): a batched shape's `c` rows are evaluated in
 /// batches, in the shape's key order, until `need` rows pass or the rows run
 /// out. The first batch is `first` rows, and each later one twice the last,
-/// up to `max`; the next batch starts after the last `c` row examined, whether
+/// every one at most `max`; the next batch starts after the last `c` row examined, whether
 /// it passed or not. Every row passes or fails by the predicate it would face
 /// alone, so the rows returned are the first `need` that pass, as
 /// row-at-a-time evaluation gives.
@@ -827,7 +1096,8 @@ where
     Fut: std::future::Future<Output = Result<Vec<(R, bool)>, sqlx::Error>>,
 {
     let mut out = Vec::new();
-    let mut size = first.max(1);
+    // No batch is larger than `max` (shared-walk §2.5), the first included.
+    let mut size = first.max(1).min(max.max(1));
     while out.len() < need {
         let rows = batch(after.take(), size).await?;
         let examined = rows.len();
@@ -851,8 +1121,18 @@ where
 pub(super) struct ReadBounds {
     /// `private_read.max_chain`.
     pub max_chain: u32,
-    /// `private_read.walk_batch_max`.
+    /// `private_read.walk_batch_max`, at most K (shared-walk §2.5).
     pub batch_max: i64,
+}
+
+impl ReadBounds {
+    /// The bounds for `max_chain` and `walk_batch_max`: no batch holds more
+    /// than [`climb_keys`] rows, each of which gives at most one start
+    /// parent.
+    pub(super) fn new(max_chain: u32, walk_batch_max: u32) -> Self {
+        let k = i64::try_from(climb_keys(max_chain)).unwrap_or(i64::MAX);
+        Self { max_chain, batch_max: i64::from(walk_batch_max.max(1)).min(k) }
+    }
 }
 
 /// HEAD's §6.9 candidate prefilter before S12, kept for the B-5 and T-54
@@ -1179,6 +1459,8 @@ pub(super) fn pre_s12_count_sql() -> String {
     );
     let stage1 = stage1_terms(false).join(" AND ");
     let s12 = "COALESCE(s1.s1ok AND (NOT s1.walks OR pv.ok), false)";
+    // The per-key reference on this thread when T-60 asks for it.
+    let walked_with = if PER_KEY.with(std::cell::Cell::get) { walked_per_key_with } else { walked_with };
     let at16 = walked_with(
         &c,
         "",
@@ -1284,11 +1566,46 @@ pub(super) fn prefilter_uris_statement(cap: u32) -> String {
 ///
 /// Database errors.
 pub(super) async fn prefilter_uris(pool: &PgPool, requester: &str, uris: &[String], cap: u32) -> Result<Vec<String>, sqlx::Error> {
+    prefilter_uris_sliced(pool, requester, uris, cap, climb_keys(cap)).await
+}
+
+/// [`prefilter_uris`] with K given (shared-walk §2.5): an input of more
+/// than `k` URIs is read in slices of `k`, in one [`SLICED`] transaction.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn prefilter_uris_sliced(
+    pool: &PgPool,
+    requester: &str,
+    uris: &[String],
+    cap: u32,
+    k: usize,
+) -> Result<Vec<String>, sqlx::Error> {
     if uris.is_empty() {
         return Ok(Vec::new());
     }
-    sqlx::query_scalar(&prefilter_uris_statement(cap)).bind(requester).bind(uris).fetch_all(pool).await
+    let sql = prefilter_uris_statement(cap);
+    if uris.len() <= k {
+        return sqlx::query_scalar(&sql).bind(requester).bind(uris).fetch_all(pool).await;
+    }
+    // Each URI once, so that no row is returned by two slices.
+    let mut distinct = uris.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let mut tx = pool.begin_with(SLICED).await?;
+    let mut out = Vec::new();
+    for slice in distinct.chunks(k.max(1)) {
+        let rows: Vec<String> = sqlx::query_scalar(&sql).bind(requester).bind(slice).fetch_all(&mut *tx).await?;
+        out.extend(rows);
+    }
+    tx.commit().await?;
+    Ok(out)
 }
+
+/// How a statement split into slices begins (shared-walk §2.5): every
+/// slice and the public term read one snapshot, in one round trip.
+const SLICED: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
 
 /// `getReplies`' page statement (§3.2): `$1` the reader, `$2` the parent,
 /// `$3` the hidden replies, `$4`/`$5` the position, `$6` the batch.
@@ -1886,15 +2203,49 @@ fn counted_quote_ref() -> String {
 ///
 /// Database errors.
 pub(super) async fn counts(pool: &PgPool, reader: &str, uris: &[String], cap: u32) -> Result<HashMap<String, Counts>, sqlx::Error> {
+    counts_sliced(pool, reader, uris, cap, climb_keys(cap), None).await
+}
+
+/// [`counts`] with K given (shared-walk §2.5). `replyCount` reads `uris`
+/// in slices of `k` past `k`; `quoteCount` always takes its keys, then its
+/// slices of at most `k`, then the public references, each in one
+/// [`SLICED`] transaction. `between`, tests only (T-63), is run on the pool
+/// after the first quote slice.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn counts_sliced(
+    pool: &PgPool,
+    reader: &str,
+    uris: &[String],
+    cap: u32,
+    k: usize,
+    between: Option<&str>,
+) -> Result<HashMap<String, Counts>, sqlx::Error> {
     let mut out: HashMap<String, Counts> = HashMap::new();
     if uris.is_empty() {
         return Ok(out);
     }
-    let replies: Vec<(String, i64)> = sqlx::query_as(&reply_counts_statement(cap))
-        .bind(reader)
-        .bind(uris)
-        .fetch_all(pool)
-        .await?;
+    let k = k.max(1);
+    let reply_sql = reply_counts_statement(cap);
+    let replies: Vec<(String, i64)> = if uris.len() <= k {
+        sqlx::query_as(&reply_sql).bind(reader).bind(uris).fetch_all(pool).await?
+    } else {
+        // Each parent once, so that each parent's replies are all in its
+        // own slice.
+        let mut distinct = uris.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut tx = pool.begin_with(SLICED).await?;
+        let mut rows = Vec::new();
+        for slice in distinct.chunks(k) {
+            let part: Vec<(String, i64)> = sqlx::query_as(&reply_sql).bind(reader).bind(slice).fetch_all(&mut *tx).await?;
+            rows.extend(part);
+        }
+        tx.commit().await?;
+        rows
+    };
     for (uri, n) in replies {
         out.entry(uri).or_default().reply = n;
     }
@@ -1916,15 +2267,98 @@ pub(super) async fn counts(pool: &PgPool, reader: &str, uris: &[String], cap: u3
             }
         }
     }
-    let quotes: Vec<(String, i64)> = sqlx::query_as(&quote_counts_statement(cap))
-        .bind(reader)
-        .bind(uris)
-        .fetch_all(pool)
-        .await?;
+    // At most K keys: one statement, one snapshot, no slice.
+    let bounded: Vec<(Option<String>, i64, bool)> =
+        sqlx::query_as(&quote_counts_bounded_statement(cap, k)).bind(reader).bind(uris).fetch_all(pool).await?;
+    if !bounded.iter().any(|(_, _, over)| *over) {
+        for (uri, n, _) in bounded {
+            if let Some(uri) = uri {
+                out.entry(uri).or_default().quote = n;
+            }
+        }
+        return Ok(out);
+    }
+    let mut tx = pool.begin_with(SLICED).await?;
+    let keys: Vec<String> = sqlx::query_scalar(QUOTE_KEYS).bind(uris).fetch_all(&mut *tx).await?;
+    let slice_sql = quote_counts_slice_statement(cap);
+    let mut quotes: HashMap<String, i64> = HashMap::new();
+    for (i, slice) in keys.chunks(k).enumerate() {
+        let rows: Vec<(String, i64)> = sqlx::query_as(&slice_sql).bind(reader).bind(uris).bind(slice).fetch_all(&mut *tx).await?;
+        for (uri, n) in rows {
+            *quotes.entry(uri).or_default() += n;
+        }
+        if i == 0
+            && let Some(sql) = between
+        {
+            sqlx::query(sql).execute(pool).await?;
+        }
+    }
+    let refs: Vec<(String, i64)> = sqlx::query_as(&quote_refs_statement()).bind(reader).bind(uris).fetch_all(&mut *tx).await?;
+    tx.commit().await?;
+    for (uri, n) in refs {
+        *quotes.entry(uri).or_default() += n;
+    }
     for (uri, n) in quotes {
         out.entry(uri).or_default().quote = n;
     }
     Ok(out)
+}
+
+/// `k` as an SQL literal, kept inside `bigint`.
+fn k_literal(k: usize) -> u64 {
+    u64::try_from(k).unwrap_or(u64::MAX).min(1 << 40)
+}
+
+/// `quoteCount` in one statement when it has at most `k` private keys
+/// (#720, B-5's ordinary pages): `c` reads at most `k` + 1 of them, and the
+/// final answers HEAD's single statement when `c` holds at most `k`, else
+/// one row flagged over, with nothing walked (the gate is a one-time
+/// filter). One statement reads one snapshot, and no statement climbs from
+/// more than K start parents, so §2.5's rule holds without the slices'
+/// round trips. `$1` the reader, `$2` the quoted posts.
+pub(super) fn quote_counts_bounded_statement(cap: u32, k: usize) -> String {
+    let k = k_literal(k);
+    walked(
+        &format!("SELECT {COLS}, p.quote_uri FROM private_posts p WHERE p.quote_uri = ANY($2) LIMIT {}", k + 1),
+        "",
+        &format!(
+            "SELECT x.quoted, x.n, false FROM ( \
+               SELECT quoted, count(*) AS n FROM ( \
+                 SELECT s1.quote_uri AS quoted FROM {PV_JOIN} WHERE {PASS} \
+                 UNION ALL \
+                 SELECT q.quoted_uri FROM private_quote_refs q WHERE q.quoted_uri = ANY($2) AND {counted} \
+               ) y GROUP BY quoted) x \
+             WHERE (SELECT count(*) FROM c) <= {k} \
+             UNION ALL \
+             SELECT NULL, 0, true WHERE (SELECT count(*) FROM c) > {k}",
+            counted = counted_quote_ref(),
+        ),
+        cap,
+    )
+}
+
+/// `quoteCount`'s keys (shared-walk §2.5): `$1` the quoted posts; one scan
+/// of `private_posts_quote`.
+const QUOTE_KEYS: &str = "SELECT p.uri FROM private_posts p WHERE p.quote_uri = ANY($1)";
+
+/// One slice of `quoteCount`'s private term (§3.2; shared-walk §2.5): `$1`
+/// the reader, `$2` the quoted posts, `$3` the slice of keys.
+pub(super) fn quote_counts_slice_statement(cap: u32) -> String {
+    walked(
+        &format!("SELECT {COLS}, p.quote_uri FROM private_posts p WHERE p.quote_uri = ANY($2) AND p.uri = ANY($3)"),
+        "",
+        &format!("SELECT s1.quote_uri, count(*) FROM {PV_JOIN} WHERE {PASS} GROUP BY s1.quote_uri"),
+        cap,
+    )
+}
+
+/// `quoteCount`'s public term, HEAD's refs arm in its own statement: `$1`
+/// the reader, `$2` the quoted posts.
+pub(super) fn quote_refs_statement() -> String {
+    format!(
+        "SELECT q.quoted_uri, count(*) FROM private_quote_refs q WHERE q.quoted_uri = ANY($2) AND {counted} GROUP BY q.quoted_uri",
+        counted = counted_quote_ref(),
+    )
 }
 
 /// `replyCount`'s statement (§3.2): `$1` the reader, `$2` the parents; one
@@ -1938,7 +2372,10 @@ pub(super) fn reply_counts_statement(cap: u32) -> String {
     )
 }
 
-/// `quoteCount`'s statement (§3.2): `$1` the reader, `$2` the quoted posts.
+/// `quoteCount`'s single statement as it stood before the slices
+/// (shared-walk T-60, T-63's reference): `$1` the reader, `$2` the quoted
+/// posts.
+#[cfg(test)]
 pub(super) fn quote_counts_statement(cap: u32) -> String {
     walked(
         &format!("SELECT {COLS}, p.quote_uri FROM private_posts p WHERE p.quote_uri = ANY($2)"),
@@ -2282,9 +2719,11 @@ pub(super) async fn update_seen(pool: &PgPool, did: &str, seen_at: DateTime<Utc>
 /// The unseen-row condition of `getUnreadCount` for the recipient `$1`.
 const UNSEEN: &str = "n.indexed_at > COALESCE((SELECT seen_at FROM private_notification_seen WHERE did = $1), '-infinity')";
 
-/// `getUnreadCount`'s statement (§3.2): `$1` the recipient. `c` is the
+/// `getUnreadCount`'s single statement as it stood before the slices
+/// (shared-walk T-60, T-63's reference): `$1` the recipient. `c` is the
 /// private-post rows of the unseen notifications, one per notification;
 /// the second term is HEAD's public-record arm unchanged.
+#[cfg(test)]
 pub(super) fn unread_statement(cap: u32) -> String {
     let kept = notification_kept();
     walked(
@@ -2315,5 +2754,109 @@ pub(super) fn unread_statement(cap: u32) -> String {
 ///
 /// Database errors.
 pub(super) async fn unread_count(pool: &PgPool, recipient: &str, cap: u32) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(&unread_statement(cap)).bind(recipient).fetch_one(pool).await
+    unread_count_sliced(pool, recipient, cap, climb_keys(cap), None).await
+}
+
+/// [`unread_count`] with K given (shared-walk §2.5): the unseen
+/// private-post rows' ids in one scan, then the walked statement over
+/// slices of at most `k` ids, then the public-record term, in one
+/// [`SLICED`] transaction. `between`, tests only (T-63), is run on the pool
+/// after the first slice.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn unread_count_sliced(
+    pool: &PgPool,
+    recipient: &str,
+    cap: u32,
+    k: usize,
+    between: Option<&str>,
+) -> Result<i64, sqlx::Error> {
+    // At most K candidates: one statement, one snapshot, no slice.
+    let bounded: Option<i64> = sqlx::query_scalar(&unread_bounded_statement(cap, k)).bind(recipient).fetch_one(pool).await?;
+    if let Some(n) = bounded {
+        return Ok(n);
+    }
+    let mut tx = pool.begin_with(SLICED).await?;
+    let ids: Vec<i64> = sqlx::query_scalar(&unread_keys_statement()).bind(recipient).fetch_all(&mut *tx).await?;
+    let slice_sql = unread_slice_statement(cap);
+    let mut total = 0i64;
+    for (i, slice) in ids.chunks(k.max(1)).enumerate() {
+        let n: i64 = sqlx::query_scalar(&slice_sql).bind(recipient).bind(slice).fetch_one(&mut *tx).await?;
+        total += n;
+        if i == 0
+            && let Some(sql) = between
+        {
+            sqlx::query(sql).execute(pool).await?;
+        }
+    }
+    let public: i64 = sqlx::query_scalar(&unread_public_statement()).bind(recipient).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(total + public)
+}
+
+/// `getUnreadCount` in one statement when it has at most `k` private-post
+/// candidates (#720, as [`quote_counts_bounded_statement`]): `c` reads at
+/// most `k` + 1, and the count is NULL, with nothing walked, when it holds
+/// more. `$1` the recipient.
+pub(super) fn unread_bounded_statement(cap: u32, k: usize) -> String {
+    let k = k_literal(k);
+    let kept = notification_kept();
+    walked(
+        &format!(
+            "SELECT {COLS}, n.id FROM private_notifications n JOIN private_posts p ON p.uri = n.record_uri \
+             WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN} \
+               AND split_part(n.record_uri, '/', 4) = '{NSID_POST_PRIVATE}' LIMIT {}",
+            k + 1
+        ),
+        "",
+        &format!(
+            "SELECT CASE WHEN (SELECT count(*) FROM c) > {k} THEN NULL ELSE \
+               (SELECT count(*) FROM {PV_JOIN} WHERE {PASS}) \
+               + (SELECT count(*) FROM private_notifications n WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN} \
+                    AND split_part(n.record_uri, '/', 4) IS DISTINCT FROM '{NSID_POST_PRIVATE}' \
+                    AND EXISTS (SELECT 1 FROM private_posts s WHERE s.uri = n.reason_subject)) END"
+        ),
+        cap,
+    )
+}
+
+/// The unseen private-post rows of `getUnreadCount`'s recipient `$1`
+/// (shared-walk §2.5): one scan of `private_notifications_recipient`,
+/// without [`notification_kept`].
+pub(super) fn unread_keys_statement() -> String {
+    format!(
+        "SELECT n.id FROM private_notifications n WHERE n.recipient_did = $1 AND {UNSEEN} \
+           AND split_part(n.record_uri, '/', 4) = '{NSID_POST_PRIVATE}'"
+    )
+}
+
+/// One slice of `getUnreadCount`'s private term (§3.2; shared-walk §2.5):
+/// `$1` the recipient, `$2` the slice of ids; `c` is the private-post rows
+/// of the unseen notifications, one per notification, every condition of
+/// the single statement kept.
+pub(super) fn unread_slice_statement(cap: u32) -> String {
+    walked(
+        &format!(
+            "SELECT {COLS}, n.id FROM private_notifications n JOIN private_posts p ON p.uri = n.record_uri \
+             WHERE n.recipient_did = $1 AND n.id = ANY($2) AND {kept} AND {UNSEEN} \
+               AND split_part(n.record_uri, '/', 4) = '{NSID_POST_PRIVATE}'",
+            kept = notification_kept(),
+        ),
+        "",
+        &format!("SELECT count(*) FROM {PV_JOIN} WHERE {PASS}"),
+        cap,
+    )
+}
+
+/// `getUnreadCount`'s public-record term, HEAD's arm in its own statement:
+/// `$1` the recipient.
+pub(super) fn unread_public_statement() -> String {
+    format!(
+        "SELECT count(*) FROM private_notifications n WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN} \
+           AND split_part(n.record_uri, '/', 4) IS DISTINCT FROM '{NSID_POST_PRIVATE}' \
+           AND EXISTS (SELECT 1 FROM private_posts s WHERE s.uri = n.reason_subject)",
+        kept = notification_kept(),
+    )
 }

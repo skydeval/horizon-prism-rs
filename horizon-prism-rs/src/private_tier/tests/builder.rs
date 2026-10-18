@@ -6,10 +6,17 @@
 
 use super::*;
 
+/// Fact 8's final over the shared walk (`$2` the post): the statement fact
+/// 8's one-row form stands in for.
+fn shared_one_row(cap: u32) -> String {
+    schema::walked(&format!("SELECT {} FROM private_posts p WHERE p.uri = $2", schema::COLS), "", &schema::fact8_final(), cap)
+}
+
 /// Every statement of §3.2 for the cap `cap`, by name.
 fn statements(cap: u32) -> Vec<(&'static str, String)> {
     vec![
         ("fact 8", schema::fact8_statement(cap)),
+        ("fact 8, shared form", shared_one_row(cap)),
         ("prefilter_uris", schema::prefilter_uris_statement(cap)),
         ("getReplies page", schema::reply_page_statement(cap)),
         ("search", schema::search_statement(cap)),
@@ -19,14 +26,18 @@ fn statements(cap: u32) -> Vec<(&'static str, String)> {
         ("timeline", schema::timeline_statement(cap)),
         ("getQuotes", schema::quote_statement(cap)),
         ("replyCount", schema::reply_counts_statement(cap)),
-        ("quoteCount", schema::quote_counts_statement(cap)),
-        ("getUnreadCount", schema::unread_statement(cap)),
+        ("quoteCount slice", schema::quote_counts_slice_statement(cap)),
+        ("getUnreadCount slice", schema::unread_slice_statement(cap)),
+        ("quoteCount bounded", schema::quote_counts_bounded_statement(cap, schema::climb_keys(cap))),
+        ("getUnreadCount bounded", schema::unread_bounded_statement(cap, schema::climb_keys(cap))),
     ]
 }
 
 /// T-52: every statement `PREPARE`s against the migrated database, which
 /// checks every column and alias it names (§3.1's table), and so do the
-/// pre-release counts.
+/// pre-release counts and the slices' plain statements. The climb's window
+/// over the working table and its `UNION` are where an unsupported
+/// construct would fail (shared-walk §9): they prepare.
 #[tokio::test]
 async fn t52_every_statement_prepares() {
     let Some(db) = fresh_db("t52-prepare").await else {
@@ -35,6 +46,9 @@ async fn t52_every_statement_prepares() {
     let mut conn = db.pool.acquire().await.expect("conn");
     let mut all = statements(CAP);
     all.extend(statements(100));
+    all.push(("quoteCount refs", schema::quote_refs_statement()));
+    all.push(("getUnreadCount keys", schema::unread_keys_statement()));
+    all.push(("getUnreadCount public term", schema::unread_public_statement()));
     all.push(("pre-S12 count", schema::pre_s12_count_sql()));
     all.push(("pre-S12 owner audiences", schema::pre_s12_owner_audience_sql()));
     for (i, (name, sql)) in all.iter().enumerate() {
@@ -261,7 +275,8 @@ async fn explain(pool: &PgPool, sql: &str, reader: &str, uris: &[String]) -> Val
 /// `private_blocks` or `labels` probe in `s1`, and rows the gate hides cost
 /// no block probe. On owner rows, rule 7's V–O term is guarded: 4 block
 /// probes a row (rule 4's pair), not 8; with V blocking O, an owner row
-/// still misses, through rule 4.
+/// still misses, through rule 4. The branch climb (`bcl`) reads
+/// `private_posts` only (shared-walk T-52).
 #[tokio::test]
 async fn t52_the_cheapest_terms_run_first() {
     let Some(mut w) = Walk::new_in("t52-order", PublicMode::On, Layout::SamePds, Some("list"), &[BOB], &[], Arc::new(NoHeads)).await else {
@@ -290,6 +305,20 @@ async fn t52_the_cheapest_terms_run_first() {
     let read = probes(&explain(&pool, &sql, BOB, &rows).await);
     w.check(!read.iter().any(|(r, loops)| ["blocks", "private_blocks"].contains(&r.as_str()) && *loops > 0), format!("gated: {read:?}"));
     exec(&pool, "DELETE FROM labels").await;
+    // The branch climb reads nothing reader-relative (shared-walk T-52).
+    let x = format!("at://{CAROL}/{PUBLIC_POST}/3kt52clim");
+    let mut branch = Vec::new();
+    for i in 0..5 {
+        let p = branch.last().cloned().unwrap_or_else(|| x.clone());
+        branch.push(w.f.private_post(ALICE, &format!("3kt52c{i}222222"), &aud, Some((&x, &p))).await);
+    }
+    let plan = explain(&pool, &sql, DAVE, &branch).await;
+    let mut read = Vec::new();
+    relations_read(cte(&plan, "bcl").expect("CTE bcl"), &mut read);
+    w.check(
+        read.iter().all(|(r, _)| r == "private_posts") && read.iter().any(|(_, loops)| *loops > 0),
+        format!("the branch climb reads: {read:?}"),
+    );
     // Owner rows: the block lookups that run are rule 4's four (PostgreSQL
     // may hash each one, running it once for every row); rule 7's V–O four
     // never run.
@@ -341,37 +370,33 @@ async fn t52_the_reorder_is_an_equivalence() {
     w.finish().await;
 }
 
-/// The walk SubPlans of the CTE `name`: the `Actual Loops` of each SubPlan
-/// holding a recursive union, and the rows its aggregate returned.
-fn walk_loops(plan: &Value, name: &str) -> (Vec<u64>, u64) {
-    fn has_recursion(node: &Value) -> bool {
-        node["Node Type"] == "Recursive Union" || node["Plans"].as_array().into_iter().flatten().any(has_recursion)
+/// The SubPlans in `node` (correlated subqueries run per outer row) whose
+/// subtree scans `private_posts`, by node type and loops.
+fn walk_subplans(node: &Value, out: &mut Vec<String>) {
+    fn reads_posts(node: &Value) -> bool {
+        node["Relation Name"] == "private_posts" || node["Plans"].as_array().into_iter().flatten().any(reads_posts)
     }
-    fn find(node: &Value, loops: &mut Vec<u64>, aggregated: &mut u64) {
-        if node["Parent Relationship"] == "SubPlan" && has_recursion(node) {
-            loops.push(node["Actual Loops"].as_u64().unwrap_or(0));
-            return;
-        }
-        if matches!(node["Node Type"].as_str(), Some("Aggregate" | "Unique")) {
-            *aggregated = node["Actual Rows"].as_u64().unwrap_or(0) * node["Actual Loops"].as_u64().unwrap_or(0);
-        }
-        for child in node["Plans"].as_array().into_iter().flatten() {
-            find(child, loops, aggregated);
-        }
+    if node["Parent Relationship"] == "SubPlan" && reads_posts(node) {
+        out.push(format!("{} {} loops {}", node["Subplan Name"], node["Node Type"], node["Actual Loops"]));
     }
-    let (mut loops, mut aggregated) = (Vec::new(), 0);
-    if let Some(node) = cte(plan, name) {
-        find(node, &mut loops, &mut aggregated);
+    for child in node["Plans"].as_array().into_iter().flatten() {
+        walk_subplans(child, out);
     }
-    (loops, aggregated)
 }
 
-/// T-52 (one walk per key, review 12, LB1): `replyCount`'s statement over
-/// 5 000 owner branch replies under one node runs the branch-root lookup
-/// and the walk once each; over 50 replies by others under 7 parents, the
-/// walk runs 7 times. Each SubPlan's loops equal its aggregate's rows.
+/// The `Actual Loops` of every scan of `relation` under `node`.
+fn loops_of(node: &Value, relation: &str) -> u64 {
+    let own = if node["Relation Name"] == relation { node["Actual Loops"].as_u64().unwrap_or(0) } else { 0 };
+    own + node["Plans"].as_array().into_iter().flatten().map(|c| loops_of(c, relation)).sum::<u64>()
+}
+
+/// T-52 (shared-walk §7, replacing "one walk per key"): `replyCount`'s
+/// statement over 5 000 owner branch replies under one node, and over 50
+/// replies by others under 7 parents, runs no SubPlan that scans
+/// `private_posts`; each climb's primary-key probes are at most its
+/// distinct start parents plus its node rows (T-61's bound).
 #[tokio::test]
-async fn t52_one_walk_per_key() {
+async fn t52_no_walk_runs_per_key() {
     let Some(mut w) = Walk::new_in("t52-per-key", PublicMode::On, Layout::SamePds, Some("followers"), &[], &[], Arc::new(NoHeads)).await else {
         return;
     };
@@ -399,13 +424,66 @@ async fn t52_one_walk_per_key() {
     }
     w.f.ready_all().await;
     let sql = schema::reply_counts_statement(CAP);
-    let plan = explain(&w.f.pool, &sql, DAVE, std::slice::from_ref(&node)).await;
-    let (br, br_rows) = walk_loops(&plan, "br");
-    let (pv, pv_rows) = walk_loops(&plan, "pv");
-    w.check(br == [1] && br_rows == 1 && pv == [1] && pv_rows == 1, format!("5 000 siblings: br {br:?}/{br_rows}, pv {pv:?}/{pv_rows}"));
-    let plan = explain(&w.f.pool, &sql, DAVE, &parents).await;
-    let (pv, pv_rows) = walk_loops(&plan, "pv");
-    w.check(pv == [7] && pv_rows == 7, format!("50 rows over 7 keys: pv {pv:?}/{pv_rows}"));
+    let counts = "SELECT (SELECT count(*) FROM bcl WHERE uri IS NOT NULL), (SELECT count(DISTINCT parent) FROM bk), \
+                  (SELECT count(*) FROM tcl WHERE uri IS NOT NULL), (SELECT count(DISTINCT parent) FROM tk)";
+    let c = format!("SELECT {} FROM private_posts p WHERE p.reply_parent_uri = ANY($2)", schema::COLS);
+    for (case, keys) in [("5 000 siblings", vec![node.clone()]), ("50 rows over 7 parents", parents.clone())] {
+        let plan = explain(&w.f.pool, &sql, DAVE, &keys).await;
+        let mut subplans = Vec::new();
+        walk_subplans(&plan, &mut subplans);
+        w.check(subplans.is_empty(), format!("{case}: SubPlans scanning private_posts: {subplans:?}"));
+        let (bn, bs, tn, ts): (i64, i64, i64, i64) =
+            sqlx::query_as(&schema::walked(&c, "", counts, CAP)).bind(DAVE).bind(&keys).fetch_one(&w.f.pool).await.expect("climb counts");
+        for (name, nodes, starts) in [("bcl", bn, bs), ("tcl", tn, ts)] {
+            let probes = cte(&plan, name).map_or(0, |n| loops_of(n, "private_posts"));
+            let bound = u64::try_from(nodes + starts).expect("counts");
+            w.check(probes <= bound, format!("{case}: {name} made {probes} probes over {starts} start parents and {nodes} node rows"));
+        }
+    }
+    w.finish().await;
+}
+
+/// T-52 (the empty climb, shared-walk §7): on fact 8 for a top-level post
+/// both climbs make no probe and return their marker row alone, so
+/// `private_posts` is read only as before the climb. (Fact 8 itself now
+/// runs the one-row form; this is the shared walk over the same row.)
+#[tokio::test]
+async fn t52_the_empty_climb() {
+    let Some(mut w) = Walk::new_in("t52-empty", PublicMode::On, Layout::SamePds, Some("followers"), &[], &[], Arc::new(NoHeads)).await else {
+        return;
+    };
+    let root = w.root.clone();
+    let pool = w.f.pool.clone();
+    let plan: Value = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", shared_one_row(CAP)))
+        .bind(DAVE)
+        .bind(&root)
+        .fetch_one(&pool)
+        .await
+        .expect("explain");
+    let plan = plan[0]["Plan"].clone();
+    for name in ["bcl", "tcl"] {
+        let node = cte(&plan, name);
+        let probes = node.map_or(0, |n| loops_of(n, "private_posts"));
+        let rows = node.and_then(|n| n["Actual Rows"].as_u64());
+        w.check(probes == 0, format!("{name} probed private_posts {probes} times"));
+        w.check(rows.is_none_or(|r| r <= 1), format!("{name} returned {rows:?} rows"));
+    }
+    let c = format!("SELECT {} FROM private_posts p WHERE p.uri = $2", schema::COLS);
+    let (bn, bm, tn, tm): (i64, i64, i64, i64) = sqlx::query_as(&schema::walked(
+        &c,
+        "",
+        "SELECT (SELECT count(*) FROM bcl WHERE uri IS NOT NULL), (SELECT count(*) FROM bcl WHERE uri IS NULL), \
+                (SELECT count(*) FROM tcl WHERE uri IS NOT NULL), (SELECT count(*) FROM tcl WHERE uri IS NULL)",
+        CAP,
+    ))
+    .bind(DAVE)
+    .bind(&root)
+    .fetch_one(&pool)
+    .await
+    .expect("empty climbs");
+    w.check((bn, bm, tn, tm) == (0, 1, 0, 1), format!("the empty climbs: {:?}", (bn, bm, tn, tm)));
+    // The rest are today's: `c`'s row and the final's anchor lookup.
+    println!("T-52 empty climb: fact 8 on a top-level post scanned private_posts {} times", loops_of(&plan, "private_posts"));
     w.finish().await;
 }
 

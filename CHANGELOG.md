@@ -364,6 +364,34 @@ commit.
   --nocapture` and the two printed queries read-only on the deployed
   database before S12 ships; not yet run on prism.
 
+### Changed (shared walk, #720)
+
+- **Private reads walk each chain row once per statement (#720).**
+  A private read statement now climbs every chain key's ancestors
+  together, one primary-key fetch per row however many keys share it,
+  and decides branch roots and walks from what it climbed; each author's
+  standing is tested once per statement. Results are unchanged (checked
+  against the previous statement on 300 seeded random fixtures). On the
+  deploy build, alone p50 before → after:
+  - a 5 000-row branch chain the reader is outside: 1.34 s → 0.30 s at
+    `max_chain` 16, 7.3 s → 0.42 s at 100;
+  - a 5 000-row thread chain of a standing writer: 2.2 s → 0.41 s at 16,
+    11.8 s → 0.49 s at 100;
+  - a 5 000-row branch comb: 12.0 s → 0.61 s at 100;
+  - `getUnreadCount` over 5 000 owner branch replies under distinct
+    parents: 1.8 s → 1.74 s (each branch is its own chain, so nothing is
+    shared).
+  - Grouping and de-duplication inside the walk compare bytes rather than
+    the locale's collation, the same groups at a fraction of the sort cost.
+  - `getUnreadCount` and `quoteCount` answer in one statement when they
+    have at most K candidates (K = 20 000 / `max_chain`), and otherwise
+    read their candidates in slices of K in one read-only snapshot;
+    `replyCount` and `prefilter_uris` split their input past K the same
+    way. Feed and reply batches hold at most K rows.
+  - The oracle's per-post fact reads one row and keeps the per-row walk,
+    which gives the same answer with a smaller plan.
+  No migration and no config key.
+
 ### Fixed (kryphocron 0.4.1)
 
 - **kryphocron 0.4.0 → 0.4.1 (#682).** 0.4.0 panicked instead of erroring
