@@ -58,7 +58,7 @@ use crate::xrpc::backstop::{Backstop, VerifyLimits};
 use crate::xrpc::member_keys::MemberKeys;
 use crate::xrpc::pools::{HostBuckets, RequesterLimit, Shares};
 use crate::xrpc::{AppState, RateLimits};
-use health::{AuditLatch, HealthState};
+use health::{AuditLatch, HealthState, PROBE_TIMEOUT};
 
 /// Exit code for configuration errors and the migration gate (EX_CONFIG).
 pub const EXIT_CONFIG: u8 = 78;
@@ -781,6 +781,7 @@ pub async fn run() -> Result<(), StartupError> {
         trusted_proxy: app.trusted_proxy,
         schema: schema_status,
         public,
+        probe_timeout: PROBE_TIMEOUT,
     };
     let listener = TcpListener::bind(cfg.file.http.bind)
         .await

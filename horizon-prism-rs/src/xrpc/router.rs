@@ -1024,10 +1024,21 @@ mod tests {
             return;
         };
         let (auth, _d) = verifier(StubFetcher::default(), 10, 4);
+        // The default burst, with a refill too slow to add a token during
+        // the test: at the default 30/s, a loaded machine sending the 80
+        // requests in over two thirds of a second refilled the bucket past
+        // them. The router's charging is what is under test, not governor's
+        // refill.
+        let defaults = crate::config::RateLimitsConfig::default();
+        let burst = defaults.anon_read.burst;
+        let limits = RateLimits::from_config(&crate::config::RateLimitsConfig {
+            anon_read: crate::config::RateClassConfig::new(0.001, burst),
+            ..defaults
+        });
         let state = AppState {
             hydrator: hydrator(&db.pool, ScopeSets::default()),
             auth: Arc::new(auth),
-            limits: RateLimits::new(),
+            limits,
             enroller: None,
             trusted_proxy: "172.30.0.10".parse().expect("ip"),
             did_document: Arc::new(json!({})),
@@ -1047,7 +1058,7 @@ mod tests {
             }
         }
         let (i, error, reset) = limited.expect("limited within 80 requests");
-        assert!(i >= 60, "burst of 60 honoured, limited at {i}");
+        assert_eq!(i, u64::from(burst), "the burst is honoured, and the next request limited");
         assert_eq!(error, "RateLimitExceeded");
         assert!(reset);
         db.drop_db().await;

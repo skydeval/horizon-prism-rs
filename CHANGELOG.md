@@ -10,6 +10,40 @@ commit.
 
 ## [Unreleased]
 
+### Test reliability (#716)
+
+Five tests that failed under the full suite's load on silonew, and passed
+alone, now decide on events rather than on the machine's speed. Each was
+re-checked against a deliberately broken build, and still fails.
+
+- **F2 consumer tests** (`a_slow_consumer_tail_anchors_after_the_window`,
+  `a_hung_database_stays_oldest`, and `a_stall_after_an_oldest_anchor_stays_oldest`,
+  which has the same shape). A re-anchor's mode depends on how many
+  entries arrived since the last one, and the fixed-rate test producer
+  kept adding while the consumer sat in a gap transaction or was held
+  before `reanchor`. On a 300-entry stream at 600 a second, a gap
+  transaction slowed by the loaded test database took a whole span, so an
+  oldest anchor was followed by another span decision instead of a tail.
+  The producer now holds while the consumer's `gap_blocked` is set or
+  `BEFORE_REANCHOR` is held (new `hooks::holding`), and skips missed ticks
+  instead of bursting.
+- **`b74_a_held_list_row_never_slows_a_members_mute`** and
+  **`b65_a_mute_never_waits_on_a_batch_holding_its_list`** (#716). The 1 s
+  per-request ceiling is gone. The row is held until every request has
+  answered and nothing on a request's path sets a `lock_timeout`, so a
+  request that waited on it would never answer; answering while it is held
+  is the proof, under a 30 s limit that only stops a hang. The 2.07 s
+  answer of #716 completed with the row still held, so it was load and not
+  a wait. The B-74 200 ms bound is still held by the median.
+- **`anonymous_reads_are_limited_per_ip`.** It used the default 30/s
+  refill, which refilled the bucket while a loaded machine sent its 80
+  requests. It now uses the default burst with a refill of 0.001/s and
+  asserts the first 429 is exactly the request after the burst.
+- **`detail_requires_a_verified_token`.** The probes' 2 s timeout made the
+  public-indexing read answer `{"read_error":"timed out"}` under load.
+  `HealthState` gains `probe_timeout` (production sets `PROBE_TIMEOUT`,
+  unchanged); this test uses 60 s, since the answers are what it checks.
+
 ### Added (embedded profiles and the background refresh, #732, #731)
 
 - **Accounts outside the community show real profiles in list views

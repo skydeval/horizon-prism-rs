@@ -30,19 +30,23 @@ use crate::test_support::{fresh_db, holds_advisory, hooks, idle_in_transaction_p
 const BUDGET: Budget = Budget { max_references: 5, max_owners: 5 };
 /// A request on a held list must answer within this (B-74).
 const REQUEST_BOUND: Duration = Duration::from_millis(200);
-/// No request comes near this: a request that waited on the held row would
-/// wait until the test let it go, seconds later. The machine's own load
-/// (the whole suite runs in parallel) can push a single answer past
-/// [`REQUEST_BOUND`], so that bound is held by the median.
-const REQUEST_CEILING: Duration = Duration::from_secs(1);
+/// How long a test lets a request on a held row run before calling it a
+/// wait. The row stays held until every request has answered, and nothing
+/// on a request's path sets a `lock_timeout`, so a request that waited on
+/// it would never answer: answering at all, while the row is held, is the
+/// proof. This only stops such a test hanging, and is long so the
+/// machine's own load (the whole suite runs in parallel; one answer has
+/// taken 2 s) is never mistaken for a wait (#716).
+const WAIT_LIMIT: Duration = Duration::from_secs(30);
 
-/// The B-74 bound over a run of requests: each under [`REQUEST_CEILING`],
-/// the median under [`REQUEST_BOUND`].
+/// The B-74 bound over a run of requests: the median under
+/// [`REQUEST_BOUND`]. Load can push a single answer past it, so no single
+/// request is held to a wall-clock bound; that none waited on the held row
+/// is shown by each answering inside [`WAIT_LIMIT`] while it was held.
 fn within_request_bound(took: &mut [Duration]) {
     took.sort_unstable();
     let (median, slowest) = (took[took.len() / 2], took[took.len() - 1]);
     eprintln!("b74: {} requests on a held list: median {median:?}, slowest {slowest:?}", took.len());
-    assert!(slowest < REQUEST_CEILING, "a request waited: {slowest:?}");
     assert!(median < REQUEST_BOUND, "median {median:?}");
 }
 
@@ -248,17 +252,16 @@ async fn b65_a_mute_never_waits_on_a_batch_holding_its_list() {
         .expect("probe");
     assert!(row_held, "the paused batch holds the list's row");
 
-    // The member phase touches nothing the batch holds.
-    let began = Instant::now();
-    let muted = tokio::time::timeout(Duration::from_secs(5), retrying(retryable, || mute_list(p, M2, &list, BUDGET)))
+    // The member phase touches nothing the batch holds: the batch is paused
+    // until it is released below, so a mute that waited on anything it
+    // holds would not answer at all.
+    let muted = tokio::time::timeout(WAIT_LIMIT, retrying(retryable, || mute_list(p, M2, &list, BUDGET)))
         .await
         .expect("the mute does not wait on the batch")
         .expect("no error reaches the client");
     assert_eq!(muted, Muted::Added);
-    // The batch holds the row until it is released below.
-    assert!(began.elapsed() < REQUEST_CEILING, "{:?}", began.elapsed());
     // The list phase skips the held row and keeps its marker.
-    let applied = tokio::time::timeout(Duration::from_secs(5), list_phase::apply(p, &list, 0)).await.expect("the list phase does not wait");
+    let applied = tokio::time::timeout(WAIT_LIMIT, list_phase::apply(p, &list, 0)).await.expect("the list phase does not wait");
     assert_eq!(applied.expect("list phase"), Applied::Busy);
     assert_eq!(markers(p, &list).await, 1);
 
@@ -704,7 +707,8 @@ async fn b65_a_row_left_running_by_a_failed_settle_comes_back_within_the_bound()
 /// batch holds it, and L's copy holding 50 000 rows, member A's
 /// `muteActorList(L)` and `unmuteActorList(L)` answer within 200 ms, and
 /// so do 20 alternating calls made while the applier is retrying L (the
-/// median of the 22; each under 1 s, which a wait on the row would pass).
+/// median of the 22; each answers while the row is still held, which a
+/// wait on the row never would).
 /// `pg_locks` taken during a member phase hold no lock of any mode on
 /// `subscribed_lists`, `subscribed_owners` or `backfill_jobs`, and not the
 /// `listref:total` advisory lock. After the row is let go, the list phase
@@ -748,7 +752,7 @@ async fn b74_a_held_list_row_never_slows_a_members_mute() {
         let (h, me, req, list) = (&h, &me, &req, &list);
         async move {
             let began = Instant::now();
-            tokio::time::timeout(Duration::from_secs(5), h.set_list_mute(me, req, list, mute))
+            tokio::time::timeout(WAIT_LIMIT, h.set_list_mute(me, req, list, mute))
                 .await
                 .expect("the request does not wait on the list's row")
                 .expect("db")

@@ -345,6 +345,13 @@ pub mod hooks {
         }
     }
 
+    /// Whether a wait at the pause site `name`, armed for `key`, is being
+    /// held: reached and not yet released.
+    #[must_use]
+    pub fn holding(name: &'static str, key: &str) -> bool {
+        lookup(name, key).is_some_and(|point| *point.hits.borrow() > 0 && !point.gate.is_closed())
+    }
+
     /// An error site: whether `name` is armed for `key`, so the site fails
     /// as if its statement had. Counts the hit. Armed with [`arm_times`],
     /// it fires that many times and then no more.

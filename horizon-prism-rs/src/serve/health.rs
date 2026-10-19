@@ -79,6 +79,9 @@ pub struct HealthState {
     pub schema: SchemaStatus,
     /// The public-indexing switch (public-indexing design §10).
     pub public: PublicIndexing,
+    /// Each probe's timeout: [`PROBE_TIMEOUT`], or longer in a test that
+    /// checks the answers rather than the bound.
+    pub probe_timeout: Duration,
 }
 
 /// The anonymous response body.
@@ -149,18 +152,18 @@ pub fn body(db: bool, redis: bool, audit_ok: bool, watermarks: &Watermarks, gap_
     }
 }
 
-async fn probe_db(pool: &PgPool) -> bool {
+async fn probe_db(pool: &PgPool, within: Duration) -> bool {
     matches!(
-        tokio::time::timeout(PROBE_TIMEOUT, sqlx::query("SELECT 1").execute(pool)).await,
+        tokio::time::timeout(within, sqlx::query("SELECT 1").execute(pool)).await,
         Ok(Ok(_))
     )
 }
 
-async fn probe_redis(redis: &ConnectionManager) -> bool {
+async fn probe_redis(redis: &ConnectionManager, within: Duration) -> bool {
     let mut conn = redis.clone();
     let ping = redis::cmd("PING");
     matches!(
-        tokio::time::timeout(PROBE_TIMEOUT, ping.query_async::<String>(&mut conn)).await,
+        tokio::time::timeout(within, ping.query_async::<String>(&mut conn)).await,
         Ok(Ok(_))
     )
 }
@@ -181,13 +184,13 @@ async fn health(State(state): State<HealthState>, ConnectInfo(peer): ConnectInfo
     }
     let (detail, db, redis) = tokio::join!(
         authenticated(&state, authorization),
-        probe_db(&state.pool),
-        probe_redis(&state.redis)
+        probe_db(&state.pool, state.probe_timeout),
+        probe_redis(&state.redis, state.probe_timeout)
     );
     let mut h = body(db, redis, !state.audit.latched(), &state.watermarks, state.status.gap_blocked(), &state.schema);
     let code = if h.ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     if detail {
-        h.public_indexing = match tokio::time::timeout(PROBE_TIMEOUT, state.public.status()).await {
+        h.public_indexing = match tokio::time::timeout(state.probe_timeout, state.public.status()).await {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => serde_json::json!({ "read_error": error.to_string() }),
             Err(_) => serde_json::json!({ "read_error": "timed out" }),
@@ -283,6 +286,10 @@ mod tests {
                 crate::aggregations::ScopeState::new(Default::default(), crate::config::ScopePolicy::MembersAndOneHop, 10),
                 crate::indexing::PublicModeSettings::from_config(&crate::config::IndexingConfig::default()),
             ),
+            // The answers are under test, not the 2 s bound: with the whole
+            // suite loading the database, the public-indexing read has taken
+            // longer than that and answered `{"read_error":"timed out"}`.
+            probe_timeout: Duration::from_secs(60),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");

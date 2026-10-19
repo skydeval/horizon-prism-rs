@@ -161,6 +161,16 @@ impl Fixture {
         self.db.name()
     }
 
+    /// The F2 tests' input: [`spawn_producer`] at 600 a second with
+    /// `MAXLEN 300`, held while this fixture's consumer is in a gap
+    /// transaction or held at `BEFORE_REANCHOR`.
+    pub fn f2_producer(&self, within: Duration) -> JoinHandle<u64> {
+        let status = Arc::clone(&self.status);
+        let key = self.key().to_string();
+        let hold = move || status.gap_blocked() || hooks::holding(hooks::BEFORE_REANCHOR, &key);
+        spawn_producer(self.url.clone(), self.cfg.stream_key.clone(), 600, 300, within, hold)
+    }
+
     /// `XADD`, with an exact `MAXLEN` when given; the new id.
     pub async fn add(&mut self, fields: &[(&str, String)], maxlen: Option<u64>) -> String {
         let mut cmd = redis::cmd("XADD");
@@ -280,15 +290,36 @@ macro_rules! eventually {
 
 /// `XADD`s commits with nothing to write at `rate` per second, in 10 ms
 /// ticks, with an exact `MAXLEN`, for `within`. The number added.
-pub(super) fn spawn_producer(url: String, stream: String, rate: u64, maxlen: u64, within: Duration) -> JoinHandle<u64> {
+///
+/// No tick adds while `hold` is true. The F2 tests hold their input while
+/// the consumer is in a gap transaction or held by the test before
+/// `reanchor`: on this test's scale (a 300-entry stream, half a second at
+/// 600 a second) those pauses, which the suite's load on the test database
+/// and its scheduler stretches, can take a whole span, so whether a gap
+/// came within a span of the last would be decided by the machine's load
+/// and not by the consumer's rate. In production a span is minutes. A
+/// missed tick is skipped, not made up in a burst: a test thread kept off
+/// the CPU stops consumer and input alike.
+pub(super) fn spawn_producer(
+    url: String,
+    stream: String,
+    rate: u64,
+    maxlen: u64,
+    within: Duration,
+    hold: impl Fn() -> bool + Send + 'static,
+) -> JoinHandle<u64> {
     tokio::spawn(async move {
         let mut c = connect(&url).await;
         let per_tick = rate / 100;
         let mut tick = tokio::time::interval(Duration::from_millis(10));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let end = Instant::now() + within;
         let mut added = 0;
         while Instant::now() < end {
             tick.tick().await;
+            if hold() {
+                continue;
+            }
             let mut pipe = redis::pipe();
             for _ in 0..per_tick {
                 let fields = commit(OUTSIDER, json!([]));
@@ -500,7 +531,7 @@ async fn a_slow_consumer_tail_anchors_after_the_window() {
     let (mut c, _) = f.consumer().await;
     c.startup().await.expect("startup");
     let start = Instant::now();
-    let producer = spawn_producer(f.url.clone(), f.cfg.stream_key.clone(), 600, 300, Duration::from_secs(10));
+    let producer = f.f2_producer(Duration::from_secs(10));
     let at_five = {
         let url = f.url.clone();
         let stream = f.cfg.stream_key.clone();
@@ -570,7 +601,7 @@ async fn a_stall_after_an_oldest_anchor_stays_oldest() {
     let (c, _) = f.consumer().await;
     let log = Arc::clone(&c.test.record);
     let start = Instant::now();
-    let producer = spawn_producer(f.url.clone(), f.cfg.stream_key.clone(), 600, 300, Duration::from_secs(10));
+    let producer = f.f2_producer(Duration::from_secs(10));
     let stop = Arc::new(AtomicBool::new(false));
     let task = drive(c, Arc::clone(&stop), Duration::from_secs(15));
     // The first re-anchor holds before `reanchor` while the second stall is
@@ -612,7 +643,7 @@ async fn hung_database_run(name: &str, ring_reset: bool) -> Option<(Vec<Reanchor
     let (mut c, _) = f.consumer().await;
     c.test.ring_reset = ring_reset;
     let log = Arc::clone(&c.test.record);
-    let producer = spawn_producer(f.url.clone(), f.cfg.stream_key.clone(), 600, 300, Duration::from_secs(14));
+    let producer = f.f2_producer(Duration::from_secs(14));
     let hang = hooks::arm_delay(hooks::WRITER_HANG, f.key(), Duration::from_secs(1), None);
     let stop = Arc::new(AtomicBool::new(false));
     let task = drive(c, Arc::clone(&stop), Duration::from_secs(20));
