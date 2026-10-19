@@ -49,7 +49,16 @@
 {% endfor %}
 </select>
 </div>
-<ol class="live-list" id="live-list" hidden></ol>
+<div class="live-tickers" id="live-tickers" hidden>
+<div>
+<h3 id="live-arriving-h">On the firehose</h3>
+<ol class="live-list" id="live-arriving" aria-labelledby="live-arriving-h"></ol>
+</div>
+<div>
+<h3 id="live-indexed-h">Indexed here</h3>
+<ol class="live-list" id="live-indexed" aria-labelledby="live-indexed-h"></ol>
+</div>
+</div>
 </section>
 </div>
 {% endblock %}

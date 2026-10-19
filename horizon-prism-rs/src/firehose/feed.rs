@@ -397,6 +397,21 @@ impl LineAction {
     }
 }
 
+/// A line's lanes (Changed by skydeval 2026-10-19): Home shows two tickers,
+/// "On the firehose" (every arriving op, its outcome marked) and "Indexed
+/// here" (what this instance wrote). Each lane is sampled on its own
+/// budgets, so a flood of skipped ops never crowds out indexed ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Lanes {
+    /// The "On the firehose" ticker.
+    pub arriving: bool,
+    /// The "Indexed here" ticker; only an indexed op.
+    pub indexed: bool,
+}
+
+/// The number of lanes, each with its own buckets.
+pub const LANES: usize = 2;
+
 /// One line of the feed (§5.2). Only the author, never a subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
@@ -406,9 +421,15 @@ pub struct Line {
     pub relay: Option<String>,
     pub action: LineAction,
     pub kind: Kind,
+    /// The op's fate: indexed, unchanged (a duplicate), failed, or a skip
+    /// or reject reason.
+    pub outcome: Outcome,
+    /// The tickers this line was sampled for.
+    pub lanes: Lanes,
     /// The author.
     pub did: String,
-    /// A written public post's cleaned first characters (C-F1).
+    /// A written public post's cleaned first characters (C-F1); only on a
+    /// line sampled for the indexed lane.
     pub text: Option<String>,
 }
 
@@ -548,7 +569,7 @@ struct Inner {
     active: AtomicBool,
     /// The union of the open streams' (bucket group, kind) bits.
     wanted: AtomicU64,
-    /// One per (bucket group, kind), [`BUCKET_PER_SEC`] each.
+    /// One per (lane, bucket group, kind), [`BUCKET_PER_SEC`] each.
     buckets: Vec<DefaultDirectRateLimiter>,
     sender: broadcast::Sender<Arc<Line>>,
     snippets: bool,
@@ -578,7 +599,7 @@ impl FeedTap {
             identity: Default::default(),
             active: AtomicBool::new(false),
             wanted: AtomicU64::new(0),
-            buckets: (0..GROUPS * KINDS).map(|_| RateLimiter::direct(per_sec)).collect(),
+            buckets: (0..LANES * GROUPS * KINDS).map(|_| RateLimiter::direct(per_sec)).collect(),
             sender,
             snippets,
             started: Utc::now(),
@@ -648,15 +669,17 @@ impl FeedTap {
             if !active {
                 continue;
             }
+            // Every op is a line now (Changed by skydeval 2026-10-19): a
+            // skipped, rejected, unchanged or failed one too, marked by its
+            // outcome and never with text.
             let action = match (op.outcome, op.action) {
-                (Outcome::Written, Action::Create) => LineAction::Created,
-                (Outcome::Written, Action::Update) => LineAction::Updated,
-                (Outcome::Written, Action::Delete) => LineAction::Deleted,
                 (Outcome::ReferenceOnly, _) => LineAction::ReferenceOnly,
-                _ => continue,
+                (_, Action::Create) => LineAction::Created,
+                (_, Action::Update) => LineAction::Updated,
+                (_, Action::Delete) => LineAction::Deleted,
             };
             let text = if inner.snippets && op.outcome == Outcome::Written { op.text } else { None };
-            self.offer(source, op.kind, action, wanted, relay, repo, text);
+            self.offer(source, op.kind, action, op.outcome, wanted, relay, repo, text);
         }
     }
 
@@ -678,16 +701,22 @@ impl FeedTap {
             return;
         }
         let wanted = inner.wanted.load(Ordering::Relaxed);
-        self.offer(Source::Network, kind, action, wanted, relay, did, None);
+        self.offer(Source::Network, kind, action, Outcome::Written, wanted, relay, did, None);
     }
 
+    /// A line for both lanes an op may go to, each on its own bucket: the
+    /// arriving lane takes any op, the indexed lane only an indexed one.
+    /// Built when either lane has a token; the snippet only with the
+    /// indexed lane's.
     #[allow(clippy::too_many_arguments)]
-    fn offer(&self, source: Source, kind: Kind, action: LineAction, wanted: u64, relay: Option<&str>, did: &str, text: Option<&str>) {
+    fn offer(&self, source: Source, kind: Kind, action: LineAction, outcome: Outcome, wanted: u64, relay: Option<&str>, did: &str, text: Option<&str>) {
         let inner = &*self.0;
         if wanted & wanted_bit(source.group(), kind) == 0 {
             return;
         }
-        if inner.buckets[source.group() * KINDS + kind.index()].check().is_err() {
+        let bucket = |lane: usize| &inner.buckets[(lane * GROUPS + source.group()) * KINDS + kind.index()];
+        let lanes = Lanes { arriving: bucket(0).check().is_ok(), indexed: outcome.indexed() && bucket(1).check().is_ok() };
+        if !lanes.arriving && !lanes.indexed {
             metrics::counter!(METRIC_NOT_SHOWN, "why" => "source_rate").increment(1);
             return;
         }
@@ -699,8 +728,10 @@ impl FeedTap {
             relay: if source == Source::Network { relay.map(str::to_string) } else { None },
             action,
             kind,
+            outcome,
+            lanes,
             did: did.to_string(),
-            text: text.map(snippet),
+            text: if lanes.indexed && outcome == Outcome::Written { text.map(snippet) } else { None },
         };
         // No receiver is not an error: the line is dropped.
         let _ = inner.sender.send(Arc::new(line));
@@ -719,13 +750,21 @@ pub(crate) mod testing {
     pub fn written(kind: Kind, text: Option<&str>) -> FeedOp<'_> {
         FeedOp { kind, action: Action::Create, outcome: Outcome::Written, text }
     }
+
+    /// A create of `kind` with `outcome`. `text` stands for a record the
+    /// writer would never hand over for an op it did not write: the tap
+    /// must drop it anyway.
+    #[must_use]
+    pub fn create(kind: Kind, outcome: Outcome, text: Option<&str>) -> FeedOp<'_> {
+        FeedOp { kind, action: Action::Create, outcome, text }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::testing::written;
+    use super::testing::{create, written};
     use super::*;
     use crate::aggregations::{PurgeKind, RejectReason};
     use crate::firehose::classifier::{
@@ -843,7 +882,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
         let built = tap.lines_built();
         assert!(built > BROADCAST_CAPACITY as u64, "every bucket's burst at least: {built}");
-        assert!(built <= (GROUPS * KINDS) as u64 * u64::from(BUCKET_PER_SEC) * 3, "the buckets bound the lines: {built}");
+        assert!(built <= (LANES * GROUPS * KINDS) as u64 * u64::from(BUCKET_PER_SEC) * 3, "the buckets bound the lines: {built}");
         assert!(matches!(idle.try_recv(), Err(broadcast::error::TryRecvError::Lagged(_))));
         assert_eq!(tap.totals().outcome(Outcome::Written), 100_000, "every op counted");
     }
@@ -854,10 +893,63 @@ mod tests {
         let tap = FeedTap::new(true);
         for i in 0..10_000 {
             tap.observe(std::iter::once(written(Kind::ALL[i % KINDS], Some("x"))), WriteSource::Firehose, None, "did:plc:a");
+            tap.observe(std::iter::once(create(Kind::Like, Outcome::NotInScope, None)), WriteSource::Firehose, None, "did:plc:a");
         }
         assert_eq!(tap.lines_built(), 0);
         assert_eq!(tap.receivers(), 0);
         assert_eq!(tap.totals().indexed(), 10_000);
+        assert_eq!(tap.totals().skipped(), 10_000);
+    }
+
+    /// Arriving events (Changed by skydeval 2026-10-19): a skipped,
+    /// unchanged or failed op is a line on the arriving lane alone, marked
+    /// by its outcome and never with text; a written post is on both lanes,
+    /// with its snippet.
+    #[test]
+    fn every_op_is_a_line_and_only_indexed_ones_carry_text() {
+        let tap = FeedTap::new(true);
+        let mut rx = tap.subscribe();
+        tap.set_wanted(WANT_ALL);
+        for outcome in Outcome::ALL {
+            tap.observe(std::iter::once(create(Kind::Post, outcome, Some("secret text"))), WriteSource::Firehose, Some("bsky"), "did:plc:a");
+        }
+        let mut seen = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            assert_eq!(line.lanes.indexed, line.outcome.indexed(), "{line:?}");
+            assert!(line.lanes.arriving, "{line:?}");
+            if line.outcome == Outcome::Written {
+                assert_eq!(line.text.as_deref(), Some("secret text"));
+            } else {
+                assert!(line.text.is_none(), "{line:?}");
+            }
+            seen.push(line.outcome);
+        }
+        assert_eq!(seen, Outcome::ALL, "one line per op, unchanged ones too");
+    }
+
+    /// Each lane has its own budget: a flood of skipped likes spends the
+    /// arriving lane's tokens and never the indexed lane's.
+    #[test]
+    fn a_skipped_flood_does_not_crowd_out_indexed_lines() {
+        let tap = FeedTap::new(false);
+        let mut rx = tap.subscribe();
+        tap.set_wanted(WANT_ALL);
+        for _ in 0..5_000 {
+            tap.observe(std::iter::once(create(Kind::Like, Outcome::NotInScope, None)), WriteSource::Firehose, None, "did:plc:a");
+        }
+        for _ in 0..20 {
+            tap.observe(std::iter::once(written(Kind::Like, None)), WriteSource::Firehose, None, "did:plc:a");
+        }
+        let (mut skipped, mut indexed) = (0, 0);
+        while let Ok(line) = rx.try_recv() {
+            if line.lanes.indexed {
+                indexed += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        assert_eq!(indexed, 20, "every indexed like reaches the indexed lane");
+        assert!(skipped <= u64::from(BUCKET_PER_SEC) * 2, "the arriving lane is sampled: {skipped}");
     }
 
     fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

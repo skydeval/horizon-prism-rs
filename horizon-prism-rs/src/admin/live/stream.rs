@@ -5,7 +5,7 @@
 //!   [`Need::Poll`]. A refusal is never a redirect: `401`, `429` or `503`
 //!   with an empty body. Then a slot (§3.4), or `429` at the global cap.
 //! - While open: lines through the stream's filter at most
-//!   [`LINES_PER_SEC`] a second, in batches; `counts` every second; the
+//!   [`LINES_PER_SEC`] a second per ticker, in batches; `counts` every second; the
 //!   session checked every minute and at its own expiry instant; `end`
 //!   with a reason on a failed check, a replacement, the 30-minute
 //!   renewal or shutdown.
@@ -30,7 +30,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use super::{Hub, LINES_PER_SEC, Slot};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Refresh, check_session, load_session, request_ip, require, session_bytes};
-use crate::firehose::feed::{GROUPS, KINDS, Kind, Line, METRIC_NOT_SHOWN, Outcome, SOURCES, Source, Totals, wanted_bit};
+use crate::firehose::feed::{GROUPS, KINDS, Kind, Lanes, Line, METRIC_NOT_SHOWN, Outcome, SOURCES, Source, Totals, wanted_bit};
 
 /// The stream's `Cache-Control`, over axum's `no-cache` (§3.2).
 pub const STREAM_CACHE_CONTROL: &str = "no-store, no-transform";
@@ -107,9 +107,12 @@ impl Filter {
 }
 
 /// A line as the `lines` event carries it: no field for what a line may
-/// not show (§6), and no `text` key at all without a snippet.
+/// not show (§6), and no `text` key at all without a snippet. `lanes` are
+/// the tickers this stream admitted it to: `"f": 1` for "On the firehose",
+/// `"i": 1` for "Indexed here"; a snippet goes only with `i`. A line that
+/// was not indexed carries its outcome as `o`.
 #[must_use]
-pub fn line_json(line: &Line, handle: Option<&str>) -> Value {
+pub fn line_json(line: &Line, handle: Option<&str>, lanes: Lanes) -> Value {
     let mut m = Map::new();
     m.insert("t".into(), json!(line.at.format("%H:%M:%S").to_string()));
     m.insert("src".into(), json!(line.source.slug()));
@@ -118,11 +121,20 @@ pub fn line_json(line: &Line, handle: Option<&str>) -> Value {
     }
     m.insert("act".into(), json!(line.action.words()));
     m.insert("k".into(), json!(line.kind.slug()));
+    if !line.outcome.indexed() {
+        m.insert("o".into(), json!(line.outcome.slug()));
+    }
+    if lanes.arriving {
+        m.insert("f".into(), json!(1));
+    }
+    if lanes.indexed {
+        m.insert("i".into(), json!(1));
+    }
     m.insert("did".into(), json!(line.did));
     if let Some(h) = handle {
         m.insert("who".into(), json!(h));
     }
-    if let Some(text) = &line.text {
+    if let Some(text) = line.text.as_ref().filter(|_| lanes.indexed && line.outcome.indexed()) {
         m.insert("text".into(), json!(text));
     }
     Value::Object(m)
@@ -239,10 +251,11 @@ struct Live {
     filter: Filter,
     id_hash: [u8; 32],
     ip: IpAddr,
-    /// The per-stream rate (C-F4): tokens, and when last refilled.
-    tokens: f64,
+    /// The per-stream rate (C-F4), per ticker (arriving, indexed): tokens,
+    /// and when last refilled.
+    tokens: [f64; 2],
     refilled: Instant,
-    batch: Vec<Arc<Line>>,
+    batch: Vec<(Arc<Line>, Lanes)>,
     /// Since the last `counts`.
     shown: u64,
     not_shown: u64,
@@ -284,7 +297,7 @@ impl Live {
             filter,
             id_hash,
             ip,
-            tokens: burst(),
+            tokens: [burst(); 2],
             refilled: now,
             batch: Vec::new(),
             shown: 0,
@@ -367,11 +380,20 @@ impl Live {
         }
         let now = Instant::now();
         let refill = now.duration_since(self.refilled).as_secs_f64() * f64::from(LINES_PER_SEC);
-        self.tokens = (self.tokens + refill).min(burst());
+        for t in &mut self.tokens {
+            *t = (*t + refill).min(burst());
+        }
         self.refilled = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            self.batch.push(line);
+        let mut take = |lane: usize, offered: bool| {
+            let ok = offered && self.tokens[lane] >= 1.0;
+            if ok {
+                self.tokens[lane] -= 1.0;
+            }
+            ok
+        };
+        let lanes = Lanes { arriving: take(0, line.lanes.arriving), indexed: take(1, line.lanes.indexed) };
+        if lanes.arriving || lanes.indexed {
+            self.batch.push((line, lanes));
         } else {
             self.not_shown += 1;
             metrics::counter!(METRIC_NOT_SHOWN, "why" => "stream_rate").increment(1);
@@ -384,9 +406,9 @@ impl Live {
             return;
         }
         let batch = std::mem::take(&mut self.batch);
-        let dids: Vec<&str> = batch.iter().map(|l| l.did.as_str()).collect();
+        let dids: Vec<&str> = batch.iter().map(|(l, _)| l.did.as_str()).collect();
         let handles = handles(&self.state, &self.hub, &dids).await;
-        let lines: Vec<Value> = batch.iter().zip(&handles).map(|(l, h)| line_json(l, h.as_deref())).collect();
+        let lines: Vec<Value> = batch.iter().zip(&handles).map(|((l, lanes), h)| line_json(l, h.as_deref(), *lanes)).collect();
         self.shown += lines.len() as u64;
         self.pending.push_back(Event::default().event("lines").data(Value::Array(lines).to_string()));
     }
@@ -480,6 +502,8 @@ mod tests {
             relay: None,
             action: LineAction::Created,
             kind,
+            outcome: Outcome::Written,
+            lanes: BOTH,
             did: "did:plc:a".into(),
             text: None,
         };
@@ -492,6 +516,8 @@ mod tests {
         assert_eq!(Filter::parse(None, Some("catch-up")).wanted(), Filter::parse(None, Some("backfill")).wanted());
     }
 
+    const BOTH: Lanes = Lanes { arriving: true, indexed: true };
+
     #[test]
     fn a_line_without_a_snippet_has_no_text_key() {
         let mut l = Line {
@@ -500,13 +526,27 @@ mod tests {
             relay: Some("bsky".into()),
             action: LineAction::Created,
             kind: Kind::PrivatePost,
+            outcome: Outcome::Written,
+            lanes: BOTH,
             did: "did:plc:a".into(),
             text: None,
         };
-        let v = line_json(&l, None);
-        assert!(v.get("text").is_none() && v.get("who").is_none());
+        let v = line_json(&l, None, BOTH);
+        assert!(v.get("text").is_none() && v.get("who").is_none() && v.get("o").is_none());
         assert_eq!((v["k"].as_str(), v["src"].as_str(), v["relay"].as_str()), (Some("private-post"), Some("network"), Some("bsky")));
+        assert_eq!((v["f"].as_u64(), v["i"].as_u64()), (Some(1), Some(1)));
         l.text = Some("hi".into());
-        assert_eq!(line_json(&l, Some("alice.test"))["who"], "alice.test");
+        assert_eq!(line_json(&l, Some("alice.test"), BOTH)["who"], "alice.test");
+        // A snippet goes only with the indexed ticker.
+        let arriving = Lanes { arriving: true, indexed: false };
+        let v = line_json(&l, None, arriving);
+        assert!(v.get("text").is_none() && v.get("i").is_none(), "{v}");
+        // A line that was not indexed: its outcome, never text.
+        l.outcome = Outcome::NotInScope;
+        let v = line_json(&l, None, BOTH);
+        assert_eq!(v["o"], "not_in_scope");
+        assert!(v.get("text").is_none(), "{v}");
+        l.outcome = Outcome::Unchanged;
+        assert_eq!(line_json(&l, None, arriving)["o"], "unchanged");
     }
 }

@@ -407,7 +407,15 @@ async fn t_f8_lines() {
     assert!(by(AUTHOR, "deleted").is_some(), "{lines:?}");
     let reference = by(NO_HANDLE, "reference only").expect("the reference");
     assert!(reference.get("text").is_none());
-    assert!(!lines.iter().any(|l| l["did"] == OUTSIDER), "a rejected op and an unknown DID make no line: {lines:?}");
+    // A rejected op is a line on the firehose ticker alone, marked by its
+    // reason, never with text (Changed by skydeval 2026-10-19); an unknown
+    // DID's identity event is still no line.
+    let outside: Vec<&Value> = lines.iter().filter(|l| l["did"] == OUTSIDER).collect();
+    assert_eq!(outside.len(), 1, "{lines:?}");
+    assert_eq!((outside[0]["o"].as_str(), outside[0]["k"].as_str(), outside[0]["f"].as_u64()), (Some("not_in_scope"), Some("post"), Some(1)));
+    assert!(outside[0].get("i").is_none() && outside[0].get("text").is_none(), "{:?}", outside[0]);
+    assert_eq!((first["f"].as_u64(), first["i"].as_u64()), (Some(1), Some(1)), "an indexed post is on both tickers");
+    assert!(lines.iter().filter(|l| l.get("o").is_some()).all(|l| l.get("text").is_none() && l.get("i").is_none()), "{lines:?}");
     let not_in_scope: u64 = counts_of(&events).iter().filter_map(|c| c["reasons"]["not_in_scope"].as_u64()).sum();
     assert!(not_in_scope >= 1, "{events:?}");
     // kinds=block: only the block.
@@ -468,6 +476,12 @@ async fn t_f2_a_stream_that_is_not_read() {
     let built = h.hub.tap().lines_built();
     assert_eq!(counted, built, "shown plus not shown is every line built");
     assert!(shown < built, "most were not shown");
+    // The server's cap, per ticker: at most LINES_PER_SEC a second each.
+    let lines = lines_of(&events);
+    for lane in ["f", "i"] {
+        let n = lines.iter().filter(|l| l.get(lane).is_some()).count() as u64;
+        assert!(n <= u64::from(live::LINES_PER_SEC) * 4, "{lane}: {n}");
+    }
     h.db.drop_db().await;
 }
 
@@ -516,14 +530,27 @@ async fn t_f11_script_not_started() {
     let live = home.body.find("id=\"live\"").expect("the feed");
     assert!(row < members && members < live, "{}", home.body);
     assert!(!home.body.contains("Recent changes"), "{}", home.body);
-    assert!(JS.contains("'network · first via '"), "the relay reads as the first to deliver");
+    assert!(JS.contains("'first via '"), "the relay reads as the first to deliver");
+    // Two fixed-height tickers (Changed by skydeval 2026-10-19), paced by
+    // one constant, with a short queue and lines removed past the bottom.
+    let arriving = home.body.find("On the firehose").expect("the firehose ticker");
+    let indexed = home.body.find("Indexed here").expect("the indexed ticker");
+    assert!(arriving < indexed);
+    assert!(JS.contains("var PACE_MS = 200;") && JS.contains("}, PACE_MS);"), "one pace constant");
+    assert!(JS.contains("var QUEUE_MAX = 20;") && JS.contains("queue.splice(0, queue.length - QUEUE_MAX)"), "the newest wait");
+    assert!(JS.contains("var ROWS_KEPT = 16;") && JS.contains("while (list.childNodes.length > ROWS_KEPT) list.removeChild(list.lastChild);"));
+    assert!(JS.contains("if (paused ||"), "pause freezes the tickers");
+    let rule = &CSS[CSS.find(".live-list {").expect("the list rule")..];
+    let rule = &rule[..rule.find('}').expect("rule end")];
+    assert!(rule.contains("overflow: hidden;") && rule.contains("height: calc("), "{rule}");
+    assert!(!CSS.contains("overflow-y"), "no scrollbar");
     assert!(home.body.replace("&#x2f;", "/").contains(&format!("<script src=\"{}\" defer></script>", *JS_HREF)), "{}", home.body);
     assert!(home.body.contains("<noscript><meta http-equiv=\"refresh\" content=\"30;url=/admin?auto=1\"></noscript>"));
     assert!(home.body.contains("The live feed needs JavaScript."));
     assert!(!home.body.contains("style="), "no inline style");
     let hide = JS.find("notice.hidden = true").expect("the hide call");
     let first_code = JS.find("var notice").expect("start");
-    assert!(first_code < hide && hide < JS.find("var MAX").expect("rest"), "the first act");
+    assert!(first_code < hide && hide < JS.find("var PACE_MS").expect("rest"), "the first act");
     assert!(!JS.contains("innerHTML") && !JS.contains(".style") && !JS.contains("eval("), "textContent and classes only");
     // Totals with JavaScript off: the server renders the figures.
     h.hub.tap().observe(std::iter::once(written(Kind::Post, None)), WriteSource::Firehose, None, AUTHOR);

@@ -58,6 +58,17 @@ shows what Prism indexes as it happens, and Activity is now the audit log.
   beside it, stacked Members-first below 48rem. A network line's relay
   reads "network · first via <relay>", since a commit is applied from
   whichever relay delivers it first.
+- **Two tickers instead of a growing list** (changed by skydeval): "On the
+  firehose" shows every arriving op, marked indexed, skipped or rejected
+  (dimmed, with the reason), duplicate (dimmed) or failed; "Indexed here"
+  shows only what this instance wrote. Each is 14 rows high with no
+  scrollbar; a line enters at the top every 200 ms from a queue of the
+  newest 20, and lines past the 16th leave the page. Pause freezes both;
+  the filters apply to both. The tap now builds lines for every outcome,
+  sampled on two lanes with their own budgets so skipped ops never crowd
+  out indexed ones; nothing is built with no stream open. Each stream
+  sends at most 25 lines a second per ticker. A line that was not indexed
+  never carries text, and snippets appear only under "Indexed here".
 
 ### Fixed (admin UI forms)
 

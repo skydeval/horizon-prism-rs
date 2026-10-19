@@ -41,6 +41,10 @@
   --button-glow: 0 2px 8px var(--accent-glow);
   --radius-sm: 6px;
   --radius: 12px;
+  --live-rows: 14;
+  --live-row: 1.75rem;
+  --live-font: 0.78rem;
+  --live-enter: 180ms;
   --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Liberation Mono", Menlo, Consolas, monospace;
   font-family: var(--font-sans);
@@ -279,14 +283,47 @@ td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
 .live-controls { display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center; margin: 0.75rem 0; }
 .live-controls select { width: auto; }
 .live-rates .fact .v, #live-rates .fact .v { font-variant-numeric: tabular-nums; }
-.live-list { list-style: none; margin: 0; padding: 0; font-family: var(--font-mono); font-size: 0.82rem; border-top: 1px solid var(--line); }
-.live-list li { display: flex; flex-wrap: wrap; gap: 0 0.75rem; padding: 0.3rem 0; border-bottom: 1px solid var(--line); }
+/* The two tickers, "On the firehose" and "Indexed here": fixed height, no
+   scrollbar, one row per line. New lines slide in at the top; the script
+   removes the ones that fall off the bottom. */
+.live-tickers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem 1.25rem; margin-top: 0.5rem; }
+.live-tickers h3 { font-size: 0.9rem; margin: 0 0 0.4rem; }
+.live-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: var(--live-font);
+  border-top: 1px solid var(--line);
+  height: calc(var(--live-rows) * var(--live-row));
+  overflow: hidden;
+}
+.live-list li {
+  display: flex;
+  gap: 0 0.6rem;
+  align-items: center;
+  height: var(--live-row);
+  white-space: nowrap;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+}
+.live-list li > span { flex: none; }
 .live-list .t, .live-list .src { color: var(--muted); }
-.live-list .t, .live-list .src, .live-list .act, .live-list .k { white-space: nowrap; }
 .live-list .k { font-weight: 600; }
-/* The handle takes what is left of the row and is cut short, not wrapped. */
-.live-list .who { flex: 1 1 0; min-width: 6rem; color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.live-list .text { flex-basis: 100%; font-family: var(--font-sans); color: var(--fg); overflow-wrap: anywhere; }
+.live-list .o { font-family: var(--font-sans); font-size: 0.75rem; color: var(--muted); }
+.live-list .o.ix { color: var(--ok); }
+/* Not indexed: dimmed, its reason in the tag. */
+.live-list li.dim { opacity: 0.55; }
+/* The handle and the snippet take what is left of the row, cut short. */
+.live-list li > .who { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--accent); }
+.live-list li > .text { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-family: var(--font-sans); color: var(--fg); }
+.live-list li.enter { animation: live-enter var(--live-enter) ease-out; }
+@keyframes live-enter {
+  from { opacity: 0; transform: translateY(-50%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-list li.enter { animation: none; }
+}
 /* With scripting off, the noscript line says so instead. */
 @media (scripting: none) {
   #live-notstarted { display: none; }
@@ -304,4 +341,5 @@ td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
   main { padding: 1.25rem 0.9rem; }
   .card { padding: 1rem; }
   td.actions { white-space: normal; }
+  .live-tickers { grid-template-columns: minmax(0, 1fr); }
 }

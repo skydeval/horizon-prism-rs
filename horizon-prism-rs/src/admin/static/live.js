@@ -10,17 +10,24 @@
   var notice = document.getElementById('live-notstarted');
   if (notice) notice.hidden = true;
 
-  var MAX = 200;
+  // The two tickers (Changed by skydeval 2026-10-19): "On the firehose"
+  // and "Indexed here", each a fixed-height box that shows one new line
+  // every PACE_MS at the top and drops lines off the bottom.
+  var PACE_MS = 200;    // one line per ticker this often: the one knob for pace
+  var QUEUE_MAX = 20;   // lines waiting per ticker; older ones are dropped
+  var ROWS_KEPT = 16;   // lines kept per ticker: the 14 shown and two below
   var statusEl = document.getElementById('live-status');
   var message = document.getElementById('live-message');
   var rates = document.getElementById('live-rates');
   var controls = document.getElementById('live-controls');
-  var list = document.getElementById('live-list');
+  var tickers = document.getElementById('live-tickers');
+  var arrivingList = document.getElementById('live-arriving');
+  var indexedList = document.getElementById('live-indexed');
   var pauseBtn = document.getElementById('live-pause');
   var kindSel = document.getElementById('live-kind');
   var sourceSel = document.getElementById('live-source');
   var tiles = document.getElementById('tiles');
-  if (!statusEl || !message || !rates || !controls || !list || !pauseBtn || !kindSel || !sourceSel) return;
+  if (!statusEl || !message || !rates || !controls || !tickers || !arrivingList || !indexedList || !pauseBtn || !kindSel || !sourceSel) return;
 
   var KIND = {
     'list-item': 'list item', 'list-block': 'list block', 'list-optout': 'list opt-out',
@@ -46,7 +53,6 @@
   var es = null;
   var paused = false;
   var stopped = false;
-  var held = []; // lines not yet on screen, newest first, at most MAX
 
   function setStatus(text, cls) {
     statusEl.textContent = text;
@@ -80,45 +86,82 @@
     return x >= 10 ? Math.round(x).toLocaleString() : x.toFixed(1);
   }
 
-  function lineEl(l) {
-    var li = el('li');
+  // An op's fate in words, for the firehose ticker: indexed, a skip or
+  // reject reason, or a duplicate (a commit already applied from the relay
+  // that delivered it first).
+  function outcome(l) {
+    if (!l.o) return 'indexed';
+    if (l.o === 'unchanged') return l.src === 'network' ? 'duplicate' : 'unchanged';
+    if (l.o === 'failed') return 'failed';
+    return REASON[l.o] || l.o;
+  }
+
+  // One line, on one row. withText: the indexed ticker, the only one that
+  // shows a public post's snippet; a line that was not indexed has none.
+  function lineEl(l, withText) {
+    var li = el('li', l.o ? 'enter dim' : 'enter');
     li.appendChild(el('span', 't', l.t));
-    // A commit is applied once, from the relay that delivers it first;
-    // later copies count as unchanged.
-    var src = el('span', 'src', l.src === 'network' && l.relay ? 'network · first via ' + l.relay : l.src);
-    if (l.src === 'network' && l.relay) src.title = 'Applied from ' + l.relay + ', the first relay to deliver it; later copies count as unchanged.';
+    if (!withText) li.appendChild(el('span', l.o ? 'o' : 'o ix', outcome(l)));
+    var src;
+    if (l.src === 'network' && l.relay) {
+      // A commit is applied once, from the relay that delivers it first;
+      // later copies count as unchanged.
+      src = el('span', 'src', (l.o ? 'via ' : 'first via ') + l.relay);
+      src.title = l.o ? 'From the network, via ' + l.relay + '.'
+        : 'From the network: applied from ' + l.relay + ', the first relay to deliver it; later copies count as unchanged.';
+    } else {
+      src = el('span', 'src', l.src);
+    }
     li.appendChild(src);
     li.appendChild(el('span', 'act', l.act));
     li.appendChild(el('span', 'k', KIND[l.k] || l.k));
     var who = el('span', 'who', l.who || l.did);
     who.title = l.did;
     li.appendChild(who);
-    if (typeof l.text === 'string') li.appendChild(el('span', 'text', '“' + l.text + '”'));
+    if (withText && !l.o && typeof l.text === 'string') li.appendChild(el('span', 'text', '“' + l.text + '”'));
     return li;
   }
 
-  function render() {
-    if (!held.length) return;
-    var frag = document.createDocumentFragment();
-    for (var i = 0; i < held.length; i++) frag.appendChild(lineEl(held[i]));
-    list.insertBefore(frag, list.firstChild);
-    while (list.childNodes.length > MAX) list.removeChild(list.lastChild);
-    held = [];
+  // A ticker: lines wait in a short queue (newest kept, oldest dropped)
+  // and enter at the top one at a time; past ROWS_KEPT they leave the page.
+  function ticker(list, withText) {
+    var queue = [];
+    return {
+      push: function (l) {
+        queue.push(l);
+        if (queue.length > QUEUE_MAX) queue.splice(0, queue.length - QUEUE_MAX);
+      },
+      step: function () {
+        if (!queue.length) return;
+        list.insertBefore(lineEl(queue.shift(), withText), list.firstChild);
+        while (list.childNodes.length > ROWS_KEPT) list.removeChild(list.lastChild);
+      },
+      clear: function () {
+        queue.length = 0;
+        list.replaceChildren();
+      }
+    };
   }
+  var firehoseTicker = ticker(arrivingList, false);
+  var indexedTicker = ticker(indexedList, true);
 
   function onLines(e) {
     var lines;
     try { lines = JSON.parse(e.data); } catch (x) { return; }
-    // A batch is newest last; held is newest first.
-    for (var i = 0; i < lines.length; i++) held.unshift(lines[i]);
-    if (held.length > MAX) held.length = MAX;
-    if (paused) {
-      pauseBtn.textContent = 'Resume (' + held.length + ' new lines)';
-      return;
+    // A batch is newest last.
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].f) firehoseTicker.push(lines[i]);
+      if (lines[i].i) indexedTicker.push(lines[i]);
     }
-    if (document.visibilityState === 'hidden') return;
-    render();
   }
+
+  // The pace: paused or hidden, the tickers stand still and only their
+  // short queues refresh.
+  setInterval(function () {
+    if (paused || document.visibilityState === 'hidden') return;
+    firehoseTicker.step();
+    indexedTicker.step();
+  }, PACE_MS);
 
   function onCounts(e) {
     var c;
@@ -135,14 +178,16 @@
       else rest += c.kinds[k];
     });
     if (rest > 0) indexed.appendChild(fact('other', per(rest)));
-    var filtered = kindSel.value || sourceSel.value;
-    var offered = c.shown + c.not_shown;
-    var of = filtered ? offered : Math.max(offered, c.indexed);
-    if (of > c.shown) indexed.appendChild(el('p', 'muted', 'Showing about ' + fmt(c.shown / secs) + ' of ' + fmt(of / secs) + ' per second.'));
+    var reasons = Object.keys(c.reasons || {});
+    var skippedN = reasons.reduce(function (n, r) { return n + c.reasons[r]; }, 0);
+    var arrivingN = (kindSel.value || sourceSel.value) ? c.shown + c.not_shown : c.indexed + skippedN + c.unchanged + c.failed;
+    var pace = 1000 / PACE_MS;
+    if (arrivingN / secs > pace) {
+      indexed.appendChild(el('p', 'muted', 'The tickers show up to ' + fmt(pace) + ' lines a second each, a sample of about ' + fmt(arrivingN / secs) + ' arriving.'));
+    }
     box.appendChild(indexed);
     var skipped = el('div');
     skipped.appendChild(el('h3', null, 'Skipped and rejected'));
-    var reasons = Object.keys(c.reasons || {});
     if (!reasons.length) skipped.appendChild(el('p', 'muted', 'None in the last second.'));
     reasons.forEach(function (r) { skipped.appendChild(fact(REASON[r] || r, per(c.reasons[r]))); });
     box.appendChild(skipped);
@@ -200,11 +245,12 @@
   }
 
   function refilter() {
-    held = [];
-    list.replaceChildren();
+    firehoseTicker.clear();
+    indexedTicker.clear();
     connect();
   }
 
+  // Pause freezes both tickers; their queues keep only the newest lines.
   pauseBtn.addEventListener('click', function () {
     paused = !paused;
     if (paused) {
@@ -213,14 +259,10 @@
     } else {
       pauseBtn.textContent = 'Pause';
       if (!stopped) setStatus('live', 'on');
-      render();
     }
   });
   kindSel.addEventListener('change', refilter);
   sourceSel.addEventListener('change', refilter);
-  document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'visible' && !paused) render();
-  });
 
   // The tiles, every 30 seconds, without reloading the page (§5.4).
   function refreshTiles() {
@@ -242,7 +284,7 @@
   }
 
   controls.hidden = false;
-  list.hidden = false;
+  tickers.hidden = false;
   setStatus('connecting…');
   connect();
   setInterval(refreshTiles, 30000);

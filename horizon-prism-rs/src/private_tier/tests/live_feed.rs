@@ -89,8 +89,11 @@ async fn t_f4_private_content_never_in_a_line() {
         assert_eq!(line["who"], "alice.test", "{kind}");
         assert!(line.get("text").is_none(), "{kind} has no text");
         let keys: Vec<&String> = line.as_object().expect("object").keys().collect();
-        assert!(keys.iter().all(|k| ["t", "src", "relay", "act", "k", "did", "who"].contains(&k.as_str())), "{keys:?}");
+        assert!(keys.iter().all(|k| ["t", "src", "relay", "act", "k", "o", "f", "i", "did", "who"].contains(&k.as_str())), "{keys:?}");
     }
+    // A line that was not indexed (skipped, rejected, a duplicate) never
+    // has text and is never on the indexed ticker.
+    assert!(all.iter().filter(|l| l.get("o").is_some()).all(|l| l.get("text").is_none() && l.get("i").is_none()), "{all:?}");
     // The public marker is in its own line's snippet and nowhere else.
     let public: Vec<&Value> = all.iter().filter(|l| l.to_string().contains(PUBLIC_TEXT)).collect();
     assert_eq!(public.len(), 1, "{all:?}");
