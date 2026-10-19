@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+{% block head %}{% endblock %}
+<title>{{ title }} · Prism admin</title>
+<link rel="stylesheet" href="{{ css }}">
+</head>
+<body>
+<header class="top">
+<a class="brand" href="/admin">
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 3 20h18z"/><path d="M12 2v18"/><path d="m7.5 11 4.5 9"/></svg>
+<span>Prism</span>
+</a>
+{% if let Some(nav) = nav %}
+<nav>
+<a href="/admin"{% if nav.current == "home" %} aria-current="page"{% endif %}>Home</a>
+<a href="/admin/members"{% if nav.current == "members" %} aria-current="page"{% endif %}>Members</a>
+<a href="/admin/activity"{% if nav.current == "activity" %} aria-current="page"{% endif %}>Activity</a>
+<a href="/admin/operators"{% if nav.current == "operators" %} aria-current="page"{% endif %}>Operators</a>
+</nav>
+<span class="bar-end">
+<span class="muted who">{{ nav.who }}</span>
+<form class="inline" method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ nav.csrf }}"><button class="secondary" type="submit">Sign out</button></form>
+</span>
+{% else %}
+<span class="muted">admin</span>
+{% endif %}
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

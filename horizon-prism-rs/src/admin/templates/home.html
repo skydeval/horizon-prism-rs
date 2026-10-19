@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block head %}<meta http-equiv="refresh" content="30">{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<div class="grid">
+<div class="card">
+<h2>Members</h2>
+<div class="stat"><span class="l">Ready</span><span class="n">{{ ready }}</span></div>
+<div class="stat"><span class="l">Members</span><span class="n">{{ members }}</span></div>
+<div class="stat"><span class="l">Limit for auto-join</span><span class="n">{{ max_members }}</span></div>
+<div class="stat"><span class="l">Denied accounts</span><span class="n">{{ denied }}</span></div>
+<p><a href="/admin/members">Manage members</a></p>
+</div>
+<div class="card">
+<h2>Recent changes</h2>
+{% for c in recent %}
+<div class="fact"><span class="l">{{ c.when }}</span><span class="v"><a href="/admin/commands/{{ c.id }}">{{ c.what }}</a> · {{ c.outcome }}</span></div>
+{% else %}
+<p class="muted">Nothing yet.</p>
+{% endfor %}
+<p><a href="/admin/activity">All activity</a></p>
+</div>
+</div>
+{% endblock %}

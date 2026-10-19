@@ -563,6 +563,35 @@ impl NetClient {
         self.send(Method::POST, url, Some(bytes), options).await
     }
 
+    /// `method url` with a body the caller encoded (its `Content-Type` among
+    /// `options.headers`), returning the capped body and the response's
+    /// headers whatever the status. For a protocol client that needs both,
+    /// such as the admin UI's OAuth client (form bodies, `DPoP-Nonce`).
+    ///
+    /// # Errors
+    ///
+    /// Any [`NetError`] other than [`NetError::Decode`].
+    pub async fn request_raw(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<Vec<u8>>,
+        options: &RequestOptions,
+    ) -> Result<(NetResponse, HeaderMap), NetError> {
+        let parsed = self.check_url(url)?;
+        let mut headers = HeaderMap::new();
+        for (name, value) in &options.headers {
+            headers.insert(name.clone(), value.clone());
+        }
+        let mut request = self.http.request(method, parsed).timeout(options.timeout).headers(headers);
+        if let Some(bytes) = body {
+            request = request.body(bytes);
+        }
+        let response = request.send().await.map_err(NetError::from_reqwest)?;
+        let response_headers = response.headers().clone();
+        Ok((read_capped(response, options.body_cap).await?, response_headers))
+    }
+
     async fn send(
         &self,
         method: Method,

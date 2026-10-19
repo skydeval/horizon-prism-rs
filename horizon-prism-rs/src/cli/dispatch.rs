@@ -91,6 +91,46 @@ pub enum AdminCmd {
     },
     /// Print a fresh service signing key, its did:key and a correlation key.
     Keygen,
+    /// Who may use the web admin UI, and from which servers (admin-ui
+    /// design §5.7). The break-glass when nobody can sign in.
+    Operator {
+        #[command(subcommand)]
+        action: OperatorAction,
+    },
+    /// Print the first-run setup code while no operator exists (read-only).
+    SetupCode,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OperatorAction {
+    /// Add an operator; their server's exact host is allowed unless a
+    /// pattern already covers it. With no operator yet, this also closes
+    /// first-run setup.
+    Add {
+        /// A handle or DID.
+        account: String,
+        /// Your own label for them, e.g. a name.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Remove an operator (never the last one).
+    Remove { did: String },
+    /// Operators and allowed servers (read-only).
+    List,
+    /// The servers operators may sign in from.
+    Host {
+        #[command(subcommand)]
+        action: HostAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HostAction {
+    /// Allow a server: an exact host, or `*.` and a host for every server
+    /// under it.
+    Add { pattern: String },
+    /// Stop allowing a server (refused if no operator could sign in).
+    Remove { pattern: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,7 +273,21 @@ impl AdminCmd {
             | Self::Deadletter { action: DeadletterAction::List { .. } }
             | Self::Stream { .. }
             | Self::Commands { .. }
+            | Self::Operator { action: OperatorAction::List }
+            | Self::SetupCode
             | Self::Keygen => return Err("read-only commands run in the CLI".to_string()),
+            Self::Operator { action: OperatorAction::Add { account, note } } => AdminCommand::OperatorAdd {
+                input: account.trim().trim_start_matches('@').to_ascii_lowercase(),
+                note: note.clone(),
+                add_host: true,
+            },
+            Self::Operator { action: OperatorAction::Remove { did } } => AdminCommand::OperatorRemove { did: did.clone() },
+            Self::Operator { action: OperatorAction::Host { action: HostAction::Add { pattern } } } => AdminCommand::OperatorHostAdd {
+                pattern: crate::admin::operators::parse_pattern(pattern)?,
+            },
+            Self::Operator { action: OperatorAction::Host { action: HostAction::Remove { pattern } } } => {
+                AdminCommand::OperatorHostRemove { pattern: pattern.trim().to_ascii_lowercase() }
+            }
             Self::Member { action: MemberAction::Add { did } } => AdminCommand::MemberAdd { did: did.clone() },
             Self::Member { action: MemberAction::Remove { did } } => AdminCommand::MemberRemove { did: did.clone() },
             Self::Member { action: MemberAction::Deny { did, reason } } => AdminCommand::MemberDeny {
@@ -284,11 +338,22 @@ impl AdminCmd {
 ///
 /// Database errors.
 pub async fn submit(pool: &PgPool, cmd: &AdminCommand) -> Result<i64, sqlx::Error> {
+    submit_as(pool, cmd, None).await
+}
+
+/// [`submit`] for a requester: the operator DID behind a command made in
+/// the admin UI, or `None` for the CLI (admin-ui design §5.8).
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn submit_as(pool: &PgPool, cmd: &AdminCommand, requested_by: Option<&str>) -> Result<i64, sqlx::Error> {
     let (command, args) = cmd.to_row();
     let mut tx = pool.begin().await?;
-    let id: i64 = sqlx::query_scalar("INSERT INTO admin_commands (command, args) VALUES ($1, $2) RETURNING id")
+    let id: i64 = sqlx::query_scalar("INSERT INTO admin_commands (command, args, requested_by) VALUES ($1, $2, $3) RETURNING id")
         .bind(command)
         .bind(&args)
+        .bind(requested_by)
         .fetch_one(&mut *tx)
         .await?;
     sqlx::query("SELECT pg_notify($1, $2)")
@@ -340,7 +405,7 @@ fn finish(result: Result<String, String>) -> u8 {
 }
 
 async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
-    use commands::{admin_commands_list, deadletter_list, keygen, label_list, member_list, stream_info};
+    use commands::{admin_commands_list, deadletter_list, keygen, label_list, member_list, operator_list, setup_code, stream_info};
     if let AdminCmd::Keygen = cmd {
         return Some(Ok(keygen::render()));
     }
@@ -351,6 +416,8 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
             | AdminCmd::Deadletter { action: DeadletterAction::List { .. } }
             | AdminCmd::Stream { .. }
             | AdminCmd::Commands { .. }
+            | AdminCmd::Operator { action: OperatorAction::List }
+            | AdminCmd::SetupCode
     );
     if !is_read_only {
         return None;
@@ -380,6 +447,10 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
                     let mut redis = commands::redis(&cfg).await?;
                     stream_info::render(&mut redis, &cfg.file.firehose.stream_key, &cfg.file.firehose.group).await
                 }
+                AdminCmd::Operator { action: OperatorAction::List } => {
+                    operator_list::render(&commands::pool(&cfg).await?).await.map_err(|e| e.to_string())
+                }
+                AdminCmd::SetupCode => setup_code::render(&commands::pool(&cfg).await?, &cfg.env.data_dir).await,
                 _ => Err("not a read-only command".to_string()),
             }
         }
@@ -498,5 +569,13 @@ mod tests {
         assert_eq!(allow.to_command(), Ok(AdminCommand::MemberAllow { did: did.into() }));
         assert!(AdminCmd::Member { action: MemberAction::Deny { did: "bob".into(), reason: None } }.to_command().is_err());
         assert!(AdminCmd::Member { action: MemberAction::List { denied: true } }.to_command().is_err(), "read-only");
+        // `operator add` from the CLI allows the account's exact host.
+        let add = AdminCmd::Operator { action: OperatorAction::Add { account: "@Alice.Example.com".into(), note: None } };
+        assert_eq!(add.to_command(), Ok(AdminCommand::OperatorAdd { input: "alice.example.com".into(), note: None, add_host: true }));
+        let host = AdminCmd::Operator { action: OperatorAction::Host { action: HostAction::Add { pattern: "*.Host.Bsky.Network".into() } } };
+        assert_eq!(host.to_command(), Ok(AdminCommand::OperatorHostAdd { pattern: "*.host.bsky.network".into() }));
+        assert!(AdminCmd::Operator { action: OperatorAction::Host { action: HostAction::Add { pattern: "https://x".into() } } }.to_command().is_err());
+        assert!(AdminCmd::Operator { action: OperatorAction::List }.to_command().is_err(), "read-only");
+        assert!(AdminCmd::SetupCode.to_command().is_err(), "read-only");
     }
 }

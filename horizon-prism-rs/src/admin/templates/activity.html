@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<form class="filters card" method="get" action="/admin/activity">
+<label for="who">Who</label>
+<input type="text" id="who" name="who" value="{{ who }}" placeholder="handle, DID, or cli">
+<label for="what">What</label>
+<select id="what" name="what">
+<option value="">anything</option>
+{% for n in command_names %}<option value="{{ n }}"{% if *n == what %} selected{% endif %}>{{ n }}</option>
+{% endfor %}
+</select>
+<label for="state">State</label>
+<select id="state" name="state">
+<option value="">any</option>
+<option value="queued"{% if state == "queued" %} selected{% endif %}>waiting</option>
+<option value="running"{% if state == "running" %} selected{% endif %}>running</option>
+<option value="done"{% if state == "done" %} selected{% endif %}>done</option>
+<option value="failed"{% if state == "failed" %} selected{% endif %}>failed</option>
+</select>
+<button type="submit">Filter</button>
+</form>
+
+<h2>Changes</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>When</th><th>Who</th><th>What</th><th>Outcome</th></tr></thead>
+<tbody>
+{% for c in commands %}
+<tr>
+<td>{{ c.when }}</td>
+<td>{{ c.who }}</td>
+<td><a href="/admin/commands/{{ c.id }}">{{ c.what }}</a></td>
+<td>{{ c.outcome }}{% if !c.raw.is_empty() %}<details><summary>Details</summary><pre>{{ c.raw }}</pre></details>{% endif %}</td>
+</tr>
+{% else %}
+<tr><td colspan="4" class="muted">No changes match.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<div class="row">
+{% if let Some(p) = prev %}<a class="button secondary" href="{{ p }}">Newer</a>{% endif %}
+{% if let Some(n) = next %}<a class="button secondary" href="{{ n }}">Older</a>{% endif %}
+</div>
+
+<h2>Sign-ins</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>When</th><th>Account</th><th>What happened</th><th>From</th></tr></thead>
+<tbody>
+{% for l in logins %}
+<tr><td>{{ l.at }}</td><td>{{ l.who }}</td><td>{{ l.outcome }}</td><td><code>{{ l.client_ip }}</code></td></tr>
+{% else %}
+<tr><td colspan="4" class="muted">No sign-ins yet.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endblock %}

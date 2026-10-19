@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+{% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
+<div class="card">
+<form class="stack" method="post" action="/admin/login">
+<input type="hidden" name="presession" value="{{ presession }}">
+<label for="input">Your handle or DID</label>
+<input type="text" id="input" name="input" value="{{ input }}" autocomplete="username" spellcheck="false" placeholder="you.example.com" required autofocus>
+<div class="hint">You sign in on your account's own server. Only this Prism's operators can sign in here.</div>
+<div class="row"><button type="submit">Sign in</button></div>
+</form>
+</div>
+{% endblock %}

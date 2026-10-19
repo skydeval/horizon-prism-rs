@@ -5,11 +5,15 @@
 //! runs it ([`Handlers::execute`]) through the same code paths and locks as
 //! the rest of `serve`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use redis::aio::ConnectionManager;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+
+use crate::admin::operators::{self, OperatorIdentity};
+pub use crate::admin::operators::Actor;
 
 use crate::aggregations::membership::{self, AddOutcome, Denial, add_member, is_denied};
 use crate::aggregations::purge::PurgeError;
@@ -62,7 +66,22 @@ pub enum AdminCommand {
     IndexingPublicScope { value: ScopeValue },
     /// `indexing status`: the switch's row, mode, phase and progress.
     IndexingStatus,
+    /// `operator add <handle-or-did> [--note]` (admin-ui design §5.7): the
+    /// account is resolved afresh here. With `add_host` (the CLI), its
+    /// exact host is allowed unless a pattern covers it; without (the UI),
+    /// a host the list does not allow fails the command.
+    OperatorAdd { input: String, note: Option<String>, add_host: bool },
+    /// `operator remove <did>`: never the last operator.
+    OperatorRemove { did: String },
+    /// `operator host add <pattern>`.
+    OperatorHostAdd { pattern: String },
+    /// `operator host remove <pattern>`: refused when no operator's last
+    /// known host would stay allowed.
+    OperatorHostRemove { pattern: String },
 }
+
+/// The longest operator note accepted.
+pub const MAX_NOTE: usize = 300;
 
 /// A command that cannot be parsed or is invalid.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -101,6 +120,12 @@ impl AdminCommand {
             Self::ListsPurge { did } => ("lists purge", json!({ "did": did })),
             Self::IndexingPublicScope { value } => ("indexing public-scope", json!({ "value": value.as_str() })),
             Self::IndexingStatus => ("indexing status", json!({})),
+            Self::OperatorAdd { input, note, add_host } => {
+                ("operator add", json!({ "input": input, "note": note, "add_host": add_host }))
+            }
+            Self::OperatorRemove { did } => ("operator remove", json!({ "did": did })),
+            Self::OperatorHostAdd { pattern } => ("operator host add", json!({ "pattern": pattern })),
+            Self::OperatorHostRemove { pattern } => ("operator host remove", json!({ "pattern": pattern })),
         }
     }
 
@@ -191,6 +216,30 @@ impl AdminCommand {
                 }
             }
             "indexing status" => Self::IndexingStatus,
+            "operator add" => {
+                let input = s("input")?;
+                if !(is_did(&input) || (proto_blue::syntax::Handle::is_valid(&input) && input == input.to_ascii_lowercase())) {
+                    return Err(InvalidCommand(format!("{command}: {input:?} is not a DID or a lowercase handle")));
+                }
+                let note = match args.get("note") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(n)) if n.chars().count() <= MAX_NOTE => Some(n.clone()),
+                    Some(_) => return Err(InvalidCommand(format!("{command}: note must be text of at most {MAX_NOTE} characters"))),
+                };
+                Self::OperatorAdd {
+                    input,
+                    note,
+                    add_host: args.get("add_host").and_then(Value::as_bool).unwrap_or(false),
+                }
+            }
+            "operator remove" => Self::OperatorRemove { did: did()? },
+            "operator host add" | "operator host remove" => {
+                let pattern = s("pattern")?;
+                if crate::admin::operators::parse_pattern(&pattern).as_deref() != Ok(pattern.as_str()) {
+                    return Err(InvalidCommand(format!("{command}: {pattern:?} is not a lowercase host or *.host pattern")));
+                }
+                if command == "operator host add" { Self::OperatorHostAdd { pattern } } else { Self::OperatorHostRemove { pattern } }
+            }
             other => return Err(InvalidCommand(format!("unknown command {other:?}"))),
         })
     }
@@ -218,11 +267,25 @@ impl AdminCommand {
             | Self::FarsightStatus
             | Self::IndexingPublicScope { .. }
             | Self::IndexingStatus
+            | Self::OperatorAdd { .. }
+            | Self::OperatorRemove { .. }
+            | Self::OperatorHostAdd { .. }
+            | Self::OperatorHostRemove { .. }
             // A prime writes nothing here, so it waits on no purge.
             | Self::FarsightPrime { .. }
             // Its handler waits on a purge of the viewer itself.
             | Self::FarsightForget { .. } => None,
         }
+    }
+}
+
+/// An operator change's result: done, a plain-words refusal (the command
+/// fails), or a database error.
+fn settled<T: Into<Value>>(result: Result<T, Result<String, sqlx::Error>>) -> Result<Outcome, String> {
+    match result {
+        Ok(v) => Ok(Outcome::Done(v.into())),
+        Err(Ok(refusal)) => Ok(Outcome::Failed(refusal)),
+        Err(Err(e)) => Err(e.to_string()),
     }
 }
 
@@ -257,6 +320,16 @@ pub struct Handlers {
     /// The public-indexing switch, which also spawns the task a phase
     /// change needs (public-indexing design §3.4).
     pub public: PublicIndexing,
+    /// What the operator commands need (admin-ui design §5.7).
+    pub operators: OperatorDeps,
+}
+
+/// What the operator commands need: fresh resolution, and the setup code's
+/// file, deleted when the first operator is added.
+#[derive(Clone, Default)]
+pub struct OperatorDeps {
+    pub identity: Option<Arc<dyn OperatorIdentity>>,
+    pub setup_code_file: Option<PathBuf>,
 }
 
 impl Handlers {
@@ -272,12 +345,13 @@ impl Handlers {
             .await
     }
 
-    /// Run one command.
-    pub async fn execute(&self, cmd: &AdminCommand) -> Outcome {
+    /// Run one command for `actor`, who is recorded as its writer
+    /// (admin-ui design §5.8).
+    pub async fn execute(&self, cmd: &AdminCommand, actor: &Actor) -> Outcome {
         let result = match cmd {
             AdminCommand::MemberAdd { did } => self.member_add(did).await,
             AdminCommand::MemberRemove { did } => self.member_remove(did).await,
-            AdminCommand::MemberDeny { did, reason } => self.member_deny(did, reason.as_deref()).await,
+            AdminCommand::MemberDeny { did, reason } => self.member_deny(did, reason.as_deref(), actor).await,
             AdminCommand::MemberAllow { did } => self.member_allow(did).await,
             AdminCommand::LabelAdd { subject, val } => self.label_add(subject, val).await,
             AdminCommand::LabelRemove { subject, val } => self.label_remove(subject, val).await,
@@ -291,16 +365,58 @@ impl Handlers {
             AdminCommand::FarsightForget { did } => self.farsight_forget(did).await,
             AdminCommand::ListsSync { uri } => self.lists_sync(uri).await,
             AdminCommand::ListsPurge { did } => self.lists_purge(did).await,
-            AdminCommand::IndexingPublicScope { value } => self.indexing_public_scope(*value).await,
+            AdminCommand::IndexingPublicScope { value } => self.indexing_public_scope(*value, actor).await,
             AdminCommand::IndexingStatus => self.public.status().await.map(Outcome::Done).map_err(|e| e.to_string()),
+            AdminCommand::OperatorAdd { input, note, add_host } => self.operator_add(input, note.as_deref(), *add_host, actor).await,
+            AdminCommand::OperatorRemove { did } => settled(operators::remove(&self.pool, did).await),
+            AdminCommand::OperatorHostAdd { pattern } => {
+                operators::host_add(&self.pool, pattern, actor).await.map(Outcome::Done).map_err(|e| e.to_string())
+            }
+            AdminCommand::OperatorHostRemove { pattern } => settled(operators::host_remove(&self.pool, pattern).await),
         };
         result.unwrap_or_else(Outcome::Failed)
     }
 
+    /// `operator add` (admin-ui design §5.7): the account is resolved
+    /// afresh, then one transaction adds it (and, with no operator before
+    /// it, closes setup); the setup code's file goes after the commit.
+    async fn operator_add(&self, input: &str, note: Option<&str>, add_host: bool, actor: &Actor) -> Result<Outcome, String> {
+        let identity = self.operators.identity.as_ref().ok_or_else(|| "identity resolution is not available".to_string())?;
+        let did = if is_did(input) {
+            input.to_string()
+        } else {
+            match identity.resolve_handle(input).await {
+                Some(did) => did,
+                None => return Ok(Outcome::Failed(format!("{input} could not be resolved to an account"))),
+            }
+        };
+        let info = match identity.resolve_fresh(&did).await {
+            Ok(info) => info,
+            Err(e) => return Ok(Outcome::Failed(format!("{did} could not be resolved: {e}"))),
+        };
+        let Some(endpoint) = info.pds_endpoint.as_deref().and_then(operators::normalize_endpoint) else {
+            return Ok(Outcome::Failed(format!("{did} names no server")));
+        };
+        let Some(host) = operators::endpoint_host(&endpoint) else {
+            return Ok(Outcome::Failed(format!("{did}'s server address could not be read")));
+        };
+        let who = operators::Resolved { did, endpoint, host };
+        match operators::add(&self.pool, &who, note, add_host, actor).await {
+            Ok((result, closed)) => {
+                if closed && let Some(path) = &self.operators.setup_code_file {
+                    crate::admin::setup_code::delete_file(path);
+                }
+                tracing::info!(event = "operator_added", did = %who.did, host = %who.host, by = actor.label(), "admin operator added");
+                Ok(Outcome::Done(result))
+            }
+            Err(failure) => settled::<Value>(Err(failure)),
+        }
+    }
+
     /// `indexing public-scope` (public-indexing design §3.4): the command's
     /// transaction, then the task its phase change needs.
-    async fn indexing_public_scope(&self, value: ScopeValue) -> Result<Outcome, String> {
-        let applied = self.public.apply_scope(value, "cli").await.map_err(|e| e.to_string())?;
+    async fn indexing_public_scope(&self, value: ScopeValue, actor: &Actor) -> Result<Outcome, String> {
+        let applied = self.public.apply_scope(value, actor.label()).await.map_err(|e| e.to_string())?;
         let task = applied.spawn.map(|task| {
             let kind = task.kind();
             drop(self.public.spawn(task));
@@ -467,7 +583,7 @@ impl Handlers {
     /// which decides whether the DID is a member. `Marked`: the batches and
     /// the end run in the background, as for `member remove`. `Skipped`:
     /// the denial alone was committed.
-    async fn member_deny(&self, did: &str, reason: Option<&str>) -> Result<Outcome, String> {
+    async fn member_deny(&self, did: &str, reason: Option<&str>, actor: &Actor) -> Result<Outcome, String> {
         let db = |e: sqlx::Error| e.to_string();
         // A shortcut: the marker's own `Busy` check is the authority.
         if self.purging(did).await.map_err(db)? {
@@ -479,7 +595,7 @@ impl Handlers {
         let denial = Denial {
             did: did.to_string(),
             reason: reason.map(str::to_string),
-            denied_by: "cli".to_string(),
+            denied_by: actor.label().to_string(),
         };
         let removed = match self.purger.marker_guarded(did, PurgeKind::MemberRemoved, &MarkerGuard::Deny(denial)).await {
             Ok(MarkerOutcome::Marked) => {
@@ -712,6 +828,30 @@ mod tests {
             assert_eq!(cmd.did(), None);
         }
         assert!(AdminCommand::parse("indexing public-scope", &json!({"value": "full"})).is_err());
+        // The operator commands (admin-ui design §11) round-trip and wait
+        // on no purge; arguments are checked as the design says.
+        for cmd in [
+            AdminCommand::OperatorAdd { input: DID.into(), note: Some("me".into()), add_host: true },
+            AdminCommand::OperatorAdd { input: "alice.example.com".into(), note: None, add_host: false },
+            AdminCommand::OperatorRemove { did: DID.into() },
+            AdminCommand::OperatorHostAdd { pattern: "*.host.bsky.network".into() },
+            AdminCommand::OperatorHostRemove { pattern: "pds.example.com".into() },
+        ] {
+            let (name, args) = cmd.to_row();
+            assert_eq!(AdminCommand::parse(name, &args), Ok(cmd.clone()));
+            assert_eq!(cmd.did(), None);
+        }
+        for (name, args) in [
+            ("operator add", json!({"input": "https://pds.example.com"})),
+            ("operator add", json!({"input": "Alice.Example.com"})),
+            ("operator add", json!({"input": DID, "note": "x".repeat(MAX_NOTE + 1)})),
+            ("operator remove", json!({"did": "alice"})),
+            ("operator host add", json!({"pattern": "PDS.example.com"})),
+            ("operator host add", json!({"pattern": "https://pds.example.com"})),
+            ("operator host remove", json!({"pattern": "*.*.example"})),
+        ] {
+            assert!(AdminCommand::parse(name, &args).is_err(), "{name} {args}");
+        }
     }
 
     #[test]

@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Operators run this Prism and may use these pages. They sign in with their own account, on its own
+server; that server must be on the list below.</p>
+
+<h2>Operators</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>Account</th><th>Note</th><th>Server (last seen)</th><th>Added</th><th></th></tr></thead>
+<tbody>
+{% for o in operators %}
+<tr>
+<td>{% if !o.handle.is_empty() %}<strong>{{ o.handle }}</strong><br>{% endif %}<code>{{ o.did }}</code></td>
+<td>{{ o.note }}</td>
+<td>{% if o.host.is_empty() %}unknown{% else %}{{ o.host }}{% endif %}<br><span class="muted">checked {{ o.checked }}</span>{% if !o.can_sign_in %}<br><span class="bad">cannot sign in: server not allowed</span>{% endif %}</td>
+<td>{{ o.added }}<br><span class="muted">by {{ o.added_by }}</span></td>
+<td class="actions"><form class="inline" method="post" action="/admin/operators/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ o.did }}"><button class="secondary" type="submit">Remove</button></form></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<div class="card">
+<h3>Add an operator</h3>
+<form class="stack" method="post" action="/admin/operators/add">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="op-input">Handle or DID</label>
+<input type="text" id="op-input" name="input" spellcheck="false" required>
+<label for="op-note">Note (for yourselves, e.g. a name)</label>
+<input type="text" id="op-note" name="note">
+<div class="row"><button type="submit">Add operator</button></div>
+</form>
+</div>
+
+<h2>Servers operators may sign in from</h2>
+<div class="banner">Only list servers where you control who can have an account. If someone took over an operator's
+account identity, they would have to move it to one of these servers to sign in here. A large shared server
+(such as <code>*.host.bsky.network</code>) is allowed, but anyone who can make an account there with a stolen identity
+could use it.</div>
+{% if hosts.is_empty() %}
+<div class="banner bad">No server is listed, so an operator on any server can sign in. Only the operator list decides
+who.</div>
+{% endif %}
+<div class="scroll">
+<table>
+<thead><tr><th>Server</th><th>Operators it covers</th><th>Added</th><th></th></tr></thead>
+<tbody>
+{% for h in hosts %}
+<tr>
+<td><code>{{ h.pattern }}</code></td>
+<td>{{ h.covers }}</td>
+<td>{{ h.added }}<br><span class="muted">by {{ h.added_by }}</span></td>
+<td class="actions"><form class="inline" method="post" action="/admin/operators/hosts/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pattern" value="{{ h.pattern }}"><button class="secondary" type="submit">Remove</button></form></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<div class="card">
+<h3>Allow a server</h3>
+<form class="stack" method="post" action="/admin/operators/hosts/add">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="pattern">Server name, or <code>*.</code> and a name for every server under it</label>
+<input type="text" id="pattern" name="pattern" spellcheck="false" placeholder="pds.example.com" required>
+<div class="row"><button type="submit">Allow</button></div>
+</form>
+</div>
+{% endblock %}

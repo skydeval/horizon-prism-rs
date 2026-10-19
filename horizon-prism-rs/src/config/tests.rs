@@ -171,6 +171,9 @@ lock_timeout_secs = 30
 
 [admin]
 command_timeout_secs = 600
+web_ui = true
+session_idle_secs = 28800
+session_max_secs = 604800
 
 [cache]
 read_time_bytes = 268435456
@@ -858,6 +861,20 @@ fn pds_patterns_are_checked() {
     for good in ["pds.example.org", "*.host.bsky.network", "bsky.social"] {
         assert!(pds_pattern(good).is_ok(), "{good}");
     }
+}
+
+/// Admin UI sessions (admin-ui design §5.4, §13): on by default, eight
+/// hours idle and seven days at most; idle may not exceed the maximum.
+#[test]
+fn admin_ui_sessions_are_checked() {
+    let cfg = load("").expect("defaults");
+    assert!(cfg.file.admin.web_ui);
+    assert_eq!((cfg.file.admin.session_idle_secs, cfg.file.admin.session_max_secs), (28_800, 604_800));
+    let p = invalid_problems(load("[admin]\nsession_idle_secs = 700000\n"));
+    assert!(has(&p, "admin.session_idle_secs must not exceed"));
+    let p = invalid_problems(load("[admin]\nsession_idle_secs = 0\n"));
+    assert!(has(&p, "admin.session_idle_secs must be greater than 0"));
+    assert!(!load("[admin]\nweb_ui = false\n").expect("valid").file.admin.web_ui);
 }
 
 #[test]

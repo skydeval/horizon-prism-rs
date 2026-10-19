@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<div class="grid">
+<div class="card">
+<div class="stat"><span class="l">Members</span><span class="n">{{ total }}</span></div>
+<div class="stat"><span class="l">Ready</span><span class="n">{{ ready }}</span></div>
+<div class="stat"><span class="l">Limit for auto-join</span><span class="n">{{ max_members }}</span></div>
+<p class="muted">Members you add yourself are always accepted and count toward the limit.</p>
+</div>
+<div class="card">
+<h2>Auto-join</h2>
+{% if auto_enroll %}
+<p>On. An account on {{ patterns }} becomes a member the first time it opens a Horizon app.</p>
+{% else %}
+<p>Off. Only the people you add are members.</p>
+{% endif %}
+<p class="muted tech">technical name: community.auto_enroll, community.enroll_pds_patterns</p>
+</div>
+<div class="card">
+<h2>Add a member</h2>
+<form class="stack" method="post" action="/admin/members/add">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="add-input">Handle or DID</label>
+<input type="text" id="add-input" name="input" spellcheck="false" placeholder="someone.example.com" required>
+<div class="row"><button type="submit">Add member</button></div>
+</form>
+</div>
+</div>
+
+<h2>Members</h2>
+<p class="muted">"Ready" means Prism has finished its first sync of the account and can serve its private posts. If an
+account says "not receiving updates", the account's server is not reaching Prism through any relay it reads.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>Account</th><th>How</th><th>Added</th><th>Ready</th><th>First ready</th><th>Private posts</th><th></th></tr></thead>
+<tbody>
+{% for m in rows %}
+<tr>
+<td>{% if !m.handle.is_empty() %}<strong>{{ m.handle }}</strong><br>{% endif %}<code>{{ m.did }}</code>{% if !m.diverged.is_empty() %}<br><span class="bad">not receiving this member's updates since {{ m.diverged }}</span>{% endif %}</td>
+<td>{{ m.source }}</td>
+<td>{{ m.added }}</td>
+<td>{{ m.ready }}</td>
+<td>{{ m.first_ready }}</td>
+<td>{% if m.owner %}has private posts{% else %}—{% endif %}</td>
+<td class="actions">
+<form class="inline" method="post" action="/admin/members/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ m.did }}"><button class="secondary" type="submit">Remove</button></form>
+<form class="inline" method="post" action="/admin/members/deny"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ m.did }}"><button class="secondary" type="submit">Deny</button></form>
+</td>
+</tr>
+{% else %}
+<tr><td colspan="7" class="muted">No members yet.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<div class="row">
+{% if prev.is_some() || next.is_some() %}<span class="muted">Page {{ page + 1 }}</span>{% endif %}
+{% if let Some(p) = prev %}<a class="button secondary" href="/admin/members?page={{ p }}">Previous</a>{% endif %}
+{% if let Some(n) = next %}<a class="button secondary" href="/admin/members?page={{ n }}">Next</a>{% endif %}
+</div>
+
+<h2>Denied accounts</h2>
+<p class="muted">A denied account never joins by itself, and cannot be added until the denial is lifted. Lifting it does
+not add them.</p>
+<div class="card">
+<h3>Deny an account</h3>
+<form class="stack" method="post" action="/admin/members/deny">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="deny-did">DID</label>
+<input type="text" id="deny-did" name="did" spellcheck="false" placeholder="did:plc:…" required>
+<label for="deny-reason">Your note (never shown to them)</label>
+<input type="text" id="deny-reason" name="reason">
+<div class="row"><button class="secondary" type="submit">Deny…</button></div>
+</form>
+</div>
+<div class="scroll">
+<table>
+<thead><tr><th>Account</th><th>Note</th><th>By</th><th>When</th><th></th></tr></thead>
+<tbody>
+{% for d in denials %}
+<tr>
+<td>{% if !d.handle.is_empty() %}<strong>{{ d.handle }}</strong><br>{% endif %}<code>{{ d.did }}</code></td>
+<td>{{ d.reason }}</td>
+<td>{{ d.by }}</td>
+<td>{{ d.at }}</td>
+<td class="actions"><form class="inline" method="post" action="/admin/members/allow"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ d.did }}"><button class="secondary" type="submit">Lift denial</button></form></td>
+</tr>
+{% else %}
+<tr><td colspan="5" class="muted">No denied accounts.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endblock %}

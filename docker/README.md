@@ -88,7 +88,15 @@ curl -fsS https://<APP_PUBLIC_HOSTNAME>/.well-known/did.json
 
 The first must return `"ok":true`; anonymously it shows only `ok` and `version`, and the full body (db, redis, audit guard, watermarks) needs a service JWT with `lxm` `_health`. The second must show `did:web:<APP_PUBLIC_HOSTNAME>`.
 
-**10. Add yourself as a member.**
+**10. Become the operator.** While the instance has no operator, `app` prints a one-time setup code in its log at every start and every 10 minutes (event `admin_setup_code`). Read it:
+
+```sh
+docker compose logs app | grep admin_setup_code
+```
+
+or print it again with `docker compose exec app /app/horizon-prism-rs admin setup-code`. Open `https://<APP_PUBLIC_HOSTNAME>/admin/setup`, enter the code and your handle, and sign in on your account's own server. You become the first operator, and your server becomes the first one allowed for operator sign-in. The code is good for 24 hours (restart `app` for a new one) and stops working once an operator exists. Finish this promptly: anyone who can read the container's logs can see the code. See "Web admin UI" below.
+
+**11. Add yourself as a member.**
 
 With auto-enroll on, a client also enrols you the first time it loads your timeline or notifications, but only if your PDS host matches `community.enroll_pds_patterns` and `community.max_members` has not been reached. Members on other PDSes must be added here.
 
@@ -171,11 +179,24 @@ Add each one that should stay an owner with `admin member add`, then upgrade.
 docker compose exec -T db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' < backup-YYYYMMDDTHHMMSS.dump
 ```
 
+## Web admin UI
+
+`app` serves an admin UI at `https://<APP_PUBLIC_HOSTNAME>/admin`: members (list with readiness, add, remove, deny, allow), activity (every change, who made it and how it ended, and the sign-ins), and operators. Every change it makes is an admin command, run exactly as the CLI's, with the operator who asked recorded.
+
+- **Who can sign in.** Operators sign in with their own ATProto account, on their account's own server (OAuth). Only accounts on the operator list may sign in, and only from a server on the allowed list. An empty allowed list allows any server (the operator list still decides who). A session ends after 8 hours unused or 7 days (`admin.session_idle_secs`, `admin.session_max_secs`), and at once if the operator's account moves to another server.
+- **The CLI break-glass.** `admin operator add <handle-or-did> [--note <text>]` adds an operator and allows the exact host of their server (unless a listed pattern already covers it); with no operator yet it also closes first-run setup. `admin operator remove <did>` (never the last one), `admin operator list`, `admin operator host add <pattern>` and `admin operator host remove <pattern>` (refused if no operator could still sign in). A pattern is a host (`pds.example.com`) or `*.` and a host (`*.host.bsky.network`).
+- **Locked out.** Run `admin operator add` for an account that can sign in. Setup never reopens on its own. As a last resort, deleting every row of `admin_operators` with SQL reopens first-run setup at the next restart.
+- **Turning it off.** `admin.web_ui = false` in `config/app.toml` mounts no `/admin` route; the CLI is then the whole admin surface.
+- **Behind a CDN.** Every `/admin` page is sent with `Cache-Control: no-store` and uses no JavaScript. Putting `/admin*` behind your CDN's access control as well is optional.
+
+**Upgrading to this version:** an existing deployment has no operator yet, so it enters first-run setup: read the code with `docker compose logs app | grep admin_setup_code` and finish at `/admin/setup`, or run `admin operator add` for your account.
+
 ## Admin commands
 
 Commands that change state are executed by the running `app` service, not by the `docker compose exec` process you type them in:
 - `member add` and `member remove`;
 - `member deny <did> [--reason <text>]` and `member allow <did>` (below);
+- `operator add`, `operator remove`, `operator host add` and `operator host remove` (above);
 - `label add` and `label remove`;
 - `scope rebuild`, `backfill` and `resync`;
 - `deadletter replay` and `deadletter drop`;
@@ -184,7 +205,7 @@ Commands that change state are executed by the running `app` service, not by the
 
 The CLI queues the command and waits up to `admin.command_timeout_secs` (600 s) for the result. If it times out, the command keeps running, and `admin commands list` shows its state. `app` must be running for these commands to take effect.
 
-Read-only commands (`… list`, `stream info`, `migrate status`, `keygen`) run directly.
+Read-only commands (`… list`, `stream info`, `migrate status`, `keygen`, `setup-code`) run directly.
 
 ### Denying membership
 

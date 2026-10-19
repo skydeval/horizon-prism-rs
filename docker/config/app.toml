@@ -196,6 +196,13 @@ lock_timeout_secs = 30
 # Mutating admin commands are executed by `serve` (design §3.3); the CLI waits
 # this long for completion before giving up (the command keeps running).
 command_timeout_secs = 600
+# The web admin UI under /admin (admin-ui design §3). false mounts no /admin
+# route, and the CLI is the whole admin surface.
+web_ui = true
+# An admin UI session ends after 8 hours without use, and 7 days after
+# sign-in in any case (admin-ui design §5.4).
+session_idle_secs = 28800
+session_max_secs = 604800
 
 [cache]
 # In-process read-time cache budget (design §7.6).

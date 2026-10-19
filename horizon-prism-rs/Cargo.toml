@@ -76,6 +76,9 @@ anyhow = "1"
 async-trait = "0.1"
 url = "2"
 unicode-normalization = "0.1"
+# The admin UI's pages (admin-ui design §4): HTML templates under
+# src/admin/templates/, checked against their structs at compile time.
+askama = "0.16"
 
 [dev-dependencies]
 # tokio::time::pause for the lag sampler's hang test (firehose throughput §4.5).

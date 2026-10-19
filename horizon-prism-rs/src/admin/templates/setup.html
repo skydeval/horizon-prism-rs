@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+{% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
+<div class="card">
+<p>This Prism has no operator yet. The first person to finish this page becomes its operator, so it asks for the
+setup code Prism printed in its log when it started (and prints again every 10 minutes).</p>
+<p>On the server, read it with:</p>
+<pre>docker compose logs app | grep admin_setup_code</pre>
+<p class="muted">or print it again with <code>docker compose exec app /app/horizon-prism-rs admin setup-code</code>.
+The code is good for 24 hours; after that, restart Prism for a new one.</p>
+<form class="stack" method="post" action="/admin/setup">
+<input type="hidden" name="presession" value="{{ presession }}">
+<label for="code">Setup code</label>
+<input type="text" id="code" name="code" autocomplete="off" spellcheck="false" placeholder="prs-XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX" required>
+<label for="input">Your handle or DID</label>
+<input type="text" id="input" name="input" value="{{ input }}" autocomplete="username" spellcheck="false" placeholder="you.example.com" required>
+<div class="hint">You sign in with this account on its own server next. Its server becomes the first one allowed for
+operator sign-in.</div>
+<div class="row"><button type="submit">Continue</button></div>
+</form>
+</div>
+{% endblock %}

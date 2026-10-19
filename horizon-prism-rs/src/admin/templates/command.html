@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block head %}{% if row.pending() %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block content %}
+<h1>{{ row.what }}</h1>
+<div class="card">
+<div class="fact"><span class="l">Outcome</span><span class="v{% if row.state == "failed" %} bad{% else if row.state == "done" %} ok{% endif %}">{{ row.outcome }}</span></div>
+<div class="fact"><span class="l">Asked by</span><span class="v">{{ row.who }}</span></div>
+<div class="fact"><span class="l">When</span><span class="v">{{ row.when }}</span></div>
+{% if row.pending() %}<p class="muted">This page reloads until the change is done.</p>{% endif %}
+{% if !row.raw.is_empty() %}<details><summary>Details</summary><pre>{{ row.raw }}</pre></details>{% endif %}
+<p class="muted tech">technical name: {{ row.command }} · command {{ row.id }}</p>
+</div>
+{% if let Some(o) = offer %}
+<div class="card">
+<h2>Allow their server too?</h2>
+<p>The account's server is not on the list of servers operators may sign in from. You can add the operator and allow
+that server in one step.</p>
+<form method="post" action="/admin/operators/add">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="input" value="{{ o.input }}">
+<input type="hidden" name="note" value="{{ o.note }}">
+<input type="hidden" name="add_host" value="yes">
+<div class="row"><button type="submit">Allow their server and add…</button></div>
+</form>
+</div>
+{% endif %}
+<p><a href="/admin/activity">All activity</a></p>
+{% endblock %}

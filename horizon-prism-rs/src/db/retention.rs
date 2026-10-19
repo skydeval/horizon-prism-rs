@@ -55,6 +55,8 @@ pub const CONSTELLATION_COUNTS_DAYS: i32 = 7;
 pub const DID_CACHE_GRACE_DAYS: i32 = 7;
 /// Finished `backfill_jobs` and `admin_commands` are kept this long (§4.4).
 pub const FINISHED_WORK_DAYS: i32 = 30;
+/// `admin_logins` rows are kept this long (admin-ui design §5.8).
+pub const ADMIN_LOGINS_DAYS: i32 = 90;
 /// How long `tag_activity_hourly` rows are kept unless
 /// `trends.aggregate_retention_hours` says otherwise (design-v3 §7.5). It
 /// matches the triggers' own default cutoff.
@@ -465,6 +467,12 @@ fn time_steps(settings: &RetentionSettings) -> Vec<Step> {
             "ac.finished_at IS NOT NULL AND ac.finished_at < now() - make_interval(days => $1)",
             Bind::Days(FINISHED_WORK_DAYS),
         ),
+        // The admin UI's sign-in rows (admin-ui design §12): expired
+        // sessions, unfinished sign-ins past ten minutes, the sign-in log
+        // past 90 days.
+        batched("admin_sessions", "id_hash", "ses", "ses.expires_at < now()", Bind::None),
+        batched("admin_oauth_states", "state", "st", "st.created_at < now() - interval '10 minutes'", Bind::None),
+        batched("admin_logins", "id", "al", "al.at < now() - make_interval(days => $1)", Bind::Days(ADMIN_LOGINS_DAYS)),
     ]
 }
 
@@ -925,6 +933,9 @@ mod tests {
         assert_eq!(bind("did_cache"), Some(Bind::Days(7)));
         assert_eq!(bind("backfill_jobs"), Some(Bind::Days(30)));
         assert_eq!(bind("admin_commands"), Some(Bind::Days(30)));
+        assert_eq!(bind("admin_logins"), Some(Bind::Days(90)));
+        assert_eq!(bind("admin_sessions"), Some(Bind::None));
+        assert_eq!(bind("admin_oauth_states"), Some(Bind::None));
     }
 
     #[test]

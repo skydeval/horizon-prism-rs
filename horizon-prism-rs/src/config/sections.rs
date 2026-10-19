@@ -563,17 +563,27 @@ impl Default for DbConfig {
     }
 }
 
-/// `[admin]` (§3.3).
+/// `[admin]` (§3.3; admin-ui design §3, §5.4, §13). All file-only.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
     pub command_timeout_secs: u64,
+    /// Serve the web admin UI under `/admin`. With `false` no `/admin` route
+    /// is mounted and the CLI is the whole admin surface.
+    pub web_ui: bool,
+    /// An admin UI session ends after this long without a request.
+    pub session_idle_secs: u64,
+    /// An admin UI session ends this long after sign-in, whatever its use.
+    pub session_max_secs: u64,
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             command_timeout_secs: 600,
+            web_ui: true,
+            session_idle_secs: 28_800,
+            session_max_secs: 604_800,
         }
     }
 }

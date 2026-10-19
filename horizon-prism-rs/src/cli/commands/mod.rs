@@ -7,6 +7,8 @@ pub mod keygen;
 pub mod label_list;
 pub mod member_list;
 pub mod migrate_status;
+pub mod operator_list;
+pub mod setup_code;
 pub mod stream_info;
 
 use redis::aio::ConnectionManager;

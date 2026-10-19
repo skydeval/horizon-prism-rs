@@ -216,6 +216,24 @@ pub async fn run() -> Result<(), StartupError> {
             return Err(StartupError::new(code, format!("migration gate: {e}")));
         }
     }
+    // First-run setup (admin-ui design §5.2): while no operator exists, the
+    // setup code is kept or made, and printed now and every 10 minutes.
+    let admin_settings = crate::admin::AdminSettings::from_config(&cfg);
+    let mut setup_reprint = None;
+    if cfg.file.admin.web_ui {
+        match crate::admin::setup_code::at_startup(&pool, &admin_settings.setup_code_file).await {
+            Ok(Some(open)) => {
+                crate::admin::setup_code::print(&open, &cfg.env.public_hostname);
+                setup_reprint = Some(crate::admin::setup_code::spawn_reprint(
+                    pool.clone(),
+                    admin_settings.setup_code_file.clone(),
+                    cfg.env.public_hostname.clone(),
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(StartupError::new(1, format!("admin setup code: {e}"))),
+        }
+    }
     // The memory of learned blocks (§5.14.18.1) is off unless switched on.
     // Off, its table holds nothing: emptied here, best effort.
     if !cfg.file.farsight.memory.enabled {
@@ -289,6 +307,7 @@ pub async fn run() -> Result<(), StartupError> {
     let constellation = ConstellationClient::new(nets.internal().client().clone(), &cfg.file.microcosm.constellation_url);
 
     let mut tasks = Vec::new();
+    tasks.extend(setup_reprint);
     if let Some(task) = public_task {
         tasks.push(public.spawn(task));
     }
@@ -583,6 +602,10 @@ pub async fn run() -> Result<(), StartupError> {
             sync_min_interval_secs: lists.sync_min_interval_secs,
             list_budget,
             public: public.clone(),
+            operators: crate::admin_executor::OperatorDeps {
+                identity: Some(Arc::new(resolver.with_intent(Intent::Internal))),
+                setup_code_file: Some(admin_settings.setup_code_file.clone()),
+            },
         })
         .spawn(),
     );
@@ -808,9 +831,26 @@ pub async fn run() -> Result<(), StartupError> {
     // The routes of every `[services.*]` block in `proxy` state (§6.7.3).
     let proxied = crate::services::proxy::router(&app, &cfg.file, &shares, &cfg.env.public_hostname)
         .map_err(|e| StartupError::new(1, format!("service proxy client: {e}")))?;
+    // The web admin UI (admin-ui design §3), unless `admin.web_ui` is off:
+    // its OAuth fetches through the public transport, its identity work
+    // through the internal one (§5.10).
+    let admin_routes = if cfg.file.admin.web_ui {
+        let admin = crate::admin::AdminState::new(
+            pool.clone(),
+            scope.clone(),
+            Arc::new(resolver.with_intent(Intent::Internal)),
+            Arc::new(crate::admin::oauth::NetFetch(nets.public().client().clone())),
+            admin_settings,
+        );
+        tasks.push(admin.spawn_housekeeping());
+        crate::admin::router(admin)
+    } else {
+        axum::Router::new()
+    };
     // §6.3's order: merge every route, then the fallbacks, the rate limit
     // and CORS outermost. Nothing is merged after `finalize`.
     let merged = crate::xrpc::router(app.clone())
+        .merge(admin_routes)
         .merge(crate::honest_501::router(&app, &cfg.file))
         .merge(proxied)
         .merge(crate::private_tier::handlers::router(private_state))

@@ -1,0 +1,3 @@
+# The admin UI's templates (admin-ui design §4).
+[general]
+dirs = ["src/admin/templates"]

@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use tokio::task::JoinHandle;
 
-use super::commands::{AdminCommand, Handlers, Outcome};
+use super::commands::{Actor, AdminCommand, Handlers, Outcome};
 
 /// The NOTIFY channel the CLI signals on.
 pub const CHANNEL: &str = "admin_commands";
@@ -30,6 +30,9 @@ struct Queued {
     id: i64,
     command: String,
     args: Value,
+    /// The operator DID behind a command made in the admin UI; `None` for
+    /// the CLI (admin-ui design §5.8).
+    requested_by: Option<String>,
 }
 
 /// The executor.
@@ -74,7 +77,7 @@ impl AdminExecutor {
     /// Database errors reading or settling the queue.
     pub async fn drain(&self) -> Result<usize, sqlx::Error> {
         let queued: Vec<Queued> = sqlx::query_as(
-            "SELECT id, command, args FROM admin_commands WHERE state = 'queued' ORDER BY created_at, id",
+            "SELECT id, command, args, requested_by FROM admin_commands WHERE state = 'queued' ORDER BY created_at, id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -104,7 +107,8 @@ impl AdminExecutor {
                 continue;
             }
             tracing::info!(event = "admin_command_started", id = row.id, command = %row.command, "admin command started");
-            match self.handlers.execute(&cmd).await {
+            let actor = Actor::from_requested_by(row.requested_by.clone());
+            match self.handlers.execute(&cmd, &actor).await {
                 Outcome::Done(result) => {
                     self.settle(row.id, "done", &result).await?;
                     executed += 1;
@@ -238,6 +242,17 @@ mod tests {
         source: Arc<dyn BackfillSource>,
         dead_letter_stream: &str,
     ) -> Option<(TestDb, AdminExecutor, ScopeState)> {
+        setup_full(name, sets, private, source, dead_letter_stream, crate::admin_executor::OperatorDeps::default()).await
+    }
+
+    async fn setup_full(
+        name: &str,
+        sets: ScopeSets,
+        private: Arc<dyn PrivateTier>,
+        source: Arc<dyn BackfillSource>,
+        dead_letter_stream: &str,
+        operators: crate::admin_executor::OperatorDeps,
+    ) -> Option<(TestDb, AdminExecutor, ScopeState)> {
         let Ok(redis_url) = std::env::var("HPRS_TEST_REDIS_URL") else {
             eprintln!("HPRS_TEST_REDIS_URL unset; skipping executor test");
             return None;
@@ -266,6 +281,7 @@ mod tests {
                 scope.clone(),
                 crate::indexing::PublicModeSettings::from_config(&crate::config::IndexingConfig::default()),
             ),
+            operators,
         };
         Some((db, AdminExecutor::new(handlers), scope))
     }
@@ -541,6 +557,123 @@ mod tests {
         assert_eq!((&r["mode"], &r["phase"], &r["generation"], &r["error"]), (&json!("off"), &json!("off"), &json!(2), &Value::Null));
         let r = done(run(&exec, p, AdminCommand::IndexingPublicScope { value: ScopeValue::Off }).await);
         assert_eq!((&r["action"], &r["task"]), (&json!("no_op"), &Value::Null));
+        db.drop_db().await;
+    }
+
+    /// DID documents for the operator commands, with a count of fresh
+    /// resolutions.
+    #[derive(Default)]
+    struct Ids {
+        endpoints: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::admin::operators::OperatorIdentity for Ids {
+        async fn resolve_handle(&self, handle: &str) -> Option<String> {
+            (handle == "alice.example.com").then(|| PURGING.to_string())
+        }
+        async fn resolve_fresh(&self, did: &str) -> Result<crate::identity::DidDocInfo, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let endpoint = self.endpoints.lock().expect("lock").get(did).cloned().ok_or("not found")?;
+            Ok(crate::identity::DidDocInfo { pds_endpoint: Some(endpoint), claimed_handle: None })
+        }
+    }
+
+    /// T-A6, T-A10b: the operator commands and who they record. `operator
+    /// add` with no operators closes setup in its transaction (and deletes
+    /// the code's file); the CLI allows the exact host, the UI refuses a
+    /// host not allowed; the last operator is never removed; `host remove`
+    /// refuses to leave nobody able to sign in, with no network call; and
+    /// every change records `cli` or the operator's DID.
+    #[tokio::test]
+    async fn operator_commands_and_their_actor() {
+        const ALICE: &str = PURGING;
+        const BOB: &str = OTHER;
+        const CAROL: &str = "did:plc:cccccccccccccccccccccccc";
+        let ids = Arc::new(Ids::default());
+        for (did, endpoint) in [(ALICE, "https://PDS.example.com/"), (BOB, "https://other.example.net"), (CAROL, "https://pds.example.com")] {
+            ids.endpoints.lock().expect("lock").insert(did.to_string(), endpoint.to_string());
+        }
+        let dir = std::env::temp_dir().join(format!("hprs-ops-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let code_file = crate::admin::setup_code::file_path(&dir);
+        let operators = crate::admin_executor::OperatorDeps {
+            identity: Some(Arc::clone(&ids) as Arc<dyn crate::admin::operators::OperatorIdentity>),
+            setup_code_file: Some(code_file.clone()),
+        };
+        let Some((db, exec, _)) =
+            setup_full("admin_operators", ScopeSets::default(), Arc::new(DisabledPrivateTier), Arc::new(NoNetwork), &test_stream(), operators).await
+        else {
+            return;
+        };
+        let p = &db.pool;
+        crate::admin::setup_code::at_startup(p, &code_file).await.expect("code").expect("open");
+        // From the CLI, by handle: the first operator closes setup.
+        let r = done(run(&exec, p, AdminCommand::OperatorAdd { input: "alice.example.com".into(), note: Some("me".into()), add_host: true }).await);
+        assert_eq!(r, json!({ "did": ALICE, "status": "added", "host": "pds.example.com", "host_added": true, "setup_closed": true }));
+        assert_eq!(count(p, "SELECT count(*) FROM admin_setup_code").await, 0);
+        assert!(!code_file.exists());
+        let (by, endpoint): (String, String) = sqlx::query_as("SELECT added_by, pds_endpoint FROM admin_operators WHERE did = $1")
+            .bind(ALICE)
+            .fetch_one(p)
+            .await
+            .expect("alice");
+        assert_eq!((by.as_str(), endpoint.as_str()), ("cli", "https://pds.example.com"));
+        // From the UI: a host not allowed fails, an allowed one records the operator.
+        let executor = &exec;
+        let ui = |cmd: AdminCommand| async move {
+            let id = crate::cli::dispatch::submit_as(p, &cmd, Some(ALICE)).await.expect("submit");
+            executor.drain().await.expect("drain");
+            wait(p, id, Duration::from_secs(10), Duration::from_millis(10)).await.expect("wait")
+        };
+        let refused = ui(AdminCommand::OperatorAdd { input: BOB.into(), note: None, add_host: false }).await;
+        assert!(matches!(&refused, Finished::Failed(v) if v["error"].as_str().is_some_and(|e| e.contains("not on the allowed list"))), "{refused:?}");
+        let r = done(ui(AdminCommand::OperatorAdd { input: CAROL.into(), note: None, add_host: false }).await);
+        assert_eq!((&r["status"], &r["host_added"], &r["setup_closed"]), (&json!("added"), &json!(false), &json!(false)));
+        let by: String = sqlx::query_scalar("SELECT added_by FROM admin_operators WHERE did = $1").bind(CAROL).fetch_one(p).await.expect("carol");
+        assert_eq!(by, ALICE);
+        let r = done(ui(AdminCommand::OperatorHostAdd { pattern: "*.example.net".into() }).await);
+        assert_eq!(r["added"], true);
+        let by: String = sqlx::query_scalar("SELECT added_by FROM admin_operator_hosts WHERE pattern = '*.example.net'").fetch_one(p).await.expect("host");
+        assert_eq!(by, ALICE);
+        // Removing pds.example.com would leave Alice and Carol unable to
+        // sign in: refused, from stored endpoints only.
+        let calls = ids.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let refused = ui(AdminCommand::OperatorHostRemove { pattern: "pds.example.com".into() }).await;
+        assert!(matches!(&refused, Finished::Failed(v) if v["error"].as_str().is_some_and(|e| e.contains("no operator able to sign in"))), "{refused:?}");
+        assert_eq!(ids.calls.load(std::sync::atomic::Ordering::SeqCst), calls, "no network call");
+        // The last operator stays.
+        assert!(matches!(run(&exec, p, AdminCommand::OperatorRemove { did: ALICE.into() }).await, Finished::Done(_)));
+        let last = run(&exec, p, AdminCommand::OperatorRemove { did: CAROL.into() }).await;
+        assert!(matches!(&last, Finished::Failed(v) if v["error"].as_str().is_some_and(|e| e.contains("last operator"))), "{last:?}");
+        // With Carol alone, the other host can go; then the last one too,
+        // which leaves any host allowed.
+        let r = done(run(&exec, p, AdminCommand::OperatorHostRemove { pattern: "*.example.net".into() }).await);
+        assert_eq!(r["any_host"], false);
+        let r = done(run(&exec, p, AdminCommand::OperatorHostRemove { pattern: "pds.example.com".into() }).await);
+        assert_eq!(r["any_host"], true);
+        // Denials record the actor too.
+        done(ui(AdminCommand::MemberDeny { did: BOB.into(), reason: None }).await);
+        let by: String = sqlx::query_scalar("SELECT denied_by FROM member_denials WHERE did = $1").bind(BOB).fetch_one(p).await.expect("denial");
+        assert_eq!(by, ALICE);
+        done(run(&exec, p, AdminCommand::MemberDeny { did: CAROL.into(), reason: None }).await);
+        let by: String = sqlx::query_scalar("SELECT denied_by FROM member_denials WHERE did = $1").bind(CAROL).fetch_one(p).await.expect("denial");
+        assert_eq!(by, "cli");
+        // And the public-data switch.
+        done(ui(AdminCommand::IndexingPublicScope { value: crate::indexing::ScopeValue::Off }).await);
+        let r = done(run(&exec, p, AdminCommand::IndexingStatus).await);
+        assert_eq!(r["updated_by"], ALICE);
+        // The queue says who asked: NULL for the CLI.
+        let (cli, ui_rows): (i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE requested_by IS NULL), count(*) FILTER (WHERE requested_by = $1) FROM admin_commands",
+        )
+        .bind(ALICE)
+        .fetch_one(p)
+        .await
+        .expect("counts");
+        assert_eq!((cli, ui_rows), (7, 6));
+        let _ = std::fs::remove_dir_all(&dir);
         db.drop_db().await;
     }
 

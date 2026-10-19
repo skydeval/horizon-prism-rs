@@ -92,6 +92,8 @@ mod tests {
             "0030_listed_revs",
             // Membership not tied to hosting (#733).
             "0031_membership",
+            // The web admin UI, S1 (#245, #735).
+            "0032_admin_ui",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

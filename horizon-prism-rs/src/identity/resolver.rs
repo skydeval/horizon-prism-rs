@@ -476,6 +476,18 @@ impl IdentityResolver {
         }
     }
 
+    /// A fresh resolution (admin-ui design §5.4): the document is fetched
+    /// from the network whatever the caches hold, through this resolver's
+    /// transport, and stored as any lookup's would be.
+    ///
+    /// # Errors
+    ///
+    /// As [`IdentityResolver::refresh_now`].
+    pub async fn resolve_fresh(&self, did: &str) -> Result<DidDocInfo, IdentityError> {
+        let fetched = self.refresh_now(did, ResolveIntent::Lookup).await?;
+        Ok(extract_info(&fetched.doc, did))
+    }
+
     /// [`IdentityResolver::resolve`] plus extraction.
     ///
     /// # Errors

@@ -467,6 +467,14 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     if cfg.sync.head_max_age_secs > MAX_HEAD_AGE_SECS {
         out.push(format!("sync.head_max_age_secs must be at most {MAX_HEAD_AGE_SECS}"));
     }
+    // Admin UI sessions (admin-ui design §5.4).
+    let admin = &cfg.admin;
+    if admin.session_idle_secs == 0 {
+        out.push("admin.session_idle_secs must be greater than 0".to_string());
+    }
+    if admin.session_idle_secs > admin.session_max_secs {
+        out.push("admin.session_idle_secs must not exceed admin.session_max_secs".to_string());
+    }
 }
 
 /// An absolute `https://` URL with a host.

@@ -10,6 +10,93 @@ commit.
 
 ## [Unreleased]
 
+### Added (web admin UI, S1, #245, #735)
+
+Admin UI design S1 (`docs/internal/design/admin-ui.md`): an admin UI
+served by `serve` itself under `/admin`, with first-run setup, operator
+sign-in, members and activity.
+
+- **Upgrade note: an upgraded deployment has no operator, so it enters
+  first-run setup.** Read the setup code with `docker compose logs app |
+  grep admin_setup_code` and finish at `https://<host>/admin/setup`, or
+  run `admin operator add <handle-or-did>` (`docker/README.md`, "Web admin
+  UI").
+- **The shell.** Server-rendered pages (askama templates, no JavaScript),
+  merged before the final router so they sit inside the global per-IP
+  limit and the CORS layer. Every `/admin` response carries
+  `Cache-Control: no-store` (the content-hashed stylesheet is cached for a
+  year), a `Content-Security-Policy` of `default-src 'none'`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
+  `X-Content-Type-Options: nosniff`; request bodies are capped at 64 KiB.
+  The look follows Farsight's admin UI (C-A1 (b)); every colour and size
+  is a token at the top of `src/admin/static/admin.css`. `admin.web_ui =
+  false` mounts no `/admin` route.
+- **First-run setup.** While no operator exists, `serve` keeps a setup
+  code (`prs-XXXXX-…`, 128 bits): its BLAKE3 hash in `admin_setup_code`,
+  the code itself only in `admin-setup-code` (0600) in the data directory.
+  It is printed at `warn` (event `admin_setup_code`, the only line that
+  carries it) at every start and every 10 minutes, kept across restarts
+  while unexpired and its file intact, and renewed after 24 hours.
+  `/admin/setup` takes the code and a handle or DID, then signs in with
+  ATProto OAuth; the callback consumes the code in the transaction that
+  adds the first operator and its server's exact host. Wrong codes past
+  five a minute from one address (an IPv6 /64 as one) are delayed two
+  seconds each, with at most 16 delayed at once (beyond, `429`); a correct
+  code is checked first and never refused. With an operator, setup
+  answers 404 and startup deletes the row and the file.
+- **Sign-in and sessions.** ATProto OAuth (PAR, PKCE, DPoP, scope
+  `atproto`, public client at `/admin/oauth/client-metadata.json`), every
+  fetch through the guarded public transport. Only an operator whose PDS
+  host is allowed starts a flow; anyone else is refused before any request
+  to their server. The callback checks `iss` against the stored issuer and
+  the token's `sub` against the DID, resolves the DID afresh, and requires
+  the same PDS endpoint the flow started from; the tokens are revoked and
+  dropped. Sessions (`__Host-prism_admin`, only its hash stored) end after
+  `admin.session_idle_secs` (8 h) unused or `admin.session_max_secs`
+  (7 days). The DID is resolved afresh before every change and at least
+  every 5 minutes: a changed PDS endpoint, or a host no longer allowed,
+  ends the session; a failed resolution refuses the request and keeps it.
+  **An empty allowed-host list allows any host** (C-A3 (b)); the operator
+  list still decides who signs in.
+- **CSRF and confirmations.** Every form carries a token keyed on the
+  session cookie (setup and sign-in a pre-session double-submit token), a
+  POST whose `Origin` is not this host is refused, and removal and denial
+  need a confirmation with the account's handle (or the last eight
+  characters of its DID) typed in.
+- **Members** (`/admin/members`, #735): members with readiness, first
+  ready, whether they have private posts and "not receiving this member's
+  updates since …"; the count against `max_members`; auto-join and its
+  hosts; the denials. Add, remove, deny and allow, each an admin command.
+- **Activity** (`/admin/activity`): every command, newest first, with who
+  asked, the outcome in words and the raw result behind "details",
+  filterable by who, what and state; the sign-in log. **Operators**
+  (`/admin/operators`): operators and allowed servers, with add and
+  remove for both.
+- **`requested_by` on the command queue.** `admin_commands.requested_by`
+  is the operator DID of a command made in the UI, NULL from the CLI. The
+  executor hands the requester to every handler, so `member_denials.denied_by`,
+  `operator_settings.updated_by` (public indexing) and the operator
+  tables' `added_by` record the operator's DID or `cli`.
+- **CLI:** `admin operator add <handle-or-did> [--note]`, `admin operator
+  remove <did>`, `admin operator list`, `admin operator host add|remove
+  <pattern>` and `admin setup-code` (read-only). `operator add` allows the
+  account's exact host unless a pattern covers it, and with no operator
+  yet closes setup in the same transaction; `operator remove` never
+  removes the last operator; `host remove` refuses to leave no operator
+  whose last known host is allowed.
+- **Migration 0032** (`0032_admin_ui`): `admin_operators`,
+  `admin_operator_hosts`, `admin_setup_code`, `admin_sessions`,
+  `admin_oauth_states`, `admin_logins`, and
+  `admin_commands.requested_by`. Retention deletes expired sessions,
+  unfinished sign-ins after 10 minutes and sign-in rows after 90 days.
+- **Config:** `[admin] web_ui = true`, `session_idle_secs = 28800`,
+  `session_max_secs = 604800` (file-only).
+- **Metrics and events:** `admin_commands_enqueued_total{command}`,
+  `admin_session_cut_total{reason}`, `admin_setup_attempts_total{outcome}`;
+  events `admin_setup_code`, `admin_setup_completed`, `admin_login`,
+  `admin_login_refused{reason}`, `admin_session_cut{reason}`,
+  `admin_command_enqueued`, `operator_added`.
+
 ### Changed (membership not tied to hosting, S1, #733)
 
 Membership design S1 (`docs/internal/design/membership.md`): membership is

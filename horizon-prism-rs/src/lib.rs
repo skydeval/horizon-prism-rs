@@ -12,6 +12,7 @@
 #[cfg(all(feature = "standin-hosts", not(debug_assertions)))]
 compile_error!("standin-hosts is test-only: build it with --profile standin, never --release");
 
+pub mod admin;
 pub mod admin_executor;
 pub mod aggregations;
 pub mod appview_clients;
