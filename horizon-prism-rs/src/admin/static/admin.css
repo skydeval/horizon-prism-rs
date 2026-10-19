@@ -278,16 +278,67 @@ td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
 .home-row { display: grid; grid-template-columns: minmax(13rem, 22%) minmax(0, 1fr); gap: 1.25rem; align-items: start; }
 .home-row > .live { min-width: 0; }
 .live .grid { grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); }
-.live-head { display: flex; gap: 0.75rem; align-items: baseline; }
-.live-head h2 { margin-bottom: 0.5rem; }
+/* Nothing in the Live card moves when events arrive (second pass): the
+   status pill keeps one width, every figure row one height, each column
+   the same rows (the script and the server fill blanks), the "since" line
+   one line (two on a phone), and the help opens over the card, not in it. */
+.live-head { display: flex; gap: 0.6rem; align-items: center; position: relative; margin-bottom: 0.5rem; }
+.live-head h2 { margin: 0; }
+.live-head .pill { min-width: 7.5rem; text-align: center; white-space: nowrap; }
+.help-btn {
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  border-color: var(--line-strong);
+  font-size: 0.85rem;
+  line-height: 1;
+}
+.help-btn:hover, .help-btn[aria-expanded="true"] { background: var(--accent-subtle); border-color: var(--accent); box-shadow: none; }
+.live-help {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  left: 0;
+  z-index: 20;
+  width: min(30rem, 100%);
+  padding: 0.75rem 1rem;
+  background: var(--card);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  font-size: 0.86rem;
+}
+.live-help p { margin: 0 0 0.45rem; }
+.live-help p:last-child { margin-bottom: 0; }
 .live-controls { display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center; margin: 0.75rem 0; }
 .live-controls select { width: auto; }
-.live-rates .fact .v, #live-rates .fact .v { font-variant-numeric: tabular-nums; }
+#live-pause { min-width: 6.5rem; }
+.live-since {
+  margin: 0 0 0.5rem;
+  font-size: 0.86rem;
+  line-height: 1.4;
+  height: 1.4em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+#live-rates h3 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+#live-rates .fact { height: 2.75rem; flex-wrap: nowrap; align-items: center; }
+#live-rates .fact .l { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#live-rates .fact .v { flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
+#live-rates .fact.blank { border-bottom-color: transparent; }
+/* The tiles the script refreshes keep their height too. */
+#tiles .stat { flex-wrap: nowrap; }
+#tiles .stat .l { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.asof { font-variant-numeric: tabular-nums; }
 /* The two tickers, "On the firehose" and "Indexed here": fixed height, no
    scrollbar, one row per line. New lines slide in at the top; the script
    removes the ones that fall off the bottom. */
 .live-tickers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem 1.25rem; margin-top: 0.5rem; }
-.live-tickers h3 { font-size: 0.9rem; margin: 0 0 0.4rem; }
+.live-tickers h3 { font-size: 0.9rem; line-height: 1.5; height: 1.5em; margin: 0 0 0.4rem; white-space: nowrap; overflow: hidden; }
 .live-list {
   list-style: none;
   margin: 0;
@@ -297,6 +348,7 @@ td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
   border-top: 1px solid var(--line);
   height: calc(var(--live-rows) * var(--live-row));
   overflow: hidden;
+  contain: content;
 }
 .live-list li {
   display: flex;
@@ -342,4 +394,6 @@ td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
   .card { padding: 1rem; }
   td.actions { white-space: normal; }
   .live-tickers { grid-template-columns: minmax(0, 1fr); }
+  /* On a phone the "since" line may need two lines: it always has two. */
+  .live-since { white-space: normal; height: 2.8em; }
 }

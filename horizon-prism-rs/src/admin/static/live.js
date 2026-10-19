@@ -16,6 +16,7 @@
   var PACE_MS = 200;    // one line per ticker this often: the one knob for pace
   var QUEUE_MAX = 20;   // lines waiting per ticker; older ones are dropped
   var ROWS_KEPT = 16;   // lines kept per ticker: the 14 shown and two below
+  var SLOTS = 3;        // rows per column of figures, whatever is counted
   var statusEl = document.getElementById('live-status');
   var message = document.getElementById('live-message');
   var rates = document.getElementById('live-rates');
@@ -27,6 +28,8 @@
   var kindSel = document.getElementById('live-kind');
   var sourceSel = document.getElementById('live-source');
   var tiles = document.getElementById('tiles');
+  var helpBtn = document.getElementById('live-help-btn');
+  var help = document.getElementById('live-help');
   if (!statusEl || !message || !rates || !controls || !tickers || !arrivingList || !indexedList || !pauseBtn || !kindSel || !sourceSel) return;
 
   var KIND = {
@@ -75,13 +78,6 @@
     return e;
   }
 
-  function fact(label, value) {
-    var d = el('div', 'fact');
-    d.appendChild(el('span', 'l', label));
-    d.appendChild(el('span', 'v', value));
-    return d;
-  }
-
   function fmt(x) {
     return x >= 10 ? Math.round(x).toLocaleString() : x.toFixed(1);
   }
@@ -98,8 +94,9 @@
 
   // One line, on one row. withText: the indexed ticker, the only one that
   // shows a public post's snippet; a line that was not indexed has none.
-  function lineEl(l, withText) {
-    var li = el('li', l.o ? 'enter dim' : 'enter');
+  // slide: a paced live line slides in; a backlog line just appears.
+  function lineEl(l, withText, slide) {
+    var li = el('li', (slide ? 'enter' : '') + (l.o ? ' dim' : ''));
     li.appendChild(el('span', 't', l.t));
     if (!withText) li.appendChild(el('span', l.o ? 'o' : 'o ix', outcome(l)));
     var src;
@@ -124,20 +121,46 @@
 
   // A ticker: lines wait in a short queue (newest kept, oldest dropped)
   // and enter at the top one at a time; past ROWS_KEPT they leave the page.
+  // Every line has a number (n), rising; a ticker takes each number once,
+  // so a reconnect's backlog never shows a line twice.
   function ticker(list, withText) {
     var queue = [];
+    var last = 0;
+    function take(l) {
+      if (typeof l.n !== 'number') return true;
+      if (l.n <= last) return false;
+      last = l.n;
+      return true;
+    }
+    function push(l) {
+      if (!take(l)) return;
+      queue.push(l);
+      if (queue.length > QUEUE_MAX) queue.splice(0, queue.length - QUEUE_MAX);
+    }
+    function trim() {
+      while (list.childNodes.length > ROWS_KEPT) list.removeChild(list.lastChild);
+    }
     return {
-      push: function (l) {
-        queue.push(l);
-        if (queue.length > QUEUE_MAX) queue.splice(0, queue.length - QUEUE_MAX);
-      },
+      push: push,
       step: function () {
         if (!queue.length) return;
-        list.insertBefore(lineEl(queue.shift(), withText), list.firstChild);
-        while (list.childNodes.length > ROWS_KEPT) list.removeChild(list.lastChild);
+        list.insertBefore(lineEl(queue.shift(), withText, true), list.firstChild);
+        trim();
+      },
+      // The backlog a stream starts with (oldest first): the lines this
+      // page has not had yet, shown at once, without the pace or the
+      // slide, newest on top. Paused or hidden, they wait like any line.
+      backlog: function (lines) {
+        lines.forEach(push);
+        if (paused || document.visibilityState === 'hidden') return;
+        var frag = document.createDocumentFragment();
+        while (queue.length) frag.insertBefore(lineEl(queue.shift(), withText, false), frag.firstChild);
+        list.insertBefore(frag, list.firstChild);
+        trim();
       },
       clear: function () {
         queue.length = 0;
+        last = 0;
         list.replaceChildren();
       }
     };
@@ -155,6 +178,14 @@
     }
   }
 
+  // Sent once when a stream opens, before any live line.
+  function onBacklog(e) {
+    var lines;
+    try { lines = JSON.parse(e.data); } catch (x) { return; }
+    firehoseTicker.backlog(lines.filter(function (l) { return l.f; }));
+    indexedTicker.backlog(lines.filter(function (l) { return l.i; }));
+  }
+
   // The pace: paused or hidden, the tickers stand still and only their
   // short queues refresh.
   setInterval(function () {
@@ -163,44 +194,101 @@
     indexedTicker.step();
   }, PACE_MS);
 
+  // The figures: built once, then only their text changes, so nothing
+  // moves. Each column has SLOTS rows: blank rows fill a short column, and
+  // a long one's last row reads "+N more", the rest named in its tooltip.
+  var stats = null;
+  function statsBox() {
+    if (stats) return stats;
+    var since = el('p', 'muted live-since');
+    var box = el('div', 'grid');
+    function column(title) {
+      var d = el('div');
+      var h = el('h3', null, title);
+      d.appendChild(h);
+      var rows = [];
+      for (var i = 0; i < SLOTS; i++) {
+        var row = el('div', 'fact blank');
+        var l = el('span', 'l', ' ');
+        var v = el('span', 'v', ' ');
+        row.appendChild(l);
+        row.appendChild(v);
+        d.appendChild(row);
+        rows.push({ row: row, l: l, v: v });
+      }
+      box.appendChild(d);
+      return { h: h, rows: rows };
+    }
+    stats = { since: since, indexed: column('Indexed'), skipped: column('Skipped and rejected'), also: column('Also') };
+    rates.replaceChildren(since, box);
+    return stats;
+  }
+
+  function setRow(r, label, value, tip) {
+    r.row.className = label === null ? 'fact blank' : 'fact';
+    r.l.textContent = label === null ? ' ' : label;
+    r.v.textContent = value === null ? ' ' : value;
+    if (tip) r.row.title = tip; else r.row.removeAttribute('title');
+  }
+
+  // items: [label, count], largest first.
+  function fillColumn(col, items, per, none) {
+    var shown = items;
+    if (items.length > SLOTS) {
+      var rest = items.slice(SLOTS - 1);
+      var sum = rest.reduce(function (n, it) { return n + it[1]; }, 0);
+      var tip = rest.map(function (it) { return it[0] + ': ' + per(it[1]); }).join(', ');
+      shown = items.slice(0, SLOTS - 1).concat([['+' + rest.length + ' more', sum, tip]]);
+    }
+    for (var i = 0; i < SLOTS; i++) {
+      var it = shown[i];
+      if (it) setRow(col.rows[i], it[0], per(it[1]), it[2]);
+      else if (i === 0 && none) setRow(col.rows[i], none, null);
+      else setRow(col.rows[i], null, null);
+    }
+  }
+
+  function largestFirst(map, words) {
+    return Object.keys(map || {})
+      .map(function (k) { return [words[k] || k, map[k]]; })
+      .sort(function (a, b) { return b[1] - a[1]; });
+  }
+
   function onCounts(e) {
     var c;
     try { c = JSON.parse(e.data); } catch (x) { return; }
     var secs = c.secs > 0 ? c.secs : 1;
     var per = function (n) { return fmt(n / secs) + '/s'; };
-    var box = el('div', 'grid');
-    var indexed = el('div');
-    indexed.appendChild(el('h3', null, 'Indexed: ' + per(c.indexed)));
-    var kinds = Object.keys(c.kinds || {}).sort(function (a, b) { return c.kinds[b] - c.kinds[a]; });
-    var rest = 0;
-    kinds.forEach(function (k, i) {
-      if (i < 6) indexed.appendChild(fact(KIND[k] || k, per(c.kinds[k])));
-      else rest += c.kinds[k];
-    });
-    if (rest > 0) indexed.appendChild(fact('other', per(rest)));
-    var reasons = Object.keys(c.reasons || {});
-    var skippedN = reasons.reduce(function (n, r) { return n + c.reasons[r]; }, 0);
-    var arrivingN = (kindSel.value || sourceSel.value) ? c.shown + c.not_shown : c.indexed + skippedN + c.unchanged + c.failed;
-    var pace = 1000 / PACE_MS;
-    if (arrivingN / secs > pace) {
-      indexed.appendChild(el('p', 'muted', 'The tickers show up to ' + fmt(pace) + ' lines a second each, a sample of about ' + fmt(arrivingN / secs) + ' arriving.'));
-    }
-    box.appendChild(indexed);
-    var skipped = el('div');
-    skipped.appendChild(el('h3', null, 'Skipped and rejected'));
-    if (!reasons.length) skipped.appendChild(el('p', 'muted', 'None in the last second.'));
-    reasons.forEach(function (r) { skipped.appendChild(fact(REASON[r] || r, per(c.reasons[r]))); });
-    box.appendChild(skipped);
-    var also = el('div');
-    also.appendChild(el('h3', null, 'Also'));
-    also.appendChild(fact('unchanged', per(c.unchanged)));
-    also.appendChild(fact('failed', per(c.failed)));
-    also.appendChild(fact('identity and account events', per(c.events)));
-    box.appendChild(also);
+    var s = statsBox();
+    s.indexed.h.textContent = 'Indexed: ' + per(c.indexed);
+    fillColumn(s.indexed, largestFirst(c.kinds, KIND), per, 'none this second');
+    fillColumn(s.skipped, largestFirst(c.reasons, REASON), per, 'none this second');
+    fillColumn(s.also, [['unchanged', c.unchanged], ['failed', c.failed], ['identity and account events', c.events]], per, null);
     var t = c.totals || {};
-    var since = el('p', 'muted', 'Since Prism started (' + t.since + '): ' + (t.indexed || 0).toLocaleString() +
-      ' indexed, ' + (t.skipped || 0).toLocaleString() + ' skipped or rejected, ' + (t.failed || 0).toLocaleString() + ' failed.');
-    rates.replaceChildren(since, box);
+    var text = 'Since ' + t.since + ': ' + (t.indexed || 0).toLocaleString() + ' indexed · ' +
+      (t.skipped || 0).toLocaleString() + ' skipped or rejected · ' + (t.failed || 0).toLocaleString() + ' failed';
+    s.since.textContent = text;
+    s.since.title = text;
+  }
+
+  // The "?" beside the heading: a short help that opens over the card.
+  // Escape or a click elsewhere closes it.
+  function setHelp(open) {
+    help.hidden = !open;
+    helpBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  if (helpBtn && help) {
+    helpBtn.hidden = false;
+    helpBtn.addEventListener('click', function () { setHelp(help.hidden); });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !help.hidden) {
+        setHelp(false);
+        helpBtn.focus();
+      }
+    });
+    document.addEventListener('click', function (e) {
+      if (!help.hidden && e.target !== helpBtn && !help.contains(e.target)) setHelp(false);
+    });
   }
 
   function onEnd(e) {
@@ -233,6 +321,7 @@
     es.addEventListener('open', function () {
       if (!stopped) setStatus(paused ? 'paused' : 'live', paused ? null : 'on');
     });
+    es.addEventListener('backlog', onBacklog);
     es.addEventListener('lines', onLines);
     es.addEventListener('counts', onCounts);
     es.addEventListener('end', onEnd);

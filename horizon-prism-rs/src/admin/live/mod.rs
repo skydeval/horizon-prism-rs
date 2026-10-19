@@ -33,6 +33,17 @@ pub const RING_EVERY: Duration = Duration::from_secs(5);
 /// Gauge: open streams.
 pub const METRIC_STREAMS: &str = "admin_live_streams";
 
+/// Rows each column of the live figures shows, whatever is counted
+/// (second pass), so the block never changes height.
+pub const STAT_SLOTS: usize = 3;
+
+/// When counting began, short, as Home's "since" line shows it:
+/// `Oct 19, 19:02 UTC`.
+#[must_use]
+pub fn since_words(t: DateTime<Utc>) -> String {
+    t.format("%b %-d, %H:%M UTC").to_string()
+}
+
 /// The stream's timings (§10), shortened by tests.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {

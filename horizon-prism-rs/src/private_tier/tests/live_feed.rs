@@ -89,7 +89,7 @@ async fn t_f4_private_content_never_in_a_line() {
         assert_eq!(line["who"], "alice.test", "{kind}");
         assert!(line.get("text").is_none(), "{kind} has no text");
         let keys: Vec<&String> = line.as_object().expect("object").keys().collect();
-        assert!(keys.iter().all(|k| ["t", "src", "relay", "act", "k", "o", "f", "i", "did", "who"].contains(&k.as_str())), "{keys:?}");
+        assert!(keys.iter().all(|k| ["n", "t", "src", "relay", "act", "k", "o", "f", "i", "did", "who"].contains(&k.as_str())), "{keys:?}");
     }
     // A line that was not indexed (skipped, rejected, a duplicate) never
     // has text and is never on the indexed ticker.
@@ -100,6 +100,19 @@ async fn t_f4_private_content_never_in_a_line() {
     assert_eq!((public[0]["k"].as_str(), public[0]["did"].as_str(), public[0]["text"].as_str()), (Some("post"), Some(BOB), Some(PUBLIC_TEXT)));
     assert!(!events.iter().filter(|(n, _)| n == "counts").any(|(_, d)| d.contains(PUBLIC_TEXT)));
     drop(stream);
+    // The backlog a reload starts with (second pass) holds the same lines
+    // under the same rule: no private marker, text on the public post only.
+    let mut reload = Sse::open(&served.base, &format!("/admin/live?page={}", page_id()), Some(&cookie)).await;
+    assert_eq!(reload.status, 200);
+    let (name, data) = reload.next(Duration::from_secs(3)).await.expect("the backlog");
+    assert_eq!(name, "backlog");
+    for m in markers {
+        assert!(!data.contains(m), "the backlog carries a private marker: {data}");
+    }
+    let kept: Vec<Value> = serde_json::from_str(&data).expect("lines");
+    assert!(kept.iter().any(|l| l["k"] == "private-post"), "{kept:?}");
+    assert!(kept.iter().filter(|l| l.get("text").is_some()).all(|l| l["k"] == "post" && l["text"] == PUBLIC_TEXT && l.get("o").is_none()), "{kept:?}");
+    drop(reload);
     served.shut_down();
 
     // Snippets off: no line has a `text` field at all.

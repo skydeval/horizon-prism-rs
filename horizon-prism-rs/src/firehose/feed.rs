@@ -5,18 +5,29 @@
 //!   commit and outside the scope guard. It always counts each op in a
 //!   fixed table of atomics (§6.3). Only while a stream is open, and only
 //!   for a (bucket group, kind) some stream wants, does it build a [`Line`]
-//!   and send it on a lossy broadcast channel. It never awaits, never
-//!   blocks and never waits for a receiver.
+//!   for the firehose ticker and send it on a lossy broadcast channel; an
+//!   indexed op's line for the "Indexed here" backlog is built either way,
+//!   on that lane's budget. It never awaits and never waits for a receiver;
+//!   a built line takes one short uncontended lock to be numbered and kept.
 //! - [`FeedOp`] is the writer's view of one op. Its one field that can carry
 //!   record content is the public-post snippet, filled only by
 //!   `writer::feed_view` (§6.1).
 //!
 //! This module depends on nothing in the admin UI's module; the admin UI's hub
 //! (`src/admin/live/`) owns the stream side.
+//!
+//! The backlog (Changed by skydeval 2026-10-19, second pass): the newest
+//! [`BACKLOG_LINES`] lines of each ticker, in memory only, so a reload
+//! repaints both tickers. The "Indexed here" ring fills whether or not
+//! anyone watches (its lines come through the indexed lane's buckets, so the
+//! cost is bounded); the "On the firehose" ring fills only while a stream is
+//! open, and keeps its lines after the last one closes.
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
@@ -35,6 +46,11 @@ pub const BUCKET_PER_SEC: u32 = 100;
 pub const SNIPPET_CHARS: usize = 100;
 /// Metric: lines not shown, by why.
 pub const METRIC_NOT_SHOWN: &str = "admin_live_lines_not_shown_total";
+/// Lines kept per ticker for a reload: the page's `QUEUE_MAX` (`live.js`),
+/// more than the rows it keeps, so a reload repaints a full ticker.
+pub const BACKLOG_LINES: usize = 20;
+/// A backlog line older than this is not sent.
+pub const BACKLOG_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
 /// What a line or a count is about (§5.2). The wire slugs use hyphens
 /// (§6.2).
@@ -415,6 +431,9 @@ pub const LANES: usize = 2;
 /// One line of the feed (§5.2). Only the author, never a subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
+    /// This tap's running number of the line, from 1: the order lines were
+    /// sent and kept in, and what a page dedupes on after a reconnect.
+    pub seq: u64,
     pub at: DateTime<Utc>,
     pub source: Source,
     /// The relay label of a network line.
@@ -572,10 +591,41 @@ struct Inner {
     /// One per (lane, bucket group, kind), [`BUCKET_PER_SEC`] each.
     buckets: Vec<DefaultDirectRateLimiter>,
     sender: broadcast::Sender<Arc<Line>>,
+    /// The tickers' newest lines, and the line numbers.
+    backlog: Mutex<Rings>,
     snippets: bool,
     started: DateTime<Utc>,
     #[cfg(test)]
     built: AtomicU64,
+    #[cfg(test)]
+    built_arriving: AtomicU64,
+}
+
+/// The two tickers' newest lines, oldest first, and the last line number
+/// given out. Numbering, keeping and sending happen under one lock, so the
+/// rings and the broadcast hold lines in number order.
+#[derive(Default)]
+struct Rings {
+    last: u64,
+    arriving: VecDeque<Arc<Line>>,
+    indexed: VecDeque<Arc<Line>>,
+}
+
+/// The backlog as a new stream reads it (oldest first), and the last line
+/// number given out when it was read: a stream skips the live lines up to
+/// it, which the backlog already covers.
+#[derive(Debug, Clone, Default)]
+pub struct Backlog {
+    pub arriving: Vec<Arc<Line>>,
+    pub indexed: Vec<Arc<Line>>,
+    pub last: u64,
+}
+
+fn keep(ring: &mut VecDeque<Arc<Line>>, line: &Arc<Line>) {
+    ring.push_back(Arc::clone(line));
+    while ring.len() > BACKLOG_LINES {
+        ring.pop_front();
+    }
 }
 
 /// The tap. Cheap to clone; every clone shares one table and one channel.
@@ -601,11 +651,31 @@ impl FeedTap {
             wanted: AtomicU64::new(0),
             buckets: (0..LANES * GROUPS * KINDS).map(|_| RateLimiter::direct(per_sec)).collect(),
             sender,
+            backlog: Mutex::new(Rings::default()),
             snippets,
             started: Utc::now(),
             #[cfg(test)]
             built: AtomicU64::new(0),
+            #[cfg(test)]
+            built_arriving: AtomicU64::new(0),
         }))
+    }
+
+    /// The backlog a new stream starts with: each ticker's kept lines
+    /// younger than [`BACKLOG_MAX_AGE`] at `now`, oldest first.
+    #[must_use]
+    pub fn backlog(&self, now: DateTime<Utc>) -> Backlog {
+        let rings = self.0.backlog.lock().unwrap_or_else(PoisonError::into_inner);
+        let cutoff = now - chrono::Duration::from_std(BACKLOG_MAX_AGE).unwrap_or_else(|_| chrono::Duration::minutes(15));
+        let young = |ring: &VecDeque<Arc<Line>>| ring.iter().filter(|l| l.at >= cutoff).cloned().collect();
+        Backlog { arriving: young(&rings.arriving), indexed: young(&rings.indexed), last: rings.last }
+    }
+
+    /// Lines built for the firehose ticker since start (tests: T-F1).
+    #[cfg(test)]
+    #[must_use]
+    pub fn arriving_built(&self) -> u64 {
+        self.0.built_arriving.load(Ordering::Relaxed)
     }
 
     /// When this process's counting began.
@@ -666,7 +736,9 @@ impl FeedTap {
         let wanted = if active { inner.wanted.load(Ordering::Relaxed) } else { 0 };
         for op in ops {
             inner.ops[slot(source, op.kind, op.outcome)].fetch_add(1, Ordering::Relaxed);
-            if !active {
+            // Unwatched, only an indexed op can make a line: for the
+            // "Indexed here" backlog (second pass), on that lane's budget.
+            if !active && !op.outcome.indexed() {
                 continue;
             }
             // Every op is a line now (Changed by skydeval 2026-10-19): a
@@ -697,32 +769,40 @@ impl FeedTap {
             return;
         }
         inner.identity[row][1].fetch_add(1, Ordering::Relaxed);
-        if !inner.active.load(Ordering::Relaxed) {
-            return;
-        }
-        let wanted = inner.wanted.load(Ordering::Relaxed);
+        let wanted = if inner.active.load(Ordering::Relaxed) { inner.wanted.load(Ordering::Relaxed) } else { 0 };
         self.offer(Source::Network, kind, action, Outcome::Written, wanted, relay, did, None);
     }
 
     /// A line for both lanes an op may go to, each on its own bucket: the
-    /// arriving lane takes any op, the indexed lane only an indexed one.
-    /// Built when either lane has a token; the snippet only with the
-    /// indexed lane's.
+    /// arriving lane takes any op some stream wants, the indexed lane any
+    /// indexed op, wanted or not, since its ring fills for the backlog even
+    /// with nobody watching. Built when either lane has a token; the
+    /// snippet only with the indexed lane's. Kept in the rings of its
+    /// lanes; sent only when some stream wants it.
     #[allow(clippy::too_many_arguments)]
     fn offer(&self, source: Source, kind: Kind, action: LineAction, outcome: Outcome, wanted: u64, relay: Option<&str>, did: &str, text: Option<&str>) {
         let inner = &*self.0;
-        if wanted & wanted_bit(source.group(), kind) == 0 {
+        let want = wanted & wanted_bit(source.group(), kind) != 0;
+        if !want && !outcome.indexed() {
             return;
         }
         let bucket = |lane: usize| &inner.buckets[(lane * GROUPS + source.group()) * KINDS + kind.index()];
-        let lanes = Lanes { arriving: bucket(0).check().is_ok(), indexed: outcome.indexed() && bucket(1).check().is_ok() };
+        let lanes = Lanes { arriving: want && bucket(0).check().is_ok(), indexed: outcome.indexed() && bucket(1).check().is_ok() };
         if !lanes.arriving && !lanes.indexed {
-            metrics::counter!(METRIC_NOT_SHOWN, "why" => "source_rate").increment(1);
+            if want {
+                metrics::counter!(METRIC_NOT_SHOWN, "why" => "source_rate").increment(1);
+            }
             return;
         }
         #[cfg(test)]
-        inner.built.fetch_add(1, Ordering::Relaxed);
-        let line = Line {
+        {
+            inner.built.fetch_add(1, Ordering::Relaxed);
+            if lanes.arriving {
+                inner.built_arriving.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let mut line = Line {
+            seq: 0,
             at: Utc::now(),
             source,
             relay: if source == Source::Network { relay.map(str::to_string) } else { None },
@@ -733,8 +813,20 @@ impl FeedTap {
             did: did.to_string(),
             text: if lanes.indexed && outcome == Outcome::Written { text.map(snippet) } else { None },
         };
-        // No receiver is not an error: the line is dropped.
-        let _ = inner.sender.send(Arc::new(line));
+        let mut rings = inner.backlog.lock().unwrap_or_else(PoisonError::into_inner);
+        rings.last += 1;
+        line.seq = rings.last;
+        let line = Arc::new(line);
+        if lanes.arriving {
+            keep(&mut rings.arriving, &line);
+        }
+        if lanes.indexed {
+            keep(&mut rings.indexed, &line);
+        }
+        if want {
+            // No receiver is not an error: the line is dropped.
+            let _ = inner.sender.send(line);
+        }
     }
 }
 
@@ -887,18 +979,60 @@ mod tests {
         assert_eq!(tap.totals().outcome(Outcome::Written), 100_000, "every op counted");
     }
 
-    /// T-F1 (unit part): with no stream open, nothing is built or sent.
+    /// T-F1 (unit part, second pass): with no stream open, nothing is sent
+    /// and no firehose line is built; indexed ops make lines for the
+    /// "Indexed here" backlog only, bounded by that lane's buckets.
     #[test]
     fn nothing_is_built_without_a_stream() {
         let tap = FeedTap::new(true);
         for i in 0..10_000 {
             tap.observe(std::iter::once(written(Kind::ALL[i % KINDS], Some("x"))), WriteSource::Firehose, None, "did:plc:a");
-            tap.observe(std::iter::once(create(Kind::Like, Outcome::NotInScope, None)), WriteSource::Firehose, None, "did:plc:a");
+            tap.observe(std::iter::once(create(Kind::Like, Outcome::NotInScope, Some("secret"))), WriteSource::Firehose, None, "did:plc:a");
         }
-        assert_eq!(tap.lines_built(), 0);
+        assert_eq!(tap.arriving_built(), 0, "no firehose line without a stream");
+        assert!(tap.lines_built() <= (GROUPS * KINDS) as u64 * u64::from(BUCKET_PER_SEC) * 2, "the indexed lane's buckets bound it: {}", tap.lines_built());
         assert_eq!(tap.receivers(), 0);
         assert_eq!(tap.totals().indexed(), 10_000);
         assert_eq!(tap.totals().skipped(), 10_000);
+        let backlog = tap.backlog(Utc::now());
+        assert!(backlog.arriving.is_empty());
+        assert_eq!(backlog.indexed.len(), BACKLOG_LINES, "the indexed ring is kept full");
+        assert!(backlog.indexed.iter().all(|l| l.lanes.indexed && !l.lanes.arriving && l.outcome == Outcome::Written));
+        assert!(backlog.indexed.windows(2).all(|w| w[0].seq < w[1].seq), "oldest first");
+        assert_eq!(backlog.last, tap.lines_built());
+    }
+
+    /// The backlog (second pass): the firehose ring fills only while a
+    /// stream is open and keeps its lines after; lines past
+    /// [`BACKLOG_MAX_AGE`] are not handed out; a line that was not indexed
+    /// has no text.
+    #[test]
+    fn the_backlog_keeps_the_newest_and_drops_the_old() {
+        let tap = FeedTap::new(true);
+        tap.set_wanted(WANT_ALL);
+        for outcome in [Outcome::Written, Outcome::NotInScope, Outcome::Unchanged] {
+            tap.observe(std::iter::once(create(Kind::Post, outcome, Some("some text"))), WriteSource::Firehose, Some("bsky"), "did:plc:a");
+        }
+        tap.set_wanted(0);
+        tap.observe(std::iter::once(create(Kind::Post, Outcome::PublicOff, Some("unseen"))), WriteSource::Firehose, None, "did:plc:a");
+        let now = Utc::now();
+        let b = tap.backlog(now);
+        assert_eq!(b.arriving.iter().map(|l| l.outcome).collect::<Vec<_>>(), [Outcome::Written, Outcome::NotInScope, Outcome::Unchanged], "kept after the stream closed");
+        assert_eq!(b.indexed.len(), 1);
+        assert_eq!(b.indexed[0].text.as_deref(), Some("some text"));
+        assert!(b.arriving.iter().filter(|l| !l.outcome.indexed()).all(|l| l.text.is_none()));
+        // Fifteen minutes on, nothing is handed out; the numbers stand.
+        let later = tap.backlog(now + chrono::Duration::minutes(16));
+        assert!(later.arriving.is_empty() && later.indexed.is_empty());
+        assert_eq!(later.last, b.last);
+        // The ring keeps the newest.
+        tap.set_wanted(WANT_ALL);
+        for i in 0..(BACKLOG_LINES + 5) {
+            tap.observe(std::iter::once(written(Kind::ALL[i % KINDS], None)), WriteSource::Backfill, None, "did:plc:b");
+        }
+        let b = tap.backlog(Utc::now());
+        assert_eq!((b.arriving.len(), b.indexed.len()), (BACKLOG_LINES, BACKLOG_LINES));
+        assert_eq!(b.arriving.last().map(|l| l.seq), Some(b.last));
     }
 
     /// Arriving events (Changed by skydeval 2026-10-19): a skipped,

@@ -4,13 +4,15 @@
 //! - At open: a `page` of 32 lowercase hex characters (else `400`), then
 //!   [`Need::Poll`]. A refusal is never a redirect: `401`, `429` or `503`
 //!   with an empty body. Then a slot (§3.4), or `429` at the global cap.
+//! - First, one `backlog` event: each ticker's kept lines through the
+//!   filter, oldest first (second pass), so a reload repaints the tickers.
 //! - While open: lines through the stream's filter at most
 //!   [`LINES_PER_SEC`] a second per ticker, in batches; `counts` every second; the
 //!   session checked every minute and at its own expiry instant; `end`
 //!   with a reason on a failed check, a replacement, the 30-minute
 //!   renewal or shutdown.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -106,14 +108,16 @@ impl Filter {
     }
 }
 
-/// A line as the `lines` event carries it: no field for what a line may
-/// not show (§6), and no `text` key at all without a snippet. `lanes` are
+/// A line as the `lines` and `backlog` events carry it: no field for what a
+/// line may not show (§6), and no `text` key at all without a snippet. `n`
+/// is the line's number, which the page dedupes on. `lanes` are
 /// the tickers this stream admitted it to: `"f": 1` for "On the firehose",
 /// `"i": 1` for "Indexed here"; a snippet goes only with `i`. A line that
 /// was not indexed carries its outcome as `o`.
 #[must_use]
 pub fn line_json(line: &Line, handle: Option<&str>, lanes: Lanes) -> Value {
     let mut m = Map::new();
+    m.insert("n".into(), json!(line.seq));
     m.insert("t".into(), json!(line.at.format("%H:%M:%S").to_string()));
     m.insert("src".into(), json!(line.source.slug()));
     if let Some(relay) = &line.relay {
@@ -218,7 +222,8 @@ pub async fn open(
     tracing::debug!(event = "admin_live_stream_opened", did = %session.did, "live feed stream opened");
     let timing = hub.timing();
     let deadline = instant_at(session.deadline(state.session_idle));
-    let live = Live::new(state.clone(), hub, rx, slot, filter, id_hash, request_ip(&state, &headers, peer), deadline);
+    let mut live = Live::new(state.clone(), hub, rx, slot, filter, id_hash, request_ip(&state, &headers, peer), deadline);
+    live.backlog().await;
     let events = futures::stream::unfold(live, |mut live| async move {
         let event = live.next().await?;
         Some((Ok::<Event, Infallible>(event), live))
@@ -256,6 +261,8 @@ struct Live {
     tokens: [f64; 2],
     refilled: Instant,
     batch: Vec<(Arc<Line>, Lanes)>,
+    /// Live lines up to this number are covered by the backlog.
+    skip_upto: u64,
     /// Since the last `counts`.
     shown: u64,
     not_shown: u64,
@@ -290,7 +297,7 @@ impl Live {
         Self {
             closing: hub.closing(),
             prev: hub.tap().totals(),
-            since: hub.started().to_rfc3339(),
+            since: super::since_words(hub.started()),
             state,
             rx,
             slot,
@@ -300,6 +307,7 @@ impl Live {
             tokens: [burst(); 2],
             refilled: now,
             batch: Vec::new(),
+            skip_upto: 0,
             shown: 0,
             not_shown: 0,
             prev_at: now,
@@ -374,8 +382,30 @@ impl Live {
         }
     }
 
+    /// The `backlog` event, once, before any live line (second pass): each
+    /// ticker's kept lines through this stream's filter, younger than
+    /// [`BACKLOG_MAX_AGE`](crate::firehose::feed::BACKLOG_MAX_AGE), oldest
+    /// first, with stored handles. Not paced and not counted against the
+    /// rate. A line kept for both tickers is one entry with both marks.
+    async fn backlog(&mut self) {
+        let backlog = self.hub.tap().backlog(Utc::now());
+        self.skip_upto = backlog.last;
+        let mut merged: BTreeMap<u64, (Arc<Line>, Lanes)> = BTreeMap::new();
+        for line in backlog.arriving.into_iter().filter(|l| self.filter.admits(l)) {
+            merged.entry(line.seq).or_insert_with(|| (line, Lanes::default())).1.arriving = true;
+        }
+        for line in backlog.indexed.into_iter().filter(|l| self.filter.admits(l)) {
+            merged.entry(line.seq).or_insert_with(|| (line, Lanes::default())).1.indexed = true;
+        }
+        let entries: Vec<(Arc<Line>, Lanes)> = merged.into_values().collect();
+        let dids: Vec<&str> = entries.iter().map(|(l, _)| l.did.as_str()).collect();
+        let handles = if dids.is_empty() { Vec::new() } else { handles(&self.state, &self.hub, &dids).await };
+        let lines: Vec<Value> = entries.iter().zip(&handles).map(|((l, lanes), h)| line_json(l, h.as_deref(), *lanes)).collect();
+        self.pending.push_back(Event::default().event("backlog").data(Value::Array(lines).to_string()));
+    }
+
     fn offer(&mut self, line: Arc<Line>) {
-        if !self.filter.admits(&line) {
+        if line.seq <= self.skip_upto || !self.filter.admits(&line) {
             return;
         }
         let now = Instant::now();
@@ -497,6 +527,7 @@ mod tests {
         assert_eq!(blocks.wanted(), wanted_bit(0, Kind::Block) | wanted_bit(1, Kind::Block));
         let backfill_private = Filter::parse(Some("private, junk"), Some("backfill"));
         let line = |kind, source| Line {
+            seq: 1,
             at: Utc::now(),
             source,
             relay: None,
@@ -521,6 +552,7 @@ mod tests {
     #[test]
     fn a_line_without_a_snippet_has_no_text_key() {
         let mut l = Line {
+            seq: 7,
             at: Utc::now(),
             source: Source::Network,
             relay: Some("bsky".into()),
@@ -533,6 +565,7 @@ mod tests {
         };
         let v = line_json(&l, None, BOTH);
         assert!(v.get("text").is_none() && v.get("who").is_none() && v.get("o").is_none());
+        assert_eq!(v["n"], 7, "the line's number, for the page to dedupe on");
         assert_eq!((v["k"].as_str(), v["src"].as_str(), v["relay"].as_str()), (Some("private-post"), Some("network"), Some("bsky")));
         assert_eq!((v["f"].as_u64(), v["i"].as_u64()), (Some(1), Some(1)));
         l.text = Some("hi".into());

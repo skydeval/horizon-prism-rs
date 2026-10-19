@@ -440,6 +440,95 @@ async fn t_f8_lines() {
     h.db.drop_db().await;
 }
 
+/// The backlog's lines: the first event of a stream, which must be one.
+async fn backlog_of(s: &mut Sse) -> Vec<Value> {
+    let (name, data) = s.next(Duration::from_secs(3)).await.expect("an event");
+    assert_eq!(name, "backlog", "the backlog comes first: {data}");
+    serde_json::from_str(&data).expect("backlog")
+}
+
+fn seq(l: &Value) -> u64 {
+    l["n"].as_u64().expect("every line has a number")
+}
+
+/// T-F12 the backlog (Changed by skydeval 2026-10-19, second pass): a new
+/// stream starts with each ticker's newest lines. "Indexed here" fills with
+/// nobody watching, "On the firehose" only while someone does and keeps its
+/// lines after; the stream's filter applies; a line that was not indexed
+/// carries no text; a reconnect's backlog and live lines never repeat a
+/// line under a new number, and live lines start past the backlog.
+#[tokio::test]
+async fn t_f12_backlog() {
+    let Some(h) = harness("admin_t_f12").await else {
+        return;
+    };
+    let p = h.pool();
+    let _alice = complete_setup(&h, ALICE).await;
+    let cookie = session(p, ALICE, PDS).await;
+    let w = writer(&h, in_scope(&[AUTHOR]));
+    let block = |rkey: &str| op(Action::Create, "app.bsky.graph.block", rkey, Some(json!({"subject": OUTSIDER, "createdAt": "2026-10-19T00:00:00Z"})));
+
+    // Nobody watching: an indexed post and a rejected one.
+    w.apply_from(Some("bsky"), AUTHOR, "3kaaaaaaaaa22", &[post("3kpost1aaaaaa", "kept for a reload")], OPTIONS).await.expect("apply");
+    w.apply(OUTSIDER, "3kaaaaaaaaa22", &[post("3kpost2aaaaaa", "outside-marker-1")], OPTIONS).await.expect("apply");
+    assert_eq!(h.hub.tap().arriving_built(), 0, "no firehose line with nobody watching");
+    let mut first = open(&h, &cookie, &page_id(), "").await;
+    assert_eq!(first.status, 200);
+    let backlog = backlog_of(&mut first).await;
+    assert_eq!(backlog.len(), 1, "{backlog:?}");
+    assert_eq!((backlog[0]["did"].as_str(), backlog[0]["k"].as_str(), backlog[0]["text"].as_str()), (Some(AUTHOR), Some("post"), Some("kept for a reload")));
+    assert_eq!((backlog[0]["i"].as_u64(), backlog[0].get("f")), (Some(1), None), "on the indexed ticker only");
+
+    // Watched: a rejected post with text, and a block; then nobody again.
+    w.apply(OUTSIDER, "3kaaaaaaaaa23", &[post("3kpost3aaaaaa", "outside-marker-2")], OPTIONS).await.expect("apply");
+    w.apply(AUTHOR, "3kaaaaaaaaa24", &[block("3kblock1aaaaa")], OPTIONS).await.expect("apply");
+    let live = lines_of(&first.collect(Duration::from_millis(800)).await);
+    assert_eq!(live.len(), 2, "{live:?}");
+    drop(first);
+    streams(&h, 0).await;
+
+    // A reload: the firehose lines from before, the indexed ones too.
+    let page = page_id();
+    let mut second = open(&h, &cookie, &page, "").await;
+    let backlog = backlog_of(&mut second).await;
+    let numbers: Vec<u64> = backlog.iter().map(seq).collect();
+    assert!(numbers.windows(2).all(|w| w[0] < w[1]), "oldest first: {numbers:?}");
+    let outside = backlog.iter().find(|l| l["did"] == OUTSIDER).expect("the rejected post, kept after the stream closed");
+    assert_eq!((outside["o"].as_str(), outside["f"].as_u64()), (Some("not_in_scope"), Some(1)));
+    assert!(outside.get("text").is_none() && outside.get("i").is_none(), "{outside}");
+    assert!(!backlog.iter().any(|l| l.to_string().contains("outside-marker")), "{backlog:?}");
+    let blocked = backlog.iter().find(|l| l["k"] == "block").expect("the block");
+    assert_eq!((blocked["f"].as_u64(), blocked["i"].as_u64()), (Some(1), Some(1)), "kept for both tickers, sent once");
+    for l in &live {
+        assert!(backlog.iter().any(|b| seq(b) == seq(l)), "the backlog repeats {l} under its own number");
+    }
+    // Every line not indexed in the backlog has no text.
+    assert!(backlog.iter().filter(|l| l.get("o").is_some()).all(|l| l.get("text").is_none() && l.get("i").is_none()), "{backlog:?}");
+
+    // The stream's filter applies to the backlog.
+    let mut blocks = open(&h, &cookie, &page_id(), "&kinds=block").await;
+    let filtered = backlog_of(&mut blocks).await;
+    assert_eq!(filtered.iter().map(|l| l["k"].as_str()).collect::<Vec<_>>(), [Some("block")], "{filtered:?}");
+    drop(blocks);
+
+    // A reconnect of the same page: the backlog holds what the page saw,
+    // under the same numbers, and live lines start past it.
+    w.apply(AUTHOR, "3kaaaaaaaaa25", &[post("3kpost4aaaaaa", "while open")], OPTIONS).await.expect("apply");
+    let seen = lines_of(&second.collect(Duration::from_millis(800)).await);
+    let while_open = seen.iter().find(|l| l["text"] == "while open").expect("the live post");
+    let mut again = open(&h, &cookie, &page, "").await;
+    assert_eq!(second.end_reason(Duration::from_secs(2)).await.as_deref(), Some("replaced"));
+    let backlog = backlog_of(&mut again).await;
+    let repeated = backlog.iter().find(|l| l["text"] == "while open").expect("in the backlog");
+    assert_eq!(seq(repeated), seq(while_open), "the same number, so the page takes it once");
+    let top = backlog.iter().map(seq).max().expect("lines");
+    w.apply(AUTHOR, "3kaaaaaaaaa26", &[post("3kpost5aaaaaa", "after the reconnect")], OPTIONS).await.expect("apply");
+    let after = lines_of(&again.collect(Duration::from_millis(800)).await);
+    assert!(!after.is_empty() && after.iter().all(|l| seq(l) > top), "{after:?}");
+    assert!(!after.iter().any(|l| l["text"] == "while open"), "{after:?}");
+    h.db.drop_db().await;
+}
+
 /// T-F2 (stream part): a client that reads nothing never holds up the
 /// writer; what its stream did not show is counted exactly.
 #[tokio::test]
@@ -555,7 +644,83 @@ async fn t_f11_script_not_started() {
     // Totals with JavaScript off: the server renders the figures.
     h.hub.tap().observe(std::iter::once(written(Kind::Post, None)), WriteSource::Firehose, None, AUTHOR);
     let home = alice.get(&format!("{}/admin?auto=1", h.base)).await;
-    assert!(home.body.contains("Since Prism started") && home.body.contains("<span class=\"l\">post</span>"), "{}", home.body);
+    assert!(home.body.contains("<p class=\"muted live-since\">Since ") && home.body.contains("<span class=\"l\">post</span>"), "{}", home.body);
+    assert_eq!(stat_rows(&home.body), [live::STAT_SLOTS; 3], "one kind: blank rows fill the columns");
+    // Five kinds: still three rows a column, the last "+3 more" naming the rest.
+    for kind in [Kind::Like, Kind::Follow, Kind::Repost, Kind::Block] {
+        h.hub.tap().observe(std::iter::once(written(kind, None)), WriteSource::Firehose, None, AUTHOR);
+    }
+    let home = alice.get(&format!("{}/admin?auto=1", h.base)).await;
+    assert_eq!(stat_rows(&home.body), [live::STAT_SLOTS; 3], "{}", home.body);
+    assert!(home.body.contains("<span class=\"l\">+3 more</span>"), "{}", home.body);
+    assert!(home.body.contains("<div class=\"fact\" title=\""), "the rest in a tooltip: {}", home.body);
+    h.db.drop_db().await;
+}
+
+/// The figure rows of each of the live section's three columns.
+fn stat_rows(body: &str) -> Vec<usize> {
+    let rates = &body[body.find("id=\"live-rates\"").expect("rates")..];
+    let rates = &rates[..rates.find("id=\"live-controls\"").expect("controls")];
+    rates.split("<h3>").skip(1).map(|col| col.matches("<div class=\"fact").count()).collect()
+}
+
+/// Nothing on Home moves when events arrive (Changed by skydeval
+/// 2026-10-19, second pass), and the help is a real button over the card.
+#[tokio::test]
+async fn t_f13_a_stable_card_and_its_help() {
+    let Some(h) = harness("admin_t_f13").await else {
+        return;
+    };
+    let alice = complete_setup(&h, ALICE).await;
+    let home = alice.get(&format!("{}/admin", h.base)).await;
+    assert_eq!(home.status, 200);
+    let body = &home.body;
+    // The figures: three columns of the same rows, whatever is counted.
+    assert_eq!(stat_rows(body), [live::STAT_SLOTS; 3], "{body}");
+    assert!(JS.contains(&format!("var SLOTS = {};", live::STAT_SLOTS)), "the script lays out the same rows");
+    assert!(JS.contains("'+' + rest.length + ' more'") && JS.contains("r.row.title = tip"), "+N more, the rest in a tooltip");
+    assert!(JS.contains("if (stats) return stats;"), "the figures are built once, then their text changes");
+    // The short "since" line: one line, numbers that keep their width.
+    let since = &CSS[CSS.find(".live-since {").expect("since rule")..];
+    let since = &since[..since.find('}').expect("end")];
+    assert!(since.contains("white-space: nowrap;") && since.contains("height: 1.4em;") && since.contains("tabular-nums"), "{since}");
+    assert!(!body.contains("Since Prism started ("), "no long timestamp");
+    for rule in ["#live-rates .fact {", "#live-rates .fact .v {"] {
+        assert!(CSS.contains(rule), "{rule}");
+    }
+    assert!(CSS[CSS.find("#live-rates .fact {").expect("fact")..].starts_with("#live-rates .fact { height: "), "a fixed row height");
+    assert!(CSS.contains(".live-head .pill { min-width:"), "the status pill keeps its width");
+    assert!(CSS.contains("#live-pause { min-width:"), "Pause and Resume keep the controls still");
+    // The sampling sentence moved into the help.
+    assert!(!JS.contains("The tickers show up to") && !body.contains("The tickers show up to"));
+    // The help: a real button that says what it controls, hidden until the
+    // script runs; a panel over the card, closed by Escape.
+    let btn = &body[body.find("<button class=\"help-btn\"").expect("the help button")..];
+    let btn = &btn[..btn.find('>').expect("end")];
+    for attr in ["type=\"button\"", "id=\"live-help-btn\"", "aria-expanded=\"false\"", "aria-controls=\"live-help\"", "aria-label=", " hidden"] {
+        assert!(btn.contains(attr), "{attr}: {btn}");
+    }
+    let panel = &body[body.find("id=\"live-help\"").expect("the panel")..];
+    let panel_tag = &panel[..panel.find('>').expect("end")];
+    assert!(panel_tag.contains("hidden"), "closed at first: {panel_tag}");
+    let panel = &panel[..panel.find("</div>").expect("panel end")];
+    for words in ["On the firehose", "Indexed here", "a sample", "first via", "duplicate", "public data off", "not in scope"] {
+        assert!(panel.contains(words), "{words}: {panel}");
+    }
+    let rule = &CSS[CSS.find(".live-help {").expect("help rule")..];
+    let rule = &rule[..rule.find('}').expect("end")];
+    assert!(rule.contains("position: absolute;"), "over the card, not in it: {rule}");
+    assert!(JS.contains("e.key === 'Escape'") && JS.contains("helpBtn.setAttribute('aria-expanded'") && JS.contains("helpBtn.hidden = false;"));
+    // Tickers: a fixed header and box; backlog lines appear without the slide.
+    let head = &CSS[CSS.find(".live-tickers h3 {").expect("ticker head")..];
+    assert!(head[..head.find('}').expect("end")].contains("height: 1.5em;"));
+    assert!(JS.contains("lineEl(queue.shift(), withText, true)") && JS.contains("lineEl(queue.shift(), withText, false)"));
+    // The backlog matches the page's queue, so a reload fills a ticker.
+    assert!(JS.contains(&format!("var QUEUE_MAX = {};", crate::firehose::feed::BACKLOG_LINES)));
+    assert!(JS.contains("es.addEventListener('backlog', onBacklog);") && JS.contains("if (l.n <= last) return false;"), "a line is taken once");
+    // The tiles keep their height as their figures change.
+    assert!(CSS.contains("#tiles .stat { flex-wrap: nowrap; }"));
+    assert!(!body.contains("style="), "no inline style");
     h.db.drop_db().await;
 }
 

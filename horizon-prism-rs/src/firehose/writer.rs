@@ -3340,7 +3340,8 @@ mod tests {
 
         /// T-F1 (admin-ui-live-feed design §11): with the tap installed and
         /// no stream open, 10 000 ops from the firehose and backfill with
-        /// mixed outcomes build no line and send nothing, and the counters
+        /// mixed outcomes build no firehose line (indexed ones fill the
+        /// "Indexed here" backlog) and send nothing, and the counters
         /// equal the outcomes; a writer without a tap returns the same
         /// reports and writes the same rows.
         #[tokio::test]
@@ -3396,8 +3397,15 @@ mod tests {
                 by_source[usize::from(source != WriteSource::Firehose)] += 100;
             }
             let totals = tap.totals();
-            assert_eq!(tap.lines_built(), 0, "no line without a stream");
+            // Second pass: with no stream, no firehose line is built; indexed
+            // ops make lines for the "Indexed here" backlog alone.
+            assert_eq!(tap.arriving_built(), 0, "no firehose line without a stream");
             assert_eq!(tap.receivers(), 0, "no receiver, so nothing was ever sent");
+            let backlog = tap.backlog(chrono::Utc::now());
+            assert!(backlog.arriving.is_empty());
+            assert!(!backlog.indexed.is_empty() && backlog.indexed.len() <= crate::firehose::feed::BACKLOG_LINES);
+            assert!(backlog.indexed.iter().all(|l| l.outcome.indexed() && l.lanes.indexed && !l.lanes.arriving), "only indexed ops");
+            assert_eq!(tap.lines_built(), backlog.last);
             assert!(expected.len() >= 4, "mixed outcomes: {expected:?}");
             for o in Outcome::ALL {
                 assert_eq!(totals.outcome(o), expected.get(&o).copied().unwrap_or(0), "{o:?}");

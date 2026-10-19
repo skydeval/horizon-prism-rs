@@ -1,0 +1,1 @@
+{% if f.blank %}<div class="fact blank"><span class="l">&nbsp;</span><span class="v">&nbsp;</span></div>{% else %}<div class="fact"{% if !f.title.is_empty() %} title="{{ f.title }}"{% endif %}><span class="l">{{ f.label }}</span><span class="v">{% if f.value.is_empty() %}&nbsp;{% else %}{{ f.value }}{% endif %}</span></div>{% endif %}

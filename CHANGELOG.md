@@ -69,6 +69,22 @@ shows what Prism indexes as it happens, and Activity is now the audit log.
   out indexed ones; nothing is built with no stream open. Each stream
   sends at most 25 lines a second per ticker. A line that was not indexed
   never carries text, and snippets appear only under "Indexed here".
+- **A still Live card, a help button, and tickers that survive a reload**
+  (changed by skydeval, second pass). Nothing on Home moves when events
+  arrive: each column of figures always has three rows (blank rows fill a
+  short one; a long one ends in "+N more", the rest in its tooltip), rows
+  and the status pill keep one size, numbers keep their width, and the
+  "since" line is short ("Since Oct 19, 19:02 UTC") and one line (two on a
+  phone). The sampling sentence moved behind a "?" button by the Live
+  heading, a help panel over the card (Escape closes it) that also says
+  what the tickers, "first via", "duplicate" and the dimmed reasons mean.
+  A new stream starts with a `backlog` event: each ticker's newest 20
+  lines, kept in memory only, through the stream's filters, none older
+  than 15 minutes, so a reload repaints both tickers at once. "Indexed
+  here" is kept filled with nobody watching (on the indexed lane's
+  budget); "On the firehose" fills only while a stream is open and keeps
+  its lines after. Every line carries a number, so a reconnect never
+  shows a line twice.
 
 ### Fixed (admin UI forms)
 

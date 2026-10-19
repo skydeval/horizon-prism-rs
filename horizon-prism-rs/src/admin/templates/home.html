@@ -8,28 +8,35 @@
 {% include "tiles.html" %}
 </div>
 <section class="card live" id="live" aria-labelledby="live-h">
-<div class="live-head"><h2 id="live-h">Live</h2><span class="pill" id="live-status" hidden>connecting…</span></div>
+<div class="live-head"><h2 id="live-h">Live</h2><button class="help-btn" type="button" id="live-help-btn" aria-expanded="false" aria-controls="live-help" aria-label="What the live feed shows" hidden>?</button><span class="pill" id="live-status" hidden>connecting…</span>
+<div class="live-help" id="live-help" role="region" aria-label="About the live feed" hidden>
+<p><b>On the firehose</b>: what arrives from the relays, and what Prism did with each one.</p>
+<p><b>Indexed here</b>: what this Prism saved.</p>
+<p>The lines are a sample: each list shows up to 5 a second, so at busy times most are not shown. The figures above count everything.</p>
+<p><b>first via</b> a relay: the relay that delivered it first. Only that copy is saved.</p>
+<p><b>duplicate</b>: the same thing from another relay. It was already saved, so it counts as unchanged.</p>
+<p>Faded lines were not saved, and say why. <b>public data off</b>: saving public data is turned off. <b>not in scope</b>: no member's scope covers it.</p>
+</div>
+</div>
 <p class="banner bad" id="live-notstarted">The live feed did not start. Reload the page; if it keeps happening, something is blocking the page's script.</p>
 <p class="banner" id="live-message" hidden></p>
 <noscript><p class="muted">The live feed needs JavaScript. These figures are from when the page loaded; it reloads every 30 seconds.</p></noscript>
 <div id="live-rates">
-<p class="muted">Since Prism started {{ live.started }}; rates over the last minute.</p>
+<p class="muted live-since">Since {{ live.started }} · rates over the last minute</p>
 <div class="grid">
 <div>
 <h3>Indexed</h3>
-{% for f in live.indexed %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.total }} · {{ f.rate }}</span></div>
-{% else %}<p class="muted">Nothing yet.</p>
+{% for f in live.indexed %}{% include "live_fact.html" %}
 {% endfor %}
 </div>
 <div>
 <h3>Skipped and rejected</h3>
-{% for f in live.reasons %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.total }} · {{ f.rate }}</span></div>
-{% else %}<p class="muted">Nothing yet.</p>
+{% for f in live.reasons %}{% include "live_fact.html" %}
 {% endfor %}
 </div>
 <div>
 <h3>Also</h3>
-{% for f in live.other %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.total }} · {{ f.rate }}</span></div>
+{% for f in live.other %}{% include "live_fact.html" %}
 {% endfor %}
 </div>
 </div>

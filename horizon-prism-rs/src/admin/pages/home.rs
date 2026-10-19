@@ -19,6 +19,7 @@ use serde::Deserialize;
 
 use super::{Nav, css, render};
 use crate::admin::auth::{Need, require};
+use crate::admin::live::{STAT_SLOTS, since_words};
 use crate::admin::{AdminState, JS_HREF, LivePage};
 use crate::firehose::feed::{Outcome, Source, Totals};
 
@@ -32,12 +33,63 @@ pub struct Tiles {
     pub as_of: String,
 }
 
-/// One figure of the live section: a total since start and the last
-/// minute's rate.
+/// One row of the live figures: a total since start and the last minute's
+/// rate. Every column has [`STAT_SLOTS`] rows (second pass): a blank row
+/// fills a short column, and a long one's last row is "+N more", the rest
+/// named in its `title`.
 pub struct Figure {
     pub label: String,
-    pub total: u64,
-    pub rate: String,
+    /// `total · rate`; empty on a blank row.
+    pub value: String,
+    /// The rows "+N more" stands for; empty otherwise.
+    pub title: String,
+    pub blank: bool,
+}
+
+impl Figure {
+    fn blank() -> Self {
+        Self { label: String::new(), value: String::new(), title: String::new(), blank: true }
+    }
+}
+
+/// A count before it is laid out in rows.
+struct Count {
+    label: String,
+    total: u64,
+    rate: Option<f64>,
+}
+
+fn rate_words(rate: Option<f64>) -> String {
+    rate.map_or_else(|| "—".to_string(), |r| format!("{r:.1}/s"))
+}
+
+impl Count {
+    fn value(&self) -> String {
+        format!("{} · {}", self.total, rate_words(self.rate))
+    }
+}
+
+/// Exactly [`STAT_SLOTS`] rows of `counts`, in their order.
+fn slots(counts: &[Count]) -> Vec<Figure> {
+    let figure = |c: &Count| Figure { label: c.label.clone(), value: c.value(), title: String::new(), blank: false };
+    let mut out: Vec<Figure> = if counts.is_empty() {
+        vec![Figure { label: "none yet".to_string(), value: String::new(), title: String::new(), blank: false }]
+    } else if counts.len() > STAT_SLOTS {
+        let (shown, rest) = counts.split_at(STAT_SLOTS - 1);
+        let more = Count {
+            label: format!("+{} more", rest.len()),
+            total: rest.iter().map(|c| c.total).sum(),
+            rate: rest.iter().map(|c| c.rate).sum(),
+        };
+        let title = rest.iter().map(|c| format!("{}: {}", c.label, c.value())).collect::<Vec<_>>().join(", ");
+        shown.iter().map(figure).chain(std::iter::once(Figure { title, ..figure(&more) })).collect()
+    } else {
+        counts.iter().map(figure).collect()
+    };
+    while out.len() < STAT_SLOTS {
+        out.push(Figure::blank());
+    }
+    out
 }
 
 /// A filter choice.
@@ -131,14 +183,8 @@ async fn load_tiles(state: &AdminState) -> Result<Tiles, sqlx::Error> {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn rate(minute: Option<&(Totals, std::time::Duration)>, of: impl Fn(&Totals) -> u64) -> String {
-    match minute {
-        Some((delta, span)) => {
-            let per_sec = of(delta) as f64 / span.as_secs_f64();
-            format!("{per_sec:.1}/s")
-        }
-        None => "—".to_string(),
-    }
+fn rate(minute: Option<&(Totals, std::time::Duration)>, of: impl Fn(&Totals) -> u64) -> Option<f64> {
+    minute.map(|(delta, span)| of(delta) as f64 / span.as_secs_f64())
 }
 
 fn live_section(state: &AdminState) -> LiveSection {
@@ -146,11 +192,11 @@ fn live_section(state: &AdminState) -> LiveSection {
     let totals = hub.tap().totals();
     let minute = hub.last_minute();
     let minute = minute.as_ref();
-    let indexed = totals
+    let mut indexed: Vec<Count> = totals
         .indexed_by_kind()
         .into_iter()
         .filter(|(_, n)| *n > 0)
-        .map(|(kind, n)| Figure {
+        .map(|(kind, n)| Count {
             label: kind.words().to_string(),
             total: n,
             rate: rate(minute, |t| {
@@ -158,26 +204,28 @@ fn live_section(state: &AdminState) -> LiveSection {
             }),
         })
         .collect();
-    let reasons = totals
+    indexed.sort_by(|a, b| b.total.cmp(&a.total));
+    let mut reasons: Vec<Count> = totals
         .reasons()
         .into_iter()
         .filter(|(_, n)| *n > 0)
-        .map(|(o, n)| Figure { label: reason_words(o).to_string(), total: n, rate: rate(minute, |t| t.outcome(o)) })
+        .map(|(o, n)| Count { label: reason_words(o).to_string(), total: n, rate: rate(minute, |t| t.outcome(o)) })
         .collect();
-    let other = [Outcome::Unchanged, Outcome::Failed]
+    reasons.sort_by(|a, b| b.total.cmp(&a.total));
+    let other: Vec<Count> = [Outcome::Unchanged, Outcome::Failed]
         .into_iter()
-        .map(|o| Figure { label: reason_words(o).to_string(), total: totals.outcome(o), rate: rate(minute, |t| t.outcome(o)) })
-        .chain(std::iter::once(Figure {
+        .map(|o| Count { label: reason_words(o).to_string(), total: totals.outcome(o), rate: rate(minute, |t| t.outcome(o)) })
+        .chain(std::iter::once(Count {
             label: "identity and account events".to_string(),
             total: totals.identity_events(),
             rate: rate(minute, Totals::identity_events),
         }))
         .collect();
     LiveSection {
-        started: hub.started().format("%Y-%m-%d %H:%M UTC").to_string(),
-        indexed,
-        reasons,
-        other,
+        started: since_words(hub.started()),
+        indexed: slots(&indexed),
+        reasons: slots(&reasons),
+        other: slots(&other),
         kinds: KIND_CHOICES.iter().map(|(value, label)| Choice { value, label }).collect(),
         sources: Source::ALL.iter().map(|s| Choice { value: s.slug(), label: s.slug() }).collect(),
     }
@@ -239,5 +287,25 @@ mod tests {
         for k in Kind::ALL {
             assert!(KIND_CHOICES.iter().any(|(v, _)| *v == k.filter()), "{k:?}");
         }
+    }
+
+    /// Second pass: every column has the same rows whatever is counted;
+    /// past them, "+N more" names the rest in its title.
+    #[test]
+    fn every_column_has_the_same_rows() {
+        let count = |label: &str, total| Count { label: label.to_string(), total, rate: Some(1.0) };
+        let counts = |n: u64| -> Vec<Count> { (0..n).map(|i| count(&format!("k{i}"), 10 - i)).collect() };
+        for n in 0..8 {
+            let rows = slots(&counts(n));
+            assert_eq!(rows.len(), STAT_SLOTS, "{n} counts");
+            let filled = usize::try_from(n.max(1)).expect("small");
+            assert_eq!(rows.iter().filter(|r| r.blank).count(), STAT_SLOTS.saturating_sub(filled), "{n} counts");
+        }
+        let counts = counts(5);
+        let rows = slots(&counts);
+        assert_eq!(rows[2].label, "+3 more");
+        assert_eq!(rows[2].title, "k2: 8 · 1.0/s, k3: 7 · 1.0/s, k4: 6 · 1.0/s");
+        assert_eq!(rows[2].value, "21 · 3.0/s");
+        assert_eq!(slots(&[])[0].label, "none yet");
     }
 }
