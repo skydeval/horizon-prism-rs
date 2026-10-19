@@ -83,7 +83,11 @@
   function lineEl(l) {
     var li = el('li');
     li.appendChild(el('span', 't', l.t));
-    li.appendChild(el('span', 'src', l.src === 'network' && l.relay ? 'network·' + l.relay : l.src));
+    // A commit is applied once, from the relay that delivers it first;
+    // later copies count as unchanged.
+    var src = el('span', 'src', l.src === 'network' && l.relay ? 'network · first via ' + l.relay : l.src);
+    if (l.src === 'network' && l.relay) src.title = 'Applied from ' + l.relay + ', the first relay to deliver it; later copies count as unchanged.';
+    li.appendChild(src);
     li.appendChild(el('span', 'act', l.act));
     li.appendChild(el('span', 'k', KIND[l.k] || l.k));
     var who = el('span', 'who', l.who || l.did);

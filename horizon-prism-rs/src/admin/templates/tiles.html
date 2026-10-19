@@ -1,4 +1,3 @@
-<div class="grid">
 <div class="card">
 <h2>Members</h2>
 <div class="stat"><span class="l">Ready</span><span class="n">{{ tiles.ready }}</span></div>
@@ -6,15 +5,5 @@
 <div class="stat"><span class="l">Limit for auto-join</span><span class="n">{{ tiles.max_members }}</span></div>
 <div class="stat"><span class="l">Denied accounts</span><span class="n">{{ tiles.denied }}</span></div>
 <p><a href="/admin/members">Manage members</a></p>
-</div>
-<div class="card">
-<h2>Recent changes</h2>
-{% for c in tiles.recent %}
-<div class="fact"><span class="l">{{ c.when }}</span><span class="v"><a href="/admin/commands/{{ c.id }}">{{ c.what }}</a> · {{ c.outcome }}</span></div>
-{% else %}
-<p class="muted">Nothing yet.</p>
-{% endfor %}
-<p><a href="/admin/audit">Full audit log</a></p>
-</div>
 </div>
 <p class="muted asof">As of {{ tiles.as_of }} UTC</p>

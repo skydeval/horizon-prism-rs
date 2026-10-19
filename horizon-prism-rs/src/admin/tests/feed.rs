@@ -138,6 +138,7 @@ async fn t_f3_session_at_open_and_while_open() {
     let tiles = get(&h, "/admin/tiles", &cookie).await;
     assert_eq!(tiles.status, 200);
     assert!(tiles.body.contains("id=\"tiles\"") && tiles.body.contains("As of"), "{}", tiles.body);
+    assert!(tiles.body.contains("<h2>Members</h2>") && !tiles.body.contains("Recent changes"), "{}", tiles.body);
     assert_headers_with(&tiles.headers, "tiles", CSP);
     assert_eq!(get(&h, "/admin?auto=1", &cookie).await.status, 200);
     assert_eq!(last_seen(p, &cookie).await, before, "watching is not activity");
@@ -508,6 +509,14 @@ async fn t_f11_script_not_started() {
     assert!(!tag.contains("hidden"), "visible by default: {tag}");
     assert!(home.body.contains("The live feed did not start."));
     assert!(home.body.contains("As of "));
+    // One row: the Members column first, then the live feed; no list of
+    // recent changes.
+    let row = home.body.find("<div class=\"home-row\">").expect("the row");
+    let members = home.body.find("<h2>Members</h2>").expect("Members");
+    let live = home.body.find("id=\"live\"").expect("the feed");
+    assert!(row < members && members < live, "{}", home.body);
+    assert!(!home.body.contains("Recent changes"), "{}", home.body);
+    assert!(JS.contains("'network · first via '"), "the relay reads as the first to deliver");
     assert!(home.body.replace("&#x2f;", "/").contains(&format!("<script src=\"{}\" defer></script>", *JS_HREF)), "{}", home.body);
     assert!(home.body.contains("<noscript><meta http-equiv=\"refresh\" content=\"30;url=/admin?auto=1\"></noscript>"));
     assert!(home.body.contains("The live feed needs JavaScript."));

@@ -3,7 +3,8 @@
 <script src="{{ js }}" defer></script>{% endblock %}
 {% block content %}
 <h1>{{ title }}</h1>
-<div id="tiles">
+<div class="home-row">
+<div class="home-side" id="tiles">
 {% include "tiles.html" %}
 </div>
 <section class="card live" id="live" aria-labelledby="live-h">
@@ -50,4 +51,5 @@
 </div>
 <ol class="live-list" id="live-list" hidden></ol>
 </section>
+</div>
 {% endblock %}

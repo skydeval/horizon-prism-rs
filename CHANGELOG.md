@@ -53,6 +53,11 @@ shows what Prism indexes as it happens, and Activity is now the audit log.
   `/admin/activity` answers `308` there with its query.
 - Metrics `admin_live_streams`, `admin_live_lines_not_shown_total{why}`,
   `admin_live_handle_lookups_total{outcome}`.
+- **Home's layout:** the "Recent changes" card is gone (the audit log has
+  them); Members sits in a narrow column (about 22%) with the live feed
+  beside it, stacked Members-first below 48rem. A network line's relay
+  reads "network · first via <relay>", since a commit is applied from
+  whichever relay delivers it first.
 
 ### Fixed (admin UI forms)
 

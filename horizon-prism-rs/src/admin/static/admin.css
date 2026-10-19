@@ -270,6 +270,10 @@ td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
 .pill { display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px; background: var(--pill); color: var(--muted); font-size: 0.8rem; font-weight: 600; }
 .pill.on { background: var(--ok-bg); color: var(--ok); }
 .pill.off { background: var(--bad-bg); color: var(--bad); }
+/* Home's row: Members in a narrow column, the live feed beside it. */
+.home-row { display: grid; grid-template-columns: minmax(13rem, 22%) minmax(0, 1fr); gap: 1.25rem; align-items: start; }
+.home-row > .live { min-width: 0; }
+.live .grid { grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); }
 .live-head { display: flex; gap: 0.75rem; align-items: baseline; }
 .live-head h2 { margin-bottom: 0.5rem; }
 .live-controls { display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center; margin: 0.75rem 0; }
@@ -278,12 +282,19 @@ td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
 .live-list { list-style: none; margin: 0; padding: 0; font-family: var(--font-mono); font-size: 0.82rem; border-top: 1px solid var(--line); }
 .live-list li { display: flex; flex-wrap: wrap; gap: 0 0.75rem; padding: 0.3rem 0; border-bottom: 1px solid var(--line); }
 .live-list .t, .live-list .src { color: var(--muted); }
+.live-list .t, .live-list .src, .live-list .act, .live-list .k { white-space: nowrap; }
 .live-list .k { font-weight: 600; }
-.live-list .who { color: var(--accent); overflow-wrap: anywhere; }
+/* The handle takes what is left of the row and is cut short, not wrapped. */
+.live-list .who { flex: 1 1 0; min-width: 6rem; color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .live-list .text { flex-basis: 100%; font-family: var(--font-sans); color: var(--fg); overflow-wrap: anywhere; }
 /* With scripting off, the noscript line says so instead. */
 @media (scripting: none) {
   #live-notstarted { display: none; }
+}
+
+/* Narrow screens: Members, then the live feed, each full width. */
+@media (max-width: 48rem) {
+  .home-row { grid-template-columns: minmax(0, 1fr); gap: 0; }
 }
 
 /* Phone width */

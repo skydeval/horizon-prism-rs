@@ -1,8 +1,8 @@
-//! Home (`/admin`, admin-ui design §6.1). S1 shows the members' counts
-//! and the last five commands; the health tiles and attention list come
-//! with S3. Below the tiles, the live feed (admin-ui-live-feed design §5):
-//! the script fills it; without JavaScript the section shows the totals
-//! since Prism started and the last minute's rates, and the page reloads
+//! Home (`/admin`, admin-ui design §6.1): the members' counts in a narrow
+//! column beside the live feed (admin-ui-live-feed design §5); the health
+//! tiles and attention list come with S3. The script fills the feed;
+//! without JavaScript the section shows the totals since Prism started
+//! and the last minute's rates, and the page reloads
 //! itself every 30 seconds to `/admin?auto=1`, a [`Need::Poll`].
 //!
 //! `/admin/tiles` is the tiles alone, a fragment the script fetches every
@@ -17,7 +17,7 @@ use axum::response::Response;
 use chrono::Utc;
 use serde::Deserialize;
 
-use super::{COMMAND_COLUMNS, CommandRow, CommandTuple, Nav, css, render};
+use super::{Nav, css, render};
 use crate::admin::auth::{Need, require};
 use crate::admin::{AdminState, JS_HREF, LivePage};
 use crate::firehose::feed::{Outcome, Source, Totals};
@@ -28,7 +28,6 @@ pub struct Tiles {
     pub ready: i64,
     pub max_members: u64,
     pub denied: i64,
-    pub recent: Vec<CommandRow>,
     /// `HH:MM:SS`, UTC.
     pub as_of: String,
 }
@@ -122,17 +121,11 @@ async fn load_tiles(state: &AdminState) -> Result<Tiles, sqlx::Error> {
     )
     .fetch_one(&state.pool)
     .await?;
-    let recent: Vec<CommandTuple> = sqlx::query_as(&format!(
-        "SELECT {COMMAND_COLUMNS} FROM admin_commands c LEFT JOIN actors a ON a.did = c.requested_by ORDER BY c.id DESC LIMIT 5"
-    ))
-    .fetch_all(&state.pool)
-    .await?;
     Ok(Tiles {
         members,
         ready,
         max_members: state.members.max_members,
         denied,
-        recent: recent.into_iter().map(CommandRow::from_tuple).collect(),
         as_of: Utc::now().format("%H:%M:%S").to_string(),
     })
 }
