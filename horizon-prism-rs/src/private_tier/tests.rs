@@ -10,6 +10,8 @@ mod b5;
 // B-5 part (3) on the deploy build (private-threads amendment 1 §2).
 mod b5_release;
 mod builder;
+// Facets and embed carried in `encodedContent` (#504).
+mod embeds;
 // The admin UI's live feed shows no private content (T-F4).
 mod live_feed;
 mod round;
