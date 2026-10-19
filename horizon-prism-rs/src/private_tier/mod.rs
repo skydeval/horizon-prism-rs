@@ -303,14 +303,6 @@ pub trait PrivateTier: Send + Sync {
     /// `owners::reevaluate` (§6.11.1).
     async fn reevaluate_owner(&self, conn: &mut PgConnection, did: &str) -> Result<Applied, sqlx::Error>;
 
-    /// Record an eligibility confirmation (`confirmed`) or its failure, which
-    /// removes eligibility (§6.11.1).
-    async fn record_eligibility(&self, conn: &mut PgConnection, did: &str, confirmed: bool) -> Result<(), sqlx::Error>;
-
-    /// When the DID's community-PDS eligibility was last confirmed.
-    async fn eligibility_confirmed_at(&self, conn: &mut PgConnection, did: &str)
-    -> Result<Option<DateTime<Utc>>, sqlx::Error>;
-
     /// `ingest::enqueue_display_refill` (private posting §3.1): once, under
     /// the `worker_state` key `marker`, a `private` job for every DID with
     /// rows stored before migration 0023. `None` when already done.
@@ -460,18 +452,6 @@ impl PrivateTier for KryphocronPrivateTier {
 
     async fn reevaluate_owner(&self, conn: &mut PgConnection, did: &str) -> Result<Applied, sqlx::Error> {
         owners::reevaluate(conn, did).await
-    }
-
-    async fn record_eligibility(&self, conn: &mut PgConnection, did: &str, confirmed: bool) -> Result<(), sqlx::Error> {
-        owners::record_eligibility(conn, did, confirmed).await
-    }
-
-    async fn eligibility_confirmed_at(
-        &self,
-        conn: &mut PgConnection,
-        did: &str,
-    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-        owners::eligibility_confirmed_at(conn, did).await
     }
 
     async fn enqueue_display_refill(&self, pool: &PgPool, marker: &str) -> Result<Option<u64>, sqlx::Error> {
@@ -625,18 +605,6 @@ impl PrivateTier for DisabledPrivateTier {
 
     async fn reevaluate_owner(&self, _conn: &mut PgConnection, _did: &str) -> Result<Applied, sqlx::Error> {
         Ok(Applied::default())
-    }
-
-    async fn record_eligibility(&self, _conn: &mut PgConnection, _did: &str, _confirmed: bool) -> Result<(), sqlx::Error> {
-        Ok(())
-    }
-
-    async fn eligibility_confirmed_at(
-        &self,
-        _conn: &mut PgConnection,
-        _did: &str,
-    ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-        Ok(None)
     }
 
     async fn enqueue_display_refill(&self, _pool: &PgPool, _marker: &str) -> Result<Option<u64>, sqlx::Error> {

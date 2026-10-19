@@ -19,8 +19,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
+use super::membership::{Denial, upsert_denial};
 use super::scope_state::{PurgeKind, ScopeState};
 use crate::db::locks::{lock_did_exclusive, lock_dids_shared};
 use crate::farsight::PurgeHook;
@@ -45,6 +47,32 @@ pub enum PurgeError {
     /// Another purge of this DID is running (§6.11.7 overlapping purges).
     #[error("a {0} purge of this DID is already running")]
     Busy(&'static str),
+}
+
+/// A condition the marker step checks inside its own transaction, under the
+/// write guard and the DID's exclusive lock (membership design §3.2). Only
+/// for a `member_removed` purge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerGuard {
+    /// None: `member remove`, `account_deleted`, `out_of_scope`.
+    None,
+    /// The never-ready expiry: the member is deleted only while it is
+    /// still an `auto_enroll` member, never ready, added before `cutoff`.
+    Expiry { cutoff: DateTime<Utc> },
+    /// `member deny`: the denial is written first, then the member, if
+    /// any, deleted. With no member the denial commits alone.
+    Deny(Denial),
+}
+
+/// What a guarded marker step did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerOutcome {
+    /// The marker committed: the batches and the end must follow.
+    Marked,
+    /// The guard's condition did not hold: no `purging_dids` row, nothing
+    /// cleared, nothing in memory changed, and nothing else runs. Under
+    /// `Deny` the denial alone was committed.
+    Skipped,
 }
 
 /// The purge runner.
@@ -107,6 +135,27 @@ impl Purger {
         self.end(did).await
     }
 
+    /// Run a whole purge whose marker checks `guard` (membership design
+    /// §3.2): the batches and the end run only after [`MarkerOutcome::Marked`].
+    /// A running purge of the DID, of any kind, is [`PurgeError::Busy`]: the
+    /// guard was not applied, so nothing is resumed.
+    ///
+    /// # Errors
+    ///
+    /// Database errors (a marked purge resumes at the next startup).
+    pub async fn purge_guarded(&self, did: &str, kind: PurgeKind, guard: &MarkerGuard) -> Result<MarkerOutcome, PurgeError> {
+        if *guard == MarkerGuard::None {
+            self.purge(did, kind).await?;
+            return Ok(MarkerOutcome::Marked);
+        }
+        if self.marker_guarded(did, kind, guard).await? == MarkerOutcome::Skipped {
+            return Ok(MarkerOutcome::Skipped);
+        }
+        self.run_batches(did, kind).await?;
+        self.end(did).await?;
+        Ok(MarkerOutcome::Marked)
+    }
+
     /// Run a purge, re-attempting the marker every 10 s while another kind
     /// of purge of the DID runs (§6.11.7).
     ///
@@ -128,6 +177,21 @@ impl Purger {
     ///
     /// [`PurgeError::Busy`] when a purge of the DID is running; database errors.
     pub async fn marker(&self, did: &str, kind: PurgeKind) -> Result<(), PurgeError> {
+        self.marker_guarded(did, kind, &MarkerGuard::None).await.map(|_| ())
+    }
+
+    /// The marker step under `guard` (membership design §3.2). With a guard
+    /// the order is: the `Busy` check; the denial (`Deny` only); the
+    /// conditional `members` delete; and only when it deleted a row, the
+    /// `purging_dids` insert and the rest of the marker. When it deleted
+    /// none, `Expiry` rolls back and `Deny` commits the denial alone; both
+    /// are [`MarkerOutcome::Skipped`].
+    ///
+    /// # Errors
+    ///
+    /// [`PurgeError::Busy`] when a purge of the DID is running; database errors.
+    pub async fn marker_guarded(&self, did: &str, kind: PurgeKind, guard: &MarkerGuard) -> Result<MarkerOutcome, PurgeError> {
+        debug_assert!(*guard == MarkerGuard::None || kind == PurgeKind::MemberRemoved, "a guard is for member_removed only");
         let mut sets = self.scope.write_guard().await;
         let mut tx = self.pool.begin().await?;
         lock_did_exclusive(&mut tx, did).await?;
@@ -139,18 +203,46 @@ impl Purger {
             let running = PurgeKind::parse(&running).map_or("unknown", PurgeKind::as_str);
             return Err(PurgeError::Busy(running));
         }
+        // Whether this step deleted a `members` row: the hook's question.
+        let mut member_removed = false;
+        match guard {
+            MarkerGuard::None => {}
+            MarkerGuard::Expiry { cutoff } => {
+                let gone = sqlx::query(
+                    "DELETE FROM members WHERE did = $1 AND source = 'auto_enroll' AND first_ready_at IS NULL AND added_at < $2",
+                )
+                .bind(did)
+                .bind(cutoff)
+                .execute(&mut *tx)
+                .await?;
+                if gone.rows_affected() == 0 {
+                    tx.rollback().await?;
+                    return Ok(MarkerOutcome::Skipped);
+                }
+                member_removed = true;
+            }
+            MarkerGuard::Deny(denial) => {
+                upsert_denial(&mut tx, denial).await?;
+                let gone = sqlx::query("DELETE FROM members WHERE did = $1").bind(did).execute(&mut *tx).await?;
+                if gone.rows_affected() == 0 {
+                    tx.commit().await?;
+                    return Ok(MarkerOutcome::Skipped);
+                }
+                member_removed = true;
+            }
+        }
         sqlx::query("INSERT INTO purging_dids (did, kind) VALUES ($1, $2)")
             .bind(did)
             .bind(kind.as_str())
             .execute(&mut *tx)
             .await?;
-        // Whether this step deleted a `members` row: the hook's question.
-        let mut member_removed = false;
         match kind {
-            PurgeKind::MemberRemoved => {
+            // Under a guard the row is already gone.
+            PurgeKind::MemberRemoved if *guard == MarkerGuard::None => {
                 let gone = sqlx::query("DELETE FROM members WHERE did = $1").bind(did).execute(&mut *tx).await?;
                 member_removed = gone.rows_affected() > 0;
             }
+            PurgeKind::MemberRemoved => {}
             PurgeKind::AccountDeleted => {
                 for table in ["members", "scope_dids", "sync_state"] {
                     let gone = sqlx::query(&format!("DELETE FROM {table} WHERE did = $1"))
@@ -228,7 +320,7 @@ impl Purger {
             hook.run(did, kind == PurgeKind::AccountDeleted, member_removed).await;
         }
         tracing::info!(event = "purge_marked", did, kind = kind.as_str(), "purge marker committed");
-        Ok(())
+        Ok(MarkerOutcome::Marked)
     }
 
     /// Delete the kind's deletion set in batches until nothing is left.

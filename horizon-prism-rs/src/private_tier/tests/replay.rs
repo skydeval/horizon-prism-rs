@@ -822,7 +822,7 @@ async fn t72_untracked_to_tracked(test: &str, mode: PublicMode) {
         return;
     };
     actor(h.pool(), EVE, "eve.test", "eve.test").await;
-    exec(h.pool(), &format!("INSERT INTO private_owner_eligible (did, confirmed_at) VALUES ('{EVE}', now())")).await;
+    h.member_outside_s(EVE).await;
     let replayed = h.direct(EVE, NSID_AUDIENCE, "3kt72aud", audience_record("list", &[BOB])).await;
     h.pds.remove(EVE, NSID_AUDIENCE, "3kt72aud");
     assert!(row(&h, "private_audiences", &replayed).await.is_some(), "inserted: no listed rev");
@@ -1160,7 +1160,7 @@ in_both_modes!(t79_newer_states_are_not_replays: t79_newer_states_are_not_replay
 
 // ---- T-80: no resurrection ----
 
-/// T-80 (review 4's ordering): O a non-member owner outside S; catch-up C
+/// T-80 (review 4's ordering): O an owner outside S; catch-up C
 /// skips A; O deletes A at D' > R; an older job reconciles A away with a
 /// tombstone at R_j < R; the firehose applies D' with no row and no
 /// tombstone. C's check finds nothing, C raises and settles, and A stays
@@ -1170,7 +1170,7 @@ async fn t80_no_resurrection(test: &str, mode: PublicMode) {
         return;
     };
     actor(h.pool(), EVE, "eve.test", "eve.test").await;
-    exec(h.pool(), &format!("INSERT INTO private_owner_eligible (did, confirmed_at) VALUES ('{EVE}', now())")).await;
+    h.member_outside_s(EVE).await;
     exec(
         h.pool(),
         &format!("INSERT INTO sync_state (did, applied_rev, head_rev, head_checked_at, firehose_rev) VALUES ('{EVE}', '{REV}', '{REV}', now(), '{REV}')"),

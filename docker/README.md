@@ -144,6 +144,27 @@ Watch progress with the authenticated `_health` detail (`schema_backfill_done`, 
 
 **Disk.** Step 1 rewrites every old `posts` row. Expect the `posts` table and its existing indexes to grow, up to about twice their size, and leave that much free space before upgrading. Postgres reuses the space afterwards but does not return it to the filesystem.
 
+### Before the 0031 upgrade
+
+From migration 0031 only a member owns private posts that are served. An account hosted on a community PDS that is not a member stops being an owner at the upgrade: its private posts, its audiences and the replies under them are kept but no longer served, until it is added with `admin member add` and its initial indexing has finished.
+
+Before upgrading, list those accounts (read-only):
+
+```sh
+docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+SELECT e.did, a.handle, e.confirmed_at,
+  (SELECT count(*) FROM private_posts p WHERE p.author_did = e.did) AS posts,
+  (SELECT count(*) FROM private_audiences x WHERE x.owner_did = e.did) AS audiences
+FROM private_owner_eligible e LEFT JOIN actors a ON a.did = e.did
+WHERE NOT EXISTS (SELECT 1 FROM members m WHERE m.did = e.did)
+  AND (EXISTS (SELECT 1 FROM private_posts p WHERE p.author_did = e.did)
+       OR EXISTS (SELECT 1 FROM private_audiences x WHERE x.owner_did = e.did))
+ORDER BY e.did;
+SQL
+```
+
+Add each one that should stay an owner with `admin member add`, then upgrade.
+
 **Restore a backup** (destructive to current data):
 
 ```sh
@@ -154,6 +175,7 @@ docker compose exec -T db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB
 
 Commands that change state are executed by the running `app` service, not by the `docker compose exec` process you type them in:
 - `member add` and `member remove`;
+- `member deny <did> [--reason <text>]` and `member allow <did>` (below);
 - `label add` and `label remove`;
 - `scope rebuild`, `backfill` and `resync`;
 - `deadletter replay` and `deadletter drop`;
@@ -163,6 +185,10 @@ Commands that change state are executed by the running `app` service, not by the
 The CLI queues the command and waits up to `admin.command_timeout_secs` (600 s) for the result. If it times out, the command keeps running, and `admin commands list` shows its state. `app` must be running for these commands to take effect.
 
 Read-only commands (`… list`, `stream info`, `migrate status`, `keygen`) run directly.
+
+### Denying membership
+
+`admin member deny <did>` keeps an account out. A denied account is never auto-enrolled, `admin member add` refuses it, and if it is a member it is removed in the same step (its removal then finishes in the background, as `member remove` does). `--reason` is a note for operators; the account never sees it. `admin member allow <did>` lifts the denial and adds nothing: run `admin member add` afterwards to admit it. `admin member list --denied` lists the denials.
 
 ### Farsight (block lists)
 
@@ -500,7 +526,7 @@ Other series, one line each (the sections above name the rest):
 - `storage_sample_errors_total{source}`: storage samples (Postgres, Redis) that failed.
 - `identity_refresh_total{outcome}`: identity refreshes, by outcome.
 - `account_status_changes_total{to}`: account status changes applied, by the new status.
-- `eligibility_cleared_total{reason}`: private-post owners whose community-PDS eligibility was cleared after repeated failures.
+- `member_denials_total`: accounts denied membership.
 - `identity_cache_requests_total{cache,result}`: reads of the DID-document caches, `hit` or `miss`.
 - `handle_resolutions_total{intent,result}`: handle resolutions; `intent` is `public` for `resolveHandle` and `internal` for indexing work.
 - `jwt_fetch_cell_failures_total`: sign-in token issuer lookups that failed.

@@ -9,7 +9,6 @@
 //! - [`refresher`]: the `identity_refresh` worker.
 
 pub mod cache;
-pub mod eligibility;
 pub mod fetch_cell;
 pub mod handle_lookup;
 pub mod refresher;

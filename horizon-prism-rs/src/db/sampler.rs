@@ -28,6 +28,8 @@ pub const METRIC_REDIS_RATIO: &str = "redis_memory_ratio";
 pub const METRIC_STREAM_LENGTH: &str = "firehose_stream_length";
 pub const METRIC_SCOPE_DIDS: &str = "scope_dids_total";
 pub const METRIC_MEMBERS: &str = "members_total";
+/// Denied DIDs (membership design §12).
+pub const METRIC_MEMBER_DENIALS: &str = "member_denials_total";
 pub const METRIC_SAMPLE_ERRORS: &str = "storage_sample_errors_total";
 
 /// `storage_budget_warn` threshold (§4.6).
@@ -113,6 +115,7 @@ pub struct DbSample {
     pub budget_ratio: f64,
     pub scope_dids_total: i64,
     pub members_total: i64,
+    pub member_denials_total: i64,
 }
 
 /// Read the Postgres half of a sample.
@@ -137,12 +140,16 @@ pub async fn sample_db(pool: &PgPool, budget_bytes: u64) -> Result<DbSample, sql
     let members_total: i64 = sqlx::query_scalar("SELECT count(*) FROM members")
         .fetch_one(pool)
         .await?;
+    let member_denials_total: i64 = sqlx::query_scalar("SELECT count(*) FROM member_denials")
+        .fetch_one(pool)
+        .await?;
     Ok(DbSample {
         tables,
         db_size_bytes,
         budget_ratio: ratio(u64::try_from(db_size_bytes).unwrap_or(0), budget_bytes),
         scope_dids_total,
         members_total,
+        member_denials_total,
     })
 }
 
@@ -156,6 +163,7 @@ pub fn record_db_sample(sample: &DbSample, budget_bytes: u64) {
     metrics::gauge!(METRIC_DB_BUDGET_RATIO).set(sample.budget_ratio);
     metrics::gauge!(METRIC_SCOPE_DIDS).set(sample.scope_dids_total as f64);
     metrics::gauge!(METRIC_MEMBERS).set(sample.members_total as f64);
+    metrics::gauge!(METRIC_MEMBER_DENIALS).set(sample.member_denials_total as f64);
     match budget_level(sample.budget_ratio) {
         BudgetLevel::Ok => {}
         BudgetLevel::Warn => tracing::warn!(
@@ -327,6 +335,7 @@ mod tests {
                 METRIC_STREAM_LENGTH,
                 METRIC_SCOPE_DIDS,
                 METRIC_MEMBERS,
+                METRIC_MEMBER_DENIALS,
             ],
             [
                 "db_table_rows",
@@ -339,6 +348,7 @@ mod tests {
                 "firehose_stream_length",
                 "scope_dids_total",
                 "members_total",
+                "member_denials_total",
             ]
         );
     }

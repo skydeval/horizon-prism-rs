@@ -493,8 +493,6 @@ pub async fn run() -> Result<(), StartupError> {
         constellation.clone(),
         budgets.clone(),
     ));
-    let community_patterns: Vec<String> =
-        cfg.file.constellation.community().map(|n| n.pds_patterns.clone()).unwrap_or_default();
     // Rule 4 (§4.3): the applier's loop, and the backfill workers serving
     // the `list_sync` lanes.
     let lists = &cfg.file.lists;
@@ -536,7 +534,6 @@ pub async fn run() -> Result<(), StartupError> {
         },
     );
     let backfill = Backfill::new(writer.clone(), Arc::clone(&source), cfg.file.backfill.clone(), fh.deterministic_attempts)
-        .with_community_patterns(community_patterns.clone())
         .with_farsight(farsight.clone())
         .with_list_sync(Some(list_sync));
     tasks.extend(
@@ -582,7 +579,6 @@ pub async fn run() -> Result<(), StartupError> {
             source: Arc::clone(&source),
             dead_letter_stream: fh.dead_letter_stream.clone(),
             deterministic_attempts: fh.deterministic_attempts,
-            community_patterns: Arc::new(community_patterns),
             farsight: farsight.clone(),
             sync_min_interval_secs: lists.sync_min_interval_secs,
             list_budget,

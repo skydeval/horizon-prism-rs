@@ -1360,8 +1360,9 @@ fn anchored_assuming_verified(parent: &str, audience: &str, owner: &str, mode: &
 /// The pre-S10 count (following-audience design §10), run read-only against
 /// the deployed database before migration 0028. S10 starts serving and
 /// stops nothing; each column is an upper bound on what starts:
-/// - `following_audiences`, `following_owners` (members, and eligible
-///   non-members);
+/// - `following_audiences`, `following_owners` (all, then the members;
+///   migration 0031 dropped the eligible non-members' column with its
+///   table);
 /// - `owners_10k_stored_follows`: owners with at least 10 000 stored
 ///   follows, a lower bound on those near or over the pass's ceiling;
 /// - `own_posts` and `cross_owner_posts` under a `following` audience;
@@ -1386,8 +1387,6 @@ SELECT
   (SELECT count(*) FROM a) AS following_audiences,
   (SELECT count(*) FROM o) AS following_owners,
   (SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM members m WHERE m.did = o.owner_did)) AS following_owners_members,
-  (SELECT count(*) FROM o WHERE NOT EXISTS (SELECT 1 FROM members m WHERE m.did = o.owner_did)
-                            AND EXISTS (SELECT 1 FROM private_owner_eligible e WHERE e.did = o.owner_did)) AS following_owners_nonmembers,
   (SELECT count(*) FROM o WHERE (SELECT count(*) FROM follows f WHERE f.author_did = o.owner_did) >= 10000)
     AS owners_10k_stored_follows,
   (SELECT count(*) FROM x WHERE x.author_did = x.owner_did) AS own_posts,

@@ -136,7 +136,21 @@ pub enum FarsightAction {
 pub enum MemberAction {
     Add { did: String },
     Remove { did: String },
-    List,
+    /// Exclude a DID: never auto-enrolled, refused by `add` until `allow`,
+    /// and removed if a member.
+    Deny {
+        did: String,
+        /// The operator's note, never shown to the DID.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Lift a denial. Adds nothing.
+    Allow { did: String },
+    List {
+        /// List the denials instead of the members.
+        #[arg(long)]
+        denied: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -214,7 +228,7 @@ impl AdminCmd {
     /// A usage message.
     pub fn to_command(&self) -> Result<AdminCommand, String> {
         let cmd = match self {
-            Self::Member { action: MemberAction::List }
+            Self::Member { action: MemberAction::List { .. } }
             | Self::Label { action: LabelAction::List { .. } }
             | Self::Deadletter { action: DeadletterAction::List { .. } }
             | Self::Stream { .. }
@@ -222,6 +236,11 @@ impl AdminCmd {
             | Self::Keygen => return Err("read-only commands run in the CLI".to_string()),
             Self::Member { action: MemberAction::Add { did } } => AdminCommand::MemberAdd { did: did.clone() },
             Self::Member { action: MemberAction::Remove { did } } => AdminCommand::MemberRemove { did: did.clone() },
+            Self::Member { action: MemberAction::Deny { did, reason } } => AdminCommand::MemberDeny {
+                did: did.clone(),
+                reason: reason.clone(),
+            },
+            Self::Member { action: MemberAction::Allow { did } } => AdminCommand::MemberAllow { did: did.clone() },
             Self::Label { action: LabelAction::Add { subject, val } } => AdminCommand::LabelAdd {
                 subject: subject.clone(),
                 val: val.clone(),
@@ -327,7 +346,7 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
     }
     let is_read_only = matches!(
         cmd,
-        AdminCmd::Member { action: MemberAction::List }
+        AdminCmd::Member { action: MemberAction::List { .. } }
             | AdminCmd::Label { action: LabelAction::List { .. } }
             | AdminCmd::Deadletter { action: DeadletterAction::List { .. } }
             | AdminCmd::Stream { .. }
@@ -340,7 +359,9 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
         async {
             let cfg = commands::config()?;
             match cmd {
-                AdminCmd::Member { .. } => member_list::render(&commands::pool(&cfg).await?).await.map_err(|e| e.to_string()),
+                AdminCmd::Member { action: MemberAction::List { denied } } => {
+                    member_list::render(&commands::pool(&cfg).await?, *denied).await.map_err(|e| e.to_string())
+                }
                 AdminCmd::Label { action: LabelAction::List { subject, val } } => {
                     label_list::render(&commands::pool(&cfg).await?, subject.as_deref(), val.as_deref())
                         .await
@@ -470,5 +491,12 @@ mod tests {
         assert!(full.to_command().is_err());
         let status = AdminCmd::Indexing { action: IndexingAction::Status };
         assert_eq!(status.to_command(), Ok(AdminCommand::IndexingStatus));
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let deny = AdminCmd::Member { action: MemberAction::Deny { did: did.into(), reason: Some("spam".into()) } };
+        assert_eq!(deny.to_command(), Ok(AdminCommand::MemberDeny { did: did.into(), reason: Some("spam".into()) }));
+        let allow = AdminCmd::Member { action: MemberAction::Allow { did: did.into() } };
+        assert_eq!(allow.to_command(), Ok(AdminCommand::MemberAllow { did: did.into() }));
+        assert!(AdminCmd::Member { action: MemberAction::Deny { did: "bob".into(), reason: None } }.to_command().is_err());
+        assert!(AdminCmd::Member { action: MemberAction::List { denied: true } }.to_command().is_err(), "read-only");
     }
 }

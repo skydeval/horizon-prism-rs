@@ -4,7 +4,8 @@
 //! in every public-indexing mode.
 //!
 //! Checked before inserting, in order:
-//! 0. the DID is not being purged (else `NotReady`, nothing inserted);
+//! 0. the DID is not being purged (else `NotReady`, nothing inserted), and
+//!    not denied (membership design §2.2: refused `denied`, never cached);
 //! 1. its PDS host matches `community.enroll_pds_patterns` (default: the
 //!    `community` network's `pds_patterns`) **and** that PDS answers
 //!    `getRepoStatus` with `active: true`;
@@ -22,7 +23,7 @@ use moka::future::Cache;
 use sqlx::PgPool;
 
 use super::ScopeState;
-use super::membership::{AddOutcome, add_member};
+use super::membership::{AddOutcome, add_member, is_denied};
 use crate::config::AppConfig;
 use crate::identity::refresher::RepoStatus;
 use crate::identity::{IdentityResolver, ResolveIntent};
@@ -33,6 +34,8 @@ use crate::subscriptions::references::Budget;
 pub const METRIC_REFUSED: &str = "auto_enroll_refused_total";
 /// The refusal of the hourly enrolment cap: transient, never cached.
 pub const REFUSED_RATE: &str = "rate";
+/// The refusal of a denied DID (membership design §2.2): never cached.
+pub const REFUSED_DENIED: &str = "denied";
 
 /// The caller's membership state for a `member` endpoint (§7.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +117,12 @@ impl AutoEnroller {
         Enrollment::Refused(reason)
     }
 
+    /// The `denied` refusal: counted, never cached.
+    fn refuse_denied(&self) -> Enrollment {
+        metrics::counter!(METRIC_REFUSED, "reason" => REFUSED_DENIED).increment(1);
+        Enrollment::Refused(REFUSED_DENIED)
+    }
+
     /// The caller's state, enrolling it if it is eligible.
     ///
     /// # Errors
@@ -129,6 +138,11 @@ impl AutoEnroller {
         }
         if self.scope.read_guard().await.purge_kind(did).is_some() {
             return Ok(Enrollment::Purging);
+        }
+        // A denial, first among the refusals and never cached, so `member
+        // allow` takes effect at the next call (membership design §3.1).
+        if is_denied(&mut *self.pool.acquire().await?, did).await? {
+            return Ok(self.refuse_denied());
         }
         if let Some(reason) = self.refused.get(did).await {
             return Ok(Enrollment::Refused(reason));
@@ -183,6 +197,8 @@ impl AutoEnroller {
             }
             AddOutcome::AlreadyMember => Enrollment::Member { ready: false },
             AddOutcome::Purging => Enrollment::Purging,
+            // Denied between the check and the insert.
+            AddOutcome::Denied => self.refuse_denied(),
         })
     }
 

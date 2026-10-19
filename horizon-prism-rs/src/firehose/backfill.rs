@@ -4,9 +4,10 @@
 //! `backfill.concurrency` (4) and a per-PDS-host budget of
 //! `backfill.per_pds_rate_per_sec` (5/s). For each job:
 //! 1. upsert the DID's identity fields (PDS endpoint, verified handle,
-//!    account status) — the claim already recorded `gap_epoch`; for a
-//!    non-member's `private`/`authz` job, confirm owner eligibility
-//!    (§6.11.1) and end `done` without listings if the DID is not an owner;
+//!    account status) — the claim already recorded `gap_epoch`; a
+//!    non-member's `private`/`authz` job ends `done` first, with no network
+//!    call and no listing: only a member can own private rows (membership
+//!    design §2.3);
 //! 2. `getLatestCommit` gives rev R;
 //! 3. list each collection of the depth table with its limit, writing every
 //!    selected record through the normal write path with rev R;
@@ -66,7 +67,6 @@ use crate::farsight::Farsight;
 use crate::indexing::PublicMode;
 use crate::identity::refresher::{RefreshReason, RepoStatus, account_status, is_repo_not_found};
 use crate::identity::resolver::extract_info;
-use crate::identity::eligibility::{self, Confirmation};
 use crate::identity::{IdentityResolver, ResolveIntent};
 use crate::microcosm::{ConstellationClient, LinksPage};
 use crate::net::{BodyCap, Intent, NetClient, RequestOptions};
@@ -872,8 +872,6 @@ pub struct Backfill {
     settings: BackfillConfig,
     attempts: u32,
     order_cache: moka::future::Cache<String, ListOrder>,
-    /// The `community` network's `pds_patterns` (owner eligibility).
-    community_patterns: Arc<Vec<String>>,
     /// The block-list index to prime on a member job, when configured.
     farsight: Option<Farsight>,
     /// The `list_sync` lanes the workers serve before their own claim.
@@ -894,7 +892,6 @@ impl Backfill {
                 .max_capacity(100_000)
                 .time_to_live(ORDER_CACHE_TTL)
                 .build(),
-            community_patterns: Arc::new(Vec::new()),
             farsight: None,
             list_sync: None,
         }
@@ -911,14 +908,6 @@ impl Backfill {
     #[must_use]
     pub fn with_farsight(mut self, farsight: Option<Farsight>) -> Self {
         self.farsight = farsight;
-        self
-    }
-
-    /// Set the community PDS patterns for owner eligibility (§6.11.1).
-    /// Without them no non-member is eligible (fail closed).
-    #[must_use]
-    pub fn with_community_patterns(mut self, patterns: Vec<String>) -> Self {
-        self.community_patterns = Arc::new(patterns);
         self
     }
 
@@ -1113,6 +1102,12 @@ impl Backfill {
             let sets = self.writer.scope().read_guard().await;
             (sets.is_member(&job.did), sets.public.mode, sets.is_tracked(&job.did))
         };
+        // A non-member owns no private rows (membership design §2.3): its
+        // private/authz job ends `done` here, before any network call.
+        if matches!(job.depth, Depth::Private | Depth::Authz) && !is_member {
+            tracing::info!(event = "backfill_owner_ineligible", did = %job.did, depth = job.depth.as_str(), "not a member; job ends without listings");
+            return Ok(Some(RunResult { ineligible: true, ..RunResult::default() }));
+        }
         // A member job asks Farsight to read the member's repository
         // (design-v3 §5.14.11). Best effort, on a task of its own: its
         // outcome never affects the job or readiness.
@@ -1126,22 +1121,7 @@ impl Backfill {
                 }
             });
         }
-        let prepared = self.source.prepare(&job.did).await;
-        // A non-member's private/authz job is an eligibility confirmation
-        // (§6.11.1). A DID that is not an owner afterwards ends `done`
-        // without listings; a failed confirmation of a still-eligible owner
-        // fails the job, which retries.
-        if matches!(job.depth, Depth::Private | Depth::Authz) && !is_member {
-            let confirmation = Confirmation::from_prepare(&prepared, &self.community_patterns);
-            let owner = eligibility::apply(&self.pool, self.writer.scope(), self.writer.private(), &job.did, &confirmation)
-                .await
-                .map_err(|e| e.to_string())?;
-            if !owner {
-                tracing::info!(event = "backfill_owner_ineligible", did = %job.did, ?confirmation, "not a private owner; job ends without listings");
-                return Ok(Some(RunResult { ineligible: true, ..RunResult::default() }));
-            }
-        }
-        let pds = prepared.map_err(|e| e.to_string())?;
+        let pds = self.source.prepare(&job.did).await.map_err(|e| e.to_string())?;
         // A run that may verify follows reads the counter before its first
         // listing, creating the row if need be, in one statement
         // (following-audience design §3.2): a clear from now on replaces it.
@@ -1584,7 +1564,9 @@ impl Backfill {
             .rows_affected();
             return Ok(if n > 0 { JobOutcome::Requeued("reconcile_incomplete") } else { JobOutcome::Superseded });
         }
-        let may_set_readiness = readiness_capable && !result.ceiling_hit && !result.auth_write_failed;
+        // An ineligible run listed nothing, so it settles no readiness, even
+        // for a DID the owner set still holds until a purge's end.
+        let may_set_readiness = readiness_capable && !result.ceiling_hit && !result.auth_write_failed && !result.ineligible;
 
         #[cfg(test)]
         crate::test_support::hooks::pause_in(crate::test_support::hooks::SETTLE_BEFORE_GAP_LOCK, &self.pool, &job.did).await;

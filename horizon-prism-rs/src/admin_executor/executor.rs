@@ -258,7 +258,6 @@ mod tests {
             source,
             dead_letter_stream: dead_letter_stream.to_string(),
             deterministic_attempts: 5,
-            community_patterns: Arc::new(vec!["*.community.example".to_string()]),
             farsight: None,
             sync_min_interval_secs: 600,
             list_budget: crate::subscriptions::references::Budget { max_references: 25, max_owners: 10 },
@@ -271,65 +270,53 @@ mod tests {
         Some((db, AdminExecutor::new(handlers), scope))
     }
 
-    /// A source whose `prepare` confirms a community PDS and records who
-    /// asked.
-    #[derive(Default)]
-    struct CommunityPds {
-        asked: std::sync::Mutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl BackfillSource for CommunityPds {
-        async fn prepare(&self, did: &str) -> Result<String, crate::firehose::backfill::PrepareError> {
-            self.asked.lock().expect("lock").push(did.to_string());
-            Ok("https://pds1.community.example".into())
-        }
-        async fn latest_rev(&self, _: &str, _: &str) -> Result<String, String> {
-            Err("unused".into())
-        }
-        async fn list_records(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<ListPage, String> {
-            Err("unused".into())
-        }
-        async fn get_record(&self, _: &str, _: &str, _: &str, _: &str) -> Result<Option<ListedRecord>, String> {
-            Err("unused".into())
-        }
-        async fn inbound_blocks(&self, _: &str, _: Option<&str>) -> Result<LinksPage, String> {
-            Err("unused".into())
-        }
-    }
-
-    #[tokio::test]
-    async fn member_remove_reconfirms_only_stale_eligibility() {
-        let (stale, fresh) = (PURGING, OTHER);
-        let mut sets = ScopeSets::default();
-        for d in [stale, fresh] {
-            sets.members.insert(d.into());
-            sets.scope.insert(d.into());
-            sets.private_owners.insert(d.into());
-        }
-        let private: Arc<dyn PrivateTier> = Arc::new(crate::private_tier::KryphocronPrivateTier);
-        let source = Arc::new(CommunityPds::default());
-        let Some((db, exec, scope)) =
-            setup_with("admin_reconfirm", sets, Arc::clone(&private), Arc::clone(&source) as Arc<dyn BackfillSource>, &test_stream())
+    /// Wait until no purge of the DID is left, as the background end
+    /// leaves it.
+    async fn until_purged(pool: &PgPool, did: &str) {
+        for _ in 0..200 {
+            let left: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM purging_dids WHERE did = $1)")
+                .bind(did)
+                .fetch_one(pool)
                 .await
-        else {
+                .expect("purging");
+            if !left {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the purge of {did} did not end");
+    }
+
+    /// T-M1, T-M2 through the queue (membership design §5): `member deny`
+    /// of a member owner removes it (the purge ends in the background, and
+    /// it is no owner after); `member add` then fails until `member allow`;
+    /// a second deny is `already_denied` and removes nothing; `allow` twice
+    /// is `allowed` then `not_denied`; `add` then adds. `member remove`
+    /// reports no eligibility any more. A deny of a non-member writes the
+    /// denial alone; `deny` and `allow` wait on a running purge of the DID.
+    #[tokio::test]
+    async fn member_deny_and_allow_through_the_queue() {
+        let (member, other) = (PURGING, OTHER);
+        let mut sets = ScopeSets::default();
+        sets.members.insert(member.into());
+        sets.scope.insert(member.into());
+        sets.private_owners.insert(member.into());
+        let private: Arc<dyn PrivateTier> = Arc::new(crate::private_tier::KryphocronPrivateTier);
+        let Some((db, exec, scope)) = setup_with("admin_deny", sets, Arc::clone(&private), Arc::new(NoNetwork), &test_stream()).await else {
             return;
         };
         let p = &db.pool;
-        for d in [stale, fresh] {
-            sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())")
-                .bind(d)
-                .execute(p)
-                .await
-                .expect("member");
+        sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())").bind(member).execute(p).await.expect("member");
+        sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 1)").bind(member).execute(p).await.expect("scope");
+        {
             let mut conn = p.acquire().await.expect("conn");
             let nsid = crate::firehose::classifier::NSID_POST_PRIVATE;
             private
                 .apply(
                     &mut conn,
                     &crate::private_tier::PrivateOp {
-                        uri: format!("at://{d}/{nsid}/3kpost222222"),
-                        author_did: d.into(),
+                        uri: format!("at://{member}/{nsid}/3kpost222222"),
+                        author_did: member.into(),
                         nsid: nsid.into(),
                         rkey: "3kpost222222".into(),
                         cid: "bafy".into(),
@@ -343,27 +330,46 @@ mod tests {
                 .await
                 .expect("private row");
         }
-        // `fresh` was confirmed an hour ago; `stale` never was.
-        {
-            let mut conn = p.acquire().await.expect("conn");
-            private.record_eligibility(&mut conn, fresh, true).await.expect("confirm");
-        }
-        for d in [stale, fresh] {
-            let id = submit(p, &AdminCommand::MemberRemove { did: d.into() }).await.expect("submit");
-            exec.drain().await.expect("drain");
-            match wait(p, id, Duration::from_secs(5), Duration::from_millis(10)).await.expect("wait") {
-                Finished::Done(result) => {
-                    let expected = if d == stale { "confirmed" } else { "fresh" };
-                    assert_eq!(result["eligibility"], expected, "{d}");
-                }
-                other => panic!("expected done, got {other:?}"),
-            }
-        }
-        assert_eq!(*source.asked.lock().expect("lock"), vec![stale.to_string()], "only the stale DID is re-confirmed");
-        let mut conn = p.acquire().await.expect("conn");
-        assert!(private.eligibility_confirmed_at(&mut conn, stale).await.expect("read").is_some());
-        drop(conn);
-        assert!(scope.read_guard().await.is_owner(stale), "an eligible owner stays an owner");
+
+        let r = done(run(&exec, p, AdminCommand::MemberDeny { did: member.into(), reason: Some("spam".into()) }).await);
+        assert_eq!(r, json!({ "did": member, "status": "denied", "removed": true }));
+        assert_eq!(count(p, "SELECT count(*) FROM members").await, 0);
+        until_purged(p, member).await;
+        assert!(!scope.read_guard().await.is_owner(member), "no owner without membership");
+        let failed = run(&exec, p, AdminCommand::MemberAdd { did: member.into() }).await;
+        assert_eq!(failed, Finished::Failed(json!({ "error": "denied; `admin member allow` first" })));
+        let r = done(run(&exec, p, AdminCommand::MemberDeny { did: member.into(), reason: None }).await);
+        assert_eq!(r, json!({ "did": member, "status": "already_denied", "removed": false }));
+        let reason: Option<String> = sqlx::query_scalar("SELECT reason FROM member_denials WHERE did = $1").bind(member).fetch_one(p).await.expect("reason");
+        assert_eq!(reason.as_deref(), Some("spam"));
+        let r = done(run(&exec, p, AdminCommand::MemberAllow { did: member.into() }).await);
+        assert_eq!(r, json!({ "did": member, "status": "allowed" }));
+        let r = done(run(&exec, p, AdminCommand::MemberAllow { did: member.into() }).await);
+        assert_eq!(r, json!({ "did": member, "status": "not_denied" }));
+        let r = done(run(&exec, p, AdminCommand::MemberAdd { did: member.into() }).await);
+        assert_eq!((&r["status"], &r["jobs"][1]["depth"]), (&json!("added"), &json!("private")), "an owner again: {r}");
+        let r = done(run(&exec, p, AdminCommand::MemberRemove { did: member.into() }).await);
+        assert_eq!(r, json!({ "did": member, "status": "removed", "purge": "member_removed" }));
+        until_purged(p, member).await;
+
+        // A non-member: the denial alone.
+        let r = done(run(&exec, p, AdminCommand::MemberDeny { did: other.into(), reason: None }).await);
+        assert_eq!(r, json!({ "did": other, "status": "denied", "removed": false }));
+        assert_eq!(count(p, "SELECT count(*) FROM purging_dids").await, 0);
+
+        // A running purge: both wait, in order, then run.
+        sqlx::query("INSERT INTO purging_dids (did, kind) VALUES ($1, 'out_of_scope')").bind(member).execute(p).await.expect("purging");
+        scope.write_guard().await.purging.insert(member.into(), PurgeKind::OutOfScope);
+        let deny = submit(p, &AdminCommand::MemberDeny { did: member.into(), reason: None }).await.expect("submit");
+        let allow = submit(p, &AdminCommand::MemberAllow { did: member.into() }).await.expect("submit");
+        exec.drain().await.expect("drain");
+        assert_eq!((state(p, deny).await, state(p, allow).await), ("queued".to_string(), "queued".to_string()));
+        assert_eq!(count(p, "SELECT count(*) FROM member_denials WHERE did = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'").await, 0);
+        sqlx::query("DELETE FROM purging_dids").execute(p).await.expect("end");
+        scope.write_guard().await.purging.clear();
+        assert_eq!(exec.drain().await.expect("drain"), 2);
+        assert_eq!((state(p, deny).await, state(p, allow).await), ("done".to_string(), "done".to_string()));
+        assert_eq!(count(p, "SELECT count(*) FROM member_denials WHERE did = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'").await, 0, "deny, then allow");
         db.drop_db().await;
     }
 

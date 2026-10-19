@@ -383,10 +383,10 @@ pub(crate) async fn enqueue_private_for_tests(conn: &mut PgConnection, did: &str
 
 /// `ingest::apply`: LWW create/update (§5.5) of an admitted private record.
 ///
-/// A `postPrivate` or `audience` row for a DID with no prior rows re-evaluates
-/// owner status (§6.11.1): an eligible DID becomes an owner and gets a
-/// `private` job; an unconfirmed one gets the `private` job only, which
-/// confirms eligibility. Blocks never make their author an owner.
+/// A `postPrivate` or `audience` row for a member with no prior rows
+/// re-evaluates owner status (§6.11.1): the member becomes an owner and gets
+/// a `private` job. A non-member's row is stored and nothing more
+/// (membership design §2.3). Blocks never make their author an owner.
 ///
 /// # Errors
 ///
@@ -512,14 +512,16 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
         changed,
         ..Applied::default()
     };
-    if changed && owner_record && !had_rows {
-        if owners::is_eligible(&mut *conn, author).await? {
-            applied = Applied {
-                changed,
-                ..owners::reevaluate(&mut *conn, author).await?
-            };
+    // Only a member can become an owner (membership design §2.3): a
+    // non-member's first row is stored and triggers nothing.
+    if changed && owner_record && !had_rows && owners::is_eligible(&mut *conn, author).await? {
+        applied = Applied {
+            changed,
+            ..owners::reevaluate(&mut *conn, author).await?
+        };
+        if applied.owners_joined.iter().any(|d| d == author) {
+            enqueue_private(&mut *conn, author).await?;
         }
-        enqueue_private(&mut *conn, author).await?;
     }
     // A `following` audience written for an existing owner (following-
     // audience design §3.6): an `authz` run verifies its follows, queued
@@ -1101,13 +1103,11 @@ pub(crate) async fn purge_did(conn: &mut PgConnection, did: &str, limit: i64) ->
         .await?
         .rows_affected();
     }
-    for table in ["private_owner_ready", "private_owner_eligible"] {
-        n += sqlx::query(&format!("DELETE FROM {table} WHERE did = $1"))
-            .bind(did)
-            .execute(&mut *conn)
-            .await?
-            .rows_affected();
-    }
+    n += sqlx::query("DELETE FROM private_owner_ready WHERE did = $1")
+        .bind(did)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
     Ok(n)
 }
 
@@ -1200,8 +1200,7 @@ pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, lim
            AND NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = b.author_did) \
            AND NOT ((EXISTS (SELECT 1 FROM private_posts x WHERE x.author_did = b.author_did) \
                      OR EXISTS (SELECT 1 FROM private_audiences x WHERE x.owner_did = b.author_did)) \
-                    AND (EXISTS (SELECT 1 FROM members x WHERE x.did = b.author_did) \
-                     OR EXISTS (SELECT 1 FROM private_owner_eligible x WHERE x.did = b.author_did))) \
+                    AND EXISTS (SELECT 1 FROM members x WHERE x.did = b.author_did)) \
          LIMIT $2)",
     )
     .bind(did)

@@ -47,8 +47,7 @@ pub(crate) async fn owners_not_ready(pool: &PgPool) -> Result<i64, sqlx::Error> 
     sqlx::query_scalar(
         "SELECT count(*) FROM ( \
            SELECT author_did AS d FROM private_posts UNION SELECT owner_did FROM private_audiences \
-         ) r WHERE (EXISTS (SELECT 1 FROM members m WHERE m.did = r.d) \
-                    OR EXISTS (SELECT 1 FROM private_owner_eligible e WHERE e.did = r.d)) \
+         ) r WHERE EXISTS (SELECT 1 FROM members m WHERE m.did = r.d) \
            AND NOT EXISTS (SELECT 1 FROM private_owner_ready o WHERE o.did = r.d)",
     )
     .fetch_one(pool)

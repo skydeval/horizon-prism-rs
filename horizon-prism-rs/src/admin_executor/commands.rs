@@ -7,13 +7,13 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
 use redis::aio::ConnectionManager;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use crate::aggregations::{PurgeKind, Purger, Rebuild, ScopeState};
-use crate::aggregations::membership::{AddOutcome, add_member};
+use crate::aggregations::membership::{self, AddOutcome, Denial, add_member, is_denied};
+use crate::aggregations::purge::PurgeError;
+use crate::aggregations::{MarkerGuard, MarkerOutcome, PurgeKind, Purger, Rebuild, ScopeState};
 use crate::db::locks::{lock_did_exclusive, uri_author};
 use crate::farsight::Farsight;
 use crate::firehose::backfill::BackfillSource;
@@ -21,7 +21,6 @@ use crate::firehose::gap::{self, GapCause};
 use crate::firehose::index_request::{IndexError, index_record};
 use crate::firehose::jobs::{self, Depth};
 use crate::firehose::writer::Writer;
-use crate::identity::eligibility::{self, Confirmation};
 use crate::indexing::{PublicIndexing, ScopeValue};
 use crate::private_tier::PrivateTier;
 use crate::subscriptions::references::{Budget, drop_member};
@@ -35,6 +34,10 @@ pub const LABEL_VALUES: [&str; 6] = ["!takedown", "!hide", "porn", "sexual", "nu
 pub enum AdminCommand {
     MemberAdd { did: String },
     MemberRemove { did: String },
+    /// `member deny <did> [--reason]` (membership design §5.2).
+    MemberDeny { did: String, reason: Option<String> },
+    /// `member allow <did>` (membership design §5.3).
+    MemberAllow { did: String },
     LabelAdd { subject: String, val: String },
     LabelRemove { subject: String, val: String },
     ScopeRebuild { dry_run: bool },
@@ -82,6 +85,8 @@ impl AdminCommand {
         match self {
             Self::MemberAdd { did } => ("member add", json!({ "did": did })),
             Self::MemberRemove { did } => ("member remove", json!({ "did": did })),
+            Self::MemberDeny { did, reason } => ("member deny", json!({ "did": did, "reason": reason })),
+            Self::MemberAllow { did } => ("member allow", json!({ "did": did })),
             Self::LabelAdd { subject, val } => ("label add", json!({ "subject": subject, "val": val })),
             Self::LabelRemove { subject, val } => ("label remove", json!({ "subject": subject, "val": val })),
             Self::ScopeRebuild { dry_run } => ("scope rebuild", json!({ "dry_run": dry_run })),
@@ -133,6 +138,15 @@ impl AdminCommand {
         Ok(match command {
             "member add" => Self::MemberAdd { did: did()? },
             "member remove" => Self::MemberRemove { did: did()? },
+            "member deny" => Self::MemberDeny {
+                did: did()?,
+                reason: match args.get("reason") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(r)) => Some(r.clone()),
+                    Some(_) => return Err(InvalidCommand(format!("{command}: reason must be a string"))),
+                },
+            },
+            "member allow" => Self::MemberAllow { did: did()? },
             "label add" => {
                 let (subject, val) = label()?;
                 Self::LabelAdd { subject, val }
@@ -185,7 +199,12 @@ impl AdminCommand {
     #[must_use]
     pub fn did(&self) -> Option<&str> {
         match self {
-            Self::MemberAdd { did } | Self::MemberRemove { did } | Self::Backfill { did, .. } | Self::ListsPurge { did } => Some(did),
+            Self::MemberAdd { did }
+            | Self::MemberRemove { did }
+            | Self::MemberDeny { did, .. }
+            | Self::MemberAllow { did }
+            | Self::Backfill { did, .. }
+            | Self::ListsPurge { did } => Some(did),
             Self::LabelAdd { subject, .. } | Self::LabelRemove { subject, .. } => {
                 if is_did(subject) { Some(subject) } else { uri_author(subject) }
             }
@@ -229,8 +248,6 @@ pub struct Handlers {
     pub source: Arc<dyn BackfillSource>,
     pub dead_letter_stream: String,
     pub deterministic_attempts: u32,
-    /// The `community` network's `pds_patterns` (owner eligibility, §6.11.1).
-    pub community_patterns: Arc<Vec<String>>,
     /// The block-list index, when `farsight.url` is set.
     pub farsight: Option<Farsight>,
     /// `lists.sync_min_interval_secs`.
@@ -260,6 +277,8 @@ impl Handlers {
         let result = match cmd {
             AdminCommand::MemberAdd { did } => self.member_add(did).await,
             AdminCommand::MemberRemove { did } => self.member_remove(did).await,
+            AdminCommand::MemberDeny { did, reason } => self.member_deny(did, reason.as_deref()).await,
+            AdminCommand::MemberAllow { did } => self.member_allow(did).await,
             AdminCommand::LabelAdd { subject, val } => self.label_add(subject, val).await,
             AdminCommand::LabelRemove { subject, val } => self.label_remove(subject, val).await,
             AdminCommand::ScopeRebuild { dry_run } => self.scope_rebuild(*dry_run).await,
@@ -402,13 +421,14 @@ impl Handlers {
     /// `member add` (§9.2, §6.11.1): under the write guard and the DID's
     /// shared lock, insert the member, put it in S (reason bit 1), enqueue a
     /// `member` backfill, and re-evaluate owner status; the in-memory sets
-    /// follow after commit.
+    /// follow after commit. A denied DID fails (membership design §5.4).
     async fn member_add(&self, did: &str) -> Result<Outcome, String> {
         match add_member(&self.pool, &self.scope, &self.private, did, "admin", self.list_budget)
             .await
             .map_err(|e| e.to_string())?
         {
             AddOutcome::Purging => Ok(Outcome::Defer),
+            AddOutcome::Denied => Ok(Outcome::Failed("denied; `admin member allow` first".to_string())),
             AddOutcome::AlreadyMember => Ok(Outcome::Done(json!({ "did": did, "status": "already_member" }))),
             AddOutcome::Added { became_owner } => {
                 let mut jobs = vec![json!({ "did": did, "depth": "member" })];
@@ -422,11 +442,8 @@ impl Handlers {
 
     /// `member remove`: the `member_removed` marker step runs here (write
     /// guard); the batched deletion and purge end run in the background.
-    ///
-    /// A private owner's community-PDS eligibility decides whether it stays
-    /// an owner once membership is gone (§6.11.1), so a confirmation older
-    /// than 24 h (or none) is refreshed first. The network call runs before
-    /// any guard, and its outcome never blocks the removal.
+    /// Membership is the only private-owner eligibility (membership design
+    /// §2.3), so the DID stops being an owner at the purge end.
     async fn member_remove(&self, did: &str) -> Result<Outcome, String> {
         let is_member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM members WHERE did = $1)")
             .bind(did)
@@ -436,12 +453,64 @@ impl Handlers {
         if !is_member {
             return Ok(Outcome::Failed(format!("{did} is not a member")));
         }
-        let reconfirmed = self.reconfirm_if_stale(did).await;
         match self.purger.marker(did, PurgeKind::MemberRemoved).await {
             Ok(()) => {}
-            Err(crate::aggregations::purge::PurgeError::Busy(_)) => return Ok(Outcome::Defer),
+            Err(PurgeError::Busy(_)) => return Ok(Outcome::Defer),
             Err(e) => return Err(e.to_string()),
         }
+        self.finish_member_removed(did);
+        Ok(Outcome::Done(json!({ "did": did, "status": "removed", "purge": "member_removed" })))
+    }
+
+    /// `member deny` (membership design §5.2): the denial and, for a member,
+    /// the `member_removed` marker in one transaction (`MarkerGuard::Deny`),
+    /// which decides whether the DID is a member. `Marked`: the batches and
+    /// the end run in the background, as for `member remove`. `Skipped`:
+    /// the denial alone was committed.
+    async fn member_deny(&self, did: &str, reason: Option<&str>) -> Result<Outcome, String> {
+        let db = |e: sqlx::Error| e.to_string();
+        // A shortcut: the marker's own `Busy` check is the authority.
+        if self.purging(did).await.map_err(db)? {
+            return Ok(Outcome::Defer);
+        }
+        // Only the operator's commands write denials, so this read tells a
+        // new denial from an existing one.
+        let already = is_denied(&mut *self.pool.acquire().await.map_err(db)?, did).await.map_err(db)?;
+        let denial = Denial {
+            did: did.to_string(),
+            reason: reason.map(str::to_string),
+            denied_by: "cli".to_string(),
+        };
+        let removed = match self.purger.marker_guarded(did, PurgeKind::MemberRemoved, &MarkerGuard::Deny(denial)).await {
+            Ok(MarkerOutcome::Marked) => {
+                self.finish_member_removed(did);
+                true
+            }
+            Ok(MarkerOutcome::Skipped) => false,
+            Err(PurgeError::Busy(_)) => return Ok(Outcome::Defer),
+            Err(e) => return Err(e.to_string()),
+        };
+        let status = if already { "already_denied" } else { "denied" };
+        tracing::info!(event = "member_denied", did, status, removed, "member denied");
+        Ok(Outcome::Done(json!({ "did": did, "status": status, "removed": removed })))
+    }
+
+    /// `member allow` (membership design §5.3): deletes the denial and adds
+    /// nothing. Deferred while the DID is purged, as `member add` is, so
+    /// `deny`, `allow` and `add` keep their order.
+    async fn member_allow(&self, did: &str) -> Result<Outcome, String> {
+        if self.purging(did).await.map_err(|e| e.to_string())? {
+            return Ok(Outcome::Defer);
+        }
+        let allowed = membership::allow(&self.pool, did).await.map_err(|e| e.to_string())?;
+        let status = if allowed { "allowed" } else { "not_denied" };
+        tracing::info!(event = "member_allowed", did, status, "member denial lifted");
+        Ok(Outcome::Done(json!({ "did": did, "status": status })))
+    }
+
+    /// The batched deletion and purge end of a `member_removed` purge whose
+    /// marker committed, in the background.
+    fn finish_member_removed(&self, did: &str) {
         let purger = self.purger.clone();
         let did_owned = did.to_string();
         tokio::spawn(async move {
@@ -454,41 +523,6 @@ impl Handlers {
                 tracing::error!(event = "member_remove_purge_failed", did = %did_owned, %error, "member_removed purge failed; it resumes at the next startup");
             }
         });
-        Ok(Outcome::Done(json!({ "did": did, "status": "removed", "purge": "member_removed", "eligibility": reconfirmed })))
-    }
-
-    /// Re-confirm a private owner's eligibility when the last confirmation
-    /// is missing or stale. Returns what happened, for the command result.
-    async fn reconfirm_if_stale(&self, did: &str) -> &'static str {
-        if !self.scope.read_guard().await.is_owner(did) {
-            return "not_owner";
-        }
-        let confirmed_at = match self.pool.acquire().await {
-            Ok(mut conn) => self.private.eligibility_confirmed_at(&mut conn, did).await,
-            Err(e) => Err(e),
-        };
-        let confirmed_at = match confirmed_at {
-            Ok(t) => t,
-            Err(error) => {
-                tracing::warn!(event = "member_remove_eligibility_read_failed", did, %error, "eligibility not re-confirmed");
-                return "unchecked";
-            }
-        };
-        if !eligibility::is_stale(confirmed_at, Utc::now()) {
-            return "fresh";
-        }
-        let confirmation = eligibility::confirm(self.source.as_ref(), &self.community_patterns, did).await;
-        let label = match &confirmation {
-            Confirmation::Eligible => "confirmed",
-            Confirmation::Ineligible(_) => "ineligible",
-            Confirmation::Failed(_) => "failed",
-        };
-        if let Err(error) = eligibility::apply(&self.pool, &self.scope, &self.private, did, &confirmation).await {
-            tracing::warn!(event = "member_remove_eligibility_write_failed", did, %error, "eligibility re-confirmation not recorded");
-            return "unchecked";
-        }
-        tracing::info!(event = "member_remove_eligibility_reconfirmed", did, outcome = label, "stale eligibility re-confirmed before removal");
-        label
     }
 
     async fn label_add(&self, subject: &str, val: &str) -> Result<Outcome, String> {
@@ -614,6 +648,9 @@ mod tests {
         for cmd in [
             AdminCommand::MemberAdd { did: DID.into() },
             AdminCommand::MemberRemove { did: DID.into() },
+            AdminCommand::MemberDeny { did: DID.into(), reason: Some("spam".into()) },
+            AdminCommand::MemberDeny { did: DID.into(), reason: None },
+            AdminCommand::MemberAllow { did: DID.into() },
             AdminCommand::LabelAdd {
                 subject: format!("at://{DID}/app.bsky.feed.post/3k"),
                 val: "!hide".into(),
@@ -685,5 +722,11 @@ mod tests {
         };
         assert_eq!(label.did(), Some(DID));
         assert_eq!(AdminCommand::Resync.did(), None);
+        // `deny` and `allow` keep their order with `add` (membership
+        // design §5.3).
+        assert_eq!(AdminCommand::MemberDeny { did: DID.into(), reason: None }.did(), Some(DID));
+        assert_eq!(AdminCommand::MemberAllow { did: DID.into() }.did(), Some(DID));
+        assert!(AdminCommand::parse("member deny", &json!({"did": DID, "reason": 7})).is_err());
+        assert!(AdminCommand::parse("member allow", &json!({"did": "bob"})).is_err());
     }
 }

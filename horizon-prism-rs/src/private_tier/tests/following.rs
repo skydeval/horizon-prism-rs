@@ -28,6 +28,10 @@ use super::*;
 // #723's tests (replay-readiness design §11), on this module's harness.
 #[path = "replay.rs"]
 mod replay;
+// Membership not tied to hosting, S1 (membership design §13), on this
+// module's harness.
+#[path = "membership.rs"]
+mod membership;
 
 const FOLLOW: &str = "app.bsky.graph.follow";
 const PDS: &str = "https://pds.example.com";
@@ -95,6 +99,8 @@ struct Pds {
     page_size: usize,
     descending: bool,
     inactive: Mutex<HashSet<String>>,
+    /// Every DID `prepare` was asked about, in order.
+    prepared: Mutex<Vec<String>>,
     hold: Mutex<Option<Hold>>,
 }
 
@@ -106,6 +112,7 @@ impl Pds {
             page_size,
             descending,
             inactive: Mutex::new(HashSet::new()),
+            prepared: Mutex::new(Vec::new()),
             hold: Mutex::new(None),
         }
     }
@@ -143,6 +150,7 @@ impl Pds {
 #[async_trait]
 impl BackfillSource for Pds {
     async fn prepare(&self, did: &str) -> Result<String, PrepareError> {
+        self.prepared.lock().expect("prepared").push(did.into());
         if self.inactive.lock().expect("inactive").contains(did) {
             return Err(PrepareError::Negative("repo inactive (deactivated)".into()));
         }
@@ -243,7 +251,6 @@ impl H {
 
     fn backfill_with(&self, cfg: BackfillConfig) -> Backfill {
         Backfill::new(self.f.writer.clone(), Arc::clone(&self.pds) as Arc<dyn BackfillSource>, cfg, 1)
-            .with_community_patterns(vec!["pds.example.com".into()])
     }
 
     /// A commit applied by the firehose, as the consumer applies it.
@@ -326,11 +333,22 @@ impl H {
         uri
     }
 
-    /// Eve: an eligible non-member owner outside S, tracked, with a
+    /// `did` a ready member, in the database and the members' set, but not in S:
+    /// tracked, with admission's rule 1 not admitting its own records, so
+    /// only a member subject admits its follows. Before the membership
+    /// design (§2.3) these tests used an eligible non-member owner, which
+    /// no longer exists; this keeps the writer's tracked-outside-S paths
+    /// under test.
+    async fn member_outside_s(&self, did: &str) {
+        exec(self.pool(), &format!("INSERT INTO members (did, source, ready_at) VALUES ('{did}', 'admin', now())")).await;
+        self.f.writer.scope().write_guard().await.members.insert(did.into());
+    }
+
+    /// Eve: an owner outside S ([`Self::member_outside_s`]), tracked, with a
     /// `following` audience and a post under it, ready.
     async fn eve(&self, tag: &str) -> (String, String) {
         actor(self.pool(), EVE, "eve.test", "eve.test").await;
-        exec(self.pool(), &format!("INSERT INTO private_owner_eligible (did, confirmed_at) VALUES ('{EVE}', now())")).await;
+        self.member_outside_s(EVE).await;
         exec(
             self.pool(),
             &format!("INSERT INTO sync_state (did, applied_rev, head_rev, head_checked_at, firehose_rev) VALUES ('{EVE}', '{REV}', '{REV}', now(), '{REV}')"),
@@ -671,17 +689,24 @@ async fn t36_every_clear_clears_the_flag() {
     assert!(!after.set);
     assert_ne!(after.clears, before.clears);
 
-    // Leaving the tracked set while staying in S: Eve, in S, an owner
-    // through her audience, deletes it.
+    // Leaving the tracked set while staying in S: Eve, a member in S and
+    // an owner through her audience, is removed (membership design §2.3:
+    // membership is the only way to be tracked, so its end is the way out).
     actor(h.pool(), EVE, "eve.test", "eve.test").await;
-    exec(h.pool(), &format!("INSERT INTO private_owner_eligible (did, confirmed_at) VALUES ('{EVE}', now())")).await;
+    exec(h.pool(), &format!("INSERT INTO members (did, source) VALUES ('{EVE}', 'admin')")).await;
     exec(h.pool(), &format!("INSERT INTO scope_dids (did, reasons) VALUES ('{EVE}', 1)")).await;
-    h.f.writer.scope().write_guard().await.scope.insert(EVE.into());
+    {
+        let mut sets = h.f.writer.scope().write_guard().await;
+        sets.members.insert(EVE.into());
+        sets.scope.insert(EVE.into());
+    }
     h.f.ingest(EVE, NSID_AUDIENCE, "3kt36eveaud1", json!({"$type": NSID_AUDIENCE, "mode": "following", "members": [], "createdAt": "2026-09-26T00:00:00Z"})).await;
     exec(h.pool(), &format!("INSERT INTO sync_state (did, applied_rev, follows_verified_at, follows_verified_rev, firehose_rev) VALUES ('{EVE}', '{REV}', now(), '{REV}', '{REV}') ON CONFLICT (did) DO UPDATE SET follows_verified_at = now()")).await;
     let before = h.flag(EVE).await;
     assert!(before.set);
-    h.f.apply_op(EVE, Action::Delete, NSID_AUDIENCE, "3kt36eveaud1", REV2, None).await;
+    let purger = Purger::new(h.pool().clone(), h.f.writer.scope().clone(), Arc::clone(h.f.writer.private()));
+    purger.purge(EVE, PurgeKind::MemberRemoved).await.expect("member removed");
+    assert!(h.f.writer.scope().read_guard().await.in_scope(EVE), "she stays in S");
     let after = h.flag(EVE).await;
     assert!(!after.set, "Eve left the tracked set: {after:?}");
     assert_ne!(after.clears, before.clears);
@@ -1584,7 +1609,7 @@ async fn t41_a_member_owner_keeps_its_newest_ten_thousand_ascending() {
     newest_ten_thousand("s10-t41-newest-asc", false).await;
 }
 
-/// T-41: a non-member owner whose follow of member V predates Prism: the
+/// T-41: an owner outside S whose follow of member V predates Prism: the
 /// `private` job inserts it, which writes NULL; the `authz` re-run a minute
 /// later sets the flag, and V reads.
 #[tokio::test]
@@ -1645,9 +1670,10 @@ async fn t41_a_switch_mid_run_is_rechecked_at_settle() {
     h.finish().await;
 }
 
-/// T-41, review 2 finding 1: a non-member owner of a `following` audience
-/// confirmed ineligible by its `authz` run ends `done`, with no re-queue and
-/// no `authz` queued after it; its audience row remains, and it owns no
+/// T-41, review 2 finding 1, as the membership design (§2.3) leaves it: a
+/// non-member with a `following` audience is no owner, and an `authz` run
+/// for it ends `done` without asking its PDS, with no re-queue and no
+/// `authz` queued after it; its audience row remains, and it owns no
 /// `following` audience. The same for a DID no longer tracked at settle.
 /// Startup's rollout queues nothing for it.
 #[tokio::test]
@@ -1656,10 +1682,14 @@ async fn t41_an_ineligible_owner_is_not_requeued() {
         return;
     };
     h.eve("t41i00").await;
+    exec(h.pool(), &format!("DELETE FROM members WHERE did = '{EVE}'")).await;
+    h.f.writer.scope().write_guard().await.members.remove(EVE);
+    // Asked, its PDS would answer: the run must not ask.
     h.pds.inactive.lock().expect("inactive").insert(EVE.into());
     h.clear_jobs().await;
     let b = h.backfill();
     assert_eq!(h.run(&b, EVE, Depth::Authz).await, JobOutcome::Done);
+    assert!(!h.pds.prepared.lock().expect("prepared").iter().any(|d| d == EVE), "no network call");
     assert_eq!(h.job(EVE, Depth::Authz).await.expect("authz").0, "done");
     let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM private_audiences WHERE owner_did = '{EVE}' AND mode = 'following'")).fetch_one(h.pool()).await.expect("rows");
     assert_eq!(rows, 1);
@@ -1669,8 +1699,8 @@ async fn t41_an_ineligible_owner_is_not_requeued() {
     assert_eq!(KryphocronPrivateTier.enqueue_following_verification(h.pool()).await.expect("rollout"), 0);
     assert_eq!(h.job(EVE, Depth::Authz).await.expect("authz").0, "done");
 
-    // Tracked at no point of the run's decision, eligible again, and gone
-    // from the tracked set before the settle: no re-check.
+    // Tracked at no point of the run's decision, and gone from the tracked
+    // set before the settle: no re-check.
     h.pds.inactive.lock().expect("inactive").clear();
     h.f.writer.scope().write_guard().await.private_owners.remove(EVE);
     let hook = hooks::arm(hooks::SETTLE_BEFORE_GAP_LOCK, &h.key(EVE));
@@ -1906,7 +1936,7 @@ async fn t42_catch_up_contradictions_and_failures() {
 
 // ---- T-43: the writer ----
 
-/// T-43: the follow tombstone (§4.1): non-member O outside S, the
+/// T-43: the follow tombstone (§4.1): O outside S, the
 /// firehose's delete of follow X finds no row and still tombstones it; a
 /// job's later write of listed X at an older rev is refused, and V does not
 /// read. A rejected follow update (§4.2), in Off and in On: the row naming
@@ -2018,7 +2048,7 @@ async fn t43_a_listing_older_than_a_rejected_edit_is_refused() {
     h.finish().await;
 }
 
-/// T-43, review 3 finding 1: non-member O, the firehose held back. Listing
+/// T-43, review 3 finding 1: O outside S, the firehose held back. Listing
 /// A of O at R1 sees X naming member V; O edits X to name non-member W at
 /// U; listing B at R2 ≥ U sees X naming W, whose write is rejected,
 /// deleting the row and tombstoning X at R2; B settles the flag. A then
@@ -2077,7 +2107,7 @@ async fn t43_two_listings_a_newer_rejection_wins() {
     h.finish().await;
 }
 
-/// T-43, review 2 finding 7 with review 3's cost rule, in Off: non-member O
+/// T-43, review 2 finding 7 with review 3's cost rule, in Off: O outside S
 /// with 100 follows of non-members. A pass writes none of them, and W's
 /// reply under O's `following` audience is read by W alone. The first pass
 /// writes 100 tombstones; a second at the same R writes none (rows and
@@ -2733,9 +2763,8 @@ async fn pre_s10_count_query_counts_each_kind() {
     // Starting: Bob's reply (Alice follows him). Not: Dave's.
     w.reply(BOB, "3kt45bobrep2", &root).await;
     w.reply(DAVE, "3kt45daverep", &root).await;
-    // An eligible non-member owner with 10 000 stored follows.
+    // A non-member with a `following` audience and 10 000 stored follows.
     for sql in [
-        format!("INSERT INTO private_owner_eligible (did, confirmed_at) VALUES ('{EVE}', now())"),
         format!(
             "INSERT INTO private_audiences (uri, owner_did, rkey, cid, rev, mode, members) \
              VALUES ('at://{EVE}/{NSID_AUDIENCE}/3kt45eveaud1', '{EVE}', '3kt45eveaud1', 'bafy', '{REV}', 'following', '{{}}')"
@@ -2747,12 +2776,12 @@ async fn pre_s10_count_query_counts_each_kind() {
     ] {
         exec(&w.f.pool, &sql).await;
     }
-    let counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+    let counts: (i64, i64, i64, i64, i64, i64, i64, i64) =
         sqlx::query_as(&schema::pre_s10_count_sql()).fetch_one(&w.f.pool).await.expect("count query");
-    // Two audiences and owners (a member, a non-member); one owner over 10 000;
+    // Two audiences and owners (one a member); one owner over 10 000;
     // Alice's root; two cross-owner replies, one starting; Alice's root
     // for Bob and Carol.
-    assert_eq!(counts, (2, 2, 1, 1, 1, 1, 2, 1, 2));
+    assert_eq!(counts, (2, 2, 1, 1, 1, 2, 1, 2));
     w.finish().await;
 }
 

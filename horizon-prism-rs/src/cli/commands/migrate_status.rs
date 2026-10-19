@@ -90,6 +90,8 @@ mod tests {
             "0029_distinct_interaction_counts",
             // Replay below a settle: the listed revs (#723).
             "0030_listed_revs",
+            // Membership not tied to hosting (#733).
+            "0031_membership",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

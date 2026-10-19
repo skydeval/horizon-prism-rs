@@ -22,6 +22,6 @@ pub mod scope_state;
 pub use admit::{Admission, AdmissionInput, AdmitRule, RecordKind, RejectReason, admit};
 pub use growth::GrowthPlan;
 pub use policy::{REASON_FOLLOWED, REASON_INTERACTED, REASON_MEMBER, in_index_scope};
-pub use purge::{PurgeLifecycle, Purger};
+pub use purge::{MarkerGuard, MarkerOutcome, PurgeLifecycle, Purger};
 pub use rebuild::Rebuild;
 pub use scope_state::{PurgeKind, ScopeSets, ScopeState};

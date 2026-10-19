@@ -10,6 +10,59 @@ commit.
 
 ## [Unreleased]
 
+### Changed (membership not tied to hosting, S1, #733)
+
+Membership design S1 (`docs/internal/design/membership.md`): membership is
+the one fact, the operator can exclude a DID, and hosting no longer makes
+anyone a private owner.
+
+- **Upgrade note: a non-member hosted on a community PDS no longer owns
+  served private posts.** Until now a DID whose PDS matched the
+  `community` network's `pds_patterns` and answered `getRepoStatus` was a
+  private owner without being a member, so its private posts, its
+  audiences and the replies under them were served. Now only a member is
+  an owner (C-M1 (b)). Migration 0031 drops those owners' readiness, their
+  repo-head state and their queued `private`/`authz` jobs. Their rows stay
+  stored, and an `admin member add` serves them again once the member's
+  `private` job has run. **Before upgrading**, run PB-M2's queries
+  read-only (`docker/README.md`, "Before the 0031 upgrade") and
+  `admin member add` everyone listed who should stay an owner; anyone left
+  off goes dark at the upgrade.
+- **`admin member deny <did> [--reason <text>]`.** Writes a denial
+  (`member_denials`). For a member, the denial and the removal are one
+  transaction: the `member_removed` purge's marker, whose batches and end
+  then run in the background as for `member remove`. For a non-member the
+  denial alone is written. The result is `{did, status: denied |
+  already_denied, removed}`. A second deny keeps the first one's time and
+  author and replaces the reason only when one is given. The reason is the
+  operator's note and is never shown to the DID.
+- **`admin member allow <did>`** deletes the denial and adds nothing
+  (`status: allowed | not_denied`). `admin member add` of a denied DID
+  fails with "denied; `admin member allow` first". `deny` and `allow` wait
+  on a running purge of the DID, as `add` does, so the three keep their
+  order.
+- **`admin member list --denied`** lists the denials.
+- **Auto-enroll refuses a denied DID**, checked first among its refusals,
+  counted as `auto_enroll_refused_total{reason="denied"}`, answered
+  `notEligible` like every refusal, and never cached, so `allow` takes
+  effect at the next call. Auto-enroll's default is unchanged in this
+  release.
+- **A non-member's `private` or `authz` job ends `done` at once**, with no
+  call to its PDS: the community-PDS confirmation, its daily
+  re-confirmation and `member remove`'s re-confirmation are gone, and
+  `member remove`'s result has no `eligibility` field.
+- **Migration 0031** (`0031_membership`) creates `member_denials`, drops
+  `private_owner_eligible` and the `actors` columns
+  `eligibility_failure_count` and `eligibility_failing_since`, after the
+  owner changeover above.
+- **Metrics:** `member_denials_total` (gauge, sampled with
+  `members_total`). Removed: `eligibility_cleared_total`. Events
+  `member_denied` and `member_allowed`.
+- The purge marker takes a guard (`MarkerGuard::{None, Expiry, Deny}`,
+  outcome `Marked` or `Skipped`); a `Skipped` marker writes no
+  `purging_dids` row, clears nothing and runs neither the batches nor the
+  end. `Expiry` is for the never-ready expiry of a later slice.
+
 ### Test reliability (#716)
 
 Five tests that failed under the full suite's load on silonew, and passed
