@@ -140,6 +140,10 @@ pub struct ScopeState {
     max_follow_scope_per_member: u32,
     /// How long an interaction holds its subject (scope-recency design §5).
     windows: ScopeWindows,
+    /// The DIDs a member's write named as a hold since the current sweep
+    /// began (scope-recency design §3.2). Locked only for an insert, a
+    /// lookup or a clear, never across an `.await`; `reload` leaves it.
+    touched: Arc<std::sync::Mutex<HashSet<String>>>,
     /// `ScopeSets.public.mode`, readable without the guard (the endpoint
     /// gate, public-indexing design §3.5). Stored under the write guard.
     public_mirror: Arc<AtomicU8>,
@@ -154,8 +158,33 @@ impl ScopeState {
             policy,
             max_follow_scope_per_member,
             windows: ScopeWindows::default(),
+            touched: Arc::default(),
             public_mirror: Arc::new(mirror),
         }
+    }
+
+    fn touched_set(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.touched.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record holds a member's write named. Writers call it under the read
+    /// guard, before their commit (scope-recency design §3.2).
+    pub fn touch(&self, dids: &[String]) {
+        if dids.is_empty() {
+            return;
+        }
+        self.touched_set().extend(dids.iter().cloned());
+    }
+
+    /// Whether a member's write named `did` as a hold since the sweep began.
+    #[must_use]
+    pub fn is_touched(&self, did: &str) -> bool {
+        self.touched_set().contains(did)
+    }
+
+    /// Start a sweep's record. The sweep calls it under the write guard.
+    pub fn clear_touched(&self) {
+        self.touched_set().clear();
     }
 
     /// Set the interaction windows (`scope.reply_quote_days`,

@@ -36,6 +36,13 @@ use crate::subscriptions::{jobs as list_sync, triggers};
 
 /// Rows per deletion batch (§6.11.7).
 pub const BATCH: i64 = 10_000;
+/// Whether a member's active activity subscription holds `$1`: the
+/// subscriber is a member and follows the subject (scope-recency design
+/// §3.6).
+const SUBSCRIPTION_HOLDS: &str = "SELECT EXISTS (SELECT 1 FROM activity_subscriptions a \
+     JOIN members m ON m.did = a.subscriber_did \
+     WHERE a.subject_did = $1 \
+       AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = a.subscriber_did AND f.subject_did = $1))";
 /// Re-attempt interval for a marker step blocked by a running purge.
 pub const OVERLAP_RETRY: Duration = Duration::from_secs(10);
 
@@ -50,12 +57,19 @@ pub enum PurgeError {
 }
 
 /// A condition the marker step checks inside its own transaction, under the
-/// write guard and the DID's exclusive lock (membership design §3.2). Only
-/// for a `member_removed` purge.
+/// write guard and the DID's exclusive lock (membership design §3.2).
+/// `Unjustified` is for an `out_of_scope` purge, the others for
+/// `member_removed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerGuard {
     /// None: `member remove`, `account_deleted`, `out_of_scope`.
     None,
+    /// The daily scope sweep (scope-recency design §3.4): the DID leaves S
+    /// only while nothing holds it: no member's write named it since the
+    /// sweep began, it is not a member, its `scope_dids` row was not
+    /// justified since `cutoff`, no member's follow inside the follow cap
+    /// names it, and no member's active activity subscription does.
+    Unjustified { cutoff: DateTime<Utc> },
     /// The never-ready expiry: the member is deleted only while it is
     /// still an `auto_enroll` member, never ready, added before `cutoff`.
     Expiry { cutoff: DateTime<Utc> },
@@ -73,6 +87,10 @@ pub enum MarkerOutcome {
     /// cleared, nothing in memory changed, and nothing else runs. Under
     /// `Deny` the denial alone was committed.
     Skipped,
+    /// `Unjustified` only: something still holds the DID, named here
+    /// (`touched`, `member`, `refreshed`, `followed`, `subscribed`). As
+    /// `Skipped`, nothing was written or changed.
+    Held(&'static str),
 }
 
 /// The purge runner.
@@ -148,8 +166,9 @@ impl Purger {
             self.purge(did, kind).await?;
             return Ok(MarkerOutcome::Marked);
         }
-        if self.marker_guarded(did, kind, guard).await? == MarkerOutcome::Skipped {
-            return Ok(MarkerOutcome::Skipped);
+        let outcome = self.marker_guarded(did, kind, guard).await?;
+        if outcome != MarkerOutcome::Marked {
+            return Ok(outcome);
         }
         self.run_batches(did, kind).await?;
         self.end(did).await?;
@@ -169,6 +188,58 @@ impl Purger {
                 other => return other,
             }
         }
+    }
+
+    /// What still holds `did` in S, read under the write guard and the DID's
+    /// exclusive lock (scope-recency design §3.4): `None` when nothing does.
+    /// No writer transaction and no subscription write is open while the
+    /// write guard is held, so every committed hold is visible here.
+    async fn still_held(&self, conn: &mut PgConnection, did: &str, cutoff: DateTime<Utc>) -> Result<Option<&'static str>, sqlx::Error> {
+        if self.scope.is_touched(did) {
+            return Ok(Some("touched"));
+        }
+        let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM members WHERE did = $1)")
+            .bind(did)
+            .fetch_one(&mut *conn)
+            .await?;
+        if member {
+            return Ok(Some("member"));
+        }
+        let justified: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT justified_at FROM scope_dids WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&mut *conn)
+            .await?;
+        if justified.is_none_or(|at| at >= cutoff) {
+            return Ok(Some("refreshed"));
+        }
+        let policy = self.scope.policy();
+        if super::policy::grows_on_follow(policy) {
+            // Some member follows the DID with fewer than the cap of its
+            // follows before that one, in the sweep's order.
+            let followed: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM follows f JOIN members m ON m.did = f.author_did \
+                 WHERE f.subject_did = $1 \
+                   AND (SELECT count(*) FROM follows e WHERE e.author_did = f.author_did \
+                          AND (e.created_at, e.uri) < (f.created_at, f.uri)) < $2)",
+            )
+            .bind(did)
+            .bind(i64::from(self.scope.max_follow_scope_per_member()))
+            .fetch_one(&mut *conn)
+            .await?;
+            if followed {
+                return Ok(Some("followed"));
+            }
+        }
+        if super::policy::holds_on_subscription(policy) {
+            let subscribed: bool = sqlx::query_scalar(SUBSCRIPTION_HOLDS)
+                .bind(did)
+                .fetch_one(&mut *conn)
+                .await?;
+            if subscribed {
+                return Ok(Some("subscribed"));
+            }
+        }
+        Ok(None)
     }
 
     /// The marker step.
@@ -191,7 +262,14 @@ impl Purger {
     ///
     /// [`PurgeError::Busy`] when a purge of the DID is running; database errors.
     pub async fn marker_guarded(&self, did: &str, kind: PurgeKind, guard: &MarkerGuard) -> Result<MarkerOutcome, PurgeError> {
-        debug_assert!(*guard == MarkerGuard::None || kind == PurgeKind::MemberRemoved, "a guard is for member_removed only");
+        debug_assert!(
+            match guard {
+                MarkerGuard::None => true,
+                MarkerGuard::Unjustified { .. } => kind == PurgeKind::OutOfScope,
+                MarkerGuard::Expiry { .. } | MarkerGuard::Deny(_) => kind == PurgeKind::MemberRemoved,
+            },
+            "Unjustified is for out_of_scope, the other guards for member_removed"
+        );
         let mut sets = self.scope.write_guard().await;
         let mut tx = self.pool.begin().await?;
         lock_did_exclusive(&mut tx, did).await?;
@@ -207,6 +285,12 @@ impl Purger {
         let mut member_removed = false;
         match guard {
             MarkerGuard::None => {}
+            MarkerGuard::Unjustified { cutoff } => {
+                if let Some(hold) = self.still_held(&mut tx, did, *cutoff).await? {
+                    tx.rollback().await?;
+                    return Ok(MarkerOutcome::Held(hold));
+                }
+            }
             MarkerGuard::Expiry { cutoff } => {
                 let gone = sqlx::query(
                     "DELETE FROM members WHERE did = $1 AND source = 'auto_enroll' AND first_ready_at IS NULL AND added_at < $2",

@@ -75,7 +75,7 @@ fill_max_wait_hours = 24
 
 [scope]
 policy = "members_and_one_hop"
-rebuild_grace_days = 7
+rebuild_grace_days = 0
 max_follow_scope_per_member = 10000
 reply_quote_days = 90
 like_repost_days = 30
@@ -461,6 +461,7 @@ fn docker_app_toml_equals_defaults() {
 fn scope_recency_keys_default_and_are_range_checked() {
     let s = load("").expect("defaults").file.scope;
     assert_eq!((s.reply_quote_days, s.like_repost_days, s.sweep_max_purges), (90, 30, 5_000));
+    assert_eq!(s.rebuild_grace_days, 0, "an unfollow applies at the next nightly check");
     assert_eq!(s.windows(), ScopeWindows { reply_quote_days: 90, like_repost_days: 30 });
     load("[scope]\nreply_quote_days = 0\nlike_repost_days = 3650\nrebuild_grace_days = 30\nsweep_max_purges = 1\n").expect("edges are valid");
     for (text, needle) in [

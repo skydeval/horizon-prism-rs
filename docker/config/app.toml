@@ -35,7 +35,9 @@ fill_max_wait_hours = 24
 [scope]
 # members_only | members_and_follows | members_and_interactions | members_and_one_hop
 policy = "members_and_one_hop"
-rebuild_grace_days = 7
+# Extra days an account nothing holds any more stays indexed before the
+# nightly scope check removes it (0-30; 0 = the next nightly check).
+rebuild_grace_days = 0
 # Follow-derived scope growth per member (design §9.4).
 max_follow_scope_per_member = 10000
 # Days a member's reply or quote keeps the accounts it names indexed, after

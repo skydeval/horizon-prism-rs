@@ -134,7 +134,7 @@ impl Default for ScopeConfig {
     fn default() -> Self {
         Self {
             policy: ScopePolicy::MembersAndOneHop,
-            rebuild_grace_days: 7,
+            rebuild_grace_days: 0,
             max_follow_scope_per_member: 10_000,
             reply_quote_days: 90,
             like_repost_days: 30,

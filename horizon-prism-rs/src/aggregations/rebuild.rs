@@ -1,20 +1,26 @@
-//! Scope rebuild (design-v2 §9.4, §9.5), run by `admin scope rebuild` and
-//! weekly by the scheduler.
+//! Scope maintenance (design-v2 §9.4, §9.5; scope-recency design §3.3).
 //!
-//! 1. Recompute S from `members`, `follows` and the interaction tables under
-//!    the active policy (public tier only; the follow cap applies per member).
-//! 2. Upsert the confirmed DIDs into `scope_dids` with `justified_at = now()`,
-//!    in batches that take each DID's shared lock before inserting (§6.11.7);
-//!    a DID new to S gets a `scope` backfill.
-//! 3. Purge (`out_of_scope`, two-phase) every DID whose `justified_at` is
-//!    older than `scope.rebuild_grace_days`.
-//! 4. Recompute `post_counts` and `actor_counts` from the base tables.
+//! **The daily sweep** ([`Rebuild::sweep`]), run one hour before retention
+//! and by `admin scope rebuild`, one run at a time:
+//! 1. Under the write guard, clear the touched set and read `T0`.
+//! 2. Compute the holds `J`: members; each member's earliest follows up to
+//!    the follow cap; the subjects of members' likes and reposts of the last
+//!    `scope.like_repost_days` days and of their replies and quotes of the
+//!    last `scope.reply_quote_days` days; and the subjects, already in S, of
+//!    members' active activity subscriptions.
+//! 3. Upsert `J` with `justified_at = now()`, in batches under each DID's
+//!    shared lock; a DID new to S gets a `scope` backfill. A DID held only by
+//!    a subscription is refreshed, never inserted.
+//! 4. Finish any `out_of_scope` purge left half-done, then purge the rows no
+//!    hold justified since `T0` minus the grace, each through the guarded
+//!    marker (`MarkerGuard::Unjustified`), 100 ms apart, at most
+//!    `scope.sweep_max_purges` per run.
 //! 5. Refresh the in-memory per-member follow counts.
 //!
-//! The weekly run also enqueues `resync` jobs, 1 DID/s, for in-scope DIDs
-//! whose last re-sync is older than 7 days (§5.7, §9.4).
+//! **Weekly**, by the scheduler: the §9.5 counts repair and `resync` jobs,
+//! 1 DID/s, for in-scope DIDs whose last re-sync is older than 7 days (§5.7).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,9 +28,13 @@ use chrono::{DateTime, TimeDelta, Utc};
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
-use super::policy::{REASON_FOLLOWED, REASON_INTERACTED, REASON_MEMBER, grows_on_follow, grows_on_interaction};
-use super::purge::Purger;
+use super::policy::{
+    REASON_FOLLOWED, REASON_INTERACTED, REASON_MEMBER, REASON_SUBSCRIBED, grows_on_follow, grows_on_interaction,
+    holds_on_subscription,
+};
+use super::purge::{MarkerGuard, MarkerOutcome, PurgeError, Purger};
 use super::scope_state::{PurgeKind, ScopeState};
+use crate::config::UtcTimeOfDay;
 use crate::db::locks::lock_dids_shared;
 use crate::firehose::jobs::Depth;
 use crate::private_tier::PrivateTier;
@@ -33,27 +43,95 @@ use crate::private_tier::PrivateTier;
 pub const UPSERT_BATCH: usize = 500;
 /// The weekly schedule is checked this often; the run itself is weekly.
 pub const SCHEDULE_CHECK: Duration = Duration::from_secs(3600);
-/// Period of the scheduled rebuild.
+/// The daily sweep's schedule is checked this often, so a run starts
+/// within minutes of its slot (scope-recency design §3.3).
+pub const SWEEP_CHECK: Duration = Duration::from_secs(300);
+/// The least time between two scheduled sweeps.
+pub const SWEEP_MIN_GAP: TimeDelta = TimeDelta::hours(23);
+/// How long a failed scheduled sweep waits before it is tried again.
+pub const SWEEP_RETRY: TimeDelta = TimeDelta::hours(1);
+/// The pause between two purges of one sweep.
+pub const PURGE_PAUSE: Duration = Duration::from_millis(100);
+/// Period of the weekly counts repair and re-syncs.
 pub const WEEK: TimeDelta = TimeDelta::days(7);
-/// `worker_state` key recording the last scheduled rebuild.
+/// `worker_state` key recording the last weekly run.
 pub const KEY_LAST_REBUILD: &str = "last_scope_rebuild";
+/// `worker_state` key recording the last scheduled sweep.
+pub const KEY_LAST_SWEEP: &str = "last_scope_sweep";
 
-/// What a rebuild did (or, for a dry run, would do).
+/// Sweeps run, by outcome (`ok`, `failed`).
+pub const METRIC_SWEEP_RUNS: &str = "scope_sweep_runs_total";
+/// DIDs a sweep removed from S.
+pub const METRIC_SWEEP_PURGED: &str = "scope_sweep_purged_total";
+/// Candidates a sweep did not remove, by reason (`touched`, `member`,
+/// `refreshed`, `followed`, `subscribed`, `busy`, `capped`).
+pub const METRIC_SWEEP_SKIPPED: &str = "scope_sweep_skipped_total";
+/// Rows of `scope_dids` after a sweep, each by its first hold (`member`,
+/// `follow`, `interaction`, `subscription`, or `none` when only the grace
+/// or the cap keeps it). Named apart from the sampler's unlabelled
+/// `scope_dids_total`.
+pub const METRIC_SCOPE_BY_HOLD: &str = "scope_dids_by_hold";
+
+/// A DID and its reason bits.
+type Held = (String, i16);
+
+/// What a sweep did (or, for a dry run, would do).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RebuildReport {
+pub struct SweepReport {
+    /// DIDs some hold justifies.
     pub justified: usize,
+    /// DIDs the sweep added to S.
     pub added: usize,
+    /// Rows no hold justifies, past the grace: the purge candidates.
+    pub candidates: usize,
+    /// DIDs removed from S, half-done purges finished included.
     pub purged: usize,
-    pub resync_enqueued: u64,
+    /// Candidates not removed, by reason.
+    pub skipped: BTreeMap<&'static str, usize>,
+    /// The candidates by the reason bits their rows last had.
+    pub would_purge_by_reasons: BTreeMap<i16, usize>,
 }
 
-/// The rebuild runner.
+impl SweepReport {
+    /// How many sweeps the candidates take at `max_purges` per sweep.
+    #[must_use]
+    pub fn sweeps_needed(&self, max_purges: u32) -> usize {
+        self.candidates.div_ceil(usize::try_from(max_purges.max(1)).unwrap_or(usize::MAX))
+    }
+
+    fn skip(&mut self, reason: &'static str) {
+        *self.skipped.entry(reason).or_insert(0) += 1;
+        metrics::counter!(METRIC_SWEEP_SKIPPED, "reason" => reason).increment(1);
+    }
+}
+
+/// The start of the most recent daily slot at or before `now`.
+#[must_use]
+pub fn most_recent_slot(now: DateTime<Utc>, slot_secs: u32) -> DateTime<Utc> {
+    let midnight = now.date_naive().and_hms_opt(0, 0, 0).map_or(now, |t| t.and_utc());
+    let today = midnight + TimeDelta::seconds(i64::from(slot_secs));
+    if today <= now { today } else { today - TimeDelta::days(1) }
+}
+
+/// Whether the scheduled sweep is due (scope-recency design §3.3): the last
+/// run was before the most recent slot and at least 23 hours ago.
+#[must_use]
+pub fn sweep_due(last: DateTime<Utc>, now: DateTime<Utc>, slot_secs: u32) -> bool {
+    last < most_recent_slot(now, slot_secs) && now - last >= SWEEP_MIN_GAP
+}
+
+/// The scope maintenance runner.
 #[derive(Clone)]
 pub struct Rebuild {
     pool: PgPool,
     scope: ScopeState,
     purger: Purger,
     grace_days: u32,
+    max_purges: u32,
+    /// Seconds after midnight UTC of the daily slot.
+    slot_secs: u32,
+    /// One sweep at a time, scheduled or `admin scope rebuild`.
+    run_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Rebuild {
@@ -65,6 +143,10 @@ impl Rebuild {
             scope,
             purger,
             grace_days,
+            max_purges: 5_000,
+            // One hour before the default retention run at 04:00.
+            slot_secs: 3 * 3600,
+            run_lock: Arc::default(),
         }
     }
 
@@ -75,13 +157,34 @@ impl Rebuild {
         self
     }
 
-    /// Step 1: DID → reason bits under the active policy.
+    /// Set `scope.sweep_max_purges`.
+    #[must_use]
+    pub fn with_max_purges(mut self, max: u32) -> Self {
+        self.max_purges = max.max(1);
+        self
+    }
+
+    /// Run the daily sweep one hour before `retention.run_at_utc`.
+    #[must_use]
+    pub fn with_retention_at(mut self, at: UtcTimeOfDay) -> Self {
+        self.slot_secs = (at.seconds_after_midnight() + 86_400 - 3600) % 86_400;
+        self
+    }
+
+    #[must_use]
+    pub fn max_purges(&self) -> u32 {
+        self.max_purges
+    }
+
+    /// Step 2: DID → reason bits under the active policy, the windows read
+    /// against `t0`.
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn compute(&self) -> Result<BTreeMap<String, i16>, sqlx::Error> {
+    pub async fn compute(&self, t0: DateTime<Utc>) -> Result<BTreeMap<String, i16>, sqlx::Error> {
         let policy = self.scope.policy();
+        let windows = self.scope.windows();
         let mut out: BTreeMap<String, i16> = BTreeMap::new();
         let members: Vec<String> = sqlx::query_scalar("SELECT did FROM members").fetch_all(&self.pool).await?;
         for m in members {
@@ -102,52 +205,114 @@ impl Rebuild {
                 *out.entry(d).or_insert(0) |= REASON_FOLLOWED;
             }
         }
-        if grows_on_interaction(policy) {
+        let likes_on = windows.like_repost_days > 0;
+        let replies_on = windows.reply_quote_days > 0;
+        if grows_on_interaction(policy) && (likes_on || replies_on) {
             // Members' replies and quotes come from their post references,
             // which exist in every public-indexing mode (public-indexing
-            // design §4.1); `posts` holds none while it is off.
+            // design §4.1); `posts` holds none while it is off. Only fresh
+            // interactions hold (scope-recency design §3.3).
+            let like_cutoff = t0 - TimeDelta::days(i64::from(windows.like_repost_days));
+            let reply_cutoff = t0 - TimeDelta::days(i64::from(windows.reply_quote_days));
             let interacted: Vec<String> = sqlx::query_scalar(
                 "SELECT DISTINCT d FROM ( \
                    SELECT split_part(l.subject_uri, '/', 3) AS d FROM likes l JOIN members m ON m.did = l.author_did \
-                     WHERE l.subject_uri LIKE 'at://%' \
+                     WHERE $1 AND l.created_at >= $2 AND l.subject_uri LIKE 'at://%' \
                    UNION ALL SELECT split_part(r.subject_uri, '/', 3) FROM reposts r JOIN members m ON m.did = r.author_did \
-                     WHERE r.subject_uri LIKE 'at://%' \
-                   UNION ALL SELECT p.reply_parent_did FROM member_post_refs p JOIN members m ON m.did = p.author_did \
-                   UNION ALL SELECT p.reply_root_did FROM member_post_refs p JOIN members m ON m.did = p.author_did \
-                   UNION ALL SELECT p.quote_did FROM member_post_refs p JOIN members m ON m.did = p.author_did \
+                     WHERE $1 AND r.created_at >= $2 AND r.subject_uri LIKE 'at://%' \
+                   UNION ALL SELECT x FROM member_post_refs p JOIN members m ON m.did = p.author_did, \
+                     LATERAL unnest(ARRAY[p.reply_parent_did, p.reply_root_did, p.quote_did]) x \
+                     WHERE $3 AND p.created_at >= $4 \
                  ) t WHERE d IS NOT NULL",
             )
+            .bind(likes_on)
+            .bind(like_cutoff)
+            .bind(replies_on)
+            .bind(reply_cutoff)
             .fetch_all(&self.pool)
             .await?;
             for d in interacted.into_iter().filter(|d| d.starts_with("did:")) {
                 *out.entry(d).or_insert(0) |= REASON_INTERACTED;
             }
         }
+        if holds_on_subscription(policy) {
+            // A member's active activity subscription holds a subject already
+            // in S, and never adds one (scope-recency design §3.6).
+            let subscribed: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT a.subject_did FROM activity_subscriptions a \
+                   JOIN members m ON m.did = a.subscriber_did \
+                  WHERE EXISTS (SELECT 1 FROM follows f WHERE f.author_did = a.subscriber_did AND f.subject_did = a.subject_did) \
+                    AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = a.subject_did)",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            for d in subscribed {
+                *out.entry(d).or_insert(0) |= REASON_SUBSCRIBED;
+            }
+        }
         Ok(out)
     }
 
-    /// Run a rebuild. `dry_run` computes and counts without writing.
+    /// Run one sweep (scope-recency design §3.3). A dry run computes and
+    /// counts without writing, clearing nothing; a real run waits for any
+    /// sweep already running.
     ///
     /// # Errors
     ///
     /// Database errors; purges already finished stay finished.
-    pub async fn run(&self, dry_run: bool) -> Result<RebuildReport, sqlx::Error> {
-        let started: DateTime<Utc> = sqlx::query_scalar("SELECT now()").fetch_one(&self.pool).await?;
-        let justified = self.compute().await?;
-        let mut report = RebuildReport {
+    pub async fn sweep(&self, dry_run: bool) -> Result<SweepReport, sqlx::Error> {
+        if dry_run {
+            return self.sweep_once(true).await;
+        }
+        let _one_at_a_time = self.run_lock.lock().await;
+        let result = self.sweep_once(false).await;
+        let outcome = if result.is_ok() { "ok" } else { "failed" };
+        metrics::counter!(METRIC_SWEEP_RUNS, "outcome" => outcome).increment(1);
+        if let Err(error) = &result {
+            tracing::warn!(event = "scope_sweep_failed", %error, "scope sweep failed");
+        }
+        result
+    }
+
+    async fn sweep_once(&self, dry_run: bool) -> Result<SweepReport, sqlx::Error> {
+        let started = std::time::Instant::now();
+        // Step 1. Every member write that named a hold before the clear
+        // committed before the guard was granted, so step 2 sees it.
+        let t0: DateTime<Utc> = if dry_run {
+            sqlx::query_scalar("SELECT now()").fetch_one(&self.pool).await?
+        } else {
+            let guard = self.scope.write_guard().await;
+            self.scope.clear_touched();
+            let t0 = sqlx::query_scalar("SELECT now()").fetch_one(&self.pool).await;
+            drop(guard);
+            t0?
+        };
+        let justified = self.compute(t0).await?;
+        let cutoff = t0 - TimeDelta::days(i64::from(self.grace_days));
+        let mut report = SweepReport {
             justified: justified.len(),
-            ..RebuildReport::default()
+            ..SweepReport::default()
         };
         if dry_run {
-            let current: Vec<String> = sqlx::query_scalar("SELECT did FROM scope_dids").fetch_all(&self.pool).await?;
-            report.added = justified.keys().filter(|d| !current.contains(d)).count();
-            report.purged = self.expired(started).await?.len();
+            let current: HashSet<String> = sqlx::query_scalar("SELECT did FROM scope_dids").fetch_all(&self.pool).await?.into_iter().collect();
+            report.added = justified.iter().filter(|(d, bits)| **bits != REASON_SUBSCRIBED && !current.contains(*d)).count();
+            self.count_candidates(&mut report, &self.candidates(cutoff, &justified).await?);
             return Ok(report);
         }
 
-        // Step 2, in batches under shared DID locks.
-        let entries: Vec<(String, i16)> = justified.into_iter().collect();
-        for chunk in entries.chunks(UPSERT_BATCH) {
+        // Step 3, in batches under shared DID locks. A DID under an
+        // `account_deleted` purge is left out, so a member's follow of a
+        // deleted account does not put it back while its purge runs.
+        let deleting: HashSet<String> = {
+            let sets = self.scope.read_guard().await;
+            sets.purging.iter().filter(|(_, k)| **k == PurgeKind::AccountDeleted).map(|(d, _)| d.clone()).collect()
+        };
+        let (holds_only, upserts): (Vec<Held>, Vec<Held>) = justified
+            .iter()
+            .filter(|(d, _)| !deleting.contains(*d))
+            .map(|(d, bits)| (d.clone(), *bits))
+            .partition(|(_, bits)| *bits == REASON_SUBSCRIBED);
+        for chunk in upserts.chunks(UPSERT_BATCH) {
             let added = self.upsert_batch(chunk).await?;
             report.added += added.len();
             if !added.is_empty() {
@@ -157,26 +322,94 @@ impl Rebuild {
                 }
             }
         }
-
-        // Step 3: each expired DID is purged independently.
-        for did in self.expired(started).await? {
-            match self.purger.purge_waiting(&did, PurgeKind::OutOfScope).await {
-                Ok(()) => report.purged += 1,
-                Err(error) => tracing::warn!(event = "scope_purge_failed", did, %error, "out-of-scope purge failed"),
-            }
+        for chunk in holds_only.chunks(UPSERT_BATCH) {
+            self.refresh_batch(chunk).await?;
         }
 
-        // Step 4 and 5.
-        self.repair_counts().await?;
+        // Step 4: half-done purges first, then the candidates, each
+        // independently.
+        let mut purges: u32 = 0;
+        let stuck: Vec<String> = sqlx::query_scalar("SELECT did FROM purging_dids WHERE kind = 'out_of_scope' ORDER BY started_at, did")
+            .fetch_all(&self.pool)
+            .await?;
+        for did in stuck {
+            if purges >= self.max_purges {
+                report.skip("capped");
+                continue;
+            }
+            if purges > 0 {
+                tokio::time::sleep(PURGE_PAUSE).await;
+            }
+            purges += 1;
+            match self.purger.purge(&did, PurgeKind::OutOfScope).await {
+                Ok(()) => report.purged += 1,
+                Err(PurgeError::Busy(_)) => report.skip("busy"),
+                Err(error) => tracing::warn!(event = "scope_purge_failed", did, %error, "finishing an out-of-scope purge failed"),
+            }
+        }
+        let candidates = self.candidates(cutoff, &justified).await?;
+        self.count_candidates(&mut report, &candidates);
+        #[cfg(test)]
+        crate::test_support::hooks::pause_in(crate::test_support::hooks::SWEEP_AFTER_COMPUTE, &self.pool, "sweep").await;
+        let guard = MarkerGuard::Unjustified { cutoff };
+        for (did, _) in candidates {
+            if purges >= self.max_purges {
+                report.skip("capped");
+                continue;
+            }
+            if purges > 0 {
+                tokio::time::sleep(PURGE_PAUSE).await;
+            }
+            match self.purger.purge_guarded(&did, PurgeKind::OutOfScope, &guard).await {
+                Ok(MarkerOutcome::Marked) => {
+                    purges += 1;
+                    report.purged += 1;
+                }
+                Ok(MarkerOutcome::Held(reason)) => report.skip(reason),
+                Ok(MarkerOutcome::Skipped) => report.skip("refreshed"),
+                // An earlier sweep's purge that failed after its marker: the
+                // DID already left S there, so it is finished unguarded.
+                Err(PurgeError::Busy("out_of_scope")) => {
+                    purges += 1;
+                    match self.purger.purge(&did, PurgeKind::OutOfScope).await {
+                        Ok(()) => report.purged += 1,
+                        Err(error) => tracing::warn!(event = "scope_purge_failed", did, %error, "finishing an out-of-scope purge failed"),
+                    }
+                }
+                // Another kind of purge: never waited for; the next sweep
+                // sees the DID again.
+                Err(PurgeError::Busy(_)) => report.skip("busy"),
+                Err(error) => {
+                    purges += 1;
+                    tracing::warn!(event = "scope_purge_failed", did, %error, "out-of-scope purge failed");
+                }
+            }
+        }
+        if report.purged > 0 {
+            metrics::counter!(METRIC_SWEEP_PURGED).increment(u64::try_from(report.purged).unwrap_or(u64::MAX));
+        }
+
+        // Step 5, and the gauges.
         self.reload_follow_counts().await?;
+        self.set_gauges(&justified).await?;
         tracing::info!(
-            event = "scope_rebuild",
+            event = "scope_sweep",
             justified = report.justified,
             added = report.added,
+            candidates = report.candidates,
             purged = report.purged,
-            "scope rebuild finished"
+            skipped = ?report.skipped,
+            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "scope sweep finished"
         );
         Ok(report)
+    }
+
+    fn count_candidates(&self, report: &mut SweepReport, candidates: &[(String, i16)]) {
+        report.candidates = candidates.len();
+        for (_, bits) in candidates {
+            *report.would_purge_by_reasons.entry(*bits).or_insert(0) += 1;
+        }
     }
 
     async fn upsert_batch(&self, chunk: &[(String, i16)]) -> Result<Vec<String>, sqlx::Error> {
@@ -204,16 +437,61 @@ impl Rebuild {
         Ok(added)
     }
 
-    /// DIDs not justified since `started` minus the grace, members excluded.
-    async fn expired(&self, started: DateTime<Utc>) -> Result<Vec<String>, sqlx::Error> {
-        let cutoff = started - TimeDelta::days(i64::from(self.grace_days));
-        sqlx::query_scalar(
-            "SELECT s.did FROM scope_dids s WHERE s.justified_at < $1 \
+    /// DIDs held only by a subscription: their existing rows are refreshed;
+    /// a row that is gone stays gone (scope-recency design §3.6).
+    async fn refresh_batch(&self, chunk: &[(String, i16)]) -> Result<(), sqlx::Error> {
+        let dids: Vec<String> = chunk.iter().map(|(d, _)| d.clone()).collect();
+        let guard = self.scope.read_guard().await;
+        let mut tx = self.pool.begin().await?;
+        lock_dids_shared(&mut tx, &dids).await?;
+        sqlx::query("UPDATE scope_dids SET reasons = $2, justified_at = now() WHERE did = ANY($1)")
+            .bind(&dids)
+            .bind(REASON_SUBSCRIBED)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        drop(guard);
+        Ok(())
+    }
+
+    /// Rows not justified since `cutoff` and not in `justified`, members
+    /// excluded, with the reason bits they last had, in DID order.
+    async fn candidates(&self, cutoff: DateTime<Utc>, justified: &BTreeMap<String, i16>) -> Result<Vec<(String, i16)>, sqlx::Error> {
+        let rows: Vec<(String, i16)> = sqlx::query_as(
+            "SELECT s.did, s.reasons FROM scope_dids s WHERE s.justified_at < $1 \
              AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = s.did) ORDER BY s.did",
         )
         .bind(cutoff)
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        Ok(rows.into_iter().filter(|(d, _)| !justified.contains_key(d)).collect())
+    }
+
+    /// `scope_dids_by_hold`: each row by its first hold, and `none` for the
+    /// rows only the grace or the cap keeps.
+    async fn set_gauges(&self, justified: &BTreeMap<String, i16>) -> Result<(), sqlx::Error> {
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scope_dids").fetch_one(&self.pool).await?;
+        let mut by_hold: BTreeMap<&'static str, i64> = BTreeMap::new();
+        for bits in justified.values() {
+            let hold = [
+                (REASON_MEMBER, "member"),
+                (REASON_FOLLOWED, "follow"),
+                (REASON_INTERACTED, "interaction"),
+                (REASON_SUBSCRIBED, "subscription"),
+            ]
+            .into_iter()
+            .find(|(bit, _)| bits & bit != 0)
+            .map_or("none", |(_, name)| name);
+            *by_hold.entry(hold).or_insert(0) += 1;
+        }
+        let held: i64 = by_hold.values().sum();
+        for hold in ["member", "follow", "interaction", "subscription"] {
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!(METRIC_SCOPE_BY_HOLD, "hold" => hold).set(by_hold.get(hold).copied().unwrap_or(0) as f64);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!(METRIC_SCOPE_BY_HOLD, "hold" => "none").set((rows - held).max(0) as f64);
+        Ok(())
     }
 
     /// §9.5 repair; see [`repair_counts`].
@@ -268,8 +546,55 @@ impl Rebuild {
         .rows_affected())
     }
 
-    /// Hourly check; runs the rebuild and stale re-syncs when the last
-    /// scheduled run is a week old (persisted, so restarts do not postpone it).
+    /// Every 5 minutes; runs the sweep when it is due (persisted, so a
+    /// restart neither skips nor repeats a day). A failed run is tried
+    /// again an hour later.
+    #[must_use]
+    pub fn spawn_daily(self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SWEEP_CHECK);
+            let mut retry_at: Option<DateTime<Utc>> = None;
+            loop {
+                tick.tick().await;
+                if retry_at.is_some_and(|at| Utc::now() < at) {
+                    continue;
+                }
+                match self.sweep_is_due().await {
+                    Ok(true) => match self.sweep(false).await {
+                        Ok(_) => {
+                            retry_at = None;
+                            if let Err(error) = self.mark_ran(KEY_LAST_SWEEP).await {
+                                tracing::warn!(event = "scope_sweep_mark_failed", %error, "recording the sweep time failed");
+                            }
+                        }
+                        Err(_) => retry_at = Some(Utc::now() + SWEEP_RETRY),
+                    },
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(event = "scope_sweep_schedule_failed", %error, "schedule check failed"),
+                }
+            }
+        })
+    }
+
+    /// Whether the scheduled sweep is due. With no record (a fresh install
+    /// or the first start of this version) it records now instead, so the
+    /// first sweep runs at least 23 hours later (scope-recency design §3.3).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn sweep_is_due(&self) -> Result<bool, sqlx::Error> {
+        match self.last_ran(KEY_LAST_SWEEP).await? {
+            Some(last) => Ok(sweep_due(last, Utc::now(), self.slot_secs)),
+            None => {
+                self.mark_ran(KEY_LAST_SWEEP).await?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Hourly check; runs the counts repair and stale re-syncs when the last
+    /// weekly run is a week old (persisted, so restarts do not postpone it).
     #[must_use]
     pub fn spawn_weekly(self) -> JoinHandle<()> {
         tokio::spawn(async move {
@@ -278,18 +603,22 @@ impl Rebuild {
                 tick.tick().await;
                 match self.due().await {
                     Ok(true) => {
-                        match self.run(false).await {
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::warn!(event = "scope_rebuild_failed", %error, "weekly scope rebuild failed");
-                                continue;
+                        if let Err(error) = self.repair_counts().await {
+                            tracing::warn!(event = "scope_rebuild_failed", %error, "weekly counts repair failed");
+                            continue;
+                        }
+                        let resyncs = match self.enqueue_stale_resyncs().await {
+                            Ok(n) => {
+                                tracing::info!(event = "weekly_resync_enqueued", jobs = n, "stale re-syncs enqueued");
+                                n
                             }
-                        }
-                        match self.enqueue_stale_resyncs().await {
-                            Ok(n) => tracing::info!(event = "weekly_resync_enqueued", jobs = n, "stale re-syncs enqueued"),
-                            Err(error) => tracing::warn!(event = "weekly_resync_failed", %error, "enqueueing re-syncs failed"),
-                        }
-                        if let Err(error) = self.mark_ran().await {
+                            Err(error) => {
+                                tracing::warn!(event = "weekly_resync_failed", %error, "enqueueing re-syncs failed");
+                                0
+                            }
+                        };
+                        tracing::info!(event = "scope_rebuild", resync_enqueued = resyncs, "weekly counts repair and re-syncs finished");
+                        if let Err(error) = self.mark_ran(KEY_LAST_REBUILD).await {
                             tracing::warn!(event = "scope_rebuild_mark_failed", %error, "recording the rebuild time failed");
                         }
                     }
@@ -301,28 +630,30 @@ impl Rebuild {
     }
 
     async fn due(&self) -> Result<bool, sqlx::Error> {
-        let last: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT (value #>> '{}')::timestamptz FROM worker_state WHERE key = $1")
-                .bind(KEY_LAST_REBUILD)
-                .fetch_optional(&self.pool)
-                .await?;
-        match last {
+        match self.last_ran(KEY_LAST_REBUILD).await? {
             Some(t) => Ok(Utc::now() - t >= WEEK),
             None => {
-                // First start: schedule a week from now instead of rebuilding
+                // First start: schedule a week from now instead of running
                 // immediately.
-                self.mark_ran().await?;
+                self.mark_ran(KEY_LAST_REBUILD).await?;
                 Ok(false)
             }
         }
     }
 
-    async fn mark_ran(&self) -> Result<(), sqlx::Error> {
+    async fn last_ran(&self, key: &str) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        sqlx::query_scalar("SELECT (value #>> '{}')::timestamptz FROM worker_state WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    async fn mark_ran(&self, key: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO worker_state (key, value, updated_at) VALUES ($1, to_jsonb(now()::text), now()) \
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
         )
-        .bind(KEY_LAST_REBUILD)
+        .bind(key)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -370,11 +701,12 @@ pub async fn repair_counts(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 #[cfg(test)]
+#[path = "sweep_tests.rs"]
+mod sweep_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregations::ScopeSets;
-    use crate::config::ScopePolicy;
-    use crate::private_tier::DisabledPrivateTier;
     use crate::test_support::fresh_db;
 
     const MEMBER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -386,132 +718,30 @@ mod tests {
         sqlx::query(sql).execute(pool).await.expect(sql);
     }
 
+    /// The weekly run keeps the §9.5 repair and the stale re-syncs.
     #[tokio::test]
-    async fn rebuild_justifies_adds_purges_and_repairs() {
-        let Some(db) = fresh_db("scope_rebuild").await else {
+    async fn the_weekly_run_repairs_counts_and_enqueues_resyncs() {
+        let Some(db) = fresh_db("scope_weekly").await else {
             return;
         };
         let p = &db.pool;
-        exec(p, "INSERT INTO members (did, source) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin')").await;
-        exec(p, "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.follow/1', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', \
-                  'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '3k', now())").await;
         exec(p, "INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES \
                  ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.like/1', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', \
                   'at://did:plc:cccccccccccccccccccccccc/app.bsky.feed.post/1', '3k', now())").await;
-        // STALE was justified long ago and nothing justifies it now.
-        exec(p, "INSERT INTO scope_dids (did, reasons, justified_at) VALUES \
-                 ('did:plc:dddddddddddddddddddddddd', 2, now() - interval '30 days')").await;
-        // A corrupted count to be repaired.
         exec(p, "UPDATE post_counts SET like_count = 99").await;
-
-        let mut sets = ScopeSets::default();
-        sets.members.insert(MEMBER.into());
-        sets.scope.insert(MEMBER.into());
-        sets.scope.insert(STALE.into());
-        let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10);
-        let rebuild = Rebuild::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier), 7);
-
-        let computed = rebuild.compute().await.expect("compute");
-        assert_eq!(computed.get(MEMBER), Some(&REASON_MEMBER));
-        assert_eq!(computed.get(FOLLOWED), Some(&REASON_FOLLOWED));
-        assert_eq!(computed.get(LIKED), Some(&REASON_INTERACTED));
-        assert_eq!(computed.len(), 3);
-
-        let dry = rebuild.run(true).await.expect("dry run");
-        assert_eq!((dry.added, dry.purged), (3, 1));
-        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM scope_dids").fetch_one(p).await.expect("count");
-        assert_eq!(rows, 1, "a dry run writes nothing");
-
-        let report = rebuild.run(false).await.expect("rebuild");
-        assert_eq!((report.added, report.purged), (3, 1));
-        let dids: Vec<String> = sqlx::query_scalar("SELECT did FROM scope_dids ORDER BY did")
-            .fetch_all(p)
-            .await
-            .expect("dids");
-        assert_eq!(dids, [MEMBER, FOLLOWED, LIKED]);
-        let snap = scope.snapshot().await;
-        assert!(snap.in_scope(FOLLOWED) && snap.in_scope(LIKED) && !snap.in_scope(STALE));
-        assert_eq!(snap.member_follows.get(MEMBER), Some(&1));
-        let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM backfill_jobs WHERE depth = 'scope'")
-            .fetch_one(p)
-            .await
-            .expect("jobs");
-        assert_eq!(jobs, 3);
+        for d in [MEMBER, FOLLOWED, LIKED] {
+            exec(p, &format!("INSERT INTO scope_dids (did, reasons) VALUES ('{d}', 1)")).await;
+        }
+        let scope = ScopeState::new(crate::aggregations::ScopeSets::default(), crate::config::ScopePolicy::MembersAndOneHop, 10);
+        let rebuild = Rebuild::new(p.clone(), scope, Arc::new(crate::private_tier::DisabledPrivateTier), 0);
+        rebuild.repair_counts().await.expect("repair");
         let likes: i32 = sqlx::query_scalar("SELECT like_count FROM post_counts WHERE post_uri = $1")
             .bind(format!("at://{LIKED}/app.bsky.feed.post/1"))
             .fetch_one(p)
             .await
             .expect("post_counts");
         assert_eq!(likes, 1);
-
-        // Nobody has been re-synced: every in-scope DID gets a resync job.
-        exec(p, "UPDATE backfill_jobs SET state = 'done', updated_at = now() - interval '8 days'").await;
         assert_eq!(rebuild.enqueue_stale_resyncs().await.expect("resync"), 3);
-        db.drop_db().await;
-    }
-
-    /// T-17 (public-indexing design §4.1): under the off rule a member's
-    /// reply, written grow-only, puts its subject in S, and the rebuild
-    /// keeps it there past the grace period from the reference alone.
-    #[tokio::test]
-    async fn a_reply_justifies_its_subject_from_the_reference() {
-        use serde_json::json;
-
-        use crate::firehose::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer};
-        use crate::indexing::{PublicMode, PublicState};
-
-        let Some(db) = fresh_db("scope_rebuild_refs").await else {
-            return;
-        };
-        let p = &db.pool;
-        exec(p, "INSERT INTO members (did, source) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin')").await;
-        let mut sets = ScopeSets::default();
-        sets.members.insert(MEMBER.into());
-        sets.scope.insert(MEMBER.into());
-        let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10);
-        {
-            let mut s = scope.write_guard().await;
-            scope.set_public(&mut s, PublicState { mode: PublicMode::Off, generation: 1, last_fill_since: None });
-        }
-        let writer = Writer::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier));
-        let parent = format!("at://{LIKED}/app.bsky.feed.post/1");
-        let quoted = format!("at://{FOLLOWED}/app.bsky.feed.post/1");
-        let reply = RawOp {
-            action: Action::Create,
-            collection: "app.bsky.feed.post".into(),
-            rkey: "3kreply".into(),
-            cid: Some("bafyreply".into()),
-            record: Some(json!({"text": "hi", "reply": {"root": {"uri": parent, "cid": "c"}, "parent": {"uri": parent, "cid": "c"}},
-                                "embed": {"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "c"}}})),
-        };
-        let options = ApplyOptions {
-            advance_applied_rev: false,
-            dead_letter_readiness: false,
-            attempts: 1,
-            live: true,
-            subscription_rules: true,
-            source: WriteSource::Firehose,
-        };
-        let report = writer.apply(MEMBER, "3kaaaaaaaaaaa", &[reply], options).await.expect("apply");
-        assert_eq!(report.outcomes, [OpOutcome::GrowOnly]);
-        let posts: i64 = sqlx::query_scalar("SELECT count(*) FROM posts").fetch_one(p).await.expect("count");
-        assert_eq!(posts, 0);
-        assert!(scope.snapshot().await.in_scope(LIKED));
-
-        // Long past the grace period, only the reference justifies them.
-        exec(p, "UPDATE scope_dids SET justified_at = now() - interval '30 days'").await;
-        let rebuild = Rebuild::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier), 7);
-        let computed = rebuild.compute().await.expect("compute");
-        assert_eq!(computed.get(LIKED), Some(&REASON_INTERACTED));
-        assert_eq!(computed.get(FOLLOWED), Some(&REASON_INTERACTED));
-        let report = rebuild.run(false).await.expect("rebuild");
-        assert_eq!(report.purged, 0);
-        let snap = scope.snapshot().await;
-        assert!(snap.in_scope(LIKED) && snap.in_scope(FOLLOWED));
-        // The mode survives a reload of the sets.
-        scope.reload(p, &DisabledPrivateTier).await.expect("reload");
-        assert_eq!(scope.snapshot().await.public.mode, PublicMode::Off);
         db.drop_db().await;
     }
 

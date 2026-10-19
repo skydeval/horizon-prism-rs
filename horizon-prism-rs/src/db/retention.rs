@@ -703,7 +703,7 @@ impl RetentionTask for PublicRetention {
 /// (design-v3 §5.6 "Subjects that leave S"): such a subscription can never
 /// notify, so it is removed, not shown as active. In batches, until none is
 /// left.
-async fn sweep_subscriptions(pool: &PgPool) -> Result<u64, sqlx::Error> {
+pub(crate) async fn sweep_subscriptions(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut total = 0;
     loop {
         let n = sqlx::query(

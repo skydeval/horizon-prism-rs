@@ -602,7 +602,7 @@ impl Handlers {
                 self.finish_member_removed(did);
                 true
             }
-            Ok(MarkerOutcome::Skipped) => false,
+            Ok(MarkerOutcome::Skipped | MarkerOutcome::Held(_)) => false,
             Err(PurgeError::Busy(_)) => return Ok(Outcome::Defer),
             Err(e) => return Err(e.to_string()),
         };
@@ -663,22 +663,32 @@ impl Handlers {
         Ok(Outcome::Done(json!({ "subject": subject, "val": val, "removed": n > 0 })))
     }
 
-    /// `scope rebuild`: a dry run computes counts inline (read-only); a real
-    /// rebuild is scheduled as its own task and the command is done at once.
+    /// `scope rebuild` (scope-recency design §3.3): a dry run computes the
+    /// next sweep's counts inline (read-only); a real one runs one sweep,
+    /// after any sweep already running and with the same cap and pacing,
+    /// then the counts repair, as its own task, and the command is done at
+    /// once.
     async fn scope_rebuild(&self, dry_run: bool) -> Result<Outcome, String> {
         if dry_run {
-            let r = self.rebuild.run(true).await.map_err(|e| e.to_string())?;
+            let r = self.rebuild.sweep(true).await.map_err(|e| e.to_string())?;
+            let by_reasons: serde_json::Map<String, serde_json::Value> =
+                r.would_purge_by_reasons.iter().map(|(bits, n)| (bits.to_string(), json!(n))).collect();
             return Ok(Outcome::Done(json!({
-                "dry_run": true, "justified": r.justified, "would_add": r.added, "would_purge": r.purged
+                "dry_run": true, "justified": r.justified, "would_add": r.added, "would_purge": r.candidates,
+                "would_purge_by_reasons": by_reasons, "sweeps": r.sweeps_needed(self.rebuild.max_purges()),
             })));
         }
         let rebuild = self.rebuild.clone();
         tokio::spawn(async move {
-            if let Err(error) = rebuild.run(false).await {
-                tracing::error!(event = "scope_rebuild_failed", %error, "admin scope rebuild failed");
+            if let Err(error) = rebuild.sweep(false).await {
+                tracing::error!(event = "scope_sweep_failed", %error, "admin scope rebuild failed");
+                return;
+            }
+            if let Err(error) = rebuild.repair_counts().await {
+                tracing::error!(event = "scope_rebuild_failed", %error, "admin scope rebuild: counts repair failed");
             }
         });
-        Ok(Outcome::Done(json!({ "dry_run": false, "scheduled": "scope_rebuild" })))
+        Ok(Outcome::Done(json!({ "dry_run": false, "scheduled": "scope_sweep" })))
     }
 
     /// `backfill <did> [--depth]`: enqueue and return the job key. The

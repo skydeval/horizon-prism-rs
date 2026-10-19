@@ -10,6 +10,18 @@ pub const REASON_FOLLOWED: i16 = 2;
 /// `scope_dids.reasons` bit: a member liked, reposted, replied to or quoted it.
 pub const REASON_INTERACTED: i16 = 4;
 
+/// `scope_dids.reasons` bit: a member's active activity subscription holds
+/// it (scope-recency design §3.6). Never a reason to add a DID.
+pub const REASON_SUBSCRIBED: i16 = 8;
+
+/// Whether a member's active activity subscription holds its subject in S
+/// under `policy`: every policy but `members_only` (scope-recency design
+/// §3.6). A subscription never adds its subject.
+#[must_use]
+pub fn holds_on_subscription(policy: ScopePolicy) -> bool {
+    policy != ScopePolicy::MembersOnly
+}
+
 /// Whether a member's follow adds its subject to S under `policy`.
 #[must_use]
 pub fn grows_on_follow(policy: ScopePolicy) -> bool {
@@ -46,6 +58,8 @@ mod tests {
         assert!(grows_on_follow(MembersAndFollows) && !grows_on_interaction(MembersAndFollows));
         assert!(!grows_on_follow(MembersAndInteractions) && grows_on_interaction(MembersAndInteractions));
         assert!(grows_on_follow(MembersAndOneHop) && grows_on_interaction(MembersAndOneHop));
+        assert!(!holds_on_subscription(MembersOnly));
+        assert!([MembersAndFollows, MembersAndInteractions, MembersAndOneHop].into_iter().all(holds_on_subscription));
     }
 
     #[test]

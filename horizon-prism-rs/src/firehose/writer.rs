@@ -917,6 +917,13 @@ impl Writer {
         if options.advance_applied_rev && sets.is_tracked(repo) {
             advance_applied_rev(&mut tx, repo, rev, true).await?;
         }
+        // Scope recency §3.2: the holds this commit names, recorded under
+        // the read guard and before the commit, so a sweep that clears the
+        // set under the write guard either sees the commit's rows or the
+        // record. A failed op leaves an entry that only keeps a DID a day.
+        for plan in &plans {
+            self.scope.touch(&plan.holds);
+        }
         tx.commit().await?;
         drop(guard);
         self.commit_effects(effects).await;

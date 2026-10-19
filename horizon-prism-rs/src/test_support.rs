@@ -257,6 +257,15 @@ pub mod hooks {
     /// reconciles. Key: `<database>/<did>`.
     pub const CATCH_UP_FAILS_AFTER_RAISE: &str = "i723_catch_up_fails_after_raise";
 
+    /// Scope recency T-R5, T-R6, T-R6b, T-R8, T-R16: the daily sweep, its
+    /// holds computed and written and its candidates chosen, before the
+    /// first candidate's marker. Key: `<database>/sweep` ([`pause_in`]).
+    pub const SWEEP_AFTER_COMPUTE: &str = "sr_sweep_after_compute";
+    /// Scope recency T-R16: `putActivitySubscription`, holding the scope
+    /// read guard after its second scope check, before its upsert. Key: the
+    /// subject.
+    pub const SUBSCRIBE_HOLDS_GUARD: &str = "sr_subscribe_holds_guard";
+
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);
 

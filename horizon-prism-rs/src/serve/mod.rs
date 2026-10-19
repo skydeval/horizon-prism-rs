@@ -578,7 +578,17 @@ pub async fn run() -> Result<(), StartupError> {
     );
     tasks.push(CountRefresher::new(pool.clone(), redis.clone(), constellation.clone(), &cfg.file.counts).spawn());
     let rebuild = Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days)
-        .with_sync_min_interval_secs(lists.sync_min_interval_secs);
+        .with_sync_min_interval_secs(lists.sync_min_interval_secs)
+        .with_max_purges(cfg.file.scope.sweep_max_purges)
+        .with_retention_at(cfg.file.retention.run_at_utc);
+    if cfg.file.scope.rebuild_grace_days > 1 {
+        tracing::warn!(
+            event = "scope_grace_slows_unfollow",
+            grace_days = cfg.file.scope.rebuild_grace_days,
+            "scope.rebuild_grace_days above 1: an unfollow takes up to grace + 1 days to apply (scope-recency design §5)"
+        );
+    }
+    tasks.push(rebuild.clone().spawn_daily());
     tasks.push(rebuild.clone().spawn_weekly());
 
     // Repo-head prober (§6.11.3); the private pipeline shares it. Under the

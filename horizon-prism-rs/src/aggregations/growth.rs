@@ -25,6 +25,9 @@ use crate::config::{ScopePolicy, ScopeWindows};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrowthPlan {
     pub subjects: Vec<(String, i16)>,
+    /// Every DID the record names as a hold, in S or not: what the writer
+    /// records in the touched set (scope-recency design §3.2).
+    pub holds: Vec<String>,
 }
 
 impl GrowthPlan {
@@ -85,13 +88,12 @@ pub fn plan(
     if input.kind.is_private() || !sets.is_member(&input.author) {
         return GrowthPlan::default();
     }
-    let reason = match input.kind {
+    let (reason, grows) = match input.kind {
+        // A follow past the cap grows nothing, but is still a hold the
+        // sweep's marker must see (scope-recency design §3.2).
         RecordKind::Follow if grows_on_follow(policy) => {
             let follows = sets.member_follows.get(&input.author).copied().unwrap_or(0);
-            if follows >= max_follow_scope_per_member {
-                return GrowthPlan::default();
-            }
-            REASON_FOLLOWED
+            (REASON_FOLLOWED, follows < max_follow_scope_per_member)
         }
         RecordKind::Like | RecordKind::Repost | RecordKind::Post if grows_on_interaction(policy) => {
             if input.subjects.is_empty() {
@@ -102,17 +104,21 @@ pub fn plan(
                 metrics::counter!(METRIC_GROWTH_STALE, "kind" => label).increment(1);
                 return GrowthPlan::default();
             }
-            REASON_INTERACTED
+            (REASON_INTERACTED, true)
         }
         _ => return GrowthPlan::default(),
     };
-    let mut subjects: Vec<(String, i16)> = Vec::new();
+    let mut plan = GrowthPlan::default();
     for s in &input.subjects {
-        if s.starts_with("did:") && !sets.in_scope(s) && !subjects.iter().any(|(d, _)| d == s) {
-            subjects.push((s.clone(), reason));
+        if !s.starts_with("did:") || plan.holds.contains(s) {
+            continue;
+        }
+        plan.holds.push(s.clone());
+        if grows && !sets.in_scope(s) {
+            plan.subjects.push((s.clone(), reason));
         }
     }
-    GrowthPlan { subjects }
+    plan
 }
 
 /// Interactions too old to grow S, by kind (scope-recency design §7).
@@ -266,6 +272,22 @@ mod tests {
             let label = format!("kind=\"{kind}\"");
             assert_eq!(crate::test_support::series(&text, METRIC_GROWTH_STALE, &[&label]), Some(n), "{kind}:\n{text}");
         }
+    }
+
+    /// Scope recency §3.2: the holds a write names, in S or not, capped
+    /// follows included; a stale interaction names none.
+    #[test]
+    fn holds_name_every_did_subject() {
+        let mut s = sets();
+        let p = ScopePolicy::MembersAndOneHop;
+        let plan_of = |s: &ScopeSets, kind, subjects: &[&str], r: &Recency| plan(&input(MEMBER, kind, subjects), s, p, 10, r);
+        let liked = plan_of(&s, RecordKind::Like, &["did:plc:already", "alice.example"], &fresh());
+        assert_eq!(liked.holds, ["did:plc:already"]);
+        assert!(liked.subjects.is_empty());
+        assert!(plan_of(&s, RecordKind::Like, &["did:plc:new"], &aged(TimeDelta::days(40))).holds.is_empty());
+        s.member_follows.insert(MEMBER.into(), 10);
+        let capped = plan_of(&s, RecordKind::Follow, &["did:plc:new"], &fresh());
+        assert_eq!((capped.holds.as_slice(), capped.is_empty()), (["did:plc:new".to_string()].as_slice(), true));
     }
 
     /// T-R6d: a subject written as a handle never grows S.

@@ -106,6 +106,21 @@ impl Hydrator {
         if !self.may_subscribe(me, subject).await? {
             return Ok(Err(invalid("This account does not allow this subscription")));
         }
+        // An active subscription holds its subject in scope (scope-recency
+        // design §3.6). The scope check and the upsert's commit happen under
+        // one read guard, so the daily sweep's marker, which holds the write
+        // guard, either sees the row or runs first, and then this request
+        // finds the subject gone.
+        let guard = self.scope().read_guard().await;
+        if !guard.in_scope(subject) {
+            drop(guard);
+            metrics::counter!(METRIC_OUT_OF_SCOPE, "action" => "rejected").increment(1);
+            return Ok(Err(invalid(
+                "this account is not indexed by this service's community, so a subscription would never notify",
+            )));
+        }
+        #[cfg(test)]
+        crate::test_support::hooks::pause(crate::test_support::hooks::SUBSCRIBE_HOLDS_GUARD, subject).await;
         sqlx::query(
             "INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply) VALUES ($1, $2, $3, $4) \
              ON CONFLICT (subscriber_did, subject_did) DO UPDATE SET post = EXCLUDED.post, reply = EXCLUDED.reply, updated_at = now()",
@@ -116,6 +131,7 @@ impl Hydrator {
         .bind(reply)
         .execute(self.pool())
         .await?;
+        drop(guard);
         Ok(Ok(Self::emit(json!({"subject": subject, "activitySubscription": {"post": post, "reply": reply}}))))
     }
 
@@ -274,6 +290,55 @@ mod tests {
         h.put_activity_subscription(&unready, OUTSIDE, false, false).await.expect("db").expect("off, outside");
         let l = h.list_activity_subscriptions(&me, &req, 50, None).await.expect("db").expect("view");
         assert_eq!(l.inner()["subscriptions"].as_array().map(Vec::len), Some(1));
+        db.drop_db().await;
+    }
+
+    /// Scope recency T-R16: enabling holds the scope read guard from its
+    /// scope check through the upsert, so a purge marker (write guard) waits
+    /// for the row; and a subject that left S meanwhile is refused.
+    #[tokio::test]
+    async fn enabling_writes_under_the_scope_read_guard() {
+        use crate::test_support::hooks;
+
+        let Some(db) = fresh_db("hydration_subscription_guard").await else {
+            return;
+        };
+        let p = &db.pool;
+        for (d, handle) in [(ME, "me.test"), (BOB, "bob.test")] {
+            actor(p, d, handle, handle).await;
+        }
+        exec(p, &format!(
+            "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
+             ('at://{ME}/app.bsky.graph.follow/1', '{ME}', '{BOB}', '3k', now())"
+        ))
+        .await;
+        let mut sets = ScopeSets::default();
+        sets.scope.insert(ME.into());
+        sets.scope.insert(BOB.into());
+        let h = hydrator(p, sets);
+        let me = Viewer {
+            did: Some(ME.into()),
+            hydrate: true,
+        };
+        let armed = hooks::arm(hooks::SUBSCRIBE_HOLDS_GUARD, BOB);
+        let (h2, me2) = (h.clone(), me.clone());
+        let put = tokio::spawn(async move { h2.put_activity_subscription(&me2, BOB, true, false).await });
+        armed.reached().await;
+        // The writer side of the lock cannot be had while the guard is held.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(200), h.scope().write_guard()).await.is_err());
+        armed.release();
+        put.await.expect("join").expect("db").expect("subscribed");
+        drop(armed);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM activity_subscriptions").fetch_one(p).await.expect("rows");
+        assert_eq!(rows, 1);
+
+        // Once BOB has left S the request is refused before any guarded step.
+        sqlx::query("DELETE FROM activity_subscriptions").execute(p).await.expect("clear");
+        let armed = hooks::arm(hooks::SUBSCRIBE_HOLDS_GUARD, BOB);
+        h.scope().write_guard().await.scope.remove(BOB);
+        let refused = h.put_activity_subscription(&me, BOB, true, false).await.expect("db").expect_err("refused");
+        assert!(refused.message.contains("not indexed"), "{refused:?}");
+        assert_eq!(armed.hits(), 0);
         db.drop_db().await;
     }
 }

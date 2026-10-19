@@ -10,6 +10,62 @@ commit.
 
 ## [Unreleased]
 
+### Changed (scope recency, S2, #741)
+
+Scope recency design S2 (`docs/internal/design/scope-recency.md`): what
+holds an account in scope is checked every night, and accounts nothing
+holds leave. Ships together with S1 (#740).
+
+- **Default change: `scope.rebuild_grace_days` is now 0 (was 7).** An
+  unfollow, an unlike or a lapsed interaction now takes effect at the next
+  nightly check. The shipped `docker/config/app.toml` sets 0. **A
+  deployment whose own `app.toml` sets `rebuild_grace_days = 7` keeps the
+  old slack until it changes it to 0**; above 1, startup logs
+  `scope_grace_slows_unfollow`.
+- **Upgrade note: the first nightly check removes every account nothing
+  holds any more**, most of all accounts held only by an old like, repost,
+  reply or quote. It runs at least 23 hours after the first start of this
+  version; before it, `admin scope rebuild --dry-run` shows its size
+  (`would_purge`, by the reason bits, and how many nights it takes at the
+  cap). Their public rows go at the retention run that follows. Activity
+  subscriptions to such an account whose subscriber no longer follows it
+  (they never notified) are deleted with them.
+- **The nightly scope check** replaces the shrink half of the weekly
+  rebuild. It runs one hour before `retention.run_at_utc` (03:00 UTC by
+  default), checked every 5 minutes; a restart over the slot runs it at
+  the next check, and a failed run is retried an hour later. What holds an
+  account: membership; a member's follow within
+  `scope.max_follow_scope_per_member`; a member's like or repost within
+  `scope.like_repost_days` of its date; a member's reply or quote within
+  `scope.reply_quote_days`; and a member's active activity subscription.
+  An account nothing holds leaves through the `out_of_scope` purge, 100 ms
+  apart, at most `scope.sweep_max_purges` (5000) a night; the rest go on
+  later nights. A half-done `out_of_scope` purge is finished first.
+- **The purge re-checks at the last moment.** Each removal's marker, under
+  the write guard and the account's lock, skips the account if a member's
+  write named it since the check began, it became a member, its row was
+  refreshed, a member's follow inside the cap names it (including one an
+  unfollow just brought under the cap), or a member's subscription holds
+  it. Nothing is written for a skipped account.
+- **Activity subscriptions hold, and never grow, scope** (decided by
+  skydeval). A member's subscription keeps its subject indexed while the
+  member is a member and follows the subject, under every policy but
+  `members_only`. Subscribing to an account outside scope is still
+  refused. `putActivitySubscription` now writes under the scope read
+  guard, so a subscription and a removal of its subject never cross.
+- **One run at a time.** `admin scope rebuild` runs one nightly check
+  (after any running one, with the same cap and pacing) and then the counts
+  repair; its result says `"scheduled": "scope_sweep"`. `--dry-run` also
+  reports `would_purge_by_reasons` and `sweeps`.
+- **Weekly** now does only the counts repair and the stale re-syncs.
+- **Metrics:** `scope_sweep_runs_total{outcome}`,
+  `scope_sweep_purged_total`, `scope_sweep_skipped_total{reason}`
+  (`touched`, `member`, `refreshed`, `followed`, `subscribed`, `busy`,
+  `capped`), and the gauge `scope_dids_by_hold{hold}` (`member`, `follow`,
+  `interaction`, `subscription`, `none`). Events `scope_sweep`,
+  `scope_sweep_failed`; the weekly `scope_rebuild` event now reports the
+  re-syncs only.
+
 ### Changed (scope recency, S1, #740)
 
 Scope recency design S1 (`docs/internal/design/scope-recency.md`): a
