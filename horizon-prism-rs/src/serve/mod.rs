@@ -262,7 +262,14 @@ pub async fn run() -> Result<(), StartupError> {
         cfg.file.scope.max_follow_scope_per_member,
     )
     .await
-    .map_err(|e| StartupError::new(1, format!("loading scope state: {e}")))?;
+    .map_err(|e| StartupError::new(1, format!("loading scope state: {e}")))?
+    .with_windows(cfg.file.scope.windows());
+    if !crate::aggregations::policy::grows_on_interaction(cfg.file.scope.policy) {
+        tracing::info!(
+            event = "scope_windows_unused",
+            "scope.reply_quote_days and scope.like_repost_days are unused under this scope.policy"
+        );
+    }
     // The public-indexing switch (public-indexing design §3.5): its startup
     // sequence runs before the first writer (`purger.resume_all` below) and
     // hands back the one task the state needs, spawned here.

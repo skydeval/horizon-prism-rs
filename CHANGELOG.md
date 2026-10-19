@@ -10,6 +10,37 @@ commit.
 
 ## [Unreleased]
 
+### Changed (scope recency, S1, #740)
+
+Scope recency design S1 (`docs/internal/design/scope-recency.md`): a
+member's old interactions no longer pull accounts into scope.
+
+- **Deploy S1 and S2 together.** S1 stops stale growth on the write path
+  only; until S2 the weekly scope rebuild is unchanged and still adds the
+  subjects of every member interaction, however old.
+- **Growth looks at the record's date.** A member's like or repost adds
+  its subject to S only when its `createdAt` (clamped to the write time
+  plus 5 minutes, as every stored date is) is within
+  `scope.like_repost_days`; a reply or quote adds the accounts it names
+  only within `scope.reply_quote_days`. A stale interaction is stored
+  exactly as before and grows nothing. This holds on every write path, so
+  a new member's backfill adds the subjects of its recent likes, replies
+  and quotes and no older ones. Follows are unchanged. A subject written
+  as a handle instead of a DID never grows S.
+- **New `[scope]` keys** (restart): `reply_quote_days` (default 90,
+  0–3650), `like_repost_days` (default 30, 0–3650); 0 turns that kind off.
+  `sweep_max_purges` (default 5000, 1–1,000,000) is read by S2's nightly
+  check. `rebuild_grace_days` is now range-checked, 0–30: a deployment
+  that sets it above 30 fails to start (exit 78) until it is lowered. The
+  shipped `docker/config/app.toml` lists the three new keys. Under a
+  policy without interactions, startup logs `scope_windows_unused`.
+- **Migration 0033** (`0033_scope_recency`) replaces the index
+  `member_post_refs_author` with `member_post_refs_author_created
+  (author_did, created_at)`; no rows change. Like every migration it needs
+  `APP_ALLOW_STARTUP_MIGRATE=1` for one start.
+- **Metric** `scope_growth_stale_total{kind}` (`like`, `repost`, `reply`,
+  `quote`): interactions too old to grow S.
+
 ### Added (admin UI live feed, #245)
 
 Admin UI live feed (`docs/internal/design/admin-ui-live-feed.md`): Home

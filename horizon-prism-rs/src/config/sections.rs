@@ -112,13 +112,22 @@ pub enum ScopePolicy {
     MembersAndOneHop,
 }
 
-/// `[scope]` (§9.2, §9.4).
+/// `[scope]` (§9.2, §9.4; scope-recency design §5).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScopeConfig {
     pub policy: ScopePolicy,
+    /// Extra days an account with no hold left stays in S (0–30).
     pub rebuild_grace_days: u32,
     pub max_follow_scope_per_member: u32,
+    /// `R`: days a member's reply or quote holds its subjects (0–3650; 0
+    /// turns replies and quotes off as a hold).
+    pub reply_quote_days: u32,
+    /// `L`: days a member's like or repost holds its subject (0–3650; 0
+    /// turns likes and reposts off as a hold).
+    pub like_repost_days: u32,
+    /// The most accounts one daily sweep removes (1–1,000,000).
+    pub sweep_max_purges: u32,
 }
 
 impl Default for ScopeConfig {
@@ -127,7 +136,35 @@ impl Default for ScopeConfig {
             policy: ScopePolicy::MembersAndOneHop,
             rebuild_grace_days: 7,
             max_follow_scope_per_member: 10_000,
+            reply_quote_days: 90,
+            like_repost_days: 30,
+            sweep_max_purges: 5_000,
         }
+    }
+}
+
+impl ScopeConfig {
+    /// The interaction windows as growth and the sweep read them.
+    #[must_use]
+    pub fn windows(&self) -> ScopeWindows {
+        ScopeWindows {
+            reply_quote_days: self.reply_quote_days,
+            like_repost_days: self.like_repost_days,
+        }
+    }
+}
+
+/// How long each kind of interaction holds its subject (scope-recency
+/// design §3.1). A window of 0 turns that kind off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeWindows {
+    pub reply_quote_days: u32,
+    pub like_repost_days: u32,
+}
+
+impl Default for ScopeWindows {
+    fn default() -> Self {
+        ScopeConfig::default().windows()
     }
 }
 

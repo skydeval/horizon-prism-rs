@@ -2345,6 +2345,43 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// Scope recency T-R2 (§3.1): a member's backfill stores every like, and
+    /// only the likes made within the like window add their subjects to S.
+    #[tokio::test]
+    async fn a_member_backfill_grows_scope_from_recent_likes_only() {
+        let Some(db) = fresh_db("backfill_scope_recency").await else {
+            return;
+        };
+        let p = &db.pool;
+        let old_subject = "did:plc:oooooooooooooooooooooooo";
+        let new_subject = "did:plc:nnnnnnnnnnnnnnnnnnnnnnnn";
+        let like = |rkey: &str, subject: &str, days: i64| {
+            let at = (chrono::Utc::now() - TimeDelta::days(days)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let post = format!("at://{subject}/{NSID_POST}/3kpost");
+            rec(DID, NSID_LIKE, rkey, json!({"subject": {"uri": post, "cid": "bafypost"}, "createdAt": at}))
+        };
+        let mut source = FakeSource {
+            rev: "3kzzzzzzzzzzz".to_string(),
+            ..FakeSource::default()
+        };
+        source.listings.insert(NSID_LIKE.to_string(), vec![like("3kold", old_subject, 200), like("3knew", new_subject, 10)]);
+        let scope = state(true);
+        let writer = Writer::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier));
+        let backfill = Backfill::new(writer, Arc::new(source), BackfillConfig::default(), 5);
+        let mut conn = p.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Resync).await.expect("enqueue");
+        drop(conn);
+        let (_, outcome) = backfill.run_once().await.expect("run").expect("a job");
+        assert_eq!(outcome, JobOutcome::Done);
+        let likes: i64 = sqlx::query_scalar("SELECT count(*) FROM likes").fetch_one(p).await.expect("likes");
+        assert_eq!(likes, 2, "both likes are stored");
+        let grown: Vec<String> = sqlx::query_scalar("SELECT did FROM scope_dids ORDER BY did").fetch_all(p).await.expect("scope");
+        assert_eq!(grown, [new_subject]);
+        let snap = scope.snapshot().await;
+        assert!(snap.in_scope(new_subject) && !snap.in_scope(old_subject));
+        db.drop_db().await;
+    }
+
     /// Private posting T-9 (§4.4): a `private` job lists the gates after
     /// `postPrivate`, and keeps those of the private posts listed in the run
     /// and of those already stored; a gate of a post it knows nothing of is

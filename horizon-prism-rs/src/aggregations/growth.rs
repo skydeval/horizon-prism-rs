@@ -13,12 +13,13 @@
 //! 3. After commit, [`commit_in_memory`] adds the new DIDs to S under a briefly
 //!    held write guard.
 
+use chrono::{DateTime, TimeDelta, Utc};
 use sqlx::PgConnection;
 
 use super::admit::{AdmissionInput, RecordKind};
 use super::policy::{REASON_FOLLOWED, REASON_INTERACTED, grows_on_follow, grows_on_interaction};
 use super::scope_state::{ScopeSets, ScopeState};
-use crate::config::ScopePolicy;
+use crate::config::{ScopePolicy, ScopeWindows};
 
 /// Subjects that an admitted record adds to S, with their reason bit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -39,16 +40,47 @@ impl GrowthPlan {
     }
 }
 
+/// When the record was made and when it is written, for the interaction
+/// windows (scope-recency design §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recency {
+    /// The record's `createdAt`, clamped (`records::created_at`).
+    pub created_at: DateTime<Utc>,
+    /// The write's own time.
+    pub now: DateTime<Utc>,
+    pub windows: ScopeWindows,
+    /// The `kind` label a stale post is counted under: `reply` or `quote`.
+    pub post_label: &'static str,
+}
+
+impl Recency {
+    /// Whether an interaction of `kind` made at `created_at` is still
+    /// fresh, and the label it is counted under when it is not.
+    fn fresh(&self, kind: RecordKind) -> (bool, &'static str) {
+        let (days, label) = match kind {
+            RecordKind::Like => (self.windows.like_repost_days, "like"),
+            RecordKind::Repost => (self.windows.like_repost_days, "repost"),
+            _ => (self.windows.reply_quote_days, self.post_label),
+        };
+        let fresh = days > 0 && self.created_at >= self.now - TimeDelta::days(i64::from(days));
+        (fresh, label)
+    }
+}
+
 /// Plan growth for an op about to be admitted. Only members' public records
 /// grow scope; subjects already in S are skipped (the in-memory set cannot lag
 /// the table while a writer holds the read guard, because removals happen
-/// under the write guard).
+/// under the write guard). A like or repost grows S only within the like
+/// window of its `createdAt`, a reply or quote only within the reply window;
+/// a stale one is stored as before and grows nothing (scope-recency design
+/// §3.1). A subject that is not a DID never grows S.
 #[must_use]
 pub fn plan(
     input: &AdmissionInput,
     sets: &ScopeSets,
     policy: ScopePolicy,
     max_follow_scope_per_member: u32,
+    recency: &Recency,
 ) -> GrowthPlan {
     if input.kind.is_private() || !sets.is_member(&input.author) {
         return GrowthPlan::default();
@@ -62,18 +94,29 @@ pub fn plan(
             REASON_FOLLOWED
         }
         RecordKind::Like | RecordKind::Repost | RecordKind::Post if grows_on_interaction(policy) => {
+            if input.subjects.is_empty() {
+                return GrowthPlan::default();
+            }
+            let (fresh, label) = recency.fresh(input.kind);
+            if !fresh {
+                metrics::counter!(METRIC_GROWTH_STALE, "kind" => label).increment(1);
+                return GrowthPlan::default();
+            }
             REASON_INTERACTED
         }
         _ => return GrowthPlan::default(),
     };
     let mut subjects: Vec<(String, i16)> = Vec::new();
     for s in &input.subjects {
-        if !sets.in_scope(s) && !subjects.iter().any(|(d, _)| d == s) {
+        if s.starts_with("did:") && !sets.in_scope(s) && !subjects.iter().any(|(d, _)| d == s) {
             subjects.push((s.clone(), reason));
         }
     }
     GrowthPlan { subjects }
 }
+
+/// Interactions too old to grow S, by kind (scope-recency design §7).
+pub const METRIC_GROWTH_STALE: &str = "scope_growth_stale_total";
 
 /// Write the planned growth inside the caller's transaction, which already
 /// holds each subject's shared DID lock. Returns the DIDs newly added.
@@ -138,40 +181,104 @@ mod tests {
         }
     }
 
+    /// A record made `age` before it is written, under the default windows.
+    fn aged(age: TimeDelta) -> Recency {
+        let now = Utc::now();
+        Recency { created_at: now - age, now, windows: ScopeWindows::default(), post_label: "reply" }
+    }
+
+    fn fresh() -> Recency {
+        aged(TimeDelta::zero())
+    }
+
     #[test]
     fn member_follow_grows_under_follow_policies() {
-        let p = plan(&input(MEMBER, RecordKind::Follow, &["did:plc:new"]), &sets(), ScopePolicy::MembersAndOneHop, 10);
+        let p = plan(&input(MEMBER, RecordKind::Follow, &["did:plc:new"]), &sets(), ScopePolicy::MembersAndOneHop, 10, &fresh());
         assert_eq!(p.subjects, [("did:plc:new".to_string(), REASON_FOLLOWED)]);
-        let none = plan(&input(MEMBER, RecordKind::Follow, &["did:plc:new"]), &sets(), ScopePolicy::MembersAndInteractions, 10);
+        let none = plan(&input(MEMBER, RecordKind::Follow, &["did:plc:new"]), &sets(), ScopePolicy::MembersAndInteractions, 10, &fresh());
         assert!(none.is_empty());
     }
 
     #[test]
     fn member_interactions_grow_under_interaction_policies() {
         for kind in [RecordKind::Like, RecordKind::Repost, RecordKind::Post] {
-            let p = plan(&input(MEMBER, kind, &["did:plc:a", "did:plc:b", "did:plc:a"]), &sets(), ScopePolicy::MembersAndOneHop, 10);
+            let p = plan(&input(MEMBER, kind, &["did:plc:a", "did:plc:b", "did:plc:a"]), &sets(), ScopePolicy::MembersAndOneHop, 10, &fresh());
             assert_eq!(p.lock_dids(), ["did:plc:a", "did:plc:b"], "{kind:?}");
             assert!(p.subjects.iter().all(|(_, r)| *r == REASON_INTERACTED));
         }
-        assert!(plan(&input(MEMBER, RecordKind::Like, &["did:plc:a"]), &sets(), ScopePolicy::MembersAndFollows, 10).is_empty());
+        assert!(plan(&input(MEMBER, RecordKind::Like, &["did:plc:a"]), &sets(), ScopePolicy::MembersAndFollows, 10, &fresh()).is_empty());
     }
 
     #[test]
     fn no_growth_for_non_members_private_records_blocks_or_known_subjects() {
         let s = sets();
         let p = ScopePolicy::MembersAndOneHop;
-        assert!(plan(&input("did:plc:x", RecordKind::Follow, &["did:plc:new"]), &s, p, 10).is_empty());
-        assert!(plan(&input(MEMBER, RecordKind::PrivatePost, &["did:plc:new"]), &s, p, 10).is_empty());
-        assert!(plan(&input(MEMBER, RecordKind::Block, &["did:plc:new"]), &s, p, 10).is_empty());
-        assert!(plan(&input(MEMBER, RecordKind::Follow, &["did:plc:already"]), &s, p, 10).is_empty());
+        let r = fresh();
+        assert!(plan(&input("did:plc:x", RecordKind::Follow, &["did:plc:new"]), &s, p, 10, &r).is_empty());
+        assert!(plan(&input(MEMBER, RecordKind::PrivatePost, &["did:plc:new"]), &s, p, 10, &r).is_empty());
+        assert!(plan(&input(MEMBER, RecordKind::Block, &["did:plc:new"]), &s, p, 10, &r).is_empty());
+        assert!(plan(&input(MEMBER, RecordKind::Follow, &["did:plc:already"]), &s, p, 10, &r).is_empty());
     }
 
     #[test]
     fn follow_cap_stops_follow_growth() {
         let mut s = sets();
         s.member_follows.insert(MEMBER.into(), 10);
-        assert!(plan(&input(MEMBER, RecordKind::Follow, &["did:plc:new"]), &s, ScopePolicy::MembersAndOneHop, 10).is_empty());
+        assert!(plan(&input(MEMBER, RecordKind::Follow, &["did:plc:new"]), &s, ScopePolicy::MembersAndOneHop, 10, &fresh()).is_empty());
         // Interactions are not capped.
-        assert!(!plan(&input(MEMBER, RecordKind::Like, &["did:plc:new"]), &s, ScopePolicy::MembersAndOneHop, 10).is_empty());
+        assert!(!plan(&input(MEMBER, RecordKind::Like, &["did:plc:new"]), &s, ScopePolicy::MembersAndOneHop, 10, &fresh()).is_empty());
+    }
+
+    /// T-R1: a like or repost grows S within the like window of its
+    /// `createdAt`, a reply or quote within the reply window; a window of 0
+    /// turns the kind off; follows have no window.
+    #[test]
+    fn interactions_grow_only_within_their_window() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let s = sets();
+        let p = ScopePolicy::MembersAndOneHop;
+        let grows = |kind: RecordKind, r: &Recency| !plan(&input(MEMBER, kind, &["did:plc:new"]), &s, p, 10, r).is_empty();
+        let day = TimeDelta::days(1);
+        let hour = TimeDelta::hours(1);
+        for kind in [RecordKind::Like, RecordKind::Repost] {
+            assert!(!grows(kind, &aged(TimeDelta::days(30) + day)), "{kind:?} past the window");
+            assert!(grows(kind, &aged(TimeDelta::days(30) - hour)), "{kind:?} inside the window");
+        }
+        assert!(!grows(RecordKind::Post, &aged(TimeDelta::days(90) + day)));
+        assert!(grows(RecordKind::Post, &aged(TimeDelta::days(90) - hour)));
+        // A 60-day-old like is stale, a 60-day-old reply fresh.
+        assert!(!grows(RecordKind::Like, &aged(TimeDelta::days(60))));
+        assert!(grows(RecordKind::Post, &aged(TimeDelta::days(60))));
+        // A window of 0 turns the kind off, even for a record made now.
+        let mut off = fresh();
+        off.windows.like_repost_days = 0;
+        assert!(!grows(RecordKind::Like, &off) && !grows(RecordKind::Repost, &off));
+        assert!(grows(RecordKind::Post, &off));
+        off.windows.reply_quote_days = 0;
+        assert!(!grows(RecordKind::Post, &off));
+        // Follows are not dated.
+        assert!(grows(RecordKind::Follow, &aged(TimeDelta::days(3650))));
+        // Each refusal is counted by kind.
+        let text = handle.render();
+        for (kind, n) in [("like", 3.0), ("repost", 2.0), ("reply", 2.0)] {
+            let label = format!("kind=\"{kind}\"");
+            assert_eq!(crate::test_support::series(&text, METRIC_GROWTH_STALE, &[&label]), Some(n), "{kind}:\n{text}");
+        }
+    }
+
+    /// T-R6d: a subject written as a handle never grows S.
+    #[test]
+    fn a_subject_that_is_not_a_did_never_grows() {
+        let p = plan(
+            &input(MEMBER, RecordKind::Like, &["alice.example", "did:plc:new"]),
+            &sets(),
+            ScopePolicy::MembersAndOneHop,
+            10,
+            &fresh(),
+        );
+        assert_eq!(p.lock_dids(), ["did:plc:new"]);
+        assert!(plan(&input(MEMBER, RecordKind::Like, &["alice.example"]), &sets(), ScopePolicy::MembersAndOneHop, 10, &fresh()).is_empty());
     }
 }

@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
-use crate::config::ScopePolicy;
+use crate::config::{ScopePolicy, ScopeWindows};
 use crate::db::locks::uri_author;
 use crate::db::{ScopeGuard, ScopeReadGuard};
 use crate::identity::PersistencePolicy;
@@ -138,6 +138,8 @@ pub struct ScopeState {
     sets: Arc<RwLock<ScopeSets>>,
     policy: ScopePolicy,
     max_follow_scope_per_member: u32,
+    /// How long an interaction holds its subject (scope-recency design §5).
+    windows: ScopeWindows,
     /// `ScopeSets.public.mode`, readable without the guard (the endpoint
     /// gate, public-indexing design §3.5). Stored under the write guard.
     public_mirror: Arc<AtomicU8>,
@@ -151,8 +153,22 @@ impl ScopeState {
             sets: Arc::new(RwLock::new(sets)),
             policy,
             max_follow_scope_per_member,
+            windows: ScopeWindows::default(),
             public_mirror: Arc::new(mirror),
         }
+    }
+
+    /// Set the interaction windows (`scope.reply_quote_days`,
+    /// `scope.like_repost_days`); the defaults otherwise.
+    #[must_use]
+    pub fn with_windows(mut self, windows: ScopeWindows) -> Self {
+        self.windows = windows;
+        self
+    }
+
+    #[must_use]
+    pub fn windows(&self) -> ScopeWindows {
+        self.windows
     }
 
     /// Set the public-indexing state and its mirror. `sets` is the write

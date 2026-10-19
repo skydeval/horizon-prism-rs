@@ -782,11 +782,23 @@ impl Writer {
                 // A grow-only post grows scope as an admitted one does, so
                 // its subjects' shared locks join the same sorted pass.
                 let plan = if matches!(a, Admission::Admit(_) | Admission::GrowOnly) {
+                    // Scope-recency design §3.1: an interaction grows S only
+                    // within its window of the record's own date.
+                    let recency = growth::Recency {
+                        created_at: u.created_at,
+                        now,
+                        windows: self.scope.windows(),
+                        post_label: match &u.body {
+                            Body::Post(p) if p.reply_parent.is_none() => "quote",
+                            _ => "reply",
+                        },
+                    };
                     growth::plan(
                         &u.input,
                         sets,
                         self.scope.policy(),
                         self.scope.max_follow_scope_per_member(),
+                        &recency,
                     )
                 } else {
                     GrowthPlan::default()

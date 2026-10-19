@@ -105,6 +105,7 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     if cfg.bookmarks.max_per_actor == 0 {
         out.push("bookmarks.max_per_actor must be at least 1".to_string());
     }
+    scope_problems(cfg, &mut out);
     if cfg.activity_subscriptions.max_per_actor == 0 {
         out.push("activity_subscriptions.max_per_actor must be at least 1".to_string());
     }
@@ -164,6 +165,21 @@ fn discovery(cfg: &FileConfig, out: &mut Vec<String>) {
     }
     if !trends.topic_link_template.contains("{tag}") {
         out.push("trends.topic_link_template must contain {tag}".to_string());
+    }
+}
+
+/// `[scope]` ranges (scope-recency design §5).
+fn scope_problems(cfg: &FileConfig, out: &mut Vec<String>) {
+    let s = &cfg.scope;
+    for (key, value, low, high) in [
+        ("scope.reply_quote_days", s.reply_quote_days, 0, 3650),
+        ("scope.like_repost_days", s.like_repost_days, 0, 3650),
+        ("scope.rebuild_grace_days", s.rebuild_grace_days, 0, 30),
+        ("scope.sweep_max_purges", s.sweep_max_purges, 1, 1_000_000),
+    ] {
+        if !(low..=high).contains(&value) {
+            out.push(format!("{key} must be {low} to {high}"));
+        }
     }
 }
 

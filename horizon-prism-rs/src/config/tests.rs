@@ -77,6 +77,9 @@ fill_max_wait_hours = 24
 policy = "members_and_one_hop"
 rebuild_grace_days = 7
 max_follow_scope_per_member = 10000
+reply_quote_days = 90
+like_repost_days = 30
+sweep_max_purges = 5000
 
 [community]
 auto_enroll = true
@@ -450,6 +453,26 @@ live_now = []
 fn docker_app_toml_equals_defaults() {
     let cfg = load(DOCKER_APP_TOML).expect("shipped config is valid");
     assert_eq!(cfg.file, FileConfig::default());
+}
+
+/// Scope recency T-R13 (§5): the window and sweep defaults, and every
+/// out-of-range value refused at startup.
+#[test]
+fn scope_recency_keys_default_and_are_range_checked() {
+    let s = load("").expect("defaults").file.scope;
+    assert_eq!((s.reply_quote_days, s.like_repost_days, s.sweep_max_purges), (90, 30, 5_000));
+    assert_eq!(s.windows(), ScopeWindows { reply_quote_days: 90, like_repost_days: 30 });
+    load("[scope]\nreply_quote_days = 0\nlike_repost_days = 3650\nrebuild_grace_days = 30\nsweep_max_purges = 1\n").expect("edges are valid");
+    for (text, needle) in [
+        ("[scope]\nreply_quote_days = 3651\n", "scope.reply_quote_days must be 0 to 3650"),
+        ("[scope]\nlike_repost_days = 3651\n", "scope.like_repost_days must be 0 to 3650"),
+        ("[scope]\nrebuild_grace_days = 31\n", "scope.rebuild_grace_days must be 0 to 30"),
+        ("[scope]\nsweep_max_purges = 0\n", "scope.sweep_max_purges must be 1 to 1000000"),
+        ("[scope]\nsweep_max_purges = 1000001\n", "scope.sweep_max_purges must be 1 to 1000000"),
+    ] {
+        let p = invalid_problems(load(text));
+        assert!(has(&p, needle), "{text}: {p:?}");
+    }
 }
 
 #[test]

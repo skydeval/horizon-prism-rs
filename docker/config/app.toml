@@ -38,6 +38,14 @@ policy = "members_and_one_hop"
 rebuild_grace_days = 7
 # Follow-derived scope growth per member (design §9.4).
 max_follow_scope_per_member = 10000
+# Days a member's reply or quote keeps the accounts it names indexed, after
+# the member's most recent one (0-3650; 0 = replies and quotes never do).
+reply_quote_days = 90
+# Days a member's like or repost keeps the account indexed (0-3650; 0 = never).
+like_repost_days = 30
+# The most accounts one nightly scope check removes; the rest go on later
+# nights (1-1000000).
+sweep_max_purges = 5000
 
 [community]
 # Auto-enroll triggers only from getTimeline / listNotifications / getUnreadCount
