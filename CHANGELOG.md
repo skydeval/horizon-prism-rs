@@ -10,6 +10,13 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (scope recency tests, #741)
+
+- The image build's private-table source check refused S2: two sweep tests
+  (T-R7, T-R11) wrote `private_posts` from `src/aggregations/`. They now go
+  through a test-only `private_tier::test_rows`, so no private table is
+  named outside `src/private_tier/`.
+
 ### Changed (scope recency, S2, #741)
 
 Scope recency design S2 (`docs/internal/design/scope-recency.md`): what

@@ -39,6 +39,8 @@ pub(crate) mod readiness;
 pub(crate) mod retention;
 mod schema;
 #[cfg(test)]
+pub(crate) mod test_rows;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{HashMap, HashSet};

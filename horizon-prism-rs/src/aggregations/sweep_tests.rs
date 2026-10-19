@@ -10,7 +10,7 @@ use super::*;
 use crate::aggregations::ScopeSets;
 use crate::config::ScopePolicy;
 use crate::firehose::writer::{Action, ApplyOptions, RawOp, WriteSource, Writer};
-use crate::private_tier::{DisabledPrivateTier, KryphocronPrivateTier};
+use crate::private_tier::{DisabledPrivateTier, KryphocronPrivateTier, test_rows};
 use crate::test_support::{TestDb, fresh_db, hooks};
 
 const M: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -317,19 +317,14 @@ async fn busy_candidates_are_skipped_and_stuck_purges_finished() {
     t.exec(&format!("INSERT INTO purging_dids (did, kind) VALUES ('{D}', 'member_removed')")).await;
     // E's out_of_scope marker committed (its row gone), its batches did not.
     t.exec(&format!("INSERT INTO purging_dids (did, kind) VALUES ('{E}', 'out_of_scope')")).await;
-    t.exec(&format!(
-        "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, plaintext_text, created_at) VALUES \
-         ('at://{E}/tools.kryphocron.feed.postPrivate/3k', '{E}', '3k', 'bafy', '3kaaaaaaaaaa2', 'x', now())"
-    ))
-    .await;
+    test_rows::insert_post(t.p(), E, "3k", None).await;
     let r = t.rebuild.sweep(false).await.expect("sweep");
     assert_eq!(r.skipped.get("busy"), Some(&1), "{r:?}");
     assert_eq!(r.purged, 1, "the stuck purge is finished: {r:?}");
     assert!(t.in_table(D).await);
     let left: Vec<String> = sqlx::query_scalar("SELECT did FROM purging_dids").fetch_all(t.p()).await.expect("purging");
     assert_eq!(left, [D]);
-    let posts: i64 = sqlx::query_scalar("SELECT count(*) FROM private_posts").fetch_one(t.p()).await.expect("posts");
-    assert_eq!(posts, 0);
+    assert!(test_rows::post_rkeys(t.p()).await.is_empty());
     t.exec("DELETE FROM purging_dids").await;
     let r = t.rebuild.sweep(false).await.expect("sweep");
     assert_eq!(r.purged, 1, "{r:?}");
@@ -433,17 +428,11 @@ async fn the_sweep_purges_private_rows_as_out_of_scope_does() {
     t.row(N, REASON_INTERACTED).await;
     let member_post = format!("at://{M}/app.bsky.feed.post/1");
     for (author, rkey, parent) in [(N, "3kpost", None), (N, "3kreply", Some(member_post.as_str())), (M, "3kmine", None)] {
-        let parent = parent.map_or("NULL".to_string(), |u| format!("'{u}'"));
-        t.exec(&format!(
-            "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, reply_root_uri, reply_parent_uri, plaintext_text, created_at) VALUES \
-             ('at://{author}/tools.kryphocron.feed.postPrivate/{rkey}', '{author}', '{rkey}', 'bafy', '3kaaaaaaaaaa2', {parent}, {parent}, 'x', now())"
-        ))
-        .await;
+        test_rows::insert_post(t.p(), author, rkey, parent).await;
     }
     let r = t.rebuild.sweep(false).await.expect("sweep");
     assert_eq!(r.purged, 1, "{r:?}");
-    let left: Vec<String> = sqlx::query_scalar("SELECT rkey FROM private_posts ORDER BY rkey").fetch_all(t.p()).await.expect("posts");
-    assert_eq!(left, ["3kmine", "3kreply"]);
+    assert_eq!(test_rows::post_rkeys(t.p()).await, ["3kmine", "3kreply"]);
     t.db.drop_db().await;
 }
 
