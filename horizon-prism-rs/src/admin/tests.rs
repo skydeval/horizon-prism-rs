@@ -315,7 +315,7 @@ fn assert_admin_headers(page: &Page, what: &str) {
     let h = |n: &str| page.headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
     assert_eq!(h("content-security-policy"), CSP, "{what}");
     assert_eq!(h("x-frame-options"), "DENY", "{what}");
-    assert_eq!(h("referrer-policy"), "no-referrer", "{what}");
+    assert_eq!(h("referrer-policy"), "same-origin", "{what}");
     assert_eq!(h("x-content-type-options"), "nosniff", "{what}");
     assert!(page.headers.get("access-control-allow-credentials").is_none(), "{what}");
 }

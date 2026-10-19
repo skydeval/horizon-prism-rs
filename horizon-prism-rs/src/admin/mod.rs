@@ -168,7 +168,11 @@ async fn headers(request: Request, next: Next) -> Response {
     }
     h.insert(HeaderName::from_static("content-security-policy"), HeaderValue::from_static(CSP));
     h.insert(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY"));
-    h.insert(HeaderName::from_static("referrer-policy"), HeaderValue::from_static("no-referrer"));
+    // `same-origin`, not `no-referrer`: under `no-referrer` browsers send
+    // `Origin: null` on form POSTs (Fetch, "append a request Origin
+    // header"), which the Origin check refuses. `same-origin` still sends
+    // nothing to other sites.
+    h.insert(HeaderName::from_static("referrer-policy"), HeaderValue::from_static("same-origin"));
     h.insert(HeaderName::from_static("x-content-type-options"), HeaderValue::from_static("nosniff"));
     response
 }

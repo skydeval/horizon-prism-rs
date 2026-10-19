@@ -10,6 +10,14 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (admin UI forms)
+
+- **Every admin form failed with "This form expired" in a browser.** The
+  admin pages sent `Referrer-Policy: no-referrer`, under which browsers
+  send `Origin: null` on form POSTs, and the Origin check refused it. The
+  admin pages now send `Referrer-Policy: same-origin`: a same-origin form
+  carries Prism's own Origin, and nothing is sent to other sites.
+
 ### Added (web admin UI, S1, #245, #735)
 
 Admin UI design S1 (`docs/internal/design/admin-ui.md`): an admin UI
