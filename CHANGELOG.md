@@ -10,6 +10,31 @@ commit.
 
 ## [Unreleased]
 
+### Changed (private embeds, S1, #744)
+
+Private-embeds design S1 (`docs/internal/design/private-embeds-504.md`):
+the read side of #504.
+
+- **Private posts may encode their facets and embed.** A private post's
+  `encodedContent` can now carry its text, facets and embed together (a
+  leading 0xFF byte, then JSON); Prism reads both that form and the
+  text-only one. The payload's `facets` and `embed` replace the clear ones
+  key by key; each gets the checks a clear field gets (`facets` an array,
+  `embed` an object, at most 64 KiB, blob refs normalized) and is left out
+  otherwise. Nothing else in the payload is read, and `embedBlobs`,
+  `mentionDids` and `quote` never reach a view. Search matches the
+  restored text. Prism never decodes a private post outside a read.
+- **A payload Prism cannot restore is a uniform miss**, counted as
+  `private_read_outcome_total{outcome="bad_content"}`: JSON that does not
+  parse or is not an object, no string `text`, nesting deeper than 128,
+  or a decoded payload over 1 000 000 bytes. An `encodedContent` over
+  1 000 000 bytes is not decoded at all (the same miss). No lexicon-valid
+  record reaches either bound.
+- **New metric:** `private_read_content_total{form="text"|"content"}`, one
+  per decoded hit, shows a PDS's conversion from the read side.
+- Upgrade Prism before a PDS you index starts writing the new form: an
+  older Prism leaves such posts out (`not_utf8`).
+
 ### Fixed (scope recency tests, #741)
 
 - The image build's private-table source check refused S2: two sweep tests

@@ -268,6 +268,12 @@ impl Fixture {
 
     /// Encode `text` with the real hooks, as Aurora-Locus would write it.
     async fn encoded_post(&self, owner: &str, rkey: &str, text: &str, audience: Option<&str>) -> Value {
+        self.encoded_bytes(owner, rkey, text.as_bytes(), audience).await
+    }
+
+    /// Encode the payload `bytes` with the real hooks: [`Self::encoded_post`]
+    /// for any payload, text or not (#504's new form).
+    async fn encoded_bytes(&self, owner: &str, rkey: &str, bytes: &[u8], audience: Option<&str>) -> Value {
         let nsid = Nsid::new(NSID_POST_PRIVATE).expect("nsid");
         let did = Did::new(owner).expect("did");
         let ctx = RecordContentContext::new(
@@ -283,7 +289,7 @@ impl Fixture {
         let encoded = kryphocron::encode_record_content(
             self.glue.at_rest_hooks(),
             self.glue.user_sink(),
-            text.as_bytes(),
+            bytes,
             &ctx,
             Instant::now() + Duration::from_secs(2),
             SystemTime::now(),

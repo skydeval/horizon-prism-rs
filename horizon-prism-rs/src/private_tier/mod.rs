@@ -27,6 +27,7 @@
 //! use horizon_prism_rs::private_tier::emit::PrivateEmit;
 //! ```
 
+mod content;
 mod cursor;
 mod emit;
 pub(crate) mod gauges;

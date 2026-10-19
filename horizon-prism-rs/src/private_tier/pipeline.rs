@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
+use super::content::{self, BadContent, Restored};
 use super::emit::PrivateEmit;
 use super::oracle::{OracleSnapshot, SnapshotInputs};
 use super::{readiness, schema};
@@ -39,6 +40,9 @@ use crate::sync::HeadProber;
 
 /// Metric: per-record outcomes (server-side only).
 pub(super) const METRIC_OUTCOMES: &str = "private_read_outcome_total";
+/// Metric: decoded payloads by `form`, `text` or `content` (private-embeds
+/// design §9): the PDS's conversion, seen from the read side.
+pub(super) const METRIC_CONTENT: &str = "private_read_content_total";
 /// The decode deadline after handler start (§6.3 step 11).
 pub(super) const DECODE_BUDGET: Duration = Duration::from_secs(2);
 
@@ -96,6 +100,9 @@ pub(super) enum Miss {
     CodecMismatch,
     DecodeFailed,
     NotUtf8,
+    /// A payload or `encodedContent` refused by `content::restore` or the
+    /// input cap (private-embeds design §2, §3).
+    BadContent,
     Db,
 }
 
@@ -116,6 +123,7 @@ impl Miss {
             Self::CodecMismatch => "codec_mismatch",
             Self::DecodeFailed => "decode_failed",
             Self::NotUtf8 => "not_utf8",
+            Self::BadContent => "bad_content",
             Self::Db => "db_error",
         }
     }
@@ -424,9 +432,14 @@ async fn read_inner(
     )
     .map_err(|_| Miss::Malformed)?;
 
-    // 11. Decode.
-    let text = match schema::encoded(&env.pool, &rauth).await? {
+    // 11. Decode, then restore the payload (private-embeds design §3): the
+    // text alone, or text, facets and embed. An `encodedContent` larger
+    // than any record could hold is not decoded.
+    let restored = match schema::encoded(&env.pool, &rauth).await? {
         Some(row) => {
+            if row.content.len() > content::PAYLOAD_MAX_BYTES {
+                return Err(Miss::BadContent);
+            }
             let codec = CodecId::new(row.codec.unwrap_or_default()).map_err(|_| Miss::Malformed)?;
             let generation = row
                 .generation
@@ -461,23 +474,35 @@ async fn read_inner(
                 CodecError::UnknownOrWrongCodec { .. } => Miss::CodecMismatch,
                 _ => Miss::DecodeFailed,
             })?;
-            String::from_utf8(bytes).map_err(|_| Miss::NotUtf8)?
+            let restored = content::restore(bytes).map_err(|e| match e {
+                BadContent::NotUtf8 => Miss::NotUtf8,
+                _ => Miss::BadContent,
+            })?;
+            metrics::counter!(METRIC_CONTENT, "form" => restored.form()).increment(1);
+            restored
         }
-        None => schema::plaintext(&env.pool, &rauth).await?.ok_or(Miss::Malformed)?,
+        None => Restored::Text(schema::plaintext(&env.pool, &rauth).await?.ok_or(Miss::Malformed)?),
     };
 
     // 12. The view, emitted through the witness.
     let meta = schema::view_meta(&env.pool, &rauth).await?.ok_or(Miss::NoRow)?;
     let display = schema::display(&env.pool, &rauth).await?.unwrap_or_default();
+    // `facets` and `embed`: the payload's when it has the key, else the
+    // clear fields as stored (private-embeds design §2). `langs` and
+    // `labels` are always the stored ones; nothing else in a payload is
+    // read.
+    let (text, facets, embed) = match restored {
+        Restored::Text(text) => (text, display.facets, display.embed),
+        Restored::Content { text, facets, embed } => (text, facets.merge(display.facets), embed.merge(display.embed)),
+    };
     let mut record = json!({
         "$type": NSID_POST_PRIVATE,
         "text": text,
         "createdAt": ts(meta.created_at),
     });
-    // The display fields as stored (§4.2): not encoded by the PDS.
     for (key, value) in [
-        ("facets", display.facets.clone()),
-        ("embed", display.embed.clone()),
+        ("facets", facets),
+        ("embed", embed.clone()),
         ("langs", display.langs.as_ref().map(|l| json!(l))),
         ("labels", display.self_labels.clone()),
     ] {
@@ -516,8 +541,7 @@ async fn read_inner(
     });
     // The media part of `embed` (§4.2); the handler adds the record part.
     let pds = authors.rows.get(owner_s).and_then(|r| r.pds_endpoint.as_deref());
-    if let Some(media) = display
-        .embed
+    if let Some(media) = embed
         .as_ref()
         .map(normalize_embed)
         .and_then(|e| media_view(owner_s, pds, &e, &env.video))
