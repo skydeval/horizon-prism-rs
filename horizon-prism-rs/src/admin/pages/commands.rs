@@ -52,7 +52,7 @@ pub async fn page(
         Err(e) => return super::internal_error(&state, &e),
     };
     let Some(row) = row else {
-        return message(&state, Some(Nav::new(&op, "activity")), StatusCode::NOT_FOUND, "Not found", "There is no such command.", Some(("/admin/activity", "Activity")));
+        return message(&state, Some(Nav::new(&op, "audit")), StatusCode::NOT_FOUND, "Not found", "There is no such command.", Some(("/admin/audit", "Audit log")));
     };
     let row = CommandRow::from_tuple(row);
     let offer = (row.command == "operator add" && row.state == "failed" && row.outcome.contains("not on the allowed list")).then(|| HostOffer {
@@ -63,7 +63,7 @@ pub async fn page(
         StatusCode::OK,
         &CommandPage {
             css: css(),
-            nav: Some(Nav::new(&op, "activity")),
+            nav: Some(Nav::new(&op, "audit")),
             title: format!("Command {id}"),
             row,
             offer,

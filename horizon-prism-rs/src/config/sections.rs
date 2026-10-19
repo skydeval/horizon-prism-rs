@@ -575,6 +575,9 @@ pub struct AdminConfig {
     pub session_idle_secs: u64,
     /// An admin UI session ends this long after sign-in, whatever its use.
     pub session_max_secs: u64,
+    /// Lines of the live feed show the first 100 characters of a written
+    /// public post (admin-ui-live-feed design §5.2, C-F1).
+    pub live_feed_snippets: bool,
 }
 
 impl Default for AdminConfig {
@@ -584,6 +587,7 @@ impl Default for AdminConfig {
             web_ui: true,
             session_idle_secs: 28_800,
             session_max_secs: 604_800,
+            live_feed_snippets: true,
         }
     }
 }

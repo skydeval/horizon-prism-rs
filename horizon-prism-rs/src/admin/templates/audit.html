@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>{{ title }}</h1>
-<form class="filters card" method="get" action="/admin/activity">
+<form class="filters card" method="get" action="/admin/audit">
 <label for="who">Who</label>
 <input type="text" id="who" name="who" value="{{ who }}" placeholder="handle, DID, or cli">
 <label for="what">What</label>

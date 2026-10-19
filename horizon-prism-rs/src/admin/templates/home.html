@@ -1,24 +1,53 @@
 {% extends "base.html" %}
-{% block head %}<meta http-equiv="refresh" content="30">{% endblock %}
+{% block head %}<noscript><meta http-equiv="refresh" content="30;url=/admin?auto=1"></noscript>
+<script src="{{ js }}" defer></script>{% endblock %}
 {% block content %}
 <h1>{{ title }}</h1>
+<div id="tiles">
+{% include "tiles.html" %}
+</div>
+<section class="card live" id="live" aria-labelledby="live-h">
+<div class="live-head"><h2 id="live-h">Live</h2><span class="pill" id="live-status" hidden>connecting…</span></div>
+<p class="banner bad" id="live-notstarted">The live feed did not start. Reload the page; if it keeps happening, something is blocking the page's script.</p>
+<p class="banner" id="live-message" hidden></p>
+<noscript><p class="muted">The live feed needs JavaScript. These figures are from when the page loaded; it reloads every 30 seconds.</p></noscript>
+<div id="live-rates">
+<p class="muted">Since Prism started {{ live.started }}; rates over the last minute.</p>
 <div class="grid">
-<div class="card">
-<h2>Members</h2>
-<div class="stat"><span class="l">Ready</span><span class="n">{{ ready }}</span></div>
-<div class="stat"><span class="l">Members</span><span class="n">{{ members }}</span></div>
-<div class="stat"><span class="l">Limit for auto-join</span><span class="n">{{ max_members }}</span></div>
-<div class="stat"><span class="l">Denied accounts</span><span class="n">{{ denied }}</span></div>
-<p><a href="/admin/members">Manage members</a></p>
-</div>
-<div class="card">
-<h2>Recent changes</h2>
-{% for c in recent %}
-<div class="fact"><span class="l">{{ c.when }}</span><span class="v"><a href="/admin/commands/{{ c.id }}">{{ c.what }}</a> · {{ c.outcome }}</span></div>
-{% else %}
-<p class="muted">Nothing yet.</p>
+<div>
+<h3>Indexed</h3>
+{% for f in live.indexed %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.total }} · {{ f.rate }}</span></div>
+{% else %}<p class="muted">Nothing yet.</p>
 {% endfor %}
-<p><a href="/admin/activity">All activity</a></p>
+</div>
+<div>
+<h3>Skipped and rejected</h3>
+{% for f in live.reasons %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.total }} · {{ f.rate }}</span></div>
+{% else %}<p class="muted">Nothing yet.</p>
+{% endfor %}
+</div>
+<div>
+<h3>Also</h3>
+{% for f in live.other %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.total }} · {{ f.rate }}</span></div>
+{% endfor %}
 </div>
 </div>
+</div>
+<div class="live-controls" id="live-controls" hidden>
+<button class="secondary" type="button" id="live-pause">Pause</button>
+<label for="live-kind">Kind</label>
+<select id="live-kind">
+<option value="">all</option>
+{% for c in live.kinds %}<option value="{{ c.value }}">{{ c.label }}</option>
+{% endfor %}
+</select>
+<label for="live-source">Source</label>
+<select id="live-source">
+<option value="">all</option>
+{% for c in live.sources %}<option value="{{ c.value }}">{{ c.label }}</option>
+{% endfor %}
+</select>
+</div>
+<ol class="live-list" id="live-list" hidden></ol>
+</section>
 {% endblock %}

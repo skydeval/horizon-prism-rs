@@ -1015,8 +1015,13 @@ impl Consumer {
             }
         };
         match event {
-            Event::Identity { kind, did, .. } => {
-                route_identity(&self.pool, kind, &did).await?;
+            Event::Identity { kind, did, relay } => {
+                let queued = route_identity(&self.pool, kind, &did).await?;
+                // The live feed counts every event and shows the queued ones
+                // (admin-ui-live-feed design §4.1).
+                if let Some(tap) = self.writer.feed() {
+                    tap.identity(kind, &did, queued, Some(self.watermarks.label_for(relay.as_deref())));
+                }
                 // Rule 4 (§4.3): an owner of a subscribed list that looks
                 // gone is looked at again; an ordinary owner's events
                 // cause no sync.
@@ -1044,7 +1049,7 @@ impl Consumer {
         );
         let report = self
             .writer
-            .apply(&commit.repo, &commit.rev, &commit.ops, self.apply_options())
+            .apply_from(Some(&label), &commit.repo, &commit.rev, &commit.ops, self.apply_options())
             .await?;
         if !report.failed.is_empty() {
             let data = entry.raw("data").map(<[u8]>::to_vec).unwrap_or_default();

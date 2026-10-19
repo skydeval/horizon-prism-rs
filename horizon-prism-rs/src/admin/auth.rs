@@ -201,6 +201,71 @@ pub enum Need {
     /// A POST that may change something: the CSRF token is checked and the
     /// DID resolved afresh.
     Change,
+    /// Watching (admin-ui-live-feed design §3.3): the live stream's open,
+    /// the Home tiles refresh, Home's reload with JavaScript off. Checked
+    /// as a page, counted against the page limit, and it does not move
+    /// `last_seen_at`, so an open tab does not keep its session alive.
+    Poll,
+}
+
+/// Whether [`check_session`] resolves the DID afresh whatever the age of
+/// the last check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// Only when the last check is older than [`RECHECK`].
+    No,
+    /// Always.
+    Yes,
+}
+
+/// Why a session check failed.
+#[derive(Debug)]
+pub enum Refusal {
+    /// No row: never signed in, or signed out.
+    SignedOut,
+    /// Past the idle or the absolute limit; the row is deleted.
+    Expired,
+    /// Cut off (§5.4): the row is deleted and the event logged.
+    NotOperator,
+    HostNotAllowed,
+    PdsChanged,
+    /// A fresh resolution failed; the session is kept.
+    CouldNotConfirm,
+    Db(sqlx::Error),
+}
+
+impl Refusal {
+    /// The live stream's `end` reason.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::SignedOut => "signed_out",
+            Self::Expired => "expired",
+            Self::NotOperator => "not_operator",
+            Self::HostNotAllowed => "host_not_allowed",
+            Self::PdsChanged => "pds_changed",
+            Self::CouldNotConfirm | Self::Db(_) => "could_not_confirm",
+        }
+    }
+}
+
+/// A checked session.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub did: String,
+    pub endpoint: String,
+    pub last_seen: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub checked: DateTime<Utc>,
+}
+
+impl Session {
+    /// When the session ends unless used: the earlier of its absolute
+    /// expiry and `last_seen_at` plus the idle limit.
+    #[must_use]
+    pub fn deadline(&self, idle: Duration) -> DateTime<Utc> {
+        self.expires.min(self.last_seen + chrono::Duration::from_std(idle).unwrap_or_default())
+    }
 }
 
 /// Record a sign-in event (§5.8).
@@ -257,12 +322,16 @@ fn to_login() -> Response {
     Redirect::to("/admin/login").into_response()
 }
 
-/// Cut a session off (§5.4): the row is deleted and the page says why.
-async fn cut(state: &AdminState, id_hash: &[u8; 32], did: &str, reason: &str, ip: IpAddr) -> Response {
+/// Cut a session off (§5.4): the row is deleted and the event logged.
+async fn cut(state: &AdminState, id_hash: &[u8; 32], did: &str, reason: &str, ip: Option<IpAddr>) {
     let _ = sqlx::query("DELETE FROM admin_sessions WHERE id_hash = $1").bind(id_hash.as_slice()).execute(&state.pool).await;
     tracing::info!(event = "admin_session_cut", did, reason, "admin session ended");
     metrics::counter!("admin_session_cut_total", "reason" => reason.to_string()).increment(1);
-    log_login(state, Some(did), &format!("session_cut:{reason}"), Some(ip)).await;
+    log_login(state, Some(did), &format!("session_cut:{reason}"), ip).await;
+}
+
+/// The page of a cut-off session: why, and the cleared cookie.
+fn cut_page(state: &AdminState, reason: &str) -> Response {
     let message = match reason {
         "not_operator" => "You are no longer an operator of this Prism, so you were signed out.",
         "host_not_allowed" => "Your account's server is no longer on this Prism's list of allowed servers, so you were signed out.",
@@ -274,6 +343,97 @@ async fn cut(state: &AdminState, id_hash: &[u8; 32], did: &str, reason: &str, ip
 }
 
 type SessionRow = (String, String, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>);
+
+/// The session row, unexpired; an expired row is deleted. Checks nothing
+/// else.
+///
+/// # Errors
+///
+/// [`Refusal::SignedOut`], [`Refusal::Expired`] or a database error.
+pub async fn load_session(state: &AdminState, id_hash: &[u8; 32]) -> Result<Session, Refusal> {
+    let row: Option<SessionRow> = sqlx::query_as(
+        "SELECT did, pds_endpoint, last_seen_at, expires_at, checked_at FROM admin_sessions WHERE id_hash = $1",
+    )
+    .bind(id_hash.as_slice())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Refusal::Db)?;
+    let Some((did, endpoint, last_seen, expires, checked)) = row else {
+        return Err(Refusal::SignedOut);
+    };
+    let now = Utc::now();
+    let idle = chrono::Duration::from_std(state.session_idle).unwrap_or_default();
+    if now >= expires || now - last_seen >= idle {
+        let _ = sqlx::query("DELETE FROM admin_sessions WHERE id_hash = $1").bind(id_hash.as_slice()).execute(&state.pool).await;
+        return Err(Refusal::Expired);
+    }
+    Ok(Session { did, endpoint, last_seen, expires, checked })
+}
+
+/// The DID is an operator, its recorded host allowed, and, when `fresh`
+/// or the last check is older than [`RECHECK`], a fresh resolution finds
+/// the same endpoint on an allowed host (§5.4). A cut-off deletes the row
+/// and logs it.
+async fn verify(state: &AdminState, id_hash: &[u8; 32], session: &Session, fresh: bool, ip: Option<IpAddr>) -> Result<(), Refusal> {
+    let did = &session.did;
+    if !is_operator(&state.pool, did).await.map_err(Refusal::Db)? {
+        cut(state, id_hash, did, "not_operator", ip).await;
+        return Err(Refusal::NotOperator);
+    }
+    let allowed = {
+        let mut conn = state.pool.acquire().await.map_err(Refusal::Db)?;
+        patterns(&mut conn).await.map_err(Refusal::Db)?
+    };
+    let host = endpoint_host(&session.endpoint).unwrap_or_default();
+    if !host_allowed(&allowed, &host) {
+        cut(state, id_hash, did, "host_not_allowed", ip).await;
+        return Err(Refusal::HostNotAllowed);
+    }
+    let stale = Utc::now() - session.checked >= chrono::Duration::from_std(RECHECK).unwrap_or_default();
+    if fresh || stale {
+        let resolved = match state.identity.resolve_fresh(did).await {
+            Ok(info) => info.pds_endpoint.as_deref().and_then(normalize_endpoint),
+            Err(error) => {
+                tracing::info!(event = "admin_recheck_failed", did = %did, %error, "resolving an operator afresh failed");
+                return Err(Refusal::CouldNotConfirm);
+            }
+        };
+        let Some(resolved) = resolved.filter(|f| *f == session.endpoint) else {
+            cut(state, id_hash, did, "pds_changed", ip).await;
+            return Err(Refusal::PdsChanged);
+        };
+        if !host_allowed(&allowed, &endpoint_host(&resolved).unwrap_or_default()) {
+            cut(state, id_hash, did, "host_not_allowed", ip).await;
+            return Err(Refusal::HostNotAllowed);
+        }
+        let _ = sqlx::query("UPDATE admin_sessions SET checked_at = now() WHERE id_hash = $1")
+            .bind(id_hash.as_slice())
+            .execute(&state.pool)
+            .await;
+        let _ = sqlx::query("UPDATE admin_operators SET pds_endpoint = $2, pds_checked_at = now() WHERE did = $1")
+            .bind(did)
+            .bind(&resolved)
+            .execute(&state.pool)
+            .await;
+    }
+    Ok(())
+}
+
+/// A session check without a request (admin-ui-live-feed design §3.3):
+/// the row present and unexpired, the DID an operator, the recorded host
+/// allowed, and a fresh resolution when the last is older than
+/// [`RECHECK`] (or always, with [`Refresh::Yes`]), exactly as [`require`]
+/// checks. It moves nothing but `checked_at`. A cut-off deletes the
+/// session, as on a page.
+///
+/// # Errors
+///
+/// Why the session no longer holds.
+pub async fn check_session(state: &AdminState, id_hash: &[u8; 32], refresh: Refresh, ip: Option<IpAddr>) -> Result<Session, Refusal> {
+    let session = load_session(state, id_hash).await?;
+    verify(state, id_hash, &session, refresh == Refresh::Yes, ip).await?;
+    Ok(session)
+}
 
 /// The signed-in operator for this request (§5.4), or the response to give
 /// instead: a redirect to setup or sign-in, a cut-off, a refusal, or `429`.
@@ -313,25 +473,14 @@ pub async fn require(
         }
     }
     let id_hash = *blake3::hash(&bytes).as_bytes();
-    let row: Option<SessionRow> = sqlx::query_as(
-        "SELECT did, pds_endpoint, last_seen_at, expires_at, checked_at FROM admin_sessions WHERE id_hash = $1",
-    )
-    .bind(id_hash.as_slice())
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(internal)?;
-    let Some((did, endpoint, last_seen, expires, checked)) = row else {
-        return Err(to_login());
+    let session = match load_session(state, &id_hash).await {
+        Ok(s) => s,
+        Err(Refusal::Db(e)) => return Err(internal(e)),
+        Err(_) => return Err(to_login()),
     };
-    let now = Utc::now();
-    let idle = chrono::Duration::from_std(state.session_idle).unwrap_or_default();
-    if now >= expires || now - last_seen >= idle {
-        let _ = sqlx::query("DELETE FROM admin_sessions WHERE id_hash = $1").bind(id_hash.as_slice()).execute(&state.pool).await;
-        return Err(to_login());
-    }
     // The limits come before any outbound call.
     let limited = match need {
-        Need::Page => state.limits.pages.check_key(&id_hash).is_err(),
+        Need::Page | Need::Poll => state.limits.pages.check_key(&id_hash).is_err(),
         Need::Change => state.limits.mutations.check_key(&id_hash).is_err(),
     };
     if limited {
@@ -344,53 +493,29 @@ pub async fn require(
             None,
         ));
     }
-    if !is_operator(&state.pool, &did).await.map_err(internal)? {
-        return Err(cut(state, &id_hash, &did, "not_operator", ip).await);
-    }
-    let allowed = {
-        let mut conn = state.pool.acquire().await.map_err(internal)?;
-        patterns(&mut conn).await.map_err(internal)?
-    };
-    let host = endpoint_host(&endpoint).unwrap_or_default();
-    if !host_allowed(&allowed, &host) {
-        return Err(cut(state, &id_hash, &did, "host_not_allowed", ip).await);
-    }
-    let stale = now - checked >= chrono::Duration::from_std(RECHECK).unwrap_or_default();
-    if need == Need::Change || stale {
-        let fresh = match state.identity.resolve_fresh(&did).await {
-            Ok(info) => info.pds_endpoint.as_deref().and_then(normalize_endpoint),
-            Err(error) => {
-                tracing::info!(event = "admin_recheck_failed", did = %did, %error, "resolving an operator afresh failed");
-                return Err(pages::message(
-                    state,
-                    None,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Try again",
-                    "Prism could not confirm your account just now; try again.",
-                    None,
-                ));
-            }
-        };
-        let Some(fresh) = fresh.filter(|f| *f == endpoint) else {
-            return Err(cut(state, &id_hash, &did, "pds_changed", ip).await);
-        };
-        if !host_allowed(&allowed, &endpoint_host(&fresh).unwrap_or_default()) {
-            return Err(cut(state, &id_hash, &did, "host_not_allowed", ip).await);
+    match verify(state, &id_hash, &session, need == Need::Change, Some(ip)).await {
+        Ok(()) => {}
+        Err(Refusal::Db(e)) => return Err(internal(e)),
+        Err(Refusal::CouldNotConfirm) => {
+            return Err(pages::message(
+                state,
+                None,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Try again",
+                "Prism could not confirm your account just now; try again.",
+                None,
+            ));
         }
-        let _ = sqlx::query("UPDATE admin_sessions SET checked_at = now() WHERE id_hash = $1")
+        Err(refusal) => return Err(cut_page(state, refusal.reason())),
+    }
+    // Watching is not activity (admin-ui-live-feed design §3.3).
+    if need != Need::Poll {
+        let _ = sqlx::query("UPDATE admin_sessions SET last_seen_at = now() WHERE id_hash = $1")
             .bind(id_hash.as_slice())
             .execute(&state.pool)
             .await;
-        let _ = sqlx::query("UPDATE admin_operators SET pds_endpoint = $2, pds_checked_at = now() WHERE did = $1")
-            .bind(&did)
-            .bind(&fresh)
-            .execute(&state.pool)
-            .await;
     }
-    let _ = sqlx::query("UPDATE admin_sessions SET last_seen_at = now() WHERE id_hash = $1")
-        .bind(id_hash.as_slice())
-        .execute(&state.pool)
-        .await;
+    let did = session.did;
     let handle: Option<String> = sqlx::query_scalar("SELECT handle FROM actors WHERE did = $1")
         .bind(&did)
         .fetch_optional(&state.pool)

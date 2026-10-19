@@ -20,6 +20,7 @@ use serde_json::Value;
 use sqlx::{Connection, PgConnection, PgPool};
 
 use super::classifier::{EcosystemKind, NSID_LISTBLOCK, RecordClass, classify, skip_reason};
+use super::feed::{FeedOp, FeedTap, Kind as FeedKind, Outcome as FeedOutcome};
 use super::jobs::{self, Depth};
 use super::normalize::normalize_record;
 use super::records::{GraphRecord, PostRecord, ProfileRecord, RecordError, SubjectRecord, private_subjects};
@@ -606,6 +607,47 @@ pub struct Writer {
     /// Told after a commit that changed a member's list-block references,
     /// so the list phase follows at once rather than at its next poll.
     applier: Option<Applier>,
+    /// The admin UI's live feed (admin-ui-live-feed design §4), when the
+    /// web UI is on.
+    feed: Option<FeedTap>,
+}
+
+/// The live feed's view of one call's ops (admin-ui-live-feed design
+/// §4.1): each op's kind, action and outcome, and, only for a written
+/// public post, a borrow of its `text`. Nothing else of a record leaves
+/// here; a private record's body is never parsed, so there is none.
+fn feed_view<'a>(prepared: &'a [Prepared], ops: &'a [RawOp], report: &'a ApplyReport) -> impl Iterator<Item = FeedOp<'a>> {
+    prepared.iter().zip(ops).zip(&report.outcomes).map(|((p, op), outcome)| {
+        let outcome = match outcome {
+            OpOutcome::Written => FeedOutcome::Written,
+            OpOutcome::Unchanged => FeedOutcome::Unchanged,
+            OpOutcome::GrowOnly => FeedOutcome::ReferenceOnly,
+            OpOutcome::Rejected(reason) | OpOutcome::Skipped(reason) => FeedOutcome::from_reason(reason),
+            OpOutcome::Failed(_) => FeedOutcome::Failed,
+        };
+        let (kind, text) = match p {
+            Prepared::Upsert(u) => match &u.body {
+                Body::Post(post) => {
+                    let kind = if post.reply_parent.is_some() { FeedKind::Reply } else { FeedKind::Post };
+                    (kind, (outcome == FeedOutcome::Written).then_some(post.text.as_str()))
+                }
+                _ => (feed_kind(u.input.kind, op), None),
+            },
+            Prepared::Delete(d) => (feed_kind(d.kind, op), None),
+            Prepared::Skip(_) => (FeedKind::Other, None),
+            Prepared::Invalid(_) => (FeedKind::from_class(classify(&op.collection, &op.rkey)), None),
+        };
+        FeedOp { kind, action: op.action, outcome, text }
+    })
+}
+
+/// A record kind as the feed names it; a public table's record by its
+/// collection.
+fn feed_kind(kind: RecordKind, op: &RawOp) -> FeedKind {
+    match kind {
+        RecordKind::Table(_) => FeedKind::from_class(classify(&op.collection, &op.rkey)),
+        other => FeedKind::from_record_kind(other),
+    }
 }
 
 impl Writer {
@@ -620,7 +662,21 @@ impl Writer {
             subscription_limits: copy::Limits { max_items: 50_000, tombstones_max_per_owner: 10_000 },
             list_budget: Budget { max_references: 25, max_owners: 10 },
             applier: None,
+            feed: None,
         }
+    }
+
+    /// Tell `tap` about every applied op (admin-ui-live-feed design §4.1).
+    #[must_use]
+    pub fn with_feed(mut self, tap: FeedTap) -> Self {
+        self.feed = Some(tap);
+        self
+    }
+
+    /// The live feed's tap, when the web UI is on.
+    #[must_use]
+    pub fn feed(&self) -> Option<&FeedTap> {
+        self.feed.as_ref()
     }
 
     /// Set a member's list-block budget, and the applier to tell when a
@@ -678,6 +734,24 @@ impl Writer {
     /// [`Transient`] when the call must be retried whole.
     pub async fn apply(
         &self,
+        repo: &str,
+        rev: &str,
+        ops: &[RawOp],
+        options: ApplyOptions,
+    ) -> Result<ApplyReport, Transient> {
+        self.apply_from(None, repo, rev, ops, options).await
+    }
+
+    /// [`Writer::apply`] for a commit from the relay labelled `relay` (the
+    /// firehose worker), which the live feed shows (admin-ui-live-feed
+    /// design §4.1).
+    ///
+    /// # Errors
+    ///
+    /// [`Transient`] when the call must be retried whole.
+    pub async fn apply_from(
+        &self,
+        relay: Option<&str>,
         repo: &str,
         rev: &str,
         ops: &[RawOp],
@@ -757,6 +831,9 @@ impl Writer {
         if !forced && nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options) {
             let report = report_without_writes(&prepared, &admissions, ops);
             drop(guard);
+            if let Some(tap) = &self.feed {
+                tap.observe(feed_view(&prepared, ops, &report), options.source, relay, repo);
+            }
             return Ok(report);
         }
 
@@ -832,6 +909,9 @@ impl Writer {
         drop(guard);
         self.commit_effects(effects).await;
         self.commit_copied(copied).await;
+        if let Some(tap) = &self.feed {
+            tap.observe(feed_view(&prepared, ops, &report), options.source, relay, repo);
+        }
         Ok(report)
     }
 
@@ -3256,6 +3336,85 @@ mod tests {
 
         async fn count(pool: &PgPool, sql: &str) -> i64 {
             sqlx::query_scalar(sql).fetch_one(pool).await.expect(sql)
+        }
+
+        /// T-F1 (admin-ui-live-feed design §11): with the tap installed and
+        /// no stream open, 10 000 ops from the firehose and backfill with
+        /// mixed outcomes build no line and send nothing, and the counters
+        /// equal the outcomes; a writer without a tap returns the same
+        /// reports and writes the same rows.
+        #[tokio::test]
+        async fn t_f1_the_tap_costs_nothing_unwatched() {
+            use crate::firehose::feed::{FeedTap, Outcome, Source};
+            let Some(tapped_db) = fresh_db("writer_t_f1_tap").await else {
+                return;
+            };
+            let Some(plain_db) = fresh_db("writer_t_f1_plain").await else {
+                return;
+            };
+            let tap = FeedTap::new(true);
+            let tapped = writer(&tapped_db.pool, true).with_feed(tap.clone());
+            let plain = writer(&plain_db.pool, true);
+            let quiet = ApplyOptions { advance_applied_rev: false, dead_letter_readiness: false, ..OPTIONS };
+            let mut expected: std::collections::HashMap<Outcome, u64> = std::collections::HashMap::new();
+            let mut by_source = [0u64; 2];
+            for i in 0..100 {
+                let source = if i % 2 == 0 { WriteSource::Firehose } else { WriteSource::Backfill };
+                let options = ApplyOptions { source, ..quiet };
+                // Half the calls come from a repo in scope, half from one
+                // outside it (nothing to write).
+                let repo = if i % 4 < 2 { AUTHOR } else { "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz" };
+                let ops: Vec<RawOp> = (0..100)
+                    .map(|j| {
+                        let rkey = format!("3k{i:04}{j:03}aaaa");
+                        match j % 4 {
+                            0 | 3 => RawOp {
+                                action: Action::Create,
+                                collection: "app.bsky.feed.post".into(),
+                                rkey: rkey.clone(),
+                                cid: Some(format!("bafy{rkey}")),
+                                record: Some(json!({"text": format!("post {rkey}"), "createdAt": "2026-10-19T00:00:00Z"})),
+                            },
+                            1 => op(Action::Create, "app.bsky.feed.generator", &rkey, Some(json!({}))),
+                            _ => op(Action::Create, "app.bsky.feed.like", &rkey, Some(json!({"subject": 1}))),
+                        }
+                    })
+                    .collect();
+                let with = tapped.apply(repo, &rev(i % 100), &ops, options).await.expect("tapped");
+                let without = plain.apply(repo, &rev(i % 100), &ops, options).await.expect("plain");
+                assert_eq!(with, without, "the same report with and without a tap");
+                for outcome in &with.outcomes {
+                    let o = match outcome {
+                        OpOutcome::Written => Outcome::Written,
+                        OpOutcome::Unchanged => Outcome::Unchanged,
+                        OpOutcome::GrowOnly => Outcome::ReferenceOnly,
+                        OpOutcome::Rejected(r) | OpOutcome::Skipped(r) => Outcome::from_reason(r),
+                        OpOutcome::Failed(_) => Outcome::Failed,
+                    };
+                    *expected.entry(o).or_default() += 1;
+                }
+                by_source[usize::from(source != WriteSource::Firehose)] += 100;
+            }
+            let totals = tap.totals();
+            assert_eq!(tap.lines_built(), 0, "no line without a stream");
+            assert_eq!(tap.receivers(), 0, "no receiver, so nothing was ever sent");
+            assert!(expected.len() >= 4, "mixed outcomes: {expected:?}");
+            for o in Outcome::ALL {
+                assert_eq!(totals.outcome(o), expected.get(&o).copied().unwrap_or(0), "{o:?}");
+            }
+            let totals = &totals;
+            let source_total = |s: Source| -> u64 {
+                crate::firehose::feed::Kind::ALL.iter().flat_map(|k| Outcome::ALL.iter().map(move |o| totals.get(s, *k, *o))).sum()
+            };
+            assert_eq!([source_total(Source::Network), source_total(Source::Backfill)], by_source);
+            let rows = |p: PgPool| async move {
+                sqlx::query_as::<_, (String, String, String)>("SELECT uri, cid, text FROM posts ORDER BY uri").fetch_all(&p).await.expect("posts")
+            };
+            let written = rows(tapped_db.pool.clone()).await;
+            assert_eq!(written.len(), 50 * 50);
+            assert_eq!(written, rows(plain_db.pool.clone()).await, "the same rows");
+            tapped_db.drop_db().await;
+            plain_db.drop_db().await;
         }
 
         /// T-3, T-17 (public-indexing design §4.1): under the off rule a

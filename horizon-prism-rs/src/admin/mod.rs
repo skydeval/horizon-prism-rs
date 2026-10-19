@@ -1,16 +1,19 @@
 //! The web admin UI (docs/internal/design/admin-ui.md), slice S1: the
 //! shell under `/admin`, first-run setup, operator sign-in with ATProto
 //! OAuth and the host re-check, CSRF and confirmations, the members screen
-//! (#735), the activity page and the operators page.
+//! (#735), the audit log and the operators page; and Home's live feed of
+//! what Prism indexes (admin-ui-live-feed.md).
 //!
 //! Served by `serve` itself on its own origin, merged before
 //! `xrpc::router::finalize`, so it sits inside the global per-IP limit
 //! and the CORS layer (which never allows credentials). Pages are askama
-//! templates with no JavaScript; every change is a command in
+//! templates and work without JavaScript; Home alone loads one
+//! same-origin script for its live feed. Every change is a command in
 //! `admin_commands` with `requested_by`, run by the executor through the
 //! same code as the CLI's. Reads query the database directly.
 
 pub mod auth;
+pub mod live;
 pub mod oauth;
 pub mod operators;
 pub mod pages;
@@ -49,9 +52,29 @@ pub const CSS: &str = include_str!("static/admin.css");
 pub static CSS_HREF: LazyLock<String> =
     LazyLock::new(|| format!("/admin/static/admin-{}.css", &blake3::hash(CSS.as_bytes()).to_hex()[..12]));
 
-/// The `Content-Security-Policy` of every `/admin` response (§3).
+/// Home's live-feed script (admin-ui-live-feed design §5.3), compiled in.
+pub const JS: &str = include_str!("static/live.js");
+
+/// The script's path, hashed like the stylesheet's.
+pub static JS_HREF: LazyLock<String> =
+    LazyLock::new(|| format!("/admin/static/live-{}.js", &blake3::hash(JS.as_bytes()).to_hex()[..12]));
+
+/// The `Content-Security-Policy` of every `/admin` response (§3) but
+/// Home's.
 pub const CSP: &str =
     "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+/// Home's policy (admin-ui-live-feed design §8): its one script and its
+/// stream, from this origin only.
+pub const CSP_LIVE: &str = "default-src 'none'; style-src 'self'; img-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+/// Every `/admin` response's `Cache-Control` unless its handler set one.
+pub const NO_STORE: &str = "no-store, no-transform";
+
+/// The response marker by which Home asks for [`CSP_LIVE`]; the headers
+/// middleware stays the only writer of the header.
+#[derive(Debug, Clone, Copy)]
+pub struct LivePage;
 
 /// What the members screen shows of `[community]` (membership design §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +126,8 @@ pub struct Inner {
     pub setup_code_file: PathBuf,
     pub members: MembersInfo,
     pub limits: Limits,
+    /// The live feed's hub (admin-ui-live-feed design §4).
+    pub live: live::Hub,
 }
 
 /// The admin router's state. Cheap to clone.
@@ -119,7 +144,8 @@ impl Deref for AdminState {
 
 impl AdminState {
     /// The state over `pool`; OAuth fetches go through `fetcher` (a
-    /// [`oauth::NetFetch`] in `serve`).
+    /// [`oauth::NetFetch`] in `serve`); `live` is the hub whose tap the
+    /// writer was given.
     #[must_use]
     pub fn new(
         pool: PgPool,
@@ -127,6 +153,7 @@ impl AdminState {
         identity: Arc<dyn OperatorIdentity>,
         fetcher: Arc<dyn FetchHandler>,
         settings: AdminSettings,
+        live: live::Hub,
     ) -> Self {
         let oauth = Arc::new(oauth::client(&settings.public_hostname, fetcher));
         Self(Arc::new(Inner {
@@ -141,6 +168,7 @@ impl AdminState {
             setup_code_file: settings.setup_code_file,
             members: settings.members,
             limits: Limits::default(),
+            live,
         }))
     }
 
@@ -158,15 +186,19 @@ impl AdminState {
     }
 }
 
-/// The §3 headers on every `/admin` response. The hashed stylesheet sets
-/// its own `Cache-Control`; everything else is `no-store`.
+/// The §3 headers on every `/admin` response. The hashed stylesheet and
+/// script and the live stream set their own `Cache-Control`; everything
+/// else is `no-store, no-transform`. Home's `200` carries [`LivePage`] and
+/// gets [`CSP_LIVE`]; every other response [`CSP`].
 async fn headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
+    let live = response.extensions().get::<LivePage>().is_some();
     let h = response.headers_mut();
     if !h.contains_key(CACHE_CONTROL) {
-        h.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        h.insert(CACHE_CONTROL, HeaderValue::from_static(NO_STORE));
     }
-    h.insert(HeaderName::from_static("content-security-policy"), HeaderValue::from_static(CSP));
+    let csp = if live { CSP_LIVE } else { CSP };
+    h.insert(HeaderName::from_static("content-security-policy"), HeaderValue::from_static(csp));
     h.insert(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY"));
     // `same-origin`, not `no-referrer`: under `no-referrer` browsers send
     // `Origin: null` on form POSTs (Fetch, "append a request Origin
@@ -177,16 +209,22 @@ async fn headers(request: Request, next: Next) -> Response {
     response
 }
 
-async fn stylesheet(Path(file): Path<String>) -> Response {
-    if format!("/admin/static/{file}") != *CSS_HREF {
+/// The hashed stylesheet and script (§4; admin-ui-live-feed design §5.3).
+async fn static_file(Path(file): Path<String>) -> Response {
+    let path = format!("/admin/static/{file}");
+    let (content_type, body) = if path == *CSS_HREF {
+        ("text/css; charset=utf-8", CSS)
+    } else if path == *JS_HREF {
+        ("text/javascript; charset=utf-8", JS)
+    } else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
     (
         [
-            (CONTENT_TYPE, HeaderValue::from_static("text/css; charset=utf-8")),
+            (CONTENT_TYPE, HeaderValue::from_static(content_type)),
             (CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable")),
         ],
-        CSS,
+        body,
     )
         .into_response()
 }
@@ -205,7 +243,9 @@ fn route(m: MethodRouter<AdminState>) -> MethodRouter<AdminState> {
 pub fn router(state: AdminState) -> Router {
     let admin = Router::new()
         .route("/", route(get(pages::home::page)))
-        .route("/static/{file}", route(get(stylesheet)))
+        .route("/tiles", route(get(pages::home::tiles)))
+        .route("/live", route(get(live::stream::open)))
+        .route("/static/{file}", route(get(static_file)))
         .route("/setup", route(get(pages::setup::form).post(pages::setup::submit)))
         .route("/login", route(get(pages::login::form).post(pages::login::submit)))
         .route("/logout", route(post(pages::login::logout)))
@@ -217,7 +257,8 @@ pub fn router(state: AdminState) -> Router {
         .route("/members/deny", route(post(pages::members::deny)))
         .route("/members/allow", route(post(pages::members::allow)))
         .route("/commands/{id}", route(get(pages::commands::page)))
-        .route("/activity", route(get(pages::activity::page)))
+        .route("/audit", route(get(pages::audit::page)))
+        .route("/activity", route(get(pages::audit::moved)))
         .route("/operators", route(get(pages::operators::page)))
         .route("/operators/add", route(post(pages::operators::add)))
         .route("/operators/remove", route(post(pages::operators::remove)))
@@ -230,5 +271,7 @@ pub fn router(state: AdminState) -> Router {
     Router::new().nest("/admin", admin)
 }
 
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;

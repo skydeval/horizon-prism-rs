@@ -10,6 +10,50 @@ commit.
 
 ## [Unreleased]
 
+### Added (admin UI live feed, #245)
+
+Admin UI live feed (`docs/internal/design/admin-ui-live-feed.md`): Home
+shows what Prism indexes as it happens, and Activity is now the audit log.
+
+- **Operator action for a deployment with its own Caddyfile:** proxy
+  `/admin/live` without `encode` and with `flush_interval -1`, as the
+  shipped `docker/Caddyfile` now does; otherwise the compressor can hold
+  the stream back.
+- **Home's live feed.** One line per record the writer applies, from the
+  network (with the relay's label), backfill, `requestRecord` and its
+  catch-up, and identity events that queued a refresh: time, source,
+  action, kind and author (stored handle, else the DID), and for a written
+  public post its first 100 characters, cleaned
+  (`admin.live_feed_snippets`, file-only, default on). Never a private
+  post's content, an audience's members, an encoded body or any record's
+  subject. Newest first, 200 lines, pause and resume, kind and source
+  filters, about 50 lines a second per viewer; the rates beside it
+  (indexed by kind, skipped and rejected by reason) are exact. With
+  JavaScript off, Home shows the totals since Prism started and the last
+  minute's rates, and reloads itself every 30 seconds.
+- **The tap.** `Writer::apply_from` (with the relay label; `apply` keeps
+  its signature) tells the tap about every op at its two successful
+  returns, after commit and outside the scope guard. It always counts;
+  only while a stream is open, and only for a kind some stream wants, does
+  it build a line, at most 100 a second per (network or other, kind), on a
+  lossy broadcast of 4096. It never waits: a slow browser misses lines.
+- **The stream** `GET /admin/live` (server-sent events): a session and the
+  page limit at open, answered `401`, `429` or `503` and never a redirect;
+  the session re-checked every minute and at its own expiry; `end` with a
+  reason; two pages per session and eight streams in all (a refused open
+  ends nobody); renewed silently every 30 minutes; `Cache-Control:
+  no-store, no-transform`; a keepalive every 15 seconds; ended at shutdown
+  so a restart is not held. Watching (the stream, the tiles refresh at
+  `/admin/tiles`, Home's reload with JavaScript off) does not keep a
+  session alive.
+- **One script, on Home only**, compiled in at a hashed path; Home alone
+  has `script-src 'self'; connect-src 'self'` in its policy. Every
+  `/admin` response is now `Cache-Control: no-store, no-transform`.
+- **The audit log** at `/admin/audit`, last in the navigation;
+  `/admin/activity` answers `308` there with its query.
+- Metrics `admin_live_streams`, `admin_live_lines_not_shown_total{why}`,
+  `admin_live_handle_lookups_total{outcome}`.
+
 ### Fixed (admin UI forms)
 
 - **Every admin form failed with "This form expired" in a browser.** The

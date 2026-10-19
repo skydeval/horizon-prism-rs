@@ -2,7 +2,7 @@
 //! they share: the navigation, the message page, command rows in plain
 //! words, and enqueuing a command.
 
-pub mod activity;
+pub mod audit;
 pub mod commands;
 pub mod home;
 pub mod login;
@@ -26,7 +26,7 @@ pub struct Nav {
     /// How the operator is named: handle, else DID.
     pub who: String,
     pub csrf: String,
-    /// The current screen: `home`, `members`, `activity`, `operators`.
+    /// The current screen: `home`, `members`, `operators`, `audit`.
     pub current: &'static str,
 }
 

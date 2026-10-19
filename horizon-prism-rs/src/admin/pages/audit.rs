@@ -1,14 +1,16 @@
-//! Activity (`/admin/activity`, admin-ui design §6.11): commands newest
-//! first (when, who, what, state, the outcome in words with the raw result
-//! behind `<details>`), and sign-ins and setup events. Filters by who,
-//! what and state. Settings changes join with S2.
+//! The audit log (`/admin/audit`, admin-ui design §6.11, formerly
+//! Activity; admin-ui-live-feed design §9): commands newest first (when,
+//! who, what, state, the outcome in words with the raw result behind
+//! `<details>`), and sign-ins and setup events. Filters by who, what and
+//! state. Settings changes join with S2. `/admin/activity` answers `308`
+//! here with its query.
 
 use std::net::SocketAddr;
 
 use askama::Template;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Redirect, Response};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
@@ -30,8 +32,8 @@ pub struct LoginRow {
 type LoginTuple = (DateTime<Utc>, Option<String>, Option<String>, String, Option<String>);
 
 #[derive(Template)]
-#[template(path = "activity.html")]
-struct ActivityPage {
+#[template(path = "audit.html")]
+struct AuditPage {
     css: &'static str,
     nav: Option<Nav>,
     title: String,
@@ -104,10 +106,19 @@ fn link(f: &Filters, page: i64) -> String {
         }
     }
     query.append_pair("page", &page.to_string());
-    format!("/admin/activity?{}", query.finish())
+    format!("/admin/audit?{}", query.finish())
 }
 
-/// `GET /admin/activity`.
+/// `GET /admin/activity`: moved, so bookmarks keep working.
+pub async fn moved(RawQuery(query): RawQuery) -> Response {
+    let to = match query.filter(|q| !q.is_empty()) {
+        Some(q) => format!("/admin/audit?{q}"),
+        None => "/admin/audit".to_string(),
+    };
+    Redirect::permanent(&to).into_response()
+}
+
+/// `GET /admin/audit`.
 pub async fn page(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -161,10 +172,10 @@ pub async fn page(
         .collect();
     render(
         StatusCode::OK,
-        &ActivityPage {
+        &AuditPage {
             css: css(),
-            nav: Some(Nav::new(&op, "activity")),
-            title: "Activity".to_string(),
+            nav: Some(Nav::new(&op, "audit")),
+            title: "Audit log".to_string(),
             commands: commands.into_iter().map(CommandRow::from_tuple).collect(),
             logins,
             who: who.unwrap_or_default().to_string(),

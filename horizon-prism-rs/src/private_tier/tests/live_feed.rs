@@ -1,0 +1,117 @@
+//! T-F4 (admin-ui-live-feed design §11): private content never reaches
+//! the admin UI's live feed. Records are written through the real writer
+//! with the real private tier and at-rest hooks, and an operator's stream
+//! and Home are read over HTTP.
+
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+use super::*;
+use crate::admin::live::Hub;
+use crate::admin::test_support::{OPERATOR, OPERATOR_PDS, Sse, page_id, serve, session};
+use crate::firehose::classifier::NSID_PRIVATE_BLOCK;
+
+const PRIVATE_TEXT: &str = "marker-private-text-41f3";
+const AUDIENCE_MEMBER: &str = "did:plc:mmmmmmmmmmmmmmmmmmmmmmmm";
+const BLOCKED: &str = "did:plc:kkkkkkkkkkkkkkkkkkkkkkkk";
+const HIDDEN_REPLY: &str = "at://did:plc:hhhhhhhhhhhhhhhhhhhhhhhh/app.bsky.feed.post/3khiddenmark";
+const PUBLIC_TEXT: &str = "marker public text 7c2e";
+
+/// Every `lines` and `counts` payload of `stream` within `within`.
+async fn payloads(stream: &mut Sse, within: Duration) -> Vec<(String, String)> {
+    stream.collect(within).await.into_iter().filter(|(n, _)| n == "lines" || n == "counts").collect()
+}
+
+fn lines(events: &[(String, String)]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|(n, _)| n == "lines")
+        .flat_map(|(_, d)| serde_json::from_str::<Vec<Value>>(d).expect("lines"))
+        .collect()
+}
+
+#[tokio::test]
+async fn t_f4_private_content_never_in_a_line() {
+    let Some(db) = fresh_db("live_feed_t_f4").await else {
+        return;
+    };
+    let mut f = fixture(&db.pool, "live_feed_t_f4").await;
+    let hub = Hub::new(true);
+    f.writer = f.writer.clone().with_feed(hub.tap());
+    let mut served = serve(&f.pool, hub.clone(), None).await;
+    let cookie = session(&f.pool, OPERATOR, OPERATOR_PDS).await;
+    let mut stream = Sse::open(&served.base, &format!("/admin/live?page={}", page_id()), Some(&cookie)).await;
+    assert_eq!(stream.status, 200);
+
+    // The private records, each carrying a marker, and a public post.
+    let audience = format!("at://{ALICE}/{NSID_AUDIENCE}/3kaudmarker1");
+    f.ingest(ALICE, NSID_AUDIENCE, "3kaudmarker1", json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [AUDIENCE_MEMBER], "createdAt": "2026-09-26T00:00:00Z"}))
+        .await;
+    let encoded = f.encoded_post(ALICE, "3kprivmarker", PRIVATE_TEXT, Some(&audience)).await;
+    let ciphertext = encoded["encodedContent"].as_str().expect("hex").to_string();
+    f.ingest(ALICE, NSID_POST_PRIVATE, "3kprivmarker", encoded).await;
+    f.ingest(ALICE, NSID_PRIVATE_BLOCK, "3kblockmark1", json!({"$type": NSID_PRIVATE_BLOCK, "subject": BLOCKED, "createdAt": "2026-09-26T00:00:00Z"}))
+        .await;
+    let private_uri = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3kprivmarker");
+    f.ingest(
+        ALICE,
+        "app.bsky.feed.threadgate",
+        "3kprivmarker",
+        json!({"$type": "app.bsky.feed.threadgate", "post": private_uri, "allow": [], "hiddenReplies": [HIDDEN_REPLY], "createdAt": "2026-09-26T00:00:00Z"}),
+    )
+    .await;
+    f.ingest(BOB, "app.bsky.feed.post", "3kpublicmark", json!({"text": PUBLIC_TEXT, "createdAt": "2026-09-26T00:00:00Z"})).await;
+
+    let events = payloads(&mut stream, Duration::from_millis(2500)).await;
+    let home = reqwest::Client::new()
+        .get(format!("{}/admin", served.base))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .expect("home");
+    assert_eq!(home.status(), 200);
+    let home = home.text().await.expect("body");
+    let markers: [&str; 6] = [PRIVATE_TEXT, &ciphertext, AUDIENCE_MEMBER, BLOCKED, HIDDEN_REPLY, "3khiddenmark"];
+    for (name, data) in &events {
+        for m in markers {
+            assert!(!data.contains(m), "{name} carries a private marker: {data}");
+        }
+    }
+    for m in markers {
+        assert!(!home.contains(m), "Home carries a private marker");
+    }
+    // The private kinds are on the feed, with the author only.
+    let all = lines(&events);
+    for kind in ["audience", "private-post", "private-block", "private-post-gate"] {
+        let line = all.iter().find(|l| l["k"] == kind).unwrap_or_else(|| panic!("a {kind} line: {all:?}"));
+        assert_eq!(line["did"], ALICE, "{kind}");
+        assert_eq!(line["who"], "alice.test", "{kind}");
+        assert!(line.get("text").is_none(), "{kind} has no text");
+        let keys: Vec<&String> = line.as_object().expect("object").keys().collect();
+        assert!(keys.iter().all(|k| ["t", "src", "relay", "act", "k", "did", "who"].contains(&k.as_str())), "{keys:?}");
+    }
+    // The public marker is in its own line's snippet and nowhere else.
+    let public: Vec<&Value> = all.iter().filter(|l| l.to_string().contains(PUBLIC_TEXT)).collect();
+    assert_eq!(public.len(), 1, "{all:?}");
+    assert_eq!((public[0]["k"].as_str(), public[0]["did"].as_str(), public[0]["text"].as_str()), (Some("post"), Some(BOB), Some(PUBLIC_TEXT)));
+    assert!(!events.iter().filter(|(n, _)| n == "counts").any(|(_, d)| d.contains(PUBLIC_TEXT)));
+    drop(stream);
+    served.shut_down();
+
+    // Snippets off: no line has a `text` field at all.
+    let quiet = Hub::new(false);
+    f.writer = f.writer.clone().with_feed(quiet.tap());
+    let mut served = serve(&f.pool, quiet.clone(), None).await;
+    let mut stream = Sse::open(&served.base, &format!("/admin/live?page={}", page_id()), Some(&cookie)).await;
+    assert_eq!(stream.status, 200);
+    f.ingest(BOB, "app.bsky.feed.post", "3kpublicmar2", json!({"text": PUBLIC_TEXT, "createdAt": "2026-09-26T00:00:00Z"})).await;
+    let events = payloads(&mut stream, Duration::from_millis(1500)).await;
+    let all = lines(&events);
+    assert!(all.iter().any(|l| l["did"] == BOB && l["k"] == "post"), "{all:?}");
+    assert!(all.iter().all(|l| l.get("text").is_none()), "{all:?}");
+    assert!(!events.iter().any(|(_, d)| d.contains(PUBLIC_TEXT)));
+    drop(stream);
+    served.shut_down();
+    db.drop_db().await;
+}

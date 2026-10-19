@@ -3,6 +3,9 @@
 //! and a stub authorization server behind the `FetchHandler` seam, served
 //! through `xrpc::router::finalize` as `serve` composes it.
 
+// The live feed (admin-ui-live-feed design §11).
+mod feed;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,6 +127,9 @@ struct Harness {
     identity: Arc<StubIdentity>,
     oauth: Arc<StubAs>,
     code_file: PathBuf,
+    hub: live::Hub,
+    shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    served: Mutex<Option<tokio::task::JoinHandle<()>>>,
     _drainer: Box<dyn Send>,
 }
 
@@ -133,7 +139,23 @@ impl Harness {
     }
 }
 
+/// The live feed's timings, shortened for tests.
+fn quick() -> live::Timing {
+    live::Timing {
+        check: Duration::from_millis(300),
+        renew: Duration::from_secs(1800),
+        reserve: Duration::from_secs(10),
+        batch: Duration::from_millis(100),
+        counts: Duration::from_millis(500),
+        keepalive: Duration::from_secs(15),
+    }
+}
+
 async fn harness(name: &str) -> Option<Harness> {
+    harness_with(name, quick(), true).await
+}
+
+async fn harness_with(name: &str, timing: live::Timing, snippets: bool) -> Option<Harness> {
     let db = fresh_db(name).await?;
     let identity = Arc::new(StubIdentity::default());
     let oauth = Arc::new(StubAs::default());
@@ -150,12 +172,14 @@ async fn harness(name: &str) -> Option<Harness> {
         setup_code_file: code_file.clone(),
         members: MembersInfo { auto_enroll: false, max_members: 1000, enroll_pds_patterns: Vec::new() },
     };
+    let hub = live::Hub::with_timing(snippets, timing);
     let admin = AdminState::new(
         db.pool.clone(),
         scope,
         Arc::clone(&identity) as Arc<dyn OperatorIdentity>,
         Arc::clone(&oauth) as Arc<dyn FetchHandler>,
         settings,
+        hub.clone(),
     );
     let (auth, drainer) = verifier(StubFetcher::default(), 10, 4);
     let app = AppState {
@@ -170,10 +194,29 @@ async fn harness(name: &str) -> Option<Harness> {
     let routes = finalize(router(admin), app, FinalConfig { not_ready_retry_secs: 5, public: Default::default() });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>()).await.expect("serve");
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let closing = hub.clone();
+    // As `serve` composes it: the hub closes when shutdown begins.
+    let served = tokio::spawn(async move {
+        axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+                closing.close();
+            })
+            .await
+            .expect("serve");
     });
-    Some(Harness { db, base: format!("http://{addr}"), identity, oauth, code_file, _drainer: Box::new(drainer) })
+    Some(Harness {
+        db,
+        base: format!("http://{addr}"),
+        identity,
+        oauth,
+        code_file,
+        hub,
+        shutdown: Mutex::new(Some(tx)),
+        served: Mutex::new(Some(served)),
+        _drainer: Box::new(drainer),
+    })
 }
 
 /// A browser: no redirects followed, cookies kept by hand.
@@ -310,14 +353,20 @@ fn csrf_of(page: &Page) -> String {
     field(&page.body, "csrf").expect("csrf")
 }
 
-/// T-A16: the §3 headers.
+/// T-A16: the §3 headers, with [`CSP`].
 fn assert_admin_headers(page: &Page, what: &str) {
-    let h = |n: &str| page.headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
-    assert_eq!(h("content-security-policy"), CSP, "{what}");
+    assert_headers_with(&page.headers, what, CSP);
+}
+
+/// T-A16 (amended by admin-ui-live-feed §11): the §3 headers, with the
+/// expected policy.
+fn assert_headers_with(headers: &RHeaders, what: &str, csp: &str) {
+    let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    assert_eq!(h("content-security-policy"), csp, "{what}");
     assert_eq!(h("x-frame-options"), "DENY", "{what}");
     assert_eq!(h("referrer-policy"), "same-origin", "{what}");
     assert_eq!(h("x-content-type-options"), "nosniff", "{what}");
-    assert!(page.headers.get("access-control-allow-credentials").is_none(), "{what}");
+    assert!(headers.get("access-control-allow-credentials").is_none(), "{what}");
 }
 
 /// T-A1: the code's life across starts. The first start writes the row
@@ -442,7 +491,7 @@ async fn t_a2_setup_flow() {
     // The form, the stylesheet, and the headers.
     let form = b.get(&format!("{}/admin/setup", h.base)).await;
     assert_admin_headers(&form, "setup form");
-    assert_eq!(form.headers.get("cache-control").and_then(|v| v.to_str().ok()), Some("no-store"));
+    assert_eq!(form.headers.get("cache-control").and_then(|v| v.to_str().ok()), Some("no-store, no-transform"));
     let css = b.get(&format!("{}{}", h.base, *CSS_HREF)).await;
     assert_eq!(css.status, 200);
     assert!(css.headers.get("cache-control").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("max-age=31536000")));
@@ -733,8 +782,8 @@ async fn t_a7_csrf_and_confirmation() {
     let page = alice.get(&format!("{}{location}", h.base)).await;
     assert_eq!(page.status, 200);
     assert!(page.body.contains("Waiting to run") && page.body.contains("http-equiv=\"refresh\""), "{}", page.body);
-    // The activity page lists it, by who.
-    let activity = alice.get(&format!("{}/admin/activity?what=member+remove", h.base)).await;
+    // The audit log lists it, by who.
+    let activity = alice.get(&format!("{}/admin/audit?what=member+remove", h.base)).await;
     assert_eq!(activity.status, 200);
     assert!(activity.body.contains("Remove member did:plc:cccccccccccccccccccccccc"));
     // Sign-out needs the token too.
@@ -753,13 +802,39 @@ async fn t_a16_headers_everywhere() {
         return;
     };
     let alice = complete_setup(&h, ALICE).await;
-    for path in ["/admin", "/admin/members", "/admin/activity", "/admin/operators", "/admin/nowhere", "/admin/login"] {
+    let js = JS_HREF.as_str();
+    let css = CSS_HREF.as_str();
+    for path in [
+        "/admin",
+        "/admin/members",
+        "/admin/audit",
+        "/admin/activity",
+        "/admin/tiles",
+        "/admin/operators",
+        "/admin/nowhere",
+        "/admin/login",
+        js,
+        css,
+    ] {
         let page = alice.send(alice.http.get(format!("{}{path}", h.base)).header("origin", "https://elsewhere.example")).await;
-        assert_admin_headers(&page, path);
+        let csp = if path == "/admin" { CSP_LIVE } else { CSP };
+        assert_headers_with(&page.headers, path, csp);
+        let cache = page.headers.get("cache-control").and_then(|v| v.to_str().ok()).unwrap_or_default();
+        if path == js || path == css {
+            assert_eq!(cache, "public, max-age=31536000, immutable", "{path}");
+        } else {
+            assert_eq!(cache, NO_STORE, "{path}");
+        }
         if path == "/admin/nowhere" {
             assert_eq!(page.status, 404);
         }
     }
+    // The stream without a session: 401 with the headers, never a redirect.
+    let stranger = Browser::new();
+    let live = stranger.get(&format!("{}/admin/live?page={}", h.base, test_support::page_id())).await;
+    assert_eq!(live.status, 401);
+    assert!(live.headers.get(LOCATION).is_none());
+    assert_admin_headers(&live, "/admin/live");
     let wrong_verb = alice.send(alice.http.delete(format!("{}/admin/members", h.base))).await;
     assert_eq!(wrong_verb.status, 405);
     assert_admin_headers(&wrong_verb, "wrong verb");

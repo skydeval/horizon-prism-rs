@@ -3,12 +3,24 @@
 # Caddy provisions and renews the certificate, redirects HTTP to HTTPS, and sets
 # X-Forwarded-For/-Proto/-Host. trusted_proxies is deliberately unset, so client-
 # supplied X-Forwarded-For is replaced with the real client address.
+#
+# /admin/live is the admin UI's live feed, a server-sent event stream
+# (admin-ui-live-feed design §3.1): proxied without encode, which could hold
+# bytes in the compressor, and flushed at once.
 
 {
 	email {$CADDY_ACME_EMAIL}
 }
 
 {$APP_PUBLIC_HOSTNAME} {
-	encode zstd gzip
-	reverse_proxy app:3030
+	@live path /admin/live
+	handle @live {
+		reverse_proxy app:3030 {
+			flush_interval -1
+		}
+	}
+	handle {
+		encode zstd gzip
+		reverse_proxy app:3030
+	}
 }

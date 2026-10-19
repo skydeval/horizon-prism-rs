@@ -1,7 +1,7 @@
 /* Prism admin UI: the one stylesheet (admin-ui design §4, C-A1 (b)).
    Every colour, font and size is a token in the first two blocks, so the
    look is changed here and nowhere else. Light and dark follow the device.
-   No JavaScript, no external files, no inline styles. */
+   No external files, no inline styles; Home's one script sets classes only. */
 
 :root {
   color-scheme: light;
@@ -262,6 +262,29 @@ button.danger { background: var(--bad); border-color: var(--bad); color: var(--b
 td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
 
 .row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-top: 1.25rem; }
+
+/* Home's live feed (admin-ui-live-feed design §5). The script sets classes
+   and the hidden attribute only, never a style. */
+[hidden] { display: none !important; }
+.asof { font-size: 0.8rem; margin: 0 0 1rem; }
+.pill { display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px; background: var(--pill); color: var(--muted); font-size: 0.8rem; font-weight: 600; }
+.pill.on { background: var(--ok-bg); color: var(--ok); }
+.pill.off { background: var(--bad-bg); color: var(--bad); }
+.live-head { display: flex; gap: 0.75rem; align-items: baseline; }
+.live-head h2 { margin-bottom: 0.5rem; }
+.live-controls { display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center; margin: 0.75rem 0; }
+.live-controls select { width: auto; }
+.live-rates .fact .v, #live-rates .fact .v { font-variant-numeric: tabular-nums; }
+.live-list { list-style: none; margin: 0; padding: 0; font-family: var(--font-mono); font-size: 0.82rem; border-top: 1px solid var(--line); }
+.live-list li { display: flex; flex-wrap: wrap; gap: 0 0.75rem; padding: 0.3rem 0; border-bottom: 1px solid var(--line); }
+.live-list .t, .live-list .src { color: var(--muted); }
+.live-list .k { font-weight: 600; }
+.live-list .who { color: var(--accent); overflow-wrap: anywhere; }
+.live-list .text { flex-basis: 100%; font-family: var(--font-sans); color: var(--fg); overflow-wrap: anywhere; }
+/* With scripting off, the noscript line says so instead. */
+@media (scripting: none) {
+  #live-notstarted { display: none; }
+}
 
 /* Phone width */
 @media (max-width: 40rem) {

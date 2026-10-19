@@ -10,6 +10,8 @@ mod b5;
 // B-5 part (3) on the deploy build (private-threads amendment 1 §2).
 mod b5_release;
 mod builder;
+// The admin UI's live feed shows no private content (T-F4).
+mod live_feed;
 mod round;
 mod threads;
 // The shared walk (#720): T-60 to T-63.

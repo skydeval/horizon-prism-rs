@@ -18,8 +18,8 @@
 <nav>
 <a href="/admin"{% if nav.current == "home" %} aria-current="page"{% endif %}>Home</a>
 <a href="/admin/members"{% if nav.current == "members" %} aria-current="page"{% endif %}>Members</a>
-<a href="/admin/activity"{% if nav.current == "activity" %} aria-current="page"{% endif %}>Activity</a>
 <a href="/admin/operators"{% if nav.current == "operators" %} aria-current="page"{% endif %}>Operators</a>
+<a href="/admin/audit"{% if nav.current == "audit" %} aria-current="page"{% endif %}>Audit log</a>
 </nav>
 <span class="bar-end">
 <span class="muted who">{{ nav.who }}</span>

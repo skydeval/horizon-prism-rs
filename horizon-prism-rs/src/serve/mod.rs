@@ -291,8 +291,16 @@ pub async fn run() -> Result<(), StartupError> {
         max_references: cfg.file.lists.subscribed_max_per_member,
         max_owners: cfg.file.lists.max_owners_per_member,
     };
-    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private))
-        .with_list_references(list_budget, applier.clone())
+    // The live feed's hub (admin-ui-live-feed design §4.1), before the
+    // writer, so every clone of the writer carries its tap; only with the
+    // web UI on.
+    let live_hub = cfg.file.admin.web_ui.then(|| crate::admin::live::Hub::new(cfg.file.admin.live_feed_snippets));
+    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private));
+    let writer = match &live_hub {
+        Some(hub) => writer.with_feed(hub.tap()),
+        None => writer,
+    }
+    .with_list_references(list_budget, applier.clone())
         .with_subscribed_post_max_age_secs(cfg.file.notifications.subscribed_post_max_age_secs)
         .with_private_notify_max_age_hours(cfg.file.private_notify.backfill_max_age_hours)
         .with_subscription_limits(subscriptions::copy::Limits {
@@ -834,15 +842,17 @@ pub async fn run() -> Result<(), StartupError> {
     // The web admin UI (admin-ui design §3), unless `admin.web_ui` is off:
     // its OAuth fetches through the public transport, its identity work
     // through the internal one (§5.10).
-    let admin_routes = if cfg.file.admin.web_ui {
+    let admin_routes = if let Some(hub) = &live_hub {
         let admin = crate::admin::AdminState::new(
             pool.clone(),
             scope.clone(),
             Arc::new(resolver.with_intent(Intent::Internal)),
             Arc::new(crate::admin::oauth::NetFetch(nets.public().client().clone())),
             admin_settings,
+            hub.clone(),
         );
         tasks.push(admin.spawn_housekeeping());
+        tasks.push(hub.spawn_sampler());
         crate::admin::router(admin)
     } else {
         axum::Router::new()
@@ -866,8 +876,16 @@ pub async fn run() -> Result<(), StartupError> {
             public: crate::honest_501::PublicMessages::from_config(&cfg.file),
         },
     );
+    // Graceful shutdown waits for open connections, so the live streams
+    // are ended first (admin-ui-live-feed design §3.5). A restart from the
+    // UI must resolve this same future.
     axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Some(hub) = live_hub {
+                hub.close();
+            }
+        })
         .await
         .map_err(|e| StartupError::new(1, format!("http server: {e}")))?;
     for t in tasks {

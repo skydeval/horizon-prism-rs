@@ -174,6 +174,7 @@ command_timeout_secs = 600
 web_ui = true
 session_idle_secs = 28800
 session_max_secs = 604800
+live_feed_snippets = true
 
 [cache]
 read_time_bytes = 268435456
@@ -875,6 +876,10 @@ fn admin_ui_sessions_are_checked() {
     let p = invalid_problems(load("[admin]\nsession_idle_secs = 0\n"));
     assert!(has(&p, "admin.session_idle_secs must be greater than 0"));
     assert!(!load("[admin]\nweb_ui = false\n").expect("valid").file.admin.web_ui);
+    // The live feed's snippets (admin-ui-live-feed design C-F1): on by
+    // default, off by the file.
+    assert!(cfg.file.admin.live_feed_snippets);
+    assert!(!load("[admin]\nlive_feed_snippets = false\n").expect("valid").file.admin.live_feed_snippets);
 }
 
 #[test]

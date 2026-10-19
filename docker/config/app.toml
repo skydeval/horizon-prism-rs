@@ -203,6 +203,10 @@ web_ui = true
 # sign-in in any case (admin-ui design §5.4).
 session_idle_secs = 28800
 session_max_secs = 604800
+# Lines of Home's live feed show the first 100 characters of each public post
+# written (admin-ui-live-feed design §5.2). Never private posts or any other
+# record's content.
+live_feed_snippets = true
 
 [cache]
 # In-process read-time cache budget (design §7.6).
