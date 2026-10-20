@@ -8,7 +8,9 @@ pub mod farsight;
 pub mod health;
 pub mod home;
 pub mod jobs;
+pub mod labels;
 pub mod login;
+pub mod lookup;
 pub mod members;
 pub mod operators;
 pub mod problems;
@@ -33,7 +35,8 @@ pub struct Nav {
     pub who: String,
     pub csrf: String,
     /// The current screen: `home`, `members`, `settings`, `health`,
-    /// `stats`, `jobs`, `problems`, `farsight`, `operators`, `audit`.
+    /// `stats`, `jobs`, `problems`, `farsight`, `labels`, `lookup`,
+    /// `operators`, `audit`.
     pub current: &'static str,
     /// Changes waiting for a restart, and settings that could not be used.
     pub banners: Banners,
@@ -179,8 +182,6 @@ pub fn describe(command: &str, args: &Value) -> String {
         "operator remove" => format!("Remove operator {}", arg(args, "did")),
         "operator host add" => format!("Allow sign-in from {}", arg(args, "pattern")),
         "operator host remove" => format!("Stop allowing sign-in from {}", arg(args, "pattern")),
-        "label add" => format!("Add label {} to {}", arg(args, "val"), arg(args, "subject")),
-        "label remove" => format!("Remove label {} from {}", arg(args, "val"), arg(args, "subject")),
         "scope rebuild" if args.get("dry_run") == Some(&Value::Bool(true)) => "Check the clean-up of the accounts Prism follows".to_string(),
         "scope rebuild" => "Clean up the accounts Prism follows now".to_string(),
         "backfill" => format!("Sync {} again", arg(args, "did")),
@@ -189,6 +190,11 @@ pub fn describe(command: &str, args: &Value) -> String {
         "deadletter drop" => format!("Dismiss record {}", arg(args, "id")),
         "farsight status" => "Ask Farsight for its status".to_string(),
         "farsight prime" => format!("Ask Farsight to read {} again", arg(args, "did")),
+        "label add" | "label remove" => {
+            let verb = if command == "label add" { "Add label" } else { "Remove label" };
+            let into = if command == "label add" { "to" } else { "from" };
+            format!("{verb} \"{}\" {into} {}", labels::label_name(arg(args, "val")), arg(args, "subject"))
+        }
         "farsight forget" => format!("Forget remembered blocks of {}", arg(args, "did")),
         "lists sync" => format!("Sync list {}", arg(args, "uri")),
         "lists purge" => format!("Clean up the lists of {}", arg(args, "did")),
@@ -293,6 +299,25 @@ pub fn outcome(command: &str, state: &str, result: Option<&Value>) -> String {
         ("resync", _) => {
             let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
             format!("Re-sync started: {} private-access checks and {} member re-syncs queued.", n("authz_jobs"), n("resync_jobs"))
+        }
+        ("label add", _) if r.get("added") == Some(&Value::Bool(false)) => "It already had this label; nothing changed.".to_string(),
+        ("label add", _) => "Added. Apps see it at once.".to_string(),
+        ("label remove", _) if r.get("removed") == Some(&Value::Bool(false)) => "It did not have this label; nothing changed.".to_string(),
+        ("label remove", _) => "Removed. Apps see it without the label at once.".to_string(),
+        ("farsight prime", _) => "Farsight was asked to read the account again; it does so in the background.".to_string(),
+        ("farsight forget", _) => {
+            let n = r.get("forgotten").and_then(Value::as_u64).unwrap_or(0);
+            format!("Forgot {n} remembered block{}.", if n == 1 { "" } else { "s" })
+        }
+        ("lists purge", _) => {
+            let n = |k: &str| r.get("deleted").and_then(|d| d.get(k)).and_then(Value::as_u64).unwrap_or(0);
+            format!(
+                "Cleaned up: {} lists, {} list entries, {} list blocks and {} list mutes deleted here.",
+                n("lists"),
+                n("list_items"),
+                n("list_blocks"),
+                n("list_mutes")
+            )
         }
         ("deadletter replay", _) => "Tried again: the record was read from its server and processed.".to_string(),
         ("deadletter drop", _) => "Dismissed.".to_string(),

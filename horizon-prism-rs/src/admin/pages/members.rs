@@ -1,8 +1,9 @@
 //! Members (`/admin/members`, admin-ui design §6.2; membership design §8,
 //! #735): the members with their readiness, the count against the limit,
 //! auto-join and its hosts, and the denials. Add; remove and deny (typed);
-//! allow. Handles come from stored `actors` rows, so a page makes no
-//! outbound call.
+//! allow. Per member (slice S5): sync again, ask Farsight to read again,
+//! forget remembered blocks (typed) and clean up lists (typed). Handles
+//! come from stored `actors` rows, so a page makes no outbound call.
 
 use std::net::SocketAddr;
 
@@ -58,6 +59,20 @@ struct MembersPage {
     page: i64,
     prev: Option<i64>,
     next: Option<i64>,
+    /// Farsight is set up: offer "ask Farsight to read again".
+    farsight: bool,
+    /// Farsight's memory of blocks is on: offer "forget".
+    memory: bool,
+}
+
+/// Whether Farsight is set up, and whether its memory of blocks is on.
+#[must_use]
+pub fn farsight_flags(state: &AdminState) -> (bool, bool) {
+    state
+        .health
+        .farsight
+        .as_ref()
+        .map_or((false, false), |f| (true, f.local_status().get("memory").is_some_and(serde_json::Value::is_object)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +153,7 @@ pub async fn page(
     } else {
         members.enroll_pds_patterns.join(", ")
     };
+    let (farsight, memory) = farsight_flags(&state);
     render(
         StatusCode::OK,
         &MembersPage {
@@ -155,6 +171,8 @@ pub async fn page(
             page,
             prev: (page > 0).then(|| page - 1),
             next: has_next.then_some(page + 1),
+            farsight,
+            memory,
         },
     )
 }
@@ -169,7 +187,7 @@ pub struct AddForm {
 
 /// An account typed into a form: a DID as is, a handle resolved (both
 /// ways) to its DID.
-async fn account(state: &AdminState, input: &str) -> Result<String, String> {
+pub async fn account(state: &AdminState, input: &str) -> Result<String, String> {
     let input = input.trim().trim_start_matches('@');
     if input.starts_with("did:") {
         return if proto_blue::syntax::Did::is_valid(input) { Ok(input.to_string()) } else { Err("That is not a valid DID.".to_string()) };
@@ -305,6 +323,131 @@ pub async fn deny(
         return r;
     }
     enqueue(&state, &op, &AdminCommand::MemberDeny { did: form.did.clone(), reason }).await
+}
+
+/// `POST /admin/members/resync`: sync the account again from its server (a
+/// `backfill`, of a member's kind for a member). Nothing is deleted.
+pub async fn resync(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<DidForm>,
+) -> Response {
+    let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
+        Ok(op) => op,
+        Err(response) => return response,
+    };
+    if let Some(r) = invalid_did(&state, &op, &form.did) {
+        return r;
+    }
+    enqueue(&state, &op, &AdminCommand::Backfill { did: form.did.clone(), depth: None }).await
+}
+
+/// The refusal of a Farsight action on a Prism without Farsight.
+fn no_farsight(state: &AdminState, op: &Operator) -> Option<Response> {
+    state.health.farsight.is_none().then(|| {
+        message(
+            state,
+            Some(Nav::new(op, "members")),
+            StatusCode::BAD_REQUEST,
+            "Not done",
+            "Farsight is not set up on this Prism, so there is nothing to ask it.",
+            Some(("/admin/members", "Members")),
+        )
+    })
+}
+
+/// `POST /admin/members/farsight-prime`: ask Farsight to read the account's
+/// own blocks and lists again now, even if it read them lately. Nothing
+/// here is deleted.
+pub async fn farsight_prime(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<DidForm>,
+) -> Response {
+    let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
+        Ok(op) => op,
+        Err(response) => return response,
+    };
+    if let Some(r) = invalid_did(&state, &op, &form.did).or_else(|| no_farsight(&state, &op)) {
+        return r;
+    }
+    enqueue(&state, &op, &AdminCommand::FarsightPrime { did: form.did.clone(), force: true }).await
+}
+
+/// `POST /admin/members/farsight-forget` (typed: the member's handle):
+/// delete the blocks Prism remembered from Farsight for this member.
+pub async fn farsight_forget(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<DidForm>,
+) -> Response {
+    let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
+        Ok(op) => op,
+        Err(response) => return response,
+    };
+    if let Some(r) = invalid_did(&state, &op, &form.did).or_else(|| no_farsight(&state, &op)) {
+        return r;
+    }
+    let page = ConfirmPage {
+        css: css(),
+        nav: Some(Nav::new(&op, "members")),
+        title: "Forget remembered blocks".to_string(),
+        what: format!(
+            "Prism deletes the list blocks it remembered from Farsight for {}. While Farsight answers, nothing changes for them: Prism asks Farsight again as they read. While Farsight is down, those blocks are missing until it is back.",
+            form.did
+        ),
+        undo: "This cannot be undone. Prism remembers blocks again as Farsight reports them.".to_string(),
+        action: "/admin/members/farsight-forget".to_string(),
+        csrf: op.csrf.clone(),
+        hidden: vec![Hidden { name: "did".to_string(), value: form.did.clone() }],
+        typed: None,
+        button: "Forget".to_string(),
+        error: None,
+    };
+    if let Err(r) = confirmed(&state, &form, page).await {
+        return r;
+    }
+    enqueue(&state, &op, &AdminCommand::FarsightForget { did: form.did.clone() }).await
+}
+
+/// `POST /admin/members/lists-purge` (typed: the account's handle): delete
+/// the account's list mutes and the lists it made, here only.
+pub async fn lists_purge(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<DidForm>,
+) -> Response {
+    let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
+        Ok(op) => op,
+        Err(response) => return response,
+    };
+    if let Some(r) = invalid_did(&state, &op, &form.did) {
+        return r;
+    }
+    let page = ConfirmPage {
+        css: css(),
+        nav: Some(Nav::new(&op, "members")),
+        title: "Clean up lists".to_string(),
+        what: format!(
+            "Prism deletes what it holds of {}'s lists: the lists they made, who is on them, their list blocks and their list mutes. Lists of other people that only they used are let go. Nothing is deleted from their own server.",
+            form.did
+        ),
+        undo: "This cannot be undone here. Lists still on their server come back the next time Prism syncs them.".to_string(),
+        action: "/admin/members/lists-purge".to_string(),
+        csrf: op.csrf.clone(),
+        hidden: vec![Hidden { name: "did".to_string(), value: form.did.clone() }],
+        typed: None,
+        button: "Clean up lists".to_string(),
+        error: None,
+    };
+    if let Err(r) = confirmed(&state, &form, page).await {
+        return r;
+    }
+    enqueue(&state, &op, &AdminCommand::ListsPurge { did: form.did.clone() }).await
 }
 
 /// `POST /admin/members/allow`: lifts a denial; adds nothing.

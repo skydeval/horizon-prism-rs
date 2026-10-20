@@ -7,7 +7,9 @@
 //! the restart (`settings`, `pages::settings`). Slice S3: Health, Jobs,
 //! Problems and Blocks (Farsight), the checks and Home's tiles over the
 //! in-process metrics (`health`). Slice S4: Stats, with the disks and
-//! counts (`stats`), endpoint usage (`usage`) and the Disk check.
+//! counts (`stats`), endpoint usage (`usage`) and the Disk check. Slice S5:
+//! Labels, Look up, and the per-member actions (sync again, Farsight read
+//! and forget, list clean-up).
 //!
 //! Served by `serve` itself on its own origin, merged before
 //! `xrpc::router::finalize`, so it sits inside the global per-IP limit
@@ -317,6 +319,14 @@ pub fn router(state: AdminState) -> Router {
         .route("/members/remove", route(post(pages::members::remove)))
         .route("/members/deny", route(post(pages::members::deny)))
         .route("/members/allow", route(post(pages::members::allow)))
+        .route("/members/resync", route(post(pages::members::resync)))
+        .route("/members/farsight-prime", route(post(pages::members::farsight_prime)))
+        .route("/members/farsight-forget", route(post(pages::members::farsight_forget)))
+        .route("/members/lists-purge", route(post(pages::members::lists_purge)))
+        .route("/labels", route(get(pages::labels::page)))
+        .route("/labels/add", route(post(pages::labels::add)))
+        .route("/labels/remove", route(post(pages::labels::remove)))
+        .route("/lookup", route(get(pages::lookup::page)))
         .route("/commands/{id}", route(get(pages::commands::page)))
         .route("/audit", route(get(pages::audit::page)))
         .route("/activity", route(get(pages::audit::moved)))

@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<form class="filters" method="get" action="/admin/lookup">
+<input type="text" name="q" value="{{ q }}" spellcheck="false" placeholder="A handle, a DID, or a post's link" aria-label="Account or post" required>
+<button type="submit">Look up</button>
+</form>
+<p class="muted">Everything Prism knows about one account. A post's link shows the account that wrote it, and the post's
+own labels.</p>
+{% if let Some(p) = problem %}<div class="banner bad">{{ p }}</div>{% endif %}
+{% if let Some(f) = found %}
+<h2>{{ f.name }}</h2>
+{% if let Some(r) = f.record %}
+<div class="card">
+<h3>The post or record</h3>
+<p><code>{{ r }}</code></p>
+{% for x in f.record_facts %}<div class="fact"><span class="l">{{ x.label }}</span><span class="v">{{ x.value }}</span></div>
+{% endfor %}
+</div>
+{% endif %}
+<div class="grid">
+<div class="card">
+<h3>Who it is</h3>
+{% for x in f.identity %}<div class="fact"><span class="l">{{ x.label }}</span><span class="v">{{ x.value }}</span></div>
+{% endfor %}
+<p class="muted">{{ f.source }}</p>
+</div>
+<div class="card">
+<h3>Membership</h3>
+{% for x in f.membership %}<div class="fact"><span class="l">{{ x.label }}</span><span class="v">{{ x.value }}</span></div>
+{% endfor %}
+</div>
+<div class="card">
+<h3>Why Prism follows it</h3>
+{% for x in f.scope %}<div class="fact"><span class="l">{{ x.label }}</span><span class="v">{{ x.value }}</span></div>
+{% endfor %}
+{% if f.in_scope %}
+{% if f.holds.is_empty() %}
+<p>Nothing held it when Prism last checked. Unless a member follows it or interacts with it again, the nightly
+clean-up lets it go.</p>
+{% else %}
+<ul>{% for h in f.holds %}<li>{{ h }}</li>{% endfor %}</ul>
+{% endif %}
+<p class="muted">As Prism last recorded it. The nightly clean-up checks again, and lets an account go once nothing holds
+it.</p>
+{% else %}
+<p class="muted">Prism stores this account's public posts only while a member is connected to it: a member, someone a
+member follows, or someone a member replied to, quoted, liked or reposted lately.</p>
+{% endif %}
+</div>
+<div class="card">
+<h3>Blocks</h3>
+{% for x in f.blocks %}<div class="fact"><span class="l">{{ x.label }}</span><span class="v">{{ x.value }}</span></div>
+{% endfor %}
+<p class="muted">{{ f.blocks_note }}</p>
+</div>
+<div class="card">
+<h3>Private posts</h3>
+{% for x in f.private %}<div class="fact"><span class="l">{{ x.label }}</span><span class="v">{{ x.value }}</span></div>
+{% endfor %}
+<p class="muted">Counts only. Prism never shows private posts here.</p>
+</div>
+</div>
+
+<h2>Labels</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>On</th><th>Label</th><th>Added</th><th></th></tr></thead>
+<tbody>
+{% for l in f.labels %}
+<tr>
+<td>{{ l.kind }}<br><code>{{ l.subject }}</code></td>
+<td>{{ l.name }}<br><span class="muted tech">{{ l.val }}</span></td>
+<td>{{ l.when }}</td>
+<td class="actions"><form class="inline" method="post" action="/admin/labels/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="subject" value="{{ l.subject }}"><input type="hidden" name="val" value="{{ l.val }}"><button class="secondary" type="submit">Remove…</button></form></td>
+</tr>
+{% else %}
+<tr><td colspan="4" class="muted">No labels on this account or its posts.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<div class="card">
+<h3>Add a label{% if f.record.is_some() %} to this post{% else %} to this account{% endif %}</h3>
+<form class="stack" method="post" action="/admin/labels/add">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="subject" value="{{ f.label_subject }}">
+<label for="add-val">Label</label>
+<select id="add-val" name="val">
+{% for c in f.choices %}<option value="{{ c.val }}">{{ c.name }}</option>
+{% endfor %}
+</select>
+<div class="row"><button type="submit">Add label</button><a class="button secondary" href="/admin/labels">What each label does</a></div>
+</form>
+</div>
+
+<h2>Sync jobs</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>Kind</th><th>State</th><th>Tries</th><th>Last problem</th><th>When</th></tr></thead>
+<tbody>
+{% for j in f.jobs %}
+<tr><td>{{ j.kind }}</td><td>{{ j.state }}</td><td>{{ j.attempts }}</td><td>{{ j.error }}</td><td>{{ j.when }}</td></tr>
+{% else %}
+<tr><td colspan="5" class="muted">No sync jobs for this account.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+<h2>Actions</h2>
+<div class="card">
+<div class="row">
+{% if f.member || f.in_scope %}<form class="inline" method="post" action="/admin/members/resync"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ f.did }}"><button class="secondary" type="submit">Sync again</button></form>{% endif %}
+{% if f.member %}
+{% if f.farsight %}<form class="inline" method="post" action="/admin/members/farsight-prime"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ f.did }}"><button class="secondary" type="submit">Ask Farsight to read again</button></form>{% endif %}
+{% if f.memory %}<form class="inline" method="post" action="/admin/members/farsight-forget"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ f.did }}"><button class="secondary" type="submit">Forget remembered blocks…</button></form>{% endif %}
+<form class="inline" method="post" action="/admin/members/lists-purge"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ f.did }}"><button class="secondary" type="submit">Clean up lists…</button></form>
+<form class="inline" method="post" action="/admin/members/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ f.did }}"><button class="secondary" type="submit">Remove member…</button></form>
+{% else if !f.denied %}
+<form class="inline" method="post" action="/admin/members/add"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="input" value="{{ f.did }}"><button class="secondary" type="submit">Add as a member</button></form>
+{% endif %}
+{% if f.denied %}
+<form class="inline" method="post" action="/admin/members/allow"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ f.did }}"><button class="secondary" type="submit">Lift denial</button></form>
+{% else %}
+<form class="inline" method="post" action="/admin/members/deny"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ f.did }}"><button class="secondary" type="submit">Deny…</button></form>
+{% endif %}
+</div>
+</div>
+{% endif %}
+{% endblock %}

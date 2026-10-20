@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Labels are this Prism's own moderation: what you put on an account or a post here applies to everyone
+who uses this Prism.</p>
+<div class="grid">
+<div class="card">
+<h2>Add a label</h2>
+<form class="stack" method="post" action="/admin/labels/add">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="add-subject">Account or post</label>
+<input type="text" id="add-subject" name="subject" spellcheck="false" value="{{ subject }}" placeholder="someone.example.com, did:…, or a post's link" required>
+<p class="hint">A handle, a DID, a post's link, or an at:// address.</p>
+<label for="add-val">Label</label>
+<select id="add-val" name="val">
+{% for c in choices %}<option value="{{ c.val }}">{{ c.name }}</option>
+{% endfor %}
+</select>
+<div class="row"><button type="submit">Add label</button></div>
+</form>
+</div>
+<div class="card labels-help">
+<h2>What each label does</h2>
+{% for c in choices %}<div class="fact"><span class="l">{{ c.name }}</span><span class="v">{{ c.meaning }}</span></div>
+{% endfor %}
+<p class="muted">Taking something down, and removing any label, ask you to type the account's handle to confirm.</p>
+</div>
+</div>
+
+<h2>Labels in use</h2>
+<form class="filters" method="get" action="/admin/labels">
+<input type="text" name="q" value="{{ q }}" spellcheck="false" placeholder="Account or post" aria-label="Account or post">
+<select name="val" aria-label="Label">
+<option value="">Every label</option>
+{% for c in filters %}<option value="{{ c.val }}"{% if c.selected %} selected{% endif %}>{{ c.name }}</option>
+{% endfor %}
+</select>
+<button class="secondary" type="submit">Show</button>
+{% if !q.is_empty() || !val.is_empty() %}<a class="button secondary" href="/admin/labels">Show all</a>{% endif %}
+</form>
+{% if let Some(p) = problem %}<div class="banner bad">{{ p }}</div>{% endif %}
+<div class="scroll">
+<table>
+<thead><tr><th>On</th><th>Label</th><th>Added</th><th></th></tr></thead>
+<tbody>
+{% for l in rows %}
+<tr>
+<td>{{ l.kind }} of <strong>{{ l.who }}</strong><br><code>{{ l.subject }}</code></td>
+<td>{{ l.name }}<br><span class="muted tech">{{ l.val }}</span></td>
+<td>{{ l.when }}</td>
+<td class="actions"><form class="inline" method="post" action="/admin/labels/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="subject" value="{{ l.subject }}"><input type="hidden" name="val" value="{{ l.val }}"><button class="secondary" type="submit">Remove…</button></form></td>
+</tr>
+{% else %}
+<tr><td colspan="4" class="muted">No labels{% if !q.is_empty() || !val.is_empty() %} match{% endif %}.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<div class="row">
+{% if prev.is_some() || next.is_some() %}<span class="muted">Page {{ page + 1 }}</span>{% endif %}
+{% if let Some(p) = prev %}<a class="button secondary" href="{{ p }}">Previous</a>{% endif %}
+{% if let Some(n) = next %}<a class="button secondary" href="{{ n }}">Next</a>{% endif %}
+</div>
+{% endblock %}

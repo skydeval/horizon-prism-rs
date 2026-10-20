@@ -10,6 +10,37 @@ commit.
 
 ## [Unreleased]
 
+### Added (admin UI S5: labels, look up, member actions, #763)
+
+Admin-ui design §6.2's per-member actions, §6.9, §6.10
+(`docs/internal/design/admin-ui.md`). The last slice of the design; scope
+rebuild and resync came with S3. No migration, no config key.
+
+- **Labels** at `/admin/labels`: the labels this Prism applies, newest
+  first, filtered by account (with its posts and records) or post and by
+  label; each of the six labels explained in words. Add a label to an
+  account or post typed as a handle, a DID, an `at://` address or a post's
+  link (`…/profile/<handle-or-did>/post/<id>`, read for its path only, never
+  fetched). Taking down and removing any label ask for the account's handle
+  (or the DID's last eight characters) typed.
+- **Look up** at `/admin/lookup`, by handle, DID or post link: the DID and
+  handle resolved afresh and checked both ways, its server, and what Prism
+  has stored; membership, denial, readiness and whether Prism receives its
+  updates; whether Prism follows it and what holds it there (member, follow,
+  recent interaction, subscription; scope recency) as of the last record;
+  the blocks Prism keeps with it on one side, under the member-side rule;
+  its private posts stored, with images, with a video, and its private
+  blocks, counted by `private_tier::stats::account_counts`; its labels and
+  sync jobs; and its actions. Identity is read as admin commands read it,
+  from the PLC directory (or the account's own address for `did:web`) with
+  Prism's own handle check; lodestar is never asked, and the page says so.
+- **Members:** per member, under "More": sync again (`backfill`), ask
+  Farsight to read again (`farsight prime --force`, only when Farsight is set
+  up), forget remembered blocks (`farsight forget`, only when the memory is
+  on) and clean up lists (`lists purge`); the last two ask for the member's
+  handle typed. Each row links to Look up. Labels and Look up join the
+  navigation after Blocks (Farsight).
+
 ### Added (admin UI S4: stats, disks, endpoint usage, #762)
 
 Admin-ui design §6.5, §9.2's Disk check, §10 (`docs/internal/design/admin-ui.md`).

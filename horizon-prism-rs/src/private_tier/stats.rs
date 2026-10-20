@@ -2,7 +2,9 @@
 //! §10.2): the private tables' plain names, so the page can label the
 //! storage sampler's per-table series without naming a private table itself
 //! (the image build's private-table source check), and how many stored
-//! private posts carry images or a video (private-media-filters design §2).
+//! private posts carry images or a video (private-media-filters design §2);
+//! and one account's private posts, by media kind, and private blocks, for
+//! Look up (§6.10).
 
 use sqlx::PgPool;
 
@@ -64,6 +66,42 @@ pub(crate) async fn media_post_counts(pool: &PgPool) -> Result<(i64, i64), sqlx:
     Ok((counts[0], counts[1]))
 }
 
+/// One account's private records as the admin UI's Look up shows them
+/// (admin-ui design §6.10).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AccountCounts {
+    /// Stored private posts by the account.
+    pub posts: i64,
+    /// Of them, with images (or a gallery).
+    pub with_images: i64,
+    /// Of them, with a video.
+    pub with_video: i64,
+    /// Private blocks the account made that Prism keeps (only those with a
+    /// member on one side, member-blocks-only design).
+    pub blocks: i64,
+}
+
+/// [`AccountCounts`] for `did`. Each count reads the author's own index
+/// rows, under a 2-second statement timeout.
+///
+/// # Errors
+///
+/// Database errors, the timeout among them.
+pub(crate) async fn account_counts(pool: &PgPool, did: &str) -> Result<AccountCounts, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '2s'").execute(&mut *tx).await?;
+    let (posts, with_images, with_video): (i64, i64, i64) = sqlx::query_as(&format!(
+        "SELECT count(*), count(*) FILTER (WHERE (media_kinds & {IMAGE}) <> 0), count(*) FILTER (WHERE (media_kinds & {VIDEO}) <> 0) \
+         FROM private_posts WHERE author_did = $1"
+    ))
+    .bind(did)
+    .fetch_one(&mut *tx)
+    .await?;
+    let blocks: i64 = sqlx::query_scalar("SELECT count(*) FROM private_blocks WHERE author_did = $1").bind(did).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(AccountCounts { posts, with_images, with_video, blocks })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +136,17 @@ mod tests {
             .expect("row");
         }
         assert_eq!(media_post_counts(&db.pool).await.expect("counts"), (2, 2));
+        // One account's counts: its posts by media kind and its blocks.
+        sqlx::query(
+            "INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
+             VALUES ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.nearhorizon.graph.blockPrivate/3kb', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '3k', now())",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("block");
+        let mine = account_counts(&db.pool, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await.expect("account");
+        assert_eq!(mine, AccountCounts { posts: 4, with_images: 2, with_video: 2, blocks: 1 });
+        assert_eq!(account_counts(&db.pool, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").await.expect("other"), AccountCounts::default());
         db.drop_db().await;
     }
 }

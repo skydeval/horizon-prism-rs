@@ -12,6 +12,9 @@ mod settings_pages;
 mod health_pages;
 // Stats and the fullest-disk tile (admin-ui design §6.5, §10).
 mod stats_pages;
+// Labels, Look up and the per-member actions (admin-ui design §6.2, §6.9,
+// §6.10; slice S5).
+mod s5_pages;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -49,6 +52,8 @@ const CAROL: &str = "did:plc:cccccccccccccccccccccccc";
 struct StubIdentity {
     endpoints: Mutex<HashMap<String, String>>,
     handles: Mutex<HashMap<String, String>>,
+    /// The handle each DID's document claims.
+    claims: Mutex<HashMap<String, String>>,
     fail: AtomicBool,
     fresh_calls: Mutex<usize>,
 }
@@ -73,7 +78,7 @@ impl OperatorIdentity for StubIdentity {
             return Err("resolution failed".into());
         }
         let endpoint = self.endpoints.lock().expect("lock").get(did).cloned().ok_or("not found")?;
-        Ok(DidDocInfo { pds_endpoint: Some(endpoint), claimed_handle: None })
+        Ok(DidDocInfo { pds_endpoint: Some(endpoint), claimed_handle: self.claims.lock().expect("lock").get(did).cloned() })
     }
 }
 
@@ -139,6 +144,8 @@ struct Harness {
     served: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The endpoint counters the stats page reads.
     usage: usage::Usage,
+    /// The in-memory scope sets the pages read.
+    scope: ScopeState,
     _drainer: Box<dyn Send>,
 }
 
@@ -190,7 +197,7 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
     let usage = usage::Usage::default();
     let admin = AdminState::new(
         db.pool.clone(),
-        scope,
+        scope.clone(),
         Arc::clone(&identity) as Arc<dyn OperatorIdentity>,
         Arc::clone(&oauth) as Arc<dyn FetchHandler>,
         settings,
@@ -233,6 +240,7 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
         shutdown: Mutex::new(Some(tx)),
         served: Mutex::new(Some(served)),
         usage,
+        scope,
         _drainer: Box::new(drainer),
     })
 }
@@ -837,6 +845,8 @@ async fn t_a16_headers_everywhere() {
         "/admin/jobs",
         "/admin/problems",
         "/admin/farsight",
+        "/admin/labels",
+        "/admin/lookup",
         "/admin/nowhere",
         "/admin/login",
         js,
