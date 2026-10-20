@@ -54,6 +54,10 @@ pub enum AdminCommand {
     Resync,
     DeadletterReplay { id: String },
     DeadletterDrop { id: String },
+    /// `deadletter sweep [--dry-run]` (actionable-warnings design §6.6):
+    /// remove the listed whole-entry dead letters the firehose would now
+    /// drop.
+    DeadletterSweep { dry_run: bool },
     /// `farsight status`: Farsight's own report, in brief.
     FarsightStatus,
     /// `farsight prime <did> [--force]`: ask Farsight to read a repository.
@@ -123,6 +127,7 @@ impl AdminCommand {
             Self::Resync => ("resync", json!({ "private_and_members": true })),
             Self::DeadletterReplay { id } => ("deadletter replay", json!({ "id": id })),
             Self::DeadletterDrop { id } => ("deadletter drop", json!({ "id": id })),
+            Self::DeadletterSweep { dry_run } => ("deadletter sweep", json!({ "dry_run": dry_run })),
             Self::FarsightStatus => ("farsight status", json!({})),
             Self::FarsightPrime { did, force } => ("farsight prime", json!({ "did": did, "force": force })),
             Self::FarsightForget { did } => ("farsight forget", json!({ "did": did })),
@@ -214,6 +219,9 @@ impl AdminCommand {
             "resync" => Self::Resync,
             "deadletter replay" => Self::DeadletterReplay { id: id()? },
             "deadletter drop" => Self::DeadletterDrop { id: id()? },
+            "deadletter sweep" => Self::DeadletterSweep {
+                dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+            },
             "farsight status" => Self::FarsightStatus,
             "farsight prime" => Self::FarsightPrime {
                 did: did()?,
@@ -287,6 +295,7 @@ impl AdminCommand {
             | Self::Resync
             | Self::DeadletterReplay { .. }
             | Self::DeadletterDrop { .. }
+            | Self::DeadletterSweep { .. }
             | Self::FarsightStatus
             | Self::IndexingPublicScope { .. }
             | Self::IndexingStatus
@@ -439,6 +448,7 @@ impl Handlers {
             AdminCommand::Resync => self.resync().await,
             AdminCommand::DeadletterReplay { id } => self.deadletter_replay(id).await,
             AdminCommand::DeadletterDrop { id } => self.deadletter_drop(id).await,
+            AdminCommand::DeadletterSweep { dry_run } => self.deadletter_sweep(*dry_run).await,
             AdminCommand::FarsightStatus => self.farsight_status().await,
             AdminCommand::FarsightPrime { did, force } => self.farsight_prime(did, *force).await,
             AdminCommand::FarsightForget { did } => self.farsight_forget(did).await,
@@ -871,7 +881,86 @@ impl Handlers {
         }
         Ok(Outcome::Done(json!({ "id": id, "dropped": true })))
     }
+
+    /// `deadletter sweep [--dry-run]` (actionable-warnings design §6.6): read
+    /// the dead-letter stream a page at a time and remove every whole-entry
+    /// letter (no path) whose payload was kept whole and that the firehose
+    /// would now drop, deciding as it does with the scope sets as they are
+    /// now. Op letters, truncated and unreadable ones are kept.
+    async fn deadletter_sweep(&self, dry_run: bool) -> Result<Outcome, String> {
+        let mut redis = self.redis.clone();
+        let (mut examined, mut removed, mut kept) = (0u64, 0u64, 0u64);
+        let mut start = "-".to_string();
+        loop {
+            let reply: redis::Value = redis::cmd("XRANGE")
+                .arg(&self.dead_letter_stream)
+                .arg(&start)
+                .arg("+")
+                .arg("COUNT")
+                .arg(SWEEP_PAGE)
+                .query_async(&mut redis)
+                .await
+                .map_err(|e| e.to_string())?;
+            let redis::Value::Array(items) = reply else {
+                return Err("unexpected XRANGE reply".to_string());
+            };
+            let entries = items.into_iter().map(crate::firehose::stream::parse_entry).collect::<Result<Vec<_>, _>>()?;
+            let Some(last) = entries.last().map(|e| e.id.clone()) else {
+                break;
+            };
+            let mut gone = Vec::new();
+            for e in &entries {
+                examined += 1;
+                if self.would_drop(e).await {
+                    gone.push(e.id.clone());
+                } else {
+                    kept += 1;
+                }
+            }
+            removed += gone.len() as u64;
+            if !dry_run && !gone.is_empty() {
+                let _: i64 = redis::cmd("XDEL").arg(&self.dead_letter_stream).arg(&gone).query_async(&mut redis).await.map_err(|e| e.to_string())?;
+            }
+            if entries.len() < SWEEP_PAGE {
+                break;
+            }
+            start = format!("({last}");
+        }
+        Ok(Outcome::Done(json!({ "examined": examined, "removed": removed, "kept": kept, "dry_run": dry_run })))
+    }
+
+    /// Whether the firehose would now drop this dead letter's entry.
+    async fn would_drop(&self, letter: &crate::firehose::stream::StreamEntry) -> bool {
+        use crate::firehose::stream::{Readable, StreamEntry, decode, readable_despite};
+        if !letter.field("path").unwrap_or_default().is_empty() {
+            return false;
+        }
+        let Some(data) = letter.raw("data_prefix") else {
+            return false;
+        };
+        if letter.field("data_len").and_then(|n| n.parse::<usize>().ok()) != Some(data.len()) {
+            return false;
+        }
+        let entry = StreamEntry {
+            id: letter.id.clone(),
+            fields: Some(vec![
+                ("type".to_string(), letter.raw("type").unwrap_or_default().to_vec()),
+                ("data".to_string(), data.to_vec()),
+            ]),
+        };
+        if decode(&entry).is_ok() {
+            return false;
+        }
+        match readable_despite(&entry) {
+            Some(Readable::NotADid) => true,
+            Some(Readable::Commit { repo, ops }) => !self.writer.would_write(&repo, &ops).await,
+            None => false,
+        }
+    }
 }
+
+/// Dead letters read per `XRANGE` by `deadletter sweep`.
+pub const SWEEP_PAGE: usize = 500;
 
 #[cfg(test)]
 mod tests {
@@ -882,6 +971,8 @@ mod tests {
     #[test]
     fn rows_round_trip() {
         for cmd in [
+            AdminCommand::DeadletterSweep { dry_run: true },
+            AdminCommand::DeadletterSweep { dry_run: false },
             AdminCommand::MemberAdd { did: DID.into() },
             AdminCommand::MemberRemove { did: DID.into() },
             AdminCommand::MemberDeny { did: DID.into(), reason: Some("spam".into()) },

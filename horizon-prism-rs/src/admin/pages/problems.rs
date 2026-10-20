@@ -1,8 +1,10 @@
 //! Problems (`/admin/problems`, admin-ui design §6.7): "Records Prism could
 //! not process", the newest 100 of the dead-letter stream by `XREVRANGE`,
 //! each with "try again" (`deadletter replay`) and "dismiss" (`deadletter
-//! drop`, confirmed); and the network stream's state, the content of
-//! `admin stream info` in words.
+//! drop`, confirmed), and "clear out" of the records the firehose would now
+//! set aside (`deadletter sweep`, confirmed; actionable-warnings design
+//! §7.2); and the network stream's state, the content of `admin stream
+//! info` in words.
 
 use std::net::SocketAddr;
 
@@ -210,6 +212,36 @@ pub async fn dismiss(State(state): State<AdminState>, ConnectInfo(peer): Connect
         return response;
     }
     enqueue(&state, &op, &AdminCommand::DeadletterDrop { id }).await
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SweepForm {
+    #[serde(default)]
+    pub csrf: String,
+    pub confirm: Option<String>,
+}
+
+/// `POST /admin/problems/sweep`: `deadletter sweep`, confirmed
+/// (actionable-warnings design §7.2).
+pub async fn sweep(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Form(form): Form<SweepForm>) -> Response {
+    let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
+        Ok(op) => op,
+        Err(response) => return response,
+    };
+    let page = Confirm {
+        title: "Clear out the records Prism would now set aside",
+        what: "Records on this list from accounts Prism does not keep are taken off it. Records from members, from accounts Prism follows, or naming a member stay.".to_string(),
+        undo: "This cannot be undone; nothing is lost, because Prism would not store these records anyway.",
+        action: "/admin/problems/sweep",
+        hidden: Vec::new(),
+        typed: None,
+        button: "Clear out",
+    }
+    .page(&op, "problems");
+    if let Some(response) = confirmed(page, form.confirm.as_deref(), None) {
+        return response;
+    }
+    enqueue(&state, &op, &AdminCommand::DeadletterSweep { dry_run: false }).await
 }
 
 #[cfg(test)]

@@ -287,6 +287,12 @@ pub enum ScopeAction {
 pub enum DeadletterAction {
     Replay { id: String },
     Drop { id: String },
+    /// Remove the listed records the firehose would now set aside
+    /// (malformed, from accounts Prism does not keep).
+    Sweep {
+        #[arg(long)]
+        dry_run: bool,
+    },
     List {
         #[arg(long, default_value_t = commands::deadletter_list::DEFAULT_LIMIT)]
         limit: u32,
@@ -362,6 +368,7 @@ impl AdminCmd {
             Self::Resync { .. } => AdminCommand::Resync,
             Self::Deadletter { action: DeadletterAction::Replay { id } } => AdminCommand::DeadletterReplay { id: id.clone() },
             Self::Deadletter { action: DeadletterAction::Drop { id } } => AdminCommand::DeadletterDrop { id: id.clone() },
+            Self::Deadletter { action: DeadletterAction::Sweep { dry_run } } => AdminCommand::DeadletterSweep { dry_run: *dry_run },
             Self::Farsight { action: FarsightAction::Status } => AdminCommand::FarsightStatus,
             Self::Farsight { action: FarsightAction::Forget { viewer_did } } => AdminCommand::FarsightForget { did: viewer_did.clone() },
             Self::Farsight { action: FarsightAction::Prime { did, force } } => AdminCommand::FarsightPrime {

@@ -541,6 +541,66 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// T-AW12 (actionable-warnings design §6.6): `deadletter sweep` removes
+    /// the whole-entry letters the firehose would now drop, and keeps a
+    /// member's, a truncated one, an op letter and an unreadable one; a dry
+    /// run removes nothing and counts the same.
+    #[tokio::test]
+    async fn deadletter_sweep_through_the_queue() {
+        use crate::firehose::deadletter::{self, DeadLetter};
+        const MEMBER: &str = PURGING;
+        const STRANGER: &str = "did:plc:sweepstrangeraaaaaaaaaaa";
+        let mut sets = ScopeSets::default();
+        sets.members.insert(MEMBER.into());
+        sets.scope.insert(MEMBER.into());
+        let stream = test_stream();
+        let Some((db, exec, _scope)) = setup_with("admin_sweep", sets, Arc::new(DisabledPrivateTier), Arc::new(NoNetwork), &stream).await else {
+            return;
+        };
+        let p = &db.pool;
+        let commit = |repo: &str, text: &str| {
+            json!({"repo": repo, "rev": "3lxcday8ef4p4", "ops": [{"action": "create", "path": "app.bsky.feed.post/3kaaaaaaaaaaa", "cid": "bafy",
+                "record": {"text": text, "createdAt": "2026-10-20T00:00:00Z"}}]})
+            .to_string()
+            .into_bytes()
+        };
+        let letter = |entry_type: &str, repo: &str, path: &str, data: Vec<u8>| DeadLetter {
+            orig_id: "1-0".into(),
+            entry_type: entry_type.into(),
+            repo: repo.into(),
+            path: path.into(),
+            error: "invalid rev".into(),
+            data,
+            ..DeadLetter::default()
+        };
+        let letters = [
+            letter("commit", STRANGER, "", commit(STRANGER, "spam")),
+            letter("commit", MEMBER, "", commit(MEMBER, "mine")),
+            letter("commit", STRANGER, "", commit(STRANGER, &"x".repeat(5000))),
+            letter("commit", STRANGER, "app.bsky.feed.post/3kaaaaaaaaaaa", commit(STRANGER, "op")),
+            letter("commit", "", "", b"{".to_vec()),
+            letter("account", "", "", json!({"did": "bob"}).to_string().into_bytes()),
+        ];
+        let mut redis = ConnectionManager::new(redis::Client::open(std::env::var("HPRS_TEST_REDIS_URL").expect("url")).expect("client"))
+            .await
+            .expect("redis");
+        deadletter::write(&mut redis, &stream, 10_000, &letters).await.expect("write");
+        type Range = Vec<(String, Vec<(String, Vec<u8>)>)>;
+        let ids: Range = redis::cmd("XRANGE").arg(&stream).arg("-").arg("+").query_async(&mut redis).await.expect("xrange");
+        let ids: Vec<String> = ids.into_iter().map(|(id, _)| id).collect();
+        let r = done(run(&exec, p, AdminCommand::DeadletterSweep { dry_run: true }).await);
+        assert_eq!((r["examined"].as_u64(), r["removed"].as_u64(), r["kept"].as_u64(), r["dry_run"].as_bool()), (Some(6), Some(2), Some(4), Some(true)), "{r}");
+        let len: i64 = redis::cmd("XLEN").arg(&stream).query_async(&mut redis).await.expect("xlen");
+        assert_eq!(len, 6, "a dry run removes nothing");
+        let r = done(run(&exec, p, AdminCommand::DeadletterSweep { dry_run: false }).await);
+        assert_eq!((r["removed"].as_u64(), r["kept"].as_u64()), (Some(2), Some(4)), "{r}");
+        let left: Range = redis::cmd("XRANGE").arg(&stream).arg("-").arg("+").query_async(&mut redis).await.expect("xrange");
+        let left: Vec<String> = left.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(left, [ids[1].clone(), ids[2].clone(), ids[3].clone(), ids[4].clone()]);
+        let _: i64 = redis::cmd("DEL").arg(&stream).query_async(&mut redis).await.expect("del");
+        db.drop_db().await;
+    }
+
     /// `indexing public-scope` and `indexing status` go through the queue:
     /// the command changes the phase and spawns the sweep, which ends Off.
     #[tokio::test]

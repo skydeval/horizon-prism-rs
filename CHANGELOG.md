@@ -10,6 +10,22 @@ commit.
 
 ## [Unreleased]
 
+### Added (actionable warnings S3: sweep the problems list, #765, #768)
+
+Actionable-warnings design S3 (`docs/internal/design/actionable-warnings.md`
+§6.6, §7.2). No migration.
+
+- **`admin deadletter sweep [--dry-run]`** and a Problems-page button,
+  "Clear out the records Prism would now set aside…" (confirmed), remove
+  from the dead-letter stream every whole-entry letter that the firehose
+  would now drop: a commit refused for its rev whose ops would write
+  nothing, or an event naming no valid DID, judged with the scope sets as
+  they are when it runs. Only letters whose whole payload was kept are
+  judged; op letters, truncated and unreadable ones stay. The stream is
+  read 500 entries at a time. The result gives `examined`, `removed` and
+  `kept`; `--dry-run` counts without removing. Run it once after the
+  upgrade to clear the letters written before S2.
+
 ### Changed (actionable warnings S2: malformed records from strangers, #765, #767)
 
 Actionable-warnings design S2 (`docs/internal/design/actionable-warnings.md`

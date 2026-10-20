@@ -353,6 +353,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/problems", route(get(pages::problems::page)))
         .route("/problems/replay", route(post(pages::problems::replay)))
         .route("/problems/dismiss", route(post(pages::problems::dismiss)))
+        .route("/problems/sweep", route(post(pages::problems::sweep)))
         .route("/farsight", route(get(pages::farsight::page)))
         .fallback(pages::not_found)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))

@@ -257,6 +257,14 @@ async fn problems_lists_dead_letters() {
     let dismiss = post(&alice, &format!("{}/admin/problems/dismiss", h.base), &[("csrf", &csrf), ("id", &id), ("confirm", "yes")]).await;
     assert_eq!(dismiss.status, 303, "{}", dismiss.body);
     assert_eq!(last_command(&queued(h.pool()).await), ("deadletter drop".to_string(), json!({"id": id}), Some(ALICE.to_string())));
+    // Clear out (actionable-warnings design §7.2): confirmed, then
+    // `deadletter sweep`.
+    assert!(page.body.contains("action=\"/admin/problems/sweep\""), "{}", page.body);
+    let confirm = post(&alice, &format!("{}/admin/problems/sweep", h.base), &[("csrf", &csrf)]).await;
+    assert!(confirm.body.contains("Clear out the records Prism would now set aside"), "{}", confirm.body);
+    let sweep = post(&alice, &format!("{}/admin/problems/sweep", h.base), &[("csrf", &csrf), ("confirm", "yes")]).await;
+    assert_eq!(sweep.status, 303, "{}", sweep.body);
+    assert_eq!(last_command(&queued(h.pool()).await), ("deadletter sweep".to_string(), json!({"dry_run": false}), Some(ALICE.to_string())));
     let bad = post(&alice, &format!("{}/admin/problems/replay", h.base), &[("csrf", &csrf), ("id", "nope")]).await;
     assert_eq!(bad.status, 400);
     let _: i64 = redis::cmd("XDEL").arg(&stream).arg(&id).query_async(&mut redis).await.expect("xdel");

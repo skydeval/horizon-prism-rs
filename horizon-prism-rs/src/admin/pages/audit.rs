@@ -56,7 +56,7 @@ pub struct Filters {
 }
 
 /// The command names the "what" filter offers.
-pub const COMMAND_NAMES: [&str; 22] = [
+pub const COMMAND_NAMES: [&str; 23] = [
     "member add",
     "member remove",
     "member deny",
@@ -72,6 +72,7 @@ pub const COMMAND_NAMES: [&str; 22] = [
     "resync",
     "deadletter replay",
     "deadletter drop",
+    "deadletter sweep",
     "farsight status",
     "farsight prime",
     "farsight forget",

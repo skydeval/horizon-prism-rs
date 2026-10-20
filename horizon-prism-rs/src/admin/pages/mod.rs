@@ -188,6 +188,8 @@ pub fn describe(command: &str, args: &Value) -> String {
         "resync" => "Re-sync private data and members".to_string(),
         "deadletter replay" => format!("Try record {} again", arg(args, "id")),
         "deadletter drop" => format!("Dismiss record {}", arg(args, "id")),
+        "deadletter sweep" if args.get("dry_run") == Some(&Value::Bool(true)) => "Count the records Prism would now set aside".to_string(),
+        "deadletter sweep" => "Clear out the records Prism would now set aside".to_string(),
         "farsight status" => "Ask Farsight for its status".to_string(),
         "farsight prime" => format!("Ask Farsight to read {} again", arg(args, "did")),
         "label add" | "label remove" => {
@@ -321,6 +323,22 @@ pub fn outcome(command: &str, state: &str, result: Option<&Value>) -> String {
         }
         ("deadletter replay", _) => "Tried again: the record was read from its server and processed.".to_string(),
         ("deadletter drop", _) => "Dismissed.".to_string(),
+        ("deadletter sweep", _) => {
+            let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let (removed, kept) = (n("removed"), n("kept"));
+            let verb = if r.get("dry_run") == Some(&Value::Bool(true)) {
+                "would be taken"
+            } else if removed == 1 {
+                "was taken"
+            } else {
+                "were taken"
+            };
+            format!(
+                "{removed} record{} from accounts Prism does not keep {verb} off the list; {kept} stay{}.",
+                if removed == 1 { "" } else { "s" },
+                if kept == 1 { "s" } else { "" }
+            )
+        }
         _ => "Done.".to_string(),
     }
 }
