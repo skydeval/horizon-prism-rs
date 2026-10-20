@@ -16,6 +16,8 @@ mod embeds;
 mod live_feed;
 // Media kinds and the media filters on the author feed (P-30).
 mod media;
+// Private blocks only with a member side (member-blocks-only design).
+mod member_blocks;
 mod round;
 mod threads;
 // The shared walk (#720): T-60 to T-63.

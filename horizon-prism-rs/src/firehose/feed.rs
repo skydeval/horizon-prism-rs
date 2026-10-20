@@ -246,12 +246,14 @@ pub enum Outcome {
     AccountDeleted,
     OutOfScope,
     MemberRemoved,
+    /// Rule M (member-blocks-only design §11): a block with no member side.
+    NoMemberSide,
     /// A reason this table does not know; never expected.
     OtherReason,
 }
 
 /// The number of outcomes.
-pub const OUTCOMES: usize = 12;
+pub const OUTCOMES: usize = 13;
 
 impl Outcome {
     /// Every outcome, in table order.
@@ -267,6 +269,7 @@ impl Outcome {
         Self::AccountDeleted,
         Self::OutOfScope,
         Self::MemberRemoved,
+        Self::NoMemberSide,
         Self::OtherReason,
     ];
 
@@ -287,6 +290,7 @@ impl Outcome {
             "account_deleted" => Self::AccountDeleted,
             "out_of_scope" => Self::OutOfScope,
             "member_removed" => Self::MemberRemoved,
+            "no_member_side" => Self::NoMemberSide,
             _ => Self::OtherReason,
         }
     }
@@ -305,6 +309,7 @@ impl Outcome {
             Self::AccountDeleted => "account_deleted",
             Self::OutOfScope => "out_of_scope",
             Self::MemberRemoved => "member_removed",
+            Self::NoMemberSide => "no_member_side",
             Self::OtherReason => "other",
         }
     }
@@ -884,9 +889,14 @@ mod tests {
             RejectReason::Purging(PurgeKind::AccountDeleted),
             RejectReason::Purging(PurgeKind::OutOfScope),
             RejectReason::Purging(PurgeKind::MemberRemoved),
+            RejectReason::NoMemberSide,
         ] {
             assert_ne!(Outcome::from_reason(r.as_str()), Outcome::OtherReason, "{r:?}");
         }
+        // T-MB8: Rule M's rejections land in their own slot.
+        assert_eq!(Outcome::from_reason(RejectReason::NoMemberSide.as_str()), Outcome::NoMemberSide);
+        assert_eq!(Outcome::NoMemberSide.slug(), "no_member_side");
+        assert!(Outcome::ALL.contains(&Outcome::NoMemberSide) && Outcome::NoMemberSide.is_reason());
         for (nsid, rkey) in [("app.bsky.feed.generator", "3k"), ("tools.kryphocron.feed.postPublic", "3k")] {
             let reason = skip_reason(classify(nsid, rkey)).expect("skipped");
             assert_ne!(Outcome::from_reason(reason), Outcome::OtherReason, "{reason}");

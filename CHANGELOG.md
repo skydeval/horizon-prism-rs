@@ -10,6 +10,25 @@ commit.
 
 ## [Unreleased]
 
+### Changed (member blocks only, S1, #760)
+
+Member-blocks-only design S1 (`docs/internal/design/member-blocks-only.md`).
+
+- **Blocks are stored only when a member is on one side** (member-blocks-only
+  design). A block, private block or list block is stored when its author is
+  a member, or (for direct and private blocks) when it names a member. An
+  account's other blocks are no longer stored because it is in scope through
+  follows or interactions, in any public-indexing mode. Rejections count as
+  `firehose_ops_skipped_total{reason="no_member_side"}`, and
+  `index.requestRecord` reports them as `outOfScope`. A block record edited
+  so that it no longer names a member removes the stored row. What members
+  see does not change: their own blocks, and others' blocks of them, are
+  stored as before. A non-member actor's `getRelationships`, when no
+  upstream AppView answers, now reports only its blocks with members.
+- The admin live feed counts these rejections in their own slot, "no member
+  side".
+- Rows stored before this change stay until S2's retention removes them.
+
 ### Added (private media filters, S2, #758)
 
 Private-media-filters design S2 (`docs/internal/design/private-media-filters.md`).

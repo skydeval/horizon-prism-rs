@@ -179,6 +179,7 @@ pub fn reason_words(o: Outcome) -> &'static str {
         Outcome::AccountDeleted => "account deleted",
         Outcome::OutOfScope => "leaving scope",
         Outcome::MemberRemoved => "member removed",
+        Outcome::NoMemberSide => "no member side",
         Outcome::Written => "written",
         Outcome::ReferenceOnly => "reference only",
         Outcome::Unchanged => "unchanged",

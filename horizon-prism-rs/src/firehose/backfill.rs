@@ -2675,6 +2675,56 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// T-MB3 (member-blocks-only design §12): a `scope` job lists no block
+    /// collection, so a scoped non-member's blocks are not stored; a member
+    /// job stores the member's blocks of a member and of a non-member.
+    #[tokio::test]
+    async fn a_member_job_stores_the_members_blocks_and_a_scope_job_none() {
+        let Some(db) = fresh_db("backfill_member_blocks_only").await else {
+            return;
+        };
+        let other_member = "did:plc:eeeeeeeeeeeeeeeeeeeeeeee";
+        let non_member = "did:plc:cccccccccccccccccccccccc";
+        let mut source = FakeSource {
+            rev: "3kzzzzzzzzzzz".to_string(),
+            ..FakeSource::default()
+        };
+        source.listings.insert(
+            NSID_BLOCK.to_string(),
+            vec![
+                rec(DID, NSID_BLOCK, "3kaaaaaaaaaaa", json!({"subject": other_member, "createdAt": "2026-09-26T00:00:00Z"})),
+                rec(DID, NSID_BLOCK, "3kbbbbbbbbbbb", json!({"subject": non_member, "createdAt": "2026-09-26T00:00:00Z"})),
+            ],
+        );
+        let source = Arc::new(source);
+        let count = || async { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM blocks").fetch_one(&db.pool).await.expect("blocks") };
+
+        // A scoped non-member: its scope job stores no block.
+        let backfill = Backfill::new(Writer::new(db.pool.clone(), state(false), Arc::new(DisabledPrivateTier)), source.clone(), BackfillConfig::default(), 5);
+        let mut conn = db.pool.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Scope).await.expect("enqueue");
+        drop(conn);
+        backfill.run_once().await.expect("run").expect("job");
+        assert_eq!(count().await, 0);
+
+        // The same DID as a member: its member job stores both.
+        sqlx::query("INSERT INTO members (did, source) VALUES ($1, 'admin')").bind(DID).execute(&db.pool).await.expect("member");
+        let mut sets = ScopeSets::default();
+        for d in [DID, other_member] {
+            sets.scope.insert(d.into());
+            sets.members.insert(d.into());
+        }
+        let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000);
+        let backfill = Backfill::new(Writer::new(db.pool.clone(), scope, Arc::new(DisabledPrivateTier)), source, BackfillConfig::default(), 5);
+        let mut conn = db.pool.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Member).await.expect("enqueue");
+        drop(conn);
+        backfill.run_once().await.expect("run").expect("job");
+        let stored: Vec<String> = sqlx::query_scalar("SELECT subject_did FROM blocks ORDER BY subject_did").fetch_all(&db.pool).await.expect("blocks");
+        assert_eq!(stored, [non_member.to_string(), other_member.to_string()]);
+        db.drop_db().await;
+    }
+
     #[tokio::test]
     async fn failures_back_off_then_fail() {
         struct Down;

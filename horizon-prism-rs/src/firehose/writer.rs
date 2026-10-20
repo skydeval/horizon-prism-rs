@@ -26,7 +26,7 @@ use super::normalize::normalize_record;
 use super::records::{GraphRecord, PostRecord, ProfileRecord, RecordError, SubjectRecord, private_subjects};
 use super::rows::{self, Cell, Row};
 use crate::aggregations::growth::{self, GrowthPlan};
-use crate::aggregations::{Admission, AdmissionInput, RecordKind, ScopeSets, ScopeState, admit};
+use crate::aggregations::{Admission, AdmissionInput, PurgeKind, RecordKind, RejectReason, ScopeSets, ScopeState, admit};
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
 use crate::hydration::normalize::is_private_uri;
 use crate::private_tier::{IngestError, PrivateOp, PrivateTier, PublicNotify, QuoteRef};
@@ -245,6 +245,10 @@ enum OpTarget<'a> {
     /// (following-audience design §4.2): the old row goes, and a tombstone
     /// at the op's rev refuses any older write of it.
     RejectedFollow(&'a Upsert, &'static str),
+    /// An update of a direct or private block that Rule M rejected, with the
+    /// reason (member-blocks-only design §9): the stored row goes, and a
+    /// tombstone at the op's rev refuses any older write of it.
+    RejectedBlock(&'a Upsert, &'static str),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -316,7 +320,8 @@ fn prepare(repo: &str, op: &RawOp, now: DateTime<Utc>) -> Prepared {
 /// transaction. A skip or a rejection bumps `firehose_ops_skipped_total`
 /// here, exactly once. A rejected follow by a tracked repo is counted and
 /// still returns `None`: it takes the rejected-follow path (following-audience
-/// design §4.2).
+/// design §4.2). So does a rejected block update (member-blocks-only design
+/// §9).
 fn outcome_without_sql(p: &Prepared, a: Option<Admission>, tracked: bool) -> Option<OpOutcome> {
     match (p, a) {
         (Prepared::Skip(reason), _) => {
@@ -326,7 +331,7 @@ fn outcome_without_sql(p: &Prepared, a: Option<Admission>, tracked: bool) -> Opt
         (Prepared::Invalid(e), _) => Some(OpOutcome::Failed(e.clone())),
         (Prepared::Upsert(u), Some(Admission::Reject(reason))) => {
             metrics::counter!(METRIC_SKIPPED, "reason" => reason.as_str()).increment(1);
-            if matches!(u.body, Body::Follow(_)) && tracked {
+            if (matches!(u.body, Body::Follow(_)) && tracked) || rejected_block_update(u, reason) {
                 None
             } else {
                 Some(OpOutcome::Rejected(reason.as_str()))
@@ -334,6 +339,17 @@ fn outcome_without_sql(p: &Prepared, a: Option<Admission>, tracked: bool) -> Opt
         }
         _ => None,
     }
+}
+
+/// An update of a direct or private block that Rule M rejected for having
+/// no member side, or because its new subject is a member being removed
+/// (member-blocks-only design §9): it takes the rejected-block path, which
+/// removes the row its earlier write stored. A create, and an update
+/// rejected as `account_deleted`, run no SQL.
+fn rejected_block_update(u: &Upsert, reason: RejectReason) -> bool {
+    !u.created
+        && u.input.kind.is_block()
+        && matches!(reason, RejectReason::NoMemberSide | RejectReason::Purging(PurgeKind::MemberRemoved))
 }
 
 /// §5.5 "Nothing to write" (firehose throughput design §1.2): the repo is
@@ -359,7 +375,7 @@ fn nothing_to_write(
         && !clears_readiness
         && prepared.iter().zip(admissions).all(|(p, a)| match p {
             Prepared::Skip(_) | Prepared::Invalid(_) => true,
-            Prepared::Upsert(_) => matches!(a, Some(Admission::Reject(_))),
+            Prepared::Upsert(u) => matches!(a, Some(Admission::Reject(r)) if !rejected_block_update(u, *r)),
             Prepared::Delete(_) => false,
         })
 }
@@ -866,12 +882,18 @@ impl Writer {
                 (_, Some(outcome)) => outcome,
                 (Prepared::Skip(_) | Prepared::Invalid(_), None) => unreachable!("decided without SQL"),
                 (Prepared::Upsert(u), None) => match admissions[i] {
-                    // `outcome_without_sql` left it here: a follow of a
-                    // tracked repo, from any source. An unfollow written as
-                    // an edit must not leave the old subject stored
-                    // (following-audience design §4.2). Already counted.
+                    // `outcome_without_sql` left it here: a block update
+                    // Rule M rejected (member-blocks-only design §9), or a
+                    // follow of a tracked repo, from any source. An edit
+                    // away from the stored subject must not leave the old
+                    // subject stored (following-audience design §4.2).
+                    // Already counted.
                     Some(Admission::Reject(reason)) => {
-                        let target = OpTarget::RejectedFollow(u, reason.as_str());
+                        let target = if rejected_block_update(u, reason) {
+                            OpTarget::RejectedBlock(u, reason.as_str())
+                        } else {
+                            OpTarget::RejectedFollow(u, reason.as_str())
+                        };
                         self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
                             .await?
                     }
@@ -1090,7 +1112,7 @@ impl Writer {
         // private tier (`private_tier_last_event_age_seconds`).
         if options.source == WriteSource::Firehose {
             let private = match target {
-                OpTarget::Upsert(u, _) => matches!(u.body, Body::Private | Body::PrivateGate),
+                OpTarget::Upsert(u, _) | OpTarget::RejectedBlock(u, _) => matches!(u.body, Body::Private | Body::PrivateGate),
                 OpTarget::Delete(d) => matches!(
                     d.kind,
                     RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock | RecordKind::PrivateGate
@@ -1109,6 +1131,7 @@ impl Writer {
                 OpTarget::GrowOnly(u, plan) => self.apply_grow_only(&mut sp, u, plan, rev, options).await,
                 OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets).await,
                 OpTarget::RejectedFollow(u, reason) => self.apply_rejected_follow(&mut sp, u, reason, repo, rev, sets).await,
+                OpTarget::RejectedBlock(u, reason) => self.apply_rejected_block(&mut sp, u, reason, rev).await,
             };
             match result {
                 Ok((outcome, eff)) => {
@@ -1566,6 +1589,37 @@ impl Writer {
             self.private.delete_notifications(conn, &u.uri).await?;
         }
         Ok((OpOutcome::Rejected(reason), eff))
+    }
+
+    /// An update of a direct or private block that Rule M rejected, at its
+    /// rev U (member-blocks-only design §9, C-MB4): the row an earlier write
+    /// stored at the URI goes by last-writer-wins, and a tombstone at U
+    /// refuses every write of the URI at or below U, so an older write
+    /// cannot store the old subject again. A private block goes through the
+    /// private tier, which tombstones it whether or not a row went. The
+    /// outcome stays `Rejected`.
+    async fn apply_rejected_block(
+        &self,
+        conn: &mut PgConnection,
+        u: &Upsert,
+        reason: &'static str,
+        rev: &str,
+    ) -> Result<(OpOutcome, MemoryEffects), OpError> {
+        if u.input.kind == RecordKind::PrivateBlock {
+            self.private.delete(conn, &u.uri, rev, true).await?;
+        } else {
+            delete_row(conn, "blocks", &u.uri, rev).await?;
+            sqlx::query(
+                "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
+                 ON CONFLICT (uri) DO UPDATE SET rev = EXCLUDED.rev, deleted_at = now() \
+                 WHERE record_tombstones.rev < EXCLUDED.rev",
+            )
+            .bind(&u.uri)
+            .bind(rev)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Ok((OpOutcome::Rejected(reason), MemoryEffects::default()))
     }
 
     /// Apply post-commit in-memory changes under a brief write guard.
@@ -2972,8 +3026,10 @@ mod tests {
             assert_eq!(like_via, (Some("at://did:plc:pack/app.bsky.graph.starterpack/1".into()), Some("bafyvia".into())));
             let follow_via: Option<String> = sqlx::query_scalar("SELECT via_uri FROM follows").fetch_one(p).await.expect("follow");
             assert_eq!(follow_via.as_deref(), Some("at://did:plc:pack/app.bsky.graph.starterpack/1"));
+            // A scoped non-member's block of a non-member is not stored
+            // (member-blocks-only design §2).
             let blocks: i64 = sqlx::query_scalar("SELECT count(*) FROM blocks").fetch_one(p).await.expect("block");
-            assert_eq!(blocks, 1);
+            assert_eq!(blocks, 0);
 
             type ProfileRow = (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, bool);
             let profile_sql = "SELECT profile_cid, pronouns, website, joined_via_starter_pack_uri, display_name, \
@@ -3046,7 +3102,10 @@ mod tests {
             let skipped: Vec<usize> = report.outcomes.iter().enumerate().filter(|(_, o)| **o == OpOutcome::Skipped("unindexed")).map(|(i, _)| i).collect();
             assert_eq!(skipped, [2, 9]);
             assert_eq!(report.failed.iter().map(|f| f.index).collect::<Vec<_>>(), [13]);
-            assert_eq!(report.outcomes.iter().filter(|o| **o == OpOutcome::Written).count(), 11);
+            assert_eq!(report.outcomes.iter().filter(|o| **o == OpOutcome::Written).count(), 10);
+            // A non-member's list block is not stored (member-blocks-only
+            // design §5).
+            assert_eq!(report.outcomes[3], OpOutcome::Rejected("no_member_side"));
 
             let count = |table: &'static str| async move {
                 let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(p).await.expect(table);
@@ -3055,7 +3114,7 @@ mod tests {
             for (table, rows) in [
                 ("lists", 1),
                 ("list_items", 1),
-                ("list_blocks", 1),
+                ("list_blocks", 0),
                 ("list_optouts", 1),
                 ("starter_packs", 1),
                 ("labeler_services", 1),
@@ -3988,6 +4047,122 @@ mod tests {
             // 3. Replaying rev 1 stores nothing.
             w.apply(owner, &rev(1), &[follow(SUBJECT)], OPTIONS).await.expect("apply");
             assert_eq!(count(p, "SELECT count(*) FROM follows").await, 0);
+            db.drop_db().await;
+        }
+
+        /// The writer for the member-blocks-only tests: `MEMBER_B` is a
+        /// member; `AUTHOR` is in S and not a member.
+        const MEMBER_B: &str = "did:plc:mmmmmmmmmmmmmmmmmmmmmmmm";
+
+        fn block_writer(pool: &PgPool) -> Writer {
+            let mut sets = ScopeSets::default();
+            sets.members.insert(MEMBER_B.into());
+            sets.scope.insert(MEMBER_B.into());
+            sets.scope.insert(AUTHOR.into());
+            Writer::new(pool.clone(), ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000), Arc::new(DisabledPrivateTier))
+        }
+
+        fn block_op(action: Action, rkey: &str, subject: &str) -> RawOp {
+            raw(action, "app.bsky.graph.block", rkey, Some(follow_of(subject)))
+        }
+
+        /// T-MB2 (member-blocks-only design §12): a commit of blocks by a
+        /// scoped non-member naming non-members opens no transaction, stores
+        /// nothing and counts each as `no_member_side`; one naming a member
+        /// is stored.
+        #[tokio::test]
+        async fn blocks_with_no_member_side_are_not_stored() {
+            let Some(db) = fresh_db("mb_no_member_side").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = block_writer(p);
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = metrics::set_default_local_recorder(&recorder);
+            let ops = [
+                block_op(Action::Create, "3kb1", SUBJECT),
+                block_op(Action::Create, "3kb2", "did:plc:cccccccccccccccccccccccc"),
+                block_op(Action::Create, "3kb3", "did:plc:dddddddddddddddddddddddd"),
+            ];
+            let r = w.apply(AUTHOR, &rev(1), &ops, OPTIONS).await.expect("apply");
+            assert!(!r.transaction);
+            assert_eq!(r.outcomes, [OpOutcome::Rejected("no_member_side"), OpOutcome::Rejected("no_member_side"), OpOutcome::Rejected("no_member_side")]);
+            assert_eq!(count(p, "SELECT count(*) FROM blocks").await, 0);
+            assert_eq!(crate::test_support::series(&handle.render(), METRIC_SKIPPED, &["reason=\"no_member_side\""]), Some(3.0));
+
+            let ops = [block_op(Action::Create, "3kb4", SUBJECT), block_op(Action::Create, "3kb5", MEMBER_B)];
+            let r = w.apply(AUTHOR, &rev(2), &ops, OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Rejected("no_member_side"), OpOutcome::Written]);
+            let stored: Vec<(String, String)> = sqlx::query_as("SELECT author_did, subject_did FROM blocks").fetch_all(p).await.expect("blocks");
+            assert_eq!(stored, [(AUTHOR.to_string(), MEMBER_B.to_string())]);
+            // A member's block of anyone is stored, and its list block too.
+            let r = w.apply(MEMBER_B, &rev(1), &[block_op(Action::Create, "3kb6", SUBJECT)], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written]);
+            let list_block = || {
+                raw(Action::Create, "app.bsky.graph.listblock", "3klb", Some(json!({"subject": format!("at://{SUBJECT}/app.bsky.graph.list/3kl"), "createdAt": "2026-09-26T00:00:00Z"})))
+            };
+            let r = w.apply(MEMBER_B, &rev(2), &[list_block()], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written]);
+            let r = w.apply(AUTHOR, &rev(3), &[list_block()], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Rejected("no_member_side")]);
+            assert_eq!(count(p, "SELECT count(*) FROM list_blocks").await, 1);
+            db.drop_db().await;
+        }
+
+        /// T-MB4b (member-blocks-only design §9, C-MB4): a non-member's
+        /// stored block of a member, updated to name a non-member, is
+        /// removed and tombstoned at the update's rev; the older create
+        /// replayed stores nothing. A rejected create runs no SQL.
+        #[tokio::test]
+        async fn a_block_updated_away_from_a_member_is_removed() {
+            let Some(db) = fresh_db("mb_rejected_block_update").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = block_writer(p);
+            let uri = format!("at://{AUTHOR}/app.bsky.graph.block/3kblk");
+            let r = w.apply(AUTHOR, &rev(1), &[block_op(Action::Create, "3kblk", MEMBER_B)], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written]);
+            assert_eq!(count(p, "SELECT count(*) FROM blocks").await, 1);
+
+            let r = w.apply(AUTHOR, &rev(2), &[block_op(Action::Update, "3kblk", SUBJECT)], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Rejected("no_member_side")]);
+            assert!(r.transaction);
+            assert_eq!(count(p, &format!("SELECT count(*) FROM blocks WHERE subject_did = '{MEMBER_B}'")).await, 0);
+            let tomb: String = sqlx::query_scalar("SELECT rev FROM record_tombstones WHERE uri = $1").bind(&uri).fetch_one(p).await.expect("tombstone");
+            assert_eq!(tomb, rev(2));
+
+            // The older create, replayed, stores nothing.
+            let r = w.apply(AUTHOR, &rev(1), &[block_op(Action::Create, "3kblk", MEMBER_B)], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
+            assert_eq!(count(p, "SELECT count(*) FROM blocks").await, 0);
+
+            // A rejected create by the same author opens no transaction.
+            let r = w.apply(AUTHOR, &rev(3), &[block_op(Action::Create, "3kother", SUBJECT)], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Rejected("no_member_side")]);
+            assert!(!r.transaction);
+            db.drop_db().await;
+        }
+
+        /// T-MB7 (member-blocks-only design §9): deleting a block never
+        /// stored writes a tombstone when the author is in S and nothing
+        /// when it is not.
+        #[tokio::test]
+        async fn deleting_a_never_stored_block() {
+            let Some(db) = fresh_db("mb_delete_never_stored").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = block_writer(p);
+            let r = w.apply(AUTHOR, &rev(1), &[raw(Action::Delete, "app.bsky.graph.block", "3kgone", None)], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
+            assert_eq!(count(p, "SELECT count(*) FROM record_tombstones").await, 1);
+            assert_eq!(count(p, "SELECT count(*) FROM blocks").await, 0);
+            let outside = "did:plc:eeeeeeeeeeeeeeeeeeeeeeee";
+            let r = w.apply(outside, &rev(1), &[raw(Action::Delete, "app.bsky.graph.block", "3kgone", None)], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
+            assert_eq!(count(p, "SELECT count(*) FROM record_tombstones").await, 1);
             db.drop_db().await;
         }
 

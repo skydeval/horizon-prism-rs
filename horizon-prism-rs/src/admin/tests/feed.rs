@@ -465,8 +465,13 @@ async fn t_f12_backlog() {
     let p = h.pool();
     let _alice = complete_setup(&h, ALICE).await;
     let cookie = session(p, ALICE, PDS).await;
-    let w = writer(&h, in_scope(&[AUTHOR]));
-    let block = |rkey: &str| op(Action::Create, "app.bsky.graph.block", rkey, Some(json!({"subject": OUTSIDER, "createdAt": "2026-10-19T00:00:00Z"})));
+    // The block names a member, so Rule M stores it (member-blocks-only
+    // design §2).
+    const BLOCKED_MEMBER: &str = "did:plc:mmmmmmmmmmmmmmmmmmmmmmmm";
+    let mut sets = in_scope(&[AUTHOR]);
+    sets.members.insert(BLOCKED_MEMBER.to_string());
+    let w = writer(&h, sets);
+    let block = |rkey: &str| op(Action::Create, "app.bsky.graph.block", rkey, Some(json!({"subject": BLOCKED_MEMBER, "createdAt": "2026-10-19T00:00:00Z"})));
 
     // Nobody watching: an indexed post and a rejected one.
     w.apply_from(Some("bsky"), AUTHOR, "3kaaaaaaaaa22", &[post("3kpost1aaaaaa", "kept for a reload")], OPTIONS).await.expect("apply");

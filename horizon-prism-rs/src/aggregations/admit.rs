@@ -40,6 +40,13 @@ impl RecordKind {
     pub fn is_block(self) -> bool {
         matches!(self, Self::Block | Self::PrivateBlock)
     }
+
+    /// The kinds Rule M decides (member-blocks-only design §2): direct and
+    /// private blocks, and list blocks.
+    #[must_use]
+    pub fn is_block_kind(self) -> bool {
+        self.is_block() || self == Self::Table("list_blocks")
+    }
 }
 
 /// What admission needs to know about one op.
@@ -61,8 +68,6 @@ pub enum AdmitRule {
     AuthorInScope,
     /// Rule 2: inbound interaction whose subject is a member.
     InboundToMember,
-    /// Rule 3: a block by a private owner.
-    OwnerBlock,
     /// Rule 3: a private owner's gate on its own private post (private
     /// posting §4.4).
     OwnerGate,
@@ -77,6 +82,9 @@ pub enum RejectReason {
     NotInScope,
     /// The off rule (public-indexing design §5) stores no such record.
     PublicOff,
+    /// Rule M (member-blocks-only design §2): a block kind whose author is
+    /// not a member and that names no member.
+    NoMemberSide,
 }
 
 impl RejectReason {
@@ -87,6 +95,7 @@ impl RejectReason {
             Self::Purging(k) => k.as_str(),
             Self::NotInScope => "not_in_scope",
             Self::PublicOff => "public_off",
+            Self::NoMemberSide => "no_member_side",
         }
     }
 }
@@ -127,6 +136,11 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
         }
         _ => {}
     }
+    // Rule M (member-blocks-only design §2), in every mode and before the
+    // off rule: a block kind is stored only with a member side.
+    if input.kind.is_block_kind() {
+        return block_rule(input, sets);
+    }
     // The off rule, in the off modes only (public-indexing design §5).
     if sets.public.mode.off_rule()
         && let Some(decision) = off_rule(input, sets)
@@ -150,10 +164,6 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
         .subjects
         .iter()
         .any(|s| sets.purge_kind(s) == Some(PurgeKind::MemberRemoved));
-    // Rule 3.
-    if input.kind.is_block() && sets.is_owner(&input.author) {
-        return Admission::Admit(AdmitRule::OwnerBlock);
-    }
     // Rule 3 for gates (private posting §4.4): an owner's gate naming the
     // owner's own private post, whose author is the op's one subject.
     if input.kind == RecordKind::PrivateGate
@@ -169,10 +179,32 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     Admission::Reject(RejectReason::NotInScope)
 }
 
+/// Rule M (member-blocks-only design §3): a direct, private or list block is
+/// stored when its author is a member, whoever it names, or when it names a
+/// member not being removed. Being in S, or a private owner, admits no block.
+/// A list block names a list, not an account, so it has no subjects and only
+/// the first arm admits it.
+fn block_rule(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
+    if sets.is_member(&input.author) {
+        return Admission::Admit(AdmitRule::AuthorInScope);
+    }
+    if input
+        .subjects
+        .iter()
+        .any(|s| sets.is_member(s) && sets.purge_kind(s) != Some(PurgeKind::MemberRemoved))
+    {
+        return Admission::Admit(AdmitRule::InboundToMember);
+    }
+    if input.subjects.iter().any(|s| sets.purge_kind(s) == Some(PurgeKind::MemberRemoved)) {
+        return Admission::Reject(RejectReason::Purging(PurgeKind::MemberRemoved));
+    }
+    Admission::Reject(RejectReason::NoMemberSide)
+}
+
 /// The off rule's table (public-indexing design §5): `Some` decides the op,
-/// `None` leaves it to the rules as they stand. Blocks, profiles, the self
-/// records other than the labeler service, and the private kinds are
-/// decided as always.
+/// `None` leaves it to the rules as they stand. Profiles, the self records
+/// other than the labeler service, and the private kinds are decided as
+/// always. The block kinds never reach it: Rule M decides them first.
 fn off_rule(input: &AdmissionInput, sets: &ScopeSets) -> Option<Admission> {
     let off = Some(Admission::Reject(RejectReason::PublicOff));
     let author_member = sets.is_member(&input.author);
@@ -259,20 +291,74 @@ mod tests {
         }
     }
 
+    /// Member-blocks-only design §2: rule 3 keeps its gate arm only. An
+    /// owner that is not a member (the window of a `member_removed` purge)
+    /// stores no block of a non-member.
     #[test]
-    fn rule_3_owner_blocks_only() {
-        assert_eq!(
-            admit(&input(OWNER, RecordKind::Block, &[STRANGER]), &sets()),
-            Admission::Admit(AdmitRule::OwnerBlock)
-        );
-        assert_eq!(
-            admit(&input(OWNER, RecordKind::PrivateBlock, &[STRANGER]), &sets()),
-            Admission::Admit(AdmitRule::OwnerBlock)
-        );
+    fn rule_3_admits_no_block() {
+        for kind in [RecordKind::Block, RecordKind::PrivateBlock] {
+            assert_eq!(
+                admit(&input(OWNER, kind, &[STRANGER]), &sets()),
+                Admission::Reject(RejectReason::NoMemberSide),
+                "{kind:?}"
+            );
+            assert_eq!(
+                admit(&input(OWNER, kind, &[MEMBER]), &sets()),
+                Admission::Admit(AdmitRule::InboundToMember),
+                "{kind:?}"
+            );
+        }
         assert_eq!(
             admit(&input(OWNER, RecordKind::Like, &[STRANGER]), &sets()),
             Admission::Reject(RejectReason::NotInScope)
         );
+    }
+
+    /// T-MB1 (member-blocks-only design §12): Rule M in every
+    /// public-indexing mode.
+    #[test]
+    fn rule_m_stores_a_block_only_with_a_member_side() {
+        const LIST_BLOCK: RecordKind = RecordKind::Table("list_blocks");
+        for mode in [PublicMode::On, PublicMode::Filling, PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
+            let s = with_mode(mode);
+            let a = |author: &str, kind: RecordKind, subjects: &[&str]| admit(&input(author, kind, subjects), &s);
+            // A member's block of anyone, list blocks included.
+            for kind in [RecordKind::Block, RecordKind::PrivateBlock, LIST_BLOCK] {
+                assert_eq!(a(MEMBER, kind, &[STRANGER]), Admission::Admit(AdmitRule::AuthorInScope), "{mode:?} {kind:?}");
+            }
+            assert_eq!(a(MEMBER, LIST_BLOCK, &[]), Admission::Admit(AdmitRule::AuthorInScope), "{mode:?}");
+            for kind in [RecordKind::Block, RecordKind::PrivateBlock] {
+                // A scoped non-member's block of a non-member: not stored.
+                assert_eq!(a(SCOPED, kind, &[OTHER]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?} {kind:?}");
+                assert_eq!(a(STRANGER, kind, &[OTHER]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?} {kind:?}");
+                // Of a member: stored.
+                assert_eq!(a(SCOPED, kind, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember), "{mode:?} {kind:?}");
+                assert_eq!(a(STRANGER, kind, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember), "{mode:?} {kind:?}");
+            }
+            // A non-member's list block, in every mode.
+            assert_eq!(a(SCOPED, LIST_BLOCK, &[]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?}");
+            assert_eq!(a(STRANGER, LIST_BLOCK, &[]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?}");
+            // A block naming only a member under `member_removed`.
+            let mut removed = s.clone();
+            removed.members.remove(MEMBER);
+            removed.purging.insert(MEMBER.into(), PurgeKind::MemberRemoved);
+            assert_eq!(
+                admit(&input(STRANGER, RecordKind::Block, &[MEMBER]), &removed),
+                Admission::Reject(RejectReason::Purging(PurgeKind::MemberRemoved)),
+                "{mode:?}"
+            );
+            // An `account_deleted` member's block.
+            let mut deleted = s.clone();
+            deleted.purging.insert(MEMBER.into(), PurgeKind::AccountDeleted);
+            assert_eq!(
+                admit(&input(MEMBER, RecordKind::Block, &[OTHER]), &deleted),
+                Admission::Reject(RejectReason::Purging(PurgeKind::AccountDeleted)),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(RejectReason::NoMemberSide.as_str(), "no_member_side");
+        assert!(LIST_BLOCK.is_block_kind() && RecordKind::Block.is_block_kind() && RecordKind::PrivateBlock.is_block_kind());
+        assert!(!RecordKind::Table("list_items").is_block_kind() && !RecordKind::Follow.is_block_kind());
     }
 
     /// Private posting §4.4 (review 11, finding 6): an owner's gate on its
@@ -384,17 +470,18 @@ mod tests {
             assert_eq!(a(STRANGER, RecordKind::Follow, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember));
             assert_eq!(a(MEMBER, RecordKind::Follow, &[STRANGER]), Admission::Admit(AdmitRule::AuthorInScope));
             assert_eq!(a(SCOPED, RecordKind::Follow, &[OTHER]), OFF);
-            // Blocks and S profiles, as today.
-            assert_eq!(a(SCOPED, RecordKind::Block, &[OTHER]), Admission::Admit(AdmitRule::AuthorInScope));
+            // Blocks by Rule M; S profiles, as today.
+            assert_eq!(a(SCOPED, RecordKind::Block, &[OTHER]), Admission::Reject(RejectReason::NoMemberSide));
             assert_eq!(a(STRANGER, RecordKind::Block, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember));
-            assert_eq!(a(OWNER, RecordKind::Block, &[STRANGER]), Admission::Admit(AdmitRule::OwnerBlock));
+            assert_eq!(a(OWNER, RecordKind::Block, &[STRANGER]), Admission::Reject(RejectReason::NoMemberSide));
             assert_eq!(a(SCOPED, RecordKind::Profile, &[]), Admission::Admit(AdmitRule::AuthorInScope));
             assert_eq!(a(STRANGER, RecordKind::Profile, &[]), Admission::Reject(RejectReason::NotInScope));
             assert_eq!(a(SCOPED, RecordKind::Table("actor_self_records"), &[]), Admission::Admit(AdmitRule::AuthorInScope));
-            // Members' list rows only.
+            // Members' list rows only; a list block by Rule M.
             for table in ["lists", "list_items", "list_optouts", "list_blocks"] {
                 assert_eq!(a(MEMBER, RecordKind::Table(table), &[]), Admission::Admit(AdmitRule::AuthorInScope), "{table}");
-                assert_eq!(a(SCOPED, RecordKind::Table(table), &[]), OFF, "{table}");
+                let refused = if table == "list_blocks" { Admission::Reject(RejectReason::NoMemberSide) } else { OFF };
+                assert_eq!(a(SCOPED, RecordKind::Table(table), &[]), refused, "{table}");
             }
             // Never stored, a member's included.
             for table in ["threadgates", "postgates", "starter_packs", "labeler_services", "nearhorizon_poll_posts"] {
@@ -464,11 +551,21 @@ mod tests {
             admit(&input(STRANGER, RecordKind::Post, &[MEMBER, OTHER]), &s),
             Admission::Admit(AdmitRule::InboundToMember)
         );
-        // The removed member's own writes are not rejected (rule 1 while in S).
+        // The removed member's own writes are not rejected (rule 1 while in
+        // S), its blocks aside: it is no longer a member, so Rule M stores
+        // only those naming a member.
         s.scope.insert(MEMBER.into());
         assert_eq!(
-            admit(&input(MEMBER, RecordKind::Block, &[STRANGER]), &s),
+            admit(&input(MEMBER, RecordKind::Like, &[STRANGER]), &s),
             Admission::Admit(AdmitRule::AuthorInScope)
+        );
+        assert_eq!(
+            admit(&input(MEMBER, RecordKind::Block, &[STRANGER]), &s),
+            Admission::Reject(RejectReason::NoMemberSide)
+        );
+        assert_eq!(
+            admit(&input(MEMBER, RecordKind::Block, &[OTHER]), &s),
+            Admission::Admit(AdmitRule::InboundToMember)
         );
     }
 }

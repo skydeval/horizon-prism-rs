@@ -90,7 +90,9 @@ impl Hydrator {
         let mut blocked_by = Pairs::new();
         {
             let scope = self.scope().read_guard().await;
-            let readable = |author: &str, subject: &str| scope.in_scope(author) || scope.is_member(subject);
+            // Rule M (member-blocks-only design §4.1): a block is read only
+            // with a member side, which keeps rows stored before it out.
+            let readable = |author: &str, subject: &str| scope.is_member(author) || scope.is_member(subject);
             for (author, subject, uri) in self.edges("blocks", &actor, &dids, true).await? {
                 if readable(&author, &subject) {
                     blocking.entry(subject).or_insert(uri);
@@ -264,8 +266,9 @@ mod tests {
         db.drop_db().await;
     }
 
-    /// B-55, B-53: any other actor is asked upstream; with no answer, local
-    /// rows answer, and a block stored only for a private owner is not read.
+    /// B-55, B-53, T-MB6 (member-blocks-only design §4.1): any other actor
+    /// is asked upstream; with no answer, local rows answer, and only blocks
+    /// with a member side are read.
     #[tokio::test]
     async fn other_actors_are_asked_upstream_then_answered_in_part() {
         let Some(db) = fresh_db("hydration_relationships_partial").await else {
@@ -273,21 +276,30 @@ mod tests {
         };
         let p = &db.pool;
         actor(p, BOB, "bob.test", "Bob").await;
-        // Carol is in scope and blocks Bob; Dave is out of scope (a private
-        // owner's block, stored by rule 3) and blocks Bob too.
-        let seen = edge(p, "blocks", CAROL, BOB, "b1").await;
+        // Carol is in scope, not a member, and blocks Bob (a row left by the
+        // old rule 1); Dave is out of scope and blocks Bob too. Bob blocks
+        // Alice, a member, and Alice blocks Bob.
+        edge(p, "blocks", CAROL, BOB, "b1").await;
         edge(p, "blocks", DAVE, BOB, "b2").await;
+        let blocking = edge(p, "blocks", BOB, ALICE, "b3").await;
+        let blocked = edge(p, "blocks", ALICE, BOB, "b4").await;
         let mut sets = ScopeSets::default();
         sets.scope.insert(BOB.into());
         sets.scope.insert(CAROL.into());
-        let others = vec![CAROL.to_string(), DAVE.to_string()];
+        sets.scope.insert(ALICE.into());
+        sets.members.insert(ALICE.into());
+        let others = vec![CAROL.to_string(), DAVE.to_string(), ALICE.to_string()];
         let req = Requester::test();
 
         let partial = hydrator(p, sets.clone());
         let v = partial.get_relationships(&req, BOB, &others).await.expect("db").expect("view");
         let r = v.inner()["relationships"].as_array().expect("relationships").clone();
-        assert_eq!(r[0]["blockedBy"], seen);
+        assert_eq!(r[0], json!({"$type": "app.bsky.graph.defs#relationship", "did": CAROL}));
         assert_eq!(r[1], json!({"$type": "app.bsky.graph.defs#relationship", "did": DAVE}));
+        assert_eq!(
+            r[2],
+            json!({"$type": "app.bsky.graph.defs#relationship", "did": ALICE, "blocking": blocking, "blockedBy": blocked})
+        );
 
         let mut up = FixedUpstream::default();
         let answer = json!({"actor": BOB, "relationships": [{"$type": "app.bsky.graph.defs#relationship", "did": CAROL, "followedBy": "at://x/app.bsky.graph.follow/1"}]});

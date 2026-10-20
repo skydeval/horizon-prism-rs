@@ -385,10 +385,10 @@ async fn leaving_held() {
     pi.startup(&file(None)).await.expect("startup");
     assert_eq!(scope.public_mode(), PublicMode::Held);
 
-    // In Held: a block and a member's follow are stored; a non-member's
-    // like is rejected.
+    // In Held: a block of a member and a member's follow are stored; a
+    // non-member's like is rejected.
     let writer = Writer::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier));
-    let block = op("app.bsky.graph.block", "3kblock", json!({"subject": D, "createdAt": "2026-10-14T00:00:00Z"}));
+    let block = op("app.bsky.graph.block", "3kblock", json!({"subject": MEMBER, "createdAt": "2026-10-14T00:00:00Z"}));
     let r = writer.apply(B, "3kaaaaaaaaaa2", &[block, like("3klike")], LIVE).await.expect("apply");
     assert_eq!(r.outcomes, [OpOutcome::Written, OpOutcome::Rejected("public_off")]);
     let follow = op("app.bsky.graph.follow", "3kfollow", json!({"subject": D, "createdAt": "2026-10-14T00:00:00Z"}));

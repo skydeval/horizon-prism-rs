@@ -40,7 +40,7 @@
   var REASON = {
     unindexed: 'not indexed', kryphocron_unproduced: 'private type not produced', not_in_scope: 'not in scope',
     public_off: 'public data off', account_deleted: 'account deleted', out_of_scope: 'leaving scope',
-    member_removed: 'member removed', other: 'other'
+    member_removed: 'member removed', no_member_side: 'no member side', other: 'other'
   };
   var ENDED = {
     signed_out: 'you signed out', expired: 'your session ended', not_operator: 'you are no longer an operator',
