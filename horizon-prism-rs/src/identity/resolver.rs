@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -26,6 +27,7 @@ use tokio::sync::Semaphore;
 
 use super::cache::{CachedDoc, DidCache, Freshness};
 use super::handle_lookup::{HandleProbe, candidate};
+use super::lodestar::{DocAnswer, Lodestar};
 use super::{IdentityError, IdentitySettings, PersistencePolicy, ResolveIntent, should_persist};
 use crate::net::{BodyCap, FetchMode, Intent, NetClient, RequestOptions, Transport, Transports};
 
@@ -238,12 +240,40 @@ struct Inner {
     refresh_permits: Arc<Semaphore>,
 }
 
+/// Which upstream a request-path read is about to ask, for its `admit`
+/// (lodestar-reads design §2.3, §2.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upstream {
+    /// Lodestar: a "no" means "skip it", never "no answer".
+    Lodestar,
+    /// The PLC directory (or a `did:web` host): a "no" is `NoBudget`.
+    Plc,
+}
+
+/// A request's admission of one network call, asked just before it.
+pub type Admit<'a> = &'a (dyn Fn(Upstream, &str) -> bool + Sync);
+
+/// Admits every call (background work and callers with no budget).
+pub fn admit_all(_upstream: Upstream, _key: &str) -> bool {
+    true
+}
+
 /// The cached DID resolver, making its network calls through one `net`
 /// intent. Cheap to clone; every intent's view shares the caches.
+///
+/// A view may carry lodestar ([`IdentityResolver::with_lodestar`]); it is
+/// asked only by a view whose intent is `Public`, and only by the read
+/// methods. [`IdentityResolver::fetch_document`],
+/// [`IdentityResolver::refresh_now`] and [`IdentityResolver::resolve_fresh`]
+/// read the PLC directory only, whatever the view, and `did_cache` never
+/// holds a lodestar document (lodestar-reads design §2.2, §2.5).
 #[derive(Clone)]
 pub struct IdentityResolver {
     inner: Arc<Inner>,
     intent: Intent,
+    lodestar: Option<Arc<Lodestar>>,
+    /// The request's deadline, which a lodestar call never passes.
+    deadline: Option<Instant>,
 }
 
 impl IdentityResolver {
@@ -281,6 +311,8 @@ impl IdentityResolver {
                 refresh_permits: Arc::new(Semaphore::new(BACKGROUND_REFRESH_PERMITS)),
             }),
             intent,
+            lodestar: None,
+            deadline: None,
         }
     }
 
@@ -291,7 +323,60 @@ impl IdentityResolver {
         Self {
             inner: Arc::clone(&self.inner),
             intent,
+            lodestar: self.lodestar.clone(),
+            deadline: self.deadline,
         }
+    }
+
+    /// This view, reading identities from `lodestar` first on public
+    /// request paths (lodestar-reads design §2.2).
+    #[must_use]
+    pub fn with_lodestar(&self, lodestar: Arc<Lodestar>) -> Self {
+        Self {
+            lodestar: Some(lodestar),
+            ..self.clone()
+        }
+    }
+
+    /// This view without lodestar: every read goes to the PLC directory.
+    /// The key path, the members' keys and the refresher take this view.
+    #[must_use]
+    pub fn directory_only(&self) -> Self {
+        Self {
+            lodestar: None,
+            ..self.clone()
+        }
+    }
+
+    /// This view for a request ending at `deadline`: a lodestar call never
+    /// runs past it.
+    #[must_use]
+    pub fn with_deadline(&self, deadline: Instant) -> Self {
+        Self {
+            deadline: Some(deadline),
+            ..self.clone()
+        }
+    }
+
+    /// Lodestar, when this view may ask it: it carries one and its intent
+    /// is `Public` (§2.9).
+    fn lodestar(&self) -> Option<&Lodestar> {
+        self.lodestar.as_deref().filter(|_| self.intent == Intent::Public)
+    }
+
+    /// Lodestar, when the gate is open and `admit` grants the call; each
+    /// skip is counted.
+    fn ask_lodestar(&self, admit: Admit<'_>, key: &str) -> Option<&Lodestar> {
+        let lodestar = self.lodestar()?;
+        if !lodestar.gate().is_open() {
+            metrics::counter!(super::lodestar::METRIC_SKIPPED, "reason" => "gate_closed").increment(1);
+            return None;
+        }
+        if !admit(Upstream::Lodestar, key) {
+            metrics::counter!(super::lodestar::METRIC_SKIPPED, "reason" => "no_budget").increment(1);
+            return None;
+        }
+        Some(lodestar)
     }
 
     /// This resolver for a fetch made for `req`: the intent is the
@@ -422,38 +507,73 @@ impl IdentityResolver {
     ///
     /// As [`IdentityResolver::refresh_now`].
     pub async fn resolve(&self, did: &str, intent: ResolveIntent) -> Result<Arc<Value>, IdentityError> {
-        self.resolve_admitted(did, intent, &|_| true).await
+        self.resolve_admitted(did, intent, &admit_all).await
     }
 
-    /// [`IdentityResolver::resolve`] for a request: `admit` is asked once
-    /// with the DID, just before a synchronous network fetch, and a `false`
-    /// ends the resolution without one. A cached entry costs nothing.
+    /// [`IdentityResolver::resolve`] for a request: `admit` is asked just
+    /// before each network call, with the upstream it would ask; for the
+    /// PLC directory a `false` ends the resolution without a call, for
+    /// lodestar it only skips lodestar. A cached entry costs nothing.
+    ///
+    /// With lodestar (a public view that carries it, lodestar-reads design
+    /// §2.3): a fresh `did_cache` entry, then the lodestar cache when it is
+    /// newer than a stale entry, then the stale entry (with a background
+    /// refresh), then lodestar, then the PLC directory.
     ///
     /// # Errors
     ///
     /// As [`IdentityResolver::resolve`], plus [`IdentityError::NoBudget`].
-    pub async fn resolve_admitted(
-        &self,
-        did: &str,
-        intent: ResolveIntent,
-        admit: &(dyn Fn(&str) -> bool + Sync),
-    ) -> Result<Arc<Value>, IdentityError> {
+    pub async fn resolve_admitted(&self, did: &str, intent: ResolveIntent, admit: Admit<'_>) -> Result<Arc<Value>, IdentityError> {
         parse_did(did)?;
-        match self.inner.cache.lookup(did).await {
-            Ok(Some((entry, Freshness::Fresh))) => return Ok(entry.doc),
-            Ok(Some((entry, Freshness::Stale))) => {
-                self.spawn_background_refresh(did, intent);
-                return Ok(entry.doc);
-            }
-            Ok(Some((_, Freshness::Expired)) | None) => {}
+        let cached = match self.inner.cache.lookup(did).await {
+            Ok(found) => found,
             Err(error) => {
                 tracing::warn!(event = "did_cache_read_failed", did, %error, "did_cache read failed; fetching");
+                None
+            }
+        };
+        let stale = match cached {
+            Some((entry, Freshness::Fresh)) => return Ok(entry.doc),
+            Some((entry, Freshness::Stale)) => Some(entry),
+            Some((_, Freshness::Expired)) | None => None,
+        };
+        if let Some(lodestar) = self.lodestar() {
+            let held = lodestar.docs().get(did).await;
+            metrics::counter!(super::cache::METRIC_REQUESTS, "cache" => "lodestar", "result" => if held.is_some() { "hit" } else { "miss" })
+                .increment(1);
+            if let Some(entry) = held.filter(|e| stale.as_ref().is_none_or(|s| e.fetched_at >= s.fetched_at)) {
+                return Ok(entry.doc);
             }
         }
-        if !admit(did) {
+        if let Some(entry) = stale {
+            self.spawn_background_refresh(did, intent);
+            return Ok(entry.doc);
+        }
+        Ok(self.refresh_read(did, intent, admit).await?.doc)
+    }
+
+    /// A read's fetch (lodestar-reads design §2.3): lodestar first, for a
+    /// `did:plc` while the gate is open and `admit` grants it, kept in the
+    /// lodestar cache; otherwise, or when lodestar cannot answer, the PLC
+    /// directory, stored as [`IdentityResolver::refresh_now`] stores. A
+    /// lodestar tombstone is final.
+    async fn refresh_read(&self, did: &str, intent: ResolveIntent, admit: Admit<'_>) -> Result<FetchedDoc, IdentityError> {
+        if did.starts_with("did:plc:")
+            && let Some(lodestar) = self.ask_lodestar(admit, did)
+        {
+            match lodestar.document(did, self.deadline).await {
+                DocAnswer::Doc(fetched) => {
+                    lodestar.docs().insert(did.to_string(), fetched.cached()).await;
+                    return Ok(fetched);
+                }
+                DocAnswer::Tombstoned => return Err(IdentityError::Tombstoned(did.to_string())),
+                DocAnswer::Fallback => {}
+            }
+        }
+        if !admit(Upstream::Plc, did) {
             return Err(IdentityError::NoBudget(did.to_string()));
         }
-        Ok(self.refresh_now(did, intent).await?.doc)
+        self.refresh_now(did, intent).await
     }
 
     /// [`IdentityResolver::resolve_admitted`] plus extraction.
@@ -461,12 +581,7 @@ impl IdentityResolver {
     /// # Errors
     ///
     /// As [`IdentityResolver::resolve_admitted`].
-    pub async fn resolve_info_admitted(
-        &self,
-        did: &str,
-        intent: ResolveIntent,
-        admit: &(dyn Fn(&str) -> bool + Sync),
-    ) -> Result<DidDocInfo, IdentityError> {
+    pub async fn resolve_info_admitted(&self, did: &str, intent: ResolveIntent, admit: Admit<'_>) -> Result<DidDocInfo, IdentityError> {
         let doc = self.resolve_admitted(did, intent, admit).await?;
         Ok(extract_info(&doc, did))
     }
@@ -474,22 +589,23 @@ impl IdentityResolver {
     /// [`IdentityResolver::resolve_info_admitted`] with no cache read and no
     /// cache write: a viewer-private lookup (design-v4 §8.1) leaves neither
     /// `did_cache` nor the in-process document cache touched, even for an
-    /// in-scope DID. `admit` is asked just before the fetch.
+    /// in-scope DID. `admit` is asked just before the fetch. Lodestar is
+    /// never asked (§2.9).
     ///
     /// # Errors
     ///
     /// As [`IdentityResolver::fetch_document`], plus
     /// [`IdentityError::NoBudget`].
-    pub async fn resolve_info_uncached(&self, did: &str, admit: &(dyn Fn(&str) -> bool + Sync)) -> Result<DidDocInfo, IdentityError> {
+    pub async fn resolve_info_uncached(&self, did: &str, admit: Admit<'_>) -> Result<DidDocInfo, IdentityError> {
         parse_did(did)?;
-        if !admit(did) {
+        if !admit(Upstream::Plc, did) {
             return Err(IdentityError::NoBudget(did.to_string()));
         }
         Ok(extract_info(&self.fetch_document(did).await?.doc, did))
     }
 
     /// A document's info for `did` under `caches` (design-v4 §8.1).
-    async fn info_with(&self, did: &str, admit: &(dyn Fn(&str) -> bool + Sync), caches: Caches) -> Result<DidDocInfo, IdentityError> {
+    async fn info_with(&self, did: &str, admit: Admit<'_>, caches: Caches) -> Result<DidDocInfo, IdentityError> {
         match caches {
             Caches::Shared => self.resolve_info_admitted(did, ResolveIntent::Lookup, admit).await,
             Caches::Bypass => self.resolve_info_uncached(did, admit).await,
@@ -521,23 +637,44 @@ impl IdentityResolver {
     /// The DID for `handle`, verified bidirectionally (the DID document
     /// claims the handle back), or `None`.
     pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
-        self.resolve_handle_admitted(handle, &|_| true).await
+        self.resolve_handle_admitted(handle, &admit_all).await
     }
 
     /// [`IdentityResolver::resolve_handle`] for a request; `admit` as in
     /// [`IdentityResolver::resolve_admitted`].
-    pub async fn resolve_handle_admitted(&self, handle: &str, admit: &(dyn Fn(&str) -> bool + Sync)) -> Option<String> {
+    pub async fn resolve_handle_admitted(&self, handle: &str, admit: Admit<'_>) -> Option<String> {
         self.resolve_handle_with(handle, admit, Caches::Shared).await
     }
 
     /// [`IdentityResolver::resolve_handle_admitted`], with the document read
-    /// under `caches`.
-    pub async fn resolve_handle_with(&self, handle: &str, admit: &(dyn Fn(&str) -> bool + Sync), caches: Caches) -> Option<String> {
+    /// under `caches`. With lodestar, its verified DID is tried first and
+    /// kept only when the DID's document claims the handle back; otherwise
+    /// the probes run, as without it (lodestar-reads design §2.7).
+    pub async fn resolve_handle_with(&self, handle: &str, admit: Admit<'_>, caches: Caches) -> Option<String> {
         let handle = handle.trim().trim_start_matches('@').to_ascii_lowercase();
+        if let Some(did) = self.lodestar_handle(&handle, admit, caches).await {
+            return Some(did);
+        }
         let did = self.inner.handles.resolve_handle(self.transport(), &handle).await?;
-        let info = self.info_with(&did, admit, caches).await.ok()?;
-        verify_bidirectional(&did, info.claimed_handle.as_deref(), Some(&did)).filter(|h| h.eq_ignore_ascii_case(&handle))?;
-        Some(did)
+        self.claims(&did, &handle, admit, caches).await.then_some(did)
+    }
+
+    /// Whether `did`'s document, read under `caches`, claims `handle`.
+    async fn claims(&self, did: &str, handle: &str, admit: Admit<'_>, caches: Caches) -> bool {
+        match self.info_with(did, admit, caches).await {
+            Ok(info) => verify_bidirectional(did, info.claimed_handle.as_deref(), Some(did)).is_some_and(|h| h.eq_ignore_ascii_case(handle)),
+            Err(_) => false,
+        }
+    }
+
+    /// The DID lodestar holds `handle` verified to, kept only when that
+    /// DID's document claims the handle back. `None` sends the caller to
+    /// the probes: lodestar's "no" and a document that does not claim the
+    /// handle (lodestar's lag) both decide nothing (§2.7, review 2 LB1).
+    async fn lodestar_handle(&self, handle: &str, admit: Admit<'_>, caches: Caches) -> Option<String> {
+        let lodestar = self.ask_lodestar(admit, handle)?;
+        let did = lodestar.handle(handle, self.deadline).await?;
+        self.claims(&did, handle, admit, caches).await.then_some(did)
     }
 
     /// The DID of `handle` with the reason kept when there is none
@@ -547,14 +684,14 @@ impl IdentityResolver {
     /// "could not find out". `admit` as in
     /// [`IdentityResolver::resolve_admitted`]; the document is read under
     /// `caches`.
-    pub async fn resolve_handle_typed(
-        &self,
-        handle: &str,
-        admit: &(dyn Fn(&str) -> bool + Sync),
-        caches: Caches,
-    ) -> super::handle_lookup::HandleOutcome {
+    pub async fn resolve_handle_typed(&self, handle: &str, admit: Admit<'_>, caches: Caches) -> super::handle_lookup::HandleOutcome {
         use super::handle_lookup::{HandleOutcome, Step, neither_found};
 
+        // Lodestar's verified DID, when its document claims the handle
+        // back; anything else runs the probes below (§2.7).
+        if let Some(did) = self.lodestar_handle(handle, admit, caches).await {
+            return HandleOutcome::Found(did);
+        }
         let (from_txt, from_file) = HandleProbe::through(self.transport()).run(handle).await;
         let Some(did) = candidate(&from_txt, &from_file) else {
             return match neither_found(&from_txt, &from_file) {
@@ -581,7 +718,26 @@ impl IdentityResolver {
     /// `network_not_found` when it named none (the probe does not tell a
     /// failure apart from an absence here).
     pub async fn verify_handle(&self, did: &str, claimed: Option<&str>) -> Option<String> {
+        self.verify_handle_admitted(did, claimed, &admit_all).await
+    }
+
+    /// [`IdentityResolver::verify_handle`] for a request. With lodestar, a
+    /// `did:plc` whose account lodestar reports at the tip with `handle`
+    /// equal to `claimed` is verified without a probe; any other answer
+    /// runs the probe (lodestar-reads design §2.7). Lodestar's negatives
+    /// are never taken.
+    pub async fn verify_handle_admitted(&self, did: &str, claimed: Option<&str>, admit: Admit<'_>) -> Option<String> {
         let claimed = claimed?;
+        if did.starts_with("did:plc:")
+            && let Some(lodestar) = self.ask_lodestar(admit, did)
+            && lodestar
+                .account(did, self.deadline)
+                .await
+                .and_then(|account| account.handle)
+                .is_some_and(|handle| handle.eq_ignore_ascii_case(claimed))
+        {
+            return verify_bidirectional(did, Some(claimed), Some(did));
+        }
         let resolved = self.inner.handles.resolve_handle(self.transport(), claimed).await;
         if self.intent == Intent::Internal {
             let result = if resolved.is_some() { "network_ok" } else { "network_not_found" };
@@ -605,10 +761,15 @@ impl IdentityResolver {
                 return;
             }
         }
-        let this = self.clone();
+        // Uncharged, as before; with lodestar it is asked first, with no
+        // request deadline (the request has moved on).
+        let this = Self {
+            deadline: None,
+            ..self.clone()
+        };
         let did = did.to_string();
         tokio::spawn(async move {
-            if let Err(error) = this.refresh_now(&did, intent).await {
+            if let Err(error) = this.refresh_read(&did, intent, &admit_all).await {
                 tracing::debug!(event = "did_background_refresh_failed", did = %did, %error, "background DID refresh failed");
             }
             if let Ok(mut refreshing) = this.inner.refreshing.lock() {

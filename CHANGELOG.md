@@ -10,6 +10,46 @@ commit.
 
 ## [Unreleased]
 
+### Added (lodestar identity reads S3, #751)
+
+Lodestar-reads design §2.2 to §2.9, §2.11 (`docs/internal/design/lodestar-reads.md`).
+
+- **With `identity.lodestar_url` set, public request paths read identities
+  from lodestar first.** That is routing and summaries, `resolveDid`,
+  `resolveHandle`, actor parameters, the upstream fallbacks and Thread Lens,
+  for ordinary (public) requests only:
+  - **DID documents** (`did:plc`): `did_cache` first; then lodestar's
+    in-process document cache (100 000 entries, kept `did_fresh_secs`);
+    then lodestar's `GET /{did}`; then the PLC directory, as before. Lodestar
+    answering "not registered" (a DID created seconds ago), 400, 403, any
+    5xx, a timeout or a malformed answer falls back to the PLC directory;
+    "DID not available" is a tombstone.
+  - **DID → handle:** lodestar's verified `handle` from `GET /account/{did}`,
+    used only when lodestar is at the directory's tip and the handle equals
+    the document's claim; anything else (any other handle status, an error,
+    a stale answer) runs this app's own DNS and HTTPS check, as before.
+    Lodestar's "not verified" is never taken.
+  - **Handle → DID:** lodestar's `GET /handle/{handle}`, kept only when the
+    DID's document claims the handle back; otherwise (including a document
+    that no longer claims it) this app's own lookup runs, as before.
+- **Never from lodestar:** sign-in token keys (the JWT path and the members'
+  key table), admin sign-in, admin commands, auto-enrolment, the identity
+  refresher (account status and deletion), backfill and `list_sync` all read
+  the PLC directory only. `did_cache` never holds a lodestar document, so the
+  key path's cached documents are the directory's. Viewer-private and
+  private-context requests never ask lodestar; `did:web` is never asked.
+- **Budget:** lodestar's own bucket (`lodestar_request_rate_per_sec`,
+  `_burst`); an empty one skips lodestar and never refuses the request. The
+  PLC bucket is drawn only when the PLC directory is asked; the requester's
+  identity share is unchanged. No call passes the request's deadline.
+- **Metrics:** `lodestar_skipped_total{reason}` (`gate_closed`,
+  `no_budget`); `identity_cache_requests_total{cache="lodestar"}` for the
+  document cache.
+- A member's `did_cache` row is now refreshed by the key path's own fetch
+  and the members' key refresh rather than by public reads, so the backstop
+  finds a member's key under an hour old less often; the key path still
+  fetches from the PLC directory, at most once an hour per active member.
+
 ### Added (lodestar identity reads S2, #750)
 
 Lodestar-reads design §2.1, §2.6, §2.13 (`docs/internal/design/lodestar-reads.md`).

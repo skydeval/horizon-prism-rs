@@ -205,7 +205,9 @@ impl IdentityRefresher {
     pub fn new(pool: PgPool, resolver: IdentityResolver, lifecycle: Arc<dyn AccountLifecycle>) -> Self {
         Self {
             pool,
-            resolver: resolver.with_intent(crate::net::Intent::Internal),
+            // The PLC directory only: deletion is decided by its answer
+            // (lodestar-reads design §2.2).
+            resolver: resolver.with_intent(crate::net::Intent::Internal).directory_only(),
             lifecycle,
         }
     }

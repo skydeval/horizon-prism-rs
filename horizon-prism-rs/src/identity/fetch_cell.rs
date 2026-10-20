@@ -201,11 +201,13 @@ pub struct GuardedDidFetcher {
 impl GuardedDidFetcher {
     /// The fetcher. JWT issuer resolution is the auth middleware's, a public
     /// path (design-v4 §11 G-9; R3-167): its fetches go through the public
-    /// intent, whatever `resolver` was built with.
+    /// intent, whatever `resolver` was built with. It never reads lodestar
+    /// (lodestar-reads design §2.2): signing keys come from the PLC
+    /// directory only, and `did_cache` never holds a lodestar document.
     #[must_use]
     pub fn new(resolver: IdentityResolver, cell: JwtFetchCell) -> Self {
         Self {
-            resolver: resolver.with_intent(crate::net::Intent::Public),
+            resolver: resolver.with_intent(crate::net::Intent::Public).directory_only(),
             cell,
             budget: None,
         }

@@ -21,7 +21,8 @@ use moka::future::Cache;
 use super::matcher::{first_match, pds_host};
 use crate::config::{COMMUNITY_NETWORK, ConstellationConfig, LOCAL_APPVIEW, NetworkAuth};
 use crate::identity::handle_lookup::HandleOutcome;
-use crate::identity::resolver::Caches;
+use crate::identity::lodestar::Lodestar;
+use crate::identity::resolver::{Caches, Upstream, admit_all};
 use crate::identity::{IdentityResolver, ResolveIntent};
 use crate::xrpc::pools::{Requester, RequesterLimit, SharedBucket};
 
@@ -227,7 +228,7 @@ impl DidLookup for IdentityResolver {
     async fn summary(&self, req: &Requester, did: &str) -> Option<DidSummary> {
         let resolver = self.for_request(req);
         let info = if req.is_viewer_private() {
-            resolver.resolve_info_uncached(did, &|_| true).await.ok()?
+            resolver.resolve_info_uncached(did, &admit_all).await.ok()?
         } else {
             resolver.resolve_info(did, ResolveIntent::Lookup).await.ok()?
         };
@@ -239,7 +240,7 @@ impl DidLookup for IdentityResolver {
     }
 
     async fn did_for_handle(&self, req: &Requester, handle: &str) -> Option<String> {
-        self.for_request(req).resolve_handle_with(handle, &|_| true, caches_for(req)).await
+        self.for_request(req).resolve_handle_with(handle, &admit_all, caches_for(req)).await
     }
 }
 
@@ -277,6 +278,9 @@ pub struct RequestLookup {
     summaries: Cache<String, DidSummary>,
     /// The typed handle lookup, when one is set.
     handles: Option<Handles>,
+    /// Lodestar's request bucket, when lodestar is set
+    /// ([`RequestLookup::with_lodestar`]).
+    lodestar: Option<SharedBucket>,
 }
 
 impl RequestLookup {
@@ -288,6 +292,32 @@ impl RequestLookup {
             plc,
             summaries: Cache::builder().max_capacity(SUMMARY_CAPACITY).time_to_live(SUMMARY_TTL).build(),
             handles: None,
+            lodestar: None,
+        }
+    }
+
+    /// Read identities from `lodestar` first on public requests, drawing on
+    /// `bucket`, lodestar's own (lodestar-reads design §2.2, §2.11).
+    #[must_use]
+    pub fn with_lodestar(self, lodestar: Arc<Lodestar>, bucket: SharedBucket) -> Self {
+        let Self { resolver, own, plc, summaries, handles, .. } = self;
+        Self {
+            resolver: resolver.with_lodestar(lodestar),
+            own,
+            plc,
+            summaries,
+            handles,
+            lodestar: Some(bucket),
+        }
+    }
+
+    /// A request's admission of each network call (§2.11): a lodestar call
+    /// takes a token of lodestar's bucket quietly (none: skip lodestar,
+    /// never "no answer"); a PLC fetch takes one of PLC's, as before.
+    fn admit<'a>(&'a self, req: &'a Requester) -> impl Fn(Upstream, &str) -> bool + Sync + 'a {
+        move |upstream, did| match upstream {
+            Upstream::Lodestar => self.lodestar.as_ref().is_some_and(|bucket| bucket.quiet_draw(req.key()).is_ok()),
+            Upstream::Plc => !did.starts_with("did:plc:") || req.draw(&self.plc),
         }
     }
 
@@ -321,14 +351,14 @@ impl DidLookup for RequestLookup {
         if !self.admitted(req) {
             return None;
         }
-        let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
-        let resolver = self.resolver.for_request(req);
+        let admit = self.admit(req);
+        let resolver = self.resolver.for_request(req).with_deadline(req.deadline());
         let info = if shared {
-            resolver.resolve_info_admitted(did, ResolveIntent::Lookup, &plc).await.ok()?
+            resolver.resolve_info_admitted(did, ResolveIntent::Lookup, &admit).await.ok()?
         } else {
-            resolver.resolve_info_uncached(did, &plc).await.ok()?
+            resolver.resolve_info_uncached(did, &admit).await.ok()?
         };
-        let handle = resolver.verify_handle(did, info.claimed_handle.as_deref()).await;
+        let handle = resolver.verify_handle_admitted(did, info.claimed_handle.as_deref(), &admit).await;
         let summary = DidSummary {
             pds: info.pds_endpoint,
             handle,
@@ -343,8 +373,8 @@ impl DidLookup for RequestLookup {
         if !self.admitted(req) {
             return None;
         }
-        let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
-        self.resolver.for_request(req).resolve_handle_with(handle, &plc, caches_for(req)).await
+        let admit = self.admit(req);
+        self.resolver.for_request(req).with_deadline(req.deadline()).resolve_handle_with(handle, &admit, caches_for(req)).await
     }
 
     async fn handle_outcome(&self, req: &Requester, handle: &str) -> HandleOutcome {
@@ -369,8 +399,8 @@ impl DidLookup for RequestLookup {
         if !self.admitted(req) {
             return HandleOutcome::Unavailable;
         }
-        let plc = |did: &str| !did.starts_with("did:plc:") || req.draw(&self.plc);
-        let outcome = self.resolver.for_request(req).resolve_handle_typed(handle, &plc, caches_for(req)).await;
+        let admit = self.admit(req);
+        let outcome = self.resolver.for_request(req).with_deadline(req.deadline()).resolve_handle_typed(handle, &admit, caches_for(req)).await;
         match &outcome {
             HandleOutcome::Found(did) => {
                 count("network_ok");

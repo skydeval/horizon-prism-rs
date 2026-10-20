@@ -14,6 +14,8 @@ pub mod cache;
 pub mod fetch_cell;
 pub mod handle_lookup;
 pub mod lodestar;
+#[cfg(test)]
+mod lodestar_tests;
 pub mod refresher;
 pub mod resolver;
 

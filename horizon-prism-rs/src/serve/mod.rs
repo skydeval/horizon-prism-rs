@@ -394,7 +394,7 @@ pub async fn run() -> Result<(), StartupError> {
     let identity = &cfg.file.identity;
     // Lodestar (lodestar-reads design), only when configured: the client,
     // its gate and the probe that keeps the gate.
-    let _lodestar = identity.lodestar().map(|url| {
+    let lodestar = identity.lodestar().map(|url| {
         let lodestar = Arc::new(crate::identity::lodestar::Lodestar::new(
             nets.public().client().clone(),
             url,
@@ -661,13 +661,24 @@ pub async fn run() -> Result<(), StartupError> {
     // `resolveHandle` asks DNS for the handle's TXT record itself, to tell
     // "no such handle" from a lookup that failed (design-v3 §5.11). Every
     // lookup goes through the transport of the request's mode.
-    let lookup = RequestLookup::new(resolver.with_intent(Intent::Public), identity_share, plc_bucket).with_handle_lookup(
+    let mut lookup = RequestLookup::new(resolver.with_intent(Intent::Public), identity_share, plc_bucket).with_handle_lookup(
         crate::constellation::routing::HandleCacheSettings {
             capacity: cfg.file.identity.resolve_handle_cache_max,
             ttl: Duration::from_secs(cfg.file.identity.resolve_handle_ttl_secs),
             negative_ttl: Duration::from_secs(cfg.file.identity.resolve_handle_negative_ttl_secs),
         },
     );
+    // Lodestar first on public request paths only, with its own bucket
+    // (lodestar-reads design §2.2, §2.11). No other user of `resolver`
+    // gets it.
+    if let Some(lodestar) = &lodestar {
+        let bucket = shares.bucket(
+            "lodestar",
+            cfg.file.identity.lodestar_request_rate_per_sec.0,
+            cfg.file.identity.lodestar_request_burst,
+        );
+        lookup = lookup.with_lodestar(Arc::clone(lodestar), bucket);
+    }
     let did_router = DidRouter::new(Arc::clone(&table), Arc::new(lookup) as Arc<dyn DidLookup>);
     let cascade = Cascade::new(
         Arc::clone(&table),

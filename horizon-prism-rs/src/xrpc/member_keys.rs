@@ -188,7 +188,8 @@ impl MemberKeys {
     /// through the internal intent (design-v4 §11 G-9).
     #[must_use]
     pub fn spawn(self, pool: PgPool, resolver: IdentityResolver, forget: impl Fn(&str) + Send + 'static) -> JoinHandle<()> {
-        let resolver = resolver.with_intent(crate::net::Intent::Internal);
+        // Keys come from the PLC directory only (lodestar-reads design §2.2).
+        let resolver = resolver.with_intent(crate::net::Intent::Internal).directory_only();
         tokio::spawn(async move {
             // DID → (failures so far, earliest next attempt).
             let mut failed: HashMap<String, (usize, Instant)> = HashMap::new();
