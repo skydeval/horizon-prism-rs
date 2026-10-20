@@ -17,6 +17,11 @@
 //!    becomes `deleted` only when a later check names the same endpoint, it
 //!    still answers `RepoNotFound`, and 24 h have passed.
 //!
+//! 4. **The account is back:** when the status check finds the repo active,
+//!    or an `identity` event comes with no status check, the DID's sync jobs
+//!    that ended `unavailable` are queued again (actionable-warnings design
+//!    §3.3).
+//!
 //! A transition to `deleted` calls [`AccountLifecycle::account_deleted`], which
 //! runs the §6.11.7 `account_deleted` purge. Failures retry with backoff
 //! (30 s, 2 m, 10 m, 1 h) up to 8 attempts.
@@ -69,6 +74,9 @@ pub const METRIC_OUTCOMES: &str = "identity_refresh_total";
 /// Metric: applied `actors.account_status` changes, labelled by the new
 /// status.
 pub const METRIC_STATUS_CHANGES: &str = "account_status_changes_total";
+/// Metric: sync jobs queued again because their account came back
+/// (actionable-warnings design §3.3).
+pub const METRIC_REQUEUED_ON_RETURN: &str = "backfill_requeued_on_return_total";
 
 /// Retry delay after the `attempt`-th consecutive failure (1-based): 30 s,
 /// 2 m, 10 m, then 1 h.
@@ -389,7 +397,42 @@ impl IdentityRefresher {
             };
             return self.check_repo_status(did, endpoint, prev_source, prev_since, now).await;
         }
+        // An `identity` event with no status check: the account may have
+        // moved to a new PDS, so its unavailable jobs try again and ask it
+        // (actionable-warnings design §3.3).
+        if reasons & RefreshReason::IDENTITY != 0 {
+            self.requeue_returned(did, false).await?;
+        }
         Ok(Outcome::Done)
+    }
+
+    /// Queue again the DID's sync jobs that ended `unavailable`, and, when
+    /// the account just turned active (`running_too`), a run in flight that
+    /// may have read the old status (actionable-warnings design §3.3). A
+    /// `scope` or `resync` row only while the DID is in S; a `member`,
+    /// `private` or `authz` row only while it is a member; never a
+    /// `list_sync` row. Each row moves to a new generation, so a superseded
+    /// run settles nothing.
+    async fn requeue_returned(&self, did: &str, running_too: bool) -> Result<u64, sqlx::Error> {
+        let n = sqlx::query(
+            "UPDATE backfill_jobs SET state = 'queued', attempts = 0, generation = generation + 1, not_before = now(), \
+               last_error = NULL, updated_at = now() \
+             WHERE did = $1 \
+               AND (state = 'unavailable' OR (state = 'running' AND $2)) \
+               AND CASE WHEN depth IN ('scope', 'resync') THEN EXISTS (SELECT 1 FROM scope_dids WHERE did = $1) \
+                        WHEN depth IN ('member', 'private', 'authz') THEN EXISTS (SELECT 1 FROM members WHERE did = $1) \
+                        ELSE false END",
+        )
+        .bind(did)
+        .bind(running_too)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if n > 0 {
+            metrics::counter!(METRIC_REQUEUED_ON_RETURN).increment(n);
+            tracing::info!(event = "backfill_requeued_on_return", did, jobs = n, "the account is back; its sync jobs are queued again");
+        }
+        Ok(n)
     }
 
     async fn check_repo_status(
@@ -420,6 +463,9 @@ impl IdentityRefresher {
             .bind(&account)
             .fetch_optional(&self.pool)
             .await?;
+            // A missing `actors` row counts as a change too
+            // (actionable-warnings design §3.3).
+            let was_active = matches!(&before, Some(Some(b)) if b == "active");
             // Each applied change is logged, so a PDS operator's status
             // events can be matched to what this AppView did with them.
             if let Some(before) = before
@@ -436,6 +482,9 @@ impl IdentityRefresher {
             }
             if account == "deleted" {
                 return self.mark_deleted(did, "pds_status_deleted").await;
+            }
+            if account == "active" {
+                self.requeue_returned(did, !was_active).await?;
             }
             return Ok(Outcome::Done);
         }
@@ -670,6 +719,129 @@ mod tests {
         assert_eq!(*lifecycle.0.lock().expect("recorded"), vec![did.to_string()]);
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM identity_refresh").fetch_one(&db.pool).await.expect("count");
         assert_eq!(left, 0, "the row is done");
+        db.drop_db().await;
+    }
+
+    /// T-AW4 (actionable-warnings design §3.3): an account that comes back
+    /// gets its unavailable jobs queued again; a running one only when the
+    /// status just changed to active; `member` rows only for a member;
+    /// `list_sync` never; nothing for a DID out of S, a handle event, or an
+    /// account still inactive.
+    #[tokio::test]
+    async fn an_account_that_comes_back_requeues_its_unavailable_jobs() {
+        use axum::extract::{Path, State};
+        use axum::routing::get;
+
+        #[derive(Clone, Default)]
+        struct Fake {
+            base: Arc<std::sync::Mutex<String>>,
+            active: Arc<std::sync::atomic::AtomicBool>,
+        }
+        async fn plc(State(f): State<Fake>, Path(did): Path<String>) -> axum::Json<serde_json::Value> {
+            let base = f.base.lock().expect("base").clone();
+            axum::Json(serde_json::json!({
+                "id": did,
+                "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": base}]
+            }))
+        }
+        async fn status(State(f): State<Fake>) -> axum::Json<serde_json::Value> {
+            if f.active.load(std::sync::atomic::Ordering::SeqCst) {
+                axum::Json(serde_json::json!({"did": "x", "active": true}))
+            } else {
+                axum::Json(serde_json::json!({"did": "x", "active": false, "status": "takendown"}))
+            }
+        }
+
+        let Some(db) = crate::test_support::fresh_db("refresher_return").await else {
+            return;
+        };
+        let p = &db.pool;
+        let fake = Fake::default();
+        let router = axum::Router::new()
+            .route("/xrpc/com.atproto.sync.getRepoStatus", get(status))
+            .route("/{did}", get(plc))
+            .with_state(fake.clone());
+        let base = crate::test_support::serve_fake(router).await;
+        *fake.base.lock().expect("base") = base.clone();
+        let settings = crate::identity::IdentitySettings { plc_url: base, fresh: Duration::from_secs(3600), stale_max: Duration::from_secs(86_400) };
+        let resolver = IdentityResolver::new(crate::net::Transports::loopback_for_tests(), p.clone(), settings, Arc::new(NeverPersist), crate::net::Intent::Internal);
+        let refresher = IdentityRefresher::new(p.clone(), resolver, Arc::new(Recorded(std::sync::Mutex::new(Vec::new()))) as Arc<dyn AccountLifecycle>);
+
+        let did = "did:plc:rrrrrrrrrrrrrrrrrrrrrrrr";
+        let member = "did:plc:mmmmmmmmmmmmmmmmmmmmmmmm";
+        let away = "did:plc:oooooooooooooooooooooooo";
+        let exec = |sql: String| async move { sqlx::query(&sql).execute(p).await.expect("sql") };
+        let seed = || async {
+            exec("DELETE FROM backfill_jobs".into()).await;
+            exec(format!(
+                "INSERT INTO backfill_jobs (did, depth, state, attempts, last_error, generation) VALUES \
+                 ('{did}', 'scope', 'unavailable', 1, 'repo inactive (takendown)', 3), \
+                 ('{did}', 'resync', 'running', 0, NULL, 3), \
+                 ('{did}', 'member', 'unavailable', 1, 'repo inactive (takendown)', 3), \
+                 ('{did}', 'list_sync', 'unavailable', 1, 'x', 3), \
+                 ('{member}', 'member', 'unavailable', 1, 'repo inactive (takendown)', 3), \
+                 ('{away}', 'scope', 'unavailable', 1, 'repo inactive (takendown)', 3)"
+            ))
+            .await;
+        };
+        let refresh = |who: &'static str, reasons: i16| {
+            let refresher = refresher.clone();
+            async move {
+                sqlx::query("INSERT INTO identity_refresh (did, reasons) VALUES ($1, $2)").bind(who).bind(reasons).execute(p).await.expect("queue");
+                assert_eq!(refresher.run_batch().await.expect("batch"), 1);
+            }
+        };
+        let state_of = |who: &'static str, depth: &'static str| async move {
+            let row: (String, i32, i64, Option<String>) =
+                sqlx::query_as("SELECT state, attempts, generation, last_error FROM backfill_jobs WHERE did = $1 AND depth = $2")
+                    .bind(who)
+                    .bind(depth)
+                    .fetch_one(p)
+                    .await
+                    .expect("job");
+            row
+        };
+        exec(format!("INSERT INTO scope_dids (did, reasons) VALUES ('{did}', 1), ('{member}', 1)")).await;
+        exec(format!("INSERT INTO members (did, source) VALUES ('{member}', 'admin')")).await;
+        exec(format!("INSERT INTO actors (did, account_status) VALUES ('{did}', 'takendown')")).await;
+
+        // Still taken down: nothing moves.
+        seed().await;
+        refresh(did, RefreshReason::ACCOUNT).await;
+        assert_eq!(state_of(did, "scope").await.0, "unavailable");
+        assert_eq!(state_of(did, "resync").await.0, "running");
+
+        // Back, from taken down: the unavailable scope row and the running
+        // resync are queued at a new generation; the member row of a
+        // non-member and the list_sync row are not.
+        fake.active.store(true, std::sync::atomic::Ordering::SeqCst);
+        refresh(did, RefreshReason::ACCOUNT).await;
+        assert_eq!(state_of(did, "scope").await, ("queued".to_string(), 0, 4, None));
+        assert_eq!(state_of(did, "resync").await, ("queued".to_string(), 0, 4, None));
+        assert_eq!(state_of(did, "member").await.0, "unavailable");
+        assert_eq!(state_of(did, "list_sync").await.0, "unavailable");
+
+        // Already active: the unavailable row is queued, the running one is
+        // left alone.
+        seed().await;
+        refresh(did, RefreshReason::ACCOUNT).await;
+        assert_eq!(state_of(did, "scope").await.0, "queued");
+        assert_eq!(state_of(did, "resync").await.0, "running");
+
+        // An identity event with no status check queues the unavailable
+        // rows only; a handle event nothing.
+        seed().await;
+        refresh(did, RefreshReason::HANDLE).await;
+        assert_eq!(state_of(did, "scope").await.0, "unavailable");
+        refresh(did, RefreshReason::IDENTITY).await;
+        assert_eq!(state_of(did, "scope").await.0, "queued");
+        assert_eq!(state_of(did, "resync").await.0, "running");
+
+        // A member's member row; a DID out of S stays.
+        refresh(member, RefreshReason::ACCOUNT).await;
+        assert_eq!(state_of(member, "member").await.0, "queued");
+        refresh(away, RefreshReason::ACCOUNT).await;
+        assert_eq!(state_of(away, "scope").await.0, "unavailable");
         db.drop_db().await;
     }
 

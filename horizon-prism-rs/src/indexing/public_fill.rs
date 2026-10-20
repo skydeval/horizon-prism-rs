@@ -23,7 +23,7 @@ pub const METRIC_INCOMPLETE: &str = "public_fill_incomplete_jobs";
 pub const METRIC_REPAIR_SECONDS: &str = "public_fill_repair_seconds";
 
 /// The jobs the fill waits on (§8.5): resyncs of members and S DIDs that
-/// are fresh, due, running or in backoff. A failed job, and one the
+/// are fresh, due, running or in backoff. A failed or unavailable job, and one the
 /// 6-hourly loop re-queued (`attempts = 0` with `last_error` set), are not.
 const REMAINING: &str = "SELECT count(*) FROM backfill_jobs j \
      WHERE j.depth = 'resync' AND j.state IN ('queued', 'running') \

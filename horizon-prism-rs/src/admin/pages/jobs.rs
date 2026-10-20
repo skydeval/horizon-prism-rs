@@ -1,6 +1,8 @@
 //! Jobs (`/admin/jobs`, admin-ui design §6.6): back-fill jobs by kind and
-//! state, the 100 newest failed jobs with "try again" (a `backfill` of the
-//! same kind), the nightly clean-up of the accounts Prism follows
+//! state, the accounts that could not be read by reason, the 100 newest
+//! failed jobs Prism would still run with "try again" (a `backfill` of the
+//! same kind) and a count of the others (actionable-warnings design §5.2),
+//! the nightly clean-up of the accounts Prism follows
 //! (scope-recency design §3.3: its last run, the next, "check" as a dry run
 //! and "clean up now", typed), and a public-data refill's progress when one
 //! runs. The counts run under a 2-second statement timeout.
@@ -26,7 +28,34 @@ use crate::firehose::jobs::Depth;
 use crate::indexing::PublicMode;
 
 /// The states of a job, in the order the table shows them.
-pub const STATES: [(&str, &str); 5] = [("queued", "Waiting"), ("running", "Running"), ("done", "Done"), ("failed", "Failed"), ("cancelled", "Cancelled")];
+pub const STATES: [(&str, &str); 6] = [
+    ("queued", "Waiting"),
+    ("running", "Running"),
+    ("done", "Done"),
+    ("failed", "Failed"),
+    ("unavailable", "Unavailable"),
+    ("cancelled", "Cancelled"),
+];
+
+/// Why an account could not be read, in words, from an `unavailable` job's
+/// `last_error` (actionable-warnings design §5.2). Matched by prefix: a
+/// tombstone's error names its DID.
+#[must_use]
+pub fn unavailable_words(error: &str) -> String {
+    match error {
+        "repo not found at its PDS" => "Not found on its server".to_string(),
+        "repo inactive (takendown)" => "Taken down by its server".to_string(),
+        "repo inactive (suspended)" => "Suspended by its server".to_string(),
+        "repo inactive (deactivated)" => "Switched off by its owner".to_string(),
+        "repo inactive (deleted)" => "Deleted".to_string(),
+        "DID document names no #atproto_pds" => "Has no server".to_string(),
+        e if e.starts_with("resolve: DID tombstoned") => "Deleted from the directory".to_string(),
+        e => match e.strip_prefix("repo inactive (").and_then(|s| s.strip_suffix(')')) {
+            Some(status) => format!("Not active ({status})"),
+            None => "Other".to_string(),
+        },
+    }
+}
 
 /// A kind of job in words.
 #[must_use]
@@ -79,6 +108,11 @@ struct JobsPage {
     /// `None`: the counts did not finish in time.
     depths: Option<Vec<DepthRow>>,
     failed: Option<Vec<FailedRow>>,
+    /// Failed jobs of accounts Prism would not run again, in words; empty
+    /// for none.
+    failed_elsewhere: String,
+    /// Unavailable jobs by reason, in words, with their counts.
+    unavailable: Vec<(String, String)>,
     states: Vec<&'static str>,
     sweep: SweepView,
     public: String,
@@ -86,19 +120,53 @@ struct JobsPage {
 
 type FailedTuple = (String, Option<String>, String, i32, Option<String>, DateTime<Utc>);
 
-/// The two job reads, under the statement timeout.
-async fn read_jobs(state: &AdminState) -> Result<(Vec<(String, String, i64)>, Vec<FailedTuple>), sqlx::Error> {
+/// Whether a failed job `j` is one Prism would still run (actionable-warnings
+/// design §5.1), as Health counts it.
+const STILL_NEEDED: &str = "(CASE WHEN j.depth = 'list_sync' \
+     THEN EXISTS (SELECT 1 FROM subscribed_lists l WHERE l.owner_did = j.did AND l.state = 'active') \
+     ELSE EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = j.did) END)";
+
+/// What the page reads, under the statement timeout.
+struct JobReads {
+    counts: Vec<(String, String, i64)>,
+    failed: Vec<FailedTuple>,
+    /// Failed jobs Prism would not run again.
+    failed_elsewhere: i64,
+    /// `unavailable` jobs by `last_error`.
+    unavailable: Vec<(Option<String>, i64)>,
+}
+
+/// The job reads, under the statement timeout.
+async fn read_jobs(state: &AdminState) -> Result<JobReads, sqlx::Error> {
     let mut tx = state.pool.begin().await?;
     sqlx::query("SET LOCAL statement_timeout = '2s'").execute(&mut *tx).await?;
     let counts: Vec<(String, String, i64)> = sqlx::query_as("SELECT depth, state, count(*) FROM backfill_jobs GROUP BY 1, 2").fetch_all(&mut *tx).await?;
-    let failed: Vec<FailedTuple> = sqlx::query_as(
+    let failed: Vec<FailedTuple> = sqlx::query_as(&format!(
         "SELECT j.did, a.handle, j.depth, j.attempts, j.last_error, j.updated_at FROM backfill_jobs j \
-         LEFT JOIN actors a ON a.did = j.did WHERE j.state = 'failed' ORDER BY j.updated_at DESC LIMIT 100",
-    )
+         LEFT JOIN actors a ON a.did = j.did WHERE j.state = 'failed' AND {STILL_NEEDED} ORDER BY j.updated_at DESC LIMIT 100"
+    ))
     .fetch_all(&mut *tx)
     .await?;
+    let failed_elsewhere: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM backfill_jobs j WHERE j.state = 'failed' AND NOT {STILL_NEEDED}"))
+        .fetch_one(&mut *tx)
+        .await?;
+    let unavailable: Vec<(Option<String>, i64)> =
+        sqlx::query_as("SELECT last_error, count(*) FROM backfill_jobs WHERE state = 'unavailable' GROUP BY 1").fetch_all(&mut *tx).await?;
     tx.commit().await?;
-    Ok((counts, failed))
+    Ok(JobReads { counts, failed, failed_elsewhere, unavailable })
+}
+
+/// The unavailable jobs by reason in words, most first, rows with the same
+/// words summed.
+#[must_use]
+pub fn unavailable_reasons(rows: &[(Option<String>, i64)]) -> Vec<(String, i64)> {
+    let mut by: BTreeMap<String, i64> = BTreeMap::new();
+    for (error, n) in rows {
+        *by.entry(unavailable_words(error.as_deref().unwrap_or_default())).or_default() += n;
+    }
+    let mut out: Vec<(String, i64)> = by.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 async fn worker_time(state: &AdminState, key: &str) -> Option<DateTime<Utc>> {
@@ -149,8 +217,18 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         Ok(op) => op,
         Err(response) => return response,
     };
+    let mut failed_elsewhere = String::new();
+    let mut unavailable = Vec::new();
     let (depths, failed) = match read_jobs(&state).await {
-        Ok((counts, failed)) => {
+        Ok(JobReads { counts, failed, failed_elsewhere: elsewhere, unavailable: by_error }) => {
+            if elsewhere > 0 {
+                failed_elsewhere = format!(
+                    "{} more failed job{} for accounts Prism no longer follows. They need nothing and are deleted after 30 days.",
+                    count(elsewhere as f64),
+                    if elsewhere == 1 { " is" } else { "s are" }
+                );
+            }
+            unavailable = unavailable_reasons(&by_error).into_iter().map(|(words, n)| (words, count(n as f64))).collect();
             let mut by_depth: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
             for (depth, job_state, n) in counts {
                 by_depth.entry(depth).or_default().insert(job_state, n);
@@ -203,6 +281,8 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             csrf: op.csrf.clone(),
             depths,
             failed,
+            failed_elsewhere,
+            unavailable,
             states: STATES.iter().map(|(_, w)| *w).collect(),
             sweep: sweep_view(&state).await,
             public,
@@ -296,5 +376,28 @@ mod tests {
         assert_eq!(next_sweep(t("2026-10-19T03:01:00Z"), t("2026-10-20T04:00:00Z"), slot), None, "due now");
         assert_eq!(depth_words("authz"), "Private access checks");
         assert_eq!(depth_words("other"), "other");
+    }
+
+    /// T-AW8 (actionable-warnings design §5.2): reasons in words, grouped.
+    #[test]
+    fn unavailable_reasons_in_words() {
+        assert_eq!(unavailable_words("repo inactive (throttled)"), "Not active (throttled)");
+        assert_eq!(unavailable_words("something else"), "Other");
+        let rows = [
+            (Some("repo not found at its PDS".to_string()), 86),
+            (Some("repo inactive (takendown)".to_string()), 81),
+            (Some("repo inactive (deactivated)".to_string()), 65),
+            (Some("resolve: DID tombstoned: did:plc:a".to_string()), 1),
+            (Some("resolve: DID tombstoned: did:plc:b".to_string()), 1),
+        ];
+        assert_eq!(
+            unavailable_reasons(&rows),
+            [
+                ("Not found on its server".to_string(), 86),
+                ("Taken down by its server".to_string(), 81),
+                ("Switched off by its owner".to_string(), 65),
+                ("Deleted from the directory".to_string(), 2),
+            ]
+        );
     }
 }

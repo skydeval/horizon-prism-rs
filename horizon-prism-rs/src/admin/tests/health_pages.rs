@@ -93,18 +93,43 @@ async fn health_jobs_and_home() {
     let auto = get(&alice, &url("/admin/health?auto=1")).await;
     assert_eq!(auto.status, 200);
 
-    // Jobs: a failed scope job can be tried again; a list sync cannot.
-    for (did, depth) in [(BOB, "scope"), (CAROL, "list_sync")] {
-        sqlx::query("INSERT INTO backfill_jobs (did, depth, state, attempts, last_error) VALUES ($1, $2, 'failed', 3, 'repo not found')")
+    // Jobs: a failed scope job of an account Prism follows can be tried
+    // again; a list sync cannot. A failed job of an account Prism no longer
+    // follows is counted, not listed, and not on Health; unavailable jobs are
+    // a column and a reasons table (actionable-warnings design §5).
+    sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 4), ('did:plc:un1', 4)").bind(BOB).execute(p).await.expect("scope");
+    for (did, depth, state, error) in [
+        (BOB, "scope", "failed", "getRepoStatus: HTTP 502"),
+        (CAROL, "list_sync", "failed", "repo not found"),
+        ("did:plc:gone", "scope", "failed", "getRecord: HTTP 500"),
+        ("did:plc:un1", "scope", "unavailable", "repo inactive (takendown)"),
+        ("did:plc:un2", "scope", "unavailable", "resolve: DID tombstoned: did:plc:un2"),
+        ("did:plc:un3", "resync", "unavailable", "resolve: DID tombstoned: did:plc:un3"),
+    ] {
+        sqlx::query("INSERT INTO backfill_jobs (did, depth, state, attempts, last_error) VALUES ($1, $2, $3, 3, $4)")
             .bind(did)
             .bind(depth)
+            .bind(state)
+            .bind(error)
             .execute(p)
             .await
             .expect("job");
     }
     let jobs = get(&alice, &url("/admin/jobs")).await;
     assert_eq!(jobs.status, 200, "{}", jobs.body);
-    assert!(jobs.body.contains("Accounts around members") && jobs.body.contains("Subscribed lists") && jobs.body.contains("repo not found"), "{}", jobs.body);
+    for text in [
+        "Accounts around members",
+        "Subscribed lists",
+        "getRepoStatus: HTTP 502",
+        "<th>Unavailable</th>",
+        "Accounts Prism could not read",
+        "<td>Deleted from the directory</td><td>2</td>",
+        "<td>Taken down by its server</td><td>1</td>",
+        "2 more failed jobs are for accounts Prism no longer follows.",
+    ] {
+        assert!(jobs.body.contains(text), "{text}: {}", jobs.body);
+    }
+    assert!(!jobs.body.contains("getRecord: HTTP 500"), "a job Prism would not run again is not listed: {}", jobs.body);
     assert_eq!(jobs.body.matches("action=\"/admin/jobs/retry\"").count(), 1, "only the scope job: {}", jobs.body);
     assert!(jobs.body.contains("Clean-up of the accounts Prism follows"), "{}", jobs.body);
     let csrf = csrf_of(&jobs);
@@ -141,7 +166,14 @@ async fn health_jobs_and_home() {
     // Home: what needs attention, worst first, and the tiles; the fragment
     // carries both.
     let home = get(&alice, &url("/admin")).await;
-    assert!(home.body.contains("Needs attention") && home.body.contains("records behind the network") && home.body.contains("2 sync jobs failed."), "{}", home.body);
+    assert!(
+        home.body.contains("Needs attention") && home.body.contains("records behind the network") && home.body.contains("1 sync job failed after trying again several times."),
+        "{}",
+        home.body
+    );
+    // Health counts the same one.
+    let health = get(&alice, &url("/admin/health")).await;
+    assert!(health.body.contains("1 sync job failed after trying again several times."), "{}", health.body);
     assert!(home.body.contains("Network stream") && home.body.contains("up to date") && home.body.contains("Last changes") && home.body.contains("Re-sync private data and members"), "the last changes name the re-sync: {}", home.body);
     let tiles = get(&alice, &url("/admin/tiles")).await;
     assert!(tiles.body.contains("id=\"attention\"") && tiles.body.contains("id=\"tiles\"") && tiles.body.contains("Needs attention"), "{}", tiles.body);

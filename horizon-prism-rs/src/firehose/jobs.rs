@@ -89,7 +89,8 @@ pub async fn enqueue_at(
 /// Enqueue one job due at `not_before`, leaving a `queued` or `running` one
 /// alone (following-audience design §3.5, §4.4): a burst of follow-ups does
 /// not keep resetting it, and a running run is not superseded. A `done`,
-/// `failed` or `cancelled` row is queued again at a new generation.
+/// `failed`, `unavailable` or `cancelled` row is queued again at a new
+/// generation.
 ///
 /// # Errors
 ///

@@ -31,9 +31,14 @@
 //! on it, and every reset of the row by anyone else moves it on, so a run
 //! whose row was reset meanwhile settles as superseded and writes nothing.
 //!
-//! Failures back off 1 m, 10 m, 1 h, and the job is `failed` after 5
-//! attempts. A retry scheduler re-queues failed jobs of tracked DIDs every
-//! `retry_every_hours`; every tracked DID gets a daily `authz` job.
+//! A run whose account is not there (not found, inactive, no PDS, a
+//! tombstoned DID) ends `unavailable` at once (actionable-warnings design
+//! §3). Other failures of `member`, `private` and `authz` jobs back off
+//! 1 m, 10 m, 1 h, and the job is `failed` after 5 attempts; those of
+//! `scope` and `resync` jobs back off for about 41 hours over 7 attempts
+//! (§4). A retry scheduler re-queues failed and unavailable jobs of tracked
+//! DIDs every `retry_every_hours`; every tracked DID gets a daily `authz`
+//! job.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
@@ -67,7 +72,7 @@ use crate::farsight::Farsight;
 use crate::indexing::PublicMode;
 use crate::identity::refresher::{RefreshReason, RepoStatus, account_status, is_repo_not_found};
 use crate::identity::resolver::extract_info;
-use crate::identity::{IdentityResolver, ResolveIntent};
+use crate::identity::{IdentityError, IdentityResolver, ResolveIntent};
 use crate::microcosm::{ConstellationClient, LinksPage};
 use crate::net::{BodyCap, Intent, NetClient, RequestOptions};
 use crate::subscriptions::runner::ListSync;
@@ -168,6 +173,59 @@ pub fn backoff(attempt: i32) -> TimeDelta {
         ..=1 => TimeDelta::minutes(1),
         2 => TimeDelta::minutes(10),
         _ => TimeDelta::hours(1),
+    }
+}
+
+/// Attempts before a `scope` or `resync` job is `failed`
+/// (actionable-warnings design §4).
+pub const LONG_MAX_ATTEMPTS: i32 = 7;
+
+/// Retry delay of a `scope` or `resync` job after its `attempt`-th
+/// consecutive failure (actionable-warnings design §4): 1 m, 10 m, 1 h,
+/// 4 h, 12 h, 24 h, so a job is `failed` about 41 hours after its first
+/// failure. Members' own jobs keep [`backoff`]: the head prober treats a
+/// backing-off `authz` row as in flight.
+#[must_use]
+pub fn long_backoff(attempt: i32) -> TimeDelta {
+    match attempt {
+        ..=1 => TimeDelta::minutes(1),
+        2 => TimeDelta::minutes(10),
+        3 => TimeDelta::hours(1),
+        4 => TimeDelta::hours(4),
+        5 => TimeDelta::hours(12),
+        _ => TimeDelta::hours(24),
+    }
+}
+
+/// The failure schedule of a depth: its attempts and its delays.
+fn schedule(depth: Depth) -> (i32, fn(i32) -> TimeDelta) {
+    match depth {
+        Depth::Scope | Depth::Resync => (LONG_MAX_ATTEMPTS, long_backoff),
+        Depth::Member | Depth::Private | Depth::Authz => (MAX_ATTEMPTS, backoff),
+    }
+}
+
+/// Why a run did not finish (actionable-warnings design §3.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// The account is not there to read: `prepare` said so definitively.
+    Unavailable(String),
+    /// Anything else.
+    Failed(String),
+}
+
+impl From<String> for RunError {
+    fn from(e: String) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl From<PrepareError> for RunError {
+    fn from(e: PrepareError) -> Self {
+        match e {
+            PrepareError::Negative(reason) => Self::Unavailable(reason),
+            PrepareError::Failed(error) => Self::Failed(error),
+        }
     }
 }
 
@@ -428,8 +486,8 @@ pub fn detect_order(records: &[ListedRecord]) -> Option<ListOrder> {
 /// Why `prepare` produced no PDS (§6.11.1 eligibility classes).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PrepareError {
-    /// A definitive answer: no PDS in the DID document, repo not found, or
-    /// repo inactive.
+    /// A definitive answer: no PDS in the DID document, repo not found,
+    /// repo inactive, or a tombstoned DID. The job ends `unavailable`.
     #[error("{0}")]
     Negative(String),
     /// No answer: resolution or transport failure, 5xx, or another status.
@@ -578,7 +636,12 @@ impl BackfillSource for NetSource {
             .resolver
             .refresh_now(did, ResolveIntent::AdmittedAuthor)
             .await
-            .map_err(|e| PrepareError::Failed(format!("resolve: {e}")))?;
+            .map_err(|e| match e {
+                // A tombstoned DID is gone for good (actionable-warnings
+                // design §3.1).
+                IdentityError::Tombstoned(_) => PrepareError::Negative(format!("resolve: {e}")),
+                _ => PrepareError::Failed(format!("resolve: {e}")),
+            })?;
         let info = extract_info(&fetched.doc, did);
         let pds = info
             .pds_endpoint
@@ -808,6 +871,8 @@ pub enum JobOutcome {
     /// Reset or cancelled by someone else while running.
     Superseded,
     Failed(String),
+    /// The account is not there to read (actionable-warnings design §3).
+    Unavailable(String),
 }
 
 enum Step {
@@ -1038,9 +1103,16 @@ impl Backfill {
         let outcome = match self.run(&job).await {
             Ok(Some(result)) => self.settle(&job, &result).await?,
             Ok(None) => JobOutcome::Superseded,
-            Err(error) => {
+            Err(RunError::Failed(error)) => {
                 if self.fail(&job, &error).await? {
                     JobOutcome::Failed(error)
+                } else {
+                    JobOutcome::Superseded
+                }
+            }
+            Err(RunError::Unavailable(reason)) => {
+                if self.unavailable(&job, &reason).await? {
+                    JobOutcome::Unavailable(reason)
                 } else {
                     JobOutcome::Superseded
                 }
@@ -1097,7 +1169,7 @@ impl Backfill {
     }
 
     /// Steps 1–5. `Ok(None)` when superseded part-way.
-    async fn run(&self, job: &Job) -> Result<Option<RunResult>, String> {
+    async fn run(&self, job: &Job) -> Result<Option<RunResult>, RunError> {
         let (is_member, mode, tracked) = {
             let sets = self.writer.scope().read_guard().await;
             (sets.is_member(&job.did), sets.public.mode, sets.is_tracked(&job.did))
@@ -1121,7 +1193,9 @@ impl Backfill {
                 }
             });
         }
-        let pds = self.source.prepare(&job.did).await.map_err(|e| e.to_string())?;
+        // A definitive "not there" ends the job `unavailable`; every other
+        // error of the run is a failure (actionable-warnings design §3.1).
+        let pds = self.source.prepare(&job.did).await?;
         // A run that may verify follows reads the counter before its first
         // listing, creating the row if need be, in one statement
         // (following-audience design §3.2): a clear from now on replaces it.
@@ -1753,8 +1827,9 @@ impl Backfill {
     /// was still the run's: a superseded run's failure touches nothing.
     async fn fail(&self, job: &Job, error: &str) -> Result<bool, sqlx::Error> {
         let attempt = job.attempts + 1;
-        let state = if attempt >= MAX_ATTEMPTS { "failed" } else { "queued" };
-        let delay = backoff(attempt).num_seconds();
+        let (max_attempts, delay_of) = schedule(job.depth);
+        let state = if attempt >= max_attempts { "failed" } else { "queued" };
+        let delay = delay_of(attempt).num_seconds();
         let error: String = error.chars().take(512).collect();
         let n = sqlx::query(
             "UPDATE backfill_jobs SET attempts = $3, state = $4, last_error = $5, updated_at = now(), \
@@ -1779,29 +1854,65 @@ impl Backfill {
         Ok(true)
     }
 
-    /// Every `retry_every_hours`: re-queue failed `member`, `private`, `authz`
-    /// and `resync` jobs of DIDs still tracked, resetting attempts, at a new
-    /// generation. Failed `list_sync` jobs are re-queued on the same period
-    /// by the list sync's own loop (`ListSync::sweep_loop`), paced by owner.
+    /// Record a run whose account is not there to read (actionable-warnings
+    /// design §3.2): the row is `unavailable` with the reason, after one
+    /// try, and nothing claims it until it is queued again. Returns whether
+    /// the row was still the run's: a superseded run touches nothing.
+    async fn unavailable(&self, job: &Job, reason: &str) -> Result<bool, sqlx::Error> {
+        let reason: String = reason.chars().take(512).collect();
+        let n = sqlx::query(
+            "UPDATE backfill_jobs SET state = 'unavailable', attempts = attempts + 1, last_error = $3, updated_at = now() \
+             WHERE did = $1 AND depth = $2 AND state = 'running' AND generation = $4",
+        )
+        .bind(&job.did)
+        .bind(job.depth.as_str())
+        .bind(&reason)
+        .bind(job.generation)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            tracing::info!(event = "backfill_job_unavailable_superseded", did = %job.did, depth = job.depth.as_str(), %reason, "a superseded backfill run found the account unavailable; its row is left alone");
+            return Ok(false);
+        }
+        tracing::info!(event = "backfill_job_unavailable", did = %job.did, depth = job.depth.as_str(), %reason, "the account is not there to read");
+        Ok(true)
+    }
+
+    /// Every `retry_every_hours`: re-queue failed and unavailable `member`,
+    /// `private`, `authz` and `resync` jobs of DIDs still tracked, resetting
+    /// attempts, at a new generation. The unavailable ones are the safety
+    /// net for a missed return event (actionable-warnings design §3.4).
+    /// Failed `list_sync` jobs are re-queued on the same period by the list
+    /// sync's own loop (`ListSync::sweep_loop`), paced by owner.
     async fn retry_loop(self) {
         let every = Duration::from_secs(u64::from(self.settings.retry_every_hours.max(1)) * 3600);
         let mut tick = tokio::time::interval(every);
         tick.tick().await;
         loop {
             tick.tick().await;
-            let tracked = self.writer.scope().read_guard().await.tracked();
-            let result = sqlx::query(
-                "UPDATE backfill_jobs SET state = 'queued', attempts = 0, generation = generation + 1, not_before = now(), updated_at = now() \
-                 WHERE state = 'failed' AND depth IN ('member', 'private', 'authz', 'resync') AND did = ANY($1)",
-            )
-            .bind(&tracked)
-            .execute(&self.pool)
-            .await;
-            match result {
-                Ok(r) => tracing::info!(event = "backfill_retry_scheduled", jobs = r.rows_affected(), "failed jobs re-queued"),
+            match self.retry_tracked().await {
+                Ok(n) => tracing::info!(event = "backfill_retry_scheduled", jobs = n, "failed and unavailable jobs re-queued"),
                 Err(error) => tracing::warn!(event = "backfill_retry_failed", %error, "re-queueing failed jobs failed"),
             }
         }
+    }
+
+    /// One pass of [`Self::retry_loop`]. Returns the rows re-queued.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn retry_tracked(&self) -> Result<u64, sqlx::Error> {
+        let tracked = self.writer.scope().read_guard().await.tracked();
+        Ok(sqlx::query(
+            "UPDATE backfill_jobs SET state = 'queued', attempts = 0, generation = generation + 1, not_before = now(), updated_at = now() \
+             WHERE state IN ('failed', 'unavailable') AND depth IN ('member', 'private', 'authz', 'resync') AND did = ANY($1)",
+        )
+        .bind(&tracked)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
     /// Daily `authz` for every tracked DID, spread over the day by DID hash
@@ -1853,7 +1964,7 @@ impl Backfill {
                 .fetch_all(&self.pool)
                 .await?;
         for depth in ["member", "scope", "private", "authz", "resync", crate::subscriptions::jobs::DEPTH] {
-            for state in ["queued", "running", "done", "failed", "cancelled"] {
+            for state in ["queued", "running", "done", "failed", "unavailable", "cancelled"] {
                 let n = rows
                     .iter()
                     .find(|(d, s, _)| d == depth && s == state)
@@ -2725,50 +2836,219 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// A PDS whose `prepare` always answers `answer`.
+    struct Answers(PrepareError);
+
+    #[async_trait]
+    impl BackfillSource for Answers {
+        async fn prepare(&self, _did: &str) -> Result<String, PrepareError> {
+            Err(self.0.clone())
+        }
+        async fn latest_rev(&self, _: &str, _: &str) -> Result<String, String> {
+            unreachable!()
+        }
+        async fn list_records(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<ListPage, String> {
+            unreachable!()
+        }
+        async fn get_record(&self, _: &str, _: &str, _: &str, _: &str) -> Result<Option<ListedRecord>, String> {
+            unreachable!()
+        }
+        async fn inbound_blocks(&self, _: &str, _: Option<&str>) -> Result<LinksPage, String> {
+            unreachable!()
+        }
+    }
+
+    /// `(state, attempts, seconds until not_before, last_error)` of the one job.
+    async fn the_job(pool: &PgPool) -> (String, i32, f64, Option<String>) {
+        sqlx::query_as("SELECT state, attempts, EXTRACT(EPOCH FROM not_before - now())::float8, last_error FROM backfill_jobs")
+            .fetch_one(pool)
+            .await
+            .expect("job")
+    }
+
+    /// T-AW2 (actionable-warnings design §4): a `scope` job backs off 1 m,
+    /// 10 m, 1 h, 4 h, 12 h, 24 h and is `failed` at the seventh failure;
+    /// a `member` job keeps 1 m, 10 m, 1 h, 1 h and is `failed` at the
+    /// fifth.
     #[tokio::test]
     async fn failures_back_off_then_fail() {
-        struct Down;
-        #[async_trait]
-        impl BackfillSource for Down {
-            async fn prepare(&self, _did: &str) -> Result<String, PrepareError> {
-                Err(PrepareError::Failed("pds down".to_string()))
-            }
-            async fn latest_rev(&self, _: &str, _: &str) -> Result<String, String> {
-                unreachable!()
-            }
-            async fn list_records(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<ListPage, String> {
-                unreachable!()
-            }
-            async fn get_record(&self, _: &str, _: &str, _: &str, _: &str) -> Result<Option<ListedRecord>, String> {
-                unreachable!()
-            }
-            async fn inbound_blocks(&self, _: &str, _: Option<&str>) -> Result<LinksPage, String> {
-                unreachable!()
-            }
-        }
         let Some(db) = fresh_db("backfill_failures").await else {
             return;
         };
         let writer = Writer::new(db.pool.clone(), state(false), Arc::new(DisabledPrivateTier));
-        let backfill = Backfill::new(writer, Arc::new(Down), BackfillConfig::default(), 5);
+        let backfill = Backfill::new(writer, Arc::new(Answers(PrepareError::Failed("pds down".to_string()))), BackfillConfig::default(), 5);
+        let long = [60.0, 600.0, 3600.0, 4.0 * 3600.0, 12.0 * 3600.0, 24.0 * 3600.0];
+        let short = [60.0, 600.0, 3600.0, 3600.0];
+        for (depth, max, waits) in [(Depth::Scope, LONG_MAX_ATTEMPTS, &long[..]), (Depth::Member, MAX_ATTEMPTS, &short[..])] {
+            sqlx::query("DELETE FROM backfill_jobs").execute(&db.pool).await.expect("clear");
+            let mut conn = db.pool.acquire().await.expect("conn");
+            jobs::enqueue(&mut conn, DID, depth).await.expect("enqueue");
+            drop(conn);
+            for attempt in 1..=max {
+                // Make the job due again.
+                sqlx::query("UPDATE backfill_jobs SET not_before = now()").execute(&db.pool).await.expect("due");
+                let (_, outcome) = backfill.run_once().await.expect("run").expect("job");
+                assert!(matches!(outcome, JobOutcome::Failed(_)), "{depth:?} {outcome:?}");
+                let (state, attempts, wait, error) = the_job(&db.pool).await;
+                assert_eq!(attempts, attempt);
+                assert_eq!(error.as_deref(), Some("pds down"));
+                if attempt == max {
+                    assert_eq!(state, "failed", "{depth:?}");
+                } else {
+                    assert_eq!(state, "queued", "{depth:?} attempt {attempt}");
+                    let expected = waits[usize::try_from(attempt - 1).expect("index")];
+                    assert!((expected - 5.0..=expected).contains(&wait), "{depth:?} attempt {attempt}: {wait} s, expected {expected} s");
+                }
+            }
+        }
+        db.drop_db().await;
+    }
+
+    /// T-AW1 (actionable-warnings design §3): a definitive "not there" ends
+    /// the job `unavailable` after one try with its reason; a superseded
+    /// run's unavailable settle touches nothing.
+    #[tokio::test]
+    async fn an_account_that_is_not_there_ends_unavailable() {
+        let Some(db) = fresh_db("backfill_unavailable").await else {
+            return;
+        };
+        for reason in ["repo not found at its PDS", "repo inactive (takendown)", "DID document names no #atproto_pds"] {
+            sqlx::query("DELETE FROM backfill_jobs").execute(&db.pool).await.expect("clear");
+            let writer = Writer::new(db.pool.clone(), state(false), Arc::new(DisabledPrivateTier));
+            let backfill = Backfill::new(writer, Arc::new(Answers(PrepareError::Negative(reason.to_string()))), BackfillConfig::default(), 5);
+            let mut conn = db.pool.acquire().await.expect("conn");
+            jobs::enqueue(&mut conn, DID, Depth::Scope).await.expect("enqueue");
+            drop(conn);
+            let (_, outcome) = backfill.run_once().await.expect("run").expect("job");
+            assert_eq!(outcome, JobOutcome::Unavailable(reason.to_string()));
+            let (state, attempts, _, error) = the_job(&db.pool).await;
+            assert_eq!((state.as_str(), attempts, error.as_deref()), ("unavailable", 1, Some(reason)));
+            // Nothing claims it.
+            assert!(backfill.run_once().await.expect("claim").is_none());
+        }
+        // A superseded run: its row was reset meanwhile.
+        sqlx::query("DELETE FROM backfill_jobs").execute(&db.pool).await.expect("clear");
+        let writer = Writer::new(db.pool.clone(), state(false), Arc::new(DisabledPrivateTier));
+        let backfill = Backfill::new(writer, Arc::new(Answers(PrepareError::Negative("repo not found at its PDS".into()))), BackfillConfig::default(), 5);
         let mut conn = db.pool.acquire().await.expect("conn");
         jobs::enqueue(&mut conn, DID, Depth::Scope).await.expect("enqueue");
-        for attempt in 1..=MAX_ATTEMPTS {
-            // Make the job due again.
-            sqlx::query("UPDATE backfill_jobs SET not_before = now()")
-                .execute(&mut *conn)
-                .await
-                .expect("due");
-            let (_, outcome) = backfill.run_once().await.expect("run").expect("job");
-            assert!(matches!(outcome, JobOutcome::Failed(_)));
-            let (state, attempts): (String, i32) = sqlx::query_as("SELECT state, attempts FROM backfill_jobs")
-                .fetch_one(&mut *conn)
-                .await
-                .expect("job");
-            assert_eq!(attempts, attempt);
-            assert_eq!(state, if attempt == MAX_ATTEMPTS { "failed" } else { "queued" });
-        }
         drop(conn);
+        let job = backfill.claim(ClaimOrder::Plain).await.expect("claim").expect("job");
+        let mut conn = db.pool.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Scope).await.expect("reset");
+        drop(conn);
+        assert!(!backfill.unavailable(&job, "repo not found at its PDS").await.expect("settle"));
+        let (state, attempts, _, error) = the_job(&db.pool).await;
+        assert_eq!((state.as_str(), attempts, error), ("queued", 0, None));
+        db.drop_db().await;
+    }
+
+    /// T-AW1/T-AW3: the error mapping, a tombstone included.
+    #[test]
+    fn run_errors_from_prepare() {
+        assert_eq!(RunError::from(PrepareError::Negative("repo inactive (deactivated)".into())), RunError::Unavailable("repo inactive (deactivated)".into()));
+        assert_eq!(RunError::from(PrepareError::Failed("getRepoStatus: HTTP 502".into())), RunError::Failed("getRepoStatus: HTTP 502".into()));
+        assert_eq!(RunError::from("listRecords: HTTP 500".to_string()), RunError::Failed("listRecords: HTTP 500".into()));
+        assert_eq!(long_backoff(4), TimeDelta::hours(4));
+        assert_eq!(long_backoff(9), TimeDelta::hours(24));
+        assert_eq!(schedule(Depth::Resync).0, LONG_MAX_ATTEMPTS);
+        assert_eq!(schedule(Depth::Authz).0, MAX_ATTEMPTS);
+    }
+
+    /// T-AW6 (actionable-warnings design §8): migration 0036 over the failed
+    /// rows prism had. Migrations run on the empty database first, so the
+    /// test seeds rows and runs the file again, as a deploy would over them.
+    #[tokio::test]
+    async fn migration_0036_reclassifies_failed_jobs() {
+        let Some(db) = fresh_db("backfill_migration_0036").await else {
+            return;
+        };
+        let p = &db.pool;
+        sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ('did:plc:s1', 4), ('did:plc:s2', 4), ('did:plc:m', 1)").execute(p).await.expect("scope");
+        sqlx::query(
+            "INSERT INTO backfill_jobs (did, depth, state, attempts, last_error, updated_at, generation) VALUES \
+             ('did:plc:a', 'scope', 'failed', 5, 'repo not found at its PDS', '2026-10-19T07:30:00Z', 2), \
+             ('did:plc:b', 'scope', 'failed', 5, 'repo inactive (takendown)', '2026-10-19T07:30:00Z', 2), \
+             ('did:plc:c', 'scope', 'failed', 5, 'repo inactive (deactivated)', '2026-10-19T07:30:00Z', 2), \
+             ('did:plc:d', 'resync', 'failed', 5, 'repo not found at its PDS', '2026-10-04T00:00:00Z', 2), \
+             ('did:plc:e', 'scope', 'failed', 5, 'DID document names no #atproto_pds', '2026-10-19T07:30:00Z', 2), \
+             ('did:plc:f', 'scope', 'failed', 5, 'resolve: DID tombstoned: did:plc:f', '2026-10-19T07:30:00Z', 2), \
+             ('did:plc:s1', 'scope', 'failed', 5, 'getRepoStatus: HTTP 502', '2026-10-19T07:30:00Z', 2), \
+             ('did:plc:s2', 'resync', 'failed', 5, 'resolve: malformed DID document for did:web:x', '2026-10-19T07:30:00Z', 2), \
+             ('did:plc:g', 'scope', 'failed', 5, 'getRecord: HTTP 500', '2026-10-19T07:30:00Z', 2), \
+             ('did:plc:m', 'member', 'failed', 5, 'getRecord: HTTP 404 NotFound', '2026-09-28T00:00:00Z', 2), \
+             ('did:plc:o', 'list_sync', 'failed', 5, 'repo not found at its PDS', '2026-10-19T07:30:00Z', 2)",
+        )
+        .execute(p)
+        .await
+        .expect("seed");
+        sqlx::raw_sql(include_str!("../../migrations/0036_unavailable_jobs.sql")).execute(p).await.expect("0036");
+        type Row = (String, String, String, i32, i64, bool);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT did, depth, state, attempts, generation, updated_at < '2026-10-20T00:00:00Z' FROM backfill_jobs ORDER BY did, depth",
+        )
+        .fetch_all(p)
+        .await
+        .expect("rows");
+        let row = |did: &str, depth: &str, state: &str, attempts: i32, generation: i64, old: bool| -> Row {
+            (format!("did:plc:{did}"), depth.into(), state.into(), attempts, generation, old)
+        };
+        assert_eq!(
+            rows,
+            [
+                row("a", "scope", "unavailable", 5, 2, true),
+                row("b", "scope", "unavailable", 5, 2, true),
+                row("c", "scope", "unavailable", 5, 2, true),
+                row("d", "resync", "unavailable", 5, 2, true),
+                row("e", "scope", "unavailable", 5, 2, true),
+                row("f", "scope", "unavailable", 5, 2, true),
+                // Out of S: stays failed.
+                row("g", "scope", "failed", 5, 2, true),
+                // A member's job keeps its schedule.
+                row("m", "member", "failed", 5, 2, true),
+                // list_sync is not touched.
+                row("o", "list_sync", "failed", 5, 2, true),
+                // In S, transient: queued again.
+                row("s1", "scope", "queued", 0, 3, false),
+                row("s2", "resync", "queued", 0, 3, false),
+            ]
+        );
+        db.drop_db().await;
+    }
+
+    /// T-AW5 (actionable-warnings design §3.4): the retry loop re-queues a
+    /// tracked DID's unavailable and failed rows of its depths, and leaves an
+    /// untracked DID's and a tracked DID's `scope` row alone.
+    #[tokio::test]
+    async fn the_retry_loop_takes_unavailable_rows_of_tracked_dids() {
+        let Some(db) = fresh_db("backfill_retry_unavailable").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO backfill_jobs (did, depth, state, attempts, last_error) VALUES \
+             ($1, 'member', 'unavailable', 1, 'repo inactive (deactivated)'), \
+             ($1, 'authz', 'failed', 5, 'boom'), \
+             ($1, 'scope', 'unavailable', 1, 'repo inactive (deactivated)'), \
+             ('did:plc:stranger', 'resync', 'unavailable', 1, 'repo not found at its PDS')",
+        )
+        .bind(DID)
+        .execute(&db.pool)
+        .await
+        .expect("seed");
+        let writer = Writer::new(db.pool.clone(), state(true), Arc::new(DisabledPrivateTier));
+        let backfill = Backfill::new(writer, Arc::new(Answers(PrepareError::Failed("unused".into()))), BackfillConfig::default(), 5);
+        assert_eq!(backfill.retry_tracked().await.expect("retry"), 2);
+        let rows: Vec<(String, String, String, i32)> =
+            sqlx::query_as("SELECT did, depth, state, attempts FROM backfill_jobs ORDER BY did, depth").fetch_all(&db.pool).await.expect("rows");
+        assert_eq!(
+            rows,
+            [
+                (DID.to_string(), "authz".to_string(), "queued".to_string(), 0),
+                (DID.to_string(), "member".to_string(), "queued".to_string(), 0),
+                (DID.to_string(), "scope".to_string(), "unavailable".to_string(), 1),
+                ("did:plc:stranger".to_string(), "resync".to_string(), "unavailable".to_string(), 1),
+            ]
+        );
         db.drop_db().await;
     }
 

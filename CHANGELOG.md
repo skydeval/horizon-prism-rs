@@ -10,6 +10,50 @@ commit.
 
 ## [Unreleased]
 
+### Changed (actionable warnings S1: unavailable accounts, #765, #766)
+
+Actionable-warnings design S1 (`docs/internal/design/actionable-warnings.md`
+§3, §4, §5, §8): Health warns only about sync jobs someone can act on.
+**Migration 0036** (needs `APP_ALLOW_STARTUP_MIGRATE=1` for that start).
+
+- **Sync jobs of accounts that are not there end `unavailable`, not
+  `failed`.** A job whose account is not found on its server, inactive
+  (taken down, deactivated, suspended, deleted or another status the server
+  names), has no server in its DID document, or whose DID is tombstoned,
+  ends in the new `unavailable` state after one try, with the reason kept
+  in `last_error` (`backfill_job_unavailable` log line, info). Nothing
+  claims such a row until it is queued again.
+- **An account that comes back is synced again by itself.** When the
+  identity refresher's status check finds the account active, or an
+  `identity` event arrives (the account may have moved), the DID's
+  `unavailable` jobs are queued again (`scope`/`resync` while Prism follows
+  the account, `member`/`private`/`authz` while it is a member; never
+  `list_sync`); a job running when the account turned active is queued
+  again too (`backfill_requeued_on_return_total`). The tracked-DID retry
+  loop also re-queues members' unavailable jobs every `retry_every_hours`,
+  and the weekly stale re-sync still covers the accounts Prism follows.
+- **Longer retries for the accounts around members.** A failing `scope` or
+  `resync` job now waits 1 min, 10 min, 1 h, 4 h, 12 h, then 24 h, and is
+  `failed` at the seventh failure, about 41 hours after the first.
+  Members' own `member`, `private` and `authz` jobs keep their schedule
+  (1 min, 10 min, 1 h, 1 h; `failed` at the fifth), since the head prober
+  treats a backing-off `authz` job as in flight.
+- **Health "Failed jobs"** counts only failed jobs Prism would still run:
+  those of accounts it follows, and `list_sync` jobs of owners with a list
+  still subscribed. Its words: "N sync jobs failed after trying again
+  several times"; when none have, it says how many followed accounts could
+  not be read because they are deleted, taken down or deactivated.
+- **Jobs page**: an "Unavailable" column, a new section "Accounts Prism
+  could not read" with the unavailable jobs by reason in words, and the
+  failed list limited to jobs Prism would still run, with a count of the
+  others ("deleted after 30 days").
+- `backfill_jobs{state="unavailable"}` gauge; retention deletes
+  `unavailable` rows 30 days after `updated_at`, like `failed` ones.
+- **Migration 0036** turns failed jobs whose `last_error` is one of the
+  "not there" answers into `unavailable` (keeping `updated_at`), and queues
+  again the other failed `scope` and `resync` jobs of accounts Prism still
+  follows. `list_sync` rows are not touched.
+
 ### Changed (membership not tied to hosting, S2, #733, #764)
 
 Membership design S2 (`docs/internal/design/membership.md` §3, §11, §12):

@@ -464,7 +464,8 @@ fn time_steps(settings: &RetentionSettings) -> Vec<Step> {
             "backfill_jobs",
             "ctid",
             "bj",
-            "bj.state IN ('done', 'failed', 'cancelled') AND bj.updated_at < now() - make_interval(days => $1)",
+            // `unavailable` is finished too (actionable-warnings design §3.5).
+            "bj.state IN ('done', 'failed', 'unavailable', 'cancelled') AND bj.updated_at < now() - make_interval(days => $1)",
             Bind::Days(FINISHED_WORK_DAYS),
         ),
         batched(
@@ -965,7 +966,7 @@ mod tests {
         };
         let t = time_steps(&settings);
         let jobs = t.iter().find(|s| s.table == "backfill_jobs").expect("jobs step");
-        assert!(jobs.sql.contains("('done', 'failed', 'cancelled')"));
+        assert!(jobs.sql.contains("('done', 'failed', 'unavailable', 'cancelled')"));
         let admin = t.iter().find(|s| s.table == "admin_commands").expect("admin step");
         assert!(admin.sql.contains("finished_at IS NOT NULL"));
     }

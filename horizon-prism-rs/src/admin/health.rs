@@ -427,7 +427,10 @@ pub struct Inputs {
     pub redis: Option<bool>,
     pub audit_ok: Option<bool>,
     pub gap_blocked: Option<bool>,
+    /// Failed jobs Prism would still run (actionable-warnings design §5.1).
     pub failed_jobs: Option<i64>,
+    /// Accounts Prism follows whose jobs ended `unavailable`.
+    pub unavailable_accounts: Option<i64>,
     pub members_not_ready: Option<i64>,
     pub set_aside: usize,
     pub waiting: usize,
@@ -519,7 +522,7 @@ fn yes_no_check(name: &'static str, ok: Option<bool>, bad: &str, fine: &str, why
 
 /// The checks of §9.2, in that order.
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
     let latest = ring.latest();
     let mut out = vec![
@@ -610,10 +613,30 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
 
     out.push(disk_check(i.disks.as_ref()));
 
+    // Actionable-warnings design §5.1: only failed jobs Prism would still
+    // run count; an account that is not there is not a failure.
     out.push(match i.failed_jobs {
         None => Check::no_data("Failed jobs", "the count did not finish in time."),
-        Some(n) if n > 0 => Check::new("Failed jobs", Level::Amber, format!("{n} sync job{} failed.", if n == 1 { "" } else { "s" })).link("/admin/jobs", "See them"),
-        Some(_) => Check::new("Failed jobs", Level::Ok, "No sync job has failed.").link("/admin/jobs", "Jobs"),
+        Some(n) if n > 0 => Check::new(
+            "Failed jobs",
+            Level::Amber,
+            format!("{} sync job{} failed after trying again several times. See what went wrong.", count(n as f64), if n == 1 { "" } else { "s" }),
+        )
+        .link("/admin/jobs", "See them"),
+        Some(_) => {
+            let unavailable = match i.unavailable_accounts {
+                Some(u) if u > 0 => format!(
+                    " {} account{} could not be read because {} deleted, taken down or deactivated; Prism reads {} again if {} back.",
+                    count(u as f64),
+                    if u == 1 { "" } else { "s" },
+                    if u == 1 { "it is" } else { "they are" },
+                    if u == 1 { "it" } else { "them" },
+                    if u == 1 { "it comes" } else { "they come" },
+                ),
+                _ => String::new(),
+            };
+            Check::new("Failed jobs", Level::Ok, format!("No sync job has failed.{unavailable}")).link("/admin/jobs", "Jobs")
+        }
     });
 
     out.push(match i.members_not_ready {
@@ -673,6 +696,19 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
     out
 }
 
+/// The failed jobs Health counts (actionable-warnings design §5.1): those of
+/// accounts Prism still follows, and `list_sync` jobs of owners with a list
+/// still subscribed. A failed job Prism would not run again needs nobody.
+pub const FAILED_JOBS_SQL: &str = "SELECT count(*) FROM backfill_jobs j WHERE j.state = 'failed' \
+     AND (CASE WHEN j.depth = 'list_sync' \
+               THEN EXISTS (SELECT 1 FROM subscribed_lists l WHERE l.owner_did = j.did AND l.state = 'active') \
+               ELSE EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = j.did) END)";
+
+/// Accounts Prism follows whose sync jobs ended `unavailable` (§5.1): a DID
+/// can have more than one such row.
+pub const UNAVAILABLE_ACCOUNTS_SQL: &str = "SELECT count(DISTINCT j.did) FROM backfill_jobs j WHERE j.state = 'unavailable' \
+     AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = j.did)";
+
 /// One count under a 2-second statement timeout (§6.6); `None` when it
 /// fails or runs out of time, so its check says "no data".
 pub async fn timed_count(pool: &PgPool, sql: &str) -> Option<i64> {
@@ -702,10 +738,11 @@ pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
             None => None,
         }
     };
-    let (db, redis, failed_jobs, members_not_ready) = tokio::join!(
+    let (db, redis, failed_jobs, unavailable_accounts, members_not_ready) = tokio::join!(
         probe_db(&state.pool, PROBE_TIMEOUT),
         redis,
-        timed_count(&state.pool, "SELECT count(*) FROM backfill_jobs WHERE state = 'failed'"),
+        timed_count(&state.pool, FAILED_JOBS_SQL),
+        timed_count(&state.pool, UNAVAILABLE_ACCOUNTS_SQL),
         timed_count(&state.pool, "SELECT count(*) FROM members WHERE ready_at IS NULL AND added_at < now() - interval '24 hours'"),
     );
     let fh = &state.settings.running.firehose;
@@ -718,6 +755,7 @@ pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
         audit_ok: h.audit.as_ref().map(|a| !a.latched()),
         gap_blocked: h.consumer.as_ref().map(|c| c.gap_blocked()),
         failed_jobs,
+        unavailable_accounts,
         members_not_ready,
         set_aside: banners.set_aside,
         waiting: banners.waiting,
@@ -846,6 +884,7 @@ mod tests {
             audit_ok: Some(true),
             gap_blocked: Some(true),
             failed_jobs: Some(3),
+            unavailable_accounts: Some(232),
             members_not_ready: Some(0),
             set_aside: 0,
             waiting: 2,
@@ -866,7 +905,7 @@ mod tests {
         assert_eq!(get("Unprocessed records", "2 records"), Level::Amber);
         assert_eq!(get("Database budget", "97%"), Level::Red);
         assert_eq!(get("Redis memory", "50%"), Level::Ok);
-        assert_eq!(get("Failed jobs", "3 sync jobs"), Level::Amber);
+        assert_eq!(get("Failed jobs", "3 sync jobs failed after trying again several times"), Level::Amber);
         assert_eq!(get("Members not ready", "Every member"), Level::Ok);
         assert_eq!(get("Farsight", "answering"), Level::Ok);
         assert_eq!(get("Farsight fallback", "off"), Level::Ok);
@@ -874,6 +913,28 @@ mod tests {
         assert_eq!(get("Search", "still being prepared"), Level::Info);
         assert_eq!(get("Trim gap", "No data"), Level::NoData, "a counter never incremented is absent");
         assert_eq!(get("Disk", "The disk holding the database (Postgres) has 15.0 GB free (2% free)"), Level::Red);
+    }
+
+    /// T-AW7 (actionable-warnings design §5.1): the Failed jobs words.
+    #[test]
+    fn failed_jobs_words() {
+        let ring = Ring::default();
+        let text = |failed: i64, unavailable: Option<i64>| {
+            let inputs = Inputs { failed_jobs: Some(failed), unavailable_accounts: unavailable, ..Inputs::default() };
+            let check = checks(&inputs, &ring).into_iter().find(|c| c.name == "Failed jobs").expect("check");
+            (check.level, check.text)
+        };
+        assert_eq!(text(1, Some(5)), (Level::Amber, "1 sync job failed after trying again several times. See what went wrong.".to_string()));
+        assert_eq!(
+            text(0, Some(232)),
+            (Level::Ok, "No sync job has failed. 232 accounts could not be read because they are deleted, taken down or deactivated; Prism reads them again if they come back.".to_string())
+        );
+        assert_eq!(
+            text(0, Some(1)),
+            (Level::Ok, "No sync job has failed. 1 account could not be read because it is deleted, taken down or deactivated; Prism reads it again if it comes back.".to_string())
+        );
+        assert_eq!(text(0, Some(0)), (Level::Ok, "No sync job has failed.".to_string()));
+        assert_eq!(text(0, None), (Level::Ok, "No sync job has failed.".to_string()));
     }
 
     /// One disk holding the database, `total` bytes with `free` free.

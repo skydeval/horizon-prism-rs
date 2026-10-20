@@ -23,10 +23,30 @@ private posts and who may see them, and subscribed lists. They run in the backgr
 <div class="banner">Prism could not count the jobs in time. Reload the page in a moment.</div>
 {% endif %}
 
+<h2>Accounts Prism could not read</h2>
+<p class="muted">These accounts are deleted, taken down by their server, or switched off by their owner. That is normal on
+the network and nothing needs doing: Prism reads them again by itself when they come back.</p>
+{% if unavailable.is_empty() %}<p class="muted">None.</p>{% else %}
+<div class="scroll">
+<table>
+<thead><tr><th>Why</th><th>Jobs</th></tr></thead>
+<tbody>
+{% for u in unavailable %}
+<tr><td>{{ u.0 }}</td><td>{{ u.1 }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<p class="muted">This counts every unavailable job, including those of accounts Prism no longer follows, which are deleted
+after 30 days.</p>
+{% endif %}
+
 <h2>Failed jobs</h2>
 {% if let Some(rows) = failed %}
-{% if rows.is_empty() %}<p class="muted">No job has failed.</p>{% else %}
-<p class="muted">The 100 most recent. "Try again" queues the same kind of sync for that account.</p>
+{% if rows.is_empty() %}<p class="muted">{% if failed_elsewhere.is_empty() %}No job has failed.{% else %}No job of an account Prism follows has failed.{% endif %}</p>{% else %}
+<p class="muted">Jobs that failed after trying again several times (for about two days for the accounts around members, a
+couple of hours for members' own). Try again once the cause is fixed, or wait: Prism tries members' jobs again every few
+hours. The 100 most recent. "Try again" queues the same kind of sync for that account.</p>
 <div class="scroll">
 <table>
 <thead><tr><th>Account</th><th>Kind</th><th>Tries</th><th>What went wrong</th><th>When</th><th></th></tr></thead>
@@ -45,6 +65,7 @@ private posts and who may see them, and subscribed lists. They run in the backgr
 </table>
 </div>
 {% endif %}
+{% if !failed_elsewhere.is_empty() %}<p class="muted">{{ failed_elsewhere }}</p>{% endif %}
 {% endif %}
 
 <h2>Clean-up of the accounts Prism follows</h2>
