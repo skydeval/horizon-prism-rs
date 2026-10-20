@@ -271,11 +271,36 @@ pub struct IdentityConfig {
     pub resolve_handle_cache_max: u64,
     pub resolve_handle_ttl_secs: u64,
     pub resolve_handle_negative_ttl_secs: u64,
+    /// Lodestar, a read-only mirror of the PLC directory that also verifies
+    /// handles (lodestar-reads design §2.1). Empty: off. `https` only.
+    /// Request-path reads ask it first; plc.directory stays the fallback
+    /// and the only source of anything that authorizes.
+    pub lodestar_url: String,
+    /// Lodestar's own bucket for request-origin calls.
+    pub lodestar_request_rate_per_sec: Float,
+    pub lodestar_request_burst: u32,
+    /// The time limit of one lodestar call, capped by the request's
+    /// deadline; 100 to 10 000.
+    pub lodestar_timeout_ms: u64,
+}
+
+impl IdentityConfig {
+    /// The lodestar base URL without a trailing `/`, or `None` when the
+    /// setting is empty (off).
+    #[must_use]
+    pub fn lodestar(&self) -> Option<&str> {
+        let url = self.lodestar_url.trim().trim_end_matches('/');
+        (!url.is_empty()).then_some(url)
+    }
 }
 
 impl Default for IdentityConfig {
     fn default() -> Self {
         Self {
+            lodestar_url: String::new(),
+            lodestar_request_rate_per_sec: Float(100.0),
+            lodestar_request_burst: 200,
+            lodestar_timeout_ms: 1500,
             plc_url: "https://plc.directory".to_string(),
             did_fresh_secs: 3600,
             did_stale_max_secs: 86_400,

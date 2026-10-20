@@ -121,6 +121,10 @@ member_pool_refresh_secs = 600
 resolve_handle_cache_max = 100000
 resolve_handle_ttl_secs = 300
 resolve_handle_negative_ttl_secs = 60
+lodestar_url = ""
+lodestar_request_rate_per_sec = 100.0
+lodestar_request_burst = 200
+lodestar_timeout_ms = 1500
 
 [kryphocron]
 oracle_freshness_bound_secs = 120
@@ -930,6 +934,36 @@ fn plc_url_may_be_plain_http_for_a_test_plc() {
     assert_eq!(cfg.file.identity.plc_url, "http://plc.test.internal:2582");
     let p = invalid_problems(load("[identity]\nplc_url = \"ftp://plc.example\"\n"));
     assert!(has(&p, "identity.plc_url"));
+}
+
+/// Lodestar-reads T-L1: empty is off; set, https only, with no plain-http
+/// exception; the call limit is 100 to 10 000 ms.
+#[test]
+fn lodestar_url_is_off_when_empty_and_https_only() {
+    assert_eq!(load("").expect("defaults").file.identity.lodestar(), None);
+    assert_eq!(load("[identity]\nlodestar_url = \"  \"\n").expect("blank").file.identity.lodestar(), None);
+    let cfg = load("[identity]\nlodestar_url = \"https://lodestar.example/\"\n").expect("valid");
+    assert_eq!(cfg.file.identity.lodestar(), Some("https://lodestar.example"));
+    let cfg = load("[identity]\nlodestar_url = \"https://example.net/lodestar\"\n").expect("a path is a prefix");
+    assert_eq!(cfg.file.identity.lodestar(), Some("https://example.net/lodestar"));
+    for bad in [
+        "http://lodestar.example",
+        "ftp://lodestar.example",
+        "https://lodestar.example/?x=1",
+        "https://lodestar.example/#top",
+        "https://user:pass@lodestar.example",
+        "lodestar",
+    ] {
+        let p = invalid_problems(load(&format!("[identity]\nlodestar_url = \"{bad}\"\n")));
+        assert!(has(&p, "identity.lodestar_url"), "{bad}: {p:?}");
+    }
+    for (ms, valid) in [(99, false), (100, true), (10_000, true), (10_001, false)] {
+        let result = load(&format!("[identity]\nlodestar_timeout_ms = {ms}\n"));
+        assert_eq!(result.is_ok(), valid, "{ms}");
+        if !valid {
+            assert!(has(&invalid_problems(result), "identity.lodestar_timeout_ms must be between 100 and 10000"));
+        }
+    }
 }
 
 #[test]

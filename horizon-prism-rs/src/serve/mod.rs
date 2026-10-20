@@ -392,6 +392,23 @@ pub async fn run() -> Result<(), StartupError> {
     }
     let microcosm = &cfg.file.microcosm;
     let identity = &cfg.file.identity;
+    // Lodestar (lodestar-reads design), only when configured: the client,
+    // its gate and the probe that keeps the gate.
+    let _lodestar = identity.lodestar().map(|url| {
+        let lodestar = Arc::new(crate::identity::lodestar::Lodestar::new(
+            nets.public().client().clone(),
+            url,
+            Duration::from_millis(identity.lodestar_timeout_ms),
+            Duration::from_secs(identity.did_fresh_secs),
+        ));
+        tracing::info!(
+            event = "lodestar_enabled",
+            host = %lodestar.host(),
+            "public request paths read identities from lodestar first; plc.directory stays the fallback and the key path's source"
+        );
+        tasks.push(Arc::clone(&lodestar).spawn_probe());
+        lodestar
+    });
     // Identity work for requests: the requester's identity share, and PLC's
     // request bucket with its issuer-refresh slice.
     let identity_share = RequesterLimit::new(

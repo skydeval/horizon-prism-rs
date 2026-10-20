@@ -952,6 +952,7 @@ pub fn problems(cfg: &FileConfig, out: &mut Vec<String>) {
         ("microcosm.slingshot", cfg.microcosm.slingshot_rate_per_sec, cfg.microcosm.slingshot_burst),
         ("microcosm.constellation", cfg.microcosm.constellation_rate_per_sec, cfg.microcosm.constellation_burst),
         ("identity.plc_request", cfg.identity.plc_request_rate_per_sec, cfg.identity.plc_request_burst),
+        ("identity.lodestar_request", cfg.identity.lodestar_request_rate_per_sec, cfg.identity.lodestar_request_burst),
         (
             "identity.requester_resolutions",
             cfg.identity.requester_resolutions_per_sec,
@@ -1221,6 +1222,8 @@ mod tests {
             ("[microcosm]\nslingshot_rate_per_sec = 0.0\n", "microcosm.slingshot"),
             ("[microcosm]\nconstellation_burst = 0\n", "microcosm.constellation"),
             ("[identity]\nplc_request_rate_per_sec = inf\n", "identity.plc_request"),
+            ("[identity]\nlodestar_request_rate_per_sec = 0.0\n", "identity.lodestar_request"),
+            ("[identity]\nlodestar_request_burst = 0\n", "identity.lodestar_request"),
             ("[identity]\nrequester_resolutions_burst = 0\n", "identity.requester_resolutions"),
             ("[sync]\npublic_fallback_rate_per_host = 0.0\n", "sync.public_fallback_rate_per_host"),
             ("[sync]\nmax_public_fallback_hosts = 10\n", "sync.max_public_fallback_hosts"),

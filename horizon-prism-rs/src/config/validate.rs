@@ -383,6 +383,29 @@ fn urls(cfg: &FileConfig, out: &mut Vec<String>) {
             ));
         }
     }
+    // Lodestar-reads §2.1: lodestar over https only (or a listed test
+    // origin), with no query, fragment or credentials. No plain-http
+    // exception: that stays the PLC directory's alone.
+    if let Some(url) = cfg.identity.lodestar() {
+        let checked = match url::Url::parse(url) {
+            Ok(u) if u.scheme() == "https"
+                && u.host_str().is_some()
+                && u.query().is_none()
+                && u.fragment().is_none()
+                && u.username().is_empty()
+                && u.password().is_none() =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "identity.lodestar_url = {url:?} must be an https URL with a host and no query, fragment or credentials"
+            )),
+            Err(e) => Err(format!("identity.lodestar_url = {url:?} is not a URL: {e}")),
+        };
+        if let Err(e) = with_leave(cfg, url, &[Intent::Public], checked) {
+            out.push(e);
+        }
+    }
     // §5.14.4: Farsight over https only (or a listed test origin).
     if let Some(url) = &cfg.farsight.url {
         let checked = match url::Url::parse(url) {
@@ -460,6 +483,10 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     }
     if cfg.identity.did_fresh_secs >= cfg.identity.did_stale_max_secs {
         out.push("identity.did_fresh_secs must be less than identity.did_stale_max_secs".to_string());
+    }
+    // Lodestar-reads §2.12.
+    if !(100..=10_000).contains(&cfg.identity.lodestar_timeout_ms) {
+        out.push("identity.lodestar_timeout_ms must be between 100 and 10000".to_string());
     }
     if cfg.counts.fresh_secs > cfg.counts.stale_max_secs {
         out.push("counts.fresh_secs must not exceed counts.stale_max_secs".to_string());

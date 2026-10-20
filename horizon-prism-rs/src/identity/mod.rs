@@ -7,10 +7,13 @@
 //! - [`fetch_cell`]: the JWT-path single-flight fetch cell and the
 //!   `GuardedDidFetcher` that kryphocron's `DefaultDidResolver` calls.
 //! - [`refresher`]: the `identity_refresh` worker.
+//! - [`lodestar`]: the optional mirror of the PLC directory that public
+//!   request paths read first (lodestar-reads design).
 
 pub mod cache;
 pub mod fetch_cell;
 pub mod handle_lookup;
+pub mod lodestar;
 pub mod refresher;
 pub mod resolver;
 

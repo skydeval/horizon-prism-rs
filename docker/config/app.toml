@@ -114,6 +114,18 @@ member_pool_refresh_secs = 600
 resolve_handle_cache_max = 100000
 resolve_handle_ttl_secs = 300
 resolve_handle_negative_ttl_secs = 60
+# Lodestar: a read-only mirror of the PLC directory that also verifies
+# handles both ways. Empty: off, and identities are read from plc_url and
+# checked by this app alone. Set to an https address you run or trust to
+# have public requests read identities from it first; anything it cannot
+# answer falls back to plc_url and this app's own checks, and sign-in
+# tokens, admin sign-in and membership always use plc_url. Restart to
+# change. See README.md, "Lodestar (identity reads)".
+lodestar_url = ""
+lodestar_request_rate_per_sec = 100.0
+lodestar_request_burst = 200
+# One call's time limit, in milliseconds (100 to 10000).
+lodestar_timeout_ms = 1500
 
 [kryphocron]
 oracle_freshness_bound_secs = 120

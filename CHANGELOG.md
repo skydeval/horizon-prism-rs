@@ -10,6 +10,34 @@ commit.
 
 ## [Unreleased]
 
+### Added (lodestar identity reads S2, #750)
+
+Lodestar-reads design §2.1, §2.6, §2.13 (`docs/internal/design/lodestar-reads.md`).
+Lodestar is a read-only mirror of the PLC directory that also verifies every
+account's handle both ways; Prism can read identities from it first.
+
+- **`[identity] lodestar_url`, empty (off) by default.** Set, it must be an
+  `https` URL with a host and no query, fragment or credentials; a plain
+  `http` address is refused (the plain-http exception stays the PLC
+  directory's alone), and a private network address is refused at call time
+  like any other upstream. With it set, `serve` builds the lodestar client
+  and a probe that asks lodestar every 15 s where it stands
+  (`lodestar_enabled` is logged once, with its host). No read uses it yet.
+- **The freshness gate.** Lodestar is asked only while its last report said
+  it is live and fresh (at the directory's tip) and that report is under 45 s
+  old. An answer saying lodestar is unreachable, refused (403), failing or
+  behind closes the gate until the next good report; an answer about one
+  item (not found, a slow live handle resolution) never does. Transitions
+  are logged once each (`lodestar_gate_opened`, `lodestar_gate_closed`).
+- **Keys** `lodestar_request_rate_per_sec` (100) and `lodestar_request_burst`
+  (200), lodestar's own request bucket, checked like the other rates; and
+  `lodestar_timeout_ms` (1500, 100 to 10000), one call's limit. All read at
+  startup.
+- **Metrics:** `lodestar_calls_total{endpoint, outcome}`,
+  `lodestar_call_seconds{endpoint}`, `lodestar_fresh` (1 while the gate is
+  open).
+- `docker/config/app.toml` ships `lodestar_url = ""` and the three keys.
+
 ### Fixed (tombstoned DIDs, lodestar identity reads S1, #749)
 
 Lodestar-reads design §2.4 (`docs/internal/design/lodestar-reads.md`).
