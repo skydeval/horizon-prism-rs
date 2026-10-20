@@ -43,7 +43,7 @@ use super::deadletter::{self, DeadLetter};
 use super::gap::{self, GapCause};
 use super::router::route_identity;
 use super::scripts::{self, CheckedRead, GapEvidence, ReanchorMode, ScriptError};
-use super::stream::{Commit, Event, IdentityKind, StreamEntry, decode, parse_read_reply, repo_hint};
+use super::stream::{Commit, Event, IdentityKind, Readable, StreamEntry, decode, parse_read_reply, readable_despite, repo_hint};
 use super::watermark::{Watermarks, contribution};
 use super::writer::{ApplyOptions, Transient, WriteSource, Writer};
 use crate::config::FirehoseConfig;
@@ -998,6 +998,20 @@ impl Consumer {
         let event = match decode(entry) {
             Ok(e) => e,
             Err(error) => {
+                // A refusal that could not matter is counted and dropped
+                // (actionable-warnings design §6): an event naming no DID,
+                // or a commit refused for its rev alone whose ops, with a
+                // valid rev, would have written nothing.
+                let dropped = match readable_despite(entry) {
+                    Some(Readable::NotADid) => Some("did"),
+                    Some(Readable::Commit { repo, ops }) => (!self.writer.would_write(&repo, &ops).await).then_some("rev"),
+                    None => None,
+                };
+                if let Some(check) = dropped {
+                    metrics::counter!(deadletter::METRIC_MALFORMED_DROPPED, "check" => check).increment(1);
+                    tracing::debug!(event = "firehose_malformed_dropped", id = %entry.id, check, %error, "a malformed entry that could not matter was dropped");
+                    return Ok(EntryPath::NoTx);
+                }
                 // Deterministic: dead-letter the whole entry (§6.11.6).
                 let (repo, rev) = repo_hint(entry);
                 let letter = DeadLetter {
@@ -1051,11 +1065,19 @@ impl Consumer {
             .writer
             .apply_from(Some(&label), &commit.repo, &commit.rev, &commit.ops, self.apply_options())
             .await?;
-        if !report.failed.is_empty() {
+        // A malformed op that could not matter is counted, not dead-lettered
+        // (actionable-warnings design §6.3).
+        let dropped = report.failed.iter().filter(|f| !f.matters).count();
+        if dropped > 0 {
+            metrics::counter!(deadletter::METRIC_MALFORMED_DROPPED, "check" => "record").increment(dropped as u64);
+            tracing::debug!(event = "firehose_malformed_dropped", id = %entry.id, check = "record", repo = %commit.repo, ops = dropped, "malformed ops that could not matter were dropped");
+        }
+        if report.failed.iter().any(|f| f.matters) {
             let data = entry.raw("data").map(<[u8]>::to_vec).unwrap_or_default();
             let letters: Vec<DeadLetter> = report
                 .failed
                 .iter()
+                .filter(|f| f.matters)
                 .map(|f| DeadLetter {
                     orig_id: entry.id.clone(),
                     entry_type: "commit".to_string(),

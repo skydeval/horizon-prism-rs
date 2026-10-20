@@ -372,13 +372,15 @@ fn assert_decisions_agree(handle: &PrometheusHandle, reanchors: &[ReanchorRecord
 
 // F1 (§1.6).
 
+/// An invalid op that could matter (it names a member) is dead-lettered
+/// without a transaction.
 #[tokio::test]
 async fn invalid_op_without_a_transaction_is_dead_lettered() {
     let Some(mut f) = Fixture::new("fh_invalid_op_dead_lettered", Options::default()).await else {
         return;
     };
     let like = json!([{"action": "create", "path": "app.bsky.feed.like/bad rkey!", "cid": null,
-        "record": {"subject": {"uri": "at://did:plc:x/app.bsky.feed.post/1", "cid": "c"}}}]);
+        "record": {"subject": {"uri": format!("at://{MEMBER}/app.bsky.feed.post/1"), "cid": "c"}}}]);
     f.add_commit(OUTSIDER, like).await;
     let (mut c, _) = f.consumer().await;
     c.startup().await.expect("startup");
@@ -391,6 +393,61 @@ async fn invalid_op_without_a_transaction_is_dead_lettered() {
         panic!("XPENDING {pending:?}");
     };
     assert_eq!(parts.first().and_then(as_u64), Some(0), "acked");
+    f.cleanup().await;
+}
+
+/// T-AW11 (actionable-warnings design §6): malformed entries that could not
+/// matter are acked, counted and not dead-lettered; those that could matter
+/// are dead-lettered as before.
+#[tokio::test]
+async fn malformed_entries_that_could_not_matter_are_dropped() {
+    let (rec, handle) = recorder();
+    let _local = metrics::set_default_local_recorder(&rec);
+    let Some(mut f) = Fixture::new("fh_malformed_dropped", Options::default()).await else {
+        return;
+    };
+    let bad_rev = |repo: &str, ops: serde_json::Value| {
+        let data = json!({"repo": repo, "rev": "3lxcday8ef4p4", "ops": ops});
+        vec![("type", "commit".to_string()), ("data", data.to_string()), ("seq", "1".to_string())]
+    };
+    let like_of = |author: &str| {
+        json!([{"action": "create", "path": "app.bsky.feed.like/3kaaaaaaaaaaa", "cid": "bafy",
+            "record": {"subject": {"uri": format!("at://{author}/app.bsky.feed.post/3kbbbbbbbbbbb"), "cid": "bafy"}, "createdAt": "2026-10-20T00:00:00Z"}}])
+    };
+    let broken_like = |named: &str| {
+        json!([{"action": "create", "path": "app.bsky.feed.like/3kaaaaaaaaaaa", "cid": "bafy",
+            "record": {"subject": {"uri": "not-a-uri", "x": named}}}])
+    };
+    // Dropped: a stranger's bad-rev like of a stranger, an event naming no
+    // DID, a stranger's broken like naming nobody.
+    f.add(&bad_rev(OUTSIDER, like_of("did:plc:nobody")), None).await;
+    f.add(&[("type", "account".into()), ("data", json!({"did": "bob"}).to_string()), ("seq", "2".into())], None).await;
+    f.add_commit(OUTSIDER, broken_like("did:plc:nobody")).await;
+    // Dead-lettered: the same from a member, a bad-rev like of a member's
+    // post (admitted under On), a broken like naming a member.
+    f.add(&bad_rev(MEMBER, like_of("did:plc:nobody")), None).await;
+    f.add(&bad_rev(OUTSIDER, like_of(MEMBER)), None).await;
+    f.add_commit(OUTSIDER, broken_like(MEMBER)).await;
+    let (mut c, _) = f.consumer().await;
+    c.startup().await.expect("startup");
+    assert!(c.run_until(|c| c.throughput.processed >= 6, Duration::from_secs(5)).await);
+    // Paths: no_tx, tx, identity, dead_letter.
+    assert_eq!(c.throughput.by_path, [4, 0, 0, 2], "the dropped entries and the op-level ones ran no transaction");
+    let dead: Vec<(String, Vec<(String, String)>)> =
+        redis::cmd("XRANGE").arg(&f.cfg.dead_letter_stream).arg("-").arg("+").query_async(&mut f.redis).await.expect("xrange");
+    let repos: Vec<String> = dead
+        .iter()
+        .map(|(_, fields)| fields.iter().find(|(k, _)| k == "repo").map(|(_, v)| v.clone()).unwrap_or_default())
+        .collect();
+    assert_eq!(repos, [MEMBER, OUTSIDER, OUTSIDER], "{dead:?}");
+    for (check, n) in [("rev", 1.0), ("did", 1.0), ("record", 1.0)] {
+        assert_eq!(rendered(&handle, crate::firehose::deadletter::METRIC_MALFORMED_DROPPED, &[&format!("check=\"{check}\"")]), Some(n), "{check}");
+    }
+    let pending: Value = redis::cmd("XPENDING").arg(&f.cfg.stream_key).arg(&f.cfg.group).query_async(&mut f.redis).await.expect("xpending");
+    let Value::Array(parts) = pending else {
+        panic!("XPENDING {pending:?}");
+    };
+    assert_eq!(parts.first().and_then(as_u64), Some(0), "all acked");
     f.cleanup().await;
 }
 

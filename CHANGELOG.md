@@ -10,6 +10,36 @@ commit.
 
 ## [Unreleased]
 
+### Changed (actionable warnings S2: malformed records from strangers, #765, #767)
+
+Actionable-warnings design S2 (`docs/internal/design/actionable-warnings.md`
+§6, §7): a malformed record Prism would not have kept anyway is counted and
+set aside, not listed as a problem. No migration.
+
+- **A commit refused for an invalid rev** (for example a rev with an `8`,
+  outside the TID alphabet) is now read once more without its rev, and its
+  ops are put through the same preparation and admission a valid commit
+  gets, with no SQL. When the commit would have written nothing (the repo
+  is not a member, not tracked, owns no subscribed list, no op would be
+  admitted, and it holds no delete), it is acked and counted
+  `firehose_malformed_dropped_total{check="rev"}` (path `no_tx`) instead of
+  being dead-lettered. The rev itself is never used.
+- **An identity, account, handle or tombstone event whose DID is not a
+  DID** is counted `check="did"` and dropped.
+- **A broken record in a readable commit** (one that fails to parse, an
+  invalid rkey, a create without record or cid) is dead-lettered only when
+  it could matter: its repo is tracked, in scope or owns a subscribed list,
+  its path is the private tier's, or a string in it names a member. Others
+  are counted `check="record"`. `FailedOp` carries `matters`.
+- Commits that could matter (from a member or tracked account, or with an
+  op admission would admit, such as a block of a member) are dead-lettered
+  and warn as before. Unreadable entries (unknown type, bad JSON, a repo
+  that is not a DID, an unknown action) are dead-lettered as before.
+- **Health "Unprocessed records"** therefore counts only records that could
+  matter; when fine, it says how many malformed records from accounts
+  Prism does not keep were set aside in the last hour. The Problems page
+  says what it lists.
+
 ### Changed (actionable warnings S1: unavailable accounts, #765, #766)
 
 Actionable-warnings design S1 (`docs/internal/design/actionable-warnings.md`

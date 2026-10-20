@@ -152,6 +152,10 @@ pub struct FailedOp {
     pub action: Action,
     pub path: String,
     pub error: String,
+    /// The op could matter to Prism (actionable-warnings design §6.3): an
+    /// op that ran SQL, or a malformed one [`invalid_op_matters`] keeps.
+    /// The firehose dead-letters only these.
+    pub matters: bool,
 }
 
 /// The result of one call.
@@ -382,7 +386,14 @@ fn nothing_to_write(
 
 /// The report the transaction would have returned for a commit with nothing
 /// to write: the same outcomes, failed ops and skip counters.
-fn report_without_writes(prepared: &[Prepared], admissions: &[Option<Admission>], ops: &[RawOp]) -> ApplyReport {
+fn report_without_writes(
+    repo: &str,
+    prepared: &[Prepared],
+    admissions: &[Option<Admission>],
+    ops: &[RawOp],
+    sets: &ScopeSets,
+    owner_side: bool,
+) -> ApplyReport {
     let mut report = ApplyReport::default();
     for (i, (p, op)) in prepared.iter().zip(ops).enumerate() {
         // An untracked repo: every op is decided here.
@@ -393,11 +404,74 @@ fn report_without_writes(prepared: &[Prepared], admissions: &[Option<Admission>]
                 action: op.action,
                 path: op.path(),
                 error: error.clone(),
+                // Decided without SQL: an invalid op.
+                matters: invalid_op_matters(repo, op, sets, owner_side),
             });
         }
         report.outcomes.push(outcome);
     }
     report
+}
+
+/// Whether a malformed op (`Prepared::Invalid`, no parsed record) could
+/// matter to Prism (actionable-warnings design §6.3): its repo is tracked,
+/// owns a subscribed list or is in S; its path is the private tier's; or a
+/// string in its record names a member. Every admission subject is taken
+/// from such a string, so the last test covers rule 2 without the record
+/// having to parse.
+#[must_use]
+pub fn invalid_op_matters(repo: &str, op: &RawOp, sets: &ScopeSets, owner_side: bool) -> bool {
+    sets.is_tracked(repo)
+        || owner_side
+        || sets.in_scope(repo)
+        || op.collection.starts_with("tools.kryphocron.")
+        || op.record.as_ref().is_some_and(|r| names_member(r, sets))
+}
+
+/// Whether any string in `value` is a member's DID, or an `at://` URI whose
+/// authority is one.
+fn names_member(value: &Value, sets: &ScopeSets) -> bool {
+    match value {
+        Value::String(s) => {
+            let did = s.strip_prefix("at://").map_or(s.as_str(), |rest| rest.split('/').next().unwrap_or_default());
+            sets.is_member(did)
+        }
+        Value::Array(items) => items.iter().any(|v| names_member(v, sets)),
+        Value::Object(fields) => fields.values().any(|v| names_member(v, sets)),
+        _ => false,
+    }
+}
+
+/// Whether a commit could make Prism write anything, for a commit the
+/// firehose refused (actionable-warnings design §6.2): exactly the
+/// opposite of "nothing to write" for the same repo and ops, with the
+/// firehose's options, plus any malformed op that could matter. Reads no
+/// rev and runs no SQL.
+#[must_use]
+pub fn commit_matters(repo: &str, ops: &[RawOp], sets: &ScopeSets, now: DateTime<Utc>) -> bool {
+    let options = ApplyOptions {
+        advance_applied_rev: true,
+        dead_letter_readiness: true,
+        attempts: 1,
+        live: true,
+        subscription_rules: true,
+        source: WriteSource::Firehose,
+    };
+    let prepared: Vec<Prepared> = ops.iter().map(|op| prepare(repo, op, now)).collect();
+    let admissions: Vec<Option<Admission>> = prepared
+        .iter()
+        .map(|p| match p {
+            Prepared::Upsert(u) => Some(admit(&u.input, sets)),
+            _ => None,
+        })
+        .collect();
+    let owner_side = sets.subscribed.tracks(repo);
+    let tracked = sets.is_tracked(repo);
+    !nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options)
+        || prepared
+            .iter()
+            .zip(ops)
+            .any(|(p, op)| matches!(p, Prepared::Invalid(_)) && invalid_op_matters(repo, op, sets, owner_side))
 }
 
 /// The author of the `postPrivate` post a gate row names (private posting
@@ -743,6 +817,14 @@ impl Writer {
         &self.private
     }
 
+    /// Whether a commit the firehose refused could matter, under the read
+    /// guard and with no SQL ([`commit_matters`], actionable-warnings design
+    /// §6.2). Nothing is written.
+    pub async fn would_write(&self, repo: &str, ops: &[RawOp]) -> bool {
+        let guard = self.scope.read_guard().await;
+        commit_matters(repo, ops, &guard, Utc::now())
+    }
+
     /// Apply one commit's ops for `repo` at `rev` in one transaction.
     ///
     /// # Errors
@@ -857,7 +939,7 @@ impl Writer {
         #[cfg(not(test))]
         let forced = false;
         if !forced && nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options) {
-            let report = report_without_writes(&prepared, &admissions, ops);
+            let report = report_without_writes(repo, &prepared, &admissions, ops, sets, owner_side);
             drop(guard);
             if let Some(tap) = &self.feed {
                 tap.observe(feed_view(&prepared, ops, &report), options.source, relay, repo);
@@ -920,6 +1002,9 @@ impl Writer {
                     action: op.action,
                     path: op.path(),
                     error: error.clone(),
+                    // An invalid op was decided without SQL; any other
+                    // failure is of an op that ran SQL, which matters.
+                    matters: !matches!(p, Prepared::Invalid(_)) || invalid_op_matters(repo, op, sets, owner_side),
                 });
             }
             report.outcomes.push(outcome);
@@ -2493,6 +2578,63 @@ mod tests {
             n.iter().map(|x| (x.recipient.as_str(), x.reason)).collect::<Vec<_>>(),
             [(MEMBER, "reply"), ("did:plc:m2", "reply")]
         );
+    }
+
+    /// T-AW10 (actionable-warnings design §6.2, §6.3): which refused commits
+    /// could matter.
+    #[test]
+    fn which_refused_commits_could_matter() {
+        use crate::indexing::PublicMode;
+        const STRANGER: &str = "did:plc:stranger";
+        const NEIGHBOUR: &str = "did:plc:neighbour";
+        const OWNER: &str = "did:plc:listowner";
+        let now = Utc::now();
+        let mut s = sets();
+        s.scope.insert(NEIGHBOUR.into());
+        s.subscribed.owners.insert(OWNER.into(), 0);
+        let like_of = |author: &str| {
+            op(Action::Create, "app.bsky.feed.like", "3kaaaaaaaaaaa", Some(json!({
+                "subject": {"uri": format!("at://{author}/app.bsky.feed.post/3kbbbbbbbbbbb"), "cid": "bafy"},
+                "createdAt": "2026-10-20T00:00:00Z"})))
+        };
+        let block_of = |subject: &str| {
+            op(Action::Create, "app.bsky.graph.block", "3kaaaaaaaaaaa", Some(json!({"subject": subject, "createdAt": "2026-10-20T00:00:00Z"})))
+        };
+        let post = op(Action::Create, "app.bsky.feed.post", "3kaaaaaaaaaaa", Some(json!({"text": "hi", "createdAt": "2026-10-20T00:00:00Z"})));
+        let delete = op(Action::Delete, "app.bsky.feed.like", "3kaaaaaaaaaaa", None);
+        let generator = op(Action::Create, "app.bsky.feed.generator", "3kaaaaaaaaaaa", Some(json!({})));
+        // `subject.uri` is not an at-uri, so the like does not parse; the
+        // other string is what the scan finds.
+        let broken_like = |named: &str| op(Action::Create, "app.bsky.feed.like", "3kaaaaaaaaaaa", Some(json!({"subject": {"uri": "not-a-uri", "x": named}})));
+        // No record: malformed.
+        let private = op(Action::Create, "tools.kryphocron.feed.postPrivate", "3kaaaaaaaaaaa", None);
+        for mode in [PublicMode::On, PublicMode::Off] {
+            s.public.mode = mode;
+            let m = |repo: &str, ops: &[RawOp]| commit_matters(repo, ops, &s, now);
+            assert!(!m(STRANGER, &[like_of("did:plc:nobody")]), "{mode:?}");
+            // A like of a member's post is admitted under On (rule 2); the
+            // off rule keeps only members' likes.
+            assert_eq!(m(STRANGER, &[like_of(MEMBER)]), mode == PublicMode::On, "{mode:?}");
+            assert!(m(STRANGER, &[block_of(MEMBER)]), "{mode:?}: a block of a member");
+            assert!(!m(STRANGER, &[block_of("did:plc:nobody")]), "{mode:?}");
+            assert!(m(STRANGER, std::slice::from_ref(&delete)), "{mode:?}: a delete always matters");
+            assert!(m(MEMBER, std::slice::from_ref(&generator)), "{mode:?}: a member's commit");
+            assert!(m(OWNER, std::slice::from_ref(&generator)), "{mode:?}: a subscribed-list owner's commit");
+            assert!(!m(STRANGER, std::slice::from_ref(&generator)), "{mode:?}: skipped only");
+            assert!(!m(STRANGER, &[]), "{mode:?}: no ops");
+            // A malformed op: by what its strings name.
+            assert!(m(STRANGER, &[broken_like(&format!("at://{MEMBER}/app.bsky.feed.post/1"))]), "{mode:?}");
+            assert!(!m(STRANGER, &[broken_like("at://did:plc:nobody/app.bsky.feed.post/1")]), "{mode:?}");
+            assert!(m(NEIGHBOUR, &[broken_like("at://did:plc:nobody/app.bsky.feed.post/1")]), "{mode:?}: its repo is in S");
+            assert!(m(STRANGER, std::slice::from_ref(&private)), "{mode:?}: the private tier's path");
+        }
+        // A non-member in S: its post is stored under On, not under Off.
+        s.public.mode = PublicMode::On;
+        assert!(commit_matters(NEIGHBOUR, std::slice::from_ref(&post), &s, now));
+        s.public.mode = PublicMode::Off;
+        assert!(!commit_matters(NEIGHBOUR, std::slice::from_ref(&post), &s, now));
+        assert!(names_member(&json!({"a": [{"b": MEMBER}]}), &s));
+        assert!(!names_member(&json!({"a": [1, "did:plc:nobody", null]}), &s));
     }
 
     #[test]

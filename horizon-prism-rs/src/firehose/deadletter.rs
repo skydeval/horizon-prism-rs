@@ -7,11 +7,19 @@
 //!
 //! The entry is bounded at about 5 KiB. The full payload is not retained:
 //! `deadletter replay` re-fetches `repo`/`path` from the PDS (§5.9).
+//!
+//! Only what could matter is written: a malformed commit or op from a repo
+//! Prism would store nothing from is counted in
+//! [`METRIC_MALFORMED_DROPPED`] instead (actionable-warnings design §6).
 
 use redis::aio::ConnectionManager;
 
 /// Metric: dead letters written, by entry type.
 pub const METRIC_DEAD_LETTERS: &str = "firehose_dead_letter_total";
+/// Metric: malformed entries and ops that could not matter, counted and
+/// dropped instead of dead-lettered (actionable-warnings design §6.4), by
+/// `check`: `rev`, `did` or `record`.
+pub const METRIC_MALFORMED_DROPPED: &str = "firehose_malformed_dropped_total";
 /// Bytes of `error` kept.
 pub const ERROR_MAX: usize = 512;
 /// Bytes of `data` kept.

@@ -212,12 +212,46 @@ pub fn decode(entry: &StreamEntry) -> Result<Event, String> {
     })
 }
 
+/// What a refused entry still lets Prism read (actionable-warnings design
+/// §6.1), so the consumer can tell whether it could matter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Readable {
+    /// A commit refused for its rev alone: its repo and ops, as `decode`
+    /// would have given them.
+    Commit { repo: String, ops: Vec<RawOp> },
+    /// An identity, account, handle or tombstone event whose `did` is not a
+    /// DID: it can name no account Prism knows.
+    NotADid,
+}
+
+/// For an entry [`decode`] refused: what can still be read, or `None` when
+/// the repo or an op cannot be (such an entry stays a whole-entry dead
+/// letter). Called only after `decode` failed, so a commit that decodes
+/// here was refused for its rev alone; no error text is matched.
+#[must_use]
+pub fn readable_despite(entry: &StreamEntry) -> Option<Readable> {
+    let data = entry.raw("data")?;
+    match entry.field("type")? {
+        "commit" => decode_commit_checked(data, false).ok().map(|c| Readable::Commit { repo: c.repo, ops: c.ops }),
+        "identity" | "account" | "handle" | "tombstone" => {
+            let d: DidData = serde_json::from_slice(data).ok()?;
+            (!proto_blue::syntax::Did::is_valid(&d.did)).then_some(Readable::NotADid)
+        }
+        _ => None,
+    }
+}
+
 fn decode_commit(data: &[u8]) -> Result<Commit, String> {
+    decode_commit_checked(data, true)
+}
+
+/// [`decode_commit`], with the rev check when `check_rev`.
+fn decode_commit_checked(data: &[u8], check_rev: bool) -> Result<Commit, String> {
     let c: CommitData = serde_json::from_slice(data).map_err(|e| format!("commit data: {e}"))?;
     if !proto_blue::syntax::Did::is_valid(&c.repo) {
         return Err(format!("invalid repo {:?}", c.repo));
     }
-    if !proto_blue::syntax::Tid::is_valid(&c.rev) {
+    if check_rev && !proto_blue::syntax::Tid::is_valid(&c.rev) {
         return Err(format!("invalid rev {:?}", c.rev));
     }
     let ops = c
@@ -343,6 +377,34 @@ mod tests {
         };
         assert!(decode(&bad).is_err());
         assert_eq!(repo_hint(&bad), (String::new(), String::new()));
+    }
+
+    /// T-AW9 (actionable-warnings design §6.1): a commit refused for its
+    /// rev alone gives its repo and ops; anything else unreadable gives
+    /// nothing; an event naming no DID is `NotADid`.
+    #[test]
+    fn readable_despite_a_refusal() {
+        let ops = json!([{"action": "create", "path": "app.bsky.feed.like/3kbbbbbbbbbbb", "cid": "bafyop", "record": {"subject": {}}}]);
+        let bad_rev = entry("commit", &json!({"repo": "did:plc:aaaa", "rev": "3lxcday8ef4p4", "ops": ops}));
+        assert!(decode(&bad_rev).is_err());
+        let good = entry("commit", &json!({"repo": "did:plc:aaaa", "rev": "3kaaaaaaaaaaa", "ops": ops}));
+        let Event::Commit(c) = decode(&good).expect("commit") else {
+            panic!("expected a commit");
+        };
+        assert_eq!(readable_despite(&bad_rev), Some(Readable::Commit { repo: "did:plc:aaaa".into(), ops: c.ops }));
+        for refused in [
+            entry("commit", &json!({"repo": "bob", "rev": "nope"})),
+            entry("commit", &json!({"repo": "did:plc:a", "rev": "nope", "ops": [{"action": "move", "path": "a/b"}]})),
+            entry("commit", &json!({"repo": "did:plc:a", "rev": "nope", "ops": [{"action": "create", "path": "nopath"}]})),
+            entry("sync", &json!({"did": "did:plc:a"})),
+            StreamEntry { id: "1-0".into(), fields: Some(vec![("type".into(), b"commit".to_vec()), ("data".into(), b"{".to_vec())]) },
+        ] {
+            assert!(decode(&refused).is_err());
+            assert_eq!(readable_despite(&refused), None, "{refused:?}");
+        }
+        let bad_did = entry("account", &json!({"did": "bob"}));
+        assert!(decode(&bad_did).is_err());
+        assert_eq!(readable_despite(&bad_did), Some(Readable::NotADid));
     }
 
     #[test]

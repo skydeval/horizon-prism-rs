@@ -9,8 +9,9 @@
 </div>
 
 <h2>Records Prism could not process</h2>
-<p class="muted">Records from the network that Prism tried several times and could not store. "Try again" reads the
-record from its author's server and stores it; "Dismiss" takes it off this list.</p>
+<p class="muted">Records from the network that Prism could not store, from members, from accounts Prism follows, or
+naming a member. "Try again" reads the record from its author's server and stores it; "Dismiss" takes it off this list.
+Broken records from other accounts are set aside without being listed, because Prism would not keep them anyway.</p>
 {% if let Some(rows) = letters %}
 {% if rows.is_empty() %}<p class="muted">None. Every record was processed.</p>{% else %}
 <p class="muted">The {{ rows.len() }} most recent.</p>

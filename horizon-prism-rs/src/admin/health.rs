@@ -43,6 +43,7 @@ pub const WATCHED: &[&str] = &[
     crate::firehose::consumer::METRIC_PROCESSED,
     crate::firehose::watermark::METRIC_DELAY,
     crate::firehose::deadletter::METRIC_DEAD_LETTERS,
+    crate::firehose::deadletter::METRIC_MALFORMED_DROPPED,
     crate::firehose::gap::METRIC_GAPS,
     crate::db::sampler::METRIC_DB_BUDGET_RATIO,
     crate::db::sampler::METRIC_DB_SIZE,
@@ -589,7 +590,23 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
     out.push(match ring.rise(HOUR, |s| s.sum(crate::firehose::deadletter::METRIC_DEAD_LETTERS)) {
         None => Check::no_data("Unprocessed records", "none have been counted since Prism started."),
         Some(n) if n > 0.0 => Check::new("Unprocessed records", Level::Amber, format!("{} records could not be processed in the last hour.", count(n))).link("/admin/problems", "See them"),
-        Some(_) => Check::new("Unprocessed records", Level::Ok, "Every record in the last hour was processed.").link("/admin/problems", "Problems"),
+        Some(_) => {
+            // Actionable-warnings design §7.1: malformed records that could
+            // not matter are set aside, not listed.
+            let set_aside = match ring.rise(HOUR, |s| s.sum(crate::firehose::deadletter::METRIC_MALFORMED_DROPPED)) {
+                Some(n) if n > 0.0 => {
+                    let one = (n - 1.0).abs() < 0.5;
+                    format!(
+                        " {} malformed record{} from accounts Prism does not keep {} set aside.",
+                        count(n),
+                        if one { "" } else { "s" },
+                        if one { "was" } else { "were" }
+                    )
+                }
+                _ => String::new(),
+            };
+            Check::new("Unprocessed records", Level::Ok, format!("Every record in the last hour was processed.{set_aside}")).link("/admin/problems", "Problems")
+        }
     });
 
     out.push(match ring.rise(FIFTEEN_MIN, |s| s.sum(crate::firehose::gap::METRIC_GAPS)) {
@@ -913,6 +930,27 @@ mod tests {
         assert_eq!(get("Search", "still being prepared"), Level::Info);
         assert_eq!(get("Trim gap", "No data"), Level::NoData, "a counter never incremented is absent");
         assert_eq!(get("Disk", "The disk holding the database (Postgres) has 15.0 GB free (2% free)"), Level::Red);
+    }
+
+    /// T-AW13 (actionable-warnings design §7.1): the Unprocessed records
+    /// words, with and without records set aside.
+    #[test]
+    fn unprocessed_records_words() {
+        let text_of = |metrics: &str| {
+            let ring = Ring::default();
+            ring.push(snap(metrics, 0));
+            checks(&Inputs::default(), &ring).into_iter().find(|c| c.name == "Unprocessed records").map(|c| (c.level, c.text)).expect("check")
+        };
+        assert_eq!(text_of("firehose_dead_letter_total{type=\"commit\"} 2"), (Level::Amber, "2 records could not be processed in the last hour.".to_string()));
+        assert_eq!(
+            text_of("firehose_dead_letter_total{type=\"commit\"} 0\nfirehose_malformed_dropped_total{check=\"rev\"} 40\nfirehose_malformed_dropped_total{check=\"did\"} 2"),
+            (Level::Ok, "Every record in the last hour was processed. 42 malformed records from accounts Prism does not keep were set aside.".to_string())
+        );
+        assert_eq!(
+            text_of("firehose_dead_letter_total{type=\"commit\"} 0\nfirehose_malformed_dropped_total{check=\"rev\"} 1"),
+            (Level::Ok, "Every record in the last hour was processed. 1 malformed record from accounts Prism does not keep was set aside.".to_string())
+        );
+        assert_eq!(text_of("firehose_dead_letter_total{type=\"commit\"} 0"), (Level::Ok, "Every record in the last hour was processed.".to_string()));
     }
 
     /// T-AW7 (actionable-warnings design §5.1): the Failed jobs words.
