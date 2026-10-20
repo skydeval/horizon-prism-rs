@@ -197,6 +197,30 @@ pub trait DidLookup: Send + Sync {
             None => HandleOutcome::NotFound,
         }
     }
+
+    /// Warm the summaries of `dids` a request is about to resolve, in as
+    /// few calls as possible (lodestar-reads design §2.10). By default
+    /// nothing: each DID is resolved when it is asked for.
+    async fn prefetch(&self, _req: &Requester, _dids: &[String]) {}
+}
+
+/// A summary from lodestar's account, when it answers everything a
+/// summary holds (§2.10 step 5): an active account, a PDS by the same rule
+/// as a document's, and a verified handle or no claim at all.
+fn batch_summary(account: &crate::identity::lodestar::Account) -> Option<DidSummary> {
+    if account.status != "active" {
+        return None;
+    }
+    let pds = crate::identity::resolver::normalize_pds(account.pds.as_deref()?)?;
+    let handle = match (&account.handle, &account.claimed_handle) {
+        (Some(handle), _) => {
+            let handle = handle.to_ascii_lowercase();
+            Some(proto_blue::syntax::Handle::is_valid(&handle).then_some(handle)?)
+        }
+        (None, None) => None,
+        (None, Some(_)) => return None,
+    };
+    Some(DidSummary { pds: Some(pds), handle })
 }
 
 /// `resolveHandle`'s cache (design-v3 §5.11 step 4): how many answers are
@@ -418,6 +442,62 @@ impl DidLookup for RequestLookup {
         }
         outcome
     }
+
+    /// One `POST /accounts` per [`Lodestar::batch_max`] DIDs not yet
+    /// summarized (§2.10): only for a public request, with lodestar set and
+    /// its gate open, one token of lodestar's bucket per call. It draws
+    /// nothing from the requester's identity share and never marks the
+    /// request spent (review 1, LB1, LB2); what it cannot fill, the per-DID
+    /// path resolves as before.
+    async fn prefetch(&self, req: &Requester, dids: &[String]) {
+        use crate::net::FetchMode;
+
+        let Some(bucket) = &self.lodestar else {
+            return;
+        };
+        if req.intent() != crate::net::Intent::Public {
+            return;
+        }
+        let Some(lodestar) = self.resolver.for_request(req).public_lodestar() else {
+            return;
+        };
+        let mut wanted: Vec<String> = Vec::new();
+        for did in dids {
+            if did.starts_with("did:plc:")
+                && crate::identity::parse_did(did).is_ok()
+                && !wanted.contains(did)
+                && self.summaries.get(did).await.is_none()
+            {
+                wanted.push(did.clone());
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        if !lodestar.gate().is_open() {
+            metrics::counter!(crate::identity::lodestar::METRIC_SKIPPED, "reason" => "gate_closed").increment(1);
+            return;
+        }
+        let mut filled = 0u64;
+        for chunk in wanted.chunks(lodestar.batch_max()) {
+            if bucket.quiet_draw(req.key()).is_err() {
+                metrics::counter!(crate::identity::lodestar::METRIC_SKIPPED, "reason" => "no_budget").increment(1);
+                break;
+            }
+            let Some(found) = lodestar.accounts(chunk, Some(req.deadline())).await else {
+                break;
+            };
+            for did in chunk {
+                if let Some(Ok(account)) = found.get(did)
+                    && let Some(summary) = batch_summary(account)
+                {
+                    self.summaries.insert(did.clone(), summary).await;
+                    filled += 1;
+                }
+            }
+        }
+        metrics::counter!(crate::identity::lodestar::METRIC_BATCH_FILLED).increment(filled);
+    }
 }
 
 /// DID → routing decision, with the `route` cache. Cheap to clone.
@@ -466,6 +546,25 @@ impl Router {
             self.cache.insert(did.to_string(), decision.clone()).await;
         }
         decision
+    }
+
+    /// Warm the lookups of `dids` that the `route` cache does not answer
+    /// (lodestar-reads design §2.10): a request about to route several
+    /// authors calls this first. A viewer-private request's route cache is
+    /// not read, and its lookup does nothing here.
+    pub async fn prefetch(&self, req: &Requester, dids: &[String]) {
+        if req.is_viewer_private() {
+            return;
+        }
+        let mut missing = Vec::new();
+        for did in dids {
+            if self.cache.get(did).await.is_none() {
+                missing.push(did.clone());
+            }
+        }
+        if !missing.is_empty() {
+            self.lookup.prefetch(req, &missing).await;
+        }
     }
 
     /// The cached home network of `did`, if the `route` cache holds one: a

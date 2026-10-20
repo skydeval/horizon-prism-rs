@@ -147,6 +147,16 @@ pub fn check_document_id(doc: &Value, did: &str) -> Result<(), IdentityError> {
     }
 }
 
+/// A PDS endpoint as the AppView keeps it: an absolute URL with a host,
+/// without a trailing `/`. The one rule for a document's endpoint and for
+/// one lodestar reports (lodestar-reads design §2.10).
+#[must_use]
+pub fn normalize_pds(endpoint: &str) -> Option<String> {
+    url::Url::parse(endpoint)
+        .is_ok_and(|u| u.host_str().is_some())
+        .then(|| endpoint.trim_end_matches('/').to_string())
+}
+
 /// Extract the PDS endpoint and claimed handle.
 #[must_use]
 pub fn extract_info(doc: &Value, did: &str) -> DidDocInfo {
@@ -163,8 +173,7 @@ pub fn extract_info(doc: &Value, did: &str) -> DidDocInfo {
             })
         })
         .and_then(|s| s.get("serviceEndpoint").and_then(Value::as_str))
-        .filter(|e| url::Url::parse(e).is_ok_and(|u| u.host_str().is_some()))
-        .map(|e| e.trim_end_matches('/').to_string());
+        .and_then(normalize_pds);
     let claimed_handle = doc
         .get("alsoKnownAs")
         .and_then(Value::as_array)
@@ -356,6 +365,12 @@ impl IdentityResolver {
             deadline: Some(deadline),
             ..self.clone()
         }
+    }
+
+    /// Lodestar, when this view may ask it, for a batch (§2.10).
+    #[must_use]
+    pub fn public_lodestar(&self) -> Option<Arc<Lodestar>> {
+        self.lodestar.clone().filter(|_| self.intent == Intent::Public)
     }
 
     /// Lodestar, when this view may ask it: it carries one and its intent

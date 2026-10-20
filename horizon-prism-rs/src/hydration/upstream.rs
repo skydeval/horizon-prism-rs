@@ -638,6 +638,10 @@ impl UpstreamSource for RealUpstreamSource {
                 by_author.entry(a.to_string()).or_default().push(uri.clone());
             }
         }
+        // Every author's route at once, when lodestar is set
+        // (lodestar-reads design §2.10).
+        let authors: Vec<String> = by_author.keys().cloned().collect();
+        self.router.prefetch(req, &authors).await;
         for (author, group) in &by_author {
             // Once a share or pool is empty, the remaining posts are left
             // out (design-v3 §II-8.3: list items are omitted).

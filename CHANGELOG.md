@@ -10,6 +10,26 @@ commit.
 
 ## [Unreleased]
 
+### Added (lodestar identity reads S4, #752)
+
+Lodestar-reads design §2.10 (`docs/internal/design/lodestar-reads.md`).
+
+- **Pages that route many accounts ask lodestar for them in one call.**
+  Before the upstream posts of a page are fetched author by author, and
+  before Thread Lens reads a level of replies or its stubs, the accounts the
+  route cache does not know are sent to lodestar's `POST /accounts` in
+  chunks of up to 1000. An account lodestar reports active, with a usable
+  PDS and either a verified handle or no claimed handle, is summarized from
+  that answer; every other account (unknown, catching up, tombstoned, a
+  handle not yet verified, `did:web`) is resolved one by one as before, with
+  its fallbacks.
+- Only for public requests, only while lodestar is at the directory's tip,
+  one token of lodestar's bucket per call. A batch draws nothing from the
+  requester's identity share and never ends a request early: a page names
+  more authors than one requester may resolve, and most of a reply level's
+  authors are never resolved at all. A failed or stale batch fills nothing.
+- Metric: `lodestar_batch_filled_total`.
+
 ### Added (lodestar identity reads S3, #751)
 
 Lodestar-reads design §2.2 to §2.9, §2.11 (`docs/internal/design/lodestar-reads.md`).

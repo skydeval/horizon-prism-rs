@@ -367,6 +367,15 @@ impl Work<'_> {
                 _ => None,
             })
             .collect();
+        // The routes of the stubs' authors at once, when lodestar is set
+        // (lodestar-reads design §2.10).
+        let authors: Vec<String> = stubs
+            .iter()
+            .filter_map(|(_, uri)| uri_author(uri))
+            .filter(|author| self.judge.verdict(author) == Some(Verdict::Clear))
+            .map(str::to_string)
+            .collect();
+        self.ladder.router().prefetch(self.r.req, &authors).await;
         for (i, uri) in stubs {
             match self.judge.verdict(uri_author(&uri).unwrap_or_default()) {
                 Some(Verdict::Clear) => {
@@ -545,6 +554,11 @@ impl Work<'_> {
                 .collect();
             let judged = self.judge.round(&authors).await?;
             self.refresh_known();
+            // The level's authors' routes at once, when lodestar is set
+            // (lodestar-reads design §2.10).
+            if judged {
+                self.ladder.router().prefetch(self.r.req, &authors).await;
+            }
             let parents: Vec<String> = read.iter().map(|seq| seq.parent.clone()).collect();
             let local_parents = self.ladder.hydrator().lens_local_rows(&parents).await?;
             for seq in read {
