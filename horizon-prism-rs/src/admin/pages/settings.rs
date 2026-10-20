@@ -360,7 +360,9 @@ pub async fn group(
     )
 }
 
-fn phase_words(mode: PublicMode) -> &'static str {
+/// The public-data phase in words (§6.3); Health and Home say it too.
+#[must_use]
+pub fn phase_words(mode: PublicMode) -> &'static str {
     match mode {
         PublicMode::On => "on",
         PublicMode::Filling => "filling: public data is being refilled, and public requests come back when it is done",

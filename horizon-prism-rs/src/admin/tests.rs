@@ -7,6 +7,9 @@
 mod feed;
 // The settings pages (admin-ui design §6.3, §8).
 mod settings_pages;
+// Health, Jobs, Problems, Blocks and Home's tiles (admin-ui design §6.1,
+// §6.4, §6.6-§6.8, §9).
+mod health_pages;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -158,6 +161,10 @@ async fn harness(name: &str) -> Option<Harness> {
 }
 
 async fn harness_with(name: &str, timing: live::Timing, snippets: bool) -> Option<Harness> {
+    harness_full(name, timing, snippets, health::HealthInputs::default()).await
+}
+
+async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: health::HealthInputs) -> Option<Harness> {
     let db = fresh_db(name).await?;
     let identity = Arc::new(StubIdentity::default());
     let oauth = Arc::new(StubAs::default());
@@ -182,7 +189,8 @@ async fn harness_with(name: &str, timing: live::Timing, snippets: bool) -> Optio
         Arc::clone(&oauth) as Arc<dyn FetchHandler>,
         settings,
         hub.clone(),
-    );
+    )
+    .with_health(inputs);
     let (auth, drainer) = verifier(StubFetcher::default(), 10, 4);
     let app = AppState {
         hydrator: crate::hydration::testing::hydrator(&db.pool, ScopeSets::default()),
@@ -817,11 +825,17 @@ async fn t_a16_headers_everywhere() {
         "/admin/settings/access",
         "/admin/settings/installed",
         "/admin/settings/running",
+        "/admin/health",
+        "/admin/jobs",
+        "/admin/problems",
+        "/admin/farsight",
         "/admin/nowhere",
         "/admin/login",
         js,
         css,
     ] {
+        // Under the ten-pages-a-second limit (§5.6).
+        tokio::time::sleep(Duration::from_millis(120)).await;
         let page = alice.send(alice.http.get(format!("{}{path}", h.base)).header("origin", "https://elsewhere.example")).await;
         let csp = if path == "/admin" { CSP_LIVE } else { CSP };
         assert_headers_with(&page.headers, path, csp);

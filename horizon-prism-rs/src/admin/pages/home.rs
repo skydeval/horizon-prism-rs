@@ -1,6 +1,9 @@
-//! Home (`/admin`, admin-ui design §6.1): the members' counts in a narrow
-//! column beside the live feed (admin-ui-live-feed design §5); the health
-//! tiles and attention list come with S3. The script fills the feed;
+//! Home (`/admin`, admin-ui design §6.1): what needs attention first (the
+//! red and amber checks of §9.2, each linking to where to act), then the
+//! tiles in a narrow column beside the live feed (admin-ui-live-feed design
+//! §5): members, public data, the network stream, the database against its
+//! budget, Farsight and the last five commands. The fullest disk comes with
+//! the stats slice (S4). The script fills the feed;
 //! without JavaScript the section shows the totals since Prism started
 //! and the last minute's rates, and the page reloads
 //! itself every 30 seconds to `/admin?auto=1`, a [`Need::Poll`].
@@ -17,8 +20,10 @@ use axum::response::Response;
 use chrono::Utc;
 use serde::Deserialize;
 
-use super::{Nav, css, render};
-use crate::admin::auth::{Need, require};
+use super::health::CheckView;
+use super::{COMMAND_COLUMNS, CommandRow, CommandTuple, Nav, css, render};
+use crate::admin::auth::{Banners, Need, banners, require};
+use crate::admin::health::gather;
 use crate::admin::live::{STAT_SLOTS, since_words};
 use crate::admin::{AdminState, JS_HREF, LivePage};
 use crate::firehose::feed::{Outcome, Source, Totals};
@@ -29,6 +34,19 @@ pub struct Tiles {
     pub ready: i64,
     pub max_members: u64,
     pub denied: i64,
+    /// Public data: on, filling, draining, off, held.
+    pub public: &'static str,
+    /// The network stream: up to date, or how far behind.
+    pub stream: String,
+    /// The database against its budget.
+    pub database: String,
+    pub farsight: &'static str,
+    /// The last five commands.
+    pub commands: Vec<CommandRow>,
+    /// The checks that need attention, worst first.
+    pub attention: Vec<CheckView>,
+    /// Checks with nothing to judge by yet.
+    pub no_data: usize,
     /// `HH:MM:SS`, UTC.
     pub as_of: String,
 }
@@ -169,18 +187,32 @@ pub fn reason_words(o: Outcome) -> &'static str {
     }
 }
 
-async fn load_tiles(state: &AdminState) -> Result<Tiles, sqlx::Error> {
+async fn load_tiles(state: &AdminState, banners: Banners) -> Result<Tiles, sqlx::Error> {
     let (members, ready, denied): (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM members), (SELECT count(*) FROM members WHERE ready_at IS NOT NULL), \
          (SELECT count(*) FROM member_denials)",
     )
     .fetch_one(&state.pool)
     .await?;
+    let commands: Vec<CommandTuple> = sqlx::query_as(&format!(
+        "SELECT {COMMAND_COLUMNS} FROM admin_commands c LEFT JOIN actors a ON a.did = c.requested_by ORDER BY c.id DESC LIMIT 5"
+    ))
+    .fetch_all(&state.pool)
+    .await?;
+    let (attention, no_data) = super::health::attention(gather(state, banners).await);
+    let now = state.health.now();
     Ok(Tiles {
         members,
         ready,
         max_members: state.members().max_members,
         denied,
+        public: super::health::public_word(state.scope.public_mode()),
+        stream: super::health::stream_words(now.as_ref()),
+        database: super::health::database_words(state, now.as_ref()),
+        farsight: super::health::farsight_words(state),
+        commands: commands.into_iter().map(CommandRow::from_tuple).collect(),
+        attention,
+        no_data,
         as_of: Utc::now().format("%H:%M:%S").to_string(),
     })
 }
@@ -247,7 +279,16 @@ pub async fn page(
         Ok(op) => op,
         Err(response) => return response,
     };
-    let tiles = match load_tiles(&state).await {
+    // A poll carries no banners; the Settings check needs them.
+    let b = if need == Need::Poll {
+        match banners(&state).await {
+            Ok(b) => b,
+            Err(e) => return super::internal_error(&state, &e),
+        }
+    } else {
+        op.banners
+    };
+    let tiles = match load_tiles(&state, b).await {
         Ok(t) => t,
         Err(e) => return super::internal_error(&state, &e),
     };
@@ -260,7 +301,7 @@ pub async fn page(
         &HomePage {
             css: css(),
             js: JS_HREF.as_str(),
-            nav: Some(Nav::new(&op, "home")),
+            nav: Some(Nav { banners: b, ..Nav::new(&op, "home") }),
             title: "Home".to_string(),
             tiles,
             live: live_section(&state),
@@ -278,7 +319,11 @@ pub async fn tiles(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
     if let Err(response) = require(&state, &headers, peer, Need::Poll, None).await {
         return response;
     }
-    match load_tiles(&state).await {
+    let b = match banners(&state).await {
+        Ok(b) => b,
+        Err(e) => return super::internal_error(&state, &e),
+    };
+    match load_tiles(&state, b).await {
         Ok(tiles) => render(StatusCode::OK, &TilesFragment { tiles }),
         Err(e) => super::internal_error(&state, &e),
     }

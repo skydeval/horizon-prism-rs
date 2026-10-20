@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+
+<h2>The network stream</h2>
+<div class="card">
+{% for s in stream %}<p>{{ s }}</p>
+{% endfor %}
+</div>
+
+<h2>Records Prism could not process</h2>
+<p class="muted">Records from the network that Prism tried several times and could not store. "Try again" reads the
+record from its author's server and stores it; "Dismiss" takes it off this list.</p>
+{% if let Some(rows) = letters %}
+{% if rows.is_empty() %}<p class="muted">None. Every record was processed.</p>{% else %}
+<p class="muted">The {{ rows.len() }} most recent.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>When</th><th>Account</th><th>What</th><th>What went wrong</th><th></th></tr></thead>
+<tbody>
+{% for d in rows %}
+<tr>
+<td>{{ d.when }}</td>
+<td><code>{{ d.account }}</code></td>
+<td>{{ d.kind }}{% if !d.path.is_empty() %}<br><span class="muted tech">{{ d.path }}</span>{% endif %}</td>
+<td>{{ d.error }}</td>
+<td class="actions">
+{% if !d.path.is_empty() %}<form class="inline" method="post" action="/admin/problems/replay"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ d.id }}"><button class="secondary" type="submit">Try again</button></form>{% endif %}
+<form class="inline" method="post" action="/admin/problems/dismiss"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ d.id }}"><button class="secondary" type="submit">Dismiss…</button></form>
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+{% else %}
+<div class="banner">Prism could not read this list just now. Reload the page in a moment.</div>
+{% endif %}
+{% endblock %}

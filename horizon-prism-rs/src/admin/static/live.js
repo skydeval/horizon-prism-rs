@@ -353,7 +353,8 @@
   kindSel.addEventListener('change', refilter);
   sourceSel.addEventListener('change', refilter);
 
-  // The tiles, every 30 seconds, without reloading the page (§5.4).
+  // The tiles and the attention list, every 30 seconds, without reloading
+  // the page (§5.4).
   function refreshTiles() {
     if (stopped || !tiles) return;
     fetch('/admin/tiles', { credentials: 'same-origin', cache: 'no-store' }).then(function (res) {
@@ -364,11 +365,15 @@
       return res.text();
     }).then(function (text) {
       if (text === null || text === undefined) return;
-      var fresh = new DOMParser().parseFromString(text, 'text/html').getElementById('tiles');
-      if (!fresh) return;
-      var nodes = [];
-      fresh.childNodes.forEach(function (n) { nodes.push(document.importNode(n, true)); });
-      tiles.replaceChildren.apply(tiles, nodes);
+      var doc = new DOMParser().parseFromString(text, 'text/html');
+      ['attention', 'tiles'].forEach(function (id) {
+        var here = document.getElementById(id);
+        var fresh = doc.getElementById(id);
+        if (!here || !fresh) return;
+        var nodes = [];
+        fresh.childNodes.forEach(function (n) { nodes.push(document.importNode(n, true)); });
+        here.replaceChildren.apply(here, nodes);
+      });
     }).catch(function () { /* the next refresh tries again */ });
   }
 

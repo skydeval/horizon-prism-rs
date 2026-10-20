@@ -38,6 +38,57 @@ fn int(v: Option<&Value>) -> Option<i64> {
     }
 }
 
+/// The stream and its reader group, read for the admin UI's Problems page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamInfo {
+    pub length: Option<i64>,
+    /// The first entry's id, `None` when the stream is empty.
+    pub first_entry_id: Option<String>,
+    /// `None`: the group is absent.
+    pub group: Option<GroupInfo>,
+}
+
+/// A reader group's state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupInfo {
+    pub pending: Option<i64>,
+    pub last_delivered_id: Option<String>,
+    /// `entries-added − entries-read`, the value the gap check uses; `None`
+    /// when Redis cannot say (a gap).
+    pub lag: Option<i64>,
+}
+
+fn id(v: Option<&Value>) -> Option<String> {
+    Some(show(v)).filter(|s| s != "nil")
+}
+
+/// Read stream and group state.
+///
+/// # Errors
+///
+/// Redis errors (for example, a missing stream).
+pub async fn read(redis: &mut ConnectionManager, stream: &str, group: &str) -> Result<StreamInfo, String> {
+    let info: Value = redis::cmd("XINFO").arg("STREAM").arg(stream).query_async(redis).await.map_err(|e| e.to_string())?;
+    let s = fields(&info);
+    let groups: Value = redis::cmd("XINFO").arg("GROUPS").arg(stream).query_async(redis).await.map_err(|e| e.to_string())?;
+    let found = match &groups {
+        Value::Array(list) => list.iter().map(fields).find(|g| get(g, "name").and_then(string).as_deref() == Some(group)),
+        _ => None,
+    };
+    Ok(StreamInfo {
+        length: int(get(&s, "length")),
+        first_entry_id: id(get(&s, "first-entry")),
+        group: found.map(|g| GroupInfo {
+            pending: int(get(&g, "pending")),
+            last_delivered_id: id(get(&g, "last-delivered-id")),
+            lag: match (int(get(&s, "entries-added")), int(get(&g, "entries-read"))) {
+                (Some(a), Some(r)) => Some(a - r),
+                _ => None,
+            },
+        }),
+    })
+}
+
 /// Render stream and group state.
 ///
 /// # Errors
@@ -117,6 +168,12 @@ mod tests {
         assert!(out.contains("lag (computed): 3"), "{out}");
         let absent = render(&mut c, &stream, "nope").await.expect("render");
         assert!(absent.contains("group nope: absent"));
+        let info = read(&mut c, &stream, "g").await.expect("read");
+        assert_eq!(info.length, Some(3));
+        assert!(info.first_entry_id.is_some());
+        assert_eq!(info.group.as_ref().and_then(|g| g.lag), Some(3));
+        assert_eq!(info.group.as_ref().and_then(|g| g.last_delivered_id.clone()), Some("0-0".to_string()));
+        assert_eq!(read(&mut c, &stream, "nope").await.expect("read").group, None);
         let _: () = redis::cmd("DEL").arg(&stream).query_async(&mut c).await.expect("del");
     }
 }

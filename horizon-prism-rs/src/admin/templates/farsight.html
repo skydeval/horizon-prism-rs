@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Farsight tells Prism which block lists apply between accounts, so a block made through a list is
+respected everywhere Prism shows posts.</p>
+{% if !configured %}
+<div class="banner">Farsight is not set up on this Prism: no Farsight address was given when Prism was installed, so
+blocks made through lists are not applied.</div>
+{% else %}
+<div class="card">
+<h2>Farsight</h2>
+{% if answering %}
+<p class="ok">Farsight is answering.</p>
+{% for f in report %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+{% if !raw.is_empty() %}<details><summary>Farsight's own figures</summary><pre>{{ raw }}</pre></details>{% endif %}
+{% else %}
+<p class="bad">Farsight did not answer just now ({{ reason }}). Blocks made through lists may be missing until it does.</p>
+{% endif %}
+<p class="muted">Asked at most every 30 seconds.</p>
+</div>
+<div class="grid">
+<div class="card">
+<h3>What Prism holds</h3>
+{% for f in local %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+</div>
+<div class="card">
+<h3>When Farsight is down</h3>
+{% for f in fallback %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+{% for f in memory %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+<p><a href="/admin/settings/blocks">Fallback and memory settings</a></p>
+</div>
+</div>
+{% endif %}
+{% endblock %}

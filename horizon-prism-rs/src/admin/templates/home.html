@@ -8,6 +8,9 @@
 page you can keep yours or take the file's.
 {% for n in notices %}<br><a href="{{ n.href }}">{{ n.name }}</a>: {{ n.text }}{% endfor %}</div>
 {% endif %}
+<div id="attention">
+{% include "attention.html" %}
+</div>
 <div class="home-row">
 <div class="home-side" id="tiles">
 {% include "tiles.html" %}

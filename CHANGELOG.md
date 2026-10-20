@@ -10,6 +10,50 @@ commit.
 
 ## [Unreleased]
 
+### Added (admin UI S3: health, jobs, problems, blocks, #755)
+
+Admin-ui design §6.1, §6.4, §6.6 to §6.8, §9 (`docs/internal/design/admin-ui.md`).
+
+- **Health** at `/admin/health`: the checks of §9.2 in plain words (database,
+  Redis, the audit guard, the stream reader, a held gap, the backlog, each
+  relay's delay, unprocessed records, dropped stream records, the database
+  budget, Redis memory, failed jobs, members not ready after a day, stuck
+  private sync, Farsight down, Farsight refusing the token, the fallback
+  withheld, the public-data clean-up stalled, settings set aside or waiting
+  for a restart, search still being prepared), each red, amber, a note,
+  fine, or "no data", never fine when its input is missing. Then the key
+  figures: relay delays, records waiting and processed per second, the
+  database and Redis against their limits, public data and a refill's
+  progress, search preparation, Farsight and lodestar, and private posts
+  read in the new and the older form, unreadable ones in the last hour, and
+  where ingest took quotes and mentions from. "Re-sync private data and
+  members" (typed `RESYNC`) sits beside a held gap. The page reloads every
+  30 seconds; its reload does not keep the session alive.
+- **Jobs** at `/admin/jobs`: sync jobs by kind and state, the 100 newest
+  failed ones with "try again" (a `backfill` of the same kind; subscribed
+  lists retry on their own), the nightly clean-up of the accounts Prism
+  follows (last and next run, failed runs, the weekly count repair), "Check"
+  (`scope rebuild --dry-run`, changes nothing) and "Clean up now" (typed
+  `REBUILD`), and a public-data refill's progress. The counts run under a
+  2-second statement timeout.
+- **Problems** at `/admin/problems`: the newest 100 records Prism could not
+  process, each with "try again" (`deadletter replay`) and "dismiss"
+  (`deadletter drop`, confirmed), and the network stream's state in words.
+- **Blocks (Farsight)** at `/admin/farsight`: Farsight's own report (asked at
+  most every 30 seconds), what Prism holds, the fallback and the memory of
+  blocks, with a link to their settings.
+- **Home** lists what needs attention first (the red and amber checks, each
+  linking to where to act) and gains tiles for public data, the network
+  stream, the database against its budget, Farsight and the last five
+  changes; the live feed's script refreshes the list with the tiles.
+- `serve` keeps the metrics recorder's handle and takes a snapshot of the
+  watched series every minute, the last hour kept in memory, so the checks
+  can ask "for five minutes" and "in the last hour". The metrics endpoint
+  is unchanged.
+- Command pages say the outcome of a clean-up check (how many accounts it
+  would keep, add and remove, and how many nightly runs that takes), a
+  re-sync, a job tried again and a dismissed record in words.
+
 ### Added (admin UI S2: settings and restart, #754, #742)
 
 Admin-ui design §6.3, §8, §11, §12 (`docs/internal/design/admin-ui.md`).

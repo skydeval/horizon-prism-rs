@@ -6,4 +6,19 @@
 <div class="stat"><span class="l" title="Denied accounts">Denied accounts</span><span class="n">{{ tiles.denied }}</span></div>
 <p><a href="/admin/members">Manage members</a></p>
 </div>
+<div class="card">
+<h2>Prism</h2>
+<div class="fact"><span class="l" title="Public data">Public data</span><span class="v">{{ tiles.public }}</span></div>
+<div class="fact"><span class="l" title="Network stream">Network stream</span><span class="v">{{ tiles.stream }}</span></div>
+<div class="fact"><span class="l" title="Database (of its budget)">Database</span><span class="v">{{ tiles.database }}</span></div>
+<div class="fact"><span class="l" title="Farsight (blocks)">Farsight</span><span class="v">{{ tiles.farsight }}</span></div>
+<p><a href="/admin/health">Health</a></p>
+</div>
+<div class="card">
+<h2>Last changes</h2>
+{% if tiles.commands.is_empty() %}<p class="muted">None yet.</p>{% endif %}
+{% for c in tiles.commands %}<p class="cmd"><a href="/admin/commands/{{ c.id }}">{{ c.what }}</a><br><span class="muted">{{ c.state_words() }} · {{ c.when }}</span></p>
+{% endfor %}
+<p><a href="/admin/audit">Audit log</a></p>
+</div>
 <p class="muted asof">As of {{ tiles.as_of }} UTC</p>

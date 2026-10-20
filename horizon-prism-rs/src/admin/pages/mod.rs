@@ -4,10 +4,14 @@
 
 pub mod audit;
 pub mod commands;
+pub mod farsight;
+pub mod health;
 pub mod home;
+pub mod jobs;
 pub mod login;
 pub mod members;
 pub mod operators;
+pub mod problems;
 pub mod settings;
 pub mod setup;
 
@@ -27,8 +31,8 @@ pub struct Nav {
     /// How the operator is named: handle, else DID.
     pub who: String,
     pub csrf: String,
-    /// The current screen: `home`, `members`, `settings`, `operators`,
-    /// `audit`.
+    /// The current screen: `home`, `members`, `settings`, `health`, `jobs`,
+    /// `problems`, `farsight`, `operators`, `audit`.
     pub current: &'static str,
     /// Changes waiting for a restart, and settings that could not be used.
     pub banners: Banners,
@@ -176,7 +180,8 @@ pub fn describe(command: &str, args: &Value) -> String {
         "operator host remove" => format!("Stop allowing sign-in from {}", arg(args, "pattern")),
         "label add" => format!("Add label {} to {}", arg(args, "val"), arg(args, "subject")),
         "label remove" => format!("Remove label {} from {}", arg(args, "val"), arg(args, "subject")),
-        "scope rebuild" => "Rebuild the set of accounts Prism follows".to_string(),
+        "scope rebuild" if args.get("dry_run") == Some(&Value::Bool(true)) => "Check the clean-up of the accounts Prism follows".to_string(),
+        "scope rebuild" => "Clean up the accounts Prism follows now".to_string(),
         "backfill" => format!("Sync {} again", arg(args, "did")),
         "resync" => "Re-sync private data and members".to_string(),
         "deadletter replay" => format!("Try record {} again", arg(args, "id")),
@@ -268,6 +273,28 @@ pub fn outcome(command: &str, state: &str, result: Option<&Value>) -> String {
             }
         }
         ("restart", _) => "Prism is restarting.".to_string(),
+        ("scope rebuild", _) if r.get("dry_run") == Some(&Value::Bool(true)) => {
+            let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let sweeps = n("sweeps");
+            format!(
+                "Checked; nothing was changed. {} accounts are still needed. The clean-up would add {} and remove {}{}.",
+                n("justified"),
+                n("would_add"),
+                n("would_purge"),
+                match sweeps {
+                    0 | 1 => String::new(),
+                    s => format!(", which takes {s} nightly runs"),
+                }
+            )
+        }
+        ("scope rebuild", _) => "Started. The clean-up runs in the background, as the nightly one does.".to_string(),
+        ("backfill", _) => "Queued. The sync runs in the background.".to_string(),
+        ("resync", _) => {
+            let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+            format!("Re-sync started: {} private-access checks and {} member re-syncs queued.", n("authz_jobs"), n("resync_jobs"))
+        }
+        ("deadletter replay", _) => "Tried again: the record was read from its server and processed.".to_string(),
+        ("deadletter drop", _) => "Dismissed.".to_string(),
         _ => "Done.".to_string(),
     }
 }
@@ -321,6 +348,18 @@ impl CommandRow {
     pub fn pending(&self) -> bool {
         matches!(self.state.as_str(), "queued" | "running")
     }
+
+    /// Its state in a word.
+    #[must_use]
+    pub fn state_words(&self) -> &str {
+        match self.state.as_str() {
+            "queued" => "waiting",
+            "running" => "running",
+            "done" => "done",
+            "failed" => "failed",
+            other => other,
+        }
+    }
 }
 
 /// The word a typed confirmation needs for an account (§5.5): its stored
@@ -364,6 +403,88 @@ pub struct ConfirmPage {
     pub error: Option<String>,
 }
 
+/// What a confirmation page says and sends (§5.5).
+pub struct Confirm<'a> {
+    pub title: &'a str,
+    pub what: String,
+    pub undo: &'a str,
+    pub action: &'a str,
+    pub hidden: Vec<Hidden>,
+    pub typed: Option<String>,
+    pub button: &'a str,
+}
+
+impl Confirm<'_> {
+    /// The page, for `op` on the screen `current`.
+    #[must_use]
+    pub fn page(self, op: &Operator, current: &'static str) -> ConfirmPage {
+        ConfirmPage {
+            css: css(),
+            nav: Some(Nav::new(op, current)),
+            title: self.title.to_string(),
+            what: self.what,
+            undo: self.undo.to_string(),
+            action: self.action.to_string(),
+            csrf: op.csrf.clone(),
+            hidden: self.hidden,
+            typed: self.typed,
+            button: self.button.to_string(),
+            error: None,
+        }
+    }
+}
+
+/// A hidden field.
+#[must_use]
+pub fn hidden_field(name: &str, value: &str) -> Hidden {
+    Hidden { name: name.to_string(), value: value.to_string() }
+}
+
+/// Run a confirmed action: the confirmation page on the first POST, its
+/// error when the typed word is wrong, else `None` (go ahead).
+#[must_use]
+pub fn confirmed(page: ConfirmPage, confirm: Option<&str>, typed: Option<&str>) -> Option<Response> {
+    if confirm != Some("yes") {
+        return Some(render(StatusCode::OK, &page));
+    }
+    if let Some(word) = page.typed.clone()
+        && !typed_matches(&word, typed)
+    {
+        let mut page = page;
+        page.error = Some(format!("Type {word} exactly to confirm."));
+        return Some(render(StatusCode::BAD_REQUEST, &page));
+    }
+    None
+}
+
+/// A byte count in words: "12.3 GB".
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn bytes(n: f64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+    let mut v = n.max(0.0);
+    let mut unit = 0;
+    while v >= 1000.0 && unit < UNITS.len() - 1 {
+        v /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{v:.0} {}", UNITS[0]) } else { format!("{v:.1} {}", UNITS[unit]) }
+}
+
+/// How long ago, in words.
+#[must_use]
+pub fn ago(t: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - t).num_seconds().max(0);
+    match secs {
+        0..60 => "just now".to_string(),
+        60..120 => "a minute ago".to_string(),
+        120..3600 => format!("{} minutes ago", secs / 60),
+        3600..7200 => "an hour ago".to_string(),
+        7200..172_800 => format!("{} hours ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -380,5 +501,10 @@ mod tests {
         assert!(typed_matches("alice.example.com", Some(" @Alice.Example.com ")));
         assert!(!typed_matches("alice.example.com", Some("bob")));
         assert!(!typed_matches("alice.example.com", None));
+        assert_eq!(bytes(512.0), "512 bytes");
+        assert_eq!(bytes(12_345_678_900.0), "12.3 GB");
+        let dry = json!({"dry_run": true, "justified": 10, "would_add": 1, "would_purge": 7000, "sweeps": 2});
+        assert_eq!(describe("scope rebuild", &json!({"dry_run": true})), "Check the clean-up of the accounts Prism follows");
+        assert!(outcome("scope rebuild", "done", Some(&dry)).contains("remove 7000, which takes 2 nightly runs"));
     }
 }

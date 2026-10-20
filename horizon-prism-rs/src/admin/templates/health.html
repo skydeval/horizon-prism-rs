@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block head %}<meta http-equiv="refresh" content="30;url=/admin/health?auto=1">{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Prism has been running since {{ started }}. This page reloads every 30 seconds.</p>
+{% if young %}<div class="banner">Prism started less than five minutes ago. Checks that look at the last few minutes say
+"No data" until Prism has watched that long.</div>{% endif %}
+
+<h2>Checks</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>Check</th><th>State</th><th>What it says</th></tr></thead>
+<tbody>
+{% for c in checks %}
+<tr>
+<td>{{ c.name }}</td>
+<td><span class="pill {{ c.class }}">{{ c.word }}</span></td>
+<td>{{ c.text }}{% if !c.href.is_empty() %} <a href="{{ c.href }}">{{ c.link }}</a>{% endif %}
+{% if c.resync %}<form class="inline" method="post" action="/admin/health/resync"><input type="hidden" name="csrf" value="{{ csrf }}"> <button class="secondary" type="submit">Re-sync private data and members…</button></form>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<p class="muted">"No data" means Prism has nothing to judge by yet, never that all is well.</p>
+
+<h2>Key figures</h2>
+<div class="grid">
+{% for g in groups %}
+<div class="card">
+<h3>{{ g.title }}</h3>
+{% for f in g.figures %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+{% if !g.note.is_empty() %}<p class="muted">{{ g.note }}</p>{% endif %}
+</div>
+{% endfor %}
+</div>
+{% endblock %}

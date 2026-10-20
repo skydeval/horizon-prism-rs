@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Sync jobs read accounts from their own servers: a new member's first sync, the accounts around members,
+private posts and who may see them, and subscribed lists. They run in the background and retry by themselves.</p>
+{% if !public.is_empty() %}<div class="banner">{{ public }}</div>{% endif %}
+
+<h2>Sync jobs</h2>
+{% if let Some(rows) = depths %}
+{% if rows.is_empty() %}<p class="muted">No sync jobs yet.</p>{% else %}
+<div class="scroll">
+<table>
+<thead><tr><th>Kind</th>{% for s in states %}<th>{{ s }}</th>{% endfor %}</tr></thead>
+<tbody>
+{% for r in rows %}
+<tr><td>{{ r.name }}<br><span class="muted tech">{{ r.tech }}</span></td>{% for c in r.counts %}<td>{{ c }}</td>{% endfor %}</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+{% else %}
+<div class="banner">Prism could not count the jobs in time. Reload the page in a moment.</div>
+{% endif %}
+
+<h2>Failed jobs</h2>
+{% if let Some(rows) = failed %}
+{% if rows.is_empty() %}<p class="muted">No job has failed.</p>{% else %}
+<p class="muted">The 100 most recent. "Try again" queues the same kind of sync for that account.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>Account</th><th>Kind</th><th>Tries</th><th>What went wrong</th><th>When</th><th></th></tr></thead>
+<tbody>
+{% for f in rows %}
+<tr>
+<td>{{ f.who }}{% if f.who != f.did %}<br><code>{{ f.did }}</code>{% endif %}</td>
+<td>{{ f.kind }}</td>
+<td>{{ f.attempts }}</td>
+<td>{{ f.error }}</td>
+<td>{{ f.when }}</td>
+<td class="actions">{% if f.retry %}<form class="inline" method="post" action="/admin/jobs/retry"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ f.did }}"><input type="hidden" name="depth" value="{{ f.depth }}"><button class="secondary" type="submit">Try again</button></form>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+{% endif %}
+
+<h2>Clean-up of the accounts Prism follows</h2>
+<div class="card">
+<p>Every night Prism stops following accounts it no longer needs: no member follows them, has interacted with them
+lately, or subscribes to a list of theirs. Their stored public data is deleted at the daily clean-up an hour later.</p>
+<div class="fact"><span class="l">Last run</span><span class="v">{{ sweep.last }}</span></div>
+<div class="fact"><span class="l">Next run</span><span class="v">{{ sweep.next }}</span></div>
+<div class="fact"><span class="l">Most accounts removed in one run</span><span class="v">{{ sweep.cap }}</span></div>
+<div class="fact"><span class="l">Runs that failed since Prism started</span><span class="v">{{ sweep.failed }}</span></div>
+<div class="fact"><span class="l">Weekly count repair, last run</span><span class="v">{{ sweep.weekly }}</span></div>
+<div class="row">
+<form class="inline" method="post" action="/admin/jobs/scope-check"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="secondary" type="submit">Check (changes nothing)</button></form>
+<form class="inline" method="post" action="/admin/jobs/scope-rebuild"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="secondary" type="submit">Clean up now…</button></form>
+</div>
+<p class="muted">"Check" counts what the next clean-up would add and remove, and changes nothing. The timing and the limit
+are in <a href="/admin/settings/storage">What Prism stores</a>.</p>
+</div>
+{% endblock %}

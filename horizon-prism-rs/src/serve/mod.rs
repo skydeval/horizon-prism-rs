@@ -177,15 +177,21 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .and_then(|text| text.parse().map_err(|e: toml::de::Error| e.to_string()))
         .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {}: {e}", config_path.display())))?;
     init_tracing(&cfg.env.log_level);
-    PrometheusBuilder::new()
+    // The recorder's handle is kept, so the admin UI can read the metrics
+    // back in process (admin-ui design §9.1); `build` also spawns the
+    // upkeep task, and the exporter is spawned here as `install` did.
+    let (recorder, exporter) = PrometheusBuilder::new()
         .with_http_listener(cfg.file.metrics.bind)
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(crate::private_tier::handlers::METRIC_UNFLOORED.to_string()),
             &crate::private_tier::handlers::unfloored_buckets(),
         )
         .map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?
-        .install()
+        .build()
         .map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?;
+    let metrics_handle = recorder.handle();
+    tokio::spawn(exporter);
+    metrics::set_global_recorder(recorder).map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?;
     #[cfg(feature = "standin-hosts")]
     metrics::gauge!("standin_hosts_build").set(1.0);
     // A bench build refuses to start without its heads file (private-threads
@@ -392,6 +398,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
         }
         _ => None,
     };
+    // The admin UI's Blocks page reads Farsight's status (admin-ui §6.8).
+    let health_farsight = farsight.clone();
     // The memory's load (§5.14.18.1), before the first task: the purge
     // hook is made from what it returns, so no purge can clear a viewer
     // while rows are read and not yet installed.
@@ -866,6 +874,16 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // The one-time re-sync that fetches the new collections of DIDs known
     // before the upgrade (design-v3 §12.3).
     tasks.push(crate::firehose::v3_resync::spawn(pool.clone()));
+    // What the admin UI's Health reads (admin-ui design §9).
+    let admin_health = crate::admin::health::HealthInputs {
+        metrics: Some(Arc::new(metrics_handle) as Arc<dyn crate::admin::health::MetricsText>),
+        ring: Arc::default(),
+        redis: Some(redis.clone()),
+        consumer: Some(Arc::clone(&status)),
+        audit: Some(AuditLatch::from_flag(glue.audit_latched())),
+        schema: Some(schema_status.clone()),
+        farsight: health_farsight,
+    };
     let state = HealthState {
         pool: pool.clone(),
         redis,
@@ -928,8 +946,10 @@ pub async fn run() -> Result<Stopped, StartupError> {
             Arc::new(crate::admin::oauth::NetFetch(nets.public().client().clone())),
             crate::admin::AdminSettings::from_config(&cfg, settings),
             hub.clone(),
-        );
+        )
+        .with_health(admin_health);
         tasks.push(admin.spawn_housekeeping());
+        tasks.push(admin.spawn_snapshots());
         tasks.push(hub.spawn_sampler());
         crate::admin::router(admin)
     } else {

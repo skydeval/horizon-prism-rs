@@ -200,7 +200,11 @@ pub struct Banners {
 }
 
 /// The banners now: one small read of the saved settings.
-async fn banners(state: &AdminState) -> Result<Banners, sqlx::Error> {
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn banners(state: &AdminState) -> Result<Banners, sqlx::Error> {
     use super::settings::store;
     let saved = store::rows(&state.pool).await?;
     let s = &state.settings;

@@ -152,14 +152,16 @@ pub fn body(db: bool, redis: bool, audit_ok: bool, watermarks: &Watermarks, gap_
     }
 }
 
-async fn probe_db(pool: &PgPool, within: Duration) -> bool {
+/// `SELECT 1` within `within`; the admin UI's Health reads it too.
+pub(crate) async fn probe_db(pool: &PgPool, within: Duration) -> bool {
     matches!(
         tokio::time::timeout(within, sqlx::query("SELECT 1").execute(pool)).await,
         Ok(Ok(_))
     )
 }
 
-async fn probe_redis(redis: &ConnectionManager, within: Duration) -> bool {
+/// `PING` within `within`; the admin UI's Health reads it too.
+pub(crate) async fn probe_redis(redis: &ConnectionManager, within: Duration) -> bool {
     let mut conn = redis.clone();
     let ping = redis::cmd("PING");
     matches!(

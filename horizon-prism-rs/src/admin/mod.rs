@@ -4,7 +4,9 @@
 //! (#735), the audit log and the operators page; and Home's live feed of
 //! what Prism indexes (admin-ui-live-feed.md). Slice S2: the settings
 //! pages, the saved settings layered over `app.toml`, the live values and
-//! the restart (`settings`, `pages::settings`).
+//! the restart (`settings`, `pages::settings`). Slice S3: Health, Jobs,
+//! Problems and Blocks (Farsight), the checks and Home's tiles over the
+//! in-process metrics (`health`).
 //!
 //! Served by `serve` itself on its own origin, merged before
 //! `xrpc::router::finalize`, so it sits inside the global per-IP limit
@@ -15,6 +17,7 @@
 //! same code as the CLI's. Reads query the database directly.
 
 pub mod auth;
+pub mod health;
 pub mod live;
 pub mod oauth;
 pub mod operators;
@@ -132,6 +135,11 @@ pub struct Inner {
     pub limits: Limits,
     /// The live feed's hub (admin-ui-live-feed design §4).
     pub live: live::Hub,
+    /// What Health, Jobs, Problems and Blocks read (§9); empty until
+    /// [`AdminState::with_health`].
+    pub health: health::HealthInputs,
+    /// Farsight's own report, kept 30 seconds (§6.8).
+    pub farsight_report: pages::farsight::ReportCache,
 }
 
 /// The admin router's state. Cheap to clone.
@@ -173,7 +181,20 @@ impl AdminState {
             settings: settings.settings,
             limits: Limits::default(),
             live,
+            health: health::HealthInputs::default(),
+            farsight_report: pages::farsight::ReportCache::default(),
         }))
+    }
+
+    /// The same state, reading `inputs` for Health and its sibling pages.
+    /// Call it before the state is cloned.
+    #[must_use]
+    pub fn with_health(mut self, inputs: health::HealthInputs) -> Self {
+        match Arc::get_mut(&mut self.0) {
+            Some(inner) => inner.health = inputs,
+            None => tracing::error!(event = "admin_health_not_set", "the admin state was shared before its health inputs were set"),
+        }
+        self
     }
 
     /// `[community]` as it applies now.
@@ -287,6 +308,16 @@ pub fn router(state: AdminState) -> Router {
         .route("/settings/public-scope", route(post(pages::settings::public_scope)))
         .route("/settings/{group}", route(get(pages::settings::group).post(pages::settings::save)))
         .route("/restart", route(post(pages::settings::restart)))
+        .route("/health", route(get(pages::health::page)))
+        .route("/health/resync", route(post(pages::health::resync)))
+        .route("/jobs", route(get(pages::jobs::page)))
+        .route("/jobs/retry", route(post(pages::jobs::retry)))
+        .route("/jobs/scope-check", route(post(pages::jobs::scope_check)))
+        .route("/jobs/scope-rebuild", route(post(pages::jobs::scope_rebuild)))
+        .route("/problems", route(get(pages::problems::page)))
+        .route("/problems/replay", route(post(pages::problems::replay)))
+        .route("/problems/dismiss", route(post(pages::problems::dismiss)))
+        .route("/farsight", route(get(pages::farsight::page)))
         .fallback(pages::not_found)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(headers))

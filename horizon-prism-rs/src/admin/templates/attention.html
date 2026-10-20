@@ -1,0 +1,13 @@
+{% if tiles.attention.is_empty() %}
+{% if tiles.no_data == 0 %}<p class="banner ok">Nothing needs attention. <a href="/admin/health">All checks</a></p>
+{% else %}<p class="banner">No problem found so far, but {{ tiles.no_data }} check{% if tiles.no_data == 1 %} has{% else %}s have{% endif %} no data yet. <a href="/admin/health">All checks</a></p>{% endif %}
+{% else %}
+<div class="card">
+<h2>Needs attention</h2>
+<ul class="attention">
+{% for c in tiles.attention %}<li><span class="pill {{ c.class }}">{{ c.word }}</span>{{ c.text }}{% if !c.href.is_empty() %} <a href="{{ c.href }}">{{ c.link }}</a>{% endif %}</li>
+{% endfor %}
+</ul>
+<p class="muted"><a href="/admin/health">All checks</a></p>
+</div>
+{% endif %}
