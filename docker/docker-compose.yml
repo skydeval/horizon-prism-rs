@@ -91,6 +91,12 @@ services:
     volumes:
       - app-data:/app/data
       - ./config/app.toml:/app/config/app.toml:ro
+      # Read-only, for the admin UI's disk figures only: Prism reads the
+      # size and free space of the disks holding Postgres and Redis
+      # (statvfs) and opens nothing there. An override that moves db-data
+      # or redis-data to a host path mounts that path here instead.
+      - db-data:/app/volumes/postgres:ro
+      - redis-data:/app/volumes/redis:ro
     ports:
       - "127.0.0.1:3030:3030"
       - "127.0.0.1:9091:9091"

@@ -5,8 +5,10 @@
 //! counts and storage bound ([`gauges`]). Every 30 s: Redis
 //! `INFO memory`. Budget and Redis-memory warnings are logged once per sample.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -153,8 +155,22 @@ pub async fn sample_db(pool: &PgPool, budget_bytes: u64) -> Result<DbSample, sql
     })
 }
 
+/// When the last database sample was exported, in unix milliseconds; 0 for
+/// never in this process. The admin stats page says "as of" this time.
+static LAST_DB_SAMPLE_MS: AtomicI64 = AtomicI64::new(0);
+
+/// When the last database sample was exported in this process.
+#[must_use]
+pub fn last_db_sample() -> Option<DateTime<Utc>> {
+    match LAST_DB_SAMPLE_MS.load(Ordering::Relaxed) {
+        0 => None,
+        ms => DateTime::from_timestamp_millis(ms),
+    }
+}
+
 /// Export a database sample and log budget warnings.
 pub fn record_db_sample(sample: &DbSample, budget_bytes: u64) {
+    LAST_DB_SAMPLE_MS.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
     for t in &sample.tables {
         metrics::gauge!(METRIC_TABLE_ROWS, "table" => t.table.clone()).set(t.rows as f64);
         metrics::gauge!(METRIC_TABLE_BYTES, "table" => t.table.clone()).set(t.bytes as f64);

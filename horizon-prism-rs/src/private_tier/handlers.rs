@@ -200,7 +200,7 @@ impl PrivateState {
 }
 
 fn xrpc(nsid: &str) -> String {
-    format!("/xrpc/{nsid}")
+    crate::admin::usage::path("private", nsid)
 }
 
 /// The private router, merged into the app by `serve`.

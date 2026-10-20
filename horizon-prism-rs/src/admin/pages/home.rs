@@ -2,8 +2,8 @@
 //! red and amber checks of §9.2, each linking to where to act), then the
 //! tiles in a narrow column beside the live feed (admin-ui-live-feed design
 //! §5): members, public data, the network stream, the database against its
-//! budget, Farsight and the last five commands. The fullest disk comes with
-//! the stats slice (S4). The script fills the feed;
+//! budget, the fullest disk, Farsight and the last five commands. The
+//! script fills the feed;
 //! without JavaScript the section shows the totals since Prism started
 //! and the last minute's rates, and the page reloads
 //! itself every 30 seconds to `/admin?auto=1`, a [`Need::Poll`].
@@ -40,6 +40,8 @@ pub struct Tiles {
     pub stream: String,
     /// The database against its budget.
     pub database: String,
+    /// The fullest disk (§6.1, §10.1).
+    pub disk: String,
     pub farsight: &'static str,
     /// The last five commands.
     pub commands: Vec<CommandRow>,
@@ -188,6 +190,16 @@ pub fn reason_words(o: Outcome) -> &'static str {
     }
 }
 
+/// The fullest disk in one phrase, for its tile.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn fullest_disk_words(d: &crate::admin::stats::Disks) -> String {
+    d.fullest().map_or_else(
+        || "unknown".to_string(),
+        |disk| format!("{} free ({:.0}% used), {}", super::bytes(disk.space.free as f64), disk.space.used_ratio() * 100.0, disk.holds_words()),
+    )
+}
+
 async fn load_tiles(state: &AdminState, banners: Banners) -> Result<Tiles, sqlx::Error> {
     let (members, ready, denied): (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM members), (SELECT count(*) FROM members WHERE ready_at IS NOT NULL), \
@@ -210,6 +222,7 @@ async fn load_tiles(state: &AdminState, banners: Banners) -> Result<Tiles, sqlx:
         public: super::health::public_word(state.scope.public_mode()),
         stream: super::health::stream_words(now.as_ref()),
         database: super::health::database_words(state, now.as_ref()),
+        disk: fullest_disk_words(&crate::admin::stats::read_disks(&state.disks)),
         farsight: super::health::farsight_words(state),
         commands: commands.into_iter().map(CommandRow::from_tuple).collect(),
         attention,

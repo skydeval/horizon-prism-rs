@@ -10,6 +10,8 @@ mod settings_pages;
 // Health, Jobs, Problems, Blocks and Home's tiles (admin-ui design §6.1,
 // §6.4, §6.6-§6.8, §9).
 mod health_pages;
+// Stats and the fullest-disk tile (admin-ui design §6.5, §10).
+mod stats_pages;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -31,7 +33,7 @@ use crate::config::ScopePolicy;
 use crate::identity::DidDocInfo;
 use crate::kryphocron_glue::jwt::tests::{StubFetcher, verifier};
 use crate::test_support::{TestDb, fresh_db};
-use crate::xrpc::router::{FinalConfig, finalize};
+use crate::xrpc::router::{FinalConfig, finalize_with};
 use crate::xrpc::{AppState, RateLimits};
 
 const HOST: &str = "prism.example.com";
@@ -135,6 +137,8 @@ struct Harness {
     hub: live::Hub,
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     served: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The endpoint counters the stats page reads.
+    usage: usage::Usage,
     _drainer: Box<dyn Send>,
 }
 
@@ -180,8 +184,10 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
         session_max: Duration::from_secs(604_800),
         setup_code_file: code_file.clone(),
         settings: settings::SettingsContext::from_file(test_support::no_auto_join()),
+        disks: stats::DiskPaths { data: dir.clone(), postgres: dir.clone(), redis: dir.join("no-redis-volume") },
     };
     let hub = live::Hub::with_timing(snippets, timing);
+    let usage = usage::Usage::default();
     let admin = AdminState::new(
         db.pool.clone(),
         scope,
@@ -190,7 +196,8 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
         settings,
         hub.clone(),
     )
-    .with_health(inputs);
+    .with_health(inputs)
+    .with_usage(usage.clone());
     let (auth, drainer) = verifier(StubFetcher::default(), 10, 4);
     let app = AppState {
         hydrator: crate::hydration::testing::hydrator(&db.pool, ScopeSets::default()),
@@ -201,7 +208,7 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
         did_document: Arc::new(json!({})),
         membership: Default::default(),
     };
-    let routes = finalize(router(admin), app, FinalConfig { not_ready_retry_secs: 5, public: Default::default() });
+    let routes = finalize_with(router(admin), app, FinalConfig { not_ready_retry_secs: 5, public: Default::default() }, usage.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -225,6 +232,7 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
         hub,
         shutdown: Mutex::new(Some(tx)),
         served: Mutex::new(Some(served)),
+        usage,
         _drainer: Box::new(drainer),
     })
 }

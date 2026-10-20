@@ -23,6 +23,7 @@ use super::pools::{ChargeKey, Exhausted, Pool};
 use super::errors::{NotReadyHint, XrpcError};
 use super::handlers::{actor, bookmarks, did_web, drafts, feed, graph, index, labels, membership, mutes, notifications, repo, search, timeline, unspecced};
 use super::rate_limit::Class;
+use crate::admin::usage::Usage;
 use crate::honest_501::{self, PublicMessages, Verb};
 
 /// The health route: exempt from the backstop for `GET` and `HEAD` (§6.3;
@@ -215,8 +216,18 @@ fn cors() -> CorsLayer {
 /// the rate limit, then CORS outermost. Nothing may be
 /// merged into the result, and no route is served from outside it (§6.5).
 /// The caller serves it with
-/// `into_make_service_with_connect_info::<SocketAddr>()`.
+/// `into_make_service_with_connect_info::<SocketAddr>()`. Requests are
+/// counted in a [`Usage`] of their own; [`finalize_with`] takes the one the
+/// admin UI reads.
 pub fn finalize(routes: Router, state: AppState, cfg: FinalConfig) -> Router {
+    finalize_with(routes, state, cfg, Usage::default())
+}
+
+/// [`finalize`], counting routed XRPC requests in `usage` (admin-ui design
+/// §10.3): the counter sits between the global limit and CORS, so a 429 of
+/// the limit and a 501 of the endpoint gate are counted, and a preflight
+/// answered by CORS is not.
+pub fn finalize_with(routes: Router, state: AppState, cfg: FinalConfig, usage: Usage) -> Router {
     let (wrong, missing) = (state.clone(), state.clone());
     let gate = PublicGate {
         app: state.clone(),
@@ -252,11 +263,14 @@ pub fn finalize(routes: Router, state: AppState, cfg: FinalConfig) -> Router {
         .layer(middleware::from_fn_with_state(cfg, finish))
         .layer(middleware::from_fn_with_state(gate, public_gate))
         .layer(middleware::from_fn_with_state(state, global_limit))
+        .layer(middleware::from_fn_with_state(usage, crate::admin::usage::count))
         .layer(cors())
 }
 
+/// A route path of the main router, registered for the admin UI's endpoint
+/// usage (admin-ui design §10.3).
 fn xrpc(nsid: &str) -> String {
-    format!("/xrpc/{nsid}")
+    crate::admin::usage::path("app", nsid)
 }
 
 /// The public routes, without fallbacks or layers: [`finalize`] adds those
@@ -346,7 +360,7 @@ pub fn router(state: AppState) -> Router {
 /// path and the PDS source); merged into the app by `serve`.
 pub fn index_router(state: index::IndexState) -> Router {
     Router::new()
-        .route(&xrpc(index::REQUEST_RECORD), post(index::request_record))
+        .route(&crate::admin::usage::path("index", index::REQUEST_RECORD), post(index::request_record))
         .with_state(state)
 }
 
@@ -762,6 +776,86 @@ mod tests {
         for m in honest_501::PUBLIC_METHODS {
             let (status, _) = send(&client, verbs(m).0, &format!("{base}/xrpc/{}", m.nsid), None).await;
             assert_ne!(status, 501, "{}", m.nsid);
+        }
+        db.drop_db().await;
+    }
+
+    /// T-A12 (admin-ui design §10.3, in memory per C-A6 (b)): routed
+    /// requests are counted by class, a 501 of the endpoint gate as "not
+    /// offered"; unrouted paths and preflights are not counted; every method
+    /// the main router registers is routed there, and its constants are
+    /// registered.
+    #[tokio::test]
+    async fn t_a12_endpoint_usage() {
+        use crate::admin::usage::{self, Class, Usage};
+        use crate::hydration::testing::set_mode;
+        use crate::indexing::PublicMode;
+
+        let Some(db) = fresh_db("xrpc_endpoint_usage").await else {
+            return;
+        };
+        let (mut state, _drainer) = bare_state(&db.pool);
+        state.limits = roomy_limits();
+        let scope = state.hydrator.scope().clone();
+        let usage = Usage::default();
+        let routes = router(state.clone());
+        usage.load_registry();
+        let cfg = FinalConfig { not_ready_retry_secs: 5, public: PublicMessages::default() };
+        let base = serve_app(finalize_with(routes, state, cfg, usage.clone())).await;
+        let client = reqwest::Client::new();
+        let of = |nsid: &str| usage.rows().into_iter().find(|r| r.nsid == nsid);
+
+        // Answered, refused and not signed in.
+        let (status, _) = get_json(&client, &format!("{base}/xrpc/app.bsky.actor.getProfile"), None).await;
+        assert_eq!(status, 400);
+        let (status, _) = get_json(&client, &format!("{base}/xrpc/app.bsky.feed.getTimeline"), None).await;
+        assert_eq!(status, 401);
+        let (status, _) = get_json(&client, &format!("{base}/xrpc/app.bsky.unspecced.getConfig"), None).await;
+        assert_eq!(status, 200);
+        // Unrouted, and a preflight: neither is counted.
+        let (status, _) = get_json(&client, &format!("{base}/xrpc/app.example.doesNotExist"), None).await;
+        assert_eq!(status, 501);
+        let r = client
+            .request(reqwest::Method::OPTIONS, format!("{base}/xrpc/app.bsky.feed.getPosts"))
+            .header("origin", "https://client.example")
+            .header("access-control-request-method", "GET")
+            .send()
+            .await
+            .expect("preflight");
+        assert_eq!(r.status().as_u16(), 200);
+        // Public data off: the gate's 501 is "not offered".
+        set_mode(&scope, PublicMode::Off).await;
+        let (status, _) = get_json(&client, &format!("{base}/xrpc/app.bsky.actor.getProfile?actor={ALICE}"), None).await;
+        assert_eq!(status, 501);
+        set_mode(&scope, PublicMode::On).await;
+
+        let profile = of("app.bsky.actor.getProfile").expect("counted");
+        assert_eq!((profile.by_class, profile.total, profile.registered), ([0, 1, 0, 1, 0], 2, true));
+        assert_eq!(Class::NotOffered as usize, 3);
+        assert!(profile.last.is_some());
+        assert_eq!(of("app.bsky.feed.getTimeline").expect("counted").by_class[Class::ClientError as usize], 1);
+        assert_eq!(of("app.bsky.unspecced.getConfig").expect("counted").by_class[Class::Ok as usize], 1);
+        assert_eq!(of("app.bsky.feed.getPosts").expect("registered").total, 0, "the preflight is not counted");
+        assert!(of("app.example.doesNotExist").is_none(), "unrouted paths have their own counter");
+        assert_eq!(of("app.bsky.graph.getFollows").expect("registered").total, 0, "listed as never used");
+
+        // The registry's main-router methods are each routed here, and the
+        // routers' constants are registered.
+        let registered = usage::registered();
+        let app: Vec<&String> = registered.iter().filter(|(_, r)| *r == "app").map(|(n, _)| n).collect();
+        assert!(app.len() > 60, "{}", app.len());
+        for nsid in app {
+            let (_, v) = get_json(&client, &format!("{base}/xrpc/{nsid}"), None).await;
+            assert_ne!(v["error"].as_str(), Some("MethodNotImplemented"), "{nsid}");
+        }
+        for nsid in [
+            timeline::GET_TIMELINE,
+            graph::GET_FOLLOWS,
+            notifications::LIST_NOTIFICATIONS,
+            membership::GET_MEMBERSHIP,
+            repo::GET_RECORD,
+        ] {
+            assert!(registered.iter().any(|(n, r)| n == nsid && *r == "app"), "{nsid}");
         }
         db.drop_db().await;
     }

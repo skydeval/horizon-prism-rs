@@ -6,7 +6,8 @@
 //! pages, the saved settings layered over `app.toml`, the live values and
 //! the restart (`settings`, `pages::settings`). Slice S3: Health, Jobs,
 //! Problems and Blocks (Farsight), the checks and Home's tiles over the
-//! in-process metrics (`health`).
+//! in-process metrics (`health`). Slice S4: Stats, with the disks and
+//! counts (`stats`), endpoint usage (`usage`) and the Disk check.
 //!
 //! Served by `serve` itself on its own origin, merged before
 //! `xrpc::router::finalize`, so it sits inside the global per-IP limit
@@ -24,6 +25,8 @@ pub mod operators;
 pub mod pages;
 pub mod settings;
 pub mod setup_code;
+pub mod stats;
+pub mod usage;
 
 use std::net::IpAddr;
 use std::ops::Deref;
@@ -102,6 +105,8 @@ pub struct AdminSettings {
     pub setup_code_file: PathBuf,
     /// The settings pages' view of the configuration (§8).
     pub settings: SettingsContext,
+    /// The paths the disk figures read (§10.1).
+    pub disks: stats::DiskPaths,
 }
 
 impl AdminSettings {
@@ -116,6 +121,7 @@ impl AdminSettings {
             session_max: Duration::from_secs(cfg.file.admin.session_max_secs),
             setup_code_file: setup_code::file_path(&cfg.env.data_dir),
             settings,
+            disks: stats::DiskPaths::standard(&cfg.env.data_dir),
         }
     }
 }
@@ -140,6 +146,11 @@ pub struct Inner {
     pub health: health::HealthInputs,
     /// Farsight's own report, kept 30 seconds (§6.8).
     pub farsight_report: pages::farsight::ReportCache,
+    /// The paths the disk figures read (§10.1).
+    pub disks: stats::DiskPaths,
+    /// Endpoint usage since the start (§10.3); empty until
+    /// [`AdminState::with_usage`].
+    pub usage: usage::Usage,
 }
 
 /// The admin router's state. Cheap to clone.
@@ -183,7 +194,21 @@ impl AdminState {
             live,
             health: health::HealthInputs::default(),
             farsight_report: pages::farsight::ReportCache::default(),
+            disks: settings.disks,
+            usage: usage::Usage::default(),
         }))
+    }
+
+    /// The same state, reading `usage` for the stats page: the counters
+    /// `xrpc::router::finalize_with` writes. Call it before the state is
+    /// cloned.
+    #[must_use]
+    pub fn with_usage(mut self, usage: usage::Usage) -> Self {
+        match Arc::get_mut(&mut self.0) {
+            Some(inner) => inner.usage = usage,
+            None => tracing::error!(event = "admin_usage_not_set", "the admin state was shared before its usage counters were set"),
+        }
+        self
     }
 
     /// The same state, reading `inputs` for Health and its sibling pages.
@@ -310,6 +335,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/restart", route(post(pages::settings::restart)))
         .route("/health", route(get(pages::health::page)))
         .route("/health/resync", route(post(pages::health::resync)))
+        .route("/stats", route(get(pages::stats::page)))
         .route("/jobs", route(get(pages::jobs::page)))
         .route("/jobs/retry", route(post(pages::jobs::retry)))
         .route("/jobs/scope-check", route(post(pages::jobs::scope_check)))

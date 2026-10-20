@@ -393,7 +393,7 @@ pub fn router(app: &AppState, cfg: &FileConfig, shares: &Shares, public_hostname
                 Verb::Get => get(handle),
                 Verb::Post => post(handle),
             };
-            router = router.route(&format!("/xrpc/{nsid}"), method.with_state(state));
+            router = router.route(&crate::admin::usage::path("services", &nsid), method.with_state(state));
         }
     }
     Ok(router)

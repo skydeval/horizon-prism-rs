@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">How much room Prism has, how much it holds, and which requests apps make. Nothing on this page changes anything.</p>
+
+<h2>Disks</h2>
+{% if disks.is_empty() %}<div class="banner">Prism cannot see any of its disks.</div>{% endif %}
+<div class="grid">
+{% for d in disks %}
+<div class="card">
+<h3>Disk holding {{ d.holds }}</h3>
+<div class="fact"><span class="l">Size</span><span class="v">{{ d.total }}</span></div>
+<div class="fact"><span class="l">Used</span><span class="v">{{ d.used }} <span class="pill {{ d.class }}">{{ d.used_share }}</span></span></div>
+<div class="fact"><span class="l">Free</span><span class="v">{{ d.free }}</span></div>
+</div>
+{% endfor %}
+</div>
+{% if !not_visible.is_empty() %}<div class="banner">Prism cannot see the disk of {{ not_visible }}. Whoever runs the server can let Prism
+see it: the install notes say how (a read-only mount; Prism only reads the disk's size and free space).</div>{% endif %}
+<p class="muted">Measured now. A disk turns amber under 10% or 5 GB free, red under 2%.</p>
+
+<div class="card">
+<h3>Storage</h3>
+{% for f in storage %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+<p class="muted">The database and Redis are measured every 5 minutes and every 30 seconds.</p>
+</div>
+
+<h2>How much is indexed</h2>
+<p class="muted">"About" counts are Postgres's own estimates, measured {{ as_of }}. They can drift a little until Postgres next tidies the table.</p>
+<div class="grid">
+{% for g in groups %}
+<div class="card">
+<h3>{{ g.title }}</h3>
+{% for f in g.figures %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+{% if !g.note.is_empty() %}<p class="muted">{{ g.note }}</p>{% endif %}
+</div>
+{% endfor %}
+</div>
+
+<details>
+<summary>Size of each table</summary>
+{% if tables.is_empty() %}<p class="muted">Not measured yet since Prism started (every 5 minutes).</p>{% else %}
+<div class="scroll">
+<table>
+<thead><tr><th>Table</th><th>Rows</th><th>Size on disk</th></tr></thead>
+<tbody>
+{% for t in tables %}
+<tr><td>{{ t.label }}{% if t.label != t.table %}<br><span class="muted tech">{{ t.table }}</span>{% endif %}</td><td>{{ t.rows }}</td><td>{{ t.size }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+</details>
+
+<h2>Endpoints in use</h2>
+<p class="muted">Requests from apps since Prism started, {{ counting_since }}. The counts start again from zero when Prism restarts.
+"Refused" is a request Prism turned down (a mistake in it, or not signed in); "Too many" was over a rate limit; "Not offered" is
+something Prism does not provide, or public data while it is off; "Errors" went wrong inside Prism.</p>
+{% if used.is_empty() %}<p class="muted">No requests yet since Prism started.</p>{% else %}
+<div class="scroll">
+<table>
+<thead><tr><th>Request</th><th>All</th><th>Answered</th><th>Refused</th><th>Too many</th><th>Not offered</th><th>Errors</th><th>Last used</th></tr></thead>
+<tbody>
+{% for e in used %}
+<tr><td>{{ e.name }}<br><span class="muted tech">{{ e.nsid }}</span></td><td>{{ e.total }}</td>{% for c in e.counts %}<td>{{ c }}</td>{% endfor %}<td>{{ e.last }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+<details>
+<summary>{{ never.len() }} request{% if never.len() != 1 %}s{% endif %} never used since Prism started</summary>
+<div class="scroll">
+<table>
+<thead><tr><th>Request</th></tr></thead>
+<tbody>
+{% for n in never %}
+<tr><td>{{ n.name }}<br><span class="muted tech">{{ n.nsid }}</span></td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+</details>
+{% endblock %}

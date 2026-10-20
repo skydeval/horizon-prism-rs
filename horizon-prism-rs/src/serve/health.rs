@@ -205,7 +205,7 @@ async fn health(State(state): State<HealthState>, ConnectInfo(peer): ConnectInfo
 
 /// The placeholder router.
 pub fn router(state: HealthState) -> Router {
-    Router::new().route("/xrpc/_health", get(health)).with_state(state)
+    Router::new().route(&crate::admin::usage::path("health", "_health"), get(health)).with_state(state)
 }
 
 #[cfg(test)]

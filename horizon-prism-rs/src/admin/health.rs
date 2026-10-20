@@ -11,7 +11,7 @@
 //! Honest state (§2, principle 5): a check whose input is missing is
 //! [`Level::NoData`], shown grey, never green. A "for N minutes" check is
 //! "no data" until N minutes of snapshots exist (review 1, finding 10).
-//! The Disk check comes with the stats slice (S4).
+//! The Disk check reads the disks (§10.1) when the checks are gathered.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -438,6 +438,43 @@ pub struct Inputs {
     /// The relays the configuration names, so a relay never heard from
     /// still has a line.
     pub relays: Vec<String>,
+    /// The disks (§10.1), read now.
+    pub disks: Option<super::stats::Disks>,
+}
+
+/// Under this share free a disk is red (§9.2).
+pub const DISK_RED_FREE: f64 = 0.02;
+/// Under this share free a disk is amber.
+pub const DISK_AMBER_FREE: f64 = 0.10;
+/// Under this many bytes free a disk is amber: 5 GB.
+pub const DISK_AMBER_BYTES: u64 = 5_000_000_000;
+
+/// The Disk check (§9.2): the fullest disk against the thresholds.
+#[allow(clippy::cast_precision_loss)]
+fn disk_check(disks: Option<&super::stats::Disks>) -> Check {
+    const NAME: &str = "Disk";
+    let Some(d) = disks else {
+        return Check::no_data(NAME, "the disks are not connected to these pages.");
+    };
+    let Some(fullest) = d.fullest() else {
+        return Check::no_data(NAME, "Prism cannot see any of its disks.");
+    };
+    let free = fullest.space.free;
+    let free_share = 1.0 - fullest.space.used_ratio();
+    let text = format!("The disk holding {} has {} free ({} free).", fullest.holds_words(), super::pages::bytes(free as f64), percent(free_share));
+    let unseen = if d.not_visible.is_empty() {
+        String::new()
+    } else {
+        format!(" Prism cannot see the disk of {}.", super::stats::join_words(&d.not_visible))
+    };
+    let check = if free_share < DISK_RED_FREE {
+        Check::new(NAME, Level::Red, text)
+    } else if free_share < DISK_AMBER_FREE || free < DISK_AMBER_BYTES {
+        Check::new(NAME, Level::Amber, text)
+    } else {
+        Check::new(NAME, Level::Ok, format!("{text}{unseen}"))
+    };
+    check.link("/admin/stats", "Stats")
 }
 
 const FIVE_MIN: Duration = Duration::from_secs(300);
@@ -480,7 +517,7 @@ fn yes_no_check(name: &'static str, ok: Option<bool>, bad: &str, fine: &str, why
     }
 }
 
-/// The checks of §9.2 (the Disk check comes with S4), in that order.
+/// The checks of §9.2, in that order.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
@@ -570,6 +607,8 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
         Some(r) if r >= 0.8 => Check::new("Redis memory", Level::Amber, format!("Redis is at {} of its memory; at 100% Prism stops reading the network.", percent(r))),
         Some(r) => Check::new("Redis memory", Level::Ok, format!("Redis is at {} of its memory.", percent(r))),
     });
+
+    out.push(disk_check(i.disks.as_ref()));
 
     out.push(match i.failed_jobs {
         None => Check::no_data("Failed jobs", "the count did not finish in time."),
@@ -685,6 +724,7 @@ pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
         schema: h.schema.as_ref().map(|s| (s.backfill_done(), s.indexes_ready())),
         lag_warn_entries: fh.lag_warn_entries,
         relays,
+        disks: Some(super::stats::read_disks(&state.disks)),
     };
     checks(&inputs, &h.ring)
 }
@@ -812,6 +852,7 @@ mod tests {
             schema: Some((true, false)),
             lag_warn_entries: 100,
             relays: vec!["bsky".into(), "microcosm".into()],
+            disks: Some(disks(1_000_000_000_000, 15_000_000_000)),
         };
         let all = checks(&inputs, &ring);
         let get = |name: &str, text: &str| all.iter().find(|c| c.name == name && c.text.contains(text)).unwrap_or_else(|| panic!("{name}: {all:#?}")).level;
@@ -832,6 +873,30 @@ mod tests {
         assert_eq!(get("Settings", "2 changes wait"), Level::Info);
         assert_eq!(get("Search", "still being prepared"), Level::Info);
         assert_eq!(get("Trim gap", "No data"), Level::NoData, "a counter never incremented is absent");
+        assert_eq!(get("Disk", "The disk holding the database (Postgres) has 15.0 GB free (2% free)"), Level::Red);
+    }
+
+    /// One disk holding the database, `total` bytes with `free` free.
+    fn disks(total: u64, free: u64) -> crate::admin::stats::Disks {
+        use crate::admin::stats::{Disk, Disks, HOLDS_POSTGRES, Space};
+        Disks { disks: vec![Disk { holds: vec![HOLDS_POSTGRES], space: Space { total, used: total - free, free, id: (1, 1, 1) } }], not_visible: Vec::new() }
+    }
+
+    /// §9.2's Disk check: red under 2% free, amber under 10% or 5 GB,
+    /// fine otherwise; no data without disks.
+    #[test]
+    fn the_disk_check() {
+        let level = |d: Option<crate::admin::stats::Disks>| disk_check(d.as_ref()).level;
+        const GB: u64 = 1_000_000_000;
+        assert_eq!(level(Some(disks(1000 * GB, 15 * GB))), Level::Red, "1.5% free");
+        assert_eq!(level(Some(disks(1000 * GB, 50 * GB))), Level::Amber, "5% free");
+        assert_eq!(level(Some(disks(40 * GB, 4 * GB))), Level::Amber, "10% but under 5 GB");
+        assert_eq!(level(Some(disks(100 * GB, 40 * GB))), Level::Ok);
+        assert_eq!(level(None), Level::NoData);
+        assert_eq!(level(Some(crate::admin::stats::Disks::default())), Level::NoData);
+        let mut unseen = disks(100 * GB, 40 * GB);
+        unseen.not_visible.push(crate::admin::stats::HOLDS_REDIS);
+        assert!(disk_check(Some(&unseen)).text.ends_with("Prism cannot see the disk of Redis."));
     }
 
     #[test]
@@ -861,7 +926,7 @@ mod tests {
         }
         let mut source = String::new();
         walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut source);
-        for name in WATCHED {
+        for name in WATCHED.iter().chain(crate::admin::stats::STATS_SERIES) {
             assert!(source.contains(&format!("\"{name}\"")), "{name} is not named outside src/admin");
         }
     }

@@ -14,6 +14,7 @@ pub mod operators;
 pub mod problems;
 pub mod settings;
 pub mod setup;
+pub mod stats;
 
 use askama::Template;
 use axum::http::StatusCode;
@@ -31,8 +32,8 @@ pub struct Nav {
     /// How the operator is named: handle, else DID.
     pub who: String,
     pub csrf: String,
-    /// The current screen: `home`, `members`, `settings`, `health`, `jobs`,
-    /// `problems`, `farsight`, `operators`, `audit`.
+    /// The current screen: `home`, `members`, `settings`, `health`,
+    /// `stats`, `jobs`, `problems`, `farsight`, `operators`, `audit`.
     pub current: &'static str,
     /// Changes waiting for a restart, and settings that could not be used.
     pub banners: Banners,

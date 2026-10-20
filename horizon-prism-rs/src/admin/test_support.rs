@@ -87,6 +87,7 @@ pub async fn serve(pool: &PgPool, hub: Hub, identity: Option<Arc<dyn OperatorIde
         session_max: Duration::from_secs(604_800),
         setup_code_file: std::env::temp_dir().join(format!("hprs-live-{}", rand::random::<u32>())),
         settings: super::settings::SettingsContext::from_file(no_auto_join()),
+        disks: super::stats::DiskPaths::standard(&std::env::temp_dir()),
     };
     let scope = ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10_000);
     let identity = identity.unwrap_or_else(|| Arc::new(FixedIdentity));

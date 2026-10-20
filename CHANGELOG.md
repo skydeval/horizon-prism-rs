@@ -10,6 +10,47 @@ commit.
 
 ## [Unreleased]
 
+### Added (admin UI S4: stats, disks, endpoint usage, #762)
+
+Admin-ui design §6.5, §9.2's Disk check, §10 (`docs/internal/design/admin-ui.md`).
+
+- **Stats** at `/admin/stats`, in the navigation after Health. **Disks:**
+  size, used and free space of the disks holding Prism's own files, Postgres
+  and Redis, read with `statvfs` when the page loads; paths on one
+  filesystem are shown once, and a disk Prism cannot see is named. Then the
+  database against its budget, the write-ahead log (needs a superuser or
+  `pg_monitor`, else "unknown"), Redis memory against its limit and the size
+  of its append-only file.
+- **How much is indexed:** members, ready members and denied accounts
+  (exact); the accounts Prism follows, those kept fully in sync and those
+  with private posts (from memory), and the accounts Prism follows by their
+  first reason as of the last nightly clean-up (`scope_dids_by_hold`); posts,
+  likes, reposts, follows, blocks, lists, notifications, bookmarks and
+  profiles from the storage sampler, marked "about"; private posts stored,
+  with images and with a video (exact, from their partial indexes), and read
+  in the new and the older form; blocks kept and not kept (no member side)
+  since the start, and blocks, list blocks and private blocks stored;
+  lodestar's answered, unanswered and skipped lookups; and every table's
+  estimated rows and size. The private tables are labelled through
+  `private_tier::stats`, so no admin file names one. Nothing counts a large
+  table.
+- **Endpoints in use:** every routed XRPC method's requests since the start
+  by outcome (answered, refused, rate limited, not offered, errors) and when
+  it was last used, and the methods never used. Each router registers its
+  methods; a middleware in `finalize` counts by axum's matched path, between
+  the global limit and CORS, so unrouted paths, `/admin` and preflights are
+  not counted. Kept in memory and reset at a restart (decision C-A6 (b)), so
+  there is no migration; each request is also exported as
+  `xrpc_requests_total{nsid,class}`.
+- **Disk check** on Health and Home's attention list: amber under 10% or
+  5 GB free, red under 2%, "no data" when no disk is visible. Home's Prism
+  tile shows the fullest disk.
+- **Compose:** `app` mounts `db-data` at `/app/volumes/postgres` and
+  `redis-data` at `/app/volumes/redis`, read-only, for the disk figures only.
+  A deployment whose override puts either on a host path mounts that path
+  there instead; without a mount the page says Prism cannot see that disk.
+  New dependency: `rustix` (`fs`), already in the graph.
+
 ### Changed (member blocks only, S2, #761)
 
 Member-blocks-only design S2 (`docs/internal/design/member-blocks-only.md`).

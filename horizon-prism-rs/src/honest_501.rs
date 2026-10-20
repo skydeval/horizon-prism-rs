@@ -438,7 +438,7 @@ pub fn router(app: &AppState, cfg: &FileConfig) -> Router {
             Verb::Get => get(answer),
             Verb::Post => post(answer),
         };
-        router = router.route(&format!("/xrpc/{}", d.nsid), method.with_state(state));
+        router = router.route(&crate::admin::usage::path("not_offered", d.nsid), method.with_state(state));
     }
     router
 }

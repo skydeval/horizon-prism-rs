@@ -924,6 +924,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // The web admin UI (admin-ui design §3), unless `admin.web_ui` is off:
     // its OAuth fetches through the public transport, its identity work
     // through the internal one (§5.10).
+    // Endpoint usage (admin-ui design §10.3): counted whether or not the UI
+    // is on, since `xrpc_requests_total` is exported either way.
+    let usage = crate::admin::usage::Usage::default();
     let admin_routes = if let Some(hub) = &live_hub {
         let settings = crate::admin::settings::SettingsContext::new(
             cfg.file.clone(),
@@ -941,7 +944,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
             crate::admin::AdminSettings::from_config(&cfg, settings),
             hub.clone(),
         )
-        .with_health(admin_health);
+        .with_health(admin_health)
+        .with_usage(usage.clone());
         tasks.push(admin.spawn_housekeeping());
         tasks.push(admin.spawn_snapshots());
         tasks.push(hub.spawn_sampler());
@@ -960,13 +964,16 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .merge(crate::threadlens::router(thread_lens))
         .merge(crate::xrpc::router::index_router(index))
         .merge(health::router(state));
-    let routes = crate::xrpc::router::finalize(
+    // Every router has registered its methods by now.
+    usage.load_registry();
+    let routes = crate::xrpc::router::finalize_with(
         merged,
         app,
         crate::xrpc::router::FinalConfig {
             not_ready_retry_secs: cfg.file.community.not_ready_retry_secs,
             public: crate::honest_501::PublicMessages::from_config(&cfg.file),
         },
+        usage,
     );
     // Graceful shutdown waits for open connections, so the live streams
     // are ended first (admin-ui-live-feed design §3.5). A restart from the

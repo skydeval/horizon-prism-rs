@@ -35,7 +35,7 @@ pub struct ResolveDidState {
 /// The `resolveDid` route, merged into the app by `serve`.
 pub fn router(state: ResolveDidState) -> Router {
     Router::new()
-        .route(&format!("/xrpc/{RESOLVE_DID}"), get(resolve_did))
+        .route(&crate::admin::usage::path("resolve_did", RESOLVE_DID), get(resolve_did))
         .with_state(state)
 }
 

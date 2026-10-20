@@ -4,8 +4,8 @@
 //! - Internals (`schema`, `oracle`, `pipeline`, `emit`) are private to this
 //!   module; their items are `pub(super)`, so nothing outside `private_tier`
 //!   can name a private-table query, a `RecordAuthz` or a `PrivateEmit`.
-//! - The `pub(crate)` surface is `ingest`, `readiness`, `owners`, `handlers`
-//!   and `retention`. The rest of the crate reaches ingest, readiness, owner
+//! - The `pub(crate)` surface is `ingest`, `readiness`, `owners`, `handlers`,
+//!   `retention` and `stats` (the admin stats page's labels and counts). The rest of the crate reaches ingest, readiness, owner
 //!   and purge operations through the [`PrivateTier`] facade, whose concrete
 //!   implementation is [`KryphocronPrivateTier`].
 //! - Content-returning queries take `&RecordAuthz` only (no URI parameter),
@@ -40,6 +40,7 @@ mod pipeline;
 pub(crate) mod readiness;
 pub(crate) mod retention;
 mod schema;
+pub(crate) mod stats;
 #[cfg(test)]
 pub(crate) mod test_rows;
 #[cfg(test)]

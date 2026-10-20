@@ -70,8 +70,8 @@ pub struct ThreadLensState {
 /// The Thread Lens routes, merged into the app by `serve`.
 pub fn router(state: ThreadLensState) -> Router {
     Router::new()
-        .route(&format!("/xrpc/{GET_THREAD}"), post(get_thread))
-        .route(&format!("/xrpc/{RESOLVE}"), post(resolve))
+        .route(&crate::admin::usage::path("threadlens", GET_THREAD), post(get_thread))
+        .route(&crate::admin::usage::path("threadlens", RESOLVE), post(resolve))
         .with_state(state)
 }
 

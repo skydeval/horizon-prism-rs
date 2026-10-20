@@ -79,6 +79,9 @@ unicode-normalization = "0.1"
 # The admin UI's pages (admin-ui design §4): HTML templates under
 # src/admin/templates/, checked against their structs at compile time.
 askama = "0.16"
+# The stats page's disk figures (admin-ui design §10.1): `statvfs` of the
+# app's data directory and the read-only volume mounts. Already in the graph.
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 # tokio::time::pause for the lag sampler's hang test (firehose throughput §4.5).
