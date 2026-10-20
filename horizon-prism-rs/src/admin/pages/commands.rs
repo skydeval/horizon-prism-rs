@@ -28,6 +28,8 @@ struct CommandPage {
     row: CommandRow,
     offer: Option<HostOffer>,
     csrf: String,
+    /// A done restart: whether Prism is back.
+    restart: Option<bool>,
 }
 
 /// `GET /admin/commands/{id}`.
@@ -55,6 +57,18 @@ pub async fn page(
         return message(&state, Some(Nav::new(&op, "audit")), StatusCode::NOT_FOUND, "Not found", "There is no such command.", Some(("/admin/audit", "Audit log")));
     };
     let row = CommandRow::from_tuple(row);
+    // A restart's page reloads every 5 seconds until this process is a
+    // newer one than the one that settled it (admin-ui design §8.5).
+    let restart = if row.command == "restart" && row.state == "done" {
+        let finished: Option<chrono::DateTime<chrono::Utc>> =
+            match sqlx::query_scalar("SELECT finished_at FROM admin_commands WHERE id = $1").bind(id).fetch_one(&state.pool).await {
+                Ok(f) => f,
+                Err(e) => return super::internal_error(&state, &e),
+            };
+        Some(finished.is_some_and(|f| state.settings.started_at > f))
+    } else {
+        None
+    };
     let offer = (row.command == "operator add" && row.state == "failed" && row.outcome.contains("not on the allowed list")).then(|| HostOffer {
         input: row.args.get("input").and_then(Value::as_str).unwrap_or_default().to_string(),
         note: row.args.get("note").and_then(Value::as_str).unwrap_or_default().to_string(),
@@ -68,6 +82,7 @@ pub async fn page(
             row,
             offer,
             csrf: op.csrf.clone(),
+            restart,
         },
     )
 }

@@ -118,6 +118,9 @@ struct HomePage {
     title: String,
     tiles: Tiles,
     live: LiveSection,
+    /// Settings whose `app.toml` value changed under a saved one
+    /// (admin-ui design §8.4).
+    notices: Vec<super::settings::Notice>,
 }
 
 #[derive(Template)]
@@ -176,7 +179,7 @@ async fn load_tiles(state: &AdminState) -> Result<Tiles, sqlx::Error> {
     Ok(Tiles {
         members,
         ready,
-        max_members: state.members.max_members,
+        max_members: state.members().max_members,
         denied,
         as_of: Utc::now().format("%H:%M:%S").to_string(),
     })
@@ -248,6 +251,10 @@ pub async fn page(
         Ok(t) => t,
         Err(e) => return super::internal_error(&state, &e),
     };
+    let notices = match super::settings::file_notices(&state).await {
+        Ok(n) => n,
+        Err(e) => return super::internal_error(&state, &e),
+    };
     let mut response = render(
         StatusCode::OK,
         &HomePage {
@@ -257,6 +264,7 @@ pub async fn page(
             title: "Home".to_string(),
             tiles,
             live: live_section(&state),
+            notices,
         },
     );
     if response.status() == StatusCode::OK {

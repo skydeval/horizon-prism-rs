@@ -203,7 +203,8 @@ impl Hydrator {
         .fetch_all(self.pool())
         .await?;
         let now = chrono::Utc::now();
-        let live_now = &self.inner.cfg.unspecced.live_now;
+        let live = self.inner.cfg.live.load();
+        let live_now = &live.unspecced.live_now;
         let statuses = stored
             .into_iter()
             .filter_map(|(did, uri, cid, record, indexed_at)| {

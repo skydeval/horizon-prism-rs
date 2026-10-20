@@ -183,6 +183,29 @@ pub struct Operator {
     /// The stored handle, when there is one.
     pub handle: Option<String>,
     pub csrf: String,
+    /// What every page says at its top (admin-ui design §6): changes
+    /// waiting for a restart, settings that could not be used.
+    pub banners: Banners,
+}
+
+/// The two banners of every page (admin-ui design §6, §8.4, §8.5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Banners {
+    /// Saved changes that apply after a restart and are not in use yet.
+    pub waiting: usize,
+    /// Saved settings that could not be used at the last start.
+    pub set_aside: usize,
+    /// The restart button works here (`APP_SUPERVISED=1`).
+    pub supervised: bool,
+}
+
+/// The banners now: one small read of the saved settings.
+async fn banners(state: &AdminState) -> Result<Banners, sqlx::Error> {
+    use super::settings::store;
+    let saved = store::rows(&state.pool).await?;
+    let s = &state.settings;
+    let counts = store::counts(&saved, &s.file_json, &s.running_json, &s.networks());
+    Ok(Banners { waiting: counts.waiting, set_aside: counts.set_aside, supervised: s.env.supervised })
 }
 
 impl Operator {
@@ -522,7 +545,9 @@ pub async fn require(
         .await
         .map_err(internal)?
         .flatten();
-    Ok(Operator { did, handle, csrf })
+    // Watching needs no banners.
+    let banners = if need == Need::Poll { Banners::default() } else { banners(state).await.map_err(internal)? };
+    Ok(Operator { did, handle, csrf, banners })
 }
 
 #[cfg(test)]

@@ -57,7 +57,12 @@ pub const DEFAULT_PARENT_HEIGHT: u32 = 80;
 pub struct ThreadLensState {
     pub app: AppState,
     pub ladder: Ladder,
+    /// The bounds of one response. `access` is read from `live`, not from
+    /// here.
     pub cfg: ThreadLensConfig,
+    /// The settings that apply at once (admin-ui design §8.5):
+    /// `threadlens.access`.
+    pub live: crate::admin::settings::LiveSettings,
     /// Seals the paging cursors.
     pub cursor_key: CursorKey,
 }
@@ -92,7 +97,10 @@ async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method
         .bind(&caller.did)
         .fetch_optional(s.app.hydrator.pool())
         .await?;
-    let hydrate = match (ready, s.cfg.access) {
+    // Read at each request: the admin UI changes it at once (admin-ui
+    // design §8.5).
+    let access = s.live.load().threadlens_access;
+    let hydrate = match (ready, access) {
         (Some(true), _) => true,
         (Some(false), ThreadLensAccess::Members) => return Err(XrpcError::not_ready()),
         (None, ThreadLensAccess::Members) => return Err(XrpcError::not_enrolled()),

@@ -28,6 +28,9 @@ pub const ENV_ALLOW_STARTUP_MIGRATE: &str = "APP_ALLOW_STARTUP_MIGRATE";
 pub const ENV_LOG_LEVEL: &str = "APP_LOG_LEVEL";
 /// The one variable without the `APP_` prefix: Farsight's API key.
 pub const ENV_FARSIGHT_TOKEN: &str = "FARSIGHT_TOKEN";
+/// `1` when a supervisor starts `serve` again after it exits, so the admin
+/// UI may restart it (admin-ui design §8.5). The shipped compose sets it.
+pub const ENV_SUPERVISED: &str = "APP_SUPERVISED";
 
 /// Default `APP_CONFIG_PATH` inside the image (§11.3).
 pub const DEFAULT_CONFIG_PATH: &str = "/app/config/app.toml";
@@ -125,6 +128,9 @@ pub struct EnvConfig {
     /// `APP_PRIVATE_CURSOR_KEY_HEX`: seals private-tier paging cursors.
     /// Separate from Thread Lens's key, so either can rotate alone.
     pub private_cursor_key: Secret32,
+    /// `APP_SUPERVISED=1`: a supervisor restarts `serve` when it exits, so
+    /// a restart from the admin UI brings it back.
+    pub supervised: bool,
 }
 
 impl EnvConfig {
@@ -177,6 +183,12 @@ impl EnvConfig {
             }
         };
 
+        let supervised = match lookup(ENV_SUPERVISED).as_deref().map(str::trim) {
+            None | Some("") | Some("0") => false,
+            Some("1") => true,
+            Some(other) => return Err(invalid(ENV_SUPERVISED, format!("expected 0 or 1, got {other:?}"))),
+        };
+
         let data_dir = lookup(ENV_DATA_DIR)
             .filter(|v| !v.trim().is_empty())
             .map_or_else(|| PathBuf::from(DEFAULT_DATA_DIR), PathBuf::from);
@@ -200,6 +212,7 @@ impl EnvConfig {
             service_signing_key,
             correlation_key,
             allow_startup_migrate,
+            supervised,
             log_level,
             farsight_token: lookup(ENV_FARSIGHT_TOKEN)
                 .map(|v| v.trim().to_string())

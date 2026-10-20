@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="muted"><a href="/admin/settings">Settings</a></p>
+<h1>{{ title }}</h1>
+
+{% if let Some(p) = public %}
+<div class="card">
+<h2>Public data</h2>
+<p>Public data. 'Off' keeps only what private posts need (blocks, follows involving members, profiles, members' own
+records), and Prism stops answering public Bluesky requests. Turning it off deletes the stored public data in the
+background. 'Community' keeps public posts and interactions of your members and the accounts around them; turning it on
+refills them, and public requests come back when the refill is done.</p>
+<div class="fact"><span class="l">Now</span><span class="v">{{ p.phase }}</span></div>
+<p><span class="pill">Applies at once</span></p>
+<form class="stack" method="post" action="/admin/settings/public-scope">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="public-scope">Public data</label>
+<select id="public-scope" name="value">
+<option value="community_scoped"{% if p.on %} selected{% endif %}>Community</option>
+<option value="off"{% if !p.on %} selected{% endif %}>Off</option>
+</select>
+<div class="row"><button type="submit">Save public data</button></div>
+</form>
+<p class="muted tech">technical name: indexing.public_scope</p>
+</div>
+{% endif %}
+
+{% if let Some(l) = lodestar %}<div class="banner">{{ l }}</div>{% endif %}
+
+<form class="stack" method="post" action="/admin/settings/{{ slug }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+{% for s in sections %}
+<div class="card">
+<h2>{{ s.title }}</h2>
+<p>{{ s.help }}</p>
+<p><span class="pill{% if s.applies == "Applies at once" %} on{% endif %}">{{ s.applies }}</span></p>
+{% if let Some(w) = s.warning %}<div class="banner bad">{{ w }}</div>{% endif %}
+{% for f in s.fields %}
+{% if s.fields.len() > 1 %}<h3>{{ f.label }}</h3>{% endif %}
+{% if let Some(problem) = f.set_aside %}<div class="banner bad">This saved value could not be used when Prism last started, so app.toml's value is in use: {{ problem }}</div>{% endif %}
+{% if let Some(file) = f.file_notice %}<div class="banner">app.toml now says {{ file }}; your saved value {{ f.current }} still applies.
+<button class="secondary" type="submit" form="reset-{{ f.key }}">Use the file's value</button>
+<button class="secondary" type="submit" form="keep-{{ f.key }}">Keep my value</button></div>{% endif %}
+<input type="hidden" name="version:{{ f.key }}" value="{{ f.version }}">
+<label for="{{ f.key }}">{% if s.fields.len() > 1 %}New value{% else %}{{ f.label }}{% endif %}{% if !f.unit.is_empty() %} ({{ f.unit }}){% endif %}</label>
+{% if f.input == "select" %}
+<select id="{{ f.key }}" name="{{ f.key }}">
+{% for o in f.options %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>
+{% endfor %}
+</select>
+{% else if f.input == "textarea" %}
+<textarea id="{{ f.key }}" name="{{ f.key }}" rows="4" spellcheck="false">{{ f.value }}</textarea>
+{% else %}
+<input type="text" id="{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" spellcheck="false">
+{% endif %}
+<div class="fact"><span class="l">Saved now</span><span class="v">{{ f.current }}</span></div>
+{% if let Some(r) = f.running %}<div class="fact"><span class="l">In use until a restart</span><span class="v">{{ r }}</span></div>{% endif %}
+<div class="fact"><span class="l">Default</span><span class="v">{{ f.default }}</span></div>
+{% if let Some(file) = f.file %}<div class="fact"><span class="l">app.toml says</span><span class="v">{{ file }}</span></div>{% endif %}
+{% if let Some(saved) = f.saved %}<div class="fact"><span class="l">Last change</span><span class="v">{{ saved }}</span></div>{% endif %}
+{% if let Some(reset) = f.reset %}{% if f.file_notice.is_none() %}<div class="row"><button class="secondary" type="submit" form="reset-{{ f.key }}">{{ reset }}</button></div>{% endif %}{% endif %}
+<p class="muted tech">technical name: {{ f.key }}</p>
+{% endfor %}
+</div>
+{% endfor %}
+<div class="row"><button type="submit">Save changes</button></div>
+</form>
+
+{% for s in sections %}{% for f in s.fields %}{% if f.reset.is_some() %}
+<form id="reset-{{ f.key }}" method="post" action="/admin/settings/reset"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="key" value="{{ f.key }}"><input type="hidden" name="version" value="{{ f.version }}"></form>
+<form id="keep-{{ f.key }}" method="post" action="/admin/settings/keep"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="key" value="{{ f.key }}"><input type="hidden" name="version" value="{{ f.version }}"></form>
+{% endif %}{% endfor %}{% endfor %}
+{% endblock %}

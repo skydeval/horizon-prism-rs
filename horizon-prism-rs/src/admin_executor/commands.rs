@@ -14,6 +14,10 @@ use sqlx::PgPool;
 
 use crate::admin::operators::{self, OperatorIdentity};
 pub use crate::admin::operators::Actor;
+use crate::admin::settings::live::is_live;
+pub use crate::admin::settings::store::Change;
+use crate::admin::settings::{LiveSettings, LiveValues, RestartHandle, store};
+use crate::config::EnvConfig;
 
 use crate::aggregations::membership::{self, AddOutcome, Denial, add_member, is_denied};
 use crate::aggregations::purge::PurgeError;
@@ -78,6 +82,12 @@ pub enum AdminCommand {
     /// `operator host remove <pattern>`: refused when no operator's last
     /// known host would stay allowed.
     OperatorHostRemove { pattern: String },
+    /// `settings set` (admin-ui design §8.3): one group's changes, or one
+    /// from the CLI, applied together or not at all.
+    SettingsSet { changes: Vec<Change> },
+    /// `restart` (admin-ui design §8.5): settled `done`, then `serve` shuts
+    /// down as at SIGTERM and exits for its supervisor to start it again.
+    Restart,
 }
 
 /// The longest operator note accepted.
@@ -126,6 +136,17 @@ impl AdminCommand {
             Self::OperatorRemove { did } => ("operator remove", json!({ "did": did })),
             Self::OperatorHostAdd { pattern } => ("operator host add", json!({ "pattern": pattern })),
             Self::OperatorHostRemove { pattern } => ("operator host remove", json!({ "pattern": pattern })),
+            Self::SettingsSet { changes } => {
+                let changes: Vec<Value> = changes
+                    .iter()
+                    .map(|c| match &c.value {
+                        Some(v) => json!({ "key": c.key, "value": v, "base_version": c.base_version }),
+                        None => json!({ "key": c.key, "reset": true, "base_version": c.base_version }),
+                    })
+                    .collect();
+                ("settings set", json!({ "changes": changes }))
+            }
+            Self::Restart => ("restart", json!({})),
         }
     }
 
@@ -240,6 +261,8 @@ impl AdminCommand {
                 }
                 if command == "operator host add" { Self::OperatorHostAdd { pattern } } else { Self::OperatorHostRemove { pattern } }
             }
+            "settings set" => Self::SettingsSet { changes: parse_changes(command, args)? },
+            "restart" => Self::Restart,
             other => return Err(InvalidCommand(format!("unknown command {other:?}"))),
         })
     }
@@ -271,12 +294,46 @@ impl AdminCommand {
             | Self::OperatorRemove { .. }
             | Self::OperatorHostAdd { .. }
             | Self::OperatorHostRemove { .. }
+            | Self::SettingsSet { .. }
+            | Self::Restart
             // A prime writes nothing here, so it waits on no purge.
             | Self::FarsightPrime { .. }
             // Its handler waits on a purge of the viewer itself.
             | Self::FarsightForget { .. } => None,
         }
     }
+}
+
+/// The most changes one `settings set` carries: a whole group's.
+pub const MAX_CHANGES: usize = 200;
+
+/// `settings set`'s changes: each a key of the registry, once, with a
+/// value or `reset`, and the version it was made against.
+fn parse_changes(command: &str, args: &Value) -> Result<Vec<Change>, InvalidCommand> {
+    let bad = |why: &str| InvalidCommand(format!("{command}: {why}"));
+    let list = args.get("changes").and_then(Value::as_array).ok_or_else(|| bad("missing changes"))?;
+    if list.is_empty() || list.len() > MAX_CHANGES {
+        return Err(bad("expected 1 to 200 changes"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(list.len());
+    for c in list {
+        let key = c.get("key").and_then(Value::as_str).ok_or_else(|| bad("a change has no key"))?;
+        if !crate::admin::settings::registry::known(key) {
+            return Err(bad(&format!("{key:?} is not a setting that can be changed")));
+        }
+        if !seen.insert(key) {
+            return Err(bad(&format!("{key:?} is changed twice")));
+        }
+        let base_version = c.get("base_version").and_then(Value::as_i64).filter(|v| *v >= 0).ok_or_else(|| bad("a change has no base_version"))?;
+        let value = match (c.get("reset").and_then(Value::as_bool), c.get("value")) {
+            (Some(true), None) => None,
+            (None | Some(false), Some(v)) => Some(v.clone()),
+            _ => return Err(bad(&format!("{key:?} needs a value or reset, not both"))),
+        };
+        out.push(Change { key: key.to_string(), value, base_version });
+    }
+    Ok(out)
 }
 
 /// An operator change's result: done, a plain-words refusal (the command
@@ -322,6 +379,20 @@ pub struct Handlers {
     pub public: PublicIndexing,
     /// What the operator commands need (admin-ui design §5.7).
     pub operators: OperatorDeps,
+    /// What `settings set` and `restart` need (admin-ui design §8.3, §8.5).
+    pub settings: SettingsDeps,
+}
+
+/// What `settings set` and `restart` need: `app.toml`'s path, read fresh
+/// at each change, the running environment to validate with, the live
+/// values to swap, and the restart. Without a path and an environment
+/// (tests that do not need them), `settings set` fails.
+#[derive(Clone, Default)]
+pub struct SettingsDeps {
+    pub config_path: Option<PathBuf>,
+    pub env: Option<EnvConfig>,
+    pub live: Option<LiveSettings>,
+    pub restart: RestartHandle,
 }
 
 /// What the operator commands need: fresh resolution, and the setup code's
@@ -348,7 +419,15 @@ impl Handlers {
     /// Run one command for `actor`, who is recorded as its writer
     /// (admin-ui design §5.8).
     pub async fn execute(&self, cmd: &AdminCommand, actor: &Actor) -> Outcome {
+        self.execute_row(None, cmd, actor).await
+    }
+
+    /// [`Handlers::execute`] for the queue's row `id`, which a settings
+    /// change records in its history.
+    pub async fn execute_row(&self, id: Option<i64>, cmd: &AdminCommand, actor: &Actor) -> Outcome {
         let result = match cmd {
+            AdminCommand::SettingsSet { changes } => self.settings_set(changes, actor, id).await,
+            AdminCommand::Restart => Ok(self.restart(actor)),
             AdminCommand::MemberAdd { did } => self.member_add(did).await,
             AdminCommand::MemberRemove { did } => self.member_remove(did).await,
             AdminCommand::MemberDeny { did, reason } => self.member_deny(did, reason.as_deref(), actor).await,
@@ -375,6 +454,37 @@ impl Handlers {
             AdminCommand::OperatorHostRemove { pattern } => settled(operators::host_remove(&self.pool, pattern).await),
         };
         result.unwrap_or_else(Outcome::Failed)
+    }
+
+    /// `settings set` (admin-ui design §8.3): the transaction of
+    /// [`store::set`], then the live values swapped when a live key
+    /// changed.
+    async fn settings_set(&self, changes: &[Change], actor: &Actor, id: Option<i64>) -> Result<Outcome, String> {
+        let (Some(path), Some(env)) = (&self.settings.config_path, &self.settings.env) else {
+            return Ok(Outcome::Failed("settings cannot be changed by this process".to_string()));
+        };
+        match store::set(&self.pool, path, env, changes, actor.label(), id).await.map_err(|e| e.to_string())? {
+            Ok(saved) => {
+                if changes.iter().any(|c| is_live(&c.key))
+                    && let Some(live) = &self.settings.live
+                {
+                    live.store(LiveValues::from_file(&saved.candidate));
+                }
+                Ok(Outcome::Done(saved.result))
+            }
+            Err(refusal) => Ok(Outcome::Failed(refusal)),
+        }
+    }
+
+    /// `restart` (admin-ui design §8.5): refused unless a supervisor starts
+    /// `serve` again. The executor triggers the shutdown once the row is
+    /// settled.
+    fn restart(&self, actor: &Actor) -> Outcome {
+        if !self.settings.env.as_ref().is_some_and(|e| e.supervised) {
+            return Outcome::Failed("Prism cannot restart itself on this server; ask whoever runs it to restart Prism".to_string());
+        }
+        tracing::warn!(event = "admin_restart_requested", by = actor.label(), "a restart was asked for; serve shuts down and its supervisor starts it again");
+        Outcome::Done(json!({ "restarting": true }))
     }
 
     /// `operator add` (admin-ui design §5.7): the account is resolved
@@ -861,6 +971,32 @@ mod tests {
             ("operator host remove", json!({"pattern": "*.*.example"})),
         ] {
             assert!(AdminCommand::parse(name, &args).is_err(), "{name} {args}");
+        }
+        // `settings set` and `restart` (admin-ui design §11) round-trip and
+        // wait on no purge; only registry keys, each once, with a version.
+        for cmd in [
+            AdminCommand::SettingsSet {
+                changes: vec![
+                    Change { key: "threadlens.access".into(), value: Some(json!("members")), base_version: 3 },
+                    Change { key: "constellation.networks[bluesky].background_burst".into(), value: None, base_version: 1 },
+                    Change { key: "honest_501.public_off_message".into(), value: Some(Value::Null), base_version: 0 },
+                ],
+            },
+            AdminCommand::Restart,
+        ] {
+            let (name, args) = cmd.to_row();
+            assert_eq!(AdminCommand::parse(name, &args), Ok(cmd.clone()));
+            assert_eq!(cmd.did(), None);
+        }
+        for args in [
+            json!({"changes": []}),
+            json!({"changes": [{"key": "http.bind", "value": "0.0.0.0:1", "base_version": 0}]}),
+            json!({"changes": [{"key": "indexing.public_scope", "value": "off", "base_version": 0}]}),
+            json!({"changes": [{"key": "threadlens.access", "value": "members"}]}),
+            json!({"changes": [{"key": "threadlens.access", "value": "members", "reset": true, "base_version": 0}]}),
+            json!({"changes": [{"key": "threadlens.access", "value": "a", "base_version": 0}, {"key": "threadlens.access", "value": "b", "base_version": 0}]}),
+        ] {
+            assert!(AdminCommand::parse("settings set", &args).is_err(), "{args}");
         }
     }
 

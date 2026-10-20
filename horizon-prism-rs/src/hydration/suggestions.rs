@@ -411,7 +411,8 @@ impl Hydrator {
     /// policy switch and not a fact about any account.
     #[must_use]
     pub fn unspecced_config(&self) -> PublicEmit<Value> {
-        let cfg = &self.inner.cfg.unspecced;
+        let live = self.inner.cfg.live.load();
+        let cfg = &live.unspecced;
         let live: Vec<Value> = cfg.live_now.iter().map(|l| json!({"did": l.did, "domains": l.domains})).collect();
         Self::emit(json!({ "checkEmailConfirmed": cfg.check_email_confirmed, "liveNow": live }))
     }

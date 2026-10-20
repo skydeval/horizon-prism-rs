@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// `[http]`: the XRPC listener (§11.2) and client-IP derivation (§7.4).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
     pub bind: SocketAddr,
@@ -34,7 +34,7 @@ impl Default for HttpConfig {
 /// `/etc/resolv.conf`. The `viewer_private` intent forwards to
 /// `public_nameservers`; a `service_proxy` client always uses the system
 /// resolver (§6.7.8).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetSectionConfig {
     pub public_nameservers: Vec<IpAddr>,
@@ -44,7 +44,7 @@ pub struct NetSectionConfig {
 }
 
 /// `[metrics]`: the Prometheus listener (§11.2).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsConfig {
     pub bind: SocketAddr,
@@ -59,7 +59,7 @@ impl Default for MetricsConfig {
 }
 
 /// `indexing.public_scope` (§9.1; public-indexing design §3.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicScope {
     /// Only what the private tier and Horizon features need is stored, and
@@ -72,7 +72,7 @@ pub enum PublicScope {
 }
 
 /// `[indexing]`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexingConfig {
     /// `None` when the key is absent. The effective value is then `off`,
@@ -102,7 +102,7 @@ impl IndexingConfig {
 }
 
 /// `scope.policy` (§9.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopePolicy {
     MembersOnly,
@@ -113,7 +113,7 @@ pub enum ScopePolicy {
 }
 
 /// `[scope]` (§9.2, §9.4; scope-recency design §5).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScopeConfig {
     pub policy: ScopePolicy,
@@ -169,7 +169,7 @@ impl Default for ScopeWindows {
 }
 
 /// `[community]` (§9.2).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommunityConfig {
     pub auto_enroll: bool,
@@ -199,7 +199,7 @@ impl Default for CommunityConfig {
 }
 
 /// `[firehose]` (§5.3, §5.11).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FirehoseConfig {
     pub stream_key: String,
@@ -246,7 +246,7 @@ impl Default for FirehoseConfig {
 }
 
 /// `[identity]` (§6.7).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IdentityConfig {
     /// PLC directory base URL. The only URL allowed to use plain `http` (§8.5).
@@ -318,7 +318,7 @@ impl Default for IdentityConfig {
 }
 
 /// `[kryphocron]` (§6.3, §6.4).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KryphocronConfig {
     pub oracle_freshness_bound_secs: u64,
@@ -335,7 +335,7 @@ impl Default for KryphocronConfig {
 /// `[private_read.floor_ms]`: whole-handler latency floors (§6.9), per
 /// deployment, 0 (off) by default (timing-floors design). Each key is 0 to
 /// [`PrivateReadFloors::MAX_MS`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrivateReadFloors {
     pub get_posts: u64,
@@ -435,7 +435,7 @@ impl PrivateReadFloors {
 }
 
 /// `[private_read]` (§6.9).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrivateReadConfig {
     pub bind_concurrency: u32,
@@ -474,7 +474,7 @@ impl Default for PrivateReadConfig {
 /// Exists only under the `bench-heads` feature, so a deploy build refuses a
 /// config that names it.
 #[cfg(feature = "bench-heads")]
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BenchConfig {
     /// The heads `BenchHeadSource` answers: one `did rev` or `did fail`
@@ -486,7 +486,7 @@ pub struct BenchConfig {
 /// build may reach. Exists only under its feature, so a deploy build
 /// refuses a config that names it.
 #[cfg(feature = "standin-hosts")]
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StandinConfig {
     pub hosts: Vec<StandinHost>,
@@ -494,7 +494,7 @@ pub struct StandinConfig {
 
 /// One listed origin and the intents whose clients may reach it.
 #[cfg(feature = "standin-hosts")]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StandinHost {
     /// `http://<private IP literal>:<port>`, in canonical form.
@@ -504,7 +504,7 @@ pub struct StandinHost {
 
 /// The intents an origin can be listed for. `viewer_private` is not one.
 #[cfg(feature = "standin-hosts")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StandinIntent {
     Public,
@@ -513,7 +513,7 @@ pub enum StandinIntent {
 
 /// `[private_notify]` (private posting §4.8, C-11). The section is never
 /// named after the private table (§3.1's names table).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrivateNotifyConfig {
     /// A write that is not live (backfill, catch-up, `requestRecord`,
@@ -534,7 +534,7 @@ impl Default for PrivateNotifyConfig {
 /// at most `scan_candidates` prefilter-passing rows within `span_hours`
 /// below its cursor, and the search reaches back `max_age_days` from its
 /// first page. All positive, and `span_hours ≤ 24 × max_age_days`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrivateSearchConfig {
     /// Prefilter-passing rows a page reads at most.
@@ -556,7 +556,7 @@ impl Default for PrivateSearchConfig {
 }
 
 /// `[sync]`: repo-head check budgets (§6.11.3).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyncConfig {
     pub head_max_age_secs: u64,
@@ -593,7 +593,7 @@ impl Default for SyncConfig {
 
 /// `[index_request]`: `requestRecord`'s catch-up of the caller's
 /// authorization collections (private posting §3.8).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexRequestConfig {
     /// At most one catch-up per DID within this many seconds.
@@ -612,7 +612,7 @@ impl Default for IndexRequestConfig {
 }
 
 /// `[db]` (§6.11.7).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DbConfig {
     pub lock_timeout_secs: u64,
@@ -627,7 +627,7 @@ impl Default for DbConfig {
 }
 
 /// `[admin]` (§3.3; admin-ui design §3, §5.4, §13). All file-only.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
     pub command_timeout_secs: u64,
@@ -656,7 +656,7 @@ impl Default for AdminConfig {
 }
 
 /// `[cache]` (§7.6).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     pub read_time_bytes: u64,
@@ -688,7 +688,7 @@ impl Default for CacheConfig {
 }
 
 /// `counts.public_source` (§9.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CountsSource {
     Local,
@@ -697,7 +697,7 @@ pub enum CountsSource {
 }
 
 /// `[counts]` (§9.6).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CountsConfig {
     pub public_source: CountsSource,
@@ -722,7 +722,7 @@ impl Default for CountsConfig {
 }
 
 /// `[microcosm]` (§2.4).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MicrocosmConfig {
     pub slingshot_url: String,
@@ -748,7 +748,7 @@ impl Default for MicrocosmConfig {
 }
 
 /// `[backfill]` (§5.10).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackfillConfig {
     pub concurrency: u32,
@@ -776,8 +776,8 @@ impl Default for BackfillConfig {
 }
 
 /// A UTC time of day written `HH:MM` (`retention.run_at_utc`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct UtcTimeOfDay {
     hour: u8,
     minute: u8,
@@ -822,6 +822,12 @@ impl TryFrom<String> for UtcTimeOfDay {
     }
 }
 
+impl From<UtcTimeOfDay> for String {
+    fn from(t: UtcTimeOfDay) -> Self {
+        t.to_string()
+    }
+}
+
 impl fmt::Display for UtcTimeOfDay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:02}:{:02}", self.hour, self.minute)
@@ -829,7 +835,7 @@ impl fmt::Display for UtcTimeOfDay {
 }
 
 /// `[retention]` (§4.4).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetentionConfig {
     /// Age cap for unprotected S-class rows; 0 disables it.
@@ -851,7 +857,7 @@ impl Default for RetentionConfig {
 }
 
 /// `[storage]` (§4.6).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub budget_bytes: u64,
@@ -866,7 +872,7 @@ impl Default for StorageConfig {
 }
 
 /// Upstream auth mode for a routing-table network (§8.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkAuth {
     Unauth,
@@ -874,7 +880,7 @@ pub enum NetworkAuth {
 }
 
 /// One `[[constellation.networks]]` entry (§8.1).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     pub name: String,
@@ -915,7 +921,7 @@ pub fn background_burst() -> u32 {
 }
 
 /// `[constellation.cascade]` (§8.1).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CascadeConfig {
     pub order: Vec<String>,
@@ -934,7 +940,7 @@ impl Default for CascadeConfig {
 }
 
 /// `[constellation]`: the multi-AppView routing table (§8.1).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConstellationConfig {
     pub networks: Vec<NetworkConfig>,
@@ -1025,7 +1031,7 @@ impl ConstellationConfig {
 
 /// `[features]` (design-v3 §6.6). Every flag is `false` in v0.1, and a flag
 /// may be `true` only for a surface this build implements.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FeaturesConfig {
     pub feed_generators: bool,
@@ -1054,7 +1060,7 @@ impl FeaturesConfig {
 }
 
 /// `[honest_501]` (design-v3 §6.1, §6.6).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Honest501Config {
     /// The `<link>` of every 501 message. Empty drops the sentence that
@@ -1070,7 +1076,7 @@ pub struct Honest501Config {
 }
 
 /// The state of a `[services.<name>]` block (design-v3 §6.7.2.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceState {
     #[default]
@@ -1093,7 +1099,7 @@ impl ServiceState {
 /// One `[services.<name>]` block (design-v3 §6.7.2). Every key but `state`
 /// and `methods` is accepted only with `state = "proxy"`; `crate::services`
 /// validates the rest.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServiceConfig {
     pub state: ServiceState,
@@ -1114,7 +1120,7 @@ pub struct ServiceConfig {
 
 /// A decimal config value. Compared bitwise, so the config stays `Eq` (a NaN
 /// equals itself here; validation rejects one anyway).
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct Float(pub f64);
 
@@ -1127,7 +1133,7 @@ impl PartialEq for Float {
 impl Eq for Float {}
 
 /// `[schema_backfill]`: the post-migration column backfill (design-v3 §12.2).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchemaBackfillConfig {
     /// Rows per batch.
@@ -1146,7 +1152,7 @@ impl Default for SchemaBackfillConfig {
 }
 
 /// `[schema_index]`: the post-migration index builds (design-v3 §12.2).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchemaIndexConfig {
     /// The first wait after a failed build; it doubles up to an hour.
@@ -1160,7 +1166,7 @@ impl Default for SchemaIndexConfig {
 }
 
 /// `[thread]`: bounds on one thread response (design-v3 §5.1).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThreadConfig {
     /// Nodes in one response: anchor, parents and replies.
@@ -1182,7 +1188,7 @@ impl Default for ThreadConfig {
 }
 
 /// `[thread_mutes]`: the cap on one member's muted threads (design-v3 §4.5).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThreadMutesConfig {
     /// Threads one member may have muted; `muteThread` past it is a 400.
@@ -1197,7 +1203,7 @@ impl Default for ThreadMutesConfig {
 
 /// `[activity_subscriptions]`: the cap on one member's subscriptions
 /// (design-v3 §4.5).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ActivitySubscriptionsConfig {
     /// Accounts one member may subscribe to; a new one past it is a 400.
@@ -1212,7 +1218,7 @@ impl Default for ActivitySubscriptionsConfig {
 
 /// `bookmarks.emit_count` (design-v3 §8.2, locked decision 27): when a
 /// post view carries `bookmarkCount`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BookmarkCount {
     /// Never: safe at any size.
@@ -1225,7 +1231,7 @@ pub enum BookmarkCount {
 }
 
 /// `[bookmarks]` (design-v3 §5.8, §8.2).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BookmarksConfig {
     /// Posts one member may bookmark; another past it is a 400.
@@ -1249,7 +1255,7 @@ impl Default for BookmarksConfig {
 /// post's video embed's view is built. A private post's video always plays
 /// from the MP4 blob on the author's PDS, whatever this says
 /// (private-video-pds design).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoPlayback {
     /// HLS on the video CDN (`video.cdn_url`), with a thumbnail. The URLs
@@ -1262,7 +1268,7 @@ pub enum VideoPlayback {
 
 /// `[video]` (private-posting design, Addendum A, as amended by the
 /// private-video-pds design): public posts' videos only.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
     pub playback: VideoPlayback,
@@ -1280,7 +1286,7 @@ impl Default for VideoConfig {
 }
 
 /// `[labelers]` (design-v3 §5.7).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LabelersConfig {
     /// Labelers one `getServices` request may name.
@@ -1294,7 +1300,7 @@ impl Default for LabelersConfig {
 }
 
 /// `[labels]` (design-v3 §5.12).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LabelsConfig {
     /// Patterns one `queryLabels` request may carry.
@@ -1308,7 +1314,7 @@ impl Default for LabelsConfig {
 }
 
 /// `[drafts]` (design-v3 §5.9).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DraftsConfig {
     /// Drafts one member may keep; another past it is `DraftLimitReached`.
@@ -1327,7 +1333,7 @@ impl Default for DraftsConfig {
 }
 
 /// `[notifications]` (design-v3 §5.6).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NotificationsConfig {
     /// How old a post may be and still be announced to its author's
@@ -1346,7 +1352,7 @@ impl Default for NotificationsConfig {
 /// `[farsight]`: the block and block-list index this AppView asks about
 /// inbound list blocks (design-v3 §5.14.4). With `url` unset, no call is
 /// ever made.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FarsightConfig {
     /// Base URL of the Farsight instance; `https` only.
@@ -1376,7 +1382,7 @@ pub struct FarsightConfig {
 /// blocks a live answer reported, so they keep applying while Farsight
 /// gives no answer and across a restart. Off by default. The numbers are
 /// signed and, with the switch off, only parsed.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FarsightMemoryConfig {
     pub enabled: bool,
@@ -1407,7 +1413,7 @@ impl Default for FarsightMemoryConfig {
 /// of range rather than of the wrong type: with the switch off they are
 /// only parsed, and a config that never enables the fallback always
 /// starts.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FarsightFallbackConfig {
     pub enabled: bool,
@@ -1462,7 +1468,7 @@ impl Default for FarsightConfig {
 }
 
 /// `[known_likers]` (design-v3 §8.2).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KnownLikersConfig {
     /// Constellation pages one thread view may read for `knownLikers`.
@@ -1476,7 +1482,7 @@ impl Default for KnownLikersConfig {
 }
 
 /// `[thread_v2]` (design-v3 §5.1).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThreadV2Config {
     /// Parents `getPostThreadV2` returns above the anchor.
@@ -1490,7 +1496,7 @@ impl Default for ThreadV2Config {
 }
 
 /// `[op_thread]` (design-v3 §8.2).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OpThreadConfig {
     /// Stored posts one feed item's walk along its author's thread may
@@ -1505,7 +1511,7 @@ impl Default for OpThreadConfig {
 }
 
 /// `[suggestions]` (design-v3 §7.1 – §7.3, §13).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SuggestionsConfig {
     /// An account is suggested only if it posted within this many days.
@@ -1551,7 +1557,7 @@ impl Default for SuggestionsConfig {
 
 /// One entry of `unspecced.live_now`: an account whose live status may
 /// link to these domains.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiveNow {
     pub did: String,
@@ -1559,7 +1565,7 @@ pub struct LiveNow {
 }
 
 /// `[unspecced]` (design-v3 §7.6): what `getConfig` answers.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UnspeccedConfig {
     /// An operator policy switch: the AppView holds no account's email.
@@ -1569,7 +1575,7 @@ pub struct UnspeccedConfig {
 
 /// One entry of `trends.suggested_topics`, in the lexicon's shape. An
 /// entry without `topic` and `link` does not parse.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuggestedTopic {
     pub topic: String,
@@ -1579,7 +1585,7 @@ pub struct SuggestedTopic {
 }
 
 /// `[trends]` (design-v3 §7.4, §7.5, §13).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TrendsConfig {
     /// The window trending topics count posts over.
@@ -1641,7 +1647,7 @@ impl Default for TrendsConfig {
 }
 
 /// `[search]` (design-v3 §9.0, §13).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SearchConfig {
     /// The longest one search statement may run; past it the search is
@@ -1683,7 +1689,7 @@ impl Default for SearchConfig {
 }
 
 /// `threadlens.access`: who may call Thread Lens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadLensAccess {
     /// Ready members only. Anyone else is refused `NotEnrolled` or
@@ -1698,7 +1704,7 @@ pub enum ThreadLensAccess {
 
 /// `[threadlens]` (design-v3 §5.15, §13): who may call Thread Lens, and the
 /// bounds of one response.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThreadLensConfig {
     /// Who may call. An anonymous caller is refused under either value.
@@ -1732,7 +1738,7 @@ impl Default for ThreadLensConfig {
 }
 
 /// `[lists]` (design-v3 §5.5).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ListsConfig {
     /// Owner-PDS pages one `getList` request reads when no AppView answers.
@@ -1785,7 +1791,7 @@ impl Default for ListsConfig {
 }
 
 /// `[known_followers]` (design-v3 §5.3).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KnownFollowersConfig {
     /// Constellation pages one `getKnownFollowers` scan may read.
@@ -1802,7 +1808,7 @@ impl Default for KnownFollowersConfig {
 }
 
 /// `[starter_packs]` (design-v3 §5.5).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StarterPacksConfig {
     /// How often every stored pack's joined counts are refreshed.
@@ -1817,7 +1823,7 @@ impl Default for StarterPacksConfig {
 
 /// `[auth]`: limits on token verification done before the per-requester
 /// backstop (design-v3 §II-8.3).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     /// Failed verifications per IP key, all issuers together.
@@ -1861,7 +1867,7 @@ impl Default for AuthConfig {
 
 /// One rate-limit class (design-v3 §10): `per_sec` tokens a second, `burst`
 /// at most. A class table gives both keys.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateClassConfig {
     pub per_sec: f64,
@@ -1887,7 +1893,7 @@ impl Eq for RateClassConfig {}
 
 /// `[rate_limits]` (design-v3 §10): every number is operator config. The
 /// defaults are the rates that used to be constants.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimitsConfig {
     pub anon_read: RateClassConfig,
@@ -1950,7 +1956,7 @@ impl RateLimitsConfig {
 }
 
 /// Everything read from `app.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
     pub rate_limits: RateLimitsConfig,

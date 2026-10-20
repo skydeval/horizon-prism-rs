@@ -3,6 +3,11 @@
 <script src="{{ js }}" defer></script>{% endblock %}
 {% block content %}
 <h1>{{ title }}</h1>
+{% if !notices.is_empty() %}
+<div class="banner">app.toml changed under settings you saved here. Your saved values still apply; on each setting's
+page you can keep yours or take the file's.
+{% for n in notices %}<br><a href="{{ n.href }}">{{ n.name }}</a>: {{ n.text }}{% endfor %}</div>
+{% endif %}
 <div class="home-row">
 <div class="home-side" id="tiles">
 {% include "tiles.html" %}

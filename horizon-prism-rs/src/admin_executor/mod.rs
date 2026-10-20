@@ -7,5 +7,5 @@
 pub mod commands;
 pub mod executor;
 
-pub use commands::{Actor, AdminCommand, Handlers, InvalidCommand, LABEL_VALUES, OperatorDeps, Outcome};
+pub use commands::{Actor, AdminCommand, Change, Handlers, InvalidCommand, LABEL_VALUES, OperatorDeps, Outcome, SettingsDeps};
 pub use executor::{AdminExecutor, CHANNEL};

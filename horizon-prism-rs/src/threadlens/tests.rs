@@ -152,7 +152,10 @@ fn state(h: Hydrator, l: Ladder, access: ThreadLensAccess) -> ThreadLensState {
     fetcher.set_key(STRANGER, signing_key(5));
     fetcher.set_key(R2, signing_key(6));
     let (auth, _d) = verifier(fetcher, 10, 4);
+    let live = crate::admin::settings::LiveSettings::default();
+    live.update(|v| v.threadlens_access = access);
     ThreadLensState {
+        live,
         app: AppState {
             hydrator: h,
             auth: Arc::new(auth),

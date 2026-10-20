@@ -181,7 +181,12 @@ docker compose exec -T db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB
 
 ## Web admin UI
 
-`app` serves an admin UI at `https://<APP_PUBLIC_HOSTNAME>/admin`: Home with a live feed of what Prism indexes, members (list with readiness, add, remove, deny, allow), operators, and the audit log (every change, who made it and how it ended, and the sign-ins; `/admin/activity` redirects there). Every change it makes is an admin command, run exactly as the CLI's, with the operator who asked recorded.
+`app` serves an admin UI at `https://<APP_PUBLIC_HOSTNAME>/admin`: Home with a live feed of what Prism indexes, members (list with readiness, add, remove, deny, allow), settings, operators, and the audit log (every change, who made it and how it ended, and the sign-ins; `/admin/activity` redirects there). Every change it makes is an admin command, run exactly as the CLI's, with the operator who asked recorded.
+
+- **Settings.** `/admin/settings` has a page per group (who can use Prism, what it stores, private posts, blocks, what apps see, extra services, limits, profiles, account lookups). Each setting shows what it does, the value saved now, the default, the value `config/app.toml` writes if it writes one, the last change, and whether it applies at once or after a restart. A saved value is kept in the database (`operator_settings`) and layered over `config/app.toml` at every start; the file itself is never written. Saving a page checks the whole configuration first, so a value Prism would refuse to start with is never saved. The membership switches, Thread Lens access, `getConfig`'s answers and the trends texts apply at once; everything else is saved at once and applies after a restart, and every page then says how many changes are waiting. Public data has its own switch on the "What Prism stores" page. Two read-only pages show what was set at install (with why it cannot be changed there) and everything Prism is running with, without secrets. Every change is kept in `operator_settings_history`.
+- **When the file and a saved value disagree.** A value saved in the UI wins over `config/app.toml`. If an upgrade or an edit changes the file under a saved value, the saved value still applies, Home lists the setting, and its page offers "Use the file's value" or "Keep my value". If a saved value no longer works after an upgrade, Prism starts without it (and the settings that must go with it), logs `operator_setting_set_aside`, and every page says so until it is fixed or cleared in the UI.
+- **Restart.** With `APP_SUPERVISED=1` (set in the shipped `docker-compose.yml`, where `restart: unless-stopped` starts `app` again), the UI can restart `app`: it shuts down as it does for `docker compose stop` and exits with code 75. Without it the button says to ask whoever runs the server. `admin restart` does the same from the command line.
+- **From the command line.** `admin settings list`, `admin settings get <key>`, `admin settings set <key> <value>` (a list separated by commas, or JSON) and `admin settings reset <key>` do what the pages do, with the same checks.
 
 - **The live feed.** Home shows, as it happens, the records Prism writes from the network, backfill and `requestRecord`: time, source, action, kind, author, and for a public post its first 100 characters (`admin.live_feed_snippets = false` turns those off). Never a private post's content, an audience's members or any record's subject. Lines are sampled to about 50 a second per viewer; the rates beside them are exact. It is a server-sent event stream at `/admin/live`: the shipped `Caddyfile` proxies that path without compression and flushes it at once, and a Caddyfile of your own needs the same block. Watching does not keep a session alive. At most 2 pages per session and 8 in all stream at once.
 
@@ -199,6 +204,7 @@ Commands that change state are executed by the running `app` service, not by the
 - `member add` and `member remove`;
 - `member deny <did> [--reason <text>]` and `member allow <did>` (below);
 - `operator add`, `operator remove`, `operator host add` and `operator host remove` (above);
+- `settings set`, `settings reset` and `restart` (above);
 - `label add` and `label remove`;
 - `scope rebuild`, `backfill` and `resync`;
 - `deadletter replay` and `deadletter drop`;
@@ -207,7 +213,7 @@ Commands that change state are executed by the running `app` service, not by the
 
 The CLI queues the command and waits up to `admin.command_timeout_secs` (600 s) for the result. If it times out, the command keeps running, and `admin commands list` shows its state. `app` must be running for these commands to take effect.
 
-Read-only commands (`… list`, `stream info`, `migrate status`, `keygen`, `setup-code`, `identity compare`) run directly.
+Read-only commands (`… list`, `settings get`, `stream info`, `migrate status`, `keygen`, `setup-code`, `identity compare`) run directly.
 
 ### Denying membership
 

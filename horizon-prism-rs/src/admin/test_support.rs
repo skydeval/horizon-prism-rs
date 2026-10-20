@@ -15,10 +15,18 @@ use tokio::sync::oneshot;
 
 use super::live::Hub;
 use super::operators::OperatorIdentity;
-use super::{AdminSettings, AdminState, MembersInfo, router};
+use super::{AdminSettings, AdminState, router};
 use crate::aggregations::{ScopeSets, ScopeState};
 use crate::config::ScopePolicy;
 use crate::identity::DidDocInfo;
+
+/// The configuration the admin tests run with: auto-join off.
+#[must_use]
+pub fn no_auto_join() -> crate::config::FileConfig {
+    let mut file = crate::config::FileConfig::default();
+    file.community.auto_enroll = false;
+    file
+}
 
 /// The operator of [`serve`]'s sessions.
 pub const OPERATOR: &str = "did:plc:oooooooooooooooooooooooo";
@@ -78,7 +86,7 @@ pub async fn serve(pool: &PgPool, hub: Hub, identity: Option<Arc<dyn OperatorIde
         session_idle: Duration::from_secs(28_800),
         session_max: Duration::from_secs(604_800),
         setup_code_file: std::env::temp_dir().join(format!("hprs-live-{}", rand::random::<u32>())),
-        members: MembersInfo { auto_enroll: false, max_members: 1000, enroll_pds_patterns: Vec::new() },
+        settings: super::settings::SettingsContext::from_file(no_auto_join()),
     };
     let scope = ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10_000);
     let identity = identity.unwrap_or_else(|| Arc::new(FixedIdentity));

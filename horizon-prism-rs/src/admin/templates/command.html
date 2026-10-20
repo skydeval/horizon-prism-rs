@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block head %}{% if row.pending() %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
+{% block head %}{% if row.pending() %}<meta http-equiv="refresh" content="2">{% else if restart == Some(false) %}<meta http-equiv="refresh" content="5">{% endif %}{% endblock %}
 {% block content %}
 <h1>{{ row.what }}</h1>
 <div class="card">
@@ -7,6 +7,8 @@
 <div class="fact"><span class="l">Asked by</span><span class="v">{{ row.who }}</span></div>
 <div class="fact"><span class="l">When</span><span class="v">{{ row.when }}</span></div>
 {% if row.pending() %}<p class="muted">This page reloads until the change is done.</p>{% endif %}
+{% if restart == Some(false) %}<p class="banner">Prism is restarting. This page reloads every 5 seconds until Prism is back. If your browser shows an error page instead, wait a minute and reload it.</p>{% endif %}
+{% if restart == Some(true) %}<p class="banner ok">Prism has restarted.</p>{% endif %}
 {% if !row.raw.is_empty() %}<details><summary>Details</summary><pre>{{ row.raw }}</pre></details>{% endif %}
 <p class="muted tech">technical name: {{ row.command }} · command {{ row.id }}</p>
 </div>

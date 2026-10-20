@@ -62,6 +62,9 @@ use health::{AuditLatch, HealthState, PROBE_TIMEOUT};
 
 /// Exit code for configuration errors and the migration gate (EX_CONFIG).
 pub const EXIT_CONFIG: u8 = 78;
+/// Exit code after a restart from the admin UI (admin-ui design §8.5,
+/// EX_TEMPFAIL): the supervisor starts `serve` again.
+pub const EXIT_RESTART: u8 = 75;
 /// Timeout for the startup Redis connection.
 pub const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the in-process gauges `viewer_private_cache_entries` and
@@ -139,12 +142,12 @@ async fn redis_manager(url: &str) -> Result<ConnectionManager, StartupError> {
         .map_err(|e| StartupError::new(1, format!("redis connect: {e}")))
 }
 
-/// Run `serve` until SIGTERM or Ctrl-C.
+/// Run `serve` until SIGTERM, Ctrl-C or a restart from the admin UI.
 ///
 /// # Errors
 ///
 /// A [`StartupError`] carrying the exit code.
-pub async fn run() -> Result<(), StartupError> {
+pub async fn run() -> Result<Stopped, StartupError> {
     // A Phase B test build says what it is before its config loads, so on
     // every start, a failed one included: on stderr, which no log filter
     // suppresses, and at error level in the log.
@@ -166,6 +169,13 @@ pub async fn run() -> Result<(), StartupError> {
         let origins: Vec<String> = cfg.file.standin.hosts.iter().map(|h| format!("{} {:?}", h.origin, h.intents)).collect();
         tracing::error!(event = "standin_hosts_origins", ?origins, "these private test origins are reachable on a request's first hop");
     }
+    // `app.toml` as a table, for the saved settings' overlay after the
+    // migration gate (admin-ui design §8.1).
+    let config_path = crate::config::config_path(&|var| std::env::var(var).ok());
+    let file_table: toml::Table = std::fs::read_to_string(&config_path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| text.parse().map_err(|e: toml::de::Error| e.to_string()))
+        .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {}: {e}", config_path.display())))?;
     init_tracing(&cfg.env.log_level);
     PrometheusBuilder::new()
         .with_http_listener(cfg.file.metrics.bind)
@@ -190,6 +200,28 @@ pub async fn run() -> Result<(), StartupError> {
         );
         source
     };
+
+    let pool = crate::db::connect(&cfg)
+        .await
+        .map_err(|e| StartupError::new(1, format!("database connect: {e}")))?;
+    match enforce_gate(&pool, cfg.env.allow_startup_migrate).await {
+        Ok(outcome) => tracing::info!(event = "migration_gate_passed", ?outcome, "migration gate passed"),
+        Err(e) => {
+            let code = u8::try_from(GateError::exit_code(&e)).unwrap_or(1);
+            return Err(StartupError::new(code, format!("migration gate: {e}")));
+        }
+    }
+    // The settings saved in the admin UI (admin-ui design §8.1, §8.4),
+    // layered over the file unit by unit; a unit that no longer validates
+    // is set aside, never a reason not to start. Everything from here on
+    // reads the effective configuration.
+    let file_only = cfg.file.clone();
+    let cfg = crate::admin::settings::store::at_startup(&pool, cfg, &file_table)
+        .await
+        .map_err(|e| StartupError::new(1, format!("admin settings: {e}")))?
+        .cfg;
+    let live = crate::admin::settings::LiveSettings::new(&cfg.file);
+    let restart = crate::admin::settings::RestartHandle::default();
     // The effective head age, for the release check (private-threads design
     // §5), and the bucket note of §3.4.
     tracing::info!(
@@ -205,28 +237,17 @@ pub async fn run() -> Result<(), StartupError> {
             "sync.max_head_fetches_per_request is above sync.read_fetch_rate_per_host: a private thread's head round can find a host's bucket empty and miss"
         );
     }
-
-    let pool = crate::db::connect(&cfg)
-        .await
-        .map_err(|e| StartupError::new(1, format!("database connect: {e}")))?;
-    match enforce_gate(&pool, cfg.env.allow_startup_migrate).await {
-        Ok(outcome) => tracing::info!(event = "migration_gate_passed", ?outcome, "migration gate passed"),
-        Err(e) => {
-            let code = u8::try_from(GateError::exit_code(&e)).unwrap_or(1);
-            return Err(StartupError::new(code, format!("migration gate: {e}")));
-        }
-    }
     // First-run setup (admin-ui design §5.2): while no operator exists, the
     // setup code is kept or made, and printed now and every 10 minutes.
-    let admin_settings = crate::admin::AdminSettings::from_config(&cfg);
+    let setup_code_file = crate::admin::setup_code::file_path(&cfg.env.data_dir);
     let mut setup_reprint = None;
     if cfg.file.admin.web_ui {
-        match crate::admin::setup_code::at_startup(&pool, &admin_settings.setup_code_file).await {
+        match crate::admin::setup_code::at_startup(&pool, &setup_code_file).await {
             Ok(Some(open)) => {
                 crate::admin::setup_code::print(&open, &cfg.env.public_hostname);
                 setup_reprint = Some(crate::admin::setup_code::spawn_reprint(
                     pool.clone(),
-                    admin_settings.setup_code_file.clone(),
+                    setup_code_file.clone(),
                     cfg.env.public_hostname.clone(),
                 ));
             }
@@ -646,7 +667,13 @@ pub async fn run() -> Result<(), StartupError> {
             public: public.clone(),
             operators: crate::admin_executor::OperatorDeps {
                 identity: Some(Arc::new(resolver.with_intent(Intent::Internal))),
-                setup_code_file: Some(admin_settings.setup_code_file.clone()),
+                setup_code_file: Some(setup_code_file.clone()),
+            },
+            settings: crate::admin_executor::SettingsDeps {
+                config_path: Some(config_path.clone()),
+                env: Some(cfg.env.clone()),
+                live: Some(live.clone()),
+                restart: restart.clone(),
             },
         })
         .spawn(),
@@ -753,8 +780,8 @@ pub async fn run() -> Result<(), StartupError> {
             op_thread_max_walk: cfg.file.op_thread.max_walk,
             search: cfg.file.search.clone(),
             suggestions: cfg.file.suggestions.clone(),
-            unspecced: cfg.file.unspecced.clone(),
             trends: cfg.file.trends.clone(),
+            live: live.clone(),
             farsight: farsight.clone(),
             list_budget,
             list_applier: Some(applier.clone()),
@@ -800,13 +827,10 @@ pub async fn run() -> Result<(), StartupError> {
         hydrator,
         auth: Arc::new(glue.verifier.clone()),
         limits,
-        enroller: Some(AutoEnroller::new(
-            &cfg,
-            pool.clone(),
-            scope.clone(),
-            Arc::clone(&private),
-            resolver.with_intent(Intent::Public),
-        )),
+        enroller: Some(
+            AutoEnroller::new(&cfg, pool.clone(), scope.clone(), Arc::clone(&private), resolver.with_intent(Intent::Public))
+                .with_live(live.clone()),
+        ),
         trusted_proxy: cfg.file.http.trusted_proxy,
         did_document: Arc::new(glue.service_key.did_document()),
         membership: crate::xrpc::handlers::membership::MembershipSettings::new(private.as_ref(), &cfg.file.private_read),
@@ -863,6 +887,7 @@ pub async fn run() -> Result<(), StartupError> {
         app: app.clone(),
         ladder: Ladder::new(app.hydrator.clone(), did_router.clone(), cascade, slingshot),
         cfg: cfg.file.threadlens.clone(),
+        live: live.clone(),
         // Without a configured key, cursors do not outlive the process.
         cursor_key: cfg
             .env
@@ -888,12 +913,20 @@ pub async fn run() -> Result<(), StartupError> {
     // its OAuth fetches through the public transport, its identity work
     // through the internal one (§5.10).
     let admin_routes = if let Some(hub) = &live_hub {
+        let settings = crate::admin::settings::SettingsContext::new(
+            cfg.file.clone(),
+            file_only,
+            file_table,
+            live.clone(),
+            crate::admin::settings::EnvFacts::from_env(&cfg.env),
+            lodestar.clone(),
+        );
         let admin = crate::admin::AdminState::new(
             pool.clone(),
             scope.clone(),
             Arc::new(resolver.with_intent(Intent::Internal)),
             Arc::new(crate::admin::oauth::NetFetch(nets.public().client().clone())),
-            admin_settings,
+            crate::admin::AdminSettings::from_config(&cfg, settings),
             hub.clone(),
         );
         tasks.push(admin.spawn_housekeeping());
@@ -923,10 +956,14 @@ pub async fn run() -> Result<(), StartupError> {
     );
     // Graceful shutdown waits for open connections, so the live streams
     // are ended first (admin-ui-live-feed design §3.5). A restart from the
-    // UI must resolve this same future.
+    // UI resolves this same future (admin-ui design §8.5).
+    let restarting = restart.clone();
     axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+            tokio::select! {
+                () = shutdown_signal() => {}
+                () = restarting.wait() => {}
+            }
             if let Some(hub) = live_hub {
                 hub.close();
             }
@@ -936,8 +973,22 @@ pub async fn run() -> Result<(), StartupError> {
     for t in tasks {
         t.abort();
     }
+    if restart.requested() {
+        tracing::warn!(event = "serve_stopped", exit_code = EXIT_RESTART, "shutdown complete; exiting for a restart");
+        return Ok(Stopped::Restart);
+    }
     tracing::info!(event = "serve_stopped", "shutdown complete");
-    Ok(())
+    Ok(Stopped::Signal)
+}
+
+/// How `serve` ended without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// SIGTERM or Ctrl-C: exit 0.
+    Signal,
+    /// A restart from the admin UI: exit [`EXIT_RESTART`] for the
+    /// supervisor to start it again.
+    Restart,
 }
 
 /// The private-read floors, once at startup (timing-floors design §2): `info`

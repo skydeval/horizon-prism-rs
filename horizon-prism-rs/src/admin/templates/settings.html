@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Each page lists its settings with what they do, the value saved now and the default. Some apply at once;
+the others apply after a restart. Every change is recorded in the audit log.</p>
+
+{% if !aside.is_empty() %}
+<h2>Saved settings that could not be used</h2>
+<div class="banner bad">When Prism last started, these saved values did not work with the rest of the settings, so Prism
+used the values from app.toml instead. Change or clear them on their page.</div>
+<div class="scroll">
+<table>
+<thead><tr><th>Setting</th><th>Problem</th></tr></thead>
+<tbody>
+{% for n in aside %}<tr><td><a href="{{ n.href }}">{{ n.name }}</a></td><td>{{ n.text }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+
+{% if !waiting.is_empty() %}
+<h2>Changes waiting for a restart</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>Setting</th><th>Change</th></tr></thead>
+<tbody>
+{% for n in waiting %}<tr><td><a href="{{ n.href }}">{{ n.name }}</a></td><td>{{ n.text }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+
+<div class="grid">
+{% for g in groups %}
+<div class="card">
+<h2><a href="/admin/settings/{{ g.slug }}">{{ g.title }}</a></h2>
+<p class="muted">{{ g.summary }}</p>
+</div>
+{% endfor %}
+</div>
+
+<h2>Read only</h2>
+<div class="card">
+<p><a href="/admin/settings/installed">Set when Prism was installed</a>: addresses, keys and connections that only
+whoever runs the server can change, and why.</p>
+<p><a href="/admin/settings/running">Everything Prism is running with</a>: every setting in use now, with secrets
+removed.</p>
+</div>
+{% endblock %}

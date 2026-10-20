@@ -108,10 +108,16 @@ impl AdminExecutor {
             }
             tracing::info!(event = "admin_command_started", id = row.id, command = %row.command, "admin command started");
             let actor = Actor::from_requested_by(row.requested_by.clone());
-            match self.handlers.execute(&cmd, &actor).await {
+            match self.handlers.execute_row(Some(row.id), &cmd, &actor).await {
                 Outcome::Done(result) => {
                     self.settle(row.id, "done", &result).await?;
                     executed += 1;
+                    // A restart is triggered only once its row says done
+                    // (admin-ui design §8.5); nothing else runs after it.
+                    if cmd == AdminCommand::Restart {
+                        self.handlers.settings.restart.trigger();
+                        return Ok(executed);
+                    }
                 }
                 Outcome::Failed(error) => {
                     self.settle(row.id, "failed", &json!({ "error": error })).await?;
@@ -242,7 +248,7 @@ mod tests {
         source: Arc<dyn BackfillSource>,
         dead_letter_stream: &str,
     ) -> Option<(TestDb, AdminExecutor, ScopeState)> {
-        setup_full(name, sets, private, source, dead_letter_stream, crate::admin_executor::OperatorDeps::default()).await
+        setup_full(name, sets, private, source, dead_letter_stream, crate::admin_executor::OperatorDeps::default(), crate::admin_executor::SettingsDeps::default()).await
     }
 
     async fn setup_full(
@@ -252,6 +258,7 @@ mod tests {
         source: Arc<dyn BackfillSource>,
         dead_letter_stream: &str,
         operators: crate::admin_executor::OperatorDeps,
+        settings: crate::admin_executor::SettingsDeps,
     ) -> Option<(TestDb, AdminExecutor, ScopeState)> {
         let Ok(redis_url) = std::env::var("HPRS_TEST_REDIS_URL") else {
             eprintln!("HPRS_TEST_REDIS_URL unset; skipping executor test");
@@ -282,6 +289,7 @@ mod tests {
                 crate::indexing::PublicModeSettings::from_config(&crate::config::IndexingConfig::default()),
             ),
             operators,
+            settings,
         };
         Some((db, AdminExecutor::new(handlers), scope))
     }
@@ -604,7 +612,7 @@ mod tests {
             setup_code_file: Some(code_file.clone()),
         };
         let Some((db, exec, _)) =
-            setup_full("admin_operators", ScopeSets::default(), Arc::new(DisabledPrivateTier), Arc::new(NoNetwork), &test_stream(), operators).await
+            setup_full("admin_operators", ScopeSets::default(), Arc::new(DisabledPrivateTier), Arc::new(NoNetwork), &test_stream(), operators, crate::admin_executor::SettingsDeps::default()).await
         else {
             return;
         };
@@ -676,6 +684,103 @@ mod tests {
         assert_eq!((cli, ui_rows), (7, 6));
         let _ = std::fs::remove_dir_all(&dir);
         db.drop_db().await;
+    }
+
+    /// Settings deps over a fresh `app.toml` in a temporary directory.
+    fn settings_deps(supervised: bool) -> (crate::admin_executor::SettingsDeps, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hprs-exec-settings-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("app.toml");
+        std::fs::write(&path, "").expect("app.toml");
+        let deps = crate::admin_executor::SettingsDeps {
+            config_path: Some(path),
+            env: Some(crate::admin::settings::tests::env(supervised, false)),
+            live: Some(crate::admin::settings::LiveSettings::default()),
+            restart: crate::admin::settings::RestartHandle::default(),
+        };
+        (deps, dir)
+    }
+
+    /// T-A9, T-A10b through the queue: a live key (`threadlens.access`)
+    /// changes the live values at once; the operator who asked, or `cli`,
+    /// is recorded in the row and its history with the command's id.
+    #[tokio::test]
+    async fn settings_set_through_the_queue() {
+        use crate::admin::settings::store::Change;
+        use crate::config::ThreadLensAccess;
+
+        let (deps, dir) = settings_deps(false);
+        let live = deps.live.clone().expect("live");
+        let Some((db, exec, _)) =
+            setup_full("admin_settings_set", ScopeSets::default(), Arc::new(DisabledPrivateTier), Arc::new(NoNetwork), &test_stream(), crate::admin_executor::OperatorDeps::default(), deps).await
+        else {
+            return;
+        };
+        let p = &db.pool;
+        let change = |key: &str, value: Value, base_version| AdminCommand::SettingsSet { changes: vec![Change { key: key.into(), value: Some(value), base_version }] };
+        let id = crate::cli::dispatch::submit_as(p, &change("threadlens.access", json!("members"), 0), Some(PURGING)).await.expect("submit");
+        exec.drain().await.expect("drain");
+        let r = done(wait(p, id, Duration::from_secs(10), Duration::from_millis(10)).await.expect("wait"));
+        assert_eq!(r["changed"][0]["applies"], "now");
+        assert_eq!(live.load().threadlens_access, ThreadLensAccess::Members, "applied at once");
+        let (by, command): (String, Option<i64>) =
+            sqlx::query_as("SELECT changed_by, command_id FROM operator_settings_history WHERE key = 'threadlens.access'").fetch_one(p).await.expect("history");
+        assert_eq!((by.as_str(), command), (PURGING, Some(id)));
+        let by: String = sqlx::query_scalar("SELECT updated_by FROM operator_settings WHERE key = 'threadlens.access'").fetch_one(p).await.expect("row");
+        assert_eq!(by, PURGING);
+        // From the CLI: `cli`. A restart key leaves the live values alone.
+        let before = live.version();
+        let r = done(run(&exec, p, change("retention.tombstone_days", json!(3), 0)).await);
+        assert_eq!(r["changed"][0]["applies"], "restart");
+        assert_eq!(live.version(), before);
+        let by: String = sqlx::query_scalar("SELECT updated_by FROM operator_settings WHERE key = 'retention.tombstone_days'").fetch_one(p).await.expect("row");
+        assert_eq!(by, "cli");
+        // A stale change fails and changes nothing.
+        let stale = run(&exec, p, change("threadlens.access", json!("signed_in"), 0)).await;
+        assert!(matches!(&stale, Finished::Failed(v) if v["error"].as_str().is_some_and(|e| e.contains("someone else"))), "{stale:?}");
+        assert_eq!(live.load().threadlens_access, ThreadLensAccess::Members);
+        let _ = std::fs::remove_dir_all(&dir);
+        db.drop_db().await;
+    }
+
+    /// T-A11: without `APP_SUPERVISED` the restart fails and nothing stops;
+    /// with it, the row is `done` before the shutdown is asked for, and
+    /// nothing queued after it runs.
+    #[tokio::test]
+    async fn restart_only_under_a_supervisor() {
+        for supervised in [false, true] {
+            let (deps, dir) = settings_deps(supervised);
+            let restart = deps.restart.clone();
+            let Some((db, exec, _)) = setup_full(
+                if supervised { "admin_restart_on" } else { "admin_restart_off" },
+                ScopeSets::default(),
+                Arc::new(DisabledPrivateTier),
+                Arc::new(NoNetwork),
+                &test_stream(),
+                crate::admin_executor::OperatorDeps::default(),
+                deps,
+            )
+            .await
+            else {
+                return;
+            };
+            let p = &db.pool;
+            let id = submit(p, &AdminCommand::Restart).await.expect("submit");
+            let after = submit(p, &AdminCommand::IndexingStatus).await.expect("submit");
+            exec.drain().await.expect("drain");
+            if supervised {
+                assert_eq!(state(p, id).await, "done");
+                assert!(restart.requested(), "the shutdown is asked for once the row is done");
+                assert_eq!(state(p, after).await, "queued", "nothing runs after a restart");
+            } else {
+                let failed = wait(p, id, Duration::from_secs(1), Duration::from_millis(10)).await.expect("wait");
+                assert!(matches!(&failed, Finished::Failed(v) if v["error"].as_str().is_some_and(|e| e.contains("cannot restart itself"))), "{failed:?}");
+                assert!(!restart.requested());
+                assert_eq!(state(p, after).await, "done");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            db.drop_db().await;
+        }
     }
 
     async fn state(pool: &PgPool, id: i64) -> String {

@@ -17,12 +17,14 @@
 //! under the `ScopeState` guard.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use moka::future::Cache;
 use sqlx::PgPool;
 
 use super::ScopeState;
+use crate::admin::settings::LiveSettings;
 use super::membership::{AddOutcome, add_member, is_denied};
 use crate::config::AppConfig;
 use crate::identity::refresher::RepoStatus;
@@ -61,10 +63,15 @@ pub struct AutoEnroller {
     private: Arc<dyn PrivateTier>,
     resolver: IdentityResolver,
     net: NetClient,
-    enabled: bool,
-    max_members: i64,
-    max_per_hour: i64,
-    patterns: Arc<Vec<String>>,
+    /// `community.auto_enroll`, `max_members`, `max_auto_enroll_per_hour`
+    /// and `enroll_pds_patterns`, read at each call (admin-ui design §8.5).
+    live: LiveSettings,
+    /// The `community` network's patterns, for an empty
+    /// `enroll_pds_patterns`. The routing table changes only at a restart.
+    community_patterns: Arc<Vec<String>>,
+    /// The live values' version the refusal cache was last cleared at: a
+    /// change clears it, so it takes effect at the next call.
+    seen: Arc<AtomicU64>,
     /// A member's budget of list references (design-v3 §4.3).
     list_budget: Budget,
     refused: Cache<String, &'static str>,
@@ -79,27 +86,24 @@ impl AutoEnroller {
         let resolver = resolver.with_intent(Intent::Public);
         let net = resolver.net().clone();
         let c = &cfg.file.community;
-        let patterns = if c.enroll_pds_patterns.is_empty() {
-            cfg.file
-                .constellation
-                .networks
-                .iter()
-                .find(|n| n.name == crate::config::COMMUNITY_NETWORK)
-                .map(|n| n.pds_patterns.clone())
-                .unwrap_or_default()
-        } else {
-            c.enroll_pds_patterns.clone()
-        };
+        let community_patterns = cfg
+            .file
+            .constellation
+            .networks
+            .iter()
+            .find(|n| n.name == crate::config::COMMUNITY_NETWORK)
+            .map(|n| n.pds_patterns.clone())
+            .unwrap_or_default();
+        let live = LiveSettings::new(&cfg.file);
         Self {
             pool,
             scope,
             private,
             resolver,
             net,
-            enabled: c.auto_enroll,
-            max_members: i64::from(c.max_members),
-            max_per_hour: i64::from(c.max_auto_enroll_per_hour),
-            patterns: Arc::new(patterns),
+            seen: Arc::new(AtomicU64::new(live.version())),
+            live,
+            community_patterns: Arc::new(community_patterns),
             list_budget: Budget {
                 max_references: cfg.file.lists.subscribed_max_per_member,
                 max_owners: cfg.file.lists.max_owners_per_member,
@@ -108,6 +112,23 @@ impl AutoEnroller {
                 .max_capacity(100_000)
                 .time_to_live(Duration::from_secs(c.enroll_refusal_cache_secs))
                 .build(),
+        }
+    }
+
+    /// Read `[community]` from `live`, the values the admin UI swaps.
+    #[must_use]
+    pub fn with_live(mut self, live: LiveSettings) -> Self {
+        self.seen = Arc::new(AtomicU64::new(live.version()));
+        self.live = live;
+        self
+    }
+
+    /// Drop every cached refusal when the live values changed since the
+    /// last call (admin-ui design §8.5's apply hook).
+    fn follow_live(&self) {
+        let now = self.live.version();
+        if self.seen.swap(now, Ordering::AcqRel) != now {
+            self.refused.invalidate_all();
         }
     }
 
@@ -144,10 +165,12 @@ impl AutoEnroller {
         if is_denied(&mut *self.pool.acquire().await?, did).await? {
             return Ok(self.refuse_denied());
         }
+        self.follow_live();
         if let Some(reason) = self.refused.get(did).await {
             return Ok(Enrollment::Refused(reason));
         }
-        if !self.enabled {
+        let live = self.live.load();
+        if !live.auto_enroll {
             return Ok(self.refuse(did, "disabled").await);
         }
         // 1. PDS host and hosting confirmation (network, before any guard).
@@ -160,7 +183,8 @@ impl AutoEnroller {
         let Some(host) = pds_host(&endpoint) else {
             return Ok(self.refuse(did, "no_pds").await);
         };
-        if !self.patterns.iter().any(|p| host_matches(&host, p)) {
+        let patterns = if live.enroll_pds_patterns.is_empty() { self.community_patterns.as_slice() } else { live.enroll_pds_patterns.as_slice() };
+        if !patterns.iter().any(|p| host_matches(&host, p)) {
             return Ok(self.refuse(did, "pds_not_community").await);
         }
         let url = format!("https://{host}/xrpc/com.atproto.sync.getRepoStatus?did={did}");
@@ -182,10 +206,11 @@ impl AutoEnroller {
         )
         .fetch_one(&self.pool)
         .await?;
-        if members >= self.max_members {
+        let live = self.live.load();
+        if members >= i64::from(live.max_members) {
             return Ok(self.refuse(did, "max_members").await);
         }
-        if recent >= self.max_per_hour {
+        if recent >= i64::from(live.max_auto_enroll_per_hour) {
             // Transient: do not cache the refusal for an hour.
             metrics::counter!(METRIC_REFUSED, "reason" => REFUSED_RATE).increment(1);
             return Ok(Enrollment::Refused(REFUSED_RATE));

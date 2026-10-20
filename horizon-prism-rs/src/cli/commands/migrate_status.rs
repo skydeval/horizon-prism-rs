@@ -96,6 +96,8 @@ mod tests {
             "0032_admin_ui",
             // Scope recency S1 (#740).
             "0033_scope_recency",
+            // The web admin UI, S2: settings (#754).
+            "0034_operator_settings_history",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

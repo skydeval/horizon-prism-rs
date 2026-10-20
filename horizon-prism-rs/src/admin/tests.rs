@@ -5,6 +5,8 @@
 
 // The live feed (admin-ui-live-feed design §11).
 mod feed;
+// The settings pages (admin-ui design §6.3, §8).
+mod settings_pages;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -170,7 +172,7 @@ async fn harness_with(name: &str, timing: live::Timing, snippets: bool) -> Optio
         session_idle: Duration::from_secs(28_800),
         session_max: Duration::from_secs(604_800),
         setup_code_file: code_file.clone(),
-        members: MembersInfo { auto_enroll: false, max_members: 1000, enroll_pds_patterns: Vec::new() },
+        settings: settings::SettingsContext::from_file(test_support::no_auto_join()),
     };
     let hub = live::Hub::with_timing(snippets, timing);
     let admin = AdminState::new(
@@ -811,6 +813,10 @@ async fn t_a16_headers_everywhere() {
         "/admin/activity",
         "/admin/tiles",
         "/admin/operators",
+        "/admin/settings",
+        "/admin/settings/access",
+        "/admin/settings/installed",
+        "/admin/settings/running",
         "/admin/nowhere",
         "/admin/login",
         js,

@@ -251,6 +251,32 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// T-A9 (admin-ui design §15): `community.auto_enroll` off → on applies
+    /// at the next call although a refusal was cached; `max_members` too.
+    #[tokio::test]
+    async fn auto_enroll_follows_the_live_settings() {
+        let Some(db) = fresh_db("xrpc_enroll_live").await else {
+            return;
+        };
+        let p = &db.pool;
+        let cfg = app_config("[community]\nauto_enroll = false\n");
+        let scope = hydrator(p, ScopeSets::default()).scope().clone();
+        let resolver = IdentityResolver::new(Transports::loopback_for_tests(), p.clone(), IdentitySettings::from_app(&cfg), Arc::new(scope.clone()), Intent::Internal);
+        let live = crate::admin::settings::LiveSettings::new(&cfg.file);
+        let enroller = AutoEnroller::new(&cfg, p.clone(), scope, Arc::new(KryphocronPrivateTier), resolver).with_live(live.clone());
+        assert_eq!(enroller.check(ALICE).await.expect("check"), Enrollment::Refused("disabled"));
+        assert_eq!(enroller.cached_refusal_for_tests(ALICE).await, Some("disabled"));
+        live.update(|v| v.auto_enroll = true);
+        // The cached refusal is gone; the account goes on to the PDS check,
+        // which no server answers here.
+        assert_eq!(enroller.check(ALICE).await.expect("check"), Enrollment::Refused("unresolvable"));
+        live.update(|v| v.max_members = 0);
+        assert_eq!(enroller.admit_for_tests(BOB).await.expect("admit"), Enrollment::Refused("max_members"));
+        live.update(|v| v.max_members = 10);
+        assert_eq!(enroller.admit_for_tests(CAROL).await.expect("admit"), Enrollment::Enrolled);
+        db.drop_db().await;
+    }
+
     /// With no enroller, the gate's own state: a non-member is notEligible.
     #[tokio::test]
     async fn without_an_enroller_a_non_member_is_not_eligible() {

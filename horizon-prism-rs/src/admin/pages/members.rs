@@ -132,10 +132,11 @@ pub async fn page(
             at: when(at),
         })
         .collect();
-    let patterns = if state.members.enroll_pds_patterns.is_empty() {
+    let members = state.members();
+    let patterns = if members.enroll_pds_patterns.is_empty() {
         "the servers of your own network".to_string()
     } else {
-        state.members.enroll_pds_patterns.join(", ")
+        members.enroll_pds_patterns.join(", ")
     };
     render(
         StatusCode::OK,
@@ -148,8 +149,8 @@ pub async fn page(
             denials,
             total,
             ready,
-            max_members: state.members.max_members,
-            auto_enroll: state.members.auto_enroll,
+            max_members: members.max_members,
+            auto_enroll: members.auto_enroll,
             patterns,
             page,
             prev: (page > 0).then(|| page - 1),

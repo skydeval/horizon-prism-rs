@@ -2,7 +2,9 @@
 //! shell under `/admin`, first-run setup, operator sign-in with ATProto
 //! OAuth and the host re-check, CSRF and confirmations, the members screen
 //! (#735), the audit log and the operators page; and Home's live feed of
-//! what Prism indexes (admin-ui-live-feed.md).
+//! what Prism indexes (admin-ui-live-feed.md). Slice S2: the settings
+//! pages, the saved settings layered over `app.toml`, the live values and
+//! the restart (`settings`, `pages::settings`).
 //!
 //! Served by `serve` itself on its own origin, merged before
 //! `xrpc::router::finalize`, so it sits inside the global per-IP limit
@@ -17,6 +19,7 @@ pub mod live;
 pub mod oauth;
 pub mod operators;
 pub mod pages;
+pub mod settings;
 pub mod setup_code;
 
 use std::net::IpAddr;
@@ -41,6 +44,7 @@ use crate::aggregations::ScopeState;
 use crate::config::AppConfig;
 use auth::Limits;
 use operators::OperatorIdentity;
+use settings::SettingsContext;
 
 /// Request bodies the admin router accepts (§3).
 pub const BODY_LIMIT: usize = 64 * 1024;
@@ -76,7 +80,8 @@ pub const NO_STORE: &str = "no-store, no-transform";
 #[derive(Debug, Clone, Copy)]
 pub struct LivePage;
 
-/// What the members screen shows of `[community]` (membership design §8).
+/// What the members screen shows of `[community]` (membership design §8),
+/// read from the live values (admin-ui design §8.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembersInfo {
     pub auto_enroll: bool,
@@ -85,30 +90,29 @@ pub struct MembersInfo {
 }
 
 /// The admin UI's settings, from the configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdminSettings {
     pub public_hostname: String,
     pub trusted_proxy: IpAddr,
     pub session_idle: Duration,
     pub session_max: Duration,
     pub setup_code_file: PathBuf,
-    pub members: MembersInfo,
+    /// The settings pages' view of the configuration (§8).
+    pub settings: SettingsContext,
 }
 
 impl AdminSettings {
+    /// From the configuration the process started with; `settings` holds
+    /// it with the file it came from.
     #[must_use]
-    pub fn from_config(cfg: &AppConfig) -> Self {
+    pub fn from_config(cfg: &AppConfig, settings: SettingsContext) -> Self {
         Self {
             public_hostname: cfg.env.public_hostname.clone(),
             trusted_proxy: cfg.file.http.trusted_proxy,
             session_idle: Duration::from_secs(cfg.file.admin.session_idle_secs),
             session_max: Duration::from_secs(cfg.file.admin.session_max_secs),
             setup_code_file: setup_code::file_path(&cfg.env.data_dir),
-            members: MembersInfo {
-                auto_enroll: cfg.file.community.auto_enroll,
-                max_members: u64::from(cfg.file.community.max_members),
-                enroll_pds_patterns: cfg.file.community.enroll_pds_patterns.clone(),
-            },
+            settings,
         }
     }
 }
@@ -124,7 +128,7 @@ pub struct Inner {
     pub session_idle: Duration,
     pub session_max: Duration,
     pub setup_code_file: PathBuf,
-    pub members: MembersInfo,
+    pub settings: SettingsContext,
     pub limits: Limits,
     /// The live feed's hub (admin-ui-live-feed design §4).
     pub live: live::Hub,
@@ -166,10 +170,21 @@ impl AdminState {
             session_idle: settings.session_idle,
             session_max: settings.session_max,
             setup_code_file: settings.setup_code_file,
-            members: settings.members,
+            settings: settings.settings,
             limits: Limits::default(),
             live,
         }))
+    }
+
+    /// `[community]` as it applies now.
+    #[must_use]
+    pub fn members(&self) -> MembersInfo {
+        let v = self.settings.live.load();
+        MembersInfo {
+            auto_enroll: v.auto_enroll,
+            max_members: u64::from(v.max_members),
+            enroll_pds_patterns: v.enroll_pds_patterns.clone(),
+        }
     }
 
     /// Forget the limits' idle keys every minute, for as long as `serve`
@@ -264,6 +279,14 @@ pub fn router(state: AdminState) -> Router {
         .route("/operators/remove", route(post(pages::operators::remove)))
         .route("/operators/hosts/add", route(post(pages::operators::host_add)))
         .route("/operators/hosts/remove", route(post(pages::operators::host_remove)))
+        .route("/settings", route(get(pages::settings::index)))
+        .route("/settings/installed", route(get(pages::settings::installed)))
+        .route("/settings/running", route(get(pages::settings::running)))
+        .route("/settings/reset", route(post(pages::settings::reset)))
+        .route("/settings/keep", route(post(pages::settings::keep)))
+        .route("/settings/public-scope", route(post(pages::settings::public_scope)))
+        .route("/settings/{group}", route(get(pages::settings::group).post(pages::settings::save)))
+        .route("/restart", route(post(pages::settings::restart)))
         .fallback(pages::not_found)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(headers))

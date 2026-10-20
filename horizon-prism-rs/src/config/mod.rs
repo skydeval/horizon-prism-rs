@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 pub use env::{
     DEFAULT_CONFIG_PATH, DEFAULT_DATA_DIR, DEFAULT_LOG_LEVEL, ENV_ALLOW_STARTUP_MIGRATE,
-    ENV_CONFIG_PATH, ENV_CORRELATION_KEY_HEX, ENV_DATA_DIR, ENV_DATABASE_URL, ENV_LOG_LEVEL,
-    ENV_PRIVATE_CURSOR_KEY_HEX, ENV_PUBLIC_HOSTNAME, ENV_REDIS_URL, ENV_SERVICE_SIGNING_KEY_HEX, EnvConfig, Secret32,
+    ENV_CONFIG_PATH, ENV_CORRELATION_KEY_HEX, ENV_DATA_DIR, ENV_DATABASE_URL, ENV_FARSIGHT_TOKEN, ENV_LOG_LEVEL, ENV_THREADLENS_CURSOR_KEY_HEX,
+    ENV_PRIVATE_CURSOR_KEY_HEX, ENV_PUBLIC_HOSTNAME, ENV_REDIS_URL, ENV_SERVICE_SIGNING_KEY_HEX, ENV_SUPERVISED, EnvConfig, Secret32,
     SecretToken, SecretUrl, config_path, validate_hostname,
 };
 pub use sections::{
@@ -81,6 +81,17 @@ pub struct AppConfig {
 }
 
 impl FileConfig {
+    /// Deserialize a TOML table (the file with the admin UI's saved
+    /// settings layered over it). Unknown keys are errors, as in
+    /// [`FileConfig::parse`].
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Parse`] on a wrong type or an unknown key.
+    pub fn from_table(table: toml::Table) -> Result<Self, ConfigError> {
+        toml::Value::Table(table).try_into().map_err(ConfigError::from)
+    }
+
     /// Parse `app.toml` contents. Unknown keys are errors.
     ///
     /// # Errors
@@ -103,6 +114,19 @@ impl FileConfig {
 }
 
 impl AppConfig {
+    /// Build from a parsed file config and an environment, then validate:
+    /// the admin UI's saved settings are layered over `app.toml` as a TOML
+    /// table, parsed, and checked here (admin-ui design §8.1).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] listing every problem found.
+    pub fn from_file(file: FileConfig, env: EnvConfig) -> Result<Self, ConfigError> {
+        let cfg = Self { file, env };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     /// Read `path`, apply the process environment overlay, and validate.
     ///
     /// # Errors

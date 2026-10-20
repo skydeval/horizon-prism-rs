@@ -34,7 +34,9 @@ fn main() -> ExitCode {
     };
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => match runtime.block_on(horizon_prism_rs::serve::run()) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(horizon_prism_rs::serve::Stopped::Signal) => ExitCode::SUCCESS,
+            // A restart from the admin UI: the supervisor starts serve again.
+            Ok(horizon_prism_rs::serve::Stopped::Restart) => ExitCode::from(horizon_prism_rs::serve::EXIT_RESTART),
             Err(e) => {
                 eprintln!("{e}");
                 tracing::error!(event = "serve_failed", error = %e, exit_code = e.exit_code, "serve exited");

@@ -18,6 +18,7 @@
 <nav>
 <a href="/admin"{% if nav.current == "home" %} aria-current="page"{% endif %}>Home</a>
 <a href="/admin/members"{% if nav.current == "members" %} aria-current="page"{% endif %}>Members</a>
+<a href="/admin/settings"{% if nav.current == "settings" %} aria-current="page"{% endif %}>Settings</a>
 <a href="/admin/operators"{% if nav.current == "operators" %} aria-current="page"{% endif %}>Operators</a>
 <a href="/admin/audit"{% if nav.current == "audit" %} aria-current="page"{% endif %}>Audit log</a>
 </nav>
@@ -30,6 +31,15 @@
 {% endif %}
 </header>
 <main>
+{% if let Some(nav) = nav %}
+{% if nav.banners.set_aside > 0 %}
+<div class="banner bad">Some saved settings could not be used: {{ nav.banners.set_aside }} saved setting{% if nav.banners.set_aside != 1 %}s{% endif %} could not be used when Prism last started. <a href="/admin/settings">See which, and why</a>.</div>
+{% endif %}
+{% if nav.banners.waiting > 0 %}
+<div class="banner">Changes waiting for a restart: {{ nav.banners.waiting }} saved change{% if nav.banners.waiting != 1 %}s{% endif %} will apply when Prism restarts. <a href="/admin/settings">See which</a>.
+{% if nav.banners.supervised %}<form class="inline" method="post" action="/admin/restart"><input type="hidden" name="csrf" value="{{ nav.csrf }}"> <button class="secondary" type="submit">Restart Prism…</button></form>{% else %} Ask whoever runs the server to restart Prism.{% endif %}</div>
+{% endif %}
+{% endif %}
 {% block content %}{% endblock %}
 </main>
 </body>

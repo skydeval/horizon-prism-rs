@@ -8,6 +8,7 @@ pub mod home;
 pub mod login;
 pub mod members;
 pub mod operators;
+pub mod settings;
 pub mod setup;
 
 use askama::Template;
@@ -16,7 +17,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use super::auth::Operator;
+use super::auth::{Banners, Operator};
 use super::{AdminState, CSS_HREF};
 use crate::admin_executor::AdminCommand;
 use crate::cli::dispatch::submit_as;
@@ -26,8 +27,11 @@ pub struct Nav {
     /// How the operator is named: handle, else DID.
     pub who: String,
     pub csrf: String,
-    /// The current screen: `home`, `members`, `operators`, `audit`.
+    /// The current screen: `home`, `members`, `settings`, `operators`,
+    /// `audit`.
     pub current: &'static str,
+    /// Changes waiting for a restart, and settings that could not be used.
+    pub banners: Banners,
 }
 
 impl Nav {
@@ -37,6 +41,7 @@ impl Nav {
             who: op.who().to_string(),
             csrf: op.csrf.clone(),
             current,
+            banners: op.banners,
         }
     }
 }
@@ -183,8 +188,31 @@ pub fn describe(command: &str, args: &Value) -> String {
         "lists purge" => format!("Clean up the lists of {}", arg(args, "did")),
         "indexing public-scope" => format!("Set public data to {}", arg(args, "value")),
         "indexing status" => "Read the public data status".to_string(),
+        "settings set" => {
+            let names: Vec<String> = args
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(|changes| changes.iter().filter_map(|c| c.get("key").and_then(Value::as_str)).map(setting_name).collect())
+                .unwrap_or_default();
+            format!("Change settings: {}", names.join(", "))
+        }
+        "restart" => "Restart Prism".to_string(),
         other => other.to_string(),
     }
+}
+
+/// A setting's name on its page, else its key.
+#[must_use]
+pub fn setting_name(key: &str) -> String {
+    let networks: Vec<String> = key
+        .strip_prefix("constellation.networks[")
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(name, _)| vec![name.to_string()])
+        .unwrap_or_default();
+    crate::admin::settings::registry::lookup(key, &networks).map_or_else(
+        || key.to_string(),
+        |(section, field)| if section.fields.len() == 1 { section.title } else { format!("{} ({})", section.title, field.label.to_lowercase()) },
+    )
 }
 
 /// A finished or waiting command's outcome in plain words.
@@ -230,6 +258,16 @@ pub fn outcome(command: &str, state: &str, result: Option<&Value>) -> String {
             "Removed. The list is now empty, so an operator on any server can sign in.".to_string()
         }
         ("operator host remove", _) => "Removed.".to_string(),
+        ("settings set", _) => {
+            let changed = r.get("changed").and_then(Value::as_array).cloned().unwrap_or_default();
+            let now = changed.iter().filter(|c| c.get("applies").and_then(Value::as_str) == Some("now")).count();
+            match (now, changed.len() - now) {
+                (_, 0) => "Saved, and in use now.".to_string(),
+                (0, _) => "Saved. It applies after a restart.".to_string(),
+                _ => "Saved. Some changes are in use now; the others apply after a restart.".to_string(),
+            }
+        }
+        ("restart", _) => "Prism is restarting.".to_string(),
         _ => "Done.".to_string(),
     }
 }

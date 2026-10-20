@@ -85,6 +85,9 @@ services:
       APP_ALLOW_STARTUP_MIGRATE: ${APP_ALLOW_STARTUP_MIGRATE:-0}
       APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
       FARSIGHT_TOKEN: ${FARSIGHT_TOKEN:-}
+      # `restart: unless-stopped` below starts app again after it exits, so
+      # the admin UI's Restart button may stop it.
+      APP_SUPERVISED: "1"
     volumes:
       - app-data:/app/data
       - ./config/app.toml:/app/config/app.toml:ro

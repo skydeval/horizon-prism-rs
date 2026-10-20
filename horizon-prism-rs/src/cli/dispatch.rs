@@ -104,6 +104,27 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: IdentityAction,
     },
+    /// The settings the web admin UI changes (admin-ui design §8).
+    Settings {
+        #[command(subcommand)]
+        action: SettingsAction,
+    },
+    /// Restart serve: it shuts down as at SIGTERM and exits for its
+    /// supervisor to start it again (needs APP_SUPERVISED=1).
+    Restart,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SettingsAction {
+    /// Every setting, with the value saved and app.toml's (read-only).
+    List,
+    /// One setting in full (read-only).
+    Get { key: String },
+    /// Save a value; it applies at once or at the next restart. Lists are
+    /// separated by commas; JSON is accepted too.
+    Set { key: String, value: String },
+    /// Remove the saved value: app.toml's value (or the default) applies.
+    Reset { key: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -296,7 +317,13 @@ impl AdminCmd {
             | Self::Operator { action: OperatorAction::List }
             | Self::SetupCode
             | Self::Identity { .. }
+            | Self::Settings { action: SettingsAction::List | SettingsAction::Get { .. } }
             | Self::Keygen => return Err("read-only commands run in the CLI".to_string()),
+            // They read the saved row's version first: see `settings_change`.
+            Self::Settings { action: SettingsAction::Set { .. } | SettingsAction::Reset { .. } } => {
+                return Err("settings set and reset read the database first".to_string());
+            }
+            Self::Restart => AdminCommand::Restart,
             Self::Operator { action: OperatorAction::Add { account, note } } => AdminCommand::OperatorAdd {
                 input: account.trim().trim_start_matches('@').to_ascii_lowercase(),
                 note: note.clone(),
@@ -440,6 +467,7 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
             | AdminCmd::Operator { action: OperatorAction::List }
             | AdminCmd::SetupCode
             | AdminCmd::Identity { .. }
+            | AdminCmd::Settings { action: SettingsAction::List | SettingsAction::Get { .. } }
     );
     if !is_read_only {
         return None;
@@ -476,11 +504,31 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
                 AdminCmd::Identity { action: IdentityAction::Compare { sample, inputs } } => {
                     commands::identity_compare::render(&cfg, *sample, inputs).await
                 }
+                AdminCmd::Settings { action: SettingsAction::List } => {
+                    commands::settings::render_list(&commands::pool(&cfg).await?, &cfg.file).await.map_err(|e| e.to_string())
+                }
+                AdminCmd::Settings { action: SettingsAction::Get { key } } => {
+                    commands::settings::render_get(&commands::pool(&cfg).await?, &cfg.file, key).await
+                }
                 _ => Err("not a read-only command".to_string()),
             }
         }
         .await,
     )
+}
+
+/// `settings set <key> <value>` or `settings reset <key>` as a command:
+/// the value read as the form reads it, against the saved row's version.
+async fn settings_change(cmd: &AdminCmd, cfg: &AppConfig, pool: &PgPool) -> Result<AdminCommand, String> {
+    let (key, value) = match cmd {
+        AdminCmd::Settings { action: SettingsAction::Set { key, value } } => (key, Some(commands::settings::parse_value(&cfg.file, key, value)?)),
+        AdminCmd::Settings { action: SettingsAction::Reset { key } } => (key, None),
+        _ => return Err("not a settings change".to_string()),
+    };
+    let base_version = commands::settings::version(pool, key).await.map_err(|e| e.to_string())?;
+    let cmd = AdminCommand::SettingsSet { changes: vec![crate::admin_executor::Change { key: key.clone(), value, base_version }] };
+    let (command, args) = cmd.to_row();
+    AdminCommand::parse(command, &args).map_err(|e| e.to_string())
 }
 
 /// `migrate status` (read-only). Returns the process exit code.
@@ -504,12 +552,16 @@ pub async fn run(args: &AdminArgs) -> u8 {
     if let Some(result) = read_only(&args.command).await {
         return finish(result);
     }
-    let cmd = match args.command.to_command() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            return 2;
-        }
+    // `settings set` and `reset` are built once the database is open.
+    let early = match &args.command {
+        AdminCmd::Settings { action: SettingsAction::Set { .. } | SettingsAction::Reset { .. } } => None,
+        other => match other.to_command() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
+        },
     };
     let cfg = match AppConfig::load_from_env() {
         Ok(c) => c,
@@ -524,6 +576,16 @@ pub async fn run(args: &AdminArgs) -> u8 {
             eprintln!("database connect: {e}");
             return 1;
         }
+    };
+    let cmd = match early {
+        Some(c) => c,
+        None => match settings_change(&args.command, &cfg, &pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
+        },
     };
     let id = match submit(&pool, &cmd).await {
         Ok(id) => id,
@@ -602,5 +664,8 @@ mod tests {
         assert!(AdminCmd::Operator { action: OperatorAction::Host { action: HostAction::Add { pattern: "https://x".into() } } }.to_command().is_err());
         assert!(AdminCmd::Operator { action: OperatorAction::List }.to_command().is_err(), "read-only");
         assert!(AdminCmd::SetupCode.to_command().is_err(), "read-only");
+        assert_eq!(AdminCmd::Restart.to_command(), Ok(AdminCommand::Restart));
+        assert!(AdminCmd::Settings { action: SettingsAction::List }.to_command().is_err(), "read-only");
+        assert!(AdminCmd::Settings { action: SettingsAction::Get { key: "threadlens.access".into() } }.to_command().is_err(), "read-only");
     }
 }

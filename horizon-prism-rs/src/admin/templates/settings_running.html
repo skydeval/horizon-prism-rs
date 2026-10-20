@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="muted"><a href="/admin/settings">Settings</a></p>
+<h1>{{ title }}</h1>
+<p class="muted">Every setting as Prism started with it: app.toml with the values saved here layered over it. Secrets
+are kept in .env and are not part of this; passwords in addresses are removed. It shows the values of the last start:
+a change saved since then shows here after the next restart, even one already in use.</p>
+<pre>{{ text }}</pre>
+{% endblock %}

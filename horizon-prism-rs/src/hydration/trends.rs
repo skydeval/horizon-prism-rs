@@ -130,7 +130,7 @@ impl Hydrator {
             "displayName": format!("#{tag}"),
             "link": cfg.topic_link_template.replace("{tag}", &encoded),
         });
-        if let Some(description) = cfg.descriptions.get(tag) {
+        if let Some(description) = self.inner.cfg.live.load().trend_descriptions.get(tag) {
             view["description"] = json!(description);
         }
         view
@@ -191,7 +191,8 @@ impl Hydrator {
         let suggested: Vec<Value> = self
             .inner
             .cfg
-            .trends
+            .live
+            .load()
             .suggested_topics
             .iter()
             .map(|s| {

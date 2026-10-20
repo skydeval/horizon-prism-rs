@@ -192,10 +192,12 @@ pub struct HydrationConfig {
     pub search: crate::config::SearchConfig,
     /// `[suggestions]`.
     pub suggestions: crate::config::SuggestionsConfig,
-    /// `[unspecced]`.
-    pub unspecced: crate::config::UnspeccedConfig,
-    /// `[trends]`.
+    /// `[trends]`. Its `descriptions` and `suggested_topics` are read from
+    /// `live` instead.
     pub trends: crate::config::TrendsConfig,
+    /// The settings that apply at once (admin-ui design §8.5): `[unspecced]`
+    /// and the trends' texts here; Thread Lens reads its access from it too.
+    pub live: crate::admin::settings::LiveSettings,
     /// The block-list index, when `farsight.url` is set.
     pub farsight: Option<Farsight>,
     /// A member's budget of list mutes (`lists.subscribed_max_per_member`,
@@ -454,6 +456,12 @@ impl Hydrator {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.inner.pool
+    }
+
+    /// The settings that apply at once (admin-ui design §8.5).
+    #[must_use]
+    pub fn live(&self) -> &crate::admin::settings::LiveSettings {
+        &self.inner.cfg.live
     }
 
     #[must_use]
@@ -1294,8 +1302,8 @@ pub(crate) mod testing {
             // Every request computes the pools again, so a test sees
             // what it just wrote.
             suggestions: crate::config::SuggestionsConfig { refresh_secs: 0, ..Default::default() },
-            unspecced: crate::config::UnspeccedConfig::default(),
             trends: crate::config::TrendsConfig { cache_ttl_secs: 0, ..Default::default() },
+            live: crate::admin::settings::LiveSettings::default(),
             farsight: None,
             list_budget: Budget { max_references: 2, max_owners: 5 },
             list_applier: None,

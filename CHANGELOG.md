@@ -10,6 +10,65 @@ commit.
 
 ## [Unreleased]
 
+### Added (admin UI S2: settings and restart, #754, #742)
+
+Admin-ui design §6.3, §8, §11, §12 (`docs/internal/design/admin-ui.md`).
+
+- **Settings pages** at `/admin/settings`: one page per group (who can use
+  Prism, what it stores, private posts, blocks, what apps see, extra
+  services, limits, profiles and caching, account lookups), each setting
+  with its plain explanation, the value saved now, the default, the value
+  `app.toml` writes if it writes one, the last change and whether it
+  applies at once or after a restart. Saving a page sends one `settings
+  set` command with every changed field. Public data keeps its own form
+  and command (typed `OFF`). Turning the Farsight fallback on (`ON`) and
+  the memory of blocks off (`OFF`) are typed. Two read-only pages: what
+  was set at install, and everything Prism is running with (URL passwords
+  removed). The registry holds §8.7's keys plus `scope.reply_quote_days`,
+  `like_repost_days`, `rebuild_grace_days` and `sweep_max_purges`
+  (scope-recency §5), `identity.lodestar_url`, `lodestar_request_rate_per_sec`,
+  `lodestar_request_burst` and `lodestar_timeout_ms` (lodestar-reads §2.14),
+  `video.playback` (public videos only), `private_notify.backfill_max_age_hours`
+  and `private_search.max_age_days`.
+- **Saved settings** live in `operator_settings` (migration 0034:
+  `version`, `set_aside`, `file_notice`, and `operator_settings_history`,
+  kept forever) and are layered over `app.toml` at every start, right
+  after the migration gate and before the memory of blocks is emptied.
+  `app.toml` is never written. A change is checked against a fresh read of
+  `app.toml` and the whole configuration with every saved value before it
+  is saved; one made from an out-of-date page fails. Keys valid only
+  together (the fallback pair, the memory block, the twelve timing floors,
+  each rate class, the bookmark counts, Farsight's rate, each network's
+  background rate, lodestar's rate) are applied and set aside together.
+- **The saved value wins over the file** (C-A7). A file change under a
+  saved value is recorded (`operator_setting_file_changed`), listed on
+  Home, and offered as "Use the file's value" or "Keep my value". A saved
+  value that no longer validates after an upgrade is set aside at startup
+  (`operator_setting_set_aside`, gauge `operator_settings_set_aside`) and
+  Prism starts without it; every page says so until it is fixed or cleared.
+- **Live settings:** `community.auto_enroll`, `enroll_pds_patterns`,
+  `max_members`, `max_auto_enroll_per_hour`, `never_ready_expiry_days`,
+  `threadlens.access`, `unspecced.check_email_confirmed`, `unspecced.live_now`,
+  `trends.descriptions` and `trends.suggested_topics` apply at the next
+  request; a change clears the auto-join refusals already cached. Every
+  other setting applies after a restart, and every page counts the changes
+  waiting for one. (`never_ready_expiry_days` is saved and read live, but
+  the hourly expiry task that uses it, membership design §3.2, is not built
+  yet, so it has no effect so far.)
+- **Restart** from the UI and `admin restart`: the command is settled
+  `done`, then `serve` shuts down as at SIGTERM and exits with code 75 for
+  its supervisor to start it again. Refused unless `APP_SUPERVISED=1`,
+  which the shipped `docker/docker-compose.yml` now sets on `app`.
+- **CLI:** `admin settings list`, `admin settings get <key>`, `admin
+  settings set <key> <value>` and `admin settings reset <key>`.
+
+### Changed (admin UI S2, #754)
+
+- `FileConfig` and its sections are serializable, so pages read any key's
+  current and default value.
+- `serve` exits 0 after SIGTERM as before, and 75 after a restart from the
+  admin UI.
+
 ### Added (lodestar identity reads S5, #753)
 
 Lodestar-reads design §2.15, §6.2 (`docs/internal/design/lodestar-reads.md`).
