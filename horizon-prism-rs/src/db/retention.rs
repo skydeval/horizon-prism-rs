@@ -6,9 +6,10 @@
 //! private-tier deletes are a separate task that `private_tier::retention`
 //! registers (§3.2, §4.4); it runs first, so the public `actors` step sees
 //! which private rows remain. Public predicates that depend on private-tier
-//! facts (the private-owner exception for `blocks`, and authors that still
-//! hold private rows for `actors`) receive them through [`RetentionInputs`],
-//! so no private table is named outside `private_tier` (§4.2).
+//! facts (authors that still hold private rows, for `actors`) receive them
+//! through [`RetentionInputs`], so no private table is named outside
+//! `private_tier` (§4.2). Blocks and list blocks are kept only with a member
+//! side (member-blocks-only design §8).
 //!
 //! Deletes run in batches of 10 000 rows with a 100 ms pause between batches.
 //! Each batch is its own statement; predicates are re-evaluated per batch
@@ -154,10 +155,6 @@ pub trait RetentionTask: Send + Sync {
 /// module that owns them.
 #[async_trait]
 pub trait RetentionInputs: Send + Sync {
-    /// The current private-owner set (§6.11.1). Their `app.bsky.graph.block`
-    /// rows are kept (§9.3 rule 3).
-    async fn private_owners(&self) -> Result<Vec<String>, sqlx::Error>;
-
     /// DIDs that still author private-tier rows after the private retention
     /// task ran. Their `actors` rows are kept (class M identity rows).
     async fn private_row_authors(&self) -> Result<Vec<String>, sqlx::Error>;
@@ -246,7 +243,7 @@ fn scoped(
 
 /// Class S / M deletes (§4.4 retention predicates), in dependency order:
 /// content first, then derived counts, then identity rows.
-fn scope_steps(private_owners: Vec<String>, private_row_authors: Vec<String>) -> Vec<Step> {
+fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
     let post_member_exception = member_among(&[
         author_of("p.reply_parent_uri"),
         author_of("p.reply_root_uri"),
@@ -290,17 +287,19 @@ fn scope_steps(private_owners: Vec<String>, private_row_authors: Vec<String>) ->
             ),
             Bind::None,
         ),
+        // Rule M (member-blocks-only design §8): a block is kept only with
+        // a member side, whatever the author's scope.
         scoped(
             "blocks",
             "uri",
             "b",
             "b.author_did",
             &format!(
-                "{} AND NOT {} AND NOT (b.author_did = ANY($1::text[]))",
-                not_in_scope("b.author_did"),
+                "NOT {} AND NOT {}",
+                member_among(&["b.author_did".to_string()]),
                 member_among(&["b.subject_did".to_string()])
             ),
-            Bind::Dids(private_owners),
+            Bind::None,
         ),
         scoped(
             "feed_items",
@@ -385,7 +384,15 @@ fn v3_scope_steps() -> Vec<Step> {
     vec![
         class_s("lists", "ls", "creator_did"),
         class_s("list_items", "li", "author_did"),
-        class_s("list_blocks", "lb", "author_did"),
+        // Rule M (member-blocks-only design §8): a member's list blocks only.
+        scoped(
+            "list_blocks",
+            "uri",
+            "lb",
+            "lb.author_did",
+            &format!("NOT {}", member_among(&["lb.author_did".to_string()])),
+            Bind::None,
+        ),
         class_s("list_optouts", "lo", "author_did"),
         class_s("starter_packs", "sp", "creator_did"),
         class_s("labeler_services", "lsv", "creator_did"),
@@ -687,9 +694,8 @@ impl RetentionTask for PublicRetention {
         scope: &dyn ScopeGuard,
         settings: &RetentionSettings,
     ) -> Result<RetentionReport, sqlx::Error> {
-        let owners = self.inputs.private_owners().await?;
         let private_authors = self.inputs.private_row_authors().await?;
-        let mut steps = scope_steps(owners, private_authors);
+        let mut steps = scope_steps(private_authors);
         steps.extend(age_cap_steps(settings.max_age_days));
         steps.extend(time_steps(settings));
         let mut report = run_steps(pool, scope, &steps).await?;
@@ -806,7 +812,7 @@ mod tests {
             max_age_days: 30,
             trend_aggregate_hours: 72,
         };
-        let mut steps = scope_steps(vec!["did:plc:owner".into()], vec!["did:plc:author".into()]);
+        let mut steps = scope_steps(vec!["did:plc:author".into()]);
         steps.extend(age_cap_steps(settings.max_age_days));
         steps.extend(time_steps(&settings));
         steps
@@ -844,7 +850,7 @@ mod tests {
 
     #[test]
     fn scope_steps_order_content_before_counts_and_identity() {
-        let tables: Vec<&str> = scope_steps(vec![], vec![]).iter().map(|s| s.table).collect();
+        let tables: Vec<&str> = scope_steps(vec![]).iter().map(|s| s.table).collect();
         assert_eq!(
             tables,
             [
@@ -893,28 +899,32 @@ mod tests {
             }
         }
         // A gate outlives its author's scope while its post row is kept.
-        let steps = scope_steps(vec![], vec![]);
+        let steps = scope_steps(vec![]);
         let gate = steps.iter().find(|s| s.table == "threadgates").expect("gate step");
         assert!(gate.sql.contains("NOT EXISTS (SELECT 1 FROM posts x WHERE x.uri = tg.post_uri)"));
     }
 
     #[test]
     fn class_m_exceptions_are_present() {
-        let steps = scope_steps(vec![], vec![]);
+        let steps = scope_steps(vec![]);
         let sql = |t: &str| steps.iter().find(|s| s.table == t).map(|s| s.sql.clone()).unwrap_or_default();
         assert!(sql("posts").contains("split_part(p.reply_parent_uri, '/', 3)"));
         assert!(sql("posts").contains("split_part(p.reply_root_uri, '/', 3)"));
         assert!(sql("posts").contains("split_part(p.quote_uri, '/', 3)"));
         assert!(sql("likes").contains("split_part(l.subject_uri, '/', 3)"));
         assert!(sql("follows").contains("m.did IN (f.subject_did)"));
-        assert!(sql("blocks").contains("b.author_did = ANY($1::text[])"));
+        // Rule M (member-blocks-only design §8): blocks and list blocks by
+        // member side, not by scope.
+        assert!(sql("blocks").contains("m.did IN (b.author_did)") && sql("blocks").contains("m.did IN (b.subject_did)"));
+        assert!(!sql("blocks").contains("scope_dids"));
+        assert!(sql("list_blocks").contains("m.did IN (lb.author_did)") && !sql("list_blocks").contains("scope_dids"));
     }
 
     #[test]
     fn binds_carry_private_inputs_and_days() {
-        let steps = scope_steps(vec!["did:plc:o".into()], vec!["did:plc:a".into()]);
+        let steps = scope_steps(vec!["did:plc:a".into()]);
         let blocks = steps.iter().find(|s| s.table == "blocks").expect("blocks step");
-        assert_eq!(blocks.bind, Bind::Dids(vec!["did:plc:o".into()]));
+        assert_eq!(blocks.bind, Bind::None);
         let actors = steps.iter().find(|s| s.table == "actors").expect("actors step");
         assert_eq!(actors.bind, Bind::Dids(vec!["did:plc:a".into()]));
 
@@ -1032,7 +1042,7 @@ mod tests {
 
     #[test]
     fn scope_steps_run_per_did_and_time_steps_do_not() {
-        for step in scope_steps(vec![], vec![]) {
+        for step in scope_steps(vec![]) {
             let candidates = step.candidates.as_deref().unwrap_or_else(|| panic!("{} per DID", step.table));
             assert!(candidates.starts_with("SELECT DISTINCT "), "{}", step.table);
             assert!(candidates.ends_with("LIMIT 500"), "{}", step.table);
@@ -1050,13 +1060,13 @@ mod tests {
 
     #[test]
     fn per_did_delete_binds_the_did_after_the_step_bind() {
-        let steps = scope_steps(vec![], vec![]);
+        let steps = scope_steps(vec![]);
         let sql = |t: &str| steps.iter().find(|s| s.table == t).map(|s| s.sql.clone()).unwrap_or_default();
         assert!(sql("posts").contains("WHERE p.author_did = $1 AND "));
         assert!(sql("feed_items").contains("WHERE fi.originator_did = $1 AND "));
         assert!(sql("post_counts").contains("WHERE split_part(pc.post_uri, '/', 3) = $1 AND "));
-        // blocks and actors bind a DID array first.
-        assert!(sql("blocks").contains("WHERE b.author_did = $2 AND "));
+        assert!(sql("blocks").contains("WHERE b.author_did = $1 AND "));
+        // actors binds a DID array first.
         assert!(sql("actors").contains("WHERE a.did = $2 AND "));
     }
 
@@ -1081,9 +1091,6 @@ mod tests {
 
         #[async_trait]
         impl RetentionInputs for NoPrivate {
-            async fn private_owners(&self) -> Result<Vec<String>, sqlx::Error> {
-                Ok(Vec::new())
-            }
             async fn private_row_authors(&self) -> Result<Vec<String>, sqlx::Error> {
                 Ok(Vec::new())
             }
@@ -1240,6 +1247,105 @@ mod tests {
             growth.commit().await.expect("commit growth");
             retention.await.expect("retention task");
             assert!(post_exists(&db.pool, &uri).await, "the re-entered DID keeps its rows");
+            db.drop_db().await;
+        }
+
+        const MEMBER: &str = "did:plc:mmmmmmmmmmmmmmmmmmmmmmmm";
+        const SCOPED: &str = "did:plc:ssssssssssssssssssssssss";
+        const STRANGER: &str = "did:plc:tttttttttttttttttttttttt";
+        const LONE: &str = "did:plc:llllllllllllllllllllllll";
+        const OTHER: &str = "did:plc:oooooooooooooooooooooooo";
+
+        async fn exec(pool: &PgPool, sql: &str) {
+            sqlx::query(sql).execute(pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+
+        async fn block(pool: &PgPool, author: &str, rkey: &str, subject: &str) {
+            exec(pool, &format!(
+                "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) \
+                 VALUES ('at://{author}/app.bsky.graph.block/{rkey}', '{author}', '{subject}', '3k', now())"
+            ))
+            .await;
+        }
+
+        async fn list_block(pool: &PgPool, author: &str) {
+            exec(pool, &format!(
+                "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) \
+                 VALUES ('at://{author}/app.bsky.graph.listblock/3klb', '{author}', '3klb', 'bafy', '3k', 'at://{OTHER}/app.bsky.graph.list/3kl', now())"
+            ))
+            .await;
+        }
+
+        async fn rows(pool: &PgPool, sql: &str) -> Vec<String> {
+            sqlx::query_scalar(sql).fetch_all(pool).await.expect(sql)
+        }
+
+        /// T-MB4 (member-blocks-only design §8, §12): one run deletes
+        /// exactly the blocks and list blocks with no member side, scope or
+        /// not; an identity row out of S whose only rows were such blocks
+        /// goes, and one in S stays.
+        #[tokio::test]
+        async fn blocks_with_no_member_side_are_deleted() {
+            let Some(db) = fresh_db().await else { return };
+            let p = &db.pool;
+            exec(p, &format!("INSERT INTO members (did, source) VALUES ('{MEMBER}', 'admin')")).await;
+            exec(p, &format!("INSERT INTO scope_dids (did, reasons) VALUES ('{MEMBER}', 1), ('{SCOPED}', 4)")).await;
+            for d in [SCOPED, LONE] {
+                exec(p, &format!(
+                    "INSERT INTO actors (did, handle, pds_endpoint, profile_record) VALUES ('{d}', '{d}', 'https://pds.example.com', '{{}}'::jsonb)"
+                ))
+                .await;
+            }
+            block(p, STRANGER, "nn", OTHER).await; // no member side: goes
+            block(p, STRANGER, "nm", MEMBER).await; // names a member: stays
+            block(p, MEMBER, "mn", OTHER).await; // a member's: stays
+            block(p, SCOPED, "sn", OTHER).await; // in S, no member side: goes
+            block(p, LONE, "ln", OTHER).await; // out of S, its only row: goes
+            list_block(p, SCOPED).await; // a non-member's: goes
+            list_block(p, MEMBER).await; // a member's: stays
+
+            let report = run_public(p).await;
+            assert!(report.deleted.contains(&("blocks", 3)), "{report:?}");
+            assert!(report.deleted.contains(&("list_blocks", 1)), "{report:?}");
+            let left = rows(p, "SELECT uri FROM blocks ORDER BY uri").await;
+            assert_eq!(
+                left,
+                [format!("at://{MEMBER}/app.bsky.graph.block/mn"), format!("at://{STRANGER}/app.bsky.graph.block/nm")]
+            );
+            assert_eq!(rows(p, "SELECT author_did FROM list_blocks").await, [MEMBER]);
+            // The identity row out of S went with its blocks; the one in S stays.
+            assert_eq!(rows(p, "SELECT did FROM actors ORDER BY did").await, [SCOPED]);
+            db.drop_db().await;
+        }
+
+        /// T-MB4: a member added while retention reaches the DID (the
+        /// membership commits under the DID's lock) keeps its blocks.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_member_added_meanwhile_keeps_its_blocks() {
+            let Some(db) = fresh_db().await else { return };
+            block(&db.pool, SCOPED, "sn", OTHER).await;
+            list_block(&db.pool, SCOPED).await;
+
+            let mut join = db.pool.begin().await.expect("begin");
+            sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended('did:' || $1, 0))")
+                .bind(SCOPED)
+                .execute(&mut *join)
+                .await
+                .expect("shared DID lock");
+            sqlx::query("INSERT INTO members (did, source) VALUES ($1, 'admin')")
+                .bind(SCOPED)
+                .execute(&mut *join)
+                .await
+                .expect("uncommitted member");
+
+            let pool = db.pool.clone();
+            let retention = tokio::spawn(async move { run_public(&pool).await });
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!retention.is_finished(), "retention waits for the membership");
+            join.commit().await.expect("commit member");
+            retention.await.expect("retention task");
+            assert_eq!(rows(&db.pool, "SELECT author_did FROM blocks").await, [SCOPED]);
+            assert_eq!(rows(&db.pool, "SELECT author_did FROM list_blocks").await, [SCOPED]);
             db.drop_db().await;
         }
     }

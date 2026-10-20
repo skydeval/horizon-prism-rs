@@ -100,8 +100,8 @@ impl StartupError {
     }
 }
 
-/// `retention` inputs: the owner set from `ScopeState`, and private row
-/// authors from the private tier (after `PrivateRetention` ran).
+/// `retention` inputs: private row authors from the private tier (after
+/// `PrivateRetention` ran), and the tombstone counts kept in `ScopeState`.
 struct ScopeRetentionInputs {
     scope: ScopeState,
     pool: sqlx::PgPool,
@@ -109,12 +109,6 @@ struct ScopeRetentionInputs {
 
 #[async_trait]
 impl RetentionInputs for ScopeRetentionInputs {
-    async fn private_owners(&self) -> Result<Vec<String>, sqlx::Error> {
-        let mut owners: Vec<String> = self.scope.snapshot().await.private_owners.into_iter().collect();
-        owners.sort();
-        Ok(owners)
-    }
-
     async fn private_row_authors(&self) -> Result<Vec<String>, sqlx::Error> {
         crate::private_tier::retention::row_authors(&self.pool).await
     }

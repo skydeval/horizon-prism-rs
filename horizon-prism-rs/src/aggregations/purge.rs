@@ -416,12 +416,11 @@ impl Purger {
         let mut total = 0;
         loop {
             let guard = self.scope.read_guard().await;
-            let owners: Vec<String> = guard.private_owners.iter().cloned().collect();
             // Read per batch: a switch between batches decides the rest.
             let off_rule = guard.public.mode.off_rule();
             let mut tx = self.pool.begin().await?;
             lock_dids_shared(&mut tx, &[did.to_string()]).await?;
-            let n = self.batch(&mut tx, did, kind, &owners, off_rule).await?;
+            let n = self.batch(&mut tx, did, kind, off_rule).await?;
             tx.commit().await?;
             drop(guard);
             total += n;
@@ -441,7 +440,6 @@ impl Purger {
         conn: &mut PgConnection,
         did: &str,
         kind: PurgeKind,
-        owners: &[String],
         off_rule: bool,
     ) -> Result<u64, sqlx::Error> {
         let mut n = 0;
@@ -515,7 +513,7 @@ impl Purger {
                 // A non-member's posts have no references (public-indexing
                 // design §4.1).
                 n += delete_batch(conn, "member_post_refs", "uri", "author_did = $1", did).await?;
-                n += member_removed_public_batch(conn, did, owners).await?;
+                n += member_removed_public_batch(conn, did).await?;
                 if off_rule {
                     n += member_removed_off_batch(conn, did).await?;
                 }
@@ -670,10 +668,11 @@ async fn delete_batch(
 }
 
 /// Class-M public rows admitted only because `did` was a member (§6.11.7):
-/// rule-2 interactions on its content by authors outside S, and inbound-block
-/// sentinel rows. A post that also names another current member as parent,
-/// root or quote author stays.
-async fn member_removed_public_batch(conn: &mut PgConnection, did: &str, owners: &[String]) -> Result<u64, sqlx::Error> {
+/// rule-2 interactions on its content by authors outside S, inbound-block
+/// sentinel rows, and every block and list block with no member side left
+/// (member-blocks-only design §7). A post that also names another current
+/// member as parent, root or quote author stays.
+async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
     const AUTHOR_OF: &str = "split_part(%s, '/', 3)";
     let author_of = |col: &str| AUTHOR_OF.replace("%s", col);
     let out_of_scope = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = t.author_did)";
@@ -708,19 +707,28 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str, owners:
         "DELETE FROM follows WHERE uri IN (SELECT uri FROM follows t WHERE subject_did = $1 AND {out_of_scope} LIMIT {BATCH})"
     );
     n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
-    // Blocks: rule-2 rows (unless the author is a private owner, rule 3) and
-    // every inbound-block sentinel row for this member.
+    // Blocks, by Rule M (member-blocks-only design §7): blocks of the member
+    // by authors that are not members, and every inbound-block sentinel row
+    // for it; the member's own blocks of non-members; its list blocks. A
+    // block between it and another member stays.
+    let non_member = |col: &str| format!("NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.{col})");
     let sql = format!(
         "DELETE FROM blocks WHERE uri IN (SELECT uri FROM blocks t WHERE subject_did = $1 \
-         AND (t.rev = $2 OR ({out_of_scope} AND NOT (t.author_did = ANY($3)))) LIMIT {BATCH})"
+         AND (t.rev = $2 OR {}) LIMIT {BATCH})",
+        non_member("author_did")
     );
     n += sqlx::query(&sql)
         .bind(did)
         .bind(SENTINEL_REV)
-        .bind(owners)
         .execute(&mut *conn)
         .await?
         .rows_affected();
+    let sql = format!(
+        "DELETE FROM blocks WHERE uri IN (SELECT uri FROM blocks t WHERE author_did = $1 AND {} LIMIT {BATCH})",
+        non_member("subject_did")
+    );
+    n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
+    n += delete_batch(conn, "list_blocks", "uri", "author_did = $1", did).await?;
     Ok(n)
 }
 
@@ -728,12 +736,12 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str, owners:
 /// stored only because `did` was a member. Its likes, reposts and list
 /// records; its follows of non-members; and non-members' follows of it.
 /// In Filling and On these rows are stored for anyone in S, so they stay.
+/// Its list blocks go in every mode (`member_removed_public_batch`).
 async fn member_removed_off_batch(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
     let mut n = 0;
     for (table, column) in [
         ("likes", "author_did"),
         ("reposts", "author_did"),
-        ("list_blocks", "author_did"),
         ("lists", "creator_did"),
         ("list_items", "author_did"),
         ("list_optouts", "author_did"),
@@ -850,7 +858,8 @@ mod tests {
             .await
             .expect("post");
         }
-        // A sentinel inbound block by an in-scope author goes; a real one stays.
+        // A sentinel inbound block by an in-scope author goes; so does a real
+        // one, which has no member side left (member-blocks-only design §7).
         for (rkey, rev) in [("1", SENTINEL_REV), ("2", "3kaaaaaaaaaaa")] {
             sqlx::query(
                 "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, $4, now())",
@@ -909,8 +918,7 @@ mod tests {
         assert_eq!(count(p, "SELECT count(*) FROM likes").await, 1);
         assert_eq!(count(p, "SELECT count(*) FROM likes WHERE author_did = 'did:plc:dddddddddddddddddddddddd'").await, 1);
         assert_eq!(count(p, "SELECT count(*) FROM posts").await, 1);
-        assert_eq!(count(p, "SELECT count(*) FROM blocks").await, 1);
-        assert_eq!(count(p, "SELECT count(*) FROM blocks WHERE rev = '3kaaaaaaaaaaa'").await, 1);
+        assert_eq!(count(p, "SELECT count(*) FROM blocks").await, 0);
         assert_eq!(count(p, "SELECT count(*) FROM notification_seen").await, 0);
         for table in ["list_mutes", "thread_mutes", "bookmarks", "drafts", "activity_subscriptions", "notification_preferences_v2"] {
             assert_eq!(count(p, &format!("SELECT count(*) FROM {table}")).await, 1, "{table}: only the other member's row is left");
@@ -1086,8 +1094,9 @@ mod tests {
         let (_, purger) = purger_in(p, PublicMode::Off);
         purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("purge");
         // Another member's follow of it, and its follow of another member,
-        // stay; its blocks and profile stay.
-        assert_eq!(left(p).await, (0, 0, vec!["1".to_string(), "2".to_string()], 2));
+        // stay; its profile stays, and its block of a non-member goes
+        // (member-blocks-only design §7).
+        assert_eq!(left(p).await, (0, 0, vec!["1".to_string(), "2".to_string()], 1));
         db.drop_db().await;
     }
 
@@ -1105,7 +1114,9 @@ mod tests {
         let (_, purger) = purger_in(p, PublicMode::Filling);
         purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("purge");
         // Only the outsider's follow of it goes: its author is outside S.
-        assert_eq!(left(p).await, (6, 0, vec!["1".to_string(), "2".to_string(), "3".to_string(), "5".to_string()], 2));
+        // Its list block and its block of a non-member go in every mode
+        // (member-blocks-only design §7).
+        assert_eq!(left(p).await, (5, 0, vec!["1".to_string(), "2".to_string(), "3".to_string(), "5".to_string()], 1));
         db.drop_db().await;
     }
 
@@ -1128,8 +1139,53 @@ mod tests {
         }
         purger.run_batches(MEMBER, PurgeKind::MemberRemoved).await.expect("batches");
         purger.end(MEMBER).await.expect("end");
-        assert_eq!(left(p).await, (6, 0, vec!["1".to_string(), "2".to_string(), "3".to_string(), "5".to_string()], 2));
+        assert_eq!(left(p).await, (5, 0, vec!["1".to_string(), "2".to_string(), "3".to_string(), "5".to_string()], 1));
         db.drop_db().await;
+    }
+
+    /// T-MB5 (member-blocks-only design §7): after a `member_removed`
+    /// purge, every block with no member side left is gone, in every mode;
+    /// a block between the removed member and another member stays.
+    #[tokio::test]
+    async fn member_removed_keeps_only_blocks_with_a_member_side() {
+        use crate::indexing::PublicMode;
+
+        for (mode, name) in [(PublicMode::On, "purge_mb_on"), (PublicMode::Off, "purge_mb_off")] {
+            let Some(db) = fresh_db(name).await else {
+                return;
+            };
+            let p = &db.pool;
+            for did in [MEMBER, OTHER_MEMBER] {
+                exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{did}', 'admin', now())")).await;
+            }
+            for did in [MEMBER, OTHER_MEMBER, SCOPED] {
+                exec(p, &format!("INSERT INTO scope_dids (did, reasons) VALUES ('{did}', 1)")).await;
+            }
+            let block = |rkey: &str, author: &str, subject: &str| {
+                format!(
+                    "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES \
+                     ('at://{author}/app.bsky.graph.block/{rkey}', '{author}', '{subject}', '3k', now())"
+                )
+            };
+            for sql in [
+                block("mn", MEMBER, OTHER_MEMBER),
+                block("mx", MEMBER, OUTSIDER),
+                block("ym", SCOPED, MEMBER),
+                block("nm", OTHER_MEMBER, MEMBER),
+                format!(
+                    "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) \
+                     VALUES ('at://{MEMBER}/app.bsky.graph.listblock/1', '{MEMBER}', '1', 'c', '3k', 'l', now())"
+                ),
+            ] {
+                exec(p, &sql).await;
+            }
+            let (_, purger) = purger_in(p, mode);
+            purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("purge");
+            let left: Vec<String> = sqlx::query_scalar("SELECT split_part(uri, '/', 5) FROM blocks ORDER BY 1").fetch_all(p).await.expect("blocks");
+            assert_eq!(left, ["mn", "nm"], "{mode:?}");
+            assert_eq!(count(p, "SELECT count(*) FROM list_blocks").await, 0, "{mode:?}");
+            db.drop_db().await;
+        }
     }
 
     /// `account_deleted` deletes the account's references in every mode.

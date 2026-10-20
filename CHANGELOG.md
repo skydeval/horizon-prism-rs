@@ -10,6 +10,25 @@ commit.
 
 ## [Unreleased]
 
+### Changed (member blocks only, S2, #761)
+
+Member-blocks-only design S2 (`docs/internal/design/member-blocks-only.md`).
+
+- **Retention deletes stored blocks with no member side**, including those
+  stored before S1, and a removed member's own blocks of non-members and its
+  list blocks in every mode. The first nightly run after the upgrade deletes
+  the backlog in its usual paced batches;
+  `docs/internal/phaseb/pbmb1_member_blocks.sql` counts it beforehand.
+- Retention keeps a block, private block or list block only with a member
+  side: a `blocks` or `private_blocks` row whose author and subject are both
+  non-members goes, and a `list_blocks` row whose author is not a member.
+  Being in scope, or a private owner, no longer keeps one. The cleanup shows
+  in `retention_deleted_rows_total{table="blocks"}`, `{table="list_blocks"}`
+  and `{table="private_blocks"}`.
+- A `member_removed` purge deletes blocks of the member by non-members, the
+  member's own blocks and private blocks of non-members, and its list blocks
+  in every public-indexing mode. Blocks between it and another member stay.
+
 ### Changed (member blocks only, S1, #760)
 
 Member-blocks-only design S1 (`docs/internal/design/member-blocks-only.md`).

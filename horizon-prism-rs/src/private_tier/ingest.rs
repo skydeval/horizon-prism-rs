@@ -1298,8 +1298,9 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
 
 /// The private part of a `member_removed` purge (§6.11.7): private posts by
 /// authors outside S admitted only because `did` was a member (no other
-/// member among the parent, root and audience authors), rule-2 private blocks of `did`
-/// by authors outside S that are not private owners, the member's private
+/// member among the parent, root and audience authors), private blocks with
+/// no member side left (of `did` by non-members, by `did` of non-members;
+/// member-blocks-only design §7), the member's private
 /// bookmarks, the member's quote references (private posting §3.1: its
 /// later deletes are no longer tracked), and the private notifications it
 /// received and authored, for the same reason.
@@ -1333,13 +1334,13 @@ pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, lim
     .execute(&mut *conn)
     .await?
     .rows_affected();
+    // Rule M (member-blocks-only design §7): private blocks of `did` by
+    // authors that are not members, and `did`'s own private blocks of
+    // non-members. One between it and another member stays.
     n += sqlx::query(
         "DELETE FROM private_blocks WHERE uri IN (SELECT b.uri FROM private_blocks b \
-         WHERE b.subject_did = $1 \
-           AND NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = b.author_did) \
-           AND NOT ((EXISTS (SELECT 1 FROM private_posts x WHERE x.author_did = b.author_did) \
-                     OR EXISTS (SELECT 1 FROM private_audiences x WHERE x.owner_did = b.author_did)) \
-                    AND EXISTS (SELECT 1 FROM members x WHERE x.did = b.author_did)) \
+         WHERE (b.subject_did = $1 AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = b.author_did)) \
+            OR (b.author_did = $1 AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = b.subject_did)) \
          LIMIT $2)",
     )
     .bind(did)
