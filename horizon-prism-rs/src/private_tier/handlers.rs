@@ -34,7 +34,7 @@ use crate::cursor_key::CursorKey;
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::NSID_POST_PRIVATE;
 use crate::hydration::actor::{ProfileContext, ProfileKind};
-use crate::hydration::embeds::{EMBED_RECORD_WITH_MEDIA, media_view, normalize_embed, quoted_uri};
+use crate::hydration::embeds::{EMBED_RECORD_WITH_MEDIA, normalize_embed, private_media_view, quoted_uri};
 use crate::hydration::normalize::is_private_uri;
 use crate::hydration::{HydrationContext, ts};
 use crate::kryphocron_glue::VerifiedCaller;
@@ -147,7 +147,6 @@ impl PrivateState {
         cursor_key: CursorKey,
     ) -> Self {
         let pool = app.hydrator.pool().clone();
-        let video = app.hydrator.video().clone();
         let bookmarks_max = app.hydrator.bookmarks_max();
         Self {
             app,
@@ -159,7 +158,6 @@ impl PrivateState {
                 freshness_bound,
                 max_head_fetches,
                 max_chain: cfg.max_chain,
-                video,
             },
             floors: Floors {
                 get_posts: Duration::from_millis(cfg.floor_ms.get_posts),
@@ -293,11 +291,12 @@ fn stored_embed(post: &PrivateEmit<Value>) -> Option<Value> {
 }
 
 /// The media view of a `recordWithMedia` embed's `media`, on the author's
-/// PDS from `authors`.
-fn embedded_media(s: &PrivateState, post: &PrivateEmit<Value>, embed: &Value, authors: &ProfileContext) -> Option<Value> {
+/// PDS from `authors`; a video plays from that PDS (private-video-pds
+/// design).
+fn embedded_media(post: &PrivateEmit<Value>, embed: &Value, authors: &ProfileContext) -> Option<Value> {
     let did = post.view().pointer("/author/did").and_then(Value::as_str)?;
     let pds = authors.rows.get(did).and_then(|r| r.pds_endpoint.as_deref());
-    media_view(did, pds, embed.get("media")?, &s.env.video)
+    private_media_view(did, pds, embed.get("media")?)
 }
 
 fn not_found_record(uri: &str) -> Value {
@@ -307,7 +306,7 @@ fn not_found_record(uri: &str) -> Value {
 /// A readable quoted private post as `app.bsky.embed.record#viewRecord`
 /// (§4.2): the decoded record as `value`, and its media one level deep, as
 /// `record_view` does for public posts.
-fn view_record(s: &PrivateState, quoted: &PrivateEmit<Value>, authors: &ProfileContext) -> Value {
+fn view_record(quoted: &PrivateEmit<Value>, authors: &ProfileContext) -> Value {
     let v = quoted.view();
     let mut record = json!({
         "$type": "app.bsky.embed.record#viewRecord",
@@ -328,7 +327,7 @@ fn view_record(s: &PrivateState, quoted: &PrivateEmit<Value>, authors: &ProfileC
         Some(media) => Some(media.clone()),
         None => stored_embed(quoted)
             .filter(|e| e.get("$type").and_then(Value::as_str) == Some(EMBED_RECORD_WITH_MEDIA))
-            .and_then(|e| embedded_media(s, quoted, &e, authors)),
+            .and_then(|e| embedded_media(quoted, &e, authors)),
     };
     if let Some(media) = media {
         record["embeds"] = json!([media]);
@@ -589,7 +588,7 @@ async fn decorate(
         counts(s, caller, &mut refs).await?;
         for q in &hits {
             if let Some(uri) = view_uri(q) {
-                records.insert(uri, view_record(s, q, &quoted_authors));
+                records.insert(uri, view_record(q, &quoted_authors));
             }
         }
         let readable: Vec<String> = records.keys().cloned().collect();
@@ -629,7 +628,7 @@ async fn decorate(
         };
         let record = json!({"$type": "app.bsky.embed.record#view", "record": record});
         if embed.get("$type").and_then(Value::as_str) == Some(EMBED_RECORD_WITH_MEDIA) {
-            let Some(media) = media_authors.as_ref().and_then(|a| embedded_media(s, post, &embed, a)) else {
+            let Some(media) = media_authors.as_ref().and_then(|a| embedded_media(post, &embed, a)) else {
                 continue;
             };
             post.decorate(

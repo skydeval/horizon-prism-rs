@@ -16,7 +16,7 @@
         },
         "embed": {
           "type": "union",
-          "description": "The stock view of the record's embed, built from either $type form. A quoted private post is read for the requester as any private post is: readable gives #viewRecord with the decoded record as its value, or #viewDetached when the quoted post's postgate detaches this post; unreadable, blocked or nonexistent all give the same #viewNotFound. A quoted public post is shown only when this AppView stores it; otherwise, for record and recordWithMedia embeds alike, embed is absent and the client renders the quote from record.embed. Quotes are not followed beyond one level. A video plays from the video CDN (playlist and thumbnail) or from the author's PDS (playlist only), as the operator configures.",
+          "description": "The stock view of the record's embed, built from either $type form. A quoted private post is read for the requester as any private post is: readable gives #viewRecord with the decoded record as its value, or #viewDetached when the quoted post's postgate detaches this post; unreadable, blocked or nonexistent all give the same #viewNotFound. A quoted public post is shown only when this AppView stores it; otherwise, for record and recordWithMedia embeds alike, embed is absent and the client renders the quote from record.embed. Quotes are not followed beyond one level. A private post's video plays from its author's PDS: playlist is the MP4 blob, and there is no thumbnail. A quoted public post's video plays as the operator configures, from the video CDN (playlist and thumbnail) or from its author's PDS.",
           "refs": [
             "app.bsky.embed.images#view",
             "app.bsky.embed.external#view",

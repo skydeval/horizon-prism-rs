@@ -27,12 +27,11 @@ use super::content::{self, BadContent, Restored};
 use super::emit::PrivateEmit;
 use super::oracle::{OracleSnapshot, SnapshotInputs};
 use super::{readiness, schema};
-use crate::config::VideoConfig;
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::NSID_POST_PRIVATE;
 use crate::firehose::watermark::Watermarks;
 use crate::hydration::actor::{ProfileContext, ProfileKind};
-use crate::hydration::embeds::{media_view, normalize_embed};
+use crate::hydration::embeds::{normalize_embed, private_media_view};
 use crate::hydration::ts;
 use crate::kryphocron_glue::{PipelineGlue, VerifiedCaller};
 use crate::moderation::{self, Gate};
@@ -149,8 +148,6 @@ pub(super) struct PipelineEnv {
     pub max_head_fetches: usize,
     /// `private_read.max_chain`: the walk's cap (private-threads §2.3).
     pub max_chain: u32,
-    /// `[video]`: how a video embed's view is built (Addendum A).
-    pub video: VideoConfig,
 }
 
 impl PipelineEnv {
@@ -539,12 +536,13 @@ async fn read_inner(
         "indexedAt": ts(meta.indexed_at),
         "labels": labels,
     });
-    // The media part of `embed` (§4.2); the handler adds the record part.
+    // The media part of `embed` (§4.2); the handler adds the record part. A
+    // video plays from the author's PDS (private-video-pds design).
     let pds = authors.rows.get(owner_s).and_then(|r| r.pds_endpoint.as_deref());
     if let Some(media) = embed
         .as_ref()
         .map(normalize_embed)
-        .and_then(|e| media_view(owner_s, pds, &e, &env.video))
+        .and_then(|e| private_media_view(owner_s, pds, &e))
     {
         view["embed"] = media;
     }

@@ -1220,8 +1220,10 @@ impl Default for BookmarksConfig {
     }
 }
 
-/// `video.playback` (private-posting design, Addendum A): how a video
-/// embed's view is built, for public and private posts alike.
+/// `video.playback` (private-posting design, Addendum A): how a public
+/// post's video embed's view is built. A private post's video always plays
+/// from the MP4 blob on the author's PDS, whatever this says
+/// (private-video-pds design).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoPlayback {
@@ -1233,7 +1235,8 @@ pub enum VideoPlayback {
     PdsBlob,
 }
 
-/// `[video]` (private-posting design, Addendum A).
+/// `[video]` (private-posting design, Addendum A, as amended by the
+/// private-video-pds design): public posts' videos only.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {

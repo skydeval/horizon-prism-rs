@@ -5,8 +5,10 @@
 //!   post may carry (`tools.kryphocron.feed.postPublic#embed*`) to the stock
 //!   `app.bsky.embed.*` ones, before any view is built.
 //! - [`media_view`] builds `images#view`, `external#view`, `video#view` or
-//!   `gallery#view` from a stock embed and the author's PDS endpoint. It
-//!   makes no request: every URL is computed.
+//!   `gallery#view` from a stock embed and the author's PDS endpoint, for a
+//!   public post; [`private_media_view`] the same for a private post, whose
+//!   video always plays from the PDS (private-video-pds design). Neither
+//!   makes a request: every URL is computed.
 
 use serde_json::{Value, json};
 
@@ -88,11 +90,37 @@ fn path_segment(did: &str) -> String {
     url::form_urlencoded::byte_serialize(did.as_bytes()).collect()
 }
 
-/// The media view of a stock embed by `did`, whose PDS is `pds`. Images and
-/// thumbs are blobs on the author's PDS. A video is played per `video`
-/// (Addendum A): HLS and a thumbnail on the CDN, or the MP4 blob.
+/// Where a video view's `playlist` points.
+#[derive(Clone, Copy)]
+enum VideoSource<'a> {
+    /// HLS and a thumbnail under this CDN base.
+    Cdn(&'a str),
+    /// The MP4 blob on the author's PDS, with no thumbnail.
+    PdsBlob,
+}
+
+/// The media view of a public post's stock embed by `did`, whose PDS is
+/// `pds`. Images and thumbs are blobs on the author's PDS. A video is played
+/// per `video` (Addendum A): HLS and a thumbnail on the CDN, or the MP4 blob.
 #[must_use]
 pub fn media_view(did: &str, pds: Option<&str>, embed: &Value, video: &VideoConfig) -> Option<Value> {
+    let source = match video.playback {
+        VideoPlayback::BskyCdn => VideoSource::Cdn(&video.cdn_url),
+        VideoPlayback::PdsBlob => VideoSource::PdsBlob,
+    };
+    build_media_view(did, pds, embed, source)
+}
+
+/// The media view of a private post's stock embed: as [`media_view`], but a
+/// video always plays from the MP4 blob on the author's PDS, with no
+/// thumbnail, whatever `[video] playback` says (private-video-pds design).
+/// With no PDS endpoint a video has no view; it never falls back to a CDN.
+#[must_use]
+pub fn private_media_view(did: &str, pds: Option<&str>, embed: &Value) -> Option<Value> {
+    build_media_view(did, pds, embed, VideoSource::PdsBlob)
+}
+
+fn build_media_view(did: &str, pds: Option<&str>, embed: &Value, video: VideoSource<'_>) -> Option<Value> {
     match embed.get("$type").and_then(Value::as_str)? {
         EMBED_IMAGES => {
             let images: Vec<Value> = embed
@@ -129,13 +157,13 @@ pub fn media_view(did: &str, pds: Option<&str>, embed: &Value, video: &VideoConf
         EMBED_VIDEO => {
             let cid = embed.get("video").and_then(blob_cid)?;
             let mut v = json!({"$type": "app.bsky.embed.video#view", "cid": cid});
-            match video.playback {
-                VideoPlayback::BskyCdn => {
-                    let base = format!("{}/watch/{}/{cid}", video.cdn_url.trim_end_matches('/'), path_segment(did));
+            match video {
+                VideoSource::Cdn(cdn_url) => {
+                    let base = format!("{}/watch/{}/{cid}", cdn_url.trim_end_matches('/'), path_segment(did));
                     v["playlist"] = json!(format!("{base}/playlist.m3u8"));
                     v["thumbnail"] = json!(format!("{base}/thumbnail.jpg"));
                 }
-                VideoPlayback::PdsBlob => v["playlist"] = json!(blob_url(pds, did, &cid)?),
+                VideoSource::PdsBlob => v["playlist"] = json!(blob_url(pds, did, &cid)?),
             }
             if let Some(alt) = embed.get("alt") {
                 v["alt"] = alt.clone();
@@ -238,5 +266,36 @@ mod tests {
         };
         let v = media_view(DID, Some(PDS), &embed, &other).expect("view");
         assert!(v["playlist"].as_str().expect("playlist").starts_with("https://cdn.example.org/watch/"));
+    }
+
+    /// T-PV0 (private-video-pds design): a private post's video is the MP4
+    /// blob on the PDS, with no thumbnail and no CDN fallback; its other
+    /// media are the public views.
+    #[test]
+    fn private_video_views_play_from_the_pds() {
+        let embed = json!({"$type": EMBED_VIDEO, "video": blob("bafyvideo"), "alt": "a clip", "aspectRatio": {"width": 16, "height": 9}});
+        let v = private_media_view(DID, Some(PDS), &embed).expect("view");
+        assert_eq!(
+            v,
+            json!({
+                "$type": "app.bsky.embed.video#view",
+                "cid": "bafyvideo",
+                "playlist": format!("{PDS}/xrpc/com.atproto.sync.getBlob?did={DID}&cid=bafyvideo"),
+                "alt": "a clip",
+                "aspectRatio": {"width": 16, "height": 9},
+            })
+        );
+        // No PDS endpoint: no view, never a CDN URL.
+        assert!(private_media_view(DID, None, &embed).is_none());
+        let others = [
+            json!({"$type": EMBED_IMAGES, "images": [{"image": blob("bafyimg"), "alt": "i"}]}),
+            json!({"$type": EMBED_EXTERNAL, "external": {"uri": "https://e.example", "title": "t", "description": "d", "thumb": blob("bafyt")}}),
+            json!({"$type": EMBED_GALLERY, "items": [{"$type": GALLERY_IMAGE, "image": blob("bafyg"), "alt": "g", "aspectRatio": {"width": 1, "height": 1}}]}),
+        ];
+        for e in &others {
+            let public = media_view(DID, Some(PDS), e, &VideoConfig::default());
+            assert!(public.is_some(), "{e}");
+            assert_eq!(private_media_view(DID, Some(PDS), e), public, "{e}");
+        }
     }
 }

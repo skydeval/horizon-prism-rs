@@ -483,8 +483,10 @@ max_per_actor = 50000
 emit_count = "never"
 count_floor = 10
 
-# How a video embed's view is built, for public and private posts alike
-# (private posting, Addendum A). "bsky_cdn": HLS and a thumbnail from the
+# How a public post's video embed's view is built (private posting,
+# Addendum A, as amended by private-video-pds). A private post's video always
+# plays from the MP4 blob on the author's PDS, whatever this says, so it never
+# depends on Bluesky's video service. "bsky_cdn": HLS and a thumbnail from the
 # video CDN at cdn_url; the URLs are computed, and Prism makes no request to
 # the CDN. A video the CDN never processed (uploaded straight to a PDS) does
 # not play this way. "pds_blob": the MP4 blob on the author's PDS, with no

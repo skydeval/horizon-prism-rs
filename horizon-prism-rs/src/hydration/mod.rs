@@ -165,8 +165,10 @@ pub struct HydrationConfig {
     pub bookmarks_emit_count: crate::config::BookmarkCount,
     /// `bookmarks.count_floor`.
     pub bookmarks_count_floor: u32,
-    /// `[video]`: how video embeds' views are built (private posting,
-    /// Addendum A).
+    /// `[video]`: how public posts' video embeds' views are built (private
+    /// posting, Addendum A). A private post's video always plays from the
+    /// author's PDS (private-video-pds design); the private tier never reads
+    /// this.
     pub video: crate::config::VideoConfig,
     /// `drafts.max_per_actor`.
     pub drafts_max: u32,
@@ -457,14 +459,6 @@ impl Hydrator {
     #[must_use]
     pub fn scope(&self) -> &ScopeState {
         &self.inner.scope
-    }
-
-    /// `[video]`: how video embeds' views are built (private posting,
-    /// Addendum A). The private tier builds its media views with the same
-    /// settings.
-    #[must_use]
-    pub fn video(&self) -> &crate::config::VideoConfig {
-        &self.inner.cfg.video
     }
 
     /// `bookmarks.max_per_actor`: the private tier counts its own bookmarks

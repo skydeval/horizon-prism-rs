@@ -1953,11 +1953,11 @@ async fn display_fields_in(mode: PublicMode, test: &str) {
     assert_eq!(posts[2]["embed"]["$type"], "app.bsky.embed.external#view");
     assert_eq!(posts[2]["embed"]["external"]["thumb"], blob_on_pds(ALICE, "bafythumb"));
     assert_eq!(posts[2]["embed"]["external"]["title"], "t");
-    // Video, by default from the CDN with a thumbnail.
-    let cdn = format!("https://video.bsky.app/watch/did%3Aplc%3A{}/bafyvideo", &ALICE[8..]);
+    // Video: the MP4 blob on the author's PDS, with no thumbnail, under the
+    // default `bsky_cdn` (private-video-pds design).
     assert_eq!(posts[3]["embed"]["$type"], "app.bsky.embed.video#view");
-    assert_eq!(posts[3]["embed"]["playlist"], format!("{cdn}/playlist.m3u8"));
-    assert_eq!(posts[3]["embed"]["thumbnail"], format!("{cdn}/thumbnail.jpg"));
+    assert_eq!(posts[3]["embed"]["playlist"], blob_on_pds(ALICE, "bafyvideo"));
+    assert!(posts[3]["embed"].get("thumbnail").is_none(), "{}", posts[3]);
     assert_eq!(posts[3]["embed"]["alt"], "a clip");
     // Gallery: `#galleryImage` items read as `app.bsky.embed.gallery#image`.
     assert_eq!(posts[4]["embed"]["$type"], "app.bsky.embed.gallery#view");
@@ -1974,16 +1974,179 @@ async fn display_fields_in(mode: PublicMode, test: &str) {
         assert!(p["record"]["text"].is_string());
     }
 
-    // Addendum A: `pds_blob` plays the MP4 blob, with no thumbnail.
-    let blob_base = serve(f.state_with_video(VideoConfig {
-        playback: VideoPlayback::PdsBlob,
-        ..VideoConfig::default()
+    // Nor under `bsky_cdn` with another CDN base.
+    let other_cdn = serve(f.state_with_video(VideoConfig {
+        playback: VideoPlayback::BskyCdn,
+        cdn_url: "https://cdn.example.org".into(),
     }))
     .await;
-    let (_, video) = one_post(&blob_base, BOB, &uris[3]).await;
+    let (body, video) = one_post(&other_cdn, BOB, &uris[3]).await;
     assert_eq!(video["embed"]["playlist"], blob_on_pds(ALICE, "bafyvideo"));
-    assert!(video["embed"].get("thumbnail").is_none(), "{video}");
+    assert!(video["embed"].get("thumbnail").is_none() && !body.contains("cdn.example.org"), "{body}");
     db.drop_db().await;
+}
+
+/// The server T-PV1 reads: `[video]` at `bsky_cdn` under a CDN base no PDS
+/// URL contains, roomy rate limits, fresh heads and watermark, no floor.
+async fn cdn_marked_server(f: &Fixture) -> String {
+    exec(&f.pool, "UPDATE sync_state SET head_checked_at = now()").await;
+    let mut app = f.app.clone();
+    app.hydrator = hydrator_configured(
+        &f.pool,
+        f.sets.clone(),
+        HydrationConfig {
+            video: VideoConfig {
+                playback: VideoPlayback::BskyCdn,
+                cdn_url: CDN_MARK.into(),
+            },
+            ..test_config()
+        },
+    );
+    app.limits = roomy_limits();
+    serve_live(f.state_of(app, Some(Duration::from_secs(1)), Duration::ZERO)).await
+}
+
+/// T-PV1's CDN base.
+const CDN_MARK: &str = "https://cdn.example.org";
+
+/// No CDN URL in `body`, under T-PV1's base or Bluesky's.
+fn assert_no_cdn(what: &str, body: &str) {
+    assert!(!body.contains("cdn.example.org") && !body.contains("video.bsky.app"), "{what}: {body}");
+}
+
+/// A video embed in the kryphocron form.
+fn video_embed(cid: &str) -> Value {
+    json!({"$type": format!("{KLEX}#embedVideo"), "video": blob(cid), "alt": format!("alt {cid}"), "aspectRatio": {"width": 16, "height": 9}})
+}
+
+/// The view T-PV1 expects of a private video `cid` by Alice.
+fn pds_video_view(cid: &str) -> Value {
+    json!({"$type": "app.bsky.embed.video#view", "cid": cid, "playlist": blob_on_pds(ALICE, cid),
+           "alt": format!("alt {cid}"), "aspectRatio": {"width": 16, "height": 9}})
+}
+
+/// T-PV1 (private-video-pds design §8), in On and in Off (T-1): with
+/// `[video]` at `bsky_cdn`, every private post's video, on every endpoint
+/// that shows it and nested at every depth, plays from Alice's PDS with no
+/// thumbnail, and no private view names a CDN. In On, a public post's video
+/// quoted inside a private post still follows the setting. T-PV2: with no
+/// PDS endpoint a private video has no view, and still no CDN URL.
+async fn private_videos_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let v = f
+        .post_with(ALICE, "3kvideo22222", &aud, json!({"embed": video_embed("bafyvideo"), "facets": [mention(BOB)], "createdAt": now}))
+        .await;
+    let quote = |uri: &str| json!({"$type": format!("{KLEX}#embedRecord"), "record": {"uri": uri, "cid": "bafyany"}});
+    let rwm = |uri: &str, cid: &str| {
+        json!({"$type": format!("{KLEX}#embedRecordWithMedia"), "record": {"record": {"uri": uri, "cid": "bafyany"}}, "media": video_embed(cid)})
+    };
+    let q = f.post_with(ALICE, "3kquotesv222", &aud, json!({"embed": quote(&v)})).await;
+    let t = f.private_post(ALICE, "3ktext222222", &aud, None).await;
+    let m = f.post_with(ALICE, "3kmedia22222", &aud, json!({"embed": rwm(&t, "bafymedia")})).await;
+    let qm = f.post_with(ALICE, "3kquotesm222", &aud, json!({"embed": quote(&m)})).await;
+    let mut reply = f.record_with(ALICE, "3kreply22222", &aud, &json!({"embed": video_embed("bafyreply")})).await;
+    reply["reply"] = json!({"root": {"uri": v, "cid": "bafy3kvideo22222"}, "parent": {"uri": v, "cid": "bafy3kvideo22222"}});
+    f.ingest(ALICE, NSID_POST_PRIVATE, "3kreply22222", reply).await;
+    // Row 7c: media quoting a public post this AppView does not store.
+    let unstored = format!("at://{CAROL}/{PUBLIC_POST}/3knotstored2");
+    let mp = f.post_with(ALICE, "3kmediapub22", &aud, json!({"embed": rwm(&unstored, "bafymediapub")})).await;
+    // A stored public post with a video, quoted by a private post.
+    let public = crate::hydration::testing::post(&f.pool, CAROL, "3kpublicvid2", "public video", None, None).await;
+    let public_video = json!({"$type": "app.bsky.embed.video", "video": blob("bafypublic")});
+    sqlx::query("UPDATE posts SET embed = $1 WHERE uri = $2")
+        .bind(&public_video)
+        .bind(&public)
+        .execute(&f.pool)
+        .await
+        .expect("embed");
+    // By Dave, so it stays out of Alice's feed and Bob's timeline, whose
+    // bodies must name no CDN.
+    let dave_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[BOB]).await;
+    let qp = f.post_with(DAVE, "3kquotespub2", &dave_aud, json!({"embed": quote(&public)})).await;
+    exec(&f.pool, &follow_sql(BOB, ALICE)).await;
+    f.ready_all().await;
+    let base = cdn_marked_server(&f).await;
+    assert_eq!(post(&base, CREATE_BOOKMARK, &json!({"uri": v, "cid": "bafy3kvideo22222"}), BOB).await.0, 200);
+
+    // getPosts: the post's own video, a quote of it, recordWithMedia media,
+    // and the media of a quoted recordWithMedia.
+    let (body, posts) = posts_of(&base, BOB, &[&v, &q, &m, &qm]).await;
+    assert_no_cdn("getPosts", &body);
+    assert_eq!(posts.len(), 4, "{body}");
+    assert_eq!(posts[0]["embed"], pds_video_view("bafyvideo"), "V");
+    assert_eq!(posts[0]["record"]["embed"], video_embed("bafyvideo"), "record.embed as stored");
+    assert_eq!(posts[1]["embed"]["record"]["embeds"][0], pds_video_view("bafyvideo"), "Q");
+    assert_eq!(posts[2]["embed"]["$type"], "app.bsky.embed.recordWithMedia#view", "M");
+    assert_eq!(posts[2]["embed"]["media"], pds_video_view("bafymedia"), "M");
+    assert_eq!(posts[3]["embed"]["record"]["embeds"][0], pds_video_view("bafymedia"), "QM");
+
+    // Every other endpoint that shows V or R.
+    let v_url = blob_on_pds(ALICE, "bafyvideo");
+    let r_url = blob_on_pds(ALICE, "bafyreply");
+    let (v_url, r_url) = (v_url.as_str(), r_url.as_str());
+    let reads: [(&str, &str, String, Vec<&str>); 7] = [
+        ("getPostThread", THREAD, format!("uri={v}"), vec![v_url, r_url]),
+        ("getAuthorFeed", FEED, format!("actor={ALICE}&limit=50"), vec![v_url, r_url]),
+        ("getTimeline", TIMELINE, "limit=50".to_string(), vec![v_url]),
+        ("getBookmarks", GET_BOOKMARKS, String::new(), vec![v_url]),
+        ("getQuotes", GET_QUOTES, format!("uri={v}"), vec![v_url]),
+        ("getReplies", GET_REPLIES, format!("uri={v}"), vec![r_url]),
+        ("searchPosts", SEARCH, "q=3kvideo22222".to_string(), vec![v_url]),
+    ];
+    for (what, method, query, urls) in &reads {
+        let (body, _, _) = json_of(&base, method, query, BOB).await;
+        assert_no_cdn(what, &body);
+        for url in urls {
+            assert!(body.contains(*url), "{what}: {url} in {body}");
+        }
+    }
+    // A notification carries the record, never a media view.
+    let (page, _) = notifications_of(&base, BOB, "").await;
+    let Some(n) = page["notifications"].as_array().expect("notifications").iter().find(|n| n["uri"] == v.as_str()) else {
+        panic!("V's mention: {page}");
+    };
+    assert!(n.get("embed").is_none() && n["record"]["embed"] == video_embed("bafyvideo"), "{n}");
+    assert_no_cdn("listNotifications", &page.to_string());
+
+    // Row 7c: no view at all; the client builds it from `record.embed`.
+    let (body, p) = one_post(&base, BOB, &mp).await;
+    assert_no_cdn("row 7c", &body);
+    assert!(p.get("embed").is_none(), "{p}");
+    assert_eq!(p["record"]["embed"], rwm(&unstored, "bafymediapub"));
+
+    // A quoted public post's video follows `[video]`: shown in On only.
+    let (_, p) = one_post(&base, BOB, &qp).await;
+    if mode.is_on() {
+        let cdn = format!("{CDN_MARK}/watch/did%3Aplc%3A{}/bafypublic", &CAROL[8..]);
+        assert_eq!(p["embed"]["record"]["embeds"][0]["playlist"], format!("{cdn}/playlist.m3u8"), "{p}");
+        assert_eq!(p["embed"]["record"]["embeds"][0]["thumbnail"], format!("{cdn}/thumbnail.jpg"), "{p}");
+    } else {
+        assert!(p.get("embed").is_none(), "{p}");
+    }
+
+    // T-PV2: Alice's PDS unknown. V reads, with no media view.
+    exec(&f.pool, &format!("UPDATE actors SET pds_endpoint = NULL WHERE did = '{ALICE}'")).await;
+    let (body, p) = one_post(&base, BOB, &v).await;
+    assert_no_cdn("no PDS", &body);
+    assert_eq!(p["uri"], v.as_str(), "{body}");
+    assert!(p.get("embed").is_none(), "{p}");
+    assert_eq!(p["record"]["embed"], video_embed("bafyvideo"));
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn private_videos_play_from_the_pds_on() {
+    private_videos_in(PublicMode::On, "pv-videos-on").await;
+}
+
+#[tokio::test]
+async fn private_videos_play_from_the_pds_off() {
+    private_videos_in(PublicMode::Off, "pv-videos-off").await;
 }
 
 #[tokio::test]

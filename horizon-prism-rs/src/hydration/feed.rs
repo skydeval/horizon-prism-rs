@@ -1595,6 +1595,12 @@ mod tests {
         assert_eq!(rwm["$type"], "app.bsky.embed.recordWithMedia#view");
         assert_eq!(rwm["media"]["$type"], "app.bsky.embed.gallery#view");
         assert_eq!(rwm["record"]["record"]["uri"], json!(plain));
+        // A public post's video follows `[video] playback`: the CDN by
+        // default (private-video-pds design; a private post's never does).
+        let v = h.get_posts(&anon, &req, std::slice::from_ref(&video)).await.expect("db").expect("view");
+        let cdn = format!("https://video.bsky.app/watch/did%3Aplc%3A{}/bafyv1", &BOB[8..]);
+        assert_eq!(v.inner()["posts"][0]["embed"]["playlist"], format!("{cdn}/playlist.m3u8"));
+        assert_eq!(v.inner()["posts"][0]["embed"]["thumbnail"], format!("{cdn}/thumbnail.jpg"));
 
         let uris = |filter: &'static str| {
             let h = &h;

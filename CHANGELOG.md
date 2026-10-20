@@ -10,6 +10,31 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (private video, #747)
+
+Private-video design (`docs/internal/design/private-video-pds.md`), which
+amends private posting's Addendum A.
+
+- **A private post's video always plays from the author's PDS.** Its view's
+  `playlist` is the MP4 blob (`com.atproto.sync.getBlob`) on the author's
+  PDS, with no `thumbnail`, whatever `[video] playback` says, so a private
+  video never depends on Bluesky's video service and Prism never points a
+  player at Bluesky's CDN for a private post. This holds wherever a private
+  post's video is shown: its own view, a quote of it, `recordWithMedia`
+  media, and every private endpoint. Before, the default `bsky_cdn` gave
+  private videos CDN URLs too, and a video the CDN did not have did not
+  play.
+- **`[video] playback` and `cdn_url` now govern public posts' videos only**,
+  including a public post quoted inside a private one. No key, default or
+  validation changes; the comments in the code and in
+  `docker/config/app.toml` say so.
+- A private video whose author's PDS Prism does not know gets no view, as an
+  image does; `record.embed` still carries it. A `recordWithMedia` quoting a
+  public post Prism does not show still has no `embed` at all, as before;
+  the client builds it from `record.embed`, and should take a private
+  post's video from the author's PDS too.
+- The `#privatePostView` lexicon's `embed` description says so.
+
 ### Changed (private embeds, S2, #745)
 
 Private-embeds design S2 (`docs/internal/design/private-embeds-504.md`):
