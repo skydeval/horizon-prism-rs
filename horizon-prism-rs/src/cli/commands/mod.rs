@@ -3,6 +3,7 @@
 
 pub mod admin_commands_list;
 pub mod deadletter_list;
+pub mod identity_compare;
 pub mod keygen;
 pub mod label_list;
 pub mod member_list;

@@ -10,6 +10,26 @@ commit.
 
 ## [Unreleased]
 
+### Added (lodestar identity reads S5, #753)
+
+Lodestar-reads design §2.15, §6.2 (`docs/internal/design/lodestar-reads.md`).
+
+- **`admin identity compare [--sample N] [DID|HANDLE ...]`**, read-only:
+  resolves each account as with `identity.lodestar_url` empty (the PLC
+  directory and this app's own handle check) and as with it set (lodestar
+  first, with the same fallbacks), and prints one line per account: which
+  source answered each side, whether the documents (compared with their
+  methods and services as sets), the PDS endpoints and the verified handles
+  are the same, how the handle was decided, and both times; then counts and
+  the median and p90 of each side. A handle is compared both ways (its
+  account, then that account). `--sample N` adds N accounts from `actors` at
+  random, a few `did:web` and a few marked deleted. It asks lodestar whatever
+  the gate says, writes nothing and caches nothing; it needs
+  `identity.lodestar_url` set in the config it reads.
+- **`docker/README.md`, "Lodestar (identity reads)":** what lodestar is,
+  what this app reads from it and what never does, the fallback, what an
+  operator trusts it with, the comparison command, and the metrics.
+
 ### Added (lodestar identity reads S4, #752)
 
 Lodestar-reads design §2.10 (`docs/internal/design/lodestar-reads.md`).

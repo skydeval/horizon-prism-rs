@@ -99,6 +99,26 @@ pub enum AdminCmd {
     },
     /// Print the first-run setup code while no operator exists (read-only).
     SetupCode,
+    /// Identity reads (read-only).
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IdentityAction {
+    /// Resolve DIDs and handles as with `identity.lodestar_url` empty and
+    /// as with it set, side by side (lodestar-reads design §6.2). Changes
+    /// nothing.
+    Compare {
+        /// Also compare this many DIDs picked at random from `actors`, plus
+        /// a few `did:web` and accounts marked deleted.
+        #[arg(long, default_value_t = 0)]
+        sample: u32,
+        /// DIDs and handles to compare.
+        inputs: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -275,6 +295,7 @@ impl AdminCmd {
             | Self::Commands { .. }
             | Self::Operator { action: OperatorAction::List }
             | Self::SetupCode
+            | Self::Identity { .. }
             | Self::Keygen => return Err("read-only commands run in the CLI".to_string()),
             Self::Operator { action: OperatorAction::Add { account, note } } => AdminCommand::OperatorAdd {
                 input: account.trim().trim_start_matches('@').to_ascii_lowercase(),
@@ -418,6 +439,7 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
             | AdminCmd::Commands { .. }
             | AdminCmd::Operator { action: OperatorAction::List }
             | AdminCmd::SetupCode
+            | AdminCmd::Identity { .. }
     );
     if !is_read_only {
         return None;
@@ -451,6 +473,9 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
                     operator_list::render(&commands::pool(&cfg).await?).await.map_err(|e| e.to_string())
                 }
                 AdminCmd::SetupCode => setup_code::render(&commands::pool(&cfg).await?, &cfg.env.data_dir).await,
+                AdminCmd::Identity { action: IdentityAction::Compare { sample, inputs } } => {
+                    commands::identity_compare::render(&cfg, *sample, inputs).await
+                }
                 _ => Err("not a read-only command".to_string()),
             }
         }

@@ -207,11 +207,35 @@ Commands that change state are executed by the running `app` service, not by the
 
 The CLI queues the command and waits up to `admin.command_timeout_secs` (600 s) for the result. If it times out, the command keeps running, and `admin commands list` shows its state. `app` must be running for these commands to take effect.
 
-Read-only commands (`… list`, `stream info`, `migrate status`, `keygen`, `setup-code`) run directly.
+Read-only commands (`… list`, `stream info`, `migrate status`, `keygen`, `setup-code`, `identity compare`) run directly.
 
 ### Denying membership
 
 `admin member deny <did>` keeps an account out. A denied account is never auto-enrolled, `admin member add` refuses it, and if it is a member it is removed in the same step (its removal then finishes in the background, as `member remove` does). `--reason` is a note for operators; the account never sees it. `admin member allow <did>` lifts the denial and adds nothing: run `admin member add` afterwards to admit it. `admin member list --denied` lists the denials.
+
+### Lodestar (identity reads)
+
+Lodestar is a read-only mirror of the PLC directory that also checks every account's handle both ways: the account's DID document claims the handle, and the handle points back to the DID. It is a separate service of this stack, optional: with `[identity] lodestar_url` empty (the default), this app reads identities from `plc_url` and checks handles itself, as it always has. Set `lodestar_url` to the https address of a lodestar you run or trust, and restart. The address must be reachable over https at a public address: plain `http` is refused at startup, and a private network address is refused like any other private host. If lodestar admits callers by address, add this server's outgoing address.
+
+**What it reads from lodestar.** Only ordinary public requests, and only identity:
+- a `did:plc` account's DID document (its PDS and claimed handle);
+- whether the claimed handle is verified, which saves this app its own DNS and HTTPS check when lodestar says yes;
+- which account holds a handle (for `resolveHandle` and handles in request parameters), kept only when that account's document claims the handle back;
+- for pages that name many accounts, the same in one batch call.
+
+**What never reads lodestar.** Sign-in tokens (their issuers' signing keys), admin sign-in and admin commands, automatic membership, account status and deletion, backfill and stored data, list syncing, viewer-private requests and `did:web` accounts all use `plc_url` and this app's own checks. Cached DID documents that sign-in tokens are checked against are always the PLC directory's.
+
+**Fallback.** Lodestar is asked only while it reports itself at the directory's tip: the app asks it every 15 s, and every account answer reports too. Anything lodestar cannot answer (an account created seconds ago, a refusal, an error, a timeout, an answer while it is catching up) is asked of `plc_url` and checked by this app, in the same request. When lodestar refuses (403), fails or falls behind, the app stops asking it until it reports at the tip again. Lodestar saying a handle is not verified is never taken: this app checks it itself.
+
+**What you trust it with.** For the reads above, lodestar is taken at its word, as the PLC directory is: a wrong or compromised lodestar could show wrong handles, hide accounts, or point the app at the wrong server for an account it does not index (what it shows from there is not stored). It cannot sign anyone in, grant admin or membership, delete anything, or change stored data. It also learns which accounts and handles this deployment's public requests ask about.
+
+`admin identity compare [--sample N] [DID|HANDLE ...]` resolves accounts both ways, as with the setting empty and as with it set, and prints them side by side with the time each took; it changes nothing. `--sample N` adds N accounts at random from those the app knows. Run it after setting `lodestar_url`:
+
+```bash
+docker compose exec app /app/horizon-prism-rs admin identity compare --sample 40 bsky.app
+```
+
+Watch `lodestar_fresh` (1 while lodestar is asked), `lodestar_calls_total{endpoint,outcome}` (`forbidden` means this server is not admitted; `behind`, that lodestar is catching up) and `lodestar_skipped_total{reason}`.
 
 ### Farsight (block lists)
 
@@ -550,7 +574,8 @@ Other series, one line each (the sections above name the rest):
 - `identity_refresh_total{outcome}`: identity refreshes, by outcome.
 - `account_status_changes_total{to}`: account status changes applied, by the new status.
 - `member_denials_total`: accounts denied membership.
-- `identity_cache_requests_total{cache,result}`: reads of the DID-document caches, `hit` or `miss`.
+- `identity_cache_requests_total{cache,result}`: reads of the DID-document caches, `hit` or `miss`; `cache="lodestar"` is lodestar's document cache.
+- `lodestar_calls_total{endpoint,outcome}`, `lodestar_call_seconds{endpoint}`, `lodestar_skipped_total{reason}`, `lodestar_batch_filled_total` and `lodestar_fresh`: lodestar's calls and the gate (see "Lodestar (identity reads)").
 - `handle_resolutions_total{intent,result}`: handle resolutions; `intent` is `public` for `resolveHandle` and `internal` for indexing work.
 - `jwt_fetch_cell_failures_total`: sign-in token issuer lookups that failed.
 - `xrpc_auth_total{result}`: sign-in token checks, by result.
