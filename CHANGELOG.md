@@ -10,6 +10,23 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (tombstoned DIDs, lodestar identity reads S1, #749)
+
+Lodestar-reads design §2.4 (`docs/internal/design/lodestar-reads.md`).
+
+- **A tombstoned `did:plc` is now recognised as tombstoned.** The PLC
+  directory answers one with `404 {"message": "DID not available: …"}`, not
+  410, so Prism read it as "not found": the identity refresher retried it
+  eight times and dropped it, and the account was never marked deleted or
+  purged; `list_sync` retried a tombstoned list owner as a transient error
+  forever. A `did:plc` 404 whose message starts `DID not available` is now
+  `Tombstoned`, as 410 still is: the refresher marks the account deleted
+  and runs the `account_deleted` purge (as design-v2 §5.6 intended), and
+  `list_sync` reads the owner as tombstoned. Any other 404 is still "not
+  found". This applies whatever `identity.lodestar_url` says; the
+  refresher reads only the PLC directory, so a purge is only ever decided
+  by its answer.
+
 ### Fixed (private video, #747)
 
 Private-video design (`docs/internal/design/private-video-pds.md`), which

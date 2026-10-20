@@ -6,8 +6,10 @@
 //!
 //! Per DID, in order:
 //! 1. **Always:** re-resolve the DID document bypassing the cache, then update
-//!    `did_cache` and `actors.pds_endpoint`. PLC 410 means `deleted`
-//!    immediately. did:web 404/410 records a suspicion that becomes `deleted`
+//!    `did_cache` and `actors.pds_endpoint`. A PLC tombstone (404 `DID not
+//!    available`, or 410) means `deleted` immediately; the refresher reads
+//!    plc.directory only, never a mirror. did:web 404/410 records a
+//!    suspicion that becomes `deleted`
 //!    only if unchanged 24 h later.
 //! 2. **`identity`, `handle`:** verify the handle bidirectionally.
 //! 3. **`account`, `tombstone`:** `getRepoStatus` on the just-resolved PDS.
@@ -599,6 +601,74 @@ mod tests {
             .expect("parses");
         assert!(!s.active);
         assert_eq!(s.status.as_deref(), Some("deactivated"));
+    }
+
+    struct Recorded(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl AccountLifecycle for Recorded {
+        async fn account_deleted(&self, did: &str) -> Result<(), String> {
+            self.0.lock().expect("recorded").push(did.to_string());
+            Ok(())
+        }
+    }
+
+    struct NeverPersist;
+
+    impl crate::identity::PersistencePolicy for NeverPersist {
+        fn in_persistence_set(&self, _did: &str) -> bool {
+            false
+        }
+    }
+
+    /// lodestar-reads T-L2: a tombstone event for a DID the directory
+    /// answers with 404 `DID not available` marks it deleted and runs the
+    /// purge hook, once.
+    #[tokio::test]
+    async fn a_tombstoned_did_plc_is_marked_deleted() {
+        use axum::extract::Path;
+        use axum::http::StatusCode as S;
+        use axum::routing::get;
+
+        let Some(db) = crate::test_support::fresh_db("refresher_tombstone").await else {
+            return;
+        };
+        async fn plc(Path(did): Path<String>) -> (S, String) {
+            (S::NOT_FOUND, format!(r#"{{"message":"DID not available: {did}"}}"#))
+        }
+        let base = crate::test_support::serve_fake(axum::Router::new().route("/{did}", get(plc))).await;
+        let settings = crate::identity::IdentitySettings {
+            plc_url: base,
+            fresh: Duration::from_secs(3600),
+            stale_max: Duration::from_secs(86_400),
+        };
+        let resolver = IdentityResolver::new(
+            crate::net::Transports::loopback_for_tests(),
+            db.pool.clone(),
+            settings,
+            Arc::new(NeverPersist),
+            crate::net::Intent::Internal,
+        );
+        let did = "did:plc:tttttttttttttttttttttttt";
+        sqlx::query("INSERT INTO identity_refresh (did, reasons) VALUES ($1, $2)")
+            .bind(did)
+            .bind(RefreshReason::TOMBSTONE)
+            .execute(&db.pool)
+            .await
+            .expect("queue");
+        let lifecycle = Arc::new(Recorded(std::sync::Mutex::new(Vec::new())));
+        let refresher = IdentityRefresher::new(db.pool.clone(), resolver, Arc::clone(&lifecycle) as Arc<dyn AccountLifecycle>);
+        assert_eq!(refresher.run_batch().await.expect("batch"), 1);
+        let status: Option<String> = sqlx::query_scalar("SELECT account_status FROM actors WHERE did = $1")
+            .bind(did)
+            .fetch_one(&db.pool)
+            .await
+            .expect("actor");
+        assert_eq!(status.as_deref(), Some("deleted"));
+        assert_eq!(*lifecycle.0.lock().expect("recorded"), vec![did.to_string()]);
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM identity_refresh").fetch_one(&db.pool).await.expect("count");
+        assert_eq!(left, 0, "the row is done");
+        db.drop_db().await;
     }
 
     #[test]

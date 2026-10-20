@@ -36,7 +36,8 @@ pub enum IdentityError {
     /// The DID's registry does not know it (PLC 404, did:web 404).
     #[error("DID not found: {0}")]
     NotFound(String),
-    /// PLC answered 410: the DID is tombstoned. did:web 410 is `Gone`.
+    /// PLC answered 404 `DID not available` (or 410): the DID is
+    /// tombstoned. did:web 410 is `Gone`.
     #[error("DID tombstoned: {0}")]
     Tombstoned(String),
     #[error("DID document gone: {0}")]

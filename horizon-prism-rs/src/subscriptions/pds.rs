@@ -50,7 +50,8 @@ fn classify_document(did: &str, fetched: Result<Option<String>, &IdentityError>)
     match fetched {
         Ok(Some(pds)) => Ok(Document::Pds(pds)),
         Ok(None) => not_active(KEY_NO_PDS),
-        // A did:plc answered with 410 by PLC is gone at once.
+        // A did:plc PLC answers as tombstoned (404 `DID not available`, or
+        // 410) is gone at once.
         Err(IdentityError::Tombstoned(_)) => Ok(Document::Status(OwnerStatus::Tombstoned)),
         // A did:web whose document is not there, or is not its own (a
         // parked or re-registered domain).

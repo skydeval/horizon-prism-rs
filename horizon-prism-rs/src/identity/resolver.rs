@@ -103,6 +103,20 @@ pub fn document_url(did: &str, target: &DidTarget, plc_url: &str) -> String {
     }
 }
 
+/// The start of the PLC directory's message for a tombstoned DID, which it
+/// answers with 404.
+pub const TOMBSTONE_MESSAGE: &str = "DID not available";
+
+/// Whether a PLC 404 body is the directory's tombstone answer,
+/// `{"message": "DID not available: <did>"}`, rather than "not registered".
+#[must_use]
+pub fn is_tombstone_answer(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("message").and_then(Value::as_str).map(|m| m.starts_with(TOMBSTONE_MESSAGE)))
+        .unwrap_or(false)
+}
+
 /// What the AppView reads from a DID document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DidDocInfo {
@@ -325,8 +339,9 @@ impl IdentityResolver {
     /// # Errors
     ///
     /// Invalid DIDs, network failures, `NotFound` (404), `Tombstoned` (PLC
-    /// 410), `Gone` (did:web 410), other non-2xx statuses as `Upstream`, and
-    /// documents that are not JSON or describe another DID.
+    /// 404 `DID not available`, or 410), `Gone` (did:web 410), other non-2xx
+    /// statuses as `Upstream`, and documents that are not JSON or describe
+    /// another DID.
     pub async fn fetch_document(&self, did: &str) -> Result<FetchedDoc, IdentityError> {
         let target = parse_did(did)?;
         let url = document_url(did, &target, &self.inner.settings.plc_url);
@@ -336,6 +351,11 @@ impl IdentityResolver {
             .await?;
         match response.status {
             s if s.is_success() => {}
+            // The directory answers a tombstoned DID with 404 `DID not
+            // available` (lodestar-reads design §2.4), not 410.
+            StatusCode::NOT_FOUND if target == DidTarget::Plc && is_tombstone_answer(&response.body) => {
+                return Err(IdentityError::Tombstoned(did.to_string()));
+            }
             StatusCode::NOT_FOUND => return Err(IdentityError::NotFound(did.to_string())),
             StatusCode::GONE => {
                 return Err(match target {
@@ -794,6 +814,47 @@ mod tests {
         };
         assert_eq!((count("network_ok"), count("network_not_found")), (Some(1.0), Some(1.0)), "{text}");
         assert!(!text.contains("intent=\"public\""), "{text}");
+    }
+
+    /// lodestar-reads T-L2: the directory's 404 `DID not available` is a
+    /// tombstone, its 404 `DID not registered` is not, and 410 still is.
+    #[test]
+    fn the_directorys_tombstone_message_is_recognised() {
+        assert!(is_tombstone_answer(format!(r#"{{"message":"DID not available: {PLC}"}}"#).as_bytes()));
+        assert!(!is_tombstone_answer(format!(r#"{{"message":"DID not registered: {PLC}"}}"#).as_bytes()));
+        assert!(!is_tombstone_answer(b"DID not available"));
+        assert!(!is_tombstone_answer(br#"{"error":"DID not available"}"#));
+        assert!(!is_tombstone_answer(b""));
+    }
+
+    /// lodestar-reads T-L2, through `fetch_document`.
+    #[tokio::test]
+    async fn a_tombstoned_did_plc_is_tombstoned() {
+        use axum::extract::Path;
+        use axum::http::StatusCode as S;
+        use axum::routing::get;
+
+        async fn plc(Path(did): Path<String>) -> (S, String) {
+            match did.as_bytes().get(8) {
+                Some(b't') => (S::NOT_FOUND, format!(r#"{{"message":"DID not available: {did}"}}"#)),
+                Some(b'n') => (S::NOT_FOUND, format!(r#"{{"message":"DID not registered: {did}"}}"#)),
+                Some(b'g') => (S::GONE, String::new()),
+                _ => (S::NOT_FOUND, "not json".to_string()),
+            }
+        }
+        let base = crate::test_support::serve_fake(axum::Router::new().route("/{did}", get(plc))).await;
+        let pool = PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").expect("lazy pool");
+        let settings = IdentitySettings {
+            plc_url: base,
+            fresh: std::time::Duration::from_secs(3600),
+            stale_max: std::time::Duration::from_secs(86_400),
+        };
+        let resolver = IdentityResolver::new(Transports::loopback_for_tests(), pool, settings, Arc::new(NeverPersist), Intent::Internal);
+        let did = |c: char| format!("did:plc:{}", c.to_string().repeat(24));
+        assert!(matches!(resolver.fetch_document(&did('t')).await, Err(IdentityError::Tombstoned(_))));
+        assert!(matches!(resolver.fetch_document(&did('n')).await, Err(IdentityError::NotFound(_))));
+        assert!(matches!(resolver.fetch_document(&did('g')).await, Err(IdentityError::Tombstoned(_))));
+        assert!(matches!(resolver.fetch_document(&did('x')).await, Err(IdentityError::NotFound(_))));
     }
 
     #[test]
