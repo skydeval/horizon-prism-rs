@@ -191,6 +191,9 @@ pub const FEATURES: &[&str] = &[
     // current audience, walked up to `private_read.max_chain` rows; paged
     // reads capped at twice their limit (S12).
     "private.threadAudience",
+    // P-30 posts_with_media and posts_with_video on getAuthorFeed
+    // (private-media-filters design).
+    "private.mediaFilters",
 ];
 
 /// The private tier as the rest of the crate may use it.

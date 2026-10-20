@@ -1625,8 +1625,10 @@ fn every_shape_is_one_walked_statement() {
         ("getReplies page", schema::reply_page_statement(CAP)),
         ("search", schema::search_statement(CAP)),
         ("expansion", schema::reply_candidates_statement(CAP)),
-        ("author feed", schema::author_statement(false, CAP)),
-        ("author threads", schema::author_statement(true, CAP)),
+        ("author feed", schema::author_statement(schema::AuthorFilter::Replies, CAP)),
+        ("author threads", schema::author_statement(schema::AuthorFilter::OwnThreads, CAP)),
+        ("author media", schema::author_statement(schema::AuthorFilter::Media, CAP)),
+        ("author video", schema::author_statement(schema::AuthorFilter::Video, CAP)),
         ("timeline", schema::timeline_statement(CAP)),
         ("getQuotes", schema::quote_statement(CAP)),
         ("replyCount", schema::reply_counts_statement(CAP)),
@@ -4450,10 +4452,13 @@ async fn author_filter_in(mode: PublicMode, test: &str) {
         assert_eq!(status, 400, "{query}: {body}");
         assert!(body.contains("Error: cursor is not valid"), "{body}");
     }
-    for filter in ["posts_no_replies", "posts_with_media", ""] {
+    for filter in ["posts_no_replies", ""] {
         let (status, body, _) = get(&base, FEED, &format!("actor={BOB}&filter={filter}"), CAROL, CAROL_KEY).await;
         assert_eq!(status, 400, "{filter}: {body}");
-        assert!(body.contains("Error: filter must be posts_with_replies or posts_and_author_threads"), "{body}");
+        assert!(
+            body.contains("Error: filter must be posts_with_replies, posts_and_author_threads, posts_with_media or posts_with_video"),
+            "{body}"
+        );
     }
     db.drop_db().await;
 }

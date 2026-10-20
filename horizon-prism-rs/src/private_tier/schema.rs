@@ -2024,30 +2024,71 @@ fn not_muted(did: &str) -> String {
     )
 }
 
+/// `getAuthorFeed`'s `filter` (P-20, §4.14; P-30, private-media-filters
+/// design §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AuthorFilter {
+    /// `posts_with_replies`: every post, and repost items.
+    Replies,
+    /// `posts_and_author_threads`: top-level posts and replies in the
+    /// actor's own threads, and repost items.
+    OwnThreads,
+    /// `posts_with_media`: posts whose embed has images or a gallery; no
+    /// repost items.
+    Media,
+    /// `posts_with_video`: posts whose embed has a video; no repost items.
+    Video,
+}
+
+impl AuthorFilter {
+    /// Every filter, for the tests that run each shape under all four.
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 4] = [Self::Replies, Self::OwnThreads, Self::Media, Self::Video];
+
+    /// The `media_kinds` bit a media filter keeps; `None` for the others.
+    pub(super) fn media_bit(self) -> Option<u8> {
+        match self {
+            Self::Media => Some(super::media::IMAGE),
+            Self::Video => Some(super::media::VIDEO),
+            Self::Replies | Self::OwnThreads => None,
+        }
+    }
+}
+
 /// `getAuthorFeed`'s statement (§3.2): `$1` the reader, `$2` the actor,
 /// `$3`/`$4` the position, `$5` the batch. `c` is HEAD's two arms, each with
-/// its own conditions, keyset, order and limit, under the merged key.
-pub(super) fn author_statement(own_threads: bool, cap: u32) -> String {
-    let threads = if own_threads {
-        "AND (p.reply_parent_uri IS NULL OR split_part(p.reply_root_uri, '/', 3) = $2)"
-    } else {
-        ""
+/// its own conditions, keyset, order and limit, under the merged key. The
+/// media filters take the posts arm alone, with the bit as a literal so the
+/// partial index of migration 0035 is provably usable.
+pub(super) fn author_statement(filter: AuthorFilter, cap: u32) -> String {
+    let posts = |cond: &str| {
+        format!(
+            "(SELECT {COLS}, p.created_at, p.rkey COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
+              FROM private_posts p \
+              WHERE p.author_did = $2 {cond} \
+                AND ($3::timestamptz IS NULL OR (p.created_at, p.rkey COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+              ORDER BY p.created_at DESC, p.rkey COLLATE \"C\" DESC LIMIT $5)"
+        )
     };
-    let c = format!(
-        "(SELECT {COLS}, p.created_at, p.rkey COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
-          FROM private_posts p \
-          WHERE p.author_did = $2 {threads} \
-            AND ($3::timestamptz IS NULL OR (p.created_at, p.rkey COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
-          ORDER BY p.created_at DESC, p.rkey COLLATE \"C\" DESC LIMIT $5) \
-         UNION ALL \
-         (SELECT {COLS}, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
-          FROM reposts rp JOIN private_posts p ON p.uri = rp.subject_uri \
-          WHERE rp.author_did = $2 AND {repost} \
-            AND ($3::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
-          ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $5) \
-         ORDER BY created_at DESC, key DESC LIMIT $5",
-        repost = repost_item(),
-    );
+    let with_reposts = |cond: &str| {
+        format!(
+            "{posts} \
+             UNION ALL \
+             (SELECT {COLS}, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
+              FROM reposts rp JOIN private_posts p ON p.uri = rp.subject_uri \
+              WHERE rp.author_did = $2 AND {repost} \
+                AND ($3::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+              ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $5) \
+             ORDER BY created_at DESC, key DESC LIMIT $5",
+            posts = posts(cond),
+            repost = repost_item(),
+        )
+    };
+    let c = match (filter, filter.media_bit()) {
+        (_, Some(bit)) => posts(&format!("AND (p.media_kinds & {bit}) <> 0")),
+        (AuthorFilter::OwnThreads, None) => with_reposts("AND (p.reply_parent_uri IS NULL OR split_part(p.reply_root_uri, '/', 3) = $2)"),
+        (_, None) => with_reposts(""),
+    };
     walked(&c, "", &feed_final(), cap)
 }
 
@@ -2056,10 +2097,11 @@ pub(super) fn author_statement(own_threads: bool, cap: u32) -> String {
 /// way with the requester, newest first, after the position
 /// `(created_at, key)`, each with its verdict (§3.2).
 ///
-/// With `own_threads` (P-20's `posts_and_author_threads`, §4.14) the
+/// With [`AuthorFilter::OwnThreads`] (P-20's `posts_and_author_threads`, §4.14) the
 /// actor's own posts are its top-level posts and its replies in threads
 /// whose **claimed** root is the actor's (C-18); repost items are kept
-/// under both filters, as on the stock feed.
+/// under both filters, as on the stock feed. The media filters keep the
+/// actor's posts whose `media_kinds` has their bit, and no repost items.
 ///
 /// # Errors
 ///
@@ -2069,13 +2111,13 @@ pub(super) async fn author_batch(
     pool: &PgPool,
     requester: &str,
     author: &str,
-    own_threads: bool,
+    filter: AuthorFilter,
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
     cap: u32,
 ) -> Result<Vec<(FeedCandidate, bool)>, sqlx::Error> {
     let (at, key) = after.map_or((None, String::new()), |(a, k)| (Some(a), k));
-    let rows: Vec<FeedRow> = sqlx::query_as(&author_statement(own_threads, cap))
+    let rows: Vec<FeedRow> = sqlx::query_as(&author_statement(filter, cap))
         .bind(requester)
         .bind(author)
         .bind(at)

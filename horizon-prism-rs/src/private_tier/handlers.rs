@@ -27,7 +27,8 @@ use super::emit::{
     BookmarkView, NotificationRecord, NotificationView, PrivateEmit, PrivateResponse, QuoteItem, ThreadNode, ThreadParent,
 };
 use super::pipeline::{self, PipelineEnv, RequestState};
-use super::schema::{self, Interaction};
+use super::media;
+use super::schema::{self, AuthorFilter, Interaction};
 use super::cursor as sealed;
 use crate::config::{PrivateReadConfig, PrivateSearchConfig};
 use crate::cursor_key::CursorKey;
@@ -58,9 +59,16 @@ pub const UPDATE_SEEN: &str = "app.nearhorizon.private.updateSeen";
 pub const GET_REPLIES: &str = "app.nearhorizon.private.getReplies";
 pub const SEARCH_POSTS: &str = "app.nearhorizon.private.searchPosts";
 
-/// `getAuthorFeed`'s `filter` values (P-20, §4.14); the first is the default.
+/// `getAuthorFeed`'s `filter` values (P-20, §4.14; P-30); the first is the
+/// default.
 const POSTS_WITH_REPLIES: &str = "posts_with_replies";
 const POSTS_AND_AUTHOR_THREADS: &str = "posts_and_author_threads";
+const POSTS_WITH_MEDIA: &str = "posts_with_media";
+const POSTS_WITH_VIDEO: &str = "posts_with_video";
+
+/// Metric: a media-filter candidate whose embed, as read, lacks the
+/// filter's media (private-media-filters design §5), by `filter`.
+pub const METRIC_MEDIA_MISMATCH: &str = "private_feed_media_mismatch_total";
 
 /// Metric: handler time before the floor, a histogram (private-threads
 /// design §4: B-5 reads its p99).
@@ -1134,17 +1142,21 @@ pub async fn get_author_feed(
     let limit = feed_limit(&p)?;
     // P-20 (§4.14): normalized, so an absent and an explicit default give
     // the same cursor binding (§3.6).
-    let filter = match p.one("filter").unwrap_or(POSTS_WITH_REPLIES) {
-        f @ (POSTS_WITH_REPLIES | POSTS_AND_AUTHOR_THREADS) => f,
-        _ => return Err(XrpcError::invalid("Error: filter must be posts_with_replies or posts_and_author_threads")),
+    let (filter, by) = match p.one("filter").unwrap_or(POSTS_WITH_REPLIES) {
+        f @ POSTS_WITH_REPLIES => (f, AuthorFilter::Replies),
+        f @ POSTS_AND_AUTHOR_THREADS => (f, AuthorFilter::OwnThreads),
+        f @ POSTS_WITH_MEDIA => (f, AuthorFilter::Media),
+        f @ POSTS_WITH_VIDEO => (f, AuthorFilter::Video),
+        _ => {
+            return Err(XrpcError::invalid(
+                "Error: filter must be posts_with_replies, posts_and_author_threads, posts_with_media or posts_with_video",
+            ));
+        }
     };
     let aad = sealed::aad(GET_AUTHOR_FEED, &caller.did, &actor, filter);
     let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let of = FeedOf::Author {
-        actor: &actor,
-        own_threads: filter == POSTS_AND_AUTHOR_THREADS,
-    };
+    let of = FeedOf::Author { actor: &actor, filter: by };
     let result = feed_body(&s, &caller, ip, of, limit, after, &aad, start).await;
     floor("getAuthorFeed", start, s.floors.get_author_feed).await;
     result.map(ok)
@@ -1185,8 +1197,8 @@ pub async fn get_timeline(
 enum FeedOf<'a> {
     /// The caller's home timeline.
     Timeline,
-    /// `actor`'s feed; `own_threads` is `posts_and_author_threads`.
-    Author { actor: &'a str, own_threads: bool },
+    /// `actor`'s feed under `filter`.
+    Author { actor: &'a str, filter: AuthorFilter },
 }
 
 /// One page of a feed: `actor`'s posts, or with no actor the caller's
@@ -1231,9 +1243,9 @@ async fn feed_body(
     let first = i64::try_from(need).unwrap_or(i64::MAX);
     let key = |c: &schema::FeedCandidate| (c.created_at, c.key.clone());
     let mut candidates = match of {
-        FeedOf::Author { actor, own_threads } => {
+        FeedOf::Author { actor, filter } => {
             schema::passing(need, first, bounds.batch_max, after, key, move |after, n| {
-                schema::author_batch(pool, me, actor, own_threads, after, n, bounds.max_chain)
+                schema::author_batch(pool, me, actor, filter, after, n, bounds.max_chain)
             })
             .await?
         }
@@ -1255,12 +1267,24 @@ async fn feed_body(
     let uris: Vec<String> = candidates.iter().map(|c| c.uri.clone()).collect();
     let authors = profiles(&hydration, &uris).await?;
     let mut full_at: Option<usize> = None;
+    // A media filter's bit: the marker only narrows the candidates; the
+    // post as read decides (private-media-filters design §5).
+    let media_filter = match of {
+        FeedOf::Author { filter, .. } => filter.media_bit().map(|bit| (bit, if bit == media::IMAGE { POSTS_WITH_MEDIA } else { POSTS_WITH_VIDEO })),
+        FeedOf::Timeline => None,
+    };
     let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
     while let Some((i, hit)) = reads.next().await {
         let c = &candidates[i];
         last = Some((c.created_at, c.key.clone()));
         if let Ok(post) = hit {
+            if let Some((bit, name)) = media_filter
+                && (post.view().pointer("/record/embed").map_or(0, media::kinds_of_embed) & bit) == 0
+            {
+                metrics::counter!(METRIC_MEDIA_MISMATCH, "filter" => name).increment(1);
+                continue;
+            }
             feed.push(post);
             reposts.push(c.repost_uri.clone().zip(c.reposter.clone()).map(|(u, by)| (u, by, c.created_at)));
             if feed.len() == limit {

@@ -23,8 +23,8 @@
           },
           "filter": {
             "type": "string",
-            "description": "Which of the actor's own posts to include. posts_with_replies (the default): all of them. posts_and_author_threads: top-level posts, and replies in threads whose root, as each reply's record claims it, is the actor's own post. The actor's repost items appear under both. Any other value is rejected with InvalidRequest.",
-            "knownValues": ["posts_with_replies", "posts_and_author_threads"],
+            "description": "Which of the actor's own posts to include. posts_with_replies (the default): all of them. posts_and_author_threads: top-level posts, and replies in threads whose root, as each reply's record claims it, is the actor's own post. The actor's repost items appear under both. posts_with_media: the actor's posts and replies whose embed, or the media of a record-with-media embed, is images or a gallery. posts_with_video: the same with a video. Under these two, repost items are left out, and a post counts only when its PDS has marked its media (`mediaKinds` on the record) or its embed is in the clear. Any other value is rejected with InvalidRequest.",
+            "knownValues": ["posts_with_replies", "posts_and_author_threads", "posts_with_media", "posts_with_video"],
             "default": "posts_with_replies"
           },
           "cursor": {

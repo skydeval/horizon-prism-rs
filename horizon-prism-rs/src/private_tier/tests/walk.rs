@@ -399,8 +399,15 @@ async fn batched(pool: &PgPool, shape: usize, reader: &str, g: &Generated, need:
         0 => format!("{:?}", schema::passing(need, first, max, None, feed_key, |after, n| schema::timeline_batch(pool, reader, after, n, cap)).await.expect("timeline")),
         1 | 2 => {
             let actor = g.authors[pick % g.authors.len()].clone();
-            let own = shape % 7 == 2;
-            format!("{:?}", schema::passing(need, first, max, None, feed_key, |after, n| schema::author_batch(pool, reader, &actor, own, after, n, cap)).await.expect("author feed"))
+            // Every filter (P-20, P-30), in a fixed order.
+            let mut out = String::new();
+            for filter in schema::AuthorFilter::ALL {
+                let rows = schema::passing(need, first, max, None, feed_key, |after, n| schema::author_batch(pool, reader, &actor, filter, after, n, cap))
+                    .await
+                    .expect("author feed");
+                out.push_str(&format!("{filter:?}: {rows:?}; "));
+            }
+            out
         }
         3 => format!("{:?}", schema::passing(need, first, max, None, pair_key, |after, n| schema::reply_page_batch(pool, reader, &parent, &[], after, n, cap)).await.expect("replies")),
         4 => format!("{:?}", schema::passing(need, first, max, None, pair_key, |after, n| schema::reply_candidates_batch(pool, reader, &parent, after, n, cap)).await.expect("expansion")),

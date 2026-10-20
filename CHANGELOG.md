@@ -10,6 +10,29 @@ commit.
 
 ## [Unreleased]
 
+### Added (private media filters, S2, #758)
+
+Private-media-filters design S2 (`docs/internal/design/private-media-filters.md`).
+
+- **Media and video filters on the private author feed.**
+  `app.nearhorizon.private.getAuthorFeed` accepts `filter=posts_with_media`
+  (images or a gallery, also inside a quote with media) and
+  `posts_with_video`, as the public feed does, without repost items. Video
+  is not media under `posts_with_media`, as on the stock feed. A private
+  post counts when its PDS marks its media (`mediaKinds`) or its embed is
+  in the clear; posts stored earlier were indexed from their clear embed at
+  upgrade (S1). Pages skip posts without media, so they fill; cursors are
+  sealed per filter, and readability is unchanged. Any other value is 400
+  `"Error: filter must be posts_with_replies, posts_and_author_threads,
+  posts_with_media or posts_with_video"`. The lexicon lists the two values.
+- **The post as read decides.** A candidate whose embed, as read, lacks
+  the filter's media is left out and counted in
+  `private_feed_media_mismatch_total{filter}`; above zero means a PDS and
+  Prism disagree.
+- `getMembership` lists `private.mediaFilters`.
+- Upgrade Prism before a PDS you index re-runs its rewrite to add the
+  marker (see S1).
+
 ### Changed (private media filters, S1, #757)
 
 Private-media-filters design S1 (`docs/internal/design/private-media-filters.md`):
