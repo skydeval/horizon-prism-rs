@@ -56,17 +56,55 @@ pub(crate) struct DisplayFields {
     pub langs: Option<Vec<String>>,
     /// The record's `labels` (`#selfLabels`) object.
     pub self_labels: Option<Value>,
-    /// The quoted URI, from `embed` in either `$type` form.
+    /// The quoted URI: from the clear `quote` when the record has one,
+    /// else from `embed` in either `$type` form (private-embeds design
+    /// §4.2).
     pub quote_uri: Option<String>,
-    /// DIDs of the `#mention` facet features, in either form.
+    /// The mentioned DIDs: from the clear `mentionDids` when the record has
+    /// it, else from the `#mention` facet features, in either form.
     pub mention_dids: Vec<String>,
+    /// Where `quote_uri` and `mention_dids` came from, for
+    /// [`METRIC_INDEX_SOURCE`].
+    pub quote_source: IndexSource,
+    pub mentions_source: IndexSource,
     /// Fields dropped as the wrong type or too large (C-16), for
     /// [`METRIC_FIELD_DROPPED`].
     pub dropped: Vec<&'static str>,
 }
 
+/// Where a `postPrivate` record's quote or mentions were indexed from
+/// (private-embeds design §4.2, §9).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum IndexSource {
+    /// Neither the dedicated field nor a kept clear `embed` / `facets`.
+    #[default]
+    None,
+    /// The clear `embed` or `facets`, as before #504.
+    Clear,
+    /// The dedicated clear `quote` or `mentionDids` (present, even when
+    /// dropped or empty of valid values).
+    Dedicated,
+}
+
+impl IndexSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Clear => "clear",
+            Self::Dedicated => "dedicated",
+        }
+    }
+}
+
 /// Metric: a display field dropped at ingest, by `field` (C-16).
 pub(crate) const METRIC_FIELD_DROPPED: &str = "private_ingest_field_dropped_total";
+/// Metric: per `postPrivate` op and `field` (`quote`, `mentions`), the
+/// `source` it was indexed from (private-embeds design §9).
+pub(crate) const METRIC_INDEX_SOURCE: &str = "private_ingest_index_source_total";
+/// Metric: notifications a private post's write did not send, by `reason`:
+/// `old_update` (a live update of a post older than the notify age),
+/// `known_recipient` (named by the post's previous version).
+pub(crate) const METRIC_NOTIFY_SUPPRESSED: &str = "private_notify_suppressed_total";
 /// A display field larger than this, serialized, is dropped (§4.2).
 pub(crate) const DISPLAY_FIELD_MAX_BYTES: usize = 64 * 1024;
 
@@ -98,25 +136,47 @@ impl DisplayFields {
         let langs = keep("langs", |v| v.as_array().is_some_and(|a| a.iter().all(Value::is_string)))
             .map(|v| v.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect());
         let self_labels = keep("labels", Value::is_object);
-        let quote_uri = embed
-            .as_ref()
-            .map(crate::hydration::embeds::normalize_embed)
-            .and_then(|e| crate::hydration::embeds::quoted_uri(&e).map(str::to_string))
-            .filter(|u| u.starts_with("at://") && uri_author(u).is_some_and(proto_blue::syntax::Did::is_valid));
+        // The dedicated clear fields of #504's new form (private-embeds
+        // design §4.2). Present (not null), even when dropped here, they
+        // decide: a bad one never falls back to `embed` or `facets`.
+        let has_quote = record.get("quote").is_some_and(|v| !v.is_null());
+        let has_mentions = record.get("mentionDids").is_some_and(|v| !v.is_null());
+        let quote = keep("quote", Value::is_object);
+        let mentions = keep("mentionDids", Value::is_array);
+        let valid_quote = |u: &str| u.starts_with("at://") && uri_author(u).is_some_and(proto_blue::syntax::Did::is_valid);
+        let (quote_uri, quote_source) = if has_quote {
+            let uri = quote.as_ref().and_then(|q| q.get("uri")).and_then(Value::as_str).filter(|u| valid_quote(u));
+            (uri.map(str::to_string), IndexSource::Dedicated)
+        } else {
+            let uri = embed
+                .as_ref()
+                .map(crate::hydration::embeds::normalize_embed)
+                .and_then(|e| crate::hydration::embeds::quoted_uri(&e).map(str::to_string))
+                .filter(|u| valid_quote(u));
+            (uri, if embed.is_some() { IndexSource::Clear } else { IndexSource::None })
+        };
+        let named: Vec<&str> = if has_mentions {
+            mentions.iter().flat_map(|m| m.as_array().into_iter().flatten()).filter_map(Value::as_str).collect()
+        } else {
+            facets
+                .iter()
+                .flat_map(|f| f.as_array().into_iter().flatten())
+                .flat_map(|facet| facet.get("features").and_then(Value::as_array).into_iter().flatten())
+                .filter(|feature| feature.get("$type").and_then(Value::as_str).is_some_and(|t| MENTION_TYPES.contains(&t)))
+                .filter_map(|feature| feature.get("did").and_then(Value::as_str))
+                .collect()
+        };
         let mut mention_dids: Vec<String> = Vec::new();
-        for feature in facets
-            .iter()
-            .flat_map(|f| f.as_array().into_iter().flatten())
-            .flat_map(|facet| facet.get("features").and_then(Value::as_array).into_iter().flatten())
-        {
-            if feature.get("$type").and_then(Value::as_str).is_some_and(|t| MENTION_TYPES.contains(&t))
-                && let Some(did) = feature.get("did").and_then(Value::as_str)
-                && proto_blue::syntax::Did::is_valid(did)
-                && !mention_dids.iter().any(|d| d == did)
-            {
+        for did in named {
+            if proto_blue::syntax::Did::is_valid(did) && !mention_dids.iter().any(|d| d == did) {
                 mention_dids.push(did.to_string());
             }
         }
+        let mentions_source = match (has_mentions, &facets) {
+            (true, _) => IndexSource::Dedicated,
+            (false, Some(_)) => IndexSource::Clear,
+            (false, None) => IndexSource::None,
+        };
         Self {
             facets,
             embed,
@@ -124,6 +184,8 @@ impl DisplayFields {
             self_labels,
             quote_uri,
             mention_dids,
+            quote_source,
+            mentions_source,
             dropped,
         }
     }
@@ -411,6 +473,14 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             for field in &f.display.dropped {
                 metrics::counter!(METRIC_FIELD_DROPPED, "field" => *field).increment(1);
             }
+            for (field, source) in [("quote", f.display.quote_source), ("mentions", f.display.mentions_source)] {
+                metrics::counter!(METRIC_INDEX_SOURCE, "field" => field, "source" => source.label()).increment(1);
+            }
+            // The notification rules (private-embeds design §6): rule 1
+            // first, then the previous version's subjects, read under the
+            // row lock the upsert takes a moment later anyway.
+            let notifies = super::notifies_post(op.source, op.created, op.created_at, op.notify_max_age);
+            let previous = if notifies { previous_subjects(&mut *conn, &op.uri).await? } else { None };
             // A row stored before migration 0023 (`display_filled` false)
             // also takes an op at its own rev: the refill (§3.1).
             let changed = sqlx::query(
@@ -456,10 +526,14 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .await?
             .rows_affected()
                 > 0;
-            // Its notifications, when the row is written: an update that
-            // adds recipients adds rows, and the others are kept (§4.8).
-            if changed && super::notifies(op.source, op.created_at, op.notify_max_age) {
-                notify_post(&mut *conn, op, &f).await?;
+            // Its notifications, when the row is written: an update notifies
+            // only the recipients its previous version did not name, and a
+            // live update only while the post is recent (private-embeds
+            // design §6); rows already written are kept (§4.8).
+            if changed && notifies {
+                notify_post(&mut *conn, op, &f, previous.as_ref()).await?;
+            } else if changed && op.source == WriteSource::Firehose && !op.created {
+                metrics::counter!(METRIC_NOTIFY_SUPPRESSED, "reason" => "old_update").increment(1);
             }
             changed
         }
@@ -733,7 +807,7 @@ type Recipient = (String, &'static str, Option<String>);
 /// quoted post's author (subject: the quoted post), `mention` to each
 /// mentioned DID (no subject). The author is never one; membership and
 /// thread mutes are tested on insert.
-fn post_recipients(author: &str, f: &PostPrivateFields) -> Vec<Recipient> {
+fn post_recipients(author: &str, s: &Subjects) -> Vec<Recipient> {
     let mut out: Vec<Recipient> = Vec::new();
     let mut push = |recipient: Option<&str>, reason: &'static str, subject: Option<&String>| {
         if let Some(r) = recipient
@@ -744,18 +818,51 @@ fn post_recipients(author: &str, f: &PostPrivateFields) -> Vec<Recipient> {
         }
     };
     for (reason, uri) in [
-        ("reply", f.reply_parent_uri.as_ref()),
-        ("reply", f.reply_root_uri.as_ref()),
-        ("quote", f.display.quote_uri.as_ref()),
+        ("reply", s.reply_parent_uri.as_ref()),
+        ("reply", s.reply_root_uri.as_ref()),
+        ("quote", s.quote_uri.as_ref()),
     ] {
         if let Some(uri) = uri.filter(|u| is_post(u)) {
             push(uri_author(uri), reason, Some(uri));
         }
     }
-    for did in &f.display.mention_dids {
+    for did in &s.mention_dids {
         push(Some(did), "mention", None);
     }
     out
+}
+
+/// What a private post's notifications are taken from: its reply parent
+/// and root, its quote and its mentions, as stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
+struct Subjects {
+    reply_parent_uri: Option<String>,
+    reply_root_uri: Option<String>,
+    quote_uri: Option<String>,
+    mention_dids: Vec<String>,
+}
+
+impl Subjects {
+    fn of(f: &PostPrivateFields) -> Self {
+        Self {
+            reply_parent_uri: f.reply_parent_uri.clone(),
+            reply_root_uri: f.reply_root_uri.clone(),
+            quote_uri: f.display.quote_uri.clone(),
+            mention_dids: f.display.mention_dids.clone(),
+        }
+    }
+}
+
+/// The stored version's [`Subjects`] of the post at `uri`, locked for the
+/// upsert that follows on the same transaction (private-embeds design §6
+/// rule 2); `None` when no row is stored.
+async fn previous_subjects(conn: &mut PgConnection, uri: &str) -> Result<Option<Subjects>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT reply_parent_uri, reply_root_uri, quote_uri, mention_dids FROM private_posts WHERE uri = $1 FOR UPDATE",
+    )
+    .bind(uri)
+    .fetch_optional(conn)
+    .await
 }
 
 /// Insert one private notification for recipient `$1` unless the recipient
@@ -801,8 +908,16 @@ async fn insert_notification(
 
 /// The private notifications of a written private post (§4.8): see
 /// [`post_recipients`]. The thread root is the reply's claimed one (C-18).
-async fn notify_post(conn: &mut PgConnection, op: &PrivateOp, f: &PostPrivateFields) -> Result<(), sqlx::Error> {
-    for r in post_recipients(&op.author_did, f) {
+/// A recipient the post's `previous` version also names is not notified
+/// (private-embeds design §6 rule 2): the update is not news to them.
+async fn notify_post(conn: &mut PgConnection, op: &PrivateOp, f: &PostPrivateFields, previous: Option<&Subjects>) -> Result<(), sqlx::Error> {
+    let known: Vec<String> =
+        previous.map(|p| post_recipients(&op.author_did, p).into_iter().map(|(did, ..)| did).collect()).unwrap_or_default();
+    for r in post_recipients(&op.author_did, &Subjects::of(f)) {
+        if known.contains(&r.0) {
+            metrics::counter!(METRIC_NOTIFY_SUPPRESSED, "reason" => "known_recipient").increment(1);
+            continue;
+        }
         insert_notification(&mut *conn, &r, &op.author_did, &op.uri, &op.cid, f.reply_root_uri.as_deref(), None).await?;
     }
     Ok(())
@@ -1309,6 +1424,72 @@ mod tests {
         let big = json!({"embed": {"$type": "app.bsky.embed.external", "external": {"uri": "x", "title": "t", "description": "d".repeat(70_000)}}, "langs": null});
         let d = DisplayFields::parse(&big);
         assert_eq!((d.embed, d.dropped), (None, vec!["embed"]));
+        // The dedicated fields (private-embeds design §4.2): wrong types or
+        // over 64 KiB are dropped and named, and never fall back.
+        let bad = json!({"quote": "at://x", "mentionDids": {"did": "did:plc:cccccccccccccccccccccccc"},
+                         "embed": {"$type": "app.bsky.embed.record", "record": {"uri": quoted}},
+                         "facets": [{"features": [mention("app.bsky.richtext.facet#mention", "did:plc:cccccccccccccccccccccccc")]}]});
+        let d = DisplayFields::parse(&bad);
+        assert_eq!(d.dropped, ["quote", "mentionDids"]);
+        assert_eq!((d.quote_uri, d.mention_dids.len()), (None, 0));
+        assert_eq!((d.quote_source, d.mentions_source), (IndexSource::Dedicated, IndexSource::Dedicated));
+        assert!(d.embed.is_some() && d.facets.is_some(), "the clear fields are still kept for display");
+        let many: Vec<String> = (0..3000).map(|i| format!("did:plc:{i:024}")).collect();
+        let d = DisplayFields::parse(&json!({"mentionDids": many}));
+        assert_eq!((d.dropped, d.mention_dids.len()), (vec!["mentionDids"], 0));
+        // Null is absent: the clear fields index.
+        let d = DisplayFields::parse(&json!({"quote": null, "mentionDids": null, "embed": bad["embed"], "facets": bad["facets"]}));
+        assert_eq!((d.quote_uri.as_deref(), d.mention_dids.len(), d.dropped.len()), (Some(quoted), 1, 0));
+        assert_eq!((d.quote_source, d.mentions_source), (IndexSource::Clear, IndexSource::Clear));
+    }
+
+    /// T-E11 (derivation): §4.2's table. The dedicated field, when present,
+    /// decides; else the clear one, as before #504; neither, nothing.
+    #[test]
+    fn quote_and_mentions_come_from_the_dedicated_fields_first() {
+        let x = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/tools.kryphocron.feed.postPrivate/3kx";
+        let y = "at://did:plc:dddddddddddddddddddddddd/app.bsky.feed.post/3ky";
+        let (c, d) = ("did:plc:cccccccccccccccccccccccc", "did:plc:dddddddddddddddddddddddd");
+        let embed_y = json!({"$type": "tools.kryphocron.feed.postPublic#embedRecord", "record": {"uri": y, "cid": "c"}});
+        let facets_d = json!([{"features": [{"$type": "#mention", "did": d}]}]);
+        for (case, record, quote, mentions, sources) in [
+            ("new form", json!({"quote": {"uri": x, "cid": "c"}, "mentionDids": [c, d, c]}), Some(x), vec![c, d], (IndexSource::Dedicated, IndexSource::Dedicated)),
+            ("old form", json!({"embed": embed_y, "facets": facets_d}), Some(y), vec![d], (IndexSource::Clear, IndexSource::Clear)),
+            ("both: the dedicated fields win", json!({"quote": {"uri": x}, "mentionDids": [c], "embed": embed_y, "facets": facets_d}), Some(x), vec![c], (IndexSource::Dedicated, IndexSource::Dedicated)),
+            ("neither", json!({"text": "t"}), None, vec![], (IndexSource::None, IndexSource::None)),
+            ("a quote of a bad uri does not fall back", json!({"quote": {"uri": "https://x"}, "embed": embed_y}), None, vec![], (IndexSource::Dedicated, IndexSource::None)),
+            ("a quote with no uri", json!({"quote": {"cid": "c"}}), None, vec![], (IndexSource::Dedicated, IndexSource::None)),
+            ("no valid DID does not fall back", json!({"mentionDids": ["bob", 5, {"did": c}], "facets": facets_d}), None, vec![], (IndexSource::None, IndexSource::Dedicated)),
+            ("valid DIDs among junk", json!({"mentionDids": ["bob", d, 5, c, d]}), None, vec![d, c], (IndexSource::None, IndexSource::Dedicated)),
+            ("an empty mentionDids", json!({"mentionDids": [], "facets": facets_d}), None, vec![], (IndexSource::None, IndexSource::Dedicated)),
+        ] {
+            let parsed = DisplayFields::parse(&record);
+            assert_eq!(parsed.quote_uri.as_deref(), quote, "{case}");
+            assert_eq!(parsed.mention_dids, mentions, "{case}");
+            assert_eq!((parsed.quote_source, parsed.mentions_source), sources, "{case}");
+            assert!(parsed.dropped.is_empty(), "{case}");
+            assert!(PostPrivateFields::parse(&record, now()).is_ok(), "{case}: never malformed");
+        }
+    }
+
+    /// Rule 1 (private-embeds design §6): a live create notifies at any age;
+    /// every other write only within the age; `notifies` (public records)
+    /// is unchanged.
+    #[test]
+    fn a_live_update_of_an_old_post_does_not_notify() {
+        let max = chrono::Duration::hours(48);
+        let (old, new) = (now() - chrono::Duration::days(3), now() - chrono::Duration::hours(1));
+        for (source, created, at, expected) in [
+            (WriteSource::Firehose, true, old, true),
+            (WriteSource::Firehose, false, old, false),
+            (WriteSource::Firehose, false, new, true),
+            (WriteSource::Backfill, true, old, false),
+            (WriteSource::Backfill, false, new, true),
+            (WriteSource::CatchUp, true, old, false),
+        ] {
+            assert_eq!(crate::private_tier::notifies_post(source, created, at, max), expected, "{source:?} {created} {at}");
+        }
+        assert!(crate::private_tier::notifies(WriteSource::Firehose, old, max), "public records: unchanged");
     }
 
     #[test]

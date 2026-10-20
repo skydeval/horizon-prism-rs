@@ -324,6 +324,7 @@ impl H {
             rev: REV.into(),
             record: record.clone(),
             source: WriteSource::Firehose,
+            created: true,
             created_at: Utc::now(),
             notify_max_age: chrono::Duration::hours(48),
         };

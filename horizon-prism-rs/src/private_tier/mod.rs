@@ -69,6 +69,9 @@ pub struct PrivateOp {
     /// The write path (private posting §4.8): only the live firehose
     /// notifies for a record of any age.
     pub source: WriteSource,
+    /// The op created the record (not an update): only a live create
+    /// notifies for a private post of any age (private-embeds design §6).
+    pub created: bool,
     /// The record's `createdAt` as `records::created_at` parses it.
     pub created_at: DateTime<Utc>,
     /// `private_notify.backfill_max_age_hours` (C-11): a write that is not
@@ -76,12 +79,22 @@ pub struct PrivateOp {
     pub notify_max_age: chrono::Duration,
 }
 
-/// Whether a write notifies (private posting §4.8, C-11): a live firehose
-/// write always does; any other source (backfill, catch-up, `requestRecord`,
-/// dead-letter replay) only for a record created within `max_age`.
+/// Whether a public record's write notifies (private posting §4.8, C-11): a
+/// live firehose write always does; any other source (backfill, catch-up,
+/// `requestRecord`, dead-letter replay) only for a record created within
+/// `max_age`.
 #[must_use]
 pub fn notifies(source: WriteSource, created_at: DateTime<Utc>, max_age: chrono::Duration) -> bool {
     source == WriteSource::Firehose || Utc::now().signed_duration_since(created_at) <= max_age
+}
+
+/// Whether a private post's write notifies (private-embeds design §6 rule
+/// 1): a live firehose **create** at any age; every other write, a live
+/// update included, only for a post created within `max_age`. A PDS
+/// rewriting its old posts so notifies no one again.
+#[must_use]
+pub fn notifies_post(source: WriteSource, created: bool, created_at: DateTime<Utc>, max_age: chrono::Duration) -> bool {
+    (source == WriteSource::Firehose && created) || Utc::now().signed_duration_since(created_at) <= max_age
 }
 
 /// A public record naming a private post (private posting §4.8), as the

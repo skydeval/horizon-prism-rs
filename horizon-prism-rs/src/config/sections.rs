@@ -493,7 +493,8 @@ pub enum StandinIntent {
 pub struct PrivateNotifyConfig {
     /// A write that is not live (backfill, catch-up, `requestRecord`,
     /// dead-letter replay) notifies only for a record created within this
-    /// many hours.
+    /// many hours. So does a live update of a private post (a live create
+    /// notifies at any age): a PDS rewriting its posts notifies no one again.
     pub backfill_max_age_hours: u32,
 }
 

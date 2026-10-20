@@ -157,6 +157,8 @@ search_posts = 0
 # Private notifications (private posting §4.8): a write that is not live
 # (backfill, catch-up, requestRecord, dead-letter replay) notifies only for a
 # record created within this many hours, so old likes are not announced as new.
+# So does a live update of a private post (a live create notifies at any age),
+# so a PDS rewriting its posts notifies no one again.
 [private_notify]
 backfill_max_age_hours = 48
 

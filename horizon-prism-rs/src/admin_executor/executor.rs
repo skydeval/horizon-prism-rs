@@ -339,6 +339,7 @@ mod tests {
                         rev: "3kaaaaaaaaaa2".into(),
                         record: json!({"text": "t"}),
                         source: crate::firehose::writer::WriteSource::Firehose,
+                        created: true,
                         created_at: chrono::Utc::now(),
                         notify_max_age: chrono::Duration::hours(48),
                     },

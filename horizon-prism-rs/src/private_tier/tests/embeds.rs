@@ -1,7 +1,8 @@
 //! Private posts whose `encodedContent` carries facets and embed (#504,
 //! private-embeds design): the old form held to a golden (T-E2); the new
 //! form read as the old (T-E1); hostile payloads (T-E5); the input cap
-//! (T-E6); search (T-E7).
+//! (T-E6); search (T-E7); ingest from the clear `quote` and `mentionDids`
+//! (T-E3, T-E9, T-E10); rewrites and the notification rules (T-E4, T-E8).
 
 use metrics_exporter_prometheus::PrometheusHandle;
 
@@ -541,5 +542,376 @@ async fn te7_search_matches_the_restored_text_only() {
         let (_, v, _) = json_of(&base, SEARCH, &format!("q={}", urlencoding(q)), BOB).await;
         assert!(post_uris(&v).is_empty(), "{q}: {v}");
     }
+    db.drop_db().await;
+}
+
+// ---- S2: ingest from the clear `quote` and `mentionDids`, and the
+// notification rules (private-embeds design §4, §6) ----
+
+/// `createdAt` for a post made `ago` before now.
+fn made_ago(ago: chrono::Duration) -> Value {
+    json!((Utc::now() - ago).to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
+/// A stored post's `(quote_uri, mention_dids)`.
+async fn indexed(pool: &PgPool, uri: &str) -> (Option<String>, Vec<String>) {
+    sqlx::query_as("SELECT quote_uri, mention_dids FROM private_posts WHERE uri = $1")
+        .bind(uri)
+        .fetch_one(pool)
+        .await
+        .expect("row")
+}
+
+/// The private notification rows whose record is `uri`, as `(recipient,
+/// reason)`, in the order written.
+async fn rows_of_record(pool: &PgPool, uri: &str) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT recipient_did, reason FROM private_notifications WHERE record_uri = $1 ORDER BY id")
+        .bind(uri)
+        .fetch_all(pool)
+        .await
+        .expect("rows")
+}
+
+/// Retention's effect on one record's notifications: they are gone.
+async fn drop_rows_of_record(pool: &PgPool, uri: &str) {
+    sqlx::query("DELETE FROM private_notifications WHERE record_uri = $1")
+        .bind(uri)
+        .execute(pool)
+        .await
+        .expect("delete");
+}
+
+/// A facet mentioning each of `dids` in the `$type` form `mention_type`.
+fn mentions(mention_type: &str, dids: &[&str]) -> Value {
+    Value::Array(
+        dids.iter()
+            .map(|d| json!({"index": {"byteStart": 0, "byteEnd": 1}, "features": [{"$type": mention_type, "did": d}]}))
+            .collect(),
+    )
+}
+
+/// A record embed of `uri` in the `$type` form `embed_type`.
+fn record_embed(embed_type: &str, uri: &str) -> Value {
+    json!({"$type": embed_type, "record": {"uri": uri, "cid": "bafyquoted"}})
+}
+
+/// Alice's audience of Bob, Carol and Dave, and Dave's post (under his
+/// audience of the other three) for her posts to quote.
+async fn quoting_setup(f: &Fixture) -> (String, String) {
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL, DAVE]).await;
+    let dave_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[ALICE, BOB, CAROL]).await;
+    let quoted = f.private_post(DAVE, "3kdavepost22", &dave_aud, None).await;
+    (aud, quoted)
+}
+
+/// T-E3 (ask 2), and the unknown-field check: a new-form post (no clear
+/// `facets` or `embed`; `embedBlobs`, `mentionDids` and `quote`, which
+/// kryphocron-lexicons 0.3.1 does not define) is written, not
+/// dead-lettered; `mentionDids` naming a member and `quote` naming a
+/// member's private post write `mention` and `quote` notifications and
+/// are stored; the quoted post's quote count and `getQuotes` include it;
+/// a threadgate `mentionRule` on a new-form root admits the mentioned
+/// member's reply.
+#[tokio::test]
+async fn te3_new_form_posts_index_their_quote_and_mentions() {
+    let Some(db) = fresh_db("te3_new_form_ingest").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "te3-ingest").await;
+    let (aud, quoted) = quoting_setup(&f).await;
+    let facets = mentions(&format!("{KLEX}#mention"), &[CAROL]);
+    let embed = json!({"$type": format!("{KLEX}#embedRecordWithMedia"), "record": {"record": {"uri": quoted, "cid": "bafyquoted"}},
+        "media": sample_images()});
+    let record = f.new_form_record(ALICE, "3knewpost222", "hello", Some(&facets), Some(&embed), &aud).await;
+    assert!(record.get("facets").is_none() && record.get("embed").is_none());
+    assert_eq!((record["mentionDids"].clone(), record["quote"]["uri"].clone()), (json!([CAROL]), json!(quoted)));
+    assert_eq!(record["embedBlobs"].as_array().map(Vec::len), Some(2));
+    // Through the firehose writer: `ingest` asserts the op did not fail.
+    let report = f
+        .writer
+        .apply(
+            ALICE,
+            REV,
+            &[RawOp {
+                action: Action::Create,
+                collection: NSID_POST_PRIVATE.into(),
+                rkey: "3knewpost222".into(),
+                cid: Some("bafy3knewpost222".into()),
+                record: Some(record),
+            }],
+            ApplyOptions {
+                advance_applied_rev: false,
+                dead_letter_readiness: false,
+                attempts: 1,
+                live: false,
+                subscription_rules: false,
+                source: WriteSource::Firehose,
+            },
+        )
+        .await
+        .expect("apply");
+    assert!(matches!(report.outcomes[..], [OpOutcome::Written]) && report.failed.is_empty(), "{report:?}");
+    let post = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3knewpost222");
+    assert_eq!(indexed(&f.pool, &post).await, (Some(quoted.clone()), vec![CAROL.to_string()]));
+    assert_eq!(private_rows(&f.pool, CAROL).await, [notified("mention", ALICE, None, &post, false)]);
+    assert_eq!(private_rows(&f.pool, DAVE).await, [notified("quote", ALICE, Some(&quoted), &post, false)]);
+
+    // A new-form root mentioning Carol, with a `mentionRule` threadgate.
+    let root = f.new_form_record(ALICE, "3knewroot222", "root", Some(&facets), None, &aud).await;
+    let root = f.put_post(ALICE, "3knewroot222", root).await;
+    f.ingest(ALICE, THREADGATE, "3knewroot222", json!({"$type": THREADGATE, "post": root, "allow": [{"$type": MENTION_RULE}],
+        "createdAt": "2026-09-26T12:00:00Z"}))
+        .await;
+    f.ready_all().await;
+    let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+
+    // The quoted post's count and `getQuotes`.
+    let (_, quoted_view) = posts_of(&base, BOB, &[&quoted]).await;
+    assert_eq!(quoted_view[0]["quoteCount"], 1, "{quoted_view:?}");
+    let (_, page, _) = json_of(&base, GET_QUOTES, &format!("uri={quoted}"), BOB).await;
+    assert_eq!(page["posts"].as_array().map(|p| p.iter().map(|v| v["uri"].clone()).collect::<Vec<_>>()), Some(vec![json!(post)]), "{page}");
+    // The view shows the restored quote and media.
+    let (_, p) = posts_of(&base, BOB, &[&post]).await;
+    assert_eq!(p[0]["embed"]["record"]["record"]["uri"], quoted.as_str(), "{p:?}");
+    // `mentionRule`: Carol, mentioned, may reply; Bob may not.
+    let (_, p) = posts_of(&base, CAROL, &[&root]).await;
+    assert_eq!(p[0]["viewer"]["replyDisabled"], false, "{p:?}");
+    let (_, p) = posts_of(&base, BOB, &[&root]).await;
+    assert_eq!(p[0]["viewer"]["replyDisabled"], true, "{p:?}");
+    db.drop_db().await;
+}
+
+/// T-E4 (ask 4a), one run: an old-form post `age` old mentioning Carol and
+/// quoting Dave's post (in the stock or the kryphocron `$type` forms), then
+/// rewritten to the new form by a live update (new CID and rev): the
+/// indexed quote and mentions are unchanged and no notification is
+/// written; with the rows then deleted, as retention does, a second
+/// rewrite writes none either.
+async fn rewrite_in(test: &str, age: chrono::Duration, kryphocron: bool) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture(&db.pool, test).await;
+    let (aud, quoted) = quoting_setup(&f).await;
+    let (mention_type, embed_type) = if kryphocron {
+        (format!("{KLEX}#mention"), format!("{KLEX}#embedRecord"))
+    } else {
+        ("app.bsky.richtext.facet#mention".to_string(), "app.bsky.embed.record".to_string())
+    };
+    let facets = mentions(&mention_type, &[CAROL]);
+    let embed = record_embed(&embed_type, &quoted);
+    let mut old = f.old_form_record(ALICE, "3krewrite222", "words", Some(&facets), Some(&embed), &aud).await;
+    old["createdAt"] = made_ago(age);
+    let post = f.put_post(ALICE, "3krewrite222", old).await;
+    let index = (Some(quoted.clone()), vec![CAROL.to_string()]);
+    assert_eq!(indexed(&f.pool, &post).await, index);
+    let written = vec![(DAVE.to_string(), "quote".to_string()), (CAROL.to_string(), "mention".to_string())];
+    assert_eq!(rows_of_record(&f.pool, &post).await, written, "the create notifies");
+
+    let mut new = f.new_form_record(ALICE, "3krewrite222", "words", Some(&facets), Some(&embed), &aud).await;
+    new["createdAt"] = made_ago(age);
+    f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3krewrite222", REV2, Some(new.clone())).await;
+    let cid: String = sqlx::query_scalar("SELECT cid FROM private_posts WHERE uri = $1").bind(&post).fetch_one(&f.pool).await.expect("cid");
+    assert_eq!(cid, format!("bafy3krewrite222{REV2}"), "the rewrite was written");
+    assert_eq!(indexed(&f.pool, &post).await, index, "the rewrite keeps the index");
+    assert_eq!(rows_of_record(&f.pool, &post).await, written, "and writes no notification");
+
+    drop_rows_of_record(&f.pool, &post).await;
+    f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3krewrite222", REV3, Some(new)).await;
+    assert_eq!(indexed(&f.pool, &post).await, index);
+    assert!(rows_of_record(&f.pool, &post).await.is_empty(), "a second rewrite notifies no one again");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn te4_rewrite_of_a_recent_post_stock_types() {
+    rewrite_in("te4-recent-stock", chrono::Duration::hours(1), false).await;
+}
+
+#[tokio::test]
+async fn te4_rewrite_of_a_recent_post_kryphocron_types() {
+    rewrite_in("te4-recent-klex", chrono::Duration::hours(1), true).await;
+}
+
+#[tokio::test]
+async fn te4_rewrite_of_an_old_post_stock_types() {
+    rewrite_in("te4-old-stock", chrono::Duration::days(3), false).await;
+}
+
+#[tokio::test]
+async fn te4_rewrite_of_an_old_post_kryphocron_types() {
+    rewrite_in("te4-old-klex", chrono::Duration::days(3), true).await;
+}
+
+/// Alice's old-form post `rkey` mentioning `dids`, made `ago` before now.
+async fn mentioning(f: &Fixture, aud: &str, rkey: &str, dids: &[&str], ago: chrono::Duration) -> Value {
+    let mut r = f.old_form_record(ALICE, rkey, "t", Some(&mentions("app.bsky.richtext.facet#mention", dids)), None, aud).await;
+    r["createdAt"] = made_ago(ago);
+    r
+}
+
+/// T-E8 (the notification rules, private-embeds design §6).
+#[tokio::test]
+async fn te8_updates_notify_only_new_recipients_of_recent_posts() {
+    let Some(db) = fresh_db("te8_notify_rules").await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let f = fixture(&db.pool, "te8-rules").await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL, DAVE]).await;
+    let (old, recent) = (chrono::Duration::days(3), chrono::Duration::hours(1));
+    let suppressed = |reason: &str| {
+        crate::test_support::series(&handle.render(), crate::private_tier::ingest::METRIC_NOTIFY_SUPPRESSED, &[&format!("reason=\"{reason}\"")])
+            .unwrap_or(0.0)
+    };
+    let recipients = |rows: Vec<(String, String)>| rows.into_iter().map(|(d, _)| d).collect::<Vec<_>>();
+
+    // A live create of a 3-day-old post notifies, as before.
+    let p1 = f.put_post(ALICE, "3kte8create2", mentioning(&f, &aud, "3kte8create2", &[CAROL], old).await).await;
+    assert_eq!(recipients(rows_of_record(&f.pool, &p1).await), [CAROL]);
+    // A live update of it adding Dave notifies no one.
+    let updated = mentioning(&f, &aud, "3kte8create2", &[CAROL, DAVE], old).await;
+    f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3kte8create2", REV2, Some(updated)).await;
+    assert_eq!(indexed(&f.pool, &p1).await.1, [CAROL, DAVE], "written");
+    assert_eq!(recipients(rows_of_record(&f.pool, &p1).await), [CAROL], "Dave is not notified");
+    assert_eq!(suppressed("old_update"), 1.0);
+    // Nor does a live update of a 3-day-old post Prism holds no row for.
+    let norow = mentioning(&f, &aud, "3kte8norow22", &[DAVE], old).await;
+    f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3kte8norow22", REV, Some(norow)).await;
+    let p2 = format!("at://{ALICE}/{NSID_POST_PRIVATE}/3kte8norow22");
+    assert_eq!(indexed(&f.pool, &p2).await.1, [DAVE], "written");
+    assert!(rows_of_record(&f.pool, &p2).await.is_empty());
+
+    // A 1-hour-old post: an update adding Dave notifies Dave alone, even
+    // with Carol's first row gone.
+    let p3 = f.put_post(ALICE, "3kte8recent2", mentioning(&f, &aud, "3kte8recent2", &[CAROL], recent).await).await;
+    assert_eq!(recipients(rows_of_record(&f.pool, &p3).await), [CAROL]);
+    drop_rows_of_record(&f.pool, &p3).await;
+    let updated = mentioning(&f, &aud, "3kte8recent2", &[CAROL, DAVE], recent).await;
+    f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3kte8recent2", REV2, Some(updated)).await;
+    assert_eq!(recipients(rows_of_record(&f.pool, &p3).await), [DAVE], "only the new recipient");
+    assert_eq!(suppressed("known_recipient"), 1.0);
+
+    // Eve, named while not a member, joins; an update naming her again and
+    // Bob for the first time notifies Bob alone.
+    let p4 = f.put_post(ALICE, "3kte8joiner2", mentioning(&f, &aud, "3kte8joiner2", &[EVE], recent).await).await;
+    assert!(rows_of_record(&f.pool, &p4).await.is_empty(), "Eve is not a member yet");
+    exec(&f.pool, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{EVE}', 'admin', now())")).await;
+    let updated = mentioning(&f, &aud, "3kte8joiner2", &[EVE, BOB], recent).await;
+    f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3kte8joiner2", REV2, Some(updated)).await;
+    assert_eq!(recipients(rows_of_record(&f.pool, &p4).await), [BOB]);
+
+    // A backfill write of a 3-day-old post notifies no one (C-11).
+    let backfilled = mentioning(&f, &aud, "3kte8backfil", &[BOB], old).await;
+    f.apply_from(WriteSource::Backfill, ALICE, Action::Create, NSID_POST_PRIVATE, "3kte8backfil", REV, Some(backfilled)).await;
+    assert!(rows_of_record(&f.pool, &format!("at://{ALICE}/{NSID_POST_PRIVATE}/3kte8backfil")).await.is_empty());
+
+    // A member's public reply to the 3-day-old post notifies as before.
+    f.ingest(BOB, PUBLIC_POST, "3kpubreply22", public_reply(&p1, "2026-10-01T10:00:00Z", None)).await;
+    let reply = format!("at://{BOB}/{PUBLIC_POST}/3kpubreply22");
+    assert_eq!(rows_of_record(&f.pool, &reply).await, [(ALICE.to_string(), "reply".to_string())]);
+    db.drop_db().await;
+}
+
+/// T-E9 (§4.3's rules).
+#[tokio::test]
+async fn te9_clear_fields_index_and_the_payload_displays() {
+    let Some(db) = fresh_db("te9_index_rules").await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let f = fixture(&db.pool, "te9-rules").await;
+    let (aud, x) = quoting_setup(&f).await;
+    let y = f.post_with(ALICE, "3kypost22222", &aud, json!({})).await;
+    let facets = mentions(&format!("{KLEX}#mention"), &[CAROL]);
+    let embed_type = format!("{KLEX}#embedRecord");
+
+    // (a) New form without `quote` or `mentionDids`: nothing indexed, no
+    // notification; the view still shows the quote and the facet.
+    let mut a = f.new_form_record(ALICE, "3kte9a222222", "a", Some(&facets), Some(&record_embed(&embed_type, &x)), &aud).await;
+    a.as_object_mut().expect("object").remove("quote");
+    a.as_object_mut().expect("object").remove("mentionDids");
+    let a = f.put_post(ALICE, "3kte9a222222", a).await;
+    assert_eq!(indexed(&f.pool, &a).await, (None, vec![]));
+    assert!(rows_of_record(&f.pool, &a).await.is_empty());
+    // (b) `quote` names X, the payload quotes Y.
+    let mut b = f.new_form_record(ALICE, "3kte9b222222", "b", None, Some(&record_embed(&embed_type, &y)), &aud).await;
+    b["quote"] = json!({"uri": x, "cid": "bafyquoted"});
+    let b = f.put_post(ALICE, "3kte9b222222", b).await;
+    assert_eq!(indexed(&f.pool, &b).await.0.as_deref(), Some(x.as_str()));
+    // (c) An old-form record quoting X in the clear, with `quote` naming Y.
+    let mut c = f.old_form_record(ALICE, "3kte9c222222", "c", None, Some(&record_embed(&embed_type, &x)), &aud).await;
+    c["quote"] = json!({"uri": y, "cid": "bafyquoted"});
+    let c = f.put_post(ALICE, "3kte9c222222", c).await;
+    assert_eq!(indexed(&f.pool, &c).await.0.as_deref(), Some(y.as_str()));
+    // (d) `quote` a string, `mentionDids` an object: dropped and counted,
+    // no fallback to the clear embed and facets, the record stored.
+    let dropped = |field: &str| {
+        crate::test_support::series(&handle.render(), crate::private_tier::ingest::METRIC_FIELD_DROPPED, &[&format!("field=\"{field}\"")]).unwrap_or(0.0)
+    };
+    let before = (dropped("quote"), dropped("mentionDids"));
+    let mut d = f.old_form_record(ALICE, "3kte9d222222", "d", Some(&facets), Some(&record_embed(&embed_type, &x)), &aud).await;
+    d["quote"] = json!(x);
+    d["mentionDids"] = json!({"did": CAROL});
+    let d = f.put_post(ALICE, "3kte9d222222", d).await;
+    assert_eq!(indexed(&f.pool, &d).await, (None, vec![]));
+    assert!(rows_of_record(&f.pool, &d).await.is_empty());
+    assert_eq!((dropped("quote"), dropped("mentionDids")), (before.0 + 1.0, before.1 + 1.0));
+    let source = |field: &str, source: &str| {
+        crate::test_support::series(&handle.render(), crate::private_tier::ingest::METRIC_INDEX_SOURCE, &[&format!("field=\"{field}\""), &format!("source=\"{source}\"")])
+            .unwrap_or(0.0)
+    };
+    assert!(source("quote", "dedicated") >= 3.0 && source("mentions", "dedicated") >= 1.0, "{}", handle.render());
+
+    f.ready_all().await;
+    let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let (_, views) = posts_of(&base, BOB, &[&a, &b, &c, &d]).await;
+    assert_eq!(views.len(), 4, "{views:?}");
+    assert_eq!(views[0]["embed"]["record"]["uri"], x.as_str());
+    assert_eq!(views[0]["record"]["facets"], facets);
+    assert_eq!(views[1]["embed"]["record"]["uri"], y.as_str(), "the view follows the payload");
+    assert_eq!(views[2]["embed"]["record"]["uri"], x.as_str(), "and an old form's clear embed");
+    assert_eq!(views[3]["record"]["facets"], facets, "the clear fields still display");
+    // X's quotes list (b), whose view quotes Y; Y's list (c).
+    let quotes = |uri: String| {
+        let base = base.clone();
+        async move {
+            let (_, page, _) = json_of(&base, GET_QUOTES, &format!("uri={uri}"), BOB).await;
+            page["posts"].as_array().expect("posts").iter().map(|p| p["uri"].as_str().expect("uri").to_string()).collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(quotes(x.clone()).await, std::slice::from_ref(&b));
+    assert_eq!(quotes(y.clone()).await, std::slice::from_ref(&c));
+    db.drop_db().await;
+}
+
+/// T-E10: indexing does not depend on decoding. A new-form record whose
+/// `encodedContent` is not laquna at all is stored with its `quote` and
+/// `mentionDids` indexed and its notifications written; its reads miss.
+#[tokio::test]
+async fn te10_indexing_needs_no_decode() {
+    let Some(db) = fresh_db("te10_no_decode").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "te10-no-decode").await;
+    let (aud, quoted) = quoting_setup(&f).await;
+    let mut record = f
+        .new_form_record(ALICE, "3kgarbage222", "g", Some(&mentions("#mention", &[CAROL])), Some(&record_embed("app.bsky.embed.record", &quoted)), &aud)
+        .await;
+    record["encodedContent"] = json!("00112233445566778899aabbccddeeff");
+    let post = f.put_post(ALICE, "3kgarbage222", record).await;
+    assert_eq!(indexed(&f.pool, &post).await, (Some(quoted.clone()), vec![CAROL.to_string()]));
+    assert_eq!(
+        rows_of_record(&f.pool, &post).await,
+        [(DAVE.to_string(), "quote".to_string()), (CAROL.to_string(), "mention".to_string())]
+    );
+    f.ready_all().await;
+    let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let (_, views) = posts_of(&base, BOB, &[&post]).await;
+    assert!(views.is_empty(), "{views:?}");
     db.drop_db().await;
 }

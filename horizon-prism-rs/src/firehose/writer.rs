@@ -1215,6 +1215,7 @@ impl Writer {
                 rev: rev.to_string(),
                 record: u.record.clone(),
                 source: options.source,
+                created: u.created,
                 created_at: u.created_at,
                 notify_max_age: self.private_notify_max_age,
             };

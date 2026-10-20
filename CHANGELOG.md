@@ -10,6 +10,39 @@ commit.
 
 ## [Unreleased]
 
+### Changed (private embeds, S2, #745)
+
+Private-embeds design S2 (`docs/internal/design/private-embeds-504.md`):
+the ingest side of #504.
+
+- **Quotes and mentions of a private post are indexed from its clear
+  `quote` and `mentionDids` fields when it has them**, else from its
+  clear `embed` and `facets` as before. A new-form post carries no clear
+  `embed` or `facets`, so its quote count, `getQuotes`, quote and mention
+  notifications and threadgate `mentionRule` come from these two fields;
+  Prism never decodes a private post outside a read. `quote` is read as
+  `{uri}` (an at-uri with a DID authority); `mentionDids` keeps its valid
+  DIDs, deduplicated. Either of the wrong type or over 64 KiB is dropped
+  and counted in `private_ingest_field_dropped_total{field}`; a present
+  field, even dropped or empty of valid values, never falls back to
+  `embed` or `facets`. The record is never refused for them. A new-form
+  post without the fields is indexed with no quote and no mentions.
+- **A private post's update notifies only new recipients, and only while
+  the post is recent** (within `private_notify.backfill_max_age_hours`,
+  48). A live create still notifies at any age. A rewrite of an existing
+  post (for example a PDS re-encoding its posts) no longer notifies anyone
+  again; nor does a recipient the previous version already named, member
+  then or not. Public records naming a private post notify as before.
+- **New metrics:** `private_ingest_index_source_total{field="quote"|"mentions",
+  source="dedicated"|"clear"|"none"}`, one per `postPrivate` op and field;
+  `private_notify_suppressed_total{reason="old_update"|"known_recipient"}`.
+- The comment on `[private_notify] backfill_max_age_hours` (in the code and
+  in `docker/config/app.toml`) says it now bounds live updates of private
+  posts too. No setting changes, and no migration.
+- Upgrade note: posts a PDS wrote in the new form while Prism ran an older
+  version are indexed with no quote or mentions until they are written
+  again (the PDS's next re-encoding run re-derives them).
+
 ### Changed (private embeds, S1, #744)
 
 Private-embeds design S1 (`docs/internal/design/private-embeds-504.md`):
