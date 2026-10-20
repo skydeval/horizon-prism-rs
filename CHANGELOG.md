@@ -10,6 +10,69 @@ commit.
 
 ## [Unreleased]
 
+### Changed (membership not tied to hosting, S2, #733, #764)
+
+Membership design S2 (`docs/internal/design/membership.md` §3, §11, §12):
+auto-enroll becomes a choice the operator makes, and auto-enrolled
+members that never finish their first indexing are removed. No migration.
+
+- **DEFAULT CHANGE (upgrade note): `community.auto_enroll` now defaults to
+  `false`** (was `true`), in code and in the shipped
+  `docker/config/app.toml` (C-M2 (b)). Hosting on a community PDS no longer
+  makes anyone a member unless the operator turns auto-enroll on. After the
+  upgrade the effective value is, in this order: the value saved in the
+  admin UI ("Auto-join", Group "Who can use Prism") if one was saved;
+  else `auto_enroll` as the deployment's `app.toml` sets it; else the new
+  default, `false`.
+  - A deployment whose `app.toml` sets `auto_enroll = true` under
+    `[community]` keeps today's behaviour exactly.
+  - A deployment whose `app.toml` sets `auto_enroll = false` is unchanged.
+  - **A deployment whose `app.toml` does not set the key stops
+    auto-enrolling at the upgrade.** A new account's `getTimeline`,
+    `listNotifications`, `getUnreadCount` or `getMembership` is refused
+    `disabled` (`auto_enroll_refused_total{reason="disabled"}`, answered
+    `notEligible`), and it becomes a member only through
+    `admin member add` or the admin UI. **To keep auto-enroll on**, add
+    `auto_enroll = true` under `[community]` in `app.toml` before
+    upgrading, or switch "Auto-join" on in the admin UI (live, no restart).
+  - **Members already enrolled are not affected.** The default decides
+    only whether a non-member is enrolled; no `members` row is removed or
+    changed by it, whatever the row's `source`.
+  - Startup logs `community_auto_enroll` with the effective value, the host
+    patterns it applies to and `never_ready_expiry_days`, so the value in
+    force is visible after the upgrade.
+- **Never-ready expiry** (§3.2), now built: `community.never_ready_expiry_days`
+  (7; 0 = off) takes effect. A task in `serve` runs a minute after the
+  start and then hourly. It removes, with the `member_removed` purge, every
+  member whose `source` is `auto_enroll`, whose `first_ready_at` is NULL
+  (it never once finished its first indexing) and whose `added_at` is more
+  than `never_ready_expiry_days` days ago. Each removal goes through the
+  guarded marker (`MarkerGuard::Expiry`), which re-checks those three
+  conditions in the marker's own transaction; a member that became ready
+  or was re-added by the operator in between is kept untouched.
+  - A member that is ready, or was ready once (`first_ready_at` is never
+    cleared, so a member that later fell behind is also kept), is never
+    expired. A member added by the operator (`source` `admin`) is never
+    expired.
+  - On the first run after the upgrade, any `auto_enroll` member that has
+    been waiting longer than the window without ever becoming ready is
+    removed. To see who that is beforehand, run read-only:
+    `SELECT did, added_at FROM members WHERE source = 'auto_enroll' AND
+    first_ready_at IS NULL AND added_at < now() - interval '7 days';`
+    (with the deployment's own window). Add anyone who should stay with
+    `admin member add` after the expiry, or set the window to 0 first.
+  - Expiry is not exclusion: no denial is written, and the account may
+    enroll again (or be added).
+  - The window is a live setting: a change in the admin UI applies at the
+    next run. The admin UI's note that it "has no effect yet" no longer
+    applies.
+- **Metrics and events:** `never_ready_expired_total`; events
+  `member_expired` (per member) and `never_ready_expiry` (per run, with
+  the window and the counts of candidates, expired, skipped, busy and
+  failed); `never_ready_expiry_failed` on an error.
+- `docker/README.md` step 11 says auto-enroll is off by default and
+  describes the expiry.
+
 ### Added (admin UI S5: labels, look up, member actions, #763)
 
 Admin-ui design §6.2's per-member actions, §6.9, §6.10

@@ -82,7 +82,7 @@ like_repost_days = 30
 sweep_max_purges = 5000
 
 [community]
-auto_enroll = true
+auto_enroll = false
 max_auto_enroll_per_hour = 50
 max_members = 1000
 never_ready_expiry_days = 7

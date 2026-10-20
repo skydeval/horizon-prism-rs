@@ -50,13 +50,18 @@ like_repost_days = 30
 sweep_max_purges = 5000
 
 [community]
-# Auto-enroll triggers only from getTimeline / listNotifications / getUnreadCount
-# (design §9.2), never from Thread Lens, private or index-request calls.
-auto_enroll = true
+# Auto-enroll: when true, an account on a host matching enroll_pds_patterns
+# becomes a member at its first getTimeline / listNotifications /
+# getUnreadCount / getMembership call (design §9.2), never from Thread Lens,
+# private or index-request calls. Off by default since membership S2: only
+# accounts added with `admin member add` (or the admin UI) are members.
+# Set true to keep enrolling by host.
+auto_enroll = false
 max_auto_enroll_per_hour = 50
 max_members = 1000
-# Auto-enrolled members that have never been ready (first_ready_at NULL) after
-# this many days are removed (design §9.2).
+# Auto-enrolled members that have never been ready (first_ready_at NULL) this
+# many days after they were added are removed, checked hourly. Admin-added
+# members never expire. 0 = never.
 never_ready_expiry_days = 7
 # Refused enrollments are cached this long before getRepoStatus is re-checked.
 enroll_refusal_cache_secs = 3600

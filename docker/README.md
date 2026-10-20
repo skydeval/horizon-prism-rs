@@ -98,7 +98,7 @@ or print it again with `docker compose exec app /app/horizon-prism-rs admin setu
 
 **11. Add yourself as a member.**
 
-With auto-enroll on, a client also enrols you the first time it loads your timeline or notifications, but only if your PDS host matches `community.enroll_pds_patterns` and `community.max_members` has not been reached. Members on other PDSes must be added here.
+Auto-enroll is off by default: only the accounts you add are members. If you turn it on (`community.auto_enroll = true`, or "Auto-join" in the admin UI), a client also enrols you the first time it loads your timeline or notifications, but only if your PDS host matches `community.enroll_pds_patterns` and `community.max_members` has not been reached. Members on other PDSes must be added here. An auto-enrolled member whose first indexing never finishes is removed after `community.never_ready_expiry_days` (7; 0 = never), checked hourly; members you add are never removed this way.
 
 A new member gets `NotReady` from member-only endpoints until their initial indexing finishes. Check its state with `admin member list`.
 

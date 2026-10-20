@@ -228,6 +228,10 @@ mod tests {
         }
 
         fn enroller(&self) -> AutoEnroller {
+            self.enroller_with("[community]\nauto_enroll = true\n")
+        }
+
+        fn enroller_with(&self, toml: &str) -> AutoEnroller {
             let lookup = |var: &str| -> Option<String> {
                 match var {
                     "APP_PUBLIC_HOSTNAME" => Some("prism.example.com".to_string()),
@@ -237,7 +241,7 @@ mod tests {
                     _ => None,
                 }
             };
-            let cfg = AppConfig::from_parts("", &lookup).expect("config");
+            let cfg = AppConfig::from_parts(toml, &lookup).expect("config");
             let resolver = IdentityResolver::new(
                 Transports::loopback_for_tests(),
                 self.pool.clone(),
@@ -330,6 +334,28 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// T-M8 (§3.1, C-M2 (b)): with a configuration that does not set
+    /// `community.auto_enroll`, auto-enroll is off: a non-member is refused
+    /// `disabled` and nothing is inserted, while a member enrolled earlier
+    /// by auto-enroll stays a member. Set explicitly, it is on.
+    #[tokio::test]
+    async fn t_m8_auto_enroll_is_off_by_default() {
+        let Some(db) = fresh_db("membership_t_m8").await else {
+            return;
+        };
+        let t = T::new(&db.pool);
+        assert!(!crate::config::FileConfig::default().community.auto_enroll);
+        assert_eq!(add_member(&db.pool, &t.scope, &t.private, M, "auto_enroll", BUDGET).await.expect("add"), AddOutcome::Added { became_owner: false });
+        let off = t.enroller_with("");
+        assert_eq!(off.check(N).await.expect("check"), Enrollment::Refused("disabled"));
+        assert!(!t.member(N).await, "nothing inserted");
+        assert_eq!(off.check(M).await.expect("check"), Enrollment::Member { ready: false }, "an earlier auto-enrolled member stays");
+        assert!(t.member(M).await);
+        let on = t.enroller_with("[community]\nauto_enroll = true\n");
+        assert_eq!(on.check(N).await.expect("check"), Enrollment::Refused("unresolvable"), "on: the network checks run");
+        db.drop_db().await;
+    }
+
     /// T-M3 (§2.2, Invariant D): `add_member` before the deny marker (the
     /// marker removes it, `Marked`) and after it (`Denied`); a deny while a
     /// purge of the DID runs is `Busy` and writes nothing; and racing pairs
@@ -387,7 +413,7 @@ mod tests {
         db.drop_db().await;
     }
 
-    /// The `Expiry` guard (§3.2; the task that uses it is S2): an
+    /// The `Expiry` guard (§3.2; the task that uses it is `expiry`): an
     /// `auto_enroll` member never ready and added before the cutoff is
     /// marked; one ready once, an `admin` one, or one added after the
     /// cutoff is `Skipped`: no `purging_dids` row, its bookmarks and mutes

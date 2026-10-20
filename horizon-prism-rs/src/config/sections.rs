@@ -187,7 +187,9 @@ pub struct CommunityConfig {
 impl Default for CommunityConfig {
     fn default() -> Self {
         Self {
-            auto_enroll: true,
+            // Off: hosting makes nobody a member unless the operator says so
+            // (membership design §3.1, C-M2 (b)).
+            auto_enroll: false,
             max_auto_enroll_per_hour: 50,
             max_members: 1000,
             never_ready_expiry_days: 7,

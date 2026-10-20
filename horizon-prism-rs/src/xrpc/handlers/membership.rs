@@ -167,7 +167,7 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        let cfg = app_config("[community]\nmax_auto_enroll_per_hour = 1\n");
+        let cfg = app_config("[community]\nauto_enroll = true\nmax_auto_enroll_per_hour = 1\n");
         let hydrator = hydrator(p, ScopeSets::default());
         let scope = hydrator.scope().clone();
         let resolver = IdentityResolver::new(Transports::loopback_for_tests(), p.clone(), IdentitySettings::from_app(&cfg), Arc::new(scope.clone()), Intent::Internal);

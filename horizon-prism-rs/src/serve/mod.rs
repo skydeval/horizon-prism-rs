@@ -222,6 +222,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .cfg;
     let live = crate::admin::settings::LiveSettings::new(&cfg.file);
     let restart = crate::admin::settings::RestartHandle::default();
+    log_community_auto_enroll(&cfg.file);
     // The effective head age, for the release check (private-threads design
     // §5), and the bucket note of §3.4.
     tracing::info!(
@@ -469,6 +470,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
             }
         }));
     }
+    // The never-ready expiry (membership design §3.2): a minute after the
+    // start, then hourly; its window is read live at each run.
+    tasks.push(crate::aggregations::expiry::NeverReadyExpiry::new(pool.clone(), purger.clone(), live.clone()).spawn());
 
     // Identity refresher, with the account_deleted purge hook.
     tasks.push(IdentityRefresher::new(pool.clone(), resolver.clone(), Arc::new(PurgeLifecycle::new(purger.clone()))).spawn());
@@ -1010,6 +1014,31 @@ pub enum Stopped {
     /// A restart from the admin UI: exit [`EXIT_RESTART`] for the
     /// supervisor to start it again.
     Restart,
+}
+
+/// Auto-enroll's effective value and host patterns, once at startup
+/// (membership design §11): the default is off since S2, so an operator
+/// who relied on the old default sees it here.
+fn log_community_auto_enroll(f: &crate::config::FileConfig) {
+    let c = &f.community;
+    let patterns = if c.enroll_pds_patterns.is_empty() {
+        f.constellation
+            .networks
+            .iter()
+            .find(|n| n.name == crate::config::COMMUNITY_NETWORK)
+            .map(|n| n.pds_patterns.clone())
+            .unwrap_or_default()
+    } else {
+        c.enroll_pds_patterns.clone()
+    };
+    tracing::info!(
+        event = "community_auto_enroll",
+        auto_enroll = c.auto_enroll,
+        patterns = %patterns.join(" "),
+        never_ready_expiry_days = c.never_ready_expiry_days,
+        "community.auto_enroll={} (off by default; only added members join when off)",
+        c.auto_enroll
+    );
 }
 
 /// The private-read floors, once at startup (timing-floors design §2): `info`

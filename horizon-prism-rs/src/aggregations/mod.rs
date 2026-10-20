@@ -8,12 +8,14 @@
 //! - [`rebuild`]: the daily scope sweep and the weekly counts repair (§9.4,
 //!   §9.5; scope-recency design §3.3).
 //! - [`counts`]: Constellation count enrichment (§9.6).
+//! - [`expiry`]: the hourly never-ready expiry (membership design §3.2).
 
 pub mod admit;
 pub mod counts;
 pub mod growth;
 pub mod policy;
 pub mod enroll;
+pub mod expiry;
 pub mod membership;
 pub mod pack_counts;
 pub mod purge;

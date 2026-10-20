@@ -265,6 +265,10 @@ pub mod hooks {
     /// read guard after its second scope check, before its upsert. Key: the
     /// subject.
     pub const SUBSCRIBE_HOLDS_GUARD: &str = "sr_subscribe_holds_guard";
+    /// Membership T-M7: the never-ready expiry, its candidates selected,
+    /// before the first candidate's marker. Key: `<database>/expiry`
+    /// ([`pause_in`]).
+    pub const EXPIRY_AFTER_SELECT: &str = "m_expiry_after_select";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);
