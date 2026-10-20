@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 
+use super::media::{self, MEDIA_KINDS_FIELD};
 use super::{Applied, IngestError, PrivateOp, PublicNotify, QuoteRef, owners};
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::{
@@ -67,6 +68,11 @@ pub(crate) struct DisplayFields {
     /// [`METRIC_INDEX_SOURCE`].
     pub quote_source: IndexSource,
     pub mentions_source: IndexSource,
+    /// The media bits (`media::IMAGE`, `media::VIDEO`): from the clear
+    /// `mediaKinds` when the record has it, else from the clear `embed`
+    /// (private-media-filters design §3.2).
+    pub media_kinds: u8,
+    pub media_source: IndexSource,
     /// Fields dropped as the wrong type or too large (C-16), for
     /// [`METRIC_FIELD_DROPPED`].
     pub dropped: Vec<&'static str>,
@@ -98,8 +104,9 @@ impl IndexSource {
 
 /// Metric: a display field dropped at ingest, by `field` (C-16).
 pub(crate) const METRIC_FIELD_DROPPED: &str = "private_ingest_field_dropped_total";
-/// Metric: per `postPrivate` op and `field` (`quote`, `mentions`), the
-/// `source` it was indexed from (private-embeds design §9).
+/// Metric: per `postPrivate` op and `field` (`quote`, `mentions`, `media`),
+/// the `source` it was indexed from (private-embeds design §9,
+/// private-media-filters design §8).
 pub(crate) const METRIC_INDEX_SOURCE: &str = "private_ingest_index_source_total";
 /// Metric: notifications a private post's write did not send, by `reason`:
 /// `old_update` (a live update of a post older than the notify age),
@@ -177,6 +184,18 @@ impl DisplayFields {
             (false, Some(_)) => IndexSource::Clear,
             (false, None) => IndexSource::None,
         };
+        // The media marker (private-media-filters design §3.2, §3.3): as
+        // `quote`, present (not null) decides, even when dropped or empty.
+        let has_media = record.get(MEDIA_KINDS_FIELD).is_some_and(|v| !v.is_null());
+        let media_field = keep(MEDIA_KINDS_FIELD, Value::is_array);
+        let (media_kinds, media_source) = if has_media {
+            let kinds = media_field.as_ref().and_then(Value::as_array).map_or(0, |a| media::kinds_of_field(a));
+            (kinds, IndexSource::Dedicated)
+        } else if let Some(e) = &embed {
+            (media::kinds_of_embed(e), IndexSource::Clear)
+        } else {
+            (0, IndexSource::None)
+        };
         Self {
             facets,
             embed,
@@ -186,6 +205,8 @@ impl DisplayFields {
             mention_dids,
             quote_source,
             mentions_source,
+            media_kinds,
+            media_source,
             dropped,
         }
     }
@@ -473,7 +494,9 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             for field in &f.display.dropped {
                 metrics::counter!(METRIC_FIELD_DROPPED, "field" => *field).increment(1);
             }
-            for (field, source) in [("quote", f.display.quote_source), ("mentions", f.display.mentions_source)] {
+            for (field, source) in
+                [("quote", f.display.quote_source), ("mentions", f.display.mentions_source), ("media", f.display.media_source)]
+            {
                 metrics::counter!(METRIC_INDEX_SOURCE, "field" => field, "source" => source.label()).increment(1);
             }
             // The notification rules (private-embeds design §6): rule 1
@@ -487,8 +510,8 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
                 "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, audience_uri, reply_root_uri, \
                    reply_parent_uri, encoded_content, encoded_codec, encoded_generation, plaintext_text, created_at, \
                    reply_root_cid, reply_parent_cid, facets, embed, langs, self_labels, quote_uri, mention_dids, \
-                   display_filled) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, true) \
+                   display_filled, media_kinds) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, true, $22) \
                  ON CONFLICT (uri) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, \
                    audience_uri = EXCLUDED.audience_uri, reply_root_uri = EXCLUDED.reply_root_uri, \
                    reply_parent_uri = EXCLUDED.reply_parent_uri, reply_root_cid = EXCLUDED.reply_root_cid, \
@@ -497,7 +520,7 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
                    plaintext_text = EXCLUDED.plaintext_text, created_at = EXCLUDED.created_at, \
                    facets = EXCLUDED.facets, embed = EXCLUDED.embed, langs = EXCLUDED.langs, \
                    self_labels = EXCLUDED.self_labels, quote_uri = EXCLUDED.quote_uri, \
-                   mention_dids = EXCLUDED.mention_dids, display_filled = true \
+                   mention_dids = EXCLUDED.mention_dids, display_filled = true, media_kinds = EXCLUDED.media_kinds \
                  WHERE private_posts.rev < EXCLUDED.rev \
                     OR (NOT private_posts.display_filled AND private_posts.rev <= EXCLUDED.rev)",
             )
@@ -522,6 +545,7 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .bind(&f.display.self_labels)
             .bind(&f.display.quote_uri)
             .bind(&f.display.mention_dids)
+            .bind(i16::from(f.display.media_kinds))
             .execute(&mut *conn)
             .await?
             .rows_affected()
@@ -1469,6 +1493,44 @@ mod tests {
             assert_eq!((parsed.quote_source, parsed.mentions_source), sources, "{case}");
             assert!(parsed.dropped.is_empty(), "{case}");
             assert!(PostPrivateFields::parse(&record, now()).is_ok(), "{case}: never malformed");
+        }
+    }
+
+    /// T-M6 (private-media-filters design §3.2, §3.3): a present
+    /// `mediaKinds` decides, even when dropped or empty, and never falls
+    /// back to the clear `embed`; absent or null, the clear `embed` decides,
+    /// in either vocabulary; neither, no media. Never malformed.
+    #[test]
+    fn media_kinds_come_from_the_marker_first() {
+        use crate::private_tier::media::{IMAGE, VIDEO, embed_fixtures};
+        let video = json!({"$type": "app.bsky.embed.video", "video": {"$type": "blob", "ref": {"$link": "v"}, "mimeType": "video/mp4", "size": 1}});
+        let big: Vec<String> = (0..10_000).map(|i| format!("image{i:04}")).collect();
+        for (case, record, bits, source, dropped) in [
+            ("image", json!({"mediaKinds": ["image"]}), IMAGE, IndexSource::Dedicated, false),
+            ("video", json!({"mediaKinds": ["video"]}), VIDEO, IndexSource::Dedicated, false),
+            ("both", json!({"mediaKinds": ["image", "video"]}), IMAGE | VIDEO, IndexSource::Dedicated, false),
+            ("both, out of order", json!({"mediaKinds": ["video", "image"]}), IMAGE | VIDEO, IndexSource::Dedicated, false),
+            ("a duplicate", json!({"mediaKinds": ["image", "image"]}), IMAGE, IndexSource::Dedicated, false),
+            ("an unknown kind", json!({"mediaKinds": ["audio"]}), 0, IndexSource::Dedicated, false),
+            ("a non-string among kinds", json!({"mediaKinds": [1, "image"]}), IMAGE, IndexSource::Dedicated, false),
+            ("empty: no fallback", json!({"mediaKinds": [], "embed": video}), 0, IndexSource::Dedicated, false),
+            ("null: absent", json!({"mediaKinds": null, "embed": video}), VIDEO, IndexSource::Clear, false),
+            ("a string: dropped", json!({"mediaKinds": "image"}), 0, IndexSource::Dedicated, true),
+            ("an object: dropped", json!({"mediaKinds": {"image": true}, "embed": video}), 0, IndexSource::Dedicated, true),
+            ("over 64 KiB: dropped", json!({"mediaKinds": big, "embed": video}), 0, IndexSource::Dedicated, true),
+            ("the marker wins over a disagreeing embed", json!({"mediaKinds": ["image"], "embed": video}), IMAGE, IndexSource::Dedicated, false),
+            ("no marker, the clear embed", json!({"embed": video}), VIDEO, IndexSource::Clear, false),
+            ("neither", json!({"text": "t"}), 0, IndexSource::None, false),
+        ] {
+            let d = DisplayFields::parse(&record);
+            assert_eq!((d.media_kinds, d.media_source), (bits, source), "{case}");
+            assert_eq!(d.dropped.contains(&"mediaKinds"), dropped, "{case}: {:?}", d.dropped);
+            assert!(PostPrivateFields::parse(&record, now()).is_ok(), "{case}: never malformed");
+        }
+        // The clear-embed path over every embed kind, in both vocabularies.
+        for (case, embed, bits) in embed_fixtures() {
+            let d = DisplayFields::parse(&json!({"embed": embed}));
+            assert_eq!((d.media_kinds, d.media_source), (bits, IndexSource::Clear), "{case}");
         }
     }
 

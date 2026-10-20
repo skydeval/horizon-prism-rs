@@ -33,6 +33,7 @@ mod emit;
 pub(crate) mod gauges;
 pub(crate) mod handlers;
 pub(crate) mod ingest;
+mod media;
 mod oracle;
 pub(crate) mod owners;
 mod pipeline;

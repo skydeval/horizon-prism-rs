@@ -10,6 +10,35 @@ commit.
 
 ## [Unreleased]
 
+### Changed (private media filters, S1, #757)
+
+Private-media-filters design S1 (`docs/internal/design/private-media-filters.md`):
+the index the media filters of S2 read. No visible change.
+
+- **Private posts are indexed by media kind.** At ingest, a private post's
+  media (images or a gallery, or a video, also as a quote-with-media's
+  media) is taken from its clear `mediaKinds` field when it has one, else
+  from its clear `embed`, in either `$type` vocabulary, by the public
+  feed's own classifier. External cards, plain quotes and a quoted post's
+  own media are not media. A `mediaKinds` that is not an array or is over
+  64 KiB is dropped and counted in
+  `private_ingest_field_dropped_total{field="mediaKinds"}`; a present one,
+  even dropped or empty, never falls back to `embed`. The record is never
+  refused for it. A new-form post without the field is indexed as having
+  no media. Prism never decodes a private post outside a read.
+- **Migration 0035** adds `private_posts.media_kinds` (a constant default,
+  no row rewritten), fills it for stored posts from their clear `embed`,
+  and builds two partial indexes holding only media posts, not
+  concurrently. Posts stored in the new form (no clear embed) are filled
+  when their PDS writes them again.
+- **New metric series:** `private_ingest_index_source_total{field="media"}`
+  (`source` as for quotes and mentions). The admin health page's "Quotes
+  and mentions" figures count only those two fields.
+- **Upgrade note: deploy this Prism before a PDS you index re-runs its
+  rewrite to add `mediaKinds`.** An older Prism drops the field with no
+  stored copy, and such a post stays out of the media filters until it is
+  written again.
+
 ### Added (admin UI S3: health, jobs, problems, blocks, #755)
 
 Admin-ui design §6.1, §6.4, §6.6 to §6.8, §9 (`docs/internal/design/admin-ui.md`).

@@ -205,6 +205,12 @@ impl Snapshot {
         self.of(name).filter(|s| s.label(label) == Some(value)).map(|s| s.value).reduce(|a, b| a + b)
     }
 
+    /// The sum over the series whose labels hold every `(label, value)`.
+    #[must_use]
+    pub fn sum_where_all(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        self.of(name).filter(|s| labels.iter().all(|(l, v)| s.label(l) == Some(*v))).map(|s| s.value).reduce(|a, b| a + b)
+    }
+
     /// Each value of `label`, with its value, in label order.
     #[must_use]
     pub fn by(&self, name: &str, label: &str) -> Vec<(String, f64)> {
@@ -731,6 +737,14 @@ mod tests {
         assert_eq!(s.sum("db_budget_ratio"), None);
         let multi = parse("x{a=\"1\",b=\"two, three\"} 4.5", |_| true);
         assert_eq!(multi, vec![Sample { name: "x".into(), labels: vec![("a".into(), "1".into()), ("b".into(), "two, three".into())], value: 4.5 }]);
+        let sources = Snapshot::from_text(
+            "private_ingest_index_source_total{field=\"quote\",source=\"dedicated\"} 2\n\
+             private_ingest_index_source_total{field=\"mentions\",source=\"dedicated\"} 3\n\
+             private_ingest_index_source_total{field=\"media\",source=\"dedicated\"} 5\n",
+            DateTime::<Utc>::UNIX_EPOCH,
+        );
+        let of = |field: &str| sources.sum_where_all(PRIVATE_INGEST_SOURCE, &[("field", field), ("source", "dedicated")]);
+        assert_eq!((of("quote"), of("mentions"), of("media"), of("other")), (Some(2.0), Some(3.0), Some(5.0), None));
     }
 
     #[test]

@@ -222,7 +222,17 @@ fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
 
     // Private posts' new form (private-embeds design §9).
     let form = |f: &str| now.and_then(|s| s.sum_where(PRIVATE_READ_CONTENT, "form", f));
-    let source = |s: &str| now.and_then(|n| n.sum_where(PRIVATE_INGEST_SOURCE, "source", s));
+    // Quotes and mentions only: the same metric also counts `field="media"`
+    // (private-media-filters design §8).
+    let source = |s: &str| {
+        now.and_then(|n| {
+            let of = |field: &str| n.sum_where_all(PRIVATE_INGEST_SOURCE, &[("field", field), ("source", s)]);
+            match (of("quote"), of("mentions")) {
+                (None, None) => None,
+                (q, m) => Some(q.unwrap_or(0.0) + m.unwrap_or(0.0)),
+            }
+        })
+    };
     let bad = ring.rise(HOUR, |s| Some(s.sum_where(PRIVATE_READ_OUTCOMES, "outcome", "bad_content").unwrap_or(0.0)));
     groups.push(FigureGroup {
         title: "Private posts",

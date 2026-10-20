@@ -98,6 +98,8 @@ mod tests {
             "0033_scope_recency",
             // The web admin UI, S2: settings (#754).
             "0034_operator_settings_history",
+            // Private media filters, S1 (#757).
+            "0035_private_media_kinds",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

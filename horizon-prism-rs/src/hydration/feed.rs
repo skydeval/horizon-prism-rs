@@ -32,7 +32,13 @@ pub const NSID_POST: &str = "app.bsky.feed.post";
 /// test.
 #[must_use]
 pub fn media_type(record: &Value) -> Option<&'static str> {
-    let embed = record.get("embed")?;
+    media_type_of_embed(record.get("embed")?)
+}
+
+/// [`media_type`] of an embed itself, in the stock `$type` form; the
+/// private tier's media filters classify a normalized embed with it.
+#[must_use]
+pub fn media_type_of_embed(embed: &Value) -> Option<&'static str> {
     let kind = match embed.get("$type").and_then(Value::as_str)? {
         "app.bsky.embed.recordWithMedia" => embed.pointer("/media/$type").and_then(Value::as_str)?,
         other => other,

@@ -77,13 +77,33 @@ fn quote_ref_of(embed: Option<&Value>) -> Option<Value> {
     Some(json!({"uri": r.get("uri")?, "cid": r.get("cid")?}))
 }
 
+/// The PDS's `mediaKinds` (private-media-filters design, the locked shape):
+/// `image` for images or a gallery, `video` for a video, at the top level
+/// or as a record-with-media's media, in either vocabulary; `None` when the
+/// embed has no media. Written out here, apart from Prism's classifier.
+pub(super) fn media_kinds_of(embed: Option<&Value>) -> Option<Value> {
+    let e = embed?;
+    let media = match e.get("$type")?.as_str()? {
+        "app.bsky.embed.recordWithMedia" | "tools.kryphocron.feed.postPublic#embedRecordWithMedia" => e.get("media")?,
+        _ => e,
+    };
+    match media.get("$type")?.as_str()? {
+        "app.bsky.embed.images"
+        | "app.bsky.embed.gallery"
+        | "tools.kryphocron.feed.postPublic#embedImage"
+        | "tools.kryphocron.feed.postPublic#embedGallery" => Some(json!(["image"])),
+        "app.bsky.embed.video" | "tools.kryphocron.feed.postPublic#embedVideo" => Some(json!(["video"])),
+        _ => None,
+    }
+}
+
 impl Fixture {
     /// A new-form record (the design's `encoded_content_post`): the payload
-    /// encoded with the real hooks, and `embedBlobs`, `mentionDids` and
-    /// `quote` derived from the same facets and embed, each omitted when
-    /// empty, as the PDS writes them. Tests that need other clear fields
-    /// change the record after.
-    async fn new_form_record(&self, owner: &str, rkey: &str, text: &str, facets: Option<&Value>, embed: Option<&Value>, audience: &str) -> Value {
+    /// encoded with the real hooks, and `embedBlobs`, `mentionDids`,
+    /// `quote` and `mediaKinds` derived from the same facets and embed, each
+    /// omitted when empty, as the PDS writes them. Tests that need other
+    /// clear fields change the record after.
+    pub(super) async fn new_form_record(&self, owner: &str, rkey: &str, text: &str, facets: Option<&Value>, embed: Option<&Value>, audience: &str) -> Value {
         let mut record = self.encoded_bytes(owner, rkey, &payload(text, facets, embed), Some(audience)).await;
         let mut blobs = Vec::new();
         if let Some(e) = embed {
@@ -99,11 +119,14 @@ impl Fixture {
         if let Some(q) = quote_ref_of(embed) {
             record["quote"] = q;
         }
+        if let Some(kinds) = media_kinds_of(embed) {
+            record["mediaKinds"] = kinds;
+        }
         record
     }
 
     /// An old-form record: `text` encoded, `facets` and `embed` in the clear.
-    async fn old_form_record(&self, owner: &str, rkey: &str, text: &str, facets: Option<&Value>, embed: Option<&Value>, audience: &str) -> Value {
+    pub(super) async fn old_form_record(&self, owner: &str, rkey: &str, text: &str, facets: Option<&Value>, embed: Option<&Value>, audience: &str) -> Value {
         let mut record = self.encoded_post(owner, rkey, text, Some(audience)).await;
         if let Some(v) = facets {
             record["facets"] = v.clone();
@@ -115,7 +138,7 @@ impl Fixture {
     }
 
     /// Ingest `record` as `owner`'s private post `rkey`; its URI.
-    async fn put_post(&self, owner: &str, rkey: &str, record: Value) -> String {
+    pub(super) async fn put_post(&self, owner: &str, rkey: &str, record: Value) -> String {
         self.ingest(owner, NSID_POST_PRIVATE, rkey, record).await;
         format!("at://{owner}/{NSID_POST_PRIVATE}/{rkey}")
     }
@@ -128,7 +151,7 @@ fn shown(view: &Value) -> (Value, Value) {
 
 /// No clear-only field of the new form reaches a body.
 fn assert_no_clear_fields(body: &str) {
-    for key in ["embedBlobs", "mentionDids", "\"quote\":", "encodedContent"] {
+    for key in ["embedBlobs", "mentionDids", "\"quote\":", "encodedContent", "mediaKinds"] {
         assert!(!body.contains(key), "{key} reached a body: {body}");
     }
 }

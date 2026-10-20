@@ -14,6 +14,8 @@ mod builder;
 mod embeds;
 // The admin UI's live feed shows no private content (T-F4).
 mod live_feed;
+// Media kinds and the media filters on the author feed (P-30).
+mod media;
 mod round;
 mod threads;
 // The shared walk (#720): T-60 to T-63.
