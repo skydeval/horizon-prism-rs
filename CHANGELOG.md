@@ -10,6 +10,18 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (divergence left set after a catch-up, #736)
+
+- **`sync_state.diverged_since` now clears when `applied_rev` reaches the
+  probed head.** The first probe of a new tracked DID stamps it (nothing
+  applied yet), and before this only a later probe that found the DID
+  current cleared it. A just-ready member showed as diverged for up to a
+  probe interval, and if that probe saw a newer commit the old stamp was
+  kept, so the divergence grace counted from the first probe and could
+  clear readiness early. The firehose's advance, a job's settle and
+  `requestRecord`'s catch-up settle each clear it when the new
+  `applied_rev` is at or past `head_rev`. No migration.
+
 ### Added (a private relay that never reports, #737)
 
 - **Prism warns when a relay in `firehose.private_relays` holds private

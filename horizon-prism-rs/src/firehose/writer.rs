@@ -2269,6 +2269,7 @@ pub async fn read_follows_clears(conn: &mut PgConnection, did: &str) -> Result<i
 /// `applied_rev = GREATEST(applied_rev, rev)` (§6.11.3). `firehose`: the
 /// firehose's own advance, which also raises `firehose_rev`, the position
 /// a follow-verification flag waits for (following-audience design §3.2).
+/// An advance that reaches the probed head ends a divergence (#736).
 ///
 /// # Errors
 ///
@@ -2278,7 +2279,9 @@ pub async fn advance_applied_rev(conn: &mut PgConnection, did: &str, rev: &str, 
         "INSERT INTO sync_state (did, applied_rev, firehose_rev) VALUES ($1, $2, CASE WHEN $3 THEN $2 END) \
          ON CONFLICT (did) DO UPDATE SET applied_rev = GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev), \
            firehose_rev = CASE WHEN $3 THEN GREATEST(sync_state.firehose_rev, EXCLUDED.applied_rev) \
-                               ELSE sync_state.firehose_rev END",
+                               ELSE sync_state.firehose_rev END, \
+           diverged_since = CASE WHEN GREATEST(sync_state.applied_rev, EXCLUDED.applied_rev) >= sync_state.head_rev \
+                                 THEN NULL ELSE sync_state.diverged_since END",
     )
     .bind(did)
     .bind(rev)
@@ -2326,7 +2329,10 @@ pub async fn advance_applied_rev_with_follows(
            follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 \
              AND sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN now() END, \
            follows_verified_rev = GREATEST(sync_state.applied_rev, \
-             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
+             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+           diverged_since = CASE WHEN GREATEST(sync_state.applied_rev, \
+               CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
+               >= sync_state.head_rev THEN NULL ELSE sync_state.diverged_since END \
          RETURNING follows_verified_at IS NOT NULL, \
            COALESCE(post_listed_rev >= $2 AND audience_listed_rev >= $2, false)",
     )

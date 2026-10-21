@@ -492,6 +492,60 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// #736: a new tracked DID's first probe stamps `diverged_since`; the
+    /// advance that brings `applied_rev` up to the head clears it, so a
+    /// later divergence counts its grace from its own start.
+    #[tokio::test]
+    async fn catching_up_to_the_head_ends_the_divergence() {
+        let Some(db) = fresh_db("head_prober_catch_up").await else {
+            return;
+        };
+        let p = &db.pool;
+        exec(p, "INSERT INTO actors (did, pds_endpoint) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'https://pds.example.com')").await;
+        let mut sets = ScopeSets::default();
+        sets.members.insert(DID.into());
+        sets.scope.insert(DID.into());
+        let heads = Arc::new(FakeHeads { rev: Mutex::new("3kbbbbbbbbbbb".into()), calls: Mutex::new(0) });
+        let prober = HeadProber::new(
+            p.clone(),
+            ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10),
+            Arc::new(DisabledPrivateTier),
+            heads.clone(),
+            HostBudgets::new(rates()),
+            SyncConfig::default(),
+        );
+        let diverged = || async move {
+            sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>("SELECT diverged_since FROM sync_state WHERE did = $1")
+                .bind(DID)
+                .fetch_one(p)
+                .await
+                .expect("sync_state")
+        };
+        // The first probe of a DID nothing has been applied for.
+        assert_eq!(prober.probe(DID, PDS).await, ProbeResult::Behind);
+        assert!(diverged().await.is_some());
+        // An advance short of the head leaves the divergence alone.
+        let mut conn = p.acquire().await.expect("conn");
+        crate::firehose::writer::advance_applied_rev(&mut conn, DID, "3kaaaaaaaaaaa", false).await.expect("advance");
+        assert!(diverged().await.is_some(), "still behind the head");
+        // The advance that reaches the head ends it, before any probe.
+        crate::firehose::writer::advance_applied_rev(&mut conn, DID, "3kbbbbbbbbbbb", true).await.expect("advance");
+        assert_eq!(diverged().await, None);
+        // The settle path does the same (listed revs cover the rev).
+        exec(p, "UPDATE sync_state SET diverged_since = now() - interval '1 hour', head_rev = '3kccccccccccc', \
+                 post_listed_rev = '3kccccccccccc', audience_listed_rev = '3kccccccccccc'").await;
+        crate::firehose::writer::advance_applied_rev_with_follows(&mut conn, DID, "3kccccccccccc", None).await.expect("settle");
+        assert_eq!(diverged().await, None);
+        drop(conn);
+        // A new commit past the applied rev starts a fresh divergence, not
+        // one dated from the first probe.
+        *heads.rev.lock().expect("lock") = "3kddddddddddd".into();
+        assert_eq!(prober.probe(DID, PDS).await, ProbeResult::Behind);
+        let since = diverged().await.expect("diverged");
+        assert!(chrono::Utc::now() - since < chrono::TimeDelta::minutes(1), "{since}");
+        db.drop_db().await;
+    }
+
     #[tokio::test]
     async fn read_head_uses_fresh_heads_and_never_waits() {
         let Some(db) = fresh_db("head_read_path").await else {

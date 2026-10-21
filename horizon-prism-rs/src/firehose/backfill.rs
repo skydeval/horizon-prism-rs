@@ -1734,7 +1734,10 @@ impl Backfill {
                            follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 \
                              AND sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN now() END, \
                            follows_verified_rev = GREATEST(sync_state.applied_rev, \
-                             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
+                             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+                           diverged_since = CASE WHEN GREATEST(sync_state.applied_rev, \
+                               CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
+                               >= sync_state.head_rev THEN NULL ELSE sync_state.diverged_since END \
                          RETURNING follows_verified_at IS NOT NULL, \
                            COALESCE(post_listed_rev >= $2 AND audience_listed_rev >= $2, false)",
                     )
