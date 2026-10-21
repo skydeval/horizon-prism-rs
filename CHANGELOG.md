@@ -10,6 +10,40 @@ commit.
 
 ## [Unreleased]
 
+### Added (Thread Lens: replies the thread's author hid are flagged, #791)
+
+- A Thread Lens node whose URI the thread root's threadgate lists in
+  `hiddenReplies` carries `hiddenByThreadgate: true` (stock's name and
+  meaning, from `app.bsky.unspecced.defs#threadItemPost`), on post nodes
+  and gap nodes alike, except the root itself and the caller's own posts.
+  The response gains no threadgate field and no other node carries any
+  part of the gate; a root that is a post node keeps its own post view's
+  `threadgate`, as before and as on every endpoint.
+- One pass after enforcement sets it on every node, whatever path it came
+  by: the baseline, stubs resolved in place, the parent walk, reply
+  expansion and continuations. The root is the anchor's stored row's
+  root, else its post node's; the gate is the root's valid stored
+  threadgate, else the gate view of the ordinary view's upstream thread
+  when it names that root. A root that is a gap (its author blocks the
+  caller, or the caller blocks it) still has its gate read from those two
+  sources, and nothing of it is sent. A private root's gate is not read:
+  Thread Lens never reads the private tier.
+- **Fixed:** with bridging on, reply expansion re-read the stored replies
+  and placed the ones the root's author had hid as ordinary replies (also
+  on a `repliesCursor` continuation). They are now flagged.
+- The baseline keeps hidden replies, and what is beneath them, instead of
+  leaving them out, so a bridging-off response is `getPostThread`'s nodes
+  plus the flagged hidden replies. `getPostThread` is unchanged.
+- `resolve` flags post items from the stored gate of the root their own
+  record names; a gap item is never flagged, so it never says whether a
+  blocked author's post is stored here.
+- Lexicon: `hiddenByThreadgate` on `postNode` and `gapNode`;
+  `getThread`'s description. Thread Lens amendment 1 §2 – §3.
+- Tests: local baseline and expansion, bridging on and off, the reply's
+  own author, a root that blocks the caller, `resolve`, a gate changed
+  between requests, a private root, an upstream thread's gate valid and
+  not, and that no gate field is ever emitted.
+
 ### Changed (Thread Lens: a `!warn` post is a post, #790)
 
 - A post an upstream labelled `!warn` is no longer `content-stripped` on

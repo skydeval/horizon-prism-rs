@@ -20,6 +20,11 @@
 //!    reachable only through it.
 //! 4. **Enforcement.** One pass over every view sent: a post by a blocked
 //!    author is a gap, and an embedded record by one is `#viewBlocked`.
+//! 5. **Hidden replies.** One pass over every node: a node the thread
+//!    root's threadgate hides from the caller carries `hiddenByThreadgate`,
+//!    whatever path it came by (Thread Lens amendment 1 §2). The baseline
+//!    keeps such replies instead of leaving them out. The response has no
+//!    gate field, and nothing of a gap root's gate is sent.
 //!
 //! Where the work stopped for a bound, the node says so with a marker, and
 //! the client asks again from there.
@@ -703,7 +708,7 @@ impl Work<'_> {
         }
         let judge = &self.judge;
         for node in &mut self.nodes {
-            let LensNode::Post { uri, parent_uri, post, markers, .. } = node else {
+            let LensNode::Post { uri, parent_uri, post, markers, hidden, .. } = node else {
                 continue;
             };
             let author = uri_author(uri).unwrap_or_default();
@@ -713,6 +718,7 @@ impl Work<'_> {
                     parent_uri: parent_uri.clone(),
                     gap,
                     markers: markers.clone(),
+                    hidden: *hidden,
                 };
             } else if let Some(embed) = post.get_mut("embed") {
                 enforce_embeds(embed, judge);
@@ -805,13 +811,16 @@ pub async fn get_thread(
     // the authors. Verdicts: one round for all of them. Emit: the ordinary
     // view again, with the request's blocks.
     let collected = h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height).await?;
-    let mut authors: Vec<String> = collected.as_ref().map(named_accounts).unwrap_or_default().into_iter().collect();
+    let mut authors: Vec<String> = collected.as_ref().map(|(tree, _)| named_accounts(tree)).unwrap_or_default().into_iter().collect();
     authors.extend(uri_author(r.anchor).map(str::to_string));
     judge.baseline(&authors).await?;
     let known = Arc::new(judge.known_blocks());
-    let tree = match collected {
-        Some(_) => with_known_blocks(Arc::clone(&known), h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height)).await?,
-        None => None,
+    let (tree, gate_view) = match collected {
+        Some(_) => match with_known_blocks(Arc::clone(&known), h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height)).await? {
+            Some((tree, gate)) => (Some(tree), gate),
+            None => (None, None),
+        },
+        None => (None, None),
     };
     let (nodes, levels) = tree.as_ref().map(|tree| flatten(tree, &judge)).unwrap_or_default();
     let bridging = judge.bridging();
@@ -869,12 +878,115 @@ pub async fn get_thread(
     }
     work.enforce().await?;
     work.author_pass().await;
+    if let Some((root, hidden)) = thread_gate(h, r.anchor, &work.nodes, gate_view.as_ref()).await? {
+        flag_hidden(&mut work.nodes, &root, &hidden, r.viewer);
+    }
     let bridging = match (bridging, work.limited) {
         (false, _) => Bridging::Off,
         (true, true) => Bridging::Limited,
         (true, false) => Bridging::Full,
     };
     Ok(Thread { nodes: work.nodes, bridging })
+}
+
+/// The last path segment of an at-uri (its record key).
+fn rkey(uri: &str) -> &str {
+    uri.rsplit('/').next().unwrap_or_default()
+}
+
+/// The thread's root and the replies its threadgate hides, for one
+/// `getThread` response (amendment 1 §2.3). Read once, after enforcement.
+///
+/// The root is the anchor's stored row's root, else the root its post
+/// node's record names. The gate is the root's valid stored threadgate,
+/// else the gate view the ordinary assembly returned with the baseline,
+/// used only when it is self-consistent and names this root. A private
+/// root has no gate here: Thread Lens never reads the private tier.
+/// Only the flags come of it.
+async fn thread_gate(h: &crate::hydration::Hydrator, anchor: &str, nodes: &[LensNode], view: Option<&Value>) -> Result<Option<(String, HashSet<String>)>, sqlx::Error> {
+    let root = match h.lens_stored_root(anchor).await? {
+        Some(root) => Some(root),
+        None => nodes.iter().find_map(|n| match n {
+            LensNode::Post { uri, root_uri, .. } if uri == anchor => Some(root_uri.clone().unwrap_or_else(|| anchor.to_string())),
+            _ => None,
+        }),
+    };
+    if root.as_deref().is_some_and(is_private_uri) {
+        return Ok(None);
+    }
+    if let Some(root) = &root
+        && let Some(hidden) = h.lens_hidden_replies(std::slice::from_ref(root)).await?.remove(root)
+    {
+        return Ok(Some((root.clone(), hidden)));
+    }
+    let Some(view) = view else {
+        return Ok(None);
+    };
+    let (Some(gate), Some(post)) = (view.get("uri").and_then(Value::as_str), view.pointer("/record/post").and_then(Value::as_str)) else {
+        return Ok(None);
+    };
+    let consistent = gate_by_form(gate) && is_post_uri(post) && uri_author(gate) == uri_author(post) && rkey(gate) == rkey(post);
+    if !consistent || is_private_uri(post) || root.as_deref().is_some_and(|r| r != post) {
+        return Ok(None);
+    }
+    let hidden = view
+        .pointer("/record/hiddenReplies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    Ok(Some((post.to_string(), hidden)))
+}
+
+/// `at://<did>/app.bsky.feed.threadgate/<rkey>`.
+fn gate_by_form(uri: &str) -> bool {
+    let mut parts = uri.strip_prefix("at://").unwrap_or_default().split('/');
+    matches!((parts.next(), parts.next(), parts.next(), parts.next()), (Some(_), Some("app.bsky.feed.threadgate"), Some(k), None) if !k.is_empty())
+}
+
+/// Set `hiddenByThreadgate` on every node the gate lists, except the root
+/// and the caller's own posts (amendment 1 §2.2).
+fn flag_hidden(nodes: &mut [LensNode], root: &str, hidden: &HashSet<String>, viewer: &Viewer) {
+    let me = viewer.did.as_deref();
+    for node in nodes {
+        let uri = node.uri();
+        let on = uri != root && hidden.contains(uri) && (me.is_none() || uri_author(uri) != me);
+        node.set_hidden_by_threadgate(on);
+    }
+}
+
+/// `hiddenByThreadgate` on `resolve` items (amendment 1 §2.6): post items
+/// only, each from the stored gate of the root its own record names. A gap
+/// item is never flagged: its root could come only from a stored row, and
+/// the flag would then say whether this AppView holds the post.
+async fn resolve_hidden(h: &crate::hydration::Hydrator, nodes: &mut [LensNode], viewer: &Viewer) -> Result<(), sqlx::Error> {
+    let roots: Vec<String> = nodes
+        .iter()
+        .filter_map(|n| match n {
+            LensNode::Post { uri, root_uri, .. } => Some(root_uri.clone().unwrap_or_else(|| uri.clone())),
+            LensNode::Gap { .. } => None,
+        })
+        .filter(|root| !is_private_uri(root))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let gates = h.lens_hidden_replies(&roots).await?;
+    if gates.is_empty() {
+        return Ok(());
+    }
+    for node in nodes {
+        let LensNode::Post { uri, root_uri, .. } = &*node else {
+            continue;
+        };
+        let root = root_uri.clone().unwrap_or_else(|| uri.clone());
+        if let Some(hidden) = gates.get(&root) {
+            let one = std::slice::from_mut(node);
+            flag_hidden(one, &root, hidden, viewer);
+        }
+    }
+    Ok(())
 }
 
 /// `resolve`: each input URI on its own (§5.15.9, §5.15.10). Its authors
@@ -952,6 +1064,7 @@ pub async fn resolve(
     }
     work.enforce().await?;
     work.author_pass().await;
+    resolve_hidden(h, &mut work.nodes, viewer).await?;
     let bridging = match (bridging, work.limited) {
         (false, _) => Bridging::Off,
         (true, true) => Bridging::Limited,

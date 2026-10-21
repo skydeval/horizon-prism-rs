@@ -183,6 +183,231 @@ async fn a_warned_post_is_a_post_on_the_ladder() {
     db.drop_db().await;
 }
 
+/// The URIs of the nodes that carry `hiddenByThreadgate`.
+fn flagged(nodes: &[LensNode]) -> Vec<String> {
+    nodes.iter().filter(|n| n.hidden_by_threadgate()).map(|n| n.uri().to_string()).collect()
+}
+
+/// Store a threadgate on `root` whose `hiddenReplies` are `hidden`, under
+/// the root's own record key and author, or replace it.
+async fn gate(p: &PgPool, root: &str, hidden: &[&str]) {
+    let author = crate::db::locks::uri_author(root).expect("did");
+    let rkey = root.rsplit('/').next().expect("rkey");
+    let uri = format!("at://{author}/app.bsky.feed.threadgate/{rkey}");
+    let record = json!({"$type": "app.bsky.feed.threadgate", "post": root, "hiddenReplies": hidden, "createdAt": "2026-09-26T12:00:00.000Z"});
+    sqlx::query("DELETE FROM threadgates WHERE uri = $1").bind(&uri).execute(p).await.expect("delete");
+    sqlx::query(
+        "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, hidden_replies, record, created_at) \
+         VALUES ($1, $2, $3, 'bafygate', '3k', $4, NULL, $5, $6, now())",
+    )
+    .bind(&uri)
+    .bind(author)
+    .bind(rkey)
+    .bind(root)
+    .bind(hidden.iter().map(ToString::to_string).collect::<Vec<_>>())
+    .bind(&record)
+    .execute(p)
+    .await
+    .expect("gate");
+}
+
+/// T-3 – T-5, T-7 – T-9 (Thread Lens amendment 1 §2): replies the root's
+/// threadgate hides are kept and flagged on every path, the baseline, the
+/// expansion, a known-block gap and `resolve`; never for their own author,
+/// never on the root; the gate itself is never sent. A gap item of
+/// `resolve` is never flagged. A change of the gate shows on the next
+/// request. A private root's gate is not read.
+#[tokio::test]
+async fn replies_the_root_hid_are_flagged_on_every_path() {
+    let Some(db) = fresh_db("threadlens_hidden_replies").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(AUTHOR, "author.test"), (R1, "r1.test"), (R2, "r2.test"), (VIEWER_A, "a.test"), (VIEWER_B, "b.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now()), ('{VIEWER_B}', 'admin', now())")).await;
+    // root ← hidden (R2, hidden) ← beneath (R2)
+    //      ← shown (R2)
+    //      ← gapped (R1, which viewer A blocks; hidden) ← deep (R2, hidden)
+    let root = post(p, AUTHOR, "3kroot222222", "root text", None, None).await;
+    let hidden = post(p, R2, "3khidden2222", "hidden text", Some(&root), Some(&root)).await;
+    let beneath = post(p, R2, "3kbeneath222", "beneath", Some(&hidden), Some(&root)).await;
+    let shown = post(p, R2, "3kshown22222", "shown", Some(&root), Some(&root)).await;
+    let gapped = post(p, R1, "3kgapped2222", "gapped", Some(&root), Some(&root)).await;
+    let deep = post(p, R2, "3kdeep222222", "deep", Some(&gapped), Some(&root)).await;
+    let never_stored = format!("at://{R1}/app.bsky.feed.post/3knever22222");
+    gate(p, &root, &[&hidden, &gapped, &deep, &root, &never_stored]).await;
+    let gate_uri = format!("at://{AUTHOR}/app.bsky.feed.threadgate/3kroot222222");
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    // The root's author blocks viewer B.
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{AUTHOR}/app.bsky.graph.block/3kb', '{AUTHOR}', '{VIEWER_B}', '3kaaaaaaaaaa2', now())")).await;
+    let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
+    let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
+    let base = fake_upstream(Arc::new(Calls::default()), None).await;
+    let l = ladder(h.clone(), &base, Arc::new(StubLookup::default()));
+    let (req, key, cfg) = (Requester::test(), CursorKey::generated(), ThreadLensConfig::default());
+    let viewer = member(VIEWER_A);
+    let request = thread::Request { viewer: &viewer, req: &req, anchor: &root, depth: 6, parent_height: 80 };
+    let emitted = |t: &thread::Thread, anchor: &str| serde_json::to_string(&crate::hydration::lens::lens_thread(anchor, &t.nodes, t.bridging)).expect("json");
+
+    // Bridging on. The baseline keeps the hidden reply and what is beneath
+    // it; the expansion places the blocked reply as a gap and the reply
+    // beneath it, which the baseline never held. Each listed node is
+    // flagged; the root, which the gate also lists, is not.
+    let on = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    assert_eq!(on.bridging, Bridging::Full);
+    let uris: Vec<String> = on.nodes.iter().map(|n| n.uri().to_string()).collect();
+    for uri in [&root, &hidden, &beneath, &shown, &gapped, &deep] {
+        assert!(uris.contains(uri), "{uri} in {uris:?}");
+    }
+    let mut got = flagged(&on.nodes);
+    got.sort();
+    let mut want = vec![hidden.clone(), gapped.clone(), deep.clone()];
+    want.sort();
+    assert_eq!(got, want);
+    assert!(matches!(on.nodes.iter().find(|n| n.uri() == gapped), Some(LensNode::Gap { gap: Gap::BlockedByYou, .. })));
+    // No gate at the response level, and none on any node but the root's
+    // own post view, which carries its `threadgate` as every post view of
+    // this AppView does (design-v4 §8.2): the root here is a post the
+    // caller may see.
+    let body = emitted(&on, &root);
+    let v: Value = serde_json::from_str(&body).expect("json");
+    let mut keys: Vec<&String> = v.as_object().expect("object").keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["anchor", "bridging", "nodes", "truncated"]);
+    assert_eq!(v["nodes"][0]["post"]["threadgate"]["uri"], json!(gate_uri), "{body}");
+    for node in v["nodes"].as_array().expect("nodes").iter().skip(1) {
+        let text = node.to_string();
+        for leaked in ["threadgate\"", "hiddenReplies", gate_uri.as_str(), "bafygate"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+    }
+    assert_eq!(body.matches("\"hiddenByThreadgate\":true").count(), 3, "{body}");
+
+    // `getPostThread` is unchanged: it leaves the hidden reply out.
+    let ordinary = h.get_post_thread(&viewer, &req, &root, 6, 80).await.expect("db").expect("view");
+    let replies: Vec<Value> = ordinary.inner()["thread"]["replies"].as_array().expect("replies").iter().map(|r| r["post"]["uri"].clone()).collect();
+    assert_eq!(replies, [json!(shown)], "getPostThread unchanged");
+
+    // Bridging off: the response is the baseline, which now holds the
+    // hidden reply and what is beneath it, flagged.
+    *fake.level.lock().expect("level") = "partial";
+    let off = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    assert_eq!(off.bridging, Bridging::Off);
+    assert_eq!(flagged(&off.nodes), vec![hidden.clone()]);
+    assert!(off.nodes.iter().any(|n| n.uri() == beneath));
+    *fake.level.lock().expect("level") = "complete";
+
+    // A hidden reply is not hidden from its own author.
+    let r2 = member(R2);
+    let own = thread::get_thread(&l, &cfg, &key, thread::Request { viewer: &r2, ..request }, None).await.expect("thread");
+    assert!(!flagged(&own.nodes).contains(&hidden), "{:?}", flagged(&own.nodes));
+
+    // The root is a gap: its author blocks viewer B. Anchored at the hidden
+    // reply, the root is a `blocking-you` gap above it, and the reply is
+    // still flagged from the root's gate. Nothing of the root or its gate
+    // is sent.
+    let b = member(VIEWER_B);
+    let at_reply = thread::get_thread(&l, &cfg, &key, thread::Request { viewer: &b, anchor: &hidden, ..request }, None).await.expect("thread");
+    assert!(matches!(&at_reply.nodes[0], LensNode::Gap { gap: Gap::BlockingYou, uri, .. } if *uri == root), "{:?}", at_reply.nodes);
+    assert!(flagged(&at_reply.nodes).contains(&hidden));
+    let body = emitted(&at_reply, &hidden);
+    for leaked in ["root text", "author.test", "hiddenReplies", gate_uri.as_str()] {
+        assert!(!body.contains(leaked), "{leaked} in {body}");
+    }
+
+    // `resolve`: a post item is flagged from its root's stored gate; a
+    // known-block item never is, whether or not its row exists.
+    let items = thread::resolve(&l, &cfg, &key, &viewer, &req, &[hidden.clone(), gapped.clone(), never_stored.clone(), shown.clone(), PRIVATE.to_string()])
+        .await
+        .expect("resolve");
+    assert_eq!(flagged(&items.nodes), vec![hidden.clone()]);
+    assert!(matches!(&items.nodes[1], LensNode::Gap { gap: Gap::BlockedByYou, .. }));
+    assert!(matches!(&items.nodes[2], LensNode::Gap { gap: Gap::BlockedByYou, .. }));
+
+    // The root's author unhides the reply: the next request has no flag on
+    // it; hidden again, flagged again.
+    gate(p, &root, &[&gapped]).await;
+    let t = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    assert_eq!(flagged(&t.nodes), vec![gapped.clone()]);
+    gate(p, &root, &[&hidden]).await;
+    let t = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    assert_eq!(flagged(&t.nodes), vec![hidden.clone()]);
+
+    // A public reply whose root is private: a gate stored under the private
+    // URI (as no writer stores one) is not read.
+    let under_private = post(p, AUTHOR, "3kunderpriv2", "under", Some(PRIVATE), Some(PRIVATE)).await;
+    let child = post(p, R2, "3kchild22222", "child", Some(&under_private), Some(PRIVATE)).await;
+    gate(p, PRIVATE, &[&child]).await;
+    let t = thread::get_thread(&l, &cfg, &key, thread::Request { anchor: &under_private, ..request }, None).await.expect("thread");
+    assert!(t.nodes.iter().any(|n| n.uri() == child), "{:?}", t.nodes);
+    assert!(flagged(&t.nodes).is_empty(), "{:?}", flagged(&t.nodes));
+    db.drop_db().await;
+}
+
+/// T-6 (amendment 1 §2.3 (b)): for an anchor not stored here, the gate view
+/// of the upstream thread flags the replies it lists, when it names this
+/// root and its own URI matches its `post`; it is never sent.
+#[tokio::test]
+async fn an_upstream_baselines_gate_flags_its_hidden_replies() {
+    use crate::hydration::testing::{FixedUpstream, hydrator_with_upstream_and_farsight, set_mode};
+    use crate::indexing::PublicMode;
+
+    let Some(db) = fresh_db("threadlens_upstream_gate").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(AUTHOR, "author.test"), (R1, "r1.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    let at = |did: &str, rkey: &str| format!("at://{did}/app.bsky.feed.post/{rkey}");
+    let (root, anchor, hid) = (at(AUTHOR, "3kroot222222"), at(AUTHOR, "3kanchor2222"), at(R1, "3khidden2222"));
+    let view = |uri: &str, did: &str, parent: Option<&str>| {
+        let mut record = json!({"$type": "app.bsky.feed.post", "text": uri, "createdAt": "2026-09-26T00:00:00Z"});
+        if let Some(parent) = parent {
+            record["reply"] = json!({"parent": {"uri": parent, "cid": "c"}, "root": {"uri": root, "cid": "c"}});
+        }
+        json!({"$type": "app.bsky.feed.defs#postView", "uri": uri, "cid": "bafy",
+               "author": {"did": did, "handle": "h.test", "viewer": {}, "labels": []},
+               "record": record, "indexedAt": "2026-09-26T00:00:00Z", "viewer": {}, "labels": []})
+    };
+    let gate_view = |post: &str, rkey: &str| {
+        json!({"uri": format!("at://{AUTHOR}/app.bsky.feed.threadgate/{rkey}"), "cid": "bafygate",
+               "record": {"$type": "app.bsky.feed.threadgate", "post": post, "hiddenReplies": [hid], "createdAt": "2026-09-26T00:00:00Z"}, "lists": []})
+    };
+    let thread = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&anchor, AUTHOR, Some(&root)),
+        "parent": {"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&root, AUTHOR, None), "replies": []},
+        "replies": [{"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&hid, R1, Some(&anchor)), "replies": []}]});
+    let mut sets = ScopeSets::default();
+    for did in [AUTHOR, R1] {
+        sets.scope.insert(did.into());
+    }
+    let cases = [
+        (gate_view(&root, "3kroot222222"), true, "a valid gate for this root"),
+        (gate_view(&root, "3kother22222"), false, "its key is not its post's"),
+        (gate_view(&anchor, "3kanchor2222"), false, "it is not this root's"),
+    ];
+    for (gv, flags, why) in cases {
+        let mut up = FixedUpstream::default();
+        up.threads.insert(anchor.clone(), json!({"thread": thread, "threadgate": gv}));
+        let (farsight, _fake) = crate::farsight::lookup::tests::engine("").await;
+        let h = hydrator_with_upstream_and_farsight(p, sets.clone(), Arc::new(up), farsight);
+        set_mode(h.scope(), PublicMode::Off).await;
+        let base = fake_upstream(Arc::new(Calls::default()), None).await;
+        let l = ladder(h, &base, Arc::new(StubLookup::default()));
+        let (req, viewer) = (Requester::test(), member(VIEWER_A));
+        let request = thread::Request { viewer: &viewer, req: &req, anchor: &anchor, depth: 6, parent_height: 80 };
+        let t = thread::get_thread(&l, &ThreadLensConfig::default(), &CursorKey::generated(), request, None).await.expect("thread");
+        assert!(t.nodes.iter().any(|n| n.uri() == hid), "{why}: {:?}", t.nodes);
+        assert_eq!(flagged(&t.nodes), if flags { vec![hid.clone()] } else { Vec::new() }, "{why}");
+        let body = serde_json::to_string(&crate::hydration::lens::lens_thread(&anchor, &t.nodes, t.bridging)).expect("json");
+        assert!(!body.contains("hiddenReplies") && !body.contains("bafygate") && !body.contains("threadgate\""), "{why}: {body}");
+    }
+    db.drop_db().await;
+}
+
 async fn serve(state: ThreadLensState) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

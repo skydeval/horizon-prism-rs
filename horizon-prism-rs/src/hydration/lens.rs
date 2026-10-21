@@ -53,12 +53,17 @@ pub enum LensNode {
         root_uri: Option<String>,
         post: Value,
         markers: Markers,
+        /// The thread root's threadgate hides it from the caller
+        /// (`hiddenByThreadgate`, Thread Lens amendment 1 §2).
+        hidden: bool,
     },
     Gap {
         uri: String,
         parent_uri: Option<String>,
         gap: Gap,
         markers: Markers,
+        /// As on a post node.
+        hidden: bool,
     },
 }
 
@@ -90,6 +95,20 @@ impl LensNode {
         }
     }
 
+    /// Whether the thread root's threadgate hides the node from the caller.
+    #[must_use]
+    pub fn hidden_by_threadgate(&self) -> bool {
+        match self {
+            Self::Post { hidden, .. } | Self::Gap { hidden, .. } => *hidden,
+        }
+    }
+
+    pub fn set_hidden_by_threadgate(&mut self, on: bool) {
+        match self {
+            Self::Post { hidden, .. } | Self::Gap { hidden, .. } => *hidden = on,
+        }
+    }
+
     /// A post node, taking the parent and root from the record's reply ref.
     #[must_use]
     pub fn post(post: Value) -> Self {
@@ -100,6 +119,7 @@ impl LensNode {
             root_uri: get("/record/reply/root/uri"),
             post,
             markers: Markers::default(),
+            hidden: false,
         }
     }
 
@@ -111,6 +131,7 @@ impl LensNode {
             parent_uri,
             gap,
             markers: Markers::default(),
+            hidden: false,
         }
     }
 
@@ -148,6 +169,11 @@ impl LensNode {
         };
         if let Some(p) = self.parent_uri() {
             v["parentUri"] = json!(p);
+        }
+        // On any node kind: the flag reads only the URI and the thread's
+        // gate (amendment 1 §2.2). No other part of the gate is set here.
+        if self.hidden_by_threadgate() {
+            v["hiddenByThreadgate"] = json!(true);
         }
         // Only a post node or a known-block gap carries a marker.
         if self.walkable() {
@@ -264,11 +290,59 @@ impl Hydrator {
     /// Run inside [`super::with_known_blocks`], it treats the request's
     /// blocks as it treats any other of the viewer's.
     ///
+    /// Replies the root's threadgate hides are kept, with what is beneath
+    /// them: Thread Lens flags them instead of leaving them out (amendment
+    /// 1 §2.4). The second value is the gate view the ordinary assembly
+    /// returned with the tree, read for its hidden replies; the response
+    /// has no gate field.
+    ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn lens_baseline(&self, viewer: &Viewer, req: &Requester, anchor: &str, depth: u32, parent_height: u32) -> Result<Option<Value>, HydrationError> {
-        Ok(self.thread_tree(viewer, req, anchor, depth, parent_height, false).await?.ok().map(|(tree, _)| tree))
+    pub async fn lens_baseline(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        anchor: &str,
+        depth: u32,
+        parent_height: u32,
+    ) -> Result<Option<(Value, Option<Value>)>, HydrationError> {
+        Ok(self.thread_tree(viewer, req, anchor, depth, parent_height, true).await?.ok())
+    }
+
+    /// The thread root a stored post names: its `reply_root_uri`, or the
+    /// post itself when it is not a reply. `None` when it is not stored.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn lens_stored_root(&self, uri: &str) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(Option<String>,)> = sqlx::query_as("SELECT reply_root_uri FROM posts WHERE uri = $1")
+            .bind(uri)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(row.map(|(root,)| root.unwrap_or_else(|| uri.to_string())))
+    }
+
+    /// The `hiddenReplies` of the valid stored threadgate of each of
+    /// `roots` that has one: its record key is the root's and its author
+    /// the root's author (design-v4 §8.3). Public `threadgates` only.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn lens_hidden_replies(&self, roots: &[String]) -> Result<HashMap<String, HashSet<String>>, sqlx::Error> {
+        if roots.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT post_uri, hidden_replies FROM threadgates WHERE post_uri = ANY($1) \
+               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
+        )
+        .bind(roots)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|(root, hidden)| (root, hidden.unwrap_or_default().into_iter().collect())).collect())
     }
 
     /// Local post views for `uris`, hydrated for the viewer.
@@ -393,6 +467,9 @@ mod tests {
         hidden.markers_mut().more_replies = Some(None);
         let mut blocked = LensNode::gap("at://did:plc:b/app.bsky.feed.post/4", None, Gap::BlockedByYou);
         blocked.markers_mut().more_replies = Some(None);
+        // T-10 (amendment 1 §3.1): the flag on a post and on a gap.
+        first.set_hidden_by_threadgate(true);
+        blocked.set_hidden_by_threadgate(true);
         let nodes = [first, hidden, blocked];
         let out = lens_thread("at://did:plc:a/app.bsky.feed.post/2", &nodes, Bridging::Limited);
         let v = out.inner();
@@ -406,8 +483,12 @@ mod tests {
                                          "parentUri": "at://did:plc:a/app.bsky.feed.post/2", "gap": "tier-hidden"}));
         assert_eq!((&v["nodes"][2]["gap"], &v["nodes"][2]["moreReplies"]), (&json!("blocked-by-you"), &json!({})));
         assert_eq!((&v["truncated"], &v["bridging"]), (&json!(true), &json!("limited")));
+        assert_eq!((&v["nodes"][0]["hiddenByThreadgate"], &v["nodes"][2]["hiddenByThreadgate"]), (&json!(true), &json!(true)));
+        assert!(v["nodes"][1].get("hiddenByThreadgate").is_none());
         let items = lens_items(&nodes, Bridging::Off);
         assert!(items.inner()["items"][0].get("moreReplies").is_none());
+        // `resolve` items keep it while losing their markers.
+        assert_eq!(items.inner()["items"][0]["hiddenByThreadgate"], json!(true));
         assert_eq!(items.inner()["bridging"], "off");
     }
 
