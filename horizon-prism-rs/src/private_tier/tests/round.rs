@@ -182,27 +182,16 @@ async fn round(test: &str, public: PublicMode, layout: Layout) {
     let head_charged = 8; // A15, Dave, Alice, A14 to A10
     for variant in ["head fails", "token refused"] {
         c.stale().await;
-        // A10's host's bucket, kept empty while the request runs.
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let drainer = (variant == "token refused").then(|| {
-            let (budgets, stop) = (c.w.f.budgets.clone(), Arc::clone(&stop));
-            let host = HostBudgets::host_of(&format!("https://bench-r{}.invalid", 4 + 9));
-            tokio::spawn(async move {
-                while !stop.load(Ordering::SeqCst) {
-                    while budgets.try_acquire(&host, Class::ReadFetch) {}
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-        });
-        if variant == "head fails" {
+        // A10's host's bucket, empty and not refilling while the request
+        // runs (#738: a task draining it raced the refill under load).
+        let host = HostBudgets::host_of(&format!("https://bench-r{}.invalid", 4 + 9));
+        if variant == "token refused" {
+            c.w.f.budgets.starve(&host, Class::ReadFetch);
+        } else {
             c.heads.fail(&a[9]);
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
         let (status, body, parents) = c.thread(0).await;
-        stop.store(true, Ordering::SeqCst);
-        if let Some(d) = drainer {
-            d.await.expect("drainer");
-        }
+        c.w.f.budgets.unstarve(&host, Class::ReadFetch);
         assert_eq!(status, 200, "{body}");
         c.w.check(parents == c.parents_before(5), format!("{variant}: the chain ends below parent 5: {parents:?}"));
         let (left, cached) = chain_state(&anchor).expect("chain state");

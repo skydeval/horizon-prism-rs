@@ -10,6 +10,16 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (test reliability: t56's refused token, #738)
+
+- **`t56_one_head_round_in_heads_order`** emptied A10's read-fetch bucket
+  with a task that drained it every millisecond, which raced the bucket's
+  refill (10 a second) when the loaded suite kept that task off the CPU,
+  so the request sometimes got a token and the chain did not end below
+  parent 5. A test-only `HostBudgets::starve` now empties the bucket and
+  stops its refill for the request. With the starve removed it fails with
+  #738's message.
+
 ### Fixed (divergence left set after a catch-up, #736)
 
 - **`sync_state.diverged_since` now clears when `applied_rev` reaches the

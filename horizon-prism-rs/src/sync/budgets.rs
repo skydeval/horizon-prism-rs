@@ -202,6 +202,21 @@ impl HostBudgets {
         self.take(host, class).is_ok()
     }
 
+    /// Test only: empty `host`'s `class` bucket and stop its refill, so it
+    /// refuses every token however long a request takes (#738); dropping
+    /// the bucket ([`Self::unstarve`]) gives it back full.
+    #[cfg(test)]
+    pub fn starve(&self, host: &str, class: Class) {
+        let mut buckets = self.buckets.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        buckets.insert((host.to_string(), class), Bucket { rate: 1e-9, tokens: 0.0, last: Instant::now() });
+    }
+
+    /// Test only: undo [`Self::starve`].
+    #[cfg(test)]
+    pub fn unstarve(&self, host: &str, class: Class) {
+        self.buckets.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&(host.to_string(), class));
+    }
+
     /// Wait for a token (background classes).
     pub async fn acquire(&self, host: &str, class: Class) {
         loop {
