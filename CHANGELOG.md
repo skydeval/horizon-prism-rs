@@ -10,6 +10,23 @@ commit.
 
 ## [Unreleased]
 
+### Added (`getMembership` advertises Thread Lens, #789)
+
+- `app.nearhorizon.actor.getMembership`'s `features` lists, after the
+  private-tier values, `threadLens` (Thread Lens is served: always, in
+  this build) and `threadLens.signedIn` while `threadlens.access` is
+  `"signed_in"` (every signed-in account is served, a non-member as a
+  visitor). Built on every call from the live setting, so an admin-UI
+  change shows on the next call with no restart. `threadLens` does not
+  depend on Farsight being configured: without it the lens is still
+  served, and each response says `bridging: "off"`.
+- With the private tier disabled, `features` now holds the Thread Lens
+  values only (it was empty). The lexicon text says so.
+- Thread Lens amendment 1 §0A
+  (`docs/internal/design/threadlens-phase4-amendment-1.md`).
+- Tests: the values and their order with the tier enabled and disabled,
+  and a live change of `threadlens.access` both ways on a running server.
+
 ### Changed (Thread Lens docs: who may call, and `blocked`, #787)
 
 - The `threadLens.defs` lexicon's `blocked` gap reads as the code assigns

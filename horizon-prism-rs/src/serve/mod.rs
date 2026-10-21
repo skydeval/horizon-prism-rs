@@ -842,7 +842,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         ),
         trusted_proxy: cfg.file.http.trusted_proxy,
         did_document: Arc::new(glue.service_key.did_document()),
-        membership: crate::xrpc::handlers::membership::MembershipSettings::new(private.as_ref(), &cfg.file.private_read),
+        membership: crate::xrpc::handlers::membership::MembershipSettings::new(private.as_ref(), &cfg.file.private_read).with_live(live.clone()),
     };
     let private_state = PrivateState::new(
         app.clone(),

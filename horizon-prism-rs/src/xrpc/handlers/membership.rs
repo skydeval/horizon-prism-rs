@@ -1,5 +1,7 @@
 //! `app.nearhorizon.actor.getMembership` (private posting §4.1, P-10): the
-//! caller's membership, and the private families this build serves.
+//! caller's membership, and the feature families this build serves: the
+//! private ones, then Thread Lens's, read per call from the live
+//! `threadlens.access` (Thread Lens amendment 1 §0A).
 //!
 //! - Query (GET), authentication required, no parameters.
 //! - Rate class: the `private` per-DID bucket. There is no member gate:
@@ -26,8 +28,9 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::AppendHeaders;
 use serde_json::Value;
 
+use crate::admin::settings::LiveSettings;
 use crate::aggregations::enroll::{Enrollment, REFUSED_RATE};
-use crate::config::PrivateReadConfig;
+use crate::config::{PrivateReadConfig, ThreadLensAccess};
 use crate::hydration::PublicEmit;
 use crate::hydration::hint::{MembershipStatus, membership};
 use crate::private_tier::{DisabledPrivateTier, PrivateTier};
@@ -40,22 +43,53 @@ pub const GET_MEMBERSHIP: &str = "app.nearhorizon.actor.getMembership";
 /// `Retry-After` on the hourly enrolment cap's 429 (§4.1).
 pub const ENROLL_CAP_RETRY_AFTER_SECS: u64 = 60;
 
+/// Thread Lens is served (Thread Lens amendment 1 §0A): its routes are
+/// registered in every build and every public-indexing mode. It does not
+/// depend on Farsight: without it every lens answer says `bridging: "off"`.
+pub const FEATURE_THREAD_LENS: &str = "threadLens";
+/// Thread Lens serves every signed-in account (`threadlens.access =
+/// "signed_in"`), a non-member as a visitor.
+pub const FEATURE_THREAD_LENS_SIGNED_IN: &str = "threadLens.signedIn";
+
 /// What `getMembership` answers with besides the caller's state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MembershipSettings {
     /// [`PrivateTier::features`]: none when the private tier is disabled.
-    pub features: &'static [&'static str],
+    pub private_features: &'static [&'static str],
     /// `private_read.membership_retry_after_secs`.
     pub retry_after_secs: u64,
+    /// The live settings, read on every call for `threadlens.access`.
+    pub live: LiveSettings,
 }
 
 impl MembershipSettings {
+    /// With the live values of the default configuration; `serve` passes
+    /// its own handle through [`Self::with_live`].
     #[must_use]
     pub fn new(private: &dyn PrivateTier, cfg: &PrivateReadConfig) -> Self {
         Self {
-            features: private.features(),
+            private_features: private.features(),
             retry_after_secs: cfg.membership_retry_after_secs,
+            live: LiveSettings::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_live(mut self, live: LiveSettings) -> Self {
+        self.live = live;
+        self
+    }
+
+    /// `features` as of this call: the private values, then Thread Lens's,
+    /// from the live `threadlens.access`.
+    #[must_use]
+    pub fn features(&self) -> Vec<&'static str> {
+        let mut out = self.private_features.to_vec();
+        out.push(FEATURE_THREAD_LENS);
+        if self.live.load().threadlens_access == ThreadLensAccess::SignedIn {
+            out.push(FEATURE_THREAD_LENS_SIGNED_IN);
+        }
+        out
     }
 }
 
@@ -88,7 +122,7 @@ pub async fn get_membership(State(s): State<AppState>, ConnectInfo(peer): Connec
         Enrollment::Refused(_) => MembershipStatus::NotEligible,
     };
     let retry = (status == MembershipStatus::Indexing).then(|| (RETRY_AFTER, HeaderValue::from(s.membership.retry_after_secs)));
-    Ok((AppendHeaders(retry), Json(membership(status, s.membership.features))))
+    Ok((AppendHeaders(retry), Json(membership(status, &s.membership.features()))))
 }
 
 #[cfg(test)]
@@ -198,8 +232,9 @@ mod tests {
         let client = reqwest::Client::new();
         let aud = format!("did:web:{AUDIENCE_HOST}");
         let token = |i: u8, did: &str| mint(&signing_key(i + 3), did, &aud, Some(GET_MEMBERSHIP));
-        let features = json!(FEATURES);
-        assert_eq!(features, json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences"]));
+        // The private values, then Thread Lens's (amendment 1 §0A).
+        let features = json!(FEATURES.iter().copied().chain([FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN]).collect::<Vec<_>>());
+        assert_eq!(json!(FEATURES), json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences"]));
         // T-N9 (private notification preferences design §8): the
         // preferences' feature is listed last.
         assert_eq!(FEATURES.last(), Some(&"private.notificationPreferences"));
@@ -248,9 +283,59 @@ mod tests {
         let (status, retry, v) = call(&client, &base, Some(&token(4, ERIN))).await;
         assert_eq!((status, retry.as_deref(), &v["status"]), (200, Some("5"), &json!("indexing")));
 
-        // The private tier disabled: no features.
+        // The private tier disabled: no private features; Thread Lens's.
         let (status, _, v) = call(&client, &disabled_base, Some(&token(1, BOB))).await;
-        assert_eq!((status, &v), (200, &json!({"status": "member", "features": []})));
+        assert_eq!((status, &v), (200, &json!({"status": "member", "features": ["threadLens", "threadLens.signedIn"]})));
+        db.drop_db().await;
+    }
+
+    /// T-0 (Thread Lens amendment 1 §0A): `features` follows a live change
+    /// of `threadlens.access` on a running server, with no restart, with
+    /// the private tier enabled and disabled.
+    #[tokio::test]
+    async fn thread_lens_features_follow_the_live_access() {
+        let Some(db) = fresh_db("xrpc_get_membership_threadlens").await else {
+            return;
+        };
+        let fetcher = StubFetcher::default();
+        fetcher.set_key(ALICE, signing_key(3));
+        let (auth, _drainer) = verifier(fetcher, 10, 4);
+        let live = crate::admin::settings::LiveSettings::default();
+        let state = AppState {
+            hydrator: hydrator(&db.pool, ScopeSets::default()),
+            auth: Arc::new(auth),
+            limits: RateLimits::new(),
+            enroller: None,
+            trusted_proxy: "172.30.0.10".parse().expect("ip"),
+            did_document: Arc::new(json!({})),
+            membership: MembershipSettings::new(&KryphocronPrivateTier, &PrivateReadConfig::default()).with_live(live.clone()),
+        };
+        let mut disabled = state.clone();
+        disabled.membership = MembershipSettings::default().with_live(live.clone());
+        let base = serve(state).await;
+        let disabled_base = serve(disabled).await;
+        let client = reqwest::Client::new();
+        let token = mint(&signing_key(3), ALICE, &format!("did:web:{AUDIENCE_HOST}"), Some(GET_MEMBERSHIP));
+        let features = |extra: &[&str]| json!(FEATURES.iter().copied().chain(extra.iter().copied()).collect::<Vec<_>>());
+        let both = [FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN];
+
+        live.update(|v| v.threadlens_access = ThreadLensAccess::SignedIn);
+        let (_, _, v) = call(&client, &base, Some(&token)).await;
+        assert_eq!(v["features"], features(&both), "{v}");
+        let (_, _, v) = call(&client, &disabled_base, Some(&token)).await;
+        assert_eq!(v["features"], json!(both), "{v}");
+
+        // Members only: Thread Lens is still served, to ready members.
+        live.update(|v| v.threadlens_access = ThreadLensAccess::Members);
+        let (_, _, v) = call(&client, &base, Some(&token)).await;
+        assert_eq!(v["features"], features(&[FEATURE_THREAD_LENS]), "{v}");
+        let (_, _, v) = call(&client, &disabled_base, Some(&token)).await;
+        assert_eq!(v["features"], json!(["threadLens"]), "{v}");
+
+        // And back, still without a restart.
+        live.update(|v| v.threadlens_access = ThreadLensAccess::SignedIn);
+        let (_, _, v) = call(&client, &base, Some(&token)).await;
+        assert_eq!(v["features"], features(&both), "{v}");
         db.drop_db().await;
     }
 
@@ -301,7 +386,7 @@ mod tests {
         let base = serve(state).await;
         let token = mint(&signing_key(3), ALICE, &format!("did:web:{AUDIENCE_HOST}"), Some(GET_MEMBERSHIP));
         let (status, _, v) = call(&reqwest::Client::new(), &base, Some(&token)).await;
-        assert_eq!((status, &v), (200, &json!({"status": "notEligible", "features": []})));
+        assert_eq!((status, &v), (200, &json!({"status": "notEligible", "features": ["threadLens", "threadLens.signedIn"]})));
         db.drop_db().await;
     }
 }
