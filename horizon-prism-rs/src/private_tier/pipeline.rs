@@ -225,22 +225,16 @@ async fn head_ok(env: &PipelineEnv, rs: &RequestState, did: &str) -> Result<bool
 /// `head_ok`'s check from the head read on (private-threads design §3.4):
 /// the stored head when fresh, else one fetched when `allow`, against
 /// `applied_rev`. Shared with [`prefetch_heads`], so both compare the same
-/// way.
+/// way. One statement per DID when the stored head is fresh: the head and
+/// `applied_rev` come from the same row (fast-reads design F-3).
 async fn head_check(env: &PipelineEnv, did: &str, allow: bool) -> Result<bool, sqlx::Error> {
     #[cfg(test)]
     if crate::test_support::hooks::injected(crate::test_support::hooks::HEAD_CHECK_FAILS, did) {
         return Err(sqlx::Error::PoolTimedOut);
     }
-    Ok(match env.prober.read_head_with(did, allow).await? {
+    Ok(match env.prober.read_head_applied(did, allow).await? {
         None => false,
-        Some(head) => {
-            let applied: Option<String> = sqlx::query_scalar("SELECT applied_rev FROM sync_state WHERE did = $1")
-                .bind(did)
-                .fetch_optional(&env.pool)
-                .await?
-                .flatten();
-            applied.is_some_and(|a| a >= head)
-        }
+        Some((head, applied)) => applied.is_some_and(|a| a >= head),
     })
 }
 

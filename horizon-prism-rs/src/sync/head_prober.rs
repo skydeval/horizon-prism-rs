@@ -90,6 +90,9 @@ impl HeadSource for NetHeadSource {
     }
 }
 
+/// A DID's stored head, whether it is fresh, its PDS and its `applied_rev`.
+type HeadRow = (Option<String>, bool, Option<String>, Option<String>);
+
 /// What one probe found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
@@ -311,27 +314,41 @@ impl HeadProber {
     ///
     /// Database errors.
     pub async fn read_head_with(&self, did: &str, allow_fetch: bool) -> Result<Option<String>, sqlx::Error> {
+        Ok(self.read_head_applied(did, allow_fetch).await?.map(|(head, _)| head))
+    }
+
+    /// [`HeadProber::read_head_with`] with the DID's `applied_rev`, for the
+    /// read path's comparison (fast-reads design F-3): `(head, applied_rev)`.
+    /// With a fresh stored head this is **one statement**, the head and
+    /// `applied_rev` read from the same row. After a synchronous fetch,
+    /// `applied_rev` is the one the fetch's own write returns, as a separate
+    /// read after it would see. `None` as `read_head_with`.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn read_head_applied(&self, did: &str, allow_fetch: bool) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
         let start = Instant::now();
         let head = self.read_head_inner(did, allow_fetch).await;
         metrics::histogram!(METRIC_CHECK_SECONDS, "path" => "read").record(start.elapsed().as_secs_f64());
         head
     }
 
-    async fn read_head_inner(&self, did: &str, allow_fetch: bool) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(Option<String>, bool, Option<String>)> = sqlx::query_as(
+    async fn read_head_inner(&self, did: &str, allow_fetch: bool) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+        let row: Option<HeadRow> = sqlx::query_as(
             "SELECT s.head_rev, \
-               COALESCE(s.head_checked_at > now() - make_interval(secs => $2), false), a.pds_endpoint \
+               COALESCE(s.head_checked_at > now() - make_interval(secs => $2), false), a.pds_endpoint, s.applied_rev \
              FROM actors a LEFT JOIN sync_state s ON s.did = a.did WHERE a.did = $1",
         )
         .bind(did)
         .bind(self.cfg.head_max_age_secs as f64)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((head, fresh, pds)) = row else {
+        let Some((head, fresh, pds, applied)) = row else {
             return Ok(None);
         };
-        if fresh && head.is_some() {
-            return Ok(head);
+        if fresh && let Some(head) = head {
+            return Ok(Some((head, applied)));
         }
         let Some(pds) = pds.filter(|_| allow_fetch) else {
             return Ok(None);
@@ -347,14 +364,16 @@ impl HeadProber {
             return Ok(None);
         };
         metrics::counter!(METRIC_CHECKS, "result" => "read_fetch").increment(1);
-        sqlx::query(
-            "UPDATE sync_state SET head_rev = $2, head_checked_at = now() WHERE did = $1",
+        // No row (no `sync_state` yet): nothing applied, so `None`.
+        let applied: Option<String> = sqlx::query_scalar(
+            "UPDATE sync_state SET head_rev = $2, head_checked_at = now() WHERE did = $1 RETURNING applied_rev",
         )
         .bind(did)
         .bind(&rev)
-        .execute(&self.pool)
-        .await?;
-        Ok(Some(rev))
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(Some((rev, applied)))
     }
 
     /// Run passes forever.
@@ -586,6 +605,56 @@ mod tests {
         assert_eq!(prober.read_head(DID).await.expect("read"), None);
         assert_eq!(*heads.calls.lock().expect("lock"), 1);
         assert_eq!(prober.read_head("did:plc:unknown").await.expect("read"), None);
+        db.drop_db().await;
+    }
+
+    /// T-F4 (fast-reads design F-3): the head with `applied_rev` from one
+    /// read gives what the head and a separate `applied_rev` read gave:
+    /// fresh and current, fresh and behind, stale with a fetch, no
+    /// `sync_state` row, no PDS, an unknown DID.
+    #[tokio::test]
+    async fn the_head_and_applied_rev_come_together() {
+        let Some(db) = fresh_db("head_read_applied").await else {
+            return;
+        };
+        let p = &db.pool;
+        const NO_ROW: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        const NO_PDS: &str = "did:plc:cccccccccccccccccccccccc";
+        exec(p, "INSERT INTO actors (did, pds_endpoint) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'https://pds.example.com'), \
+                 ('did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', 'https://pds.example.com'), ('did:plc:cccccccccccccccccccccccc', NULL)").await;
+        exec(p, "INSERT INTO sync_state (did, head_rev, applied_rev, head_checked_at) VALUES \
+                 ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', '3kaaaaaaaaaaa', '3kaaaaaaaaaaa', now()), \
+                 ('did:plc:cccccccccccccccccccccccc', '3kaaaaaaaaaaa', '3kaaaaaaaaaaa', now() - interval '5 minutes')").await;
+        let heads = Arc::new(FakeHeads { rev: Mutex::new("3kccccccccccc".into()), calls: Mutex::new(0) });
+        let prober = HeadProber::new(
+            p.clone(),
+            ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10),
+            Arc::new(DisabledPrivateTier),
+            heads.clone(),
+            HostBudgets::new(rates()),
+            SyncConfig::default(),
+        );
+        let read = |did: &'static str| {
+            let prober = prober.clone();
+            async move { prober.read_head_applied(did, true).await.expect("read") }
+        };
+        let some = |head: &str, applied: Option<&str>| Some((head.to_string(), applied.map(str::to_string)));
+        // Fresh and current, then fresh and behind: no fetch.
+        assert_eq!(read(DID).await, some("3kaaaaaaaaaaa", Some("3kaaaaaaaaaaa")));
+        exec(p, "UPDATE sync_state SET head_rev = '3kbbbbbbbbbbb' WHERE did = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'").await;
+        assert_eq!(read(DID).await, some("3kbbbbbbbbbbb", Some("3kaaaaaaaaaaa")));
+        assert_eq!(*heads.calls.lock().expect("lock"), 0);
+        // Stale: one fetch, its head and the row's applied_rev.
+        exec(p, "UPDATE sync_state SET head_checked_at = now() - interval '5 minutes' WHERE did = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'").await;
+        assert_eq!(read(DID).await, some("3kccccccccccc", Some("3kaaaaaaaaaaa")));
+        assert_eq!(*heads.calls.lock().expect("lock"), 1);
+        // No sync_state row: the fetched head with nothing applied.
+        assert_eq!(read(NO_ROW).await, some("3kccccccccccc", None));
+        // A stale head and no PDS, and an unknown DID: a miss.
+        assert_eq!(read(NO_PDS).await, None);
+        assert_eq!(read("did:plc:unknown").await, None);
+        // And `read_head_with` is the same head.
+        assert_eq!(prober.read_head_with(DID, false).await.expect("read"), Some("3kccccccccccc".into()));
         db.drop_db().await;
     }
 }

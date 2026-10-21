@@ -10,6 +10,17 @@ commit.
 
 ## [Unreleased]
 
+### Changed (fast reads F-C, reduced: one statement per head, #802)
+
+- A private read's repo-head check reads the stored head and
+  `applied_rev` in one statement (`HeadProber::read_head_applied`)
+  instead of two, per DID. Where and when heads are checked, the
+  per-request fetch budget and every outcome are unchanged; after a
+  synchronous fetch, `applied_rev` comes from the fetch's own write.
+- Stale-while-revalidate (fast-reads C-4) was not taken (skydeval,
+  2026-10-21): there is no `sync.head_stale_grace_secs` and no
+  `served_stale`, and design-v4 §II-6.11.3's 60 s head bound is as it was.
+
 ### Changed (fast reads F-B: direct calls, #801)
 
 - CORS preflights are cached for a day: `Access-Control-Max-Age` 600 →
