@@ -2,7 +2,9 @@
 //! came from an upstream AppView before it is emitted:
 //! 1. **Content stripping** is detected first (for Thread Lens, §10.4): a post
 //!    view whose `record` is absent or has neither `text` nor `embed`, or
-//!    whose upstream labels include `!takedown`, `!hide` or `!warn`.
+//!    whose upstream labels include `!takedown` or `!hide`. `!warn` is not
+//!    among them (Thread Lens amendment 1 §1): such a post is shown, with
+//!    its upstream labels removed, as on every other view.
 //! 2. **Labels.** Upstream `labels` arrays are removed at every depth; local
 //!    labels (§7.8) are applied instead.
 //! 3. **Viewer state.** `viewer` objects are replaced with locally computed
@@ -19,7 +21,7 @@ use crate::db::locks::uri_author;
 use crate::firehose::classifier::{RecordClass, classify};
 
 /// Labels whose presence upstream marks a post as content-stripped (§10.4).
-pub const STRIPPING_LABELS: [&str; 3] = ["!takedown", "!hide", "!warn"];
+pub const STRIPPING_LABELS: [&str; 2] = ["!takedown", "!hide"];
 
 /// Whether an at-URI names a private-tier record (§7.1, §7.3).
 #[must_use]
@@ -330,13 +332,22 @@ mod tests {
                                      "author": {"did": "did:plc:author", "handle": "a"}, "value": {"text": "secret"}}}
             },
             "stripped": post("at://did:plc:author/app.bsky.feed.post/9", None, vec![]),
-            "warned": post("at://did:plc:author/app.bsky.feed.post/8", Some("t"), vec![label("!warn")])
+            "warned": post("at://did:plc:author/app.bsky.feed.post/8", Some("t"), vec![label("!warn")]),
+            "hidden": post("at://did:plc:author/app.bsky.feed.post/7", Some("t"), vec![label("!hide")]),
+            "takendown": post("at://did:plc:author/app.bsky.feed.post/6", Some("t"), vec![label("!takedown")]),
+            "bare": post("at://did:plc:author/app.bsky.feed.post/5", Some("t"), vec![label("!warn"), label("porn")])
         });
         let report = normalize_upstream(&mut v, &Overlay::default());
         assert_eq!(v["post"]["embed"]["record"]["$type"], "app.bsky.embed.record#viewNotFound");
         assert!(!v.to_string().contains("secret"));
         assert!(report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/9"));
-        assert!(report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/8"));
+        // `!hide` and `!takedown` strip; `!warn` does not (Thread Lens
+        // amendment 1 §1): the post is shown with its labels removed.
+        assert!(report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/7"));
+        assert!(report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/6"));
+        assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/8"));
+        assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/5"));
+        assert!(v["warned"].get("labels").is_none() && v["bare"].get("labels").is_none(), "{v}");
         assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/1"));
     }
 }

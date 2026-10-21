@@ -10,6 +10,18 @@ commit.
 
 ## [Unreleased]
 
+### Changed (Thread Lens: a `!warn` post is a post, #790)
+
+- A post an upstream labelled `!warn` is no longer `content-stripped` on
+  the Thread Lens ladder (bridged stubs, the parent walk, reply
+  expansion, `resolve`). It is a post node with its upstream labels
+  removed, as the baseline, `getPostThread` and `getPosts` already show
+  it, so the two Thread Lens paths agree. `!takedown` and `!hide` stay
+  `content-stripped`. Thread Lens amendment 1 §1.
+- Tests: normalization strips on `!hide` and `!takedown` and not on
+  `!warn`; the ladder returns a `!warn` post from an upstream `getPosts`
+  as a post with no upstream labels, and `!hide` / `!takedown` as gaps.
+
 ### Added (`getMembership` advertises Thread Lens, #789)
 
 - `app.nearhorizon.actor.getMembership`'s `features` lists, after the

@@ -134,6 +134,55 @@ async fn tier_hidden_is_emitted_without_any_lookup() {
     assert_eq!(lookup.calls.load(Ordering::SeqCst), 0, "no DID resolution");
 }
 
+/// T-2 (Thread Lens amendment 1 §1): a post an upstream labelled `!warn`
+/// comes through the ladder as a post, with the upstream labels removed;
+/// one labelled `!hide` or `!takedown` is still `content-stripped`.
+#[tokio::test]
+async fn a_warned_post_is_a_post_on_the_ladder() {
+    let Some(db) = fresh_db("threadlens_warn").await else {
+        return;
+    };
+    let p = &db.pool;
+    let view = |rkey: &str, label: &str| {
+        let uri = format!("at://{AUTHOR}/app.bsky.feed.post/{rkey}");
+        json!({"$type": "app.bsky.feed.defs#postView", "uri": uri, "cid": "bafy",
+               "author": {"did": AUTHOR, "handle": "author.test", "viewer": {}, "labels": []},
+               "record": {"$type": "app.bsky.feed.post", "text": "warned text", "createdAt": "2026-09-26T00:00:00Z"},
+               "indexedAt": "2026-09-26T00:00:00Z", "viewer": {}, "replyCount": 0,
+               "labels": [{"src": "did:plc:upstreamlabeler", "uri": uri, "val": label, "cts": "2026-09-26T00:00:00Z"}]})
+    };
+    let posts: HashMap<String, Value> = [("3kwarned2222", "!warn"), ("3khidden2222", "!hide"), ("3ktakedown22", "!takedown")]
+        .into_iter()
+        .map(|(rkey, label)| (format!("at://{AUTHOR}/app.bsky.feed.post/{rkey}"), view(rkey, label)))
+        .collect();
+    let app = AxumRouter::new()
+        .route(
+            "/xrpc/{method}",
+            get(|State(posts): State<Arc<HashMap<String, Value>>>, Path(method): Path<String>, Query(q): Query<HashMap<String, String>>| async move {
+                match (method.as_str(), q.get("uris").and_then(|u| posts.get(u))) {
+                    ("app.bsky.feed.getPosts", Some(post)) => axum::Json(json!({"posts": [post]})).into_response(),
+                    _ => (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "NotFound"}))).into_response(),
+                }
+            }),
+        )
+        .with_state(Arc::new(posts));
+    let base = serve_fake(app).await;
+    let l = ladder(hydrator(p, ScopeSets::default()), &base, Arc::new(StubLookup::default()));
+    let (req, viewer) = (Requester::test(), member(VIEWER_A));
+    let at = |rkey: &str| format!("at://{AUTHOR}/app.bsky.feed.post/{rkey}");
+    match l.resolve(&viewer, &req, &at("3kwarned2222"), Mode::Full).await.expect("db") {
+        Resolved::Post(view) => {
+            assert_eq!(view["record"]["text"], "warned text");
+            assert!(!view.to_string().contains("!warn"), "{view}");
+        }
+        other => panic!("a !warn post is a post: {other:?}"),
+    }
+    for rkey in ["3khidden2222", "3ktakedown22"] {
+        assert_eq!(l.resolve(&viewer, &req, &at(rkey), Mode::Full).await.expect("db"), Resolved::Gap(Gap::ContentStripped), "{rkey}");
+    }
+    db.drop_db().await;
+}
+
 async fn serve(state: ThreadLensState) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

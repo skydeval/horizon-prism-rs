@@ -27,7 +27,8 @@ pub enum Gap {
     /// No source answered: every one was transient.
     UpstreamUnavailable,
     /// An upstream view with no record content, or upstream moderation
-    /// labels (`!takedown`, `!hide`, `!warn`).
+    /// labels `!takedown` or `!hide`. A `!warn` post is a post node, with
+    /// its upstream labels removed (Thread Lens amendment 1 §1).
     ContentStripped,
     /// A private-tier URI: emitted with no lookup at all (§10.5).
     TierHidden,
