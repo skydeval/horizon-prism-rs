@@ -1,0 +1,34 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getNotificationPreferences",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the requester's preferences for its private notifications. Every reason is listed, from everyone, until the requester sets otherwise. Separate from app.bsky.notification.getPreferences. Requires auth by a ready community member.",
+      "parameters": {
+        "type": "params",
+        "properties": {}
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["preferences"],
+          "properties": {
+            "preferences": { "type": "ref", "ref": "app.nearhorizon.private.defs#notificationPreferences" }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

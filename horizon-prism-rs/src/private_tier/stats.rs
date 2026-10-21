@@ -24,6 +24,7 @@ const TABLE_LABELS: &[(&str, &str)] = &[
     ("private_quote_refs", "Quotes of private posts"),
     ("private_notifications", "Private notifications"),
     ("private_notification_seen", "Private notifications read"),
+    ("private_notification_prefs", "Private notification settings"),
 ];
 
 /// `(table, label)` for every private table.
@@ -113,7 +114,7 @@ mod tests {
     async fn labels_cover_the_private_tables_and_media_counts() {
         for table in [
             "posts", "audiences", "blocks", "tombstones", "owner_ready", "owner_eligible", "bookmarks", "threadgates", "postgates", "quote_refs",
-            "notifications", "notification_seen",
+            "notifications", "notification_seen", "notification_prefs",
         ] {
             let name = format!("private_{table}");
             assert!(admin_table_labels().iter().any(|(t, l)| *t == name && !l.is_empty()), "{name}");

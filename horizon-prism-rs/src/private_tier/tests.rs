@@ -18,6 +18,8 @@ mod live_feed;
 mod media;
 // Private blocks only with a member side (member-blocks-only design).
 mod member_blocks;
+// Private notification preferences (private-notification-prefs design).
+mod prefs;
 mod round;
 mod threads;
 // The shared walk (#720): T-60 to T-63.
@@ -2712,7 +2714,7 @@ async fn private_router_methods_are_routed_in_every_mode() {
         .copied()
         .filter(|(n, _)| n.starts_with("app.nearhorizon.private."))
         .collect();
-    assert_eq!(methods.len(), 11);
+    assert_eq!(methods.len(), 13);
     for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
         set_mode(app.hydrator.scope(), mode).await;
         for &(nsid, verb) in &methods {

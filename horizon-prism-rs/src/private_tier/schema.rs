@@ -2614,10 +2614,23 @@ impl NotificationRow {
     }
 }
 
+/// The recipient `$1`'s notification preferences pass the row `n` (private
+/// notification preferences design §5.1, §6.1): not `list: false` for its
+/// reason, and, under `include: "follows"`, the recipient follows its author
+/// as stored now. No row, or no key for the reason, passes. Each
+/// `SELECT q.prefs` names only `$1`, so it runs once per statement; `CASE`
+/// reaches the `follows` probe only for a follows-only reason.
+pub(super) const PREFERRED: &str = "CASE \
+   WHEN (((SELECT q.prefs FROM private_notification_prefs q WHERE q.did = $1) -> n.reason) ->> 'list') = 'false' THEN false \
+   WHEN (((SELECT q.prefs FROM private_notification_prefs q WHERE q.did = $1) -> n.reason) ->> 'include') = 'follows' \
+     THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = n.author_did) \
+   ELSE true END";
+
 /// Up to `limit` of `recipient`'s private notifications, newest first, after
 /// the plain `indexed_at::id` cursor, with the `reasons` filter (none: every
-/// reason). The scan applies none of the recipient's other state, as the
-/// public scan does (`hydration/notifications.rs`).
+/// reason) and the recipient's notification preferences ([`PREFERRED`]), so
+/// a page is filled from rows they allow. The scan applies none of the
+/// recipient's other state; [`notification_kept`] follows it.
 ///
 /// # Errors
 ///
@@ -2630,13 +2643,14 @@ pub(super) async fn notification_rows(
     limit: i64,
 ) -> Result<Vec<NotificationRow>, sqlx::Error> {
     let (at, id) = after.map_or((None, 0), |(a, i)| (Some(a), i));
-    sqlx::query_as(
+    sqlx::query_as(&format!(
         "SELECT n.id, n.author_did, n.reason, n.reason_subject, n.record_uri, n.record_cid, n.public_record, n.indexed_at \
          FROM private_notifications n WHERE n.recipient_did = $1 \
            AND ($2::timestamptz IS NULL OR (n.indexed_at, n.id) < ($2, $3)) \
            AND (cardinality($5::text[]) = 0 OR n.reason = ANY($5)) \
+           AND {PREFERRED} \
          ORDER BY n.indexed_at DESC, n.id DESC LIMIT $4",
-    )
+    ))
     .bind(recipient)
     .bind(at)
     .bind(id)
@@ -2653,7 +2667,8 @@ pub(super) async fn notification_rows(
 ///   mute: `repost`; a quote mute: `quote`);
 /// - no moderation list of the recipient's that applies names its author;
 /// - no muted thread: the record, the root it claims, the subject, or the
-///   subject's own claimed root is a muted root.
+///   subject's own claimed root is a muted root;
+/// - the recipient's notification preferences ([`PREFERRED`]).
 fn notification_kept() -> String {
     format!(
         "NOT {blocked} \
@@ -2668,7 +2683,8 @@ fn notification_kept() -> String {
          AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
                n.record_uri, n.record_root, n.reason_subject, \
                (SELECT s.reply_root_uri FROM private_posts s WHERE s.uri = n.reason_subject), \
-               (SELECT s.reply_root_uri FROM posts s WHERE s.uri = n.reason_subject)))",
+               (SELECT s.reply_root_uri FROM posts s WHERE s.uri = n.reason_subject))) \
+         AND {PREFERRED}",
         blocked = blocked("$1", "n.author_did"),
         applies = crate::hydration::APPLIES,
     )
@@ -2755,6 +2771,42 @@ pub(super) async fn update_seen(pool: &PgPool, did: &str, seen_at: DateTime<Utc>
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// `did`'s stored notification preferences, if it wrote any (private
+/// notification preferences design §4.1).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn notification_prefs(pool: &PgPool, did: &str) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    sqlx::query_scalar("SELECT prefs FROM private_notification_prefs WHERE did = $1")
+        .bind(did)
+        .fetch_optional(pool)
+        .await
+}
+
+/// `putNotificationPreferences` (§4.2): `supplied`'s keys replace the
+/// stored ones whole (`jsonb ||`), in one statement under the row's lock, so
+/// two writes of different keys both land. Returns the stored object.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn merge_notification_prefs(
+    pool: &PgPool,
+    did: &str,
+    supplied: &serde_json::Value,
+) -> Result<serde_json::Value, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO private_notification_prefs (did, prefs) VALUES ($1, $2) \
+         ON CONFLICT (did) DO UPDATE SET prefs = private_notification_prefs.prefs || EXCLUDED.prefs, updated_at = now() \
+         RETURNING prefs",
+    )
+    .bind(did)
+    .bind(supplied)
+    .fetch_one(pool)
+    .await
 }
 
 /// The unseen-row condition of `getUnreadCount` for the recipient `$1`.

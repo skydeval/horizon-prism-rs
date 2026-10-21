@@ -10,6 +10,42 @@ commit.
 
 ## [Unreleased]
 
+### Added (private notification preferences, S1, #775, #777)
+
+Private notification preferences design S1
+(`docs/internal/design/private-notification-prefs.md`; skydeval's N1 to N4
+as recommended). Migration 0037.
+
+- **Private notification preferences.**
+  `app.nearhorizon.private.getNotificationPreferences` and
+  `putNotificationPreferences` read and set a member's preferences for its
+  own private notifications: per reason (`like`, `repost`, `reply`,
+  `quote`, `mention`), stock's `filterablePreference`, whether it is listed
+  (`list`) and whether only accounts the member follows count
+  (`include: follows`). A put replaces only the reasons it names, as
+  `putPreferencesV2`; other keys are ignored; a malformed preference is
+  `InvalidRequest` and writes nothing. `push` is stored and has no effect.
+  Both are own-only, gated and rate-limited as the other private methods,
+  served in every public-indexing mode, and not floored.
+- **`listNotifications` and `getUnreadCount` honour them when read.** A
+  reason with `list: false` is neither listed nor counted; under
+  `include: follows` a notification counts only while the member follows
+  its author as Prism stores the follow. Nothing changes when rows are
+  written, so changing a preference back restores every retained
+  notification. The list applies them in its scan, so its pages fill. With
+  no preferences stored, both answer as before.
+- **Storage.** A new private table, `private_notification_prefs`, one row
+  per member that wrote one, deleted by the `member_removed` and
+  `account_deleted` purges, never swept by retention; the admin stats page
+  labels it "Private notification settings". The image build's
+  private-table source check now covers it.
+- `getMembership` lists `private.notificationPreferences`. The lexicons gain
+  `private/getNotificationPreferences.json`,
+  `private/putNotificationPreferences.json` and
+  `private/defs#notificationPreferences`; `listNotifications`,
+  `getUnreadCount` and `getMembership` describe the change (and
+  `getMembership` now also names `private.mediaFilters`).
+
 ### Added (private notification preferences, S0: the appearance lexicon, #775, #776)
 
 Private notification preferences design S0

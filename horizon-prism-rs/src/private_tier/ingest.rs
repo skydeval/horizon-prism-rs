@@ -1193,9 +1193,10 @@ async fn purge_bookmarks(conn: &mut PgConnection, did: &str, limit: i64) -> Resu
     .rows_affected())
 }
 
-/// The private notifications `did` received and those it authored, and its
-/// last-seen row, at most `limit` rows (private posting §3.1: the
-/// `account_deleted` and `member_removed` purges). An authored row may hold
+/// The private notifications `did` received and those it authored, its
+/// last-seen row and its notification preferences, at most `limit` rows
+/// (private posting §3.1: the `account_deleted` and `member_removed` purges;
+/// private notification preferences design §3.1). An authored row may hold
 /// `public_record`, a copy of the DID's public post.
 async fn purge_notifications(conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
     let mut n = sqlx::query(
@@ -1207,11 +1208,12 @@ async fn purge_notifications(conn: &mut PgConnection, did: &str, limit: i64) -> 
     .execute(&mut *conn)
     .await?
     .rows_affected();
-    n += sqlx::query("DELETE FROM private_notification_seen WHERE did = $1")
-        .bind(did)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
+    for sql in [
+        "DELETE FROM private_notification_seen WHERE did = $1",
+        "DELETE FROM private_notification_prefs WHERE did = $1",
+    ] {
+        n += sqlx::query(sql).bind(did).execute(&mut *conn).await?.rows_affected();
+    }
     Ok(n)
 }
 

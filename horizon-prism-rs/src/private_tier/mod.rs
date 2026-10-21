@@ -195,6 +195,9 @@ pub const FEATURES: &[&str] = &[
     // P-30 posts_with_media and posts_with_video on getAuthorFeed
     // (private-media-filters design).
     "private.mediaFilters",
+    // get/putNotificationPreferences, honoured by listNotifications and
+    // getUnreadCount (private notification preferences design).
+    "private.notificationPreferences",
 ];
 
 /// The private tier as the rest of the crate may use it.

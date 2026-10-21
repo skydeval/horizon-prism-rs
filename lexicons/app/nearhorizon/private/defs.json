@@ -132,6 +132,18 @@
       "properties": {
         "post": { "type": "ref", "ref": "app.bsky.feed.defs#postView" }
       }
+    },
+    "notificationPreferences": {
+      "type": "object",
+      "description": "The requester's preferences for its private notifications, one per reason. reply and quote cover private posts replying to or quoting the requester's private post and community members' public posts doing the same; like and repost are community members' likes and reposts of the requester's private posts; mention is a mention of the requester in a private post. list: false leaves the reason out of listNotifications and getUnreadCount; include: 'follows' keeps it only from accounts the requester follows, as this AppView has indexed the follows when the notifications are read; push is stored and has no effect (this AppView sends no push for private notifications).",
+      "required": ["like", "mention", "quote", "reply", "repost"],
+      "properties": {
+        "like": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
+        "mention": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
+        "quote": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
+        "reply": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
+        "repost": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" }
+      }
     }
   }
 }

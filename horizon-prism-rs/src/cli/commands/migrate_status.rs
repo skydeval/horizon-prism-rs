@@ -102,6 +102,8 @@ mod tests {
             "0035_private_media_kinds",
             // Actionable warnings S1: unavailable jobs (#766).
             "0036_unavailable_jobs",
+            // Private notification preferences, S1 (#777).
+            "0037_notify_prefs_private_tier",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

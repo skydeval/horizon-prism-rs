@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Count the requester's private notifications newer than its last updateSeen, under the exclusions listNotifications applies. A notification from a private post the requester may not read, or about a private post that no longer exists, is not counted. Requires auth by a ready community member.",
+      "description": "Count the requester's private notifications newer than its last updateSeen, under the exclusions and notification preferences listNotifications applies. A notification from a private post the requester may not read, or about a private post that no longer exists, is not counted. Requires auth by a ready community member.",
       "output": {
         "encoding": "application/json",
         "schema": {

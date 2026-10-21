@@ -1,0 +1,47 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.putNotificationPreferences",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Set the requester's preferences for its private notifications. Each supplied reason replaces that reason's preference whole; the others are kept. Other keys are ignored. Returns every reason's preference. Separate from app.bsky.notification.putPreferencesV2. Requires auth by a ready community member.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "like": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
+            "mention": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
+            "quote": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
+            "reply": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
+            "repost": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["preferences"],
+          "properties": {
+            "preferences": { "type": "ref", "ref": "app.nearhorizon.private.defs#notificationPreferences" }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "The input is not an object, or a supplied preference is not an object with include (all or follows), list and push."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        }
+      ]
+    }
+  }
+}

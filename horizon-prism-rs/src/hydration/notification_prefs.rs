@@ -60,8 +60,10 @@ fn complete(stored: Option<&Value>) -> Value {
     out
 }
 
-/// One supplied preference, checked against its lexicon shape.
-fn checked(key: &str, value: &Value, filterable: bool) -> Result<Value, String> {
+/// One supplied preference, checked against its lexicon shape, as a fresh
+/// object of its fields alone. The private notification preferences check
+/// theirs with it too (private notification preferences design §4.2).
+pub(crate) fn checked(key: &str, value: &Value, filterable: bool) -> Result<Value, String> {
     let flag = |name: &str| value.get(name).and_then(Value::as_bool).ok_or_else(|| format!("{key}.{name} must be a boolean"));
     let mut out = json!({"list": flag("list")?, "push": flag("push")?});
     if filterable {

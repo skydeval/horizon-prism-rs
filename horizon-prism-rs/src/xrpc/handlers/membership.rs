@@ -199,10 +199,10 @@ mod tests {
         let aud = format!("did:web:{AUDIENCE_HOST}");
         let token = |i: u8, did: &str| mint(&signing_key(i + 3), did, &aud, Some(GET_MEMBERSHIP));
         let features = json!(FEATURES);
-        assert_eq!(features, json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters"]));
-        // T-M10 (private-media-filters design §6): the media filters' feature
-        // is listed last.
-        assert_eq!(FEATURES.last(), Some(&"private.mediaFilters"));
+        assert_eq!(features, json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences"]));
+        // T-N9 (private notification preferences design §8): the
+        // preferences' feature is listed last.
+        assert_eq!(FEATURES.last(), Some(&"private.notificationPreferences"));
 
         // Authentication is required.
         let (status, _, v) = call(&client, &base, None).await;

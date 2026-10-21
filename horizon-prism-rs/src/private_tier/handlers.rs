@@ -56,6 +56,8 @@ pub const GET_QUOTES: &str = "app.nearhorizon.private.getQuotes";
 pub const LIST_NOTIFICATIONS: &str = "app.nearhorizon.private.listNotifications";
 pub const GET_UNREAD_COUNT: &str = "app.nearhorizon.private.getUnreadCount";
 pub const UPDATE_SEEN: &str = "app.nearhorizon.private.updateSeen";
+pub const GET_NOTIFICATION_PREFERENCES: &str = "app.nearhorizon.private.getNotificationPreferences";
+pub const PUT_NOTIFICATION_PREFERENCES: &str = "app.nearhorizon.private.putNotificationPreferences";
 pub const GET_REPLIES: &str = "app.nearhorizon.private.getReplies";
 pub const SEARCH_POSTS: &str = "app.nearhorizon.private.searchPosts";
 
@@ -219,6 +221,8 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(LIST_NOTIFICATIONS), get(list_notifications))
         .route(&xrpc(GET_UNREAD_COUNT), get(get_unread_count))
         .route(&xrpc(UPDATE_SEEN), post(update_seen))
+        .route(&xrpc(GET_NOTIFICATION_PREFERENCES), get(get_notification_preferences))
+        .route(&xrpc(PUT_NOTIFICATION_PREFERENCES), post(put_notification_preferences))
         .route(&xrpc(GET_REPLIES), get(get_replies))
         .route(&xrpc(SEARCH_POSTS), get(search_posts))
         .with_state(state)
@@ -2043,18 +2047,20 @@ fn notification_cursor(c: Option<&str>) -> Result<Option<(DateTime<Utc>, i64)>, 
 /// seenAt?}`, each item in the shape of
 /// `app.bsky.notification.listNotifications#notification`:
 /// 1. the caller's rows are scanned, newest first, with the `reasons`
-///    filter and the plain `indexed_at::id` cursor;
+///    filter, the caller's notification preferences and the plain
+///    `indexed_at::id` cursor;
 /// 2. after the scan, a row is dropped for a block either way with its
 ///    author (`blocks` and `private_blocks`), a mute of its author (full,
-///    or scoped by reason), a moderation list that applies, or a muted
-///    thread;
+///    or scoped by reason), a moderation list that applies, a muted
+///    thread, or the caller's notification preferences (checked again);
 /// 3. a row from a private post reads the post through the pipeline for
 ///    the caller: a miss drops it, and `record` is the decoded record;
 /// 4. a row from a member's public record carries that record (a post's
 ///    as stored, a like or repost rebuilt from its row), and is dropped
 ///    once its subject private post is no longer stored.
 ///
-/// Notification preferences are not applied; `reasons` filters (C-13). The
+/// The caller's private notification preferences apply (private
+/// notification preferences design §6); `reasons` narrows further. The
 /// cursor follows the scan, so a page may be short. Floored
 /// (`list_notifications`).
 pub async fn list_notifications(
@@ -2171,7 +2177,7 @@ async fn notifications_body(
 
 /// `app.nearhorizon.private.getUnreadCount` (private posting §4.8) →
 /// `{count}`: the caller's rows after its last-seen time, under the list's
-/// exclusions, counting a private post's row only when the post passes the
+/// exclusions and the caller's notification preferences, counting a private post's row only when the post passes the
 /// prefilter for the caller, and a public record's only while its subject
 /// is stored. Floored (`get_unread_count`): the scan's time depends on rows
 /// the caller cannot read.
@@ -2202,6 +2208,74 @@ pub async fn update_seen(
         .map_err(|_| XrpcError::invalid("Error: seenAt must be a datetime"))?;
     schema::update_seen(&s.env.pool, &caller.did, seen_at.with_timezone(&Utc)).await?;
     Ok(ok(PrivateResponse::empty()))
+}
+
+/// The reasons a private notification has, each a key of the preferences
+/// (private notification preferences design §4): the private side has no
+/// follow, chat or activity reasons.
+pub(super) const PREFERENCE_REASONS: [&str; 5] = ["like", "mention", "quote", "reply", "repost"];
+
+/// `stored` over the defaults (`{include: all, list: true, push: true}`),
+/// key by key: exactly the five reasons, each a complete preference. A
+/// stored key that is not an object reads as the default.
+fn complete_preferences(stored: Option<&Value>) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in PREFERENCE_REASONS {
+        let value = stored
+            .and_then(|s| s.get(key))
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({"include": "all", "list": true, "push": true}));
+        out.insert(key.to_string(), value);
+    }
+    Value::Object(out)
+}
+
+/// `app.nearhorizon.private.getNotificationPreferences` (private
+/// notification preferences design §4.1) → `{preferences}`: the caller's own
+/// five preferences over the defaults. No floor: nothing here depends on a
+/// post or on another account.
+pub async fn get_notification_preferences(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private(&s.app, &headers, peer, GET_NOTIFICATION_PREFERENCES).await?;
+    let stored = schema::notification_prefs(&s.env.pool, &caller.did).await?;
+    Ok(ok(PrivateResponse::notification_preferences(complete_preferences(stored.as_ref()))))
+}
+
+/// `app.nearhorizon.private.putNotificationPreferences` (§4.2) →
+/// `{preferences}`: each supplied reason replaces the caller's preference
+/// for it whole, the others are kept (stock `putPreferencesV2`). A supplied
+/// preference is checked by the public validator; other keys are ignored;
+/// with no known key nothing is written. The gate runs before the body is
+/// read. No floor.
+pub async fn put_notification_preferences(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private(&s.app, &headers, peer, PUT_NOTIFICATION_PREFERENCES).await?;
+    let input = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if !input.is_object() {
+        return Err(XrpcError::invalid("Error: input must be an object"));
+    }
+    let mut supplied = serde_json::Map::new();
+    for key in PREFERENCE_REASONS {
+        if let Some(value) = input.get(key) {
+            let checked = crate::hydration::notification_prefs::checked(key, value, true)
+                .map_err(|message| XrpcError::invalid(format!("Error: {message}")))?;
+            supplied.insert(key.to_string(), checked);
+        }
+    }
+    let stored = if supplied.is_empty() {
+        schema::notification_prefs(&s.env.pool, &caller.did).await?
+    } else {
+        Some(schema::merge_notification_prefs(&s.env.pool, &caller.did, &Value::Object(supplied)).await?)
+    };
+    Ok(ok(PrivateResponse::notification_preferences(complete_preferences(stored.as_ref()))))
 }
 
 #[cfg(test)]
