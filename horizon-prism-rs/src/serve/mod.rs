@@ -484,6 +484,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .restore(&pool)
         .await
         .map_err(|e| StartupError::new(1, format!("restoring watermarks: {e}")))?;
+    // #737: a private relay that never reported holds every private read
+    // back. Warn now, and again every few minutes while it is silent.
+    watermarks.warn_unreported_at_start();
     tasks.push(watermarks.spawn_persister(pool.clone()));
     let coverage_labels: Vec<String> = fh.relay_labels.values().cloned().collect();
     let (coverage, coverage_task) = CoverageTracker::new(

@@ -442,6 +442,9 @@ pub struct Inputs {
     /// The relays the configuration names, so a relay never heard from
     /// still has a line.
     pub relays: Vec<String>,
+    /// `firehose.private_relays`: private reads wait for every one of them,
+    /// so one that has never reported is a problem, not a warning (#737).
+    pub private_relays: Vec<String>,
     /// The disks (§10.1), read now.
     pub disks: Option<super::stats::Disks>,
 }
@@ -578,9 +581,25 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
         let delay_of = |s: &Snapshot| s.sum_where(crate::firehose::watermark::METRIC_DELAY, "relay", &relay);
         let now = latest.as_ref().and_then(|s| delay_of(s.as_ref()));
         let held = ring.held_for(FIVE_MIN, |s| delay_of(s).map(|d| d > 120.0));
+        let private = i.private_relays.contains(&relay);
         out.push(match (held, now) {
             (Held::NoData, _) => Check::no_data("Relay delay", &format!("{relay}: Prism needs five minutes of readings first.")),
-            (Held::Yes, Some(d)) if d.is_infinite() => Check::new("Relay delay", Level::Amber, format!("Nothing received from {relay} since Prism started.")),
+            // No watermark, persisted or new: the relay has never reported.
+            (Held::Yes, Some(d)) if d.is_infinite() && private => Check::new(
+                "Relay delay",
+                Level::Red,
+                format!(
+                    "{relay} has never reported. Private posts wait for it, so every private read misses as stale. \
+                     Start its relay reader, or remove it from the relays private posts wait for."
+                ),
+            )
+            .link("/admin/settings", "Settings"),
+            (Held::Yes, Some(d)) if d.is_infinite() => Check::new("Relay delay", Level::Amber, format!("{relay} has never reported.")),
+            (Held::Yes, d) if private => Check::new(
+                "Relay delay",
+                Level::Amber,
+                format!("{relay} is {} behind; private posts newer than that miss as stale.", minutes(d.unwrap_or(0.0))),
+            ),
             (Held::Yes, d) => Check::new("Relay delay", Level::Amber, format!("{relay} is {} behind.", minutes(d.unwrap_or(0.0)))),
             (Held::No, Some(d)) if d.is_finite() => Check::new("Relay delay", Level::Ok, format!("{relay} is up to date ({} s behind).", d.round())),
             (Held::No, _) => Check::new("Relay delay", Level::Ok, format!("{relay} is up to date.")),
@@ -779,6 +798,7 @@ pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
         schema: h.schema.as_ref().map(|s| (s.backfill_done(), s.indexes_ready())),
         lag_warn_entries: fh.lag_warn_entries,
         relays,
+        private_relays: fh.private_relays.clone(),
         disks: Some(super::stats::read_disks(&state.disks)),
     };
     checks(&inputs, &h.ring)
@@ -908,6 +928,7 @@ mod tests {
             schema: Some((true, false)),
             lag_warn_entries: 100,
             relays: vec!["bsky".into(), "microcosm".into()],
+            private_relays: Vec::new(),
             disks: Some(disks(1_000_000_000_000, 15_000_000_000)),
         };
         let all = checks(&inputs, &ring);
@@ -917,7 +938,7 @@ mod tests {
         assert_eq!(get("Held gap", "missed"), Level::Red);
         assert_eq!(all.iter().find(|c| c.name == "Held gap").and_then(|c| c.action), Some(Action::Resync));
         assert_eq!(get("Backlog", "500 records behind"), Level::Amber);
-        assert_eq!(get("Relay delay", "Nothing received from bsky since Prism started"), Level::Amber);
+        assert_eq!(get("Relay delay", "bsky has never reported."), Level::Amber, "not a private relay");
         assert_eq!(get("Relay delay", "microcosm"), Level::NoData, "a configured relay with no series");
         assert_eq!(get("Unprocessed records", "2 records"), Level::Amber);
         assert_eq!(get("Database budget", "97%"), Level::Red);
@@ -930,6 +951,36 @@ mod tests {
         assert_eq!(get("Search", "still being prepared"), Level::Info);
         assert_eq!(get("Trim gap", "No data"), Level::NoData, "a counter never incremented is absent");
         assert_eq!(get("Disk", "The disk holding the database (Postgres) has 15.0 GB free (2% free)"), Level::Red);
+    }
+
+    /// #737: a private relay that has never reported is a Problem naming
+    /// it; one that is behind is a Warning; one that keeps up is fine.
+    #[test]
+    fn a_private_relay_that_never_reported_is_a_problem() {
+        let ring = Ring::default();
+        let text = "firehose_worker_delay_seconds{relay=\"bsky\"} 2\n\
+            firehose_worker_delay_seconds{relay=\"microcosm\"} +Inf\n\
+            firehose_worker_delay_seconds{relay=\"community-a\"} 900";
+        for m in 0..=5 {
+            ring.push(snap(text, m));
+        }
+        let inputs = Inputs {
+            relays: vec!["community-a".into(), "bsky".into(), "microcosm".into()],
+            private_relays: vec!["bsky".into(), "microcosm".into(), "community-a".into()],
+            ..Inputs::default()
+        };
+        let relay = |name: &str| {
+            checks(&inputs, &ring)
+                .into_iter()
+                .find(|c| c.name == "Relay delay" && c.text.starts_with(name))
+                .map(|c| (c.level, c.text))
+                .expect("check")
+        };
+        let (level, text) = relay("microcosm");
+        assert_eq!(level, Level::Red);
+        assert!(text.starts_with("microcosm has never reported. Private posts wait for it, so every private read misses as stale."), "{text}");
+        assert_eq!(relay("bsky").0, Level::Ok);
+        assert_eq!(relay("community-a"), (Level::Amber, "community-a is 15 minutes behind; private posts newer than that miss as stale.".to_string()));
     }
 
     /// T-AW13 (actionable-warnings design §7.1): the Unprocessed records

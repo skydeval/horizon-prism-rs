@@ -23,6 +23,11 @@ pub const PERSIST_INTERVAL: Duration = Duration::from_secs(10);
 pub const GAUGE_INTERVAL: Duration = Duration::from_secs(1);
 /// Label for a `_relay` URL absent from `firehose.relay_labels`.
 pub const UNKNOWN_RELAY: &str = "other";
+/// How often the private relays are checked for silence, the first time
+/// this long after the start.
+pub const PRIVATE_RELAY_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+/// A private relay whose watermark is further behind than this is silent.
+pub const PRIVATE_RELAY_SILENT_AFTER: Duration = Duration::from_secs(300);
 
 /// Metric: `now − watermark[r]`.
 pub const METRIC_DELAY: &str = "firehose_worker_delay_seconds";
@@ -110,6 +115,68 @@ impl Watermarks {
             .flatten()
     }
 
+    /// The private relays holding private reads back as of `now`: each one
+    /// with no watermark (`None`: it has never reported) or a watermark
+    /// more than `silent_after` behind. Private reads wait for the slowest
+    /// private relay, so any one of these makes them miss as stale.
+    #[must_use]
+    pub fn silent_private_relays(&self, now: DateTime<Utc>, silent_after: Duration) -> Vec<(String, Option<DateTime<Utc>>)> {
+        let limit = chrono::TimeDelta::from_std(silent_after).unwrap_or(chrono::TimeDelta::MAX);
+        let m = self.lock();
+        self.private_relays
+            .iter()
+            .map(|r| (r.clone(), m.get(r).copied()))
+            .filter(|(_, w)| w.is_none_or(|w| now - w > limit))
+            .collect()
+    }
+
+    /// Log a warning for each private relay [`Self::silent_private_relays`]
+    /// names; returns how many were named.
+    pub fn warn_silent_private_relays(&self, now: DateTime<Utc>) -> usize {
+        let silent = self.silent_private_relays(now, PRIVATE_RELAY_SILENT_AFTER);
+        for (relay, w) in &silent {
+            match w {
+                None => tracing::warn!(
+                    event = "private_relay_never_reported",
+                    relay = %relay,
+                    "relay {relay} is in firehose.private_relays but has never reported; every private read misses as stale until it does. \
+                     Start its relay reader, or remove it from firehose.private_relays"
+                ),
+                Some(w) => tracing::warn!(
+                    event = "private_relay_silent",
+                    relay = %relay,
+                    behind_secs = (now - *w).num_seconds(),
+                    "relay {relay} is in firehose.private_relays but its last event is {} s old; newer private posts miss as stale until it catches up",
+                    (now - *w).num_seconds()
+                ),
+            }
+        }
+        silent.len()
+    }
+
+    /// The startup check: after [`Self::restore`], a private relay with no
+    /// persisted watermark while another relay has one has never reported
+    /// on this database. A fresh database (no watermark at all) waits for
+    /// the periodic check instead.
+    pub fn warn_unreported_at_start(&self) -> usize {
+        let missing: Vec<String> = {
+            let m = self.lock();
+            if m.is_empty() {
+                return 0;
+            }
+            self.private_relays.iter().filter(|r| !m.contains_key(*r)).cloned().collect()
+        };
+        for relay in &missing {
+            tracing::warn!(
+                event = "private_relay_never_reported",
+                relay = %relay,
+                "relay {relay} is in firehose.private_relays but has never reported on this database; every private read misses as stale until it does. \
+                 Start its relay reader, or remove it from firehose.private_relays"
+            );
+        }
+        missing.len()
+    }
+
     /// Every configured label with its watermark (for `/xrpc/_health`).
     #[must_use]
     pub fn snapshot(&self) -> BTreeMap<String, Option<DateTime<Utc>>> {
@@ -185,7 +252,9 @@ impl Watermarks {
         }
     }
 
-    /// Refresh the delay gauges every second and persist every 10 s.
+    /// Refresh the delay gauges every second, persist every 10 s, and warn
+    /// about silent private relays every [`PRIVATE_RELAY_CHECK_INTERVAL`]
+    /// (the first time one interval after the start).
     #[must_use]
     pub fn spawn_persister(&self, pool: PgPool) -> JoinHandle<()> {
         let this = self.clone();
@@ -194,9 +263,17 @@ impl Watermarks {
             gauges.set_missed_tick_behavior(MissedTickBehavior::Delay);
             let mut persist = tokio::time::interval(PERSIST_INTERVAL);
             persist.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut relays = tokio::time::interval_at(
+                tokio::time::Instant::now() + PRIVATE_RELAY_CHECK_INTERVAL,
+                PRIVATE_RELAY_CHECK_INTERVAL,
+            );
+            relays.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = gauges.tick() => this.record_gauges(),
+                    _ = relays.tick() => {
+                        this.warn_silent_private_relays(Utc::now());
+                    }
                     _ = persist.tick() => {
                         if let Err(error) = this.persist(&pool).await {
                             tracing::warn!(event = "watermark_persist_failed", %error, "persisting watermarks failed");
@@ -257,6 +334,29 @@ mod tests {
         assert_eq!(w.private_watermark(), Some(t("2026-09-26T11:30:00Z")));
         let snap = w.snapshot();
         assert_eq!(snap.len(), 3);
+    }
+
+    /// #737: a private relay that never reports, or stops reporting, is
+    /// named; a non-private one never is.
+    #[test]
+    fn silent_private_relays_are_named() {
+        let w = marks();
+        let now = t("2026-09-26T12:00:00Z");
+        let five = PRIVATE_RELAY_SILENT_AFTER;
+        assert_eq!(w.warn_unreported_at_start(), 0, "a fresh database waits for the periodic check");
+        assert_eq!(w.silent_private_relays(now, five), vec![("bsky".to_string(), None), ("microcosm".to_string(), None)]);
+        w.observe("bsky", t("2026-09-26T11:59:00Z"));
+        w.observe("community-a", t("2020-01-01T00:00:00Z"));
+        // The silonew case: bsky reports, microcosm never does.
+        assert_eq!(w.silent_private_relays(now, five), vec![("microcosm".to_string(), None)]);
+        assert_eq!(w.warn_unreported_at_start(), 1);
+        assert_eq!(w.warn_silent_private_relays(now), 1);
+        w.observe("microcosm", t("2026-09-26T11:50:00Z"));
+        assert_eq!(w.warn_unreported_at_start(), 0);
+        assert_eq!(w.silent_private_relays(now, five), vec![("microcosm".to_string(), Some(t("2026-09-26T11:50:00Z")))], "ten minutes behind");
+        w.observe("microcosm", t("2026-09-26T11:58:00Z"));
+        assert!(w.silent_private_relays(now, five).is_empty());
+        assert_eq!(w.warn_silent_private_relays(now), 0);
     }
 
     mod pg {

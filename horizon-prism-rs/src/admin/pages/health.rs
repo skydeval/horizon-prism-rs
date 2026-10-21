@@ -93,7 +93,7 @@ pub fn stream_words(now: Option<&Snapshot>) -> String {
         return UNKNOWN.to_string();
     };
     if worst.is_infinite() {
-        "a relay has sent nothing since the start".to_string()
+        "a relay has never reported".to_string()
     } else if worst < 120.0 {
         "up to date".to_string()
     } else {
@@ -158,7 +158,7 @@ fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
             &format!("{relay} delay"),
             match delay {
                 None => UNKNOWN.to_string(),
-                Some(d) if d.is_infinite() => "nothing received since Prism started".to_string(),
+                Some(d) if d.is_infinite() => "never reported".to_string(),
                 Some(d) if d < 120.0 => format!("{d:.0} seconds"),
                 Some(d) => format!("{:.0} minutes", (d / 60.0).round()),
             },

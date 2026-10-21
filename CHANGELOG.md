@@ -10,6 +10,26 @@ commit.
 
 ## [Unreleased]
 
+### Added (a private relay that never reports, #737)
+
+- **Prism warns when a relay in `firehose.private_relays` holds private
+  reads back.** Private reads wait for every private relay's watermark, so
+  one whose relay reader is not running makes every private read miss as
+  stale, the author's own included. At startup, a private relay with no
+  persisted watermark while another relay has one logs
+  `private_relay_never_reported` naming it. Every 5 minutes from 5 minutes
+  after the start, each private relay with no watermark
+  (`private_relay_never_reported`) or one more than 5 minutes behind
+  (`private_relay_silent`, with `behind_secs`) is named in a warning. Prism
+  still starts.
+- **Health "Relay delay"**: a private relay that has never reported is a
+  Problem ("… has never reported. Private posts wait for it, so every
+  private read misses as stale."), with a link to Settings; a private relay
+  that is behind says private posts newer than that miss. Any relay with no
+  watermark now reads "never reported" (was "nothing received since Prism
+  started", which was wrong after a restart), on Health's figures and
+  Home's stream tile too.
+
 ### Added (actionable warnings S3: sweep the problems list, #765, #768)
 
 Actionable-warnings design S3 (`docs/internal/design/actionable-warnings.md`
