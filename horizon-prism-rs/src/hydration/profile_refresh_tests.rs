@@ -913,7 +913,16 @@ async fn t23_get_profiles_makes_one_call_and_one_farsight_lookup() {
 struct SlowHandles {
     in_flight: AtomicUsize,
     most: AtomicUsize,
+    /// When the first call came in.
+    first: std::sync::OnceLock<std::time::Instant>,
 }
+
+/// How long the calls wait for four to be in flight at once. Each call does
+/// a database lookup before it reaches the upstream, and under load those
+/// can take longer than the shortest sleep, so a call could finish before
+/// the fourth starts (#771). A build that runs fewer than four at once
+/// waits this long once and then fails.
+const MEET_WITHIN: Duration = Duration::from_secs(10);
 
 #[async_trait::async_trait]
 impl UpstreamSource for SlowHandles {
@@ -935,6 +944,11 @@ impl UpstreamSource for SlowHandles {
     async fn resolve_handle(&self, _req: &Requester, handle: &str) -> Option<String> {
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
+        // Hold until four have been in flight together (or the wait is up).
+        let deadline = *self.first.get_or_init(std::time::Instant::now) + MEET_WITHIN;
+        while self.most.load(Ordering::SeqCst) < 4 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // Later handles answer sooner, so order comes from the input.
         let n: u64 = handle.trim_start_matches('h').trim_end_matches(".test").parse().unwrap_or(0);
         tokio::time::sleep(Duration::from_millis(120 - 15 * n)).await;

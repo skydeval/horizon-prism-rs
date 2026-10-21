@@ -10,6 +10,16 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (test reliability: T-24's four at a time, #771)
+
+- **`t24_handles_resolve_four_at_a_time_in_order`** failed once with three
+  in flight, not four. Each handle runs a local lookup before it reaches
+  the upstream, and under load those lookups finished further apart than
+  the shortest fake answer (75 ms). The fake upstream now holds each call
+  until four have been in flight together (at most 10 s), then answers in
+  the same scrambled order. With the concurrency set to 3 it fails with
+  3 against 4.
+
 ### Fixed (test reliability: t56's refused token, #738)
 
 - **`t56_one_head_round_in_heads_order`** emptied A10's read-fetch bucket
