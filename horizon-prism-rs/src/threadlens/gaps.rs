@@ -15,8 +15,9 @@ pub enum Gap {
     /// The server did not fetch the post because it could not check the
     /// viewer's blocks for its author.
     BlockStateUnknown,
-    /// A block between other parties, reported by an upstream, that was
-    /// not bridged.
+    /// A block the ordinary thread view reported that was not looked past:
+    /// a block between other parties, or one whose author's blocks with
+    /// the viewer could not be checked. Never from `resolve`.
     Blocked,
     /// A local tombstone, or Slingshot `RecordNotFound` for an author whose
     /// account is locally known to be `active`.

@@ -609,11 +609,18 @@ async fn the_parent_walk_goes_past_a_blocked_author() {
     assert!(got.nodes.iter().all(|n| !n.markers().more_parents));
     assert_eq!(got.bridging, Bridging::Full);
 
-    // `parentHeight` bounds the chain; the top node says there is more.
+    // `parentHeight` bounds the chain; the top node says there is more,
+    // and names its parent from the stored row, as it would had the walk
+    // gone on. Nothing else of the blocked post is sent.
     let short = thread::Request { parent_height: 1, ..request };
     let got = thread::get_thread(&l, &cfg, &key, short, None).await.expect("thread");
     assert_eq!(shape(&got.nodes), [(middle.clone(), Some("blocked-by-you")), (leaf.clone(), None)]);
     assert!(got.nodes[0].markers().more_parents);
+    assert_eq!(got.nodes[0].parent_uri(), Some(root.as_str()));
+    let emitted = serde_json::to_string(&crate::hydration::lens::lens_thread(&leaf, &got.nodes, got.bridging)).expect("json");
+    let top: Value = serde_json::from_str::<Value>(&emitted).expect("json")["nodes"][0].clone();
+    assert_eq!(top, json!({"$type": "app.nearhorizon.threadLens.defs#gapNode", "uri": middle, "gap": "blocked-by-you", "parentUri": root, "moreParents": true}));
+    assert!(!emitted.contains("\"middle\"") && !emitted.contains("r1.test"), "{emitted}");
 
     // With bridging off the response is the ordinary view: it ends at the
     // blocked parent, and says nothing more.

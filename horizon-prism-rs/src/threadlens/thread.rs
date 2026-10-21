@@ -410,12 +410,22 @@ impl Work<'_> {
     /// The walk up the parents (§5.15.11): one step at a time from the
     /// top of the chain, through known-block gaps, until the root, a URI
     /// already seen, a gap the ladder classifies, an author that cannot be
-    /// checked, or a bound. A bound leaves `moreParents` on the top node.
+    /// checked, or a bound. A bound leaves `moreParents` on the top node;
+    /// a known-block gap there keeps the `parentUri` [`Self::parent_of_top`]
+    /// named.
     async fn parents(&mut self) -> Result<(), sqlx::Error> {
         loop {
             let Some(parent) = self.parent_of_top().await? else {
                 return Ok(());
             };
+            // A known-block gap's parent, named by a local row or the
+            // baseline (never the hidden record), is written whether or not
+            // the walk goes on: a bound leaves `moreParents` and the link.
+            if let Some(LensNode::Gap { parent_uri, .. }) = self.nodes.first_mut()
+                && parent_uri.is_none()
+            {
+                *parent_uri = Some(parent.clone());
+            }
             if self.seen.contains(&parent) {
                 return Ok(());
             }
@@ -447,12 +457,6 @@ impl Work<'_> {
                     LensNode::gap(&parent, None, Gap::BlockStateUnknown)
                 }
             };
-            // The node below now has its parent in the response.
-            if let Some(LensNode::Gap { parent_uri, .. }) = self.nodes.first_mut()
-                && parent_uri.is_none()
-            {
-                *parent_uri = Some(parent.clone());
-            }
             let goes_on = node.walkable();
             self.seen.insert(parent);
             self.nodes.insert(0, node);

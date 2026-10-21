@@ -10,6 +10,21 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (Thread Lens: a blocked top gap's `parentUri` at a bound, #786)
+
+- When the parent walk stopped at a bound (`parentHeight`, the page budget,
+  `parent_rounds`, or a round that could not judge the next author) above a
+  `blocked-by-you` / `blocking-you` gap, the gap carried `moreParents` but
+  no `parentUri`, although the walk already knew its parent from a local
+  `posts` row or the baseline. That link is now written whenever the walk
+  names it, whether or not the walk goes on. It is never read from the
+  hidden record (design-v4 §5.15.11); a gap whose parent no local row or
+  baseline names still has none (§5.15.19 item 8).
+- The `blocked` gap's doc text says what the code assigns: a block the
+  ordinary thread view reported that was not looked past, between other
+  parties or with an author whose blocks with the viewer could not be
+  checked.
+
 ### Added (`Retry-After` on every 429, #785)
 
 - **Every `429` names `Retry-After`.** A limiter's refusal (the rate classes,
