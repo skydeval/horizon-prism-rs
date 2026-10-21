@@ -18,7 +18,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::header::{COOKIE, ORIGIN, SET_COOKIE};
+use axum::http::header::{COOKIE, ORIGIN, RETRY_AFTER, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use chrono::{DateTime, Utc};
@@ -27,7 +27,7 @@ use tokio::sync::Semaphore;
 
 use super::operators::{endpoint_host, host_allowed, is_operator, normalize_endpoint, patterns};
 use super::{AdminState, pages};
-use crate::xrpc::rate_limit::{client_ip, ip_key};
+use crate::xrpc::rate_limit::{client_ip, ip_key, retry_after_of};
 
 /// The session cookie.
 pub const SESSION_COOKIE: &str = "__Host-prism_admin";
@@ -163,17 +163,25 @@ impl Limits {
 
     /// A wrong setup code from `ip`: past the per-minute allowance, the
     /// answer is delayed, and past the bound of delayed answers it is
-    /// `Err` (answer `429`).
-    pub async fn wrong_code(&self, ip: IpAddr) -> Result<(), ()> {
-        if self.wrong_codes.check_key(&ip_key(ip)).is_ok() {
+    /// `Err` (answer `429`), carrying its `Retry-After`: the seconds until a
+    /// wrong code from `ip` is answered at once again.
+    pub async fn wrong_code(&self, ip: IpAddr) -> Result<(), u64> {
+        let Err(not_until) = self.wrong_codes.check_key(&ip_key(ip)) else {
             return Ok(());
-        }
+        };
         let Ok(_permit) = Arc::clone(&self.delayed).try_acquire_owned() else {
-            return Err(());
+            return Err(retry_after_of(&not_until));
         };
         tokio::time::sleep(WRONG_CODE_DELAY).await;
         Ok(())
     }
+}
+
+/// `response` with `Retry-After: secs` (every `429` names one).
+#[must_use]
+pub fn with_retry_after(mut response: Response, secs: u64) -> Response {
+    response.headers_mut().insert(RETRY_AFTER, HeaderValue::from(secs.max(1)));
+    response
 }
 
 /// A signed-in operator.
@@ -507,18 +515,19 @@ pub async fn require(
     };
     // The limits come before any outbound call.
     let limited = match need {
-        Need::Page | Need::Poll => state.limits.pages.check_key(&id_hash).is_err(),
-        Need::Change => state.limits.mutations.check_key(&id_hash).is_err(),
+        Need::Page | Need::Poll => state.limits.pages.check_key(&id_hash),
+        Need::Change => state.limits.mutations.check_key(&id_hash),
     };
-    if limited {
-        return Err(pages::message(
+    if let Err(not_until) = limited {
+        let page = pages::message(
             state,
             None,
             StatusCode::TOO_MANY_REQUESTS,
             "Slow down",
             "Too many requests in a short time. Wait a moment and try again.",
             None,
-        ));
+        );
+        return Err(with_retry_after(page, retry_after_of(&not_until)));
     }
     match verify(state, &id_hash, &session, need == Need::Change, Some(ip)).await {
         Ok(()) => {}

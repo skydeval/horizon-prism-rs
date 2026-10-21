@@ -18,7 +18,7 @@ use crate::admin::auth::{
 };
 use crate::admin::operators::{endpoint_host, host_allowed, is_operator, normalize_endpoint, patterns};
 use crate::admin::{AdminState, oauth, setup_code};
-use crate::xrpc::rate_limit::ip_key;
+use crate::xrpc::rate_limit::{ip_key, retry_after_of};
 
 #[derive(Template)]
 #[template(path = "login.html")]
@@ -193,8 +193,9 @@ pub async fn submit(
     if !presession_ok(&headers, &form.presession) || !origin_ok(&headers, &state.public_hostname) {
         return login_page(StatusCode::FORBIDDEN, &form.input, Some("This form expired. Try again.".to_string()));
     }
-    if state.limits.login.check_key(&ip_key(ip)).is_err() {
-        return login_page(StatusCode::TOO_MANY_REQUESTS, &form.input, Some("Too many sign-in attempts; wait a minute.".to_string()));
+    if let Err(not_until) = state.limits.login.check_key(&ip_key(ip)) {
+        let page = login_page(StatusCode::TOO_MANY_REQUESTS, &form.input, Some("Too many sign-in attempts; wait a minute.".to_string()));
+        return auth::with_retry_after(page, retry_after_of(&not_until));
     }
     let (did, endpoint) = match resolve_input(&state, &form.input).await {
         Ok(found) => found,

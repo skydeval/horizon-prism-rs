@@ -10,6 +10,26 @@ commit.
 
 ## [Unreleased]
 
+### Added (`Retry-After` on every 429, #785)
+
+- **Every `429` names `Retry-After`.** A limiter's refusal (the rate classes,
+  Thread Lens's among them, the global backstop, the backstop's per-member
+  verification ceiling, the request and pool budgets, the service-proxy
+  classes) keeps `ratelimit-reset` (epoch seconds) and adds `Retry-After`:
+  the seconds left to that reset, at least 1. Built once, in the
+  conversion every limiter's refusal goes through.
+- The admin UI's limits name one too: a session's page and change limits
+  and sign-in starts (the bucket's wait, rounded up), wrong setup codes
+  (until a wrong code is answered at once again), and the live feed's
+  stream cap (the renewal reservation, the soonest a slot can free). A
+  refused live-feed open keeps the `Retry-After` of the limit that refused
+  it.
+- A target's `429` relayed by the service proxy is unchanged: none of the
+  target's headers are relayed (design-v4 §6.7.7).
+- Tests: each path's `429` carries `Retry-After` ≥ 1, consistent with its
+  `ratelimit-reset` (Thread Lens class, global class, per-member ceiling,
+  service classes, the conversion itself, the admin limits).
+
 ### Measured (shared walk's open items, #720)
 
 Shared-walk amendment 1 (`docs/internal/design/shared-walk-amendment-1.md`).

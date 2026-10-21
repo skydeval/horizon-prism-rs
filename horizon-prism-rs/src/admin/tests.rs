@@ -258,6 +258,11 @@ struct Page {
     body: String,
 }
 
+/// A page's `Retry-After`, in seconds.
+fn retry_after(page: &Page) -> Option<u64> {
+    page.headers.get("retry-after")?.to_str().ok()?.parse().ok()
+}
+
 impl Browser {
     fn new() -> Self {
         Self::from_address(None)
@@ -597,10 +602,19 @@ async fn t_a2_wrong_codes_are_throttled_per_address() {
     // Past the bound of delayed answers at once: 429.
     let attempts = (0..auth::MAX_DELAYED + 4).map(|_| async {
         let b = Browser::from_address(Some("2001:db8::3"));
-        start_setup(&h, &b, wrong, ALICE).await.status
+        let page = start_setup(&h, &b, wrong, ALICE).await;
+        (page.status, retry_after(&page))
     });
-    let statuses = futures::future::join_all(attempts).await;
+    let answers = futures::future::join_all(attempts).await;
+    let statuses: Vec<u16> = answers.iter().map(|(s, _)| *s).collect();
     assert!(statuses.contains(&429), "{statuses:?}");
+    // Each 429 names a retry: at least 1 second, at most the minute the
+    // wrong codes are counted over.
+    for (status, retry) in &answers {
+        if *status == 429 {
+            assert!(retry.is_some_and(|s| (1..=60).contains(&s)), "{answers:?}");
+        }
+    }
     // Another address is not slowed, and the correct code works from the
     // throttled one.
     let other = Browser::from_address(Some("198.51.100.7"));
@@ -678,21 +692,37 @@ async fn t_a3_host_check_at_login() {
 }
 
 /// T-M9: sign-in starts are limited per client address, keyed on the
-/// forwarded address from the trusted proxy.
+/// forwarded address from the trusted proxy. Every 429 names `Retry-After`.
 #[tokio::test]
 async fn t_m9_login_limit_keys_on_the_forwarded_address() {
     let Some(h) = harness("admin_t_m9_limit").await else {
         return;
     };
-    let _alice = complete_setup(&h, ALICE).await;
+    let alice = complete_setup(&h, ALICE).await;
     let one = Browser::from_address(Some("203.0.113.5"));
     let mut statuses = Vec::new();
+    let mut last = None;
     for _ in 0..11 {
         let form = one.get(&format!("{}/admin/login", h.base)).await;
         let presession = field(&form.body, "presession").expect("presession");
-        statuses.push(one.post(&format!("{}/admin/login", h.base), &[("input", "did:plc:dddddddddddddddddddddddd"), ("presession", &presession)]).await.status);
+        let page = one.post(&format!("{}/admin/login", h.base), &[("input", "did:plc:dddddddddddddddddddddddd"), ("presession", &presession)]).await;
+        statuses.push(page.status);
+        last = Some(page);
     }
     assert_eq!(statuses.last(), Some(&429), "{statuses:?}");
+    // The 429 names a retry: one sign-in start comes back every 6 seconds.
+    let retry = last.as_ref().and_then(retry_after);
+    assert!(retry.is_some_and(|s| (1..=6).contains(&s)), "{retry:?}");
+    // A session's page limit, 10 a second: its 429 names a retry too.
+    let home = format!("{}/admin", h.base);
+    let pages = (0..30).map(|_| alice.get(&home));
+    let answers: Vec<(u16, Option<u64>)> = futures::future::join_all(pages).await.iter().map(|p| (p.status, retry_after(p))).collect();
+    assert!(answers.iter().any(|(s, _)| *s == 429), "{answers:?}");
+    for (status, retry) in &answers {
+        if *status == 429 {
+            assert_eq!(*retry, Some(1), "{answers:?}");
+        }
+    }
     let two = Browser::from_address(Some("203.0.113.6"));
     let form = two.get(&format!("{}/admin/login", h.base)).await;
     let presession = field(&form.body, "presession").expect("presession");

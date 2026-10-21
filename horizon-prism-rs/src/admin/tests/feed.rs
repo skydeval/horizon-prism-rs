@@ -302,6 +302,9 @@ async fn t_f6_caps() {
     let s9 = session(p, ALICE, PDS).await;
     let ninth = open(&h, &s9, &page_id(), "").await;
     assert_eq!(ninth.status, 429);
+    // The cap's 429 names a retry: the soonest a reserved slot can free.
+    let secs: u64 = ninth.header("retry-after").parse().expect("Retry-After");
+    assert_eq!(secs, crate::xrpc::rate_limit::retry_after_secs(h.hub.timing().reserve));
     assert_eq!(h.hub.open_streams(), MAX, "nobody was ended");
     let events = a2.collect(Duration::from_millis(700)).await;
     assert!(!events.iter().any(|(n, _)| n == "end"), "{events:?}");

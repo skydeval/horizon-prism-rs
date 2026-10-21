@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Query, State};
-use axum::http::header::{CACHE_CONTROL, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, RETRY_AFTER, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -31,7 +31,10 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use super::{Hub, LINES_PER_SEC, Slot};
 use crate::admin::AdminState;
-use crate::admin::auth::{Need, Refresh, check_session, load_session, request_ip, require, session_bytes};
+use crate::admin::auth::{
+    Need, Refresh, check_session, load_session, request_ip, require, session_bytes, with_retry_after,
+};
+use crate::xrpc::rate_limit::retry_after_secs;
 use crate::firehose::feed::{GROUPS, KINDS, Kind, Lanes, Line, METRIC_NOT_SHOWN, Outcome, SOURCES, Source, Totals, wanted_bit};
 
 /// The stream's `Cache-Control`, over axum's `no-cache` (§3.2).
@@ -178,7 +181,7 @@ fn empty(status: StatusCode) -> Response {
 
 /// A refusal at open, never a redirect (§3.3): `401` for no or an ended
 /// session, `429`, `503` otherwise; the body empty, the cleared cookie of
-/// a cut-off kept.
+/// a cut-off and the `Retry-After` of a `429` kept.
 fn refusal(page: &Response) -> Response {
     let status = match page.status() {
         s if s.is_redirection() || s == StatusCode::UNAUTHORIZED => StatusCode::UNAUTHORIZED,
@@ -186,8 +189,12 @@ fn refusal(page: &Response) -> Response {
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     let mut out = empty(status);
-    if let Some(cookie) = page.headers().get(SET_COOKIE) {
-        out.headers_mut().insert(SET_COOKIE, cookie.clone());
+    for name in [SET_COOKIE, RETRY_AFTER] {
+        if let Some(value) = page.headers().get(&name)
+            && (name != RETRY_AFTER || status == StatusCode::TOO_MANY_REQUESTS)
+        {
+            out.headers_mut().insert(name, value.clone());
+        }
     }
     out
 }
@@ -216,8 +223,10 @@ pub async fn open(
     let hub = state.live.clone();
     let filter = Filter::parse(q.kinds.as_deref(), q.sources.as_deref());
     let rx = hub.tap().subscribe();
+    // At the global cap a slot frees when a stream ends; the soonest is a
+    // renewal's reserved slot left unclaimed (§3.4).
     let Ok(slot) = hub.admit(id_hash, &page, filter.wanted()) else {
-        return empty(StatusCode::TOO_MANY_REQUESTS);
+        return with_retry_after(empty(StatusCode::TOO_MANY_REQUESTS), retry_after_secs(hub.timing().reserve));
     };
     tracing::debug!(event = "admin_live_stream_opened", did = %session.did, "live feed stream opened");
     let timing = hub.timing();

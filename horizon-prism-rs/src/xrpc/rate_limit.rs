@@ -1,6 +1,7 @@
 //! Rate limiting (design-v2 §7.4, design-v3 §10): `governor` keyed buckets.
 //! Exceeding one returns `429 {"error":"RateLimitExceeded"}` with a
-//! `ratelimit-reset` header (epoch seconds).
+//! `ratelimit-reset` header (epoch seconds) and a `Retry-After` header
+//! (delta-seconds to that reset, at least 1).
 //!
 //! Every number is operator config, `[rate_limits.<class>]` with `per_sec`
 //! and `burst`. The defaults:
@@ -343,6 +344,28 @@ pub struct Limited {
     pub reset_epoch_secs: u64,
 }
 
+impl Limited {
+    /// `Retry-After` for this rejection, from the epoch second `now`: the
+    /// seconds left to the reset, at least 1.
+    #[must_use]
+    pub fn retry_after_secs(&self, now: u64) -> u64 {
+        self.reset_epoch_secs.saturating_sub(now).max(1)
+    }
+}
+
+/// `Retry-After` for a wait: whole seconds, rounded up, at least 1. Every
+/// `429` names one (the admin UI's limits included).
+#[must_use]
+pub fn retry_after_secs(wait: Duration) -> u64 {
+    (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1)
+}
+
+/// `Retry-After` for a `governor` refusal, measured now.
+#[must_use]
+pub fn retry_after_of(not_until: &governor::NotUntil<<DefaultClock as Clock>::Instant>) -> u64 {
+    retry_after_secs(not_until.wait_time_from(DefaultClock::default().now()))
+}
+
 /// All buckets. Cheap to clone.
 #[derive(Clone)]
 pub struct RateLimits {
@@ -528,6 +551,15 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn retry_after_rounds_up_and_is_at_least_one() {
+        assert_eq!(retry_after_secs(Duration::ZERO), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_secs(Duration::from_secs(1)), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1001)), 2);
+        assert_eq!(retry_after_secs(Duration::from_secs(12)), 12);
+    }
 
     #[test]
     fn per_ip_and_per_did_buckets_are_independent() {

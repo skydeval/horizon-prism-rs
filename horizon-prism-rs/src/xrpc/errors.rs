@@ -2,6 +2,8 @@
 //! with the lexicon error names. `app.bsky.*` endpoints follow their
 //! lexicons' public semantics; none reveals private-tier facts.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use axum::Json;
 use axum::http::header::RETRY_AFTER;
 use axum::http::{HeaderValue, StatusCode};
@@ -88,14 +90,17 @@ impl From<AuthError> for XrpcError {
     }
 }
 
+/// Every limiter's refusal: `ratelimit-reset` (epoch seconds) and
+/// `Retry-After` (the seconds left to it, at least 1).
 impl From<Limited> for XrpcError {
     fn from(l: Limited) -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             error: "RateLimitExceeded",
             message: "Rate Limit Exceeded".into(),
             reset: Some(l.reset_epoch_secs),
-            retry_after: None,
+            retry_after: Some(l.retry_after_secs(now)),
             not_ready: false,
         }
     }
@@ -140,6 +145,20 @@ impl From<sqlx::Error> for XrpcError {
     }
 }
 
+/// Test check for a limiter's `429`: `Retry-After` is at least 1 and agrees
+/// with `ratelimit-reset` (a retry after it is no earlier than the reset,
+/// and it is no longer than the reset plus the test's own elapsed time).
+#[cfg(test)]
+pub(crate) fn assert_retry_after(retry_after: Option<&str>, reset: Option<&str>) {
+    let retry: u64 = retry_after.expect("Retry-After").parse().expect("delta-seconds");
+    let reset: u64 = reset.expect("ratelimit-reset").parse().expect("epoch seconds");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("time").as_secs();
+    let left = reset.saturating_sub(now);
+    assert!(retry >= 1, "Retry-After {retry}");
+    assert!(retry >= left, "Retry-After {retry} ends before ratelimit-reset {reset} (now {now})");
+    assert!(retry <= left.max(1) + 2, "Retry-After {retry} is past ratelimit-reset {reset} (now {now})");
+}
+
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
         let mut response = (self.status, Json(json!({ "error": self.error, "message": self.message }))).into_response();
@@ -155,5 +174,42 @@ impl IntoResponse for XrpcError {
             response.extensions_mut().insert(NotReadyHint);
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::xrpc::pools::Pool;
+
+    fn headers(e: XrpcError) -> (Option<String>, Option<String>) {
+        let r = e.into_response();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        let get = |name: &str| r.headers().get(name).map(|v| v.to_str().expect("ascii").to_string());
+        (get("retry-after"), get("ratelimit-reset"))
+    }
+
+    /// Every limiter's 429 names `Retry-After`, the seconds left to its
+    /// `ratelimit-reset`, at least 1.
+    #[test]
+    fn a_limiters_429_carries_retry_after_from_its_reset() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("time").as_secs();
+        let limited = Limited { reset_epoch_secs: now + 7 };
+        assert_eq!(limited.retry_after_secs(now), 7);
+        let (retry, reset) = headers(limited.into());
+        assert_retry_after(retry.as_deref(), reset.as_deref());
+        // A reset already reached, or this very second: still at least 1.
+        assert_eq!(Limited { reset_epoch_secs: now - 3 }.retry_after_secs(now), 1);
+        assert_eq!(Limited { reset_epoch_secs: now }.retry_after_secs(now), 1);
+        let (retry, _) = headers(Limited { reset_epoch_secs: now.saturating_sub(3) }.into());
+        assert_eq!(retry.as_deref(), Some("1"));
+        // A spent share or pool (the auth path, an upstream budget, the
+        // backstop's per-member ceiling) goes through the same conversion.
+        let exhausted = Exhausted { pool: Pool::Member, retry_after: Duration::from_millis(2500) };
+        let (retry, reset) = headers(exhausted.into());
+        assert_retry_after(retry.as_deref(), reset.as_deref());
+        assert!(matches!(retry.as_deref(), Some("2" | "3" | "4")), "{retry:?}");
     }
 }

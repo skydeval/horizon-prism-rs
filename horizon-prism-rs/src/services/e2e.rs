@@ -338,7 +338,8 @@ async fn classes_buckets_and_permits() {
     let matches = h.url("app.bsky.contact.getMatches");
     assert_eq!(client.get(&matches).send().await.expect("request").status().as_u16(), 200);
     let r = client.get(&matches).send().await.expect("request");
-    assert!(r.headers().get("ratelimit-reset").is_some());
+    let (_, retry, reset) = limited(&r);
+    crate::xrpc::errors::assert_retry_after(retry.as_deref(), reset.as_deref());
     assert_eq!(error_of(r).await, (429, "RateLimitExceeded".to_string()));
     assert_eq!(h.seen("getMatches").len(), 1);
 
@@ -348,7 +349,8 @@ async fn classes_buckets_and_permits() {
         assert_eq!(client.get(&config).send().await.expect("request").status().as_u16(), 200);
     }
     let r = client.get(&config).send().await.expect("request");
-    assert!(r.headers().get("ratelimit-reset").is_some());
+    let (_, retry, reset) = limited(&r);
+    crate::xrpc::errors::assert_retry_after(retry.as_deref(), reset.as_deref());
     assert_eq!(error_of(r).await, (429, "RateLimitExceeded".to_string()));
     assert_eq!(h.seen("getConfig").len(), 3);
 
@@ -361,6 +363,67 @@ async fn classes_buckets_and_permits() {
     assert_eq!(a.expect("request").status().as_u16(), 200);
     assert_eq!(error_of(b.expect("request")).await, (503, "NotEnoughResources".to_string()));
     assert_eq!(h.seen("wait").len(), 1);
+    h.db.drop_db().await;
+}
+
+/// Status, `Retry-After` and `ratelimit-reset` of one answer.
+fn limited(r: &reqwest::Response) -> (u16, Option<String>, Option<String>) {
+    let get = |name: &str| r.headers().get(name).map(|v| v.to_str().expect("ascii").to_string());
+    (r.status().as_u16(), get("retry-after"), get("ratelimit-reset"))
+}
+
+/// Every 429 names `Retry-After` from its reset: the global backstop's
+/// class and the backstop's per-member verification ceiling (a proxied
+/// service's class: [`classes_buckets_and_permits`]).
+#[tokio::test]
+async fn the_backstops_429s_carry_retry_after() {
+    // The global class: two requests from this address, then 429.
+    let toml = format!("{ROOMY}[rate_limits.global]\nper_sec = 0.001\nburst = 2\n");
+    let Some(h) = start("backstop_retry_after", &toml, None).await else {
+        return;
+    };
+    let client = reqwest::Client::new();
+    let matches = h.url("app.bsky.contact.getMatches");
+    for _ in 0..2 {
+        assert_eq!(client.get(&matches).send().await.expect("request").status().as_u16(), 200);
+    }
+    let r = client.get(&matches).send().await.expect("request");
+    let (status, retry, reset) = limited(&r);
+    assert_eq!(status, 429);
+    crate::xrpc::errors::assert_retry_after(retry.as_deref(), reset.as_deref());
+    assert_eq!(error_of(r).await, (429, "RateLimitExceeded".to_string()));
+    h.db.drop_db().await;
+
+    // The per-member verification ceiling: one verification, then 429
+    // before any verification, charged to neither key.
+    let toml = concat!(
+        "[auth]\nmember_verify_rate_per_sec = 0.001\nmember_verify_burst = 1\n",
+        "[services.contact]\nstate = \"proxy\"\nproxy_url = \"{target}\"\nallow_private_network = true\n",
+    );
+    let key = signing_key(5);
+    let compressed = key.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+    let doc = json!({"id": MEMBER, "verificationMethod": [{
+        "id": format!("{MEMBER}#atproto"), "type": "Multikey", "controller": MEMBER,
+        "publicKeyMultibase": multikey(&compressed),
+    }]});
+    let cfg = FileConfig::parse(toml.replace("{target}", "http://127.0.0.1:1").as_str()).expect("parse");
+    let backstop = Backstop {
+        limits: VerifyLimits::from_config(&cfg.auth),
+        keys: MemberKeys::default(),
+    };
+    backstop.keys.insert(MEMBER, &doc, chrono::Utc::now());
+    let Some(h) = start("backstop_member_retry_after", toml, Some(backstop)).await else {
+        return;
+    };
+    let token = bearer(5, MEMBER, &aud(), "app.bsky.contact.getMatches");
+    let matches = h.url("app.bsky.contact.getMatches");
+    let r = client.get(&matches).header("authorization", &token).send().await.expect("request");
+    assert_eq!(r.status().as_u16(), 200);
+    let r = client.get(&matches).header("authorization", &token).send().await.expect("request");
+    let (status, retry, reset) = limited(&r);
+    assert_eq!(status, 429);
+    crate::xrpc::errors::assert_retry_after(retry.as_deref(), reset.as_deref());
+    assert_eq!(h.seen("getMatches").len(), 1, "the refused call was not forwarded");
     h.db.drop_db().await;
 }
 

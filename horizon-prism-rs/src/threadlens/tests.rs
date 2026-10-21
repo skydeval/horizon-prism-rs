@@ -171,6 +171,37 @@ fn state(h: Hydrator, l: Ladder, access: ThreadLensAccess) -> ThreadLensState {
     }
 }
 
+/// The Thread Lens class's 429 names `Retry-After` from its reset. The
+/// class is charged after the token verifies and before any database read.
+#[tokio::test]
+async fn the_thread_lens_429_carries_retry_after() {
+    let pool = PgPool::connect_lazy("postgres://nobody@127.0.0.1:1/none").expect("lazy pool");
+    let calls = Arc::new(Calls::default());
+    let base = fake_upstream(Arc::clone(&calls), None).await;
+    let h = hydrator(&pool, ScopeSets::default());
+    let l = ladder(h.clone(), &base, Arc::new(StubLookup::default()));
+    let mut s = state(h, l, ThreadLensAccess::SignedIn);
+    s.app.limits = RateLimits::from_config(&crate::config::RateLimitsConfig {
+        thread_lens: crate::config::RateClassConfig::new(0.001, 1),
+        ..crate::config::RateLimitsConfig::default()
+    });
+    let url = serve(s).await;
+    let token = mint(&signing_key(3), VIEWER_A, &format!("did:web:{AUDIENCE_HOST}"), Some(RESOLVE));
+    let send = || {
+        reqwest::Client::new()
+            .post(format!("{url}/xrpc/{RESOLVE}"))
+            .header("authorization", format!("Bearer {token}"))
+            .json(&json!({"uris": [PRIVATE]}))
+            .send()
+    };
+    // The one token is taken; the database read after it fails here.
+    assert_ne!(send().await.expect("request").status().as_u16(), 429);
+    let r = send().await.expect("request");
+    assert_eq!(r.status().as_u16(), 429);
+    let get = |name: &str| r.headers().get(name).map(|v| v.to_str().expect("ascii").to_string());
+    crate::xrpc::errors::assert_retry_after(get("retry-after").as_deref(), get("ratelimit-reset").as_deref());
+}
+
 async fn call(base: &str, method: &str, caller: &str, key: u8, body: &Value) -> (u16, String) {
     let token = mint(&signing_key(key), caller, &format!("did:web:{AUDIENCE_HOST}"), Some(method));
     let r = reqwest::Client::new()

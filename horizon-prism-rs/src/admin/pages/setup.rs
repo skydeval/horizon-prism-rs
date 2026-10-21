@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use super::login::{continue_to, resolve_input, start_flow};
 use super::{css, not_found, render};
-use crate::admin::auth::{ct_eq, origin_ok, presession_cookie, presession_ok, random_token, request_ip};
+use crate::admin::auth::{ct_eq, origin_ok, presession_cookie, presession_ok, random_token, request_ip, with_retry_after};
 use crate::admin::{AdminState, setup_code};
 
 #[derive(Template)]
@@ -93,8 +93,9 @@ pub async fn submit(
         let ip = request_ip(&state, &headers, peer);
         metrics::counter!("admin_setup_attempts_total", "outcome" => "wrong_code").increment(1);
         tracing::debug!(event = "admin_setup_code_failures", client_ip = %ip, "a wrong setup code was entered");
-        if state.limits.wrong_code(ip).await.is_err() {
-            return setup_page(StatusCode::TOO_MANY_REQUESTS, &form.input, Some("Too many wrong codes. Wait a minute and try again.".to_string()));
+        if let Err(retry_after) = state.limits.wrong_code(ip).await {
+            let page = setup_page(StatusCode::TOO_MANY_REQUESTS, &form.input, Some("Too many wrong codes. Wait a minute and try again.".to_string()));
+            return with_retry_after(page, retry_after);
         }
         return setup_page(
             StatusCode::BAD_REQUEST,
