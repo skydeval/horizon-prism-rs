@@ -501,6 +501,10 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     if !(1..=100).contains(&read.max_chain) {
         out.push("private_read.max_chain must be 1 to 100".to_string());
     }
+    // fast-reads design §4.1: at least a minute, at most an hour.
+    if !(60..=3600).contains(&read.membership_valid_for_secs) {
+        out.push("private_read.membership_valid_for_secs must be 60 to 3600".to_string());
+    }
     if read.page_reads_factor == 0 {
         out.push("private_read.page_reads_factor must be greater than 0".to_string());
     }

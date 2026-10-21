@@ -132,6 +132,7 @@ oracle_freshness_bound_secs = 120
 [private_read]
 bind_concurrency = 8
 membership_retry_after_secs = 5
+membership_valid_for_secs = 3600
 max_chain = 16
 page_reads_factor = 2
 walk_batch_max = 1000
@@ -991,6 +992,20 @@ fn zero_values_that_break_runtime_are_rejected() {
         let text = format!("[{section}]\n{key} = 0\n");
         let p = invalid_problems(load(&text));
         assert!(has(&p, &format!("{section}.{key} must be greater than 0")), "{section}.{key}");
+    }
+}
+
+/// T-F5 (fast-reads design §4.1): `membership_valid_for_secs` is 60 to
+/// 3 600, an hour by default.
+#[test]
+fn membership_validity_is_a_minute_to_an_hour() {
+    assert_eq!(load("").expect("defaults").file.private_read.membership_valid_for_secs, 3600);
+    for (secs, valid) in [(0, false), (59, false), (60, true), (600, true), (3600, true), (3601, false)] {
+        let result = load(&format!("[private_read]\nmembership_valid_for_secs = {secs}\n"));
+        assert_eq!(result.is_ok(), valid, "{secs}");
+        if !valid {
+            assert!(has(&invalid_problems(result), "private_read.membership_valid_for_secs must be 60 to 3600"), "{secs}");
+        }
     }
 }
 

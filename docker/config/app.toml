@@ -140,6 +140,11 @@ bind_concurrency = 8
 # Retry-After on a getMembership answer of `indexing`: a polling hint, not an
 # estimate (private posting §4.1).
 membership_retry_after_secs = 5
+# How long a client may act on a getMembership answer of `member` before it
+# asks again (its validForSecs; 60 to 3600). Private reads are authorized on
+# every request whatever this is; it bounds only what a client does on its
+# own, such as offering private compose, after a membership is removed.
+membership_valid_for_secs = 3600
 # Private threads (private-threads design §2.3, §3.2.1, §3.3). A reply's chain
 # of parents is walked at most max_chain stored posts (1 to 100); a reply
 # deeper than that is read by its author only. A paged read (author feed,

@@ -444,6 +444,10 @@ pub struct PrivateReadConfig {
     /// `Retry-After` on a `getMembership` answer of `indexing`: a polling
     /// hint, not an estimate (private posting §4.1).
     pub membership_retry_after_secs: u64,
+    /// How long a client may act on a `getMembership` answer of `member`,
+    /// counted from when it received it (`validForSecs`, fast-reads design
+    /// §4.1). 60 to 3 600. Reads are authorized per request whatever it is.
+    pub membership_valid_for_secs: u64,
     /// The private-threads walk's bound (private-threads design §2.3,
     /// C-T12): a reply's chain of parents is walked at most this many
     /// stored rows. 1 to 100.
@@ -464,6 +468,7 @@ impl Default for PrivateReadConfig {
         Self {
             bind_concurrency: 8,
             membership_retry_after_secs: 5,
+            membership_valid_for_secs: 3600,
             max_chain: 16,
             page_reads_factor: 2,
             walk_batch_max: 1000,

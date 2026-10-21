@@ -242,6 +242,7 @@ impl Fixture {
         let cfg = PrivateReadConfig {
             bind_concurrency: 8,
             membership_retry_after_secs: 5,
+            membership_valid_for_secs: 3600,
             max_chain: read.max_chain,
             page_reads_factor: read.page_reads_factor,
             walk_batch_max: read.walk_batch_max,

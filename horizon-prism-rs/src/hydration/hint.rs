@@ -59,11 +59,18 @@ impl MembershipStatus {
     }
 }
 
-/// The `getMembership` output: the caller's own state and the private
-/// families this build serves. No private fact is in it.
+/// The `getMembership` output: the caller's own state, the families this
+/// build serves, the caller's `permissions` and how long the client may act
+/// on the answer (`validForSecs`, fast-reads design §4.1). No private fact
+/// is in it.
 #[must_use]
-pub fn membership(status: MembershipStatus, features: &[&str]) -> PublicEmit<Value> {
-    PublicEmit::new(json!({ "status": status.as_str(), "features": features }))
+pub fn membership(status: MembershipStatus, features: &[&str], permissions: Value, valid_for_secs: u64) -> PublicEmit<Value> {
+    PublicEmit::new(json!({
+        "status": status.as_str(),
+        "features": features,
+        "permissions": permissions,
+        "validForSecs": valid_for_secs,
+    }))
 }
 
 /// The `resolveDid` output.

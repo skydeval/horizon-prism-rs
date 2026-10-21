@@ -15,6 +15,16 @@
           "type": "object",
           "required": ["status", "features"],
           "properties": {
+            "validForSecs": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "How long the client may act on this answer, in seconds, counted from when it received it (never compared with the device clock). 'member': this AppView's setting, an hour by default; 'indexing': the Retry-After value, so the client polls as before; 'notEligible': no longer than a refusal is remembered. Ask again at once after NotEnrolled or NotReady from any private or Thread Lens read, a 401 a fresh token does not cure, a 501 on a method features said was served, an account switch or sign-in. Private reads are authorized on every request whatever this says. The response carries Cache-Control: private, no-store; the validity is this field, never an HTTP cache. Present in every answer of this version."
+            },
+            "permissions": {
+              "type": "ref",
+              "ref": "#permissions",
+              "description": "This AppView's answer for the requester, so a client need not derive it from status and features. Present in every answer of this version."
+            },
             "status": {
               "type": "string",
               "description": "'member': a ready member; the private read methods serve the requester. 'indexing': enrolled, and the account's initial indexing is still running; the response carries a Retry-After header, a polling hint rather than an estimate. 'notEligible': not enrolled now. It means \"not now\", not \"never\": a refusal is remembered for up to an hour (for example while the requester's PDS is unreachable, or while this AppView is full), and the requester may ask again on a later session.",
@@ -22,7 +32,7 @@
             },
             "features": {
               "type": "array",
-              "description": "The feature families this AppView serves, whatever the requester's status, read when the call is answered, so a change of this AppView's settings shows on the next call. The private-tier values ('private' and 'private.*') are present only while the private tier is enabled. Known values: 'threadLens' (app.nearhorizon.threadLens.getThread and resolve are served; listed whether or not the AppView can bridge, which each Thread Lens response reports in its own 'bridging'); 'threadLens.signedIn' (listed with 'threadLens' when Thread Lens serves every signed-in account, a requester that is not a ready member with viewer.blockedBy and viewer.muted false only; without it Thread Lens serves ready members only and refuses anyone else NotEnrolled or NotReady); 'private' (the app.nearhorizon.private read methods); 'private.embeds' (facets, embeds, langs, labels and audience on private post views); 'private.bookmarks' (the app.nearhorizon.private bookmark methods and viewer.bookmarked); 'private.gates' (threadgates and postgates on private posts: threadgate on a thread root, viewer.replyDisabled, hidden replies, viewer.embeddingDisabled and detached quotes); 'private.interactions' (counts and viewer state on private post views, getLikes, getRepostedBy, getQuotes, repost items and thread mutes of private roots); 'private.notifications' (the app.nearhorizon.private notification methods: listNotifications, getUnreadCount, updateSeen); 'private.freshIndex' (app.nearhorizon.index.requestRecord answers caughtUp, and with caughtUp true the caller's private posts read at once); 'private.paging' (sealed cursors on getAuthorFeed, getTimeline and getReplies that page past posts the requester cannot read, so a short or empty page can carry a cursor; the filter parameter of getAuthorFeed; app.nearhorizon.private.getReplies); 'private.crossPdsReplies' (replies under another account's audience are served when anchored to that account's post in the thread, on any PDS); 'private.following' (the `following` audience mode: read by the accounts its owner follows, once the AppView has compared those follows with the owner's repository); 'private.search' (app.nearhorizon.private.searchPosts, a scan at query time over the recent private posts the requester may read); 'private.threadAudience' (a reply is read by its thread root's current audience, or its branch root's in a private branch under a public post, while its writer and every writer above it stand under that audience; chains are walked up to this AppView's max_chain posts; a paged read reads at most twice its limit, so a short page can carry a cursor); 'private.mediaFilters' (posts_with_media and posts_with_video on getAuthorFeed); 'private.notificationPreferences' (app.nearhorizon.private.getNotificationPreferences and putNotificationPreferences; listNotifications and getUnreadCount honour them). Later values name further families; a client ignores values it does not know.",
+              "description": "The feature families this AppView serves, whatever the requester's status, read when the call is answered, so a change of this AppView's settings shows on the next call. The private-tier values ('private' and 'private.*') are present only while the private tier is enabled. Known values: 'threadLens' (app.nearhorizon.threadLens.getThread and resolve are served; listed whether or not the AppView can bridge, which each Thread Lens response reports in its own 'bridging'); 'threadLens.signedIn' (listed with 'threadLens' when Thread Lens serves every signed-in account, a requester that is not a ready member with viewer.blockedBy and viewer.muted false only; without it Thread Lens serves ready members only and refuses anyone else NotEnrolled or NotReady); 'private' (the app.nearhorizon.private read methods); 'private.embeds' (facets, embeds, langs, labels and audience on private post views); 'private.bookmarks' (the app.nearhorizon.private bookmark methods and viewer.bookmarked); 'private.gates' (threadgates and postgates on private posts: threadgate on a thread root, viewer.replyDisabled, hidden replies, viewer.embeddingDisabled and detached quotes); 'private.interactions' (counts and viewer state on private post views, getLikes, getRepostedBy, getQuotes, repost items and thread mutes of private roots); 'private.notifications' (the app.nearhorizon.private notification methods: listNotifications, getUnreadCount, updateSeen); 'private.freshIndex' (app.nearhorizon.index.requestRecord answers caughtUp, and with caughtUp true the caller's private posts read at once); 'private.paging' (sealed cursors on getAuthorFeed, getTimeline and getReplies that page past posts the requester cannot read, so a short or empty page can carry a cursor; the filter parameter of getAuthorFeed; app.nearhorizon.private.getReplies); 'private.crossPdsReplies' (replies under another account's audience are served when anchored to that account's post in the thread, on any PDS); 'private.following' (the `following` audience mode: read by the accounts its owner follows, once the AppView has compared those follows with the owner's repository); 'private.search' (app.nearhorizon.private.searchPosts, a scan at query time over the recent private posts the requester may read); 'private.threadAudience' (a reply is read by its thread root's current audience, or its branch root's in a private branch under a public post, while its writer and every writer above it stand under that audience; chains are walked up to this AppView's max_chain posts; a paged read reads at most twice its limit, so a short page can carry a cursor); 'private.mediaFilters' (posts_with_media and posts_with_video on getAuthorFeed); 'private.notificationPreferences' (app.nearhorizon.private.getNotificationPreferences and putNotificationPreferences; listNotifications and getUnreadCount honour them); 'private.anyPds' (private posts from any PDS are served, and a private post without encodedContent is served to no reader, its author included: encode in the client). Later values name further families; a client ignores values it does not know.",
               "items": { "type": "string" }
             }
           }
@@ -34,6 +44,24 @@
           "description": "This AppView's hourly enrolment limit is reached. The response carries Retry-After; ask again after it."
         }
       ]
+    },
+    "permissions": {
+      "type": "object",
+      "required": ["privateRead", "privateIndexed", "threadLens"],
+      "properties": {
+        "privateRead": {
+          "type": "boolean",
+          "description": "The private read methods serve the requester now: a ready member, while the private tier is enabled."
+        },
+        "privateIndexed": {
+          "type": "boolean",
+          "description": "Private posts the requester writes are indexed by this AppView and served once its indexing is ready: a member, ready or not, while the private tier is enabled. When false, do not offer private posting against this AppView: such posts would be written and never served. It does not say every record is served: while features lists 'private.anyPds', a post without encodedContent is served to no reader, its author included, so the client encodes its private posts."
+        },
+        "threadLens": {
+          "type": "boolean",
+          "description": "Thread Lens serves the requester: a ready member, or any signed-in account while features lists 'threadLens.signedIn'."
+        }
+      }
     }
   }
 }

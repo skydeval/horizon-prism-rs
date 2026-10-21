@@ -10,6 +10,26 @@ commit.
 
 ## [Unreleased]
 
+### Added (fast reads F-D: getMembership validity and permissions, #803)
+
+- `app.nearhorizon.actor.getMembership` answers two more fields
+  (additive): `validForSecs`, how long the client may act on the answer
+  from when it received it (`member`: the new
+  `private_read.membership_valid_for_secs`, default 3 600, 60 to 3 600,
+  refused at load outside that; `indexing`: the `Retry-After` value;
+  `notEligible`: at most `community.enroll_refusal_cache_secs`), and
+  `permissions {privateRead, privateIndexed, threadLens}`: `privateRead` a
+  ready member with the private tier on; `privateIndexed` a member, ready
+  or not, with the private tier on (while `private.anyPds` is listed the
+  client must still encode: a post without `encodedContent` is served to
+  no one); `threadLens` a ready member, or anyone signed in while
+  `threadLens.signedIn` is listed.
+- Every `getMembership` answer carries `Cache-Control: private, no-store`.
+  Private reads are still authorized per request; the validity bounds only
+  what a client does on its own.
+- `private_read.membership_valid_for_secs` is in `docker/config/app.toml`
+  and is a restart key on the admin UI's "Private posts" page.
+
 ### Changed (fast reads F-C, reduced: one statement per head, #802)
 
 - A private read's repo-head check reads the stored head and

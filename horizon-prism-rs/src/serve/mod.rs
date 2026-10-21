@@ -852,7 +852,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
         did_document: Arc::new(glue.service_key.did_document()),
         membership: crate::xrpc::handlers::membership::MembershipSettings::new(private.as_ref(), &cfg.file.private_read)
             .with_live(live.clone())
-            .with_any_pds(cfg.file.private_any_pds.enabled),
+            .with_any_pds(cfg.file.private_any_pds.enabled)
+            .with_refusal_cache(cfg.file.community.enroll_refusal_cache_secs),
     };
     let private_state = PrivateState::new(
         app.clone(),
