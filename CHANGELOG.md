@@ -10,6 +10,16 @@ commit.
 
 ## [Unreleased]
 
+### Changed (kryphocron 0.4.3, #794)
+
+- `kryphocron` moves from 0.4.2 to 0.4.3 (private-encode design E0). No
+  API change: laquna now draws a fresh 32-byte slug for every encode, so
+  two encodings of the same post never share a keystream (an edit, a
+  rotation, a delete and re-create at the same rkey). Decoding is
+  unchanged, and records encoded before decode as before. Required before
+  the encoder (`encodePost`) ships. `Cargo.lock` changes kryphocron only;
+  no test compared encoded bytes.
+
 ### Added (Thread Lens: which of the caller's lists blocks an author, #792)
 
 - A `blocked-by-you` gap whose block comes through one of the caller's own
