@@ -5028,6 +5028,24 @@ async fn b5_search_floor_on_a_seeded_week() {
             items.iter().min(),
             items.iter().max()
         );
+        // The same page at B-5's concurrency of 8 (#720, H-10): 200
+        // requests on the same server, heads refreshed first.
+        exec(&f.pool, "UPDATE sync_state SET head_checked_at = now()").await;
+        use futures::StreamExt;
+        let base = &base;
+        let mut c8: Vec<Duration> = futures::stream::iter(0..200)
+            .map(|_| async move { json_of(base, SEARCH, query, BOB).await.2 })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+        c8.sort();
+        println!(
+            "B-5 searchPosts, {name}, concurrency 8: p50 {:?}, p99 {:?}, max {:?} over {} requests",
+            c8[c8.len() / 2],
+            c8[c8.len() * 99 / 100],
+            c8[c8.len() - 1],
+            c8.len()
+        );
     }
     db.drop_db().await;
 }

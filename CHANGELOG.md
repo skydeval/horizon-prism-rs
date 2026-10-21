@@ -21,6 +21,14 @@ No change to what any endpoint returns.
   1 167 ms; the 750 pipeline reads take the rest (about 1.4 ms each at
   `bind_concurrency` 8). A cap on the expansion's reads is waiting on a
   choice by skydeval, since it changes which replies a thread can show.
+- **H-10, `searchPosts` pages that match nothing (#779).**
+  `b5_search_floor_on_a_seeded_week` now also runs each page at
+  concurrency 8. On a release build, a page that matches nothing (300 reads)
+  takes 622 ms alone and 2.17 s p50, 2.47 s p99 at concurrency 8; a full
+  page of 100, 289 ms alone and 1.22 s p99. Floors are 0 by default, so
+  nothing waits on the old 1 500 ms floor; the cost is recorded and
+  accepted. An operator who needs it lower sets `private_search.span_hours`
+  or `scan_candidates`.
 
 ### Added (private notification preferences, S1, #775, #777)
 
