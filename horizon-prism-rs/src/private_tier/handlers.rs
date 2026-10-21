@@ -168,6 +168,7 @@ impl PrivateState {
                 freshness_bound,
                 max_head_fetches,
                 max_chain: cfg.max_chain,
+                plaintext_refused: crate::config::PrivateAnyPdsConfig::default().enabled,
             },
             floors: Floors {
                 get_posts: Duration::from_millis(cfg.floor_ms.get_posts),
@@ -197,6 +198,15 @@ impl PrivateState {
     #[must_use]
     pub(crate) fn with_search(mut self, cfg: &PrivateSearchConfig) -> Self {
         self.search = SearchBounds::from(cfg);
+        self
+    }
+
+    /// S4 (private-encode design §7.1): while `refused`
+    /// (`private_any_pds.enabled`), a plaintext private post is a uniform
+    /// miss for every reader. On by default, as the config.
+    #[must_use]
+    pub(crate) fn with_plaintext_refused(mut self, refused: bool) -> Self {
+        self.env.plaintext_refused = refused;
         self
     }
 }

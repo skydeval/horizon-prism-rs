@@ -189,6 +189,13 @@ scan_candidates = 300
 span_hours = 168
 max_age_days = 365
 
+# Private posts from any PDS (private-encode design §7, S4). While enabled,
+# getMembership lists `private.anyPds` and a private post with no encoded
+# content (plaintext) is a miss for every reader, its author included; the
+# row is kept, so turning this off serves it again. Restart to apply.
+[private_any_pds]
+enabled = true
+
 # Repo-head check for tracked DIDs (design §6.11.3). head_max_age_secs is at
 # most 600; a larger value refuses to start.
 [sync]

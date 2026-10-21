@@ -553,9 +553,15 @@ async fn te5_te6_hostile_payloads_and_the_input_cap() {
     assert_eq!(read(y_acute).await["record"]["text"], "ÿes");
     // Six new-form posts (two of them decoded twice: Bob's miss and the
     // author's read) and two old-form; the plaintext post decodes nothing
-    // and is not counted.
+    // and is not counted. Since private-encode E4 it is refused (S4, on by
+    // default): a miss, outcome `plaintext`; with the switch off, served.
     assert_eq!(content_forms(&handle), (forms.0 + 2.0, forms.1 + 8.0));
-    assert_eq!(read(plain).await["record"]["text"], "plain");
+    let refused = || crate::test_support::series(&handle.render(), pipeline::METRIC_OUTCOMES, &["outcome=\"plaintext\""]).unwrap_or(0.0);
+    let before = refused();
+    assert!(one_post(&base, BOB, &plain).await.1.is_null());
+    assert_eq!(refused(), before + 1.0);
+    let lenient = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO).with_plaintext_refused(false)).await;
+    assert_eq!(one_post(&lenient, BOB, &plain).await.1["record"]["text"], "plain");
     assert_eq!(content_forms(&handle), (forms.0 + 2.0, forms.1 + 8.0));
     db.drop_db().await;
 }

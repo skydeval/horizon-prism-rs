@@ -111,6 +111,10 @@ pub(super) enum Miss {
     /// does not carry, for a reader other than the author (private-encode
     /// design §6.3).
     IndexMismatch,
+    /// A private post with no encoded content while plaintext is refused
+    /// (S4, private-encode design §7.1), for every reader, its author
+    /// included.
+    Plaintext,
     Db,
 }
 
@@ -133,6 +137,7 @@ impl Miss {
             Self::NotUtf8 => "not_utf8",
             Self::BadContent => "bad_content",
             Self::IndexMismatch => "index_mismatch",
+            Self::Plaintext => "plaintext",
             Self::Db => "db_error",
         }
     }
@@ -158,6 +163,9 @@ pub(super) struct PipelineEnv {
     pub max_head_fetches: usize,
     /// `private_read.max_chain`: the walk's cap (private-threads §2.3).
     pub max_chain: u32,
+    /// `private_any_pds.enabled` (private-encode design §7, S4): a private
+    /// post with no encoded content is a uniform miss for every reader.
+    pub plaintext_refused: bool,
 }
 
 impl PipelineEnv {
@@ -493,6 +501,10 @@ async fn read_inner(
             metrics::counter!(METRIC_CONTENT, "form" => restored.form()).increment(1);
             restored
         }
+        // S4 (private-encode design §7.1): plaintext is refused while
+        // `private_any_pds.enabled`, from any host, the author included. The
+        // row is kept, and served again if the switch is turned off.
+        None if env.plaintext_refused => return Err(Miss::Plaintext),
         None => Restored::Text(row.plaintext_text.take().ok_or(Miss::Malformed)?),
     };
 

@@ -17,6 +17,8 @@ mod embeds;
 mod index_check;
 // The admin UI's live feed shows no private content (T-F4).
 mod live_feed;
+// S4, plaintext refused while `private_any_pds.enabled` (private-encode E4).
+mod plaintext;
 // Media kinds and the media filters on the author feed (P-30).
 mod media;
 // Private blocks only with a member side (member-blocks-only design).
@@ -4639,12 +4641,15 @@ impl Fixture {
     }
 
     /// A search server: roomy rate limits (a page costs 5 tokens), fresh
-    /// heads and watermark, `floor`, and `bounds`.
+    /// heads and watermark, `floor`, and `bounds`. Plaintext posts are
+    /// served (S4 off): the paging tests seed hundreds of posts with
+    /// `post_saying(.., false)` to stay fast, and search decides nothing
+    /// about S4 (T-S1 does).
     async fn search_server(&self, floor: Duration, bounds: &PrivateSearchConfig) -> String {
         exec(&self.pool, "UPDATE sync_state SET head_checked_at = now()").await;
         let mut app = self.app.clone();
         app.limits = roomy_limits();
-        serve(self.state_of(app, Some(Duration::from_secs(1)), floor).with_search(bounds)).await
+        serve(self.state_of(app, Some(Duration::from_secs(1)), floor).with_search(bounds).with_plaintext_refused(false)).await
     }
 }
 

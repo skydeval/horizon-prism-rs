@@ -1,6 +1,7 @@
 //! `app.nearhorizon.actor.getMembership` (private posting §4.1, P-10): the
 //! caller's membership, and the feature families this build serves: the
-//! private ones, then Thread Lens's, read per call from the live
+//! private ones (with `private.anyPds` while `private_any_pds.enabled`),
+//! then Thread Lens's, read per call from the live
 //! `threadlens.access` (Thread Lens amendment 1 §0A).
 //!
 //! - Query (GET), authentication required, no parameters.
@@ -30,7 +31,7 @@ use serde_json::Value;
 
 use crate::admin::settings::LiveSettings;
 use crate::aggregations::enroll::{Enrollment, REFUSED_RATE};
-use crate::config::{PrivateReadConfig, ThreadLensAccess};
+use crate::config::{PrivateAnyPdsConfig, PrivateReadConfig, ThreadLensAccess};
 use crate::hydration::PublicEmit;
 use crate::hydration::hint::{MembershipStatus, membership};
 use crate::private_tier::{DisabledPrivateTier, PrivateTier};
@@ -51,11 +52,19 @@ pub const FEATURE_THREAD_LENS: &str = "threadLens";
 /// "signed_in"`), a non-member as a visitor.
 pub const FEATURE_THREAD_LENS_SIGNED_IN: &str = "threadLens.signedIn";
 
+/// Private posts from any PDS are fully served, and a plaintext one is
+/// refused (private-encode design §7, S4): listed after the private tier's
+/// own values while `private_any_pds.enabled`.
+pub const FEATURE_ANY_PDS: &str = "private.anyPds";
+
 /// What `getMembership` answers with besides the caller's state.
 #[derive(Debug, Clone)]
 pub struct MembershipSettings {
     /// [`PrivateTier::features`]: none when the private tier is disabled.
     pub private_features: &'static [&'static str],
+    /// `private_any_pds.enabled`: [`FEATURE_ANY_PDS`] is listed, with the
+    /// private values.
+    pub any_pds: bool,
     /// `private_read.membership_retry_after_secs`.
     pub retry_after_secs: u64,
     /// The live settings, read on every call for `threadlens.access`.
@@ -69,6 +78,7 @@ impl MembershipSettings {
     pub fn new(private: &dyn PrivateTier, cfg: &PrivateReadConfig) -> Self {
         Self {
             private_features: private.features(),
+            any_pds: PrivateAnyPdsConfig::default().enabled,
             retry_after_secs: cfg.membership_retry_after_secs,
             live: LiveSettings::default(),
         }
@@ -80,11 +90,22 @@ impl MembershipSettings {
         self
     }
 
-    /// `features` as of this call: the private values, then Thread Lens's,
-    /// from the live `threadlens.access`.
+    /// `private_any_pds.enabled` from the config.
+    #[must_use]
+    pub fn with_any_pds(mut self, enabled: bool) -> Self {
+        self.any_pds = enabled;
+        self
+    }
+
+    /// `features` as of this call: the private values (with
+    /// [`FEATURE_ANY_PDS`] last while it is on), then Thread Lens's, from
+    /// the live `threadlens.access`.
     #[must_use]
     pub fn features(&self) -> Vec<&'static str> {
         let mut out = self.private_features.to_vec();
+        if self.any_pds && !self.private_features.is_empty() {
+            out.push(FEATURE_ANY_PDS);
+        }
         out.push(FEATURE_THREAD_LENS);
         if self.live.load().threadlens_access == ThreadLensAccess::SignedIn {
             out.push(FEATURE_THREAD_LENS_SIGNED_IN);
@@ -233,7 +254,9 @@ mod tests {
         let aud = format!("did:web:{AUDIENCE_HOST}");
         let token = |i: u8, did: &str| mint(&signing_key(i + 3), did, &aud, Some(GET_MEMBERSHIP));
         // The private values, then Thread Lens's (amendment 1 §0A).
-        let features = json!(FEATURES.iter().copied().chain([FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN]).collect::<Vec<_>>());
+        // `private.anyPds` follows them while `private_any_pds.enabled`
+        // (private-encode design §7; on by default).
+        let features = json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN]).collect::<Vec<_>>());
         assert_eq!(json!(FEATURES), json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences"]));
         // T-N9 (private notification preferences design §8): the
         // preferences' feature is listed last.
@@ -289,6 +312,21 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// `private.anyPds` is listed, last of the private values, exactly
+    /// while `private_any_pds.enabled` and the private tier serves.
+    #[test]
+    fn any_pds_follows_its_switch() {
+        let on = MembershipSettings::new(&KryphocronPrivateTier, &PrivateReadConfig::default());
+        let mut want: Vec<&str> = FEATURES.to_vec();
+        want.extend([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN]);
+        assert_eq!(on.features(), want);
+        let off = on.with_any_pds(false);
+        assert!(!off.features().contains(&FEATURE_ANY_PDS));
+        assert_eq!(off.features().len(), FEATURES.len() + 2);
+        let disabled = MembershipSettings::default().with_any_pds(true);
+        assert_eq!(disabled.features(), [FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN]);
+    }
+
     /// T-0 (Thread Lens amendment 1 §0A): `features` follows a live change
     /// of `threadlens.access` on a running server, with no restart, with
     /// the private tier enabled and disabled.
@@ -316,7 +354,7 @@ mod tests {
         let disabled_base = serve(disabled).await;
         let client = reqwest::Client::new();
         let token = mint(&signing_key(3), ALICE, &format!("did:web:{AUDIENCE_HOST}"), Some(GET_MEMBERSHIP));
-        let features = |extra: &[&str]| json!(FEATURES.iter().copied().chain(extra.iter().copied()).collect::<Vec<_>>());
+        let features = |extra: &[&str]| json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS]).chain(extra.iter().copied()).collect::<Vec<_>>());
         let both = [FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN];
 
         live.update(|v| v.threadlens_access = ThreadLensAccess::SignedIn);

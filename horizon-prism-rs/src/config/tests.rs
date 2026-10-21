@@ -158,6 +158,9 @@ scan_candidates = 300
 span_hours = 168
 max_age_days = 365
 
+[private_any_pds]
+enabled = true
+
 [sync]
 head_max_age_secs = 60
 max_head_fetches_per_request = 16

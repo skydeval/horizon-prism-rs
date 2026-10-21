@@ -10,6 +10,44 @@ commit.
 
 ## [Unreleased]
 
+### Changed — BEHAVIOUR CHANGE: plaintext private posts are no longer served (S4, #798)
+
+- **While `[private_any_pds] enabled = true` (the default), a
+  `tools.kryphocron.feed.postPrivate` record with no `encodedContent` is a
+  uniform miss for every reader, its author included**, from any host
+  (outcome `plaintext` in `private_read_outcome_total`). Before this
+  change such a post was served from its stored `text`. Ingest is
+  unchanged: the row is kept and counted, so turning the switch off
+  (`[private_any_pds] enabled = false`, then restart) serves it again.
+  The refusal does not cascade: replies under a refused plaintext root
+  stay readable. As with a post that fails decode, `getUnreadCount` and
+  the counts can still count one (the prefilter does not decode).
+- While on, `getMembership.features` lists `private.anyPds` (after
+  `private.notificationPreferences`): private posts from any PDS are
+  fully served, and must be encoded. Horizon encodes on the client and
+  writes to the member's own PDS; a member converts an old plaintext post
+  by encoding its content at the same rkey and rewriting the record.
+- This is private-encode design §7 (S4, slice E4). It was keyed to
+  `private_encode.enabled` / `private.encode` in the design; Prism's
+  encoder (`encodePost`) was withdrawn by skydeval on 2026-10-21 before it
+  was built, so S4 has its own switch and feature.
+- **Before deploying:** count the stored plaintext rows by the author's
+  PDS (they go dark): `SELECT a.pds_endpoint, count(*) FROM private_posts p
+  LEFT JOIN actors a ON a.did = p.author_did WHERE p.encoded_content IS
+  NULL GROUP BY 1`.
+- Config: `[private_any_pds]` (`deny_unknown_fields`), file-only;
+  `docker/config/app.toml` gains it. Startup logs `private_any_pds` with
+  the value. Tests: T-S1 (author and audience miss, a reply under it
+  reads, the row kept; off, served), T-S2 (a converted post is served);
+  `getMembership`'s feature list on and off; and Horizon's PQ-16: with the
+  switch on, `private.anyPds` is listed and plaintext is refused, an
+  over-claim misses for others and `droppedFields` is set; off, the
+  feature is not listed and plaintext is served, while the clear-field
+  check and `droppedFields` still apply (they never depend on the
+  switch).
+- Search's paging tests serve plaintext fixtures with S4 off, and T-E5
+  now expects its plaintext post to be refused (served with S4 off).
+
 ### Changed (private reads: one row snapshot, clear fields checked at read, the author's `droppedFields`, #796)
 
 - **One statement for the row** (private-encode design E2, §6.1): steps

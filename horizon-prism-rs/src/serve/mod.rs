@@ -842,7 +842,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
         ),
         trusted_proxy: cfg.file.http.trusted_proxy,
         did_document: Arc::new(glue.service_key.did_document()),
-        membership: crate::xrpc::handlers::membership::MembershipSettings::new(private.as_ref(), &cfg.file.private_read).with_live(live.clone()),
+        membership: crate::xrpc::handlers::membership::MembershipSettings::new(private.as_ref(), &cfg.file.private_read)
+            .with_live(live.clone())
+            .with_any_pds(cfg.file.private_any_pds.enabled),
     };
     let private_state = PrivateState::new(
         app.clone(),
@@ -855,8 +857,14 @@ pub async fn run() -> Result<Stopped, StartupError> {
         // Required and never generated (private posting §3.6, C-14).
         crate::cursor_key::CursorKey::new(cfg.env.private_cursor_key.expose()),
     )
-    .with_search(&cfg.file.private_search);
+    .with_search(&cfg.file.private_search)
+    .with_plaintext_refused(cfg.file.private_any_pds.enabled);
     log_floors(&cfg.file.private_read.floor_ms);
+    tracing::info!(
+        event = "private_any_pds",
+        enabled = cfg.file.private_any_pds.enabled,
+        "private posts from any PDS: plaintext private posts are refused while enabled"
+    );
     // The post-migration task (design-v3 §12.2): every migration is applied
     // and ingest is running, so old rows can be filled and the large
     // indexes built while the app serves.

@@ -531,6 +531,24 @@ impl Default for PrivateNotifyConfig {
     }
 }
 
+/// `[private_any_pds]` (private-encode design §7, S4, re-keyed when
+/// `encodePost` was withdrawn on 2026-10-21): whether private posts from
+/// any PDS are fully served, which means a private post must carry encoded
+/// content. While on, `getMembership` lists `private.anyPds` and a
+/// `postPrivate` with no `encodedContent` is a uniform miss for every
+/// reader, its author included. File-only; a restart applies it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivateAnyPdsConfig {
+    pub enabled: bool,
+}
+
+impl Default for PrivateAnyPdsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// `[private_search]` (private posting §4.17, C-8): the bounded scan of
 /// `private.searchPosts`. No index of decoded text exists; each page reads
 /// at most `scan_candidates` prefilter-passing rows within `span_hours`
@@ -2001,6 +2019,7 @@ pub struct FileConfig {
     pub private_read: PrivateReadConfig,
     pub private_notify: PrivateNotifyConfig,
     pub private_search: PrivateSearchConfig,
+    pub private_any_pds: PrivateAnyPdsConfig,
     pub sync: SyncConfig,
     pub index_request: IndexRequestConfig,
     pub db: DbConfig,
