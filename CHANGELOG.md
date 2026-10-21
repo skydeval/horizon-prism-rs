@@ -10,6 +10,22 @@ commit.
 
 ## [Unreleased]
 
+### Added (private notification preferences, S0: the appearance lexicon, #775, #776)
+
+Private notification preferences design S0
+(`docs/internal/design/private-notification-prefs.md` §11).
+
+- **`lexicons/app/nearhorizon/actor/appearance.json`** defines
+  `app.nearhorizon.actor.appearance`, the account's backdrop, presets and
+  theme settings, so every `app.nearhorizon.*` definition has one home.
+  Definition only: Prism neither indexes nor serves the record; clients read
+  and write it on the account's PDS. Field names, limits and required fields
+  are Horizon's; the description sits on `main`, as in Prism's other
+  lexicons.
+- A test reads the lexicon tree beside the crate: every file parses, is
+  lexicon 1, and its `id` is its path, and every served `app.nearhorizon.*`
+  method has its file. A build tree with the crate alone skips it.
+
 ### Changed (private embeds, S3: the codec's decode bound, #746)
 
 Private-embeds design S3 (`docs/internal/design/private-embeds-504.md` §7,

@@ -1,0 +1,95 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.actor.appearance",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A Horizon account's appearance: backdrop, custom backdrop, presets, and the theme settings that follow the account. Public, one per account, in the account's own repo. Every field but version and updatedAt is optional; a reader keeps its own setting for a field the account never set. This AppView neither indexes nor serves this record; clients read and write it on the account's PDS.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": ["version", "updatedAt"],
+        "properties": {
+          "version": { "type": "integer", "minimum": 1 },
+          "backdrop": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "The chosen backdrop's id, for example 'pride.trans', 'skies.auto' or 'custom'. Ids of removed backdrops may still appear and are migrated by the client."
+          },
+          "custom": { "type": "ref", "ref": "#customBackdrop" },
+          "presets": {
+            "type": "array",
+            "maxLength": 10,
+            "items": { "type": "ref", "ref": "#preset" }
+          },
+          "colorMode": {
+            "type": "string",
+            "maxLength": 32,
+            "knownValues": ["system", "light", "dark"]
+          },
+          "darkTheme": {
+            "type": "string",
+            "maxLength": 32,
+            "knownValues": ["dim", "dark"]
+          },
+          "font": {
+            "type": "string",
+            "maxLength": 32,
+            "knownValues": ["system", "theme"]
+          },
+          "fontSize": {
+            "type": "string",
+            "maxLength": 32,
+            "knownValues": ["smaller", "default", "larger"]
+          },
+          "updatedAt": { "type": "string", "format": "datetime" }
+        }
+      }
+    },
+    "customBackdrop": {
+      "type": "object",
+      "required": ["mode", "a"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "knownValues": ["solid", "twoTone", "stripes"]
+        },
+        "a": {
+          "type": "string",
+          "minLength": 7,
+          "maxLength": 7,
+          "description": "#RRGGBB. The one-tone colour, or the two-tone's top-left."
+        },
+        "b": {
+          "type": "string",
+          "minLength": 7,
+          "maxLength": 7,
+          "description": "#RRGGBB. The two-tone's bottom-right."
+        },
+        "pattern": {
+          "type": "string",
+          "maxLength": 32,
+          "knownValues": ["dots", "grid", "lines"],
+          "description": "A quiet pattern over a one-tone."
+        },
+        "stripes": {
+          "type": "array",
+          "minLength": 2,
+          "maxLength": 8,
+          "items": { "type": "string", "minLength": 7, "maxLength": 7 },
+          "description": "The custom stripes, top to bottom, #RRGGBB. a and b are still written."
+        }
+      }
+    },
+    "preset": {
+      "type": "object",
+      "required": ["slot", "custom", "savedAt"],
+      "properties": {
+        "slot": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "name": { "type": "string", "maxLength": 640, "maxGraphemes": 64 },
+        "custom": { "type": "ref", "ref": "#customBackdrop" },
+        "savedAt": { "type": "string", "format": "datetime" }
+      }
+    }
+  }
+}

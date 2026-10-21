@@ -576,4 +576,46 @@ mod tests {
             "This endpoint is planned for a future release. See https://s.example for status."
         );
     }
+
+    /// Every `.json` file under `dir`, recursively.
+    fn json_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read lexicon dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                json_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "json") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// T-N12 (private notification preferences design §9): every lexicon
+    /// file parses, is lexicon 1, and its `id` is its path; every served
+    /// `app.nearhorizon.*` method has its file. The lexicons sit beside the
+    /// crate; a build tree with the crate alone skips this.
+    #[test]
+    fn lexicon_files_match_their_paths_and_cover_the_served_methods() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lexicons");
+        if !root.is_dir() {
+            eprintln!("{} not found; skipping the lexicon files check", root.display());
+            return;
+        }
+        let mut files = Vec::new();
+        json_files(&root, &mut files);
+        let mut ids = BTreeSet::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read lexicon");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert_eq!(v["lexicon"], 1, "{}", path.display());
+            let rel = path.strip_prefix(&root).expect("under root").with_extension("");
+            let want: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            let want = want.join(".");
+            assert_eq!(v["id"].as_str(), Some(want.as_str()), "{}", path.display());
+            ids.insert(want);
+        }
+        assert!(ids.contains("app.nearhorizon.actor.appearance"));
+        for s in crate::xrpc::rate_limit::SERVED.iter().filter(|s| s.nsid.starts_with("app.nearhorizon.")) {
+            assert!(ids.contains(s.nsid), "{} has no lexicon file", s.nsid);
+        }
+    }
 }
