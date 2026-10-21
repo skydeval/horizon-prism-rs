@@ -10,6 +10,16 @@ commit.
 
 ## [Unreleased]
 
+### Changed (Thread Lens docs: who may call, and `blocked`, #787)
+
+- The `threadLens.defs` lexicon's `blocked` gap reads as the code assigns
+  it: a block the ordinary thread view reported that was not looked past,
+  between other parties or with an author whose blocks with the caller
+  could not be checked; never returned by `resolve`. It said "reported by
+  another server". No change to any response. (The design and the client
+  contract note were updated in the same pass: Thread Lens serves every
+  signed-in account under `threadlens.access = "signed_in"`, the default.)
+
 ### Fixed (Thread Lens: a blocked top gap's `parentUri` at a bound, #786)
 
 - When the parent walk stopped at a bound (`parentHeight`, the page budget,
