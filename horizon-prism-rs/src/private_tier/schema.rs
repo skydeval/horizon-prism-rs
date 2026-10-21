@@ -1,8 +1,9 @@
 //! Private-table queries (design-v2 §3.2, §4.5, §6.3, §6.9), `pub(super)`.
 //!
-//! - **Content** (`encoded`, `plaintext`, `view_meta`, `validation_flags`)
-//!   takes `&RecordAuthz` only and reads only its resource: a witness for one
-//!   record cannot load another. There is no URI parameter.
+//! - **Content** (`snapshot`, one statement for the whole row since
+//!   private-encode E2) takes `&RecordAuthz` only and reads only its
+//!   resource: a witness for one record cannot load another. There is no
+//!   URI parameter.
 //! - **Non-content** queries (oracle facts, candidate prefilters) take DIDs
 //!   and URIs and return no private content.
 
@@ -93,32 +94,6 @@ pub(super) async fn row_authors(pool: &PgPool) -> Result<Vec<String>, sqlx::Erro
     .await
 }
 
-/// Non-content view metadata, behind the witness.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub(super) struct ViewMeta {
-    pub cid: String,
-    pub audience_uri: Option<String>,
-    pub reply_root_uri: Option<String>,
-    pub reply_parent_uri: Option<String>,
-    pub reply_root_cid: Option<String>,
-    pub reply_parent_cid: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub indexed_at: DateTime<Utc>,
-}
-
-/// # Errors
-///
-/// Database errors.
-pub(super) async fn view_meta(pool: &PgPool, rauth: &RecordAuthz) -> Result<Option<ViewMeta>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT p.cid, p.audience_uri, p.reply_root_uri, p.reply_parent_uri, p.reply_root_cid, p.reply_parent_cid, \
-           p.created_at, p.indexed_at FROM private_posts p WHERE p.uri = $1",
-    )
-    .bind(rauth.uri())
-    .fetch_optional(pool)
-    .await
-}
-
 /// The view's audience (P-3, §4.10; private-threads design §2.6): the
 /// governing audience's `(mode, name)` while its row is stored. Never its
 /// members.
@@ -133,85 +108,57 @@ pub(super) async fn audience_view(pool: &PgPool, uri: &str) -> Result<Option<(Op
         .await
 }
 
-/// A post's display fields as stored (private-posting design §3.1): content,
-/// read only behind the witness.
-#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
-pub(super) struct Display {
+/// One version of a private post's row, behind the witness (private-encode
+/// design §6.1): everything steps 10 to 12 read, from one statement, so the
+/// view's `cid` is the CID of the record whose content it shows.
+#[derive(Clone, sqlx::FromRow)]
+pub(super) struct Snapshot {
+    pub has_text: bool,
+    pub has_codec: bool,
+    pub has_generation: bool,
+    /// Content: read only behind the witness.
+    pub encoded_content: Option<Vec<u8>>,
+    pub encoded_codec: Option<String>,
+    pub encoded_generation: Option<String>,
+    /// Content: the old plaintext form.
+    pub plaintext_text: Option<String>,
+    pub cid: String,
+    pub audience_uri: Option<String>,
+    pub reply_root_uri: Option<String>,
+    pub reply_parent_uri: Option<String>,
+    pub reply_root_cid: Option<String>,
+    pub reply_parent_cid: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub indexed_at: DateTime<Utc>,
+    /// The display columns (content).
     pub facets: Option<serde_json::Value>,
     pub embed: Option<serde_json::Value>,
     pub langs: Option<Vec<String>>,
     pub self_labels: Option<serde_json::Value>,
+    /// The index columns (structural facts, §6.2).
+    pub quote_uri: Option<String>,
+    pub mention_dids: Vec<String>,
+    pub media_kinds: i16,
 }
 
-/// `schema::display(&rauth)`: the record's facets, embed, langs and
-/// self-labels.
+/// `schema::snapshot(&rauth)`: the record's row, one version, in one
+/// statement (private-encode design §6.1).
 ///
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn display(pool: &PgPool, rauth: &RecordAuthz) -> Result<Option<Display>, sqlx::Error> {
-    sqlx::query_as("SELECT facets, embed, langs, self_labels FROM private_posts WHERE uri = $1")
-        .bind(rauth.uri())
-        .fetch_optional(pool)
-        .await
-}
-
-/// Field presence for `RecordValidation::post_private` (§6.3 step 10):
-/// `(has_text, has_encoded_content, has_codec, has_generation)`.
-///
-/// # Errors
-///
-/// Database errors.
-pub(super) async fn validation_flags(
-    pool: &PgPool,
-    rauth: &RecordAuthz,
-) -> Result<Option<(bool, bool, bool, bool)>, sqlx::Error> {
+pub(super) async fn snapshot(pool: &PgPool, rauth: &RecordAuthz) -> Result<Option<Snapshot>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT plaintext_text IS NOT NULL, encoded_content IS NOT NULL, \
-           encoded_codec IS NOT NULL, encoded_generation IS NOT NULL \
-         FROM private_posts WHERE uri = $1",
+        "SELECT p.plaintext_text IS NOT NULL AS has_text, p.encoded_codec IS NOT NULL AS has_codec, \
+           p.encoded_generation IS NOT NULL AS has_generation, p.encoded_content, p.encoded_codec, \
+           p.encoded_generation, p.plaintext_text, p.cid, p.audience_uri, p.reply_root_uri, p.reply_parent_uri, \
+           p.reply_root_cid, p.reply_parent_cid, p.created_at, p.indexed_at, p.facets, p.embed, p.langs, \
+           p.self_labels, p.quote_uri, p.mention_dids, p.media_kinds \
+         FROM private_posts p WHERE p.uri = $1",
     )
     .bind(rauth.uri())
     .fetch_optional(pool)
     .await
-}
-
-/// Encoded content as stored (§4.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct EncodedRow {
-    pub content: Vec<u8>,
-    pub codec: Option<String>,
-    pub generation: Option<String>,
-}
-
-/// `schema::encoded(&rauth)`: the record's encoded content, if it has any.
-///
-/// # Errors
-///
-/// Database errors.
-pub(super) async fn encoded(pool: &PgPool, rauth: &RecordAuthz) -> Result<Option<EncodedRow>, sqlx::Error> {
-    type Row = (Option<Vec<u8>>, Option<String>, Option<String>);
-    let row: Option<Row> = sqlx::query_as(
-        "SELECT encoded_content, encoded_codec, encoded_generation FROM private_posts WHERE uri = $1",
-    )
-    .bind(rauth.uri())
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.and_then(|(content, codec, generation)| content.map(|content| EncodedRow { content, codec, generation })))
-}
-
-/// `schema::plaintext(&rauth)`: `plaintext_text` where the lexicon's XOR rule
-/// allowed plaintext.
-///
-/// # Errors
-///
-/// Database errors.
-pub(super) async fn plaintext(pool: &PgPool, rauth: &RecordAuthz) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<String>>("SELECT plaintext_text FROM private_posts WHERE uri = $1")
-        .bind(rauth.uri())
-        .fetch_optional(pool)
-        .await
-        .map(Option::flatten)
 }
 
 /// A block in either direction between `x` and `y` (SQL expressions), over

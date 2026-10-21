@@ -10,6 +10,44 @@ commit.
 
 ## [Unreleased]
 
+### Changed (private reads: one row snapshot, clear fields checked at read, the author's `droppedFields`, #796)
+
+- **One statement for the row** (private-encode design E2, §6.1): steps
+  10–12 of the private read take the row in one statement
+  (`schema::snapshot`) instead of five, so a view's `cid` is always the
+  CID of the record whose content it shows; an ingest upsert landing
+  mid-read can no longer pair one version's content with another's `cid`.
+- **Clear fields checked at read** (§6.2, §6.3, choice E-C1). After
+  decoding, the facts a correct encoder writes for what the writer
+  encoded (from the payload's raw `facets` and `embed`, even when the read
+  leaves them out, else the stored clear columns) are compared with the
+  row's indexed `quote_uri`, `mention_dids` and `media_kinds`.
+  **Behaviour change:** a post whose clear `quote`, `mentionDids` or
+  `mediaKinds` claims something its content does not carry (an
+  over-claim) is now a uniform miss, outcome `index_mismatch`, for every
+  reader but its author, who still reads it (and can rewrite it). So
+  notifications, quote listings and media-filter listings that such a
+  post earned at ingest are no longer shown. An under-claim (a field
+  missing, as on older PDS records) is served. Ingest still never
+  decodes. Counted: `private_read_index_check_total{field, result}`.
+  Residual, as for a post that fails decode: `getUnreadCount` and
+  `quoteCount` count with the prefilter and can still count one.
+- **`droppedFields`** (§8.4, choice E-C10): the author's own
+  `privatePostView` lists `facets` and/or `embed` when the read left that
+  part of the encoded content out (the wrong type, or over 64 KiB), so a
+  client re-encoding from the view knows it would lose it. Never set for
+  any other reader, never on a quoted post's view. Lexicon:
+  `privatePostView.droppedFields`.
+- Tests: T-P4 (over-claims of each field miss for others and hit for the
+  author, with the notification written but not listed and the quote not
+  listed; under-claims served; honest posts match, oversized honest fields
+  included; a wrong-typed or oversized field cannot switch the check
+  off), T-P5 (the `getUnreadCount` and `quoteCount` residuals asserted as
+  they are), T-P6 (an upsert after the snapshot changes neither `cid` nor
+  content), T-D1 to T-D3 (the marker on every read method, never for
+  others, a rewrite from the author's view heals an over-claim). T-E5,
+  T-E9 and T-M9 updated: their over-claiming posts now miss for others.
+
 ### Changed (one derivation of a private post's clear fields, #795)
 
 - New `private_tier::clear_fields` (private-encode design E1, §5): the

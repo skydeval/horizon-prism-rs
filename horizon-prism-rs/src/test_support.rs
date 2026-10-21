@@ -257,6 +257,13 @@ pub mod hooks {
     /// reconciles. Key: `<database>/<did>`.
     pub const CATCH_UP_FAILS_AFTER_RAISE: &str = "i723_catch_up_fails_after_raise";
 
+    /// Private-encode T-P6: a private read, its row snapshot taken, before
+    /// it decodes and builds the view. Key: the post's URI.
+    pub const PRIVATE_SNAPSHOT_TAKEN: &str = "pe_private_snapshot_taken";
+    /// Private-encode T-D2: the author's `droppedFields` marker is not set,
+    /// as if its code were removed ([`injected`]). Key: the post's URI.
+    pub const DROPPED_MARKER_OFF: &str = "pe_dropped_marker_off";
+
     /// Scope recency T-R5, T-R6, T-R6b, T-R8, T-R16: the daily sweep, its
     /// holds computed and written and its candidates chosen, before the
     /// first candidate's marker. Key: `<database>/sweep` ([`pause_in`]).

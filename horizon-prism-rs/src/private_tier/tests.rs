@@ -12,6 +12,9 @@ mod b5_release;
 mod builder;
 // Facets and embed carried in `encodedContent` (#504).
 mod embeds;
+// The read-time clear-field check, the row snapshot and the author's
+// `droppedFields` (private-encode design E2).
+mod index_check;
 // The admin UI's live feed shows no private content (T-F4).
 mod live_feed;
 // Media kinds and the media filters on the author feed (P-30).

@@ -27,19 +27,37 @@ pub(super) enum Field {
     /// normalized.
     Kept(Value),
     /// The wrong type, or too large: left out, and the clear field does not
-    /// stand in for it (C-16).
-    Dropped,
+    /// stand in for it (C-16). The raw value is kept, behind the witness,
+    /// only for the read-time clear-field check (private-encode design
+    /// §6.2); it never reaches a view.
+    Dropped(Value),
 }
 
 impl Field {
     /// The display merge (§2): the payload's value when the payload has the
     /// key, else the clear `column`.
-    pub(super) fn merge(self, column: Option<Value>) -> Option<Value> {
+    pub(super) fn merge(&self, column: Option<Value>) -> Option<Value> {
         match self {
             Self::Absent => column,
-            Self::Kept(v) => Some(v),
-            Self::Dropped => None,
+            Self::Kept(v) => Some(v.clone()),
+            Self::Dropped(_) => None,
         }
+    }
+
+    /// What the writer encoded for this field, for the read-time check
+    /// (private-encode design §6.2): the payload's value when the payload
+    /// has the key, dropped or not, else the clear `column`.
+    pub(super) fn raw<'a>(&'a self, column: Option<&'a Value>) -> Option<&'a Value> {
+        match self {
+            Self::Absent => column,
+            Self::Kept(v) | Self::Dropped(v) => Some(v),
+        }
+    }
+
+    /// Whether the read left this payload field out (private-encode design
+    /// §8.4).
+    pub(super) fn dropped(&self) -> bool {
+        matches!(self, Self::Dropped(_))
     }
 }
 
@@ -106,14 +124,14 @@ fn field(value: Option<Value>, ok: fn(&Value) -> bool) -> Field {
     match value {
         None | Some(Value::Null) => Field::Absent,
         Some(v) if ok(&v) => {
-            let v = normalize_record(&v);
-            if serde_json::to_vec(&v).is_ok_and(|b| b.len() <= DISPLAY_FIELD_MAX_BYTES) {
-                Field::Kept(v)
+            let normalized = normalize_record(&v);
+            if serde_json::to_vec(&normalized).is_ok_and(|b| b.len() <= DISPLAY_FIELD_MAX_BYTES) {
+                Field::Kept(normalized)
             } else {
-                Field::Dropped
+                Field::Dropped(v)
             }
         }
-        Some(_) => Field::Dropped,
+        Some(v) => Field::Dropped(v),
     }
 }
 
@@ -177,16 +195,17 @@ mod tests {
         // Null is absent; the wrong type is dropped; other keys are ignored.
         assert_eq!(
             restore(new_form(&json!({"text": "t", "facets": null, "embed": [1], "reply": {}, "quote": {}, "mentionDids": [], "$type": "x"}))),
-            Ok(Restored::Content { text: "t".into(), facets: Field::Absent, embed: Field::Dropped })
+            Ok(Restored::Content { text: "t".into(), facets: Field::Absent, embed: Field::Dropped(json!([1])) })
         );
         assert_eq!(
             restore(new_form(&json!({"text": "t", "facets": {"a": 1}, "embed": null}))),
-            Ok(Restored::Content { text: "t".into(), facets: Field::Dropped, embed: Field::Absent })
+            Ok(Restored::Content { text: "t".into(), facets: Field::Dropped(json!({"a": 1})), embed: Field::Absent })
         );
-        // Over 64 KiB serialized: dropped.
+        // Over 64 KiB serialized: dropped, the raw value kept for the
+        // read-time check (private-encode design §6.2).
         let long = json!({"text": "t", "embed": {"$type": "app.bsky.embed.external",
             "external": {"uri": "x", "title": "t", "description": "d".repeat(70_000)}}});
-        assert!(matches!(restore(new_form(&long)), Ok(Restored::Content { embed: Field::Dropped, .. })));
+        assert!(matches!(restore(new_form(&long)), Ok(Restored::Content { embed: Field::Dropped(ref raw), .. }) if *raw == long["embed"]));
         // Duplicate keys: the last wins, as on the PDS.
         assert_eq!(restore(new_form_raw(r#"{"text": "a", "text": "b"}"#)), Ok(Restored::Content {
             text: "b".into(),
@@ -222,7 +241,13 @@ mod tests {
         let clear = Some(json!(["clear"]));
         assert_eq!(Field::Absent.merge(clear.clone()), clear);
         assert_eq!(Field::Kept(json!(["payload"])).merge(clear.clone()), Some(json!(["payload"])));
-        assert_eq!(Field::Dropped.merge(clear), None, "a bad payload field does not fall back");
+        assert_eq!(Field::Dropped(json!("bad")).merge(clear.clone()), None, "a bad payload field does not fall back");
         assert_eq!(Field::Absent.merge(None), None);
+        // The raw value: the payload's, dropped or not, else the column.
+        let column = clear.as_ref();
+        assert_eq!(Field::Absent.raw(column), column);
+        assert_eq!(Field::Kept(json!(["payload"])).raw(column), Some(&json!(["payload"])));
+        assert_eq!(Field::Dropped(json!("bad")).raw(column), Some(&json!("bad")));
+        assert!(Field::Dropped(json!("bad")).dropped() && !Field::Absent.dropped() && !Field::Kept(json!([])).dropped());
     }
 }

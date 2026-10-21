@@ -457,11 +457,21 @@ async fn t_m9_the_post_as_read_decides() {
     f.ready_all().await;
     let base = serve(f.state(Some(Duration::from_secs(1)))).await;
 
+    // Since private-encode E2 the over-claiming marker is a miss for Bob in
+    // the pipeline (`index_mismatch`), before the feed's own check.
     let pages = trace(&base, ALICE, MEDIA, BOB, 1).await;
     assert_eq!(pages[0], (vec![newest_first(images.clone())[0].clone()], true), "{pages:?}");
     let seen: Vec<String> = pages.iter().flat_map(|(u, _)| u.clone()).collect();
+    assert_eq!(seen, newest_first(images.clone()), "{pages:?}");
+    let render = handle.render();
+    let mismatches = |text: &str| crate::test_support::series(text, super::super::handlers::METRIC_MEDIA_MISMATCH, &[&format!("filter=\"{MEDIA}\"")]);
+    assert_eq!(mismatches(&render), None, "{render}");
+    assert_eq!(crate::test_support::series(&render, crate::private_tier::pipeline::METRIC_OUTCOMES, &["outcome=\"index_mismatch\""]), Some(1.0), "{render}");
+    // The author reads the post, so the feed's check decides for her: the
+    // post is not listed, and the mismatch is counted once.
+    let pages = trace(&base, ALICE, MEDIA, ALICE, 1).await;
+    let seen: Vec<String> = pages.iter().flat_map(|(u, _)| u.clone()).collect();
     assert_eq!(seen, newest_first(images), "{pages:?}");
-    let mismatches = crate::test_support::series(&handle.render(), super::super::handlers::METRIC_MEDIA_MISMATCH, &[&format!("filter=\"{MEDIA}\"")]);
-    assert_eq!(mismatches, Some(1.0), "{}", handle.render());
+    assert_eq!(mismatches(&handle.render()), Some(1.0), "{}", handle.render());
     db.drop_db().await;
 }

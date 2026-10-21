@@ -1,7 +1,10 @@
 //! The #504 clear fields, one derivation (private-encode design §5): the
 //! payload a private post's content is encoded as, the clear fields a
 //! correct encoder writes beside it, and the facts Prism indexes from them.
-//! Used by `encodePost`, by ingest's fallback and by the read-time check.
+//! Used by ingest's fallback and by the read-time check; the payload and
+//! the wire fields are the form a client-side encoder must produce, held
+//! to the PDS's by the parity tests (Prism's own encoder was withdrawn by
+//! skydeval, 2026-10-21).
 //!
 //! - [`payload`] is the PDS's content form byte for byte: `0xFF`, then a
 //!   JSON object with `text`, then `facets`, then `embed` when present, each
@@ -74,7 +77,7 @@ impl ClearFields {
     /// The fields as record keys, each omitted when empty, in the PDS's
     /// order of insertion (`mentionDids`, `quote`, `mediaKinds`,
     /// `embedBlobs`).
-    #[cfg_attr(not(test), expect(dead_code, reason = "the encoder (private-encode E3) is its first caller outside the parity tests"))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "the wire form a client encoder must produce; only the parity tests build it (Prism's encoder was withdrawn)"))]
     pub(super) fn into_record_fields(self) -> Map<String, Value> {
         let mut out = Map::new();
         if !self.mention_dids.is_empty() {
@@ -104,7 +107,7 @@ pub(super) struct IndexFacts {
 
 /// The content-form payload of `text`, `facets` and `embed`, byte for byte
 /// as the PDS's `content_payload` builds it.
-#[cfg_attr(not(test), expect(dead_code, reason = "the encoder (private-encode E3) is its first caller outside the parity tests"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "the wire form a client encoder must produce; only the parity tests build it (Prism's encoder was withdrawn)"))]
 pub(super) fn payload(text: &str, facets: Option<&Value>, embed: Option<&Value>) -> Vec<u8> {
     let mut content = Map::new();
     content.insert("text".into(), Value::String(text.to_string()));

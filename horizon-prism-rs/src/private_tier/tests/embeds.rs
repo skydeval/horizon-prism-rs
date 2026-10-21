@@ -497,9 +497,27 @@ async fn te5_te6_hostile_payloads_and_the_input_cap() {
             post
         }
     };
+    // Clear index fields the payload does not back are an over-claim since
+    // private-encode E2: a miss for every reader but the author, who reads
+    // the post as before (§6.3). Each such read decodes, so it is counted
+    // under its form.
+    let as_author = |uri: String| {
+        let (base, handle) = (base.clone(), handle.clone());
+        async move {
+            let mismatch = || crate::test_support::series(&handle.render(), pipeline::METRIC_OUTCOMES, &["outcome=\"index_mismatch\""]).unwrap_or(0.0);
+            let before = mismatch();
+            assert!(one_post(&base, BOB, &uri).await.1.is_null(), "{uri}: a miss for Bob");
+            assert_eq!(mismatch(), before + 1.0, "{uri}");
+            let (_, post) = one_post(&base, ALICE, &uri).await;
+            assert!(!post.is_null(), "{uri}: the author reads it");
+            assert_no_clear_fields(&post.to_string());
+            post
+        }
+    };
     // A wrong-typed payload field is left out, and the clear one does not
-    // stand in for it.
-    let p = read(wrong_types).await;
+    // stand in for it (the clear fields indexed a mention and an image the
+    // payload lacks: an over-claim).
+    let p = as_author(wrong_types).await;
     assert_eq!(p["record"]["text"], "w");
     assert!(p["record"].get("facets").is_none() && p["record"].get("embed").is_none() && p.get("embed").is_none(), "{p}");
     // Over 64 KiB: left out; the facets beside it stay.
@@ -511,8 +529,8 @@ async fn te5_te6_hostile_payloads_and_the_input_cap() {
     assert_eq!((&p["record"]["facets"], &p["record"]["embed"]), (&facets, &images));
     assert_eq!(p["embed"]["$type"], "app.bsky.embed.images#view");
     // Extra payload keys never reach the view; the clear ones are the
-    // columns' or nothing.
-    let p = read(extra_keys).await;
+    // columns' or nothing (the clear `mentionDids` and `quote` over-claim).
+    let p = as_author(extra_keys).await;
     assert_eq!(p["record"]["text"], "e");
     assert_eq!(p["record"]["langs"], json!(["en"]));
     assert_eq!(p["record"]["audienceList"], aud.as_str());
@@ -533,11 +551,12 @@ async fn te5_te6_hostile_payloads_and_the_input_cap() {
     // Old-form text that looks like JSON, or begins with U+00FF: verbatim.
     assert_eq!(read(json_like).await["record"]["text"], json_text);
     assert_eq!(read(y_acute).await["record"]["text"], "ÿes");
-    // Six new-form hits and two old-form; the plaintext post decodes
-    // nothing and is not counted.
-    assert_eq!(content_forms(&handle), (forms.0 + 2.0, forms.1 + 6.0));
+    // Six new-form posts (two of them decoded twice: Bob's miss and the
+    // author's read) and two old-form; the plaintext post decodes nothing
+    // and is not counted.
+    assert_eq!(content_forms(&handle), (forms.0 + 2.0, forms.1 + 8.0));
     assert_eq!(read(plain).await["record"]["text"], "plain");
-    assert_eq!(content_forms(&handle), (forms.0 + 2.0, forms.1 + 6.0));
+    assert_eq!(content_forms(&handle), (forms.0 + 2.0, forms.1 + 8.0));
     db.drop_db().await;
 }
 
@@ -937,14 +956,19 @@ async fn te9_clear_fields_index_and_the_payload_displays() {
 
     f.ready_all().await;
     let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    // Since private-encode E2, (b) and (c) over-claim (their `quote` names
+    // a post the content does not quote): a miss for Bob, served to the
+    // author. (a) and (d) under-claim: served.
     let (_, views) = posts_of(&base, BOB, &[&a, &b, &c, &d]).await;
-    assert_eq!(views.len(), 4, "{views:?}");
+    assert_eq!(views.len(), 2, "{views:?}");
     assert_eq!(views[0]["embed"]["record"]["uri"], x.as_str());
     assert_eq!(views[0]["record"]["facets"], facets);
-    assert_eq!(views[1]["embed"]["record"]["uri"], y.as_str(), "the view follows the payload");
-    assert_eq!(views[2]["embed"]["record"]["uri"], x.as_str(), "and an old form's clear embed");
-    assert_eq!(views[3]["record"]["facets"], facets, "the clear fields still display");
-    // X's quotes list (b), whose view quotes Y; Y's list (c).
+    assert_eq!(views[1]["record"]["facets"], facets, "the clear fields still display");
+    let (_, views) = posts_of(&base, ALICE, &[&b, &c]).await;
+    assert_eq!(views.len(), 2, "{views:?}");
+    assert_eq!(views[0]["embed"]["record"]["uri"], y.as_str(), "the view follows the payload");
+    assert_eq!(views[1]["embed"]["record"]["uri"], x.as_str(), "and an old form's clear embed");
+    // Neither over-claim is listed in the quotes of the post it names.
     let quotes = |uri: String| {
         let base = base.clone();
         async move {
@@ -952,8 +976,8 @@ async fn te9_clear_fields_index_and_the_payload_displays() {
             page["posts"].as_array().expect("posts").iter().map(|p| p["uri"].as_str().expect("uri").to_string()).collect::<Vec<_>>()
         }
     };
-    assert_eq!(quotes(x.clone()).await, std::slice::from_ref(&b));
-    assert_eq!(quotes(y.clone()).await, std::slice::from_ref(&c));
+    assert!(quotes(x.clone()).await.is_empty());
+    assert!(quotes(y.clone()).await.is_empty());
     db.drop_db().await;
 }
 

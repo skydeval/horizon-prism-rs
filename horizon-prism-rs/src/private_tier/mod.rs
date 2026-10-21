@@ -16,7 +16,7 @@
 //! witness nor the emit types can be named.
 //!
 //! ```compile_fail
-//! use horizon_prism_rs::private_tier::schema::encoded;
+//! use horizon_prism_rs::private_tier::schema::snapshot;
 //! ```
 //!
 //! ```compile_fail

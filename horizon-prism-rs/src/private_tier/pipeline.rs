@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
+use super::clear_fields;
 use super::content::{self, BadContent, Restored};
 use super::emit::PrivateEmit;
 use super::oracle::{OracleSnapshot, SnapshotInputs};
@@ -42,6 +43,10 @@ pub(super) const METRIC_OUTCOMES: &str = "private_read_outcome_total";
 /// Metric: decoded payloads by `form`, `text` or `content` (private-embeds
 /// design §9): the PDS's conversion, seen from the read side.
 pub(super) const METRIC_CONTENT: &str = "private_read_content_total";
+/// Metric: the read-time clear-field check per hit and `field` (`quote`,
+/// `mentions`, `media`), by `result` (`match`, `under`, `over`)
+/// (private-encode design §6.2).
+pub(super) const METRIC_INDEX_CHECK: &str = "private_read_index_check_total";
 /// The decode deadline after handler start (§6.3 step 11).
 pub(super) const DECODE_BUDGET: Duration = Duration::from_secs(2);
 
@@ -102,6 +107,10 @@ pub(super) enum Miss {
     /// A payload or `encodedContent` refused by `content::restore` or the
     /// input cap (private-embeds design §2, §3).
     BadContent,
+    /// A clear index field claims a quote, a mention or media the payload
+    /// does not carry, for a reader other than the author (private-encode
+    /// design §6.3).
+    IndexMismatch,
     Db,
 }
 
@@ -123,6 +132,7 @@ impl Miss {
             Self::DecodeFailed => "decode_failed",
             Self::NotUtf8 => "not_utf8",
             Self::BadContent => "bad_content",
+            Self::IndexMismatch => "index_mismatch",
             Self::Db => "db_error",
         }
     }
@@ -416,12 +426,15 @@ async fn read_inner(
     // 9. The witness. From here on content is loaded only through it.
     let rauth = RecordAuthz::new(&bound);
 
-    // 10. Structural validation behind the witness.
-    let (has_text, has_encoded, has_codec, has_generation) =
-        schema::validation_flags(&env.pool, &rauth).await?.ok_or(Miss::NoRow)?;
+    // 10. Structural validation behind the witness, on one version of the
+    // row read in one statement (private-encode design §6.1): the content
+    // and the view's `cid` below come from the same version.
+    let mut row = schema::snapshot(&env.pool, &rauth).await?.ok_or(Miss::NoRow)?;
+    #[cfg(test)]
+    crate::test_support::hooks::pause(crate::test_support::hooks::PRIVATE_SNAPSHOT_TAKEN, uri).await;
     kryphocron::validate_record_for_read(
         rauth.authz(),
-        &RecordValidation::post_private(has_text, has_encoded, has_codec, has_generation),
+        &RecordValidation::post_private(row.has_text, row.encoded_content.is_some(), row.has_codec, row.has_generation),
         nsid.clone(),
         trace,
         env.glue.substrate_sink(),
@@ -433,14 +446,15 @@ async fn read_inner(
     // text alone, or text, facets and embed. An `encodedContent` larger
     // than any record could hold is not decoded; the codec the hooks carry
     // refuses output past the same bound (S3), which fails `decode_failed`.
-    let restored = match schema::encoded(&env.pool, &rauth).await? {
-        Some(row) => {
-            if row.content.len() > content::PAYLOAD_MAX_BYTES {
+    let restored = match row.encoded_content.take() {
+        Some(encoded) => {
+            if encoded.len() > content::PAYLOAD_MAX_BYTES {
                 return Err(Miss::BadContent);
             }
-            let codec = CodecId::new(row.codec.unwrap_or_default()).map_err(|_| Miss::Malformed)?;
+            let codec = CodecId::new(row.encoded_codec.take().unwrap_or_default()).map_err(|_| Miss::Malformed)?;
             let generation = row
-                .generation
+                .encoded_generation
+                .take()
                 .map(RotationGenerationMark::new)
                 .transpose()
                 .map_err(|_| Miss::Malformed)?;
@@ -462,7 +476,7 @@ async fn read_inner(
                 rauth.authz(),
                 env.glue.at_rest_hooks(),
                 env.glue.user_sink(),
-                &EncodedRecord::new(codec, row.content, generation),
+                &EncodedRecord::new(codec, encoded, generation),
                 &context,
                 start + DECODE_BUDGET,
                 SystemTime::now(),
@@ -479,20 +493,48 @@ async fn read_inner(
             metrics::counter!(METRIC_CONTENT, "form" => restored.form()).increment(1);
             restored
         }
-        None => Restored::Text(schema::plaintext(&env.pool, &rauth).await?.ok_or(Miss::Malformed)?),
+        None => Restored::Text(row.plaintext_text.take().ok_or(Miss::Malformed)?),
     };
 
-    // 12. The view, emitted through the witness.
-    let meta = schema::view_meta(&env.pool, &rauth).await?.ok_or(Miss::NoRow)?;
-    let display = schema::display(&env.pool, &rauth).await?.unwrap_or_default();
-    // `facets` and `embed`: the payload's when it has the key, else the
-    // clear fields as stored (private-embeds design §2). `langs` and
-    // `labels` are always the stored ones; nothing else in a payload is
-    // read.
-    let (text, facets, embed) = match restored {
-        Restored::Text(text) => (text, display.facets, display.embed),
-        Restored::Content { text, facets, embed } => (text, facets.merge(display.facets), embed.merge(display.embed)),
+    // 12. The clear-field check (private-encode design §6.2, §6.3): the
+    // facts a correct encoder writes for what the writer encoded, from the
+    // payload's raw `facets` and `embed` (dropped at read or not) where the
+    // payload has the key, else the stored clear column, against the row's
+    // index columns. An over-claim is a miss for every reader but the
+    // author; an under-claim is served.
+    let is_author = caller.did == owner_s;
+    let (raw_facets, raw_embed) = match &restored {
+        Restored::Text(_) => (row.facets.as_ref(), row.embed.as_ref()),
+        Restored::Content { facets, embed, .. } => (facets.raw(row.facets.as_ref()), embed.raw(row.embed.as_ref())),
     };
+    let expected = clear_fields::index(&clear_fields::derive(raw_facets, raw_embed));
+    if index_check(&expected, &row) && !is_author {
+        return Err(Miss::IndexMismatch);
+    }
+    // The author's marker (§8.4): the payload fields this read leaves out.
+    let mut dropped_fields: Vec<&str> = Vec::new();
+    if let Restored::Content { facets, embed, .. } = &restored
+        && is_author
+    {
+        #[cfg(test)]
+        let marker_on = !crate::test_support::hooks::injected(crate::test_support::hooks::DROPPED_MARKER_OFF, uri);
+        #[cfg(not(test))]
+        let marker_on = true;
+        if marker_on {
+            dropped_fields.extend([("facets", facets), ("embed", embed)].into_iter().filter(|(_, f)| f.dropped()).map(|(k, _)| k));
+        }
+    }
+
+    // The view, emitted through the witness. `facets` and `embed`: the
+    // payload's when it has the key, else the clear fields as stored
+    // (private-embeds design §2). `langs` and `labels` are always the
+    // stored ones; nothing else in a payload is read.
+    let (text, facets, embed) = match restored {
+        Restored::Text(text) => (text, row.facets.take(), row.embed.take()),
+        Restored::Content { text, facets, embed } => (text, facets.merge(row.facets.take()), embed.merge(row.embed.take())),
+    };
+    let meta = &row;
+    let display = &row;
     let mut record = json!({
         "$type": NSID_POST_PRIVATE,
         "text": text,
@@ -537,6 +579,9 @@ async fn read_inner(
         "indexedAt": ts(meta.indexed_at),
         "labels": labels,
     });
+    if !dropped_fields.is_empty() {
+        view["droppedFields"] = json!(dropped_fields);
+    }
     // The media part of `embed` (§4.2); the handler adds the record part. A
     // video plays from the author's PDS (private-video-pds design).
     let pds = authors.rows.get(owner_s).and_then(|r| r.pds_endpoint.as_deref());
@@ -564,6 +609,38 @@ async fn read_inner(
         view["audience"] = audience;
     }
     Ok(PrivateEmit::new(&rauth, view))
+}
+
+/// The read-time clear-field check (private-encode design §6.2): compare
+/// the facts `expected` from what the writer encoded with the row's index
+/// columns, field by field, counting each result. Whether any field
+/// over-claims: a stored quote other than the expected one, a stored
+/// mention or media bit the payload lacks.
+fn index_check(expected: &clear_fields::IndexFacts, row: &schema::Snapshot) -> bool {
+    let stored_media = u8::try_from(row.media_kinds & 0xFF).unwrap_or(0);
+    let quote_over = row.quote_uri.is_some() && row.quote_uri != expected.quote_uri;
+    let quote_under = expected.quote_uri.is_some() && row.quote_uri.is_none();
+    let mentions_over = row.mention_dids.iter().any(|d| !expected.mention_dids.contains(d));
+    let mentions_under = expected.mention_dids.iter().any(|d| !row.mention_dids.contains(d));
+    let media_over = stored_media & !expected.media_kinds != 0;
+    let media_under = expected.media_kinds & !stored_media != 0;
+    let mut over = false;
+    for (field, is_over, is_under) in [
+        ("quote", quote_over, quote_under),
+        ("mentions", mentions_over, mentions_under),
+        ("media", media_over, media_under),
+    ] {
+        let result = if is_over {
+            "over"
+        } else if is_under {
+            "under"
+        } else {
+            "match"
+        };
+        metrics::counter!(METRIC_INDEX_CHECK, "field" => field, "result" => result).increment(1);
+        over |= is_over;
+    }
+    over
 }
 
 /// The `val`s of a stored `#selfLabels` object.
