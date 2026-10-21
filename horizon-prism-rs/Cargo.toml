@@ -48,7 +48,9 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 webpki-roots = "1"
 ipnet = "2"
 # 0.4.3: a fresh slug for every encode (private-encode design §4.3).
-kryphocron = "0.4.3"
+# 0.4.4: `post_content`, the payload and clear-field derivation the client
+# encoder uses; the read-time clear-field check calls it.
+kryphocron = "0.4.4"
 kryphocron-lexicons = "0.3"
 proto-blue = "0.3.3"
 k256 = { version = "0.13", features = ["ecdsa"] }

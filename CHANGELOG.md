@@ -10,6 +10,27 @@ commit.
 
 ## [Unreleased]
 
+### Changed (kryphocron 0.4.4: the read check derives with kryphocron's own function, #793)
+
+- `kryphocron` moves from 0.4.3 to 0.4.4 (additive; `Cargo.lock` changes
+  kryphocron only). Horizon encodes private posts in the client with
+  kryphocron itself, so the clear-field derivation behind ingest's
+  fallback and the read-time check is now
+  `kryphocron::post_content::derive_clear_fields`, and the payload form
+  `PostContent::to_payload`, instead of Prism's own port: Prism verifies
+  with the function the encoder used. No behaviour changes: a test holds
+  kryphocron's derivation equal to the port it replaces over every parity
+  fixture, every media fixture and wrong-typed fields; T-P1 holds it (and
+  `from_payload`) equal to the PDS's own output.
+- A client-encoder fixture (Horizon K6-L2): records built with
+  `to_payload` and `derive_clear_fields(..).apply_to`, written through the
+  writer — a mention facet, a quote, images, a video, a record with images,
+  a record with video, and an embed and facets with unknown extra keys —
+  are each read by the audience with every field counted `match`.
+- `encodedContentGeneration` is client-asserted: a comment in the read
+  pipeline and a test (T-G1) pin that it decides no access; a mark dated
+  far in the future or at the epoch reads exactly as the real one.
+
 ### Changed — BEHAVIOUR CHANGE: plaintext private posts are no longer served (S4, #798)
 
 - **While `[private_any_pds] enabled = true` (the default), a

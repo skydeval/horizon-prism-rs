@@ -6,7 +6,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 
 use super::*;
 use crate::private_tier::handlers::{GET_QUOTES, GET_UNREAD_COUNT, LIST_NOTIFICATIONS};
-use crate::private_tier::pipeline;
+use crate::private_tier::{clear_fields, pipeline};
 
 const IMAGE_BLOB: &str = "bafyimgcheck";
 
@@ -355,6 +355,111 @@ async fn td3_rewriting_from_the_authors_view_heals_an_over_claim() {
     let (_, view) = one_post(&base, ALICE, &both).await;
     assert_eq!(view["droppedFields"], json!(["embed"]), "{view}");
     assert!(!reads(&base, BOB, &both).await);
+    db.drop_db().await;
+}
+
+/// The client encoder's parity fixture (Horizon K6-L2): records built as
+/// the client builds them with kryphocron 0.4.4 (`PostContent::to_payload`
+/// for the payload, `derive_clear_fields(..).apply_to` for the clear
+/// fields), encoded with the real hooks and written through the writer.
+/// For each, the fields kryphocron derives equal what Prism's read check
+/// expects, every field is counted `match`, and a member of the audience
+/// reads the post.
+#[tokio::test]
+async fn tk1_records_the_client_encoder_writes_are_served() {
+    use kryphocron::post_content::{PostContent, derive_clear_fields};
+    let Some(db) = fresh_db("tk1_client_encoder").await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let f = fixture(&db.pool, "tk1-client").await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL]).await;
+    let quoted = f.post_with(ALICE, "3kquotedx222", &aud, json!({})).await;
+    let strong = json!({"uri": quoted, "cid": "bafyquoted"});
+    let video = json!({"$type": "app.bsky.embed.video", "video": {"$type": "blob", "ref": {"$link": "bafyvid"}, "mimeType": "video/mp4", "size": 9}, "alt": "v"});
+    let cases: Vec<(&str, Option<Value>, Option<Value>, Value)> = vec![
+        ("a mention facet", Some(json!([mention(CAROL)])), None, json!({"mentionDids": [CAROL]})),
+        ("a quote", None, Some(json!({"$type": "app.bsky.embed.record", "record": strong})), json!({"quote": strong})),
+        ("images", None, Some(images()), json!({"embedBlobs": [blob(IMAGE_BLOB)], "mediaKinds": ["image"]})),
+        ("video", None, Some(video.clone()), json!({"embedBlobs": [video["video"]], "mediaKinds": ["video"]})),
+        ("record with images", None, Some(json!({"$type": "app.bsky.embed.recordWithMedia", "record": {"record": strong}, "media": images()})),
+            json!({"embedBlobs": [blob(IMAGE_BLOB)], "quote": strong, "mediaKinds": ["image"]})),
+        ("record with video", None, Some(json!({"$type": "app.bsky.embed.recordWithMedia", "record": {"record": strong}, "media": video})),
+            json!({"embedBlobs": [video["video"]], "quote": strong, "mediaKinds": ["video"]})),
+        ("unknown extra keys", Some(json!([{"index": {"byteStart": 0, "byteEnd": 1}, "features": [{"$type": "app.nearhorizon.richtext.facet#spoiler", "reason": "x"}, {"$type": "app.bsky.richtext.facet#mention", "did": CAROL, "x-extra": 1}]}])),
+            Some(json!({"$type": "app.bsky.embed.images", "images": [{"image": blob(IMAGE_BLOB), "alt": "", "app.nearhorizon.spoiler": {"reason": "flash"}}], "x-unknown": {"k": [1, 2]}})),
+            json!({"embedBlobs": [blob(IMAGE_BLOB)], "mentionDids": [CAROL], "mediaKinds": ["image"]})),
+    ];
+    let mut uris = Vec::new();
+    for (i, (case, facets, embed, want)) in cases.iter().enumerate() {
+        let rkey = format!("3kclient{i:02}22");
+        let content = PostContent { text: (*case).to_string(), facets: facets.clone(), embed: embed.clone() };
+        let mut record = f.encoded_bytes(ALICE, &rkey, &content.to_payload(), Some(&aud)).await;
+        let fields = derive_clear_fields(facets.as_ref(), embed.as_ref());
+        fields.apply_to(record.as_object_mut().expect("record"));
+        // What kryphocron derived is what the case names, and what Prism's
+        // read check expects from the same content.
+        let mut derived = serde_json::Map::new();
+        fields.apply_to(&mut derived);
+        assert_eq!(Value::Object(derived), *want, "{case}: kryphocron's fields");
+        let expected = clear_fields::index(&clear_fields::derive(facets.as_ref(), embed.as_ref()));
+        let mut wire = serde_json::Map::new();
+        fields.apply_to(&mut wire);
+        let from_wire = clear_fields::index(&clear_fields::ClearFields {
+            embed_blobs: vec![],
+            mention_dids: wire.get("mentionDids").and_then(Value::as_array).cloned().unwrap_or_default(),
+            quote: wire.get("quote").cloned(),
+            media_kinds: wire.get("mediaKinds").and_then(Value::as_array).cloned().unwrap_or_default(),
+        });
+        assert_eq!(expected, from_wire, "{case}: what the client wrote is what Prism expects");
+        uris.push((*case, f.put_post(ALICE, &rkey, record).await));
+    }
+    f.ready_all().await;
+    let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    for (case, uri) in &uris {
+        let count = |result: &'static str| ["quote", "mentions", "media"].map(|fld| check_count(&handle, fld, result));
+        let (matched, over, under) = (count("match"), count("over"), count("under"));
+        let (_, view) = one_post(&base, BOB, uri).await;
+        assert_eq!(view["record"]["text"], *case, "{case}: served to the audience: {view}");
+        assert!(count("match").iter().zip(matched).all(|(a, b)| *a >= b + 1.0), "{case}: every field matches");
+        assert_eq!((count("over"), count("under")), (over, under), "{case}: no over- or under-claim");
+    }
+    db.drop_db().await;
+}
+
+/// T-G1: `encodedContentGeneration` is client-asserted and decides no
+/// access. The same post read with its real mark, a mark dated far in the
+/// future, and a mark dated at the epoch, gives the same view to its
+/// audience and its author.
+#[tokio::test]
+async fn tg1_the_generation_mark_decides_no_access() {
+    let Some(db) = fresh_db("tg1_generation").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "tg1-generation").await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let rec = f.new_form_record(ALICE, "3kgeneration", "marked", None, None, &aud).await;
+    let real = rec["encodedContentGeneration"].as_str().expect("mark").to_string();
+    let post = f.put_post(ALICE, "3kgeneration", rec).await;
+    f.ready_all().await;
+    let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let hex = real.rsplit('/').next().expect("batch").to_string();
+    let mut views = Vec::new();
+    for mark in [real.clone(), format!("laquna/{:020}/{hex}", 99_999_999_999u64), format!("laquna/{:020}/{hex}", 0)] {
+        sqlx::query("UPDATE private_posts SET encoded_generation = $2 WHERE uri = $1").bind(&post).bind(&mark).execute(&f.pool).await.expect("mark");
+        for reader in [BOB, ALICE] {
+            let (_, mut view) = one_post(&base, reader, &post).await;
+            assert_eq!(view["record"]["text"], "marked", "{mark} for {reader}");
+            view.as_object_mut().expect("view").remove("indexedAt");
+            views.push((reader, view));
+        }
+    }
+    for (reader, view) in &views {
+        let first = &views.iter().find(|(r, _)| r == reader).expect("first").1;
+        assert_eq!(view, first, "{reader}: the mark changes nothing");
+    }
     db.drop_db().await;
 }
 

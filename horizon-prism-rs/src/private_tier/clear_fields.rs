@@ -1,60 +1,33 @@
 //! The #504 clear fields, one derivation (private-encode design §5): the
 //! payload a private post's content is encoded as, the clear fields a
 //! correct encoder writes beside it, and the facts Prism indexes from them.
-//! Used by ingest's fallback and by the read-time check; the payload and
-//! the wire fields are the form a client-side encoder must produce, held
-//! to the PDS's by the parity tests (Prism's own encoder was withdrawn by
-//! skydeval, 2026-10-21).
+//! Used by ingest's fallback and by the read-time check.
 //!
-//! - [`payload`] is the PDS's content form byte for byte: `0xFF`, then a
-//!   JSON object with `text`, then `facets`, then `embed` when present, each
-//!   the value as parsed. Nothing inside `facets` or `embed` is read,
-//!   renamed, reordered or dropped, so extension keys survive (serde_json's
-//!   `preserve_order`, declared in Cargo.toml, keeps every object's key
-//!   order).
-//! - [`derive`] ports the PDS's `mention_dids`, `quoted_record`,
-//!   `media_kinds` and `blob_objects`, with the same type lists, order and
-//!   omissions. It accepts any JSON: a field of the wrong type derives no
+//! The derivation is kryphocron's own (`kryphocron::post_content`, 0.4.4):
+//! the encoder Horizon runs in the client is kryphocron, so Prism verifies
+//! with the same function the encoder used. The parity tests hold it equal
+//! to the PDS's encoder over a fixture the PDS's code generated.
+//!
+//! - [`payload`] is the content form: `0xFF`, then a JSON object with
+//!   `text`, then `facets`, then `embed` when present, each the value as
+//!   parsed (`PostContent::to_payload`). Nothing inside `facets` or `embed`
+//!   is read, renamed, reordered or dropped, so extension keys survive
+//!   (serde_json's `preserve_order`, declared in Cargo.toml, keeps every
+//!   object's key order).
+//! - [`derive`] is `kryphocron::post_content::derive_clear_fields`, in wire
+//!   form. It accepts any JSON: a field of the wrong type derives no
 //!   mention, quote or media kind.
 //! - [`index`] is what Prism indexes from wire clear fields, with ingest's
 //!   filters.
 //!
-//! Secrecy (design §9, S-3, S-5): [`ClearFields`] holds content-derived
-//! values and is not `Debug`; nothing here logs, and nothing panics on an
-//! input value.
+//! [`ClearFields`] holds content-derived values and is not `Debug`;
+//! nothing here logs, and nothing panics on an input value.
 
+use kryphocron::post_content::{PostContent, derive_clear_fields};
 use serde_json::{Map, Value};
 
 use super::media;
 use crate::db::locks::uri_author;
-
-/// The first byte of the content form (the PDS's `CONTENT_FORM_MARKER`).
-pub(super) const CONTENT_FORM: u8 = 0xFF;
-
-/// Image embeds, in the stock and the kryphocron vocabularies.
-const IMAGE_EMBED_TYPES: [&str; 4] = [
-    "app.bsky.embed.images",
-    "app.bsky.embed.gallery",
-    "tools.kryphocron.feed.postPublic#embedImage",
-    "tools.kryphocron.feed.postPublic#embedGallery",
-];
-
-/// Video embeds, in the stock and the kryphocron vocabularies.
-const VIDEO_EMBED_TYPES: [&str; 2] = ["app.bsky.embed.video", "tools.kryphocron.feed.postPublic#embedVideo"];
-
-/// Record-with-media embeds, in the stock and the kryphocron vocabularies.
-const RECORD_WITH_MEDIA_TYPES: [&str; 2] = ["app.bsky.embed.recordWithMedia", "tools.kryphocron.feed.postPublic#embedRecordWithMedia"];
-
-/// Record embeds, in the stock and the kryphocron vocabularies.
-const RECORD_TYPES: [&str; 2] = ["app.bsky.embed.record", "tools.kryphocron.feed.postPublic#embedRecord"];
-
-/// Mention facet features: the stock and the kryphocron vocabularies, and
-/// the bare local form.
-pub(super) const MENTION_TYPES: [&str; 3] = [
-    "app.bsky.richtext.facet#mention",
-    "tools.kryphocron.feed.postPublic#mention",
-    "#mention",
-];
 
 /// The clear fields a correct encoder writes for one post's content, in wire
 /// form (what goes on the record). Each is empty (or `None`) when the
@@ -65,7 +38,7 @@ pub(super) struct ClearFields {
     /// order.
     pub embed_blobs: Vec<Value>,
     /// `mentionDids`: the mentioned DIDs, deduplicated in first-appearance
-    /// order, DID syntax not checked (as the PDS writes them).
+    /// order, DID syntax not checked (as an encoder writes them).
     pub mention_dids: Vec<Value>,
     /// `quote`: `{uri, cid}` of the quoted record, when both are strings.
     pub quote: Option<Value>,
@@ -105,37 +78,28 @@ pub(super) struct IndexFacts {
     pub media_kinds: u8,
 }
 
-/// The content-form payload of `text`, `facets` and `embed`, byte for byte
-/// as the PDS's `content_payload` builds it.
+/// The content-form payload of `text`, `facets` and `embed`
+/// (`PostContent::to_payload`).
 #[cfg_attr(not(test), expect(dead_code, reason = "the wire form a client encoder must produce; only the parity tests build it (Prism's encoder was withdrawn)"))]
 pub(super) fn payload(text: &str, facets: Option<&Value>, embed: Option<&Value>) -> Vec<u8> {
-    let mut content = Map::new();
-    content.insert("text".into(), Value::String(text.to_string()));
-    if let Some(f) = facets {
-        content.insert("facets".into(), f.clone());
+    PostContent {
+        text: text.to_string(),
+        facets: facets.cloned(),
+        embed: embed.cloned(),
     }
-    if let Some(e) = embed {
-        content.insert("embed".into(), e.clone());
-    }
-    let mut bytes = vec![CONTENT_FORM];
-    // A `Value` with string keys always serializes; an error here would be
-    // an allocation failure, and the vector simply stays short.
-    let _ = serde_json::to_writer(&mut bytes, &Value::Object(content));
-    bytes
+    .to_payload()
 }
 
-/// The clear fields of `facets` and `embed` (the PDS's derivation).
+/// The clear fields of `facets` and `embed`
+/// (`kryphocron::post_content::derive_clear_fields`), in wire form.
 pub(super) fn derive(facets: Option<&Value>, embed: Option<&Value>) -> ClearFields {
-    let mut out = ClearFields::default();
-    if let Some(f) = facets {
-        out.mention_dids = mention_dids(f);
+    let fields = derive_clear_fields(facets, embed);
+    ClearFields {
+        embed_blobs: fields.embed_blobs,
+        mention_dids: fields.mention_dids.into_iter().map(Value::String).collect(),
+        quote: fields.quote,
+        media_kinds: fields.media_kinds.into_iter().map(|k| Value::String(k.to_string())).collect(),
     }
-    if let Some(e) = embed {
-        out.quote = quoted_record(e);
-        out.media_kinds = media_kinds(e);
-        blob_objects(e, &mut out.embed_blobs);
-    }
-    out
 }
 
 /// An `at://` URI whose authority is a valid DID: what ingest indexes as a
@@ -168,84 +132,80 @@ pub(super) fn index(fields: &ClearFields) -> IndexFacts {
     }
 }
 
-/// The media kinds `embed` itself carries (the PDS's `media_kinds`).
-fn media_kinds(embed: &Value) -> Vec<Value> {
-    let embed_type = |value: &Value| value.get("$type").and_then(Value::as_str).map(str::to_string);
-    let media_type = match embed_type(embed) {
-        Some(t) if RECORD_WITH_MEDIA_TYPES.contains(&t.as_str()) => embed.get("media").and_then(embed_type),
-        other => other,
-    };
-    let kind = match media_type.as_deref() {
-        Some(t) if IMAGE_EMBED_TYPES.contains(&t) => media::KIND_IMAGE,
-        Some(t) if VIDEO_EMBED_TYPES.contains(&t) => media::KIND_VIDEO,
-        _ => return Vec::new(),
-    };
-    vec![Value::String(kind.to_string())]
-}
-
-/// The DIDs `facets` mention, deduplicated, in first-appearance order (the
-/// PDS's `mention_dids`).
-fn mention_dids(facets: &Value) -> Vec<Value> {
-    let mut dids: Vec<Value> = Vec::new();
-    let features = facets
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|facet| facet.get("features").and_then(Value::as_array))
-        .flatten();
-    for feature in features {
-        let is_mention = feature.get("$type").and_then(Value::as_str).is_some_and(|t| MENTION_TYPES.contains(&t));
-        if let (true, Some(did)) = (is_mention, feature.get("did").and_then(Value::as_str)) {
-            let did = Value::String(did.to_string());
-            if !dids.contains(&did) {
-                dids.push(did);
-            }
-        }
-    }
-    dids
-}
-
-/// The strong ref (`{uri, cid}`) of the record `embed` quotes (the PDS's
-/// `quoted_record`): both must be strings.
-fn quoted_record(embed: &Value) -> Option<Value> {
-    let t = embed.get("$type").and_then(Value::as_str)?;
-    let strong_ref = if RECORD_TYPES.contains(&t) {
-        embed.get("record")?
-    } else if RECORD_WITH_MEDIA_TYPES.contains(&t) {
-        embed.get("record")?.get("record")?
-    } else {
-        return None;
-    };
-    let uri = strong_ref.get("uri").and_then(Value::as_str)?;
-    let cid = strong_ref.get("cid").and_then(Value::as_str)?;
-    let mut out = Map::new();
-    out.insert("uri".into(), Value::String(uri.to_string()));
-    out.insert("cid".into(), Value::String(cid.to_string()));
-    Some(Value::Object(out))
-}
-
-/// Every blob object (`$type: blob`) inside `value`, copied whole (the
-/// PDS's `blob_objects`). Recursion depth is bounded by the JSON parser's
-/// own limit (128) on every value that reaches it.
-fn blob_objects(value: &Value, found: &mut Vec<Value>) {
-    match value {
-        Value::Object(map) => {
-            if map.get("$type").and_then(Value::as_str) == Some("blob") {
-                found.push(value.clone());
-            } else {
-                map.values().for_each(|v| blob_objects(v, found));
-            }
-        }
-        Value::Array(items) => items.iter().for_each(|v| blob_objects(v, found)),
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The derivation Prism used before it called kryphocron's (private-encode
+    /// E1, a port of the PDS's), kept for the parity test below: kryphocron's
+    /// must give the same wire fields over every fixture input.
+    fn old_port(facets: Option<&Value>, embed: Option<&Value>) -> ClearFields {
+        const IMAGE: [&str; 4] = ["app.bsky.embed.images", "app.bsky.embed.gallery", "tools.kryphocron.feed.postPublic#embedImage", "tools.kryphocron.feed.postPublic#embedGallery"];
+        const VIDEO: [&str; 2] = ["app.bsky.embed.video", "tools.kryphocron.feed.postPublic#embedVideo"];
+        const RWM: [&str; 2] = ["app.bsky.embed.recordWithMedia", "tools.kryphocron.feed.postPublic#embedRecordWithMedia"];
+        const REC: [&str; 2] = ["app.bsky.embed.record", "tools.kryphocron.feed.postPublic#embedRecord"];
+        const MENTION: [&str; 3] = ["app.bsky.richtext.facet#mention", "tools.kryphocron.feed.postPublic#mention", "#mention"];
+        fn blobs(v: &Value, out: &mut Vec<Value>) {
+            match v {
+                Value::Object(m) if m.get("$type").and_then(Value::as_str) == Some("blob") => out.push(v.clone()),
+                Value::Object(m) => m.values().for_each(|c| blobs(c, out)),
+                Value::Array(a) => a.iter().for_each(|c| blobs(c, out)),
+                _ => {}
+            }
+        }
+        let mut out = ClearFields::default();
+        for f in facets.and_then(Value::as_array).into_iter().flatten().filter_map(|f| f.get("features").and_then(Value::as_array)).flatten() {
+            if f.get("$type").and_then(Value::as_str).is_some_and(|t| MENTION.contains(&t))
+                && let Some(d) = f.get("did").and_then(Value::as_str)
+                && !out.mention_dids.contains(&json!(d))
+            {
+                out.mention_dids.push(json!(d));
+            }
+        }
+        if let Some(e) = embed {
+            let t = e.get("$type").and_then(Value::as_str);
+            let r = match t {
+                Some(t) if REC.contains(&t) => e.get("record"),
+                Some(t) if RWM.contains(&t) => e.get("record").and_then(|r| r.get("record")),
+                _ => None,
+            };
+            if let Some((u, c)) = r.and_then(|r| Some((r.get("uri")?.as_str()?, r.get("cid")?.as_str()?))) {
+                out.quote = Some(json!({"uri": u, "cid": c}));
+            }
+            let media = match t {
+                Some(t) if RWM.contains(&t) => e.get("media").and_then(|m| m.get("$type")).and_then(Value::as_str),
+                other => other,
+            };
+            match media {
+                Some(m) if IMAGE.contains(&m) => out.media_kinds.push(json!("image")),
+                Some(m) if VIDEO.contains(&m) => out.media_kinds.push(json!("video")),
+                _ => {}
+            }
+            blobs(e, &mut out.embed_blobs);
+        }
+        out
+    }
+
+    /// Parity between kryphocron's derivation and the one Prism ingested
+    /// with before (the PDS's): equal over every fixture input, every media
+    /// fixture, and wrong-typed fields.
+    #[test]
+    fn kryphocrons_derivation_equals_the_old_port() {
+        let doc = fixture();
+        let mut inputs: Vec<(Option<Value>, Option<Value>)> = doc["cases"]
+            .as_array()
+            .expect("cases")
+            .iter()
+            .map(|c| (c.get("facets").cloned(), c.get("embed").cloned()))
+            .collect();
+        inputs.extend(media::embed_fixtures().into_iter().map(|(_, e, _)| (None, Some(e))));
+        inputs.extend([(Some(json!("a string")), Some(json!([1, {"$type": "blob"}]))), (Some(json!({"features": []})), Some(json!(5)))]);
+        for (facets, embed) in &inputs {
+            assert!(derive(facets.as_ref(), embed.as_ref()) == old_port(facets.as_ref(), embed.as_ref()), "{facets:?} {embed:?}");
+        }
+    }
 
     /// T-P2 (design §5.3): `serde_json::Map` keeps insertion order in this
     /// build, and a parsed object keeps its key order. If a dependency
@@ -271,9 +231,12 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// T-P1 (design §5.3): `payload` and `derive` over every input of the
+    /// T-P1 (design §5.3): kryphocron's `to_payload` and
+    /// `derive_clear_fields`, as Prism calls them, over every input of the
     /// fixture equal what the PDS's own code produced, byte for byte and
-    /// key for key, extension keys included.
+    /// key for key, extension keys included; and `from_payload` reads each
+    /// payload back to its input. So the client encoder (kryphocron), the
+    /// PDS and Prism's check agree.
     #[test]
     fn t_p1_payload_and_clear_fields_match_the_pds() {
         let doc = fixture();
@@ -283,7 +246,10 @@ mod tests {
             let name = case["name"].as_str().expect("name");
             let text = case["text"].as_str().expect("text");
             let (facets, embed) = (case.get("facets"), case.get("embed"));
-            assert_eq!(hex(&payload(text, facets, embed)), case["payloadHex"].as_str().expect("hex"), "{name}: payload");
+            let bytes = payload(text, facets, embed);
+            assert_eq!(hex(&bytes), case["payloadHex"].as_str().expect("hex"), "{name}: payload");
+            let back = PostContent::from_payload(&bytes).expect("reads back");
+            assert_eq!((back.text.as_str(), back.facets.as_ref(), back.embed.as_ref()), (text, facets, embed), "{name}: from_payload");
             let derived = Value::Object(derive(facets, embed).into_record_fields());
             // Key order too: compare the serialized forms.
             assert_eq!(

@@ -460,6 +460,15 @@ async fn read_inner(
                 return Err(Miss::BadContent);
             }
             let codec = CodecId::new(row.encoded_codec.take().unwrap_or_default()).map_err(|_| Miss::Malformed)?;
+            // `encodedContentGeneration` is client-asserted (a client
+            // encoder stamps it from its own clock). It is handed to the
+            // codec only as the record's mark (laquna reads its slug from
+            // the artifact, not from the mark), and nothing in the read
+            // rule, the oracle or any other account's view compares it
+            // with the clock or with anything else: a mark dated in the
+            // future reads exactly as a current one (T-G1). Only a mark that
+            // is not a mark at all makes the record malformed, as any other
+            // malformed field of the author's own record does.
             let generation = row
                 .encoded_generation
                 .take()
