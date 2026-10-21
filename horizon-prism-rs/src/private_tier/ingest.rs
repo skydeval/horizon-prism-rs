@@ -18,7 +18,7 @@ use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 
 use super::media::{self, MEDIA_KINDS_FIELD};
-use super::{Applied, IngestError, PrivateOp, PublicNotify, QuoteRef, owners};
+use super::{Applied, IngestError, PrivateOp, PublicNotify, QuoteRef, clear_fields, owners};
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::{
     NSID_AUDIENCE, NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_THREADGATE,
@@ -115,13 +115,6 @@ pub(crate) const METRIC_NOTIFY_SUPPRESSED: &str = "private_notify_suppressed_tot
 /// A display field larger than this, serialized, is dropped (§4.2).
 pub(crate) const DISPLAY_FIELD_MAX_BYTES: usize = 64 * 1024;
 
-/// The mention feature types `mention_dids` reads (§3.1).
-const MENTION_TYPES: [&str; 3] = [
-    "app.bsky.richtext.facet#mention",
-    "tools.kryphocron.feed.postPublic#mention",
-    "#mention",
-];
-
 impl DisplayFields {
     /// Read the display fields defensively. A field of the wrong type or over
     /// [`DISPLAY_FIELD_MAX_BYTES`] is dropped and named in `dropped`; it
@@ -150,35 +143,29 @@ impl DisplayFields {
         let has_mentions = record.get("mentionDids").is_some_and(|v| !v.is_null());
         let quote = keep("quote", Value::is_object);
         let mentions = keep("mentionDids", Value::is_array);
-        let valid_quote = |u: &str| u.starts_with("at://") && uri_author(u).is_some_and(proto_blue::syntax::Did::is_valid);
+        // A dedicated field absent: the fact comes from the kept clear
+        // `facets` and `embed` through the one derivation the encoder and
+        // the read-time check use (private-encode design §5.2).
+        let derived = clear_fields::index(&clear_fields::derive(facets.as_ref(), embed.as_ref()));
         let (quote_uri, quote_source) = if has_quote {
-            let uri = quote.as_ref().and_then(|q| q.get("uri")).and_then(Value::as_str).filter(|u| valid_quote(u));
+            let uri = quote
+                .as_ref()
+                .and_then(|q| q.get("uri"))
+                .and_then(Value::as_str)
+                .filter(|u| clear_fields::indexable_quote(u));
             (uri.map(str::to_string), IndexSource::Dedicated)
         } else {
-            let uri = embed
-                .as_ref()
-                .map(crate::hydration::embeds::normalize_embed)
-                .and_then(|e| crate::hydration::embeds::quoted_uri(&e).map(str::to_string))
-                .filter(|u| valid_quote(u));
-            (uri, if embed.is_some() { IndexSource::Clear } else { IndexSource::None })
+            (derived.quote_uri.clone(), if embed.is_some() { IndexSource::Clear } else { IndexSource::None })
         };
-        let named: Vec<&str> = if has_mentions {
-            mentions.iter().flat_map(|m| m.as_array().into_iter().flatten()).filter_map(Value::as_str).collect()
+        let mention_dids = if has_mentions {
+            let wire = clear_fields::ClearFields {
+                mention_dids: mentions.iter().flat_map(|m| m.as_array().into_iter().flatten()).cloned().collect(),
+                ..clear_fields::ClearFields::default()
+            };
+            clear_fields::index(&wire).mention_dids
         } else {
-            facets
-                .iter()
-                .flat_map(|f| f.as_array().into_iter().flatten())
-                .flat_map(|facet| facet.get("features").and_then(Value::as_array).into_iter().flatten())
-                .filter(|feature| feature.get("$type").and_then(Value::as_str).is_some_and(|t| MENTION_TYPES.contains(&t)))
-                .filter_map(|feature| feature.get("did").and_then(Value::as_str))
-                .collect()
+            derived.mention_dids.clone()
         };
-        let mut mention_dids: Vec<String> = Vec::new();
-        for did in named {
-            if proto_blue::syntax::Did::is_valid(did) && !mention_dids.iter().any(|d| d == did) {
-                mention_dids.push(did.to_string());
-            }
-        }
         let mentions_source = match (has_mentions, &facets) {
             (true, _) => IndexSource::Dedicated,
             (false, Some(_)) => IndexSource::Clear,
@@ -191,8 +178,8 @@ impl DisplayFields {
         let (media_kinds, media_source) = if has_media {
             let kinds = media_field.as_ref().and_then(Value::as_array).map_or(0, |a| media::kinds_of_field(a));
             (kinds, IndexSource::Dedicated)
-        } else if let Some(e) = &embed {
-            (media::kinds_of_embed(e), IndexSource::Clear)
+        } else if embed.is_some() {
+            (derived.media_kinds, IndexSource::Clear)
         } else {
             (0, IndexSource::None)
         };
@@ -1421,7 +1408,10 @@ mod tests {
         for (embed, expected) in [
             (json!({"$type": "tools.kryphocron.feed.postPublic#embedRecord", "record": {"uri": quoted, "cid": "c"}}), Some(quoted)),
             (json!({"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "c"}}), Some(quoted)),
-            (json!({"$type": "app.bsky.embed.recordWithMedia", "record": {"record": {"uri": quoted}}, "media": {}}), Some(quoted)),
+            (json!({"$type": "app.bsky.embed.recordWithMedia", "record": {"record": {"uri": quoted, "cid": "c"}}, "media": {}}), Some(quoted)),
+            // A strong ref with no `cid` is not a quote (private-encode
+            // design §5.2, E-C7: the PDS's derivation needs both).
+            (json!({"$type": "app.bsky.embed.recordWithMedia", "record": {"record": {"uri": quoted}}, "media": {}}), None),
             (json!({"$type": "app.bsky.embed.record", "record": {"uri": "https://not.an.at-uri"}}), None),
             (json!({"$type": "app.bsky.embed.images", "images": []}), None),
         ] {
@@ -1454,7 +1444,7 @@ mod tests {
         // The dedicated fields (private-embeds design §4.2): wrong types or
         // over 64 KiB are dropped and named, and never fall back.
         let bad = json!({"quote": "at://x", "mentionDids": {"did": "did:plc:cccccccccccccccccccccccc"},
-                         "embed": {"$type": "app.bsky.embed.record", "record": {"uri": quoted}},
+                         "embed": {"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "c"}},
                          "facets": [{"features": [mention("app.bsky.richtext.facet#mention", "did:plc:cccccccccccccccccccccccc")]}]});
         let d = DisplayFields::parse(&bad);
         assert_eq!(d.dropped, ["quote", "mentionDids"]);
@@ -1535,6 +1525,72 @@ mod tests {
             let d = DisplayFields::parse(&json!({"embed": embed}));
             assert_eq!((d.media_kinds, d.media_source), (bits, IndexSource::Clear), "{case}");
         }
+    }
+
+    /// The fallback as it stood before private-encode E1, for T-P3: the
+    /// quote from the normalized embed's `uri` alone, the mentions from the
+    /// three feature types, the media from the read-side classifier.
+    fn old_fallback(facets: Option<&Value>, embed: Option<&Value>) -> (Option<String>, Vec<String>, u8) {
+        let valid_quote = |u: &str| u.starts_with("at://") && uri_author(u).is_some_and(proto_blue::syntax::Did::is_valid);
+        let quote = embed
+            .map(crate::hydration::embeds::normalize_embed)
+            .and_then(|e| crate::hydration::embeds::quoted_uri(&e).map(str::to_string))
+            .filter(|u| valid_quote(u));
+        let types = ["app.bsky.richtext.facet#mention", "tools.kryphocron.feed.postPublic#mention", "#mention"];
+        let mut mentions: Vec<String> = Vec::new();
+        for did in facets
+            .iter()
+            .flat_map(|f| f.as_array().into_iter().flatten())
+            .flat_map(|facet| facet.get("features").and_then(Value::as_array).into_iter().flatten())
+            .filter(|feature| feature.get("$type").and_then(Value::as_str).is_some_and(|t| types.contains(&t)))
+            .filter_map(|feature| feature.get("did").and_then(Value::as_str))
+        {
+            if proto_blue::syntax::Did::is_valid(did) && !mentions.iter().any(|d| d == did) {
+                mentions.push(did.to_string());
+            }
+        }
+        (quote, mentions, embed.map_or(0, media::kinds_of_embed))
+    }
+
+    /// T-P3 (private-encode design §5.2): over every parity fixture and
+    /// every media fixture, the fallback through the shared derivation
+    /// equals the old one on `mention_dids` and `media_kinds`, and on
+    /// `quote_uri` differs only for a quote whose strong ref has no string
+    /// `cid`.
+    #[test]
+    fn t_p3_the_shared_fallback_equals_the_old_one() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/private_tier/tests/fixtures/content_parity.json");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("json");
+        let mut inputs: Vec<(String, Value)> = Vec::new();
+        for case in doc["cases"].as_array().expect("cases") {
+            let mut record = json!({});
+            for key in ["facets", "embed"] {
+                if let Some(v) = case.get(key) {
+                    record[key] = v.clone();
+                }
+            }
+            inputs.push((case["name"].as_str().expect("name").to_string(), record));
+        }
+        for (case, embed, _) in crate::private_tier::media::embed_fixtures() {
+            inputs.push((format!("media fixture: {case}"), json!({"embed": embed})));
+        }
+        let mut differed = Vec::new();
+        for (case, record) in &inputs {
+            let d = DisplayFields::parse(record);
+            let (quote, mentions, media) = old_fallback(d.facets.as_ref(), d.embed.as_ref());
+            assert_eq!(d.mention_dids, mentions, "{case}");
+            assert_eq!(d.media_kinds, media, "{case}");
+            if d.quote_uri != quote {
+                let embed = crate::hydration::embeds::normalize_embed(d.embed.as_ref().expect("embed"));
+                let strong_ref = match embed["$type"].as_str() {
+                    Some("app.bsky.embed.record") => &embed["record"],
+                    _ => &embed["record"]["record"],
+                };
+                assert!(!strong_ref["cid"].is_string() && d.quote_uri.is_none(), "{case}: {:?} vs {quote:?}", d.quote_uri);
+                differed.push(case.clone());
+            }
+        }
+        assert_eq!(differed, ["quote without a cid", "quote with a non-string cid"], "the cid-less quotes, and only they");
     }
 
     /// Rule 1 (private-embeds design §6): a live create notifies at any age;

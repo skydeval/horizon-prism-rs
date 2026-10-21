@@ -1,0 +1,1097 @@
+{
+  "generatedBy": "the PDS's content_payload and clear-field derivation (aurora-locus src/kryphocron_content.rs at 42280a4), serde_json with preserve_order",
+  "cases": [
+    {
+      "name": "text only",
+      "text": "hello",
+      "payloadHex": "ff7b2274657874223a2268656c6c6f227d",
+      "clear": {}
+    },
+    {
+      "name": "empty text",
+      "text": "",
+      "payloadHex": "ff7b2274657874223a22227d",
+      "clear": {}
+    },
+    {
+      "name": "non-ASCII and control characters",
+      "text": "café ☃ 🌅 tab\there\nline\u0001\u001f \"quoted\" back\\slash  ",
+      "payloadHex": "ff7b2274657874223a22636166c3a920e2988320f09f8c85207461625c74686572655c6e6c696e655c75303030315c7530303166205c2271756f7465645c22206261636b5c5c736c61736820e280a8227d",
+      "clear": {}
+    },
+    {
+      "name": "PDS test: kryphocron image",
+      "text": "t",
+      "embed": {
+        "$type": "tools.kryphocron.feed.postPublic#embedImage",
+        "images": [
+          {
+            "alt": "a quiet street",
+            "image": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6paaaaa"
+              },
+              "mimeType": "image/jpeg",
+              "size": 1234
+            }
+          }
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d626564496d616765222c22696d61676573223a5b7b22616c74223a226120717569657420737472656574222c22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261666b726569613373786279636a64376e61736f74667163766b7161626d7a726b6f36617569636a6d78746f6576363263787636706161616161227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a313233347d7d5d7d7d",
+      "clear": {
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6paaaaa"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1234
+          }
+        ]
+      }
+    },
+    {
+      "name": "PDS test: kryphocron gallery",
+      "text": "t",
+      "embed": {
+        "$type": "tools.kryphocron.feed.postPublic#embedGallery",
+        "items": [
+          {
+            "alt": "one",
+            "image": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pbbbbb"
+              },
+              "mimeType": "image/png",
+              "size": 1234
+            },
+            "aspectRatio": {
+              "width": 1,
+              "height": 1
+            }
+          },
+          {
+            "alt": "two",
+            "image": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pccccc"
+              },
+              "mimeType": "image/png",
+              "size": 1234
+            },
+            "aspectRatio": {
+              "width": 2,
+              "height": 1
+            }
+          }
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d62656447616c6c657279222c226974656d73223a5b7b22616c74223a226f6e65222c22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261666b726569613373786279636a64376e61736f74667163766b7161626d7a726b6f36617569636a6d78746f6576363263787636706262626262227d2c226d696d6554797065223a22696d6167652f706e67222c2273697a65223a313233347d2c22617370656374526174696f223a7b227769647468223a312c22686569676874223a317d7d2c7b22616c74223a2274776f222c22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261666b726569613373786279636a64376e61736f74667163766b7161626d7a726b6f36617569636a6d78746f6576363263787636706363636363227d2c226d696d6554797065223a22696d6167652f706e67222c2273697a65223a313233347d2c22617370656374526174696f223a7b227769647468223a322c22686569676874223a317d7d5d7d7d",
+      "clear": {
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pbbbbb"
+            },
+            "mimeType": "image/png",
+            "size": 1234
+          },
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pccccc"
+            },
+            "mimeType": "image/png",
+            "size": 1234
+          }
+        ]
+      }
+    },
+    {
+      "name": "PDS test: kryphocron video with captions",
+      "text": "t",
+      "embed": {
+        "$type": "tools.kryphocron.feed.postPublic#embedVideo",
+        "video": {
+          "$type": "blob",
+          "ref": {
+            "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pddddd"
+          },
+          "mimeType": "video/mp4",
+          "size": 1234
+        },
+        "alt": "a clip",
+        "captions": [
+          {
+            "lang": "en",
+            "file": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6peeeee"
+              },
+              "mimeType": "text/vtt",
+              "size": 1234
+            }
+          }
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d626564566964656f222c22766964656f223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261666b726569613373786279636a64376e61736f74667163766b7161626d7a726b6f36617569636a6d78746f6576363263787636706464646464227d2c226d696d6554797065223a22766964656f2f6d7034222c2273697a65223a313233347d2c22616c74223a226120636c6970222c2263617074696f6e73223a5b7b226c616e67223a22656e222c2266696c65223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261666b726569613373786279636a64376e61736f74667163766b7161626d7a726b6f36617569636a6d78746f6576363263787636706565656565227d2c226d696d6554797065223a22746578742f767474222c2273697a65223a313233347d7d5d7d7d",
+      "clear": {
+        "mediaKinds": [
+          "video"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pddddd"
+            },
+            "mimeType": "video/mp4",
+            "size": 1234
+          },
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6peeeee"
+            },
+            "mimeType": "text/vtt",
+            "size": 1234
+          }
+        ]
+      }
+    },
+    {
+      "name": "PDS test: kryphocron external with thumb",
+      "text": "t",
+      "embed": {
+        "$type": "tools.kryphocron.feed.postPublic#embedExternal",
+        "external": {
+          "uri": "https://example.com/a",
+          "title": "A page",
+          "description": "about it",
+          "thumb": {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pfffff"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1234
+          }
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d62656445787465726e616c222c2265787465726e616c223a7b22757269223a2268747470733a2f2f6578616d706c652e636f6d2f61222c227469746c65223a22412070616765222c226465736372697074696f6e223a2261626f7574206974222c227468756d62223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261666b726569613373786279636a64376e61736f74667163766b7161626d7a726b6f36617569636a6d78746f6576363263787636706666666666227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a313233347d7d7d7d",
+      "clear": {
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pfffff"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1234
+          }
+        ]
+      }
+    },
+    {
+      "name": "PDS test: kryphocron record",
+      "text": "t",
+      "embed": {
+        "$type": "tools.kryphocron.feed.postPublic#embedRecord",
+        "record": {
+          "uri": "at://did:plc:other/tools.kryphocron.feed.postPrivate/3kquoted00002",
+          "cid": "bafyreigquoted"
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d6265645265636f7264222c227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6f746865722f746f6f6c732e6b727970686f63726f6e2e666565642e706f7374507269766174652f336b71756f7465643030303032222c22636964223a22626166797265696771756f746564227d7d7d",
+      "clear": {
+        "quote": {
+          "uri": "at://did:plc:other/tools.kryphocron.feed.postPrivate/3kquoted00002",
+          "cid": "bafyreigquoted"
+        }
+      }
+    },
+    {
+      "name": "PDS test: kryphocron record with media",
+      "text": "t",
+      "embed": {
+        "$type": "tools.kryphocron.feed.postPublic#embedRecordWithMedia",
+        "record": {
+          "record": {
+            "uri": "at://did:plc:other/tools.kryphocron.feed.postPrivate/3kquoted00002",
+            "cid": "bafyreigquoted"
+          }
+        },
+        "media": {
+          "$type": "tools.kryphocron.feed.postPublic#embedImage",
+          "images": [
+            {
+              "alt": "with a quote",
+              "image": {
+                "$type": "blob",
+                "ref": {
+                  "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pggggg"
+                },
+                "mimeType": "image/jpeg",
+                "size": 1234
+              }
+            }
+          ]
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d6265645265636f7264576974684d65646961222c227265636f7264223a7b227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6f746865722f746f6f6c732e6b727970686f63726f6e2e666565642e706f7374507269766174652f336b71756f7465643030303032222c22636964223a22626166797265696771756f746564227d7d2c226d65646961223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d626564496d616765222c22696d61676573223a5b7b22616c74223a227769746820612071756f7465222c22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261666b726569613373786279636a64376e61736f74667163766b7161626d7a726b6f36617569636a6d78746f6576363263787636706767676767227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a313233347d7d5d7d7d7d",
+      "clear": {
+        "quote": {
+          "uri": "at://did:plc:other/tools.kryphocron.feed.postPrivate/3kquoted00002",
+          "cid": "bafyreigquoted"
+        },
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pggggg"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1234
+          }
+        ]
+      }
+    },
+    {
+      "name": "stock images",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.images",
+        "images": [
+          {
+            "image": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafyimg1"
+              },
+              "mimeType": "image/jpeg",
+              "size": 1
+            },
+            "alt": ""
+          }
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e696d61676573222c22696d61676573223a5b7b22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a2262616679696d6731227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a317d2c22616c74223a22227d5d7d7d",
+      "clear": {
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyimg1"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "stock gallery",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.gallery",
+        "items": [
+          {
+            "$type": "app.bsky.embed.gallery#image",
+            "image": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafygal1"
+              },
+              "mimeType": "image/jpeg",
+              "size": 1
+            }
+          }
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e67616c6c657279222c226974656d73223a5b7b222474797065223a226170702e62736b792e656d6265642e67616c6c65727923696d616765222c22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261667967616c31227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a317d7d5d7d7d",
+      "clear": {
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafygal1"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "kryphocron gallery item type",
+      "text": "t",
+      "embed": {
+        "$type": "tools.kryphocron.feed.postPublic#embedGallery",
+        "items": [
+          {
+            "$type": "tools.kryphocron.feed.postPublic#galleryImage",
+            "image": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafygal2"
+              },
+              "mimeType": "image/jpeg",
+              "size": 1
+            }
+          }
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d62656447616c6c657279222c226974656d73223a5b7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c69632367616c6c657279496d616765222c22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261667967616c32227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a317d7d5d7d7d",
+      "clear": {
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafygal2"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "stock video",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.video",
+        "video": {
+          "$type": "blob",
+          "ref": {
+            "$link": "bafyvid1"
+          },
+          "mimeType": "video/mp4",
+          "size": 1
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e766964656f222c22766964656f223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261667976696431227d2c226d696d6554797065223a22766964656f2f6d7034222c2273697a65223a317d7d7d",
+      "clear": {
+        "mediaKinds": [
+          "video"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyvid1"
+            },
+            "mimeType": "video/mp4",
+            "size": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "stock external, no thumb",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.external",
+        "external": {
+          "uri": "https://example.com/b",
+          "title": "B",
+          "description": ""
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e65787465726e616c222c2265787465726e616c223a7b22757269223a2268747470733a2f2f6578616d706c652e636f6d2f62222c227469746c65223a2242222c226465736372697074696f6e223a22227d7d7d",
+      "clear": {}
+    },
+    {
+      "name": "stock record",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.record",
+        "record": {
+          "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+          "cid": "bafyq"
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264222c227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6262626262626262626262626262626262626262626262622f6170702e62736b792e666565642e706f73742f336b71222c22636964223a226261667971227d7d7d",
+      "clear": {
+        "quote": {
+          "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+          "cid": "bafyq"
+        }
+      }
+    },
+    {
+      "name": "stock record with images",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.recordWithMedia",
+        "record": {
+          "$type": "app.bsky.embed.record",
+          "record": {
+            "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/tools.kryphocron.feed.postPrivate/3kq",
+            "cid": "bafyq"
+          }
+        },
+        "media": {
+          "$type": "app.bsky.embed.images",
+          "images": [
+            {
+              "image": {
+                "$type": "blob",
+                "ref": {
+                  "$link": "bafyimg2"
+                },
+                "mimeType": "image/png",
+                "size": 2
+              },
+              "alt": "x"
+            }
+          ]
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264576974684d65646961222c227265636f7264223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264222c227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6262626262626262626262626262626262626262626262622f746f6f6c732e6b727970686f63726f6e2e666565642e706f7374507269766174652f336b71222c22636964223a226261667971227d7d2c226d65646961223a7b222474797065223a226170702e62736b792e656d6265642e696d61676573222c22696d61676573223a5b7b22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a2262616679696d6732227d2c226d696d6554797065223a22696d6167652f706e67222c2273697a65223a327d2c22616c74223a2278227d5d7d7d7d",
+      "clear": {
+        "quote": {
+          "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/tools.kryphocron.feed.postPrivate/3kq",
+          "cid": "bafyq"
+        },
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyimg2"
+            },
+            "mimeType": "image/png",
+            "size": 2
+          }
+        ]
+      }
+    },
+    {
+      "name": "stock record with kryphocron video",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.recordWithMedia",
+        "record": {
+          "record": {
+            "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+            "cid": "bafyq"
+          }
+        },
+        "media": {
+          "$type": "tools.kryphocron.feed.postPublic#embedVideo",
+          "video": {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyvid2"
+            },
+            "mimeType": "video/mp4",
+            "size": 3
+          }
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264576974684d65646961222c227265636f7264223a7b227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6262626262626262626262626262626262626262626262622f6170702e62736b792e666565642e706f73742f336b71222c22636964223a226261667971227d7d2c226d65646961223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d626564566964656f222c22766964656f223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261667976696432227d2c226d696d6554797065223a22766964656f2f6d7034222c2273697a65223a337d7d7d7d",
+      "clear": {
+        "quote": {
+          "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+          "cid": "bafyq"
+        },
+        "mediaKinds": [
+          "video"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyvid2"
+            },
+            "mimeType": "video/mp4",
+            "size": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "kryphocron record with stock images",
+      "text": "t",
+      "embed": {
+        "$type": "tools.kryphocron.feed.postPublic#embedRecordWithMedia",
+        "record": {
+          "record": {
+            "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+            "cid": "bafyq"
+          }
+        },
+        "media": {
+          "$type": "app.bsky.embed.images",
+          "images": [
+            {
+              "image": {
+                "$type": "blob",
+                "ref": {
+                  "$link": "bafyimg3"
+                },
+                "mimeType": "image/jpeg",
+                "size": 1
+              },
+              "alt": ""
+            }
+          ]
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c696323656d6265645265636f7264576974684d65646961222c227265636f7264223a7b227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6262626262626262626262626262626262626262626262622f6170702e62736b792e666565642e706f73742f336b71222c22636964223a226261667971227d7d2c226d65646961223a7b222474797065223a226170702e62736b792e656d6265642e696d61676573222c22696d61676573223a5b7b22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a2262616679696d6733227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a317d2c22616c74223a22227d5d7d7d7d",
+      "clear": {
+        "quote": {
+          "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+          "cid": "bafyq"
+        },
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyimg3"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "record with media with no media",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.recordWithMedia",
+        "record": {
+          "record": {
+            "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+            "cid": "bafyq"
+          }
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264576974684d65646961222c227265636f7264223a7b227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6262626262626262626262626262626262626262626262622f6170702e62736b792e666565642e706f73742f336b71222c22636964223a226261667971227d7d7d7d",
+      "clear": {
+        "quote": {
+          "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+          "cid": "bafyq"
+        }
+      }
+    },
+    {
+      "name": "nested record with media",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.recordWithMedia",
+        "record": {
+          "record": {
+            "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+            "cid": "bafyq"
+          }
+        },
+        "media": {
+          "$type": "app.bsky.embed.recordWithMedia",
+          "record": {
+            "record": {
+              "uri": "at://did:plc:cccccccccccccccccccccccc/app.bsky.feed.post/3kr",
+              "cid": "bafyr"
+            }
+          },
+          "media": {
+            "$type": "app.bsky.embed.images",
+            "images": [
+              {
+                "image": {
+                  "$type": "blob",
+                  "ref": {
+                    "$link": "bafyimg4"
+                  },
+                  "mimeType": "image/jpeg",
+                  "size": 1
+                },
+                "alt": ""
+              }
+            ]
+          }
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264576974684d65646961222c227265636f7264223a7b227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6262626262626262626262626262626262626262626262622f6170702e62736b792e666565642e706f73742f336b71222c22636964223a226261667971227d7d2c226d65646961223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264576974684d65646961222c227265636f7264223a7b227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6363636363636363636363636363636363636363636363632f6170702e62736b792e666565642e706f73742f336b72222c22636964223a226261667972227d7d2c226d65646961223a7b222474797065223a226170702e62736b792e656d6265642e696d61676573222c22696d61676573223a5b7b22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a2262616679696d6734227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a317d2c22616c74223a22227d5d7d7d7d7d",
+      "clear": {
+        "quote": {
+          "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+          "cid": "bafyq"
+        },
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyimg4"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "quote without a cid",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.record",
+        "record": {
+          "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq"
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264222c227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6262626262626262626262626262626262626262626262622f6170702e62736b792e666565642e706f73742f336b71227d7d7d",
+      "clear": {}
+    },
+    {
+      "name": "quote with a non-string cid",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.record",
+        "record": {
+          "uri": "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kq",
+          "cid": {
+            "$link": "bafyq"
+          }
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264222c227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6262626262626262626262626262626262626262626262622f6170702e62736b792e666565642e706f73742f336b71222c22636964223a7b22246c696e6b223a226261667971227d7d7d7d",
+      "clear": {}
+    },
+    {
+      "name": "quote naming a non-DID authority",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.record",
+        "record": {
+          "uri": "at://not-a-did/app.bsky.feed.post/3kq",
+          "cid": "bafyq"
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264222c227265636f7264223a7b22757269223a2261743a2f2f6e6f742d612d6469642f6170702e62736b792e666565642e706f73742f336b71222c22636964223a226261667971227d7d7d",
+      "clear": {
+        "quote": {
+          "uri": "at://not-a-did/app.bsky.feed.post/3kq",
+          "cid": "bafyq"
+        }
+      }
+    },
+    {
+      "name": "unknown embed type with a blob",
+      "text": "t",
+      "embed": {
+        "$type": "app.example.embed.audio",
+        "audio": {
+          "$type": "blob",
+          "ref": {
+            "$link": "bafyaud"
+          },
+          "mimeType": "audio/ogg",
+          "size": 9
+        }
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e6578616d706c652e656d6265642e617564696f222c22617564696f223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a2262616679617564227d2c226d696d6554797065223a22617564696f2f6f6767222c2273697a65223a397d7d7d",
+      "clear": {
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyaud"
+            },
+            "mimeType": "audio/ogg",
+            "size": 9
+          }
+        ]
+      }
+    },
+    {
+      "name": "embed without a type",
+      "text": "t",
+      "embed": {
+        "images": [
+          {
+            "image": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafyimg5"
+              },
+              "mimeType": "image/jpeg",
+              "size": 1
+            }
+          }
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b22696d61676573223a5b7b22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a2262616679696d6735227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a317d7d5d7d7d",
+      "clear": {
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyimg5"
+            },
+            "mimeType": "image/jpeg",
+            "size": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "legacy blob form",
+      "text": "t",
+      "embed": {
+        "$type": "app.bsky.embed.images",
+        "images": [
+          {
+            "image": {
+              "cid": "bafylegacy",
+              "mimeType": "image/jpeg"
+            },
+            "alt": ""
+          }
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a2274222c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e696d61676573222c22696d61676573223a5b7b22696d616765223a7b22636964223a22626166796c6567616379222c226d696d6554797065223a22696d6167652f6a706567227d2c22616c74223a22227d5d7d7d",
+      "clear": {
+        "mediaKinds": [
+          "image"
+        ]
+      }
+    },
+    {
+      "name": "mentions in three types, a duplicate and a non-DID",
+      "text": "@a @b @c @a @x",
+      "facets": [
+        {
+          "index": {
+            "byteStart": 0,
+            "byteEnd": 2
+          },
+          "features": [
+            {
+              "$type": "app.bsky.richtext.facet#mention",
+              "did": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ]
+        },
+        {
+          "index": {
+            "byteStart": 3,
+            "byteEnd": 5
+          },
+          "features": [
+            {
+              "$type": "tools.kryphocron.feed.postPublic#mention",
+              "did": "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+          ]
+        },
+        {
+          "index": {
+            "byteStart": 6,
+            "byteEnd": 8
+          },
+          "features": [
+            {
+              "$type": "#mention",
+              "did": "did:web:carol.example"
+            }
+          ]
+        },
+        {
+          "index": {
+            "byteStart": 9,
+            "byteEnd": 11
+          },
+          "features": [
+            {
+              "$type": "app.bsky.richtext.facet#mention",
+              "did": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ]
+        },
+        {
+          "index": {
+            "byteStart": 12,
+            "byteEnd": 14
+          },
+          "features": [
+            {
+              "$type": "app.bsky.richtext.facet#mention",
+              "did": "not a did"
+            }
+          ]
+        }
+      ],
+      "payloadHex": "ff7b2274657874223a224061204062204063204061204078222c22666163657473223a5b7b22696e646578223a7b22627974655374617274223a302c2262797465456e64223a327d2c226665617475726573223a5b7b222474797065223a226170702e62736b792e72696368746578742e6661636574236d656e74696f6e222c22646964223a226469643a706c633a616161616161616161616161616161616161616161616161227d5d7d2c7b22696e646578223a7b22627974655374617274223a332c2262797465456e64223a357d2c226665617475726573223a5b7b222474797065223a22746f6f6c732e6b727970686f63726f6e2e666565642e706f73745075626c6963236d656e74696f6e222c22646964223a226469643a706c633a626262626262626262626262626262626262626262626262227d5d7d2c7b22696e646578223a7b22627974655374617274223a362c2262797465456e64223a387d2c226665617475726573223a5b7b222474797065223a22236d656e74696f6e222c22646964223a226469643a7765623a6361726f6c2e6578616d706c65227d5d7d2c7b22696e646578223a7b22627974655374617274223a392c2262797465456e64223a31317d2c226665617475726573223a5b7b222474797065223a226170702e62736b792e72696368746578742e6661636574236d656e74696f6e222c22646964223a226469643a706c633a616161616161616161616161616161616161616161616161227d5d7d2c7b22696e646578223a7b22627974655374617274223a31322c2262797465456e64223a31347d2c226665617475726573223a5b7b222474797065223a226170702e62736b792e72696368746578742e6661636574236d656e74696f6e222c22646964223a226e6f74206120646964227d5d7d5d7d",
+      "clear": {
+        "mentionDids": [
+          "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+          "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+          "did:web:carol.example",
+          "not a did"
+        ]
+      }
+    },
+    {
+      "name": "links, tags and a mention with no did",
+      "text": "see #tag",
+      "facets": [
+        {
+          "index": {
+            "byteStart": 0,
+            "byteEnd": 3
+          },
+          "features": [
+            {
+              "$type": "app.bsky.richtext.facet#link",
+              "uri": "https://example.com"
+            }
+          ]
+        },
+        {
+          "index": {
+            "byteStart": 4,
+            "byteEnd": 8
+          },
+          "features": [
+            {
+              "$type": "app.bsky.richtext.facet#tag",
+              "tag": "tag"
+            },
+            {
+              "$type": "app.bsky.richtext.facet#mention"
+            }
+          ]
+        }
+      ],
+      "payloadHex": "ff7b2274657874223a227365652023746167222c22666163657473223a5b7b22696e646578223a7b22627974655374617274223a302c2262797465456e64223a337d2c226665617475726573223a5b7b222474797065223a226170702e62736b792e72696368746578742e6661636574236c696e6b222c22757269223a2268747470733a2f2f6578616d706c652e636f6d227d5d7d2c7b22696e646578223a7b22627974655374617274223a342c2262797465456e64223a387d2c226665617475726573223a5b7b222474797065223a226170702e62736b792e72696368746578742e666163657423746167222c22746167223a22746167227d2c7b222474797065223a226170702e62736b792e72696368746578742e6661636574236d656e74696f6e227d5d7d5d7d",
+      "clear": {}
+    },
+    {
+      "name": "keys in non-alphabetical order",
+      "text": "z",
+      "facets": [
+        {
+          "index": {
+            "byteEnd": 1,
+            "byteStart": 0
+          },
+          "features": [
+            {
+              "did": "did:plc:dddddddddddddddddddddddd",
+              "$type": "app.bsky.richtext.facet#mention"
+            }
+          ]
+        }
+      ],
+      "embed": {
+        "images": [
+          {
+            "image": {
+              "size": 7,
+              "mimeType": "image/webp",
+              "ref": {
+                "$link": "bafyorder"
+              },
+              "$type": "blob"
+            },
+            "alt": "zz",
+            "aspectRatio": {
+              "width": 3,
+              "height": 2
+            }
+          }
+        ],
+        "$type": "app.bsky.embed.images"
+      },
+      "payloadHex": "ff7b2274657874223a227a222c22666163657473223a5b7b22696e646578223a7b2262797465456e64223a312c22627974655374617274223a307d2c226665617475726573223a5b7b22646964223a226469643a706c633a646464646464646464646464646464646464646464646464222c222474797065223a226170702e62736b792e72696368746578742e6661636574236d656e74696f6e227d5d7d5d2c22656d626564223a7b22696d61676573223a5b7b22696d616765223a7b2273697a65223a372c226d696d6554797065223a22696d6167652f77656270222c22726566223a7b22246c696e6b223a22626166796f72646572227d2c222474797065223a22626c6f62227d2c22616c74223a227a7a222c22617370656374526174696f223a7b227769647468223a332c22686569676874223a327d7d5d2c222474797065223a226170702e62736b792e656d6265642e696d61676573227d7d",
+      "clear": {
+        "mentionDids": [
+          "did:plc:dddddddddddddddddddddddd"
+        ],
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "size": 7,
+            "mimeType": "image/webp",
+            "ref": {
+              "$link": "bafyorder"
+            },
+            "$type": "blob"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Horizon extension keys",
+      "text": "spoiler",
+      "facets": [
+        {
+          "index": {
+            "byteStart": 0,
+            "byteEnd": 7
+          },
+          "features": [
+            {
+              "$type": "app.nearhorizon.richtext.facet#spoiler",
+              "reason": "plot"
+            },
+            {
+              "$type": "app.bsky.richtext.facet#mention",
+              "did": "did:plc:eeeeeeeeeeeeeeeeeeeeeeee"
+            }
+          ]
+        }
+      ],
+      "embed": {
+        "$type": "app.bsky.embed.images",
+        "images": [
+          {
+            "image": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafyspoiler"
+              },
+              "mimeType": "image/jpeg",
+              "size": 5
+            },
+            "alt": "",
+            "app.nearhorizon.spoiler": {
+              "reason": "flashing",
+              "blur": true
+            }
+          }
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a2273706f696c6572222c22666163657473223a5b7b22696e646578223a7b22627974655374617274223a302c2262797465456e64223a377d2c226665617475726573223a5b7b222474797065223a226170702e6e656172686f72697a6f6e2e72696368746578742e66616365742373706f696c6572222c22726561736f6e223a22706c6f74227d2c7b222474797065223a226170702e62736b792e72696368746578742e6661636574236d656e74696f6e222c22646964223a226469643a706c633a656565656565656565656565656565656565656565656565227d5d7d5d2c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e696d61676573222c22696d61676573223a5b7b22696d616765223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261667973706f696c6572227d2c226d696d6554797065223a22696d6167652f6a706567222c2273697a65223a357d2c22616c74223a22222c226170702e6e656172686f72697a6f6e2e73706f696c6572223a7b22726561736f6e223a22666c617368696e67222c22626c7572223a747275657d7d5d7d7d",
+      "clear": {
+        "mentionDids": [
+          "did:plc:eeeeeeeeeeeeeeeeeeeeeeee"
+        ],
+        "mediaKinds": [
+          "image"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyspoiler"
+            },
+            "mimeType": "image/jpeg",
+            "size": 5
+          }
+        ]
+      }
+    },
+    {
+      "name": "facets and embed together",
+      "text": "hi @f",
+      "facets": [
+        {
+          "index": {
+            "byteStart": 3,
+            "byteEnd": 5
+          },
+          "features": [
+            {
+              "$type": "app.bsky.richtext.facet#mention",
+              "did": "did:plc:ffffffffffffffffffffffff"
+            }
+          ]
+        }
+      ],
+      "embed": {
+        "$type": "app.bsky.embed.recordWithMedia",
+        "record": {
+          "record": {
+            "uri": "at://did:plc:ffffffffffffffffffffffff/tools.kryphocron.feed.postPrivate/3kz",
+            "cid": "bafyz"
+          }
+        },
+        "media": {
+          "$type": "app.bsky.embed.video",
+          "video": {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyvid3"
+            },
+            "mimeType": "video/mp4",
+            "size": 4
+          }
+        }
+      },
+      "payloadHex": "ff7b2274657874223a226869204066222c22666163657473223a5b7b22696e646578223a7b22627974655374617274223a332c2262797465456e64223a357d2c226665617475726573223a5b7b222474797065223a226170702e62736b792e72696368746578742e6661636574236d656e74696f6e222c22646964223a226469643a706c633a666666666666666666666666666666666666666666666666227d5d7d5d2c22656d626564223a7b222474797065223a226170702e62736b792e656d6265642e7265636f7264576974684d65646961222c227265636f7264223a7b227265636f7264223a7b22757269223a2261743a2f2f6469643a706c633a6666666666666666666666666666666666666666666666662f746f6f6c732e6b727970686f63726f6e2e666565642e706f7374507269766174652f336b7a222c22636964223a22626166797a227d7d2c226d65646961223a7b222474797065223a226170702e62736b792e656d6265642e766964656f222c22766964656f223a7b222474797065223a22626c6f62222c22726566223a7b22246c696e6b223a226261667976696433227d2c226d696d6554797065223a22766964656f2f6d7034222c2273697a65223a347d7d7d7d",
+      "clear": {
+        "mentionDids": [
+          "did:plc:ffffffffffffffffffffffff"
+        ],
+        "quote": {
+          "uri": "at://did:plc:ffffffffffffffffffffffff/tools.kryphocron.feed.postPrivate/3kz",
+          "cid": "bafyz"
+        },
+        "mediaKinds": [
+          "video"
+        ],
+        "embedBlobs": [
+          {
+            "$type": "blob",
+            "ref": {
+              "$link": "bafyvid3"
+            },
+            "mimeType": "video/mp4",
+            "size": 4
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty facets and numbers",
+      "text": "n",
+      "facets": [],
+      "embed": {
+        "$type": "app.example.embed.numbers",
+        "values": [
+          1,
+          -2,
+          3.5,
+          1e+100,
+          0.1,
+          12345678901234567890
+        ]
+      },
+      "payloadHex": "ff7b2274657874223a226e222c22666163657473223a5b5d2c22656d626564223a7b222474797065223a226170702e6578616d706c652e656d6265642e6e756d62657273222c2276616c756573223a5b312c2d322c332e352c31652b3130302c302e312c31323334353637383930313233343536373839305d7d7d",
+      "clear": {}
+    }
+  ]
+}
