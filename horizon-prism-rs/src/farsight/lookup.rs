@@ -1766,6 +1766,9 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct Fake {
         pub blockers: Mutex<HashSet<String>>,
+        /// Accounts the actor list-blocks, each with the lists it names in
+        /// `blockedByActor`.
+        pub blocked_through: Mutex<HashMap<String, Vec<String>>>,
         pub level: Mutex<&'static str>,
         pub status: Mutex<u16>,
         pub delay_ms: Mutex<u64>,
@@ -1795,10 +1798,15 @@ pub(crate) mod tests {
             return "x".repeat(5 * 1024 * 1024).into_response();
         }
         let blockers = fake.blockers.lock().expect("blockers");
+        let through = fake.blocked_through.lock().expect("through");
         let results: Vec<Value> = others
             .iter()
-            .filter(|o| blockers.contains(*o))
-            .map(|o| json!({"did": o, "blocksActor": {"direct": false, "lists": [LIST]}, "blockedByActor": {"direct": false, "lists": []}}))
+            .filter(|o| blockers.contains(*o) || through.contains_key(*o))
+            .map(|o| {
+                let inbound: Vec<&str> = if blockers.contains(o) { vec![LIST] } else { Vec::new() };
+                let outbound = through.get(o).cloned().unwrap_or_default();
+                json!({"did": o, "blocksActor": {"direct": false, "lists": inbound}, "blockedByActor": {"direct": false, "lists": outbound}})
+            })
             .collect();
         let level = *fake.level.lock().expect("level");
         axum::Json(json!({"actor": V, "results": results, "partialFor": [], "freshness": {"coverage": {"level": if level.is_empty() { "complete" } else { level }}}})).into_response()

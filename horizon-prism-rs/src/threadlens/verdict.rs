@@ -78,6 +78,11 @@ pub struct Judge {
     bridging: bool,
     baseline_done: bool,
     out_local: HashSet<String>,
+    /// Of `out_local`, the authors the viewer blocks directly.
+    out_direct: HashSet<String>,
+    /// Of `out_local`, the smallest URI of the viewer's applying list-block
+    /// references that cover each author.
+    out_lists: HashMap<String, String>,
     in_local: HashSet<String>,
     pairs: HashMap<String, PairAnswer>,
     judged: HashSet<String>,
@@ -95,6 +100,8 @@ impl Judge {
             bridging: false,
             baseline_done: false,
             out_local: HashSet::new(),
+            out_direct: HashSet::new(),
+            out_lists: HashMap::new(),
             in_local: HashSet::new(),
             pairs: HashMap::new(),
             judged: HashSet::new(),
@@ -110,6 +117,7 @@ impl Judge {
         let mut judge = Self::new(pool, viewer, None, &ThreadLensConfig::default());
         let own = |dids: &[&str]| dids.iter().map(ToString::to_string).collect::<HashSet<String>>();
         judge.out_local = own(by_viewer);
+        judge.out_direct = own(by_viewer);
         judge.in_local = own(of_viewer);
         judge.judged = own(by_viewer).into_iter().chain(own(of_viewer)).chain(own(others)).collect();
         judge.baseline_done = true;
@@ -151,6 +159,22 @@ impl Judge {
         )
     }
 
+    /// For an author the viewer blocks through a list and not directly,
+    /// one such list of the viewer's own: the smallest URI among its
+    /// applying list-block references that cover the author and the list
+    /// Farsight's `blockedByActor` named (Thread Lens amendment 1 §2A).
+    /// `None` for a direct block, and when no list is known. Nothing of the
+    /// author's own records is read.
+    #[must_use]
+    pub fn blocking_list(&self, did: &str) -> Option<String> {
+        let pair = self.pairs.get(did);
+        if self.out_direct.contains(did) || pair.is_some_and(|p| p.outbound.direct) {
+            return None;
+        }
+        let farsight = pair.and_then(|p| p.outbound.list.as_ref());
+        [self.out_lists.get(did), farsight].into_iter().flatten().min().cloned()
+    }
+
     /// Every block the request knows so far, for the views it builds
     /// (§5.15.12).
     #[must_use]
@@ -171,10 +195,12 @@ impl Judge {
     /// Rule 2 for `authors`: the viewer's direct blocks, its list-block
     /// references that apply, and direct blocks of the viewer.
     async fn local(&mut self, authors: &[String]) -> Result<(), sqlx::Error> {
-        let rows: Vec<(String, bool)> = sqlx::query_as(&format!(
-            "SELECT subject_did, true FROM blocks WHERE author_did = $1 AND subject_did = ANY($2) \
-             UNION ALL SELECT author_did, false FROM blocks WHERE subject_did = $1 AND author_did = ANY($2) \
-             UNION ALL SELECT i.subject_did, true FROM list_references r \
+        // The third column names the list for a list block, and is NULL for
+        // a direct one.
+        let rows: Vec<(String, bool, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT subject_did, true, NULL::text FROM blocks WHERE author_did = $1 AND subject_did = ANY($2) \
+             UNION ALL SELECT author_did, false, NULL::text FROM blocks WHERE subject_did = $1 AND author_did = ANY($2) \
+             UNION ALL SELECT i.subject_did, true, r.list_uri FROM list_references r \
                JOIN subscribed_lists l ON l.list_uri = r.list_uri \
                JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
                WHERE r.member_did = $1 AND r.source = 'block' AND {APPLIES} AND i.subject_did = ANY($2)"
@@ -183,12 +209,23 @@ impl Judge {
         .bind(authors)
         .fetch_all(&self.pool)
         .await?;
-        for (did, outbound) in rows {
-            if outbound {
-                self.out_local.insert(did);
-            } else {
+        for (did, outbound, list) in rows {
+            if !outbound {
                 self.in_local.insert(did);
+                continue;
             }
+            match list {
+                Some(list) => {
+                    let smallest = self.out_lists.entry(did.clone()).or_insert_with(|| list.clone());
+                    if list < *smallest {
+                        *smallest = list;
+                    }
+                }
+                None => {
+                    self.out_direct.insert(did.clone());
+                }
+            }
+            self.out_local.insert(did);
         }
         Ok(())
     }

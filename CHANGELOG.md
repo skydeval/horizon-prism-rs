@@ -10,6 +10,24 @@ commit.
 
 ## [Unreleased]
 
+### Added (Thread Lens: which of the caller's lists blocks an author, #792)
+
+- A `blocked-by-you` gap whose block comes through one of the caller's own
+  list blocks, and not a direct block, carries `blockingByListUri`: that
+  list's at-uri (stock's `blockingByList` concept, as the URI only). When
+  several apply, the smallest URI, across the caller's applying
+  list-block references and the list Farsight names in `blockedByActor`.
+  Absent for a direct block and when no list is known. `getThread` and
+  `resolve` alike.
+- No new call: the local verdict query returns the list it already joins
+  on, and the pair answer already holds Farsight's list. Nothing of the
+  author's records is read or sent. `blocking-you` gaps carry no list.
+- Lexicon: `blockingByListUri` on `gapNode`. Thread Lens amendment 1 §2A.
+- Tests: a list block from local references (the smaller of two), a
+  direct block with a list (no field), a `blocking-you` gap (no field),
+  a list Farsight alone reports, for a member and a visitor, through
+  `getThread` and `resolve`; nothing of the authors in the bytes.
+
 ### Added (Thread Lens: replies the thread's author hid are flagged, #791)
 
 - A Thread Lens node whose URI the thread root's threadgate lists in

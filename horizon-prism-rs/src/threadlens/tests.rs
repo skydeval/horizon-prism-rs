@@ -408,6 +408,82 @@ async fn an_upstream_baselines_gate_flags_its_hidden_replies() {
     db.drop_db().await;
 }
 
+/// T-11 (Thread Lens amendment 1 §2A): a `blocked-by-you` gap names the
+/// caller's own list when the block comes through one, the smallest URI
+/// when several do, from the caller's references or from Farsight's
+/// `blockedByActor`; never for a direct block, never on `blocking-you`.
+#[tokio::test]
+async fn a_blocked_by_you_gap_names_the_callers_list() {
+    let Some(db) = fresh_db("threadlens_blocking_list").await else {
+        return;
+    };
+    let p = &db.pool;
+    const D: &str = "did:plc:dddddddddddddddddddddddd";
+    const E: &str = "did:plc:eeeeeeeeeeeeeeeeeeeeeeee";
+    for (did, handle) in [(AUTHOR, "author.test"), (R1, "r1.test"), (R2, "r2.test"), (D, "d.test"), (E, "e.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    let owner = "did:plc:oooooooooooooooooooooooo";
+    let (l1, l2) = (format!("at://{owner}/app.bsky.graph.list/3kl1"), format!("at://{owner}/app.bsky.graph.list/3kl0"));
+    // The viewer list-blocks L1 (holding R1 and D) and L2 (holding R1),
+    // blocks D directly too, and blocks nobody else. R2 blocks the viewer
+    // through a list of R2's (per Farsight). Farsight reports E in a list
+    // the viewer list-blocks that no local reference covers.
+    for (list, subjects) in [(&l1, vec![R1, D]), (&l2, vec![R1])] {
+        exec(p, &format!("INSERT INTO subscribed_lists (list_uri, owner_did, state, purpose) VALUES ('{list}', '{owner}', 'active', 'app.bsky.graph.defs#modlist')")).await;
+        for (i, s) in subjects.iter().enumerate() {
+            let rkey = format!("3ki{}{i}", list.rsplit('/').next().expect("rkey"));
+            exec(p, &format!("INSERT INTO subscribed_list_items (uri, list_uri, owner_did, rkey, cid, rev, subject_did) VALUES ('at://{owner}/app.bsky.graph.listitem/{rkey}', '{list}', '{owner}', '{rkey}', 'c', '3k', '{s}')")).await;
+        }
+        exec(p, &format!("INSERT INTO list_references (member_did, list_uri, source, admitted, effective) VALUES ('{VIEWER_A}', '{list}', 'block', true, true)")).await;
+    }
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kd', '{VIEWER_A}', '{D}', '3kaaaaaaaaaa2', now())")).await;
+    let anchor = post(p, AUTHOR, "3kanchor2222", "anchor", None, None).await;
+    let by_r1 = post(p, R1, "3kbyr1222222", "secret r1", Some(&anchor), Some(&anchor)).await;
+    let by_d = post(p, D, "3kbyd2222222", "secret d", Some(&anchor), Some(&anchor)).await;
+    let by_r2 = post(p, R2, "3kbyr2222222", "secret r2", Some(&anchor), Some(&anchor)).await;
+    let by_e = post(p, E, "3kbye2222222", "secret e", Some(&anchor), Some(&anchor)).await;
+    let farsight_list = format!("at://{VIEWER_A}/app.bsky.graph.list/3kmine");
+    let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
+    fake.blockers.lock().expect("blockers").insert(R2.to_string());
+    fake.blocked_through.lock().expect("through").insert(E.to_string(), vec![farsight_list.clone()]);
+    let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
+    let base = fake_upstream(Arc::new(Calls::default()), None).await;
+    let l = ladder(h, &base, Arc::new(StubLookup::default()));
+    let (req, key, cfg) = (Requester::test(), CursorKey::generated(), ThreadLensConfig::default());
+    let list_of = |nodes: &[LensNode], uri: &str| -> (Option<&'static str>, Option<String>) {
+        let v = crate::hydration::lens::lens_items(nodes, Bridging::Full);
+        let item = v.inner()["items"].as_array().expect("items").iter().find(|i| i["uri"] == json!(uri)).cloned().expect("node");
+        let gap = Gap::ALL.iter().find(|g| item["gap"] == json!(g.label())).map(|g| g.label());
+        (gap, item["blockingByListUri"].as_str().map(str::to_string))
+    };
+
+    for viewer in [member(VIEWER_A), Viewer { did: Some(VIEWER_A.to_string()), hydrate: false }] {
+        let request = thread::Request { viewer: &viewer, req: &req, anchor: &anchor, depth: 6, parent_height: 80 };
+        let t = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+        // R1 is in L1 and L2: the smaller URI, L2.
+        assert_eq!(list_of(&t.nodes, &by_r1), (Some("blocked-by-you"), Some(l2.clone())));
+        // D is in L1 and blocked directly: no list.
+        assert_eq!(list_of(&t.nodes, &by_d), (Some("blocked-by-you"), None));
+        // R2 blocks the viewer: never a list on `blocking-you`.
+        assert_eq!(list_of(&t.nodes, &by_r2), (Some("blocking-you"), None));
+        // E: from Farsight alone, the caller's own list it named.
+        assert_eq!(list_of(&t.nodes, &by_e), (Some("blocked-by-you"), Some(farsight_list.clone())));
+        let body = serde_json::to_string(&crate::hydration::lens::lens_thread(&anchor, &t.nodes, t.bridging)).expect("json");
+        for leaked in ["secret", "r1.test", "r2.test", "d.test", "e.test", crate::farsight::lookup::tests::LIST] {
+            assert!(!body.contains(leaked), "{leaked} in {body}");
+        }
+        // `resolve` names the same lists.
+        let items = thread::resolve(&l, &cfg, &key, &viewer, &req, &[by_r1.clone(), by_d.clone(), by_r2.clone(), by_e.clone()]).await.expect("resolve");
+        assert_eq!(list_of(&items.nodes, &by_r1).1, Some(l2.clone()));
+        assert_eq!(list_of(&items.nodes, &by_d).1, None);
+        assert_eq!(list_of(&items.nodes, &by_r2).1, None);
+        assert_eq!(list_of(&items.nodes, &by_e).1, Some(farsight_list.clone()));
+    }
+    db.drop_db().await;
+}
+
 async fn serve(state: ThreadLensState) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

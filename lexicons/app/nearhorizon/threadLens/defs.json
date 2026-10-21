@@ -53,6 +53,11 @@
           "type": "boolean",
           "description": "As on postNode, on a gap of any kind. Never on a resolve item."
         },
+        "blockingByListUri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "Only on a 'blocked-by-you' gap whose block comes through a list rather than a direct block: one list the caller list-blocks that holds the author (the stock concept of viewerState.blockingByList, as the list's URI only). When several apply, the smallest URI. Absent for a direct block, and when the server knows no such list. It names only the caller's own list block, nothing of the author's records."
+        },
         "gap": {
           "type": "string",
           "description": "Why the post is not shown. 'blocked-by-you': the caller blocks the author. 'blocking-you': the author blocks the caller. 'block-state-unknown': the server did not fetch the post because it could not check the caller's blocks for its author. 'blocked': a block the ordinary thread view reported that was not looked past: a block between other parties, or one whose author's blocks with the caller could not be checked. Never returned by resolve. 'tier-hidden': every private-tier URI, whether or not it exists. An open set: treat an unknown value as a gap with no content.",

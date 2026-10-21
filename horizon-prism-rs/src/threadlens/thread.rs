@@ -719,12 +719,26 @@ impl Work<'_> {
                     gap,
                     markers: markers.clone(),
                     hidden: *hidden,
+                    blocking_list: None,
                 };
             } else if let Some(embed) = post.get_mut("embed") {
                 enforce_embeds(embed, judge);
             }
         }
         Ok(())
+    }
+
+    /// On every `blocked-by-you` gap, the caller's own list that blocks the
+    /// author, when the block comes through a list and not directly
+    /// (amendment 1 §2A). From the request's verdict data only: no call.
+    fn name_lists(&mut self) {
+        for node in &mut self.nodes {
+            let list = match &*node {
+                LensNode::Gap { uri, gap: Gap::BlockedByYou, .. } => self.judge.blocking_list(uri_author(uri).unwrap_or_default()),
+                _ => continue,
+            };
+            node.set_blocking_list(list);
+        }
     }
 
     /// The author pass (design-v4 §8.1): a post built from its record
@@ -878,6 +892,7 @@ pub async fn get_thread(
     }
     work.enforce().await?;
     work.author_pass().await;
+    work.name_lists();
     if let Some((root, hidden)) = thread_gate(h, r.anchor, &work.nodes, gate_view.as_ref()).await? {
         flag_hidden(&mut work.nodes, &root, &hidden, r.viewer);
     }
@@ -1064,6 +1079,7 @@ pub async fn resolve(
     }
     work.enforce().await?;
     work.author_pass().await;
+    work.name_lists();
     resolve_hidden(h, &mut work.nodes, viewer).await?;
     let bridging = match (bridging, work.limited) {
         (false, _) => Bridging::Off,

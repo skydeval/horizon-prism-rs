@@ -64,6 +64,10 @@ pub enum LensNode {
         markers: Markers,
         /// As on a post node.
         hidden: bool,
+        /// On a `blocked-by-you` gap whose block comes through a list: one
+        /// of the caller's own block lists that holds the author
+        /// (`blockingByListUri`, Thread Lens amendment 1 §2A).
+        blocking_list: Option<String>,
     },
 }
 
@@ -103,6 +107,14 @@ impl LensNode {
         }
     }
 
+    /// Name the caller's list on a `blocked-by-you` gap; nothing on any
+    /// other node.
+    pub fn set_blocking_list(&mut self, list: Option<String>) {
+        if let Self::Gap { gap: Gap::BlockedByYou, blocking_list, .. } = self {
+            *blocking_list = list;
+        }
+    }
+
     pub fn set_hidden_by_threadgate(&mut self, on: bool) {
         match self {
             Self::Post { hidden, .. } | Self::Gap { hidden, .. } => *hidden = on,
@@ -132,6 +144,7 @@ impl LensNode {
             gap,
             markers: Markers::default(),
             hidden: false,
+            blocking_list: None,
         }
     }
 
@@ -165,7 +178,16 @@ impl LensNode {
                 }
                 v
             }
-            Self::Gap { uri, gap, .. } => json!({"$type": "app.nearhorizon.threadLens.defs#gapNode", "uri": uri, "gap": gap.label()}),
+            Self::Gap { uri, gap, blocking_list, .. } => {
+                let mut v = json!({"$type": "app.nearhorizon.threadLens.defs#gapNode", "uri": uri, "gap": gap.label()});
+                // Only a `blocked-by-you` gap names a list: the caller's own.
+                if *gap == Gap::BlockedByYou
+                    && let Some(list) = blocking_list
+                {
+                    v["blockingByListUri"] = json!(list);
+                }
+                v
+            }
         };
         if let Some(p) = self.parent_uri() {
             v["parentUri"] = json!(p);
@@ -470,6 +492,9 @@ mod tests {
         // T-10 (amendment 1 §3.1): the flag on a post and on a gap.
         first.set_hidden_by_threadgate(true);
         blocked.set_hidden_by_threadgate(true);
+        // T-11 (§2A): the list, on a `blocked-by-you` gap only.
+        blocked.set_blocking_list(Some("at://did:plc:v/app.bsky.graph.list/l".into()));
+        hidden.set_blocking_list(Some("at://did:plc:v/app.bsky.graph.list/l".into()));
         let nodes = [first, hidden, blocked];
         let out = lens_thread("at://did:plc:a/app.bsky.feed.post/2", &nodes, Bridging::Limited);
         let v = out.inner();
@@ -485,6 +510,8 @@ mod tests {
         assert_eq!((&v["truncated"], &v["bridging"]), (&json!(true), &json!("limited")));
         assert_eq!((&v["nodes"][0]["hiddenByThreadgate"], &v["nodes"][2]["hiddenByThreadgate"]), (&json!(true), &json!(true)));
         assert!(v["nodes"][1].get("hiddenByThreadgate").is_none());
+        assert_eq!(v["nodes"][2]["blockingByListUri"], json!("at://did:plc:v/app.bsky.graph.list/l"));
+        assert!(v["nodes"][1].get("blockingByListUri").is_none() && v["nodes"][0].get("blockingByListUri").is_none());
         let items = lens_items(&nodes, Bridging::Off);
         assert!(items.inner()["items"][0].get("moreReplies").is_none());
         // `resolve` items keep it while losing their markers.
