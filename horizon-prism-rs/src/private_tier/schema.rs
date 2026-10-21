@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
+use super::handlers::PREFERENCE_REASONS;
 use super::pipeline::RecordAuthz;
 use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE};
 
@@ -2793,8 +2794,40 @@ pub(super) fn unread_statement(cap: u32) -> String {
 /// # Errors
 ///
 /// Database errors.
+#[cfg(test)]
 pub(super) async fn unread_count(pool: &PgPool, recipient: &str, cap: u32) -> Result<i64, sqlx::Error> {
     unread_count_sliced(pool, recipient, cap, climb_keys(cap), None).await
+}
+
+/// [`unread_count`] over the notifications whose reason is one of
+/// `reasons` (fast-reads design §5.2 B-1); none: every reason, exactly
+/// [`unread_count`]. Applied as `listNotifications` applies its `reasons`,
+/// so a reason no row has matches nothing.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn unread_count_for(pool: &PgPool, recipient: &str, cap: u32, reasons: &[String]) -> Result<i64, sqlx::Error> {
+    match reasons_clause(reasons) {
+        Some(filter) => unread_count_sliced_for(pool, recipient, cap, climb_keys(cap), None, &filter).await,
+        None => Ok(0),
+    }
+}
+
+/// The `reasons` filter as a clause over `n`: empty for no reasons; else
+/// the reasons given that a private notification can have, as literals
+/// from [`PREFERENCE_REASONS`] (never the caller's text). `None` when every
+/// reason given is one no row has, so nothing can match.
+pub(super) fn reasons_clause(reasons: &[String]) -> Option<String> {
+    if reasons.is_empty() {
+        return Some(String::new());
+    }
+    let known: Vec<String> = PREFERENCE_REASONS
+        .iter()
+        .filter(|k| reasons.iter().any(|r| r == *k))
+        .map(|k| format!("'{k}'"))
+        .collect();
+    (!known.is_empty()).then(|| format!(" AND n.reason IN ({})", known.join(", ")))
 }
 
 /// [`unread_count`] with K given (shared-walk §2.5): the unseen
@@ -2806,6 +2839,7 @@ pub(super) async fn unread_count(pool: &PgPool, recipient: &str, cap: u32) -> Re
 /// # Errors
 ///
 /// Database errors.
+#[cfg(test)]
 pub(super) async fn unread_count_sliced(
     pool: &PgPool,
     recipient: &str,
@@ -2813,14 +2847,27 @@ pub(super) async fn unread_count_sliced(
     k: usize,
     between: Option<&str>,
 ) -> Result<i64, sqlx::Error> {
+    unread_count_sliced_for(pool, recipient, cap, k, between, "").await
+}
+
+/// [`unread_count_sliced`] with a [`reasons_clause`] `filter` in every
+/// statement.
+async fn unread_count_sliced_for(
+    pool: &PgPool,
+    recipient: &str,
+    cap: u32,
+    k: usize,
+    between: Option<&str>,
+    filter: &str,
+) -> Result<i64, sqlx::Error> {
     // At most K candidates: one statement, one snapshot, no slice.
-    let bounded: Option<i64> = sqlx::query_scalar(&unread_bounded_statement(cap, k)).bind(recipient).fetch_one(pool).await?;
+    let bounded: Option<i64> = sqlx::query_scalar(&unread_bounded_statement_for(cap, k, filter)).bind(recipient).fetch_one(pool).await?;
     if let Some(n) = bounded {
         return Ok(n);
     }
     let mut tx = pool.begin_with(SLICED).await?;
-    let ids: Vec<i64> = sqlx::query_scalar(&unread_keys_statement()).bind(recipient).fetch_all(&mut *tx).await?;
-    let slice_sql = unread_slice_statement(cap);
+    let ids: Vec<i64> = sqlx::query_scalar(&unread_keys_statement_for(filter)).bind(recipient).fetch_all(&mut *tx).await?;
+    let slice_sql = unread_slice_statement_for(cap, filter);
     let mut total = 0i64;
     for (i, slice) in ids.chunks(k.max(1)).enumerate() {
         let n: i64 = sqlx::query_scalar(&slice_sql).bind(recipient).bind(slice).fetch_one(&mut *tx).await?;
@@ -2831,7 +2878,7 @@ pub(super) async fn unread_count_sliced(
             sqlx::query(sql).execute(pool).await?;
         }
     }
-    let public: i64 = sqlx::query_scalar(&unread_public_statement()).bind(recipient).fetch_one(&mut *tx).await?;
+    let public: i64 = sqlx::query_scalar(&unread_public_statement_for(filter)).bind(recipient).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     Ok(total + public)
 }
@@ -2840,13 +2887,18 @@ pub(super) async fn unread_count_sliced(
 /// candidates (#720, as [`quote_counts_bounded_statement`]): `c` reads at
 /// most `k` + 1, and the count is NULL, with nothing walked, when it holds
 /// more. `$1` the recipient.
+#[cfg(test)]
 pub(super) fn unread_bounded_statement(cap: u32, k: usize) -> String {
+    unread_bounded_statement_for(cap, k, "")
+}
+
+fn unread_bounded_statement_for(cap: u32, k: usize, filter: &str) -> String {
     let k = k_literal(k);
     let kept = notification_kept();
     walked(
         &format!(
             "SELECT {COLS}, n.id FROM private_notifications n JOIN private_posts p ON p.uri = n.record_uri \
-             WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN} \
+             WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN}{filter} \
                AND split_part(n.record_uri, '/', 4) = '{NSID_POST_PRIVATE}' LIMIT {}",
             k + 1
         ),
@@ -2854,7 +2906,7 @@ pub(super) fn unread_bounded_statement(cap: u32, k: usize) -> String {
         &format!(
             "SELECT CASE WHEN (SELECT count(*) FROM c) > {k} THEN NULL ELSE \
                (SELECT count(*) FROM {PV_JOIN} WHERE {PASS}) \
-               + (SELECT count(*) FROM private_notifications n WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN} \
+               + (SELECT count(*) FROM private_notifications n WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN}{filter} \
                     AND split_part(n.record_uri, '/', 4) IS DISTINCT FROM '{NSID_POST_PRIVATE}' \
                     AND EXISTS (SELECT 1 FROM private_posts s WHERE s.uri = n.reason_subject)) END"
         ),
@@ -2865,9 +2917,14 @@ pub(super) fn unread_bounded_statement(cap: u32, k: usize) -> String {
 /// The unseen private-post rows of `getUnreadCount`'s recipient `$1`
 /// (shared-walk §2.5): one scan of `private_notifications_recipient`,
 /// without [`notification_kept`].
+#[cfg(test)]
 pub(super) fn unread_keys_statement() -> String {
+    unread_keys_statement_for("")
+}
+
+fn unread_keys_statement_for(filter: &str) -> String {
     format!(
-        "SELECT n.id FROM private_notifications n WHERE n.recipient_did = $1 AND {UNSEEN} \
+        "SELECT n.id FROM private_notifications n WHERE n.recipient_did = $1 AND {UNSEEN}{filter} \
            AND split_part(n.record_uri, '/', 4) = '{NSID_POST_PRIVATE}'"
     )
 }
@@ -2876,11 +2933,16 @@ pub(super) fn unread_keys_statement() -> String {
 /// `$1` the recipient, `$2` the slice of ids; `c` is the private-post rows
 /// of the unseen notifications, one per notification, every condition of
 /// the single statement kept.
+#[cfg(test)]
 pub(super) fn unread_slice_statement(cap: u32) -> String {
+    unread_slice_statement_for(cap, "")
+}
+
+fn unread_slice_statement_for(cap: u32, filter: &str) -> String {
     walked(
         &format!(
             "SELECT {COLS}, n.id FROM private_notifications n JOIN private_posts p ON p.uri = n.record_uri \
-             WHERE n.recipient_did = $1 AND n.id = ANY($2) AND {kept} AND {UNSEEN} \
+             WHERE n.recipient_did = $1 AND n.id = ANY($2) AND {kept} AND {UNSEEN}{filter} \
                AND split_part(n.record_uri, '/', 4) = '{NSID_POST_PRIVATE}'",
             kept = notification_kept(),
         ),
@@ -2892,9 +2954,14 @@ pub(super) fn unread_slice_statement(cap: u32) -> String {
 
 /// `getUnreadCount`'s public-record term, HEAD's arm in its own statement:
 /// `$1` the recipient.
+#[cfg(test)]
 pub(super) fn unread_public_statement() -> String {
+    unread_public_statement_for("")
+}
+
+fn unread_public_statement_for(filter: &str) -> String {
     format!(
-        "SELECT count(*) FROM private_notifications n WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN} \
+        "SELECT count(*) FROM private_notifications n WHERE n.recipient_did = $1 AND {kept} AND {UNSEEN}{filter} \
            AND split_part(n.record_uri, '/', 4) IS DISTINCT FROM '{NSID_POST_PRIVATE}' \
            AND EXISTS (SELECT 1 FROM private_posts s WHERE s.uri = n.reason_subject)",
         kept = notification_kept(),

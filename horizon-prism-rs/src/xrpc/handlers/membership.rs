@@ -340,10 +340,11 @@ mod tests {
         // `private.anyPds` follows them while `private_any_pds.enabled`
         // (private-encode design §7; on by default).
         let features = json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN]).collect::<Vec<_>>());
-        assert_eq!(json!(FEATURES), json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences"]));
+        assert_eq!(json!(FEATURES), json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences", "private.unreadReasons"]));
         // T-N9 (private notification preferences design §8): the
-        // preferences' feature is listed last.
-        assert_eq!(FEATURES.last(), Some(&"private.notificationPreferences"));
+        // preferences' feature followed every value before it; the fast
+        // reads' values follow it (fast-reads design §5.3).
+        assert_eq!(FEATURES.iter().position(|f| *f == "private.notificationPreferences"), Some(13));
 
         // Authentication is required.
         let (status, _, v) = call(&client, &base, None).await;

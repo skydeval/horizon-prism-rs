@@ -3944,6 +3944,62 @@ async fn notification_reads_in(mode: PublicMode, test: &str) {
     db.drop_db().await;
 }
 
+/// T-F7 (fast-reads design §5.2 B-1): with an unread row of every reason
+/// and every private post readable, `getUnreadCount {reasons}` equals the
+/// unread items `listNotifications` returns for the same `reasons`; no
+/// `reasons` is the count without them; a reason no row can have counts
+/// nothing, as it lists nothing.
+#[tokio::test]
+async fn t_f7_unread_count_takes_reasons() {
+    let test = "tf7-unread-reasons";
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture(&db.pool, test).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL, DAVE]).await;
+    let aud_carol = f.audience(CAROL, "3kaudcarol22", Some("list"), &[ALICE]).await;
+    let aud_dave = f.audience(DAVE, "3kauddave222", Some("list"), &[ALICE]).await;
+    let t = f.private_post(ALICE, "3ktpost22222", &aud, None).await;
+    f.post_with(DAVE, "3kquote22222", &aud_dave, quote_of(&t)).await;
+    f.post_with(CAROL, "3kmention222", &aud_carol, json!({"facets": [mention(ALICE)]})).await;
+    let at = "2026-10-01T10:00:00Z";
+    f.ingest(BOB, PUBLIC_POST, "3kpubreply22", public_reply(&t, at, None)).await;
+    f.ingest(BOB, LIKE, "3klikebob222", subject_record(LIKE, &t, at)).await;
+    f.ingest(BOB, REPOST, "3krepostbob2", subject_record(REPOST, &t, at)).await;
+    f.ready_all().await;
+    let base = serve_live(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let count = |query: String| {
+        let base = base.clone();
+        async move {
+            let (_, v, _) = json_of(&base, GET_UNREAD_COUNT, &query, ALICE).await;
+            v["count"].as_i64().expect("count")
+        }
+    };
+    let listed = |query: String| {
+        let base = base.clone();
+        async move {
+            let (page, _) = notifications_of(&base, ALICE, &query).await;
+            page["notifications"].as_array().expect("list").iter().filter(|n| n["isRead"] == false).count()
+        }
+    };
+    let (page, _) = notifications_of(&base, ALICE, "").await;
+    let mut reasons: Vec<&str> = page["notifications"].as_array().expect("list").iter().filter_map(|n| n["reason"].as_str()).collect();
+    reasons.sort_unstable();
+    assert_eq!(reasons, ["like", "mention", "quote", "reply", "repost"], "rows {:?}", private_rows(&f.pool, ALICE).await);
+    assert_eq!(count(String::new()).await, 5, "one of every reason");
+    for reasons in [vec!["reply"], vec!["reply", "mention"], vec!["like", "repost"], vec!["quote", "mention", "reply"], vec!["like", "reply", "mention", "quote", "repost"]] {
+        let query = reasons.iter().map(|r| format!("reasons={r}")).collect::<Vec<_>>().join("&");
+        let n = count(query.clone()).await;
+        assert_eq!(i64::try_from(listed(query.clone()).await).expect("small"), n, "{query}");
+        assert_eq!(n, i64::try_from(reasons.len()).expect("small"), "{query}");
+    }
+    for query in ["reasons=follow", "reasons=nothing&reasons=other"] {
+        assert_eq!((count(query.to_string()).await, listed(query.to_string()).await), (0, 0), "{query}");
+    }
+    assert_eq!(count("reasons=follow&reasons=like".to_string()).await, 1, "the known reasons still count");
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn private_notification_reads_on() {
     notification_reads_in(PublicMode::On, "s6-reads-on").await;

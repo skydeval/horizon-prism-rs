@@ -10,6 +10,17 @@ commit.
 
 ## [Unreleased]
 
+### Added (fast reads F-E: getUnreadCount reasons, #804)
+
+- `app.nearhorizon.private.getUnreadCount` takes the optional repeated
+  `reasons` parameter of `listNotifications`, applied the same way before
+  counting (a reason no private notification has matches nothing, as on
+  `listNotifications`). Without it the count is as before. A client's
+  badge of selected reasons is one count instead of paging
+  `listNotifications`. The count is still the prefilter's: a post that
+  passes it and then misses a read is counted and not listed.
+- `getMembership` lists `private.unreadReasons`.
+
 ### Added (fast reads F-D: getMembership validity and permissions, #803)
 
 - `app.nearhorizon.actor.getMembership` answers two more fields

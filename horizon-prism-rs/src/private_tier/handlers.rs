@@ -2233,21 +2233,25 @@ async fn notifications_body(
     Ok(PrivateResponse::notifications(notifications, next, seen.map(ts)))
 }
 
-/// `app.nearhorizon.private.getUnreadCount` (private posting §4.8) →
-/// `{count}`: the caller's rows after its last-seen time, under the list's
-/// exclusions and the caller's notification preferences, counting a private post's row only when the post passes the
-/// prefilter for the caller, and a public record's only while its subject
-/// is stored. Floored (`get_unread_count`): the scan's time depends on rows
-/// the caller cannot read.
+/// `app.nearhorizon.private.getUnreadCount {reasons?}` (private posting
+/// §4.8; fast-reads design §5.2 B-1) → `{count}`: the caller's rows after
+/// its last-seen time, under the list's exclusions and the caller's
+/// notification preferences, counting a private post's row only when the
+/// post passes the prefilter for the caller, and a public record's only
+/// while its subject is stored. `reasons` narrows the rows as on
+/// `listNotifications`. Floored (`get_unread_count`): the scan's time
+/// depends on rows the caller cannot read.
 pub async fn get_unread_count(
     State(s): State<PrivateState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, GET_UNREAD_COUNT).await?;
     let gate = start.elapsed();
-    let (result, timed) = stages::run(schema::unread_count(&s.env.pool, &caller.did, s.env.max_chain)).await;
+    let reasons = Params::parse(q.as_deref()).all("reasons");
+    let (result, timed) = stages::run(schema::unread_count_for(&s.env.pool, &caller.did, s.env.max_chain, &reasons)).await;
     floor("getUnreadCount", start, gate, &timed, s.floors.get_unread_count).await;
     Ok(ok(PrivateResponse::unread_count(result?)))
 }

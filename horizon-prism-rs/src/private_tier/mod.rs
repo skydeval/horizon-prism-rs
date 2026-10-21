@@ -200,6 +200,8 @@ pub const FEATURES: &[&str] = &[
     // get/putNotificationPreferences, honoured by listNotifications and
     // getUnreadCount (private notification preferences design).
     "private.notificationPreferences",
+    // `getUnreadCount {reasons}` (fast-reads design §5.2 B-1, F-E).
+    "private.unreadReasons",
 ];
 
 /// The private tier as the rest of the crate may use it.
