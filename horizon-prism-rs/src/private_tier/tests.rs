@@ -5176,3 +5176,70 @@ async fn unfloored_time_is_recorded_at_zero() {
     assert_eq!(count(&handle.render()), Some(1.0), "{}", handle.render());
     db.drop_db().await;
 }
+
+/// T-F6 (fast-reads design §7.2): through the final router, one private
+/// read records one `xrpc_request_seconds{nsid}` observation and one of
+/// each stage (`gate`, `reads`, `rest`; no `context` on `getPosts`), whose
+/// sum is the unfloored time; a preflight records nothing.
+#[tokio::test]
+async fn t_f6_request_and_stage_times() {
+    use crate::xrpc::router::{FinalConfig, finalize};
+
+    let Some(db) = fresh_db("tf6_stage_metrics").await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let f = fixture(&db.pool, "tf6-metric").await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let post = f.private_post(ALICE, "3kpost222222", &aud, None).await;
+    f.ready_all().await;
+    let mut app = f.app.clone();
+    app.limits = roomy_limits();
+    let routes = finalize(router(f.state_of(app.clone(), Some(Duration::from_secs(1)), Duration::ZERO)), app, FinalConfig {
+        not_ready_retry_secs: 5,
+        public: crate::honest_501::PublicMessages::default(),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, routes.into_make_service_with_connect_info::<SocketAddr>()).await.expect("serve");
+    });
+    let base = format!("http://{addr}");
+    let series = |text: &str, name: &str, labels: &[&str]| crate::test_support::series(text, name, labels);
+    let nsid = r#"nsid="app.nearhorizon.private.getPosts""#;
+
+    // A preflight is answered by CORS and timed nowhere.
+    let r = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("{base}/xrpc/{POSTS}"))
+        .header("origin", "https://client.example")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "authorization")
+        .send()
+        .await
+        .expect("preflight");
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(series(&handle.render(), "xrpc_request_seconds_count", &[nsid]), None);
+
+    let (status, body, _) = get(&base, POSTS, &format!("uris={post}"), BOB, BOB_KEY).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("3kpost222222"), "{body}");
+    let text = handle.render();
+    assert_eq!(series(&text, "xrpc_request_seconds_count", &[nsid]), Some(1.0), "{text}");
+    let endpoint = r#"endpoint="getPosts""#;
+    let unfloored = series(&text, "private_read_unfloored_seconds_sum", &[endpoint]).expect("unfloored");
+    let mut sum = 0.0;
+    for stage in ["gate", "reads", "rest"] {
+        let label = format!(r#"stage="{stage}""#);
+        assert_eq!(series(&text, "private_read_stage_seconds_count", &[endpoint, &label]), Some(1.0), "{stage}: {text}");
+        sum += series(&text, "private_read_stage_seconds_sum", &[endpoint, &label]).expect("stage sum");
+    }
+    assert_eq!(series(&text, "private_read_stage_seconds_count", &[endpoint, r#"stage="context""#]), None);
+    assert!((sum - unfloored).abs() < 0.001, "stages {sum} against {unfloored}");
+    assert!(series(&text, "private_read_stage_seconds_sum", &[endpoint, r#"stage="reads""#]).expect("reads") > 0.0);
+    // The request's own time holds the private read's.
+    let request = series(&text, "xrpc_request_seconds_sum", &[nsid]).expect("request time");
+    assert!(request >= unfloored, "{request} against {unfloored}");
+    db.drop_db().await;
+}

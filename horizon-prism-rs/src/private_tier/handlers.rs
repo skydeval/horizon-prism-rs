@@ -27,7 +27,7 @@ use super::emit::{
     BookmarkView, NotificationRecord, NotificationView, PrivateEmit, PrivateResponse, QuoteItem, ThreadNode, ThreadParent,
 };
 use super::pipeline::{self, PipelineEnv, RequestState};
-use super::media;
+use super::{media, stages};
 use super::schema::{self, AuthorFilter, Interaction};
 use super::cursor as sealed;
 use crate::config::{PrivateReadConfig, PrivateSearchConfig};
@@ -75,6 +75,14 @@ pub const METRIC_MEDIA_MISMATCH: &str = "private_feed_media_mismatch_total";
 /// Metric: handler time before the floor, a histogram (private-threads
 /// design §4: B-5 reads its p99).
 pub const METRIC_UNFLOORED: &str = "private_read_unfloored_seconds";
+
+/// Metric: the unfloored time by stage (`gate`, `reads`, `context`,
+/// `rest`), a histogram (fast-reads design §7.2).
+pub const METRIC_STAGES: &str = "private_read_stage_seconds";
+
+/// Metric: a paged read that returned no items and a cursor (fast-reads
+/// design §5.2, C-11), by `endpoint`.
+pub const METRIC_EMPTY_PAGE: &str = "private_read_empty_page_total";
 
 /// [`METRIC_UNFLOORED`]'s buckets: 20, logarithmic, from 5 ms to 5 s.
 #[must_use]
@@ -238,10 +246,32 @@ pub fn router(state: PrivateState) -> Router {
         .with_state(state)
 }
 
-/// Step 13: record the unfloored time, then wait out the floor.
-async fn floor(endpoint: &'static str, start: Instant, target: Duration) {
-    metrics::histogram!(METRIC_UNFLOORED, "endpoint" => endpoint).record(start.elapsed().as_secs_f64());
+/// Step 13: record the unfloored time and its stages (fast-reads design
+/// §7.2), then wait out the floor. `gate` is how long the gate took from
+/// `start`.
+async fn floor(endpoint: &'static str, start: Instant, gate: Duration, timed: &stages::Stages, target: Duration) {
+    let unfloored = start.elapsed();
+    metrics::histogram!(METRIC_UNFLOORED, "endpoint" => endpoint).record(unfloored.as_secs_f64());
+    stages::record(endpoint, unfloored, gate, timed);
     kryphocron::equalize_timing(start, target).await;
+}
+
+/// Count `result` when it is a page with no items and a cursor.
+fn note_page(endpoint: &'static str, result: &Result<PrivateResponse, XrpcError>) {
+    stages::count_empty_page(endpoint, result.as_ref().is_ok_and(PrivateResponse::is_empty_page));
+}
+
+/// One private record read through the pipeline for `caller`, timed in the
+/// `reads` stage.
+async fn read_post(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    uri: &str,
+    authors: &ProfileContext,
+    start: Instant,
+) -> Result<PrivateEmit<Value>, pipeline::Miss> {
+    stages::reading(pipeline::read(&s.env, rs, caller, uri, authors, start)).await
 }
 
 /// The private-context hydration of a request by `caller` (design-v4 §8.1
@@ -276,7 +306,7 @@ async fn read_many(
     start: Instant,
 ) -> Vec<Option<PrivateEmit<Value>>> {
     // Futures are lazy: building them all first only fixes their borrows.
-    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, rs, caller, u, authors, start)).collect();
+    let reads: Vec<_> = uris.iter().map(|u| read_post(s, rs, caller, u, authors, start)).collect();
     futures::stream::iter(reads)
         .buffered(s.concurrency)
         .map(Result::ok)
@@ -675,14 +705,15 @@ pub async fn get_posts(
     RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
-    let caller = prepare_private(&s.app, &headers, peer,GET_POSTS).await?;
+    let caller = prepare_private(&s.app, &headers, peer, GET_POSTS).await?;
+    let gate = start.elapsed();
     let requested = Params::parse(q.as_deref()).all("uris");
     if requested.is_empty() || requested.len() > 25 {
         return Err(XrpcError::invalid("Error: uris must have between 1 and 25 items"));
     }
     let ip = request_ip(&s.app, &headers, peer);
-    let result = posts_body(&s, &caller, ip, &requested, start).await;
-    floor("getPosts", start, s.floors.get_posts).await;
+    let (result, timed) = stages::run(posts_body(&s, &caller, ip, &requested, start)).await;
+    floor("getPosts", start, gate, &timed, s.floors.get_posts).await;
     result.map(ok)
 }
 
@@ -730,14 +761,15 @@ pub async fn get_post_thread(
     RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
-    let caller = prepare_private(&s.app, &headers, peer,GET_POST_THREAD).await?;
+    let caller = prepare_private(&s.app, &headers, peer, GET_POST_THREAD).await?;
+    let gate = start.elapsed();
     let p = Params::parse(q.as_deref());
     let uri = p.required("uri")?.to_string();
     let depth = bounded(&p, "depth", 6, 10)?;
     let parent_height = bounded(&p, "parentHeight", 20, 30)?;
     let ip = request_ip(&s.app, &headers, peer);
-    let result = thread_body(&s, &caller, ip, &uri, depth, parent_height, start).await;
-    floor("getPostThread", start, s.floors.get_post_thread).await;
+    let (result, timed) = stages::run(thread_body(&s, &caller, ip, &uri, depth, parent_height, start)).await;
+    floor("getPostThread", start, gate, &timed, s.floors.get_post_thread).await;
     result.and_then(|t| t.ok_or_else(not_found)).map(ok)
 }
 
@@ -791,7 +823,7 @@ impl Covered {
 /// position. Returns the DIDs whose check failed on the database.
 async fn head_round(s: &PrivateState, rs: &RequestState, caller: &VerifiedCaller, rows: &[Covered]) -> HashSet<String> {
     let dids: Vec<String> = rows.iter().flat_map(|r| r.head_dids(caller)).collect();
-    pipeline::prefetch_heads(&s.env, rs, &dids, s.concurrency).await.db_failed
+    stages::reading(pipeline::prefetch_heads(&s.env, rs, &dids, s.concurrency)).await.db_failed
 }
 
 async fn thread_body(
@@ -866,7 +898,7 @@ async fn thread_body(
         return Ok(None);
     }
     let readable = covered.iter().take_while(|r| !touches_failed(r)).count().min(parent_height as usize + 1).min(THREAD_NODE_CAP);
-    let reads: Vec<_> = covered[..readable].iter().map(|r| pipeline::read(&s.env, &rs, caller, &r.uri, &authors, start)).collect();
+    let reads: Vec<_> = covered[..readable].iter().map(|r| read_post(s, &rs, caller, &r.uri, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency.max(1));
     let Some(Ok(anchor)) = reads.next().await else {
         return Ok(None);
@@ -915,7 +947,7 @@ async fn thread_body(
         true
     } else if is_private_uri(&claimed) && passing.contains(&claimed) {
         let authors = profiles(&hydration, std::slice::from_ref(&claimed)).await?;
-        pipeline::read(&s.env, &rs, caller, &claimed, &authors, start).await.is_ok()
+        read_post(s, &rs, caller, &claimed, &authors, start).await.is_ok()
     } else {
         false
     };
@@ -940,7 +972,7 @@ async fn thread_sequential(
 ) -> Result<Option<PrivateResponse>, XrpcError> {
     let anchor_uri = vec![uri.to_string()];
     let authors = profiles(hydration, &anchor_uri).await?;
-    let Ok(anchor) = pipeline::read(&s.env, rs, caller, uri, &authors, start).await else {
+    let Ok(anchor) = read_post(s, rs, caller, uri, &authors, start).await else {
         return Ok(None);
     };
     let mut budget = THREAD_NODE_CAP - 1;
@@ -955,7 +987,7 @@ async fn thread_sequential(
         }
         if is_private_uri(&parent) {
             let authors = profiles(hydration, std::slice::from_ref(&parent)).await?;
-            let Ok(p) = pipeline::read(&s.env, rs, caller, &parent, &authors, start).await else {
+            let Ok(p) = read_post(s, rs, caller, &parent, &authors, start).await else {
                 break;
             };
             budget -= 1;
@@ -980,7 +1012,7 @@ async fn thread_sequential(
         true
     } else if is_private_uri(&root) {
         let authors = profiles(hydration, std::slice::from_ref(&root)).await?;
-        pipeline::read(&s.env, rs, caller, &root, &authors, start).await.is_ok()
+        read_post(s, rs, caller, &root, &authors, start).await.is_ok()
     } else {
         false
     };
@@ -1147,7 +1179,8 @@ pub async fn get_author_feed(
     RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
-    let caller = prepare_private(&s.app, &headers, peer,GET_AUTHOR_FEED).await?;
+    let caller = prepare_private(&s.app, &headers, peer, GET_AUTHOR_FEED).await?;
+    let gate = start.elapsed();
     let p = Params::parse(q.as_deref());
     let actor = p.required("actor")?.to_string();
     if !actor.starts_with("did:") {
@@ -1171,8 +1204,9 @@ pub async fn get_author_feed(
     let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
     let of = FeedOf::Author { actor: &actor, filter: by };
-    let result = feed_body(&s, &caller, ip, of, limit, after, &aad, start).await;
-    floor("getAuthorFeed", start, s.floors.get_author_feed).await;
+    let (result, timed) = stages::run(feed_body(&s, &caller, ip, of, limit, after, &aad, start)).await;
+    floor("getAuthorFeed", start, gate, &timed, s.floors.get_author_feed).await;
+    note_page("getAuthorFeed", &result);
     result.map(ok)
 }
 
@@ -1196,13 +1230,15 @@ pub async fn get_timeline(
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, GET_TIMELINE).await?;
+    let gate = start.elapsed();
     let p = Params::parse(q.as_deref());
     let limit = feed_limit(&p)?;
     let aad = sealed::aad(GET_TIMELINE, &caller.did, "", "");
     let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let result = feed_body(&s, &caller, ip, FeedOf::Timeline, limit, after, &aad, start).await;
-    floor("getTimeline", start, s.floors.get_timeline).await;
+    let (result, timed) = stages::run(feed_body(&s, &caller, ip, FeedOf::Timeline, limit, after, &aad, start)).await;
+    floor("getTimeline", start, gate, &timed, s.floors.get_timeline).await;
+    note_page("getTimeline", &result);
     result.map(ok)
 }
 
@@ -1287,7 +1323,7 @@ async fn feed_body(
         FeedOf::Author { filter, .. } => filter.media_bit().map(|bit| (bit, if bit == media::IMAGE { POSTS_WITH_MEDIA } else { POSTS_WITH_VIDEO })),
         FeedOf::Timeline => None,
     };
-    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+    let reads: Vec<_> = uris.iter().map(|u| read_post(s, &rs, caller, u, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
     while let Some((i, hit)) = reads.next().await {
         let c = &candidates[i];
@@ -1416,6 +1452,7 @@ pub async fn get_bookmarks(
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, GET_BOOKMARKS).await?;
+    let gate = start.elapsed();
     let p = Params::parse(q.as_deref());
     let limit = match p.u32("limit")?.unwrap_or(50) {
         l @ 1..=100 => l,
@@ -1423,8 +1460,9 @@ pub async fn get_bookmarks(
     };
     let after = parse_cursor(p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let result = bookmarks_body(&s, &caller, ip, limit as usize, after, start).await;
-    floor("getBookmarks", start, s.floors.get_bookmarks).await;
+    let (result, timed) = stages::run(bookmarks_body(&s, &caller, ip, limit as usize, after, start)).await;
+    floor("getBookmarks", start, gate, &timed, s.floors.get_bookmarks).await;
+    note_page("getBookmarks", &result);
     result.map(ok)
 }
 
@@ -1491,7 +1529,7 @@ async fn anchor_readable(
     start: Instant,
 ) -> Result<bool, XrpcError> {
     let authors = profiles(hydration, &[uri.to_string()]).await?;
-    Ok(pipeline::read(&s.env, rs, caller, uri, &authors, start).await.is_ok())
+    Ok(read_post(s, rs, caller, uri, &authors, start).await.is_ok())
 }
 
 /// `app.nearhorizon.private.getLikes {uri, limit 1-100 default 50, cursor}`
@@ -1533,13 +1571,15 @@ async fn interactions(
         Interaction::Repost => (GET_REPOSTED_BY, "getRepostedBy", s.floors.get_reposted_by),
     };
     let caller = prepare_private(&s.app, headers, peer, method).await?;
+    let gate = start.elapsed();
     let p = Params::parse(q);
     let uri = p.required("uri")?.to_string();
     let limit = page_limit(&p)?;
     let after = parse_cursor(p.one("cursor"))?;
     let ip = request_ip(&s.app, headers, peer);
-    let result = interactions_body(s, &caller, ip, kind, &uri, limit, after, start).await;
-    floor(endpoint, start, target).await;
+    let (result, timed) = stages::run(interactions_body(s, &caller, ip, kind, &uri, limit, after, start)).await;
+    floor(endpoint, start, gate, &timed, target).await;
+    note_page(endpoint, &result);
     result.map(ok)
 }
 
@@ -1609,14 +1649,16 @@ pub async fn get_quotes(
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, GET_QUOTES).await?;
+    let gate = start.elapsed();
     let p = Params::parse(q.as_deref());
     let uri = p.required("uri")?.to_string();
     let limit = page_limit(&p)?;
     let aad = sealed::aad(GET_QUOTES, &caller.did, &uri, "");
     let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let result = quotes_body(&s, &caller, ip, &uri, limit, after, &aad, start).await;
-    floor("getQuotes", start, s.floors.get_quotes).await;
+    let (result, timed) = stages::run(quotes_body(&s, &caller, ip, &uri, limit, after, &aad, start)).await;
+    floor("getQuotes", start, gate, &timed, s.floors.get_quotes).await;
+    note_page("getQuotes", &result);
     result.map(ok)
 }
 
@@ -1654,7 +1696,7 @@ async fn quotes_body(
     let mut last: Option<(DateTime<Utc>, String)> = None;
     let private: Vec<String> = candidates.iter().filter(|c| c.cid.is_none()).map(|c| c.uri.clone()).collect();
     let authors = profiles(&hydration, &private).await?;
-    let reads: Vec<_> = private.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+    let reads: Vec<_> = private.iter().map(|u| read_post(s, &rs, caller, u, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency);
     let mut full_at: Option<usize> = None;
     for (i, c) in candidates.iter().enumerate() {
@@ -1719,6 +1761,7 @@ pub async fn get_replies(
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, GET_REPLIES).await?;
+    let gate = start.elapsed();
     let p = Params::parse(q.as_deref());
     let uri = p.required("uri")?.to_string();
     let limit = feed_limit(&p)?;
@@ -1726,8 +1769,9 @@ pub async fn get_replies(
     let aad = sealed::aad(GET_REPLIES, &caller.did, &uri, "");
     let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let result = replies_body(&s, &caller, ip, &uri, limit, depth, after, &aad, start).await;
-    floor("getReplies", start, s.floors.get_replies).await;
+    let (result, timed) = stages::run(replies_body(&s, &caller, ip, &uri, limit, depth, after, &aad, start)).await;
+    floor("getReplies", start, gate, &timed, s.floors.get_replies).await;
+    note_page("getReplies", &result);
     result.map(ok)
 }
 
@@ -1770,7 +1814,7 @@ async fn replies_anchor(
     let authors = profiles(hydration, &[uri.to_string()]).await?;
     let Some(anchor_row) = anchor_row else {
         // HEAD's path.
-        let Ok(anchor) = pipeline::read(&s.env, rs, caller, uri, &authors, start).await else {
+        let Ok(anchor) = read_post(s, rs, caller, uri, &authors, start).await else {
             return Ok(None);
         };
         let root = claimed_root(&anchor).unwrap_or_else(|| uri.to_string());
@@ -1782,7 +1826,7 @@ async fn replies_anchor(
         pipeline::count_db_miss();
         return Ok(None);
     }
-    if pipeline::read(&s.env, rs, caller, uri, &authors, start).await.is_err() {
+    if read_post(s, rs, caller, uri, &authors, start).await.is_err() {
         return Ok(None);
     }
     let read = claimed == uri
@@ -1838,7 +1882,7 @@ async fn replies_body(
     let uris: Vec<String> = candidates.iter().map(|(u, _)| u.clone()).collect();
     let authors = profiles(&hydration, &uris).await?;
     let mut full_at: Option<usize> = None;
-    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+    let reads: Vec<_> = uris.iter().map(|u| read_post(s, &rs, caller, u, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
     while let Some((i, hit)) = reads.next().await {
         let (u, at) = &candidates[i];
@@ -1952,6 +1996,7 @@ pub async fn search_posts(
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, SEARCH_POSTS).await?;
+    let gate = start.elapsed();
     let p = Params::parse(q.as_deref());
     let q = p.required("q")?.to_string();
     let query = SearchQuery::parse(&q)?;
@@ -1965,8 +2010,9 @@ pub async fn search_posts(
     let aad = sealed::aad(SEARCH_POSTS, &caller.did, &q, "");
     let from = sealed::open_search(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let result = search_body(&s, &caller, ip, &query, limit, from, &aad, start).await;
-    floor("searchPosts", start, s.floors.search_posts).await;
+    let (result, timed) = stages::run(search_body(&s, &caller, ip, &query, limit, from, &aad, start)).await;
+    floor("searchPosts", start, gate, &timed, s.floors.search_posts).await;
+    note_page("searchPosts", &result);
     result.map(ok)
 }
 
@@ -2012,7 +2058,7 @@ async fn search_body(
     let mut posts: Vec<PrivateEmit<Value>> = Vec::new();
     // The last returned row, once the page holds `limit`.
     let mut full_at: Option<(DateTime<Utc>, String)> = None;
-    let reads: Vec<_> = uris.iter().map(|u| pipeline::read(&s.env, &rs, caller, u, &authors, start)).collect();
+    let reads: Vec<_> = uris.iter().map(|u| read_post(s, &rs, caller, u, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
     while let Some((i, hit)) = reads.next().await {
         if let Ok(post) = hit
@@ -2081,13 +2127,15 @@ pub async fn list_notifications(
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, LIST_NOTIFICATIONS).await?;
+    let gate = start.elapsed();
     let p = Params::parse(q.as_deref());
     let limit = page_limit(&p)?;
     let after = notification_cursor(p.one("cursor"))?;
     let reasons = p.all("reasons");
     let ip = request_ip(&s.app, &headers, peer);
-    let result = notifications_body(&s, &caller, ip, limit, after, &reasons, start).await;
-    floor("listNotifications", start, s.floors.list_notifications).await;
+    let (result, timed) = stages::run(notifications_body(&s, &caller, ip, limit, after, &reasons, start)).await;
+    floor("listNotifications", start, gate, &timed, s.floors.list_notifications).await;
+    note_page("listNotifications", &result);
     result.map(ok)
 }
 
@@ -2198,8 +2246,9 @@ pub async fn get_unread_count(
 ) -> Result<Response, XrpcError> {
     let start = Instant::now();
     let caller = prepare_private(&s.app, &headers, peer, GET_UNREAD_COUNT).await?;
-    let result = schema::unread_count(&s.env.pool, &caller.did, s.env.max_chain).await;
-    floor("getUnreadCount", start, s.floors.get_unread_count).await;
+    let gate = start.elapsed();
+    let (result, timed) = stages::run(schema::unread_count(&s.env.pool, &caller.did, s.env.max_chain)).await;
+    floor("getUnreadCount", start, gate, &timed, s.floors.get_unread_count).await;
     Ok(ok(PrivateResponse::unread_count(result?)))
 }
 

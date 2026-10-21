@@ -174,15 +174,23 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // The recorder's handle is kept, so the admin UI can read the metrics
     // back in process (admin-ui design §9.1); `build` also spawns the
     // upkeep task, and the exporter is spawned here as `install` did.
-    let (recorder, exporter) = PrometheusBuilder::new()
-        .with_http_listener(cfg.file.metrics.bind)
-        .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full(crate::private_tier::handlers::METRIC_UNFLOORED.to_string()),
-            &crate::private_tier::handlers::unfloored_buckets(),
-        )
-        .map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?
-        .build()
-        .map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?;
+    // The latency histograms share one set of buckets (fast-reads design
+    // §7.2); the rest render as summaries.
+    let mut builder = PrometheusBuilder::new().with_http_listener(cfg.file.metrics.bind);
+    for name in [
+        crate::private_tier::handlers::METRIC_UNFLOORED,
+        crate::private_tier::handlers::METRIC_STAGES,
+        crate::admin::usage::METRIC_SECONDS,
+        crate::sync::head_prober::METRIC_CHECK_SECONDS,
+    ] {
+        builder = builder
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Full(name.to_string()),
+                &crate::private_tier::handlers::unfloored_buckets(),
+            )
+            .map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?;
+    }
+    let (recorder, exporter) = builder.build().map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?;
     let metrics_handle = recorder.handle();
     tokio::spawn(exporter);
     metrics::set_global_recorder(recorder).map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?;

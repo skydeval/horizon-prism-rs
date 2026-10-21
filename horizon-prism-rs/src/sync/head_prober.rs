@@ -220,7 +220,7 @@ impl HeadProber {
             Ok(rev) => self.record_head(did, &rev).await.unwrap_or_else(|e| ProbeResult::Error(e.to_string())),
             Err(e) => ProbeResult::Error(e),
         };
-        metrics::histogram!(METRIC_CHECK_SECONDS).record(start.elapsed().as_secs_f64());
+        metrics::histogram!(METRIC_CHECK_SECONDS, "path" => "probe").record(start.elapsed().as_secs_f64());
         metrics::counter!(METRIC_CHECKS, "result" => result.label()).increment(1);
         if let ProbeResult::Error(error) = &result {
             tracing::debug!(event = "sync_head_check_failed", did, %error, "head probe failed");
@@ -311,6 +311,13 @@ impl HeadProber {
     ///
     /// Database errors.
     pub async fn read_head_with(&self, did: &str, allow_fetch: bool) -> Result<Option<String>, sqlx::Error> {
+        let start = Instant::now();
+        let head = self.read_head_inner(did, allow_fetch).await;
+        metrics::histogram!(METRIC_CHECK_SECONDS, "path" => "read").record(start.elapsed().as_secs_f64());
+        head
+    }
+
+    async fn read_head_inner(&self, did: &str, allow_fetch: bool) -> Result<Option<String>, sqlx::Error> {
         let row: Option<(Option<String>, bool, Option<String>)> = sqlx::query_as(
             "SELECT s.head_rev, \
                COALESCE(s.head_checked_at > now() - make_interval(secs => $2), false), a.pds_endpoint \
@@ -334,9 +341,7 @@ impl HeadProber {
             return Ok(None);
         }
         let timeout = Duration::from_millis(self.cfg.head_fetch_timeout_ms);
-        let start = Instant::now();
         let fetched = self.source.latest_rev(&pds, did, timeout).await;
-        metrics::histogram!(METRIC_CHECK_SECONDS).record(start.elapsed().as_secs_f64());
         let Ok(rev) = fetched else {
             metrics::counter!(METRIC_CHECKS, "result" => "error").increment(1);
             return Ok(None);

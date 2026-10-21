@@ -317,6 +317,25 @@ impl PrivateResponse {
     pub(in crate::private_tier) fn feed(feed: Vec<PrivateEmit<Value>>, cursor: Option<String>) -> Self {
         Self::Feed { feed, cursor }
     }
+
+    /// A page with no items and a cursor (fast-reads design §5.2, C-11).
+    /// Never true for a response that is not a page.
+    pub(in crate::private_tier) fn is_empty_page(&self) -> bool {
+        let (empty, cursor) = match self {
+            Self::Feed { feed, cursor } => (feed.is_empty(), cursor),
+            Self::Bookmarks { bookmarks, cursor } => (bookmarks.is_empty(), cursor),
+            Self::Likes { likes, cursor, .. } => (likes.is_empty(), cursor),
+            Self::RepostedBy { reposted_by, cursor, .. } => (reposted_by.is_empty(), cursor),
+            Self::Quotes { posts, cursor, .. } => (posts.is_empty(), cursor),
+            Self::Replies { replies, cursor } => (replies.is_empty(), cursor),
+            Self::Notifications { notifications, cursor, .. } => (notifications.is_empty(), cursor),
+            Self::Search { posts, cursor } => (posts.is_empty(), cursor),
+            Self::Posts(_) | Self::Thread(_) | Self::UnreadCount(_) | Self::NotificationPreferences(_) | Self::Empty => {
+                return false;
+            }
+        };
+        empty && cursor.is_some()
+    }
 }
 
 impl Serialize for PrivateResponse {

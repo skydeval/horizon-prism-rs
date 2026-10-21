@@ -10,6 +10,32 @@ commit.
 
 ## [Unreleased]
 
+### Added (fast reads F-A: read latency metrics, #800)
+
+- `xrpc_request_seconds{nsid}`: a histogram of every routed XRPC request's
+  time, recorded beside `xrpc_requests_total` (inside the global limit, so
+  authentication is in it; CORS preflights and unrouted paths are not
+  timed). `getMembership`, Thread Lens and the public methods now have a
+  latency series.
+- `private_read_stage_seconds{endpoint,stage}`: the twelve floored private
+  reads' unfloored time split into `gate` (verification, the bucket, the
+  member check), `reads` (wall time while any pipeline read or head round
+  is in flight: head checks, row, bind, decode; concurrent reads count
+  once), `context` (the feeds' reply context, once it exists) and `rest`
+  (listing, prefilter, hydration, decoration). The stages sum to
+  `private_read_unfloored_seconds`.
+- `sync_head_check_seconds` gains `path`: `probe` for the background
+  prober's `getLatestCommit`, `read` for a private read's whole head
+  lookup (the stored-head query and any synchronous fetch), which is the
+  only part that is request time. Before, it held the two fetch kinds
+  mixed and no database time.
+- `private_read_empty_page_total{endpoint}`: a paged private read that
+  returned no items and a cursor (what drives a client's empty-page loop).
+- The three latency histograms, and `sync_head_check_seconds`, are
+  exported with the 20 buckets of `private_read_unfloored_seconds` (5 ms
+  to 5 s) instead of as summaries. Labels are method names and fixed
+  strings only.
+
 ### Changed (kryphocron 0.4.4: the read check derives with kryphocron's own function, #793)
 
 - `kryphocron` moves from 0.4.3 to 0.4.4 (additive; `Cargo.lock` changes

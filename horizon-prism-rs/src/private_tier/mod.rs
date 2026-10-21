@@ -41,6 +41,7 @@ mod pipeline;
 pub(crate) mod readiness;
 pub(crate) mod retention;
 mod schema;
+mod stages;
 pub(crate) mod stats;
 #[cfg(test)]
 pub(crate) mod test_rows;

@@ -13,7 +13,8 @@
 //! places between the global limit and CORS. It reads axum's `MatchedPath`,
 //! so only routed paths under `/xrpc/` are counted: unrouted NSIDs (their
 //! own counter) and `/admin` are not. Each request is also exported as
-//! `xrpc_requests_total{nsid, class}`.
+//! `xrpc_requests_total{nsid, class}`, and its time as
+//! `xrpc_request_seconds{nsid}`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -27,6 +28,11 @@ use chrono::{DateTime, Utc};
 
 /// `xrpc_requests_total{nsid, class}`.
 pub const METRIC: &str = "xrpc_requests_total";
+
+/// `xrpc_request_seconds{nsid}`, a histogram (fast-reads design §7.2): a
+/// routed request's time from inside the global limit to its response, so
+/// authentication is in it and a preflight is not.
+pub const METRIC_SECONDS: &str = "xrpc_request_seconds";
 
 /// What kind of answer a request got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,8 +200,10 @@ pub async fn count(State(usage): State<Usage>, request: Request, next: Next) -> 
         .get::<MatchedPath>()
         .and_then(|p| p.as_str().strip_prefix("/xrpc/"))
         .map(str::to_string);
+    let start = std::time::Instant::now();
     let response = next.run(request).await;
     if let Some(nsid) = nsid {
+        metrics::histogram!(METRIC_SECONDS, "nsid" => nsid.clone()).record(start.elapsed().as_secs_f64());
         usage.record(&nsid, Class::of(response.status()));
     }
     response
