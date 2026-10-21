@@ -4049,7 +4049,10 @@ impl crate::firehose::backfill::BackfillSource for Repo {
 }
 
 /// `requestRecord` over `repo`, with a catch-up whose interval no earlier
-/// call has started.
+/// call has started. The interval is an hour, so "a second call within the
+/// interval" holds however slowly the suite runs (a 10 s interval could
+/// pass under load before the second call, #772); a test that wants the
+/// interval over starts a new server.
 async fn index_server(f: &Fixture, repo: &Arc<Repo>) -> String {
     use crate::firehose::index_request::{CATCH_UP_DEADLINE, CatchUp, CatchUpConfig};
     let state = crate::xrpc::handlers::index::IndexState {
@@ -4058,7 +4061,7 @@ async fn index_server(f: &Fixture, repo: &Arc<Repo>) -> String {
         writer: f.writer.clone(),
         attempts: 1,
         catch_up: CatchUp::new(CatchUpConfig {
-            min_interval: Duration::from_secs(10),
+            min_interval: Duration::from_secs(3600),
             max_pages: 8,
             reconcile_confirm_limit: 50,
             attempts: 1,
@@ -4151,7 +4154,8 @@ async fn request_record_catches_up_and_the_record_reads_at_once() {
         assert_eq!(readable(&base, reader, &[&p1, &p2]).await, [p1.clone(), p2.clone()], "{reader}");
     }
 
-    // A second call within 10 s does not list and answers as it stands.
+    // A second call within the interval does not list and answers as it
+    // stands.
     repo.set_rev(R2);
     set_head(&f.pool, ALICE, R2).await;
     let (_, caught_up) = request_record(&index, &p1).await;

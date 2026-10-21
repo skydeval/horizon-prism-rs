@@ -10,6 +10,16 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (test reliability: requestRecord's second call, #772)
+
+- **`request_record_catches_up_and_the_record_reads_at_once`** sometimes
+  saw `caughtUp: true` on the second call, which is meant to fall within
+  the catch-up interval. The test server's interval was 10 s, and a loaded
+  suite could take longer than that between the two calls, so the second
+  catch-up ran. The test server's interval is now an hour; tests that want
+  it over already start a new server. With a 1 ms interval it fails as
+  reported.
+
 ### Fixed (test reliability: T-24's four at a time, #771)
 
 - **`t24_handles_resolve_four_at_a_time_in_order`** failed once with three
