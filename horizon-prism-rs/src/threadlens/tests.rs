@@ -552,6 +552,57 @@ async fn the_thread_lens_429_carries_retry_after() {
     crate::xrpc::errors::assert_retry_after(get("retry-after").as_deref(), get("ratelimit-reset").as_deref());
 }
 
+/// T-F1 (fast-reads design §1.1, §2.2): a Thread Lens route takes a direct
+/// call's token as it takes a proxied one. A bare `aud` and
+/// `#bsky_appview`, an hour's window, pass authentication; another
+/// fragment, another `lxm`, no `lxm` and a window past an hour are 401.
+/// (A token that passes gets whatever the empty database answers, never
+/// 401.)
+#[tokio::test]
+async fn direct_tokens_reach_thread_lens() {
+    use crate::kryphocron_glue::jwt::tests::mint_claims;
+
+    let Some(db) = fresh_db("threadlens_direct_tokens").await else {
+        return;
+    };
+    let calls = Arc::new(Calls::default());
+    let base = fake_upstream(Arc::clone(&calls), None).await;
+    let h = hydrator(&db.pool, ScopeSets::default());
+    let l = ladder(h.clone(), &base, Arc::new(StubLookup::default()));
+    let url = serve(state(h, l, ThreadLensAccess::SignedIn)).await;
+    let host = format!("did:web:{AUDIENCE_HOST}");
+    let now = chrono::Utc::now().timestamp();
+    let token = |aud: &str, lxm: Option<&str>, window: i64| {
+        let mut claims = json!({"iss": VIEWER_A, "aud": aud, "iat": now, "exp": now + window});
+        if let Some(lxm) = lxm {
+            claims["lxm"] = json!(lxm);
+        }
+        mint_claims(&signing_key(3), &claims)
+    };
+    let fragment = format!("{host}#bsky_appview");
+    let other = format!("{host}#atproto_labeler");
+    for (aud, lxm, window, passes) in [
+        (host.as_str(), Some(RESOLVE), 60, true),
+        (fragment.as_str(), Some(RESOLVE), 3_540, true),
+        (host.as_str(), Some(RESOLVE), 3_600, true),
+        (host.as_str(), Some(RESOLVE), 3_601, false),
+        (other.as_str(), Some(RESOLVE), 3_540, false),
+        (fragment.as_str(), Some(GET_THREAD), 3_540, false),
+        (fragment.as_str(), None, 60, false),
+    ] {
+        let r = reqwest::Client::new()
+            .post(format!("{url}/xrpc/{RESOLVE}"))
+            .header("authorization", format!("Bearer {}", token(aud, lxm, window)))
+            .json(&json!({"uris": [PRIVATE]}))
+            .send()
+            .await
+            .expect("request");
+        let status = r.status().as_u16();
+        assert_eq!(status != 401, passes, "{aud} {lxm:?} {window}: {status}");
+    }
+    db.drop_db().await;
+}
+
 async fn call(base: &str, method: &str, caller: &str, key: u8, body: &Value) -> (u16, String) {
     let token = mint(&signing_key(key), caller, &format!("did:web:{AUDIENCE_HOST}"), Some(method));
     let r = reqwest::Client::new()

@@ -5243,3 +5243,48 @@ async fn t_f6_request_and_stage_times() {
     assert!(request >= unfloored, "{request} against {unfloored}");
     db.drop_db().await;
 }
+
+/// T-F1 (fast-reads design §2.2): a private read called directly. A bare
+/// `aud` and `#bsky_appview`, with Horizon's 59-minute window or a full
+/// hour, read the post; another fragment, a window past an hour and
+/// another method's token are 401.
+#[tokio::test]
+async fn t_f1_direct_tokens_read_private_posts() {
+    use crate::kryphocron_glue::jwt::tests::mint_claims;
+
+    let Some(db) = fresh_db("tf1_direct_tokens").await else {
+        return;
+    };
+    let f = fixture(&db.pool, "tf1-direct").await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let post = f.private_post(ALICE, "3kpost222222", &aud, None).await;
+    f.ready_all().await;
+    let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let host = format!("did:web:{AUDIENCE_HOST}");
+    let fragment = format!("{host}#bsky_appview");
+    let other = format!("{host}#atproto_labeler");
+    let now = Utc::now().timestamp();
+    for (audience, lxm, window, status) in [
+        (host.as_str(), POSTS, 60, 200),
+        (fragment.as_str(), POSTS, 3_540, 200),
+        (host.as_str(), POSTS, 3_600, 200),
+        (fragment.as_str(), POSTS, 3_601, 401),
+        (other.as_str(), POSTS, 3_540, 401),
+        (fragment.as_str(), THREAD, 3_540, 401),
+    ] {
+        let token = mint_claims(&signing_key(BOB_KEY), &json!({"iss": BOB, "aud": audience, "lxm": lxm, "iat": now, "exp": now + window}));
+        let r = reqwest::Client::new()
+            .get(format!("{base}/xrpc/{POSTS}?uris={post}"))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .expect("request");
+        let got = r.status().as_u16();
+        let body = r.text().await.expect("body");
+        assert_eq!(got, status, "{audience} {lxm} {window}: {body}");
+        if status == 200 {
+            assert!(body.contains("3kpost222222"), "{body}");
+        }
+    }
+    db.drop_db().await;
+}

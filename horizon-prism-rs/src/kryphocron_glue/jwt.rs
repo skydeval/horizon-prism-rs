@@ -562,6 +562,27 @@ pub(crate) mod tests {
         assert!(matches!(v.verify_request_jwt(Some(&forged), METHOD).await, Err(AuthError::Invalid(_))));
     }
 
+    /// T-F1 (fast-reads design §1.1, §2.2): a direct call's token. `exp −
+    /// iat` of 3 540 s (Horizon's 59 minutes) and 3 600 s verify, 3 601 s is
+    /// refused; with a bare `aud` and with `#bsky_appview` alike. A
+    /// proxied-shaped token (bare `aud`, 60 s) verifies.
+    #[tokio::test]
+    async fn direct_tokens_verify_up_to_an_hour() {
+        let fetcher = StubFetcher::default();
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let key = signing_key(3);
+        fetcher.set_key(did, key.clone());
+        let (v, _drainer) = verifier(fetcher, 100, 16);
+        let now = chrono::Utc::now().timestamp();
+        for aud in [aud(), format!("{}#bsky_appview", aud())] {
+            for (window, ok) in [(60, true), (3_540, true), (3_600, true), (3_601, false)] {
+                let token = mint_claims(&key, &json!({"iss": did, "aud": aud, "lxm": METHOD, "iat": now, "exp": now + window}));
+                let verified = v.verify_request_jwt(Some(&format!("Bearer {token}")), METHOD).await;
+                assert_eq!(verified.is_ok(), ok, "{aud} exp - iat = {window}: {verified:?}");
+            }
+        }
+    }
+
     /// #682: a correctly signed token whose time claims are too large to be
     /// times is rejected here. Passed on, it would panic kryphocron 0.4.0.
     #[tokio::test]

@@ -10,6 +10,20 @@ commit.
 
 ## [Unreleased]
 
+### Changed (fast reads F-B: direct calls, #801)
+
+- CORS preflights are cached for a day: `Access-Control-Max-Age` 600 →
+  86 400, as the reference PDS and AppView send (browsers apply their own
+  cap, 2 h in Chromium). A client calling Prism directly with a service
+  token pays one preflight per URL per browser cap instead of per 10
+  minutes. A preflight answer carries nothing about a caller.
+- No authentication change: a token minted by `getServiceAuth` for a
+  direct call already verifies. New tests pin it on a private read,
+  `getMembership` and a Thread Lens route: `aud` bare or
+  `#bsky_appview`, `exp − iat` up to 3 600 s (3 540 s, Horizon's planned
+  59 minutes, and 3 600 s pass; 3 601 s is refused); another fragment,
+  another method's `lxm` or no `lxm` are 401.
+
 ### Added (fast reads F-A: read latency metrics, #800)
 
 - `xrpc_request_seconds{nsid}`: a histogram of every routed XRPC request's

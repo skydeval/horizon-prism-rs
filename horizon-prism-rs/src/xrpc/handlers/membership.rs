@@ -403,6 +403,52 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// T-F1 (fast-reads design §2.2): `getMembership` called directly, with
+    /// a token from `getServiceAuth`: a bare `aud` and `#bsky_appview` with
+    /// Horizon's 59-minute window answer; another fragment, a window past an
+    /// hour and another method's token are 401.
+    #[tokio::test]
+    async fn direct_tokens_reach_get_membership() {
+        use crate::kryphocron_glue::jwt::tests::mint_claims;
+
+        let Some(db) = fresh_db("xrpc_get_membership_direct").await else {
+            return;
+        };
+        let fetcher = StubFetcher::default();
+        fetcher.set_key(ALICE, signing_key(3));
+        let (auth, _drainer) = verifier(fetcher, 10, 4);
+        let state = AppState {
+            hydrator: hydrator(&db.pool, ScopeSets::default()),
+            auth: Arc::new(auth),
+            limits: RateLimits::new(),
+            enroller: None,
+            trusted_proxy: "172.30.0.10".parse().expect("ip"),
+            did_document: Arc::new(json!({})),
+            membership: MembershipSettings::default(),
+        };
+        let base = serve(state).await;
+        let client = reqwest::Client::new();
+        let host = format!("did:web:{AUDIENCE_HOST}");
+        let now = chrono::Utc::now().timestamp();
+        let token = |aud: &str, lxm: &str, window: i64| {
+            mint_claims(&signing_key(3), &json!({"iss": ALICE, "aud": aud, "lxm": lxm, "iat": now, "exp": now + window}))
+        };
+        let fragment = format!("{host}#bsky_appview");
+        let other = format!("{host}#atproto_labeler");
+        for (aud, lxm, window, status) in [
+            (host.as_str(), GET_MEMBERSHIP, 60, 200),
+            (fragment.as_str(), GET_MEMBERSHIP, 3_540, 200),
+            (fragment.as_str(), GET_MEMBERSHIP, 3_600, 200),
+            (fragment.as_str(), GET_MEMBERSHIP, 3_601, 401),
+            (other.as_str(), GET_MEMBERSHIP, 3_540, 401),
+            (fragment.as_str(), "app.nearhorizon.private.getPosts", 3_540, 401),
+        ] {
+            let (got, _, v) = call(&client, &base, Some(&token(aud, lxm, window))).await;
+            assert_eq!(got, status, "{aud} {lxm} {window}: {v}");
+        }
+        db.drop_db().await;
+    }
+
     /// With no enroller, the gate's own state: a non-member is notEligible.
     #[tokio::test]
     async fn without_an_enroller_a_non_member_is_not_eligible() {

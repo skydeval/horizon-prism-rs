@@ -29,8 +29,10 @@ use crate::honest_501::{self, PublicMessages, Verb};
 /// The health route: exempt from the backstop for `GET` and `HEAD` (§6.3;
 /// `serve::health` charges it itself when a token is presented).
 const HEALTH_PATH: &str = "/xrpc/_health";
-/// Preflight cache lifetime (§6.5).
-const CORS_MAX_AGE: Duration = Duration::from_secs(600);
+/// Preflight cache lifetime (§6.5; fast-reads design F-1): a day, as the
+/// reference PDS and AppView send. Browsers cap it (Chromium at 2 h). A
+/// preflight answer carries nothing about a caller.
+const CORS_MAX_AGE: Duration = Duration::from_secs(86_400);
 
 /// Settings of the final router.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -610,7 +612,8 @@ mod tests {
             assert!(allowed.contains("authorization") && allowed.contains("content-type"), "{allowed}");
             let methods = h["access-control-allow-methods"].to_str().expect("ascii");
             assert!(methods.contains("GET") && methods.contains("POST"), "{methods}");
-            assert_eq!(h["access-control-max-age"], "600");
+            // T-F2 (fast-reads design F-1): a day.
+            assert_eq!(h["access-control-max-age"], "86400");
             assert!(h.get("access-control-allow-credentials").is_none());
         }
 
