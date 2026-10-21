@@ -1227,6 +1227,86 @@ async fn b5_absolute_floors() {
     assert!(failures.is_empty(), "{} failing cases:\n{}", failures.len(), failures.join("\n"));
 }
 
+/// H-3's trace (shared-walk §6, #720): where `getPostThread` of
+/// [`Part3::UndecodableChildren`]'s root spends its time. Each alone, p50 of
+/// 20: the request; the expansion's candidate statements, one
+/// `reply_candidates` per expanded node in turn, as `expand` runs them; and
+/// pipeline reads, as `getPosts` of 25 undecodable children (each a full
+/// read that misses at the decode) and of 25 readable ones. The thread
+/// makes one read per candidate, so its reads cost about
+/// `candidates / 25 ×` the first. Prints the numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "H-3 trace; run with --release --ignored --nocapture"]
+async fn b5_thread_expansion_trace() {
+    const N: usize = 20;
+    let Some((w, heads)) = part3_walk("b5-h3-trace").await else {
+        return;
+    };
+    let pool = w.f.pool.clone();
+    let cases = Part3::UndecodableChildren.build(&pool).await;
+    exec(&pool, "ANALYZE").await;
+    let read = PrivateReadConfig { max_chain: CAP, ..PrivateReadConfig::default() };
+    let base = serve_live(w.f.state_bounded(&read)).await;
+    let query = cases[0].2.clone();
+    let root = query.strip_prefix("uri=").expect("uri").to_string();
+    let thread = sample(&base, THREAD, &query, DAVE, N, 1).await;
+
+    // The nodes `expand` expands: the root, then each level's readable
+    // children, down to the leaves.
+    let mut nodes = vec![root.clone()];
+    let mut level = vec![root];
+    while !level.is_empty() {
+        level = sqlx::query_scalar("SELECT uri FROM private_posts WHERE reply_parent_uri = ANY($1) AND uri LIKE '%/b5ca%' ORDER BY uri")
+            .bind(&level)
+            .fetch_all(&pool)
+            .await
+            .expect("level");
+        nodes.extend(level.iter().cloned());
+    }
+    let bounds = schema::ReadBounds::new(CAP, read.walk_batch_max);
+    let per_node = super::super::handlers::REPLIES_PER_NODE;
+    let mut statements = Vec::new();
+    let mut candidates = 0;
+    for _ in 0..N {
+        let t = Instant::now();
+        candidates = 0;
+        for node in &nodes {
+            candidates += schema::reply_candidates(&pool, DAVE, node, per_node, bounds).await.expect("candidates").len();
+        }
+        statements.push(t.elapsed());
+    }
+    statements.sort();
+    let some = |pattern: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let uris: Vec<String> =
+                sqlx::query_scalar("SELECT uri FROM private_posts WHERE uri LIKE $1 AND reply_parent_uri IS NOT NULL ORDER BY uri LIMIT 25")
+                    .bind(pattern)
+                    .fetch_all(&pool)
+                    .await
+                    .expect("uris");
+            uris.iter().map(|u| format!("uris={u}")).collect::<Vec<_>>().join("&")
+        }
+    };
+    let misses = sample(&base, POSTS, &some("%/b5cu%").await, DAVE, N, 1).await;
+    let hits = sample(&base, POSTS, &some("%/b5ca%").await, DAVE, N, 1).await;
+    let p50 = |d: &[Duration]| percentile(d, 50).as_secs_f64() * 1000.0;
+    #[allow(clippy::cast_precision_loss)]
+    let reads = p50(&misses) * candidates as f64 / 25.0;
+    println!(
+        "H-3 trace: getPostThread p50 {:.1} ms; {} expanded nodes, {candidates} candidates; candidate statements p50 {:.1} ms; \
+         getPosts of 25 undecodable p50 {:.1} ms (so about {reads:.0} ms for the thread's reads); getPosts of 25 readable p50 {:.1} ms",
+        p50(&thread),
+        nodes.len(),
+        p50(&statements),
+        p50(&misses),
+        p50(&hits),
+    );
+    assert_eq!(heads.0.load(Ordering::SeqCst), 0, "no head fetch in the bench regime");
+    let failures = w.drain().await;
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
 impl Walk {
     /// This walk's failures, its database dropped.
     async fn drain(self) -> Vec<String> {

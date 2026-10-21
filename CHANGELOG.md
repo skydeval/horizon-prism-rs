@@ -10,6 +10,18 @@ commit.
 
 ## [Unreleased]
 
+### Measured (shared walk's open items, #720)
+
+Shared-walk amendment 1 (`docs/internal/design/shared-walk-amendment-1.md`).
+No change to what any endpoint returns.
+
+- **H-3, thread expansion reads (#778).** A new ignored test,
+  `b5_thread_expansion_trace`, splits `getPostThread` over 48 undecodable
+  children per node: the 31 per-node candidate statements take 84 ms of
+  1 167 ms; the 750 pipeline reads take the rest (about 1.4 ms each at
+  `bind_concurrency` 8). A cap on the expansion's reads is waiting on a
+  choice by skydeval, since it changes which replies a thread can show.
+
 ### Added (private notification preferences, S1, #775, #777)
 
 Private notification preferences design S1
