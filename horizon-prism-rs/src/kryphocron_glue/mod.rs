@@ -32,8 +32,8 @@ use crate::identity::{GuardedDidFetcher, IdentityResolver, JwtFetchCell};
 pub enum GlueError {
     #[error(transparent)]
     ServiceKey(#[from] ServiceKeyError),
-    /// `DefaultAtRestHooks::for_data_dir` failed (for example an unwritable
-    /// data directory).
+    /// The default rotation oracle could not be built (for example an
+    /// unwritable data directory).
     #[error("at-rest hooks: {0}")]
     AtRestHooks(String),
     /// `validate_at_rest_install` rejected the hook set.
@@ -41,14 +41,37 @@ pub enum GlueError {
     AtRestInstall(String),
 }
 
-/// Build and validate the at-rest hooks for `data_dir` (§6.6). Laquna is
-/// installed inside kryphocron; the host never names the codec.
+/// The largest payload Prism decodes or restores, and the largest
+/// `encodedContent` it decodes: the size of the largest record a PDS accepts
+/// (the lexicon bounds `encodedContent` at the same). The codec stops
+/// decompressing past it (private-embeds design §7, S3), and the read
+/// pipeline checks the input and the restored payload against it.
+pub const PAYLOAD_MAX_BYTES: usize = 1_000_000;
+
+/// Laquna, as `DefaultAtRestHooks::for_data_dir` installs it (the default
+/// seed policy), with its decoded length bounded at [`PAYLOAD_MAX_BYTES`]:
+/// a small record that decompresses past the bound fails as
+/// `CodecError::Malformed` without being expanded (private-embeds design
+/// §7, S3). The one place the host names the codec type; it only builds it
+/// for the hooks and never calls it.
+#[expect(
+    clippy::disallowed_types,
+    reason = "builds laquna once, for the hooks, to set its decode bound; nothing here decodes (private-embeds design S3)"
+)]
+fn bounded_codec() -> kryphocron::codec::laquna::Codec {
+    kryphocron::codec::laquna::Codec::default().with_max_decoded_len(PAYLOAD_MAX_BYTES)
+}
+
+/// Build and validate the at-rest hooks for `data_dir` (§6.6): laquna with
+/// its decode bound ([`bounded_codec`]) and, as `for_data_dir` gives, the
+/// default rotation oracle persisting under `data_dir` and no audit
+/// resolver.
 ///
 /// # Errors
 ///
 /// Either fallible step.
 pub fn at_rest_hooks(data_dir: PathBuf) -> Result<Arc<dyn AtRestHooks>, GlueError> {
-    let hooks = DefaultAtRestHooks::for_data_dir(data_dir).map_err(|e| {
+    let hooks = DefaultAtRestHooks::builder(data_dir).with_codec(Arc::new(bounded_codec())).build().map_err(|e| {
         tracing::error!(event = "at_rest_hooks_failed", error = ?e, "at-rest hooks could not be built");
         GlueError::AtRestHooks(format!("{e:?}"))
     })?;
@@ -145,5 +168,24 @@ impl GlueContext {
     #[must_use]
     pub fn audit_latched(&self) -> Arc<AtomicBool> {
         self.pipeline.audit_latched()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The codec the hooks are built with carries the decode bound, at the
+    /// payload cap; laquna with no bound would report `None`.
+    #[test]
+    fn the_installed_codec_carries_the_decode_bound() {
+        assert_eq!(bounded_codec().max_decoded_len(), Some(PAYLOAD_MAX_BYTES));
+        assert_eq!(PAYLOAD_MAX_BYTES, 1_000_000);
+        let dir = std::env::temp_dir().join(format!("hprs-glue-bound-{}", std::process::id()));
+        let hooks = at_rest_hooks(dir.clone()).expect("at-rest hooks");
+        assert_eq!(hooks.content_codec().codec_id().as_str(), "laquna/0.2");
+        assert!(hooks.rotation_oracle().is_some(), "the default rotation oracle stays installed");
+        assert!(dir.join("kryphocron").join("rotation.state").exists(), "the oracle persists under the data dir");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

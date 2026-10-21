@@ -1928,9 +1928,9 @@ dependencies = [
 
 [[package]]
 name = "kryphocron"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59c1deb09ff63ede0ee5e1e206ddf4d30850de2dff1e83772828cd0c0f89ce49"
+checksum = "8af7ba2c48f4823a9d0799a15315b5a033e924aa8d052e46438498c392ec6cb2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

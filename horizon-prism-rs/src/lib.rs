@@ -4,7 +4,9 @@
 //! Modules are added in the §15 implementation order.
 
 // §3.1, §6.3: the public codec surface (`ContentCodec::decode`,
-// `DecodeContext`, `laquna::Codec`) is forbidden by clippy.toml.
+// `DecodeContext`, `laquna::Codec`) is forbidden by clippy.toml. One
+// `#[expect]` lets `kryphocron_glue::bounded_codec` build laquna for the
+// hooks, to set its decode bound (private-embeds design S3).
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 // The stand-in exception is test-only (docs/internal/design/

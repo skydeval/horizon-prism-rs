@@ -1,8 +1,9 @@
 //! Private posts whose `encodedContent` carries facets and embed (#504,
 //! private-embeds design): the old form held to a golden (T-E2); the new
 //! form read as the old (T-E1); hostile payloads (T-E5); the input cap
-//! (T-E6); search (T-E7); ingest from the clear `quote` and `mentionDids`
-//! (T-E3, T-E9, T-E10); rewrites and the notification rules (T-E4, T-E8).
+//! (T-E6); the codec's decode bound (T-S3); search (T-E7); ingest from the
+//! clear `quote` and `mentionDids` (T-E3, T-E9, T-E10); rewrites and the
+//! notification rules (T-E4, T-E8).
 
 use metrics_exporter_prometheus::PrometheusHandle;
 
@@ -411,10 +412,13 @@ async fn te5_te6_hostile_payloads_and_the_input_cap() {
         ("3kffalone222", raw_payload(b"")),
         ("3kffspace222", raw_payload(b"  \n")),
         ("3kdeepjson22", raw_payload(format!(r#"{{"text": "t", "x": {}{}}}"#, "[".repeat(200), "]".repeat(200)).as_bytes())),
-        ("3kbigpayload", payload(&"a".repeat(1_000_001), None, None)),
     ] {
         misses.push((rkey, f.encoded_bytes(ALICE, rkey, &bytes, Some(&aud)).await, "bad_content"));
     }
+    // A payload over the cap now fails in the codec, before it is restored
+    // (S3; T-S3 below).
+    let big = payload(&"a".repeat(1_000_001), None, None);
+    misses.push(("3kbigpayload", f.encoded_bytes(ALICE, "3kbigpayload", &big, Some(&aud)).await, "decode_failed"));
     // An old-form payload that is not UTF-8: today's miss.
     misses.push(("3knotutf8222", f.encoded_bytes(ALICE, "3knotutf8222", &[0xC3, 0x28], Some(&aud)).await, "not_utf8"));
     // A new-form payload under another codec id.
@@ -534,6 +538,47 @@ async fn te5_te6_hostile_payloads_and_the_input_cap() {
     assert_eq!(content_forms(&handle), (forms.0 + 2.0, forms.1 + 6.0));
     assert_eq!(read(plain).await["record"]["text"], "plain");
     assert_eq!(content_forms(&handle), (forms.0 + 2.0, forms.1 + 6.0));
+    db.drop_db().await;
+}
+
+/// T-S3 (S3, the codec's decode bound): with the hooks `serve` builds, a
+/// payload of exactly `PAYLOAD_MAX_BYTES` reads; one byte more fails in the
+/// codec (`decode_failed`; past the codec it would be `bad_content`); and a
+/// 64 MiB payload, whose `encodedContent` is far under the input cap, fails
+/// in the codec too, without being expanded.
+#[tokio::test]
+async fn ts3_the_codec_bounds_what_it_decodes() {
+    let Some(db) = fresh_db("ts3_decode_bound").await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let f = fixture(&db.pool, "ts3-bound").await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB]).await;
+    let max = crate::kryphocron_glue::PAYLOAD_MAX_BYTES;
+
+    let at_cap = vec![b'a'; max];
+    let at_cap = f.put_post(ALICE, "3katcap22222", f.encoded_bytes(ALICE, "3katcap22222", &at_cap, Some(&aud)).await).await;
+    let over = vec![b'a'; max + 1];
+    let over = f.put_post(ALICE, "3kovercap222", f.encoded_bytes(ALICE, "3kovercap222", &over, Some(&aud)).await).await;
+    // An RLE bomb: 64 MiB of one byte compresses to a few kilobytes.
+    let bomb = f.encoded_bytes(ALICE, "3kbomb222222", &vec![b'a'; 64 << 20], Some(&aud)).await;
+    let bomb_input = bomb["encodedContent"].as_str().expect("hex").len() / 2;
+    assert!(bomb_input < 64 * 1024, "the bomb is small on the wire: {bomb_input} bytes");
+    let bomb = f.put_post(ALICE, "3kbomb222222", bomb).await;
+    f.ready_all().await;
+    let base = serve(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+
+    let (outcome, post) = read_outcome(&base, &handle, &at_cap).await;
+    assert_eq!(outcome, "hit");
+    assert_eq!(post["record"]["text"].as_str().map(str::len), Some(max));
+    assert_eq!(read_outcome(&base, &handle, &over).await, ("decode_failed", Value::Null));
+    let started = Instant::now();
+    assert_eq!(read_outcome(&base, &handle, &bomb).await, ("decode_failed", Value::Null));
+    // Unbounded, the bomb is 64 MiB of output; bounded, the frame header
+    // alone refuses it.
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     db.drop_db().await;
 }
 

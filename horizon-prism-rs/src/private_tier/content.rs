@@ -8,11 +8,11 @@ use serde_json::Value;
 use super::ingest::DISPLAY_FIELD_MAX_BYTES;
 use crate::firehose::normalize::normalize_record;
 
-/// The largest payload restored, and the largest `encodedContent` decoded:
-/// the size of the largest record a PDS accepts (the lexicon bounds
-/// `encodedContent` at the same). A payload restores at most what a record
-/// could hold in the clear.
-pub(super) const PAYLOAD_MAX_BYTES: usize = 1_000_000;
+/// The largest payload restored, and the largest `encodedContent` decoded. A
+/// payload restores at most what a record could hold in the clear. The same
+/// constant bounds the codec's own decode, so a payload over it fails in the
+/// codec first; the check here stays for any payload that reaches it.
+pub(super) use crate::kryphocron_glue::PAYLOAD_MAX_BYTES;
 
 /// The byte that opens a new-form payload. It never begins valid UTF-8, so
 /// it tells the two forms apart.

@@ -10,6 +10,32 @@ commit.
 
 ## [Unreleased]
 
+### Changed (private embeds, S3: the codec's decode bound, #746)
+
+Private-embeds design S3 (`docs/internal/design/private-embeds-504.md` §7,
+choice K1): kryphocron 0.4.2.
+
+- **The codec stops decoding at 1 000 000 bytes.** The at-rest hooks now
+  install laquna with kryphocron's optional decode bound set to the payload
+  cap (`PAYLOAD_MAX_BYTES`, one constant shared with the read pipeline's
+  checks). A private post whose content would decode past it is refused by
+  the frame header or as soon as the output passes the bound, so a small
+  record that expands to gigabytes no longer costs the memory or time to
+  expand it. Everything else in the hooks is as before: laquna's default
+  seed policy, the default rotation oracle under the data dir, no audit
+  resolver.
+- **A decoded payload over 1 000 000 bytes now misses as `decode_failed`**,
+  not `bad_content`: the codec refuses it before the payload is restored,
+  and kryphocron reports it as any other decode failure. No lexicon-valid
+  record reaches the bound.
+- The 1 000 000-byte input cap stays: an `encodedContent` over it is still
+  not decoded (`bad_content`). It bounds the unmasking work, which the
+  output bound does not.
+- `clippy.toml` still forbids naming `laquna::Codec`; the one function that
+  builds it for the hooks carries an `#[expect(clippy::disallowed_types)]`
+  and never decodes.
+- `Cargo.lock`: kryphocron 0.4.1 → 0.4.2, nothing else.
+
 ### Fixed (test reliability: requestRecord's second call, #772)
 
 - **`request_record_catches_up_and_the_record_reads_at_once`** sometimes

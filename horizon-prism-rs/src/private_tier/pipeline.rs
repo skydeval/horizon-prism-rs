@@ -431,7 +431,8 @@ async fn read_inner(
 
     // 11. Decode, then restore the payload (private-embeds design §3): the
     // text alone, or text, facets and embed. An `encodedContent` larger
-    // than any record could hold is not decoded.
+    // than any record could hold is not decoded; the codec the hooks carry
+    // refuses output past the same bound (S3), which fails `decode_failed`.
     let restored = match schema::encoded(&env.pool, &rauth).await? {
         Some(row) => {
             if row.content.len() > content::PAYLOAD_MAX_BYTES {
