@@ -29,6 +29,17 @@ No change to what any endpoint returns.
   nothing waits on the old 1 500 ms floor; the cost is recorded and
   accepted. An operator who needs it lower sets `private_search.span_hours`
   or `scan_candidates`.
+- **H-9, a stored branch root (#780): not built.** It would spare the
+  chain fetch only for branch replies that fail before the walk (a reader
+  outside the audience, an accepted cost). Replies that pass, such as the
+  5 000 owner branch replies under distinct parents behind
+  `getUnreadCount`'s 1.7 s, are walked row by row whatever is stored, so
+  it would not change them; their cost is linear in the rows read (the
+  same 1.57–1.91 s at any slice size from 156 to 5 000).
+- The B-5 release loader's database pool now uses production's connection
+  settings, JIT off among them, so `b5_release_plans` times what the
+  deploy build runs (on the old pool JIT compilation made `Distinct`'s
+  statement read 6.9 s). Test harness only.
 
 ### Added (private notification preferences, S1, #775, #777)
 

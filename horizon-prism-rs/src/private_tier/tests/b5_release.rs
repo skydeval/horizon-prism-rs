@@ -176,7 +176,13 @@ async fn load(which: Which) -> Option<Loaded> {
     exec(&admin, &format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).await;
     exec(&admin, &format!("CREATE DATABASE {name}")).await;
     let url = format!("{}/{name}", admin_url.rsplit_once('/').expect("database path").0);
-    let pool = PgPool::connect(&url).await.expect("connect");
+    // Production's connection settings, JIT off among them, so the plans
+    // `b5_release_plans` times are the deploy build's (shared-walk
+    // amendment 1 §1.6).
+    let pool = crate::db::pool::pool_options()
+        .connect_with(crate::db::pool::connect_options(&url, 30).expect("connect options"))
+        .await
+        .expect("connect");
     crate::db::migrations::MIGRATOR.run(&pool).await.expect("migrations");
 
     let extra = if matches!(which, Which::Stale { .. }) { stale_authors() } else { Vec::new() };
