@@ -10,6 +10,20 @@ commit.
 
 ## [Unreleased]
 
+### Removed (Community B network entry)
+
+- **The `community-b` `[[constellation.networks]]` entry** is removed from
+  `docker/config/app.toml` and from the built-in defaults, and `community-b`
+  leaves the default `constellation.cascade.order` (now `["bluesky",
+  "community-a"]`). Its `appview_url`, `api.community-b.example`, is Community B's
+  PDS (`describeServer` answers `did:web:community-b.example`), not an
+  AppView. Community B has no AppView yet; the entry comes back, by its
+  AppView's DID, once it does. The entry shipped disabled, so routing is
+  unchanged. A config that still lists `community-b` in `cascade.order`
+  without a matching network fails validation ("is not a configured
+  network"); drop it from the order. Tests that used it as their example
+  network now use placeholder networks. No migration or lexicon change.
+
 ### Changed (firehose batch size 2000)
 
 - **`firehose.batch_size`** defaults to 2000 (was 500), in the code default

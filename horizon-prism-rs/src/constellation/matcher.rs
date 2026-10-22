@@ -56,7 +56,6 @@ mod tests {
         let mut cfg = ConstellationConfig::default();
         let names = |host: &str, cfg: &ConstellationConfig| first_match(&cfg.networks, host).map(|n| n.name.clone());
         assert_eq!(names("pds.community-a.example", &cfg), Some("community-a".into()));
-        assert_eq!(names("community-b.example", &cfg), Some("community-b".into()));
         assert_eq!(names("pds.example.org", &cfg), None);
         // An earlier entry shadows a later, more specific one.
         cfg.networks.insert(

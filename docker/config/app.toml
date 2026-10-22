@@ -347,19 +347,6 @@ burst = 20
 enabled = true
 
 [[constellation.networks]]
-name = "community-b"
-pds_patterns = ["community-b.example", "*.community-b.example"]
-appview_url = "https://api.community-b.example"
-# Unauthenticated reads return 401; service_jwt needs Community B's AppView DID,
-# which api.community-b.example does not publish. Enable only after setting
-# appview_did and passing design §14 check B-6.
-auth = "service_jwt"
-appview_did = ""
-rate_per_sec = 10
-burst = 20
-enabled = false
-
-[[constellation.networks]]
 name = "community"
 # Add the community PDS hostnames (exact host or *.suffix) here.
 pds_patterns = []
@@ -368,7 +355,7 @@ auth = "unauth"
 enabled = true
 
 [constellation.cascade]
-order = ["bluesky", "community-a", "community-b"]
+order = ["bluesky", "community-a"]
 
 # Endpoints this AppView does not serve yet (feed generators, push,
 # preferences, reports, video, age assurance, contact import) answer

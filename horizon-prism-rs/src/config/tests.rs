@@ -50,7 +50,7 @@ fn empty_file_yields_design_defaults() {
     assert_eq!(cfg.file.identity.jwt_issuer_tracker_max, 20_000);
     assert_eq!(cfg.file.retention.run_at_utc.to_string(), "04:00");
     assert_eq!(cfg.file.kryphocron.oracle_freshness_bound_secs, 120);
-    assert_eq!(cfg.file.constellation.networks.len(), 4);
+    assert_eq!(cfg.file.constellation.networks.len(), 3);
 }
 
 /// The committed `docker/config/app.toml`, reproduced here because the image
@@ -250,16 +250,6 @@ burst = 20
 enabled = true
 
 [[constellation.networks]]
-name = "community-b"
-pds_patterns = ["community-b.example", "*.community-b.example"]
-appview_url = "https://api.community-b.example"
-auth = "service_jwt"
-appview_did = ""
-rate_per_sec = 10
-burst = 20
-enabled = false
-
-[[constellation.networks]]
 name = "community"
 pds_patterns = []
 appview_url = "local"
@@ -267,7 +257,7 @@ auth = "unauth"
 enabled = true
 
 [constellation.cascade]
-order = ["bluesky", "community-a", "community-b"]
+order = ["bluesky", "community-a"]
 
 [honest_501]
 status_url = ""
@@ -784,9 +774,9 @@ const COMMUNITY: &str = "[[constellation.networks]]\nname = \"community\"\npds_p
 fn enabled_service_jwt_requires_appview_did() {
     let text = with_networks(
         &format!(
-            "{COMMUNITY}[[constellation.networks]]\nname = \"community-b\"\nappview_url = \"https://api.community-b.example\"\nauth = \"service_jwt\"\nappview_did = \"\"\nrate_per_sec = 10\nburst = 20\nenabled = true\n"
+            "{COMMUNITY}[[constellation.networks]]\nname = \"signed\"\nappview_url = \"https://appview.signed.example\"\nauth = \"service_jwt\"\nappview_did = \"\"\nrate_per_sec = 10\nburst = 20\nenabled = true\n"
         ),
-        "[\"community-b\"]",
+        "[\"signed\"]",
     );
     let p = invalid_problems(load(&text));
     assert!(has(&p, "requires appview_did"));
@@ -796,9 +786,9 @@ fn enabled_service_jwt_requires_appview_did() {
 fn enabled_service_jwt_with_did_is_accepted() {
     let text = with_networks(
         &format!(
-            "{COMMUNITY}[[constellation.networks]]\nname = \"community-b\"\nappview_url = \"https://api.community-b.example\"\nauth = \"service_jwt\"\nappview_did = \"did:web:api.community-b.example\"\nrate_per_sec = 10\nburst = 20\nenabled = true\n"
+            "{COMMUNITY}[[constellation.networks]]\nname = \"signed\"\nappview_url = \"https://appview.signed.example\"\nauth = \"service_jwt\"\nappview_did = \"did:web:appview.signed.example\"\nrate_per_sec = 10\nburst = 20\nenabled = true\n"
         ),
-        "[\"community-b\"]",
+        "[\"signed\"]",
     );
     load(&text).expect("valid");
 }

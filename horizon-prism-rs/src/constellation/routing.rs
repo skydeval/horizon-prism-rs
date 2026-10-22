@@ -828,10 +828,8 @@ pub(crate) mod tests {
         assert_eq!(local.appview_url, None, "community is never an outbound call");
         assert_eq!(t.decide("https://pds.unknown.example"), RoutingDecision::unknown());
 
-        // Community B ships disabled: skipped everywhere.
         assert_eq!(t.cascade(), ["bluesky", "community-a"]);
         assert_eq!(t.plan(Some("community-a")), ["community-a", "bluesky"], "home first, then the cascade without it");
-        assert_eq!(t.plan(Some("community-b")), ["bluesky", "community-a"], "a disabled home is skipped");
         assert_eq!(t.plan(Some(COMMUNITY_NETWORK)), ["bluesky", "community-a"]);
         assert_eq!(t.plan(None), ["bluesky", "community-a"], "unknown DIDs use the cascade");
     }
@@ -839,12 +837,26 @@ pub(crate) mod tests {
     #[test]
     fn enabling_a_network_adds_it_to_the_cascade() {
         let mut cfg = ConstellationConfig::default();
-        for n in &mut cfg.networks {
-            if n.name == "community-b" {
-                n.enabled = true;
-                n.appview_did = "did:web:api.community-b.example".into();
-            }
-        }
+        let extra = |name: &str, enabled: bool| NetworkConfig {
+            name: name.into(),
+            pds_patterns: vec![],
+            appview_url: format!("https://appview.{name}.example"),
+            auth: NetworkAuth::Unauth,
+            appview_did: String::new(),
+            rate_per_sec: Some(1),
+            burst: Some(1),
+            enabled,
+            background_rate_per_sec: crate::config::background_rate_per_sec(),
+            background_burst: crate::config::background_burst(),
+        };
+        // A disabled home is skipped everywhere.
+        cfg.networks.push(extra("dormant", false));
+        cfg.cascade.order.push("dormant".into());
+        let t = RoutingTable::from_config(&cfg);
+        assert_eq!(t.cascade(), ["bluesky", "community-a"]);
+        assert_eq!(t.plan(Some("dormant")), ["bluesky", "community-a"], "a disabled home is skipped");
+        cfg.networks.push(extra("second", true));
+        cfg.cascade.order.push("second".into());
         cfg.networks.push(NetworkConfig {
             name: "offline".into(),
             pds_patterns: vec![],
@@ -859,8 +871,8 @@ pub(crate) mod tests {
         });
         cfg.cascade.order.push("offline".into());
         let t = RoutingTable::from_config(&cfg);
-        assert_eq!(t.cascade(), ["bluesky", "community-a", "community-b"]);
-        assert_eq!(t.plan(Some("community-b")), ["community-b", "bluesky", "community-a"]);
+        assert_eq!(t.cascade(), ["bluesky", "community-a", "second"]);
+        assert_eq!(t.plan(Some("second")), ["second", "bluesky", "community-a"]);
     }
 
     #[tokio::test]

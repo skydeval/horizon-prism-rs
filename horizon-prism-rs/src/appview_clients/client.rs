@@ -297,10 +297,10 @@ mod tests {
         assert_eq!(r["query"], "uris=at%3A%2F%2Fa%2Fb%2F1&uris=at%3A%2F%2Fa%2Fb%2F2");
 
         let signed = AppViewClient::new(
-            "community-b",
+            "signed",
             &base,
             AppViewAuth::ServiceJwt {
-                aud: "did:web:api.community-b.example".into(),
+                aud: "did:web:appview.signed.example".into(),
                 key: Box::new(key),
             },
             net,
@@ -316,7 +316,7 @@ mod tests {
         )
         .expect("json");
         assert_eq!(claims["lxm"], "app.bsky.actor.getProfile");
-        assert_eq!(claims["aud"], "did:web:api.community-b.example");
+        assert_eq!(claims["aud"], "did:web:appview.signed.example");
     }
 
     #[test]
@@ -337,7 +337,7 @@ mod tests {
         let key = ServiceKey::new("prism.example.com", &[5u8; 32]).expect("key");
         let clients = from_config(&cfg, &NetClient::loopback_for_tests(), &key);
         let names: Vec<&str> = clients.iter().map(AppViewClient::network).collect();
-        // community-b ships disabled; community is local.
+        // community is local.
         assert_eq!(names, ["bluesky", "community-a", "extra"]);
     }
 }

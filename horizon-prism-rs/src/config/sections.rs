@@ -955,11 +955,7 @@ pub struct CascadeConfig {
 impl Default for CascadeConfig {
     fn default() -> Self {
         Self {
-            order: vec![
-                "bluesky".to_string(),
-                "community-a".to_string(),
-                "community-b".to_string(),
-            ],
+            order: vec!["bluesky".to_string(), "community-a".to_string()],
         }
     }
 }
@@ -1020,14 +1016,6 @@ impl Default for ConstellationConfig {
                     NetworkAuth::Unauth,
                     Some((10, 20)),
                     true,
-                ),
-                network(
-                    "community-b",
-                    &["community-b.example", "*.community-b.example"],
-                    "https://api.community-b.example",
-                    NetworkAuth::ServiceJwt,
-                    Some((10, 20)),
-                    false,
                 ),
                 network(
                     COMMUNITY_NETWORK,
