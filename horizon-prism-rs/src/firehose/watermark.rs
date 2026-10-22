@@ -9,6 +9,7 @@
 //!   startup, and only ever advanced.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,10 @@ pub const PRIVATE_RELAY_SILENT_AFTER: Duration = Duration::from_secs(300);
 pub const METRIC_DELAY: &str = "firehose_worker_delay_seconds";
 /// Metric: commits whose `time` did not parse.
 pub const METRIC_TIME_UNPARSED: &str = "firehose_commit_time_unparsed_total";
+/// Metric: 1 while private reads are degraded (the private watermark is
+/// `None` or older than the freshness bound), else 0 (degraded-mode design
+/// §8).
+pub const METRIC_DEGRADED: &str = "private_read_degraded";
 
 const KEY_PREFIX: &str = "watermark:";
 
@@ -54,6 +59,11 @@ pub struct Watermarks {
     /// `_relay` URL → label.
     labels: Arc<BTreeMap<String, String>>,
     private_relays: Arc<Vec<String>>,
+    /// `kryphocron.oracle_freshness_bound_secs`, for the degraded gauge and
+    /// its transition logs; without it neither is recorded.
+    freshness_bound: Option<Duration>,
+    /// The degraded state the gauge loop last saw.
+    was_degraded: Arc<AtomicBool>,
 }
 
 impl Watermarks {
@@ -63,6 +73,49 @@ impl Watermarks {
             inner: Arc::new(Mutex::new(HashMap::new())),
             labels: Arc::new(labels),
             private_relays: Arc::new(private_relays),
+            freshness_bound: None,
+            was_degraded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// With the freshness bound the degraded gauge and its transition logs
+    /// test against (degraded-mode design §8).
+    #[must_use]
+    pub fn with_freshness_bound(mut self, bound: Duration) -> Self {
+        self.freshness_bound = Some(bound);
+        self
+    }
+
+    /// Whether private reads are degraded at `now` (degraded-mode design,
+    /// Terms): the private watermark is `None` or more than `bound` behind.
+    /// Global; reads nothing but the watermarks.
+    #[must_use]
+    pub fn degraded_at(&self, now: DateTime<Utc>, bound: Duration) -> bool {
+        let bound = chrono::TimeDelta::from_std(bound).unwrap_or(chrono::TimeDelta::MAX);
+        self.private_watermark().is_none_or(|w| now - w > bound)
+    }
+
+    /// The degraded gauge and its transition logs, against the configured
+    /// bound: `private_read_degraded_started` (with the private relays
+    /// holding reads back) and `_ended`, once per change.
+    fn record_degraded(&self, now: DateTime<Utc>) {
+        let Some(bound) = self.freshness_bound else {
+            return;
+        };
+        let degraded = self.degraded_at(now, bound);
+        metrics::gauge!(METRIC_DEGRADED).set(if degraded { 1.0 } else { 0.0 });
+        if self.was_degraded.swap(degraded, Ordering::SeqCst) == degraded {
+            return;
+        }
+        if degraded {
+            let relays: Vec<String> = self.silent_private_relays(now, bound).into_iter().map(|(r, _)| r).collect();
+            tracing::warn!(
+                event = "private_read_degraded_started",
+                relays = %relays.join(","),
+                "private reads are degraded: the private watermark is behind; reads fall back to per-repo head checks"
+            );
+        } else {
+            tracing::info!(event = "private_read_degraded_ended", "private reads are no longer degraded");
         }
     }
 
@@ -245,6 +298,7 @@ impl Watermarks {
 
     fn record_gauges(&self) {
         let now = Utc::now();
+        self.record_degraded(now);
         for (label, w) in self.snapshot() {
             // A relay with no watermark is infinitely stale.
             let delay = w.map_or(f64::INFINITY, |w| secs(now - w));
@@ -304,6 +358,34 @@ mod tests {
             .map(|(u, l)| (u.to_string(), l.to_string()))
             .collect();
         Watermarks::new(labels, vec!["bsky".into(), "microcosm".into()])
+    }
+
+    /// Degraded-mode design §8: degraded while any private relay has no
+    /// watermark or the minimum is past the bound; the transition is
+    /// recorded once per change.
+    #[test]
+    fn degraded_follows_the_private_watermark() {
+        let w = marks().with_freshness_bound(Duration::from_secs(120));
+        let now = t("2026-09-26T12:00:00Z");
+        let bound = Duration::from_secs(120);
+        assert!(w.degraded_at(now, bound), "no watermark: degraded");
+        w.observe("bsky", t("2026-09-26T11:59:30Z"));
+        assert!(w.degraded_at(now, bound), "microcosm never reported");
+        w.observe("microcosm", t("2026-09-26T11:57:00Z"));
+        assert!(w.degraded_at(now, bound), "three minutes behind");
+        w.observe("microcosm", t("2026-09-26T11:58:00Z"));
+        assert!(!w.degraded_at(now, bound), "exactly at the bound is fresh");
+        // community-a is not private and never counts.
+        w.observe("community-a", t("2020-01-01T00:00:00Z"));
+        assert!(!w.degraded_at(now, bound));
+        w.record_degraded(now);
+        assert!(!w.was_degraded.load(Ordering::SeqCst));
+        w.record_degraded(t("2026-09-26T12:05:00Z"));
+        assert!(w.was_degraded.load(Ordering::SeqCst));
+        // Without a bound nothing is recorded.
+        let unbound = marks();
+        unbound.record_degraded(now);
+        assert!(!unbound.was_degraded.load(Ordering::SeqCst));
     }
 
     #[test]

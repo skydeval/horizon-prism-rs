@@ -149,6 +149,9 @@ impl IdentityKind {
 pub struct Commit {
     pub repo: String,
     pub rev: String,
+    /// The rev of the repo's previous commit, from the sidecar's `since`
+    /// (degraded-mode design §2.4). `None` when absent, null or not a TID.
+    pub since: Option<String>,
     /// `None` when `time` is absent or not RFC 3339.
     pub time: Option<DateTime<Utc>>,
     pub relay: Option<String>,
@@ -159,6 +162,9 @@ pub struct Commit {
 struct CommitData {
     repo: String,
     rev: String,
+    /// Any JSON: a value that is not a TID is ignored, never an error.
+    #[serde(default)]
+    since: Option<Json>,
     #[serde(default)]
     ops: Vec<OpData>,
     #[serde(default)]
@@ -277,9 +283,16 @@ fn decode_commit_checked(data: &[u8], check_rev: bool) -> Result<Commit, String>
         .as_deref()
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.with_timezone(&Utc));
+    let since = c
+        .since
+        .as_ref()
+        .and_then(Json::as_str)
+        .filter(|s| proto_blue::syntax::Tid::is_valid(s))
+        .map(str::to_string);
     Ok(Commit {
         repo: c.repo,
         rev: c.rev,
+        since,
         time,
         relay: c.relay,
         ops,
@@ -350,6 +363,29 @@ mod tests {
         assert_eq!(c.ops[0].cid.as_deref(), Some("bafyop"));
         assert_eq!(c.ops[1].record, None);
         assert!(c.time.is_some());
+    }
+
+    /// T-DM2 (degraded-mode design §2.4): `since` present, null,
+    /// malformed and absent. Only a TID is kept; nothing else fails the
+    /// commit.
+    #[test]
+    fn decodes_since() {
+        let since_of = |since: Option<Json>| {
+            let mut data = json!({"repo": "did:plc:aaaa", "rev": "3kaaaaaaaaaab", "ops": []});
+            if let Some(v) = since {
+                data["since"] = v;
+            }
+            let Event::Commit(c) = decode(&entry("commit", &data)).expect("commit") else {
+                panic!("expected commit");
+            };
+            c.since
+        };
+        assert_eq!(since_of(Some(json!("3kaaaaaaaaaaa"))), Some("3kaaaaaaaaaaa".to_string()));
+        assert_eq!(since_of(Some(Json::Null)), None);
+        assert_eq!(since_of(Some(json!("yesterday"))), None);
+        assert_eq!(since_of(Some(json!(42))), None);
+        assert_eq!(since_of(Some(json!({"rev": "3kaaaaaaaaaaa"}))), None);
+        assert_eq!(since_of(None), None);
     }
 
     #[test]

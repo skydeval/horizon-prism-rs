@@ -1735,6 +1735,8 @@ impl Backfill {
                              AND sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN now() END, \
                            follows_verified_rev = GREATEST(sync_state.applied_rev, \
                              CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+                           chain_rev = GREATEST(sync_state.chain_rev, \
+                             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
                            diverged_since = CASE WHEN GREATEST(sync_state.applied_rev, \
                                CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
                                >= sync_state.head_rev THEN NULL ELSE sync_state.diverged_since END \
@@ -1747,6 +1749,9 @@ impl Backfill {
                     .bind(pass.unwrap_or(0))
                     .fetch_one(&mut *tx)
                     .await?;
+                    // Degraded-mode design §2.4: the settle's `chain_rev`
+                    // runs through the links waiting above it.
+                    crate::firehose::writer::chain_advance(&mut tx, &job.did).await?;
                     if !covered {
                         metrics::counter!(METRIC_SETTLE_UNCOVERED, "path" => "job").increment(1);
                         tracing::warn!(event = "settle_uncovered", did = %job.did, rev = %result.rev, "the listed revs do not cover the settle; applied_rev left where it was");
@@ -1984,6 +1989,12 @@ impl Backfill {
         let waiting = following_owners_waiting_firehose(&self.pool).await?;
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(METRIC_FOLLOWING_WAITING).set(waiting as f64);
+        let (behind, links) = chain_gauges(&self.pool).await?;
+        #[allow(clippy::cast_precision_loss)]
+        {
+            metrics::gauge!(METRIC_CHAIN_BEHIND).set(behind as f64);
+            metrics::gauge!(METRIC_CHAIN_LINKS).set(links as f64);
+        }
         let backlog = authz_daily_backlog_secs(&self.pool).await?;
         metrics::gauge!(METRIC_AUTHZ_BACKLOG).set(backlog);
         let over = backlog > AUTHZ_BUDGET.as_secs_f64();
@@ -1999,6 +2010,30 @@ impl Backfill {
         self.writer.private().sample_gauges(&self.pool).await?;
         Ok(())
     }
+}
+
+/// Metric: tracked DIDs whose chain is short of `applied_rev`, or has not
+/// started (degraded-mode design §8).
+pub const METRIC_CHAIN_BEHIND: &str = "sync_chain_behind";
+/// Metric: rows in `sync_chain_links` (degraded-mode design §8).
+pub const METRIC_CHAIN_LINKS: &str = "sync_chain_links";
+
+/// `sync_chain_behind` and `sync_chain_links` (degraded-mode design §8):
+/// DIDs with an `applied_rev` whose `chain_rev` is NULL or below it, and
+/// the links waiting. A floor in the first names repos the fallback cannot
+/// serve until their next settle.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn chain_gauges(pool: &PgPool) -> Result<(i64, i64), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM sync_state WHERE applied_rev IS NOT NULL \
+                   AND (chain_rev IS NULL OR chain_rev < applied_rev)), \
+                (SELECT count(*) FROM sync_chain_links)",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 /// `authz_daily_backlog_seconds` (§II-6.11.5): how long the oldest due

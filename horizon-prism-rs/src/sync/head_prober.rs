@@ -25,6 +25,8 @@ use url::Url;
 use super::budgets::{Class, HostBudgets};
 use crate::aggregations::ScopeState;
 use crate::config::SyncConfig;
+use crate::firehose::jobs::{self, Depth};
+use crate::firehose::watermark::Watermarks;
 use crate::firehose::writer::clear_readiness;
 use crate::net::{BodyCap, NetClient, RequestOptions, Transports};
 use crate::private_tier::PrivateTier;
@@ -32,6 +34,9 @@ use crate::private_tier::PrivateTier;
 pub const METRIC_CHECKS: &str = "sync_head_check_total";
 pub const METRIC_CHECK_SECONDS: &str = "sync_head_check_seconds";
 pub const METRIC_DIVERGENCE: &str = "sync_divergence_detected_total";
+/// Metric: `authz` jobs the degraded probe enqueued for a repo whose chain
+/// stayed behind its head (degraded-mode design §2.4).
+pub const METRIC_DEGRADED_AUTHZ: &str = "sync_degraded_authz_enqueued_total";
 
 /// Pause between prober passes when nothing was due.
 pub const IDLE: Duration = Duration::from_secs(1);
@@ -127,6 +132,9 @@ pub struct HeadProber {
     source: Arc<dyn HeadSource>,
     budgets: HostBudgets,
     cfg: SyncConfig,
+    /// The watermarks and freshness bound the degraded probe tests; `None`
+    /// never enqueues (degraded-mode design §2.4).
+    degraded: Option<(Watermarks, Duration)>,
 }
 
 impl HeadProber {
@@ -146,7 +154,21 @@ impl HeadProber {
             source,
             budgets,
             cfg,
+            degraded: None,
         }
+    }
+
+    /// With the degraded probe (degraded-mode design §2.4): while private
+    /// reads are degraded, a repo whose chain has been behind its head for
+    /// `sync.divergence_grace_secs` gets an `authz` job, its readiness kept.
+    #[must_use]
+    pub fn with_degraded(mut self, watermarks: Watermarks, bound: Duration) -> Self {
+        self.degraded = Some((watermarks, bound));
+        self
+    }
+
+    fn is_degraded(&self) -> bool {
+        self.degraded.as_ref().is_some_and(|(w, bound)| w.degraded_at(chrono::Utc::now(), *bound))
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -241,29 +263,35 @@ impl HeadProber {
             return Ok(ProbeResult::Current);
         }
         let mut tx = self.pool.begin().await?;
-        let (behind, overdue): (bool, bool) = sqlx::query_as(
-            "INSERT INTO sync_state (did, head_rev, head_checked_at, diverged_since) \
-             VALUES ($1, $2, now(), CASE WHEN $2 > '' THEN now() END) \
+        // `chain_behind_since` (degraded-mode design §2.4) is kept the way
+        // `diverged_since` is, against `chain_rev`, on every probe.
+        let (behind, overdue, chain_overdue): (bool, bool, bool) = sqlx::query_as(
+            "INSERT INTO sync_state (did, head_rev, head_checked_at, diverged_since, chain_behind_since) \
+             VALUES ($1, $2, now(), CASE WHEN $2 > '' THEN now() END, CASE WHEN $2 > '' THEN now() END) \
              ON CONFLICT (did) DO UPDATE SET head_rev = EXCLUDED.head_rev, head_checked_at = now(), \
                diverged_since = CASE \
                  WHEN EXCLUDED.head_rev > COALESCE(sync_state.applied_rev, '') \
                    THEN COALESCE(sync_state.diverged_since, now()) \
+                 ELSE NULL END, \
+               chain_behind_since = CASE \
+                 WHEN EXCLUDED.head_rev > COALESCE(sync_state.chain_rev, '') \
+                   THEN COALESCE(sync_state.chain_behind_since, now()) \
                  ELSE NULL END \
              RETURNING diverged_since IS NOT NULL, \
-               COALESCE(diverged_since < now() - make_interval(secs => $3), false)",
+               COALESCE(diverged_since < now() - make_interval(secs => $3), false), \
+               COALESCE(chain_behind_since < now() - make_interval(secs => $3), false)",
         )
         .bind(did)
         .bind(rev)
         .bind(self.cfg.divergence_grace_secs as f64)
         .fetch_one(&mut *tx)
         .await?;
-        if !behind {
+        if !(behind && overdue) {
+            if chain_overdue && self.is_degraded() {
+                self.degraded_probe(&mut tx, did).await?;
+            }
             tx.commit().await?;
-            return Ok(ProbeResult::Current);
-        }
-        if !overdue {
-            tx.commit().await?;
-            return Ok(ProbeResult::Behind);
+            return Ok(if behind { ProbeResult::Behind } else { ProbeResult::Current });
         }
         // Past the grace. An authz job already queued or running will raise
         // applied_rev; re-queueing it would only restart it.
@@ -292,6 +320,31 @@ impl HeadProber {
         metrics::counter!(METRIC_DIVERGENCE).increment(1);
         tracing::warn!(event = "sync_divergence_detected", did, head_rev = rev, "repo head ahead of applied_rev past the grace; readiness cleared, authz enqueued");
         Ok(ProbeResult::DivergenceDetected)
+    }
+
+    /// The degraded probe (degraded-mode design §2.4): an `authz` job for a
+    /// repo whose chain has stayed behind its head past the grace, without
+    /// clearing its readiness (the daily job's kind of run), skipping one
+    /// with an `authz` job queued or running. Re-armed either way, so the
+    /// next job comes one grace later at the earliest.
+    async fn degraded_probe(&self, conn: &mut sqlx::PgConnection, did: &str) -> Result<(), sqlx::Error> {
+        let in_flight: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM backfill_jobs WHERE did = $1 AND depth = 'authz' \
+             AND state IN ('queued', 'running'))",
+        )
+        .bind(did)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !in_flight {
+            jobs::enqueue_if_idle(&mut *conn, did, Depth::Authz, chrono::Utc::now()).await?;
+            metrics::counter!(METRIC_DEGRADED_AUTHZ).increment(1);
+            tracing::info!(event = "sync_degraded_authz_enqueued", did, "chain behind its head while degraded; authz enqueued");
+        }
+        sqlx::query("UPDATE sync_state SET chain_behind_since = now() WHERE did = $1")
+            .bind(did)
+            .execute(conn)
+            .await?;
+        Ok(())
     }
 
     /// The read path's head for `did` (§6.11.3): the stored head when checked
@@ -655,6 +708,103 @@ mod tests {
         assert_eq!(read("did:plc:unknown").await, None);
         // And `read_head_with` is the same head.
         assert_eq!(prober.read_head_with(DID, false).await.expect("read"), Some("3kccccccccccc".into()));
+        db.drop_db().await;
+    }
+
+    /// T-DM15 (degraded-mode design §2.4): `chain_behind_since` is set when
+    /// a probe finds the head above `chain_rev` and cleared when it does
+    /// not; while degraded, a DID behind past the grace gets one `authz` job,
+    /// keeps its readiness, and gets no second job within the next grace;
+    /// while fresh, none.
+    #[tokio::test]
+    async fn degraded_probe_enqueues_authz_for_a_chain_behind() {
+        let Some(db) = fresh_db("dm15_degraded_probe").await else {
+            return;
+        };
+        let p = &db.pool;
+        exec(p, "INSERT INTO actors (did, pds_endpoint) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'https://pds.example.com')").await;
+        exec(p, "INSERT INTO members (did, source, ready_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin', now())").await;
+        // Applied up to the head, so no divergence; the chain is behind.
+        exec(p, "INSERT INTO sync_state (did, applied_rev, chain_rev) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', '3kbbbbbbbbbbb', '3kaaaaaaaaaaa')").await;
+        let mut sets = ScopeSets::default();
+        sets.members.insert(DID.into());
+        sets.scope.insert(DID.into());
+        let heads = Arc::new(FakeHeads { rev: Mutex::new("3kbbbbbbbbbbb".into()), calls: Mutex::new(0) });
+        let watermarks = Watermarks::new(std::collections::BTreeMap::new(), vec!["r".into()]);
+        let prober = HeadProber::new(
+            p.clone(),
+            ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10),
+            Arc::new(DisabledPrivateTier),
+            heads.clone(),
+            HostBudgets::new(rates()),
+            SyncConfig::default(),
+        )
+        .with_degraded(watermarks.clone(), Duration::from_secs(120));
+        let behind_since = || async move {
+            sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>("SELECT chain_behind_since FROM sync_state WHERE did = $1")
+                .bind(DID)
+                .fetch_one(p)
+                .await
+                .expect("sync_state")
+        };
+        let jobs = || async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM backfill_jobs WHERE did = $1 AND depth = 'authz'")
+                .bind(DID)
+                .fetch_one(p)
+                .await
+                .expect("jobs")
+        };
+        let ready = || async move {
+            sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>("SELECT ready_at FROM members WHERE did = $1")
+                .bind(DID)
+                .fetch_one(p)
+                .await
+                .expect("member")
+        };
+        // Degraded (the relay never reported). The first probe stamps the
+        // chain's clock; within the grace nothing is queued.
+        assert_eq!(prober.probe(DID, PDS).await, ProbeResult::Current);
+        let first = behind_since().await.expect("stamped");
+        assert_eq!(jobs().await, 0);
+        // Past the grace: one authz, readiness kept, the clock re-armed.
+        exec(p, "UPDATE sync_state SET chain_behind_since = now() - interval '10 minutes'").await;
+        assert_eq!(prober.probe(DID, PDS).await, ProbeResult::Current);
+        assert_eq!(jobs().await, 1);
+        assert!(ready().await.is_some(), "the degraded probe keeps readiness");
+        let rearmed = behind_since().await.expect("re-armed");
+        assert!(rearmed >= first);
+        // Within the next grace (the job done, say): no second job.
+        exec(p, "UPDATE backfill_jobs SET state = 'done'").await;
+        assert_eq!(prober.probe(DID, PDS).await, ProbeResult::Current);
+        let state: String = sqlx::query_scalar("SELECT state FROM backfill_jobs WHERE did = $1").bind(DID).fetch_one(p).await.expect("job");
+        assert_eq!(state, "done");
+        // Past it with the job queued: skipped, as divergence skips.
+        exec(p, "UPDATE backfill_jobs SET state = 'queued'").await;
+        exec(p, "UPDATE sync_state SET chain_behind_since = now() - interval '10 minutes'").await;
+        let generation = || async move {
+            sqlx::query_scalar::<_, i64>("SELECT generation::bigint FROM backfill_jobs WHERE did = $1").bind(DID).fetch_one(p).await.expect("gen")
+        };
+        let before = generation().await;
+        assert_eq!(prober.probe(DID, PDS).await, ProbeResult::Current);
+        assert_eq!(generation().await, before, "a queued job is not reset");
+        exec(p, "UPDATE backfill_jobs SET state = 'done'").await;
+
+        // Not degraded: past the grace, nothing is queued.
+        watermarks.observe("r", chrono::Utc::now());
+        exec(p, "UPDATE sync_state SET chain_behind_since = now() - interval '10 minutes'").await;
+        assert_eq!(prober.probe(DID, PDS).await, ProbeResult::Current);
+        let state: String = sqlx::query_scalar("SELECT state FROM backfill_jobs WHERE did = $1").bind(DID).fetch_one(p).await.expect("job");
+        assert_eq!(state, "done", "fresh: no job");
+        assert!(behind_since().await.is_some(), "still behind: the clock runs");
+
+        // The chain reaches the head: the clock clears.
+        exec(p, "UPDATE sync_state SET chain_rev = '3kbbbbbbbbbbb'").await;
+        assert_eq!(prober.probe(DID, PDS).await, ProbeResult::Current);
+        assert_eq!(behind_since().await, None);
+        // A NULL chain is behind any head.
+        exec(p, "UPDATE sync_state SET chain_rev = NULL").await;
+        prober.probe(DID, PDS).await;
+        assert!(behind_since().await.is_some());
         db.drop_db().await;
     }
 }

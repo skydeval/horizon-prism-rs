@@ -606,6 +606,10 @@ Other series, one line each (the sections above name the rest):
 - `private_read_stage_seconds{endpoint,stage}`: a private read's time by stage (`gate`, `reads`, `context`, `rest`); the stages add up to `private_read_unfloored_seconds`.
 - `private_read_empty_page_total{endpoint}`: private pages answered with no items and a cursor.
 - `sync_divergence_detected_total`: repositories whose head stayed ahead of what was indexed past the grace period; their readiness is cleared and they are checked again.
+- `private_read_degraded`: 1 while private reads are degraded (a private relay has never reported, or the slowest one is more than `kryphocron.oracle_freshness_bound_secs` behind), else 0. The start and end are logged as `private_read_degraded_started` (naming the relays behind) and `private_read_degraded_ended`.
+- `sync_chain_breaks_total`: commits of tracked repositories that arrived before the commit they follow (a gap or reorder on the relays) and wait until it arrives or the next full sync covers it. Needs a horizon-firehose that carries `since`.
+- `sync_chain_behind` and `sync_chain_links`: tracked repositories whose seen-every-commit position is short of what was indexed (or not started yet), and the commits waiting for it. A floor in `sync_chain_behind` names repositories a degraded private read cannot use until their next full sync.
+- `sync_degraded_authz_enqueued_total`: full syncs queued while degraded for repositories whose seen-every-commit position stayed behind their head past `sync.divergence_grace_secs`; readiness is kept.
 - `list_subscription_tx_retries_total`: subscribed-list transactions run again after a deadlock or conflict.
 - `list_copy_write_errors_total`: list items that could not be copied for a subscribed list.
 - `list_purpose_writes_total{path,result}` and `list_purpose_write_errors_total{path}`: subscribed lists' purposes written (`modlist`, `other`, `none`) and the writes that failed, from the firehose (`ingest`) or a sync (`sync`).

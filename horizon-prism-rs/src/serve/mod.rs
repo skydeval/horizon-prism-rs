@@ -487,7 +487,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
 
     // Firehose: watermarks, coverage, consumer, lag sampler.
     let fh = cfg.file.firehose.clone();
-    let watermarks = Watermarks::new(fh.relay_labels.clone(), fh.private_relays.clone());
+    let watermarks = Watermarks::new(fh.relay_labels.clone(), fh.private_relays.clone())
+        .with_freshness_bound(Duration::from_secs(cfg.file.kryphocron.oracle_freshness_bound_secs));
     watermarks
         .restore(&pool)
         .await
@@ -660,7 +661,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
         head_source,
         budgets.clone(),
         cfg.file.sync.clone(),
-    );
+    )
+    // Degraded-mode design §2.4: the degraded probe's test.
+    .with_degraded(watermarks.clone(), Duration::from_secs(cfg.file.kryphocron.oracle_freshness_bound_secs));
     if crate::sync::SPAWNS_PROBER {
         tasks.push(prober.clone().spawn());
     }

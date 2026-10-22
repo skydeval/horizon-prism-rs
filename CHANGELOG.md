@@ -10,6 +10,38 @@ commit.
 
 ## [Unreleased]
 
+### Added (degraded mode DM1: each repo's chain, #822)
+
+- **`sync_state.chain_rev`**: a rev up to which Prism holds every commit of
+  a tracked repo, applied by the firehose or covered by a settle's listing
+  (degraded-mode design §2.4). `applied_rev` is a maximum and cannot show
+  a commit dropped by a relay while a later one arrived; `chain_rev` can,
+  from the `since` horizon-firehose now carries in each commit entry (the
+  previous commit's rev). A firehose commit whose `since` is at or below
+  `chain_rev` raises it; any other commit above it waits in
+  `sync_chain_links` (at most 256 per DID, lowest dropped) until the
+  missing commit arrives from any relay, or a settle (job or catch-up)
+  raises `chain_rev` to its covered rev and runs through the waiting
+  links. A commit with a dead-lettered op neither chains nor waits. An
+  entry without `since` (an older sidecar) decodes as before and leaves
+  the chain to the settles. Untracking clears the chain and its links.
+  Nothing reads `chain_rev` yet; DM2's head fallback will.
+- **The degraded probe**: the prober also keeps `chain_behind_since` (when
+  it first found the head above `chain_rev`). While private reads are
+  degraded, a DID whose chain stays behind past
+  `sync.divergence_grace_secs` gets an `authz` job without losing its
+  readiness, at most one per grace, none while one is queued or running.
+- Metrics: `private_read_degraded` (1 while the private watermark is
+  missing or older than `kryphocron.oracle_freshness_bound_secs`, with
+  `private_read_degraded_started` / `_ended` logged on each change),
+  `sync_chain_breaks_total`, `sync_chain_behind`, `sync_chain_links`,
+  `sync_degraded_authz_enqueued_total`.
+- **`docker/docker-compose.yml`** pins horizon-firehose at `0901576` (was
+  `b3b7d1e`): each commit entry carries `since` (string or null). The
+  sidecar images need a rebuild.
+- **Migration 0039** (needs `APP_ALLOW_STARTUP_MIGRATE=1` for that start).
+  No config key or lexicon change.
+
 ### Removed (Community B network entry)
 
 - **The `community-b` `[[constellation.networks]]` entry** is removed from

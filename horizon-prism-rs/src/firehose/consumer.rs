@@ -1063,7 +1063,7 @@ impl Consumer {
         );
         let report = self
             .writer
-            .apply_from(Some(&label), &commit.repo, &commit.rev, &commit.ops, self.apply_options())
+            .apply_commit(Some(&label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, self.apply_options())
             .await?;
         // A malformed op that could not matter is counted, not dead-lettered
         // (actionable-warnings design §6.3).

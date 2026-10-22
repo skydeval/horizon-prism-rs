@@ -148,12 +148,16 @@ async fn forget_tracked_sync_state(conn: &mut PgConnection, did: &str) -> Result
     if in_scope {
         sqlx::query(
             "UPDATE sync_state SET applied_rev = NULL, head_rev = NULL, head_checked_at = NULL, \
-             diverged_since = NULL, follows_verified_at = NULL, follows_clears = nextval('follows_clears_seq') \
+             diverged_since = NULL, follows_verified_at = NULL, follows_clears = nextval('follows_clears_seq'), \
+             chain_rev = NULL, chain_behind_since = NULL \
              WHERE did = $1",
         )
         .bind(did)
         .execute(&mut *conn)
         .await?;
+        // The chain's links go with it (degraded-mode design §2.4); a
+        // deleted row takes them by its foreign key.
+        sqlx::query("DELETE FROM sync_chain_links WHERE did = $1").bind(did).execute(&mut *conn).await?;
     } else {
         sqlx::query("DELETE FROM sync_state WHERE did = $1")
             .bind(did)

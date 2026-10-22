@@ -855,6 +855,26 @@ impl Writer {
         ops: &[RawOp],
         options: ApplyOptions,
     ) -> Result<ApplyReport, Transient> {
+        self.apply_commit(relay, repo, rev, None, ops, options).await
+    }
+
+    /// [`Writer::apply_from`] for a commit that carries the stream's
+    /// `since` (degraded-mode design §2.4): with `advance_applied_rev`, a
+    /// tracked repo's chain is written in the same transaction, unless an
+    /// op the firehose dead-letters failed.
+    ///
+    /// # Errors
+    ///
+    /// [`Transient`] when the call must be retried whole.
+    pub async fn apply_commit(
+        &self,
+        relay: Option<&str>,
+        repo: &str,
+        rev: &str,
+        since: Option<&str>,
+        ops: &[RawOp],
+        options: ApplyOptions,
+    ) -> Result<ApplyReport, Transient> {
         // Firehose throughput design §2.4: a hung database, before the
         // nothing-to-write check so it holds every entry alike.
         #[cfg(test)]
@@ -1023,6 +1043,13 @@ impl Writer {
         // every op committed or failed, whatever the ops were.
         if options.advance_applied_rev && sets.is_tracked(repo) {
             advance_applied_rev(&mut tx, repo, rev, true).await?;
+            // Degraded-mode design §2.4: the chain, for a commit with
+            // `since` none of whose ops is dead-lettered.
+            if let Some(since) = since
+                && !report.failed.iter().any(|f| f.matters)
+            {
+                chain_commit(&mut tx, repo, rev, since).await?;
+            }
         }
         // Scope recency §3.2: the holds this commit names, recorded under
         // the read guard and before the commit, so a sweep that clears the
@@ -2330,6 +2357,8 @@ pub async fn advance_applied_rev_with_follows(
              AND sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN now() END, \
            follows_verified_rev = GREATEST(sync_state.applied_rev, \
              CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+           chain_rev = GREATEST(sync_state.chain_rev, \
+             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
            diverged_since = CASE WHEN GREATEST(sync_state.applied_rev, \
                CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
                >= sync_state.head_rev THEN NULL ELSE sync_state.diverged_since END \
@@ -2340,9 +2369,127 @@ pub async fn advance_applied_rev_with_follows(
     .bind(rev)
     .bind(pass.is_some())
     .bind(pass.unwrap_or(0))
-    .fetch_one(conn)
+    .fetch_one(&mut *conn)
     .await?;
+    // Degraded-mode design §2.4: a covered settle raises `chain_rev` with
+    // `applied_rev`, then runs through the links waiting above it.
+    chain_advance(conn, did).await?;
     Ok(Settled { verified, covered })
+}
+
+/// Metric: commits of tracked repos recorded as a chain link, their `since`
+/// not chaining when they arrived (degraded-mode design §2.4).
+pub const METRIC_CHAIN_BREAKS: &str = "sync_chain_breaks_total";
+/// Links kept per DID above `chain_rev` (degraded-mode design §2.4).
+pub const CHAIN_LINKS_PER_DID: i64 = 256;
+
+/// What a firehose commit did to its repo's chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainStep {
+    /// `since` chained onto `chain_rev`: raised to `rev`, then advanced.
+    Chained,
+    /// Recorded as a link, waiting for the chain to reach it.
+    Linked,
+    /// At or below `chain_rev` (a replay), or a link already recorded:
+    /// nothing written.
+    Nothing,
+}
+
+/// The firehose's chain write for a tracked repo (degraded-mode design
+/// §2.4): run in the transaction that advanced `applied_rev` (which holds
+/// the `sync_state` row's lock), for a commit that carries `since` and had
+/// no op dead-lettered. A commit above `chain_rev` whose `since` is at or
+/// below it raises `chain_rev` to `rev` and advances through the waiting
+/// links; any other commit above it (or any while `chain_rev` is NULL) is
+/// recorded as a link, counted in [`METRIC_CHAIN_BREAKS`].
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn chain_commit(conn: &mut PgConnection, did: &str, rev: &str, since: &str) -> Result<ChainStep, sqlx::Error> {
+    let chain: Option<Option<String>> = sqlx::query_scalar("SELECT chain_rev FROM sync_state WHERE did = $1 FOR UPDATE")
+        .bind(did)
+        .fetch_optional(&mut *conn)
+        .await?;
+    // No row: the repo is not tracked here; nothing to chain.
+    let Some(chain) = chain else {
+        return Ok(ChainStep::Nothing);
+    };
+    if chain.as_deref().is_some_and(|c| rev <= c) {
+        return Ok(ChainStep::Nothing);
+    }
+    if chain.as_deref().is_some_and(|c| since <= c) {
+        sqlx::query("UPDATE sync_state SET chain_rev = $2 WHERE did = $1")
+            .bind(did)
+            .bind(rev)
+            .execute(&mut *conn)
+            .await?;
+        chain_advance(conn, did).await?;
+        return Ok(ChainStep::Chained);
+    }
+    let inserted = sqlx::query("INSERT INTO sync_chain_links (did, rev, since) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+        .bind(did)
+        .bind(rev)
+        .bind(since)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    if inserted == 0 {
+        return Ok(ChainStep::Nothing);
+    }
+    metrics::counter!(METRIC_CHAIN_BREAKS).increment(1);
+    trim_chain_links(conn, did).await?;
+    Ok(ChainStep::Linked)
+}
+
+/// The chain's advance (degraded-mode design §2.4): raise `chain_rev`
+/// through every link whose `since` the chain reaches, drop the links at or
+/// below it, and keep at most [`CHAIN_LINKS_PER_DID`] (the highest). A
+/// NULL `chain_rev` advances nothing. Called by every writer of
+/// `chain_rev`, in its transaction, holding the row's lock.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn chain_advance(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+    // The reachable revs from `chain_rev`: a link joins when its `since` is
+    // at or below a rev already reached and its rev above it. At most 257
+    // rows, so the walk is small; its maximum is where every link up to the
+    // first missing commit ends.
+    sqlx::query(
+        "WITH RECURSIVE walk(rev) AS ( \
+           SELECT chain_rev FROM sync_state WHERE did = $1 AND chain_rev IS NOT NULL \
+           UNION \
+           SELECT l.rev FROM sync_chain_links l JOIN walk w ON l.since <= w.rev AND l.rev > w.rev WHERE l.did = $1 \
+         ) \
+         UPDATE sync_state SET chain_rev = (SELECT max(rev) FROM walk) \
+         WHERE did = $1 AND chain_rev IS NOT NULL AND chain_rev < (SELECT max(rev) FROM walk)",
+    )
+    .bind(did)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "DELETE FROM sync_chain_links l USING sync_state s \
+         WHERE l.did = $1 AND s.did = $1 AND s.chain_rev IS NOT NULL AND l.rev <= s.chain_rev",
+    )
+    .bind(did)
+    .execute(&mut *conn)
+    .await?;
+    trim_chain_links(conn, did).await
+}
+
+/// Keep a DID's [`CHAIN_LINKS_PER_DID`] highest links. Dropping a link only
+/// stops the chain earlier (fail-closed).
+async fn trim_chain_links(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM sync_chain_links WHERE did = $1 AND rev IN \
+           (SELECT rev FROM sync_chain_links WHERE did = $1 ORDER BY rev DESC OFFSET $2)",
+    )
+    .bind(did)
+    .bind(CHAIN_LINKS_PER_DID)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// How long a full run tries for a DID's lock to raise a listed rev
@@ -4358,6 +4505,237 @@ mod tests {
                 .await
                 .expect("job");
             assert_eq!(depth, "authz");
+            db.drop_db().await;
+        }
+
+        /// `(chain_rev, applied_rev, link revs)` of `did`, asserting
+        /// `chain_rev <= applied_rev` (degraded-mode design §2.4).
+        async fn chain_of(p: &PgPool, did: &str) -> (Option<String>, Option<String>, Vec<String>) {
+            let (chain, applied): (Option<String>, Option<String>) =
+                sqlx::query_as("SELECT chain_rev, applied_rev FROM sync_state WHERE did = $1")
+                    .bind(did)
+                    .fetch_optional(p)
+                    .await
+                    .expect("sync_state")
+                    .unwrap_or_default();
+            if let Some(c) = &chain {
+                assert!(applied.as_ref().is_some_and(|a| a >= c), "chain_rev {c} above applied_rev {applied:?}");
+            }
+            let links: Vec<String> = sqlx::query_scalar("SELECT rev FROM sync_chain_links WHERE did = $1 ORDER BY rev")
+                .bind(did)
+                .fetch_all(p)
+                .await
+                .expect("links");
+            (chain, applied, links)
+        }
+
+        /// A covered settle at `r`, as a job's or catch-up's.
+        async fn settle_at(p: &PgPool, did: &str, r: &str) {
+            sqlx::query("INSERT INTO sync_state (did) VALUES ($1) ON CONFLICT DO NOTHING").bind(did).execute(p).await.expect("row");
+            sqlx::query("UPDATE sync_state SET post_listed_rev = GREATEST(post_listed_rev, $2), audience_listed_rev = GREATEST(audience_listed_rev, $2) WHERE did = $1")
+                .bind(did)
+                .bind(r)
+                .execute(p)
+                .await
+                .expect("listed revs");
+            let mut tx = p.begin().await.expect("tx");
+            let settled = advance_applied_rev_with_follows(&mut tx, did, r, None).await.expect("settle");
+            tx.commit().await.expect("commit");
+            assert!(settled.covered);
+        }
+
+        fn s(n: usize) -> Option<String> {
+            Some(rev(n))
+        }
+
+        /// T-DM1 (degraded-mode design §2.4): the chain's base at a settle,
+        /// a chaining commit, a hole on the live relay mended by the stalled
+        /// relay's copy, a replay, a dead-lettered op, no `since`, and the
+        /// metric.
+        #[tokio::test]
+        async fn chain_rules() {
+            let Some(db) = fresh_db("dm1_chain_rules").await else {
+                return;
+            };
+            let p = &db.pool;
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _local = metrics::set_default_local_recorder(&recorder);
+            let breaks = || crate::test_support::series(&handle.render(), METRIC_CHAIN_BREAKS, &[]).unwrap_or(0.0);
+            let w = writer(p, true);
+            let commit = |n: usize, since: usize| {
+                let w = w.clone();
+                async move { w.apply_commit(None, AUTHOR, &rev(n), Some(&rev(since)), &[], OPTIONS).await.expect("apply") }
+            };
+
+            // Before any settle every commit waits as a link.
+            commit(5, 4).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (None, s(5), vec![rev(5)]));
+            assert!((breaks() - 1.0).abs() < f64::EPSILON);
+            // The settle at 10 is the base; the link below it goes.
+            settle_at(p, AUTHOR, &rev(10)).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(10), s(10), vec![]));
+
+            // A chaining commit raises the chain and writes no link.
+            commit(11, 10).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(11), s(11), vec![]));
+            assert!((breaks() - 1.0).abs() < f64::EPSILON, "a chaining commit is not a break");
+
+            // A hole on the live relay: 13 and 14 arrive, 12 does not.
+            commit(13, 12).await;
+            commit(14, 13).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(11), s(14), vec![rev(13), rev(14)]));
+            assert!((breaks() - 3.0).abs() < f64::EPSILON);
+            // The stalled relay's copy of 12 chains, and the advance runs
+            // through every waiting link.
+            commit(12, 11).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(14), s(14), vec![]));
+
+            // A replayed old commit records nothing.
+            commit(9, 8).await;
+            commit(14, 13).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(14), s(14), vec![]));
+
+            // A commit with a dead-lettered op records no link and does not
+            // chain, though `applied_rev` moves.
+            let bad = RawOp {
+                action: Action::Create,
+                collection: "app.bsky.feed.like".into(),
+                rkey: RKEY.into(),
+                cid: Some("bafy".into()),
+                record: Some(json!({"subject": "nope"})),
+            };
+            let r = w.apply_commit(None, AUTHOR, &rev(15), s(14).as_deref(), &[bad], OPTIONS).await.expect("apply");
+            assert!(r.failed.iter().any(|f| f.matters));
+            assert_eq!(chain_of(p, AUTHOR).await, (s(14), s(15), vec![]));
+            // The next commit cannot chain past it.
+            commit(16, 15).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(14), s(16), vec![rev(16)]));
+
+            // An entry without `since` (an older sidecar) leaves the chain to
+            // the settles.
+            w.apply_from(None, AUTHOR, &rev(17), &[], OPTIONS).await.expect("apply");
+            assert_eq!(chain_of(p, AUTHOR).await, (s(14), s(17), vec![rev(16)]));
+            settle_at(p, AUTHOR, &rev(17)).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(17), s(17), vec![]));
+
+            // Non-firehose writes never touch the chain.
+            let quiet = ApplyOptions { advance_applied_rev: false, ..OPTIONS };
+            w.apply_commit(None, AUTHOR, &rev(19), s(18).as_deref(), &[], quiet).await.expect("apply");
+            assert_eq!(chain_of(p, AUTHOR).await, (s(17), s(17), vec![]));
+            db.drop_db().await;
+        }
+
+        /// T-DM1 (review 1, LB2): two and three commits applied between a
+        /// job's `getLatestCommit` and its settle are carried by the settle;
+        /// an uncovered settle moves nothing.
+        #[tokio::test]
+        async fn settle_carries_commits_between_its_head_and_itself() {
+            let Some(db) = fresh_db("dm1_settle_carries").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, true);
+            let commit = |n: usize, since: usize| {
+                let w = w.clone();
+                async move { w.apply_commit(None, AUTHOR, &rev(n), Some(&rev(since)), &[], OPTIONS).await.expect("apply") }
+            };
+            // The job read R = 20; 21 and 22 arrive before it settles.
+            commit(21, 20).await;
+            commit(22, 21).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (None, s(22), vec![rev(21), rev(22)]));
+            settle_at(p, AUTHOR, &rev(20)).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(22), s(22), vec![]));
+
+            // Next run: R = 30, but 23..=29 came and went while the chain
+            // was fine; 31, 32, 33 arrive before the settle at 30, 30 never
+            // does on the stream.
+            for n in 23..=29 {
+                commit(n, n - 1).await;
+            }
+            assert_eq!(chain_of(p, AUTHOR).await, (s(29), s(29), vec![]));
+            commit(31, 30).await;
+            commit(32, 31).await;
+            commit(33, 32).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(29), s(33), vec![rev(31), rev(32), rev(33)]));
+            // An uncovered settle moves nothing.
+            let mut tx = p.begin().await.expect("tx");
+            sqlx::query("UPDATE sync_state SET post_listed_rev = $2, audience_listed_rev = $2 WHERE did = $1")
+                .bind(AUTHOR)
+                .bind(rev(25))
+                .execute(&mut *tx)
+                .await
+                .expect("listed");
+            let settled = advance_applied_rev_with_follows(&mut tx, AUTHOR, &rev(30), None).await.expect("settle");
+            tx.commit().await.expect("commit");
+            assert!(!settled.covered);
+            assert_eq!(chain_of(p, AUTHOR).await, (s(29), s(33), vec![rev(31), rev(32), rev(33)]));
+            settle_at(p, AUTHOR, &rev(30)).await;
+            assert_eq!(chain_of(p, AUTHOR).await, (s(33), s(33), vec![]));
+            db.drop_db().await;
+        }
+
+        /// T-DM1: a 257th link drops the lowest; dropping only stops the
+        /// chain earlier. Untracking deletes the links, by the in-scope
+        /// reset and by the row's deletion.
+        #[tokio::test]
+        async fn chain_links_are_capped_and_go_with_the_row() {
+            let Some(db) = fresh_db("dm1_chain_cap").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, true);
+            settle_at(p, AUTHOR, &rev(99)).await;
+            assert_eq!(chain_of(p, AUTHOR).await.0, s(99));
+            // 257 commits none of which chains (every odd rev is missing).
+            let mut tx = p.begin().await.expect("tx");
+            for i in 0..=256 {
+                let n = 102 + 2 * i;
+                advance_applied_rev(&mut tx, AUTHOR, &rev(n), true).await.expect("advance");
+                assert_eq!(chain_commit(&mut tx, AUTHOR, &rev(n), &rev(n - 1)).await.expect("chain"), ChainStep::Linked);
+            }
+            tx.commit().await.expect("commit");
+            let (chain, _, links) = chain_of(p, AUTHOR).await;
+            assert_eq!(chain, s(99));
+            assert_eq!(links.len(), 256);
+            assert_eq!(links.first(), Some(&rev(104)), "the lowest, 102, was dropped");
+            assert_eq!(links.last(), Some(&rev(614)));
+            // 101 arrives before 100: its link is the lowest, so the cap
+            // drops it at once. When 100 chains the chain stops there
+            // (fail-closed) until 101 comes again.
+            w.apply_commit(None, AUTHOR, &rev(101), s(100).as_deref(), &[], OPTIONS).await.expect("apply");
+            let (_, _, links) = chain_of(p, AUTHOR).await;
+            assert_eq!((links.len(), links.first()), (256, Some(&rev(104))));
+            let mut tx = p.begin().await.expect("tx");
+            assert_eq!(chain_commit(&mut tx, AUTHOR, &rev(100), &rev(99)).await.expect("chain"), ChainStep::Chained);
+            tx.commit().await.expect("commit");
+            assert_eq!(chain_of(p, AUTHOR).await.0, s(100));
+            let mut tx = p.begin().await.expect("tx");
+            assert_eq!(chain_commit(&mut tx, AUTHOR, &rev(101), &rev(100)).await.expect("chain"), ChainStep::Chained);
+            tx.commit().await.expect("commit");
+            let (chain, _, links) = chain_of(p, AUTHOR).await;
+            assert_eq!((chain, links.len()), (s(101), 256));
+
+            // Untracking a DID still in scope keeps its row, without its chain.
+            sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)").bind(AUTHOR).execute(p).await.expect("scope");
+            let mut conn = p.acquire().await.expect("conn");
+            crate::private_tier::owners::reevaluate(&mut conn, AUTHOR).await.expect("reevaluate");
+            drop(conn);
+            assert_eq!(chain_of(p, AUTHOR).await, (None, None, vec![]));
+            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_state WHERE did = $1").bind(AUTHOR).fetch_one(p).await.expect("row");
+            assert_eq!(rows, 1);
+            // Out of scope: the row goes, and its links with it.
+            sqlx::query("DELETE FROM scope_dids").execute(p).await.expect("scope");
+            let mut tx = p.begin().await.expect("tx");
+            advance_applied_rev(&mut tx, AUTHOR, &rev(200), true).await.expect("advance");
+            assert_eq!(chain_commit(&mut tx, AUTHOR, &rev(200), &rev(199)).await.expect("chain"), ChainStep::Linked);
+            tx.commit().await.expect("commit");
+            assert_eq!(chain_of(p, AUTHOR).await.2, vec![rev(200)]);
+            let mut conn = p.acquire().await.expect("conn");
+            crate::private_tier::owners::reevaluate(&mut conn, AUTHOR).await.expect("reevaluate");
+            drop(conn);
+            let links: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_chain_links").fetch_one(p).await.expect("links");
+            assert_eq!(links, 0);
             db.drop_db().await;
         }
     }
