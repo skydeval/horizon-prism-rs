@@ -26,6 +26,7 @@ use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLim
 use tokio::sync::Semaphore;
 
 use super::operators::{endpoint_host, host_allowed, is_operator, normalize_endpoint, patterns};
+use super::theme::Theme;
 use super::{AdminState, pages};
 use crate::xrpc::rate_limit::{client_ip, ip_key, retry_after_of};
 
@@ -194,6 +195,8 @@ pub struct Operator {
     /// What every page says at its top (admin-ui design §6): changes
     /// waiting for a restart, settings that could not be used.
     pub banners: Banners,
+    /// Their own look of the pages (#810).
+    pub theme: Theme,
 }
 
 /// The two banners of every page (admin-ui design §6, §8.4, §8.5).
@@ -552,15 +555,19 @@ pub async fn require(
             .await;
     }
     let did = session.did;
-    let handle: Option<String> = sqlx::query_scalar("SELECT handle FROM actors WHERE did = $1")
-        .bind(&did)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(internal)?
-        .flatten();
+    // The handle, and the operator's own look, which every page carries
+    // (a watching reload included, so it never draws in the default).
+    let row: Option<(Option<String>, String, String)> = sqlx::query_as(
+        "SELECT a.handle, o.theme_mode, o.theme_scheme FROM admin_operators o LEFT JOIN actors a ON a.did = o.did WHERE o.did = $1",
+    )
+    .bind(&did)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal)?;
+    let (handle, theme) = row.map_or((None, Theme::default()), |(h, mode, scheme)| (h, Theme::from_stored(&mode, &scheme)));
     // Watching needs no banners.
     let banners = if need == Need::Poll { Banners::default() } else { banners(state).await.map_err(internal)? };
-    Ok(Operator { did, handle, csrf, banners })
+    Ok(Operator { did, handle, csrf, banners, theme })
 }
 
 #[cfg(test)]

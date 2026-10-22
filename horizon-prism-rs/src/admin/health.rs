@@ -694,19 +694,19 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
 
     out.push(match ring.held_for(FIVE_MIN, |s| s.sum(crate::farsight::gate::METRIC_DOWN).map(|v| v >= 1.0)) {
         Held::NoData => Check::no_data("Farsight", "Farsight is not set up, or Prism needs five minutes of readings first."),
-        Held::Yes => Check::new("Farsight", Level::Amber, "Farsight is not answering; block-list blocks may be missing.").link("/admin/farsight", "Blocks (Farsight)"),
-        Held::No => Check::new("Farsight", Level::Ok, "Farsight is answering.").link("/admin/farsight", "Blocks (Farsight)"),
+        Held::Yes => Check::new("Farsight", Level::Amber, "Farsight is not answering; block-list blocks may be missing.").link("/admin/farsight", "Blocks"),
+        Held::No => Check::new("Farsight", Level::Ok, "Farsight is answering.").link("/admin/farsight", "Blocks"),
     });
 
     out.push(match ring.rise(FIFTEEN_MIN, |s| s.sum(crate::farsight::lookup::METRIC_AUTH_FAILED)) {
         None => Check::no_data("Farsight sign-in", "no refusal has been counted since Prism started."),
-        Some(n) if n > 0.0 => Check::new("Farsight sign-in", Level::Red, "Farsight refuses Prism's token.").link("/admin/farsight", "Blocks (Farsight)"),
+        Some(n) if n > 0.0 => Check::new("Farsight sign-in", Level::Red, "Farsight refuses Prism's token.").link("/admin/farsight", "Blocks"),
         Some(_) => Check::new("Farsight sign-in", Level::Ok, "Farsight accepts Prism's token."),
     });
 
     out.push(match ring.held_for(FIVE_MIN, |s| s.max(crate::farsight::gate::METRIC_WITHHELD).map(|v| v >= 1.0)) {
         Held::NoData => Check::no_data("Farsight fallback", "Farsight is not set up, or Prism needs five minutes of readings first."),
-        Held::Yes => Check::new("Farsight fallback", Level::Amber, "The Farsight fallback is on but not being used.").link("/admin/farsight", "Blocks (Farsight)"),
+        Held::Yes => Check::new("Farsight fallback", Level::Amber, "The Farsight fallback is on but not being used.").link("/admin/farsight", "Blocks"),
         Held::No => Check::new("Farsight fallback", Level::Ok, "The Farsight fallback is off, or ready when needed."),
     });
 

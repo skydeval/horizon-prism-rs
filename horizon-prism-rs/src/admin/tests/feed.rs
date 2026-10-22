@@ -582,8 +582,8 @@ async fn t_f2_a_stream_that_is_not_read() {
     h.db.drop_db().await;
 }
 
-/// T-F9: the audit log, the old address's `308` with its query, and the
-/// navigation's last entry.
+/// T-F9: the audit log, the old address's `308` with its query, and its
+/// place in the navigation.
 #[tokio::test]
 async fn t_f9_audit_log() {
     let Some(h) = harness("admin_t_f9").await else {
@@ -599,8 +599,9 @@ async fn t_f9_audit_log() {
     let bare = alice.get(&format!("{}/admin/activity", h.base)).await;
     assert_eq!((bare.status, bare.headers.get(LOCATION).and_then(|v| v.to_str().ok())), (308, Some("/admin/audit")));
     let nav = &audit.body[audit.body.find("<nav>").expect("nav")..audit.body.find("</nav>").expect("nav end")];
+    // Settings is last since #810; the audit log is still in the menu.
     let last = nav.rfind("<a ").expect("a link");
-    assert!(nav[last..].contains("/admin/audit") && nav[last..].contains("Audit log"), "{nav}");
+    assert!(nav[last..].contains("/admin/settings") && nav.contains("aria-current=\"page\">Audit log</a>"), "{nav}");
     assert!(!audit.body.contains(">Activity<"));
     h.db.drop_db().await;
 }

@@ -104,6 +104,8 @@ mod tests {
             "0036_unavailable_jobs",
             // Private notification preferences, S1 (#777).
             "0037_notify_prefs_private_tier",
+            // The admin UI's Appearance page (#810).
+            "0038_admin_appearance",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

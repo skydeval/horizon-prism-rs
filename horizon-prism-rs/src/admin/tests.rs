@@ -15,6 +15,8 @@ mod stats_pages;
 // Labels, Look up and the per-member actions (admin-ui design §6.2, §6.9,
 // §6.10; slice S5).
 mod s5_pages;
+// Appearance, the menu's order and the product name (#810).
+mod appearance_pages;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

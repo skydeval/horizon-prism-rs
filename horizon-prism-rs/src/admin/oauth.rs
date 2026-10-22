@@ -79,7 +79,7 @@ pub fn client_metadata(public_hostname: &str) -> OAuthClientMetadata {
         token_endpoint_auth_signing_alg: None,
         application_type: Some("web".to_string()),
         dpop_bound_access_tokens: Some(true),
-        client_name: Some(format!("Prism admin ({public_hostname})")),
+        client_name: Some(format!("Horizon-Prism admin ({public_hostname})")),
         client_uri: Some(format!("https://{public_hostname}/admin")),
         logo_uri: None,
     }

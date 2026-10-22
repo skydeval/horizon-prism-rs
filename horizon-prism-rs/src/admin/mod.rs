@@ -9,7 +9,7 @@
 //! in-process metrics (`health`). Slice S4: Stats, with the disks and
 //! counts (`stats`), endpoint usage (`usage`) and the Disk check. Slice S5:
 //! Labels, Look up, and the per-member actions (sync again, Farsight read
-//! and forget, list clean-up).
+//! and forget, list clean-up). Each operator's Appearance (`theme`, #810).
 //!
 //! Served by `serve` itself on its own origin, merged before
 //! `xrpc::router::finalize`, so it sits inside the global per-IP limit
@@ -28,6 +28,7 @@ pub mod pages;
 pub mod settings;
 pub mod setup_code;
 pub mod stats;
+pub mod theme;
 pub mod usage;
 
 use std::net::IpAddr;
@@ -341,6 +342,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/settings/reset", route(post(pages::settings::reset)))
         .route("/settings/keep", route(post(pages::settings::keep)))
         .route("/settings/public-scope", route(post(pages::settings::public_scope)))
+        .route("/settings/appearance", route(get(pages::appearance::page).post(pages::appearance::save)))
         .route("/settings/{group}", route(get(pages::settings::group).post(pages::settings::save)))
         .route("/restart", route(post(pages::settings::restart)))
         .route("/health", route(get(pages::health::page)))

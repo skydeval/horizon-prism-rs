@@ -2,6 +2,7 @@
 //! they share: the navigation, the message page, command rows in plain
 //! words, and enqueuing a command.
 
+pub mod appearance;
 pub mod audit;
 pub mod commands;
 pub mod farsight;
@@ -34,12 +35,12 @@ pub struct Nav {
     /// How the operator is named: handle, else DID.
     pub who: String,
     pub csrf: String,
-    /// The current screen: `home`, `members`, `settings`, `health`,
-    /// `stats`, `jobs`, `problems`, `farsight`, `labels`, `lookup`,
-    /// `operators`, `audit`.
+    /// The current screen: the first word of an entry of [`MENU`].
     pub current: &'static str,
     /// Changes waiting for a restart, and settings that could not be used.
     pub banners: Banners,
+    /// The classes of `<html>`: the operator's own look (#810).
+    pub theme: String,
 }
 
 impl Nav {
@@ -50,9 +51,40 @@ impl Nav {
             csrf: op.csrf.clone(),
             current,
             banners: op.banners,
+            theme: op.theme.class(),
         }
     }
+
+    /// The top menu's links, the current page marked.
+    #[must_use]
+    pub fn menu(&self) -> Vec<MenuLink> {
+        MENU.iter().map(|&(word, href, label)| MenuLink { href, label, current: word == self.current }).collect()
+    }
 }
+
+/// A link of the top menu.
+pub struct MenuLink {
+    pub href: &'static str,
+    pub label: &'static str,
+    pub current: bool,
+}
+
+/// The top menu (§6), in its order: everyday pages first, Settings last
+/// (#810). `(current, href, label)`; `current` is [`Nav::current`]'s word.
+pub const MENU: [(&str, &str, &str); 12] = [
+    ("home", "/admin", "Home"),
+    ("members", "/admin/members", "Members"),
+    ("health", "/admin/health", "Health"),
+    ("jobs", "/admin/jobs", "Jobs"),
+    ("problems", "/admin/problems", "Problems"),
+    ("stats", "/admin/stats", "Stats"),
+    ("farsight", "/admin/farsight", "Blocks"),
+    ("labels", "/admin/labels", "Labels"),
+    ("lookup", "/admin/lookup", "Look up"),
+    ("audit", "/admin/audit", "Audit log"),
+    ("operators", "/admin/operators", "Operators"),
+    ("settings", "/admin/settings", "Settings"),
+];
 
 /// A link on a message page.
 pub struct Link {

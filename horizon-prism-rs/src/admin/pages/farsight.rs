@@ -87,7 +87,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
     let mut page = FarsightPage {
         css: css(),
         nav: Some(Nav::new(&op, "farsight")),
-        title: "Blocks (Farsight)".to_string(),
+        title: "Blocks".to_string(),
         configured: false,
         answering: false,
         reason: String::new(),

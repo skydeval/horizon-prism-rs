@@ -10,6 +10,28 @@ commit.
 
 ## [Unreleased]
 
+### Added (admin UI: Horizon-Prism name, Appearance, menu order, #810)
+
+- Settings › Appearance (`/admin/settings/appearance`): each operator
+  chooses light, dark or the device's choice, and a colour scheme (Sky, the
+  default, Violet, Teal, Graphite). Saved per operator in
+  `admin_operators.theme_mode` / `theme_scheme`, so it follows them to any
+  device; read with the session and set on every signed-in page's `<html>`
+  as `mode-… scheme-…` classes, so pages draw in it from the first paint.
+  The stylesheet's accent tokens now come from the scheme in its light or
+  dark form; no script, no inline style, the CSP unchanged. Sign-in, setup
+  and refusal pages use the default. The form has the usual checks
+  (session, CSRF token, `Origin`, one change a second); it is not a command
+  and not in the audit log, and not an `operator_settings` key.
+- The admin pages show the product name as Horizon-Prism: the brand, every
+  `<title>` (`… · Horizon-Prism admin`), Home's server card, and the OAuth
+  client name the sign-in screen shows.
+- The top menu puts everyday pages first and Settings last: Home, Members,
+  Health, Jobs, Problems, Stats, Blocks, Labels, Look up, Audit log,
+  Operators, Settings. "Blocks (Farsight)" is "Blocks" in the menu, the
+  page title and Health's links; the page still explains Farsight.
+- **Migration 0038** (needs `APP_ALLOW_STARTUP_MIGRATE=1` for that start).
+
 ### Added (notServed N2: the author's marker, #809)
 
 - `app.nearhorizon.private.defs#privatePostView.notServed`: on the
