@@ -53,6 +53,10 @@ pub(super) const OVER_CLAIM: &str = "overClaim";
 /// Metric: the degraded fallback's per-record results (degraded-mode design
 /// §8): `passed`, `behind`, `untracked`, `climb_cap`, `walk_outside`.
 pub(super) const METRIC_FALLBACK: &str = "private_read_fallback_total";
+/// Metric: unavailable answers (degraded-mode design §8): `thread` (B's
+/// 503), `quote` (C's `#viewUnavailable`), `listed` (A's `unavailable`
+/// entries).
+pub(super) const METRIC_UNAVAILABLE: &str = "private_read_unavailable_total";
 /// The most distinct climb authors one read checks (degraded-mode design
 /// §2.5, RS-7): more is a miss while degraded.
 pub(super) const CLIMB_AUTHORS_MAX: usize = 64;
@@ -158,6 +162,20 @@ impl Miss {
     }
 }
 
+impl Miss {
+    /// A transient miss's reason for its author (degraded-mode design
+    /// §3.2): `syncing` when Prism has not seen what the read depends on,
+    /// `indexing` when an owner is not ready; `None` for every miss whose
+    /// cause needs a record to change.
+    pub(super) fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Stale | Self::HeadCheck | Self::FallbackBehind => Some("syncing"),
+            Self::OwnerNotReady | Self::AudienceOwnerNotReady => Some("indexing"),
+            _ => None,
+        }
+    }
+}
+
 impl From<sqlx::Error> for Miss {
     fn from(e: sqlx::Error) -> Self {
         tracing::warn!(event = "private_read_db_error", error = %e, "private read failed on the database");
@@ -184,6 +202,32 @@ pub(super) struct PipelineEnv {
     /// `private_read.head_fallback` (degraded-mode design §2, DM-C9): while
     /// degraded, serve reads whose every repository is shown current.
     pub head_fallback: bool,
+    /// `private_read.degraded_retry_min_secs` and `_max_secs` (§3.7).
+    pub retry_min_secs: u64,
+    pub retry_max_secs: u64,
+}
+
+/// `retryAfter` (degraded-mode design §3.7): a quarter of the private
+/// watermark's delay (unbounded when there is none), rounded, within
+/// `min..=max`. Early in a stall a retry comes soon; an old one backs off.
+pub(super) fn retry_after_secs(watermark: Option<SystemTime>, now: SystemTime, min: u64, max: u64) -> u64 {
+    let quarter = watermark.map_or(u64::MAX, |w| {
+        let delay = now.duration_since(w).unwrap_or(Duration::ZERO).as_secs_f64();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let q = (delay / 4.0).round() as u64;
+        q
+    });
+    quarter.clamp(min, max.max(min))
+}
+
+/// What a listed response carries at its top level (degraded-mode design
+/// §3.2): `degraded` and `retryAfter` while degraded, and the caller's own
+/// transient misses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Signals {
+    pub degraded: bool,
+    pub retry_after: Option<u64>,
+    pub unavailable: Vec<(String, &'static str)>,
 }
 
 impl PipelineEnv {
@@ -230,6 +274,11 @@ pub(super) struct RequestState {
     fallback: bool,
     climbs: Mutex<Climbs>,
     lookups: Mutex<HashMap<String, Lookup>>,
+    /// §3.7's value, taken when the request began.
+    retry_after: u64,
+    /// The caller's own posts this request read through the pipeline that
+    /// missed transiently, each once, in first-read order.
+    unavailable: std::sync::Mutex<Vec<(String, &'static str)>>,
 }
 
 impl RequestState {
@@ -237,6 +286,7 @@ impl RequestState {
     /// fresh now; the fallback on when also `private_read.head_fallback`.
     pub(super) fn new(env: &PipelineEnv) -> Self {
         let degraded = !env.watermark_fresh();
+        let watermark = env.watermarks.private_watermark().map(SystemTime::from);
         Self {
             heads: Mutex::new(HashMap::new()),
             fetch_budget: AtomicUsize::new(env.max_head_fetches),
@@ -244,6 +294,36 @@ impl RequestState {
             fallback: degraded && env.head_fallback,
             climbs: Mutex::new(Climbs::default()),
             lookups: Mutex::new(HashMap::new()),
+            retry_after: retry_after_secs(watermark, SystemTime::now(), env.retry_min_secs, env.retry_max_secs),
+            unavailable: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// `retryAfter` for this request's unavailable answers (§3.7).
+    pub(super) fn retry_after(&self) -> u64 {
+        self.retry_after
+    }
+
+    /// Whether `uri` missed transiently for its own author in this request.
+    pub(super) fn is_unavailable(&self, uri: &str) -> bool {
+        self.unavailable.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(u, _)| u == uri)
+    }
+
+    /// A listed response's top-level fields (degraded-mode design §3.2),
+    /// counting each `unavailable` entry.
+    pub(super) fn signals(&self) -> Signals {
+        let unavailable = self.unavailable.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        if !unavailable.is_empty() {
+            metrics::counter!(METRIC_UNAVAILABLE, "kind" => "listed").increment(u64::try_from(unavailable.len()).unwrap_or(u64::MAX));
+        }
+        Signals { degraded: self.degraded, retry_after: self.degraded.then_some(self.retry_after), unavailable }
+    }
+
+    /// Note a transient miss of the caller's own post (§3.2).
+    fn note_unavailable(&self, uri: &str, reason: &'static str) {
+        let mut list = self.unavailable.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !list.iter().any(|(u, _)| u == uri) {
+            list.push((uri.to_string(), reason));
         }
     }
 
@@ -536,6 +616,13 @@ pub(super) async fn read(
     // Boxed: the bind and decode futures are large, and a page holds up to
     // `bind_concurrency` of them.
     let result = Box::pin(read_inner(env, rs, caller, uri, authors, start)).await;
+    // The caller's own post, missed transiently (degraded-mode design §3.2).
+    if let Err(m) = &result
+        && let Some(reason) = m.unavailable_reason()
+        && uri_author(uri) == Some(caller.did.as_str())
+    {
+        rs.note_unavailable(uri, reason);
+    }
     let label = match &result {
         Ok(_) => "hit",
         Err(m) => m.label(),

@@ -7,6 +7,51 @@ use sqlx::PgPool;
 
 pub const ENV: &str = "HPRS_TEST_DATABASE_URL";
 
+/// The statements of the degraded fallback this thread ran while
+/// [`Noted::start`] holds (degraded-mode T-DM4, T-DM13): each site notes its
+/// name as it executes. A current-thread test runtime runs its servers'
+/// tasks on the test's own thread, so a test sees its handlers' statements
+/// and no other test's.
+pub mod noted {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static NOTED: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+    }
+
+    /// Note `name`, when this thread is noting.
+    pub fn note(name: &'static str) {
+        NOTED.with(|n| {
+            if let Some(v) = n.borrow_mut().as_mut() {
+                v.push(name);
+            }
+        });
+    }
+
+    /// Noting on this thread until dropped.
+    pub struct Noted;
+
+    impl Noted {
+        #[must_use]
+        pub fn start() -> Self {
+            NOTED.with(|n| *n.borrow_mut() = Some(Vec::new()));
+            Self
+        }
+
+        /// What was noted since the start or the last take.
+        #[must_use]
+        pub fn take(&self) -> Vec<&'static str> {
+            NOTED.with(|n| n.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default())
+        }
+    }
+
+    impl Drop for Noted {
+        fn drop(&mut self) {
+            NOTED.with(|n| *n.borrow_mut() = None);
+        }
+    }
+}
+
 /// A uniquely named database, dropped by [`TestDb::drop_db`].
 pub struct TestDb {
     admin: PgPool,

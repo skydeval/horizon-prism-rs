@@ -616,6 +616,6 @@ async fn tn2_tn3_tn6_tn7_tn8_the_marker_is_the_authors_alone() {
     w.check(!view.is_null() && view.get("notServed").is_none(), format!("hidden by the threadgate: {view}"));
 
     // T-N13.
-    w.check(crate::private_tier::FEATURES.last() == Some(&"private.notServed"), "the feature is listed".to_string());
+    w.check(crate::private_tier::FEATURES.contains(&"private.notServed"), "the feature is listed".to_string());
     w.finish().await;
 }

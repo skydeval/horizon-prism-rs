@@ -179,6 +179,8 @@ impl PrivateState {
                 max_chain: cfg.max_chain,
                 plaintext_refused: crate::config::PrivateAnyPdsConfig::default().enabled,
                 head_fallback: cfg.head_fallback,
+                retry_min_secs: cfg.degraded_retry_min_secs,
+                retry_max_secs: cfg.degraded_retry_max_secs,
             },
             floors: Floors {
                 get_posts: Duration::from_millis(cfg.floor_ms.get_posts),
@@ -354,6 +356,12 @@ fn embedded_media(post: &PrivateEmit<Value>, embed: &Value, authors: &ProfileCon
     let did = post.view().pointer("/author/did").and_then(Value::as_str)?;
     let pds = authors.rows.get(did).and_then(|r| r.pds_endpoint.as_deref());
     private_media_view(did, pds, embed.get("media")?)
+}
+
+/// `app.nearhorizon.private.defs#viewUnavailable` (degraded-mode design
+/// §3.4): a quoted private post not shown yet, never "not found".
+fn unavailable_record(uri: &str, retry_after: u64) -> Value {
+    json!({"$type": "app.nearhorizon.private.defs#viewUnavailable", "uri": uri, "unavailable": true, "retryAfter": retry_after})
 }
 
 fn not_found_record(uri: &str) -> Value {
@@ -731,6 +739,13 @@ async fn decorate(
                     json!({"$type": "app.bsky.embed.record#viewDetached", "uri": &quoted, "detached": true})
                 }
                 Some(record) => record.clone(),
+                // C (degraded-mode design §3.4): while degraded every
+                // private quote not shown, whatever the cause; otherwise the
+                // caller's own quoted post missed transiently.
+                None if rs.degraded() || (uri_author(&quoted) == Some(caller.did.as_str()) && rs.is_unavailable(&quoted)) => {
+                    metrics::counter!(pipeline::METRIC_UNAVAILABLE, "kind" => "quote").increment(1);
+                    unavailable_record(&quoted, rs.retry_after())
+                }
                 None => not_found_record(&quoted),
             }
         } else {
@@ -755,8 +770,15 @@ async fn decorate(
     Ok(())
 }
 
+/// A private response; while degraded, also `Retry-After` with the body's
+/// `retryAfter` (degraded-mode design §3.2).
 fn ok(body: PrivateResponse) -> Response {
-    Json(body).into_response()
+    let retry_after = body.signals().retry_after;
+    let mut response = Json(body).into_response();
+    if let Some(secs) = retry_after {
+        response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(secs));
+    }
+    response
 }
 
 pub async fn get_posts(
@@ -773,13 +795,15 @@ pub async fn get_posts(
         return Err(XrpcError::invalid("Error: uris must have between 1 and 25 items"));
     }
     let ip = request_ip(&s.app, &headers, peer);
-    let (result, timed) = stages::run(posts_body(&s, &caller, ip, &requested, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(posts_body(&s, &rs, &caller, ip, &requested, start)).await;
     floor("getPosts", start, gate, &timed, s.floors.get_posts).await;
-    result.map(ok)
+    result.map(|b| ok(b.with_signals(rs.signals())))
 }
 
 async fn posts_body(
     s: &PrivateState,
+    rs: &RequestState,
     caller: &VerifiedCaller,
     ip: IpAddr,
     requested: &[String],
@@ -795,11 +819,10 @@ async fn posts_body(
     let candidates: Vec<String> = wanted.into_iter().filter(|u| passing.contains(u)).collect();
     let hydration = private_hydration(s, caller, ip).await?;
     let authors = profiles(&hydration, &candidates).await?;
-    let rs = RequestState::new(&s.env);
     let mut posts: Vec<PrivateEmit<Value>> =
-        read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
+        read_many(s, rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
     let mut refs: Vec<&mut PrivateEmit<Value>> = posts.iter_mut().collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
+    decorate(s, rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::posts(posts))
 }
 
@@ -829,9 +852,39 @@ pub async fn get_post_thread(
     let depth = bounded(&p, "depth", 6, 10)?;
     let parent_height = bounded(&p, "parentHeight", 20, 30)?;
     let ip = request_ip(&s.app, &headers, peer);
-    let (result, timed) = stages::run(thread_body(&s, &caller, ip, &uri, depth, parent_height, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(thread_body(&s, &rs, &caller, ip, &uri, depth, parent_height, start)).await;
+    // The anchor's miss decides 400 or 503 (degraded-mode design §3.3),
+    // after the body and before the floor, which both wait.
+    let result = result.and_then(|t| match t {
+        Ok(thread) => Ok(thread.with_signals(rs.signals())),
+        Err(miss) => Err(anchor_miss(&rs, &caller.did, &uri, miss)),
+    });
     floor("getPostThread", start, gate, &timed, s.floors.get_post_thread).await;
-    result.and_then(|t| t.ok_or_else(not_found)).map(ok)
+    result.map(ok)
+}
+
+/// Why `getPostThread` read no anchor: the anchor's pipeline miss, when the
+/// pipeline read it.
+type AnchorMiss = Option<pipeline::Miss>;
+
+/// `getPostThread`'s answer for an anchor miss (degraded-mode design §3.3,
+/// B). Degraded: `503 Unavailable` for every miss but a URI the pipeline
+/// refuses from its text alone. Not degraded: `503 Unavailable` only for
+/// the caller's own anchor missed transiently; every other miss is today's
+/// `400 NotFound`, byte-identical.
+fn anchor_miss(rs: &RequestState, caller: &str, uri: &str, miss: AnchorMiss) -> XrpcError {
+    let unavailable = if rs.degraded() {
+        miss != Some(pipeline::Miss::NotPrivate)
+    } else {
+        uri_author(uri) == Some(caller) && miss.is_some_and(|m| m.unavailable_reason().is_some())
+    };
+    if unavailable {
+        metrics::counter!(pipeline::METRIC_UNAVAILABLE, "kind" => "thread").increment(1);
+        XrpcError::unavailable(rs.retry_after())
+    } else {
+        not_found()
+    }
 }
 
 /// The parent URI named by an authorized view's `record.reply.parent`.
@@ -887,16 +940,17 @@ async fn head_round(s: &PrivateState, rs: &RequestState, caller: &VerifiedCaller
     stages::reading(pipeline::prefetch_heads(&s.env, rs, &dids, s.concurrency)).await.db_failed
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn thread_body(
     s: &PrivateState,
+    rs: &RequestState,
     caller: &VerifiedCaller,
     ip: IpAddr,
     uri: &str,
     depth: u32,
     parent_height: u32,
     start: Instant,
-) -> Result<Option<PrivateResponse>, XrpcError> {
-    let rs = RequestState::new(&s.env);
+) -> Result<Result<PrivateResponse, AnchorMiss>, XrpcError> {
     let hydration = private_hydration(s, caller, ip).await?;
     let pool = &s.env.pool;
     // 1. The structural chain: the anchor's row and its ancestors, with no
@@ -923,10 +977,10 @@ async fn thread_body(
         _ => None,
     };
     let Some(anchor_row) = anchor_row else {
-        return thread_sequential(s, &rs, caller, &hydration, uri, depth, parent_height, start).await;
+        return thread_sequential(s, rs, caller, &hydration, uri, depth, parent_height, start).await;
     };
     if !anchor_row.ready(s).await? {
-        return thread_sequential(s, &rs, caller, &hydration, uri, depth, parent_height, start).await;
+        return thread_sequential(s, rs, caller, &hydration, uri, depth, parent_height, start).await;
     }
     // The prefix: the longest run of ancestors, nearest first, that pass
     // the prefilter and are ready.
@@ -943,7 +997,7 @@ async fn thread_body(
     }
     // 4. One head round, in HEAD's charge order. The claimed root is not in
     // it.
-    let db_failed = head_round(s, &rs, caller, &covered).await;
+    let db_failed = head_round(s, rs, caller, &covered).await;
     // 5. The reads, stopping at the first miss of any kind. Every head of
     // the prefix is in the request's cache now, so the reads run together
     // (§3.4's named fallback, `read_many`'s `buffered(concurrency)`), up to
@@ -956,13 +1010,15 @@ async fn thread_body(
     if touches_failed(&covered[0]) {
         // HEAD's `Miss::Db` at the anchor: its not-found.
         pipeline::count_db_miss();
-        return Ok(None);
+        return Ok(Err(Some(pipeline::Miss::Db)));
     }
     let readable = covered.iter().take_while(|r| !touches_failed(r)).count().min(parent_height as usize + 1).min(THREAD_NODE_CAP);
-    let reads: Vec<_> = covered[..readable].iter().map(|r| read_post(s, &rs, caller, &r.uri, &authors, start)).collect();
+    let reads: Vec<_> = covered[..readable].iter().map(|r| read_post(s, rs, caller, &r.uri, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency.max(1));
-    let Some(Ok(anchor)) = reads.next().await else {
-        return Ok(None);
+    let anchor = match reads.next().await {
+        Some(Ok(anchor)) => anchor,
+        Some(Err(miss)) => return Ok(Err(Some(miss))),
+        None => return Ok(Err(None)),
     };
     let mut budget = THREAD_NODE_CAP - 1;
     let mut chain: Vec<PrivateEmit<Value>> = Vec::new();
@@ -984,7 +1040,7 @@ async fn thread_body(
     }
     drop(reads);
     #[cfg(test)]
-    tests::record_chain_state(uri, &rs).await;
+    tests::record_chain_state(uri, rs).await;
     // The public top (review 15, m2): the last structural row's public
     // parent, when every private ancestor was read and fewer than
     // `parentHeight` of them were, as HEAD's loop tests before it looks at
@@ -1008,11 +1064,11 @@ async fn thread_body(
         true
     } else if is_private_uri(&claimed) && passing.contains(&claimed) {
         let authors = profiles(&hydration, std::slice::from_ref(&claimed)).await?;
-        read_post(s, &rs, caller, &claimed, &authors, start).await.is_ok()
+        read_post(s, rs, caller, &claimed, &authors, start).await.is_ok()
     } else {
         false
     };
-    thread_tail(s, &rs, caller, &hydration, uri, anchor, chain, public_top, (claimed, root_read), depth, budget, start).await
+    thread_tail(s, rs, caller, &hydration, uri, anchor, chain, public_top, (claimed, root_read), depth, budget, start).await
 }
 
 /// `getPostThread` as HEAD reads it (private-threads design §3.4 step 2):
@@ -1030,11 +1086,12 @@ async fn thread_sequential(
     depth: u32,
     parent_height: u32,
     start: Instant,
-) -> Result<Option<PrivateResponse>, XrpcError> {
+) -> Result<Result<PrivateResponse, AnchorMiss>, XrpcError> {
     let anchor_uri = vec![uri.to_string()];
     let authors = profiles(hydration, &anchor_uri).await?;
-    let Ok(anchor) = read_post(s, rs, caller, uri, &authors, start).await else {
-        return Ok(None);
+    let anchor = match read_post(s, rs, caller, uri, &authors, start).await {
+        Ok(anchor) => anchor,
+        Err(miss) => return Ok(Err(Some(miss))),
     };
     let mut budget = THREAD_NODE_CAP - 1;
 
@@ -1099,7 +1156,7 @@ async fn thread_tail(
     depth: u32,
     mut budget: usize,
     start: Instant,
-) -> Result<Option<PrivateResponse>, XrpcError> {
+) -> Result<Result<PrivateResponse, AnchorMiss>, XrpcError> {
     let chain_has_root = chain.iter().any(|p| view_uri(p).as_deref() == Some(root.as_str()));
     let roots_read: Vec<String> = if root_read && root != uri && !chain_has_root { vec![root.clone()] } else { Vec::new() };
     // The replies the read root's private threadgate hides, except from
@@ -1127,7 +1184,7 @@ async fn thread_tail(
         }));
     }
     root.parent = parent.map(Box::new);
-    Ok(Some(PrivateResponse::thread(root)))
+    Ok(Ok(PrivateResponse::thread(root)))
 }
 
 /// The replies the private threadgate of `root`, a root the caller read in
@@ -1290,10 +1347,11 @@ pub async fn get_author_feed(
     let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
     let of = FeedOf::Author { actor: &actor, filter: by };
-    let (result, timed) = stages::run(feed_body(&s, &caller, ip, of, limit, after, &aad, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(feed_body(&s, &rs, &caller, ip, of, limit, after, &aad, start)).await;
     floor("getAuthorFeed", start, gate, &timed, s.floors.get_author_feed).await;
     note_page("getAuthorFeed", &result);
-    result.map(ok)
+    result.map(|b| ok(b.with_signals(rs.signals())))
 }
 
 /// `limit` 1–50, default 30: the feeds and `getReplies`.
@@ -1322,10 +1380,11 @@ pub async fn get_timeline(
     let aad = sealed::aad(GET_TIMELINE, &caller.did, "", "");
     let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let (result, timed) = stages::run(feed_body(&s, &caller, ip, FeedOf::Timeline, limit, after, &aad, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(feed_body(&s, &rs, &caller, ip, FeedOf::Timeline, limit, after, &aad, start)).await;
     floor("getTimeline", start, gate, &timed, s.floors.get_timeline).await;
     note_page("getTimeline", &result);
-    result.map(ok)
+    result.map(|b| ok(b.with_signals(rs.signals())))
 }
 
 /// Whose feed [`feed_body`] pages.
@@ -1362,6 +1421,7 @@ enum FeedOf<'a> {
 #[allow(clippy::too_many_arguments)]
 async fn feed_body(
     s: &PrivateState,
+    rs: &RequestState,
     caller: &VerifiedCaller,
     ip: IpAddr,
     of: FeedOf<'_>,
@@ -1374,7 +1434,6 @@ async fn feed_body(
     // One lookahead row tells whether prefiltered candidates remain.
     let need = max_reads + 1;
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(&s.env);
     let (pool, me, bounds) = (&s.env.pool, caller.did.as_str(), s.bounds);
     let first = i64::try_from(need).unwrap_or(i64::MAX);
     let key = |c: &schema::FeedCandidate| (c.created_at, c.key.clone());
@@ -1409,7 +1468,7 @@ async fn feed_body(
         FeedOf::Author { filter, .. } => filter.media_bit().map(|bit| (bit, if bit == media::IMAGE { POSTS_WITH_MEDIA } else { POSTS_WITH_VIDEO })),
         FeedOf::Timeline => None,
     };
-    let reads: Vec<_> = uris.iter().map(|u| read_post(s, &rs, caller, u, &authors, start)).collect();
+    let reads: Vec<_> = uris.iter().map(|u| read_post(s, rs, caller, u, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
     while let Some((i, hit)) = reads.next().await {
         let c = &candidates[i];
@@ -1435,11 +1494,11 @@ async fn feed_body(
     let more = full_at.map_or(beyond, |i| i + 1 < candidates.len() || beyond);
     let cursor = last.filter(|_| more).and_then(|(at, key)| sealed::seal(&s.cursor_key, aad, at, &key));
     let mut refs: Vec<&mut PrivateEmit<Value>> = feed.iter_mut().collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
+    decorate(s, rs, caller, &hydration, &mut refs, &[], start).await?;
     // The reply context, once every item is read and decorated (fast-reads
     // design §5.2 B-2), before the repost reasons: a context view is the
     // post's own view.
-    let replies = stages::context(reply_context(s, &rs, caller, &hydration, &feed, limit, start)).await?;
+    let replies = stages::context(reply_context(s, rs, caller, &hydration, &feed, limit, start)).await?;
     let mut reposters: Vec<String> = Vec::new();
     for (_, by, _) in reposts.iter().flatten() {
         if !reposters.contains(by) {
@@ -1635,14 +1694,16 @@ pub async fn get_bookmarks(
     };
     let after = parse_cursor(p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let (result, timed) = stages::run(bookmarks_body(&s, &caller, ip, limit as usize, after, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(bookmarks_body(&s, &rs, &caller, ip, limit as usize, after, start)).await;
     floor("getBookmarks", start, gate, &timed, s.floors.get_bookmarks).await;
     note_page("getBookmarks", &result);
-    result.map(ok)
+    result.map(|b| ok(b.with_signals(rs.signals())))
 }
 
 async fn bookmarks_body(
     s: &PrivateState,
+    rs: &RequestState,
     caller: &VerifiedCaller,
     ip: IpAddr,
     limit: usize,
@@ -1659,9 +1720,8 @@ async fn bookmarks_body(
     let candidates: Vec<String> = uris.into_iter().filter(|u| passing.contains(u)).collect();
     let hydration = private_hydration(s, caller, ip).await?;
     let authors = profiles(&hydration, &candidates).await?;
-    let rs = RequestState::new(&s.env);
     let mut hits: HashMap<String, PrivateEmit<Value>> = HashMap::new();
-    for (uri, hit) in candidates.iter().zip(read_many(s, &rs, caller, &candidates, &authors, start).await) {
+    for (uri, hit) in candidates.iter().zip(read_many(s, rs, caller, &candidates, &authors, start).await) {
         if let Some(post) = hit {
             hits.insert(uri.clone(), post);
         }
@@ -1679,7 +1739,7 @@ async fn bookmarks_body(
         })
         .collect();
     let mut refs: Vec<&mut PrivateEmit<Value>> = bookmarks.iter_mut().map(|b| &mut b.item).collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
+    decorate(s, rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::bookmarks(bookmarks, next))
 }
 
@@ -1752,15 +1812,17 @@ async fn interactions(
     let limit = page_limit(&p)?;
     let after = parse_cursor(p.one("cursor"))?;
     let ip = request_ip(&s.app, headers, peer);
-    let (result, timed) = stages::run(interactions_body(s, &caller, ip, kind, &uri, limit, after, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(interactions_body(s, &rs, &caller, ip, kind, &uri, limit, after, start)).await;
     floor(endpoint, start, gate, &timed, target).await;
     note_page(endpoint, &result);
-    result.map(ok)
+    result.map(|b| ok(b.with_signals(rs.signals())))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn interactions_body(
     s: &PrivateState,
+    rs: &RequestState,
     caller: &VerifiedCaller,
     ip: IpAddr,
     kind: Interaction,
@@ -1774,8 +1836,7 @@ async fn interactions_body(
         Interaction::Repost => PrivateResponse::reposted_by(uri.to_string(), items, cursor),
     };
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(&s.env);
-    if !anchor_readable(s, &rs, caller, &hydration, uri, start).await? {
+    if !anchor_readable(s, rs, caller, &hydration, uri, start).await? {
         return Ok(respond(Vec::new(), None));
     }
     let rows = schema::interactions(&s.env.pool, &caller.did, kind, uri, after, i64::try_from(limit).unwrap_or(i64::MAX)).await?;
@@ -1831,15 +1892,17 @@ pub async fn get_quotes(
     let aad = sealed::aad(GET_QUOTES, &caller.did, &uri, "");
     let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let (result, timed) = stages::run(quotes_body(&s, &caller, ip, &uri, limit, after, &aad, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(quotes_body(&s, &rs, &caller, ip, &uri, limit, after, &aad, start)).await;
     floor("getQuotes", start, gate, &timed, s.floors.get_quotes).await;
     note_page("getQuotes", &result);
-    result.map(ok)
+    result.map(|b| ok(b.with_signals(rs.signals())))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn quotes_body(
     s: &PrivateState,
+    rs: &RequestState,
     caller: &VerifiedCaller,
     ip: IpAddr,
     uri: &str,
@@ -1849,8 +1912,7 @@ async fn quotes_body(
     start: Instant,
 ) -> Result<PrivateResponse, XrpcError> {
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(&s.env);
-    if !anchor_readable(s, &rs, caller, &hydration, uri, start).await? {
+    if !anchor_readable(s, rs, caller, &hydration, uri, start).await? {
         return Ok(PrivateResponse::quotes(uri.to_string(), Vec::new(), None));
     }
     // The read cap (private-threads design §3.3), with one row of
@@ -1871,7 +1933,7 @@ async fn quotes_body(
     let mut last: Option<(DateTime<Utc>, String)> = None;
     let private: Vec<String> = candidates.iter().filter(|c| c.cid.is_none()).map(|c| c.uri.clone()).collect();
     let authors = profiles(&hydration, &private).await?;
-    let reads: Vec<_> = private.iter().map(|u| read_post(s, &rs, caller, u, &authors, start)).collect();
+    let reads: Vec<_> = private.iter().map(|u| read_post(s, rs, caller, u, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency);
     let mut full_at: Option<usize> = None;
     for (i, c) in candidates.iter().enumerate() {
@@ -1902,7 +1964,7 @@ async fn quotes_body(
             QuoteItem::Public { .. } => None,
         })
         .collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
+    decorate(s, rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::quotes(uri.to_string(), items, cursor))
 }
 
@@ -1946,10 +2008,11 @@ pub async fn get_replies(
     let aad = sealed::aad(GET_REPLIES, &caller.did, &uri, "");
     let after = sealed::open(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let (result, timed) = stages::run(replies_body(&s, &caller, ip, &uri, limit, depth, after, &aad, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(replies_body(&s, &rs, &caller, ip, &uri, limit, depth, after, &aad, start)).await;
     floor("getReplies", start, gate, &timed, s.floors.get_replies).await;
     note_page("getReplies", &result);
-    result.map(ok)
+    result.map(|b| ok(b.with_signals(rs.signals())))
 }
 
 /// `getReplies`' private anchor and its claimed root (private-threads
@@ -2014,6 +2077,7 @@ async fn replies_anchor(
 #[allow(clippy::too_many_arguments)]
 async fn replies_body(
     s: &PrivateState,
+    rs: &RequestState,
     caller: &VerifiedCaller,
     ip: IpAddr,
     uri: &str,
@@ -2024,11 +2088,10 @@ async fn replies_body(
     start: Instant,
 ) -> Result<PrivateResponse, XrpcError> {
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(&s.env);
     // The thread's root, when it was read for the caller in this request.
     let mut roots_read: Vec<String> = Vec::new();
     if is_private_uri(uri) {
-        match replies_anchor(s, &rs, caller, &hydration, uri, start).await? {
+        match replies_anchor(s, rs, caller, &hydration, uri, start).await? {
             Some(root) => roots_read.extend(root),
             None => return Ok(PrivateResponse::replies(Vec::new(), None)),
         }
@@ -2059,7 +2122,7 @@ async fn replies_body(
     let uris: Vec<String> = candidates.iter().map(|(u, _)| u.clone()).collect();
     let authors = profiles(&hydration, &uris).await?;
     let mut full_at: Option<usize> = None;
-    let reads: Vec<_> = uris.iter().map(|u| read_post(s, &rs, caller, u, &authors, start)).collect();
+    let reads: Vec<_> = uris.iter().map(|u| read_post(s, rs, caller, u, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
     while let Some((i, hit)) = reads.next().await {
         let (u, at) = &candidates[i];
@@ -2079,9 +2142,9 @@ async fn replies_body(
     let mut budget = THREAD_NODE_CAP.saturating_sub(hits.len());
     let level: Vec<String> = hits.iter().filter_map(view_uri).collect();
     // The expansion's own read allowance, apart from the page's.
-    let (mut replies, expanded) = expand(s, &rs, caller, &hydration, level, depth, &mut budget, expansion_reads(s), &hidden, start).await?;
+    let (mut replies, expanded) = expand(s, rs, caller, &hydration, level, depth, &mut budget, expansion_reads(s), &hidden, start).await?;
     let mut refs: Vec<&mut PrivateEmit<Value>> = hits.iter_mut().chain(replies.values_mut().flatten()).collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, &roots_read, start).await?;
+    decorate(s, rs, caller, &hydration, &mut refs, &roots_read, start).await?;
     let nodes = hits
         .into_iter()
         .map(|hit| {
@@ -2188,15 +2251,17 @@ pub async fn search_posts(
     let aad = sealed::aad(SEARCH_POSTS, &caller.did, &q, "");
     let from = sealed::open_search(&s.cursor_key, &aad, p.one("cursor"))?;
     let ip = request_ip(&s.app, &headers, peer);
-    let (result, timed) = stages::run(search_body(&s, &caller, ip, &query, limit, from, &aad, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(search_body(&s, &rs, &caller, ip, &query, limit, from, &aad, start)).await;
     floor("searchPosts", start, gate, &timed, s.floors.search_posts).await;
     note_page("searchPosts", &result);
-    result.map(ok)
+    result.map(|b| ok(b.with_signals(rs.signals())))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn search_body(
     s: &PrivateState,
+    rs: &RequestState,
     caller: &VerifiedCaller,
     ip: IpAddr,
     query: &SearchQuery,
@@ -2229,14 +2294,13 @@ async fn search_body(
     let scanned_all = i64::try_from(candidates.len()).unwrap_or(i64::MAX) >= bounds.scan_candidates;
 
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(&s.env);
     let wanted: Vec<&(String, DateTime<Utc>)> = candidates.iter().filter(|(u, _)| query.may_match(u)).collect();
     let uris: Vec<String> = wanted.iter().map(|(u, _)| u.clone()).collect();
     let authors = profiles(&hydration, &uris).await?;
     let mut posts: Vec<PrivateEmit<Value>> = Vec::new();
     // The last returned row, once the page holds `limit`.
     let mut full_at: Option<(DateTime<Utc>, String)> = None;
-    let reads: Vec<_> = uris.iter().map(|u| read_post(s, &rs, caller, u, &authors, start)).collect();
+    let reads: Vec<_> = uris.iter().map(|u| read_post(s, rs, caller, u, &authors, start)).collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
     while let Some((i, hit)) = reads.next().await {
         if let Ok(post) = hit
@@ -2262,7 +2326,7 @@ async fn search_body(
         sealed::seal_search(&s.cursor_key, aad, &sealed::SearchPosition { at, uri, bound: pos.bound })
     });
     let mut refs: Vec<&mut PrivateEmit<Value>> = posts.iter_mut().collect();
-    decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
+    decorate(s, rs, caller, &hydration, &mut refs, &[], start).await?;
     Ok(PrivateResponse::search(posts, cursor))
 }
 
@@ -2311,15 +2375,17 @@ pub async fn list_notifications(
     let after = notification_cursor(p.one("cursor"))?;
     let reasons = p.all("reasons");
     let ip = request_ip(&s.app, &headers, peer);
-    let (result, timed) = stages::run(notifications_body(&s, &caller, ip, limit, after, &reasons, start)).await;
+    let rs = RequestState::new(&s.env);
+    let (result, timed) = stages::run(notifications_body(&s, &rs, &caller, ip, limit, after, &reasons, start)).await;
     floor("listNotifications", start, gate, &timed, s.floors.list_notifications).await;
     note_page("listNotifications", &result);
-    result.map(ok)
+    result.map(|b| ok(b.with_signals(rs.signals())))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn notifications_body(
     s: &PrivateState,
+    rs: &RequestState,
     caller: &VerifiedCaller,
     ip: IpAddr,
     limit: usize,
@@ -2344,8 +2410,7 @@ async fn notifications_body(
     let passing: HashSet<String> = schema::prefilter_uris(pool, me, &post_uris, s.env.max_chain).await?.into_iter().collect();
     let candidates: Vec<String> = post_uris.into_iter().filter(|u| passing.contains(u)).collect();
     let authors = profiles(&hydration, &candidates).await?;
-    let rs = RequestState::new(&s.env);
-    let mut posts: Vec<PrivateEmit<Value>> = read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
+    let mut posts: Vec<PrivateEmit<Value>> = read_many(s, rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
     let mut refs: Vec<&mut PrivateEmit<Value>> = posts.iter_mut().collect();
     operator_labels(&hydration, &mut refs).await?;
     let mut hits: HashMap<String, Vec<PrivateEmit<Value>>> = HashMap::new();
@@ -2356,7 +2421,7 @@ async fn notifications_body(
     }
     // The subjects, after the notifications' own posts (fast-reads design
     // §5.2 B-3).
-    let subject_posts = notification_subjects(s, &rs, caller, &hydration, &rows, start).await?;
+    let subject_posts = notification_subjects(s, rs, caller, &hydration, &rows, start).await?;
 
     // Rows from a public record: the subject must still be stored.
     let public: Vec<&schema::NotificationRow> = rows.iter().filter(|r| !r.is_from_private_post()).collect();

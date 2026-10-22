@@ -511,6 +511,13 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     if read.walk_batch_max == 0 {
         out.push("private_read.walk_batch_max must be greater than 0".to_string());
     }
+    // Degraded-mode design §3.7, §7: retryAfter's bounds.
+    if !(1..=3600).contains(&read.degraded_retry_min_secs) {
+        out.push("private_read.degraded_retry_min_secs must be 1 to 3600".to_string());
+    }
+    if !(read.degraded_retry_min_secs..=3600).contains(&read.degraded_retry_max_secs) {
+        out.push("private_read.degraded_retry_max_secs must be at least private_read.degraded_retry_min_secs and at most 3600".to_string());
+    }
     if cfg.sync.head_max_age_secs > MAX_HEAD_AGE_SECS {
         out.push(format!("sync.head_max_age_secs must be at most {MAX_HEAD_AGE_SECS}"));
     }

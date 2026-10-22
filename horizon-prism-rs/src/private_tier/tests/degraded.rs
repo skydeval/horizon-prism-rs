@@ -5,15 +5,11 @@
 //! private relay that never reported, so the private watermark is `None`.
 
 use std::collections::HashSet;
-use std::sync::Mutex as StdMutex;
-
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::Layer;
-
 use super::*;
 use crate::firehose::writer::{ChainStep, advance_applied_rev, chain_commit};
 use crate::private_tier::handlers::tests::chain_state;
 use crate::private_tier::pipeline;
+use crate::test_support::noted::Noted;
 use crate::test_support::{hooks, series};
 
 /// Every fixture repo's applied rev, and its chain once [`chain_all`] ran.
@@ -23,69 +19,9 @@ const M: &str = "3l22222222222";
 /// The commit after it, which the live relay delivered.
 const H: &str = "3l22222222223";
 
-/// Statements sqlx ran on this thread while installed (its `sqlx::query`
-/// events): what a request's handlers and pipeline executed.
-#[derive(Clone, Default)]
-struct Statements(Arc<StdMutex<Vec<String>>>);
-
-#[derive(Default)]
-struct Fields {
-    summary: String,
-    statement: String,
-}
-
-impl tracing::field::Visit for Fields {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        match field.name() {
-            "summary" => self.summary = value.to_string(),
-            "db.statement" => self.statement = value.to_string(),
-            _ => {}
-        }
-    }
-
-    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
-}
-
-impl<S: tracing::Subscriber> Layer<S> for Statements {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().target() != "sqlx::query" {
-            return;
-        }
-        let mut f = Fields::default();
-        event.record(&mut f);
-        let text = if f.statement.trim().is_empty() { f.summary } else { f.statement.trim().to_string() };
-        self.0.lock().expect("statements").push(text);
-    }
-}
-
-impl Statements {
-    /// Capture from now until the guard drops.
-    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
-        let s = Self::default();
-        let filter = tracing_subscriber::filter::Targets::new().with_target("sqlx::query", tracing::Level::TRACE);
-        let subscriber = tracing_subscriber::registry().with(s.clone().with_filter(filter));
-        (s, tracing::subscriber::set_default(subscriber))
-    }
-
-    fn take(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().expect("statements"))
-    }
-}
-
-/// The climb statement's text.
-fn is_climb(sql: &str) -> bool {
-    sql.contains("k AS MATERIALIZED (SELECT DISTINCT p.parent, p.root")
-}
-
-/// Fact 8 with its walk's authors.
-fn is_fact8_with_authors(sql: &str) -> bool {
-    sql.contains("AS authors")
-}
-
-/// A statement only the fallback runs: the climb, fact 8 with authors, or
-/// a head read with `chain_rev`.
-fn fallback_only(sql: &str) -> bool {
-    is_climb(sql) || is_fact8_with_authors(sql) || sql.contains("chain_rev")
+/// How often `name` was noted.
+fn count(noted: &[&'static str], name: &str) -> usize {
+    noted.iter().filter(|n| **n == name).count()
 }
 
 /// A local Prometheus recorder for this thread, which a current-thread test
@@ -481,11 +417,10 @@ async fn tdm4_the_climb() {
     let in_cycle = w.reply(DAVE, "3kdm4x222222", &z).await;
 
     let uris = vec![p.clone(), sibling.clone(), below_own.clone(), bb.clone(), in_cycle.clone(), root.clone(), own.clone(), branch_root.clone()];
-    let (statements, guard) = Statements::capture();
+    let noted = Noted::start();
     let got = schema::climb_authors(pool, &uris, CAP).await.expect("climb");
-    drop(guard);
-    let climbs = statements.take().into_iter().filter(|s| is_climb(s)).count();
-    assert_eq!(climbs, 1, "one statement for the set");
+    assert_eq!(count(&noted.take(), "climb_authors"), 1, "one statement for the set");
+    drop(noted);
     let authors = |u: &str| {
         let mut a = got.get(u).expect(u).authors.clone();
         a.sort();
@@ -567,12 +502,10 @@ async fn tdm4_untracked_cap_and_levels() {
 
     // One climb statement per level: Dave's thread from the root, two levels
     // of replies (the chain's first two rows).
-    let (statements, guard) = Statements::capture();
-    sqlx::query("SELECT 1 AS capture_probe").execute(&w.f.pool).await.expect("probe");
-    assert!(statements.take().iter().any(|s| s.contains("capture_probe")), "the capture sees the probe");
+    let noted = Noted::start();
     let (_, thread) = thread_of(&base, DAVE, &format!("uri={root}&depth=2")).await;
-    drop(guard);
-    let climbs = statements.take().into_iter().filter(|s| is_climb(s)).count();
+    let climbs = count(&noted.take(), "climb_authors");
+    drop(noted);
     w.check(thread["post"]["uri"] == root.as_str(), "the root reads".to_string());
     // The anchor's own climb, then one for each of the two levels.
     w.check(climbs == 3, format!("climb statements {climbs}"));
@@ -635,7 +568,7 @@ async fn tdm5_bind_freshness() {
 /// T-DM13: with the watermark fresh, `getPosts`, `getPostThread`,
 /// `getAuthorFeed` and `getTimeline` run none of the fallback's statements,
 /// and answer the same bytes with the fallback on and off. Degraded, the
-/// same reads do run them (the capture sees them).
+/// same reads do run them (each fallback statement notes itself, `noted`).
 #[tokio::test]
 async fn tdm13_a_fresh_watermark_is_unchanged() {
     let Some(w) = Walk::new_in("dm13-fresh", PublicMode::On, Layout::SamePds, Some("followers"), &[], &[], Arc::new(NoHeads)).await else {
@@ -658,28 +591,25 @@ async fn tdm13_a_fresh_watermark_is_unchanged() {
         (TIMELINE, String::new()),
     ];
     for (method, query) in &calls {
-        let (statements, guard) = Statements::capture();
-        // A statement of the test's own first: the capture is live.
-        sqlx::query("SELECT 1 AS capture_probe").execute(&w.f.pool).await.expect("probe");
-        assert!(statements.take().iter().any(|s| s.contains("capture_probe")), "the capture sees the probe");
+        let noted = Noted::start();
         let (s_on, b_on, _) = get(&on_fresh, method, query, DAVE, DAVE_KEY).await;
-        let ran = statements.take();
+        let ran = noted.take();
         let (s_off, b_off, _) = get(&off_fresh, method, query, DAVE, DAVE_KEY).await;
-        drop(guard);
+        drop(noted);
         assert_eq!((s_on, s_off), (200, 200), "{method}: {b_on}");
         assert_eq!(b_on, b_off, "{method}: the same bytes");
         assert!(!b_on.contains("\"degraded\"") && !b_on.contains("\"retryAfter\""), "{method}: {b_on}");
-        assert!(!ran.is_empty(), "{method}: the capture sees statements");
-        assert!(!ran.iter().any(|s| fallback_only(s)), "{method}: a fallback statement ran fresh");
+        assert!(ran.is_empty(), "{method}: fallback statements ran fresh: {ran:?}");
     }
-    // Degraded, the fallback's statements run.
-    let (statements, guard) = Statements::capture();
-    sqlx::query("SELECT 1 AS capture_probe").execute(&w.f.pool).await.expect("probe");
+    // Degraded, the fallback's statements run: the notes are live.
+    let noted = Noted::start();
     let (status, body, _) = get(&degraded, POSTS, &format!("uris={p}"), DAVE, DAVE_KEY).await;
-    drop(guard);
+    let ran = noted.take();
+    drop(noted);
     assert_eq!(status, 200, "{body}");
-    let ran = statements.take();
-    assert!(ran.iter().any(|s| is_climb(s)) && ran.iter().any(|s| is_fact8_with_authors(s)), "degraded runs the climb and fact 8 with authors");
+    for name in ["climb_authors", "fact8_with_authors", "read_head_state", "stored_head"] {
+        assert!(count(&ran, name) > 0, "degraded runs {name}: {ran:?}");
+    }
     assert!(serde_json::from_str::<Value>(&body).expect("json")["posts"].as_array().is_some_and(|a| a.len() == 1), "{body}");
     w.finish().await;
 }
@@ -748,4 +678,229 @@ async fn tdm16_own_read_while_degraded() {
     w.check(served(&base, BOB, &p).await, "the author reads its own reply".to_string());
     w.check(!served(&base, DAVE, &p).await, "another reader does not".to_string());
     w.finish().await;
+}
+
+// ---- A, B, C: what clients are told (degraded-mode design §3) ----
+
+/// A GET with its `Retry-After` header: status, body, header.
+async fn get_with_retry(base: &str, method: &str, query: &str, did: &str) -> (u16, String, Option<String>) {
+    let token = mint(&signing_key(key_of(did)), did, &format!("did:web:{AUDIENCE_HOST}"), Some(method));
+    let r = reqwest::Client::new()
+        .get(format!("{base}/xrpc/{method}?{query}"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("request");
+    let status = r.status().as_u16();
+    let retry = r.headers().get("retry-after").map(|v| v.to_str().expect("ascii").to_string());
+    (status, r.text().await.expect("body"), retry)
+}
+
+/// The degraded `retryAfter` with no private watermark: the maximum.
+const RETRY_MAX: u64 = 300;
+
+/// §3.7's formula: a quarter of the delay, within the bounds; no watermark
+/// is the maximum.
+#[test]
+fn tdm7_retry_after_formula() {
+    let now = SystemTime::now();
+    let ago = |s: u64| Some(now - Duration::from_secs(s));
+    assert_eq!(pipeline::retry_after_secs(None, now, 30, 300), 300);
+    assert_eq!(pipeline::retry_after_secs(ago(130), now, 30, 300), 33);
+    assert_eq!(pipeline::retry_after_secs(ago(60), now, 30, 300), 30, "early in a stall: the minimum");
+    assert_eq!(pipeline::retry_after_secs(ago(3600), now, 30, 300), 300, "an old stall: the maximum");
+    assert_eq!(pipeline::retry_after_secs(ago(600), now, 30, 300), 150);
+}
+
+/// T-DM6 (B): degraded, every anchor miss of `getPostThread` is the same
+/// `503 Unavailable` (an existing readable-but-behind anchor, an existing
+/// unreadable one, a nonexistent `postPrivate` URI, one under the caller's
+/// DID), with `retryAfter` in the body and the header; a URI of another
+/// NSID is `400`. Not degraded: the caller's own anchor missed transiently
+/// is `503`; another author's with the same cause, and a nonexistent URI,
+/// are byte-identical `400 NotFound`.
+#[tokio::test]
+async fn tdm6_thread_anchor_misses() {
+    let Some(mut w) = Walk::new_in("dm6-anchor", PublicMode::On, Layout::SamePds, Some("followers"), &[], &[], Arc::new(NoHeads)).await else {
+        return;
+    };
+    let root = w.root.clone();
+    let c = w.reply(CAROL, "3kdm6c222222", &root).await;
+    let behind = w.reply(BOB, "3kdm6b222222", &c).await;
+    let carols = w.f.audience(CAROL, "3kdm6aud2222", Some("list"), &[BOB]).await;
+    let unreadable = w.f.private_post(CAROL, "3kdm6u222222", &carols, None).await;
+    w.f.ready_all().await;
+    chain_all(&w.f.pool).await;
+    hole(&w.f.pool, CAROL).await;
+    let s = servers(&w).await;
+    let expected = format!("{{\"error\":\"Unavailable\",\"message\":\"Temporarily unavailable; try again\",\"retryAfter\":{RETRY_MAX}}}");
+    for uri in [
+        behind.clone(),
+        unreadable.clone(),
+        format!("at://{BOB}/{NSID_POST_PRIVATE}/3knothere222"),
+        format!("at://{DAVE}/{NSID_POST_PRIVATE}/3knothere222"),
+    ] {
+        let (status, body, retry) = get_with_retry(&s.on, THREAD, &format!("uri={uri}"), DAVE).await;
+        w.check(status == 503 && body == expected, format!("degraded {uri}: {status} {body}"));
+        w.check(retry.as_deref() == Some(RETRY_MAX.to_string().as_str()), format!("degraded {uri}: Retry-After {retry:?}"));
+    }
+    let other = format!("at://{BOB}/app.bsky.feed.post/3kdm6pub2222");
+    let (status, body, _) = get_with_retry(&s.on, THREAD, &format!("uri={other}"), DAVE).await;
+    w.check(status == 400 && body.contains("\"NotFound\""), format!("another NSID: {status} {body}"));
+    // With the fallback off the anchor misses `stale`: the same 503.
+    let (status, body, _) = get_with_retry(&s.off, THREAD, &format!("uri={behind}"), DAVE).await;
+    w.check(status == 503 && body == expected, format!("fallback off: {status} {body}"));
+
+    // Not degraded: Bob's own anchor behind its head (`head_check`).
+    let mine = w.f.private_post(BOB, "3kdm6mine222", &w.aud.clone(), None).await;
+    exec(&w.f.pool, &format!("UPDATE sync_state SET head_rev = '{H}' WHERE did = '{BOB}'")).await;
+    let (status, body, retry) = get_with_retry(&s.fresh, THREAD, &format!("uri={mine}"), BOB).await;
+    w.check(status == 503 && body.contains("\"Unavailable\"") && body.contains("\"retryAfter\":30"), format!("own transient: {status} {body}"));
+    w.check(retry.as_deref() == Some("30"), format!("own transient Retry-After {retry:?}"));
+    let (status_other, other_body, _) = get_with_retry(&s.fresh, THREAD, &format!("uri={mine}"), DAVE).await;
+    let (status_none, none_body, _) = get_with_retry(&s.fresh, THREAD, &format!("uri=at://{BOB}/{NSID_POST_PRIVATE}/3knothere222"), DAVE).await;
+    w.check(status_other == 400 && other_body == none_body && status_none == 400, format!("another's: {status_other} {other_body} / {none_body}"));
+    w.finish().await;
+}
+
+/// T-DM7 (A): two callers at one moment get the same `degraded` and
+/// `retryAfter`, with `Retry-After` equal to the body's; `unavailable`
+/// lists only the caller's own transient misses (never another author's
+/// post, never one that missed for good) and is absent when empty; outside
+/// degraded mode it is still listed (DM-C3), with no `degraded`.
+#[tokio::test]
+async fn tdm7_response_signals() {
+    let Some(mut w) = Walk::new_in("dm7-signals", PublicMode::On, Layout::SamePds, Some("followers"), &[], &[], Arc::new(NoHeads)).await else {
+        return;
+    };
+    let aud = w.aud.clone();
+    let root = w.root.clone();
+    // Bob's own posts: one top-level (behind once Bob's chain is), one
+    // taken down (a permanent miss).
+    let mine = w.f.private_post(BOB, "3kdm7mine222", &aud, None).await;
+    let gone = w.f.private_post(BOB, "3kdm7gone222", &aud, None).await;
+    w.label(&gone, "!takedown").await;
+    let carols = w.f.private_post(CAROL, "3kdm7carol22", &aud, None).await;
+    w.f.ready_all().await;
+    chain_all(&w.f.pool).await;
+    hole(&w.f.pool, BOB).await;
+    hole(&w.f.pool, CAROL).await;
+    let s = servers(&w).await;
+    let query = format!("uris={mine}&uris={gone}&uris={carols}&uris={root}");
+    let (sb, bob, rb) = get_with_retry(&s.on, POSTS, &query, BOB).await;
+    let (sd, dave, rd) = get_with_retry(&s.on, POSTS, &query, DAVE).await;
+    assert_eq!((sb, sd), (200, 200), "{bob} {dave}");
+    let (bob, dave): (Value, Value) = (serde_json::from_str(&bob).expect("json"), serde_json::from_str(&dave).expect("json"));
+    w.check(bob["degraded"] == true && dave["degraded"] == true, "degraded for both".to_string());
+    w.check(bob["retryAfter"] == RETRY_MAX && dave["retryAfter"] == RETRY_MAX, "the same retryAfter".to_string());
+    w.check(rb.as_deref() == Some("300") && rd.as_deref() == Some("300"), format!("Retry-After {rb:?} {rd:?}"));
+    w.check(bob["unavailable"] == json!([{"uri": mine, "reason": "syncing"}]), format!("Bob's unavailable {}", bob["unavailable"]));
+    w.check(dave.get("unavailable").is_none(), format!("Dave's own nothing: {dave}"));
+    // Bob is behind, so every read of his misses; Dave reads the root.
+    w.check(bob["posts"].as_array().is_some_and(Vec::is_empty), "Bob, behind, reads nothing".to_string());
+    w.check(dave["posts"].as_array().is_some_and(|p| p.len() == 1), "Dave reads the root".to_string());
+
+    // Not degraded: still listed, with no degraded or retryAfter. Bob's
+    // head past what was applied: `head_check`.
+    exec(&w.f.pool, &format!("UPDATE sync_state SET head_rev = '3l22222222224' WHERE did = '{BOB}'")).await;
+    let (status, body, retry) = get_with_retry(&s.fresh, POSTS, &format!("uris={mine}"), BOB).await;
+    let v: Value = serde_json::from_str(&body).expect("json");
+    w.check(status == 200 && v.get("degraded").is_none() && v.get("retryAfter").is_none() && retry.is_none(), format!("fresh: {body} {retry:?}"));
+    w.check(v["unavailable"] == json!([{"uri": mine, "reason": "syncing"}]), format!("fresh unavailable {body}"));
+    // An owner not ready: `indexing`.
+    let mut conn = w.f.pool.acquire().await.expect("conn");
+    readiness::clear_owner(&mut conn, CAROL).await.expect("clear");
+    drop(conn);
+    let (_, body, _) = get_with_retry(&s.fresh, POSTS, &format!("uris={carols}"), CAROL).await;
+    let v: Value = serde_json::from_str(&body).expect("json");
+    w.check(v["unavailable"] == json!([{"uri": carols, "reason": "indexing"}]), format!("indexing: {body}"));
+    w.finish().await;
+}
+
+/// T-DM8 (C): degraded, a quote of a readable-but-behind post, of an
+/// unreadable one, of a prefilter-failing one and of a nonexistent URI are
+/// the same `#viewUnavailable`; not degraded, the caller's own quoted post
+/// missed transiently is `#viewUnavailable`, another's is `#viewNotFound`,
+/// as for a nonexistent URI.
+#[tokio::test]
+async fn tdm8_quoted_posts() {
+    let Some(mut w) = Walk::new_in("dm8-quotes", PublicMode::On, Layout::SamePds, Some("followers"), &[], &[], Arc::new(NoHeads)).await else {
+        return;
+    };
+    let (aud, root) = (w.aud.clone(), w.root.clone());
+    let c = w.reply(CAROL, "3kdm8c222222", &root).await;
+    let behind = w.reply(BOB, "3kdm8b222222", &c).await;
+    let undecodable = w.f.undecodable(CAROL, "3kdm8u222222", &aud, None).await;
+    let carols = w.f.audience(CAROL, "3kdm8aud2222", Some("list"), &[BOB]).await;
+    let hidden = w.f.private_post(CAROL, "3kdm8h222222", &carols, None).await;
+    let nothing = format!("at://{CAROL}/{NSID_POST_PRIVATE}/3knothere222");
+    let quoted = [behind.clone(), undecodable.clone(), hidden.clone(), nothing.clone()];
+    let mut quoting = Vec::new();
+    for (i, q) in quoted.iter().enumerate() {
+        let uri = w.f.post_with(ALICE, &format!("3kdm8q{i}22222"), &aud, json!({"embed": {"$type": "app.bsky.embed.record", "record": {"uri": q, "cid": "bafyany"}}})).await;
+        quoting.push(uri);
+    }
+    w.f.ready_all().await;
+    chain_all(&w.f.pool).await;
+    hole(&w.f.pool, CAROL).await;
+    let s = servers(&w).await;
+    let refs: Vec<&str> = quoting.iter().map(String::as_str).collect();
+    let (_, posts) = posts_of(&s.on, DAVE, &refs).await;
+    w.check(posts.len() == 4, format!("the four quoting posts read: {}", posts.len()));
+    for (post, q) in posts.iter().zip(&quoted) {
+        let want = json!({"$type": "app.bsky.embed.record#view", "record": {"$type": "app.nearhorizon.private.defs#viewUnavailable", "uri": q, "unavailable": true, "retryAfter": RETRY_MAX}});
+        w.check(post["embed"] == want, format!("degraded quote of {q}: {}", post["embed"]));
+    }
+    let as_text = |p: &Value, q: &str| p["embed"].to_string().replace(q, "URI");
+    let texts: Vec<String> = posts.iter().zip(&quoted).map(|(p, q)| as_text(p, q)).collect();
+    w.check(texts.windows(2).all(|t| t[0] == t[1]), format!("byte-identical: {texts:?}"));
+
+    // Not degraded. Bob's own post under Carol's audience, Carol not ready:
+    // his quote of it is unavailable; Dave's view of Alice's quote of a
+    // post of Carol's is not found, as a nonexistent one.
+    let bobs = w.f.private_post(BOB, "3kdm8own2222", &carols, None).await;
+    let carols_open = w.f.private_post(CAROL, "3kdm8open222", &aud, None).await;
+    let bob_quotes = w.f.post_with(BOB, "3kdm8bq22222", &aud, json!({"embed": {"$type": "app.bsky.embed.record", "record": {"uri": bobs, "cid": "bafyany"}}})).await;
+    let alice_quotes = w.f.post_with(ALICE, "3kdm8aq22222", &aud, json!({"embed": {"$type": "app.bsky.embed.record", "record": {"uri": carols_open, "cid": "bafyany"}}})).await;
+    let alice_quotes_nothing = w.f.post_with(ALICE, "3kdm8an22222", &aud, json!({"embed": {"$type": "app.bsky.embed.record", "record": {"uri": nothing, "cid": "bafyany"}}})).await;
+    let mut conn = w.f.pool.acquire().await.expect("conn");
+    readiness::clear_owner(&mut conn, CAROL).await.expect("clear");
+    drop(conn);
+    let (_, mine) = posts_of(&s.fresh, BOB, &[&bob_quotes]).await;
+    let want = json!({"$type": "app.nearhorizon.private.defs#viewUnavailable", "uri": bobs, "unavailable": true, "retryAfter": 30});
+    w.check(mine.first().is_some_and(|p| p["embed"]["record"] == want), format!("own transient quote: {mine:?}"));
+    let (_, theirs) = posts_of(&s.fresh, DAVE, &[&alice_quotes, &alice_quotes_nothing]).await;
+    w.check(theirs.len() == 2, format!("Alice's two quoting posts: {}", theirs.len()));
+    if theirs.len() == 2 {
+        let a = as_text(&theirs[0], &carols_open);
+        let b = as_text(&theirs[1], &nothing);
+        w.check(a == b && a.contains("viewNotFound"), format!("another's transient quote is not found: {a} / {b}"));
+    }
+    w.finish().await;
+}
+
+/// T-DM10: with `floor_ms.get_post_thread` set, B's 503 and the 400 both
+/// wait the floor.
+#[tokio::test]
+async fn tdm10_the_503_is_floored() {
+    let Some(w) = Walk::new_in("dm10-floor", PublicMode::On, Layout::SamePds, Some("followers"), &[], &[], Arc::new(NoHeads)).await else {
+        return;
+    };
+    let floor = Duration::from_millis(400);
+    let base = serve_heads(w.f.state_read(w.f.app.clone(), None, floor, &TEST_CURSOR_KEY, &PrivateReadConfig::default())).await;
+    let nothing = format!("at://{BOB}/{NSID_POST_PRIVATE}/3knothere222");
+    let other = format!("at://{BOB}/app.bsky.feed.post/3knothere222");
+    let (s503, body, took503) = get(&base, THREAD, &format!("uri={nothing}"), DAVE, DAVE_KEY).await;
+    let (s400, _, took400) = get(&base, THREAD, &format!("uri={other}"), DAVE, DAVE_KEY).await;
+    assert_eq!((s503, s400), (503, 400), "{body}");
+    assert!(took503 >= floor && took400 >= floor, "{took503:?} {took400:?}");
+    w.finish().await;
+}
+
+/// T-DM11: `private.degraded` is listed, after `private.notServed`.
+#[test]
+fn tdm11_the_feature_is_listed() {
+    let f = crate::private_tier::FEATURES;
+    let at = |name: &str| f.iter().position(|x| *x == name);
+    assert!(at("private.degraded").is_some_and(|d| at("private.notServed").is_some_and(|n| d == n + 1)), "{f:?}");
 }

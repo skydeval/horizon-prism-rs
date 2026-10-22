@@ -162,6 +162,11 @@ walk_batch_max = 1000
 # read against each repository's head (design degraded-mode.md §2). Off: every
 # private read misses until the relay catches up.
 head_fallback = true
+# While degraded, responses carry degraded and retryAfter (also the Retry-After
+# header): a quarter of the private watermark's delay, within these bounds in
+# seconds (design degraded-mode.md §3.7). Min 1 to 3600, max from min to 3600.
+degraded_retry_min_secs = 30
+degraded_retry_max_secs = 300
 
 # Whole-handler latency floors, off by default (design timing-floors.md). A
 # private post's existence is not secret (skydeval, 2026-10-15), so Prism

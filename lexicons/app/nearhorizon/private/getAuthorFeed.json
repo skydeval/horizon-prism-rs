@@ -52,6 +52,23 @@
             "cursor": {
               "type": "string",
               "description": "Present whenever more candidates remain. A page reads at most twice its `limit` in candidates. It can be short or empty and still carry a cursor; keep paging while a cursor is present. Absent at the end of the feed, and also, exceptionally, when the last examined position is too long to seal (an author whose did:web is several hundred characters), where the feed ends early."
+            },
+            "degraded": {
+              "type": "boolean",
+              "description": "Present and true while this AppView is degraded: a relay it reads private posts from is behind, so posts may be missing for now and should not be shown as deleted. Absent otherwise. The same for every requester at a given moment."
+            },
+            "retryAfter": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "With degraded: seconds to wait before asking again (also sent as the Retry-After header)."
+            },
+            "unavailable": {
+              "type": "array",
+              "description": "The requester's own private posts this response read and could not serve yet, each once; absent when none. Never names another account's post.",
+              "items": {
+                "type": "ref",
+                "ref": "app.nearhorizon.private.defs#unavailablePost"
+              }
             }
           }
         }

@@ -10,6 +10,45 @@ commit.
 
 ## [Unreleased]
 
+### Added (degraded mode DM3: telling clients, #824)
+
+- **A, the response signal** (degraded-mode design §3.2): `getPosts`,
+  `getPostThread`, `getAuthorFeed`, `getTimeline`, `getBookmarks`,
+  `getLikes`, `getRepostedBy`, `getQuotes`, `getReplies`, `searchPosts`
+  and `listNotifications` carry `degraded: true` and `retryAfter` (and the
+  `Retry-After` header) while degraded, the same for every caller at that
+  moment; and `unavailable: [{uri, reason}]` naming the caller's **own**
+  private posts the request read and could not serve yet (`syncing`:
+  `stale`, `head_check`, `fallback_behind`; `indexing`: an owner not
+  ready), each once, whenever there are any, degraded or not. Absent when
+  empty; never another author's post.
+- **B, `getPostThread`'s anchor:** while degraded, every anchor miss is
+  `503 Unavailable` with `retryAfter` in the body and the header, whatever
+  the cause, except a URI that is not a private post's (still `400
+  NotFound`). Not degraded, only the caller's own anchor missed
+  transiently is `503`; every other miss is the same `400 NotFound` as
+  before. The 503 is floored as the 400 is. `getReplies`, `getLikes`,
+  `getRepostedBy` and `getQuotes` keep their empty answer, with A's fields.
+- **C, quoted private posts:** while degraded, every private quote not
+  shown (unreadable, behind, prefilter-failing or nonexistent alike) is
+  `app.nearhorizon.private.defs#viewUnavailable {uri, unavailable,
+  retryAfter}`; not degraded, only the caller's own quoted post missed
+  transiently. Reply context and thread parents are unchanged.
+- `retryAfter` is a quarter of the private watermark's delay (unbounded
+  with none), within **`private_read.degraded_retry_min_secs`** (30) and
+  **`private_read.degraded_retry_max_secs`** (300), new keys in the admin
+  settings.
+- Lexicons: `defs#unavailablePost`, `defs#viewUnavailable`, the three
+  optional fields on the eleven outputs, `getPostThread`'s `Unavailable`
+  error; `getMembership` lists the feature **`private.degraded`**.
+- Metric: `private_read_unavailable_total{kind}` (`thread`, `quote`,
+  `listed`).
+- Tests: the private round trip expects the degraded `503 Unavailable`;
+  the degraded-mode tests note the fallback's statements per thread
+  (`test_support::noted`) instead of capturing sqlx's tracing events, which
+  missed statements when tests ran in parallel.
+- No migration.
+
 ### Added (degraded mode DM2: the head fallback, #823)
 
 - **Private reads while a private relay is behind** (degraded-mode design

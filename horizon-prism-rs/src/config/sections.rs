@@ -465,6 +465,11 @@ pub struct PrivateReadConfig {
     /// checked per read (degraded-mode design §2, DM-C9). Off: every
     /// private read misses while degraded, as before.
     pub head_fallback: bool,
+    /// `retryAfter` while degraded is a quarter of the private watermark's
+    /// delay within these bounds, in seconds (degraded-mode design §3.7):
+    /// min 1 to 3 600, max at least min and at most 3 600.
+    pub degraded_retry_min_secs: u64,
+    pub degraded_retry_max_secs: u64,
     pub floor_ms: PrivateReadFloors,
 }
 
@@ -478,6 +483,8 @@ impl Default for PrivateReadConfig {
             page_reads_factor: 2,
             walk_batch_max: 1000,
             head_fallback: true,
+            degraded_retry_min_secs: 30,
+            degraded_retry_max_secs: 300,
             floor_ms: PrivateReadFloors::default(),
         }
     }

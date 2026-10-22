@@ -468,6 +468,8 @@ impl HeadProber {
     }
 
     async fn read_head_state_inner(&self, did: &str, allow_fetch: bool) -> Result<Option<HeadState>, sqlx::Error> {
+        #[cfg(test)]
+        crate::test_support::noted::note("read_head_state");
         type Row = (Option<String>, bool, Option<String>, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>);
         let row: Option<Row> = sqlx::query_as(
             "SELECT s.head_rev, \
@@ -520,6 +522,8 @@ impl HeadProber {
     ///
     /// Database errors.
     pub async fn stored_head(&self, did: &str) -> Result<StoredHead, sqlx::Error> {
+        #[cfg(test)]
+        crate::test_support::noted::note("stored_head");
         type Row = (Option<String>, bool, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>);
         let row: Option<Row> = sqlx::query_as(
             "SELECT head_rev, COALESCE(head_checked_at > now() - make_interval(secs => $2), false), \

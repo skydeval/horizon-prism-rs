@@ -35,6 +35,9 @@ pub struct XrpcError {
     pub retry_after: Option<u64>,
     /// Whether this is the `NotReady` gate error (see [`NotReadyHint`]).
     pub not_ready: bool,
+    /// `retryAfter` in the body as well as the header: for clients behind a
+    /// proxy that drops `Retry-After` (degraded-mode design §3.3, §3.5).
+    pub retry_after_in_body: bool,
 }
 
 impl XrpcError {
@@ -46,6 +49,7 @@ impl XrpcError {
             reset: None,
             retry_after: None,
             not_ready: false,
+            retry_after_in_body: false,
         }
     }
 
@@ -72,6 +76,16 @@ impl XrpcError {
         Self {
             not_ready: true,
             ..Self::new(StatusCode::BAD_REQUEST, NOT_READY, "Account indexing in progress")
+        }
+    }
+
+    /// `503 Unavailable` (degraded-mode design §3.3): a private anchor that
+    /// cannot be served yet; `retryAfter` in the body and the header.
+    #[must_use]
+    pub fn unavailable(secs: u64) -> Self {
+        Self {
+            retry_after_in_body: true,
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, "Unavailable", "Temporarily unavailable; try again").with_retry_after(secs)
         }
     }
 
@@ -102,6 +116,7 @@ impl From<Limited> for XrpcError {
             reset: Some(l.reset_epoch_secs),
             retry_after: Some(l.retry_after_secs(now)),
             not_ready: false,
+            retry_after_in_body: false,
         }
     }
 }
@@ -161,7 +176,11 @@ pub(crate) fn assert_retry_after(retry_after: Option<&str>, reset: Option<&str>)
 
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
-        let mut response = (self.status, Json(json!({ "error": self.error, "message": self.message }))).into_response();
+        let body = match self.retry_after.filter(|_| self.retry_after_in_body) {
+            Some(secs) => json!({ "error": self.error, "message": self.message, "retryAfter": secs }),
+            None => json!({ "error": self.error, "message": self.message }),
+        };
+        let mut response = (self.status, Json(body)).into_response();
         if let Some(reset) = self.reset
             && let Ok(v) = HeaderValue::from_str(&reset.to_string())
         {

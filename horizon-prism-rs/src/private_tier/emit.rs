@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde::ser::SerializeMap;
 use serde_json::Value;
 
-use super::pipeline::RecordAuthz;
+use super::pipeline::{RecordAuthz, Signals};
 use crate::hydration::PublicEmit;
 
 /// One authorized private record's view.
@@ -321,9 +321,17 @@ impl NotificationView {
     }
 }
 
-/// The body of every private handler response.
+/// The body of every private handler response, and its top-level signals
+/// (degraded-mode design §3.2).
 #[derive(Debug)]
-pub enum PrivateResponse {
+pub struct PrivateResponse {
+    body: Body,
+    signals: Signals,
+}
+
+/// What a private handler answers.
+#[derive(Debug)]
+enum Body {
     Posts(Vec<PrivateEmit<Value>>),
     Thread(ThreadNode),
     Feed { feed: Vec<FeedItem>, cursor: Option<String> },
@@ -353,75 +361,90 @@ pub enum PrivateResponse {
 }
 
 impl PrivateResponse {
+    fn of(body: Body) -> Self {
+        Self { body, signals: Signals::default() }
+    }
+
+    /// The same response with `signals` at its top level.
+    pub(in crate::private_tier) fn with_signals(mut self, signals: Signals) -> Self {
+        self.signals = signals;
+        self
+    }
+
+    /// Its top-level signals.
+    pub(in crate::private_tier) fn signals(&self) -> &Signals {
+        &self.signals
+    }
+
     pub(in crate::private_tier) fn notifications(
         notifications: Vec<NotificationView>,
         cursor: Option<String>,
         seen_at: Option<String>,
     ) -> Self {
-        Self::Notifications { notifications, cursor, seen_at }
+        Self::of(Body::Notifications { notifications, cursor, seen_at })
     }
 
     pub(in crate::private_tier) fn unread_count(count: i64) -> Self {
-        Self::UnreadCount(count)
+        Self::of(Body::UnreadCount(count))
     }
 
     pub(in crate::private_tier) fn notification_preferences(prefs: Value) -> Self {
-        Self::NotificationPreferences(prefs)
+        Self::of(Body::NotificationPreferences(prefs))
     }
 
     pub(in crate::private_tier) fn search(posts: Vec<PrivateEmit<Value>>, cursor: Option<String>) -> Self {
-        Self::Search { posts, cursor }
+        Self::of(Body::Search { posts, cursor })
     }
 
     pub(in crate::private_tier) fn likes(uri: String, likes: Vec<Value>, cursor: Option<String>) -> Self {
-        Self::Likes { uri, likes, cursor }
+        Self::of(Body::Likes { uri, likes, cursor })
     }
 
     pub(in crate::private_tier) fn reposted_by(uri: String, reposted_by: Vec<Value>, cursor: Option<String>) -> Self {
-        Self::RepostedBy { uri, reposted_by, cursor }
+        Self::of(Body::RepostedBy { uri, reposted_by, cursor })
     }
 
     pub(in crate::private_tier) fn quotes(uri: String, posts: Vec<QuoteItem>, cursor: Option<String>) -> Self {
-        Self::Quotes { uri, posts, cursor }
+        Self::of(Body::Quotes { uri, posts, cursor })
     }
 
     pub(in crate::private_tier) fn replies(replies: Vec<ThreadNode>, cursor: Option<String>) -> Self {
-        Self::Replies { replies, cursor }
+        Self::of(Body::Replies { replies, cursor })
     }
 
     pub(in crate::private_tier) fn bookmarks(bookmarks: Vec<BookmarkView>, cursor: Option<String>) -> Self {
-        Self::Bookmarks { bookmarks, cursor }
+        Self::of(Body::Bookmarks { bookmarks, cursor })
     }
 
     pub(in crate::private_tier) fn empty() -> Self {
-        Self::Empty
+        Self::of(Body::Empty)
     }
 
     pub(in crate::private_tier) fn posts(posts: Vec<PrivateEmit<Value>>) -> Self {
-        Self::Posts(posts)
+        Self::of(Body::Posts(posts))
     }
 
     pub(in crate::private_tier) fn thread(anchor: ThreadNode) -> Self {
-        Self::Thread(anchor)
+        Self::of(Body::Thread(anchor))
     }
 
     pub(in crate::private_tier) fn feed(feed: Vec<FeedItem>, cursor: Option<String>) -> Self {
-        Self::Feed { feed, cursor }
+        Self::of(Body::Feed { feed, cursor })
     }
 
     /// A page with no items and a cursor (fast-reads design §5.2, C-11).
     /// Never true for a response that is not a page.
     pub(in crate::private_tier) fn is_empty_page(&self) -> bool {
-        let (empty, cursor) = match self {
-            Self::Feed { feed, cursor } => (feed.is_empty(), cursor),
-            Self::Bookmarks { bookmarks, cursor } => (bookmarks.is_empty(), cursor),
-            Self::Likes { likes, cursor, .. } => (likes.is_empty(), cursor),
-            Self::RepostedBy { reposted_by, cursor, .. } => (reposted_by.is_empty(), cursor),
-            Self::Quotes { posts, cursor, .. } => (posts.is_empty(), cursor),
-            Self::Replies { replies, cursor } => (replies.is_empty(), cursor),
-            Self::Notifications { notifications, cursor, .. } => (notifications.is_empty(), cursor),
-            Self::Search { posts, cursor } => (posts.is_empty(), cursor),
-            Self::Posts(_) | Self::Thread(_) | Self::UnreadCount(_) | Self::NotificationPreferences(_) | Self::Empty => {
+        let (empty, cursor) = match &self.body {
+            Body::Feed { feed, cursor } => (feed.is_empty(), cursor),
+            Body::Bookmarks { bookmarks, cursor } => (bookmarks.is_empty(), cursor),
+            Body::Likes { likes, cursor, .. } => (likes.is_empty(), cursor),
+            Body::RepostedBy { reposted_by, cursor, .. } => (reposted_by.is_empty(), cursor),
+            Body::Quotes { posts, cursor, .. } => (posts.is_empty(), cursor),
+            Body::Replies { replies, cursor } => (replies.is_empty(), cursor),
+            Body::Notifications { notifications, cursor, .. } => (notifications.is_empty(), cursor),
+            Body::Search { posts, cursor } => (posts.is_empty(), cursor),
+            Body::Posts(_) | Body::Thread(_) | Body::UnreadCount(_) | Body::NotificationPreferences(_) | Body::Empty => {
                 return false;
             }
         };
@@ -432,49 +455,49 @@ impl PrivateResponse {
 impl Serialize for PrivateResponse {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut m = s.serialize_map(None)?;
-        match self {
-            Self::Posts(posts) => m.serialize_entry("posts", posts)?,
-            Self::Thread(t) => m.serialize_entry("thread", t)?,
-            Self::Feed { feed, cursor } => {
+        match &self.body {
+            Body::Posts(posts) => m.serialize_entry("posts", posts)?,
+            Body::Thread(t) => m.serialize_entry("thread", t)?,
+            Body::Feed { feed, cursor } => {
                 m.serialize_entry("feed", feed)?;
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
                 }
             }
-            Self::Bookmarks { bookmarks, cursor } => {
+            Body::Bookmarks { bookmarks, cursor } => {
                 m.serialize_entry("bookmarks", bookmarks)?;
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
                 }
             }
-            Self::Likes { uri, likes, cursor } => {
+            Body::Likes { uri, likes, cursor } => {
                 m.serialize_entry("uri", uri)?;
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
                 }
                 m.serialize_entry("likes", likes)?;
             }
-            Self::RepostedBy { uri, reposted_by, cursor } => {
+            Body::RepostedBy { uri, reposted_by, cursor } => {
                 m.serialize_entry("uri", uri)?;
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
                 }
                 m.serialize_entry("repostedBy", reposted_by)?;
             }
-            Self::Quotes { uri, posts, cursor } => {
+            Body::Quotes { uri, posts, cursor } => {
                 m.serialize_entry("uri", uri)?;
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
                 }
                 m.serialize_entry("posts", posts)?;
             }
-            Self::Replies { replies, cursor } => {
+            Body::Replies { replies, cursor } => {
                 m.serialize_entry("replies", replies)?;
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
                 }
             }
-            Self::Notifications { notifications, cursor, seen_at } => {
+            Body::Notifications { notifications, cursor, seen_at } => {
                 m.serialize_entry("notifications", notifications)?;
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
@@ -483,15 +506,28 @@ impl Serialize for PrivateResponse {
                     m.serialize_entry("seenAt", at)?;
                 }
             }
-            Self::UnreadCount(count) => m.serialize_entry("count", count)?,
-            Self::NotificationPreferences(prefs) => m.serialize_entry("preferences", prefs)?,
-            Self::Search { posts, cursor } => {
+            Body::UnreadCount(count) => m.serialize_entry("count", count)?,
+            Body::NotificationPreferences(prefs) => m.serialize_entry("preferences", prefs)?,
+            Body::Search { posts, cursor } => {
                 m.serialize_entry("posts", posts)?;
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
                 }
             }
-            Self::Empty => {}
+            Body::Empty => {}
+        }
+        // Degraded-mode design §3.2: the global signal while degraded, and
+        // the caller's own transient misses; absent otherwise.
+        if self.signals.degraded {
+            m.serialize_entry("degraded", &true)?;
+            if let Some(secs) = self.signals.retry_after {
+                m.serialize_entry("retryAfter", &secs)?;
+            }
+        }
+        if !self.signals.unavailable.is_empty() {
+            let items: Vec<Value> =
+                self.signals.unavailable.iter().map(|(uri, reason)| serde_json::json!({"uri": uri, "reason": reason})).collect();
+            m.serialize_entry("unavailable", &items)?;
         }
         m.end()
     }

@@ -1094,6 +1094,8 @@ fn fact8_with_authors_final() -> String {
 /// Database errors.
 pub(super) async fn fact8_with_authors(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> Result<(Fact8, Vec<String>), sqlx::Error> {
     type Row = (Option<String>, Option<String>, bool, bool, bool, Vec<String>);
+    #[cfg(test)]
+    crate::test_support::noted::note("fact8_with_authors");
     let row: Option<Row> = sqlx::query_as(&fact8_with_authors_statement(cap)).bind(reader).bind(uri).fetch_optional(pool).await?;
     Ok(row.map_or_else(Default::default, |(owner, gov, s1ok, verdict, anchored, authors)| {
         (Fact8 { owner, gov, s1ok, verdict, anchored }, authors)
@@ -1171,11 +1173,15 @@ pub(super) async fn climb_authors(pool: &PgPool, uris: &[String], cap: u32) -> R
     let k = climb_keys(cap).max(1);
     let cap = i32::try_from(cap).unwrap_or(i32::MAX);
     let rows: Vec<Row> = if uris.len() <= k {
+        #[cfg(test)]
+        crate::test_support::noted::note("climb_authors");
         sqlx::query_as(&sql).bind(uris).bind(cap).fetch_all(pool).await?
     } else {
         let mut tx = pool.begin_with(SLICED).await?;
         let mut rows = Vec::new();
         for slice in uris.chunks(k) {
+            #[cfg(test)]
+            crate::test_support::noted::note("climb_authors");
             let part: Vec<Row> = sqlx::query_as(&sql).bind(slice).bind(cap).fetch_all(&mut *tx).await?;
             rows.extend(part);
         }

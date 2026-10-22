@@ -137,6 +137,8 @@ max_chain = 16
 page_reads_factor = 2
 walk_batch_max = 1000
 head_fallback = true
+degraded_retry_min_secs = 30
+degraded_retry_max_secs = 300
 
 [private_read.floor_ms]
 get_posts = 0
@@ -1131,6 +1133,25 @@ fn floors_setting_is_off_on_or_partial() {
 
 /// Private-threads design §5: `max_chain` is 1 to 100 (16 by default, 100
 /// accepted), the paging keys are positive, and T-57's head-age cap: a
+/// Degraded-mode design §7: `retryAfter`'s bounds, 30 and 300 by default;
+/// min 1 to 3 600, max from min to 3 600.
+#[test]
+fn degraded_retry_bounds() {
+    let read = load("").expect("defaults").file.private_read;
+    assert_eq!((read.head_fallback, read.degraded_retry_min_secs, read.degraded_retry_max_secs), (true, 30, 300));
+    let ok = load("[private_read]\ndegraded_retry_min_secs = 60\ndegraded_retry_max_secs = 60\n").expect("equal bounds");
+    assert_eq!(ok.file.private_read.degraded_retry_max_secs, 60);
+    for (toml, problem) in [
+        ("degraded_retry_min_secs = 0\n", "private_read.degraded_retry_min_secs must be 1 to 3600"),
+        ("degraded_retry_min_secs = 3601\ndegraded_retry_max_secs = 3601\n", "private_read.degraded_retry_min_secs must be 1 to 3600"),
+        ("degraded_retry_min_secs = 100\ndegraded_retry_max_secs = 99\n", "private_read.degraded_retry_max_secs must be at least"),
+        ("degraded_retry_max_secs = 3601\n", "private_read.degraded_retry_max_secs must be at least"),
+    ] {
+        let p = invalid_problems(load(&format!("[private_read]\n{toml}")));
+        assert!(has(&p, problem), "{toml}: {p:?}");
+    }
+}
+
 /// `sync.head_max_age_secs` above 600 is refused on every build.
 #[test]
 fn private_threads_keys_and_the_head_age_cap_are_checked() {

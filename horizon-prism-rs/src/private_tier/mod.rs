@@ -211,6 +211,10 @@ pub const FEATURES: &[&str] = &[
     // `notServed` on the author's own private post views (not-served-reason
     // design, K6-L3).
     "private.notServed",
+    // `degraded`, `retryAfter` and `unavailable` on the listed responses,
+    // `getPostThread`'s `503 Unavailable` and `#viewUnavailable` quotes
+    // (degraded-mode design §3.2–§3.4).
+    "private.degraded",
 ];
 
 /// The private tier as the rest of the crate may use it.

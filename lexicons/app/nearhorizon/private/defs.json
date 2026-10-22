@@ -16,7 +16,7 @@
         },
         "embed": {
           "type": "union",
-          "description": "The stock view of the record's embed, built from either $type form. A quoted private post is read for the requester as any private post is: readable gives #viewRecord with the decoded record as its value, or #viewDetached when the quoted post's postgate detaches this post; unreadable, blocked or nonexistent all give the same #viewNotFound. A quoted public post is shown only when this AppView stores it; otherwise, for record and recordWithMedia embeds alike, embed is absent and the client renders the quote from record.embed. Quotes are not followed beyond one level. A private post's video plays from its author's PDS: playlist is the MP4 blob, and there is no thumbnail. A quoted public post's video plays as the operator configures, from the video CDN (playlist and thumbnail) or from its author's PDS.",
+          "description": "The stock view of the record's embed, built from either $type form. A quoted private post is read for the requester as any private post is: readable gives #viewRecord with the decoded record as its value, or #viewDetached when the quoted post's postgate detaches this post; unreadable, blocked or nonexistent all give the same #viewNotFound. #viewUnavailable (app.nearhorizon.private.defs#viewUnavailable) is given instead while this AppView is degraded, for every private quote it does not show, and otherwise for the requester's own quoted private post that cannot be read yet; retry after its retryAfter seconds. A quoted public post is shown only when this AppView stores it; otherwise, for record and recordWithMedia embeds alike, embed is absent and the client renders the quote from record.embed. Quotes are not followed beyond one level. A private post's video plays from its author's PDS: playlist is the MP4 blob, and there is no thumbnail. A quoted public post's video plays as the operator configures, from the video CDN (playlist and thumbnail) or from its author's PDS.",
           "refs": [
             "app.bsky.embed.images#view",
             "app.bsky.embed.external#view",
@@ -173,6 +173,46 @@
         "quote": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
         "reply": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
         "repost": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" }
+      }
+    },
+    "unavailablePost": {
+      "type": "object",
+      "description": "One of the requester's own private posts this response read and could not serve yet: the cause clears without any record changing.",
+      "required": [
+        "uri",
+        "reason"
+      ],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "reason": {
+          "type": "string",
+          "knownValues": [
+            "syncing",
+            "indexing"
+          ],
+          "description": "syncing: this AppView has not yet seen every change the post's read depends on; indexing: the post's author or audience owner is still being indexed."
+        }
+      }
+    },
+    "viewUnavailable": {
+      "type": "object",
+      "description": "A quoted private post this AppView cannot show yet, in place of app.bsky.embed.record#viewNotFound: while degraded, for every private quote it does not show (whether or not the post exists or is readable); otherwise only for the requester's own post that cannot be read yet. Not a statement that the post is gone.",
+      "required": [
+        "uri",
+        "unavailable",
+        "retryAfter"
+      ],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "unavailable": {
+          "type": "boolean",
+          "const": true
+        },
+        "retryAfter": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Seconds to wait before asking again."
+        }
       }
     }
   }

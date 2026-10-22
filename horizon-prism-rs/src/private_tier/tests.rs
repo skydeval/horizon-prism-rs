@@ -251,6 +251,8 @@ impl Fixture {
             page_reads_factor: read.page_reads_factor,
             walk_batch_max: read.walk_batch_max,
             head_fallback: read.head_fallback,
+            degraded_retry_min_secs: read.degraded_retry_min_secs,
+            degraded_retry_max_secs: read.degraded_retry_max_secs,
             floor_ms: PrivateReadFloors {
                 get_posts: ms,
                 get_post_thread: ms,
@@ -566,12 +568,18 @@ async fn private_reads_round_trip_and_every_miss_is_uniform() {
     assert_eq!((status, body.as_str()), (200, r#"{"feed":[]}"#));
 
     // Stale private watermark: a miss for everyone, including the owner.
-    let stale = serve(f.state(Some(Duration::from_secs(600)))).await;
+    // Degraded (degraded-mode design §3.3), every anchor miss is the same
+    // `503 Unavailable`, a global answer; these repos have no chain yet, so
+    // the head fallback cannot serve them.
+    // 602 s behind: a quarter is 150.5, so 151 for the next four seconds.
+    let stale = serve(f.state(Some(Duration::from_secs(602)))).await;
     let (status, body, _) = get(&stale, THREAD, &format!("uri={post}"), BOB, BOB_KEY).await;
-    assert_eq!((status, body.as_str()), (400, not_found.as_str()), "stale watermark");
+    assert_eq!((status, body.as_str()), (503, r#"{"error":"Unavailable","message":"Temporarily unavailable; try again","retryAfter":151}"#), "stale watermark");
     let never = serve(f.state(None)).await;
     let (status, body, _) = get(&never, THREAD, &format!("uri={own}"), ALICE, ALICE_KEY).await;
-    assert_eq!((status, body.as_str()), (400, not_found.as_str()), "no watermark");
+    assert_eq!((status, body.as_str()), (503, r#"{"error":"Unavailable","message":"Temporarily unavailable; try again","retryAfter":300}"#), "no watermark");
+    let (status, body, _) = get(&never, THREAD, &format!("uri={missing}"), BOB, BOB_KEY).await;
+    assert_eq!((status, body.as_str()), (503, r#"{"error":"Unavailable","message":"Temporarily unavailable; try again","retryAfter":300}"#), "no watermark, no row");
 
     // Owner readiness cleared: a miss.
     let mut conn = f.pool.acquire().await.expect("conn");
