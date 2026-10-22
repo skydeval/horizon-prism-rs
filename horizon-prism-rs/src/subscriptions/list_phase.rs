@@ -260,10 +260,19 @@ pub async fn release_with(pool: &PgPool, list: &str, waiting: &Waiting) -> Resul
         .bind(list)
         .fetch_one(&mut *tx)
         .await?;
+        // A return ends the transaction first: a dropped one rolls back only
+        // when its connection is next used, and until then the row stays
+        // locked to the list phase's `SKIP LOCKED` (`Busy`).
         match state.as_deref() {
-            None => return Ok(Released::Gone { items }),
+            None => {
+                tx.rollback().await?;
+                return Ok(Released::Gone { items });
+            }
             Some("unreferenced") if !wanted => {}
-            Some(_) => return Ok(Released::Stopped { items }),
+            Some(_) => {
+                tx.rollback().await?;
+                return Ok(Released::Stopped { items });
+            }
         }
         let deleted = sqlx::query(
             "DELETE FROM subscribed_list_items WHERE ctid IN (SELECT ctid FROM subscribed_list_items WHERE list_uri = $1 LIMIT $2)",

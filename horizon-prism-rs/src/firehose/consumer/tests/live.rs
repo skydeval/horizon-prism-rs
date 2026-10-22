@@ -189,13 +189,26 @@ impl Fixture {
         self.add(&commit(repo, ops), None).await
     }
 
-    /// `n` commits with nothing to write.
+    /// `n` commits with nothing to write, added atomically (`MULTI`): a
+    /// consumer that recreates its group after a wipe sees all of them or
+    /// none, never a refill cut in two.
     pub async fn add_n(&mut self, n: usize, maxlen: Option<u64>) -> Vec<String> {
-        let mut ids = Vec::with_capacity(n);
-        for _ in 0..n {
-            ids.push(self.add(&commit(OUTSIDER, json!([])), maxlen).await);
+        if n == 0 {
+            return Vec::new();
         }
-        ids
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for _ in 0..n {
+            let cmd = pipe.cmd("XADD").arg(&self.cfg.stream_key);
+            if let Some(m) = maxlen {
+                cmd.arg("MAXLEN").arg(m);
+            }
+            cmd.arg("*");
+            for (k, v) in &commit(OUTSIDER, json!([])) {
+                cmd.arg(*k).arg(v);
+            }
+        }
+        pipe.query_async(&mut self.redis).await.expect("xadd")
     }
 
     pub async fn del_stream(&mut self) {

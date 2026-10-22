@@ -2536,6 +2536,9 @@ mod tests {
         let mut kept = KryphocronPrivateTier.local_uris(&mut conn, DID, NSID_THREADGATE, "zzzzzzzzzzzzz").await.expect("gates");
         kept.sort();
         assert_eq!(kept, [format!("at://{DID}/{NSID_THREADGATE}/3klisted"), format!("at://{DID}/{NSID_THREADGATE}/3kstored")]);
+        // Returned before `drop_db`, whose pool close waits for every
+        // connection: held, it hung the suite once.
+        drop(conn);
         db.drop_db().await;
     }
 

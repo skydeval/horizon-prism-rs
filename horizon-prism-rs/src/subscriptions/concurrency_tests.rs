@@ -919,7 +919,6 @@ async fn b74_a_mute_during_a_release_stops_it_and_an_unmute_lets_it_finish() {
         async move { count(&p, "SELECT count(*) FROM subscribed_list_items WHERE list_uri = $1", &list).await }
     };
     let applier = Applier::new(p.clone(), scope(), 0);
-    let task = tokio::spawn(applier.clone().run());
     let toggle = |mute: bool| {
         let (applier, list) = (applier.clone(), list.clone());
         async move {
@@ -932,8 +931,11 @@ async fn b74_a_mute_during_a_release_stops_it_and_an_unmute_lets_it_finish() {
         }
     };
 
-    // Mute and unmute during the release: it still finishes.
+    // Mute and unmute during the release: it still finishes. The applier
+    // starts after the first list phase, which it would otherwise race
+    // for the row (`Busy`).
     subscribe(p, M, &list).await;
+    let task = tokio::spawn(applier.clone().run());
     synced_copy(p, OWNER, &list, 50_000).await;
     let paused = hooks::arm(hooks::RELEASE_BETWEEN_BATCHES, &list);
     let started = Instant::now();

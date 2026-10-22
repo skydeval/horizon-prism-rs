@@ -447,8 +447,11 @@ async fn serve(state: PrivateState) -> String {
 /// GET with a token for `did`, returning status, raw body and elapsed time.
 async fn get(base: &str, method: &str, query: &str, did: &str, key: u8) -> (u16, String, Duration) {
     let token = mint(&signing_key(key), did, &format!("did:web:{AUDIENCE_HOST}"), Some(method));
+    // Built before the clock starts: a client's setup (its TLS roots) is
+    // no part of the answer's time, and on a loaded debug build it is slow.
+    let client = reqwest::Client::new();
     let start = Instant::now();
-    let r = reqwest::Client::new()
+    let r = client
         .get(format!("{base}/xrpc/{method}?{query}"))
         .header("authorization", format!("Bearer {token}"))
         .send()
@@ -5286,6 +5289,7 @@ async fn floors_change_no_content_in(mode: PublicMode, test: &str) {
         // At 0 nothing waits: the fastest of a few answers, each the same,
         // is under the floor (one answer alone can be slower on a loaded
         // host; a floor would hold every one).
+        let mut tooks = vec![took_0];
         for _ in 0..4 {
             if took_0 < FLOOR {
                 break;
@@ -5293,8 +5297,9 @@ async fn floors_change_no_content_in(mode: PublicMode, test: &str) {
             let (status, body, took) = get(&zero, method, &query, reader, key_of(reader)).await;
             assert_eq!(status, status_0, "{case}: {body}");
             took_0 = took_0.min(took);
+            tooks.push(took);
         }
-        assert!(took_0 < FLOOR, "{case}: at 0 the fastest of five took {took_0:?}");
+        assert!(took_0 < FLOOR, "{case}: at 0 the fastest of five took {took_0:?} (each: {tooks:?}; at the floor {took_f:?})");
         let mut v_0: Value = serde_json::from_str(&body_0).expect("json");
         let mut v_f: Value = serde_json::from_str(&body_f).expect("json");
         match (v_0.as_object_mut().and_then(|o| o.remove("cursor")), v_f.as_object_mut().and_then(|o| o.remove("cursor"))) {

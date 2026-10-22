@@ -1085,7 +1085,6 @@ mod tests {
     mod pg {
         use super::*;
 
-        const ENV: &str = "HPRS_TEST_DATABASE_URL";
         const DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 
         struct NoPrivate;
@@ -1097,41 +1096,8 @@ mod tests {
             }
         }
 
-        struct TestDb {
-            admin: PgPool,
-            pool: PgPool,
-            name: String,
-        }
-
-        impl TestDb {
-            async fn drop_db(self) {
-                self.pool.close().await;
-                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name))
-                    .execute(&self.admin)
-                    .await;
-            }
-        }
-
-        async fn fresh_db() -> Option<TestDb> {
-            let Ok(admin_url) = std::env::var(ENV) else {
-                eprintln!("{ENV} unset; skipping Postgres-backed retention test");
-                return None;
-            };
-            let admin = PgPool::connect(&admin_url).await.expect("connect admin database");
-            let name = format!("hprs_test_{}", rand::random::<u32>());
-            sqlx::query(&format!("CREATE DATABASE {name}"))
-                .execute(&admin)
-                .await
-                .expect("create test database");
-            let base = admin_url.rsplit_once('/').expect("URL with a database path").0;
-            let pool = PgPool::connect(&format!("{base}/{name}"))
-                .await
-                .expect("connect test database");
-            crate::db::migrations::MIGRATOR
-                .run(&pool)
-                .await
-                .expect("apply migrations");
-            Some(TestDb { admin, pool, name })
+        async fn fresh_db() -> Option<crate::test_support::TestDb> {
+            crate::test_support::fresh_db("retention").await
         }
 
         async fn insert_post(pool: &PgPool) -> String {

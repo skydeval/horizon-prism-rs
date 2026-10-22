@@ -7,7 +7,7 @@ use sqlx::PgPool;
 
 pub const ENV: &str = "HPRS_TEST_DATABASE_URL";
 
-/// A migrated, uniquely named database, dropped by [`TestDb::drop_db`].
+/// A uniquely named database, dropped by [`TestDb::drop_db`].
 pub struct TestDb {
     admin: PgPool,
     pub pool: PgPool,
@@ -30,14 +30,69 @@ impl TestDb {
     }
 }
 
-/// Create and migrate a fresh database, or `None` when the env var is unset.
+/// Create a fresh, fully migrated database, or `None` when the env var is
+/// unset. It is a copy of the migrated template ([`template`]), so the
+/// migrations run once per test run rather than once per test;
+/// `_sqlx_migrations` comes with the copy.
 pub async fn fresh_db(test: &str) -> Option<TestDb> {
-    let db = empty_db(test).await?;
-    crate::db::migrations::MIGRATOR
-        .run(&db.pool)
+    let Ok(admin_url) = std::env::var(ENV) else {
+        eprintln!("{ENV} unset; skipping Postgres-backed test {test}");
+        return None;
+    };
+    let template = template(&admin_url).await;
+    Some(create_db(&admin_url, &format!("TEMPLATE {template}")).await)
+}
+
+/// The migrated template database's name, built on first use. Its name
+/// carries a hash of the migration set, so a changed set gets a template
+/// of its own. Built under a Postgres advisory lock, so test binaries
+/// sharing the server build it once; marked a template only when complete,
+/// so a build that died part way is rebuilt.
+async fn template(admin_url: &str) -> &'static str {
+    static TEMPLATE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    TEMPLATE.get_or_init(|| build_template(admin_url)).await
+}
+
+async fn build_template(admin_url: &str) -> String {
+    use sqlx::Connection;
+
+    // FNV-1a over each migration's version and checksum: stable across
+    // builds, unlike `DefaultHasher`.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for m in crate::db::migrations::MIGRATOR.iter() {
+        for byte in m.version.to_le_bytes().iter().chain(m.checksum.iter()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let name = format!("hprs_template_{hash:016x}");
+    // One connection, not a pool: the cell outlives this test's runtime.
+    let mut admin = sqlx::PgConnection::connect(admin_url).await.expect("connect admin database");
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended('hprs_test_template', 0))")
+        .execute(&mut admin)
         .await
-        .expect("apply migrations");
-    Some(db)
+        .expect("template lock");
+    let built: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1 AND datistemplate)")
+        .bind(&name)
+        .fetch_one(&mut admin)
+        .await
+        .expect("read pg_database");
+    if !built {
+        for sql in [format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"), format!("CREATE DATABASE {name}")] {
+            sqlx::query(&sql).execute(&mut admin).await.expect("create template database");
+        }
+        let base = admin_url.rsplit_once('/').expect("URL with a database path").0;
+        let mut conn = sqlx::PgConnection::connect(&format!("{base}/{name}")).await.expect("connect template database");
+        crate::db::migrations::MIGRATOR.run(&mut conn).await.expect("apply migrations");
+        conn.close().await.expect("close template connection");
+        // No connections from here on: a copy needs none open to its source.
+        sqlx::query(&format!("ALTER DATABASE {name} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false"))
+            .execute(&mut admin)
+            .await
+            .expect("mark template");
+    }
+    let _ = admin.close().await;
+    name
 }
 
 /// Serve `router` on an ephemeral loopback port (fake upstreams), returning
@@ -489,14 +544,20 @@ pub async fn empty_db(test: &str) -> Option<TestDb> {
         eprintln!("{ENV} unset; skipping Postgres-backed test {test}");
         return None;
     };
-    let admin = PgPool::connect(&admin_url).await.expect("connect admin database");
+    Some(create_db(&admin_url, "").await)
+}
+
+/// A uniquely named database, created with `options` (a template or none).
+async fn create_db(admin_url: &str, options: &str) -> TestDb {
+    let admin = PgPool::connect(admin_url).await.expect("connect admin database");
     let name = format!("hprs_test_{}", rand::random::<u32>());
-    sqlx::query(&format!("CREATE DATABASE {name}"))
+    sqlx::query(&format!("CREATE DATABASE {name} {options}"))
         .execute(&admin)
         .await
         .expect("create test database");
     // As every deployed pool runs (`db::pool`): no JIT. The shared walk's
-    // recursive CTEs carry estimates far past `jit_above_cost`.
+    // recursive CTEs carry estimates far past `jit_above_cost`. A template
+    // does not pass on its settings, so each database gets its own.
     sqlx::query(&format!("ALTER DATABASE {name} SET jit = off"))
         .execute(&admin)
         .await
@@ -505,5 +566,5 @@ pub async fn empty_db(test: &str) -> Option<TestDb> {
     let pool = PgPool::connect(&format!("{base}/{name}"))
         .await
         .expect("connect test database");
-    Some(TestDb { admin, pool, name })
+    TestDb { admin, pool, name }
 }

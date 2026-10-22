@@ -10,6 +10,61 @@ commit.
 
 ## [Unreleased]
 
+### Changed (tests: one migrated template per run, #811)
+
+- **`test_support::fresh_db`** no longer replays every migration for each
+  test. The first call in a test run builds a migrated template database,
+  `hprs_template_<hash>`, named by an FNV-1a hash of the migration set's
+  versions and checksums, so a changed set gets a template of its own. It
+  is built under a Postgres advisory lock, so test binaries sharing the
+  server build it once, and marked `IS_TEMPLATE` (with connections off)
+  only when complete, so a build that died part way is rebuilt. Each test
+  then gets `CREATE DATABASE hprs_test_<n> TEMPLATE …`, with
+  `_sqlx_migrations` copied along; `jit = off` is still set per database,
+  since a template does not pass on its settings. `empty_db` is unchanged
+  for the migration tests, and each test keeps its own database and
+  `drop_db`.
+- The retention tests' own copy of `fresh_db` now calls the shared one.
+- Full suite on the build box: 1,491.6 s before (1,213 passed, 18
+  ignored), with the throwaway Postgres also tuned for tests (tmpfs data
+  directory; `fsync`, `synchronous_commit` and `full_page_writes` off):
+  874.8 s after (1,213 passed, 18 ignored), wall time 24 min 56 s to
+  14 min 40 s. The test process, not Postgres, is now what the suite
+  waits on.
+
+### Fixed (test reliability in the faster suite, #812)
+
+The faster suite runs its tests closer together, and five of them failed or
+hung in it.
+
+- **`a_second_wipe_after_the_gap_runs_a_second_gap`** failed once in the
+  faster suite: its live consumer recreated the group at `$` between two of
+  the refill's `XADD`s, so the refill's later entries were delivered and
+  the third processed entry was one of them, not the entry added after the
+  gap. The fixture's `add_n` now adds its entries in one `MULTI`, so a
+  recreation sees a refill whole or not at all.
+- **`list_phase::release_with`** returned `Gone` or `Stopped` by dropping
+  its transaction, which holds the list's row `FOR UPDATE`. A dropped
+  transaction rolls back only when its connection is next used, so until
+  then the list phase's `SKIP LOCKED` found the row held and answered
+  `Busy`; `a_resubscription_stops_a_release` failed on that. Both returns
+  now roll back first. In service the effect was a list phase put off to
+  its next pass.
+- **`b74_a_mute_during_a_release_stops_it_and_an_unmute_lets_it_finish`**
+  started its applier before its first direct list phase, which then raced
+  the applier for the row and got `Busy`. The applier now starts after it,
+  as in the other B-74 tests.
+- **`floors_change_no_content_off`** timed each answer from before building
+  its HTTP client, so a client's setup on a loaded debug build counted
+  toward "under the floor at 0" (in two runs the fastest of five was 408
+  and 410 ms against 400). The client is now built before the clock
+  starts, and a failure lists each attempt's time. It passed in the next
+  full run; that the setup was the whole cause is not proven.
+- **`the_private_plan_keeps_gates_of_postprivate_records`** held a pooled
+  connection across `drop_db`, whose pool close waits for every
+  connection; it hung one run for 53 minutes. The connection is now
+  returned first.
+
 ### Added (admin UI: Horizon-Prism name, Appearance, menu order, #810)
 
 - Settings › Appearance (`/admin/settings/appearance`): each operator
