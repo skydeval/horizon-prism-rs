@@ -32,6 +32,7 @@ fn statements(cap: u32) -> Vec<(&'static str, String)> {
         ("getUnreadCount slice", schema::unread_slice_statement(cap)),
         ("quoteCount bounded", schema::quote_counts_bounded_statement(cap, schema::climb_keys(cap))),
         ("getUnreadCount bounded", schema::unread_bounded_statement(cap, schema::climb_keys(cap))),
+        ("notServed", schema::not_served_statement(cap)),
     ]
 }
 

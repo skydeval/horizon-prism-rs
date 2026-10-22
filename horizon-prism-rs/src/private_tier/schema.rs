@@ -1020,6 +1020,224 @@ pub(super) async fn fact8(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> R
     }))
 }
 
+// ---- `notServed` (docs/internal/design/not-served-reason.md §4) ----
+//
+// The read rule's statement with the reader removed: `$1` is bound to the
+// empty string, which no stored row names (every stored DID passed
+// `Did::is_valid`), so every reader-relative term is inert and no row takes
+// the self arm; stage 1 drops rule 8. What is left is the verdict for a
+// reader about whom nothing is known.
+//
+// Slice N1 builds the statement alone; `decorate` reads it from N2, until
+// which the items below are allowed to be unread outside tests.
+
+/// The four columns of the `notServed` statement for one of the author's
+/// rows (§4.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct NotServedRow {
+    /// The read rule passes for a clean reader.
+    pub served: bool,
+    /// Fact 8's `anchored`, and G's row is stored.
+    pub placed: bool,
+    /// The author is O, or O is `active`, the author and O have no block,
+    /// and the author stands under G.
+    pub standing_ok: bool,
+    /// The chain above is `cap` rows long without reaching its stop (only
+    /// for walked rows that are not served).
+    pub capped: bool,
+}
+
+/// The post-level thread reasons a post is not served (§4.1): `placement`,
+/// `standing`, `chainCap`. All false when the post is served.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct ThreadFault {
+    pub placement: bool,
+    pub standing: bool,
+    pub chain_cap: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ThreadFault {
+    /// The reasons from the statement's columns (§4.1). `placement` is also
+    /// the catch-all: a post that is placed, standing and not capped but not
+    /// served has a fault in its chain, so a post not served always has a
+    /// reason.
+    pub(super) fn of(row: NotServedRow) -> Self {
+        if row.served {
+            return Self::default();
+        }
+        Self {
+            placement: !row.placed || (row.standing_ok && !row.capped),
+            standing: row.placed && !row.standing_ok,
+            chain_cap: row.capped,
+        }
+    }
+
+    /// No reason.
+    pub(super) fn is_empty(self) -> bool {
+        !(self.placement || self.standing || self.chain_cap)
+    }
+
+    /// The reasons' wire values, in the lexicon's order (§3.4): `placement`,
+    /// `standing`, `chainCap`.
+    pub(super) fn names(self) -> Vec<&'static str> {
+        [(self.placement, "placement"), (self.standing, "standing"), (self.chain_cap, "chainCap")]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect()
+    }
+}
+
+/// The cap probe (§4.3) for the `s1` row: a structural climb from its
+/// parent, by primary key, at most `cap` rows, each agreeing on the root;
+/// true when it holds exactly `cap` distinct rows and none is a stop (a
+/// thread's root or a thread reply by O, O being the DID of the root's URI;
+/// a branch's first row whose parent is not a `postPrivate` record). It
+/// reads `private_posts` only.
+#[cfg_attr(not(test), allow(dead_code))]
+fn cap_probe(cap: u32) -> String {
+    let thread = is_private("s1.reply_root_uri");
+    let stop = |x: &str| {
+        let parent_private = is_private(&format!("{x}.parent"));
+        format!(
+            "(CASE WHEN {thread} THEN {x}.uri = s1.reply_root_uri \
+                    OR ({x}.author = split_part(s1.reply_root_uri, '/', 3) AND {parent_private}) \
+                  ELSE NOT {parent_private} END)"
+        )
+    };
+    format!(
+        "(WITH RECURSIVE up(uri, parent, author, hop) AS ( \
+            SELECT s.uri, s.reply_parent_uri, s.author_did, 1 FROM private_posts s \
+            WHERE s.uri = s1.reply_parent_uri AND {agree} \
+            UNION ALL \
+            SELECT s.uri, s.reply_parent_uri, s.author_did, u.hop + 1 \
+            FROM up u JOIN private_posts s ON s.uri = u.parent \
+            WHERE u.hop < {cap} AND NOT {stop_u} AND {agree} \
+          ) \
+          SELECT count(*) = {cap} AND count(DISTINCT up.uri) = {cap} AND NOT COALESCE(bool_or({stop_up}), false) FROM up)",
+        agree = agree("s.uri", "s.reply_root_uri", "s1.reply_root_uri"),
+        stop_u = stop("u"),
+        stop_up = stop("up"),
+    )
+}
+
+/// The `notServed` statement's final SELECT over [`PV_JOIN`] (§4.1), one
+/// row per `s1` row: its URI, `served`, `placed`, `standing_ok`, `capped`,
+/// each `COALESCE`d to false.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn not_served_final(cap: u32) -> String {
+    let served = "COALESCE(s1.s1ok AND (NOT s1.walks OR pv.ok), false)";
+    format!(
+        "SELECT s1.uri, {served} AS served, \
+           COALESCE(an.uri IS NOT NULL AND {role} AND {anchor_owned} AND {post_owned} AND {anchor_gate} AND a.uri IS NOT NULL, false) AS placed, \
+           COALESCE(s1.author_did = s1.owner OR ( \
+             (SELECT x.account_status FROM actors x WHERE x.did = s1.owner) = 'active' \
+             AND NOT {author_owner} AND {standing}), false) AS standing_ok, \
+           COALESCE(CASE WHEN NOT {served} AND s1.walks THEN {probe} END, false) AS capped \
+         FROM {PV_JOIN} \
+         LEFT JOIN private_posts an ON an.uri = s1.anchor \
+         LEFT JOIN private_audiences a ON a.uri = s1.gov",
+        role = role_kind("s1", "an"),
+        anchor_owned = owned("an.audience_uri", "an.author_did"),
+        post_owned = owned("s1.audience_uri", "an.author_did"),
+        anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
+        author_owner = blocked("s1.author_did", "s1.owner"),
+        standing = standing("s1.author_did", "s1.owner", &follows_verified("s1.owner"), false),
+        probe = cap_probe(cap),
+    )
+}
+
+/// The `notServed` statement (§4.1): `$1` the empty reader, `$2` the URIs,
+/// `$3` the author. `c` holds only the author's own rows among `$2`; stage 1
+/// is [`stage1_terms`] without rule 8.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn not_served_statement(cap: u32) -> String {
+    let c = format!("SELECT {COLS} FROM private_posts p WHERE p.uri = ANY($2) AND p.author_did = $3");
+    let stage1 = stage1_terms(false).join(" AND ");
+    #[cfg(test)]
+    if PER_KEY.with(std::cell::Cell::get) {
+        return walked_per_key_with(&c, "", &not_served_final(cap), cap, &stage1);
+    }
+    walked_with(&c, "", &not_served_final(cap), cap, &stage1)
+}
+
+/// The statement's columns for `author`'s rows among `uris`, by URI; a URI
+/// not by `author`, or not stored, has no entry (§4.1).
+///
+/// # Errors
+///
+/// Database errors.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) async fn not_served_rows(
+    pool: &PgPool,
+    author: &str,
+    uris: &[String],
+    cap: u32,
+) -> Result<HashMap<String, NotServedRow>, sqlx::Error> {
+    not_served_rows_sliced(pool, author, uris, cap, climb_keys(cap)).await
+}
+
+/// [`not_served_rows`] with K given: past `k` URIs, in slices of `k` inside
+/// one [`SLICED`] transaction, so every slice reads one snapshot (§4.1).
+///
+/// # Errors
+///
+/// Database errors.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) async fn not_served_rows_sliced(
+    pool: &PgPool,
+    author: &str,
+    uris: &[String],
+    cap: u32,
+    k: usize,
+) -> Result<HashMap<String, NotServedRow>, sqlx::Error> {
+    type Row = (String, bool, bool, bool, bool);
+    let mut out = HashMap::new();
+    if uris.is_empty() {
+        return Ok(out);
+    }
+    let sql = not_served_statement(cap);
+    let rows: Vec<Row> = if uris.len() <= k {
+        sqlx::query_as(&sql).bind("").bind(uris).bind(author).fetch_all(pool).await?
+    } else {
+        // Each URI once, so that no row is returned by two slices.
+        let mut distinct = uris.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut tx = pool.begin_with(SLICED).await?;
+        let mut rows = Vec::new();
+        for slice in distinct.chunks(k.max(1)) {
+            let part: Vec<Row> = sqlx::query_as(&sql).bind("").bind(slice).bind(author).fetch_all(&mut *tx).await?;
+            rows.extend(part);
+        }
+        tx.commit().await?;
+        rows
+    };
+    for (uri, served, placed, standing_ok, capped) in rows {
+        out.insert(uri, NotServedRow { served, placed, standing_ok, capped });
+    }
+    Ok(out)
+}
+
+/// The thread reasons for `author`'s rows among `uris` that are not served,
+/// by URI (§4.1, §4.4): a URI served, not by `author` or not stored has no
+/// entry.
+///
+/// # Errors
+///
+/// Database errors.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) async fn not_served(pool: &PgPool, author: &str, uris: &[String], cap: u32) -> Result<HashMap<String, ThreadFault>, sqlx::Error> {
+    let rows = not_served_rows(pool, author, uris, cap).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(uri, row)| (uri, ThreadFault::of(row)))
+        .filter(|(_, fault)| !fault.is_empty())
+        .collect())
+}
+
 /// The batch loop (§3.2.1): a batched shape's `c` rows are evaluated in
 /// batches, in the shape's key order, until `need` rows pass or the rows run
 /// out. The first batch is `first` rows, and each later one twice the last,

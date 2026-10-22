@@ -23,6 +23,8 @@ mod plaintext;
 mod media;
 // Private blocks only with a member side (member-blocks-only design).
 mod member_blocks;
+// The author-only `notServed` marker (not-served-reason design).
+mod not_served;
 // Private notification preferences (private-notification-prefs design).
 mod prefs;
 mod round;

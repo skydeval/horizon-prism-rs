@@ -10,6 +10,19 @@ commit.
 
 ## [Unreleased]
 
+### Added (notServed N1: the statement, #808)
+
+- `schema::not_served`: for the caller's own private posts, whether each
+  would be served to its audience and, if not, the post-level thread
+  reasons (`placement`, `standing`, `chainCap`). It is the read rule's own
+  statement (the shared walk and stage 1, from the same builders) with the
+  reader bound to the empty string and rule 8 left out, so every term that
+  depends on who reads is inert; a structural probe, run only for walked
+  rows that fail, tells a chain longer than `private_read.max_chain` from
+  a broken one. One statement per call, in slices of `climb_keys(cap)` in
+  one snapshot past that. Only rows by the given author are read.
+- No wire change: nothing calls it yet (N2 does).
+
 ### Added (fast reads F-G: notification subjects, #806)
 
 - `app.nearhorizon.private.listNotifications` items whose `reasonSubject`
