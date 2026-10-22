@@ -208,6 +208,9 @@ pub const FEATURES: &[&str] = &[
     // `reasonSubjectPost` on listNotifications items (fast-reads design
     // §5.2 B-3, F-G).
     "private.notificationSubjects",
+    // `notServed` on the author's own private post views (not-served-reason
+    // design, K6-L3).
+    "private.notServed",
 ];
 
 /// The private tier as the rest of the crate may use it.

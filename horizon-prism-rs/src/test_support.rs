@@ -263,6 +263,15 @@ pub mod hooks {
     /// Private-encode T-D2: the author's `droppedFields` marker is not set,
     /// as if its code were removed ([`injected`]). Key: the post's URI.
     pub const DROPPED_MARKER_OFF: &str = "pe_dropped_marker_off";
+    /// Not-served-reason T-N3: the author's `notServed` marker is not set,
+    /// neither `overClaim` in the pipeline nor the thread reasons in
+    /// `decorate`, as if its code were removed ([`injected_in`]). Key:
+    /// `<database>/<caller>`.
+    pub const NOT_SERVED_OFF: &str = "ns_not_served_off";
+    /// Not-served-reason T-N3, T-N8: a counting site, hit once each time
+    /// `decorate` runs the `notServed` statement ([`injected_in`]). Key:
+    /// `<database>/<caller>`.
+    pub const NOT_SERVED_RUN: &str = "ns_not_served_run";
 
     /// Scope recency T-R5, T-R6, T-R6b, T-R8, T-R16: the daily sweep, its
     /// holds computed and written and its candidates chosen, before the

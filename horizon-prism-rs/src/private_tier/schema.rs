@@ -1027,14 +1027,10 @@ pub(super) async fn fact8(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> R
 // `Did::is_valid`), so every reader-relative term is inert and no row takes
 // the self arm; stage 1 drops rule 8. What is left is the verdict for a
 // reader about whom nothing is known.
-//
-// Slice N1 builds the statement alone; `decorate` reads it from N2, until
-// which the items below are allowed to be unread outside tests.
 
 /// The four columns of the `notServed` statement for one of the author's
 /// rows (§4.1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct NotServedRow {
     /// The read rule passes for a clean reader.
     pub served: bool,
@@ -1051,14 +1047,12 @@ pub(super) struct NotServedRow {
 /// The post-level thread reasons a post is not served (§4.1): `placement`,
 /// `standing`, `chainCap`. All false when the post is served.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ThreadFault {
     pub placement: bool,
     pub standing: bool,
     pub chain_cap: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ThreadFault {
     /// The reasons from the statement's columns (§4.1). `placement` is also
     /// the catch-all: a post that is placed, standing and not capped but not
@@ -1096,7 +1090,6 @@ impl ThreadFault {
 /// thread's root or a thread reply by O, O being the DID of the root's URI;
 /// a branch's first row whose parent is not a `postPrivate` record). It
 /// reads `private_posts` only.
-#[cfg_attr(not(test), allow(dead_code))]
 fn cap_probe(cap: u32) -> String {
     let thread = is_private("s1.reply_root_uri");
     let stop = |x: &str| {
@@ -1126,7 +1119,6 @@ fn cap_probe(cap: u32) -> String {
 /// The `notServed` statement's final SELECT over [`PV_JOIN`] (§4.1), one
 /// row per `s1` row: its URI, `served`, `placed`, `standing_ok`, `capped`,
 /// each `COALESCE`d to false.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn not_served_final(cap: u32) -> String {
     let served = "COALESCE(s1.s1ok AND (NOT s1.walks OR pv.ok), false)";
     format!(
@@ -1152,7 +1144,6 @@ pub(super) fn not_served_final(cap: u32) -> String {
 /// The `notServed` statement (§4.1): `$1` the empty reader, `$2` the URIs,
 /// `$3` the author. `c` holds only the author's own rows among `$2`; stage 1
 /// is [`stage1_terms`] without rule 8.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn not_served_statement(cap: u32) -> String {
     let c = format!("SELECT {COLS} FROM private_posts p WHERE p.uri = ANY($2) AND p.author_did = $3");
     let stage1 = stage1_terms(false).join(" AND ");
@@ -1169,7 +1160,6 @@ pub(super) fn not_served_statement(cap: u32) -> String {
 /// # Errors
 ///
 /// Database errors.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) async fn not_served_rows(
     pool: &PgPool,
     author: &str,
@@ -1185,7 +1175,6 @@ pub(super) async fn not_served_rows(
 /// # Errors
 ///
 /// Database errors.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) async fn not_served_rows_sliced(
     pool: &PgPool,
     author: &str,
@@ -1228,7 +1217,6 @@ pub(super) async fn not_served_rows_sliced(
 /// # Errors
 ///
 /// Database errors.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) async fn not_served(pool: &PgPool, author: &str, uris: &[String], cap: u32) -> Result<HashMap<String, ThreadFault>, sqlx::Error> {
     let rows = not_served_rows(pool, author, uris, cap).await?;
     Ok(rows

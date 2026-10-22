@@ -10,6 +10,32 @@ commit.
 
 ## [Unreleased]
 
+### Added (notServed N2: the author's marker, #809)
+
+- `app.nearhorizon.private.defs#privatePostView.notServed`: on the
+  author's own top-level view only, present when this AppView would not
+  serve the post to any reader of its audience, with each post-level
+  reason once, in order: `placement` (not attached to a thread its
+  audience can read), `standing` (the author does not stand under the
+  thread's governing audience, or the thread owner's account is not
+  active), `chainCap` (the chain above is longer than
+  `private_read.max_chain`), `overClaim` (the record's clear fields claim
+  what its content does not carry). Absent means served. Never on another
+  reader's view, never on a quoted view; per-reader exclusions (a block
+  with a reader, a reader outside the audience, a reader's stale head) never
+  set it, and no value names or distinguishes a block. It follows the read
+  rule live: re-read rather than cache it.
+- `overClaim` comes from the read's clear-field check; the thread reasons
+  from one `schema::not_served` statement per response that shows any of
+  the caller's own posts, in `decorate` on every endpoint (getPosts,
+  getPostThread, the feeds and their reply context, getReplies,
+  getBookmarks, searchPosts, notification subjects). A response with no
+  post by the caller runs nothing new, and every other reader's view is
+  byte-identical to before.
+- `private_read_not_served_total{reason}` (`placement`, `standing`,
+  `chain_cap`, `over_claim`): one per own view marked, per reason.
+- `getMembership` lists `private.notServed`. No config key.
+
 ### Added (notServed N1: the statement, #808)
 
 - `schema::not_served`: for the caller's own private posts, whether each

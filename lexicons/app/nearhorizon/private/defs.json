@@ -58,6 +58,11 @@
           "items": { "type": "string", "knownValues": ["facets", "embed"] },
           "description": "Only on the author's own view: the parts of the post's encoded content that this view leaves out because the read refused them (the wrong type, or over 64 KiB). Absent when nothing was left out, and always absent for any other reader. A client re-encoding the post from this view would lose these parts."
         },
+        "notServed": {
+          "type": "array",
+          "items": { "type": "string", "knownValues": ["placement", "standing", "chainCap", "overClaim"] },
+          "description": "Only on the author's own view, while getMembership lists 'private.notServed': present when this AppView would not serve the post to any reader of its audience, with each post-level reason once, in this order. placement: the post is not attached to a thread its audience can read (no valid thread root or branch root, an audience not owned by the thread's owner, the governing audience's record missing, the root or a post above it hidden or unreadable to everyone). standing: the author does not stand under the thread's governing audience, or the thread owner's account is not active. chainCap: the chain of replies above the post is longer than this AppView walks. overClaim: the record's clear mentionDids, quote or mediaKinds claim something its content does not carry. Absent when the post is served to its audience, and always absent for any other reader and on a quoted post. Whether any reader is inside the audience, and anything that depends on who the reader is, is not considered."
+        },
         "viewer": {
           "type": "ref",
           "ref": "app.bsky.feed.defs#viewerState",

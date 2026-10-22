@@ -47,6 +47,9 @@ pub(super) const METRIC_CONTENT: &str = "private_read_content_total";
 /// `mentions`, `media`), by `result` (`match`, `under`, `over`)
 /// (private-encode design §6.2).
 pub(super) const METRIC_INDEX_CHECK: &str = "private_read_index_check_total";
+/// `notServed`'s content reason (not-served-reason design §2.1): the
+/// record's clear fields over-claim.
+pub(super) const OVER_CLAIM: &str = "overClaim";
 /// The decode deadline after handler start (§6.3 step 11).
 pub(super) const DECODE_BUDGET: Duration = Duration::from_secs(2);
 
@@ -523,9 +526,16 @@ async fn read_inner(
         Restored::Content { facets, embed, .. } => (facets.raw(row.facets.as_ref()), embed.raw(row.embed.as_ref())),
     };
     let expected = clear_fields::index(&clear_fields::derive(raw_facets, raw_embed));
-    if index_check(&expected, &row) && !is_author {
+    let over_claim = index_check(&expected, &row);
+    if over_claim && !is_author {
         return Err(Miss::IndexMismatch);
     }
+    // The author's `notServed` (not-served-reason design §4.4): an
+    // over-claim misses for every other reader, so the post is not served.
+    // `decorate` adds the thread reasons in front of it on a top-level view.
+    #[cfg(test)]
+    let over_claim = over_claim && !crate::test_support::hooks::injected_in(crate::test_support::hooks::NOT_SERVED_OFF, &env.pool, &caller.did);
+    let over_claim = over_claim && is_author;
     // The author's marker (§8.4): the payload fields this read leaves out.
     let mut dropped_fields: Vec<&str> = Vec::new();
     if let Restored::Content { facets, embed, .. } = &restored
@@ -596,6 +606,9 @@ async fn read_inner(
     });
     if !dropped_fields.is_empty() {
         view["droppedFields"] = json!(dropped_fields);
+    }
+    if over_claim {
+        view["notServed"] = json!([OVER_CLAIM]);
     }
     // The media part of `embed` (§4.2); the handler adds the record part. A
     // video plays from the author's PDS (private-video-pds design).

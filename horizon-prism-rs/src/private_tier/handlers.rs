@@ -27,7 +27,7 @@ use super::emit::{
     BookmarkView, ContextPost, FeedItem, NotificationRecord, NotificationView, PrivateEmit, PrivateResponse, QuoteItem, ReplyContext,
     ThreadNode, ThreadParent,
 };
-use super::pipeline::{self, PipelineEnv, RequestState};
+use super::pipeline::{self, OVER_CLAIM, PipelineEnv, RequestState};
 use super::{media, stages};
 use super::schema::{self, AuthorFilter, Interaction};
 use super::cursor as sealed;
@@ -444,6 +444,61 @@ async fn viewer_state(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&m
     Ok(())
 }
 
+/// Metric: the author's own views marked `notServed`, one per view and
+/// `reason` (not-served-reason design §4.5).
+pub(super) const METRIC_NOT_SERVED: &str = "private_read_not_served_total";
+
+/// `notServed` on the caller's own top-level views (not-served-reason
+/// design §4.4): the thread reasons from one `schema::not_served` statement
+/// over the page's own posts, then `overClaim` where the pipeline set it.
+/// A page with no post by the caller runs nothing and changes nothing, so
+/// every other reader's view is as it was. Quoted posts never come here.
+async fn not_served(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&mut PrivateEmit<Value>]) -> Result<(), XrpcError> {
+    let me = caller.did.as_str();
+    let mut own: Vec<String> = posts.iter().filter_map(|p| view_uri(p)).filter(|u| uri_author(u) == Some(me)).collect();
+    if own.is_empty() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    {
+        use crate::test_support::hooks;
+        if hooks::injected_in(hooks::NOT_SERVED_OFF, &s.env.pool, me) {
+            return Ok(());
+        }
+        let _ = hooks::injected_in(hooks::NOT_SERVED_RUN, &s.env.pool, me);
+    }
+    own.sort_unstable();
+    own.dedup();
+    let faults = schema::not_served(&s.env.pool, me, &own, s.env.max_chain).await?;
+    for post in posts.iter_mut() {
+        let Some(uri) = view_uri(post).filter(|u| uri_author(u) == Some(me)) else {
+            continue;
+        };
+        let mut reasons = faults.get(&uri).copied().map(schema::ThreadFault::names).unwrap_or_default();
+        let over = post
+            .view()
+            .get("notServed")
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(|r| r.as_str() == Some(OVER_CLAIM)));
+        if over {
+            reasons.push(OVER_CLAIM);
+        }
+        if reasons.is_empty() {
+            continue;
+        }
+        for reason in &reasons {
+            let label = match *reason {
+                "chainCap" => "chain_cap",
+                OVER_CLAIM => "over_claim",
+                other => other,
+            };
+            metrics::counter!(METRIC_NOT_SERVED, "reason" => label).increment(1);
+        }
+        post.decorate("notServed", json!(reasons));
+    }
+    Ok(())
+}
+
 /// The thread root a post claims (private-posting design §3.1, C-18): its
 /// record's `reply.root.uri`, or the post itself when it is top-level. The
 /// claim is in the record the reader already reads.
@@ -611,6 +666,7 @@ async fn decorate(
     operator_labels(hydration, posts).await?;
     counts(s, caller, posts).await?;
     viewer_state(s, caller, posts).await?;
+    not_served(s, caller, posts).await?;
     let read: HashSet<String> = posts.iter().filter_map(|p| view_uri(p)).chain(roots_read.iter().cloned()).collect();
     gate_state(s, caller, hydration, posts, &read).await?;
     let quotes: Vec<Option<(Value, String)>> = posts

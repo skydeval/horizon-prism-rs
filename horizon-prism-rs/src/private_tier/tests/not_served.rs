@@ -1,8 +1,15 @@
 //! `notServed` (docs/internal/design/not-served-reason.md §11): the
 //! statement against the read rule (T-N1), the cap probe (T-N5), standing
-//! (T-N7) and the statement's own checks (T-N12).
+//! (T-N7) and the statement's own checks (T-N12); on the wire, per-reader
+//! exclusions never mark (T-N2), never for others (T-N3), `overClaim`
+//! (T-N4), labels (T-N6), the statement's runs (T-N8), every endpoint
+//! (T-N9), stability (T-N10), served cases (T-N11) and the feature (T-N13).
+
+use metrics_exporter_prometheus::PrometheusHandle;
 
 use super::*;
+use crate::private_tier::handlers::METRIC_NOT_SERVED;
+use crate::test_support::hooks;
 
 /// The reasons the statement gives `author`'s `uri`, and its columns; `None`
 /// when it returns no row for it.
@@ -314,5 +321,301 @@ async fn tn5_chain_cap() {
         }
         w.check(whole.len() == uris.iter().filter(|u| u.contains(who)).count(), format!("{who}: {} rows", whole.len()));
     }
+    w.finish().await;
+}
+
+// ---- On the wire (N2) ----
+
+/// Every private post view of `uri` anywhere in `body`: an object with that
+/// `uri` and a `record` (a quoted `#viewRecord` has `value` instead).
+fn views_of(body: &Value, uri: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    match body {
+        Value::Object(m) => {
+            if m.get("uri").and_then(Value::as_str) == Some(uri) && m.contains_key("record") {
+                out.push(body.clone());
+            }
+            for v in m.values() {
+                out.extend(views_of(v, uri));
+            }
+        }
+        Value::Array(a) => {
+            for v in a {
+                out.extend(views_of(v, uri));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The hook key of `did` in this walk's database.
+fn hook_key(w: &Walk, did: &str) -> String {
+    format!("{}/{did}", w.f.pool.connect_options().get_database().unwrap_or_default())
+}
+
+/// `private_read_not_served_total{reason}`.
+fn marked(handle: &PrometheusHandle, reason: &str) -> f64 {
+    crate::test_support::series(&handle.render(), METRIC_NOT_SERVED, &[&format!("reason=\"{reason}\"")]).unwrap_or(0.0)
+}
+
+/// `reader`'s `getPosts` of `uris`: the raw body.
+async fn body_of(w: &Walk, reader: &str, uris: &[&str]) -> String {
+    posts_of(&w.base, reader, uris).await.0
+}
+
+/// T-N4, T-N9, T-N10 and T-N3's quote: Bob's reply to T with a forged
+/// `mentionDids` is `["overClaim"]` on every endpoint that shows it to him
+/// (getPosts, getPostThread as anchor, parent and reply, getAuthorFeed and
+/// its reply context, getTimeline, getReplies, getBookmarks, searchPosts,
+/// a notification's subject), and Dave misses it; with a dropped embed as
+/// well, `droppedFields` and `notServed` both; quoted, never; the metric
+/// counts it; two reads give the same bytes; a rewrite heals it.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn tn4_tn9_over_claim_on_every_endpoint() {
+    let Some(mut w) = Walk::new("tn4-not-served", Layout::SamePds, Some("followers"), &[]).await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let (t, aud) = (w.root.clone(), w.aud.clone());
+    let reply = json!({"root": {"uri": t, "cid": "bafyroot"}, "parent": {"uri": t, "cid": "bafyparent"}});
+    let mut rec = w.f.new_form_record(BOB, "3kns4forged2", "forgedwords", None, None, &aud).await;
+    rec["reply"] = reply.clone();
+    rec["mentionDids"] = json!([CAROL]);
+    let forged = w.f.put_post(BOB, "3kns4forged2", rec).await;
+    let raw = br#"{"text":"t","embed":[1]}"#.iter().fold(vec![0xFF], |mut v, b| {
+        v.push(*b);
+        v
+    });
+    let mut rec = w.f.encoded_bytes(BOB, "3kns4both222", &raw, Some(&aud)).await;
+    rec["reply"] = reply.clone();
+    rec["mentionDids"] = json!([CAROL]);
+    let both = w.f.put_post(BOB, "3kns4both222", rec).await;
+    let child = w.reply(BOB, "3kns4child22", &forged).await;
+    let bob_aud = w.f.audience(BOB, "3kns4bobaud2", Some("list"), &[CAROL, DAVE]).await;
+    let quote = w.f.post_with(BOB, "3kns4quote22", &bob_aud, quote_of(&forged)).await;
+    w.f.ingest(CAROL, LIKE, "3kns4like222", subject_record(LIKE, &forged, "2026-10-01T10:00:00Z")).await;
+    w.f.ready_all().await;
+    assert_eq!(post(&w.base, CREATE_BOOKMARK, &json!({"uri": forged, "cid": "bafyany"}), BOB).await.0, 200);
+    let want = json!(["overClaim"]);
+
+    // getPosts: the author's view, and Dave's miss.
+    let before = marked(&handle, "over_claim");
+    let (body, view) = one_post(&w.base, BOB, &forged).await;
+    w.check(view["notServed"] == want, format!("getPosts: {view}"));
+    w.check(marked(&handle, "over_claim") == before + 1.0, "the metric counts the view".to_string());
+    let (again, _) = one_post(&w.base, BOB, &forged).await;
+    w.check(again == body, format!("T-N10: two reads differ:\n{body}\n{again}"));
+    w.check(one_post(&w.base, DAVE, &forged).await.1.is_null(), "Dave reads the over-claim".to_string());
+    let (_, view) = one_post(&w.base, BOB, &both).await;
+    w.check(view["droppedFields"] == json!(["embed"]) && view["notServed"] == want, format!("both markers: {view}"));
+    // The child below it is served, unmarked; Dave reads it.
+    let (_, view) = one_post(&w.base, BOB, &child).await;
+    w.check(!view.is_null() && view.get("notServed").is_none(), format!("the child: {view}"));
+
+    // Every endpoint (T-N9): each view of the post carries the same field.
+    let reads: Vec<(&str, &str, String)> = vec![
+        ("getPostThread, anchor", THREAD, format!("uri={forged}")),
+        ("getPostThread, parent", THREAD, format!("uri={child}")),
+        ("getPostThread, reply", THREAD, format!("uri={t}")),
+        ("getAuthorFeed, item and reply context", FEED, format!("actor={BOB}&limit=50")),
+        ("getTimeline", TIMELINE, "limit=50".to_string()),
+        ("getReplies", GET_REPLIES, format!("uri={t}")),
+        ("getBookmarks", GET_BOOKMARKS, String::new()),
+        ("searchPosts", SEARCH, "q=forgedwords".to_string()),
+        ("listNotifications, subject", LIST_NOTIFICATIONS, String::new()),
+    ];
+    for (what, method, query) in &reads {
+        // A search page can be empty with a cursor: every page of it.
+        let page = if *method == SEARCH { Value::Array(pages(&w.base, method, query, BOB, 20).await) } else { json_of(&w.base, method, query, BOB).await.1 };
+        let views = views_of(&page, &forged);
+        w.check(
+            !views.is_empty() && views.iter().all(|v| v["notServed"] == want),
+            format!("{what}: {} views of {forged}: {page}", views.len()),
+        );
+    }
+    let (_, feed, _) = json_of(&w.base, FEED, &format!("actor={BOB}&limit=50"), BOB).await;
+    let item = feed["feed"].as_array().into_iter().flatten().find(|i| i["uri"] == child.as_str()).cloned().unwrap_or_default();
+    w.check(item["reply"]["parent"]["notServed"] == want, format!("reply context: {item}"));
+
+    // Quoted, never (T-N3): Bob's own quote of it, and Dave's.
+    for reader in [BOB, DAVE] {
+        let (body, view) = one_post(&w.base, reader, &quote).await;
+        w.check(!view.is_null() && !body.contains("notServed"), format!("{reader}'s quote: {body}"));
+    }
+    let (_, view) = one_post(&w.base, BOB, &quote).await;
+    w.check(view["embed"]["record"]["uri"] == forged.as_str(), format!("Bob reads the quoted post: {view}"));
+
+    // The rewrite heals it (T-D3): no marker, Dave reads it.
+    let (_, view) = one_post(&w.base, BOB, &forged).await;
+    let record = &view["record"];
+    let mut rewrite = w.f.new_form_record(BOB, "3kns4forged2", record["text"].as_str().expect("text"), None, None, &aud).await;
+    rewrite["reply"] = reply;
+    rewrite["createdAt"] = record["createdAt"].clone();
+    w.f.apply_op(BOB, Action::Update, NSID_POST_PRIVATE, "3kns4forged2", REV2, Some(rewrite)).await;
+    let (_, view) = one_post(&w.base, BOB, &forged).await;
+    w.check(!view.is_null() && view.get("notServed").is_none(), format!("healed: {view}"));
+    w.check(!one_post(&w.base, DAVE, &forged).await.1.is_null(), "Dave reads the healed post".to_string());
+    w.finish().await;
+}
+
+/// T-N2, T-N3, T-N6, T-N7, T-N8, T-N11, T-N13 on the wire, in Alice's
+/// `followers` thread T and her `list` thread L.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn tn2_tn3_tn6_tn7_tn8_the_marker_is_the_authors_alone() {
+    let Some(mut w) = Walk::new("tn2-not-served", Layout::SamePds, Some("followers"), &[]).await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let t = w.root.clone();
+    let rb = w.reply(BOB, "3kns2bob2222", &t).await;
+    let rc = w.reply(CAROL, "3kns2carol22", &t).await;
+    let rb2 = w.reply(BOB, "3kns2bobund2", &rc).await;
+    let list = w.f.audience(ALICE, "3kns2list222", Some("list"), &[BOB, CAROL, DAVE]).await;
+    let lroot = w.f.private_post(ALICE, "3kns2lroot22", &list, None).await;
+    let lb = w.f.private_post(BOB, "3kns2lbob222", &list, Some((&lroot, &lroot))).await;
+    let narrower = w.f.audience(ALICE, "3kns2narrow2", Some("list"), &[DAVE]).await;
+    let a12 = w.f.private_post(BOB, "3kns2a122222", &narrower, Some((&t, &t))).await;
+    let empty = w.f.audience(BOB, "3kns2empty22", Some("list"), &[]).await;
+    let bob_empty = w.f.private_post(BOB, "3kns2bobemp2", &empty, None).await;
+    w.f.ready_all().await;
+    let own = [rb.as_str(), rb2.as_str(), lb.as_str()];
+    let baseline = body_of(&w, BOB, &own).await;
+    w.check(!baseline.contains("notServed") && posts_of(&w.base, BOB, &own).await.1.len() == 3, format!("baseline: {baseline}"));
+    for uri in own {
+        w.expect("baseline", DAVE, uri, true).await;
+    }
+
+    // T-N11: served cases carry nothing.
+    let body = body_of(&w, BOB, &[&a12, &bob_empty]).await;
+    w.check(!body.contains("notServed") && posts_of(&w.base, BOB, &[&a12, &bob_empty]).await.1.len() == 2, format!("A-12 and an empty list: {body}"));
+
+    // T-N2: per-reader exclusions make Dave miss and change nothing of
+    // Bob's views.
+    let stale = format!("UPDATE sync_state SET head_checked_at = 'epoch' WHERE did = '{DAVE}'");
+    let fresh = format!("UPDATE sync_state SET head_checked_at = now() WHERE did = '{DAVE}'");
+    for (case, apply, undo, missed) in [
+        ("Dave blocks Bob", block_sql(DAVE, BOB), "DELETE FROM blocks".to_string(), &rb),
+        ("Bob blocks Dave", block_sql(BOB, DAVE), "DELETE FROM blocks".to_string(), &rb),
+        ("Dave blocks Alice", block_sql(DAVE, ALICE), "DELETE FROM blocks".to_string(), &rb),
+        ("Dave blocks a chain author", block_sql(DAVE, CAROL), "DELETE FROM blocks".to_string(), &rb2),
+        ("Dave's head stale", stale, fresh, &rb),
+    ] {
+        exec(&w.f.pool, &apply).await;
+        w.check(posts_of(&w.base, DAVE, &[missed]).await.1.is_empty(), format!("{case}: Dave reads {missed}"));
+        let body = body_of(&w, BOB, &own).await;
+        w.check(body == baseline, format!("{case}: Bob's views changed:\n{baseline}\n{body}"));
+        exec(&w.f.pool, &undo).await;
+    }
+    w.edit_audience("3kns2list222", "list", &[BOB, CAROL], REV2).await;
+    w.check(posts_of(&w.base, DAVE, &[&lb]).await.1.is_empty(), "Dave outside L reads Bob's reply".to_string());
+    let body = body_of(&w, BOB, &own).await;
+    w.check(body == baseline, format!("Dave outside L: Bob's views changed:\n{baseline}\n{body}"));
+    w.edit_audience("3kns2list222", "list", &[BOB, CAROL, DAVE], REV3).await;
+
+    // T-N3 and T-N8: another reader's bodies are the ones built with the
+    // marker code off, and the statement never runs for them.
+    let dave_reads: Vec<(&str, String)> = vec![
+        (POSTS, format!("uris={t}&uris={rb}&uris={rc}&uris={rb2}&uris={lb}&uris={a12}")),
+        (THREAD, format!("uri={t}")),
+        (FEED, format!("actor={BOB}&limit=50")),
+    ];
+    let runs = hooks::arm(hooks::NOT_SERVED_RUN, &hook_key(&w, DAVE));
+    let mut on = Vec::new();
+    for (method, query) in &dave_reads {
+        on.push(json_of(&w.base, method, query, DAVE).await.0);
+    }
+    w.check(runs.hits() == 0, format!("the statement ran {} times for Dave", runs.hits()));
+    drop(runs);
+    let off = hooks::arm(hooks::NOT_SERVED_OFF, &hook_key(&w, DAVE));
+    for ((method, query), on) in dave_reads.iter().zip(&on) {
+        let (body_off, _, _) = json_of(&w.base, method, query, DAVE).await;
+        w.check(&body_off == on, format!("{method}: Dave's body differs with the marker code off"));
+        w.check(!on.contains("notServed"), format!("{method}: Dave sees a marker"));
+    }
+    drop(off);
+    // The author: one statement per response that shows an own post, none
+    // for a response that shows none.
+    let runs = hooks::arm(hooks::NOT_SERVED_RUN, &hook_key(&w, BOB));
+    json_of(&w.base, FEED, &format!("actor={BOB}&limit=50"), BOB).await;
+    json_of(&w.base, THREAD, &format!("uri={t}"), BOB).await;
+    let n = runs.hits();
+    posts_of(&w.base, BOB, &[&t, &rc]).await;
+    w.check(n == 2 && runs.hits() == 2, format!("Bob's runs: {n}, then {}", runs.hits()));
+    drop(runs);
+
+    // T-N7: standing, on the wire. Bob removed from L, then restored.
+    w.edit_audience("3kns2list222", "list", &[CAROL, DAVE], "3kaaaaaaaaad2").await;
+    let (_, view) = one_post(&w.base, BOB, &lb).await;
+    w.check(view["notServed"] == json!(["standing"]), format!("Bob removed from L: {view}"));
+    w.check(posts_of(&w.base, DAVE, &[&lb]).await.1.is_empty(), "Dave reads Bob's reply after the removal".to_string());
+    w.edit_audience("3kns2list222", "list", &[BOB, CAROL, DAVE], "3kaaaaaaaaae2").await;
+    let (_, view) = one_post(&w.base, BOB, &lb).await;
+    w.check(!view.is_null() && view.get("notServed").is_none(), format!("Bob restored: {view}"));
+    // A block either way, public or private: the same bytes, `standing`;
+    // nothing names a block.
+    let private_block = |from: &str, to: &str| {
+        format!(
+            "INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
+             VALUES ('at://{from}/tools.kryphocron.graph.block/1', '{from}', '{to}', '3k', now())"
+        )
+    };
+    let before = marked(&handle, "standing");
+    let mut bodies = Vec::new();
+    for (apply, undo) in [
+        (block_sql(ALICE, BOB), "DELETE FROM blocks"),
+        (block_sql(BOB, ALICE), "DELETE FROM blocks"),
+        (private_block(ALICE, BOB), "DELETE FROM private_blocks"),
+        (private_block(BOB, ALICE), "DELETE FROM private_blocks"),
+    ] {
+        exec(&w.f.pool, &apply).await;
+        bodies.push(body_of(&w, BOB, &[&rb]).await);
+        exec(&w.f.pool, undo).await;
+    }
+    let view: Value = serde_json::from_str(&bodies[0]).expect("json");
+    w.check(view["posts"][0]["notServed"] == json!(["standing"]), format!("a block: {}", bodies[0]));
+    w.check(bodies.iter().all(|b| *b == bodies[0]), format!("the four blocks differ: {bodies:?}"));
+    w.check(marked(&handle, "standing") == before + 4.0, "the metric counts standing".to_string());
+    // Unfollowing: Bob's view is byte-identical to the blocks' (nothing
+    // tells a block from a missing follow), his reply below Carol's is
+    // `standing` too; Carol, reading Bob's unserved reply, misses it and
+    // sees no marker.
+    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}' AND subject_did = '{ALICE}'")).await;
+    let unfollowed = body_of(&w, BOB, &[&rb]).await;
+    w.check(unfollowed == bodies[0], format!("a block and an unfollow differ:\n{}\n{unfollowed}", bodies[0]));
+    let (_, views) = posts_of(&w.base, BOB, &[&rb, &rb2]).await;
+    w.check(views.len() == 2 && views.iter().all(|v| v["notServed"] == json!(["standing"])), format!("Bob unfollows: {views:?}"));
+    let carols = body_of(&w, CAROL, &[&rb, &rc]).await;
+    w.check(!carols.contains("notServed") && !carols.contains(&rb), format!("Carol: {carols}"));
+    exec(&w.f.pool, &follow_sql(BOB, ALICE)).await;
+
+    // T-N6: labels.
+    for (case, subject, val, want) in [
+        ("!hide on the root", t.as_str(), "!hide", Some(json!(["placement"]))),
+        ("!takedown on O", ALICE, "!takedown", Some(json!(["placement"]))),
+        ("a non-hiding label on the root", t.as_str(), "!warn", None),
+    ] {
+        w.label(subject, val).await;
+        let (_, view) = one_post(&w.base, BOB, &rb).await;
+        w.check(!view.is_null() && view.get("notServed").cloned() == want, format!("{case}: {view}"));
+        exec(&w.f.pool, "DELETE FROM labels").await;
+    }
+    w.label(&rb, "!hide").await;
+    w.check(one_post(&w.base, BOB, &rb).await.1.is_null(), "!hide on Bob's own reply: he reads it".to_string());
+    exec(&w.f.pool, "DELETE FROM labels").await;
+
+    // T-N11: a reply the root's threadgate hides is not marked.
+    w.f.ingest(ALICE, THREADGATE, "3kroot222222", json!({"$type": THREADGATE, "post": t, "allow": [], "hiddenReplies": [rb]})).await;
+    let (_, view) = one_post(&w.base, BOB, &rb).await;
+    w.check(!view.is_null() && view.get("notServed").is_none(), format!("hidden by the threadgate: {view}"));
+
+    // T-N13.
+    w.check(crate::private_tier::FEATURES.last() == Some(&"private.notServed"), "the feature is listed".to_string());
     w.finish().await;
 }
