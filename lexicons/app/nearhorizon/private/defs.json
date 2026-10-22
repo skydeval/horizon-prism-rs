@@ -72,6 +72,26 @@
           "type": "ref",
           "ref": "app.bsky.feed.defs#threadgateView",
           "description": "On a top-level post: its threadgate (an app.bsky.feed.threadgate record with the post's record key, in the post author's repository). lists holds only the lists this AppView serves from its own rows. A gate only flags and hides replies; it never admits a reader the audience does not."
+        },
+        "reply": {
+          "type": "ref",
+          "ref": "#replyRef",
+          "description": "On a feed item of getTimeline or getAuthorFeed only, while getMembership lists 'private.replyContext': present when the item's post is a reply (its record.reply), with the root and the parent it names. Absent on any other view."
+        }
+      }
+    },
+    "replyRef": {
+      "type": "object",
+      "description": "A feed item's reply context, in the shape of app.bsky.feed.defs#replyRef. A private root or parent is read for the requester as getPosts reads it, in the same request, and carries the same decoration (labels, counts, viewer, gates, the record part of embed); one the requester cannot read, or that does not exist, is the same #notFoundPost. A public root or parent is given by reference (#publicPostRef), to hydrate through a public AppView.",
+      "required": ["root", "parent"],
+      "properties": {
+        "root": {
+          "type": "union",
+          "refs": ["#privatePostView", "app.bsky.feed.defs#notFoundPost", "#publicPostRef"]
+        },
+        "parent": {
+          "type": "union",
+          "refs": ["#privatePostView", "app.bsky.feed.defs#notFoundPost", "#publicPostRef"]
         }
       }
     },

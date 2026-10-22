@@ -39,6 +39,14 @@ impl PrivateEmit<Value> {
         &self.0
     }
 
+    /// The same authorized view again, for the same reader in the same
+    /// response: a post that is both a feed item and another item's reply
+    /// context, or the subject of several notifications (fast-reads design
+    /// §5.2). It is never a view for another reader.
+    pub(in crate::private_tier) fn duplicate(&self) -> Self {
+        Self(self.0.clone())
+    }
+
     /// Add `key` to the view after the page's reads (private-posting design
     /// §3.3): a value computed for a URI that is already a hit, such as the
     /// record part of `embed` or the operator labels. Content of another
@@ -163,6 +171,83 @@ impl Serialize for QuoteItem {
     }
 }
 
+/// One side of a feed item's reply context (fast-reads design §5.2 B-2),
+/// each with its `$type`: a private post read for the caller through the
+/// pipeline, `app.bsky.feed.defs#notFoundPost` for any private post that
+/// did not read (the same for every reason), or a public post by reference.
+#[derive(Debug)]
+pub enum ContextPost {
+    Private(PrivateEmit<Value>),
+    NotFound(String),
+    Public { uri: String, cid: String },
+}
+
+impl Serialize for ContextPost {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        match self {
+            Self::Private(post) => {
+                m.serialize_entry("$type", "app.nearhorizon.private.defs#privatePostView")?;
+                if let Value::Object(view) = post.view() {
+                    for (k, v) in view {
+                        m.serialize_entry(k, v)?;
+                    }
+                }
+            }
+            Self::NotFound(uri) => {
+                m.serialize_entry("$type", "app.bsky.feed.defs#notFoundPost")?;
+                m.serialize_entry("uri", uri)?;
+                m.serialize_entry("notFound", &true)?;
+            }
+            Self::Public { uri, cid } => {
+                m.serialize_entry("$type", "app.nearhorizon.private.defs#publicPostRef")?;
+                m.serialize_entry("uri", uri)?;
+                m.serialize_entry("cid", cid)?;
+            }
+        }
+        m.end()
+    }
+}
+
+/// `app.nearhorizon.private.defs#replyRef`: a feed item's root and parent.
+#[derive(Debug)]
+pub struct ReplyContext {
+    pub(in crate::private_tier) root: ContextPost,
+    pub(in crate::private_tier) parent: ContextPost,
+}
+
+impl Serialize for ReplyContext {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(2))?;
+        m.serialize_entry("root", &self.root)?;
+        m.serialize_entry("parent", &self.parent)?;
+        m.end()
+    }
+}
+
+/// One item of `getTimeline` or `getAuthorFeed`: the post's view, and its
+/// reply context when its post is a reply.
+#[derive(Debug)]
+pub struct FeedItem {
+    pub(in crate::private_tier) post: PrivateEmit<Value>,
+    pub(in crate::private_tier) reply: Option<ReplyContext>,
+}
+
+impl Serialize for FeedItem {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        if let Value::Object(view) = self.post.view() {
+            for (k, v) in view {
+                m.serialize_entry(k, v)?;
+            }
+        }
+        if let Some(reply) = &self.reply {
+            m.serialize_entry("reply", reply)?;
+        }
+        m.end()
+    }
+}
+
 /// What a private notification is about (private posting §4.8).
 #[derive(Debug)]
 pub enum NotificationRecord {
@@ -235,7 +320,7 @@ impl NotificationView {
 pub enum PrivateResponse {
     Posts(Vec<PrivateEmit<Value>>),
     Thread(ThreadNode),
-    Feed { feed: Vec<PrivateEmit<Value>>, cursor: Option<String> },
+    Feed { feed: Vec<FeedItem>, cursor: Option<String> },
     Bookmarks { bookmarks: Vec<BookmarkView>, cursor: Option<String> },
     /// `getLikes`: `likes` are `{indexedAt, createdAt, actor}` of member
     /// likers, public data.
@@ -314,7 +399,7 @@ impl PrivateResponse {
         Self::Thread(anchor)
     }
 
-    pub(in crate::private_tier) fn feed(feed: Vec<PrivateEmit<Value>>, cursor: Option<String>) -> Self {
+    pub(in crate::private_tier) fn feed(feed: Vec<FeedItem>, cursor: Option<String>) -> Self {
         Self::Feed { feed, cursor }
     }
 

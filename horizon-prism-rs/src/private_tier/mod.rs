@@ -202,6 +202,9 @@ pub const FEATURES: &[&str] = &[
     "private.notificationPreferences",
     // `getUnreadCount {reasons}` (fast-reads design §5.2 B-1, F-E).
     "private.unreadReasons",
+    // `reply {root, parent}` on getTimeline and getAuthorFeed items
+    // (fast-reads design §5.2 B-2, F-F).
+    "private.replyContext",
 ];
 
 /// The private tier as the rest of the crate may use it.

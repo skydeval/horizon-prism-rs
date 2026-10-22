@@ -30,6 +30,7 @@
           "properties": {
             "feed": {
               "type": "array",
+              "description": "An item whose post is a reply carries reply, its root and parent (app.nearhorizon.private.defs#replyRef), while getMembership lists 'private.replyContext'. They are read after the page's items are chosen and do not count against the page's reads.",
               "items": {
                 "type": "ref",
                 "ref": "app.nearhorizon.private.defs#privatePostView"

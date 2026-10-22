@@ -340,7 +340,7 @@ mod tests {
         // `private.anyPds` follows them while `private_any_pds.enabled`
         // (private-encode design §7; on by default).
         let features = json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN]).collect::<Vec<_>>());
-        assert_eq!(json!(FEATURES), json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences", "private.unreadReasons"]));
+        assert_eq!(json!(FEATURES), json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences", "private.unreadReasons", "private.replyContext"]));
         // T-N9 (private notification preferences design §8): the
         // preferences' feature followed every value before it; the fast
         // reads' values follow it (fast-reads design §5.3).

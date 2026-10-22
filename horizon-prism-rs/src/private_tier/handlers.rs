@@ -24,7 +24,8 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use super::emit::{
-    BookmarkView, NotificationRecord, NotificationView, PrivateEmit, PrivateResponse, QuoteItem, ThreadNode, ThreadParent,
+    BookmarkView, ContextPost, FeedItem, NotificationRecord, NotificationView, PrivateEmit, PrivateResponse, QuoteItem, ReplyContext,
+    ThreadNode, ThreadParent,
 };
 use super::pipeline::{self, PipelineEnv, RequestState};
 use super::{media, stages};
@@ -1350,6 +1351,10 @@ async fn feed_body(
     let cursor = last.filter(|_| more).and_then(|(at, key)| sealed::seal(&s.cursor_key, aad, at, &key));
     let mut refs: Vec<&mut PrivateEmit<Value>> = feed.iter_mut().collect();
     decorate(s, &rs, caller, &hydration, &mut refs, &[], start).await?;
+    // The reply context, once every item is read and decorated (fast-reads
+    // design §5.2 B-2), before the repost reasons: a context view is the
+    // post's own view.
+    let replies = stages::context(reply_context(s, &rs, caller, &hydration, &feed, limit, start)).await?;
     let mut reposters: Vec<String> = Vec::new();
     for (_, by, _) in reposts.iter().flatten() {
         if !reposters.contains(by) {
@@ -1368,7 +1373,92 @@ async fn feed_body(
             }
         }
     }
-    Ok(PrivateResponse::feed(feed, cursor))
+    let items = feed.into_iter().zip(replies).map(|(post, reply)| FeedItem { post, reply }).collect();
+    Ok(PrivateResponse::feed(items, cursor))
+}
+
+/// A strong ref's `(uri, cid)`; the cid absent on rows stored before it was
+/// kept.
+fn strong_ref(r: &Value) -> Option<(&str, Option<&str>)> {
+    Some((r.get("uri")?.as_str()?, r.get("cid").and_then(Value::as_str)))
+}
+
+/// The reply context of a feed page's items (fast-reads design §5.2 B-2,
+/// C-9): for each item whose record names `reply`, its root and parent.
+/// - A private root or parent already an item of the page is that item's
+///   view again, not read again. The others, each once, at most `2 ×
+///   limit`, pass the prefilter and are read through the pipeline for the
+///   caller in the request's `RequestState`, after every item, so an item's
+///   head-fetch funding is what it was; they are not charged to the page's
+///   read cap. Every check of a read applies: the clear-field check,
+///   `droppedFields` on the author's own view, S4. A hit is decorated as
+///   `getPosts` decorates (labels, counts, `viewer`, gates, the record part
+///   of `embed`).
+/// - A private one that does not read, whatever the reason, is
+///   `#notFoundPost`, the answer for a URI that names nothing.
+/// - A public one is `#publicPostRef {uri, cid}` from the record's strong
+///   ref (C-3): a private handler does not render public posts. Without a
+///   stored cid the item carries no `reply`.
+#[allow(clippy::too_many_arguments)]
+async fn reply_context(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    items: &[PrivateEmit<Value>],
+    limit: usize,
+    start: Instant,
+) -> Result<Vec<Option<ReplyContext>>, XrpcError> {
+    let named: Vec<Option<(&Value, &Value)>> = items
+        .iter()
+        .map(|p| {
+            let reply = p.view().pointer("/record/reply")?;
+            Some((reply.get("root")?, reply.get("parent")?))
+        })
+        .collect();
+    let on_page: HashMap<String, usize> = items.iter().enumerate().filter_map(|(i, p)| view_uri(p).map(|u| (u, i))).collect();
+    let mut wanted: Vec<String> = Vec::new();
+    for (root, parent) in named.iter().flatten() {
+        for (uri, _) in [root, parent].into_iter().filter_map(|r| strong_ref(r)) {
+            if is_private_uri(uri) && !on_page.contains_key(uri) && !wanted.iter().any(|w| w == uri) {
+                wanted.push(uri.to_string());
+            }
+        }
+    }
+    wanted.truncate(2 * limit);
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
+    wanted.retain(|u| passing.contains(u));
+    let mut read: HashMap<String, PrivateEmit<Value>> = HashMap::new();
+    if !wanted.is_empty() {
+        let authors = profiles(hydration, &wanted).await?;
+        let mut hits: Vec<PrivateEmit<Value>> = read_many(s, rs, caller, &wanted, &authors, start).await.into_iter().flatten().collect();
+        // The page's items were read for the caller in this request too.
+        let page: Vec<String> = on_page.keys().cloned().collect();
+        let mut refs: Vec<&mut PrivateEmit<Value>> = hits.iter_mut().collect();
+        decorate(s, rs, caller, hydration, &mut refs, &page, start).await?;
+        for hit in hits {
+            if let Some(uri) = view_uri(&hit) {
+                read.insert(uri, hit);
+            }
+        }
+    }
+    let side = |r: &Value| -> Option<ContextPost> {
+        let (uri, cid) = strong_ref(r)?;
+        if !is_private_uri(uri) {
+            return Some(ContextPost::Public { uri: uri.to_string(), cid: cid?.to_string() });
+        }
+        Some(match on_page.get(uri).map(|&i| &items[i]).or_else(|| read.get(uri)) {
+            Some(post) => ContextPost::Private(post.duplicate()),
+            None => ContextPost::NotFound(uri.to_string()),
+        })
+    };
+    Ok(named
+        .into_iter()
+        .map(|n| {
+            let (root, parent) = n?;
+            Some(ReplyContext { root: side(root)?, parent: side(parent)? })
+        })
+        .collect())
 }
 
 /// Whether `uri` is `at://<did>/tools.kryphocron.feed.postPrivate/<rkey>`,

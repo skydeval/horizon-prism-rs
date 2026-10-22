@@ -110,7 +110,6 @@ pub(super) async fn reading<F: Future>(read: F) -> F::Output {
 }
 
 /// Time `step` as the `context` stage; reads inside it are not `reads`.
-#[cfg_attr(not(test), allow(dead_code, reason = "the feeds' reply context uses it"))]
 pub(super) async fn context<F: Future>(step: F) -> F::Output {
     let stages = STAGES.try_with(Arc::clone).ok();
     if let Some(s) = &stages {

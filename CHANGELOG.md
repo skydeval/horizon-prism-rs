@@ -10,6 +10,25 @@ commit.
 
 ## [Unreleased]
 
+### Added (fast reads F-F: reply context on feed items, #805)
+
+- `app.nearhorizon.private.getTimeline` and `getAuthorFeed` items whose
+  post is a reply carry `reply {root, parent}`
+  (`app.nearhorizon.private.defs#replyRef`), so a client needs no second
+  `getPosts` for missing parents and roots. A private root or parent is
+  read for the caller through the same pipeline as every private read (the
+  clear-field check, `droppedFields` on the author's own view and S4
+  apply) and decorated as `getPosts` decorates; one that does not read,
+  for any reason, is `app.bsky.feed.defs#notFoundPost`; a public one is
+  `#publicPostRef {uri, cid}`.
+- The context reads run after the page's items are chosen and read, only
+  for emitted items, each URI once, reusing a post already on the page,
+  at most `2 × limit`, and are not charged to the page's read cap: pages
+  and cursors are as before. Their time is the `context` stage of
+  `private_read_stage_seconds`. New server work on the feeds: up to
+  `2 × limit` more pipeline reads per page of replies.
+- `getMembership` lists `private.replyContext`.
+
 ### Added (fast reads F-E: getUnreadCount reasons, #804)
 
 - `app.nearhorizon.private.getUnreadCount` takes the optional repeated

@@ -3944,6 +3944,83 @@ async fn notification_reads_in(mode: PublicMode, test: &str) {
     db.drop_db().await;
 }
 
+/// T-F8 (fast-reads design §5.2 B-2): Bob's author feed, read by Bob.
+/// - Replies to Carol's readable post carry it as root and parent, as a
+///   decorated `#privatePostView`; the shared parent is read once.
+/// - A reply to an item of the page reuses that item; it is not read again.
+/// - A parent Bob cannot read and one that does not exist are the same
+///   `#notFoundPost` but for the URI.
+/// - A public parent is `#publicPostRef` with the record's cids.
+/// - A top-level post has no `reply`; the `context` stage is recorded.
+/// - A page of `limit` replies to distinct parents is full and has a cursor:
+///   the context reads are outside the read cap.
+#[tokio::test]
+async fn t_f8_feed_items_carry_their_reply_context() {
+    let test = "tf8-reply-context";
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let f = fixture(&db.pool, test).await;
+    let aud_carol = f.audience(CAROL, "3kaudcarol22", Some("list"), &[BOB]).await;
+    let aud_dave = f.audience(DAVE, "3kauddave222", Some("list"), &[]).await;
+    let aud_bob = f.audience(BOB, "3kaudbob2222", Some("list"), &[ALICE]).await;
+    let c1 = f.private_post(CAROL, "3kcarol22222", &aud_carol, None).await;
+    let d1 = f.private_post(DAVE, "3kdave222222", &aud_dave, None).await;
+    let ghost = format!("at://{CAROL}/{NSID_POST_PRIVATE}/3knothere222");
+    let public = format!("at://{DAVE}/{PUBLIC_POST}/3kpubpost222");
+    let b0 = f.private_post(BOB, "3kbob0222222", &aud_bob, None).await;
+    let b1 = f.private_post(BOB, "3kbob1222222", &aud_carol, Some((&c1, &c1))).await;
+    let b2 = f.private_post(BOB, "3kbob2222222", &aud_carol, Some((&c1, &c1))).await;
+    let b3 = f.private_post(BOB, "3kbob3222222", &aud_bob, Some((&b0, &b0))).await;
+    let b4 = f.private_post(BOB, "3kbob4222222", &aud_dave, Some((&d1, &d1))).await;
+    let b5 = f.private_post(BOB, "3kbob5222222", &aud_bob, Some((&ghost, &ghost))).await;
+    let b6 = f.private_post(BOB, "3kbob6222222", &aud_bob, Some((&public, &public))).await;
+    f.ready_all().await;
+    let base = serve_live(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let hits = |text: &str| crate::test_support::series(text, "private_read_outcome_total", &[r#"outcome="hit""#]).unwrap_or(0.0);
+    let before = hits(&handle.render());
+    let (_, page, _) = json_of(&base, FEED, &format!("actor={BOB}"), BOB).await;
+    let text = handle.render();
+    let items = page["feed"].as_array().expect("feed");
+    let item = |uri: &str| items.iter().find(|i| i["uri"] == uri).unwrap_or_else(|| panic!("{uri} in {page}")).clone();
+    assert_eq!(items.len(), 7, "{page}");
+    // Seven items and Carol's post once; Dave's and the missing one fail
+    // the prefilter and are not read, Bob's own post is reused.
+    assert_eq!(hits(&text) - before, 8.0, "{text}");
+    for b in [&b1, &b2] {
+        let reply = &item(b)["reply"];
+        for side in ["root", "parent"] {
+            let v = &reply[side];
+            assert_eq!((v["$type"].as_str(), v["uri"].as_str()), (Some("app.nearhorizon.private.defs#privatePostView"), Some(c1.as_str())), "{b}: {reply}");
+            assert!(v["likeCount"].is_number() && v["viewer"].is_object() && v["record"]["text"] == "3kcarol22222", "decorated: {v}");
+        }
+    }
+    let reused = &item(&b3)["reply"]["parent"];
+    let mut own = item(&b0);
+    own.as_object_mut().expect("view").insert("$type".into(), json!("app.nearhorizon.private.defs#privatePostView"));
+    assert_eq!(reused, &own, "the item's own view");
+    let missing = |b: &str, uri: &str| item(b)["reply"]["parent"].to_string().replace(uri, "URI");
+    assert_eq!(missing(&b4, &d1), missing(&b5, &ghost), "unreadable and nonexistent alike");
+    assert_eq!(item(&b4)["reply"]["parent"], json!({"$type": "app.bsky.feed.defs#notFoundPost", "uri": d1, "notFound": true}));
+    assert_eq!(
+        item(&b6)["reply"],
+        json!({"root": {"$type": "app.nearhorizon.private.defs#publicPostRef", "uri": public, "cid": "bafyroot"},
+               "parent": {"$type": "app.nearhorizon.private.defs#publicPostRef", "uri": public, "cid": "bafyparent"}})
+    );
+    assert!(item(&b0).get("reply").is_none());
+    let endpoint = r#"endpoint="getAuthorFeed""#;
+    assert_eq!(crate::test_support::series(&text, "private_read_stage_seconds_count", &[endpoint, r#"stage="context""#]), Some(1.0), "{text}");
+
+    // Two replies to distinct parents per page, outside the read cap of 2 × 2.
+    let (_, page, _) = json_of(&base, FEED, &format!("actor={BOB}&limit=2"), BOB).await;
+    assert_eq!(page["feed"].as_array().map(Vec::len), Some(2), "{page}");
+    assert!(page["cursor"].is_string(), "{page}");
+    db.drop_db().await;
+}
+
 /// T-F7 (fast-reads design §5.2 B-1): with an unread row of every reason
 /// and every private post readable, `getUnreadCount {reasons}` equals the
 /// unread items `listNotifications` returns for the same `reasons`; no
