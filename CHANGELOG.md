@@ -10,6 +10,14 @@ commit.
 
 ## [Unreleased]
 
+### Changed (firehose batch size 2000)
+
+- **`firehose.batch_size`** defaults to 2000 (was 500), in the code default
+  and `docker/config/app.toml`. A read returns whatever has arrived, so at
+  live rates nothing changes; under a backlog the per-batch Redis round
+  trips and `XACK` are spread over four times the entries (about 5–10 %
+  more throughput, firehose overload note fix 5).
+
 ### Changed (private thread expansion read cap, H-3, #778)
 
 - **`getPostThread` and `getReplies`** (private tier) cap the pipeline

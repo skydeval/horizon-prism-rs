@@ -234,7 +234,7 @@ impl Default for FirehoseConfig {
             stream_key: "firehose:events".to_string(),
             group: "horizon-prism-rs".to_string(),
             consumer_name: "app".to_string(),
-            batch_size: 500,
+            batch_size: 2000,
             dead_letter_stream: "firehose:dead-letters".to_string(),
             deterministic_attempts: 5,
             dead_letter_maxlen: 10_000,

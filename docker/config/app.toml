@@ -76,7 +76,9 @@ not_ready_retry_secs = 5
 stream_key = "firehose:events"
 group = "horizon-prism-rs"
 consumer_name = "app"
-batch_size = 500
+# Entries per read. Only a backlog fills a batch; at live rates a read
+# returns whatever has arrived.
+batch_size = 2000
 dead_letter_stream = "firehose:dead-letters"
 # Deterministic failures are retried in place this many times, then dead-lettered
 # as metadata plus the first 4 KiB of data (design §5.3).
