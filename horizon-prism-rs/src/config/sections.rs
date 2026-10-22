@@ -460,6 +460,11 @@ pub struct PrivateReadConfig {
     /// batched read asks for more after a short batch (private-threads
     /// design §3.2.1).
     pub walk_batch_max: u32,
+    /// While private reads are degraded (the private watermark is stale),
+    /// serve a read whose every repository Prism holds up to its head,
+    /// checked per read (degraded-mode design §2, DM-C9). Off: every
+    /// private read misses while degraded, as before.
+    pub head_fallback: bool,
     pub floor_ms: PrivateReadFloors,
 }
 
@@ -472,6 +477,7 @@ impl Default for PrivateReadConfig {
             max_chain: 16,
             page_reads_factor: 2,
             walk_batch_max: 1000,
+            head_fallback: true,
             floor_ms: PrivateReadFloors::default(),
         }
     }

@@ -10,6 +10,45 @@ commit.
 
 ## [Unreleased]
 
+### Added (degraded mode DM2: the head fallback, #823)
+
+- **Private reads while a private relay is behind** (degraded-mode design
+  §2): while the private watermark is missing or older than
+  `kryphocron.oracle_freshness_bound_secs` ("degraded", decided once per
+  request), a private read no longer misses as `stale` by default. Step 3′,
+  after the head checks and before the oracle snapshot, shows every
+  repository the read depends on current: its head no older than
+  `sync.head_max_age_secs` and its `chain_rev` (DM1) at or above it. The
+  set is the author, the reader, the audience owner and, for another
+  reader's walked reply, the authors of the rows the structural climb
+  from its parent visits, up to the walk's stop (`schema::climb_authors`,
+  one statement per page or expansion level, at most 64 distinct authors;
+  more is a miss). The author, reader and audience owner reuse step 3's
+  head checks; every other repository is its stored head with no fetch, so
+  no fetch budget or read-fetch token is spent. Step 5′ then requires
+  fact 8's O and every author its walk read (`fact8_with_authors`, used
+  only here) to be in that set; on the author's own read only the author
+  and audience owner count. The oracles answer `last_synced_at` with the
+  oldest head check of the set. A repository whose chain is broken (a
+  commit dropped by the relays, a gap) is not served until the commit
+  arrives or a settle runs; such a miss is `fallback_behind`. With a fresh
+  watermark nothing changes: same statements, same bytes.
+- Threads and `getReplies` keep the sequential path while degraded, now
+  decided from the request's own degraded flag.
+- **Config:** `private_read.head_fallback` (default `true`; off restores
+  the `stale` miss), in the admin settings (Private posts). Serve warns
+  (`config_head_fallback_over_bound`) when it is on and
+  `sync.head_max_age_secs` is above `kryphocron.oracle_freshness_bound_secs`,
+  where fallback reads would be refused at bind.
+- Metrics: `private_read_outcome_total{outcome="fallback_behind"}`,
+  `private_read_fallback_total{result}` (`passed`, `behind`, `untracked`,
+  `climb_cap`, `walk_outside`).
+- Residuals (design §15): account status from the relays, public likers,
+  reposters and quotes beside a fallback-served anchor, and a hit's counts
+  are as fresh as the relays; a read's heads may be up to
+  `sync.head_max_age_secs` old, as before.
+- No migration, lexicon or feature string.
+
 ### Added (degraded mode DM1: each repo's chain, #822)
 
 - **`sync_state.chain_rev`**: a rev up to which Prism holds every commit of

@@ -598,15 +598,12 @@ fn branch_root_of(parent: &str, root: &str, cap: u32) -> String {
     )
 }
 
-/// The walk (§2.3, §2.4) for the key row `k` (`reply_parent_uri`,
-/// `reply_root_uri`, `owner`), with G (`a`) and O's flag (`fv.ok`) in scope:
-/// from `k`'s parent through stored rows, at most `cap`, each tested inside
-/// the recursion, so the walk ends at its first failing row; true when it
-/// reaches its stop. A cycle fails at the cap. The one-row form only
-/// ([`walked_one`]); every other statement uses descent 2.
-fn parent_verdict(cap: u32) -> String {
+/// The walk's step test (§2.3, §2.4) for the stored row `s` against the key
+/// row `k` (`reply_parent_uri`, `reply_root_uri`, `owner`), with G (`a`) and
+/// O's flag (`fv.ok`) in scope.
+fn walk_step() -> String {
     let thread = is_private("k.reply_root_uri");
-    let step = format!(
+    format!(
         "(s.reply_root_uri = k.reply_root_uri OR ({thread} AND s.uri = k.reply_root_uri)) \
          AND {owned} \
          AND {gate} \
@@ -627,30 +624,66 @@ fn parent_verdict(cap: u32) -> String {
         reader_author = blocked("$1", "s.author_did"),
         author_owner = blocked("s.author_did", "k.owner"),
         standing = standing("s.author_did", "k.owner", "COALESCE(fv.ok, false)", false),
-    );
-    // A thread's walk stops at the root or at the first thread reply by O
-    // (a "none"-kind row by O is not one); a branch's at the branch root,
-    // the first row whose parent is not a `postPrivate` record.
-    let stop = |u: &str| {
-        let parent_private = is_private(&format!("{u}.parent"));
-        format!(
-            "CASE WHEN {thread} THEN {u}.uri = k.reply_root_uri OR ({u}.author = k.owner AND {parent_private}) \
-                  ELSE NOT {parent_private} END"
-        )
-    };
+    )
+}
+
+/// The walk's stop for the `up` row `u` (§2.3): a thread's walk stops at the
+/// root or at the first thread reply by O (a "none"-kind row by O is not
+/// one); a branch's at the branch root, the first row whose parent is not a
+/// `postPrivate` record.
+fn walk_stop(u: &str) -> String {
+    let thread = is_private("k.reply_root_uri");
+    let parent_private = is_private(&format!("{u}.parent"));
     format!(
-        "EXISTS ( \
-           WITH RECURSIVE up(uri, parent, author, hop) AS ( \
+        "CASE WHEN {thread} THEN {u}.uri = k.reply_root_uri OR ({u}.author = k.owner AND {parent_private}) \
+              ELSE NOT {parent_private} END"
+    )
+}
+
+/// The walk's rows (§2.3): the recursive CTE `up` from `k`'s parent through
+/// stored rows, at most `cap`, each tested inside the recursion, so the walk
+/// ends at its first failing row. A cycle fails at the cap.
+fn walk_up(cap: u32) -> String {
+    let step = walk_step();
+    format!(
+        "WITH RECURSIVE up(uri, parent, author, hop) AS ( \
              SELECT s.uri, s.reply_parent_uri, s.author_did, 1 FROM private_posts s \
              WHERE s.uri = k.reply_parent_uri AND {step} \
              UNION ALL \
              SELECT s.uri, s.reply_parent_uri, s.author_did, u.hop + 1 \
              FROM up u JOIN private_posts s ON s.uri = u.parent \
              WHERE u.hop < {cap} AND NOT ({stop_u}) AND {step} \
-           ) \
+           )",
+        stop_u = walk_stop("u"),
+    )
+}
+
+/// The walk (§2.3, §2.4) for the key row `k` (`reply_parent_uri`,
+/// `reply_root_uri`, `owner`), with G (`a`) and O's flag (`fv.ok`) in scope:
+/// from `k`'s parent through stored rows, at most `cap`, each tested inside
+/// the recursion, so the walk ends at its first failing row; true when it
+/// reaches its stop. A cycle fails at the cap. The one-row form only
+/// ([`walked_one`]); every other statement uses descent 2.
+fn parent_verdict(cap: u32) -> String {
+    format!(
+        "EXISTS ( \
+           {up} \
            SELECT 1 FROM up WHERE {stop_up})",
-        stop_u = stop("u"),
-        stop_up = stop("up"),
+        up = walk_up(cap),
+        stop_up = walk_stop("up"),
+    )
+}
+
+/// The authors of the walk's rows other than O (degraded-mode design §2.5,
+/// `walk_authors`): the same `up` rows as [`parent_verdict`], read a second
+/// time. Every row in `up` passed the step test. An empty array when the
+/// walk has no row.
+fn parent_walk_authors(cap: u32) -> String {
+    format!(
+        "(SELECT COALESCE(array_agg(DISTINCT x.author) FILTER (WHERE x.author <> k.owner), '{{}}'::text[]) FROM ( \
+           {up} \
+           SELECT up.author FROM up) x)",
+        up = walk_up(cap),
     )
 }
 
@@ -932,6 +965,12 @@ pub(super) fn walked_one(c: &str, s1_filter: &str, final_: &str, cap: u32) -> St
 
 /// [`walked_per_key`] with stage 1's text given.
 fn walked_per_key_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -> String {
+    walked_per_key_extra(c, s1_filter, final_, cap, stage1, "")
+}
+
+/// [`walked_per_key_with`] with `pv_extra` (a leading comma and more
+/// columns of `pv`, or nothing) after its verdict.
+fn walked_per_key_extra(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str, pv_extra: &str) -> String {
     format!(
         "WITH c AS MATERIALIZED ({c}), \
          br AS MATERIALIZED ( \
@@ -948,7 +987,7 @@ fn walked_per_key_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1:
                   COALESCE({walks}, true) AS walks \
            FROM c {join} {s1_filter}), \
          pv AS MATERIALIZED ( \
-           SELECT k.reply_parent_uri, k.reply_root_uri, COALESCE({verdict}, false) AS ok \
+           SELECT k.reply_parent_uri, k.reply_root_uri, COALESCE({verdict}, false) AS ok{pv_extra} \
            FROM (SELECT DISTINCT s1.reply_parent_uri, s1.reply_root_uri, s1.owner, s1.gov \
                  FROM s1 WHERE s1.s1ok AND s1.walks AND s1.author_did <> $1) k \
            LEFT JOIN private_audiences a ON a.uri = k.gov \
@@ -1018,6 +1057,135 @@ pub(super) async fn fact8(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> R
         verdict,
         anchored,
     }))
+}
+
+/// Fact 8 with its walk's authors (degraded-mode design §2.5): `$1` the
+/// reader, `$2` the post. The same statement as [`fact8_statement`] with
+/// `pv` also returning the authors of the walk's rows other than O, from the
+/// same snapshot as the verdict. Used only while degraded with the head
+/// fallback on; [`fact8_statement`] is unchanged.
+pub(super) fn fact8_with_authors_statement(cap: u32) -> String {
+    let c = format!("SELECT {COLS} FROM private_posts p WHERE p.uri = $2");
+    let extra = format!(", {} AS authors", parent_walk_authors(cap));
+    walked_per_key_extra(&c, "", &fact8_with_authors_final(), cap, &stage1_ok(), &extra)
+}
+
+/// [`fact8_final`] with the walk's authors: at most one `c` row, so at most
+/// one `pv` row; none when the post is not walked (or is the reader's own).
+fn fact8_with_authors_final() -> String {
+    format!(
+        "SELECT s1.owner, s1.gov, s1.s1ok, COALESCE(s1.s1ok AND (NOT s1.walks OR pv.ok), false), \
+           COALESCE(an.uri IS NOT NULL AND {role} AND {anchor_owned} AND {post_owned} AND {anchor_gate}, false), \
+           COALESCE((SELECT x.authors FROM pv x LIMIT 1), '{{}}'::text[]) \
+         FROM {PV_JOIN} LEFT JOIN private_posts an ON an.uri = s1.anchor",
+        role = role_kind("s1", "an"),
+        anchor_owned = owned("an.audience_uri", "an.author_did"),
+        post_owned = owned("s1.audience_uri", "an.author_did"),
+        anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
+    )
+}
+
+/// [`fact8`] with the authors of the rows its walk visited, other than O
+/// (degraded-mode design §2.5, `walk_authors`); the default and no authors
+/// when no row is stored.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn fact8_with_authors(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> Result<(Fact8, Vec<String>), sqlx::Error> {
+    type Row = (Option<String>, Option<String>, bool, bool, bool, Vec<String>);
+    let row: Option<Row> = sqlx::query_as(&fact8_with_authors_statement(cap)).bind(reader).bind(uri).fetch_optional(pool).await?;
+    Ok(row.map_or_else(Default::default, |(owner, gov, s1ok, verdict, anchored, authors)| {
+        (Fact8 { owner, gov, s1ok, verdict, anchored }, authors)
+    }))
+}
+
+/// One post's climb (degraded-mode design §2.2, §2.6): its key, and whether
+/// it is walked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Climbed {
+    pub parent: Option<String>,
+    pub root: Option<String>,
+    /// Every reply but O's own thread reply (the read rule's `needs_walk`,
+    /// O taken from the root's URI): only these have a climb.
+    pub walked: bool,
+    /// The authors of the rows the structural climb from the post's parent
+    /// visits, the stop row included; empty when not walked.
+    pub authors: Vec<String>,
+}
+
+/// The climb statement (degraded-mode design §2.2, §2.6): `$1` the posts'
+/// URIs, `$2` the cap. For each stored post: its key, whether it is walked,
+/// and for a walked one the authors of the rows the structural climb from
+/// its parent visits, by primary key, each agreeing on its root, stopping
+/// where the walk stops (a thread at the root or at a thread reply by the
+/// root's author; a branch at the first row whose parent is not a
+/// `postPrivate`) or at `$2` rows, the stop row included. It ignores the
+/// walk's step tests, so it visits every row the walk can. Siblings share
+/// one climb. Reads `private_posts` only.
+pub(super) fn climb_authors_statement() -> String {
+    let thread = is_private("u.kr");
+    let parent_private = is_private("u.parent");
+    format!(
+        "WITH RECURSIVE p AS MATERIALIZED ( \
+           SELECT c.uri, c.reply_parent_uri AS parent, c.reply_root_uri AS root, \
+                  COALESCE(NOT ({top} OR {broot} OR ({treply} AND c.author_did = split_part(c.reply_root_uri, '/', 3))), true) AS walked \
+           FROM private_posts c WHERE c.uri = ANY($1)), \
+         k AS MATERIALIZED (SELECT DISTINCT p.parent, p.root FROM p WHERE p.walked AND p.parent IS NOT NULL AND p.root IS NOT NULL), \
+         up(kp, kr, uri, parent, author, hop) AS ( \
+           SELECT k.parent, k.root, s.uri, s.reply_parent_uri, s.author_did, 1 \
+           FROM k JOIN private_posts s ON s.uri = k.parent \
+           WHERE {agree_first} \
+           UNION ALL \
+           SELECT u.kp, u.kr, s.uri, s.reply_parent_uri, s.author_did, u.hop + 1 \
+           FROM up u JOIN private_posts s ON s.uri = u.parent \
+           WHERE u.hop < $2 \
+             AND NOT (CASE WHEN {thread} THEN u.uri = u.kr OR (u.author = split_part(u.kr, '/', 3) AND {parent_private}) \
+                           ELSE NOT {parent_private} END) \
+             AND {agree_next}), \
+         a AS (SELECT up.kp, up.kr, array_agg(DISTINCT up.author) AS authors FROM up GROUP BY up.kp, up.kr) \
+         SELECT p.uri, p.parent, p.root, p.walked, COALESCE(a.authors, '{{}}'::text[]) \
+         FROM p LEFT JOIN a ON a.kp = p.parent AND a.kr = p.root",
+        top = is_top_level("c"),
+        broot = is_branch_root("c"),
+        treply = is_thread_reply("c"),
+        agree_first = agree("s.uri", "s.reply_root_uri", "k.root"),
+        agree_next = agree("s.uri", "s.reply_root_uri", "u.kr"),
+    )
+}
+
+/// [`climb_authors_statement`] for `uris`: at most [`climb_keys`]`(cap)`
+/// posts per statement, sliced past that in one [`SLICED`] transaction. By
+/// URI; a URI with no stored row is absent.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn climb_authors(pool: &PgPool, uris: &[String], cap: u32) -> Result<HashMap<String, Climbed>, sqlx::Error> {
+    type Row = (String, Option<String>, Option<String>, bool, Vec<String>);
+    let mut out = HashMap::new();
+    if uris.is_empty() {
+        return Ok(out);
+    }
+    let sql = climb_authors_statement();
+    let k = climb_keys(cap).max(1);
+    let cap = i32::try_from(cap).unwrap_or(i32::MAX);
+    let rows: Vec<Row> = if uris.len() <= k {
+        sqlx::query_as(&sql).bind(uris).bind(cap).fetch_all(pool).await?
+    } else {
+        let mut tx = pool.begin_with(SLICED).await?;
+        let mut rows = Vec::new();
+        for slice in uris.chunks(k) {
+            let part: Vec<Row> = sqlx::query_as(&sql).bind(slice).bind(cap).fetch_all(&mut *tx).await?;
+            rows.extend(part);
+        }
+        tx.commit().await?;
+        rows
+    };
+    for (uri, parent, root, walked, authors) in rows {
+        out.insert(uri, Climbed { parent, root, walked, authors: if walked { authors } else { Vec::new() } });
+    }
+    Ok(out)
 }
 
 // ---- `notServed` (docs/internal/design/not-served-reason.md §4) ----

@@ -60,7 +60,7 @@ struct Generated {
 
 /// The tables a fixture writes, emptied before the next.
 const T60_TABLES: &str = "private_posts, private_audiences, blocks, private_blocks, labels, follows, sync_state, \
-    private_notifications, private_notification_seen, private_quote_refs";
+    sync_chain_links, private_notifications, private_notification_seen, private_quote_refs";
 
 /// T-60's fixture generator (shared-walk §7): authors with every audience
 /// mode, random list members, follows, verification flags, blocks of both
@@ -554,6 +554,74 @@ async fn t60_the_shared_walk_equals_the_per_key_walk() {
     }
     println!("T-60: {fixtures} fixtures, {rows_seen} rows, {} mismatches", failures.len());
     db.drop_db().await;
+    assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.iter().take(40).cloned().collect::<Vec<_>>().join("\n"));
+}
+
+/// T-DM12 (degraded-mode design §2.5, §2.6): on T-60's generated fixtures
+/// (`HPRS_TDM12_FIXTURES`, else 40), for every author as reader and every
+/// row, `fact8_with_authors` gives `fact8`'s five outputs, and its
+/// `walk_authors` are the authors of the walk's passing rows other than O:
+/// within the structural climb's authors less O, and equal to them when
+/// the walk passed (a passing walk visits every row of the climb), empty
+/// for the reader's own row and for a row that is not walked.
+#[tokio::test]
+async fn tdm12_fact8_with_authors_is_fact8_and_its_walk() {
+    let Some(db) = fresh_db("tdm12-walk-authors").await else {
+        return;
+    };
+    let pool = db.pool.clone();
+    let seed = std::env::var("HPRS_T60_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| u64::try_from(Utc::now().timestamp_micros()).unwrap_or(812));
+    println!("T-DM12 seed {seed}");
+    let fixtures = std::env::var("HPRS_TDM12_FIXTURES").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let mut rng = Rng(seed);
+    let mut failures: Vec<String> = Vec::new();
+    let (mut compared, mut equal_checked) = (0usize, 0usize);
+    for f in 0..fixtures {
+        let cap = [3u32, 5, 16][f % 3];
+        let g = generate(&pool, &mut rng, &format!("tdm12f{f}"), usize::try_from(cap * 2).expect("small")).await;
+        let uris: Vec<String> = g.rows.iter().map(|r| r.uri.clone()).collect();
+        let climbs = schema::climb_authors(&pool, &uris, cap).await.expect("climb");
+        for reader in &g.authors {
+            for row in &g.rows {
+                let plain = schema::fact8(&pool, reader, &row.uri, cap).await.expect("fact 8");
+                let (with, authors) = schema::fact8_with_authors(&pool, reader, &row.uri, cap).await.expect("fact 8 with authors");
+                let at = format!("seed {seed}, fixture {f}, cap {cap}, reader {reader}, {}", row.uri);
+                compared += 1;
+                if plain != with {
+                    failures.push(format!("{at}: fact 8 {plain:?}, with authors {with:?}"));
+                }
+                let mut authors = authors;
+                authors.sort();
+                authors.dedup();
+                let climb = climbs.get(&row.uri);
+                let owner = with.owner.clone().unwrap_or_default();
+                let mut climbed: Vec<String> = climb.map(|c| c.authors.iter().filter(|a| **a != owner).cloned().collect()).unwrap_or_default();
+                climbed.sort();
+                climbed.dedup();
+                if &row.author == reader || !climb.is_some_and(|c| c.walked) {
+                    if !authors.is_empty() {
+                        failures.push(format!("{at}: not walked for this reader, yet walk authors {authors:?}"));
+                    }
+                    continue;
+                }
+                if !authors.iter().all(|a| climbed.contains(a)) {
+                    failures.push(format!("{at}: walk authors {authors:?} outside the climb {climbed:?}"));
+                }
+                if with.verdict && with.s1ok {
+                    equal_checked += 1;
+                    if authors != climbed {
+                        failures.push(format!("{at}: a passing walk's authors {authors:?}, the climb's {climbed:?}"));
+                    }
+                }
+            }
+        }
+    }
+    println!("T-DM12: {compared} reads compared, {equal_checked} passing walks checked equal, {} mismatches", failures.len());
+    db.drop_db().await;
+    assert!(equal_checked > 0, "no passing walk was checked: the equality proves nothing");
     assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.iter().take(40).cloned().collect::<Vec<_>>().join("\n"));
 }
 

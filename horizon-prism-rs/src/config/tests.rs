@@ -136,6 +136,7 @@ membership_valid_for_secs = 3600
 max_chain = 16
 page_reads_factor = 2
 walk_batch_max = 1000
+head_fallback = true
 
 [private_read.floor_ms]
 get_posts = 0

@@ -98,6 +98,27 @@ impl HeadSource for NetHeadSource {
 /// A DID's stored head, whether it is fresh, its PDS and its `applied_rev`.
 type HeadRow = (Option<String>, bool, Option<String>, Option<String>);
 
+/// A head with what the degraded fallback compares it against
+/// (degraded-mode design §2.5): `applied_rev`, `chain_rev`, and when the
+/// head was checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadState {
+    pub head: String,
+    pub applied: Option<String>,
+    pub chain: Option<String>,
+    pub checked_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A stored head read with no fetch (degraded-mode design §2.5): the DID
+/// has no `sync_state` row, its head is older than `head_max_age_secs` (or
+/// unknown), or it is fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredHead {
+    Untracked,
+    Stale,
+    Fresh(HeadState),
+}
+
 /// What one probe found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
@@ -427,6 +448,93 @@ impl HeadProber {
         .await?
         .flatten();
         Ok(Some((rev, applied)))
+    }
+
+    /// [`HeadProber::read_head_applied`] for the degraded fallback
+    /// (degraded-mode design §2.5): the same head, with `chain_rev` and the
+    /// head's check time from the same row, in one statement when the
+    /// stored head is fresh; after a fetch, from the fetch's own write. Only
+    /// a degraded request with the fallback on uses it, so a fresh request's
+    /// statements are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn read_head_state(&self, did: &str, allow_fetch: bool) -> Result<Option<HeadState>, sqlx::Error> {
+        let start = Instant::now();
+        let head = self.read_head_state_inner(did, allow_fetch).await;
+        metrics::histogram!(METRIC_CHECK_SECONDS, "path" => "read").record(start.elapsed().as_secs_f64());
+        head
+    }
+
+    async fn read_head_state_inner(&self, did: &str, allow_fetch: bool) -> Result<Option<HeadState>, sqlx::Error> {
+        type Row = (Option<String>, bool, Option<String>, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>);
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT s.head_rev, \
+               COALESCE(s.head_checked_at > now() - make_interval(secs => $2), false), a.pds_endpoint, s.applied_rev, \
+               s.chain_rev, s.head_checked_at \
+             FROM actors a LEFT JOIN sync_state s ON s.did = a.did WHERE a.did = $1",
+        )
+        .bind(did)
+        .bind(self.cfg.head_max_age_secs as f64)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((head, fresh, pds, applied, chain, checked_at)) = row else {
+            return Ok(None);
+        };
+        if fresh && let (Some(head), Some(checked_at)) = (head, checked_at) {
+            return Ok(Some(HeadState { head, applied, chain, checked_at }));
+        }
+        let Some(pds) = pds.filter(|_| allow_fetch) else {
+            return Ok(None);
+        };
+        if !self.budgets.try_acquire(&HostBudgets::host_of(&pds), Class::ReadFetch) {
+            metrics::counter!(METRIC_CHECKS, "result" => "read_budget_exhausted").increment(1);
+            return Ok(None);
+        }
+        let timeout = Duration::from_millis(self.cfg.head_fetch_timeout_ms);
+        let Ok(rev) = self.source.latest_rev(&pds, did, timeout).await else {
+            metrics::counter!(METRIC_CHECKS, "result" => "error").increment(1);
+            return Ok(None);
+        };
+        metrics::counter!(METRIC_CHECKS, "result" => "read_fetch").increment(1);
+        let written: Option<(Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "UPDATE sync_state SET head_rev = $2, head_checked_at = now() WHERE did = $1 \
+             RETURNING applied_rev, chain_rev, head_checked_at",
+        )
+        .bind(did)
+        .bind(&rev)
+        .fetch_optional(&self.pool)
+        .await?;
+        // No row: nothing applied, and no chain.
+        let (applied, chain, checked_at) = written.unwrap_or((None, None, chrono::Utc::now()));
+        Ok(Some(HeadState { head: rev, applied, chain, checked_at }))
+    }
+
+    /// A DID's stored head with no fetch (degraded-mode design §2.5, step
+    /// 3′): the prober keeps every tracked DID's head fresh, so a stale one
+    /// is a miss, and no fetch budget or read-fetch token is spent. One
+    /// statement.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn stored_head(&self, did: &str) -> Result<StoredHead, sqlx::Error> {
+        type Row = (Option<String>, bool, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>);
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT head_rev, COALESCE(head_checked_at > now() - make_interval(secs => $2), false), \
+               applied_rev, chain_rev, head_checked_at \
+             FROM sync_state WHERE did = $1",
+        )
+        .bind(did)
+        .bind(self.cfg.head_max_age_secs as f64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => StoredHead::Untracked,
+            Some((Some(head), true, applied, chain, Some(checked_at))) => StoredHead::Fresh(HeadState { head, applied, chain, checked_at }),
+            Some(_) => StoredHead::Stale,
+        })
     }
 
     /// Run passes forever.

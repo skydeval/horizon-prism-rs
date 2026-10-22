@@ -263,6 +263,7 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
         ),
         one(Private, "private_read.membership_valid_for_secs", "How long apps trust a membership answer", "How long a Horizon app may act on a member's membership answer before it asks again (1 minute to 1 hour). After you remove a member, their app may still offer private posting for up to this long; private reads stop at once either way.", whole(60, 3600, "seconds")),
         one(Private, "sync.head_max_age_secs", "How fresh private reads must be", "How old Prism's knowledge of an account's latest change may be before a private read checks it again (at most 10 minutes).", whole(0, 600, "seconds")),
+        one(Private, "private_read.head_fallback", "Keep private posts readable while a relay is behind", "When a relay Prism reads private posts from falls behind, still serve a private post if Prism has every change of every account it depends on, checked per read. When off, private posts are unavailable until the relay catches up.", Kind::Switch),
         one(Private, "private_notify.backfill_max_age_hours", "Notify about late private posts for", "When Prism finds a private post while catching up rather than as it happens, it notifies people only if the post was made within this many hours, so an old post found late notifies nobody.", whole(0, 87_600, "hours")),
         one(Private, "private_search.max_age_days", "How far back private search reaches", "How far back a search of private posts reaches.", whole(1, 36_500, "days")),
         // Group 4.

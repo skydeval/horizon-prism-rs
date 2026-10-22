@@ -54,6 +54,10 @@ async fn t52_every_statement_prepares() {
     all.push(("getUnreadCount public term", schema::unread_public_statement()));
     all.push(("pre-S12 count", schema::pre_s12_count_sql()));
     all.push(("pre-S12 owner audiences", schema::pre_s12_owner_audience_sql()));
+    // Degraded mode (T-DM12): the climb and fact 8 with its walk's authors.
+    all.push(("climb authors", schema::climb_authors_statement()));
+    all.push(("fact 8 with authors", schema::fact8_with_authors_statement(CAP)));
+    all.push(("fact 8 with authors at 100", schema::fact8_with_authors_statement(100)));
     for (i, (name, sql)) in all.iter().enumerate() {
         let text = sql.trim_end_matches(';');
         sqlx::raw_sql(&format!("PREPARE s12_t52_{i} AS {text}"))

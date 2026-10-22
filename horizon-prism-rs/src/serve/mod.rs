@@ -246,6 +246,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
             "sync.max_head_fetches_per_request is above sync.read_fetch_rate_per_host: a private thread's head round can find a host's bucket empty and miss"
         );
     }
+    warn_head_fallback_bound(&cfg.file);
     // First-run setup (admin-ui design §5.2): while no operator exists, the
     // setup code is kept or made, and printed now and every 10 minutes.
     let setup_code_file = crate::admin::setup_code::file_path(&cfg.env.data_dir);
@@ -1037,6 +1038,23 @@ pub enum Stopped {
     /// A restart from the admin UI: exit [`EXIT_RESTART`] for the
     /// supervisor to start it again.
     Restart,
+}
+
+/// The degraded fallback's startup check (degraded-mode design §2.5, §7):
+/// a fallback read's oracles answer with the oldest head age, so a head
+/// allowed to be older than `kryphocron.oracle_freshness_bound_secs` makes
+/// kryphocron's bind refuse it. Returns whether it warned.
+pub(crate) fn warn_head_fallback_bound(file: &crate::config::FileConfig) -> bool {
+    let over = file.private_read.head_fallback && file.sync.head_max_age_secs > file.kryphocron.oracle_freshness_bound_secs;
+    if over {
+        tracing::warn!(
+            event = "config_head_fallback_over_bound",
+            head_max_age_secs = file.sync.head_max_age_secs,
+            oracle_freshness_bound_secs = file.kryphocron.oracle_freshness_bound_secs,
+            "sync.head_max_age_secs is above kryphocron.oracle_freshness_bound_secs: while degraded, private reads served by private_read.head_fallback can be refused at bind"
+        );
+    }
+    over
 }
 
 /// Auto-enroll's effective value and host patterns, once at startup

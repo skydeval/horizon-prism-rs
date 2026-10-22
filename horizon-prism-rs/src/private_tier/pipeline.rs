@@ -50,6 +50,12 @@ pub(super) const METRIC_INDEX_CHECK: &str = "private_read_index_check_total";
 /// `notServed`'s content reason (not-served-reason design §2.1): the
 /// record's clear fields over-claim.
 pub(super) const OVER_CLAIM: &str = "overClaim";
+/// Metric: the degraded fallback's per-record results (degraded-mode design
+/// §8): `passed`, `behind`, `untracked`, `climb_cap`, `walk_outside`.
+pub(super) const METRIC_FALLBACK: &str = "private_read_fallback_total";
+/// The most distinct climb authors one read checks (degraded-mode design
+/// §2.5, RS-7): more is a miss while degraded.
+pub(super) const CLIMB_AUTHORS_MAX: usize = 64;
 /// The decode deadline after handler start (§6.3 step 11).
 pub(super) const DECODE_BUDGET: Duration = Duration::from_secs(2);
 
@@ -118,6 +124,11 @@ pub(super) enum Miss {
     /// (S4, private-encode design §7.1), for every reader, its author
     /// included.
     Plaintext,
+    /// Degraded with the head fallback on (degraded-mode design §2.5): a
+    /// repository the read depends on is not shown to hold every commit up
+    /// to its head (step 3′), or the snapshot's walk read a repository
+    /// outside the checked set (step 5′).
+    FallbackBehind,
     Db,
 }
 
@@ -141,6 +152,7 @@ impl Miss {
             Self::BadContent => "bad_content",
             Self::IndexMismatch => "index_mismatch",
             Self::Plaintext => "plaintext",
+            Self::FallbackBehind => "fallback_behind",
             Self::Db => "db_error",
         }
     }
@@ -169,6 +181,9 @@ pub(super) struct PipelineEnv {
     /// `private_any_pds.enabled` (private-encode design §7, S4): a private
     /// post with no encoded content is a uniform miss for every reader.
     pub plaintext_refused: bool,
+    /// `private_read.head_fallback` (degraded-mode design §2, DM-C9): while
+    /// degraded, serve reads whose every repository is shown current.
+    pub head_fallback: bool,
 }
 
 impl PipelineEnv {
@@ -180,19 +195,62 @@ impl PipelineEnv {
     }
 }
 
-/// Per-request state: repo-head results by DID, and the synchronous head
-/// fetch budget.
+/// One DID's head result in a request: `applied_rev ≥ head` (step 3), and
+/// under the degraded fallback `chain_rev ≥ head` and when the head was
+/// checked (degraded-mode design §2.5). Outside the fallback `chain_ok` is
+/// false and `checked_at` `None`: neither is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HeadResult {
+    pub applied_ok: bool,
+    pub chain_ok: bool,
+    pub checked_at: Option<SystemTime>,
+}
+
+/// A head step 3′ looked up with no fetch for a DID step 3 did not check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    Untracked,
+    Stale,
+    Fresh(HeadResult),
+}
+
+/// The request's climbs (degraded-mode design §2.6): by post URI.
+#[derive(Default)]
+struct Climbs {
+    by_uri: HashMap<String, schema::Climbed>,
+}
+
+/// Per-request state: repo-head results by DID, the synchronous head fetch
+/// budget, and whether the request is degraded (decided once, here; degraded-
+/// mode design §3.1), with the fallback's climbs and no-fetch heads.
 pub(super) struct RequestState {
-    heads: Mutex<HashMap<String, bool>>,
+    heads: Mutex<HashMap<String, HeadResult>>,
     fetch_budget: AtomicUsize,
+    degraded: bool,
+    fallback: bool,
+    climbs: Mutex<Climbs>,
+    lookups: Mutex<HashMap<String, Lookup>>,
 }
 
 impl RequestState {
-    pub(super) fn new(max_head_fetches: usize) -> Self {
+    /// The request's state: degraded when the private watermark is not
+    /// fresh now; the fallback on when also `private_read.head_fallback`.
+    pub(super) fn new(env: &PipelineEnv) -> Self {
+        let degraded = !env.watermark_fresh();
         Self {
             heads: Mutex::new(HashMap::new()),
-            fetch_budget: AtomicUsize::new(max_head_fetches),
+            fetch_budget: AtomicUsize::new(env.max_head_fetches),
+            degraded,
+            fallback: degraded && env.head_fallback,
+            climbs: Mutex::new(Climbs::default()),
+            lookups: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether this request is degraded (degraded-mode design §3.1): read
+    /// everywhere from here, so one response never mixes two answers.
+    pub(super) fn degraded(&self) -> bool {
+        self.degraded
     }
 
     /// The head fetches this request may still make (T-56).
@@ -201,10 +259,11 @@ impl RequestState {
         self.fetch_budget.load(Ordering::SeqCst)
     }
 
-    /// The DIDs whose head results this request holds (T-56).
+    /// The DIDs whose head results this request holds, with step 3's result
+    /// (T-56).
     #[cfg(test)]
     pub(super) async fn cached(&self) -> HashMap<String, bool> {
-        self.heads.lock().await.clone()
+        self.heads.lock().await.iter().map(|(d, r)| (d.clone(), r.applied_ok)).collect()
     }
 
     /// One charge of the per-request budget: whether a fetch is funded.
@@ -216,29 +275,49 @@ impl RequestState {
 /// The repo-head check (§6.11.3): `applied_rev ≥ head_rev`, with the head no
 /// older than `sync.head_max_age_secs` or fetched now within the budget.
 async fn head_ok(env: &PipelineEnv, rs: &RequestState, did: &str) -> Result<bool, sqlx::Error> {
-    if let Some(ok) = rs.heads.lock().await.get(did) {
-        return Ok(*ok);
+    if let Some(r) = rs.heads.lock().await.get(did) {
+        return Ok(r.applied_ok);
     }
     let allow = rs.charge();
-    let ok = head_check(env, did, allow).await?;
-    rs.heads.lock().await.insert(did.to_string(), ok);
-    Ok(ok)
+    let r = head_check(env, did, allow, rs.fallback).await?;
+    rs.heads.lock().await.insert(did.to_string(), r);
+    Ok(r.applied_ok)
 }
 
 /// `head_ok`'s check from the head read on (private-threads design §3.4):
 /// the stored head when fresh, else one fetched when `allow`, against
 /// `applied_rev`. Shared with [`prefetch_heads`], so both compare the same
 /// way. One statement per DID when the stored head is fresh: the head and
-/// `applied_rev` come from the same row (fast-reads design F-3).
-async fn head_check(env: &PipelineEnv, did: &str, allow: bool) -> Result<bool, sqlx::Error> {
+/// `applied_rev` come from the same row (fast-reads design F-3). Under the
+/// degraded fallback the same row also gives `chain_rev` and the check time
+/// (degraded-mode design §2.5).
+async fn head_check(env: &PipelineEnv, did: &str, allow: bool, fallback: bool) -> Result<HeadResult, sqlx::Error> {
     #[cfg(test)]
     if crate::test_support::hooks::injected(crate::test_support::hooks::HEAD_CHECK_FAILS, did) {
         return Err(sqlx::Error::PoolTimedOut);
     }
-    Ok(match env.prober.read_head_applied(did, allow).await? {
-        None => false,
-        Some((head, applied)) => applied.is_some_and(|a| a >= head),
+    if fallback {
+        return Ok(match env.prober.read_head_state(did, allow).await? {
+            None => HeadResult { applied_ok: false, chain_ok: false, checked_at: None },
+            Some(h) => head_result(&h),
+        });
+    }
+    Ok(HeadResult {
+        applied_ok: match env.prober.read_head_applied(did, allow).await? {
+            None => false,
+            Some((head, applied)) => applied.is_some_and(|a| a >= head),
+        },
+        chain_ok: false,
+        checked_at: None,
     })
+}
+
+fn head_result(h: &crate::sync::HeadState) -> HeadResult {
+    HeadResult {
+        applied_ok: h.applied.as_ref().is_some_and(|a| *a >= h.head),
+        chain_ok: h.chain.as_ref().is_some_and(|c| *c >= h.head),
+        checked_at: Some(SystemTime::from(h.checked_at)),
+    }
 }
 
 /// What a head round left behind (§3.4).
@@ -273,18 +352,18 @@ pub(super) async fn prefetch_heads(env: &PipelineEnv, rs: &RequestState, dids: &
     let checks: Vec<_> = funded
         .into_iter()
         .map(|(did, allow)| async move {
-            let result = head_check(env, &did, allow).await;
+            let result = head_check(env, &did, allow, rs.fallback).await;
             (did, result)
         })
         .collect();
-    let results: Vec<(String, Result<bool, sqlx::Error>)> =
+    let results: Vec<(String, Result<HeadResult, sqlx::Error>)> =
         futures::stream::iter(checks).buffered(concurrency.max(1)).collect().await;
     let mut out = Prefetch::default();
     let mut cached = rs.heads.lock().await;
     for (did, result) in results {
         match result {
-            Ok(ok) => {
-                cached.insert(did, ok);
+            Ok(r) => {
+                cached.insert(did, r);
             }
             Err(e) => {
                 tracing::warn!(event = "private_read_db_error", error = %e, "a head check in the round failed on the database");
@@ -317,6 +396,125 @@ pub(super) async fn ready(env: &PipelineEnv, author: &str, audience_owner: Optio
         Some(a) => readiness::owner_ready(&env.pool, a).await,
         None => Ok(true),
     }
+}
+
+/// The climbs of `uris` in one statement (degraded-mode design §2.6), for
+/// a request under the fallback: every handler that reads a set of rows
+/// calls this before reading them, so siblings and a page share one
+/// statement. URIs already climbed are skipped. A database error leaves
+/// them unclimbed: each read then climbs its own.
+pub(super) async fn prefill_climbs(env: &PipelineEnv, rs: &RequestState, uris: &[String]) {
+    if !rs.fallback {
+        return;
+    }
+    let wanted: Vec<String> = {
+        let climbs = rs.climbs.lock().await;
+        let mut wanted: Vec<String> = Vec::new();
+        for u in uris {
+            if !climbs.by_uri.contains_key(u) && !wanted.contains(u) {
+                wanted.push(u.clone());
+            }
+        }
+        wanted
+    };
+    if wanted.is_empty() {
+        return;
+    }
+    match schema::climb_authors(&env.pool, &wanted, env.max_chain).await {
+        Ok(found) => rs.climbs.lock().await.by_uri.extend(found),
+        Err(e) => tracing::warn!(event = "private_read_db_error", error = %e, "a climb prefill failed on the database"),
+    }
+}
+
+/// The climb of `uri` (degraded-mode design §2.6): from the request's
+/// cache, else one statement for it alone. `None` when no row is stored.
+async fn climb_of(env: &PipelineEnv, rs: &RequestState, uri: &str) -> Result<Option<schema::Climbed>, sqlx::Error> {
+    if let Some(c) = rs.climbs.lock().await.by_uri.get(uri) {
+        return Ok(Some(c.clone()));
+    }
+    let mut found = schema::climb_authors(&env.pool, &[uri.to_string()], env.max_chain).await?;
+    let climbed = found.remove(uri);
+    if let Some(c) = &climbed {
+        rs.climbs.lock().await.by_uri.insert(uri.to_string(), c.clone());
+    }
+    Ok(climbed)
+}
+
+/// A DID's head for step 3′: step 3's result when it checked the DID in
+/// this request, else the stored head with no fetch (degraded-mode design
+/// §2.5), cached apart so it never stands in for step 3's own check.
+async fn fallback_head(env: &PipelineEnv, rs: &RequestState, did: &str) -> Result<Lookup, sqlx::Error> {
+    if let Some(r) = rs.heads.lock().await.get(did) {
+        return Ok(Lookup::Fresh(*r));
+    }
+    if let Some(l) = rs.lookups.lock().await.get(did) {
+        return Ok(*l);
+    }
+    let l = match env.prober.stored_head(did).await? {
+        crate::sync::StoredHead::Untracked => Lookup::Untracked,
+        crate::sync::StoredHead::Stale => Lookup::Stale,
+        crate::sync::StoredHead::Fresh(h) => Lookup::Fresh(head_result(&h)),
+    };
+    rs.lookups.lock().await.insert(did.to_string(), l);
+    Ok(l)
+}
+
+/// What step 3′ found: the DIDs shown Current, and the oldest of their head
+/// checks, which the oracles answer `last_synced_at` with.
+struct Certified {
+    current: HashSet<String>,
+    last_synced: Option<SystemTime>,
+}
+
+fn fallback_miss(result: &'static str) -> Miss {
+    metrics::counter!(METRIC_FALLBACK, "result" => result).increment(1);
+    Miss::FallbackBehind
+}
+
+/// Step 3′ (degraded-mode design §2.5): Current(X) for every X in the
+/// decide set D(V, P) = {W, V, A} ∪ Climb(P) (Climb only on another reader's
+/// walked post), before the snapshot. W, V and A reuse step 3's results;
+/// every other X is its stored head with no fetch. Runs for every record
+/// that reaches it, whatever the read rule will say.
+async fn certify(env: &PipelineEnv, rs: &RequestState, caller: &str, uri: &str, author: &str, audience_owner: Option<&str>) -> Result<Certified, Miss> {
+    let mut d: Vec<String> = vec![author.to_string()];
+    for x in [Some(caller), audience_owner].into_iter().flatten() {
+        if !d.iter().any(|y| y == x) {
+            d.push(x.to_string());
+        }
+    }
+    if caller != author
+        && let Some(climbed) = climb_of(env, rs, uri).await?
+        && climbed.walked
+    {
+        let mut distinct: Vec<&String> = climbed.authors.iter().collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() > CLIMB_AUTHORS_MAX {
+            return Err(fallback_miss("climb_cap"));
+        }
+        for x in distinct {
+            if !d.contains(x) {
+                d.push(x.clone());
+            }
+        }
+    }
+    let mut certified = Certified { current: HashSet::new(), last_synced: None };
+    for x in d {
+        match fallback_head(env, rs, &x).await? {
+            Lookup::Untracked => return Err(fallback_miss("untracked")),
+            Lookup::Stale => return Err(fallback_miss("behind")),
+            Lookup::Fresh(r) if !r.chain_ok => return Err(fallback_miss("behind")),
+            Lookup::Fresh(r) => {
+                certified.last_synced = match (certified.last_synced, r.checked_at) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                certified.current.insert(x);
+            }
+        }
+    }
+    Ok(certified)
 }
 
 fn trace_id() -> TraceId {
@@ -393,6 +591,18 @@ async fn read_inner(
         }
     }
 
+    // 3′. Degraded with the head fallback on (degraded-mode design §2.5):
+    // every repository the read depends on holds every commit up to its
+    // head, shown before the snapshot.
+    let certified = if rs.fallback {
+        let c = certify(env, rs, &caller.did, uri, owner_s, audience_owner).await?;
+        #[cfg(test)]
+        crate::test_support::hooks::pause(crate::test_support::hooks::FALLBACK_AFTER_CHECK, uri).await;
+        Some(c)
+    } else {
+        None
+    };
+
     // 4. The oracle snapshot.
     let resource = ResourceId::new(owner.clone(), nsid.clone(), rkey.clone());
     let watermark = env.watermarks.private_watermark().map(SystemTime::from);
@@ -402,18 +612,32 @@ async fn read_inner(
             requester: &caller.did,
             resource: &resource,
             uri,
-            watermark,
+            last_synced: certified.as_ref().map_or(watermark, |c| c.last_synced),
             bound: env.freshness_bound,
             max_chain: env.max_chain,
+            with_authors: certified.is_some(),
         },
     )
     .await?;
 
-    // 5. Host freshness: the only block-freshness enforcement point.
+    // 5. Host freshness: the only block-freshness enforcement point, or,
+    // under the fallback, step 5′: fact 8's O and every author its walk
+    // read are among the repositories step 3′ showed Current. On the
+    // author's own read nothing beyond step 3′'s W and A.
     let now = SystemTime::now();
-    let fresh = watermark.is_some_and(|w| now.duration_since(w).unwrap_or(Duration::ZERO) <= env.freshness_bound);
-    if !fresh {
-        return Err(Miss::Stale);
+    if let Some(c) = &certified {
+        if caller.did != owner_s {
+            let outside = snap.fact8_owner().into_iter().chain(snap.walk_authors().iter().map(String::as_str)).any(|d| !c.current.contains(d));
+            if outside {
+                return Err(fallback_miss("walk_outside"));
+            }
+        }
+        metrics::counter!(METRIC_FALLBACK, "result" => "passed").increment(1);
+    } else {
+        let fresh = watermark.is_some_and(|w| now.duration_since(w).unwrap_or(Duration::ZERO) <= env.freshness_bound);
+        if !fresh {
+            return Err(Miss::Stale);
+        }
     }
     let view_audience = snap.view_audience().map(str::to_string);
 

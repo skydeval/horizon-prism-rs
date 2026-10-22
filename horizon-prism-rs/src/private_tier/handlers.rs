@@ -178,6 +178,7 @@ impl PrivateState {
                 max_head_fetches,
                 max_chain: cfg.max_chain,
                 plaintext_refused: crate::config::PrivateAnyPdsConfig::default().enabled,
+                head_fallback: cfg.head_fallback,
             },
             floors: Floors {
                 get_posts: Duration::from_millis(cfg.floor_ms.get_posts),
@@ -306,6 +307,9 @@ async fn read_many(
     authors: &ProfileContext,
     start: Instant,
 ) -> Vec<Option<PrivateEmit<Value>>> {
+    // Degraded with the head fallback on: the set's climbs in one statement
+    // before any read (degraded-mode design §2.6).
+    stages::reading(pipeline::prefill_climbs(&s.env, rs, uris)).await;
     // Futures are lazy: building them all first only fixes their borrows.
     let reads: Vec<_> = uris.iter().map(|u| read_post(s, rs, caller, u, authors, start)).collect();
     futures::stream::iter(reads)
@@ -791,7 +795,7 @@ async fn posts_body(
     let candidates: Vec<String> = wanted.into_iter().filter(|u| passing.contains(u)).collect();
     let hydration = private_hydration(s, caller, ip).await?;
     let authors = profiles(&hydration, &candidates).await?;
-    let rs = RequestState::new(s.env.max_head_fetches);
+    let rs = RequestState::new(&s.env);
     let mut posts: Vec<PrivateEmit<Value>> =
         read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
     let mut refs: Vec<&mut PrivateEmit<Value>> = posts.iter_mut().collect();
@@ -892,7 +896,7 @@ async fn thread_body(
     parent_height: u32,
     start: Instant,
 ) -> Result<Option<PrivateResponse>, XrpcError> {
-    let rs = RequestState::new(s.env.max_head_fetches);
+    let rs = RequestState::new(&s.env);
     let hydration = private_hydration(s, caller, ip).await?;
     let pool = &s.env.pool;
     // 1. The structural chain: the anchor's row and its ancestors, with no
@@ -915,7 +919,7 @@ async fn thread_body(
     // prefilter, a stale watermark or an anchor that is not ready takes
     // HEAD's sequential path, with no round.
     let anchor_row = match rows.first() {
-        Some((u, ..)) if passing.contains(u) && s.env.watermark_fresh() => Covered::of(s, u).await?,
+        Some((u, ..)) if passing.contains(u) && !rs.degraded() => Covered::of(s, u).await?,
         _ => None,
     };
     let Some(anchor_row) = anchor_row else {
@@ -1063,6 +1067,8 @@ async fn thread_sequential(
     // for the caller unless the anchor or the chain already read it, so
     // that its gate applies (§4.4, C-17). A root the caller cannot read
     // hides nothing and disables nothing.
+    #[cfg(test)]
+    tests::record_chain_state(&format!("sequential:{uri}"), rs).await;
     let root = claimed_root(&anchor).unwrap_or_else(|| uri.to_string());
     let chain_has_root = chain.iter().any(|p| view_uri(p).as_deref() == Some(root.as_str()));
     let root_read = if root == uri || chain_has_root {
@@ -1368,7 +1374,7 @@ async fn feed_body(
     // One lookahead row tells whether prefiltered candidates remain.
     let need = max_reads + 1;
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(s.env.max_head_fetches);
+    let rs = RequestState::new(&s.env);
     let (pool, me, bounds) = (&s.env.pool, caller.did.as_str(), s.bounds);
     let first = i64::try_from(need).unwrap_or(i64::MAX);
     let key = |c: &schema::FeedCandidate| (c.created_at, c.key.clone());
@@ -1653,7 +1659,7 @@ async fn bookmarks_body(
     let candidates: Vec<String> = uris.into_iter().filter(|u| passing.contains(u)).collect();
     let hydration = private_hydration(s, caller, ip).await?;
     let authors = profiles(&hydration, &candidates).await?;
-    let rs = RequestState::new(s.env.max_head_fetches);
+    let rs = RequestState::new(&s.env);
     let mut hits: HashMap<String, PrivateEmit<Value>> = HashMap::new();
     for (uri, hit) in candidates.iter().zip(read_many(s, &rs, caller, &candidates, &authors, start).await) {
         if let Some(post) = hit {
@@ -1768,7 +1774,7 @@ async fn interactions_body(
         Interaction::Repost => PrivateResponse::reposted_by(uri.to_string(), items, cursor),
     };
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(s.env.max_head_fetches);
+    let rs = RequestState::new(&s.env);
     if !anchor_readable(s, &rs, caller, &hydration, uri, start).await? {
         return Ok(respond(Vec::new(), None));
     }
@@ -1843,7 +1849,7 @@ async fn quotes_body(
     start: Instant,
 ) -> Result<PrivateResponse, XrpcError> {
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(s.env.max_head_fetches);
+    let rs = RequestState::new(&s.env);
     if !anchor_readable(s, &rs, caller, &hydration, uri, start).await? {
         return Ok(PrivateResponse::quotes(uri.to_string(), Vec::new(), None));
     }
@@ -1973,7 +1979,7 @@ async fn replies_anchor(
         wanted.push(claimed.clone());
     }
     let passing: HashSet<String> = schema::prefilter_uris(pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
-    let anchor_row = if stored.is_some() && passing.contains(uri) && s.env.watermark_fresh() {
+    let anchor_row = if stored.is_some() && passing.contains(uri) && !rs.degraded() {
         Covered::of(s, uri).await?
     } else {
         None
@@ -2018,7 +2024,7 @@ async fn replies_body(
     start: Instant,
 ) -> Result<PrivateResponse, XrpcError> {
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(s.env.max_head_fetches);
+    let rs = RequestState::new(&s.env);
     // The thread's root, when it was read for the caller in this request.
     let mut roots_read: Vec<String> = Vec::new();
     if is_private_uri(uri) {
@@ -2223,7 +2229,7 @@ async fn search_body(
     let scanned_all = i64::try_from(candidates.len()).unwrap_or(i64::MAX) >= bounds.scan_candidates;
 
     let hydration = private_hydration(s, caller, ip).await?;
-    let rs = RequestState::new(s.env.max_head_fetches);
+    let rs = RequestState::new(&s.env);
     let wanted: Vec<&(String, DateTime<Utc>)> = candidates.iter().filter(|(u, _)| query.may_match(u)).collect();
     let uris: Vec<String> = wanted.iter().map(|(u, _)| u.clone()).collect();
     let authors = profiles(&hydration, &uris).await?;
@@ -2338,7 +2344,7 @@ async fn notifications_body(
     let passing: HashSet<String> = schema::prefilter_uris(pool, me, &post_uris, s.env.max_chain).await?.into_iter().collect();
     let candidates: Vec<String> = post_uris.into_iter().filter(|u| passing.contains(u)).collect();
     let authors = profiles(&hydration, &candidates).await?;
-    let rs = RequestState::new(s.env.max_head_fetches);
+    let rs = RequestState::new(&s.env);
     let mut posts: Vec<PrivateEmit<Value>> = read_many(s, &rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
     let mut refs: Vec<&mut PrivateEmit<Value>> = posts.iter_mut().collect();
     operator_labels(&hydration, &mut refs).await?;

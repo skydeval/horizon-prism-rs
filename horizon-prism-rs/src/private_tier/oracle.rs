@@ -67,6 +67,11 @@ pub(super) struct OracleSnapshot {
     muted: bool,
     last_synced: SystemTime,
     bound: Duration,
+    /// Fact 8's O (degraded-mode design §2.5, step 5′).
+    fact8_owner: Option<String>,
+    /// The authors of the rows fact 8's walk visited, other than O; read
+    /// only with `with_authors`, else empty.
+    walk_authors: Vec<String>,
 }
 
 /// Inputs for [`OracleSnapshot::load`].
@@ -74,11 +79,17 @@ pub(super) struct SnapshotInputs<'a> {
     pub requester: &'a str,
     pub resource: &'a ResourceId,
     pub uri: &'a str,
-    /// `private_watermark`; `None` (no watermark yet) is infinitely stale.
-    pub watermark: Option<SystemTime>,
+    /// What the oracles answer `last_synced_at` with: `private_watermark`,
+    /// or under the degraded fallback the oldest head check of the repos
+    /// the read depends on (degraded-mode design §2.5). `None` (no
+    /// watermark yet) is infinitely stale.
+    pub last_synced: Option<SystemTime>,
     pub bound: Duration,
     /// `private_read.max_chain`, the walk's cap (private-threads §2.3).
     pub max_chain: u32,
+    /// Read fact 8 with its walk's authors (`schema::fact8_with_authors`):
+    /// only while degraded with the head fallback on.
+    pub with_authors: bool,
 }
 
 impl OracleSnapshot {
@@ -97,7 +108,13 @@ impl OracleSnapshot {
         // Fact 8: the read rule's verdict, as the one-row case of the
         // candidate statement (private-threads design §3.2): O, G, stage 1
         // and the walk.
-        let f8 = schema::fact8(pool, input.requester, input.uri, input.max_chain).await?;
+        let (f8, walk_authors) = if input.with_authors {
+            #[cfg(test)]
+            crate::test_support::hooks::pause(crate::test_support::hooks::FALLBACK_BEFORE_FACT8, input.uri).await;
+            schema::fact8_with_authors(pool, input.requester, input.uri, input.max_chain).await?
+        } else {
+            (schema::fact8(pool, input.requester, input.uri, input.max_chain).await?, Vec::new())
+        };
         // Fact 2 and the relation facts, bound to fact 8's G and O, loaded
         // on every load whatever the mode, so that the mode adds no
         // difference of its own. With no anchor (`''`, the post's owner
@@ -165,9 +182,22 @@ impl OracleSnapshot {
             requester_blocks_owner,
             owner_blocks_requester,
             muted,
-            last_synced: input.watermark.unwrap_or(SystemTime::UNIX_EPOCH),
+            last_synced: input.last_synced.unwrap_or(SystemTime::UNIX_EPOCH),
             bound: input.bound,
+            fact8_owner: f8.owner.clone(),
+            walk_authors,
         })
+    }
+
+    /// Fact 8's O, when it found an anchor.
+    pub(super) fn fact8_owner(&self) -> Option<&str> {
+        self.fact8_owner.as_deref().filter(|o| !o.is_empty())
+    }
+
+    /// The authors of the rows fact 8's walk visited, other than O (empty
+    /// unless loaded `with_authors`).
+    pub(super) fn walk_authors(&self) -> &[String] {
+        &self.walk_authors
     }
 
     /// The audience the post's view names (private-threads design §2.6):

@@ -31,6 +31,8 @@ mod round;
 mod threads;
 // The shared walk (#720): T-60 to T-63.
 mod walk;
+// Degraded mode: the head fallback (degraded-mode design §10).
+mod degraded;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -248,6 +250,7 @@ impl Fixture {
             max_chain: read.max_chain,
             page_reads_factor: read.page_reads_factor,
             walk_batch_max: read.walk_batch_max,
+            head_fallback: read.head_fallback,
             floor_ms: PrivateReadFloors {
                 get_posts: ms,
                 get_post_thread: ms,
@@ -888,9 +891,10 @@ async fn oracle_admits_capped(pool: &PgPool, reader: &str, uri: &str, cap: u32) 
             requester: reader,
             resource: &resource,
             uri,
-            watermark: Some(SystemTime::now()),
+            last_synced: Some(SystemTime::now()),
             bound: Duration::from_secs(120),
             max_chain: cap,
+            with_authors: false,
         },
     )
     .await

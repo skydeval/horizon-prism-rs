@@ -340,6 +340,13 @@ pub mod hooks {
     /// before the first candidate's marker. Key: `<database>/expiry`
     /// ([`pause_in`]).
     pub const EXPIRY_AFTER_SELECT: &str = "m_expiry_after_select";
+    /// The private pipeline under the degraded fallback, after step 3′
+    /// found every repo Current and before the snapshot (degraded-mode
+    /// T-DM3b). Key: the post's URI.
+    pub const FALLBACK_AFTER_CHECK: &str = "dm_fallback_after_check";
+    /// The snapshot under the degraded fallback, before fact 8 (after the
+    /// climb). Key: the post's URI.
+    pub const FALLBACK_BEFORE_FACT8: &str = "dm_fallback_before_fact8";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);

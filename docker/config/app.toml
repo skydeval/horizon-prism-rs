@@ -156,6 +156,12 @@ membership_valid_for_secs = 3600
 max_chain = 16
 page_reads_factor = 2
 walk_batch_max = 1000
+# While a private relay is behind (the private watermark older than
+# kryphocron.oracle_freshness_bound_secs), serve a private read when Prism
+# holds every commit of every repository the read depends on, checked per
+# read against each repository's head (design degraded-mode.md §2). Off: every
+# private read misses until the relay catches up.
+head_fallback = true
 
 # Whole-handler latency floors, off by default (design timing-floors.md). A
 # private post's existence is not secret (skydeval, 2026-10-15), so Prism

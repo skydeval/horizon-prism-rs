@@ -7,7 +7,7 @@ pub mod budgets;
 pub mod head_prober;
 
 pub use budgets::{BudgetRates, Class, HostBudgets};
-pub use head_prober::{HeadProber, HeadSource, NetHeadSource, ProbeResult};
+pub use head_prober::{HeadProber, HeadSource, HeadState, NetHeadSource, ProbeResult, StoredHead};
 
 /// Whether `serve` spawns the background head prober: never under the
 /// `bench-heads` feature (private-threads design §4, "the bench regime"),
