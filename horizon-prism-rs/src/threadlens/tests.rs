@@ -798,6 +798,12 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     assert!(status == 400 && body.contains("NotEnrolled"), "{body}");
     let (status, body) = call(&url, GET_THREAD, R2, 6, &thread_input).await;
     assert!(status == 400 && body.contains("NotReady"), "{body}");
+    // T-DM9 (degraded-mode design §3.5): ready once before, its readiness
+    // since cleared: `503 Reindexing`, with `retryAfter` in the body.
+    exec(p, &format!("UPDATE members SET first_ready_at = now() WHERE did = '{R2}'")).await;
+    let (status, body) = call(&url, GET_THREAD, R2, 6, &thread_input).await;
+    assert!(status == 503 && body.contains("\"Reindexing\"") && body.contains("\"retryAfter\":30"), "{body}");
+    exec(p, &format!("UPDATE members SET first_ready_at = NULL WHERE did = '{R2}'")).await;
     let r = reqwest::Client::new().post(format!("{url}/xrpc/{GET_THREAD}")).json(&thread_input).send().await.expect("request");
     assert_eq!(r.status().as_u16(), 401);
     // `access = "signed_in"` still needs a token.

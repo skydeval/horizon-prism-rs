@@ -10,6 +10,36 @@ commit.
 
 ## [Unreleased]
 
+### Added (degraded mode DM4: `Reindexing`, #825)
+
+- **D, readiness cleared after the first time** (degraded-mode design
+  §3.5): a member whose `ready_at` was cleared while `first_ready_at` is
+  set (a gap, the prober's divergence, a dead letter, a purge marker's
+  interim) now gets **`503 Reindexing`** with `retryAfter` in the body and
+  the `Retry-After` header, instead of `400 NotReady`, at every site that
+  answered `NotReady`: the private gate, the member-only public gate,
+  Thread Lens's gate (`access = members`), and the two view-error sites
+  (`getTimeline`, `putActivitySubscription`), each through one
+  constructor. A client that turns private features off on `NotReady`
+  keeps the member a member and retries. First-time indexing, `Enrolled`
+  and `Purging` stay `400 NotReady`. `Enrollment::Member` carries
+  `reindexing`; `member_state`, `Enroller::check` and Thread Lens read
+  `first_ready_at` beside `ready_at`.
+- **`getMembership`** answers such a member **`reindexing`**, with a
+  member's permissions, and `validForSecs` and `Retry-After` both
+  **`community.reindex_retry_secs`** (new key, default 30, 1 to 3 600, in
+  the admin settings). First-time indexing is still `indexing`.
+- The 503 is a gate error, outside the timing floors, as `NotReady` is.
+- Lexicons: `Reindexing` in every private method's and Thread Lens's
+  `errors`; `getMembership`'s `status` gains `reindexing`; the feature
+  **`private.reindexing`**. The stock `app.bsky.*` lexicons are not
+  edited; a stock client gets the 503 from a member-only public endpoint
+  where it got a 400 before.
+- Metric: `xrpc_reindexing_total{site}` (`private`, `public`,
+  `threadlens`, `view`, `membership`).
+- `migrate status`'s test lists migration 0039 (missed in DM1).
+- No migration.
+
 ### Added (degraded mode DM3: telling clients, #824)
 
 - **A, the response signal** (degraded-mode design §3.2): `getPosts`,

@@ -904,3 +904,70 @@ fn tdm11_the_feature_is_listed() {
     let at = |name: &str| f.iter().position(|x| *x == name);
     assert!(at("private.degraded").is_some_and(|d| at("private.notServed").is_some_and(|n| d == n + 1)), "{f:?}");
 }
+
+// ---- D: readiness cleared after the first time (degraded-mode design §3.5) ----
+
+/// T-DM9 (D), the private gate and the two view-error sites: after a gap
+/// transaction a member is `503 Reindexing` with `retryAfter` in the body
+/// and the header; a member never ready, and a removed-and-re-added one,
+/// are `400 NotReady`; after the settle, 200. D's 503 is a gate error,
+/// outside the floor (T-DM10).
+#[tokio::test]
+async fn tdm9_reindexing_at_the_private_gate_and_the_view_sites() {
+    let Some(w) = Walk::new_in("dm9-reindexing", PublicMode::On, Layout::SamePds, Some("followers"), &[], &[], Arc::new(NoHeads)).await else {
+        return;
+    };
+    let pool = w.f.pool.clone();
+    exec(&pool, "UPDATE members SET first_ready_at = ready_at").await;
+    let floor = Duration::from_millis(400);
+    let base = serve_live(w.f.state_read(w.f.app.clone(), Some(Duration::from_secs(1)), floor, &TEST_CURSOR_KEY, &PrivateReadConfig::default())).await;
+    let root = w.root.clone();
+    let scope = ScopeState::new(w.f.sets.clone(), ScopePolicy::MembersAndOneHop, 10_000);
+    crate::firehose::gap::run_gap_transaction_clearing(&pool, &scope, &KryphocronPrivateTier, crate::firehose::gap::GapCause::Trim, false, false)
+        .await
+        .expect("gap");
+    let expected = "{\"error\":\"Reindexing\",\"message\":\"Account re-indexing after an interruption; try again\",\"retryAfter\":30}";
+    let start = Instant::now();
+    let (status, body, retry) = get_with_retry(&base, POSTS, &format!("uris={root}"), BOB).await;
+    let took = start.elapsed();
+    assert_eq!((status, body.as_str(), retry.as_deref()), (503, expected, Some("30")));
+    assert!(took < floor, "outside the floor: {took:?}");
+
+    // The view-error sites' own checks.
+    let viewer = crate::hydration::Viewer { did: Some(BOB.to_string()), hydrate: false };
+    let req = crate::xrpc::auth::request_handle(None, "127.0.0.1".parse().expect("ip"));
+    let timeline = w.f.app.hydrator.get_timeline(&viewer, &req, 10, None).await.expect("db");
+    let e = crate::xrpc::errors::XrpcError::from(timeline.expect_err("a view error"));
+    assert_eq!((e.status.as_u16(), e.error, e.retry_after), (503, "Reindexing", Some(30)));
+    let sub = w.f.app.hydrator.put_activity_subscription(&viewer, CAROL, true, false).await.expect("db");
+    let e = crate::xrpc::errors::XrpcError::from(sub.expect_err("a view error"));
+    assert_eq!((e.status.as_u16(), e.error, e.retry_after), (503, "Reindexing", Some(30)));
+
+    // Never ready: NotReady, at the gate and the view sites alike.
+    exec(&pool, &format!("UPDATE members SET first_ready_at = NULL WHERE did = '{BOB}'")).await;
+    let (status, body, _) = get_with_retry(&base, POSTS, &format!("uris={root}"), BOB).await;
+    assert!(status == 400 && body.contains("\"NotReady\"") && !body.contains("retryAfter"), "{status} {body}");
+    let timeline = w.f.app.hydrator.get_timeline(&viewer, &req, 10, None).await.expect("db");
+    assert_eq!(timeline.expect_err("a view error").error, "NotReady");
+
+    // Removed and re-added: `first_ready_at` starts again, NotReady.
+    // (A removal deletes the row; `add_member` inserts a fresh one.)
+    exec(&pool, &format!("DELETE FROM members WHERE did = '{CAROL}'")).await;
+    exec(&pool, &format!("INSERT INTO members (did, source) VALUES ('{CAROL}', 'admin')")).await;
+    let (status, body, _) = get_with_retry(&base, POSTS, &format!("uris={root}"), CAROL).await;
+    assert!(status == 400 && body.contains("\"NotReady\""), "{status} {body}");
+
+    // The settle: ready again, 200.
+    exec(&pool, &format!("UPDATE members SET ready_at = now(), first_ready_at = COALESCE(first_ready_at, now()) WHERE did = '{DAVE}'")).await;
+    let (status, body, _) = get_with_retry(&base, POSTS, &format!("uris={root}"), DAVE).await;
+    assert_eq!(status, 200, "{body}");
+    w.finish().await;
+}
+
+/// T-DM11: `private.reindexing` is listed, after `private.degraded`.
+#[test]
+fn tdm11_reindexing_is_listed() {
+    let f = crate::private_tier::FEATURES;
+    let at = |name: &str| f.iter().position(|x| *x == name);
+    assert!(at("private.reindexing").is_some_and(|r| at("private.degraded").is_some_and(|d| r == d + 1)), "{f:?}");
+}

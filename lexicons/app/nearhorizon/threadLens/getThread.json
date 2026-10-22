@@ -71,7 +71,11 @@
       "errors": [
         { "name": "InvalidRequest", "description": "Malformed request body, a parameter out of range, or a repliesCursor that is not valid for this anchor." },
         { "name": "NotEnrolled", "description": "The caller is not a member." },
-        { "name": "NotReady", "description": "The caller's account is not ready yet." }
+        { "name": "NotReady", "description": "The caller's account is not ready yet." },
+        {
+          "name": "Reindexing",
+          "description": "The caller's account is being re-indexed after an interruption; retry after `retryAfter` seconds (in the body; also the Retry-After header). Not NotReady: the caller is still a member."
+        }
       ]
     }
   }

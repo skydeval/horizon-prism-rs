@@ -79,6 +79,9 @@ pub struct MembershipSettings {
     pub refusal_cache_secs: u64,
     /// The live settings, read on every call for `threadlens.access`.
     pub live: LiveSettings,
+    /// `community.reindex_retry_secs` (degraded-mode design §3.5): the
+    /// `Reindexing` answers' `retryAfter` and `reindexing`'s validity.
+    pub reindex_retry_secs: u64,
 }
 
 impl MembershipSettings {
@@ -93,7 +96,15 @@ impl MembershipSettings {
             valid_for_secs: cfg.membership_valid_for_secs,
             refusal_cache_secs: CommunityConfig::default().enroll_refusal_cache_secs,
             live: LiveSettings::default(),
+            reindex_retry_secs: CommunityConfig::default().reindex_retry_secs,
         }
+    }
+
+    /// `community.reindex_retry_secs` from the config.
+    #[must_use]
+    pub fn with_reindex_retry(mut self, secs: u64) -> Self {
+        self.reindex_retry_secs = secs;
+        self
     }
 
     /// `community.enroll_refusal_cache_secs` from the config.
@@ -112,6 +123,7 @@ impl MembershipSettings {
         match status {
             MembershipStatus::Member => self.valid_for_secs,
             MembershipStatus::Indexing => self.retry_after_secs,
+            MembershipStatus::Reindexing => self.reindex_retry_secs,
             MembershipStatus::NotEligible => self.valid_for_secs.min(self.refusal_cache_secs),
         }
     }
@@ -131,10 +143,11 @@ impl MembershipSettings {
     #[must_use]
     pub fn permissions(&self, status: MembershipStatus, features: &[&str]) -> Permissions {
         let private = !self.private_features.is_empty();
-        let member = status == MembershipStatus::Member;
+        // A member being re-indexed keeps a member's permissions (§3.5).
+        let member = matches!(status, MembershipStatus::Member | MembershipStatus::Reindexing);
         Permissions {
             private_read: private && member,
-            private_indexed: private && matches!(status, MembershipStatus::Member | MembershipStatus::Indexing),
+            private_indexed: private && matches!(status, MembershipStatus::Member | MembershipStatus::Reindexing | MembershipStatus::Indexing),
             thread_lens: features.contains(&FEATURE_THREAD_LENS) && (member || features.contains(&FEATURE_THREAD_LENS_SIGNED_IN)),
         }
     }
@@ -202,8 +215,9 @@ pub async fn get_membership(State(s): State<AppState>, ConnectInfo(peer): Connec
         None => member_state(&s, &caller.did).await?,
     };
     let status = match enrollment {
-        Enrollment::Member { ready: true } => MembershipStatus::Member,
-        Enrollment::Member { ready: false } | Enrollment::Enrolled | Enrollment::Purging => MembershipStatus::Indexing,
+        Enrollment::Member { ready: true, .. } => MembershipStatus::Member,
+        Enrollment::Member { ready: false, reindexing: true } => MembershipStatus::Reindexing,
+        Enrollment::Member { ready: false, .. } | Enrollment::Enrolled | Enrollment::Purging => MembershipStatus::Indexing,
         Enrollment::Refused(REFUSED_RATE) => {
             return Err(XrpcError::new(StatusCode::TOO_MANY_REQUESTS, "RateLimitExceeded", "Rate Limit Exceeded")
                 .with_retry_after(ENROLL_CAP_RETRY_AFTER_SECS));
@@ -213,6 +227,10 @@ pub async fn get_membership(State(s): State<AppState>, ConnectInfo(peer): Connec
     let mut headers = vec![(CACHE_CONTROL_HEADER, HeaderValue::from_static(CACHE_CONTROL))];
     if status == MembershipStatus::Indexing {
         headers.push((RETRY_AFTER, HeaderValue::from(s.membership.retry_after_secs)));
+    }
+    if status == MembershipStatus::Reindexing {
+        metrics::counter!(crate::xrpc::errors::METRIC_REINDEXING, "site" => "membership").increment(1);
+        headers.push((RETRY_AFTER, HeaderValue::from(s.membership.reindex_retry_secs)));
     }
     let features = s.membership.features();
     let permissions = s.membership.permissions(status, &features);
@@ -340,7 +358,7 @@ mod tests {
         // `private.anyPds` follows them while `private_any_pds.enabled`
         // (private-encode design §7; on by default).
         let features = json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN]).collect::<Vec<_>>());
-        assert_eq!(json!(FEATURES), json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences", "private.unreadReasons", "private.replyContext", "private.notificationSubjects", "private.notServed", "private.degraded"]));
+        assert_eq!(json!(FEATURES), json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences", "private.unreadReasons", "private.replyContext", "private.notificationSubjects", "private.notServed", "private.degraded", "private.reindexing"]));
         // T-N9 (private notification preferences design §8): the
         // preferences' feature followed every value before it; the fast
         // reads' values follow it (fast-reads design §5.3).
@@ -465,6 +483,83 @@ mod tests {
             // The private tier disabled: nothing private, whatever the status.
             assert_eq!(ask(disabled_base.clone(), 0, ALICE).await, (cache.clone(), perms(false, false, true), json!(3600)), "{access:?}");
             assert_eq!(ask(disabled_base.clone(), 1, BOB).await.1, perms(false, false, lens_for_others), "{access:?}");
+        }
+        db.drop_db().await;
+    }
+
+    /// T-DM9 (degraded-mode design §3.5), `getMembership` and the
+    /// member-only public gate, with and without an enroller: a member whose
+    /// readiness was cleared after the first time is `reindexing` (member
+    /// permissions, `validForSecs` and `Retry-After` the re-index interval)
+    /// and gets `503 Reindexing` with `retryAfter` in the body and the
+    /// header; a member never ready is `indexing` and `400 NotReady`; once
+    /// ready again, `member` and 200.
+    #[tokio::test]
+    async fn tdm9_reindexing_membership_and_public_gate() {
+        let Some(db) = fresh_db("xrpc_get_membership_reindexing").await else {
+            return;
+        };
+        let p = &db.pool;
+        let cfg = app_config("[community]\nauto_enroll = true\n");
+        let fetcher = StubFetcher::default();
+        for (i, did) in [ALICE, BOB].into_iter().enumerate() {
+            fetcher.set_key(did, signing_key(u8::try_from(i).expect("small") + 3));
+        }
+        let (auth, _drainer) = verifier(fetcher, 100, 16);
+        let hydrator = hydrator(p, ScopeSets::default());
+        let scope = hydrator.scope().clone();
+        let resolver = IdentityResolver::new(Transports::loopback_for_tests(), p.clone(), IdentitySettings::from_app(&cfg), Arc::new(scope.clone()), Intent::Internal);
+        let enroller = AutoEnroller::new(&cfg, p.clone(), scope.clone(), Arc::new(KryphocronPrivateTier), resolver);
+        let without = AppState {
+            hydrator,
+            auth: Arc::new(auth),
+            limits: RateLimits::new(),
+            enroller: None,
+            trusted_proxy: "172.30.0.10".parse().expect("ip"),
+            did_document: Arc::new(json!({})),
+            membership: MembershipSettings::new(&KryphocronPrivateTier, &cfg.file.private_read).with_reindex_retry(30),
+        };
+        let mut with = without.clone();
+        with.enroller = Some(enroller);
+        let bases = [serve(without).await, serve(with).await];
+        exec(p, "INSERT INTO members (did, source, ready_at, first_ready_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin', NULL, now() - interval '1 day')").await;
+        exec(p, "INSERT INTO members (did, source) VALUES ('did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', 'admin')").await;
+        let aud = format!("did:web:{AUDIENCE_HOST}");
+        let client = reqwest::Client::new();
+        let features = json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN]).collect::<Vec<_>>());
+        let timeline = |base: &str, i: u8, did: &str| {
+            let token = mint(&signing_key(i + 3), did, &aud, Some("app.bsky.feed.getTimeline"));
+            let req = client.get(format!("{base}/xrpc/app.bsky.feed.getTimeline")).header("authorization", format!("Bearer {token}"));
+            async move {
+                let r = req.send().await.expect("request");
+                let status = r.status().as_u16();
+                let retry = r.headers().get("retry-after").map(|v| v.to_str().expect("ascii").to_string());
+                (status, retry, r.text().await.expect("body"))
+            }
+        };
+        for base in &bases {
+            let alice = mint(&signing_key(3), ALICE, &aud, Some(GET_MEMBERSHIP));
+            let (status, retry, v) = call(&client, base, Some(&alice)).await;
+            assert_eq!((status, retry.as_deref(), &v), (200, Some("30"), &answer("reindexing", &features, [true, true, true], 30)));
+            let (status, retry, body) = timeline(base, 0, ALICE).await;
+            assert_eq!(status, 503, "{body}");
+            assert_eq!(retry.as_deref(), Some("30"));
+            let v: Value = serde_json::from_str(&body).expect("json");
+            assert_eq!((&v["error"], &v["retryAfter"]), (&json!("Reindexing"), &json!(30)), "{body}");
+            let bob = mint(&signing_key(4), BOB, &aud, Some(GET_MEMBERSHIP));
+            let (status, retry, v) = call(&client, base, Some(&bob)).await;
+            assert_eq!((status, retry.as_deref(), &v["status"]), (200, Some("5"), &json!("indexing")));
+            let (status, retry, body) = timeline(base, 1, BOB).await;
+            assert!(status == 400 && body.contains("\"NotReady\"") && !body.contains("retryAfter"), "{body}");
+            assert_eq!(retry.as_deref(), Some("7"));
+        }
+        exec(p, "UPDATE members SET ready_at = now() WHERE did = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'").await;
+        for base in &bases {
+            let alice = mint(&signing_key(3), ALICE, &aud, Some(GET_MEMBERSHIP));
+            let (_, _, v) = call(&client, base, Some(&alice)).await;
+            assert_eq!(v["status"], "member");
+            let (status, _, body) = timeline(base, 0, ALICE).await;
+            assert_eq!(status, 200, "{body}");
         }
         db.drop_db().await;
     }

@@ -100,6 +100,8 @@ pub enum HydrationError {
 pub struct ViewError {
     pub error: &'static str,
     pub message: String,
+    /// `retryAfter` for an error that names one (`Reindexing`).
+    pub retry_after: Option<u64>,
 }
 
 impl ViewError {
@@ -107,7 +109,32 @@ impl ViewError {
         Self {
             error,
             message: message.into(),
+            retry_after: None,
         }
+    }
+
+    /// `NotReady` for `did`, or `Reindexing` when its readiness was cleared
+    /// after it was first set (degraded-mode design §3.5): the view-error
+    /// sites' own readiness answer.
+    pub(crate) async fn not_ready_for(pool: &PgPool, did: Option<&str>, reindex_retry_secs: u64) -> Result<Self, sqlx::Error> {
+        let reindexing = match did {
+            Some(did) => sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM members WHERE did = $1 AND ready_at IS NULL AND first_ready_at IS NOT NULL)",
+            )
+            .bind(did)
+            .fetch_one(pool)
+            .await?,
+            None => false,
+        };
+        Ok(if reindexing {
+            Self {
+                error: crate::xrpc::errors::REINDEXING,
+                message: "Account re-indexing after an interruption; try again".into(),
+                retry_after: Some(reindex_retry_secs),
+            }
+        } else {
+            Self::new("NotReady", "Account indexing in progress")
+        })
     }
 }
 
@@ -172,6 +199,8 @@ pub struct HydrationConfig {
     pub video: crate::config::VideoConfig,
     /// `drafts.max_per_actor`.
     pub drafts_max: u32,
+    /// `community.reindex_retry_secs` (degraded-mode design §3.5).
+    pub reindex_retry_secs: u64,
     /// `drafts.max_bytes`.
     pub drafts_max_bytes: u32,
     /// `labels.query_max_patterns`.
@@ -467,6 +496,12 @@ impl Hydrator {
     #[must_use]
     pub fn scope(&self) -> &ScopeState {
         &self.inner.scope
+    }
+
+    /// `community.reindex_retry_secs`.
+    #[must_use]
+    pub fn reindex_retry_secs(&self) -> u64 {
+        self.inner.cfg.reindex_retry_secs
     }
 
     /// `bookmarks.max_per_actor`: the private tier counts its own bookmarks
@@ -1290,6 +1325,7 @@ pub(crate) mod testing {
             bookmarks_count_floor: 2,
             video: crate::config::VideoConfig::default(),
             drafts_max: 2,
+            reindex_retry_secs: 30,
             drafts_max_bytes: 2000,
             labels_query_max_patterns: 25,
             labelers_max_dids: 3,

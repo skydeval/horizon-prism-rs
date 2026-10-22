@@ -18,6 +18,13 @@ use crate::kryphocron_glue::AuthError;
 /// The lexicon error name of the readiness gate.
 pub const NOT_READY: &str = "NotReady";
 
+/// The lexicon error name of a member being re-indexed (degraded-mode
+/// design §3.5): not `NotReady`, so a client keeps the member a member.
+pub const REINDEXING: &str = "Reindexing";
+/// Metric: `503 Reindexing` answers and `getMembership`'s `reindexing`, by
+/// `site`.
+pub const METRIC_REINDEXING: &str = "xrpc_reindexing_total";
+
 /// Response extension set on every `400 NotReady`. The final router's layer
 /// turns it into `Retry-After` (design-v3 §II-7.1), so no handler needs the
 /// configured value.
@@ -79,6 +86,24 @@ impl XrpcError {
         }
     }
 
+    /// `503 Reindexing` (degraded-mode design §3.5): the caller is a member
+    /// whose readiness was cleared after it was first set. `retryAfter` in
+    /// the body and the header; counted by `site` (`private`, `public`,
+    /// `threadlens`, `view`).
+    #[must_use]
+    pub fn reindexing(secs: u64, site: &'static str) -> Self {
+        metrics::counter!(METRIC_REINDEXING, "site" => site).increment(1);
+        Self {
+            retry_after_in_body: true,
+            ..Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                REINDEXING,
+                "Account re-indexing after an interruption; try again",
+            )
+            .with_retry_after(secs)
+        }
+    }
+
     /// `503 Unavailable` (degraded-mode design §3.3): a private anchor that
     /// cannot be served yet; `retryAfter` in the body and the header.
     #[must_use]
@@ -123,6 +148,11 @@ impl From<Limited> for XrpcError {
 
 impl From<ViewError> for XrpcError {
     fn from(e: ViewError) -> Self {
+        // The view-error sites' own readiness checks (degraded-mode design
+        // §3.5): the same answer as the gates'.
+        if e.error == REINDEXING {
+            return Self::reindexing(e.retry_after.unwrap_or(crate::config::CommunityConfig::default().reindex_retry_secs), "view");
+        }
         // The timeline's own readiness check raises `NotReady` as a view
         // error; it carries the retry hint like the gate's.
         Self {

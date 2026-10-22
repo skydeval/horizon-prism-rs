@@ -259,9 +259,13 @@ pub async fn prepare(
             member_state(state, did).await?
         };
         match state_now {
-            Enrollment::Member { ready: true } => {}
-            Enrollment::Member { ready: false } if !ready => {}
-            Enrollment::Member { ready: false } | Enrollment::Enrolled | Enrollment::Purging => {
+            Enrollment::Member { ready: true, .. } => {}
+            Enrollment::Member { ready: false, .. } if !ready => {}
+            // Degraded-mode design §3.5: re-indexing after the first time.
+            Enrollment::Member { ready: false, reindexing: true } => {
+                return Err(XrpcError::reindexing(state.membership.reindex_retry_secs, "public"));
+            }
+            Enrollment::Member { ready: false, .. } | Enrollment::Enrolled | Enrollment::Purging => {
                 return Err(XrpcError::not_ready());
             }
             Enrollment::Refused(_) => return Err(XrpcError::not_enrolled()),
@@ -311,20 +315,21 @@ pub async fn prepare_private(
     let ip = request_ip(state, headers, peer);
     state.limits.charge(method, Family::Private, Some(&caller.did), ip)?;
     match member_state(state, &caller.did).await? {
-        Enrollment::Member { ready: true } => Ok(caller),
-        Enrollment::Member { ready: false } | Enrollment::Enrolled | Enrollment::Purging => Err(XrpcError::not_ready()),
+        Enrollment::Member { ready: true, .. } => Ok(caller),
+        Enrollment::Member { ready: false, reindexing: true } => Err(XrpcError::reindexing(state.membership.reindex_retry_secs, "private")),
+        Enrollment::Member { ready: false, .. } | Enrollment::Enrolled | Enrollment::Purging => Err(XrpcError::not_ready()),
         Enrollment::Refused(_) => Err(XrpcError::not_enrolled()),
     }
 }
 
 /// The caller's membership without enrolling it.
 pub(crate) async fn member_state(state: &AppState, did: &str) -> Result<Enrollment, sqlx::Error> {
-    let ready: Option<bool> = sqlx::query_scalar("SELECT ready_at IS NOT NULL FROM members WHERE did = $1")
+    let row: Option<(bool, bool)> = sqlx::query_as(crate::aggregations::enroll::MEMBER_READINESS_SQL)
         .bind(did)
         .fetch_optional(state.hydrator.pool())
         .await?;
-    Ok(match ready {
-        Some(ready) => Enrollment::Member { ready },
+    Ok(match row {
+        Some((ready, first_ready)) => Enrollment::member(ready, first_ready),
         None => Enrollment::Refused("not_member"),
     })
 }

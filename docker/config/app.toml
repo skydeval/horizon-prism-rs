@@ -71,6 +71,11 @@ enroll_pds_patterns = []
 # Seconds sent as `Retry-After` on every `400 NotReady` (account indexing in
 # progress). A constant hint for clients, not an estimate of progress.
 not_ready_retry_secs = 5
+# Seconds sent as `retryAfter` (body and header) on `503 Reindexing`: a member
+# whose indexing was interrupted after it was first ready (a gap, a
+# divergence), and getMembership's `reindexing` (design degraded-mode.md §3.5).
+# 1 to 3600.
+reindex_retry_secs = 30
 
 [firehose]
 stream_key = "firehose:events"

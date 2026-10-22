@@ -215,6 +215,9 @@ pub const FEATURES: &[&str] = &[
     // `getPostThread`'s `503 Unavailable` and `#viewUnavailable` quotes
     // (degraded-mode design §3.2–§3.4).
     "private.degraded",
+    // `503 Reindexing` for a member re-indexed after the first time, and
+    // getMembership's `reindexing` (degraded-mode design §3.5).
+    "private.reindexing",
 ];
 
 /// The private tier as the rest of the crate may use it.

@@ -182,6 +182,10 @@ pub struct CommunityConfig {
     /// `Retry-After` on every `400 NotReady` (design-v3 §II-7.1): a constant,
     /// not an estimate of indexing progress.
     pub not_ready_retry_secs: u64,
+    /// `Retry-After` and body `retryAfter` on `503 Reindexing`, and
+    /// `getMembership`'s `reindexing` validity (degraded-mode design §3.5,
+    /// §3.7): 1 to 3 600.
+    pub reindex_retry_secs: u64,
 }
 
 impl Default for CommunityConfig {
@@ -196,6 +200,7 @@ impl Default for CommunityConfig {
             enroll_refusal_cache_secs: 3600,
             enroll_pds_patterns: Vec::new(),
             not_ready_retry_secs: 5,
+            reindex_retry_secs: 30,
         }
     }
 }

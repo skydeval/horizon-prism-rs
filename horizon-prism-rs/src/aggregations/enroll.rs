@@ -42,8 +42,10 @@ pub const REFUSED_DENIED: &str = "denied";
 /// The caller's membership state for a `member` endpoint (§7.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Enrollment {
-    /// A member; `ready` when `members.ready_at` is set.
-    Member { ready: bool },
+    /// A member; `ready` when `members.ready_at` is set; `reindexing` when
+    /// it is not but `first_ready_at` is (readiness cleared after the first
+    /// time: a gap, a divergence, a dead letter; degraded-mode design §3.5).
+    Member { ready: bool, reindexing: bool },
     /// Just enrolled (not ready yet).
     Enrolled,
     /// Being purged: `NotReady`.
@@ -51,6 +53,18 @@ pub enum Enrollment {
     /// Not enrolled: `NotEnrolled`, with the refusal reason.
     Refused(&'static str),
 }
+
+impl Enrollment {
+    /// A member from its two readiness columns.
+    #[must_use]
+    pub fn member(ready: bool, first_ready: bool) -> Self {
+        Self::Member { ready, reindexing: !ready && first_ready }
+    }
+}
+
+/// The member row's readiness as [`Enrollment::member`] reads it:
+/// `ready_at` and `first_ready_at` set, or `None` for no row.
+pub(crate) const MEMBER_READINESS_SQL: &str = "SELECT ready_at IS NOT NULL, first_ready_at IS NOT NULL FROM members WHERE did = $1";
 
 /// §8.2 PDS matching, shared with the routing table.
 pub use crate::constellation::matcher::{host_matches, pds_host};
@@ -150,12 +164,9 @@ impl AutoEnroller {
     ///
     /// Database errors.
     pub async fn check(&self, did: &str) -> Result<Enrollment, sqlx::Error> {
-        let ready: Option<bool> = sqlx::query_scalar("SELECT ready_at IS NOT NULL FROM members WHERE did = $1")
-            .bind(did)
-            .fetch_optional(&self.pool)
-            .await?;
-        if let Some(ready) = ready {
-            return Ok(Enrollment::Member { ready });
+        let row: Option<(bool, bool)> = sqlx::query_as(MEMBER_READINESS_SQL).bind(did).fetch_optional(&self.pool).await?;
+        if let Some((ready, first_ready)) = row {
+            return Ok(Enrollment::member(ready, first_ready));
         }
         if self.scope.read_guard().await.purge_kind(did).is_some() {
             return Ok(Enrollment::Purging);
@@ -220,7 +231,7 @@ impl AutoEnroller {
                 tracing::info!(event = "auto_enrolled", did, "member auto-enrolled");
                 Enrollment::Enrolled
             }
-            AddOutcome::AlreadyMember => Enrollment::Member { ready: false },
+            AddOutcome::AlreadyMember => Enrollment::Member { ready: false, reindexing: false },
             AddOutcome::Purging => Enrollment::Purging,
             // Denied between the check and the insert.
             AddOutcome::Denied => self.refuse_denied(),

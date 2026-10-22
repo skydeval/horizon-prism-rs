@@ -511,6 +511,9 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     if read.walk_batch_max == 0 {
         out.push("private_read.walk_batch_max must be greater than 0".to_string());
     }
+    if !(1..=3600).contains(&cfg.community.reindex_retry_secs) {
+        out.push("community.reindex_retry_secs must be 1 to 3600".to_string());
+    }
     // Degraded-mode design §3.7, §7: retryAfter's bounds.
     if !(1..=3600).contains(&read.degraded_retry_min_secs) {
         out.push("private_read.degraded_retry_min_secs must be 1 to 3600".to_string());

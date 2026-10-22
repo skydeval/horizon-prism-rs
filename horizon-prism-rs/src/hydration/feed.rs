@@ -873,7 +873,7 @@ impl Hydrator {
     /// Database errors.
     pub async fn get_timeline(&self, viewer: &Viewer, req: &Requester, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
         let Some(me) = viewer.state_did() else {
-            return Ok(Err(ViewError::new("NotReady", "Account indexing in progress")));
+            return Ok(Err(ViewError::not_ready_for(self.pool(), viewer.did.as_deref(), self.reindex_retry_secs()).await?));
         };
         let (at, after_uri) = parse_local_cursor(cursor);
         let items: Vec<FeedItem> = sqlx::query_as(

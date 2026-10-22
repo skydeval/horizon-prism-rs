@@ -89,6 +89,7 @@ never_ready_expiry_days = 7
 enroll_refusal_cache_secs = 3600
 enroll_pds_patterns = []
 not_ready_retry_secs = 5
+reindex_retry_secs = 30
 
 [firehose]
 stream_key = "firehose:events"
@@ -1133,6 +1134,18 @@ fn floors_setting_is_off_on_or_partial() {
 
 /// Private-threads design §5: `max_chain` is 1 to 100 (16 by default, 100
 /// accepted), the paging keys are positive, and T-57's head-age cap: a
+/// Degraded-mode design §7: `community.reindex_retry_secs` is 30 by
+/// default, 1 to 3 600.
+#[test]
+fn reindex_retry_bounds() {
+    assert_eq!(load("").expect("defaults").file.community.reindex_retry_secs, 30);
+    assert_eq!(load("[community]\nreindex_retry_secs = 3600\n").expect("max").file.community.reindex_retry_secs, 3600);
+    for bad in [0, 3601] {
+        let p = invalid_problems(load(&format!("[community]\nreindex_retry_secs = {bad}\n")));
+        assert!(has(&p, "community.reindex_retry_secs must be 1 to 3600"), "{bad}: {p:?}");
+    }
+}
+
 /// Degraded-mode design §7: `retryAfter`'s bounds, 30 and 300 by default;
 /// min 1 to 3 600, max from min to 3 600.
 #[test]

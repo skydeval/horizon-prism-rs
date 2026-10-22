@@ -44,6 +44,9 @@ pub enum MembershipStatus {
     Member,
     /// Enrolled, not ready yet (or being purged).
     Indexing,
+    /// A member being re-indexed after an interruption (degraded-mode design
+    /// §3.5): readiness cleared after it was first set.
+    Reindexing,
     /// Not enrolled now: "not now", not "never".
     NotEligible,
 }
@@ -54,6 +57,7 @@ impl MembershipStatus {
         match self {
             Self::Member => "member",
             Self::Indexing => "indexing",
+            Self::Reindexing => "reindexing",
             Self::NotEligible => "notEligible",
         }
     }

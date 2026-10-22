@@ -349,7 +349,7 @@ mod tests {
         let off = t.enroller_with("");
         assert_eq!(off.check(N).await.expect("check"), Enrollment::Refused("disabled"));
         assert!(!t.member(N).await, "nothing inserted");
-        assert_eq!(off.check(M).await.expect("check"), Enrollment::Member { ready: false }, "an earlier auto-enrolled member stays");
+        assert_eq!(off.check(M).await.expect("check"), Enrollment::Member { ready: false, reindexing: false }, "an earlier auto-enrolled member stays");
         assert!(t.member(M).await);
         let on = t.enroller_with("[community]\nauto_enroll = true\n");
         assert_eq!(on.check(N).await.expect("check"), Enrollment::Refused("unresolvable"), "on: the network checks run");

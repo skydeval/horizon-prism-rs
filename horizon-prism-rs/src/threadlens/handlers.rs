@@ -93,15 +93,21 @@ async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method
     let caller = authenticate(&s.app, authorization, method).await?;
     let ip = request_ip(&s.app, headers, peer);
     s.app.limits.charge(method, Family::ThreadLens, Some(&caller.did), ip)?;
-    let ready: Option<bool> = sqlx::query_scalar("SELECT ready_at IS NOT NULL FROM members WHERE did = $1")
+    let row: Option<(bool, bool)> = sqlx::query_as(crate::aggregations::enroll::MEMBER_READINESS_SQL)
         .bind(&caller.did)
         .fetch_optional(s.app.hydrator.pool())
         .await?;
+    let ready = row.map(|(ready, _)| ready);
+    let reindexing = row.is_some_and(|(ready, first_ready)| !ready && first_ready);
     // Read at each request: the admin UI changes it at once (admin-ui
     // design §8.5).
     let access = s.live.load().threadlens_access;
     let hydrate = match (ready, access) {
         (Some(true), _) => true,
+        // Degraded-mode design §3.5: re-indexing after the first time.
+        (Some(false), ThreadLensAccess::Members) if reindexing => {
+            return Err(XrpcError::reindexing(s.app.membership.reindex_retry_secs, "threadlens"));
+        }
         (Some(false), ThreadLensAccess::Members) => return Err(XrpcError::not_ready()),
         (None, ThreadLensAccess::Members) => return Err(XrpcError::not_enrolled()),
         (Some(false) | None, ThreadLensAccess::SignedIn) => false,

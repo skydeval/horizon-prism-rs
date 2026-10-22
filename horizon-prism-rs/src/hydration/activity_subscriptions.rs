@@ -85,7 +85,7 @@ impl Hydrator {
         // The declaration check reads the member's follows, which are all
         // here only once the member is ready.
         if !viewer.hydrate {
-            return Ok(Err(ViewError::new("NotReady", "Account indexing in progress")));
+            return Ok(Err(ViewError::not_ready_for(self.pool(), viewer.did.as_deref(), self.reindex_retry_secs()).await?));
         }
         if !self.in_scope(subject).await {
             metrics::counter!(METRIC_OUT_OF_SCOPE, "action" => "rejected").increment(1);

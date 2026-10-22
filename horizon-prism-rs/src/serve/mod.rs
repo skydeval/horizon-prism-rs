@@ -791,6 +791,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
             bookmarks_count_floor: cfg.file.bookmarks.count_floor,
             video: cfg.file.video.clone(),
             drafts_max: cfg.file.drafts.max_per_actor,
+            reindex_retry_secs: cfg.file.community.reindex_retry_secs,
             drafts_max_bytes: cfg.file.drafts.max_bytes,
             labels_query_max_patterns: cfg.file.labels.query_max_patterns,
             labelers_max_dids: cfg.file.labelers.get_services_max_dids,
@@ -857,7 +858,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
         membership: crate::xrpc::handlers::membership::MembershipSettings::new(private.as_ref(), &cfg.file.private_read)
             .with_live(live.clone())
             .with_any_pds(cfg.file.private_any_pds.enabled)
-            .with_refusal_cache(cfg.file.community.enroll_refusal_cache_secs),
+            .with_refusal_cache(cfg.file.community.enroll_refusal_cache_secs)
+            .with_reindex_retry(cfg.file.community.reindex_retry_secs),
     };
     let private_state = PrivateState::new(
         app.clone(),

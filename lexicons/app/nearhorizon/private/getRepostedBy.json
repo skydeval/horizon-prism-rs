@@ -65,6 +65,10 @@
         {
           "name": "NotReady",
           "description": "The caller's account indexing is still in progress."
+        },
+        {
+          "name": "Reindexing",
+          "description": "The caller's account is being re-indexed after an interruption; retry after `retryAfter` seconds (in the body; also the Retry-After header). Not NotReady: the caller is still a member."
         }
       ]
     }
