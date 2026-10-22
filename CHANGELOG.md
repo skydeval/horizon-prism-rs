@@ -10,6 +10,31 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract R1: the gate's snapshot, #829)
+
+- **Refract** (refract design §4.2, §7.4) starts with what the moderation
+  gate reads. `ScopeSets` gains R-live (`restored`, DID to home
+  community), `candidates` and `refract_hidden` (each hidden DID with its
+  reasons: ending, pending, awaiting labels, a gone account label; and
+  records with a gone label). All empty until the later slices fill them;
+  no behaviour changes yet.
+- Each request builds one **Refract snapshot** on its first gate call
+  (`Requester.refract`, shared by every clone; the read guard is dropped
+  before it is computed) with three outputs: `wholesale` (non-members
+  outside S, hidden as an account), `by_collection` (off modes: S
+  non-members lose everything but profile, self records and follows;
+  members their posts) and `records` (gone record labels; in On and
+  Filling only of authors outside S and the members). A per-request
+  serve-time check (`Requester.refract_check`) overrides `records` only.
+- `moderation::gate`, `gate_many` and `gate_many_among` take a required
+  `RefractView` (snapshot and check). A `wholesale` DID is
+  `Hidden(Takedown)`; a record its rule hides is the new
+  `Hidden(RecordRemoved)`. `getRecord` builds its own snapshot; the
+  private pipeline passes an empty one (Refract never hides a private
+  post). R-live is readable on public paths (G-9) and in
+  `in_scope_or_member`, and counts as S for the identity persistence set.
+- No migration.
+
 ### Added (degraded mode DM4: `Reindexing`, #825)
 
 - **D, readiness cleared after the first time** (degraded-mode design

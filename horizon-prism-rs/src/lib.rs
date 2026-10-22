@@ -34,6 +34,7 @@ pub mod microcosm;
 pub mod moderation;
 pub mod net;
 pub mod private_tier;
+pub mod refract;
 pub mod serve;
 pub mod services;
 pub mod subscriptions;

@@ -22,7 +22,7 @@
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use moka::Expiry;
@@ -689,6 +689,13 @@ pub struct Requester {
     /// The profile batch's budget, shared by clones of one mode
     /// ([`Requester::reserve_profiles`]).
     profile_budget: Arc<Mutex<ProfileBudget>>,
+    /// The request's Refract snapshot (refract design §4.2), built on the
+    /// first gate call and shared by every clone, so every gate of one
+    /// request reads the same one.
+    refract: Arc<OnceLock<Arc<crate::refract::RefractSnapshot>>>,
+    /// The request's Refract serve-time label check (§4.5), shared by every
+    /// clone like the snapshot.
+    refract_check: Arc<Mutex<crate::refract::RefractCheck>>,
 }
 
 /// `origin` of an outbound call made while serving an XRPC request
@@ -720,7 +727,39 @@ impl Requester {
             local_only: false,
             endpoint: None,
             profile_budget: ProfileBudget::fresh(),
+            refract: Arc::default(),
+            refract_check: Arc::default(),
         }
+    }
+
+    /// The Refract snapshot, if one was built for this request.
+    #[must_use]
+    pub fn refract_snapshot(&self) -> Option<Arc<crate::refract::RefractSnapshot>> {
+        self.refract.get().cloned()
+    }
+
+    /// Keep `built` as this request's Refract snapshot unless one is kept
+    /// already; returns the one kept.
+    pub fn keep_refract_snapshot(&self, built: Arc<crate::refract::RefractSnapshot>) -> Arc<crate::refract::RefractSnapshot> {
+        Arc::clone(self.refract.get_or_init(|| built))
+    }
+
+    /// A copy of the request's Refract serve-time check.
+    #[must_use]
+    pub fn refract_check(&self) -> crate::refract::RefractCheck {
+        self.refract_check.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Record serve-time check results for this request.
+    pub fn note_refract_check(&self, f: impl FnOnce(&mut crate::refract::RefractCheck)) {
+        f(&mut self.refract_check.lock().unwrap_or_else(PoisonError::into_inner));
+    }
+
+    /// Whether two handles share one Refract snapshot (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn shares_refract(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.refract, &other.refract) && Arc::ptr_eq(&self.refract_check, &other.refract_check)
     }
 
     /// This request, serving the XRPC method `endpoint`.

@@ -10,6 +10,11 @@
 //! | `!hide` on the record | `Collapsed` |
 //! | otherwise | `Visible` |
 //!
+//! Refract (refract design §7.4) adds, from the request's snapshot and
+//! serve-time check ([`RefractView`]), with no extra query: an account in
+//! `wholesale` is `Hidden(Takedown)`, and a record its author's collection
+//! rule hides, or with a gone community label, is `Hidden(RecordRemoved)`.
+//!
 //! Account status is known only for DIDs with `actors` rows; for other DIDs
 //! the gate is `Visible` unless a label applies. Public paths read the
 //! status only of DIDs in `scope_dids` and members ([`gate_many_among`];
@@ -21,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use sqlx::PgPool;
 
 use crate::db::locks::uri_author;
+pub use crate::refract::RefractView;
 
 /// Why a subject is hidden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +35,10 @@ pub enum HiddenReason {
     Deactivated,
     Suspended,
     Deleted,
+    /// A record Refract hides (refract design §7.4): its author's collection
+    /// rule hides it, or it has a gone community label. Record subjects
+    /// only.
+    RecordRemoved,
 }
 
 /// The gate's verdict for one subject.
@@ -61,7 +71,8 @@ impl Gate {
             Self::Hidden(HiddenReason::Takedown | HiddenReason::Suspended) => {
                 Some(("AccountTakedown", "Account has been suspended"))
             }
-            Self::Hidden(HiddenReason::Deleted) => Some(("InvalidRequest", "Profile not found")),
+            // `RecordRemoved` applies to records only; a profile never sees it.
+            Self::Hidden(HiddenReason::Deleted | HiddenReason::RecordRemoved) => Some(("InvalidRequest", "Profile not found")),
             Self::Visible | Self::Collapsed => None,
         }
     }
@@ -82,8 +93,8 @@ fn status_reason(status: &str) -> Option<HiddenReason> {
 /// # Errors
 ///
 /// Database errors.
-pub async fn gate_many(pool: &PgPool, subjects: &[String]) -> Result<HashMap<String, Gate>, sqlx::Error> {
-    gate_many_among(pool, subjects, None).await
+pub async fn gate_many(pool: &PgPool, subjects: &[String], refract: RefractView<'_>) -> Result<HashMap<String, Gate>, sqlx::Error> {
+    gate_many_among(pool, subjects, None, refract).await
 }
 
 /// [`gate_many`], reading `account_status` only for the authors in
@@ -94,7 +105,12 @@ pub async fn gate_many(pool: &PgPool, subjects: &[String]) -> Result<HashMap<Str
 /// # Errors
 ///
 /// Database errors.
-pub async fn gate_many_among(pool: &PgPool, subjects: &[String], readable: Option<&HashSet<String>>) -> Result<HashMap<String, Gate>, sqlx::Error> {
+pub async fn gate_many_among(
+    pool: &PgPool,
+    subjects: &[String],
+    readable: Option<&HashSet<String>>,
+    refract: RefractView<'_>,
+) -> Result<HashMap<String, Gate>, sqlx::Error> {
     let mut authors: HashSet<String> = HashSet::new();
     let mut keys: HashSet<String> = HashSet::new();
     for s in subjects {
@@ -128,10 +144,12 @@ pub async fn gate_many_among(pool: &PgPool, subjects: &[String], readable: Optio
         .iter()
         .map(|s| {
             let author = uri_author(s).unwrap_or(s);
-            let gate = if takedown.contains(s.as_str()) || takedown.contains(author) {
+            let gate = if takedown.contains(s.as_str()) || takedown.contains(author) || refract.account_hidden(author) {
                 Gate::Hidden(HiddenReason::Takedown)
             } else if let Some(r) = status.get(author) {
                 Gate::Hidden(*r)
+            } else if refract.record_hidden(s) {
+                Gate::Hidden(HiddenReason::RecordRemoved)
             } else if s.starts_with("at://") && hide.contains(s.as_str()) {
                 Gate::Collapsed
             } else {
@@ -147,9 +165,9 @@ pub async fn gate_many_among(pool: &PgPool, subjects: &[String], readable: Optio
 /// # Errors
 ///
 /// Database errors.
-pub async fn gate(pool: &PgPool, subject: &str) -> Result<Gate, sqlx::Error> {
+pub async fn gate(pool: &PgPool, subject: &str, refract: RefractView<'_>) -> Result<Gate, sqlx::Error> {
     let s = subject.to_string();
-    Ok(gate_many(pool, std::slice::from_ref(&s))
+    Ok(gate_many(pool, std::slice::from_ref(&s), refract)
         .await?
         .remove(&s)
         .unwrap_or(Gate::Visible))
@@ -186,7 +204,7 @@ mod tests {
             .execute(p)
             .await
             .expect("actor");
-        let g = gate_many(p, &[post_a.clone(), post_b.clone(), post_c.clone(), B.to_string(), C.to_string()])
+        let g = gate_many(p, &[post_a.clone(), post_b.clone(), post_c.clone(), B.to_string(), C.to_string()], RefractView::empty())
             .await
             .expect("gate");
         assert_eq!(g[&post_a], Gate::Hidden(HiddenReason::Takedown), "author takedown hides the post");
@@ -194,7 +212,67 @@ mod tests {
         assert_eq!(g[&post_c], Gate::Hidden(HiddenReason::Deactivated));
         assert_eq!(g[B], Gate::Visible);
         assert_eq!(g[C].profile_error().map(|e| e.0), Some("AccountDeactivated"));
-        assert_eq!(gate(p, A).await.expect("gate").profile_error().map(|e| e.0), Some("AccountTakedown"));
+        assert_eq!(gate(p, A, RefractView::empty()).await.expect("gate").profile_error().map(|e| e.0), Some("AccountTakedown"));
+        db.drop_db().await;
+    }
+
+    /// Refract design §7.4: the snapshot hides with no query; a local
+    /// takedown and account status come first; the check overrides only
+    /// `records`; `RecordRemoved` is a record subject's reason.
+    #[tokio::test]
+    async fn refract_snapshot_hides_what_it_names() {
+        use std::sync::Arc;
+
+        use crate::aggregations::ScopeSets;
+        use crate::indexing::PublicMode;
+        use crate::refract::{RefractCheck, RefractHidden, RefractSnapshot};
+
+        let Some(db) = fresh_db("moderation_gate_refract").await else {
+            return;
+        };
+        let p = &db.pool;
+        let post_a = format!("at://{A}/app.bsky.feed.post/1");
+        let post_b = format!("at://{B}/app.bsky.feed.post/1");
+        let like_b = format!("at://{B}/app.bsky.feed.like/1");
+        let profile_b = format!("at://{B}/app.bsky.actor.profile/self");
+        let post_c = format!("at://{C}/app.bsky.feed.post/1");
+        sqlx::query("INSERT INTO actors (did, account_status) VALUES ($1, 'deactivated')").bind(C).execute(p).await.expect("actor");
+        let mut sets = ScopeSets::default();
+        sets.public.mode = PublicMode::Off;
+        sets.scope.insert(B.into());
+        let mut hidden = RefractHidden::default();
+        // A: a non-member outside S, ending; B: in S, pending; C: a gone
+        // record label on a deactivated account.
+        hidden.update(A, |r| r.ending = true);
+        hidden.update(B, |r| r.pending = true);
+        hidden.add_record(&post_c, None);
+        sets.refract_hidden = Arc::new(hidden);
+        let snap = RefractSnapshot::of(&sets);
+        let check = RefractCheck::default();
+        let view = RefractView { snapshot: &snap, check: &check };
+        let subjects = [post_a.clone(), A.to_string(), post_b.clone(), like_b.clone(), profile_b.clone(), B.to_string(), post_c.clone()];
+        let g = gate_many(p, &subjects, view).await.expect("gate");
+        assert_eq!(g[&post_a], Gate::Hidden(HiddenReason::Takedown));
+        assert_eq!(g[A].profile_error().map(|e| e.0), Some("AccountTakedown"), "what Bluesky says for the same DID");
+        assert_eq!(g[&post_b], Gate::Hidden(HiddenReason::RecordRemoved));
+        assert_eq!(g[&like_b], Gate::Hidden(HiddenReason::RecordRemoved));
+        assert_eq!(g[&profile_b], Gate::Visible, "an S DID's profile is never hidden for Refract");
+        assert_eq!(g[B], Gate::Visible);
+        assert_eq!(g[&post_c], Gate::Hidden(HiddenReason::Deactivated), "account status comes first");
+        // The check un-hides a record label only.
+        let mut check = RefractCheck::default();
+        check.note(&post_c, false);
+        check.note(&post_b, false);
+        let view = RefractView { snapshot: &snap, check: &check };
+        let g = gate_many_among(p, std::slice::from_ref(&post_b), None, view).await.expect("gate");
+        assert_eq!(g[&post_b], Gate::Hidden(HiddenReason::RecordRemoved), "never over a collection rule");
+        // In On mode an S DID is never hidden for Refract.
+        sets.public.mode = PublicMode::On;
+        let snap = RefractSnapshot::of(&sets);
+        let view = RefractView { snapshot: &snap, check: &RefractCheck::default() };
+        let g = gate_many(p, &[post_b.clone(), post_a.clone()], view).await.expect("gate");
+        assert_eq!(g[&post_b], Gate::Visible);
+        assert_eq!(g[&post_a], Gate::Hidden(HiddenReason::Takedown));
         db.drop_db().await;
     }
 }

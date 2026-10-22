@@ -67,6 +67,15 @@ pub struct ScopeSets {
     /// fill (public-indexing design §3.5). Set only under the write guard,
     /// through [`ScopeState::set_public`], which keeps the mirror in step.
     pub public: PublicState,
+    /// Refract's R-live (refract design, Terms): restored DIDs not pending
+    /// removal, to their home community's name; empty while the feature is
+    /// off. Behind an `Arc` so a request snapshot copies it cheaply.
+    pub restored: Arc<HashMap<String, String>>,
+    /// Refract candidates (state `candidate`), to their home community.
+    pub candidates: HashMap<String, String>,
+    /// What the gate hides for Refract (refract design §4.2), swapped on
+    /// change.
+    pub refract_hidden: Arc<crate::refract::RefractHidden>,
 }
 
 /// What the copy rule looks up for every list-item write: which lists are
@@ -119,6 +128,12 @@ impl ScopeSets {
     #[must_use]
     pub fn is_tracked(&self, did: &str) -> bool {
         self.is_member(did) || self.is_owner(did)
+    }
+
+    /// Whether `did` is in Refract's R-live.
+    #[must_use]
+    pub fn is_restored(&self, did: &str) -> bool {
+        self.restored.contains_key(did)
     }
 
     /// Every tracked DID.
@@ -325,7 +340,10 @@ impl ScopeState {
     }
 
     /// Replace every set with a fresh load (after a rebuild). The
-    /// public-indexing state is not a set and is kept.
+    /// public-indexing state is not a set and is kept. Refract's sets are
+    /// kept as they are under the write guard: every Refract change is
+    /// applied in memory in commit order under that guard (refract design
+    /// §4.2), so they already match the committed rows.
     ///
     /// # Errors
     ///
@@ -334,6 +352,9 @@ impl ScopeState {
         let mut fresh = load_sets(pool, private).await?;
         let mut sets = self.write_guard().await;
         fresh.public = sets.public;
+        fresh.restored = Arc::clone(&sets.restored);
+        fresh.candidates = std::mem::take(&mut sets.candidates);
+        fresh.refract_hidden = Arc::clone(&sets.refract_hidden);
         *sets = fresh;
         Ok(())
     }
@@ -394,6 +415,11 @@ async fn load_sets(pool: &PgPool, private: &dyn PrivateTier) -> Result<ScopeSets
             .map(|(did, n)| (did, u32::try_from(n).unwrap_or(u32::MAX)))
             .collect(),
         public: PublicState::default(),
+        // Refract's sets are loaded with its configuration, after its
+        // startup clearing (refract design §4.2), by `refract::load`.
+        restored: Arc::default(),
+        candidates: HashMap::new(),
+        refract_hidden: Arc::default(),
     };
     // Members are always in S (reason bit 1), even before a rebuild wrote it.
     let members: Vec<String> = sets.members.iter().cloned().collect();
@@ -415,9 +441,10 @@ impl ScopeGuard for ScopeState {
 /// in-process cache.
 impl PersistencePolicy for ScopeState {
     fn in_persistence_set(&self, did: &str) -> bool {
+        // Refract's R is treated like S (refract design §5.4).
         self.sets
             .try_read()
-            .map(|s| s.is_member(did) || s.in_scope(did))
+            .map(|s| s.is_member(did) || s.in_scope(did) || s.is_restored(did))
             .unwrap_or(false)
     }
 }

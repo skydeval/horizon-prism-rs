@@ -605,7 +605,8 @@ impl Hydrator {
     /// treated as absent.
     pub async fn in_scope_or_member(&self, did: &str) -> bool {
         let scope = self.scope().read_guard().await;
-        scope.in_scope(did) || scope.is_member(did)
+        // Refract's R-live is public by construction (refract design §5.5).
+        scope.in_scope(did) || scope.is_member(did) || scope.is_restored(did)
     }
 
     /// Whether every public record of `did` is stored here: the
@@ -622,7 +623,9 @@ impl Hydrator {
     /// the author of a private reply), and are treated as absent.
     pub(crate) async fn readable_dids(&self, dids: &[String]) -> Vec<String> {
         let scope = self.scope().read_guard().await;
-        dids.iter().filter(|d| scope.in_scope(d) || scope.is_member(d)).cloned().collect()
+        // Refract's R-live is public by construction: an account Bluesky
+        // withholds and a community serves (refract design §5.5).
+        dids.iter().filter(|d| scope.in_scope(d) || scope.is_member(d) || scope.is_restored(d)).cloned().collect()
     }
 
     /// Of `dids`, those whose per-DID state `req` may read: all of them in
@@ -644,7 +647,34 @@ impl Hydrator {
     pub(crate) async fn gate_many(&self, req: &Requester, subjects: &[String]) -> Result<HashMap<String, crate::moderation::Gate>, sqlx::Error> {
         let authors: Vec<String> = subjects.iter().map(|s| uri_author(s).unwrap_or(s).to_string()).collect();
         let readable: HashSet<String> = self.readable_for(req, &authors).await.into_iter().collect();
-        crate::moderation::gate_many_among(self.pool(), subjects, Some(&readable)).await
+        let snapshot = self.refract_snapshot(req).await;
+        let check = req.refract_check();
+        let view = crate::refract::RefractView { snapshot: &snapshot, check: &check };
+        crate::moderation::gate_many_among(self.pool(), subjects, Some(&readable), view).await
+    }
+
+    /// The request's Refract snapshot (refract design §4.2): built on the
+    /// first call, from a short read guard that is dropped before the
+    /// snapshot is computed, and kept on `req` for every clone of it.
+    pub(crate) async fn refract_snapshot(&self, req: &Requester) -> Arc<crate::refract::RefractSnapshot> {
+        if let Some(built) = req.refract_snapshot() {
+            return built;
+        }
+        let captured = {
+            let sets = self.scope().read_guard().await;
+            crate::refract::Captured::of(&sets)
+        };
+        req.keep_refract_snapshot(Arc::new(captured.compute(Utc::now())))
+    }
+
+    /// A Refract snapshot of its own, for a path with no request handle
+    /// (`getRecord`, §4.2).
+    pub(crate) async fn refract_snapshot_now(&self) -> crate::refract::RefractSnapshot {
+        let captured = {
+            let sets = self.scope().read_guard().await;
+            crate::refract::Captured::of(&sets)
+        };
+        captured.compute(Utc::now())
     }
 
     /// [`Hydrator::gate_many`] for one subject.

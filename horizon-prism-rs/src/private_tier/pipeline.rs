@@ -652,7 +652,8 @@ async fn read_inner(
     let nsid = Nsid::new(nsid_s).map_err(|_| Miss::NotPrivate)?;
     let rkey = RecordKey::new(rkey_s).map_err(|_| Miss::NotPrivate)?;
     let requester = Did::new(&caller.did).map_err(|_| Miss::NotPrivate)?;
-    if moderation::gate(&env.pool, uri).await? != Gate::Visible {
+    // Refract never hides a private post (refract design §7.4).
+    if moderation::gate(&env.pool, uri, moderation::RefractView::empty()).await? != Gate::Visible {
         return Err(Miss::Moderation);
     }
     let facts = schema::post_facts(&env.pool, uri).await?.ok_or(Miss::NoRow)?;

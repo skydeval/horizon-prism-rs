@@ -124,7 +124,12 @@ impl Hydrator {
             return Ok(Err(not_found()));
         };
         let uri = format!("at://{did}/{collection}/{rkey}");
-        let gates = moderation::gate_many(self.pool(), &[uri.clone(), did.clone()]).await?;
+        // Its own Refract snapshot, and no serve-time check (refract design
+        // §4.2, §4.5).
+        let snapshot = self.refract_snapshot_now().await;
+        let check = crate::refract::RefractCheck::default();
+        let view = crate::refract::RefractView { snapshot: &snapshot, check: &check };
+        let gates = moderation::gate_many(self.pool(), &[uri.clone(), did.clone()], view).await?;
         if gates.values().any(|g| g.is_hidden()) {
             return Ok(Err(not_found()));
         }
