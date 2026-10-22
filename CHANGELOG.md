@@ -10,7 +10,24 @@ commit.
 
 ## [Unreleased]
 
-### Changed (tests: one migrated template per run, #811)
+### Fixed (horizon-firehose pin: no stale-cursor replay)
+
+- **`docker/docker-compose.yml`** pins horizon-firehose at `b3b7d1e`
+  (was `3f7ee6f`). Every reconnect, including the SDK's internal keepalive
+  reconnect, now dials with the current saved cursor, and an event at or
+  below its relay's published cursor is dropped before XADD
+  (`replayed_events_dropped_total`). This fixes the 2026-10-22 incident,
+  where a keepalive reconnect reused a day-old cursor, replayed ~21–27 h
+  per relay, trimmed `firehose:events` and held the bsky watermark, so
+  private reads missed as stale. The new `cursor.relay_reset_after_seconds`
+  key (default 600) is optional; existing relay configs load unchanged.
+
+### Fixed (horizon-firehose pin: no stale-cursor replay)
+
+- **`docker/docker-compose.yml`** pins horizon-firehose at
+### Fixed (horizon-firehose pin: no stale-cursor replay)
+
+- **`docker/docker-compose.yml`** pins horizon-### Changed (tests: one migrated template per run, #811)
 
 - **`test_support::fresh_db`** no longer replays every migration for each
   test. The first call in a test run builds a migrated template database,
