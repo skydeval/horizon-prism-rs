@@ -88,6 +88,36 @@ impl AppViewClient {
         self.net.get(url.as_str(), &options).await
     }
 
+    /// [`Self::query`] with extra request headers, returning the response's
+    /// headers too (Refract's labeler reads through an AppView, refract
+    /// design §4.5: `atproto-accept-labelers` out, `atproto-content-labelers`
+    /// back).
+    ///
+    /// # Errors
+    ///
+    /// Transport failures ([`NetError`]); statuses are in the response.
+    pub async fn query_with_headers(
+        &self,
+        method: &str,
+        params: &[(&str, String)],
+        headers: &[(HeaderName, HeaderValue)],
+    ) -> Result<(NetResponse, axum::http::HeaderMap), NetError> {
+        let url = Url::parse_with_params(&format!("{}/xrpc/{method}", self.base), params).map_err(|e| NetError::InvalidUrl {
+            url: self.base.clone(),
+            reason: e.to_string(),
+        })?;
+        let mut options = RequestOptions::new(BodyCap::APPVIEW).timeout(CALL_TIMEOUT);
+        if let AppViewAuth::ServiceJwt { aud, key } = &self.auth {
+            let token = jwt::mint(key, aud, method, chrono::Utc::now().timestamp());
+            let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| NetError::Encode(e.to_string()))?;
+            options = options.header(HeaderName::from_static("authorization"), value);
+        }
+        for (name, value) in headers {
+            options = options.header(name.clone(), value.clone());
+        }
+        self.net.request_raw(axum::http::Method::GET, url.as_str(), None, &options).await
+    }
+
     /// `app.bsky.actor.getProfile`.
     ///
     /// # Errors

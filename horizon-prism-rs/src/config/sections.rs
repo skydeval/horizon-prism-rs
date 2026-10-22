@@ -1986,6 +1986,138 @@ impl RateLimitsConfig {
     }
 }
 
+/// How Prism reads a community's labeler (refract design §3.1, §4.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelSource {
+    /// `queryLabels` on the labeler's own `#atproto_labeler` endpoint.
+    Labeler,
+    /// Through the community AppView, with `atproto-accept-labelers`
+    /// (tier 1 only).
+    Appview,
+}
+
+impl LabelSource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Labeler => "labeler",
+            Self::Appview => "appview",
+        }
+    }
+}
+
+/// The labels that end a restore by default (refract design §3.1, D-6).
+#[must_use]
+pub fn default_gone_labels() -> Vec<String> {
+    vec!["!takedown".to_string(), "!hide".to_string()]
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+/// One `[[refract.communities]]` entry (refract design §3.1).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefractCommunity {
+    /// Unique; shown in the restored marker.
+    pub name: String,
+    /// The hosts its members live on (`pds_pattern` syntax).
+    #[serde(default)]
+    pub pds_patterns: Vec<String>,
+    /// 1 (PDS + AppView) or 2 (PDS + labeler).
+    pub tier: u8,
+    /// Tier 1: an enabled, non-local `[[constellation.networks]]` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appview_network: Option<String>,
+    /// Required on tier 2, optional on tier 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labeler_did: Option<String>,
+    /// Required when `labeler_did` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_source: Option<LabelSource>,
+    /// Labels from `labeler_did` that end a restore or hide a record.
+    #[serde(default = "default_gone_labels")]
+    pub gone_labels: Vec<String>,
+    /// Off: restores nothing; its DIDs are pending removal.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+impl RefractCommunity {
+    /// Community A, the shipped default (refract design §3.1, D-10).
+    #[must_use]
+    pub fn example() -> Self {
+        Self {
+            name: "community-a".to_string(),
+            pds_patterns: vec!["community-a.example".to_string(), "*.community-a.example".to_string()],
+            tier: 1,
+            appview_network: Some("community-a".to_string()),
+            labeler_did: Some("did:plc:cccccccccccccccccccccccc".to_string()),
+            label_source: Some(LabelSource::Appview),
+            gone_labels: default_gone_labels(),
+            enabled: true,
+        }
+    }
+}
+
+/// `[refract]` (refract design §3.3). `enabled` and `communities` are live
+/// settings; the rest take effect at restart.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RefractConfig {
+    pub enabled: bool,
+    pub communities: Vec<RefractCommunity>,
+    pub backfill_concurrency: u32,
+    pub record_label_sweep_hours: u32,
+    pub record_label_ttl_mins: u32,
+    pub visitor_candidates_per_ip_per_hour: u32,
+    pub visitor_candidates_per_hour: u32,
+    pub sweep_rate_per_sec: Float,
+    pub recheck_hours: u32,
+    pub grace_days: u32,
+    pub unverified_max_hours: u32,
+    pub disable_delay_hours: u32,
+    pub checker_concurrency: u32,
+    pub candidates_per_caller_per_hour: u32,
+    pub bluesky_rate_per_sec: Float,
+    pub per_pds_rate_per_sec: Float,
+    pub label_poll_secs: u32,
+    pub label_ff_pages_per_sec: u32,
+    pub resync_days: u32,
+    pub event_days: u32,
+    pub resolves_per_caller_per_hour: u32,
+}
+
+impl Default for RefractConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            communities: vec![RefractCommunity::example()],
+            backfill_concurrency: 1,
+            record_label_sweep_hours: 24,
+            record_label_ttl_mins: 60,
+            visitor_candidates_per_ip_per_hour: 50,
+            visitor_candidates_per_hour: 2000,
+            sweep_rate_per_sec: Float(2.0),
+            recheck_hours: 24,
+            grace_days: 30,
+            unverified_max_hours: 72,
+            disable_delay_hours: 24,
+            checker_concurrency: 4,
+            candidates_per_caller_per_hour: 100,
+            bluesky_rate_per_sec: Float(1.0),
+            per_pds_rate_per_sec: Float(1.0),
+            label_poll_secs: 60,
+            label_ff_pages_per_sec: 5,
+            resync_days: 7,
+            event_days: 365,
+            resolves_per_caller_per_hour: 300,
+        }
+    }
+}
+
 /// Everything read from `app.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2042,6 +2174,7 @@ pub struct FileConfig {
     pub retention: RetentionConfig,
     pub storage: StorageConfig,
     pub constellation: ConstellationConfig,
+    pub refract: RefractConfig,
     /// The B-5 bench's head source; only under `bench-heads`.
     #[cfg(feature = "bench-heads")]
     pub bench: BenchConfig,

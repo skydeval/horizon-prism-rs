@@ -312,6 +312,19 @@ pub async fn run() -> Result<Stopped, StartupError> {
     let policy: Arc<dyn PersistencePolicy> = Arc::new(scope.clone());
     // Internal by default; each request-path user takes its own view.
     let resolver = IdentityResolver::new(nets.clone(), pool.clone(), IdentitySettings::from_app(&cfg), policy, Intent::Internal);
+    // Refract's startup (refract design §4.2): the config task's clearing
+    // commits, then its in-memory sets are loaded, before the first writer.
+    crate::refract::Refract::new(
+        pool.clone(),
+        scope.clone(),
+        live.clone(),
+        cfg.file.refract.clone(),
+        crate::refract::net::RefractNet::new(nets.internal().client().clone(), Vec::new(), None, &cfg.file.refract),
+        &resolver,
+    )
+    .startup()
+    .await
+    .map_err(|e| StartupError::new(1, format!("refract startup: {e}")))?;
     // Rule 4 (§4.3): the applier runs list phases and releases.
     let applier = Applier::new(pool.clone(), scope.clone(), cfg.file.lists.sync_min_interval_secs);
     // The storage bound for the member count now (§4.7.6); the storage
@@ -733,6 +746,22 @@ pub async fn run() -> Result<Stopped, StartupError> {
         crate::appview_clients::from_config(&cfg.file.constellation, nets.public().client(), &glue.service_key),
         &shares,
     );
+    // Refract (refract design): its checker, label reads and config task,
+    // with the cascade's buckets for the community AppViews.
+    let refract = crate::refract::Refract::new(
+        pool.clone(),
+        scope.clone(),
+        live.clone(),
+        cfg.file.refract.clone(),
+        crate::refract::net::RefractNet::new(
+            nets.internal().client().clone(),
+            crate::appview_clients::from_config(&cfg.file.constellation, nets.internal().client(), &glue.service_key),
+            Some(&cascade),
+            &cfg.file.refract,
+        ),
+        &resolver,
+    );
+    tasks.extend(refract.spawn());
     let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes)
         .with_ttls(crate::hydration::cache::RtTtls {
             profile: Duration::from_secs(cfg.file.cache.profile_ttl_secs),
@@ -924,6 +953,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
     let listener = TcpListener::bind(cfg.file.http.bind)
         .await
         .map_err(|e| StartupError::new(1, format!("binding {}: {e}", cfg.file.http.bind)))?;
+    // The pending delay never runs before `serve` is up (refract §4.6).
+    tasks.push(refract.spawn_delay());
     tracing::info!(event = "serve_started", bind = %cfg.file.http.bind, tasks = tasks.len(), "serving");
     let thread_lens = ThreadLensState {
         app: app.clone(),

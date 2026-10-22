@@ -346,6 +346,13 @@ impl IdentityRefresher {
 
     async fn process(&self, did: &str, reasons: i16) -> Result<Outcome, IdentityError> {
         let target = parse_did(did)?;
+        // Refract (refract design §4.4): an event for a DID with a Refract
+        // row makes it due now. A DID whose only tie is a candidate or
+        // rejected row gets nothing else: no `actors` row is written for it
+        // (D-2).
+        if crate::refract::make_due_on_event(&self.pool, did).await? {
+            return Ok(Outcome::Done);
+        }
         let prev = self.actor_state(did).await?;
         let prev_source = prev.as_ref().and_then(|p| p.deletion_suspect_pds.as_deref());
         let prev_since = prev.as_ref().and_then(|p| p.deletion_suspect_at);

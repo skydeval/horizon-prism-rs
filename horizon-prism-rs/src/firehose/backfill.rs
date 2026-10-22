@@ -144,12 +144,12 @@ impl ClaimOrder {
         match self {
             Self::Plain => {
                 "SELECT did, depth FROM backfill_jobs \
-                 WHERE state = 'queued' AND depth <> 'list_sync' AND not_before <= now() \
+                 WHERE state = 'queued' AND depth NOT IN ('list_sync', 'refract') AND not_before <= now() \
                  ORDER BY not_before LIMIT 1 FOR UPDATE SKIP LOCKED"
             }
             Self::Priority => {
                 "SELECT did, depth FROM backfill_jobs \
-                 WHERE state = 'queued' AND depth <> 'list_sync' AND not_before <= now() \
+                 WHERE state = 'queued' AND depth NOT IN ('list_sync', 'refract') AND not_before <= now() \
                  ORDER BY (depth IN ('member', 'private', 'authz')) DESC, not_before \
                  LIMIT 1 FOR UPDATE SKIP LOCKED"
             }
@@ -200,7 +200,7 @@ pub fn long_backoff(attempt: i32) -> TimeDelta {
 /// The failure schedule of a depth: its attempts and its delays.
 fn schedule(depth: Depth) -> (i32, fn(i32) -> TimeDelta) {
     match depth {
-        Depth::Scope | Depth::Resync => (LONG_MAX_ATTEMPTS, long_backoff),
+        Depth::Scope | Depth::Resync | Depth::Refract => (LONG_MAX_ATTEMPTS, long_backoff),
         Depth::Member | Depth::Private | Depth::Authz => (MAX_ATTEMPTS, backoff),
     }
 }
@@ -429,8 +429,30 @@ pub fn plan(depth: Depth, is_member: bool, mode: PublicMode) -> DepthPlan {
             },
             inbound_blocks: false,
         },
+        // Refract's full history (refract design §6.1, C-4): every
+        // collection the restored rule admits, to the end; a member's
+        // posts only (its member job lists the rest). Every mode.
+        Depth::Refract => DepthPlan {
+            profile: !is_member,
+            self_records: if is_member { &[] } else { &OFF_SELF_RECORDS },
+            collections: if is_member { vec![public(NSID_POST, Limit::All)] } else { REFRACT.to_vec() },
+            inbound_blocks: false,
+        },
     }
 }
+
+/// What a non-member's `refract` job lists (refract design §6.1).
+const REFRACT: [CollectionPlan; 9] = [
+    public(NSID_POST, Limit::All),
+    public(NSID_REPOST, Limit::All),
+    public(NSID_LIKE, Limit::All),
+    public(NSID_FOLLOW, Limit::All),
+    public(NSID_LIST, Limit::All),
+    public(NSID_LISTITEM, Limit::All),
+    public(NSID_LIST_OPTOUT, Limit::All),
+    public(NSID_THREADGATE, Limit::All),
+    public(NSID_POSTGATE, Limit::All),
+];
 
 /// A record as listed or fetched from a PDS.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

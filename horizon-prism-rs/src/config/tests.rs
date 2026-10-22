@@ -355,6 +355,38 @@ verdict_round_timeout_ms = 500
 parent_rounds = 8
 verdict_max_dids = 600
 
+[refract]
+enabled = false
+backfill_concurrency = 1
+record_label_sweep_hours = 24
+record_label_ttl_mins = 60
+visitor_candidates_per_ip_per_hour = 50
+visitor_candidates_per_hour = 2000
+sweep_rate_per_sec = 2.0
+recheck_hours = 24
+grace_days = 30
+unverified_max_hours = 72
+disable_delay_hours = 24
+checker_concurrency = 4
+candidates_per_caller_per_hour = 100
+bluesky_rate_per_sec = 1.0
+per_pds_rate_per_sec = 1.0
+label_poll_secs = 60
+label_ff_pages_per_sec = 5
+resync_days = 7
+event_days = 365
+resolves_per_caller_per_hour = 300
+
+[[refract.communities]]
+name = "community-a"
+pds_patterns = ["community-a.example", "*.community-a.example"]
+tier = 1
+appview_network = "community-a"
+labeler_did = "did:plc:cccccccccccccccccccccccc"
+label_source = "appview"
+gone_labels = ["!takedown", "!hide"]
+enabled = true
+
 [lists]
 read_listing_pages = 5
 subscribed_max_per_member = 25
@@ -455,6 +487,41 @@ live_now = []
 fn docker_app_toml_equals_defaults() {
     let cfg = load(DOCKER_APP_TOML).expect("shipped config is valid");
     assert_eq!(cfg.file, FileConfig::default());
+}
+
+/// Refract T-15 (refract design §3.1): the default is off with Community A
+/// listed; every communities rule is checked.
+#[test]
+fn refract_communities_are_validated() {
+    let r = load("").expect("defaults").file.refract;
+    assert!(!r.enabled);
+    assert_eq!(r.communities, vec![crate::config::RefractCommunity::example()]);
+    let tier2 = "[[refract.communities]]\nname = \"north\"\npds_patterns = [\"*.north.example\"]\ntier = 2\nlabeler_did = \"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"\nlabel_source = \"labeler\"\n";
+    let cfg = load(tier2).expect("a tier 2 entry");
+    assert_eq!(cfg.file.refract.communities[0].gone_labels, ["!takedown", "!hide"]);
+    assert!(cfg.file.refract.communities[0].enabled);
+    for (text, needle) in [
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = []\ntier = 1\nappview_network = \"community-a\"\n", "needs at least one server"),
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 1\n", "tier 1 needs appview_network"),
+        ("[refract]\nenabled = true\n[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 1\nappview_network = \"community\"\n", "is not an enabled network"),
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 2\n", "tier 2 needs labeler_did"),
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 3\n", "must be 1 or 2"),
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 2\nlabeler_did = \"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"\nlabel_source = \"appview\"\n", "appview is for tier 1 only"),
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 2\nlabeler_did = \"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"\n", "label_source is needed"),
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 2\nlabeler_did = \"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"\nlabel_source = \"labeler\"\ngone_labels = []\n", "needs at least one label"),
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 1\nappview_network = \"community-a\"\nappview_network2 = 1\n", "unknown field"),
+        (&format!("{tier2}{tier2}"), "the name is used twice"),
+        (&format!("{tier2}{}", tier2.replace("north", "south")), "another community has the same labeler"),
+        ("[refract]\nchecker_concurrency = 0\n", "refract.checker_concurrency must be at least 1"),
+        ("[refract]\nbluesky_rate_per_sec = 0.0\n", "refract.bluesky_rate_per_sec must be above 0"),
+    ] {
+        let problems = match load(text) {
+            Err(ConfigError::Invalid(p)) => p.join("; "),
+            Err(e) => e.to_string(),
+            Ok(_) => String::new(),
+        };
+        assert!(problems.contains(needle), "{text}: {problems}");
+    }
 }
 
 /// Scope recency T-R13 (§5): the window and sweep defaults, and every

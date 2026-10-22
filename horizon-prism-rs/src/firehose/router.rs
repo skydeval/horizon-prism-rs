@@ -2,7 +2,7 @@
 //!
 //! Identity, account, handle and tombstone events carry no rev, so they are
 //! not applied directly. If the DID is in `scope_dids` or `members`, or has an
-//! `actors` row, the worker upserts `identity_refresh` with a 30 s debounce,
+//! `actors` row, or a Refract row (refract design §4.4), the worker upserts `identity_refresh` with a 30 s debounce,
 //! OR-ing the reason bit into any pending row. Otherwise the event is ignored.
 
 use sqlx::PgPool;
@@ -36,6 +36,7 @@ pub async fn route_identity(pool: &PgPool, kind: IdentityKind, did: &str) -> Res
          WHERE EXISTS (SELECT 1 FROM scope_dids WHERE did = $1) \
             OR EXISTS (SELECT 1 FROM members WHERE did = $1) \
             OR EXISTS (SELECT 1 FROM actors WHERE did = $1) \
+            OR EXISTS (SELECT 1 FROM refract_dids WHERE did = $1) \
          ON CONFLICT (did) DO UPDATE SET reasons = identity_refresh.reasons | EXCLUDED.reasons",
     )
     .bind(did)
@@ -67,6 +68,12 @@ mod tests {
             .await
             .expect("actor");
         assert!(!route_identity(&db.pool, IdentityKind::Handle, "did:plc:stranger").await.expect("route"));
+        // A Refract candidate's events are routed too (refract design §4.4).
+        sqlx::query("INSERT INTO refract_dids (did, community, state, source) VALUES ('did:plc:candidate', 'community-a', 'candidate', 'fill')")
+            .execute(&db.pool)
+            .await
+            .expect("candidate");
+        assert!(route_identity(&db.pool, IdentityKind::Account, "did:plc:candidate").await.expect("route"));
         assert!(route_identity(&db.pool, IdentityKind::Handle, known).await.expect("route"));
         assert!(route_identity(&db.pool, IdentityKind::Account, known).await.expect("route"));
         let (reasons, delay): (i16, f64) = sqlx::query_as(
@@ -82,7 +89,7 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .expect("count");
-        assert_eq!(rows, 1);
+        assert_eq!(rows, 2);
         db.drop_db().await;
     }
 }

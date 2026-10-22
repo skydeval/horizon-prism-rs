@@ -365,6 +365,20 @@ impl Cascade {
         &self.table
     }
 
+    /// `network`'s background bucket, shared with the profile refresh: a
+    /// clone draws on the same tokens (refract design §4.4).
+    #[must_use]
+    pub fn background_bucket(&self, network: &str) -> Option<BackgroundBucket> {
+        self.networks.get(network).map(|s| s.background.clone())
+    }
+
+    /// `network`'s request bucket, drawn on a request's share (refract
+    /// design §4.5, the serve-time check).
+    #[must_use]
+    pub fn request_bucket(&self, network: &str) -> Option<SharedBucket> {
+        self.networks.get(network).and_then(|s| s.bucket.clone())
+    }
+
     /// Whether `network`'s breaker is open now (tests, metrics).
     #[must_use]
     pub fn breaker_open(&self, network: &str) -> bool {

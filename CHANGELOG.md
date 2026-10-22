@@ -10,6 +10,59 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract R2: config, the restored set, checker and labels, #830)
+
+- **Config** (refract design §3): `[refract]` with `enabled` (default
+  off) and `communities` (default: Community A, tier 1, its labeler
+  `did:plc:cccccccccccccccccccccccc` read through its AppView), both
+  **live** settings (`LIVE_KEYS`, the registry's new `Communities` kind,
+  saved whole), and the restart keys `backfill_concurrency`,
+  `record_label_sweep_hours`, `record_label_ttl_mins`,
+  `visitor_candidates_per_ip_per_hour`, `visitor_candidates_per_hour`,
+  `sweep_rate_per_sec`, `recheck_hours`, `grace_days`,
+  `unverified_max_hours`, `disable_delay_hours`, `checker_concurrency`,
+  `candidates_per_caller_per_hour`, `bluesky_rate_per_sec`,
+  `per_pds_rate_per_sec`, `label_poll_secs`, `label_ff_pages_per_sec`,
+  `resync_days`, `event_days`, `resolves_per_caller_per_hour`. Every
+  communities rule is validated on every save; a tier 1 entry's network
+  is checked while the feature and the entry are on.
+- `LiveSettings` gains a watch channel sent after every swap.
+- **Migration 0040**: `refract_dids`, `refract_events`, `refract_labels`,
+  `refract_notifications`, `refract_pending`, `refract_pending_dids`,
+  `refract_record_reads`, `backfill_jobs.refract_cursor` and the
+  `refract` claim index. Every job enqueue clears `refract_cursor`; the
+  regular workers no longer claim `refract` jobs (new depth `refract`).
+- **The checker** (§4.1, §4.3, §4.4): claims due `candidate`, `restored`
+  and `grace` rows (never `rejected`, `ending` or a pending DID), runs the
+  five rules (Bluesky withholds it; hosted on an enabled community by a
+  fresh resolve; active on its PDS, with deactivation as 30-day grace;
+  kept by its community, by its AppView and its own labeler's labels; no
+  local takedown) and writes the verdict under the write guard with a
+  version check, with the full transition table, events, `actors` facts
+  for R, the `refract` backfill on restore and its cancel on ending.
+  `#account`/`#identity` events of a DID with a Refract row make it due;
+  a candidate-only DID gets no `actors` row.
+- **Labels** (§4.5): signatures checked against the labeler's
+  `#atproto_label` key (a failing gone label is kept unverified and hides
+  at once); the targeted fetch and the 60 s incremental poll (with its
+  fast-forward) for `labeler`-source communities; for `appview`-source
+  ones the labels of the AppView's `getProfile` (checked against
+  `atproto-content-labelers`) and the rolling `getPosts` sweep with
+  omissions. Labels count only from a DID's own community's labeler.
+- **Live changes and pending removal** (§3.2, §4.6): one task diffs the
+  live values against the applied entries (renames keep state, changed
+  entries make their DIDs due, label-reader changes drop old rows,
+  `gone_labels` edits update stored flags), puts R in the `feature` scope
+  when switched off and unlisted DIDs in `entry:<hash>` scopes, drops
+  candidates, clears scopes when hosts match again (hidden until the
+  first label fetch), and ends pending DIDs only after
+  `disable_delay_hours`, never while kept.
+- Metrics: `refract_dids{state}`, `refract_checks_total`,
+  `refract_transitions_total`, `refract_label_poll_total`,
+  `refract_label_poll_lag_seconds`, `refract_label_reads_total`,
+  `refract_label_sweep_total`, `refract_label_sweep_lag_seconds`,
+  `refract_labels_rejected_total`, `refract_pending_end`.
+
 ### Added (Refract R1: the gate's snapshot, #829)
 
 - **Refract** (refract design §4.2, §7.4) starts with what the moderation

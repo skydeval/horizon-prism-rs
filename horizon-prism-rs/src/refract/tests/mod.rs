@@ -1,5 +1,9 @@
 //! Refract tests that need more than one module (refract design §13).
 
+mod checks;
+mod config;
+pub(crate) mod harness;
+
 use std::sync::Arc;
 use std::time::Duration;
 

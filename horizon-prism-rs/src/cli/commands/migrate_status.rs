@@ -108,6 +108,8 @@ mod tests {
             "0038_admin_appearance",
             // Degraded mode DM1: each repo's chain (#822).
             "0039_chain_rev",
+            // Refract R2 (#830).
+            "0040_refract",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

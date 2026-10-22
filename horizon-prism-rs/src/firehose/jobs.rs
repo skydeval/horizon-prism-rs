@@ -6,6 +6,8 @@
 //! Every reset of an existing row also moves its `generation` on
 //! (design-v4 §II-5.10 "Generations"), so a run that began before it can
 //! write nothing more to the row, even once another worker has claimed it.
+//! Every enqueue clears `refract_cursor` (refract design §6.1): a queued run
+//! lists from the start.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
@@ -18,6 +20,9 @@ pub enum Depth {
     Private,
     Authz,
     Resync,
+    /// A restored DID's full history (refract design §6.1), run only by the
+    /// dedicated `refract` workers.
+    Refract,
 }
 
 impl Depth {
@@ -29,6 +34,7 @@ impl Depth {
             Self::Private => "private",
             Self::Authz => "authz",
             Self::Resync => "resync",
+            Self::Refract => "refract",
         }
     }
 
@@ -40,6 +46,7 @@ impl Depth {
             "private" => Some(Self::Private),
             "authz" => Some(Self::Authz),
             "resync" => Some(Self::Resync),
+            "refract" => Some(Self::Refract),
             _ => None,
         }
     }
@@ -55,7 +62,7 @@ impl Depth {
 const UPSERT: &str = "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error, updated_at) \
      VALUES ($1, $2, 'queued', 0, $3, NULL, now()) \
      ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
-       not_before = EXCLUDED.not_before, last_error = NULL, updated_at = now()";
+       not_before = EXCLUDED.not_before, last_error = NULL, refract_cursor = NULL, updated_at = now()";
 
 /// Enqueue (or reset to queued) one job, due now.
 ///
@@ -105,7 +112,7 @@ pub async fn enqueue_if_idle(
         "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error, updated_at) \
          VALUES ($1, $2, 'queued', 0, $3, NULL, now()) \
          ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
-           not_before = EXCLUDED.not_before, last_error = NULL, updated_at = now() \
+           not_before = EXCLUDED.not_before, last_error = NULL, refract_cursor = NULL, updated_at = now() \
          WHERE backfill_jobs.state NOT IN ('queued', 'running')",
     )
     .bind(did)
@@ -129,7 +136,7 @@ pub async fn enqueue_many(conn: &mut PgConnection, dids: &[String], depth: Depth
         "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error, updated_at) \
          SELECT d, $2, 'queued', 0, now(), NULL, now() FROM unnest($1::text[]) AS d \
          ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
-           not_before = now(), last_error = NULL, updated_at = now()",
+           not_before = now(), last_error = NULL, refract_cursor = NULL, updated_at = now()",
     )
     .bind(dids)
     .bind(depth.as_str())
@@ -161,7 +168,7 @@ pub async fn enqueue_staggered(
         "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, last_error, updated_at) \
          SELECT d, 'resync', 'queued', 0, nb, NULL, now() FROM unnest($1::text[], $2::timestamptz[]) AS t(d, nb) \
          ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
-           not_before = EXCLUDED.not_before, last_error = NULL, updated_at = now() \
+           not_before = EXCLUDED.not_before, last_error = NULL, refract_cursor = NULL, updated_at = now() \
          WHERE backfill_jobs.state <> 'queued'",
     )
     .bind(dids)
@@ -178,7 +185,7 @@ mod tests {
 
     #[test]
     fn depths_round_trip() {
-        for d in [Depth::Member, Depth::Scope, Depth::Private, Depth::Authz, Depth::Resync] {
+        for d in [Depth::Member, Depth::Scope, Depth::Private, Depth::Authz, Depth::Resync, Depth::Refract] {
             assert_eq!(Depth::parse(d.as_str()), Some(d));
         }
         assert_eq!(Depth::parse("full"), None);
@@ -191,6 +198,7 @@ mod tests {
         assert!(Depth::Authz.is_full_authorization());
         assert!(!Depth::Scope.is_full_authorization());
         assert!(!Depth::Resync.is_full_authorization());
+        assert!(!Depth::Refract.is_full_authorization());
     }
 
     /// public-indexing §8.3, T-23: a queued resync keeps its due time,

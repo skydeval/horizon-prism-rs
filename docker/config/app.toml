@@ -599,6 +599,53 @@ verdict_round_timeout_ms = 500
 parent_rounds = 8
 verdict_max_dids = 600
 
+# Accounts Bluesky's AppView took down that a community you list still hosts
+# and has not banned stay readable through this AppView. `enabled` and the
+# communities apply at once when changed in the admin UI's Communities page
+# (or `admin settings set`); the other keys at a restart. Off by default.
+[refract]
+enabled = false
+backfill_concurrency = 1           # workers that copy a restored account's history
+record_label_sweep_hours = 24      # every stored restored post's labels re-read this often
+record_label_ttl_mins = 60         # a post's labels re-read when served, past this age
+visitor_candidates_per_ip_per_hour = 50
+visitor_candidates_per_hour = 2000
+sweep_rate_per_sec = 2.0
+recheck_hours = 24                 # each restored account checked again this often
+grace_days = 30                    # a deactivated account is kept hidden this long
+unverified_max_hours = 72
+disable_delay_hours = 24           # switched off or unlisted: ended after this long
+checker_concurrency = 4
+candidates_per_caller_per_hour = 100
+bluesky_rate_per_sec = 1.0
+per_pds_rate_per_sec = 1.0
+label_poll_secs = 60
+label_ff_pages_per_sec = 5
+resync_days = 7
+event_days = 365
+resolves_per_caller_per_hour = 300
+
+# A tier 1 community: its PDS hosts and its AppView (a network above). Its
+# labeler, read through that AppView, decides which labels end a restore.
+[[refract.communities]]
+name = "community-a"
+pds_patterns = ["community-a.example", "*.community-a.example"]
+tier = 1
+appview_network = "community-a"
+labeler_did = "did:plc:cccccccccccccccccccccccc"
+label_source = "appview"
+gone_labels = ["!takedown", "!hide"]
+enabled = true
+
+# A tier 2 community: its PDS hosts and a labeler read directly.
+# [[refract.communities]]
+# name = "community-b"
+# pds_patterns = ["community-b.example", "*.community-b.example"]
+# tier = 2
+# labeler_did = "did:plc:dddddddddddddddddddddddd"
+# label_source = "labeler"
+# gone_labels = ["!takedown", "!hide"]
+
 # Showing a list that no other AppView could answer for: how many pages of
 # the list owner's records one request may read from the owner's server.
 [lists]

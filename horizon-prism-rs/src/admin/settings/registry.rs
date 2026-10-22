@@ -29,6 +29,10 @@ pub enum Group {
     Limits,
     Profiles,
     Lookups,
+    /// Refract's two live keys (refract design §9.1). Edited on the
+    /// Communities page, not a generic settings page, so it is not in
+    /// [`Group::ALL`].
+    Communities,
 }
 
 impl Group {
@@ -56,6 +60,7 @@ impl Group {
             Self::Limits => "limits",
             Self::Profiles => "profiles",
             Self::Lookups => "lookups",
+            Self::Communities => "communities",
         }
     }
 
@@ -71,6 +76,7 @@ impl Group {
             Self::Limits => "Limits",
             Self::Profiles => "Profiles and caching",
             Self::Lookups => "Account lookups",
+            Self::Communities => "Communities",
         }
     }
 
@@ -87,6 +93,7 @@ impl Group {
             Self::Limits => "How many requests each visitor may make.",
             Self::Profiles => "How long profiles from other networks are reused.",
             Self::Lookups => "Where Prism looks up accounts first.",
+            Self::Communities => "Accounts other communities still host after Bluesky took them down.",
         }
     }
 
@@ -127,13 +134,16 @@ pub enum Kind {
     LiveNow,
     /// `topic | link | name | description`, one per line.
     Topics,
+    /// The Refract communities list, one JSON value (refract design §3.1):
+    /// edited on the Communities page, which saves the whole list.
+    Communities,
 }
 
 impl Kind {
     /// Whether the form shows a box of several lines.
     #[must_use]
     pub fn multiline(&self) -> bool {
-        matches!(self, Self::Hosts | Self::Lines { .. } | Self::LiveNow | Self::Topics)
+        matches!(self, Self::Hosts | Self::Lines { .. } | Self::LiveNow | Self::Topics | Self::Communities)
     }
 }
 
@@ -402,6 +412,21 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             field("identity.lodestar_request_burst", "At once", whole(1, U32, "lookups")),
         ],
     ));
+    // Refract (refract design §3.1, §9.1).
+    out.push(one(
+        Group::Communities,
+        "refract.enabled",
+        "Keep accounts other communities still host",
+        "When on, an account Bluesky took down stays readable through Prism while a community listed below still hosts it on its own server and has not banned it. When off, those accounts are hidden at once and removed after a delay.",
+        Kind::Switch,
+    ));
+    out.push(one(
+        Group::Communities,
+        "refract.communities",
+        "Communities",
+        "The communities whose accounts are kept: their servers, how their decisions are read, and which labels end it. Saved as one list.",
+        Kind::Communities,
+    ));
     out.push(one(Lookups, "identity.lodestar_timeout_ms", "Longest wait for lodestar", "How long Prism waits for one lodestar answer before it asks the PLC directory instead (100 to 10,000).", whole(100, 10_000, "milliseconds")));
     out
 }
@@ -565,6 +590,7 @@ pub fn form_text(kind: &Kind, v: &Value) -> String {
                     .join("\n")
             })
             .unwrap_or_default(),
+        Kind::Communities => serde_json::to_string_pretty(v).unwrap_or_default(),
         Kind::Topics => v
             .as_array()
             .map(|a| {
@@ -600,6 +626,10 @@ pub fn words(kind: &Kind, v: &Value, ctx: &Context) -> String {
         Kind::Gigabytes => format!("{text} GB"),
         Kind::Decimal { unit, .. } => format!("{text} {unit}"),
         Kind::OptionalText if v.is_null() => "Prism's own text".to_string(),
+        Kind::Communities => {
+            let names: Vec<&str> = v.as_array().map(|a| a.iter().filter_map(|c| c.get("name").and_then(Value::as_str)).collect()).unwrap_or_default();
+            if names.is_empty() { "none".to_string() } else { names.join(", ") }
+        }
         Kind::TimeOfDay => format!("{text} UTC"),
         _ if text.is_empty() => "none".to_string(),
         Kind::Hosts | Kind::Lines { .. } | Kind::LiveNow | Kind::Topics => text.lines().collect::<Vec<_>>().join("; "),
@@ -702,6 +732,10 @@ pub fn parse(kind: &Kind, text: &str, ctx: &Context) -> Result<Value, String> {
                 out.push(serde_json::json!({ "did": did, "domains": domains }));
             }
             Ok(Value::Array(out))
+        }
+        Kind::Communities => {
+            let v: Value = serde_json::from_str(text.trim()).map_err(|e| format!("enter the list as JSON: {e}"))?;
+            if v.is_array() { Ok(v) } else { Err("enter the list as a JSON array".to_string()) }
         }
         Kind::Topics => {
             let mut out = Vec::new();

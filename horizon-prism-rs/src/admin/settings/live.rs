@@ -14,13 +14,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
-use crate::config::{FileConfig, SuggestedTopic, ThreadLensAccess, UnspeccedConfig};
+use crate::config::{FileConfig, RefractCommunity, SuggestedTopic, ThreadLensAccess, UnspeccedConfig};
 
 /// The keys that apply at once (§8.5), besides `indexing.public_scope`,
 /// which has its own command.
-pub const LIVE_KEYS: [&str; 10] = [
+pub const LIVE_KEYS: [&str; 12] = [
     "community.auto_enroll",
     "community.enroll_pds_patterns",
     "community.max_members",
@@ -31,6 +31,9 @@ pub const LIVE_KEYS: [&str; 10] = [
     "unspecced.live_now",
     "trends.descriptions",
     "trends.suggested_topics",
+    // Refract (refract design §3.1, C-2).
+    "refract.enabled",
+    "refract.communities",
 ];
 
 /// Whether `key` applies at once.
@@ -53,6 +56,10 @@ pub struct LiveValues {
     pub unspecced: UnspeccedConfig,
     pub trend_descriptions: BTreeMap<String, String>,
     pub suggested_topics: Vec<SuggestedTopic>,
+    /// `refract.enabled`.
+    pub refract_enabled: bool,
+    /// `refract.communities`, the whole list as one value.
+    pub refract_communities: Vec<RefractCommunity>,
 }
 
 impl LiveValues {
@@ -69,6 +76,8 @@ impl LiveValues {
             unspecced: f.unspecced.clone(),
             trend_descriptions: f.trends.descriptions.clone(),
             suggested_topics: f.trends.suggested_topics.clone(),
+            refract_enabled: f.refract.enabled,
+            refract_communities: f.refract.communities.clone(),
         }
     }
 }
@@ -80,6 +89,9 @@ pub struct LiveSettings {
     /// Bumped at every swap, so a consumer that caches a decision (the
     /// enroller's refusals) knows to drop it.
     version: Arc<AtomicU64>,
+    /// The version, sent after every swap (refract design §3.2), so a task
+    /// that waits for changes never misses a save made while it worked.
+    changed: Arc<watch::Sender<u64>>,
 }
 
 impl LiveSettings {
@@ -89,6 +101,7 @@ impl LiveSettings {
         Self {
             values: Arc::new(ArcSwap::from_pointee(LiveValues::from_file(f))),
             version: Arc::new(AtomicU64::new(0)),
+            changed: Arc::new(watch::channel(0).0),
         }
     }
 
@@ -107,7 +120,15 @@ impl LiveSettings {
     /// Swap in new values (§8.3 step 5).
     pub fn store(&self, values: LiveValues) {
         self.values.store(Arc::new(values));
-        self.version.fetch_add(1, Ordering::AcqRel);
+        let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+        self.changed.send_replace(version);
+    }
+
+    /// A receiver told of every swap after it is made (refract design
+    /// §3.2). Several swaps before it looks are seen as one.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     /// Change some values in place (tests, and a consumer's own setter).
@@ -179,6 +200,15 @@ mod tests {
         assert_eq!(live.load().threadlens_access, ThreadLensAccess::Members);
         assert!(live.version() > v0);
         assert!(is_live("threadlens.access") && !is_live("retention.tombstone_days"));
+        assert!(is_live("refract.enabled") && is_live("refract.communities") && !is_live("refract.grace_days"));
+        // The watch channel sees every swap, coalesced.
+        let mut rx = live.subscribe();
+        live.update(|v| v.refract_enabled = true);
+        live.update(|v| v.refract_communities.clear());
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.changed()).await.expect("told").expect("open");
+        assert_eq!(*rx.borrow_and_update(), live.version());
+        assert!(!rx.has_changed().expect("open"), "two swaps, one wake");
+        assert!(live.load().refract_enabled && live.load().refract_communities.is_empty());
         // A trigger before anyone waits is not lost.
         let restart = RestartHandle::default();
         restart.trigger();

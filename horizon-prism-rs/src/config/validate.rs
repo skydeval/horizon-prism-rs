@@ -116,9 +116,110 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
         out.push("thread.max_nodes must be at least 1".to_string());
     }
     discovery(cfg, &mut out);
+    refract(cfg, &mut out);
     #[cfg(feature = "standin-hosts")]
     crate::net::standin::problems(&cfg.standin, &mut out);
     out
+}
+
+/// `[refract]` (refract design §3.1, §3.3): the communities list, run on
+/// every save through the settings overlay, and the numbers.
+fn refract(cfg: &FileConfig, out: &mut Vec<String>) {
+    let r = &cfg.refract;
+    let mut names = BTreeSet::new();
+    let mut labelers = BTreeSet::new();
+    for c in &r.communities {
+        let at = format!("refract.communities[{}]", c.name);
+        if c.name.trim().is_empty() || c.name.len() > 64 {
+            out.push("refract.communities: every community needs a name of 1 to 64 characters".to_string());
+        }
+        if !names.insert(c.name.clone()) {
+            out.push(format!("{at}: the name is used twice"));
+        }
+        if c.pds_patterns.is_empty() {
+            out.push(format!("{at}.pds_patterns: needs at least one server"));
+        }
+        for p in &c.pds_patterns {
+            if let Err(e) = pds_pattern(p) {
+                out.push(format!("{at}.pds_patterns: {e}"));
+            }
+        }
+        match c.tier {
+            1 => match c.appview_network.as_deref() {
+                None => out.push(format!("{at}: tier 1 needs appview_network")),
+                // Checked while the feature and the entry are on: an inert
+                // entry (the shipped default with the feature off) never
+                // stops a start whose routing table has no such network.
+                Some(n) if r.enabled && c.enabled => {
+                    let usable = cfg.constellation.networks.iter().any(|net| net.name == n && net.enabled && net.appview_url != LOCAL_APPVIEW);
+                    if !usable {
+                        out.push(format!("{at}.appview_network: {n:?} is not an enabled network with an AppView"));
+                    }
+                }
+                Some(_) => {}
+            },
+            2 => {
+                if c.labeler_did.is_none() {
+                    out.push(format!("{at}: tier 2 needs labeler_did"));
+                }
+                if c.appview_network.is_some() {
+                    out.push(format!("{at}: tier 2 has no appview_network"));
+                }
+            }
+            t => out.push(format!("{at}.tier: must be 1 or 2, not {t}")),
+        }
+        match (&c.labeler_did, c.label_source) {
+            (Some(did), source) => {
+                if !proto_blue::syntax::Did::is_valid(did) {
+                    out.push(format!("{at}.labeler_did: {did:?} is not a DID"));
+                }
+                if !labelers.insert(did.clone()) {
+                    out.push(format!("{at}.labeler_did: another community has the same labeler"));
+                }
+                match source {
+                    None => out.push(format!("{at}: label_source is needed with labeler_did")),
+                    Some(super::sections::LabelSource::Appview) if c.tier != 1 => {
+                        out.push(format!("{at}.label_source: appview is for tier 1 only"));
+                    }
+                    Some(_) => {}
+                }
+                if c.gone_labels.is_empty() {
+                    out.push(format!("{at}.gone_labels: needs at least one label"));
+                }
+            }
+            (None, Some(_)) => out.push(format!("{at}: label_source needs labeler_did")),
+            (None, None) => {}
+        }
+        if c.gone_labels.iter().any(|l| l.trim().is_empty()) {
+            out.push(format!("{at}.gone_labels: a label is empty"));
+        }
+    }
+    for (key, value) in [
+        ("backfill_concurrency", r.backfill_concurrency),
+        ("record_label_sweep_hours", r.record_label_sweep_hours),
+        ("record_label_ttl_mins", r.record_label_ttl_mins),
+        ("recheck_hours", r.recheck_hours),
+        ("grace_days", r.grace_days),
+        ("unverified_max_hours", r.unverified_max_hours),
+        ("checker_concurrency", r.checker_concurrency),
+        ("label_poll_secs", r.label_poll_secs),
+        ("label_ff_pages_per_sec", r.label_ff_pages_per_sec),
+        ("resync_days", r.resync_days),
+        ("event_days", r.event_days),
+    ] {
+        if value == 0 {
+            out.push(format!("refract.{key} must be at least 1"));
+        }
+    }
+    for (key, value) in [
+        ("sweep_rate_per_sec", r.sweep_rate_per_sec.0),
+        ("bluesky_rate_per_sec", r.bluesky_rate_per_sec.0),
+        ("per_pds_rate_per_sec", r.per_pds_rate_per_sec.0),
+    ] {
+        if !(value.is_finite() && value > 0.0) {
+            out.push(format!("refract.{key} must be above 0"));
+        }
+    }
 }
 
 /// `[search]`, `[suggestions]` and `[trends]` (design-v3 §7, §9, §13):
