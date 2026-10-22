@@ -268,6 +268,9 @@ pub struct NotificationView {
     pub(in crate::private_tier) author: Value,
     pub(in crate::private_tier) reason: String,
     pub(in crate::private_tier) reason_subject: Option<String>,
+    /// The private post `reason_subject` names, read for the recipient
+    /// (fast-reads design §5.2 B-3); absent when it did not read.
+    pub(in crate::private_tier) reason_subject_post: Option<PrivateEmit<Value>>,
     pub(in crate::private_tier) is_read: bool,
     pub(in crate::private_tier) indexed_at: String,
 }
@@ -302,6 +305,9 @@ impl NotificationView {
         m.serialize_entry("reason", &self.reason)?;
         if let Some(subject) = &self.reason_subject {
             m.serialize_entry("reasonSubject", subject)?;
+        }
+        if let Some(post) = &self.reason_subject_post {
+            m.serialize_entry("reasonSubjectPost", post)?;
         }
         m.serialize_entry("record", record)?;
         m.serialize_entry("isRead", &self.is_read)?;

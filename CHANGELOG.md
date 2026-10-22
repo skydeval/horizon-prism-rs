@@ -10,6 +10,19 @@ commit.
 
 ## [Unreleased]
 
+### Added (fast reads F-G: notification subjects, #806)
+
+- `app.nearhorizon.private.listNotifications` items whose `reasonSubject`
+  names a private post carry `reasonSubjectPost`: that post read for the
+  caller through the same pipeline as every private read (the clear-field
+  check, `droppedFields` on the author's own view and S4 apply), each
+  subject once, after the notifications' own posts, and decorated as
+  `getPosts` decorates. A subject that does not read, for any reason,
+  leaves the field out. A client needs no `getPosts` for subjects. The
+  lexicon describes the item as `#notification`, the stock shape with the
+  new field.
+- `getMembership` lists `private.notificationSubjects`.
+
 ### Added (fast reads F-F: reply context on feed items, #805)
 
 - `app.nearhorizon.private.getTimeline` and `getAuthorFeed` items whose

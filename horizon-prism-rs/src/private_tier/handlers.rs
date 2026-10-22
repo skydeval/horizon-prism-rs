@@ -2266,6 +2266,9 @@ async fn notifications_body(
             hits.entry(uri).or_default().push(post);
         }
     }
+    // The subjects, after the notifications' own posts (fast-reads design
+    // §5.2 B-3).
+    let subject_posts = notification_subjects(s, &rs, caller, &hydration, &rows, start).await?;
 
     // Rows from a public record: the subject must still be stored.
     let public: Vec<&schema::NotificationRow> = rows.iter().filter(|r| !r.is_from_private_post()).collect();
@@ -2311,16 +2314,51 @@ async fn notifications_body(
                 record,
             }
         };
+        let reason_subject_post = r.reason_subject.as_ref().and_then(|u| subject_posts.get(u)).map(PrivateEmit::duplicate);
         notifications.push(NotificationView {
             record,
             author: actors.view(&r.author_did, ProfileKind::View),
             reason: r.reason,
             reason_subject: r.reason_subject,
+            reason_subject_post,
             is_read: seen.is_some_and(|at| r.indexed_at <= at),
             indexed_at: ts(r.indexed_at),
         });
     }
     Ok(PrivateResponse::notifications(notifications, next, seen.map(ts)))
+}
+
+/// The private posts the notification `rows` name as `reasonSubject`, read
+/// for the caller (fast-reads design §5.2 B-3, C-10), by URI: each once,
+/// after the prefilter, through the pipeline in the request's
+/// `RequestState` (the clear-field check, `droppedFields` and S4 apply),
+/// decorated as `getPosts` decorates. A subject that does not read, for
+/// any reason, is absent, so its notification carries no
+/// `reasonSubjectPost`, as one with a deleted subject.
+async fn notification_subjects(
+    s: &PrivateState,
+    rs: &RequestState,
+    caller: &VerifiedCaller,
+    hydration: &HydrationContext,
+    rows: &[schema::NotificationRow],
+    start: Instant,
+) -> Result<HashMap<String, PrivateEmit<Value>>, XrpcError> {
+    let mut wanted: Vec<String> = Vec::new();
+    for subject in rows.iter().filter_map(|r| r.reason_subject.as_ref()) {
+        if is_private_uri(subject) && !wanted.contains(subject) {
+            wanted.push(subject.clone());
+        }
+    }
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
+    wanted.retain(|u| passing.contains(u));
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let authors = profiles(hydration, &wanted).await?;
+    let mut hits: Vec<PrivateEmit<Value>> = read_many(s, rs, caller, &wanted, &authors, start).await.into_iter().flatten().collect();
+    let mut refs: Vec<&mut PrivateEmit<Value>> = hits.iter_mut().collect();
+    decorate(s, rs, caller, hydration, &mut refs, &[], start).await?;
+    Ok(hits.into_iter().filter_map(|hit| view_uri(&hit).map(|u| (u, hit))).collect())
 }
 
 /// `app.nearhorizon.private.getUnreadCount {reasons?}` (private posting

@@ -35,7 +35,7 @@
               "type": "array",
               "items": {
                 "type": "ref",
-                "ref": "app.bsky.notification.listNotifications#notification"
+                "ref": "#notification"
               }
             },
             "cursor": {
@@ -56,6 +56,33 @@
           "description": "The caller's account indexing is still in progress."
         }
       ]
+    },
+    "notification": {
+      "type": "object",
+      "description": "app.bsky.notification.listNotifications#notification, with reasonSubjectPost.",
+      "required": ["uri", "cid", "author", "reason", "record", "isRead", "indexedAt"],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "cid": { "type": "string", "format": "cid" },
+        "author": { "type": "ref", "ref": "app.bsky.actor.defs#profileView" },
+        "reason": {
+          "type": "string",
+          "knownValues": ["like", "repost", "reply", "quote", "mention"]
+        },
+        "reasonSubject": { "type": "string", "format": "at-uri" },
+        "reasonSubjectPost": {
+          "type": "ref",
+          "ref": "app.nearhorizon.private.defs#privatePostView",
+          "description": "While getMembership lists 'private.notificationSubjects': the private post reasonSubject names, read for the requester as getPosts reads it, with the same decoration. Absent when reasonSubject is absent or public, and when the requester cannot read the post or it no longer exists, the same for every reason."
+        },
+        "record": { "type": "unknown" },
+        "isRead": { "type": "boolean" },
+        "indexedAt": { "type": "string", "format": "datetime" },
+        "labels": {
+          "type": "array",
+          "items": { "type": "ref", "ref": "com.atproto.label.defs#label" }
+        }
+      }
     }
   }
 }

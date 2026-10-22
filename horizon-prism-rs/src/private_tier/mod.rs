@@ -205,6 +205,9 @@ pub const FEATURES: &[&str] = &[
     // `reply {root, parent}` on getTimeline and getAuthorFeed items
     // (fast-reads design §5.2 B-2, F-F).
     "private.replyContext",
+    // `reasonSubjectPost` on listNotifications items (fast-reads design
+    // §5.2 B-3, F-G).
+    "private.notificationSubjects",
 ];
 
 /// The private tier as the rest of the crate may use it.

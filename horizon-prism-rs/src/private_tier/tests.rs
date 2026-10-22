@@ -4021,6 +4021,53 @@ async fn t_f8_feed_items_carry_their_reply_context() {
     db.drop_db().await;
 }
 
+/// T-F9 (fast-reads design §5.2 B-3): Bob's like and repost of Alice's
+/// private post carry it as `reasonSubjectPost`, decorated as `getPosts`
+/// decorates, read once for both; a mention has no subject and no field;
+/// once the subject does not read for Alice (taken down), the notification
+/// is what it was without the field.
+#[tokio::test]
+async fn t_f9_notifications_carry_their_subject() {
+    let test = "tf9-subjects";
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let f = fixture(&db.pool, test).await;
+    let aud = f.audience(ALICE, "3kaudience22", Some("list"), &[BOB, CAROL]).await;
+    let aud_carol = f.audience(CAROL, "3kaudcarol22", Some("list"), &[ALICE]).await;
+    let t = f.private_post(ALICE, "3ktpost22222", &aud, None).await;
+    f.post_with(CAROL, "3kmention222", &aud_carol, json!({"facets": [mention(ALICE)]})).await;
+    let at = "2026-10-01T10:00:00Z";
+    f.ingest(BOB, LIKE, "3klikebob222", subject_record(LIKE, &t, at)).await;
+    f.ingest(BOB, REPOST, "3krepostbob2", subject_record(REPOST, &t, at)).await;
+    f.ready_all().await;
+    let base = serve_live(f.state_floored(Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let hits = |text: &str| crate::test_support::series(text, "private_read_outcome_total", &[r#"outcome="hit""#]).unwrap_or(0.0);
+    let before = hits(&handle.render());
+    let (page, _) = notifications_of(&base, ALICE, "").await;
+    // The mention's post and the one subject.
+    assert_eq!(hits(&handle.render()) - before, 2.0, "{page}");
+    let of = |page: &Value, reason: &str| {
+        page["notifications"].as_array().expect("list").iter().find(|n| n["reason"] == reason).unwrap_or_else(|| panic!("{reason} in {page}")).clone()
+    };
+    let like = of(&page, "like");
+    let subject = &like["reasonSubjectPost"];
+    assert_eq!((subject["uri"].as_str(), subject["record"]["text"].as_str()), (Some(t.as_str()), Some("3ktpost22222")), "{like}");
+    assert!(subject["likeCount"] == 1 && subject["repostCount"] == 1 && subject["viewer"].is_object(), "decorated: {subject}");
+    assert_eq!(of(&page, "repost")["reasonSubjectPost"], *subject, "the same subject");
+    assert!(of(&page, "mention").get("reasonSubjectPost").is_none());
+
+    exec(&f.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{t}', '!takedown')")).await;
+    let (after, _) = notifications_of(&base, ALICE, "").await;
+    let mut without = like.clone();
+    without.as_object_mut().expect("object").remove("reasonSubjectPost");
+    assert_eq!(of(&after, "like"), without, "no field, nothing else changed");
+    db.drop_db().await;
+}
+
 /// T-F7 (fast-reads design §5.2 B-1): with an unread row of every reason
 /// and every private post readable, `getUnreadCount {reasons}` equals the
 /// unread items `listNotifications` returns for the same `reasons`; no
