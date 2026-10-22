@@ -1100,7 +1100,8 @@ async fn thread_tail(
     // their own author, left out before they are read (`thread.rs:207-208`).
     let hidden = if root_read { hidden_replies(s, caller, &root).await? } else { HashSet::new() };
 
-    let (mut replies, expanded) = expand(s, rs, caller, hydration, vec![uri.to_string()], depth, &mut budget, &hidden, start).await?;
+    let reads = expansion_reads(s);
+    let (mut replies, expanded) = expand(s, rs, caller, hydration, vec![uri.to_string()], depth, &mut budget, reads, &hidden, start).await?;
 
     // Every node is read; decorate them all at once.
     let mut refs: Vec<&mut PrivateEmit<Value>> = std::iter::once(&mut anchor)
@@ -1138,9 +1139,26 @@ async fn hidden_replies(s: &PrivateState, caller: &VerifiedCaller, root: &str) -
         .collect())
 }
 
+/// The pipeline reads one expansion may make (shared-walk amendment 1
+/// §2.3 (b), C2 (b)): [`THREAD_NODE_CAP`] × `private_read.page_reads_factor`,
+/// 400 at the default factor 2.
+fn expansion_reads(s: &PrivateState) -> usize {
+    THREAD_NODE_CAP.saturating_mul(s.reads_factor)
+}
+
 /// The replies below `level`, breadth-first, up to `depth` levels, at most
 /// [`REPLIES_PER_NODE`] candidates a node, each read for the caller, while
 /// `budget` nodes remain. `hidden` are left out before they are read.
+///
+/// At most `reads` candidates are read in all, across the levels, hits and
+/// misses alike (shared-walk amendment 1 §2.3 (b)). Whole nodes only: the
+/// parents are taken in order, and a parent is expanded only if every
+/// candidate it would read (after `hidden`, and after `budget` cuts it, as
+/// before) fits in the reads left. The first parent that does not fit, and
+/// every parent after it on any level, is not expanded: no `replies`, as
+/// for a node past `depth`. Its candidate statement has run; its reads have
+/// not.
+///
 /// Returns the hits by parent URI and the URIs that were expanded.
 #[allow(clippy::too_many_arguments)]
 async fn expand(
@@ -1151,31 +1169,33 @@ async fn expand(
     mut level: Vec<String>,
     depth: u32,
     budget: &mut usize,
+    reads: usize,
     hidden: &HashSet<String>,
     start: Instant,
 ) -> Result<(HashMap<String, Vec<PrivateEmit<Value>>>, HashSet<String>), XrpcError> {
     let mut replies: HashMap<String, Vec<PrivateEmit<Value>>> = HashMap::new();
     let mut expanded: HashSet<String> = HashSet::new();
+    let mut reads_left = reads;
     for _ in 0..depth {
         if level.is_empty() || *budget == 0 {
             break;
         }
         let mut batch: Vec<(String, String)> = Vec::new();
+        let mut capped = false;
         for parent in &level {
             if batch.len() >= *budget {
                 break;
             }
-            expanded.insert(parent.clone());
+            let room = *budget - batch.len();
             let candidates = schema::reply_candidates(&s.env.pool, &caller.did, parent, REPLIES_PER_NODE, s.bounds).await?;
-            for c in candidates {
-                if batch.len() >= *budget {
-                    break;
-                }
-                if hidden.contains(&c) {
-                    continue;
-                }
-                batch.push((parent.clone(), c));
+            let wanted: Vec<String> = candidates.into_iter().filter(|c| !hidden.contains(c)).take(room).collect();
+            if wanted.len() > reads_left {
+                capped = true;
+                break;
             }
+            reads_left -= wanted.len();
+            expanded.insert(parent.clone());
+            batch.extend(wanted.into_iter().map(|c| (parent.clone(), c)));
         }
         let uris: Vec<String> = batch.iter().map(|(_, c)| c.clone()).collect();
         let authors = profiles(hydration, &uris).await?;
@@ -1187,6 +1207,9 @@ async fn expand(
                 level.push(child);
                 replies.entry(parent).or_default().push(post);
             }
+        }
+        if capped {
+            break;
         }
     }
     Ok((replies, expanded))
@@ -1896,7 +1919,9 @@ async fn quotes_body(
 /// - Each reply is expanded breadth-first `depth` levels below it, at most
 ///   [`REPLIES_PER_NODE`] children a node and [`THREAD_NODE_CAP`] nodes in
 ///   the response, as `getPostThread`; deeper levels are reached by calling
-///   `getReplies` on a node.
+///   `getReplies` on a node. The expansion reads at most
+///   [`THREAD_NODE_CAP`] × `page_reads_factor` candidates, apart from the
+///   page's own reads, whole nodes only (`expand`).
 ///
 /// Floored (`get_replies`).
 pub async fn get_replies(
@@ -2047,7 +2072,8 @@ async fn replies_body(
 
     let mut budget = THREAD_NODE_CAP.saturating_sub(hits.len());
     let level: Vec<String> = hits.iter().filter_map(view_uri).collect();
-    let (mut replies, expanded) = expand(s, &rs, caller, &hydration, level, depth, &mut budget, &hidden, start).await?;
+    // The expansion's own read allowance, apart from the page's.
+    let (mut replies, expanded) = expand(s, &rs, caller, &hydration, level, depth, &mut budget, expansion_reads(s), &hidden, start).await?;
     let mut refs: Vec<&mut PrivateEmit<Value>> = hits.iter_mut().chain(replies.values_mut().flatten()).collect();
     decorate(s, &rs, caller, &hydration, &mut refs, &roots_read, start).await?;
     let nodes = hits

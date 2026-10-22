@@ -1,6 +1,7 @@
 //! S12's T-56 (docs/internal/design/private-threads.md §3.3, §3.4, §6): the
 //! read cap, the prefiltered parents, root and quotes, and the head round,
-//! with a head source that records its calls.
+//! with a head source that records its calls; and C2 (b), the thread
+//! expansion's read cap (shared-walk amendment 1 §2.3 (b)).
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -508,5 +509,117 @@ async fn t56_the_read_cap() {
     exec(&w.f.pool, "DELETE FROM blocks").await;
     let absent = page_trace(pages(&w.base, TIMELINE, "limit=2", DAVE, 30).await);
     assert_eq!(blocked, absent, "a blocking author's rows are as if absent");
+    w.finish().await;
+}
+
+/// The nodes of `level`'s next level down, in the response's order (the
+/// order `expand` took them in).
+fn next_level(level: &[Value]) -> Vec<Value> {
+    level.iter().flat_map(|n| n["replies"].as_array().cloned().unwrap_or_default()).collect()
+}
+
+/// Whether each node has `replies`: `Some(n)` with n replies, or `None`.
+fn replies_shape(level: &[Value]) -> Vec<Option<usize>> {
+    level.iter().map(|n| n["replies"].as_array().map(Vec::len)).collect()
+}
+
+/// C2 (b), H-3 (shared-walk amendment 1 §2.3 (b), #778): the expansion's
+/// read cap, `THREAD_NODE_CAP × page_reads_factor` candidates, whole nodes
+/// only. Alice's root R, two readable replies under it and two under each of
+/// those, three levels down (L1: 2, L2: 4, L3: 8), every node above L3 with
+/// 38 undecodable replies beside its 2: the expansion reads 40 + 80 + 160 =
+/// 280 candidates. (40 a node keeps every level's batch inside the node
+/// budget, so only the read cap cuts.)
+/// - Factor 2 (400) is above it: the thread is the one an uncapped
+///   expansion gives (factor 100), every node expanded, 280 reads.
+/// - Factor 1 (200): `getPostThread` reads exactly 200 (R, L1, then the
+///   first two L2 nodes); the third L2 node does not fit, so it, the L2 node
+///   after it and the L3 nodes have no `replies`.
+/// - `getReplies` of R, `depth` 2: the page's 40 reads are its own. Factor
+///   1: the expansion reads 200 (L1, then the first three L2 nodes), and the
+///   last L2 node has no `replies`. Factor 2: all 240.
+///
+/// Reads are counted by `private_read_outcome_total`; the anchor's (or the
+/// page's) are taken off by the same request at `depth` 0.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn c2b_the_expansion_read_cap() {
+    let Some(w) = walk_on("c2b-read-cap").await else {
+        return;
+    };
+    let (t, aud) = (w.root.clone(), w.aud.clone());
+    let mut b = super::b5::Bulk::new("c2ba");
+    let mut u = super::b5::Bulk::new("c2bu");
+    let mut level = vec![t.clone()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for node in &level {
+            for _ in 0..38 {
+                u.post(BOB, &aud, Some((&t, node)));
+            }
+            next.push(b.post(BOB, &aud, Some((&t, node))));
+            next.push(b.post(CAROL, &aud, Some((&t, node))));
+        }
+        level = next;
+    }
+    b.write(&w.f.pool).await;
+    u.write(&w.f.pool).await;
+    super::b5::make_undecodable(&w.f.pool, &format!("at://{BOB}/%/c2bu%")).await;
+    w.f.ready_all().await;
+
+    let server = async |factor: u32| {
+        let read = PrivateReadConfig { max_chain: CAP, page_reads_factor: factor, ..PrivateReadConfig::default() };
+        // The bulk rows are plaintext, which S4 refuses by default.
+        serve_live(w.f.state_bounded(&read).with_plaintext_refused(false)).await
+    };
+    let counted = PipelineReads::default();
+    let guard = metrics::set_default_local_recorder(&counted);
+    // The reads of `method` with `query` and `depth` (empty for the
+    // method's default) beyond those of `depth=0`, and the body as JSON.
+    // `depth` is given once: of two, the first is the one taken.
+    let expansion = async |base: &str, method: &str, query: &str, depth: &str| -> (u64, Value) {
+        let before = counted.count();
+        json_of(base, method, &format!("{query}&depth=0"), DAVE).await;
+        let anchor = counted.count() - before;
+        let before = counted.count();
+        let (_, v, _) = json_of(base, method, &format!("{query}{depth}"), DAVE).await;
+        (counted.count() - before - anchor, v)
+    };
+
+    // Under the cap: as uncapped.
+    let thread = format!("uri={t}");
+    let (reads, under) = expansion(&server(2).await, THREAD, &thread, "").await;
+    let (uncapped_reads, uncapped) = expansion(&server(100).await, THREAD, &thread, "").await;
+    assert_eq!((reads, uncapped_reads), (280, 280));
+    assert_eq!(under, uncapped, "a thread under the cap is as uncapped");
+    let root = &under["thread"];
+    assert_eq!(reply_uris(root).len(), 14, "{root}");
+    let l1 = next_level(std::slice::from_ref(root));
+    let l2 = next_level(&l1);
+    let l3 = next_level(&l2);
+    assert_eq!(replies_shape(&l2), [Some(2); 4]);
+    assert_eq!(replies_shape(&l3), [Some(0); 8], "leaves are expanded, with no replies");
+
+    // Over the cap: 200 reads, whole nodes.
+    let (reads, over) = expansion(&server(1).await, THREAD, &thread, "").await;
+    assert_eq!(reads, 200, "the expansion reads at most the cap");
+    let root = &over["thread"];
+    let l1 = next_level(std::slice::from_ref(root));
+    assert_eq!(replies_shape(&l1), [Some(2); 2]);
+    let l2 = next_level(&l1);
+    assert_eq!(replies_shape(&l2), [Some(2), Some(2), None, None], "the first L2 node that does not fit, and those after it");
+    let l3 = next_level(&l2);
+    assert_eq!(replies_shape(&l3), [None; 4], "nodes after the first that does not fit");
+
+    // `getReplies`: the page's reads apart, the expansion's capped.
+    let page = format!("uri={t}&limit=50");
+    let (reads, capped) = expansion(&server(1).await, GET_REPLIES, &page, "&depth=2").await;
+    assert_eq!(reads, 200, "getReplies' expansion reads at most the cap");
+    let top: Vec<Value> = capped["replies"].as_array().expect("replies").clone();
+    assert_eq!((replies_uris(&capped).len(), replies_shape(&top)), (2, vec![Some(2); 2]), "{capped}");
+    assert_eq!(replies_shape(&next_level(&top)), [Some(2), Some(2), Some(2), None]);
+    let (reads, _) = expansion(&server(2).await, GET_REPLIES, &page, "&depth=2").await;
+    assert_eq!(reads, 240, "getReplies under the cap reads every candidate");
+    drop(guard);
     w.finish().await;
 }

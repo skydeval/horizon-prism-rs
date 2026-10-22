@@ -1233,8 +1233,10 @@ async fn b5_absolute_floors() {
 /// `reply_candidates` per expanded node in turn, as `expand` runs them; and
 /// pipeline reads, as `getPosts` of 25 undecodable children (each a full
 /// read that misses at the decode) and of 25 readable ones. The thread
-/// makes one read per candidate, so its reads cost about
-/// `candidates / 25 ×` the first. Prints the numbers.
+/// makes one read per candidate up to the expansion's read cap (C2 (b),
+/// `THREAD_NODE_CAP × page_reads_factor`, 400 here, whole nodes only), so
+/// its reads cost about `min(candidates, cap) / 25 ×` the first. Prints the
+/// numbers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "H-3 trace; run with --release --ignored --nocapture"]
 async fn b5_thread_expansion_trace() {
@@ -1246,7 +1248,8 @@ async fn b5_thread_expansion_trace() {
     let cases = Part3::UndecodableChildren.build(&pool).await;
     exec(&pool, "ANALYZE").await;
     let read = PrivateReadConfig { max_chain: CAP, ..PrivateReadConfig::default() };
-    let base = serve_live(w.f.state_bounded(&read)).await;
+    // The fixture's rows are plaintext, which S4 refuses by default.
+    let base = serve_live(w.f.state_bounded(&read).with_plaintext_refused(false)).await;
     let query = cases[0].2.clone();
     let root = query.strip_prefix("uri=").expect("uri").to_string();
     let thread = sample(&base, THREAD, &query, DAVE, N, 1).await;
@@ -1291,10 +1294,13 @@ async fn b5_thread_expansion_trace() {
     let misses = sample(&base, POSTS, &some("%/b5cu%").await, DAVE, N, 1).await;
     let hits = sample(&base, POSTS, &some("%/b5ca%").await, DAVE, N, 1).await;
     let p50 = |d: &[Duration]| percentile(d, 50).as_secs_f64() * 1000.0;
+    let cap = super::super::handlers::THREAD_NODE_CAP * usize::try_from(read.page_reads_factor).expect("factor");
+    let read_count = candidates.min(cap);
     #[allow(clippy::cast_precision_loss)]
-    let reads = p50(&misses) * candidates as f64 / 25.0;
+    let reads = p50(&misses) * read_count as f64 / 25.0;
     println!(
-        "H-3 trace: getPostThread p50 {:.1} ms; {} expanded nodes, {candidates} candidates; candidate statements p50 {:.1} ms; \
+        "H-3 trace: getPostThread p50 {:.1} ms; {} nodes, {candidates} candidates, at most {read_count} read (cap {cap}); \
+         candidate statements p50 {:.1} ms; \
          getPosts of 25 undecodable p50 {:.1} ms (so about {reads:.0} ms for the thread's reads); getPosts of 25 readable p50 {:.1} ms",
         p50(&thread),
         nodes.len(),

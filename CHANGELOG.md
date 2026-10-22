@@ -10,6 +10,22 @@ commit.
 
 ## [Unreleased]
 
+### Changed (private thread expansion read cap, H-3, #778)
+
+- **`getPostThread` and `getReplies`** (private tier) cap the pipeline
+  reads of one reply expansion at `THREAD_NODE_CAP ×
+  private_read.page_reads_factor` (400 at the default factor 2), counted
+  across levels, hits and misses alike (shared-walk amendment 1 §2.3 (b),
+  C2 (b)). Whole nodes only: a parent is expanded only if all of its
+  candidates fit in the reads left; the first that does not, and every
+  parent after it, comes back without `replies`, as a node past `depth`
+  does, and is reached by calling `getReplies` on it. `getReplies`' own
+  page reads are not counted against the cap. A thread of nodes with many
+  undecodable children no longer reads up to ~1,990 posts per request.
+  No migration, config key or lexicon change.
+- The changelog's horizon-firehose pin entry, duplicated in part by the
+  last commit, is repaired.
+
 ### Fixed (horizon-firehose pin: no stale-cursor replay)
 
 - **`docker/docker-compose.yml`** pins horizon-firehose at `b3b7d1e`
@@ -22,12 +38,7 @@ commit.
   private reads missed as stale. The new `cursor.relay_reset_after_seconds`
   key (default 600) is optional; existing relay configs load unchanged.
 
-### Fixed (horizon-firehose pin: no stale-cursor replay)
-
-- **`docker/docker-compose.yml`** pins horizon-firehose at
-### Fixed (horizon-firehose pin: no stale-cursor replay)
-
-- **`docker/docker-compose.yml`** pins horizon-### Changed (tests: one migrated template per run, #811)
+### Changed (tests: one migrated template per run, #811)
 
 - **`test_support::fresh_db`** no longer replays every migration for each
   test. The first call in a test run builds a migrated template database,
