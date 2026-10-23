@@ -1613,8 +1613,11 @@ impl Writer {
         // Tombstone iff a row was removed, or the author is in S (§5.5); a
         // follow of any tracked repo too, so that a listing's older write
         // cannot restore an unfollow that found no row (following-audience
-        // design §4.1).
-        if removed || author_in_scope || (d.kind == RecordKind::Follow && sets.is_tracked(repo)) {
+        // design §4.1); and any record of a DID in Refract's R or a
+        // candidate, so a delete before or during its backfill keeps the
+        // backfill from writing it (refract design §5.2).
+        let in_r_or_candidate = sets.is_restored(repo) || sets.candidates.contains_key(repo) || sets.refract_hidden.pending(repo);
+        if removed || author_in_scope || in_r_or_candidate || (d.kind == RecordKind::Follow && sets.is_tracked(repo)) {
             sqlx::query(
                 "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
                  ON CONFLICT (uri) DO UPDATE SET rev = GREATEST(record_tombstones.rev, EXCLUDED.rev), deleted_at = now()",
@@ -1634,6 +1637,16 @@ impl Writer {
                 .execute(&mut *conn)
                 .await?;
             sqlx::query("DELETE FROM notifications WHERE record_uri = $1")
+                .bind(&d.uri)
+                .execute(&mut *conn)
+                .await?;
+            // Refract's (refract design §5.2, §4.5): its notifications and
+            // its community label reads.
+            sqlx::query("DELETE FROM refract_notifications WHERE record_uri = $1")
+                .bind(&d.uri)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("DELETE FROM refract_record_reads WHERE uri = $1")
                 .bind(&d.uri)
                 .execute(&mut *conn)
                 .await?;

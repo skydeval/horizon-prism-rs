@@ -10,6 +10,7 @@
 //! - [`labels`], [`poll`]: community labels (§4.5).
 //! - [`config_task`]: live changes, pending scopes and their delay (§3.2,
 //!   §4.6).
+//! - [`purge`]: the Refract purge (§6.2).
 //! - [`net`]: the outbound calls.
 
 pub mod checker;
@@ -18,6 +19,7 @@ pub mod config_task;
 pub mod labels;
 pub mod net;
 pub mod poll;
+pub mod purge;
 pub mod snapshot;
 pub mod state;
 #[cfg(test)]
@@ -30,6 +32,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 pub use communities::Communities;
+pub use purge::forget_account;
 pub use snapshot::{Captured, CollectionRule, HideReasons, RefractCheck, RefractHidden, RefractSnapshot, RefractView};
 pub use state::State;
 
@@ -136,6 +139,7 @@ impl Refract {
             tokio::spawn(self.clone().run_checker()),
             tokio::spawn(self.clone().run_poller()),
             tokio::spawn(self.clone().run_sweep()),
+            tokio::spawn(self.clone().run_purger()),
             tokio::spawn(self.clone().run_gauges()),
         ]
     }

@@ -122,6 +122,9 @@ pub enum ClaimOrder {
     /// Due `member`, `private` and `authz` jobs first, each part by
     /// `not_before` (workers 1 and up).
     Priority,
+    /// `refract` jobs only, by `not_before`: Refract's own workers
+    /// (refract design §6.1).
+    Refract,
 }
 
 impl ClaimOrder {
@@ -135,6 +138,7 @@ impl ClaimOrder {
         match self {
             Self::Plain => "plain",
             Self::Priority => "priority",
+            Self::Refract => "refract",
         }
     }
 
@@ -152,6 +156,11 @@ impl ClaimOrder {
                  WHERE state = 'queued' AND depth NOT IN ('list_sync', 'refract') AND not_before <= now() \
                  ORDER BY (depth IN ('member', 'private', 'authz')) DESC, not_before \
                  LIMIT 1 FOR UPDATE SKIP LOCKED"
+            }
+            Self::Refract => {
+                "SELECT did, depth FROM backfill_jobs \
+                 WHERE state = 'queued' AND depth = 'refract' AND not_before <= now() \
+                 ORDER BY not_before LIMIT 1 FOR UPDATE SKIP LOCKED"
             }
         }
     }
@@ -963,6 +972,9 @@ pub struct Backfill {
     farsight: Option<Farsight>,
     /// The `list_sync` lanes the workers serve before their own claim.
     list_sync: Option<ListSync>,
+    /// `refract.backfill_concurrency`: the dedicated `refract` workers
+    /// (refract design §6.1).
+    refract_workers: u32,
 }
 
 impl Backfill {
@@ -981,7 +993,15 @@ impl Backfill {
                 .build(),
             farsight: None,
             list_sync: None,
+            refract_workers: 0,
         }
+    }
+
+    /// Run `n` dedicated `refract` workers (refract design §6.1).
+    #[must_use]
+    pub fn with_refract_workers(mut self, n: u32) -> Self {
+        self.refract_workers = n;
+        self
     }
 
     /// Serve the `list_sync` lanes from these workers.
@@ -1025,6 +1045,10 @@ impl Backfill {
             let this = self.clone();
             handles.push(tokio::spawn(async move { this.worker_loop(worker).await }));
         }
+        for _ in 0..self.refract_workers {
+            let this = self.clone();
+            handles.push(tokio::spawn(async move { this.refract_loop().await }));
+        }
         let this = self.clone();
         handles.push(tokio::spawn(async move { this.retry_loop().await }));
         let this = self.clone();
@@ -1037,6 +1061,42 @@ impl Backfill {
         let this = self;
         handles.push(tokio::spawn(async move { this.metrics_loop().await }));
         Ok(handles)
+    }
+
+    /// A `refract` worker: claims `refract` jobs only, so a long full
+    /// history never holds a regular worker (refract design §6.1).
+    async fn refract_loop(self) {
+        loop {
+            let idle = match self.claim(ClaimOrder::Refract).await {
+                Ok(Some(job)) => {
+                    if let Err(error) = self.run_claimed(job).await {
+                        tracing::warn!(event = "backfill_refract_settle_failed", %error, "settling a refract job failed");
+                    }
+                    false
+                }
+                Ok(None) => true,
+                Err(error) => {
+                    tracing::warn!(event = "backfill_claim_failed", worker = "refract", %error, "claiming a refract job failed");
+                    true
+                }
+            };
+            if idle {
+                tokio::time::sleep(IDLE_POLL).await;
+            }
+        }
+    }
+
+    /// Claim and run one due `refract` job, if any (tests).
+    ///
+    /// # Errors
+    ///
+    /// Claiming or settling failed (database).
+    #[cfg(test)]
+    pub async fn run_refract_once(&self) -> Result<Option<(Job, JobOutcome)>, sqlx::Error> {
+        let Some(job) = self.claim(ClaimOrder::Refract).await? else {
+            return Ok(None);
+        };
+        self.run_claimed(job).await.map(Some)
     }
 
     async fn worker_loop(self, worker: u32) {
@@ -1192,6 +1252,9 @@ impl Backfill {
 
     /// Steps 1–5. `Ok(None)` when superseded part-way.
     async fn run(&self, job: &Job) -> Result<Option<RunResult>, RunError> {
+        if job.depth == Depth::Refract {
+            return self.run_refract(job).await;
+        }
         let (is_member, mode, tracked) = {
             let sets = self.writer.scope().read_guard().await;
             (sets.is_member(&job.did), sets.public.mode, sets.is_tracked(&job.did))
@@ -1349,6 +1412,131 @@ impl Backfill {
             match self.inbound_pass(job).await? {
                 None => return Ok(None),
                 Some(ceiling) => result.ceiling_hit |= ceiling,
+            }
+        }
+        Ok(Some(result))
+    }
+
+    /// Whether `did` is in Refract's R-live now, under the read guard.
+    async fn restored_live(&self, did: &str) -> bool {
+        self.writer.scope().read_guard().await.is_restored(did)
+    }
+
+    /// Save a `refract` run's position (refract design §6.1), only while
+    /// the row is still the run's. `false`: superseded.
+    async fn save_refract_cursor(&self, job: &Job, cursor: &RefractCursor) -> Result<bool, String> {
+        let n = sqlx::query(
+            "UPDATE backfill_jobs SET refract_cursor = $3, updated_at = now() \
+             WHERE did = $1 AND depth = 'refract' AND state = 'running' AND generation = $2",
+        )
+        .bind(&job.did)
+        .bind(job.generation)
+        .bind(serde_json::to_value(cursor).map_err(|e| e.to_string())?)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// A `refract` run (refract design §6.1): every collection the restored
+    /// rule admits, to the end, each page written as it arrives in one
+    /// transaction, only its URIs kept for the reconcile, and the position
+    /// saved after each page so a restart or a retry resumes. A resumed
+    /// collection is not reconciled in that run. The DID's R-live
+    /// membership is checked before each page; out of it, the run stops.
+    /// `Ok(None)` when superseded.
+    async fn run_refract(&self, job: &Job) -> Result<Option<RunResult>, RunError> {
+        let (is_member, mode, live) = {
+            let sets = self.writer.scope().read_guard().await;
+            (sets.is_member(&job.did), sets.public.mode, sets.is_restored(&job.did))
+        };
+        if !live {
+            tracing::info!(event = "backfill_refract_not_restored", did = %job.did, "not in R; the refract job ends");
+            return Ok(Some(RunResult::default()));
+        }
+        let pds = self.source.prepare(&job.did).await?;
+        let rev = self.source.latest_rev(&pds, &job.did).await?;
+        let plan = plan(Depth::Refract, is_member, mode);
+        let saved: Option<Value> = sqlx::query_scalar("SELECT refract_cursor FROM backfill_jobs WHERE did = $1 AND depth = 'refract' AND generation = $2")
+            .bind(&job.did)
+            .bind(job.generation)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .flatten();
+        let mut cursor: RefractCursor = saved.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        let resumed = cursor.collection.clone();
+        let result = RunResult { rev, ..RunResult::default() };
+        let mut budget = self.settings.reconcile_confirm_limit;
+        let ceiling = usize::try_from(self.settings.full_listing_ceiling).unwrap_or(usize::MAX);
+        for c in &plan.collections {
+            if cursor.done.iter().any(|d| d == c.nsid) {
+                continue;
+            }
+            let mut page_cursor = if cursor.collection.as_deref() == Some(c.nsid) { cursor.cursor.clone() } else { None };
+            let mut complete = resumed.as_deref() != Some(c.nsid);
+            let prefix = format!("at://{}/{}/", job.did, c.nsid);
+            let mut listed: HashSet<String> = HashSet::new();
+            loop {
+                if let Step::Superseded = self.still_running(job).await? {
+                    return Ok(None);
+                }
+                if !self.restored_live(&job.did).await {
+                    tracing::info!(event = "backfill_refract_left_r", did = %job.did, "the DID left R; the refract job stops");
+                    return Ok(Some(result));
+                }
+                let page = self.source.list_records(&pds, &job.did, c.nsid, page_cursor.as_deref()).await?;
+                let empty = page.records.is_empty();
+                let records: Vec<ListedRecord> = page.records.into_iter().filter(|r| r.uri.starts_with(&prefix)).collect();
+                listed.extend(records.iter().map(|r| r.uri.clone()));
+                if !records.is_empty() {
+                    let ops: Vec<RawOp> = records
+                        .iter()
+                        .map(|r| RawOp {
+                            action: Action::Create,
+                            collection: c.nsid.to_string(),
+                            rkey: r.rkey().to_string(),
+                            cid: Some(r.cid.clone()),
+                            record: Some(r.value.clone()),
+                        })
+                        .collect();
+                    self.writer.apply(&job.did, &result.rev, &ops, self.options()).await.map_err(|e| e.to_string())?;
+                }
+                let more = page.cursor.is_some() && !empty && listed.len() < ceiling;
+                if page.cursor.is_some() && !empty && listed.len() >= ceiling {
+                    complete = false;
+                    tracing::warn!(event = "backfill_listing_truncated", did = %job.did, collection = c.nsid, "refract listing hit the ceiling; not reconciled");
+                }
+                if more {
+                    cursor.collection = Some(c.nsid.to_string());
+                    cursor.cursor.clone_from(&page.cursor);
+                } else {
+                    cursor.collection = None;
+                    cursor.cursor = None;
+                    cursor.done.push(c.nsid.to_string());
+                }
+                if !self.save_refract_cursor(job, &cursor).await? {
+                    return Ok(None);
+                }
+                if !more {
+                    break;
+                }
+                page_cursor = page.cursor;
+            }
+            if complete {
+                self.reconcile(&pds, job, c.nsid, &result.rev, &listed, &mut budget, mode.off_rule()).await?;
+            }
+        }
+        for nsid in plan.profile.then_some(NSID_PROFILE).into_iter().chain(plan.self_records.iter().copied()) {
+            match self.source.get_optional_record(&pds, &job.did, nsid, "self").await? {
+                Optional::Found(record) => {
+                    self.write_record(&job.did, &result.rev, nsid, &record).await?;
+                }
+                Optional::Absent => self.delete_record(&job.did, &result.rev, nsid, "self").await?,
+                Optional::Unclear => {
+                    metrics::counter!(METRIC_OPTIONAL_UNCLEAR, "collection" => nsid).increment(1);
+                }
             }
         }
         Ok(Some(result))
@@ -1937,7 +2125,8 @@ impl Backfill {
         let tracked = self.writer.scope().read_guard().await.tracked();
         Ok(sqlx::query(
             "UPDATE backfill_jobs SET state = 'queued', attempts = 0, generation = generation + 1, not_before = now(), updated_at = now() \
-             WHERE state IN ('failed', 'unavailable') AND depth IN ('member', 'private', 'authz', 'resync') AND did = ANY($1)",
+             WHERE state IN ('failed', 'unavailable') AND ((depth IN ('member', 'private', 'authz', 'resync') AND did = ANY($1)) \
+               OR (depth = 'refract' AND EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = backfill_jobs.did AND r.state IN ('restored', 'grace'))))",
         )
         .bind(&tracked)
         .execute(&self.pool)
@@ -1993,7 +2182,7 @@ impl Backfill {
             sqlx::query_as("SELECT depth, state, count(*) FROM backfill_jobs GROUP BY depth, state")
                 .fetch_all(&self.pool)
                 .await?;
-        for depth in ["member", "scope", "private", "authz", "resync", crate::subscriptions::jobs::DEPTH] {
+        for depth in ["member", "scope", "private", "authz", "resync", "refract", crate::subscriptions::jobs::DEPTH] {
             for state in ["queued", "running", "done", "failed", "unavailable", "cancelled"] {
                 let n = rows
                     .iter()
@@ -2103,7 +2292,20 @@ pub async fn following_owners_waiting_firehose(pool: &PgPool) -> Result<i64, sql
 ///
 /// Database errors.
 pub async fn local_uris(writer: &Writer, did: &str, nsid: &str, rev: &str, off_rule: bool) -> Result<Vec<String>, sqlx::Error> {
-    let table = if off_rule && nsid == NSID_POST { Some(("member_post_refs", "author_did")) } else { public_table(nsid) };
+    // A DID in Refract's R (database state) keeps full post rows under the
+    // off rule: its posts are read from `posts` too (refract design §6.1).
+    if off_rule && nsid == NSID_POST {
+        return sqlx::query_scalar(
+            "SELECT uri FROM member_post_refs WHERE author_did = $1 AND rev < $2 \
+             UNION SELECT uri FROM posts WHERE author_did = $1 AND rev < $2 \
+               AND EXISTS (SELECT 1 FROM refract_dids WHERE did = $1 AND state IN ('restored', 'grace'))",
+        )
+        .bind(did)
+        .bind(rev)
+        .fetch_all(writer.pool())
+        .await;
+    }
+    let table = public_table(nsid);
     let mut uris = Vec::new();
     if let Some((table, author)) = table {
         uris = sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE {author} = $1 AND rev < $2"))
@@ -2120,6 +2322,16 @@ pub async fn local_uris(writer: &Writer, did: &str, nsid: &str, rev: &str, off_r
     let mut conn = writer.pool().acquire().await?;
     uris.extend(writer.private().local_uris(&mut conn, did, nsid, rev).await?);
     Ok(uris)
+}
+
+/// A `refract` run's saved position (refract design §6.1): the collection
+/// it is in and its page cursor, and the collections already done.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct RefractCursor {
+    pub collection: Option<String>,
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub done: Vec<String>,
 }
 
 /// Seconds into the day for a DID's daily job.
@@ -2187,7 +2399,7 @@ async fn retry_requeue(conn: &mut PgConnection, job: &Job) -> Result<(), sqlx::E
 /// The run's completion, only while the row is still the run's (§II-5.10).
 async fn mark_done(conn: &mut PgConnection, job: &Job) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE backfill_jobs SET state = 'done', attempts = 0, last_error = NULL, updated_at = now() \
+        "UPDATE backfill_jobs SET state = 'done', attempts = 0, last_error = NULL, refract_cursor = NULL, updated_at = now() \
          WHERE did = $1 AND depth = $2 AND generation = $3",
     )
     .bind(&job.did)
@@ -2358,6 +2570,10 @@ mod tests {
         hidden: HashSet<String>,
         inbound: Vec<LinkingRecord>,
         get_record_calls: Mutex<Vec<String>>,
+        /// `(collection, cursor)` of every listing call.
+        list_calls: Mutex<Vec<(String, Option<String>)>>,
+        /// A listing call that fails once.
+        fail_once: Mutex<Option<(String, Option<String>)>>,
     }
 
     #[async_trait]
@@ -2375,6 +2591,15 @@ mod tests {
             collection: &str,
             cursor: Option<&str>,
         ) -> Result<ListPage, String> {
+            let call = (collection.to_string(), cursor.map(str::to_string));
+            self.list_calls.lock().expect("lock").push(call.clone());
+            {
+                let mut fail = self.fail_once.lock().expect("lock");
+                if fail.as_ref() == Some(&call) {
+                    *fail = None;
+                    return Err("injected listing failure".to_string());
+                }
+            }
             let all = self.listings.get(collection).cloned().unwrap_or_default();
             let start: usize = cursor.map_or(0, |c| c.parse().expect("cursor"));
             let end = (start + 2).min(all.len());
@@ -2443,6 +2668,82 @@ mod tests {
             .fetch_all(pool)
             .await
             .expect("posts")
+    }
+
+    /// Refract T-12-r3, T-8i (refract design §6.1): a `refract` job is never
+    /// claimed by a regular worker; its pages are written as they arrive and
+    /// its position saved; a failed run resumes at the saved cursor (the
+    /// resumed collection not reconciled); a finished run clears the
+    /// cursor; a resync lists from the start and reconciles from `posts`;
+    /// `retry_tracked` re-queues a failed one of a DID in R; a superseded
+    /// run saves no cursor.
+    #[tokio::test]
+    async fn refract_runs_stream_resume_and_reconcile() {
+        let Some(db) = fresh_db("backfill_refract_runs").await else {
+            return;
+        };
+        let p = &db.pool;
+        let mut sets = ScopeSets::default();
+        sets.public.mode = PublicMode::Off;
+        Arc::make_mut(&mut sets.restored).insert(DID.into(), "sky".into());
+        let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000);
+        let writer = Writer::new(p.clone(), scope, Arc::new(DisabledPrivateTier));
+        sqlx::query("INSERT INTO refract_dids (did, community, state, source) VALUES ($1, 'sky', 'restored', 'fill')").bind(DID).execute(p).await.expect("row");
+        let mut source = FakeSource { rev: "3kzzzzzzzzzzz".to_string(), ..FakeSource::default() };
+        let posts: Vec<ListedRecord> = (1..=5).map(|i| rec(DID, NSID_POST, &format!("3kpost{i}"), json!({"$type": NSID_POST, "text": "t", "createdAt": "2026-10-22T00:00:00.000Z"}))).collect();
+        source.listings.insert(NSID_POST.to_string(), posts);
+        let subject = "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kx";
+        let likes: Vec<ListedRecord> = (1..=3)
+            .map(|i| rec(DID, NSID_LIKE, &format!("3klike{i}"), json!({"$type": NSID_LIKE, "subject": {"uri": subject, "cid": "bafyx"}, "createdAt": "2026-10-22T00:00:00.000Z"})))
+            .collect();
+        source.listings.insert(NSID_LIKE.to_string(), likes);
+        *source.fail_once.lock().expect("lock") = Some((NSID_POST.to_string(), Some("2".to_string())));
+        let source = Arc::new(source);
+        let backfill = Backfill::new(writer, Arc::clone(&source) as Arc<dyn BackfillSource>, BackfillConfig::default(), 1);
+        // A stored post the PDS no longer has.
+        insert_post(p, "3kstale", "3kaaaaaaaaaaa").await;
+        let mut conn = p.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Refract).await.expect("enqueue");
+        drop(conn);
+        assert!(backfill.run_once().await.expect("claim").is_none(), "a regular worker never claims a refract job");
+        // First run: fails on the second posts page, its first page written.
+        let (_, outcome) = backfill.run_refract_once().await.expect("run").expect("claimed");
+        assert!(matches!(outcome, JobOutcome::Failed(_)), "{outcome:?}");
+        let cursor: Option<Value> = sqlx::query_scalar("SELECT refract_cursor FROM backfill_jobs WHERE did = $1").bind(DID).fetch_one(p).await.expect("cursor");
+        assert_eq!(cursor, Some(json!({"collection": NSID_POST, "cursor": "2", "done": []})));
+        assert_eq!(post_uris(p).await.len(), 3, "the first page (two posts) and the stale one");
+        // A restart re-queues it at a new generation; the run resumes.
+        sqlx::query("UPDATE backfill_jobs SET state = 'queued', generation = generation + 1, not_before = now() WHERE did = $1").bind(DID).execute(p).await.expect("requeue");
+        source.list_calls.lock().expect("lock").clear();
+        let (_, outcome) = backfill.run_refract_once().await.expect("run").expect("claimed");
+        assert_eq!(outcome, JobOutcome::Done);
+        let calls = source.list_calls.lock().expect("lock").clone();
+        assert_eq!(calls.first(), Some(&(NSID_POST.to_string(), Some("2".to_string()))), "resumed at the saved cursor: {calls:?}");
+        assert!(!calls.contains(&(NSID_POST.to_string(), None)));
+        assert_eq!(post_uris(p).await.len(), 6, "every listed post, and the stale one: the resumed collection is not reconciled");
+        let likes: i64 = sqlx::query_scalar("SELECT count(*) FROM likes").fetch_one(p).await.expect("likes");
+        assert_eq!(likes, 3);
+        let cursor: Option<Value> = sqlx::query_scalar("SELECT refract_cursor FROM backfill_jobs WHERE did = $1").bind(DID).fetch_one(p).await.expect("cursor");
+        assert_eq!(cursor, None, "cleared when the run finishes");
+        // The resync lists from the start and reconciles from `posts`.
+        let mut conn = p.acquire().await.expect("conn");
+        jobs::enqueue(&mut conn, DID, Depth::Refract).await.expect("enqueue");
+        drop(conn);
+        source.list_calls.lock().expect("lock").clear();
+        backfill.run_refract_once().await.expect("run").expect("claimed");
+        assert_eq!(source.list_calls.lock().expect("lock").first(), Some(&(NSID_POST.to_string(), None)));
+        assert_eq!(post_uris(p).await.len(), 5, "the stale post is reconciled away");
+        // A failed refract job of a DID in R is retried; not of one out of it.
+        sqlx::query("UPDATE backfill_jobs SET state = 'failed' WHERE did = $1").bind(DID).execute(p).await.expect("fail");
+        assert_eq!(backfill.retry_tracked().await.expect("retry"), 1);
+        sqlx::query("UPDATE backfill_jobs SET state = 'failed' WHERE did = $1").bind(DID).execute(p).await.expect("fail");
+        sqlx::query("UPDATE refract_dids SET state = 'ending'").execute(p).await.expect("ending");
+        assert_eq!(backfill.retry_tracked().await.expect("retry"), 0);
+        // A superseded run saves no cursor.
+        sqlx::query("UPDATE backfill_jobs SET state = 'running', generation = 7 WHERE did = $1").bind(DID).execute(p).await.expect("running");
+        let job = Job { did: DID.into(), depth: Depth::Refract, attempts: 0, run_id: 1, generation: 6, gap_epoch: 0, last_error: None };
+        assert!(!backfill.save_refract_cursor(&job, &RefractCursor::default()).await.expect("save"));
+        db.drop_db().await;
     }
 
     /// design-v3 §3.2, §II-5.10: the v3 collections are backfilled.

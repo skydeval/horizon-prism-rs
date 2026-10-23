@@ -428,6 +428,7 @@ impl IdentityRefresher {
                AND (state = 'unavailable' OR (state = 'running' AND $2)) \
                AND CASE WHEN depth IN ('scope', 'resync') THEN EXISTS (SELECT 1 FROM scope_dids WHERE did = $1) \
                         WHEN depth IN ('member', 'private', 'authz') THEN EXISTS (SELECT 1 FROM members WHERE did = $1) \
+                        WHEN depth = 'refract' THEN EXISTS (SELECT 1 FROM refract_dids WHERE did = $1 AND state IN ('restored', 'grace')) \
                         ELSE false END",
         )
         .bind(did)

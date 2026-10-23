@@ -71,6 +71,9 @@ pub enum AdmitRule {
     /// Rule 3: a private owner's gate on its own private post (private
     /// posting §4.4).
     OwnerGate,
+    /// Refract's restored rule (refract design §5.1): the author is in
+    /// R-live.
+    Restored,
 }
 
 /// Why an op was rejected.
@@ -141,6 +144,11 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     if input.kind.is_block_kind() {
         return block_rule(input, sets);
     }
+    // Refract's restored rule (refract design §5.1), in every mode, before
+    // the off rule.
+    if let Some(decision) = restored_rule(input, sets) {
+        return decision;
+    }
     // The off rule, in the off modes only (public-indexing design §5).
     if sets.public.mode.off_rule()
         && let Some(decision) = off_rule(input, sets)
@@ -177,6 +185,32 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
         return Admission::Reject(RejectReason::Purging(PurgeKind::MemberRemoved));
     }
     Admission::Reject(RejectReason::NotInScope)
+}
+
+/// Refract's restored rule (refract design §5.1): an author in R-live that
+/// is not a member has its posts (full rows), likes, reposts, follows,
+/// lists, list items, list opt-outs, threadgates, postgates, profile and
+/// the three off self records admitted; a member in R-live only its posts,
+/// as full rows instead of the off rule's grow-only. `None` leaves the op to
+/// the other rules (starter packs, the labeler service, polls, and
+/// everything of an author outside R-live).
+fn restored_rule(input: &AdmissionInput, sets: &ScopeSets) -> Option<Admission> {
+    if !sets.is_restored(&input.author) {
+        return None;
+    }
+    let restored = Some(Admission::Admit(AdmitRule::Restored));
+    if sets.is_member(&input.author) {
+        return if input.kind == RecordKind::Post { restored } else { None };
+    }
+    match input.kind {
+        RecordKind::Post
+        | RecordKind::Like
+        | RecordKind::Repost
+        | RecordKind::Follow
+        | RecordKind::Profile
+        | RecordKind::Table("lists" | "list_items" | "list_optouts" | "threadgates" | "postgates" | "actor_self_records") => restored,
+        _ => None,
+    }
 }
 
 /// Rule M (member-blocks-only design §3): a direct, private or list block is
@@ -451,6 +485,66 @@ mod tests {
     }
 
     const OFF: Admission = Admission::Reject(RejectReason::PublicOff);
+
+    const RESTORED: &str = "did:plc:restored";
+
+    fn restored(mode: PublicMode, member: bool) -> ScopeSets {
+        let mut s = with_mode(mode);
+        std::sync::Arc::make_mut(&mut s.restored).insert(RESTORED.into(), "community-a".into());
+        if member {
+            s.members.insert(RESTORED.into());
+            s.scope.insert(RESTORED.into());
+        }
+        s
+    }
+
+    /// Refract T-1, T-2 (refract design §5.1): an R author's post gets a
+    /// full row in every mode; its other admitted kinds too; a member in R
+    /// gets full post rows and otherwise today's answers; a candidate (not
+    /// in R-live) is decided as before; Rule M and purges come first.
+    #[test]
+    fn t1_t2_the_restored_rule() {
+        const R: Admission = Admission::Admit(AdmitRule::Restored);
+        let admitted = [
+            RecordKind::Post,
+            RecordKind::Like,
+            RecordKind::Repost,
+            RecordKind::Follow,
+            RecordKind::Profile,
+            RecordKind::Table("lists"),
+            RecordKind::Table("list_items"),
+            RecordKind::Table("list_optouts"),
+            RecordKind::Table("threadgates"),
+            RecordKind::Table("postgates"),
+            RecordKind::Table("actor_self_records"),
+        ];
+        for mode in [PublicMode::On, PublicMode::Filling, PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
+            let s = restored(mode, false);
+            for kind in admitted {
+                assert_eq!(admit(&input(RESTORED, kind, &[STRANGER]), &s), R, "{mode:?} {kind:?}");
+            }
+            for kind in [RecordKind::Table("starter_packs"), RecordKind::Table("labeler_services"), RecordKind::Table("nearhorizon_poll_posts")] {
+                assert_ne!(admit(&input(RESTORED, kind, &[]), &s), R, "{mode:?} {kind:?} falls through");
+            }
+            // Rule M decides blocks first.
+            assert_eq!(admit(&input(RESTORED, RecordKind::Block, &[STRANGER]), &s), Admission::Reject(RejectReason::NoMemberSide));
+            assert_eq!(admit(&input(RESTORED, RecordKind::Table("list_blocks"), &[]), &s), Admission::Reject(RejectReason::NoMemberSide));
+            // A member in R: full post rows; the rest as today.
+            let m = restored(mode, true);
+            assert_eq!(admit(&input(RESTORED, RecordKind::Post, &[]), &m), R, "{mode:?}");
+            let mut plain = m.clone();
+            plain.restored = std::sync::Arc::default();
+            for kind in [RecordKind::Like, RecordKind::Table("threadgates"), RecordKind::Profile] {
+                assert_eq!(admit(&input(RESTORED, kind, &[]), &m), admit(&input(RESTORED, kind, &[]), &plain), "{mode:?} {kind:?}");
+            }
+            // Not in R-live (a candidate, or pending): as before.
+            assert_eq!(admit(&input(RESTORED, RecordKind::Post, &[]), &with_mode(mode)), admit(&input(STRANGER, RecordKind::Post, &[]), &with_mode(mode)));
+            // An account_deleted purge comes first.
+            let mut d = restored(mode, false);
+            d.purging.insert(RESTORED.into(), PurgeKind::AccountDeleted);
+            assert_eq!(admit(&input(RESTORED, RecordKind::Post, &[]), &d), Admission::Reject(RejectReason::Purging(PurgeKind::AccountDeleted)));
+        }
+    }
 
     /// T-2: the off rule's table, in each of the off modes.
     #[test]

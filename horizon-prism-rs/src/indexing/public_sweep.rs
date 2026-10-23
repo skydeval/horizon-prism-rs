@@ -60,9 +60,17 @@ pub struct SweepTable {
 
 const ALL: &str = "TRUE";
 const AUTHOR_NOT_MEMBER: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did)";
-const CREATOR_NOT_MEMBER: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.creator_did)";
-const NO_MEMBER_END: &str =
-    "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did OR m.did = t.subject_did)";
+// Refract's spares (refract design §5.4): an author in R (database state)
+// keeps the rows the restored rule admitted.
+const NOT_R_AUTHOR: &str = "NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace'))";
+const AUTHOR_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace'))";
+const CREATOR_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.creator_did) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.creator_did AND r.state IN ('restored', 'grace'))";
+const NO_MEMBER_END_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did OR m.did = t.subject_did) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace'))";
+const POST_NOT_R: &str =
+    "NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = split_part(t.post_uri, '/', 3) AND r.state IN ('restored', 'grace'))";
 
 const fn table(name: &'static str, key: Key, delete_when: &'static str, start: u64) -> SweepTable {
     SweepTable { name, key, delete_when, start }
@@ -79,24 +87,25 @@ pub const TABLES: [SweepTable; 18] = [
     table("notifications", Key::Id, ALL, 10_000),
     // 2. Non-members' likes and reposts, while `posts` still exists for
     // their trend triggers.
-    table("likes", URI, AUTHOR_NOT_MEMBER, 1_000),
-    table("reposts", URI, AUTHOR_NOT_MEMBER, 1_000),
+    table("likes", URI, AUTHOR_NOT_MEMBER_NOR_R, 1_000),
+    table("reposts", URI, AUTHOR_NOT_MEMBER_NOR_R, 1_000),
     // 3.
-    table("posts", URI, ALL, 1_000),
+    table("posts", URI, NOT_R_AUTHOR, 1_000),
     // 4.
-    table("threadgates", URI, ALL, 10_000),
-    table("postgates", URI, ALL, 10_000),
+    table("threadgates", URI, NOT_R_AUTHOR, 10_000),
+    table("postgates", URI, NOT_R_AUTHOR, 10_000),
     table("starter_packs", URI, ALL, 10_000),
     table("labeler_services", URI, ALL, 10_000),
     table("nearhorizon_poll_posts", URI, ALL, 10_000),
-    table("lists", URI, CREATOR_NOT_MEMBER, 10_000),
-    table("list_items", URI, AUTHOR_NOT_MEMBER, 10_000),
-    table("list_optouts", URI, AUTHOR_NOT_MEMBER, 10_000),
+    table("lists", URI, CREATOR_NOT_MEMBER_NOR_R, 10_000),
+    table("list_items", URI, AUTHOR_NOT_MEMBER_NOR_R, 10_000),
+    table("list_optouts", URI, AUTHOR_NOT_MEMBER_NOR_R, 10_000),
     table("list_blocks", URI, AUTHOR_NOT_MEMBER, 10_000),
     // 5.
-    table("follows", URI, NO_MEMBER_END, 10_000),
-    // 6. Also removes the negative trend rows steps 2–3 created.
-    table("post_counts", Key::Text("post_uri"), ALL, 10_000),
+    table("follows", URI, NO_MEMBER_END_NOR_R, 10_000),
+    // 6. Also removes the negative trend rows steps 2–3 created. The
+    // counts of R's posts stay, as `load_posts` falls back to them.
+    table("post_counts", Key::Text("post_uri"), POST_NOT_R, 10_000),
     table("tag_activity_hourly", Key::TagHour, ALL, 10_000),
     table("starter_pack_counts", Key::Text("pack_uri"), ALL, 10_000),
 ];

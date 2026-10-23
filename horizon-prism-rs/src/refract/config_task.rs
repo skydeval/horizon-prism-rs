@@ -295,6 +295,24 @@ impl Refract {
     ///
     /// Database errors.
     pub async fn housekeeping(&self) -> Result<(), sqlx::Error> {
+        // The weekly resync (refract design §6.1): the same depth again, to
+        // repair relay gaps; a queued or running one is left alone.
+        let due: Vec<String> = sqlx::query_scalar(
+            "SELECT d.did FROM refract_dids d WHERE d.state IN ('restored', 'grace') AND d.resync_at <= now() \
+             AND NOT EXISTS (SELECT 1 FROM refract_pending_dids p WHERE p.did = d.did) ORDER BY d.resync_at LIMIT 100",
+        )
+        .fetch_all(&self.inner.pool)
+        .await?;
+        for did in due {
+            let mut tx = self.inner.pool.begin().await?;
+            crate::firehose::jobs::enqueue_if_idle(&mut tx, &did, crate::firehose::jobs::Depth::Refract, Utc::now()).await?;
+            sqlx::query("UPDATE refract_dids SET resync_at = now() + make_interval(days => $2) WHERE did = $1")
+                .bind(&did)
+                .bind(i32::try_from(self.inner.cfg.resync_days).unwrap_or(7))
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
         let rejected: Vec<String> = sqlx::query_scalar("DELETE FROM refract_dids WHERE state = 'rejected' AND updated_at < now() - make_interval(secs => $1) RETURNING did")
             .bind(super::checker::REJECTED_KEEP.num_seconds() as f64)
             .fetch_all(&self.inner.pool)

@@ -10,6 +10,40 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract R3: storage, backfill and the Refract purge, #831)
+
+- **The restored rule** (refract design §5.1): `AdmitRule::Restored`, in
+  every mode, after the purge rejections and Rule M and before the off
+  rule. An author in R-live that is not a member has its posts (full
+  rows), likes, reposts, follows, lists, list items, list opt-outs,
+  threadgates, postgates, profile and the off self records admitted; a
+  member in R-live its posts as full rows (its reference and growth as
+  before).
+- **Tombstones** (§5.2): a delete of a record by a DID in R, pending, or
+  a candidate always writes one, so the backfill cannot bring it back; a
+  delete also removes the record's Refract notifications and label reads.
+- **The `refract` backfill** (§6.1): full history, every collection the
+  rule admits, to `backfill.full_listing_ceiling`; each page written in
+  one transaction as it arrives, only URIs kept for the reconcile, the
+  position saved in `backfill_jobs.refract_cursor` after each page
+  (cleared by every enqueue, the `→ ending` cancel, the purge's end and a
+  finished run; kept by restarts and retries); a resumed collection is
+  not reconciled in that run. `refract.backfill_concurrency` dedicated
+  workers claim `refract` jobs only. `retry_tracked` and the
+  account-is-back re-queue cover `refract` jobs of DIDs in R; the weekly
+  resync (`refract.resync_days`) lists everything again. A reconcile of a
+  DID in R under the off rule reads `posts` as well as the references.
+- **The Refract purge** (§6.2): its own runner over `ending` rows (no
+  `purging_dids` row; it waits while another purge of the DID runs);
+  batches of 10,000 that delete only the exception rows for the mode, S
+  and membership read per batch; members' rows about the DID are never
+  deleted; then one end transaction.
+- **Spares** (§5.4): the on→off sweep, retention's scope steps (posts,
+  likes, reposts, follows, lists, list items, opt-outs, self records,
+  actors, counts) and its age cap, and the `member_removed` batches keep
+  the rows of DIDs in R. An `AccountDeleted` marker deletes every Refract
+  row of the DID; a purge's end re-queues `refract` for a DID in R-live.
+
 ### Added (Refract R2: config, the restored set, checker and labels, #830)
 
 - **Config** (refract design §3): `[refract]` with `enabled` (default

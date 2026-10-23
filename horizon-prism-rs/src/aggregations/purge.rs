@@ -335,6 +335,8 @@ impl Purger {
                         .await?;
                     member_removed |= table == "members" && gone.rows_affected() > 0;
                 }
+                // Every Refract row of the DID (refract design §4.3).
+                crate::refract::forget_account(&mut tx, did).await?;
             }
             PurgeKind::OutOfScope => {
                 sqlx::query("DELETE FROM scope_dids WHERE did = $1").bind(did).execute(&mut *tx).await?;
@@ -375,6 +377,9 @@ impl Purger {
                 sets.scope.remove(did);
                 sets.private_owners.remove(did);
                 sets.member_follows.remove(did);
+                std::sync::Arc::make_mut(&mut sets.restored).remove(did);
+                sets.candidates.remove(did);
+                std::sync::Arc::make_mut(&mut sets.refract_hidden).forget(did);
             }
             PurgeKind::MemberRemoved => {
                 sets.members.remove(did);
@@ -510,6 +515,7 @@ impl Purger {
                     .await?
                     .rows_affected();
                 n += delete_batch(conn, "notifications", "id", "recipient_did = $1", did).await?;
+                n += delete_batch(conn, "refract_notifications", "id", "recipient_did = $1", did).await?;
                 // A non-member's posts have no references (public-indexing
                 // design §4.1).
                 n += delete_batch(conn, "member_post_refs", "uri", "author_did = $1", did).await?;
@@ -571,6 +577,12 @@ impl Purger {
             && !applied.owners_left.iter().any(|d| d == did);
         if is_member || is_owner {
             jobs::enqueue(&mut tx, did, Depth::Authz).await?;
+        }
+        // The marker cancelled every job of the DID, Refract's too
+        // (refract design §4.3): a DID in R-live has its history fetched
+        // again.
+        if guard.is_restored(did) {
+            jobs::enqueue(&mut tx, did, Depth::Refract).await?;
         }
         tx.commit().await?;
         // Still under the read guard, so no member's marker step falls
@@ -675,7 +687,10 @@ async fn delete_batch(
 async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
     const AUTHOR_OF: &str = "split_part(%s, '/', 3)";
     let author_of = |col: &str| AUTHOR_OF.replace("%s", col);
-    let out_of_scope = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = t.author_did)";
+    // A restored DID's interactions with the member stay: the restored rule
+    // admits them (refract design §5.4).
+    let out_of_scope = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = t.author_did) \
+        AND NOT EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = t.author_did AND rf.state IN ('restored', 'grace'))";
     let mut n = 0;
     for table in ["likes", "reposts"] {
         let sql = format!(
@@ -738,6 +753,10 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Resu
 /// In Filling and On these rows are stored for anyone in S, so they stay.
 /// Its list blocks go in every mode (`member_removed_public_batch`).
 async fn member_removed_off_batch(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
+    // Refract (refract design §5.4): a removed member in R keeps what the
+    // restored rule admits; a restored DID's follow of it stays too.
+    let in_r = |col: &str| format!("EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = {col} AND rf.state IN ('restored', 'grace'))");
+    let removed_in_r = in_r("$1");
     let mut n = 0;
     for (table, column) in [
         ("likes", "author_did"),
@@ -746,12 +765,12 @@ async fn member_removed_off_batch(conn: &mut PgConnection, did: &str) -> Result<
         ("list_items", "author_did"),
         ("list_optouts", "author_did"),
     ] {
-        n += delete_batch(conn, table, "uri", &format!("{column} = $1"), did).await?;
+        n += delete_batch(conn, table, "uri", &format!("{column} = $1 AND NOT {removed_in_r}"), did).await?;
     }
     let non_member = |col: &str| format!("NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.{col})");
-    for (own, other) in [("author_did", "subject_did"), ("subject_did", "author_did")] {
+    for (own, other, spare) in [("author_did", "subject_did", removed_in_r.clone()), ("subject_did", "author_did", in_r("t.author_did"))] {
         let sql = format!(
-            "DELETE FROM follows WHERE uri IN (SELECT uri FROM follows t WHERE t.{own} = $1 AND {} LIMIT {BATCH})",
+            "DELETE FROM follows WHERE uri IN (SELECT uri FROM follows t WHERE t.{own} = $1 AND {} AND NOT {spare} LIMIT {BATCH})",
             non_member(other)
         );
         n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();

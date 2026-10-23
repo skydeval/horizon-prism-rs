@@ -639,7 +639,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
     );
     let backfill = Backfill::new(writer.clone(), Arc::clone(&source), cfg.file.backfill.clone(), fh.deterministic_attempts)
         .with_farsight(farsight.clone())
-        .with_list_sync(Some(list_sync));
+        .with_list_sync(Some(list_sync))
+        .with_refract_workers(cfg.file.refract.backfill_concurrency);
     tasks.extend(
         backfill
             .spawn()

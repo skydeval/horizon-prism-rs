@@ -3,6 +3,7 @@
 mod checks;
 mod config;
 pub(crate) mod harness;
+mod storage;
 
 use std::sync::Arc;
 use std::time::Duration;

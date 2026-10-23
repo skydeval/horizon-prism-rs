@@ -192,6 +192,20 @@ fn not_in_scope(col: &str) -> String {
     NOT_IN_SCOPE.replace("{col}", col)
 }
 
+/// Refract's spare (refract design §5.4): the DID is not in R (database
+/// state, so a DID pending removal is spared too).
+const NOT_IN_R: &str = "NOT EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = {col} AND rf.state IN ('restored', 'grace'))";
+
+fn not_in_r(col: &str) -> String {
+    NOT_IN_R.replace("{col}", col)
+}
+
+/// Out of scope and not in Refract's R: what the scope steps that delete
+/// by author test.
+fn out_and_not_r(col: &str) -> String {
+    format!("{} AND {}", not_in_scope(col), not_in_r(col))
+}
+
 /// The DID in an at-uri's authority segment (`at://<did>/<collection>/<rkey>`).
 fn author_of(col: &str) -> String {
     format!("split_part({col}, '/', 3)")
@@ -256,7 +270,7 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             "uri",
             "p",
             "p.author_did",
-            &format!("{} AND NOT {post_member_exception}", not_in_scope("p.author_did")),
+            &format!("{} AND NOT {post_member_exception}", out_and_not_r("p.author_did")),
             Bind::None,
         ),
         scoped(
@@ -264,7 +278,7 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             "uri",
             "l",
             "l.author_did",
-            &format!("{} AND NOT {}", not_in_scope("l.author_did"), subject_member("l")),
+            &format!("{} AND NOT {}", out_and_not_r("l.author_did"), subject_member("l")),
             Bind::None,
         ),
         scoped(
@@ -272,7 +286,7 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             "uri",
             "r",
             "r.author_did",
-            &format!("{} AND NOT {}", not_in_scope("r.author_did"), subject_member("r")),
+            &format!("{} AND NOT {}", out_and_not_r("r.author_did"), subject_member("r")),
             Bind::None,
         ),
         scoped(
@@ -282,7 +296,7 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             "f.author_did",
             &format!(
                 "{} AND NOT {}",
-                not_in_scope("f.author_did"),
+                out_and_not_r("f.author_did"),
                 member_among(&["f.subject_did".to_string()])
             ),
             Bind::None,
@@ -321,7 +335,7 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
                  AND NOT EXISTS (SELECT 1 FROM reposts x WHERE x.subject_uri = pc.post_uri) \
                  AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.reply_parent_uri = pc.post_uri) \
                  AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.quote_uri = pc.post_uri)",
-                not_in_scope(&author_of("pc.post_uri"))
+                out_and_not_r(&author_of("pc.post_uri"))
             ),
             Bind::None,
         ),
@@ -340,7 +354,7 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
                  AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.author_did = a.did) \
                  AND NOT EXISTS (SELECT 1 FROM blocks x WHERE x.author_did = a.did) \
                  AND NOT (a.did = ANY($1::text[]))",
-                not_in_scope("a.did"),
+                out_and_not_r("a.did"),
                 member_among(&["a.did".to_string()])
             ),
             Bind::Dids(private_row_authors),
@@ -353,7 +367,7 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             "ac.did",
             &format!(
                 "{} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.did = ac.did)",
-                not_in_scope("ac.did")
+                out_and_not_r("ac.did")
             ),
             Bind::None,
         ),
@@ -372,6 +386,11 @@ fn v3_scope_steps() -> Vec<Step> {
         let col = format!("{alias}.{author}");
         scoped(table, "uri", alias, &col, &not_in_scope(&col), Bind::None)
     };
+    // The tables Refract's restored rule writes (refract design §5.4).
+    let class_s_r = |table: &'static str, alias: &'static str, author: &'static str| {
+        let col = format!("{alias}.{author}");
+        scoped(table, "uri", alias, &col, &out_and_not_r(&col), Bind::None)
+    };
     // A gate is also kept while its post row is kept (class M).
     let gate = |table: &'static str, alias: &'static str| {
         let col = format!("{alias}.author_did");
@@ -382,8 +401,8 @@ fn v3_scope_steps() -> Vec<Step> {
         scoped(table, "uri", alias, &col, &pred, Bind::None)
     };
     vec![
-        class_s("lists", "ls", "creator_did"),
-        class_s("list_items", "li", "author_did"),
+        class_s_r("lists", "ls", "creator_did"),
+        class_s_r("list_items", "li", "author_did"),
         // Rule M (member-blocks-only design §8): a member's list blocks only.
         scoped(
             "list_blocks",
@@ -393,10 +412,10 @@ fn v3_scope_steps() -> Vec<Step> {
             &format!("NOT {}", member_among(&["lb.author_did".to_string()])),
             Bind::None,
         ),
-        class_s("list_optouts", "lo", "author_did"),
+        class_s_r("list_optouts", "lo", "author_did"),
         class_s("starter_packs", "sp", "creator_did"),
         class_s("labeler_services", "lsv", "creator_did"),
-        class_s("actor_self_records", "asr", "did"),
+        class_s_r("actor_self_records", "asr", "did"),
         class_s("nearhorizon_poll_posts", "pp", "author_did"),
         gate("threadgates", "tg"),
         gate("postgates", "pg"),
@@ -493,10 +512,13 @@ fn age_cap_steps(max_age_days: u32) -> Vec<Step> {
         return Vec::new();
     }
     let days = i32::try_from(max_age_days).unwrap_or(i32::MAX);
+    // Refract's R keeps its full history (refract design §5.4, C-4).
     let unprotected = |col: &str| {
         format!(
             "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = {col}) \
-             AND NOT EXISTS (SELECT 1 FROM follows f JOIN members m ON m.did = f.author_did WHERE f.subject_did = {col})"
+             AND NOT EXISTS (SELECT 1 FROM follows f JOIN members m ON m.did = f.author_did WHERE f.subject_did = {col}) \
+             AND {}",
+            not_in_r(col)
         )
     };
     let post_member_exception = member_among(&[
@@ -1329,5 +1351,54 @@ mod tests {
                 trend_aggregate_hours: 72,
             }
         );
+    }
+
+    /// Refract T-10, T-12-r5 (refract design §5.4): the scope steps and the
+    /// age cap spare the rows of a DID in R (`restored` or `grace`), and
+    /// take them once it leaves R.
+    #[tokio::test]
+    async fn refract_r_is_spared_by_retention() {
+        let Some(db) = crate::test_support::fresh_db("retention_refract_spare").await else {
+            return;
+        };
+        let p = &db.pool;
+        let scope = crate::aggregations::ScopeState::new(crate::aggregations::ScopeSets::default(), crate::config::ScopePolicy::MembersAndOneHop, 10_000);
+        let r = "did:plc:restoredaaaaaaaaaaaaaaaa";
+        let other = "did:plc:otheraaaaaaaaaaaaaaaaaaa";
+        for did in [r, other] {
+            for sql in [
+                format!("INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at) VALUES ('at://{did}/app.bsky.feed.post/3k', '{did}', '3k', 'c', '3k', '{{}}'::jsonb, '2020-01-01')"),
+                format!("INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES ('at://{did}/app.bsky.feed.like/3k', '{did}', 'at://did:plc:zzzz/app.bsky.feed.post/1', '3k', '2020-01-01')"),
+                format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{did}/app.bsky.graph.follow/3k', '{did}', 'did:plc:zzzz', '3k', '2020-01-01')"),
+                format!("INSERT INTO post_counts (post_uri) VALUES ('at://{did}/app.bsky.feed.post/3k')"),
+                format!("INSERT INTO actors (did) VALUES ('{did}')"),
+            ] {
+                sqlx::query(&sql).execute(p).await.expect("seed");
+            }
+        }
+        sqlx::query("INSERT INTO refract_dids (did, community, state, source) VALUES ($1, 'sky', 'grace', 'fill')").bind(r).execute(p).await.expect("r");
+        let run = || async {
+            let mut steps = age_cap_steps(30);
+            steps.extend(scope_steps(Vec::new()));
+            for step in &steps {
+                run_step(p, &scope, step).await.expect("step");
+            }
+        };
+        let rows = |did: &'static str| async move {
+            let mut n = 0i64;
+            for t in ["posts", "likes", "follows", "actors"] {
+                let col = if t == "actors" { "did" } else { "author_did" };
+                n += sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {t} WHERE {col} = $1")).bind(did).fetch_one(p).await.expect("count");
+            }
+            n += sqlx::query_scalar::<_, i64>("SELECT count(*) FROM post_counts WHERE split_part(post_uri, '/', 3) = $1").bind(did).fetch_one(p).await.expect("count");
+            n
+        };
+        run().await;
+        assert_eq!(rows(r).await, 5, "R is spared, the age cap included");
+        assert_eq!(rows(other).await, 0);
+        sqlx::query("UPDATE refract_dids SET state = 'ending'").execute(p).await.expect("ending");
+        run().await;
+        assert_eq!(rows(r).await, 0, "once out of R, retention takes it");
+        db.drop_db().await;
     }
 }
