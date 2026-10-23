@@ -86,12 +86,15 @@ impl Hydrator {
         }
         let unfound: Vec<String> = misses.into_iter().filter(|d| !out.contains_key(d)).collect();
         for d in unfound {
-            match self.upstream().record(&walk, &format!("at://{d}/app.bsky.actor.profile/self")).await {
-                Some(found) => {
+            // Only Slingshot's `RecordNotFound` is remembered; no answer is
+            // asked again next time.
+            match self.upstream().record_or_absent(&walk, &format!("at://{d}/app.bsky.actor.profile/self")).await {
+                Some(Some(found)) => {
                     let view = record_profile(&d, rows.get(&d), found.get("value").unwrap_or(&Value::Null));
                     out.insert(d, view);
                 }
-                None => NO_PROFILE.insert(d, ()),
+                Some(None) => NO_PROFILE.insert(d, ()),
+                None => {}
             }
         }
         out
@@ -557,9 +560,26 @@ impl Hydrator {
         Ok(Some(mentions))
     }
 
-    /// `refract.getReplies` (refract design §7.1): the stored replies by
-    /// DIDs in `restored` under `root`, newest first, at most 200, as
-    /// `postView`s, less those the root's threadgate hides or doesn't
+    /// The stored replies by DIDs in `restored` under `root`, newest first,
+    /// at most 200: `(uri, author)`.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn refract_reply_rows(&self, root: &str, restored: &[String]) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT uri, author_did FROM posts WHERE reply_root_uri = $1 AND author_did = ANY($2) \
+             ORDER BY created_at DESC, uri DESC LIMIT $3",
+        )
+        .bind(root)
+        .bind(restored)
+        .bind(REPLIES_MAX)
+        .fetch_all(self.pool())
+        .await
+    }
+
+    /// `refract.getReplies` (refract design §7.1): `rows` (from
+    /// [`Hydrator::refract_reply_rows`]) as `postView`s, less those the root's threadgate hides or doesn't
     /// admit, those of an author the caller blocks or is blocked by
     /// (`blocks` for a visitor or a member that is not ready), and those
     /// whose author and the root's author block each other or were left
@@ -574,19 +594,10 @@ impl Hydrator {
         viewer: &Viewer,
         req: &Requester,
         root: &str,
-        restored: &[String],
+        rows: Vec<(String, String)>,
         blocks: Option<&mut crate::refract::handlers::Blocks>,
         round: Duration,
     ) -> Result<PublicEmit<Value>, HydrationError> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT uri, author_did FROM posts WHERE reply_root_uri = $1 AND author_did = ANY($2) \
-             ORDER BY created_at DESC, uri DESC LIMIT $3",
-        )
-        .bind(root)
-        .bind(restored)
-        .bind(REPLIES_MAX)
-        .fetch_all(self.pool())
-        .await?;
         if rows.is_empty() {
             return Ok(Self::refract_empty("posts"));
         }

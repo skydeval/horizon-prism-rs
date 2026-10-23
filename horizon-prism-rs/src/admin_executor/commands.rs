@@ -92,6 +92,13 @@ pub enum AdminCommand {
     /// `restart` (admin-ui design §8.5): settled `done`, then `serve` shuts
     /// down as at SIGTERM and exits for its supervisor to start it again.
     Restart,
+    /// `refract check <did>` (refract design §9): due now, or a candidate.
+    RefractCheck { did: String },
+    /// `refract end <did> [--reason]`: `restored` or `grace` → `ending`.
+    RefractEnd { did: String, reason: Option<String> },
+    /// `refract keep <scope>` / `unkeep <scope>` (§4.6): hold a pending end,
+    /// or restart its clock.
+    RefractKeep { scope: String, keep: bool },
 }
 
 /// The longest operator note accepted.
@@ -152,6 +159,9 @@ impl AdminCommand {
                 ("settings set", json!({ "changes": changes }))
             }
             Self::Restart => ("restart", json!({})),
+            Self::RefractCheck { did } => ("refract check", json!({ "did": did })),
+            Self::RefractEnd { did, reason } => ("refract end", json!({ "did": did, "reason": reason })),
+            Self::RefractKeep { scope, keep } => ("refract keep", json!({ "scope": scope, "keep": keep })),
         }
     }
 
@@ -271,6 +281,24 @@ impl AdminCommand {
             }
             "settings set" => Self::SettingsSet { changes: parse_changes(command, args)? },
             "restart" => Self::Restart,
+            "refract check" => Self::RefractCheck { did: did()? },
+            "refract end" => Self::RefractEnd {
+                did: did()?,
+                reason: match args.get("reason") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(r)) if !r.is_empty() && r.chars().count() <= MAX_NOTE => Some(r.clone()),
+                    Some(_) => return Err(InvalidCommand(format!("{command}: reason must be text of 1 to {MAX_NOTE} characters"))),
+                },
+            },
+            "refract keep" => {
+                let scope = s("scope")?;
+                let valid = scope == "feature"
+                    || scope.strip_prefix("entry:").is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()));
+                if !valid {
+                    return Err(InvalidCommand(format!("{command}: {scope:?} is not feature or entry:<hash>")));
+                }
+                Self::RefractKeep { scope, keep: args.get("keep").and_then(Value::as_bool).unwrap_or(true) }
+            }
             other => return Err(InvalidCommand(format!("unknown command {other:?}"))),
         })
     }
@@ -284,6 +312,8 @@ impl AdminCommand {
             | Self::MemberDeny { did, .. }
             | Self::MemberAllow { did }
             | Self::Backfill { did, .. }
+            | Self::RefractCheck { did }
+            | Self::RefractEnd { did, .. }
             | Self::ListsPurge { did } => Some(did),
             Self::LabelAdd { subject, .. } | Self::LabelRemove { subject, .. } => {
                 if is_did(subject) { Some(subject) } else { uri_author(subject) }
@@ -305,6 +335,7 @@ impl AdminCommand {
             | Self::OperatorHostRemove { .. }
             | Self::SettingsSet { .. }
             | Self::Restart
+            | Self::RefractKeep { .. }
             // A prime writes nothing here, so it waits on no purge.
             | Self::FarsightPrime { .. }
             // Its handler waits on a purge of the viewer itself.
@@ -390,6 +421,8 @@ pub struct Handlers {
     pub operators: OperatorDeps,
     /// What `settings set` and `restart` need (admin-ui design §8.3, §8.5).
     pub settings: SettingsDeps,
+    /// Refract, for `refract check` and `end` (refract design §9).
+    pub refract: Option<crate::refract::Refract>,
 }
 
 /// What `settings set` and `restart` need: `app.toml`'s path, read fresh
@@ -462,6 +495,9 @@ impl Handlers {
                 operators::host_add(&self.pool, pattern, actor).await.map(Outcome::Done).map_err(|e| e.to_string())
             }
             AdminCommand::OperatorHostRemove { pattern } => settled(operators::host_remove(&self.pool, pattern).await),
+            AdminCommand::RefractCheck { did } => self.refract_check(did).await,
+            AdminCommand::RefractEnd { did, reason } => self.refract_end(did, reason.as_deref()).await,
+            AdminCommand::RefractKeep { scope, keep } => self.refract_keep(scope, *keep).await,
         };
         result.unwrap_or_else(Outcome::Failed)
     }
@@ -769,6 +805,7 @@ impl Handlers {
             .await
             .map_err(|e| e.to_string())?
             .rows_affected();
+        self.refract_label_changed(subject).await?;
         Ok(Outcome::Done(json!({ "subject": subject, "val": val, "added": n > 0 })))
     }
 
@@ -780,7 +817,75 @@ impl Handlers {
             .await
             .map_err(|e| e.to_string())?
             .rows_affected();
+        self.refract_label_changed(subject).await?;
         Ok(Outcome::Done(json!({ "subject": subject, "val": val, "removed": n > 0 })))
+    }
+
+    /// A local label on a DID makes its Refract row due now (refract design
+    /// §4.4, §9): a local takedown takes it out of R at the next check.
+    async fn refract_label_changed(&self, subject: &str) -> Result<(), String> {
+        if !is_did(subject) {
+            return Ok(());
+        }
+        let dids = [subject.to_string()];
+        match &self.refract {
+            Some(r) => r.make_due(&dids).await,
+            None => crate::refract::make_due(&self.pool, &dids).await,
+        }
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// `refract check <did>` (refract design §9): a DID with a row the
+    /// checker checks is made due now; any other (a rejected one too) is
+    /// made a candidate, when a listed community hosts it.
+    async fn refract_check(&self, did: &str) -> Result<Outcome, String> {
+        let Some(r) = &self.refract else {
+            return Ok(Outcome::Failed("Refract is not running".to_string()));
+        };
+        if !r.enabled() {
+            return Ok(Outcome::Failed("refract.enabled is off".to_string()));
+        }
+        if r.make_due(&[did.to_string()]).await.map_err(|e| e.to_string())? > 0 {
+            return Ok(Outcome::Done(json!({ "did": did, "due": true })));
+        }
+        let info = match r.resolver().resolve_info(did, crate::identity::ResolveIntent::Lookup).await {
+            Ok(info) => info,
+            Err(e) => return Ok(Outcome::Failed(format!("{did} did not resolve: {e}"))),
+        };
+        let Some(host) = info.pds_endpoint.as_deref().and_then(crate::constellation::matcher::pds_host) else {
+            return Ok(Outcome::Failed(format!("{did} has no PDS endpoint")));
+        };
+        if !r.insert_candidate(did, &host, "admin").await.map_err(|e| e.to_string())? {
+            return Ok(Outcome::Failed(format!("no enabled community hosts {host}, or {did} is being purged")));
+        }
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM refract_dids WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Outcome::Done(json!({ "did": did, "state": state })))
+    }
+
+    /// `refract end <did> [--reason]` (refract design §9).
+    async fn refract_end(&self, did: &str, reason: Option<&str>) -> Result<Outcome, String> {
+        let Some(r) = &self.refract else {
+            return Ok(Outcome::Failed("Refract is not running".to_string()));
+        };
+        if r.end(did, reason.unwrap_or("admin")).await.map_err(|e| e.to_string())? {
+            Ok(Outcome::Done(json!({ "did": did, "state": "ending" })))
+        } else {
+            Ok(Outcome::Failed(format!("{did} is not restored or in grace")))
+        }
+    }
+
+    /// `refract keep` / `unkeep <scope>` (refract design §4.6, §9).
+    async fn refract_keep(&self, scope: &str, keep: bool) -> Result<Outcome, String> {
+        if crate::refract::Refract::keep(&self.pool, scope, keep).await.map_err(|e| e.to_string())? {
+            Ok(Outcome::Done(json!({ "scope": scope, "keep": keep })))
+        } else {
+            Ok(Outcome::Failed(format!("no pending scope {scope}")))
+        }
     }
 
     /// `scope rebuild` (scope-recency design §3.3): a dry run computes the
@@ -1089,6 +1194,20 @@ mod tests {
         ] {
             assert!(AdminCommand::parse("settings set", &args).is_err(), "{args}");
         }
+        // `refract` (refract design §9).
+        for cmd in [
+            AdminCommand::RefractCheck { did: DID.into() },
+            AdminCommand::RefractEnd { did: DID.into(), reason: Some("operator".into()) },
+            AdminCommand::RefractEnd { did: DID.into(), reason: None },
+            AdminCommand::RefractKeep { scope: "feature".into(), keep: true },
+            AdminCommand::RefractKeep { scope: "entry:0a1b".into(), keep: false },
+        ] {
+            let (name, args) = cmd.to_row();
+            assert_eq!(AdminCommand::parse(name, &args), Ok(cmd.clone()));
+        }
+        assert_eq!(AdminCommand::RefractCheck { did: DID.into() }.did(), Some(DID));
+        assert!(AdminCommand::parse("refract keep", &json!({"scope": "entry:xyz", "keep": true})).is_err());
+        assert!(AdminCommand::parse("refract check", &json!({"did": "bob"})).is_err());
     }
 
     #[test]

@@ -683,37 +683,6 @@ pub async fn run() -> Result<Stopped, StartupError> {
         tasks.push(prober.clone().spawn());
     }
 
-    // Admin executor (§3.3).
-    tasks.push(
-        AdminExecutor::new(Handlers {
-            pool: pool.clone(),
-            scope: scope.clone(),
-            private: Arc::clone(&private),
-            writer: writer.clone(),
-            purger: purger.clone(),
-            rebuild,
-            redis: redis.clone(),
-            source: Arc::clone(&source),
-            dead_letter_stream: fh.dead_letter_stream.clone(),
-            deterministic_attempts: fh.deterministic_attempts,
-            farsight: farsight.clone(),
-            sync_min_interval_secs: lists.sync_min_interval_secs,
-            list_budget,
-            public: public.clone(),
-            operators: crate::admin_executor::OperatorDeps {
-                identity: Some(Arc::new(resolver.with_intent(Intent::Internal))),
-                setup_code_file: Some(setup_code_file.clone()),
-            },
-            settings: crate::admin_executor::SettingsDeps {
-                config_path: Some(config_path.clone()),
-                env: Some(cfg.env.clone()),
-                live: Some(live.clone()),
-                restart: restart.clone(),
-            },
-        })
-        .spawn(),
-    );
-
     // Constellation routing (§8): the table, the `route` cache over the
     // identity resolver, one client per outbound network, the cascade, and
     // the upstream source behind hydration's seam.
@@ -763,6 +732,39 @@ pub async fn run() -> Result<Stopped, StartupError> {
         &resolver,
     );
     tasks.extend(refract.spawn());
+
+    // Admin executor (§3.3).
+    tasks.push(
+        AdminExecutor::new(Handlers {
+            pool: pool.clone(),
+            scope: scope.clone(),
+            private: Arc::clone(&private),
+            writer: writer.clone(),
+            purger: purger.clone(),
+            rebuild,
+            redis: redis.clone(),
+            source: Arc::clone(&source),
+            dead_letter_stream: fh.dead_letter_stream.clone(),
+            deterministic_attempts: fh.deterministic_attempts,
+            farsight: farsight.clone(),
+            sync_min_interval_secs: lists.sync_min_interval_secs,
+            list_budget,
+            public: public.clone(),
+            operators: crate::admin_executor::OperatorDeps {
+                identity: Some(Arc::new(resolver.with_intent(Intent::Internal))),
+                setup_code_file: Some(setup_code_file.clone()),
+            },
+            settings: crate::admin_executor::SettingsDeps {
+                config_path: Some(config_path.clone()),
+                env: Some(cfg.env.clone()),
+                live: Some(live.clone()),
+                restart: restart.clone(),
+            },
+            refract: Some(refract.clone()),
+        })
+        .spawn(),
+    );
+
     let read_cache = ReadCache::new(cfg.file.cache.read_time_bytes)
         .with_ttls(crate::hydration::cache::RtTtls {
             profile: Duration::from_secs(cfg.file.cache.profile_ttl_secs),

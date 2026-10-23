@@ -246,8 +246,11 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
             if let Some(marker) = marked {
                 m.insert("restored".into(), marker.clone());
             }
-            // 1. Content stripping, before labels go.
+            // 1. Content stripping, before labels go. A restored author's
+            // view is never content-stripped: Bluesky's own takedown is
+            // what Refract serves past (refract design §7.5).
             if post_like
+                && marked.is_none()
                 && let Some(uri) = &uri
                 && stripped(m)
             {
@@ -459,6 +462,14 @@ mod tests {
         assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/5"));
         assert!(v["warned"].get("labels").is_none() && v["bare"].get("labels").is_none(), "{v}");
         assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/1"));
+        // Refract §7.5: a restored author's view is never content-stripped
+        // by Bluesky's own labels; it carries the marker.
+        let mut v = json!({"takendown": post("at://did:plc:restored/app.bsky.feed.post/6", Some("t"), vec![label("!takedown")])});
+        let mut overlay = Overlay::default();
+        overlay.restored.insert("did:plc:restored".into(), json!({"community": "sky", "tier": 1}));
+        let report = normalize_upstream(&mut v, &overlay);
+        assert!(report.content_stripped.is_empty());
+        assert_eq!(v["takendown"]["restored"]["community"], "sky");
     }
 
     /// Refract T-8ah, T-8al, T-8am, T-13 (refract design §7.2 step 4,

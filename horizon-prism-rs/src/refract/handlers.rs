@@ -587,12 +587,11 @@ pub async fn get_replies(State(s): State<RefractState>, ConnectInfo(peer): Conne
     }
     let h = &s.app.hydrator;
     let snapshot = h.refract_snapshot(&caller.req).await;
+    let rows = h.refract_reply_rows(&root, &served(&snapshot)).await.map_err(|e| XrpcError::from(crate::hydration::HydrationError::from(e)))?;
+    let uris: Vec<String> = rows.iter().map(|(u, _)| u.clone()).collect();
+    s.refract.serve_check(&caller.req, &uris).await;
     let mut blocks = Blocks::new(&s, &caller);
-    let result = h
-        .refract_replies(&caller.viewer, &caller.req, &root, &served(&snapshot), blocks.as_mut(), s.round_timeout)
-        .await
-        .map(Json)
-        .map_err(Into::into);
+    let result = h.refract_replies(&caller.viewer, &caller.req, &root, rows, blocks.as_mut(), s.round_timeout).await.map(Json).map_err(Into::into);
     metrics::counter!(METRIC_READS, "method" => "getReplies", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }

@@ -161,6 +161,48 @@ async fn labels_page() {
     h.db.drop_db().await;
 }
 
+/// Refract's Communities page (refract design §9.1): the list with its
+/// counts, a disable that would make restored accounts pending asks first
+/// and then saves the whole list, and pending ends are kept from here.
+#[tokio::test]
+async fn communities_page() {
+    let Some(h) = harness("admin_communities").await else {
+        return;
+    };
+    let p = h.pool();
+    let alice = complete_setup(&h, ALICE).await;
+    sqlx::query("INSERT INTO refract_dids (did, community, pds_host, state, source) VALUES ($1, 'community-a', 'community-a.example', 'restored', 'fill')")
+        .bind(BOB)
+        .execute(p)
+        .await
+        .expect("row");
+    sqlx::query("INSERT INTO refract_pending (scope) VALUES ('feature')").execute(p).await.expect("pending");
+    let page = get(&alice, &format!("{}/admin/communities", h.base)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for text in ["aria-current=\"page\">Communities</a>", "<strong>community-a</strong>", "Pending ends", "Add a community"] {
+        assert!(page.body.contains(text), "{text}: {}", page.body);
+    }
+    let csrf = csrf_of(&page);
+    let toggle = format!("{}/admin/communities/toggle", h.base);
+    let before = count(p, "SELECT count(*) FROM admin_commands").await;
+    let confirm = post(&alice, &toggle, &[("csrf", &csrf), ("name", "community-a")]).await;
+    assert!(confirm.status == 200 && confirm.body.contains("1 restored account will be hidden"), "{}", confirm.body);
+    assert_eq!(count(p, "SELECT count(*) FROM admin_commands").await, before, "nothing queued unconfirmed");
+    let done = post(&alice, &toggle, &[("csrf", &csrf), ("name", "community-a"), ("confirm", "yes")]).await;
+    assert_eq!(done.status, 303, "{}", done.body);
+    let (command, args, by) = newest(p).await;
+    assert_eq!((command.as_str(), by.as_deref()), ("settings set", Some(ALICE)));
+    let change = &args["changes"][0];
+    assert_eq!(change["key"], "refract.communities");
+    assert_eq!(change["value"][0]["name"], "community-a");
+    assert_eq!(change["value"][0]["enabled"], false);
+    let keep = post(&alice, &format!("{}/admin/communities/keep", h.base), &[("csrf", &csrf), ("scope", "feature"), ("keep", "true")]).await;
+    assert_eq!(keep.status, 303, "{}", keep.body);
+    let (command, args, _) = newest(p).await;
+    assert_eq!((command.as_str(), args), ("refract keep", json!({"scope": "feature", "keep": true})));
+    h.db.drop_db().await;
+}
+
 #[tokio::test]
 async fn look_up() {
     let Some(h) = harness("admin_s5_lookup").await else {

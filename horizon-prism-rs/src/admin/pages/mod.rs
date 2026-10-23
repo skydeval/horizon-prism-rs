@@ -5,6 +5,7 @@
 pub mod appearance;
 pub mod audit;
 pub mod commands;
+pub mod communities;
 pub mod farsight;
 pub mod health;
 pub mod home;
@@ -71,7 +72,7 @@ pub struct MenuLink {
 
 /// The top menu (§6), in its order: everyday pages first, Settings last
 /// (#810). `(current, href, label)`; `current` is [`Nav::current`]'s word.
-pub const MENU: [(&str, &str, &str); 12] = [
+pub const MENU: [(&str, &str, &str); 13] = [
     ("home", "/admin", "Home"),
     ("members", "/admin/members", "Members"),
     ("health", "/admin/health", "Health"),
@@ -80,6 +81,7 @@ pub const MENU: [(&str, &str, &str); 12] = [
     ("stats", "/admin/stats", "Stats"),
     ("farsight", "/admin/farsight", "Blocks"),
     ("labels", "/admin/labels", "Labels"),
+    ("communities", "/admin/communities", "Communities"),
     ("lookup", "/admin/lookup", "Look up"),
     ("audit", "/admin/audit", "Audit log"),
     ("operators", "/admin/operators", "Operators"),
@@ -243,6 +245,10 @@ pub fn describe(command: &str, args: &Value) -> String {
             format!("Change settings: {}", names.join(", "))
         }
         "restart" => "Restart Prism".to_string(),
+        "refract check" => format!("Check {} for its community now", arg(args, "did")),
+        "refract end" => format!("Stop keeping {}", arg(args, "did")),
+        "refract keep" if args.get("keep") == Some(&Value::Bool(false)) => format!("Release the pending end {}", arg(args, "scope")),
+        "refract keep" => format!("Keep the pending end {}", arg(args, "scope")),
         other => other.to_string(),
     }
 }
@@ -314,6 +320,11 @@ pub fn outcome(command: &str, state: &str, result: Option<&Value>) -> String {
             }
         }
         ("restart", _) => "Prism is restarting.".to_string(),
+        ("refract check", _) if r.get("due") == Some(&Value::Bool(true)) => "It is checked now.".to_string(),
+        ("refract check", _) => "It is a candidate now and is checked at once.".to_string(),
+        ("refract end", _) => "It is ending; its data here is deleted in the background.".to_string(),
+        ("refract keep", _) if r.get("keep") == Some(&Value::Bool(false)) => "Released; its time starts again.".to_string(),
+        ("refract keep", _) => "Kept: these accounts stay hidden but are not ended.".to_string(),
         ("scope rebuild", _) if r.get("dry_run") == Some(&Value::Bool(true)) => {
             let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
             let sweeps = n("sweeps");

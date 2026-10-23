@@ -126,7 +126,10 @@ impl Ladder {
             // C4 (public-indexing design §11): unless the mode is On, a
             // community author's posts are not stored, so the cascade is
             // asked for them too.
-            if !home.is_community() || !self.hydrator.scope().public_mode().is_on() {
+            // A restored author's post missing here takes the community
+            // path in every mode (refract design §7.5).
+            let restored = self.hydrator.refract_snapshot(req).await.is_restored(&author);
+            if restored || !home.is_community() || !self.hydrator.scope().public_mode().is_on() {
                 let uris = [uri.to_string()];
                 match self.cascade.fetch(req, home.network_name.as_deref(), Call::Posts(&uris)).await {
                     Fetched::Hit { body, .. } => {

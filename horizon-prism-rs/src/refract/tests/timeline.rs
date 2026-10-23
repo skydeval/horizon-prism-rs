@@ -84,7 +84,8 @@ async fn t12_timeline() {
 }
 
 async fn replies(h: &Hydrator, root: &str, viewer: &Viewer) -> Vec<String> {
-    let v = h.refract_replies(viewer, &Requester::test(), root, &restored(), None, Duration::from_secs(1)).await.expect("replies");
+    let rows = h.refract_reply_rows(root, &restored()).await.expect("rows");
+    let v = h.refract_replies(viewer, &Requester::test(), root, rows, None, Duration::from_secs(1)).await.expect("replies");
     v.inner()["posts"].as_array().expect("posts").iter().filter_map(|p| p["uri"].as_str().map(str::to_string)).collect()
 }
 

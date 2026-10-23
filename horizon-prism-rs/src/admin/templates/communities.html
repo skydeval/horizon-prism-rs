@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Accounts Bluesky took down that a community listed here still hosts and has not banned stay visible
+through this Prism, marked with their community. Each change below saves the whole list at once and applies
+without a restart.</p>
+
+<div class="card">
+<h2>Keep these accounts</h2>
+{% if enabled %}
+<p class="ok">On: accounts of the enabled communities below are kept.</p>
+<form class="inline" method="post" action="/admin/communities/switch"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="enabled" value="false"><button class="secondary" type="submit">Turn off…</button></form>
+{% else %}
+<p class="muted">Off: no account is kept, and none is looked at.</p>
+<form class="inline" method="post" action="/admin/communities/switch"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="enabled" value="true"><button type="submit">Turn on</button></form>
+{% endif %}
+</div>
+
+<h2>Communities</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>Community</th><th>Servers</th><th>Decisions read from</th><th>Ends on</th>{% for s in states %}<th>{{ s }}</th>{% endfor %}<th></th></tr></thead>
+<tbody>
+{% for c in communities %}
+<tr>
+<td><strong>{{ c.name }}</strong><br><span class="muted">tier {{ c.tier }}{% if !c.enabled %}, disabled{% endif %}</span></td>
+<td><code>{{ c.patterns }}</code></td>
+<td>{% if !c.appview.is_empty() %}AppView <code>{{ c.appview }}</code><br>{% endif %}{% if !c.labeler.is_empty() %}labeler <code>{{ c.labeler }}</code> ({{ c.source }}){% endif %}</td>
+<td><code>{{ c.gone }}</code></td>
+{% for n in c.counts %}<td>{{ n }}</td>{% endfor %}
+<td class="actions">
+<form class="inline" method="post" action="/admin/communities/toggle"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="name" value="{{ c.name }}"><button class="secondary" type="submit">{% if c.enabled %}Disable…{% else %}Enable{% endif %}</button></form>
+<form class="inline" method="post" action="/admin/communities/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="name" value="{{ c.name }}"><button class="secondary" type="submit">Remove…</button></form>
+</td>
+</tr>
+{% else %}
+<tr><td colspan="10" class="muted">No community is listed.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% if !unlisted.is_empty() %}
+<p class="muted">Accounts of communities no longer listed: {% for u in unlisted %}{{ u.name }} ({{ u.count }}){% if !loop.last %}, {% endif %}{% endfor %}.</p>
+{% endif %}
+
+{% if !pending.is_empty() %}
+<h2>Pending ends</h2>
+<p class="muted">These accounts are hidden now and end at the time shown, unless kept.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>Why</th><th>Accounts</th><th>Since</th><th>Ends</th><th></th></tr></thead>
+<tbody>
+{% for p in pending %}
+<tr>
+<td><code>{{ p.scope }}</code></td>
+<td>{{ p.dids }}</td>
+<td>{{ p.since }}</td>
+<td>{{ p.ends }}</td>
+<td class="actions"><form class="inline" method="post" action="/admin/communities/keep"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="scope" value="{{ p.scope }}">{% if p.keep %}<input type="hidden" name="keep" value="false"><button class="secondary" type="submit">Unkeep</button>{% else %}<input type="hidden" name="keep" value="true"><button class="secondary" type="submit">Keep</button>{% endif %}</form></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+
+<h2>Edit</h2>
+<div class="grid">
+{% for c in communities %}
+<div class="card">
+<h3>{{ c.name }}</h3>
+<form class="stack" method="post" action="/admin/communities/save">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="original" value="{{ c.name }}">
+<label>Name</label><input type="text" name="name" value="{{ c.name }}" spellcheck="false" required>
+<label>Tier</label><select name="tier"><option value="1"{% if c.tier == 1 %} selected{% endif %}>1: its own servers and AppView</option><option value="2"{% if c.tier == 2 %} selected{% endif %}>2: its own servers and labeler</option></select>
+<label>Servers</label><input type="text" name="pds_patterns" value="{{ c.patterns }}" spellcheck="false">
+<p class="hint">Hosts its accounts live on, separated by commas; <code>*.host</code> covers every host under it.</p>
+<label>AppView network</label><input type="text" name="appview_network" value="{{ c.appview }}" spellcheck="false">
+<label>Labeler DID</label><input type="text" name="labeler_did" value="{{ c.labeler }}" spellcheck="false">
+<label>Labels read</label><select name="label_source"><option value=""{% if c.source.is_empty() %} selected{% endif %}>—</option><option value="labeler"{% if c.source == "labeler" %} selected{% endif %}>from the labeler</option><option value="appview"{% if c.source == "appview" %} selected{% endif %}>through the AppView</option></select>
+<label>Labels that end an account or hide a post</label><input type="text" name="gone_labels" value="{{ c.gone }}" spellcheck="false">
+<label><input type="checkbox" name="enabled"{% if c.enabled %} checked{% endif %}> Enabled</label>
+<div class="row"><button type="submit">Save</button></div>
+</form>
+</div>
+{% endfor %}
+<div class="card">
+<h3>Add a community</h3>
+<form class="stack" method="post" action="/admin/communities/save">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Name</label><input type="text" name="name" spellcheck="false" required>
+<label>Tier</label><select name="tier"><option value="1">1: its own servers and AppView</option><option value="2">2: its own servers and labeler</option></select>
+<label>Servers</label><input type="text" name="pds_patterns" spellcheck="false" placeholder="*.example.social">
+<label>AppView network</label><input type="text" name="appview_network" spellcheck="false">
+<label>Labeler DID</label><input type="text" name="labeler_did" spellcheck="false">
+<label>Labels read</label><select name="label_source"><option value="">—</option><option value="labeler">from the labeler</option><option value="appview">through the AppView</option></select>
+<label>Labels that end an account or hide a post</label><input type="text" name="gone_labels" spellcheck="false" placeholder="the defaults">
+<label><input type="checkbox" name="enabled" checked> Enabled</label>
+<div class="row"><button type="submit">Add</button></div>
+</form>
+</div>
+</div>
+<p class="muted">The same from the command line: <code>admin settings set refract.communities '&lt;json&gt;'</code>,
+<code>admin settings set refract.enabled true</code>, and <code>admin refract status</code>.</p>
+{% endblock %}

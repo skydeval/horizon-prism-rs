@@ -112,6 +112,38 @@ pub enum AdminCmd {
     /// Restart serve: it shuts down as at SIGTERM and exits for its
     /// supervisor to start it again (needs APP_SUPERVISED=1).
     Restart,
+    /// Accounts served for the listed communities (refract design §9).
+    Refract {
+        #[command(subcommand)]
+        action: RefractAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RefractAction {
+    /// The switch, the communities and their entry hashes, counts by
+    /// state, pending ends, label cursors (read-only).
+    Status,
+    /// The accounts Refract knows (read-only).
+    List {
+        /// candidate | rejected | restored | grace | ending
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// One account: its row, last verdict, labels and events (read-only).
+    Show { did: String },
+    /// Check an account now: due now if known, else a candidate.
+    Check { did: String },
+    /// End an account that is restored or in grace.
+    End {
+        did: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Hold a pending end (`feature` or `entry:<hash>`).
+    Keep { scope: String },
+    /// Release a held pending end; its clock starts again.
+    Unkeep { scope: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -324,6 +356,7 @@ impl AdminCmd {
             | Self::SetupCode
             | Self::Identity { .. }
             | Self::Settings { action: SettingsAction::List | SettingsAction::Get { .. } }
+            | Self::Refract { action: RefractAction::Status | RefractAction::List { .. } | RefractAction::Show { .. } }
             | Self::Keygen => return Err("read-only commands run in the CLI".to_string()),
             // They read the saved row's version first: see `settings_change`.
             Self::Settings { action: SettingsAction::Set { .. } | SettingsAction::Reset { .. } } => {
@@ -381,6 +414,10 @@ impl AdminCmd {
                 value: ScopeValue::parse(value).ok_or_else(|| format!("public-scope takes off or community_scoped, not {value:?}"))?,
             },
             Self::Indexing { action: IndexingAction::Status } => AdminCommand::IndexingStatus,
+            Self::Refract { action: RefractAction::Check { did } } => AdminCommand::RefractCheck { did: did.clone() },
+            Self::Refract { action: RefractAction::End { did, reason } } => AdminCommand::RefractEnd { did: did.clone(), reason: reason.clone() },
+            Self::Refract { action: RefractAction::Keep { scope } } => AdminCommand::RefractKeep { scope: scope.clone(), keep: true },
+            Self::Refract { action: RefractAction::Unkeep { scope } } => AdminCommand::RefractKeep { scope: scope.clone(), keep: false },
         };
         let (command, args) = cmd.to_row();
         AdminCommand::parse(command, &args).map_err(|e| e.to_string())
@@ -475,6 +512,7 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
             | AdminCmd::SetupCode
             | AdminCmd::Identity { .. }
             | AdminCmd::Settings { action: SettingsAction::List | SettingsAction::Get { .. } }
+            | AdminCmd::Refract { action: RefractAction::Status | RefractAction::List { .. } | RefractAction::Show { .. } }
     );
     if !is_read_only {
         return None;
@@ -517,6 +555,11 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
                 AdminCmd::Settings { action: SettingsAction::Get { key } } => {
                     commands::settings::render_get(&commands::pool(&cfg).await?, &cfg.file, key).await
                 }
+                AdminCmd::Refract { action: RefractAction::Status } => commands::refract::render_status(&commands::pool(&cfg).await?, &cfg.file).await,
+                AdminCmd::Refract { action: RefractAction::List { state } } => {
+                    commands::refract::render_list(&commands::pool(&cfg).await?, state.as_deref()).await
+                }
+                AdminCmd::Refract { action: RefractAction::Show { did } } => commands::refract::render_show(&commands::pool(&cfg).await?, did).await,
                 _ => Err("not a read-only command".to_string()),
             }
         }
@@ -674,5 +717,9 @@ mod tests {
         assert_eq!(AdminCmd::Restart.to_command(), Ok(AdminCommand::Restart));
         assert!(AdminCmd::Settings { action: SettingsAction::List }.to_command().is_err(), "read-only");
         assert!(AdminCmd::Settings { action: SettingsAction::Get { key: "threadlens.access".into() } }.to_command().is_err(), "read-only");
+        let keep = AdminCmd::Refract { action: RefractAction::Unkeep { scope: "feature".into() } };
+        assert_eq!(keep.to_command(), Ok(AdminCommand::RefractKeep { scope: "feature".into(), keep: false }));
+        assert!(AdminCmd::Refract { action: RefractAction::Keep { scope: "nope".into() } }.to_command().is_err());
+        assert!(AdminCmd::Refract { action: RefractAction::Status }.to_command().is_err(), "read-only");
     }
 }

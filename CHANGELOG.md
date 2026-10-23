@@ -10,6 +10,35 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract R8: operator tooling and Thread Lens, #836)
+
+- **Communities page** in the admin UI (`/admin/communities`, refract
+  design §9.1, C-2): the feature switch, each community with its fields
+  and its accounts by state, add / edit / enable / disable / remove, and
+  the pending ends with Keep and Unkeep. Every change saves
+  `refract.communities` (or `refract.enabled`) as one `settings set`, so
+  the whole configuration is validated and the settings history records
+  it. A change that would make restored accounts pending (the switch off,
+  a community disabled, removed or given other servers) says how many and
+  asks first.
+- **`admin refract`** (§9): `status` (switch, communities and their entry
+  hashes, counts by state, pending ends, label cursors and the newest
+  label's age), `list [--state]`, `show <did>` (row, last verdict, labels,
+  events) read-only; `check <did>` (due now, or a candidate), `end <did>
+  [--reason]`, `keep <scope>` and `unkeep <scope>` through `serve`. `admin
+  label add`/`remove` on a DID also makes its Refract row due now.
+- **Thread Lens** (§7.5): a restored author's post missing here takes the
+  community path in every mode, and its upstream view is never
+  content-stripped by Bluesky's own labels; it carries the marker.
+
+### Changed (Refract R8, #836)
+
+- `refract.getReplies` runs the serve-time label check (§4.5) on the
+  replies it found before gating them.
+- A restored DID with no profile record is remembered for ten minutes
+  only when Slingshot says `RecordNotFound`; a Slingshot that did not
+  answer is asked again next time.
+
 ### Added (Refract R7: timeline and replies, #835)
 
 - **`app.nearhorizon.refract.getTimeline`** (refract design §7.1): for a

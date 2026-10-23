@@ -117,7 +117,7 @@ async fn menu_order_and_product_name() {
     assert_eq!(home.status, 200, "{}", home.body);
     assert_eq!(
         menu(&home.body),
-        ["Home", "Members", "Health", "Jobs", "Problems", "Stats", "Blocks", "Labels", "Look up", "Audit log", "Operators", "Settings"]
+        ["Home", "Members", "Health", "Jobs", "Problems", "Stats", "Blocks", "Labels", "Communities", "Look up", "Audit log", "Operators", "Settings"]
     );
     assert!(home.body.contains("aria-current=\"page\">Home</a>"), "{}", home.body);
     // The name: the brand, the title, Home's card.

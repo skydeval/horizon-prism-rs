@@ -290,6 +290,7 @@ mod tests {
             ),
             operators,
             settings,
+            refract: None,
         };
         Some((db, AdminExecutor::new(handlers), scope))
     }
