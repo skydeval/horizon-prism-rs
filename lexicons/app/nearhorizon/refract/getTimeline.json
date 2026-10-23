@@ -1,0 +1,29 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.refract.getTimeline",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Posts and reposts, newest first, by accounts this AppView serves for a listed community that the caller follows: top-level posts, replies to accounts the caller follows, and reposts. For a member, from its stored follows; empty for anyone else.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 },
+          "cursor": { "type": "string" }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["feed"],
+          "properties": {
+            "cursor": { "type": "string" },
+            "feed": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.feed.defs#feedViewPost" } }
+          }
+        }
+      },
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }]
+    }
+  }
+}

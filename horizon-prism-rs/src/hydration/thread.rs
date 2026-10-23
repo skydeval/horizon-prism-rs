@@ -444,7 +444,7 @@ impl Hydrator {
         let Some(anchor_row) = anchor.get(uri) else {
             let author = uri_author(uri).unwrap_or_default().to_string();
             if !self.stores_public_of(&author).await
-                && !self.gate(req, uri).await?.is_hidden()
+                && self.gate(req, uri).await?.listable()
                 && let Some(v) = self.upstream().post_thread(req, uri, depth, parent_height).await
             {
                 // An upstream AppView's thread, with whatever gate view it
@@ -637,9 +637,12 @@ impl Hydrator {
             return Ok(out);
         }
         let fetched = Value::Array(self.upstream().post_records(req, &allowed).await);
-        if let Value::Array(views) = self.normalized(viewer, req, fetched).await?.0 {
+        let (normalized, _, gates) = self.normalized(viewer, req, fetched).await?;
+        if let Value::Array(views) = normalized {
             for v in views {
-                if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string) {
+                if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string)
+                    && gates.listable(&u)
+                {
                     out.insert(u, v);
                 }
             }

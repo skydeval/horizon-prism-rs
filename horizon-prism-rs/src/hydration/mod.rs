@@ -32,6 +32,7 @@ pub mod notifications;
 pub mod polls;
 pub mod private_context;
 pub mod profile_refresh;
+pub mod refract;
 pub mod relationships;
 pub mod repo;
 pub mod search;
@@ -312,6 +313,10 @@ pub struct KnownBlocks {
     pub by_viewer: HashSet<String>,
     /// Authors that block the viewer.
     pub of_viewer: HashSet<String>,
+    /// Authors a Refract visitor's Farsight rounds left unanswered (refract
+    /// design §7.1): treated as blocked, with no viewer field. Thread Lens
+    /// never fills it.
+    pub unanswered: HashSet<String>,
 }
 
 tokio::task_local! {
@@ -343,7 +348,7 @@ fn apply_known_blocks(out: &mut ActorViewer, me: &str, dids: &[String]) {
         if known.of_viewer.contains(did) {
             out.blocked_by.insert(did.clone());
         }
-        if known.by_viewer.contains(did) && !out.blocking.contains_key(did) {
+        if (known.by_viewer.contains(did) || known.unanswered.contains(did)) && !out.blocking.contains_key(did) {
             out.blocking_unrecorded.insert(did.clone());
         }
     }
@@ -440,6 +445,53 @@ impl ActorViewer {
             || self.blocked_by.contains(did)
             || self.blocking_by_list.contains_key(did)
             || self.blocking_unrecorded.contains(did)
+    }
+}
+
+/// The gate verdicts `normalized` computed over every post and account an
+/// upstream view names, and the accounts the viewer blocks or is blocked
+/// by (refract design §7.2 "Array callers"). A caller that returns a
+/// normalized array filters it with these, with no second gate call.
+#[derive(Debug, Clone, Default)]
+#[must_use]
+pub struct Gates {
+    pub map: HashMap<String, crate::moderation::Gate>,
+    pub blocked: HashSet<String>,
+}
+
+impl Gates {
+    /// The gate of `subject` (visible when not named).
+    #[must_use]
+    pub fn gate(&self, subject: &str) -> crate::moderation::Gate {
+        self.map.get(subject).copied().unwrap_or(crate::moderation::Gate::Visible)
+    }
+
+    /// Visible in lists and threads.
+    #[must_use]
+    pub fn listable(&self, subject: &str) -> bool {
+        self.gate(subject).listable()
+    }
+
+    /// Hidden by the gate.
+    #[must_use]
+    pub fn hidden(&self, subject: &str) -> bool {
+        self.gate(subject).is_hidden()
+    }
+
+    /// The viewer blocks `did` or is blocked by it.
+    #[must_use]
+    pub fn blocked(&self, did: &str) -> bool {
+        self.blocked.contains(did)
+    }
+
+    /// Whether a `feedViewPost` stays: its post listable and not by a
+    /// blocked author, and its repost's author not hidden.
+    #[must_use]
+    pub fn keeps_feed_item(&self, item: &Value) -> bool {
+        let uri = item.pointer("/post/uri").and_then(Value::as_str).unwrap_or_default();
+        let author = uri_author(uri).unwrap_or_default();
+        let by = item.pointer("/reason/by/did").and_then(Value::as_str);
+        self.listable(uri) && !self.blocked(author) && !by.is_some_and(|d| self.hidden(d))
     }
 }
 
@@ -964,7 +1016,7 @@ impl Hydrator {
     /// # Errors
     ///
     /// Database errors.
-    pub async fn normalized(&self, viewer: &Viewer, req: &Requester, mut view: Value) -> Result<(Value, normalize::NormalizeReport), sqlx::Error> {
+    pub async fn normalized(&self, viewer: &Viewer, req: &Requester, mut view: Value) -> Result<(Value, normalize::NormalizeReport, Gates), sqlx::Error> {
         let (dids, uris) = normalize::subjects(&view);
         let dids: Vec<String> = dids.into_iter().collect();
         let uris: Vec<String> = uris.into_iter().collect();
@@ -975,15 +1027,56 @@ impl Hydrator {
         let roots: Vec<String> = normalize::thread_roots(&view).into_iter().collect();
         let muted_threads = self.in_muted_threads(viewer, &roots).await?;
         let labelled: Vec<String> = dids.iter().chain(uris.iter()).cloned().collect();
+        // The gate for everything nested (refract design §7.2 step 4), for
+        // every caller: one gate call over every post and account the view
+        // names, and the viewer's blocks of them.
+        let gates = self.gate_many(req, &labelled).await?;
+        let blocked: HashSet<String> = dids.iter().filter(|d| actors.blocked_either_way(d)).cloned().collect();
+        let hidden_creators: HashSet<String> = dids.iter().filter(|d| gates.get(*d).is_some_and(|g| g.is_hidden())).cloned().collect();
+        let restored = self.restored_markers(req, &dids, &gates).await;
         let overlay = normalize::Overlay {
             profile_viewers: dids.iter().map(|d| (d.clone(), actors.view(d))).collect(),
             post_viewers,
             muted_threads,
             labels: self.load_labels(&labelled).await?,
+            hidden: gates.clone(),
+            hidden_creators,
+            blocked: blocked.clone(),
+            restored,
         };
         let report = normalize::normalize_upstream(&mut view, &overlay);
         self.enrich_counts(req, &mut view).await?;
-        Ok((view, report))
+        Ok((view, report, Gates { map: gates, blocked }))
+    }
+
+    /// The restored markers of `dids` (refract design §7.3): the DIDs in
+    /// R-live that wait for no first label fetch and that `gates` does not
+    /// hide.
+    pub(crate) async fn restored_markers(&self, req: &Requester, dids: &[String], gates: &HashMap<String, crate::moderation::Gate>) -> HashMap<String, Value> {
+        let snapshot = self.refract_snapshot(req).await;
+        if snapshot.restored.is_empty() {
+            return HashMap::new();
+        }
+        let communities = crate::refract::Communities::new(self.live().load().refract_communities.clone());
+        dids.iter()
+            .filter(|d| !snapshot.awaiting.contains(*d) && !gates.get(*d).is_some_and(|g| g.is_hidden()))
+            .filter_map(|d| {
+                let c = communities.by_name(snapshot.restored.get(d)?)?;
+                Some((d.clone(), crate::refract::marker(c)))
+            })
+            .collect()
+    }
+
+    /// [`Hydrator::restored_markers`] for local view builders: the gate is
+    /// read for the DIDs of `dids` in R-live only.
+    pub(crate) async fn markers_for(&self, req: &Requester, dids: &[String]) -> Result<HashMap<String, Value>, sqlx::Error> {
+        let snapshot = self.refract_snapshot(req).await;
+        let restored: Vec<String> = dids.iter().filter(|d| snapshot.restored.contains_key(*d)).cloned().collect();
+        if restored.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let gates = self.gate_many(req, &restored).await?;
+        Ok(self.restored_markers(req, &restored, &gates).await)
     }
 
     /// The viewer's likes and reposts of `uris` (§7.5): the newest when it
@@ -1204,6 +1297,8 @@ pub(crate) mod testing {
         pub threads: HashMap<String, Value>,
         /// DID → `getAuthorPolls` output.
         pub polls: HashMap<String, Value>,
+        /// DID → `getFollows` output.
+        pub follows: HashMap<String, Value>,
         /// Handle → DID, for `resolve_handle`.
         pub handles: HashMap<String, String>,
         pub calls: std::sync::atomic::AtomicUsize,
@@ -1308,8 +1403,8 @@ pub(crate) mod testing {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.feeds.get(&(actor.to_string(), cursor.map(str::to_string))).cloned()
         }
-        async fn follows(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
-            None
+        async fn follows(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+            self.follows.get(actor).cloned()
         }
         async fn lists_descending(&self, _req: &Requester, _actor: &str) -> bool {
             self.descending

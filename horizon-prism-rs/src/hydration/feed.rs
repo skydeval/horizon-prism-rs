@@ -151,6 +151,9 @@ impl PostContext {
         if let Some(gate) = self.threadgates.get(uri) {
             v.insert("threadgate".into(), gate.clone());
         }
+        if let Some(m) = self.profiles.markers.get(&row.author_did) {
+            v.insert("restored".into(), m.clone());
+        }
         Some(Value::Object(v))
     }
 
@@ -192,12 +195,21 @@ impl PostContext {
         {
             v.insert("embeds".into(), json!([embed]));
         }
+        if let Some(m) = self.profiles.markers.get(&row.author_did) {
+            v.insert("restored".into(), m.clone());
+        }
         Value::Object(v)
     }
 
     fn media_view(&self, row: &PostRow, embed: &Value) -> Option<Value> {
         let did = &row.author_did;
         let pds = self.profiles.rows.get(did).and_then(|r| r.pds_endpoint.as_deref());
+        // A restored author's video plays from its own server (refract
+        // design §7.2): Bluesky's video service does not serve it.
+        if self.profiles.markers.contains_key(did) {
+            let pds_blob = crate::config::VideoConfig { playback: crate::config::VideoPlayback::PdsBlob, ..self.video.clone() };
+            return super::embeds::media_view(did, pds, embed, &pds_blob);
+        }
         super::embeds::media_view(did, pds, embed, &self.video)
     }
 
@@ -487,11 +499,24 @@ impl Hydrator {
                 .filter(|u| !gates.get(u).copied().unwrap_or(Gate::Visible).is_hidden() && !deleted.contains(u))
                 .collect();
             let upstream = Value::Array(self.upstream().posts(req, &allowed).await);
-            if let Value::Array(views) = self.normalized(viewer, req, upstream).await?.0 {
-                posts.extend(views);
+            // The gate after the fetch (refract design §7.2): a hidden post
+            // is dropped, a collapsed one kept, as on the local path.
+            let (normalized, _, gates) = self.normalized(viewer, req, upstream).await?;
+            if let Value::Array(views) = normalized {
+                posts.extend(views.into_iter().filter(|v| !gates.hidden(v.get("uri").and_then(Value::as_str).unwrap_or_default())));
             }
         }
         Ok(Ok(Self::emit(json!({ "posts": posts }))))
+    }
+
+    /// An upstream `getAuthorFeed` answer, normalized, its `feed` filtered
+    /// with the gate map (refract design §7.2 "Array callers").
+    async fn filtered_feed(&self, viewer: &Viewer, req: &Requester, v: Value) -> Result<Value, sqlx::Error> {
+        let (mut v, _, gates) = self.normalized(viewer, req, v).await?;
+        if let Some(feed) = v.get_mut("feed").and_then(Value::as_array_mut) {
+            feed.retain(|item| gates.keeps_feed_item(item));
+        }
+        Ok(v)
     }
 
     /// By post: its place and the length of its thread's contiguous run by
@@ -649,7 +674,7 @@ impl Hydrator {
             // Out-of-scope subject: the cascade (item 7).
             return Ok(
                 match self.upstream().author_feed(req, &did, limit, cursor, filter).await {
-                    Some(v) => Ok(Self::emit(self.normalized(viewer, req, v).await?.0)),
+                    Some(v) => Ok(Self::emit(self.filtered_feed(viewer, req, v).await?)),
                     None => Err(ViewError::new("InvalidRequest", "Profile not found")),
                 },
             );
@@ -658,7 +683,7 @@ impl Hydrator {
         // PDS, below the records stored here (design-v3 §11 G-3).
         if cursor.is_some_and(|c| c.starts_with("P:")) {
             return match self.upstream().author_feed(req, &did, limit, cursor, filter).await {
-                Some(v) => Ok(Ok(Self::emit(self.normalized(viewer, req, v).await?.0))),
+                Some(v) => Ok(Ok(Self::emit(self.filtered_feed(viewer, req, v).await?))),
                 None => match req.exhausted() {
                     // No budget for the listing: a 429, never an empty page.
                     Some(exhausted) => Err(HydrationError::NoBudget(exhausted)),
@@ -829,9 +854,10 @@ impl Hydrator {
         let partial_cursor = cursor.filter(|c| c.starts_with("PL:")).map(|c| &c[1..]);
         if !complete && partial_cursor.is_none() {
             if let Some(found) = self.upstream().list_feed(req, list, limit, cursor).await {
-                let (mut found, _) = self.normalized(viewer, req, found).await?;
+                let (mut found, _, gates) = self.normalized(viewer, req, found).await?;
                 if let Some(feed) = found.get_mut("feed").and_then(Value::as_array_mut) {
                     *feed = self.without_excluded(viewer, std::mem::take(feed)).await?;
+                    feed.retain(|item| gates.keeps_feed_item(item));
                 }
                 return Ok(Ok(Self::emit(found)));
             }
@@ -1132,9 +1158,12 @@ impl Hydrator {
         let mut remote: HashMap<String, Value> = HashMap::new();
         if !missing.is_empty() {
             let fetched = Value::Array(self.upstream().post_records(req, &missing).await);
-            if let Value::Array(views) = self.normalized(viewer, req, fetched).await?.0 {
+            let (normalized, _, gates) = self.normalized(viewer, req, fetched).await?;
+            if let Value::Array(views) = normalized {
                 for v in views {
-                    if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string) {
+                    if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string)
+                        && gates.listable(&u)
+                    {
                         remote.insert(u, v);
                     }
                 }
@@ -1203,9 +1232,12 @@ impl Hydrator {
         let mut remote: HashMap<String, Value> = HashMap::new();
         if !missing.is_empty() {
             let fetched = Value::Array(self.upstream().post_records(req, &missing).await);
-            if let Value::Array(views) = self.normalized(viewer, req, fetched).await?.0 {
+            let (normalized, _, gates) = self.normalized(viewer, req, fetched).await?;
+            if let Value::Array(views) = normalized {
                 for v in views {
-                    if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string) {
+                    if let Some(u) = v.get("uri").and_then(Value::as_str).map(str::to_string)
+                        && gates.listable(&u)
+                    {
                         remote.insert(u, v);
                     }
                 }

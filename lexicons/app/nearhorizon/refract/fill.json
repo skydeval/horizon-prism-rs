@@ -1,0 +1,30 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.refract.fill",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Views of accounts, and of posts by accounts, that Bluesky's AppView withholds and a listed community still serves. Named accounts not yet known are checked in the background and reported in `pending`; ask again a little later. Everything else is omitted. Any signed-in caller.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "dids": { "type": "array", "maxLength": 25, "items": { "type": "string", "format": "did" } },
+          "uris": { "type": "array", "maxLength": 25, "items": { "type": "string", "format": "at-uri" } }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["profiles", "posts", "pending"],
+          "properties": {
+            "profiles": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.actor.defs#profileViewDetailed" } },
+            "posts": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.feed.defs#postView" } },
+            "pending": { "type": "array", "items": { "type": "string", "format": "did" }, "description": "Accounts accepted for checking and not served yet." }
+          }
+        }
+      },
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }]
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.refract.getUnreadCount",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "How many of the caller's notifications from accounts this AppView serves for a listed community arrived after `seenAt`, filtered as listNotifications is. For a member; 0 for anyone else.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "seenAt": { "type": "string", "format": "datetime" }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["count"],
+          "properties": {
+            "count": { "type": "integer" }
+          }
+        }
+      },
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }]
+    }
+  }
+}

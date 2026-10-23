@@ -40,7 +40,7 @@ impl Hydrator {
         if !self.stores_public_of(&did).await || cursor.is_some_and(|c| c.starts_with("P:")) {
             return match self.upstream().author_polls(req, &did, limit, cursor).await {
                 Some(v) => {
-                    let (mut v, _) = self.normalized(viewer, req, v).await?;
+                    let (mut v, _, _) = self.normalized(viewer, req, v).await?;
                     self.poll_author_pass(req, &did, &mut v).await;
                     Ok(Ok(Self::emit(v)))
                 }

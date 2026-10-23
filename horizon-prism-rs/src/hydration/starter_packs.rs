@@ -357,7 +357,7 @@ impl Hydrator {
         } else if list.is_some()
             && let Some(up) = self.upstream().starter_pack(req, uri).await
         {
-            let (up, _) = self.normalized(viewer, req, up).await?;
+            let (up, _, _) = self.normalized(viewer, req, up).await?;
             let sample: Vec<Value> = up
                 .pointer("/starterPack/listItemsSample")
                 .and_then(Value::as_array)
@@ -465,7 +465,7 @@ impl Hydrator {
             let Some(found) = self.upstream().actor_starter_packs(req, &did, limit, cursor).await else {
                 return Ok(Err(ViewError::new("InvalidRequest", "Profile not found")));
             };
-            let (mut found, _) = self.normalized(viewer, req, found).await?;
+            let (mut found, _, _) = self.normalized(viewer, req, found).await?;
             let uris: Vec<String> = found["starterPacks"]
                 .as_array()
                 .into_iter()

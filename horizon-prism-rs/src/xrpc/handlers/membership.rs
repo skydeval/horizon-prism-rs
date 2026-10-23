@@ -55,6 +55,8 @@ pub const FEATURE_THREAD_LENS: &str = "threadLens";
 /// Thread Lens serves every signed-in account (`threadlens.access =
 /// "signed_in"`), a non-member as a visitor.
 pub const FEATURE_THREAD_LENS_SIGNED_IN: &str = "threadLens.signedIn";
+/// `refract` (refract design §7.1): the Refract endpoints are on.
+pub const FEATURE_REFRACT: &str = "refract";
 
 /// Private posts from any PDS are fully served, and a plaintext one is
 /// refused (private-encode design §7, S4): listed after the private tier's
@@ -175,8 +177,13 @@ impl MembershipSettings {
             out.push(FEATURE_ANY_PDS);
         }
         out.push(FEATURE_THREAD_LENS);
-        if self.live.load().threadlens_access == ThreadLensAccess::SignedIn {
+        let live = self.live.load();
+        if live.threadlens_access == ThreadLensAccess::SignedIn {
             out.push(FEATURE_THREAD_LENS_SIGNED_IN);
+        }
+        // Refract (refract design §7.1): from runtime state, while on.
+        if live.refract_enabled {
+            out.push(FEATURE_REFRACT);
         }
         out
     }

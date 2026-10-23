@@ -44,6 +44,9 @@ pub struct ProfileContext {
     /// By actor without a readable row: the upstream view the profile tiers
     /// resolved (design-v4 §8.1), as cached.
     pub remote: HashMap<String, Value>,
+    /// By actor in Refract's R-live that the gate does not hide: its
+    /// restored marker (refract design §7.3).
+    pub markers: HashMap<String, Value>,
 }
 
 /// The parts of a detailed view that `getProfile` and `getProfiles` load
@@ -66,19 +69,25 @@ impl ProfileContext {
     /// A profile view; an actor without a local row gets the remote view
     /// the tiers resolved, projected to `kind` with the local `viewer` and
     /// `labels`, or else the minimal `{did, handle: "handle.invalid"}` form.
+    /// A row with no profile record yet (a restored account before its
+    /// backfill lands, refract design §7.2) prefers the remote view too.
     #[must_use]
     pub fn view(&self, did: &str, kind: ProfileKind) -> Value {
         let row = self.rows.get(did);
-        if row.is_none()
+        if row.is_none_or(|r| r.profile_record.is_none())
             && let Some(remote) = self.remote.get(did)
         {
             let mut v = super::profile_refresh::project(remote, kind);
             v.insert("did".into(), json!(did));
             if !v.get("handle").is_some_and(Value::is_string) {
-                v.insert("handle".into(), json!(INVALID_HANDLE));
+                let handle = row.and_then(|r| r.handle.as_deref()).unwrap_or(INVALID_HANDLE);
+                v.insert("handle".into(), json!(handle));
             }
             v.insert("viewer".into(), self.viewer.view(did));
             v.insert("labels".into(), Value::Array(self.labels.get(did).cloned().unwrap_or_default()));
+            if let Some(m) = self.markers.get(did) {
+                v.insert("restored".into(), m.clone());
+            }
             return Value::Object(v);
         }
         let mut v = Map::new();
@@ -151,6 +160,9 @@ impl ProfileContext {
         }
         v.insert("viewer".into(), viewer);
         v.insert("labels".into(), Value::Array(self.labels.get(did).cloned().unwrap_or_default()));
+        if let Some(m) = self.markers.get(did) {
+            v.insert("restored".into(), m.clone());
+        }
         Value::Object(v)
     }
 }
@@ -175,7 +187,8 @@ impl Hydrator {
         // Private-context hydration reads every row (§8.1, R3-179).
         let readable = self.readable_for(req, dids).await;
         let rows = self.load_actor_rows(&readable).await?;
-        let remote = self.tier_profiles(req, dids, &readable, tiers).await;
+        let mut remote = self.tier_profiles(req, dids, &readable, tiers).await;
+        remote.extend(self.refract_profiles(req, dids, &rows).await);
         let mut actor_viewer = self.actor_viewer(viewer, dids).await?;
         self.fill_list_views(viewer, req, &mut actor_viewer).await?;
         let labels = self.load_labels(dids).await?;
@@ -222,6 +235,7 @@ impl Hydrator {
             statuses,
             details: HashMap::new(),
             remote,
+            markers: self.markers_for(req, dids).await?,
         })
     }
 
@@ -333,7 +347,8 @@ impl Hydrator {
     pub(crate) async fn anonymous_profile_context(&self, req: &Requester, dids: &[String]) -> Result<ProfileContext, sqlx::Error> {
         let readable = self.readable_dids(dids).await;
         let rows = self.load_actor_rows(&readable).await?;
-        let remote = self.tier_profiles(req, dids, &readable, Tiers::List).await;
+        let mut remote = self.tier_profiles(req, dids, &readable, Tiers::List).await;
+        remote.extend(self.refract_profiles(req, dids, &rows).await);
         Ok(ProfileContext {
             rows,
             viewer: ActorViewer::default(),
@@ -343,6 +358,7 @@ impl Hydrator {
             statuses: HashMap::new(),
             details: HashMap::new(),
             remote,
+            markers: self.markers_for(req, dids).await?,
         })
     }
 
@@ -441,7 +457,7 @@ impl Hydrator {
         }
         let mut remote: HashMap<String, Value> = HashMap::new();
         if !views.is_empty() {
-            let (normalized, _) = self.normalized(viewer, req, json!({ "profiles": views })).await?;
+            let (normalized, _, _) = self.normalized(viewer, req, json!({ "profiles": views })).await?;
             for v in normalized.get("profiles").and_then(Value::as_array).into_iter().flatten() {
                 if let Some(d) = v.get("did").and_then(Value::as_str) {
                     remote.insert(d.to_string(), v.clone());

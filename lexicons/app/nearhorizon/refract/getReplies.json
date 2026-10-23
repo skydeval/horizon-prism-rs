@@ -1,0 +1,29 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.refract.getReplies",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "The stored replies, by accounts this AppView serves for a listed community, in the thread of `root` that the caller may see, newest first, at most 200. The client splices each whose parent is on screen or another returned post.",
+      "parameters": {
+        "type": "params",
+        "required": ["anchor", "root"],
+        "properties": {
+          "anchor": { "type": "string", "format": "at-uri" },
+          "root": { "type": "string", "format": "at-uri" }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["posts"],
+          "properties": {
+            "posts": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.feed.defs#postView" } }
+          }
+        }
+      },
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }]
+    }
+  }
+}

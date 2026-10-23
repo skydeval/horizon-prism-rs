@@ -151,6 +151,10 @@ impl UpstreamSource for NoUpstream {
     }
 }
 
+/// Per-author cascade calls of one `posts` call in flight at once
+/// (refract design §7.2 step 3).
+pub const AUTHOR_CONCURRENCY: usize = 8;
+
 /// Metric: where an upstream view's counts came from.
 pub const METRIC_UPSTREAM_COUNTS: &str = "upstream_view_counts_total";
 
@@ -642,18 +646,29 @@ impl UpstreamSource for RealUpstreamSource {
         // (lodestar-reads design §2.10).
         let authors: Vec<String> = by_author.keys().cloned().collect();
         self.router.prefetch(req, &authors).await;
-        for (author, group) in &by_author {
-            // Once a share or pool is empty, the remaining posts are left
-            // out (design-v3 §II-8.3: list items are omitted).
-            if req.spent() {
-                break;
-            }
-            if let Some(body) = self.cascade(req, author, Call::Posts(group)).await {
-                for post in body.get("posts").and_then(Value::as_array).into_iter().flatten() {
-                    if let Some(uri) = post.get("uri").and_then(Value::as_str).filter(|u| group.iter().any(|g| g == u)) {
-                        self.cache.put_json(req, &format!("rt:post:{uri}"), post).await;
-                        found.insert(uri.to_string(), post.clone());
-                    }
+        // The authors' calls run concurrently, at most
+        // `AUTHOR_CONCURRENCY` in flight, under the request's deadline
+        // (refract design §7.2 step 3). Once a share or pool is empty, the
+        // remaining posts are left out (design-v3 §II-8.3: list items are
+        // omitted).
+        let groups: Vec<(String, Vec<String>)> = by_author.iter().map(|(a, g)| (a.clone(), g.clone())).collect();
+        let answers: Vec<(Vec<String>, Option<Value>)> = futures::stream::iter(groups)
+            .map(|(author, group)| async move {
+                if req.spent() {
+                    return (group, None);
+                }
+                let body = self.cascade(req, &author, Call::Posts(&group)).await;
+                (group, body)
+            })
+            .buffer_unordered(AUTHOR_CONCURRENCY)
+            .collect()
+            .await;
+        for (group, body) in answers {
+            let Some(body) = body else { continue };
+            for post in body.get("posts").and_then(Value::as_array).into_iter().flatten() {
+                if let Some(uri) = post.get("uri").and_then(Value::as_str).filter(|u| group.iter().any(|g| g == u)) {
+                    self.cache.put_json(req, &format!("rt:post:{uri}"), post).await;
+                    found.insert(uri.to_string(), post.clone());
                 }
             }
         }
@@ -1221,7 +1236,7 @@ mod tests {
             "posts": [post(&fresh), post(&stale), post(&unknown)],
             "profile": {"did": OUTSIDER, "handle": "o.test", "followersCount": 10, "followsCount": 4}
         });
-        let (v, _) = h.normalized(&crate::hydration::Viewer::anonymous(), &Requester::test(), view).await.expect("normalize");
+        let (v, _, _) = h.normalized(&crate::hydration::Viewer::anonymous(), &Requester::test(), view).await.expect("normalize");
         assert_eq!(v["posts"][0]["likeCount"], 200, "a fresh Constellation value overrides upstream");
         assert_eq!(v["posts"][0]["repostCount"], 5, "a count Constellation does not carry is untouched");
         assert_eq!(v["posts"][1]["likeCount"], 7, "a stale value is still used");

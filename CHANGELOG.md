@@ -10,6 +10,81 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract R5: restored profiles and author feeds, #833)
+
+- **`app.nearhorizon.refract.getAuthorFeed`** (refract design §7.1): the
+  feed of a DID in R-live, built from its stored `posts` and `reposts`
+  (not `feed_items`, not the cascade), with the `posts_with_replies`,
+  `posts_no_replies`, `posts_with_media`, `posts_with_video` and
+  `posts_and_author_threads` filters, the pinned post from its profile
+  record, and local cursors; `NotFound` for anyone else. For a visitor,
+  an author Farsight leaves unanswered gets an empty feed.
+- **Subjects not stored here** (§7.2 steps 1–3): a page's repost
+  subjects, reply parents and roots and quotes are gated and checked for
+  blocks before any fetch, fetched through the cascade (at most 25 per
+  page, within the request's budget), and gated again after. A repost
+  whose subject can't be shown is left out; a parent or root renders as
+  `notFoundPost` (`blockedPost` for a block).
+- **Remote profiles for restored DIDs** (§7.2): a restored DID whose
+  profile record is not stored yet renders from the remote tiers in every
+  tier mode, with Slingshot's profile record as the last tier, without the
+  shared negative cache; a DID Slingshot has no record for is not walked
+  again for ten minutes.
+- Media of restored authors comes from their PDS; their video is always
+  `pds_blob`.
+
+### Changed (Refract R5, #833)
+
+- The cascade's `getPosts` fetch for posts not stored here asks each
+  author's network concurrently, at most eight at a time, under the
+  request's deadline, for every caller.
+
+### Added (Refract R4: endpoints, the gate after the fetch, the marker, #832)
+
+- **`app.nearhorizon.refract.fill`** and **`.getPostThread`** (refract
+  design §7.1), with lexicons for all seven Refract methods and
+  `app.nearhorizon.refract.defs#restored`. Any signed-in caller (C-3): a
+  ready member with member viewer state and its Farsight handle; anyone
+  else as a visitor. Errors `NotEnabled` and `AuthRequired`; readiness
+  errors never. New rate class `[rate_limits.refract]` (5/s, burst 20,
+  per caller DID, in the admin's Limits page); the seven NSIDs are always
+  served (`KEPT_METHODS`). `getMembership` lists the feature `refract`
+  while `refract.enabled` is on.
+- **Visitor blocks** (§7.1, C-9): Farsight pair answers for the authors a
+  request names, then for those found in what it built (collect → judge
+  → emit); a pair Farsight leaves unanswered is treated as a block
+  (`KnownBlocks.unanswered`, applied as `blocking_unrecorded`). With no
+  Farsight configured, visitors get no block enforcement.
+- **Discovery** (§4.4): `fill` makes candidates of the DIDs it names that
+  are unknown or past their rejection's wait, resolving them in the
+  background; `pending` lists them (and R-live DIDs awaiting their first
+  labels), the same whether or not Prism holds a row for the DID. Capped
+  per caller (`candidates_per_caller_per_hour`,
+  `resolves_per_caller_per_hour`); a visitor's call makes candidates only
+  when its token carries `#bsky_appview`, within
+  `visitor_candidates_per_ip_per_hour` and `visitor_candidates_per_hour`.
+- **The serve-time label check** (§4.5) for posts these endpoints serve
+  from an `appview`-source community: at most four `getPosts` calls of 25
+  on the request's budget, the results in the request's `RefractCheck`.
+- **The gate after the fetch, for every caller** (§7.2 step 4): every
+  upstream view is gated as a whole: a thread node the gate does not list
+  becomes a `notFoundPost` with no replies (`blockedPost` for a blocked
+  author), keeping the chain above it for Thread Lens; so does a reply ref; a hidden quote becomes `viewNotFound`
+  (`viewBlocked`), a collapsed one stays; a list, feed, starter-pack or
+  labeler embed by a hidden creator becomes `viewNotFound`. `normalized`
+  returns its gate map, and the callers that return upstream arrays drop
+  what it hides: `getPosts` (hidden), `getAuthorFeed` and `getListFeed`
+  (not listable, blocked, or reposted by a hidden account), `getQuotes`,
+  `getActorLikes` and a thread's remote posts (not listable), `getFollows`
+  (hidden or blocked either way). An upstream thread is fetched only for
+  a listable anchor. **This changes public On-mode answers too**: nested
+  posts with a local `!takedown`/`!hide`, a hidden author, or a blocked
+  author are no longer served inside upstream views.
+- **The restored marker** (§7.3): `"restored": {community, tier,
+  labeler}` on the profile and post views (and quotes) of accounts in
+  R-live, local or upstream, in every response; never on a hidden one or
+  one awaiting its first labels.
+
 ### Added (Refract R3: storage, backfill and the Refract purge, #831)
 
 - **The restored rule** (refract design §5.1): `AdmitRule::Restored`, in

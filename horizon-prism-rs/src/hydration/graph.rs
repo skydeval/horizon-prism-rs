@@ -105,7 +105,15 @@ impl Hydrator {
         };
         if !self.in_scope(&did).await {
             return Ok(match self.upstream().follows(req, &did, limit, cursor).await {
-                Some(v) => Ok(Self::emit(self.normalized(viewer, req, v).await?.0)),
+                Some(v) => {
+                    // As the local list drops them (refract design §7.2):
+                    // hidden accounts and blocks either way.
+                    let (mut v, _, gates) = self.normalized(viewer, req, v).await?;
+                    if let Some(follows) = v.get_mut("follows").and_then(Value::as_array_mut) {
+                        follows.retain(|p| p.get("did").and_then(Value::as_str).is_some_and(|d| !gates.hidden(d) && !gates.blocked(d)));
+                    }
+                    Ok(Self::emit(v))
+                }
                 None => Err(not_found()),
             });
         }

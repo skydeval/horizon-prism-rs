@@ -1,0 +1,17 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.refract.defs",
+  "description": "Accounts Bluesky's AppView withholds that a community this AppView lists still hosts and has not banned, served from what this AppView stores.",
+  "defs": {
+    "restored": {
+      "type": "object",
+      "description": "The marker carried by the view of every such account and its posts (profileViewBasic, profileView, profileViewDetailed, postView including feedViewPost.reply.parent and .root and threadViewPost.post, and embed.record#viewRecord), in every response of this AppView. Absent means the subject is not one. Never on a gap node, notFoundPost, blockedPost or viewNotFound.",
+      "required": ["community", "tier"],
+      "properties": {
+        "community": { "type": "string", "description": "The name of the community that hosts the account, as the operator listed it." },
+        "tier": { "type": "integer", "minimum": 1, "maximum": 2, "description": "1: the community runs an AppView; 2: it runs a labeler." },
+        "labeler": { "type": "string", "format": "did", "description": "The community's labeler, when it has one. Its labels on these views carry it as their src." }
+      }
+    }
+  }
+}

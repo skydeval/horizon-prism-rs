@@ -12,6 +12,15 @@
 //! 4. **Private-tier references.** An embedded record whose URI is
 //!    private-tier becomes `app.bsky.embed.record#viewNotFound`; a private
 //!    post in a thread becomes `app.bsky.feed.defs#notFoundPost`.
+//! 5. **The gate for everything nested** (refract design §7.2 step 4): a
+//!    thread node whose post the gate does not list becomes a whole
+//!    `notFoundPost` (or `blockedPost`) with no replies; so does a reply
+//!    ref; a quoted post the gate hides becomes `viewNotFound` (or
+//!    `viewBlocked`), and a list, feed, starter pack or labeler embed by a
+//!    hidden creator `viewNotFound`. Arrays are filtered by the callers,
+//!    with the gate map `normalized` returns.
+//! 6. **The restored marker** (refract design §7.3), on the views of
+//!    accounts in R-live, never on a view the gate hides.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,6 +28,7 @@ use serde_json::{Map, Value, json};
 
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::{RecordClass, classify};
+use crate::moderation::Gate;
 
 /// Labels whose presence upstream marks a post as content-stripped (§10.4).
 pub const STRIPPING_LABELS: [&str; 2] = ["!takedown", "!hide"];
@@ -53,6 +63,56 @@ pub struct Overlay {
     pub muted_threads: HashSet<String>,
     /// Local label objects by subject (URI or DID).
     pub labels: HashMap<String, Vec<Value>>,
+    /// The gate verdict of each nested post URI and DID (refract design
+    /// §7.2 step 4). Absent means visible.
+    pub hidden: HashMap<String, Gate>,
+    /// DIDs whose own gate verdict is `Hidden`.
+    pub hidden_creators: HashSet<String>,
+    /// DIDs the viewer blocks or is blocked by.
+    pub blocked: HashSet<String>,
+    /// The restored marker by DID (refract design §7.3).
+    pub restored: HashMap<String, Value>,
+}
+
+impl Overlay {
+    fn gate(&self, uri: &str) -> Gate {
+        self.hidden.get(uri).copied().unwrap_or(Gate::Visible)
+    }
+
+    fn author_view(&self, did: &str) -> Value {
+        json!({"did": did, "viewer": self.profile_viewers.get(did).cloned().unwrap_or_else(|| json!({}))})
+    }
+
+    /// What replaces a thread node or a reply ref of `uri`: `blockedPost`
+    /// for a blocked author, `notFoundPost` for a post the gate does not
+    /// list.
+    fn post_slot(&self, uri: &str) -> Option<Value> {
+        let author = uri_author(uri).unwrap_or_default();
+        if self.blocked.contains(author) {
+            return Some(json!({"$type": "app.bsky.feed.defs#blockedPost", "uri": uri, "blocked": true, "author": self.author_view(author)}));
+        }
+        (!self.gate(uri).listable()).then(|| json!({"$type": "app.bsky.feed.defs#notFoundPost", "uri": uri, "notFound": true}))
+    }
+
+    /// What replaces an embed's `.record` slot.
+    fn record_slot(&self, slot: &Map<String, Value>) -> Option<Value> {
+        let ty = slot.get("$type").and_then(Value::as_str).unwrap_or_default();
+        let uri = slot.get("uri").and_then(Value::as_str).unwrap_or_default();
+        if ty == "app.bsky.embed.record#viewRecord" || (slot.contains_key("author") && slot.contains_key("value")) {
+            let author = uri_author(uri).unwrap_or_default();
+            if self.blocked.contains(author) {
+                return Some(json!({"$type": "app.bsky.embed.record#viewBlocked", "uri": uri, "blocked": true, "author": self.author_view(author)}));
+            }
+            return self.gate(uri).is_hidden().then(|| json!({"$type": "app.bsky.embed.record#viewNotFound", "uri": uri, "notFound": true}));
+        }
+        let creator = slot.get("creator").and_then(|c| c.get("did")).and_then(Value::as_str);
+        let embedded = matches!(
+            ty,
+            "app.bsky.graph.defs#listView" | "app.bsky.feed.defs#generatorView" | "app.bsky.graph.defs#starterPackViewBasic" | "app.bsky.labeler.defs#labelerView"
+        ) || (ty.is_empty() && creator.is_some());
+        (embedded && creator.is_some_and(|c| self.hidden_creators.contains(c)))
+            .then(|| json!({"$type": "app.bsky.embed.record#viewNotFound", "uri": uri, "notFound": true}))
+    }
 }
 
 /// What normalization observed.
@@ -135,7 +195,57 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
                 *v = replacement;
                 return;
             }
+            // 5. The gate for everything nested.
+            if ty == "app.bsky.feed.defs#threadViewPost"
+                && let Some(u) = m.get("post").and_then(|p| p.get("uri")).and_then(Value::as_str)
+                && let Some(mut replacement) = overlay.post_slot(u)
+            {
+                // Its replies go; the chain above it stays, so Thread Lens
+                // still walks past it to the root.
+                if let Some(mut parent) = m.remove("parent")
+                    && let Some(r) = replacement.as_object_mut()
+                {
+                    walk(&mut parent, overlay, report);
+                    r.insert("parent".into(), parent);
+                }
+                *v = replacement;
+                return;
+            }
+            let slot = match ty.as_str() {
+                "app.bsky.embed.record#view" => m.get_mut("record"),
+                "app.bsky.embed.recordWithMedia#view" => m.get_mut("record").and_then(|r| r.get_mut("record")),
+                _ => None,
+            };
+            if let Some(slot) = slot
+                && let Some(replacement) = slot.as_object().and_then(|o| overlay.record_slot(o))
+            {
+                *slot = replacement;
+            }
+            if let Some(Value::Object(reply)) = m.get_mut("reply") {
+                for key in ["root", "parent"] {
+                    let replacement = reply
+                        .get(key)
+                        .and_then(Value::as_object)
+                        .filter(|r| r.contains_key("author"))
+                        .and_then(|r| r.get("uri").and_then(Value::as_str))
+                        .and_then(|u| overlay.post_slot(u));
+                    if let Some(r) = replacement {
+                        reply.insert(key.to_string(), r);
+                    }
+                }
+            }
             let post_like = is_post_view(m) || ty == "app.bsky.embed.record#viewRecord";
+            // 6. The marker, on what the gate let through.
+            let marked = if post_like {
+                uri.as_deref().and_then(uri_author).and_then(|a| overlay.restored.get(a))
+            } else if is_profile_view(m) {
+                m.get("did").and_then(Value::as_str).and_then(|d| overlay.restored.get(d))
+            } else {
+                None
+            };
+            if let Some(marker) = marked {
+                m.insert("restored".into(), marker.clone());
+            }
             // 1. Content stripping, before labels go.
             if post_like
                 && let Some(uri) = &uri
@@ -349,5 +459,61 @@ mod tests {
         assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/5"));
         assert!(v["warned"].get("labels").is_none() && v["bare"].get("labels").is_none(), "{v}");
         assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/1"));
+    }
+
+    /// Refract T-8ah, T-8al, T-8am, T-13 (refract design §7.2 step 4,
+    /// §7.3): a thread node the gate does not list becomes a whole
+    /// `notFoundPost` with no replies; a reply ref one too; a hidden quote
+    /// becomes `viewNotFound`, a collapsed one stays; a quote by a blocked
+    /// author `viewBlocked` with its author; a list embed by a hidden
+    /// creator `viewNotFound`, a top-level list array untouched; the marker
+    /// sits on visible post and profile views only.
+    #[test]
+    fn nested_views_are_gated_and_marked() {
+        use crate::moderation::HiddenReason;
+        let p = |n: &str, author: &str| format!("at://{author}/app.bsky.feed.post/{n}");
+        let pv = |uri: &str, author: &str| json!({"$type": "app.bsky.feed.defs#postView", "uri": uri, "cid": "c", "author": {"did": author, "handle": "h.test"}, "record": {"text": "t"}, "indexedAt": "2026-01-01T00:00:00Z"});
+        let (ok, gone, hide, blocker, restored) = ("did:plc:ok", "did:plc:gone", "did:plc:hide", "did:plc:blocker", "did:plc:restored");
+        let mut quoting = pv(&p("q", ok), ok);
+        quoting["embed"] = json!({"$type": "app.bsky.embed.record#view", "record": {"$type": "app.bsky.embed.record#viewRecord", "uri": p("1", gone), "cid": "c", "author": {"did": gone, "handle": "g"}, "value": {"text": "x"}}});
+        let mut collapsed = pv(&p("c", ok), ok);
+        collapsed["embed"] = json!({"$type": "app.bsky.embed.recordWithMedia#view", "record": {"$type": "app.bsky.embed.record#view", "record": {"$type": "app.bsky.embed.record#viewRecord", "uri": p("1", hide), "cid": "c", "author": {"did": hide, "handle": "g"}, "value": {"text": "x"}}}, "media": {}});
+        let mut blocked_quote = pv(&p("b", ok), ok);
+        blocked_quote["embed"] = json!({"$type": "app.bsky.embed.record#view", "record": {"$type": "app.bsky.embed.record#viewRecord", "uri": p("1", blocker), "cid": "c", "author": {"did": blocker, "handle": "g"}, "value": {"text": "x"}}});
+        let mut list_embed = pv(&p("l", ok), ok);
+        list_embed["embed"] = json!({"$type": "app.bsky.embed.record#view", "record": {"$type": "app.bsky.graph.defs#listView", "uri": format!("at://{gone}/app.bsky.graph.list/1"), "creator": {"did": gone, "handle": "g"}, "name": "L"}});
+        let mut v = json!({
+            "thread": {"$type": "app.bsky.feed.defs#threadViewPost", "post": pv(&p("root", restored), restored), "replies": [
+                {"$type": "app.bsky.feed.defs#threadViewPost", "post": pv(&p("2", gone), gone), "replies": [{"$type": "app.bsky.feed.defs#threadViewPost", "post": pv(&p("3", ok), ok)}]},
+                {"$type": "app.bsky.feed.defs#threadViewPost", "post": pv(&p("2", hide), hide)}
+            ]},
+            "feed": [{"post": pv(&p("f", ok), ok), "reply": {"root": pv(&p("1", gone), gone), "parent": pv(&p("1", blocker), blocker)}}],
+            "quotes": [quoting, collapsed, blocked_quote, list_embed],
+            "lists": [{"$type": "app.bsky.graph.defs#listView", "uri": format!("at://{gone}/app.bsky.graph.list/1"), "creator": {"did": gone, "handle": "g"}, "name": "L"}]
+        });
+        let mut overlay = Overlay::default();
+        overlay.hidden.insert(p("2", gone), Gate::Hidden(HiddenReason::Takedown));
+        overlay.hidden.insert(p("1", gone), Gate::Hidden(HiddenReason::Takedown));
+        overlay.hidden.insert(gone.to_string(), Gate::Hidden(HiddenReason::Takedown));
+        overlay.hidden.insert(p("2", hide), Gate::Collapsed);
+        overlay.hidden.insert(p("1", hide), Gate::Collapsed);
+        overlay.hidden_creators.insert(gone.to_string());
+        overlay.blocked.insert(blocker.to_string());
+        overlay.restored.insert(restored.to_string(), json!({"community": "sky", "tier": 1}));
+        normalize_upstream(&mut v, &overlay);
+        let replies = &v["thread"]["replies"];
+        assert_eq!(replies[0], json!({"$type": "app.bsky.feed.defs#notFoundPost", "uri": p("2", gone), "notFound": true}), "the whole node, no replies");
+        assert_eq!(replies[1]["$type"], "app.bsky.feed.defs#notFoundPost", "a collapsed post is not listed in a thread");
+        assert_eq!(v["feed"][0]["reply"]["root"]["$type"], "app.bsky.feed.defs#notFoundPost");
+        assert_eq!(v["feed"][0]["reply"]["parent"]["$type"], "app.bsky.feed.defs#blockedPost");
+        assert_eq!(v["feed"][0]["reply"]["parent"]["author"]["did"], blocker);
+        assert_eq!(v["quotes"][0]["embed"]["record"]["$type"], "app.bsky.embed.record#viewNotFound");
+        assert_eq!(v["quotes"][1]["embed"]["record"]["record"]["$type"], "app.bsky.embed.record#viewRecord", "a collapsed quote stays");
+        assert_eq!(v["quotes"][2]["embed"]["record"]["$type"], "app.bsky.embed.record#viewBlocked");
+        assert_eq!(v["quotes"][3]["embed"]["record"]["$type"], "app.bsky.embed.record#viewNotFound");
+        assert_eq!(v["lists"][0]["$type"], "app.bsky.graph.defs#listView", "top-level arrays are the callers'");
+        assert_eq!(v["thread"]["post"]["restored"], json!({"community": "sky", "tier": 1}));
+        assert_eq!(v["thread"]["post"]["author"]["restored"], json!({"community": "sky", "tier": 1}));
+        assert_eq!(v.to_string().matches("\"restored\":{").count(), 2, "on visible views of the restored account only");
     }
 }

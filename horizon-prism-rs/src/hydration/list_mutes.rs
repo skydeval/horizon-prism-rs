@@ -314,6 +314,7 @@ mod tests {
         let known = std::sync::Arc::new(crate::hydration::KnownBlocks {
             by_viewer: [CAROL.to_string()].into(),
             of_viewer: [BOB.to_string(), ALICE.to_string()].into(),
+            ..Default::default()
         });
         let s = crate::hydration::with_known_blocks(known, h.actor_viewer(&me, &[CAROL.to_string(), BOB.to_string(), ALICE.to_string()]))
             .await
@@ -364,10 +365,10 @@ mod tests {
         assert_eq!(viewer["muted"], json!(true));
         assert_eq!((&viewer["mutedByList"]["uri"], &viewer["mutedByList"]["name"]), (&json!(outside), &json!("Outside")));
         let view = json!({"uri": post, "cid": "bafyfar", "author": {"did": FAR, "handle": "far.example"}, "record": {"text": "far"}});
-        let (view, _) = h.normalized(&me, &req, view).await.expect("db");
+        let (view, _, _) = h.normalized(&me, &req, view).await.expect("db");
         assert_eq!(view["author"]["viewer"]["mutedByList"]["uri"], json!(outside));
         // Another viewer's view of the same subject names no list.
-        let (view, _) = h.normalized(&Viewer::anonymous(), &req, view).await.expect("db");
+        let (view, _, _) = h.normalized(&Viewer::anonymous(), &req, view).await.expect("db");
         assert!(view["author"]["viewer"].get("mutedByList").is_none());
         db.drop_db().await;
     }
@@ -390,6 +391,7 @@ mod tests {
             std::sync::Arc::new(crate::hydration::KnownBlocks {
                 by_viewer: [CAROL.to_string()].into(),
                 of_viewer: [BOB.to_string(), ALICE.to_string()].into(),
+                ..Default::default()
             })
         };
 

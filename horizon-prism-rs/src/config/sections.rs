@@ -1941,6 +1941,8 @@ pub struct RateLimitsConfig {
     /// one bucket per proxied service and key.
     pub service_proxy_member: RateClassConfig,
     pub service_proxy_ip: RateClassConfig,
+    /// Refract's endpoints (refract design §7.1), per caller DID.
+    pub refract: RateClassConfig,
     /// NSID to family name: moves one served endpoint to another family.
     pub endpoint_class: BTreeMap<String, String>,
 }
@@ -1960,6 +1962,7 @@ impl Default for RateLimitsConfig {
             global: RateClassConfig::new(100.0, 200),
             service_proxy_member: RateClassConfig::new(5.0, 20),
             service_proxy_ip: RateClassConfig::new(10.0, 20),
+            refract: RateClassConfig::new(5.0, 20),
             endpoint_class: BTreeMap::new(),
         }
     }
@@ -1968,7 +1971,7 @@ impl Default for RateLimitsConfig {
 impl RateLimitsConfig {
     /// Every class with its config key, in §10's order.
     #[must_use]
-    pub fn classes(&self) -> [(&'static str, RateClassConfig); 12] {
+    pub fn classes(&self) -> [(&'static str, RateClassConfig); 13] {
         [
             ("anon_read", self.anon_read),
             ("auth_read", self.auth_read),
@@ -1982,6 +1985,7 @@ impl RateLimitsConfig {
             ("global", self.global),
             ("service_proxy_member", self.service_proxy_member),
             ("service_proxy_ip", self.service_proxy_ip),
+            ("refract", self.refract),
         ]
     }
 }

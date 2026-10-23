@@ -18,6 +18,7 @@
 //! | `index_request` | DID | 0.5/s, 30 |
 //! | `resolve` | endpoint and IP | 10/s, 20 |
 //! | `global` | IP | 100/s, 200 (backstop) |
+//! | `refract` | DID | 5/s, 20 |
 //!
 //! Classes form **families**: a request is charged to its family's IP-keyed
 //! member when anonymous and to its DID-keyed member when authenticated.
@@ -55,10 +56,12 @@ pub enum Class {
     ServiceProxyMember,
     /// A proxied service's calls from everyone else, by IP key.
     ServiceProxyIp,
+    /// Refract's endpoints (refract design §7.1).
+    Refract,
 }
 
 impl Class {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::AnonRead,
         Self::AuthRead,
         Self::SearchAnon,
@@ -71,6 +74,7 @@ impl Class {
         Self::Global,
         Self::ServiceProxyMember,
         Self::ServiceProxyIp,
+        Self::Refract,
     ];
 
     fn config(self, cfg: &RateLimitsConfig) -> RateClassConfig {
@@ -87,6 +91,7 @@ impl Class {
             Self::Global => cfg.global,
             Self::ServiceProxyMember => cfg.service_proxy_member,
             Self::ServiceProxyIp => cfg.service_proxy_ip,
+            Self::Refract => cfg.refract,
         }
     }
 }
@@ -104,6 +109,8 @@ pub enum Family {
     IndexRequest,
     /// IP-keyed, with one bucket per endpoint.
     Resolve,
+    /// Refract's endpoints, per caller DID.
+    Refract,
 }
 
 impl Family {
@@ -118,6 +125,7 @@ impl Family {
             "thread_lens" => Self::ThreadLens,
             "index_request" => Self::IndexRequest,
             "resolve" => Self::Resolve,
+            "refract" => Self::Refract,
             _ => return None,
         })
     }
@@ -241,6 +249,13 @@ pub const SERVED: &[Served] = &[
     served("app.nearhorizon.threadLens.resolve", Family::ThreadLens, false),
     served("app.nearhorizon.index.requestRecord", Family::IndexRequest, false),
     served("app.nearhorizon.constellation.resolveDid", Family::Resolve, true),
+    served("app.nearhorizon.refract.fill", Family::Refract, false),
+    served("app.nearhorizon.refract.getReplies", Family::Refract, false),
+    served("app.nearhorizon.refract.getAuthorFeed", Family::Refract, false),
+    served("app.nearhorizon.refract.getPostThread", Family::Refract, false),
+    served("app.nearhorizon.refract.getTimeline", Family::Refract, false),
+    served("app.nearhorizon.refract.listNotifications", Family::Refract, false),
+    served("app.nearhorizon.refract.getUnreadCount", Family::Refract, false),
 ];
 
 /// Methods charged more than one token of their bucket. A private search
@@ -263,6 +278,7 @@ fn authenticated_class(family: Family) -> Class {
         Family::ThreadLens => Class::ThreadLens,
         Family::IndexRequest => Class::IndexRequest,
         Family::Resolve => Class::Resolve,
+        Family::Refract => Class::Refract,
     }
 }
 

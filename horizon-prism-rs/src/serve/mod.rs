@@ -1024,6 +1024,12 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .merge(crate::private_tier::handlers::router(private_state))
         .merge(crate::constellation::resolve_did::router(resolve_did))
         .merge(crate::threadlens::router(thread_lens))
+        .merge(crate::refract::handlers::router(crate::refract::handlers::RefractState {
+            app: app.clone(),
+            refract: refract.clone(),
+            discovery: Arc::default(),
+            round_timeout: Duration::from_millis(u64::from(cfg.file.threadlens.verdict_round_timeout_ms)),
+        }))
         .merge(crate::xrpc::router::index_router(index))
         .merge(health::router(state));
     // Every router has registered its methods by now.

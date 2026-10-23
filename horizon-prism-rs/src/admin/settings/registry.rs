@@ -220,7 +220,7 @@ const FLOORS: [(&str, &str); 12] = [
 ];
 
 /// The rate classes (§8.7 Group 7), with what each limits.
-const RATE_CLASSES: [(&str, &str, &str); 12] = [
+const RATE_CLASSES: [(&str, &str, &str); 13] = [
     ("anon_read", "Visitors not signed in", "Requests per second one visitor who is not signed in may make, and how many at once."),
     ("auth_read", "Signed-in accounts", "Requests per second one signed-in account may make to read, and how many at once."),
     ("search_anon", "Searches by visitors not signed in", "Searches per second one visitor who is not signed in may make, and how many at once."),
@@ -233,6 +233,7 @@ const RATE_CLASSES: [(&str, &str, &str); 12] = [
     ("global", "Everything from one address", "Requests per second from one address in all, whatever they are, and how many at once."),
     ("service_proxy_member", "Extra services, members", "Requests per second one member may pass on to an extra service, and how many at once."),
     ("service_proxy_ip", "Extra services, others", "Requests per second one address may pass on to an extra service, and how many at once."),
+    ("refract", "Accounts kept from other communities", "Requests per second one signed-in account may make for accounts other communities still host, and how many at once."),
 ];
 
 /// Every editable setting, in page order. `networks` are the routing

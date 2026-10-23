@@ -16,10 +16,12 @@
 pub mod checker;
 pub mod communities;
 pub mod config_task;
+pub mod handlers;
 pub mod labels;
 pub mod net;
 pub mod poll;
 pub mod purge;
+pub mod serve_check;
 pub mod snapshot;
 pub mod state;
 #[cfg(test)]
@@ -103,6 +105,58 @@ impl Refract {
     #[must_use]
     pub fn net(&self) -> &net::RefractNet {
         &self.inner.net
+    }
+
+    /// The identity resolver Refract uses (internal, the directory).
+    #[must_use]
+    pub fn resolver(&self) -> &IdentityResolver {
+        &self.inner.resolver
+    }
+
+    /// Insert `did`, whose PDS is on `host`, as a candidate due now, or
+    /// make a `rejected` row a candidate again (§4.4). Refused (`false`)
+    /// when no enabled community hosts it or a purge of it runs; any other
+    /// existing row is left alone (`true`: it is known).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn insert_candidate(&self, did: &str, host: &str, source: &str) -> Result<bool, sqlx::Error> {
+        let communities = self.communities();
+        let Some(home) = communities.home(host) else {
+            return Ok(false);
+        };
+        let mut sets = self.inner.scope.write_guard().await;
+        let mut tx = self.inner.pool.begin().await?;
+        let purging: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM purging_dids WHERE did = $1)").bind(did).fetch_one(&mut *tx).await?;
+        if purging {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let from: Option<Option<String>> = sqlx::query_scalar(
+            "WITH old AS (SELECT state FROM refract_dids WHERE did = $1)              INSERT INTO refract_dids (did, community, pds_host, state, source, candidate_since, next_check_at)              VALUES ($1, $2, $3, 'candidate', $4, now(), now())              ON CONFLICT (did) DO UPDATE SET state = 'candidate', community = EXCLUDED.community, pds_host = EXCLUDED.pds_host,                source = EXCLUDED.source, candidate_since = now(), next_check_at = now(), attempts = 0,                version = refract_dids.version + 1, updated_at = now()              WHERE refract_dids.state = 'rejected'              RETURNING (SELECT state FROM old)",
+        )
+        .bind(did)
+        .bind(&home.name)
+        .bind(host)
+        .bind(source)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(from) = from else {
+            tx.rollback().await?;
+            return Ok(true);
+        };
+        sqlx::query("INSERT INTO refract_events (did, from_state, to_state, reason) VALUES ($1, $2, 'candidate', $3)")
+            .bind(did)
+            .bind(&from)
+            .bind(source)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        state::refresh(&self.inner.pool, &mut sets, Some(&[did.to_string()]), &communities).await?;
+        drop(sets);
+        self.inner.due.notify_one();
+        Ok(true)
     }
 
     /// `refract.enabled`, read live.
@@ -211,6 +265,16 @@ impl Refract {
         state::refresh(&self.inner.pool, &mut sets, Some(&[did.to_string()]), &communities).await?;
         Ok(true)
     }
+}
+
+/// The restored marker of a community (refract design §7.3).
+#[must_use]
+pub fn marker(c: &crate::config::RefractCommunity) -> serde_json::Value {
+    let mut m = serde_json::json!({"community": c.name, "tier": c.tier});
+    if let Some(l) = &c.labeler_did {
+        m["labeler"] = serde_json::json!(l);
+    }
+    m
 }
 
 /// Make `dids` due now (§4.3 "Due now").
