@@ -22,6 +22,16 @@ const THIRD: &str = "did:plc:thirdaaaaaaaaaaaaaaaaaaa";
 const FOURTH: &str = "did:plc:fourthaaaaaaaaaaaaaaaaaa";
 
 async fn serve(h: &Harness, farsight: Option<crate::farsight::Farsight>) -> String {
+    let state = refract_state(h, farsight);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await.expect("serve");
+    });
+    format!("http://{addr}")
+}
+
+fn refract_state(h: &Harness, farsight: Option<crate::farsight::Farsight>) -> RefractState {
     let fetcher = StubFetcher::default();
     fetcher.set_key(VISITOR, signing_key(3));
     let (auth, _d) = verifier(fetcher, 10, 4);
@@ -34,7 +44,7 @@ async fn serve(h: &Harness, farsight: Option<crate::farsight::Farsight>) -> Stri
         ReadCache::new(1024 * 1024),
         HydrationConfig { live: h.live.clone(), farsight, ..test_config() },
     );
-    let state = RefractState {
+    RefractState {
         app: AppState {
             hydrator,
             auth: Arc::new(auth),
@@ -47,13 +57,7 @@ async fn serve(h: &Harness, farsight: Option<crate::farsight::Farsight>) -> Stri
         refract: h.refract.clone(),
         discovery: Arc::default(),
         round_timeout: Duration::from_millis(500),
-    };
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    tokio::spawn(async move {
-        axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await.expect("serve");
-    });
-    format!("http://{addr}")
+    }
 }
 
 async fn call(base: &str, method: &str, query: &str, aud_fragment: Option<&str>) -> (u16, Value) {
@@ -248,6 +252,36 @@ async fn fill_names_what_it_could_not_fetch() {
     assert_eq!(body["posts"].as_array().map(Vec::len), Some(1), "{body}");
     assert_eq!(body["profiles"].as_array().map(Vec::len), Some(1), "{body}");
     assert_eq!(body["withheld"], json!([{"id": FOURTH, "reason": "unavailable"}, {"id": unfetched, "reason": "unavailable"}]), "{body}");
+    db.drop_db().await;
+}
+
+/// RF-S16: an account the checker restores after the request's snapshot
+/// was taken (the snapshot here predates the row) is reported `pending`,
+/// never dropped as if final; one restored and pending removal stays out.
+#[tokio::test]
+async fn restored_after_the_snapshot_is_pending() {
+    let Some(db) = fresh_db("refract_endpoint_snapshot_race").await else {
+        return;
+    };
+    let h = Harness::new(&db.pool, ScopeSets::default(), vec![tier1()]).await;
+    let s = refract_state(&h, None);
+    // The request's snapshot, taken before the restore.
+    let stale = crate::refract::RefractSnapshot::default();
+    h.row(OTHER, "sky", "restored").await;
+    h.row(FOURTH, "sky", "restored").await;
+    exec(&h.pool, "INSERT INTO refract_pending (scope) VALUES ('test')").await;
+    exec(&h.pool, &format!("INSERT INTO refract_pending_dids (did, scope) VALUES ('{FOURTH}', 'test')")).await;
+    let caller = crate::refract::handlers::Caller {
+        did: VISITOR.to_string(),
+        viewer: crate::hydration::Viewer { did: Some(VISITOR.to_string()), hydrate: false },
+        req: crate::xrpc::pools::Requester::test(),
+        ip: "192.0.2.1".parse().expect("ip"),
+        member: false,
+        direct: true,
+    };
+    let found = s.discover(&caller, &[OTHER.to_string(), FOURTH.to_string()], &stale).await.expect("discover");
+    assert_eq!(found.pending, [OTHER], "{found:?}");
+    assert!(found.withheld.is_empty(), "{found:?}");
     db.drop_db().await;
 }
 

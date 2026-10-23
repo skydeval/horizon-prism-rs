@@ -10,6 +10,10 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (Refract fill: restored mid-request, #855, #867)
+
+- **An account restored while a `fill` runs is `pending`, not dropped.** The request's restored set is taken before discovery reads each account's row; when the checker restored the account in between, `fill` left it out with nothing said, which the lexicon calls final. Now such an account (restored, not pending removal) is reported in `pending`, so the next `fill` serves it.
+
 ### Added (Refract fill: unavailable, #855, #866)
 
 - **`fill` names what it couldn't fetch.** A `withheld` reason `unavailable` (not final) for a named restored profile or post left out because it couldn't be fetched this time: a post neither stored nor returned upstream (not hidden by the gate and not seen deleted), or a restored account with no stored profile record and no remote view (no AppView answered and Slingshot gave no `RecordNotFound`), which before came back as a bare stub. Hidden, taken-down and seen-deleted items stay final and unlisted. The `fill` lexicon now says an absent item is final unless it is in `withheld` or `pending`, or is a URI whose author is in `pending`.

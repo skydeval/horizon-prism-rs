@@ -483,8 +483,22 @@ impl RefractState {
                     continue;
                 }
                 Some(("rejected", true)) | None => {}
-                // Restored but pending removal, rejected not yet
-                // re-eligible, or ending: nothing to start.
+                // Restored after this request's snapshot was taken (the
+                // checker ran in between): not served this time, so
+                // `pending`, never a silent omission (RF-S16). Restored
+                // and pending removal stays out.
+                Some(("restored", _)) => {
+                    let removing: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM refract_pending_dids WHERE did = $1)")
+                        .bind(did)
+                        .fetch_one(pool)
+                        .await?;
+                    if !removing {
+                        pending.push(did.clone());
+                    }
+                    continue;
+                }
+                // Rejected not yet re-eligible, grace or ending: nothing to
+                // start.
                 Some(_) => continue,
             }
             // Found on no listed community lately: nothing to start, no cap.
