@@ -510,14 +510,22 @@ impl Hydrator {
         Ok(complete.then_some(false))
     }
 
-    /// Whether the root's `allow` rules admit `replier`. `None` when no
+    /// Whether the root's `allow` rules admit `replier`: `false` too when no
     /// rule admits it and one couldn't be evaluated (dropped: fail closed).
     async fn refract_admitted(&self, req: &Requester, root_author: &str, rules: &[Value], replier: &str, mentions: Option<&HashSet<String>>) -> Result<bool, sqlx::Error> {
+        Ok(self.refract_admission(req, root_author, rules, replier, mentions).await? == Some(true))
+    }
+
+    /// The root's `allow` rules for `replier`, three-valued: `Some(true)` a
+    /// rule admits it, `Some(false)` every rule was evaluated and none does,
+    /// `None` none admits it and one couldn't be evaluated.
+    async fn refract_admission(&self, req: &Requester, root_author: &str, rules: &[Value], replier: &str, mentions: Option<&HashSet<String>>) -> Result<Option<bool>, sqlx::Error> {
         let members: Vec<String> = sqlx::query_scalar("SELECT did FROM members WHERE did = ANY($1)")
             .bind(vec![root_author.to_string(), replier.to_string()])
             .fetch_all(self.pool())
             .await?;
         let local = !members.is_empty();
+        let mut complete = true;
         for rule in rules {
             let allowed = match rule.get("$type").and_then(Value::as_str).unwrap_or_default() {
                 "app.bsky.feed.threadgate#mentionRule" => mentions.map(|m| m.contains(replier)),
@@ -529,11 +537,13 @@ impl Hydrator {
                 },
                 _ => None,
             };
-            if allowed == Some(true) {
-                return Ok(true);
+            match allowed {
+                Some(true) => return Ok(Some(true)),
+                Some(false) => {}
+                None => complete = false,
             }
         }
-        Ok(false)
+        Ok(complete.then_some(false))
     }
 
     /// The DIDs the root post mentions, from its stored row or its record.
@@ -677,5 +687,252 @@ impl Hydrator {
             .filter_map(|u| ctx.post_view(u))
             .collect();
         Ok(Self::emit(json!({ "posts": posts })))
+    }
+}
+
+/// Restored posts given a visitor's `like` and `repost` per request (RF-S1).
+pub const VISITOR_POSTS: usize = 20;
+/// Restored accounts given a visitor's `following` per request.
+pub const VISITOR_ACCOUNTS: usize = 10;
+/// Thread roots judged for a visitor's `replyDisabled` per request.
+pub const VISITOR_ROOTS: usize = 5;
+/// One Constellation call for a visitor's own record.
+const VISITOR_CALL_TIMEOUT: Duration = Duration::from_millis(800);
+/// No call for a visitor's viewer state starts later than this into the
+/// step.
+const VISITOR_BUDGET: Duration = Duration::from_secs(1);
+const VISITOR_CONCURRENCY: usize = 8;
+/// `refract_viewer_state_total{field, outcome}`: a visitor's viewer-state
+/// fields, `found`, `none` or `unknown`.
+pub const METRIC_VIEWER_STATE: &str = "refract_viewer_state_total";
+
+/// A visitor's own-record field, and where Constellation keeps its links.
+#[derive(Debug, Clone, Copy)]
+enum OwnField {
+    Like,
+    Repost,
+    Following,
+}
+
+impl OwnField {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Like => "like",
+            Self::Repost => "repost",
+            Self::Following => "following",
+        }
+    }
+
+    fn collection(self) -> &'static str {
+        match self {
+            Self::Like => super::thread::NSID_LIKE,
+            Self::Repost => super::feed::NSID_REPOST,
+            Self::Following => super::graph::NSID_FOLLOW,
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::Like | Self::Repost => ".subject.uri",
+            Self::Following => ".subject",
+        }
+    }
+}
+
+/// What a visitor's viewer state is looked up for, in document order.
+#[derive(Default)]
+struct VisitorTargets {
+    posts: Vec<String>,
+    accounts: Vec<String>,
+    roots: Vec<String>,
+    /// Each post of `posts` → its thread root.
+    root_of: HashMap<String, String>,
+}
+
+/// A profile view whose viewer carries a block either way.
+fn block_marked(m: &serde_json::Map<String, Value>) -> bool {
+    m.get("viewer").is_some_and(|v| {
+        v.get("blockedBy").and_then(Value::as_bool) == Some(true) || v.get("blocking").is_some() || v.get("blockingByList").is_some()
+    })
+}
+
+fn visitor_targets(v: &Value, t: &mut VisitorTargets) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| visitor_targets(x, t)),
+        Value::Object(m) => {
+            if m.contains_key("restored") {
+                if super::normalize::is_post_view(m)
+                    && let Some(u) = m.get("uri").and_then(Value::as_str)
+                {
+                    if !t.root_of.contains_key(u) && t.posts.len() < VISITOR_POSTS {
+                        t.posts.push(u.to_string());
+                        let root = m.get("record").and_then(|r| r.pointer("/reply/root/uri")).and_then(Value::as_str).unwrap_or(u).to_string();
+                        if !t.roots.contains(&root) && t.roots.len() < VISITOR_ROOTS {
+                            t.roots.push(root.clone());
+                        }
+                        t.root_of.insert(u.to_string(), root);
+                    }
+                } else if super::normalize::is_profile_view(m)
+                    && let Some(d) = m.get("did").and_then(Value::as_str)
+                    && !block_marked(m)
+                    && !t.accounts.iter().any(|a| a == d)
+                    && t.accounts.len() < VISITOR_ACCOUNTS
+                {
+                    t.accounts.push(d.to_string());
+                }
+            }
+            m.values().for_each(|x| visitor_targets(x, t));
+        }
+        _ => {}
+    }
+}
+
+/// Write a visitor's viewer state into every restored view it was found
+/// for.
+fn apply_visitor_state(v: &mut Value, found: &HashMap<(&'static str, String), String>, disabled: &HashMap<String, bool>, root_of: &HashMap<String, String>) {
+    match v {
+        Value::Array(a) => a.iter_mut().for_each(|x| apply_visitor_state(x, found, disabled, root_of)),
+        Value::Object(m) => {
+            if m.contains_key("restored") {
+                let mut fields: Vec<(&str, Value)> = Vec::new();
+                if super::normalize::is_post_view(m)
+                    && let Some(u) = m.get("uri").and_then(Value::as_str).map(str::to_string)
+                {
+                    for field in ["like", "repost"] {
+                        if let Some(r) = found.get(&(field, u.clone())) {
+                            fields.push((field, json!(r)));
+                        }
+                    }
+                    if let Some(d) = root_of.get(&u).and_then(|r| disabled.get(r)) {
+                        fields.push(("replyDisabled", json!(d)));
+                    }
+                } else if super::normalize::is_profile_view(m)
+                    && !block_marked(m)
+                    && let Some(r) = m.get("did").and_then(Value::as_str).and_then(|d| found.get(&("following", d.to_string())))
+                {
+                    fields.push(("following", json!(r)));
+                }
+                if !fields.is_empty() {
+                    let viewer = m.entry("viewer").or_insert_with(|| json!({}));
+                    if !viewer.is_object() {
+                        *viewer = json!({});
+                    }
+                    for (k, x) in fields {
+                        viewer[k] = x;
+                    }
+                }
+            }
+            m.values_mut().for_each(|x| apply_visitor_state(x, found, disabled, root_of));
+        }
+        _ => {}
+    }
+}
+
+impl Hydrator {
+    /// RF-S1: a visitor's own record linking to `target` from `collection`
+    /// at `path`, through one Constellation `links` call filtered to `me`,
+    /// drawn from the caller's share without marking the request. `None`
+    /// when it can't be known (no Constellation, no share, an error, a
+    /// server that ignored the filter); `Some(None)` for no record.
+    async fn refract_own_link(&self, req: &Requester, me: &str, target: &str, collection: &str, path: &str) -> Option<Option<String>> {
+        let client = self.backlinks()?;
+        if self.constellation_bucket().is_some_and(|b| b.draw(req.key()).is_err()) {
+            return None;
+        }
+        let page = tokio::time::timeout(VISITOR_CALL_TIMEOUT, client.links_by(target, collection, path, me, 1)).await.ok()?.ok()?;
+        if page.linking_records.iter().any(|r| r.did != me || r.collection != collection) {
+            return None;
+        }
+        Some(page.linking_records.first().map(|r| format!("at://{}/{}/{}", r.did, r.collection, r.rkey)))
+    }
+
+    /// RF-S1: whether `me` may not reply in the thread of `root`, from the
+    /// root's threadgate as `getReplies` reads it. `None` when it can't be
+    /// known; never `true` on an unevaluated rule.
+    async fn refract_reply_disabled(&self, req: &Requester, me: &str, root: &str) -> Result<Option<bool>, sqlx::Error> {
+        let Some(author) = uri_author(root) else {
+            return Ok(None);
+        };
+        if author == me {
+            return Ok(Some(false));
+        }
+        let Some(rules) = self.refract_root_rules(req, root).await? else {
+            return Ok(None);
+        };
+        let Some(allow) = rules.allow else {
+            return Ok(Some(false));
+        };
+        if allow.is_empty() {
+            return Ok(Some(true));
+        }
+        let mentions = if allow.iter().any(|r| r.get("$type").and_then(Value::as_str) == Some("app.bsky.feed.threadgate#mentionRule")) {
+            self.refract_root_mentions(req, root).await?
+        } else {
+            None
+        };
+        Ok(self.refract_admission(req, author, &allow, me, mentions.as_ref()).await?.map(|admitted| !admitted))
+    }
+
+    /// RF-S1: a visitor's viewer state on the restored views of `body`:
+    /// `viewer.like` and `viewer.repost` on restored posts, `viewer.following`
+    /// on restored accounts (not across a block), from the caller's own
+    /// records on Constellation; `viewer.replyDisabled` from each post's
+    /// root threadgate. Capped per request; a field that can't be known
+    /// stays absent. Nothing is stored or cached.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn refract_visitor_state(&self, me: &str, req: &Requester, body: PublicEmit<Value>) -> Result<PublicEmit<Value>, HydrationError> {
+        use futures::StreamExt;
+        let mut t = VisitorTargets::default();
+        visitor_targets(body.inner(), &mut t);
+        if t.posts.is_empty() && t.accounts.is_empty() {
+            return Ok(body);
+        }
+        let started = std::time::Instant::now();
+        let mut asks: Vec<(OwnField, String)> = Vec::new();
+        for p in &t.posts {
+            asks.push((OwnField::Like, p.clone()));
+            asks.push((OwnField::Repost, p.clone()));
+        }
+        for d in &t.accounts {
+            asks.push((OwnField::Following, d.clone()));
+        }
+        let answers: Vec<(OwnField, String, Option<Option<String>>)> = futures::stream::iter(asks)
+            .map(|(field, target)| async move {
+                let got = if started.elapsed() >= VISITOR_BUDGET { None } else { self.refract_own_link(req, me, &target, field.collection(), field.path()).await };
+                (field, target, got)
+            })
+            .buffer_unordered(VISITOR_CONCURRENCY)
+            .collect()
+            .await;
+        let mut found: HashMap<(&'static str, String), String> = HashMap::new();
+        for (field, target, got) in answers {
+            let outcome = match got {
+                Some(Some(uri)) => {
+                    found.insert((field.name(), target), uri);
+                    "found"
+                }
+                Some(None) => "none",
+                None => "unknown",
+            };
+            metrics::counter!(METRIC_VIEWER_STATE, "field" => field.name(), "outcome" => outcome).increment(1);
+        }
+        let mut disabled: HashMap<String, bool> = HashMap::new();
+        for root in &t.roots {
+            let got = if started.elapsed() >= VISITOR_BUDGET { None } else { self.refract_reply_disabled(req, me, root).await? };
+            let outcome = match got {
+                Some(d) => {
+                    disabled.insert(root.clone(), d);
+                    "found"
+                }
+                None => "unknown",
+            };
+            metrics::counter!(METRIC_VIEWER_STATE, "field" => "replyDisabled", "outcome" => outcome).increment(1);
+        }
+        let mut view = body.inner().clone();
+        apply_visitor_state(&mut view, &found, &disabled, &t.root_of);
+        Ok(Self::emit(view))
     }
 }

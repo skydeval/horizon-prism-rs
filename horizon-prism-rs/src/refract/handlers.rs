@@ -3,7 +3,9 @@
 //! - **Who may call** (C-3): any signed-in caller with a verified token. A
 //!   ready member is served with member viewer state and its Farsight
 //!   handle; anyone else, a member that is not ready included, as a
-//!   **visitor**: no viewer state beyond the request's known blocks.
+//!   **visitor**: no stored viewer state beyond the request's known
+//!   blocks; restored views get the visitor's own like, repost, follow
+//!   and `replyDisabled`, looked up per request and kept nowhere (RF-S1).
 //!   Readiness errors are never answered here.
 //! - **The request is public, never private**: a public `Requester`, never
 //!   `HydrationContext::Private`.
@@ -282,6 +284,21 @@ where
         return with_known_blocks(b.known(), build()).await;
     }
     Ok(first)
+}
+
+/// A visitor's own viewer state on the restored views of a built body
+/// (RF-S1); a ready member's answer is left as built.
+async fn visitor_state(s: &RefractState, caller: &Caller, result: XrpcResult) -> XrpcResult {
+    match result {
+        Ok(Json(body)) if caller.visitor() => s
+            .app
+            .hydrator
+            .refract_visitor_state(&caller.did, &caller.req, body)
+            .await
+            .map(Json)
+            .map_err(Into::into),
+        other => other,
+    }
 }
 
 /// The in-memory caps on candidate creation (§7.1 "Abuse bounds"), in
@@ -579,6 +596,7 @@ pub async fn fill(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<
         h.refract_fill(&caller.viewer, &caller.req, &profiles, &posts, &pending).await.map(Json).map_err(Into::into)
     })
     .await;
+    let result = visitor_state(&s, &caller, result).await;
     metrics::counter!(METRIC_READS, "method" => "fill", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }
@@ -603,6 +621,7 @@ pub async fn get_post_thread(State(s): State<RefractState>, ConnectInfo(peer): C
         respond(&caller.req, h.get_post_thread(&caller.viewer, &caller.req, &uri, depth, parent_height).await)
     })
     .await;
+    let result = visitor_state(&s, &caller, result).await;
     metrics::counter!(METRIC_READS, "method" => "getPostThread", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }
@@ -644,6 +663,7 @@ pub async fn get_author_feed(State(s): State<RefractState>, ConnectInfo(peer): C
         h.refract_feed(&caller.viewer, &caller.req, &items, next.as_deref(), FEED_SUBJECT_CAP).await.map(Json).map_err(Into::into)
     })
     .await;
+    let result = visitor_state(&s, &caller, result).await;
     metrics::counter!(METRIC_READS, "method" => "getAuthorFeed", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }
@@ -677,6 +697,7 @@ pub async fn get_timeline(State(s): State<RefractState>, ConnectInfo(peer): Conn
         h.refract_feed(&caller.viewer, &caller.req, &items, next.as_deref(), FEED_SUBJECT_CAP).await.map(Json).map_err(Into::into)
     })
     .await;
+    let result = visitor_state(&s, &caller, result).await;
     metrics::counter!(METRIC_READS, "method" => "getTimeline", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }
@@ -698,6 +719,7 @@ pub async fn get_replies(State(s): State<RefractState>, ConnectInfo(peer): Conne
     s.refract.serve_check(&caller.req, &uris).await;
     let mut blocks = Blocks::new(&s, &caller);
     let result = h.refract_replies(&caller.viewer, &caller.req, &root, rows, blocks.as_mut(), s.round_timeout).await.map(Json).map_err(Into::into);
+    let result = visitor_state(&s, &caller, result).await;
     metrics::counter!(METRIC_READS, "method" => "getReplies", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }

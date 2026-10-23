@@ -125,3 +125,79 @@ async fn t14_replies_and_the_threadgate() {
     assert_eq!(replies(&h, &open, &anon).await, [d], "no threadgate: every reply");
     db.drop_db().await;
 }
+
+const VISITOR: &str = "did:plc:visitoraaaaaaaaaaaaaaaaa";
+
+/// A Constellation answering `links` filtered to a DID: the visitor liked
+/// `liked` and follows R1; for reposts it ignores the filter.
+async fn own_links(liked: String) -> String {
+    use axum::extract::RawQuery;
+    let router = axum::Router::new().route(
+        "/links",
+        axum::routing::get(move |RawQuery(q): RawQuery| {
+            let liked = liked.clone();
+            async move {
+                let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(q.unwrap_or_default().as_bytes()).into_owned().collect();
+                let (target, collection, did) = (q["target"].as_str(), q["collection"].as_str(), q.get("did").map(String::as_str));
+                let records = match (collection, did) {
+                    ("app.bsky.feed.like", Some(VISITOR)) if target == liked => json!([{"did": VISITOR, "collection": collection, "rkey": "3klike"}]),
+                    ("app.bsky.graph.follow", Some(VISITOR)) if target == R1 => json!([{"did": VISITOR, "collection": collection, "rkey": "3kfollow"}]),
+                    ("app.bsky.feed.repost", _) => json!([{"did": OTHER, "collection": collection, "rkey": "3kother"}]),
+                    _ => json!([]),
+                };
+                axum::Json(json!({"total": 1, "linking_records": records, "cursor": null}))
+            }
+        }),
+    );
+    crate::test_support::serve_fake(router).await
+}
+
+/// RF-S1: a visitor's restored views carry its own like (found), no
+/// repost (a server that ignored the filter: unknown, absent), its follow
+/// of the restored author, and `replyDisabled` from the root's threadgate
+/// (true under a mention rule that doesn't name it, false with no gate).
+#[tokio::test]
+async fn rf_s1_visitor_viewer_state() {
+    let Some(db) = fresh_db("refract_visitor_state").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(R1, "r1.test"), (R2, "r2.test"), (OTHER, "o.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    let gated = format!("at://{OTHER}/app.bsky.feed.post/3kgatedroot");
+    let open = format!("at://{OTHER}/app.bsky.feed.post/3kopenroot");
+    let a = post(p, R1, "3ka", "mentioned", Some(&gated), Some(&gated)).await;
+    let d = post(p, R2, "3kd", "open", Some(&open), Some(&open)).await;
+    let mut up = FixedUpstream::default();
+    up.records.insert(
+        gated.clone(),
+        json!({"uri": gated, "cid": "c", "value": {"text": "hi", "facets": [{"index": {"byteStart": 0, "byteEnd": 2}, "features": [{"$type": "app.bsky.richtext.facet#mention", "did": R1}]}]}}),
+    );
+    up.records.insert(
+        format!("at://{OTHER}/app.bsky.feed.threadgate/3kgatedroot"),
+        json!({"uri": "x", "cid": "c", "value": {"post": gated, "allow": [{"$type": "app.bsky.feed.threadgate#mentionRule"}]}}),
+    );
+    let base = own_links(a.clone()).await;
+    let h = crate::hydration::testing::hydrator_full(p, sets(), Arc::new(up), Some(&base));
+    let visitor = Viewer { did: Some(VISITOR.into()), hydrate: false };
+    let req = Requester::test();
+    let rows = h.refract_reply_rows(&gated, &restored()).await.expect("rows");
+    let body = h.refract_replies(&visitor, &req, &gated, rows, None, Duration::from_secs(1)).await.expect("replies");
+    let out = h.refract_visitor_state(VISITOR, &req, body).await.expect("state");
+    let got = &out.inner()["posts"][0];
+    assert_eq!(got["uri"], json!(a));
+    assert!(got.get("restored").is_some(), "{got}");
+    assert_eq!(got["viewer"]["like"], json!(format!("at://{VISITOR}/app.bsky.feed.like/3klike")), "{got}");
+    assert!(got["viewer"].get("repost").is_none(), "{got}");
+    assert_eq!(got["viewer"]["replyDisabled"], json!(true), "{got}");
+    assert_eq!(got["author"]["viewer"]["following"], json!(format!("at://{VISITOR}/app.bsky.graph.follow/3kfollow")), "{got}");
+    let rows = h.refract_reply_rows(&open, &restored()).await.expect("rows");
+    let body = h.refract_replies(&visitor, &req, &open, rows, None, Duration::from_secs(1)).await.expect("replies");
+    let out = h.refract_visitor_state(VISITOR, &req, body).await.expect("state");
+    let got = &out.inner()["posts"][0];
+    assert_eq!(got["uri"], json!(d));
+    assert_eq!(got["viewer"]["replyDisabled"], json!(false), "no gate: {got}");
+    assert!(got["viewer"].get("like").is_none() && got["author"]["viewer"].get("following").is_none(), "{got}");
+    db.drop_db().await;
+}

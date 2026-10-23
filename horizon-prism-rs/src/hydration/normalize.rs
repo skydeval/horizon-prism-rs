@@ -122,11 +122,11 @@ pub struct NormalizeReport {
     pub content_stripped: HashSet<String>,
 }
 
-fn is_post_view(m: &Map<String, Value>) -> bool {
+pub(super) fn is_post_view(m: &Map<String, Value>) -> bool {
     m.get("uri").and_then(Value::as_str).is_some() && m.contains_key("author") && m.contains_key("cid")
 }
 
-fn is_profile_view(m: &Map<String, Value>) -> bool {
+pub(super) fn is_profile_view(m: &Map<String, Value>) -> bool {
     m.get("did").and_then(Value::as_str).is_some() && m.contains_key("handle")
 }
 

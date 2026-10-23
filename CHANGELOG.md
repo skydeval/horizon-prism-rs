@@ -10,6 +10,10 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract visitor viewer state, #855, #858)
+
+- **A visitor's own likes, reposts and follows on restored views.** For a caller served in visitor form (a non-member, or a member not ready), the restored posts in a `fill`, `getPostThread`, `getAuthorFeed`, `getReplies` or (not-ready member) `getTimeline` answer carry `viewer.like` and `viewer.repost`, and restored profile views `viewer.following`, each the at-URI of the caller's own record, found through one Constellation `links` call per field filtered to the caller's DID (an answer with any other DID is ignored). `viewer.replyDisabled` comes from each post's root threadgate, as `getReplies` reads it; it is set only when known, so an outcome Prism couldn't evaluate leaves it out. Per request at most 20 restored posts, 10 restored accounts (not across a block) and 5 thread roots; 8 calls in flight, none started after 1 s, each drawn from the caller's Constellation share without turning the response into a 429. Nothing is stored or cached; a field Prism can't find out stays absent. Ready members are unchanged. Metric `refract_viewer_state_total{field, outcome}`.
+
 ### Fixed (Refract client fixes A, #855, #856)
 
 - **A `fill` no longer re-reports an account no listed community hosts.** When a `fill`'s background resolve finds a named DID on no enabled community (its document names no PDS, or a PDS no entry matches, or the registry has no usable document), the outcome is remembered in memory for 24 hours (at most 100,000 DIDs, lost at restart, nothing written anywhere). A further `fill` leaves the DID out of `pending` and charges none of the discovery caps. Any change of `refract.communities` forgets every remembered DID, so one a new or widened entry would host is resolved again. A resolve that fails for a reason worth retrying is not remembered. New `refract_candidates_total` outcomes `not_hosted_cached` and `resolve_failed`.
