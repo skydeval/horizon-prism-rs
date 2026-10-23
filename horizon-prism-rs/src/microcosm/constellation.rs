@@ -141,6 +141,20 @@ impl ConstellationClient {
         self.get(&url).await
     }
 
+    /// One page of records linking to `target` from `collection` at
+    /// `path`, filtered to those in the repository of `did` (Constellation's
+    /// `did` parameter, refract design §7.1). The caller checks every
+    /// returned record's DID: a server that ignores the filter is caught.
+    ///
+    /// # Errors
+    ///
+    /// Transport, status or decode failures.
+    pub async fn links_by(&self, target: &str, collection: &str, path: &str, did: &str, limit: u32) -> Result<LinksPage, ConstellationError> {
+        let limit = limit.to_string();
+        let url = self.url("/links", &[("target", target), ("collection", collection), ("path", path), ("did", did), ("limit", &limit)])?;
+        self.get(&url).await
+    }
+
     /// Distinct DIDs linking to `target` from `collection` at `path`.
     ///
     /// # Errors

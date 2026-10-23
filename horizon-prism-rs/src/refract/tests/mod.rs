@@ -8,6 +8,7 @@ mod notifications;
 mod reads;
 pub(crate) mod harness;
 mod storage;
+mod timeline;
 
 use std::sync::Arc;
 use std::time::Duration;

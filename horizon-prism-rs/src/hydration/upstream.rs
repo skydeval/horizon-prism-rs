@@ -77,6 +77,11 @@ pub trait UpstreamSource: Send + Sync {
     async fn record(&self, _req: &Requester, _uri: &str) -> Option<Value> {
         None
     }
+    /// As `record`, telling an absent record (`Some(None)`) from no answer
+    /// (`None`).
+    async fn record_or_absent(&self, _req: &Requester, _uri: &str) -> Option<Option<Value>> {
+        None
+    }
     /// The items of a list this AppView does not serve from its own rows
     /// (design-v3 §5.5): `{items: [listItemView], cursor?, listItemCount?}`.
     /// `listItemCount` is present only when an AppView answered.
@@ -819,6 +824,22 @@ impl UpstreamSource for RealUpstreamSource {
         let view = json!({"uri": uri, "cid": record.cid, "value": record.value});
         self.cache.put_json(req, &key, &view).await;
         Some(view)
+    }
+
+    async fn record_or_absent(&self, req: &Requester, uri: &str) -> Option<Option<Value>> {
+        let key = format!("rt:record:{uri}");
+        if let Some(v) = self.cache.get_json::<Value>(req, &key).await {
+            return Some(Some(v));
+        }
+        match self.slingshot.get_record(req, uri).await {
+            Ok(record) => {
+                let view = json!({"uri": uri, "cid": record.cid, "value": record.value});
+                self.cache.put_json(req, &key, &view).await;
+                Some(Some(view))
+            }
+            Err(crate::microcosm::slingshot::SlingshotError::NotFound) => Some(None),
+            Err(_) => None,
+        }
     }
 
     async fn list_items(&self, req: &Requester, list: &str, limit: u32, cursor: Option<&str>) -> Option<Value> {

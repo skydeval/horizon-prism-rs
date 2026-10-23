@@ -82,6 +82,8 @@ pub fn router(state: RefractState) -> Router {
         .route(&crate::admin::usage::path("refract", GET_POST_THREAD), get(get_post_thread))
         .route(&crate::admin::usage::path("refract", GET_AUTHOR_FEED), get(get_author_feed))
         .route(&crate::admin::usage::path("refract", LIST_NOTIFICATIONS), get(list_notifications))
+        .route(&crate::admin::usage::path("refract", GET_TIMELINE), get(get_timeline))
+        .route(&crate::admin::usage::path("refract", GET_REPLIES), get(get_replies))
         .route(&crate::admin::usage::path("refract", GET_UNREAD_COUNT), get(get_unread_count))
         .with_state(state)
 }
@@ -537,6 +539,61 @@ pub async fn get_author_feed(State(s): State<RefractState>, ConnectInfo(peer): C
     })
     .await;
     metrics::counter!(METRIC_READS, "method" => "getAuthorFeed", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
+    result
+}
+
+/// R-live less the DIDs still waiting for their first labels: what a
+/// Refract read serves.
+fn served(snapshot: &RefractSnapshot) -> Vec<String> {
+    snapshot.restored.keys().filter(|d| !snapshot.awaiting.contains(*d)).cloned().collect()
+}
+
+/// `refract.getTimeline` (§7.1): member-only data; a non-member gets an
+/// empty feed.
+pub async fn get_timeline(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, RawQuery(q): RawQuery) -> XrpcResult {
+    let caller = gate(&s, &headers, peer, GET_TIMELINE).await?;
+    let p = Params::parse(q.as_deref());
+    let limit = p.u32("limit")?.unwrap_or(50).clamp(1, 100);
+    let cursor = p.one("cursor").map(str::to_string);
+    if !caller.member {
+        metrics::counter!(METRIC_READS, "method" => "getTimeline", "outcome" => "not_member").increment(1);
+        return Ok(Json(crate::hydration::Hydrator::refract_empty("feed")));
+    }
+    let h = &s.app.hydrator;
+    let hydration = |e: sqlx::Error| XrpcError::from(crate::hydration::HydrationError::from(e));
+    let snapshot = h.refract_snapshot(&caller.req).await;
+    let (items, next) = h.refract_timeline_items(&caller.did, &served(&snapshot), cursor.as_deref(), limit).await.map_err(hydration)?;
+    let local: Vec<String> = items.iter().filter(|i| i.kind != "repost").map(|i| i.post_uri.clone()).collect();
+    s.refract.serve_check(&caller.req, &local).await;
+    let mut blocks = Blocks::new(&s, &caller);
+    let named: Vec<String> = items.iter().flat_map(|i| [i.originator_did.clone()].into_iter().chain(uri_author(&i.post_uri).map(str::to_string))).collect();
+    let result = with_blocks(&mut blocks, &named, || async {
+        h.refract_feed(&caller.viewer, &caller.req, &items, next.as_deref(), FEED_SUBJECT_CAP).await.map(Json).map_err(Into::into)
+    })
+    .await;
+    metrics::counter!(METRIC_READS, "method" => "getTimeline", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
+    result
+}
+
+/// `refract.getReplies` (§7.1): the restored replies in the thread of
+/// `root`, for anyone signed in.
+pub async fn get_replies(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, RawQuery(q): RawQuery) -> XrpcResult {
+    let caller = gate(&s, &headers, peer, GET_REPLIES).await?;
+    let p = Params::parse(q.as_deref());
+    let root = p.required("root")?.to_string();
+    let anchor = p.required("anchor")?.to_string();
+    if !at_uri(&root) || !at_uri(&anchor) {
+        return Err(XrpcError::invalid("Error: anchor and root must be at-uris"));
+    }
+    let h = &s.app.hydrator;
+    let snapshot = h.refract_snapshot(&caller.req).await;
+    let mut blocks = Blocks::new(&s, &caller);
+    let result = h
+        .refract_replies(&caller.viewer, &caller.req, &root, &served(&snapshot), blocks.as_mut(), s.round_timeout)
+        .await
+        .map(Json)
+        .map_err(Into::into);
+    metrics::counter!(METRIC_READS, "method" => "getReplies", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }
 

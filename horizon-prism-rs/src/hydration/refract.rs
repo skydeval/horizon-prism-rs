@@ -311,3 +311,360 @@ fn view_record(post: &Value) -> Value {
     v
 }
 
+/// What a member's own tables drop from a Refract timeline, for the DID
+/// expression `d` (refract design §7.1 "Member-only data"): a full mute,
+/// a block either way, and the list mutes and list blocks that apply.
+fn timeline_excluded(d: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = {d} AND m.scope = 'full') \
+          OR EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = {d}) OR (b.author_did = {d} AND b.subject_did = $1)) \
+          OR EXISTS (SELECT 1 FROM list_references r \
+                     JOIN subscribed_lists l ON l.list_uri = r.list_uri \
+                     JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
+                     WHERE r.member_did = $1 AND i.subject_did = {d} \
+                       AND r.admitted AND r.effective AND l.state = 'active' AND l.purpose = 'app.bsky.graph.defs#modlist'))"
+    )
+}
+
+/// The most replies `refract.getReplies` returns.
+pub const REPLIES_MAX: i64 = 200;
+/// Records one Constellation `links` call for a threadgate rule asks for.
+const RULE_LINKS: u32 = 50;
+
+/// Threadgate records of roots not stored here (refract design §7.1): the
+/// record, or `None` for no gate; ten minutes.
+static ROOT_GATES: LazyLock<moka::sync::Cache<String, Option<Value>>> =
+    LazyLock::new(|| moka::sync::Cache::builder().max_capacity(10_000).time_to_live(Duration::from_secs(600)).build());
+
+/// The root's threadgate as `getReplies` applies it.
+struct RootRules {
+    hidden: HashSet<String>,
+    /// `None`: no `allow`, everyone may reply.
+    allow: Option<Vec<Value>>,
+}
+
+impl Hydrator {
+    /// The page of `refract.getTimeline` for a member (refract design
+    /// §7.1): posts by DIDs in `restored` the member follows (top-level, and
+    /// replies whose parent author it follows) and their reposts, newest
+    /// first, with the member's mutes, blocks and list mutes and blocks
+    /// applied in SQL to the row's author and a repost's subject author.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn refract_timeline_items(&self, me: &str, restored: &[String], cursor: Option<&str>, limit: u32) -> Result<(Vec<FeedItem>, Option<String>), sqlx::Error> {
+        let (at, after) = parse_local_cursor(cursor);
+        let sql = format!(
+            "SELECT uri, originator_did, post_uri, kind, sort_at FROM ( \
+               SELECT p.uri, p.author_did AS originator_did, p.uri AS post_uri, \
+                 CASE WHEN p.reply_parent_uri IS NULL THEN 'post' ELSE 'reply' END AS kind, p.created_at AS sort_at, \
+                 p.quote_uri IS NOT NULL AS quote \
+               FROM posts p WHERE p.author_did = ANY($2) \
+                 AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = p.author_did) \
+                 AND (p.reply_parent_uri IS NULL \
+                      OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = split_part(p.reply_parent_uri, '/', 3))) \
+               UNION ALL \
+               SELECT r.uri, r.author_did, r.subject_uri, 'repost', r.created_at, false FROM reposts r \
+               WHERE r.author_did = ANY($2) \
+                 AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = r.author_did) \
+             ) t WHERE ($3::timestamptz IS NULL OR (t.sort_at, t.uri) < ($3, $4)) \
+               AND NOT {} AND NOT {} \
+               AND NOT (t.kind = 'repost' AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
+                        AND m.subject_did = t.originator_did AND m.scope IN ('reposts', 'reposts_and_quotes'))) \
+               AND NOT (t.quote AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
+                        AND m.subject_did = t.originator_did AND m.scope IN ('quotes', 'reposts_and_quotes'))) \
+             ORDER BY t.sort_at DESC, t.uri DESC LIMIT $5",
+            timeline_excluded("t.originator_did"),
+            timeline_excluded("split_part(t.post_uri, '/', 3)"),
+        );
+        let items: Vec<FeedItem> = sqlx::query_as(&sql)
+            .bind(me)
+            .bind(restored)
+            .bind(at)
+            .bind(after.unwrap_or_default())
+            .bind(i64::from(limit))
+            .fetch_all(self.pool())
+            .await?;
+        let next = (items.len() == usize::try_from(limit).unwrap_or(usize::MAX)).then(|| items.last().map(|i| local_cursor(i.sort_at, &i.uri))).flatten();
+        Ok((items, next))
+    }
+
+    /// A body with nothing in it, for a caller a Refract method serves
+    /// nothing (a non-member's `getTimeline`).
+    #[must_use]
+    pub fn refract_empty(key: &str) -> PublicEmit<Value> {
+        Self::emit(json!({ key: [] }))
+    }
+
+    /// The root's threadgate (refract design §7.1 `getReplies`): stored
+    /// here, else through Slingshot `getRecord`, cached ten minutes. `None`
+    /// when it can't be known.
+    async fn refract_root_rules(&self, req: &Requester, root: &str) -> Result<Option<RootRules>, sqlx::Error> {
+        let (Some(author), Some(rkey)) = (uri_author(root), root.rsplit('/').next()) else {
+            return Ok(None);
+        };
+        let stored: Option<(Vec<String>, Option<Value>)> = sqlx::query_as(
+            "SELECT hidden_replies, allow FROM threadgates WHERE post_uri = $1 \
+               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
+        )
+        .bind(root)
+        .fetch_optional(self.pool())
+        .await?;
+        let record = if let Some((hidden, allow)) = stored {
+            return Ok(Some(RootRules { hidden: hidden.into_iter().collect(), allow: allow.and_then(|a| a.as_array().cloned()) }));
+        } else if let Some(cached) = ROOT_GATES.get(root) {
+            cached
+        } else {
+            let uri = format!("at://{author}/app.bsky.feed.threadgate/{rkey}");
+            let Some(found) = self.upstream().record_or_absent(req, &uri).await else {
+                return Ok(None);
+            };
+            let record = found.and_then(|v| v.get("value").cloned());
+            ROOT_GATES.insert(root.to_string(), record.clone());
+            record
+        };
+        let Some(record) = record else {
+            return Ok(Some(RootRules { hidden: HashSet::new(), allow: None }));
+        };
+        let hidden = record
+            .get("hiddenReplies")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        Ok(Some(RootRules { hidden, allow: record.get("allow").and_then(Value::as_array).cloned() }))
+    }
+
+    /// Whether `follower` follows `subject` (refract design §7.1): from the
+    /// stored `follows` when `local`, else one Constellation `links` call
+    /// filtered to `follower`. `None` when it can't be known, including a
+    /// server that ignored the filter.
+    async fn refract_follows(&self, req: &Requester, follower: &str, subject: &str, local: bool) -> Result<Option<bool>, sqlx::Error> {
+        if local {
+            let found: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+                .bind(follower)
+                .bind(subject)
+                .fetch_one(self.pool())
+                .await?;
+            return Ok(Some(found));
+        }
+        let Some(client) = self.backlinks() else {
+            return Ok(None);
+        };
+        if self.draw_constellation(req).is_err() {
+            return Ok(None);
+        }
+        let Ok(page) = client.links_by(subject, "app.bsky.graph.follow", ".subject", follower, RULE_LINKS).await else {
+            return Ok(None);
+        };
+        if page.linking_records.iter().any(|r| r.did != follower) {
+            return Ok(None);
+        }
+        Ok(Some(!page.linking_records.is_empty()))
+    }
+
+    /// Whether `replier` is on `list` (refract design §7.1 `listRule`).
+    async fn refract_on_list(&self, req: &Requester, list: &str, replier: &str) -> Result<Option<bool>, sqlx::Error> {
+        let Some(owner) = uri_author(list) else {
+            return Ok(None);
+        };
+        let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM members WHERE did = $1)")
+            .bind(owner)
+            .fetch_one(self.pool())
+            .await?;
+        if member {
+            let found: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_items WHERE list_uri = $1 AND subject_did = $2)")
+                .bind(list)
+                .bind(replier)
+                .fetch_one(self.pool())
+                .await?;
+            return Ok(Some(found));
+        }
+        let Some(client) = self.backlinks() else {
+            return Ok(None);
+        };
+        if self.draw_constellation(req).is_err() {
+            return Ok(None);
+        }
+        let Ok(page) = client.links_by(replier, "app.bsky.graph.listitem", ".subject", owner, RULE_LINKS).await else {
+            return Ok(None);
+        };
+        if page.linking_records.iter().any(|r| r.did != owner) {
+            return Ok(None);
+        }
+        let mut complete = true;
+        for r in &page.linking_records {
+            let uri = format!("at://{}/{}/{}", r.did, r.collection, r.rkey);
+            match self.upstream().record(req, &uri).await {
+                Some(v) if v.pointer("/value/list").and_then(Value::as_str) == Some(list) => return Ok(Some(true)),
+                Some(_) => {}
+                None => complete = false,
+            }
+        }
+        Ok(complete.then_some(false))
+    }
+
+    /// Whether the root's `allow` rules admit `replier`. `None` when no
+    /// rule admits it and one couldn't be evaluated (dropped: fail closed).
+    async fn refract_admitted(&self, req: &Requester, root_author: &str, rules: &[Value], replier: &str, mentions: Option<&HashSet<String>>) -> Result<bool, sqlx::Error> {
+        let members: Vec<String> = sqlx::query_scalar("SELECT did FROM members WHERE did = ANY($1)")
+            .bind(vec![root_author.to_string(), replier.to_string()])
+            .fetch_all(self.pool())
+            .await?;
+        let local = !members.is_empty();
+        for rule in rules {
+            let allowed = match rule.get("$type").and_then(Value::as_str).unwrap_or_default() {
+                "app.bsky.feed.threadgate#mentionRule" => mentions.map(|m| m.contains(replier)),
+                "app.bsky.feed.threadgate#followingRule" => self.refract_follows(req, root_author, replier, local).await?,
+                "app.bsky.feed.threadgate#followerRule" => self.refract_follows(req, replier, root_author, local).await?,
+                "app.bsky.feed.threadgate#listRule" => match rule.get("list").and_then(Value::as_str) {
+                    Some(list) => self.refract_on_list(req, list, replier).await?,
+                    None => None,
+                },
+                _ => None,
+            };
+            if allowed == Some(true) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The DIDs the root post mentions, from its stored row or its record.
+    async fn refract_root_mentions(&self, req: &Requester, root: &str) -> Result<Option<HashSet<String>>, sqlx::Error> {
+        let stored: Option<Option<Vec<String>>> = sqlx::query_scalar("SELECT mention_dids FROM posts WHERE uri = $1")
+            .bind(root)
+            .fetch_optional(self.pool())
+            .await?;
+        if let Some(m) = stored {
+            return Ok(Some(m.unwrap_or_default().into_iter().collect()));
+        }
+        let Some(record) = self.upstream().record(req, root).await else {
+            return Ok(None);
+        };
+        let mentions = record
+            .pointer("/value/facets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|f| f.get("features").and_then(Value::as_array).cloned().unwrap_or_default())
+            .filter(|feature| feature.get("$type").and_then(Value::as_str) == Some("app.bsky.richtext.facet#mention"))
+            .filter_map(|feature| feature.get("did").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        Ok(Some(mentions))
+    }
+
+    /// `refract.getReplies` (refract design §7.1): the stored replies by
+    /// DIDs in `restored` under `root`, newest first, at most 200, as
+    /// `postView`s, less those the root's threadgate hides or doesn't
+    /// admit, those of an author the caller blocks or is blocked by
+    /// (`blocks` for a visitor or a member that is not ready), and those
+    /// whose author and the root's author block each other or were left
+    /// unanswered (a separate Farsight reader, `round` long).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn refract_replies(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        root: &str,
+        restored: &[String],
+        blocks: Option<&mut crate::refract::handlers::Blocks>,
+        round: Duration,
+    ) -> Result<PublicEmit<Value>, HydrationError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT uri, author_did FROM posts WHERE reply_root_uri = $1 AND author_did = ANY($2) \
+             ORDER BY created_at DESC, uri DESC LIMIT $3",
+        )
+        .bind(root)
+        .bind(restored)
+        .bind(REPLIES_MAX)
+        .fetch_all(self.pool())
+        .await?;
+        if rows.is_empty() {
+            return Ok(Self::refract_empty("posts"));
+        }
+        let Some(root_author) = uri_author(root).map(str::to_string) else {
+            return Ok(Self::refract_empty("posts"));
+        };
+        // The threadgate: unknowable drops every reply (fail closed).
+        let Some(rules) = self.refract_root_rules(req, root).await? else {
+            return Ok(Self::refract_empty("posts"));
+        };
+        let me = viewer.did.as_deref();
+        let mentions = match &rules.allow {
+            Some(allow) if allow.iter().any(|r| r.get("$type").and_then(Value::as_str) == Some("app.bsky.feed.threadgate#mentionRule")) => {
+                self.refract_root_mentions(req, root).await?
+            }
+            _ => None,
+        };
+        let mut admitted: HashMap<String, bool> = HashMap::new();
+        let mut kept: Vec<(String, String)> = Vec::new();
+        for (uri, author) in rows {
+            if rules.hidden.contains(&uri) && Some(author.as_str()) != me {
+                continue;
+            }
+            if let Some(allow) = &rules.allow
+                && author != root_author
+            {
+                let ok = match admitted.get(&author) {
+                    Some(ok) => *ok,
+                    None => {
+                        let ok = self.refract_admitted(req, &root_author, allow, &author, mentions.as_ref()).await?;
+                        admitted.insert(author.clone(), ok);
+                        ok
+                    }
+                };
+                if !ok {
+                    continue;
+                }
+            }
+            kept.push((uri, author));
+        }
+        let mut repliers: Vec<String> = kept.iter().map(|(_, a)| a.clone()).collect::<HashSet<_>>().into_iter().collect();
+        repliers.sort_unstable();
+        // The caller's blocks.
+        let mut dropped: HashSet<String> = HashSet::new();
+        match blocks {
+            Some(b) => {
+                b.round(&repliers).await;
+                dropped.extend(repliers.iter().filter(|a| b.blocked(a)).cloned());
+            }
+            None => {
+                let actors = self.actor_viewer(viewer, &repliers).await?;
+                dropped.extend(repliers.iter().filter(|a| actors.blocked_either_way(a)).cloned());
+            }
+        }
+        // The root author and each replier: a separate reader.
+        let others: Vec<String> = repliers.iter().filter(|a| **a != root_author && !dropped.contains(*a)).cloned().collect();
+        if !others.is_empty()
+            && let Some(farsight) = self.farsight()
+        {
+            let reader = farsight.request(req);
+            reader.set_visitor();
+            let got = reader.pair_answers(&root_author, &others, crate::farsight::PairBudget { max_calls: u32::MAX, timeout: round }, None).await;
+            for did in others {
+                match got.answers.get(&did) {
+                    Some(answer) if !answer.inbound.is_block() && !answer.outbound.is_block() => {}
+                    _ => {
+                        dropped.insert(did);
+                    }
+                }
+            }
+        }
+        let uris: Vec<String> = kept.iter().filter(|(_, a)| !dropped.contains(a)).map(|(u, _)| u.clone()).collect();
+        let ctx = self.post_context_for(Some(viewer), req, &uris, CountMode::List, &[], &[]).await?;
+        let posts: Vec<Value> = uris
+            .iter()
+            .filter(|u| ctx.gates.get(*u).is_none_or(|g| g.listable()))
+            .filter_map(|u| ctx.post_view(u))
+            .collect();
+        Ok(Self::emit(json!({ "posts": posts })))
+    }
+}

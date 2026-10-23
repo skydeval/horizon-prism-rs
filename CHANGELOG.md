@@ -10,6 +10,30 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract R7: timeline and replies, #835)
+
+- **`app.nearhorizon.refract.getTimeline`** (refract design §7.1): for a
+  member, ready or not, the posts of the restored DIDs it follows
+  (top-level, and replies whose parent author it follows) and their
+  reposts, newest first, from `posts` and `reposts` joined to its stored
+  follows. Its mutes, blocks and list mutes and blocks apply in SQL to the
+  row's author and a repost's subject author (`reposts` and `quotes` mute
+  scopes included). A non-member gets an empty feed.
+- **`app.nearhorizon.refract.getReplies`** (§7.1): the stored replies by
+  restored DIDs under `root`, newest first, at most 200, as `postView`s.
+  The root's threadgate (stored, else Slingshot `getRecord`, cached ten
+  minutes) applies: `hiddenReplies` (not to the reply's own author) and
+  the `allow` rules: `mentionRule` from the root's facets, `followingRule`
+  and `followerRule` from stored follows when either side is a member,
+  else one Constellation `links` call filtered with `did` (a server that
+  ignores the filter makes the rule unevaluable), `listRule` from stored
+  list items when the owner is a member, else Constellation backlinks and
+  `getRecord`. A rule that can't be evaluated drops the reply (fail
+  closed); so does a threadgate that can't be fetched. The caller's
+  blocks apply (a visitor's through Farsight pair answers), and the root
+  author and each replier are checked through a separate Farsight reader;
+  an unanswered pair drops the reply.
+
 ### Added (Refract R6: notifications, #834)
 
 - **Refract notifications** (refract design §5.3): a restored author's

@@ -1370,6 +1370,10 @@ pub(crate) mod testing {
             self.note(req, format!("record {uri}"));
             self.records.get(uri).cloned()
         }
+        async fn record_or_absent(&self, req: &Requester, uri: &str) -> Option<Option<Value>> {
+            self.note(req, format!("record {uri}"));
+            Some(self.records.get(uri).cloned())
+        }
         async fn resolve_handle(&self, req: &Requester, handle: &str) -> Option<String> {
             self.note(req, format!("resolve_handle {handle}"));
             self.handles.get(handle).cloned()
