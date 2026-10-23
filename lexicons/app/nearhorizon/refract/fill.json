@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Views of accounts, and of posts by accounts, that Bluesky's AppView withholds and a listed community still serves. Named accounts not yet known are checked in the background and reported in `pending`; ask again a little later. Everything else is omitted. Any signed-in caller.",
+      "description": "Views of accounts, and of posts by accounts, that Bluesky's AppView withholds and a listed community still serves. Named accounts not yet known are checked in the background and reported in `pending`; ask again a little later. Everything else is omitted, a malformed DID or URI included (the rest are answered). Any signed-in caller.",
       "parameters": {
         "type": "params",
         "properties": {
@@ -20,11 +20,11 @@
           "properties": {
             "profiles": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.actor.defs#profileViewDetailed" } },
             "posts": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.feed.defs#postView" } },
-            "pending": { "type": "array", "items": { "type": "string", "format": "did" }, "description": "Accounts accepted for checking and not served yet." }
+            "pending": { "type": "array", "items": { "type": "string", "format": "did" }, "description": "Accounts accepted for checking and not served yet. An account whose check found it on no listed community is left out for a day." }
           }
         }
       },
-      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }]
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }, { "name": "InvalidToken" }, { "name": "RateLimitExceeded" }]
     }
   }
 }

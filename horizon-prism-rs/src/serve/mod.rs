@@ -183,6 +183,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         crate::admin::usage::METRIC_SECONDS,
         crate::sync::head_prober::METRIC_CHECK_SECONDS,
         crate::private_tier::fanout::METRIC_SECONDS,
+        crate::refract::handlers::METRIC_READ_SECONDS,
     ] {
         builder = builder
             .set_buckets_for_metric(

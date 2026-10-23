@@ -622,6 +622,9 @@ Other series, one line each (the sections above name the rest):
 - `xrpc_method_not_implemented_total` and `xrpc_wrong_method_total`: requests for a method this AppView does not have, and for one with the wrong HTTP verb.
 - `sort_fallback_total{endpoint}`: listings served in `latest` order because another was asked.
 - `search_duration_seconds{endpoint}`, `trends_refresh_seconds` and `suggestions_refresh_seconds`: how long searches, trend refreshes and suggestion refreshes took.
+- `refract_reads_total{method,outcome}` and `refract_read_seconds{method}`: Refract calls (`fill`, `getReplies`, `getAuthorFeed`, `getPostThread`, `getTimeline`, `listNotifications`, `getUnreadCount`) by how they ended, and how long each took, sign-in check included (a histogram, for p50/p95 per method).
+- `refract_candidates_total{source,outcome}`: accounts a `fill` (or the admin) named for checking, by outcome; `not_hosted` is a resolve that found the account on no listed community, `not_hosted_cached` a later `fill` that skipped it because of that (remembered in memory for 24 hours, forgotten when the communities change), `resolve_failed` a resolve that failed for a reason worth trying again.
+- `refract_visitor_pairs_total{outcome}`: block checks between a visitor and an author, `answered` or `unanswered` (treated as blocked).
 - `standin_hosts_build`: 1 in a test build that can reach private addresses; it never appears in a deploy build.
 
 A latched audit guard (design §6.5) makes `/xrpc/_health` return 503. `docker compose ps` then shows `app` as unhealthy. Restart `app` after investigating the logged panic.

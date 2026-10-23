@@ -9,7 +9,7 @@
         "type": "params",
         "required": ["anchor", "root"],
         "properties": {
-          "anchor": { "type": "string", "format": "at-uri" },
+          "anchor": { "type": "string", "format": "at-uri", "description": "The post the client shows the thread for. Reserved: results are selected by `root` only, and `anchor` neither narrows nor orders them." },
           "root": { "type": "string", "format": "at-uri" }
         }
       },
@@ -23,7 +23,7 @@
           }
         }
       },
-      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }]
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }, { "name": "InvalidToken" }, { "name": "RateLimitExceeded" }]
     }
   }
 }

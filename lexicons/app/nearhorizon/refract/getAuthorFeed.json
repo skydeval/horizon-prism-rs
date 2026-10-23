@@ -31,7 +31,7 @@
           }
         }
       },
-      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }, { "name": "NotFound" }]
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }, { "name": "InvalidToken" }, { "name": "RateLimitExceeded" }, { "name": "NotFound" }, { "name": "AccountTakedown" }, { "name": "AccountDeactivated" }, { "name": "InvalidRequest", "description": "Profile not found: the account is deleted." }]
     }
   }
 }

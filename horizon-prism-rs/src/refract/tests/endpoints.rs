@@ -171,6 +171,43 @@ async fn visitors_unanswered_pairs_are_blocked() {
     db.drop_db().await;
 }
 
+/// RF-S6 and `fill` leniency: a malformed item is dropped and the rest
+/// answered; a DID found on no listed community is pending once, then left
+/// out (no new resolve, no cap) until the communities change.
+#[tokio::test]
+async fn fill_remembers_not_hosted() {
+    let Some(db) = fresh_db("refract_endpoint_not_hosted").await else {
+        return;
+    };
+    let h = Harness::new(&db.pool, ScopeSets::default(), vec![tier1()]).await;
+    h.set(|w| {
+        w.pds_of.insert(THIRD.to_string(), "https://pds.elsewhere.example".to_string());
+    });
+    let base = serve(&h, None).await;
+    let (status, body) = call(&base, FILL, &format!("dids={THIRD}&dids=bogus&uris=nope"), Some("bsky_appview")).await;
+    assert_eq!((status, body["pending"].clone()), (200, json!([THIRD])), "{body}");
+    // The resolve lands: not hosted, so no row and, soon, not pending.
+    let mut left_out = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_, body) = call(&base, FILL, &format!("dids={THIRD}"), Some("bsky_appview")).await;
+        if body["pending"] == json!([]) {
+            left_out = true;
+            break;
+        }
+    }
+    assert!(left_out, "a not-hosted DID is left out of pending");
+    assert_eq!(h.state(THIRD).await, None, "nothing stored about it");
+    // A change of the communities forgets it.
+    let mut wide = tier1();
+    wide.name = "elsewhere".into();
+    wide.pds_patterns = vec!["*.elsewhere.example".into()];
+    h.live.update(|v| v.refract_communities.push(wide));
+    let (_, body) = call(&base, FILL, &format!("dids={THIRD}"), Some("bsky_appview")).await;
+    assert_eq!(body["pending"], json!([THIRD]), "{body}");
+    db.drop_db().await;
+}
+
 fn urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }

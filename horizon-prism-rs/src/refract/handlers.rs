@@ -14,8 +14,12 @@
 //!   enforcement (C-9 (a)).
 //! - **Discovery** (§4.4): `fill` makes candidates of the DIDs it names,
 //!   capped per caller, and for visitors only on direct calls (`aud` with
-//!   `#bsky_appview`), per client address and in all.
-//! - **Errors**: `NotEnabled` (the feature is off) and `AuthRequired`.
+//!   `#bsky_appview`), per client address and in all. A DID whose resolve
+//!   found it on no listed community is remembered in memory for a day
+//!   ([`NotHosted`]): left out of `pending`, charged no cap.
+//! - **Errors**: `NotEnabled` (the feature is off), `AuthRequired`,
+//!   `InvalidToken`, `RateLimitExceeded`; `getAuthorFeed`'s actor gate
+//!   adds `AccountTakedown`, `AccountDeactivated` and `InvalidRequest`.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -58,6 +62,8 @@ pub const FILL_MAX: usize = 25;
 pub const FEED_SUBJECT_CAP: usize = 25;
 /// `refract_reads_total{method, outcome}`.
 pub const METRIC_READS: &str = "refract_reads_total";
+/// `refract_read_seconds{method}`, a histogram with the latency buckets.
+pub const METRIC_READ_SECONDS: &str = "refract_read_seconds";
 /// `refract_candidates_total{source, outcome}`.
 pub const METRIC_CANDIDATES: &str = "refract_candidates_total";
 /// `refract_visitor_pairs_total{outcome}`.
@@ -85,7 +91,25 @@ pub fn router(state: RefractState) -> Router {
         .route(&crate::admin::usage::path("refract", GET_TIMELINE), get(get_timeline))
         .route(&crate::admin::usage::path("refract", GET_REPLIES), get(get_replies))
         .route(&crate::admin::usage::path("refract", GET_UNREAD_COUNT), get(get_unread_count))
+        .route_layer(axum::middleware::from_fn(time_read))
         .with_state(state)
+}
+
+/// `refract_read_seconds{method}`: each Refract call's time, sign-in check
+/// included, labelled as `refract_reads_total` is (`fill`, `getReplies`…).
+async fn time_read(request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let method = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .and_then(|p| p.as_str().rsplit('/').next())
+        .and_then(|nsid| nsid.strip_prefix("app.nearhorizon.refract."))
+        .map(str::to_string);
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    if let Some(method) = method {
+        metrics::histogram!(METRIC_READ_SECONDS, "method" => method).record(start.elapsed().as_secs_f64());
+    }
+    response
 }
 
 /// `400 NotEnabled`.
@@ -261,10 +285,64 @@ where
 }
 
 /// The in-memory caps on candidate creation (§7.1 "Abuse bounds"), in
-/// fixed hourly windows, reset at restart.
+/// fixed hourly windows, reset at restart; and the DIDs found on no listed
+/// community.
 #[derive(Default)]
 pub struct Discovery {
     windows: Mutex<Windows>,
+    pub not_hosted: NotHosted,
+}
+
+/// How long a not-hosted outcome is remembered.
+pub const NOT_HOSTED_TTL: Duration = Duration::from_secs(24 * 3600);
+/// The most not-hosted DIDs remembered.
+pub const NOT_HOSTED_MAX: u64 = 100_000;
+
+/// DIDs a `fill`'s resolve found on no listed community: for 24 hours a
+/// further `fill` leaves them out of `pending` and charges no cap. In
+/// memory only, bounded, lost at restart; nothing about them is written
+/// anywhere (D-2). Every entry was judged against the communities list in
+/// `against`; any change of the list clears them all, so a DID a new or
+/// widened entry would host is resolved again.
+pub struct NotHosted {
+    cache: moka::sync::Cache<String, ()>,
+    against: Mutex<super::Communities>,
+}
+
+impl Default for NotHosted {
+    fn default() -> Self {
+        Self::new(NOT_HOSTED_MAX, NOT_HOSTED_TTL)
+    }
+}
+
+impl NotHosted {
+    #[must_use]
+    pub fn new(max: u64, ttl: Duration) -> Self {
+        Self { cache: moka::sync::Cache::builder().max_capacity(max).time_to_live(ttl).build(), against: Mutex::default() }
+    }
+
+    /// Run `f` with the entries judged against `now`, clearing them all
+    /// first when they were judged against another list. The lock is held
+    /// throughout, so an entry is never kept across a change of the list.
+    fn with<T>(&self, now: &super::Communities, f: impl FnOnce(&moka::sync::Cache<String, ()>) -> T) -> T {
+        let mut against = self.against.lock().unwrap_or_else(PoisonError::into_inner);
+        if *against != *now {
+            self.cache.invalidate_all();
+            *against = now.clone();
+        }
+        f(&self.cache)
+    }
+
+    /// Whether `did` was found on no community of `now`.
+    #[must_use]
+    pub fn contains(&self, did: &str, now: &super::Communities) -> bool {
+        self.with(now, |c| c.contains_key(did))
+    }
+
+    /// Remember that `did` is on no community of `judged`.
+    pub fn insert(&self, did: &str, judged: &super::Communities) {
+        self.with(judged, |c| c.insert(did.to_string(), ()));
+    }
 }
 
 #[derive(Default)]
@@ -346,6 +424,7 @@ impl RefractState {
     pub async fn discover(&self, caller: &Caller, dids: &[String], snapshot: &RefractSnapshot) -> Result<Vec<String>, sqlx::Error> {
         let cfg = self.refract.cfg();
         let pool = self.refract.pool();
+        let communities = self.refract.communities();
         let mut pending = Vec::new();
         for did in dids {
             if snapshot.is_restored(did) {
@@ -367,6 +446,11 @@ impl RefractState {
                 // Restored but pending removal, rejected not yet
                 // re-eligible, or ending: nothing to start.
                 Some(_) => continue,
+            }
+            // Found on no listed community lately: nothing to start, no cap.
+            if self.discovery.not_hosted.contains(did, &communities) {
+                metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "not_hosted_cached").increment(1);
+                continue;
             }
             // The free checks: no local takedown, not pending removal.
             let blocked: bool = sqlx::query_scalar(
@@ -409,27 +493,50 @@ impl RefractState {
             }
             pending.push(did.clone());
             let refract = self.refract.clone();
+            let discovery = Arc::clone(&self.discovery);
             let did = did.clone();
             tokio::spawn(async move {
-                let outcome = match refract.resolver().resolve_info(&did, ResolveIntent::Lookup).await {
-                    Ok(info) => match info.pds_endpoint.as_deref().and_then(crate::constellation::matcher::pds_host) {
-                        Some(host) => match refract.insert_candidate(&did, &host, "fill").await {
-                            Ok(true) => "inserted",
-                            Ok(false) => "not_hosted",
-                            Err(error) => {
-                                tracing::warn!(event = "refract_candidate_failed", did, %error, "inserting a candidate failed");
-                                "error"
-                            }
-                        },
-                        None => "not_hosted",
-                    },
-                    Err(_) => "not_hosted",
-                };
+                let outcome = resolve_and_insert(&refract, &discovery.not_hosted, &did).await;
                 metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => outcome).increment(1);
             });
         }
         Ok(pending)
     }
+}
+
+/// A `fill`'s background resolve of `did`: insert it as a candidate when a
+/// listed community hosts it. A definite "hosted by none" (the document
+/// names no PDS, or one no enabled entry matches, or the registry has no
+/// usable document) is remembered in `not_hosted`; a transient failure or a
+/// refusal for another reason (a purge running) is not. Returns the
+/// metric's outcome.
+async fn resolve_and_insert(refract: &Refract, not_hosted: &NotHosted, did: &str) -> &'static str {
+    let communities = refract.communities();
+    let host = match refract.resolver().resolve_info(did, ResolveIntent::Lookup).await {
+        Ok(info) => info.pds_endpoint.as_deref().and_then(crate::constellation::matcher::pds_host),
+        Err(e) if e.is_transient() || matches!(e, crate::identity::IdentityError::NoBudget(_)) => return "resolve_failed",
+        Err(_) => None,
+    };
+    let Some(host) = host.filter(|h| communities.home(h).is_some()) else {
+        not_hosted.insert(did, &communities);
+        return "not_hosted";
+    };
+    match refract.insert_candidate(did, &host, "fill").await {
+        Ok(true) => "inserted",
+        Ok(false) => "not_hosted",
+        Err(error) => {
+            tracing::warn!(event = "refract_candidate_failed", did, %error, "inserting a candidate failed");
+            "error"
+        }
+    }
+}
+
+/// `fill`'s DIDs and at-URIs less the malformed ones and repeats.
+fn valid_fill_items(dids: Vec<String>, uris: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut seen = HashSet::new();
+    let dids = dids.into_iter().filter(|d| proto_blue::syntax::Did::is_valid(d) && seen.insert(d.clone())).collect();
+    let uris = uris.into_iter().filter(|u| at_uri(u) && seen.insert(u.clone())).collect();
+    (dids, uris)
 }
 
 fn at_uri(u: &str) -> bool {
@@ -444,9 +551,8 @@ pub async fn fill(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<
     if dids.len() > FILL_MAX || uris.len() > FILL_MAX {
         return Err(XrpcError::invalid("Error: dids and uris take at most 25 items each"));
     }
-    if !dids.iter().all(|d| proto_blue::syntax::Did::is_valid(d)) || !uris.iter().all(|u| at_uri(u)) {
-        return Err(XrpcError::invalid("Error: dids must be DIDs and uris at-uris"));
-    }
+    // A malformed item is dropped; the rest are answered.
+    let (dids, uris) = valid_fill_items(dids, uris);
     let h = &s.app.hydrator;
     let snapshot = h.refract_snapshot(&caller.req).await;
     let mut named: Vec<String> = dids.clone();
@@ -645,5 +751,40 @@ mod tests {
         assert!(d.take(Cap::Global, "", 1) && !d.take(Cap::Global, "x", 1));
         assert_eq!(ip_key("2001:db8:1:2:3:4:5:6".parse().expect("ip")), "2001:db8:1:2::/64");
         assert_eq!(ip_key("192.0.2.1".parse().expect("ip")), "192.0.2.1");
+    }
+
+    /// RF-S6: remembered against one communities list; any change of the
+    /// list forgets everything, and an outcome judged against an older list
+    /// never survives into a newer one.
+    #[test]
+    fn not_hosted_is_forgotten_when_the_communities_change() {
+        let a = super::super::Communities::new(vec![crate::config::RefractCommunity::example()]);
+        let b = super::super::Communities::default();
+        let n = NotHosted::default();
+        assert!(!n.contains("did:plc:x", &a));
+        n.insert("did:plc:x", &a);
+        assert!(n.contains("did:plc:x", &a) && !n.contains("did:plc:y", &a));
+        assert!(!n.contains("did:plc:x", &b), "a change clears");
+        assert!(!n.contains("did:plc:x", &a), "and changing back does not restore it");
+        // Judged against `a` while `b` is live: gone at the next look.
+        n.insert("did:plc:z", &a);
+        assert!(!n.contains("did:plc:z", &b));
+        // Expiry.
+        let short = NotHosted::new(10, Duration::from_millis(50));
+        short.insert("did:plc:x", &a);
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!short.contains("did:plc:x", &a));
+    }
+
+    /// `fill` drops malformed items and repeats and keeps the rest.
+    #[test]
+    fn fill_items_drop_malformed() {
+        let good = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3k".to_string();
+        let (dids, uris) = valid_fill_items(
+            vec!["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(), "not a did".into(), "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into()],
+            vec![good.clone(), "https://example.com".into(), "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into()],
+        );
+        assert_eq!(dids, ["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]);
+        assert_eq!(uris, [good]);
     }
 }

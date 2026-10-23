@@ -10,6 +10,16 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (Refract client fixes A, #855, #856)
+
+- **A `fill` no longer re-reports an account no listed community hosts.** When a `fill`'s background resolve finds a named DID on no enabled community (its document names no PDS, or a PDS no entry matches, or the registry has no usable document), the outcome is remembered in memory for 24 hours (at most 100,000 DIDs, lost at restart, nothing written anywhere). A further `fill` leaves the DID out of `pending` and charges none of the discovery caps. Any change of `refract.communities` forgets every remembered DID, so one a new or widened entry would host is resolved again. A resolve that fails for a reason worth retrying is not remembered. New `refract_candidates_total` outcomes `not_hosted_cached` and `resolve_failed`.
+- **`fill` answers the valid items of a request.** A malformed DID or at-URI (or a repeat) is dropped instead of failing the whole call with `InvalidRequest`; more than 25 of either is still refused.
+- **Lexicons.** Every `app.nearhorizon.refract.*` method declares `InvalidToken` and `RateLimitExceeded`; `getAuthorFeed` declares `AccountTakedown`, `AccountDeactivated` and `InvalidRequest` (profile not found), from its actor check. `getPostThread` answers only `NotFound` for an anchor it can't serve. `getReplies` documents `anchor` as reserved: results are chosen by `root` only.
+
+### Added (Refract client fixes A, #855, #856)
+
+- `refract_read_seconds{method}`: a latency histogram per Refract method (sign-in check included), beside `refract_reads_total`; the Refract metrics are listed in the deploy README.
+
 ### Added (public root gates PRG2: reads, #850, #853)
 
 - **A public root's Hide hides private replies.** `app.nearhorizon.private.getPostThread` and `getReplies` leave out a private reply, with what is beneath it, when the public post it claims as its root has a stored threadgate (PRG1) listing it in `hiddenReplies`, except for the reply's own author. No read of the root is needed. On `getReplies` for a public URI each reply is judged by the root it claims, so one root's gate never hides another root's replies; a hidden candidate is examined as an unreadable one is, so a page can be short and still carry a cursor. The anchor is never hidden, and `getPosts` still serves hidden replies. The public root's `allow` rules do not apply to private branches. `getMembership` lists `private.publicRootGates`; the `getMembership`, `getReplies` and `private.defs` lexicons describe it.

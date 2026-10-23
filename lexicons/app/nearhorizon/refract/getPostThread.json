@@ -24,7 +24,7 @@
           }
         }
       },
-      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }, { "name": "NotFound" }]
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }, { "name": "InvalidToken" }, { "name": "RateLimitExceeded" }, { "name": "NotFound" }]
     }
   }
 }
