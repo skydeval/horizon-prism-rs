@@ -363,6 +363,10 @@ enum Body {
     /// `listActivitySubscriptions` (§4.2): the caller's own rows as
     /// `{subject, activitySubscription}`.
     ActivitySubscriptions { subscriptions: Vec<Value>, cursor: Option<String> },
+    /// `getAppearance` and `putAppearance` (private-appearance design
+    /// §5.1): the caller's own `#appearanceState`, its fields at the top
+    /// level, never anything from a post.
+    Appearance(Value),
     /// `{}`: a write's answer.
     Empty,
 }
@@ -431,6 +435,10 @@ impl PrivateResponse {
         Self::of(Body::ActivitySubscriptions { subscriptions, cursor })
     }
 
+    pub(in crate::private_tier) fn appearance(state: Value) -> Self {
+        Self::of(Body::Appearance(state))
+    }
+
     pub(in crate::private_tier) fn empty() -> Self {
         Self::of(Body::Empty)
     }
@@ -465,6 +473,7 @@ impl PrivateResponse {
             | Body::UnreadCount(_)
             | Body::NotificationPreferences(_)
             | Body::ActivitySubscription(_)
+            | Body::Appearance(_)
             | Body::Empty => {
                 return false;
             }
@@ -535,7 +544,7 @@ impl Serialize for PrivateResponse {
                     m.serialize_entry("cursor", c)?;
                 }
             }
-            Body::ActivitySubscription(answer) => {
+            Body::ActivitySubscription(answer) | Body::Appearance(answer) => {
                 if let Value::Object(fields) = answer {
                     for (k, v) in fields {
                         m.serialize_entry(k, v)?;

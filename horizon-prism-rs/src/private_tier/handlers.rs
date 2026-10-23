@@ -41,7 +41,7 @@ use crate::hydration::normalize::is_private_uri;
 use crate::hydration::{HydrationContext, ts};
 use crate::kryphocron_glue::VerifiedCaller;
 use crate::xrpc::AppState;
-use crate::xrpc::auth::{Params, prepare_private, request_handle, request_ip};
+use crate::xrpc::auth::{Params, prepare_private, prepare_private_own, request_handle, request_ip};
 use crate::xrpc::errors::XrpcError;
 
 pub const GET_POSTS: &str = "app.nearhorizon.private.getPosts";
@@ -63,6 +63,8 @@ pub const GET_REPLIES: &str = "app.nearhorizon.private.getReplies";
 pub const SEARCH_POSTS: &str = "app.nearhorizon.private.searchPosts";
 pub const PUT_ACTIVITY_SUBSCRIPTION: &str = "app.nearhorizon.private.putActivitySubscription";
 pub const LIST_ACTIVITY_SUBSCRIPTIONS: &str = "app.nearhorizon.private.listActivitySubscriptions";
+pub const GET_APPEARANCE: &str = "app.nearhorizon.private.getAppearance";
+pub const PUT_APPEARANCE: &str = "app.nearhorizon.private.putAppearance";
 
 /// `getAuthorFeed`'s `filter` values (P-20, §4.14; P-30); the first is the
 /// default.
@@ -263,6 +265,8 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(SEARCH_POSTS), get(search_posts))
         .route(&xrpc(PUT_ACTIVITY_SUBSCRIPTION), post(put_activity_subscription))
         .route(&xrpc(LIST_ACTIVITY_SUBSCRIPTIONS), get(list_activity_subscriptions))
+        .route(&xrpc(GET_APPEARANCE), get(get_appearance))
+        .route(&xrpc(PUT_APPEARANCE), post(put_appearance))
         .with_state(state)
 }
 
@@ -2794,6 +2798,52 @@ pub async fn list_activity_subscriptions(
         .map(|r| json!({"subject": r.subject, "activitySubscription": {"post": r.post, "reply": r.reply}}))
         .collect();
     Ok(ok(PrivateResponse::activity_subscriptions(items, next)))
+}
+
+/// An appearance answer: `#appearanceState`, never cached
+/// (private-appearance design §5).
+fn appearance_answer(state: Value) -> Response {
+    let mut response = ok(PrivateResponse::appearance(state));
+    response
+        .headers_mut()
+        .insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("private, no-store"));
+    response
+}
+
+/// `app.nearhorizon.private.getAppearance` (private-appearance design
+/// §5.2) → `#appearanceState`: the caller's own choice of where its
+/// appearance is saved, and the value with `private` and `public`; `{}`
+/// before its first put. Served to any member, ready or not (§4). No floor.
+pub async fn get_appearance(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private_own(&s.app, &headers, peer, GET_APPEARANCE).await?;
+    let row = schema::appearance_row(&s.env.pool, &caller.did).await?;
+    Ok(appearance_answer(super::appearance::state(row.as_ref())))
+}
+
+/// `app.nearhorizon.private.putAppearance {store, appearance?, swapRev?}`
+/// (§5.3) → `#appearanceState`: replaces the caller's whole setting,
+/// swapped on `rev` when `swapRev` is given (`""`: only with no row). The
+/// gate runs before the body is read; the write re-checks membership under
+/// the DID's lock (§5.5). The value is never logged. No floor.
+pub async fn put_appearance(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private_own(&s.app, &headers, peer, PUT_APPEARANCE).await?;
+    let input = super::appearance::put_input(&body)?;
+    match schema::appearance_put(&s.env.pool, &caller.did, input.store, input.value.as_deref(), input.swap.as_deref()).await? {
+        schema::AppearancePut::Stored(row) => Ok(appearance_answer(super::appearance::state(Some(&row)))),
+        schema::AppearancePut::NotMember => Err(XrpcError::not_enrolled()),
+        schema::AppearancePut::Mismatch => {
+            Err(XrpcError::new(StatusCode::BAD_REQUEST, "InvalidSwap", "Error: swapRev does not match the stored rev"))
+        }
+    }
 }
 
 #[cfg(test)]

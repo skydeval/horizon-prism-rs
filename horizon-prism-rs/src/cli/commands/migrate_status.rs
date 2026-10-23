@@ -114,6 +114,8 @@ mod tests {
             "0041_subscribe_private_tier",
             // Public root gates PRG1 (#850).
             "0042_public_root_gates",
+            // Private appearance AP1 (#870).
+            "0043_appearance_private_tier",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

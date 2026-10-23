@@ -3704,3 +3704,100 @@ fn unread_public_statement_for(filter: &str) -> String {
         kept = notification_kept(),
     )
 }
+
+/// A member's appearance row (private-appearance design §3.1), the value as
+/// its stored JSON text.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(super) struct AppearanceRow {
+    pub store: String,
+    pub appearance: Option<String>,
+    pub rev: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// What `putAppearance`'s write did (§5.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AppearancePut {
+    Stored(AppearanceRow),
+    /// The caller is no longer a member (a removal after the gate): nothing
+    /// written.
+    NotMember,
+    /// `swapRev` did not match: nothing written.
+    Mismatch,
+}
+
+/// The columns both appearance statements return.
+const APPEARANCE_COLUMNS: &str = "store, appearance::text AS appearance, rev, created_at";
+/// A new row's `rev`: the database clock's microseconds.
+const CLOCK_REV: &str = "(extract(epoch FROM clock_timestamp()) * 1e6)::bigint";
+
+/// `did`'s appearance row, if it put one (§5.2).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn appearance_row(pool: &PgPool, did: &str) -> Result<Option<AppearanceRow>, sqlx::Error> {
+    sqlx::query_as(&format!("SELECT {APPEARANCE_COLUMNS} FROM private_appearance WHERE did = $1"))
+        .bind(did)
+        .fetch_optional(pool)
+        .await
+}
+
+/// `putAppearance`'s write (§5.5), in one transaction: the DID's shared
+/// lock (a removal marker holds it exclusively before deleting `members`),
+/// the membership read again, then one statement by `swap`: absent,
+/// unconditional; `""`, create only; any other value, update only that
+/// `rev`. `value` is the compact JSON text, `None` with `device`. Every
+/// write moves `rev` strictly up.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn appearance_put(
+    pool: &PgPool,
+    did: &str,
+    store: &str,
+    value: Option<&str>,
+    swap: Option<&str>,
+) -> Result<AppearancePut, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    #[cfg(test)]
+    crate::test_support::hooks::pause_in(crate::test_support::hooks::APPEARANCE_BEFORE_LOCK, pool, did).await;
+    crate::db::locks::lock_dids_shared(&mut tx, &[did.to_string()]).await?;
+    #[cfg(test)]
+    crate::test_support::hooks::pause_in(crate::test_support::hooks::APPEARANCE_AFTER_LOCK, pool, did).await;
+    let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM members WHERE did = $1)")
+        .bind(did)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !member {
+        return Ok(AppearancePut::NotMember);
+    }
+    let sql = match swap {
+        None => format!(
+            "INSERT INTO private_appearance (did, store, appearance, rev) VALUES ($1, $2, $3::text::json, {CLOCK_REV}) \
+             ON CONFLICT (did) DO UPDATE SET store = EXCLUDED.store, appearance = EXCLUDED.appearance, \
+               rev = GREATEST(private_appearance.rev + 1, EXCLUDED.rev), updated_at = now() \
+             RETURNING {APPEARANCE_COLUMNS}"
+        ),
+        Some("") => format!(
+            "INSERT INTO private_appearance (did, store, appearance, rev) VALUES ($1, $2, $3::text::json, {CLOCK_REV}) \
+             ON CONFLICT (did) DO NOTHING RETURNING {APPEARANCE_COLUMNS}"
+        ),
+        Some(_) => format!(
+            "UPDATE private_appearance SET store = $2, appearance = $3::text::json, \
+               rev = GREATEST(rev + 1, {CLOCK_REV}), updated_at = now() \
+             WHERE did = $1 AND rev::text = $4 RETURNING {APPEARANCE_COLUMNS}"
+        ),
+    };
+    let mut q = sqlx::query_as::<_, AppearanceRow>(&sql).bind(did).bind(store).bind(value);
+    if let Some(rev) = swap.filter(|s| !s.is_empty()) {
+        q = q.bind(rev);
+    }
+    let row = q.fetch_optional(&mut *tx).await?;
+    let Some(row) = row else {
+        return Ok(AppearancePut::Mismatch);
+    };
+    tx.commit().await?;
+    Ok(AppearancePut::Stored(row))
+}

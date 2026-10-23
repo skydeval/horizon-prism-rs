@@ -215,6 +215,19 @@
           "description": "Seconds to wait before asking again."
         }
       }
+    },
+    "appearanceState": {
+      "type": "object",
+      "description": "The requester's choice of where its appearance is saved, and the appearance this AppView keeps for it. store is absent until the requester first puts one. appearance is an app.nearhorizon.actor.appearance record value, present with store private or public. rev changes on every write; putAppearance swaps on it. migratedAt is when store was first set.",
+      "properties": {
+        "store": {
+          "type": "string",
+          "knownValues": ["private", "public", "device"]
+        },
+        "appearance": { "type": "unknown" },
+        "rev": { "type": "string" },
+        "migratedAt": { "type": "string", "format": "datetime" }
+      }
     }
   }
 }

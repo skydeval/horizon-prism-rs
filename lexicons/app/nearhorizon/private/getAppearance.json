@@ -1,0 +1,24 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.getAppearance",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the requester's appearance setting. Requires auth by a community member, ready or not.",
+      "parameters": {
+        "type": "params",
+        "properties": {}
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": { "type": "ref", "ref": "app.nearhorizon.private.defs#appearanceState" }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        }
+      ]
+    }
+  }
+}

@@ -27,6 +27,7 @@
 //! use horizon_prism_rs::private_tier::emit::PrivateEmit;
 //! ```
 
+mod appearance;
 mod clear_fields;
 mod content;
 mod cursor;

@@ -1,0 +1,43 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.putAppearance",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Set where the requester's appearance is saved, replacing the whole setting. With store private or public, appearance is required: an app.nearhorizon.actor.appearance record value with its $type, version and updatedAt, in the atproto data model, at most 16 KiB as JSON, kept whole; its other fields are not checked against the record lexicon. With device it must be absent, and any kept appearance is deleted. This AppView accepts only the three listed store values. swapRev: write only if the stored rev equals it; the empty string writes only if the requester has none. Requires auth by a community member, ready or not.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["store"],
+          "properties": {
+            "store": {
+              "type": "string",
+              "knownValues": ["private", "public", "device"]
+            },
+            "appearance": { "type": "unknown" },
+            "swapRev": { "type": "string" }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": { "type": "ref", "ref": "app.nearhorizon.private.defs#appearanceState" }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "The input is malformed, store and appearance do not match (appearance required with private or public, absent with device; null is refused), or the appearance fails the checks above or is over the size."
+        },
+        {
+          "name": "InvalidSwap",
+          "description": "swapRev does not match the stored rev (or is the empty string and a setting exists). Nothing was written; read it again with getAppearance."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        }
+      ]
+    }
+  }
+}

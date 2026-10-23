@@ -10,6 +10,10 @@ commit.
 
 ## [Unreleased]
 
+### Added (private appearance, #857, #870)
+
+- **Private appearance.** `app.nearhorizon.private.getAppearance` and `putAppearance` keep a member's choice of where its appearance is saved (`private`, `public` or `device`) and, for `private` and `public`, the appearance itself: an `app.nearhorizon.actor.appearance` record value in the atproto data model, at most 16 KiB, kept whole (its other fields are not checked against the record lexicon, so a legacy value is kept as sent). A put replaces the whole setting and can swap on `rev`, which changes on every write (`swapRev: ""` creates only; a mismatch is `InvalidSwap`). Served to members whether or not their indexing is ready. Answers carry `Cache-Control: private, no-store`. Stored in a new private table (migration `0043_appearance_private_tier`), deleted when the member is removed or the account deleted; the admin stats count its rows.
+
 ### Fixed (Refract fill: repeated resolves and slow profile walks, #855, #868, #869)
 
 - **A re-asked DID isn't resolved or charged twice.** `fill`'s discovery now remembers, in memory, the DIDs whose resolve it started and those whose resolve failed (a transient error or no budget) in the last 5 seconds. Such a DID is answered `pending` with no cap charged and no new resolve; before, each re-ask started another resolve and charged the caps again. At most 10,000 DIDs, lost at restart, cleared by any change of `refract.communities`. Metric outcome `resolving` on `refract_candidates_total`.

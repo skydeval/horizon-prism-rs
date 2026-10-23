@@ -322,6 +322,25 @@ pub async fn prepare_private(
     }
 }
 
+/// The gate for a member's own settings (private-appearance design §4):
+/// `prepare_private` without the readiness steps. A member is served
+/// whether or not its indexing is ready: nothing it reads or writes depends
+/// on the index. `NotEnrolled` without a `members` row. Never enrols.
+///
+/// # Errors
+///
+/// `AuthRequired`/`InvalidToken`, `RateLimitExceeded`, `NotEnrolled`.
+pub async fn prepare_private_own(state: &AppState, headers: &HeaderMap, peer: SocketAddr, method: &str) -> Result<VerifiedCaller, XrpcError> {
+    let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let caller = authenticate(state, authorization, method).await?;
+    let ip = request_ip(state, headers, peer);
+    state.limits.charge(method, Family::Private, Some(&caller.did), ip)?;
+    match member_state(state, &caller.did).await? {
+        Enrollment::Member { .. } => Ok(caller),
+        Enrollment::Enrolled | Enrollment::Purging | Enrollment::Refused(_) => Err(XrpcError::not_enrolled()),
+    }
+}
+
 /// The caller's membership without enrolling it.
 pub(crate) async fn member_state(state: &AppState, did: &str) -> Result<Enrollment, sqlx::Error> {
     let row: Option<(bool, bool)> = sqlx::query_as(crate::aggregations::enroll::MEMBER_READINESS_SQL)

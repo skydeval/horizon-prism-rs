@@ -1320,6 +1320,12 @@ async fn purge_notifications(conn: &mut PgConnection, did: &str, limit: i64) -> 
     Ok(n)
 }
 
+/// The member's appearance setting, one row at most (private-appearance
+/// design §3.2: the `account_deleted` and `member_removed` purges).
+async fn purge_appearance(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query("DELETE FROM private_appearance WHERE did = $1").bind(did).execute(&mut *conn).await?.rows_affected())
+}
+
 /// The private activity subscriptions where `did` is the subscriber or the
 /// subject, at most `limit` rows (private-activity-subs design §3.2: the
 /// `account_deleted` and `member_removed` purges).
@@ -1337,8 +1343,9 @@ async fn purge_subscriptions(conn: &mut PgConnection, did: &str, limit: i64) -> 
 
 /// `ingest::purge_did` (account deletion): every private row authored by the
 /// DID, its owner state, its private bookmarks, its private notifications,
-/// the private subscriptions it holds or is the subject of, and its posts'
-/// subscribed-post queue rows, at most `limit` rows per table.
+/// the private subscriptions it holds or is the subject of, its posts'
+/// subscribed-post queue rows, and its appearance setting, at most `limit`
+/// rows per table.
 ///
 /// # Errors
 ///
@@ -1347,6 +1354,7 @@ pub(crate) async fn purge_did(conn: &mut PgConnection, did: &str, limit: i64) ->
     let mut n = purge_bookmarks(conn, did, limit).await?;
     n += purge_notifications(conn, did, limit).await?;
     n += purge_subscriptions(conn, did, limit).await?;
+    n += purge_appearance(conn, did).await?;
     // Its posts' subscribed-post queue rows (private-activity-subs §3.2).
     n += sqlx::query("DELETE FROM private_post_fanout WHERE uri IN (SELECT uri FROM private_post_fanout WHERE author_did = $1 LIMIT $2)")
         .bind(did)
@@ -1436,7 +1444,8 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
 /// bookmarks, the member's quote references (private posting §3.1: its
 /// later deletes are no longer tracked), and the private notifications it
 /// received and authored, for the same reason; and the private
-/// subscriptions it holds or is the subject of (private-activity-subs §3.2).
+/// subscriptions it holds or is the subject of (private-activity-subs §3.2),
+/// and its appearance setting (private-appearance §3.2).
 ///
 /// # Errors
 ///
@@ -1445,6 +1454,7 @@ pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, lim
     let mut n = purge_bookmarks(conn, did, limit).await?;
     n += purge_notifications(conn, did, limit).await?;
     n += purge_subscriptions(conn, did, limit).await?;
+    n += purge_appearance(conn, did).await?;
     n += sqlx::query(
         "DELETE FROM private_quote_refs WHERE uri IN (SELECT uri FROM private_quote_refs WHERE author_did = $1 LIMIT $2)",
     )
