@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use futures::StreamExt;
 use serde_json::{Value, json};
 
 use super::actor::ProfileKind;
@@ -20,6 +21,14 @@ use crate::xrpc::pools::Requester;
 /// Restored DIDs Slingshot found no profile record for (refract design
 /// §7.2): not walked again for ten minutes. Never the shared negative
 /// cache, which a restored DID neither reads nor writes.
+/// `fill`'s remote profile walks in flight at once (RF-S4): the bound the
+/// cascade's per-author and Slingshot fetches use.
+pub const FILL_PROFILE_CONCURRENCY: usize = 8;
+/// A `fill`'s remote profile walks end this long before the request's
+/// deadline, leaving room for the rest of the answer; a DID not walked by
+/// then is `unavailable`.
+pub const FILL_PROFILE_MARGIN: Duration = Duration::from_secs(1);
+
 static NO_PROFILE: LazyLock<moka::sync::Cache<String, ()>> =
     LazyLock::new(|| moka::sync::Cache::builder().max_capacity(100_000).time_to_live(Duration::from_secs(600)).build());
 
@@ -85,10 +94,19 @@ impl Hydrator {
             out.insert(d, v);
         }
         let unfound: Vec<String> = misses.into_iter().filter(|d| !out.contains_key(d)).collect();
-        for d in unfound {
+        let walk = &walk;
+        let answers: Vec<(String, Option<Option<Value>>)> = futures::stream::iter(unfound)
+            .map(|d| async move {
+                let answer = self.upstream().record_or_absent(walk, &format!("at://{d}/app.bsky.actor.profile/self")).await;
+                (d, answer)
+            })
+            .buffer_unordered(super::upstream::SLINGSHOT_CONCURRENCY)
+            .collect()
+            .await;
+        for (d, answer) in answers {
             // Only Slingshot's `RecordNotFound` is remembered; no answer is
             // asked again next time.
-            match self.upstream().record_or_absent(&walk, &format!("at://{d}/app.bsky.actor.profile/self")).await {
+            match answer {
                 Some(Some(found)) => {
                     let view = record_profile(&d, rows.get(&d), found.get("value").unwrap_or(&Value::Null));
                     out.insert(d, view);
@@ -121,19 +139,31 @@ impl Hydrator {
     ) -> Result<PublicEmit<Value>, HydrationError> {
         let mut out_profiles = Vec::new();
         let mut missing_profiles: Vec<String> = Vec::new();
+        let stored: HashSet<String> = sqlx::query_scalar("SELECT did FROM actors WHERE did = ANY($1) AND profile_record IS NOT NULL")
+            .bind(profiles)
+            .fetch_all(self.pool())
+            .await?
+            .into_iter()
+            .collect();
+        // The DIDs with no stored profile record are walked remotely at
+        // once, `FILL_PROFILE_CONCURRENCY` in flight, each ending
+        // `FILL_PROFILE_MARGIN` before the request's deadline (RF-S4).
+        let cold: Vec<String> = profiles.iter().filter(|d| !stored.contains(*d) && !NO_PROFILE.contains_key(*d)).cloned().collect();
+        let until = tokio::time::Instant::from_std(req.deadline().checked_sub(FILL_PROFILE_MARGIN).unwrap_or_else(|| req.deadline()));
+        let walked: HashSet<String> = futures::stream::iter(cold)
+            .map(|d: String| async move {
+                let found = tokio::time::timeout_at(until, self.refract_profiles(req, std::slice::from_ref(&d), &HashMap::new())).await;
+                found.is_ok_and(|v| !v.is_empty()).then_some(d)
+            })
+            .buffer_unordered(FILL_PROFILE_CONCURRENCY)
+            .filter_map(|d| async move { d })
+            .collect()
+            .await;
         for did in profiles {
-            // No stored profile record and no remote view (none answered,
-            // and no `RecordNotFound` remembered): the view would be a bare
-            // stub, so the profile is unavailable, not served.
-            let stored: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM actors WHERE did = $1 AND profile_record IS NOT NULL)")
-                .bind(did)
-                .fetch_one(self.pool())
-                .await?;
-            if !stored
-                && !NO_PROFILE.contains_key(did)
-                && self.refract_profiles(req, std::slice::from_ref(did), &HashMap::new()).await.is_empty()
-                && !NO_PROFILE.contains_key(did)
-            {
+            // No stored profile record and no remote view (none answered in
+            // time, and no `RecordNotFound` remembered): the view would be a
+            // bare stub, so the profile is unavailable, not served.
+            if !stored.contains(did) && !walked.contains(did) && !NO_PROFILE.contains_key(did) {
                 missing_profiles.push(did.clone());
                 continue;
             }
@@ -1108,7 +1138,6 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn refract_visitor_state(&self, me: &str, req: &Requester, body: PublicEmit<Value>) -> Result<PublicEmit<Value>, HydrationError> {
-        use futures::StreamExt;
         let unchecked = || Self::refract_with(&body, &[("viewerChecked", json!({"posts": [], "actors": [], "roots": []}))]);
         // RF-S12: off, no reader DID leaves Prism and nothing is checked.
         if !self.inner.cfg.live.load().refract_visitor_viewer_state {

@@ -18,7 +18,9 @@
 //!   capped per caller, and for visitors only on direct calls (`aud` with
 //!   `#bsky_appview`), per client address and in all. A DID whose resolve
 //!   found it on no listed community is remembered in memory for a day
-//!   ([`NotHosted`]): left out of `pending`, charged no cap.
+//!   ([`NotHosted`]): left out of `pending`, charged no cap. A DID being
+//!   resolved, or whose resolve failed in the last few seconds
+//!   ([`Resolving`]), is `pending` with no cap and no second resolve.
 //! - **Errors**: `NotEnabled` (the feature is off), `AuthRequired`,
 //!   `InvalidToken`, `RateLimitExceeded`; `getAuthorFeed`'s actor gate
 //!   adds `AccountTakedown`, `AccountDeactivated` and `InvalidRequest`.
@@ -26,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
@@ -319,6 +321,130 @@ fn served_as(caller: &Caller, result: XrpcResult) -> XrpcResult {
 pub struct Discovery {
     windows: Mutex<Windows>,
     pub not_hosted: NotHosted,
+    pub resolving: Resolving,
+}
+
+/// How long a DID whose resolve just failed (transient, or no budget) is
+/// answered `pending` without a new resolve (RF-S15).
+pub const RESOLVE_FAILED_MEMO: Duration = Duration::from_secs(5);
+/// An in-flight entry older than this is taken as lost (the resolver's own
+/// timeouts end a resolve well before it).
+pub const RESOLVE_IN_FLIGHT_MAX: Duration = Duration::from_secs(30);
+/// The most DIDs the memo holds; past it a resolve is started unremembered.
+pub const RESOLVING_MAX: usize = 10_000;
+
+/// RF-S15: the DIDs a `fill` started resolving and those whose resolve just
+/// failed. A DID in it is answered `pending` with no cap charged and no new
+/// resolve, so a re-ask neither starts a second resolve nor pays again. In
+/// memory only, bounded, lost at restart; judged against one communities
+/// list like [`NotHosted`], and cleared by any change of it.
+pub struct Resolving {
+    inner: Mutex<ResolvingInner>,
+    failed_for: Duration,
+}
+
+#[derive(Default)]
+struct ResolvingInner {
+    against: super::Communities,
+    entries: HashMap<String, Memo>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Memo {
+    /// Started at.
+    InFlight(Instant),
+    /// Remembered until.
+    Failed(Instant),
+}
+
+impl Memo {
+    fn live(self, now: Instant) -> bool {
+        match self {
+            Self::InFlight(at) => now.saturating_duration_since(at) < RESOLVE_IN_FLIGHT_MAX,
+            Self::Failed(until) => now < until,
+        }
+    }
+}
+
+impl Default for Resolving {
+    fn default() -> Self {
+        Self::new(RESOLVE_FAILED_MEMO)
+    }
+}
+
+impl Resolving {
+    #[must_use]
+    pub fn new(failed_for: Duration) -> Self {
+        Self { inner: Mutex::default(), failed_for }
+    }
+
+    fn with<T>(&self, now: &super::Communities, f: impl FnOnce(&mut HashMap<String, Memo>) -> T) -> T {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if inner.against != *now {
+            inner.entries.clear();
+            inner.against = now.clone();
+        }
+        f(&mut inner.entries)
+    }
+
+    /// Whether `did` is being resolved, or its resolve failed moments ago.
+    #[must_use]
+    pub fn contains(&self, did: &str, now: &super::Communities) -> bool {
+        self.with(now, |m| match m.get(did) {
+            Some(e) if e.live(Instant::now()) => true,
+            Some(_) => {
+                m.remove(did);
+                false
+            }
+            None => false,
+        })
+    }
+
+    /// Whether `did`'s resolve failed and is remembered now.
+    #[cfg(test)]
+    #[must_use]
+    pub fn failed(&self, did: &str) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        matches!(inner.entries.get(did), Some(e @ Memo::Failed(_)) if e.live(Instant::now()))
+    }
+
+    /// Claim `did` for a resolve: false when one is in flight or just
+    /// failed (nothing to start); true otherwise, remembered as in flight
+    /// when there is room.
+    pub fn begin(&self, did: &str, now: &super::Communities) -> bool {
+        self.with(now, |m| {
+            let at = Instant::now();
+            if m.get(did).is_some_and(|e| e.live(at)) {
+                return false;
+            }
+            if room(m, did, at) {
+                m.insert(did.to_string(), Memo::InFlight(at));
+            }
+            true
+        })
+    }
+
+    /// A resolve of `did`, started under `judged`, ended: remembered for a
+    /// moment when it failed, forgotten otherwise.
+    pub fn finish(&self, did: &str, judged: &super::Communities, failed: bool) {
+        self.with(judged, |m| {
+            let at = Instant::now();
+            if failed && room(m, did, at) {
+                m.insert(did.to_string(), Memo::Failed(at + self.failed_for));
+            } else {
+                m.remove(did);
+            }
+        });
+    }
+}
+
+/// Whether `did` fits in the memo, dropping ended entries when it is full.
+fn room(m: &mut HashMap<String, Memo>, did: &str, now: Instant) -> bool {
+    if m.contains_key(did) || m.len() < RESOLVING_MAX {
+        return true;
+    }
+    m.retain(|_, e| e.live(now));
+    m.len() < RESOLVING_MAX
 }
 
 /// How long a not-hosted outcome is remembered.
@@ -410,6 +536,25 @@ impl Discovery {
         }
         *n += 1;
         true
+    }
+
+    /// How many of `cap` are taken for `key` this hour.
+    #[cfg(test)]
+    pub fn taken(&self, cap: Cap, key: &str) -> u32 {
+        let w = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+        match cap {
+            Cap::Caller => w.per_caller.get(key).copied().unwrap_or_default(),
+            Cap::Resolve => w.resolves.get(key).copied().unwrap_or_default(),
+            Cap::Ip => w.per_ip.get(key).copied().unwrap_or_default(),
+            Cap::Global => w.global,
+        }
+    }
+
+    /// A discovery whose failed resolves are remembered for `failed_for`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_failure_memo(failed_for: Duration) -> Self {
+        Self { resolving: Resolving::new(failed_for), ..Self::default() }
     }
 
     /// Give back one of `cap` taken for `key`.
@@ -518,6 +663,13 @@ impl RefractState {
                 metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "known").increment(1);
                 continue;
             }
+            // Being resolved, or its resolve failed moments ago (RF-S15):
+            // pending, no cap, no second resolve.
+            if self.discovery.resolving.contains(did, &communities) {
+                metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "resolving").increment(1);
+                pending.push(did.clone());
+                continue;
+            }
             if caller.visitor() {
                 if !caller.direct {
                     metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "no_fragment").increment(1);
@@ -537,6 +689,12 @@ impl RefractState {
                     continue;
                 }
             }
+            let give_back_visitor = || {
+                if caller.visitor() {
+                    self.discovery.give_back(Cap::Ip, &ip_key(caller.ip));
+                    self.discovery.give_back(Cap::Global, "");
+                }
+            };
             if !self.discovery.take(Cap::Caller, &caller.did, cfg.candidates_per_caller_per_hour) {
                 metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "capped").increment(1);
                 withheld.push((did.clone(), "capped"));
@@ -550,12 +708,26 @@ impl RefractState {
                 withheld.push((did.clone(), "capped"));
                 continue;
             }
+            // Another request started this DID's resolve meanwhile: the
+            // caps go back and it is pending as theirs.
+            if !self.discovery.resolving.begin(did, &communities) {
+                give_back_visitor();
+                self.discovery.give_back(Cap::Caller, &caller.did);
+                if !cached {
+                    self.discovery.give_back(Cap::Resolve, &caller.did);
+                }
+                metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "resolving").increment(1);
+                pending.push(did.clone());
+                continue;
+            }
             pending.push(did.clone());
             let refract = self.refract.clone();
             let discovery = Arc::clone(&self.discovery);
             let did = did.clone();
+            let judged = communities.clone();
             tokio::spawn(async move {
                 let outcome = resolve_and_insert(&refract, &discovery.not_hosted, &did).await;
+                discovery.resolving.finish(&did, &judged, matches!(outcome, "resolve_failed" | "error"));
                 metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => outcome).increment(1);
             });
         }
@@ -850,6 +1022,31 @@ mod tests {
         short.insert("did:plc:x", &a);
         std::thread::sleep(Duration::from_millis(120));
         assert!(!short.contains("did:plc:x", &a));
+    }
+
+    /// RF-S15: an in-flight DID can't be claimed twice; a failure is
+    /// remembered for its moment, a success not at all; a change of the
+    /// communities clears both.
+    #[test]
+    fn resolving_memo() {
+        let a = super::super::Communities::new(vec![crate::config::RefractCommunity::example()]);
+        let b = super::super::Communities::default();
+        let r = Resolving::new(Duration::from_millis(80));
+        assert!(!r.contains("did:plc:x", &a));
+        assert!(r.begin("did:plc:x", &a));
+        assert!(r.contains("did:plc:x", &a) && !r.begin("did:plc:x", &a), "in flight");
+        r.finish("did:plc:x", &a, false);
+        assert!(!r.contains("did:plc:x", &a), "a success is forgotten");
+        assert!(r.begin("did:plc:x", &a));
+        r.finish("did:plc:x", &a, true);
+        assert!(r.contains("did:plc:x", &a) && !r.begin("did:plc:x", &a), "a failure is remembered");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!r.contains("did:plc:x", &a), "for a moment only");
+        assert!(r.begin("did:plc:y", &a));
+        assert!(!r.contains("did:plc:y", &b), "a change clears");
+        // A failure judged against the old list is not kept into the new one.
+        r.finish("did:plc:y", &a, true);
+        assert!(!r.contains("did:plc:y", &b));
     }
 
     /// `fill` drops malformed items and repeats and keeps the rest.

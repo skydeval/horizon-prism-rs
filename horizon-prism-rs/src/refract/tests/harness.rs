@@ -48,6 +48,12 @@ pub struct World {
     pub key: String,
     /// The DID document's PDS for each DID (default: the fake's base).
     pub pds_of: HashMap<String, String>,
+    /// DIDs whose document the directory answers 503 for.
+    pub plc_fail: std::collections::HashSet<String>,
+    /// How long the directory takes to answer.
+    pub plc_delay: Option<std::time::Duration>,
+    /// The directory's lookups, by DID.
+    pub plc_calls: HashMap<String, u32>,
     pub calls: Vec<String>,
 }
 
@@ -82,17 +88,29 @@ async fn community(State(w): State<Shared>, Path(method): Path<String>, headers:
     (StatusCode::from_u16(s).expect("status"), out, axum::Json(b))
 }
 
-async fn plc(State(w): State<Shared>, Path(did): Path<String>) -> axum::Json<Value> {
+async fn plc(State(w): State<Shared>, Path(did): Path<String>) -> axum::response::Response {
+    let (delay, fail) = {
+        let mut w = w.lock().expect("world");
+        *w.plc_calls.entry(did.clone()).or_default() += 1;
+        (w.plc_delay, w.plc_fail.contains(&did))
+    };
+    if let Some(d) = delay {
+        tokio::time::sleep(d).await;
+    }
+    if fail {
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({}))).into_response();
+    }
     let w = w.lock().expect("world");
     if did == LABELER || did == OTHER_LABELER {
         return axum::Json(json!({
             "id": did,
             "verificationMethod": [{"id": "#atproto_label", "type": "Multikey", "publicKeyMultibase": w.key}],
             "service": [{"id": "#atproto_labeler", "type": "AtprotoLabeler", "serviceEndpoint": w.pds_base}]
-        }));
+        }))
+        .into_response();
     }
     let pds = w.pds_of.get(&did).cloned().unwrap_or_else(|| w.pds_base.clone());
-    axum::Json(json!({"id": did, "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": pds}]}))
+    axum::Json(json!({"id": did, "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": pds}]})).into_response()
 }
 
 async fn repo_status(State(w): State<Shared>) -> impl IntoResponse {

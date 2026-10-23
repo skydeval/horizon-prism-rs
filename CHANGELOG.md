@@ -10,6 +10,11 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (Refract fill: repeated resolves and slow profile walks, #855, #868, #869)
+
+- **A re-asked DID isn't resolved or charged twice.** `fill`'s discovery now remembers, in memory, the DIDs whose resolve it started and those whose resolve failed (a transient error or no budget) in the last 5 seconds. Such a DID is answered `pending` with no cap charged and no new resolve; before, each re-ask started another resolve and charged the caps again. At most 10,000 DIDs, lost at restart, cleared by any change of `refract.communities`. Metric outcome `resolving` on `refract_candidates_total`.
+- **`fill` walks cold restored profiles in parallel.** A named restored account with no stored profile record was looked up remotely one at a time (the community AppView, then Slingshot), so 25 cold accounts could run past the request deadline. The lookups now run 8 at a time and stop 1 second before the deadline; an account not looked up by then is `withheld` `unavailable`. The Slingshot fallback for several accounts runs in parallel too.
+
 ### Fixed (Refract fill: restored mid-request, #855, #867)
 
 - **An account restored while a `fill` runs is `pending`, not dropped.** The request's restored set is taken before discovery reads each account's row; when the checker restored the account in between, `fill` left it out with nothing said, which the lexicon calls final. Now such an account (restored, not pending removal) is reported in `pending`, so the next `fill` serves it.

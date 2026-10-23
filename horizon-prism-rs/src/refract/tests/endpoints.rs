@@ -32,6 +32,10 @@ async fn serve(h: &Harness, farsight: Option<crate::farsight::Farsight>) -> Stri
 }
 
 fn refract_state(h: &Harness, farsight: Option<crate::farsight::Farsight>) -> RefractState {
+    refract_state_over(h, farsight, Arc::new(NoUpstream))
+}
+
+fn refract_state_over(h: &Harness, farsight: Option<crate::farsight::Farsight>, upstream: Arc<dyn crate::hydration::UpstreamSource>) -> RefractState {
     let fetcher = StubFetcher::default();
     fetcher.set_key(VISITOR, signing_key(3));
     let (auth, _d) = verifier(fetcher, 10, 4);
@@ -40,7 +44,7 @@ fn refract_state(h: &Harness, farsight: Option<crate::farsight::Farsight>) -> Re
         h.refract.scope().clone(),
         None,
         None,
-        Arc::new(NoUpstream),
+        upstream,
         ReadCache::new(1024 * 1024),
         HydrationConfig { live: h.live.clone(), farsight, ..test_config() },
     );
@@ -282,6 +286,138 @@ async fn restored_after_the_snapshot_is_pending() {
     let found = s.discover(&caller, &[OTHER.to_string(), FOURTH.to_string()], &stale).await.expect("discover");
     assert_eq!(found.pending, [OTHER], "{found:?}");
     assert!(found.withheld.is_empty(), "{found:?}");
+    db.drop_db().await;
+}
+
+fn direct_visitor() -> crate::refract::handlers::Caller {
+    crate::refract::handlers::Caller {
+        did: VISITOR.to_string(),
+        viewer: crate::hydration::Viewer { did: Some(VISITOR.to_string()), hydrate: false },
+        req: crate::xrpc::pools::Requester::test(),
+        ip: "192.0.2.1".parse().expect("ip"),
+        member: false,
+        direct: true,
+    }
+}
+
+/// RF-S15: a DID whose resolve is in flight, or failed moments ago, is
+/// pending again with no cap charged and no second resolve; once the
+/// moment has passed it is resolved (and charged) again.
+#[tokio::test]
+async fn resolves_in_flight_or_just_failed_are_not_repeated() {
+    use crate::refract::handlers::{Cap, Discovery};
+    let Some(db) = fresh_db("refract_endpoint_resolving").await else {
+        return;
+    };
+    let h = Harness::new(&db.pool, ScopeSets::default(), vec![tier1()]).await;
+    let mut s = refract_state(&h, None);
+    s.discovery = Arc::new(Discovery::with_failure_memo(Duration::from_millis(1500)));
+    let caller = direct_visitor();
+    let snap = crate::refract::RefractSnapshot::default();
+    let dids = [THIRD.to_string()];
+    let plc_calls = || h.world.lock().expect("world").plc_calls.get(THIRD).copied().unwrap_or_default();
+    // In flight: a slow directory.
+    h.set(|w| {
+        w.plc_delay = Some(Duration::from_millis(400));
+        w.plc_fail.insert(THIRD.to_string());
+    });
+    let first = s.discover(&caller, &dids, &snap).await.expect("discover");
+    let again = s.discover(&caller, &dids, &snap).await.expect("discover");
+    assert_eq!((first.pending.as_slice(), again.pending.as_slice()), (&dids[..], &dids[..]));
+    assert!(again.withheld.is_empty(), "{again:?}");
+    assert_eq!(s.discovery.taken(Cap::Caller, VISITOR), 1, "the re-ask is not charged");
+    assert_eq!(s.discovery.taken(Cap::Ip, "192.0.2.1"), 1);
+    assert_eq!(s.discovery.taken(Cap::Global, ""), 1);
+    // The resolve fails (503): remembered for a moment.
+    let mut failed = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if s.discovery.resolving.failed(THIRD) {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "the resolve failed");
+    let calls = plc_calls();
+    assert!(calls > 0, "the resolve ran");
+    let after_fail = s.discover(&caller, &dids, &snap).await.expect("discover");
+    assert_eq!(after_fail.pending, dids, "{after_fail:?}");
+    assert_eq!(s.discovery.taken(Cap::Caller, VISITOR), 1, "not charged while remembered");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(plc_calls(), calls, "no second resolve");
+    assert_eq!(h.state(THIRD).await, None, "nothing stored");
+    // Past the moment: resolved and charged again.
+    h.set(|w| w.plc_delay = None);
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let later = s.discover(&caller, &dids, &snap).await.expect("discover");
+    assert_eq!(later.pending, dids);
+    assert_eq!(s.discovery.taken(Cap::Caller, VISITOR), 2, "a new resolve is charged");
+    db.drop_db().await;
+}
+
+/// An upstream whose community AppView answers every profile after a
+/// pause, and one DID's never in time.
+struct SlowProfiles {
+    stuck: String,
+}
+
+#[async_trait::async_trait]
+impl crate::hydration::UpstreamSource for SlowProfiles {
+    async fn profile(&self, _req: &crate::xrpc::pools::Requester, _actor: &str) -> Option<Value> {
+        None
+    }
+    async fn fetch_profiles(&self, _req: &crate::xrpc::pools::Requester, dids: &[String], _until: std::time::Instant) -> crate::constellation::ProfilesFetched {
+        let pause = if dids.contains(&self.stuck) { 10_000 } else { 300 };
+        tokio::time::sleep(Duration::from_millis(pause)).await;
+        let mut out = crate::constellation::ProfilesFetched::default();
+        for d in dids {
+            out.found.insert(d.clone(), json!({"did": d, "handle": "restored.test"}));
+        }
+        out
+    }
+    async fn posts(&self, _req: &crate::xrpc::pools::Requester, _uris: &[String]) -> Vec<Value> {
+        Vec::new()
+    }
+    async fn post_thread(&self, _req: &crate::xrpc::pools::Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
+        None
+    }
+    async fn author_feed(&self, _req: &crate::xrpc::pools::Requester, _actor: &str, _limit: u32, _cursor: Option<&str>, _filter: &str) -> Option<Value> {
+        None
+    }
+    async fn follows(&self, _req: &crate::xrpc::pools::Requester, _actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
+        None
+    }
+}
+
+/// RF-S4: a `fill`'s cold restored profiles are walked in parallel, so
+/// twelve 300 ms walks end well inside a 2.5 s deadline (in turn they
+/// would take 3.6 s); one not walked in time is `unavailable`.
+#[tokio::test]
+async fn fill_walks_cold_profiles_in_parallel() {
+    let Some(db) = fresh_db("refract_endpoint_parallel_profiles").await else {
+        return;
+    };
+    let h = Harness::new(&db.pool, ScopeSets::default(), vec![tier1()]).await;
+    let dids: Vec<String> = (b'a'..b'm').map(|c| format!("did:plc:cold{}{}", char::from(c), "a".repeat(19))).collect();
+    let stuck = format!("did:plc:stuck{}", "a".repeat(19));
+    for d in dids.iter().chain([&stuck]) {
+        exec(&h.pool, &format!("INSERT INTO refract_dids (did, community, pds_host, state, source) VALUES ('{d}', 'sky', '127.0.0.1', 'restored', 'fill')")).await;
+    }
+    h.refract.apply_config().await.expect("load");
+    let s = refract_state_over(&h, None, Arc::new(SlowProfiles { stuck: stuck.clone() }));
+    let mut named = dids.clone();
+    named.push(stuck.clone());
+    let viewer = crate::hydration::Viewer { did: Some(VISITOR.to_string()), hydrate: false };
+    let started = std::time::Instant::now();
+    let req = crate::xrpc::pools::Requester::test().with_deadline(started + Duration::from_millis(2500));
+    let body = s.app.hydrator.refract_fill(&viewer, &req, &named, &[], &[], &[]).await.expect("fill");
+    let body = body.inner().clone();
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(2500), "took {took:?}");
+    let served: Vec<&str> = body["profiles"].as_array().expect("profiles").iter().filter_map(|p| p["did"].as_str()).collect();
+    assert_eq!(served.len(), dids.len(), "{body}");
+    assert!(dids.iter().all(|d| served.contains(&d.as_str())), "{body}");
+    assert_eq!(body["withheld"], json!([{"id": stuck, "reason": "unavailable"}]), "{body}");
     db.drop_db().await;
 }
 
