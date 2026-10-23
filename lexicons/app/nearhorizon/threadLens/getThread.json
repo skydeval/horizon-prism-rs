@@ -42,7 +42,7 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["anchor", "nodes", "truncated", "bridging"],
+          "required": ["anchor", "nodes", "truncated", "bridging", "servedAs"],
           "properties": {
             "anchor": { "type": "string", "format": "at-uri" },
             "nodes": {
@@ -64,6 +64,11 @@
               "type": "string",
               "description": "'off': the server could not check the caller's blocks, and the response is what getPostThread would return. 'limited': it could, but at least one post was held back because its author could not be checked. 'full': nothing was held back for that reason. Tells the reader that a thread may be incomplete for want of a check, as opposed to a real block.",
               "knownValues": ["off", "limited", "full"]
+            },
+            "servedAs": {
+              "type": "string",
+              "description": "Whose viewer state the post views carry. 'member': the caller is a ready member; post views carry its own viewer.like and viewer.repost from its records here (absent means not liked or reposted), viewer.threadMuted from its thread mutes here, and on authors following, followedBy, muted, mutedByList and the block fields. 'visitor': anyone else; post views carry no viewer state but viewer.blockedBy and viewer.muted false on authors, and viewer.replyDisabled where the root's threadgate alone decides it.",
+              "knownValues": ["member", "visitor"]
             }
           }
         }

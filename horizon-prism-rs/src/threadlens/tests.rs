@@ -249,7 +249,7 @@ async fn replies_the_root_hid_are_flagged_on_every_path() {
     let (req, key, cfg) = (Requester::test(), CursorKey::generated(), ThreadLensConfig::default());
     let viewer = member(VIEWER_A);
     let request = thread::Request { viewer: &viewer, req: &req, anchor: &root, depth: 6, parent_height: 80 };
-    let emitted = |t: &thread::Thread, anchor: &str| serde_json::to_string(&crate::hydration::lens::lens_thread(anchor, &t.nodes, t.bridging)).expect("json");
+    let emitted = |t: &thread::Thread, anchor: &str| serde_json::to_string(&crate::hydration::lens::lens_thread(anchor, &t.nodes, t.bridging, true)).expect("json");
 
     // Bridging on. The baseline keeps the hidden reply and what is beneath
     // it; the expansion places the blocked reply as a gap and the reply
@@ -275,7 +275,7 @@ async fn replies_the_root_hid_are_flagged_on_every_path() {
     let v: Value = serde_json::from_str(&body).expect("json");
     let mut keys: Vec<&String> = v.as_object().expect("object").keys().collect();
     keys.sort();
-    assert_eq!(keys, ["anchor", "bridging", "nodes", "truncated"]);
+    assert_eq!(keys, ["anchor", "bridging", "nodes", "servedAs", "truncated"]);
     assert_eq!(v["nodes"][0]["post"]["threadgate"]["uri"], json!(gate_uri), "{body}");
     for node in v["nodes"].as_array().expect("nodes").iter().skip(1) {
         let text = node.to_string();
@@ -402,8 +402,109 @@ async fn an_upstream_baselines_gate_flags_its_hidden_replies() {
         let t = thread::get_thread(&l, &ThreadLensConfig::default(), &CursorKey::generated(), request, None).await.expect("thread");
         assert!(t.nodes.iter().any(|n| n.uri() == hid), "{why}: {:?}", t.nodes);
         assert_eq!(flagged(&t.nodes), if flags { vec![hid.clone()] } else { Vec::new() }, "{why}");
-        let body = serde_json::to_string(&crate::hydration::lens::lens_thread(&anchor, &t.nodes, t.bridging)).expect("json");
+        let body = serde_json::to_string(&crate::hydration::lens::lens_thread(&anchor, &t.nodes, t.bridging, true)).expect("json");
         assert!(!body.contains("hiddenReplies") && !body.contains("bafygate") && !body.contains("threadgate\""), "{why}: {body}");
+    }
+    db.drop_db().await;
+}
+
+/// T-7 (threadlens-hydration design §3.4): `viewer.replyDisabled` on the
+/// posts of a thread whose root is a post node, from the root's gate and
+/// this AppView's own rows only; for a visitor only what the gate alone
+/// decides; never when the root is not in the response; no source asked.
+#[tokio::test]
+async fn reply_disabled_comes_from_the_roots_gate_and_local_rows() {
+    use crate::hydration::testing::{FixedUpstream, hydrator_with_upstream_and_farsight, set_mode};
+    use crate::indexing::PublicMode;
+
+    let Some(db) = fresh_db("threadlens_reply_disabled").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(AUTHOR, "author.test"), (R1, "r1.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    let at = |did: &str, rkey: &str| format!("at://{did}/app.bsky.feed.post/{rkey}");
+    let (root, anchor, reply) = (at(AUTHOR, "3kroot222222"), at(AUTHOR, "3kanchor2222"), at(R1, "3kreply22222"));
+    let view = |uri: &str, did: &str, parent: Option<&str>, facets: Value| {
+        let mut record = json!({"$type": "app.bsky.feed.post", "text": uri, "createdAt": "2026-09-26T00:00:00Z", "facets": facets});
+        if let Some(parent) = parent {
+            record["reply"] = json!({"parent": {"uri": parent, "cid": "c"}, "root": {"uri": root, "cid": "c"}});
+        }
+        json!({"$type": "app.bsky.feed.defs#postView", "uri": uri, "cid": "bafy",
+               "author": {"did": did, "handle": "h.test", "viewer": {}, "labels": []},
+               "record": record, "indexedAt": "2026-09-26T00:00:00Z", "viewer": {}, "labels": [], "replyCount": 0})
+    };
+    let mention = json!([{"index": {"byteStart": 0, "byteEnd": 2}, "features": [{"$type": "app.bsky.richtext.facet#mention", "did": VIEWER_A}]}]);
+    let thread = |with_root: bool, facets: &Value| {
+        let mut t = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&anchor, AUTHOR, Some(&root), json!([])),
+            "replies": [{"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&reply, R1, Some(&anchor), json!([])), "replies": []}]});
+        if with_root {
+            t["parent"] = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&root, AUTHOR, None, facets.clone()), "replies": []});
+        }
+        t
+    };
+    let gate = |allow: Option<Value>| {
+        let mut record = json!({"$type": "app.bsky.feed.threadgate", "post": root, "hiddenReplies": [], "createdAt": "2026-09-26T00:00:00Z"});
+        if let Some(allow) = allow {
+            record["allow"] = allow;
+        }
+        json!({"uri": format!("at://{AUTHOR}/app.bsky.feed.threadgate/3kroot222222"), "cid": "bafygate", "record": record, "lists": []})
+    };
+    let rule = |kind: &str| json!({"$type": format!("app.bsky.feed.threadgate#{kind}")});
+    let other_list = json!({"$type": "app.bsky.feed.threadgate#listRule", "list": format!("at://{R1}/app.bsky.graph.list/3klist")});
+    let mut sets = ScopeSets::default();
+    for did in [AUTHOR, R1] {
+        sets.scope.insert(did.into());
+    }
+    // (allow, root in the response, root mentions the member, member follows
+    // the author) → (member's answer, visitor's answer, why).
+    let none = json!([]);
+    let cases: Vec<(Option<Value>, bool, &Value, bool, Option<bool>, Option<bool>, &str)> = vec![
+        (None, true, &none, false, Some(false), Some(false), "no allow: anyone may reply"),
+        (Some(json!([])), true, &none, false, Some(true), Some(true), "empty allow: nobody else may"),
+        (Some(json!([rule("followerRule")])), true, &none, true, Some(false), None, "the member follows the author"),
+        (Some(json!([rule("followerRule")])), true, &none, false, Some(true), None, "it does not"),
+        (Some(json!([rule("followingRule")])), true, &none, false, None, None, "no follow by an author who is no member: unknown"),
+        (Some(json!([rule("mentionRule")])), true, &mention, false, Some(false), None, "the root mentions it"),
+        (Some(json!([other_list.clone()])), true, &none, false, None, None, "a list no ready member owns"),
+        (Some(json!([rule("followerRule"), other_list.clone()])), true, &none, true, Some(false), None, "one rule admits it"),
+        (Some(json!([rule("followingRule")])), true, &none, true, Some(false), None, "the author follows it"),
+        (Some(json!([])), false, &none, false, None, None, "the root is not in the response"),
+    ];
+    for (allow, with_root, facets, follows, member_wants, visitor_wants, why) in cases {
+        exec(p, "DELETE FROM follows").await;
+        if follows {
+            exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.follow/3kf', '{VIEWER_A}', '{AUTHOR}', '3k', now())")).await;
+            // The author follows the member too: `followingRule` admits it.
+            exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{AUTHOR}/app.bsky.graph.follow/3kf', '{AUTHOR}', '{VIEWER_A}', '3k', now())")).await;
+        }
+        let mut up = FixedUpstream::default();
+        up.threads.insert(anchor.clone(), json!({"thread": thread(with_root, facets), "threadgate": gate(allow.clone())}));
+        let up = Arc::new(up);
+        let (farsight, _fake) = crate::farsight::lookup::tests::engine("").await;
+        let h = hydrator_with_upstream_and_farsight(p, sets.clone(), Arc::clone(&up) as Arc<dyn crate::hydration::UpstreamSource>, farsight);
+        set_mode(h.scope(), PublicMode::Off).await;
+        let calls = Arc::new(Calls::default());
+        let base = fake_upstream(Arc::clone(&calls), None).await;
+        let l = ladder(h, &base, Arc::new(StubLookup::default()));
+        for (viewer, wants, who) in [(member(VIEWER_A), member_wants, "member"), (Viewer { did: Some(STRANGER.into()), hydrate: false }, visitor_wants, "visitor")] {
+            let req = Requester::test();
+            let request = thread::Request { viewer: &viewer, req: &req, anchor: &anchor, depth: 6, parent_height: 80 };
+            let t = thread::get_thread(&l, &ThreadLensConfig::default(), &CursorKey::generated(), request, None).await.expect("thread");
+            for node in &t.nodes {
+                let LensNode::Post { uri, post, .. } = node else { continue };
+                let got = post.pointer("/viewer/replyDisabled").and_then(Value::as_bool);
+                assert_eq!(got, wants, "{why}, {who}, {uri}");
+            }
+            assert!(t.nodes.iter().any(|n| n.uri() == reply), "{why}");
+        }
+        // With the root in the baseline nothing is fetched at all; without
+        // it, only the parent walk asks for the root, as it always did.
+        if with_root {
+            assert_eq!((calls.appview.load(Ordering::SeqCst), calls.slingshot.load(Ordering::SeqCst)), (0, 0), "{why}: nothing asked for it");
+        }
     }
     db.drop_db().await;
 }
@@ -453,7 +554,7 @@ async fn a_blocked_by_you_gap_names_the_callers_list() {
     let l = ladder(h, &base, Arc::new(StubLookup::default()));
     let (req, key, cfg) = (Requester::test(), CursorKey::generated(), ThreadLensConfig::default());
     let list_of = |nodes: &[LensNode], uri: &str| -> (Option<&'static str>, Option<String>) {
-        let v = crate::hydration::lens::lens_items(nodes, Bridging::Full);
+        let v = crate::hydration::lens::lens_items(nodes, Bridging::Full, true);
         let item = v.inner()["items"].as_array().expect("items").iter().find(|i| i["uri"] == json!(uri)).cloned().expect("node");
         let gap = Gap::ALL.iter().find(|g| item["gap"] == json!(g.label())).map(|g| g.label());
         (gap, item["blockingByListUri"].as_str().map(str::to_string))
@@ -470,7 +571,7 @@ async fn a_blocked_by_you_gap_names_the_callers_list() {
         assert_eq!(list_of(&t.nodes, &by_r2), (Some("blocking-you"), None));
         // E: from Farsight alone, the caller's own list it named.
         assert_eq!(list_of(&t.nodes, &by_e), (Some("blocked-by-you"), Some(farsight_list.clone())));
-        let body = serde_json::to_string(&crate::hydration::lens::lens_thread(&anchor, &t.nodes, t.bridging)).expect("json");
+        let body = serde_json::to_string(&crate::hydration::lens::lens_thread(&anchor, &t.nodes, t.bridging, true)).expect("json");
         for leaked in ["secret", "r1.test", "r2.test", "d.test", "e.test", crate::farsight::lookup::tests::LIST] {
             assert!(!body.contains(leaked), "{leaked} in {body}");
         }
@@ -692,6 +793,8 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
         "{body}"
     );
     assert_eq!(v["bridging"], "full", "{body}");
+    // T-6 (threadlens-hydration design §3.2): whose viewer state it is.
+    assert_eq!(v["servedAs"], "member", "{body}");
     // A gap carries nothing of its author but the URI.
     assert_eq!(v["nodes"][1].as_object().map(|m| m.keys().filter(|k| !k.starts_with("more")).count()), Some(4));
     for leaked in ["\"one\"", "\"two\"", "r1.test", "r2.test"] {
@@ -727,6 +830,7 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
         "{body_s}"
     );
     assert_eq!(s["bridging"], "full", "{body_s}");
+    assert_eq!(s["servedAs"], "visitor", "{body_s}");
     // Nothing by a blocked author is sent to a visitor either.
     for leaked in ["\"one\"", "\"two\"", "r1.test", "r2.test"] {
         assert!(!body_s.contains(leaked), "{leaked} in {body_s}");
@@ -742,6 +846,7 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     let r: Value = serde_json::from_str(&body).expect("json");
     let gaps: Vec<Value> = r["items"].as_array().expect("items").iter().map(|i| i["gap"].clone()).collect();
     assert_eq!(gaps, [Value::Null, json!("blocked-by-you"), json!("blocking-you")], "{body}");
+    assert_eq!(r["servedAs"], "visitor", "{body}");
     // A member that is not ready is served as a visitor until it is: it
     // follows the author, and is shown no `following`.
     let (status, body) = call(&open, GET_THREAD, R2, 6, &thread_input).await;
@@ -764,6 +869,7 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     let r: Value = serde_json::from_str(&body).expect("json");
     let gaps: Vec<Value> = r["items"].as_array().expect("items").iter().map(|i| i["gap"].clone()).collect();
     assert_eq!(gaps, [Value::Null, json!("tier-hidden"), json!("blocked-by-you"), json!("deleted"), json!("not-found")], "{body}");
+    assert_eq!(r["servedAs"], "member", "{body}");
 
     // Farsight answers without vouching: bridging is off and the response
     // is the ordinary view, which for viewer A is the anchor alone.
@@ -1024,7 +1130,7 @@ async fn the_parent_walk_goes_past_a_blocked_author() {
     assert_eq!(shape(&got.nodes), [(middle.clone(), Some("blocked-by-you")), (leaf.clone(), None)]);
     assert!(got.nodes[0].markers().more_parents);
     assert_eq!(got.nodes[0].parent_uri(), Some(root.as_str()));
-    let emitted = serde_json::to_string(&crate::hydration::lens::lens_thread(&leaf, &got.nodes, got.bridging)).expect("json");
+    let emitted = serde_json::to_string(&crate::hydration::lens::lens_thread(&leaf, &got.nodes, got.bridging, true)).expect("json");
     let top: Value = serde_json::from_str::<Value>(&emitted).expect("json")["nodes"][0].clone();
     assert_eq!(top, json!({"$type": "app.nearhorizon.threadLens.defs#gapNode", "uri": middle, "gap": "blocked-by-you", "parentUri": root, "moreParents": true}));
     assert!(!emitted.contains("\"middle\"") && !emitted.contains("r1.test"), "{emitted}");

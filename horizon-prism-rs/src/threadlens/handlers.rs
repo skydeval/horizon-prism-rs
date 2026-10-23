@@ -174,7 +174,7 @@ pub async fn get_thread(
         parent_height,
     };
     let thread = assemble(&s.ladder, &s.cfg, &s.cursor_key, request, cursor).await?;
-    Ok(Json(lens_thread(&input.anchor, &thread.nodes, thread.bridging)))
+    Ok(Json(lens_thread(&input.anchor, &thread.nodes, thread.bridging, viewer.hydrate)))
 }
 
 pub async fn resolve(
@@ -192,5 +192,5 @@ pub async fn resolve(
         return Err(XrpcError::invalid("Error: uris must be at-uris"));
     }
     let resolved = resolve_each(&s.ladder, &s.cfg, &s.cursor_key, &viewer, &req, &input.uris).await?;
-    Ok(Json(lens_items(&resolved.nodes, resolved.bridging)))
+    Ok(Json(lens_items(&resolved.nodes, resolved.bridging, viewer.hydrate)))
 }

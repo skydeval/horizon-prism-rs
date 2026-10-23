@@ -24,7 +24,7 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["items", "bridging"],
+          "required": ["items", "bridging", "servedAs"],
           "properties": {
             "items": {
               "type": "array",
@@ -41,6 +41,11 @@
               "type": "string",
               "description": "As in getThread.",
               "knownValues": ["off", "limited", "full"]
+            },
+            "servedAs": {
+              "type": "string",
+              "description": "As in getThread.",
+              "knownValues": ["member", "visitor"]
             }
           }
         }

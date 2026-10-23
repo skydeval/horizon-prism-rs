@@ -214,6 +214,28 @@ impl LensNode {
     }
 }
 
+/// The DIDs a post record's facets mention.
+fn mentions(record: &Value) -> HashSet<String> {
+    record
+        .get("facets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|f| f.get("features").and_then(Value::as_array).cloned().unwrap_or_default())
+        .filter(|f| f.get("$type").and_then(Value::as_str) == Some("app.bsky.richtext.facet#mention"))
+        .filter_map(|f| f.get("did").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
+/// A thread root's threadgate, as Thread Lens reads it: the replies it
+/// hides and its `allow` rules (`None` when the field is absent: anyone
+/// may reply).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LensGate {
+    pub hidden: HashSet<String>,
+    pub allow: Option<Vec<Value>>,
+}
+
 /// The state of bridging for one request (§5.15.16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bridging {
@@ -240,19 +262,27 @@ impl Bridging {
 /// `threadLens.getThread` output. `truncated` says that some node carries
 /// a continuation marker.
 #[must_use]
-pub fn lens_thread(anchor: &str, nodes: &[LensNode], bridging: Bridging) -> PublicEmit<Value> {
+pub fn lens_thread(anchor: &str, nodes: &[LensNode], bridging: Bridging, member: bool) -> PublicEmit<Value> {
     let truncated = nodes.iter().any(|n| n.walkable() && n.markers().any());
     PublicEmit::new(json!({
         "anchor": anchor,
         "nodes": nodes.iter().map(LensNode::to_json).collect::<Vec<_>>(),
         "truncated": truncated,
         "bridging": bridging.label(),
+        "servedAs": served_as(member),
     }))
+}
+
+/// `servedAs` (threadlens-hydration design §3.2): whose viewer state the
+/// post views carry. `member`: a ready member's, from its own records here;
+/// `visitor`: none but the request's blocks.
+fn served_as(member: bool) -> &'static str {
+    if member { "member" } else { "visitor" }
 }
 
 /// `threadLens.resolve` output. Items carry no markers.
 #[must_use]
-pub fn lens_items(nodes: &[LensNode], bridging: Bridging) -> PublicEmit<Value> {
+pub fn lens_items(nodes: &[LensNode], bridging: Bridging, member: bool) -> PublicEmit<Value> {
     let items: Vec<Value> = nodes
         .iter()
         .map(|n| {
@@ -264,7 +294,7 @@ pub fn lens_items(nodes: &[LensNode], bridging: Bridging) -> PublicEmit<Value> {
             v
         })
         .collect();
-    PublicEmit::new(json!({ "items": items, "bridging": bridging.label() }))
+    PublicEmit::new(json!({ "items": items, "bridging": bridging.label(), "servedAs": served_as(member) }))
 }
 
 /// Every account a view names: authors, creators and the authorities of
@@ -350,25 +380,123 @@ impl Hydrator {
         Ok(row.map(|(root,)| root.unwrap_or_else(|| uri.to_string())))
     }
 
-    /// The `hiddenReplies` of the valid stored threadgate of each of
-    /// `roots` that has one: its record key is the root's and its author
-    /// the root's author (design-v4 §8.3). Public `threadgates` only.
+    /// The valid stored threadgate of each of `roots` that has one: its
+    /// record key is the root's and its author the root's author
+    /// (design-v4 §8.3). Public `threadgates` only.
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn lens_hidden_replies(&self, roots: &[String]) -> Result<HashMap<String, HashSet<String>>, sqlx::Error> {
+    pub async fn lens_root_gates(&self, roots: &[String]) -> Result<HashMap<String, LensGate>, sqlx::Error> {
         if roots.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
-            "SELECT post_uri, hidden_replies FROM threadgates WHERE post_uri = ANY($1) \
+        let rows: Vec<(String, Option<Vec<String>>, Option<Value>)> = sqlx::query_as(
+            "SELECT post_uri, hidden_replies, allow FROM threadgates WHERE post_uri = ANY($1) \
                AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
         )
         .bind(roots)
         .fetch_all(self.pool())
         .await?;
-        Ok(rows.into_iter().map(|(root, hidden)| (root, hidden.unwrap_or_default().into_iter().collect())).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(root, hidden, allow)| {
+                let gate = LensGate {
+                    hidden: hidden.unwrap_or_default().into_iter().collect(),
+                    allow: allow.and_then(|a| a.as_array().cloned()),
+                };
+                (root, gate)
+            })
+            .collect())
+    }
+
+    /// `viewer.replyDisabled` for the caller on the posts of the thread
+    /// rooted at `root`, under `gate` (threadlens-hydration design §3.4).
+    /// Read from this AppView's own rows only: no source is asked anything
+    /// about the caller. `None` leaves the field out, when the answer
+    /// cannot be known that way.
+    ///
+    /// - The root's author may always reply; with no `allow`, anyone may;
+    ///   with an empty `allow`, nobody else may.
+    /// - Beyond that, only a ready member's rules are read: a visitor's
+    ///   follows and list memberships are not looked up (design-v4
+    ///   §5.15.17). `followerRule` (the caller follows the author) reads
+    ///   the caller's own follows, all stored; `followingRule` (the author
+    ///   follows the caller) is known when the follow is stored, or when the
+    ///   author is a ready member, whose own follows are all stored;
+    ///   `listRule` is read only for a list a ready member owns, whose items
+    ///   are stored; `mentionRule` from the root's record (`root_record`).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn lens_reply_disabled(&self, viewer: &Viewer, root: &str, gate: &LensGate, root_record: &Value) -> Result<Option<bool>, sqlx::Error> {
+        let Some(me) = viewer.did.as_deref() else {
+            return Ok(None);
+        };
+        let author = uri_author(root).unwrap_or_default();
+        if me == author {
+            return Ok(Some(false));
+        }
+        let Some(rules) = &gate.allow else {
+            return Ok(Some(false));
+        };
+        if rules.is_empty() {
+            return Ok(Some(true));
+        }
+        if viewer.state_did().is_none() {
+            return Ok(None);
+        }
+        let mut complete = true;
+        for rule in rules {
+            let allowed = match rule.get("$type").and_then(Value::as_str).unwrap_or_default() {
+                "app.bsky.feed.threadgate#mentionRule" => Some(mentions(root_record).contains(me)),
+                "app.bsky.feed.threadgate#followerRule" => Some(self.lens_follows(me, author).await?),
+                // A follow of the caller by a non-member is stored only from
+                // the firehose since the caller joined: only a ready
+                // member's own follows are all here.
+                "app.bsky.feed.threadgate#followingRule" => {
+                    if self.lens_follows(author, me).await? {
+                        Some(true)
+                    } else if self.is_ready_member(author).await? {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                "app.bsky.feed.threadgate#listRule" => {
+                    let list = rule.get("list").and_then(Value::as_str).unwrap_or_default();
+                    if super::lists::is_list_uri(list) && self.is_ready_member(uri_author(list).unwrap_or_default()).await? {
+                        Some(
+                            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_items WHERE list_uri = $1 AND subject_did = $2)")
+                                .bind(list)
+                                .bind(me)
+                                .fetch_one(self.pool())
+                                .await?,
+                        )
+                    } else {
+                        None
+                    }
+                }
+                // A rule this version does not know.
+                _ => None,
+            };
+            match allowed {
+                Some(true) => return Ok(Some(false)),
+                Some(false) => {}
+                None => complete = false,
+            }
+        }
+        Ok(complete.then_some(true))
+    }
+
+    /// Whether `follower` follows `subject`, from the stored `follows`.
+    async fn lens_follows(&self, follower: &str, subject: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+            .bind(follower)
+            .bind(subject)
+            .fetch_one(self.pool())
+            .await
     }
 
     /// Local post views for `uris`, hydrated for the viewer.
@@ -523,7 +651,7 @@ mod tests {
         blocked.set_blocking_list(Some("at://did:plc:v/app.bsky.graph.list/l".into()));
         hidden.set_blocking_list(Some("at://did:plc:v/app.bsky.graph.list/l".into()));
         let nodes = [first, hidden, blocked];
-        let out = lens_thread("at://did:plc:a/app.bsky.feed.post/2", &nodes, Bridging::Limited);
+        let out = lens_thread("at://did:plc:a/app.bsky.feed.post/2", &nodes, Bridging::Limited, true);
         let v = out.inner();
         assert_eq!(v["nodes"][0]["$type"], "app.nearhorizon.threadLens.defs#postNode");
         assert_eq!(v["nodes"][0]["parentUri"], "at://did:plc:a/app.bsky.feed.post/1");
@@ -539,7 +667,7 @@ mod tests {
         assert!(v["nodes"][1].get("hiddenByThreadgate").is_none());
         assert_eq!(v["nodes"][2]["blockingByListUri"], json!("at://did:plc:v/app.bsky.graph.list/l"));
         assert!(v["nodes"][1].get("blockingByListUri").is_none() && v["nodes"][0].get("blockingByListUri").is_none());
-        let items = lens_items(&nodes, Bridging::Off);
+        let items = lens_items(&nodes, Bridging::Off, false);
         assert!(items.inner()["items"][0].get("moreReplies").is_none());
         // `resolve` items keep it while losing their markers.
         assert_eq!(items.inner()["items"][0]["hiddenByThreadgate"], json!(true));

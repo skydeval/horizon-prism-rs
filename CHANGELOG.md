@@ -10,6 +10,12 @@ commit.
 
 ## [Unreleased]
 
+### Added (Thread Lens hydrated views, #878, #886)
+
+- **`servedAs`** on every `app.nearhorizon.threadLens.getThread` and `resolve` answer: `member` (a ready member: post views carry its own `viewer.like`, `viewer.repost` and `viewer.threadMuted` as Prism holds them, and author viewer state) or `visitor` (none but `blockedBy` and `muted: false`). Visitors get no like or repost state: no reader DID is sent anywhere to find it.
+- **`viewer.replyDisabled` on lens post views**, on the posts of a thread whose root is a post node of the answer, from the root's threadgate (stored, or the one the upstream returned with the thread) and Prism's own rows only: the root's author and a gate with no `allow` give `false`, an empty `allow` gives `true`; for a ready member, `followerRule`, `followingRule` (known when the follow is stored or the root's author is a ready member), `mentionRule` (the root record's facets) and `listRule` (lists a ready member owns). Left out when that cannot decide it, and whenever the root is a gap or not in the answer, so nothing of a gap root's gate is sent. No outside call is made for it.
+- **`threadLens.hydrated`** in `getMembership.features` (with `threadLens`). The lexicons describe what a lens post view carries: viewer state per `servedAs`, counts (the upstream's, or Prism's Constellation count; none on a post built from its record), `replyDisabled` as above, and labels that are Prism's own, not the reader's labelers' (`atproto-accept-labelers` is not honoured; a decision for skydeval, #887).
+
 ### Changed (Thread Lens latency, #878, #885)
 
 - **`getThread` is about three times faster on a bridged thread** (a 46-post bench thread with measured network delays: 2221 ms → 748 ms median; design `threadlens-hydration.md` §1–§2). The response is the same except where a reply page is slow (below).

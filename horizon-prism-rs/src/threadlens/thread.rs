@@ -45,7 +45,7 @@ use super::verdict::{Judge, Verdict};
 use crate::config::ThreadLensConfig;
 use crate::db::locks::uri_author;
 use crate::farsight::{Farsight, Lookup};
-use crate::hydration::lens::{Bridging, LensNode, named_accounts};
+use crate::hydration::lens::{Bridging, LensGate, LensNode, named_accounts};
 use crate::hydration::normalize::is_private_uri;
 use crate::hydration::{HydrationError, KnownBlocks, Viewer, with_known_blocks};
 use crate::xrpc::pools::Requester;
@@ -1110,8 +1110,8 @@ pub async fn get_thread(
     work.author_pass().await;
     work.name_lists();
     phases.mark("authors");
-    if let Some((root, hidden)) = thread_gate(h, r.anchor, &work.nodes, gate_view.as_ref()).await? {
-        flag_hidden(&mut work.nodes, &root, &hidden, r.viewer);
+    if let Some((root, gate)) = thread_gate(h, r.anchor, &work.nodes, gate_view.as_ref()).await? {
+        apply_gate(h, &mut work.nodes, &root, &gate, r.viewer).await?;
     }
     phases.mark("gate");
     let bridging = match (bridging, work.limited) {
@@ -1136,7 +1136,7 @@ fn rkey(uri: &str) -> &str {
 /// used only when it is self-consistent and names this root. A private
 /// root has no gate here: Thread Lens never reads the private tier.
 /// Only the flags come of it.
-async fn thread_gate(h: &crate::hydration::Hydrator, anchor: &str, nodes: &[LensNode], view: Option<&Value>) -> Result<Option<(String, HashSet<String>)>, sqlx::Error> {
+async fn thread_gate(h: &crate::hydration::Hydrator, anchor: &str, nodes: &[LensNode], view: Option<&Value>) -> Result<Option<(String, LensGate)>, sqlx::Error> {
     let root = match h.lens_stored_root(anchor).await? {
         Some(root) => Some(root),
         None => nodes.iter().find_map(|n| match n {
@@ -1148,9 +1148,9 @@ async fn thread_gate(h: &crate::hydration::Hydrator, anchor: &str, nodes: &[Lens
         return Ok(None);
     }
     if let Some(root) = &root
-        && let Some(hidden) = h.lens_hidden_replies(std::slice::from_ref(root)).await?.remove(root)
+        && let Some(gate) = h.lens_root_gates(std::slice::from_ref(root)).await?.remove(root)
     {
-        return Ok(Some((root.clone(), hidden)));
+        return Ok(Some((root.clone(), gate)));
     }
     let Some(view) = view else {
         return Ok(None);
@@ -1170,7 +1170,51 @@ async fn thread_gate(h: &crate::hydration::Hydrator, anchor: &str, nodes: &[Lens
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect();
-    Ok(Some((post.to_string(), hidden)))
+    let allow = view.pointer("/record/allow").and_then(Value::as_array).cloned();
+    Ok(Some((post.to_string(), LensGate { hidden, allow })))
+}
+
+/// The root post's record, when the response holds the root as a post
+/// node.
+fn root_record<'a>(nodes: &'a [LensNode], root: &str) -> Option<&'a Value> {
+    nodes.iter().find_map(|n| match n {
+        LensNode::Post { uri, post, .. } if uri == root => post.get("record"),
+        _ => None,
+    })
+}
+
+/// Set `viewer.replyDisabled` to `disabled` on every post node of the thread
+/// rooted at `root` (threadlens-hydration design §3.4).
+fn set_reply_disabled(nodes: &mut [LensNode], root: &str, disabled: bool) {
+    for node in nodes {
+        if let LensNode::Post { uri, root_uri, post, .. } = node
+            && root_uri.as_deref().unwrap_or(uri.as_str()) == root
+        {
+            post["viewer"]["replyDisabled"] = json!(disabled);
+        }
+    }
+}
+
+/// `viewer.replyDisabled` from the root's gate, on the thread's post
+/// nodes, where it can be known (threadlens-hydration design §3.4). Only
+/// while the root itself is a post node of the response: then its own view
+/// carries its gate already, and nothing of a gap root's gate is sent
+/// (amendment 1 §2.5).
+async fn apply_reply_disabled(h: &crate::hydration::Hydrator, nodes: &mut [LensNode], root: &str, gate: &LensGate, viewer: &Viewer) -> Result<(), sqlx::Error> {
+    let Some(record) = root_record(nodes, root).cloned() else {
+        return Ok(());
+    };
+    if let Some(disabled) = h.lens_reply_disabled(viewer, root, gate, &record).await? {
+        set_reply_disabled(nodes, root, disabled);
+    }
+    Ok(())
+}
+
+/// The root's gate on `nodes`: the hidden flags (amendment 1 §2), then
+/// `viewer.replyDisabled`.
+async fn apply_gate(h: &crate::hydration::Hydrator, nodes: &mut [LensNode], root: &str, gate: &LensGate, viewer: &Viewer) -> Result<(), sqlx::Error> {
+    flag_hidden(nodes, root, &gate.hidden, viewer);
+    apply_reply_disabled(h, nodes, root, gate, viewer).await
 }
 
 /// `at://<did>/app.bsky.feed.threadgate/<rkey>`.
@@ -1205,19 +1249,24 @@ async fn resolve_hidden(h: &crate::hydration::Hydrator, nodes: &mut [LensNode], 
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    let gates = h.lens_hidden_replies(&roots).await?;
+    let gates = h.lens_root_gates(&roots).await?;
     if gates.is_empty() {
         return Ok(());
     }
-    for node in nodes {
+    // The flags per item; `viewer.replyDisabled` once per root, on every
+    // item of its thread (threadlens-hydration design §3.4).
+    for node in nodes.iter_mut() {
         let LensNode::Post { uri, root_uri, .. } = &*node else {
             continue;
         };
         let root = root_uri.clone().unwrap_or_else(|| uri.clone());
-        if let Some(hidden) = gates.get(&root) {
+        if let Some(gate) = gates.get(&root) {
             let one = std::slice::from_mut(node);
-            flag_hidden(one, &root, hidden, viewer);
+            flag_hidden(one, &root, &gate.hidden, viewer);
         }
+    }
+    for (root, gate) in &gates {
+        apply_reply_disabled(h, nodes, root, gate, viewer).await?;
     }
     Ok(())
 }

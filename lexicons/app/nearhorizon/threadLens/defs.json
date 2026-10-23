@@ -15,7 +15,7 @@
     },
     "postNode": {
       "type": "object",
-      "description": "A post in a Thread Lens response, hydrated for the caller: viewer state is the caller's own.",
+      "description": "A post in a Thread Lens response, hydrated for the caller (see servedAs on the output). Viewer state is the caller's own as this server holds it: a ready member's like, repost and thread mute from its records here; for anyone else none but the block fields. Counts (likeCount, repostCount, replyCount, quoteCount) are the upstream AppView's, each replaced by this server's Constellation count for the post when it has one; a post built from its record alone (when no AppView returned it) has none. viewer.replyDisabled is set on the posts of a thread whose root is a post node of the response, from the root's threadgate and this server's own records, and left out when it cannot be known that way. Labels are this server's own (its operator's, and a restored account's community labeler's), not the caller's labelers'. viewer.embeddingDisabled is present only where this server stores the post's postgate.",
       "required": ["uri", "post"],
       "properties": {
         "uri": { "type": "string", "format": "at-uri" },
