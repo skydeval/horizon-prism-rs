@@ -486,16 +486,11 @@ async fn t_as8_definitive_refusals() {
     let dave_root = f.private_post(DAVE, "3kas8dave222", &dave_everyone, None).await;
     let dave_froot = f.private_post(DAVE, "3kas8davef22", &dave_followers, None).await;
     f.ready(DAVE).await;
-    let private_block = format!(
-        "INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
-         VALUES ('at://{BOB}/tools.kryphocron.graph.block/3kpb', '{BOB}', '{ALICE}', '3k', now())"
-    );
     // (case, setup, teardown, the thread replied in, the audience).
     type Case<'a> = (&'a str, String, String, Option<(&'a str, &'a str)>, &'a str);
     let cases: Vec<Case> = vec![
         ("Bob blocks Alice", block_sql(BOB, ALICE), "DELETE FROM blocks".into(), None, aud.as_str()),
         ("Alice blocks Bob", block_sql(ALICE, BOB), "DELETE FROM blocks".into(), None, aud.as_str()),
-        ("a private block", private_block, "DELETE FROM private_blocks".into(), None, aud.as_str()),
         ("a list block", list_block_sql(BOB, CAROL, "3kmodlist222", &[ALICE]), "DELETE FROM list_references".into(), None, aud.as_str()),
         (
             "Bob blocks the thread's owner",

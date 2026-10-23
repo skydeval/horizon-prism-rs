@@ -8,7 +8,7 @@
 //!    create/update, `RecordNotFound` → delete.
 //!
 //! `requestRecord` then runs [`catch_up`] (private posting §3.8): a bounded
-//! full listing of the caller's four authorization collections at R, which
+//! full listing of the caller's three authorization collections at R, which
 //! may advance the caller's `applied_rev` to R as an `authz` job does.
 //! design-v4 §II-6.11.3's "exactly two writers" of `applied_rev` are three:
 //! the firehose worker, full-authorization jobs, and this catch-up, which is
@@ -208,7 +208,7 @@ enum Ended {
 /// 2. The gap epoch is read; the `sync_state` row is made sure of and its
 ///    follow counter read, in one statement (following-audience design
 ///    §3.2), before any listing.
-/// 3. The four authorization collections are listed to the end and each
+/// 3. The three authorization collections are listed to the end and each
 ///    record whose CID is not stored is written at `rev` as
 ///    [`WriteSource::CatchUp`], with `dead_letter_readiness`: a failed write
 ///    clears the DID's readiness and queues `authz` in its own transaction,

@@ -63,8 +63,7 @@ pub(crate) async fn owners_not_ready(pool: &PgPool) -> Result<i64, sqlx::Error> 
 /// Whether any private row is stored.
 async fn rows_exist(pool: &PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM private_posts) OR EXISTS (SELECT 1 FROM private_audiences) \
-             OR EXISTS (SELECT 1 FROM private_blocks)",
+        "SELECT EXISTS (SELECT 1 FROM private_posts) OR EXISTS (SELECT 1 FROM private_audiences)",
     )
     .fetch_one(pool)
     .await
@@ -74,8 +73,7 @@ async fn rows_exist(pool: &PgPool) -> Result<bool, sqlx::Error> {
 async fn newest_row(pool: &PgPool) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT max(t) FROM (SELECT max(indexed_at) AS t FROM private_posts \
-           UNION ALL SELECT max(indexed_at) FROM private_audiences \
-           UNION ALL SELECT max(indexed_at) FROM private_blocks) m",
+           UNION ALL SELECT max(indexed_at) FROM private_audiences) m",
     )
     .fetch_one(pool)
     .await

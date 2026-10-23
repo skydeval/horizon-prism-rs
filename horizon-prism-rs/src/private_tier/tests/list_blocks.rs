@@ -251,12 +251,12 @@ async fn t_pb8_list_block_probes_are_index_backed() {
 }
 
 /// T-PB unit checks: the purpose rule has one definition; `blocked` has its
-/// six terms; the builder's aliases capture no outer row; the feature.
+/// four terms (two direct, two list; private blocks removed 2026-10-24); the builder's aliases capture no outer row; the feature.
 #[test]
 fn t_pb_unit_the_builder() {
     assert_eq!(crate::hydration::applies_as("r", "l"), crate::hydration::APPLIES);
     let b = schema::blocked_for_tests("$1", "l.author_did");
-    assert_eq!(b.matches("EXISTS (").count(), 6, "{b}");
+    assert_eq!(b.matches("EXISTS (").count(), 4, "{b}");
     assert!(b.contains("lbi.subject_did = l.author_did") && b.contains("lbr.member_did = l.author_did"), "{b}");
     assert!(b.contains("$1 <> l.author_did") && b.contains("l.author_did <> $1"), "{b}");
     for alias in ["l", "r", "i", "q", "s", "k", "b", "c", "p"] {

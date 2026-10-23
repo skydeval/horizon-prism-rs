@@ -57,7 +57,7 @@ use url::Url;
 use super::classifier::{
     NSID_ACTOR_STATUS, NSID_AUDIENCE, NSID_BLOCK, NSID_CONTENT_VISIBILITY, NSID_FOLLOW, NSID_LABELER_SERVICE, NSID_LIKE,
     NSID_LIST, NSID_LIST_OPTOUT, NSID_LISTBLOCK, NSID_LISTITEM, NSID_NOTIFICATION_DECLARATION, NSID_POLL_POST,
-    NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_PROFILE, NSID_REPOST, NSID_STARTER_PACK,
+    NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PROFILE, NSID_REPOST, NSID_STARTER_PACK,
     NSID_THREADGATE,
 };
 use super::follows_pass::{self, Fetched, FollowsLister, PassOutcome, PassSettings};
@@ -282,7 +282,7 @@ pub enum Limit {
 pub struct CollectionPlan {
     pub nsid: &'static str,
     pub limit: Limit,
-    /// One of the four authorization collections (§6.11.3).
+    /// One of the three authorization collections (§6.11.3).
     pub authorization: bool,
 }
 
@@ -313,15 +313,15 @@ const fn authorization(nsid: &'static str) -> CollectionPlan {
     }
 }
 
-/// The four authorization collections (§6.11.3), in listing order. Also
-/// what `requestRecord`'s catch-up lists (private posting §3.8).
-pub const AUTHORIZATION_NSIDS: [&str; 4] = [NSID_BLOCK, NSID_PRIVATE_BLOCK, NSID_AUDIENCE, NSID_POST_PRIVATE];
+/// The three authorization collections (§6.11.3), in listing order. Also
+/// what `requestRecord`'s catch-up lists (private posting §3.8). Private
+/// blocks are no longer one: they were removed (skydeval, 2026-10-24).
+pub const AUTHORIZATION_NSIDS: [&str; 3] = [NSID_BLOCK, NSID_AUDIENCE, NSID_POST_PRIVATE];
 
-const AUTHORIZATION: [CollectionPlan; 4] = [
+const AUTHORIZATION: [CollectionPlan; 3] = [
     authorization(AUTHORIZATION_NSIDS[0]),
     authorization(AUTHORIZATION_NSIDS[1]),
     authorization(AUTHORIZATION_NSIDS[2]),
-    authorization(AUTHORIZATION_NSIDS[3]),
 ];
 
 // Gates are listed after posts, with the posts' limit, and only gates of the
@@ -2471,8 +2471,8 @@ mod tests {
         ]);
         let member = plan(Depth::Member, true);
         assert!(member.inbound_blocks && member.self_records == SELF_RECORDS);
-        assert_eq!(member.collections.len(), 16);
-        assert_eq!(member.collections.iter().filter(|c| c.authorization).count(), 4);
+        assert_eq!(member.collections.len(), 15);
+        assert_eq!(member.collections.iter().filter(|c| c.authorization).count(), 3);
         assert!(member.collections.iter().filter(|c| c.authorization).all(|c| c.limit == Limit::All));
         // A member's list collections are listed whole.
         for nsid in [NSID_LIST, NSID_LISTITEM, NSID_LISTBLOCK, NSID_LIST_OPTOUT, NSID_STARTER_PACK] {
@@ -2543,7 +2543,7 @@ mod tests {
                     assert!(p.self_records.is_empty() || p.self_records == SELF_RECORDS);
                 }
             }
-            assert_eq!(nsids(&plan(Depth::Member, true, mode)).len(), 16);
+            assert_eq!(nsids(&plan(Depth::Member, true, mode)).len(), 15);
         }
     }
 

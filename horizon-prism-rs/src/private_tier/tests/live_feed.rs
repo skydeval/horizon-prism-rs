@@ -10,8 +10,10 @@ use serde_json::{Value, json};
 use super::*;
 use crate::admin::live::Hub;
 use crate::admin::test_support::{OPERATOR, OPERATOR_PDS, Sse, page_id, serve, session};
-use crate::firehose::classifier::NSID_PRIVATE_BLOCK;
 
+/// A private block: skipped since they were removed (skydeval,
+/// 2026-10-24), and its subject is never on the feed either.
+const NSID_PRIVATE_BLOCK: &str = "tools.kryphocron.graph.block";
 const PRIVATE_TEXT: &str = "marker-private-text-41f3";
 const AUDIENCE_MEMBER: &str = "did:plc:mmmmmmmmmmmmmmmmmmmmmmmm";
 const BLOCKED: &str = "did:plc:kkkkkkkkkkkkkkkkkkkkkkkk";
@@ -83,7 +85,7 @@ async fn t_f4_private_content_never_in_a_line() {
     }
     // The private kinds are on the feed, with the author only.
     let all = lines(&events);
-    for kind in ["audience", "private-post", "private-block", "private-post-gate"] {
+    for kind in ["audience", "private-post", "private-post-gate"] {
         let line = all.iter().find(|l| l["k"] == kind).unwrap_or_else(|| panic!("a {kind} line: {all:?}"));
         assert_eq!(line["did"], ALICE, "{kind}");
         assert_eq!(line["who"], "alice.test", "{kind}");

@@ -263,8 +263,7 @@ impl Hydrator {
 
     /// `app.bsky.graph.getBlocks`: the (member) viewer's own
     /// `app.bsky.graph.block` records, newest first, each with
-    /// `viewer.blocking`. Private blocks are in another table and never
-    /// listed (§II-7.5).
+    /// `viewer.blocking` (§II-7.5).
     ///
     /// # Errors
     ///

@@ -3,8 +3,7 @@
 //! storage sampler's per-table series without naming a private table itself
 //! (the image build's private-table source check), and how many stored
 //! private posts carry images or a video (private-media-filters design §2);
-//! and one account's private posts, by media kind, and private blocks, for
-//! Look up (§6.10).
+//! and one account's private posts, by media kind, for Look up (§6.10).
 
 use sqlx::PgPool;
 
@@ -14,7 +13,6 @@ use super::media::{IMAGE, VIDEO};
 const TABLE_LABELS: &[(&str, &str)] = &[
     ("private_posts", "Private posts"),
     ("private_audiences", "Who may see each private post"),
-    ("private_blocks", "Private blocks"),
     ("private_tombstones", "Deleted private records remembered"),
     ("private_owner_ready", "Accounts whose private posts are ready"),
     ("private_owner_eligible", "Accounts checked for private posting"),
@@ -41,12 +39,6 @@ pub(crate) fn admin_table_labels() -> &'static [(&'static str, &'static str)] {
 #[must_use]
 pub(crate) fn admin_posts_table() -> &'static str {
     TABLE_LABELS[0].0
-}
-
-/// The private blocks' table, as the sampler's `table` label names it.
-#[must_use]
-pub(crate) fn admin_blocks_table() -> &'static str {
-    TABLE_LABELS[2].0
 }
 
 /// Stored private posts with images (or a gallery) and with a video. Each
@@ -81,12 +73,9 @@ pub(crate) struct AccountCounts {
     pub with_images: i64,
     /// Of them, with a video.
     pub with_video: i64,
-    /// Private blocks the account made that Prism keeps (only those with a
-    /// member on one side, member-blocks-only design).
-    pub blocks: i64,
 }
 
-/// [`AccountCounts`] for `did`. Each count reads the author's own index
+/// [`AccountCounts`] for `did`. The count reads the author's own index
 /// rows, under a 2-second statement timeout.
 ///
 /// # Errors
@@ -102,9 +91,8 @@ pub(crate) async fn account_counts(pool: &PgPool, did: &str) -> Result<AccountCo
     .bind(did)
     .fetch_one(&mut *tx)
     .await?;
-    let blocks: i64 = sqlx::query_scalar("SELECT count(*) FROM private_blocks WHERE author_did = $1").bind(did).fetch_one(&mut *tx).await?;
     tx.commit().await?;
-    Ok(AccountCounts { posts, with_images, with_video, blocks })
+    Ok(AccountCounts { posts, with_images, with_video })
 }
 
 #[cfg(test)]
@@ -117,14 +105,13 @@ mod tests {
     #[tokio::test]
     async fn labels_cover_the_private_tables_and_media_counts() {
         for table in [
-            "posts", "audiences", "blocks", "tombstones", "owner_ready", "owner_eligible", "bookmarks", "threadgates", "postgates", "quote_refs",
+            "posts", "audiences", "tombstones", "owner_ready", "owner_eligible", "bookmarks", "threadgates", "postgates", "quote_refs",
             "notifications", "notification_seen", "notification_prefs", "activity_subscriptions", "post_fanout", "appearance",
         ] {
             let name = format!("private_{table}");
             assert!(admin_table_labels().iter().any(|(t, l)| *t == name && !l.is_empty()), "{name}");
         }
         assert_eq!(admin_posts_table(), "private_posts");
-        assert_eq!(admin_blocks_table(), "private_blocks");
         let Some(db) = fresh_db("private_media_counts").await else {
             return;
         };
@@ -141,16 +128,9 @@ mod tests {
             .expect("row");
         }
         assert_eq!(media_post_counts(&db.pool).await.expect("counts"), (2, 2));
-        // One account's counts: its posts by media kind and its blocks.
-        sqlx::query(
-            "INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
-             VALUES ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.nearhorizon.graph.blockPrivate/3kb', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '3k', now())",
-        )
-        .execute(&db.pool)
-        .await
-        .expect("block");
+        // One account's counts: its posts by media kind.
         let mine = account_counts(&db.pool, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await.expect("account");
-        assert_eq!(mine, AccountCounts { posts: 4, with_images: 2, with_video: 2, blocks: 1 });
+        assert_eq!(mine, AccountCounts { posts: 4, with_images: 2, with_video: 2 });
         assert_eq!(account_counts(&db.pool, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").await.expect("other"), AccountCounts::default());
         db.drop_db().await;
     }

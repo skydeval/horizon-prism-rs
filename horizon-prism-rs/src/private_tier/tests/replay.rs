@@ -592,9 +592,8 @@ in_both_modes!(t67_sources: t67_sources_on, t67_sources_off);
 
 // ---- T-68: deny-only classes ----
 
-/// T-68: below the listed revs, a private block, a public block, a
-/// threadgate of a private post and a follow are applied, and so is a
-/// delete.
+/// T-68: below the listed revs, a block, a threadgate of a private post
+/// and a follow are applied, and so is a delete.
 async fn t68_deny_only_classes(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
@@ -606,7 +605,6 @@ async fn t68_deny_only_classes(test: &str, mode: PublicMode) {
     assert_eq!(listed(&h, ALICE).await, both(R3));
     let at = "2026-10-01T00:00:00Z";
     for (collection, rkey, record) in [
-        ("tools.kryphocron.graph.block", "3kt68pblk", json!({"$type": "tools.kryphocron.graph.block", "subject": CAROL, "createdAt": at})),
         ("app.bsky.graph.block", "3kt68blk", json!({"$type": "app.bsky.graph.block", "subject": DAVE, "createdAt": at})),
         (THREADGATE, "3kt68pst", json!({"$type": THREADGATE, "post": p, "allow": [], "createdAt": at})),
         (FOLLOW, "3kt68fol", follow_record(CAROL)),

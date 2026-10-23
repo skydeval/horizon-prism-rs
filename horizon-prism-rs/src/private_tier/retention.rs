@@ -7,9 +7,7 @@
 //!   delete re-checks scope and membership inside that transaction.
 //!   - `private_posts`: author out of scope, unless the reply parent or root
 //!     author, or the audience's author, is a member (§9.3 rule 2);
-//!   - `private_audiences`: owner out of scope;
-//!   - `private_blocks`: neither the author nor the subject is a member
-//!     (member-blocks-only design §8).
+//!   - `private_audiences`: owner out of scope.
 //! - Class T: `private_tombstones` older than `retention.tombstone_days`;
 //!   `private_notifications` older than `retention.notification_days`;
 //!   `private_post_fanout` rows done more than two days ago
@@ -50,12 +48,6 @@ struct Step {
 fn steps() -> Vec<Step> {
     let posts = format!("{} AND NOT {}", not_in_scope("p.author_did"), super::ingest::REPLY_TO_MEMBER);
     let audiences = not_in_scope("a.owner_did");
-    // Rule M (member-blocks-only design §8): kept only with a member side,
-    // whatever the author's scope. `$1`, the owner set, keeps the shape and
-    // is no longer tested for blocks.
-    let blocks = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = b.author_did) \
-                  AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = b.subject_did)"
-        .to_string();
     let step = |table: &'static str, key: &str, alias: &str, did_col: &str, pred: &str, owner_rows: bool| Step {
         table,
         candidates: format!(
@@ -70,7 +62,6 @@ fn steps() -> Vec<Step> {
     vec![
         step("private_posts", "uri", "p", "author_did", &posts, true),
         step("private_audiences", "uri", "a", "owner_did", &audiences, true),
-        step("private_blocks", "uri", "b", "author_did", &blocks, false),
     ]
 }
 

@@ -18,7 +18,6 @@ pub enum RecordKind {
     Table(&'static str),
     PrivatePost,
     PrivateAudience,
-    PrivateBlock,
     /// A stock `app.bsky.feed.threadgate` or `postgate` whose `post` is a
     /// `postPrivate` URI (private posting §4.4, P-18). Its one subject is the
     /// gated post's author.
@@ -34,20 +33,18 @@ impl RecordKind {
     /// Private-tier kinds (`Kryphocron(Private)`, and gates of private posts).
     #[must_use]
     pub fn is_private(self) -> bool {
-        matches!(
-            self,
-            Self::PrivatePost | Self::PrivateAudience | Self::PrivateBlock | Self::PrivateGate
-        )
+        matches!(self, Self::PrivatePost | Self::PrivateAudience | Self::PrivateGate)
     }
 
-    /// Block records of either namespace (§9.3 rule 3).
+    /// Block records (§9.3 rule 3): `app.bsky.graph.block` only, since
+    /// private blocks were removed (skydeval, 2026-10-24).
     #[must_use]
     pub fn is_block(self) -> bool {
-        matches!(self, Self::Block | Self::PrivateBlock)
+        matches!(self, Self::Block)
     }
 
-    /// The kinds Rule M decides (member-blocks-only design §2): direct and
-    /// private blocks, and list blocks.
+    /// The kinds Rule M decides (member-blocks-only design §2): direct
+    /// blocks and list blocks.
     #[must_use]
     pub fn is_block_kind(self) -> bool {
         self.is_block() || self == Self::Table("list_blocks")
@@ -270,7 +267,6 @@ fn off_rule(input: &AdmissionInput, sets: &ScopeSets) -> Option<Admission> {
         | RecordKind::Table("actor_self_records")
         | RecordKind::PrivatePost
         | RecordKind::PrivateAudience
-        | RecordKind::PrivateBlock
         | RecordKind::PrivateGate => None,
         // Decided before the off rule, through its public row.
         RecordKind::PublicRootGate => None,
@@ -339,7 +335,6 @@ mod tests {
             RecordKind::Follow,
             RecordKind::Block,
             RecordKind::PrivatePost,
-            RecordKind::PrivateBlock,
         ] {
             assert_eq!(
                 admit(&input(STRANGER, kind, &[OTHER, MEMBER]), &sets()),
@@ -354,18 +349,14 @@ mod tests {
     /// stores no block of a non-member.
     #[test]
     fn rule_3_admits_no_block() {
-        for kind in [RecordKind::Block, RecordKind::PrivateBlock] {
-            assert_eq!(
-                admit(&input(OWNER, kind, &[STRANGER]), &sets()),
-                Admission::Reject(RejectReason::NoMemberSide),
-                "{kind:?}"
-            );
-            assert_eq!(
-                admit(&input(OWNER, kind, &[MEMBER]), &sets()),
-                Admission::Admit(AdmitRule::InboundToMember),
-                "{kind:?}"
-            );
-        }
+        assert_eq!(
+            admit(&input(OWNER, RecordKind::Block, &[STRANGER]), &sets()),
+            Admission::Reject(RejectReason::NoMemberSide)
+        );
+        assert_eq!(
+            admit(&input(OWNER, RecordKind::Block, &[MEMBER]), &sets()),
+            Admission::Admit(AdmitRule::InboundToMember)
+        );
         assert_eq!(
             admit(&input(OWNER, RecordKind::Like, &[STRANGER]), &sets()),
             Admission::Reject(RejectReason::NotInScope)
@@ -381,18 +372,17 @@ mod tests {
             let s = with_mode(mode);
             let a = |author: &str, kind: RecordKind, subjects: &[&str]| admit(&input(author, kind, subjects), &s);
             // A member's block of anyone, list blocks included.
-            for kind in [RecordKind::Block, RecordKind::PrivateBlock, LIST_BLOCK] {
+            for kind in [RecordKind::Block, LIST_BLOCK] {
                 assert_eq!(a(MEMBER, kind, &[STRANGER]), Admission::Admit(AdmitRule::AuthorInScope), "{mode:?} {kind:?}");
             }
             assert_eq!(a(MEMBER, LIST_BLOCK, &[]), Admission::Admit(AdmitRule::AuthorInScope), "{mode:?}");
-            for kind in [RecordKind::Block, RecordKind::PrivateBlock] {
-                // A scoped non-member's block of a non-member: not stored.
-                assert_eq!(a(SCOPED, kind, &[OTHER]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?} {kind:?}");
-                assert_eq!(a(STRANGER, kind, &[OTHER]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?} {kind:?}");
-                // Of a member: stored.
-                assert_eq!(a(SCOPED, kind, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember), "{mode:?} {kind:?}");
-                assert_eq!(a(STRANGER, kind, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember), "{mode:?} {kind:?}");
-            }
+            let kind = RecordKind::Block;
+            // A scoped non-member's block of a non-member: not stored.
+            assert_eq!(a(SCOPED, kind, &[OTHER]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?}");
+            assert_eq!(a(STRANGER, kind, &[OTHER]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?}");
+            // Of a member: stored.
+            assert_eq!(a(SCOPED, kind, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember), "{mode:?}");
+            assert_eq!(a(STRANGER, kind, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember), "{mode:?}");
             // A non-member's list block, in every mode.
             assert_eq!(a(SCOPED, LIST_BLOCK, &[]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?}");
             assert_eq!(a(STRANGER, LIST_BLOCK, &[]), Admission::Reject(RejectReason::NoMemberSide), "{mode:?}");
@@ -415,7 +405,7 @@ mod tests {
             );
         }
         assert_eq!(RejectReason::NoMemberSide.as_str(), "no_member_side");
-        assert!(LIST_BLOCK.is_block_kind() && RecordKind::Block.is_block_kind() && RecordKind::PrivateBlock.is_block_kind());
+        assert!(LIST_BLOCK.is_block_kind() && RecordKind::Block.is_block_kind());
         assert!(!RecordKind::Table("list_items").is_block_kind() && !RecordKind::Follow.is_block_kind());
     }
 

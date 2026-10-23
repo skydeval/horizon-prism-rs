@@ -34,7 +34,7 @@
 
   var KIND = {
     'list-item': 'list item', 'list-block': 'list block', 'list-optout': 'list opt-out',
-    'starter-pack': 'starter pack', 'private-post': 'private post', 'private-block': 'private block',
+    'starter-pack': 'starter pack', 'private-post': 'private post',
     'private-post-gate': 'private-post gate'
   };
   var REASON = {

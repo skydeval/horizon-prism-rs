@@ -64,8 +64,8 @@ use crate::firehose::writer::WriteSource;
 pub struct PrivateOp {
     pub uri: String,
     pub author_did: String,
-    /// `tools.kryphocron.feed.postPrivate`, `tools.kryphocron.policy.audience`
-    /// or `tools.kryphocron.graph.block`.
+    /// `tools.kryphocron.feed.postPrivate` or
+    /// `tools.kryphocron.policy.audience`.
     pub nsid: String,
     pub rkey: String,
     pub cid: String,

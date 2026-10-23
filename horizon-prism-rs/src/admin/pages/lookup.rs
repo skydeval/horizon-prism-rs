@@ -4,8 +4,8 @@
 //! Prism (and what holds it there, scope-recency design), ready and
 //! receiving updates; its labels and jobs; the blocks Prism keeps for it
 //! (only those with a member on one side, member-blocks-only design); its
-//! private posts by media kind and its private blocks (through the private
-//! tier's own counts); and links to the actions for it.
+//! private posts by media kind (through the private tier's own counts); and
+//! links to the actions for it.
 //!
 //! Identity is read the way admin commands read it: the PLC directory (or
 //! the account's own address for `did:web`) and Prism's own handle check.
@@ -302,7 +302,6 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             fact("Private posts stored", count(c.posts as f64)),
             fact("With images", count(c.with_images as f64)),
             fact("With a video", count(c.with_video as f64)),
-            fact("Private blocks it made", count(c.blocks as f64)),
         ],
         Err(error) => {
             tracing::warn!(event = "admin_lookup_counts_failed", %error, "a look-up's private counts did not finish");

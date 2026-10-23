@@ -2423,8 +2423,7 @@ fn notification_cursor(c: Option<&str>) -> Result<Option<(DateTime<Utc>, i64)>, 
 ///    filter, the caller's notification preferences and the plain
 ///    `indexed_at::id` cursor;
 /// 2. after the scan, a row is dropped for a block either way with its
-///    author (`blocks`, `private_blocks`, members' list blocks that
-///    apply), a mute of its author (full,
+///    author (`blocks`, members' list blocks that apply), a mute of its author (full,
 ///    or scoped by reason), a moderation list that applies, a muted
 ///    thread, or the caller's notification preferences (checked again);
 /// 3. a row from a private post reads the post through the pipeline for

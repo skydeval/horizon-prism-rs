@@ -59,13 +59,13 @@ struct Generated {
 }
 
 /// The tables a fixture writes, emptied before the next.
-const T60_TABLES: &str = "private_posts, private_audiences, blocks, private_blocks, labels, follows, sync_state, \
+const T60_TABLES: &str = "private_posts, private_audiences, blocks, labels, follows, sync_state, \
     sync_chain_links, private_notifications, private_notification_seen, private_quote_refs, \
     list_references, subscribed_lists, subscribed_list_items";
 
 /// T-60's fixture generator (shared-walk §7): authors with every audience
-/// mode, random list members, follows, verification flags, blocks of both
-/// kinds, labels, hiding statuses and missing `actors` rows; threads,
+/// mode, random list members, follows, verification flags, blocks,
+/// labels, hiding statuses and missing `actors` rows; threads,
 /// branches (several under one public root, combs, lines) up to `depth`;
 /// foreign, bogus and self roots, several roots on one parent, missing
 /// parents, cycles with and without a stop, NULL audiences, public parents
@@ -123,9 +123,8 @@ async fn generate(pool: &PgPool, rng: &mut Rng, tag: &str, depth: usize) -> Gene
                 exec(pool, &follow_sql(a, b)).await;
             }
             if rng.chance(5) {
-                let table = if rng.chance(50) { "blocks" } else { "private_blocks" };
                 exec(pool, &format!(
-                    "INSERT INTO {table} (uri, author_did, subject_did, rev, created_at) \
+                    "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) \
                      VALUES ('at://{a}/app.bsky.graph.block/t60{}', '{a}', '{b}', '3k', now()) ON CONFLICT DO NOTHING",
                     &b[8..]
                 )).await;

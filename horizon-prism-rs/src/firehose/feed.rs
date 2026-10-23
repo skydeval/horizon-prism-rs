@@ -75,7 +75,6 @@ pub enum Kind {
     Setting,
     PrivatePost,
     Audience,
-    PrivateBlock,
     PrivateGate,
     Identity,
     Account,
@@ -83,7 +82,7 @@ pub enum Kind {
 }
 
 /// The number of kinds.
-pub const KINDS: usize = 24;
+pub const KINDS: usize = 23;
 
 impl Kind {
     /// Every kind, in table order.
@@ -107,7 +106,6 @@ impl Kind {
         Self::Setting,
         Self::PrivatePost,
         Self::Audience,
-        Self::PrivateBlock,
         Self::PrivateGate,
         Self::Identity,
         Self::Account,
@@ -142,7 +140,6 @@ impl Kind {
             Self::Setting => "setting",
             Self::PrivatePost => "private-post",
             Self::Audience => "audience",
-            Self::PrivateBlock => "private-block",
             Self::PrivateGate => "private-post-gate",
             Self::Identity => "identity",
             Self::Account => "account",
@@ -159,7 +156,6 @@ impl Kind {
             Self::ListOptout => "list opt-out",
             Self::StarterPack => "starter pack",
             Self::PrivatePost => "private post",
-            Self::PrivateBlock => "private block",
             Self::PrivateGate => "private-post gate",
             other => other.slug(),
         }
@@ -179,7 +175,7 @@ impl Kind {
             Self::Block => "block",
             Self::Profile => "profile",
             Self::List | Self::ListItem | Self::ListBlock | Self::ListOptout => "list",
-            Self::PrivatePost | Self::Audience | Self::PrivateBlock | Self::PrivateGate => "private",
+            Self::PrivatePost | Self::Audience | Self::PrivateGate => "private",
             Self::Identity | Self::Account => "identity",
             Self::StarterPack | Self::Labeler | Self::Threadgate | Self::Postgate | Self::Poll | Self::Setting | Self::Other => "other",
         }
@@ -198,7 +194,6 @@ impl Kind {
             RecordKind::Profile => Self::Profile,
             RecordKind::PrivatePost => Self::PrivatePost,
             RecordKind::PrivateAudience => Self::Audience,
-            RecordKind::PrivateBlock => Self::PrivateBlock,
             RecordKind::PrivateGate => Self::PrivateGate,
             RecordKind::PublicRootGate => Self::Threadgate,
             RecordKind::Table(_) => Self::Other,
@@ -866,7 +861,7 @@ mod tests {
     use super::*;
     use crate::aggregations::{PurgeKind, RejectReason};
     use crate::firehose::classifier::{
-        NSID_AUDIENCE, NSID_BLOCK, NSID_POST, NSID_POST_PRIVATE, NSID_PRIVATE_BLOCK, classify, skip_reason,
+        NSID_AUDIENCE, NSID_BLOCK, NSID_POST, NSID_POST_PRIVATE, classify, skip_reason,
     };
 
     #[test]
@@ -912,7 +907,6 @@ mod tests {
             RecordKind::Profile,
             RecordKind::PrivatePost,
             RecordKind::PrivateAudience,
-            RecordKind::PrivateBlock,
             RecordKind::PrivateGate,
             RecordKind::PublicRootGate,
         ] {
@@ -937,7 +931,8 @@ mod tests {
         assert_eq!(Kind::from_class(classify(NSID_BLOCK, "3k")), Kind::Block);
         assert_eq!(Kind::from_class(classify(NSID_POST_PRIVATE, "3k")), Kind::PrivatePost);
         assert_eq!(Kind::from_class(classify(NSID_AUDIENCE, "3k")), Kind::Audience);
-        assert_eq!(Kind::from_class(classify(NSID_PRIVATE_BLOCK, "3k")), Kind::PrivateBlock);
+        // Private blocks are skipped, not indexed (skydeval, 2026-10-24).
+        assert_eq!(Kind::from_class(classify("tools.kryphocron.graph.block", "3k")), Kind::Other);
         // Table order matches the indexes, and slugs are distinct.
         for (i, k) in Kind::ALL.iter().enumerate() {
             assert_eq!(k.index(), i);

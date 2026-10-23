@@ -249,7 +249,7 @@ enum OpTarget<'a> {
     /// (following-audience design §4.2): the old row goes, and a tombstone
     /// at the op's rev refuses any older write of it.
     RejectedFollow(&'a Upsert, &'static str),
-    /// An update of a direct or private block that Rule M rejected, with the
+    /// An update of a direct block that Rule M rejected, with the
     /// reason (member-blocks-only design §9): the stored row goes, and a
     /// tombstone at the op's rev refuses any older write of it.
     RejectedBlock(&'a Upsert, &'static str),
@@ -348,7 +348,7 @@ fn outcome_without_sql(p: &Prepared, a: Option<Admission>, tracked: bool) -> Opt
     }
 }
 
-/// An update of a direct or private block that Rule M rejected for having
+/// An update of a direct block that Rule M rejected for having
 /// no member side, or because its new subject is a member being removed
 /// (member-blocks-only design §9): it takes the rejected-block path, which
 /// removes the row its earlier write stored. A create, and an update
@@ -586,7 +586,7 @@ fn build_upsert(
             },
             None => return Ok(None),
         },
-        RecordClass::Kryphocron { kind: Some(k), .. } => (Body::Private, private_subjects(k, record)?),
+        RecordClass::Kryphocron { kind: Some(k), .. } => (Body::Private, private_subjects(k, record)),
         RecordClass::Kryphocron { kind: None, .. } | RecordClass::Unindexed => {
             return Err(RecordError("not an indexed class".to_string()));
         }
@@ -1260,7 +1260,7 @@ impl Writer {
                 OpTarget::Upsert(u, _) | OpTarget::RejectedBlock(u, _) => matches!(u.body, Body::Private | Body::PrivateGate),
                 OpTarget::Delete(d) => matches!(
                     d.kind,
-                    RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock | RecordKind::PrivateGate
+                    RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateGate
                 ),
                 OpTarget::GrowOnly(..) | OpTarget::RejectedFollow(..) | OpTarget::RootGate(..) => false,
             };
@@ -1655,7 +1655,7 @@ impl Writer {
         let author_in_scope = sets.in_scope(repo);
         let removed = match d.kind {
             // A delete carries no record, so it never classifies as a gate.
-            RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock | RecordKind::PrivateGate => {
+            RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateGate => {
                 let applied = self.private.delete(conn, &d.uri, rev, author_in_scope).await?;
                 eff.owners_joined = applied.owners_joined;
                 eff.owners_left = applied.owners_left;
@@ -1825,13 +1825,11 @@ impl Writer {
         Ok((OpOutcome::Rejected(reason), eff))
     }
 
-    /// An update of a direct or private block that Rule M rejected, at its
-    /// rev U (member-blocks-only design §9, C-MB4): the row an earlier write
+    /// An update of a direct block that Rule M rejected, at its rev U
+    /// (member-blocks-only design §9, C-MB4): the row an earlier write
     /// stored at the URI goes by last-writer-wins, and a tombstone at U
     /// refuses every write of the URI at or below U, so an older write
-    /// cannot store the old subject again. A private block goes through the
-    /// private tier, which tombstones it whether or not a row went. The
-    /// outcome stays `Rejected`.
+    /// cannot store the old subject again. The outcome stays `Rejected`.
     async fn apply_rejected_block(
         &self,
         conn: &mut PgConnection,
@@ -1839,20 +1837,16 @@ impl Writer {
         reason: &'static str,
         rev: &str,
     ) -> Result<(OpOutcome, MemoryEffects), OpError> {
-        if u.input.kind == RecordKind::PrivateBlock {
-            self.private.delete(conn, &u.uri, rev, true).await?;
-        } else {
-            delete_row(conn, "blocks", &u.uri, rev).await?;
-            sqlx::query(
-                "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
-                 ON CONFLICT (uri) DO UPDATE SET rev = EXCLUDED.rev, deleted_at = now() \
-                 WHERE record_tombstones.rev < EXCLUDED.rev",
-            )
-            .bind(&u.uri)
-            .bind(rev)
-            .execute(&mut *conn)
-            .await?;
-        }
+        delete_row(conn, "blocks", &u.uri, rev).await?;
+        sqlx::query(
+            "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
+             ON CONFLICT (uri) DO UPDATE SET rev = EXCLUDED.rev, deleted_at = now() \
+             WHERE record_tombstones.rev < EXCLUDED.rev",
+        )
+        .bind(&u.uri)
+        .bind(rev)
+        .execute(&mut *conn)
+        .await?;
         Ok((OpOutcome::Rejected(reason), MemoryEffects::default()))
     }
 
@@ -2189,7 +2183,7 @@ async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo
         RecordKind::Table(table) => vec![table],
         RecordKind::PublicRootGate => vec!["threadgates"],
         // The private tier keeps its own (`ingest::delete`).
-        RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock | RecordKind::PrivateGate => {
+        RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateGate => {
             return Ok(false);
         }
     };

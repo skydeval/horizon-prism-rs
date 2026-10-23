@@ -125,7 +125,7 @@ fn rows_of(s: &Snapshot, table: &str) -> Option<f64> {
 /// Kept and refused blocks since the start, from the live feed's totals:
 /// every block kind, every source.
 fn blocks_since_start(t: &Totals) -> (u64, u64) {
-    let kinds = [Kind::Block, Kind::ListBlock, Kind::PrivateBlock];
+    let kinds = [Kind::Block, Kind::ListBlock];
     let sum = |outcomes: &[Outcome]| -> u64 {
         Source::ALL.iter().flat_map(|s| kinds.iter().flat_map(move |k| outcomes.iter().map(move |o| t.get(*s, *k, *o)))).sum()
     };
@@ -276,7 +276,6 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         fig("Not kept since Prism started (no member involved)", count(refused as f64)),
         fig("Blocks stored", about(rows_of(&s, "blocks"))),
         fig("Blocks of whole lists stored", about(rows_of(&s, "list_blocks"))),
-        fig("Private blocks stored", about(rows_of(&s, crate::private_tier::stats::admin_blocks_table()))),
     ];
     groups.push(FigureGroup { title: "Blocks", figures: blocks, note: "Prism keeps only blocks made by or against a member.".to_string() });
     groups.push(lodestar(&state, &s));

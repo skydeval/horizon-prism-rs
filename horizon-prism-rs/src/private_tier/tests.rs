@@ -23,8 +23,8 @@ mod plaintext;
 mod media;
 // Members' list blocks in the private read rule (private-blocks design).
 mod list_blocks;
-// Private blocks only with a member side (member-blocks-only design).
-mod member_blocks;
+// Private blocks are not indexed (skydeval, 2026-10-24).
+mod no_private_blocks;
 // The author-only `notServed` marker (not-served-reason design).
 mod not_served;
 // Private notification preferences (private-notification-prefs design).
@@ -823,7 +823,7 @@ async fn migration_0002_adds_nullable_reply_cids() {
 
 #[tokio::test]
 async fn blocks_in_either_direction_are_misses() {
-    let Some(db) = fresh_db("private_blocks_miss").await else {
+    let Some(db) = fresh_db("blocks_miss").await else {
         return;
     };
     let f = fixture(&db.pool, "blocks").await;
@@ -3932,19 +3932,13 @@ async fn notification_reads_in(mode: PublicMode, test: &str) {
     assert_eq!(page["notifications"][0]["uri"], m.as_str(), "{page}");
     assert_eq!(unread_of(&base, DAVE).await, 1);
 
-    // A blocked author is dropped, either way, public or private block.
-    for sql in [
-        block_sql(DAVE, BOB),
-        block_sql(BOB, DAVE),
-        format!("INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
-                 VALUES ('at://{DAVE}/tools.kryphocron.graph.block/1', '{DAVE}', '{BOB}', '3k', now())"),
-    ] {
+    // A blocked author is dropped, either way.
+    for sql in [block_sql(DAVE, BOB), block_sql(BOB, DAVE)] {
         exec(&f.pool, &sql).await;
         let (page, _) = notifications_of(&base, DAVE, "").await;
         assert_eq!(page, json!({"notifications": []}), "{sql}");
         assert_eq!(unread_of(&base, DAVE).await, 0, "{sql}");
         exec(&f.pool, "DELETE FROM blocks").await;
-        exec(&f.pool, "DELETE FROM private_blocks").await;
     }
     // A full mute drops it too.
     exec(&f.pool, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{DAVE}', '{BOB}')")).await;
@@ -4402,7 +4396,7 @@ async fn request_record_catches_up_and_the_record_reads_at_once() {
     let index = index_server(&f, &repo).await;
     assert_eq!(request_record(&index, &p2).await, ("indexed".to_string(), true));
     assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(R1));
-    assert_eq!(repo.lists(), 4, "the four authorization collections, one page each");
+    assert_eq!(repo.lists(), 3, "the three authorization collections, one page each");
     for reader in [BOB, ALICE] {
         assert_eq!(readable(&base, reader, &[&p1, &p2]).await, [p1.clone(), p2.clone()], "{reader}");
     }
@@ -4413,7 +4407,7 @@ async fn request_record_catches_up_and_the_record_reads_at_once() {
     set_head(&f.pool, ALICE, R2).await;
     let (_, caught_up) = request_record(&index, &p1).await;
     assert!(!caught_up);
-    assert_eq!(repo.lists(), 4, "no listing");
+    assert_eq!(repo.lists(), 3, "no listing");
     assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(R1));
 
     // A delete, once the interval has passed (a new process's interval).
@@ -4494,17 +4488,17 @@ async fn catch_up_is_bounded_and_settles_only_a_clean_listing() {
     repo.bump_epoch.store(true, std::sync::atomic::Ordering::SeqCst);
     let index = index_server(&f, &repo).await;
     assert!(!request_record(&index, &p1).await.1);
-    assert_eq!(repo.lists(), 4, "listed in pages of one");
+    assert_eq!(repo.lists(), 3, "listed in pages of one");
     assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(REV));
 
-    // Over the page cap (six private blocks in pages of one, nine pages in
-    // all): no advance.
-    for i in 0..6 {
+    // Over the page cap (seven blocks in pages of one, nine pages in all):
+    // no advance.
+    for i in 0..7 {
         repo.put(
-            crate::firehose::classifier::NSID_PRIVATE_BLOCK,
+            crate::firehose::classifier::NSID_BLOCK,
             &format!("3kblock00000{i}"),
             &format!("bafyblock{i}"),
-            json!({"$type": crate::firehose::classifier::NSID_PRIVATE_BLOCK, "subject": CAROL, "createdAt": "2026-09-26T00:00:00Z"}),
+            json!({"$type": crate::firehose::classifier::NSID_BLOCK, "subject": CAROL, "createdAt": "2026-09-26T00:00:00Z"}),
         );
     }
     repo.set_rev(R3);

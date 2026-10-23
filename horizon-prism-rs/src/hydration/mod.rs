@@ -869,8 +869,7 @@ impl Hydrator {
                 .bind(dids)
                 .fetch_all(p)
                 .await?;
-        // `blocks` only: `app.bsky.graph.block`, never the private-tier block
-        // table (§7.5).
+        // `blocks`: `app.bsky.graph.block` (§7.5).
         let blocking: Vec<(String, String)> =
             sqlx::query_as("SELECT subject_did, uri FROM blocks WHERE author_did = $1 AND subject_did = ANY($2)")
                 .bind(me)

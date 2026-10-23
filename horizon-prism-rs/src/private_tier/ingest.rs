@@ -1,5 +1,5 @@
 //! Private-tier ingest (design-v2 §3.2, §4.5, §5.5, §6.11.1): LWW writes of
-//! admitted `postPrivate`, `policy.audience` and `graph.block` records, with
+//! admitted `postPrivate` and `policy.audience` records and private gates, with
 //! `private_tombstones`, owner re-evaluation, and the purge and reconcile
 //! helpers.
 //!
@@ -21,7 +21,7 @@ use super::media::{self, MEDIA_KINDS_FIELD};
 use super::{Applied, IngestError, PrivateOp, PublicNotify, QuoteRef, clear_fields, owners};
 use crate::db::locks::uri_author;
 use crate::firehose::classifier::{
-    NSID_AUDIENCE, NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PRIVATE_BLOCK, NSID_THREADGATE,
+    NSID_AUDIENCE, NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_THREADGATE,
 };
 use crate::firehose::jobs::{self, Depth};
 use crate::firehose::normalize::{bytes_field, strong_ref_cid};
@@ -319,15 +319,6 @@ impl AudienceFields {
     }
 }
 
-fn subject_did(record: &Value) -> Result<String, IngestError> {
-    record
-        .get("subject")
-        .and_then(Value::as_str)
-        .filter(|d| proto_blue::syntax::Did::is_valid(d))
-        .map(str::to_string)
-        .ok_or_else(|| malformed("subject is not a DID"))
-}
-
 async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM private_tombstones WHERE uri = $1 AND rev >= $2)")
         .bind(uri)
@@ -456,7 +447,7 @@ pub(crate) async fn enqueue_private_for_tests(conn: &mut PgConnection, did: &str
 /// A `postPrivate` or `audience` row for a member with no prior rows
 /// re-evaluates owner status (§6.11.1): the member becomes an owner and gets
 /// a `private` job. A non-member's row is stored and nothing more
-/// (membership design §2.3). Blocks never make their author an owner.
+/// (membership design §2.3). Gates never make their author an owner.
 ///
 /// # Errors
 ///
@@ -465,8 +456,8 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
     let now = Utc::now();
     let owner_record = op.nsid == NSID_POST_PRIVATE || op.nsid == NSID_AUDIENCE;
     // A grant collection's op below the listed rev is refused as a
-    // tombstoned one is (replay-readiness design §4.3); a private block only
-    // denies, so it is never refused for it.
+    // tombstoned one is (replay-readiness design §4.3); any other op only by
+    // its tombstone.
     let refused = if owner_record { superseded(&mut *conn, op).await? } else { tombstoned(&mut *conn, &op.uri, &op.rev).await? };
     if refused {
         return Ok(Applied::default());
@@ -582,25 +573,6 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .bind(&f.mode)
             .bind(&f.members)
             .bind(&f.name)
-            .execute(&mut *conn)
-            .await?
-            .rows_affected()
-                > 0
-        }
-        NSID_PRIVATE_BLOCK => {
-            let subject = subject_did(&op.record)?;
-            sqlx::query(
-                "INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
-                 VALUES ($1, $2, $3, $4, $5) \
-                 ON CONFLICT (uri) DO UPDATE SET subject_did = EXCLUDED.subject_did, rev = EXCLUDED.rev, \
-                   created_at = EXCLUDED.created_at \
-                 WHERE private_blocks.rev < EXCLUDED.rev",
-            )
-            .bind(&op.uri)
-            .bind(author)
-            .bind(&subject)
-            .bind(&op.rev)
-            .bind(created_at(&op.record, now))
             .execute(&mut *conn)
             .await?
             .rows_affected()
@@ -1139,7 +1111,6 @@ fn table_of(uri: &str) -> Option<(&'static str, &'static str)> {
     match collection {
         NSID_POST_PRIVATE => Some(("private_posts", "author_did")),
         NSID_AUDIENCE => Some(("private_audiences", "owner_did")),
-        NSID_PRIVATE_BLOCK => Some(("private_blocks", "author_did")),
         _ => None,
     }
 }
@@ -1192,9 +1163,7 @@ pub(crate) async fn delete(conn: &mut PgConnection, uri: &str, rev: &str, author
         changed: removed,
         ..Applied::default()
     };
-    if removed
-        && table != "private_blocks"
-        && let Some(author) = uri_author(uri)
+    if removed && let Some(author) = uri_author(uri)
     {
         applied = Applied {
             changed: removed,
@@ -1413,7 +1382,6 @@ pub(crate) async fn purge_did(conn: &mut PgConnection, did: &str, limit: i64) ->
     for (table, col) in [
         ("private_posts", "author_did"),
         ("private_audiences", "owner_did"),
-        ("private_blocks", "author_did"),
         ("private_threadgates", "author_did"),
         ("private_postgates", "author_did"),
         ("private_quote_refs", "author_did"),
@@ -1486,10 +1454,8 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
 
 /// The private part of a `member_removed` purge (§6.11.7): private posts by
 /// authors outside S admitted only because `did` was a member (no other
-/// member among the parent, root and audience authors), private blocks with
-/// no member side left (of `did` by non-members, by `did` of non-members;
-/// member-blocks-only design §7), the member's private
-/// bookmarks, the member's quote references (private posting §3.1: its
+/// member among the parent, root and audience authors), the member's
+/// private bookmarks, the member's quote references (private posting §3.1: its
 /// later deletes are no longer tracked), and the private notifications it
 /// received and authored, for the same reason; and the private
 /// subscriptions it holds or is the subject of (private-activity-subs §3.2).
@@ -1520,20 +1486,6 @@ pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, lim
            AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did <> $1 AND m.did IN \
                (split_part(p.reply_parent_uri, '/', 3), split_part(p.reply_root_uri, '/', 3), \
                 split_part(p.audience_uri, '/', 3))) \
-         LIMIT $2)",
-    )
-    .bind(did)
-    .bind(limit)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
-    // Rule M (member-blocks-only design §7): private blocks of `did` by
-    // authors that are not members, and `did`'s own private blocks of
-    // non-members. One between it and another member stays.
-    n += sqlx::query(
-        "DELETE FROM private_blocks WHERE uri IN (SELECT b.uri FROM private_blocks b \
-         WHERE (b.subject_did = $1 AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = b.author_did)) \
-            OR (b.author_did = $1 AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = b.subject_did)) \
          LIMIT $2)",
     )
     .bind(did)

@@ -149,15 +149,9 @@ async fn tn1_the_reasons_agree_with_the_read_rule() {
     // Each change: its SQL, its undo, and the reasons it gives (the rest
     // stay served).
     let unfollow = format!("DELETE FROM follows WHERE author_did = '{BOB}' AND subject_did = '{ALICE}'");
-    let private_block = |from: &str, to: &str| {
-        format!(
-            "INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
-             VALUES ('at://{from}/tools.kryphocron.graph.block/1', '{from}', '{to}', '3k', now())"
-        )
-    };
     let status = |s: &str| format!("UPDATE actors SET account_status = '{s}' WHERE did = '{ALICE}'");
     let label = |subject: &str, val: &str| format!("INSERT INTO labels (subject, val) VALUES ('{subject}', '{val}')");
-    let (unblock, unblock_private) = ("DELETE FROM blocks".to_string(), "DELETE FROM private_blocks".to_string());
+    let unblock = "DELETE FROM blocks".to_string();
     let standing_bob = vec![(BOB, s.rb.clone(), vec!["standing"]), (CAROL, s.rc_under_b.clone(), vec!["placement"]), (BOB, s.a12.clone(), vec!["standing"])];
     // A block between Bob and Alice reaches the list thread too.
     let mut blocked_bob = standing_bob.clone();
@@ -169,9 +163,7 @@ async fn tn1_the_reasons_agree_with_the_read_rule() {
         ("Bob blocks Alice", block_sql(BOB, ALICE), unblock, blocked_bob.clone()),
         // A list block either way (private-blocks design, T-PB5).
         ("Alice list-blocks Bob", list_block_sql(ALICE, ALICE, "3kns1list1", &[BOB]), "DELETE FROM list_references".to_string(), blocked_bob.clone()),
-        ("Bob list-blocks Alice", list_block_sql(BOB, CAROL, "3kns1list2", &[ALICE]), "DELETE FROM list_references".to_string(), blocked_bob.clone()),
-        ("Alice blocks Bob privately", private_block(ALICE, BOB), unblock_private.clone(), blocked_bob.clone()),
-        ("Bob blocks Alice privately", private_block(BOB, ALICE), unblock_private, blocked_bob),
+        ("Bob list-blocks Alice", list_block_sql(BOB, CAROL, "3kns1list2", &[ALICE]), "DELETE FROM list_references".to_string(), blocked_bob),
         (
             "Alice deactivated",
             status("deactivated"),
@@ -561,21 +553,13 @@ async fn tn2_tn3_tn6_tn7_tn8_the_marker_is_the_authors_alone() {
     w.edit_audience("3kns2list222", "list", &[BOB, CAROL, DAVE], "3kaaaaaaaaae2").await;
     let (_, view) = one_post(&w.base, BOB, &lb).await;
     w.check(!view.is_null() && view.get("notServed").is_none(), format!("Bob restored: {view}"));
-    // A block either way, public, private or by a list: the same bytes,
-    // `standing`; nothing names a block.
-    let private_block = |from: &str, to: &str| {
-        format!(
-            "INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
-             VALUES ('at://{from}/tools.kryphocron.graph.block/1', '{from}', '{to}', '3k', now())"
-        )
-    };
+    // A block either way, direct or by a list: the same bytes, `standing`;
+    // nothing names a block.
     let before = marked(&handle, "standing");
     let mut bodies = Vec::new();
     for (apply, undo) in [
         (block_sql(ALICE, BOB), "DELETE FROM blocks"),
         (block_sql(BOB, ALICE), "DELETE FROM blocks"),
-        (private_block(ALICE, BOB), "DELETE FROM private_blocks"),
-        (private_block(BOB, ALICE), "DELETE FROM private_blocks"),
         (list_block_sql(ALICE, ALICE, "3kns7list1", &[BOB]), "DELETE FROM list_references"),
         (list_block_sql(BOB, CAROL, "3kns7list2", &[ALICE]), "DELETE FROM list_references"),
     ] {
@@ -585,8 +569,8 @@ async fn tn2_tn3_tn6_tn7_tn8_the_marker_is_the_authors_alone() {
     }
     let view: Value = serde_json::from_str(&bodies[0]).expect("json");
     w.check(view["posts"][0]["notServed"] == json!(["standing"]), format!("a block: {}", bodies[0]));
-    w.check(bodies.iter().all(|b| *b == bodies[0]), format!("the six blocks differ: {bodies:?}"));
-    w.check(marked(&handle, "standing") == before + 6.0, "the metric counts standing".to_string());
+    w.check(bodies.iter().all(|b| *b == bodies[0]), format!("the four blocks differ: {bodies:?}"));
+    w.check(marked(&handle, "standing") == before + 4.0, "the metric counts standing".to_string());
     // Unfollowing: Bob's view is byte-identical to the blocks' (nothing
     // tells a block from a missing follow), his reply below Carol's is
     // `standing` too; Carol, reading Bob's unserved reply, misses it and

@@ -1392,7 +1392,7 @@ async fn t41_a_contradiction_clears_whatever_the_settle_does() {
     let ceiling = h.backfill_with(BackfillConfig { full_listing_ceiling: 1, ..BackfillConfig::default() });
     for (case, b) in [("ceiling_hit", &ceiling), ("auth_write_failed", &h.backfill())] {
         if case == "auth_write_failed" {
-            h.pds.put(ALICE, "tools.kryphocron.graph.block", "3kt41ebadblk", json!({"$type": "tools.kryphocron.graph.block", "subject": "not a did", "createdAt": "2026-09-26T00:00:00Z"}));
+            h.pds.put(ALICE, NSID_AUDIENCE, "3kt41ebadaud", json!({"$type": NSID_AUDIENCE, "mode": "list", "members": "not a list", "createdAt": "2026-09-26T00:00:00Z"}));
         }
         h.clear_jobs().await;
         set_follows_verified(h.pool(), ALICE, true).await;
@@ -1401,7 +1401,7 @@ async fn t41_a_contradiction_clears_whatever_the_settle_does() {
         assert!(!h.flag(ALICE).await.set, "{case}");
         assert_eq!(h.applied(ALICE).await, applied, "{case}");
     }
-    h.pds.remove(ALICE, "tools.kryphocron.graph.block", "3kt41ebadblk");
+    h.pds.remove(ALICE, NSID_AUDIENCE, "3kt41ebadaud");
     // A catch-up.
     h.ready_again().await;
     set_follows_verified(h.pool(), ALICE, true).await;

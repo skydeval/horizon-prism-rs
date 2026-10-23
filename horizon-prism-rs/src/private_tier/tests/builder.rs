@@ -278,10 +278,11 @@ async fn explain(pool: &PgPool, sql: &str, reader: &str, uris: &[String]) -> Val
 }
 
 /// T-52 (order of evaluation, review 13, LB1; scoped per review 14, m2): on
-/// `prefilter_uris`' single post arm, a reader outside G costs no `blocks`,
-/// `private_blocks` or `labels` probe in `s1`, and rows the gate hides cost
-/// no block probe. On owner rows, rule 7's V–O term is guarded: 4 block
-/// probes a row (rule 4's pair), not 8; with V blocking O, an owner row
+/// `prefilter_uris`' single post arm, a reader outside G costs no `blocks`
+/// or `labels` probe in `s1`, and rows the gate hides cost no block probe.
+/// On owner rows, rule 7's V–O term is guarded: 2 block probes a row (rule
+/// 4's pair, one each way, since private blocks were removed), not 4; with
+/// V blocking O, an owner row
 /// still misses, through rule 4. The branch climb (`bcl`) reads
 /// `private_posts` only (shared-walk T-52).
 #[tokio::test]
@@ -305,7 +306,7 @@ async fn t52_the_cheapest_terms_run_first() {
     // Dave is outside G (`list` of Bob): no block or label probe.
     let read = probes(&explain(&pool, &sql, DAVE, &rows).await);
     w.check(
-        !read.iter().any(|(r, loops)| ["blocks", "private_blocks", "list_references", "labels"].contains(&r.as_str()) && *loops > 0),
+        !read.iter().any(|(r, loops)| ["blocks", "list_references", "labels"].contains(&r.as_str()) && *loops > 0),
         format!("outside G: {read:?}"),
     );
     // Every row hidden from Bob, inside G: no block probe.
@@ -314,7 +315,7 @@ async fn t52_the_cheapest_terms_run_first() {
     }
     let read = probes(&explain(&pool, &sql, BOB, &rows).await);
     w.check(
-        !read.iter().any(|(r, loops)| ["blocks", "private_blocks", "list_references"].contains(&r.as_str()) && *loops > 0),
+        !read.iter().any(|(r, loops)| ["blocks", "list_references"].contains(&r.as_str()) && *loops > 0),
         format!("gated: {read:?}"),
     );
     exec(&pool, "DELETE FROM labels").await;
@@ -332,12 +333,12 @@ async fn t52_the_cheapest_terms_run_first() {
         read.iter().all(|(r, _)| r == "private_posts") && read.iter().any(|(_, loops)| *loops > 0),
         format!("the branch climb reads: {read:?}"),
     );
-    // Owner rows: the block lookups that run are rule 4's four (PostgreSQL
-    // may hash each one, running it once for every row); rule 7's V–O four
+    // Owner rows: the block lookups that run are rule 4's two (PostgreSQL
+    // may hash each one, running it once for every row); rule 7's V–O two
     // never run.
     let read = probes(&explain(&pool, &sql, BOB, &rows).await);
-    let blocks_run = read.iter().filter(|(r, loops)| (r == "blocks" || r == "private_blocks") && *loops > 0).count();
-    w.check(blocks_run == 4, format!("owner rows: {blocks_run} block lookups ran: {read:?}"));
+    let blocks_run = read.iter().filter(|(r, loops)| r == "blocks" && *loops > 0).count();
+    w.check(blocks_run == 2, format!("owner rows: {blocks_run} block lookups ran: {read:?}"));
     // And at most rule 4's two list-block lookups (private-blocks T-52).
     let lists_run = read.iter().filter(|(r, loops)| r == "list_references" && *loops > 0).count();
     w.check(lists_run <= 2, format!("owner rows: {lists_run} list-block lookups ran: {read:?}"));
