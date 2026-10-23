@@ -1353,6 +1353,7 @@ impl Writer {
                 created: u.created,
                 created_at: u.created_at,
                 notify_max_age: self.private_notify_max_age,
+                subscribed_max_age: self.subscribed_post_max_age,
             };
             let applied = if u.body == Body::PrivateGate {
                 self.private.apply_gate(conn, &op).await?

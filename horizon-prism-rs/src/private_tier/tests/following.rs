@@ -327,6 +327,7 @@ impl H {
             created: true,
             created_at: Utc::now(),
             notify_max_age: chrono::Duration::hours(48),
+            subscribed_max_age: chrono::Duration::hours(24),
         };
         let mut conn = self.pool().acquire().await.expect("conn");
         KryphocronPrivateTier.apply(&mut conn, &op).await.expect("private apply");

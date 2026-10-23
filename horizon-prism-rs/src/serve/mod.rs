@@ -182,6 +182,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         crate::private_tier::handlers::METRIC_STAGES,
         crate::admin::usage::METRIC_SECONDS,
         crate::sync::head_prober::METRIC_CHECK_SECONDS,
+        crate::private_tier::fanout::METRIC_SECONDS,
     ] {
         builder = builder
             .set_buckets_for_metric(
@@ -907,6 +908,13 @@ pub async fn run() -> Result<Stopped, StartupError> {
     .with_search(&cfg.file.private_search)
     .with_plaintext_refused(cfg.file.private_any_pds.enabled)
     .with_activity_subscriptions_max(cfg.file.private_notify.activity_subscriptions_max);
+    // The subscribed-post fan-out (private-activity-subs design §5.2),
+    // whenever the private tier is on.
+    if !private.features().is_empty() {
+        tasks.push(
+            crate::private_tier::fanout::Fanout::new(&private_state, scope.clone(), cfg.file.private_notify.subscribed_post_retry_secs).spawn(),
+        );
+    }
     log_floors(&cfg.file.private_read.floor_ms);
     tracing::info!(
         event = "private_any_pds",

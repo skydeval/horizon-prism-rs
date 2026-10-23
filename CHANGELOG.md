@@ -10,6 +10,33 @@ commit.
 
 ## [Unreleased]
 
+### Added (private activity subscriptions AS2: the fan-out, #839, #847)
+
+- **Subscribed-post notifications for private posts, after commit.** A
+  private post's first store (from the firehose, `requestRecord`,
+  dead-letter replay or catch-up, never backfill, while its `createdAt` is
+  within `notifications.subscribed_post_max_age_secs`) queues one row in
+  the store's transaction, whoever subscribes, so the store's cost says
+  nothing about subscribers; an update (an audience change, a rotation, a
+  PDS rewrite) never does. A worker, woken by `pg_notify` and a 5 s poll,
+  two posts at a time, writes a `subscribed-post` private notification to
+  each subscriber the public fan-out's rules allow (the kind on since
+  before the post, the declaration and the follow, no other notification
+  of the record, no muted thread) and who is inside the post's audience
+  now: the read rule's own checks, fail closed. A transient state (the
+  private relay behind, an owner not ready, a repository head behind, the
+  audience or thread not stored yet, a `following` audience not yet
+  verified, the subscriber not ready) defers and retries; no attempt
+  starts `[private_notify] subscribed_post_retry_secs` (120 s) or more
+  after the first store, and a subscriber decided once is never decided
+  again, so someone added to the audience later is not notified. Rows are
+  written under the scope read guard and re-checked against deletes,
+  unsubscribes, blocks and removals. Done queue rows are kept two days so
+  a post fans out once. Metrics `private_subscribed_post_fanouts_total
+  {outcome}`, `_rows_total`, `_deferrals_total{reason}`,
+  `_fanout_seconds`, and the gauges `private_subscribed_post_queue` and
+  `_queue_lag_seconds`. Not listed in `getMembership` yet.
+
 ### Added (private activity subscriptions AS1, #839, #846)
 
 - **Private activity subscriptions, storage and methods.**

@@ -351,6 +351,7 @@ mod tests {
                         created: true,
                         created_at: chrono::Utc::now(),
                         notify_max_age: chrono::Duration::hours(48),
+                        subscribed_max_age: chrono::Duration::hours(24),
                     },
                 )
                 .await

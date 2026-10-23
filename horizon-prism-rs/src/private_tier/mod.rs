@@ -31,6 +31,7 @@ mod clear_fields;
 mod content;
 mod cursor;
 mod emit;
+pub(crate) mod fanout;
 pub(crate) mod gauges;
 pub(crate) mod handlers;
 pub(crate) mod ingest;
@@ -81,6 +82,19 @@ pub struct PrivateOp {
     /// `private_notify.backfill_max_age_hours` (C-11): a write that is not
     /// live notifies only for a record created within it.
     pub notify_max_age: chrono::Duration,
+    /// `notifications.subscribed_post_max_age_secs` (private-activity-subs
+    /// design §5.1): a private post first stored within it is queued for
+    /// its subscribed-post notifications.
+    pub subscribed_max_age: chrono::Duration,
+}
+
+/// Whether a private post's first store queues its subscribed-post fan-out
+/// (private-activity-subs design §5.1): every source but backfill, for a
+/// post whose `createdAt` is within `max_age` of now. Nothing else is
+/// looked at, so the store costs the same whoever subscribes.
+#[must_use]
+pub fn fans_out(source: WriteSource, created_at: DateTime<Utc>, max_age: chrono::Duration) -> bool {
+    source != WriteSource::Backfill && Utc::now().signed_duration_since(created_at) <= max_age
 }
 
 /// Whether a public record's write notifies (private posting §4.8, C-11): a

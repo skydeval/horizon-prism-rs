@@ -11,7 +11,9 @@
 //!   - `private_blocks`: neither the author nor the subject is a member
 //!     (member-blocks-only design §8).
 //! - Class T: `private_tombstones` older than `retention.tombstone_days`;
-//!   `private_notifications` older than `retention.notification_days`.
+//!   `private_notifications` older than `retention.notification_days`;
+//!   `private_post_fanout` rows done more than two days ago
+//!   (private-activity-subs design §3.2).
 //! - Every DID that lost `private_posts`/`private_audiences` rows is
 //!   re-evaluated as an owner in the same transaction as its last batch, and
 //!   the in-memory owner set follows after commit.
@@ -221,6 +223,30 @@ impl RetentionTask for PrivateRetention {
             metrics::counter!(METRIC_DELETED_ROWS, "table" => "private_notifications").increment(notifications);
         }
         report.deleted.push(("private_notifications", notifications));
+        // Class T: the subscribed-post queue's done rows, kept two days so a
+        // post fans out once (private-activity-subs §3.2).
+        let mut queue = 0u64;
+        loop {
+            let guard = scope.read().await;
+            let n = sqlx::query(&format!(
+                "DELETE FROM private_post_fanout WHERE uri IN (SELECT uri FROM private_post_fanout \
+                 WHERE done_at < now() - make_interval(days => $1) LIMIT {BATCH_SIZE})"
+            ))
+            .bind(super::fanout::DONE_KEEP_DAYS)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            drop(guard);
+            queue += n;
+            if n < BATCH_SIZE {
+                break;
+            }
+            tokio::time::sleep(BATCH_PAUSE).await;
+        }
+        if queue > 0 {
+            metrics::counter!(METRIC_DELETED_ROWS, "table" => "private_post_fanout").increment(queue);
+        }
+        report.deleted.push(("private_post_fanout", queue));
         Ok(report)
     }
 }

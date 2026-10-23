@@ -31,6 +31,8 @@ mod not_served;
 mod prefs;
 // Private activity subscriptions: the methods (private-activity-subs design).
 mod subscriptions;
+// Private activity subscriptions: the fan-out.
+mod fanout;
 mod round;
 mod threads;
 // The shared walk (#720): T-60 to T-63.

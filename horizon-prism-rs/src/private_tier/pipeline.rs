@@ -354,7 +354,7 @@ impl RequestState {
 
 /// The repo-head check (§6.11.3): `applied_rev ≥ head_rev`, with the head no
 /// older than `sync.head_max_age_secs` or fetched now within the budget.
-async fn head_ok(env: &PipelineEnv, rs: &RequestState, did: &str) -> Result<bool, sqlx::Error> {
+pub(super) async fn head_ok(env: &PipelineEnv, rs: &RequestState, did: &str) -> Result<bool, sqlx::Error> {
     if let Some(r) = rs.heads.lock().await.get(did) {
         return Ok(r.applied_ok);
     }

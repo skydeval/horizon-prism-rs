@@ -2374,6 +2374,153 @@ pub(super) async fn subscription_rows(
     Ok(rows.into_iter().map(|(subject, post, reply, updated_at)| SubscriptionRow { subject, post, reply, updated_at }).collect())
 }
 
+/// What the subscribed-post fan-out reads of a post first (private-activity
+/// -subs design §5.3, step 0): no content.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(super) struct FanoutPost {
+    pub author_did: String,
+    pub audience_uri: Option<String>,
+    pub reply_parent_uri: Option<String>,
+    pub reply_root_uri: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub encoded: bool,
+    /// The author is a member now.
+    pub member: bool,
+}
+
+/// [`FanoutPost`] for `uri`, if stored.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn fanout_post(pool: &PgPool, uri: &str) -> Result<Option<FanoutPost>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT p.author_did, p.audience_uri, p.reply_parent_uri, p.reply_root_uri, p.created_at, \
+           p.encoded_content IS NOT NULL AS encoded, \
+           EXISTS (SELECT 1 FROM members m WHERE m.did = p.author_did) AS member \
+         FROM private_posts p WHERE p.uri = $1",
+    )
+    .bind(uri)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The subscribed-post fan-out's candidates for the post `uri` by `author`
+/// (private-activity-subs design §5.3, step 1), each with whether the
+/// subscriber is a ready member: the public fan-out's rules (the kind's flag
+/// on since before the post's second, a member other than the author, the
+/// author in S and backfilled once, the declaration and the follow, no
+/// other private notification of this record, no muted thread), over
+/// `pending` alone when given.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn fanout_candidates(
+    pool: &PgPool,
+    author: &str,
+    uri: &str,
+    post: &FanoutPost,
+    pending: Option<&[String]>,
+) -> Result<Vec<(String, bool)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT s.subscriber_did, m.ready_at IS NOT NULL \
+         FROM private_activity_subscriptions s \
+         JOIN members m ON m.did = s.subscriber_did \
+         CROSS JOIN (SELECT COALESCE((SELECT record->>'allowSubscriptions' FROM actor_self_records \
+                                      WHERE did = $1 AND collection = 'app.bsky.notification.declaration'), \
+                                     'followers') AS allow) d \
+         WHERE s.subject_did = $1 AND s.subscriber_did <> $1 \
+           AND ($6::text[] IS NULL OR s.subscriber_did = ANY($6)) \
+           AND (CASE WHEN $3 THEN s.reply_since ELSE s.post_since END) \
+                 < date_trunc('second', $4::timestamptz) + interval '1 second' \
+           AND EXISTS (SELECT 1 FROM scope_dids sd WHERE sd.did = $1) \
+           AND EXISTS (SELECT 1 FROM sync_state y WHERE y.did = $1 AND y.last_resync_at IS NOT NULL) \
+           AND d.allow IN ('followers', 'mutuals') \
+           AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = s.subscriber_did AND f.subject_did = $1) \
+           AND (d.allow <> 'mutuals' \
+                OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = s.subscriber_did)) \
+           AND NOT EXISTS (SELECT 1 FROM private_notifications n \
+                           WHERE n.recipient_did = s.subscriber_did AND n.record_uri = $2) \
+           AND NOT EXISTS (SELECT 1 FROM thread_mutes t \
+                           WHERE t.viewer_did = s.subscriber_did AND t.root_uri IN ($2, $5::text)) \
+         ORDER BY s.subscriber_did",
+    )
+    .bind(author)
+    .bind(uri)
+    .bind(post.reply_parent_uri.is_some())
+    .bind(post.created_at)
+    .bind(&post.reply_root_uri)
+    .bind(pending)
+    .fetch_all(pool)
+    .await
+}
+
+/// Whether the post `uri`'s governing audience G, when its mode is
+/// `following`, has its owner O's follows verified (private-activity-subs
+/// design §5.4 step 4b): rule 8 under `following` needs the flag for every
+/// reader. G and O are fact 8's, which do not depend on the reader; any
+/// other mode, or no G, is ready.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn following_ready(pool: &PgPool, uri: &str, cap: u32) -> Result<bool, sqlx::Error> {
+    let f = fact8(pool, "", uri, cap).await?;
+    let (Some(gov), Some(owner)) = (f.gov, f.owner) else {
+        return Ok(true);
+    };
+    sqlx::query_scalar(&format!(
+        "SELECT COALESCE((SELECT a.mode FROM private_audiences a WHERE a.uri = $1), 'list') <> 'following' OR {}",
+        follows_verified("$2")
+    ))
+    .bind(gov)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+}
+
+/// Write the `subscribed-post` notifications of the post `uri` by `author`
+/// to `recipients` (private-activity-subs design §5.5), on the caller's
+/// transaction: the post's row locked `FOR KEY SHARE` first, so a delete
+/// waits for this commit and then takes the rows; each recipient checked
+/// again (a member, subscribed to this kind since before the post, no block
+/// either way with the author, no other row for the record, no muted
+/// thread). Returns the rows written.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn fanout_insert(
+    conn: &mut sqlx::PgConnection,
+    author: &str,
+    uri: &str,
+    recipients: &[String],
+) -> Result<u64, sqlx::Error> {
+    sqlx::query("SELECT 1 FROM private_posts WHERE uri = $1 FOR KEY SHARE").bind(uri).execute(&mut *conn).await?;
+    Ok(sqlx::query(&format!(
+        "INSERT INTO private_notifications (recipient_did, author_did, reason, record_uri, record_cid, record_root) \
+         SELECT r.did, $1, 'subscribed-post', $2, p.cid, p.reply_root_uri \
+         FROM unnest($3::text[]) AS r(did) JOIN private_posts p ON p.uri = $2 \
+         WHERE EXISTS (SELECT 1 FROM members m WHERE m.did = r.did) \
+           AND EXISTS (SELECT 1 FROM private_activity_subscriptions s \
+                       WHERE s.subscriber_did = r.did AND s.subject_did = $1 \
+                         AND (CASE WHEN p.reply_parent_uri IS NOT NULL THEN s.reply_since ELSE s.post_since END) \
+                             < date_trunc('second', p.created_at) + interval '1 second') \
+           AND NOT {blocked} \
+           AND NOT EXISTS (SELECT 1 FROM private_notifications n WHERE n.recipient_did = r.did AND n.record_uri = $2) \
+           AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = r.did AND t.root_uri IN ($2, p.reply_root_uri)) \
+         ON CONFLICT DO NOTHING",
+        blocked = blocked("r.did", "$1"),
+    ))
+    .bind(author)
+    .bind(uri)
+    .bind(recipients)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected())
+}
+
 /// A private post's valid threadgate (private posting §4.4): the gate in
 /// the post author's repo with the post's rkey.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]

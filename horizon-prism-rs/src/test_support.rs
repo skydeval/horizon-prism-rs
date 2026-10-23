@@ -393,6 +393,17 @@ pub mod hooks {
     /// climb). Key: the post's URI.
     pub const FALLBACK_BEFORE_FACT8: &str = "dm_fallback_before_fact8";
 
+    /// The subscribed-post fan-out (private-activity-subs T-AS13): a
+    /// claimed run stops before it settles its row, as a crash would. Key:
+    /// the post's URI.
+    pub const FANOUT_CRASH: &str = "as_fanout_crash";
+    /// The fan-out, its post-level checks passed, before the subscribers'
+    /// verdicts (T-AS7d, T-AS13). Key: the post's URI.
+    pub const FANOUT_BEFORE_VERDICT: &str = "as_fanout_before_verdict";
+    /// The fan-out, its verdicts decided, before its write (T-AS9). Key:
+    /// the post's URI.
+    pub const FANOUT_BEFORE_WRITE: &str = "as_fanout_before_write";
+
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);
 

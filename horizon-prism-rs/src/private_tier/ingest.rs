@@ -492,8 +492,10 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             let notifies = super::notifies_post(op.source, op.created, op.created_at, op.notify_max_age);
             let previous = if notifies { previous_subjects(&mut *conn, &op.uri).await? } else { None };
             // A row stored before migration 0023 (`display_filled` false)
-            // also takes an op at its own rev: the refill (§3.1).
-            let changed = sqlx::query(
+            // also takes an op at its own rev: the refill (§3.1). The row
+            // returned says whether it was inserted (`xmax = 0`) or updated;
+            // none, that LWW refused the op (private-activity-subs §5.1).
+            let inserted: Option<bool> = sqlx::query_scalar(
                 "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, audience_uri, reply_root_uri, \
                    reply_parent_uri, encoded_content, encoded_codec, encoded_generation, plaintext_text, created_at, \
                    reply_root_cid, reply_parent_cid, facets, embed, langs, self_labels, quote_uri, mention_dids, \
@@ -509,7 +511,8 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
                    self_labels = EXCLUDED.self_labels, quote_uri = EXCLUDED.quote_uri, \
                    mention_dids = EXCLUDED.mention_dids, display_filled = true, media_kinds = EXCLUDED.media_kinds \
                  WHERE private_posts.rev < EXCLUDED.rev \
-                    OR (NOT private_posts.display_filled AND private_posts.rev <= EXCLUDED.rev)",
+                    OR (NOT private_posts.display_filled AND private_posts.rev <= EXCLUDED.rev) \
+                 RETURNING (xmax = 0)",
             )
             .bind(&op.uri)
             .bind(author)
@@ -533,10 +536,16 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .bind(&f.display.quote_uri)
             .bind(&f.display.mention_dids)
             .bind(i16::from(f.display.media_kinds))
-            .execute(&mut *conn)
-            .await?
-            .rows_affected()
-                > 0;
+            .fetch_optional(&mut *conn)
+            .await?;
+            let changed = inserted.is_some();
+            // The first store of a recent post queues its subscribed-post
+            // fan-out, whoever subscribes (private-activity-subs §5.1). An
+            // update never does: an audience change, a rotation or a PDS
+            // rewrite announces nothing.
+            if inserted == Some(true) && super::fans_out(op.source, f.created_at, op.subscribed_max_age) {
+                super::fanout::enqueue(&mut *conn, &op.uri, author).await?;
+            }
             // Its notifications, when the row is written: an update notifies
             // only the recipients its previous version did not name, and a
             // live update only while the post is recent (private-embeds

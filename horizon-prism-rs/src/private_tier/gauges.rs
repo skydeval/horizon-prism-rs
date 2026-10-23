@@ -5,7 +5,11 @@
 //! - `private_tier_last_event_age_seconds`: seconds since the live
 //!   firehose last delivered a private-tier op. Community PDSes must be
 //!   crawled by every private relay; a value past 24 h while private rows
-//!   exist says one is not, and is logged (`private_tier_ingest_stale`).
+//!   exist says one is not, and is logged (`private_tier_ingest_stale`);
+//! - `private_subscribed_post_queue` and
+//!   `private_subscribed_post_queue_lag_seconds`: the subscribed-post
+//!   fan-out's rows not done, and the oldest one's age (private-activity-subs
+//!   design §12).
 //!
 //! The last event is kept in process. At a start, before the first event,
 //! it is the newest private row's `indexed_at`, so a restart does not hide
@@ -102,6 +106,10 @@ pub(crate) async fn sample(pool: &PgPool) -> Result<(), sqlx::Error> {
     let age = last_event_age(pool, Utc::now()).await?;
     #[allow(clippy::cast_precision_loss)]
     metrics::gauge!(METRIC_LAST_EVENT_AGE).set(age as f64);
+    let (queued, lag) = super::fanout::queue_state(pool).await?;
+    #[allow(clippy::cast_precision_loss)]
+    metrics::gauge!(super::fanout::METRIC_QUEUE).set(queued as f64);
+    metrics::gauge!(super::fanout::METRIC_QUEUE_LAG).set(lag);
     if age > STALE_AFTER_SECS && rows_exist(pool).await? {
         tracing::warn!(
             event = "private_tier_ingest_stale",
