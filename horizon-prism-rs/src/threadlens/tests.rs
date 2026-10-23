@@ -461,7 +461,8 @@ async fn reply_disabled_comes_from_the_roots_gate_and_local_rows() {
     // (allow, root in the response, root mentions the member, member follows
     // the author) → (member's answer, visitor's answer, why).
     let none = json!([]);
-    let cases: Vec<(Option<Value>, bool, &Value, bool, Option<bool>, Option<bool>, &str)> = vec![
+    type Case<'a> = (Option<Value>, bool, &'a Value, bool, Option<bool>, Option<bool>, &'a str);
+    let cases: Vec<Case> = vec![
         (None, true, &none, false, Some(false), Some(false), "no allow: anyone may reply"),
         (Some(json!([])), true, &none, false, Some(true), Some(true), "empty allow: nobody else may"),
         (Some(json!([rule("followerRule")])), true, &none, true, Some(false), None, "the member follows the author"),
