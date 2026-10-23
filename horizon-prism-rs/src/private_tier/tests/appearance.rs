@@ -467,10 +467,18 @@ async fn t_ap15_request_time_is_recorded() {
     db.drop_db().await;
 }
 
-/// T-AP14: `getMembership`'s `features` ends with `private.appearance`.
+/// T-AP14: `getMembership`'s `features` lists `private.appearance` (last
+/// until the retention's string followed it).
 #[test]
-fn t_ap14_the_feature_is_listed_last() {
-    assert_eq!(crate::private_tier::FEATURES.last(), Some(&"private.appearance"));
+fn t_ap14_the_feature_is_listed() {
+    assert!(crate::private_tier::FEATURES.contains(&"private.appearance"));
+}
+
+/// T-AR13: `features` ends with `private.appearanceRetention` (amendment 1
+/// §9).
+#[test]
+fn t_ar13_the_retention_feature_is_listed_last() {
+    assert_eq!(crate::private_tier::FEATURES.last(), Some(&"private.appearanceRetention"));
 }
 
 // ---- Retention (private-appearance amendment 1 §13) ----

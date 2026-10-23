@@ -247,6 +247,9 @@ pub const FEATURES: &[&str] = &[
     "private.publicRootGates",
     // get/putAppearance: a member's appearance choice and value (private-appearance design).
     "private.appearance",
+    // includeRetained, retainedUntil and releaseAppearance: a removed
+    // member's appearance kept 7 days (private-appearance amendment 1).
+    "private.appearanceRetention",
 ];
 
 /// The private tier as the rest of the crate may use it.
