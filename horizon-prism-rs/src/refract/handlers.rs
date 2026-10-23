@@ -81,6 +81,8 @@ pub fn router(state: RefractState) -> Router {
         .route(&crate::admin::usage::path("refract", FILL), get(fill))
         .route(&crate::admin::usage::path("refract", GET_POST_THREAD), get(get_post_thread))
         .route(&crate::admin::usage::path("refract", GET_AUTHOR_FEED), get(get_author_feed))
+        .route(&crate::admin::usage::path("refract", LIST_NOTIFICATIONS), get(list_notifications))
+        .route(&crate::admin::usage::path("refract", GET_UNREAD_COUNT), get(get_unread_count))
         .with_state(state)
 }
 
@@ -220,6 +222,13 @@ impl Blocks {
     #[must_use]
     pub fn unanswered(&self, did: &str) -> bool {
         self.known.unanswered.contains(did)
+    }
+
+    /// Whether `did` blocks the caller, is blocked by it, or was left
+    /// unanswered.
+    #[must_use]
+    pub fn blocked(&self, did: &str) -> bool {
+        self.known.of_viewer.contains(did) || self.known.by_viewer.contains(did) || self.known.unanswered.contains(did)
     }
 
     #[must_use]
@@ -528,6 +537,40 @@ pub async fn get_author_feed(State(s): State<RefractState>, ConnectInfo(peer): C
     })
     .await;
     metrics::counter!(METRIC_READS, "method" => "getAuthorFeed", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
+    result
+}
+
+/// `refract.listNotifications` (§5.3, §7.1): member-only data; a
+/// non-member gets an empty list.
+pub async fn list_notifications(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, RawQuery(q): RawQuery) -> XrpcResult {
+    let caller = gate(&s, &headers, peer, LIST_NOTIFICATIONS).await?;
+    let p = Params::parse(q.as_deref());
+    let limit = p.u32("limit")?.unwrap_or(50).clamp(1, 100);
+    let cursor = p.one("cursor").map(str::to_string);
+    let mut blocks = Blocks::new(&s, &caller);
+    let result = respond(
+        &caller.req,
+        s.app.hydrator.refract_list_notifications(&caller.viewer, &caller.req, caller.member, limit, cursor.as_deref(), blocks.as_mut()).await,
+    );
+    metrics::counter!(METRIC_READS, "method" => "listNotifications", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
+    result
+}
+
+/// `refract.getUnreadCount` (§5.3, §7.1): a non-member counts 0.
+pub async fn get_unread_count(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, RawQuery(q): RawQuery) -> XrpcResult {
+    let caller = gate(&s, &headers, peer, GET_UNREAD_COUNT).await?;
+    let p = Params::parse(q.as_deref());
+    let seen_at = match p.one("seenAt") {
+        Some(t) => Some(
+            chrono::DateTime::parse_from_rfc3339(t)
+                .map_err(|_| XrpcError::invalid("Error: seenAt must be a datetime"))?
+                .with_timezone(&Utc),
+        ),
+        None => None,
+    };
+    let mut blocks = Blocks::new(&s, &caller);
+    let result = respond(&caller.req, s.app.hydrator.refract_unread_count(&caller.viewer, &caller.req, caller.member, seen_at, blocks.as_mut()).await);
+    metrics::counter!(METRIC_READS, "method" => "getUnreadCount", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }
 

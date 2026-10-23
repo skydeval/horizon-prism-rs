@@ -4,6 +4,7 @@ mod checks;
 mod config;
 mod endpoints;
 mod feeds;
+mod notifications;
 mod reads;
 pub(crate) mod harness;
 mod storage;

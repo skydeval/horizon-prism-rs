@@ -72,6 +72,26 @@ fn preference_clause(hidden: usize, follows: usize) -> String {
     )
 }
 
+/// The table a notification read reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Table {
+    Public,
+    /// `refract_notifications` (refract design §5.3).
+    Refract,
+}
+
+impl Table {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Public => "notifications",
+            Self::Refract => "refract_notifications",
+        }
+    }
+}
+
+/// The most authors a Refract unread count asks Farsight about.
+const FARSIGHT_AUTHORS: usize = 100;
+
 /// A like or repost row: URI, subject URI and CID, `created_at`, `via` URI
 /// and CID.
 type SubjectRow = (String, String, Option<String>, DateTime<Utc>, Option<String>, Option<String>);
@@ -170,30 +190,74 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn list_notifications(&self, viewer: &Viewer, req: &Requester, limit: u32, cursor: Option<&str>, reasons: &[String]) -> ViewResult<Value> {
+        self.list_notifications_in(viewer, req, limit, cursor, reasons, Table::Public, None).await
+    }
+
+    /// `refract.listNotifications` (refract design §5.3, §7.1): the
+    /// caller's `refract_notifications`, under the filters of
+    /// `listNotifications` plus the moderation gate with the request's
+    /// Refract snapshot. A non-member gets an empty list; a member that is
+    /// not ready has its tables applied in the scan and its Farsight blocks
+    /// judged through `blocks` (a visitor's rounds). No `isRead`.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn refract_list_notifications(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        member: bool,
+        limit: u32,
+        cursor: Option<&str>,
+        blocks: Option<&mut crate::refract::handlers::Blocks>,
+    ) -> ViewResult<Value> {
+        if !member {
+            return Ok(Ok(Self::emit(json!({ "notifications": [] }))));
+        }
+        self.list_notifications_in(viewer, req, limit, cursor, &[], Table::Refract, blocks).await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn list_notifications_in(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        limit: u32,
+        cursor: Option<&str>,
+        reasons: &[String],
+        table: Table,
+        blocks: Option<&mut crate::refract::handlers::Blocks>,
+    ) -> ViewResult<Value> {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
         let (at, id) = parse_cursor(cursor);
+        // The member's preferences are private state too, applied after
+        // hydration (and, for a Refract read by a member that is not
+        // ready, in the scan with its tables).
+        let prefs = self.reason_filter(me).await?;
+        let in_scan = table == Table::Refract && !viewer.hydrate;
         // The scan applies none of the viewer's private state: every scanned
         // row is hydrated, and the viewer's mutes, blocks and thread mutes
         // drop rows afterwards (design-v3 §8.1 "Hydrate before filtering").
         // So what a member's read fetches and caches does not depend on what
         // it muted. A page can be short; the cursor follows the scan.
-        let rows: Vec<NotificationRow> = sqlx::query_as(
+        let sql = format!(
             "SELECT n.id, n.author_did, n.reason, n.reason_subject, n.record_uri, n.record_cid, n.indexed_at, n.starter_pack_uri \
-             FROM notifications n WHERE n.recipient_did = $1 \
+             FROM {} n WHERE n.recipient_did = $1 \
                AND ($2::timestamptz IS NULL OR (n.indexed_at, n.id) < ($2, $3)) \
-               AND (cardinality($5::text[]) = 0 OR n.reason = ANY($5)) \
+               AND (cardinality($5::text[]) = 0 OR n.reason = ANY($5)) {} \
              ORDER BY n.indexed_at DESC, n.id DESC LIMIT $4",
-        )
-        .bind(me)
-        .bind(at)
-        .bind(id)
-        .bind(i64::from(limit))
-        .bind(reasons)
-        .fetch_all(self.pool())
-        .await?;
-        let seen = self.seen_at(me).await?;
+            table.name(),
+            if in_scan { format!("AND {EXCLUSIONS} AND {}", preference_clause(6, 7)) } else { String::new() },
+        );
+        let mut scan = sqlx::query_as(&sql).bind(me).bind(at).bind(id).bind(i64::from(limit)).bind(reasons);
+        if in_scan {
+            scan = scan.bind(&prefs.hidden).bind(&prefs.follows_only);
+        }
+        let rows: Vec<NotificationRow> = scan.fetch_all(self.pool()).await?;
+        let seen = if table == Table::Public { self.seen_at(me).await? } else { None };
         let authors: Vec<String> = rows.iter().map(|r| r.author_did.clone()).collect();
         let ctx = self.profile_context(viewer, req, &authors, None, super::Tiers::List).await?;
         let records = self.notification_records(&rows).await?;
@@ -220,9 +284,22 @@ impl Hydrator {
                 }
             }
         }
-        // The member's preferences are private state too, applied here and
-        // not in the scan.
-        let prefs = self.reason_filter(me).await?;
+        // Refract: the moderation gate with the request's snapshot over the
+        // authors and records (§5.3), and a not-ready member's Farsight
+        // blocks, judged as a visitor's.
+        let mut hidden_by_gate: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if table == Table::Refract {
+            let mut subjects: Vec<String> = authors.clone();
+            subjects.extend(rows.iter().map(|r| r.record_uri.clone()));
+            subjects.sort_unstable();
+            subjects.dedup();
+            let gates = self.gate_many(req, &subjects).await?;
+            hidden_by_gate.extend(gates.into_iter().filter(|(_, g)| g.is_hidden()).map(|(s, _)| s));
+            if let Some(b) = blocks {
+                b.round(&authors).await;
+                hidden_by_gate.extend(authors.iter().filter(|a| b.blocked(a)).cloned());
+            }
+        }
         let followed: std::collections::HashSet<String> = if prefs.follows_only.is_empty() {
             std::collections::HashSet::new()
         } else {
@@ -236,7 +313,9 @@ impl Hydrator {
         };
         let dropped = |r: &NotificationRow| {
             let who = &ctx.viewer;
-            who.blocked_either_way(&r.author_did)
+            hidden_by_gate.contains(&r.author_did)
+                || hidden_by_gate.contains(&r.record_uri)
+                || who.blocked_either_way(&r.author_did)
                 || prefs.hidden.contains(&r.reason)
                 || (prefs.follows_only.contains(&r.reason) && !followed.contains(&r.author_did))
                 || who.muted.contains(&r.author_did)
@@ -268,6 +347,11 @@ impl Hydrator {
                     "indexedAt": ts(r.indexed_at),
                     "labels": labels.get(&r.record_uri).cloned().unwrap_or_default(),
                 });
+                if table == Table::Refract
+                    && let Some(n) = n.as_object_mut()
+                {
+                    n.remove("isRead");
+                }
                 if let Some(s) = &r.reason_subject {
                     n["reasonSubject"] = json!(s);
                 }
@@ -372,6 +456,104 @@ impl Hydrator {
             }
         }
         Ok(Ok(Self::emit(json!({ "count": count }))))
+    }
+
+    /// `refract.getUnreadCount` (refract design §5.3, §7.1): the caller's
+    /// `refract_notifications` newer than `seen_at` (else the stored
+    /// last-seen time), under the count's exclusions and, in SQL, the
+    /// request's Refract snapshot, account statuses and local takedowns.
+    /// Inbound list blocks are subtracted as `getUnreadCount` does; for a
+    /// member that is not ready, through `blocks`. A non-member counts 0.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn refract_unread_count(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        member: bool,
+        seen_at: Option<DateTime<Utc>>,
+        blocks: Option<&mut crate::refract::handlers::Blocks>,
+    ) -> ViewResult<Value> {
+        let Some(me) = viewer.did.as_deref() else {
+            return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
+        };
+        if !member {
+            return Ok(Ok(Self::emit(json!({ "count": 0 }))));
+        }
+        let prefs = self.reason_filter(me).await?;
+        let snapshot = self.refract_snapshot(req).await;
+        let mut all_but_kept: Vec<String> = Vec::new();
+        let mut posts_only: Vec<String> = Vec::new();
+        for (did, rule) in &snapshot.by_collection {
+            match rule {
+                crate::refract::CollectionRule::AllButKept => all_but_kept.push(did.clone()),
+                crate::refract::CollectionRule::PostsOnly => posts_only.push(did.clone()),
+            }
+        }
+        let wholesale: Vec<String> = snapshot.wholesale.iter().cloned().collect();
+        let records: Vec<String> = snapshot.records.iter().cloned().collect();
+        let mut kept: Vec<String> = vec![crate::refract::snapshot::NSID_PROFILE.to_string(), crate::refract::snapshot::NSID_FOLLOW.to_string()];
+        kept.extend(crate::firehose::backfill::OFF_SELF_RECORDS.iter().map(|c| (*c).to_string()));
+        let sql = format!(
+            "SELECT count(*) FROM refract_notifications n WHERE n.recipient_did = $1 AND {EXCLUSIONS} AND {} \
+               AND n.indexed_at > COALESCE($2::timestamptz, \
+                   (SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity') \
+               AND n.author_did <> ALL($5) AND n.record_uri <> ALL($6) \
+               AND NOT (n.author_did = ANY($7) AND split_part(n.record_uri, '/', 4) <> ALL($9)) \
+               AND NOT (n.author_did = ANY($8) AND split_part(n.record_uri, '/', 4) = 'app.bsky.feed.post') \
+               AND NOT EXISTS (SELECT 1 FROM actors a WHERE a.did = n.author_did \
+                               AND a.account_status IN ('deactivated', 'takendown', 'suspended', 'deleted')) \
+               AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject IN (n.record_uri, n.author_did) AND l.val = '!takedown') \
+               AND ($10::text[] IS NULL OR n.author_did = ANY($10))",
+            preference_clause(3, 4)
+        );
+        let count = |only: Option<Vec<String>>| {
+            sqlx::query_scalar::<_, i64>(&sql)
+                .bind(me)
+                .bind(seen_at)
+                .bind(&prefs.hidden)
+                .bind(&prefs.follows_only)
+                .bind(&wholesale)
+                .bind(&records)
+                .bind(&all_but_kept)
+                .bind(&posts_only)
+                .bind(&kept)
+                .bind(only)
+                .fetch_one(self.pool())
+        };
+        let mut total = count(None).await?;
+        if total > 0 {
+            // The unread rows' authors, newest first, as many as one
+            // request may ask Farsight about.
+            let ready_lookup = if viewer.hydrate { crate::xrpc::backstop::farsight() } else { None };
+            let cap = ready_lookup.as_ref().map_or(FARSIGHT_AUTHORS, |l| l.capacity().min(FARSIGHT_AUTHORS));
+            let authors: Vec<String> = sqlx::query_scalar(
+                "SELECT n.author_did FROM refract_notifications n WHERE n.recipient_did = $1 \
+                   AND n.indexed_at > COALESCE($2::timestamptz, \
+                       (SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity') \
+                 GROUP BY n.author_did ORDER BY max(n.indexed_at) DESC LIMIT $3",
+            )
+            .bind(me)
+            .bind(seen_at)
+            .bind(i64::try_from(cap).unwrap_or(i64::MAX))
+            .fetch_all(self.pool())
+            .await?;
+            let blockers: Vec<String> = if let Some(lookup) = ready_lookup {
+                lookup.set_no_fallback();
+                lookup.inbound_list_blocks(me, &authors, &std::collections::HashSet::new()).await.into_keys().collect()
+            } else if let Some(b) = blocks {
+                b.round(&authors).await;
+                authors.into_iter().filter(|a| b.blocked(a)).collect()
+            } else {
+                Vec::new()
+            };
+            if !blockers.is_empty() {
+                total = (total - count(Some(blockers)).await?).max(0);
+            }
+        }
+        Ok(Ok(Self::emit(json!({ "count": total }))))
     }
 
     /// `app.bsky.notification.updateSeen`.

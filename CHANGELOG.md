@@ -10,6 +10,26 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract R6: notifications, #834)
+
+- **Refract notifications** (refract design §5.3): a restored author's
+  records from the live stream or a catch-up (never a backfill or an
+  index request) notify members in `refract_notifications`, in every
+  mode: the reasons `notifications_for` gives (mentions from facets
+  included), each checked against the recipient's thread mutes, and the
+  via-repost reasons deduplicated against the same table. No
+  `subscribed-post`. A delete takes its rows with it.
+- **`app.nearhorizon.refract.listNotifications`** and
+  **`.getUnreadCount`** (§5.3, §7.1): the caller's rows under the filters
+  of `listNotifications` (blocks both ways, mutes, list mutes and blocks,
+  inbound list blocks, notification preferences, thread mutes), plus the
+  moderation gate with the request's Refract snapshot (a gone record
+  label, an author pending removal, in grace or ending is left out). The
+  count applies the same exclusions in SQL. No `isRead`. A member that is
+  not ready gets its own tables applied in the scan and its Farsight
+  blocks judged as a visitor's; a non-member gets an empty list and a
+  zero count.
+
 ### Added (Refract R5: restored profiles and author feeds, #833)
 
 - **`app.nearhorizon.refract.getAuthorFeed`** (refract design §7.1): the

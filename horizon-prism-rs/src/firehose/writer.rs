@@ -1462,6 +1462,12 @@ impl Writer {
         if notify {
             self.notify(conn, u, sets, live).await?;
         }
+        // Refract (refract design §5.3): a restored author's records from
+        // the live stream or a catch-up notify members in their own table,
+        // in every mode; a backfill or an index request never does.
+        if sets.is_restored(author) && matches!(options.source, WriteSource::Firehose | WriteSource::CatchUp) {
+            self.refract_notify(conn, u, sets).await?;
+        }
         eff.growth_added = growth::apply(conn, plan).await?;
         Ok((OpOutcome::Written, eff))
     }
@@ -1536,6 +1542,49 @@ impl Writer {
             && Utc::now().signed_duration_since(p.created_at) <= self.subscribed_post_max_age
         {
             insert_subscribed_post(conn, author, &u.uri, &u.cid, p.reply_parent.is_some(), p.created_at, root).await?;
+        }
+        Ok(())
+    }
+
+    /// `refract_notifications` for a restored author's record (refract
+    /// design §5.3): the reasons `notifications_for` gives, each checked
+    /// against the recipient's thread mutes, and the via-repost reasons; no
+    /// `subscribed-post`.
+    async fn refract_notify(&self, conn: &mut PgConnection, u: &Upsert, sets: &ScopeSets) -> Result<(), OpError> {
+        const TABLE: &str = "refract_notifications";
+        let author = u.input.author.as_str();
+        let root = match &u.body {
+            Body::Post(p) => p.reply_root.as_ref().map(|r| r.uri.as_str()),
+            _ => None,
+        };
+        for n in notifications_for(author, &u.body, sets) {
+            insert_notification_into(conn, TABLE, &n, author, &u.uri, &u.cid, root).await?;
+        }
+        match &u.body {
+            Body::Like(s) | Body::Repost(s) => {
+                let reason = if matches!(u.body, Body::Like(_)) { "like-via-repost" } else { "repost-via-repost" };
+                if !is_private_uri(&s.subject.uri)
+                    && let Some(via) = &s.via
+                    && via.uri.contains("/app.bsky.feed.repost/")
+                    && let Some(reposter) = uri_author(&via.uri)
+                    && reposter != author
+                    && sets.is_member(reposter)
+                {
+                    insert_via_notification_into(conn, TABLE, reason, author, &u.uri, &u.cid, &via.uri, &s.subject.uri).await?;
+                }
+            }
+            Body::Follow(g) => {
+                if let Some(via) = &g.via
+                    && via.uri.contains("/app.bsky.graph.starterpack/")
+                {
+                    sqlx::query("UPDATE refract_notifications SET starter_pack_uri = $1 WHERE record_uri = $2 AND reason = 'follow'")
+                        .bind(&via.uri)
+                        .bind(&u.uri)
+                        .execute(&mut *conn)
+                        .await?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -2149,8 +2198,22 @@ async fn insert_notification(
     record_cid: &str,
     record_root: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    insert_notification_into(conn, "notifications", n, author, record_uri, record_cid, record_root).await
+}
+
+/// [`insert_notification`] into `table`: `notifications`, or Refract's
+/// `refract_notifications` (refract design §5.3).
+async fn insert_notification_into(
+    conn: &mut PgConnection,
+    table: &str,
+    n: &Notification,
+    author: &str,
+    record_uri: &str,
+    record_cid: &str,
+    record_root: Option<&str>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(&format!(
-        "INSERT INTO notifications (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
+        "INSERT INTO {table} (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
          SELECT $1, $5, $6, $4, $2, $7 WHERE NOT {THREAD_MUTED} ON CONFLICT DO NOTHING"
     ))
     .bind(&n.recipient)
@@ -2178,13 +2241,29 @@ async fn insert_via_notification(
     via: &str,
     subject: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO notifications (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
+    insert_via_notification_into(conn, "notifications", reason, author, record_uri, record_cid, via, subject).await
+}
+
+/// [`insert_via_notification`] into `table`, its dedupe read from the same
+/// table (refract design §5.3).
+#[allow(clippy::too_many_arguments)]
+async fn insert_via_notification_into(
+    conn: &mut PgConnection,
+    table: &str,
+    reason: &'static str,
+    author: &str,
+    record_uri: &str,
+    record_cid: &str,
+    via: &str,
+    subject: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "INSERT INTO {table} (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
          SELECT r.author_did, $1, $2, r.uri, $3, $4 FROM reposts r \
          WHERE r.uri = $5 AND r.subject_uri = $6 \
-           AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.recipient_did = r.author_did AND n.record_uri = $3) \
+           AND NOT EXISTS (SELECT 1 FROM {table} n WHERE n.recipient_did = r.author_did AND n.record_uri = $3) \
          ON CONFLICT DO NOTHING",
-    )
+    ))
     .bind(author)
     .bind(reason)
     .bind(record_uri)
