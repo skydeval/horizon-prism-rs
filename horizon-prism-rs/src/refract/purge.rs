@@ -86,6 +86,26 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
             n += profile(conn, did).await?;
         }
     }
+    // Always: other accounts' reposts of the DID's posts that only the
+    // restored-subject rule kept (refract-reposts design §4). Never a
+    // member's (D-7) nor one by a DID in R (its own rule keeps it); in On and
+    // Filling, never one by a DID in S (rule 1), nor any when the DID is a
+    // member (rule 2).
+    if off || !member {
+        let s_spare = if off { "" } else { " AND NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = t.author_did)" };
+        n += delete(
+            conn,
+            "reposts",
+            "uri",
+            &format!(
+                "split_part(t.subject_uri, '/', 3) = $1 AND t.author_did <> $1 \
+                 AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did) \
+                 AND NOT EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = t.author_did AND rf.state IN ('restored', 'grace')){s_spare}"
+            ),
+            did,
+        )
+        .await?;
+    }
     // Always: the DID's Refract notifications, and its public ones whose
     // record no longer exists.
     n += delete(conn, "refract_notifications", "id", "t.author_did = $1", did).await?;

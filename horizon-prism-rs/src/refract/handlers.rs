@@ -22,7 +22,7 @@
 //!   resolved, or whose resolve failed in the last few seconds
 //!   ([`Resolving`]), is `pending` with no cap and no second resolve.
 //! - **Errors**: `NotEnabled` (the feature is off), `AuthRequired`,
-//!   `InvalidToken`, `RateLimitExceeded`; `getAuthorFeed`'s actor gate
+//!   `InvalidToken`, `RateLimitExceeded`; `getAuthorFeed`'s and `getAuthorReposts`' actor gate
 //!   adds `AccountTakedown`, `AccountDeactivated` and `InvalidRequest`.
 
 use std::collections::{HashMap, HashSet};
@@ -58,6 +58,7 @@ pub const GET_POST_THREAD: &str = "app.nearhorizon.refract.getPostThread";
 pub const GET_TIMELINE: &str = "app.nearhorizon.refract.getTimeline";
 pub const LIST_NOTIFICATIONS: &str = "app.nearhorizon.refract.listNotifications";
 pub const GET_UNREAD_COUNT: &str = "app.nearhorizon.refract.getUnreadCount";
+pub const GET_AUTHOR_REPOSTS: &str = "app.nearhorizon.refract.getAuthorReposts";
 
 /// `fill` takes at most this many DIDs and as many URIs.
 pub const FILL_MAX: usize = 25;
@@ -95,6 +96,7 @@ pub fn router(state: RefractState) -> Router {
         .route(&crate::admin::usage::path("refract", GET_TIMELINE), get(get_timeline))
         .route(&crate::admin::usage::path("refract", GET_REPLIES), get(get_replies))
         .route(&crate::admin::usage::path("refract", GET_UNREAD_COUNT), get(get_unread_count))
+        .route(&crate::admin::usage::path("refract", GET_AUTHOR_REPOSTS), get(get_author_reposts))
         .route_layer(axum::middleware::from_fn(time_read))
         .with_state(state)
 }
@@ -889,6 +891,45 @@ pub async fn get_author_feed(State(s): State<RefractState>, ConnectInfo(peer): C
     .await;
     let result = visitor_state(&s, &caller, result).await;
     metrics::counter!(METRIC_READS, "method" => "getAuthorFeed", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
+    result
+}
+
+/// `refract.getAuthorReposts` (refract-reposts design §3.2): any actor's
+/// reposts of restored posts, newest first, for anyone signed in. A visitor
+/// blocked either way by the actor, or left unanswered, gets an empty feed.
+pub async fn get_author_reposts(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, RawQuery(q): RawQuery) -> XrpcResult {
+    let caller = gate(&s, &headers, peer, GET_AUTHOR_REPOSTS).await?;
+    let p = Params::parse(q.as_deref());
+    let actor = p.required("actor")?.to_string();
+    let limit = crate::hydration::feed::clamp_limit(p.u32("limit")?).min(100);
+    let cursor = p.one("cursor").map(str::to_string);
+    let h = &s.app.hydrator;
+    let hydration = |e: sqlx::Error| XrpcError::from(crate::hydration::HydrationError::from(e));
+    let Some(did) = h.resolve_actor(&caller.req, &actor).await.map_err(hydration)? else {
+        metrics::counter!(METRIC_READS, "method" => "getAuthorReposts", "outcome" => "not_found").increment(1);
+        return Err(XrpcError::invalid("Profile not found"));
+    };
+    if let Some((error, message)) = h.gate(&caller.req, &did).await.map_err(hydration)?.profile_error() {
+        return Err(XrpcError::new(StatusCode::BAD_REQUEST, error, message));
+    }
+    let snapshot = h.refract_snapshot(&caller.req).await;
+    let (items, next) = h.refract_author_reposts_items(&did, &served(&snapshot), cursor.as_deref(), limit).await.map_err(hydration)?;
+    let local: Vec<String> = items.iter().map(|i| i.post_uri.clone()).collect();
+    s.refract.serve_check(&caller.req, &local).await;
+    let mut blocks = Blocks::new(&s, &caller);
+    let mut named: Vec<String> = vec![did.clone()];
+    named.extend(items.iter().filter_map(|i| uri_author(&i.post_uri).map(str::to_string)));
+    if let Some(b) = blocks.as_mut() {
+        b.round(&named).await;
+    }
+    let items = if blocks.as_ref().is_some_and(|b| b.blocked(&did)) { Vec::new() } else { items };
+    let next = if items.is_empty() { None } else { next };
+    let result = with_blocks(&mut blocks, &named, || async {
+        h.refract_feed(&caller.viewer, &caller.req, &items, next.as_deref(), FEED_SUBJECT_CAP).await.map(Json).map_err(Into::into)
+    })
+    .await;
+    let result = visitor_state(&s, &caller, result).await;
+    metrics::counter!(METRIC_READS, "method" => "getAuthorReposts", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }
 

@@ -69,6 +69,11 @@ const CREATOR_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHER
      AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.creator_did AND r.state IN ('restored', 'grace'))";
 const NO_MEMBER_END_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did OR m.did = t.subject_did) \
      AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace'))";
+// refract-reposts design §4: a repost whose subject's author is in R is
+// kept by the restored-subject rule, whoever wrote it.
+const REPOST_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace')) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = split_part(t.subject_uri, '/', 3) AND r.state IN ('restored', 'grace'))";
 const POST_NOT_R: &str =
     "NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = split_part(t.post_uri, '/', 3) AND r.state IN ('restored', 'grace'))";
 
@@ -88,7 +93,7 @@ pub const TABLES: [SweepTable; 18] = [
     // 2. Non-members' likes and reposts, while `posts` still exists for
     // their trend triggers.
     table("likes", URI, AUTHOR_NOT_MEMBER_NOR_R, 1_000),
-    table("reposts", URI, AUTHOR_NOT_MEMBER_NOR_R, 1_000),
+    table("reposts", URI, REPOST_NOT_MEMBER_NOR_R, 1_000),
     // 3.
     table("posts", URI, NOT_R_AUTHOR, 1_000),
     // 4.

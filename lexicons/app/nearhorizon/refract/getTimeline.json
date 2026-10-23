@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Posts and reposts, newest first, by accounts this AppView serves for a listed community that the caller follows: top-level posts, replies to accounts the caller follows, and reposts. For a member, from its stored follows; empty for anyone else.",
+      "description": "Posts and reposts, newest first, by accounts this AppView serves for a listed community that the caller follows: top-level posts, replies to accounts the caller follows, and reposts; and reposts of their posts by the caller and by accounts the caller follows (reason app.bsky.feed.defs#reasonRepost). For a member, from its stored follows; empty for anyone else.",
       "parameters": {
         "type": "params",
         "properties": {

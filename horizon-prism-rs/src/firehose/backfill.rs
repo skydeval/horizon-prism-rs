@@ -85,6 +85,19 @@ pub const INBOUND_BATCH: usize = 500;
 pub const MAX_ATTEMPTS: i32 = 5;
 /// Poll interval when no job is due.
 pub const IDLE_POLL: Duration = Duration::from_secs(5);
+/// The newest posts of a restored DID whose older reposts the fill asks
+/// Constellation for, once (refract-reposts design §5).
+pub const REPOST_FILL_POSTS: i64 = 200;
+/// Reposts asked for per post: one Constellation page.
+pub const REPOST_FILL_PAGE: u32 = 100;
+/// The pause between two of the fill's Constellation calls (4 a second).
+const REPOST_FILL_PAUSE: Duration = Duration::from_millis(250);
+/// How long a DID whose fill failed waits for its next try.
+const REPOST_FILL_RETRY: Duration = Duration::from_secs(600);
+/// `refract_repost_fill_total{outcome}`: `done`, `left`, `error`.
+pub const METRIC_REPOST_FILL: &str = "refract_repost_fill_total";
+/// `refract_repost_fill_rows_total`.
+pub const METRIC_REPOST_FILL_ROWS: &str = "refract_repost_fill_rows_total";
 /// Listing-order detection is cached per PDS host for this long.
 pub const ORDER_CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Re-queue delay for a job whose DID is being purged (§6.11.7).
@@ -559,6 +572,13 @@ pub trait BackfillSource: Send + Sync {
     /// One Constellation page of `app.bsky.graph.block` records at `.subject`
     /// linking to `member`.
     async fn inbound_blocks(&self, member: &str, cursor: Option<&str>) -> Result<LinksPage, String>;
+    /// One Constellation page (the newest `limit`) of `app.bsky.feed.repost`
+    /// records at `.subject.uri` linking to `post` (refract-reposts design
+    /// §5). The default answers none.
+    async fn repost_links(&self, post: &str, limit: u32) -> Result<LinksPage, String> {
+        let _ = (post, limit);
+        Ok(LinksPage { total: 0, linking_records: Vec::new(), cursor: None })
+    }
 }
 
 /// The production source: `net` for PDS calls under the host's backfill
@@ -808,6 +828,13 @@ impl BackfillSource for NetSource {
             .await
             .map_err(|e| format!("constellation: {e}"))
     }
+
+    async fn repost_links(&self, post: &str, limit: u32) -> Result<LinksPage, String> {
+        self.constellation
+            .links(post, NSID_REPOST, ".subject.uri", limit, None)
+            .await
+            .map_err(|e| format!("constellation: {e}"))
+    }
 }
 
 /// A job's follows-pass lister (following-audience design §3.5): the job's
@@ -975,6 +1002,8 @@ pub struct Backfill {
     /// `refract.backfill_concurrency`: the dedicated `refract` workers
     /// (refract design §6.1).
     refract_workers: u32,
+    /// DIDs whose repost fill failed lately (refract-reposts design §5).
+    repost_fill_failed: moka::sync::Cache<String, ()>,
 }
 
 impl Backfill {
@@ -994,6 +1023,7 @@ impl Backfill {
             farsight: None,
             list_sync: None,
             refract_workers: 0,
+            repost_fill_failed: moka::sync::Cache::builder().max_capacity(100_000).time_to_live(REPOST_FILL_RETRY).build(),
         }
     }
 
@@ -1049,6 +1079,10 @@ impl Backfill {
             let this = self.clone();
             handles.push(tokio::spawn(async move { this.refract_loop().await }));
         }
+        if self.refract_workers > 0 {
+            let this = self.clone();
+            handles.push(tokio::spawn(async move { this.repost_fill_loop().await }));
+        }
         let this = self.clone();
         handles.push(tokio::spawn(async move { this.retry_loop().await }));
         let this = self.clone();
@@ -1084,6 +1118,94 @@ impl Backfill {
                 tokio::time::sleep(IDLE_POLL).await;
             }
         }
+    }
+
+    /// The repost fill (refract-reposts design §5): one restored DID at a
+    /// time, until aborted.
+    async fn repost_fill_loop(self) {
+        loop {
+            match self.repost_fill_once().await {
+                Ok(Some(_)) => {}
+                Ok(None) => tokio::time::sleep(IDLE_POLL).await,
+                Err(error) => {
+                    tracing::warn!(event = "refract_repost_fill_failed", %error, "a repost fill failed; retried");
+                    tokio::time::sleep(IDLE_POLL).await;
+                }
+            }
+        }
+    }
+
+    /// Fill one restored DID's older reposts (refract-reposts design §5): a
+    /// DID in R-live whose `reposts_filled_at` is unset and that has no
+    /// `refract` job queued or running; for its newest
+    /// [`REPOST_FILL_POSTS`] posts, one Constellation page each, written
+    /// through [`Writer::apply_inbound_reposts`] (so only what admission
+    /// stores). Returns the DID and the outcome (`done`, `left`, `error`),
+    /// or `None` when no DID is due.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn repost_fill_once(&self) -> Result<Option<(String, &'static str)>, sqlx::Error> {
+        let due: Vec<String> = sqlx::query_scalar(
+            "SELECT d.did FROM refract_dids d WHERE d.state IN ('restored', 'grace') AND d.reposts_filled_at IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM backfill_jobs j WHERE j.did = d.did AND j.depth = 'refract' AND j.state IN ('queued', 'running')) \
+             ORDER BY d.since NULLS LAST, d.did LIMIT 50",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut picked = None;
+        for did in due {
+            if !self.repost_fill_failed.contains_key(&did) && self.restored_live(&did).await {
+                picked = Some(did);
+                break;
+            }
+        }
+        let Some(did) = picked else {
+            return Ok(None);
+        };
+        let posts: Vec<String> = sqlx::query_scalar("SELECT uri FROM posts WHERE author_did = $1 ORDER BY created_at DESC, uri DESC LIMIT $2")
+            .bind(&did)
+            .bind(REPOST_FILL_POSTS)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut rows: u64 = 0;
+        let mut outcome = "done";
+        for (i, post) in posts.iter().enumerate() {
+            if !self.restored_live(&did).await {
+                outcome = "left";
+                break;
+            }
+            if i > 0 {
+                tokio::time::sleep(REPOST_FILL_PAUSE).await;
+            }
+            let page = match self.source.repost_links(post, REPOST_FILL_PAGE).await {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(event = "refract_repost_fill_error", did = %did, %error, "Constellation did not answer; the fill is tried again later");
+                    outcome = "error";
+                    break;
+                }
+            };
+            let reposters: Vec<(String, String)> =
+                page.linking_records.into_iter().filter(|r| r.collection == NSID_REPOST).map(|r| (r.did, r.rkey)).collect();
+            if !reposters.is_empty() {
+                rows += self.writer.apply_inbound_reposts(post, &reposters).await?;
+            }
+        }
+        metrics::counter!(METRIC_REPOST_FILL_ROWS).increment(rows);
+        metrics::counter!(METRIC_REPOST_FILL, "outcome" => outcome).increment(1);
+        match outcome {
+            "done" => {
+                sqlx::query("UPDATE refract_dids SET reposts_filled_at = now() WHERE did = $1 AND state IN ('restored', 'grace')")
+                    .bind(&did)
+                    .execute(&self.pool)
+                    .await?;
+            }
+            _ => self.repost_fill_failed.insert(did.clone(), ()),
+        }
+        tracing::info!(event = "refract_repost_fill", did = %did, outcome, rows, "a restored DID's older reposts were filled");
+        Ok(Some((did, outcome)))
     }
 
     /// Claim and run one due `refract` job, if any (tests).

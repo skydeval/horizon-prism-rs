@@ -184,6 +184,7 @@ mod tests {
             author: author.into(),
             kind,
             subjects: subjects.iter().map(|s| (*s).to_string()).collect(),
+            public_post_subject: false,
         }
     }
 

@@ -61,6 +61,9 @@ pub struct AdmissionInput {
     /// post; the authors of a reply's parent and root; the author of a quoted
     /// post; a follow's or block's subject. Empty for other records.
     pub subjects: Vec<String>,
+    /// A like or repost whose subject is an `app.bsky.feed.post` (not a
+    /// private post): what the restored-subject rule needs.
+    pub public_post_subject: bool,
 }
 
 /// Why an op was admitted.
@@ -76,6 +79,10 @@ pub enum AdmitRule {
     /// Refract's restored rule (refract design §5.1): the author is in
     /// R-live.
     Restored,
+    /// Refract's restored-subject rule (refract-reposts design §1): a
+    /// repost of a public post whose author is in R-live, by anyone, when
+    /// no other rule stores it.
+    RestoredSubject,
     /// The public-root-gate rule (public-root-gates design §3.2): a public
     /// root's gate whose public row is not stored; only the private tier's
     /// copy is written, and only while a private post claims the root.
@@ -130,6 +137,21 @@ impl Admission {
 /// admission-checked (§5.5).
 #[must_use]
 pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
+    let decision = admit_by_rules(input, sets);
+    // Refract's restored-subject rule (refract-reposts design §1), in every
+    // mode: it only widens what no other rule stores, and never overrides a
+    // purge rejection.
+    if matches!(decision, Admission::Reject(RejectReason::NotInScope | RejectReason::PublicOff))
+        && input.kind == RecordKind::Repost
+        && input.public_post_subject
+        && input.subjects.iter().any(|s| sets.is_restored(s))
+    {
+        return Admission::Admit(AdmitRule::RestoredSubject);
+    }
+    decision
+}
+
+fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     // Purge-kind rejections (§6.11.7 table) come first.
     match sets.purge_kind(&input.author) {
         Some(PurgeKind::AccountDeleted) => {
@@ -313,6 +335,7 @@ mod tests {
             author: author.into(),
             kind,
             subjects: subjects.iter().map(|s| (*s).to_string()).collect(),
+            public_post_subject: matches!(kind, RecordKind::Like | RecordKind::Repost),
         }
     }
 
@@ -592,6 +615,38 @@ mod tests {
             let mut d = restored(mode, false);
             d.purging.insert(RESTORED.into(), PurgeKind::AccountDeleted);
             assert_eq!(admit(&input(RESTORED, RecordKind::Post, &[]), &d), Admission::Reject(RejectReason::Purging(PurgeKind::AccountDeleted)));
+        }
+    }
+
+    /// refract-reposts A-1 (§1): anyone's repost of a public post by an
+    /// R-live author is stored in every mode, as `RestoredSubject` only when
+    /// no other rule stores it; not a repost of a private post, not a like
+    /// or reply, not when the author is out of R-live; a purge rejection of
+    /// the reposter stands.
+    #[test]
+    fn a1_reposts_of_restored_posts() {
+        const RS: Admission = Admission::Admit(AdmitRule::RestoredSubject);
+        for mode in [PublicMode::On, PublicMode::Filling, PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
+            let s = restored(mode, false);
+            assert_eq!(admit(&input(STRANGER, RecordKind::Repost, &[RESTORED]), &s), RS, "{mode:?}");
+            assert_eq!(admit(&input(MEMBER, RecordKind::Repost, &[RESTORED]), &s), Admission::Admit(AdmitRule::AuthorInScope), "{mode:?}");
+            let scoped = admit(&input(SCOPED, RecordKind::Repost, &[RESTORED]), &s);
+            assert_eq!(scoped, if mode.off_rule() { RS } else { Admission::Admit(AdmitRule::AuthorInScope) }, "{mode:?}");
+            let mut private = input(STRANGER, RecordKind::Repost, &[RESTORED]);
+            private.public_post_subject = false;
+            assert_eq!(admit(&private, &s), admit(&private, &with_mode(mode)), "{mode:?} a private subject");
+            for kind in [RecordKind::Like, RecordKind::Post] {
+                assert_eq!(admit(&input(STRANGER, kind, &[RESTORED]), &s), admit(&input(STRANGER, kind, &[RESTORED]), &with_mode(mode)), "{mode:?} {kind:?}");
+            }
+            // Out of R-live (a candidate, pending): as before.
+            assert_ne!(admit(&input(STRANGER, RecordKind::Repost, &[RESTORED]), &with_mode(mode)), RS, "{mode:?}");
+            let mut d = restored(mode, false);
+            d.purging.insert(STRANGER.into(), PurgeKind::AccountDeleted);
+            assert_eq!(admit(&input(STRANGER, RecordKind::Repost, &[RESTORED]), &d), Admission::Reject(RejectReason::Purging(PurgeKind::AccountDeleted)));
+            // A member in R: rule 2 keeps reposts of its posts in On and Filling.
+            let m = restored(mode, true);
+            let want = if mode.off_rule() { RS } else { Admission::Admit(AdmitRule::InboundToMember) };
+            assert_eq!(admit(&input(STRANGER, RecordKind::Repost, &[RESTORED]), &m), want, "{mode:?}");
         }
     }
 

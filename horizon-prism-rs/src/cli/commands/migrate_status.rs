@@ -120,6 +120,8 @@ mod tests {
             "0044_appearance_retention",
             // Private blocks removed (#876).
             "0045_drop_private_blocks",
+            // Refract reposts of restored posts RR3 (#894).
+            "0046_refract_reposts",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

@@ -344,6 +344,7 @@ pub const KEPT_METHODS: &[&str] = &[
     "app.nearhorizon.refract.getTimeline",
     "app.nearhorizon.refract.listNotifications",
     "app.nearhorizon.refract.getUnreadCount",
+    "app.nearhorizon.refract.getAuthorReposts",
 ];
 
 /// The methods private posting has added so far (§3.2), each with its
@@ -501,19 +502,19 @@ mod tests {
     /// S11's running totals, private notification preferences' two,
     /// private activity subscriptions' two, private appearance's two and
     /// its retention's one): every served method is in exactly one of the
-    /// two sets, 56 public and 51 kept (Refract's seven included), 107 served. Their verbs are checked
+    /// two sets, 56 public and 52 kept (Refract's eight included), 108 served. Their verbs are checked
     /// against the routes in `xrpc::router`'s and `private_tier`'s tests.
     #[test]
     fn public_and_kept_methods_classify_every_served_method() {
         use crate::xrpc::rate_limit::SERVED;
 
-        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 51));
+        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 52));
         let public: BTreeSet<&str> = PUBLIC_METHODS.iter().map(|m| m.nsid).collect();
         let kept: BTreeSet<&str> = KEPT_METHODS.iter().copied().collect();
-        assert_eq!((public.len(), kept.len()), (56, 51), "no NSID twice");
+        assert_eq!((public.len(), kept.len()), (56, 52), "no NSID twice");
         assert!(public.is_disjoint(&kept));
         let served: BTreeSet<&str> = SERVED.iter().map(|s| s.nsid).collect();
-        assert_eq!(served.len(), 107);
+        assert_eq!(served.len(), 108);
         // Private posting's methods are kept, in the `private` family.
         for &(nsid, _) in PRIVATE_POSTING_METHODS {
             assert!(kept.contains(nsid), "{nsid}");

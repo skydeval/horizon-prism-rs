@@ -6,6 +6,7 @@ mod endpoints;
 mod feeds;
 mod notifications;
 mod reads;
+mod reposts;
 pub(crate) mod harness;
 mod storage;
 mod timeline;

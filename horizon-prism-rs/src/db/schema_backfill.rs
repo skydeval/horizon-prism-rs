@@ -55,7 +55,7 @@ const LOCK_RETRY: Duration = Duration::from_millis(500);
 
 /// The large-table indexes, by name, with the one statement that builds
 /// each (§3.1: the names and definitions are normative).
-pub const INDEXES: [(&str, &str); 12] = [
+pub const INDEXES: [(&str, &str); 13] = [
     ("posts_search", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_search ON posts USING gin (search_tsv)"),
     ("posts_tags", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_tags ON posts USING gin (tags)"),
     ("posts_domains", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_domains ON posts USING gin (link_domains)"),
@@ -75,6 +75,13 @@ pub const INDEXES: [(&str, &str); 12] = [
         "reposts_private_subject",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_private_subject ON reposts (author_did, created_at DESC) \
          WHERE subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%'",
+    ),
+    // Reposts by the subject's author: Refract's purge and spares of
+    // reposts of restored posts, and `getTimeline`'s repost arm
+    // (docs/internal/refract/refract-reposts-v1.md §6).
+    (
+        "reposts_subject_did",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_subject_did ON reposts (split_part(subject_uri, '/', 3), created_at DESC)",
     ),
 ];
 
@@ -605,7 +612,7 @@ mod tests {
             .fetch_one(p)
             .await
             .expect("recorded");
-        assert_eq!(recorded, 12);
+        assert_eq!(recorded, 13);
         // A second pass finds every index valid and builds nothing.
         t.run_index_builds().await.expect("again");
         db.drop_db().await;

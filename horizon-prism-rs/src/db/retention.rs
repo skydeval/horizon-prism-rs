@@ -286,7 +286,9 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             "uri",
             "r",
             "r.author_did",
-            &format!("{} AND NOT {}", out_and_not_r("r.author_did"), subject_member("r")),
+            // A repost of an R author's post is kept whoever wrote it
+            // (refract-reposts design §4).
+            &format!("{} AND NOT {} AND {}", out_and_not_r("r.author_did"), subject_member("r"), not_in_r(&author_of("r.subject_uri"))),
             Bind::None,
         ),
         scoped(
@@ -553,9 +555,10 @@ fn age_cap_steps(max_age_days: u32) -> Vec<Step> {
             "uri",
             "r",
             &format!(
-                "r.created_at < now() - make_interval(days => $1) AND {} AND NOT {}",
+                "r.created_at < now() - make_interval(days => $1) AND {} AND NOT {} AND {}",
                 unprotected("r.author_did"),
-                member_among(&[author_of("r.subject_uri")])
+                member_among(&[author_of("r.subject_uri")]),
+                not_in_r(&author_of("r.subject_uri"))
             ),
             Bind::Days(days),
         ),

@@ -701,10 +701,14 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Resu
     let out_of_scope = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = t.author_did) \
         AND NOT EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = t.author_did AND rf.state IN ('restored', 'grace'))";
     let mut n = 0;
+    // Reposts of a removed member in R are kept by the restored-subject
+    // rule (refract-reposts design §4).
+    let subject_in_r = "EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = $1 AND rf.state IN ('restored', 'grace'))";
     for table in ["likes", "reposts"] {
+        let spare = if table == "reposts" { format!(" AND NOT {subject_in_r}") } else { String::new() };
         let sql = format!(
             "DELETE FROM {table} WHERE uri IN (SELECT uri FROM {table} t \
-             WHERE {} = $1 AND {out_of_scope} LIMIT {BATCH})",
+             WHERE {} = $1 AND {out_of_scope}{spare} LIMIT {BATCH})",
             author_of("t.subject_uri")
         );
         n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
@@ -774,7 +778,10 @@ async fn member_removed_off_batch(conn: &mut PgConnection, did: &str) -> Result<
         ("list_items", "author_did"),
         ("list_optouts", "author_did"),
     ] {
-        n += delete_batch(conn, table, "uri", &format!("{column} = $1 AND NOT {removed_in_r}"), did).await?;
+        // Its reposts of R authors' posts are kept by the restored-subject
+        // rule (refract-reposts design §4).
+        let spare = if table == "reposts" { format!(" AND NOT {}", in_r("split_part(subject_uri, '/', 3)")) } else { String::new() };
+        n += delete_batch(conn, table, "uri", &format!("{column} = $1 AND NOT {removed_in_r}{spare}"), did).await?;
     }
     let non_member = |col: &str| format!("NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.{col})");
     for (own, other, spare) in [("author_did", "subject_did", removed_in_r.clone()), ("subject_did", "author_did", in_r("t.author_did"))] {

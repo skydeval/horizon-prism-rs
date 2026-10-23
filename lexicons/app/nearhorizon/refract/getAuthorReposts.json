@@ -1,0 +1,33 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.refract.getAuthorReposts",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "An account's reposts of posts by accounts this AppView serves for a listed community, newest first, as feed items whose reason is app.bsky.feed.defs#reasonRepost (by the actor). Any account, served for a listed community or not. A repost whose post or reposter cannot be shown is left out; a visitor blocked either way by the actor gets an empty feed.",
+      "parameters": {
+        "type": "params",
+        "required": ["actor"],
+        "properties": {
+          "actor": { "type": "string", "format": "at-identifier" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 },
+          "cursor": { "type": "string" }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["feed"],
+          "properties": {
+            "servedAs": { "type": "string", "knownValues": ["member", "visitor"], "description": "The form this answer was served in: `member` (a ready member, with its stored viewer state) or `visitor` (anyone else)." },
+            "viewerChecked": { "type": "ref", "ref": "app.nearhorizon.refract.defs#viewerChecked" },
+            "cursor": { "type": "string" },
+            "feed": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.feed.defs#feedViewPost" } }
+          }
+        }
+      },
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }, { "name": "InvalidToken" }, { "name": "RateLimitExceeded" }, { "name": "AccountTakedown" }, { "name": "AccountDeactivated" }, { "name": "InvalidRequest", "description": "Profile not found: the actor does not resolve, or the account is deleted." }]
+    }
+  }
+}

@@ -477,6 +477,12 @@ pub fn commit_matters(repo: &str, ops: &[RawOp], sets: &ScopeSets, now: DateTime
             .any(|(p, op)| matches!(p, Prepared::Invalid(_)) && invalid_op_matters(repo, op, sets, owner_side))
 }
 
+/// Whether `uri` names an `app.bsky.feed.post` (refract-reposts design §1:
+/// the restored-subject rule takes reposts of public posts only).
+fn is_public_post_uri(uri: &str) -> bool {
+    uri.starts_with("at://") && uri.split('/').nth(3) == Some(super::classifier::NSID_POST)
+}
+
 /// The author of the `postPrivate` post a gate row names (private posting
 /// §4.4): the gate's one admission subject. `None` for any other row,
 /// including a gate on a public post.
@@ -526,6 +532,7 @@ fn build_upsert(
     now: DateTime<Utc>,
 ) -> Result<Option<Upsert>, RecordError> {
     let normalized = normalize_record(record);
+    let mut public_post_subject = false;
     let (body, subjects) = match class {
         RecordClass::Ecosystem(EcosystemKind::Post) => {
             let p = PostRecord::parse(record, now)?;
@@ -549,11 +556,13 @@ fn build_upsert(
         RecordClass::Ecosystem(EcosystemKind::Like) => {
             let s = SubjectRecord::parse(record, now)?;
             let subjects = uri_author(&s.subject.uri).map(str::to_string).into_iter().collect();
+            public_post_subject = is_public_post_uri(&s.subject.uri);
             (Body::Like(s), subjects)
         }
         RecordClass::Ecosystem(EcosystemKind::Repost) => {
             let s = SubjectRecord::parse(record, now)?;
             let subjects = uri_author(&s.subject.uri).map(str::to_string).into_iter().collect();
+            public_post_subject = is_public_post_uri(&s.subject.uri);
             (Body::Repost(s), subjects)
         }
         RecordClass::Ecosystem(EcosystemKind::Follow) => {
@@ -603,6 +612,7 @@ fn build_upsert(
             author: repo.to_string(),
             kind,
             subjects,
+            public_post_subject,
         },
         record: normalized,
     }))
@@ -1207,6 +1217,7 @@ impl Writer {
                 author: did.clone(),
                 kind: RecordKind::Block,
                 subjects: vec![member.to_string()],
+                public_post_subject: false,
             };
             if !proto_blue::syntax::Did::is_valid(did) || !proto_blue::syntax::RecordKey::is_valid(rkey) {
                 continue;
@@ -1231,6 +1242,68 @@ impl Writer {
         .bind(&uris)
         .bind(&dids)
         .bind(member)
+        .bind(SENTINEL_REV)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        drop(guard);
+        Ok(inserted)
+    }
+
+    /// Reposts of the public post `subject` found through Constellation
+    /// backlinks (refract-reposts design §5): each `(did, rkey)` that
+    /// [`admit`] stores becomes a `reposts` row with no subject CID, the
+    /// sentinel rev (any real write wins) and its record key's time (now
+    /// when the key is not a TID; never later than now). Tombstoned URIs and
+    /// rows already stored are left alone. Returns the rows written.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn apply_inbound_reposts(&self, subject: &str, reposters: &[(String, String)]) -> Result<u64, sqlx::Error> {
+        let Some(subject_author) = uri_author(subject).filter(|_| is_public_post_uri(subject)) else {
+            return Ok(0);
+        };
+        let now = Utc::now();
+        let guard = self.scope.read_guard().await;
+        let sets: &ScopeSets = &guard;
+        let mut dids: Vec<String> = Vec::new();
+        let mut uris: Vec<String> = Vec::new();
+        let mut times: Vec<DateTime<Utc>> = Vec::new();
+        for (did, rkey) in reposters {
+            if !proto_blue::syntax::Did::is_valid(did) || !proto_blue::syntax::RecordKey::is_valid(rkey) {
+                continue;
+            }
+            let input = AdmissionInput {
+                author: did.clone(),
+                kind: RecordKind::Repost,
+                subjects: vec![subject_author.to_string()],
+                public_post_subject: true,
+            };
+            let uri = format!("at://{did}/{}/{rkey}", super::classifier::NSID_REPOST);
+            if admit(&input, sets).is_admitted() && !uris.contains(&uri) {
+                dids.push(did.clone());
+                uris.push(uri);
+                times.push(crate::hydration::feed::tid_timestamp(rkey).map_or(now, |t| t.min(now)));
+            }
+        }
+        if uris.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        lock_dids_shared(&mut tx, &dids).await?;
+        lock_uris(&mut tx, &uris).await?;
+        let inserted = sqlx::query(
+            "INSERT INTO reposts (uri, author_did, subject_uri, subject_cid, rev, created_at, indexed_at) \
+             SELECT u, d, $4, NULL, $5, c, now() FROM unnest($1::text[], $2::text[], $3::timestamptz[]) AS t(u, d, c) \
+             WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.uri = t.u) \
+             ON CONFLICT (uri) DO NOTHING",
+        )
+        .bind(&uris)
+        .bind(&dids)
+        .bind(&times)
+        .bind(subject)
         .bind(SENTINEL_REV)
         .execute(&mut *tx)
         .await?

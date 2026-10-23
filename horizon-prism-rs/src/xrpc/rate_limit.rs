@@ -261,6 +261,7 @@ pub const SERVED: &[Served] = &[
     served("app.nearhorizon.refract.getTimeline", Family::Refract, false),
     served("app.nearhorizon.refract.listNotifications", Family::Refract, false),
     served("app.nearhorizon.refract.getUnreadCount", Family::Refract, false),
+    served("app.nearhorizon.refract.getAuthorReposts", Family::Refract, false),
 ];
 
 /// Methods charged more than one token of their bucket. A private search

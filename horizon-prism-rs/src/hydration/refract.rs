@@ -245,8 +245,17 @@ impl Hydrator {
                 push(u);
             }
         }
-        // Step 1: the gate first, and the viewer's blocks of the authors.
-        let authors: Vec<String> = subjects.iter().chain(uris.iter()).filter_map(|u| uri_author(u)).map(str::to_string).collect::<HashSet<_>>().into_iter().collect();
+        // Step 1: the gate first, and the viewer's blocks of the authors and
+        // the reposters (refract-reposts design §3.3).
+        let authors: Vec<String> = subjects
+            .iter()
+            .chain(uris.iter())
+            .filter_map(|u| uri_author(u))
+            .map(str::to_string)
+            .chain(originators.iter().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         let mut gated: Vec<String> = subjects.clone();
         gated.extend(authors.iter().cloned());
         let gates = self.gate_many(req, &gated).await?;
@@ -283,6 +292,15 @@ impl Hydrator {
         let mut out = Vec::new();
         for item in items {
             if gates.get(&item.originator_did).is_some_and(|g| g.is_hidden()) || blocked(&item.post_uri) {
+                continue;
+            }
+            // A reposter blocked either way, or one no tier can render (it
+            // would read "handle.invalid"), leaves the repost out
+            // (refract-reposts design §3.3).
+            if item.kind == "repost"
+                && (actors.blocked_either_way(&item.originator_did)
+                    || !(ctx.profiles.rows.contains_key(&item.originator_did) || ctx.profiles.remote.contains_key(&item.originator_did)))
+            {
                 continue;
             }
             let local = ctx.posts.contains_key(&item.post_uri);
@@ -434,9 +452,11 @@ struct RootRules {
 impl Hydrator {
     /// The page of `refract.getTimeline` for a member (refract design
     /// §7.1): posts by DIDs in `restored` the member follows (top-level, and
-    /// replies whose parent author it follows) and their reposts, newest
-    /// first, with the member's mutes, blocks and list mutes and blocks
-    /// applied in SQL to the row's author and a repost's subject author.
+    /// replies whose parent author it follows) and their reposts, and the
+    /// reposts of their posts by the member and the accounts it follows
+    /// (refract-reposts design §3.1), newest first, with the member's mutes,
+    /// blocks and list mutes and blocks applied in SQL to the row's author
+    /// and a repost's subject author.
     ///
     /// # Errors
     ///
@@ -454,8 +474,10 @@ impl Hydrator {
                       OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = split_part(p.reply_parent_uri, '/', 3))) \
                UNION ALL \
                SELECT r.uri, r.author_did, r.subject_uri, 'repost', r.created_at, false FROM reposts r \
-               WHERE r.author_did = ANY($2) \
-                 AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = r.author_did) \
+               WHERE (r.author_did = ANY($2) \
+                      AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = r.author_did)) \
+                  OR (split_part(r.subject_uri, '/', 3) = ANY($2) AND split_part(r.subject_uri, '/', 4) = 'app.bsky.feed.post' \
+                      AND (r.author_did = $1 OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = r.author_did))) \
              ) t WHERE ($3::timestamptz IS NULL OR (t.sort_at, t.uri) < ($3, $4)) \
                AND NOT {} AND NOT {} \
                AND NOT (t.kind = 'repost' AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
@@ -474,6 +496,33 @@ impl Hydrator {
             .bind(i64::from(limit))
             .fetch_all(self.pool())
             .await?;
+        let next = (items.len() == usize::try_from(limit).unwrap_or(usize::MAX)).then(|| items.last().map(|i| local_cursor(i.sort_at, &i.uri))).flatten();
+        Ok((items, next))
+    }
+
+    /// The page of `refract.getAuthorReposts` (refract-reposts design
+    /// §3.2): `actor`'s reposts of public posts by DIDs in `restored`,
+    /// newest first, local cursors; and the next cursor.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn refract_author_reposts_items(&self, actor: &str, restored: &[String], cursor: Option<&str>, limit: u32) -> Result<(Vec<FeedItem>, Option<String>), sqlx::Error> {
+        let (at, after) = parse_local_cursor(cursor);
+        let items: Vec<FeedItem> = sqlx::query_as(
+            "SELECT r.uri, r.author_did AS originator_did, r.subject_uri AS post_uri, 'repost' AS kind, r.created_at AS sort_at \
+             FROM reposts r WHERE r.author_did = $1 \
+               AND split_part(r.subject_uri, '/', 3) = ANY($2) AND split_part(r.subject_uri, '/', 4) = 'app.bsky.feed.post' \
+               AND ($3::timestamptz IS NULL OR (r.created_at, r.uri) < ($3, $4)) \
+             ORDER BY r.created_at DESC, r.uri DESC LIMIT $5",
+        )
+        .bind(actor)
+        .bind(restored)
+        .bind(at)
+        .bind(after.unwrap_or_default())
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await?;
         let next = (items.len() == usize::try_from(limit).unwrap_or(usize::MAX)).then(|| items.last().map(|i| local_cursor(i.sort_at, &i.uri))).flatten();
         Ok((items, next))
     }
