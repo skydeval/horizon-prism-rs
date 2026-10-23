@@ -342,8 +342,10 @@ async fn t4_public_root_gates_hide_off() {
     reads_in(PublicMode::Off, "prg-reads-off").await;
 }
 
-/// T-6: the feature is listed, last.
+/// T-6: the feature is listed after `private.activitySubscriptions`.
 #[test]
 fn t6_the_feature_is_listed() {
-    assert_eq!(crate::private_tier::FEATURES.last(), Some(&"private.publicRootGates"));
+    let f = crate::private_tier::FEATURES;
+    let at = f.iter().position(|x| *x == "private.publicRootGates").expect("listed");
+    assert_eq!(f[at - 1], "private.activitySubscriptions");
 }

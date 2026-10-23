@@ -245,6 +245,8 @@ pub const FEATURES: &[&str] = &[
     // hiddenReplies lists from getPostThread and getReplies
     // (public-root-gates design).
     "private.publicRootGates",
+    // get/putAppearance: a member's appearance choice and value (private-appearance design).
+    "private.appearance",
 ];
 
 /// The private tier as the rest of the crate may use it.
