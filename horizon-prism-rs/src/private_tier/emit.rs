@@ -350,8 +350,8 @@ enum Body {
     /// `getUnreadCount`.
     UnreadCount(i64),
     /// `getNotificationPreferences` and `putNotificationPreferences`: the
-    /// caller's own five preferences, never anything from a post (private
-    /// notification preferences design §4).
+    /// caller's own six preferences, never anything from a post (private
+    /// notification preferences design §4; private-activity-subs §7).
     NotificationPreferences(Value),
     /// `searchPosts` (private posting §4.17): the page's matches, and the
     /// sealed cursor while the search has span left.

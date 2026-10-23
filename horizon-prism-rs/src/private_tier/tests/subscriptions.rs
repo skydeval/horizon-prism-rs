@@ -1,6 +1,7 @@
 //! Private activity subscriptions, the methods (private-activity-subs design
 //! §4): put and list (T-AS1), the put's refusals and cap (T-AS2), the purges
-//! (T-AS12) and the gate (T-AS14).
+//! (T-AS12), the gate (T-AS14), the `subscribedPost` preference (T-AS11)
+//! and the feature (T-AS15).
 
 use super::*;
 
@@ -248,4 +249,51 @@ async fn t_as14_the_gate() {
     assert!(ps == 400 && pb.contains("\"NotEnrolled\"") && ls == 400 && lb.contains("\"NotEnrolled\""), "{pb} {lb}");
     assert!(stored_rows(&f.pool).await.is_empty());
     db.drop_db().await;
+}
+
+const GET_PREFS: &str = "app.nearhorizon.private.getNotificationPreferences";
+const PUT_PREFS: &str = "app.nearhorizon.private.putNotificationPreferences";
+
+/// T-AS11: six preferences, `subscribedPost` `{list: true, push: true}` by
+/// default; the put takes `list` and `push` for it, drops an `include`, and
+/// refuses a non-boolean.
+#[tokio::test]
+async fn t_as11_the_subscribed_post_preference() {
+    let test = "t_as11_subs_preference";
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, PublicMode::Off).await;
+    f.ready_all().await;
+    let base = served_capped(&f, 1000).await;
+    let prefs = json_of(&base, GET_PREFS, "", BOB).await.1;
+    let keys: Vec<&String> = prefs["preferences"].as_object().expect("object").keys().collect();
+    assert_eq!(keys.len(), 6, "{prefs}");
+    assert_eq!(prefs["preferences"]["subscribedPost"], json!({"list": true, "push": true}));
+
+    let (status, body) = super::post(&base, PUT_PREFS, &json!({"subscribedPost": {"include": "follows", "list": false, "push": true}}), BOB).await;
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["preferences"]["subscribedPost"], json!({"list": false, "push": true}), "include dropped");
+    assert_eq!(v["preferences"]["like"], json!({"include": "all", "list": true, "push": true}), "the others kept");
+    let stored: Value = sqlx::query_scalar(&format!("SELECT prefs FROM private_notification_prefs WHERE did = '{BOB}'"))
+        .fetch_one(&f.pool)
+        .await
+        .expect("row");
+    assert_eq!(stored, json!({"subscribedPost": {"list": false, "push": true}}));
+
+    let (status, body) = super::post(&base, PUT_PREFS, &json!({"subscribedPost": {"list": "no", "push": true}}), BOB).await;
+    let v: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!((status, v["message"].as_str()), (400, Some("Error: subscribedPost.list must be a boolean")));
+    assert_eq!(json_of(&base, GET_PREFS, "", BOB).await.1["preferences"]["subscribedPost"], json!({"list": false, "push": true}));
+    db.drop_db().await;
+}
+
+/// T-AS15: `getMembership` lists `private.activitySubscriptions`, last,
+/// after `private.listBlocks`.
+#[test]
+fn t_as15_the_feature_is_listed_last() {
+    let f = crate::private_tier::FEATURES;
+    assert_eq!(f.last(), Some(&"private.activitySubscriptions"));
+    assert_eq!(f[f.len() - 2], "private.listBlocks");
 }

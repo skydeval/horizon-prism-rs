@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use super::handlers::PREFERENCE_REASONS;
+use super::handlers::NOTIFICATION_REASONS;
 use super::pipeline::RecordAuthz;
 use crate::firehose::classifier::{NSID_AUDIENCE, NSID_POST_PRIVATE};
 
@@ -3247,13 +3247,17 @@ impl NotificationRow {
 
 /// The recipient `$1`'s notification preferences pass the row `n` (private
 /// notification preferences design §5.1, §6.1): not `list: false` for its
-/// reason, and, under `include: "follows"`, the recipient follows its author
-/// as stored now. No row, or no key for the reason, passes. Each
+/// reason's key, and, under `include: "follows"`, the recipient follows its
+/// author as stored now. No row, or no key for the reason, passes. The key
+/// is the reason, but `subscribedPost` for `subscribed-post`
+/// (private-activity-subs design §6), which has no `include`. Each
 /// `SELECT q.prefs` names only `$1`, so it runs once per statement; `CASE`
 /// reaches the `follows` probe only for a follows-only reason.
 pub(super) const PREFERRED: &str = "CASE \
-   WHEN (((SELECT q.prefs FROM private_notification_prefs q WHERE q.did = $1) -> n.reason) ->> 'list') = 'false' THEN false \
-   WHEN (((SELECT q.prefs FROM private_notification_prefs q WHERE q.did = $1) -> n.reason) ->> 'include') = 'follows' \
+   WHEN (((SELECT q.prefs FROM private_notification_prefs q WHERE q.did = $1) \
+          -> (CASE n.reason WHEN 'subscribed-post' THEN 'subscribedPost' ELSE n.reason END)) ->> 'list') = 'false' THEN false \
+   WHEN (((SELECT q.prefs FROM private_notification_prefs q WHERE q.did = $1) \
+          -> (CASE n.reason WHEN 'subscribed-post' THEN 'subscribedPost' ELSE n.reason END)) ->> 'include') = 'follows' \
      THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = n.author_did) \
    ELSE true END";
 
@@ -3500,13 +3504,13 @@ pub(super) async fn unread_count_for(pool: &PgPool, recipient: &str, cap: u32, r
 
 /// The `reasons` filter as a clause over `n`: empty for no reasons; else
 /// the reasons given that a private notification can have, as literals
-/// from [`PREFERENCE_REASONS`] (never the caller's text). `None` when every
-/// reason given is one no row has, so nothing can match.
+/// from [`NOTIFICATION_REASONS`] (never the caller's text). `None` when
+/// every reason given is one no row has, so nothing can match.
 pub(super) fn reasons_clause(reasons: &[String]) -> Option<String> {
     if reasons.is_empty() {
         return Some(String::new());
     }
-    let known: Vec<String> = PREFERENCE_REASONS
+    let known: Vec<String> = NOTIFICATION_REASONS
         .iter()
         .filter(|k| reasons.iter().any(|r| r == *k))
         .map(|k| format!("'{k}'"))

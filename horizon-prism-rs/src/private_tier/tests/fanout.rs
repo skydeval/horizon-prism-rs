@@ -2,7 +2,7 @@
 //! design §5): per-kind times (T-AS3), first store only (T-AS4), Horizon's
 //! three (T-AS5), the public rules (T-AS6), transient narrowing (T-AS7,
 //! T-AS7b to T-AS7d), definitive narrowing (T-AS8), the write's re-checks
-//! (T-AS9) and the worker's mechanics (T-AS13). Each attempt is driven by
+//! (T-AS9), the worker's mechanics (T-AS13) and read time (T-AS10). Each attempt is driven by
 //! [`Fanout::run_uri`], with no sleeping.
 
 use super::*;
@@ -691,5 +691,66 @@ async fn t_as13_worker_mechanics() {
     assert!(stored, "stored again");
     assert_eq!(w.run_uri(&uri).await.expect("run"), None, "its queue row is done");
     assert!(recipients(&pool, &uri).await.is_empty());
+    db.drop_db().await;
+}
+
+/// T-AS10: a `subscribed-post` row lists under All and under its reason,
+/// `getUnreadCount {reasons: [subscribed-post]}` counts it, `subscribedPost`
+/// `list: false` hides it from both, and so does a later mute of the
+/// author.
+#[tokio::test]
+async fn t_as10_read_time() {
+    let test = "t_as10_fanout_read";
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let (f, aud) = world(&db.pool, test, "list", &[BOB]).await;
+    subscribe(&f.pool, BOB, ALICE, true, false).await;
+    let uri = fresh_post(&f, ALICE, "3kas10post22", &aud, None).await;
+    assert_eq!(run(&worker(&f), &uri).await, notified(1));
+    let mut app = f.app.clone();
+    app.limits = roomy_limits();
+    let base = serve(f.state_of(app, Some(Duration::from_secs(1)), Duration::ZERO)).await;
+    let listed = |query: &'static str| {
+        let base = base.clone();
+        async move {
+            let (_, page, _) = json_of(&base, LIST_NOTIFICATIONS, query, BOB).await;
+            page["notifications"]
+                .as_array()
+                .expect("notifications")
+                .iter()
+                .map(|n| (n["reason"].as_str().expect("reason").to_string(), n["uri"].as_str().expect("uri").to_string()))
+                .collect::<Vec<_>>()
+        }
+    };
+    let counted = |query: &'static str| {
+        let base = base.clone();
+        async move { json_of(&base, GET_UNREAD_COUNT, query, BOB).await.1["count"].as_i64().expect("count") }
+    };
+    let one = vec![("subscribed-post".to_string(), uri.clone())];
+    assert_eq!(listed("").await, one);
+    assert_eq!(listed("reasons=subscribed-post").await, one);
+    assert_eq!(counted("reasons=subscribed-post").await, 1, "the reason filter knows subscribed-post");
+    assert_eq!(counted("").await, 1);
+    let (_, page, _) = json_of(&base, LIST_NOTIFICATIONS, "", BOB).await;
+    assert_eq!(page["notifications"][0]["record"]["$type"], json!(NSID_POST_PRIVATE), "the post, read for Bob: {page}");
+
+    let put = |list: bool| {
+        let base = base.clone();
+        async move {
+            let (status, body) =
+                super::post(&base, "app.nearhorizon.private.putNotificationPreferences", &json!({"subscribedPost": {"list": list, "push": true}}), BOB).await;
+            assert_eq!(status, 200, "{body}");
+        }
+    };
+    put(false).await;
+    assert!(listed("").await.is_empty());
+    assert!(listed("reasons=subscribed-post").await.is_empty());
+    assert_eq!((counted("").await, counted("reasons=subscribed-post").await), (0, 0));
+    put(true).await;
+    assert_eq!(listed("").await, one);
+    exec(&f.pool, &format!("INSERT INTO mutes (viewer_did, subject_did, scope) VALUES ('{BOB}', '{ALICE}', 'full')")).await;
+    assert!(listed("").await.is_empty());
+    assert_eq!(counted("reasons=subscribed-post").await, 0);
     db.drop_db().await;
 }

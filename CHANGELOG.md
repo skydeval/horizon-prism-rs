@@ -10,6 +10,11 @@ commit.
 
 ## [Unreleased]
 
+### Added (private activity subscriptions, #839, #848)
+
+- **Private activity subscriptions.** `app.nearhorizon.private.putActivitySubscription` and `listActivitySubscriptions` let a member be notified of an account's new private posts and replies, separately from the public bell. A new private post notifies each subscriber who can read it, as a `subscribed-post` private notification written seconds after the post is first stored; subscribers outside the post's audience get nothing. The account's notification declaration and the subscriber's follow apply. A new `subscribedPost` notification preference turns the reason off. `getMembership` lists `private.activitySubscriptions`.
+- `getUnreadCount {reasons}` now takes `subscribed-post`, as `listNotifications` does; `getNotificationPreferences` returns `subscribedPost` (`{list, push}`, default on) beside the five reasons, and `putNotificationPreferences` accepts it (an `include` given for it is dropped). The lexicons list the new reason and key.
+
 ### Added (private activity subscriptions AS2: the fan-out, #839, #847)
 
 - **Subscribed-post notifications for private posts, after commit.** A

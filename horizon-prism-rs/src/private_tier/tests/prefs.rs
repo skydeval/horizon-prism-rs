@@ -17,7 +17,7 @@ fn pref(include: &str, list: bool) -> Value {
 
 fn defaults() -> Value {
     let all = pref("all", true);
-    json!({"like": all, "mention": all, "quote": all, "reply": all, "repost": all})
+    json!({"like": all, "mention": all, "quote": all, "reply": all, "repost": all, "subscribedPost": {"list": true, "push": true}})
 }
 
 /// The served private router with roomy limits and no floor.

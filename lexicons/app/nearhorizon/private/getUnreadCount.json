@@ -10,7 +10,7 @@
         "properties": {
           "reasons": {
             "type": "array",
-            "description": "Notification reasons to count (like, repost, reply, quote, mention), applied as listNotifications applies its reasons. All when absent. Served while getMembership lists 'private.unreadReasons'.",
+            "description": "Notification reasons to count (like, repost, reply, quote, mention, subscribed-post), applied as listNotifications applies its reasons. All when absent. Served while getMembership lists 'private.unreadReasons'.",
             "items": { "type": "string" }
           }
         }

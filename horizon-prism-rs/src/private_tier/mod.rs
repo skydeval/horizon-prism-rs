@@ -235,6 +235,10 @@ pub const FEATURES: &[&str] = &[
     // Members' list blocks of moderation lists count wherever the private
     // read rule tests a block, both ways (private-blocks design).
     "private.listBlocks",
+    // `putActivitySubscription`, `listActivitySubscriptions`,
+    // `subscribed-post` notifications after commit with audience narrowing,
+    // and the `subscribedPost` preference (private-activity-subs design).
+    "private.activitySubscriptions",
 ];
 
 /// The private tier as the rest of the crate may use it.

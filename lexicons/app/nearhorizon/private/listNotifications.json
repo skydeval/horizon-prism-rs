@@ -4,13 +4,13 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "List the requester's private notifications, newest first. They come from private posts (reply, quote, mention: the uri and record are the private post, read for the requester as getPosts reads it, and omitted when the requester may not read it) and from community members' public records naming one of the requester's private posts (like and repost of it; quote and reply: the uri and record are the public post). reasonSubject is always one of the requester's own posts. Authors the requester blocks, is blocked by or mutes, and threads the requester muted, are left out. The requester's private notification preferences (getNotificationPreferences) apply: a reason with list false is left out, and a reason with include 'follows' keeps only notifications from accounts the requester follows now. reasons narrows further. Requires auth by a ready community member.",
+      "description": "List the requester's private notifications, newest first. They come from private posts (reply, quote, mention: the uri and record are the private post, read for the requester as getPosts reads it, and omitted when the requester may not read it) and from community members' public records naming one of the requester's private posts (like and repost of it; quote and reply: the uri and record are the public post), and from accounts the requester subscribes to (subscribed-post: the uri and record are the new private post). reasonSubject is always one of the requester's own posts. Authors the requester blocks, is blocked by or mutes, and threads the requester muted, are left out. The requester's private notification preferences (getNotificationPreferences) apply: a reason with list false is left out, and a reason with include 'follows' keeps only notifications from accounts the requester follows now. reasons narrows further. Requires auth by a ready community member.",
       "parameters": {
         "type": "params",
         "properties": {
           "reasons": {
             "type": "array",
-            "description": "Notification reasons to include (like, repost, reply, quote, mention). All when absent.",
+            "description": "Notification reasons to include (like, repost, reply, quote, mention, subscribed-post). All when absent.",
             "items": { "type": "string" }
           },
           "limit": {
@@ -88,7 +88,7 @@
         "author": { "type": "ref", "ref": "app.bsky.actor.defs#profileView" },
         "reason": {
           "type": "string",
-          "knownValues": ["like", "repost", "reply", "quote", "mention"]
+          "knownValues": ["like", "repost", "reply", "quote", "mention", "subscribed-post"]
         },
         "reasonSubject": { "type": "string", "format": "at-uri" },
         "reasonSubjectPost": {

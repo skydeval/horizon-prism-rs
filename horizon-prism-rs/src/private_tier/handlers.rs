@@ -2571,22 +2571,28 @@ pub async fn update_seen(
     Ok(ok(PrivateResponse::empty()))
 }
 
-/// The reasons a private notification has, each a key of the preferences
-/// (private notification preferences design §4): the private side has no
-/// follow, chat or activity reasons.
+/// The filterable reasons a private notification has, each a key of the
+/// preferences (private notification preferences design §4): the private
+/// side has no follow, chat or activity reasons.
 pub(super) const PREFERENCE_REASONS: [&str; 5] = ["like", "mention", "quote", "reply", "repost"];
 
-/// `stored` over the defaults (`{include: all, list: true, push: true}`),
-/// key by key: exactly the five reasons, each a complete preference. A
-/// stored key that is not an object reads as the default.
+/// The plain (`{list, push}`) preference of `subscribed-post`
+/// (private-activity-subs design §7): stock `subscribedPost`.
+pub(super) const SUBSCRIBED_POST_KEY: &str = "subscribedPost";
+
+/// Every reason a private notification row can have (private-activity-subs
+/// design §6): the five, and `subscribed-post` from the fan-out.
+pub(super) const NOTIFICATION_REASONS: [&str; 6] = ["like", "mention", "quote", "reply", "repost", "subscribed-post"];
+
+/// `stored` over the defaults, key by key: the five reasons
+/// (`{include: all, list: true, push: true}`) and `subscribedPost`
+/// (`{list: true, push: true}`), each a complete preference. A stored key
+/// that is not an object reads as the default.
 fn complete_preferences(stored: Option<&Value>) -> Value {
     let mut out = serde_json::Map::new();
-    for key in PREFERENCE_REASONS {
-        let value = stored
-            .and_then(|s| s.get(key))
-            .filter(|v| v.is_object())
-            .cloned()
-            .unwrap_or_else(|| json!({"include": "all", "list": true, "push": true}));
+    let keys = PREFERENCE_REASONS.iter().map(|k| (*k, json!({"include": "all", "list": true, "push": true})));
+    for (key, default) in keys.chain([(SUBSCRIBED_POST_KEY, json!({"list": true, "push": true}))]) {
+        let value = stored.and_then(|s| s.get(key)).filter(|v| v.is_object()).cloned().unwrap_or(default);
         out.insert(key.to_string(), value);
     }
     Value::Object(out)
@@ -2594,7 +2600,8 @@ fn complete_preferences(stored: Option<&Value>) -> Value {
 
 /// `app.nearhorizon.private.getNotificationPreferences` (private
 /// notification preferences design §4.1) → `{preferences}`: the caller's own
-/// five preferences over the defaults. No floor: nothing here depends on a
+/// six preferences over the defaults (the five reasons and
+/// `subscribedPost`). No floor: nothing here depends on a
 /// post or on another account.
 pub async fn get_notification_preferences(
     State(s): State<PrivateState>,
@@ -2624,9 +2631,12 @@ pub async fn put_notification_preferences(
         return Err(XrpcError::invalid("Error: input must be an object"));
     }
     let mut supplied = serde_json::Map::new();
-    for key in PREFERENCE_REASONS {
+    // The five filterable reasons, then `subscribedPost`, plain: an
+    // `include` given for it is dropped (private-activity-subs §7).
+    let keys = PREFERENCE_REASONS.iter().map(|k| (*k, true)).chain([(SUBSCRIBED_POST_KEY, false)]);
+    for (key, filterable) in keys {
         if let Some(value) = input.get(key) {
-            let checked = crate::hydration::notification_prefs::checked(key, value, true)
+            let checked = crate::hydration::notification_prefs::checked(key, value, filterable)
                 .map_err(|message| XrpcError::invalid(format!("Error: {message}")))?;
             supplied.insert(key.to_string(), checked);
         }

@@ -14,7 +14,8 @@
             "mention": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
             "quote": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
             "reply": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
-            "repost": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" }
+            "repost": { "type": "ref", "ref": "app.bsky.notification.defs#filterablePreference" },
+            "subscribedPost": { "type": "ref", "ref": "app.bsky.notification.defs#preference" }
           }
         }
       },
@@ -31,7 +32,7 @@
       "errors": [
         {
           "name": "InvalidRequest",
-          "description": "The input is not an object, or a supplied preference is not an object with include (all or follows), list and push."
+          "description": "The input is not an object, or a supplied preference is not an object with include (all or follows), list and push (subscribedPost: list and push; an include given for it is dropped)."
         },
         {
           "name": "NotEnrolled",
