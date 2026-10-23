@@ -304,13 +304,19 @@ async fn t52_the_cheapest_terms_run_first() {
     };
     // Dave is outside G (`list` of Bob): no block or label probe.
     let read = probes(&explain(&pool, &sql, DAVE, &rows).await);
-    w.check(!read.iter().any(|(r, loops)| ["blocks", "private_blocks", "labels"].contains(&r.as_str()) && *loops > 0), format!("outside G: {read:?}"));
+    w.check(
+        !read.iter().any(|(r, loops)| ["blocks", "private_blocks", "list_references", "labels"].contains(&r.as_str()) && *loops > 0),
+        format!("outside G: {read:?}"),
+    );
     // Every row hidden from Bob, inside G: no block probe.
     for uri in &rows {
         w.label(uri, "!hide").await;
     }
     let read = probes(&explain(&pool, &sql, BOB, &rows).await);
-    w.check(!read.iter().any(|(r, loops)| ["blocks", "private_blocks"].contains(&r.as_str()) && *loops > 0), format!("gated: {read:?}"));
+    w.check(
+        !read.iter().any(|(r, loops)| ["blocks", "private_blocks", "list_references"].contains(&r.as_str()) && *loops > 0),
+        format!("gated: {read:?}"),
+    );
     exec(&pool, "DELETE FROM labels").await;
     // The branch climb reads nothing reader-relative (shared-walk T-52).
     let x = format!("at://{CAROL}/{PUBLIC_POST}/3kt52clim");
@@ -332,6 +338,9 @@ async fn t52_the_cheapest_terms_run_first() {
     let read = probes(&explain(&pool, &sql, BOB, &rows).await);
     let blocks_run = read.iter().filter(|(r, loops)| (r == "blocks" || r == "private_blocks") && *loops > 0).count();
     w.check(blocks_run == 4, format!("owner rows: {blocks_run} block lookups ran: {read:?}"));
+    // And at most rule 4's two list-block lookups (private-blocks T-52).
+    let lists_run = read.iter().filter(|(r, loops)| r == "list_references" && *loops > 0).count();
+    w.check(lists_run <= 2, format!("owner rows: {lists_run} list-block lookups ran: {read:?}"));
     exec(&pool, &block_sql(BOB, ALICE)).await;
     let passing = schema::prefilter_uris(&pool, BOB, &rows, CAP).await.expect("prefilter");
     w.check(passing.is_empty(), format!("V blocking O misses through rule 4: {passing:?}"));

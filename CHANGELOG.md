@@ -10,6 +10,21 @@ commit.
 
 ## [Unreleased]
 
+### Changed (private list blocks, #838, #840)
+
+- **List blocks count in the private read rule.** A member's list block
+  of a moderation list now blocks like a direct block wherever private
+  reads test one, in both directions. A reader who list-blocks an author,
+  or whom the author list-blocks, is not served the author's private
+  posts or replies, sees none of their reposts or notifications, and
+  their likes and quotes do not count for each other. A reply by a writer
+  who list-blocks the thread's owner, or whom the owner list-blocks, is
+  read by its author only, with `notServed: ["standing"]`. Only list
+  blocks Prism stores and applies count, as on public views: members'
+  own, inside their budget, once synced, of moderation lists. The private
+  tier still asks no outside service. `getMembership` lists
+  `private.listBlocks`. No migration.
+
 ### Added (Refract accounts page, #837)
 
 - **Refract accounts page** in the admin UI (`/admin/refract`, beside

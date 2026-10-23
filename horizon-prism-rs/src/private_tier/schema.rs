@@ -61,23 +61,28 @@ pub(super) async fn audience_row(pool: &PgPool, uri: &str) -> Result<Option<Audi
     Ok(row.map(|(owner, mode, members)| AudienceRow { owner, mode, members }))
 }
 
-/// `(a blocks b, b blocks a)` over `blocks` and `private_blocks` (§6.4).
+/// `(a blocks b, b blocks a)` over `blocks`, `private_blocks` and members'
+/// list blocks that apply (§6.4; private-blocks design §2.3), the sources
+/// [`blocked`] reads, so the oracle agrees with fact 8.
 ///
 /// # Errors
 ///
 /// Database errors.
 pub(super) async fn blocks_between(pool: &PgPool, a: &str, b: &str) -> Result<(bool, bool), sqlx::Error> {
-    sqlx::query_as(
-        "SELECT \
-           EXISTS (SELECT 1 FROM blocks WHERE author_did = $1 AND subject_did = $2) \
-             OR EXISTS (SELECT 1 FROM private_blocks WHERE author_did = $1 AND subject_did = $2), \
-           EXISTS (SELECT 1 FROM blocks WHERE author_did = $2 AND subject_did = $1) \
-             OR EXISTS (SELECT 1 FROM private_blocks WHERE author_did = $2 AND subject_did = $1)",
-    )
-    .bind(a)
-    .bind(b)
-    .fetch_one(pool)
-    .await
+    sqlx::query_as(&blocks_between_statement()).bind(a).bind(b).fetch_one(pool).await
+}
+
+/// [`blocks_between`]'s statement: `$1` and `$2` the two DIDs.
+pub(super) fn blocks_between_statement() -> String {
+    let one_way = |x: &str, y: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM blocks WHERE author_did = {x} AND subject_did = {y}) \
+               OR EXISTS (SELECT 1 FROM private_blocks WHERE author_did = {x} AND subject_did = {y}) \
+               OR {list}",
+            list = list_blocks(x, y),
+        )
+    };
+    format!("SELECT {}, {}", one_way("$1", "$2"), one_way("$2", "$1"))
 }
 
 /// Authors of private rows (retention inputs, §4.4: their `actors` rows are
@@ -163,13 +168,42 @@ pub(super) async fn snapshot(pool: &PgPool, rauth: &RecordAuthz) -> Result<Optio
 }
 
 /// A block in either direction between `x` and `y` (SQL expressions), over
-/// the two sources [`blocks_between`] reads.
+/// the sources [`blocks_between`] reads: `blocks`, `private_blocks`, and
+/// members' list blocks that apply ([`list_blocks`]; private-blocks design
+/// §2.2). Used only negated or as a deny, so a list block missing or not
+/// yet synced leaves the rule as it was without list blocks (§2.4).
 fn blocked(x: &str, y: &str) -> String {
     format!(
         "(EXISTS (SELECT 1 FROM blocks b WHERE b.author_did = {x} AND b.subject_did = {y}) \
           OR EXISTS (SELECT 1 FROM blocks b WHERE b.author_did = {y} AND b.subject_did = {x}) \
           OR EXISTS (SELECT 1 FROM private_blocks b WHERE b.author_did = {x} AND b.subject_did = {y}) \
-          OR EXISTS (SELECT 1 FROM private_blocks b WHERE b.author_did = {y} AND b.subject_did = {x}))"
+          OR EXISTS (SELECT 1 FROM private_blocks b WHERE b.author_did = {y} AND b.subject_did = {x}) \
+          OR {xy} OR {yx})",
+        xy = list_blocks(x, y),
+        yx = list_blocks(y, x),
+    )
+}
+
+/// [`blocked`] for the private-blocks unit checks.
+#[cfg(test)]
+pub(super) fn blocked_for_tests(x: &str, y: &str) -> String {
+    blocked(x, y)
+}
+
+/// `x` blocks `y` through a list (SQL expressions; private-blocks design
+/// §2.1): a list block of `x`'s that applies (`hydration::APPLIES`:
+/// admitted, synced, its list active and a moderation list) whose list's
+/// copied items name `y`; never `x` itself, as `actor_viewer`. Only members
+/// have references. The aliases are this builder's own: `blocked` is
+/// inlined where `l`, `r`, `i` and `q` name outer rows.
+fn list_blocks(x: &str, y: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM list_references lbr \
+           JOIN subscribed_lists lbl ON lbl.list_uri = lbr.list_uri \
+           JOIN subscribed_list_items lbi ON lbi.list_uri = lbr.list_uri \
+           WHERE lbr.member_did = {x} AND lbr.source = 'block' AND lbi.subject_did = {y} \
+             AND {x} <> {y} AND {applies})",
+        applies = crate::hydration::applies_as("lbr", "lbl"),
     )
 }
 
@@ -2990,7 +3024,8 @@ pub(super) async fn notification_rows(
 
 /// What a private notification `n` of the recipient `$1` must pass (§4.8,
 /// "Reading", step 2), in the list and the count alike:
-/// - no block either way with its author, in `blocks` or `private_blocks`;
+/// - no block either way with its author, in `blocks`, `private_blocks` or
+///   a member's list block that applies ([`blocked`]);
 /// - no full mute of its author, and no scoped mute of its reason (a repost
 ///   mute: `repost`; a quote mute: `quote`);
 /// - no moderation list of the recipient's that applies names its author;

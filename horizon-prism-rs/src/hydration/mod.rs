@@ -366,6 +366,13 @@ type LocalListRow = (String, String, String, String, Option<String>, DateTime<Ut
 pub(crate) const APPLIES: &str =
     "r.admitted AND r.effective AND l.state = 'active' AND l.purpose = 'app.bsky.graph.defs#modlist'";
 
+/// [`APPLIES`] for the reference alias `r` and the list alias `l` given, for
+/// a statement whose outer aliases would capture the usual ones (the private
+/// tier's `blocked`). `applies_as("r", "l")` is [`APPLIES`].
+pub(crate) fn applies_as(r: &str, l: &str) -> String {
+    format!("{r}.admitted AND {r}.effective AND {l}.state = 'active' AND {l}.purpose = 'app.bsky.graph.defs#modlist'")
+}
+
 /// Viewer relationships to actors (§7.5).
 #[derive(Debug, Clone, Default)]
 pub struct ActorViewer {

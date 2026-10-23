@@ -167,6 +167,9 @@ async fn tn1_the_reasons_agree_with_the_read_rule() {
         ("Bob unfollows Alice", unfollow, follow_sql(BOB, ALICE), standing_bob.clone()),
         ("Alice blocks Bob", block_sql(ALICE, BOB), unblock.clone(), blocked_bob.clone()),
         ("Bob blocks Alice", block_sql(BOB, ALICE), unblock, blocked_bob.clone()),
+        // A list block either way (private-blocks design, T-PB5).
+        ("Alice list-blocks Bob", list_block_sql(ALICE, ALICE, "3kns1list1", &[BOB]), "DELETE FROM list_references".to_string(), blocked_bob.clone()),
+        ("Bob list-blocks Alice", list_block_sql(BOB, CAROL, "3kns1list2", &[ALICE]), "DELETE FROM list_references".to_string(), blocked_bob.clone()),
         ("Alice blocks Bob privately", private_block(ALICE, BOB), unblock_private.clone(), blocked_bob.clone()),
         ("Bob blocks Alice privately", private_block(BOB, ALICE), unblock_private, blocked_bob),
         (
@@ -558,8 +561,8 @@ async fn tn2_tn3_tn6_tn7_tn8_the_marker_is_the_authors_alone() {
     w.edit_audience("3kns2list222", "list", &[BOB, CAROL, DAVE], "3kaaaaaaaaae2").await;
     let (_, view) = one_post(&w.base, BOB, &lb).await;
     w.check(!view.is_null() && view.get("notServed").is_none(), format!("Bob restored: {view}"));
-    // A block either way, public or private: the same bytes, `standing`;
-    // nothing names a block.
+    // A block either way, public, private or by a list: the same bytes,
+    // `standing`; nothing names a block.
     let private_block = |from: &str, to: &str| {
         format!(
             "INSERT INTO private_blocks (uri, author_did, subject_did, rev, created_at) \
@@ -573,6 +576,8 @@ async fn tn2_tn3_tn6_tn7_tn8_the_marker_is_the_authors_alone() {
         (block_sql(BOB, ALICE), "DELETE FROM blocks"),
         (private_block(ALICE, BOB), "DELETE FROM private_blocks"),
         (private_block(BOB, ALICE), "DELETE FROM private_blocks"),
+        (list_block_sql(ALICE, ALICE, "3kns7list1", &[BOB]), "DELETE FROM list_references"),
+        (list_block_sql(BOB, CAROL, "3kns7list2", &[ALICE]), "DELETE FROM list_references"),
     ] {
         exec(&w.f.pool, &apply).await;
         bodies.push(body_of(&w, BOB, &[&rb]).await);
@@ -580,8 +585,8 @@ async fn tn2_tn3_tn6_tn7_tn8_the_marker_is_the_authors_alone() {
     }
     let view: Value = serde_json::from_str(&bodies[0]).expect("json");
     w.check(view["posts"][0]["notServed"] == json!(["standing"]), format!("a block: {}", bodies[0]));
-    w.check(bodies.iter().all(|b| *b == bodies[0]), format!("the four blocks differ: {bodies:?}"));
-    w.check(marked(&handle, "standing") == before + 4.0, "the metric counts standing".to_string());
+    w.check(bodies.iter().all(|b| *b == bodies[0]), format!("the six blocks differ: {bodies:?}"));
+    w.check(marked(&handle, "standing") == before + 6.0, "the metric counts standing".to_string());
     // Unfollowing: Bob's view is byte-identical to the blocks' (nothing
     // tells a block from a missing follow), his reply below Carol's is
     // `standing` too; Carol, reading Bob's unserved reply, misses it and

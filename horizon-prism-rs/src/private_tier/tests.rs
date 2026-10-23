@@ -21,6 +21,8 @@ mod live_feed;
 mod plaintext;
 // Media kinds and the media filters on the author feed (P-30).
 mod media;
+// Members' list blocks in the private read rule (private-blocks design).
+mod list_blocks;
 // Private blocks only with a member side (member-blocks-only design).
 mod member_blocks;
 // The author-only `notServed` marker (not-served-reason design).
@@ -874,6 +876,29 @@ fn block_sql(from: &str, to: &str) -> String {
         "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) \
          VALUES ('at://{from}/app.bsky.graph.block/{}', '{from}', '{to}', '3k', now())",
         &to[8..]
+    )
+}
+
+/// A list block by `member` of `owner`'s list `rkey` naming `subjects`
+/// (private-blocks design §10), in one statement: the list subscribed,
+/// active and a moderation list, its items copied, and the reference
+/// admitted and synced, so it applies. Each part is kept if already there;
+/// `DELETE FROM list_references` undoes it.
+fn list_block_sql(member: &str, owner: &str, rkey: &str, subjects: &[&str]) -> String {
+    let list = format!("at://{owner}/app.bsky.graph.list/{rkey}");
+    let items: Vec<String> = subjects
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("('at://{owner}/app.bsky.graph.listitem/{rkey}i{i}', '{list}', '{owner}', '{rkey}i{i}', 'bafyli', '3k', '{s}')"))
+        .collect();
+    format!(
+        "WITH l AS (INSERT INTO subscribed_lists (list_uri, owner_did, state, purpose) \
+                    VALUES ('{list}', '{owner}', 'active', 'app.bsky.graph.defs#modlist') ON CONFLICT DO NOTHING RETURNING 1), \
+              i AS (INSERT INTO subscribed_list_items (uri, list_uri, owner_did, rkey, cid, rev, subject_did) \
+                    VALUES {items} ON CONFLICT DO NOTHING RETURNING 1) \
+         INSERT INTO list_references (member_did, list_uri, source, source_uri, admitted, admitted_at, effective) \
+         VALUES ('{member}', '{list}', 'block', 'at://{member}/app.bsky.graph.listblock/{rkey}', true, now(), true) ON CONFLICT DO NOTHING",
+        items = items.join(", "),
     )
 }
 

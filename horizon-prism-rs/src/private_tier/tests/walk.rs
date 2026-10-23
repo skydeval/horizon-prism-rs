@@ -60,7 +60,8 @@ struct Generated {
 
 /// The tables a fixture writes, emptied before the next.
 const T60_TABLES: &str = "private_posts, private_audiences, blocks, private_blocks, labels, follows, sync_state, \
-    sync_chain_links, private_notifications, private_notification_seen, private_quote_refs";
+    sync_chain_links, private_notifications, private_notification_seen, private_quote_refs, \
+    list_references, subscribed_lists, subscribed_list_items";
 
 /// T-60's fixture generator (shared-walk §7): authors with every audience
 /// mode, random list members, follows, verification flags, blocks of both
@@ -326,6 +327,20 @@ async fn generate(pool: &PgPool, rng: &mut Rng, tag: &str, depth: usize) -> Gene
             0 => exec(pool, &format!("INSERT INTO private_notification_seen (did, seen_at) VALUES ('{a}', now() - interval '1 day')")).await,
             1 => exec(pool, &format!("INSERT INTO private_notification_seen (did, seen_at) VALUES ('{a}', now() + interval '1 day')")).await,
             _ => {}
+        }
+    }
+    // List blocks (private-blocks design §10), drawn last so the rest of a
+    // seed's fixture is as before: an author's block list naming random
+    // authors (itself among them at times), some not yet synced.
+    for (i, a) in authors.iter().enumerate() {
+        if rng.chance(25) {
+            let subjects: Vec<&str> = authors.iter().filter(|_| rng.chance(30)).map(String::as_str).collect();
+            if !subjects.is_empty() {
+                exec(pool, &list_block_sql(a, a, &format!("t60l{i}"), &subjects)).await;
+                if rng.chance(20) {
+                    exec(pool, &format!("UPDATE list_references SET effective = false WHERE member_did = '{a}'")).await;
+                }
+            }
         }
     }
     Generated { authors, rows }

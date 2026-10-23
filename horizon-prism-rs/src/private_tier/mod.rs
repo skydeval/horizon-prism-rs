@@ -218,6 +218,9 @@ pub const FEATURES: &[&str] = &[
     // `503 Reindexing` for a member re-indexed after the first time, and
     // getMembership's `reindexing` (degraded-mode design §3.5).
     "private.reindexing",
+    // Members' list blocks of moderation lists count wherever the private
+    // read rule tests a block, both ways (private-blocks design).
+    "private.listBlocks",
 ];
 
 /// The private tier as the rest of the crate may use it.
