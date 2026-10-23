@@ -289,11 +289,11 @@ async fn t_as11_the_subscribed_post_preference() {
     db.drop_db().await;
 }
 
-/// T-AS15: `getMembership` lists `private.activitySubscriptions`, last,
-/// after `private.listBlocks`.
+/// T-AS15: `getMembership` lists `private.activitySubscriptions` after
+/// `private.listBlocks`.
 #[test]
-fn t_as15_the_feature_is_listed_last() {
+fn t_as15_the_feature_is_listed() {
     let f = crate::private_tier::FEATURES;
-    assert_eq!(f.last(), Some(&"private.activitySubscriptions"));
-    assert_eq!(f[f.len() - 2], "private.listBlocks");
+    let at = f.iter().position(|x| *x == "private.activitySubscriptions").expect("listed");
+    assert_eq!(f[at - 1], "private.listBlocks");
 }

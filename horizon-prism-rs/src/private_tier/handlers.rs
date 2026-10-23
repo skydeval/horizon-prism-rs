@@ -1175,9 +1175,11 @@ async fn thread_tail(
 ) -> Result<Result<PrivateResponse, AnchorMiss>, XrpcError> {
     let chain_has_root = chain.iter().any(|p| view_uri(p).as_deref() == Some(root.as_str()));
     let roots_read: Vec<String> = if root_read && root != uri && !chain_has_root { vec![root.clone()] } else { Vec::new() };
-    // The replies the read root's private threadgate hides, except from
-    // their own author, left out before they are read (`thread.rs:207-208`).
-    let hidden = if root_read { hidden_replies(s, caller, &root).await? } else { HashSet::new() };
+    // The replies the root's threadgate hides, except from their own author,
+    // left out before they are read (`thread.rs:207-208`): a private root's
+    // when it was read, a public root's always (public-root-gates design
+    // §5.3).
+    let hidden = root_hidden(s, caller, &root, root_read).await?;
 
     let reads = expansion_reads(s);
     let (mut replies, expanded) = expand(s, rs, caller, hydration, vec![uri.to_string()], depth, &mut budget, reads, &hidden, start).await?;
@@ -1216,6 +1218,23 @@ async fn hidden_replies(s: &PrivateState, caller: &VerifiedCaller, root: &str) -
         .flat_map(|g| g.hidden_replies)
         .filter(|reply| uri_author(reply) != Some(caller.did.as_str()))
         .collect())
+}
+
+/// The replies a thread's root's gate hides from the caller: for a private
+/// root, its private threadgate's, when the root was read for the caller in
+/// this request (C-17); for a public root, its stored public gate's, with no
+/// read (a gate is a public record; public-root-gates design §5.1).
+async fn root_hidden(s: &PrivateState, caller: &VerifiedCaller, root: &str, root_read: bool) -> Result<HashSet<String>, XrpcError> {
+    if is_private_uri(root) {
+        return if root_read { hidden_replies(s, caller, root).await } else { Ok(HashSet::new()) };
+    }
+    public_root_hidden(s, caller, std::slice::from_ref(&root.to_string())).await
+}
+
+/// The private replies the stored gates of the public roots `roots` hide
+/// from the caller (public-root-gates design §5.2).
+async fn public_root_hidden(s: &PrivateState, caller: &VerifiedCaller, roots: &[String]) -> Result<HashSet<String>, XrpcError> {
+    Ok(schema::public_root_hidden(&s.env.pool, &caller.did, roots).await?.into_iter().collect())
 }
 
 /// The pipeline reads one expansion may make (shared-walk amendment 1
@@ -1997,6 +2016,10 @@ async fn quotes_body(
 ///   sets `replyDisabled` (§4.4, C-17) ([`replies_anchor`]).
 /// - A public `uri` is not read or fetched: only its private replies are
 ///   listed, and nothing about the public post is emitted.
+/// - A reply whose claimed root is a public post is left out, with what is
+///   beneath it, when that root's stored threadgate lists it, except for
+///   its own author; no read of the root is needed (public-root-gates
+///   design §5).
 /// - Candidates pass the prefilter. The read cap, the lookahead and the
 ///   sealed cursor (§3.6), bound to the method, the caller and `uri`, as
 ///   [`feed_body`].
@@ -2032,8 +2055,8 @@ pub async fn get_replies(
 }
 
 /// `getReplies`' private anchor and its claimed root (private-threads
-/// design §3.4): `None` when the anchor misses; otherwise the root, when it
-/// was read for the caller.
+/// design §3.4): `None` when the anchor misses; otherwise the claimed root
+/// and whether it was read for the caller (a public root never is).
 ///
 /// A one-row lookup with no reader finds the claimed root, the stored
 /// `reply_root_uri` the anchor's view emits. One prefilter covers the
@@ -2049,7 +2072,7 @@ async fn replies_anchor(
     hydration: &HydrationContext,
     uri: &str,
     start: Instant,
-) -> Result<Option<Option<String>>, XrpcError> {
+) -> Result<Option<(String, bool)>, XrpcError> {
     let pool = &s.env.pool;
     let stored = schema::stored_root(pool, uri).await?;
     let claimed = stored.clone().flatten().unwrap_or_else(|| uri.to_string());
@@ -2075,7 +2098,7 @@ async fn replies_anchor(
         };
         let root = claimed_root(&anchor).unwrap_or_else(|| uri.to_string());
         let read = root == uri || (is_private_uri(&root) && anchor_readable(s, rs, caller, hydration, &root, start).await?);
-        return Ok(Some(read.then_some(root)));
+        return Ok(Some((root, read)));
     };
     let db_failed = head_round(s, rs, caller, std::slice::from_ref(&anchor_row)).await;
     if anchor_row.head_dids(caller).iter().any(|d| db_failed.contains(d)) {
@@ -2087,7 +2110,7 @@ async fn replies_anchor(
     }
     let read = claimed == uri
         || (is_private_uri(&claimed) && passing.contains(&claimed) && anchor_readable(s, rs, caller, hydration, &claimed, start).await?);
-    Ok(Some(read.then_some(claimed)))
+    Ok(Some((claimed, read)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2104,18 +2127,24 @@ async fn replies_body(
     start: Instant,
 ) -> Result<PrivateResponse, XrpcError> {
     let hydration = private_hydration(s, caller, ip).await?;
-    // The thread's root, when it was read for the caller in this request.
+    // The thread's root, when it was read for the caller in this request,
+    // and the replies its gate hides (a public root's with no read,
+    // public-root-gates design §5.3). On a public `uri` no root is known
+    // before the page: each candidate is judged by the root it claims.
     let mut roots_read: Vec<String> = Vec::new();
-    if is_private_uri(uri) {
+    let public_uri = !is_private_uri(uri);
+    let mut hidden = HashSet::new();
+    if !public_uri {
         match replies_anchor(s, rs, caller, &hydration, uri, start).await? {
-            Some(root) => roots_read.extend(root),
+            Some((root, read)) => {
+                hidden = root_hidden(s, caller, &root, read).await?;
+                if read {
+                    roots_read.push(root);
+                }
+            }
             None => return Ok(PrivateResponse::replies(Vec::new(), None)),
         }
     }
-    let hidden = match roots_read.first() {
-        Some(root) => hidden_replies(s, caller, root).await?,
-        None => HashSet::new(),
-    };
     let hidden_list: Vec<String> = hidden.iter().cloned().collect();
 
     // The read cap (private-threads design §3.3), with one row of
@@ -2136,14 +2165,29 @@ async fn replies_body(
     // The last examined candidate's position.
     let mut last: Option<(DateTime<Utc>, String)> = None;
     let uris: Vec<String> = candidates.iter().map(|(u, _)| u.clone()).collect();
+    // On a public `uri`: the candidates their claimed public roots' gates
+    // hide, not read, examined as misses are (public-root-gates design
+    // §5.3).
+    let page_hidden: HashSet<String> = if public_uri {
+        schema::public_root_hidden_among(&s.env.pool, &caller.did, &uris).await?.into_iter().collect()
+    } else {
+        HashSet::new()
+    };
     let authors = profiles(&hydration, &uris).await?;
     let mut full_at: Option<usize> = None;
-    let reads: Vec<_> = uris.iter().map(|u| read_post(s, rs, caller, u, &authors, start)).collect();
+    let reads: Vec<_> = uris
+        .iter()
+        .map(|u| {
+            let skip = page_hidden.contains(u);
+            let authors = &authors;
+            async move { if skip { None } else { read_post(s, rs, caller, u, authors, start).await.ok() } }
+        })
+        .collect();
     let mut reads = futures::stream::iter(reads).buffered(s.concurrency).enumerate();
     while let Some((i, hit)) = reads.next().await {
         let (u, at) = &candidates[i];
         last = Some((*at, u.clone()));
-        if let Ok(post) = hit {
+        if let Some(post) = hit {
             hits.push(post);
             if hits.len() == limit {
                 full_at = Some(i);
@@ -2157,6 +2201,15 @@ async fn replies_body(
 
     let mut budget = THREAD_NODE_CAP.saturating_sub(hits.len());
     let level: Vec<String> = hits.iter().filter_map(view_uri).collect();
+    // On a public `uri`, the expansion's hidden replies are those of the
+    // public roots the hits claim: a hit's served descendants claim its root
+    // (public-root-gates design §5.3).
+    if public_uri {
+        let mut roots: Vec<String> = hits.iter().filter_map(claimed_root).filter(|r| !is_private_uri(r)).collect();
+        roots.sort_unstable();
+        roots.dedup();
+        hidden = public_root_hidden(s, caller, &roots).await?;
+    }
     // The expansion's own read allowance, apart from the page's.
     let (mut replies, expanded) = expand(s, rs, caller, &hydration, level, depth, &mut budget, expansion_reads(s), &hidden, start).await?;
     let mut refs: Vec<&mut PrivateEmit<Value>> = hits.iter_mut().chain(replies.values_mut().flatten()).collect();

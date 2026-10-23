@@ -150,7 +150,7 @@
         },
         "replies": {
           "type": "array",
-          "description": "Authorized private replies to this post, ordered by createdAt ascending, at most 50 per node. When the thread's root (the anchor's claimed reply.root) was read for the requester, replies its threadgate lists in hiddenReplies are left out, except for their own author.",
+          "description": "Authorized private replies to this post, ordered by createdAt ascending, at most 50 per node. When the thread's root (the anchor's claimed reply.root) was read for the requester, replies its threadgate lists in hiddenReplies are left out, except for their own author. While features lists private.publicRootGates, the same holds for a public root, whose threadgate needs no read.",
           "items": { "type": "ref", "ref": "#privateThreadView" }
         }
       }

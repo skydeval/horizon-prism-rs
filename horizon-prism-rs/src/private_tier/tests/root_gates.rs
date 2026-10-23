@@ -248,3 +248,102 @@ async fn t3_the_fetch_queue() {
     assert_eq!(copy_of(&f.pool, &format!("at://{OP}/{THREADGATE}/3kdroot22222")).await, Some(Vec::new()));
     db.drop_db().await;
 }
+
+/// Every post URI in a `getReplies` page, nodes and their replies.
+fn all_uris(page: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for node in page["replies"].as_array().into_iter().flatten() {
+        out.push(node["post"]["uri"].as_str().expect("uri").to_string());
+        out.extend(reply_uris(node));
+    }
+    out.sort();
+    out
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// T-4 (§5), in On and in Off: OP, outside S, hides Carol's branch reply C
+/// (and so Dave's CC below it) and Dave's branch root E under its public
+/// post P. `getPostThread` and `getReplies` leave them out for others and
+/// keep them for their authors; `getPosts` serves them; a gate on another
+/// root hides only the replies that claim that root (a branch F under P
+/// claiming Z, whose author lists Dave's D in Z's gate, does not hide D);
+/// the anchor is never hidden; paging passes hidden candidates.
+async fn reads_in(mode: PublicMode, test: &str) {
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, mode).await;
+    let aud_b = f.audience(BOB, "3kaudbob2222", Some("list"), &[CAROL, DAVE]).await;
+    let aud_d = f.audience(DAVE, "3kauddave222", Some("list"), &[BOB, CAROL]).await;
+    let p = public(OP, "3kproot22222");
+    let z = public(NOBODY, "3kzroot22222");
+    let a = f.private_post(BOB, "3kbranch2222", &aud_b, Some((&p, &p))).await;
+    let c = f.private_post(CAROL, "3kcreply2222", &aud_b, Some((&p, &a))).await;
+    let cc = f.private_post(DAVE, "3kccreply222", &aud_b, Some((&p, &c))).await;
+    let d = f.private_post(DAVE, "3kdreply2222", &aud_b, Some((&p, &a))).await;
+    let e = f.private_post(DAVE, "3kebranch222", &aud_d, Some((&p, &p))).await;
+    let forged = f.private_post(BOB, "3kfbranch222", &aud_b, Some((&z, &p))).await;
+    f.ingest(OP, THREADGATE, "3kproot22222", gate_of(&p, &[&c, &e, &p])).await;
+    f.ingest(NOBODY, THREADGATE, "3kzroot22222", gate_of(&z, &[&d])).await;
+    f.ready_all().await;
+    let base = serve(f.state(Some(Duration::from_secs(1)))).await;
+
+    // getPostThread on the branch root: C and its subtree hidden from Dave,
+    // kept for Carol, its author.
+    for (reader, want) in [(DAVE, vec![d.clone()]), (CAROL, vec![c.clone(), cc.clone(), d.clone()])] {
+        let (_, t) = thread_of(&base, reader, &format!("uri={a}")).await;
+        assert_eq!(sorted(reply_uris(&t)), sorted(want), "{reader}: {t}");
+    }
+    // On the hidden reply itself: the anchor is shown, as are its replies.
+    let (_, t) = thread_of(&base, DAVE, &format!("uri={c}")).await;
+    assert_eq!(t["post"]["uri"], c.as_str());
+    assert_eq!(reply_uris(&t), std::slice::from_ref(&cc));
+    // getPosts still serves it.
+    assert_eq!(posts_of(&base, DAVE, &[&c]).await.1.len(), 1);
+    // getReplies on the branch root.
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={a}"), DAVE).await;
+    assert_eq!(all_uris(&v), std::slice::from_ref(&d));
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={a}"), CAROL).await;
+    assert_eq!(all_uris(&v), sorted(vec![c.clone(), cc.clone(), d.clone()]));
+
+    // getReplies on the public post: E hidden from Carol (a page
+    // candidate), kept for Dave; Z's gate does not hide D, whose root is
+    // P, though F, a hit, claims Z.
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={p}"), CAROL).await;
+    assert_eq!(sorted(replies_uris(&v)), sorted(vec![a.clone(), forged.clone()]));
+    assert_eq!(all_uris(&v), sorted(vec![a.clone(), c.clone(), cc.clone(), d.clone(), forged.clone()]));
+    let (_, v, _) = json_of(&base, GET_REPLIES, &format!("uri={p}"), DAVE).await;
+    assert_eq!(sorted(replies_uris(&v)), sorted(vec![a.clone(), e.clone(), forged.clone()]));
+    assert_eq!(all_uris(&v), sorted(vec![a.clone(), d.clone(), e.clone(), forged.clone()]));
+    // Paging one at a time passes the hidden candidate.
+    let all = pages(&base, GET_REPLIES, &format!("uri={p}&limit=1&depth=0"), CAROL, 10).await;
+    let seen: Vec<String> = all.iter().flat_map(replies_uris).collect();
+    assert_eq!(sorted(seen), sorted(vec![a.clone(), forged.clone()]));
+    assert!(all.last().expect("pages").get("cursor").is_none());
+
+    // The gate's delete brings them back.
+    f.apply_op(OP, Action::Delete, THREADGATE, "3kproot22222", REV2, None).await;
+    let (_, t) = thread_of(&base, DAVE, &format!("uri={a}")).await;
+    assert_eq!(sorted(reply_uris(&t)), sorted(vec![c.clone(), cc.clone(), d.clone()]));
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn t4_public_root_gates_hide_on() {
+    reads_in(PublicMode::On, "prg-reads-on").await;
+}
+
+#[tokio::test]
+async fn t4_public_root_gates_hide_off() {
+    reads_in(PublicMode::Off, "prg-reads-off").await;
+}
+
+/// T-6: the feature is listed, last.
+#[test]
+fn t6_the_feature_is_listed() {
+    assert_eq!(crate::private_tier::FEATURES.last(), Some(&"private.publicRootGates"));
+}

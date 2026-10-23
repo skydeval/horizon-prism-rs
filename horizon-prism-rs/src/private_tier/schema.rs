@@ -2555,6 +2555,55 @@ pub(super) async fn threadgates(pool: &PgPool, posts: &[String]) -> Result<Vec<T
     .await
 }
 
+/// The private replies the stored gates of the public roots `roots` hide
+/// from `viewer` (public-root-gates design §5.2): each listed among a valid
+/// gate's first 300 `hiddenReplies` (the lexicon's `maxLength`), stored,
+/// claiming that gate's post as its root, and not by `viewer`. A gate is a
+/// public record, so no root is read.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn public_root_hidden(pool: &PgPool, viewer: &str, roots: &[String]) -> Result<Vec<String>, sqlx::Error> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_scalar(&format!(
+        "SELECT p.uri FROM private_threadgates g \
+         CROSS JOIN LATERAL unnest(g.hidden_replies[1:300]) AS h(uri) \
+         JOIN private_posts p ON p.uri = h.uri AND p.reply_root_uri = g.post_uri \
+         WHERE g.post_uri = ANY($1) AND split_part(g.post_uri, '/', 4) = 'app.bsky.feed.post' \
+           AND {VALID_GATE} AND p.author_did <> $2"
+    ))
+    .bind(roots)
+    .bind(viewer)
+    .fetch_all(pool)
+    .await
+}
+
+/// Among `uris`, the private posts the stored gate of the public root each
+/// claims hides from `viewer` (public-root-gates design §5.2), for
+/// candidates whose roots are not known yet.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn public_root_hidden_among(pool: &PgPool, viewer: &str, uris: &[String]) -> Result<Vec<String>, sqlx::Error> {
+    if uris.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_scalar(&format!(
+        "SELECT p.uri FROM private_posts p JOIN private_threadgates g ON g.post_uri = p.reply_root_uri \
+         WHERE p.uri = ANY($1) AND p.author_did <> $2 \
+           AND split_part(p.reply_root_uri, '/', 4) = 'app.bsky.feed.post' \
+           AND {VALID_GATE} AND p.uri = ANY(g.hidden_replies[1:300])"
+    ))
+    .bind(uris)
+    .bind(viewer)
+    .fetch_all(pool)
+    .await
+}
+
 /// A private post's valid postgate: whether it turns embedding off
 /// (`app.bsky.feed.postgate#disableRule`) and the quoting URIs it detaches.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]

@@ -240,6 +240,10 @@ pub const FEATURES: &[&str] = &[
     // `subscribed-post` notifications after commit with audience narrowing,
     // and the `subscribedPost` preference (private-activity-subs design).
     "private.activitySubscriptions",
+    // A public thread root's threadgate hides the private replies its
+    // hiddenReplies lists from getPostThread and getReplies
+    // (public-root-gates design).
+    "private.publicRootGates",
 ];
 
 /// The private tier as the rest of the crate may use it.

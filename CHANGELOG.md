@@ -10,6 +10,10 @@ commit.
 
 ## [Unreleased]
 
+### Added (public root gates PRG2: reads, #850, #853)
+
+- **A public root's Hide hides private replies.** `app.nearhorizon.private.getPostThread` and `getReplies` leave out a private reply, with what is beneath it, when the public post it claims as its root has a stored threadgate (PRG1) listing it in `hiddenReplies`, except for the reply's own author. No read of the root is needed. On `getReplies` for a public URI each reply is judged by the root it claims, so one root's gate never hides another root's replies; a hidden candidate is examined as an unreadable one is, so a page can be short and still carry a cursor. The anchor is never hidden, and `getPosts` still serves hidden replies. The public root's `allow` rules do not apply to private branches. `getMembership` lists `private.publicRootGates`; the `getMembership`, `getReplies` and `private.defs` lexicons describe it.
+
 ### Added (public root gates PRG1: storage and fetch, #850, #852)
 
 - **A public thread root's threadgate is kept for its private replies.** A stock `app.bsky.feed.threadgate` naming a public post in its author's own repo, with the post's rkey, is copied by the private tier into `private_threadgates`, whoever its author is and in every public-indexing mode, while a private post claims that post as its `reply.root` (or a copy is already stored, so it stays current). Its public row is decided as before. The off sweep and an `out_of_scope` purge keep the copy; a gate delete and an `account_deleted` purge remove it.
