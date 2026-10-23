@@ -940,7 +940,7 @@ async fn an_s_authors_thread_takes_the_upstream_baseline_unless_the_mode_is_on()
 
     // On: an S author's posts are all stored here, so a missing anchor has
     // no baseline. The viewer fields are there.
-    assert_eq!(h.lens_baseline(&viewer, &req, &anchor, 0, 80).await.expect("db"), None);
+    assert_eq!(h.lens_baseline(&viewer, &req, &anchor, 0, 80, &Default::default()).await.expect("db"), None);
     assert_eq!(h.post_viewer(&viewer, std::slice::from_ref(&anchor)).await.expect("db")[&anchor]["bookmarked"], true);
     assert!(h.actor_viewer(&viewer, &[AUTHOR.to_string()]).await.expect("db").view(AUTHOR).get("activitySubscription").is_some());
 

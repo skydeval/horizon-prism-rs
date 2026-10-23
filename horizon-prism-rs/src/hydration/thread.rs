@@ -68,6 +68,10 @@ type GateRow = (String, String, Value, Vec<String>, Option<Value>);
 /// threadgate.
 pub(super) type Tree = (Value, Option<Value>);
 
+/// One request's upstream `getPostThread` answer, fetched at most once
+/// (threadlens-hydration design §2.3, F1).
+pub type ThreadMemo = tokio::sync::OnceCell<Option<Value>>;
+
 fn not_found() -> ViewError {
     ViewError::new("NotFound", "Post not found")
 }
@@ -434,6 +438,30 @@ impl Hydrator {
         parent_height: u32,
         keep_hidden: bool,
     ) -> Result<Result<Tree, ViewError>, super::HydrationError> {
+        self.thread_tree_memo(viewer, req, uri, depth, parent_height, keep_hidden, None).await
+    }
+
+    /// [`Hydrator::thread_tree`], with the upstream thread taken from
+    /// `memo` when an earlier assembly of the same request fetched it
+    /// (threadlens-hydration design §2.3, F1): Thread Lens assembles the
+    /// baseline twice, to collect and to emit, and the upstream answer is
+    /// the same input to both. The memo holds the raw upstream answer, never
+    /// a view normalized for a viewer.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn thread_tree_memo(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        uri: &str,
+        depth: u32,
+        parent_height: u32,
+        keep_hidden: bool,
+        memo: Option<&ThreadMemo>,
+    ) -> Result<Result<Tree, ViewError>, super::HydrationError> {
         let started = Instant::now();
         if is_private_uri(uri) {
             return Ok(Err(not_found()));
@@ -445,7 +473,10 @@ impl Hydrator {
             let author = uri_author(uri).unwrap_or_default().to_string();
             if !self.stores_public_of(&author).await
                 && self.gate(req, uri).await?.listable()
-                && let Some(v) = self.upstream().post_thread(req, uri, depth, parent_height).await
+                && let Some(v) = match memo {
+                    Some(cell) => cell.get_or_init(|| self.upstream().post_thread(req, uri, depth, parent_height)).await.clone(),
+                    None => self.upstream().post_thread(req, uri, depth, parent_height).await,
+                }
             {
                 // An upstream AppView's thread, with whatever gate view it
                 // gave.

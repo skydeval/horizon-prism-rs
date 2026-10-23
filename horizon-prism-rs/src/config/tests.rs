@@ -357,6 +357,7 @@ listing_calls = 60
 verdict_round_timeout_ms = 500
 parent_rounds = 8
 verdict_max_dids = 600
+listing_timeout_ms = 1500
 
 [refract]
 enabled = false

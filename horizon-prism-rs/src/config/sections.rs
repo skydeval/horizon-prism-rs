@@ -1767,6 +1767,11 @@ pub struct ThreadLensConfig {
     /// Distinct authors looked up for bridging in one request, beyond the
     /// ordinary view's own.
     pub verdict_max_dids: u32,
+    /// How long a response waits for one Constellation page of replies.
+    /// Past it the page is no answer for that response (the node keeps its
+    /// marker) and is fetched on in the background, for the client's next
+    /// request (threadlens-hydration design §2.3, F5).
+    pub listing_timeout_ms: u32,
 }
 
 impl Default for ThreadLensConfig {
@@ -1778,6 +1783,7 @@ impl Default for ThreadLensConfig {
             verdict_round_timeout_ms: 500,
             parent_rounds: 8,
             verdict_max_dids: 600,
+            listing_timeout_ms: 1500,
         }
     }
 }

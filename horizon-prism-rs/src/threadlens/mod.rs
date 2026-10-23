@@ -20,6 +20,8 @@ pub mod thread;
 pub mod verdict;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod tests;
 
 pub use gaps::Gap;

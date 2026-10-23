@@ -235,25 +235,30 @@ impl super::Hydrator {
         count_targets(view, &mut targets);
         targets.sort();
         targets.dedup();
+        // One read for every target and one enqueue for those to refresh
+        // (threadlens-hydration design §2.3, F4).
+        let mut rows = counts::cached_many(self.pool(), &targets, &self.inner.cfg.counts).await?;
         let mut found: HashMap<String, Counts> = HashMap::new();
+        let mut refresh: Vec<String> = Vec::new();
         for t in targets {
-            let source = match counts::cached(self.pool(), &t, &self.inner.cfg.counts).await? {
+            let source = match rows.remove(&t) {
                 Some((c, Freshness::Fresh)) => {
                     found.insert(t, c);
                     "fresh"
                 }
                 Some((c, _)) => {
-                    self.enqueue_refresh(req, &t).await;
+                    refresh.push(t.clone());
                     found.insert(t, c);
                     "stale"
                 }
                 None => {
-                    self.enqueue_refresh(req, &t).await;
+                    refresh.push(t);
                     "upstream"
                 }
             };
             metrics::counter!(METRIC_UPSTREAM_COUNTS, "source" => source).increment(1);
         }
+        self.enqueue_refresh_many(req, &refresh).await;
         apply_counts(view, &found);
         Ok(())
     }

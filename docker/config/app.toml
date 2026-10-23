@@ -588,7 +588,9 @@ max_walk = 50
 # bounds how many reply lists one response starts to read. The other three
 # bound the block checks one response makes: the time one round of checks
 # may take, how many rounds the walk up the parents may make, and how many
-# different authors are checked.
+# different authors are checked. listing_timeout_ms is how long a response
+# waits for one page of a reply list; a slower page is left for the client's
+# next request (the node says there is more) and is fetched meanwhile.
 # access says who may use it:
 #   "signed_in"  every signed-in account, members or not (the default)
 #   "members"    members of this server whose account is ready; anyone else
@@ -604,6 +606,7 @@ listing_calls = 60
 verdict_round_timeout_ms = 500
 parent_rounds = 8
 verdict_max_dids = 600
+listing_timeout_ms = 1500
 
 # Accounts Bluesky's AppView took down that a community you list still hosts
 # and has not banned stay readable through this AppView. `enabled` and the

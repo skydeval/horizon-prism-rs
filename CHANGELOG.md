@@ -10,6 +10,18 @@ commit.
 
 ## [Unreleased]
 
+### Changed (Thread Lens latency, #878, #885)
+
+- **`getThread` is about three times faster on a bridged thread** (a 46-post bench thread with measured network delays: 2221 ms → 748 ms median; design `threadlens-hydration.md` §1–§2). The response is the same except where a reply page is slow (below).
+  - The upstream thread of the baseline is fetched once per request; it was fetched twice, to collect authors and to emit.
+  - A reply level's Constellation pages are read together (8 at once) instead of one node after another; the listing allowance is spent exactly as before.
+  - The fetch ladder runs for a whole reply level (and for the stubs, and for `resolve`) at once: one gate, tombstone and local read, one `getPosts` per home network and 25 posts (a URI whose record key an AppView may refuse goes alone), one normalization, then Slingshot per URI as before. Each URI gets the answer it got alone.
+  - Counts on upstream views are read in one query and queued for refresh in one Redis round trip (also on every list endpoint's count path), and no longer enriched twice on each Thread Lens view.
+  - The anchor's first reply page is asked for while the baseline is built, when bridging is possible (Farsight and Constellation configured, no `repliesCursor`, `depth` ≥ 1). It costs one Constellation call when bridging turns out off or the anchor has no replies.
+- **A slow reply page no longer holds the response.** New `threadlens.listing_timeout_ms` (default 1500, at least 1; `docker/config/app.toml`): past it, the page is no answer for that response (the node keeps its `moreReplies` cursor, as for any page without an answer) and the call finishes in the background into the read-time cache, so following the marker answers at once. Before, a response waited up to the Constellation client's 10 s (a cold page took 3.9 s from silonew).
+- **Metrics:** `threadlens_phase_seconds{phase}` (`collect`, `baseline_round`, `emit`, `stubs`, `parents`, `replies`, `enforce`, `authors`, `gate`) and `threadlens_listing_timeouts_total`.
+- A release-mode bench, `threadlens::bench` (ignored by default).
+
 ### Removed (kryphocron private blocks, #875, #876)
 
 - **Private blocks are no longer tracked** (skydeval, 2026-10-24: a public block already keeps the two accounts apart). `tools.kryphocron.graph.block` records are skipped on the firehose, in backfill and in `requestRecord`'s catch-up, like any private NSID Prism does not index (`firehose_ops_skipped_total{reason="kryphocron_unproduced"}`); the authorization collections are now three (`app.bsky.graph.block`, `policy.audience`, `postPrivate`). Only `app.bsky.graph.block` and members' list blocks that apply count as blocks in the private read rule, private notifications and their unread count, private search, the activity-subscription fan-out and `notServed`. Gone with them: their retention step and `member_removed` batch, the live feed's `private-block` kind, the stats page's "Private blocks stored" and Look up's "Private blocks it made". **Migration 0045** (`0045_drop_private_blocks`) drops the `private_blocks` table and its rows. The lexicon descriptions no longer mention private blocks (and now say a list block counts where `private.listBlocks` is listed). Other `tools.kryphocron.*` records are unchanged.

@@ -318,6 +318,9 @@ impl Hydrator {
     /// returned with the tree, read for its hidden replies; the response
     /// has no gate field.
     ///
+    /// `memo` carries the upstream thread from the collect assembly to the
+    /// emit assembly of one request, so it is fetched once.
+    ///
     /// # Errors
     ///
     /// Database errors.
@@ -328,8 +331,9 @@ impl Hydrator {
         anchor: &str,
         depth: u32,
         parent_height: u32,
+        memo: &super::thread::ThreadMemo,
     ) -> Result<Option<(Value, Option<Value>)>, HydrationError> {
-        Ok(self.thread_tree(viewer, req, anchor, depth, parent_height, true).await?.ok())
+        Ok(self.thread_tree_memo(viewer, req, anchor, depth, parent_height, true, Some(memo)).await?.ok())
     }
 
     /// The thread root a stored post names: its `reply_root_uri`, or the
@@ -382,14 +386,14 @@ impl Hydrator {
     }
 
     /// Normalize an upstream view for the viewer (§II-8.6): local viewer
-    /// state and labels replace the upstream's.
+    /// state and labels replace the upstream's, and counts are enriched
+    /// (once: `normalized` does it).
     ///
     /// # Errors
     ///
     /// Database errors.
     pub async fn lens_normalize(&self, viewer: &Viewer, req: &Requester, view: Value) -> Result<(Value, NormalizeReport), sqlx::Error> {
-        let (mut view, report, _) = self.normalized(viewer, req, view).await?;
-        self.enrich_counts(req, &mut view).await?;
+        let (view, report, _) = self.normalized(viewer, req, view).await?;
         Ok((view, report))
     }
 
@@ -403,6 +407,22 @@ impl Hydrator {
             .bind(uri)
             .fetch_one(self.pool())
             .await
+    }
+
+    /// Of `uris`, those `record_tombstones` holds, in one read.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn tombstoned_many(&self, uris: &[String]) -> Result<HashSet<String>, sqlx::Error> {
+        if uris.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let rows: Vec<String> = sqlx::query_scalar("SELECT uri FROM record_tombstones WHERE uri = ANY($1)")
+            .bind(uris)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Whether the author's account is locally known to be `active`.
@@ -456,6 +476,13 @@ impl Hydrator {
         .bind(i64::from(limit))
         .fetch_all(self.pool())
         .await
+    }
+
+    /// Whether a reply sequence has a Constellation phase: Constellation is
+    /// configured.
+    #[must_use]
+    pub fn lists_replies(&self) -> bool {
+        self.backlinks().is_some()
     }
 
     /// The Constellation phase of a post's reply sequence: one page of

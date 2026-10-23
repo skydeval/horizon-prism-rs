@@ -55,6 +55,7 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
         ("threadlens.listing_calls", cfg.threadlens.listing_calls, 2),
         ("threadlens.parent_rounds", cfg.threadlens.parent_rounds, 1),
         ("threadlens.verdict_round_timeout_ms", cfg.threadlens.verdict_round_timeout_ms, 1),
+        ("threadlens.listing_timeout_ms", cfg.threadlens.listing_timeout_ms, 1),
     ] {
         if value < least {
             out.push(format!("{key} must be at least {least}"));

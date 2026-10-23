@@ -168,6 +168,67 @@ pub async fn cached(pool: &PgPool, target: &str, cfg: &CountsConfig) -> Result<O
     )))
 }
 
+/// [`cached`] for many targets in one query (threadlens-hydration design
+/// §2.3, F4): each usable row with its freshness, by target. Absent and
+/// expired rows are left out, and each row's age is recorded as
+/// [`cached`] records it.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn cached_many(pool: &PgPool, targets: &[String], cfg: &CountsConfig) -> Result<std::collections::HashMap<String, (Counts, Freshness)>, sqlx::Error> {
+    type Row = (String, Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<i32>, DateTime<Utc>, DateTime<Utc>);
+    let mut out = std::collections::HashMap::new();
+    if targets.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT target, likes, reposts, replies, quotes, followers, fetched_at, now() FROM constellation_counts WHERE target = ANY($1)",
+    )
+    .bind(targets)
+    .fetch_all(pool)
+    .await?;
+    for (target, likes, reposts, replies, quotes, followers, fetched_at, now) in rows {
+        let age = (now - fetched_at).num_seconds();
+        #[allow(clippy::cast_precision_loss)]
+        metrics::histogram!(METRIC_AGE).record(age.max(0) as f64);
+        let f = freshness(age, cfg);
+        if f != Freshness::Expired {
+            out.insert(target, (Counts { likes, reposts, replies, quotes, followers }, f));
+        }
+    }
+    Ok(out)
+}
+
+/// [`enqueue_refresh`] for many targets: one `SCARD`, then one `SADD` of as
+/// many of them as the set has room for. Those past the cap are dropped and
+/// counted, as [`enqueue_refresh`] drops one. Returns how many were sent.
+pub async fn enqueue_refresh_many(redis: &mut ConnectionManager, targets: &[String], max: u64) -> usize {
+    if targets.is_empty() {
+        return 0;
+    }
+    let size: redis::RedisResult<u64> = redis.scard(REFRESH_KEY).await;
+    let Ok(n) = size else {
+        metrics::counter!(METRIC_CACHE_ERRORS, "op" => "cc_scard").increment(1);
+        return 0;
+    };
+    let room = usize::try_from(max.saturating_sub(n)).unwrap_or(usize::MAX);
+    let (sent, dropped) = targets.split_at(room.min(targets.len()));
+    if !dropped.is_empty() {
+        metrics::counter!(METRIC_DROPPED).increment(u64::try_from(dropped.len()).unwrap_or(u64::MAX));
+    }
+    if sent.is_empty() {
+        return 0;
+    }
+    match redis.sadd::<_, _, i64>(REFRESH_KEY, sent).await {
+        Ok(_) => sent.len(),
+        Err(_) => {
+            metrics::counter!(METRIC_CACHE_ERRORS, "op" => "cc_sadd").increment(1);
+            0
+        }
+    }
+}
+
 /// Enqueue a target for background refresh, if the set is below its cap.
 /// Returns whether it was enqueued; Redis errors are a counted no-op.
 pub async fn enqueue_refresh(redis: &mut ConnectionManager, target: &str, max: u64) -> bool {
@@ -302,6 +363,22 @@ mod tests {
                 .await
                 .expect("age");
             assert_eq!(cached(&db.pool, "did:plc:a", &cfg).await.expect("read"), None);
+            // `cached_many` answers each target as `cached` does: fresh,
+            // stale, expired (left out) and absent (left out).
+            let post = Counts { likes: Some(3), reposts: Some(1), replies: Some(0), quotes: Some(2), followers: None };
+            store(&db.pool, "at://fresh", &post).await.expect("store");
+            store(&db.pool, "at://stale", &post).await.expect("store");
+            sqlx::query("UPDATE constellation_counts SET fetched_at = now() - interval '1 hour' WHERE target = 'at://stale'")
+                .execute(&db.pool)
+                .await
+                .expect("age");
+            let targets: Vec<String> = ["did:plc:a", "at://fresh", "at://stale", "at://absent"].map(String::from).to_vec();
+            let many = cached_many(&db.pool, &targets, &cfg).await.expect("read");
+            for t in &targets {
+                assert_eq!(many.get(t).copied(), cached(&db.pool, t, &cfg).await.expect("read"), "{t}");
+            }
+            assert_eq!((many.len(), many["at://stale"].1), (2, Freshness::Stale));
+            assert!(cached_many(&db.pool, &[], &cfg).await.expect("read").is_empty());
             db.drop_db().await;
         }
 
@@ -318,6 +395,15 @@ mod tests {
             assert!(!enqueue_refresh(&mut conn, "at://c", 2).await);
             let n: u64 = conn.scard(REFRESH_KEY).await.expect("scard");
             assert_eq!(n, 2);
+            // Many at once: only as many as the set has room for.
+            let _: () = redis::cmd("DEL").arg(REFRESH_KEY).query_async(&mut conn).await.expect("del");
+            let targets: Vec<String> = ["at://a", "at://b", "at://c", "at://d"].map(String::from).to_vec();
+            assert_eq!(enqueue_refresh_many(&mut conn, &targets[..1], 3).await, 1);
+            assert_eq!(enqueue_refresh_many(&mut conn, &targets[1..], 3).await, 2);
+            let n: u64 = conn.scard(REFRESH_KEY).await.expect("scard");
+            assert_eq!(n, 3);
+            assert_eq!(enqueue_refresh_many(&mut conn, &targets, 3).await, 0, "full");
+            assert_eq!(enqueue_refresh_many(&mut conn, &[], 3).await, 0);
             let _: () = redis::cmd("DEL").arg(REFRESH_KEY).query_async(&mut conn).await.expect("del");
         }
     }

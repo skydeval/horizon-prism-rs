@@ -50,8 +50,9 @@ use crate::hydration::normalize::is_private_uri;
 use crate::hydration::{HydrationError, KnownBlocks, Viewer, with_known_blocks};
 use crate::xrpc::pools::Requester;
 
-/// Ladder runs in flight.
-pub const LADDER_CONCURRENCY: usize = 8;
+/// Reply sequences read at once for one level (threadlens-hydration
+/// design §2.3, F2).
+pub const LISTING_CONCURRENCY: usize = 8;
 /// Replies read of one node's sequence in each of its two phases.
 const LISTING_PAGE: u32 = 100;
 const NSID_POST: &str = "app.bsky.feed.post";
@@ -72,6 +73,44 @@ pub struct Request<'a> {
 pub struct Thread {
     pub nodes: Vec<LensNode>,
     pub bridging: Bridging,
+    /// Where the request's time went, phase by phase, in order
+    /// (threadlens-hydration design §2.5). Also recorded as
+    /// [`METRIC_PHASE_SECONDS`].
+    pub phases: Vec<(&'static str, std::time::Duration)>,
+}
+
+/// Metric: seconds a `getThread` or `resolve` request spent in each phase,
+/// labelled `phase`.
+pub const METRIC_PHASE_SECONDS: &str = "threadlens_phase_seconds";
+/// Metric: Constellation reply pages a response stopped waiting for
+/// (`threadlens.listing_timeout_ms`).
+pub const METRIC_LISTING_TIMEOUTS: &str = "threadlens_listing_timeouts_total";
+
+/// The phase clock of one request.
+struct Phases {
+    last: std::time::Instant,
+    list: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl Phases {
+    fn start() -> Self {
+        Self { last: std::time::Instant::now(), list: Vec::new() }
+    }
+
+    /// Close the phase that ran since the last mark.
+    fn mark(&mut self, phase: &'static str) {
+        let now = std::time::Instant::now();
+        self.list.push((phase, now - self.last));
+        self.last = now;
+    }
+
+    /// Record every phase on the histogram and hand them over.
+    fn finish(self) -> Vec<(&'static str, std::time::Duration)> {
+        for (phase, took) in &self.list {
+            metrics::histogram!(METRIC_PHASE_SECONDS, "phase" => *phase).record(took.as_secs_f64());
+        }
+        self.list
+    }
 }
 
 /// `at://<did>/app.bsky.feed.post/<rkey>`.
@@ -261,6 +300,38 @@ struct Seq {
     rest: Option<Option<Position>>,
 }
 
+/// One Constellation page of replies, asked for as its own task: the
+/// listed reply URIs and the next cursor, or no answer.
+type PageCall = tokio::task::JoinHandle<Option<(Vec<String>, Option<String>)>>;
+
+/// Ask for one page of `parent`'s replies from `cursor`, as its own task, so
+/// a response that stops waiting for it leaves it to finish and fill the
+/// read-time cache (F5).
+fn listing_call(h: &crate::hydration::Hydrator, req: &Requester, parent: &str, cursor: Option<String>) -> PageCall {
+    let (h, req, parent) = (h.clone(), req.clone(), parent.to_string());
+    tokio::spawn(async move { h.lens_listed_replies(&req, &parent, LISTING_PAGE, cursor.as_deref()).await })
+}
+
+/// One node's stored replies as read, before its listing page.
+struct LocalRead {
+    replies: Vec<Reply>,
+    /// Set when more stored replies remain than a page holds: the position
+    /// to resume from. Nothing is listed then.
+    full: Option<Option<Position>>,
+    /// The listing cursor to read from.
+    listed_from: Option<String>,
+    /// Where the sequence started.
+    from: Option<Position>,
+}
+
+/// One sequence of a level, while its page is read: done, or its page due
+/// (the node, its stored replies, and the page's call if already asked).
+type Slot = Result<Seq, (String, LocalRead, Option<PageCall>)>;
+
+/// One sequence's placement: what to do with each reply, and the first
+/// reply left for the page budget.
+type Plan = (Vec<(String, Act)>, Option<usize>);
+
 /// What to do with a reply that was read.
 enum Act {
     Gap(Gap),
@@ -293,6 +364,11 @@ struct Work<'a> {
     key: &'a CursorKey,
     /// Whether bridging is on for the request.
     bridging: bool,
+    /// `threadlens.listing_timeout_ms`.
+    listing_timeout: std::time::Duration,
+    /// The anchor's first Constellation page, asked for while the baseline
+    /// was assembled (threadlens-hydration design §2.7, F7).
+    anchor_page: Option<PageCall>,
     /// The position a `repliesCursor` request resumes the anchor's
     /// sequence from, and the cursor as it was sent.
     start: Option<(Position, String)>,
@@ -310,6 +386,15 @@ impl Work<'_> {
     /// The ladder for one URI, hydrated with the request's blocks.
     async fn fetch(&self, uri: &str) -> Result<Resolved, sqlx::Error> {
         with_known_blocks(Arc::clone(&self.known), self.ladder.resolve(self.r.viewer, self.r.req, uri, Mode::Full)).await
+    }
+
+    /// The ladder for each of `uris` at once (threadlens-hydration design
+    /// §2.3, F3), hydrated with the request's blocks.
+    async fn fetch_many(&self, uris: &[String]) -> Result<HashMap<String, Resolved>, sqlx::Error> {
+        if uris.is_empty() {
+            return Ok(HashMap::new());
+        }
+        with_known_blocks(Arc::clone(&self.known), self.ladder.resolve_many(self.r.viewer, self.r.req, uris, Mode::Full)).await
     }
 
     fn ladder_node(&mut self, resolved: Resolved, uri: &str, parent_uri: Option<String>) -> LensNode {
@@ -381,11 +466,20 @@ impl Work<'_> {
             .map(str::to_string)
             .collect();
         self.ladder.router().prefetch(self.r.req, &authors).await;
+        // Every `Clear` stub through the ladder at once.
+        let clear: Vec<String> = stubs
+            .iter()
+            .filter(|(_, uri)| self.judge.verdict(uri_author(uri).unwrap_or_default()) == Some(Verdict::Clear))
+            .map(|(_, uri)| uri.clone())
+            .collect();
+        let mut fetched = self.fetch_many(&clear).await?;
         for (i, uri) in stubs {
             match self.judge.verdict(uri_author(&uri).unwrap_or_default()) {
                 Some(Verdict::Clear) => {
                     let parent = self.nodes[i].parent_uri().map(str::to_string);
-                    let resolved = self.fetch(&uri).await?;
+                    let Some(resolved) = fetched.remove(&uri) else {
+                        continue;
+                    };
                     if !matches!(resolved, Resolved::Gap(_)) {
                         self.nodes[i] = self.ladder_node(resolved, &uri, parent);
                     }
@@ -472,14 +566,12 @@ impl Work<'_> {
         }
     }
 
-    /// One node's reply sequence from `from` (§5.15.14): the stored
-    /// replies, then the ones Constellation lists that are not stored.
-    /// The Constellation phase is read only with bridging on.
-    async fn sequence(&mut self, parent: &str, from: Option<Position>) -> Result<Seq, sqlx::Error> {
-        let h = self.ladder.hydrator();
+    /// The local phase of one node's reply sequence from `from` (§5.15.14):
+    /// the stored replies. A cursor already in the Constellation phase
+    /// reads none.
+    async fn local_phase(h: &crate::hydration::Hydrator, parent: &str, from: Option<Position>) -> Result<LocalRead, sqlx::Error> {
         let page = usize::try_from(LISTING_PAGE).unwrap_or(usize::MAX);
         let mut replies: Vec<Reply> = Vec::new();
-        let seq = |replies, rest| Seq { parent: parent.to_string(), replies, rest };
         let listed_from = match &from {
             Some(Position::Listed { cursor }) => cursor.clone(),
             local => {
@@ -495,37 +587,144 @@ impl Work<'_> {
                     before = Some(Position::Local { at, uri });
                 }
                 if more {
-                    return Ok(seq(replies, Some(before)));
+                    return Ok(LocalRead { replies, full: Some(before), listed_from: None, from });
                 }
                 None
             }
         };
-        if !self.bridging {
-            // In this state the stored replies are all there is to read. A
-            // cursor already in the Constellation phase cannot be read
-            // from at all: the marker keeps it.
-            let kept = matches!(from, Some(Position::Listed { .. })).then(|| from.clone());
-            return Ok(seq(replies, kept));
-        }
-        let here = Position::Listed { cursor: listed_from.clone() };
-        if self.listings == 0 {
-            return Ok(seq(replies, Some(Some(here))));
-        }
-        self.listings -= 1;
-        let rest = match h.lens_listed_replies(self.r.req, parent, LISTING_PAGE, listed_from.as_deref()).await {
+        Ok(LocalRead { replies, full: None, listed_from, from })
+    }
+
+    /// The Constellation phase of one node's reply sequence: one page of
+    /// the replies its listing names that are not stored, after the stored
+    /// ones read.
+    ///
+    /// A page that takes longer than `timeout` is no answer for this
+    /// response (threadlens-hydration design §2.3, F5): the marker keeps
+    /// the cursor, and the call goes on in the background, so the page is
+    /// in the read-time cache when the client follows the marker.
+    ///
+    /// `early` is the same page already asked for (F7): its call is awaited
+    /// instead of a new one.
+    async fn listing_phase(
+        h: &crate::hydration::Hydrator,
+        req: &Requester,
+        parent: &str,
+        mut read: LocalRead,
+        timeout: std::time::Duration,
+        early: Option<PageCall>,
+    ) -> Result<Seq, sqlx::Error> {
+        let here = Position::Listed { cursor: read.listed_from.clone() };
+        let call = match early {
+            Some(call) => call,
+            None => listing_call(h, req, parent, read.listed_from.clone()),
+        };
+        let page = match tokio::time::timeout(timeout, call).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(_)) => None,
+            Err(_) => {
+                metrics::counter!(METRIC_LISTING_TIMEOUTS).increment(1);
+                None
+            }
+        };
+        let rest = match page {
             // No answer: the marker keeps the cursor it had.
             None => Some(Some(here)),
             Some((listed, next)) => {
                 let stored = h.lens_local_rows(&listed).await?;
                 for uri in listed {
-                    if !stored.contains_key(&uri) && !replies.iter().any(|r| r.uri == uri) {
-                        replies.push(Reply { uri, local_row: false, before: Some(here.clone()) });
+                    if !stored.contains_key(&uri) && !read.replies.iter().any(|r| r.uri == uri) {
+                        read.replies.push(Reply { uri, local_row: false, before: Some(here.clone()) });
                     }
                 }
                 next.map(|cursor| Some(Position::Listed { cursor: Some(cursor) }))
             }
         };
-        Ok(seq(replies, rest))
+        Ok(Seq { parent: parent.to_string(), replies: read.replies, rest })
+    }
+
+    /// One level's reply sequences (§5.15.14), in level order. The stored
+    /// replies of every node and then the Constellation pages are read
+    /// concurrently (threadlens-hydration design §2.3, F2); the
+    /// allowances are spent in the order and on the reads they were spent
+    /// on when the sequences were read one by one, so the same sequences
+    /// are started and the same markers set.
+    async fn read_level(&mut self, level: &[String], start: &mut Option<Position>) -> Result<Vec<Seq>, sqlx::Error> {
+        // The nodes whose sequences may start, each with where it starts:
+        // the first one takes the request's cursor position.
+        let mut eligible: Vec<(String, Option<Position>)> = Vec::new();
+        for parent in level {
+            let Some(node) = self.index(parent).map(|i| &self.nodes[i]) else {
+                continue;
+            };
+            if !node.walkable() || node.no_replies() {
+                continue;
+            }
+            eligible.push((parent.clone(), start.take()));
+        }
+        // Each started sequence spends a listing, so no more than
+        // `listings` of them can start: only theirs are read.
+        let readable = if self.budget == 0 { 0 } else { usize::try_from(self.listings).unwrap_or(usize::MAX) };
+        let h = self.ladder.hydrator().clone();
+        let locals: Vec<LocalRead> = futures::stream::iter(eligible.iter().take(readable).cloned())
+            .map(|(parent, from)| {
+                let h = &h;
+                async move { Self::local_phase(h, &parent, from).await }
+            })
+            .buffered(LISTING_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()?;
+        let mut locals = locals.into_iter();
+        // In level order: the outer allowance for the sequence, then, when
+        // its stored replies end, the inner one for its listing page.
+        let mut slots: Vec<Slot> = Vec::new();
+        for (parent, from) in eligible {
+            if self.listings == 0 || self.budget == 0 {
+                self.mark_at(&parent, from);
+                continue;
+            }
+            self.listings -= 1;
+            let read = locals.next().expect("a local read for every sequence started");
+            if let Some(rest) = read.full {
+                slots.push(Ok(Seq { parent, replies: read.replies, rest: Some(rest) }));
+                continue;
+            }
+            if !self.bridging {
+                // In this state the stored replies are all there is to read.
+                // A cursor already in the Constellation phase cannot be read
+                // from at all: the marker keeps it.
+                let kept = matches!(read.from, Some(Position::Listed { .. })).then(|| read.from.clone());
+                slots.push(Ok(Seq { parent, replies: read.replies, rest: kept }));
+                continue;
+            }
+            if self.listings == 0 {
+                let here = Position::Listed { cursor: read.listed_from.clone() };
+                slots.push(Ok(Seq { parent, replies: read.replies, rest: Some(Some(here)) }));
+                continue;
+            }
+            self.listings -= 1;
+            // The anchor's first page may already be on its way (F7).
+            let early = if parent == self.r.anchor && read.listed_from.is_none() { self.anchor_page.take() } else { None };
+            slots.push(Err((parent, read, early)));
+        }
+        let (req, timeout) = (self.r.req, self.listing_timeout);
+        futures::stream::iter(slots)
+            .map(|slot| {
+                let h = &h;
+                async move {
+                    match slot {
+                        Ok(seq) => Ok(seq),
+                        Err((parent, read, early)) => Self::listing_phase(h, req, &parent, read, timeout, early).await,
+                    }
+                }
+            })
+            .buffered(LISTING_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// The replies, level by level below the anchor and node by node in
@@ -539,22 +738,7 @@ impl Work<'_> {
         let mut start = self.start.as_ref().map(|(position, _)| position.clone());
         let levels = if self.bridging { self.r.depth } else { self.r.depth.min(1) };
         for _ in 0..levels {
-            let mut read: Vec<Seq> = Vec::new();
-            for parent in &level {
-                let Some(node) = self.index(parent).map(|i| &self.nodes[i]) else {
-                    continue;
-                };
-                if !node.walkable() || node.no_replies() {
-                    continue;
-                }
-                let from = start.take();
-                if self.listings == 0 || self.budget == 0 {
-                    self.mark_at(parent, from);
-                    continue;
-                }
-                self.listings -= 1;
-                read.push(self.sequence(parent, from).await?);
-            }
+            let read: Vec<Seq> = self.read_level(&level, &mut start).await?;
             let authors: Vec<String> = read
                 .iter()
                 .flat_map(|seq| seq.replies.iter())
@@ -570,13 +754,33 @@ impl Work<'_> {
             }
             let parents: Vec<String> = read.iter().map(|seq| seq.parent.clone()).collect();
             let local_parents = self.ladder.hydrator().lens_local_rows(&parents).await?;
+            // Every sequence's replies are planned in level order, as if
+            // each were placed before the next was planned; the level's
+            // fetches then go through the ladder at once (F3).
+            let mut plans: Vec<Plan> = Vec::new();
+            if judged {
+                let (mut seen, mut budget) = (self.seen.clone(), self.budget);
+                for seq in &read {
+                    plans.push(self.plan(seq, local_parents.contains_key(&seq.parent), &mut seen, &mut budget));
+                }
+            }
+            let fetches: Vec<String> = plans
+                .iter()
+                .flat_map(|(acts, _)| acts.iter())
+                .filter(|(_, act)| matches!(act, Act::Fetch))
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            let mut fetched = self.fetch_many(&fetches).await?;
+            let mut plans = plans.into_iter();
             for seq in read {
                 // A reply whose author could not be sent in the round is
                 // not placed: the cursor is the position before it.
-                let stopped = if judged {
-                    self.place(&seq, local_parents.contains_key(&seq.parent)).await?
-                } else {
-                    seq.replies.iter().position(|reply| !self.seen.contains(&reply.uri))
+                let stopped = match plans.next() {
+                    Some((acts, stopped)) => {
+                        self.place(&seq.parent, acts, &mut fetched);
+                        stopped
+                    }
+                    None => seq.replies.iter().position(|reply| !self.seen.contains(&reply.uri)),
                 };
                 let resume = match stopped {
                     Some(i) => Some(seq.replies[i].before.clone()),
@@ -622,20 +826,22 @@ impl Work<'_> {
         }
     }
 
-    /// Place the replies read for a node that the response does not hold
-    /// yet. Returns the index of the first reply that was not placed for
-    /// the page budget, if any.
+    /// What to do with the replies read for a node that the response does
+    /// not hold yet, and the index of the first reply that was not placed
+    /// for the page budget, if any. `seen` and `budget` are the level's
+    /// running copies: they move as if the sequences before this one had
+    /// been placed already (threadlens-hydration design §2.3, F3).
     ///
     /// A stored reply to a node that was itself built from a stored row is
     /// one of the ordinary view's own rows: it is shown without a `Clear`
     /// verdict. A known block makes it a gap in its place with bridging
     /// on, and leaves it out with bridging off. Every other reply is a
     /// bridge candidate, and enters only with bridging on.
-    async fn place(&mut self, seq: &Seq, local_parent: bool) -> Result<Option<usize>, sqlx::Error> {
-        let mut acts: Vec<(&str, Act)> = Vec::new();
+    fn plan(&mut self, seq: &Seq, local_parent: bool, seen: &mut HashSet<String>, budget: &mut usize) -> Plan {
+        let mut acts: Vec<(String, Act)> = Vec::new();
         let mut stopped = None;
         for (i, reply) in seq.replies.iter().enumerate() {
-            if self.seen.contains(&reply.uri) {
+            if seen.contains(&reply.uri) {
                 continue;
             }
             let verdict = self.judge.verdict(uri_author(&reply.uri).unwrap_or_default());
@@ -654,38 +860,32 @@ impl Work<'_> {
             if matches!(act, Act::Skip) {
                 continue;
             }
-            if acts.len() >= self.budget {
+            if acts.len() >= *budget {
                 stopped = Some(i);
                 break;
             }
-            acts.push((&reply.uri, act));
+            acts.push((reply.uri.clone(), act));
         }
-        let fetches: Vec<String> = acts.iter().filter(|(_, act)| matches!(act, Act::Fetch)).map(|(uri, _)| (*uri).to_string()).collect();
-        let this = &*self;
-        let mut fetched: HashMap<String, Resolved> = futures::stream::iter(fetches)
-            .map(|uri| async move {
-                let resolved = this.fetch(&uri).await;
-                resolved.map(|r| (uri, r))
-            })
-            .buffered(LADDER_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<_, _>>()?;
+        *budget = budget.saturating_sub(acts.len());
+        seen.extend(acts.iter().map(|(uri, _)| uri.clone()));
+        (acts, stopped)
+    }
+
+    /// Place one sequence's planned replies, from the level's fetches.
+    fn place(&mut self, parent: &str, acts: Vec<(String, Act)>, fetched: &mut HashMap<String, Resolved>) {
         for (uri, act) in acts {
             let node = match act {
-                Act::Gap(gap) => LensNode::gap(uri, Some(seq.parent.clone()), gap),
-                Act::Fetch => match fetched.remove(uri) {
-                    Some(resolved) => self.ladder_node(resolved, uri, Some(seq.parent.clone())),
+                Act::Gap(gap) => LensNode::gap(&uri, Some(parent.to_string()), gap),
+                Act::Fetch => match fetched.remove(&uri) {
+                    Some(resolved) => self.ladder_node(resolved, &uri, Some(parent.to_string())),
                     None => continue,
                 },
                 Act::Skip => continue,
             };
-            self.seen.insert(uri.to_string());
+            self.seen.insert(uri);
             self.nodes.push(node);
             self.budget = self.budget.saturating_sub(1);
         }
-        Ok(stopped)
     }
 
     /// Enforcement (§5.15.12): one pass over every view the response
@@ -810,6 +1010,7 @@ pub async fn get_thread(
         return Ok(Thread {
             nodes: vec![LensNode::gap(r.anchor, None, gap)],
             bridging: Bridging::Off,
+            phases: Vec::new(),
         });
     }
     let h = ladder.hydrator();
@@ -824,13 +1025,21 @@ pub async fn get_thread(
     // Collect: the ordinary view, with no Thread Lens rule applied, names
     // the authors. Verdicts: one round for all of them. Emit: the ordinary
     // view again, with the request's blocks.
-    let collected = h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height).await?;
+    let mut phases = Phases::start();
+    // F7: the anchor's first page of listed replies is asked for now, beside
+    // the baseline, when bridging can be on and the replies will be read.
+    let anchor_page = (cursor.is_none() && r.depth > 0 && h.farsight().is_some() && h.lists_replies())
+        .then(|| listing_call(h, r.req, r.anchor, None));
+    let memo = crate::hydration::thread::ThreadMemo::new();
+    let collected = h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height, &memo).await?;
     let mut authors: Vec<String> = collected.as_ref().map(|(tree, _)| named_accounts(tree)).unwrap_or_default().into_iter().collect();
     authors.extend(uri_author(r.anchor).map(str::to_string));
+    phases.mark("collect");
     judge.baseline(&authors).await?;
+    phases.mark("baseline_round");
     let known = Arc::new(judge.known_blocks());
     let (tree, gate_view) = match collected {
-        Some(_) => match with_known_blocks(Arc::clone(&known), h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height)).await? {
+        Some(_) => match with_known_blocks(Arc::clone(&known), h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height, &memo)).await? {
             Some((tree, gate)) => (Some(tree), gate),
             None => (None, None),
         },
@@ -853,8 +1062,11 @@ pub async fn get_thread(
         from_record: HashSet::new(),
         key,
         bridging,
+        listing_timeout: std::time::Duration::from_millis(u64::from(cfg.listing_timeout_ms)),
+        anchor_page,
         start: cursor,
     };
+    phases.mark("emit");
     let attach = if work.nodes.is_empty() { work.anchor_alone().await? } else { true };
     if work.start.is_some() {
         // The anchor's sequence from the cursor. A post's stored replies
@@ -869,7 +1081,9 @@ pub async fn get_thread(
         }
     } else if bridging && attach {
         work.stubs().await?;
+        phases.mark("stubs");
         work.parents().await?;
+        phases.mark("parents");
         work.replies().await?;
     } else if !bridging {
         // The response is the baseline. It says where the ordinary view
@@ -890,18 +1104,22 @@ pub async fn get_thread(
             }
         }
     }
+    phases.mark("replies");
     work.enforce().await?;
+    phases.mark("enforce");
     work.author_pass().await;
     work.name_lists();
+    phases.mark("authors");
     if let Some((root, hidden)) = thread_gate(h, r.anchor, &work.nodes, gate_view.as_ref()).await? {
         flag_hidden(&mut work.nodes, &root, &hidden, r.viewer);
     }
+    phases.mark("gate");
     let bridging = match (bridging, work.limited) {
         (false, _) => Bridging::Off,
         (true, true) => Bridging::Limited,
         (true, false) => Bridging::Full,
     };
-    Ok(Thread { nodes: work.nodes, bridging })
+    Ok(Thread { nodes: work.nodes, bridging, phases: phases.finish() })
 }
 
 /// The last path segment of an at-uri (its record key).
@@ -1025,7 +1243,7 @@ pub async fn resolve(
     // Inputs all decided by their form: no round, no call.
     if judged.is_empty() {
         let nodes = uris.iter().map(|uri| LensNode::gap(uri, None, gap_by_form(uri).unwrap_or(Gap::NotFound))).collect();
-        return Ok(Thread { nodes, bridging: Bridging::Off });
+        return Ok(Thread { nodes, bridging: Bridging::Off, phases: Vec::new() });
     }
     let lookup = h.farsight().map(|farsight| lens_lookup(farsight, viewer, req));
     let mut judge = Judge::new(h.pool().clone(), &me, lookup, cfg);
@@ -1046,6 +1264,8 @@ pub async fn resolve(
         from_record: HashSet::new(),
         key,
         bridging,
+        listing_timeout: std::time::Duration::from_millis(u64::from(cfg.listing_timeout_ms)),
+        anchor_page: None,
         start: None,
     };
     let fetches: Vec<String> = uris
@@ -1053,17 +1273,7 @@ pub async fn resolve(
         .filter(|uri| gap_by_form(uri).is_none() && bridging && work.judge.verdict(uri_author(uri).unwrap_or_default()) == Some(Verdict::Clear))
         .cloned()
         .collect();
-    let this = &work;
-    let mut fetched: HashMap<String, Resolved> = futures::stream::iter(fetches)
-        .map(|uri| async move {
-            let resolved = this.fetch(&uri).await;
-            resolved.map(|r| (uri, r))
-        })
-        .buffered(LADDER_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<_, sqlx::Error>>()?;
+    let mut fetched = work.fetch_many(&fetches).await?;
     for uri in uris {
         let verdict = work.judge.verdict(uri_author(uri).unwrap_or_default());
         let node = match (gap_by_form(uri), block_gap(verdict), fetched.remove(uri)) {
@@ -1086,7 +1296,7 @@ pub async fn resolve(
         (true, true) => Bridging::Limited,
         (true, false) => Bridging::Full,
     };
-    Ok(Thread { nodes: work.nodes, bridging })
+    Ok(Thread { nodes: work.nodes, bridging, phases: Vec::new() })
 }
 
 #[cfg(test)]

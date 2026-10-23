@@ -1166,27 +1166,30 @@ impl Hydrator {
         };
         let cfg = &self.inner.cfg.counts;
         let mut misses: Vec<String> = Vec::new();
-        for t in targets {
-            match counts::cached(self.pool(), t, cfg).await {
-                Ok(Some((c, Freshness::Fresh))) => {
-                    out.insert(t.clone(), c);
-                }
-                Ok(Some((c, _))) => {
-                    out.insert(t.clone(), c);
-                    if !matches!(mode, CountMode::Quiet) {
-                        self.enqueue_refresh(req, t).await;
+        // One read for every target (threadlens-hydration design §2.3, F4).
+        match counts::cached_many(self.pool(), targets, cfg).await {
+            Ok(mut rows) => {
+                let mut stale: Vec<String> = Vec::new();
+                for t in targets {
+                    match rows.remove(t) {
+                        Some((c, Freshness::Fresh)) => {
+                            out.insert(t.clone(), c);
+                        }
+                        Some((c, _)) => {
+                            out.insert(t.clone(), c);
+                            stale.push(t.clone());
+                        }
+                        None => misses.push(t.clone()),
                     }
                 }
-                Ok(None) => misses.push(t.clone()),
-                Err(error) => tracing::debug!(event = "constellation_counts_read_failed", %error, "counts read failed"),
-            }
-        }
-        match mode {
-            CountMode::List => {
-                for t in &misses {
-                    self.enqueue_refresh(req, t).await;
+                if !matches!(mode, CountMode::Quiet) {
+                    self.enqueue_refresh_many(req, &stale).await;
                 }
             }
+            Err(error) => tracing::debug!(event = "constellation_counts_read_failed", %error, "counts read failed"),
+        }
+        match mode {
+            CountMode::List => self.enqueue_refresh_many(req, &misses).await,
             CountMode::Quiet => {}
             CountMode::Sync { started } => {
                 use futures::StreamExt;
@@ -1221,6 +1224,18 @@ impl Hydrator {
             }
         }
         out
+    }
+
+    /// [`Hydrator::enqueue_refresh`] for many targets, in one round trip
+    /// for the size and one for the add.
+    async fn enqueue_refresh_many(&self, req: &Requester, targets: &[String]) {
+        if req.is_viewer_private() || targets.is_empty() {
+            return;
+        }
+        if let Some(redis) = &self.inner.redis {
+            let mut conn = redis.clone();
+            counts::enqueue_refresh_many(&mut conn, targets, self.inner.cfg.counts.refresh_queue_max).await;
+        }
     }
 
     /// Put `target` on `cc:refresh`, unless `req` is viewer-private, whose
