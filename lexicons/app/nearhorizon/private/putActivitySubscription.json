@@ -1,0 +1,58 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.putActivitySubscription",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Turn the requester's notifications of an account's new private posts and replies on or off. Any account but the requester's own may be named; whether a post notifies is decided when it is posted, by the account's app.bsky.notification.declaration, the requester's follow and the post's audience. Separate from app.bsky.notification.putActivitySubscription. Both flags false deletes the subscription. Requires auth by a ready community member.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["subject", "activitySubscription"],
+          "properties": {
+            "subject": { "type": "string", "format": "did" },
+            "activitySubscription": { "type": "ref", "ref": "app.bsky.notification.defs#activitySubscription" }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["subject"],
+          "properties": {
+            "subject": { "type": "string", "format": "did" },
+            "activitySubscription": {
+              "type": "ref",
+              "ref": "app.bsky.notification.defs#activitySubscription",
+              "description": "The stored flags; absent after turning both off."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "The input is not an object, subject is not a valid DID or is the requester's own, or activitySubscription is not an object with boolean post and reply."
+        },
+        {
+          "name": "LimitReached",
+          "description": "Turning on a subscription to a new account would pass the requester's limit of private subscriptions (the message names it; 1000 by default, at most 3000)."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        },
+        {
+          "name": "Reindexing",
+          "description": "The caller's account is being re-indexed after an interruption; retry after `retryAfter` seconds (in the body; also the Retry-After header). Not NotReady: the caller is still a member."
+        }
+      ]
+    }
+  }
+}

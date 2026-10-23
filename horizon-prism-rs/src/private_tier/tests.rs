@@ -29,6 +29,8 @@ mod member_blocks;
 mod not_served;
 // Private notification preferences (private-notification-prefs design).
 mod prefs;
+// Private activity subscriptions: the methods (private-activity-subs design).
+mod subscriptions;
 mod round;
 mod threads;
 // The shared walk (#720): T-60 to T-63.
@@ -2762,7 +2764,7 @@ async fn private_router_methods_are_routed_in_every_mode() {
         .copied()
         .filter(|(n, _)| n.starts_with("app.nearhorizon.private."))
         .collect();
-    assert_eq!(methods.len(), 13);
+    assert_eq!(methods.len(), 15);
     for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
         set_mode(app.hydrator.scope(), mode).await;
         for &(nsid, verb) in &methods {
@@ -2786,7 +2788,14 @@ async fn private_router_methods_are_routed_in_every_mode() {
                 // `q` for `searchPosts`; the other methods ignore it.
                 crate::honest_501::Verb::Get => get(&base, nsid, &format!("uri={uri}&q=post"), BOB, BOB_KEY).await.0,
                 crate::honest_501::Verb::Post => {
-                    post(&base, nsid, &json!({"uri": uri, "cid": "bafy", "seenAt": "2026-10-01T00:00:00Z"}), BOB).await.0
+                    // `subject` and `activitySubscription` for
+                    // `putActivitySubscription` (an off); the others ignore
+                    // them.
+                    let body = json!({
+                        "uri": uri, "cid": "bafy", "seenAt": "2026-10-01T00:00:00Z",
+                        "subject": ALICE, "activitySubscription": {"post": false, "reply": false},
+                    });
+                    post(&base, nsid, &body, BOB).await.0
                 }
             };
             assert_eq!(status, 200, "{mode:?} {nsid}");

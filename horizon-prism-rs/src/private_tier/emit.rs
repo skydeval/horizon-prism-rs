@@ -356,6 +356,13 @@ enum Body {
     /// `searchPosts` (private posting §4.17): the page's matches, and the
     /// sealed cursor while the search has span left.
     Search { posts: Vec<PrivateEmit<Value>>, cursor: Option<String> },
+    /// `putActivitySubscription` (private-activity-subs design §4.1):
+    /// `{subject, activitySubscription?}`, from the input and the caller's
+    /// own row, never from a post.
+    ActivitySubscription(Value),
+    /// `listActivitySubscriptions` (§4.2): the caller's own rows as
+    /// `{subject, activitySubscription}`.
+    ActivitySubscriptions { subscriptions: Vec<Value>, cursor: Option<String> },
     /// `{}`: a write's answer.
     Empty,
 }
@@ -416,6 +423,14 @@ impl PrivateResponse {
         Self::of(Body::Bookmarks { bookmarks, cursor })
     }
 
+    pub(in crate::private_tier) fn activity_subscription(answer: Value) -> Self {
+        Self::of(Body::ActivitySubscription(answer))
+    }
+
+    pub(in crate::private_tier) fn activity_subscriptions(subscriptions: Vec<Value>, cursor: Option<String>) -> Self {
+        Self::of(Body::ActivitySubscriptions { subscriptions, cursor })
+    }
+
     pub(in crate::private_tier) fn empty() -> Self {
         Self::of(Body::Empty)
     }
@@ -444,7 +459,13 @@ impl PrivateResponse {
             Body::Replies { replies, cursor } => (replies.is_empty(), cursor),
             Body::Notifications { notifications, cursor, .. } => (notifications.is_empty(), cursor),
             Body::Search { posts, cursor } => (posts.is_empty(), cursor),
-            Body::Posts(_) | Body::Thread(_) | Body::UnreadCount(_) | Body::NotificationPreferences(_) | Body::Empty => {
+            Body::ActivitySubscriptions { subscriptions, cursor } => (subscriptions.is_empty(), cursor),
+            Body::Posts(_)
+            | Body::Thread(_)
+            | Body::UnreadCount(_)
+            | Body::NotificationPreferences(_)
+            | Body::ActivitySubscription(_)
+            | Body::Empty => {
                 return false;
             }
         };
@@ -513,6 +534,19 @@ impl Serialize for PrivateResponse {
                 if let Some(c) = cursor {
                     m.serialize_entry("cursor", c)?;
                 }
+            }
+            Body::ActivitySubscription(answer) => {
+                if let Value::Object(fields) = answer {
+                    for (k, v) in fields {
+                        m.serialize_entry(k, v)?;
+                    }
+                }
+            }
+            Body::ActivitySubscriptions { subscriptions, cursor } => {
+                if let Some(c) = cursor {
+                    m.serialize_entry("cursor", c)?;
+                }
+                m.serialize_entry("subscriptions", subscriptions)?;
             }
             Body::Empty => {}
         }

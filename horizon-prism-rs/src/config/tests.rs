@@ -157,6 +157,8 @@ search_posts = 0
 
 [private_notify]
 backfill_max_age_hours = 48
+activity_subscriptions_max = 1000
+subscribed_post_retry_secs = 120
 
 [private_search]
 scan_candidates = 300
@@ -1211,6 +1213,25 @@ fn reindex_retry_bounds() {
     for bad in [0, 3601] {
         let p = invalid_problems(load(&format!("[community]\nreindex_retry_secs = {bad}\n")));
         assert!(has(&p, "community.reindex_retry_secs must be 1 to 3600"), "{bad}: {p:?}");
+    }
+}
+
+/// Private activity subscriptions (private-activity-subs design §4.3): the
+/// cap 1000 by default, 1 to 3000; the fan-out's bound 120 s, 10 to 120.
+#[test]
+fn private_subscription_bounds() {
+    let notify = load("").expect("defaults").file.private_notify;
+    assert_eq!((notify.activity_subscriptions_max, notify.subscribed_post_retry_secs), (1000, 120));
+    let ok = load("[private_notify]\nactivity_subscriptions_max = 3000\nsubscribed_post_retry_secs = 10\n").expect("bounds");
+    assert_eq!(ok.file.private_notify.activity_subscriptions_max, 3000);
+    for (toml, problem) in [
+        ("activity_subscriptions_max = 0\n", "private_notify.activity_subscriptions_max must be 1 to 3000"),
+        ("activity_subscriptions_max = 3001\n", "private_notify.activity_subscriptions_max must be 1 to 3000"),
+        ("subscribed_post_retry_secs = 0\n", "private_notify.subscribed_post_retry_secs must be 10 to 120"),
+        ("subscribed_post_retry_secs = 121\n", "private_notify.subscribed_post_retry_secs must be 10 to 120"),
+    ] {
+        let p = invalid_problems(load(&format!("[private_notify]\n{toml}")));
+        assert!(has(&p, problem), "{toml}: {p:?}");
     }
 }
 

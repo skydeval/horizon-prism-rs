@@ -597,6 +597,14 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     if u64::from(search.span_hours) > 24 * u64::from(search.max_age_days) {
         out.push("private_search.span_hours must be at most 24 × private_search.max_age_days".to_string());
     }
+    // Private activity subscriptions (private-activity-subs design §4.3).
+    let notify = &cfg.private_notify;
+    if !(1..=3000).contains(&notify.activity_subscriptions_max) {
+        out.push("private_notify.activity_subscriptions_max must be 1 to 3000".to_string());
+    }
+    if !(10..=120).contains(&notify.subscribed_post_retry_secs) {
+        out.push("private_notify.subscribed_post_retry_secs must be 10 to 120".to_string());
+    }
     // The private-threads walk and paging (private-threads design §5).
     let read = &cfg.private_read;
     if !(1..=100).contains(&read.max_chain) {

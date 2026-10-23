@@ -546,11 +546,25 @@ pub struct PrivateNotifyConfig {
     /// many hours. So does a live update of a private post (a live create
     /// notifies at any age): a PDS rewriting its posts notifies no one again.
     pub backfill_max_age_hours: u32,
+    /// The most accounts one member may subscribe to privately
+    /// (`putActivitySubscription`, private-activity-subs design §4.1): 1 to
+    /// 3000, since Horizon reads the list to at most 30 pages of 100.
+    /// Separate from `activity_subscriptions.max_per_actor`.
+    pub activity_subscriptions_max: u32,
+    /// How long after a private post is first stored its subscribed-post
+    /// fan-out may still start an attempt (private-activity-subs design
+    /// §5.6): 10 to 120 seconds. Past it the post notifies nobody it has
+    /// not notified yet.
+    pub subscribed_post_retry_secs: u32,
 }
 
 impl Default for PrivateNotifyConfig {
     fn default() -> Self {
-        Self { backfill_max_age_hours: 48 }
+        Self {
+            backfill_max_age_hours: 48,
+            activity_subscriptions_max: 1000,
+            subscribed_post_retry_secs: 120,
+        }
     }
 }
 

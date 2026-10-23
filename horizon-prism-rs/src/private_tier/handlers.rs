@@ -61,6 +61,8 @@ pub const GET_NOTIFICATION_PREFERENCES: &str = "app.nearhorizon.private.getNotif
 pub const PUT_NOTIFICATION_PREFERENCES: &str = "app.nearhorizon.private.putNotificationPreferences";
 pub const GET_REPLIES: &str = "app.nearhorizon.private.getReplies";
 pub const SEARCH_POSTS: &str = "app.nearhorizon.private.searchPosts";
+pub const PUT_ACTIVITY_SUBSCRIPTION: &str = "app.nearhorizon.private.putActivitySubscription";
+pub const LIST_ACTIVITY_SUBSCRIPTIONS: &str = "app.nearhorizon.private.listActivitySubscriptions";
 
 /// `getAuthorFeed`'s `filter` values (P-20, §4.14; P-30); the first is the
 /// default.
@@ -151,6 +153,9 @@ pub struct PrivateState {
     pub(super) reads_factor: usize,
     /// The walk's cap and the batch bound (`[private_read]`, §3.2.1).
     pub(super) bounds: schema::ReadBounds,
+    /// `private_notify.activity_subscriptions_max` (private-activity-subs
+    /// design §4.1).
+    pub(super) subscriptions_max: u32,
 }
 
 impl PrivateState {
@@ -202,7 +207,16 @@ impl PrivateState {
             search: SearchBounds::from(&PrivateSearchConfig::default()),
             reads_factor: usize::try_from(cfg.page_reads_factor).unwrap_or(2).max(1),
             bounds: schema::ReadBounds::new(cfg.max_chain, cfg.walk_batch_max),
+            subscriptions_max: crate::config::PrivateNotifyConfig::default().activity_subscriptions_max,
         }
+    }
+
+    /// `putActivitySubscription` caps each member at `max` subscriptions
+    /// (`private_notify.activity_subscriptions_max`) rather than the default.
+    #[must_use]
+    pub(crate) fn with_activity_subscriptions_max(mut self, max: u32) -> Self {
+        self.subscriptions_max = max;
+        self
     }
 
     /// `searchPosts` scans by `cfg` (`[private_search]`) rather than the
@@ -247,6 +261,8 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(PUT_NOTIFICATION_PREFERENCES), post(put_notification_preferences))
         .route(&xrpc(GET_REPLIES), get(get_replies))
         .route(&xrpc(SEARCH_POSTS), get(search_posts))
+        .route(&xrpc(PUT_ACTIVITY_SUBSCRIPTION), post(put_activity_subscription))
+        .route(&xrpc(LIST_ACTIVITY_SUBSCRIPTIONS), get(list_activity_subscriptions))
         .with_state(state)
 }
 
@@ -2621,6 +2637,100 @@ pub async fn put_notification_preferences(
         Some(schema::merge_notification_prefs(&s.env.pool, &caller.did, &Value::Object(supplied)).await?)
     };
     Ok(ok(PrivateResponse::notification_preferences(complete_preferences(stored.as_ref()))))
+}
+
+/// `putActivitySubscription`'s input (private-activity-subs design §4.1
+/// step 2): `(subject, post, reply)`, checked from the input alone.
+fn subscription_input<'a>(input: &'a Value, caller: &str) -> Result<(&'a str, bool, bool), XrpcError> {
+    if !input.is_object() {
+        return Err(XrpcError::invalid("Error: input must be an object"));
+    }
+    let subject = field(input, "subject")?;
+    if !proto_blue::syntax::Did::is_valid(subject) {
+        return Err(XrpcError::invalid("Error: subject must be a valid did"));
+    }
+    if subject == caller {
+        return Err(XrpcError::invalid("Error: Cannot subscribe to own activity"));
+    }
+    let flags = input
+        .get("activitySubscription")
+        .filter(|v| v.is_object())
+        .ok_or_else(|| XrpcError::invalid("Error: Input must have the property \"activitySubscription\""))?;
+    let flag = |name: &str| {
+        flags
+            .get(name)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| XrpcError::invalid(format!("Error: activitySubscription.{name} must be a boolean")))
+    };
+    Ok((subject, flag("post")?, flag("reply")?))
+}
+
+/// `app.nearhorizon.private.putActivitySubscription {subject,
+/// activitySubscription: {post, reply}}` (private-activity-subs design §4.1)
+/// → `{subject, activitySubscription?}`: turns the caller's notifications of
+/// `subject`'s new private posts and replies on or off. Any DID but the
+/// caller's own may be named, and nothing about it is read: the answer and
+/// its time depend only on the input and the caller's own rows. Off deletes
+/// the row; on keeps each kind's on-since time while it stays on. The cap is
+/// `private_notify.activity_subscriptions_max` (`LimitReached`). Whether a
+/// post notifies is decided when it is stored (the declaration, the follow,
+/// the audience). No floor.
+pub async fn put_activity_subscription(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private(&s.app, &headers, peer, PUT_ACTIVITY_SUBSCRIPTION).await?;
+    let input = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let (subject, post, reply) = subscription_input(&input, &caller.did)?;
+    if !post && !reply {
+        schema::subscription_delete(&s.env.pool, &caller.did, subject).await?;
+        return Ok(ok(PrivateResponse::activity_subscription(json!({"subject": subject}))));
+    }
+    // Under the scope read guard, so a `member_removed` or `account_deleted`
+    // marker (the write guard) cannot commit inside the upsert's
+    // transaction, and its purge sees the row.
+    let guard = s.app.hydrator.scope().read_guard().await;
+    let put = schema::subscription_put(&s.env.pool, &caller.did, subject, post, reply, s.subscriptions_max).await;
+    drop(guard);
+    match put? {
+        schema::SubscriptionPut::NotMember => Err(XrpcError::not_enrolled()),
+        schema::SubscriptionPut::LimitReached => Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "LimitReached",
+            format!("Error: private activity subscription limit reached ({})", s.subscriptions_max),
+        )),
+        schema::SubscriptionPut::Stored { post, reply } => Ok(ok(PrivateResponse::activity_subscription(json!({
+            "subject": subject,
+            "activitySubscription": {"post": post, "reply": reply},
+        })))),
+    }
+}
+
+/// `app.nearhorizon.private.listActivitySubscriptions {limit 1-100 default
+/// 50, cursor}` (private-activity-subs design §4.2) → `{cursor?,
+/// subscriptions: [{subject, activitySubscription}]}`: the caller's own
+/// rows, most recently changed first, with no profile hydrated. The cursor
+/// is the plain `updated_at::subject` of the last row: it walks the caller's
+/// own rows. No floor.
+pub async fn list_activity_subscriptions(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private(&s.app, &headers, peer, LIST_ACTIVITY_SUBSCRIPTIONS).await?;
+    let p = Params::parse(q.as_deref());
+    let limit = page_limit(&p)?;
+    let after = parse_cursor(p.one("cursor"))?;
+    let rows = schema::subscription_rows(&s.env.pool, &caller.did, after, i64::try_from(limit).unwrap_or(i64::MAX)).await?;
+    let next = (rows.len() == limit).then(|| rows.last().map(|r| cursor(r.updated_at, &r.subject))).flatten();
+    let items = rows
+        .into_iter()
+        .map(|r| json!({"subject": r.subject, "activitySubscription": {"post": r.post, "reply": r.reply}}))
+        .collect();
+    Ok(ok(PrivateResponse::activity_subscriptions(items, next)))
 }
 
 #[cfg(test)]

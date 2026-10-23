@@ -10,6 +10,24 @@ commit.
 
 ## [Unreleased]
 
+### Added (private activity subscriptions AS1, #839, #846)
+
+- **Private activity subscriptions, storage and methods.**
+  `app.nearhorizon.private.putActivitySubscription {subject,
+  activitySubscription: {post, reply}}` turns a member's notifications of
+  an account's new private posts and replies on or off, separately from
+  the public bell; `listActivitySubscriptions {limit, cursor}` lists the
+  member's own, most recently changed first, as `{subject,
+  activitySubscription}`. Any account but the member's own may be named
+  and nothing about it is read. Each kind keeps the time it was turned
+  on. The cap is `[private_notify] activity_subscriptions_max` (1000, at
+  most 3000), refused with `LimitReached`. The `account_deleted` and
+  `member_removed` purges remove a member's subscriptions and those naming
+  it. Not listed in `getMembership` yet, and nothing notifies yet.
+  Migration `0041_subscribe_private_tier` adds two tables and touches no
+  existing row; `[private_notify] subscribed_post_retry_secs` (120, 10 to
+  120) is read once the fan-out lands.
+
 ### Changed (private list blocks, #838, #840)
 
 - **List blocks count in the private read rule.** A member's list block

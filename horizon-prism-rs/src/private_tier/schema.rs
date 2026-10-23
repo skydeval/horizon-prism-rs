@@ -2252,6 +2252,128 @@ pub(super) async fn bookmarked(pool: &PgPool, viewer: &str, uris: &[String]) -> 
         .await
 }
 
+/// What `putActivitySubscription`'s upsert did (private-activity-subs
+/// design §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubscriptionPut {
+    /// The stored flags.
+    Stored { post: bool, reply: bool },
+    /// The caller is no longer a member (a removal after the gate): nothing
+    /// written.
+    NotMember,
+    /// A new subject past the cap: nothing written.
+    LimitReached,
+}
+
+/// Turn off `subscriber`'s private subscription to `subject`: the row goes.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn subscription_delete(pool: &PgPool, subscriber: &str, subject: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM private_activity_subscriptions WHERE subscriber_did = $1 AND subject_did = $2")
+        .bind(subscriber)
+        .bind(subject)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Turn on `subscriber`'s private subscription to `subject` for the kinds
+/// given (at least one), in one transaction: the member's puts serialize on
+/// an advisory lock, so the cap of `max` rows is exact; the membership is
+/// read again; a kind going from off to on takes `now()` as its on-since
+/// time, one staying on keeps its own, one turned off is cleared.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn subscription_put(
+    pool: &PgPool,
+    subscriber: &str,
+    subject: &str,
+    post: bool,
+    reply: bool,
+    max: u32,
+) -> Result<SubscriptionPut, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('private-subs ' || $1, 0))")
+        .bind(subscriber)
+        .execute(&mut *tx)
+        .await?;
+    let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM members WHERE did = $1)")
+        .bind(subscriber)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !member {
+        return Ok(SubscriptionPut::NotMember);
+    }
+    let (held, existing): (i64, bool) = sqlx::query_as(
+        "SELECT count(*), COALESCE(bool_or(subject_did = $2), false) FROM private_activity_subscriptions WHERE subscriber_did = $1",
+    )
+    .bind(subscriber)
+    .bind(subject)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !existing && held >= i64::from(max) {
+        return Ok(SubscriptionPut::LimitReached);
+    }
+    let (post, reply): (bool, bool) = sqlx::query_as(
+        "INSERT INTO private_activity_subscriptions (subscriber_did, subject_did, post_since, reply_since) \
+         VALUES ($1, $2, CASE WHEN $3 THEN now() END, CASE WHEN $4 THEN now() END) \
+         ON CONFLICT (subscriber_did, subject_did) DO UPDATE SET \
+           post_since = CASE WHEN $3 THEN COALESCE(private_activity_subscriptions.post_since, now()) END, \
+           reply_since = CASE WHEN $4 THEN COALESCE(private_activity_subscriptions.reply_since, now()) END, \
+           updated_at = now() \
+         RETURNING post_since IS NOT NULL, reply_since IS NOT NULL",
+    )
+    .bind(subscriber)
+    .bind(subject)
+    .bind(post)
+    .bind(reply)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(SubscriptionPut::Stored { post, reply })
+}
+
+/// One of the caller's private subscriptions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SubscriptionRow {
+    pub subject: String,
+    pub post: bool,
+    pub reply: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Up to `limit` of `subscriber`'s private subscriptions, most recently
+/// changed first, after the `updated_at::subject` cursor.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn subscription_rows(
+    pool: &PgPool,
+    subscriber: &str,
+    after: Option<(DateTime<Utc>, String)>,
+    limit: i64,
+) -> Result<Vec<SubscriptionRow>, sqlx::Error> {
+    let (at, subject) = after.map_or((None, String::new()), |(a, s)| (Some(a), s));
+    let rows: Vec<(String, bool, bool, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT subject_did, post_since IS NOT NULL, reply_since IS NOT NULL, updated_at \
+         FROM private_activity_subscriptions \
+         WHERE subscriber_did = $1 AND ($2::timestamptz IS NULL OR (updated_at, subject_did) < ($2, $3)) \
+         ORDER BY updated_at DESC, subject_did DESC LIMIT $4",
+    )
+    .bind(subscriber)
+    .bind(at)
+    .bind(subject)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(subject, post, reply, updated_at)| SubscriptionRow { subject, post, reply, updated_at }).collect())
+}
+
 /// A private post's valid threadgate (private posting §4.4): the gate in
 /// the post author's repo with the post's rkey.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]

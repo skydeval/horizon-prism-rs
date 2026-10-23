@@ -201,6 +201,11 @@ search_posts = 0
 # so a PDS rewriting its posts notifies no one again.
 [private_notify]
 backfill_max_age_hours = 48
+# Private activity subscriptions: the most accounts one member may subscribe
+# to privately (1 to 3000), and how long after a private post is first stored
+# its subscribed-post notifications may still be decided (10 to 120 seconds).
+activity_subscriptions_max = 1000
+subscribed_post_retry_secs = 120
 
 # Private search (private posting §4.17): a bounded scan at query time, with no
 # index of decoded text. A page reads at most scan_candidates private posts the

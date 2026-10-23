@@ -110,6 +110,8 @@ mod tests {
             "0039_chain_rev",
             // Refract R2 (#830).
             "0040_refract",
+            // Private activity subscriptions AS1 (#839).
+            "0041_subscribe_private_tier",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

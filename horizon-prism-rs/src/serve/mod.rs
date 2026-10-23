@@ -905,7 +905,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
         crate::cursor_key::CursorKey::new(cfg.env.private_cursor_key.expose()),
     )
     .with_search(&cfg.file.private_search)
-    .with_plaintext_refused(cfg.file.private_any_pds.enabled);
+    .with_plaintext_refused(cfg.file.private_any_pds.enabled)
+    .with_activity_subscriptions_max(cfg.file.private_notify.activity_subscriptions_max);
     log_floors(&cfg.file.private_read.floor_ms);
     tracing::info!(
         event = "private_any_pds",

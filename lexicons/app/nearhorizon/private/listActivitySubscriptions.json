@@ -1,0 +1,64 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.listActivitySubscriptions",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List the requester's private activity subscriptions (putActivitySubscription), most recently changed first. Each item is the subject's DID and its flags; no profile is included. Only the requester's own subscriptions: no method lists who subscribes to an account. Requires auth by a ready community member.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque pagination cursor from a previous response."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["subscriptions"],
+          "properties": {
+            "cursor": {
+              "type": "string",
+              "description": "Present when the page was full: more of the requester's subscriptions may follow."
+            },
+            "subscriptions": {
+              "type": "array",
+              "items": { "type": "ref", "ref": "#subscription" }
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        },
+        {
+          "name": "Reindexing",
+          "description": "The caller's account is being re-indexed after an interruption; retry after `retryAfter` seconds (in the body; also the Retry-After header). Not NotReady: the caller is still a member."
+        }
+      ]
+    },
+    "subscription": {
+      "type": "object",
+      "required": ["subject", "activitySubscription"],
+      "properties": {
+        "subject": { "type": "string", "format": "did" },
+        "activitySubscription": { "type": "ref", "ref": "app.bsky.notification.defs#activitySubscription" }
+      }
+    }
+  }
+}
