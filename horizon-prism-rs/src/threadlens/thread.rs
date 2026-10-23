@@ -47,6 +47,7 @@ use crate::db::locks::uri_author;
 use crate::farsight::{Farsight, Lookup};
 use crate::hydration::lens::{Bridging, LensGate, LensNode, named_accounts};
 use crate::hydration::normalize::is_private_uri;
+use crate::hydration::thread::BLOCKED_CHAIN_MARK;
 use crate::hydration::{HydrationError, KnownBlocks, Viewer, with_known_blocks};
 use crate::xrpc::pools::Requester;
 
@@ -189,16 +190,35 @@ fn baseline_node(v: &Value, parent_uri: Option<String>, judge: &Judge) -> Option
     Some(LensNode::gap(&uri, parent_uri, gap))
 }
 
+/// The parent links the baseline knows above its blocked stubs, which end
+/// the ordinary view's chain ([`BLOCKED_CHAIN_MARK`]): each URI's parent.
+/// Links only, read by the walk above a known-block gap.
+fn chain_links(chain: &[&Value]) -> HashMap<String, String> {
+    let mut links = HashMap::new();
+    for node in chain {
+        let (Some(uri), Some(above)) = (node.get("uri").and_then(Value::as_str), node.get(BLOCKED_CHAIN_MARK).and_then(Value::as_array)) else {
+            continue;
+        };
+        let mut below = uri.to_string();
+        for p in above.iter().filter_map(Value::as_str) {
+            links.entry(below).or_insert_with(|| p.to_string());
+            below = p.to_string();
+        }
+    }
+    links
+}
+
 /// The ordinary view's tree, flattened: parents root-most first, the
 /// anchor, replies breadth-first. The second value is each reply's level
-/// below the anchor.
-fn flatten(tree: &Value, judge: &Judge) -> (Vec<LensNode>, HashMap<String, u32>) {
+/// below the anchor; the third, [`chain_links`].
+fn flatten(tree: &Value, judge: &Judge) -> (Vec<LensNode>, HashMap<String, u32>, HashMap<String, String>) {
     let mut chain: Vec<&Value> = Vec::new();
     let mut cur = tree.get("parent");
     while let Some(p) = cur.filter(|p| p.is_object()) {
         chain.push(p);
         cur = p.get("parent");
     }
+    let links = chain_links(&chain);
     chain.reverse();
     let mut nodes = Vec::new();
     let mut levels = HashMap::new();
@@ -210,7 +230,7 @@ fn flatten(tree: &Value, judge: &Judge) -> (Vec<LensNode>, HashMap<String, u32>)
         }
     }
     let Some(anchor) = baseline_node(tree, above, judge) else {
-        return (Vec::new(), levels);
+        return (Vec::new(), levels, links);
     };
     let anchor_uri = anchor.uri().to_string();
     levels.insert(anchor_uri.clone(), 0);
@@ -231,7 +251,7 @@ fn flatten(tree: &Value, judge: &Judge) -> (Vec<LensNode>, HashMap<String, u32>)
         level = next;
         depth += 1;
     }
-    (nodes, levels)
+    (nodes, levels, links)
 }
 
 /// `#viewBlocked` for an embedded record by a blocked author: the URI,
@@ -372,6 +392,9 @@ struct Work<'a> {
     /// The position a `repliesCursor` request resumes the anchor's
     /// sequence from, and the cursor as it was sent.
     start: Option<(Position, String)>,
+    /// The parent links the baseline knows above its blocked stubs
+    /// ([`chain_links`]).
+    links: HashMap<String, String>,
 }
 
 impl Work<'_> {
@@ -492,16 +515,26 @@ impl Work<'_> {
     }
 
     /// The parent of the chain's top node, when the walk may name it: a
-    /// post's own reply ref, or, above a known-block gap, the parent a
-    /// local row names. It is never fetched from a source for a gap, since
-    /// that would fetch the blocked author's record.
+    /// post's own reply ref, or, above a known-block gap (`blocked-by-you`
+    /// or `blocking-you`), the first of: the link the baseline gave it; the
+    /// link the baseline knows above its blocked stubs; the parent a local
+    /// row names; the parent the blocked post's record names, read through
+    /// the record source (design-v4 §5.15.11, as amended by skydeval
+    /// 2026-10-24). Only that URI is read from the record: nothing else of
+    /// the blocked post is kept or sent.
     async fn parent_of_top(&self) -> Result<Option<String>, sqlx::Error> {
+        let h = self.ladder.hydrator();
         Ok(match self.nodes.first() {
             Some(LensNode::Post { parent_uri, .. }) => parent_uri.clone(),
-            Some(LensNode::Gap { uri, gap, parent_uri, .. }) if gap.known_block() => match parent_uri {
-                Some(p) => Some(p.clone()),
-                None => self.ladder.hydrator().lens_local_rows(std::slice::from_ref(uri)).await?.remove(uri).flatten(),
-            },
+            Some(LensNode::Gap { uri, gap, parent_uri, .. }) if gap.known_block() => {
+                if let Some(p) = parent_uri.clone().or_else(|| self.links.get(uri).cloned()) {
+                    return Ok(Some(p));
+                }
+                match h.lens_local_rows(std::slice::from_ref(uri)).await?.remove(uri) {
+                    Some(row) => row,
+                    None => h.lens_record_parent(self.r.req, uri).await?,
+                }
+            }
             _ => None,
         })
     }
@@ -517,9 +550,9 @@ impl Work<'_> {
             let Some(parent) = self.parent_of_top().await? else {
                 return Ok(());
             };
-            // A known-block gap's parent, named by a local row or the
-            // baseline (never the hidden record), is written whether or not
-            // the walk goes on: a bound leaves `moreParents` and the link.
+            // A known-block gap's parent (the link alone, never anything
+            // else of the hidden post) is written whether or not the walk
+            // goes on: a bound leaves `moreParents` and the link.
             if let Some(LensNode::Gap { parent_uri, .. }) = self.nodes.first_mut()
                 && parent_uri.is_none()
             {
@@ -1045,7 +1078,7 @@ pub async fn get_thread(
         },
         None => (None, None),
     };
-    let (nodes, levels) = tree.as_ref().map(|tree| flatten(tree, &judge)).unwrap_or_default();
+    let (nodes, levels, links) = tree.as_ref().map(|tree| flatten(tree, &judge)).unwrap_or_default();
     let bridging = judge.bridging();
     let mut work = Work {
         ladder,
@@ -1065,6 +1098,7 @@ pub async fn get_thread(
         listing_timeout: std::time::Duration::from_millis(u64::from(cfg.listing_timeout_ms)),
         anchor_page,
         start: cursor,
+        links,
     };
     phases.mark("emit");
     let attach = if work.nodes.is_empty() { work.anchor_alone().await? } else { true };
@@ -1316,6 +1350,7 @@ pub async fn resolve(
         listing_timeout: std::time::Duration::from_millis(u64::from(cfg.listing_timeout_ms)),
         anchor_page: None,
         start: None,
+        links: HashMap::new(),
     };
     let fetches: Vec<String> = uris
         .iter()
@@ -1385,7 +1420,8 @@ mod tests {
             {"$type": "app.bsky.feed.defs#blockedPost", "uri": uri(A, "others"), "blocked": true},
             {"$type": "app.bsky.feed.defs#notFoundPost", "uri": uri(A, "gone"), "notFound": true},
         ]);
-        let (nodes, levels) = flatten(&tree, &judge);
+        let (nodes, levels, links) = flatten(&tree, &judge);
+        assert!(links.is_empty());
         let got: Vec<(String, Option<&str>)> = nodes
             .iter()
             .map(|n| match n {
@@ -1409,6 +1445,22 @@ mod tests {
         assert_eq!((levels[&uri(A, "anchor")], levels[&uri(A, "r1")], levels[&uri(A, "r1a")]), (0, 1, 2));
         // A stub keeps the parent the tree placed it under.
         assert_eq!(nodes[3].parent_uri(), Some(uri(A, "anchor").as_str()));
+    }
+
+    /// A blocked parent stub that ends the ordinary chain hands the walk
+    /// the links above it, and the gap node is built from its URI alone.
+    #[tokio::test]
+    async fn a_blocked_stubs_chain_links_are_read_and_nothing_else() {
+        let judge = Judge::judged(V, &[B], &[], &[A]);
+        let mut tree = view(A, "anchor", Some(&uri(B, "b2")));
+        tree["parent"] = json!({"$type": "app.bsky.feed.defs#blockedPost", "uri": uri(B, "b2"), "blocked": true,
+            "author": {"did": B, "viewer": {"blocking": "x"}}});
+        tree["parent"][BLOCKED_CHAIN_MARK] = json!([uri(A, "v1"), uri(B, "b1"), uri(A, "root")]);
+        let (nodes, _, links) = flatten(&tree, &judge);
+        assert_eq!(nodes.len(), 2);
+        assert!(matches!(&nodes[0], LensNode::Gap { uri: u, gap: Gap::BlockedByYou, parent_uri: None, .. } if *u == uri(B, "b2")));
+        let want: HashMap<String, String> = [(uri(B, "b2"), uri(A, "v1")), (uri(A, "v1"), uri(B, "b1")), (uri(B, "b1"), uri(A, "root"))].into_iter().collect();
+        assert_eq!(links, want);
     }
 
     /// An embedded record by an author the viewer has a block with

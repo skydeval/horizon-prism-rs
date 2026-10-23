@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-use super::normalize::NormalizeReport;
+use super::normalize::{NormalizeReport, is_private_uri};
 use super::{CountMode, HydrationError, Hydrator, PublicEmit, Viewer};
 use crate::db::locks::uri_author;
 use crate::moderation::Gate;
@@ -583,6 +583,25 @@ impl Hydrator {
             .fetch_all(self.pool())
             .await?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// The parent a known-block gap's record names (design-v4 §5.15.11, as
+    /// amended by skydeval 2026-10-24): the record is read through the
+    /// record source and only its `reply.parent.uri` is kept. Nothing else
+    /// of it is returned, cached as a view, or emitted. `None` for a private
+    /// or hidden URI, a record that is not a reply, or no answer.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn lens_record_parent(&self, req: &Requester, uri: &str) -> Result<Option<String>, sqlx::Error> {
+        if is_private_uri(uri) || self.gate(req, uri).await?.is_hidden() {
+            return Ok(None);
+        }
+        let Some(record) = self.upstream().record(req, uri).await else {
+            return Ok(None);
+        };
+        Ok(record.pointer("/value/reply/parent/uri").and_then(Value::as_str).map(str::to_string))
     }
 
     /// The local phase of a post's reply sequence (§5.15.14): the stored

@@ -42,6 +42,12 @@ pub const DEFAULT_PARENT_HEIGHT: u32 = 80;
 /// endpoints are built from. Never part of a response.
 pub(super) const HIDDEN_MARK: &str = "hiddenByThreadgate";
 
+/// Set on a `#blockedPost` parent stub of the tree the internal assemblies
+/// (Thread Lens, V2) read: the URIs of the chain above it, nearest first,
+/// as the assembly already knows them from local rows and the records it
+/// fetched. Links only; never part of a response.
+pub const BLOCKED_CHAIN_MARK: &str = "blockedChainAbove";
+
 /// The replies the root's threadgate hides from this viewer.
 #[derive(Default)]
 struct Hidden {
@@ -121,22 +127,43 @@ impl PostContext {
         })
     }
 
-    /// The node for parent `uri`, or `None` where the chain was cut.
-    fn parent_node(&self, uri: &str, remaining: u32, remote: &Remote) -> Option<Value> {
+    /// The parent a chain post names: its local row's, else its fetched
+    /// record's.
+    fn link_of(&self, uri: &str, remote: &Remote) -> Option<String> {
+        self.posts.get(uri).and_then(|r| r.reply_parent_uri.clone()).or_else(|| remote.parent_of(uri))
+    }
+
+    /// The node for parent `uri`, or `None` where the chain was cut. With
+    /// `mark` (an internal assembly), a blocked stub carries
+    /// [`BLOCKED_CHAIN_MARK`]: the ordinary view still ends there.
+    fn parent_node(&self, uri: &str, remaining: u32, remote: &Remote, mark: bool) -> Option<Value> {
         if remote.cut.as_deref() == Some(uri) {
             return None;
         }
-        if let Some(b) = self.blocked_post(uri) {
+        if let Some(mut b) = self.blocked_post(uri) {
+            if mark {
+                let mut above: Vec<String> = Vec::new();
+                let mut cur = self.link_of(uri, remote);
+                while let Some(p) = cur.take() {
+                    if p == uri || above.contains(&p) || remote.cut.as_deref() == Some(p.as_str()) || is_private_uri(&p) {
+                        break;
+                    }
+                    cur = self.link_of(&p, remote);
+                    above.push(p);
+                }
+                if !above.is_empty() {
+                    b[BLOCKED_CHAIN_MARK] = json!(above);
+                }
+            }
             return Some(b);
         }
         let Some(post) = self.node_post(uri, remote).filter(|_| self.listable(uri)) else {
             return Some(not_found_post(uri));
         };
         let mut node = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": post});
-        let parent = self.posts.get(uri).and_then(|r| r.reply_parent_uri.clone()).or_else(|| remote.parent_of(uri));
         if remaining > 0
-            && let Some(parent) = parent
-            && let Some(above) = self.parent_node(&parent, remaining - 1, remote)
+            && let Some(parent) = self.link_of(uri, remote)
+            && let Some(above) = self.parent_node(&parent, remaining - 1, remote, mark)
         {
             node["parent"] = above;
         }
@@ -424,7 +451,9 @@ impl Hydrator {
     }
 
     /// The tree of `getPostThread`, with the root's threadgate view. With
-    /// `keep_hidden`, replies the gate hides stay in the tree, marked.
+    /// `keep_hidden` (the internal assemblies), replies the gate hides stay
+    /// in the tree, marked, and a blocked parent stub carries
+    /// [`BLOCKED_CHAIN_MARK`].
     ///
     /// # Errors
     ///
@@ -641,7 +670,7 @@ impl Hydrator {
         let mut thread = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": post});
         if parent_height > 0
             && let Some(parent) = &anchor_row.reply_parent_uri
-            && let Some(above) = ctx.parent_node(parent, parent_height - 1, &remote)
+            && let Some(above) = ctx.parent_node(parent, parent_height - 1, &remote, keep_hidden)
         {
             thread["parent"] = above;
         }

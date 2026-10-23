@@ -10,6 +10,10 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (Thread Lens: walking up past a block, #895)
+
+- **`threadLens.getThread` now walks up past a blocked post that is not stored here.** Before, when the viewer had a block with a non-member (with public indexing off), the parent chain ended at that author's post: the client showed the blocked-post placeholder and nothing above it. Now the link above a `blocked-by-you` or `blocking-you` gap comes from the first source that has it: the links the ordinary view already read, the post's stored row, or the post's record (only its `reply.parent.uri`, read through Slingshot, skydeval's decision 2026-10-24). The walk then goes on to the thread's start, past further blocked posts, within `parentHeight` and the page budget as before. The gap still carries only `uri`, `gap`, `parentUri` and `moreParents`. Bridging off (the ordinary view) is unchanged.
+
 ### Added (Refract: reposts of restored posts, #888)
 
 - **Reposts of restored posts are stored, by anyone** (skydeval's amendment to Refract's D-2, 2026-10-24; design `refract-reposts-v1.md`). A repost of a public post whose author is restored is admitted in every mode when no other rule stores it (`AdmitRule::RestoredSubject`); only the repost record. A repost of a private post, a like, a reply or a quote is decided as before, and a purge's rejection of the reposter stands.

@@ -1144,3 +1144,178 @@ async fn the_parent_walk_goes_past_a_blocked_author() {
     assert_eq!(got.bridging, Bridging::Off);
     db.drop_db().await;
 }
+
+/// Each node's URI and gap label, in order.
+fn shape_of(nodes: &[LensNode]) -> Vec<(String, Option<&'static str>)> {
+    nodes
+        .iter()
+        .map(|n| match n {
+            LensNode::Post { uri, .. } => (uri.clone(), None),
+            LensNode::Gap { uri, gap, .. } => (uri.clone(), Some(gap.label())),
+        })
+        .collect()
+}
+
+/// A post view as an upstream source builds it, replying to `parent`. A
+/// blocked post's (text "secret …") author is `blocked.test`.
+fn upstream_view(uri: &str, did: &str, text: &str, parent: Option<&str>, root: &str) -> Value {
+    let mut record = json!({"$type": "app.bsky.feed.post", "text": text, "createdAt": "2026-09-26T00:00:00Z"});
+    if let Some(parent) = parent {
+        record["reply"] = json!({"parent": {"uri": parent, "cid": "c"}, "root": {"uri": root, "cid": "c"}});
+    }
+    let handle = if text.starts_with("secret") { "blocked.test" } else { "shown.test" };
+    json!({"$type": "app.bsky.feed.defs#postView", "uri": uri, "cid": "bafy",
+           "author": {"did": did, "handle": handle, "viewer": {}, "labels": []},
+           "record": record, "indexedAt": "2026-09-26T00:00:00Z", "viewer": {}, "labels": []})
+}
+
+/// Every gap node sent carries its URI, gap and links, and nothing of the
+/// blocked post: no text, no author, no handle.
+fn assert_bare_gaps(anchor: &str, got: &thread::Thread) {
+    let emitted = serde_json::to_value(crate::hydration::lens::lens_thread(anchor, &got.nodes, got.bridging, true)).expect("json");
+    for node in emitted["nodes"].as_array().expect("nodes") {
+        if node["$type"] == "app.nearhorizon.threadLens.defs#gapNode" {
+            let keys: Vec<&str> = node.as_object().expect("object").keys().map(String::as_str).collect();
+            assert!(keys.iter().all(|k| ["$type", "uri", "gap", "parentUri", "moreParents"].contains(k)), "{node}");
+        }
+    }
+    let body = emitted.to_string();
+    assert!(!body.contains("secret") && !body.contains("blocked.test"), "{body}");
+}
+
+/// #895: the walk goes up past a blocked post that has no local row (a
+/// non-member's post, public indexing off), several times, taking each link
+/// from the baseline, which read the chain to build the ordinary view. The
+/// same for a post by an author who blocks the viewer. No record is fetched
+/// for it, nothing of the blocked posts is sent, and with bridging off the
+/// response is still the ordinary view, which ends at the first block.
+#[tokio::test]
+async fn the_walk_goes_past_blocked_posts_with_no_local_row() {
+    use crate::hydration::testing::{FixedUpstream, hydrator_with_upstream_and_farsight};
+
+    let Some(db) = fresh_db("threadlens_walk_no_row").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(R1, "r1.test"), (R2, "r2.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    // The viewer blocks R1; R2 blocks the viewer.
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{R2}/app.bsky.graph.block/3kc', '{R2}', '{VIEWER_A}', '3kaaaaaaaaaa2', now())")).await;
+    let at = |did: &str, rkey: &str| format!("at://{did}/app.bsky.feed.post/{rkey}");
+    let mut up = FixedUpstream::default();
+    // A back-and-forth: the viewer's posts are stored, the other side's
+    // are not. root ← b1 ← v1 ← b2 ← anchor.
+    let mut cases = Vec::new();
+    for (other, t, label) in [(R1, "a", "blocked-by-you"), (R2, "b", "blocking-you")] {
+        let root = post(p, VIEWER_A, &format!("3kroot{t}"), "root", None, None).await;
+        let b1 = at(other, &format!("3kb1{t}"));
+        let v1 = post(p, VIEWER_A, &format!("3kv1{t}"), "v1", Some(&b1), Some(&root)).await;
+        let b2 = at(other, &format!("3kb2{t}"));
+        let anchor = post(p, VIEWER_A, &format!("3kanchor{t}"), "anchor", Some(&b2), Some(&root)).await;
+        up.posts.insert(b1.clone(), upstream_view(&b1, other, "secret b1", Some(&root), &root));
+        up.posts.insert(b2.clone(), upstream_view(&b2, other, "secret b2", Some(&v1), &root));
+        cases.push((label, root, b1, v1, b2, anchor));
+    }
+    let up = Arc::new(up);
+    let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
+    let h = hydrator_with_upstream_and_farsight(p, ScopeSets::default(), Arc::clone(&up) as _, farsight);
+    let base = fake_upstream(Arc::new(Calls::default()), None).await;
+    let l = ladder(h, &base, Arc::new(StubLookup::default()));
+    let (req, viewer, key, cfg) = (Requester::test(), member(VIEWER_A), CursorKey::generated(), ThreadLensConfig::default());
+
+    for (label, root, b1, v1, b2, anchor) in &cases {
+        let request = thread::Request { viewer: &viewer, req: &req, anchor: anchor.as_str(), depth: 0, parent_height: 80 };
+        up.take_modes();
+        let got = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+        let want = [(root.clone(), None), (b1.clone(), Some(*label)), (v1.clone(), None), (b2.clone(), Some(*label)), (anchor.clone(), None)];
+        assert_eq!(shape_of(&got.nodes), want, "{label}");
+        assert_eq!(got.nodes[1].parent_uri(), Some(root.as_str()), "{label}");
+        assert_eq!(got.nodes[3].parent_uri(), Some(v1.as_str()), "{label}");
+        assert!(got.nodes.iter().all(|n| !n.markers().more_parents), "{label}");
+        assert_eq!(got.bridging, Bridging::Full, "{label}");
+        assert!(!up.take_modes().iter().any(|(call, _)| call.starts_with("record ")), "{label}: the baseline's links, no record fetched");
+        assert_bare_gaps(anchor, &got);
+
+        // `parentHeight` still bounds the walk: the gap names its parent and
+        // says there is more.
+        let short = thread::Request { parent_height: 1, ..request };
+        let got = thread::get_thread(&l, &cfg, &key, short, None).await.expect("thread");
+        assert_eq!(shape_of(&got.nodes), [(b2.clone(), Some(*label)), (anchor.clone(), None)], "{label}");
+        let emitted = serde_json::to_value(crate::hydration::lens::lens_thread(anchor, &got.nodes, got.bridging, true)).expect("json");
+        assert_eq!(
+            emitted["nodes"][0],
+            json!({"$type": "app.nearhorizon.threadLens.defs#gapNode", "uri": b2, "gap": label, "parentUri": v1, "moreParents": true})
+        );
+    }
+
+    // Bridging off: the ordinary view, which ends at the block and names no
+    // parent for it.
+    *fake.level.lock().expect("level") = "partial";
+    for (label, _, _, _, b2, anchor) in &cases {
+        let request = thread::Request { viewer: &viewer, req: &req, anchor: anchor.as_str(), depth: 0, parent_height: 80 };
+        let got = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+        assert_eq!(shape_of(&got.nodes), [(b2.clone(), Some(*label)), (anchor.clone(), None)], "{label}");
+        assert_eq!(got.nodes[0].parent_uri(), None, "{label}");
+        assert_eq!(got.bridging, Bridging::Off);
+        assert_bare_gaps(anchor, &got);
+    }
+    db.drop_db().await;
+}
+
+/// #895: where the baseline does not know the link above a blocked post (an
+/// upstream thread that ends at the block), the walk reads it from the
+/// blocked post's record, and only that: twice here, past two blocked
+/// posts. Nothing of either record is sent.
+#[tokio::test]
+async fn the_walk_reads_the_link_above_a_blocked_post_from_its_record() {
+    use crate::hydration::testing::{FixedUpstream, hydrator_with_upstream_and_farsight};
+
+    let Some(db) = fresh_db("threadlens_walk_record_link").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(AUTHOR, "author.test"), (R1, "r1.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    let at = |did: &str, rkey: &str| format!("at://{did}/app.bsky.feed.post/{rkey}");
+    // root ← b1 ← v1 ← b2 ← anchor; the anchor is not stored, so the
+    // baseline is an upstream thread, which ends at b2.
+    let root = post(p, VIEWER_A, "3kroot22222", "root", None, None).await;
+    let b1 = at(R1, "3kb122222");
+    let v1 = post(p, VIEWER_A, "3kv122222", "v1", Some(&b1), Some(&root)).await;
+    let b2 = at(R1, "3kb222222");
+    let anchor = at(AUTHOR, "3kanchor2222");
+    let record = |parent: &str, text: &str| {
+        json!({"uri": "", "cid": "c", "value": {"$type": "app.bsky.feed.post", "text": text, "createdAt": "2026-09-26T00:00:00Z",
+               "reply": {"parent": {"uri": parent, "cid": "c"}, "root": {"uri": root, "cid": "c"}}}})
+    };
+    let mut up = FixedUpstream::default();
+    up.records.insert(b1.clone(), record(&root, "secret b1"));
+    up.records.insert(b2.clone(), record(&v1, "secret b2"));
+    let thread = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": upstream_view(&anchor, AUTHOR, "anchor", Some(&b2), &root),
+                        "parent": {"$type": "app.bsky.feed.defs#blockedPost", "uri": b2, "blocked": true, "author": {"did": R1, "handle": "blocked.test"}},
+                        "replies": []});
+    up.threads.insert(anchor.clone(), json!({"thread": thread}));
+    let up = Arc::new(up);
+    let (farsight, _fake) = crate::farsight::lookup::tests::engine("").await;
+    let h = hydrator_with_upstream_and_farsight(p, ScopeSets::default(), Arc::clone(&up) as _, farsight);
+    let base = fake_upstream(Arc::new(Calls::default()), None).await;
+    let l = ladder(h, &base, Arc::new(StubLookup::default()));
+    let (req, viewer, key, cfg) = (Requester::test(), member(VIEWER_A), CursorKey::generated(), ThreadLensConfig::default());
+
+    let request = thread::Request { viewer: &viewer, req: &req, anchor: &anchor, depth: 0, parent_height: 80 };
+    let got = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    let want = [(root.clone(), None), (b1.clone(), Some("blocked-by-you")), (v1.clone(), None), (b2.clone(), Some("blocked-by-you")), (anchor.clone(), None)];
+    assert_eq!(shape_of(&got.nodes), want);
+    assert_eq!(got.nodes[1].parent_uri(), Some(root.as_str()));
+    assert_eq!(got.nodes[3].parent_uri(), Some(v1.as_str()));
+    let records: Vec<String> = up.take_modes().into_iter().map(|(call, _)| call).filter(|call| call.starts_with("record ")).collect();
+    assert_eq!(records, [format!("record {b2}"), format!("record {b1}")]);
+    assert_bare_gaps(&anchor, &got);
+    db.drop_db().await;
+}
