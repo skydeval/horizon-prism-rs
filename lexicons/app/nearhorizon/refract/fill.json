@@ -20,10 +20,10 @@
           "properties": {
             "servedAs": { "type": "string", "knownValues": ["member", "visitor"], "description": "The form this answer was served in: `member` (a ready member, with its stored viewer state) or `visitor` (anyone else)." },
             "viewerChecked": { "type": "ref", "ref": "app.nearhorizon.refract.defs#viewerChecked" },
-            "withheld": { "type": "array", "items": { "type": "ref", "ref": "app.nearhorizon.refract.defs#withheld" }, "description": "Named items held back for a reason that is not final. A named item absent from profiles, posts, pending and withheld is final: not hosted by a listed community, rejected, taken down here, deleted or not restored." },
+            "withheld": { "type": "array", "items": { "type": "ref", "ref": "app.nearhorizon.refract.defs#withheld" }, "description": "Named items held back for a reason that is not final. A named item that is not returned is final (not hosted by a listed community, rejected, taken down here, deleted or not restored) unless it is in `withheld` or `pending`, or it is a URI whose author is in `pending`." },
             "profiles": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.actor.defs#profileViewDetailed" } },
             "posts": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.feed.defs#postView" } },
-            "pending": { "type": "array", "items": { "type": "string", "format": "did" }, "description": "Accounts accepted for checking and not served yet. An account whose check found it on no listed community is left out for a day." }
+            "pending": { "type": "array", "items": { "type": "string", "format": "did" }, "description": "Accounts accepted for checking and not served yet. An account whose check found it on no listed community is left out for a day. A named URI whose author is here is not final either." }
           }
         }
       },

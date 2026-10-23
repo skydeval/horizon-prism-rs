@@ -10,6 +10,10 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract fill: unavailable, #855, #866)
+
+- **`fill` names what it couldn't fetch.** A `withheld` reason `unavailable` (not final) for a named restored profile or post left out because it couldn't be fetched this time: a post neither stored nor returned upstream (not hidden by the gate and not seen deleted), or a restored account with no stored profile record and no remote view (no AppView answered and Slingshot gave no `RecordNotFound`), which before came back as a bare stub. Hidden, taken-down and seen-deleted items stay final and unlisted. The `fill` lexicon now says an absent item is final unless it is in `withheld` or `pending`, or is a URI whose author is in `pending`.
+
 ### Added (Refract answer metadata, #855, #864)
 
 - **`servedAs` on every Refract answer.** Each `app.nearhorizon.refract.*` answer names the form the gate served it in: `member` (a ready member, with its stored viewer state) or `visitor`.

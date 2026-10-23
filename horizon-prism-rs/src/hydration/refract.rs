@@ -120,9 +120,26 @@ impl Hydrator {
         withheld: &[(String, &'static str)],
     ) -> Result<PublicEmit<Value>, HydrationError> {
         let mut out_profiles = Vec::new();
+        let mut missing_profiles: Vec<String> = Vec::new();
         for did in profiles {
-            if let Ok(view) = self.get_profile(viewer, req, did).await? {
-                out_profiles.push(view.inner().clone());
+            // No stored profile record and no remote view (none answered,
+            // and no `RecordNotFound` remembered): the view would be a bare
+            // stub, so the profile is unavailable, not served.
+            let stored: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM actors WHERE did = $1 AND profile_record IS NOT NULL)")
+                .bind(did)
+                .fetch_one(self.pool())
+                .await?;
+            if !stored
+                && !NO_PROFILE.contains_key(did)
+                && self.refract_profiles(req, std::slice::from_ref(did), &HashMap::new()).await.is_empty()
+                && !NO_PROFILE.contains_key(did)
+            {
+                missing_profiles.push(did.clone());
+                continue;
+            }
+            match self.get_profile(viewer, req, did).await? {
+                Ok(view) => out_profiles.push(view.inner().clone()),
+                Err(_) => missing_profiles.push(did.clone()),
             }
         }
         let mut out_posts: Vec<Value> = Vec::new();
@@ -137,6 +154,25 @@ impl Hydrator {
         out_posts.retain(|p| p.get("uri").and_then(Value::as_str).is_some_and(|u| wanted.contains(&u.to_string())));
         let unanswered = super::known_blocks().map(|k| k.unanswered.clone()).unwrap_or_default();
         let mut held: Vec<Value> = withheld.iter().map(|(id, reason)| json!({"id": id, "reason": reason})).collect();
+        // RF-S14: a profile or post left out because it couldn't be fetched
+        // (not because the gate hides it or a delete was seen) is
+        // `unavailable`, not final.
+        let returned: HashSet<String> = out_posts.iter().filter_map(|p| p.get("uri").and_then(Value::as_str).map(str::to_string)).collect();
+        let missing_posts: Vec<String> = posts.iter().filter(|u| !returned.contains(*u)).cloned().collect();
+        if !missing_profiles.is_empty() || !missing_posts.is_empty() {
+            let subjects: Vec<String> = missing_profiles.iter().chain(missing_posts.iter()).cloned().collect();
+            let gates = self.gate_many(req, &subjects).await?;
+            let deleted: HashSet<String> = sqlx::query_scalar("SELECT uri FROM record_tombstones WHERE uri = ANY($1)")
+                .bind(&missing_posts)
+                .fetch_all(self.pool())
+                .await?
+                .into_iter()
+                .collect();
+            let hidden = |s: &str| gates.get(s).is_some_and(|g| g.is_hidden());
+            for id in subjects.iter().filter(|s| !hidden(s) && !deleted.contains(*s)) {
+                held.push(json!({"id": id, "reason": "unavailable"}));
+            }
+        }
         out_posts.retain(|p| {
             let Some(u) = p.get("uri").and_then(Value::as_str) else { return true };
             let Some(a) = uri_author(u).filter(|a| actors.blocked_either_way(a)) else { return true };

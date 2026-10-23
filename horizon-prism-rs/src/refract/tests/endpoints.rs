@@ -225,6 +225,32 @@ async fn fill_remembers_not_hosted() {
     db.drop_db().await;
 }
 
+/// RF-S14: a restored post or profile that couldn't be fetched is
+/// `withheld` as `unavailable`; a post this AppView saw deleted is left out
+/// as final, not listed.
+#[tokio::test]
+async fn fill_names_what_it_could_not_fetch() {
+    let Some(db) = fresh_db("refract_endpoint_unavailable").await else {
+        return;
+    };
+    let h = Harness::new(&db.pool, ScopeSets::default(), vec![tier1()]).await;
+    let uri = restored_subject(&h).await;
+    // A second restored account with nothing stored, and no upstream.
+    exec(&h.pool, &format!("INSERT INTO refract_dids (did, community, pds_host, state, source) VALUES ('{FOURTH}', 'sky', '127.0.0.1', 'restored', 'fill')")).await;
+    h.refract.apply_config().await.expect("load");
+    let unfetched = format!("at://{SUBJECT}/app.bsky.feed.post/3kunfetched");
+    let deleted = format!("at://{SUBJECT}/app.bsky.feed.post/3kdeleted");
+    exec(&h.pool, &format!("INSERT INTO record_tombstones (uri, rev) VALUES ('{deleted}', '3kaaaaaaaaaa9')")).await;
+    let base = serve(&h, None).await;
+    let q = format!("dids={SUBJECT}&dids={FOURTH}&uris={}&uris={}&uris={}", urlencode(&uri), urlencode(&unfetched), urlencode(&deleted));
+    let (status, body) = call(&base, FILL, &q, Some("bsky_appview")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["posts"].as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body["profiles"].as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body["withheld"], json!([{"id": FOURTH, "reason": "unavailable"}, {"id": unfetched, "reason": "unavailable"}]), "{body}");
+    db.drop_db().await;
+}
+
 fn urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }

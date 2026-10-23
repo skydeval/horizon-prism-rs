@@ -31,8 +31,8 @@
         "id": { "type": "string", "description": "The DID or at-URI as named." },
         "reason": {
           "type": "string",
-          "knownValues": ["unanswered", "capped", "proxied", "blocked"],
-          "description": "unanswered: the block check between a visitor and the account got no answer. capped: a discovery limit was reached, so no check was started. proxied: a visitor's call came through a proxy, so no check was started. blocked: the post's author and the caller block each other, either way."
+          "knownValues": ["unanswered", "capped", "proxied", "blocked", "unavailable"],
+          "description": "unanswered: the block check between a visitor and the account got no answer. capped: a discovery limit was reached, so no check was started. proxied: a visitor's call came through a proxy, so no check was started. blocked: the post's author and the caller block each other, either way. unavailable: the profile or post could not be fetched this time (a failed or empty fetch, locally or upstream); ask again later."
         }
       }
     }
