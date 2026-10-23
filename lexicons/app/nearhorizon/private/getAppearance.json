@@ -4,10 +4,15 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Get the requester's appearance setting. Requires auth by a community member, ready or not.",
+      "description": "Get the requester's appearance setting. Requires auth. A community member is served, ready or not; anyone else gets NotEnrolled unless includeRetained finds a setting kept for it.",
       "parameters": {
         "type": "params",
-        "properties": {}
+        "properties": {
+          "includeRetained": {
+            "type": "boolean",
+            "description": "Also answer a setting kept after the requester stopped being a member, marked retainedUntil; served to the requester whether or not it is a member now. Without it, a kept setting is not answered."
+          }
+        }
       },
       "output": {
         "encoding": "application/json",
@@ -16,7 +21,7 @@
       "errors": [
         {
           "name": "NotEnrolled",
-          "description": "The caller is not a community member of this AppView."
+          "description": "The caller is not a community member of this AppView, and has no kept setting (or did not ask for one with includeRetained)."
         }
       ]
     }

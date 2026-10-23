@@ -1,0 +1,34 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.releaseAppearance",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Delete the requester's appearance setting kept after it stopped being a member (getAppearance with includeRetained answers it with retainedUntil), if rev is its rev. Idempotent: with no kept setting (already released, past retainedUntil whether or not it has been deleted yet, or never kept) it succeeds with the same empty answer and does nothing; rev is checked only against a kept setting. Requires auth; not for current members, whose setting changes only through putAppearance.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["rev"],
+          "properties": {
+            "rev": { "type": "string" }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": { "type": "object", "properties": {} }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "The input is malformed, or the caller is a community member."
+        },
+        {
+          "name": "InvalidSwap",
+          "description": "A setting is kept for the requester and rev is not its rev. Nothing was deleted; read it again with getAppearance and includeRetained."
+        }
+      ]
+    }
+  }
+}

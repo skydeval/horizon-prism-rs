@@ -9,7 +9,9 @@
 //! - `private_subscribed_post_queue` and
 //!   `private_subscribed_post_queue_lag_seconds`: the subscribed-post
 //!   fan-out's rows not done, and the oldest one's age (private-activity-subs
-//!   design §12).
+//!   design §12);
+//! - `appearance_retained_rows`: appearance rows kept after a removal
+//!   (private-appearance amendment 1 §10).
 //!
 //! The last event is kept in process. At a start, before the first event,
 //! it is the newest private row's `indexed_at`, so a restart does not hide
@@ -110,6 +112,9 @@ pub(crate) async fn sample(pool: &PgPool) -> Result<(), sqlx::Error> {
     #[allow(clippy::cast_precision_loss)]
     metrics::gauge!(super::fanout::METRIC_QUEUE).set(queued as f64);
     metrics::gauge!(super::fanout::METRIC_QUEUE_LAG).set(lag);
+    let retained = super::schema::appearance_retained_count(pool).await?;
+    #[allow(clippy::cast_precision_loss)]
+    metrics::gauge!(super::appearance::METRIC_RETAINED_ROWS).set(retained as f64);
     if age > STALE_AFTER_SECS && rows_exist(pool).await? {
         tracing::warn!(
             event = "private_tier_ingest_stale",

@@ -249,6 +249,7 @@ pub const SERVED: &[Served] = &[
     served("app.nearhorizon.private.listActivitySubscriptions", Family::Private, false),
     served("app.nearhorizon.private.getAppearance", Family::Private, false),
     served("app.nearhorizon.private.putAppearance", Family::Private, false),
+    served("app.nearhorizon.private.releaseAppearance", Family::Private, false),
     served("app.nearhorizon.threadLens.getThread", Family::ThreadLens, false),
     served("app.nearhorizon.threadLens.resolve", Family::ThreadLens, false),
     served("app.nearhorizon.index.requestRecord", Family::IndexRequest, false),

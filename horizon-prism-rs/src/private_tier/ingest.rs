@@ -1320,10 +1320,58 @@ async fn purge_notifications(conn: &mut PgConnection, did: &str, limit: i64) -> 
     Ok(n)
 }
 
-/// The member's appearance setting, one row at most (private-appearance
-/// design §3.2: the `account_deleted` and `member_removed` purges).
+/// The account's appearance setting, one row at most, live or retained
+/// (private-appearance design §3.2: the `account_deleted` purge; the
+/// `member_removed` purge retains it instead, amendment 1 §4.3).
 async fn purge_appearance(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
     Ok(sqlx::query("DELETE FROM private_appearance WHERE did = $1").bind(did).execute(&mut *conn).await?.rows_affected())
+}
+
+/// `ingest::retain_appearance` (private-appearance amendment 1 §4.1): in the
+/// removal marker's transaction, after it deleted the `members` row, keep
+/// the removed member's appearance row for 7 days from the marker's
+/// `now()`. A second removal restarts the 7 days; a row already past them
+/// is left to the sweep, never revived. `rev` and `updated_at` stay.
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn retain_appearance(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+    let n = sqlx::query(&format!(
+        "UPDATE private_appearance SET retained_until = now() + {} \
+         WHERE did = $1 AND (retained_until IS NULL OR retained_until > now())",
+        super::appearance::RETAIN_FOR
+    ))
+    .bind(did)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if n > 0 {
+        metrics::counter!(super::appearance::METRIC_RETENTION, "event" => "retained").increment(n);
+    }
+    Ok(())
+}
+
+/// The batch backstop (amendment 1 §4.2): a `member_removed` purge whose
+/// marker committed without retaining the row (the code before the
+/// retention) retains it here, from the purge's start. It matches at most
+/// once, so the batch loop still ends; a member's row is never matched.
+async fn retain_appearance_backstop(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
+    let n = sqlx::query(&format!(
+        "UPDATE private_appearance \
+            SET retained_until = COALESCE((SELECT started_at FROM purging_dids WHERE did = $1), now()) + {} \
+          WHERE did = $1 AND retained_until IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM members WHERE did = $1)",
+        super::appearance::RETAIN_FOR
+    ))
+    .bind(did)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if n > 0 {
+        metrics::counter!(super::appearance::METRIC_RETENTION, "event" => "backstop").increment(n);
+    }
+    Ok(n)
 }
 
 /// The private activity subscriptions where `did` is the subscriber or the
@@ -1444,8 +1492,9 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
 /// bookmarks, the member's quote references (private posting §3.1: its
 /// later deletes are no longer tracked), and the private notifications it
 /// received and authored, for the same reason; and the private
-/// subscriptions it holds or is the subject of (private-activity-subs §3.2),
-/// and its appearance setting (private-appearance §3.2).
+/// subscriptions it holds or is the subject of (private-activity-subs §3.2).
+/// Its appearance setting is kept, not deleted: retained by the marker, or
+/// here by the backstop (private-appearance amendment 1 §4.2).
 ///
 /// # Errors
 ///
@@ -1454,7 +1503,7 @@ pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, lim
     let mut n = purge_bookmarks(conn, did, limit).await?;
     n += purge_notifications(conn, did, limit).await?;
     n += purge_subscriptions(conn, did, limit).await?;
-    n += purge_appearance(conn, did).await?;
+    n += retain_appearance_backstop(conn, did).await?;
     n += sqlx::query(
         "DELETE FROM private_quote_refs WHERE uri IN (SELECT uri FROM private_quote_refs WHERE author_did = $1 LIMIT $2)",
     )

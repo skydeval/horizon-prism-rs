@@ -341,6 +341,26 @@ pub async fn prepare_private_own(state: &AppState, headers: &HeaderMap, peer: So
     }
 }
 
+/// The gate for an account's own appearance, member or not
+/// (private-appearance amendment 1 §5): `prepare_private_own`'s
+/// authentication (the service JWT's verified issuer is the only DID the
+/// caller can name) and `private` charge, then the caller's membership
+/// handed back instead of refusing a non-member: `true` for any `members`
+/// row, ready or not. The handler serves a non-member nothing but its own
+/// retained row. Never enrols.
+///
+/// # Errors
+///
+/// `AuthRequired`/`InvalidToken`, `RateLimitExceeded`.
+pub async fn prepare_private_self(state: &AppState, headers: &HeaderMap, peer: SocketAddr, method: &str) -> Result<(VerifiedCaller, bool), XrpcError> {
+    let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let caller = authenticate(state, authorization, method).await?;
+    let ip = request_ip(state, headers, peer);
+    state.limits.charge(method, Family::Private, Some(&caller.did), ip)?;
+    let member = matches!(member_state(state, &caller.did).await?, Enrollment::Member { .. });
+    Ok((caller, member))
+}
+
 /// The caller's membership without enrolling it.
 pub(crate) async fn member_state(state: &AppState, did: &str) -> Result<Enrollment, sqlx::Error> {
     let row: Option<(bool, bool)> = sqlx::query_as(crate::aggregations::enroll::MEMBER_READINESS_SQL)

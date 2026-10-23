@@ -1,6 +1,8 @@
 //! A member's appearance setting (private-appearance design §5): the input
-//! of `putAppearance`, the check of the value, and the answer of both
-//! methods. The handlers are in `handlers`, the queries in `schema`.
+//! of `putAppearance` and `releaseAppearance`, the check of the value, and
+//! the answer of the methods. The handlers are in `handlers`, the queries in
+//! `schema`, the retention's statements in `ingest` and `retention`
+//! (private-appearance amendment 1).
 
 use chrono::SecondsFormat;
 use serde_json::{Map, Value};
@@ -17,6 +19,38 @@ pub(super) const VALUE_MAX: usize = 16_384;
 
 /// The three choices, as stored.
 const STORES: [&str; 3] = ["private", "public", "device"];
+
+/// How long a removed member's row is kept (amendment 1 §4), as SQL:
+/// 7 days (skydeval, 2026-10-24).
+pub(super) const RETAIN_FOR: &str = "interval '7 days'";
+/// `appearance_retention_total{event}`: `retained` (the removal marker set
+/// the retention), `backstop` (a purge batch did, for a marker committed
+/// without it), `released` (`releaseAppearance` deleted the row). The
+/// expiry is `retention_deleted_rows_total{table}` (amendment 1 §10).
+pub const METRIC_RETENTION: &str = "appearance_retention_total";
+/// `appearance_retained_rows`: rows kept after a removal, expired unswept
+/// ones included, sampled with the private gauges.
+pub const METRIC_RETAINED_ROWS: &str = "appearance_retained_rows";
+
+/// `releaseAppearance`'s body (amendment 1 §6.4): the `rev` to release.
+/// Unknown keys are ignored.
+///
+/// # Errors
+///
+/// `InvalidRequest`, its message `"Error: "`-prefixed.
+pub(super) fn release_input(body: &[u8]) -> Result<String, XrpcError> {
+    if body.len() > BODY_MAX {
+        return Err(XrpcError::invalid("Error: input is too large"));
+    }
+    let input = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+    let Some(input) = input.as_object() else {
+        return Err(XrpcError::invalid("Error: input must be an object"));
+    };
+    match input.get("rev") {
+        Some(Value::String(rev)) => Ok(rev.clone()),
+        _ => Err(XrpcError::invalid("Error: rev must be a string")),
+    }
+}
 
 /// A checked `putAppearance` input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +123,8 @@ pub(super) fn checked_value(value: &Value) -> Result<String, XrpcError> {
 }
 
 /// `#appearanceState` (§5.1): `{}` with no row; else `store`, `rev`,
-/// `migratedAt`, and `appearance` with `private` and `public`.
+/// `migratedAt`, `appearance` with `private` and `public`, and
+/// `retainedUntil` on a retained row (amendment 1 §6.1).
 pub(super) fn state(row: Option<&AppearanceRow>) -> Value {
     let mut out = Map::new();
     if let Some(row) = row {
@@ -99,6 +134,9 @@ pub(super) fn state(row: Option<&AppearanceRow>) -> Value {
         }
         out.insert("rev".into(), Value::String(row.rev.to_string()));
         out.insert("migratedAt".into(), Value::String(row.created_at.to_rfc3339_opts(SecondsFormat::Millis, true)));
+        if let Some(until) = row.retained_until {
+            out.insert("retainedUntil".into(), Value::String(until.to_rfc3339_opts(SecondsFormat::Millis, true)));
+        }
     }
     Value::Object(out)
 }
@@ -134,6 +172,29 @@ mod tests {
         assert_eq!(message(put_input(br#"{"store": "device", "swapRev": 3}"#)), "Error: swapRev must be a string");
         let big = format!(r#"{{"store": "device", "pad": "{}"}}"#, "x".repeat(BODY_MAX));
         assert_eq!(message(put_input(big.as_bytes())), "Error: input is too large");
+    }
+
+    #[test]
+    fn release_inputs() {
+        let refused = |b: &[u8]| release_input(b).expect_err("refused").message;
+        assert_eq!(release_input(br#"{"rev": "123", "extra": 1}"#).expect("ok"), "123");
+        assert_eq!(release_input(br#"{"rev": ""}"#).expect("ok"), "");
+        assert_eq!(refused(b"[]"), "Error: input must be an object");
+        assert_eq!(refused(b""), "Error: input must be an object");
+        assert_eq!(refused(b"{}"), "Error: rev must be a string");
+        assert_eq!(refused(br#"{"rev": 123}"#), "Error: rev must be a string");
+        assert_eq!(refused(br#"{"rev": null}"#), "Error: rev must be a string");
+        let big = format!(r#"{{"rev": "1", "pad": "{}"}}"#, "x".repeat(BODY_MAX));
+        assert_eq!(refused(big.as_bytes()), "Error: input is too large");
+    }
+
+    #[test]
+    fn retained_until_is_answered() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-22T12:00:00.5Z").expect("time").to_utc();
+        let mut row = AppearanceRow { store: "device".into(), appearance: None, rev: 7, created_at: at, retained_until: None };
+        assert!(state(Some(&row)).get("retainedUntil").is_none());
+        row.retained_until = Some(at);
+        assert_eq!(state(Some(&row))["retainedUntil"], "2026-11-22T12:00:00.500Z");
     }
 
     #[test]

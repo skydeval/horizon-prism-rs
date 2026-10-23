@@ -3,8 +3,10 @@
 //! 1. **Marker step**, one short transaction: the `ScopeState` write guard,
 //!    then the DID's **exclusive** advisory lock (waiting out in-flight
 //!    writers that hold its shared lock); insert `purging_dids`; delete the
-//!    membership/scope rows the kind requires; clear readiness; cancel the
-//!    DID's jobs. After commit the in-memory sets follow.
+//!    membership/scope rows the kind requires; for a removed member, keep
+//!    its appearance setting 7 days (private-appearance amendment 1);
+//!    clear readiness; cancel the DID's jobs. After commit the in-memory
+//!    sets follow.
 //! 2. **Batched deletion** of the kind's deletion set, 10 000 rows per
 //!    transaction, each under a read guard and the DID's shared lock. Never
 //!    per-URI locks, never under the write guard.
@@ -349,6 +351,13 @@ impl Purger {
             PurgeKind::MemberRemoved | PurgeKind::AccountDeleted => drop_member(&mut tx, did).await?,
             PurgeKind::OutOfScope => false,
         };
+        // A removed member's own settings kept for it, in the transaction
+        // that deleted its `members` row, so no caller sees the row gone
+        // with nothing kept (private-appearance amendment 1 §4.1). Account
+        // deletion keeps nothing.
+        if kind == PurgeKind::MemberRemoved && member_removed {
+            self.private.retain_appearance(&mut tx, did).await?;
+        }
         // Readiness, for every kind.
         self.private.clear_owner_readiness(&mut tx, did).await?;
         sqlx::query("UPDATE members SET ready_at = NULL WHERE did = $1")

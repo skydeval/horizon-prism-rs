@@ -2770,7 +2770,7 @@ async fn private_router_methods_are_routed_in_every_mode() {
         .copied()
         .filter(|(n, _)| n.starts_with("app.nearhorizon.private."))
         .collect();
-    assert_eq!(methods.len(), 17);
+    assert_eq!(methods.len(), 18);
     for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
         set_mode(app.hydrator.scope(), mode).await;
         for &(nsid, verb) in &methods {
@@ -2789,23 +2789,30 @@ async fn private_router_methods_are_routed_in_every_mode() {
             let v: Value = r.json().await.expect("json");
             assert_eq!(status, 400, "{mode:?} wrong verb {nsid}");
             assert_eq!(v["message"], format!("Incorrect HTTP method ({wrong}) expected {right}"), "{mode:?} {nsid}");
-            // A ready member is served.
+            // A ready member is served; `releaseAppearance` answers a member
+            // `InvalidRequest` (private-appearance amendment 1 §6.4).
             let status = match verb {
                 // `q` for `searchPosts`; the other methods ignore it.
                 crate::honest_501::Verb::Get => get(&base, nsid, &format!("uri={uri}&q=post"), BOB, BOB_KEY).await.0,
                 crate::honest_501::Verb::Post => {
                     // `subject` and `activitySubscription` for
                     // `putActivitySubscription` (an off), `store` for
-                    // `putAppearance`; the others ignore them.
+                    // `putAppearance`, `rev` for `releaseAppearance`; the
+                    // others ignore them.
                     let body = json!({
                         "uri": uri, "cid": "bafy", "seenAt": "2026-10-01T00:00:00Z",
                         "subject": ALICE, "activitySubscription": {"post": false, "reply": false},
-                        "store": "device",
+                        "store": "device", "rev": "1",
                     });
-                    post(&base, nsid, &body, BOB).await.0
+                    let (status, answer) = post(&base, nsid, &body, BOB).await;
+                    if nsid == "app.nearhorizon.private.releaseAppearance" {
+                        assert!(answer.contains("putAppearance"), "a member is refused: {answer}");
+                    }
+                    status
                 }
             };
-            assert_eq!(status, 200, "{mode:?} {nsid}");
+            let served = if nsid == "app.nearhorizon.private.releaseAppearance" { 400 } else { 200 };
+            assert_eq!(status, served, "{mode:?} {nsid}");
         }
     }
     db.drop_db().await;

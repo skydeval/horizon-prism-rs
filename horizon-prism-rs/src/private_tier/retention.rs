@@ -13,7 +13,8 @@
 //! - Class T: `private_tombstones` older than `retention.tombstone_days`;
 //!   `private_notifications` older than `retention.notification_days`;
 //!   `private_post_fanout` rows done more than two days ago
-//!   (private-activity-subs design §3.2).
+//!   (private-activity-subs design §3.2); `private_appearance` rows past
+//!   their `retained_until` (private-appearance amendment 1 §4.4).
 //! - Every DID that lost `private_posts`/`private_audiences` rows is
 //!   re-evaluated as an owner in the same transaction as its last batch, and
 //!   the in-memory owner set follows after commit.
@@ -247,6 +248,32 @@ impl RetentionTask for PrivateRetention {
             metrics::counter!(METRIC_DELETED_ROWS, "table" => "private_post_fanout").increment(queue);
         }
         report.deleted.push(("private_post_fanout", queue));
+        // Class T: appearance rows kept after a removal, past their
+        // retention (private-appearance amendment 1 §4.4). The predicate is
+        // on the outer DELETE too, so a row a member's put made live after
+        // the subquery read it is re-checked and kept. A live row
+        // (`retained_until` NULL) is never touched.
+        let mut appearance = 0u64;
+        loop {
+            let guard = scope.read().await;
+            let n = sqlx::query(&format!(
+                "DELETE FROM private_appearance WHERE retained_until <= now() \
+                   AND did IN (SELECT did FROM private_appearance WHERE retained_until <= now() LIMIT {BATCH_SIZE})"
+            ))
+            .execute(pool)
+            .await?
+            .rows_affected();
+            drop(guard);
+            appearance += n;
+            if n < BATCH_SIZE {
+                break;
+            }
+            tokio::time::sleep(BATCH_PAUSE).await;
+        }
+        if appearance > 0 {
+            metrics::counter!(METRIC_DELETED_ROWS, "table" => "private_appearance").increment(appearance);
+        }
+        report.deleted.push(("private_appearance", appearance));
         Ok(report)
     }
 }

@@ -41,7 +41,7 @@ use crate::hydration::normalize::is_private_uri;
 use crate::hydration::{HydrationContext, ts};
 use crate::kryphocron_glue::VerifiedCaller;
 use crate::xrpc::AppState;
-use crate::xrpc::auth::{Params, prepare_private, prepare_private_own, request_handle, request_ip};
+use crate::xrpc::auth::{Params, prepare_private, prepare_private_own, prepare_private_self, request_handle, request_ip};
 use crate::xrpc::errors::XrpcError;
 
 pub const GET_POSTS: &str = "app.nearhorizon.private.getPosts";
@@ -65,6 +65,7 @@ pub const PUT_ACTIVITY_SUBSCRIPTION: &str = "app.nearhorizon.private.putActivity
 pub const LIST_ACTIVITY_SUBSCRIPTIONS: &str = "app.nearhorizon.private.listActivitySubscriptions";
 pub const GET_APPEARANCE: &str = "app.nearhorizon.private.getAppearance";
 pub const PUT_APPEARANCE: &str = "app.nearhorizon.private.putAppearance";
+pub const RELEASE_APPEARANCE: &str = "app.nearhorizon.private.releaseAppearance";
 
 /// `getAuthorFeed`'s `filter` values (P-20, §4.14; P-30); the first is the
 /// default.
@@ -267,6 +268,7 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(LIST_ACTIVITY_SUBSCRIPTIONS), get(list_activity_subscriptions))
         .route(&xrpc(GET_APPEARANCE), get(get_appearance))
         .route(&xrpc(PUT_APPEARANCE), post(put_appearance))
+        .route(&xrpc(RELEASE_APPEARANCE), post(release_appearance))
         .with_state(state)
 }
 
@@ -2810,18 +2812,60 @@ fn appearance_answer(state: Value) -> Response {
     response
 }
 
-/// `app.nearhorizon.private.getAppearance` (private-appearance design
-/// §5.2) → `#appearanceState`: the caller's own choice of where its
-/// appearance is saved, and the value with `private` and `public`; `{}`
-/// before its first put. Served to any member, ready or not (§4). No floor.
+/// `app.nearhorizon.private.getAppearance {includeRetained?}`
+/// (private-appearance design §5.2; amendment 1 §6.2) →
+/// `#appearanceState`: the caller's own choice of where its appearance is
+/// saved, and the value with `private` and `public`; `{}` before its first
+/// put. Served to any member, ready or not (§4). A row kept after a removal
+/// is answered only with `includeRetained` (`true`; anything else is false),
+/// marked `retainedUntil`, to its owner whether or not it is a member now;
+/// without it, it is absent (RM-1). A non-member with no kept row, or
+/// without the param, is `NotEnrolled`. No floor.
 pub async fn get_appearance(
     State(s): State<PrivateState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    RawQuery(q): RawQuery,
 ) -> Result<Response, XrpcError> {
-    let caller = prepare_private_own(&s.app, &headers, peer, GET_APPEARANCE).await?;
-    let row = schema::appearance_row(&s.env.pool, &caller.did).await?;
+    let include_retained = Params::parse(q.as_deref()).bool("includeRetained");
+    let (caller, member) = prepare_private_self(&s.app, &headers, peer, GET_APPEARANCE).await?;
+    let which = match (member, include_retained) {
+        (true, false) => schema::AppearanceRead::Live,
+        (true, true) => schema::AppearanceRead::LiveOrRetained,
+        (false, true) => schema::AppearanceRead::Retained,
+        (false, false) => return Err(XrpcError::not_enrolled()),
+    };
+    let row = schema::appearance_row(&s.env.pool, &caller.did, which).await?;
+    if !member && row.is_none() {
+        return Err(XrpcError::not_enrolled());
+    }
     Ok(appearance_answer(super::appearance::state(row.as_ref())))
+}
+
+/// `app.nearhorizon.private.releaseAppearance {rev}` (private-appearance
+/// amendment 1 §6.4) → `{}`: deletes the caller's row kept after a removal
+/// when `rev` is its `rev`. No kept row (released, expired, never kept):
+/// `{}`, nothing deleted, so a retry succeeds. Another `rev`:
+/// `InvalidSwap`. A member: `InvalidRequest` (its row changes only through
+/// `putAppearance`). The gate runs before the body is read; the
+/// transaction decides membership under the DID's lock. No floor.
+pub async fn release_appearance(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let (caller, _) = prepare_private_self(&s.app, &headers, peer, RELEASE_APPEARANCE).await?;
+    let rev = super::appearance::release_input(&body)?;
+    match schema::appearance_release(&s.env.pool, &caller.did, &rev).await? {
+        schema::AppearanceRelease::Done => Ok(appearance_answer(json!({}))),
+        schema::AppearanceRelease::Member => {
+            Err(XrpcError::invalid("Error: a member's appearance changes only through putAppearance"))
+        }
+        schema::AppearanceRelease::Mismatch => {
+            Err(XrpcError::new(StatusCode::BAD_REQUEST, "InvalidSwap", "Error: rev does not match the retained rev"))
+        }
+    }
 }
 
 /// `app.nearhorizon.private.putAppearance {store, appearance?, swapRev?}`

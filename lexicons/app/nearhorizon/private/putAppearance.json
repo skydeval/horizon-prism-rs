@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Set where the requester's appearance is saved, replacing the whole setting. With store private or public, appearance is required: an app.nearhorizon.actor.appearance record value with its $type, version and updatedAt, in the atproto data model, at most 16 KiB as JSON, kept whole; its other fields are not checked against the record lexicon. With device it must be absent, and any kept appearance is deleted. This AppView accepts only the three listed store values. swapRev: write only if the stored rev equals it; the empty string writes only if the requester has none. Requires auth by a community member, ready or not.",
+      "description": "Set where the requester's appearance is saved, replacing the whole setting. With store private or public, appearance is required: an app.nearhorizon.actor.appearance record value with its $type, version and updatedAt, in the atproto data model, at most 16 KiB as JSON, kept whole; its other fields are not checked against the record lexicon. With device it must be absent, and any kept appearance is deleted. This AppView accepts only the three listed store values. swapRev: write only if the stored rev equals it; the empty string writes only if the requester has none. A setting kept after the requester stopped being a member (retainedUntil) counts as none for the empty string, matches its own rev, and is replaced by any put, which makes it the live setting again. Requires auth by a community member, ready or not.",
       "input": {
         "encoding": "application/json",
         "schema": {

@@ -324,6 +324,11 @@ pub trait PrivateTier: Send + Sync {
     /// Clear one DID's owner readiness (dead letter, divergence, purge marker).
     async fn clear_owner_readiness(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error>;
 
+    /// `ingest::retain_appearance` (private-appearance amendment 1 §4.1): in
+    /// a `member_removed` marker's transaction that deleted the `members`
+    /// row, keep the removed member's appearance for 7 days.
+    async fn retain_appearance(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error>;
+
     /// `readiness::mark_owner_ready` (§5.10). A no-op for a non-owner.
     async fn mark_owner_ready(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error>;
 
@@ -475,6 +480,10 @@ impl PrivateTier for KryphocronPrivateTier {
 
     async fn clear_owner_readiness(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
         readiness::clear_owner(conn, did).await
+    }
+
+    async fn retain_appearance(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+        ingest::retain_appearance(conn, did).await
     }
 
     async fn mark_owner_ready(&self, conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
@@ -632,6 +641,10 @@ impl PrivateTier for DisabledPrivateTier {
     }
 
     async fn clear_owner_readiness(&self, _conn: &mut PgConnection, _did: &str) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    async fn retain_appearance(&self, _conn: &mut PgConnection, _did: &str) -> Result<(), sqlx::Error> {
         Ok(())
     }
 

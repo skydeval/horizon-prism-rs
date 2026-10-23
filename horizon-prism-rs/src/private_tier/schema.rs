@@ -86,7 +86,9 @@ pub(super) fn blocks_between_statement() -> String {
 }
 
 /// Authors of private rows (retention inputs, §4.4: their `actors` rows are
-/// kept).
+/// kept), and the owners of retained appearance rows, so that a removed
+/// account's identity events stay routed and its deletion still purges the
+/// row (private-appearance amendment 1 §4.5).
 ///
 /// # Errors
 ///
@@ -94,7 +96,8 @@ pub(super) fn blocks_between_statement() -> String {
 pub(super) async fn row_authors(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT author_did FROM private_posts UNION SELECT owner_did FROM private_audiences \
-         UNION SELECT author_did FROM private_blocks",
+         UNION SELECT author_did FROM private_blocks \
+         UNION SELECT did FROM private_appearance WHERE retained_until IS NOT NULL",
     )
     .fetch_all(pool)
     .await
@@ -3706,13 +3709,39 @@ fn unread_public_statement_for(filter: &str) -> String {
 }
 
 /// A member's appearance row (private-appearance design §3.1), the value as
-/// its stored JSON text.
+/// its stored JSON text. `retained_until` is set on a row kept after a
+/// removal (private-appearance amendment 1 §3).
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub(super) struct AppearanceRow {
     pub store: String,
     pub appearance: Option<String>,
     pub rev: i64,
     pub created_at: DateTime<Utc>,
+    pub retained_until: Option<DateTime<Utc>>,
+}
+
+/// Which appearance row a read may answer (private-appearance amendment 1
+/// §6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AppearanceRead {
+    /// A member without `includeRetained`: the live row only (RM-1).
+    Live,
+    /// A member with `includeRetained`: the live row or an unexpired
+    /// retained one.
+    LiveOrRetained,
+    /// A non-member with `includeRetained`: an unexpired retained row only.
+    Retained,
+}
+
+/// What `releaseAppearance` did (amendment 1 §6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AppearanceRelease {
+    /// The retained row was deleted, or there was none: `{}`.
+    Done,
+    /// The caller is a member: nothing deleted.
+    Member,
+    /// An unexpired retained row with another `rev`: nothing deleted.
+    Mismatch,
 }
 
 /// What `putAppearance`'s write did (§5.5).
@@ -3726,18 +3755,29 @@ pub(super) enum AppearancePut {
     Mismatch,
 }
 
-/// The columns both appearance statements return.
-const APPEARANCE_COLUMNS: &str = "store, appearance::text AS appearance, rev, created_at";
+/// The columns every appearance statement returns.
+const APPEARANCE_COLUMNS: &str = "store, appearance::text AS appearance, rev, created_at, retained_until";
 /// A new row's `rev`: the database clock's microseconds.
 const CLOCK_REV: &str = "(extract(epoch FROM clock_timestamp()) * 1e6)::bigint";
+/// What a put sets besides the value (amendment 1 §6.3): the row is live,
+/// and a retained row made live starts over (`migratedAt`). Every right-hand
+/// side reads the row as it was.
+const APPEARANCE_LIVE: &str = "created_at = CASE WHEN private_appearance.retained_until IS NULL \
+     THEN private_appearance.created_at ELSE now() END, retained_until = NULL";
 
-/// `did`'s appearance row, if it put one (§5.2).
+/// `did`'s appearance row as `which` may answer it (§5.2; amendment 1
+/// §6.2): an expired row is never answered.
 ///
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn appearance_row(pool: &PgPool, did: &str) -> Result<Option<AppearanceRow>, sqlx::Error> {
-    sqlx::query_as(&format!("SELECT {APPEARANCE_COLUMNS} FROM private_appearance WHERE did = $1"))
+pub(super) async fn appearance_row(pool: &PgPool, did: &str, which: AppearanceRead) -> Result<Option<AppearanceRow>, sqlx::Error> {
+    let kept = match which {
+        AppearanceRead::Live => "retained_until IS NULL",
+        AppearanceRead::LiveOrRetained => "(retained_until IS NULL OR retained_until > now())",
+        AppearanceRead::Retained => "retained_until > now()",
+    };
+    sqlx::query_as(&format!("SELECT {APPEARANCE_COLUMNS} FROM private_appearance WHERE did = $1 AND {kept}"))
         .bind(did)
         .fetch_optional(pool)
         .await
@@ -3746,9 +3786,11 @@ pub(super) async fn appearance_row(pool: &PgPool, did: &str) -> Result<Option<Ap
 /// `putAppearance`'s write (§5.5), in one transaction: the DID's shared
 /// lock (a removal marker holds it exclusively before deleting `members`),
 /// the membership read again, then one statement by `swap`: absent,
-/// unconditional; `""`, create only; any other value, update only that
-/// `rev`. `value` is the compact JSON text, `None` with `device`. Every
-/// write moves `rev` strictly up.
+/// unconditional; `""`, only with no live row (a retained row, expired or
+/// not, is replaced); any other value, update only that `rev` on a row not
+/// expired. `value` is the compact JSON text, `None` with `device`. Every
+/// write moves `rev` strictly up and leaves the row live (amendment 1
+/// §6.3).
 ///
 /// # Errors
 ///
@@ -3773,21 +3815,19 @@ pub(super) async fn appearance_put(
     if !member {
         return Ok(AppearancePut::NotMember);
     }
+    let upsert = format!(
+        "INSERT INTO private_appearance (did, store, appearance, rev) VALUES ($1, $2, $3::text::json, {CLOCK_REV}) \
+         ON CONFLICT (did) DO UPDATE SET store = EXCLUDED.store, appearance = EXCLUDED.appearance, \
+           rev = GREATEST(private_appearance.rev + 1, EXCLUDED.rev), updated_at = now(), {APPEARANCE_LIVE}"
+    );
     let sql = match swap {
-        None => format!(
-            "INSERT INTO private_appearance (did, store, appearance, rev) VALUES ($1, $2, $3::text::json, {CLOCK_REV}) \
-             ON CONFLICT (did) DO UPDATE SET store = EXCLUDED.store, appearance = EXCLUDED.appearance, \
-               rev = GREATEST(private_appearance.rev + 1, EXCLUDED.rev), updated_at = now() \
-             RETURNING {APPEARANCE_COLUMNS}"
-        ),
-        Some("") => format!(
-            "INSERT INTO private_appearance (did, store, appearance, rev) VALUES ($1, $2, $3::text::json, {CLOCK_REV}) \
-             ON CONFLICT (did) DO NOTHING RETURNING {APPEARANCE_COLUMNS}"
-        ),
+        None => format!("{upsert} RETURNING {APPEARANCE_COLUMNS}"),
+        Some("") => format!("{upsert} WHERE private_appearance.retained_until IS NOT NULL RETURNING {APPEARANCE_COLUMNS}"),
         Some(_) => format!(
             "UPDATE private_appearance SET store = $2, appearance = $3::text::json, \
-               rev = GREATEST(rev + 1, {CLOCK_REV}), updated_at = now() \
-             WHERE did = $1 AND rev::text = $4 RETURNING {APPEARANCE_COLUMNS}"
+               rev = GREATEST(rev + 1, {CLOCK_REV}), updated_at = now(), {APPEARANCE_LIVE} \
+             WHERE did = $1 AND rev::text = $4 AND (retained_until IS NULL OR retained_until > now()) \
+             RETURNING {APPEARANCE_COLUMNS}"
         ),
     };
     let mut q = sqlx::query_as::<_, AppearanceRow>(&sql).bind(did).bind(store).bind(value);
@@ -3800,4 +3840,55 @@ pub(super) async fn appearance_put(
     };
     tx.commit().await?;
     Ok(AppearancePut::Stored(row))
+}
+
+/// `releaseAppearance`'s delete (amendment 1 §6.4), in one transaction: the
+/// DID's shared lock, the membership read again (a member is refused), then
+/// the caller's unexpired retained row deleted if its `rev` is `rev`. Nothing
+/// deleted: an unexpired retained row left means another `rev`; anything
+/// else (no row, an expired one, a live one) is done.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn appearance_release(pool: &PgPool, did: &str, rev: &str) -> Result<AppearanceRelease, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    crate::db::locks::lock_dids_shared(&mut tx, &[did.to_string()]).await?;
+    let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM members WHERE did = $1)")
+        .bind(did)
+        .fetch_one(&mut *tx)
+        .await?;
+    if member {
+        return Ok(AppearanceRelease::Member);
+    }
+    let gone = sqlx::query("DELETE FROM private_appearance WHERE did = $1 AND rev::text = $2 AND retained_until > now()")
+        .bind(did)
+        .bind(rev)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let outcome = if gone > 0 {
+        metrics::counter!(super::appearance::METRIC_RETENTION, "event" => "released").increment(gone);
+        AppearanceRelease::Done
+    } else {
+        let kept: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM private_appearance WHERE did = $1 AND retained_until > now())")
+            .bind(did)
+            .fetch_one(&mut *tx)
+            .await?;
+        if kept { AppearanceRelease::Mismatch } else { AppearanceRelease::Done }
+    };
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// Rows kept after a removal, expired unswept ones included: the
+/// `appearance_retained_rows` gauge (amendment 1 §10).
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn appearance_retained_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT count(*) FROM private_appearance WHERE retained_until IS NOT NULL")
+        .fetch_one(pool)
+        .await
 }
