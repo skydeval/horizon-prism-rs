@@ -593,7 +593,9 @@ impl Hydrator {
     /// admit, those of an author the caller blocks or is blocked by
     /// (`blocks` for a visitor or a member that is not ready), and those
     /// whose author and the root's author block each other or were left
-    /// unanswered (a separate Farsight reader, `round` long).
+    /// unanswered (a separate Farsight reader, `round` long); then other
+    /// accounts' direct replies to them (RF-S7,
+    /// [`Hydrator::refract_child_replies`]).
     ///
     /// # Errors
     ///
@@ -618,26 +620,58 @@ impl Hydrator {
         let Some(rules) = self.refract_root_rules(req, root).await? else {
             return Ok(Self::refract_empty("posts"));
         };
-        let me = viewer.did.as_deref();
         let mentions = match &rules.allow {
             Some(allow) if allow.iter().any(|r| r.get("$type").and_then(Value::as_str) == Some("app.bsky.feed.threadgate#mentionRule")) => {
                 self.refract_root_mentions(req, root).await?
             }
             _ => None,
         };
+        let mut blocks = blocks;
         let mut admitted: HashMap<String, bool> = HashMap::new();
+        let thread = ThreadRules { root_author: &root_author, rules: &rules, mentions: mentions.as_ref(), round };
+        let kept = self.refract_admit_replies(viewer, req, &thread, rows, blocks.as_deref_mut(), &mut admitted).await?;
+        let uris: Vec<String> = kept.into_iter().map(|(u, _)| u).collect();
+        let ctx = self.post_context_for(Some(viewer), req, &uris, CountMode::List, &[], &[]).await?;
+        let mut posts: Vec<Value> = uris
+            .iter()
+            .filter(|u| ctx.gates.get(*u).is_none_or(|g| g.listable()))
+            .filter_map(|u| ctx.post_view(u))
+            .collect();
+        // RF-S7: other accounts' direct replies to the restored ones.
+        let children = self.refract_child_replies(viewer, req, root, &thread, &posts, blocks, &mut admitted).await?;
+        posts.extend(children);
+        Ok(Self::emit(json!({ "posts": posts })))
+    }
+
+    /// The replies of `items` (`(uri, author)`) `getReplies` may return:
+    /// less those the root's threadgate hides (except from their own author)
+    /// or doesn't admit (fail closed), those of an author the caller blocks
+    /// or is blocked by (`blocks` for a visitor or a member that is not
+    /// ready), and those whose author and the root's author block each
+    /// other or were left unanswered. `admitted` remembers each author's
+    /// admission across calls.
+    async fn refract_admit_replies(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        t: &ThreadRules<'_>,
+        items: Vec<(String, String)>,
+        blocks: Option<&mut crate::refract::handlers::Blocks>,
+        admitted: &mut HashMap<String, bool>,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let me = viewer.did.as_deref();
         let mut kept: Vec<(String, String)> = Vec::new();
-        for (uri, author) in rows {
-            if rules.hidden.contains(&uri) && Some(author.as_str()) != me {
+        for (uri, author) in items {
+            if t.rules.hidden.contains(&uri) && Some(author.as_str()) != me {
                 continue;
             }
-            if let Some(allow) = &rules.allow
-                && author != root_author
+            if let Some(allow) = &t.rules.allow
+                && author != t.root_author
             {
                 let ok = match admitted.get(&author) {
                     Some(ok) => *ok,
                     None => {
-                        let ok = self.refract_admitted(req, &root_author, allow, &author, mentions.as_ref()).await?;
+                        let ok = self.refract_admitted(req, t.root_author, allow, &author, t.mentions).await?;
                         admitted.insert(author.clone(), ok);
                         ok
                     }
@@ -663,32 +697,167 @@ impl Hydrator {
             }
         }
         // The root author and each replier: a separate reader.
-        let others: Vec<String> = repliers.iter().filter(|a| **a != root_author && !dropped.contains(*a)).cloned().collect();
-        if !others.is_empty()
-            && let Some(farsight) = self.farsight()
-        {
-            let reader = farsight.request(req);
-            reader.set_visitor();
-            let got = reader.pair_answers(&root_author, &others, crate::farsight::PairBudget { max_calls: u32::MAX, timeout: round }, None).await;
-            for did in others {
-                match got.answers.get(&did) {
-                    Some(answer) if !answer.inbound.is_block() && !answer.outbound.is_block() => {}
-                    _ => {
-                        dropped.insert(did);
-                    }
+        let others: Vec<String> = repliers.iter().filter(|a| **a != t.root_author && !dropped.contains(*a)).cloned().collect();
+        dropped.extend(self.refract_pairs_blocked(req, t.root_author, &others, t.round).await);
+        Ok(kept.into_iter().filter(|(_, a)| !dropped.contains(a)).collect())
+    }
+
+    /// Those of `others` that block `of` or are blocked by it, or were left
+    /// unanswered, through a separate Farsight reader (so its cache and
+    /// fallback don't touch the caller's request), `round` long. None with
+    /// no Farsight configured.
+    async fn refract_pairs_blocked(&self, req: &Requester, of: &str, others: &[String], round: Duration) -> HashSet<String> {
+        let mut out = HashSet::new();
+        if others.is_empty() {
+            return out;
+        }
+        let Some(farsight) = self.farsight() else {
+            return out;
+        };
+        let reader = farsight.request(req);
+        reader.set_visitor();
+        let got = reader.pair_answers(of, others, crate::farsight::PairBudget { max_calls: u32::MAX, timeout: round }, None).await;
+        for did in others {
+            match got.answers.get(did) {
+                Some(answer) if !answer.inbound.is_block() && !answer.outbound.is_block() => {}
+                _ => {
+                    out.insert(did.clone());
                 }
             }
         }
-        let uris: Vec<String> = kept.iter().filter(|(_, a)| !dropped.contains(a)).map(|(u, _)| u.clone()).collect();
-        let ctx = self.post_context_for(Some(viewer), req, &uris, CountMode::List, &[], &[]).await?;
-        let posts: Vec<Value> = uris
+        out
+    }
+
+    /// RF-S7: other accounts' direct replies to the restored replies of
+    /// `posts`, at most [`CHILDREN_MAX`], from at most [`CHILD_PARENTS`]
+    /// parents whose `replyCount` isn't 0 (one Constellation `links` page
+    /// each, `.reply.parent.uri`, drawn from the caller's share). Gated
+    /// before the fetch (never fetched when hidden), admitted as restored
+    /// replies are, dropped across a block with the parent's author, then
+    /// fetched through the cascade (nothing stored), judged again for a
+    /// visitor over every account the fetched views name, normalized, and
+    /// kept only when their record's root is `root` and their parent the
+    /// one asked.
+    #[allow(clippy::too_many_arguments)]
+    async fn refract_child_replies(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        root: &str,
+        t: &ThreadRules<'_>,
+        posts: &[Value],
+        mut blocks: Option<&mut crate::refract::handlers::Blocks>,
+        admitted: &mut HashMap<String, bool>,
+    ) -> Result<Vec<Value>, sqlx::Error> {
+        let Some(client) = self.backlinks() else {
+            return Ok(Vec::new());
+        };
+        let returned: HashSet<&str> = posts.iter().filter_map(|p| p.get("uri").and_then(Value::as_str)).collect();
+        let parents: Vec<&str> = posts
             .iter()
-            .filter(|u| ctx.gates.get(*u).is_none_or(|g| g.listable()))
-            .filter_map(|u| ctx.post_view(u))
+            .filter(|p| p.get("replyCount").and_then(Value::as_u64) != Some(0))
+            .filter_map(|p| p.get("uri").and_then(Value::as_str))
+            .take(CHILD_PARENTS)
             .collect();
-        Ok(Self::emit(json!({ "posts": posts })))
+        let mut children: Vec<(String, String)> = Vec::new();
+        let mut parent_of: HashMap<String, String> = HashMap::new();
+        for parent in parents {
+            let room = CHILDREN_MAX.saturating_sub(children.len());
+            if room == 0 {
+                break;
+            }
+            if self.constellation_bucket().is_some_and(|b| b.draw(req.key()).is_err()) {
+                break;
+            }
+            let Ok(page) = client.links(parent, NSID_POST, ".reply.parent.uri", u32::try_from(room).unwrap_or(u32::MAX), None).await else {
+                continue;
+            };
+            for r in page.linking_records {
+                let uri = format!("at://{}/{}/{}", r.did, r.collection, r.rkey);
+                if r.collection != NSID_POST || returned.contains(uri.as_str()) || is_private_uri(&uri) || parent_of.contains_key(&uri) || children.len() >= CHILDREN_MAX {
+                    continue;
+                }
+                parent_of.insert(uri.clone(), parent.to_string());
+                children.push((uri, r.did));
+            }
+        }
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The gate first: a hidden reply or author is never fetched.
+        let mut gated: Vec<String> = children.iter().map(|(u, _)| u.clone()).collect();
+        gated.extend(children.iter().map(|(_, a)| a.clone()));
+        let gates = self.gate_many(req, &gated).await?;
+        let hidden = |s: &str| gates.get(s).is_some_and(|g| g.is_hidden());
+        children.retain(|(u, a)| !hidden(u) && !hidden(a));
+        let mut kept = self.refract_admit_replies(viewer, req, t, children, blocks.as_deref_mut(), admitted).await?;
+        // The parent's author and each child's: a separate reader.
+        let parent_author = |u: &str| parent_of.get(u).and_then(|p| uri_author(p)).unwrap_or_default().to_string();
+        let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
+        for (u, a) in &kept {
+            let pa = parent_author(u);
+            if pa != *a && pa != t.root_author {
+                let kids = by_parent.entry(pa).or_default();
+                if !kids.contains(a) {
+                    kids.push(a.clone());
+                }
+            }
+        }
+        let mut across: HashSet<(String, String)> = HashSet::new();
+        for (pa, kids) in by_parent {
+            for kid in self.refract_pairs_blocked(req, &pa, &kids, t.round).await {
+                across.insert((pa.clone(), kid));
+            }
+        }
+        kept.retain(|(u, a)| !across.contains(&(parent_author(u), a.clone())));
+        if kept.is_empty() || req.spent() {
+            return Ok(Vec::new());
+        }
+        let uris: Vec<String> = kept.into_iter().map(|(u, _)| u).collect();
+        let found = Value::Array(self.upstream().posts(req, &uris).await);
+        // For a visitor, every account the fetched views name is judged
+        // before the views are built (collect → judge → emit).
+        let known = match blocks {
+            Some(b) => {
+                let (dids, _) = super::normalize::subjects(&found);
+                let dids: Vec<String> = dids.into_iter().collect();
+                b.round(&dids).await;
+                Some(b.known())
+            }
+            None => None,
+        };
+        let (found, _, after) = match known {
+            Some(k) => super::with_known_blocks(k, self.normalized(viewer, req, found)).await?,
+            None => self.normalized(viewer, req, found).await?,
+        };
+        let mut by_uri: HashMap<String, Value> = HashMap::new();
+        for v in found.as_array().into_iter().flatten() {
+            let Some(u) = v.get("uri").and_then(Value::as_str) else { continue };
+            let in_thread = v.pointer("/record/reply/root/uri").and_then(Value::as_str) == Some(root)
+                && v.pointer("/record/reply/parent/uri").and_then(Value::as_str).is_some_and(|p| parent_of.get(u).is_some_and(|q| q == p));
+            if in_thread && after.listable(u) && !after.blocked(uri_author(u).unwrap_or_default()) {
+                by_uri.insert(u.to_string(), v.clone());
+            }
+        }
+        Ok(uris.iter().filter_map(|u| by_uri.remove(u)).collect())
     }
 }
+
+/// What `getReplies` judges every reply of one thread by.
+struct ThreadRules<'a> {
+    root_author: &'a str,
+    rules: &'a RootRules,
+    mentions: Option<&'a HashSet<String>>,
+    /// How long a separate Farsight reader's round may take.
+    round: Duration,
+}
+
+/// The collection of posts.
+const NSID_POST: &str = "app.bsky.feed.post";
+/// RF-S7: parents asked for other accounts' replies per `getReplies`.
+pub const CHILD_PARENTS: usize = 10;
+/// RF-S7: other accounts' replies per `getReplies`.
+pub const CHILDREN_MAX: usize = 50;
 
 /// Restored posts given a visitor's `like` and `repost` per request (RF-S1).
 pub const VISITOR_POSTS: usize = 20;

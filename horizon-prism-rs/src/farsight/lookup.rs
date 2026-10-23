@@ -1776,14 +1776,20 @@ pub(crate) mod tests {
         pub huge_over: Mutex<usize>,
         pub calls: AtomicUsize,
         pub asked: Mutex<Vec<Vec<String>>>,
+        /// `(actor, other)` pairs where `other` list-blocks that actor only.
+        pub pair_blocks: Mutex<HashSet<(String, String)>>,
     }
 
     async fn answer(State(fake): State<Arc<Fake>>, RawQuery(q): RawQuery) -> axum::response::Response {
         fake.calls.fetch_add(1, Ordering::SeqCst);
-        let others: Vec<String> = url::form_urlencoded::parse(q.unwrap_or_default().as_bytes())
+        let query = q.unwrap_or_default();
+        let others: Vec<String> = url::form_urlencoded::parse(query.as_bytes())
             .filter(|(k, _)| k == "others")
             .map(|(_, v)| v.into_owned())
             .collect();
+        let actor: String = url::form_urlencoded::parse(query.as_bytes()).find(|(k, _)| k == "actor").map(|(_, v)| v.into_owned()).unwrap_or_default();
+        let pairs: HashSet<String> =
+            fake.pair_blocks.lock().expect("pairs").iter().filter(|(a, _)| *a == actor).map(|(_, o)| o.clone()).collect();
         fake.asked.lock().expect("asked").push(others.clone());
         let delay = *fake.delay_ms.lock().expect("delay");
         if delay > 0 {
@@ -1801,15 +1807,16 @@ pub(crate) mod tests {
         let through = fake.blocked_through.lock().expect("through");
         let results: Vec<Value> = others
             .iter()
-            .filter(|o| blockers.contains(*o) || through.contains_key(*o))
+            .filter(|o| blockers.contains(*o) || through.contains_key(*o) || pairs.contains(*o))
             .map(|o| {
-                let inbound: Vec<&str> = if blockers.contains(o) { vec![LIST] } else { Vec::new() };
+                let inbound: Vec<&str> = if blockers.contains(o) || pairs.contains(o) { vec![LIST] } else { Vec::new() };
                 let outbound = through.get(o).cloned().unwrap_or_default();
                 json!({"did": o, "blocksActor": {"direct": false, "lists": inbound}, "blockedByActor": {"direct": false, "lists": outbound}})
             })
             .collect();
         let level = *fake.level.lock().expect("level");
-        axum::Json(json!({"actor": V, "results": results, "partialFor": [], "freshness": {"coverage": {"level": if level.is_empty() { "complete" } else { level }}}})).into_response()
+        let actor = if actor.is_empty() { V.to_string() } else { actor };
+        axum::Json(json!({"actor": actor, "results": results, "partialFor": [], "freshness": {"coverage": {"level": if level.is_empty() { "complete" } else { level }}}})).into_response()
     }
 
     /// An engine over a fake Farsight, with `toml` as its `[farsight]`.

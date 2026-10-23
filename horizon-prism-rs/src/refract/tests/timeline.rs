@@ -126,6 +126,89 @@ async fn t14_replies_and_the_threadgate() {
     db.drop_db().await;
 }
 
+fn kid(name: &str) -> String {
+    format!("did:plc:{name:a<24}")
+}
+
+/// A child reply's `postView`, as the cascade returns it.
+fn child_view(uri: &str, author: &str, root: &str, parent: &str) -> serde_json::Value {
+    json!({
+        "uri": uri, "cid": "bafychild", "author": {"did": author, "handle": "kid.test"},
+        "record": {"$type": "app.bsky.feed.post", "text": "kid", "createdAt": "2026-10-23T00:00:00.000Z",
+                   "reply": {"root": {"uri": root, "cid": "c"}, "parent": {"uri": parent, "cid": "c"}}},
+        "replyCount": 0, "repostCount": 0, "likeCount": 0, "quoteCount": 0, "indexedAt": "2026-10-23T00:00:00.000Z"
+    })
+}
+
+/// RF-S7: `getReplies` adds other accounts' direct replies to a returned
+/// restored reply, after the restored ones: not one whose record claims
+/// another root, not one the root's threadgate hides, not one whose author
+/// and the parent's author block each other, and nothing from a restored
+/// reply whose `replyCount` is 0 (not asked).
+#[tokio::test]
+async fn rf_s7_other_accounts_replies() {
+    use crate::hydration::{HydrationConfig, ReadCache};
+    let Some(db) = fresh_db("refract_child_replies").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(R1, "r1.test"), (R2, "r2.test"), (OTHER, "o.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    let root = format!("at://{OTHER}/app.bsky.feed.post/3kroot");
+    let a = post(p, R1, "3ka", "replied to", Some(&root), Some(&root)).await;
+    let b = post(p, R2, "3kb", "no replies", Some(&root), Some(&root)).await;
+    exec(p, &format!("INSERT INTO post_counts (post_uri, reply_count) VALUES ('{a}', 4), ('{b}', 0)")).await;
+    let (ok, forged, hidden, blocked, unasked) = (kid("kidone"), kid("kidtwo"), kid("kidthree"), kid("kidfour"), kid("kidfive"));
+    let uri = |d: &str| format!("at://{d}/app.bsky.feed.post/3kchild");
+    let mut up = FixedUpstream::default();
+    up.records.insert(format!("at://{OTHER}/app.bsky.feed.threadgate/3kroot"), json!({"uri": "x", "cid": "c", "value": {"post": root, "hiddenReplies": [uri(&hidden)]}}));
+    for d in [&ok, &hidden, &blocked] {
+        up.posts.insert(uri(d), child_view(&uri(d), d, &root, &a));
+    }
+    up.posts.insert(uri(&forged), child_view(&uri(&forged), &forged, &format!("at://{OTHER}/app.bsky.feed.post/3kelsewhere"), &a));
+    up.posts.insert(uri(&unasked), child_view(&uri(&unasked), &unasked, &root, &b));
+    // Constellation: the children of `a` and of `b`, and who was asked.
+    let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let (kids_of_a, kids_of_b) = ([ok.clone(), forged.clone(), hidden.clone(), blocked.clone()], [unasked.clone()]);
+    let (a2, b2, seen) = (a.clone(), b.clone(), Arc::clone(&asked));
+    let router = axum::Router::new().route(
+        "/links",
+        axum::routing::get(move |axum::extract::RawQuery(q): axum::extract::RawQuery| {
+            let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(q.unwrap_or_default().as_bytes()).into_owned().collect();
+            seen.lock().expect("asked").push(q["target"].clone());
+            let kids: Vec<String> = if q["target"] == a2 && q["path"] == ".reply.parent.uri" {
+                kids_of_a.to_vec()
+            } else if q["target"] == b2 {
+                kids_of_b.to_vec()
+            } else {
+                Vec::new()
+            };
+            let records: Vec<serde_json::Value> = kids.iter().map(|d| json!({"did": d, "collection": "app.bsky.feed.post", "rkey": "3kchild"})).collect();
+            async move { axum::Json(json!({"total": records.len(), "linking_records": records, "cursor": null})) }
+        }),
+    );
+    let base = crate::test_support::serve_fake(router).await;
+    let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
+    fake.pair_blocks.lock().expect("pairs").insert((R1.to_string(), blocked.clone()));
+    let h = Hydrator::new(
+        p.clone(),
+        crate::aggregations::ScopeState::new(sets(), crate::config::ScopePolicy::MembersAndOneHop, 10_000),
+        Some(crate::microcosm::ConstellationClient::new(crate::net::NetClient::loopback_for_tests(), &base)),
+        None,
+        Arc::new(up),
+        ReadCache::new(1024 * 1024),
+        HydrationConfig { farsight: Some(farsight), ..crate::hydration::testing::test_config() },
+    );
+    let viewer = Viewer { did: Some(MEMBER.into()), hydrate: false };
+    let got = replies(&h, &root, &viewer).await;
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert!(got[..2].contains(&a) && got[..2].contains(&b), "the restored replies first: {got:?}");
+    assert_eq!(got[2], uri(&ok), "{got:?}");
+    assert!(!asked.lock().expect("asked").contains(&b), "a reply with no replies is not asked about");
+    db.drop_db().await;
+}
+
 const VISITOR: &str = "did:plc:visitoraaaaaaaaaaaaaaaaa";
 
 /// A Constellation answering `links` filtered to a DID: the visitor liked

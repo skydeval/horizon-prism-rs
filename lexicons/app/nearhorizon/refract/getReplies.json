@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "The stored replies, by accounts this AppView serves for a listed community, in the thread of `root` that the caller may see, newest first, at most 200. The client splices each whose parent is on screen or another returned post.",
+      "description": "The stored replies, by accounts this AppView serves for a listed community, in the thread of `root` that the caller may see, newest first, at most 200; then up to 50 direct replies by other accounts to those posts, judged by the same thread, moderation and block rules (their parent is one of the posts before them). The client splices each whose parent is on screen or another returned post.",
       "parameters": {
         "type": "params",
         "required": ["anchor", "root"],
