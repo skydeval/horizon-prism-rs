@@ -10,6 +10,31 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract accounts page, #837)
+
+- **Refract accounts page** in the admin UI (`/admin/refract`, beside
+  Communities in the menu): every account Refract knows with its handle,
+  community, state, since, last and next check, and for a restored one how
+  far the fetch of its history has got; filtered by state and community,
+  a hundred to a page. **Add** takes a handle or a DID and queues `refract
+  check` (a candidate checked now); the command's page then links to the
+  account. `/admin/refract/<did>` shows what `admin refract show` does
+  (the row, the last check rule by rule, labels, events, any pending end
+  hiding it), with **Check again** and, for a restored account or one in
+  grace, **Remove** (`refract end`, typed: the account's handle; Prism
+  deletes what it stored for the account and keeps members' own records
+  that point at it). Pending ends are listed with Keep and Release. With
+  Refract off the page says so and offers no add or check.
+
+### Fixed (#837)
+
+- The Communities page's table no longer breaks words: the Communities
+  and Refract accounts pages use a wider column, headers, names, dates and
+  chips stay on one line (servers and labels one chip each, the labeler
+  DID shortened with the full one on hover), the five state counts are one
+  compact cell linking to the accounts in that state, and a table too
+  wide for the screen scrolls inside its box. Unkeep reads Release.
+
 ### Added (Refract R8: operator tooling and Thread Lens, #836)
 
 - **Communities page** in the admin UI (`/admin/communities`, refract

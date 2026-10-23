@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block main_class %} class="wide"{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Accounts Bluesky took down that a listed community still hosts. A candidate is being checked; a restored
+account is kept and served, marked with its community; one in grace failed a check and is still served for a while;
+an ending one's data here is being deleted. The communities themselves are on the <a href="/admin/communities">Communities</a> page.</p>
+{% if !enabled %}
+<div class="banner">Refract is off: nothing is checked and no account is kept. Turn it on on the <a href="/admin/communities">Communities</a> page.</div>
+{% endif %}
+
+<div class="grid">
+<div class="card">
+<h2>Add an account</h2>
+{% if enabled %}
+<form class="stack" method="post" action="/admin/refract/add">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="add-input">Handle or DID</label>
+<input type="text" id="add-input" name="input" spellcheck="false" placeholder="someone.example.social" required>
+<p class="hint">It becomes a candidate and is checked now. It is kept only if a listed community hosts it and every check passes.</p>
+<div class="row"><button type="submit">Add and check</button></div>
+</form>
+{% else %}
+<p class="muted">Accounts can be added once Refract is on.</p>
+{% endif %}
+</div>
+</div>
+
+<h2>Accounts</h2>
+<form class="filters card" method="get" action="/admin/refract">
+<label for="state">State</label>
+<select id="state" name="state">
+<option value="">any</option>
+{% for s in states %}<option value="{{ s }}"{% if *s == state %} selected{% endif %}>{{ s }}</option>
+{% endfor %}
+</select>
+<label for="community">Community</label>
+<select id="community" name="community">
+<option value="">any</option>
+{% for c in communities %}<option value="{{ c }}"{% if *c == community %} selected{% endif %}>{{ c }}</option>
+{% endfor %}
+</select>
+<button type="submit">Show</button>
+</form>
+<p class="muted">{{ total }} account{% if total != 1 %}s{% endif %}.</p>
+<div class="scroll">
+<table class="dense">
+<thead><tr><th>Account</th><th>Community</th><th>State</th><th>Since</th><th>Last checked</th><th>Next check</th><th>History</th><th></th></tr></thead>
+<tbody>
+{% for r in rows %}
+<tr>
+<td class="nowrap">{% if !r.handle.is_empty() %}<strong>{{ r.handle }}</strong><br>{% endif %}<code class="chip">{{ r.did }}</code></td>
+<td class="nowrap">{{ r.community }}</td>
+<td class="nowrap">{{ r.state }}</td>
+<td class="nowrap">{{ r.since }}</td>
+<td class="nowrap">{{ r.checked }}</td>
+<td class="nowrap">{{ r.next }}</td>
+<td>{{ r.history }}</td>
+<td class="actions"><a class="button secondary" href="/admin/refract/{{ r.did }}">Details</a></td>
+</tr>
+{% else %}
+<tr><td colspan="8" class="muted">No accounts{% if !state.is_empty() || !community.is_empty() %} match{% endif %}.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<div class="row">
+{% if prev.is_some() || next.is_some() %}<span class="muted">Page {{ page + 1 }}</span>{% endif %}
+{% if let Some(p) = prev %}<a class="button secondary" href="{{ p }}">Previous</a>{% endif %}
+{% if let Some(n) = next %}<a class="button secondary" href="{{ n }}">Next</a>{% endif %}
+</div>
+
+<h2>Pending ends</h2>
+<p class="muted">When Refract is turned off, or a community is disabled, removed or given other servers, its restored
+accounts are hidden at once and ended at the time shown. Keep holds them hidden without ending them; Release starts
+their time again.</p>
+<div class="scroll">
+<table class="dense">
+<thead><tr><th>Why</th><th>Accounts</th><th>Since</th><th>Ends</th><th></th></tr></thead>
+<tbody>
+{% for p in pending %}
+<tr>
+<td><code class="chip">{{ p.scope }}</code></td>
+<td>{{ p.dids }}</td>
+<td class="nowrap">{{ p.since }}</td>
+<td class="nowrap">{{ p.ends }}</td>
+<td class="actions"><form class="inline" method="post" action="/admin/communities/keep"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="scope" value="{{ p.scope }}">{% if p.keep %}<input type="hidden" name="keep" value="false"><button class="secondary" type="submit">Release</button>{% else %}<input type="hidden" name="keep" value="true"><button class="secondary" type="submit">Keep</button>{% endif %}</form></td>
+</tr>
+{% else %}
+<tr><td colspan="5" class="muted">No pending ends.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<p class="muted">The same from the command line: <code>admin refract list</code>, <code>admin refract check &lt;did&gt;</code>,
+<code>admin refract end &lt;did&gt;</code>, <code>admin refract keep|unkeep &lt;scope&gt;</code>.</p>
+{% endblock %}

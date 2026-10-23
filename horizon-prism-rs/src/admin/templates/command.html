@@ -11,6 +11,7 @@
 {% if restart == Some(true) %}<p class="banner ok">Prism has restarted.</p>{% endif %}
 {% if !row.raw.is_empty() %}<details><summary>Details</summary><pre>{{ row.raw }}</pre></details>{% endif %}
 <p class="muted tech">technical name: {{ row.command }} · command {{ row.id }}</p>
+{% if let Some(f) = follow %}<div class="row"><a class="button" href="{{ f.href }}">{{ f.label }}</a></div>{% endif %}
 </div>
 {% if let Some(o) = offer %}
 <div class="card">

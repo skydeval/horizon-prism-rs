@@ -203,6 +203,140 @@ async fn communities_page() {
     h.db.drop_db().await;
 }
 
+/// The Refract accounts page (refract design §9): the list with its state
+/// filter and history progress; adding by handle and by DID (refused while
+/// Refract is off); an account's page; check again; a removal typed with
+/// the handle and offered only for restored accounts; the command's page
+/// linking back; pending ends released from here.
+#[tokio::test]
+async fn refract_accounts_page() {
+    const DAN: &str = "did:plc:dddddddddddddddddddddddd";
+    let Some(h) = harness("admin_refract_accounts").await else {
+        return;
+    };
+    let p = h.pool();
+    let alice = complete_setup(&h, ALICE).await;
+    sqlx::query("INSERT INTO actors (did, handle, pds_endpoint) VALUES ($1, $2, 'https://community-a.example')").bind(BOB).bind(BOB_HANDLE).execute(p).await.expect("actor");
+    let verdict = json!({"at": "2026-10-22T00:00:00Z", "rules": [{"rule": 1, "result": "pass", "detail": "AccountTakedown"}]});
+    sqlx::query(
+        "INSERT INTO refract_dids (did, community, pds_host, state, source, since, last_verdict) VALUES ($1, 'community-a', 'community-a.example', 'restored', 'fill', now(), $2)",
+    )
+    .bind(BOB)
+    .bind(&verdict)
+    .execute(p)
+    .await
+    .expect("bob");
+    sqlx::query("INSERT INTO refract_dids (did, community, pds_host, state, source) VALUES ($1, 'community-a', 'community-a.example', 'rejected', 'admin')")
+        .bind(CAROL)
+        .execute(p)
+        .await
+        .expect("carol");
+    let cursor = json!({"collection": "app.bsky.feed.post", "cursor": "c", "done": ["app.bsky.actor.profile"]});
+    sqlx::query("INSERT INTO backfill_jobs (did, depth, state, refract_cursor) VALUES ($1, 'refract', 'running', $2)").bind(BOB).bind(&cursor).execute(p).await.expect("job");
+    sqlx::query("INSERT INTO refract_events (did, from_state, to_state, reason) VALUES ($1, 'candidate', 'restored', 'rules')").bind(BOB).execute(p).await.expect("event");
+    sqlx::query("INSERT INTO refract_pending (scope, keep) VALUES ('feature', true)").execute(p).await.expect("pending");
+    sqlx::query("INSERT INTO refract_pending_dids (scope, did) VALUES ('feature', $1)").bind(BOB).execute(p).await.expect("pending did");
+    let list = format!("{}/admin/refract", h.base);
+    let url = |path: &str| format!("{}/admin/refract/{path}", h.base);
+
+    // Off: everything listed, said plainly, and nothing can be added.
+    let page = get(&alice, &list).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for text in [
+        "aria-current=\"page\">Refract accounts</a>",
+        "Refract is off",
+        BOB_HANDLE,
+        CAROL,
+        "fetching, 1 collection fetched, now app.bsky.feed.post",
+        "Pending ends",
+        ">Release</button>",
+        "<main class=\"wide\">",
+        "<table class=\"dense\">",
+    ] {
+        assert!(page.body.contains(text), "{text}: {}", page.body);
+    }
+    assert!(!page.body.contains("action=\"/admin/refract/add\""), "{}", page.body);
+    let csrf = csrf_of(&page);
+    let before = count(p, "SELECT count(*) FROM admin_commands").await;
+    let refused = post(&alice, &url("add"), &[("csrf", &csrf), ("input", DAN)]).await;
+    assert!(refused.status == 400 && refused.body.contains("Refract is off"), "{}", refused.body);
+    assert_eq!(count(p, "SELECT count(*) FROM admin_commands").await, before, "nothing queued while off");
+    let restored = get(&alice, &format!("{list}?state=restored")).await;
+    assert!(restored.body.contains(BOB) && !restored.body.contains(CAROL), "{}", restored.body);
+
+    // On: add by handle and by DID; a bad one is refused.
+    h.live.update(|v| v.refract_enabled = true);
+    let page = get(&alice, &list).await;
+    assert!(page.body.contains("action=\"/admin/refract/add\"") && !page.body.contains("Refract is off"), "{}", page.body);
+    h.identity.handles.lock().expect("lock").insert("dan.example.com".to_string(), DAN.to_string());
+    let added = post(&alice, &url("add"), &[("csrf", &csrf), ("input", "@Dan.example.com")]).await;
+    assert_eq!(added.status, 303, "{}", added.body);
+    let (command, args, by) = newest(p).await;
+    assert_eq!((command.as_str(), args, by.as_deref()), ("refract check", json!({"did": DAN}), Some(ALICE)));
+    let added = post(&alice, &url("add"), &[("csrf", &csrf), ("input", CAROL)]).await;
+    assert_eq!(added.status, 303, "{}", added.body);
+    assert_eq!(newest(p).await.1, json!({"did": CAROL}));
+    let before = count(p, "SELECT count(*) FROM admin_commands").await;
+    let bad = post(&alice, &url("add"), &[("csrf", &csrf), ("input", "not a handle")]).await;
+    assert_eq!(bad.status, 400, "{}", bad.body);
+    assert_eq!(count(p, "SELECT count(*) FROM admin_commands").await, before);
+
+    // The account's page: what `admin refract show` gives.
+    let detail = get(&alice, &url(BOB)).await;
+    assert_eq!(detail.status, 200, "{}", detail.body);
+    for text in [
+        "restored: kept and served",
+        "1. Bluesky withholds it",
+        "AccountTakedown",
+        "Hidden while a pending end runs",
+        "fetching, 1 collection fetched",
+        "rules",
+        "Check again",
+        "Remove…",
+    ] {
+        assert!(detail.body.contains(text), "{text}: {}", detail.body);
+    }
+    let rejected = get(&alice, &url(CAROL)).await;
+    assert!(rejected.body.contains("Only a restored account") && !rejected.body.contains("Remove…"), "{}", rejected.body);
+    assert_eq!(get(&alice, &url("did:plc:nobodynobodynobodynobody")).await.status, 404);
+
+    // Check again.
+    let checked = post(&alice, &url("check"), &[("csrf", &csrf), ("did", BOB)]).await;
+    assert_eq!(checked.status, 303, "{}", checked.body);
+    assert_eq!(newest(p).await.0, "refract check");
+
+    // Remove: the confirmation, the typed handle, then `refract end`.
+    let before = count(p, "SELECT count(*) FROM admin_commands").await;
+    let ask = post(&alice, &url("end"), &[("csrf", &csrf), ("did", BOB), ("reason", "spam")]).await;
+    assert_eq!(ask.status, 200, "{}", ask.body);
+    assert!(ask.body.contains(&format!("type <code>{BOB_HANDLE}</code>")) && ask.body.contains("that point at it (their likes, follows, replies and quotes) are kept"), "{}", ask.body);
+    let wrong = post(&alice, &url("end"), &[("csrf", &csrf), ("did", BOB), ("reason", "spam"), ("confirm", "yes"), ("typed", "bbbbbbbb")]).await;
+    assert_eq!(wrong.status, 400, "{}", wrong.body);
+    let missing = post(&alice, &url("end"), &[("csrf", &csrf), ("did", BOB), ("confirm", "yes")]).await;
+    assert_eq!(missing.status, 400, "{}", missing.body);
+    let not_restored = post(&alice, &url("end"), &[("csrf", &csrf), ("did", CAROL), ("confirm", "yes"), ("typed", "cccccccc")]).await;
+    assert_eq!(not_restored.status, 400, "{}", not_restored.body);
+    assert_eq!(count(p, "SELECT count(*) FROM admin_commands").await, before, "nothing queued unconfirmed");
+    let done = post(&alice, &url("end"), &[("csrf", &csrf), ("did", BOB), ("reason", "spam"), ("confirm", "yes"), ("typed", "@Bob.Example.com")]).await;
+    assert_eq!(done.status, 303, "{}", done.body);
+    let (command, args, by) = newest(p).await;
+    assert_eq!((command.as_str(), args, by.as_deref()), ("refract end", json!({"did": BOB, "reason": "spam"}), Some(ALICE)));
+
+    // Once run, the command's page links to the account.
+    let id: i64 = sqlx::query_scalar("SELECT max(id) FROM admin_commands").fetch_one(p).await.expect("id");
+    let waiting = get(&alice, &format!("{}/admin/commands/{id}", h.base)).await;
+    assert!(!waiting.body.contains("See the account"), "{}", waiting.body);
+    sqlx::query("UPDATE admin_commands SET state = 'done', result = '{}' WHERE id = $1").bind(id).execute(p).await.expect("done");
+    let ran = get(&alice, &format!("{}/admin/commands/{id}", h.base)).await;
+    assert!(ran.body.contains(&format!("href=\"/admin/refract/{BOB}\"")), "{}", ran.body);
+
+    // Pending ends: release.
+    let release = post(&alice, &format!("{}/admin/communities/keep", h.base), &[("csrf", &csrf), ("scope", "feature"), ("keep", "false")]).await;
+    assert_eq!(release.status, 303, "{}", release.body);
+    assert_eq!(newest(p).await, ("refract keep".to_string(), json!({"scope": "feature", "keep": false}), Some(ALICE.to_string())));
+    h.db.drop_db().await;
+}
+
 #[tokio::test]
 async fn look_up() {
     let Some(h) = harness("admin_s5_lookup").await else {

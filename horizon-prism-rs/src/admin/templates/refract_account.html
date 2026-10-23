@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block main_class %} class="wide"{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p><code>{{ did }}</code> · <a href="/admin/refract">All Refract accounts</a> · <a href="/admin/lookup?q={{ did }}">Look up</a></p>
+{% if !enabled %}
+<div class="banner">Refract is off: nothing is checked and no account is kept. Turn it on on the <a href="/admin/communities">Communities</a> page.</div>
+{% endif %}
+{% if !pending.is_empty() %}
+<div class="banner">Hidden while a pending end runs: {% for p in pending %}<code>{{ p }}</code>{% if !loop.last %}, {% endif %}{% endfor %}. See <a href="/admin/refract">Pending ends</a>.</div>
+{% endif %}
+<div class="grid">
+<div class="card">
+<h2>State</h2>
+<p><strong>{{ state_words }}</strong> <span class="muted tech">({{ state }})</span></p>
+{% for x in facts %}<div class="fact"><span class="l">{{ x.label }}</span><span class="v">{{ x.value }}</span></div>
+{% endfor %}
+</div>
+<div class="card">
+<h2>Last check</h2>
+{% if rules.is_empty() %}
+<p class="muted">Not checked yet.</p>
+{% else %}
+{% if !verdict_at.is_empty() %}<p class="muted">{{ verdict_at }}</p>{% endif %}
+{% for r in rules %}<div class="fact"><span class="l">{{ r.rule }}</span><span class="v{% if r.result == "pass" %} ok{% else if r.result == "fail" %} bad{% endif %}">{{ r.result }}{% if !r.detail.is_empty() %}: {{ r.detail }}{% endif %}</span></div>
+{% endfor %}
+{% endif %}
+{% if !verdict.is_empty() %}<details><summary>Details</summary><pre>{{ verdict }}</pre></details>{% endif %}
+</div>
+</div>
+
+<h2>Actions</h2>
+<div class="card">
+{% if can_check && enabled %}
+<form class="inline" method="post" action="/admin/refract/check"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ did }}"><button class="secondary" type="submit">Check again</button></form>
+{% endif %}
+{% if can_end %}
+<form class="stack" method="post" action="/admin/refract/end">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="did" value="{{ did }}">
+<label for="end-reason">Your note (optional)</label>
+<input type="text" id="end-reason" name="reason">
+<p class="hint">Removing stops keeping the account: Prism deletes what it stored for it, and keeps members' own records that point at it.</p>
+<div class="row"><button class="secondary" type="submit">Remove…</button></div>
+</form>
+{% else %}
+<p class="muted">Only a restored account, or one in grace, can be removed.</p>
+{% endif %}
+</div>
+
+<h2>Labels from its community</h2>
+<div class="scroll">
+<table class="dense">
+<thead><tr><th>Labeler</th><th>On</th><th>Label</th><th>Made</th><th>Expires</th><th>Ends it</th><th>Verified</th></tr></thead>
+<tbody>
+{% for l in labels %}
+<tr><td><code class="chip">{{ l.labeler }}</code></td><td><code class="chip">{{ l.subject }}</code></td><td class="nowrap"><code class="chip">{{ l.val }}</code></td><td class="nowrap">{{ l.cts }}</td><td class="nowrap">{{ l.exp }}</td><td>{% if l.gone %}yes{% else %}no{% endif %}</td><td>{% if l.verified %}yes{% else %}no{% endif %}</td></tr>
+{% else %}
+<tr><td colspan="7" class="muted">No labels stored for this account.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+<h2>What happened</h2>
+<div class="scroll">
+<table class="dense">
+<thead><tr><th>When</th><th>From</th><th>To</th><th>Why</th></tr></thead>
+<tbody>
+{% for e in events %}
+<tr><td class="nowrap">{{ e.at }}</td><td class="nowrap">{{ e.from }}</td><td class="nowrap">{{ e.to }}</td><td>{{ e.reason }}</td></tr>
+{% else %}
+<tr><td colspan="4" class="muted">Nothing recorded yet.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<p class="muted tech">technical name: admin refract show {{ did }}</p>
+{% endblock %}

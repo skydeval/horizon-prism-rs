@@ -146,6 +146,8 @@ struct Harness {
     served: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The endpoint counters the stats page reads.
     usage: usage::Usage,
+    /// The live settings the pages read.
+    live: settings::LiveSettings,
     /// The in-memory scope sets the pages read.
     scope: ScopeState,
     _drainer: Box<dyn Send>,
@@ -195,6 +197,7 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
         settings: settings::SettingsContext::from_file(test_support::no_auto_join()),
         disks: stats::DiskPaths { data: dir.clone(), postgres: dir.clone(), redis: dir.join("no-redis-volume") },
     };
+    let live_settings = settings.settings.live.clone();
     let hub = live::Hub::with_timing(snippets, timing);
     let usage = usage::Usage::default();
     let admin = AdminState::new(
@@ -243,6 +246,7 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
         served: Mutex::new(Some(served)),
         usage,
         scope,
+        live: live_settings,
         _drainer: Box::new(drainer),
     })
 }

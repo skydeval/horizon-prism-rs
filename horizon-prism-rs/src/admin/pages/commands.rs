@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
 
-use super::{COMMAND_COLUMNS, CommandRow, CommandTuple, Nav, css, message, render};
+use super::{COMMAND_COLUMNS, CommandRow, CommandTuple, Link, Nav, css, message, render};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
 
@@ -28,6 +28,8 @@ struct CommandPage {
     row: CommandRow,
     offer: Option<HostOffer>,
     csrf: String,
+    /// The page of the account a Refract command was about.
+    follow: Option<Link>,
     /// A done restart: whether Prism is back.
     restart: Option<bool>,
 }
@@ -73,6 +75,13 @@ pub async fn page(
         input: row.args.get("input").and_then(Value::as_str).unwrap_or_default().to_string(),
         note: row.args.get("note").and_then(Value::as_str).unwrap_or_default().to_string(),
     });
+    // A Refract check or end: the account's page, once it has run.
+    let follow = row
+        .args
+        .get("did")
+        .and_then(Value::as_str)
+        .filter(|_| matches!(row.command.as_str(), "refract check" | "refract end") && !row.pending())
+        .map(|did| Link { href: format!("/admin/refract/{did}"), label: "See the account".to_string() });
     render(
         StatusCode::OK,
         &CommandPage {
@@ -83,6 +92,7 @@ pub async fn page(
             offer,
             csrf: op.csrf.clone(),
             restart,
+            follow,
         },
     )
 }

@@ -26,7 +26,7 @@
 <span class="muted">admin</span>
 {% endif %}
 </header>
-<main>
+<main{% block main_class %}{% endblock %}>
 {% if let Some(nav) = nav %}
 {% if nav.banners.set_aside > 0 %}
 <div class="banner bad">Some saved settings could not be used: {{ nav.banners.set_aside }} saved setting{% if nav.banners.set_aside != 1 %}s{% endif %} could not be used when Prism last started. <a href="/admin/settings">See which, and why</a>.</div>

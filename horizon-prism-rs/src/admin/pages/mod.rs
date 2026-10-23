@@ -16,6 +16,7 @@ pub mod lookup;
 pub mod members;
 pub mod operators;
 pub mod problems;
+pub mod refract;
 pub mod settings;
 pub mod setup;
 pub mod stats;
@@ -72,7 +73,7 @@ pub struct MenuLink {
 
 /// The top menu (§6), in its order: everyday pages first, Settings last
 /// (#810). `(current, href, label)`; `current` is [`Nav::current`]'s word.
-pub const MENU: [(&str, &str, &str); 13] = [
+pub const MENU: [(&str, &str, &str); 14] = [
     ("home", "/admin", "Home"),
     ("members", "/admin/members", "Members"),
     ("health", "/admin/health", "Health"),
@@ -82,6 +83,7 @@ pub const MENU: [(&str, &str, &str); 13] = [
     ("farsight", "/admin/farsight", "Blocks"),
     ("labels", "/admin/labels", "Labels"),
     ("communities", "/admin/communities", "Communities"),
+    ("refract", "/admin/refract", "Refract accounts"),
     ("lookup", "/admin/lookup", "Look up"),
     ("audit", "/admin/audit", "Audit log"),
     ("operators", "/admin/operators", "Operators"),

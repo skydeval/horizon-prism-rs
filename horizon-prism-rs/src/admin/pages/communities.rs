@@ -21,11 +21,10 @@ use axum::Form;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Confirm, Nav, confirmed, css, enqueue, hidden_field, message, render, when};
+use super::{Confirm, Nav, confirmed, css, enqueue, hidden_field, message, render};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
 use crate::admin::settings::store::Change;
@@ -34,7 +33,7 @@ use crate::config::{LabelSource, RefractCommunity, default_gone_labels};
 
 const ENABLED: &str = "refract.enabled";
 const LIST: &str = "refract.communities";
-const STATES: [&str; 5] = ["candidate", "rejected", "restored", "grace", "ending"];
+const STATES: [&str; 5] = ["restored", "grace", "candidate", "ending", "rejected"];
 
 /// One community as the page shows and edits it.
 pub struct CommunityView {
@@ -46,8 +45,36 @@ pub struct CommunityView {
     pub source: String,
     pub gone: String,
     pub enabled: bool,
-    /// Accounts by state, in [`STATES`]' order.
-    pub counts: Vec<i64>,
+    /// The servers and gone labels one by one, each a chip.
+    pub pattern_list: Vec<String>,
+    pub gone_list: Vec<String>,
+    /// The labeler DID shortened for the table (the full one in its title).
+    pub labeler_short: String,
+    /// Accounts by state, in [`STATES`]' order, each linked to its list.
+    pub counts: Vec<Count>,
+}
+
+/// One community's accounts in one state.
+pub struct Count {
+    pub n: i64,
+    pub state: &'static str,
+    pub href: String,
+}
+
+/// A long DID shortened to its method, its first four and last four
+/// characters: `did:plc:cccc…cccc`.
+#[must_use]
+pub fn short_did(did: &str) -> String {
+    let Some((method, id)) = did.strip_prefix("did:").and_then(|r| r.split_once(':')) else {
+        return did.to_string();
+    };
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= 12 {
+        return did.to_string();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("did:{method}:{head}…{tail}")
 }
 
 /// Accounts of a community no longer listed.
@@ -73,7 +100,6 @@ struct CommunitiesPage {
     title: String,
     csrf: String,
     enabled: bool,
-    states: Vec<&'static str>,
     communities: Vec<CommunityView>,
     pending: Vec<PendingView>,
     unlisted: Vec<Unlisted>,
@@ -110,10 +136,20 @@ fn view(c: &RefractCommunity, counts: &HashMap<(String, String), i64>) -> Commun
         patterns: c.pds_patterns.join(", "),
         appview: c.appview_network.clone().unwrap_or_default(),
         labeler: c.labeler_did.clone().unwrap_or_default(),
+        labeler_short: c.labeler_did.as_deref().map(short_did).unwrap_or_default(),
         source: c.label_source.map(LabelSource::as_str).unwrap_or_default().to_string(),
         gone: c.gone_labels.join(", "),
         enabled: c.enabled,
-        counts: STATES.iter().map(|s| counts.get(&(c.name.clone(), (*s).to_string())).copied().unwrap_or(0)).collect(),
+        pattern_list: c.pds_patterns.clone(),
+        gone_list: c.gone_labels.clone(),
+        counts: STATES
+            .iter()
+            .map(|s| Count {
+                n: counts.get(&(c.name.clone(), (*s).to_string())).copied().unwrap_or(0),
+                state: s,
+                href: super::refract::link(s, &c.name, 0),
+            })
+            .collect(),
     }
 }
 
@@ -128,16 +164,10 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         Ok(c) => c,
         Err(e) => return super::internal_error(&state, &e),
     };
-    let pending: Vec<(String, DateTime<Utc>, bool, i64)> = match sqlx::query_as(
-        "SELECT p.scope, p.first_seen, p.keep, (SELECT count(*) FROM refract_pending_dids d WHERE d.scope = p.scope) FROM refract_pending p ORDER BY p.scope",
-    )
-    .fetch_all(&state.pool)
-    .await
-    {
+    let pending = match super::refract::pending(&state).await {
         Ok(p) => p,
         Err(e) => return super::internal_error(&state, &e),
     };
-    let delay = chrono::TimeDelta::hours(i64::from(state.settings.running.refract.disable_delay_hours));
     let mut unlisted: Vec<Unlisted> = Vec::new();
     for ((community, _), n) in &counts {
         if !list.iter().any(|c| &c.name == community) {
@@ -156,18 +186,8 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             title: "Communities".to_string(),
             csrf: op.csrf.clone(),
             enabled,
-            states: STATES.to_vec(),
             communities: list.iter().map(|c| view(c, &counts)).collect(),
-            pending: pending
-                .into_iter()
-                .map(|(scope, since, keep, dids)| PendingView {
-                    ends: if keep { "kept".to_string() } else { when(since + delay) },
-                    since: when(since),
-                    scope,
-                    keep,
-                    dids,
-                })
-                .collect(),
+            pending,
             unlisted,
         },
     )
@@ -481,5 +501,12 @@ mod tests {
         let mut off = e.clone();
         off.enabled = false;
         assert!(may_make_pending(&e, &off) && !may_make_pending(&off, &e));
+    }
+
+    #[test]
+    fn long_dids_are_shortened() {
+        assert_eq!(short_did("did:plc:cccccccccccccccccccccccc"), "did:plc:cccc…cccc");
+        assert_eq!(short_did("did:web:a.example"), "did:web:a.example");
+        assert_eq!(short_did("not a did"), "not a did");
     }
 }

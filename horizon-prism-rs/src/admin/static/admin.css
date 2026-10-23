@@ -318,6 +318,24 @@ tr:last-child td { border-bottom: none; }
 tbody tr:hover { background-color: var(--card-hover); }
 td.actions { white-space: nowrap; text-align: right; }
 
+/* Wide tables (Communities, Refract accounts): a wider column for the page,
+   and nothing breaks inside a word or a token. Headers, names, dates and
+   chips stay on one line; text wraps only between them; a table too wide
+   for the screen scrolls inside its .scroll box. */
+main.wide { max-width: 110rem; }
+main.wide > p, main.wide > .banner { max-width: 74rem; }
+table.dense th, table.dense td { overflow-wrap: normal; word-break: normal; }
+table.dense th { white-space: nowrap; }
+table.dense td.actions { white-space: nowrap; }
+table.dense td.actions form.inline + form.inline, table.dense td.actions .button + form.inline { margin-left: 0.35rem; }
+.nowrap { white-space: nowrap; }
+code.chip { white-space: nowrap; overflow-wrap: normal; display: inline-block; margin: 0 0.25rem 0.25rem 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 0.25rem 0.35rem; }
+.chips code.chip { margin: 0; }
+.counts { display: flex; flex-wrap: wrap; gap: 0.15rem 0.6rem; }
+.counts a, .counts span { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.counts .zero { color: var(--muted); }
+
 /* Code */
 code, pre { font-family: var(--font-mono); font-size: 0.86rem; }
 code { background: var(--code); color: var(--code-fg); padding: 0.1rem 0.35rem; border-radius: var(--radius-sm); border: 1px solid var(--code-border); overflow-wrap: anywhere; }
