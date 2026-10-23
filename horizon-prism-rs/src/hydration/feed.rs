@@ -116,6 +116,16 @@ impl PostContext {
         self.profiles.viewer.blocked_either_way(did)
     }
 
+    /// The `indexedAt` a view of `row` carries. A restored author's posts
+    /// are mostly backfilled, so the row's `indexed_at` is when Prism wrote
+    /// it, long after the post was made, and stock clients show such a post
+    /// as archived with the wrong date (#879). A restored view carries the
+    /// earlier of `created_at` and `indexed_at`, which also keeps a
+    /// future-dated `createdAt` out. The stored row is unchanged.
+    fn shown_indexed_at(&self, row: &PostRow) -> DateTime<Utc> {
+        if self.profiles.markers.contains_key(&row.author_did) { row.created_at.min(row.indexed_at) } else { row.indexed_at }
+    }
+
     /// `app.bsky.feed.defs#postView`, if the post is local and not hidden.
     #[must_use]
     pub fn post_view(&self, uri: &str) -> Option<Value> {
@@ -145,7 +155,7 @@ impl PostContext {
         if let Some(n) = self.bookmark_counts.get(uri) {
             v.insert("bookmarkCount".into(), json!(n));
         }
-        v.insert("indexedAt".into(), json!(ts(row.indexed_at)));
+        v.insert("indexedAt".into(), json!(ts(self.shown_indexed_at(row))));
         v.insert("viewer".into(), self.viewers.get(uri).cloned().unwrap_or_else(|| json!({})));
         v.insert("labels".into(), Value::Array(self.labels.get(uri).cloned().unwrap_or_default()));
         if let Some(gate) = self.threadgates.get(uri) {
@@ -189,7 +199,7 @@ impl PostContext {
         v.insert("repostCount".into(), json!(c.and_then(|c| c.reposts).or(row.repost_count).unwrap_or(0)));
         v.insert("replyCount".into(), json!(c.and_then(|c| c.replies).or(row.reply_count).unwrap_or(0)));
         v.insert("quoteCount".into(), json!(c.and_then(|c| c.quotes).or(row.quote_count).unwrap_or(0)));
-        v.insert("indexedAt".into(), json!(ts(row.indexed_at)));
+        v.insert("indexedAt".into(), json!(ts(self.shown_indexed_at(row))));
         if depth == 0
             && let Some(embed) = row.embed.as_ref().and_then(|e| self.embed_view(row, e, depth + 1))
         {

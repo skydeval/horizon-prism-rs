@@ -83,6 +83,49 @@ async fn t12_timeline() {
     db.drop_db().await;
 }
 
+/// #879: a restored post's view, and a quote of it, carry the earlier of
+/// `created_at` and `indexed_at` as `indexedAt` (a backfilled post is
+/// not shown as archived); a future-dated `created_at` is never sent; a
+/// post by an account not restored keeps its `indexed_at`; the stored rows
+/// are unchanged.
+#[tokio::test]
+async fn restored_indexed_at_is_the_earlier_time() {
+    use crate::hydration::CountMode;
+    let Some(db) = fresh_db("refract_indexed_at").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(R1, "r1.test"), (OTHER, "o.test"), (MEMBER, "m.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    let old = post(p, R1, "3kold", "old", None, None).await;
+    let ahead = post(p, R1, "3kahead", "future-dated", None, None).await;
+    let theirs = post(p, OTHER, "3ktheirs", "not restored", None, None).await;
+    let quoting = post(p, OTHER, "3kquoting", "quotes the old one", None, None).await;
+    exec(p, "UPDATE posts SET indexed_at = '2026-10-20T00:00:00Z'").await;
+    exec(p, &format!("UPDATE posts SET created_at = '2024-05-01T00:00:00Z' WHERE uri IN ('{old}', '{theirs}')")).await;
+    exec(p, &format!("UPDATE posts SET created_at = '2030-01-01T00:00:00Z' WHERE uri = '{ahead}'")).await;
+    exec(
+        p,
+        &format!("UPDATE posts SET quote_uri = '{old}', embed = '{{\"$type\": \"app.bsky.embed.record\", \"record\": {{\"uri\": \"{old}\", \"cid\": \"bafy3kold\"}}}}'::jsonb WHERE uri = '{quoting}'"),
+    )
+    .await;
+    let h = hydrator_with(p, sets(), Arc::new(FixedUpstream::default()));
+    let viewer = Viewer { did: Some(MEMBER.into()), hydrate: true };
+    let uris = vec![old.clone(), ahead.clone(), theirs.clone(), quoting.clone()];
+    let ctx = h.post_context(&viewer, &Requester::test(), &uris, CountMode::List).await.expect("context");
+    let at = |uri: &str| ctx.post_view(uri).expect("view")["indexedAt"].as_str().expect("indexedAt").to_string();
+    assert_eq!(at(&old), "2024-05-01T00:00:00.000Z", "a backfilled restored post: its createdAt");
+    assert_eq!(at(&ahead), "2026-10-20T00:00:00.000Z", "a future createdAt is never sent");
+    assert_eq!(at(&theirs), "2026-10-20T00:00:00.000Z", "not restored: unchanged");
+    let quote = ctx.post_view(&quoting).expect("quoting");
+    assert_eq!(quote["embed"]["record"]["uri"], json!(old), "{quote}");
+    assert_eq!(quote["embed"]["record"]["indexedAt"], json!("2024-05-01T00:00:00.000Z"), "{quote}");
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM posts WHERE indexed_at = '2026-10-20T00:00:00Z'").fetch_one(p).await.expect("count");
+    assert_eq!(stored, 4, "indexed_at is unchanged in storage");
+    db.drop_db().await;
+}
+
 async fn replies(h: &Hydrator, root: &str, viewer: &Viewer) -> Vec<String> {
     let rows = h.refract_reply_rows(root, &restored()).await.expect("rows");
     let v = h.refract_replies(viewer, &Requester::test(), root, rows, None, Duration::from_secs(1)).await.expect("replies");

@@ -10,6 +10,10 @@ commit.
 
 ## [Unreleased]
 
+### Fixed (restored `indexedAt`, #879)
+
+- **Restored post views no longer read as archived.** A post view (and a quote's `viewRecord`) of a restored author carried `indexedAt` = when Prism wrote the row, which for a backfilled account is the backfill time, so stock clients showed older posts as "Archived from …" with the wrong date in date lines and feed timestamps. Those views now carry the earlier of the post's `createdAt` and Prism's write time, so a future-dated `createdAt` is never sent. Every path that builds restored views from stored rows gets it (`refract.*`, Thread Lens, public reads). Stored rows are unchanged; views of other accounts are unchanged.
+
 ### Added (Thread Lens hydrated views, #878, #886)
 
 - **`servedAs`** on every `app.nearhorizon.threadLens.getThread` and `resolve` answer: `member` (a ready member: post views carry its own `viewer.like`, `viewer.repost` and `viewer.threadMuted` as Prism holds them, and author viewer state) or `visitor` (none but `blockedBy` and `muted: false`). Visitors get no like or repost state: no reader DID is sent anywhere to find it.
