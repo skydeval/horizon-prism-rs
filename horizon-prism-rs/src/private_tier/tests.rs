@@ -39,6 +39,8 @@ mod threads;
 mod walk;
 // Degraded mode: the head fallback (degraded-mode design §10).
 mod degraded;
+// Public root gates (public-root-gates design §10).
+mod root_gates;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

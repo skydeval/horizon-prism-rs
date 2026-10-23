@@ -19,7 +19,7 @@ const TABLE_LABELS: &[(&str, &str)] = &[
     ("private_owner_ready", "Accounts whose private posts are ready"),
     ("private_owner_eligible", "Accounts checked for private posting"),
     ("private_bookmarks", "Private bookmarks"),
-    ("private_threadgates", "Who may reply to private posts"),
+    ("private_threadgates", "Threadgates of private posts, and of public roots with private replies"),
     ("private_postgates", "Who may quote private posts"),
     ("private_quote_refs", "Quotes of private posts"),
     ("private_notifications", "Private notifications"),
@@ -27,6 +27,7 @@ const TABLE_LABELS: &[(&str, &str)] = &[
     ("private_notification_prefs", "Private notification settings"),
     ("private_activity_subscriptions", "Private activity subscriptions"),
     ("private_post_fanout", "Private subscription fan-out queue"),
+    ("private_root_gate_fetches", "Public root threadgate fetches"),
 ];
 
 /// `(table, label)` for every private table.

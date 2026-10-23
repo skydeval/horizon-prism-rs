@@ -41,6 +41,7 @@ pub(crate) mod owners;
 mod pipeline;
 pub(crate) mod readiness;
 pub(crate) mod retention;
+pub(crate) mod root_gates;
 mod schema;
 mod stages;
 pub(crate) mod stats;
@@ -270,6 +271,11 @@ pub trait PrivateTier: Send + Sync {
     /// admitted threadgate or postgate whose `post` is a `postPrivate` URI.
     async fn apply_gate(&self, conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError>;
 
+    /// `ingest::apply_root_gate` (public-root-gates design §3.3): LWW copy
+    /// of a public root's threadgate, kept only while a private post claims
+    /// the root or a copy is already stored.
+    async fn apply_root_gate(&self, conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError>;
+
     /// `ingest::delete_gate`: the private copy of a deleted threadgate or
     /// postgate, if any (a delete does not say which post kind it gated).
     async fn delete_gate(
@@ -422,6 +428,10 @@ impl PrivateTier for KryphocronPrivateTier {
         ingest::apply_gate(conn, op).await
     }
 
+    async fn apply_root_gate(&self, conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError> {
+        ingest::apply_root_gate(conn, op).await
+    }
+
     async fn delete_gate(
         &self,
         conn: &mut PgConnection,
@@ -572,6 +582,11 @@ impl PrivateTier for DisabledPrivateTier {
 
     async fn apply_gate(&self, _conn: &mut PgConnection, _op: &PrivateOp) -> Result<Applied, IngestError> {
         metrics::counter!(METRIC_PRIVATE_SKIPPED, "op" => "apply_gate").increment(1);
+        Ok(Applied::default())
+    }
+
+    /// Not counted: every public root's gate on the network reaches it.
+    async fn apply_root_gate(&self, _conn: &mut PgConnection, _op: &PrivateOp) -> Result<Applied, IngestError> {
         Ok(Applied::default())
     }
 

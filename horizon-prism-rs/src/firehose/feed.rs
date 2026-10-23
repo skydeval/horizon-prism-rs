@@ -200,6 +200,7 @@ impl Kind {
             RecordKind::PrivateAudience => Self::Audience,
             RecordKind::PrivateBlock => Self::PrivateBlock,
             RecordKind::PrivateGate => Self::PrivateGate,
+            RecordKind::PublicRootGate => Self::Threadgate,
             RecordKind::Table(_) => Self::Other,
         }
     }
@@ -913,6 +914,7 @@ mod tests {
             RecordKind::PrivateAudience,
             RecordKind::PrivateBlock,
             RecordKind::PrivateGate,
+            RecordKind::PublicRootGate,
         ] {
             assert_ne!(Kind::from_record_kind(k), Kind::Other, "{k:?}");
         }

@@ -23,6 +23,11 @@ pub enum RecordKind {
     /// `postPrivate` URI (private posting §4.4, P-18). Its one subject is the
     /// gated post's author.
     PrivateGate,
+    /// A stock `app.bsky.feed.threadgate` on a public post, in the post
+    /// author's repo with the post's rkey (public-root-gates design §3.1).
+    /// Its public row is decided as `Table("threadgates")`; the private
+    /// tier keeps a copy while a private post claims the post as its root.
+    PublicRootGate,
 }
 
 impl RecordKind {
@@ -74,6 +79,10 @@ pub enum AdmitRule {
     /// Refract's restored rule (refract design §5.1): the author is in
     /// R-live.
     Restored,
+    /// The public-root-gate rule (public-root-gates design §3.2): a public
+    /// root's gate whose public row is not stored; only the private tier's
+    /// copy is written, and only while a private post claims the root.
+    PublicRootGate,
 }
 
 /// Why an op was rejected.
@@ -143,6 +152,19 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     // off rule: a block kind is stored only with a member side.
     if input.kind.is_block_kind() {
         return block_rule(input, sets);
+    }
+    // The public-root-gate rule (public-root-gates design §3.2), in every
+    // mode: the public row as a `threadgates` record decides; when it is not
+    // stored, the private tier's copy is still offered.
+    if input.kind == RecordKind::PublicRootGate {
+        let public = AdmissionInput {
+            kind: RecordKind::Table("threadgates"),
+            ..input.clone()
+        };
+        return match admit(&public, sets) {
+            admitted @ Admission::Admit(_) => admitted,
+            _ => Admission::Admit(AdmitRule::PublicRootGate),
+        };
     }
     // Refract's restored rule (refract design §5.1), in every mode, before
     // the off rule.
@@ -250,6 +272,8 @@ fn off_rule(input: &AdmissionInput, sets: &ScopeSets) -> Option<Admission> {
         | RecordKind::PrivateAudience
         | RecordKind::PrivateBlock
         | RecordKind::PrivateGate => None,
+        // Decided before the off rule, through its public row.
+        RecordKind::PublicRootGate => None,
         RecordKind::Follow => {
             let subject_member = input.subjects.iter().any(|s| sets.is_member(s));
             if author_member || subject_member { None } else { off }
@@ -436,6 +460,41 @@ mod tests {
             Admission::Reject(RejectReason::Purging(PurgeKind::OutOfScope))
         );
         assert!(RecordKind::PrivateGate.is_private());
+    }
+
+    /// Public-root-gates T-1 (design §3.2): a public root's gate takes its
+    /// public row's decision when that admits, and is otherwise admitted
+    /// for the private tier's copy alone, in every mode; an
+    /// `account_deleted` author is rejected first.
+    #[test]
+    fn t1_public_root_gates() {
+        const ROOT_GATE: Admission = Admission::Admit(AdmitRule::PublicRootGate);
+        let gate = |author: &str, s: &ScopeSets| admit(&input(author, RecordKind::PublicRootGate, &[]), s);
+        for mode in [PublicMode::On, PublicMode::Filling, PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
+            let s = with_mode(mode);
+            let public = |author: &str| admit(&input(author, RecordKind::Table("threadgates"), &[]), &s);
+            for author in [MEMBER, SCOPED, OWNER, STRANGER] {
+                let expected = match public(author) {
+                    a @ Admission::Admit(_) => a,
+                    _ => ROOT_GATE,
+                };
+                assert_eq!(gate(author, &s), expected, "{mode:?} {author}");
+            }
+            // In On an author in S keeps its public row; off, nobody does.
+            let scoped = if mode.off_rule() { ROOT_GATE } else { Admission::Admit(AdmitRule::AuthorInScope) };
+            assert_eq!(gate(SCOPED, &s), scoped, "{mode:?}");
+            assert_eq!(gate(STRANGER, &s), ROOT_GATE, "{mode:?}");
+            // A restored non-member keeps its public row in every mode.
+            assert_eq!(gate(RESTORED, &restored(mode, false)), Admission::Admit(AdmitRule::Restored), "{mode:?}");
+            assert_eq!(gate(RESTORED, &restored(mode, true)), if mode.off_rule() { ROOT_GATE } else { Admission::Admit(AdmitRule::AuthorInScope) }, "{mode:?}");
+            let mut d = s.clone();
+            d.purging.insert(STRANGER.into(), PurgeKind::AccountDeleted);
+            assert_eq!(gate(STRANGER, &d), Admission::Reject(RejectReason::Purging(PurgeKind::AccountDeleted)), "{mode:?}");
+            let mut o = s.clone();
+            o.purging.insert(STRANGER.into(), PurgeKind::OutOfScope);
+            assert_eq!(gate(STRANGER, &o), ROOT_GATE, "{mode:?}");
+        }
+        assert!(!RecordKind::PublicRootGate.is_private() && !RecordKind::PublicRootGate.is_block_kind());
     }
 
     #[test]

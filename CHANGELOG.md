@@ -10,6 +10,12 @@ commit.
 
 ## [Unreleased]
 
+### Added (public root gates PRG1: storage and fetch, #850, #852)
+
+- **A public thread root's threadgate is kept for its private replies.** A stock `app.bsky.feed.threadgate` naming a public post in its author's own repo, with the post's rkey, is copied by the private tier into `private_threadgates`, whoever its author is and in every public-indexing mode, while a private post claims that post as its `reply.root` (or a copy is already stored, so it stays current). Its public row is decided as before. The off sweep and an `out_of_scope` purge keep the copy; a gate delete and an `account_deleted` purge remove it.
+- **One-time fetch.** When a private reply is its public root's only stored one and no copy of the root's gate is stored, a fetch of the gate from its author's PDS is queued (`private_root_gate_fetches`); a worker in `serve` runs it through the `requestRecord` path (`getLatestCommit`, `getRecord`, the write path at that rev) under the host's backfill budget, retries with backoff, and gives up after 8 attempts. A gate delete while a fetch is pending tombstones the gate. Metric `private_root_gate_fetches_total{outcome}`.
+- **Migration 0042** (`0042_public_root_gates`): an index on `private_posts (reply_root_uri)`, the fetch queue, and a seed queueing every public root already claimed by a stored private post, which the worker drains after the deploy.
+
 ### Added (private activity subscriptions, #839, #848)
 
 - **Private activity subscriptions.** `app.nearhorizon.private.putActivitySubscription` and `listActivitySubscriptions` let a member be notified of an account's new private posts and replies, separately from the public bell. A new private post notifies each subscriber who can read it, as a `subscribed-post` private notification written seconds after the post is first stored; subscribers outside the post's audience get nothing. The account's notification declaration and the subscriber's follow apply. A new `subscribedPost` notification preference turns the reason off. `getMembership` lists `private.activitySubscriptions`.

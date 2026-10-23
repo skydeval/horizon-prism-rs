@@ -648,6 +648,12 @@ pub async fn run() -> Result<Stopped, StartupError> {
             .await
             .map_err(|e| StartupError::new(1, format!("starting backfill: {e}")))?,
     );
+    // Public root gate fetches (public-root-gates design §4.2), migration
+    // 0042's seed first.
+    tasks.push(
+        crate::private_tier::root_gates::RootGateFetches::new(pool.clone(), writer.clone(), Arc::clone(&source), fh.deterministic_attempts)
+            .spawn(),
+    );
     tasks.push(CountRefresher::new(pool.clone(), redis.clone(), constellation.clone(), &cfg.file.counts).spawn());
     let rebuild = Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days)
         .with_sync_min_interval_secs(lists.sync_min_interval_secs)

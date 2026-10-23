@@ -539,6 +539,12 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .fetch_optional(&mut *conn)
             .await?;
             let changed = inserted.is_some();
+            // A reply under a public root that is the root's only stored one
+            // queues a fetch of the root's gate (public-root-gates design
+            // §4.1).
+            if changed && let Some((root, gate)) = public_root(f.reply_root_uri.as_deref()) {
+                queue_root_gate_fetch(&mut *conn, &op.uri, root, &gate).await?;
+            }
             // The first store of a recent post queues its subscribed-post
             // fan-out, whoever subscribes (private-activity-subs §5.1). An
             // update never does: an audience change, a rotation or a PDS
@@ -718,9 +724,95 @@ pub(crate) async fn apply_gate(conn: &mut PgConnection, op: &PrivateOp) -> Resul
     })
 }
 
+/// `ingest::apply_root_gate` (public-root-gates design §3.3): LWW copy of a
+/// public root's valid threadgate into `private_threadgates`, with
+/// `private_tombstones` checked, kept only while a private post claims its
+/// post as `reply.root`, or when a copy is already stored (so it stays
+/// current after the last such reply goes). The writer has checked the
+/// gate's shape: a threadgate naming an `app.bsky.feed.post` URI in its own
+/// repo with its own rkey.
+///
+/// # Errors
+///
+/// [`IngestError::Malformed`] for a gate with no at-uri `post`; database
+/// errors.
+pub(crate) async fn apply_root_gate(conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError> {
+    if tombstoned(&mut *conn, &op.uri, &op.rev).await? {
+        return Ok(Applied::default());
+    }
+    let post = gate_post(&op.record)?;
+    let at = created_at(&op.record, Utc::now());
+    let changed = sqlx::query(
+        "INSERT INTO private_threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, hidden_replies, record, created_at) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10 \
+         WHERE EXISTS (SELECT 1 FROM private_posts WHERE reply_root_uri = $6) \
+            OR EXISTS (SELECT 1 FROM private_threadgates WHERE uri = $1) \
+         ON CONFLICT (uri) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, post_uri = EXCLUDED.post_uri, \
+           allow = EXCLUDED.allow, hidden_replies = EXCLUDED.hidden_replies, record = EXCLUDED.record, \
+           created_at = EXCLUDED.created_at, indexed_at = now() \
+         WHERE private_threadgates.rev < EXCLUDED.rev",
+    )
+    .bind(&op.uri)
+    .bind(&op.author_did)
+    .bind(&op.rkey)
+    .bind(&op.cid)
+    .bind(&op.rev)
+    .bind(&post)
+    .bind(op.record.get("allow").filter(|v| !v.is_null()).cloned())
+    .bind(gate_strings(&op.record, "hiddenReplies"))
+    .bind(&op.record)
+    .bind(at)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected()
+        > 0;
+    Ok(Applied {
+        changed,
+        ..Applied::default()
+    })
+}
+
+/// The root a fetch is queued for (public-root-gates design §4.1): a
+/// private post's `reply_root_uri` when it is an `app.bsky.feed.post` URI
+/// whose authority is a DID, with its canonical threadgate URI.
+fn public_root(root: Option<&str>) -> Option<(&str, String)> {
+    let root = root?;
+    let mut parts = root.strip_prefix("at://")?.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(did), Some(NSID_POST), Some(rkey), None) if did.starts_with("did:") && !rkey.is_empty() => {
+            Some((root, format!("at://{did}/{NSID_THREADGATE}/{rkey}")))
+        }
+        _ => None,
+    }
+}
+
+/// Queue the fetch of a public root's gate (public-root-gates design §4.1)
+/// when the private post `uri` just written is the only stored one claiming
+/// the root and no copy of its gate is stored: a gate written before then
+/// was not kept. A pending fetch is left as it is; a done one is queued
+/// again.
+async fn queue_root_gate_fetch(conn: &mut PgConnection, uri: &str, root: &str, gate: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO private_root_gate_fetches (root_uri) \
+         SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM private_posts WHERE reply_root_uri = $1 AND uri <> $2) \
+                     AND NOT EXISTS (SELECT 1 FROM private_threadgates WHERE uri = $3) \
+         ON CONFLICT (root_uri) DO UPDATE SET queued_at = now(), next_at = now(), attempts = 0, done_at = NULL, \
+           last_error = NULL \
+         WHERE private_root_gate_fetches.done_at IS NOT NULL",
+    )
+    .bind(root)
+    .bind(uri)
+    .bind(gate)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// `ingest::delete_gate`: delete the private copy of a threadgate or
 /// postgate at `uri` with `rev <= R`. Tombstone iff a row was removed or the
-/// author is in S (§5.5), as [`delete`] does.
+/// author is in S (§5.5), as [`delete`] does, or a fetch of the gate is
+/// pending, so that a fetch that read it before this delete cannot write it
+/// after (public-root-gates design §3.4).
 ///
 /// # Errors
 ///
@@ -739,13 +831,28 @@ pub(crate) async fn delete_gate(conn: &mut PgConnection, uri: &str, rev: &str, a
         .await?
         .rows_affected()
         > 0;
-    if removed || author_in_scope {
+    if removed || author_in_scope || (table == "private_threadgates" && fetch_pending(&mut *conn, uri).await?) {
         tombstone(&mut *conn, uri, rev).await?;
     }
     Ok(Applied {
         changed: removed,
         ..Applied::default()
     })
+}
+
+/// Whether a fetch of the threadgate at `uri` is pending: one queued for the
+/// public post with its repo and rkey (public-root-gates design §3.4).
+async fn fetch_pending(conn: &mut PgConnection, gate: &str) -> Result<bool, sqlx::Error> {
+    let Some((repo, rkey)) = gate.strip_prefix("at://").and_then(|r| {
+        let mut parts = r.split('/');
+        Some((parts.next()?, parts.nth(1)?))
+    }) else {
+        return Ok(false);
+    };
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM private_root_gate_fetches WHERE root_uri = $1 AND done_at IS NULL)")
+        .bind(format!("at://{repo}/{NSID_POST}/{rkey}"))
+        .fetch_one(conn)
+        .await
 }
 
 /// The record keys of `did`'s stored private posts (backfill keeps their
@@ -1304,9 +1411,12 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
     .rows_affected();
     // The DID's gates go with its private posts (private posting §3.1): any
     // whose post is no longer stored, the kept class-M replies' gates aside.
+    // Its public roots' gates stay: they are kept whoever wrote them
+    // (public-root-gates design §3.5).
     for table in ["private_threadgates", "private_postgates"] {
         n += sqlx::query(&format!(
             "DELETE FROM {table} WHERE uri IN (SELECT g.uri FROM {table} g WHERE g.author_did = $1 \
+               AND split_part(g.post_uri, '/', 4) = '{NSID_POST_PRIVATE}' \
                AND NOT EXISTS (SELECT 1 FROM private_posts p WHERE p.uri = g.post_uri) LIMIT $2)"
         ))
         .bind(did)

@@ -26,7 +26,7 @@ use super::normalize::normalize_record;
 use super::records::{GraphRecord, PostRecord, ProfileRecord, RecordError, SubjectRecord, private_subjects};
 use super::rows::{self, Cell, Row};
 use crate::aggregations::growth::{self, GrowthPlan};
-use crate::aggregations::{Admission, AdmissionInput, PurgeKind, RecordKind, RejectReason, ScopeSets, ScopeState, admit};
+use crate::aggregations::{Admission, AdmissionInput, AdmitRule, PurgeKind, RecordKind, RejectReason, ScopeSets, ScopeState, admit};
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
 use crate::hydration::normalize::is_private_uri;
 use crate::private_tier::{IngestError, PrivateOp, PrivateTier, PublicNotify, QuoteRef};
@@ -253,6 +253,9 @@ enum OpTarget<'a> {
     /// reason (member-blocks-only design §9): the stored row goes, and a
     /// tombstone at the op's rev refuses any older write of it.
     RejectedBlock(&'a Upsert, &'static str),
+    /// A public root's gate whose public row is not stored (public-root-
+    /// gates design §3.2): the private tier's copy only.
+    RootGate(&'a Upsert),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -491,6 +494,26 @@ fn private_gate_subject(row: &Row) -> Option<String> {
     uri_author(post).map(str::to_string)
 }
 
+/// Whether a gate row is a public root's gate (public-root-gates design
+/// §3.1): a threadgate whose `post` is an `app.bsky.feed.post` URI in the
+/// gate's own repo, with the gate's rkey.
+fn is_public_root_gate(row: &Row, repo: &str, rkey: &str) -> bool {
+    if row.table != "threadgates" {
+        return false;
+    }
+    let Some(post) = row.cells.iter().find_map(|(name, cell)| match (name, cell) {
+        (&"post_uri", Cell::Text(Some(uri))) => Some(uri.as_str()),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let mut parts = post.strip_prefix("at://").unwrap_or_default().split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(did), Some(super::classifier::NSID_POST), Some(k), None) if did == repo && k == rkey
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_upsert(
     repo: &str,
@@ -552,6 +575,12 @@ fn build_upsert(
                 Some(author) => {
                     kind = RecordKind::PrivateGate;
                     (Body::PrivateGate, vec![author])
+                }
+                // A public root's gate: its public row as before, and the
+                // private tier's copy (public-root-gates design §3.2).
+                None if is_public_root_gate(&row, repo, &op.rkey) => {
+                    kind = RecordKind::PublicRootGate;
+                    (Body::Row(row), Vec::new())
                 }
                 None => (Body::Row(row), Vec::new()),
             },
@@ -1004,6 +1033,10 @@ impl Writer {
                         self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
                             .await?
                     }
+                    Some(Admission::Admit(AdmitRule::PublicRootGate)) => {
+                        self.run_with_attempts(&mut tx, options, OpTarget::RootGate(u), repo, rev, sets, &mut effects)
+                            .await?
+                    }
                     // Reached by `Admit` only.
                     _ => {
                         let target = OpTarget::Upsert(u, &plans[i]);
@@ -1229,7 +1262,7 @@ impl Writer {
                     d.kind,
                     RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock | RecordKind::PrivateGate
                 ),
-                OpTarget::GrowOnly(..) | OpTarget::RejectedFollow(..) => false,
+                OpTarget::GrowOnly(..) | OpTarget::RejectedFollow(..) | OpTarget::RootGate(..) => false,
             };
             if private {
                 crate::private_tier::gauges::note_event();
@@ -1244,6 +1277,10 @@ impl Writer {
                 OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets).await,
                 OpTarget::RejectedFollow(u, reason) => self.apply_rejected_follow(&mut sp, u, reason, repo, rev, sets).await,
                 OpTarget::RejectedBlock(u, reason) => self.apply_rejected_block(&mut sp, u, reason, rev).await,
+                OpTarget::RootGate(u) => self.apply_root_gate(&mut sp, u, rev, options).await.map(|written| {
+                    let outcome = if written { OpOutcome::Written } else { OpOutcome::Unchanged };
+                    (outcome, MemoryEffects::default())
+                }),
             };
             match result {
                 Ok((outcome, eff)) => {
@@ -1328,6 +1365,30 @@ impl Writer {
         })
     }
 
+    /// The private tier's view of an upsert.
+    fn private_op(&self, u: &Upsert, rev: &str, options: ApplyOptions) -> PrivateOp {
+        PrivateOp {
+            uri: u.uri.clone(),
+            author_did: u.input.author.clone(),
+            nsid: u.collection.clone(),
+            rkey: u.rkey.clone(),
+            cid: u.cid.clone(),
+            rev: rev.to_string(),
+            record: u.record.clone(),
+            source: options.source,
+            created: u.created,
+            created_at: u.created_at,
+            notify_max_age: self.private_notify_max_age,
+            subscribed_max_age: self.subscribed_post_max_age,
+        }
+    }
+
+    /// The private tier's copy of a public root's gate (public-root-gates
+    /// design §3.3): whether it was written.
+    async fn apply_root_gate(&self, conn: &mut PgConnection, u: &Upsert, rev: &str, options: ApplyOptions) -> Result<bool, OpError> {
+        Ok(self.private.apply_root_gate(conn, &self.private_op(u, rev, options)).await?.changed)
+    }
+
     async fn apply_upsert(
         &self,
         conn: &mut PgConnection,
@@ -1341,20 +1402,7 @@ impl Writer {
         let mut eff = MemoryEffects::default();
         let author = u.input.author.as_str();
         if matches!(u.body, Body::Private | Body::PrivateGate) {
-            let op = PrivateOp {
-                uri: u.uri.clone(),
-                author_did: author.to_string(),
-                nsid: u.collection.clone(),
-                rkey: u.rkey.clone(),
-                cid: u.cid.clone(),
-                rev: rev.to_string(),
-                record: u.record.clone(),
-                source: options.source,
-                created: u.created,
-                created_at: u.created_at,
-                notify_max_age: self.private_notify_max_age,
-                subscribed_max_age: self.subscribed_post_max_age,
-            };
+            let op = self.private_op(u, rev, options);
             let applied = if u.body == Body::PrivateGate {
                 self.private.apply_gate(conn, &op).await?
             } else {
@@ -1365,9 +1413,14 @@ impl Writer {
             let outcome = if applied.changed { OpOutcome::Written } else { OpOutcome::Unchanged };
             return Ok((outcome, eff));
         }
+        // A public root's gate whose public row is admitted too (public-root-
+        // gates design §3.2): the private tier's copy first, by its own rev,
+        // before this row's tombstone and LWW returns.
+        let copied = u.input.kind == RecordKind::PublicRootGate && self.apply_root_gate(conn, u, rev, options).await?;
+        let unchanged = if copied { OpOutcome::Written } else { OpOutcome::Unchanged };
         if tombstoned(conn, &u.uri, rev).await? {
             metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "tombstoned").increment(1);
-            return Ok((OpOutcome::Unchanged, eff));
+            return Ok((unchanged, eff));
         }
         // Rule 4 (§4.3): a member's list block is a reference to the list.
         // An update may name another list, so the one it named is read
@@ -1426,7 +1479,7 @@ impl Writer {
         }
         if !written {
             metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "older_rev").increment(1);
-            return Ok((OpOutcome::Unchanged, eff));
+            return Ok((unchanged, eff));
         }
         // A public record naming a private post notifies privately, in
         // every mode, outside the `notify` flag below (private posting §4.8).
@@ -1657,6 +1710,12 @@ impl Writer {
             RecordKind::Table(table @ ("threadgates" | "postgates")) => {
                 let private = self.private.delete_gate(conn, &d.uri, rev, author_in_scope).await?;
                 delete_row(conn, table, &d.uri, rev).await? || private.changed
+            }
+            // A delete carries no record, so it is never classified as a
+            // public root's gate; were it, it is a threadgate delete.
+            RecordKind::PublicRootGate => {
+                let private = self.private.delete_gate(conn, &d.uri, rev, author_in_scope).await?;
+                delete_row(conn, "threadgates", &d.uri, rev).await? || private.changed
             }
             RecordKind::Table(table) => delete_row(conn, table, &d.uri, rev).await?,
         };
@@ -2128,6 +2187,7 @@ async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo
         RecordKind::Follow => vec!["follows"],
         RecordKind::Block => vec!["blocks"],
         RecordKind::Table(table) => vec![table],
+        RecordKind::PublicRootGate => vec!["threadgates"],
         // The private tier keeps its own (`ingest::delete`).
         RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateBlock | RecordKind::PrivateGate => {
             return Ok(false);
