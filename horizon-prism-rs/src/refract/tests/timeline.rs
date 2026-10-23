@@ -212,20 +212,21 @@ async fn rf_s7_other_accounts_replies() {
 const VISITOR: &str = "did:plc:visitoraaaaaaaaaaaaaaaaa";
 
 /// A Constellation answering `links` filtered to a DID: the visitor liked
-/// `liked` and follows R1; for reposts it ignores the filter.
-async fn own_links(liked: String) -> String {
+/// `liked` and follows R1; for reposts of `liked` it ignores the filter.
+async fn own_links(liked: String, calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
     use axum::extract::RawQuery;
     let router = axum::Router::new().route(
         "/links",
         axum::routing::get(move |RawQuery(q): RawQuery| {
             let liked = liked.clone();
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move {
                 let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(q.unwrap_or_default().as_bytes()).into_owned().collect();
                 let (target, collection, did) = (q["target"].as_str(), q["collection"].as_str(), q.get("did").map(String::as_str));
                 let records = match (collection, did) {
                     ("app.bsky.feed.like", Some(VISITOR)) if target == liked => json!([{"did": VISITOR, "collection": collection, "rkey": "3klike"}]),
                     ("app.bsky.graph.follow", Some(VISITOR)) if target == R1 => json!([{"did": VISITOR, "collection": collection, "rkey": "3kfollow"}]),
-                    ("app.bsky.feed.repost", _) => json!([{"did": OTHER, "collection": collection, "rkey": "3kother"}]),
+                    ("app.bsky.feed.repost", _) if target == liked => json!([{"did": OTHER, "collection": collection, "rkey": "3kother"}]),
                     _ => json!([]),
                 };
                 axum::Json(json!({"total": 1, "linking_records": records, "cursor": null}))
@@ -248,8 +249,8 @@ async fn rf_s1_visitor_viewer_state() {
     for (did, handle) in [(R1, "r1.test"), (R2, "r2.test"), (OTHER, "o.test")] {
         actor(p, did, handle, handle).await;
     }
-    let gated = format!("at://{OTHER}/app.bsky.feed.post/3kgatedroot");
-    let open = format!("at://{OTHER}/app.bsky.feed.post/3kopenroot");
+    let gated = format!("at://{OTHER}/app.bsky.feed.post/3kvgatedroot");
+    let open = format!("at://{OTHER}/app.bsky.feed.post/3kvopenroot");
     let a = post(p, R1, "3ka", "mentioned", Some(&gated), Some(&gated)).await;
     let d = post(p, R2, "3kd", "open", Some(&open), Some(&open)).await;
     let mut up = FixedUpstream::default();
@@ -258,16 +259,37 @@ async fn rf_s1_visitor_viewer_state() {
         json!({"uri": gated, "cid": "c", "value": {"text": "hi", "facets": [{"index": {"byteStart": 0, "byteEnd": 2}, "features": [{"$type": "app.bsky.richtext.facet#mention", "did": R1}]}]}}),
     );
     up.records.insert(
-        format!("at://{OTHER}/app.bsky.feed.threadgate/3kgatedroot"),
+        format!("at://{OTHER}/app.bsky.feed.threadgate/3kvgatedroot"),
         json!({"uri": "x", "cid": "c", "value": {"post": gated, "allow": [{"$type": "app.bsky.feed.threadgate#mentionRule"}]}}),
     );
-    let base = own_links(a.clone()).await;
-    let h = crate::hydration::testing::hydrator_full(p, sets(), Arc::new(up), Some(&base));
+    let calls: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+    let base = own_links(a.clone(), Arc::clone(&calls)).await;
+    let live = crate::admin::settings::LiveSettings::default();
+    let h = Hydrator::new(
+        p.clone(),
+        crate::aggregations::ScopeState::new(sets(), crate::config::ScopePolicy::MembersAndOneHop, 10_000),
+        Some(crate::microcosm::ConstellationClient::new(crate::net::NetClient::loopback_for_tests(), &base)),
+        None,
+        Arc::new(up),
+        crate::hydration::ReadCache::new(1024 * 1024),
+        crate::hydration::HydrationConfig { live: live.clone(), ..crate::hydration::testing::test_config() },
+    );
     let visitor = Viewer { did: Some(VISITOR.into()), hydrate: false };
     let req = Requester::test();
+    // RF-S12: off by default, nothing leaves Prism and nothing is checked.
     let rows = h.refract_reply_rows(&gated, &restored()).await.expect("rows");
     let body = h.refract_replies(&visitor, &req, &gated, rows, None, Duration::from_secs(1)).await.expect("replies");
     let out = h.refract_visitor_state(VISITOR, &req, body).await.expect("state");
+    assert_eq!(out.inner()["viewerChecked"], json!({"posts": [], "actors": [], "roots": []}));
+    assert!(out.inner()["posts"][0]["viewer"].get("like").is_none() && out.inner()["posts"][0]["viewer"].get("replyDisabled").is_none());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no Constellation call with the switch off");
+    live.update(|v| v.refract_visitor_viewer_state = true);
+    let rows = h.refract_reply_rows(&gated, &restored()).await.expect("rows");
+    let body = h.refract_replies(&visitor, &req, &gated, rows, None, Duration::from_secs(1)).await.expect("replies");
+    let out = h.refract_visitor_state(VISITOR, &req, body).await.expect("state");
+    // RF-S13: the repost answer was refused (another DID), so the post is
+    // not listed; the author and the root are.
+    assert_eq!(out.inner()["viewerChecked"], json!({"posts": [], "actors": [R1], "roots": [gated]}), "{}", out.inner());
     let got = &out.inner()["posts"][0];
     assert_eq!(got["uri"], json!(a));
     assert!(got.get("restored").is_some(), "{got}");
@@ -278,6 +300,7 @@ async fn rf_s1_visitor_viewer_state() {
     let rows = h.refract_reply_rows(&open, &restored()).await.expect("rows");
     let body = h.refract_replies(&visitor, &req, &open, rows, None, Duration::from_secs(1)).await.expect("replies");
     let out = h.refract_visitor_state(VISITOR, &req, body).await.expect("state");
+    assert_eq!(out.inner()["viewerChecked"], json!({"posts": [d], "actors": [R2], "roots": [open]}), "none known: {}", out.inner());
     let got = &out.inner()["posts"][0];
     assert_eq!(got["uri"], json!(d));
     assert_eq!(got["viewer"]["replyDisabled"], json!(false), "no gate: {got}");

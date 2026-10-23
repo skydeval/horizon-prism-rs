@@ -17,6 +17,7 @@
           "type": "object",
           "required": ["count"],
           "properties": {
+            "servedAs": { "type": "string", "knownValues": ["member", "visitor"], "description": "The form this answer was served in: `member` (a ready member, with its stored viewer state) or `visitor` (anyone else)." },
             "count": { "type": "integer" }
           }
         }

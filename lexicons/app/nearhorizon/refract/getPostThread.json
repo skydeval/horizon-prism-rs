@@ -20,6 +20,8 @@
           "type": "object",
           "required": ["thread"],
           "properties": {
+            "servedAs": { "type": "string", "knownValues": ["member", "visitor"], "description": "The form this answer was served in: `member` (a ready member, with its stored viewer state) or `visitor` (anyone else)." },
+            "viewerChecked": { "type": "ref", "ref": "app.nearhorizon.refract.defs#viewerChecked" },
             "thread": { "type": "union", "refs": ["app.bsky.feed.defs#threadViewPost", "app.bsky.feed.defs#notFoundPost", "app.bsky.feed.defs#blockedPost"] }
           }
         }

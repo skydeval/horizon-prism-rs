@@ -20,7 +20,7 @@ use crate::config::{FileConfig, RefractCommunity, SuggestedTopic, ThreadLensAcce
 
 /// The keys that apply at once (§8.5), besides `indexing.public_scope`,
 /// which has its own command.
-pub const LIVE_KEYS: [&str; 12] = [
+pub const LIVE_KEYS: [&str; 13] = [
     "community.auto_enroll",
     "community.enroll_pds_patterns",
     "community.max_members",
@@ -34,6 +34,7 @@ pub const LIVE_KEYS: [&str; 12] = [
     // Refract (refract design §3.1, C-2).
     "refract.enabled",
     "refract.communities",
+    "refract.visitor_viewer_state",
 ];
 
 /// Whether `key` applies at once.
@@ -60,6 +61,9 @@ pub struct LiveValues {
     pub refract_enabled: bool,
     /// `refract.communities`, the whole list as one value.
     pub refract_communities: Vec<RefractCommunity>,
+    /// `refract.visitor_viewer_state`: whether a visitor's own records are
+    /// looked up on Constellation with its DID (RF-S1, RF-S12).
+    pub refract_visitor_viewer_state: bool,
 }
 
 impl LiveValues {
@@ -78,6 +82,7 @@ impl LiveValues {
             suggested_topics: f.trends.suggested_topics.clone(),
             refract_enabled: f.refract.enabled,
             refract_communities: f.refract.communities.clone(),
+            refract_visitor_viewer_state: f.refract.visitor_viewer_state,
         }
     }
 }

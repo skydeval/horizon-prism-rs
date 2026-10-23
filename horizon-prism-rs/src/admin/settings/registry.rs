@@ -428,6 +428,13 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
         "The communities whose accounts are kept: their servers, how their decisions are read, and which labels end it. Saved as one list.",
         Kind::Communities,
     ));
+    out.push(one(
+        Group::Apps,
+        "refract.visitor_viewer_state",
+        "Show visitors their own likes on kept accounts",
+        "When on, a signed-in reader who is not a member sees their own likes, reposts and follows on accounts other communities still host. To find them, Prism sends the reader's account, with each such post and account on screen, to the backlink service (Constellation) set up at install. When off, no reader's account is sent there and those apps hide like, repost and follow on such accounts.",
+        Kind::Switch,
+    ));
     out.push(one(Lookups, "identity.lodestar_timeout_ms", "Longest wait for lodestar", "How long Prism waits for one lodestar answer before it asks the PLC directory instead (100 to 10,000).", whole(100, 10_000, "milliseconds")));
     out
 }

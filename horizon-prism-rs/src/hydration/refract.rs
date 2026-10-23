@@ -103,12 +103,22 @@ impl Hydrator {
     /// `refract.fill`'s body: the `profileViewDetailed` of each DID of
     /// `profiles` that renders, the `postView` of each post of `posts`, and
     /// `pending` as the handler decided it. A post whose author the viewer
-    /// blocks or is blocked by is left out, as every other omission.
+    /// blocks or is blocked by is left out, and listed in `withheld` (RF-S11)
+    /// with the handler's `withheld`: `blocked`, or `unanswered` when a
+    /// visitor's pair with the author went unanswered.
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn refract_fill(&self, viewer: &Viewer, req: &Requester, profiles: &[String], posts: &[String], pending: &[String]) -> Result<PublicEmit<Value>, HydrationError> {
+    pub async fn refract_fill(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        profiles: &[String],
+        posts: &[String],
+        pending: &[String],
+        withheld: &[(String, &'static str)],
+    ) -> Result<PublicEmit<Value>, HydrationError> {
         let mut out_profiles = Vec::new();
         for did in profiles {
             if let Ok(view) = self.get_profile(viewer, req, did).await? {
@@ -123,10 +133,19 @@ impl Hydrator {
         }
         let authors: Vec<String> = out_posts.iter().filter_map(|p| p.get("uri").and_then(Value::as_str).and_then(uri_author)).map(str::to_string).collect();
         let actors = self.actor_viewer(viewer, &authors).await?;
-        out_posts.retain(|p| p.get("uri").and_then(Value::as_str).and_then(uri_author).is_none_or(|a| !actors.blocked_either_way(a)));
         let wanted: HashSet<&String> = posts.iter().collect();
         out_posts.retain(|p| p.get("uri").and_then(Value::as_str).is_some_and(|u| wanted.contains(&u.to_string())));
-        Ok(Self::emit(json!({"profiles": out_profiles, "posts": out_posts, "pending": pending})))
+        let unanswered = super::known_blocks().map(|k| k.unanswered.clone()).unwrap_or_default();
+        let mut held: Vec<Value> = withheld.iter().map(|(id, reason)| json!({"id": id, "reason": reason})).collect();
+        out_posts.retain(|p| {
+            let Some(u) = p.get("uri").and_then(Value::as_str) else { return true };
+            let Some(a) = uri_author(u).filter(|a| actors.blocked_either_way(a)) else { return true };
+            if !withheld.iter().any(|(id, _)| id == u) {
+                held.push(json!({"id": u, "reason": if unanswered.contains(a) { "unanswered" } else { "blocked" }}));
+            }
+            false
+        });
+        Ok(Self::emit(json!({"profiles": out_profiles, "posts": out_posts, "pending": pending, "withheld": held})))
     }
 
     /// `feedViewPost`s for Refract's feeds (refract design §7.2): local
@@ -1054,10 +1073,15 @@ impl Hydrator {
     /// Database errors.
     pub async fn refract_visitor_state(&self, me: &str, req: &Requester, body: PublicEmit<Value>) -> Result<PublicEmit<Value>, HydrationError> {
         use futures::StreamExt;
+        let unchecked = || Self::refract_with(&body, &[("viewerChecked", json!({"posts": [], "actors": [], "roots": []}))]);
+        // RF-S12: off, no reader DID leaves Prism and nothing is checked.
+        if !self.inner.cfg.live.load().refract_visitor_viewer_state {
+            return Ok(unchecked());
+        }
         let mut t = VisitorTargets::default();
         visitor_targets(body.inner(), &mut t);
         if t.posts.is_empty() && t.accounts.is_empty() {
-            return Ok(body);
+            return Ok(unchecked());
         }
         let started = std::time::Instant::now();
         let mut asks: Vec<(OwnField, String)> = Vec::new();
@@ -1077,7 +1101,12 @@ impl Hydrator {
             .collect()
             .await;
         let mut found: HashMap<(&'static str, String), String> = HashMap::new();
+        // RF-S13: the fields answered, a record or none.
+        let mut known: HashSet<(&'static str, String)> = HashSet::new();
         for (field, target, got) in answers {
+            if got.is_some() {
+                known.insert((field.name(), target.clone()));
+            }
             let outcome = match got {
                 Some(Some(uri)) => {
                     found.insert((field.name(), target), uri);
@@ -1102,6 +1131,27 @@ impl Hydrator {
         }
         let mut view = body.inner().clone();
         apply_visitor_state(&mut view, &found, &disabled, &t.root_of);
+        // RF-S13: a listed subject's absent field is none; an unlisted
+        // subject's is unknown.
+        let posts: Vec<&String> = t.posts.iter().filter(|p| known.contains(&("like", (*p).clone())) && known.contains(&("repost", (*p).clone()))).collect();
+        let actors: Vec<&String> = t.accounts.iter().filter(|d| known.contains(&("following", (*d).clone()))).collect();
+        let roots: Vec<&String> = t.roots.iter().filter(|r| disabled.contains_key(*r)).collect();
+        if let Some(m) = view.as_object_mut() {
+            m.insert("viewerChecked".into(), json!({"posts": posts, "actors": actors, "roots": roots}));
+        }
         Ok(Self::emit(view))
+    }
+
+    /// `body` with top-level `fields` added (RF-S10, RF-S13): answer
+    /// metadata, never a view.
+    #[must_use]
+    pub fn refract_with(body: &PublicEmit<Value>, fields: &[(&str, Value)]) -> PublicEmit<Value> {
+        let mut v = body.inner().clone();
+        if let Some(m) = v.as_object_mut() {
+            for (k, x) in fields {
+                m.insert((*k).to_string(), x.clone());
+            }
+        }
+        Self::emit(v)
     }
 }

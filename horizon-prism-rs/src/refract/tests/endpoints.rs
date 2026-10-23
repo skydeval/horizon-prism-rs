@@ -92,6 +92,14 @@ async fn the_gate() {
     assert_eq!(r.status().as_u16(), 401);
     let (status, body) = call(&base, FILL, "", None).await;
     assert_eq!((status, body["profiles"].clone()), (200, json!([])), "{body}");
+    assert_eq!(body["servedAs"], "visitor", "{body}");
+    // RF-S10: a ready member is served as one, with no viewerChecked.
+    exec(&h.pool, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VISITOR}', 'admin', now())")).await;
+    let (_, body) = call(&base, FILL, "", None).await;
+    assert_eq!(body["servedAs"], "member", "{body}");
+    assert!(body.get("viewerChecked").is_none(), "{body}");
+    let (_, body) = call(&base, crate::refract::handlers::GET_UNREAD_COUNT, "", None).await;
+    assert_eq!(body["servedAs"], "member", "{body}");
     h.live.update(|v| v.refract_enabled = false);
     let (status, body) = call(&base, FILL, "", None).await;
     assert_eq!((status, body["error"].as_str()), (400, Some("NotEnabled")));
@@ -119,6 +127,11 @@ async fn fill_serves_and_discovers() {
     assert_eq!(body["profiles"][0]["restored"]["community"], "sky");
     assert_eq!(body["posts"][0]["uri"], json!(uri));
     assert_eq!(body["pending"], json!([OTHER, FOURTH]), "the same for a DID with an actors row");
+    // RF-S10, RF-S13: a visitor's answer says so; the switch is off, so
+    // nothing was checked.
+    assert_eq!(body["servedAs"], "visitor", "{body}");
+    assert_eq!(body["withheld"], json!([]), "{body}");
+    assert_eq!(body["viewerChecked"], json!({"posts": [], "actors": [], "roots": []}), "{body}");
     // The resolves land: both are candidates.
     for _ in 0..50 {
         if h.count("SELECT count(*) FROM refract_dids WHERE state = 'candidate'").await == 2 {
@@ -130,6 +143,7 @@ async fn fill_serves_and_discovers() {
     // A bare-aud visitor call answers but discovers nothing.
     let (status, body) = call(&base, FILL, &format!("dids={THIRD}"), None).await;
     assert_eq!((status, body["pending"].clone()), (200, json!([])));
+    assert_eq!(body["withheld"], json!([{"id": THIRD, "reason": "proxied"}]), "RF-S11: {body}");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(h.state(THIRD).await, None);
     // A candidate already known is pending again, with no new row.
@@ -162,12 +176,15 @@ async fn visitors_unanswered_pairs_are_blocked() {
     let (status, body) = call(&base, FILL, &q, None).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!((body["profiles"].clone(), body["posts"].clone()), (json!([]), json!([])), "{body}");
+    // RF-S11: both said to be held back, not final.
+    assert_eq!(body["withheld"], json!([{"id": SUBJECT, "reason": "unanswered"}, {"id": uri, "reason": "unanswered"}]), "{body}");
     // Answered, the author blocking the visitor: its post is left out.
     *fake.status.lock().expect("status") = 200;
     fake.blockers.lock().expect("blockers").insert(SUBJECT.to_string());
     let (_, body) = call(&base, FILL, &q, None).await;
     assert_eq!(body["posts"], json!([]), "{body}");
     assert_eq!(body["profiles"][0]["viewer"]["blockedBy"], json!(true), "{body}");
+    assert_eq!(body["withheld"], json!([{"id": uri, "reason": "blocked"}]), "{body}");
     db.drop_db().await;
 }
 

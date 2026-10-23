@@ -286,10 +286,11 @@ where
     Ok(first)
 }
 
-/// A visitor's own viewer state on the restored views of a built body
-/// (RF-S1); a ready member's answer is left as built.
+/// A view-bearing answer's last step: for a visitor, its own viewer state
+/// on the restored views and `viewerChecked` (RF-S1, RF-S13; a ready
+/// member's views are left as built); then `servedAs` (RF-S10).
 async fn visitor_state(s: &RefractState, caller: &Caller, result: XrpcResult) -> XrpcResult {
-    match result {
+    let result = match result {
         Ok(Json(body)) if caller.visitor() => s
             .app
             .hydrator
@@ -298,7 +299,17 @@ async fn visitor_state(s: &RefractState, caller: &Caller, result: XrpcResult) ->
             .map(Json)
             .map_err(Into::into),
         other => other,
-    }
+    };
+    served_as(caller, result)
+}
+
+/// RF-S10: every answer names the form it was served in, as the gate
+/// decided it.
+fn served_as(caller: &Caller, result: XrpcResult) -> XrpcResult {
+    result.map(|Json(body)| {
+        let form = if caller.visitor() { "visitor" } else { "member" };
+        Json(crate::hydration::Hydrator::refract_with(&body, &[("servedAs", serde_json::json!(form))]))
+    })
 }
 
 /// The in-memory caps on candidate creation (§7.1 "Abuse bounds"), in
@@ -428,21 +439,33 @@ pub fn ip_key(ip: IpAddr) -> String {
     }
 }
 
+/// What discovery decided for a `fill`'s DIDs.
+#[derive(Debug, Default)]
+pub struct Discovered {
+    /// Accepted for checking, or restored and waiting for first labels.
+    pub pending: Vec<String>,
+    /// Held back for a reason that isn't final (RF-S11): `capped` (a
+    /// discovery cap) or `proxied` (a visitor's bare-`aud` call).
+    pub withheld: Vec<(String, &'static str)>,
+}
+
 impl RefractState {
     /// Discovery (§4.4) for the DIDs a `fill` names that are not in R-live:
     /// returns `pending`, every one accepted for checking (a candidate
     /// already, or one whose resolve was started now), plus R-live DIDs
-    /// waiting for their first label fetch. Never waits for a resolve or a
-    /// check, and reads no `actors` row (G-9).
+    /// waiting for their first label fetch; and `withheld`, those a cap or
+    /// a proxied visitor call kept from discovery. Never waits for a
+    /// resolve or a check, and reads no `actors` row (G-9).
     ///
     /// # Errors
     ///
     /// Database errors.
-    pub async fn discover(&self, caller: &Caller, dids: &[String], snapshot: &RefractSnapshot) -> Result<Vec<String>, sqlx::Error> {
+    pub async fn discover(&self, caller: &Caller, dids: &[String], snapshot: &RefractSnapshot) -> Result<Discovered, sqlx::Error> {
         let cfg = self.refract.cfg();
         let pool = self.refract.pool();
         let communities = self.refract.communities();
         let mut pending = Vec::new();
+        let mut withheld: Vec<(String, &'static str)> = Vec::new();
         for did in dids {
             if snapshot.is_restored(did) {
                 if snapshot.awaiting.contains(did) {
@@ -484,21 +507,25 @@ impl RefractState {
             if caller.visitor() {
                 if !caller.direct {
                     metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "no_fragment").increment(1);
+                    withheld.push((did.clone(), "proxied"));
                     continue;
                 }
                 let ip = ip_key(caller.ip);
                 if !self.discovery.take(Cap::Ip, &ip, cfg.visitor_candidates_per_ip_per_hour) {
                     metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "visitor_capped").increment(1);
+                    withheld.push((did.clone(), "capped"));
                     continue;
                 }
                 if !self.discovery.take(Cap::Global, "", cfg.visitor_candidates_per_hour) {
                     self.discovery.give_back(Cap::Ip, &ip);
                     metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "visitor_capped").increment(1);
+                    withheld.push((did.clone(), "capped"));
                     continue;
                 }
             }
             if !self.discovery.take(Cap::Caller, &caller.did, cfg.candidates_per_caller_per_hour) {
                 metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "capped").increment(1);
+                withheld.push((did.clone(), "capped"));
                 continue;
             }
             // A resolve the resolver's cache cannot answer counts.
@@ -506,6 +533,7 @@ impl RefractState {
             if !cached && !self.discovery.take(Cap::Resolve, &caller.did, cfg.resolves_per_caller_per_hour) {
                 self.discovery.give_back(Cap::Caller, &caller.did);
                 metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => "resolve_capped").increment(1);
+                withheld.push((did.clone(), "capped"));
                 continue;
             }
             pending.push(did.clone());
@@ -517,7 +545,7 @@ impl RefractState {
                 metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => outcome).increment(1);
             });
         }
-        Ok(pending)
+        Ok(Discovered { pending, withheld })
     }
 }
 
@@ -580,7 +608,15 @@ pub async fn fill(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<
             named.push(a.to_string());
         }
     }
-    let pending = s.discover(&caller, &named, &snapshot).await.map_err(|e| XrpcError::from(crate::hydration::HydrationError::from(e)))?;
+    let Discovered { pending, withheld: held } = s.discover(&caller, &named, &snapshot).await.map_err(|e| XrpcError::from(crate::hydration::HydrationError::from(e)))?;
+    // RF-S11: a DID held back from discovery, and the posts of it named.
+    let mut withheld: Vec<(String, &'static str)> = Vec::new();
+    for (did, reason) in &held {
+        if dids.contains(did) {
+            withheld.push((did.clone(), reason));
+        }
+        withheld.extend(uris.iter().filter(|u| uri_author(u) == Some(did.as_str())).map(|u| (u.clone(), *reason)));
+    }
     let served = |d: &str| snapshot.is_restored(d) && !snapshot.awaiting.contains(d);
     let profiles: Vec<String> = dids.iter().filter(|d| served(d)).cloned().collect();
     let posts: Vec<String> = uris.iter().filter(|u| uri_author(u).is_some_and(served)).cloned().collect();
@@ -590,10 +626,12 @@ pub async fn fill(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<
     if let Some(b) = blocks.as_mut() {
         b.round(&authors).await;
     }
-    // A restored account left unanswered for a visitor: no profile.
-    let profiles: Vec<String> = profiles.into_iter().filter(|d| !blocks.as_ref().is_some_and(|b| b.unanswered(d))).collect();
+    // A restored account left unanswered for a visitor: no profile, and
+    // said so (RF-S11).
+    let (unanswered, profiles): (Vec<String>, Vec<String>) = profiles.into_iter().partition(|d| blocks.as_ref().is_some_and(|b| b.unanswered(d)));
+    withheld.extend(unanswered.into_iter().map(|d| (d, "unanswered")));
     let result = with_blocks(&mut blocks, &authors, || async {
-        h.refract_fill(&caller.viewer, &caller.req, &profiles, &posts, &pending).await.map(Json).map_err(Into::into)
+        h.refract_fill(&caller.viewer, &caller.req, &profiles, &posts, &pending, &withheld).await.map(Json).map_err(Into::into)
     })
     .await;
     let result = visitor_state(&s, &caller, result).await;
@@ -683,7 +721,7 @@ pub async fn get_timeline(State(s): State<RefractState>, ConnectInfo(peer): Conn
     let cursor = p.one("cursor").map(str::to_string);
     if !caller.member {
         metrics::counter!(METRIC_READS, "method" => "getTimeline", "outcome" => "not_member").increment(1);
-        return Ok(Json(crate::hydration::Hydrator::refract_empty("feed")));
+        return visitor_state(&s, &caller, Ok(Json(crate::hydration::Hydrator::refract_empty("feed")))).await;
     }
     let h = &s.app.hydrator;
     let hydration = |e: sqlx::Error| XrpcError::from(crate::hydration::HydrationError::from(e));
@@ -736,6 +774,7 @@ pub async fn list_notifications(State(s): State<RefractState>, ConnectInfo(peer)
         &caller.req,
         s.app.hydrator.refract_list_notifications(&caller.viewer, &caller.req, caller.member, limit, cursor.as_deref(), blocks.as_mut()).await,
     );
+    let result = served_as(&caller, result);
     metrics::counter!(METRIC_READS, "method" => "listNotifications", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }
@@ -754,6 +793,7 @@ pub async fn get_unread_count(State(s): State<RefractState>, ConnectInfo(peer): 
     };
     let mut blocks = Blocks::new(&s, &caller);
     let result = respond(&caller.req, s.app.hydrator.refract_unread_count(&caller.viewer, &caller.req, caller.member, seen_at, blocks.as_mut()).await);
+    let result = served_as(&caller, result);
     metrics::counter!(METRIC_READS, "method" => "getUnreadCount", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }

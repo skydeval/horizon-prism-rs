@@ -12,6 +12,29 @@
         "tier": { "type": "integer", "minimum": 1, "maximum": 2, "description": "1: the community runs an AppView; 2: it runs a labeler." },
         "labeler": { "type": "string", "format": "did", "description": "The community's labeler, when it has one. Its labels on these views carry it as their src." }
       }
+    },
+    "viewerChecked": {
+      "type": "object",
+      "description": "On a visitor-form answer: the restored subjects whose viewer state was looked up and answered. A listed post with no viewer.like or viewer.repost has none; a listed actor with no viewer.following has none; a post whose thread root is listed carries viewer.replyDisabled. A subject not listed is unknown. All lists are empty when the operator has visitor viewer state off.",
+      "required": ["posts", "actors", "roots"],
+      "properties": {
+        "posts": { "type": "array", "items": { "type": "string", "format": "at-uri" }, "description": "Restored posts whose like and repost were both answered." },
+        "actors": { "type": "array", "items": { "type": "string", "format": "did" }, "description": "Restored accounts whose following was answered." },
+        "roots": { "type": "array", "items": { "type": "string", "format": "at-uri" }, "description": "Thread roots whose replyDisabled is known." }
+      }
+    },
+    "withheld": {
+      "type": "object",
+      "description": "An item a fill named and held back for a reason that is not final.",
+      "required": ["id", "reason"],
+      "properties": {
+        "id": { "type": "string", "description": "The DID or at-URI as named." },
+        "reason": {
+          "type": "string",
+          "knownValues": ["unanswered", "capped", "proxied", "blocked"],
+          "description": "unanswered: the block check between a visitor and the account got no answer. capped: a discovery limit was reached, so no check was started. proxied: a visitor's call came through a proxy, so no check was started. blocked: the post's author and the caller block each other, either way."
+        }
+      }
     }
   }
 }

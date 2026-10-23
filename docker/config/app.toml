@@ -630,6 +630,11 @@ label_ff_pages_per_sec = 5
 resync_days = 7
 event_days = 365
 resolves_per_caller_per_hour = 300
+# A non-member reader's own likes, reposts and follows on kept accounts,
+# looked up on the Constellation set above with the reader's account as the
+# filter: that service then sees which reader looks at what. Off by default;
+# applies at once when changed in the admin UI.
+visitor_viewer_state = false
 
 # A tier 1 community: its PDS hosts and its AppView (a network above). Its
 # labeler, read through that AppView, decides which labels end a restore.

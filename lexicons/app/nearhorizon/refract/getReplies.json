@@ -19,6 +19,8 @@
           "type": "object",
           "required": ["posts"],
           "properties": {
+            "servedAs": { "type": "string", "knownValues": ["member", "visitor"], "description": "The form this answer was served in: `member` (a ready member, with its stored viewer state) or `visitor` (anyone else)." },
+            "viewerChecked": { "type": "ref", "ref": "app.nearhorizon.refract.defs#viewerChecked" },
             "posts": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.feed.defs#postView" } }
           }
         }

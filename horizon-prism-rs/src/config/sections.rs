@@ -2106,6 +2106,10 @@ pub struct RefractConfig {
     pub resync_days: u32,
     pub event_days: u32,
     pub resolves_per_caller_per_hour: u32,
+    /// A visitor's own like, repost and follow on restored views, looked up
+    /// on Constellation with the reader's DID as the filter (RF-S1). Off by
+    /// default: with it off no reader DID leaves Prism. Live.
+    pub visitor_viewer_state: bool,
 }
 
 impl Default for RefractConfig {
@@ -2132,6 +2136,7 @@ impl Default for RefractConfig {
             resync_days: 7,
             event_days: 365,
             resolves_per_caller_per_hour: 300,
+            visitor_viewer_state: false,
         }
     }
 }

@@ -10,6 +10,17 @@ commit.
 
 ## [Unreleased]
 
+### Added (Refract answer metadata, #855, #864)
+
+- **`servedAs` on every Refract answer.** Each `app.nearhorizon.refract.*` answer names the form the gate served it in: `member` (a ready member, with its stored viewer state) or `visitor`.
+- **`fill` names what it held back and why.** `withheld: [{id, reason}]` lists the named DIDs and URIs left out for a reason that isn't final: `unanswered` (a visitor's block check with the account got no answer; before, just no profile), `capped` (a discovery cap: per caller, per resolve, per address or in all), `proxied` (a visitor's bare-`aud` call, which starts no discovery), `blocked` (a post whose author and the caller block each other, either way). An item named and absent from `profiles`, `posts`, `pending` and `withheld` is final. A post of an account held back by a cap or a proxied call is listed with it.
+- The lexicons describe both, with `withheld` and `viewerChecked` in `app.nearhorizon.refract.defs`.
+
+### Changed (Refract visitor viewer state behind a switch, #855, #864)
+
+- **`refract.visitor_viewer_state`, off by default.** A visitor's own like, repost and follow lookups send the reader's DID, with each restored subject on screen, to the configured Constellation. They now run only with this live setting on (admin UI, "What apps see"; `docker/config/app.toml`). Off, no reader DID leaves Prism and no visitor viewer state is added, `replyDisabled` included (its follow rules would send the reader's DID too).
+- **`viewerChecked` on visitor-form answers** of `fill`, `getPostThread`, `getAuthorFeed`, `getReplies` and `getTimeline`: `{posts, actors, roots}`, the restored subjects whose like and repost, following, or thread root's `replyDisabled` were looked up and answered (a reply by another DID is refused, so not listed). A listed subject's absent field is none; an unlisted one is unknown. Empty with the switch off.
+
 ### Added (Refract replies under restored replies, #855, #859)
 
 - **`refract.getReplies` returns other accounts' replies to restored replies.** After the restored replies, it adds up to 50 direct replies by other accounts whose parent is one of them, asked of Constellation (`.reply.parent.uri`) for at most 10 returned replies whose `replyCount` isn't 0, newest first, each page drawn from the caller's Constellation share. They pass the rules restored replies do: the moderation gate before any fetch, the root's `hiddenReplies` (except to the reply's author) and `allow` rules (fail closed), the caller's blocks (a visitor's Farsight rounds, unanswered treated as blocked) and the root author's; and also a block either way between the reply's author and its parent's author. They are fetched through the cascade like other subjects (nothing stored), judged again for a visitor over every account the fetched views name, and kept only when their record names this thread's root and the parent asked about. They carry no restored marker. The `getReplies` lexicon describes them.
