@@ -245,6 +245,29 @@ impl Call<'_> {
             Self::ActorStarterPacks { actor, limit, cursor } => client.get_actor_starter_packs(actor, limit, cursor).await,
         }
     }
+
+    /// [`Self::invoke`], with the reader's labelers on `getPosts` and
+    /// `getPostThread` when the request named any (threadlens-hydration
+    /// design §3.6 (b)): the header goes out rebuilt from its valid
+    /// entries, and the labelers the answer says it applied are recorded.
+    /// Every other call, and every call outside such a request, is made as
+    /// before.
+    async fn invoke_scoped(self, client: &AppViewClient) -> Result<NetResponse, NetError> {
+        let Some(scope) = crate::appview_clients::accept_labelers::current() else {
+            return self.invoke(client).await;
+        };
+        let answer = match self {
+            Self::Posts(uris) => client.get_posts_labelled(uris, scope.value()).await,
+            Self::PostThread { uri, depth, parent_height } => client.get_post_thread_labelled(uri, depth, parent_height, scope.value()).await,
+            other => return other.invoke(client).await,
+        };
+        answer.map(|(response, headers)| {
+            if response.is_success() {
+                scope.record_applied(&headers);
+            }
+            response
+        })
+    }
 }
 
 /// The cascade's result.
@@ -543,7 +566,7 @@ impl Cascade {
                 drop(admission);
                 return Fetched::NoAnswer(attempts);
             }
-            let Ok(result) = tokio::time::timeout(deadline - now, call.invoke(&state.client)).await else {
+            let Ok(result) = tokio::time::timeout(deadline - now, call.invoke_scoped(&state.client)).await else {
                 // The request's own deadline fired before the call's 3 s
                 // timeout could: a `budget` cut, not an upstream failure
                 // (design-v3 §II-8.3, R3-174). It is not recorded by the

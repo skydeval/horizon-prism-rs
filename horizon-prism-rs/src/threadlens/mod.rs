@@ -15,6 +15,7 @@
 pub mod cursor;
 pub mod gaps;
 pub mod handlers;
+pub mod labelers;
 pub mod ladder;
 pub mod thread;
 pub mod verdict;

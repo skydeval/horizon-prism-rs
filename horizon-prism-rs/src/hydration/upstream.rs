@@ -645,8 +645,17 @@ impl UpstreamSource for RealUpstreamSource {
     async fn posts(&self, req: &Requester, uris: &[String]) -> Vec<Value> {
         let mut found: HashMap<String, Value> = HashMap::new();
         let mut by_author: HashMap<String, Vec<String>> = HashMap::new();
+        // A request that names its labelers gets views carrying their
+        // labels: it neither reads nor writes the shared post views, which
+        // carry another request's labelers or none (threadlens-hydration
+        // design §3.6 (b)).
+        let shared = crate::appview_clients::accept_labelers::current().is_none();
         for uri in uris.iter().filter(|u| !is_private_uri(u)) {
-            if let Some(v) = self.cache.get_json::<Value>(req, &format!("rt:post:{uri}")).await {
+            if !shared {
+                if let Some(a) = uri_author(uri) {
+                    by_author.entry(a.to_string()).or_default().push(uri.clone());
+                }
+            } else if let Some(v) = self.cache.get_json::<Value>(req, &format!("rt:post:{uri}")).await {
                 found.insert(uri.clone(), v);
             } else if let Some(a) = uri_author(uri) {
                 by_author.entry(a.to_string()).or_default().push(uri.clone());
@@ -677,7 +686,9 @@ impl UpstreamSource for RealUpstreamSource {
             let Some(body) = body else { continue };
             for post in body.get("posts").and_then(Value::as_array).into_iter().flatten() {
                 if let Some(uri) = post.get("uri").and_then(Value::as_str).filter(|u| group.iter().any(|g| g == u)) {
-                    self.cache.put_json(req, &format!("rt:post:{uri}"), post).await;
+                    if shared {
+                        self.cache.put_json(req, &format!("rt:post:{uri}"), post).await;
+                    }
                     found.insert(uri.to_string(), post.clone());
                 }
             }
@@ -1401,5 +1412,90 @@ mod tests {
         // A thread falls back to the anchor from Slingshot.
         let thread = up.post_thread(&req, &uris[0], 6, 20).await.expect("thread");
         assert_eq!(thread["thread"]["post"]["record"]["text"], "from slingshot 3kaaa");
+    }
+
+    /// #887 (threadlens-hydration design §3.6 (b)): inside a request that
+    /// names its labelers, `getPosts` and `getPostThread` carry the rebuilt
+    /// header and record what the answer applied; other calls carry none.
+    /// Post views fetched that way are neither read from nor written to the
+    /// shared cache, so one labeler set never sees another's views.
+    #[tokio::test]
+    async fn reader_labelers_go_upstream_and_keep_off_the_shared_cache() {
+        use axum::extract::Path;
+        use axum::http::HeaderMap;
+
+        use crate::appview_clients::accept_labelers::{AcceptLabelers, LabelerScope, with_labelers};
+
+        type Seen = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+        let seen: Seen = Arc::default();
+        let router = AxumRouter::new()
+            .route(
+                "/xrpc/{method}",
+                get(|State(seen): State<Seen>, Path(method): Path<String>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                    let accept = headers.get("atproto-accept-labelers").map(|v| v.to_str().expect("ascii").to_string());
+                    seen.lock().expect("lock").push((method.clone(), accept.clone()));
+                    // The label says which header the view was fetched with.
+                    let val = accept.clone().unwrap_or_else(|| "none".into());
+                    let src = accept.as_deref().and_then(|a| a.split(';').next()).unwrap_or("did:plc:default").to_string();
+                    let applied = accept.clone().unwrap_or_else(|| "did:plc:default".into());
+                    let post = |uri: &str| {
+                        json!({"uri": uri, "cid": "c", "author": {"did": OUTSIDER, "handle": "oooo.test"},
+                               "record": {"$type": NSID_POST, "text": "t", "createdAt": "2026-09-26T00:00:00Z"},
+                               "indexedAt": "2026-09-26T00:00:00Z", "labels": [{"src": src, "uri": uri, "val": val, "cts": "2026-09-26T00:00:00Z"}]})
+                    };
+                    let body = match method.as_str() {
+                        "app.bsky.feed.getPosts" => json!({"posts": [post(q.get("uris").expect("uris"))]}),
+                        "app.bsky.feed.getPostThread" => json!({"thread": {"$type": "app.bsky.feed.defs#threadViewPost", "post": post(q.get("uri").expect("uri"))}}),
+                        _ => json!({"did": OUTSIDER, "handle": "oooo.test"}),
+                    };
+                    ([("atproto-content-labelers", applied)], axum::Json(body)).into_response()
+                }),
+            )
+            .with_state(Arc::clone(&seen));
+        let base = serve_fake(router).await;
+        let up = source(cascade_for(&[("bluesky", &base), ("community-a", &base)]), &base);
+        let req = Requester::test();
+        let uri = format!("at://{OUTSIDER}/{NSID_POST}/3kpost");
+        let uris = vec![uri.clone()];
+        let label = |posts: &[Value]| posts[0]["labels"][0]["val"].as_str().expect("val").to_string();
+        let calls = || seen.lock().expect("lock").len();
+        let scope = |raw: &str| Some(LabelerScope::new(AcceptLabelers::parse(raw).expect("valid")));
+
+        // Without labelers: fetched once, then from the shared cache.
+        assert_eq!(label(&up.posts(&req, &uris).await), "none");
+        assert_eq!(label(&up.posts(&req, &uris).await), "none");
+        assert_eq!(calls(), 1);
+        // Labeler set A: the cache is not read, the header goes out rebuilt
+        // (the invalid entry dropped), and the view carries A's label.
+        let a = scope("did:plc:aaaa;redact, junk");
+        assert_eq!(label(&with_labelers(a.clone(), up.posts(&req, &uris)).await), "did:plc:aaaa;redact");
+        // Set B: fetched again, never A's view.
+        let b = scope("did:plc:bbbb");
+        assert_eq!(label(&with_labelers(b.clone(), up.posts(&req, &uris)).await), "did:plc:bbbb");
+        assert_eq!(calls(), 3);
+        // Neither was written over the shared entry.
+        assert_eq!(label(&up.posts(&req, &uris).await), "none");
+        assert_eq!(calls(), 3);
+        assert_eq!(up.cache.get_json::<Value>(&req, &format!("rt:post:{uri}")).await.expect("cached")["labels"][0]["val"], "none");
+        // What each answer applied is recorded on its own scope.
+        let applied = |s: &Option<Arc<LabelerScope>>| s.as_ref().and_then(|s| s.content_labelers()).map(|v| v.to_str().expect("ascii").to_string());
+        assert_eq!((applied(&a), applied(&b)), (Some("did:plc:aaaa;redact".into()), Some("did:plc:bbbb".into())));
+
+        // `getPostThread` carries it too; `getProfile` does not.
+        let thread = with_labelers(b.clone(), up.post_thread(&req, &uri, 6, 20)).await.expect("thread");
+        assert_eq!(thread["thread"]["post"]["labels"][0]["val"], "did:plc:bbbb");
+        with_labelers(b, up.profile(&req, OUTSIDER)).await.expect("profile");
+        let seen = seen.lock().expect("lock").clone();
+        let sent: Vec<(&str, Option<&str>)> = seen.iter().map(|(m, h)| (m.as_str(), h.as_deref())).collect();
+        assert_eq!(
+            sent,
+            [
+                ("app.bsky.feed.getPosts", None),
+                ("app.bsky.feed.getPosts", Some("did:plc:aaaa;redact")),
+                ("app.bsky.feed.getPosts", Some("did:plc:bbbb")),
+                ("app.bsky.feed.getPostThread", Some("did:plc:bbbb")),
+                ("app.bsky.actor.getProfile", None),
+            ]
+        );
     }
 }

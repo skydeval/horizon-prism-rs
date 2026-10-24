@@ -509,7 +509,12 @@ impl Hydrator {
             {
                 // An upstream AppView's thread, with whatever gate view it
                 // gave.
-                let mut v = self.normalized(viewer, req, v).await?.0;
+                let (mut v, report, _) = self.normalized(viewer, req, v).await?;
+                // Fetched with the request's labelers, if it named any
+                // (threadlens-hydration design §3.6 (b)).
+                if let Some(scope) = crate::appview_clients::accept_labelers::current() {
+                    scope.mark_labelled(report.labelled);
+                }
                 let gate = v.get("threadgate").cloned().filter(|g| !g.is_null());
                 return Ok(Ok((v["thread"].take(), gate)));
             }

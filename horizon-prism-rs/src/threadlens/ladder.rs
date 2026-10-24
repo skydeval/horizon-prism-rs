@@ -242,6 +242,11 @@ impl Ladder {
             if !views.is_empty() {
                 let found: Vec<String> = views.iter().filter_map(|v| v.get("uri").and_then(Value::as_str).map(str::to_string)).collect();
                 let (normalized, report) = self.hydrator.lens_normalize(viewer, req, Value::Array(views)).await?;
+                // Fetched with the request's labelers, if it named any
+                // (threadlens-hydration design §3.6 (b)).
+                if let Some(scope) = crate::appview_clients::accept_labelers::current() {
+                    scope.mark_labelled(report.labelled.iter().cloned());
+                }
                 for (uri, view) in found.into_iter().zip(normalized.as_array().cloned().unwrap_or_default()) {
                     let resolved = if report.content_stripped.contains(&uri) { Resolved::Gap(Gap::ContentStripped) } else { Resolved::Post(view) };
                     cascade.remove(&uri);

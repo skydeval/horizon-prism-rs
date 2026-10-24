@@ -1,6 +1,7 @@
 //! Outbound AppView clients and service-JWT minting (design-v2 §3.2, §6.8,
 //! §8).
 
+pub mod accept_labelers;
 pub mod client;
 pub mod jwt;
 

@@ -10,6 +10,11 @@ commit.
 
 ## [Unreleased]
 
+### Added (Thread Lens honours the reader's labelers, #887)
+
+- **`atproto-accept-labelers` on `threadLens.getThread` and `resolve`** (skydeval, 2026-10-24: a labeler is a labeler, so every labeler the request names is honoured, moderation or not). The header's valid entries (DIDs, `redact` kept, at most 32; a header over 4096 bytes is ignored) are rebuilt and sent with the upstream `getPostThread` and `getPosts` calls the answer makes; nothing else of the request goes upstream. Post views and their authors keep the labels those labelers applied, after Prism's own and without repeats (an upstream copy of Prism's own labels is not kept). A post Prism built from its own rows gets them from one `getPosts` per 25 posts read for its labels alone. The response carries `atproto-content-labelers` naming the labelers applied. The labels only add to views: the gate, the gaps and the threadgate rules are as before, and content stripping reads the upstream labels as it always did. Upstream post views fetched with a labeler set never enter or come from the shared `rt:post` cache. Amends design-v4 §II-7.8 and §II-8.6 for Thread Lens; other views still remove upstream labels.
+- `getMembership.features` lists `threadLens.labelers` with `threadLens`; the lexicon describes it, and `threadLens.defs#postNode` says what labels carry.
+
 ### Changed (pronouns and plural: signed-out reads held tighter, #896)
 
 - **`plural.getRecords` and `plural.listMembers` have their own rate classes** (skydeval, 2026-10-24: signed-out re-asks a lot less frequent): signed out, `plural_anon` per IP (IPv6 per /64), 1/s with a burst of 10, enough for a feed page's call plus a re-ask after 30 s and then every 5 minutes; with a service token that verifies, `plural_auth` per account, 5/s with a burst of 30. A token that does not verify is refused (`InvalidToken`) rather than charged as anonymous. Every 429 carries `Retry-After`. New config `[rate_limits] plural_anon`, `plural_auth`; the family name for `endpoint_class` is `plural`.

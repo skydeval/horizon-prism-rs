@@ -557,6 +557,12 @@ impl Hydrator {
         &self.inner.scope
     }
 
+    /// The DID Prism's own labels carry as `src`.
+    #[must_use]
+    pub fn labeler_did(&self) -> &str {
+        &self.inner.cfg.labeler_did
+    }
+
     /// `community.reindex_retry_secs`.
     #[must_use]
     pub fn reindex_retry_secs(&self) -> u64 {
@@ -1040,6 +1046,17 @@ impl Hydrator {
         let blocked: HashSet<String> = dids.iter().filter(|d| actors.blocked_either_way(d)).cloned().collect();
         let hidden_creators: HashSet<String> = dids.iter().filter(|d| gates.get(*d).is_some_and(|g| g.is_hidden())).cloned().collect();
         let restored = self.restored_markers(req, &dids, &gates).await;
+        // The labelers a Thread Lens request named (threadlens-hydration
+        // design §3.6 (b)). Prism's own labels are the local ones: an
+        // upstream copy of them is not kept.
+        let reader_labelers = crate::appview_clients::accept_labelers::current().map(|s| {
+            s.accept()
+                .entries()
+                .iter()
+                .map(|e| e.did.clone())
+                .filter(|d| *d != self.inner.cfg.labeler_did)
+                .collect::<HashSet<String>>()
+        });
         let overlay = normalize::Overlay {
             profile_viewers: dids.iter().map(|d| (d.clone(), actors.view(d))).collect(),
             post_viewers,
@@ -1049,6 +1066,7 @@ impl Hydrator {
             hidden_creators,
             blocked: blocked.clone(),
             restored,
+            reader_labelers,
         };
         let report = normalize::normalize_upstream(&mut view, &overlay);
         self.enrich_counts(req, &mut view).await?;

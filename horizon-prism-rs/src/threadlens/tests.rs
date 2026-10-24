@@ -1319,3 +1319,181 @@ async fn the_walk_reads_the_link_above_a_blocked_post_from_its_record() {
     assert_bare_gaps(&anchor, &got);
     db.drop_db().await;
 }
+
+/// One call the labelers' fake AppView received: the method, the
+/// `uris`/`uri` it asked for, its `atproto-accept-labelers`, and every
+/// header name and value it carried.
+#[derive(Debug, Clone)]
+struct LabelledCall {
+    method: String,
+    asked: Vec<String>,
+    accept: Option<String>,
+    headers: Vec<(String, String)>,
+    query: String,
+}
+
+const L1: &str = "did:plc:labeler1111111111111111";
+const L2: &str = "did:plc:labeler2222222222222222";
+const L3: &str = "did:plc:labeler3333333333333333";
+
+/// An AppView answering `getPosts` for any post URI with a view labelled
+/// by L1 (asked for), L2 (not asked for) and Prism's own labeler (an
+/// upstream copy), its author labelled by L1, and saying it applied L1 and
+/// a labeler nobody asked for. Everything else is NotFound.
+async fn labelling_appview(calls: Arc<std::sync::Mutex<Vec<LabelledCall>>>) -> String {
+    use axum::extract::RawQuery;
+    use axum::http::HeaderMap;
+
+    let app = AxumRouter::new()
+        .route(
+            "/xrpc/{method}",
+            get(
+                |State(calls): State<Arc<std::sync::Mutex<Vec<LabelledCall>>>>, Path(method): Path<String>, headers: HeaderMap, RawQuery(query): RawQuery| async move {
+                    let query = query.unwrap_or_default();
+                    let asked: Vec<String> = url::form_urlencoded::parse(query.as_bytes())
+                        .filter(|(k, _)| k == "uris" || k == "uri")
+                        .map(|(_, v)| v.into_owned())
+                        .collect();
+                    calls.lock().expect("calls").push(LabelledCall {
+                        method: method.clone(),
+                        asked: asked.clone(),
+                        accept: headers.get("atproto-accept-labelers").map(|v| v.to_str().expect("ascii").to_string()),
+                        headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string())).collect(),
+                        query: query.clone(),
+                    });
+                    if method != "app.bsky.feed.getPosts" {
+                        return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "NotFound"}))).into_response();
+                    }
+                    let label = |src: &str, uri: &str, val: &str| json!({"src": src, "uri": uri, "val": val, "cts": "2026-10-24T00:00:00Z"});
+                    let posts: Vec<Value> = asked
+                        .iter()
+                        .map(|uri| {
+                            let did = crate::db::locks::uri_author(uri).expect("did");
+                            json!({"$type": "app.bsky.feed.defs#postView", "uri": uri, "cid": "bafy",
+                                   "author": {"did": did, "handle": "upstream.test", "labels": [label(L1, did, "whimsy")]},
+                                   "record": {"$type": "app.bsky.feed.post", "text": "upstream text", "createdAt": "2026-10-24T00:00:00Z"},
+                                   "indexedAt": "2026-10-24T00:00:00Z", "replyCount": 0,
+                                   "labels": [label(L1, uri, "meme"), label(L2, uri, "other"), label(crate::hydration::testing::LABELER, uri, "stale-own")]})
+                        })
+                        .collect();
+                    ([("atproto-content-labelers", format!("{L1};redact, did:plc:notasked"))], axum::Json(json!({"posts": posts}))).into_response()
+                },
+            ),
+        )
+        .with_state(calls);
+    serve_fake(app).await
+}
+
+/// `(src, val)` of a view's labels.
+fn labels_of(v: &Value) -> Vec<(String, String)> {
+    v["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|l| (l["src"].as_str().unwrap_or_default().to_string(), l["val"].as_str().unwrap_or_default().to_string()))
+        .collect()
+}
+
+/// #887 (threadlens-hydration design §3.6 (b), skydeval 2026-10-24): a
+/// request's `atproto-accept-labelers`, rebuilt from its valid entries,
+/// goes with the upstream calls; the labels those labelers applied are on
+/// the post and author views, beside Prism's own and without its upstream
+/// copy; a post Prism built from its own row gets them from one `getPosts`
+/// read for labels alone; `atproto-content-labelers` names what was
+/// applied. Nothing else of the request goes upstream. Without the header,
+/// or with one past the bound, nothing changes.
+#[tokio::test]
+async fn the_readers_labelers_label_the_lens_views() {
+    let Some(db) = fresh_db("threadlens_labelers").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(AUTHOR, "author.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    let local = post(p, AUTHOR, "3klocal22222", "local", None, None).await;
+    exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{local}', 'prism-own')")).await;
+    // Not stored here: the ladder fetches it.
+    let remote = format!("at://{STRANGER}/app.bsky.feed.post/3kremote2222");
+    let (farsight, _fake) = crate::farsight::lookup::tests::engine("").await;
+    let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
+    let calls: Arc<std::sync::Mutex<Vec<LabelledCall>>> = Arc::default();
+    let base = labelling_appview(Arc::clone(&calls)).await;
+    let l = ladder(h.clone(), &base, Arc::new(StubLookup::default()));
+    let url = serve(state(h, l, ThreadLensAccess::Members)).await;
+    let own = crate::hydration::testing::LABELER;
+    let token = |method: &str| mint(&signing_key(3), VIEWER_A, &format!("did:web:{AUDIENCE_HOST}"), Some(method));
+    let send = |method: &'static str, body: Value, accept: Option<String>| {
+        let mut r = reqwest::Client::new()
+            .post(format!("{url}/xrpc/{method}"))
+            .header("authorization", format!("Bearer {}", token(method)))
+            .header("x-reader-secret", "do-not-forward")
+            .json(&body);
+        if let Some(a) = accept {
+            r = r.header("atproto-accept-labelers", a);
+        }
+        r.send()
+    };
+    let take = || std::mem::take(&mut *calls.lock().expect("calls"));
+
+    // With labelers: L1 (redact), an invalid entry, Prism's own, and L3.
+    let accept = format!("{L1};redact, not a did, {own}, {L3};weird");
+    let r = send(RESOLVE, json!({"uris": [local, remote]}), Some(accept.clone())).await.expect("request");
+    assert_eq!(r.status().as_u16(), 200);
+    // L1 was applied upstream and Prism's own by Prism; L3 by nobody, and
+    // the labeler nobody asked for is not named.
+    let content = r.headers().get("atproto-content-labelers").map(|v| v.to_str().expect("ascii").to_string());
+    assert_eq!(content.as_deref(), Some(format!("{L1};redact, {own}").as_str()));
+    let v: Value = r.json().await.expect("json");
+    let (local_view, remote_view) = (&v["items"][0]["post"], &v["items"][1]["post"]);
+    assert_eq!((&v["items"][0]["uri"], &v["items"][1]["uri"]), (&json!(local), &json!(remote)), "{v}");
+    // The local post keeps its own text and Prism's label, and gains L1's.
+    assert_eq!(local_view["record"]["text"], "local", "{v}");
+    assert_eq!(labels_of(local_view), [(own.to_string(), "prism-own".to_string()), (L1.to_string(), "meme".to_string())], "{v}");
+    assert_eq!(labels_of(&local_view["author"]), [(L1.to_string(), "whimsy".to_string())], "{v}");
+    // The fetched post keeps L1's labels only: not L2's (not asked for),
+    // not the upstream copy of Prism's own.
+    assert_eq!(labels_of(remote_view), [(L1.to_string(), "meme".to_string())], "{v}");
+    assert_eq!(labels_of(&remote_view["author"]), [(L1.to_string(), "whimsy".to_string())], "{v}");
+    // Two `getPosts`: the ladder's for the remote post, then the labels
+    // read for the local one alone. Both carried the rebuilt header and
+    // nothing of the caller.
+    let got = take();
+    let posts: Vec<&LabelledCall> = got.iter().filter(|c| c.method == "app.bsky.feed.getPosts").collect();
+    assert_eq!(posts.iter().map(|c| c.asked.clone()).collect::<Vec<_>>(), [vec![remote.clone()], vec![local.clone()]], "{got:?}");
+    for c in &got {
+        assert_eq!(c.accept.as_deref(), Some(format!("{L1};redact, {own}, {L3}").as_str()), "{c:?}");
+        for (name, value) in &c.headers {
+            assert!(!["authorization", "x-reader-secret", "cookie"].contains(&name.as_str()), "{name} forwarded: {c:?}");
+            assert!(!value.contains(VIEWER_A) && !value.contains("do-not-forward"), "{name}: {value}");
+        }
+        assert!(!c.query.contains(VIEWER_A), "{c:?}");
+    }
+
+    // `getThread` on the local post: the same labels, the same header.
+    let r = send(GET_THREAD, json!({"anchor": local, "depth": 0}), Some(accept.clone())).await.expect("request");
+    assert_eq!(r.headers().get("atproto-content-labelers").map(|v| v.to_str().expect("ascii").to_string()), Some(format!("{L1};redact, {own}")));
+    let t: Value = r.json().await.expect("json");
+    assert_eq!(labels_of(&t["nodes"][0]["post"]), [(own.to_string(), "prism-own".to_string()), (L1.to_string(), "meme".to_string())], "{t}");
+    let got = take();
+    assert_eq!(got.iter().map(|c| (c.method.as_str(), c.asked.clone())).collect::<Vec<_>>(), [("app.bsky.feed.getPosts", vec![local.clone()])], "{got:?}");
+    assert_eq!(got[0].accept.as_deref(), Some(format!("{L1};redact, {own}, {L3}").as_str()));
+
+    // Without the header, with one past the bound, and with one naming no
+    // valid DID: no header upstream, no labels read for the local post,
+    // no `atproto-content-labelers`, and only Prism's labels.
+    let oversize = format!("{L1}, {}", "x".repeat(crate::appview_clients::accept_labelers::MAX_HEADER_BYTES));
+    for accept in [None, Some(oversize), Some("nothing, valid;redact".to_string())] {
+        let r = send(RESOLVE, json!({"uris": [local, remote]}), accept.clone()).await.expect("request");
+        assert_eq!(r.status().as_u16(), 200);
+        assert!(r.headers().get("atproto-content-labelers").is_none(), "{accept:?}");
+        let v: Value = r.json().await.expect("json");
+        assert_eq!(labels_of(&v["items"][0]["post"]), [(own.to_string(), "prism-own".to_string())], "{accept:?}: {v}");
+        assert!(labels_of(&v["items"][1]["post"]).is_empty() && labels_of(&v["items"][1]["post"]["author"]).is_empty(), "{accept:?}: {v}");
+        let got = take();
+        assert_eq!(got.iter().map(|c| c.asked.clone()).collect::<Vec<_>>(), [vec![remote.clone()]], "{accept:?}: {got:?}");
+        assert!(got.iter().all(|c| c.accept.is_none()), "{accept:?}: {got:?}");
+    }
+    db.drop_db().await;
+}

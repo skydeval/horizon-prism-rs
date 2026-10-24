@@ -15,6 +15,13 @@
 //!     pool.
 //!
 //!   Responses are for the caller: [`gate`] returns who is asking.
+//! - **The reader's labelers** (threadlens-hydration design §3.6 (b),
+//!   skydeval 2026-10-24): a request's `atproto-accept-labelers`, its valid
+//!   entries only, goes with the upstream `getPostThread` and `getPosts`
+//!   calls the response makes; the labels those labelers applied are kept
+//!   on its views, and `atproto-content-labelers` names the ones applied.
+//!   No other request header, and never the caller's DID or token, goes
+//!   upstream.
 //! - **Non-enumeration:** every per-URI failure is a typed gap. Request-level
 //!   failures (malformed body, bad parameters, too many URIs) are
 //!   `400 InvalidRequest` and depend only on the input and, under
@@ -33,6 +40,7 @@ use serde_json::Value;
 use super::cursor::CursorKey;
 use super::ladder::Ladder;
 use super::thread::{Request, get_thread as assemble, resolve as resolve_each};
+use crate::appview_clients::accept_labelers::{AcceptLabelers, CONTENT_LABELERS, LabelerScope, with_labelers};
 use crate::config::{ThreadLensAccess, ThreadLensConfig};
 use crate::db::locks::uri_author;
 use crate::hydration::lens::{lens_items, lens_thread};
@@ -119,6 +127,17 @@ async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method
     Ok((request_handle(viewer.state_did(), ip), viewer))
 }
 
+/// The response's `atproto-content-labelers`, for a request that named its
+/// labelers (threadlens-hydration design §3.6 (b)): those an upstream said
+/// it applied, and Prism's own when named. Absent otherwise.
+fn content_labelers(scope: Option<&LabelerScope>) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    if let Some(value) = scope.and_then(LabelerScope::content_labelers) {
+        out.insert(axum::http::HeaderName::from_static(CONTENT_LABELERS), value);
+    }
+    out
+}
+
 fn at_uri(u: &str) -> bool {
     u.starts_with("at://") && uri_author(u).is_some_and(proto_blue::syntax::Did::is_valid) && u.matches('/').count() == 4
 }
@@ -146,7 +165,7 @@ pub async fn get_thread(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     bytes: Bytes,
-) -> Result<Json<PublicEmit<Value>>, XrpcError> {
+) -> Result<(HeaderMap, Json<PublicEmit<Value>>), XrpcError> {
     let (req, viewer) = gate(&s, &headers, peer, GET_THREAD).await?;
     let input: GetThreadInput = body(&bytes)?;
     if !at_uri(&input.anchor) {
@@ -173,8 +192,9 @@ pub async fn get_thread(
         depth,
         parent_height,
     };
-    let thread = assemble(&s.ladder, &s.cfg, &s.cursor_key, request, cursor).await?;
-    Ok(Json(lens_thread(&input.anchor, &thread.nodes, thread.bridging, viewer.hydrate)))
+    let scope = AcceptLabelers::from_headers(&headers).map(LabelerScope::new);
+    let thread = with_labelers(scope.clone(), assemble(&s.ladder, &s.cfg, &s.cursor_key, request, cursor)).await?;
+    Ok((content_labelers(scope.as_deref()), Json(lens_thread(&input.anchor, &thread.nodes, thread.bridging, viewer.hydrate))))
 }
 
 pub async fn resolve(
@@ -182,7 +202,7 @@ pub async fn resolve(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     bytes: Bytes,
-) -> Result<Json<PublicEmit<Value>>, XrpcError> {
+) -> Result<(HeaderMap, Json<PublicEmit<Value>>), XrpcError> {
     let (req, viewer) = gate(&s, &headers, peer, RESOLVE).await?;
     let input: ResolveInput = body(&bytes)?;
     if input.uris.is_empty() || input.uris.len() > MAX_URIS {
@@ -191,6 +211,7 @@ pub async fn resolve(
     if !input.uris.iter().all(|u| at_uri(u)) {
         return Err(XrpcError::invalid("Error: uris must be at-uris"));
     }
-    let resolved = resolve_each(&s.ladder, &s.cfg, &s.cursor_key, &viewer, &req, &input.uris).await?;
-    Ok(Json(lens_items(&resolved.nodes, resolved.bridging, viewer.hydrate)))
+    let scope = AcceptLabelers::from_headers(&headers).map(LabelerScope::new);
+    let resolved = with_labelers(scope.clone(), resolve_each(&s.ladder, &s.cfg, &s.cursor_key, &viewer, &req, &input.uris)).await?;
+    Ok((content_labelers(scope.as_deref()), Json(lens_items(&resolved.nodes, resolved.bridging, viewer.hydrate))))
 }

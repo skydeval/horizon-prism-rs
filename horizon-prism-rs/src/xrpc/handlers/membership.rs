@@ -60,6 +60,11 @@ pub const FEATURE_THREAD_LENS_SIGNED_IN: &str = "threadLens.signedIn";
 /// outputs, viewer state per `servedAs`, counts, and `viewer.replyDisabled`
 /// where its own rows decide it. Labels are this AppView's own.
 pub const FEATURE_THREAD_LENS_HYDRATED: &str = "threadLens.hydrated";
+/// Thread Lens honours the request's `atproto-accept-labelers`
+/// (threadlens-hydration design §3.6 (b), skydeval 2026-10-24): post views
+/// carry the labels the named labelers applied beside this AppView's own,
+/// and the response names the applied ones in `atproto-content-labelers`.
+pub const FEATURE_THREAD_LENS_LABELERS: &str = "threadLens.labelers";
 /// `refract` (refract design §7.1): the Refract endpoints are on.
 pub const FEATURE_REFRACT: &str = "refract";
 
@@ -198,6 +203,7 @@ impl MembershipSettings {
             out.push(FEATURE_THREAD_LENS_SIGNED_IN);
         }
         out.push(FEATURE_THREAD_LENS_HYDRATED);
+        out.push(FEATURE_THREAD_LENS_LABELERS);
         // Refract (refract design §7.1): from runtime state, while on.
         if live.refract_enabled {
             out.push(FEATURE_REFRACT);
@@ -388,7 +394,7 @@ mod tests {
         // The private values, then Thread Lens's (amendment 1 §0A).
         // `private.anyPds` follows them while `private_any_pds.enabled`
         // (private-encode design §7; on by default).
-        let features = json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]).collect::<Vec<_>>());
+        let features = json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, FEATURE_THREAD_LENS_LABELERS, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]).collect::<Vec<_>>());
         assert_eq!(json!(FEATURES), json!(["private", "private.embeds", "private.bookmarks", "private.gates", "private.interactions", "private.notifications", "private.freshIndex", "private.paging", "private.crossPdsReplies", "private.following", "private.search", "private.threadAudience", "private.mediaFilters", "private.notificationPreferences", "private.unreadReasons", "private.replyContext", "private.notificationSubjects", "private.notServed", "private.degraded", "private.reindexing", "private.listBlocks", "private.activitySubscriptions", "private.publicRootGates", "private.appearance", "private.appearanceRetention"]));
         // T-N9 (private notification preferences design §8): the
         // preferences' feature followed every value before it; the fast
@@ -441,7 +447,7 @@ mod tests {
 
         // The private tier disabled: no private features; Thread Lens's.
         let (status, _, v) = call(&client, &disabled_base, Some(&token(1, BOB))).await;
-        assert_eq!((status, &v), (200, &answer("member", &json!(["threadLens", "threadLens.signedIn", "threadLens.hydrated", "plural.fronters", "plural.read"]), [false, false, true], 3600)));
+        assert_eq!((status, &v), (200, &answer("member", &json!(["threadLens", "threadLens.signedIn", "threadLens.hydrated", "threadLens.labelers", "plural.fronters", "plural.read"]), [false, false, true], 3600)));
         db.drop_db().await;
     }
 
@@ -557,7 +563,7 @@ mod tests {
         exec(p, "INSERT INTO members (did, source) VALUES ('did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', 'admin')").await;
         let aud = format!("did:web:{AUDIENCE_HOST}");
         let client = reqwest::Client::new();
-        let features = json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]).collect::<Vec<_>>());
+        let features = json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, FEATURE_THREAD_LENS_LABELERS, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]).collect::<Vec<_>>());
         let timeline = |base: &str, i: u8, did: &str| {
             let token = mint(&signing_key(i + 3), did, &aud, Some("app.bsky.feed.getTimeline"));
             let req = client.get(format!("{base}/xrpc/app.bsky.feed.getTimeline")).header("authorization", format!("Bearer {token}"));
@@ -601,13 +607,13 @@ mod tests {
     fn any_pds_follows_its_switch() {
         let on = MembershipSettings::new(&KryphocronPrivateTier, &PrivateReadConfig::default());
         let mut want: Vec<&str> = FEATURES.to_vec();
-        want.extend([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]);
+        want.extend([FEATURE_ANY_PDS, FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, FEATURE_THREAD_LENS_LABELERS, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]);
         assert_eq!(on.features(), want);
         let off = on.with_any_pds(false);
         assert!(!off.features().contains(&FEATURE_ANY_PDS));
-        assert_eq!(off.features().len(), FEATURES.len() + 5);
+        assert_eq!(off.features().len(), FEATURES.len() + 6);
         let disabled = MembershipSettings::default().with_any_pds(true);
-        assert_eq!(disabled.features(), [FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]);
+        assert_eq!(disabled.features(), [FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, FEATURE_THREAD_LENS_LABELERS, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]);
     }
 
     /// T-0 (Thread Lens amendment 1 §0A): `features` follows a live change
@@ -638,7 +644,7 @@ mod tests {
         let client = reqwest::Client::new();
         let token = mint(&signing_key(3), ALICE, &format!("did:web:{AUDIENCE_HOST}"), Some(GET_MEMBERSHIP));
         let features = |extra: &[&str]| json!(FEATURES.iter().copied().chain([FEATURE_ANY_PDS]).chain(extra.iter().copied()).collect::<Vec<_>>());
-        let both = [FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ];
+        let both = [FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, FEATURE_THREAD_LENS_LABELERS, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ];
 
         live.update(|v| v.threadlens_access = ThreadLensAccess::SignedIn);
         let (_, _, v) = call(&client, &base, Some(&token)).await;
@@ -649,9 +655,9 @@ mod tests {
         // Members only: Thread Lens is still served, to ready members.
         live.update(|v| v.threadlens_access = ThreadLensAccess::Members);
         let (_, _, v) = call(&client, &base, Some(&token)).await;
-        assert_eq!(v["features"], features(&[FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_HYDRATED, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]), "{v}");
+        assert_eq!(v["features"], features(&[FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_HYDRATED, FEATURE_THREAD_LENS_LABELERS, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]), "{v}");
         let (_, _, v) = call(&client, &disabled_base, Some(&token)).await;
-        assert_eq!(v["features"], json!(["threadLens", "threadLens.hydrated", "plural.fronters", "plural.read"]), "{v}");
+        assert_eq!(v["features"], json!(["threadLens", "threadLens.hydrated", "threadLens.labelers", "plural.fronters", "plural.read"]), "{v}");
 
         // And back, still without a restart.
         live.update(|v| v.threadlens_access = ThreadLensAccess::SignedIn);
@@ -753,7 +759,7 @@ mod tests {
         let base = serve(state).await;
         let token = mint(&signing_key(3), ALICE, &format!("did:web:{AUDIENCE_HOST}"), Some(GET_MEMBERSHIP));
         let (status, _, v) = call(&reqwest::Client::new(), &base, Some(&token)).await;
-        assert_eq!((status, &v), (200, &answer("notEligible", &json!(["threadLens", "threadLens.signedIn", "threadLens.hydrated", "plural.fronters", "plural.read"]), [false, false, true], 3600)));
+        assert_eq!((status, &v), (200, &answer("notEligible", &json!(["threadLens", "threadLens.signedIn", "threadLens.hydrated", "threadLens.labelers", "plural.fronters", "plural.read"]), [false, false, true], 3600)));
         db.drop_db().await;
     }
 }

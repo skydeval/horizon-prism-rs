@@ -22,6 +22,20 @@ use crate::net::{BodyCap, NetClient, NetError, NetResponse, RequestOptions};
 /// Total time per upstream call (§8.3).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// `getPosts` parameters (≤ 25 URIs).
+fn posts_params(uris: &[String]) -> Vec<(&'static str, String)> {
+    uris.iter().take(25).map(|u| ("uris", u.clone())).collect()
+}
+
+/// `getPostThread` parameters.
+fn thread_params(uri: &str, depth: u32, parent_height: u32) -> Vec<(&'static str, String)> {
+    vec![("uri", uri.to_string()), ("depth", depth.to_string()), ("parentHeight", parent_height.to_string())]
+}
+
+fn accept_labelers(value: &HeaderValue) -> (HeaderName, HeaderValue) {
+    (HeaderName::from_static(super::accept_labelers::ACCEPT_LABELERS), value.clone())
+}
+
 /// How a network is called.
 #[derive(Clone)]
 pub enum AppViewAuth {
@@ -143,8 +157,7 @@ impl AppViewClient {
     ///
     /// Transport failures.
     pub async fn get_posts(&self, uris: &[String]) -> Result<NetResponse, NetError> {
-        let params: Vec<(&str, String)> = uris.iter().take(25).map(|u| ("uris", u.clone())).collect();
-        self.query("app.bsky.feed.getPosts", &params).await
+        self.query("app.bsky.feed.getPosts", &posts_params(uris)).await
     }
 
     /// `app.bsky.feed.getPostThread`.
@@ -153,15 +166,33 @@ impl AppViewClient {
     ///
     /// Transport failures.
     pub async fn get_post_thread(&self, uri: &str, depth: u32, parent_height: u32) -> Result<NetResponse, NetError> {
-        self.query(
-            "app.bsky.feed.getPostThread",
-            &[
-                ("uri", uri.to_string()),
-                ("depth", depth.to_string()),
-                ("parentHeight", parent_height.to_string()),
-            ],
-        )
-        .await
+        self.query("app.bsky.feed.getPostThread", &thread_params(uri, depth, parent_height)).await
+    }
+
+    /// [`Self::get_posts`] carrying `atproto-accept-labelers`, with the
+    /// response's headers (threadlens-hydration design §3.6 (b)).
+    ///
+    /// # Errors
+    ///
+    /// Transport failures.
+    pub async fn get_posts_labelled(&self, uris: &[String], labelers: &HeaderValue) -> Result<(NetResponse, axum::http::HeaderMap), NetError> {
+        self.query_with_headers("app.bsky.feed.getPosts", &posts_params(uris), &[accept_labelers(labelers)]).await
+    }
+
+    /// [`Self::get_post_thread`] carrying `atproto-accept-labelers`, with
+    /// the response's headers.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures.
+    pub async fn get_post_thread_labelled(
+        &self,
+        uri: &str,
+        depth: u32,
+        parent_height: u32,
+        labelers: &HeaderValue,
+    ) -> Result<(NetResponse, axum::http::HeaderMap), NetError> {
+        self.query_with_headers("app.bsky.feed.getPostThread", &thread_params(uri, depth, parent_height), &[accept_labelers(labelers)]).await
     }
 
     /// `app.bsky.feed.getAuthorFeed`.

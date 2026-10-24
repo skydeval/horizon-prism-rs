@@ -1144,6 +1144,8 @@ pub async fn get_thread(
     work.author_pass().await;
     work.name_lists();
     phases.mark("authors");
+    super::labelers::add_reader_labels(ladder, r.req, &mut work.nodes).await;
+    phases.mark("labels");
     if let Some((root, gate)) = thread_gate(h, r.anchor, &work.nodes, gate_view.as_ref()).await? {
         apply_gate(h, &mut work.nodes, &root, &gate, r.viewer).await?;
     }
@@ -1374,6 +1376,7 @@ pub async fn resolve(
     work.enforce().await?;
     work.author_pass().await;
     work.name_lists();
+    super::labelers::add_reader_labels(ladder, req, &mut work.nodes).await;
     resolve_hidden(h, &mut work.nodes, viewer).await?;
     let bridging = match (bridging, work.limited) {
         (false, _) => Bridging::Off,

@@ -6,7 +6,11 @@
 //!    among them (Thread Lens amendment 1 §1): such a post is shown, with
 //!    its upstream labels removed, as on every other view.
 //! 2. **Labels.** Upstream `labels` arrays are removed at every depth; local
-//!    labels (§7.8) are applied instead.
+//!    labels (§7.8) are applied instead. A Thread Lens request that names
+//!    its labelers keeps the upstream labels those labelers applied, beside
+//!    the local ones and without repeats (threadlens-hydration design §3.6
+//!    (b), skydeval 2026-10-24); content stripping (1) reads the labels as
+//!    the upstream sent them, as before.
 //! 3. **Viewer state.** `viewer` objects are replaced with locally computed
 //!    state (§7.5); with an anonymous viewer, `viewer` is `{}`.
 //! 4. **Private-tier references.** An embedded record whose URI is
@@ -72,6 +76,29 @@ pub struct Overlay {
     pub blocked: HashSet<String>,
     /// The restored marker by DID (refract design §7.3).
     pub restored: HashMap<String, Value>,
+    /// The labelers the request named (threadlens-hydration design §3.6
+    /// (b)), Prism's own left out: upstream labels from these are kept
+    /// beside the local ones. `None` removes every upstream label.
+    pub reader_labelers: Option<HashSet<String>>,
+}
+
+/// Whether two label objects are the same label.
+pub(crate) fn same_label(a: &Value, b: &Value) -> bool {
+    ["src", "uri", "val"].iter().all(|k| a.get(*k) == b.get(*k)) && a.get("neg").and_then(Value::as_bool).unwrap_or(false) == b.get("neg").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Local labels, then the kept upstream ones that are not among them.
+fn merged_labels(local: Option<&Vec<Value>>, kept: &[Value]) -> Option<Vec<Value>> {
+    if local.is_none() && kept.is_empty() {
+        return None;
+    }
+    let mut out: Vec<Value> = local.cloned().unwrap_or_default();
+    for label in kept {
+        if !out.iter().any(|l| same_label(l, label)) {
+            out.push(label.clone());
+        }
+    }
+    Some(out)
 }
 
 impl Overlay {
@@ -120,6 +147,9 @@ impl Overlay {
 pub struct NormalizeReport {
     /// Post URIs detected as content-stripped, before labels were removed.
     pub content_stripped: HashSet<String>,
+    /// With [`Overlay::reader_labelers`], the post views normalized: their
+    /// upstream labels from those labelers were kept.
+    pub labelled: HashSet<String>,
 }
 
 pub(super) fn is_post_view(m: &Map<String, Value>) -> bool {
@@ -256,8 +286,15 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
             {
                 report.content_stripped.insert(uri.clone());
             }
-            // 2. Labels: upstream removed; local applied on labelled subjects.
-            m.remove("labels");
+            // 2. Labels: upstream removed, but for those of the labelers the
+            // request named; local applied on labelled subjects.
+            let kept: Vec<Value> = match (m.remove("labels"), &overlay.reader_labelers) {
+                (Some(Value::Array(labels)), Some(keep)) => labels
+                    .into_iter()
+                    .filter(|l| l.get("src").and_then(Value::as_str).is_some_and(|s| keep.contains(s)))
+                    .collect(),
+                _ => Vec::new(),
+            };
             // 3. Viewer state.
             if post_like && let Some(uri) = &uri {
                 if m.contains_key("viewer") || is_post_view(m) {
@@ -267,18 +304,26 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
                     }
                     m.insert("viewer".into(), viewer);
                 }
-                if let Some(local) = overlay.labels.get(uri) {
-                    m.insert("labels".into(), Value::Array(local.clone()));
+                if let Some(labels) = merged_labels(overlay.labels.get(uri), &kept) {
+                    m.insert("labels".into(), Value::Array(labels));
+                }
+                if overlay.reader_labelers.is_some() && is_post_view(m) {
+                    report.labelled.insert(uri.clone());
                 }
             } else if is_profile_view(m) {
                 let did = m.get("did").and_then(Value::as_str).unwrap_or_default().to_string();
                 let viewer = overlay.profile_viewers.get(&did).cloned().unwrap_or_else(|| json!({}));
                 m.insert("viewer".into(), viewer);
-                if let Some(local) = overlay.labels.get(&did) {
-                    m.insert("labels".into(), Value::Array(local.clone()));
+                if let Some(labels) = merged_labels(overlay.labels.get(&did), &kept) {
+                    m.insert("labels".into(), Value::Array(labels));
                 }
-            } else if m.contains_key("viewer") {
-                m.insert("viewer".into(), json!({}));
+            } else {
+                if m.contains_key("viewer") {
+                    m.insert("viewer".into(), json!({}));
+                }
+                if !kept.is_empty() {
+                    m.insert("labels".into(), Value::Array(kept));
+                }
             }
             for (k, child) in m.iter_mut() {
                 // Every `viewer` here is local now (or `{}`): walking it would
@@ -402,6 +447,43 @@ mod tests {
         assert_eq!(v["posts"][0]["author"]["viewer"], json!({}), "anonymous-equivalent viewer");
         assert_eq!(v["posts"][0]["author"]["labels"][0]["src"], "did:web:here");
         assert!(v["posts"][0].get("labels").is_none());
+    }
+
+    /// #887 (threadlens-hydration design §3.6 (b)): with the request's
+    /// labelers, their upstream labels stay at every depth, after the local
+    /// ones and without repeats; every other upstream label goes; content
+    /// stripping reads the labels as sent; the post views are reported.
+    #[test]
+    fn keeps_the_readers_labelers_labels() {
+        let uri = "at://did:plc:author/app.bsky.feed.post/1";
+        let quoted = "at://did:plc:author/app.bsky.feed.post/2";
+        let mine = |val: &str, subject: &str| json!({"src": "did:plc:mine", "uri": subject, "val": val, "cts": "c"});
+        let mut p = post(uri, Some("hi"), vec![label("porn"), mine("meme", uri), mine("dupe", uri)]);
+        p["author"]["labels"] = json!([label("spam"), mine("whimsy", "did:plc:author")]);
+        p["embed"] = json!({"$type": "app.bsky.embed.record#view", "record": {"$type": "app.bsky.embed.record#viewRecord", "uri": quoted, "cid": "c",
+            "author": {"did": "did:plc:author", "handle": "a.example"}, "value": {"text": "q"}, "labels": [mine("quoted", quoted), label("x")]}});
+        let mut hidden = post("at://did:plc:author/app.bsky.feed.post/3", Some("h"), vec![mine("!hide", "at://did:plc:author/app.bsky.feed.post/3")]);
+        hidden["labels"][0]["uri"] = json!("at://did:plc:author/app.bsky.feed.post/3");
+        let mut v = json!({"posts": [p, hidden], "list": {"uri": "at://did:plc:author/app.bsky.graph.list/l", "labels": [mine("listy", "l"), label("y")]}});
+        let mut overlay = Overlay::default();
+        overlay.labels.insert(uri.into(), vec![json!({"src": "did:web:here", "uri": uri, "val": "local", "cts": "c"}), mine("dupe", uri)]);
+        overlay.reader_labelers = Some(["did:plc:mine".to_string()].into());
+        let report = normalize_upstream(&mut v, &overlay);
+        let vals = |x: &Value| x["labels"].as_array().map(|ls| ls.iter().map(|l| l["val"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>());
+        assert_eq!(vals(&v["posts"][0]), Some(vec!["local".into(), "dupe".into(), "meme".into()]));
+        assert_eq!(vals(&v["posts"][0]["author"]), Some(vec!["whimsy".into()]));
+        assert_eq!(vals(&v["posts"][0]["embed"]["record"]), Some(vec!["quoted".into()]));
+        assert_eq!(vals(&v["list"]), Some(vec!["listy".into()]));
+        // The self-labels in the record are the author's, untouched.
+        assert_eq!(v["posts"][0]["record"]["labels"]["values"][0]["val"], "nudity");
+        // `!hide` from a named labeler is read by content stripping as
+        // before (the design's rule is unchanged).
+        assert!(report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/3"));
+        assert!(report.labelled.contains(uri));
+        // Without the request's labelers, nothing is reported.
+        let mut again = json!({"posts": [post(uri, Some("hi"), vec![mine("meme", uri)])]});
+        let report = normalize_upstream(&mut again, &Overlay::default());
+        assert!(again["posts"][0].get("labels").is_none() && report.labelled.is_empty());
     }
 
     /// B-73: the list view behind a local `blockingByList` keeps its labels
