@@ -118,6 +118,7 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     }
     discovery(cfg, &mut out);
     refract(cfg, &mut out);
+    plural(cfg, &mut out);
     #[cfg(feature = "standin-hosts")]
     crate::net::standin::problems(&cfg.standin, &mut out);
     out
@@ -219,6 +220,34 @@ fn refract(cfg: &FileConfig, out: &mut Vec<String>) {
     ] {
         if !(value.is_finite() && value > 0.0) {
             out.push(format!("refract.{key} must be above 0"));
+        }
+    }
+}
+
+/// `[plural]` (plural-pronouns design §6).
+fn plural(cfg: &FileConfig, out: &mut Vec<String>) {
+    let p = &cfg.plural;
+    if p.inline_wait_ms > 2500 {
+        out.push("plural.inline_wait_ms must be at most 2500".to_string());
+    }
+    if !(1..=100).contains(&p.member_pages) {
+        out.push("plural.member_pages must be 1 to 100".to_string());
+    }
+    if p.max_stream_lag_secs < 10 {
+        out.push("plural.max_stream_lag_secs must be at least 10".to_string());
+    }
+    for (key, value) in [
+        ("fill_concurrency", p.fill_concurrency),
+        ("reverify_hours", p.reverify_hours),
+        ("max_pending", p.max_pending),
+    ] {
+        if value == 0 {
+            out.push(format!("plural.{key} must be at least 1"));
+        }
+    }
+    for (key, value) in [("fill_rate_per_sec", p.fill_rate_per_sec.0), ("per_host_rate_per_sec", p.per_host_rate_per_sec.0)] {
+        if !(value.is_finite() && value > 0.0) {
+            out.push(format!("plural.{key} must be above 0"));
         }
     }
 }

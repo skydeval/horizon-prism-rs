@@ -478,6 +478,8 @@ impl Purger {
                     ("threadgates", "author_did"),
                     ("postgates", "author_did"),
                     ("nearhorizon_poll_posts", "author_did"),
+                    // Pronouns and plural records (plural-pronouns §2.3).
+                    ("plural_records", "did"),
                 ] {
                     n += delete_batch(conn, table, "uri", &format!("{column} = $1"), did).await?;
                 }

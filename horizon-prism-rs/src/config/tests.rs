@@ -391,6 +391,17 @@ label_source = "appview"
 gone_labels = ["!takedown", "!hide"]
 enabled = true
 
+[plural]
+enabled = true
+inline_wait_ms = 1500
+fill_concurrency = 8
+fill_rate_per_sec = 10.0
+per_host_rate_per_sec = 4.0
+member_pages = 10
+reverify_hours = 24
+max_pending = 100000
+max_stream_lag_secs = 120
+
 [lists]
 read_listing_pages = 5
 subscribed_max_per_member = 25

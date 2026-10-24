@@ -53,6 +53,22 @@ pub struct Row {
     pub cells: Vec<(&'static str, Cell)>,
 }
 
+/// The table of the plural collections (plural-pronouns design §2.3).
+pub const PLURAL_TABLE: &str = "plural_records";
+
+/// A plural record larger than this, serialized, is stored with `record`
+/// NULL (plural-pronouns design §2.6).
+pub const PLURAL_RECORD_MAX_BYTES: usize = 64 * 1024;
+
+/// The stored value of a plural record: its normalized JSON, or `None`
+/// over [`PLURAL_RECORD_MAX_BYTES`].
+#[must_use]
+pub fn plural_value(normalized: &Value) -> Option<Value> {
+    serde_json::to_vec(normalized)
+        .is_ok_and(|b| b.len() <= PLURAL_RECORD_MAX_BYTES)
+        .then(|| normalized.clone())
+}
+
 /// The table of a v3 record kind, for deletes.
 #[must_use]
 pub fn table(kind: EcosystemKind) -> Option<&'static str> {
@@ -67,6 +83,7 @@ pub fn table(kind: EcosystemKind) -> Option<&'static str> {
         EcosystemKind::Threadgate => "threadgates",
         EcosystemKind::Postgate => "postgates",
         EcosystemKind::PollPost => "nearhorizon_poll_posts",
+        EcosystemKind::Plural => PLURAL_TABLE,
         EcosystemKind::Post
         | EcosystemKind::Like
         | EcosystemKind::Repost
@@ -267,6 +284,23 @@ pub fn row(
                     ),
                     stored,
                     created,
+                ],
+            )
+        }
+        // Any author's (plural-pronouns design §2.2): the record whole, or
+        // NULL over the size bound; `indexed_at` on every write, for the
+        // listing's reconcile (§2.4). Not an object: a broken record.
+        EcosystemKind::Plural => {
+            if !record.is_object() {
+                return Err(err("record is not an object"));
+            }
+            tid(
+                PLURAL_TABLE,
+                "did",
+                vec![
+                    ("collection", Cell::Text(Some(collection.to_string()))),
+                    ("record", Cell::Json(plural_value(normalized))),
+                    ("indexed_at", Cell::Time(Some(now))),
                 ],
             )
         }

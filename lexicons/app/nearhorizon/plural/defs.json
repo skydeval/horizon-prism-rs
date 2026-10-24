@@ -1,0 +1,49 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.plural.defs",
+  "defs": {
+    "answer": {
+      "type": "object",
+      "description": "What this AppView knows of one record. 'record': the current record, with its CID. 'none': the AppView listed the author's repository and has seen every change since, and there is no such record. 'unknown': anything else (not listed yet, the repository unreachable or not active, the account hidden, the stream behind); never read as absence.",
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string", "knownValues": ["record", "none", "unknown"] },
+        "uri": { "type": "string", "format": "at-uri", "description": "With 'record'." },
+        "cid": { "type": "string", "format": "cid", "description": "With 'record'." },
+        "value": { "type": "unknown", "description": "With 'record': the record as written." }
+      }
+    },
+    "actorRecords": {
+      "type": "object",
+      "description": "The self-keyed records of one account.",
+      "required": ["did", "pronouns", "system", "front"],
+      "properties": {
+        "did": { "type": "string", "format": "did" },
+        "pronouns": { "type": "ref", "ref": "#answer", "description": "app.nearhorizon.actor.pronouns, rkey self." },
+        "system": { "type": "ref", "ref": "#answer", "description": "app.nearhorizon.plural.system, rkey self." },
+        "front": { "type": "ref", "ref": "#answer", "description": "app.nearhorizon.plural.front, rkey self." }
+      }
+    },
+    "memberAnswer": {
+      "type": "object",
+      "description": "An #answer for one app.nearhorizon.plural.member record, with the URI asked for.",
+      "required": ["uri", "status"],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "status": { "type": "string", "knownValues": ["record", "none", "unknown"] },
+        "cid": { "type": "string", "format": "cid" },
+        "value": { "type": "unknown" }
+      }
+    },
+    "memberView": {
+      "type": "object",
+      "required": ["uri", "rkey", "cid", "value"],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "rkey": { "type": "string", "format": "record-key" },
+        "cid": { "type": "string", "format": "cid" },
+        "value": { "type": "unknown" }
+      }
+    }
+  }
+}

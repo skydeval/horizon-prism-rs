@@ -899,7 +899,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
             .with_live(live.clone())
             .with_any_pds(cfg.file.private_any_pds.enabled)
             .with_refusal_cache(cfg.file.community.enroll_refusal_cache_secs)
-            .with_reindex_retry(cfg.file.community.reindex_retry_secs),
+            .with_reindex_retry(cfg.file.community.reindex_retry_secs)
+            .with_plural_read(cfg.file.plural.enabled),
     };
     let private_state = PrivateState::new(
         app.clone(),
@@ -955,6 +956,27 @@ pub async fn run() -> Result<Stopped, StartupError> {
         audit: Some(AuditLatch::from_flag(glue.audit_latched())),
         schema: Some(schema_status.clone()),
         farsight: health_farsight,
+    };
+    // Pronouns and plural systems (plural-pronouns design §2.4, §2.8): the
+    // listings run through the internal transport, with the background loop
+    // while the methods are on.
+    let plural_filler = crate::plural::fill::Filler::new(
+        pool.clone(),
+        nets.internal().client().clone(),
+        Arc::new(resolver.clone()),
+        scope.clone(),
+        &cfg.file.plural,
+    );
+    if cfg.file.plural.enabled {
+        tasks.push(plural_filler.clone().spawn());
+    }
+    let plural_state = crate::plural::handlers::PluralState {
+        app: app.clone(),
+        filler: plural_filler,
+        fresh: crate::plural::handlers::Freshness::Watermarks(
+            watermarks.clone(),
+            Duration::from_secs(u64::from(cfg.file.plural.max_stream_lag_secs)),
+        ),
     };
     let state = HealthState {
         pool: pool.clone(),
@@ -1049,6 +1071,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
             round_timeout: Duration::from_millis(u64::from(cfg.file.threadlens.verdict_round_timeout_ms)),
         }))
         .merge(crate::xrpc::router::index_router(index))
+        .merge(crate::plural::handlers::router(plural_state))
         .merge(health::router(state));
     // Every router has registered its methods by now.
     usage.load_registry();

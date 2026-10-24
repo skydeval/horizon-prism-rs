@@ -660,6 +660,27 @@ enabled = true
 # label_source = "labeler"
 # gone_labels = ["!takedown", "!hide"]
 
+# Pronouns and plural systems: app.nearhorizon.plural.getRecords and
+# listMembers, answered for any account without sign-in, so a reader's
+# browser never asks an author's server. Records of these collections are
+# stored from the firehose whatever `enabled` says; `enabled = false` makes
+# both methods answer 501 and stops the per-account listings. The first
+# time an account is asked about, its server is listed once (four
+# listRecords calls) so that Prism can say a record is absent; the listing
+# is repeated when asked about after reverify_hours. inline_wait_ms: how
+# long a call waits for listings it started (0 to 2500). max_stream_lag_secs:
+# past this firehose delay nothing is answered as absent.
+[plural]
+enabled = true
+inline_wait_ms = 1500
+fill_concurrency = 8
+fill_rate_per_sec = 10.0
+per_host_rate_per_sec = 4.0
+member_pages = 10
+reverify_hours = 24
+max_pending = 100000
+max_stream_lag_secs = 120
+
 # Showing a list that no other AppView could answer for: how many pages of
 # the list owner's records one request may read from the owner's server.
 [lists]

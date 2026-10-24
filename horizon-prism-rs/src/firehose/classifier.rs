@@ -32,6 +32,14 @@ pub const NSID_CONTENT_VISIBILITY: &str = "app.bsky.actor.contentVisibilityDecla
 pub const NSID_THREADGATE: &str = "app.bsky.feed.threadgate";
 pub const NSID_POSTGATE: &str = "app.bsky.feed.postgate";
 pub const NSID_POLL_POST: &str = "app.nearhorizon.poll.post";
+/// The four collections of pronouns and plural systems (plural-pronouns
+/// design §0): the first three at rkey `self` only.
+pub const NSID_PRONOUNS: &str = "app.nearhorizon.actor.pronouns";
+pub const NSID_PLURAL_SYSTEM: &str = "app.nearhorizon.plural.system";
+pub const NSID_PLURAL_FRONT: &str = "app.nearhorizon.plural.front";
+pub const NSID_PLURAL_MEMBER: &str = "app.nearhorizon.plural.member";
+/// The plural collections, the self-keyed three first.
+pub const PLURAL_COLLECTIONS: [&str; 4] = [NSID_PRONOUNS, NSID_PLURAL_SYSTEM, NSID_PLURAL_FRONT, NSID_PLURAL_MEMBER];
 pub const NSID_POST_PRIVATE: &str = "tools.kryphocron.feed.postPrivate";
 pub const NSID_AUDIENCE: &str = "tools.kryphocron.policy.audience";
 
@@ -59,6 +67,9 @@ pub enum EcosystemKind {
     Threadgate,
     Postgate,
     PollPost,
+    /// A record of [`PLURAL_COLLECTIONS`] (plural-pronouns design §2.2),
+    /// stored for any author in `plural_records`.
+    Plural,
 }
 
 /// Kryphocron records Prism indexes (§5.4 table). Private blocks
@@ -135,6 +146,8 @@ pub fn classify(nsid: &str, rkey: &str) -> RecordClass {
         NSID_THREADGATE => RecordClass::Ecosystem(EcosystemKind::Threadgate),
         NSID_POSTGATE => RecordClass::Ecosystem(EcosystemKind::Postgate),
         NSID_POLL_POST => RecordClass::Ecosystem(EcosystemKind::PollPost),
+        NSID_PRONOUNS | NSID_PLURAL_SYSTEM | NSID_PLURAL_FRONT if rkey == "self" => RecordClass::Ecosystem(EcosystemKind::Plural),
+        NSID_PLURAL_MEMBER => RecordClass::Ecosystem(EcosystemKind::Plural),
         // rkey-self records accept only rkey `self`, like profiles (§3.2).
         NSID_LABELER_SERVICE if rkey == "self" => RecordClass::Ecosystem(EcosystemKind::LabelerService),
         NSID_NOTIFICATION_DECLARATION | NSID_ACTOR_STATUS | NSID_CONTENT_VISIBILITY if rkey == "self" => {
@@ -209,6 +222,22 @@ mod tests {
             assert_eq!(classify(nsid, "self"), RecordClass::Ecosystem(kind));
             assert_eq!(classify(nsid, "3kaaaaaaaaaaa"), RecordClass::Unindexed, "{nsid}");
         }
+    }
+
+    /// T-P1 (plural-pronouns design §2.2): the four plural collections, the
+    /// self-keyed three at `self` only.
+    #[test]
+    fn plural_collections_and_their_table() {
+        for nsid in PLURAL_COLLECTIONS {
+            let c = classify(nsid, "self");
+            assert_eq!(c, RecordClass::Ecosystem(EcosystemKind::Plural), "{nsid}");
+            assert_eq!(c.record_kind(), Some(RecordKind::Table("plural_records")), "{nsid}");
+        }
+        for nsid in [NSID_PRONOUNS, NSID_PLURAL_SYSTEM, NSID_PLURAL_FRONT] {
+            assert_eq!(classify(nsid, "3kaaaaaaaaaaa"), RecordClass::Unindexed, "{nsid}");
+        }
+        assert_eq!(classify(NSID_PLURAL_MEMBER, "3kaaaaaaaaaaa"), RecordClass::Ecosystem(EcosystemKind::Plural));
+        assert_eq!(classify("app.nearhorizon.plural.fronters", "3k"), RecordClass::Unindexed);
     }
 
     #[test]

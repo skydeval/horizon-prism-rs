@@ -1,0 +1,37 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.plural.listMembers",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "The app.nearhorizon.plural.member records of one account, member or not, in ascending rkey order. No auth; charged by IP. 'status': 'complete' when every member is listed across the pages, 'partial' when the AppView cannot promise that (a very large system, the stream behind, a member it could not show), 'unknown' when it has not listed the repository (members empty; ask again). Cache-control as getRecords.",
+      "parameters": {
+        "type": "params",
+        "required": ["actor"],
+        "properties": {
+          "actor": { "type": "string", "format": "did" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 },
+          "cursor": { "type": "string" }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["actor", "status", "members"],
+          "properties": {
+            "actor": { "type": "string", "format": "did" },
+            "status": { "type": "string", "knownValues": ["complete", "partial", "unknown"] },
+            "members": { "type": "array", "items": { "type": "ref", "ref": "app.nearhorizon.plural.defs#memberView" } },
+            "cursor": { "type": "string" }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest", "description": "A malformed actor, limit or cursor." },
+        { "name": "RateLimitExceeded" },
+        { "name": "MethodNotImplemented", "description": "Pronouns and plural records are not served by this AppView." }
+      ]
+    }
+  }
+}

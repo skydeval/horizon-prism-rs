@@ -87,6 +87,9 @@ pub enum AdmitRule {
     /// root's gate whose public row is not stored; only the private tier's
     /// copy is written, and only while a private post claims the root.
     PublicRootGate,
+    /// The plural rule (plural-pronouns design §2.2): a record of the four
+    /// pronouns and plural collections, by any author, in every mode.
+    Plural,
 }
 
 /// Why an op was rejected.
@@ -166,6 +169,12 @@ fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
             return Admission::Reject(RejectReason::Purging(PurgeKind::OutOfScope));
         }
         _ => {}
+    }
+    // The plural rule (plural-pronouns design §2.2), in every mode, for any
+    // author, before every other rule: these records are served to every
+    // reader, and nothing else of the author follows from it.
+    if input.kind == RecordKind::Table(crate::firehose::rows::PLURAL_TABLE) {
+        return Admission::Admit(AdmitRule::Plural);
     }
     // Rule M (member-blocks-only design §2), in every mode and before the
     // off rule: a block kind is stored only with a member side.
@@ -647,6 +656,29 @@ mod tests {
             let m = restored(mode, true);
             let want = if mode.off_rule() { RS } else { Admission::Admit(AdmitRule::InboundToMember) };
             assert_eq!(admit(&input(STRANGER, RecordKind::Repost, &[RESTORED]), &m), want, "{mode:?}");
+        }
+    }
+
+    /// T-P2 (plural-pronouns design §2.2): anyone's plural record is stored
+    /// in every mode; an `account_deleted` purge rejects it first; the
+    /// author's other records are decided as before.
+    #[test]
+    fn t_p2_the_plural_rule() {
+        const PLURAL: RecordKind = RecordKind::Table("plural_records");
+        for mode in [PublicMode::On, PublicMode::Filling, PublicMode::Draining, PublicMode::Off, PublicMode::Held] {
+            let s = with_mode(mode);
+            for author in [STRANGER, MEMBER, SCOPED, OWNER] {
+                assert_eq!(admit(&input(author, PLURAL, &[]), &s), Admission::Admit(AdmitRule::Plural), "{mode:?} {author}");
+            }
+            let mut d = s.clone();
+            d.purging.insert(STRANGER.into(), PurgeKind::AccountDeleted);
+            assert_eq!(admit(&input(STRANGER, PLURAL, &[]), &d), Admission::Reject(RejectReason::Purging(PurgeKind::AccountDeleted)));
+            let mut o = s.clone();
+            o.purging.insert(STRANGER.into(), PurgeKind::OutOfScope);
+            assert_eq!(admit(&input(STRANGER, PLURAL, &[]), &o), Admission::Admit(AdmitRule::Plural), "{mode:?}");
+            for kind in [RecordKind::Post, RecordKind::Profile, RecordKind::Table("actor_self_records")] {
+                assert_ne!(admit(&input(STRANGER, kind, &[]), &s), Admission::Admit(AdmitRule::Plural), "{mode:?} {kind:?}");
+            }
         }
     }
 

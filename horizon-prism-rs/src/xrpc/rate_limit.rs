@@ -262,6 +262,9 @@ pub const SERVED: &[Served] = &[
     served("app.nearhorizon.refract.listNotifications", Family::Refract, false),
     served("app.nearhorizon.refract.getUnreadCount", Family::Refract, false),
     served("app.nearhorizon.refract.getAuthorReposts", Family::Refract, false),
+    // Pronouns and plural systems (plural-pronouns design §3): by IP.
+    served("app.nearhorizon.plural.getRecords", Family::Read, true),
+    served("app.nearhorizon.plural.listMembers", Family::Read, true),
 ];
 
 /// Methods charged more than one token of their bucket. A private search

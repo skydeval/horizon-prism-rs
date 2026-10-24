@@ -33,6 +33,7 @@ pub(crate) mod kryphocron_glue;
 pub mod microcosm;
 pub mod moderation;
 pub mod net;
+pub mod plural;
 pub mod private_tier;
 pub mod refract;
 pub mod serve;

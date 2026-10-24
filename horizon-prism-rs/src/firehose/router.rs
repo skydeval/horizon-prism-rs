@@ -46,7 +46,11 @@ pub async fn route_identity(pool: &PgPool, kind: IdentityKind, did: &str) -> Res
     .await?
     .rows_affected()
         > 0;
-    tracing::debug!(event = "firehose_identity_event", r#type = kind.as_str(), did, queued, "non-commit event routed");
+    // A DID with plural records or a plural repo row is listed again soon
+    // (plural-pronouns design §2.4, R3), so a deactivation or a deletion
+    // reaches its answers and a deleted account's records go.
+    let plural = crate::plural::fill::account_event(pool, did).await?;
+    tracing::debug!(event = "firehose_identity_event", r#type = kind.as_str(), did, queued, plural, "non-commit event routed");
     Ok(queued)
 }
 
@@ -90,6 +94,35 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(rows, 2);
+        db.drop_db().await;
+    }
+
+    /// T-P9 (plural-pronouns design §2.4, R3): an account event lists a DID
+    /// with plural rows again in 30 s; one with only stored records gets a
+    /// pending row; any other DID writes nothing.
+    #[tokio::test]
+    async fn account_events_reach_plural_dids() {
+        let Some(db) = fresh_db("account_events_reach_plural_dids").await else {
+            return;
+        };
+        let p = &db.pool;
+        sqlx::query("INSERT INTO plural_repos (did, state, verified_at) VALUES ('did:plc:complete', 'complete', now())").execute(p).await.expect("repo");
+        sqlx::query(
+            "INSERT INTO plural_records (uri, did, rkey, cid, rev, collection, record) \
+             VALUES ('at://did:plc:recordonly/app.nearhorizon.plural.member/3k', 'did:plc:recordonly', '3k', 'c', 'r', 'app.nearhorizon.plural.member', '{}')",
+        )
+        .execute(p)
+        .await
+        .expect("record");
+        for did in ["did:plc:complete", "did:plc:recordonly", "did:plc:nobody"] {
+            route_identity(p, IdentityKind::Account, did).await.expect("route");
+        }
+        let rows: Vec<(String, String, f64)> =
+            sqlx::query_as("SELECT did, state, extract(epoch FROM next_fill_at - now())::float8 FROM plural_repos ORDER BY did").fetch_all(p).await.expect("rows");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!((rows[0].0.as_str(), rows[0].1.as_str()), ("did:plc:complete", "complete"));
+        assert_eq!((rows[1].0.as_str(), rows[1].1.as_str()), ("did:plc:recordonly", "pending"));
+        assert!(rows.iter().all(|r| r.2 > 20.0 && r.2 <= 30.0), "{rows:?}");
         db.drop_db().await;
     }
 }

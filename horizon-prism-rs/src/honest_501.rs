@@ -345,6 +345,10 @@ pub const KEPT_METHODS: &[&str] = &[
     "app.nearhorizon.refract.listNotifications",
     "app.nearhorizon.refract.getUnreadCount",
     "app.nearhorizon.refract.getAuthorReposts",
+    // Pronouns and plural systems (plural-pronouns design §2.8): always
+    // routed; `plural.enabled = false` is the handlers' own 501.
+    "app.nearhorizon.plural.getRecords",
+    "app.nearhorizon.plural.listMembers",
 ];
 
 /// The methods private posting has added so far (§3.2), each with its
@@ -502,19 +506,20 @@ mod tests {
     /// S11's running totals, private notification preferences' two,
     /// private activity subscriptions' two, private appearance's two and
     /// its retention's one): every served method is in exactly one of the
-    /// two sets, 56 public and 52 kept (Refract's eight included), 108 served. Their verbs are checked
+    /// two sets, 56 public and 54 kept (Refract's eight and the two plural
+    /// reads included), 110 served. Their verbs are checked
     /// against the routes in `xrpc::router`'s and `private_tier`'s tests.
     #[test]
     fn public_and_kept_methods_classify_every_served_method() {
         use crate::xrpc::rate_limit::SERVED;
 
-        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 52));
+        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 54));
         let public: BTreeSet<&str> = PUBLIC_METHODS.iter().map(|m| m.nsid).collect();
         let kept: BTreeSet<&str> = KEPT_METHODS.iter().copied().collect();
-        assert_eq!((public.len(), kept.len()), (56, 52), "no NSID twice");
+        assert_eq!((public.len(), kept.len()), (56, 54), "no NSID twice");
         assert!(public.is_disjoint(&kept));
         let served: BTreeSet<&str> = SERVED.iter().map(|s| s.nsid).collect();
-        assert_eq!(served.len(), 108);
+        assert_eq!(served.len(), 110);
         // Private posting's methods are kept, in the `private` family.
         for &(nsid, _) in PRIVATE_POSTING_METHODS {
             assert!(kept.contains(nsid), "{nsid}");

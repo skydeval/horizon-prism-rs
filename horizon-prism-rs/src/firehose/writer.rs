@@ -1799,7 +1799,10 @@ impl Writer {
         // candidate, so a delete before or during its backfill keeps the
         // backfill from writing it (refract design §5.2).
         let in_r_or_candidate = sets.is_restored(repo) || sets.candidates.contains_key(repo) || sets.refract_hidden.pending(repo);
-        if removed || author_in_scope || in_r_or_candidate || (d.kind == RecordKind::Follow && sets.is_tracked(repo)) {
+        // A plural record's delete always leaves one (plural-pronouns design
+        // §2.3), so a listing that read the record first cannot store it.
+        let plural = d.kind == RecordKind::Table(rows::PLURAL_TABLE);
+        if removed || author_in_scope || in_r_or_candidate || plural || (d.kind == RecordKind::Follow && sets.is_tracked(repo)) {
             sqlx::query(
                 "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
                  ON CONFLICT (uri) DO UPDATE SET rev = GREATEST(record_tombstones.rev, EXCLUDED.rev), deleted_at = now()",
@@ -3689,6 +3692,71 @@ mod tests {
             let stranger = [create("app.bsky.graph.list", "3klist", json!({"name": "Theirs", "purpose": "app.bsky.graph.defs#modlist"}))];
             let r = w.apply(SUBJECT, &rev(1), &stranger, OPTIONS).await.expect("apply");
             assert_eq!(r.outcomes, [OpOutcome::Rejected("not_in_scope")]);
+            db.drop_db().await;
+        }
+
+        /// T-P3 (plural-pronouns design §2.2, §2.3, §2.6): a stranger's
+        /// plural records are written, updated and deleted under the off
+        /// rule; a delete tombstones even with no row; an oversize record
+        /// is stored with `record` NULL; nothing else of the author is.
+        #[tokio::test]
+        async fn t_p3_plural_records_of_anyone() {
+            let Some(db) = fresh_db("t_p3_plural_records").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, false);
+            set_public(&w, PublicMode::Off, None).await;
+            let raw = |action: Action, collection: &str, rkey: &str, record: Option<Value>| RawOp {
+                action,
+                collection: collection.into(),
+                rkey: rkey.into(),
+                cid: record.as_ref().map(|r| format!("bafy{}", r["n"])),
+                record,
+            };
+            let member = "app.nearhorizon.plural.member";
+            let ops = [
+                raw(Action::Create, "app.nearhorizon.actor.pronouns", "self", Some(json!({"n": 1, "sets": [{"forms": ["she", "her"]}], "createdAt": "2026-10-24T00:00:00Z"}))),
+                raw(Action::Create, member, "3kwren", Some(json!({"n": 2, "displayName": "Wren", "x-unknown": true}))),
+                raw(Action::Create, "app.nearhorizon.plural.system", "3knotself", Some(json!({"n": 3}))),
+                raw(Action::Create, member, "3kbig", Some(json!({"n": 4, "displayName": "x".repeat(70 * 1024)}))),
+                raw(Action::Create, "app.bsky.feed.post", "3kpost", Some(json!({"n": 5, "text": "hi", "createdAt": "2026-10-24T00:00:00Z"}))),
+            ];
+            let r = w.apply(SUBJECT, &rev(1), &ops, OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes[0], OpOutcome::Written);
+            assert_eq!(r.outcomes[1], OpOutcome::Written);
+            assert_eq!(r.outcomes[2], OpOutcome::Skipped("unindexed"), "self-keyed collections at `self` only");
+            assert_eq!(r.outcomes[3], OpOutcome::Written);
+            assert_eq!(r.outcomes[4], OpOutcome::Rejected("public_off"), "nothing else of the author");
+            let row = |rkey: &'static str| async move {
+                let r: Option<(String, Option<Value>, String)> = sqlx::query_as("SELECT collection, record, rev FROM plural_records WHERE uri = $1")
+                    .bind(format!("at://{SUBJECT}/{member}/{rkey}"))
+                    .fetch_optional(p)
+                    .await
+                    .expect("row");
+                r
+            };
+            let wren = row("3kwren").await.expect("wren");
+            assert_eq!((wren.0.as_str(), wren.1.as_ref().map(|v| v["x-unknown"].clone())), (member, Some(json!(true))));
+            assert_eq!(row("3kbig").await.expect("big").1, None, "oversize stores NULL");
+            // An update at a higher rev wins; a lower one does not.
+            let renamed = [raw(Action::Update, member, "3kwren", Some(json!({"n": 6, "displayName": "Robin"})))];
+            w.apply(SUBJECT, &rev(3), &renamed, OPTIONS).await.expect("update");
+            let older = [raw(Action::Update, member, "3kwren", Some(json!({"n": 7, "displayName": "Old"})))];
+            w.apply(SUBJECT, &rev(2), &older, OPTIONS).await.expect("older");
+            assert_eq!(row("3kwren").await.expect("wren").1.expect("value")["displayName"], "Robin");
+            // Deletes: the row goes and a tombstone stays, with or without a row.
+            let deletes = [raw(Action::Delete, member, "3kwren", None), raw(Action::Delete, member, "3knever", None)];
+            w.apply(SUBJECT, &rev(4), &deletes, OPTIONS).await.expect("delete");
+            assert!(row("3kwren").await.is_none());
+            let tombstones: i64 = sqlx::query_scalar("SELECT count(*) FROM record_tombstones WHERE uri LIKE $1")
+                .bind(format!("at://{SUBJECT}/{member}/%"))
+                .fetch_one(p)
+                .await
+                .expect("tombstones");
+            assert_eq!(tombstones, 2);
+            let actors: i64 = sqlx::query_scalar("SELECT count(*) FROM actors WHERE did = $1").bind(SUBJECT).fetch_one(p).await.expect("actors");
+            assert_eq!(actors, 0, "no actors row for the author");
             db.drop_db().await;
         }
 

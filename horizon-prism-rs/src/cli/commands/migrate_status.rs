@@ -122,6 +122,8 @@ mod tests {
             "0045_drop_private_blocks",
             // Refract reposts of restored posts RR3 (#894).
             "0046_refract_reposts",
+            // Pronouns and plural systems (#896).
+            "0047_plural",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

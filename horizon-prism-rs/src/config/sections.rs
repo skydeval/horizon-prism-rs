@@ -2086,6 +2086,48 @@ impl RefractCommunity {
     }
 }
 
+/// `[plural]` (plural-pronouns design §6): the public read of pronouns and
+/// plural records. File-only; a restart applies it. The records are stored
+/// from the firehose whatever `enabled` says.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluralConfig {
+    /// The two methods, the per-DID listings and `plural.read`.
+    pub enabled: bool,
+    /// How long a read waits for the listings it started (0–2500).
+    pub inline_wait_ms: u32,
+    /// Listings running at once.
+    pub fill_concurrency: u32,
+    /// Listings started per second, process-wide (burst twice that).
+    pub fill_rate_per_sec: Float,
+    /// `listRecords` calls per second to one PDS host (burst twice that).
+    pub per_host_rate_per_sec: Float,
+    /// Member pages of 100 one listing reads (1–100).
+    pub member_pages: u32,
+    /// A complete DID asked about after this long is listed again.
+    pub reverify_hours: u32,
+    /// Rows `pending` or `failed` at most; past it a new DID answers unknown.
+    pub max_pending: u32,
+    /// Past this firehose delay nothing is answered as absent (≥ 10).
+    pub max_stream_lag_secs: u32,
+}
+
+impl Default for PluralConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            inline_wait_ms: 1500,
+            fill_concurrency: 8,
+            fill_rate_per_sec: Float(10.0),
+            per_host_rate_per_sec: Float(4.0),
+            member_pages: 10,
+            reverify_hours: 24,
+            max_pending: 100_000,
+            max_stream_lag_secs: 120,
+        }
+    }
+}
+
 /// `[refract]` (refract design §3.3). `enabled` and `communities` are live
 /// settings; the rest take effect at restart.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -2204,6 +2246,7 @@ pub struct FileConfig {
     pub storage: StorageConfig,
     pub constellation: ConstellationConfig,
     pub refract: RefractConfig,
+    pub plural: PluralConfig,
     /// The B-5 bench's head source; only under `bench-heads`.
     #[cfg(feature = "bench-heads")]
     pub bench: BenchConfig,

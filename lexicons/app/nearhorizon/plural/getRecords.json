@@ -1,0 +1,38 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.plural.getRecords",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Pronouns and plural records of any accounts, member or not: for each DID in 'actors' its app.nearhorizon.actor.pronouns, app.nearhorizon.plural.system and app.nearhorizon.plural.front (rkey self), and each app.nearhorizon.plural.member named in 'members'. No auth; charged by IP. Answers come in request order, each once. The accounts named by 'actors' and by the member URIs together are at most 50. A first call about an account may answer 'unknown' while the AppView lists its repository; ask again. Responses carry cache-control: public, max-age=30 when no answer is 'unknown', else max-age=5. A 501 MethodNotImplemented (or a 404 from an AppView without this method) means the records are not served here.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "actors": { "type": "array", "items": { "type": "string", "format": "did" }, "maxLength": 50 },
+          "members": {
+            "type": "array",
+            "description": "URIs of the form at://<did>/app.nearhorizon.plural.member/<rkey>.",
+            "items": { "type": "string", "format": "at-uri" },
+            "maxLength": 100
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["actors", "members"],
+          "properties": {
+            "actors": { "type": "array", "items": { "type": "ref", "ref": "app.nearhorizon.plural.defs#actorRecords" } },
+            "members": { "type": "array", "items": { "type": "ref", "ref": "app.nearhorizon.plural.defs#memberAnswer" } }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest", "description": "Neither param, a malformed DID or member URI, or more than the caps allow." },
+        { "name": "RateLimitExceeded" },
+        { "name": "MethodNotImplemented", "description": "Pronouns and plural records are not served by this AppView." }
+      ]
+    }
+  }
+}

@@ -221,6 +221,7 @@ impl Kind {
                 EcosystemKind::Threadgate => Self::Threadgate,
                 EcosystemKind::Postgate => Self::Postgate,
                 EcosystemKind::PollPost => Self::Poll,
+                EcosystemKind::Plural => Self::Other,
             },
             class => class.record_kind().map_or(Self::Other, Self::from_record_kind),
         }
