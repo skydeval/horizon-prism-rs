@@ -529,8 +529,9 @@ mod tests {
     /// readiness was cleared after the first time is `reindexing` (member
     /// permissions, `validForSecs` and `Retry-After` the re-index interval)
     /// and gets `503 Reindexing` with `retryAfter` in the body and the
-    /// header; a member never ready is `indexing` and `400 NotReady`; once
-    /// ready again, `member` and 200.
+    /// header; a member never ready is `indexing` and `400 NotReady`; a
+    /// member being purged is, through the enroller, `indexing` and
+    /// `400 NotReady`; once ready again, `member` and 200.
     #[tokio::test]
     async fn tdm9_reindexing_membership_and_public_gate() {
         let Some(db) = fresh_db("xrpc_get_membership_reindexing").await else {
@@ -539,7 +540,7 @@ mod tests {
         let p = &db.pool;
         let cfg = app_config("[community]\nauto_enroll = true\n");
         let fetcher = StubFetcher::default();
-        for (i, did) in [ALICE, BOB].into_iter().enumerate() {
+        for (i, did) in [ALICE, BOB, CAROL].into_iter().enumerate() {
             fetcher.set_key(did, signing_key(u8::try_from(i).expect("small") + 3));
         }
         let (auth, _drainer) = verifier(fetcher, 100, 16);
@@ -547,6 +548,7 @@ mod tests {
         let scope = hydrator.scope().clone();
         let resolver = IdentityResolver::new(Transports::loopback_for_tests(), p.clone(), IdentitySettings::from_app(&cfg), Arc::new(scope.clone()), Intent::Internal);
         let enroller = AutoEnroller::new(&cfg, p.clone(), scope.clone(), Arc::new(KryphocronPrivateTier), resolver);
+        let purger = crate::aggregations::purge::Purger::new(p.clone(), scope.clone(), Arc::new(KryphocronPrivateTier));
         let without = AppState {
             hydrator,
             auth: Arc::new(auth),
@@ -590,6 +592,20 @@ mod tests {
             assert!(status == 400 && body.contains("\"NotReady\"") && !body.contains("retryAfter"), "{body}");
             assert_eq!(retry.as_deref(), Some("7"));
         }
+        // `Purging`: a removed member whose purge is still running. Only the
+        // enroller reads the purge marker (its check, before any refusal):
+        // `indexing` and 400 NotReady through it; the gate's own state sees
+        // a non-member.
+        exec(p, &format!("INSERT INTO members (did, source, ready_at, first_ready_at) VALUES ('{CAROL}', 'admin', now(), now())")).await;
+        purger.marker(CAROL, crate::aggregations::scope_state::PurgeKind::MemberRemoved).await.expect("marker");
+        assert!(scope.read_guard().await.purge_kind(CAROL).is_some(), "the marker is held");
+        let carol = mint(&signing_key(5), CAROL, &aud, Some(GET_MEMBERSHIP));
+        let (status, _, v) = call(&client, &bases[1], Some(&carol)).await;
+        assert_eq!((status, &v["status"]), (200, &json!("indexing")), "{v}");
+        let (status, _, body) = timeline(&bases[1], 2, CAROL).await;
+        assert!(status == 400 && body.contains("\"NotReady\"") && !body.contains("retryAfter"), "{body}");
+        let (status, _, body) = timeline(&bases[0], 2, CAROL).await;
+        assert!(status == 400 && body.contains("\"NotEnrolled\""), "{body}");
         exec(p, "UPDATE members SET ready_at = now() WHERE did = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'").await;
         for base in &bases {
             let alice = mint(&signing_key(3), ALICE, &aud, Some(GET_MEMBERSHIP));
