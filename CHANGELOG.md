@@ -1,4797 +1,697 @@
 # Changelog
 
-All notable changes to horizon-prism-rs are recorded here, in the style of
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Chainlink issues are
-referenced inline as `#NN`. Every commit that lands functional work updates the
-matching section under `[Unreleased]` in the same commit; issues are closed
-with a changelog entry (no `--no-changelog`). Entries before item 5 were
-backfilled per milestone (§15 implementation order of design-v2), not per
-commit.
+All notable changes to Horizon-Prism-rs (Horizon-Prism for short), in the
+spirit of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), grouped by
+development phase, newest first. **Read the upgrade notes of every phase you
+cross before upgrading.** Every schema migration needs one start with
+`APP_ALLOW_STARTUP_MIGRATE=1` (`docker/README.md`, "Schema migrations").
+
+Convention: new entries go under `## [Unreleased]` and move into a phase when
+that phase closes. Entries say what changed for users and operators; they carry
+no tracker references.
 
 ## [Unreleased]
 
-### Added (Thread Lens honours the reader's labelers, #887)
+Nothing yet: every change so far is in a phase below.
 
-- **`atproto-accept-labelers` on `threadLens.getThread` and `resolve`** (skydeval, 2026-10-24: a labeler is a labeler, so every labeler the request names is honoured, moderation or not). The header's valid entries (DIDs, `redact` kept, at most 32; a header over 4096 bytes is ignored) are rebuilt and sent with the upstream `getPostThread` and `getPosts` calls the answer makes; nothing else of the request goes upstream. Post views and their authors keep the labels those labelers applied, after Prism's own and without repeats (an upstream copy of Prism's own labels is not kept). A post Prism built from its own rows gets them from one `getPosts` per 25 posts read for its labels alone. The response carries `atproto-content-labelers` naming the labelers applied. The labels only add to views: the gate, the gaps and the threadgate rules are as before, and content stripping reads the upstream labels as it always did. Upstream post views fetched with a labeler set never enter or come from the shared `rt:post` cache. Amends design-v4 §II-7.8 and §II-8.6 for Thread Lens; other views still remove upstream labels.
-- `getMembership.features` lists `threadLens.labelers` with `threadLens`; the lexicon describes it, and `threadLens.defs#postNode` says what labels carry.
+## Phase 9: Pronouns and plural systems (2026-10-24)
 
-### Changed (pronouns and plural: signed-out reads held tighter, #896)
-
-- **`plural.getRecords` and `plural.listMembers` have their own rate classes** (skydeval, 2026-10-24: signed-out re-asks a lot less frequent): signed out, `plural_anon` per IP (IPv6 per /64), 1/s with a burst of 10, enough for a feed page's call plus a re-ask after 30 s and then every 5 minutes; with a service token that verifies, `plural_auth` per account, 5/s with a burst of 30. A token that does not verify is refused (`InvalidToken`) rather than charged as anonymous. Every 429 carries `Retry-After`. New config `[rate_limits] plural_anon`, `plural_auth`; the family name for `endpoint_class` is `plural`.
-- A signed-out answer with any `unknown` now carries `cache-control: public, max-age=30` (signed in, still `max-age=5`); answers with no `unknown` keep `max-age=30`, so a rename or delete still shows within about a minute.
-
-### Added (pronouns and plural systems: fronters on posts, #896, #903)
-
-- **Kryphocron posts carry their fronters.** The clear top-level `app.nearhorizon.plural.fronters` key of a `tools.kryphocron.feed.postPrivate` record (from `createPostPrivate`, `participatePrivate` or the encode route; it is never part of the encoded payload) is stored in `private_posts.fronters` and returned in the private view's `record`, and so in a quoting post's `#viewRecord.value`. Checked strictly: an object whose `members` is 1 to 20 objects, each with `id` a valid record key and an optional `status` string of at most 320 bytes, within 64 KiB; other keys are kept as written. An invalid value is dropped and counted (`private_ingest_field_dropped_total{field="app.nearhorizon.plural.fronters"}`); the post still ingests. Served behind the read path like the rest of the view.
-- **The fronters refill**: migration 0047 marked every private post row not filled, and the first start after it queues one `private` job per DID with such rows (once, `worker_state` key `private_fronters_refill`), which lists the DID's private records again, so posts written before this release show their fronters.
-- **Public posts**: every view Prism builds from a stored or fetched record (post views, threads, quote `value`s, notifications, Refract views, Slingshot-built posts in Thread Lens, `repo.getRecord`, upstream views) already kept the key; tests now hold each path to it.
-- `getMembership.features` lists `plural.fronters` for both.
-
-### Added (pronouns and plural systems: the public read, #896, #901, #902)
-
-- **New `app.nearhorizon.plural.getRecords {actors?, members?}`**: for any account, member or not, its `app.nearhorizon.actor.pronouns`, `app.nearhorizon.plural.system` and `app.nearhorizon.plural.front` (rkey `self`) and named `app.nearhorizon.plural.member` records, so a reader's browser never asks an author's server (design `plural-pronouns.md`). Each answer is `record` (value and CID), `none` or `unknown`. `none` only when Prism listed the author's repository and every change since reached it through the firehose, and the firehose is within `plural.max_stream_lag_secs` (120 s); never on a guess. At most 50 accounts (member URIs' accounts included) and 100 member URIs per call. No sign-in, charged by IP to `anon_read`, kept in every public-indexing mode, CORS as every route; `cache-control: public, max-age=30`, or `max-age=5` when any answer is `unknown`.
-- **New `app.nearhorizon.plural.listMembers {actor, limit, cursor}`**: an account's members in ascending rkey order, with `status` `complete`, `partial` or `unknown`.
-- **The four collections are stored from the firehose for any author** (`AdmitRule::Plural`, in every mode; nothing else of the author is stored by it), in the new `plural_records`. A delete always leaves a tombstone. A record over 64 KiB is stored without its value and answers `unknown`. The `account_deleted` purge removes them.
-- **The first time an account is asked about, its repository is listed once** (four `listRecords` calls, members up to `plural.member_pages` pages of 100) and reconciled with what the firehose stored, in `plural_repos` (`pending`, `complete`, `unavailable`, `failed`, `gone`). A call waits up to `plural.inline_wait_ms` (1.5 s) for the listings it started. A repository that is deactivated, taken down or not found answers `unknown` and its records are deleted; a tombstoned DID answers `none`. Failures retry at 1 min, 5 min, 30 min, 2 h, then 6 h. A complete account asked about after `plural.reverify_hours` (24) is listed again. An account event for an account with plural rows lists it again 30 s on. Bounded by `plural.fill_concurrency` (8), `plural.fill_rate_per_sec` (10) and `plural.per_host_rate_per_sec` (4); at most `plural.max_pending` (100,000) accounts waiting.
-- **`getMembership.features`** lists `plural.fronters` and, while `plural.enabled`, `plural.read`. Signed out, the methods answering (not 501 `MethodNotImplemented`) is the discovery.
-- New `[plural]` config section (file-only); `enabled = false` makes both methods answer 501 and stops the listings (the records are still stored).
-- **Migration 0047** (`0047_plural`): `plural_records`, `plural_repos`, and `private_posts.fronters` (used by the next entry).
-- Metrics `plural_reads_total{method, outcome}`, `plural_read_seconds{method}`, `plural_answers_total{kind, status}`, `plural_fills_total{outcome}`, `plural_fill_seconds`, `plural_fill_calls_total{outcome}`, gauge `plural_repos{state}`.
-- Lexicons `app.nearhorizon.plural.defs`, `getRecords`, `listMembers`.
-
-### Fixed (Thread Lens: walking up past a block, #895)
-
-- **`threadLens.getThread` now walks up past a blocked post that is not stored here.** Before, when the viewer had a block with a non-member (with public indexing off), the parent chain ended at that author's post: the client showed the blocked-post placeholder and nothing above it. Now the link above a `blocked-by-you` or `blocking-you` gap comes from the first source that has it: the links the ordinary view already read, the post's stored row, or the post's record (only its `reply.parent.uri`, read through Slingshot, skydeval's decision 2026-10-24). The walk then goes on to the thread's start, past further blocked posts, within `parentHeight` and the page budget as before. The gap still carries only `uri`, `gap`, `parentUri` and `moreParents`. Bridging off (the ordinary view) is unchanged.
-
-### Added (Refract: reposts of restored posts, #888)
-
-- **Reposts of restored posts are stored, by anyone** (skydeval's amendment to Refract's D-2, 2026-10-24; design `refract-reposts-v1.md`). A repost of a public post whose author is restored is admitted in every mode when no other rule stores it (`AdmitRule::RestoredSubject`); only the repost record. A repost of a private post, a like, a reply or a quote is decided as before, and a purge's rejection of the reposter stands.
-- **`refract.getTimeline`** also returns reposts of restored posts by the member and by accounts it follows, with `reason: reasonRepost`, merged in time order with what it returned before. The member's mutes, blocks and list mutes and blocks apply to the reposter and the post's author as for other items. Visitors still get an empty feed.
-- **New `app.nearhorizon.refract.getAuthorReposts {actor, limit, cursor}`**: any account's reposts of restored posts, newest first, as `feedViewPost`s with `reasonRepost` (by the actor), `servedAs` and `viewerChecked` as the other feeds; for anyone signed in. A visitor blocked either way by the actor (or left unanswered by Farsight) gets an empty feed. Errors: `AccountTakedown`, `AccountDeactivated`, `InvalidRequest` (actor not found or deleted), and the usual four. In the `refract` rate class.
-- **Every Refract feed** now gates the reposter too and leaves out a repost whose reposter blocks the reader or is blocked by it, or that no profile tier can render (it would read `handle.invalid`).
-- **Older reposts are filled once per restore** from Constellation backlinks: for the restored account's newest 200 posts, one page (the newest 100 reposts) each, at most 4 calls a second, one account at a time, after its `refract` backfill job is done; rows carry the record key's time and no subject CID, tombstoned URIs are skipped, and admission decides each row. Runs only with `refract.backfill_concurrency` > 0. **Migration 0046** (`0046_refract_reposts`) adds `refract_dids.reposts_filled_at`; accounts already restored are filled after deploy. Metrics `refract_repost_fill_total{outcome}` (`done`, `left`, `error`) and `refract_repost_fill_rows_total`.
-- **Kept and removed with the restored account:** the on→off sweep, retention (scope and age-cap steps) and member removal spare reposts whose post's author is restored; when the account's restore ends, the Refract purge deletes other accounts' reposts of its posts, except members' (never purged), restored accounts', and in On/Filling those of accounts in scope (or all, when the account is a member).
-- A new large-table index, `reposts_subject_did` (`reposts (split_part(subject_uri, '/', 3), created_at DESC)`), built by the post-migration index task.
-
-### Fixed (restored `indexedAt`, #879)
-
-- **Restored post views no longer read as archived.** A post view (and a quote's `viewRecord`) of a restored author carried `indexedAt` = when Prism wrote the row, which for a backfilled account is the backfill time, so stock clients showed older posts as "Archived from …" with the wrong date in date lines and feed timestamps. Those views now carry the earlier of the post's `createdAt` and Prism's write time, so a future-dated `createdAt` is never sent. Every path that builds restored views from stored rows gets it (`refract.*`, Thread Lens, public reads). Stored rows are unchanged; views of other accounts are unchanged.
-
-### Added (Thread Lens hydrated views, #878, #886)
-
-- **`servedAs`** on every `app.nearhorizon.threadLens.getThread` and `resolve` answer: `member` (a ready member: post views carry its own `viewer.like`, `viewer.repost` and `viewer.threadMuted` as Prism holds them, and author viewer state) or `visitor` (none but `blockedBy` and `muted: false`). Visitors get no like or repost state: no reader DID is sent anywhere to find it.
-- **`viewer.replyDisabled` on lens post views**, on the posts of a thread whose root is a post node of the answer, from the root's threadgate (stored, or the one the upstream returned with the thread) and Prism's own rows only: the root's author and a gate with no `allow` give `false`, an empty `allow` gives `true`; for a ready member, `followerRule`, `followingRule` (known when the follow is stored or the root's author is a ready member), `mentionRule` (the root record's facets) and `listRule` (lists a ready member owns). Left out when that cannot decide it, and whenever the root is a gap or not in the answer, so nothing of a gap root's gate is sent. No outside call is made for it.
-- **`threadLens.hydrated`** in `getMembership.features` (with `threadLens`). The lexicons describe what a lens post view carries: viewer state per `servedAs`, counts (the upstream's, or Prism's Constellation count; none on a post built from its record), `replyDisabled` as above, and labels that are Prism's own, not the reader's labelers' (`atproto-accept-labelers` is not honoured; a decision for skydeval, #887).
-
-### Changed (Thread Lens latency, #878, #885)
-
-- **`getThread` is about three times faster on a bridged thread** (a 46-post bench thread with measured network delays: 2221 ms → 748 ms median; design `threadlens-hydration.md` §1–§2). The response is the same except where a reply page is slow (below).
-  - The upstream thread of the baseline is fetched once per request; it was fetched twice, to collect authors and to emit.
-  - A reply level's Constellation pages are read together (8 at once) instead of one node after another; the listing allowance is spent exactly as before.
-  - The fetch ladder runs for a whole reply level (and for the stubs, and for `resolve`) at once: one gate, tombstone and local read, one `getPosts` per home network and 25 posts (a URI whose record key an AppView may refuse goes alone), one normalization, then Slingshot per URI as before. Each URI gets the answer it got alone.
-  - Counts on upstream views are read in one query and queued for refresh in one Redis round trip (also on every list endpoint's count path), and no longer enriched twice on each Thread Lens view.
-  - The anchor's first reply page is asked for while the baseline is built, when bridging is possible (Farsight and Constellation configured, no `repliesCursor`, `depth` ≥ 1). It costs one Constellation call when bridging turns out off or the anchor has no replies.
-- **A slow reply page no longer holds the response.** New `threadlens.listing_timeout_ms` (default 1500, at least 1; `docker/config/app.toml`): past it, the page is no answer for that response (the node keeps its `moreReplies` cursor, as for any page without an answer) and the call finishes in the background into the read-time cache, so following the marker answers at once. Before, a response waited up to the Constellation client's 10 s (a cold page took 3.9 s from silonew).
-- **Metrics:** `threadlens_phase_seconds{phase}` (`collect`, `baseline_round`, `emit`, `stubs`, `parents`, `replies`, `enforce`, `authors`, `gate`) and `threadlens_listing_timeouts_total`.
-- A release-mode bench, `threadlens::bench` (ignored by default).
-
-### Removed (kryphocron private blocks, #875, #876)
-
-- **Private blocks are no longer tracked** (skydeval, 2026-10-24: a public block already keeps the two accounts apart). `tools.kryphocron.graph.block` records are skipped on the firehose, in backfill and in `requestRecord`'s catch-up, like any private NSID Prism does not index (`firehose_ops_skipped_total{reason="kryphocron_unproduced"}`); the authorization collections are now three (`app.bsky.graph.block`, `policy.audience`, `postPrivate`). Only `app.bsky.graph.block` and members' list blocks that apply count as blocks in the private read rule, private notifications and their unread count, private search, the activity-subscription fan-out and `notServed`. Gone with them: their retention step and `member_removed` batch, the live feed's `private-block` kind, the stats page's "Private blocks stored" and Look up's "Private blocks it made". **Migration 0045** (`0045_drop_private_blocks`) drops the `private_blocks` table and its rows. The lexicon descriptions no longer mention private blocks (and now say a list block counts where `private.listBlocks` is listed). Other `tools.kryphocron.*` records are unchanged.
-
-### Changed (private appearance retention, #872, #873)
-
-- **A removed member's appearance is kept 7 days.** Removing a member (operator remove, deny, or the never-ready expiry) no longer deletes its appearance row: the removal keeps it, in the same transaction that ends the membership, until 7 days after the removal, for the account alone. `getAppearance` takes `includeRetained`: with it, the kept row is answered to its owner, member or not, marked `retainedUntil`; without it, a kept row is never answered. The new `app.nearhorizon.private.releaseAppearance {rev}` deletes the account's kept row; it answers `{}` whether or not a row was there (released, expired or never kept), `InvalidSwap` for another `rev`, and `InvalidRequest` to a member. Any member put replaces a kept row and makes it live again (`swapRev: ""` treats it as no row). Past `retainedUntil` a row is absent to every method and the daily private retention deletes it. Account deletion still deletes the row at once, and a removed account with a kept row stays followed so its deletion is seen. A purge whose removal was recorded by an earlier build keeps the row from its batches. Migration `0044_appearance_retention`; metrics `appearance_retention_total{event}` and `appearance_retained_rows`. `getMembership` lists `private.appearanceRetention` (#874).
-
-### Added (private appearance, #857, #870)
-
-- **Private appearance.** `app.nearhorizon.private.getAppearance` and `putAppearance` keep a member's choice of where its appearance is saved (`private`, `public` or `device`) and, for `private` and `public`, the appearance itself: an `app.nearhorizon.actor.appearance` record value in the atproto data model, at most 16 KiB, kept whole (its other fields are not checked against the record lexicon, so a legacy value is kept as sent). A put replaces the whole setting and can swap on `rev`, which changes on every write (`swapRev: ""` creates only; a mismatch is `InvalidSwap`). Served to members whether or not their indexing is ready. Answers carry `Cache-Control: private, no-store`. Stored in a new private table (migration `0043_appearance_private_tier`), deleted when the member is removed or the account deleted; the admin stats count its rows. `getMembership` lists `private.appearance` (#871).
-
-### Fixed (Refract fill: repeated resolves and slow profile walks, #855, #868, #869)
-
-- **A re-asked DID isn't resolved or charged twice.** `fill`'s discovery now remembers, in memory, the DIDs whose resolve it started and those whose resolve failed (a transient error or no budget) in the last 5 seconds. Such a DID is answered `pending` with no cap charged and no new resolve; before, each re-ask started another resolve and charged the caps again. At most 10,000 DIDs, lost at restart, cleared by any change of `refract.communities`. Metric outcome `resolving` on `refract_candidates_total`.
-- **`fill` walks cold restored profiles in parallel.** A named restored account with no stored profile record was looked up remotely one at a time (the community AppView, then Slingshot), so 25 cold accounts could run past the request deadline. The lookups now run 8 at a time and stop 1 second before the deadline; an account not looked up by then is `withheld` `unavailable`. The Slingshot fallback for several accounts runs in parallel too.
-
-### Fixed (Refract fill: restored mid-request, #855, #867)
-
-- **An account restored while a `fill` runs is `pending`, not dropped.** The request's restored set is taken before discovery reads each account's row; when the checker restored the account in between, `fill` left it out with nothing said, which the lexicon calls final. Now such an account (restored, not pending removal) is reported in `pending`, so the next `fill` serves it.
-
-### Added (Refract fill: unavailable, #855, #866)
-
-- **`fill` names what it couldn't fetch.** A `withheld` reason `unavailable` (not final) for a named restored profile or post left out because it couldn't be fetched this time: a post neither stored nor returned upstream (not hidden by the gate and not seen deleted), or a restored account with no stored profile record and no remote view (no AppView answered and Slingshot gave no `RecordNotFound`), which before came back as a bare stub. Hidden, taken-down and seen-deleted items stay final and unlisted. The `fill` lexicon now says an absent item is final unless it is in `withheld` or `pending`, or is a URI whose author is in `pending`.
-
-### Added (Refract answer metadata, #855, #864)
-
-- **`servedAs` on every Refract answer.** Each `app.nearhorizon.refract.*` answer names the form the gate served it in: `member` (a ready member, with its stored viewer state) or `visitor`.
-- **`fill` names what it held back and why.** `withheld: [{id, reason}]` lists the named DIDs and URIs left out for a reason that isn't final: `unanswered` (a visitor's block check with the account got no answer; before, just no profile), `capped` (a discovery cap: per caller, per resolve, per address or in all), `proxied` (a visitor's bare-`aud` call, which starts no discovery), `blocked` (a post whose author and the caller block each other, either way). An item named and absent from `profiles`, `posts`, `pending` and `withheld` is final. A post of an account held back by a cap or a proxied call is listed with it.
-- The lexicons describe both, with `withheld` and `viewerChecked` in `app.nearhorizon.refract.defs`.
-
-### Changed (Refract visitor viewer state behind a switch, #855, #864)
-
-- **`refract.visitor_viewer_state`, off by default.** A visitor's own like, repost and follow lookups send the reader's DID, with each restored subject on screen, to the configured Constellation. They now run only with this live setting on (admin UI, "What apps see"; `docker/config/app.toml`). Off, no reader DID leaves Prism and no visitor viewer state is added, `replyDisabled` included (its follow rules would send the reader's DID too).
-- **`viewerChecked` on visitor-form answers** of `fill`, `getPostThread`, `getAuthorFeed`, `getReplies` and `getTimeline`: `{posts, actors, roots}`, the restored subjects whose like and repost, following, or thread root's `replyDisabled` were looked up and answered (a reply by another DID is refused, so not listed). A listed subject's absent field is none; an unlisted one is unknown. Empty with the switch off.
-
-### Added (Refract replies under restored replies, #855, #859)
-
-- **`refract.getReplies` returns other accounts' replies to restored replies.** After the restored replies, it adds up to 50 direct replies by other accounts whose parent is one of them, asked of Constellation (`.reply.parent.uri`) for at most 10 returned replies whose `replyCount` isn't 0, newest first, each page drawn from the caller's Constellation share. They pass the rules restored replies do: the moderation gate before any fetch, the root's `hiddenReplies` (except to the reply's author) and `allow` rules (fail closed), the caller's blocks (a visitor's Farsight rounds, unanswered treated as blocked) and the root author's; and also a block either way between the reply's author and its parent's author. They are fetched through the cascade like other subjects (nothing stored), judged again for a visitor over every account the fetched views name, and kept only when their record names this thread's root and the parent asked about. They carry no restored marker. The `getReplies` lexicon describes them.
-
-### Added (Refract visitor viewer state, #855, #858)
-
-- **A visitor's own likes, reposts and follows on restored views.** For a caller served in visitor form (a non-member, or a member not ready), the restored posts in a `fill`, `getPostThread`, `getAuthorFeed`, `getReplies` or (not-ready member) `getTimeline` answer carry `viewer.like` and `viewer.repost`, and restored profile views `viewer.following`, each the at-URI of the caller's own record, found through one Constellation `links` call per field filtered to the caller's DID (an answer with any other DID is ignored). `viewer.replyDisabled` comes from each post's root threadgate, as `getReplies` reads it; it is set only when known, so an outcome Prism couldn't evaluate leaves it out. Per request at most 20 restored posts, 10 restored accounts (not across a block) and 5 thread roots; 8 calls in flight, none started after 1 s, each drawn from the caller's Constellation share without turning the response into a 429. Nothing is stored or cached; a field Prism can't find out stays absent. Ready members are unchanged. Metric `refract_viewer_state_total{field, outcome}`.
-
-### Fixed (Refract client fixes A, #855, #856)
-
-- **A `fill` no longer re-reports an account no listed community hosts.** When a `fill`'s background resolve finds a named DID on no enabled community (its document names no PDS, or a PDS no entry matches, or the registry has no usable document), the outcome is remembered in memory for 24 hours (at most 100,000 DIDs, lost at restart, nothing written anywhere). A further `fill` leaves the DID out of `pending` and charges none of the discovery caps. Any change of `refract.communities` forgets every remembered DID, so one a new or widened entry would host is resolved again. A resolve that fails for a reason worth retrying is not remembered. New `refract_candidates_total` outcomes `not_hosted_cached` and `resolve_failed`.
-- **`fill` answers the valid items of a request.** A malformed DID or at-URI (or a repeat) is dropped instead of failing the whole call with `InvalidRequest`; more than 25 of either is still refused.
-- **Lexicons.** Every `app.nearhorizon.refract.*` method declares `InvalidToken` and `RateLimitExceeded`; `getAuthorFeed` declares `AccountTakedown`, `AccountDeactivated` and `InvalidRequest` (profile not found), from its actor check. `getPostThread` answers only `NotFound` for an anchor it can't serve. `getReplies` documents `anchor` as reserved: results are chosen by `root` only.
-
-### Added (Refract client fixes A, #855, #856)
-
-- `refract_read_seconds{method}`: a latency histogram per Refract method (sign-in check included), beside `refract_reads_total`; the Refract metrics are listed in the deploy README.
-
-### Added (public root gates PRG2: reads, #850, #853)
-
-- **A public root's Hide hides private replies.** `app.nearhorizon.private.getPostThread` and `getReplies` leave out a private reply, with what is beneath it, when the public post it claims as its root has a stored threadgate (PRG1) listing it in `hiddenReplies`, except for the reply's own author. No read of the root is needed. On `getReplies` for a public URI each reply is judged by the root it claims, so one root's gate never hides another root's replies; a hidden candidate is examined as an unreadable one is, so a page can be short and still carry a cursor. The anchor is never hidden, and `getPosts` still serves hidden replies. The public root's `allow` rules do not apply to private branches. `getMembership` lists `private.publicRootGates`; the `getMembership`, `getReplies` and `private.defs` lexicons describe it.
-
-### Added (public root gates PRG1: storage and fetch, #850, #852)
-
-- **A public thread root's threadgate is kept for its private replies.** A stock `app.bsky.feed.threadgate` naming a public post in its author's own repo, with the post's rkey, is copied by the private tier into `private_threadgates`, whoever its author is and in every public-indexing mode, while a private post claims that post as its `reply.root` (or a copy is already stored, so it stays current). Its public row is decided as before. The off sweep and an `out_of_scope` purge keep the copy; a gate delete and an `account_deleted` purge remove it.
-- **One-time fetch.** When a private reply is its public root's only stored one and no copy of the root's gate is stored, a fetch of the gate from its author's PDS is queued (`private_root_gate_fetches`); a worker in `serve` runs it through the `requestRecord` path (`getLatestCommit`, `getRecord`, the write path at that rev) under the host's backfill budget, retries with backoff, and gives up after 8 attempts. A gate delete while a fetch is pending tombstones the gate. Metric `private_root_gate_fetches_total{outcome}`.
-- **Migration 0042** (`0042_public_root_gates`): an index on `private_posts (reply_root_uri)`, the fetch queue, and a seed queueing every public root already claimed by a stored private post, which the worker drains after the deploy.
-
-### Added (private activity subscriptions, #839, #848)
-
-- **Private activity subscriptions.** `app.nearhorizon.private.putActivitySubscription` and `listActivitySubscriptions` let a member be notified of an account's new private posts and replies, separately from the public bell. A new private post notifies each subscriber who can read it, as a `subscribed-post` private notification written seconds after the post is first stored; subscribers outside the post's audience get nothing. The account's notification declaration and the subscriber's follow apply. A new `subscribedPost` notification preference turns the reason off. `getMembership` lists `private.activitySubscriptions`.
-- `getUnreadCount {reasons}` now takes `subscribed-post`, as `listNotifications` does; `getNotificationPreferences` returns `subscribedPost` (`{list, push}`, default on) beside the five reasons, and `putNotificationPreferences` accepts it (an `include` given for it is dropped). The lexicons list the new reason and key.
-
-### Added (private activity subscriptions AS2: the fan-out, #839, #847)
-
-- **Subscribed-post notifications for private posts, after commit.** A
-  private post's first store (from the firehose, `requestRecord`,
-  dead-letter replay or catch-up, never backfill, while its `createdAt` is
-  within `notifications.subscribed_post_max_age_secs`) queues one row in
-  the store's transaction, whoever subscribes, so the store's cost says
-  nothing about subscribers; an update (an audience change, a rotation, a
-  PDS rewrite) never does. A worker, woken by `pg_notify` and a 5 s poll,
-  two posts at a time, writes a `subscribed-post` private notification to
-  each subscriber the public fan-out's rules allow (the kind on since
-  before the post, the declaration and the follow, no other notification
-  of the record, no muted thread) and who is inside the post's audience
-  now: the read rule's own checks, fail closed. A transient state (the
-  private relay behind, an owner not ready, a repository head behind, the
-  audience or thread not stored yet, a `following` audience not yet
-  verified, the subscriber not ready) defers and retries; no attempt
-  starts `[private_notify] subscribed_post_retry_secs` (120 s) or more
-  after the first store, and a subscriber decided once is never decided
-  again, so someone added to the audience later is not notified. Rows are
-  written under the scope read guard and re-checked against deletes,
-  unsubscribes, blocks and removals. Done queue rows are kept two days so
-  a post fans out once. Metrics `private_subscribed_post_fanouts_total
-  {outcome}`, `_rows_total`, `_deferrals_total{reason}`,
-  `_fanout_seconds`, and the gauges `private_subscribed_post_queue` and
-  `_queue_lag_seconds`. Not listed in `getMembership` yet.
-
-### Added (private activity subscriptions AS1, #839, #846)
-
-- **Private activity subscriptions, storage and methods.**
-  `app.nearhorizon.private.putActivitySubscription {subject,
-  activitySubscription: {post, reply}}` turns a member's notifications of
-  an account's new private posts and replies on or off, separately from
-  the public bell; `listActivitySubscriptions {limit, cursor}` lists the
-  member's own, most recently changed first, as `{subject,
-  activitySubscription}`. Any account but the member's own may be named
-  and nothing about it is read. Each kind keeps the time it was turned
-  on. The cap is `[private_notify] activity_subscriptions_max` (1000, at
-  most 3000), refused with `LimitReached`. The `account_deleted` and
-  `member_removed` purges remove a member's subscriptions and those naming
-  it. Not listed in `getMembership` yet, and nothing notifies yet.
-  Migration `0041_subscribe_private_tier` adds two tables and touches no
-  existing row; `[private_notify] subscribed_post_retry_secs` (120, 10 to
-  120) is read once the fan-out lands.
-
-### Changed (private list blocks, #838, #840)
-
-- **List blocks count in the private read rule.** A member's list block
-  of a moderation list now blocks like a direct block wherever private
-  reads test one, in both directions. A reader who list-blocks an author,
-  or whom the author list-blocks, is not served the author's private
-  posts or replies, sees none of their reposts or notifications, and
-  their likes and quotes do not count for each other. A reply by a writer
-  who list-blocks the thread's owner, or whom the owner list-blocks, is
-  read by its author only, with `notServed: ["standing"]`. Only list
-  blocks Prism stores and applies count, as on public views: members'
-  own, inside their budget, once synced, of moderation lists. The private
-  tier still asks no outside service. `getMembership` lists
-  `private.listBlocks`. No migration.
-
-### Added (Refract accounts page, #837)
-
-- **Refract accounts page** in the admin UI (`/admin/refract`, beside
-  Communities in the menu): every account Refract knows with its handle,
-  community, state, since, last and next check, and for a restored one how
-  far the fetch of its history has got; filtered by state and community,
-  a hundred to a page. **Add** takes a handle or a DID and queues `refract
-  check` (a candidate checked now); the command's page then links to the
-  account. `/admin/refract/<did>` shows what `admin refract show` does
-  (the row, the last check rule by rule, labels, events, any pending end
-  hiding it), with **Check again** and, for a restored account or one in
-  grace, **Remove** (`refract end`, typed: the account's handle; Prism
-  deletes what it stored for the account and keeps members' own records
-  that point at it). Pending ends are listed with Keep and Release. With
-  Refract off the page says so and offers no add or check.
-
-### Fixed (#837)
-
-- The Communities page's table no longer breaks words: the Communities
-  and Refract accounts pages use a wider column, headers, names, dates and
-  chips stay on one line (servers and labels one chip each, the labeler
-  DID shortened with the full one on hover), the five state counts are one
-  compact cell linking to the accounts in that state, and a table too
-  wide for the screen scrolls inside its box. Unkeep reads Release.
-
-### Added (Refract R8: operator tooling and Thread Lens, #836)
-
-- **Communities page** in the admin UI (`/admin/communities`, refract
-  design §9.1, C-2): the feature switch, each community with its fields
-  and its accounts by state, add / edit / enable / disable / remove, and
-  the pending ends with Keep and Unkeep. Every change saves
-  `refract.communities` (or `refract.enabled`) as one `settings set`, so
-  the whole configuration is validated and the settings history records
-  it. A change that would make restored accounts pending (the switch off,
-  a community disabled, removed or given other servers) says how many and
-  asks first.
-- **`admin refract`** (§9): `status` (switch, communities and their entry
-  hashes, counts by state, pending ends, label cursors and the newest
-  label's age), `list [--state]`, `show <did>` (row, last verdict, labels,
-  events) read-only; `check <did>` (due now, or a candidate), `end <did>
-  [--reason]`, `keep <scope>` and `unkeep <scope>` through `serve`. `admin
-  label add`/`remove` on a DID also makes its Refract row due now.
-- **Thread Lens** (§7.5): a restored author's post missing here takes the
-  community path in every mode, and its upstream view is never
-  content-stripped by Bluesky's own labels; it carries the marker.
-
-### Changed (Refract R8, #836)
-
-- `refract.getReplies` runs the serve-time label check (§4.5) on the
-  replies it found before gating them.
-- A restored DID with no profile record is remembered for ten minutes
-  only when Slingshot says `RecordNotFound`; a Slingshot that did not
-  answer is asked again next time.
-
-### Added (Refract R7: timeline and replies, #835)
-
-- **`app.nearhorizon.refract.getTimeline`** (refract design §7.1): for a
-  member, ready or not, the posts of the restored DIDs it follows
-  (top-level, and replies whose parent author it follows) and their
-  reposts, newest first, from `posts` and `reposts` joined to its stored
-  follows. Its mutes, blocks and list mutes and blocks apply in SQL to the
-  row's author and a repost's subject author (`reposts` and `quotes` mute
-  scopes included). A non-member gets an empty feed.
-- **`app.nearhorizon.refract.getReplies`** (§7.1): the stored replies by
-  restored DIDs under `root`, newest first, at most 200, as `postView`s.
-  The root's threadgate (stored, else Slingshot `getRecord`, cached ten
-  minutes) applies: `hiddenReplies` (not to the reply's own author) and
-  the `allow` rules: `mentionRule` from the root's facets, `followingRule`
-  and `followerRule` from stored follows when either side is a member,
-  else one Constellation `links` call filtered with `did` (a server that
-  ignores the filter makes the rule unevaluable), `listRule` from stored
-  list items when the owner is a member, else Constellation backlinks and
-  `getRecord`. A rule that can't be evaluated drops the reply (fail
-  closed); so does a threadgate that can't be fetched. The caller's
-  blocks apply (a visitor's through Farsight pair answers), and the root
-  author and each replier are checked through a separate Farsight reader;
-  an unanswered pair drops the reply.
-
-### Added (Refract R6: notifications, #834)
-
-- **Refract notifications** (refract design §5.3): a restored author's
-  records from the live stream or a catch-up (never a backfill or an
-  index request) notify members in `refract_notifications`, in every
-  mode: the reasons `notifications_for` gives (mentions from facets
-  included), each checked against the recipient's thread mutes, and the
-  via-repost reasons deduplicated against the same table. No
-  `subscribed-post`. A delete takes its rows with it.
-- **`app.nearhorizon.refract.listNotifications`** and
-  **`.getUnreadCount`** (§5.3, §7.1): the caller's rows under the filters
-  of `listNotifications` (blocks both ways, mutes, list mutes and blocks,
-  inbound list blocks, notification preferences, thread mutes), plus the
-  moderation gate with the request's Refract snapshot (a gone record
-  label, an author pending removal, in grace or ending is left out). The
-  count applies the same exclusions in SQL. No `isRead`. A member that is
-  not ready gets its own tables applied in the scan and its Farsight
-  blocks judged as a visitor's; a non-member gets an empty list and a
-  zero count.
-
-### Added (Refract R5: restored profiles and author feeds, #833)
-
-- **`app.nearhorizon.refract.getAuthorFeed`** (refract design §7.1): the
-  feed of a DID in R-live, built from its stored `posts` and `reposts`
-  (not `feed_items`, not the cascade), with the `posts_with_replies`,
-  `posts_no_replies`, `posts_with_media`, `posts_with_video` and
-  `posts_and_author_threads` filters, the pinned post from its profile
-  record, and local cursors; `NotFound` for anyone else. For a visitor,
-  an author Farsight leaves unanswered gets an empty feed.
-- **Subjects not stored here** (§7.2 steps 1–3): a page's repost
-  subjects, reply parents and roots and quotes are gated and checked for
-  blocks before any fetch, fetched through the cascade (at most 25 per
-  page, within the request's budget), and gated again after. A repost
-  whose subject can't be shown is left out; a parent or root renders as
-  `notFoundPost` (`blockedPost` for a block).
-- **Remote profiles for restored DIDs** (§7.2): a restored DID whose
-  profile record is not stored yet renders from the remote tiers in every
-  tier mode, with Slingshot's profile record as the last tier, without the
-  shared negative cache; a DID Slingshot has no record for is not walked
-  again for ten minutes.
-- Media of restored authors comes from their PDS; their video is always
-  `pds_blob`.
-
-### Changed (Refract R5, #833)
-
-- The cascade's `getPosts` fetch for posts not stored here asks each
-  author's network concurrently, at most eight at a time, under the
-  request's deadline, for every caller.
-
-### Added (Refract R4: endpoints, the gate after the fetch, the marker, #832)
-
-- **`app.nearhorizon.refract.fill`** and **`.getPostThread`** (refract
-  design §7.1), with lexicons for all seven Refract methods and
-  `app.nearhorizon.refract.defs#restored`. Any signed-in caller (C-3): a
-  ready member with member viewer state and its Farsight handle; anyone
-  else as a visitor. Errors `NotEnabled` and `AuthRequired`; readiness
-  errors never. New rate class `[rate_limits.refract]` (5/s, burst 20,
-  per caller DID, in the admin's Limits page); the seven NSIDs are always
-  served (`KEPT_METHODS`). `getMembership` lists the feature `refract`
-  while `refract.enabled` is on.
-- **Visitor blocks** (§7.1, C-9): Farsight pair answers for the authors a
-  request names, then for those found in what it built (collect → judge
-  → emit); a pair Farsight leaves unanswered is treated as a block
-  (`KnownBlocks.unanswered`, applied as `blocking_unrecorded`). With no
-  Farsight configured, visitors get no block enforcement.
-- **Discovery** (§4.4): `fill` makes candidates of the DIDs it names that
-  are unknown or past their rejection's wait, resolving them in the
-  background; `pending` lists them (and R-live DIDs awaiting their first
-  labels), the same whether or not Prism holds a row for the DID. Capped
-  per caller (`candidates_per_caller_per_hour`,
-  `resolves_per_caller_per_hour`); a visitor's call makes candidates only
-  when its token carries `#bsky_appview`, within
-  `visitor_candidates_per_ip_per_hour` and `visitor_candidates_per_hour`.
-- **The serve-time label check** (§4.5) for posts these endpoints serve
-  from an `appview`-source community: at most four `getPosts` calls of 25
-  on the request's budget, the results in the request's `RefractCheck`.
-- **The gate after the fetch, for every caller** (§7.2 step 4): every
-  upstream view is gated as a whole: a thread node the gate does not list
-  becomes a `notFoundPost` with no replies (`blockedPost` for a blocked
-  author), keeping the chain above it for Thread Lens; so does a reply ref; a hidden quote becomes `viewNotFound`
-  (`viewBlocked`), a collapsed one stays; a list, feed, starter-pack or
-  labeler embed by a hidden creator becomes `viewNotFound`. `normalized`
-  returns its gate map, and the callers that return upstream arrays drop
-  what it hides: `getPosts` (hidden), `getAuthorFeed` and `getListFeed`
-  (not listable, blocked, or reposted by a hidden account), `getQuotes`,
-  `getActorLikes` and a thread's remote posts (not listable), `getFollows`
-  (hidden or blocked either way). An upstream thread is fetched only for
-  a listable anchor. **This changes public On-mode answers too**: nested
-  posts with a local `!takedown`/`!hide`, a hidden author, or a blocked
-  author are no longer served inside upstream views.
-- **The restored marker** (§7.3): `"restored": {community, tier,
-  labeler}` on the profile and post views (and quotes) of accounts in
-  R-live, local or upstream, in every response; never on a hidden one or
-  one awaiting its first labels.
-
-### Added (Refract R3: storage, backfill and the Refract purge, #831)
-
-- **The restored rule** (refract design §5.1): `AdmitRule::Restored`, in
-  every mode, after the purge rejections and Rule M and before the off
-  rule. An author in R-live that is not a member has its posts (full
-  rows), likes, reposts, follows, lists, list items, list opt-outs,
-  threadgates, postgates, profile and the off self records admitted; a
-  member in R-live its posts as full rows (its reference and growth as
-  before).
-- **Tombstones** (§5.2): a delete of a record by a DID in R, pending, or
-  a candidate always writes one, so the backfill cannot bring it back; a
-  delete also removes the record's Refract notifications and label reads.
-- **The `refract` backfill** (§6.1): full history, every collection the
-  rule admits, to `backfill.full_listing_ceiling`; each page written in
-  one transaction as it arrives, only URIs kept for the reconcile, the
-  position saved in `backfill_jobs.refract_cursor` after each page
-  (cleared by every enqueue, the `→ ending` cancel, the purge's end and a
-  finished run; kept by restarts and retries); a resumed collection is
-  not reconciled in that run. `refract.backfill_concurrency` dedicated
-  workers claim `refract` jobs only. `retry_tracked` and the
-  account-is-back re-queue cover `refract` jobs of DIDs in R; the weekly
-  resync (`refract.resync_days`) lists everything again. A reconcile of a
-  DID in R under the off rule reads `posts` as well as the references.
-- **The Refract purge** (§6.2): its own runner over `ending` rows (no
-  `purging_dids` row; it waits while another purge of the DID runs);
-  batches of 10,000 that delete only the exception rows for the mode, S
-  and membership read per batch; members' rows about the DID are never
-  deleted; then one end transaction.
-- **Spares** (§5.4): the on→off sweep, retention's scope steps (posts,
-  likes, reposts, follows, lists, list items, opt-outs, self records,
-  actors, counts) and its age cap, and the `member_removed` batches keep
-  the rows of DIDs in R. An `AccountDeleted` marker deletes every Refract
-  row of the DID; a purge's end re-queues `refract` for a DID in R-live.
-
-### Added (Refract R2: config, the restored set, checker and labels, #830)
-
-- **Config** (refract design §3): `[refract]` with `enabled` (default
-  off) and `communities` (default: Community A, tier 1, its labeler
-  `did:plc:cccccccccccccccccccccccc` read through its AppView), both
-  **live** settings (`LIVE_KEYS`, the registry's new `Communities` kind,
-  saved whole), and the restart keys `backfill_concurrency`,
-  `record_label_sweep_hours`, `record_label_ttl_mins`,
-  `visitor_candidates_per_ip_per_hour`, `visitor_candidates_per_hour`,
-  `sweep_rate_per_sec`, `recheck_hours`, `grace_days`,
-  `unverified_max_hours`, `disable_delay_hours`, `checker_concurrency`,
-  `candidates_per_caller_per_hour`, `bluesky_rate_per_sec`,
-  `per_pds_rate_per_sec`, `label_poll_secs`, `label_ff_pages_per_sec`,
-  `resync_days`, `event_days`, `resolves_per_caller_per_hour`. Every
-  communities rule is validated on every save; a tier 1 entry's network
-  is checked while the feature and the entry are on.
-- `LiveSettings` gains a watch channel sent after every swap.
-- **Migration 0040**: `refract_dids`, `refract_events`, `refract_labels`,
-  `refract_notifications`, `refract_pending`, `refract_pending_dids`,
-  `refract_record_reads`, `backfill_jobs.refract_cursor` and the
-  `refract` claim index. Every job enqueue clears `refract_cursor`; the
-  regular workers no longer claim `refract` jobs (new depth `refract`).
-- **The checker** (§4.1, §4.3, §4.4): claims due `candidate`, `restored`
-  and `grace` rows (never `rejected`, `ending` or a pending DID), runs the
-  five rules (Bluesky withholds it; hosted on an enabled community by a
-  fresh resolve; active on its PDS, with deactivation as 30-day grace;
-  kept by its community, by its AppView and its own labeler's labels; no
-  local takedown) and writes the verdict under the write guard with a
-  version check, with the full transition table, events, `actors` facts
-  for R, the `refract` backfill on restore and its cancel on ending.
-  `#account`/`#identity` events of a DID with a Refract row make it due;
-  a candidate-only DID gets no `actors` row.
-- **Labels** (§4.5): signatures checked against the labeler's
-  `#atproto_label` key (a failing gone label is kept unverified and hides
-  at once); the targeted fetch and the 60 s incremental poll (with its
-  fast-forward) for `labeler`-source communities; for `appview`-source
-  ones the labels of the AppView's `getProfile` (checked against
-  `atproto-content-labelers`) and the rolling `getPosts` sweep with
-  omissions. Labels count only from a DID's own community's labeler.
-- **Live changes and pending removal** (§3.2, §4.6): one task diffs the
-  live values against the applied entries (renames keep state, changed
-  entries make their DIDs due, label-reader changes drop old rows,
-  `gone_labels` edits update stored flags), puts R in the `feature` scope
-  when switched off and unlisted DIDs in `entry:<hash>` scopes, drops
-  candidates, clears scopes when hosts match again (hidden until the
-  first label fetch), and ends pending DIDs only after
-  `disable_delay_hours`, never while kept.
-- Metrics: `refract_dids{state}`, `refract_checks_total`,
-  `refract_transitions_total`, `refract_label_poll_total`,
-  `refract_label_poll_lag_seconds`, `refract_label_reads_total`,
-  `refract_label_sweep_total`, `refract_label_sweep_lag_seconds`,
-  `refract_labels_rejected_total`, `refract_pending_end`.
-
-### Added (Refract R1: the gate's snapshot, #829)
-
-- **Refract** (refract design §4.2, §7.4) starts with what the moderation
-  gate reads. `ScopeSets` gains R-live (`restored`, DID to home
-  community), `candidates` and `refract_hidden` (each hidden DID with its
-  reasons: ending, pending, awaiting labels, a gone account label; and
-  records with a gone label). All empty until the later slices fill them;
-  no behaviour changes yet.
-- Each request builds one **Refract snapshot** on its first gate call
-  (`Requester.refract`, shared by every clone; the read guard is dropped
-  before it is computed) with three outputs: `wholesale` (non-members
-  outside S, hidden as an account), `by_collection` (off modes: S
-  non-members lose everything but profile, self records and follows;
-  members their posts) and `records` (gone record labels; in On and
-  Filling only of authors outside S and the members). A per-request
-  serve-time check (`Requester.refract_check`) overrides `records` only.
-- `moderation::gate`, `gate_many` and `gate_many_among` take a required
-  `RefractView` (snapshot and check). A `wholesale` DID is
-  `Hidden(Takedown)`; a record its rule hides is the new
-  `Hidden(RecordRemoved)`. `getRecord` builds its own snapshot; the
-  private pipeline passes an empty one (Refract never hides a private
-  post). R-live is readable on public paths (G-9) and in
-  `in_scope_or_member`, and counts as S for the identity persistence set.
-- No migration.
-
-### Added (degraded mode DM4: `Reindexing`, #825)
-
-- **D, readiness cleared after the first time** (degraded-mode design
-  §3.5): a member whose `ready_at` was cleared while `first_ready_at` is
-  set (a gap, the prober's divergence, a dead letter, a purge marker's
-  interim) now gets **`503 Reindexing`** with `retryAfter` in the body and
-  the `Retry-After` header, instead of `400 NotReady`, at every site that
-  answered `NotReady`: the private gate, the member-only public gate,
-  Thread Lens's gate (`access = members`), and the two view-error sites
-  (`getTimeline`, `putActivitySubscription`), each through one
-  constructor. A client that turns private features off on `NotReady`
-  keeps the member a member and retries. First-time indexing, `Enrolled`
-  and `Purging` stay `400 NotReady`. `Enrollment::Member` carries
-  `reindexing`; `member_state`, `Enroller::check` and Thread Lens read
-  `first_ready_at` beside `ready_at`.
-- **`getMembership`** answers such a member **`reindexing`**, with a
-  member's permissions, and `validForSecs` and `Retry-After` both
-  **`community.reindex_retry_secs`** (new key, default 30, 1 to 3 600, in
-  the admin settings). First-time indexing is still `indexing`.
-- The 503 is a gate error, outside the timing floors, as `NotReady` is.
-- Lexicons: `Reindexing` in every private method's and Thread Lens's
-  `errors`; `getMembership`'s `status` gains `reindexing`; the feature
-  **`private.reindexing`**. The stock `app.bsky.*` lexicons are not
-  edited; a stock client gets the 503 from a member-only public endpoint
-  where it got a 400 before.
-- Metric: `xrpc_reindexing_total{site}` (`private`, `public`,
-  `threadlens`, `view`, `membership`).
-- `migrate status`'s test lists migration 0039 (missed in DM1).
-- No migration.
-
-### Added (degraded mode DM3: telling clients, #824)
-
-- **A, the response signal** (degraded-mode design §3.2): `getPosts`,
-  `getPostThread`, `getAuthorFeed`, `getTimeline`, `getBookmarks`,
-  `getLikes`, `getRepostedBy`, `getQuotes`, `getReplies`, `searchPosts`
-  and `listNotifications` carry `degraded: true` and `retryAfter` (and the
-  `Retry-After` header) while degraded, the same for every caller at that
-  moment; and `unavailable: [{uri, reason}]` naming the caller's **own**
-  private posts the request read and could not serve yet (`syncing`:
-  `stale`, `head_check`, `fallback_behind`; `indexing`: an owner not
-  ready), each once, whenever there are any, degraded or not. Absent when
-  empty; never another author's post.
-- **B, `getPostThread`'s anchor:** while degraded, every anchor miss is
-  `503 Unavailable` with `retryAfter` in the body and the header, whatever
-  the cause, except a URI that is not a private post's (still `400
-  NotFound`). Not degraded, only the caller's own anchor missed
-  transiently is `503`; every other miss is the same `400 NotFound` as
-  before. The 503 is floored as the 400 is. `getReplies`, `getLikes`,
-  `getRepostedBy` and `getQuotes` keep their empty answer, with A's fields.
-- **C, quoted private posts:** while degraded, every private quote not
-  shown (unreadable, behind, prefilter-failing or nonexistent alike) is
-  `app.nearhorizon.private.defs#viewUnavailable {uri, unavailable,
-  retryAfter}`; not degraded, only the caller's own quoted post missed
-  transiently. Reply context and thread parents are unchanged.
-- `retryAfter` is a quarter of the private watermark's delay (unbounded
-  with none), within **`private_read.degraded_retry_min_secs`** (30) and
-  **`private_read.degraded_retry_max_secs`** (300), new keys in the admin
-  settings.
-- Lexicons: `defs#unavailablePost`, `defs#viewUnavailable`, the three
-  optional fields on the eleven outputs, `getPostThread`'s `Unavailable`
-  error; `getMembership` lists the feature **`private.degraded`**.
-- Metric: `private_read_unavailable_total{kind}` (`thread`, `quote`,
-  `listed`).
-- Tests: the private round trip expects the degraded `503 Unavailable`;
-  the degraded-mode tests note the fallback's statements per thread
-  (`test_support::noted`) instead of capturing sqlx's tracing events, which
-  missed statements when tests ran in parallel.
-- No migration.
-
-### Added (degraded mode DM2: the head fallback, #823)
-
-- **Private reads while a private relay is behind** (degraded-mode design
-  §2): while the private watermark is missing or older than
-  `kryphocron.oracle_freshness_bound_secs` ("degraded", decided once per
-  request), a private read no longer misses as `stale` by default. Step 3′,
-  after the head checks and before the oracle snapshot, shows every
-  repository the read depends on current: its head no older than
-  `sync.head_max_age_secs` and its `chain_rev` (DM1) at or above it. The
-  set is the author, the reader, the audience owner and, for another
-  reader's walked reply, the authors of the rows the structural climb
-  from its parent visits, up to the walk's stop (`schema::climb_authors`,
-  one statement per page or expansion level, at most 64 distinct authors;
-  more is a miss). The author, reader and audience owner reuse step 3's
-  head checks; every other repository is its stored head with no fetch, so
-  no fetch budget or read-fetch token is spent. Step 5′ then requires
-  fact 8's O and every author its walk read (`fact8_with_authors`, used
-  only here) to be in that set; on the author's own read only the author
-  and audience owner count. The oracles answer `last_synced_at` with the
-  oldest head check of the set. A repository whose chain is broken (a
-  commit dropped by the relays, a gap) is not served until the commit
-  arrives or a settle runs; such a miss is `fallback_behind`. With a fresh
-  watermark nothing changes: same statements, same bytes.
-- Threads and `getReplies` keep the sequential path while degraded, now
-  decided from the request's own degraded flag.
-- **Config:** `private_read.head_fallback` (default `true`; off restores
-  the `stale` miss), in the admin settings (Private posts). Serve warns
-  (`config_head_fallback_over_bound`) when it is on and
-  `sync.head_max_age_secs` is above `kryphocron.oracle_freshness_bound_secs`,
-  where fallback reads would be refused at bind.
-- Metrics: `private_read_outcome_total{outcome="fallback_behind"}`,
-  `private_read_fallback_total{result}` (`passed`, `behind`, `untracked`,
-  `climb_cap`, `walk_outside`).
-- Residuals (design §15): account status from the relays, public likers,
-  reposters and quotes beside a fallback-served anchor, and a hit's counts
-  are as fresh as the relays; a read's heads may be up to
-  `sync.head_max_age_secs` old, as before.
-- No migration, lexicon or feature string.
-
-### Added (degraded mode DM1: each repo's chain, #822)
-
-- **`sync_state.chain_rev`**: a rev up to which Prism holds every commit of
-  a tracked repo, applied by the firehose or covered by a settle's listing
-  (degraded-mode design §2.4). `applied_rev` is a maximum and cannot show
-  a commit dropped by a relay while a later one arrived; `chain_rev` can,
-  from the `since` horizon-firehose now carries in each commit entry (the
-  previous commit's rev). A firehose commit whose `since` is at or below
-  `chain_rev` raises it; any other commit above it waits in
-  `sync_chain_links` (at most 256 per DID, lowest dropped) until the
-  missing commit arrives from any relay, or a settle (job or catch-up)
-  raises `chain_rev` to its covered rev and runs through the waiting
-  links. A commit with a dead-lettered op neither chains nor waits. An
-  entry without `since` (an older sidecar) decodes as before and leaves
-  the chain to the settles. Untracking clears the chain and its links.
-  Nothing reads `chain_rev` yet; DM2's head fallback will.
-- **The degraded probe**: the prober also keeps `chain_behind_since` (when
-  it first found the head above `chain_rev`). While private reads are
-  degraded, a DID whose chain stays behind past
-  `sync.divergence_grace_secs` gets an `authz` job without losing its
-  readiness, at most one per grace, none while one is queued or running.
-- Metrics: `private_read_degraded` (1 while the private watermark is
-  missing or older than `kryphocron.oracle_freshness_bound_secs`, with
-  `private_read_degraded_started` / `_ended` logged on each change),
-  `sync_chain_breaks_total`, `sync_chain_behind`, `sync_chain_links`,
-  `sync_degraded_authz_enqueued_total`.
-- **`docker/docker-compose.yml`** pins horizon-firehose at `0901576` (was
-  `b3b7d1e`): each commit entry carries `since` (string or null). The
-  sidecar images need a rebuild.
-- **Migration 0039** (needs `APP_ALLOW_STARTUP_MIGRATE=1` for that start).
-  No config key or lexicon change.
-
-### Removed (Community B network entry)
-
-- **The `community-b` `[[constellation.networks]]` entry** is removed from
-  `docker/config/app.toml` and from the built-in defaults, and `community-b`
-  leaves the default `constellation.cascade.order` (now `["bluesky",
-  "community-a"]`). Its `appview_url`, `api.community-b.example`, is Community B's
-  PDS (`describeServer` answers `did:web:community-b.example`), not an
-  AppView. Community B has no AppView yet; the entry comes back, by its
-  AppView's DID, once it does. The entry shipped disabled, so routing is
-  unchanged. A config that still lists `community-b` in `cascade.order`
-  without a matching network fails validation ("is not a configured
-  network"); drop it from the order. Tests that used it as their example
-  network now use placeholder networks. No migration or lexicon change.
-
-### Changed (firehose batch size 2000)
-
-- **`firehose.batch_size`** defaults to 2000 (was 500), in the code default
-  and `docker/config/app.toml`. A read returns whatever has arrived, so at
-  live rates nothing changes; under a backlog the per-batch Redis round
-  trips and `XACK` are spread over four times the entries (about 5–10 %
-  more throughput, firehose overload note fix 5).
-
-### Changed (private thread expansion read cap, H-3, #778)
-
-- **`getPostThread` and `getReplies`** (private tier) cap the pipeline
-  reads of one reply expansion at `THREAD_NODE_CAP ×
-  private_read.page_reads_factor` (400 at the default factor 2), counted
-  across levels, hits and misses alike (shared-walk amendment 1 §2.3 (b),
-  C2 (b)). Whole nodes only: a parent is expanded only if all of its
-  candidates fit in the reads left; the first that does not, and every
-  parent after it, comes back without `replies`, as a node past `depth`
-  does, and is reached by calling `getReplies` on it. `getReplies`' own
-  page reads are not counted against the cap. A thread of nodes with many
-  undecodable children no longer reads up to ~1,990 posts per request.
-  No migration, config key or lexicon change.
-- The changelog's horizon-firehose pin entry, duplicated in part by the
-  last commit, is repaired.
-
-### Fixed (horizon-firehose pin: no stale-cursor replay)
-
-- **`docker/docker-compose.yml`** pins horizon-firehose at `b3b7d1e`
-  (was `3f7ee6f`). Every reconnect, including the SDK's internal keepalive
-  reconnect, now dials with the current saved cursor, and an event at or
-  below its relay's published cursor is dropped before XADD
-  (`replayed_events_dropped_total`). This fixes the 2026-10-22 incident,
-  where a keepalive reconnect reused a day-old cursor, replayed ~21–27 h
-  per relay, trimmed `firehose:events` and held the bsky watermark, so
-  private reads missed as stale. The new `cursor.relay_reset_after_seconds`
-  key (default 600) is optional; existing relay configs load unchanged.
-
-### Changed (tests: one migrated template per run, #811)
-
-- **`test_support::fresh_db`** no longer replays every migration for each
-  test. The first call in a test run builds a migrated template database,
-  `hprs_template_<hash>`, named by an FNV-1a hash of the migration set's
-  versions and checksums, so a changed set gets a template of its own. It
-  is built under a Postgres advisory lock, so test binaries sharing the
-  server build it once, and marked `IS_TEMPLATE` (with connections off)
-  only when complete, so a build that died part way is rebuilt. Each test
-  then gets `CREATE DATABASE hprs_test_<n> TEMPLATE …`, with
-  `_sqlx_migrations` copied along; `jit = off` is still set per database,
-  since a template does not pass on its settings. `empty_db` is unchanged
-  for the migration tests, and each test keeps its own database and
-  `drop_db`.
-- The retention tests' own copy of `fresh_db` now calls the shared one.
-- Full suite on the build box: 1,491.6 s before (1,213 passed, 18
-  ignored), with the throwaway Postgres also tuned for tests (tmpfs data
-  directory; `fsync`, `synchronous_commit` and `full_page_writes` off):
-  874.8 s after (1,213 passed, 18 ignored), wall time 24 min 56 s to
-  14 min 40 s. The test process, not Postgres, is now what the suite
-  waits on.
-
-### Fixed (test reliability in the faster suite, #812)
-
-The faster suite runs its tests closer together, and five of them failed or
-hung in it.
-
-- **`a_second_wipe_after_the_gap_runs_a_second_gap`** failed once in the
-  faster suite: its live consumer recreated the group at `$` between two of
-  the refill's `XADD`s, so the refill's later entries were delivered and
-  the third processed entry was one of them, not the entry added after the
-  gap. The fixture's `add_n` now adds its entries in one `MULTI`, so a
-  recreation sees a refill whole or not at all.
-- **`list_phase::release_with`** returned `Gone` or `Stopped` by dropping
-  its transaction, which holds the list's row `FOR UPDATE`. A dropped
-  transaction rolls back only when its connection is next used, so until
-  then the list phase's `SKIP LOCKED` found the row held and answered
-  `Busy`; `a_resubscription_stops_a_release` failed on that. Both returns
-  now roll back first. In service the effect was a list phase put off to
-  its next pass.
-- **`b74_a_mute_during_a_release_stops_it_and_an_unmute_lets_it_finish`**
-  started its applier before its first direct list phase, which then raced
-  the applier for the row and got `Busy`. The applier now starts after it,
-  as in the other B-74 tests.
-- **`floors_change_no_content_off`** timed each answer from before building
-  its HTTP client, so a client's setup on a loaded debug build counted
-  toward "under the floor at 0" (in two runs the fastest of five was 408
-  and 410 ms against 400). The client is now built before the clock
-  starts, and a failure lists each attempt's time. It passed in the next
-  full run; that the setup was the whole cause is not proven.
-- **`the_private_plan_keeps_gates_of_postprivate_records`** held a pooled
-  connection across `drop_db`, whose pool close waits for every
-  connection; it hung one run for 53 minutes. The connection is now
-  returned first.
-
-### Added (admin UI: Horizon-Prism name, Appearance, menu order, #810)
-
-- Settings › Appearance (`/admin/settings/appearance`): each operator
-  chooses light, dark or the device's choice, and a colour scheme (Sky, the
-  default, Violet, Teal, Graphite). Saved per operator in
-  `admin_operators.theme_mode` / `theme_scheme`, so it follows them to any
-  device; read with the session and set on every signed-in page's `<html>`
-  as `mode-… scheme-…` classes, so pages draw in it from the first paint.
-  The stylesheet's accent tokens now come from the scheme in its light or
-  dark form; no script, no inline style, the CSP unchanged. Sign-in, setup
-  and refusal pages use the default. The form has the usual checks
-  (session, CSRF token, `Origin`, one change a second); it is not a command
-  and not in the audit log, and not an `operator_settings` key.
-- The admin pages show the product name as Horizon-Prism: the brand, every
-  `<title>` (`… · Horizon-Prism admin`), Home's server card, and the OAuth
-  client name the sign-in screen shows.
-- The top menu puts everyday pages first and Settings last: Home, Members,
-  Health, Jobs, Problems, Stats, Blocks, Labels, Look up, Audit log,
-  Operators, Settings. "Blocks (Farsight)" is "Blocks" in the menu, the
-  page title and Health's links; the page still explains Farsight.
-- **Migration 0038** (needs `APP_ALLOW_STARTUP_MIGRATE=1` for that start).
-
-### Added (notServed N2: the author's marker, #809)
-
-- `app.nearhorizon.private.defs#privatePostView.notServed`: on the
-  author's own top-level view only, present when this AppView would not
-  serve the post to any reader of its audience, with each post-level
-  reason once, in order: `placement` (not attached to a thread its
-  audience can read), `standing` (the author does not stand under the
-  thread's governing audience, or the thread owner's account is not
-  active), `chainCap` (the chain above is longer than
-  `private_read.max_chain`), `overClaim` (the record's clear fields claim
-  what its content does not carry). Absent means served. Never on another
-  reader's view, never on a quoted view; per-reader exclusions (a block
-  with a reader, a reader outside the audience, a reader's stale head) never
-  set it, and no value names or distinguishes a block. It follows the read
-  rule live: re-read rather than cache it.
-- `overClaim` comes from the read's clear-field check; the thread reasons
-  from one `schema::not_served` statement per response that shows any of
-  the caller's own posts, in `decorate` on every endpoint (getPosts,
-  getPostThread, the feeds and their reply context, getReplies,
-  getBookmarks, searchPosts, notification subjects). A response with no
-  post by the caller runs nothing new, and every other reader's view is
-  byte-identical to before.
-- `private_read_not_served_total{reason}` (`placement`, `standing`,
-  `chain_cap`, `over_claim`): one per own view marked, per reason.
-- `getMembership` lists `private.notServed`. No config key.
-
-### Added (notServed N1: the statement, #808)
-
-- `schema::not_served`: for the caller's own private posts, whether each
-  would be served to its audience and, if not, the post-level thread
-  reasons (`placement`, `standing`, `chainCap`). It is the read rule's own
-  statement (the shared walk and stage 1, from the same builders) with the
-  reader bound to the empty string and rule 8 left out, so every term that
-  depends on who reads is inert; a structural probe, run only for walked
-  rows that fail, tells a chain longer than `private_read.max_chain` from
-  a broken one. One statement per call, in slices of `climb_keys(cap)` in
-  one snapshot past that. Only rows by the given author are read.
-- No wire change: nothing calls it yet (N2 does).
-
-### Added (fast reads F-G: notification subjects, #806)
-
-- `app.nearhorizon.private.listNotifications` items whose `reasonSubject`
-  names a private post carry `reasonSubjectPost`: that post read for the
-  caller through the same pipeline as every private read (the clear-field
-  check, `droppedFields` on the author's own view and S4 apply), each
-  subject once, after the notifications' own posts, and decorated as
-  `getPosts` decorates. A subject that does not read, for any reason,
-  leaves the field out. A client needs no `getPosts` for subjects. The
-  lexicon describes the item as `#notification`, the stock shape with the
-  new field.
-- `getMembership` lists `private.notificationSubjects`.
-
-### Added (fast reads F-F: reply context on feed items, #805)
-
-- `app.nearhorizon.private.getTimeline` and `getAuthorFeed` items whose
-  post is a reply carry `reply {root, parent}`
-  (`app.nearhorizon.private.defs#replyRef`), so a client needs no second
-  `getPosts` for missing parents and roots. A private root or parent is
-  read for the caller through the same pipeline as every private read (the
-  clear-field check, `droppedFields` on the author's own view and S4
-  apply) and decorated as `getPosts` decorates; one that does not read,
-  for any reason, is `app.bsky.feed.defs#notFoundPost`; a public one is
-  `#publicPostRef {uri, cid}`.
-- The context reads run after the page's items are chosen and read, only
-  for emitted items, each URI once, reusing a post already on the page,
-  at most `2 × limit`, and are not charged to the page's read cap: pages
-  and cursors are as before. Their time is the `context` stage of
-  `private_read_stage_seconds`. New server work on the feeds: up to
-  `2 × limit` more pipeline reads per page of replies.
-- `getMembership` lists `private.replyContext`.
-
-### Added (fast reads F-E: getUnreadCount reasons, #804)
-
-- `app.nearhorizon.private.getUnreadCount` takes the optional repeated
-  `reasons` parameter of `listNotifications`, applied the same way before
-  counting (a reason no private notification has matches nothing, as on
-  `listNotifications`). Without it the count is as before. A client's
-  badge of selected reasons is one count instead of paging
-  `listNotifications`. The count is still the prefilter's: a post that
-  passes it and then misses a read is counted and not listed.
-- `getMembership` lists `private.unreadReasons`.
-
-### Added (fast reads F-D: getMembership validity and permissions, #803)
-
-- `app.nearhorizon.actor.getMembership` answers two more fields
-  (additive): `validForSecs`, how long the client may act on the answer
-  from when it received it (`member`: the new
-  `private_read.membership_valid_for_secs`, default 3 600, 60 to 3 600,
-  refused at load outside that; `indexing`: the `Retry-After` value;
-  `notEligible`: at most `community.enroll_refusal_cache_secs`), and
-  `permissions {privateRead, privateIndexed, threadLens}`: `privateRead` a
-  ready member with the private tier on; `privateIndexed` a member, ready
-  or not, with the private tier on (while `private.anyPds` is listed the
-  client must still encode: a post without `encodedContent` is served to
-  no one); `threadLens` a ready member, or anyone signed in while
-  `threadLens.signedIn` is listed.
-- Every `getMembership` answer carries `Cache-Control: private, no-store`.
-  Private reads are still authorized per request; the validity bounds only
-  what a client does on its own.
-- `private_read.membership_valid_for_secs` is in `docker/config/app.toml`
-  and is a restart key on the admin UI's "Private posts" page.
-
-### Changed (fast reads F-C, reduced: one statement per head, #802)
-
-- A private read's repo-head check reads the stored head and
-  `applied_rev` in one statement (`HeadProber::read_head_applied`)
-  instead of two, per DID. Where and when heads are checked, the
-  per-request fetch budget and every outcome are unchanged; after a
-  synchronous fetch, `applied_rev` comes from the fetch's own write.
-- Stale-while-revalidate (fast-reads C-4) was not taken (skydeval,
-  2026-10-21): there is no `sync.head_stale_grace_secs` and no
-  `served_stale`, and design-v4 §II-6.11.3's 60 s head bound is as it was.
-
-### Changed (fast reads F-B: direct calls, #801)
-
-- CORS preflights are cached for a day: `Access-Control-Max-Age` 600 →
-  86 400, as the reference PDS and AppView send (browsers apply their own
-  cap, 2 h in Chromium). A client calling Prism directly with a service
-  token pays one preflight per URL per browser cap instead of per 10
-  minutes. A preflight answer carries nothing about a caller.
-- No authentication change: a token minted by `getServiceAuth` for a
-  direct call already verifies. New tests pin it on a private read,
-  `getMembership` and a Thread Lens route: `aud` bare or
-  `#bsky_appview`, `exp − iat` up to 3 600 s (3 540 s, Horizon's planned
-  59 minutes, and 3 600 s pass; 3 601 s is refused); another fragment,
-  another method's `lxm` or no `lxm` are 401.
-
-### Added (fast reads F-A: read latency metrics, #800)
-
-- `xrpc_request_seconds{nsid}`: a histogram of every routed XRPC request's
-  time, recorded beside `xrpc_requests_total` (inside the global limit, so
-  authentication is in it; CORS preflights and unrouted paths are not
-  timed). `getMembership`, Thread Lens and the public methods now have a
-  latency series.
-- `private_read_stage_seconds{endpoint,stage}`: the twelve floored private
-  reads' unfloored time split into `gate` (verification, the bucket, the
-  member check), `reads` (wall time while any pipeline read or head round
-  is in flight: head checks, row, bind, decode; concurrent reads count
-  once), `context` (the feeds' reply context, once it exists) and `rest`
-  (listing, prefilter, hydration, decoration). The stages sum to
-  `private_read_unfloored_seconds`.
-- `sync_head_check_seconds` gains `path`: `probe` for the background
-  prober's `getLatestCommit`, `read` for a private read's whole head
-  lookup (the stored-head query and any synchronous fetch), which is the
-  only part that is request time. Before, it held the two fetch kinds
-  mixed and no database time.
-- `private_read_empty_page_total{endpoint}`: a paged private read that
-  returned no items and a cursor (what drives a client's empty-page loop).
-- The three latency histograms, and `sync_head_check_seconds`, are
-  exported with the 20 buckets of `private_read_unfloored_seconds` (5 ms
-  to 5 s) instead of as summaries. Labels are method names and fixed
-  strings only.
-
-### Changed (kryphocron 0.4.4: the read check derives with kryphocron's own function, #793)
-
-- `kryphocron` moves from 0.4.3 to 0.4.4 (additive; `Cargo.lock` changes
-  kryphocron only). Horizon encodes private posts in the client with
-  kryphocron itself, so the clear-field derivation behind ingest's
-  fallback and the read-time check is now
-  `kryphocron::post_content::derive_clear_fields`, and the payload form
-  `PostContent::to_payload`, instead of Prism's own port: Prism verifies
-  with the function the encoder used. No behaviour changes: a test holds
-  kryphocron's derivation equal to the port it replaces over every parity
-  fixture, every media fixture and wrong-typed fields; T-P1 holds it (and
-  `from_payload`) equal to the PDS's own output.
-- A client-encoder fixture (Horizon K6-L2): records built with
-  `to_payload` and `derive_clear_fields(..).apply_to`, written through the
-  writer — a mention facet, a quote, images, a video, a record with images,
-  a record with video, and an embed and facets with unknown extra keys —
-  are each read by the audience with every field counted `match`.
-- `encodedContentGeneration` is client-asserted: a comment in the read
-  pipeline and a test (T-G1) pin that it decides no access; a mark dated
-  far in the future or at the epoch reads exactly as the real one.
-
-### Changed — BEHAVIOUR CHANGE: plaintext private posts are no longer served (S4, #798)
-
-- **While `[private_any_pds] enabled = true` (the default), a
-  `tools.kryphocron.feed.postPrivate` record with no `encodedContent` is a
-  uniform miss for every reader, its author included**, from any host
-  (outcome `plaintext` in `private_read_outcome_total`). Before this
-  change such a post was served from its stored `text`. Ingest is
-  unchanged: the row is kept and counted, so turning the switch off
-  (`[private_any_pds] enabled = false`, then restart) serves it again.
-  The refusal does not cascade: replies under a refused plaintext root
-  stay readable. As with a post that fails decode, `getUnreadCount` and
-  the counts can still count one (the prefilter does not decode).
-- While on, `getMembership.features` lists `private.anyPds` (after
-  `private.notificationPreferences`): private posts from any PDS are
-  fully served, and must be encoded. Horizon encodes on the client and
-  writes to the member's own PDS; a member converts an old plaintext post
-  by encoding its content at the same rkey and rewriting the record.
-- This is private-encode design §7 (S4, slice E4). It was keyed to
-  `private_encode.enabled` / `private.encode` in the design; Prism's
-  encoder (`encodePost`) was withdrawn by skydeval on 2026-10-21 before it
-  was built, so S4 has its own switch and feature.
-- **Before deploying:** count the stored plaintext rows by the author's
-  PDS (they go dark): `SELECT a.pds_endpoint, count(*) FROM private_posts p
-  LEFT JOIN actors a ON a.did = p.author_did WHERE p.encoded_content IS
-  NULL GROUP BY 1`.
-- Config: `[private_any_pds]` (`deny_unknown_fields`), file-only;
-  `docker/config/app.toml` gains it. Startup logs `private_any_pds` with
-  the value. Tests: T-S1 (author and audience miss, a reply under it
-  reads, the row kept; off, served), T-S2 (a converted post is served);
-  `getMembership`'s feature list on and off; and Horizon's PQ-16: with the
-  switch on, `private.anyPds` is listed and plaintext is refused, an
-  over-claim misses for others and `droppedFields` is set; off, the
-  feature is not listed and plaintext is served, while the clear-field
-  check and `droppedFields` still apply (they never depend on the
-  switch).
-- Search's paging tests serve plaintext fixtures with S4 off, and T-E5
-  now expects its plaintext post to be refused (served with S4 off).
-
-### Changed (private reads: one row snapshot, clear fields checked at read, the author's `droppedFields`, #796)
-
-- **One statement for the row** (private-encode design E2, §6.1): steps
-  10–12 of the private read take the row in one statement
-  (`schema::snapshot`) instead of five, so a view's `cid` is always the
-  CID of the record whose content it shows; an ingest upsert landing
-  mid-read can no longer pair one version's content with another's `cid`.
-- **Clear fields checked at read** (§6.2, §6.3, choice E-C1). After
-  decoding, the facts a correct encoder writes for what the writer
-  encoded (from the payload's raw `facets` and `embed`, even when the read
-  leaves them out, else the stored clear columns) are compared with the
-  row's indexed `quote_uri`, `mention_dids` and `media_kinds`.
-  **Behaviour change:** a post whose clear `quote`, `mentionDids` or
-  `mediaKinds` claims something its content does not carry (an
-  over-claim) is now a uniform miss, outcome `index_mismatch`, for every
-  reader but its author, who still reads it (and can rewrite it). So
-  notifications, quote listings and media-filter listings that such a
-  post earned at ingest are no longer shown. An under-claim (a field
-  missing, as on older PDS records) is served. Ingest still never
-  decodes. Counted: `private_read_index_check_total{field, result}`.
-  Residual, as for a post that fails decode: `getUnreadCount` and
-  `quoteCount` count with the prefilter and can still count one.
-- **`droppedFields`** (§8.4, choice E-C10): the author's own
-  `privatePostView` lists `facets` and/or `embed` when the read left that
-  part of the encoded content out (the wrong type, or over 64 KiB), so a
-  client re-encoding from the view knows it would lose it. Never set for
-  any other reader, never on a quoted post's view. Lexicon:
-  `privatePostView.droppedFields`.
-- Tests: T-P4 (over-claims of each field miss for others and hit for the
-  author, with the notification written but not listed and the quote not
-  listed; under-claims served; honest posts match, oversized honest fields
-  included; a wrong-typed or oversized field cannot switch the check
-  off), T-P5 (the `getUnreadCount` and `quoteCount` residuals asserted as
-  they are), T-P6 (an upsert after the snapshot changes neither `cid` nor
-  content), T-D1 to T-D3 (the marker on every read method, never for
-  others, a rewrite from the author's view heals an over-claim). T-E5,
-  T-E9 and T-M9 updated: their over-claiming posts now miss for others.
-
-### Changed (one derivation of a private post's clear fields, #795)
-
-- New `private_tier::clear_fields` (private-encode design E1, §5): the
-  content-form payload (`0xFF`, then `{text, facets?, embed?}` in that
-  order, each value as sent), the clear fields a correct encoder writes
-  beside it (`embedBlobs`, `mentionDids`, `quote`, `mediaKinds`), and the
-  facts Prism indexes from them. A port of the PDS's own derivation, with
-  the same type lists, order and omissions; ingest and the read-time check
-  (E2) share it. The payload form is what a client-side encoder must
-  produce (Prism's own encoder, `encodePost`, was withdrawn by skydeval on
-  2026-10-21 and is not built).
-- Ingest's fallback, when a record has no dedicated `quote`,
-  `mentionDids` or `mediaKinds`, now derives the fact from the clear
-  `facets` and `embed` through it. Mentions and media kinds are unchanged
-  over every fixture. **One change:** a clear quote embed whose strong ref
-  has no string `cid` is no longer indexed as a quote (the record lexicon
-  requires the `cid`, so only a lexicon-invalid record changes; choice
-  E-C7).
-- `serde_json`'s `preserve_order` is declared in `Cargo.toml` (it was on
-  through feature unification only), so a payload keeps its key order and
-  Horizon's extension keys byte for byte.
-- Parity: `src/private_tier/tests/fixtures/content_parity.json`, 32 inputs
-  (every embed kind in both vocabularies, the PDS's own test embeds,
-  mentions in the three types with a duplicate and a non-DID, cid-less
-  quotes, a nested record-with-media, an unknown embed type, non-ASCII and
-  control characters, keys out of alphabetical order, Horizon's
-  `app.nearhorizon.spoiler` and `app.nearhorizon.richtext.facet` keys),
-  with the payload bytes and clear fields generated by the PDS's own
-  functions at its commit `42280a4`. Tests: T-P1 (payload and clear
-  fields equal the fixture byte for byte and key for key), T-P2 (the
-  ordering guard), T-P3 (the new fallback against the old over every
-  fixture: only the two cid-less quotes differ).
-
-### Changed (kryphocron 0.4.3, #794)
-
-- `kryphocron` moves from 0.4.2 to 0.4.3 (private-encode design E0). No
-  API change: laquna now draws a fresh 32-byte slug for every encode, so
-  two encodings of the same post never share a keystream (an edit, a
-  rotation, a delete and re-create at the same rkey). Decoding is
-  unchanged, and records encoded before decode as before. Required before
-  the encoder (`encodePost`) ships. `Cargo.lock` changes kryphocron only;
-  no test compared encoded bytes.
-
-### Added (Thread Lens: which of the caller's lists blocks an author, #792)
-
-- A `blocked-by-you` gap whose block comes through one of the caller's own
-  list blocks, and not a direct block, carries `blockingByListUri`: that
-  list's at-uri (stock's `blockingByList` concept, as the URI only). When
-  several apply, the smallest URI, across the caller's applying
-  list-block references and the list Farsight names in `blockedByActor`.
-  Absent for a direct block and when no list is known. `getThread` and
-  `resolve` alike.
-- No new call: the local verdict query returns the list it already joins
-  on, and the pair answer already holds Farsight's list. Nothing of the
-  author's records is read or sent. `blocking-you` gaps carry no list.
-- Lexicon: `blockingByListUri` on `gapNode`. Thread Lens amendment 1 §2A.
-- Tests: a list block from local references (the smaller of two), a
-  direct block with a list (no field), a `blocking-you` gap (no field),
-  a list Farsight alone reports, for a member and a visitor, through
-  `getThread` and `resolve`; nothing of the authors in the bytes.
-
-### Added (Thread Lens: replies the thread's author hid are flagged, #791)
-
-- A Thread Lens node whose URI the thread root's threadgate lists in
-  `hiddenReplies` carries `hiddenByThreadgate: true` (stock's name and
-  meaning, from `app.bsky.unspecced.defs#threadItemPost`), on post nodes
-  and gap nodes alike, except the root itself and the caller's own posts.
-  The response gains no threadgate field and no other node carries any
-  part of the gate; a root that is a post node keeps its own post view's
-  `threadgate`, as before and as on every endpoint.
-- One pass after enforcement sets it on every node, whatever path it came
-  by: the baseline, stubs resolved in place, the parent walk, reply
-  expansion and continuations. The root is the anchor's stored row's
-  root, else its post node's; the gate is the root's valid stored
-  threadgate, else the gate view of the ordinary view's upstream thread
-  when it names that root. A root that is a gap (its author blocks the
-  caller, or the caller blocks it) still has its gate read from those two
-  sources, and nothing of it is sent. A private root's gate is not read:
-  Thread Lens never reads the private tier.
-- **Fixed:** with bridging on, reply expansion re-read the stored replies
-  and placed the ones the root's author had hid as ordinary replies (also
-  on a `repliesCursor` continuation). They are now flagged.
-- The baseline keeps hidden replies, and what is beneath them, instead of
-  leaving them out, so a bridging-off response is `getPostThread`'s nodes
-  plus the flagged hidden replies. `getPostThread` is unchanged.
-- `resolve` flags post items from the stored gate of the root their own
-  record names; a gap item is never flagged, so it never says whether a
-  blocked author's post is stored here.
-- Lexicon: `hiddenByThreadgate` on `postNode` and `gapNode`;
-  `getThread`'s description. Thread Lens amendment 1 §2 – §3.
-- Tests: local baseline and expansion, bridging on and off, the reply's
-  own author, a root that blocks the caller, `resolve`, a gate changed
-  between requests, a private root, an upstream thread's gate valid and
-  not, and that no gate field is ever emitted.
-
-### Changed (Thread Lens: a `!warn` post is a post, #790)
-
-- A post an upstream labelled `!warn` is no longer `content-stripped` on
-  the Thread Lens ladder (bridged stubs, the parent walk, reply
-  expansion, `resolve`). It is a post node with its upstream labels
-  removed, as the baseline, `getPostThread` and `getPosts` already show
-  it, so the two Thread Lens paths agree. `!takedown` and `!hide` stay
-  `content-stripped`. Thread Lens amendment 1 §1.
-- Tests: normalization strips on `!hide` and `!takedown` and not on
-  `!warn`; the ladder returns a `!warn` post from an upstream `getPosts`
-  as a post with no upstream labels, and `!hide` / `!takedown` as gaps.
-
-### Added (`getMembership` advertises Thread Lens, #789)
-
-- `app.nearhorizon.actor.getMembership`'s `features` lists, after the
-  private-tier values, `threadLens` (Thread Lens is served: always, in
-  this build) and `threadLens.signedIn` while `threadlens.access` is
-  `"signed_in"` (every signed-in account is served, a non-member as a
-  visitor). Built on every call from the live setting, so an admin-UI
-  change shows on the next call with no restart. `threadLens` does not
-  depend on Farsight being configured: without it the lens is still
-  served, and each response says `bridging: "off"`.
-- With the private tier disabled, `features` now holds the Thread Lens
-  values only (it was empty). The lexicon text says so.
-- Thread Lens amendment 1 §0A
-  (`docs/internal/design/threadlens-phase4-amendment-1.md`).
-- Tests: the values and their order with the tier enabled and disabled,
-  and a live change of `threadlens.access` both ways on a running server.
-
-### Changed (Thread Lens docs: who may call, and `blocked`, #787)
-
-- The `threadLens.defs` lexicon's `blocked` gap reads as the code assigns
-  it: a block the ordinary thread view reported that was not looked past,
-  between other parties or with an author whose blocks with the caller
-  could not be checked; never returned by `resolve`. It said "reported by
-  another server". No change to any response. (The design and the client
-  contract note were updated in the same pass: Thread Lens serves every
-  signed-in account under `threadlens.access = "signed_in"`, the default.)
-
-### Fixed (Thread Lens: a blocked top gap's `parentUri` at a bound, #786)
-
-- When the parent walk stopped at a bound (`parentHeight`, the page budget,
-  `parent_rounds`, or a round that could not judge the next author) above a
-  `blocked-by-you` / `blocking-you` gap, the gap carried `moreParents` but
-  no `parentUri`, although the walk already knew its parent from a local
-  `posts` row or the baseline. That link is now written whenever the walk
-  names it, whether or not the walk goes on. It is never read from the
-  hidden record (design-v4 §5.15.11); a gap whose parent no local row or
-  baseline names still has none (§5.15.19 item 8).
-- The `blocked` gap's doc text says what the code assigns: a block the
-  ordinary thread view reported that was not looked past, between other
-  parties or with an author whose blocks with the viewer could not be
-  checked.
-
-### Added (`Retry-After` on every 429, #785)
-
-- **Every `429` names `Retry-After`.** A limiter's refusal (the rate classes,
-  Thread Lens's among them, the global backstop, the backstop's per-member
-  verification ceiling, the request and pool budgets, the service-proxy
-  classes) keeps `ratelimit-reset` (epoch seconds) and adds `Retry-After`:
-  the seconds left to that reset, at least 1. Built once, in the
-  conversion every limiter's refusal goes through.
-- The admin UI's limits name one too: a session's page and change limits
-  and sign-in starts (the bucket's wait, rounded up), wrong setup codes
-  (until a wrong code is answered at once again), and the live feed's
-  stream cap (the renewal reservation, the soonest a slot can free). A
-  refused live-feed open keeps the `Retry-After` of the limit that refused
-  it.
-- A target's `429` relayed by the service proxy is unchanged: none of the
-  target's headers are relayed (design-v4 §6.7.7).
-- Tests: each path's `429` carries `Retry-After` ≥ 1, consistent with its
-  `ratelimit-reset` (Thread Lens class, global class, per-member ceiling,
-  service classes, the conversion itself, the admin limits).
-
-### Measured (shared walk's open items, #720)
-
-Shared-walk amendment 1 (`docs/internal/design/shared-walk-amendment-1.md`).
-No change to what any endpoint returns.
-
-- **H-3, thread expansion reads (#778).** A new ignored test,
-  `b5_thread_expansion_trace`, splits `getPostThread` over 48 undecodable
-  children per node: the 31 per-node candidate statements take 84 ms of
-  1 167 ms; the 750 pipeline reads take the rest (about 1.4 ms each at
-  `bind_concurrency` 8). A cap on the expansion's reads is waiting on a
-  choice by skydeval, since it changes which replies a thread can show.
-- **H-10, `searchPosts` pages that match nothing (#779).**
-  `b5_search_floor_on_a_seeded_week` now also runs each page at
-  concurrency 8. On a release build, a page that matches nothing (300 reads)
-  takes 622 ms alone and 2.17 s p50, 2.47 s p99 at concurrency 8; a full
-  page of 100, 289 ms alone and 1.22 s p99. Floors are 0 by default, so
-  nothing waits on the old 1 500 ms floor; the cost is recorded and
-  accepted. An operator who needs it lower sets `private_search.span_hours`
-  or `scan_candidates`.
-- **H-9, a stored branch root (#780): not built.** It would spare the
-  chain fetch only for branch replies that fail before the walk (a reader
-  outside the audience, an accepted cost). Replies that pass, such as the
-  5 000 owner branch replies under distinct parents behind
-  `getUnreadCount`'s 1.7 s, are walked row by row whatever is stored, so
-  it would not change them; their cost is linear in the rows read (the
-  same 1.57–1.91 s at any slice size from 156 to 5 000).
-- The B-5 release loader's database pool now uses production's connection
-  settings, JIT off among them, so `b5_release_plans` times what the
-  deploy build runs (on the old pool JIT compilation made `Distinct`'s
-  statement read 6.9 s). Test harness only.
-
-### Added (private notification preferences, S1, #775, #777)
-
-Private notification preferences design S1
-(`docs/internal/design/private-notification-prefs.md`; skydeval's N1 to N4
-as recommended). Migration 0037.
-
-- **Private notification preferences.**
-  `app.nearhorizon.private.getNotificationPreferences` and
-  `putNotificationPreferences` read and set a member's preferences for its
-  own private notifications: per reason (`like`, `repost`, `reply`,
-  `quote`, `mention`), stock's `filterablePreference`, whether it is listed
-  (`list`) and whether only accounts the member follows count
-  (`include: follows`). A put replaces only the reasons it names, as
-  `putPreferencesV2`; other keys are ignored; a malformed preference is
-  `InvalidRequest` and writes nothing. `push` is stored and has no effect.
-  Both are own-only, gated and rate-limited as the other private methods,
-  served in every public-indexing mode, and not floored.
-- **`listNotifications` and `getUnreadCount` honour them when read.** A
-  reason with `list: false` is neither listed nor counted; under
-  `include: follows` a notification counts only while the member follows
-  its author as Prism stores the follow. Nothing changes when rows are
-  written, so changing a preference back restores every retained
-  notification. The list applies them in its scan, so its pages fill. With
-  no preferences stored, both answer as before.
-- **Storage.** A new private table, `private_notification_prefs`, one row
-  per member that wrote one, deleted by the `member_removed` and
-  `account_deleted` purges, never swept by retention; the admin stats page
-  labels it "Private notification settings". The image build's
-  private-table source check now covers it.
-- `getMembership` lists `private.notificationPreferences`. The lexicons gain
-  `private/getNotificationPreferences.json`,
-  `private/putNotificationPreferences.json` and
-  `private/defs#notificationPreferences`; `listNotifications`,
-  `getUnreadCount` and `getMembership` describe the change (and
-  `getMembership` now also names `private.mediaFilters`).
-
-### Added (private notification preferences, S0: the appearance lexicon, #775, #776)
-
-Private notification preferences design S0
-(`docs/internal/design/private-notification-prefs.md` §11).
-
-- **`lexicons/app/nearhorizon/actor/appearance.json`** defines
-  `app.nearhorizon.actor.appearance`, the account's backdrop, presets and
-  theme settings, so every `app.nearhorizon.*` definition has one home.
-  Definition only: Prism neither indexes nor serves the record; clients read
-  and write it on the account's PDS. Field names, limits and required fields
-  are Horizon's; the description sits on `main`, as in Prism's other
-  lexicons.
-- A test reads the lexicon tree beside the crate: every file parses, is
-  lexicon 1, and its `id` is its path, and every served `app.nearhorizon.*`
-  method has its file. A build tree with the crate alone skips it.
-
-### Changed (private embeds, S3: the codec's decode bound, #746)
-
-Private-embeds design S3 (`docs/internal/design/private-embeds-504.md` §7,
-choice K1): kryphocron 0.4.2.
-
-- **The codec stops decoding at 1 000 000 bytes.** The at-rest hooks now
-  install laquna with kryphocron's optional decode bound set to the payload
-  cap (`PAYLOAD_MAX_BYTES`, one constant shared with the read pipeline's
-  checks). A private post whose content would decode past it is refused by
-  the frame header or as soon as the output passes the bound, so a small
-  record that expands to gigabytes no longer costs the memory or time to
-  expand it. Everything else in the hooks is as before: laquna's default
-  seed policy, the default rotation oracle under the data dir, no audit
-  resolver.
-- **A decoded payload over 1 000 000 bytes now misses as `decode_failed`**,
-  not `bad_content`: the codec refuses it before the payload is restored,
-  and kryphocron reports it as any other decode failure. No lexicon-valid
-  record reaches the bound.
-- The 1 000 000-byte input cap stays: an `encodedContent` over it is still
-  not decoded (`bad_content`). It bounds the unmasking work, which the
-  output bound does not.
-- `clippy.toml` still forbids naming `laquna::Codec`; the one function that
-  builds it for the hooks carries an `#[expect(clippy::disallowed_types)]`
-  and never decodes.
-- `Cargo.lock`: kryphocron 0.4.1 → 0.4.2, nothing else.
-
-### Fixed (test reliability: requestRecord's second call, #772)
-
-- **`request_record_catches_up_and_the_record_reads_at_once`** sometimes
-  saw `caughtUp: true` on the second call, which is meant to fall within
-  the catch-up interval. The test server's interval was 10 s, and a loaded
-  suite could take longer than that between the two calls, so the second
-  catch-up ran. The test server's interval is now an hour; tests that want
-  it over already start a new server. With a 1 ms interval it fails as
-  reported.
-
-### Fixed (test reliability: T-24's four at a time, #771)
-
-- **`t24_handles_resolve_four_at_a_time_in_order`** failed once with three
-  in flight, not four. Each handle runs a local lookup before it reaches
-  the upstream, and under load those lookups finished further apart than
-  the shortest fake answer (75 ms). The fake upstream now holds each call
-  until four have been in flight together (at most 10 s), then answers in
-  the same scrambled order. With the concurrency set to 3 it fails with
-  3 against 4.
-
-### Fixed (test reliability: t56's refused token, #738)
-
-- **`t56_one_head_round_in_heads_order`** emptied A10's read-fetch bucket
-  with a task that drained it every millisecond, which raced the bucket's
-  refill (10 a second) when the loaded suite kept that task off the CPU,
-  so the request sometimes got a token and the chain did not end below
-  parent 5. A test-only `HostBudgets::starve` now empties the bucket and
-  stops its refill for the request. With the starve removed it fails with
-  #738's message.
-
-### Fixed (divergence left set after a catch-up, #736)
-
-- **`sync_state.diverged_since` now clears when `applied_rev` reaches the
-  probed head.** The first probe of a new tracked DID stamps it (nothing
-  applied yet), and before this only a later probe that found the DID
-  current cleared it. A just-ready member showed as diverged for up to a
-  probe interval, and if that probe saw a newer commit the old stamp was
-  kept, so the divergence grace counted from the first probe and could
-  clear readiness early. The firehose's advance, a job's settle and
-  `requestRecord`'s catch-up settle each clear it when the new
-  `applied_rev` is at or past `head_rev`. No migration.
-
-### Added (a private relay that never reports, #737)
-
-- **Prism warns when a relay in `firehose.private_relays` holds private
-  reads back.** Private reads wait for every private relay's watermark, so
-  one whose relay reader is not running makes every private read miss as
-  stale, the author's own included. At startup, a private relay with no
-  persisted watermark while another relay has one logs
-  `private_relay_never_reported` naming it. Every 5 minutes from 5 minutes
-  after the start, each private relay with no watermark
-  (`private_relay_never_reported`) or one more than 5 minutes behind
-  (`private_relay_silent`, with `behind_secs`) is named in a warning. Prism
-  still starts.
-- **Health "Relay delay"**: a private relay that has never reported is a
-  Problem ("… has never reported. Private posts wait for it, so every
-  private read misses as stale."), with a link to Settings; a private relay
-  that is behind says private posts newer than that miss. Any relay with no
-  watermark now reads "never reported" (was "nothing received since Prism
-  started", which was wrong after a restart), on Health's figures and
-  Home's stream tile too.
-
-### Added (actionable warnings S3: sweep the problems list, #765, #768)
-
-Actionable-warnings design S3 (`docs/internal/design/actionable-warnings.md`
-§6.6, §7.2). No migration.
-
-- **`admin deadletter sweep [--dry-run]`** and a Problems-page button,
-  "Clear out the records Prism would now set aside…" (confirmed), remove
-  from the dead-letter stream every whole-entry letter that the firehose
-  would now drop: a commit refused for its rev whose ops would write
-  nothing, or an event naming no valid DID, judged with the scope sets as
-  they are when it runs. Only letters whose whole payload was kept are
-  judged; op letters, truncated and unreadable ones stay. The stream is
-  read 500 entries at a time. The result gives `examined`, `removed` and
-  `kept`; `--dry-run` counts without removing. Run it once after the
-  upgrade to clear the letters written before S2.
-
-### Changed (actionable warnings S2: malformed records from strangers, #765, #767)
-
-Actionable-warnings design S2 (`docs/internal/design/actionable-warnings.md`
-§6, §7): a malformed record Prism would not have kept anyway is counted and
-set aside, not listed as a problem. No migration.
-
-- **A commit refused for an invalid rev** (for example a rev with an `8`,
-  outside the TID alphabet) is now read once more without its rev, and its
-  ops are put through the same preparation and admission a valid commit
-  gets, with no SQL. When the commit would have written nothing (the repo
-  is not a member, not tracked, owns no subscribed list, no op would be
-  admitted, and it holds no delete), it is acked and counted
-  `firehose_malformed_dropped_total{check="rev"}` (path `no_tx`) instead of
-  being dead-lettered. The rev itself is never used.
-- **An identity, account, handle or tombstone event whose DID is not a
-  DID** is counted `check="did"` and dropped.
-- **A broken record in a readable commit** (one that fails to parse, an
-  invalid rkey, a create without record or cid) is dead-lettered only when
-  it could matter: its repo is tracked, in scope or owns a subscribed list,
-  its path is the private tier's, or a string in it names a member. Others
-  are counted `check="record"`. `FailedOp` carries `matters`.
-- Commits that could matter (from a member or tracked account, or with an
-  op admission would admit, such as a block of a member) are dead-lettered
-  and warn as before. Unreadable entries (unknown type, bad JSON, a repo
-  that is not a DID, an unknown action) are dead-lettered as before.
-- **Health "Unprocessed records"** therefore counts only records that could
-  matter; when fine, it says how many malformed records from accounts
-  Prism does not keep were set aside in the last hour. The Problems page
-  says what it lists.
-
-### Changed (actionable warnings S1: unavailable accounts, #765, #766)
-
-Actionable-warnings design S1 (`docs/internal/design/actionable-warnings.md`
-§3, §4, §5, §8): Health warns only about sync jobs someone can act on.
-**Migration 0036** (needs `APP_ALLOW_STARTUP_MIGRATE=1` for that start).
-
-- **Sync jobs of accounts that are not there end `unavailable`, not
-  `failed`.** A job whose account is not found on its server, inactive
-  (taken down, deactivated, suspended, deleted or another status the server
-  names), has no server in its DID document, or whose DID is tombstoned,
-  ends in the new `unavailable` state after one try, with the reason kept
-  in `last_error` (`backfill_job_unavailable` log line, info). Nothing
-  claims such a row until it is queued again.
-- **An account that comes back is synced again by itself.** When the
-  identity refresher's status check finds the account active, or an
-  `identity` event arrives (the account may have moved), the DID's
-  `unavailable` jobs are queued again (`scope`/`resync` while Prism follows
-  the account, `member`/`private`/`authz` while it is a member; never
-  `list_sync`); a job running when the account turned active is queued
-  again too (`backfill_requeued_on_return_total`). The tracked-DID retry
-  loop also re-queues members' unavailable jobs every `retry_every_hours`,
-  and the weekly stale re-sync still covers the accounts Prism follows.
-- **Longer retries for the accounts around members.** A failing `scope` or
-  `resync` job now waits 1 min, 10 min, 1 h, 4 h, 12 h, then 24 h, and is
-  `failed` at the seventh failure, about 41 hours after the first.
-  Members' own `member`, `private` and `authz` jobs keep their schedule
-  (1 min, 10 min, 1 h, 1 h; `failed` at the fifth), since the head prober
-  treats a backing-off `authz` job as in flight.
-- **Health "Failed jobs"** counts only failed jobs Prism would still run:
-  those of accounts it follows, and `list_sync` jobs of owners with a list
-  still subscribed. Its words: "N sync jobs failed after trying again
-  several times"; when none have, it says how many followed accounts could
-  not be read because they are deleted, taken down or deactivated.
-- **Jobs page**: an "Unavailable" column, a new section "Accounts Prism
-  could not read" with the unavailable jobs by reason in words, and the
-  failed list limited to jobs Prism would still run, with a count of the
-  others ("deleted after 30 days").
-- `backfill_jobs{state="unavailable"}` gauge; retention deletes
-  `unavailable` rows 30 days after `updated_at`, like `failed` ones.
-- **Migration 0036** turns failed jobs whose `last_error` is one of the
-  "not there" answers into `unavailable` (keeping `updated_at`), and queues
-  again the other failed `scope` and `resync` jobs of accounts Prism still
-  follows. `list_sync` rows are not touched.
-
-### Changed (membership not tied to hosting, S2, #733, #764)
-
-Membership design S2 (`docs/internal/design/membership.md` §3, §11, §12):
-auto-enroll becomes a choice the operator makes, and auto-enrolled
-members that never finish their first indexing are removed. No migration.
-
-- **DEFAULT CHANGE (upgrade note): `community.auto_enroll` now defaults to
-  `false`** (was `true`), in code and in the shipped
-  `docker/config/app.toml` (C-M2 (b)). Hosting on a community PDS no longer
-  makes anyone a member unless the operator turns auto-enroll on. After the
-  upgrade the effective value is, in this order: the value saved in the
-  admin UI ("Auto-join", Group "Who can use Prism") if one was saved;
-  else `auto_enroll` as the deployment's `app.toml` sets it; else the new
-  default, `false`.
-  - A deployment whose `app.toml` sets `auto_enroll = true` under
-    `[community]` keeps today's behaviour exactly.
-  - A deployment whose `app.toml` sets `auto_enroll = false` is unchanged.
-  - **A deployment whose `app.toml` does not set the key stops
-    auto-enrolling at the upgrade.** A new account's `getTimeline`,
-    `listNotifications`, `getUnreadCount` or `getMembership` is refused
-    `disabled` (`auto_enroll_refused_total{reason="disabled"}`, answered
-    `notEligible`), and it becomes a member only through
-    `admin member add` or the admin UI. **To keep auto-enroll on**, add
-    `auto_enroll = true` under `[community]` in `app.toml` before
-    upgrading, or switch "Auto-join" on in the admin UI (live, no restart).
-  - **Members already enrolled are not affected.** The default decides
-    only whether a non-member is enrolled; no `members` row is removed or
-    changed by it, whatever the row's `source`.
-  - Startup logs `community_auto_enroll` with the effective value, the host
-    patterns it applies to and `never_ready_expiry_days`, so the value in
-    force is visible after the upgrade.
-- **Never-ready expiry** (§3.2), now built: `community.never_ready_expiry_days`
-  (7; 0 = off) takes effect. A task in `serve` runs a minute after the
-  start and then hourly. It removes, with the `member_removed` purge, every
-  member whose `source` is `auto_enroll`, whose `first_ready_at` is NULL
-  (it never once finished its first indexing) and whose `added_at` is more
-  than `never_ready_expiry_days` days ago. Each removal goes through the
-  guarded marker (`MarkerGuard::Expiry`), which re-checks those three
-  conditions in the marker's own transaction; a member that became ready
-  or was re-added by the operator in between is kept untouched.
-  - A member that is ready, or was ready once (`first_ready_at` is never
-    cleared, so a member that later fell behind is also kept), is never
-    expired. A member added by the operator (`source` `admin`) is never
-    expired.
-  - On the first run after the upgrade, any `auto_enroll` member that has
-    been waiting longer than the window without ever becoming ready is
-    removed. To see who that is beforehand, run read-only:
-    `SELECT did, added_at FROM members WHERE source = 'auto_enroll' AND
-    first_ready_at IS NULL AND added_at < now() - interval '7 days';`
-    (with the deployment's own window). Add anyone who should stay with
-    `admin member add` after the expiry, or set the window to 0 first.
-  - Expiry is not exclusion: no denial is written, and the account may
-    enroll again (or be added).
-  - The window is a live setting: a change in the admin UI applies at the
-    next run. The admin UI's note that it "has no effect yet" no longer
-    applies.
-- **Metrics and events:** `never_ready_expired_total`; events
-  `member_expired` (per member) and `never_ready_expiry` (per run, with
-  the window and the counts of candidates, expired, skipped, busy and
-  failed); `never_ready_expiry_failed` on an error.
-- `docker/README.md` step 11 says auto-enroll is off by default and
-  describes the expiry.
-
-### Added (admin UI S5: labels, look up, member actions, #763)
-
-Admin-ui design §6.2's per-member actions, §6.9, §6.10
-(`docs/internal/design/admin-ui.md`). The last slice of the design; scope
-rebuild and resync came with S3. No migration, no config key.
-
-- **Labels** at `/admin/labels`: the labels this Prism applies, newest
-  first, filtered by account (with its posts and records) or post and by
-  label; each of the six labels explained in words. Add a label to an
-  account or post typed as a handle, a DID, an `at://` address or a post's
-  link (`…/profile/<handle-or-did>/post/<id>`, read for its path only, never
-  fetched). Taking down and removing any label ask for the account's handle
-  (or the DID's last eight characters) typed.
-- **Look up** at `/admin/lookup`, by handle, DID or post link: the DID and
-  handle resolved afresh and checked both ways, its server, and what Prism
-  has stored; membership, denial, readiness and whether Prism receives its
-  updates; whether Prism follows it and what holds it there (member, follow,
-  recent interaction, subscription; scope recency) as of the last record;
-  the blocks Prism keeps with it on one side, under the member-side rule;
-  its private posts stored, with images, with a video, and its private
-  blocks, counted by `private_tier::stats::account_counts`; its labels and
-  sync jobs; and its actions. Identity is read as admin commands read it,
-  from the PLC directory (or the account's own address for `did:web`) with
-  Prism's own handle check; lodestar is never asked, and the page says so.
-- **Members:** per member, under "More": sync again (`backfill`), ask
-  Farsight to read again (`farsight prime --force`, only when Farsight is set
-  up), forget remembered blocks (`farsight forget`, only when the memory is
-  on) and clean up lists (`lists purge`); the last two ask for the member's
-  handle typed. Each row links to Look up. Labels and Look up join the
-  navigation after Blocks (Farsight).
-
-### Added (admin UI S4: stats, disks, endpoint usage, #762)
-
-Admin-ui design §6.5, §9.2's Disk check, §10 (`docs/internal/design/admin-ui.md`).
-
-- **Stats** at `/admin/stats`, in the navigation after Health. **Disks:**
-  size, used and free space of the disks holding Prism's own files, Postgres
-  and Redis, read with `statvfs` when the page loads; paths on one
-  filesystem are shown once, and a disk Prism cannot see is named. Then the
-  database against its budget, the write-ahead log (needs a superuser or
-  `pg_monitor`, else "unknown"), Redis memory against its limit and the size
-  of its append-only file.
-- **How much is indexed:** members, ready members and denied accounts
-  (exact); the accounts Prism follows, those kept fully in sync and those
-  with private posts (from memory), and the accounts Prism follows by their
-  first reason as of the last nightly clean-up (`scope_dids_by_hold`); posts,
-  likes, reposts, follows, blocks, lists, notifications, bookmarks and
-  profiles from the storage sampler, marked "about"; private posts stored,
-  with images and with a video (exact, from their partial indexes), and read
-  in the new and the older form; blocks kept and not kept (no member side)
-  since the start, and blocks, list blocks and private blocks stored;
-  lodestar's answered, unanswered and skipped lookups; and every table's
-  estimated rows and size. The private tables are labelled through
-  `private_tier::stats`, so no admin file names one. Nothing counts a large
-  table.
-- **Endpoints in use:** every routed XRPC method's requests since the start
-  by outcome (answered, refused, rate limited, not offered, errors) and when
-  it was last used, and the methods never used. Each router registers its
-  methods; a middleware in `finalize` counts by axum's matched path, between
-  the global limit and CORS, so unrouted paths, `/admin` and preflights are
-  not counted. Kept in memory and reset at a restart (decision C-A6 (b)), so
-  there is no migration; each request is also exported as
-  `xrpc_requests_total{nsid,class}`.
-- **Disk check** on Health and Home's attention list: amber under 10% or
-  5 GB free, red under 2%, "no data" when no disk is visible. Home's Prism
-  tile shows the fullest disk.
-- **Compose:** `app` mounts `db-data` at `/app/volumes/postgres` and
-  `redis-data` at `/app/volumes/redis`, read-only, for the disk figures only.
-  A deployment whose override puts either on a host path mounts that path
-  there instead; without a mount the page says Prism cannot see that disk.
-  New dependency: `rustix` (`fs`), already in the graph.
-
-### Changed (member blocks only, S2, #761)
-
-Member-blocks-only design S2 (`docs/internal/design/member-blocks-only.md`).
-
-- **Retention deletes stored blocks with no member side**, including those
-  stored before S1, and a removed member's own blocks of non-members and its
-  list blocks in every mode. The first nightly run after the upgrade deletes
-  the backlog in its usual paced batches;
-  `docs/internal/phaseb/pbmb1_member_blocks.sql` counts it beforehand.
-- Retention keeps a block, private block or list block only with a member
-  side: a `blocks` or `private_blocks` row whose author and subject are both
-  non-members goes, and a `list_blocks` row whose author is not a member.
-  Being in scope, or a private owner, no longer keeps one. The cleanup shows
-  in `retention_deleted_rows_total{table="blocks"}`, `{table="list_blocks"}`
-  and `{table="private_blocks"}`.
-- A `member_removed` purge deletes blocks of the member by non-members, the
-  member's own blocks and private blocks of non-members, and its list blocks
-  in every public-indexing mode. Blocks between it and another member stay.
-
-### Changed (member blocks only, S1, #760)
-
-Member-blocks-only design S1 (`docs/internal/design/member-blocks-only.md`).
-
-- **Blocks are stored only when a member is on one side** (member-blocks-only
-  design). A block, private block or list block is stored when its author is
-  a member, or (for direct and private blocks) when it names a member. An
-  account's other blocks are no longer stored because it is in scope through
-  follows or interactions, in any public-indexing mode. Rejections count as
-  `firehose_ops_skipped_total{reason="no_member_side"}`, and
-  `index.requestRecord` reports them as `outOfScope`. A block record edited
-  so that it no longer names a member removes the stored row. What members
-  see does not change: their own blocks, and others' blocks of them, are
-  stored as before. A non-member actor's `getRelationships`, when no
-  upstream AppView answers, now reports only its blocks with members.
-- The admin live feed counts these rejections in their own slot, "no member
-  side".
-- Rows stored before this change stay until S2's retention removes them.
-
-### Added (private media filters, S2, #758)
-
-Private-media-filters design S2 (`docs/internal/design/private-media-filters.md`).
-
-- **Media and video filters on the private author feed.**
-  `app.nearhorizon.private.getAuthorFeed` accepts `filter=posts_with_media`
-  (images or a gallery, also inside a quote with media) and
-  `posts_with_video`, as the public feed does, without repost items. Video
-  is not media under `posts_with_media`, as on the stock feed. A private
-  post counts when its PDS marks its media (`mediaKinds`) or its embed is
-  in the clear; posts stored earlier were indexed from their clear embed at
-  upgrade (S1). Pages skip posts without media, so they fill; cursors are
-  sealed per filter, and readability is unchanged. Any other value is 400
-  `"Error: filter must be posts_with_replies, posts_and_author_threads,
-  posts_with_media or posts_with_video"`. The lexicon lists the two values.
-- **The post as read decides.** A candidate whose embed, as read, lacks
-  the filter's media is left out and counted in
-  `private_feed_media_mismatch_total{filter}`; above zero means a PDS and
-  Prism disagree.
-- `getMembership` lists `private.mediaFilters`.
-- Upgrade Prism before a PDS you index re-runs its rewrite to add the
-  marker (see S1).
-
-### Changed (private media filters, S1, #757)
-
-Private-media-filters design S1 (`docs/internal/design/private-media-filters.md`):
-the index the media filters of S2 read. No visible change.
-
-- **Private posts are indexed by media kind.** At ingest, a private post's
-  media (images or a gallery, or a video, also as a quote-with-media's
-  media) is taken from its clear `mediaKinds` field when it has one, else
-  from its clear `embed`, in either `$type` vocabulary, by the public
-  feed's own classifier. External cards, plain quotes and a quoted post's
-  own media are not media. A `mediaKinds` that is not an array or is over
-  64 KiB is dropped and counted in
-  `private_ingest_field_dropped_total{field="mediaKinds"}`; a present one,
-  even dropped or empty, never falls back to `embed`. The record is never
-  refused for it. A new-form post without the field is indexed as having
-  no media. Prism never decodes a private post outside a read.
-- **Migration 0035** adds `private_posts.media_kinds` (a constant default,
-  no row rewritten), fills it for stored posts from their clear `embed`,
-  and builds two partial indexes holding only media posts, not
-  concurrently. Posts stored in the new form (no clear embed) are filled
-  when their PDS writes them again.
-- **New metric series:** `private_ingest_index_source_total{field="media"}`
-  (`source` as for quotes and mentions). The admin health page's "Quotes
-  and mentions" figures count only those two fields.
-- **Upgrade note: deploy this Prism before a PDS you index re-runs its
-  rewrite to add `mediaKinds`.** An older Prism drops the field with no
-  stored copy, and such a post stays out of the media filters until it is
-  written again.
-
-### Added (admin UI S3: health, jobs, problems, blocks, #755)
-
-Admin-ui design §6.1, §6.4, §6.6 to §6.8, §9 (`docs/internal/design/admin-ui.md`).
-
-- **Health** at `/admin/health`: the checks of §9.2 in plain words (database,
-  Redis, the audit guard, the stream reader, a held gap, the backlog, each
-  relay's delay, unprocessed records, dropped stream records, the database
-  budget, Redis memory, failed jobs, members not ready after a day, stuck
-  private sync, Farsight down, Farsight refusing the token, the fallback
-  withheld, the public-data clean-up stalled, settings set aside or waiting
-  for a restart, search still being prepared), each red, amber, a note,
-  fine, or "no data", never fine when its input is missing. Then the key
-  figures: relay delays, records waiting and processed per second, the
-  database and Redis against their limits, public data and a refill's
-  progress, search preparation, Farsight and lodestar, and private posts
-  read in the new and the older form, unreadable ones in the last hour, and
-  where ingest took quotes and mentions from. "Re-sync private data and
-  members" (typed `RESYNC`) sits beside a held gap. The page reloads every
-  30 seconds; its reload does not keep the session alive.
-- **Jobs** at `/admin/jobs`: sync jobs by kind and state, the 100 newest
-  failed ones with "try again" (a `backfill` of the same kind; subscribed
-  lists retry on their own), the nightly clean-up of the accounts Prism
-  follows (last and next run, failed runs, the weekly count repair), "Check"
-  (`scope rebuild --dry-run`, changes nothing) and "Clean up now" (typed
-  `REBUILD`), and a public-data refill's progress. The counts run under a
-  2-second statement timeout.
-- **Problems** at `/admin/problems`: the newest 100 records Prism could not
-  process, each with "try again" (`deadletter replay`) and "dismiss"
-  (`deadletter drop`, confirmed), and the network stream's state in words.
-- **Blocks (Farsight)** at `/admin/farsight`: Farsight's own report (asked at
-  most every 30 seconds), what Prism holds, the fallback and the memory of
-  blocks, with a link to their settings.
-- **Home** lists what needs attention first (the red and amber checks, each
-  linking to where to act) and gains tiles for public data, the network
-  stream, the database against its budget, Farsight and the last five
-  changes; the live feed's script refreshes the list with the tiles.
-- `serve` keeps the metrics recorder's handle and takes a snapshot of the
-  watched series every minute, the last hour kept in memory, so the checks
-  can ask "for five minutes" and "in the last hour". The metrics endpoint
-  is unchanged.
-- Command pages say the outcome of a clean-up check (how many accounts it
-  would keep, add and remove, and how many nightly runs that takes), a
-  re-sync, a job tried again and a dismissed record in words.
-
-### Added (admin UI S2: settings and restart, #754, #742)
-
-Admin-ui design §6.3, §8, §11, §12 (`docs/internal/design/admin-ui.md`).
-
-- **Settings pages** at `/admin/settings`: one page per group (who can use
-  Prism, what it stores, private posts, blocks, what apps see, extra
-  services, limits, profiles and caching, account lookups), each setting
-  with its plain explanation, the value saved now, the default, the value
-  `app.toml` writes if it writes one, the last change and whether it
-  applies at once or after a restart. Saving a page sends one `settings
-  set` command with every changed field. Public data keeps its own form
-  and command (typed `OFF`). Turning the Farsight fallback on (`ON`) and
-  the memory of blocks off (`OFF`) are typed. Two read-only pages: what
-  was set at install, and everything Prism is running with (URL passwords
-  removed). The registry holds §8.7's keys plus `scope.reply_quote_days`,
-  `like_repost_days`, `rebuild_grace_days` and `sweep_max_purges`
-  (scope-recency §5), `identity.lodestar_url`, `lodestar_request_rate_per_sec`,
-  `lodestar_request_burst` and `lodestar_timeout_ms` (lodestar-reads §2.14),
-  `video.playback` (public videos only), `private_notify.backfill_max_age_hours`
-  and `private_search.max_age_days`.
-- **Saved settings** live in `operator_settings` (migration 0034:
-  `version`, `set_aside`, `file_notice`, and `operator_settings_history`,
-  kept forever) and are layered over `app.toml` at every start, right
-  after the migration gate and before the memory of blocks is emptied.
-  `app.toml` is never written. A change is checked against a fresh read of
-  `app.toml` and the whole configuration with every saved value before it
-  is saved; one made from an out-of-date page fails. Keys valid only
-  together (the fallback pair, the memory block, the twelve timing floors,
-  each rate class, the bookmark counts, Farsight's rate, each network's
-  background rate, lodestar's rate) are applied and set aside together.
-- **The saved value wins over the file** (C-A7). A file change under a
-  saved value is recorded (`operator_setting_file_changed`), listed on
-  Home, and offered as "Use the file's value" or "Keep my value". A saved
-  value that no longer validates after an upgrade is set aside at startup
-  (`operator_setting_set_aside`, gauge `operator_settings_set_aside`) and
-  Prism starts without it; every page says so until it is fixed or cleared.
-- **Live settings:** `community.auto_enroll`, `enroll_pds_patterns`,
-  `max_members`, `max_auto_enroll_per_hour`, `never_ready_expiry_days`,
-  `threadlens.access`, `unspecced.check_email_confirmed`, `unspecced.live_now`,
-  `trends.descriptions` and `trends.suggested_topics` apply at the next
-  request; a change clears the auto-join refusals already cached. Every
-  other setting applies after a restart, and every page counts the changes
-  waiting for one. (`never_ready_expiry_days` is saved and read live, but
-  the hourly expiry task that uses it, membership design §3.2, is not built
-  yet, so it has no effect so far.)
-- **Restart** from the UI and `admin restart`: the command is settled
-  `done`, then `serve` shuts down as at SIGTERM and exits with code 75 for
-  its supervisor to start it again. Refused unless `APP_SUPERVISED=1`,
-  which the shipped `docker/docker-compose.yml` now sets on `app`.
-- **CLI:** `admin settings list`, `admin settings get <key>`, `admin
-  settings set <key> <value>` and `admin settings reset <key>`.
-
-### Changed (admin UI S2, #754)
-
-- `FileConfig` and its sections are serializable, so pages read any key's
-  current and default value.
-- `serve` exits 0 after SIGTERM as before, and 75 after a restart from the
-  admin UI.
-
-### Added (lodestar identity reads S5, #753)
-
-Lodestar-reads design §2.15, §6.2 (`docs/internal/design/lodestar-reads.md`).
-
-- **`admin identity compare [--sample N] [DID|HANDLE ...]`**, read-only:
-  resolves each account as with `identity.lodestar_url` empty (the PLC
-  directory and this app's own handle check) and as with it set (lodestar
-  first, with the same fallbacks), and prints one line per account: which
-  source answered each side, whether the documents (compared with their
-  methods and services as sets), the PDS endpoints and the verified handles
-  are the same, how the handle was decided, and both times; then counts and
-  the median and p90 of each side. A handle is compared both ways (its
-  account, then that account). `--sample N` adds N accounts from `actors` at
-  random, a few `did:web` and a few marked deleted. It asks lodestar whatever
-  the gate says, writes nothing and caches nothing; it needs
-  `identity.lodestar_url` set in the config it reads.
-- **`docker/README.md`, "Lodestar (identity reads)":** what lodestar is,
-  what this app reads from it and what never does, the fallback, what an
-  operator trusts it with, the comparison command, and the metrics.
-
-### Added (lodestar identity reads S4, #752)
-
-Lodestar-reads design §2.10 (`docs/internal/design/lodestar-reads.md`).
-
-- **Pages that route many accounts ask lodestar for them in one call.**
-  Before the upstream posts of a page are fetched author by author, and
-  before Thread Lens reads a level of replies or its stubs, the accounts the
-  route cache does not know are sent to lodestar's `POST /accounts` in
-  chunks of up to 1000. An account lodestar reports active, with a usable
-  PDS and either a verified handle or no claimed handle, is summarized from
-  that answer; every other account (unknown, catching up, tombstoned, a
-  handle not yet verified, `did:web`) is resolved one by one as before, with
-  its fallbacks.
-- Only for public requests, only while lodestar is at the directory's tip,
-  one token of lodestar's bucket per call. A batch draws nothing from the
-  requester's identity share and never ends a request early: a page names
-  more authors than one requester may resolve, and most of a reply level's
-  authors are never resolved at all. A failed or stale batch fills nothing.
-- Metric: `lodestar_batch_filled_total`.
-
-### Added (lodestar identity reads S3, #751)
-
-Lodestar-reads design §2.2 to §2.9, §2.11 (`docs/internal/design/lodestar-reads.md`).
-
-- **With `identity.lodestar_url` set, public request paths read identities
-  from lodestar first.** That is routing and summaries, `resolveDid`,
-  `resolveHandle`, actor parameters, the upstream fallbacks and Thread Lens,
-  for ordinary (public) requests only:
-  - **DID documents** (`did:plc`): `did_cache` first; then lodestar's
-    in-process document cache (100 000 entries, kept `did_fresh_secs`);
-    then lodestar's `GET /{did}`; then the PLC directory, as before. Lodestar
-    answering "not registered" (a DID created seconds ago), 400, 403, any
-    5xx, a timeout or a malformed answer falls back to the PLC directory;
-    "DID not available" is a tombstone.
-  - **DID → handle:** lodestar's verified `handle` from `GET /account/{did}`,
-    used only when lodestar is at the directory's tip and the handle equals
-    the document's claim; anything else (any other handle status, an error,
-    a stale answer) runs this app's own DNS and HTTPS check, as before.
-    Lodestar's "not verified" is never taken.
-  - **Handle → DID:** lodestar's `GET /handle/{handle}`, kept only when the
-    DID's document claims the handle back; otherwise (including a document
-    that no longer claims it) this app's own lookup runs, as before.
-- **Never from lodestar:** sign-in token keys (the JWT path and the members'
-  key table), admin sign-in, admin commands, auto-enrolment, the identity
-  refresher (account status and deletion), backfill and `list_sync` all read
-  the PLC directory only. `did_cache` never holds a lodestar document, so the
-  key path's cached documents are the directory's. Viewer-private and
-  private-context requests never ask lodestar; `did:web` is never asked.
-- **Budget:** lodestar's own bucket (`lodestar_request_rate_per_sec`,
-  `_burst`); an empty one skips lodestar and never refuses the request. The
-  PLC bucket is drawn only when the PLC directory is asked; the requester's
-  identity share is unchanged. No call passes the request's deadline.
-- **Metrics:** `lodestar_skipped_total{reason}` (`gate_closed`,
-  `no_budget`); `identity_cache_requests_total{cache="lodestar"}` for the
-  document cache.
-- A member's `did_cache` row is now refreshed by the key path's own fetch
-  and the members' key refresh rather than by public reads, so the backstop
-  finds a member's key under an hour old less often; the key path still
-  fetches from the PLC directory, at most once an hour per active member.
-
-### Added (lodestar identity reads S2, #750)
-
-Lodestar-reads design §2.1, §2.6, §2.13 (`docs/internal/design/lodestar-reads.md`).
-Lodestar is a read-only mirror of the PLC directory that also verifies every
-account's handle both ways; Prism can read identities from it first.
-
-- **`[identity] lodestar_url`, empty (off) by default.** Set, it must be an
-  `https` URL with a host and no query, fragment or credentials; a plain
-  `http` address is refused (the plain-http exception stays the PLC
-  directory's alone), and a private network address is refused at call time
-  like any other upstream. With it set, `serve` builds the lodestar client
-  and a probe that asks lodestar every 15 s where it stands
-  (`lodestar_enabled` is logged once, with its host). No read uses it yet.
-- **The freshness gate.** Lodestar is asked only while its last report said
-  it is live and fresh (at the directory's tip) and that report is under 45 s
-  old. An answer saying lodestar is unreachable, refused (403), failing or
-  behind closes the gate until the next good report; an answer about one
-  item (not found, a slow live handle resolution) never does. Transitions
-  are logged once each (`lodestar_gate_opened`, `lodestar_gate_closed`).
-- **Keys** `lodestar_request_rate_per_sec` (100) and `lodestar_request_burst`
-  (200), lodestar's own request bucket, checked like the other rates; and
-  `lodestar_timeout_ms` (1500, 100 to 10000), one call's limit. All read at
-  startup.
-- **Metrics:** `lodestar_calls_total{endpoint, outcome}`,
-  `lodestar_call_seconds{endpoint}`, `lodestar_fresh` (1 while the gate is
-  open).
-- `docker/config/app.toml` ships `lodestar_url = ""` and the three keys.
-
-### Fixed (tombstoned DIDs, lodestar identity reads S1, #749)
-
-Lodestar-reads design §2.4 (`docs/internal/design/lodestar-reads.md`).
-
-- **A tombstoned `did:plc` is now recognised as tombstoned.** The PLC
-  directory answers one with `404 {"message": "DID not available: …"}`, not
-  410, so Prism read it as "not found": the identity refresher retried it
-  eight times and dropped it, and the account was never marked deleted or
-  purged; `list_sync` retried a tombstoned list owner as a transient error
-  forever. A `did:plc` 404 whose message starts `DID not available` is now
-  `Tombstoned`, as 410 still is: the refresher marks the account deleted
-  and runs the `account_deleted` purge (as design-v2 §5.6 intended), and
-  `list_sync` reads the owner as tombstoned. Any other 404 is still "not
-  found". This applies whatever `identity.lodestar_url` says; the
-  refresher reads only the PLC directory, so a purge is only ever decided
-  by its answer.
-
-### Fixed (private video, #747)
-
-Private-video design (`docs/internal/design/private-video-pds.md`), which
-amends private posting's Addendum A.
-
-- **A private post's video always plays from the author's PDS.** Its view's
-  `playlist` is the MP4 blob (`com.atproto.sync.getBlob`) on the author's
-  PDS, with no `thumbnail`, whatever `[video] playback` says, so a private
-  video never depends on Bluesky's video service and Prism never points a
-  player at Bluesky's CDN for a private post. This holds wherever a private
-  post's video is shown: its own view, a quote of it, `recordWithMedia`
-  media, and every private endpoint. Before, the default `bsky_cdn` gave
-  private videos CDN URLs too, and a video the CDN did not have did not
-  play.
-- **`[video] playback` and `cdn_url` now govern public posts' videos only**,
-  including a public post quoted inside a private one. No key, default or
-  validation changes; the comments in the code and in
-  `docker/config/app.toml` say so.
-- A private video whose author's PDS Prism does not know gets no view, as an
-  image does; `record.embed` still carries it. A `recordWithMedia` quoting a
-  public post Prism does not show still has no `embed` at all, as before;
-  the client builds it from `record.embed`, and should take a private
-  post's video from the author's PDS too.
-- The `#privatePostView` lexicon's `embed` description says so.
-
-### Changed (private embeds, S2, #745)
-
-Private-embeds design S2 (`docs/internal/design/private-embeds-504.md`):
-the ingest side of #504.
-
-- **Quotes and mentions of a private post are indexed from its clear
-  `quote` and `mentionDids` fields when it has them**, else from its
-  clear `embed` and `facets` as before. A new-form post carries no clear
-  `embed` or `facets`, so its quote count, `getQuotes`, quote and mention
-  notifications and threadgate `mentionRule` come from these two fields;
-  Prism never decodes a private post outside a read. `quote` is read as
-  `{uri}` (an at-uri with a DID authority); `mentionDids` keeps its valid
-  DIDs, deduplicated. Either of the wrong type or over 64 KiB is dropped
-  and counted in `private_ingest_field_dropped_total{field}`; a present
-  field, even dropped or empty of valid values, never falls back to
-  `embed` or `facets`. The record is never refused for them. A new-form
-  post without the fields is indexed with no quote and no mentions.
-- **A private post's update notifies only new recipients, and only while
-  the post is recent** (within `private_notify.backfill_max_age_hours`,
-  48). A live create still notifies at any age. A rewrite of an existing
-  post (for example a PDS re-encoding its posts) no longer notifies anyone
-  again; nor does a recipient the previous version already named, member
-  then or not. Public records naming a private post notify as before.
-- **New metrics:** `private_ingest_index_source_total{field="quote"|"mentions",
-  source="dedicated"|"clear"|"none"}`, one per `postPrivate` op and field;
-  `private_notify_suppressed_total{reason="old_update"|"known_recipient"}`.
-- The comment on `[private_notify] backfill_max_age_hours` (in the code and
-  in `docker/config/app.toml`) says it now bounds live updates of private
-  posts too. No setting changes, and no migration.
-- Upgrade note: posts a PDS wrote in the new form while Prism ran an older
-  version are indexed with no quote or mentions until they are written
-  again (the PDS's next re-encoding run re-derives them).
-
-### Changed (private embeds, S1, #744)
-
-Private-embeds design S1 (`docs/internal/design/private-embeds-504.md`):
-the read side of #504.
-
-- **Private posts may encode their facets and embed.** A private post's
-  `encodedContent` can now carry its text, facets and embed together (a
-  leading 0xFF byte, then JSON); Prism reads both that form and the
-  text-only one. The payload's `facets` and `embed` replace the clear ones
-  key by key; each gets the checks a clear field gets (`facets` an array,
-  `embed` an object, at most 64 KiB, blob refs normalized) and is left out
-  otherwise. Nothing else in the payload is read, and `embedBlobs`,
-  `mentionDids` and `quote` never reach a view. Search matches the
-  restored text. Prism never decodes a private post outside a read.
-- **A payload Prism cannot restore is a uniform miss**, counted as
-  `private_read_outcome_total{outcome="bad_content"}`: JSON that does not
-  parse or is not an object, no string `text`, nesting deeper than 128,
-  or a decoded payload over 1 000 000 bytes. An `encodedContent` over
-  1 000 000 bytes is not decoded at all (the same miss). No lexicon-valid
-  record reaches either bound.
-- **New metric:** `private_read_content_total{form="text"|"content"}`, one
-  per decoded hit, shows a PDS's conversion from the read side.
-- Upgrade Prism before a PDS you index starts writing the new form: an
-  older Prism leaves such posts out (`not_utf8`).
-
-### Fixed (scope recency tests, #741)
-
-- The image build's private-table source check refused S2: two sweep tests
-  (T-R7, T-R11) wrote `private_posts` from `src/aggregations/`. They now go
-  through a test-only `private_tier::test_rows`, so no private table is
-  named outside `src/private_tier/`.
-
-### Changed (scope recency, S2, #741)
-
-Scope recency design S2 (`docs/internal/design/scope-recency.md`): what
-holds an account in scope is checked every night, and accounts nothing
-holds leave. Ships together with S1 (#740).
-
-- **Default change: `scope.rebuild_grace_days` is now 0 (was 7).** An
-  unfollow, an unlike or a lapsed interaction now takes effect at the next
-  nightly check. The shipped `docker/config/app.toml` sets 0. **A
-  deployment whose own `app.toml` sets `rebuild_grace_days = 7` keeps the
-  old slack until it changes it to 0**; above 1, startup logs
-  `scope_grace_slows_unfollow`.
-- **Upgrade note: the first nightly check removes every account nothing
-  holds any more**, most of all accounts held only by an old like, repost,
-  reply or quote. It runs at least 23 hours after the first start of this
-  version; before it, `admin scope rebuild --dry-run` shows its size
-  (`would_purge`, by the reason bits, and how many nights it takes at the
-  cap). Their public rows go at the retention run that follows. Activity
-  subscriptions to such an account whose subscriber no longer follows it
-  (they never notified) are deleted with them.
-- **The nightly scope check** replaces the shrink half of the weekly
-  rebuild. It runs one hour before `retention.run_at_utc` (03:00 UTC by
-  default), checked every 5 minutes; a restart over the slot runs it at
-  the next check, and a failed run is retried an hour later. What holds an
-  account: membership; a member's follow within
-  `scope.max_follow_scope_per_member`; a member's like or repost within
-  `scope.like_repost_days` of its date; a member's reply or quote within
-  `scope.reply_quote_days`; and a member's active activity subscription.
-  An account nothing holds leaves through the `out_of_scope` purge, 100 ms
-  apart, at most `scope.sweep_max_purges` (5000) a night; the rest go on
-  later nights. A half-done `out_of_scope` purge is finished first.
-- **The purge re-checks at the last moment.** Each removal's marker, under
-  the write guard and the account's lock, skips the account if a member's
-  write named it since the check began, it became a member, its row was
-  refreshed, a member's follow inside the cap names it (including one an
-  unfollow just brought under the cap), or a member's subscription holds
-  it. Nothing is written for a skipped account.
-- **Activity subscriptions hold, and never grow, scope** (decided by
-  skydeval). A member's subscription keeps its subject indexed while the
-  member is a member and follows the subject, under every policy but
-  `members_only`. Subscribing to an account outside scope is still
-  refused. `putActivitySubscription` now writes under the scope read
-  guard, so a subscription and a removal of its subject never cross.
-- **One run at a time.** `admin scope rebuild` runs one nightly check
-  (after any running one, with the same cap and pacing) and then the counts
-  repair; its result says `"scheduled": "scope_sweep"`. `--dry-run` also
-  reports `would_purge_by_reasons` and `sweeps`.
-- **Weekly** now does only the counts repair and the stale re-syncs.
-- **Metrics:** `scope_sweep_runs_total{outcome}`,
-  `scope_sweep_purged_total`, `scope_sweep_skipped_total{reason}`
-  (`touched`, `member`, `refreshed`, `followed`, `subscribed`, `busy`,
-  `capped`), and the gauge `scope_dids_by_hold{hold}` (`member`, `follow`,
-  `interaction`, `subscription`, `none`). Events `scope_sweep`,
-  `scope_sweep_failed`; the weekly `scope_rebuild` event now reports the
-  re-syncs only.
-
-### Changed (scope recency, S1, #740)
-
-Scope recency design S1 (`docs/internal/design/scope-recency.md`): a
-member's old interactions no longer pull accounts into scope.
-
-- **Deploy S1 and S2 together.** S1 stops stale growth on the write path
-  only; until S2 the weekly scope rebuild is unchanged and still adds the
-  subjects of every member interaction, however old.
-- **Growth looks at the record's date.** A member's like or repost adds
-  its subject to S only when its `createdAt` (clamped to the write time
-  plus 5 minutes, as every stored date is) is within
-  `scope.like_repost_days`; a reply or quote adds the accounts it names
-  only within `scope.reply_quote_days`. A stale interaction is stored
-  exactly as before and grows nothing. This holds on every write path, so
-  a new member's backfill adds the subjects of its recent likes, replies
-  and quotes and no older ones. Follows are unchanged. A subject written
-  as a handle instead of a DID never grows S.
-- **New `[scope]` keys** (restart): `reply_quote_days` (default 90,
-  0–3650), `like_repost_days` (default 30, 0–3650); 0 turns that kind off.
-  `sweep_max_purges` (default 5000, 1–1,000,000) is read by S2's nightly
-  check. `rebuild_grace_days` is now range-checked, 0–30: a deployment
-  that sets it above 30 fails to start (exit 78) until it is lowered. The
-  shipped `docker/config/app.toml` lists the three new keys. Under a
-  policy without interactions, startup logs `scope_windows_unused`.
-- **Migration 0033** (`0033_scope_recency`) replaces the index
-  `member_post_refs_author` with `member_post_refs_author_created
-  (author_did, created_at)`; no rows change. Like every migration it needs
-  `APP_ALLOW_STARTUP_MIGRATE=1` for one start.
-- **Metric** `scope_growth_stale_total{kind}` (`like`, `repost`, `reply`,
-  `quote`): interactions too old to grow S.
-
-### Added (admin UI live feed, #245)
-
-Admin UI live feed (`docs/internal/design/admin-ui-live-feed.md`): Home
-shows what Prism indexes as it happens, and Activity is now the audit log.
-
-- **Operator action for a deployment with its own Caddyfile:** proxy
-  `/admin/live` without `encode` and with `flush_interval -1`, as the
-  shipped `docker/Caddyfile` now does; otherwise the compressor can hold
-  the stream back.
-- **Home's live feed.** One line per record the writer applies, from the
-  network (with the relay's label), backfill, `requestRecord` and its
-  catch-up, and identity events that queued a refresh: time, source,
-  action, kind and author (stored handle, else the DID), and for a written
-  public post its first 100 characters, cleaned
-  (`admin.live_feed_snippets`, file-only, default on). Never a private
-  post's content, an audience's members, an encoded body or any record's
-  subject. Newest first, 200 lines, pause and resume, kind and source
-  filters, about 50 lines a second per viewer; the rates beside it
-  (indexed by kind, skipped and rejected by reason) are exact. With
-  JavaScript off, Home shows the totals since Prism started and the last
-  minute's rates, and reloads itself every 30 seconds.
-- **The tap.** `Writer::apply_from` (with the relay label; `apply` keeps
-  its signature) tells the tap about every op at its two successful
-  returns, after commit and outside the scope guard. It always counts;
-  only while a stream is open, and only for a kind some stream wants, does
-  it build a line, at most 100 a second per (network or other, kind), on a
-  lossy broadcast of 4096. It never waits: a slow browser misses lines.
-- **The stream** `GET /admin/live` (server-sent events): a session and the
-  page limit at open, answered `401`, `429` or `503` and never a redirect;
-  the session re-checked every minute and at its own expiry; `end` with a
-  reason; two pages per session and eight streams in all (a refused open
-  ends nobody); renewed silently every 30 minutes; `Cache-Control:
-  no-store, no-transform`; a keepalive every 15 seconds; ended at shutdown
-  so a restart is not held. Watching (the stream, the tiles refresh at
-  `/admin/tiles`, Home's reload with JavaScript off) does not keep a
-  session alive.
-- **One script, on Home only**, compiled in at a hashed path; Home alone
-  has `script-src 'self'; connect-src 'self'` in its policy. Every
-  `/admin` response is now `Cache-Control: no-store, no-transform`.
-- **The audit log** at `/admin/audit`, last in the navigation;
-  `/admin/activity` answers `308` there with its query.
-- Metrics `admin_live_streams`, `admin_live_lines_not_shown_total{why}`,
-  `admin_live_handle_lookups_total{outcome}`.
-- **Home's layout:** the "Recent changes" card is gone (the audit log has
-  them); Members sits in a narrow column (about 22%) with the live feed
-  beside it, stacked Members-first below 48rem. A network line's relay
-  reads "network · first via <relay>", since a commit is applied from
-  whichever relay delivers it first.
-- **Two tickers instead of a growing list** (changed by skydeval): "On the
-  firehose" shows every arriving op, marked indexed, skipped or rejected
-  (dimmed, with the reason), duplicate (dimmed) or failed; "Indexed here"
-  shows only what this instance wrote. Each is 14 rows high with no
-  scrollbar; a line enters at the top every 200 ms from a queue of the
-  newest 20, and lines past the 16th leave the page. Pause freezes both;
-  the filters apply to both. The tap now builds lines for every outcome,
-  sampled on two lanes with their own budgets so skipped ops never crowd
-  out indexed ones; nothing is built with no stream open. Each stream
-  sends at most 25 lines a second per ticker. A line that was not indexed
-  never carries text, and snippets appear only under "Indexed here".
-- **A still Live card, a help button, and tickers that survive a reload**
-  (changed by skydeval, second pass). Nothing on Home moves when events
-  arrive: each column of figures always has three rows (blank rows fill a
-  short one; a long one ends in "+N more", the rest in its tooltip), rows
-  and the status pill keep one size, numbers keep their width, and the
-  "since" line is short ("Since Oct 19, 19:02 UTC") and one line (two on a
-  phone). The sampling sentence moved behind a "?" button by the Live
-  heading, a help panel over the card (Escape closes it) that also says
-  what the tickers, "first via", "duplicate" and the dimmed reasons mean.
-  A new stream starts with a `backlog` event: each ticker's newest 20
-  lines, kept in memory only, through the stream's filters, none older
-  than 15 minutes, so a reload repaints both tickers at once. "Indexed
-  here" is kept filled with nobody watching (on the indexed lane's
-  budget); "On the firehose" fills only while a stream is open and keeps
-  its lines after. Every line carries a number, so a reconnect never
-  shows a line twice.
-
-### Fixed (admin UI forms)
-
-- **Every admin form failed with "This form expired" in a browser.** The
-  admin pages sent `Referrer-Policy: no-referrer`, under which browsers
-  send `Origin: null` on form POSTs, and the Origin check refused it. The
-  admin pages now send `Referrer-Policy: same-origin`: a same-origin form
-  carries Prism's own Origin, and nothing is sent to other sites.
-
-### Added (web admin UI, S1, #245, #735)
-
-Admin UI design S1 (`docs/internal/design/admin-ui.md`): an admin UI
-served by `serve` itself under `/admin`, with first-run setup, operator
-sign-in, members and activity.
-
-- **Upgrade note: an upgraded deployment has no operator, so it enters
-  first-run setup.** Read the setup code with `docker compose logs app |
-  grep admin_setup_code` and finish at `https://<host>/admin/setup`, or
-  run `admin operator add <handle-or-did>` (`docker/README.md`, "Web admin
-  UI").
-- **The shell.** Server-rendered pages (askama templates, no JavaScript),
-  merged before the final router so they sit inside the global per-IP
-  limit and the CORS layer. Every `/admin` response carries
-  `Cache-Control: no-store` (the content-hashed stylesheet is cached for a
-  year), a `Content-Security-Policy` of `default-src 'none'`,
-  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
-  `X-Content-Type-Options: nosniff`; request bodies are capped at 64 KiB.
-  The look follows Farsight's admin UI (C-A1 (b)); every colour and size
-  is a token at the top of `src/admin/static/admin.css`. `admin.web_ui =
-  false` mounts no `/admin` route.
-- **First-run setup.** While no operator exists, `serve` keeps a setup
-  code (`prs-XXXXX-…`, 128 bits): its BLAKE3 hash in `admin_setup_code`,
-  the code itself only in `admin-setup-code` (0600) in the data directory.
-  It is printed at `warn` (event `admin_setup_code`, the only line that
-  carries it) at every start and every 10 minutes, kept across restarts
-  while unexpired and its file intact, and renewed after 24 hours.
-  `/admin/setup` takes the code and a handle or DID, then signs in with
-  ATProto OAuth; the callback consumes the code in the transaction that
-  adds the first operator and its server's exact host. Wrong codes past
-  five a minute from one address (an IPv6 /64 as one) are delayed two
-  seconds each, with at most 16 delayed at once (beyond, `429`); a correct
-  code is checked first and never refused. With an operator, setup
-  answers 404 and startup deletes the row and the file.
-- **Sign-in and sessions.** ATProto OAuth (PAR, PKCE, DPoP, scope
-  `atproto`, public client at `/admin/oauth/client-metadata.json`), every
-  fetch through the guarded public transport. Only an operator whose PDS
-  host is allowed starts a flow; anyone else is refused before any request
-  to their server. The callback checks `iss` against the stored issuer and
-  the token's `sub` against the DID, resolves the DID afresh, and requires
-  the same PDS endpoint the flow started from; the tokens are revoked and
-  dropped. Sessions (`__Host-prism_admin`, only its hash stored) end after
-  `admin.session_idle_secs` (8 h) unused or `admin.session_max_secs`
-  (7 days). The DID is resolved afresh before every change and at least
-  every 5 minutes: a changed PDS endpoint, or a host no longer allowed,
-  ends the session; a failed resolution refuses the request and keeps it.
-  **An empty allowed-host list allows any host** (C-A3 (b)); the operator
-  list still decides who signs in.
-- **CSRF and confirmations.** Every form carries a token keyed on the
-  session cookie (setup and sign-in a pre-session double-submit token), a
-  POST whose `Origin` is not this host is refused, and removal and denial
-  need a confirmation with the account's handle (or the last eight
-  characters of its DID) typed in.
-- **Members** (`/admin/members`, #735): members with readiness, first
-  ready, whether they have private posts and "not receiving this member's
-  updates since …"; the count against `max_members`; auto-join and its
-  hosts; the denials. Add, remove, deny and allow, each an admin command.
-- **Activity** (`/admin/activity`): every command, newest first, with who
-  asked, the outcome in words and the raw result behind "details",
-  filterable by who, what and state; the sign-in log. **Operators**
-  (`/admin/operators`): operators and allowed servers, with add and
-  remove for both.
-- **`requested_by` on the command queue.** `admin_commands.requested_by`
-  is the operator DID of a command made in the UI, NULL from the CLI. The
-  executor hands the requester to every handler, so `member_denials.denied_by`,
-  `operator_settings.updated_by` (public indexing) and the operator
-  tables' `added_by` record the operator's DID or `cli`.
-- **CLI:** `admin operator add <handle-or-did> [--note]`, `admin operator
-  remove <did>`, `admin operator list`, `admin operator host add|remove
-  <pattern>` and `admin setup-code` (read-only). `operator add` allows the
-  account's exact host unless a pattern covers it, and with no operator
-  yet closes setup in the same transaction; `operator remove` never
-  removes the last operator; `host remove` refuses to leave no operator
-  whose last known host is allowed.
-- **Migration 0032** (`0032_admin_ui`): `admin_operators`,
-  `admin_operator_hosts`, `admin_setup_code`, `admin_sessions`,
-  `admin_oauth_states`, `admin_logins`, and
-  `admin_commands.requested_by`. Retention deletes expired sessions,
-  unfinished sign-ins after 10 minutes and sign-in rows after 90 days.
-- **Config:** `[admin] web_ui = true`, `session_idle_secs = 28800`,
-  `session_max_secs = 604800` (file-only).
-- **Metrics and events:** `admin_commands_enqueued_total{command}`,
-  `admin_session_cut_total{reason}`, `admin_setup_attempts_total{outcome}`;
-  events `admin_setup_code`, `admin_setup_completed`, `admin_login`,
-  `admin_login_refused{reason}`, `admin_session_cut{reason}`,
-  `admin_command_enqueued`, `operator_added`.
-
-### Changed (membership not tied to hosting, S1, #733)
-
-Membership design S1 (`docs/internal/design/membership.md`): membership is
-the one fact, the operator can exclude a DID, and hosting no longer makes
-anyone a private owner.
-
-- **Upgrade note: a non-member hosted on a community PDS no longer owns
-  served private posts.** Until now a DID whose PDS matched the
-  `community` network's `pds_patterns` and answered `getRepoStatus` was a
-  private owner without being a member, so its private posts, its
-  audiences and the replies under them were served. Now only a member is
-  an owner (C-M1 (b)). Migration 0031 drops those owners' readiness, their
-  repo-head state and their queued `private`/`authz` jobs. Their rows stay
-  stored, and an `admin member add` serves them again once the member's
-  `private` job has run. **Before upgrading**, run PB-M2's queries
-  read-only (`docker/README.md`, "Before the 0031 upgrade") and
-  `admin member add` everyone listed who should stay an owner; anyone left
-  off goes dark at the upgrade.
-- **`admin member deny <did> [--reason <text>]`.** Writes a denial
-  (`member_denials`). For a member, the denial and the removal are one
-  transaction: the `member_removed` purge's marker, whose batches and end
-  then run in the background as for `member remove`. For a non-member the
-  denial alone is written. The result is `{did, status: denied |
-  already_denied, removed}`. A second deny keeps the first one's time and
-  author and replaces the reason only when one is given. The reason is the
-  operator's note and is never shown to the DID.
-- **`admin member allow <did>`** deletes the denial and adds nothing
-  (`status: allowed | not_denied`). `admin member add` of a denied DID
-  fails with "denied; `admin member allow` first". `deny` and `allow` wait
-  on a running purge of the DID, as `add` does, so the three keep their
-  order.
-- **`admin member list --denied`** lists the denials.
-- **Auto-enroll refuses a denied DID**, checked first among its refusals,
-  counted as `auto_enroll_refused_total{reason="denied"}`, answered
-  `notEligible` like every refusal, and never cached, so `allow` takes
-  effect at the next call. Auto-enroll's default is unchanged in this
-  release.
-- **A non-member's `private` or `authz` job ends `done` at once**, with no
-  call to its PDS: the community-PDS confirmation, its daily
-  re-confirmation and `member remove`'s re-confirmation are gone, and
-  `member remove`'s result has no `eligibility` field.
-- **Migration 0031** (`0031_membership`) creates `member_denials`, drops
-  `private_owner_eligible` and the `actors` columns
-  `eligibility_failure_count` and `eligibility_failing_since`, after the
-  owner changeover above.
-- **Metrics:** `member_denials_total` (gauge, sampled with
-  `members_total`). Removed: `eligibility_cleared_total`. Events
-  `member_denied` and `member_allowed`.
-- The purge marker takes a guard (`MarkerGuard::{None, Expiry, Deny}`,
-  outcome `Marked` or `Skipped`); a `Skipped` marker writes no
-  `purging_dids` row, clears nothing and runs neither the batches nor the
-  end. `Expiry` is for the never-ready expiry of a later slice.
-
-### Test reliability (#716)
-
-Five tests that failed under the full suite's load on silonew, and passed
-alone, now decide on events rather than on the machine's speed. Each was
-re-checked against a deliberately broken build, and still fails.
-
-- **F2 consumer tests** (`a_slow_consumer_tail_anchors_after_the_window`,
-  `a_hung_database_stays_oldest`, and `a_stall_after_an_oldest_anchor_stays_oldest`,
-  which has the same shape). A re-anchor's mode depends on how many
-  entries arrived since the last one, and the fixed-rate test producer
-  kept adding while the consumer sat in a gap transaction or was held
-  before `reanchor`. On a 300-entry stream at 600 a second, a gap
-  transaction slowed by the loaded test database took a whole span, so an
-  oldest anchor was followed by another span decision instead of a tail.
-  The producer now holds while the consumer's `gap_blocked` is set or
-  `BEFORE_REANCHOR` is held (new `hooks::holding`), and skips missed ticks
-  instead of bursting.
-- **`b74_a_held_list_row_never_slows_a_members_mute`** and
-  **`b65_a_mute_never_waits_on_a_batch_holding_its_list`** (#716). The 1 s
-  per-request ceiling is gone. The row is held until every request has
-  answered and nothing on a request's path sets a `lock_timeout`, so a
-  request that waited on it would never answer; answering while it is held
-  is the proof, under a 30 s limit that only stops a hang. The 2.07 s
-  answer of #716 completed with the row still held, so it was load and not
-  a wait. The B-74 200 ms bound is still held by the median.
-- **`anonymous_reads_are_limited_per_ip`.** It used the default 30/s
-  refill, which refilled the bucket while a loaded machine sent its 80
-  requests. It now uses the default burst with a refill of 0.001/s and
-  asserts the first 429 is exactly the request after the burst.
-- **`detail_requires_a_verified_token`.** The probes' 2 s timeout made the
-  public-indexing read answer `{"read_error":"timed out"}` under load.
-  `HealthState` gains `probe_timeout` (production sets `PROBE_TIMEOUT`,
-  unchanged); this test uses 60 s, since the answers are what it checks.
-
-### Added (embedded profiles and the background refresh, #732, #731)
-
-- **Accounts outside the community show real profiles in list views
-  (#732).** Design-v4 §8.1's three tiers, as the profile refresh design
-  specifies, for every embedded profile of an account outside
-  `scope_dids ∪ members`: `rt` hits, then one synchronous upstream
-  `getProfiles` walk of the cascade, then the minimal form plus the
-  background refresh queue.
-  - One budget per request and mode: 25 accounts and an 800 ms window that
-    the request's first batch opens, shared by every hydration step of the
-    request (a feed's reposters now share its authors' batch). A
-    viewer-private or private-context part of a request has its own.
-  - The batch, and the thread anchor's author and `getList`'s and
-    `getStarterPack`'s top-level creators (which take the per-account
-    path), draw on a detached exhaustion record: an empty share ends that
-    fetch but never cuts a page or turns a response into a 429.
-  - Viewer-private listings (`getMutes`, `getListMutes`' creators,
-    `listActivitySubscriptions`) run the batch on the viewer's share into
-    the viewer's own cache, with no negative entry and no queue (C-P1 a).
-    Private-context hydration fetches nothing, as before.
-  - Thread Lens nodes built from a record, and `getAuthorPolls`' PDS-path
-    author, take the tiers through an author pass that computes no viewer
-    state, so it asks Farsight nothing.
-- **Negative profile entries.** An account every callable network answered
-  without gets `rt:profile-neg:{did}` for `cache.profile_negative_ttl_secs`;
-  list views then show it in the minimal form without asking. `getProfile`
-  and `getProfiles` never read it. `rt` entries now live by key class
-  (`cache.profile_ttl_secs` for profiles, `farsight.cache_ttl_secs` for
-  Farsight pair answers, 300 s otherwise).
-- **`getProfiles` asks once.** Handles resolve four at a time; out-of-scope
-  subjects take positive `rt` hits, then one walk of the cascade for all
-  the rest, and are normalized together (one Farsight lookup per request).
-  A subject no network has is omitted, with no Slingshot fallback. It
-  never queues.
-- **Background profile refresh.** One task drains the queue in batches of
-  25, grouped by a cache-only read of the `route` cache (it never resolves
-  an account), waiting on each network's own background bucket
-  (`background_rate_per_sec`, `background_burst`) with
-  `origin="background"`. A transient answer drops the batch with no retry;
-  a `community` route is walked like an unrouted account (C-P2 b).
-- Config: `cache.profile_ttl_secs` (3600), `cache.profile_negative_ttl_secs`
-  (900, at most the former), `cache.profile_refresh_max` (10 000), and
-  `background_rate_per_sec` (1.0) and `background_burst` (2) on each
-  `[[constellation.networks]]` entry (ignored on `community`).
-- Metrics (finishes #731): `profile_batch_fetch_total{network,result}`,
-  `profile_refresh_queue`, `profile_refresh_dropped_total`,
-  `profile_refresh_completed_total` and `profile_refresh_negative_total`.
-
-### Fixed (embedded profile rows, #734)
-
-- **A member could tell whether an account had a private tie (#734).**
-  Embedded profiles rendered from any stored `actors` row, and the
-  moderation gate read any row's `account_status`. Rows exist for private
-  owners (their identity and profile) and for the authors of private
-  replies to members (PDS and handle), so muting or blocking such an
-  account and reading `getMutes` or `getBlocks` showed its handle,
-  display name, avatar, description, pronouns, `createdAt` and
-  `indexedAt`, where an unknown account shows `handle.invalid`. The same
-  held for list creators in `getListMutes` and `getListBlocks` and for
-  Thread Lens authors. A deactivated owner's entry, or its lists, were
-  left out of `getBlocks`, `getListMutes` and `getListBlocks`, its Thread
-  Lens nodes were not found, and `getProfile` answered
-  `AccountDeactivated` instead of the cascade's answer.
-  - As design-v4 §8.1 "Embedded profile views" and §11 G-9 specify
-    (R3-143), a row, its stored status and declaration records, and the
-    gate's status read are used only for accounts in `scope_dids` and
-    members, on every public path. Any other account renders exactly as
-    one never seen, so its rendering no longer depends on private facts.
-  - Private-context hydration (the private tier's own views) still
-    renders every stored row and reads every status, as §8.1 specifies.
-  - Out-of-scope accounts now render in the minimal form on list views
-    until the profile batch and refresh queue of design-v4 §8.1 land
-    (#732). On prism this affects only accounts outside S on the four
-    lists above and on Thread Lens.
-
-### Added (metrics audit, #730, #731)
-
-- **The Farsight fallback's own series (#730).** As design-v4 §14.2
-  specifies: `farsight_fallback_discarded_total` (answered calls whose
-  answer guard 1 discarded because Farsight answered meanwhile),
-  `farsight_fallback_pairs_total{result}` (one per account of an answered
-  call: `blocked`, `clear`, `invalid`, `not_found`, `missing`, or
-  `dropped` by guard 2), `farsight_fallback_blocks_applied_total` (blocks
-  a fallback answer applied) and the gauge
-  `farsight_fallback_ledger_entries` (notes in the ledger, sampled with
-  the gate's gauges once a second). `inbound_list_blocks_applied_total`
-  counts every inbound list block the ordinary reader applies to a
-  response, whatever its source.
-- **Operators: two Farsight renames.** `farsight_fallback_calls_total{class}`
-  is now `farsight_fallback_requests_total{endpoint, class}`, with the XRPC
-  method served as `endpoint`. `farsight_calls_total{outcome}`'s value
-  `refused_address` is now `refused` (`requestBackfill` and `getStats`
-  keep `refused_address` in their own reasons). Update any rule or
-  dashboard that names the old ones.
-- **`farsight_fallback_skipped_total{reason}` follows the design's
-  reasons.** `stopped` is now `actor_stop`. A call past the request's call
-  cap counts `call_cap`, and one not made because the request's fallback
-  allowance was spent counts `allowance`; `deadline` now counts each call
-  not made, not each request. A guard-1 discard was counted here as
-  `farsight_answered`, which no longer exists: it is
-  `farsight_fallback_discarded_total`. An empty share or pool is still
-  one reason, `no_budget`.
-- **Private tier, backfill and list-sync gauges (#731).** Sampled with
-  the backfill gauges every minute: `private_owners_not_ready_total`
-  (private owners with no readiness), `private_tier_last_event_age_seconds`
-  (seconds since the live firehose last delivered a private-tier op;
-  seeded at a start from the newest private row, 0 with none; over 24 h
-  while private rows exist it logs `private_tier_ingest_stale`),
-  `authz_daily_backlog_seconds` (how long the oldest due `authz` job that
-  has not completed has waited; past 24 h it logs `authz_budget_exceeded`
-  once), and `backfill_jobs{depth="list_sync", state}`, which the sampler
-  left out. The storage sampler adds `list_sync_slow_owners`,
-  `list_sync_cut_owners` and `list_sync_weekly_overdue` (owners with a
-  subscribed list whose last complete listing is more than 8 days old).
-- **`index_request_total{status}`**: `requestRecord` calls that completed,
-  by the status returned, beside `index_request_catch_up_total`.
-- **`list_purpose_writes_total{path, result}`**: each purpose written to a
-  subscribed list, from the firehose (`ingest`) or a sync (`sync`), by what
-  was stored (`modlist`, `other`, `none`). Operators:
-  `list_purpose_write_errors_total` now carries the same `path` label; the
-  unlabelled series is gone.
-- **XRPC surface and search timings (#731).**
-  `xrpc_method_not_implemented_total` (unknown methods answered by the
-  router's `501`), `xrpc_wrong_method_total` (wrong-verb `400`s),
-  `sort_fallback_total{endpoint}` (listings served `latest` with
-  `X-Prism-Sort-Fallback`), `auth_budget_exhausted_total` (the auth-path
-  `429` when an issuer lookup runs out of budget), and the histograms
-  `search_duration_seconds{endpoint}` (each search query, timed-out ones
-  included), `trends_refresh_seconds` and `suggestions_refresh_seconds`.
-- **Identity, auth and budget metrics (#731).**
-  `identity_cache_requests_total{cache, result}` (every read of the DID
-  document caches, `hit` or `miss`; `cache` is `internal`, as no separate
-  public identity cache exists yet), `cascade_request_deadline_exceeded_total`
-  (cascades that found the request's deadline past),
-  `auth_member_verify_exhausted_total` (the per-member `429`),
-  `auth_claims_precheck_failed_total` (tokens failing the claims pre-check),
-  `member_pool_allowance_exhausted_total` (member issuer lookups whose
-  issuer-refresh allowance was spent), `viewer_private_cache_evictions_total`,
-  and the gauges `viewer_private_cache_entries` and `host_budget_buckets`,
-  sampled at startup and every 15 s. Operators:
-  `handle_resolutions_total` gains the `intent` label, `public` for
-  `resolveHandle` and `internal` for indexing work's handle checks; the
-  series without it are gone.
-- **`docker/README.md`: the metrics (#730, #731).** The
-  `PrivateTierIngestStale` and `AuthzBudgetExceeded` alert examples now
-  have series to fire on, and say what they measure. New `ListSyncStuck`
-  (`list_sync_running_age_seconds > 6750`) and `SearchTimeouts`
-  (`rate(search_timeout_total[5m]) > 0.1`) examples. A section on
-  Farsight's fallback and memory: off by default, what the fallback
-  discloses, when it asks, measuring Farsight under load first, its load
-  on the other AppView, what the memory stores and for how long, and
-  their metrics. A one-line list of every other series.
+Any account's pronouns and plural-system records are readable from
+Horizon-Prism, and posts carry their fronters.
 
 ### Added
 
-- **The `standin-hosts` test feature (Phase B stand-ins, #676).** Off by
-  default and never in a deploy build. A `[standin]` section lists origins
-  `http://<private IP literal>:<port>` (RFC 1918 or ULA, never `.0`, `.1`
-  or `.255`, at most 8), each with the intents (`public`, `internal`) whose
-  clients may reach it; `viewer_private` cannot be named. On a request's
-  first hop only, the URL policy lets a listed origin through; redirects
-  never use it and the DNS guard is unchanged. `farsight.url`,
-  `microcosm.slingshot_url`, `microcosm.constellation_url`, a network's
-  `appview_url` and a private-literal `identity.plc_url` take `http` only
-  on an origin listed for every intent their clients use.
-  - Locks: the feature does not compile without debug assertions (build
-    it with the new `standin` profile); a featureless build refuses a
-    `[standin]` section; a feature build's `serve` refuses to start
-    without one; it prints `HPRS_STANDIN_HOSTS_BUILD` on stderr and logs
-    `standin_hosts_build` at error level before its config loads, and
-    exports the gauge `standin_hosts_build`. `docker/Dockerfile` clears
-    cargo flags, refuses a repository cargo config, copies the binary to
-    `/out` and fails the image if that binary carries the marker or is
-    missing.
-  - The `farsight.url` scheme rule moved to config validation, its texts
-    unchanged. Outbound clients no longer send a `Referer` on redirects.
+- **`app.nearhorizon.plural.getRecords {actors?, members?}`**: for any account,
+  member or not, its `app.nearhorizon.actor.pronouns`, `plural.system`,
+  `plural.front` and named `plural.member` records, so a reader's browser never
+  asks an author's server. Each answer is `record`, `none` or `unknown`; `none`
+  only when the account's repository was listed and the firehose is within
+  `plural.max_stream_lag_secs`. Up to 50 accounts and 100 member URIs a call; no
+  sign-in needed; short public `cache-control`.
+- **`app.nearhorizon.plural.listMembers {actor, limit, cursor}`**: an account's
+  members in record-key order, with `status` `complete`, `partial` or `unknown`.
+- The four collections are stored from the firehose for any author, in every
+  public-indexing mode. The first time an account is asked about, its repository
+  is listed once and reconciled; it is listed again after
+  `plural.reverify_hours`. Bounded by the `[plural]` concurrency and rate keys.
+- **Fronters on private posts**: the clear `app.nearhorizon.plural.fronters` key
+  of a private post is validated, stored and returned in its view (and in quotes
+  of it); an invalid value is dropped and counted, and the post still ingests.
+  Existing private posts are listed again once to fill it. Public post views
+  already kept the key.
+- Rate classes `plural_anon` (per IP, 1/s, burst 10) and `plural_auth` (per
+  account, 5/s, burst 30); a token that does not verify is refused.
+- `getMembership.features`: `plural.fronters` (always) and `plural.read` (while
+  `plural.enabled`).
+- New `[plural]` config section; `enabled = false` answers both methods 501.
+  Metrics `plural_*`. Lexicons `app.nearhorizon.plural.defs`, `getRecords`,
+  `listMembers`.
 
-- **The `following` audience mode (private posting S10, #719; Horizon
-  P-4).** A post under a `following` audience is read by its owner and by
-  the ready members the owner follows, by the follow records indexed
-  here; a reply under it by another account is read by others only while
-  the owner follows that account. Blocks apply as in every mode. A
-  `following` post reaches a reader's timeline only when the reader also
-  follows its owner.
-  - The owner's follows are trusted only once verified: an
-    `authz`, `private` or `member` job (or `requestRecord`'s catch-up) of an
-    owner of a `following` audience lists its follows to the end, writes
-    what is missing or changed, confirms every stored follow the listing
-    lacks, and only then sets a flag beside the applied revision. The flag
-    counts only once the firehose has applied the owner's commits that far,
-    usually seconds later. Until then, and for an owner over
-    `[backfill] follows_pass_ceiling` (50 000) follows, those audiences
-    are read by the owner alone, and replies under them by their authors.
-  - The flag is cleared by everything that clears readiness (a gap, a
-    failed op, the prober's divergence, a purge, leaving the tracked set)
-    and by any follow written by a job, catch-up or `requestRecord` that
-    adds a row or changes its subject; a run that overlapped a clear sets
-    nothing. Each start queues `authz` for owners not yet verified, and a
-    new `following` audience queues one.
-  - An unfollow written as an edit that admission rejects now deletes the
-    old row and tombstones the record, from every source; a deleted
-    follow of a tracked account is always tombstoned.
-  - `requestRecord`'s `caughtUp: true` leaves the caller's `following`
-    audiences waiting for the firehose; its follows count toward the
-    catch-up's page cap.
-  - Migration 0028 (`sync_state` columns, metadata only; seeds
-    `gap_epoch`). Metrics `follows_pass_total{outcome}`,
-    `follows_pass_skipped_total` and the gauge
-    `following_owners_waiting_firehose` (a floor that never drains names
-    owners on a PDS no relay crawls). `getMembership`'s `features` gains
-    `private.following`. Pre-release count: run
-    `cargo test pre_s10_count_query -- --ignored --nocapture` and the
-    printed query read-only before migration 0028; not yet run on prism.
+### Upgrade notes
 
-- **Private search (private posting S11, #719; Horizon P-7).**
-  `app.nearhorizon.private.searchPosts {q, sort, limit, cursor}` searches
-  the posts the caller may read, at query time: no index of decoded text
-  is stored. Each page scans up to `[private_search] scan_candidates`
-  (300) readable candidates within `span_hours` (168) below its cursor
-  and returns up to `limit` matches; search reaches back `max_age_days`
-  (365) from the first page. A page can be empty and still carry a
-  cursor, so keep requesting while one comes back; where a page ends
-  depends only on posts the caller may read. `sort: "top"` is answered in
-  `latest` order. The cursor is sealed. A search page costs 5 tokens of
-  the `private` rate bucket (a `private` burst below 5 is refused at
-  startup). Floor `search_posts` 1500 ms. `getMembership`'s `features`
-  gains `private.search`.
+- Migration 0047 (`plural_records`, `plural_repos`, `private_posts.fronters`).
 
-- **Sealed feed cursors, an author-feed filter and paged replies
-  (private posting S8, #719; Horizon P-17, P-20, P-6/P-14).**
-  - `getTimeline` and `getAuthorFeed` cursors are sealed and fixed-length,
-    bound to the caller, method, actor and filter. A short or empty page
-    carries a cursor whenever candidates remain; an absent cursor means
-    the end (except when the last examined author's `did:web` is
-    extremely long). Old unsealed cursors get one 400: start the feed over.
-  - `getAuthorFeed` takes `filter`: `posts_with_replies` (default) or
-    `posts_and_author_threads`; any other value is a 400.
-  - New `app.nearhorizon.private.getReplies {uri, limit, cursor, depth}`:
-    the private replies the caller may read to a private or a public post,
-    oldest first, paged, each expanded to `depth`. A private `uri` the
-    caller may not read gives `{replies: []}`. Floor `get_replies` 1200 ms.
-  - `getMembership`'s `features` gains `private.paging`.
+## Phase 8: Private extras (2026-10-21 – 2026-10-23)
 
-- **A just-indexed record is readable at once (private posting S7, #719;
-  Horizon P-11).** `app.nearhorizon.index.requestRecord` now also catches
-  the caller's own repository up inline: it lists the private-tier
-  collections (up to `[index_request] catch_up_max_pages`, 8 pages, and
-  1.5 s), writes what changed through the normal writer, confirms deletes,
-  and advances the account's applied revision only if every write
-  succeeded. The answer gains `caughtUp: boolean`; when `true`, private
-  reads reflect the record immediately and the author's other private
-  posts stay readable. A failed write answers `false` and clears the
-  account's readiness, as the firehose does. One catch-up per account per
-  `catch_up_min_interval_secs` (10). This is a third way the applied
-  revision advances, beside backfill and the firehose. New
-  `sync.catch_up_rate_per_host` (10), metric
-  `index_request_catch_up_total{outcome}`. `getMembership`'s `features`
-  gains `private.freshIndex`.
+Notification preferences, activity subscriptions, list blocks and appearance for
+the private tier; public roots' hidden replies; private blocks retired.
 
-- **Private notifications (private posting S6, #719; Horizon P-9).**
-  `app.nearhorizon.private.listNotifications {limit, cursor, reasons?}`,
-  `getUnreadCount` and `updateSeen`, served in every public-indexing mode
-  (the off mode writes them too). Reasons: `reply`, `mention` and `quote`
-  (listed only if the recipient may read the post), and `like` and
-  `repost` of the recipient's private post by a member. A member's public
-  quote or reply of a private post notifies its author privately, with the
-  public post as `uri`. No `*-via-repost` reasons; records indexed late
-  (backfill, catch-up, `requestRecord`, replay) and older than
-  `[private_notify] backfill_max_age_hours` (48) do not notify;
-  notification preferences do not apply (use `reasons`). Thread mutes use
-  the reply's own root; blocks and mutes apply as on public notifications.
-  Deleting the record removes its notification. Rows are kept 90 days.
-  Migration 0027. Floors `list_notifications` 1200 ms, `get_unread_count`
-  300 ms. `getMembership`'s `features` gains `private.notifications`.
+### Added
 
-### Changed (private-read timing floors)
-
-- **Private-read timing floors are off by default (Horizon P-24).** Every
-  key of `[private_read.floor_ms]` now defaults to 0, so private reads
-  answer as soon as they are ready. The floors hid whether a private post
-  exists; since a private post is a public record under another NSID, that
-  is not secret. Uniform omission is unchanged: an unreadable post is
-  still left out exactly like a missing one. **If your `app.toml` lists
-  `[private_read.floor_ms]` (the shipped template did), those floors stay
-  until you delete the section or set the keys to 0.** An operator who
-  wants floors sets **every** key above that endpoint's measured p99 in
-  `private_read_unfloored_seconds{endpoint}`, since a post can be timed
-  through any endpoint that reads it; serve warns at startup when only
-  some are set. The previous defaults were `get_posts` 1000,
-  `get_post_thread`, `get_author_feed`, `get_timeline`, `get_bookmarks`,
-  `get_quotes`, `list_notifications` and `get_replies` 1200, `get_likes`
-  and `get_reposted_by` 800, `get_unread_count` 300, `search_posts` 1500.
-  0 is now accepted, and each floor is at most 10000: a config with a
-  larger floor no longer starts.
-
-### Changed (private threads S12)
-
-- **A private reply is read by its thread root's current audience
-  (#719; Horizon P-21, P-22, P-23).** A thread reply is read by the readers
-  of its root's audience as it is now, and a reply in a private branch
-  under a public post by those of its branch root's. It is served only
-  when its root (or branch root) is stored, names an audience of its own
-  author and is visible; the reply names an audience of that author; its
-  author, and the author of every post above it in its chain other than
-  the root's author, may write under the root's current audience now (the
-  PDS's rule for the mode) with no block either way with the root's
-  author; and its chain of parents, through stored private posts agreeing
-  on its root, reaches a post by the root's author (or the branch root)
-  within `[private_read] max_chain` posts, each visible to the reader. The
-  root author's own thread replies are not walked and are read by the
-  root's audience whatever audience of theirs they name. A post is never
-  served to a reader where either has blocked the other; its author always
-  reads it unless moderation hides it, even when the thread's owner has
-  blocked the author or removed them from the audience. `audience` on a
-  post's view is now the governing audience (left out of the author's own
-  read when the author no longer stands under it).
-  - **Starts being served:** replies in moved threads, under any of the
-    owner's audiences, whose writers stand; replies 9 to 16 deep; owner
-    thread replies whose parent is hidden, missing or in another thread;
-    owner thread replies naming a narrower owner audience, to the root's
-    readers.
-  - **Stops being served:** replies by writers who do not stand under the
-    root's current audience, with everything below them except the owner's
-    thread replies; replies in another account's thread under the
-    replier's own audience; owner thread replies naming a wider owner
-    audience, beyond the root's readers; replies under an invalid root or
-    branch root (deleted, never stored, a reply, under another account's
-    audience, moderated, or by an account with a hiding status); posts with
-    a public parent and a private root; replies deeper than `max_chain`.
-  - Admission takes a private post's `audienceList` author as a subject
-    beside its reply parent and root authors, and the `member_removed`
-    purge, the out-of-scope purge and retention keep and drop by the same
-    three.
-- **Paging (#719).** `getAuthorFeed`, `getTimeline`, `getQuotes` and
-  `getReplies` read at most `[private_read] page_reads_factor` (2) times
-  their `limit` in candidates a page, in one window, and end with a cursor
-  at the last row read; a page can be short or empty and still carry a
-  cursor, so keep paging while one comes back. No page end depends on
-  elapsed time any more. Candidates are evaluated in batches of up to
-  `walk_batch_max` (1 000) rows.
-- **Thread reads (#719).** `getPostThread` reads its parent chain with one
-  head round charged in the order sequential reads would charge, at most
-  `bind_concurrency` fetches at a time; parents, the claimed root and
-  quoted private posts that the reader may not read are no longer read
-  and spend no head budget. `getReplies` finds its claimed root with a
-  one-row lookup.
-- **Contracts.** The lexicons of `getPosts`, `getPostThread`,
-  `getAuthorFeed`, `getTimeline` and `getReplies` state the new rule;
-  `getAuthorFeed`, `getTimeline`, `getQuotes` and `getReplies` state the
-  read cap on their cursor; `defs#privatePostView.audience` is the
-  governing audience. `getMembership`'s `features` gains
-  `private.threadAudience`.
-- **Configuration.** New `[private_read]` keys `max_chain` (16, 1 to 100;
-  an operator may raise it to 100, accepting longer walks under floods),
-  `page_reads_factor` (2) and `walk_batch_max` (1 000).
-  **`sync.head_max_age_secs` above 600 is now rejected: `serve` and `admin`
-  refuse to start with such a config, so lower it before upgrading.**
-  `serve` logs `config: sync.head_max_age_secs=<n>` at startup, and warns
-  when `sync.max_head_fetches_per_request` exceeds
-  `sync.read_fetch_rate_per_host`. `private_read_unfloored_seconds` is a
-  histogram (20 buckets, 5 ms to 5 s).
-- **Private read statements cost less (#719).** A top-level post or a
-  branch root is its own anchor and is not looked up again; every other
-  row's anchor and governing audience are looked up once per distinct
-  anchor and hashed in; the moderation gate's two label lookups are
-  separate, so each hashes; a walk step by the root's author skips the
-  status lookup stage 1 already made. Results are unchanged. On B-5's
-  row classes most now cost at or below HEAD's statement; branch replies
-  whose reader is outside the audience still pay one primary-key lookup
-  per row up to the branch root (about 4×, 6× and 10× HEAD's cost at
-  depths 4, 8 and 16), as does a chain past the cap.
-- **Private reads no longer go quadratic when the planner underestimates
-  (#719).** A private read statement's per-key results (branch roots,
-  anchors with their audiences, walk verdicts) are folded into one map
-  each and looked up per row by key, instead of being joined back to the
-  candidates. When the planner put the candidates at one row and thousands
-  came back, those joins became nested loops over the whole result: an
-  unread count over 5 000 notifications took 22 s, and now takes about
-  1.9 s under `EXPLAIN ANALYZE`. Results are unchanged.
-- **JIT compilation is off on every database connection.** The planner
-  priced large private read batches above `jit_above_cost`, and compiling
-  them took about 3 s a statement, far longer than running them. That
-  showed as `getTimeline` at 4.5 s over branch conversations the reader
-  is outside, quote and reply counts at 4 s, and 5 s+ tails under load.
-  With JIT off, those requests take 45 to 320 ms alone. Nothing to
-  configure.
-- **The thread parent chain reads its rows together (#719).** Once the
-  head round has checked every ancestor's heads, `getPostThread` reads the
-  anchor and its ancestors at `bind_concurrency` at a time instead of one
-  by one. Results above the first miss are discarded, so the response is
-  unchanged. A 16-deep chain with every head stale drops from about
-  1 220 ms to about 1 020 ms.
-- **Accepted walk costs (#720).** Two costs ship as measured, with no
-  index or config change: a branch reply whose reader is outside the
-  audience, under distinct parents, costs about 4.1×, 6.3× and 10.4×
-  HEAD's statement at depths 4, 8 and 16; and a branch chain deeper than
-  `max_chain` under an audience the reader is outside costs about 7.5×
-  HEAD's at `max_chain` 16 and 42× at 100 (Prism runs 100). A flood needs
-  one stored branch post per row in one long chain, under the attacker's
-  own audience, and is bounded by the cap. #720's set-based branch-root
-  walk is the fix for both. T-54 holds them at the measured ratio × 1.1.
-- **The B-5 bench.** A cargo feature `bench-heads` (never in a deploy
-  build: the Dockerfile passes no features, a featureless build refuses a
-  `[bench]` section, and a feature build refuses to start without a
-  readable `bench.heads_file`) answers repo heads from a file after 450 ms
-  and runs no background head prober. The ignored tests
-  `b5_row_class_ratios`, `b5_absolute_floors` and `b5_stale_head_chain`
-  build the synthetic snapshot and measure the gate.
-  - B-5 part (3) runs against the deploy build itself (`b5_release`):
-    one fresh database per fixture and configuration, every member's
-    DID document seeded in `did_cache` so readers' tokens verify with no
-    network fetch (PLC points at an unresolvable host, so a miss fails
-    closed), a feeder that keeps the private watermark and heads fresh,
-    checks that the run saw no gap and that a wrong-key token is refused
-    after exactly one failed fetch, and each case gated on the server's
-    own `private_read_unfloored_seconds`. Only the stale-head chain uses
-    the `bench-heads` build. Six more fixtures: T-58's self-service
-    failures, 5 000 failing quotes, `limit × 8 + 1` undecodable
-    candidates, 48 undecodable children per thread node, 50 000 likes,
-    and 5 000 posts that fail the prefilter. Nothing is added to the
-    binary. Each loaded database is a deployment past its first day (the
-    one-time re-sync done, daily `authz` queued for later), so `serve`
-    runs no backfill during a measurement, and the runner reports any
-    that did. `b5_release_plans` prints the full plans of the slow
-    statements.
-- Pre-release count: run `cargo test pre_s12_count_query -- --ignored
-  --nocapture` and the two printed queries read-only on the deployed
-  database before S12 ships; not yet run on prism.
-
-### Changed (shared walk, #720)
-
-- **Private reads walk each chain row once per statement (#720).**
-  A private read statement now climbs every chain key's ancestors
-  together, one primary-key fetch per row however many keys share it,
-  and decides branch roots and walks from what it climbed; each author's
-  standing is tested once per statement. Results are unchanged (checked
-  against the previous statement on 300 seeded random fixtures). On the
-  deploy build, alone p50 before → after:
-  - a 5 000-row branch chain the reader is outside: 1.34 s → 0.30 s at
-    `max_chain` 16, 7.3 s → 0.42 s at 100;
-  - a 5 000-row thread chain of a standing writer: 2.2 s → 0.41 s at 16,
-    11.8 s → 0.49 s at 100;
-  - a 5 000-row branch comb: 12.0 s → 0.61 s at 100;
-  - `getUnreadCount` over 5 000 owner branch replies under distinct
-    parents: 1.8 s → 1.74 s (each branch is its own chain, so nothing is
-    shared).
-  - Grouping and de-duplication inside the walk compare bytes rather than
-    the locale's collation, the same groups at a fraction of the sort cost.
-  - `getUnreadCount` and `quoteCount` answer in one statement when they
-    have at most K candidates (K = 20 000 / `max_chain`), and otherwise
-    read their candidates in slices of K in one read-only snapshot;
-    `replyCount` and `prefilter_uris` split their input past K the same
-    way. Feed and reply batches hold at most K rows.
-  - The oracle's per-post fact reads one row and keeps the per-row walk,
-    which gives the same answer with a smaller plan.
-  No migration and no config key.
-
-### Fixed (kryphocron 0.4.1)
-
-- **kryphocron 0.4.0 → 0.4.1 (#682).** 0.4.0 panicked instead of erroring
-  when a correctly signed JWT carried an out-of-range `exp`, `iat` or `nbf`
-  (or an `exp` within clock skew of the largest representable time), and in
-  its trust and wire time decoders. 0.4.1 returns `Malformed` there. Prism's
-  own pre-check (`time_claims_out_of_range_are_rejected_before_the_verifier`)
-  stays as a second guard.
-
-### Fixed (replay below a settle)
-
-- **A replayed, since-deleted audience could grant read access after a
-  settle (#723).** A job or `requestRecord`'s catch-up moves the applied
-  revision ahead of the firehose; a commit the firehose then replayed
-  from below it (a consumer behind with no gap, a relay re-sending, a
-  second relay lagging) could store an audience or private post the
-  owner had already deleted or changed, and the head check passed while
-  it was read. Each tracked account now keeps a listed revision per
-  grant collection (private posts, audiences): the head revision of the
-  last run that listed that collection to the end with no write failing,
-  raised under the account's advisory lock (tried, never queued) before
-  that run's reconcile. An upsert of either collection below it is
-  refused from every source, as a tombstoned one is: the listing already
-  holds its effect or its undoing. Deletes, private blocks, gates and
-  follows are never refused.
-  - A settle raises the applied revision only to a revision both listed
-    revisions cover; otherwise it leaves it where it was, writes the
-    follow-verification flag NULL and logs `settle_uncovered`. A settle
-    whose `sync_state` row was deleted mid-run writes the applied
-    revision NULL.
-  - Catch-up checks, under the same lock, the records it skipped as
-    unchanged: if one is now stored in an older version below its
-    revision, it raises and settles nothing and answers `caughtUp: false`
-    (`replayed_below`), so the firehose's correcting commit still applies.
-  - Reads are unchanged, and a settle opens reads as soon as before. A
-    lock held past 5 s re-queues the job a minute on without counting an
-    attempt; a catch-up then answers `caughtUp: false`
-    (`listed_rev_busy`).
-  - Migration 0030 (`sync_state.post_listed_rev`,
-    `audience_listed_rev`, metadata only) seeds both from `applied_rev`
-    where a settle had moved it ahead of the firehose. Metrics
-    `private_ingest_below_listed_total{collection}`,
-    `listed_rev_lock_retries_total` and `settle_uncovered_total{path}`.
-    Pre-release count: run
-    `cargo test pre_listed_revs_count_query -- --ignored --nocapture` and
-    the printed query read-only before migration 0030; not yet run on
-    prism.
-
-### Fixed (firehose throughput)
-
-- **The consumer could fall into a trim-gap loop (#724).** A commit that
-  can write nothing (an untracked repo, every op skipped, invalid or
-  rejected, no delete, no rule-4 list it owns, no invalid
-  `tools.kryphocron.*` op) now opens no transaction and takes no locks; it
-  returns the same report, failed ops and skip counters. That is about
-  95 % of entries on prism's mix.
-- **Re-anchoring after a trim gap** stays at the oldest entry unless the
-  worker has measured itself slower than its input: a repeat gap within
-  one stream length, 30 s of samples with no failed step, at least 90 %
-  busy, and fewer entries processed per busy second than the stream
-  gained. Then it anchors at the stream's tail as read when the gap was
-  detected, so every skipped entry predates the gap's jobs; if an entry
-  after that tail was trimmed meanwhile, it falls back to oldest. The
-  script also reads the first batch. Each decision is logged and counted
-  with its reason (`firehose_reanchor_total{mode}`,
-  `firehose_reanchor_decisions_total{reason}`).
-- **A recreation gap could be lost (#726), and a group lost in pending
-  mode was never recreated.** A missing group is now recognised on every
-  read, the pending and blocking reads and `reanchor` included, in either
-  mode. While watermarks exist, `worker_state['recreation_gap_owed']` is
-  set before the group is created and cleared only by the gap's own
-  transaction; nothing is read while it is set, startup runs an owed gap
-  first, and `/xrpc/_health`'s `gap_blocked` stays true meanwhile.
-- **Throughput metrics and alerts.** New: `firehose_entries_processed_total{path}`,
-  `firehose_consumer_busy_seconds_total`, the backlog pair
-  `firehose_entries_processed_backlog_total` and
-  `firehose_consumer_backlog_busy_seconds_total` (full, gap-free steps
-  only: backlog capacity is their rate ratio, target ≥ 9 000/s),
-  `firehose_stream_entries_added_total`, `firehose_consumer_group_present`,
-  and `firehose_lag_sample_calls_total{call}` /
-  `firehose_lag_sample_failures_total{call}`. The lag sampler's three
-  calls are independent, each with a 3 s timeout; a missing group sets
-  the lag gauge to the stream's length. `firehose_headroom_warn` logs a
-  backlog fraction above 0.5 for 15 min. `docker/README.md` gains
-  `FirehoseBacklogPersistent`, `FirehoseConsumerSlowerThanInput`,
-  `FirehoseGroupMissing` and `FirehoseSamplerFailing`, kept equal to
-  `firehose::alert_rules` by tests.
-
-### Fixed (record consistency)
-
-- **A late duplicate delete wiped a re-created record's feed items and
-  notifications (#725).** A delete took the URI's feed items, public
-  notifications and private notifications whatever its rev, so a record
-  deleted at rev 2 and created again at rev 3 lost them when a slower
-  relay's copy of the rev-2 delete arrived; the row itself survived. They
-  now go only when no newer record is stored at the URI: a row of the
-  kind's table above the delete's rev (for a post, its row or its
-  member reference; for a profile, the repo's stored profile; for a
-  private post, its `private_posts` row). A delete that finds no row
-  still cleans up, as before.
-- **One account's duplicate likes or reposts inflated the counts (#727).**
-  `likeCount` and `repostCount` now count accounts, not records; every
-  record is still stored. Migration 0029 replaces the row-level count
-  triggers on `likes` and `reposts` with statement-level ones: a count
-  moves only when an account's first live like (repost) of a post arrives
-  or its last one goes, also when one statement writes or deletes several
-  of one account's records. It adds `(subject_uri, author_did)` indexes on
-  both tables and recounts every existing `post_counts` row by account.
-  The weekly repair, the private tier's counts and labelers' local
-  `likeCount` count accounts too.
-  - `getLikes` and `getRepostedBy` (public, from stored rows, and
-    `private.getLikes` / `private.getRepostedBy`) list each account once,
-    at its newest record of the post; Constellation's pages were already
-    deduplicated. `viewer.like` and `viewer.repost` name the viewer's
-    newest record, so the post shows as liked until the last one is
-    deleted. A thread's `knownLikers` lists each account once.
-
-### Fixed (private posting S10)
-
-- **Readiness could be set after a gap (#722).** A job's or catch-up's
-  settle read the gap epoch without a lock, so a gap committing between
-  that read and the settle's writes could be undone: `ready_at`, owner
-  readiness or the applied revision set after the gap cleared them. Every
-  settle now takes a shared advisory lock and reads the epoch under it as
-  its first statements, and the gap takes the same lock exclusively
-  first: a settle that holds it commits before the gap, which then clears
-  it; one that comes after sees the new epoch and settles nothing. A
-  waiting gap is not starved by later settles.
-
-### Changed (private posting S9)
-
-- **Blocks apply under `list` audiences too (#719; Horizon P-13,
-  choice C-6).** Under another account's `list` audience, or one with no
-  mode, a block either way between a reply's author and the audience's
-  owner now keeps the reply out (it is read by its author only),
-  including replies whose chain passes through such an author's post. A
-  reader blocked either way with the audience's owner no longer reads
-  replies there (S0's walk already denied this). Rule 6 also covers
-  `following`, which has no effect until that mode is built. Nothing
-  starts being served. Pre-release count on prism (2026-10-16): the 2
-  posts under another account's audience are both `followers`, so 0 stop.
-
-### Fixed (private posting S6)
-
-- **Public notifications could name a private post (#717).** With public
-  indexing on, likes, reposts, replies and quotes of a private post wrote
-  public notification rows naming the private URI. They are no longer
-  written (via reasons included), and rows left from before are neither
-  listed nor counted by the public notification methods.
-
-- **Counts, viewer state, likes, reposts and quotes of private posts
-  (private posting S5, #719; Horizon P-2, P-5, P-16).**
-  - Private post views carry `replyCount`, `likeCount`, `repostCount` and
-    `quoteCount`, counting only what the reader may see: replies and
-    private quotes the reader may read, public quotes, and likes and
-    reposts by members with no block either way (C-2). `viewer` gains
-    `like`, `repost` and `threadMuted`. Everything is matched by URI, so a
-    changed CID (an audience edit) keeps them.
-  - New `app.nearhorizon.private.getLikes`, `getRepostedBy` and
-    `getQuotes`, empty uniformly when the caller may not read the post.
-    `getQuotes` returns private quoting posts as `privatePostView` and
-    public ones as `#publicPostRef {uri, cid}`, with a sealed cursor.
-  - A member's repost of a private post the caller may read appears in
-    the private timeline and the reposter's author feed, with
-    `reason: #reasonRepost` (no `cid`: reposts are stored without it).
-  - `muteThread` / `unmuteThread` accept a private root.
-  - Migration 0026 (`private_quote_refs`); a post-migration index on
-    reposts by subject. New floors `get_likes`, `get_reposted_by` (800)
-    and `get_quotes` (1200). `getMembership`'s `features` gains
-    `private.interactions`.
-
-- **Reply and quote gates on private posts (private posting S4, #719;
-  Horizon P-18).** A stock `app.bsky.feed.threadgate` or `postgate` whose
-  `post` is a `postPrivate` URI (same author and rkey as the post) is now
-  stored in every public-indexing mode and applied on private reads:
-  `threadgate` on the root's view, `viewer.replyDisabled` (only when the
-  thread root was read for that reader in the same request, so a reply in
-  a feed usually carries none), hidden replies left out of threads except
-  for their author, `viewer.embeddingDisabled` from a `disableRule`, and a
-  detached quote shown as `app.bsky.embed.record#viewDetached`. The
-  audience stays the outer bound. Gates are removed with their post and
-  with the owner's purges. Backfill lists them after the authorization
-  collections. Migration 0025. `getMembership`'s `features` gains
-  `private.gates`.
-
-- **Private bookmarks (private posting S3, #719; Horizon P-8).**
-  `app.nearhorizon.private.createBookmark {uri, cid}`, `deleteBookmark
-  {uri}` and `getBookmarks {limit, cursor}`, served in every
-  public-indexing mode. `createBookmark` accepts a `postPrivate` URI
-  without reading the post (the answer says nothing about it), and is
-  idempotent; the cap is the public bookmark cap, counted separately.
-  `getBookmarks` lists, newest first, only the bookmarked posts the
-  caller may read now (others are left out; the cursor is unaffected),
-  under its own floor (`private_read.floor_ms.get_bookmarks`, default
-  1200). Private post views gain `viewer.bookmarked`. Bookmarks are
-  removed with the account's purge and when a member is removed.
-  Migration 0024. `getMembership`'s `features` gains `private.bookmarks`.
-
-- **Private post views carry their content (private posting S2, #719;
-  Horizon P-1, P-3).** `privatePostView.record` now carries `facets`,
-  `embed`, `langs` and `labels` as stored, and the view has a top-level
-  `embed` in the stock `app.bsky.embed.*#view` shapes (images, external,
-  video, gallery, record, recordWithMedia; both the kryphocron and the
-  stock `$type` forms are read). A quoted private post is read through the
-  private pipeline for the same reader (`#viewRecord` if readable, else
-  `#viewNotFound`); a quoted public post is a `#viewRecord` only when
-  public indexing is on. `labels` holds self-labels and operator labels.
-  The view gains `audience: {uri, mode?, name?}`; audience names are
-  stored and follow renames. A display field of the wrong type is dropped
-  and counted (`private_ingest_field_dropped_total{field}`), never the
-  post. Migration 0023 adds the columns; on first start a `private` job is
-  queued for each account whose rows predate it, to fill them.
-  - **Video playback** (new `[video] playback`, default `bsky_cdn`): video
-    views, public and private, use Bluesky's HLS playlist and thumbnail
-    (`[video] cdn_url`, default `https://video.bsky.app`); tested to work
-    for a video no post references. `pds_blob` keeps the MP4 blob on the
-    author's PDS and no thumbnail.
-  - Private read floors rise: `getPosts` 1000 ms, `getPostThread`,
-    `getAuthorFeed` and `getTimeline` 1200 ms. A deployment that pins the
-    old values in `[private_read.floor_ms]` keeps them until updated.
-  - `getMembership`'s `features` gains `private.embeds`.
-
-- **`app.nearhorizon.actor.getMembership` (private posting S1, #719;
-  Horizon P-10).** A signed-in account asks whether it is a member, in
-  every public-indexing mode; an eligible account is enrolled exactly as
-  `getTimeline` enrolls it. Answers `{status: "member" | "indexing" |
-  "notEligible", features}`; `indexing` carries `Retry-After`
-  (`private_read.membership_retry_after_secs`, default 5), and the hourly
-  enrollment cap answers 429 with `Retry-After`. `features` lists the
-  private method families this deployment serves (today `private` and
-  `private.crossPdsReplies`); later slices add theirs. Lexicon
-  `lexicons/app/nearhorizon/actor/getMembership.json`.
-  - **Operators must set `APP_PRIVATE_CURSOR_KEY_HEX`** (`openssl rand
-    -hex 32`, the same on every replica) before upgrading; without it the
-    app exits 78. It keys the private tier's sealed cursors in later
-    slices. The Thread Lens cursor key code moved to a shared module,
-    unchanged.
-
-- **Concurrency tests for jobs and list subscriptions (#712; Phase B
-  B-65, B-74).** Test-only pause and fault-injection hooks
-  (`test_support::hooks`, compiled only for tests) and `pg_locks` helpers,
-  with 19 tests: a mute never waits on a batch holding its list, a lost
-  deadlock is retried in place, a reference admitted mid-run waits for the
-  rerun, the list-sync lane cap, priority raise, a stuck row's recovery
-  bound, the breaker under budget cuts, a held list row never slows a
-  mute, a marker left by a kill is applied after restart, a 50 000-item
-  list released within 60 s, and the 35 s unreferenced bound. Four tests
-  are ignored until the bugs they found are fixed (#713, #714).
-
-- **List subscription and reference gauges (#710; design-v4 §4.7.6).**
-  Sampled every 300 s with the storage gauges:
-  `list_subscriptions_total` (active subscribed lists),
-  `list_references_unadmitted{source}`, `list_reference_changes_pending`,
-  `list_references_dormant{source}` (references on a list that is not a
-  moderation list), `list_records_unlisted` and
-  `list_references_unlisted{source}`. `list_subscription_rows_bound`
-  (members × 2 × `subscribed_max_per_member` × `subscribed_max_items`) is
-  also logged at startup.
-
-- **Account status changes are logged.** When a re-check after an
-  `#account` event changes an account's stored status, the identity
-  refresher logs `account_status_changed` with the DID and the old and
-  new status, and counts `account_status_changes_total{to}`. A PDS
-  operator's status events can now be matched to what the AppView did
-  with them; until now only the final status was visible.
-
-- **Public indexing switch, part 1: the off rule and its data path (#708).**
-  Groundwork for `indexing.public_scope = "off"`. Nothing switches yet:
-  the mode is held in memory and starts On, so behaviour is unchanged
-  until the switch itself lands.
-  - **Config:** `public_scope` gains `"off"`, the default for a fresh
-    install; an absent key means off. The shipped `app.toml` leaves the
-    key commented out, so an upgrade or a template pull never changes it.
-    New `indexing.fill_max_wait_hours` (24) and
-    `honest_501.public_off_message` / `public_filling_message`.
-  - **Migrations 0020–0022:** `operator_settings`; `member_post_refs`
-    (who a member's posts reply to and quote, no content), filled from
-    stored posts; two partial claim indexes on `backfill_jobs`.
-  - **The off rule** (in the draining, off and held modes): blocks,
-    profiles, follows with a member at either end, and members' own
-    likes, reposts and lists are stored; a member's post writes only its
-    reference and grows scope; everything else is skipped as
-    `public_off`. No notifications or feed items are written.
-  - **References in every mode.** The weekly scope rebuild reads
-    `member_post_refs` instead of `posts`, so scope no longer depends on
-    stored posts. Deletes and the `account_deleted` / `member_removed`
-    purges remove references.
-  - **Backfill** takes the mode: off plans list only what the off rule
-    keeps, and never the labeler service record. A backfilled record
-    created before the last fill began writes no notification.
-  - **Removing a member under the off rule** also removes the rows kept
-    only because it was a member.
-
-- **Public indexing switch, part 4: endpoints and Thread Lens (#708).**
-  - **Public endpoints answer an honest 501** unless public indexing is
-    on: 56 public `app.bsky.*` methods answer
-    `501 {"error":"NotImplemented","message":…}` with their registered
-    verb, saying to use the public AppView (or, while turning on, that
-    the method comes back when the backfill completes). A wrong verb
-    keeps its 400, and preflights are answered as before. The private
-    tier, Thread Lens, mutes, list mutes and blocks, drafts, labels,
-    `resolveHandle`, polls, `requestRecord` and `resolveDid` (25 methods)
-    stay served. Messages can be overridden with
-    `honest_501.public_off_message` / `public_filling_message`. Metric
-    `public_off_501_total{nsid}`.
-  - **Thread Lens** builds its baseline upstream when public data is not
-    stored, and community authors' public reads go to the configured
-    networks unless public indexing is on. `resolveDid` reports
-    `localIndexed: false` unless it is on.
-  - Viewer `bookmarked` and `activitySubscription` are left out unless
-    public indexing is on.
-
-- **Public indexing switch, part 3: the switch (#708).**
-  - **Commands:** `admin indexing public-scope <off|community_scoped>`
-    and `admin indexing status`. The live value is held in
-    `operator_settings`; the running state in
-    `worker_state['public_transition']`.
-  - **Startup** never deletes anything by itself. A database with public
-    data and no setting row is an upgrade: it stays `community_scoped`,
-    and the file's value is only recorded. After that, an explicit
-    `public_scope` in `app.toml` is applied only when it changed since
-    the last start. An unreadable state is held: the off rule applies,
-    nothing is deleted or filled, and health reports `held`.
-  - **Turning off** deletes stored public data in the background, table
-    by table, in short batches that resume after a restart and keep
-    members' rows. Health shows progress and raises `sweep_stalled` after
-    30 minutes without progress.
-  - **Turning on** queues a resync for every scoped account, staggered one
-    second apart. When they are done, or after
-    `indexing.fill_max_wait_hours`, counts are repaired and the mode
-    becomes On. A request to turn on while deleting waits for the delete
-    to end.
-  - **Health** gains a `public_indexing` block; `docker/README.md` gains
-    the operator note.
-
-- **Backfill claim order (#708, part 2).** Worker 0 claims the earliest
-  due job of any depth, as before, and no longer runs list syncs when
-  there are two or more workers. Workers 1 and up claim due `member`,
-  `private` and `authz` jobs before `scope` and `resync` jobs. New
-  members and gap recovery no longer wait behind resync waves, and worker
-  0 keeps resyncs moving. Both claims are served by the partial indexes
-  of migration 0022. Metric `backfill_claims_total{order, depth}`.
-
-- **Thread Lens for every signed-in account (#685).**
-  Thread Lens (`app.nearhorizon.threadLens.getThread` and `.resolve`)
-  was for ready members only. Now any signed-in account may call it,
-  unless the operator says otherwise. A caller with no token, or one that
-  does not verify, still gets 401.
-  - **Config:** `threadlens.access`, read at startup.
-    `"signed_in"` (the default) serves members and signed-in
-    non-members. `"members"` is the behaviour until now: anyone else is
-    refused `NotEnrolled` or `NotReady`. Any other value is a parse
-    error. An operator who wants no change sets `access = "members"`.
-  - **What a non-member gets.** The same thread, with its own blocks
-    applied: a post by an author it blocks, or who blocks it, is a gap,
-    and nothing by that author is sent. Its blocks come from Farsight,
-    and from the block rows this AppView holds for it (a member's block
-    of it, its block of a member). The views carry `viewer.blockedBy`
-    and `viewer.muted: false` and no other viewer state: no like,
-    repost, follow, bookmark or thread-mute state, and no
-    `viewer.blocking`. A member whose account is not ready is served the
-    same way until it is, instead of being refused. Other endpoints
-    answer a non-member as before.
-  - **Farsight.** A non-member's lens draws on the non-member part of
-    `farsight.rate_per_sec`, with a share per account
-    (`farsight.requester_share`), so the accounts behind one PDS do not
-    share one. Members' own part is never drawn on. An operator with
-    many signed-in non-members may need to raise
-    `farsight.rate_per_sec`. A non-member's failed calls never count
-    toward the read breaker, and while the breaker is half-open its
-    calls are refused rather than used as the probe, so non-members
-    cannot keep the fallback from members during an outage. Until a
-    member's call or a public `getRelationships` finds Farsight
-    answering again, non-members get the ordinary thread view.
-  - **Cache and memory.** The memory of learned blocks
-    (`[farsight.memory]`) stays for members only: nothing is stored for
-    a non-member. In the cache of Farsight's answers, a non-member's
-    entries go first when `farsight.cache_entries_total` is reached, and
-    a new sweep, once per `farsight.cache_ttl_secs`, removes expired
-    entries, so an account that never returns leaves nothing behind.
-  - No new metric. Refused and unbudgeted calls are counted as before in
-    `farsight_calls_total{outcome="breaker_open"|"no_budget"}`.
-  - The lexicons' descriptions say who may call under each setting;
-    their shapes and errors are unchanged.
-  (docs/internal/design/threadlens-access.md)
-- **Private audiences: `followers`, `everyone` and `nobody` (#663).**
-  Until now a private post was served to anyone but its author only
-  when its audience was a `list`. Now:
-  - `followers`: a ready member who follows the audience's owner reads
-    it, by the follow records this AppView has indexed. A new follow or
-    an unfollow takes effect within about a minute.
-  - `everyone`: every ready member of this AppView reads it.
-  - `nobody`, `following` and any other mode: the author only.
-    `following` is not resolved yet.
-  - A block record or a private block, in either direction, between the
-    reader and the author keeps the reader out, as before. For a reply
-    written under another account's `followers` or `everyone` audience,
-    that account reads the reply, and its blocks count too: with the
-    reader, and with the reply's author. A block through a list does not
-    keep a reader out of a private post.
-  - Posts by a deactivated author, and posts between blocked accounts,
-    are no longer candidates for a page, and a feed page now looks at a
-    second window of candidates when the first holds too few readable
-    posts, so a run of unreadable posts does not end a feed early.
-  This applies to `getPosts`, `getPostThread`, `getAuthorFeed` and
-  `getTimeline`; their lexicon descriptions say which audiences are
-  resolved. The PDS still refuses every mode but `list` on a direct
-  read. Two indexes, `follows_pair` and `blocks_pair`, are built in the
-  background after startup; `_health`'s `search_indexes_ready` is false
-  until they exist (docs/internal/design/private-audience-modes.md).
-- **The private home timeline (#663).**
-  `app.nearhorizon.private.getTimeline` returns the private posts the
-  caller may read whose author is the caller or an account the caller
-  follows, newest first by `createdAt`, as `{feed, cursor?}` in
-  `getAuthorFeed`'s shape (`limit` 1 – 50, default 30). Pages are keyed
-  on `createdAt` and then the post's URI, so posts by different authors
-  that share a time are each returned once. A post the caller may not
-  read leaves no trace, and an empty page takes as long as a full one
-  (`private_read.floor_ms.get_timeline`, default 1000). An author the
-  caller fully mutes, directly or through a moderation list, is left
-  out. Same sign-in gate, errors and rate class as the other private
-  queries. Lexicon `app/nearhorizon/private/getTimeline.json` (Horizon
-  R-2; design-v3 §1.7 item 12).
-- **Profile views carry `status` (#675).** An account's stored
-  `app.bsky.actor.status` record is shown on its profile views as a
-  `statusView`: the status, the record, the `external#view` of its
-  embed, and, when the record sets `durationMinutes`, `expiresAt` and
-  `isActive`. The duration is clamped to 5 minutes – 4 hours and counted
-  from the record's `createdAt` or from when it was indexed, whichever
-  is earlier, so a status dated in the future cannot stay live. With
-  `unspecced.live_now` set, a live status is shown only for an account
-  on that list whose embed links to a domain listed for it (design-v3
-  §8.1, §7.6).
-- **Item 17: trending topics and trends (#675).**
-  `app.bsky.unspecced.getTrendingTopics` ranks hashtags by posts in the
-  last `trends.topics_window_hours`; `getTrends` ranks them by
-  engagement over `trends.window_hours`, each like, repost and reply
-  weighted by how recently it was made, and counted only on a post made
-  within `trends.subject_lookback_hours` before it. In both, only posts
-  by in-scope, visible authors who have not opted out count, and a tag
-  needs `min_posts` posts by `min_authors` authors, so one account
-  cannot carry a tag. A trend carries `startedAt`, `postCount`, `"hot"`
-  when its last full hour is at `hot_ratio` times its hourly mean, up to
-  five authors (after the viewer's mutes and blocks), and `recIdStr`.
-  Links come from `trends.topic_link_template`; descriptions and
-  `suggested` topics only from the operator's config. Each list is
-  computed again every `cache_ttl_secs`; a trend refresh that passes
-  `refresh_timeout_ms` keeps the previous list and counts in
-  `trends_refresh_timeout_total`. New `[trends]` section (design-v3
-  §7.4, §7.5). `trends.subject_lookback_hours` and the new
-  `trends.aggregate_retention_hours` are set on every database
-  connection, so the triggers that keep the hourly aggregate follow
-  them, and the daily job deletes aggregate rows past the latter.
-  Startup now rejects `[search]`, `[suggestions]` and `[trends]` values
-  that could not work: a zero timeout, window or pool; `max_offset`
-  above `top_candidates`; a ratio or half-life that is not above 0; an
-  aggregate retention shorter than a trend window; a link template
-  without `{tag}`.
-- **Item 17: suggestions and `getConfig` (#675).** Computed from what
-  this AppView stores, with no placeholder accounts and no network call
-  while ranking. An account can be suggested when it is in scope, active,
-  has a real handle, is not hidden by a label, has not set
-  `hideFromAlgorithmicRecommendations`, and posted in the last
-  `suggestions.active_days`. Served: `getSuggestedUsers` and
-  `app.bsky.actor.getSuggestions` (newest; the latter pages by offset),
-  `getSuggestedUsersForExplore` and `getSuggestedOnboardingUsers`
-  (most followed), `getSuggestedUsersForDiscover` and `…ForSeeMore`
-  (for a ready member, the accounts most followed by the accounts it
-  follows; most followed for anyone else),
-  `app.bsky.graph.getSuggestedFollowsByActor` (the accounts most followed
-  by the actor's followers, padded with the most followed),
-  `getTaggedSuggestions`, `getSuggestedStarterPacks` and
-  `getOnboardingSuggestedStarterPacks` (most joined this week), and
-  `getConfig` (`[unspecced]`). A ready member is never shown itself, an
-  account it follows, one it blocks or is blocked by, or one it mutes.
-  The per-member and per-actor queries run under the search statement
-  timeout and are cached; a timeout falls back to the most followed and
-  counts in `suggestions_timeout_total{endpoint}`. Responses carry
-  `recIdStr`. New `[suggestions]` and `[unspecced]` sections (design-v3
-  §7.1 – §7.3, §7.6).
-- **Item 16: typeahead and starter-pack search (#675).**
-  `app.bsky.actor.searchActorsTypeahead` matches the start of a handle
-  or display name, and from three characters a word inside the display
-  name. Each branch reads at most `search.typeahead_candidates` rows in
-  index order before ranking, so one character costs a bounded scan.
-  Order: members, accounts the viewer follows, the exact handle, then
-  the shortest handle. It makes no Farsight call: an inbound list block
-  applies from what is already known. `app.bsky.graph.searchStarterPacks`
-  and `searchStarterPacksV2` search stored packs of in-scope creators by
-  text, most joined first; V2 adds an exact `hitsTotal` when small. V2's
-  views carry no `list` or `listItemsSample`. All three are in the
-  Search rate class (design-v3 §9.4, §9.5).
-- **Item 16: post search (#675).** `app.bsky.feed.searchPosts` and
-  `app.bsky.feed.searchPostsV2`, two parameter parsers over one search
-  of the posts stored here whose author is in scope. Text is matched
-  with quoted phrases, `OR` and `-term`. The operators `from:`, `to:`,
-  `mentions:`, `lang:`, `domain:`, `since:`, `until:` and `#tag` are read
-  out of the query text and joined to the parameters with AND. V2's
-  include and exclude filters (authors, mentions, domains, URLs, embedded
-  records, hashtags, languages, media, replies, thread, `following`) are
-  all served. Handles resolve from this AppView's own rows only; one
-  that does not resolve matches nothing. A private-tier URI in a filter
-  is never compared with anything. Without `since`, a search looks back
-  `recent_window_days` (V2: unless `allTime`). `latest` / `recent` pages
-  by time; `top` ranks the newest `top_candidates` matches by stored
-  engagement and text rank. `hitsTotal` is exact and given only up to
-  `hits_total_max`. A search that passes `statement_timeout_ms` is
-  `BadQueryString` "query too expensive" and counts in
-  `search_timeout_total{endpoint}`. A signed-in member's mutes and
-  blocks apply, list mutes and inbound list blocks included; signed out,
-  authors with `!no-unauthenticated` are left out. New `[search]`
-  section. Both endpoints are in the Search rate class (design-v3 §9.0
-  – §9.2).
-- **Item 12c: the memory of learned blocks (#684).** With
-  `farsight.memory.enabled`, an inbound list block that Farsight or the
-  fallback reports for a ready member is remembered, in the new table
-  `learned_inbound_blocks` and in a copy held in the process. A
-  remembered block applies to a pair whenever the answer in hand does not
-  vouch for it: when Farsight gave no answer, on a cache-only read, past
-  the call cap, in the unread count, and in Thread Lens (as a block,
-  never as a complete answer). A complete Farsight answer that names no
-  block forgets the pair on that very request. Otherwise a block expires
-  `retention_hours` after it was last confirmed. A pair that is
-  remembered is not sent to the fallback. Bounded by `max_per_viewer` and
-  `max_total`. Removing a member or deleting an account clears its blocks
-  at once, from the purge itself, and a request that was in flight at
-  that moment adds nothing afterwards; the daily job deletes rows past the
-  retention and rows of accounts that are no longer members.
-  `admin farsight forget <viewer-did>` clears one member, and
-  `admin farsight status` now also prints `answered_since_start`,
-  `run_clean`, `down`, a `fallback` block and a `memory` block (counts
-  only), whether or not Farsight answers. Off by default; with it off,
-  `serve` empties the table at startup and nothing is stored or read.
-  Metrics: `farsight_memory_entries`, `farsight_memory_changes_total{op}`
-  (`learn`, `confirm`, `forget`, `evict`, `expire`),
-  `farsight_memory_blocks_applied_total` and
-  `farsight_memory_dropped_total{reason}`.
-  Migration `0019_learned_inbound_blocks`: an upgrade to this build needs
-  `APP_ALLOW_STARTUP_MIGRATE=1` for one start, as for any migration
-  (design-v3 §5.14.18; proposed locked decision 39).
-- **Item 12b: the fallback for inbound list blocks (#683).** With
-  `farsight.fallback.enabled`, and only while Farsight is down, a ready
-  member's ordinary page asks the AppView that `farsight.fallback.network`
-  names (`app.bsky.graph.getRelationships`, with no sign-in) which of
-  the accounts whose Farsight calls did not get through block the member
-  through a list. A reported block applies as any inbound list block
-  does, for `cache_ttl_secs`. It never counts as a complete answer,
-  never overrides what Farsight said, and Farsight is asked again as
-  soon as it is back. An account told "nothing" is not sent again for
-  `cache_ttl_secs`; a member the other AppView does not know is not sent
-  again for as long. Thread Lens, the unread count, `getRelationships`,
-  private reads and anonymous requests never cause a call. The fallback
-  has its own rate bucket and its own breaker
-  (`farsight_fallback_calls_total{class}`,
-  `farsight_fallback_skipped_total{reason}`). Each call tells that
-  AppView which member is looking at which accounts, so it is off unless
-  switched on, and `serve` says so at startup when it is (design-v3
-  §5.14.17; proposed locked decision 39).
-- **Item 12b: knowing when Farsight is down (#683).** The `farsight`
-  module now keeps, beside its breaker, whether every call since
-  Farsight's last answer failed as a service failure (a timeout, a
-  transport error or a `5xx`). Farsight counts as down only when it has
-  answered this process at least once, its breaker is open, and nothing
-  else came in between: so a wrong URL or a revoked key never counts,
-  and one `401`, `429` or `404` keeps it from counting until Farsight
-  answers again. A refused address is now told apart from a transport
-  error (`farsight_calls_total{outcome="refused_address"}`). Nothing
-  acts on "down" yet (design-v3 §5.14.17.2).
-- **Item 12b: fallback settings (#683).** A `[farsight.fallback]`
-  section, off by default: `enabled`, `network`, `timeout_ms`,
-  `max_calls_per_request`, `cache_ttl_secs`, `rate_per_sec`, `burst` and
-  `requester_share`. With the switch off the values are only parsed, and
-  `serve` logs any it would reject; with it on, startup refuses a
-  missing `farsight.url`, a network that is unknown, disabled, local or
-  not `unauth`, and numbers out of range. Nothing reads them yet: no
-  fallback call is made (design-v3 §5.14.17.1; proposed locked decision
-  39).
-- **Item 12a: one set of blocks for a whole request (#674).** A request
-  can supply the blocks it knows beyond local rows
-  (`hydration::with_known_blocks`), and every view built for it
-  (profiles, posts, embeds, upstream views) then applies them, in the
-  direction found. A block with no record here hides its author and
-  carries no `viewer.blocking` URI. Thread Lens will supply its verdicts
-  this way (design-v3 §5.15.12).
-- **Item 12a: Thread Lens verdicts (#674).** `threadlens::verdict`
-  decides, for the viewer and each author, one of "you block them",
-  "they block you", "clear" and "cannot say", from the viewer's own
-  blocks and list blocks, and from Farsight. An author is "clear" only
-  when Farsight vouches for it and for the viewer's side of the request;
-  a block always counts, vouched or not. Lookups run in rounds, each
-  author sent at most once per request, within
-  `threadlens.verdict_max_dids`. Thread Lens does not use it yet
-  (design-v3 §5.15.4 – §5.15.6).
-- **Item 12a: a second way to read Farsight (#674).** The `farsight`
-  module can now return, for a viewer and a set of accounts, the whole
-  answer per pair (a direct or list block in either direction, and
-  whether Farsight vouches for it) and the coverage level of each call,
-  under a call and time budget the caller brings. It shares the cache
-  with ordinary views, so a page render and a Thread Lens request for
-  the same pair cost one lookup. Nothing calls it yet (design-v3
-  §5.14.9).
-- **Item 12a: Thread Lens v2 settings (#674).** A `[threadlens]`
-  section with `page_nodes` (200), `listing_calls` (60),
-  `verdict_round_timeout_ms` (500), `parent_rounds` (8) and
-  `verdict_max_dids` (600), checked at startup, and an optional
-  `APP_THREADLENS_CURSOR_KEY_HEX` that `admin keygen` now prints a value
-  for. Nothing reads them yet: Thread Lens still behaves as before
-  (design-v3 §5.15, §13).
-- **Item 12: purposes survive a failed item listing (#673).** When a
-  list sync reads all of an owner's list records and then fails while
-  reading the list items, what the list records said about each list's
-  purpose is still written before the run is retried.
-- **Item 12: a purge clears a member from the sync lanes' accounting
-  (#673).** Removing a member or deleting its account now also drops
-  what was held in memory about it for scheduling list syncs: what
-  waited for it, and the lane time charged to it.
-- **Item 12: lost deadlocks are retried in place (#673).** A list
-  sync's batch or its final step that loses a deadlock or a
-  serialization conflict, for instance to a firehose write by the same
-  owner, is run again in place, up to five times, instead of failing the
-  run. `muteActorList` and `unmuteActorList` do the same, so such a
-  conflict never reaches the client
-  (`list_subscription_tx_retries_total`).
-- **Item 12: removed list settings say what replaced them (#673).** A
-  config that still has `lists.subscribed_max_total` or
-  `retention.subscribed_list_grace_days` is refused at startup with a
-  message naming the per-member budget keys and the immediate release,
-  instead of only "unknown field".
-- **Item 12: the tombstone cap covers a sync's own tombstones (#673).**
-  The tombstones a list sync writes for items moved out of a list now
-  count against `lists.subscription_tombstones_max_per_owner`: after a
-  run's writes the owner's oldest tombstones past the cap are removed,
-  and the in-memory count is read again.
-- **Item 12: `admin lists purge <did>` (#673).** Deletes an account's
-  list mutes and the list records it authored (lists, list items, list
-  blocks, opt-outs), and its references with them. A local cleanup, not
-  a takedown: records still in the account's repository come back at
-  its next re-sync (design-v3 §14.3).
-- **Item 12: `muteActorList`, `unmuteActorList`, `getListMutes`,
-  `getListBlocks` (#673).** A member can mute a moderation list, up to
-  `lists.subscribed_max_per_member` lists from at most
-  `lists.max_owners_per_member` owners; past that the call is
-  `400 InvalidRequest` and nothing is written. A list that is not a
-  moderation list, or a URI that is not a list, is `400 InvalidRequest`.
-  The two listings show the lists the member mutes and blocks, newest
-  first, whether or not they have an effect yet (design-v3 §5.3).
-- **Item 12: a member's list mutes and list blocks take effect
-  (#673).** Once a list's owner has been synced, the accounts on a
-  moderation list the member mutes are treated as fully muted, and those
-  on one it blocks as blocked by the member: in the timeline and list
-  feeds, notifications and the unread count, threads, and everywhere
-  else a direct mute or block already applies. Profile views carry
-  `muted: true`, and `mutedByList` / `blockingByList` with the list's
-  view: from its row for a ready member's list, from its record for any
-  other (left out if the record cannot be read; the mute or block
-  applies all the same). A reference past the member's budget, not yet
-  synced, or to a list that is not a moderation list changes nothing.
-  The members come from the private copy only, and nobody else's views
-  are affected (design-v3 §4.3 "List purpose", §5.3).
-- **Item 12: budget changes and tombstone clean-up (#673).** At startup
-  every member's references are checked again against the configured
-  budget, so raising `lists.subscribed_max_per_member` or
-  `lists.max_owners_per_member` admits references that waited and
-  lowering them stops the newest. Rule 4's tombstones now expire with
-  `retention.tombstone_days`, and the recovery sweep deletes those older
-  than an hour whose owner no longer has a subscribed list (design-v3
-  §4.3 "Tombstones").
-- **Item 12: references follow membership (#673).** Adding a member
-  (by `admin member add` or auto-enrolment) gives it references for the
-  list mutes and list blocks it already has stored, in the order they
-  were made and under its budget. Removing a member, or deleting its
-  account, deletes all its references in the purge's first step, and
-  the lists nobody else references are released (design-v3 §4.3
-  "Callers of the member phase").
-- **Item 12: a member's list block becomes a reference (#673).** When a
-  member's own `app.bsky.graph.listblock` record is written, changed to
-  name another list, or deleted, the writer derives that member's
-  reference to the list again and tells the list phase, on every write
-  path, `requestRecord` included. A list block past the member's budget
-  is stored and has no effect (design-v3 §4.3 "Callers of the member
-  phase").
-- **Item 12: the copy rule and the purpose rule in the writer (#673).**
-  When the owner of a list that a member mutes or blocks changes the
-  list, the writer now keeps the private copy current: a list item is
-  copied, a delete or a move out of the list removes the copy and leaves
-  a tombstone so a late, older create is not copied again, and the
-  list's purpose is stored on its row. This happens whether or not the
-  owner's records are admitted to the public tables, and never changes
-  what the public tables or an op's outcome show. Caps:
-  `lists.subscribed_max_items` per list (`list_items_over_cap_total`)
-  and `lists.subscription_tombstones_max_per_owner`
-  (`subscription_tombstones_evicted_total`). The firehose, backfill and
-  dead-letter replay run the rules; `requestRecord` does not
-  (`ApplyOptions.subscription_rules`; design-v3 §4.3 "The copy rule",
-  "The purpose rule").
-- **Item 12: the other reasons a list sync starts (#673).**
-  `subscriptions::triggers` adds the recovery sweep (at startup and with
-  every retry-scheduler run: it finds again every reference still
-  waiting on a sync, and every list never synced), the weekly run (a
-  low-priority sync for each owner with no complete listing in 7 days,
-  one owner a second), a sync on an account or identity event for an
-  owner that looks gone (never for an ordinary owner), and requested
-  syncs recorded on the owner's row. A sync row left `running` at
-  startup, or found stuck, now ends as a run does: the owner's pacing
-  moves and the next start is paced. All are on in `serve`: the firehose
-  consumer raises the event sync, and the end of a purge of a list
-  owner requests one (design-v3 §4.3 "When a sync is enqueued").
-- **Item 12: `admin lists sync <list-uri>` (#673).** Asks for a
-  high-priority sync of the owner of a list some member mutes or blocks.
-  It is still paced like any other sync of that owner, waits while the
-  owner is being purged, and fails for a list no member references
-  (design-v3 §14.3).
-- **Item 12: list syncs on the backfill workers (#673).**
-  `subscriptions::runner` lets a backfill worker run a list sync before
-  its ordinary work: the fast lane first, then the slow lane, each with
-  its own fixed number of permits, tried and never waited for. Lane time
-  now counts a run still in progress. A row left `running` with no run
-  behind it is queued again at a new generation by a check every quarter
-  of `lists.sync_stuck_secs` (`list_sync_stuck_requeued_total`,
-  `list_sync_running_age_seconds`), and at startup. `serve` starts the
-  applier and gives the lanes to its backfill workers; nothing creates a
-  reference yet, so they stay idle (design-v3 §4.3 "Lanes").
-- **Item 12: choosing the next list sync (#673).**
-  `subscriptions::claim` picks one due sync per lane (fast, and slow for
-  owners whose servers answer slowly). A queued sync whose reason has
-  gone, such as a mute withdrawn before the run began, ends without a
-  run and without moving the owner's pacing
-  (`list_sync_causeless_total`). Among the rest the pick goes to whoever
-  has held the lane least lately: each member's mutes and each member's
-  blocks count separately, beside two shared turns for repairs nobody
-  waits on and for owners that were cut. The general backfill worker no
-  longer claims or re-queues `list_sync` rows. A run also stops when its
-  job row is no longer `running`. Nothing starts a claim yet (design-v3
-  §4.3 "A separate claim", "Fair claims").
-- **Item 12: list sync against real servers (#673).**
-  `subscriptions::pds` checks a list owner's account (a fresh identity
-  document that is neither stored nor cached, then the repository's
-  status and latest revision at its PDS) and reads its records from that
-  same PDS under the host's backfill allowance. Time waiting for that
-  allowance is not counted as the owner's server being slow. A timeout
-  or a server error never starts a suspicion that the owner is gone
-  (design-v3 §4.3 "The run", step 2).
-- **Item 12: a whole list sync run, and owners that are gone (#673).**
-  `subscriptions::run` takes one run from start to end. An owner being
-  purged is not listed. An owner whose account does not answer is first
-  only suspected: nothing changes for members, and the run comes back a
-  day later; the same answer a day or more after the suspicion began, or
-  a tombstone in the PLC directory, confirms it, and the owner's lists
-  are then emptied. A move to another PDS starts the suspicion over. A
-  listing cut short keeps what was read and retries a day later. Runs
-  are counted in `list_sync_runs_total{outcome, lane}`. Nothing starts a
-  run yet (design-v3 §4.3 "The run").
-- **Item 12: reading a list owner's records within bounds (#673).**
-  `subscriptions::fetch` reads the owner's list records, then its list
-  items, page by page, and stops at the first limit reached: records,
-  pages, slow answers, time spent in calls, or total time. A listing
-  stopped early is marked incomplete with the reason; a slow answerer or
-  a server of tiny pages is told apart from an owner that is simply
-  large. No record is fetched by name (design-v3 §4.3 "Per-owner
-  bounds").
-- **Item 12: how a list sync run ends (#673).** Every end of a run
-  records its time on the list owner's row first, then settles the job:
-  a completion is done (or queued again if a sync was asked for while it
-  ran); a run cut short is queued a day later and the owner backs off
-  for a week; a failure is retried with the usual backoff. No retry is
-  ever scheduled earlier than the owner's earliest start, and a run that
-  was superseded settles nothing (design-v3 §4.3 "Pacing and claiming").
-- **Item 12: what a list sync writes (#673).** `subscriptions::sync`
-  takes an owner's listings and brings the private copy in line: it
-  keeps each list's oldest entries up to the cap, removes an entry that
-  is gone only when two complete listings in a row lack it (one on a
-  list's first sync), removes and remembers an entry moved to a list
-  nobody subscribes to, and records each list's purpose. A waiting list
-  mute or block takes effect only when the run served its list and
-  listed the list's own record; otherwise it is marked once and waits
-  for the owner's next run. A listing cut short only adds. Fetching the
-  listings and scheduling the job are not built yet (design-v3 §4.3
-  "The run").
-- **Item 12: the reference applier and the in-memory subscribed sets
-  (#673).** `subscriptions::applier` is the background task that runs the
-  list phase (on a signal, at startup with a full reconcile, and every
-  60 s), retries a busy list after a second, gives one that stays busy a
-  task that waits for it, and releases unreferenced lists in tasks of
-  their own. `ScopeState` now holds which lists are subscribed and whose
-  changes are tracked, set from the rows after each commit. The pairs of
-  members waiting on an owner's sync are kept in memory only. Not started
-  by `serve` yet (design-v3 §4.3).
-- **Item 12: `[lists]` settings for members' list mutes and blocks
-  (#673).** The per-member budget (`subscribed_max_per_member` 25,
-  `max_owners_per_member` 10, `subscribed_max_items` 50 000), the
-  tombstone cap, and the list-sync pacing, lanes and per-run bounds, all
-  at the design's defaults. Startup refuses lanes that would leave fewer
-  than two backfill workers for readiness jobs, and a wall-time bound
-  shorter than the other bounds allow. Nothing reads them yet
-  (design-v3 §4.3, §13).
-- **Item 12: the list phase, release, and sync enqueue rules (#673).**
-  `subscriptions::list_phase` turns a change marker into the list's
-  `subscribed_lists` row (active while an admitted reference exists,
-  unreferenced otherwise), takes the owner's row, and queues the owner's
-  `list_sync` when a reference waits on one; it never waits on a list
-  row. An unreferenced list is released at once: items in batches, then
-  the row, then the owner's queued job if it was the owner's last list.
-  `subscriptions::jobs` holds the earliest start an owner's next sync
-  may have and the rule that an enqueue never supersedes a running job.
-  Nothing runs these yet (design-v3 §4.3).
-- **Item 12: list references and the member phase (#673).** New module
-  `subscriptions::references`: a member's list mute or list block is a
-  reference to a list, admitted while it is inside the member's budget
-  (its first references of that kind, naming a bounded number of list
-  owners, counted in arrival order from the member's own rows only). The
-  member phase writes the member's rows and a change marker in one
-  transaction that takes no lock on shared state. Nothing calls it yet
-  and no reference has any effect on a view yet (design-v3 §4.3).
-- **Item 12: migration `0018_subscribed_list_purpose` (#673).** Four
-  optional columns for the rule that a member's own list block or list
-  mute has an effect only on a moderation list: a subscribed list's
-  purpose, the revision it was read at, since when its record has been
-  missing, and a mark on a reference whose list record was not found.
-  Nothing reads or writes them yet; the migration ships before the code
-  that fills those tables, so it has no data to convert
-  (design-v3 §4.3 "List purpose", §12.1).
-- **Item 15: `com.atproto.identity.resolveHandle` (#675).** The account a
-  handle belongs to. Bad syntax is refused before anything is looked up.
-  An indexed account's stored handle is answered at once. Otherwise the
-  handle's DNS record and its well-known file are both asked, and the
-  account found must name the handle back. "No such handle" is
-  `HandleNotFound`; a lookup that could not be completed is
-  `502 UpstreamFailure`, never mistaken for "not found". Answers are
-  remembered (`[identity] resolve_handle_cache_max`,
-  `resolve_handle_ttl_secs`, `resolve_handle_negative_ttl_secs`); a failed
-  lookup never is. Counted in `handle_resolutions_total{result}`
-  (design-v3 §5.11).
-- **Item 15: `app.bsky.labeler.getServices` (#675).** The labeling
-  services an app asks about: stored ones from local rows, any other
-  from its service record through Slingshot. Each view carries its
-  creator's profile, like count, the viewer's like, local labels and
-  `indexedAt`; `detailed=true` adds the policies and subject fields. A
-  labeler taken down here is left out. At most
-  `[labelers] get_services_max_dids` per request (default 50)
-  (design-v3 §5.7).
-- **Item 15: `bookmarkCount` (#675).** Post views can carry how many
-  members bookmarked the post, by `[bookmarks] emit_count`: `never` (the
-  default, safe for a small community where a count of 1 points at one
-  person), `above_floor` (only from `count_floor`, default 10, never
-  shown as a lower number) or `always` (design-v3 §8.2).
-- **Item 15: `app.nearhorizon.feed.getAuthorPolls` (#675).** An
-  account's public polls, newest first, with a basic author view.
-  Non-public polls are never returned. An indexed author's polls come
-  from stored rows; anyone else's from their own server, a page at a
-  time. `limit` is 1 to 100 (default 25); more is a 400. Lexicon files
-  for the endpoint and for `app.nearhorizon.poll.post` are under
-  `lexicons/` (design-v3 §5.13).
-- **Item 15: `app.bsky.feed.getActorLikes` (#675).** A ready member's own
-  likes, newest first; `actor` must be the caller. Liked posts not stored
-  here are fetched from Slingshot, at most a page's worth. A liked post
-  that is gone or hidden, or whose author has a block with the member,
-  is left out (design-v3 §5.4).
-- **Item 15: `com.atproto.repo.getRecord` (#675).** Serves public
-  records this AppView stores with their JSON (posts, profiles, lists of
-  ready members, starter packs, labeler services, gates, public polls,
-  and the three self-keyed declaration records), from local tables only.
-  A private-tier collection is `RecordNotFound` before any lookup;
-  collections kept without their JSON (likes, reposts, follows, blocks,
-  list items) are refused by name; a handle is resolved only for an
-  indexed account, with no outbound lookup (design-v3 §5.10).
-- **Item 15: `com.atproto.label.queryLabels` (#675).** Anyone can read
-  the labels this AppView's operator applied, by exact account or record,
-  or by a prefix that names one whole account (`at://<did>/…*`), so no
-  request can list every label. Up to `[labels] query_max_patterns`
-  patterns (default 25), 250 labels a page. Labels on private-tier
-  records are never returned. Labels are unsigned (design-v3 §5.12).
-- **Item 15: drafts (#675).** `app.bsky.draft.createDraft`, `getDrafts`,
-  `updateDraft` and `deleteDraft`. A draft is checked against the
-  lexicon (posts, text length, the embed lists) and against
-  `[drafts] max_bytes` (default 1 MiB) before it is stored; a member
-  keeps at most `[drafts] max_per_actor` (default 1000, then
-  `DraftLimitReached`). An update of an id the member does not own
-  changes nothing and succeeds. Nothing inside a draft is fetched or
-  logged (design-v3 §5.9).
-- **Item 15: bookmarks (#675).** `app.bsky.bookmark.createBookmark`,
-  `deleteBookmark` and `getBookmarks`. Only posts can be bookmarked;
-  any other collection, private-tier URIs included, is
-  `UnsupportedCollection`, decided from the URI alone. A member holds at
-  most `[bookmarks] max_per_actor` (default 50 000). The listing reads
-  stored posts only and makes no fetch and no count refresh; a post not
-  stored here, gone or hidden shows as `notFoundPost`, and one with a
-  block as `blockedPost`. Post views carry `viewer.bookmarked`
-  (design-v3 §5.8, §8.2).
-- **Item 14: subscription state on profiles (#675).** Profile views
-  carry `viewer.activitySubscription` for a ready member subscribed to
-  the account, and detailed profile views carry
-  `associated.activitySubscription.allowSubscriptions` from the account's
-  notification declaration (`followers` when it has none)
-  (design-v3 §8.1).
-- **Item 14: `starterpack-joined` notifications (#675).** When an
-  account's profile is created, as seen live on the firehose, and names a
-  member's starter pack as the one it joined through, that member is
-  notified. A profile edit, a backfill or a replay announces nothing. The
-  notification shows the joiner's current profile record and its CID
-  (design-v3 §8.6).
-- **Item 14: `like-via-repost`, `repost-via-repost` and `starterPack`
-  (#675).** A like or repost made from a member's repost notifies that
-  member, when the repost is stored here and has the same subject, and
-  unless they were already notified of it as the post's author. A
-  `follow` notification whose follow was made through a starter pack
-  carries the pack as `starterPack`. Rebuilt like, repost and follow
-  records include their `via` (design-v3 §8.6).
-- **Item 14: sweep of subscriptions that can no longer notify (#675).**
-  The daily retention run deletes activity subscriptions whose subject is
-  no longer indexed here, so they are not shown as active
-  (`activity_subscriptions_out_of_scope_total{action="swept"}`;
-  design-v3 §5.6).
-- **Item 14: `subscribed-post` notifications (#675).** When a post by an
-  in-scope, once-backfilled author arrives from the firehose, each member
-  subscribed to that author for that kind of post gets a `subscribed-post`
-  notification, unless another reason already notified them of it. Posts
-  older than `[notifications] subscribed_post_max_age_secs` (default one
-  day) or older than the subscription, and posts written by backfill or
-  `requestRecord`, announce nothing. The author's declaration is checked
-  again each time (design-v3 §5.6).
-- **Item 14: activity subscriptions (#675).**
-  `app.bsky.notification.putActivitySubscription` and
-  `listActivitySubscriptions`. Turning a subscription off always works.
-  Turning one on needs a ready member, a subject this AppView indexes,
-  room under `[activity_subscriptions] max_per_actor` (default 1000), and
-  the subject's permission (its notification declaration; no record means
-  followers only). No notification is generated from them yet
-  (design-v3 §5.6).
-- **Item 14: notification preferences (#675).**
-  `app.bsky.notification.getPreferences` and `putPreferencesV2` store a
-  member's preferences (13 keys; `chat` is always its default), and they
-  are applied: a reason with `list: false` leaves `listNotifications` and
-  `getUnreadCount`, and `include: "follows"` keeps a reason only from
-  accounts the member follows. `push` has no effect. The legacy
-  `putPreferences {priority}` is accepted and stores nothing
-  (design-v3 §5.6).
-- **Item 13: `viewer.replyDisabled` on `getPosts` (#675).** Stored posts
-  returned by `getPosts` carry `viewer.replyDisabled` for a member, from
-  the threadgate of each post's thread root, by the same rules as on an
-  opened thread (design-v3 §8.2, §8.3).
-- **Item 13: `!no-unauthenticated` in the newer thread view (#675).** A
-  signed-out viewer of `getPostThreadV2` is not shown posts by an account
-  whose profile carries the `!no-unauthenticated` label: the opened post
-  and the posts above it become `threadItemNoUnauthenticated` items, and
-  replies are left out. Only profiles stored here are read for the label
-  (design-v3 §5.1).
-- **Item 13: `followingRule` checks Constellation (#675).** For a thread
-  whose author lets only accounts they follow reply, a follow that is not
-  stored here is looked for among the viewer's followers on Constellation
-  (at most `[known_followers] profile_scan_pages` pages, default 2,
-  charged to the caller). `viewer.replyDisabled` is then `false` or
-  `true`; when the scan cannot finish it is left out, as before
-  (design-v3 §8.3).
-- **Item 13: thread position on feed items (#675).** A post in a feed
-  that is part of its author's own thread (the root, then the author's
-  earliest reply to each post in turn) carries `opThreadPostIndex` and
-  `opThreadPostCount`. Worked out from stored posts only, for in-scope
-  authors, up to `[op_thread] max_walk` posts (default 50; a longer
-  thread carries no position; 0 turns it off) (design-v3 §8.2).
-- **Item 13: `thread_v2.max_parents` (#675).** How many parents
-  `getPostThreadV2` returns above the opened post is now a setting
-  (default 80, at most 1000) instead of a fixed number (design-v3 §5.1).
-- **Item 13: `threadgate` on post views (#675).** A post with a valid
-  threadgate of its own carries it as `threadgate` wherever the post view
-  appears, with the lists its rules name (design-v3 §8.2).
-- **Item 13: detached quotes (#675).** When the author of a quoted post
-  has detached a quote (the post's valid postgate lists the quoting post in
-  `detachedEmbeddingUris`), the quote's embedded record renders as
-  `app.bsky.embed.record#viewDetached` (design-v3 §8.3).
-- **Item 13: `viewer.knownLikers` on the thread anchor (#675).** For a
-  ready member: the accounts it follows that liked the post, with a count
-  and up to 5 profiles (design-v3 §8.2). Stored likes are joined with a
-  scan of the post's likers on Constellation, at most
-  `known_likers.scan_max_pages` pages (default 5) of 100, each charged to
-  the caller's Constellation share. Accounts with a block either way are
-  left out, and the field is left out when nobody is left.
-- **Item 13: `viewer.replyDisabled` on the thread anchor (#675).** For a
-  ready member, from the root post's threadgate (design-v3 §8.3). The
-  root's author may always reply. `allow = []` disables replies. Otherwise
-  a rule that lets the viewer in (mentioned in the root, follows the
-  root's author, is followed by the root's author, is on a list this
-  AppView serves from its own rows) enables them. When no rule lets the
-  viewer in and every rule could be checked in full, replies are disabled;
-  when one could not (a list held elsewhere, a follow not stored here), the
-  field is left out, since the answer is not known. With no gate or no
-  `allow`, the field is left out.
-- **Item 13: `viewer.embeddingDisabled` (#675).** A ready member sees
-  `embeddingDisabled: true` on a post whose author turned quoting off (a
-  valid postgate with a `disableRule`, design-v3 §8.3). The author's own
-  view does not carry it.
-- **Item 13: threadgates in thread views (#675).** `getPostThread` and
-  `getPostThreadV2` carry the root post's `threadgate` view, with the lists
-  its rules name as `listViewBasic` (design-v3 §5.1, §8.3). A gate counts
-  only when its record key is its post's and its author is the post's
-  author. A reply the gate hides is left out of both thread views; when it
-  is a direct reply of the anchor, `getPostThreadOtherV2` returns it with
-  `hiddenByThreadgate`. A hidden reply is not hidden from its own author.
-  Replies that break the gate's `allow` rules are not removed.
-- **Item 13: `getPostThreadV2` and `getPostThreadOtherV2` (#675).** The
-  flat thread view (design-v3 §5.1), built from the same tree
-  `getPostThread` assembles, so the endpoints agree on what a thread holds.
-  Parents are at negative depths, the anchor at 0, replies below. Siblings
-  come in this order: the root's author, the viewer, accounts the viewer
-  follows, everyone else; each group by `sort` (`oldest`, `newest`, or
-  `top` by like count). Every direct reply of the anchor is returned, and
-  at most `branchingFactor` replies of each deeper post, to `below` levels;
-  `moreReplies` counts what was known and not returned. A direct reply by
-  an account the viewer fully mutes moves to `getPostThreadOtherV2` with
-  `mutedByViewer`; a muted reply deeper down is left out of both. The
-  contiguous thread by the root's author carries `opThread`,
-  `opThreadPostIndex` and `opThreadPostCount`. A missing, private-tier or
-  hidden anchor is one `threadItemNotFound` item, and a blocked anchor one
-  `threadItemBlocked`. Not built yet: the threadgate view and replies
-  hidden by it, and the `!no-unauthenticated` items.
-- **Item 12: `admin farsight status` and `admin farsight prime` (#673).**
-  `status` prints Farsight's own report in brief, with whether this
-  AppView's read breaker is open and how many answers it has cached.
-  `prime <did> [--force]` asks Farsight to read one account's repository
-  again (design-v3 §5.14.11, §14.3). Both run in `serve` through the
-  command queue and fail with a reason when `farsight.url` is not set.
-  Operator notes are in `docker/README.md`, "Farsight (block lists)".
-- **Item 12: Farsight is primed when a member is enrolled (#673).** With
-  `farsight.prime_on_enroll` (default true), each `member` backfill job
-  asks Farsight to read the member's own repository, so the member's blocks
-  and list blocks are current there at once (design-v3 §5.14.11). The call
-  is best effort and never affects the job or readiness. It has a breaker
-  of its own, apart from the one for reads.
-  `farsight_prime_failed_total{reason}`.
-- **Item 12: inbound list blocks in notifications (#673).** An account that
-  blocks the viewer through a list sends it no notifications: it is left
-  out of `listNotifications`, and `getUnreadCount` subtracts its unread rows
-  (design-v3 §5.14.7). The count asks Farsight about the unread rows'
-  authors, newest first, up to what one request may ask; authors past that
-  are not checked. A member that stops being ready loses its cached
-  Farsight answers.
-- **Item 12: `getRelationships.blockedByList` (#673).** For a ready-member
-  `actor`, each other account that blocks it through a list gets
-  `blockedByList`, the list's URI, from one Farsight lookup on the caller's
-  share (design-v3 §5.14.8). Answers are cached in shared entries for
-  `farsight.cache_ttl_secs`. This public endpoint never reads or writes a
-  member's own cached answers, so it cannot show that a member recently
-  viewed an account. With no answer from Farsight the field is left out,
-  the response still goes out, and `relationships_partial_total` counts it.
-- **Item 12: inbound list blocks from Farsight (#673).** With
-  `farsight.url` set, a ready member's public requests ask Farsight which
-  accounts on the page block the member through a list, and such an account
-  is treated as one that blocks the member directly: `viewer.blockedBy` is
-  true, and every surface that already hides a direct inbound block hides
-  this one (design-v3 §5.14.5). Accounts with a direct block are not asked
-  about, and neither is the member itself.
-  - Answers are kept per viewer for `farsight.cache_ttl_secs`, and a
-    request never asks twice about one account. An answer Farsight does not
-    vouch for never removes a cached block; a vouched clean answer does.
-  - A request asks about at most `farsight.max_calls_per_request` chunks of
-    100 accounts and waits at most `farsight.timeout_ms` in all. Calls draw
-    on a bucket of their own, with member and non-member pools and a
-    per-requester share. Five failed calls open a breaker, after which no
-    call is made for 30 s; an anonymous caller's failures do not count
-    toward it. An answer over the size cap is asked again once, as two
-    halves.
-  - When Farsight gives no answer, for any reason, the page is rendered
-    with the blocks this AppView holds itself. Nothing here slows a request
-    beyond the allowance or turns it into an error.
-  - Private-tier reads never ask Farsight. `getMutes` reads the member's
-    cached answers only, so Farsight never sees a member beside its mutes.
-  - `farsight_calls_total{outcome}`, `farsight_coverage_total{level}`,
-    `farsight_partial_total{reason}`, `farsight_auth_failed_total`.
-  - Not built yet: the post-scan filters that drop a blocker's items from
-    the timeline, list feeds and notifications before views are built, the
-    unread-count correction, `getRelationships.blockedByList`, clearing a
-    removed member's cached answers, the prime on enrollment, and the
-    `admin farsight` commands.
-- **Item 12: the Farsight client (#673).** `[farsight]` config and the
-  `FARSIGHT_TOKEN` environment variable (design-v3 §5.14.4). With
-  `farsight.url` unset, the default, nothing changes. Startup refuses a
-  `url` that is not `https`, or one set without `FARSIGHT_TOKEN`. The
-  `farsight` module holds the parts no request uses yet: the DIDs Farsight
-  accepts and their canonical form, the split of a lookup into calls of at
-  most 100 accounts and 6 KB, the `checkBlocks` call with its failures
-  classified, the reading of an answer into one pair answer per account,
-  and the rule for writing a new answer over a cached one. No request calls
-  Farsight yet.
-- **Item 12: `getListFeed` (#673).** The posts and reposts of a list's
-  members, newest first (design-v3 §5.5). Local rows answer only when the
-  list is served locally and every member is in scope, so that the feed is
-  complete. Otherwise an upstream AppView is asked. When none answers, a
-  locally served list is answered from its in-scope members, with a cursor
-  of its own kind, and `list_feed_partial_total` counts it. The viewer's
-  mutes and blocks drop items after hydration. An unknown list is
-  `UnknownList`.
-- **Item 12: `getKnownFollowers` (#673).** For a ready member: the accounts
-  it follows that follow the named account (design-v3 §5.3). Stored follows
-  are joined with a scan of the account's followers on Constellation, at
-  most `known_followers.scan_max_pages` pages (default 20) of 100, each page
-  charged to the caller's Constellation share. A scan that stops early
-  gives a shorter list and counts in
-  `known_followers_scan_truncated_total`. Accounts with a block in either
-  direction are left out. The result is paged from a snapshot with an offset
-  cursor. With Constellation unavailable, stored follows alone answer.
-- **Item 12: `getRelationships` (#673).** For a ready member, `following`,
-  `followedBy`, `blocking` and `blockedBy` come from local rows, which are
-  complete for a member (design-v3 §5.3). `blockingByList` is the member's
-  `listblock` record for a moderation list that names the other account,
-  and only for a list whose owner is a ready member; it is read from public
-  rows and never from the subscription tables. Any other actor is asked of
-  an upstream AppView; when none answers, local rows answer what they can
-  and `relationships_partial_total` counts it. A stored block is read only
-  when its author is in scope or its subject is a member. At most 30
-  `others`; one that does not resolve is `#notFoundActor`. `blockedByList`
-  is not set yet: it needs the block index.
-- **Item 12: starter-pack joined counts (#673).** A job recounts, for every
-  stored pack, how many accounts joined through it, every
-  `starter_packs.counts_refresh_secs` (default 3600, at least 60). The
-  all-time number comes from Constellation, or from local profile rows when
-  Constellation does not answer. The week number is today's all-time value
-  minus the value of 7 days ago when both came from the same source;
-  otherwise it is the local count of joiners whose profile is at most 7 days
-  old. A count is written only while its pack exists.
-  `starter_pack_counts_refreshed_total{source}`.
-- **Item 12: `getListsWithMembership` and `getStarterPacksWithMembership`
-  (#673).** A ready member's own moderation and curate lists, or its own
-  starter packs, each with the named actor's list item when the actor is on
-  the list. Reference lists are never included, and asking for them is `400
-  InvalidRequest`.
-- **Item 12: starter-pack views (#673).** `getStarterPack`,
-  `getStarterPacks` (at most 25 URIs, misses omitted) and
-  `getActorStarterPacks` (design-v3 §5.5). A stored pack is served from its
-  row, any other from Slingshot. An actor's packs are listed from local rows
-  only for a ready member; otherwise from an upstream AppView, then the
-  owner's PDS. The pack's list follows the same rule as `getList`: its item
-  count and its sample of at most 12 members come from local rows only when
-  the list's owner is a ready member, and from an upstream AppView
-  otherwise. Joined counts are shown when the counts job has stored them;
-  that job is not built yet. `feeds` is omitted.
-- **Item 12: `getList` and `getLists` (#673).** A list is served from this
-  AppView's own rows only when its owner is a ready member, whose lists and
-  list items are held in full (design-v3 §5.5). Any other list is read as if
-  nothing were stored: its record from Slingshot, its items from an upstream
-  AppView, and, when none answers, from the owner's PDS (at most
-  `lists.read_listing_pages` pages a request, default 5, with a `P:` cursor
-  while the PDS has more). `listView` carries
-  the creator, `listItemCount` (distinct subjects, or the upstream's number),
-  local labels, and the viewer's own `muted`, `blocked` and
-  `referenceListOptOut`. Duplicate items of one subject show once. A
-  reference list leaves out subjects who opted out, except for its owner,
-  who sees them with `subjectOptedOut`. `getLists` takes `purposes` as short
-  forms or full tokens. A URI that is not an `app.bsky.graph.list` misses
-  with no fetch.
-- **Item 12: thread mutes and `getBlocks` (#673).**
-  `app.bsky.graph.muteThread` and `unmuteThread` store the caller's muted
-  thread roots (design-v3 §5.3). A muted thread sends the muter no
-  notifications: not for a reply in it, and not for a like, repost or quote
-  of a post in it. Post views in it carry `viewer.threadMuted: true`,
-  including upstream views of replies this AppView does not store. `root`
-  must be the at-uri of an `app.bsky.feed.post`; it is not looked up, so the
-  call makes no fetch. A member may mute `thread_mutes.max_per_actor`
-  threads (default 10 000); past it the call is `400 InvalidRequest`, and a
-  repeat of an existing mute still succeeds. `app.bsky.graph.getBlocks`
-  lists a ready member's own blocks, newest first, with `viewer.blocking`.
-- **Item 11a: deferred services can be forwarded (#672).**
-  `[services.<name>] state = "proxy"` is now accepted for `contact`,
-  `age_assurance` and operator-defined services (design-v3 §6.7); before,
-  it stopped startup. Push still accepts only `disabled`, and `serve` is
-  still refused. A request to a forwarded NSID goes to
-  `<proxy_url>/xrpc/<nsid>` with its query and body unchanged, and the
-  target's status and JSON body come back unchanged.
-  - **Tokens.** A request with an `Authorization` header is verified here
-    first, with `lxm` equal to the called method and an `aud` fragment that
-    is absent or in the service's `aud_fragments` (default `bsky_appview`).
-    The header is then forwarded unchanged. One that fails is answered `401
-    InvalidToken` here and is never forwarded. A caller the backstop already
-    verified is not verified twice, but still meets the service's fragment
-    list.
-  - **Headers.** Only `Authorization`, `Content-Type` and `Content-Encoding`
-    (POST), `Accept-Language` and `atproto-accept-labelers` are sent, with
-    this AppView's `User-Agent`. Cookies, `atproto-proxy`, `X-Forwarded-For`
-    and every other header are dropped, so the target never sees the
-    caller's address. Of the target's headers only `Content-Type`,
-    `Content-Encoding`, `Content-Language` and `atproto-content-labelers`
-    are relayed, and `X-Content-Type-Options: nosniff` is added.
-  - **Limits.** `service_proxy_member` (5/s, burst 20) and
-    `service_proxy_ip` (10/s, burst 20) have one bucket per service and per
-    key, the key being the one the backstop selected. Each service has a
-    request bucket (`rate_per_sec` 20, `burst` 40) with the member and
-    non-member pools and per-requester shares of §II-8.3
-    (`target_kind="service"`), and `max_in_flight` (64) calls in progress.
-    Over a bucket: `429` with `ratelimit-reset`. Over `max_in_flight`: `503
-    NotEnoughResources`, not queued. A POST body is read in full first,
-    within `max_request_bytes` (`413 PayloadTooLarge`) and
-    `body_read_timeout_ms` (`400 InvalidRequest`), so a slow sender holds
-    nothing of the service's.
-  - **Answers.** JSON within `max_response_bytes`, or an empty body, is
-    relayed with the target's status. A redirect, another content type or a
-    larger body is `502 UpstreamFailure`; no answer within `timeout_ms` is
-    `504 UpstreamTimeout`. These messages never name the target.
-  - **Transport.** Each service has its own client: no redirects, the
-    system resolver, `https` to public addresses only.
-    `allow_private_network = true` permits `http` and loopback, RFC 1918,
-    CGNAT and unique-local addresses for that service's host. Over `http`
-    every resolved address must be private. Link-local addresses stay
-    blocked.
-  - `app.bsky.contact.sendNotification` keeps its 501 in every state.
-  - Metrics: `service_proxy_requests_total{service, nsid, outcome}`,
-    `service_proxy_duration_seconds{service}`, `service_state{service,
-    state}`. Operator notes are in `docker/README.md`, "Forwarding a service
-    to another server".
-- **Item 10: rate limits are config (#669).** Every limit is
-  `[rate_limits.<class>]` with `per_sec` (a decimal) and `burst`, with the
-  former constants as defaults (design-v3 §10). Startup refuses a `per_sec`
-  that is not finite or is outside 0.000001 to 1 000 000, a `burst` below 1,
-  and a pair that would overflow the bucket arithmetic. New classes
-  `search_anon` (10/s, burst 20) and `search_auth` (30/s, burst 60) now
-  charge `searchActors`, which used the read classes before. `resolve` has
-  one bucket per endpoint and IP. `rate_limits.endpoint_class.<nsid>` moves
-  one served endpoint to another class family (`read`, `search`, `write`,
-  `private`, `thread_lens`, `index_request`, `resolve`); an unknown family,
-  an NSID this AppView does not serve, or a DID-keyed family on an endpoint
-  that accepts anonymous calls is a startup error. `service_proxy_member`
-  and `service_proxy_ip` are accepted and validated; nothing charges them
-  until service proxying is built.
-- **Item 10: upstream calls draw on pools and shares (#669).** Every
-  request carries a handle naming who is charged (a ready member by DID,
-  everyone else by IP key) and one 6 s deadline that all its cascades
-  share, in place of 6 s per cascade (design-v3 §II-8.3). Each outbound
-  network's `rate_per_sec`/`burst` bucket, Slingshot
-  (`microcosm.slingshot_rate_per_sec`) and request-origin Constellation
-  (`microcosm.constellation_rate_per_sec`) are now split into a member pool
-  and a non-member pool with per-requester shares. With the defaults a
-  single non-member address gets 2.5 calls a second (burst 5) to Bluesky's
-  AppView, where every caller shared 20 a second before. An empty share or
-  pool is no answer: it stops the cascade and its fallbacks for that item,
-  is never recorded by a breaker, and never turns into a not-found.
-  - A single-subject request that then finds nothing (`getProfile`,
-    `getPostThread`, an actor that does not resolve) answers
-    `429 RateLimitExceeded` with `ratelimit-reset`, not "not found".
-  - `getLikes`, `getRepostedBy`, `getQuotes` and `getFollowers` answer 429
-    when there is no budget for the Constellation listing, and no longer
-    fall back to local rows in that case.
-  - Posts and profiles inside a list are left out; a thread's parent chain
-    stops without a not-found item; counts use the stored or local value;
-    Thread Lens reports `upstream-unavailable`.
-  - A cascade cut by the request's deadline is no answer too. A call the
-    deadline cuts short is not counted against the network's breaker
-    (`upstream_budget_cutoff_total{network}`); before, slow requests could
-    open a healthy network's breaker.
-  - An author feed or follows list read from another AppView or the
-    author's PDS answers 429 when it ran out of budget before producing
-    anything. A PDS feed that runs out while fetching a reposted post ends
-    the page before that item and keeps its cursor behind it, so the next
-    page resumes there.
-- **Item 10: the pre-auth backstop chooses who a request is charged to
-  (#669).** Before the per-requester backstop, a request whose token passes
-  the claims pre-check, names a ready member whose signing key is held in
-  memory, is admitted by the verification limits and verifies against that
-  key is charged to the member's DID: the `global` backstop, and every
-  upstream pool and share. Everything else is charged to its IP key
-  (design-v3 §II-8.3). So members behind one PDS no longer share that
-  PDS's address for the backstop or for upstream budgets, and a forged
-  token naming a member spends none of the member's limits. That step
-  reads no database and makes no network call.
-  - A key under 1 h old authenticates, and the handler does not verify the
-    token a second time. A key 1 h to 24 h old only selects the member;
-    the handler verifies as before.
-  - Ready members' DID documents are held in a table reloaded from
-    `did_cache` every 30 s; documents older than 12 h, or missing, are
-    re-resolved in the background (`member_key_refresh_failed_total`,
-    gauge `member_keys`).
-  - A member whose own verification ceiling is empty gets 429 and is
-    charged to neither key.
-  - Thread Lens, the private endpoints and `index.requestRecord` use the
-    same selection.
-  Differences from the design text, recorded on #669: the selection is
-  passed to handlers through a task-local, not request extensions; the key
-  table follows `did_cache` with up to 30 s delay instead of being updated
-  on each write; only the table counts as an in-memory key (not
-  kryphocron's own cache or the fetch cell).
-- **Item 11: retention covers the new tables (#671).** The daily job
-  prunes lists, list items, list blocks, opt-outs, starter packs, labeler
-  declarations, self records and poll posts once their author leaves
-  scope (design-v3 §14.1). Thread and post gates go the same way, unless
-  their post row is still kept. Starter-pack counts whose pack is gone
-  are swept, and `tag_activity_hourly` rows older than 72 hours are
-  deleted. The subscription tables and the viewer-private tables are
-  never swept. Deleting a post now deletes its canonical thread gate and
-  post gate with it.
-- **Item 11: backfills fetch the new collections (#671).** The depth
-  table gains them (design-v3 §II-5.10): a member's lists, list items, list
-  blocks, opt-outs and starter packs are listed whole, its thread and post
-  gates and poll posts with the same limit as its posts; a scoped DID gets
-  25 starter packs, 100 poll posts and the gates of its 100 posts; the
-  labeler declaration and the three self records are fetched with
-  `getRecord`, like the profile. A gate is kept only when its post is
-  among the posts the job selected. `private` and `authz` jobs never list
-  them, so readiness is unaffected. Reconcile deletes a stored record of
-  these collections that the repo no longer has, as it does for posts.
-- **Item 11: one-time re-sync after the upgrade (#671).** Once, after
-  the upgrade, `serve` enqueues a `resync` job for every member and then
-  for every other in-scope DID, one a second, so the new collections and
-  each profile's CID are fetched for accounts known before it
-  (design-v3 §12.3). Progress is kept in
-  `worker_state['v3_collections_resync']`; a restart resumes, and a
-  finished pass never runs again.
-- **Item 11: the post-migration backfill task (#671).** `serve` starts a
-  background task once migrations are applied (design-v3 §12.2).
-  - Phase 1 fills the new `posts` columns from each stored record, and the
-    new profile columns of `actors`, in keyset batches
-    (`schema_backfill.batch_size`, default 10 000, with
-    `schema_backfill.pause_ms`, default 100, between them). A batch only
-    touches rows still unfilled whose `cid` (or profile rev) is the one it
-    read, so it never overwrites what the writer stored meanwhile. Progress
-    is kept in `worker_state`, so a restart resumes.
-  - Phase 2 then builds `posts_search`, `posts_tags`, `posts_domains`,
-    `posts_urls`, `posts_mentions`, `posts_langs`, `posts_created`,
-    `likes_via` and `reposts_via`, one at a time, with
-    `CREATE INDEX CONCURRENTLY` on a connection of its own with no lock or
-    statement timeout. An invalid index left by an interrupted build is
-    waited for while a backend still builds it and dropped otherwise. A
-    failed build is retried after `schema_index.retry_backoff_secs`
-    (default 300), doubling up to an hour.
-  - `_health` detail gains `schema_backfill_done` and
-    `search_indexes_ready`. Metrics: `schema_backfill_remaining{table}`,
-    `schema_index_pending`, `schema_index_build_failures_total{index}`.
-  Expect the `posts` heap and its indexes to grow, up to about twice,
-  while phase 1 rewrites old rows.
-- **Item 11: twelve more collections are indexed (#671).** Lists, list
-  items, list blocks, reference-list opt-outs, starter packs, labeler
-  declarations, the notification declaration, actor status and
-  content-visibility declaration, thread gates, post gates and Nearhorizon
-  poll posts are classified and written to their tables, with the same
-  last-writer-wins, tombstone and delete rules as every record
-  (design-v3 §3.2). All are admitted by rule 1 only: their author must be
-  in scope.
-  - A list item is indexed only when its `list` is a list in its own
-    repo. Otherwise any account could add subjects to another account's
-    list.
-  - The labeler and the three declaration records are indexed only at
-    rkey `self`.
-  - `index.requestRecord` accepts these collections.
-  - The `account_deleted` purge removes an account's rows from every new
-    record table, its derived starter-pack counts, its own private state,
-    and subscriptions others hold on it. The `member_removed` purge
-    removes the member's private state (list and thread mutes, bookmarks,
-    drafts, activity subscriptions, notification preferences).
-  No endpoint reads the new tables yet, and the subscription copy of list
-  items (rule 4) is item 12.
-- **Item 11: the writer fills the new columns (#671).** Every post
-  written from now on stores `tags`, `link_domains`, `link_urls`,
-  `lang_prefixes`, `embed_type`, `media_type` and `search_tsv`
-  (design-v3 §3.1, §9.0): tags are lowercased NFC without `#`, sorted and
-  distinct; links are `http`/`https` only, with each link's host and its
-  parent domains; languages carry their primary subtag. The arrays are
-  `{}`, never NULL, on a written row. Likes, reposts and follows store
-  their `via` reference. Profiles store `profile_cid`, `pronouns`,
-  `website`, `joinedViaStarterPack` and a clamped `createdAt`; a profile
-  write at the stored rev fills a missing `profile_cid` and changes
-  nothing else. Rows written before this stay unfilled until the
-  post-migration task runs. New dependency: `unicode-normalization`.
-- **Item 11: migrations 0004–0011 and 0013–0017 (#671).** The schema of
-  design-v3 §3.1: lists, list items, list blocks and opt-outs; the rule-4
-  subscription tables with `subscribed_lists.item_count` kept by
-  triggers; list and thread mutes; starter packs and their counts;
-  labeler declarations and the other rkey-self actor records; thread and
-  post gates; poll posts; bookmarks, drafts, activity subscriptions and
-  notification preferences v2; `via` references on follows, likes and
-  reposts; profile columns on `actors`; search and trend columns on
-  `posts`; `tag_activity_hourly` with its `posts`, `likes` and `reposts`
-  triggers; backfill job generations. Every change is additive, and none
-  builds an index on `posts`, `likes` or `reposts`. Nothing writes or
-  reads the new tables and columns yet. With 0012 they ship as one
-  upgrade.
-  - The startup check that every member can refresh its key once per
-    window from PLC's issuer-refresh slice is added (`community.max_members`
-    against `identity.member_pool_refresh_secs`, design-v3 §13).
-- **Item 10: an in-scope author's feed continues from its PDS (G-3,
-  #670).** When `getAuthorFeed` runs out of stored rows for an in-scope
-  author whose PDS lists records newest first, it emits a
-  `P:<oldest stored post rkey>:<oldest stored repost rkey>` cursor and the
-  next page comes from the PDS, as it already did for out-of-scope
-  authors. On a PDS that lists oldest first, or whose order is unknown,
-  the feed ends with the stored rows. A PDS page that the filter empties
-  now keeps its cursor, so it no longer ends the feed.
-- **Item 10: `getPostThread` shows replies and parents it does not store
-  (G-6, #670).** A node's replies are the union of the local rows and the
-  replies Constellation lists for it (up to
-  `thread.constellation_replies_per_node`, default 50). Replies and
-  parents not stored here are fetched from Slingshot through the read-time
-  cache, at most `thread.max_remote_fetches` (default 100) per request;
-  the node cap is `thread.max_nodes` (default 200). Before, only local
-  replies were shown and a parent by an out-of-scope author was a
-  not-found item.
-  - A listed reply that cannot be fetched, or whose record does not reply
-    to that node, is left out, not shown as not-found.
-  - A reply or parent by an in-scope author is never fetched: if it is not
-    stored, it is gone.
-  - A parent there was no budget to fetch ends the chain with no item.
-- **Item 10: `getQuotes` shows quoting posts it does not store (G-7,
-  #670).** A quoting post Constellation lists and this AppView has not
-  indexed is fetched from Slingshot through the read-time cache, at most
-  `limit` per page, and placed in listing order. Before, such posts were
-  left out. Hidden posts and blocked authors are filtered before any
-  fetch.
-- **Item 10: `getProfiles` resolves out-of-scope actors (G-1, #670).**
-  An actor this AppView does not index is fetched the way `getProfile`
-  fetches it (its home AppView and the cascade, then the Slingshot profile
-  record), up to 8 at a time, and returned in input order. Before, such
-  actors were dropped. One that no source resolves, or that there is no
-  upstream budget for, is omitted.
-- **Item 10: token-issuer lookups are charged to the request (#669).**
-  When verifying a token needs the issuer's DID document from the network,
-  the fetch costs the request one token of its identity share and, for a
-  `did:plc`, a PLC token (design-v3 §II-8.3). The charge is the first step
-  of the fetch itself, so a document already held costs nothing and a
-  fetch that finds no budget stores no failure. PLC's member pool keeps
-  half of itself as an issuer-refresh slice: on a request charged to an IP
-  key, a ready member's document may be fetched from it once per
-  `identity.member_pool_refresh_secs` (default 600). So a flood of tokens
-  naming members takes at most that slice, and the rest of the member pool
-  stays for members' own requests. A request whose issuer lookup found no
-  budget answers `429 RateLimitExceeded`, not `401`.
-- **Item 10: pre-auth backstop parts (#669).**
-  `xrpc::backstop` holds the two parts of design-v3 §II-8.3's backstop
-  that need no I/O. The claims pre-check reads a token's unverified
-  payload and applies the claim checks the verifier makes after the
-  signature (`iss`, `aud` with no fragment or `#bsky_appview`, `lxm`,
-  `iat`, `exp`, `nbf`, the validity window, `nonce`), with the verifier's
-  own skew and window. `VerifyLimits` is the token lifecycle around a
-  pre-backstop verification: failed-verification limits per (IP key,
-  issuer) and per IP key, an exemption for a member that verified from
-  that IP key against the same key within a day, a per-member ceiling and
-  a per-IP-key ceiling. New `[auth]` settings, validated at startup.
-- **Item 10: identity lookups and author-PDS listings are charged
-  (#669).** Resolving a DID or a handle for a request costs one token of
-  the requester's identity share
-  (`identity.requester_resolutions_per_sec`, default 5/s, burst 25), and a
-  PLC directory fetch it causes also draws on PLC's request bucket
-  (`identity.plc_request_rate_per_sec`). A summary (PDS and verified
-  handle) is reused for 5 minutes, so a DID named many times is resolved
-  and charged once; before, every use repeated the handle check over the
-  network. Without budget the lookup has no answer, and `resolveDid`
-  answers 429 instead of the unresolvable shape. Every `listRecords` call
-  made for a public request draws on its PDS host's own bucket
-  (`sync.public_fallback_rate_per_host`, default 25/s, for up to
-  `sync.max_public_fallback_hosts` hosts), split into pools and shares
-  like the others. It no longer uses the private tier's read-fetch bucket,
-  so public traffic cannot drain the private tier's head fetches. Token
-  issuer lookups during authentication are not charged yet.
-- **Item 10: pools and fair shares (#669).** `xrpc::pools`
-  holds the shared upstream bucket of design-v3 §II-8.3: a member pool and
-  a non-member pool (`constellation.nonmember_fraction`, default 0.5), and
-  inside each a per-requester share (`constellation.requester_share`,
-  default 0.25) kept in one LRU cache
-  (`constellation.requester_share_max_entries`, default 200 000). A draw
-  takes the share token and the pool token as one step, so an empty pool
-  does not spend the share. New settings, validated at startup:
-  `microcosm.slingshot_rate_per_sec`/`_burst`,
-  `microcosm.constellation_rate_per_sec`/`_burst`,
-  `identity.plc_request_rate_per_sec`/`_burst` and
-  `identity.requester_resolutions_per_sec`/`_burst`.
-- **Item 10: IPv6 callers are limited per `/64`.** Every IP-keyed rate
-  limit (anonymous reads and search, `resolve`, the per-IP backstop) keys
-  an IPv6 address by its `/64`, and an IPv4-mapped address by its IPv4
-  address (design-v3 §II-8.3 item 3).
-- **Item 10: gallery embeds.** `app.bsky.embed.gallery` is rendered wherever
-  an embed is: as a post's embed, as the media of `recordWithMedia` (which
-  no longer loses its quoted record), and inside a quoted post's `embeds`
-  (design-v3 §8.4; locked decision 33). Every view item carries
-  `$type: app.bsky.embed.gallery#viewImage` with `thumbnail`, `fullsize`,
-  `alt` and `aspectRatio`; a record item of another type, or one missing
-  `alt` or `aspectRatio`, is left out.
-- **Item 10: `getAuthorFeed` `posts_with_video` (G-2).** The filter is
-  accepted and returns posts whose media is a video, directly or inside
-  `recordWithMedia`. One classifier, `media_type`, decides for local rows
-  and for records listed from a PDS.
-- **Item 10: scoped mutes.** `muteActor` takes `onlyReposts` and
-  `onlyQuoteposts` and stores `mutes.scope` (`full`, `reposts`, `quotes`,
-  `reposts_and_quotes`; migration 0012). A repeat call replaces the scope
-  and keeps the row's `created_at`; `unmuteActor` deletes the row whatever
-  its scope; `getMutes` lists full mutes only (design-v3 §5.3; locked
-  decision 32). A repost mute removes the subject's reposts from the
-  timeline and their `repost` notifications; a quote mute removes their
-  quote posts and `quote` notifications. `viewer.muted` is the full mute;
-  `mutedOnlyReposts` and `mutedOnlyQuoteposts` are set only when it is
-  false. The private-tier mute oracle reads full mutes only.
-- **Item 10: the final router, with CORS.** Every route is merged into one
-  router, which then gets its fallbacks, the per-IP backstop and, outermost,
-  a CORS layer (design-v3 §6.3, §6.5). Every `/xrpc/*` response, errors
-  included, carries `Access-Control-Allow-Origin: *`; preflights allow `GET`
-  and `POST` with `authorization`, `content-type`, `atproto-proxy` and
-  `atproto-accept-labelers`; `X-Prism-Sort-Fallback`, `ratelimit-reset`,
-  `Retry-After` and `atproto-content-labelers` are exposed. This covers the
-  private, index, Thread Lens, resolve-DID and health routes, so a browser
-  client can call the AppView directly with a bearer token.
-- **Item 10: router fallback and wrong-verb answers.** An unregistered
-  `/xrpc/<nsid>` answers `501 MethodNotImplemented`, a malformed NSID
-  `400 InvalidRequest`, and a registered method asked with the wrong verb
-  `400 InvalidRequest` "Incorrect HTTP method (X) expected Y". Before, these
-  were a bare 404 and an empty 405. Both are charged to `anon_read`.
-- **Item 10: honest-501 routes.** The 36 deferred endpoints (feed
-  generators, push, preferences, reports, video, external embed views, age
-  assurance, contact) answer `501 NotImplemented` from registered routes,
-  for their lexicon verb, without authentication (§6.1, §6.2).
-  `honest_501.status_url` fills the "See <link> for status." pointer, and an
-  empty one drops that sentence; `honest_501.messages.<nsid>` overrides one
-  message. `honest_501_total{nsid}`.
-- **Item 10: `[services.*]` and `[features]` config.** Deferred external
-  services (`contact`, `age_assurance`, `push`, and operator-defined ones
-  with their own `methods`) are `disabled`, `proxy` or `serve` (§6.7). This
-  build accepts only `disabled`: `proxy`, `serve` and any `features.* = true`
-  stop startup with exit 78 and say why. The whole of §6.7.2.3's validation
-  is in, including the reserved namespaces and the one-owner-per-NSID check
-  for custom services. `features.push`, `features.age_assurance` and
-  `features.contact` are removed and name their replacement key.
-- **Item 10: `Retry-After` on `NotReady`.** Every `400 NotReady` carries
-  `Retry-After` from `community.not_ready_retry_secs` (default 5): a constant
-  hint for clients, not an estimate of indexing progress.
-- **Item 10: `#bsky_notif` and `/did.json`.** The did:web document lists the
-  notification service beside `#bsky_appview`, so a PDS proxying push
-  registration reaches the honest 501. `/did.json` serves the same bytes as
-  `/.well-known/did.json`, both with `Cache-Control: public, max-age=300`.
-- **Item 8.5: pre-Phase B verification tests.** Ascending-PDS author-feed
-  fallback (newest `limit` records from at most 10 listing pages, no cursor,
-  a `P:` cursor ends the feed) against a mock ascending PDS; eligibility
-  streak restarts after a mid-streak success. The Thread Lens block-party
-  and `tier-hidden` no-lookup tests re-run green.
-- **Item 8.5: `app.nearhorizon.index.requestRecord`.** The §5.9 safety net:
-  any authenticated DID may ask the AppView to index a record from its own
-  repo; the record is fetched from the caller's PDS (`getLatestCommit`, then
-  `getRecord`) and run through the normal write path, answering `indexed`,
-  `deleted`, `out_of_scope` or `unchanged`. A URI outside the caller's
-  repo and an unsupported collection are distinct `InvalidRequest` messages
-  (#232); per-DID 0.5/s, burst 30. `admin deadletter replay` now shares the
-  same procedure (`firehose::index_request`).
-- **Item 8: upstream views prefer Constellation counts.** After
-  normalization, every upstream post view (`likeCount`, `repostCount`,
-  `replyCount`, `quoteCount`) and profile view (`followersCount`) takes a
-  fresh or stale `constellation_counts` value over the upstream count;
-  stale rows and targets with no row are queued on `cc:refresh`, and with no
-  row the upstream count stays (never a local zero). Applies to public
-  upstream views and Thread Lens. `upstream_view_counts_total{source}`.
-- **Item 8: notification, mute and label coverage.** Tests for every
-  notification reason's record (`reply`, `mention`, `quote`, `like`,
-  `repost`, `follow`), block exclusion in both directions for the list and
-  the unread count, `indexed_at::id` paging, unmute idempotence, and local
-  label emission and enforcement (`!takedown` hidden from lists and direct
-  fetches, `!hide` listed nowhere but returned on direct `getPosts`,
-  informational labels on posts, authors, profiles and thread replies).
-- **Item 8: mutating admin commands tested through the queue.**
-  `backfill` (default `member`/`scope` depth, explicit depth),
-  `scope rebuild --dry-run` (counts, no side effects), `resync
-  --private-and-members` (gap epoch advanced, member readiness cleared,
-  `authz`/`resync` enqueued), `deadletter replay` (record re-fetched and
-  admitted, absent record deleted, entry left listed) and `deadletter drop`.
-- **Item 7: migration 0002.** `private_posts.reply_root_cid` and
-  `reply_parent_cid` (nullable). Rows written earlier keep NULL until an
-  `admin backfill --depth resync` refetches them.
-- **Item 7: reply cids on private views.** `postPrivate` ingest reads
-  `reply.{root,parent}.cid` (string or `$link`; a cid of any other shape is
-  malformed) and `privatePostView.record.reply` carries `{uri, cid}` strong
-  refs, `{uri}` only for pre-0002 rows.
-- **Item 7: eligibility failure handling.** Migration 0003 adds
-  `actors.eligibility_failure_count` and `eligibility_failing_since`. A
-  failed `getRepoStatus` confirmation (network error, 5xx) keeps eligibility
-  and extends the streak; three consecutive failures spanning at least 24 h
-  remove it (`eligibility_cleared_after_failures`). Definitive answers (repo
-  not found, inactive, no PDS, host outside the community patterns) remove
-  it at once, and any answer resets the streak. Backfill `prepare` now
-  returns a typed `PrepareError` (`Negative` / `Failed`).
-- **Item 7: `admin member remove` re-confirms eligibility.** For a private
-  owner whose community-PDS confirmation is missing or older than 24 h, the
-  command re-confirms with `getRepoStatus` before the `member_removed`
-  marker, so the purge end's owner re-evaluation sees fresh eligibility. The
-  outcome never blocks the removal and is reported in the command result
-  (`eligibility`).
-- **Item 7: Slingshot client.** `microcosm::slingshot` `getRecord` for
-  record-level fallback (§8.3 step 6, Thread Lens step 4): through `net`,
-  3 s timeout, 256 KiB cap; classified as record, `NotFound`, `Transient` or
-  `Invalid`. `net` gains a test-only loopback client for fake upstreams.
-- **Item 7: `appview_clients`.** One outbound client per enabled network
-  (the local `community` network has none): `unauth`, or `service_jwt` with
-  a fresh AppView-signed token per call (`iss` did:web, `aud` =
-  `appview_did`, `lxm`, 60 s `exp`, 16-byte `jti`, ES256K low-S). Typed
-  `getProfile`, `getPosts`, `getPostThread`, `getAuthorFeed`, `getFollows`;
-  3 s per call, 4 MiB cap.
-- **Item 7: `constellation` routing.** The routing table from
-  `[[constellation.networks]]` and `[constellation.cascade]`: §8.2 PDS
-  matching (first match in file order; `community` is local, never an
-  outbound call), the per-DID `route` cache (200 000 entries, 1 h, resolved
-  DIDs only), and the call plan (home AppView, then the cascade without it,
-  disabled networks skipped). §8.3 response classes (`hit`, `miss`,
-  `withheld`, `auth-refused`, `transient`); per-network token buckets
-  (empty = transient skip) and breakers (5 consecutive failures, 30 s open,
-  one half-open probe); 3 s per call, 6 s per cascade.
-  `app.nearhorizon.constellation.resolveDid` (public, 10/s burst 20 per IP,
-  `cache-control: public, max-age=300`). Rate classes `threadLens` (2/s,
-  10 per DID) and `resolveDid` added.
-- **Item 7: `RealUpstreamSource`.** Hydration's seam now serves
-  out-of-scope subjects: home AppView then the cascade (skipped for the
-  `community` network), then record-level fallback. Profiles, posts and
-  thread anchors (with their parent chain) fall back to Slingshot records;
-  author feeds and follows fall back to the author PDS `listRecords` on the
-  read-fetch budget, continuing (`P:` cursor) only on PDSes that list
-  descending (order probed once per host, cached 24 h). Upstream views are
-  normalized (§8.6: local viewer state and labels, private references
-  not-found) and cached in `rt`; upstream post and thread fetches run the
-  moderation gate first. Non-indexed handles resolve through the identity
-  resolver (bidirectionally verified). `serve` wires the routing table,
-  AppView clients, cascade, Slingshot and `resolveDid`.
-- **Item 7: Thread Lens.** `app.nearhorizon.threadLens.getThread` and
-  `.resolve` (POST, service-JWT auth, 2/s burst 10 per DID). The caller DID
-  is used for the auth gate and rate limit only. Hydration runs with no
-  viewer at all (never `actor_viewer`/`post_viewer`, every `viewer` is
-  `{}`), and the gap taxonomy has no viewer-relative variant. The §10.4
-  ladder: `tier-hidden` before any lookup, then the moderation gate, local
-  tombstones and posts, home AppView and cascade (`getPosts`), Slingshot,
-  and classification (`deleted`, `not-found`, `upstream-unavailable`,
-  `content-stripped`). `getThread` takes its structure from upstream
-  `getPostThread` (`#blockedPost` stubs → local/Slingshot, else
-  `blocked`; `#notFoundPost` → full ladder), falls back to the anchor and
-  parent chain, appends local and Constellation replies breadth-first, and
-  caps at 200 nodes. Responses are `PublicEmit`s built in
-  `hydration::lens`.
-- **Item 6: private tier and `app.nearhorizon.private.*`.** `private_tier`
-  owns every private table behind a `pub(crate)` facade: defensive
-  `postPrivate` / audience parsing with dead-lettering of malformed records
-  (#235), LWW ingest, owner set and readiness, purges, and private retention
-  (registered ahead of public retention). Reads run the §6.3 pipeline per
-  record: moderation gate, owner readiness, repo-head check, a per-record
-  oracle snapshot (Block/Audience/Mute, rules 1–7), host freshness against
-  `private_watermark`, kryphocron issue/bind, the sealed `RecordAuthz`
-  witness, record validation and `decode_record_content`, emitted only
-  through `PrivateEmit`. `getPosts`, `getPostThread` (200 nodes,
-  `publicParent`) and `getAuthorFeed` (`created_at::rkey` cursor) share one
-  uniform miss, per-endpoint timing floors, a 10/s (burst 20) per-DID limit
-  and `private_read_outcome_total` / `private_read_unfloored_seconds`. The
-  `private` backfill job confirms non-member owner eligibility (§6.11.1).
-  `kryphocron_glue` gains panic-contained log audit sinks, the user-sink
-  latch reported by `/xrpc/_health`, and validated at-rest hooks from
-  `APP_DATA_DIR`; `clippy.toml` forbids the public codec surface.
-- **Item 5: `app.bsky.*` XRPC surface and read-only admin CLI.** axum routes
-  for `actor.getProfile(s)`, `actor.searchActors`, `feed.getPosts`,
-  `getPostThread`, `getAuthorFeed`, `getLikes`, `getRepostedBy`, `getQuotes`,
-  `getTimeline`, `graph.getFollows`, `getFollowers`, `getMutes`,
-  `muteActor`, `unmuteActor`, `notification.listNotifications`,
-  `getUnreadCount`, `updateSeen`, and `/.well-known/did.json` (secp256k1
-  Multikey). Callers authenticate through the `kryphocron_glue` JWT path:
-  `verify_request_jwt` with the issuer tracker, eviction drainer, rotation
-  retry and the `aud`-fragment / `lxm` host checks. Per-IP and per-DID
-  `governor` limits with `ratelimit-reset`, trusted-proxy
-  `X-Forwarded-For`, `NotEnrolled` / `NotReady` gates, and auto-enroll
-  (§9.2) sharing the member-add path with the admin executor. Read-only CLI:
-  `admin member list`, `label list`, `deadletter list`, `stream info`,
-  `commands list`, `keygen`, and `migrate status`.
-- **Item 5: public hydration.** `hydration` builds `app.bsky.*` views from
-  local tables behind the sealed `PublicEmit<T>`: profiles (`getProfile(s)`,
-  `searchActors`), posts with embeds, author feeds with the §5.12 filters and
-  pins, member timelines, threads (parent chain, replies, 200-node cap),
-  follows, followers, mutes and notifications. Viewer state only for ready
-  members (`blocks` only, never private blocks); §9.6 counts (synchronous
-  Constellation for single-object views, `cc:refresh` for lists);
-  Constellation-first likes, reposts, quotes and followers with local
-  fallback; the §8.6 upstream normalizer; the in-process read-time cache; an
-  `UpstreamSource` seam answering a uniform miss until item 7. `moderation`
-  adds the §7.10 gate (`!takedown`, `!hide`, account status).
-- **Item 4.5: admin executor and head prober.** CLI-to-`serve` command queue
-  with `LISTEN/NOTIFY` (member add/remove, labels, scope rebuild, backfill,
-  resync, dead-letter replay/drop), purge-aware per-DID deferral and crash
-  recovery; per-host repo-head prober with independent probe, read-fetch and
-  backfill budgets and divergence detection; `authz_backfill_stuck_total` and
-  the `authz_stuck` log for authorization records that can never parse.
-- **Item 4: firehose ingest and aggregations.** Redis stream consumer with the
-  `read_checked` / `reanchor` / `group_create` Lua scripts, per-relay
-  watermarks, gap transaction, relay coverage tracker and dead letters; record
-  classifier and defensive record parsing (#233); per-record last-writer-wins
-  writer with sorted DID and URI advisory locks; admission predicate, scope
-  growth, two-phase purges, weekly scope rebuild; backfill worker with
-  reconcile and the Constellation inbound-block pass; Constellation count
-  enrichment; `serve` wiring and `/xrpc/_health`.
-- **Item 3: foundations.** Configuration (`app.toml` plus `APP_*` overlay),
-  Postgres pool, migration 0001 and the exit-78 migration gate, retention and
-  storage sampler, SSRF-guarded outbound HTTP (`net`), DID/handle resolution
-  with the JWT fetch cell (#234) and the identity refresher.
-- **Item 2: lexicons.** `app.nearhorizon.*` lexicon JSON for v1, with
-  `audienceList` optional in `privatePostView`.
+- **Private notification preferences**:
+  `app.nearhorizon.private.getNotificationPreferences` and
+  `putNotificationPreferences`, per reason (`like`, `repost`, `reply`, `quote`,
+  `mention`, `subscribedPost`): whether it is listed, and whether only followed
+  accounts count. Applied when read, so switching a reason back restores every
+  retained notification. Feature `private.notificationPreferences`.
+- **Private activity subscriptions**: `app.nearhorizon.private.putActivitySubscription`
+  and `listActivitySubscriptions`, separate from the public bell (cap
+  `[private_notify] activity_subscriptions_max`, default 1000). A new private
+  post notifies each subscriber who can read it with a `subscribed-post` private
+  notification, seconds after it is stored; subscribers outside its audience get
+  nothing, and nobody is notified twice. `getUnreadCount {reasons}` takes
+  `subscribed-post`. Feature `private.activitySubscriptions`.
+- **Public root gates**: a public thread root's threadgate is kept (fetched once
+  from its author's PDS when needed) while private replies claim that root, and
+  its `hiddenReplies` hide those replies, with what is beneath them, from
+  `private.getPostThread` and `getReplies`, except for the reply's own author.
+  Feature `private.publicRootGates`.
+- **Private appearance**: `app.nearhorizon.private.getAppearance` and
+  `putAppearance` keep where a member's appearance is saved (`private`, `public`
+  or `device`) and the appearance itself (up to 16 KiB), with `rev` swaps.
+  Feature `private.appearance`.
+- **Appearance retention**: a removed member's appearance is kept 7 days for the
+  account alone (`getAppearance {includeRetained}`, `retainedUntil`, and the new
+  `releaseAppearance`). Feature `private.appearanceRetention`.
+- `lexicons/app/nearhorizon/actor/appearance.json` defines the
+  `app.nearhorizon.actor.appearance` record (definition only: clients read and
+  write it on the account's PDS).
 
 ### Changed
 
-- **kryphocron-lexicons 0.3.1.** Brings the private-post media embeds
-  (gallery, video, quote with media), aspect ratios, link thumbnails,
-  `langs` and self-labels to `postPrivate`. No behaviour change yet; the
-  private views use them once private posting (Phase 2) lands.
+- **List blocks count in the private read rule.** A member's list block of a
+  moderation list blocks like a direct block, both ways, wherever private reads
+  test one: posts, replies, reposts, notifications and counts. A reply blocked
+  this way is read by its author only, with `notServed: ["standing"]`. Feature
+  `private.listBlocks`.
 
-- **Item 12a: Thread Lens is viewer-relative, and enforces the viewer's
-  blocks on the server (#674).** `threadLens.getThread` and `.resolve`
-  are now for members whose account is ready, and answer for the caller.
-  A block between the caller and an author hides that author's posts,
-  as `blocked-by-you` or `blocking-you` gaps, and nothing around them:
-  the replies beneath a blocked author's post stay, and a block between
-  two other people changes nothing. Nothing by a blocked author is
-  sent, in a post or in an embed. The response always holds the
-  ordinary thread view, never cut; it adds to it only while Farsight
-  vouches for the caller's blocks, and says so in `bridging` (`off`,
-  `limited`, `full`). A post whose author cannot be checked is not
-  fetched (`block-state-unknown`). `depth` and `parentHeight` go to
-  1000; one response adds at most `threadlens.page_nodes` nodes and
-  marks where it stopped (`moreParents`, `moreReplies`, `truncated`).
-  Post views carry the caller's viewer state. A `moreReplies` marker
-  carries a cursor when part of the node's replies was read; the cursor
-  is sealed with `APP_THREADLENS_CURSOR_KEY_HEX` (or a key made at
-  start), opens only for the node it was issued for, and is passed back
-  as `repliesCursor`. The lexicons are edited in place (design-v3 §5.15;
-  proposed locked decision 38).
-- **Item 12: Farsight call outcomes are named (#673).**
-  `farsight_calls_total{outcome}` now says `rate_limited` (this key's
-  allowance on Farsight is spent), `overloaded` (Farsight is up and
-  full) and `auth` (the key is refused) where it said `status` for all
-  three. They are read from the error name Farsight sends, since it uses
-  429 and 503 for two conditions each. What counts as a failure is
-  unchanged.
-- **Item 15: host names are looked up fully qualified (#675).** Every
-  outbound DNS lookup now asks for the name with a trailing dot, so the
-  resolver never retries it with a search domain. Inside Docker that
-  retry could turn a DNS server failure into "no such name". An address
-  is not looked up at all, as before. Groundwork for `resolveHandle`:
-  `identity::handle_lookup` sorts a handle's DNS record and well-known
-  file into found, confirmed absent, or try again (design-v3 §5.11).
-- `getTimeline` does the same as `listNotifications` below: it hydrates
-  every scanned item and applies the viewer's mutes and blocks afterwards.
-- `listNotifications` hydrates every row it scans and applies the viewer's
-  mutes, blocks and thread mutes afterwards, where it filtered in SQL before
-  (design-v3 §8.1 "Hydrate before filtering"). What a member's read fetches
-  and caches no longer depends on what the member muted. A page can now hold
-  fewer than `limit` items while a cursor is still returned.
-- `getAuthorFeed` `posts_with_media` now means images and galleries. Video
-  moved to its own filter, as in the reference AppView, so a client with
-  Media and Video tabs does not show a video twice. A `recordWithMedia`
-  whose media is an external link no longer counts as media.
-- The per-IP backstop is one layer on the final router instead of one per
-  sub-router. `GET` and `HEAD` on `/xrpc/_health` stay exempt.
-- `app.nearhorizon.private.getAuthorFeed`'s lexicon description names its
-  ordering field (`record.createdAt`, clamped to indexing time plus five
-  minutes).
-- Design-v2 §6.11.3: read-fetch budget 25 per host (ascending-PDS worst
-  case); §13 row 185.
-- `sync.read_fetch_rate_per_host` defaults to 25 (was 20), in code and in
-  `docker/config/app.toml`: the worst-case ascending-PDS author feed needs
-  21 read-fetch calls (order probe, 10 post pages, 10 repost pages).
-- Dockerfile: the COPY comment no longer describes `clippy.toml` as
-  pending; it names the file and the clippy step that enforces it.
-- F: requestRecord emits two distinct InvalidRequest messages (#232)
-- Design-v2 §6.11.1/§4.2: eligibility failure handling (3 failures over
-  24 h), negative answers, streak reset, and the `member remove`
-  re-confirmation; reply cids and the eligibility columns in the schema.
-- Design-v2 §7.1/§9.6: `getLikes` and `getRepostedBy` page Constellation
-  `/links` (per-record timestamps), not `/links/distinct-dids`; counts are
-  unchanged.
-- I: postPrivate field parsing at the private-tier decode boundary must be defensive (#235)
-- Design-v2 clarifications: dead-letter replay leaves the entry in place
-  (§5.9); the head prober skips DIDs with an `authz` job in flight (§6.11.3);
-  `admin backfill` defaults to `member` depth for members, `scope` otherwise
-  (§3.3); item 5 builds the `kryphocron_glue` JWT path and an upstream seam
-  (§15). postPrivate field parsing tracked for item 6 (#235).
-- `read_checked` computes consumer lag as `entries-added − entries-read` from
-  the group counter; Redis 7.4 re-estimates the `XINFO GROUPS` `lag` field.
-- `hickory-resolver` pinned to 0.26 so one hickory is in the dependency graph.
+### Removed
+
+- **Private blocks** (`tools.kryphocron.graph.block`) are no longer tracked: a
+  public block already keeps two accounts apart. They are skipped on ingest;
+  only `app.bsky.graph.block` and applying list blocks count as blocks in the
+  private tier. The admin pages' private-block figures are gone.
+
+### Upgrade notes
+
+- Migrations 0037 (notification preferences), 0041 (activity subscriptions),
+  0042 (public root gates; seeds a one-time fetch queue that drains after
+  deploy), 0043 and 0044 (appearance and its retention), 0045 (drops the
+  `private_blocks` table and its rows).
+
+## Phase 7: Refract (2026-10-22 – 2026-10-23)
+
+Refract serves accounts that Bluesky's AppView withholds but a configured
+community still hosts and has not banned ("restored" accounts), from
+Horizon-Prism's own storage.
+
+### Added
+
+- **`[refract]` config**: `enabled` (off by default) and `communities`, both live
+  settings validated whole on every save, plus restart keys for checks, labels,
+  backfill and discovery caps.
+- **The checker**: a candidate is restored when Bluesky withholds it, a fresh
+  resolve finds it on an enabled community's PDS, it is active there
+  (deactivation starts a 30-day grace), its community has not labelled it gone,
+  and it has no local takedown. Labels are signature-checked and polled. Changes
+  to the communities apply live, with a delay before restored accounts end.
+- **Storage**: a restored account's posts, interactions, graph records, gates and
+  profile are admitted in every mode, backfilled in full by
+  `refract.backfill_concurrency` dedicated workers, re-synced weekly, and spared
+  by the scope sweep and retention. When a restore ends, a dedicated purge
+  removes them, never members' rows.
+- **Endpoints**, for any signed-in caller (ready members with their viewer state,
+  everyone else as a visitor), in their own `refract` rate class:
+  `app.nearhorizon.refract.fill`, `getPostThread`, `getAuthorFeed`,
+  `getTimeline`, `getReplies`, `listNotifications`, `getUnreadCount` and
+  `getAuthorReposts`. Every answer carries `servedAs`; `fill` reports `pending`
+  and `withheld` (`unanswered`, `capped`, `proxied`, `blocked`, `unavailable`).
+  Feature `refract`.
+- Restored profile and post views carry `restored {community, tier, labeler}` in
+  every response; their media and video come from their PDS.
+- Restored authors' live records notify members. `getReplies` also returns other
+  accounts' direct replies to restored replies, under the root's threadgate
+  (fail closed) and both sides' blocks.
+- Reposts of restored posts are stored from anyone and served on `getTimeline`
+  and `getAuthorReposts`; older ones are filled once per restore from
+  Constellation backlinks.
+- **Visitor viewer state** (a visitor's own likes, reposts, follows and
+  `replyDisabled` on restored views) behind the live switch
+  `refract.visitor_viewer_state`, **off by default**, since the lookups send the
+  reader's DID to Constellation; `viewerChecked` says what was looked up.
+- Admin: Communities and Refract accounts pages (add, check, remove, keep or
+  release pending ends) and `admin refract status|list|show|check|end|keep|unkeep`.
+- Metrics `refract_*`, including `refract_read_seconds{method}`.
+
+### Changed
+
+- **The moderation gate also runs after every upstream fetch**, for every caller:
+  nested posts, quotes and embeds by hidden or blocked authors, or with a local
+  `!takedown` or `!hide`, are no longer served inside upstream views. This also
+  changes public answers with public indexing on.
+- The cascade's `getPosts` asks each author's network concurrently (up to 8),
+  under the request's deadline.
+- Thread Lens fetches a restored author's missing post through its community and
+  marks it.
 
 ### Fixed
 
-- **The Farsight gate's gauges were missing (#729).** `farsight_down`
-  (1 while Farsight has answered this process, its read breaker is open
-  and the run is clean) and `farsight_fallback_withheld{reason}` (1 while
-  the breaker is open and Farsight is not down; `reason` =
-  `never_answered` or `unclean`) now exist, as design-v4 §14.2 specifies.
-  They are computed from the gate when sampled, never set on an outcome:
-  `serve` samples once at startup, so every series exists at 0 before
-  the first call, then once a second, so both drop to 0 when an open
-  period ends by the clock. Computed from the gate alone, with the
-  fallback on or off. `docker/README.md` names both and gains the
-  `FarsightDown`, `FarsightFallbackWithheld` and `FarsightAuthFailed`
-  alert examples.
+- Restored post views send the earlier of `createdAt` and the indexing time as
+  `indexedAt`, so clients no longer show backfilled posts as archived.
+- `fill` drops malformed items instead of failing the call, remembers accounts no
+  community hosts for 24 hours, reports an account restored mid-request as
+  `pending`, no longer charges a repeated resolve twice, and walks cold profiles
+  in parallel within the deadline.
+- The Refract lexicons declare every error their methods return.
 
-- **A reply could enter another account's audience (#718; private
-  posting S0, #719).** A private post under an audience owned by someone
-  else was served to that audience whenever its author and the owner
-  shared a PDS, with no thread check, and the community PDS's
-  `participatePrivate` accepted such a reply with an invented parent. Such
-  a post is now served, on any PDS, only when its parent chain under the
-  same audience reaches a post by the audience's owner within 8 steps,
-  every step being one the reader could read (no block either way, not
-  hidden by moderation, its writer allowed in the audience), and its
-  author may write there by the audience's rule (`everyone`: no block;
-  `followers`: a stored follow of the owner; `list` or no mode: listed)
-  with no block between author and owner (except under `list` or no mode
-  for now). Prism no longer uses a same-PDS shortcut.
-  - **Stops serving, to anyone but the author:** such posts that do not
-    hang from the owner's post; replies more than 8 levels below it;
-    others' replies left under an old audience after the root's audience
-    moved; under `list` or no mode, replies by writers not listed; under
-    `followers`, replies whose writer's follow of the owner is not stored;
-    a reply below a step the reader cannot read.
-  - **Starts serving:** posts by authors whose account status is neither
-    `active` nor one of the four hiding statuses (`deactivated`,
-    `takendown`, `suspended`, `deleted`), e.g. `throttled`. Taken-down and
-    hidden posts now also leave the private feed prefilter.
-  - **Pre-release count on prism (2026-10-15):** 11 private posts, 2 under
-    another account's audience; 0 stop being served, 0 start.
+### Upgrade notes
 
-- **Backfill job generations (#713; design-v4 §II-5.10).** A job's run
-  could settle, fail or re-queue the row after the job had been reset
-  under it (re-enqueued, cancelled by a purge, re-queued at startup), and
-  so overwrite the newer run's state. Claims now carry the job's
-  generation and gap epoch; every settle, fail, still-running, re-queue
-  and done write acts only while the generation matches (a stale run
-  settles as superseded), and every reset site bumps it, `list_sync`
-  rows included.
-- **List release and recovery (#714).** Releasing an owner's last list
-  cancels its sync with a new generation (R3-151) and drops the owner's
-  waiting pairs (N-1501). The retry scheduler's recovery sweep now runs
-  the full reconcile every `retry_every_hours`, not only at startup. The
-  daily orphan sweep of §14.1 is built: leftover `unreferenced` rows are
-  released, list-less items and owner rows removed (race-safe against a
-  new reference, R3-159), and missing owner rows created.
-- **List sync retries and the recovery sweep's purge guard (#715).**
-  Failed `list_sync` jobs are re-queued every `retry_every_hours` with
-  their attempts reset, a new generation and the owner's pacing (an owner
-  that is gone, or has no active list, is left alone). The recovery sweep
-  holds the scope read guard while it adds waiting pairs and skips
-  members being purged, so a purge cannot fall between its read and its
-  add.
-- **Purge end's list sync is high priority and puts its waiters back.**
-  The end of a purge of a list owner queued its `list_sync` at low
-  priority and added no waiting pairs, so members whose list references
-  were owed a run waited behind weekly work. It is now high priority, and
-  the owner's owed `(member, source)` pairs are added to its fair-claim
-  set after the commit, skipping members being purged (design-v4 §4.3).
-- Tests that silenced the panic hook for the whole process now silence
-  only their own thread, so other tests' failures print their message.
+- Migrations 0040 (Refract tables) and 0046 (`refract_dids.reposts_filled_at`;
+  accounts already restored are filled after deploy). The post-migration index
+  task builds a new large-table index, `reposts_subject_did`.
 
-- **Network clients by intent (#711; design-v4 §8.1, R3-168, R3-179,
-  R3-213).** Outbound HTTP and DNS now go through one of three transports,
-  each a client with its own resolver: `public` (upstream AppViews,
-  Slingshot, Constellation for requests, Farsight lookups, JWT issuers),
-  `internal` (backfill, list syncs, the identity refresher, repo-head
-  checks, member keys, Farsight `requestBackfill`/`getStats`) and
-  `viewer_private` (fetches made for a viewer's own private state: no DNS
-  cache, no idle connections, no TLS session resumption). A request's
-  mode picks the transport; background jobs pin theirs. The service proxy
-  keeps its own client. New config `[net] public_nameservers` and
-  `internal_nameservers` (both default to the system resolver, so nothing
-  changes unless set; invalid entries refuse startup, doubtful ones warn).
-  Handle TXT lookups now go through the chosen transport's resolver
-  instead of the system one. A source-scanning test keeps request paths
-  from pinning a transport.
+## Phase 6: Resilience (2026-10-16 – 2026-10-22)
 
-- **Phase B, B-64 to B-81 (#676).**
-  - **`subscribed-post` for accounts that are not tracked.** The "backfilled
-    once" fact (`sync_state.last_resync_at`) was written only for tracked
-    DIDs and was deleted with a removed member's repo-head state, so an
-    activity subscription to a followed non-member, or to a removed member
-    still in scope, never produced a notification. Every backfill job of a
-    DID in scope now records it, and removing a member keeps it while the
-    DID stays in scope.
-  - **A refused Farsight address is logged and counted as refused.** A
-    hostname that resolves only to non-public addresses was counted as a
-    transport error and not logged. The network client now reports a guard
-    refusal as `BlockedAddress` for hostnames as well as IP literals, and
-    Farsight logs `farsight_address_refused` at each refusal and counts
-    `refused_address` (also for `requestBackfill` and `getStats`).
-  - A `proxy_url` naming this AppView's own host with a trailing dot or in
-    another case is refused at startup, as the plain form already was.
-  - List views under `viewer.blockingByList` / `mutedByList` keep their
-    `labels` and `viewer` when the profile came from upstream, and both list
-    builders produce the same shape.
+The firehose keeps up under load, private reads keep working while a relay is
+behind, and clients are told when to retry.
 
-- **Phase B, B-50 to B-63 (#676).**
-  - **Muted threads write no notifications.** A reply or like in a
-    thread the recipient muted is no longer written at all (it was
-    written and only hidden while the mute lasted, so it reappeared after
-    unmuting). The same for `subscribed-post`.
-  - **`getKnownFollowers` keeps to the request deadline.** For a large
-    account the Constellation scan ran every page (about 60 s); it now
-    stops at the deadline and returns the followers found so far
-    (`known_followers_scan_truncated_total`).
-  - **Private-context hydration (design-v4 §8.1, R3-179).** The private
-    handlers reach the hydrator only through `HydrationContext::Private`:
-    authors and a private thread's public parent render from local rows
-    only, with no upstream, Slingshot or Constellation call, no shared or
-    identity cache read or written, and no Farsight lookup.
-  - **`PublicEmit` is made only in `hydration`.** `getConfig`'s view moved
-    there; a `compile_fail` doctest covers the constructor.
-  - **Metrics:** `microcosm_requests_total{service, origin, endpoint}`, and
-    `origin` and `endpoint` labels on `upstream_calls_total`.
-  - **Stored accounts outside scope and members are not read** by
-    `resolveHandle`'s stored answer, `getRecord`'s profile branch, Thread
-    Lens' account check, or `getProfile`/`getProfiles`, which now choose
-    local or cascade by scope and membership rather than by whether a row
-    exists (G-9, R3-96).
+### Added
 
-- **Viewer-private fetches (#709; design-v4 §8.1, R3-188, R3-208).** A
-  fetch whose subjects come from a viewer's own mutes, list mutes,
-  bookmarks or activity subscriptions warmed the shared caches, so an
-  anonymous caller could time requests and learn what a member had muted
-  or bookmarked. Such fetches now run viewer-private: they never read or
-  write the shared read-time cache, the routing cache, the identity
-  caches or the resolveHandle cache, write no stored counts and queue no
-  count refresh. They use a per-viewer private cache instead, cleared when
-  the viewer leaves the ready set. New config `cache.viewer_private_ttl_secs`
-  (3600), `viewer_private_max` (50 000) and `viewer_private_per_viewer_max`
-  (500). Covers `getMutes`, `muteActor`/`unmuteActor`, `muteActorList`,
-  `getListMutes`, `getBookmarks`, `listActivitySubscriptions` and the lists
-  behind `viewer.mutedByList`. A source-scanning test keeps new call sites
-  on those tables viewer-private. Not yet built: the separate network
-  client the design names for these fetches (#711).
+- **Degraded mode**, while the private relay is behind:
+  - Each tracked repository keeps a `chain_rev` (every commit up to it is held),
+    from the `since` the firehose sidecar now sends; a dropped commit is caught
+    up by another relay or a settle.
+  - Private reads check every repository they depend on against its stored head
+    instead of missing as stale (`private_read.head_fallback`, on by default).
+  - Private read responses carry `degraded`, `retryAfter` and `unavailable` (the
+    caller's own posts not servable yet); `getPostThread` answers
+    `503 Unavailable`, and an unshowable quoted private post is
+    `#viewUnavailable`. Keys `private_read.degraded_retry_min_secs` and
+    `_max_secs`. Feature `private.degraded`.
+  - A member whose readiness was lost after it was first ready gets
+    `503 Reindexing` with `retryAfter` instead of `400 NotReady`, and
+    `getMembership` answers `reindexing` (`community.reindex_retry_secs`).
+    Feature `private.reindexing`.
+- **Every `429` carries `Retry-After`**, the admin UI's limits included.
+- A warning, in the log and on Health, when a private relay has never reported
+  or is more than 5 minutes behind, since private reads wait for it.
+- Firehose throughput metrics and alert examples (`FirehoseBacklogPersistent`,
+  `FirehoseConsumerSlowerThanInput`, `FirehoseGroupMissing`,
+  `FirehoseSamplerFailing`).
 
-- **Profiles were missing fields (#676, Phase B B-32, B-36, B-43).**
-  - `getProfile` / `getProfiles` now return `pronouns`, `website` and
-    `joinedViaStarterPack`; `associated.lists` and `starterPacks` for a
-    ready member and `associated.labeler` for an account in scope; and,
-    for a ready-member viewer, `viewer.knownFollowers` (bounded as
-    `getKnownFollowers` is). The writer had stored these; the views never
-    read them. `pronouns` also appears on the basic and standard views.
-  - An account outside scope that the viewer mutes or blocks through a
-    list now carries `viewer.mutedByList` / `blockingByList`, as one in
-    scope already did.
-  - A post made in the same second as the activity subscription to its
-    author is announced (`createdAt` is stamped to the second).
+### Changed
 
-- **`getPosts` served a deleted post from upstream (#676).** A post not
-  stored here is fetched from upstream, and those copies are cached. A
-  post whose delete this AppView had already seen was fetched all the
-  same, so it stayed visible for as long as the upstream copy or the
-  cache lasted (over 90 s in a Phase B check). A post with a local
-  tombstone is no longer fetched.
+- `firehose.batch_size` defaults to 2000 (was 500): more throughput under a
+  backlog, no change at live rates.
+- A commit that can write nothing (most of the firehose) opens no transaction.
+  After a trim gap the consumer re-anchors at the oldest entry unless it has
+  measured itself slower than its input.
+- Private `getPostThread` and `getReplies` cap one reply expansion's reads at
+  `THREAD_NODE_CAP × private_read.page_reads_factor` (400 by default), whole
+  nodes only; a parent past the cap comes back without `replies`, to be read with
+  `getReplies`.
+- The test suite builds one migrated template database per run (about 40 %
+  faster), and load-sensitive tests decide on events rather than timing.
 
-- **`sort=top` said nothing about being served as `latest` (#676,
-  Phase B B-31 / B-51).** `getFollows`, `getFollowers` and `getQuotes`
-  read every source in `latest` order, and locked decision 30 has a
-  `sort` other than `latest` answered that way with
-  `X-Prism-Sort-Fallback: latest`. The header was exposed to browsers but
-  never sent. It is now, for `top` and any other value; `sort=latest`
-  and no `sort` send none.
+### Fixed
 
-- **A new member on a PDS that answers a missing record with 404 was
-  never fully set up.** A member's setup fetches its profile and a few
-  optional `self` records, which a new account does not have. Prism took
-  only the lexicon's `RecordNotFound` as "absent"; a PDS that answers
-  HTTP 404 `NotFound` instead (Aurora-Locus does) failed the whole job,
-  which then retried after 1 minute, 10 minutes and hourly without ever
-  succeeding, so the member waited minutes to become ready and its
-  posts, likes and follows were not backfilled. For those optional
-  records a 404 `NotFound` now writes nothing, deletes nothing and does
-  not fail the job; it counts in
-  `backfill_optional_record_unclear_total{collection}`. Where Prism
-  confirms a record is gone before deleting its copy, only
-  `RecordNotFound` still counts.
-- **The fallback ends by the request's deadline (#683).** A fallback
-  call could run its whole timeout even when the request it belonged to
-  had less time left. Its calls are now cut to the time the request has
-  left, and a request with none left asks nothing
-  (`farsight_fallback_skipped_total{reason="deadline"}`).
-- **`searchActors` now keeps to its corpus and to the viewer's blocks
-  (#679).** It searched every stored identity row, which included
-  accounts stored only because of a private reply to a member, so a
-  search could reveal that such an interaction exists. It now finds only
-  active accounts that are in scope or members. A signed-in member's
-  mutes and blocks, list mutes and inbound list blocks included, now
-  leave accounts out; signed out, accounts with `!no-unauthenticated`
-  are left out. A search that passes `search.statement_timeout_ms` is
-  `InvalidRequest` "query too expensive" (design-v3 §9.3).
-- **Item 12: a Farsight that hangs now counts as failing (#673).** A
-  `checkBlocks` call that ran out its whole timeout was meant to count
-  towards pausing Farsight calls, but the check compared the time left
-  after the clock had started against the full timeout, so it never did:
-  with Farsight hanging, every member request waited the full timeout.
-  The check now uses the time the request started with. A half of a
-  request asked again after a too-large answer only has the time the
-  first call left, so its timeout does not count.
-- **Item 10: an upstream network could stay unreachable until restart
-  (#669).** After a breaker's open period one probing call is let through
-  and every other call is refused until that call's result is recorded. A
-  request dropped while its probe was in flight (a client disconnecting, a
-  timeout further up) never recorded one, so the network was skipped by
-  every later cascade until the process restarted. Admitted calls now hold
-  the probe slot through a guard that gives it back on any exit without a
-  recorded outcome (design-v3 §II-8.3). `SharedBreaker` and `Admission` are
-  the reusable form, for the Farsight breaker later.
+- The firehose sidecar no longer replays from a stale cursor after a keepalive
+  reconnect, which held the watermark back and made private reads miss as stale.
+- A missing consumer group is recognised on every read, and a recreation gap can
+  no longer be lost.
+- `sync_state.diverged_since` clears once the applied rev reaches the probed head,
+  so a just-ready member no longer shows as diverged or loses readiness early.
 
-- **Item 10: `seenAt` on the notification endpoints (G-4, G-5).**
-  `getUnreadCount` now reads `seenAt` and, when present, counts from it
-  instead of from the stored last-seen time; before, the parameter was
-  ignored. `listNotifications` answers `400 InvalidRequest` to a request
-  carrying `seenAt`, which the lexicon marks unsupported; before, it was
-  accepted and ignored. `priority` stays accepted and ignored on both.
+### Removed
 
-- Retention and scope growth no longer race: scope-dependent deletes run per
-  DID under the DID's exclusive advisory lock, and growth takes the subject's
-  shared lock before inserting `scope_dids`.
+- The disabled `community-b` network entry (its URL was a PDS, not an AppView),
+  from the built-in defaults and `docker/config/app.toml`. The default
+  `constellation.cascade.order` is now `["bluesky", "community-a"]`.
+
+### Upgrade notes
+
+- Migration 0039 (`chain_rev`).
+- Rebuild the firehose sidecar images: `docker/docker-compose.yml` pins a newer
+  horizon-firehose (the stale-cursor fix, then `since` on each commit).
+- A config that still lists `community-b` in `constellation.cascade.order` fails
+  validation; remove it.
+
+## Phase 5: Thread Lens (2026-10-13 – 2026-10-24)
+
+Thread Lens for every signed-in account, hidden replies flagged, faster hydrated
+views, the reader's labelers, and walking up past blocks.
+
+### Added
+
+- **`threadlens.access`**: `signed_in` (default) serves every signed-in account,
+  non-members as visitors with their own blocks (from Farsight and stored rows)
+  applied; `members` serves ready members only. Live from the admin UI. Visitors
+  draw on Farsight's non-member share and never trip its breaker. Features
+  `threadLens` and `threadLens.signedIn`.
+- `hiddenByThreadgate: true` on nodes the root's threadgate hides (never the root
+  or the caller's own posts), with bridging on or off; such replies are kept and
+  flagged rather than dropped.
+- `blockingByListUri` on a `blocked-by-you` gap whose block comes through one of
+  the caller's own list blocks.
+- **Hydrated views**: `servedAs` (`member` or `visitor`), a member's own viewer
+  state, counts, and `viewer.replyDisabled` decided from the root's threadgate
+  and local rows. Feature `threadLens.hydrated`.
+- **The reader's labelers**: `atproto-accept-labelers` is honoured for every
+  labeler it names, moderation or not (at most 32); views keep those labels
+  beside the operator's, and `atproto-content-labelers` names them. Labels only
+  add to views. Feature `threadLens.labelers`.
+- `threadlens.listing_timeout_ms` (default 1500): a slow reply page no longer
+  holds the response; it finishes in the background, and the node keeps its
+  `moreReplies` cursor. Metrics `threadlens_phase_seconds{phase}`,
+  `threadlens_listing_timeouts_total`.
+
+### Changed
+
+- `getThread` is about three times faster on a bridged thread: one upstream
+  fetch, concurrent reply pages, a batched fetch ladder and batched counts.
+- A post labelled `!warn` upstream is a post (upstream labels removed), not
+  `content-stripped`; `!takedown` and `!hide` still are.
+- `getMembership.features` lists the Thread Lens values even with the private
+  tier disabled.
+
+### Fixed
+
+- The parent walk goes on up past a blocked post that is not stored locally
+  (reading only its `reply.parent.uri`), so the client shows a placeholder for
+  the blocked post and the thread above it.
+- A blocked top gap carries `parentUri` whenever the walk knows it, even when the
+  walk stopped at a bound.
+- With bridging on, reply expansion no longer re-adds replies the root's author
+  hid as ordinary replies.
+- The `blocked` gap's lexicon text says what it means: a block the ordinary view
+  reported that was not looked past.
+
+### Upgrade notes
+
+- Thread Lens now serves every signed-in account by default; set
+  `threadlens.access = "members"` to keep it to members. An operator with many
+  visitors may need to raise `farsight.rate_per_sec`.
+
+## Phase 4: Operator tooling and community scope (2026-10-18 – 2026-10-22)
+
+A web admin UI, membership decided by the operator, scope that follows recent
+activity, fewer stored blocks, actionable warnings, and Lodestar identity reads.
+
+### Added
+
+- **Web admin UI** under `/admin`, served by `serve`: first-run setup with a
+  one-time code, operator sign-in with ATProto OAuth, CSRF checks and typed
+  confirmations for destructive actions. Pages: Home (what needs attention,
+  tiles, and live tickers of what the firehose delivers and what is indexed),
+  Members (add, remove, deny, allow, re-sync, Farsight and list actions), Health,
+  Jobs, Problems, Stats (disks, indexed counts, endpoint usage), Blocks, Labels,
+  Look up, Audit log, Operators, Settings, and a per-operator Appearance (light
+  or dark, colour scheme).
+- **Saved settings**: values saved in the UI are layered over `app.toml` (never
+  written), validated whole and kept with their history. A saved value wins over
+  the file; a later file change under it is offered to the operator; a saved
+  value that no longer validates after an upgrade is set aside at startup. Live
+  settings apply at the next request; the rest wait for a restart, which the UI
+  and `admin restart` can perform when `APP_SUPERVISED=1`.
+- CLI: `admin operator add|remove|list`, `admin operator host add|remove`,
+  `admin setup-code`, `admin settings list|get|set|reset`, `admin restart`,
+  `admin member deny|allow`, `admin member list --denied`,
+  `admin deadletter sweep [--dry-run]`, `admin identity compare`.
+- **Denials**: `admin member deny` writes a denial and removes a member in the
+  same step; auto-enroll refuses a denied account; `admin member allow` lifts it.
+- **Never-ready expiry**: auto-enrolled members that never finish their first
+  indexing are removed after `community.never_ready_expiry_days` (7; 0 = off).
+  Operator-added and once-ready members are never expired.
+- **Lodestar identity reads** (`identity.lodestar_url`, empty = off): public
+  request paths read DID documents and verified handles from a Lodestar mirror of
+  the PLC directory first, only while it reports itself current, falling back to
+  the PLC directory and Horizon-Prism's own handle check; pages that route many
+  accounts batch their lookups. Sign-in keys, admin, auto-enrollment, the
+  identity refresher, backfill and list syncs never use it.
+  `admin identity compare` checks it against the directory.
+
+### Changed
+
+- **Membership is the only owner gate**: hosting on a community PDS no longer
+  makes an account a private owner, so only members' private posts are served.
+- **`community.auto_enroll` defaults to `false`**: hosting on a community PDS no
+  longer makes anyone a member unless the operator turns auto-join on.
+- **Scope recency**: a member's like or repost grows scope only within
+  `scope.like_repost_days` (30) of its date, a reply or quote within
+  `scope.reply_quote_days` (90). A nightly scope check, an hour before retention,
+  removes accounts nothing holds any more (membership, a follow within the cap,
+  a recent interaction, an activity subscription), at most
+  `scope.sweep_max_purges` a night. Activity subscriptions hold scope but never
+  grow it. The weekly rebuild keeps only the counts repair and stale re-syncs.
+- `scope.rebuild_grace_days` defaults to 0 (was 7) and must be 0 to 30.
+- **Blocks are stored only with a member on one side**; retention removes stored
+  blocks and list blocks with no member side, and a removed member's blocks of
+  non-members.
+- Sync jobs of accounts that are deleted, taken down, deactivated or tombstoned
+  end `unavailable` after one try and are queued again when the account comes
+  back; `scope` and `resync` jobs retry for about 41 hours before failing.
+  Health's "Failed jobs" counts only jobs worth acting on.
+- Malformed commits and records from accounts Horizon-Prism would not keep are
+  counted and dropped instead of dead-lettered.
+
+### Fixed
+
+- A tombstoned `did:plc` (the PLC directory's `404 DID not available`) is
+  recognised as tombstoned: the account is marked deleted and purged, and list
+  syncs stop retrying it.
+- Admin forms no longer fail with "This form expired" (`Referrer-Policy:
+  same-origin`).
+
+### Removed
+
+- The community-PDS eligibility confirmation for private owners, with its
+  columns and `eligibility_cleared_total`.
+
+### Upgrade notes
+
+- **Before migration 0031**, run the read-only queries in `docker/README.md`
+  ("Before the 0031 upgrade") and `admin member add` every non-member owner whose
+  private posts should stay served; anyone left off goes dark.
+- **Auto-enroll is off unless set**: a deployment whose `app.toml` does not set
+  `[community] auto_enroll` stops auto-enrolling at the upgrade. Set
+  `auto_enroll = true`, or switch Auto-join on in the UI, to keep it. Existing
+  members are unaffected. The first expiry run removes auto-enrolled members that
+  waited longer than the window without becoming ready.
+- **The first nightly scope check removes every account nothing holds any
+  more**, mostly accounts held only by old interactions;
+  `admin scope rebuild --dry-run` shows how many. A deployment whose own
+  `app.toml` sets `rebuild_grace_days = 7` keeps the old slack until it changes
+  it; above 30 the app does not start.
+- An upgraded deployment has no operator and enters first-run setup: read the
+  code with `docker compose logs app | grep admin_setup_code`, or run
+  `admin operator add`. A deployment with its own Caddyfile proxies
+  `/admin/live` without `encode` and with `flush_interval -1`. The shipped
+  compose file sets `APP_SUPERVISED=1` and mounts the database and Redis volumes
+  read-only for the disk figures.
+- Run `admin deadletter sweep` once to clear dead letters that are now dropped.
+- Migrations 0031 (membership), 0032 (admin UI), 0033 (scope recency index),
+  0034 (saved settings), 0036 (unavailable jobs; queues failed `scope` and
+  `resync` jobs again), 0038 (admin appearance).
+
+## Phase 3: Private posting (2026-10-12 – 2026-10-21)
+
+The private tier becomes a full posting surface: audiences, content,
+interactions, notifications, threads, search, encoded content from any PDS, and
+fast reads.
+
+### Added
+
+- **Audiences** `followers`, `everyone`, `nobody` and `following` beside `list`;
+  `following` is read by the accounts the owner follows, once those follows are
+  verified against the owner's repository. A block either way keeps a reader out
+  in every mode.
+- `app.nearhorizon.private.getTimeline`, the private home timeline.
+- **`app.nearhorizon.actor.getMembership`**: whether the caller is a member
+  (`member`, `indexing`, `notEligible`), the `features` this deployment serves,
+  `validForSecs`, and `permissions {privateRead, privateIndexed, threadLens}`;
+  never cached.
+- Private post views carry facets, embeds (stock `#view` shapes; quoted private
+  posts read for the same reader), langs, labels and `audience`. Feature
+  `private.embeds`.
+- Private bookmarks: `createBookmark`, `deleteBookmark`, `getBookmarks` and
+  `viewer.bookmarked`. Feature `private.bookmarks`.
+- Threadgates and postgates on private posts: `threadgate`, `viewer.replyDisabled`,
+  hidden replies, `viewer.embeddingDisabled`, detached quotes. Feature
+  `private.gates`.
+- Counts and viewer state on private posts (counting only what the reader may
+  see), `getLikes`, `getRepostedBy`, `getQuotes`, reposts in timelines and author
+  feeds, and thread mutes of private roots. Feature `private.interactions`.
+- **Private notifications**: `listNotifications`, `getUnreadCount` (with
+  `reasons`) and `updateSeen`. Feed items carry their reply context and
+  notifications their subject post, read for the caller, so a client needs no
+  extra `getPosts`. Features `private.notifications`, `private.unreadReasons`,
+  `private.replyContext`, `private.notificationSubjects`.
+- `index.requestRecord` catches the caller's own repository up inline and answers
+  `caughtUp`; when `true`, private reads reflect the record at once. Feature
+  `private.freshIndex`.
+- Sealed private feed cursors; a `filter` on `getAuthorFeed`
+  (`posts_with_replies`, `posts_and_author_threads`, `posts_with_media`,
+  `posts_with_video`); `app.nearhorizon.private.getReplies`. Features
+  `private.paging`, `private.mediaFilters`.
+- `app.nearhorizon.private.searchPosts`: a query-time scan of the recent private
+  posts the caller may read; no index of decoded text is stored. Feature
+  `private.search`.
+- **Private threads**: a reply is read by its thread root's current audience (or
+  its branch root's, under a public post) while its writer and every writer above
+  it may write there, within `[private_read] max_chain` (16) posts. Feature
+  `private.threadAudience`.
+- **Encoded content** may carry text, facets and embed together. Clear `quote`,
+  `mentionDids` and `mediaKinds` fields are indexed without decoding; a post whose
+  clear fields claim what its content does not carry is a miss for everyone but
+  its author. The author's own view lists `droppedFields`, and `notServed`
+  (`placement`, `standing`, `chainCap`, `overClaim`) when no reader would be
+  served. Features `private.anyPds`, `private.notServed`.
+- Read-latency metrics: `xrpc_request_seconds{nsid}`,
+  `private_read_stage_seconds`, `sync_head_check_seconds{path}`,
+  `private_read_empty_page_total`.
+
+### Changed
+
+- **Plaintext private posts are no longer served** while
+  `[private_any_pds] enabled = true` (the default): a `postPrivate` record without
+  `encodedContent` is a miss for every reader, its author included. Encoded
+  private posts from any PDS are served.
+- A reply under another account's audience is served, on any PDS, only when its
+  chain reaches the owner's post; the same-PDS shortcut is gone.
+- A private video always plays from its author's PDS; `[video] playback` and
+  `cdn_url` govern public videos only.
+- Private-read timing floors default to 0 (off).
+- A paged private read examines at most `page_reads_factor` × `limit`
+  candidates; a short or empty page can carry a cursor, so keep paging while one
+  comes back.
+- Private read statements walk each chain row once (much faster on long chains),
+  and JIT compilation is off on every database connection.
+- An update of a private post notifies only new recipients, and only while the
+  post is recent.
+- The codec stops decoding at the 1 MB payload cap.
+- kryphocron 0.4.4 and kryphocron-lexicons 0.3.1; clear fields are derived with
+  kryphocron's own function, the one clients encode with.
+- CORS preflights are cached for a day.
+- `sync.head_max_age_secs` above 600 is refused at startup.
+
+### Fixed
+
+- Public notifications no longer name a private post.
+- A replayed, since-deleted audience or private post can no longer be stored
+  below a settle and grant read access.
+- Readiness can no longer be set after a gap cleared it.
+
+### Upgrade notes
+
+- **Set `APP_PRIVATE_CURSOR_KEY_HEX`** (`openssl rand -hex 32`, the same on every
+  replica) before upgrading; without it the app exits 78.
+- **Plaintext private posts go dark.** Count them by PDS first:
+  `SELECT a.pds_endpoint, count(*) FROM private_posts p LEFT JOIN actors a ON a.did = p.author_did WHERE p.encoded_content IS NULL GROUP BY 1`.
+  `[private_any_pds] enabled = false` serves them again.
+- Upgrade before a PDS you index starts writing the encoded-content form or
+  `mediaKinds`; an older version leaves such posts out, or out of the media
+  filters, until they are written again.
+- An `app.toml` that lists `[private_read.floor_ms]` keeps those floors until
+  the section is removed. Lower `sync.head_max_age_secs` to 600 or less.
+- Migrations 0023 (display columns; queues a `private` job per account to fill
+  them), 0024 (bookmarks), 0025 (gates), 0026 (quote references), 0027
+  (notifications), 0028 (verified follows), 0030 (listed revisions), 0035 (media
+  kinds).
+
+## Phase 2: A complete AppView (2026-10-11 – 2026-10-18)
+
+The rest of the `app.bsky.*` read surface, members' list mutes and blocks with
+Farsight, Thread Lens v2, upstream budgets, and running without public indexing.
+
+### Added
+
+- **The final router**: CORS on every `/xrpc/*` response (browser clients can
+  call directly), `501 MethodNotImplemented` for unknown methods, a proper
+  wrong-verb `400`, honest `501 NotImplemented` routes for deferred features,
+  `Retry-After` on `NotReady`, and `/did.json` plus `#bsky_notif` in the DID
+  document.
+- Deferred services (`contact`, `age_assurance`, custom ones) can be forwarded to
+  another server (`[services.<name>] state = "proxy"`), with token checks, header
+  filtering, rate limits and size caps.
+- **Twelve more collections** (lists, list items, list blocks, opt-outs, starter
+  packs, labeler declarations, self records, threadgates, postgates, polls),
+  with backfill, retention and purges; search, trend, `via` and profile columns,
+  filled for old rows by a post-migration task; a one-time re-sync.
+- Lists and starter packs: `getList`, `getLists`, `getListFeed`,
+  `getListsWithMembership`, `getStarterPack(s)`, `getActorStarterPacks`,
+  `getStarterPacksWithMembership`, and joined counts.
+- Graph: `getRelationships`, `getKnownFollowers`, `getBlocks`,
+  `muteThread`/`unmuteThread`, and scoped mutes (`onlyReposts`, `onlyQuoteposts`).
+- Threads: `getPostThreadV2` and `getPostThreadOtherV2`; threadgate views and
+  hidden replies; `viewer.replyDisabled`, `viewer.embeddingDisabled` and
+  `viewer.knownLikers`; detached quotes; `opThreadPostIndex`/`Count`;
+  `!no-unauthenticated` items; `thread_v2.max_parents`. `getPostThread`,
+  `getQuotes` and `getProfiles` show posts and actors not stored locally.
+- Notifications: preferences (`getPreferences`, `putPreferencesV2`), activity
+  subscriptions and `subscribed-post`, `like-via-repost`, `repost-via-repost`,
+  `starterpack-joined`, and `seenAt` on `getUnreadCount`.
+- Bookmarks, drafts, `label.queryLabels`, `repo.getRecord` (from local rows),
+  `getActorLikes` (one's own likes), `app.nearhorizon.feed.getAuthorPolls`,
+  `bookmarkCount` (`[bookmarks] emit_count`), `labeler.getServices`,
+  `identity.resolveHandle`.
+- Search: `searchPosts` and `searchPostsV2` (query operators and V2 filters),
+  `searchActorsTypeahead`, `searchStarterPacks` and `searchStarterPacksV2`.
+- Suggestions (`getSuggestions`, the `getSuggested*` family,
+  `getSuggestedFollowsByActor`, tagged suggestions, `getConfig`),
+  `getTrendingTopics` and `getTrends`, all computed from local data.
+- Profiles: `status` (gated by `unspecced.live_now`), `pronouns`, `website`,
+  `joinedViaStarterPack`, associated counts and `viewer.knownFollowers`. Gallery
+  embeds and the `posts_with_video` filter. An author feed continues from a
+  descending PDS.
+- **Members' list mutes and list blocks**: `muteActorList`, `unmuteActorList`,
+  `getListMutes`, `getListBlocks`. Moderation lists a member mutes or blocks are
+  synced from the owner's PDS within per-member budgets and apply wherever a
+  direct mute or block does. `admin lists sync` and `admin lists purge`.
+- **Farsight**: with `farsight.url`, a member's pages learn which accounts block
+  the member through a list (`viewer.blockedBy`, `getRelationships.blockedByList`,
+  notifications and the unread count); Farsight is primed when a member enrolls;
+  an optional fallback AppView while Farsight is down and an optional memory of
+  learned blocks, both off by default. `admin farsight status|prime|forget`.
+- **Thread Lens v2**: viewer-relative threads in which a block hides only the
+  blocked author's posts (as gaps), not the thread around them; posts past blocks
+  only while Farsight vouches (`bridging` `off`, `limited`, `full`); sealed
+  `repliesCursor` paging.
+- **Rate limits and budgets**: `[rate_limits.<class>]` config with
+  `endpoint_class` overrides; member and non-member pools with per-requester
+  shares for every upstream; one deadline per request; IPv6 keyed by `/64`; a
+  pre-auth backstop that charges a verified member to its DID.
+- **Public indexing switch**: `indexing.public_scope = "off"` (the default for a
+  fresh install) stores only what members need, answers the public `app.bsky.*`
+  methods with an honest 501, and keeps the private, Thread Lens and member
+  methods served. `admin indexing public-scope` and `admin indexing status`
+  switch it, deleting or refilling public data in the background.
+- Network clients by intent (`public`, `internal`, `viewer_private`), with
+  optional `[net]` nameservers; fetches for a viewer's own mutes, bookmarks and
+  subscriptions never touch shared caches.
+- Embedded profiles of accounts outside the community come from a bounded
+  upstream batch, a negative cache and a background refresh queue.
+- Metrics for Farsight and its fallback and memory, list subscriptions, the
+  private tier, backfill, the XRPC surface, identity, auth and budgets; alert
+  examples in `docker/README.md`.
+
+### Changed
+
+- `getTimeline` and `listNotifications` hydrate before filtering mutes and
+  blocks; a page can be short and still carry a cursor.
+- `getAuthorFeed`'s `posts_with_media` means images and galleries; video has its
+  own filter.
+- `getFollows`, `getFollowers` and `getQuotes` send
+  `X-Prism-Sort-Fallback: latest` for a `sort` other than `latest`.
+- `likeCount` and `repostCount` count accounts, not records.
+- Backfill workers past the first claim readiness jobs before resyncs.
+- Outbound DNS names are looked up fully qualified.
+- Metric renames: `farsight_fallback_calls_total` is
+  `farsight_fallback_requests_total{endpoint, class}`; the outcome
+  `refused_address` is `refused`; `handle_resolutions_total` gains `intent`.
+
+### Fixed
+
+- A service token with an out-of-range `iat`, `exp` or `nbf` is refused
+  (`InvalidToken`) instead of panicking the request (kryphocron 0.4.1).
+- An upstream network could stay skipped until a restart after a dropped breaker
+  probe.
+- A hung Farsight now counts as failing, and the fallback keeps to the request's
+  deadline.
+- `searchActors` keeps to accounts in scope and members, and applies the viewer's
+  blocks and mutes.
+- Accounts outside scope render as never seen on public paths, so stored rows of
+  private-tier contacts no longer show through embedded profiles, `getProfile`,
+  `resolveHandle` or `getRecord`.
+- `getPosts` no longer fetches a post upstream once its delete has been seen.
+- A late duplicate delete no longer wipes a re-created record's feed items and
+  notifications.
+- Muted threads write no notifications; `getKnownFollowers` keeps to the request
+  deadline.
+- A member whose PDS answers a missing optional record with HTTP 404 is set up
+  normally.
+- Backfill job generations stop a stale run from overwriting a newer one; list
+  releases, recovery and retries no longer leave lists waiting.
+
+### Upgrade notes
+
+- Migrations 0004–0017 ship together (new collections and columns; a one-time
+  re-sync and index builds follow, and `posts` may grow up to about twice while
+  old rows are filled; see `docker/README.md`, "After the 0004–0017 upgrade"),
+  then 0018 (list purpose), 0019 (learned blocks), 0020–0022 (public indexing
+  switch and member post references), 0029 (counts by account; recounts every
+  post).
+- An upgraded database with public data stays `community_scoped`; a fresh
+  install defaults to `off`.
+- Removed config keys (`lists.subscribed_max_total`,
+  `retention.subscribed_list_grace_days`, `features.push`,
+  `features.age_assurance`, `features.contact`) are refused at startup with a
+  message naming their replacement.
+- Farsight's fallback tells another AppView which accounts are on a member's
+  page; read `docker/README.md` before turning it on.
+
+## Phase 1: Foundation (2026-09-26 – 2026-09-28)
+
+Firehose ingest, the core `app.bsky.*` read API, the upstream cascade, the first
+private tier and Thread Lens, and the admin CLI.
+
+### Added
+
+- `app.nearhorizon.*` lexicons.
+- Configuration (`app.toml` plus `APP_*` overrides), Postgres with an
+  operator-gated migration step, retention, an SSRF-guarded HTTP client, DID and
+  handle resolution, and the identity refresher.
+- Firehose ingest from a Redis stream: per-relay watermarks, gap handling, dead
+  letters, defensive record parsing, last-writer-wins writes, scope admission and
+  growth, purges, a weekly scope rebuild, backfill with reconcile, and
+  Constellation count enrichment.
+- An admin command queue run by `serve` (members, labels, scope rebuild,
+  backfill, resync, dead-letter replay and drop) and a repo-head prober.
+- The core `app.bsky.*` read API (profiles, posts, threads, author feeds,
+  timelines, likes, reposts, quotes, follows, mutes, notifications), service-JWT
+  auth, rate limits, enrollment gates, auto-enroll, and the did:web document.
+- Hydration from local rows with the moderation gate (`!takedown`, `!hide`,
+  account status), Constellation counts, and the upstream normalizer.
+- The upstream cascade: per-network AppView clients, PDS-based routing, breakers,
+  Slingshot record fallback, author-PDS listings, and
+  `app.nearhorizon.constellation.resolveDid`.
+- The first private tier: `app.nearhorizon.private.getPosts`, `getPostThread`
+  and `getAuthorFeed`, read through an authorization pipeline with one uniform
+  miss for anything unreadable.
+- The first Thread Lens: `threadLens.getThread` and `resolve`, with a gap for
+  each post that cannot be shown.
+- `app.nearhorizon.index.requestRecord`: a signed-in account can ask for a record
+  of its own to be indexed now.
+- Read-only admin CLI: `member list`, `label list`, `deadletter list`,
+  `stream info`, `commands list`, `keygen`, `migrate status`.
+
+### Changed
+
+- `sync.read_fetch_rate_per_host` defaults to 25 (was 20).
+- `getLikes` and `getRepostedBy` page Constellation's per-record links.
+
+### Fixed
+
+- Retention and scope growth no longer race.
+- Consumer lag is computed from the group counters, not Redis 7.4's estimated
+  `lag`.
 
 ### Security
 
-- A service token whose `iat`, `exp` or `nbf` is too large to be a time is
-  rejected as `InvalidToken` before verification (#682). kryphocron 0.4.0
-  turns those claims into times with an addition that panics on overflow,
-  after the signature has verified, and anyone can sign a token for a DID
-  of their own. Such a request used to end in a panicked request task
-  instead of a 401.
-- `/xrpc/_health` answers anonymous callers with `{"ok","version"}` only;
-  the db/redis/audit flags, per-relay watermarks, `private_watermark` and
-  `gap_blocked` need a service JWT that verifies with `lxm` `_health` (no
-  membership check). An invalid token is answered as anonymous. Status
-  codes are unchanged (200/503), and the route stays outside the global
-  per-IP bucket except that a request carrying `Authorization` is charged
-  to it before verification. Design-v2 §7.1; §13 row 186.
-- Authorization-collection records that fail deterministically keep readiness
-  unset (fail-closed) and raise the `AuthzBackfillStuck` alert.
+- `/xrpc/_health` answers anonymous callers with `ok` and `version` only; the
+  details need a verified service token.
+- Authorization records that fail to parse keep readiness unset and raise an
+  alert.
+
+### Upgrade notes
+
+- Migrations 0001–0003.
