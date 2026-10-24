@@ -246,11 +246,15 @@ struct Served {
 }
 
 async fn serve_plural(pool: &sqlx::PgPool, pds_url: &str, cfg: &PluralConfig, fresh: bool, sets: ScopeSets) -> Served {
+    serve_plural_limited(pool, pds_url, cfg, fresh, sets, RateLimits::new()).await
+}
+
+async fn serve_plural_limited(pool: &sqlx::PgPool, pds_url: &str, cfg: &PluralConfig, fresh: bool, sets: ScopeSets, limits: RateLimits) -> Served {
     let (auth, _d) = verifier(StubFetcher::default(), 10, 4);
     let app = AppState {
         hydrator: hydrator(pool, sets),
         auth: Arc::new(auth),
-        limits: RateLimits::new(),
+        limits,
         enroller: None,
         trusted_proxy: "172.30.0.10".parse().expect("ip"),
         did_document: Arc::new(json!({})),
@@ -402,7 +406,14 @@ async fn t_p8_signed_out_calls_are_held_to_plural_anon() {
     let Some(db) = fresh_db("plural_t_p8_anon_limit").await else {
         return;
     };
-    let s = serve_plural(&db.pool, "http://127.0.0.1:9", &PluralConfig { enabled: false, ..PluralConfig::default() }, true, ScopeSets::default()).await;
+    // The default burst of 10, refilled too slowly to matter here, so the
+    // count does not depend on how fast the calls run.
+    let cfg = crate::config::RateLimitsConfig {
+        plural_anon: crate::config::RateClassConfig::new(0.001, 10),
+        ..crate::config::RateLimitsConfig::default()
+    };
+    let disabled = PluralConfig { enabled: false, ..PluralConfig::default() };
+    let s = serve_plural_limited(&db.pool, "http://127.0.0.1:9", &disabled, true, ScopeSets::default(), RateLimits::from_config(&cfg)).await;
     let url = format!("{}/{GET_RECORDS}?actors={ALICE}", s.base);
     let mut statuses = Vec::new();
     let mut retry_after = None;
@@ -413,9 +424,8 @@ async fn t_p8_signed_out_calls_are_held_to_plural_anon() {
         }
         statuses.push(r.status().as_u16());
     }
-    // The burst, plus at most one token refilled at 1/s while the loop runs.
-    let served = statuses.iter().filter(|s| **s == 501).count();
-    assert!((10..=11).contains(&served), "{statuses:?}");
+    assert_eq!(statuses.iter().filter(|s| **s == 501).count(), 10, "{statuses:?}");
+    assert_eq!(crate::config::RateLimitsConfig::default().plural_anon, crate::config::RateClassConfig::new(1.0, 10));
     assert!(statuses.contains(&429), "{statuses:?}");
     assert!(retry_after.is_some_and(|v| v.parse::<u64>().is_ok_and(|n| n >= 1)), "Retry-After on the 429");
     let r = reqwest::Client::new().get(&url).header("authorization", "Bearer not-a-token").send().await.expect("request");
