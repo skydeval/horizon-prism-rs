@@ -1,7 +1,10 @@
 //! `app.nearhorizon.plural.getRecords` and `listMembers` (plural-pronouns
-//! design §2.8): queries, no sign-in, charged by IP to `anon_read`, kept in
-//! every public-indexing mode, CORS as every route. With `plural.enabled`
-//! off both answer 501 `MethodNotImplemented` from their own routes.
+//! design §2.8): queries, no sign-in needed. Signed out they are charged by
+//! IP to the tight `plural_anon` class; with a service token that verifies,
+//! by DID to `plural_auth` (skydeval, 2026-10-24: signed-out re-asks a lot
+//! less frequent). Every 429 carries `Retry-After`. Kept in every
+//! public-indexing mode, CORS as every route. With `plural.enabled` off
+//! both answer 501 `MethodNotImplemented` from their own routes.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -32,9 +35,12 @@ pub const MAX_MEMBERS: usize = 100;
 /// `listMembers`' page size.
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 100;
-/// `cache-control` with every answer known, and with any unknown.
+/// `cache-control` with every answer known; with any unknown for a
+/// signed-in caller; with any unknown for a signed-out one (its client
+/// re-asks after 30 s anyway). `record` and `none` stay within the minute.
 pub const CACHE_KNOWN: &str = "public, max-age=30";
 pub const CACHE_UNKNOWN: &str = "public, max-age=5";
+pub const CACHE_UNKNOWN_ANON: &str = "public, max-age=30";
 
 /// Whether the firehose is current (§2.5).
 #[derive(Clone)]
@@ -80,13 +86,34 @@ fn not_served() -> XrpcError {
     XrpcError::new(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "Pronouns and plural records are not served here")
 }
 
-fn finish(method: &'static str, begun: Instant, result: Result<(Value, bool), XrpcError>) -> Result<Response, XrpcError> {
+/// Charge the call (§3): a token that verifies charges `plural_auth` by
+/// DID; no token charges `plural_anon` by IP; a token that does not verify
+/// is refused. Returns whether the caller is signed in.
+async fn charge(s: &PluralState, headers: &HeaderMap, ip: std::net::IpAddr, method: &str) -> Result<bool, XrpcError> {
+    let authorization = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let caller = match authorization {
+        Some(_) => Some(crate::xrpc::auth::authenticate(&s.app, authorization, method).await?),
+        None => None,
+    };
+    s.app.limits.charge(method, Family::Plural, caller.as_ref().map(|c| c.did.as_str()), ip)?;
+    Ok(caller.is_some())
+}
+
+/// What one read answered: its body, whether any answer is `unknown`, and
+/// whether the caller is signed in.
+type Done = (Value, bool, bool);
+
+fn finish(method: &'static str, begun: Instant, result: Result<Done, XrpcError>) -> Result<Response, XrpcError> {
     metrics::histogram!(METRIC_READ_SECONDS, "method" => method).record(begun.elapsed().as_secs_f64());
     match result {
-        Ok((body, unknown)) => {
+        Ok((body, unknown, signed_in)) => {
             metrics::counter!(METRIC_READS, "method" => method, "outcome" => "ok").increment(1);
             let mut response = Json(body).into_response();
-            let cache = if unknown { CACHE_UNKNOWN } else { CACHE_KNOWN };
+            let cache = match (unknown, signed_in) {
+                (false, _) => CACHE_KNOWN,
+                (true, true) => CACHE_UNKNOWN,
+                (true, false) => CACHE_UNKNOWN_ANON,
+            };
             response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
             Ok(response)
         }
@@ -133,9 +160,9 @@ pub async fn get_records(
     finish("getRecords", begun, result)
 }
 
-async fn get_records_inner(s: &PluralState, peer: SocketAddr, headers: &HeaderMap, q: Option<&str>) -> Result<(Value, bool), XrpcError> {
+async fn get_records_inner(s: &PluralState, peer: SocketAddr, headers: &HeaderMap, q: Option<&str>) -> Result<Done, XrpcError> {
     let ip = request_ip(&s.app, headers, peer);
-    s.app.limits.charge(GET_RECORDS, Family::Read, None, ip)?;
+    let signed_in = charge(s, headers, ip, GET_RECORDS).await?;
     if !s.filler.config().enabled {
         return Err(not_served());
     }
@@ -200,7 +227,7 @@ async fn get_records_inner(s: &PluralState, peer: SocketAddr, headers: &HeaderMa
         }
         member_out.push(a);
     }
-    Ok((json!({"actors": actor_out, "members": member_out}), unknown))
+    Ok((json!({"actors": actor_out, "members": member_out}), unknown, signed_in))
 }
 
 pub async fn list_members(
@@ -214,9 +241,9 @@ pub async fn list_members(
     finish("listMembers", begun, result)
 }
 
-async fn list_members_inner(s: &PluralState, peer: SocketAddr, headers: &HeaderMap, q: Option<&str>) -> Result<(Value, bool), XrpcError> {
+async fn list_members_inner(s: &PluralState, peer: SocketAddr, headers: &HeaderMap, q: Option<&str>) -> Result<Done, XrpcError> {
     let ip = request_ip(&s.app, headers, peer);
-    s.app.limits.charge(LIST_MEMBERS, Family::Read, None, ip)?;
+    let signed_in = charge(s, headers, ip, LIST_MEMBERS).await?;
     if !s.filler.config().enabled {
         return Err(not_served());
     }
@@ -242,9 +269,9 @@ async fn list_members_inner(s: &PluralState, peer: SocketAddr, headers: &HeaderM
     if gate.get(&actor).is_some_and(|g| g.is_hidden()) || !listed {
         // `gone`: the account is gone, so it has no members.
         if row.is_some_and(|r| r.state == RepoState::Gone) {
-            return Ok((json!({"actor": actor, "status": "complete", "members": []}), false));
+            return Ok((json!({"actor": actor, "status": "complete", "members": []}), false, signed_in));
         }
-        return Ok((unknown, true));
+        return Ok((unknown, true, signed_in));
     }
     let page = reads::member_page(s.filler.pool(), &actor, cursor.as_deref(), i64::from(limit) + 1).await?;
     let more = page.len() > usize::try_from(limit).unwrap_or(usize::MAX);
@@ -267,5 +294,5 @@ async fn list_members_inner(s: &PluralState, peer: SocketAddr, headers: &HeaderM
     if more && let Some((_, rkey, ..)) = page.last() {
         out["cursor"] = json!(rkey);
     }
-    Ok((out, partial))
+    Ok((out, partial, signed_in))
 }

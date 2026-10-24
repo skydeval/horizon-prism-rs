@@ -10,6 +10,11 @@ commit.
 
 ## [Unreleased]
 
+### Changed (pronouns and plural: signed-out reads held tighter, #896)
+
+- **`plural.getRecords` and `plural.listMembers` have their own rate classes** (skydeval, 2026-10-24: signed-out re-asks a lot less frequent): signed out, `plural_anon` per IP (IPv6 per /64), 1/s with a burst of 10, enough for a feed page's call plus a re-ask after 30 s and then every 5 minutes; with a service token that verifies, `plural_auth` per account, 5/s with a burst of 30. A token that does not verify is refused (`InvalidToken`) rather than charged as anonymous. Every 429 carries `Retry-After`. New config `[rate_limits] plural_anon`, `plural_auth`; the family name for `endpoint_class` is `plural`.
+- A signed-out answer with any `unknown` now carries `cache-control: public, max-age=30` (signed in, still `max-age=5`); answers with no `unknown` keep `max-age=30`, so a rename or delete still shows within about a minute.
+
 ### Added (pronouns and plural systems: fronters on posts, #896, #903)
 
 - **Kryphocron posts carry their fronters.** The clear top-level `app.nearhorizon.plural.fronters` key of a `tools.kryphocron.feed.postPrivate` record (from `createPostPrivate`, `participatePrivate` or the encode route; it is never part of the encoded payload) is stored in `private_posts.fronters` and returned in the private view's `record`, and so in a quoting post's `#viewRecord.value`. Checked strictly: an object whose `members` is 1 to 20 objects, each with `id` a valid record key and an optional `status` string of at most 320 bytes, within 64 KiB; other keys are kept as written. An invalid value is dropped and counted (`private_ingest_field_dropped_total{field="app.nearhorizon.plural.fronters"}`); the post still ingests. Served behind the read path like the rest of the view.

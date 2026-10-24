@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Pronouns and plural records of any accounts, member or not: for each DID in 'actors' its app.nearhorizon.actor.pronouns, app.nearhorizon.plural.system and app.nearhorizon.plural.front (rkey self), and each app.nearhorizon.plural.member named in 'members'. No auth; charged by IP. Answers come in request order, each once. The accounts named by 'actors' and by the member URIs together are at most 50. A first call about an account may answer 'unknown' while the AppView lists its repository; ask again. Responses carry cache-control: public, max-age=30 when no answer is 'unknown', else max-age=5. A 501 MethodNotImplemented (or a 404 from an AppView without this method) means the records are not served here.",
+      "description": "Pronouns and plural records of any accounts, member or not: for each DID in 'actors' its app.nearhorizon.actor.pronouns, app.nearhorizon.plural.system and app.nearhorizon.plural.front (rkey self), and each app.nearhorizon.plural.member named in 'members'. No auth needed: signed out it is charged by IP to a tight class, with a service token by account. Answers come in request order, each once. The accounts named by 'actors' and by the member URIs together are at most 50. A first call about an account may answer 'unknown' while the AppView lists its repository; ask again. Responses carry cache-control: public, max-age=30 when no answer is 'unknown'; with any 'unknown', max-age=5 signed in and max-age=30 signed out. A 501 MethodNotImplemented (or a 404 from an AppView without this method) means the records are not served here.",
       "parameters": {
         "type": "params",
         "properties": {

@@ -1963,6 +1963,10 @@ pub struct RateLimitsConfig {
     pub service_proxy_ip: RateClassConfig,
     /// Refract's endpoints (refract design §7.1), per caller DID.
     pub refract: RateClassConfig,
+    /// The pronouns and plural reads (plural-pronouns design §3): signed
+    /// out, per IP, tight; signed in (a verified token), per DID.
+    pub plural_anon: RateClassConfig,
+    pub plural_auth: RateClassConfig,
     /// NSID to family name: moves one served endpoint to another family.
     pub endpoint_class: BTreeMap<String, String>,
 }
@@ -1983,6 +1987,8 @@ impl Default for RateLimitsConfig {
             service_proxy_member: RateClassConfig::new(5.0, 20),
             service_proxy_ip: RateClassConfig::new(10.0, 20),
             refract: RateClassConfig::new(5.0, 20),
+            plural_anon: RateClassConfig::new(1.0, 10),
+            plural_auth: RateClassConfig::new(5.0, 30),
             endpoint_class: BTreeMap::new(),
         }
     }
@@ -1991,7 +1997,7 @@ impl Default for RateLimitsConfig {
 impl RateLimitsConfig {
     /// Every class with its config key, in §10's order.
     #[must_use]
-    pub fn classes(&self) -> [(&'static str, RateClassConfig); 13] {
+    pub fn classes(&self) -> [(&'static str, RateClassConfig); 15] {
         [
             ("anon_read", self.anon_read),
             ("auth_read", self.auth_read),
@@ -2006,6 +2012,8 @@ impl RateLimitsConfig {
             ("service_proxy_member", self.service_proxy_member),
             ("service_proxy_ip", self.service_proxy_ip),
             ("refract", self.refract),
+            ("plural_anon", self.plural_anon),
+            ("plural_auth", self.plural_auth),
         ]
     }
 }

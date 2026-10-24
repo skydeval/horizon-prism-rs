@@ -287,6 +287,8 @@ global = { per_sec = 100.0, burst = 200 }
 service_proxy_member = { per_sec = 5.0, burst = 20 }
 service_proxy_ip = { per_sec = 10.0, burst = 20 }
 refract = { per_sec = 5.0, burst = 20 }
+plural_anon = { per_sec = 1.0, burst = 10 }
+plural_auth = { per_sec = 5.0, burst = 30 }
 
 [auth]
 failed_verify_rate_per_sec = 10.0

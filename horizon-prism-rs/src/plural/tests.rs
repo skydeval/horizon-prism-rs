@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use super::fill::{Filler, LookupError, Outcome, PdsLookup};
-use super::handlers::{CACHE_KNOWN, CACHE_UNKNOWN, Freshness, PluralState, router};
+use super::handlers::{CACHE_KNOWN, CACHE_UNKNOWN_ANON, Freshness, PluralState, router};
 use super::*;
 use crate::aggregations::{ScopeSets, ScopeState};
 use crate::config::{PluralConfig, ScopePolicy};
@@ -307,7 +307,7 @@ async fn t_p6_get_records() {
     exec(&s.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{ALICE}', '!takedown')")).await;
     let (_, cache, v) = get(&format!("{}/{GET_RECORDS}?actors={ALICE}", s.base)).await;
     assert_eq!(v["actors"][0]["pronouns"], json!({"status": "unknown"}));
-    assert_eq!(cache.as_deref(), Some(CACHE_UNKNOWN));
+    assert_eq!(cache.as_deref(), Some(CACHE_UNKNOWN_ANON));
     exec(&s.pool, "DELETE FROM labels").await;
 
     // Input errors.
@@ -335,7 +335,7 @@ async fn t_p5_stale_firehose_gives_no_none() {
     let s = serve_plural(&db.pool, &url, &PluralConfig::default(), false, ScopeSets::default()).await;
     let (_, cache, v) = get(&format!("{}/{GET_RECORDS}?actors={BOB}", s.base)).await;
     assert_eq!(v["actors"][0]["pronouns"], json!({"status": "unknown"}), "{v}");
-    assert_eq!(cache.as_deref(), Some(CACHE_UNKNOWN));
+    assert_eq!(cache.as_deref(), Some(CACHE_UNKNOWN_ANON));
     assert_eq!(repo_state(&db.pool, BOB).await.map(|r| r.0), Some("complete".into()), "listed, but not answered as absent");
     db.drop_db().await;
 }
@@ -368,7 +368,7 @@ async fn t_p7_list_members() {
     exec(p, "UPDATE plural_records SET record = NULL WHERE rkey = '3kb'").await;
     let (_, cache, v) = get(&format!("{}/{LIST_MEMBERS}?actor={ALICE}", s.base)).await;
     assert_eq!((v["status"].as_str(), rkeys(&v)), (Some("partial"), vec!["3kc".to_string()]));
-    assert_eq!(cache.as_deref(), Some(CACHE_UNKNOWN));
+    assert_eq!(cache.as_deref(), Some(CACHE_UNKNOWN_ANON));
     // Not listable: unknown.
     pds.fail(BOB, 500, "InternalServerError");
     let (_, _, v) = get(&format!("{}/{LIST_MEMBERS}?actor={BOB}", s.base)).await;
@@ -391,6 +391,35 @@ async fn t_p8_disabled_is_501() {
     }
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM plural_repos").fetch_one(&db.pool).await.expect("count");
     assert_eq!(rows, 0, "nothing listed");
+    db.drop_db().await;
+}
+
+/// T-P8 (§3, skydeval 2026-10-24): signed out, the tight per-IP class
+/// (`plural_anon`, burst 10) answers 429 with `Retry-After` past its burst;
+/// a token that does not verify is refused, not charged as anonymous.
+#[tokio::test]
+async fn t_p8_signed_out_calls_are_held_to_plural_anon() {
+    let Some(db) = fresh_db("plural_t_p8_anon_limit").await else {
+        return;
+    };
+    let s = serve_plural(&db.pool, "http://127.0.0.1:9", &PluralConfig { enabled: false, ..PluralConfig::default() }, true, ScopeSets::default()).await;
+    let url = format!("{}/{GET_RECORDS}?actors={ALICE}", s.base);
+    let mut statuses = Vec::new();
+    let mut retry_after = None;
+    for _ in 0..12 {
+        let r = reqwest::get(&url).await.expect("request");
+        if r.status().as_u16() == 429 {
+            retry_after = r.headers().get("retry-after").map(|v| v.to_str().expect("ascii").to_string());
+        }
+        statuses.push(r.status().as_u16());
+    }
+    // The burst, plus at most one token refilled at 1/s while the loop runs.
+    let served = statuses.iter().filter(|s| **s == 501).count();
+    assert!((10..=11).contains(&served), "{statuses:?}");
+    assert!(statuses.contains(&429), "{statuses:?}");
+    assert!(retry_after.is_some_and(|v| v.parse::<u64>().is_ok_and(|n| n >= 1)), "Retry-After on the 429");
+    let r = reqwest::Client::new().get(&url).header("authorization", "Bearer not-a-token").send().await.expect("request");
+    assert_eq!(r.status().as_u16(), 401);
     db.drop_db().await;
 }
 

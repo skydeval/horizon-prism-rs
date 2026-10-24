@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "The app.nearhorizon.plural.member records of one account, member or not, in ascending rkey order. No auth; charged by IP. 'status': 'complete' when every member is listed across the pages, 'partial' when the AppView cannot promise that (a very large system, the stream behind, a member it could not show), 'unknown' when it has not listed the repository (members empty; ask again). Cache-control as getRecords.",
+      "description": "The app.nearhorizon.plural.member records of one account, member or not, in ascending rkey order. No auth needed: signed out it is charged by IP to a tight class, with a service token by account. 'status': 'complete' when every member is listed across the pages, 'partial' when the AppView cannot promise that (a very large system, the stream behind, a member it could not show), 'unknown' when it has not listed the repository (members empty; ask again). Cache-control as getRecords.",
       "parameters": {
         "type": "params",
         "required": ["actor"],

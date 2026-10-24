@@ -19,6 +19,8 @@
 //! | `resolve` | endpoint and IP | 10/s, 20 |
 //! | `global` | IP | 100/s, 200 (backstop) |
 //! | `refract` | DID | 5/s, 20 |
+//! | `plural_anon` | IP | 1/s, 10 |
+//! | `plural_auth` | DID | 5/s, 30 |
 //!
 //! Classes form **families**: a request is charged to its family's IP-keyed
 //! member when anonymous and to its DID-keyed member when authenticated.
@@ -58,10 +60,14 @@ pub enum Class {
     ServiceProxyIp,
     /// Refract's endpoints (refract design §7.1).
     Refract,
+    /// The pronouns and plural reads (plural-pronouns design §3): per IP
+    /// signed out, per DID signed in.
+    PluralAnon,
+    PluralAuth,
 }
 
 impl Class {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 15] = [
         Self::AnonRead,
         Self::AuthRead,
         Self::SearchAnon,
@@ -75,6 +81,8 @@ impl Class {
         Self::ServiceProxyMember,
         Self::ServiceProxyIp,
         Self::Refract,
+        Self::PluralAnon,
+        Self::PluralAuth,
     ];
 
     fn config(self, cfg: &RateLimitsConfig) -> RateClassConfig {
@@ -92,6 +100,8 @@ impl Class {
             Self::ServiceProxyMember => cfg.service_proxy_member,
             Self::ServiceProxyIp => cfg.service_proxy_ip,
             Self::Refract => cfg.refract,
+            Self::PluralAnon => cfg.plural_anon,
+            Self::PluralAuth => cfg.plural_auth,
         }
     }
 }
@@ -111,6 +121,8 @@ pub enum Family {
     Resolve,
     /// Refract's endpoints, per caller DID.
     Refract,
+    /// `plural_anon` / `plural_auth`.
+    Plural,
 }
 
 impl Family {
@@ -126,6 +138,7 @@ impl Family {
             "index_request" => Self::IndexRequest,
             "resolve" => Self::Resolve,
             "refract" => Self::Refract,
+            "plural" => Self::Plural,
             _ => return None,
         })
     }
@@ -134,7 +147,7 @@ impl Family {
     /// can be charged to it.
     #[must_use]
     pub fn serves_anonymous(self) -> bool {
-        matches!(self, Self::Read | Self::Search | Self::Resolve)
+        matches!(self, Self::Read | Self::Search | Self::Resolve | Self::Plural)
     }
 }
 
@@ -262,9 +275,10 @@ pub const SERVED: &[Served] = &[
     served("app.nearhorizon.refract.listNotifications", Family::Refract, false),
     served("app.nearhorizon.refract.getUnreadCount", Family::Refract, false),
     served("app.nearhorizon.refract.getAuthorReposts", Family::Refract, false),
-    // Pronouns and plural systems (plural-pronouns design §3): by IP.
-    served("app.nearhorizon.plural.getRecords", Family::Read, true),
-    served("app.nearhorizon.plural.listMembers", Family::Read, true),
+    // Pronouns and plural systems (plural-pronouns design §3): per IP
+    // signed out, per DID signed in.
+    served("app.nearhorizon.plural.getRecords", Family::Plural, true),
+    served("app.nearhorizon.plural.listMembers", Family::Plural, true),
 ];
 
 /// Methods charged more than one token of their bucket. A private search
@@ -288,6 +302,7 @@ fn authenticated_class(family: Family) -> Class {
         Family::IndexRequest => Class::IndexRequest,
         Family::Resolve => Class::Resolve,
         Family::Refract => Class::Refract,
+        Family::Plural => Class::PluralAuth,
     }
 }
 
@@ -505,6 +520,7 @@ impl RateLimits {
         match (self.family(method, default), did) {
             (Family::Resolve, _) => self.check(Class::Resolve, &format!("{method}|{}", ip_key(ip))),
             (Family::Search, None) => self.check_ip(Class::SearchAnon, ip),
+            (Family::Plural, None) => self.check_ip(Class::PluralAnon, ip),
             // An authenticated call takes its method's cost ([`COSTS`]).
             (family, Some(did)) => self.check_n(authenticated_class(family), did, cost(method)),
             // An anonymous read. A DID-keyed family never reaches here with
