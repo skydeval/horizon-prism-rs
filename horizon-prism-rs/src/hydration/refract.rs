@@ -417,6 +417,61 @@ fn view_record(post: &Value) -> Value {
     v
 }
 
+/// The longest `q` the Refract actor searches take, in characters.
+pub const SEARCH_Q_MAX: usize = 100;
+
+/// A string as the Refract actor searches compare it: compatibility
+/// decomposed, combining marks dropped, lowercased ("Zoë" and "ZOE" both
+/// read "zoe").
+#[must_use]
+pub fn search_fold(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfkd().filter(|c| !unicode_normalization::char::is_combining_mark(*c)).flat_map(char::to_lowercase).collect()
+}
+
+/// How an account matched `q` (folded): 0 its handle is `q`, 1 its handle
+/// starts with `q`, 2 its display name does; `None` no match.
+fn search_rank(q: &str, handle: &str, display_name: Option<&str>) -> Option<u8> {
+    let h = search_fold(handle);
+    if h == q {
+        Some(0)
+    } else if h.starts_with(q) {
+        Some(1)
+    } else if display_name.is_some_and(|n| search_fold(n.trim_start()).starts_with(q)) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Where a match sorts in the Refract actor searches: by rank, then by
+/// handle, then by DID; a total order, so a cursor (the last key of a page)
+/// stays put as accounts come and go.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SearchKey {
+    pub rank: u8,
+    pub handle: String,
+    pub did: String,
+}
+
+impl SearchKey {
+    /// The cursor form: `rank:handle:did` (a handle holds no colon).
+    #[must_use]
+    pub fn cursor(&self) -> String {
+        format!("{}:{}:{}", self.rank, self.handle, self.did)
+    }
+
+    /// A cursor read back; `None` when it is not one.
+    #[must_use]
+    pub fn parse(cursor: &str) -> Option<Self> {
+        let mut parts = cursor.splitn(3, ':');
+        let rank: u8 = parts.next()?.parse().ok().filter(|r| *r <= 2)?;
+        let handle = parts.next()?.to_string();
+        let did = parts.next().filter(|d| d.starts_with("did:"))?.to_string();
+        Some(Self { rank, handle, did })
+    }
+}
+
 /// What a member's own tables drop from a Refract timeline, for the DID
 /// expression `d` (refract design §7.1 "Member-only data"): a full mute,
 /// a block either way, and the list mutes and list blocks that apply.
@@ -525,6 +580,66 @@ impl Hydrator {
         .await?;
         let next = (items.len() == usize::try_from(limit).unwrap_or(usize::MAX)).then(|| items.last().map(|i| local_cursor(i.sort_at, &i.uri))).flatten();
         Ok((items, next))
+    }
+
+    /// A page of the Refract actor searches: the DIDs of `restored` whose
+    /// stored handle or display name starts with `q` (already
+    /// [`search_fold`]ed), in [`SearchKey`] order after `after`, at most
+    /// `limit`; and the key of the last one when more follow. An account with
+    /// no stored handle is not searched (its view would read
+    /// `handle.invalid`).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn refract_search_page(&self, restored: &[String], q: &str, after: Option<&SearchKey>, limit: usize) -> Result<(Vec<String>, Option<SearchKey>), sqlx::Error> {
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT did, handle, display_name FROM actors WHERE did = ANY($1) AND handle IS NOT NULL AND handle <> $2")
+                .bind(restored)
+                .bind(super::INVALID_HANDLE)
+                .fetch_all(self.pool())
+                .await?;
+        let mut hits: Vec<SearchKey> = rows
+            .into_iter()
+            .filter_map(|(did, handle, name)| {
+                let handle = handle.to_lowercase();
+                search_rank(q, &handle, name.as_deref()).map(|rank| SearchKey { rank, handle, did })
+            })
+            .filter(|k| after.is_none_or(|a| k > a))
+            .collect();
+        hits.sort();
+        let limit = limit.max(1);
+        let next = (hits.len() > limit).then(|| hits[limit - 1].clone());
+        hits.truncate(limit);
+        Ok((hits.into_iter().map(|k| k.did).collect(), next))
+    }
+
+    /// The body of a Refract actor search: the views of `dids` (as `kind`)
+    /// that the moderation gate shows and the caller neither blocks, is
+    /// blocked by (a visitor's unanswered pairs included), nor fully mutes,
+    /// each carrying the restored marker; `withheld` as the handler decided
+    /// it; `cursor` when given.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn refract_search_actors(
+        &self,
+        viewer: &Viewer,
+        req: &Requester,
+        dids: &[String],
+        kind: ProfileKind,
+        cursor: Option<&str>,
+        withheld: &[(String, &'static str)],
+    ) -> Result<PublicEmit<Value>, HydrationError> {
+        let (visible, ctx) = self.searchable(viewer, req, dids).await?;
+        let actors: Vec<Value> = visible.iter().map(|d| ctx.view(d, kind)).filter(|v| v.get("restored").is_some()).collect();
+        let held: Vec<Value> = withheld.iter().map(|(id, reason)| json!({"id": id, "reason": reason})).collect();
+        let mut out = json!({"actors": actors, "withheld": held});
+        if let Some(c) = cursor {
+            out["cursor"] = json!(c);
+        }
+        Ok(Self::emit(out))
     }
 
     /// A body with nothing in it, for a caller a Refract method serves
@@ -1267,5 +1382,28 @@ impl Hydrator {
             }
         }
         Self::emit(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Case, diacritics and compatibility forms fold; the ranks; a cursor
+    /// reads back as the key it came from, and anything else does not.
+    #[test]
+    fn search_fold_rank_and_cursor() {
+        assert_eq!(search_fold("ZoË Ångström"), "zoe angstrom");
+        assert_eq!(search_fold("ｆｕｌｌ"), "full");
+        assert_eq!(search_rank("ann.test", "ann.test", None), Some(0));
+        assert_eq!(search_rank("ann", "annabel.test", Some("Ann")), Some(1));
+        assert_eq!(search_rank("ann", "bob.test", Some("  Ánna")), Some(2));
+        assert_eq!(search_rank("ann", "bob.test", Some("Joann")), None);
+        let key = SearchKey { rank: 1, handle: "ann.test".into(), did: "did:plc:aaaa".into() };
+        assert_eq!(SearchKey::parse(&key.cursor()), Some(key));
+        assert!(SearchKey::parse("junk").is_none() && SearchKey::parse("3:a:did:plc:a").is_none() && SearchKey::parse("1:a:b").is_none());
+        let a = SearchKey { rank: 0, handle: "z".into(), did: "did:x".into() };
+        let b = SearchKey { rank: 1, handle: "a".into(), did: "did:x".into() };
+        assert!(a < b, "rank first");
     }
 }

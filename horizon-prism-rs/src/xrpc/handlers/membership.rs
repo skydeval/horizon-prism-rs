@@ -67,6 +67,9 @@ pub const FEATURE_THREAD_LENS_HYDRATED: &str = "threadLens.hydrated";
 pub const FEATURE_THREAD_LENS_LABELERS: &str = "threadLens.labelers";
 /// `refract` (refract design §7.1): the Refract endpoints are on.
 pub const FEATURE_REFRACT: &str = "refract";
+/// `refract.search`: `app.nearhorizon.refract.searchActors` and
+/// `searchActorsTypeahead` are served; listed with [`FEATURE_REFRACT`].
+pub const FEATURE_REFRACT_SEARCH: &str = "refract.search";
 
 /// Private posts from any PDS are fully served, and a plaintext one is
 /// refused (private-encode design §7, S4): listed after the private tier's
@@ -207,6 +210,7 @@ impl MembershipSettings {
         // Refract (refract design §7.1): from runtime state, while on.
         if live.refract_enabled {
             out.push(FEATURE_REFRACT);
+            out.push(FEATURE_REFRACT_SEARCH);
         }
         // Pronouns and plural systems (plural-pronouns design §1.3, §2.9):
         // the fronters key kept on every post record this AppView builds,
@@ -630,6 +634,19 @@ mod tests {
         assert_eq!(off.features().len(), FEATURES.len() + 6);
         let disabled = MembershipSettings::default().with_any_pds(true);
         assert_eq!(disabled.features(), [FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, FEATURE_THREAD_LENS_LABELERS, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]);
+    }
+
+    /// `refract` and `refract.search` are listed together, exactly while
+    /// Refract is on.
+    #[test]
+    fn refract_features_follow_the_switch() {
+        let live = LiveSettings::default();
+        let settings = MembershipSettings::default().with_live(live.clone());
+        assert!(!settings.features().iter().any(|f| f.starts_with("refract")));
+        live.update(|v| v.refract_enabled = true);
+        let on = settings.features();
+        let at = on.iter().position(|f| *f == FEATURE_REFRACT).expect("refract");
+        assert_eq!(on.get(at + 1), Some(&FEATURE_REFRACT_SEARCH));
     }
 
     /// T-0 (Thread Lens amendment 1 §0A): `features` follows a live change

@@ -12,6 +12,14 @@ no tracker references.
 
 ## [Unreleased]
 
+### Added
+
+- **Refract actor search**: `app.nearhorizon.refract.searchActorsTypeahead
+  {q, limit}` and `searchActors {q, limit, cursor}` find restored accounts by
+  the start of their handle or display name (case and diacritics ignored),
+  shaped as Bluesky's actor searches and with Refract's usual rules; listed in
+  `getMembership.features` as `refract.search` while Refract is on.
+
 ### Fixed
 
 - Saving private notification preferences while being removed from the

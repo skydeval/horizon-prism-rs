@@ -1,0 +1,33 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.refract.searchActors",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Accounts this AppView serves for a listed community whose handle or display name starts with q, as app.bsky.actor.searchActors answers, paged. Case and diacritics are ignored; a leading @ is dropped. Order: the exact handle, then handles starting with q, then display names starting with q, each by handle; the cursor keeps its place in that order as accounts come and go. Every view carries app.nearhorizon.refract.defs#restored. An account the moderation gate hides, one the caller blocks or is blocked by, and one the caller fully mutes is left out after the page is cut, so a page can be short and still carry a cursor. Any signed-in caller.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "q": { "type": "string", "maxLength": 100, "description": "At most 100 characters after trimming. Empty: no actors." },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25 },
+          "cursor": { "type": "string" }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["actors"],
+          "properties": {
+            "servedAs": { "type": "string", "knownValues": ["member", "visitor"], "description": "The form this answer was served in: `member` (a ready member, with its stored viewer state) or `visitor` (anyone else)." },
+            "viewerChecked": { "type": "ref", "ref": "app.nearhorizon.refract.defs#viewerChecked" },
+            "withheld": { "type": "array", "items": { "type": "ref", "ref": "app.nearhorizon.refract.defs#withheld" }, "description": "Matching accounts of this page held back for a reason that is not final: `unanswered`, a visitor's block check with the account got no answer." },
+            "cursor": { "type": "string", "description": "Present while more matches follow." },
+            "actors": { "type": "array", "items": { "type": "ref", "ref": "app.bsky.actor.defs#profileView" } }
+          }
+        }
+      },
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }, { "name": "InvalidToken" }, { "name": "RateLimitExceeded" }, { "name": "InvalidRequest", "description": "q is longer than 100 characters, or the cursor is not one this method gave." }]
+    }
+  }
+}

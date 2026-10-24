@@ -424,3 +424,124 @@ async fn fill_walks_cold_profiles_in_parallel() {
 fn urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
+
+const FIFTH: &str = "did:plc:fifthaaaaaaaaaaaaaaaaaaa";
+
+/// Four accounts matching "ann" and one not: SUBJECT `ann.test`, OTHER
+/// `annabel.test` and THIRD `aaron.test` ("Ánn.test fan") restored, FOURTH
+/// `annie.test` ending, FIFTH `ann.zone` with no Refract row.
+async fn search_world(h: &Harness) {
+    for (did, handle, name) in [
+        (SUBJECT, "ann.test", "Zed"),
+        (OTHER, "annabel.test", "Bob"),
+        (THIRD, "aaron.test", "Ánn.test fan"),
+        (FOURTH, "annie.test", "Annie"),
+        (FIFTH, "ann.zone", "Ann"),
+    ] {
+        actor(&h.pool, did, handle, name).await;
+    }
+    for (did, state) in [(SUBJECT, "restored"), (OTHER, "restored"), (THIRD, "restored"), (FOURTH, "ending")] {
+        exec(&h.pool, &format!("INSERT INTO refract_dids (did, community, pds_host, state, source) VALUES ('{did}', 'sky', '127.0.0.1', '{state}', 'fill')")).await;
+    }
+    h.refract.apply_config().await.expect("load");
+}
+
+fn handles(body: &Value) -> Vec<String> {
+    body["actors"].as_array().expect("actors").iter().map(|a| a["handle"].as_str().unwrap_or_default().to_string()).collect()
+}
+
+/// The actor searches: restored accounts only (not an ending one, not one
+/// with no Refract row), by handle or display-name prefix, case,
+/// diacritics and a leading @ ignored; exact handle, then handle prefix,
+/// then display-name prefix, by handle within each; every view marked; the
+/// typeahead basic and unpaged, the search a `profileView` paged by a
+/// cursor; `q` checked; a ready member's full mute leaves an account out.
+#[tokio::test]
+async fn search_actors_order_fold_and_page() {
+    use crate::refract::handlers::{SEARCH_ACTORS, SEARCH_ACTORS_TYPEAHEAD};
+    let Some(db) = fresh_db("refract_endpoint_search").await else {
+        return;
+    };
+    let h = Harness::new(&db.pool, ScopeSets::default(), vec![tier1()]).await;
+    search_world(&h).await;
+    let base = serve(&h, None).await;
+    let (status, body) = call(&base, SEARCH_ACTORS_TYPEAHEAD, "q=ann", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(handles(&body), ["ann.test", "annabel.test", "aaron.test"], "{body}");
+    for a in body["actors"].as_array().expect("actors") {
+        assert_eq!(a["restored"]["community"], "sky", "{a}");
+        assert!(a.get("indexedAt").is_none(), "profileViewBasic: {a}");
+    }
+    assert_eq!(body["servedAs"], "visitor", "{body}");
+    assert_eq!(body["viewerChecked"], json!({"posts": [], "actors": [], "roots": []}), "{body}");
+    assert!(body.get("cursor").is_none(), "{body}");
+    // The exact handle before a display-name match whose handle sorts first.
+    let (_, body) = call(&base, SEARCH_ACTORS_TYPEAHEAD, &format!("q={}", urlencode(" @ANN.Test ")), None).await;
+    assert_eq!(handles(&body), ["ann.test", "aaron.test"], "{body}");
+    // Diacritics folded both ways.
+    let (_, body) = call(&base, SEARCH_ACTORS_TYPEAHEAD, &format!("q={}", urlencode("ånn.")), None).await;
+    assert_eq!(handles(&body), ["ann.test", "aaron.test"], "{body}");
+    let (_, body) = call(&base, SEARCH_ACTORS_TYPEAHEAD, "q=ann&limit=2", None).await;
+    assert_eq!(handles(&body), ["ann.test", "annabel.test"], "{body}");
+    // searchActors: profileViews, paged.
+    let (status, body) = call(&base, SEARCH_ACTORS, "q=ann&limit=2", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(handles(&body), ["ann.test", "annabel.test"], "{body}");
+    assert!(body["actors"][0].get("indexedAt").is_some(), "profileView: {body}");
+    let cursor = body["cursor"].as_str().expect("cursor").to_string();
+    let (_, body) = call(&base, SEARCH_ACTORS, &format!("q=ann&limit=2&cursor={}", urlencode(&cursor)), None).await;
+    assert_eq!(handles(&body), ["aaron.test"], "{body}");
+    assert!(body.get("cursor").is_none(), "{body}");
+    // An account restored meanwhile does not move the cursor's place.
+    actor(&h.pool, "did:plc:annaaaaaaaaaaaaaaaaaaaaa", "ann.a", "A").await;
+    exec(&h.pool, "INSERT INTO refract_dids (did, community, pds_host, state, source) VALUES ('did:plc:annaaaaaaaaaaaaaaaaaaaaa', 'sky', '127.0.0.1', 'restored', 'fill')").await;
+    h.refract.apply_config().await.expect("load");
+    let (_, body) = call(&base, SEARCH_ACTORS, &format!("q=ann&limit=2&cursor={}", urlencode(&cursor)), None).await;
+    assert_eq!(handles(&body), ["aaron.test"], "{body}");
+    // `q` checked.
+    let (status, body) = call(&base, SEARCH_ACTORS, "q=%20%20", None).await;
+    assert_eq!((status, body["actors"].clone()), (200, json!([])), "{body}");
+    let (status, body) = call(&base, SEARCH_ACTORS_TYPEAHEAD, &format!("q={}", "a".repeat(101)), None).await;
+    assert_eq!((status, body["error"].as_str()), (400, Some("InvalidRequest")), "{body}");
+    let (status, body) = call(&base, SEARCH_ACTORS, "q=ann&cursor=junk", None).await;
+    assert_eq!((status, body["error"].as_str()), (400, Some("InvalidRequest")), "{body}");
+    // A ready member: served as one; its full mute applies.
+    exec(&h.pool, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VISITOR}', 'admin', now())")).await;
+    exec(&h.pool, &format!("INSERT INTO mutes (viewer_did, subject_did, scope) VALUES ('{VISITOR}', '{OTHER}', 'full')")).await;
+    let (_, body) = call(&base, SEARCH_ACTORS_TYPEAHEAD, "q=ann", None).await;
+    assert_eq!(handles(&body), ["ann.a", "ann.test", "aaron.test"], "{body}");
+    assert_eq!(body["servedAs"], "member", "{body}");
+    // Off: NotEnabled.
+    h.live.update(|v| v.refract_enabled = false);
+    let (status, body) = call(&base, SEARCH_ACTORS, "q=ann", None).await;
+    assert_eq!((status, body["error"].as_str()), (400, Some("NotEnabled")));
+    db.drop_db().await;
+}
+
+/// The actor searches for a visitor (C-9 (b)): an account that blocks the
+/// visitor is left out; with the pairs unanswered every match is left out
+/// and listed in `withheld`.
+#[tokio::test]
+async fn search_actors_visitor_blocks() {
+    use crate::refract::handlers::SEARCH_ACTORS_TYPEAHEAD;
+    let Some(db) = fresh_db("refract_endpoint_search_blocks").await else {
+        return;
+    };
+    let h = Harness::new(&db.pool, ScopeSets::default(), vec![tier1()]).await;
+    search_world(&h).await;
+    let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
+    *fake.status.lock().expect("status") = 503;
+    let base = serve(&h, Some(farsight)).await;
+    let (status, body) = call(&base, SEARCH_ACTORS_TYPEAHEAD, "q=ann", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(handles(&body), Vec::<String>::new(), "{body}");
+    let unanswered = |d: &str| json!({"id": d, "reason": "unanswered"});
+    assert_eq!(body["withheld"], json!([unanswered(SUBJECT), unanswered(OTHER), unanswered(THIRD)]), "{body}");
+    // Answered, OTHER blocking the visitor: left out, nothing withheld.
+    *fake.status.lock().expect("status") = 200;
+    fake.blockers.lock().expect("blockers").insert(OTHER.to_string());
+    let (_, body) = call(&base, SEARCH_ACTORS_TYPEAHEAD, "q=ann", None).await;
+    assert_eq!(handles(&body), ["ann.test", "aaron.test"], "{body}");
+    assert_eq!(body["withheld"], json!([]), "{body}");
+    db.drop_db().await;
+}

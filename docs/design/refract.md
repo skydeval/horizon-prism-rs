@@ -101,8 +101,9 @@ All need a signed-in caller and are in the `refract` rate class.
 | `getReplies` | Restored replies in a thread (and other replies under them), with the root's threadgate and blocks applied. |
 | `getTimeline` | Posts by restored accounts a member follows, and reposts of restored posts by the member and accounts it follows. |
 | `listNotifications`, `getUnreadCount` | A member's notifications from restored authors. |
+| `searchActors`, `searchActorsTypeahead` | Restored accounts whose handle or display name starts with `q` (case and diacritics ignored): the exact handle first, then handle matches, then display-name matches, by handle. Shaped as Bluesky's actor searches; `searchActors` pages by cursor. |
 
-`getMembership` lists `refract` while the feature is on. With the feature off, the methods answer `NotEnabled`.
+`getMembership` lists `refract` while the feature is on, and `refract.search` with it for the two searches. With the feature off, the methods answer `NotEnabled`.
 
 ## Guarantees
 

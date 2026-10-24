@@ -23,7 +23,9 @@
 //!   ([`Resolving`]), is `pending` with no cap and no second resolve.
 //! - **Errors**: `NotEnabled` (the feature is off), `AuthRequired`,
 //!   `InvalidToken`, `RateLimitExceeded`; `getAuthorFeed`'s and `getAuthorReposts`' actor gate
-//!   adds `AccountTakedown`, `AccountDeactivated` and `InvalidRequest`.
+//!   adds `AccountTakedown`, `AccountDeactivated` and `InvalidRequest`;
+//!   the actor searches add `InvalidRequest` (a `q` too long, a malformed
+//!   cursor).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -41,6 +43,7 @@ use serde_json::Value;
 use super::{Refract, RefractSnapshot};
 use crate::db::locks::uri_author;
 use crate::farsight::{Lookup, PairBudget};
+use crate::hydration::actor::ProfileKind;
 use crate::hydration::normalize::subjects;
 use crate::hydration::{KnownBlocks, PublicEmit, Viewer, with_known_blocks};
 use crate::identity::ResolveIntent;
@@ -59,6 +62,8 @@ pub const GET_TIMELINE: &str = "app.nearhorizon.refract.getTimeline";
 pub const LIST_NOTIFICATIONS: &str = "app.nearhorizon.refract.listNotifications";
 pub const GET_UNREAD_COUNT: &str = "app.nearhorizon.refract.getUnreadCount";
 pub const GET_AUTHOR_REPOSTS: &str = "app.nearhorizon.refract.getAuthorReposts";
+pub const SEARCH_ACTORS: &str = "app.nearhorizon.refract.searchActors";
+pub const SEARCH_ACTORS_TYPEAHEAD: &str = "app.nearhorizon.refract.searchActorsTypeahead";
 
 /// `fill` takes at most this many DIDs and as many URIs.
 pub const FILL_MAX: usize = 25;
@@ -97,6 +102,8 @@ pub fn router(state: RefractState) -> Router {
         .route(&crate::admin::usage::path("refract", GET_REPLIES), get(get_replies))
         .route(&crate::admin::usage::path("refract", GET_UNREAD_COUNT), get(get_unread_count))
         .route(&crate::admin::usage::path("refract", GET_AUTHOR_REPOSTS), get(get_author_reposts))
+        .route(&crate::admin::usage::path("refract", SEARCH_ACTORS), get(search_actors))
+        .route(&crate::admin::usage::path("refract", SEARCH_ACTORS_TYPEAHEAD), get(search_actors_typeahead))
         .route_layer(axum::middleware::from_fn(time_read))
         .with_state(state)
 }
@@ -930,6 +937,70 @@ pub async fn get_author_reposts(State(s): State<RefractState>, ConnectInfo(peer)
     .await;
     let result = visitor_state(&s, &caller, result).await;
     metrics::counter!(METRIC_READS, "method" => "getAuthorReposts", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
+    result
+}
+
+/// `refract.searchActors`: restored accounts whose handle or display name
+/// starts with `q`, as `profileView`s, paged.
+pub async fn search_actors(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, RawQuery(q): RawQuery) -> XrpcResult {
+    search(&s, peer, &headers, q.as_deref(), SEARCH_ACTORS).await
+}
+
+/// `refract.searchActorsTypeahead`: as `searchActors`, one page of
+/// `profileViewBasic`s.
+pub async fn search_actors_typeahead(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, RawQuery(q): RawQuery) -> XrpcResult {
+    search(&s, peer, &headers, q.as_deref(), SEARCH_ACTORS_TYPEAHEAD).await
+}
+
+/// The Refract actor searches, for anyone signed in: prefix matches on the
+/// handles and display names of R-live (less the DIDs waiting for their
+/// first labels), case and diacritics folded, ordered exact handle, handle
+/// prefix, display-name prefix, then by handle. The gate, the caller's
+/// blocks either way (a visitor's from Farsight, unanswered treated as
+/// blocked and listed in `withheld`) and full mutes apply after the page is
+/// cut, so a page can be short.
+async fn search(s: &RefractState, peer: SocketAddr, headers: &HeaderMap, q: Option<&str>, method: &'static str) -> XrpcResult {
+    use crate::hydration::refract::{SEARCH_Q_MAX, SearchKey, search_fold};
+    let caller = gate(s, headers, peer, method).await?;
+    let typeahead = method == SEARCH_ACTORS_TYPEAHEAD;
+    let label = if typeahead { "searchActorsTypeahead" } else { "searchActors" };
+    let p = Params::parse(q);
+    let limit = p.u32("limit")?.unwrap_or(if typeahead { 10 } else { 25 }).clamp(1, 100);
+    let term = p.one("q").unwrap_or_default().trim();
+    let term = term.strip_prefix('@').unwrap_or(term);
+    if term.chars().count() > SEARCH_Q_MAX {
+        return Err(XrpcError::invalid("Error: q takes at most 100 characters"));
+    }
+    let after = match p.one("cursor").filter(|_| !typeahead) {
+        Some(c) => Some(SearchKey::parse(c).ok_or_else(|| XrpcError::invalid("Error: malformed cursor"))?),
+        None => None,
+    };
+    let folded = search_fold(term);
+    if folded.is_empty() {
+        metrics::counter!(METRIC_READS, "method" => label, "outcome" => "empty").increment(1);
+        return visitor_state(s, &caller, Ok(Json(crate::hydration::Hydrator::refract_empty("actors")))).await;
+    }
+    let h = &s.app.hydrator;
+    let snapshot = h.refract_snapshot(&caller.req).await;
+    let (dids, next) = h
+        .refract_search_page(&served(&snapshot), &folded, after.as_ref(), usize::try_from(limit).unwrap_or(100))
+        .await
+        .map_err(|e| XrpcError::from(crate::hydration::HydrationError::from(e)))?;
+    let next = if typeahead { None } else { next.map(|k| k.cursor()) };
+    let mut blocks = Blocks::new(s, &caller);
+    if let Some(b) = blocks.as_mut() {
+        b.round(&dids).await;
+    }
+    // RF-S11: an account left unanswered for a visitor is held back, and
+    // said so.
+    let withheld: Vec<(String, &'static str)> = dids.iter().filter(|d| blocks.as_ref().is_some_and(|b| b.unanswered(d))).map(|d| (d.clone(), "unanswered")).collect();
+    let kind = if typeahead { ProfileKind::Basic } else { ProfileKind::View };
+    let result = with_blocks(&mut blocks, &dids, || async {
+        h.refract_search_actors(&caller.viewer, &caller.req, &dids, kind, next.as_deref(), &withheld).await.map(Json).map_err(Into::into)
+    })
+    .await;
+    let result = visitor_state(s, &caller, result).await;
+    metrics::counter!(METRIC_READS, "method" => label, "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
 }
 

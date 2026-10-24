@@ -57,7 +57,7 @@ Any other well-formed NSID Horizon-Prism does not know answers `501 MethodNotImp
 | `private` | `getPosts`, `getPostThread`, `getAuthorFeed`, `getTimeline`, `getReplies`, `searchPosts`, `getLikes`, `getRepostedBy`, `getQuotes`, `createBookmark`, `deleteBookmark`, `getBookmarks`, `listNotifications`, `getUnreadCount`, `updateSeen`, `getNotificationPreferences`, `putNotificationPreferences`, `putActivitySubscription`, `listActivitySubscriptions` | Ready member |
 | `private` (appearance) | `getAppearance`, `putAppearance`, `releaseAppearance` | Member (ready or not); a removed member may read and release its own retained appearance |
 | `threadLens` | `getThread`, `resolve` (both POST) | Any signed-in account (the default), or ready members only if the operator sets `threadlens.access = "members"` |
-| `refract` | `fill`, `getPostThread`, `getAuthorFeed`, `getAuthorReposts`, `getReplies`, `getTimeline`, `listNotifications`, `getUnreadCount` | Signed in; non-members are served as visitors |
+| `refract` | `fill`, `getPostThread`, `getAuthorFeed`, `getAuthorReposts`, `getReplies`, `getTimeline`, `listNotifications`, `getUnreadCount`, `searchActors`, `searchActorsTypeahead` | Signed in; non-members are served as visitors |
 | `plural` | `getRecords`, `listMembers` | Public |
 | `index` | `requestRecord` (POST) | Signed in, for the caller's own records |
 | `feed` | `getAuthorPolls` | Public |
@@ -114,6 +114,7 @@ The call also enrolls an eligible caller, as loading the timeline does.
 | `threadLens.hydrated` | Thread Lens views carry `servedAs`, viewer state, counts and `replyDisabled` |
 | `threadLens.labelers` | Thread Lens honours `atproto-accept-labelers` |
 | `refract` | Refract methods are on |
+| `refract.search` | `refract.searchActors` and `refract.searchActorsTypeahead` are served (listed with `refract`) |
 | `plural.fronters` | Post records in views keep the plural fronters key |
 | `plural.read` | `plural.getRecords` and `listMembers` are served |
 
