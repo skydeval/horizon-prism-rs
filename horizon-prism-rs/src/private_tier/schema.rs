@@ -3474,7 +3474,13 @@ pub(super) async fn notification_prefs(pool: &PgPool, did: &str) -> Result<Optio
 
 /// `putNotificationPreferences` (§4.2): `supplied`'s keys replace the
 /// stored ones whole (`jsonb ||`), in one statement under the row's lock, so
-/// two writes of different keys both land. Returns the stored object.
+/// two writes of different keys both land. Returns the stored object, or
+/// `None` with nothing written when `did` is no longer a member.
+///
+/// In one transaction, as `appearance_put`: the DID's shared lock (a
+/// removal marker holds it exclusively before deleting `members`), then the
+/// membership read again, so a put racing a removal either lands before the
+/// marker (and the purge after it deletes the row) or finds the member gone.
 ///
 /// # Errors
 ///
@@ -3483,16 +3489,31 @@ pub(super) async fn merge_notification_prefs(
     pool: &PgPool,
     did: &str,
     supplied: &serde_json::Value,
-) -> Result<serde_json::Value, sqlx::Error> {
-    sqlx::query_scalar(
+) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    #[cfg(test)]
+    crate::test_support::hooks::pause_in(crate::test_support::hooks::NOTIFICATION_PREFS_BEFORE_LOCK, pool, did).await;
+    crate::db::locks::lock_dids_shared(&mut tx, &[did.to_string()]).await?;
+    #[cfg(test)]
+    crate::test_support::hooks::pause_in(crate::test_support::hooks::NOTIFICATION_PREFS_AFTER_LOCK, pool, did).await;
+    let member: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM members WHERE did = $1)")
+        .bind(did)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !member {
+        return Ok(None);
+    }
+    let stored = sqlx::query_scalar(
         "INSERT INTO private_notification_prefs (did, prefs) VALUES ($1, $2) \
          ON CONFLICT (did) DO UPDATE SET prefs = private_notification_prefs.prefs || EXCLUDED.prefs, updated_at = now() \
          RETURNING prefs",
     )
     .bind(did)
     .bind(supplied)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(stored))
 }
 
 /// The unseen-row condition of `getUnreadCount` for the recipient `$1`.

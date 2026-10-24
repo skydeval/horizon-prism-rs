@@ -2702,7 +2702,12 @@ pub async fn put_notification_preferences(
     let stored = if supplied.is_empty() {
         schema::notification_prefs(&s.env.pool, &caller.did).await?
     } else {
-        Some(schema::merge_notification_prefs(&s.env.pool, &caller.did, &Value::Object(supplied)).await?)
+        // `None`: removed since the gate; nothing written.
+        Some(
+            schema::merge_notification_prefs(&s.env.pool, &caller.did, &Value::Object(supplied))
+                .await?
+                .ok_or_else(XrpcError::not_enrolled)?,
+        )
     };
     Ok(ok(PrivateResponse::notification_preferences(complete_preferences(stored.as_ref()))))
 }

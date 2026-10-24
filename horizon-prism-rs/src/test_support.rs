@@ -411,6 +411,13 @@ pub mod hooks {
     /// Private appearance T-AP10: `putAppearance`'s write holding the DID's
     /// shared lock, before its membership check. Key: `<database>/<did>`.
     pub const APPEARANCE_AFTER_LOCK: &str = "ap_put_after_lock";
+    /// Private notification preferences T-N11: `putNotificationPreferences`'
+    /// write, its transaction begun, before the DID's shared lock. Key:
+    /// `<database>/<did>` ([`pause_in`]).
+    pub const NOTIFICATION_PREFS_BEFORE_LOCK: &str = "np_put_before_lock";
+    /// Private notification preferences T-N11: the write holding the DID's
+    /// shared lock, before its membership check. Key: `<database>/<did>`.
+    pub const NOTIFICATION_PREFS_AFTER_LOCK: &str = "np_put_after_lock";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);

@@ -2,7 +2,8 @@
 //! each reason muted neither lists nor counts (T-N1), `include: follows`
 //! read at read time (T-N2), the defaults unchanged (T-N3), the methods
 //! (T-N4, T-N7), full pages (T-N5), the counting paths agree (T-N6), the
-//! purges (T-N8), and mutes and blocks beside them (T-N10).
+//! purges (T-N8), mutes and blocks beside them (T-N10), and a put racing
+//! the removal purge (T-N11).
 
 use std::collections::BTreeSet;
 
@@ -404,5 +405,86 @@ async fn t_n10_mutes_and_blocks_beside_preferences() {
     let got = listed(&base, ALICE).await;
     assert!(got.iter().all(|r| r.2 != DAVE), "{got:?}");
     assert_eq!(counted_every_way(&f, &base, ALICE).await, i64::try_from(got.len()).expect("n"));
+    db.drop_db().await;
+}
+
+/// T-N11: a put racing the `member_removed` purge leaves no row behind. Held
+/// before the DID's lock while the removal marker commits, it answers
+/// `NotEnrolled` and writes nothing; held after the lock, the marker waits
+/// for its commit and the purge then deletes the row. Either way the member,
+/// rejoining, reads the defaults.
+#[tokio::test]
+async fn t_n11_the_purge_race() {
+    use crate::aggregations::purge::Purger;
+    use crate::aggregations::scope_state::PurgeKind;
+    use crate::test_support::hooks;
+
+    let test = "t_n11_prefs_race";
+    let Some(db) = fresh_db(test).await else {
+        return;
+    };
+    let f = fixture_in(&db.pool, test, PublicMode::Off).await;
+    f.ready_all().await;
+    let base = served(&f).await;
+    let purger = Purger::new(f.pool.clone(), f.writer.scope().clone(), Arc::clone(f.writer.private()));
+    let name: String = sqlx::query_scalar("SELECT current_database()::text").fetch_one(&f.pool).await.expect("db");
+    let row = |did: &'static str| {
+        let pool = f.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Value>("SELECT prefs FROM private_notification_prefs WHERE did = $1")
+                .bind(did)
+                .fetch_optional(&pool)
+                .await
+                .expect("row")
+        }
+    };
+    let body = json!({"like": pref("all", false)});
+    let rejoin = |did: &'static str| {
+        let (pool, base) = (f.pool.clone(), base.clone());
+        async move {
+            exec(&pool, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{did}', 'admin', now())")).await;
+            assert_eq!(get_prefs(&base, did).await, json!({"preferences": defaults()}), "{did} rejoined");
+        }
+    };
+
+    // Before the lock: the marker commits first.
+    let armed = hooks::arm(hooks::NOTIFICATION_PREFS_BEFORE_LOCK, &format!("{name}/{BOB}"));
+    let pending = tokio::spawn({
+        let (base, body) = (base.clone(), body.clone());
+        async move { put_prefs(&base, BOB, &body).await }
+    });
+    armed.reached().await;
+    purger.purge(BOB, PurgeKind::MemberRemoved).await.expect("purge");
+    armed.release();
+    let (status, v) = pending.await.expect("put");
+    assert_eq!((status, v["error"].as_str()), (400, Some("NotEnrolled")), "{v}");
+    assert_eq!(row(BOB).await, None, "nothing written");
+    drop(armed);
+    rejoin(BOB).await;
+
+    // After the lock: the marker waits for the put's commit.
+    let armed = hooks::arm(hooks::NOTIFICATION_PREFS_AFTER_LOCK, &format!("{name}/{CAROL}"));
+    let pending = tokio::spawn({
+        let base = base.clone();
+        async move { put_prefs(&base, CAROL, &body).await }
+    });
+    armed.reached().await;
+    let purge = tokio::spawn({
+        let purger = purger.clone();
+        async move { purger.purge(CAROL, PurgeKind::MemberRemoved).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let member: bool = sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM members WHERE did = '{CAROL}')"))
+        .fetch_one(&f.pool)
+        .await
+        .expect("member");
+    assert!(member, "the marker waits on the put's lock");
+    armed.release();
+    let (status, v) = pending.await.expect("put");
+    assert_eq!(status, 200, "{v}");
+    purge.await.expect("join").expect("purge");
+    assert_eq!(row(CAROL).await, None, "the purge took the put's row");
+    drop(armed);
+    rejoin(CAROL).await;
     db.drop_db().await;
 }

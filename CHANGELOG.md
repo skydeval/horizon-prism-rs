@@ -12,7 +12,11 @@ no tracker references.
 
 ## [Unreleased]
 
-Nothing yet: every change so far is in a phase below.
+### Fixed
+
+- Saving private notification preferences while being removed from the
+  community no longer leaves those preferences behind for a later rejoin; the
+  save answers `NotEnrolled` instead.
 
 ## Phase 9: Pronouns and plural systems (2026-10-24)
 
