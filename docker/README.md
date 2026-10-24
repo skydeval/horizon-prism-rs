@@ -274,7 +274,7 @@ The other AppView can also join it with the ordinary profile and thread lookups 
 - A Farsight that has never answered this process (a wrong `farsight.url`, a revoked key) never brings it on. After a restart during an outage there is no fallback until Farsight has answered once, so it cannot be switched on in the middle of an outage.
 - One `401`, `403`, `429` or `400` during a real outage keeps it off for the rest of that outage.
 - A long Farsight outage makes it the steady source for that long.
-- Thread Lens and `getRelationships` never ask it, and Thread Lens shows no hidden replies while Farsight is down, with the fallback or without it. Its answers are that AppView's own view, are never treated as complete, and never override Farsight's.
+- Thread Lens and `getRelationships` never ask it, and while Farsight is down Thread Lens shows nothing past a block (bridging is off), with the fallback or without it; it still shows, and flags, replies the thread's author hid. Its answers are that AppView's own view, are never treated as complete, and never override Farsight's.
 
 `farsight_down`, `farsight_fallback_withheld` and `farsight_auth_failed_total` show which state you are in (alert examples below).
 

@@ -13,13 +13,13 @@ An ordinary thread view loses parts of a conversation. A block between two peopl
 | `threadLens.getThread` | the thread around an anchor post: parents, the anchor, replies level by level |
 | `threadLens.resolve` | up to 25 post URIs, one item each, in order |
 
-Both are POST and need a signed-in caller. `getMembership.features` lists `threadLens`, and `threadLens.signedIn` while every signed-in account may use it.
+Both are POST and need a signed-in caller. `getMembership.features` lists `threadLens`; `threadLens.signedIn` while every signed-in account may use it; `threadLens.hydrated` (post views are hydrated: `servedAs`, the viewer state it names, counts, and `viewer.replyDisabled` where the root's threadgate decides it); and `threadLens.labelers` (the reader's labelers are honoured, below).
 
 ### What it shows beyond the ordinary view
 
 Every response starts from what `getPostThread` returns for the caller. When it can check the caller's blocks (**bridging**), it adds:
 - **posts past a block between other people.** A reply the ordinary view stubs because two other accounts block each other is shown;
-- **posts past the caller's own block.** The blocked author's posts stay gaps, but the replies under them and the parents above them are shown. The parent walk goes on past a blocked post to the start of the thread;
+- **posts past the caller's own block.** The blocked author's posts stay gaps (the client shows only a placeholder), but the replies under them and the parents above them are shown. The parent walk goes on up past a blocked post, and past any further ones, to the start of the thread;
 - **replies Horizon-Prism does not store**, found through Constellation and fetched from the upstream AppView or Slingshot.
 
 It also keeps **replies the root author hid** (threadgate `hiddenReplies`) in the response, marked `hiddenByThreadgate`, so the client can collapse them as stock does. A reply is never marked for its own author. This marking happens with bridging on or off.
@@ -56,7 +56,7 @@ Nobody may use it signed out. `servedAs` on the response says which.
 - **A member** gets its own viewer state: likes, reposts, thread mutes, follows, mutes and block fields.
 - **A visitor** gets `viewer.blockedBy` and `viewer.muted: false` only. Its own blocks still hide authors' posts; they are not named in views. Nothing is remembered for it, and its Farsight checks use the non-member share of the rate.
 - **The moderation gate**, as on every view (see [blocks and moderation](blocks-and-moderation.md)).
-- **Labels.** The operator's own. When the request carries `atproto-accept-labelers`, the labels those labelers applied are kept beside them, and `atproto-content-labelers` names them. Labels only add to views.
+- **Labels.** The operator's own. When the request carries `atproto-accept-labelers` (feature `threadLens.labelers`), every labeler it names is honoured, moderation labeler or not: the labels those labelers applied are kept beside the operator's, and `atproto-content-labelers` names them. Labels only add to views.
 
 ### Farsight
 
