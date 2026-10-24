@@ -43,6 +43,8 @@ mod degraded;
 mod root_gates;
 // Private appearance (private-appearance design §11).
 mod appearance;
+// Plural-pronouns T-F1: the fronters key.
+mod fronters;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

@@ -143,6 +143,8 @@ pub(super) struct Snapshot {
     pub embed: Option<serde_json::Value>,
     pub langs: Option<Vec<String>>,
     pub self_labels: Option<serde_json::Value>,
+    /// The clear fronters object (plural-pronouns design §1.1).
+    pub fronters: Option<serde_json::Value>,
     /// The index columns (structural facts, §6.2).
     pub quote_uri: Option<String>,
     pub mention_dids: Vec<String>,
@@ -161,7 +163,7 @@ pub(super) async fn snapshot(pool: &PgPool, rauth: &RecordAuthz) -> Result<Optio
            p.encoded_generation IS NOT NULL AS has_generation, p.encoded_content, p.encoded_codec, \
            p.encoded_generation, p.plaintext_text, p.cid, p.audience_uri, p.reply_root_uri, p.reply_parent_uri, \
            p.reply_root_cid, p.reply_parent_cid, p.created_at, p.indexed_at, p.facets, p.embed, p.langs, \
-           p.self_labels, p.quote_uri, p.mention_dids, p.media_kinds \
+           p.self_labels, p.fronters, p.quote_uri, p.mention_dids, p.media_kinds \
          FROM private_posts p WHERE p.uri = $1",
     )
     .bind(rauth.uri())

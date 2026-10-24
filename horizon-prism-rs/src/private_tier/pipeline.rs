@@ -882,6 +882,9 @@ async fn read_inner(
         ("embed", embed.clone()),
         ("langs", display.langs.as_ref().map(|l| json!(l))),
         ("labels", display.self_labels.clone()),
+        // The post's fronters, clear and as written (plural-pronouns
+        // design §1.1), behind the witness with the rest of the view.
+        (crate::plural::FRONTERS_KEY, display.fronters.clone()),
     ] {
         if let Some(v) = value {
             record[key] = v;

@@ -10,6 +10,13 @@ commit.
 
 ## [Unreleased]
 
+### Added (pronouns and plural systems: fronters on posts, #896, #903)
+
+- **Kryphocron posts carry their fronters.** The clear top-level `app.nearhorizon.plural.fronters` key of a `tools.kryphocron.feed.postPrivate` record (from `createPostPrivate`, `participatePrivate` or the encode route; it is never part of the encoded payload) is stored in `private_posts.fronters` and returned in the private view's `record`, and so in a quoting post's `#viewRecord.value`. Checked strictly: an object whose `members` is 1 to 20 objects, each with `id` a valid record key and an optional `status` string of at most 320 bytes, within 64 KiB; other keys are kept as written. An invalid value is dropped and counted (`private_ingest_field_dropped_total{field="app.nearhorizon.plural.fronters"}`); the post still ingests. Served behind the read path like the rest of the view.
+- **The fronters refill**: migration 0047 marked every private post row not filled, and the first start after it queues one `private` job per DID with such rows (once, `worker_state` key `private_fronters_refill`), which lists the DID's private records again, so posts written before this release show their fronters.
+- **Public posts**: every view Prism builds from a stored or fetched record (post views, threads, quote `value`s, notifications, Refract views, Slingshot-built posts in Thread Lens, `repo.getRecord`, upstream views) already kept the key; tests now hold each path to it.
+- `getMembership.features` lists `plural.fronters` for both.
+
 ### Added (pronouns and plural systems: the public read, #896, #901, #902)
 
 - **New `app.nearhorizon.plural.getRecords {actors?, members?}`**: for any account, member or not, its `app.nearhorizon.actor.pronouns`, `app.nearhorizon.plural.system` and `app.nearhorizon.plural.front` (rkey `self`) and named `app.nearhorizon.plural.member` records, so a reader's browser never asks an author's server (design `plural-pronouns.md`). Each answer is `record` (value and CID), `none` or `unknown`. `none` only when Prism listed the author's repository and every change since reached it through the firehose, and the firehose is within `plural.max_stream_lag_secs` (120 s); never on a guess. At most 50 accounts (member URIs' accounts included) and 100 member URIs per call. No sign-in, charged by IP to `anon_read`, kept in every public-indexing mode, CORS as every route; `cache-control: public, max-age=30`, or `max-age=5` when any answer is `unknown`.

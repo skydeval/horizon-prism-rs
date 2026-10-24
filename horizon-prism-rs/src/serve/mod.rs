@@ -82,6 +82,8 @@ async fn sample_process_gauges(read_cache: ReadCache, budgets: HostBudgets) {
 /// The `worker_state` key marking the private display refill as queued
 /// (private posting §3.1).
 pub const PRIVATE_DISPLAY_REFILL: &str = "private_display_refill";
+/// The `worker_state` key of the fronters refill (plural-pronouns §1.1).
+pub const PRIVATE_FRONTERS_REFILL: &str = "private_fronters_refill";
 
 /// A startup failure, with the process exit code to use.
 #[derive(Debug, thiserror::Error)]
@@ -582,6 +584,14 @@ pub async fn run() -> Result<Stopped, StartupError> {
         Ok(Some(queued)) => tracing::info!(event = "private_display_refill_queued", queued, "private jobs queued to fill display fields"),
         Ok(None) => {}
         Err(error) => tracing::warn!(event = "private_display_refill_failed", %error, "queuing the private display refill failed; retried at the next start"),
+    }
+    // The fronters refill (plural-pronouns design §1.1): once, at the first
+    // start after migration 0047, which marked every private post row not
+    // filled, so each DID's private records are listed again.
+    match private.enqueue_display_refill(&pool, PRIVATE_FRONTERS_REFILL).await {
+        Ok(Some(queued)) => tracing::info!(event = "private_fronters_refill_queued", queued, "private jobs queued to fill post fronters"),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(event = "private_fronters_refill_failed", %error, "queuing the private fronters refill failed; retried at the next start"),
     }
     // The `following` rollout (following-audience design §3.6): at each
     // start, an `authz` job for every owner of a `following` audience whose

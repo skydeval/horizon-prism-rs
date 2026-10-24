@@ -405,3 +405,68 @@ fn t_p10_features() {
     let f = off.features();
     assert!(f.contains(&FEATURE_FRONTERS) && !f.contains(&FEATURE_READ), "{f:?}");
 }
+
+/// T-F2 (§1.2): a public post carrying the fronters key keeps it on every
+/// path Prism builds a record on: the writer's stored row, a post view, a
+/// quote's `value`, a thread's post, a reply notification's `record`, a
+/// Slingshot-built view (Thread Lens's ladder) and the upstream walk.
+#[tokio::test]
+async fn t_f2_public_posts_keep_the_fronters_key() {
+    use crate::firehose::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource, Writer};
+    use crate::hydration::Viewer;
+    use crate::hydration::testing::actor;
+    use crate::xrpc::pools::Requester;
+
+    let Some(db) = fresh_db("plural_t_f2_public_fronters").await else {
+        return;
+    };
+    let p = &db.pool;
+    let fronters = json!({"members": [{"id": "3kwren"}]});
+    let mut sets = ScopeSets::default();
+    for did in [ALICE, BOB] {
+        sets.members.insert(did.into());
+        sets.scope.insert(did.into());
+    }
+    let w = Writer::new(p.clone(), ScopeState::new(sets.clone(), ScopePolicy::MembersAndOneHop, 10_000), Arc::new(crate::private_tier::DisabledPrivateTier));
+    let options = ApplyOptions { advance_applied_rev: false, dead_letter_readiness: false, attempts: 1, live: true, subscription_rules: false, source: WriteSource::Firehose };
+    actor(p, ALICE, "alice.test", "Alice").await;
+    actor(p, BOB, "bob.test", "Bob").await;
+    let root = format!("at://{ALICE}/app.bsky.feed.post/3kroot");
+    let reply = format!("at://{BOB}/app.bsky.feed.post/3kreply");
+    let quote = format!("at://{BOB}/app.bsky.feed.post/3kquote");
+    let op = |rkey: &str, record: Value| RawOp { action: Action::Create, collection: "app.bsky.feed.post".into(), rkey: rkey.into(), cid: Some(format!("bafy{rkey}")), record: Some(record) };
+    let root_record = json!({"$type": "app.bsky.feed.post", "text": "we wrote this", "createdAt": "2026-10-24T00:00:00.000Z", FRONTERS_KEY: fronters});
+    let r = w.apply(ALICE, "3kaaaaaaaaaa2", &[op("3kroot", root_record)], options).await.expect("root");
+    assert_eq!(r.outcomes, [OpOutcome::Written]);
+    let reply_record = json!({"$type": "app.bsky.feed.post", "text": "a reply", "createdAt": "2026-10-24T00:01:00.000Z", FRONTERS_KEY: fronters,
+        "reply": {"root": {"uri": root, "cid": "bafy3kroot"}, "parent": {"uri": root, "cid": "bafy3kroot"}}});
+    let quote_record = json!({"$type": "app.bsky.feed.post", "text": "a quote", "createdAt": "2026-10-24T00:02:00.000Z",
+        "embed": {"$type": "app.bsky.embed.record", "record": {"uri": root, "cid": "bafy3kroot"}}});
+    w.apply(BOB, "3kaaaaaaaaaa3", &[op("3kreply", reply_record), op("3kquote", quote_record)], options).await.expect("bob");
+    // The stored row.
+    let stored: Value = sqlx::query_scalar("SELECT record FROM posts WHERE uri = $1").bind(&root).fetch_one(p).await.expect("row");
+    assert_eq!(stored[FRONTERS_KEY], fronters);
+    let h = hydrator(p, sets);
+    let req = Requester::test();
+    // A post view and a quote's `value`.
+    let v = h.get_posts(&Viewer::anonymous(), &req, &[root.clone(), quote.clone()]).await.expect("db").expect("view");
+    let posts = v.inner()["posts"].as_array().expect("posts").clone();
+    assert_eq!(posts[0]["record"][FRONTERS_KEY], fronters, "{}", posts[0]);
+    assert_eq!(posts[1]["embed"]["record"]["value"][FRONTERS_KEY], fronters, "{}", posts[1]);
+    // A thread.
+    let t = h.get_post_thread(&Viewer::anonymous(), &req, &reply, 6, 80).await.expect("db").expect("thread");
+    assert_eq!(t.inner()["thread"]["post"]["record"][FRONTERS_KEY], fronters, "{}", t.inner());
+    assert_eq!(t.inner()["thread"]["parent"]["post"]["record"][FRONTERS_KEY], fronters, "{}", t.inner());
+    // A reply notification to Alice, written by the writer itself.
+    let me = Viewer { did: Some(ALICE.into()), hydrate: true };
+    let n = h.list_notifications(&me, &req, 50, None, &[]).await.expect("db").expect("view");
+    let reply_n = n.inner()["notifications"].as_array().expect("list").iter().find(|x| x["reason"] == "reply").cloned().expect("reply");
+    assert_eq!(reply_n["record"][FRONTERS_KEY], fronters, "{reply_n}");
+    // Slingshot-built posts (Thread Lens's ladder) and the upstream walk.
+    let built = crate::hydration::upstream::post_from_record(&root, Some("bafy"), "alice.test", &stored);
+    assert_eq!(built["record"][FRONTERS_KEY], fronters);
+    let mut upstream = json!({"posts": [{"uri": root, "cid": "c", "author": {"did": ALICE, "handle": "alice.test"}, "record": stored.clone(), "labels": []}]});
+    crate::hydration::normalize::normalize_upstream(&mut upstream, &crate::hydration::normalize::Overlay::default());
+    assert_eq!(upstream["posts"][0]["record"][FRONTERS_KEY], fronters);
+    db.drop_db().await;
+}

@@ -57,6 +57,9 @@ pub(crate) struct DisplayFields {
     pub langs: Option<Vec<String>>,
     /// The record's `labels` (`#selfLabels`) object.
     pub self_labels: Option<Value>,
+    /// The clear `app.nearhorizon.plural.fronters` object, when valid
+    /// (plural-pronouns design §1.1): kept as received.
+    pub fronters: Option<Value>,
     /// The quoted URI: from the clear `quote` when the record has one,
     /// else from `embed` in either `$type` form (private-embeds design
     /// §4.2).
@@ -136,6 +139,7 @@ impl DisplayFields {
         let langs = keep("langs", |v| v.as_array().is_some_and(|a| a.iter().all(Value::is_string)))
             .map(|v| v.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect());
         let self_labels = keep("labels", Value::is_object);
+        let fronters = keep(crate::plural::FRONTERS_KEY, valid_fronters);
         // The dedicated clear fields of #504's new form (private-embeds
         // design §4.2). Present (not null), even when dropped here, they
         // decide: a bad one never falls back to `embed` or `facets`.
@@ -188,6 +192,7 @@ impl DisplayFields {
             embed,
             langs,
             self_labels,
+            fronters,
             quote_uri,
             mention_dids,
             quote_source,
@@ -197,6 +202,27 @@ impl DisplayFields {
             dropped,
         }
     }
+}
+
+/// A valid fronters value (plural-pronouns design §1.1, strict): an object
+/// whose `members` is an array of 1 to 20 objects, each with `id` a valid
+/// record key and `status`, when present, a string of at most 320 bytes.
+/// Other keys are kept as received (the object is open).
+pub(crate) fn valid_fronters(v: &Value) -> bool {
+    let Some(members) = v.as_object().and_then(|o| o.get("members")).and_then(Value::as_array) else {
+        return false;
+    };
+    (1..=20).contains(&members.len())
+        && members.iter().all(|m| {
+            let Some(m) = m.as_object() else { return false };
+            let id = m.get("id").and_then(Value::as_str).is_some_and(proto_blue::syntax::RecordKey::is_valid);
+            let status = match m.get("status") {
+                None => true,
+                Some(Value::String(s)) => s.len() <= 320,
+                Some(_) => false,
+            };
+            id && status
+        })
 }
 
 fn malformed(msg: impl Into<String>) -> IngestError {
@@ -490,8 +516,8 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
                 "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, audience_uri, reply_root_uri, \
                    reply_parent_uri, encoded_content, encoded_codec, encoded_generation, plaintext_text, created_at, \
                    reply_root_cid, reply_parent_cid, facets, embed, langs, self_labels, quote_uri, mention_dids, \
-                   display_filled, media_kinds) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, true, $22) \
+                   display_filled, media_kinds, fronters) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, true, $22, $23) \
                  ON CONFLICT (uri) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, \
                    audience_uri = EXCLUDED.audience_uri, reply_root_uri = EXCLUDED.reply_root_uri, \
                    reply_parent_uri = EXCLUDED.reply_parent_uri, reply_root_cid = EXCLUDED.reply_root_cid, \
@@ -500,7 +526,8 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
                    plaintext_text = EXCLUDED.plaintext_text, created_at = EXCLUDED.created_at, \
                    facets = EXCLUDED.facets, embed = EXCLUDED.embed, langs = EXCLUDED.langs, \
                    self_labels = EXCLUDED.self_labels, quote_uri = EXCLUDED.quote_uri, \
-                   mention_dids = EXCLUDED.mention_dids, display_filled = true, media_kinds = EXCLUDED.media_kinds \
+                   mention_dids = EXCLUDED.mention_dids, display_filled = true, media_kinds = EXCLUDED.media_kinds, \
+                   fronters = EXCLUDED.fronters \
                  WHERE private_posts.rev < EXCLUDED.rev \
                     OR (NOT private_posts.display_filled AND private_posts.rev <= EXCLUDED.rev) \
                  RETURNING (xmax = 0)",
@@ -527,6 +554,7 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             .bind(&f.display.quote_uri)
             .bind(&f.display.mention_dids)
             .bind(i16::from(f.display.media_kinds))
+            .bind(&f.display.fronters)
             .fetch_optional(&mut *conn)
             .await?;
             let changed = inserted.is_some();
