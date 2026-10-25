@@ -108,15 +108,15 @@ pub struct Purger {
     /// The `farsight` module's hook (§5.14.18.3), shared by every clone
     /// and set once. Empty, no hook runs.
     hook: Arc<OnceLock<PurgeHook>>,
-    /// The system-accounts keys: an `account_deleted` purge forgets the DID
-    /// as an owner always and, with the keys, as a listed account.
-    system_accounts: Option<crate::system_accounts::Keys>,
+    /// The system-accounts state: an `account_deleted` purge forgets the DID
+    /// as an owner always and, on, as a listed account; locked, it keeps it.
+    system_accounts: crate::system_accounts::State,
 }
 
 impl Purger {
     #[must_use]
     pub fn new(pool: PgPool, scope: ScopeState, private: Arc<dyn PrivateTier>) -> Self {
-        Self { pool, scope, private, sync_min_interval_secs: 600, applier: None, hook: Arc::default(), system_accounts: None }
+        Self { pool, scope, private, sync_min_interval_secs: 600, applier: None, hook: Arc::default(), system_accounts: crate::system_accounts::State::Off }
     }
 
     /// Set the applier to tell when a purge removes a member's list
@@ -129,8 +129,8 @@ impl Purger {
 
     /// Set the system-accounts keys (system-accounts design §6).
     #[must_use]
-    pub fn with_system_accounts(mut self, keys: Option<crate::system_accounts::Keys>) -> Self {
-        self.system_accounts = keys;
+    pub fn with_system_accounts(mut self, state: crate::system_accounts::State) -> Self {
+        self.system_accounts = state;
         self
     }
 
@@ -351,7 +351,7 @@ impl Purger {
                 crate::refract::forget_account(&mut tx, did).await?;
                 // Its system-account list, and its place on others' lists
                 // (system-accounts design §6), with the marker.
-                crate::system_accounts::forget_account(&mut tx, did, self.system_accounts.as_ref()).await?;
+                crate::system_accounts::forget_account(&mut tx, did, &self.system_accounts).await?;
             }
             PurgeKind::OutOfScope => {
                 sqlx::query("DELETE FROM scope_dids WHERE did = $1").bind(did).execute(&mut *tx).await?;

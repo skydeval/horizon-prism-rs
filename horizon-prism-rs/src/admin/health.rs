@@ -65,6 +65,8 @@ pub const WATCHED: &[&str] = &[
     PRIVATE_READ_CONTENT,
     PRIVATE_READ_OUTCOMES,
     PRIVATE_INGEST_SOURCE,
+    crate::system_accounts::METRIC_STATE,
+    crate::system_accounts::METRIC_PENDING,
 ];
 
 /// `private_read_content_total{form}`, emitted by the private tier.
@@ -724,12 +726,45 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
         Check::new("Settings", Level::Ok, "Every saved setting is in use.")
     });
 
+    out.push(system_accounts_check(latest.as_deref()));
+
     out.push(match i.schema {
         None => Check::no_data("Search", "the preparation task is not connected to these pages."),
         Some((true, true)) => Check::new("Search", Level::Ok, "Search is ready."),
         Some(_) => Check::new("Search", Level::Info, "Search is still being prepared."),
     });
     out
+}
+
+/// The System accounts check (system-accounts amendment 1 §7), from the
+/// state gauge.
+fn system_accounts_check(now: Option<&Snapshot>) -> Check {
+    const NAME: &str = "System accounts";
+    let var = crate::config::ENV_SYSTEM_ACCOUNTS_KEY_HEX;
+    let state = now.and_then(|s| {
+        crate::system_accounts::STATE_LABELS
+            .into_iter()
+            .find(|label| s.sum_where(crate::system_accounts::METRIC_STATE, "state", label).is_some_and(|v| v >= 0.5))
+    });
+    let locked = |what: String| {
+        Check::new(
+            NAME,
+            Level::Red,
+            format!("System accounts are off: {what}. Set the key they were sealed with and restart. Account deletions are recorded meanwhile and applied then."),
+        )
+    };
+    match state {
+        None => Check::no_data(NAME, "not reported yet."),
+        Some("on") => Check::new(NAME, Level::Ok, "System accounts are on."),
+        Some("catching_up") => Check::new(
+            NAME,
+            Level::Amber,
+            "System accounts are catching up: applying the account changes seen while they were locked, and waiting for the identity checks of listed accounts. They serve again when done.",
+        ),
+        Some("locked_unset") => locked(format!("{var} is not set, and lists are stored")),
+        Some("locked_mismatch") => locked(format!("{var} is not the key the stored lists were sealed with")),
+        Some(_) => Check::new(NAME, Level::Ok, "System accounts are not in use."),
+    }
 }
 
 /// The failed jobs Health counts (actionable-warnings design §5.1): those of
@@ -826,6 +861,28 @@ impl super::AdminState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// System-accounts amendment 1 T-A8: the check for each state.
+    #[test]
+    fn system_accounts_check_says_each_state() {
+        let at = |state: &str| {
+            let text: String = crate::system_accounts::STATE_LABELS
+                .iter()
+                .map(|l| format!("system_accounts_state{{state=\"{l}\"}} {}\n", u8::from(*l == state)))
+                .collect();
+            system_accounts_check(Some(&Snapshot::from_text(&text, Utc::now())))
+        };
+        assert_eq!(at("on").level, Level::Ok);
+        assert_eq!(at("off").text, "System accounts are not in use.");
+        let unset = at("locked_unset");
+        assert_eq!(unset.level, Level::Red);
+        assert!(unset.text.contains("APP_SYSTEM_ACCOUNTS_KEY_HEX is not set"), "{}", unset.text);
+        let mismatch = at("locked_mismatch");
+        assert_eq!(mismatch.level, Level::Red);
+        assert!(mismatch.text.contains("is not the key the stored lists were sealed with"), "{}", mismatch.text);
+        assert_eq!(at("catching_up").level, Level::Amber);
+        assert_eq!(system_accounts_check(None).level, Level::NoData);
+    }
 
     const TEXT: &str = "# TYPE firehose_worker_delay_seconds gauge\n\
         firehose_worker_delay_seconds{relay=\"bsky\"} 3\n\

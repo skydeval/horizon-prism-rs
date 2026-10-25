@@ -233,12 +233,16 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .map_err(|e| StartupError::new(1, format!("admin settings: {e}")))?
         .cfg;
     let live = crate::admin::settings::LiveSettings::new(&cfg.file);
-    // System accounts (system-accounts design §4.3): on with its key, and
-    // a key that is not the one stored lists were sealed with stops the start.
+    // System accounts (system-accounts design §4.3, amendment 1 §4): on with
+    // its key; a missing or wrong key while lists are stored locks only the
+    // feature. Only a database failure stops the start.
     let system_accounts = crate::system_accounts::at_startup(&pool, cfg.env.system_accounts_key.as_ref())
         .await
         .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
-    tracing::info!(event = "system_accounts", enabled = system_accounts.is_some(), "system accounts");
+    tracing::info!(event = "system_accounts", enabled = system_accounts.is_on(), state = system_accounts.label(), "system accounts");
+    // The catch-up (amendment 1 §6): in the background, so a slow or failing
+    // round never holds the start; the methods serve once it is done.
+    let system_accounts_catch_up = crate::system_accounts::catch_up_task(pool.clone(), &system_accounts);
     let restart = crate::admin::settings::RestartHandle::default();
     log_community_auto_enroll(&cfg.file);
     // The effective head age, for the release check (private-threads design
@@ -378,6 +382,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
 
     let mut tasks = Vec::new();
     tasks.extend(setup_reprint);
+    tasks.extend(system_accounts_catch_up);
     if let Some(task) = public_task {
         tasks.push(public.spawn(task));
     }
@@ -919,7 +924,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
             .with_refusal_cache(cfg.file.community.enroll_refusal_cache_secs)
             .with_reindex_retry(cfg.file.community.reindex_retry_secs)
             .with_plural_read(cfg.file.plural.enabled)
-            .with_system_accounts(system_accounts.is_some()),
+            .with_system_accounts_serving(system_accounts.serving_flag()),
     };
     let private_state = PrivateState::new(
         app.clone(),
@@ -1093,7 +1098,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .merge(crate::plural::handlers::router(plural_state))
         .merge(crate::system_accounts::handlers::router(crate::system_accounts::handlers::SystemAccountsState {
             app: app.clone(),
-            keys: system_accounts,
+            state: system_accounts,
         }))
         .merge(health::router(state));
     // Every router has registered its methods by now.

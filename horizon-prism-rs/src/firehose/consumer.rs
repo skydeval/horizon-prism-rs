@@ -463,8 +463,8 @@ pub struct Consumer {
     status: Arc<ConsumerStatus>,
     /// `lists.sync_min_interval_secs`, for a sync an owner's event causes.
     sync_min_interval_secs: u32,
-    /// The system-accounts keys, for routing identity events (`None`: off).
-    system_accounts: Option<crate::system_accounts::Keys>,
+    /// The system-accounts state, for routing identity events.
+    system_accounts: crate::system_accounts::State,
     throughput: Throughput,
     shared: Arc<ThroughputShared>,
     /// `A` at this process's previous trim re-anchor.
@@ -505,7 +505,7 @@ impl Consumer {
             coverage,
             status,
             sync_min_interval_secs: 600,
-            system_accounts: None,
+            system_accounts: crate::system_accounts::State::Off,
             throughput: Throughput::new(WINDOW),
             shared: Arc::default(),
             prev_reanchor_added: None,
@@ -523,8 +523,8 @@ impl Consumer {
 
     /// Set the system-accounts keys (system-accounts design §6).
     #[must_use]
-    pub fn with_system_accounts(mut self, keys: Option<crate::system_accounts::Keys>) -> Self {
-        self.system_accounts = keys;
+    pub fn with_system_accounts(mut self, state: crate::system_accounts::State) -> Self {
+        self.system_accounts = state;
         self
     }
 
@@ -1040,7 +1040,7 @@ impl Consumer {
         };
         match event {
             Event::Identity { kind, did, relay } => {
-                let queued = route_identity(&self.pool, kind, &did, self.system_accounts.as_ref()).await?;
+                let queued = route_identity(&self.pool, kind, &did, &self.system_accounts).await?;
                 // The live feed counts every event and shows the queued ones
                 // (admin-ui-live-feed design §4.1).
                 if let Some(tap) = self.writer.feed() {

@@ -36,4 +36,4 @@ When an account is deleted, its list goes, and it leaves every list it was on. D
 - Requests pass through whatever terminates TLS in front of Horizon-Prism. The shipped Caddy configuration writes no access log; an operator's own proxy or CDN must not log request bodies or `Authorization`.
 - Refreshing a deleted account's identity stores what Horizon-Prism stores for any account it refreshes (its DID document and status), never which list held it.
 - A deletion Horizon-Prism never hears about leaves the rows until the next event for that account.
-- The key has no rotation in this version.
+- The key has no rotation in this version. If it is lost or changed, the lists are kept but unusable: system accounts stay off (the rest of Horizon-Prism runs), account events are recorded, and when the right key is back the feature serves again only after accounts known to be deleted have left the lists and the other recorded accounts on a list have had their usual deletion check.

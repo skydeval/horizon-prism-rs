@@ -100,9 +100,10 @@ pub struct MembershipSettings {
     /// `plural.enabled` (plural-pronouns design §2.9): `plural.read` is
     /// listed.
     pub plural_read: bool,
-    /// `APP_SYSTEM_ACCOUNTS_KEY_HEX` is set (system-accounts design §1
-    /// D-9): `account.systemAccounts` is listed, for every caller.
-    pub system_accounts: bool,
+    /// System accounts serve (system-accounts design §1 D-9, amendment 1):
+    /// `account.systemAccounts` is listed, for every caller. Read on every
+    /// call: it turns on when the catch-up is done.
+    pub system_accounts: crate::system_accounts::Serving,
 }
 
 impl MembershipSettings {
@@ -119,7 +120,7 @@ impl MembershipSettings {
             live: LiveSettings::default(),
             reindex_retry_secs: CommunityConfig::default().reindex_retry_secs,
             plural_read: crate::config::PluralConfig::default().enabled,
-            system_accounts: false,
+            system_accounts: crate::system_accounts::Serving::fixed(false),
         }
     }
 
@@ -130,10 +131,17 @@ impl MembershipSettings {
         self
     }
 
-    /// Whether the system-accounts feature is on.
+    /// Whether the system-accounts feature is on, fixed.
     #[must_use]
     pub fn with_system_accounts(mut self, enabled: bool) -> Self {
-        self.system_accounts = enabled;
+        self.system_accounts = crate::system_accounts::Serving::fixed(enabled);
+        self
+    }
+
+    /// The system-accounts serving flag, read on every call.
+    #[must_use]
+    pub fn with_system_accounts_serving(mut self, serving: crate::system_accounts::Serving) -> Self {
+        self.system_accounts = serving;
         self
     }
 
@@ -232,7 +240,7 @@ impl MembershipSettings {
         }
         // System accounts (system-accounts design §1 D-9): members and
         // non-members alike.
-        if self.system_accounts {
+        if self.system_accounts.get() {
             out.push(crate::system_accounts::FEATURE);
         }
         out

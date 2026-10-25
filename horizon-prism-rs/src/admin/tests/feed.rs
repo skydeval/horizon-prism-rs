@@ -389,7 +389,7 @@ async fn t_f8_lines() {
     writer(&h, off).apply(NO_HANDLE, "3kaaaaaaaaa25", &[post("3kpost4aaaaaa", "kept as a reference")], OPTIONS).await.expect("apply");
     // An identity event for an unknown DID: counted, no line.
     let before = h.hub.tap().totals().identity_events();
-    let queued = route_identity(p, IdentityKind::Handle, OUTSIDER, None).await.expect("route");
+    let queued = route_identity(p, IdentityKind::Handle, OUTSIDER, &crate::system_accounts::State::Off).await.expect("route");
     assert!(!queued);
     h.hub.tap().identity(IdentityKind::Handle, OUTSIDER, queued, Some("bsky"));
     assert_eq!(h.hub.tap().totals().identity_events(), before + 1);

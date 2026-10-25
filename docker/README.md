@@ -52,7 +52,7 @@ openssl rand -hex 32
 
 It is required: without it, or with a value that is not 64 hex characters, `app` refuses to start (exit 78). It is never generated at start, because a generated key would break every private-feed cursor at each restart and between replicas. Give every replica the same value. Rotating it makes open private-feed cursors fail once, and clients start those feeds over.
 
-Optionally, switch system accounts on by putting a key in `.env` as `APP_SYSTEM_ACCOUNTS_KEY_HEX` (`admin keygen` prints one; `openssl rand -hex 32` works too). It seals and indexes every account's private list of system accounts. Give every replica the same value and keep it: once lists are stored, a start with another key or none stops (exit 78), since the lists could no longer be read or removed on account deletion. See `docs/configuration.md` ("System-accounts key"). A deployment with its own compose override must pass the variable to `app` too.
+Optionally, switch system accounts on by putting a key in `.env` as `APP_SYSTEM_ACCOUNTS_KEY_HEX` (`admin keygen` prints one; `openssl rand -hex 32` works too). It seals and indexes every account's private list of system accounts. Give every replica the same value, keep it and back it up: once lists are stored, a start with another key or none leaves system accounts off (the rest runs), and they come back only with that key. See `docs/configuration.md` ("System-accounts key"). A deployment with its own compose override must pass the variable to `app` too.
 
 **5. Community PDS hosts.** Add your community PDS hostnames to the `community` network's `pds_patterns` in `config/app.toml`.
 

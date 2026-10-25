@@ -94,10 +94,19 @@ Each request class is a token bucket: `per_sec` and `burst`. Anonymous callers a
 
 `APP_SYSTEM_ACCOUNTS_KEY_HEX` is a separate secret on purpose: its lists outlive any rotation of the other keys. Without it the feature is off and nothing is stored. Set it, and `getMembership` lists `account.systemAccounts` for every signed-in account.
 
-Once a list is stored, the key must stay the same. A start with another key, or with none, stops with exit 78 and says why, because the lists could then be neither read nor removed when an account is deleted. There is no rotation in this version. To start over, stop `app` and run, in the database:
+Once a list is stored, the key must stay the same, so back it up. If a start finds lists but no key, or another key, Horizon-Prism still starts and only system accounts are off ("locked"):
+
+- the five methods answer 501 with "System accounts are unavailable on this AppView for now; lists are kept", and `getMembership` leaves `account.systemAccounts` out;
+- no entry is read, added or removed, so a listed account cannot leave lists until the key is back (owners are still recognised, and a deleted account's own list is still deleted, since neither needs the key);
+- every identity, account, handle and tombstone event seen is recorded in `sysacct_pending` (any account's, so it says nothing about who is on a list; it grows by up to a few hundred thousand short rows a day on the full network);
+- the log (`system_accounts_locked`) and the Health page ("System accounts", red) say which case it is.
+
+Set the right key and restart. Accounts deleted meanwhile then leave every list, the recorded accounts that are on a list are checked by the identity refresher as usual, and the methods serve again once those checks are done: usually minutes, up to a few hours when an account's server is failing (Health's "System accounts" check is amber meanwhile; it runs in the background and never holds the start). A check the refresher gives up on counts as done, as it would with the key present. Every replica must have the same key. A replica started without it is locked and keeps recording. A replica that is already serving keeps serving and applies what a locked replica records, as soon as its own catch-up is not waiting on earlier checks; a replica that starts meanwhile waits to serve until no replica is locked. When several replicas start with the right key, each waits until the recorded checks are done, and a restart while catching up starts those checks again. While catching up, each process holds the recorded rows in memory, about 100 MB per week the key was missing on the full network; after a lock of months, give the process room for that or empty `sysacct_pending` first, accepting that deletions seen meanwhile then reach the lists only through later events.
+
+A key that is not 64 hex characters still stops the start (exit 78), as for any malformed setting. There is no rotation in this version. To start over, stop `app` and run, in the database:
 
 ```sql
-TRUNCATE sysacct_entries, sysacct_lists, sysacct_used_tokens, sysacct_key;
+TRUNCATE sysacct_entries, sysacct_lists, sysacct_used_tokens, sysacct_key, sysacct_pending;
 ```
 
 Every list is then gone; the next start records the new key.

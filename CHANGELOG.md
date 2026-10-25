@@ -31,14 +31,27 @@ no tracker references.
   never logged; lists go when an account is deleted. Up to 31 accounts per
   list; rate class `[rate_limits.system_accounts]`.
 
+### Changed
+
+- **A system-accounts key problem no longer stops Horizon-Prism.** With lists
+  stored and `APP_SYSTEM_ACCOUNTS_KEY_HEX` missing or not the key they were
+  sealed with, Horizon-Prism starts and only system accounts are off: the five
+  methods answer 501 saying the lists are kept, `getMembership` leaves the
+  feature out, the log and the Health page say what to fix, and nothing is
+  added to or removed from the lists (a deleted owner's own list still goes).
+  Account events seen meanwhile are recorded. With the right key back,
+  accounts deleted meanwhile leave every list, the others on a list are
+  checked as usual, and the methods serve again once that is done.
+
 ### Upgrade notes
 
-- Migration 0048 (system accounts): one start with
-  `APP_ALLOW_STARTUP_MIGRATE=1`.
+- Migrations 0048 (system accounts) and 0049 (account events kept while the
+  key is missing): one start with `APP_ALLOW_STARTUP_MIGRATE=1`.
 - System accounts are off until `APP_SYSTEM_ACCOUNTS_KEY_HEX` is set (64 hex;
   `admin keygen` prints one). The shipped compose passes it through; a
-  compose override must pass it too. Once lists are stored, keep the key:
-  a start with another key or none stops with exit 78.
+  compose override must pass it too. Once lists are stored, keep the key and
+  back it up: with another key or none, system accounts stay off until it is
+  back (the rest of Horizon-Prism runs).
 
 ### Fixed
 

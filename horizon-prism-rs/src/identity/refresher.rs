@@ -276,7 +276,7 @@ impl IdentityRefresher {
             }
             Ok(Outcome::Recheck(delay)) => {
                 metrics::counter!(METRIC_OUTCOMES, "outcome" => "recheck").increment(1);
-                self.reschedule(&row.did, delay, 0).await
+                self.reschedule(&row.did, delay, 0, true).await
             }
             Err(error) => {
                 let attempt = row.attempts.saturating_add(1);
@@ -287,7 +287,7 @@ impl IdentityRefresher {
                 } else {
                     metrics::counter!(METRIC_OUTCOMES, "outcome" => "retry").increment(1);
                     tracing::debug!(event = "identity_refresh_retry", did = %row.did, attempt, %error, "identity refresh failed; retrying");
-                    self.reschedule(&row.did, backoff(attempt), attempt).await
+                    self.reschedule(&row.did, backoff(attempt), attempt, false).await
                 }
             }
         };
@@ -314,14 +314,18 @@ impl IdentityRefresher {
         Ok(())
     }
 
-    async fn reschedule(&self, did: &str, delay: Duration, attempts: i32) -> Result<(), sqlx::Error> {
+    /// Put the row back for later. `settled`: the check ran to an answer (a
+    /// recheck), so `settled_at` says so; a retry after an error leaves it
+    /// (system-accounts amendment 1 R3-1).
+    async fn reschedule(&self, did: &str, delay: Duration, attempts: i32, settled: bool) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE identity_refresh SET not_before = now() + make_interval(secs => $2), attempts = $3 \
-             WHERE did = $1",
+            "UPDATE identity_refresh SET not_before = now() + make_interval(secs => $2), attempts = $3, \
+             settled_at = CASE WHEN $4 THEN now() ELSE settled_at END WHERE did = $1",
         )
         .bind(did)
         .bind(secs(delay))
         .bind(attempts)
+        .bind(settled)
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -1,7 +1,9 @@
 //! The five `app.nearhorizon.account.*` methods (design §2). Routed in every
 //! public-indexing mode, CORS as every route, `Cache-Control: private,
 //! no-store` on every answer. With the feature off each answers `501
-//! MethodNotImplemented` before authentication.
+//! MethodNotImplemented` before authentication; locked, or catching up
+//! (amendment 1), the same 501 saying the lists are kept, so a client keeps
+//! what it holds.
 //!
 //! Every call authenticates as Prism's other authed methods do
 //! ([`authenticate`]); the three writes add the token rules ([`tokens`]):
@@ -25,7 +27,7 @@ use super::store::{self, Refusal, StoreError};
 use super::tokens::{UsedToken, lifetime_ok, used_token};
 use super::{
     ADD_SYSTEM_ACCOUNT, CONFIRM_SYSTEM_ACCOUNT, GET_SYSTEM_ACCOUNT_STATUS, GET_SYSTEM_ACCOUNTS, Keys, LEAVE_SYSTEM_ACCOUNTS, MAX_BODY,
-    MAX_ENTRIES, MAX_LIFETIME, METRIC_REQUESTS, REMOVE_SYSTEM_ACCOUNT,
+    MAX_ENTRIES, MAX_LIFETIME, METRIC_REQUESTS, REMOVE_SYSTEM_ACCOUNT, State as FeatureState,
 };
 use crate::kryphocron_glue::VerifiedCaller;
 use crate::xrpc::AppState;
@@ -40,8 +42,8 @@ pub const CACHE_CONTROL: &str = "private, no-store";
 #[derive(Clone)]
 pub struct SystemAccountsState {
     pub app: AppState,
-    /// `None`: the feature is off.
-    pub keys: Option<Keys>,
+    /// The feature's state (amendment 1 §4).
+    pub state: FeatureState,
 }
 
 /// The five routes, merged into the app by `serve`.
@@ -128,6 +130,15 @@ fn not_served() -> XrpcError {
     XrpcError::new(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "System accounts are not served here")
 }
 
+/// Locked or catching up (amendment 1 §5): the lists are kept.
+fn unavailable() -> XrpcError {
+    XrpcError::new(
+        StatusCode::NOT_IMPLEMENTED,
+        "MethodNotImplemented",
+        "System accounts are unavailable on this AppView for now; lists are kept",
+    )
+}
+
 /// What every method starts with: the feature, the caller, and, for a
 /// write, its bearer's lifetime and stored identity; then the rate charge.
 struct Gate {
@@ -139,9 +150,16 @@ struct Gate {
 
 async fn gate(s: &SystemAccountsState, headers: &HeaderMap, peer: SocketAddr, method: &str, write: bool) -> Result<Gate, Fail> {
     let ip = request_ip(&s.app, headers, peer);
-    let Some(keys) = s.keys.clone() else {
-        s.app.limits.check_ip(Class::AnonRead, ip)?;
-        return Err(not_served().into());
+    let keys = match &s.state {
+        FeatureState::On(live) if live.serving.get() => live.keys.clone(),
+        FeatureState::Off => {
+            s.app.limits.check_ip(Class::AnonRead, ip)?;
+            return Err(not_served().into());
+        }
+        FeatureState::Locked(_) | FeatureState::On(_) => {
+            s.app.limits.check_ip(Class::AnonRead, ip)?;
+            return Err(Fail { error: unavailable(), outcome: "unavailable" });
+        }
     };
     let authorization = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     let caller = authenticate(&s.app, authorization, method).await?;
