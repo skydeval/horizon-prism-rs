@@ -1,0 +1,42 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.account.getSystemAccounts",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get the requester's own list of system accounts: the other accounts of its plural system that it registered, in the order added. Requires auth; any signed-in account, member or not. A list never written is empty with rev 0. Served while getMembership lists the feature account.systemAccounts.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["accounts", "rev"],
+          "properties": {
+            "accounts": {
+              "type": "array",
+              "items": { "type": "ref", "ref": "#entry" }
+            },
+            "rev": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Grows with every write to this list, never goes back: an answer with a lower rev than one already seen is older."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "MethodNotImplemented",
+          "description": "System accounts are not served by this AppView (HTTP 501)."
+        }
+      ]
+    },
+    "entry": {
+      "type": "object",
+      "required": ["did", "addedAt"],
+      "properties": {
+        "did": { "type": "string", "format": "did" },
+        "addedAt": { "type": "string", "format": "datetime" }
+      }
+    }
+  }
+}

@@ -19,6 +19,26 @@ no tracker references.
   the start of their handle or display name (case and diacritics ignored),
   shaped as Bluesky's actor searches and with Refract's usual rules; listed in
   `getMembership.features` as `refract.search` while Refract is on.
+- **System accounts**: a private list of the other accounts of a plural
+  system, kept by Horizon-Prism the way an AppView keeps mutes and readable
+  only by its owner. `app.nearhorizon.account.getSystemAccounts`,
+  `addSystemAccount {account, proof}`, `removeSystemAccount {account}`,
+  `getSystemAccountStatus` and `leaveSystemAccounts`, for any signed-in
+  account, member or not; listed in `getMembership.features` as
+  `account.systemAccounts`. Adding an account takes a proof from that
+  account's own server; the three writes and the proof take tokens that live
+  at most 65 s and are accepted once. Listed accounts are sealed at rest and
+  never logged; lists go when an account is deleted. Up to 31 accounts per
+  list; rate class `[rate_limits.system_accounts]`.
+
+### Upgrade notes
+
+- Migration 0048 (system accounts): one start with
+  `APP_ALLOW_STARTUP_MIGRATE=1`.
+- System accounts are off until `APP_SYSTEM_ACCOUNTS_KEY_HEX` is set (64 hex;
+  `admin keygen` prints one). The shipped compose passes it through; a
+  compose override must pass it too. Once lists are stored, keep the key:
+  a start with another key or none stops with exit 78.
 
 ### Fixed
 

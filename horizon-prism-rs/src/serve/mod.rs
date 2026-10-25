@@ -233,6 +233,12 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .map_err(|e| StartupError::new(1, format!("admin settings: {e}")))?
         .cfg;
     let live = crate::admin::settings::LiveSettings::new(&cfg.file);
+    // System accounts (system-accounts design §4.3): on with its key, and
+    // a key that is not the one stored lists were sealed with stops the start.
+    let system_accounts = crate::system_accounts::at_startup(&pool, cfg.env.system_accounts_key.as_ref())
+        .await
+        .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
+    tracing::info!(event = "system_accounts", enabled = system_accounts.is_some(), "system accounts");
     let restart = crate::admin::settings::RestartHandle::default();
     log_community_auto_enroll(&cfg.file);
     // The effective head age, for the release check (private-threads design
@@ -364,7 +370,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
         });
     let purger = Purger::new(pool.clone(), scope.clone(), Arc::clone(&private))
         .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
-        .with_applier(applier.clone());
+        .with_applier(applier.clone())
+        .with_system_accounts(system_accounts.clone());
     // Constellation for background work: backfill, the count refresher and
     // the starter-pack counts.
     let constellation = ConstellationClient::new(nets.internal().client().clone(), &cfg.file.microcosm.constellation_url);
@@ -532,7 +539,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
         coverage,
         Arc::clone(&status),
     )
-    .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs);
+    .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
+    .with_system_accounts(system_accounts.clone());
     let throughput = consumer.throughput_shared();
     tasks.push(consumer.spawn());
     tasks.push(spawn_lag_sampler(redis.clone(), fh.clone(), throughput, LAG_SAMPLE_INTERVAL));
@@ -910,7 +918,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
             .with_any_pds(cfg.file.private_any_pds.enabled)
             .with_refusal_cache(cfg.file.community.enroll_refusal_cache_secs)
             .with_reindex_retry(cfg.file.community.reindex_retry_secs)
-            .with_plural_read(cfg.file.plural.enabled),
+            .with_plural_read(cfg.file.plural.enabled)
+            .with_system_accounts(system_accounts.is_some()),
     };
     let private_state = PrivateState::new(
         app.clone(),
@@ -1082,6 +1091,10 @@ pub async fn run() -> Result<Stopped, StartupError> {
         }))
         .merge(crate::xrpc::router::index_router(index))
         .merge(crate::plural::handlers::router(plural_state))
+        .merge(crate::system_accounts::handlers::router(crate::system_accounts::handlers::SystemAccountsState {
+            app: app.clone(),
+            keys: system_accounts,
+        }))
         .merge(health::router(state));
     // Every router has registered its methods by now.
     usage.load_registry();

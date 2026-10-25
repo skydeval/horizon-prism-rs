@@ -33,6 +33,15 @@ RUN set -e; \
     leaks="$(grep -v '^src/private_tier/' /tmp/private_refs || true)"; \
     if [ -n "$leaks" ]; then echo "private-tier table referenced outside src/private_tier/:"; echo "$leaks"; exit 1; fi
 
+# System-accounts source check (system-accounts design §4.4): the sysacct_
+# tables may only be named under src/system_accounts/, so no other method,
+# view or admin page reads them.
+RUN set -e; \
+    rc=0; grep -rl 'sysacct_' --include='*.rs' src > /tmp/sysacct_refs || rc=$?; \
+    if [ "$rc" -gt 1 ]; then echo "system-accounts source check: grep failed ($rc)"; exit 1; fi; \
+    leaks="$(grep -v '^src/system_accounts/' /tmp/sysacct_refs || true)"; \
+    if [ -n "$leaks" ]; then echo "system-accounts table referenced outside src/system_accounts/:"; echo "$leaks"; exit 1; fi
+
 # A deploy image never carries the stand-in exception
 # (docs/internal/design/standin-guard-exception.md): no cargo config or
 # flags that could turn debug assertions on in a release build.

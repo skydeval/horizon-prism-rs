@@ -1967,6 +1967,9 @@ pub struct RateLimitsConfig {
     /// out, per IP, tight; signed in (a verified token), per DID.
     pub plural_anon: RateClassConfig,
     pub plural_auth: RateClassConfig,
+    /// The system-accounts methods (system-accounts design §7), per caller
+    /// DID; the three writes cost 4 tokens.
+    pub system_accounts: RateClassConfig,
     /// NSID to family name: moves one served endpoint to another family.
     pub endpoint_class: BTreeMap<String, String>,
 }
@@ -1989,6 +1992,7 @@ impl Default for RateLimitsConfig {
             refract: RateClassConfig::new(5.0, 20),
             plural_anon: RateClassConfig::new(1.0, 10),
             plural_auth: RateClassConfig::new(5.0, 30),
+            system_accounts: RateClassConfig::new(1.0, 20),
             endpoint_class: BTreeMap::new(),
         }
     }
@@ -1997,7 +2001,7 @@ impl Default for RateLimitsConfig {
 impl RateLimitsConfig {
     /// Every class with its config key, in §10's order.
     #[must_use]
-    pub fn classes(&self) -> [(&'static str, RateClassConfig); 15] {
+    pub fn classes(&self) -> [(&'static str, RateClassConfig); 16] {
         [
             ("anon_read", self.anon_read),
             ("auth_read", self.auth_read),
@@ -2014,6 +2018,7 @@ impl RateLimitsConfig {
             ("refract", self.refract),
             ("plural_anon", self.plural_anon),
             ("plural_auth", self.plural_auth),
+            ("system_accounts", self.system_accounts),
         ]
     }
 }

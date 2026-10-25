@@ -24,6 +24,10 @@ pub const ENV_THREADLENS_CURSOR_KEY_HEX: &str = "APP_THREADLENS_CURSOR_KEY_HEX";
 /// §3.6, C-14). Required: a generated key would break every private cursor
 /// at each restart and between replicas, so it is never made at start.
 pub const ENV_PRIVATE_CURSOR_KEY_HEX: &str = "APP_PRIVATE_CURSOR_KEY_HEX";
+/// The key system-account lists are sealed and indexed with (system-accounts
+/// design §1 D-2). Optional: without it the feature is off. Once lists are
+/// stored it must stay the same, on every replica.
+pub const ENV_SYSTEM_ACCOUNTS_KEY_HEX: &str = "APP_SYSTEM_ACCOUNTS_KEY_HEX";
 pub const ENV_ALLOW_STARTUP_MIGRATE: &str = "APP_ALLOW_STARTUP_MIGRATE";
 pub const ENV_LOG_LEVEL: &str = "APP_LOG_LEVEL";
 /// The one variable without the `APP_` prefix: Farsight's API key.
@@ -128,6 +132,9 @@ pub struct EnvConfig {
     /// `APP_PRIVATE_CURSOR_KEY_HEX`: seals private-tier paging cursors.
     /// Separate from Thread Lens's key, so either can rotate alone.
     pub private_cursor_key: Secret32,
+    /// `APP_SYSTEM_ACCOUNTS_KEY_HEX`: seals and indexes system-account
+    /// lists. `None` means the feature is off.
+    pub system_accounts_key: Option<Secret32>,
     /// `APP_SUPERVISED=1`: a supervisor restarts `serve` when it exits, so
     /// a restart from the admin UI brings it back.
     pub supervised: bool,
@@ -202,9 +209,15 @@ impl EnvConfig {
             Some(hex) => Some(Secret32::from_hex(&hex).map_err(|r| invalid(ENV_THREADLENS_CURSOR_KEY_HEX, r))?),
         };
 
+        let system_accounts_key = match lookup(ENV_SYSTEM_ACCOUNTS_KEY_HEX).filter(|v| !v.trim().is_empty()) {
+            None => None,
+            Some(hex) => Some(Secret32::from_hex(&hex).map_err(|r| invalid(ENV_SYSTEM_ACCOUNTS_KEY_HEX, r))?),
+        };
+
         Ok(Self {
             threadlens_cursor_key,
             private_cursor_key,
+            system_accounts_key,
             public_hostname,
             database_url: SecretUrl(database_url),
             redis_url,

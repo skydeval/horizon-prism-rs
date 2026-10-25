@@ -20,7 +20,7 @@ pub use live::{LiveSettings, LiveValues, RestartHandle};
 
 use crate::config::{
     ENV_CORRELATION_KEY_HEX, ENV_DATABASE_URL, ENV_FARSIGHT_TOKEN, ENV_PRIVATE_CURSOR_KEY_HEX, ENV_REDIS_URL, ENV_SERVICE_SIGNING_KEY_HEX,
-    ENV_THREADLENS_CURSOR_KEY_HEX, EnvConfig, FileConfig,
+    ENV_SYSTEM_ACCOUNTS_KEY_HEX, ENV_THREADLENS_CURSOR_KEY_HEX, EnvConfig, FileConfig,
 };
 use crate::identity::lodestar::Lodestar;
 
@@ -46,6 +46,7 @@ impl EnvFacts {
                 (ENV_CORRELATION_KEY_HEX, true),
                 (ENV_PRIVATE_CURSOR_KEY_HEX, true),
                 (ENV_THREADLENS_CURSOR_KEY_HEX, env.threadlens_cursor_key.is_some()),
+                (ENV_SYSTEM_ACCOUNTS_KEY_HEX, env.system_accounts_key.is_some()),
                 (ENV_FARSIGHT_TOKEN, env.farsight_token.is_some()),
                 (ENV_DATABASE_URL, true),
                 (ENV_REDIS_URL, true),

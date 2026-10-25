@@ -1,0 +1,23 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.account.getSystemAccountStatus",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Whether any account's list of system accounts holds the requester. Never which accounts, never how many. Requires auth; any signed-in account.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["registered"],
+          "properties": {
+            "registered": { "type": "boolean" }
+          }
+        }
+      },
+      "errors": [
+        { "name": "MethodNotImplemented", "description": "System accounts are not served by this AppView (HTTP 501)." }
+      ]
+    }
+  }
+}

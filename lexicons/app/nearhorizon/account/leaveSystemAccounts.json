@@ -1,0 +1,22 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.account.leaveSystemAccounts",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Remove the requester from every account's list of system accounts; the entries are deleted, not kept. The answer is empty whether or not any list held it. The requester's token lives at most 65 seconds and is accepted once. Requires auth; any signed-in account.",
+      "input": {
+        "encoding": "application/json",
+        "schema": { "type": "object", "properties": {} }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": { "type": "object", "properties": {} }
+      },
+      "errors": [
+        { "name": "InvalidToken", "description": "The requester's token lives over 65 seconds or was already used (HTTP 401)." },
+        { "name": "MethodNotImplemented", "description": "System accounts are not served by this AppView (HTTP 501)." }
+      ]
+    }
+  }
+}

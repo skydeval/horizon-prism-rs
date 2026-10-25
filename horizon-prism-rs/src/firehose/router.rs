@@ -3,7 +3,10 @@
 //! Identity, account, handle and tombstone events carry no rev, so they are
 //! not applied directly. If the DID is in `scope_dids` or `members`, or has an
 //! `actors` row, or a Refract row (refract design §4.4), the worker upserts `identity_refresh` with a 30 s debounce,
-//! OR-ing the reason bit into any pending row. Otherwise the event is ignored.
+//! OR-ing the reason bit into any pending row. A DID that owns a system-account
+//! list, or (with the key) is on one, is queued the same way (system-accounts
+//! design §6), without counting as queued: the live feed and the log keep
+//! saying only whether the main tables track it. Otherwise the event is ignored.
 
 use sqlx::PgPool;
 
@@ -24,12 +27,18 @@ impl IdentityKind {
     }
 }
 
-/// Route one event. Returns whether a refresh was queued.
+/// Route one event. Returns whether a refresh was queued for a DID the main
+/// tables track; `system_accounts` is the feature's keys (`None` while off).
 ///
 /// # Errors
 ///
 /// Any database error (transient for the worker).
-pub async fn route_identity(pool: &PgPool, kind: IdentityKind, did: &str) -> Result<bool, sqlx::Error> {
+pub async fn route_identity(
+    pool: &PgPool,
+    kind: IdentityKind,
+    did: &str,
+    system_accounts: Option<&crate::system_accounts::Keys>,
+) -> Result<bool, sqlx::Error> {
     let queued = sqlx::query(
         "INSERT INTO identity_refresh (did, reasons, not_before) \
          SELECT $1, $2, now() + make_interval(secs => $3) \
@@ -46,6 +55,19 @@ pub async fn route_identity(pool: &PgPool, kind: IdentityKind, did: &str) -> Res
     .await?
     .rows_affected()
         > 0;
+    // A system-accounts owner or listed account: its deletion must reach
+    // the lists. Queued, but not reported as queued.
+    if !queued && crate::system_accounts::holds(pool, system_accounts, did).await? {
+        sqlx::query(
+            "INSERT INTO identity_refresh (did, reasons, not_before) VALUES ($1, $2, now() + make_interval(secs => $3)) \
+             ON CONFLICT (did) DO UPDATE SET reasons = identity_refresh.reasons | EXCLUDED.reasons",
+        )
+        .bind(did)
+        .bind(kind.reason_bit())
+        .bind(DEBOUNCE_SECS)
+        .execute(pool)
+        .await?;
+    }
     // A DID with plural records or a plural repo row is listed again soon
     // (plural-pronouns design §2.4, R3), so a deactivation or a deletion
     // reaches its answers and a deleted account's records go.
@@ -71,15 +93,15 @@ mod tests {
             .execute(&db.pool)
             .await
             .expect("actor");
-        assert!(!route_identity(&db.pool, IdentityKind::Handle, "did:plc:stranger").await.expect("route"));
+        assert!(!route_identity(&db.pool, IdentityKind::Handle, "did:plc:stranger", None).await.expect("route"));
         // A Refract candidate's events are routed too (refract design §4.4).
         sqlx::query("INSERT INTO refract_dids (did, community, state, source) VALUES ('did:plc:candidate', 'community-a', 'candidate', 'fill')")
             .execute(&db.pool)
             .await
             .expect("candidate");
-        assert!(route_identity(&db.pool, IdentityKind::Account, "did:plc:candidate").await.expect("route"));
-        assert!(route_identity(&db.pool, IdentityKind::Handle, known).await.expect("route"));
-        assert!(route_identity(&db.pool, IdentityKind::Account, known).await.expect("route"));
+        assert!(route_identity(&db.pool, IdentityKind::Account, "did:plc:candidate", None).await.expect("route"));
+        assert!(route_identity(&db.pool, IdentityKind::Handle, known, None).await.expect("route"));
+        assert!(route_identity(&db.pool, IdentityKind::Account, known, None).await.expect("route"));
         let (reasons, delay): (i16, f64) = sqlx::query_as(
             "SELECT reasons, extract(epoch FROM not_before - now())::float8 FROM identity_refresh WHERE did = $1",
         )
@@ -115,7 +137,7 @@ mod tests {
         .await
         .expect("record");
         for did in ["did:plc:complete", "did:plc:recordonly", "did:plc:nobody"] {
-            route_identity(p, IdentityKind::Account, did).await.expect("route");
+            route_identity(p, IdentityKind::Account, did, None).await.expect("route");
         }
         let rows: Vec<(String, String, f64)> =
             sqlx::query_as("SELECT did, state, extract(epoch FROM next_fill_at - now())::float8 FROM plural_repos ORDER BY did").fetch_all(p).await.expect("rows");

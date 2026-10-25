@@ -40,6 +40,7 @@ pub mod serve;
 pub mod services;
 pub mod subscriptions;
 pub mod sync;
+pub mod system_accounts;
 pub mod threadlens;
 pub mod xrpc;
 

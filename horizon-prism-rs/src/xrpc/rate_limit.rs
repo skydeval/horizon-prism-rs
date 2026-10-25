@@ -21,6 +21,7 @@
 //! | `refract` | DID | 5/s, 20 |
 //! | `plural_anon` | IP | 1/s, 10 |
 //! | `plural_auth` | DID | 5/s, 30 |
+//! | `system_accounts` | DID | 1/s, 20 |
 //!
 //! Classes form **families**: a request is charged to its family's IP-keyed
 //! member when anonymous and to its DID-keyed member when authenticated.
@@ -64,10 +65,12 @@ pub enum Class {
     /// signed out, per DID signed in.
     PluralAnon,
     PluralAuth,
+    /// The system-accounts methods (system-accounts design §7), per DID.
+    SystemAccounts,
 }
 
 impl Class {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::AnonRead,
         Self::AuthRead,
         Self::SearchAnon,
@@ -83,6 +86,7 @@ impl Class {
         Self::Refract,
         Self::PluralAnon,
         Self::PluralAuth,
+        Self::SystemAccounts,
     ];
 
     fn config(self, cfg: &RateLimitsConfig) -> RateClassConfig {
@@ -102,6 +106,7 @@ impl Class {
             Self::Refract => cfg.refract,
             Self::PluralAnon => cfg.plural_anon,
             Self::PluralAuth => cfg.plural_auth,
+            Self::SystemAccounts => cfg.system_accounts,
         }
     }
 }
@@ -123,6 +128,8 @@ pub enum Family {
     Refract,
     /// `plural_anon` / `plural_auth`.
     Plural,
+    /// `system_accounts`, per caller DID only.
+    SystemAccounts,
 }
 
 impl Family {
@@ -139,6 +146,7 @@ impl Family {
             "resolve" => Self::Resolve,
             "refract" => Self::Refract,
             "plural" => Self::Plural,
+            "system_accounts" => Self::SystemAccounts,
             _ => return None,
         })
     }
@@ -281,11 +289,23 @@ pub const SERVED: &[Served] = &[
     // signed out, per DID signed in.
     served("app.nearhorizon.plural.getRecords", Family::Plural, true),
     served("app.nearhorizon.plural.listMembers", Family::Plural, true),
+    // System accounts (system-accounts design §7): signed in only, per DID.
+    served("app.nearhorizon.account.getSystemAccounts", Family::SystemAccounts, false),
+    served("app.nearhorizon.account.addSystemAccount", Family::SystemAccounts, false),
+    served("app.nearhorizon.account.removeSystemAccount", Family::SystemAccounts, false),
+    served("app.nearhorizon.account.getSystemAccountStatus", Family::SystemAccounts, false),
+    served("app.nearhorizon.account.leaveSystemAccounts", Family::SystemAccounts, false),
 ];
 
 /// Methods charged more than one token of their bucket. A private search
 /// page costs up to 300 binds and decodes (private posting §4.17).
-pub const COSTS: &[(&str, u32)] = &[("app.nearhorizon.private.searchPosts", 5)];
+/// A system-accounts write takes 4 (system-accounts design §7).
+pub const COSTS: &[(&str, u32)] = &[
+    ("app.nearhorizon.private.searchPosts", 5),
+    ("app.nearhorizon.account.addSystemAccount", 4),
+    ("app.nearhorizon.account.removeSystemAccount", 4),
+    ("app.nearhorizon.account.leaveSystemAccounts", 4),
+];
 
 /// The tokens one call of `method` takes: its [`COSTS`] entry, else 1.
 #[must_use]
@@ -305,6 +325,7 @@ fn authenticated_class(family: Family) -> Class {
         Family::Resolve => Class::Resolve,
         Family::Refract => Class::Refract,
         Family::Plural => Class::PluralAuth,
+        Family::SystemAccounts => Class::SystemAccounts,
     }
 }
 

@@ -1,0 +1,35 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.account.removeSystemAccount",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Remove an account from the requester's list of system accounts; the entry is deleted, not kept. Idempotent: an account not on the list is success. The requester's token lives at most 65 seconds and is accepted once. Requires auth; any signed-in account.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["account"],
+          "properties": {
+            "account": { "type": "string", "format": "did" }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["rev"],
+          "properties": {
+            "rev": { "type": "integer", "minimum": 0 }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest", "description": "The input is malformed or account is not a DID." },
+        { "name": "InvalidToken", "description": "The requester's token lives over 65 seconds or was already used (HTTP 401)." },
+        { "name": "MethodNotImplemented", "description": "System accounts are not served by this AppView (HTTP 501)." }
+      ]
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.account.addSystemAccount",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Add an account to the requester's list of system accounts. proof is a service token minted by that account's own server (com.atproto.server.getServiceAuth) with aud this AppView and lxm app.nearhorizon.account.confirmSystemAccount, a name no route serves. The requester's token and the proof each live at most 65 seconds (exp minus iat) and are accepted once: a token used by a request that succeeded is refused, a token used only by a refused request is not. Idempotent: an account already on the list keeps its addedAt, and the answer is the list's current rev. Requires auth; any signed-in account.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["account", "proof"],
+          "properties": {
+            "account": { "type": "string", "format": "did" },
+            "proof": { "type": "string" }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["rev"],
+          "properties": {
+            "rev": { "type": "integer", "minimum": 0 }
+          }
+        }
+      },
+      "errors": [
+        { "name": "InvalidRequest", "description": "The input is malformed, account is not a DID, or account is the requester." },
+        { "name": "InvalidProof", "description": "The proof did not verify, lives over 65 seconds, was issued by another account, or was already used." },
+        { "name": "ListFull", "description": "The list holds 31 accounts already." },
+        { "name": "InvalidToken", "description": "The requester's token lives over 65 seconds or was already used (HTTP 401)." },
+        { "name": "MethodNotImplemented", "description": "System accounts are not served by this AppView (HTTP 501)." }
+      ]
+    }
+  }
+}

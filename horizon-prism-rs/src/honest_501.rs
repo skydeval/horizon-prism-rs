@@ -351,6 +351,13 @@ pub const KEPT_METHODS: &[&str] = &[
     // routed; `plural.enabled = false` is the handlers' own 501.
     "app.nearhorizon.plural.getRecords",
     "app.nearhorizon.plural.listMembers",
+    // System accounts (system-accounts design §2): always routed; with
+    // the feature off the handlers answer their own 501.
+    "app.nearhorizon.account.getSystemAccounts",
+    "app.nearhorizon.account.addSystemAccount",
+    "app.nearhorizon.account.removeSystemAccount",
+    "app.nearhorizon.account.getSystemAccountStatus",
+    "app.nearhorizon.account.leaveSystemAccounts",
 ];
 
 /// The methods private posting has added so far (§3.2), each with its
@@ -508,20 +515,20 @@ mod tests {
     /// S11's running totals, private notification preferences' two,
     /// private activity subscriptions' two, private appearance's two and
     /// its retention's one): every served method is in exactly one of the
-    /// two sets, 56 public and 56 kept (Refract's ten and the two plural
-    /// reads included), 112 served. Their verbs are checked
+    /// two sets, 56 public and 61 kept (Refract's ten, the two plural
+    /// reads and the five system-accounts methods included), 117 served. Their verbs are checked
     /// against the routes in `xrpc::router`'s and `private_tier`'s tests.
     #[test]
     fn public_and_kept_methods_classify_every_served_method() {
         use crate::xrpc::rate_limit::SERVED;
 
-        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 56));
+        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 61));
         let public: BTreeSet<&str> = PUBLIC_METHODS.iter().map(|m| m.nsid).collect();
         let kept: BTreeSet<&str> = KEPT_METHODS.iter().copied().collect();
-        assert_eq!((public.len(), kept.len()), (56, 56), "no NSID twice");
+        assert_eq!((public.len(), kept.len()), (56, 61), "no NSID twice");
         assert!(public.is_disjoint(&kept));
         let served: BTreeSet<&str> = SERVED.iter().map(|s| s.nsid).collect();
-        assert_eq!(served.len(), 112);
+        assert_eq!(served.len(), 117);
         // Private posting's methods are kept, in the `private` family.
         for &(nsid, _) in PRIVATE_POSTING_METHODS {
             assert!(kept.contains(nsid), "{nsid}");

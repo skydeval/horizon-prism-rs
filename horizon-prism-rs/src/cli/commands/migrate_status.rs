@@ -124,6 +124,8 @@ mod tests {
             "0046_refract_reposts",
             // Pronouns and plural systems (#896).
             "0047_plural",
+            // System accounts (#907).
+            "0048_system_accounts",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

@@ -100,6 +100,9 @@ pub struct MembershipSettings {
     /// `plural.enabled` (plural-pronouns design §2.9): `plural.read` is
     /// listed.
     pub plural_read: bool,
+    /// `APP_SYSTEM_ACCOUNTS_KEY_HEX` is set (system-accounts design §1
+    /// D-9): `account.systemAccounts` is listed, for every caller.
+    pub system_accounts: bool,
 }
 
 impl MembershipSettings {
@@ -116,6 +119,7 @@ impl MembershipSettings {
             live: LiveSettings::default(),
             reindex_retry_secs: CommunityConfig::default().reindex_retry_secs,
             plural_read: crate::config::PluralConfig::default().enabled,
+            system_accounts: false,
         }
     }
 
@@ -123,6 +127,13 @@ impl MembershipSettings {
     #[must_use]
     pub fn with_plural_read(mut self, enabled: bool) -> Self {
         self.plural_read = enabled;
+        self
+    }
+
+    /// Whether the system-accounts feature is on.
+    #[must_use]
+    pub fn with_system_accounts(mut self, enabled: bool) -> Self {
+        self.system_accounts = enabled;
         self
     }
 
@@ -218,6 +229,11 @@ impl MembershipSettings {
         out.push(crate::plural::FEATURE_FRONTERS);
         if self.plural_read {
             out.push(crate::plural::FEATURE_READ);
+        }
+        // System accounts (system-accounts design §1 D-9): members and
+        // non-members alike.
+        if self.system_accounts {
+            out.push(crate::system_accounts::FEATURE);
         }
         out
     }
