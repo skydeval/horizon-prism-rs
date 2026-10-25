@@ -13,6 +13,7 @@ Short design notes, one per area. Each says what Horizon-Prism does, what it gua
 | [thread-lens.md](thread-lens.md) | The thread view that shows what the ordinary view leaves out. |
 | [refract.md](refract.md) | Restored accounts. |
 | [pronouns-and-plural.md](pronouns-and-plural.md) | Pronouns and plural-system records. |
+| [system-accounts.md](system-accounts.md) | The private list of a plural system's accounts, and its privacy properties. |
 | [degraded-mode.md](degraded-mode.md) | What happens when a relay or Farsight falls behind. |
 
 Guides for operators are one level up: [running](../running.md), [configuration](../configuration.md), [admin](../admin.md), [API](../api.md), [operations](../operations.md).

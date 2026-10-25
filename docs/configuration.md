@@ -22,6 +22,7 @@ A value saved in the admin UI wins over the file. Horizon-Prism never writes `ap
 | `APP_SERVICE_SIGNING_KEY_HEX` | The AppView's signing key, from `admin keygen`. |
 | `APP_CORRELATION_KEY_HEX` | Audit correlation key, from `admin keygen`. |
 | `APP_PRIVATE_CURSOR_KEY_HEX` | Private-feed cursor key. Required. Same on every replica. |
+| `APP_SYSTEM_ACCOUNTS_KEY_HEX` | Optional. Switches system accounts on, and seals and indexes their lists. 64 hex (`admin keygen` prints one, or `openssl rand -hex 32`). Same on every replica. Once lists are stored, keep it: see below. |
 | `APP_ALLOW_STARTUP_MIGRATE` | `1` only while applying migrations. |
 | `FARSIGHT_TOKEN` | Farsight API key, only if Farsight is used. |
 | `CADDY_ACME_EMAIL` | Certificate contact. |
@@ -87,4 +88,16 @@ The Farsight fallback sends a member's DID and the accounts on their page to ano
 
 ## Rate limits
 
-Each request class is a token bucket: `per_sec` and `burst`. Anonymous callers are keyed by IP, signed-in callers by account, and a global per-IP bucket backs both. Classes: `anon_read`, `auth_read`, `search_anon`, `search_auth`, `write`, `private`, `thread_lens`, `index_request`, `resolve`, `refract`, `plural_anon`, `plural_auth`, plus the service-proxy classes. `[rate_limits.endpoint_class]` moves one method to another class.
+Each request class is a token bucket: `per_sec` and `burst`. Anonymous callers are keyed by IP, signed-in callers by account, and a global per-IP bucket backs both. Classes: `anon_read`, `auth_read`, `search_anon`, `search_auth`, `write`, `private`, `thread_lens`, `index_request`, `resolve`, `refract`, `plural_anon`, `plural_auth`, `system_accounts`, plus the service-proxy classes. `[rate_limits.endpoint_class]` moves one method to another class.
+
+## System-accounts key
+
+`APP_SYSTEM_ACCOUNTS_KEY_HEX` is a separate secret on purpose: its lists outlive any rotation of the other keys. Without it the feature is off and nothing is stored. Set it, and `getMembership` lists `account.systemAccounts` for every signed-in account.
+
+Once a list is stored, the key must stay the same. A start with another key, or with none, stops with exit 78 and says why, because the lists could then be neither read nor removed when an account is deleted. There is no rotation in this version. To start over, stop `app` and run, in the database:
+
+```sql
+TRUNCATE sysacct_entries, sysacct_lists, sysacct_used_tokens, sysacct_key;
+```
+
+Every list is then gone; the next start records the new key.

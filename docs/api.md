@@ -59,6 +59,7 @@ Any other well-formed NSID Horizon-Prism does not know answers `501 MethodNotImp
 | `threadLens` | `getThread`, `resolve` (both POST) | Any signed-in account (the default), or ready members only if the operator sets `threadlens.access = "members"` |
 | `refract` | `fill`, `getPostThread`, `getAuthorFeed`, `getAuthorReposts`, `getReplies`, `getTimeline`, `listNotifications`, `getUnreadCount`, `searchActors`, `searchActorsTypeahead` | Signed in; non-members are served as visitors |
 | `plural` | `getRecords`, `listMembers` | Public |
+| `account` | `getSystemAccounts`, `addSystemAccount`, `removeSystemAccount`, `getSystemAccountStatus`, `leaveSystemAccounts` | Signed in, member or not; each answers for the caller only |
 | `index` | `requestRecord` (POST) | Signed in, for the caller's own records |
 | `feed` | `getAuthorPolls` | Public |
 | `constellation` | `resolveDid` | Public |
@@ -67,6 +68,7 @@ Any other well-formed NSID Horizon-Prism does not know answers `501 MethodNotImp
 - **threadLens**: whole-thread views that bridge across AppViews and blocks. See [thread-lens](design/thread-lens.md).
 - **refract**: views of restored accounts that a listed community still hosts. Optional; with it off every method answers `400 NotEnabled`. See [refract](design/refract.md).
 - **plural**: pronouns and plural-system records. Optional; with `plural.enabled` off both methods answer 501. See [pronouns-and-plural](design/pronouns-and-plural.md).
+- **account**: system accounts, a private list of the other accounts of the caller's plural system, kept like mutes and readable only by the caller. Adding an account takes a proof minted by that account's own server (`lxm` `app.nearhorizon.account.confirmSystemAccount`, a name no route serves). The three writes and the proof take fresh tokens: each lives at most 65 s and is accepted once. A listed account can ask whether any list holds it (yes or no) and leave every list. Every write returns the list's `rev`, which only grows. Optional; off, every method answers 501. See [system-accounts](design/system-accounts.md).
 - **index.requestRecord**: ask Horizon-Prism to index a record the caller just wrote, in case no relay delivered it. Horizon-Prism fetches the record from the caller's PDS itself. The URI's repo must be the caller. It answers `status` (`indexed`, `deleted`, `out_of_scope`, `unchanged`) and `caughtUp`.
 - **constellation.resolveDid**: a routing hint for a DID: its PDS, handle, home network and home AppView.
 
@@ -117,6 +119,7 @@ The call also enrolls an eligible caller, as loading the timeline does.
 | `refract.search` | `refract.searchActors` and `refract.searchActorsTypeahead` are served (listed with `refract`) |
 | `plural.fronters` | Post records in views keep the plural fronters key |
 | `plural.read` | `plural.getRecords` and `listMembers` are served |
+| `account.systemAccounts` | The five `account.*` system-accounts methods are served, for members and non-members |
 
 ## Authentication
 
@@ -133,7 +136,7 @@ Horizon-Prism publishes its DID document at `/.well-known/did.json`, with the `#
 | Access | Methods |
 |---|---|
 | Public (no token) | Public stock reads, `resolveHandle`, `queryLabels`, `getRecord`, `getAuthorPolls`, `plural.*`, `constellation.resolveDid`. A token, if sent, must verify. |
-| Signed in | `getMembership`, `index.requestRecord`, `refract.*`; `threadLens.*` (default) |
+| Signed in | `getMembership`, `index.requestRecord`, `refract.*`, `account.*`; `threadLens.*` (default) |
 | Member, ready or not | Mute management; `putAppearance` (`getAppearance` and `releaseAppearance` also serve a removed member's own retained row) |
 | Ready member | Other signed-in stock methods; `private.*` reads and writes; `threadLens.*` when limited to members |
 
@@ -159,6 +162,6 @@ After `NotEnrolled`, `NotReady`, or a 501 on a method `features` said was served
 
 ## Rate limits
 
-Each request is charged to a token bucket by class: read, search, write, private, thread_lens, index_request, resolve, refract and plural. Anonymous calls are keyed by IP. Signed-in calls are keyed by account. A global per-IP bucket backs them all. Some costly calls take more than one token. Forwarded services have their own buckets.
+Each request is charged to a token bucket by class: read, search, write, private, thread_lens, index_request, resolve, refract, plural and system_accounts. Anonymous calls are keyed by IP. Signed-in calls are keyed by account. A global per-IP bucket backs them all. Some costly calls take more than one token. Forwarded services have their own buckets.
 
 Every 429 carries `Retry-After`. The operator sets all numbers in `[rate_limits]` and can move a method to another class. See [configuration](configuration.md).
