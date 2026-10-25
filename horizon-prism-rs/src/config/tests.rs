@@ -357,7 +357,7 @@ max_walk = 50
 access = "signed_in"
 page_nodes = 200
 listing_calls = 60
-verdict_round_timeout_ms = 500
+verdict_round_timeout_ms = 800
 parent_rounds = 8
 verdict_max_dids = 600
 listing_timeout_ms = 1500
@@ -1096,7 +1096,7 @@ fn threadlens_bounds_have_floors() {
     assert!(has(&p, "threadlens.page_nodes must be at least 2"), "{p:?}");
     assert!(has(&p, "threadlens.listing_calls must be at least 2") && has(&p, "threadlens.parent_rounds must be at least 1"), "{p:?}");
     let cfg = load("[threadlens]\npage_nodes = 2\nlisting_calls = 2\nparent_rounds = 1\n").expect("the floors themselves are valid");
-    assert_eq!((cfg.file.threadlens.verdict_max_dids, cfg.file.threadlens.verdict_round_timeout_ms), (600, 500));
+    assert_eq!((cfg.file.threadlens.verdict_max_dids, cfg.file.threadlens.verdict_round_timeout_ms), (600, 800));
     assert!(cfg.env.threadlens_cursor_key.is_none());
 }
 

@@ -27,6 +27,10 @@ use crate::farsight::lookup::{PairAnswers, PairBudget};
 use crate::farsight::{Lookup, PairAnswer};
 use crate::hydration::{APPLIES, KnownBlocks};
 
+/// `threadlens_bridging_total{state, reason}`: each request's switch, and
+/// why (`vouched`, `no_farsight`, `unanswered`, `partial`, `no_call`).
+pub const METRIC_BRIDGING: &str = "threadlens_bridging_total";
+
 /// What the server knows about blocks between the viewer and one author.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Verdict {
@@ -274,9 +278,25 @@ impl Judge {
                 None => self.ask(std::slice::from_ref(&self.viewer), 1, None).await,
             };
             got.vouches = forced.vouches;
+            got.unanswered = forced.unanswered;
+            got.levels.extend(forced.levels);
             got.answers.extend(forced.answers);
         }
         self.bridging = self.lookup.is_some() && got.vouches;
+        // Why bridging is on or off for this request, so a client's "can't
+        // see around blocks" notice can be traced to its cause.
+        let reason = if self.lookup.is_none() {
+            "no_farsight"
+        } else if self.bridging {
+            "vouched"
+        } else if got.unanswered {
+            "unanswered"
+        } else if got.levels.iter().any(|level| !level.vouches()) {
+            "partial"
+        } else {
+            "no_call"
+        };
+        metrics::counter!(METRIC_BRIDGING, "state" => if self.bridging { "on" } else { "off" }, "reason" => reason).increment(1);
         self.baseline_done = true;
         self.take(authors, got.answers);
         Ok(())

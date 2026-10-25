@@ -158,6 +158,30 @@ impl FarsightClient {
     }
 }
 
+/// How often [`FarsightClient::keep_warm`] touches Farsight: well inside the
+/// transport's 90 s idle limit and a CDN's keep-alive limit.
+pub const KEEP_WARM_EVERY: Duration = Duration::from_secs(30);
+
+impl FarsightClient {
+    /// Keep a connection to Farsight open on the transport `checkBlocks`
+    /// uses, for as long as `serve` runs. Opening one costs a DNS lookup,
+    /// TCP and TLS (200–300 ms through a CDN), which on its own can spend
+    /// a Thread Lens round's budget and switch bridging off. The request is
+    /// a bare unauthenticated `GET /xrpc/_health`: no token, no account,
+    /// whatever it answers; only the open connection matters.
+    #[must_use]
+    pub fn keep_warm(self) -> tokio::task::JoinHandle<()> {
+        let url = format!("{}/xrpc/_health", self.base);
+        tokio::spawn(async move {
+            let options = RequestOptions::new(BodyCap::GET_RECORD).timeout(Duration::from_secs(5));
+            loop {
+                let _ = self.public.get(&url, &options).await;
+                tokio::time::sleep(KEEP_WARM_EVERY).await;
+            }
+        })
+    }
+}
+
 /// Farsight's own status report.
 pub const GET_STATS_PATH: &str = "/xrpc/app.nearhorizon.farsight.query.getStats";
 

@@ -941,6 +941,10 @@ pub struct PairAnswers {
     /// and every answer's level was `complete` or `assisted`: Farsight
     /// vouches for the viewer's side (design-v3 §5.15.4).
     pub vouches: bool,
+    /// At least one call had no answer (a timeout, a refusal, a transport
+    /// error): why a lookup that made calls did not vouch, when it is not
+    /// a partial level.
+    pub unanswered: bool,
 }
 
 impl Lookup {
@@ -1558,6 +1562,7 @@ impl Lookup {
             let owner = Owner { viewer: &actor, member: self.member() };
             out.calls = called.len();
             out.vouches =!called.is_empty() && called.iter().all(|call| call.answered && call.levels.iter().all(|level| level.vouches()));
+            out.unanswered = called.iter().any(|call| !call.answered);
             for call in called {
                 out.levels.extend(call.levels);
                 for (other, outcome) in call.outcomes {

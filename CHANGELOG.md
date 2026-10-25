@@ -33,6 +33,13 @@ no tracker references.
 
 ### Changed
 
+- **Thread Lens falls back less often.** Horizon-Prism keeps one connection to
+  Farsight open (a bare request every 30 s), so a thread never waits for a
+  new DNS, TCP and TLS setup, which through a CDN could spend the whole budget
+  of a block check and show the thread without bridging. The default
+  `threadlens.verdict_round_timeout_ms` is now 800 (was 500). New metric
+  `threadlens_bridging_total{state, reason}` says why bridging was on or off
+  for each request (`vouched`, `unanswered`, `partial`, `no_farsight`).
 - **Admin UI sessions last much longer**: 30 days unused (was 8 hours) and a
   year in all (was 7 days), so an operator can stay signed in like on any
   Bluesky client. A session still ends at once if the operator is removed or

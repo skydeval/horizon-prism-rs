@@ -406,6 +406,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
             let client = crate::farsight::FarsightClient::new(&nets, url, token.expose())
                 .ok_or_else(|| StartupError::new(78, "FARSIGHT_TOKEN is not a usable header value".to_string()))?;
             tracing::info!(event = "farsight_enabled", "inbound list blocks are read from Farsight");
+            // One connection kept open, so a Thread Lens round never pays
+            // for opening one.
+            tasks.push(client.clone().keep_warm());
             let farsight = crate::farsight::Farsight::new(client, &cfg.file.farsight, &shares);
             // The fallback (§5.14.17), only when the operator switched it
             // on. Validation has checked the entry it names.
