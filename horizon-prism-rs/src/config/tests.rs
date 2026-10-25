@@ -189,8 +189,8 @@ lock_timeout_secs = 30
 [admin]
 command_timeout_secs = 600
 web_ui = true
-session_idle_secs = 28800
-session_max_secs = 604800
+session_idle_secs = 2592000
+session_max_secs = 31536000
 live_feed_snippets = true
 
 [cache]
@@ -981,8 +981,8 @@ fn pds_patterns_are_checked() {
 fn admin_ui_sessions_are_checked() {
     let cfg = load("").expect("defaults");
     assert!(cfg.file.admin.web_ui);
-    assert_eq!((cfg.file.admin.session_idle_secs, cfg.file.admin.session_max_secs), (28_800, 604_800));
-    let p = invalid_problems(load("[admin]\nsession_idle_secs = 700000\n"));
+    assert_eq!((cfg.file.admin.session_idle_secs, cfg.file.admin.session_max_secs), (2_592_000, 31_536_000));
+    let p = invalid_problems(load("[admin]\nsession_idle_secs = 40000000\n"));
     assert!(has(&p, "admin.session_idle_secs must not exceed"));
     let p = invalid_problems(load("[admin]\nsession_idle_secs = 0\n"));
     assert!(has(&p, "admin.session_idle_secs must be greater than 0"));

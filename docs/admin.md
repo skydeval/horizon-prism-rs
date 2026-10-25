@@ -9,7 +9,7 @@ Horizon-Prism has two admin surfaces: a web UI at `/admin` and the `admin` CLI. 
 - Operators sign in with their own atproto account, on their account's own server (OAuth). There are no local passwords.
 - Only accounts on the operator list may sign in, and only from a server on the allowed-host list. An empty host list allows any server.
 - The first operator is created with a one-time setup code (see [running](running.md)). After that, operators add other operators.
-- A session ends after 8 hours unused or 7 days in total, and at once if the operator's account moves to another server.
+- A session ends after 30 days unused or a year in total, and at once if the operator is removed or their account moves to another server.
 - `admin.web_ui = false` in `app.toml` removes `/admin` entirely. The CLI then does everything.
 
 Behind a CDN, keep features that inject or rewrite scripts off for `/admin*`. The UI's security policy blocks them.

@@ -705,8 +705,10 @@ impl Default for AdminConfig {
         Self {
             command_timeout_secs: 600,
             web_ui: true,
-            session_idle_secs: 28_800,
-            session_max_secs: 604_800,
+            // 30 days unused, a year in all (skydeval 2026-10-25: an
+            // operator stays signed in for days, as on Bluesky).
+            session_idle_secs: 2_592_000,
+            session_max_secs: 31_536_000,
             live_feed_snippets: true,
         }
     }

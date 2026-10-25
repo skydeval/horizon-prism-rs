@@ -33,6 +33,11 @@ no tracker references.
 
 ### Changed
 
+- **Admin UI sessions last much longer**: 30 days unused (was 8 hours) and a
+  year in all (was 7 days), so an operator can stay signed in like on any
+  Bluesky client. A session still ends at once if the operator is removed or
+  their account moves to a server that is not allowed. Set
+  `admin.session_idle_secs` / `admin.session_max_secs` to shorten them.
 - **A system-accounts key problem no longer stops Horizon-Prism.** With lists
   stored and `APP_SYSTEM_ACCOUNTS_KEY_HEX` missing or not the key they were
   sealed with, Horizon-Prism starts and only system accounts are off: the five

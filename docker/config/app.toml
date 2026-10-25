@@ -263,10 +263,11 @@ command_timeout_secs = 600
 # The web admin UI under /admin (admin-ui design §3). false mounts no /admin
 # route, and the CLI is the whole admin surface.
 web_ui = true
-# An admin UI session ends after 8 hours without use, and 7 days after
-# sign-in in any case (admin-ui design §5.4).
-session_idle_secs = 28800
-session_max_secs = 604800
+# An admin UI session ends after 30 days without use, and a year after
+# sign-in in any case; at once if the operator is removed or their account
+# moves to a server that is not allowed (admin-ui design §5.4).
+session_idle_secs = 2592000
+session_max_secs = 31536000
 # Lines of Home's live feed show the first 100 characters of each public post
 # written (admin-ui-live-feed design §5.2). Never private posts or any other
 # record's content.
