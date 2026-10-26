@@ -8,9 +8,11 @@
 //! conclude that an author has no list block against the viewer.
 //!
 //! **The switch.** Bridging is on for a request when Farsight is
-//! configured and the request's first round of lookups was answered whole
-//! at coverage `complete` or `assisted`. Otherwise nothing is added to
-//! the ordinary view on that request.
+//! configured and answered every call of the request's first round, at any
+//! coverage level (skydeval 2026-10-25: only Farsight unreachable, refusing
+//! or overloaded switches it off). An author is `Clear` when Farsight's
+//! answer names no block and does not flag that pair. Otherwise nothing is
+//! added to the ordinary view on that request.
 //!
 //! **Rounds.** Verdicts are fetched in rounds through the `farsight`
 //! module, which holds the cache and the request's memo: an author is
@@ -62,7 +64,7 @@ pub fn decide(is_viewer: bool, out_local: bool, in_local: bool, pair: Option<&Pa
         Verdict::BlockedByYou
     } else if in_local || pair.is_some_and(|p| p.inbound.is_block()) {
         Verdict::BlockingYou
-    } else if bridging && pair.is_some_and(|p| p.vouched) {
+    } else if bridging && pair.is_some_and(|p| p.vouched || p.unflagged) {
         Verdict::Clear
     } else {
         Verdict::Undetermined
@@ -278,21 +280,26 @@ impl Judge {
                 None => self.ask(std::slice::from_ref(&self.viewer), 1, None).await,
             };
             got.vouches = forced.vouches;
+            got.calls = forced.calls;
             got.unanswered = forced.unanswered;
             got.levels.extend(forced.levels);
             got.answers.extend(forced.answers);
         }
-        self.bridging = self.lookup.is_some() && got.vouches;
+        // On whenever Farsight answered every call of the round, at any
+        // coverage level (skydeval 2026-10-25): only Farsight unreachable,
+        // refusing or overloaded switches it off. A flagged pair still
+        // stays undetermined, author by author.
+        self.bridging = self.lookup.is_some() && got.calls > 0 && !got.unanswered;
         // Why bridging is on or off for this request, so a client's "can't
         // see around blocks" notice can be traced to its cause.
         let reason = if self.lookup.is_none() {
             "no_farsight"
-        } else if self.bridging {
+        } else if self.bridging && got.vouches {
             "vouched"
+        } else if self.bridging {
+            "answered_partial"
         } else if got.unanswered {
             "unanswered"
-        } else if got.levels.iter().any(|level| !level.vouches()) {
-            "partial"
         } else {
             "no_call"
         };
@@ -342,7 +349,7 @@ mod tests {
 
     fn pair(inbound: bool, outbound: bool, vouched: bool) -> PairAnswer {
         let relation = |on: bool| Relation { direct: false, list: on.then(|| LIST.to_string()) };
-        PairAnswer { inbound: relation(inbound), outbound: relation(outbound), vouched }
+        PairAnswer { inbound: relation(inbound), outbound: relation(outbound), vouched, unflagged: vouched }
     }
 
     #[test]
@@ -422,16 +429,29 @@ mod tests {
         assert!(alone.bridging());
         assert_eq!(fake.asked.lock().expect("asked").last().expect("asked"), &[V.to_string()]);
 
-        // Farsight answers but does not vouch: bridging is off, nobody is
-        // Clear, a block it names still applies, and no later round calls.
+        // Farsight answers at level partial (a firehose gap being repaired):
+        // bridging stays on (skydeval 2026-10-25); an unflagged author is
+        // Clear, and a block Farsight names still applies.
         *fake.level.lock().expect("level") = "partial";
+        let fresh = "did:plc:ffffffffffffffffffffffff";
         let mut partial = Judge::new(p.clone(), V, lookup(), &cfg);
-        partial.baseline(&dids(&[A, B])).await.expect("baseline");
-        assert!(!partial.bridging());
-        assert_eq!((partial.verdict(A), partial.verdict(B)), (Some(Verdict::BlockingYou), Some(Verdict::Undetermined)));
+        partial.baseline(&dids(&[A, fresh])).await.expect("baseline");
+        assert!(partial.bridging());
+        assert_eq!((partial.verdict(A), partial.verdict(fresh)), (Some(Verdict::BlockingYou), Some(Verdict::Clear)));
+
+        // Farsight does not answer in time: bridging is off, nobody is
+        // Clear, and no later round calls.
+        *fake.level.lock().expect("level") = "complete";
+        *fake.delay_ms.lock().expect("delay") = u64::from(cfg.verdict_round_timeout_ms) + 400;
+        let slow_author = "did:plc:gggggggggggggggggggggggg";
+        let mut slow = Judge::new(p.clone(), V, lookup(), &cfg);
+        slow.baseline(&dids(&[slow_author])).await.expect("baseline");
+        assert!(!slow.bridging());
+        assert_eq!(slow.verdict(slow_author), Some(Verdict::Undetermined));
         let before = calls();
-        assert!(partial.round(&dids(&[C])).await.expect("round"));
-        assert_eq!((partial.verdict(C), calls()), (Some(Verdict::BlockedByYou), before));
+        assert!(slow.round(&dids(&[C])).await.expect("round"));
+        assert_eq!((slow.verdict(C), calls()), (Some(Verdict::BlockedByYou), before));
+        *fake.delay_ms.lock().expect("delay") = 0;
 
         // Farsight not configured: off, with local blocks only.
         let mut none = Judge::new(p.clone(), V, None, &cfg);

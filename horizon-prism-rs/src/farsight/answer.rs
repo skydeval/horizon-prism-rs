@@ -65,6 +65,13 @@ pub struct PairAnswer {
     /// Farsight answered, at coverage `complete` or `assisted`, and did not
     /// flag this pair. Only then does a clean answer mean "no block".
     pub vouched: bool,
+    /// Farsight answered and did not flag this pair, at any coverage level.
+    /// Thread Lens bridges on it (skydeval 2026-10-25: a response-level
+    /// `partial`, such as a short firehose gap being repaired, must not
+    /// switch bridging off for every thread). It never removes a block:
+    /// only `vouched` does.
+    #[serde(default)]
+    pub unflagged: bool,
 }
 
 impl PairAnswer {
@@ -73,6 +80,7 @@ impl PairAnswer {
     pub fn clean(vouched: bool) -> Self {
         Self {
             vouched,
+            unflagged: vouched,
             ..Self::default()
         }
     }
@@ -115,6 +123,7 @@ impl PairAnswer {
                     inbound: Relation { direct: new.inbound.direct || live.inbound.direct, list: new.inbound.list.clone() },
                     outbound: new.outbound.with(&live.outbound),
                     vouched: false,
+                    unflagged: new.unflagged,
                 },
                 true,
                 Source::Farsight,
@@ -124,6 +133,7 @@ impl PairAnswer {
                     inbound: Relation { direct: live.inbound.direct || new.inbound.direct, list: live.inbound.list.clone() },
                     outbound: live.outbound.with(&new.outbound),
                     vouched: false,
+                    unflagged: false,
                 },
                 false,
                 Source::Fallback,
@@ -133,6 +143,7 @@ impl PairAnswer {
                     inbound: live.inbound.with(&new.inbound),
                     outbound: live.outbound.with(&new.outbound),
                     vouched: false,
+                    unflagged: new.unflagged,
                 },
                 false,
                 Source::Farsight,
@@ -149,6 +160,7 @@ impl PairAnswer {
             inbound: Relation { direct: false, list: Some(list) },
             outbound: Relation::default(),
             vouched: false,
+            unflagged: false,
         }
     }
 }
@@ -257,8 +269,9 @@ impl ChunkAnswer {
             .filter(|did| !malformed.contains(*did))
             .map(|did| {
                 let (inbound, outbound) = blocks.remove(did).unwrap_or_default();
-                let vouched = coverage.vouches() && !flagged.contains(did);
-                (did.clone(), PairAnswer { inbound, outbound, vouched })
+                let unflagged = !flagged.contains(did);
+                let vouched = coverage.vouches() && unflagged;
+                (did.clone(), PairAnswer { inbound, outbound, vouched, unflagged })
             })
             .collect();
         Some(Self {
@@ -307,7 +320,10 @@ mod tests {
         assert_eq!(read.coverage, Coverage::Assisted);
         assert_eq!(read.pairs.len(), 4);
         // The first list is the block list; the pair is vouched.
-        assert_eq!(read.pairs[A], PairAnswer { inbound: Relation { direct: false, list: Some(L1.into()) }, outbound: Relation::default(), vouched: true });
+        assert_eq!(
+            read.pairs[A],
+            PairAnswer { inbound: Relation { direct: false, list: Some(L1.into()) }, outbound: Relation::default(), vouched: true, unflagged: true }
+        );
         // A flagged pair is not vouched, and its blocks are still blocks.
         assert_eq!(read.pairs[B].inbound, Relation { direct: true, list: None });
         assert_eq!(read.pairs[B].outbound.list.as_deref(), Some(L2));
@@ -324,7 +340,7 @@ mod tests {
         let body = |level: Value| json!({"results": [], "partialFor": [], "freshness": {"coverage": {"level": level}}});
         for (level, vouched) in [(json!("complete"), true), (json!("assisted"), true), (json!("partial"), false), (json!("brand-new"), false), (Value::Null, false)] {
             let read = ChunkAnswer::read(&body(level.clone()), &asked()).expect("answer");
-            assert!(read.pairs.values().all(|p| p.vouched == vouched && !p.any_block()), "{level}");
+            assert!(read.pairs.values().all(|p| p.vouched == vouched && p.unflagged && !p.any_block()), "{level}");
         }
     }
 
@@ -354,6 +370,7 @@ mod tests {
             inbound: Relation { direct: false, list: inbound.map(str::to_string) },
             outbound: Relation::default(),
             vouched,
+            unflagged: vouched,
         }
     }
 

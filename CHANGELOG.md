@@ -39,7 +39,14 @@ no tracker references.
   of a block check and show the thread without bridging. The default
   `threadlens.verdict_round_timeout_ms` is now 800 (was 500). New metric
   `threadlens_bridging_total{state, reason}` says why bridging was on or off
-  for each request (`vouched`, `unanswered`, `partial`, `no_farsight`).
+  for each request (`vouched`, `answered_partial`, `unanswered`,
+  `no_farsight`).
+- **Thread Lens keeps bridging while Farsight reports partial coverage** (for
+  example while it repairs a short firehose gap). Bridging is now off only
+  when Farsight does not answer in time, refuses or is overloaded. An author
+  Farsight flags for that pair (a list it cannot read) is still not bridged,
+  and a partial answer still never clears a block Horizon-Prism already
+  knows.
 - **Admin UI sessions last much longer**: 30 days unused (was 8 hours) and a
   year in all (was 7 days), so an operator can stay signed in like on any
   Bluesky client. A session still ends at once if the operator is removed or
