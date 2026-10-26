@@ -83,6 +83,44 @@ pub struct Overlay {
 }
 
 /// Whether two label objects are the same label.
+/// The labels a record's own `labels` (`com.atproto.label.defs#selfLabels`)
+/// put on its view, as Bluesky's AppView shows them: one label per value,
+/// `src` the record's author, `uri` and `cid` the record's, `cts` its
+/// `createdAt`. Clients moderate from a view's `labels` only, so a
+/// self-label that is only in the record warns no one.
+pub(crate) fn self_labels(record: Option<&Value>, uri: &str, cid: Option<&str>, author: &str) -> Vec<Value> {
+    let Some(record) = record else {
+        return Vec::new();
+    };
+    let values = record.pointer("/labels/values").and_then(Value::as_array);
+    let cts = record.get("createdAt").and_then(Value::as_str);
+    values
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("val").and_then(Value::as_str))
+        .filter(|val| !val.is_empty())
+        .map(|val| {
+            let mut label = json!({"src": author, "uri": uri, "val": val});
+            if let Some(cid) = cid {
+                label["cid"] = json!(cid);
+            }
+            if let Some(cts) = cts {
+                label["cts"] = json!(cts);
+            }
+            label
+        })
+        .collect()
+}
+
+/// Add `extra` to `labels`, without repeats.
+pub(crate) fn add_missing_labels(labels: &mut Vec<Value>, extra: Vec<Value>) {
+    for label in extra {
+        if !labels.iter().any(|l| same_label(l, &label)) {
+            labels.push(label);
+        }
+    }
+}
+
 pub(crate) fn same_label(a: &Value, b: &Value) -> bool {
     ["src", "uri", "val"].iter().all(|k| a.get(*k) == b.get(*k)) && a.get("neg").and_then(Value::as_bool).unwrap_or(false) == b.get("neg").and_then(Value::as_bool).unwrap_or(false)
 }
@@ -287,11 +325,24 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
                 report.content_stripped.insert(uri.clone());
             }
             // 2. Labels: upstream removed, but for those of the labelers the
-            // request named; local applied on labelled subjects.
-            let kept: Vec<Value> = match (m.remove("labels"), &overlay.reader_labelers) {
-                (Some(Value::Array(labels)), Some(keep)) => labels
+            // request named, and the subject's own self-labels (`src` its
+            // author), which every AppView shows; local applied on labelled
+            // subjects.
+            let subject_author: Option<String> = if post_like {
+                uri.as_deref().and_then(uri_author).map(str::to_string)
+            } else if is_profile_view(m) {
+                m.get("did").and_then(Value::as_str).map(str::to_string)
+            } else {
+                None
+            };
+            let kept: Vec<Value> = match m.remove("labels") {
+                Some(Value::Array(labels)) => labels
                     .into_iter()
-                    .filter(|l| l.get("src").and_then(Value::as_str).is_some_and(|s| keep.contains(s)))
+                    .filter(|l| {
+                        l.get("src").and_then(Value::as_str).is_some_and(|s| {
+                            subject_author.as_deref() == Some(s) || overlay.reader_labelers.as_ref().is_some_and(|keep| keep.contains(s))
+                        })
+                    })
                     .collect(),
                 _ => Vec::new(),
             };
@@ -304,8 +355,17 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
                     }
                     m.insert("viewer".into(), viewer);
                 }
-                if let Some(labels) = merged_labels(overlay.labels.get(uri), &kept) {
+                let own = self_labels(
+                    m.get("record").or_else(|| m.get("value")),
+                    uri,
+                    m.get("cid").and_then(Value::as_str),
+                    subject_author.as_deref().unwrap_or_default(),
+                );
+                if let Some(mut labels) = merged_labels(overlay.labels.get(uri), &kept) {
+                    add_missing_labels(&mut labels, own);
                     m.insert("labels".into(), Value::Array(labels));
+                } else if !own.is_empty() {
+                    m.insert("labels".into(), Value::Array(own));
                 }
                 if overlay.reader_labelers.is_some() && is_post_view(m) {
                     report.labelled.insert(uri.clone());
@@ -429,10 +489,18 @@ mod tests {
         let before = count_key(&thread, "labels");
         assert!(before >= 6);
         normalize_upstream(&mut thread, &Overlay::default());
-        // Only the three record self-label blocks remain (they are record data).
+        // The record self-label blocks stay (record data), and each post's
+        // labels hold its author's self-label only: every third-party
+        // upstream label is gone (self-labels: skydeval 2026-10-26).
         let after = count_key(&thread, "labels");
-        assert_eq!(after, 3, "{thread:#}");
+        assert_eq!(after, 6, "{thread:#}");
         assert_eq!(thread["thread"]["post"]["record"]["labels"]["values"][0]["val"], "nudity");
+        for post in [&thread["thread"]["post"], &thread["thread"]["parent"]["post"], &thread["thread"]["replies"][0]["post"]] {
+            let labels = post["labels"].as_array().expect("labels");
+            assert_eq!(labels.len(), 1, "{post}");
+            assert_eq!((labels[0]["src"].as_str(), labels[0]["val"].as_str()), (Some("did:plc:author"), Some("nudity")));
+            assert_eq!(labels[0]["uri"], post["uri"]);
+        }
     }
 
     #[test]
@@ -446,7 +514,9 @@ mod tests {
         assert_eq!(v["posts"][0]["viewer"], json!({"like": "at://local-like"}));
         assert_eq!(v["posts"][0]["author"]["viewer"], json!({}), "anonymous-equivalent viewer");
         assert_eq!(v["posts"][0]["author"]["labels"][0]["src"], "did:web:here");
-        assert!(v["posts"][0].get("labels").is_none());
+        // The upstream "porn" label goes; the author's self-label shows.
+        assert_eq!(v["posts"][0]["labels"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["posts"][0]["labels"][0]["src"], "did:plc:author");
     }
 
     /// #887 (threadlens-hydration design §3.6 (b)): with the request's
@@ -470,7 +540,7 @@ mod tests {
         overlay.reader_labelers = Some(["did:plc:mine".to_string()].into());
         let report = normalize_upstream(&mut v, &overlay);
         let vals = |x: &Value| x["labels"].as_array().map(|ls| ls.iter().map(|l| l["val"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>());
-        assert_eq!(vals(&v["posts"][0]), Some(vec!["local".into(), "dupe".into(), "meme".into()]));
+        assert_eq!(vals(&v["posts"][0]), Some(vec!["local".into(), "dupe".into(), "meme".into(), "nudity".into()]));
         assert_eq!(vals(&v["posts"][0]["author"]), Some(vec!["whimsy".into()]));
         assert_eq!(vals(&v["posts"][0]["embed"]["record"]), Some(vec!["quoted".into()]));
         assert_eq!(vals(&v["list"]), Some(vec!["listy".into()]));
@@ -483,7 +553,14 @@ mod tests {
         // Without the request's labelers, nothing is reported.
         let mut again = json!({"posts": [post(uri, Some("hi"), vec![mine("meme", uri)])]});
         let report = normalize_upstream(&mut again, &Overlay::default());
-        assert!(again["posts"][0].get("labels").is_none() && report.labelled.is_empty());
+        assert_eq!(vals(&again["posts"][0]), Some(vec!["nudity".into()]), "only the self-label");
+        assert!(report.labelled.is_empty());
+        // An author's own label sent by the upstream (src = author) stays
+        // even without the request's labelers, once.
+        let own = json!({"src": "did:plc:author", "uri": uri, "val": "nudity", "cts": "c"});
+        let mut sent = json!({"posts": [post(uri, Some("hi"), vec![own, label("x")])]});
+        normalize_upstream(&mut sent, &Overlay::default());
+        assert_eq!(vals(&sent["posts"][0]), Some(vec!["nudity".into()]));
     }
 
     /// B-73: the list view behind a local `blockingByList` keeps its labels
@@ -542,7 +619,11 @@ mod tests {
         assert!(report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/6"));
         assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/8"));
         assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/5"));
-        assert!(v["warned"].get("labels").is_none() && v["bare"].get("labels").is_none(), "{v}");
+        // Their upstream labels go; the author's self-label shows.
+        for key in ["warned", "bare"] {
+            let labels = v[key]["labels"].as_array().expect("labels");
+            assert!(labels.iter().all(|l| l["src"] == "did:plc:author"), "{v}");
+        }
         assert!(!report.content_stripped.contains("at://did:plc:author/app.bsky.feed.post/1"));
         // Refract §7.5: a restored author's view is never content-stripped
         // by Bluesky's own labels; it carries the marker.

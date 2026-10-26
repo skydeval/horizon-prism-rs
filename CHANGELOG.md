@@ -85,6 +85,12 @@ no tracker references.
 
 ### Fixed
 
+- **Authors' self-labels now show on posts and profiles.** A post's or
+  profile's own content warnings (`com.atproto.label.defs#selfLabels` in the
+  record, e.g. nudity or porn) are now in the view's `labels` with `src` the
+  author, as Bluesky's AppView shows them; before, prism removed them from
+  upstream views and never added them to its own, so clients that moderate
+  from `labels` showed such posts without their warning.
 - Saving private notification preferences while being removed from the
   community no longer leaves those preferences behind for a later rejoin; the
   save answers `NotEnrolled` instead.

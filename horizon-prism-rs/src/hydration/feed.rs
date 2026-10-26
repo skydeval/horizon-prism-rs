@@ -157,7 +157,9 @@ impl PostContext {
         }
         v.insert("indexedAt".into(), json!(ts(self.shown_indexed_at(row))));
         v.insert("viewer".into(), self.viewers.get(uri).cloned().unwrap_or_else(|| json!({})));
-        v.insert("labels".into(), Value::Array(self.labels.get(uri).cloned().unwrap_or_default()));
+        let mut labels = self.labels.get(uri).cloned().unwrap_or_default();
+        super::normalize::add_missing_labels(&mut labels, super::normalize::self_labels(Some(&row.record), uri, Some(&row.cid), &row.author_did));
+        v.insert("labels".into(), Value::Array(labels));
         if let Some(gate) = self.threadgates.get(uri) {
             v.insert("threadgate".into(), gate.clone());
         }
@@ -194,7 +196,9 @@ impl PostContext {
         v.insert("cid".into(), json!(row.cid));
         v.insert("author".into(), self.profiles.view(&row.author_did, ProfileKind::Basic));
         v.insert("value".into(), row.record.clone());
-        v.insert("labels".into(), Value::Array(self.labels.get(uri).cloned().unwrap_or_default()));
+        let mut labels = self.labels.get(uri).cloned().unwrap_or_default();
+        super::normalize::add_missing_labels(&mut labels, super::normalize::self_labels(Some(&row.record), uri, Some(&row.cid), &row.author_did));
+        v.insert("labels".into(), Value::Array(labels));
         v.insert("likeCount".into(), json!(c.and_then(|c| c.likes).or(row.like_count).unwrap_or(0)));
         v.insert("repostCount".into(), json!(c.and_then(|c| c.reposts).or(row.repost_count).unwrap_or(0)));
         v.insert("replyCount".into(), json!(c.and_then(|c| c.replies).or(row.reply_count).unwrap_or(0)));
@@ -1704,6 +1708,38 @@ mod tests {
             .expect("view");
         let uris: Vec<&str> = v.inner()["posts"].as_array().expect("posts").iter().filter_map(|x| x["uri"].as_str()).collect();
         assert_eq!(uris, [elsewhere.as_str()]);
+        db.drop_db().await;
+    }
+
+    /// Self-labels (skydeval 2026-10-26): a stored post's record self-labels
+    /// show in its view's `labels` (src its author), as on Bluesky's
+    /// AppView, on the post and on a quote of it; a post without any has
+    /// none.
+    #[tokio::test]
+    async fn record_self_labels_show_in_the_view() {
+        let Some(db) = fresh_db("hydration_self_labels").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let marked = post(p, BOB, "3kself222222", "spicy", None, None).await;
+        let plain = post(p, BOB, "3kplain22222", "plain", None, None).await;
+        exec(
+            p,
+            &format!(
+                "UPDATE posts SET record = record || '{{\"labels\": {{\"$type\": \"com.atproto.label.defs#selfLabels\", \"values\": [{{\"val\": \"porn\"}}]}}}}'::jsonb WHERE uri = '{marked}'"
+            ),
+        )
+        .await;
+        let h = hydrator(p, sets());
+        let v = h.get_posts(&Viewer::anonymous(), &Requester::test(), &[marked.clone(), plain.clone()]).await.expect("db").expect("view");
+        let posts = v.inner()["posts"].as_array().expect("posts");
+        let by_uri = |u: &str| posts.iter().find(|x| x["uri"] == u).expect("post");
+        let labels = by_uri(&marked)["labels"].as_array().expect("labels").clone();
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert_eq!((labels[0]["src"].as_str(), labels[0]["val"].as_str(), labels[0]["uri"].as_str()), (Some(BOB), Some("porn"), Some(marked.as_str())));
+        assert!(by_uri(&plain)["labels"].as_array().is_some_and(Vec::is_empty));
         db.drop_db().await;
     }
 

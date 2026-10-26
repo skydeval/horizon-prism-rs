@@ -84,7 +84,19 @@ impl ProfileContext {
                 v.insert("handle".into(), json!(handle));
             }
             v.insert("viewer".into(), self.viewer.view(did));
-            v.insert("labels".into(), Value::Array(self.labels.get(did).cloned().unwrap_or_default()));
+            // The remote view's self-labels (`src` the account) stay, as on
+            // every AppView; other upstream labels give way to local ones.
+            let own: Vec<Value> = remote
+                .get("labels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|l| l.get("src").and_then(Value::as_str) == Some(did))
+                .cloned()
+                .collect();
+            let mut labels = self.labels.get(did).cloned().unwrap_or_default();
+            super::normalize::add_missing_labels(&mut labels, own);
+            v.insert("labels".into(), Value::Array(labels));
             if let Some(m) = self.markers.get(did) {
                 v.insert("restored".into(), m.clone());
             }
@@ -159,7 +171,10 @@ impl ProfileContext {
             viewer["knownFollowers"] = known.clone();
         }
         v.insert("viewer".into(), viewer);
-        v.insert("labels".into(), Value::Array(self.labels.get(did).cloned().unwrap_or_default()));
+        let mut labels = self.labels.get(did).cloned().unwrap_or_default();
+        let profile_uri = format!("at://{did}/app.bsky.actor.profile/self");
+        super::normalize::add_missing_labels(&mut labels, super::normalize::self_labels(row.and_then(|r| r.profile_record.as_ref()), &profile_uri, None, did));
+        v.insert("labels".into(), Value::Array(labels));
         if let Some(m) = self.markers.get(did) {
             v.insert("restored".into(), m.clone());
         }
