@@ -115,6 +115,7 @@ The call also enrolls an eligible caller, as loading the timeline does.
 | `threadLens.signedIn` | Thread Lens serves any signed-in account, not only members |
 | `threadLens.hydrated` | Thread Lens views carry `servedAs`, viewer state, counts and `replyDisabled` |
 | `threadLens.labelers` | Thread Lens honours `atproto-accept-labelers` |
+| `threadLens.handleAnchor` | `getThread` takes `at://<handle>/app.bsky.feed.post/<rkey>` (any case), resolves the handle as `resolveHandle` does and answers the DID-form `anchor`. Errors: `HandleNotFound` (400), `UpstreamFailure` (502), 429. Without Lodestar, a handle prism has not stored is resolved by DNS and HTTPS probes, up to about 3 s of the request |
 | `refract` | Refract methods are on |
 | `refract.search` | `refract.searchActors` and `refract.searchActorsTypeahead` are served (listed with `refract`) |
 | `plural.fronters` | Post records in views keep the plural fronters key |

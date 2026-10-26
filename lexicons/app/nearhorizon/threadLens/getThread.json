@@ -14,7 +14,7 @@
             "anchor": {
               "type": "string",
               "format": "at-uri",
-              "description": "AT-URI of the anchor post."
+              "description": "AT-URI of the anchor post. The authority is a DID or, where getMembership lists 'threadLens.handleAnchor', a handle (in any case; the post collection only), which this server resolves as com.atproto.identity.resolveHandle does."
             },
             "depth": {
               "type": "integer",
@@ -44,7 +44,7 @@
           "type": "object",
           "required": ["anchor", "nodes", "truncated", "bridging", "servedAs"],
           "properties": {
-            "anchor": { "type": "string", "format": "at-uri" },
+            "anchor": { "type": "string", "format": "at-uri", "description": "The anchor, always DID-form: a handle-form request's resolved form." },
             "nodes": {
               "type": "array",
               "description": "The parent chain, root-most first; the anchor; then replies, level by level.",
@@ -74,7 +74,9 @@
         }
       },
       "errors": [
-        { "name": "InvalidRequest", "description": "Malformed request body, a parameter out of range, or a repliesCursor that is not valid for this anchor." },
+        { "name": "InvalidRequest", "description": "Malformed request body, an anchor that is not a DID-form at-uri or a handle-form post at-uri, a parameter out of range, or a repliesCursor that is not valid for this anchor." },
+        { "name": "HandleNotFound", "description": "A handle-form anchor's handle does not resolve." },
+        { "name": "UpstreamFailure", "description": "A handle-form anchor's handle could not be resolved now (502); retry, or resolve it and send the DID form." },
         { "name": "NotEnrolled", "description": "The caller is not a member." },
         { "name": "NotReady", "description": "The caller's account is not ready yet." },
         {

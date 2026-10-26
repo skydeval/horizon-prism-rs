@@ -1506,4 +1506,5 @@ async fn the_readers_labelers_label_the_lens_views() {
     db.drop_db().await;
 }
 
+mod handle_anchor;
 mod quoted;

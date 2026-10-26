@@ -241,7 +241,7 @@ struct Handles {
 }
 
 /// `handle_resolutions_total{intent, result}` (§5.11, R3-155): `intent` is
-/// `public` for `resolveHandle` and `internal` for internal work, so
+/// `public` for public request paths (`resolveHandle` and Thread Lens handle anchors) and `internal` for internal work, so
 /// internal resolutions never move a public series.
 pub const METRIC_HANDLE_RESOLUTIONS: &str = "handle_resolutions_total";
 

@@ -14,6 +14,15 @@ no tracker references.
 
 ### Added
 
+- **Thread Lens takes a handle-form anchor.** `getThread` accepts
+  `at://<handle>/app.bsky.feed.post/<rkey>` (any case) and resolves the
+  handle itself, as `resolveHandle` does, so a client opening a thread from
+  a `/profile/<handle>/post/<rkey>` link saves a round trip. The answer's
+  `anchor` is always DID-form. A handle that does not resolve is
+  `400 HandleNotFound`; a resolver failure `502 UpstreamFailure`.
+  `getMembership` lists `threadLens.handleAnchor`. Without Lodestar, a
+  handle Horizon-Prism has not stored is resolved by DNS and HTTPS probes,
+  which can take up to about 3 s of the request.
 - **Thread Lens marks quote posts whose card is whole.** A post node now
   carries `embedWhole: true` when its quote card is what the reader's own
   AppView would show (but for the reader's mutes, which the client applies):

@@ -25,7 +25,14 @@
 //! - **Non-enumeration:** every per-URI failure is a typed gap. Request-level
 //!   failures (malformed body, bad parameters, too many URIs) are
 //!   `400 InvalidRequest` and depend only on the input and, under
-//!   `members`, on the caller's membership and readiness.
+//!   `members`, on the caller's membership and readiness; and, for a
+//!   handle-form anchor, on whether the handle resolves, which depends on
+//!   the network too (`HandleNotFound`, `UpstreamFailure`, `429`).
+//! - **Handle-form anchor** (threadlens-handle-anchor design, feature
+//!   `threadLens.handleAnchor`): `getThread` takes
+//!   `at://<handle>/app.bsky.feed.post/<rkey>` (any case), resolves the
+//!   handle as `resolveHandle` does after the cheap checks, and from then on
+//!   uses the DID form only; the answer's `anchor` is DID-form.
 
 use std::net::SocketAddr;
 
@@ -139,6 +146,23 @@ fn content_labelers(scope: Option<&LabelerScope>) -> HeaderMap {
     out
 }
 
+/// The post collection, the only one a handle-form anchor may name.
+const POST_COLLECTION: &str = "app.bsky.feed.post";
+
+/// A handle-form anchor (threadlens-handle-anchor design §1.1): the handle,
+/// lower-cased, and the record key, when `u` is exactly
+/// `at://<handle>/app.bsky.feed.post/<rkey>` with a valid handle (any case)
+/// and a valid record key. Checked before any resolution.
+pub(super) fn handle_anchor(u: &str) -> Option<(String, String)> {
+    let mut parts = u.strip_prefix("at://")?.split('/');
+    let (authority, collection, rkey) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || collection != POST_COLLECTION || !proto_blue::syntax::RecordKey::is_valid(rkey) {
+        return None;
+    }
+    let handle = authority.to_ascii_lowercase();
+    proto_blue::syntax::Handle::is_valid(&handle).then(|| (handle, rkey.to_string()))
+}
+
 fn at_uri(u: &str) -> bool {
     u.starts_with("at://") && uri_author(u).is_some_and(proto_blue::syntax::Did::is_valid) && u.matches('/').count() == 4
 }
@@ -169,19 +193,39 @@ pub async fn get_thread(
 ) -> Result<(HeaderMap, Json<PublicEmit<Value>>), XrpcError> {
     let (req, viewer) = gate(&s, &headers, peer, GET_THREAD).await?;
     let input: GetThreadInput = body(&bytes)?;
-    if !at_uri(&input.anchor) {
-        return Err(XrpcError::invalid("Error: anchor must be an at-uri"));
-    }
+    let handle_form = if at_uri(&input.anchor) {
+        None
+    } else {
+        Some(handle_anchor(&input.anchor).ok_or_else(|| XrpcError::invalid("Error: anchor must be an at-uri"))?)
+    };
     let depth = input.depth.unwrap_or(DEFAULT_DEPTH);
     let parent_height = input.parent_height.unwrap_or(DEFAULT_PARENT_HEIGHT);
     if depth > MAX_DEPTH || parent_height > MAX_DEPTH {
         return Err(XrpcError::invalid("Error: depth and parentHeight must be 0-1000"));
     }
+    // A handle-form anchor is resolved now, after the cheap checks, and only
+    // the DID form is used from here on (threadlens-handle-anchor design
+    // §1.2–§1.5). Errors map as `resolveHandle`'s do.
+    let anchor = match handle_form {
+        None => input.anchor.clone(),
+        Some((handle, rkey)) => {
+            let resolved = crate::xrpc::handlers::respond(&req, s.app.hydrator.resolve_handle(&req, &handle).await)?;
+            let did = resolved
+                .0
+                .inner()
+                .get("did")
+                .and_then(Value::as_str)
+                .filter(|d| proto_blue::syntax::Did::is_valid(d))
+                .map(str::to_string)
+                .ok_or_else(XrpcError::internal)?;
+            format!("at://{did}/{POST_COLLECTION}/{rkey}")
+        }
+    };
     // A cursor that fails authentication, or was issued for another node,
     // is refused: the client restarts that node without one.
     let cursor = match input.replies_cursor {
         None => None,
-        Some(raw) => match s.cursor_key.open(&input.anchor, &raw) {
+        Some(raw) => match s.cursor_key.open(&anchor, &raw) {
             Some(position) => Some((position, raw)),
             None => return Err(XrpcError::invalid("Error: repliesCursor is not valid for this anchor")),
         },
@@ -189,13 +233,13 @@ pub async fn get_thread(
     let request = Request {
         viewer: &viewer,
         req: &req,
-        anchor: &input.anchor,
+        anchor: &anchor,
         depth,
         parent_height,
     };
     let scope = AcceptLabelers::from_headers(&headers).map(|accept| LabelerScope::new(accept, s.ladder.hydrator().labeler_did()));
     let thread = with_labelers(scope.clone(), assemble(&s.ladder, &s.cfg, &s.cursor_key, request, cursor)).await?;
-    Ok((content_labelers(scope.as_deref()), Json(lens_thread(&input.anchor, &thread.nodes, thread.bridging, viewer.hydrate))))
+    Ok((content_labelers(scope.as_deref()), Json(lens_thread(&anchor, &thread.nodes, thread.bridging, viewer.hydrate))))
 }
 
 pub async fn resolve(
