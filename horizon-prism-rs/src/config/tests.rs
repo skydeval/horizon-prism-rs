@@ -240,7 +240,7 @@ requester_share_max_entries = 200000
 [[constellation.networks]]
 name = "bluesky"
 pds_patterns = ["*.host.bsky.network", "bsky.social"]
-appview_url = "https://public.api.bsky.app"
+appview_url = "https://api.bsky.app"
 auth = "unauth"
 rate_per_sec = 20
 burst = 40

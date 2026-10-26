@@ -1038,7 +1038,10 @@ impl Default for ConstellationConfig {
                 network(
                     "bluesky",
                     &["*.host.bsky.network", "bsky.social"],
-                    "https://public.api.bsky.app",
+                    // Not public.api.bsky.app: that endpoint applies only
+                    // Bluesky's own labeler, so a reader's labelers never
+                    // come back as applied (2026-10-26).
+                    "https://api.bsky.app",
                     NetworkAuth::Unauth,
                     Some((20, 40)),
                     true,

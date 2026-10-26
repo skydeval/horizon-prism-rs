@@ -33,6 +33,12 @@ no tracker references.
 
 ### Changed
 
+- **Bluesky's AppView is now `api.bsky.app`** (was `public.api.bsky.app`) in the
+  shipped configuration. The public endpoint applies only Bluesky's own
+  labeler and ignores a reader's others, so Thread Lens and other reads could
+  never report the reader's labelers as applied, and clients had to re-read
+  every post. Operators with their own `config/app.toml` should make the same
+  change to the `bluesky` network's `appview_url`.
 - **Thread Lens falls back less often.** Horizon-Prism keeps one connection to
   Farsight open (a bare request every 30 s), so a thread never waits for a
   new DNS, TCP and TLS setup, which through a CDN could spend the whole budget

@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"did": "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "pds": "https://morel.us-east.host.bsky.network",
-                   "handle": "bbbb.test", "homeNetwork": "bluesky", "homeAppview": "https://public.api.bsky.app",
+                   "handle": "bbbb.test", "homeNetwork": "bluesky", "homeAppview": "https://api.bsky.app",
                    "cascade": ["bluesky", "community-a"], "capabilities": {"localIndexed": false}})
         );
         let (_, _, v) = get("did:plc:cccccccccccccccccccccccc").await;
@@ -182,9 +182,9 @@ mod tests {
             set_mode(hydrator_handle.scope(), mode).await;
             let (_, _, v) = get("did:plc:cccccccccccccccccccccccc").await;
             assert_eq!(v["capabilities"]["localIndexed"], false, "{mode:?}");
-            assert_eq!((v["homeNetwork"].clone(), v["homeAppview"].clone()), (json!("community"), json!("https://public.api.bsky.app")), "{mode:?}");
+            assert_eq!((v["homeNetwork"].clone(), v["homeAppview"].clone()), (json!("community"), json!("https://api.bsky.app")), "{mode:?}");
             let (_, _, v) = get("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").await;
-            assert_eq!(v["homeAppview"], "https://public.api.bsky.app", "{mode:?}");
+            assert_eq!(v["homeAppview"], "https://api.bsky.app", "{mode:?}");
         }
         set_mode(hydrator_handle.scope(), PublicMode::On).await;
         let (_, _, v) = get("did:plc:cccccccccccccccccccccccc").await;

@@ -822,7 +822,7 @@ pub(crate) mod tests {
         let t = table_with_community(&["*.community.example"]);
         let bsky = t.decide("https://morel.us-east.host.bsky.network");
         assert_eq!(bsky.network_name.as_deref(), Some("bluesky"));
-        assert_eq!(bsky.appview_url.as_deref(), Some("https://public.api.bsky.app"));
+        assert_eq!(bsky.appview_url.as_deref(), Some("https://api.bsky.app"));
         let local = t.decide("https://pds1.community.example");
         assert!(local.is_community());
         assert_eq!(local.appview_url, None, "community is never an outbound call");
