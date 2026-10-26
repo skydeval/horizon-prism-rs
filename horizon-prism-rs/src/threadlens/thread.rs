@@ -1146,7 +1146,7 @@ pub async fn get_thread(
     phases.mark("authors");
     super::labelers::add_reader_labels(ladder, r.req, &mut work.nodes).await;
     phases.mark("labels");
-    if let Some((root, gate)) = thread_gate(h, r.anchor, &work.nodes, gate_view.as_ref()).await? {
+    if let Some((root, gate)) = thread_gate(h, r.anchor, &work.nodes, gate_view.as_ref(), tree.is_some()).await? {
         apply_gate(h, &mut work.nodes, &root, &gate, r.viewer).await?;
     }
     phases.mark("gate");
@@ -1169,11 +1169,21 @@ fn rkey(uri: &str) -> &str {
 /// The root is the anchor's stored row's root, else the root its post
 /// node's record names. The gate is the root's valid stored threadgate,
 /// else the gate view the ordinary assembly returned with the baseline,
-/// used only when it is self-consistent and names this root. A private
-/// root has no gate here: Thread Lens never reads the private tier.
+/// used only when it is self-consistent and names this root, else, for a
+/// baseline the upstream AppView gave (`baseline`, anchor not stored), no
+/// gate at all: its answer names the root's gate whenever there is one.
+/// A private root has no gate here: Thread Lens never reads the private
+/// tier.
 /// Only the flags come of it.
-async fn thread_gate(h: &crate::hydration::Hydrator, anchor: &str, nodes: &[LensNode], view: Option<&Value>) -> Result<Option<(String, LensGate)>, sqlx::Error> {
-    let root = match h.lens_stored_root(anchor).await? {
+async fn thread_gate(
+    h: &crate::hydration::Hydrator,
+    anchor: &str,
+    nodes: &[LensNode],
+    view: Option<&Value>,
+    baseline: bool,
+) -> Result<Option<(String, LensGate)>, sqlx::Error> {
+    let stored_root = h.lens_stored_root(anchor).await?;
+    let root = match stored_root.clone() {
         Some(root) => Some(root),
         None => nodes.iter().find_map(|n| match n {
             LensNode::Post { uri, root_uri, .. } if uri == anchor => Some(root_uri.clone().unwrap_or_else(|| anchor.to_string())),
@@ -1189,6 +1199,17 @@ async fn thread_gate(h: &crate::hydration::Hydrator, anchor: &str, nodes: &[Lens
         return Ok(Some((root.clone(), gate)));
     }
     let Some(view) = view else {
+        // The baseline came from an upstream AppView (the anchor is not
+        // stored here, so the ordinary assembly asked upstream) and its
+        // answer named no threadgate: the root has none, and anyone may
+        // reply, as the upstream AppView itself reads it. A stored thread
+        // without a stored gate proves nothing, so it stays undecided.
+        if baseline
+            && stored_root.is_none()
+            && let Some(root) = root
+        {
+            return Ok(Some((root, LensGate { hidden: Default::default(), allow: None })));
+        }
         return Ok(None);
     };
     let (Some(gate), Some(post)) = (view.get("uri").and_then(Value::as_str), view.pointer("/record/post").and_then(Value::as_str)) else {

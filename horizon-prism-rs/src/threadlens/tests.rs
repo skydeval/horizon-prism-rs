@@ -1068,6 +1068,9 @@ async fn an_s_authors_thread_takes_the_upstream_baseline_unless_the_mode_is_on()
     assert_eq!(posts.iter().map(|v| v["uri"].clone()).collect::<Vec<_>>(), [json!(root), json!(anchor)]);
     for post in &posts {
         assert_eq!(post["viewer"]["threadMuted"], true, "{post}");
+        // The upstream answer named no threadgate: the root has none, so
+        // the viewer may reply, and the client can skip its own read.
+        assert_eq!(post["viewer"]["replyDisabled"], false, "{post}");
         assert!(post["viewer"].get("bookmarked").is_none(), "{post}");
         assert!(post["author"]["viewer"].get("activitySubscription").is_none(), "{post}");
     }

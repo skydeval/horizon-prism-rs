@@ -33,6 +33,11 @@ no tracker references.
 
 ### Changed
 
+- **Thread Lens says replies are allowed on threads without a threadgate.**
+  A thread read from the upstream AppView whose answer names no threadgate
+  now carries `viewer.replyDisabled: false` on its posts, instead of leaving
+  it out; clients that skip their own re-read when prism's views are whole
+  can now skip it for ordinary threads.
 - **Bluesky's AppView is now `api.bsky.app`** (was `public.api.bsky.app`) in the
   shipped configuration. The public endpoint applies only Bluesky's own
   labeler and ignores a reader's others, so Thread Lens and other reads could
