@@ -42,6 +42,19 @@ use crate::net::{BodyCap, RequestOptions, Transports};
 use crate::sync::HostBudgets;
 use crate::xrpc::pools::{HostBuckets, Requester};
 
+/// Where a post view, or a thread's, came from (threadlens-quoted-posts
+/// design §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewSource {
+    /// An upstream AppView's answer, through the cascade.
+    Cascade,
+    /// The record-level fallback: Slingshot records, or views cached from
+    /// them.
+    Fallback,
+    /// This AppView's own rows.
+    Local,
+}
+
 /// Upstream lookups for subjects this AppView does not index.
 #[async_trait]
 pub trait UpstreamSource: Send + Sync {
@@ -62,8 +75,10 @@ pub trait UpstreamSource: Send + Sync {
     async fn post_records(&self, _req: &Requester, _uris: &[String]) -> Vec<Value> {
         Vec::new()
     }
-    /// `app.bsky.feed.getPostThread`.
-    async fn post_thread(&self, req: &Requester, uri: &str, depth: u32, parent_height: u32) -> Option<Value>;
+    /// `app.bsky.feed.getPostThread`, with where the answer came from: an
+    /// AppView through the cascade, or the record-level fallback
+    /// (threadlens-quoted-posts design §4).
+    async fn post_thread(&self, req: &Requester, uri: &str, depth: u32, parent_height: u32) -> Option<(Value, ViewSource)>;
     /// `app.bsky.feed.getAuthorFeed` output.
     async fn author_feed(&self, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>, filter: &str) -> Option<Value>;
     /// `app.bsky.graph.getFollows` output.
@@ -145,7 +160,7 @@ impl UpstreamSource for NoUpstream {
     async fn posts(&self, _req: &Requester, _uris: &[String]) -> Vec<Value> {
         Vec::new()
     }
-    async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
+    async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<(Value, ViewSource)> {
         None
     }
     async fn author_feed(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>, _filter: &str) -> Option<Value> {
@@ -723,13 +738,13 @@ impl UpstreamSource for RealUpstreamSource {
             .await
     }
 
-    async fn post_thread(&self, req: &Requester, uri: &str, depth: u32, parent_height: u32) -> Option<Value> {
+    async fn post_thread(&self, req: &Requester, uri: &str, depth: u32, parent_height: u32) -> Option<(Value, ViewSource)> {
         if is_private_uri(uri) {
             return None;
         }
         let author = uri_author(uri)?;
         if let Some(v) = self.cascade(req, author, Call::PostThread { uri, depth, parent_height }).await {
-            return Some(v);
+            return Some((v, ViewSource::Cascade));
         }
         if req.spent() {
             return None;
@@ -771,7 +786,9 @@ impl UpstreamSource for RealUpstreamSource {
         if let Some(p) = parent {
             thread["parent"] = p;
         }
-        Some(json!({ "thread": thread }))
+        // Slingshot's records, or a view cached from them: never an
+        // AppView's answer, however whole it looks.
+        Some((json!({ "thread": thread }), ViewSource::Fallback))
     }
 
     async fn author_feed(&self, req: &Requester, actor: &str, limit: u32, cursor: Option<&str>, filter: &str) -> Option<Value> {
@@ -1410,8 +1427,11 @@ mod tests {
         let profile = up.profile(&req, OUTSIDER).await.expect("profile");
         assert_eq!((profile["displayName"].as_str(), profile["handle"].as_str()), (Some("Outsider"), Some("oooo.test")));
         // A thread falls back to the anchor from Slingshot.
-        let thread = up.post_thread(&req, &uris[0], 6, 20).await.expect("thread");
+        let (thread, source) = up.post_thread(&req, &uris[0], 6, 20).await.expect("thread");
         assert_eq!(thread["thread"]["post"]["record"]["text"], "from slingshot 3kaaa");
+        // Reported as the fallback, not as an AppView's answer
+        // (threadlens-quoted-posts design §4).
+        assert_eq!(source, ViewSource::Fallback);
     }
 
     /// #887 (threadlens-hydration design §3.6 (b)): inside a request that
@@ -1459,7 +1479,7 @@ mod tests {
         let uris = vec![uri.clone()];
         let label = |posts: &[Value]| posts[0]["labels"][0]["val"].as_str().expect("val").to_string();
         let calls = || seen.lock().expect("lock").len();
-        let scope = |raw: &str| Some(LabelerScope::new(AcceptLabelers::parse(raw).expect("valid")));
+        let scope = |raw: &str| Some(LabelerScope::new(AcceptLabelers::parse(raw).expect("valid"), "did:web:appview.example.com"));
 
         // Without labelers: fetched once, then from the shared cache.
         assert_eq!(label(&up.posts(&req, &uris).await), "none");
@@ -1482,8 +1502,9 @@ mod tests {
         assert_eq!((applied(&a), applied(&b)), (Some("did:plc:aaaa;redact".into()), Some("did:plc:bbbb".into())));
 
         // `getPostThread` carries it too; `getProfile` does not.
-        let thread = with_labelers(b.clone(), up.post_thread(&req, &uri, 6, 20)).await.expect("thread");
+        let (thread, source) = with_labelers(b.clone(), up.post_thread(&req, &uri, 6, 20)).await.expect("thread");
         assert_eq!(thread["thread"]["post"]["labels"][0]["val"], "did:plc:bbbb");
+        assert_eq!(source, ViewSource::Cascade);
         with_labelers(b, up.profile(&req, OUTSIDER)).await.expect("profile");
         let seen = seen.lock().expect("lock").clone();
         let sent: Vec<(&str, Option<&str>)> = seen.iter().map(|(m, h)| (m.as_str(), h.as_deref())).collect();

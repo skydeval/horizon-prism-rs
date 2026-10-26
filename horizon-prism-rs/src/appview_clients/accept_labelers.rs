@@ -10,14 +10,17 @@
 //!   ever is);
 //! - normalization keeps the labels those labelers applied, beside Prism's
 //!   own;
-//! - the response names, in `atproto-content-labelers`, the labelers an
-//!   upstream said it applied.
+//! - the response names, in `atproto-content-labelers`, the labelers every
+//!   upstream answer of the request said it applied (the intersection of
+//!   the answers), and Prism's own, which Prism applies itself
+//!   (threadlens-quoted-posts design §3).
 //!
 //! Every labeler is forwarded, moderation or not: a labeler is a labeler.
 //! The labels only add to views; Prism's gate and Thread Lens's rules decide
 //! what is shown, as before.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::http::{HeaderMap, HeaderValue};
@@ -132,26 +135,45 @@ pub fn named_in(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
+/// `threadlens_labelers_unapplied_total{network}`: scoped upstream answers
+/// that left out a labeler the request accepted (threadlens-quoted-posts
+/// design §3). Prism's own labeler is not expected from an upstream.
+pub const METRIC_LABELERS_UNAPPLIED: &str = "threadlens_labelers_unapplied_total";
+
 /// One request's labelers, and what its upstream calls reported.
 #[derive(Debug)]
 pub struct LabelerScope {
     accept: AcceptLabelers,
     value: HeaderValue,
-    /// Accepted labelers an upstream answer named as applied.
-    applied: Mutex<HashSet<String>>,
+    /// Prism's own labeler DID, given when the scope is created.
+    own: String,
+    /// The accepted labelers every scoped upstream answer named as applied:
+    /// `None` until the first answer, then the intersection.
+    upstream_applied: Mutex<Option<HashSet<String>>>,
+    /// The accepted labelers Prism applied itself.
+    own_applied: Mutex<HashSet<String>>,
+    /// Scoped answers that left out an accepted labeler.
+    unapplied_answers: AtomicUsize,
     /// Post URIs whose upstream view, fetched with the header, was
     /// normalized for this request.
     labelled: Mutex<HashSet<String>>,
 }
 
 impl LabelerScope {
+    /// The scope of one request. `own` is Prism's own labeler DID: its
+    /// labels are on every view Prism serves, so it is applied from the
+    /// start when the request accepts it.
     #[must_use]
-    pub fn new(accept: AcceptLabelers) -> Arc<Self> {
+    pub fn new(accept: AcceptLabelers, own: &str) -> Arc<Self> {
         let value = accept.header_value();
+        let own_applied: HashSet<String> = accept.contains(own).then(|| own.to_string()).into_iter().collect();
         Arc::new(Self {
             accept,
             value,
-            applied: Mutex::new(HashSet::new()),
+            own: own.to_string(),
+            upstream_applied: Mutex::new(None),
+            own_applied: Mutex::new(own_applied),
+            unapplied_answers: AtomicUsize::new(0),
             labelled: Mutex::new(HashSet::new()),
         })
     }
@@ -167,24 +189,56 @@ impl LabelerScope {
         &self.value
     }
 
-    /// Record an upstream answer's `atproto-content-labelers`: only the
-    /// labelers the request accepted count.
-    pub fn record_applied(&self, response: &HeaderMap) {
-        let named = named_in(response);
-        let mut applied = self.applied.lock().unwrap_or_else(PoisonError::into_inner);
-        for did in named {
-            if self.accept.contains(&did) {
-                applied.insert(did);
-            }
+    /// Record a scoped upstream answer's `atproto-content-labelers`: only
+    /// the labelers the request accepted count, and a labeler counts as
+    /// applied upstream only while every answer named it (the
+    /// intersection). Returns whether the answer left out an accepted
+    /// labeler other than Prism's own.
+    pub fn record_applied(&self, response: &HeaderMap) -> bool {
+        let named: HashSet<String> = named_in(response).into_iter().filter(|did| self.accept.contains(did)).collect();
+        let missed = self.accept.entries.iter().any(|e| e.did != self.own && !named.contains(&e.did));
+        let mut applied = self.upstream_applied.lock().unwrap_or_else(PoisonError::into_inner);
+        *applied = Some(match applied.take() {
+            None => named,
+            Some(before) => before.intersection(&named).cloned().collect(),
+        });
+        if missed {
+            self.unapplied_answers.fetch_add(1, Ordering::Relaxed);
         }
+        missed
     }
 
     /// Mark a labeler applied by Prism itself (its own labels are always
     /// on its views).
     pub fn mark_applied(&self, did: &str) {
         if self.accept.contains(did) {
-            self.applied.lock().unwrap_or_else(PoisonError::into_inner).insert(did.to_string());
+            self.own_applied.lock().unwrap_or_else(PoisonError::into_inner).insert(did.to_string());
         }
+    }
+
+    /// The scoped answers of this request that left out an accepted
+    /// labeler (each also counted on [`METRIC_LABELERS_UNAPPLIED`]).
+    #[must_use]
+    pub fn unapplied_answers(&self) -> usize {
+        self.unapplied_answers.load(Ordering::Relaxed)
+    }
+
+    /// The accepted labelers counted as applied: those every scoped
+    /// upstream answer named, and Prism's own.
+    fn applied(&self) -> HashSet<String> {
+        let mut out = self.own_applied.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(upstream) = &*self.upstream_applied.lock().unwrap_or_else(PoisonError::into_inner) {
+            out.extend(upstream.iter().cloned());
+        }
+        out
+    }
+
+    /// Whether every labeler the request accepted counts as applied
+    /// (threadlens-quoted-posts design §2 condition 1).
+    #[must_use]
+    pub fn all_applied(&self) -> bool {
+        let applied = self.applied();
+        self.accept.entries.iter().all(|e| applied.contains(&e.did))
     }
 
     pub fn mark_labelled<I: IntoIterator<Item = String>>(&self, uris: I) {
@@ -201,7 +255,7 @@ impl LabelerScope {
     /// when none was.
     #[must_use]
     pub fn content_labelers(&self) -> Option<HeaderValue> {
-        let applied = self.applied.lock().unwrap_or_else(PoisonError::into_inner);
+        let applied = self.applied();
         let named: Vec<String> = self.accept.entries.iter().filter(|e| applied.contains(&e.did)).map(Labeler::render).collect();
         if named.is_empty() {
             return None;
@@ -263,16 +317,73 @@ mod tests {
         assert!(AcceptLabelers::from_headers(&HeaderMap::new()).is_none());
     }
 
+    const OWN: &str = "did:web:prism.example.com";
+
+    fn answer(named: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if !named.is_empty() {
+            h.insert(CONTENT_LABELERS, HeaderValue::from_str(named).expect("ascii"));
+        }
+        h
+    }
+
     #[test]
     fn content_labelers_names_only_accepted_applied_labelers() {
-        let scope = LabelerScope::new(AcceptLabelers::parse(&format!("{A};redact, {B}")).expect("two"));
+        let scope = LabelerScope::new(AcceptLabelers::parse(&format!("{A};redact, {B}")).expect("two"), OWN);
         assert_eq!(scope.content_labelers(), None);
-        let mut answer = HeaderMap::new();
-        answer.insert(CONTENT_LABELERS, HeaderValue::from_str(&format!("{A};redact, did:plc:notasked")).expect("ascii"));
-        scope.record_applied(&answer);
+        assert!(scope.record_applied(&answer(&format!("{A};redact, did:plc:notasked"))), "B left out");
         assert_eq!(scope.content_labelers().expect("one"), format!("{A};redact").as_str());
+        assert!(!scope.all_applied());
         scope.mark_applied(B);
         scope.mark_applied("did:plc:notasked");
         assert_eq!(scope.content_labelers().expect("two"), format!("{A};redact, {B}").as_str());
+        assert!(scope.all_applied());
+    }
+
+    /// T-Q2 (threadlens-quoted-posts design §3): a labeler is applied only
+    /// while every scoped answer named it. One answer naming both and one
+    /// naming A only: the header names A, not everything is applied, and
+    /// one answer is counted as having left one out.
+    #[test]
+    fn applied_is_the_intersection_of_the_answers() {
+        let scope = LabelerScope::new(AcceptLabelers::parse(&format!("{A};redact, {B}")).expect("two"), OWN);
+        assert!(!scope.record_applied(&answer(&format!("{A};redact, {B}"))));
+        assert!(scope.all_applied());
+        assert_eq!(scope.content_labelers().expect("both"), format!("{A};redact, {B}").as_str());
+        assert!(scope.record_applied(&answer(A)));
+        assert_eq!(scope.content_labelers().expect("one"), format!("{A};redact").as_str());
+        assert!(!scope.all_applied());
+        assert_eq!(scope.unapplied_answers(), 1);
+        // An answer naming both again does not bring B back.
+        assert!(!scope.record_applied(&answer(&format!("{A}, {B}"))));
+        assert_eq!(scope.content_labelers().expect("one"), format!("{A};redact").as_str());
+        // A header-less answer empties the upstream part.
+        assert!(scope.record_applied(&answer("")));
+        assert_eq!(scope.content_labelers(), None);
+        assert_eq!(scope.unapplied_answers(), 2);
+    }
+
+    /// T-Q10 and T-Q16 (§3): Prism's own labeler is applied from the
+    /// scope's creation, is not expected from an upstream, and stays
+    /// applied whatever the later answers name.
+    #[test]
+    fn prisms_own_labeler_is_applied_from_the_start() {
+        let scope = LabelerScope::new(AcceptLabelers::parse(&format!("{A}, {OWN}")).expect("two"), OWN);
+        assert_eq!(scope.content_labelers().expect("own"), OWN);
+        // The upstream names A and not Prism's own: everything is applied,
+        // and the answer left nothing out.
+        assert!(!scope.record_applied(&answer(A)));
+        assert!(scope.all_applied());
+        assert_eq!(scope.content_labelers().expect("both"), format!("{A}, {OWN}").as_str());
+        // A label batch's answer without the header narrows the upstream
+        // part only.
+        assert!(scope.record_applied(&answer("")));
+        assert_eq!(scope.content_labelers().expect("own"), OWN);
+        assert!(!scope.all_applied());
+        // With Prism's own not accepted, it is never named.
+        let other = LabelerScope::new(AcceptLabelers::parse(A).expect("one"), OWN);
+        assert_eq!(other.content_labelers(), None);
+        other.mark_applied(OWN);
+        assert_eq!(other.content_labelers(), None);
     }
 }

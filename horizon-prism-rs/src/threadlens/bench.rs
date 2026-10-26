@@ -150,10 +150,10 @@ impl UpstreamSource for SlowUpstream {
     async fn posts(&self, _req: &Requester, _uris: &[String]) -> Vec<Value> {
         Vec::new()
     }
-    async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
+    async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<(Value, crate::hydration::upstream::ViewSource)> {
         self.calls.thread.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(self.delay)).await;
-        Some(self.thread.clone())
+        Some((self.thread.clone(), crate::hydration::upstream::ViewSource::Cascade))
     }
     async fn author_feed(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>, _filter: &str) -> Option<Value> {
         None
@@ -468,8 +468,8 @@ async fn resolve_many_answers_each_uri_as_resolve_does() {
     assert_eq!(many[&private], Resolved::Gap(Gap::TierHidden));
     assert_eq!(many[&hidden], Resolved::Gap(Gap::NotFound));
     assert_eq!(many[&deleted], Resolved::Gap(Gap::Deleted));
-    assert!(matches!(many[&local], Resolved::Post(_)), "{:?}", many[&local]);
-    assert!(matches!(many[&upstream], Resolved::Post(_)), "{:?}", many[&upstream]);
+    assert!(matches!(many[&local], Resolved::Post(_, crate::hydration::upstream::ViewSource::Local)), "{:?}", many[&local]);
+    assert!(matches!(many[&upstream], Resolved::Post(_, crate::hydration::upstream::ViewSource::Cascade)), "{:?}", many[&upstream]);
     assert_eq!(many[&stripped], Resolved::Gap(Gap::ContentStripped));
     assert!(matches!(many[&missing], Resolved::Gap(_)), "{:?}", many[&missing]);
     db.drop_db().await;

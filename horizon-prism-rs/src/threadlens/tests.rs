@@ -171,7 +171,7 @@ async fn a_warned_post_is_a_post_on_the_ladder() {
     let (req, viewer) = (Requester::test(), member(VIEWER_A));
     let at = |rkey: &str| format!("at://{AUTHOR}/app.bsky.feed.post/{rkey}");
     match l.resolve(&viewer, &req, &at("3kwarned2222"), Mode::Full).await.expect("db") {
-        Resolved::Post(view) => {
+        Resolved::Post(view, _) => {
             assert_eq!(view["record"]["text"], "warned text");
             assert!(!view.to_string().contains("!warn"), "{view}");
         }
@@ -1505,3 +1505,5 @@ async fn the_readers_labelers_label_the_lens_views() {
     }
     db.drop_db().await;
 }
+
+mod quoted;

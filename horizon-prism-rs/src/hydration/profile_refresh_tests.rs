@@ -932,7 +932,7 @@ impl UpstreamSource for SlowHandles {
     async fn posts(&self, _req: &Requester, _uris: &[String]) -> Vec<Value> {
         Vec::new()
     }
-    async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
+    async fn post_thread(&self, _req: &Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<(Value, crate::hydration::upstream::ViewSource)> {
         None
     }
     async fn author_feed(&self, _req: &Requester, _actor: &str, _limit: u32, _cursor: Option<&str>, _filter: &str) -> Option<Value> {

@@ -130,6 +130,19 @@ impl Judge {
         judge
     }
 
+    /// As [`Self::judged`], with bridging on and Farsight vouching for
+    /// `clear`: those are `Clear`, the `others` `Undetermined`.
+    #[cfg(test)]
+    pub(crate) fn vouching(viewer: &str, by_viewer: &[&str], of_viewer: &[&str], clear: &[&str], others: &[&str]) -> Self {
+        let mut judge = Self::judged(viewer, by_viewer, of_viewer, others);
+        judge.bridging = true;
+        for did in clear {
+            judge.judged.insert((*did).to_string());
+            judge.pairs.insert((*did).to_string(), PairAnswer::clean(true));
+        }
+        judge
+    }
+
     /// The viewer the verdicts are for.
     #[must_use]
     pub fn viewer(&self) -> &str {

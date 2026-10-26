@@ -1435,8 +1435,9 @@ pub(crate) mod testing {
         async fn actor_starter_packs(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
             self.actor_packs.get(actor).cloned()
         }
-        async fn post_thread(&self, _req: &Requester, uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
-            self.threads.get(uri).cloned()
+        async fn post_thread(&self, _req: &Requester, uri: &str, _depth: u32, _parent_height: u32) -> Option<(Value, crate::hydration::upstream::ViewSource)> {
+            // An AppView's answer, as the cascade gives one.
+            self.threads.get(uri).cloned().map(|v| (v, crate::hydration::upstream::ViewSource::Cascade))
         }
         async fn author_polls(&self, _req: &Requester, actor: &str, _limit: u32, _cursor: Option<&str>) -> Option<Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

@@ -28,7 +28,7 @@ use crate::constellation::{Call, Cascade, Fetched, Router};
 use crate::db::locks::uri_author;
 use crate::hydration::{Hydrator, Viewer};
 use crate::hydration::normalize::is_private_uri;
-use crate::hydration::upstream::post_from_record;
+use crate::hydration::upstream::{ViewSource, post_from_record};
 use crate::microcosm::{SlingshotClient, SlingshotError};
 use crate::moderation::Gate;
 use crate::xrpc::pools::Requester;
@@ -57,8 +57,10 @@ pub enum Mode {
 /// A resolved URI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolved {
-    /// A `postView`, with the viewer's state.
-    Post(Value),
+    /// A `postView`, with the viewer's state, and the step it came from:
+    /// `Local` (step 2) or `Cascade` (step 3, an upstream AppView's
+    /// `getPosts` answer; threadlens-quoted-posts design §4).
+    Post(Value, ViewSource),
     /// A `postView` built from the record alone (Slingshot): its author is
     /// `{did, handle}` from the identity lookup, until the author pass
     /// gives it a profile (design-v4 §8.1).
@@ -108,7 +110,8 @@ impl Ladder {
         Ok(if report.content_stripped.contains(uri) {
             Resolved::Gap(Gap::ContentStripped)
         } else {
-            Resolved::Post(view)
+            // Step 4 turns this into a `RecordPost`.
+            Resolved::Post(view, ViewSource::Fallback)
         })
     }
 
@@ -173,7 +176,7 @@ impl Ladder {
             let mut local = self.hydrator.lens_local_posts(viewer, req, &left).await?;
             left.retain(|uri| match local.remove(uri) {
                 Some(view) => {
-                    out.insert(uri.clone(), Resolved::Post(view));
+                    out.insert(uri.clone(), Resolved::Post(view, ViewSource::Local));
                     false
                 }
                 None => true,
@@ -248,7 +251,7 @@ impl Ladder {
                     scope.mark_labelled(report.labelled.iter().cloned());
                 }
                 for (uri, view) in found.into_iter().zip(normalized.as_array().cloned().unwrap_or_default()) {
-                    let resolved = if report.content_stripped.contains(&uri) { Resolved::Gap(Gap::ContentStripped) } else { Resolved::Post(view) };
+                    let resolved = if report.content_stripped.contains(&uri) { Resolved::Gap(Gap::ContentStripped) } else { Resolved::Post(view, ViewSource::Cascade) };
                     cascade.remove(&uri);
                     out.insert(uri, resolved);
                 }
@@ -287,7 +290,7 @@ impl Ladder {
                     .unwrap_or_else(|| crate::hydration::INVALID_HANDLE.to_string());
                 let view = post_from_record(uri, record.cid.as_deref(), &handle, &record.value);
                 return Ok(match self.upstream_view(viewer, req, uri, view).await? {
-                    Resolved::Post(view) => Resolved::RecordPost(view),
+                    Resolved::Post(view, _) => Resolved::RecordPost(view),
                     other => other,
                 });
             }

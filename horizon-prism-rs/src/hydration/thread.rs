@@ -19,6 +19,7 @@ use super::feed::{NSID_POST, PostContext};
 use super::graph::NSID_FOLLOW;
 use super::lists::is_list_uri;
 use super::normalize::is_private_uri;
+use super::upstream::ViewSource;
 use super::{CountMode, Hydrator, ViewError, ViewResult, Viewer};
 use crate::db::locks::uri_author;
 use crate::moderation::Gate;
@@ -75,8 +76,9 @@ type GateRow = (String, String, Value, Vec<String>, Option<Value>);
 pub(super) type Tree = (Value, Option<Value>);
 
 /// One request's upstream `getPostThread` answer, fetched at most once
-/// (threadlens-hydration design §2.3, F1).
-pub type ThreadMemo = tokio::sync::OnceCell<Option<Value>>;
+/// (threadlens-hydration design §2.3, F1), with where it came from
+/// (threadlens-quoted-posts design §4).
+pub type ThreadMemo = tokio::sync::OnceCell<Option<(Value, ViewSource)>>;
 
 fn not_found() -> ViewError {
     ViewError::new("NotFound", "Post not found")
@@ -467,7 +469,7 @@ impl Hydrator {
         parent_height: u32,
         keep_hidden: bool,
     ) -> Result<Result<Tree, ViewError>, super::HydrationError> {
-        self.thread_tree_memo(viewer, req, uri, depth, parent_height, keep_hidden, None).await
+        Ok(self.thread_tree_memo(viewer, req, uri, depth, parent_height, keep_hidden, None).await?.map(|(tree, _)| tree))
     }
 
     /// [`Hydrator::thread_tree`], with the upstream thread taken from
@@ -476,6 +478,11 @@ impl Hydrator {
     /// baseline twice, to collect and to emit, and the upstream answer is
     /// the same input to both. The memo holds the raw upstream answer, never
     /// a view normalized for a viewer.
+    ///
+    /// With the tree, the source of the branch **this call** took
+    /// (threadlens-quoted-posts design §4): `Local` for the local rows, and
+    /// for the upstream branch the source the answer came from. Two calls
+    /// of one request can take different branches; each says its own.
     ///
     /// # Errors
     ///
@@ -490,7 +497,7 @@ impl Hydrator {
         parent_height: u32,
         keep_hidden: bool,
         memo: Option<&ThreadMemo>,
-    ) -> Result<Result<Tree, ViewError>, super::HydrationError> {
+    ) -> Result<Result<(Tree, ViewSource), ViewError>, super::HydrationError> {
         let started = Instant::now();
         if is_private_uri(uri) {
             return Ok(Err(not_found()));
@@ -502,7 +509,7 @@ impl Hydrator {
             let author = uri_author(uri).unwrap_or_default().to_string();
             if !self.stores_public_of(&author).await
                 && self.gate(req, uri).await?.listable()
-                && let Some(v) = match memo {
+                && let Some((v, source)) = match memo {
                     Some(cell) => cell.get_or_init(|| self.upstream().post_thread(req, uri, depth, parent_height)).await.clone(),
                     None => self.upstream().post_thread(req, uri, depth, parent_height).await,
                 }
@@ -511,12 +518,17 @@ impl Hydrator {
                 // gave.
                 let (mut v, report, _) = self.normalized(viewer, req, v).await?;
                 // Fetched with the request's labelers, if it named any
-                // (threadlens-hydration design §3.6 (b)).
-                if let Some(scope) = crate::appview_clients::accept_labelers::current() {
+                // (threadlens-hydration design §3.6 (b)). Only an AppView's
+                // answer was: the fallback's views asked no labeler, and the
+                // label batch gives them the reader's labels
+                // (threadlens-quoted-posts design §4).
+                if source == ViewSource::Cascade
+                    && let Some(scope) = crate::appview_clients::accept_labelers::current()
+                {
                     scope.mark_labelled(report.labelled);
                 }
                 let gate = v.get("threadgate").cloned().filter(|g| !g.is_null());
-                return Ok(Ok((v["thread"].take(), gate)));
+                return Ok(Ok(((v["thread"].take(), gate), source)));
             }
             return Ok(Err(not_found()));
         };
@@ -653,7 +665,7 @@ impl Hydrator {
             return Ok(Err(not_found()));
         }
         if let Some(blocked) = ctx.blocked_post(uri) {
-            return Ok(Ok((blocked, None)));
+            return Ok(Ok(((blocked, None), ViewSource::Local)));
         }
         let Some(post) = ctx.post_view(uri) else {
             return Ok(Err(not_found()));
@@ -680,7 +692,7 @@ impl Hydrator {
             thread["parent"] = above;
         }
         thread["replies"] = Value::Array(ctx.reply_nodes(uri, &children, &remote, &hidden));
-        Ok(Ok((thread, gate)))
+        Ok(Ok(((thread, gate), ViewSource::Local)))
     }
 
     /// Post views for URIs not stored here, built from their Slingshot

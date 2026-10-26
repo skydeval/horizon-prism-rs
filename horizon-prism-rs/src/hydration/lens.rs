@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use super::normalize::{NormalizeReport, is_private_uri};
+use super::upstream::ViewSource;
 use super::{CountMode, HydrationError, Hydrator, PublicEmit, Viewer};
 use crate::db::locks::uri_author;
 use crate::moderation::Gate;
@@ -56,6 +57,11 @@ pub enum LensNode {
         /// The thread root's threadgate hides it from the caller
         /// (`hiddenByThreadgate`, Thread Lens amendment 1 §2).
         hidden: bool,
+        /// The post view, its quote card included, is what the reader's own
+        /// AppView would show, but for the reader's mutes (`embedWhole`,
+        /// threadlens-quoted-posts design §2). Set last, before the
+        /// response is serialized.
+        embed_whole: bool,
     },
     Gap {
         uri: String,
@@ -132,7 +138,14 @@ impl LensNode {
             post,
             markers: Markers::default(),
             hidden: false,
+            embed_whole: false,
         }
+    }
+
+    /// Whether the node carries `embedWhole`. Only a post node can.
+    #[must_use]
+    pub fn embed_whole(&self) -> bool {
+        matches!(self, Self::Post { embed_whole: true, .. })
     }
 
     /// A gap with no markers.
@@ -171,10 +184,15 @@ impl LensNode {
 
     fn to_json(&self) -> Value {
         let mut v = match self {
-            Self::Post { uri, root_uri, post, .. } => {
+            Self::Post { uri, root_uri, post, embed_whole, .. } => {
                 let mut v = json!({"$type": "app.nearhorizon.threadLens.defs#postNode", "uri": uri, "post": post});
                 if let Some(r) = root_uri {
                     v["rootUri"] = json!(r);
+                }
+                // Only when true: absent says nothing (threadlens-quoted-posts
+                // design §2).
+                if *embed_whole {
+                    v["embedWhole"] = json!(true);
                 }
                 v
             }
@@ -351,6 +369,10 @@ impl Hydrator {
     /// `memo` carries the upstream thread from the collect assembly to the
     /// emit assembly of one request, so it is fetched once.
     ///
+    /// The third value is the source of the branch this call took
+    /// (threadlens-quoted-posts design §4): only `Cascade` means the tree's
+    /// top-level post views are an upstream AppView's answer.
+    ///
     /// # Errors
     ///
     /// Database errors.
@@ -362,8 +384,12 @@ impl Hydrator {
         depth: u32,
         parent_height: u32,
         memo: &super::thread::ThreadMemo,
-    ) -> Result<Option<(Value, Option<Value>)>, HydrationError> {
-        Ok(self.thread_tree_memo(viewer, req, anchor, depth, parent_height, true, Some(memo)).await?.ok())
+    ) -> Result<Option<(Value, Option<Value>, ViewSource)>, HydrationError> {
+        Ok(self
+            .thread_tree_memo(viewer, req, anchor, depth, parent_height, true, Some(memo))
+            .await?
+            .ok()
+            .map(|((tree, gate), source)| (tree, gate, source)))
     }
 
     /// The thread root a stored post names: its `reply_root_uri`, or the
@@ -691,6 +717,29 @@ mod tests {
         // `resolve` items keep it while losing their markers.
         assert_eq!(items.inner()["items"][0]["hiddenByThreadgate"], json!(true));
         assert_eq!(items.inner()["bridging"], "off");
+    }
+
+    /// T-Q6 (threadlens-quoted-posts design §2): `embedWhole` is emitted
+    /// only when true, on `getThread` nodes and `resolve` items alike, and
+    /// never on a gap.
+    #[test]
+    fn embed_whole_is_emitted_only_when_true() {
+        let post = |rkey: &str| json!({"uri": format!("at://did:plc:a/app.bsky.feed.post/{rkey}"), "cid": "c", "author": {"did": "did:plc:a", "handle": "a"}, "record": {"text": rkey}});
+        let mut marked = LensNode::post(post("1"));
+        if let LensNode::Post { embed_whole, .. } = &mut marked {
+            *embed_whole = true;
+        }
+        let unmarked = LensNode::post(post("2"));
+        let gap = LensNode::gap("at://did:plc:b/app.bsky.feed.post/3", None, Gap::Deleted);
+        assert!(marked.embed_whole() && !unmarked.embed_whole() && !gap.embed_whole());
+        let nodes = [marked, unmarked, gap];
+        let thread = lens_thread("at://did:plc:a/app.bsky.feed.post/1", &nodes, Bridging::Full, true);
+        let items = lens_items(&nodes, Bridging::Full, true);
+        for list in [&thread.inner()["nodes"], &items.inner()["items"]] {
+            assert_eq!(list[0]["embedWhole"], json!(true), "{list}");
+            assert!(list[1].get("embedWhole").is_none(), "{list}");
+            assert!(list[2].get("embedWhole").is_none(), "{list}");
+        }
     }
 
     #[test]

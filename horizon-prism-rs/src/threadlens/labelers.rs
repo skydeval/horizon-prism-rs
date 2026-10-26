@@ -60,9 +60,9 @@ pub async fn add_reader_labels(ladder: &Ladder, req: &Requester, nodes: &mut [Le
         return;
     };
     let h = ladder.hydrator();
+    // Prism's own labels are on every view it serves: the scope counts its
+    // labeler as applied from the start (threadlens-quoted-posts design §3).
     let own = h.labeler_did().to_string();
-    // Prism's own labels are on every view it serves.
-    scope.mark_applied(&own);
     let mut wanted: Vec<String> = Vec::new();
     for node in nodes.iter() {
         if let LensNode::Post { uri, .. } = node
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn only_accepted_labels_are_added_once() {
-        let scope = LabelerScope::new(AcceptLabelers::parse("did:plc:meme, did:web:prism.example").expect("two"));
+        let scope = LabelerScope::new(AcceptLabelers::parse("did:plc:meme, did:web:prism.example").expect("two"), "did:web:prism.example");
         let labels = json!([
             {"src": "did:plc:meme", "uri": "at://x", "val": "cat"},
             {"src": "did:plc:other", "uri": "at://x", "val": "dog"},

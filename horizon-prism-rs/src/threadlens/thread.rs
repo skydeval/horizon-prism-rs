@@ -48,6 +48,7 @@ use crate::farsight::{Farsight, Lookup};
 use crate::hydration::lens::{Bridging, LensGate, LensNode, named_accounts};
 use crate::hydration::normalize::is_private_uri;
 use crate::hydration::thread::BLOCKED_CHAIN_MARK;
+use crate::hydration::upstream::ViewSource;
 use crate::hydration::{HydrationError, KnownBlocks, Viewer, with_known_blocks};
 use crate::xrpc::pools::Requester;
 
@@ -301,6 +302,64 @@ fn enforce_embeds(v: &mut Value, judge: &Judge) {
     }
 }
 
+fn type_of(v: &Value) -> &str {
+    v.get("$type").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// A quote embed: the card a client re-reads for.
+fn is_record_embed(v: &Value) -> bool {
+    matches!(type_of(v), "app.bsky.embed.record#view" | "app.bsky.embed.recordWithMedia#view")
+}
+
+/// The media a marked `recordWithMedia#view` may carry (R4-5).
+const WHOLE_MEDIA: [&str; 3] = ["app.bsky.embed.images#view", "app.bsky.embed.external#view", "app.bsky.embed.video#view"];
+
+/// Whether an upstream post view's quote card is what the reader's own
+/// AppView would show, but for the reader's mutes (threadlens-quoted-posts
+/// design §2, conditions 3 and 4). The embed is a `record#view`, or a
+/// `recordWithMedia#view` with known media, and the quoted record is:
+/// - a `#viewRecord` with an explicit `$type`, by the author its URI names,
+///   with no restored marker, whose author is `Clear` for the reader, and
+///   which quotes nothing itself (one level only); or
+/// - `#viewBlocked` or `#viewDetached`, as the upstream gave it or as
+///   enforcement replaced it.
+///
+/// Nothing else: a `#viewNotFound` (the reader's own AppView may show the
+/// post), a card (an upstream card lacks Prism's own labels and gate), a
+/// private-tier URI.
+fn quote_is_whole(post: &Value, judge: &Judge) -> bool {
+    let Some(embed) = post.get("embed") else {
+        return false;
+    };
+    let record = match type_of(embed) {
+        "app.bsky.embed.record#view" => embed.get("record"),
+        "app.bsky.embed.recordWithMedia#view" if embed.get("media").is_some_and(|m| WHOLE_MEDIA.contains(&type_of(m))) => embed.pointer("/record/record"),
+        _ => None,
+    };
+    let Some(record) = record else {
+        return false;
+    };
+    let Some(uri) = record.get("uri").and_then(Value::as_str) else {
+        return false;
+    };
+    if is_private_uri(uri) {
+        return false;
+    }
+    match type_of(record) {
+        "app.bsky.embed.record#viewRecord" => {
+            let author = record.pointer("/author/did").and_then(Value::as_str);
+            author.is_some()
+                && author == uri_author(uri)
+                && record.get("restored").is_none()
+                && record.pointer("/author/restored").is_none()
+                && author.and_then(|a| judge.verdict(a)) == Some(Verdict::Clear)
+                && !record.get("embeds").and_then(Value::as_array).into_iter().flatten().any(is_record_embed)
+        }
+        "app.bsky.embed.record#viewBlocked" | "app.bsky.embed.record#viewDetached" => true,
+        _ => false,
+    }
+}
+
 /// One reply read of a node's sequence.
 struct Reply {
     uri: String,
@@ -395,6 +454,12 @@ struct Work<'a> {
     /// The parent links the baseline knows above its blocked stubs
     /// ([`chain_links`]).
     links: HashMap<String, String>,
+    /// URIs of the post nodes whose view is the view a cascade answer of
+    /// this request gave for that URI as a top-level post: the baseline's,
+    /// when its emit tree was a cascade hit, and the ladder's step 3
+    /// (threadlens-quoted-posts design §4). A node that replaces another
+    /// for the URI decides it again.
+    upstream: HashSet<String>,
 }
 
 impl Work<'_> {
@@ -421,27 +486,30 @@ impl Work<'_> {
     }
 
     fn ladder_node(&mut self, resolved: Resolved, uri: &str, parent_uri: Option<String>) -> LensNode {
-        let resolved_kind = match &resolved {
-            Resolved::RecordPost(_) => Some(true),
-            Resolved::Post(_) => Some(false),
-            Resolved::Gap(_) => None,
-        };
-        match resolved {
-            Resolved::Post(post) | Resolved::RecordPost(post) => {
-                if matches!(&resolved_kind, Some(true)) {
-                    self.from_record.insert(uri.to_string());
+        // The node stands for `uri` from now on: it is upstream only when
+        // its own view is a cascade answer's (step 3).
+        self.upstream.remove(uri);
+        let post = match resolved {
+            Resolved::Post(post, source) => {
+                if source == ViewSource::Cascade {
+                    self.upstream.insert(uri.to_string());
                 }
-                self.bridged.push(uri.to_string());
-                let mut node = LensNode::post(post);
-                if let LensNode::Post { parent_uri: own, .. } = &mut node
-                    && own.is_none()
-                {
-                    *own = parent_uri;
-                }
-                node
+                post
             }
-            Resolved::Gap(gap) => LensNode::gap(uri, parent_uri, gap),
+            Resolved::RecordPost(post) => {
+                self.from_record.insert(uri.to_string());
+                post
+            }
+            Resolved::Gap(gap) => return LensNode::gap(uri, parent_uri, gap),
+        };
+        self.bridged.push(uri.to_string());
+        let mut node = LensNode::post(post);
+        if let LensNode::Post { parent_uri: own, .. } = &mut node
+            && own.is_none()
+        {
+            *own = parent_uri;
         }
+        node
     }
 
     /// The anchor of an empty baseline (§5.15.10 "The anchor comes
@@ -974,6 +1042,20 @@ impl Work<'_> {
         }
     }
 
+    /// `embedWhole` on the post nodes (threadlens-quoted-posts design §2):
+    /// the request named labelers and every scoped answer applied them all;
+    /// the node's view came from a cascade answer of this request; its quote
+    /// card is one [`quote_is_whole`] admits. Run last, after enforcement,
+    /// the reader's labels and the gate, so it reads the views as sent.
+    fn mark_whole(&mut self) {
+        let applied = crate::appview_clients::accept_labelers::current().is_some_and(|scope| scope.all_applied());
+        for node in &mut self.nodes {
+            if let LensNode::Post { uri, post, embed_whole, .. } = node {
+                *embed_whole = applied && self.upstream.contains(uri.as_str()) && !is_private_uri(uri) && quote_is_whole(post, &self.judge);
+            }
+        }
+    }
+
     /// The author pass (design-v4 §8.1): a post built from its record
     /// carries `{did, handle}`. Its author, when not readable, takes the
     /// profile tiers, and a resolved one becomes the batch's
@@ -1065,20 +1147,30 @@ pub async fn get_thread(
         .then(|| listing_call(h, r.req, r.anchor, None));
     let memo = crate::hydration::thread::ThreadMemo::new();
     let collected = h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height, &memo).await?;
-    let mut authors: Vec<String> = collected.as_ref().map(|(tree, _)| named_accounts(tree)).unwrap_or_default().into_iter().collect();
+    let mut authors: Vec<String> = collected.as_ref().map(|(tree, ..)| named_accounts(tree)).unwrap_or_default().into_iter().collect();
     authors.extend(uri_author(r.anchor).map(str::to_string));
     phases.mark("collect");
     judge.baseline(&authors).await?;
     phases.mark("baseline_round");
     let known = Arc::new(judge.known_blocks());
-    let (tree, gate_view) = match collected {
+    // The emit assembly's own branch decides which nodes are upstream
+    // (threadlens-quoted-posts design §4): collect and emit can, in a rare
+    // race, take different branches, and the emit one is what is shown.
+    let (tree, gate_view, source) = match collected {
         Some(_) => match with_known_blocks(Arc::clone(&known), h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height, &memo)).await? {
-            Some((tree, gate)) => (Some(tree), gate),
-            None => (None, None),
+            Some((tree, gate, source)) => (Some(tree), gate, Some(source)),
+            None => (None, None, None),
         },
-        None => (None, None),
+        None => (None, None, None),
     };
     let (nodes, levels, links) = tree.as_ref().map(|tree| flatten(tree, &judge)).unwrap_or_default();
+    // A cascade hit's top-level post views are the answer's: nothing after
+    // `flatten` swaps one for another view.
+    let upstream: HashSet<String> = if source == Some(ViewSource::Cascade) {
+        nodes.iter().filter(|n| matches!(n, LensNode::Post { .. })).map(|n| n.uri().to_string()).collect()
+    } else {
+        HashSet::new()
+    };
     let bridging = judge.bridging();
     let mut work = Work {
         ladder,
@@ -1099,6 +1191,7 @@ pub async fn get_thread(
         anchor_page,
         start: cursor,
         links,
+        upstream,
     };
     phases.mark("emit");
     let attach = if work.nodes.is_empty() { work.anchor_alone().await? } else { true };
@@ -1149,6 +1242,7 @@ pub async fn get_thread(
     if let Some((root, gate)) = thread_gate(h, r.anchor, &work.nodes, gate_view.as_ref(), tree.is_some()).await? {
         apply_gate(h, &mut work.nodes, &root, &gate, r.viewer).await?;
     }
+    work.mark_whole();
     phases.mark("gate");
     let bridging = match (bridging, work.limited) {
         (false, _) => Bridging::Off,
@@ -1374,6 +1468,7 @@ pub async fn resolve(
         anchor_page: None,
         start: None,
         links: HashMap::new(),
+        upstream: HashSet::new(),
     };
     let fetches: Vec<String> = uris
         .iter()
@@ -1399,6 +1494,7 @@ pub async fn resolve(
     work.name_lists();
     super::labelers::add_reader_labels(ladder, req, &mut work.nodes).await;
     resolve_hidden(h, &mut work.nodes, viewer).await?;
+    work.mark_whole();
     let bridging = match (bridging, work.limited) {
         (false, _) => Bridging::Off,
         (true, true) => Bridging::Limited,
@@ -1514,6 +1610,103 @@ mod tests {
         assert_eq!(embed["also"][0], json!({"$type": "app.bsky.embed.record#viewBlocked", "uri": uri(B, "quoted"), "blocked": true, "author": {"did": B, "viewer": {"blockedBy": false}}}));
         assert_eq!(embed["record"]["record"]["embeds"][0]["record"]["author"]["viewer"]["blockedBy"], json!(true));
         assert_eq!(embed["also"][1]["$type"], "app.bsky.embed.record#viewBlocked");
+    }
+
+    /// A post view quoting `record`, as `record#view` or, with `media`, as
+    /// `recordWithMedia#view`.
+    fn quoting(record: Value, media: Option<&str>) -> Value {
+        let embed = match media {
+            None => json!({"$type": "app.bsky.embed.record#view", "record": record}),
+            Some(ty) => json!({"$type": "app.bsky.embed.recordWithMedia#view", "media": {"$type": ty},
+                               "record": {"$type": "app.bsky.embed.record#view", "record": record}}),
+        };
+        json!({"uri": uri(A, "quoting"), "cid": "c", "author": {"did": A}, "record": {"text": "q"}, "embed": embed})
+    }
+
+    fn view_record(did: &str, rkey: &str) -> Value {
+        json!({"$type": "app.bsky.embed.record#viewRecord", "uri": uri(did, rkey), "cid": "c", "author": {"did": did, "handle": "h"}, "value": {"text": "quoted"}})
+    }
+
+    /// T-Q1, T-Q5, T-Q7, T-Q14, T-Q17 (threadlens-quoted-posts design §2):
+    /// which quote cards are whole, each beside the case it differs from.
+    #[tokio::test]
+    async fn which_quote_cards_are_whole() {
+        // A is Clear, B blocked by the viewer, C Undetermined; D was never
+        // judged (the allowance ran out).
+        const D: &str = "did:plc:dddddddddddddddddddddddd";
+        let judge = Judge::vouching(V, &[B], &[], &[A], &[C]);
+        let whole = |post: &Value| quote_is_whole(post, &judge);
+
+        // T-Q1: a Clear author's post, as `record#view` and with each known
+        // media kind.
+        assert!(whole(&quoting(view_record(A, "q"), None)));
+        for media in ["app.bsky.embed.images#view", "app.bsky.embed.external#view", "app.bsky.embed.video#view"] {
+            assert!(whole(&quoting(view_record(A, "q"), Some(media))), "{media}");
+        }
+        // T-Q17: unknown media; no embed; a media-only embed.
+        assert!(!whole(&quoting(view_record(A, "q"), Some("app.bsky.embed.unknown#view"))));
+        assert!(!whole(&json!({"uri": uri(A, "p"), "author": {"did": A}})));
+        assert!(!whole(&json!({"uri": uri(A, "p"), "author": {"did": A}, "embed": {"$type": "app.bsky.embed.images#view", "images": []}})));
+        // T-Q1: a quoted record that quotes again (one level only), at
+        // either shape; T-Q14: also through `recordWithMedia`.
+        for inner in ["app.bsky.embed.record#view", "app.bsky.embed.recordWithMedia#view"] {
+            let mut nested = view_record(A, "q");
+            nested["embeds"] = json!([{"$type": inner, "record": view_record(A, "deeper")}]);
+            assert!(!whole(&quoting(nested.clone(), None)), "{inner}");
+            assert!(!whole(&quoting(nested, Some("app.bsky.embed.images#view"))), "{inner}");
+        }
+        // Media inside the quoted record is fine.
+        let mut with_media = view_record(A, "q");
+        with_media["embeds"] = json!([{"$type": "app.bsky.embed.images#view", "images": []}]);
+        assert!(whole(&quoting(with_media, None)));
+        // T-Q1 / T-Q7: an unjudged author, an Undetermined one.
+        assert!(!whole(&quoting(view_record(D, "q"), None)));
+        assert!(!whole(&quoting(view_record(C, "q"), None)));
+        // T-Q14: an author other than the URI's authority, no `$type`, the
+        // restored marker on the record or its author.
+        let mut other_author = view_record(A, "q");
+        other_author["uri"] = json!(uri(C, "q"));
+        assert!(!whole(&quoting(other_author, None)));
+        let mut untyped = view_record(A, "q");
+        untyped.as_object_mut().expect("object").remove("$type");
+        assert!(!whole(&quoting(untyped, None)));
+        let mut restored = view_record(A, "q");
+        restored["restored"] = json!({"community": "sky", "tier": 1});
+        assert!(!whole(&quoting(restored, None)));
+        let mut restored_author = view_record(A, "q");
+        restored_author["author"]["restored"] = json!({"community": "sky", "tier": 1});
+        assert!(!whole(&quoting(restored_author, None)));
+
+        // T-Q5: `#viewBlocked` and `#viewDetached` as the upstream gave
+        // them; a blocked author's record replaced by enforcement.
+        let blocked = json!({"$type": "app.bsky.embed.record#viewBlocked", "uri": uri(C, "q"), "blocked": true, "author": {"did": C, "viewer": {}}});
+        let detached = json!({"$type": "app.bsky.embed.record#viewDetached", "uri": uri(C, "q"), "detached": true});
+        assert!(whole(&quoting(blocked, None)));
+        assert!(whole(&quoting(detached, Some("app.bsky.embed.images#view"))));
+        let mut replaced = quoting(view_record(B, "q"), None);
+        assert!(!whole(&replaced), "a blocked author's record as it came");
+        enforce_embeds(&mut replaced["embed"], &judge);
+        assert_eq!(replaced["embed"]["record"]["$type"], "app.bsky.embed.record#viewBlocked");
+        assert!(whole(&replaced));
+        // T-Q5 / T-Q17: `#viewNotFound`, upstream or Prism's (a gate-hidden
+        // or private quote), and the cards.
+        let not_found = json!({"$type": "app.bsky.embed.record#viewNotFound", "uri": uri(A, "q"), "notFound": true});
+        assert!(!whole(&quoting(not_found, None)));
+        let cards = [
+            ("app.bsky.feed.defs#generatorView", format!("at://{A}/app.bsky.feed.generator/g")),
+            ("app.bsky.graph.defs#listView", format!("at://{A}/app.bsky.graph.list/l")),
+            ("app.bsky.labeler.defs#labelerView", format!("at://{A}/app.bsky.labeler.service/self")),
+            ("app.bsky.graph.defs#starterPackViewBasic", format!("at://{A}/app.bsky.graph.starterpack/s")),
+        ];
+        for (ty, card) in cards {
+            assert!(!whole(&quoting(json!({"$type": ty, "uri": card, "creator": {"did": A, "handle": "h"}}), None)), "{ty}");
+        }
+        // §2.4: a private quoted URI, even shaped as a record.
+        let mut private = view_record(A, "q");
+        private["uri"] = json!(format!("at://{A}/tools.kryphocron.feed.postPrivate/q"));
+        assert!(!whole(&quoting(private, None)));
+        let private_blocked = json!({"$type": "app.bsky.embed.record#viewBlocked", "uri": format!("at://{C}/tools.kryphocron.feed.postPrivate/q"), "blocked": true});
+        assert!(!whole(&quoting(private_blocked, None)));
     }
 
     #[test]

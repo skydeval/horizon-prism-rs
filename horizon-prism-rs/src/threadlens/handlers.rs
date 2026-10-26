@@ -128,8 +128,9 @@ async fn gate(s: &ThreadLensState, headers: &HeaderMap, peer: SocketAddr, method
 }
 
 /// The response's `atproto-content-labelers`, for a request that named its
-/// labelers (threadlens-hydration design §3.6 (b)): those an upstream said
-/// it applied, and Prism's own when named. Absent otherwise.
+/// labelers (threadlens-hydration design §3.6 (b)): those every scoped
+/// upstream answer said it applied (threadlens-quoted-posts design §3), and
+/// Prism's own when named. Absent otherwise.
 fn content_labelers(scope: Option<&LabelerScope>) -> HeaderMap {
     let mut out = HeaderMap::new();
     if let Some(value) = scope.and_then(LabelerScope::content_labelers) {
@@ -192,7 +193,7 @@ pub async fn get_thread(
         depth,
         parent_height,
     };
-    let scope = AcceptLabelers::from_headers(&headers).map(LabelerScope::new);
+    let scope = AcceptLabelers::from_headers(&headers).map(|accept| LabelerScope::new(accept, s.ladder.hydrator().labeler_did()));
     let thread = with_labelers(scope.clone(), assemble(&s.ladder, &s.cfg, &s.cursor_key, request, cursor)).await?;
     Ok((content_labelers(scope.as_deref()), Json(lens_thread(&input.anchor, &thread.nodes, thread.bridging, viewer.hydrate))))
 }
@@ -211,7 +212,7 @@ pub async fn resolve(
     if !input.uris.iter().all(|u| at_uri(u)) {
         return Err(XrpcError::invalid("Error: uris must be at-uris"));
     }
-    let scope = AcceptLabelers::from_headers(&headers).map(LabelerScope::new);
+    let scope = AcceptLabelers::from_headers(&headers).map(|accept| LabelerScope::new(accept, s.ladder.hydrator().labeler_did()));
     let resolved = with_labelers(scope.clone(), resolve_each(&s.ladder, &s.cfg, &s.cursor_key, &viewer, &req, &input.uris)).await?;
     Ok((content_labelers(scope.as_deref()), Json(lens_items(&resolved.nodes, resolved.bridging, viewer.hydrate))))
 }

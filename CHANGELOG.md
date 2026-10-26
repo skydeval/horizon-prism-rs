@@ -14,6 +14,18 @@ no tracker references.
 
 ### Added
 
+- **Thread Lens marks quote posts whose card is whole.** A post node now
+  carries `embedWhole: true` when its quote card is what the reader's own
+  AppView would show (but for the reader's mutes, which the client applies):
+  the post view came from an upstream AppView's answer for this request, the
+  quoted post's author has no block with the reader as Farsight vouches, the
+  quoted post quotes nothing itself, and every labeler the reader accepts
+  was applied. Clients that skip their own re-read for whole views can now
+  skip it for these quote posts too. Posts Horizon-Prism builds itself, cards
+  for feeds, lists, labelers and starter packs, and quotes of posts the
+  upstream could not find are not marked. New metric
+  `threadlens_labelers_unapplied_total{network}` counts upstream answers that
+  left out a labeler the reader accepted.
 - **Refract actor search**: `app.nearhorizon.refract.searchActorsTypeahead
   {q, limit}` and `searchActors {q, limit, cursor}` find restored accounts by
   the start of their handle or display name (case and diacritics ignored),
@@ -33,6 +45,13 @@ no tracker references.
 
 ### Changed
 
+- **Thread Lens names a labeler as applied only when every upstream answer
+  applied it.** `atproto-content-labelers` on `getThread` and `resolve` used
+  to name a labeler if any upstream answer of the request said it applied
+  it; now every answer has to (Horizon-Prism's own labeler is still always
+  named when accepted). A thread served from the record-level fallback no
+  longer counts as fetched with the reader's labelers, so its posts get the
+  reader's labels from the label read, as posts Horizon-Prism builds do.
 - **Thread Lens says replies are allowed on threads without a threadgate.**
   A thread read from the upstream AppView whose answer names no threadgate
   now carries `viewer.replyDisabled: false` on its posts, instead of leaving

@@ -262,8 +262,10 @@ impl Call<'_> {
             other => return other.invoke(client).await,
         };
         answer.map(|(response, headers)| {
-            if response.is_success() {
-                scope.record_applied(&headers);
+            // A network that stops honouring the header shows up here
+            // (threadlens-quoted-posts design §3).
+            if response.is_success() && scope.record_applied(&headers) {
+                metrics::counter!(crate::appview_clients::accept_labelers::METRIC_LABELERS_UNAPPLIED, "network" => client.network().to_string()).increment(1);
             }
             response
         })

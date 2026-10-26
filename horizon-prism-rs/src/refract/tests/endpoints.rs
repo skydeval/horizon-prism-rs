@@ -378,7 +378,7 @@ impl crate::hydration::UpstreamSource for SlowProfiles {
     async fn posts(&self, _req: &crate::xrpc::pools::Requester, _uris: &[String]) -> Vec<Value> {
         Vec::new()
     }
-    async fn post_thread(&self, _req: &crate::xrpc::pools::Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<Value> {
+    async fn post_thread(&self, _req: &crate::xrpc::pools::Requester, _uri: &str, _depth: u32, _parent_height: u32) -> Option<(Value, crate::hydration::upstream::ViewSource)> {
         None
     }
     async fn author_feed(&self, _req: &crate::xrpc::pools::Requester, _actor: &str, _limit: u32, _cursor: Option<&str>, _filter: &str) -> Option<Value> {

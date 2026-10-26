@@ -30,6 +30,10 @@
         "hiddenByThreadgate": {
           "type": "boolean",
           "description": "Present and true when the thread's root author hid this post: its URI is in the hiddenReplies of the root's threadgate, and the caller is not its author. The same meaning as app.bsky.unspecced.defs#threadItemPost.hiddenByThreadgate. The flag is all a node carries of the gate; only a root post node's own post view keeps its threadgate, as every post view does. A client collapses such a reply, with what is beneath it, as stock does for hidden replies; a flagged anchor or parent is shown with a notice. Flags from several responses for one thread are combined: a response without the flag never clears it."
+        },
+        "embedWhole": {
+          "type": "boolean",
+          "description": "Present and true when the post's quote card (embed.record, or embed.record.record for recordWithMedia) is whole: what the caller's own AppView would show, except for the caller's mutes, which the client applies to the quoted author itself. Set only when the request carried atproto-accept-labelers and every upstream answer of the request applied every labeler it names (a labeler the upstream does not recognise counts as not applied); the post view is an upstream AppView's answer fetched for this request (not built by this server, nor from a record or a cache); and the card is a viewRecord by a quoted author this server could check has no block with the caller, which quotes nothing itself, or a viewBlocked or viewDetached. Never for a viewNotFound, a feed, list, labeler or starter-pack card, or with recordWithMedia media other than images, external or video. Without Farsight no post is marked. Absent says nothing: re-read the post as before."
         }
       }
     },
