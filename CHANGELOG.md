@@ -85,8 +85,8 @@ no tracker references.
 
 ### Fixed
 
-- **Authors' self-labels now show on posts and profiles.** A post's or
-  profile's own content warnings (`com.atproto.label.defs#selfLabels` in the
+- **Authors' self-labels now show on posts, profiles and cards.** A post's,
+  profile's, or feed/list/labeler/starter-pack card's own content warnings (`com.atproto.label.defs#selfLabels` in the
   record, e.g. nudity or porn) are now in the view's `labels` with `src` the
   author, as Bluesky's AppView shows them; before, prism removed them from
   upstream views and never added them to its own, so clients that moderate

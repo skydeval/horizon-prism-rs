@@ -333,7 +333,9 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
             } else if is_profile_view(m) {
                 m.get("did").and_then(Value::as_str).map(str::to_string)
             } else {
-                None
+                // A feed, list, labeler or starter-pack card: its creator's
+                // self-labels are its own, as on a post.
+                m.get("creator").and_then(|c| c.get("did")).and_then(Value::as_str).map(str::to_string)
             };
             let kept: Vec<Value> = match m.remove("labels") {
                 Some(Value::Array(labels)) => labels
@@ -561,6 +563,27 @@ mod tests {
         let mut sent = json!({"posts": [post(uri, Some("hi"), vec![own, label("x")])]});
         normalize_upstream(&mut sent, &Overlay::default());
         assert_eq!(vals(&sent["posts"][0]), Some(vec!["nudity".into()]));
+    }
+
+    /// Self-labels on cards (skydeval 2026-10-26): a feed, list, labeler or
+    /// starter-pack view keeps the labels its creator set on it (`src` the
+    /// creator) and loses every other upstream label, top level and quoted.
+    #[test]
+    fn card_views_keep_their_creators_self_labels() {
+        let creator = json!({"did": "did:plc:maker", "handle": "m.example"});
+        let own = |uri: &str| json!({"src": "did:plc:maker", "uri": uri, "val": "porn", "cts": "c"});
+        let list = "at://did:plc:maker/app.bsky.graph.list/1";
+        let feed = "at://did:plc:maker/app.bsky.feed.generator/f";
+        let mut v = json!({
+            "list": {"uri": list, "cid": "c", "name": "L", "creator": creator, "labels": [own(list), label("spam")]},
+            "post": post("at://did:plc:author/app.bsky.feed.post/1", Some("q"), vec![])
+        });
+        v["post"]["embed"] = json!({"$type": "app.bsky.embed.record#view",
+            "record": {"$type": "app.bsky.feed.defs#generatorView", "uri": feed, "cid": "c", "did": "did:web:feed.example",
+                       "displayName": "F", "creator": creator, "labels": [own(feed), label("x")], "indexedAt": "2026-01-01T00:00:00Z"}});
+        normalize_upstream(&mut v, &Overlay::default());
+        assert_eq!(v["list"]["labels"], json!([own(list)]));
+        assert_eq!(v["post"]["embed"]["record"]["labels"], json!([own(feed)]));
     }
 
     /// B-73: the list view behind a local `blockingByList` keeps its labels
