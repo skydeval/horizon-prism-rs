@@ -153,6 +153,12 @@ no tracker references.
 
 ### Fixed
 
+- **Self-labels always carry `cts`.** A self-label on a record with no
+  `createdAt` (some profile records have none) went out without `cts`, which
+  `com.atproto.label.defs#label` requires, so strict clients refused the
+  whole view; in a private thread the reply's parent disappeared. `cts` is
+  now the record's `createdAt`, else its indexed time (as Bluesky's AppView
+  does), else the Unix epoch.
 - **Authors' self-labels now show on posts, profiles and cards.** A post's,
   profile's, or feed/list/labeler/starter-pack card's own content warnings (`com.atproto.label.defs#selfLabels` in the
   record, e.g. nudity or porn) are now in the view's `labels` with `src` the

@@ -173,7 +173,13 @@ impl ProfileContext {
         v.insert("viewer".into(), viewer);
         let mut labels = self.labels.get(did).cloned().unwrap_or_default();
         let profile_uri = format!("at://{did}/app.bsky.actor.profile/self");
-        super::normalize::add_missing_labels(&mut labels, super::normalize::self_labels(row.and_then(|r| r.profile_record.as_ref()), &profile_uri, None, did));
+        super::normalize::add_missing_labels(&mut labels, super::normalize::self_labels(
+            row.and_then(|r| r.profile_record.as_ref()),
+            &profile_uri,
+            None,
+            did,
+            row.map(|r| ts(r.indexed_at)).as_deref(),
+        ));
         v.insert("labels".into(), Value::Array(labels));
         if let Some(m) = self.markers.get(did) {
             v.insert("restored".into(), m.clone());

@@ -88,12 +88,16 @@ pub struct Overlay {
 /// `src` the record's author, `uri` and `cid` the record's, `cts` its
 /// `createdAt`. Clients moderate from a view's `labels` only, so a
 /// self-label that is only in the record warns no one.
-pub(crate) fn self_labels(record: Option<&Value>, uri: &str, cid: Option<&str>, author: &str) -> Vec<Value> {
+///
+/// `cts` is required on a label, so a record with no `createdAt` (a profile
+/// may have none) takes `indexed_at`, as Bluesky's AppView does, and the
+/// Unix epoch when neither is known.
+pub(crate) fn self_labels(record: Option<&Value>, uri: &str, cid: Option<&str>, author: &str, indexed_at: Option<&str>) -> Vec<Value> {
     let Some(record) = record else {
         return Vec::new();
     };
     let values = record.pointer("/labels/values").and_then(Value::as_array);
-    let cts = record.get("createdAt").and_then(Value::as_str);
+    let cts = record.get("createdAt").and_then(Value::as_str).or(indexed_at).unwrap_or(EPOCH_CTS);
     values
         .into_iter()
         .flatten()
@@ -104,13 +108,15 @@ pub(crate) fn self_labels(record: Option<&Value>, uri: &str, cid: Option<&str>, 
             if let Some(cid) = cid {
                 label["cid"] = json!(cid);
             }
-            if let Some(cts) = cts {
-                label["cts"] = json!(cts);
-            }
+            label["cts"] = json!(cts);
             label
         })
         .collect()
 }
+
+/// A self-label's `cts` when neither the record's `createdAt` nor an
+/// indexed time is known.
+const EPOCH_CTS: &str = "1970-01-01T00:00:00.000Z";
 
 /// Add `extra` to `labels`, without repeats.
 pub(crate) fn add_missing_labels(labels: &mut Vec<Value>, extra: Vec<Value>) {
@@ -362,6 +368,7 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
                     uri,
                     m.get("cid").and_then(Value::as_str),
                     subject_author.as_deref().unwrap_or_default(),
+                    m.get("indexedAt").and_then(Value::as_str),
                 );
                 if let Some(mut labels) = merged_labels(overlay.labels.get(uri), &kept) {
                     add_missing_labels(&mut labels, own);
@@ -563,6 +570,21 @@ mod tests {
         let mut sent = json!({"posts": [post(uri, Some("hi"), vec![own, label("x")])]});
         normalize_upstream(&mut sent, &Overlay::default());
         assert_eq!(vals(&sent["posts"][0]), Some(vec!["nudity".into()]));
+    }
+
+    /// A self-label always carries `cts` (2026-10-27): a profile record with
+    /// no `createdAt` made a label strict clients refused, and a private
+    /// thread lost its parent. The record's `createdAt`, else the indexed
+    /// time, else the epoch.
+    #[test]
+    fn self_labels_always_carry_cts() {
+        let uri = "at://did:plc:jane/app.bsky.actor.profile/self";
+        let no_date = json!({"labels": {"values": [{"val": "!no-unauthenticated"}]}});
+        let dated = json!({"createdAt": "2026-01-02T00:00:00.000Z", "labels": {"values": [{"val": "!no-unauthenticated"}]}});
+        let cts = |record: &Value, indexed: Option<&str>| self_labels(Some(record), uri, None, "did:plc:jane", indexed)[0]["cts"].clone();
+        assert_eq!(cts(&dated, Some("2026-05-05T00:00:00.000Z")), json!("2026-01-02T00:00:00.000Z"));
+        assert_eq!(cts(&no_date, Some("2026-05-05T00:00:00.000Z")), json!("2026-05-05T00:00:00.000Z"));
+        assert_eq!(cts(&no_date, None), json!(EPOCH_CTS));
     }
 
     /// Self-labels on cards (skydeval 2026-10-26): a feed, list, labeler or

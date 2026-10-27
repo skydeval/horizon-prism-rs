@@ -155,10 +155,14 @@ impl PostContext {
         if let Some(n) = self.bookmark_counts.get(uri) {
             v.insert("bookmarkCount".into(), json!(n));
         }
-        v.insert("indexedAt".into(), json!(ts(self.shown_indexed_at(row))));
+        let indexed_at = ts(self.shown_indexed_at(row));
+        v.insert("indexedAt".into(), json!(indexed_at));
         v.insert("viewer".into(), self.viewers.get(uri).cloned().unwrap_or_else(|| json!({})));
         let mut labels = self.labels.get(uri).cloned().unwrap_or_default();
-        super::normalize::add_missing_labels(&mut labels, super::normalize::self_labels(Some(&row.record), uri, Some(&row.cid), &row.author_did));
+        super::normalize::add_missing_labels(
+            &mut labels,
+            super::normalize::self_labels(Some(&row.record), uri, Some(&row.cid), &row.author_did, Some(&indexed_at)),
+        );
         v.insert("labels".into(), Value::Array(labels));
         if let Some(gate) = self.threadgates.get(uri) {
             v.insert("threadgate".into(), gate.clone());
@@ -197,7 +201,10 @@ impl PostContext {
         v.insert("author".into(), self.profiles.view(&row.author_did, ProfileKind::Basic));
         v.insert("value".into(), row.record.clone());
         let mut labels = self.labels.get(uri).cloned().unwrap_or_default();
-        super::normalize::add_missing_labels(&mut labels, super::normalize::self_labels(Some(&row.record), uri, Some(&row.cid), &row.author_did));
+        super::normalize::add_missing_labels(
+            &mut labels,
+            super::normalize::self_labels(Some(&row.record), uri, Some(&row.cid), &row.author_did, Some(&ts(self.shown_indexed_at(row)))),
+        );
         v.insert("labels".into(), Value::Array(labels));
         v.insert("likeCount".into(), json!(c.and_then(|c| c.likes).or(row.like_count).unwrap_or(0)));
         v.insert("repostCount".into(), json!(c.and_then(|c| c.reposts).or(row.repost_count).unwrap_or(0)));
