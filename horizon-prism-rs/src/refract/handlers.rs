@@ -173,7 +173,14 @@ pub async fn gate(s: &RefractState, headers: &HeaderMap, peer: SocketAddr, metho
         return Err(not_enabled());
     }
     let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let caller = authenticate(&s.app, authorization, method).await?;
+    let caller = match authenticate(&s.app, authorization, method).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Debug only: why a refract call was refused.
+            tracing::debug!(event = "refract_gate_refused", method, has_token = authorization.is_some(), error = ?e, "refract call refused");
+            return Err(e);
+        }
+    };
     let ip = request_ip(&s.app, headers, peer);
     s.app.limits.charge(method, Family::Refract, Some(&caller.did), ip)?;
     let row: Option<(bool, bool)> = sqlx::query_as(crate::aggregations::enroll::MEMBER_READINESS_SQL)
@@ -853,6 +860,27 @@ pub async fn fill(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<
     .await;
     let result = visitor_state(&s, &caller, result).await;
     metrics::counter!(METRIC_READS, "method" => "fill", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
+    // Debug only (off at the default `info`): what was asked and answered,
+    // for tracing one client's card against the wire.
+    if tracing::enabled!(tracing::Level::DEBUG)
+        && let Ok(Json(emit)) = &result
+    {
+        use serde_json::Value as J;
+        let body = emit.inner();
+        let uris_of = |key: &str| -> Vec<String> {
+            body.get(key).and_then(J::as_array).into_iter().flatten().filter_map(|v| v.get("uri").and_then(J::as_str).map(str::to_string)).collect()
+        };
+        tracing::debug!(
+            event = "refract_fill_answer",
+            caller = %caller.did,
+            asked_dids = ?dids,
+            asked_uris = ?uris,
+            posts = ?uris_of("posts"),
+            pending = %body.get("pending").cloned().unwrap_or(J::Null),
+            withheld = %body.get("withheld").cloned().unwrap_or(J::Null),
+            "refract fill answered"
+        );
+    }
     result
 }
 
