@@ -14,6 +14,9 @@ no tracker references.
 
 ### Added
 
+- **Refract community list**: `app.nearhorizon.refract.getCommunities`
+  lists the enabled communities and their PDS host patterns, so a client can
+  skip `fill` for an author no listed community could host.
 - **Thread Lens reads the thread outline when it is on.** With
   `[thread_outline]` enabled, fresh, holding the whole thread, and Farsight
   configured, `getThread` takes the parents and replies from the outline:

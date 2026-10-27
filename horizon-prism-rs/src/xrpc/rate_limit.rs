@@ -285,6 +285,7 @@ pub const SERVED: &[Served] = &[
     served("app.nearhorizon.refract.getAuthorReposts", Family::Refract, false),
     served("app.nearhorizon.refract.searchActors", Family::Refract, false),
     served("app.nearhorizon.refract.searchActorsTypeahead", Family::Refract, false),
+    served("app.nearhorizon.refract.getCommunities", Family::Refract, false),
     // Pronouns and plural systems (plural-pronouns design §3): per IP
     // signed out, per DID signed in.
     served("app.nearhorizon.plural.getRecords", Family::Plural, true),

@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-use super::harness::{Harness, OTHER, SUBJECT, tier1};
+use super::harness::{Harness, OTHER, SUBJECT, tier1, tier2};
 use crate::aggregations::ScopeSets;
 use crate::hydration::testing::{actor, exec, post, test_config};
 use crate::hydration::{HydrationConfig, Hydrator, NoUpstream, ReadCache};
@@ -111,6 +111,60 @@ async fn the_gate() {
     h.live.update(|v| v.refract_enabled = false);
     let (status, body) = call(&base, FILL, "", None).await;
     assert_eq!((status, body["error"].as_str()), (400, Some("NotEnabled")));
+    db.drop_db().await;
+}
+
+/// `getCommunities`: the enabled communities in list order, their patterns
+/// lowercased in list order, a disabled one left out, `max-age=3600`; the
+/// gate's `AuthRequired` with no token and `NotEnabled` while off.
+#[tokio::test]
+async fn get_communities_lists_enabled_patterns() {
+    use crate::refract::handlers::{COMMUNITIES_CACHE, GET_COMMUNITIES};
+    let Some(db) = fresh_db("refract_endpoint_communities").await else {
+        return;
+    };
+    let mut sky = tier1();
+    sky.pds_patterns = vec!["*.Sky.Example".into(), "SKY.example".into()];
+    let mut off = tier2();
+    off.name = "off".into();
+    off.pds_patterns = vec!["*.off.example".into()];
+    off.enabled = false;
+    let mut north = tier2();
+    north.pds_patterns = vec!["127.0.0.1".into()];
+    let h = Harness::new(&db.pool, ScopeSets::default(), vec![sky, off, north]).await;
+    let base = serve(&h, None).await;
+    let r = reqwest::Client::new().get(format!("{base}/xrpc/{GET_COMMUNITIES}")).send().await.expect("request");
+    assert_eq!(r.status().as_u16(), 401, "the gate: a token is needed");
+    let token = mint(&signing_key(3), VISITOR, &format!("did:web:{AUDIENCE_HOST}"), Some(GET_COMMUNITIES));
+    let r = reqwest::Client::new()
+        .get(format!("{base}/xrpc/{GET_COMMUNITIES}"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.headers().get("cache-control").and_then(|v| v.to_str().ok()), Some(COMMUNITIES_CACHE));
+    let body: Value = r.json().await.expect("json");
+    assert_eq!(
+        body,
+        json!({"communities": [
+            {"name": "sky", "pdsPatterns": ["*.sky.example", "sky.example"]},
+            {"name": "north", "pdsPatterns": ["127.0.0.1"]},
+        ]}),
+    );
+    // A community disabled live is left out at once.
+    h.live.update(|v| {
+        for c in &mut v.refract_communities {
+            if c.name == "sky" {
+                c.enabled = false;
+            }
+        }
+    });
+    let (status, body) = call(&base, GET_COMMUNITIES, "", None).await;
+    assert_eq!((status, body), (200, json!({"communities": [{"name": "north", "pdsPatterns": ["127.0.0.1"]}]})));
+    h.live.update(|v| v.refract_enabled = false);
+    let (status, body) = call(&base, GET_COMMUNITIES, "", None).await;
+    assert_eq!((status, body["error"].as_str()), (400, Some("NotEnabled")), "{body}");
     db.drop_db().await;
 }
 

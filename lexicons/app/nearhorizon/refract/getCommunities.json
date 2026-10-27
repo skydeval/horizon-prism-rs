@@ -1,0 +1,29 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.refract.getCommunities",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "The communities this AppView lists for Refract and has enabled, in its list order, each with the PDS host patterns that decide whether it hosts an account, lowercased. An account whose PDS host matches none of them is never restored, so a client can skip asking app.nearhorizon.refract.fill about it. A pattern is a host name, or `*.` and a domain, which matches any host under that domain but not the domain itself. Answered with `Cache-Control: max-age=3600`. Any signed-in caller.",
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["communities"],
+          "properties": {
+            "communities": { "type": "array", "items": { "type": "ref", "ref": "#community" } }
+          }
+        }
+      },
+      "errors": [{ "name": "NotEnabled" }, { "name": "AuthRequired" }, { "name": "InvalidToken" }, { "name": "RateLimitExceeded" }]
+    },
+    "community": {
+      "type": "object",
+      "required": ["name", "pdsPatterns"],
+      "properties": {
+        "name": { "type": "string", "description": "The community's name, as restored views carry it." },
+        "pdsPatterns": { "type": "array", "items": { "type": "string" }, "description": "PDS host patterns, lowercased, in the order this AppView lists them." }
+      }
+    }
+  }
+}

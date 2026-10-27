@@ -64,6 +64,11 @@ pub const GET_UNREAD_COUNT: &str = "app.nearhorizon.refract.getUnreadCount";
 pub const GET_AUTHOR_REPOSTS: &str = "app.nearhorizon.refract.getAuthorReposts";
 pub const SEARCH_ACTORS: &str = "app.nearhorizon.refract.searchActors";
 pub const SEARCH_ACTORS_TYPEAHEAD: &str = "app.nearhorizon.refract.searchActorsTypeahead";
+pub const GET_COMMUNITIES: &str = "app.nearhorizon.refract.getCommunities";
+
+/// `getCommunities`' `Cache-Control`: the list changes only when the
+/// operator edits it.
+pub const COMMUNITIES_CACHE: &str = "max-age=3600";
 
 /// `fill` takes at most this many DIDs and as many URIs.
 pub const FILL_MAX: usize = 25;
@@ -104,6 +109,7 @@ pub fn router(state: RefractState) -> Router {
         .route(&crate::admin::usage::path("refract", GET_AUTHOR_REPOSTS), get(get_author_reposts))
         .route(&crate::admin::usage::path("refract", SEARCH_ACTORS), get(search_actors))
         .route(&crate::admin::usage::path("refract", SEARCH_ACTORS_TYPEAHEAD), get(search_actors_typeahead))
+        .route(&crate::admin::usage::path("refract", GET_COMMUNITIES), get(get_communities))
         .route_layer(axum::middleware::from_fn(time_read))
         .with_state(state)
 }
@@ -1091,6 +1097,27 @@ pub async fn list_notifications(State(s): State<RefractState>, ConnectInfo(peer)
     let result = served_as(&caller, result);
     metrics::counter!(METRIC_READS, "method" => "listNotifications", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
     result
+}
+
+/// `refract.getCommunities`: the enabled communities, in list order, with
+/// the PDS host patterns their `home` match uses, lowercased, so a client
+/// can tell whether an author's PDS could be on one before asking `fill`.
+pub async fn get_communities(State(s): State<RefractState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Result<axum::response::Response, XrpcError> {
+    use axum::response::IntoResponse;
+    let result = gate(&s, &headers, peer, GET_COMMUNITIES).await;
+    metrics::counter!(METRIC_READS, "method" => "getCommunities", "outcome" => if result.is_ok() { "ok" } else { "error" }).increment(1);
+    result?;
+    let communities: Vec<Value> = s
+        .refract
+        .communities()
+        .all()
+        .iter()
+        .filter(|c| c.enabled)
+        .map(|c| serde_json::json!({"name": c.name, "pdsPatterns": c.pds_patterns.iter().map(|p| p.to_ascii_lowercase()).collect::<Vec<_>>()}))
+        .collect();
+    let mut response = Json(serde_json::json!({ "communities": communities })).into_response();
+    response.headers_mut().insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static(COMMUNITIES_CACHE));
+    Ok(response)
 }
 
 /// `refract.getUnreadCount` (§5.3, §7.1): a non-member counts 0.

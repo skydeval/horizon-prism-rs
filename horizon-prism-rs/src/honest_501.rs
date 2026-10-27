@@ -347,6 +347,7 @@ pub const KEPT_METHODS: &[&str] = &[
     "app.nearhorizon.refract.getAuthorReposts",
     "app.nearhorizon.refract.searchActors",
     "app.nearhorizon.refract.searchActorsTypeahead",
+    "app.nearhorizon.refract.getCommunities",
     // Pronouns and plural systems (plural-pronouns design §2.8): always
     // routed; `plural.enabled = false` is the handlers' own 501.
     "app.nearhorizon.plural.getRecords",
@@ -515,20 +516,20 @@ mod tests {
     /// S11's running totals, private notification preferences' two,
     /// private activity subscriptions' two, private appearance's two and
     /// its retention's one): every served method is in exactly one of the
-    /// two sets, 56 public and 61 kept (Refract's ten, the two plural
-    /// reads and the five system-accounts methods included), 117 served. Their verbs are checked
+    /// two sets, 56 public and 62 kept (Refract's eleven, the two plural
+    /// reads and the five system-accounts methods included), 118 served. Their verbs are checked
     /// against the routes in `xrpc::router`'s and `private_tier`'s tests.
     #[test]
     fn public_and_kept_methods_classify_every_served_method() {
         use crate::xrpc::rate_limit::SERVED;
 
-        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 61));
+        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 62));
         let public: BTreeSet<&str> = PUBLIC_METHODS.iter().map(|m| m.nsid).collect();
         let kept: BTreeSet<&str> = KEPT_METHODS.iter().copied().collect();
-        assert_eq!((public.len(), kept.len()), (56, 61), "no NSID twice");
+        assert_eq!((public.len(), kept.len()), (56, 62), "no NSID twice");
         assert!(public.is_disjoint(&kept));
         let served: BTreeSet<&str> = SERVED.iter().map(|s| s.nsid).collect();
-        assert_eq!(served.len(), 117);
+        assert_eq!(served.len(), 118);
         // Private posting's methods are kept, in the `private` family.
         for &(nsid, _) in PRIVATE_POSTING_METHODS {
             assert!(kept.contains(nsid), "{nsid}");
