@@ -621,6 +621,7 @@ fn state(h: Hydrator, l: Ladder, access: ThreadLensAccess) -> ThreadLensState {
         ladder: l,
         cfg: ThreadLensConfig { access, ..ThreadLensConfig::default() },
         cursor_key: CursorKey::new(&[9; 32]),
+        outline: None,
     }
 }
 
@@ -1507,4 +1508,5 @@ async fn the_readers_labelers_label_the_lens_views() {
 }
 
 mod handle_anchor;
+mod outline;
 mod quoted;

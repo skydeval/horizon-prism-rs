@@ -46,7 +46,7 @@ use serde_json::Value;
 
 use super::cursor::CursorKey;
 use super::ladder::Ladder;
-use super::thread::{Request, get_thread as assemble, resolve as resolve_each};
+use super::thread::{Request, get_thread_outlined as assemble, resolve as resolve_each};
 use crate::appview_clients::accept_labelers::{AcceptLabelers, CONTENT_LABELERS, LabelerScope, with_labelers};
 use crate::config::{ThreadLensAccess, ThreadLensConfig};
 use crate::db::locks::uri_author;
@@ -80,6 +80,9 @@ pub struct ThreadLensState {
     pub live: crate::admin::settings::LiveSettings,
     /// Seals the paging cursors.
     pub cursor_key: CursorKey,
+    /// The thread outline's reading side, when `[thread_outline]` is on
+    /// (thread outline design §5).
+    pub outline: Option<super::outline::Reader>,
 }
 
 /// The Thread Lens routes, merged into the app by `serve`.
@@ -238,7 +241,7 @@ pub async fn get_thread(
         parent_height,
     };
     let scope = AcceptLabelers::from_headers(&headers).map(|accept| LabelerScope::new(accept, s.ladder.hydrator().labeler_did()));
-    let thread = with_labelers(scope.clone(), assemble(&s.ladder, &s.cfg, &s.cursor_key, request, cursor)).await?;
+    let thread = with_labelers(scope.clone(), assemble(&s.ladder, &s.cfg, &s.cursor_key, s.outline.as_ref(), request, cursor)).await?;
     Ok((content_labelers(scope.as_deref()), Json(lens_thread(&anchor, &thread.nodes, thread.bridging, viewer.hydrate))))
 }
 

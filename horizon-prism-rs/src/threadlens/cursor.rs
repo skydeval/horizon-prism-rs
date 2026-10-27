@@ -26,6 +26,12 @@ pub enum Position {
     /// is the listing's start.
     #[serde(rename = "c")]
     Listed { cursor: Option<String> },
+    /// In the outline phase (thread outline design §5.3.4), after the
+    /// outline-only reply at this `(created_at, uri)`; an empty `uri` is
+    /// the phase's start. A process without this variant refuses such a
+    /// cursor with a 400.
+    #[serde(rename = "o")]
+    Outline { at: DateTime<Utc>, uri: String },
 }
 
 #[cfg(test)]
@@ -42,7 +48,8 @@ mod tests {
             uri: "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kreply".into(),
         };
         let listed = Position::Listed { cursor: Some("abc".into()) };
-        for position in [local, listed, Position::Listed { cursor: None }] {
+        let outline = Position::Outline { at: DateTime::UNIX_EPOCH, uri: "at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kreply".into() };
+        for position in [local, listed, Position::Listed { cursor: None }, outline] {
             let cursor = key.seal(NODE, &position).expect("sealed");
             assert!(cursor.len() <= MAX_CURSOR_LEN && !cursor.contains("3kreply"));
             assert_eq!(key.open(NODE, &cursor), Some(position.clone()));

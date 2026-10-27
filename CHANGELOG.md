@@ -14,14 +14,35 @@ no tracker references.
 
 ### Added
 
+- **Thread Lens reads the thread outline when it is on.** With
+  `[thread_outline]` enabled, fresh, holding the whole thread, and Farsight
+  configured, `getThread` takes the parents and replies from the outline:
+  their authors are judged in one round and the posts fetched in one batch,
+  and Constellation is read only for the anchor's first page of replies, as
+  a cross-check. What readers can see change: under each node, stored
+  replies still come first, and the other replies follow oldest first (by
+  `createdAt`, then URI) instead of in Constellation's order; a reply none
+  of the operator's relays delivered is not found, unless Constellation
+  lists it under the anchor, in which case the request falls back to
+  Constellation; and the parent chain is bounded by `parentHeight` alone.
+  Verdicts, the baseline and the block rules are unchanged. Anything the
+  outline cannot vouch for (a thread older than its coverage, a gap it
+  knows of, a stored reply it lacks, a tree over `max_tree` or a thread
+  over `max_thread`) takes the earlier path for that request. A
+  `moreReplies` cursor can now point into the outline's replies; an older
+  release refuses such a cursor with a 400, and the client restarts that
+  node. New metrics `threadlens_outline_total{use}` (`tree`, `absent`,
+  `incomplete`, `hole`, `too_big`, `stale`, `bridging_off`, `crosscheck`,
+  `off`, `error`: the reads failed or took over 300 ms past the baseline) and `outline_crosscheck_total{result}` (`match`, `miss`,
+  `pending`, `late`); `threadlens_phase_seconds` gains an `outline` phase.
 - **Thread outline index** (`[thread_outline]`, off by default). When on,
   Horizon-Prism records the reply structure of every public post the
   firehose delivers: author, record key, parent, root, time and rev, and a
   mark when deleted, with no text. It is network-wide post ingest, for
   every author and whatever `public_scope` says (about 3 million posts a
   day), so it costs about 17 GB of disk at the default 30-day window;
-  older rows are deleted by the daily retention run. Thread Lens will use
-  it to know a thread's shape up front; this release only builds it.
+  older rows are deleted by the daily retention run. Thread Lens uses it
+  to know a thread's shape up front (above).
   Ingest never waits on it: if its writer falls behind, it catches up from
   the stream, and what the stream no longer holds restarts its coverage.
   One process writes it at a time. Migration 0050 adds its tables, so this

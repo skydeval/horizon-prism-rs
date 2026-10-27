@@ -89,7 +89,7 @@ The Farsight fallback sends a member's DID and the accounts on their page to ano
 
 ## Thread outline
 
-`[thread_outline]` keeps the reply structure of every public post the firehose delivers: author, record key, parent, root, time and rev, and a mark when deleted. It keeps no text. Thread Lens uses it to know a thread's shape before it fetches posts.
+`[thread_outline]` keeps the reply structure of every public post the firehose delivers: author, record key, parent, root, time and rev, and a mark when deleted. It keeps no text. Thread Lens uses it to know a thread's shape before it fetches posts: when the outline is fresh, holds the whole thread and Farsight is configured, a `getThread` reads the parents and replies from it, judges their authors in one round and fetches them in one batch, instead of listing each node's replies from Constellation level by level. Anything it cannot vouch for (a thread older than its coverage, a gap it knows of, a reply Constellation lists that it lacks) falls back to Constellation for that request.
 
 It is off by default because, once on, it records every author's posts network-wide, whatever `public_scope` says: about 3 million posts a day, and about 17 GB of disk at the default `window_days = 30`. Rows older than `window_days` are deleted by the daily retention run.
 
@@ -101,7 +101,9 @@ It is off by default because, once on, it records every author's posts network-w
 | `flush_ms` | `250` | How often the writer writes a batch. |
 | `settle_secs` | `900` | Threads count as complete only for roots seen this long after the outline's coverage began. |
 | `fresh_secs` | `30` | How far behind the stream the outline may fall and still be used. |
-| `max_tree`, `max_thread`, `enforce_reserve` | `5000`, `20000`, `100` | Bounds on what Thread Lens reads from it. |
+| `max_tree` | `5000` | Rows Thread Lens reads under an anchor. A larger subtree takes the path without the outline, and is remembered for 10 minutes. |
+| `max_thread` | `20000` | Rows of one thread Thread Lens scans to check that nothing is missing. A larger thread takes the path without the outline. |
+| `enforce_reserve` | `100` | Verdict lookups (of `threadlens.verdict_max_dids`) kept back from the outline's candidate round for the check of embedded posts. |
 
 All keys apply at restart. Switching it off clears its progress, so switching it on again starts coverage afresh; the rows already stored age out. One process writes it at a time (an advisory lock): a second process waits and takes over when the first stops. Watch `outline_writer_active`, `outline_through_age_seconds` and `outline_missed_total`.
 

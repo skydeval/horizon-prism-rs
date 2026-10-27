@@ -155,6 +155,16 @@ pub fn tid_value(s: &str) -> Option<i64> {
     i64::try_from(v).ok()
 }
 
+/// A decoded TID as its 13-character string: the inverse of [`tid_value`].
+#[must_use]
+pub fn tid_string(v: i64) -> String {
+    const ALPHABET: &[u8] = b"234567abcdefghijklmnopqrstuvwxyz";
+    let v = u64::try_from(v).unwrap_or(0);
+    (0..13u32)
+        .map(|i| char::from(ALPHABET[usize::try_from((v >> (60 - 5 * i)) & 31).unwrap_or(0)]))
+        .collect()
+}
+
 /// The time a decoded TID carries (its microseconds).
 #[must_use]
 pub fn tid_time(v: i64) -> Option<DateTime<Utc>> {
@@ -448,6 +458,8 @@ mod tests {
         assert!(b > a && a > 0);
         assert_eq!(tid_value("self"), None);
         assert_eq!(tid_value("3kaaaaaaaaaa"), None);
+        assert_eq!(tid_string(a), "3kaaaaaaaaaa2");
+        assert_eq!(tid_value(&tid_string(b)), Some(b));
         let t = tid_time(a).expect("time");
         assert_eq!(Some(t), crate::hydration::feed::tid_timestamp("3kaaaaaaaaaa2"));
     }

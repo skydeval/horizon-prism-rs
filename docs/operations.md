@@ -25,6 +25,8 @@ Key metrics:
 | `outline_writer_active`, `outline_through_age_seconds` | The thread outline's writer holds its lock, and how far behind the stream it is (if enabled). |
 | `outline_missed_total{reason}`, `outline_holes_total{reason}` | Posts the thread outline could not record, and places it marked as missing a reply. |
 | `outline_freshness{state}`, `outline_replays_total{why}` | Whether Thread Lens may use the outline now (1 for the current state), and how often it caught up from the stream, by cause. |
+| `threadlens_outline_total{use}` | How each Thread Lens request that could use the outline was served: `tree`, or why not (`absent`, `incomplete`, `hole`, `too_big`, `stale`, `bridging_off`, `crosscheck`, `off`, `error`: the reads failed or took over 300 ms past the baseline). |
+| `outline_crosscheck_total{result}` | The anchor's first Constellation page checked against the outline: `match`, `miss` (the request used Constellation instead), `pending`, `late`. |
 
 ## Logs
 

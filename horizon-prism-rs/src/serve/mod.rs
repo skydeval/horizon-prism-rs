@@ -542,11 +542,14 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // The thread outline (thread outline design §3, §4): its writer is
     // spawned before the consumer, which hands it each commit's ops.
     let to = &cfg.file.thread_outline;
+    let mut outline_reader = None;
     let outline_sender = if to.enabled {
-        // `_outline` is the readers' handle; S2 hands it to Thread Lens.
-        let (_outline, sender, outline_writer) =
+        // The readers' handle goes to Thread Lens (thread outline design §5).
+        let (outline, sender, outline_writer) =
             crate::thread_outline::writer::start(to.clone(), pool.clone(), redis.clone(), fh.stream_key.clone(), watermarks.clone());
         tasks.push(outline_writer.spawn());
+        crate::threadlens::outline::register_series();
+        outline_reader = Some(crate::threadlens::outline::Reader::new(outline));
         Some(sender)
     } else {
         // Switching off deletes `through` and clears `complete_since`.
@@ -1068,6 +1071,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
             .threadlens_cursor_key
             .as_ref()
             .map_or_else(crate::cursor_key::CursorKey::generated, |key| crate::cursor_key::CursorKey::new(key.expose())),
+        outline: outline_reader,
     };
     let index = crate::xrpc::handlers::index::IndexState {
         app: app.clone(),

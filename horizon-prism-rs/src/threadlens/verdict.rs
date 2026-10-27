@@ -81,6 +81,9 @@ pub struct Judge {
     /// Distinct authors that may still be looked up for bridging, beyond
     /// the baseline round's (`threadlens.verdict_max_dids`).
     dids_left: usize,
+    /// The part of the allowance candidate rounds leave for enforcement,
+    /// fixed at the first one (thread outline design §5.3.1, N7).
+    reserve_floor: Option<usize>,
     bridging: bool,
     baseline_done: bool,
     out_local: HashSet<String>,
@@ -103,6 +106,7 @@ impl Judge {
             lookup,
             round_timeout: Duration::from_millis(u64::from(cfg.verdict_round_timeout_ms)),
             dids_left: usize::try_from(cfg.verdict_max_dids).unwrap_or(usize::MAX),
+            reserve_floor: None,
             bridging: false,
             baseline_done: false,
             out_local: HashSet::new(),
@@ -344,6 +348,55 @@ impl Judge {
         let answers = if self.bridging { self.ask(&authors, u32::MAX, None).await.answers } else { HashMap::new() };
         self.take(authors, answers);
         Ok(true)
+    }
+
+    /// Distinct authors that may still be looked up in this request.
+    #[must_use]
+    pub fn dids_left(&self) -> usize {
+        self.dids_left
+    }
+
+    /// The candidate round (thread outline design §5.3.1, N3, N7): of
+    /// `posts` (URIs, in order), the longest prefix whose authors not yet
+    /// judged fit in the allowance less the part kept for enforcement,
+    /// `min(reserve, dids_left / 2)` as it was at the request's first
+    /// candidate round: later rounds keep the same floor. Those authors are judged in one round, as
+    /// [`Self::round`] judges them. Returns the prefix's length. It never
+    /// refuses the whole set: a prefix of posts by authors already judged
+    /// is always covered. A URI decided by its form names no author.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn round_prefix(&mut self, posts: &[String], reserve: usize) -> Result<usize, sqlx::Error> {
+        debug_assert!(self.baseline_done, "the baseline round runs first");
+        let floor = *self.reserve_floor.get_or_insert(reserve.min(self.dids_left / 2));
+        let allowance = self.dids_left.saturating_sub(floor);
+        let mut fresh: Vec<String> = Vec::new();
+        let mut taken: HashSet<&str> = HashSet::new();
+        let mut covered = 0;
+        for uri in posts {
+            let author = if crate::threadlens::thread::gap_by_form(uri).is_none() { crate::db::locks::uri_author(uri) } else { None };
+            if let Some(did) = author
+                && did != self.viewer
+                && !self.judged.contains(did)
+                && !taken.contains(did)
+            {
+                if fresh.len() >= allowance {
+                    break;
+                }
+                taken.insert(did);
+                fresh.push(did.to_string());
+            }
+            covered += 1;
+        }
+        if !fresh.is_empty() {
+            self.dids_left -= fresh.len();
+            self.local(&fresh).await?;
+            let answers = if self.bridging { self.ask(&fresh, u32::MAX, None).await.answers } else { HashMap::new() };
+            self.take(fresh, answers);
+        }
+        Ok(covered)
     }
 }
 

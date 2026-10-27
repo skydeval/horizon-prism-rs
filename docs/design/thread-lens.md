@@ -20,7 +20,9 @@ Both are POST and need a signed-in caller. `getMembership.features` lists `threa
 Every response starts from what `getPostThread` returns for the caller. When it can check the caller's blocks (**bridging**), it adds:
 - **posts past a block between other people.** A reply the ordinary view stubs because two other accounts block each other is shown;
 - **posts past the caller's own block.** The blocked author's posts stay gaps (the client shows only a placeholder), but the replies under them and the parents above them are shown. The parent walk goes on up past a blocked post, and past any further ones, to the start of the thread;
-- **replies Horizon-Prism does not store**, found through Constellation and fetched from the upstream AppView or Slingshot.
+- **replies Horizon-Prism does not store**, found through Constellation, or through the [thread outline](../configuration.md#thread-outline) when it is on, and fetched from the upstream AppView or Slingshot.
+
+Under each node, stored replies come first, oldest first. The replies found elsewhere follow: in Constellation's order, or, from the outline, oldest first (by `createdAt`, then URI). From the outline, a reply none of the operator's relays delivered is not found, unless Constellation lists it under the anchor itself, in which case that request uses Constellation; and the parent chain is bounded by `parentHeight` alone.
 
 It also keeps **replies the root author hid** (threadgate `hiddenReplies`) in the response, marked `hiddenByThreadgate`, so the client can collapse them as stock does. A reply is never marked for its own author. This marking happens with bridging on or off.
 

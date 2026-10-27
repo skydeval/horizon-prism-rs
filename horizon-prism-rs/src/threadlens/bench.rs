@@ -2,8 +2,10 @@
 //! upstream thread of 46 posts, read by a ready member with Farsight
 //! vouching, against fake sources that answer after fixed delays measured
 //! from the network (Bluesky's AppView, Constellation, Slingshot,
-//! Farsight). It prints the wall time of cold requests (fresh caches),
-//! their phases and the calls each source took.
+//! Farsight). It prints the wall time of cold requests (fresh caches) and
+//! of warm ones (the same request again), their phases and the calls each
+//! source took: today's path, then with the thread outline holding the
+//! fixture's shape (thread outline design §7).
 //!
 //! The bench is ignored by default. Run it in release mode:
 //! `cargo test --release -- --ignored --nocapture threadlens::bench`.
@@ -23,6 +25,7 @@ use serde_json::{Value, json};
 
 use super::cursor::CursorKey;
 use super::ladder::Ladder;
+use super::outline::Reader;
 use super::thread;
 use crate::aggregations::{ScopeSets, ScopeState};
 use crate::appview_clients::{AppViewAuth, AppViewClient};
@@ -74,39 +77,60 @@ fn view(u: &str, parent: Option<&str>, root: &str, replies: u64) -> Value {
            "replyCount": replies, "likeCount": 3, "repostCount": 1, "quoteCount": 0})
 }
 
+/// The fixture's record keys: TIDs of an hour ago, so the outline holds
+/// the thread as complete.
+struct Rkeys {
+    root: String,
+    anchor: String,
+    reply: String,
+    deep: String,
+    extra: String,
+}
+
 /// The fixture: the anchor (a reply to the root), 20 replies to it, of
 /// which the first 8 have 2 replies each. Constellation lists those, and
 /// 4 replies to the anchor and 1 to each of the first 4 that the upstream
 /// thread does not hold: 8 bridged posts.
 struct Fixture {
+    rk: Rkeys,
     anchor: String,
     thread: Value,
     /// Target → listed reply URIs.
     listed: HashMap<String, Vec<String>>,
     /// Post views `getPosts` answers.
     posts: HashMap<String, Value>,
+    /// Every post with its parent, in the order they were made: the
+    /// outline's rows.
+    edges: Vec<(String, Option<String>)>,
 }
 
 fn fixture() -> Fixture {
+    let base = (chrono::Utc::now() - chrono::TimeDelta::hours(1)).timestamp_micros() << 10;
+    let tid = |n: i64| crate::thread_outline::ops::tid_string(base + n);
+    let rk = Rkeys { root: tid(1), anchor: tid(2), reply: tid(3), deep: tid(4), extra: tid(5) };
     let op = did(1);
-    let root = uri(&op, "3kroot");
-    let anchor = uri(&op, "3kanchor");
+    let root = uri(&op, &rk.root);
+    let anchor = uri(&op, &rk.anchor);
+    let mut edges = vec![(root.clone(), None), (anchor.clone(), Some(root.clone()))];
     let mut listed: HashMap<String, Vec<String>> = HashMap::new();
     let mut posts = HashMap::new();
     let mut replies = Vec::new();
     for i in 0..20 {
-        let r = uri(&did(100 + i), "3kreply");
+        let r = uri(&did(100 + i), &rk.reply);
+        edges.push((r.clone(), Some(anchor.clone())));
         let mut node = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&r, Some(&anchor), &root, if i < 8 { 2 } else { 0 })});
         listed.entry(anchor.clone()).or_default().push(r.clone());
         if i < 8 {
             let mut kids = Vec::new();
             for j in 0..2 {
-                let k = uri(&did(200 + i * 2 + j), "3kdeep");
+                let k = uri(&did(200 + i * 2 + j), &rk.deep);
+                edges.push((k.clone(), Some(r.clone())));
                 kids.push(json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&k, Some(&r), &root, 0), "replies": []}));
                 listed.entry(r.clone()).or_default().push(k);
             }
             if i < 4 {
-                let extra = uri(&did(300 + i), "3kextra");
+                let extra = uri(&did(300 + i), &rk.extra);
+                edges.push((extra.clone(), Some(r.clone())));
                 posts.insert(extra.clone(), view(&extra, Some(&r), &root, 0));
                 listed.entry(r.clone()).or_default().push(extra);
             }
@@ -117,14 +141,52 @@ fn fixture() -> Fixture {
         replies.push(node);
     }
     for i in 0..4 {
-        let extra = uri(&did(400 + i), "3kextra");
+        let extra = uri(&did(400 + i), &rk.extra);
+        edges.push((extra.clone(), Some(anchor.clone())));
         posts.insert(extra.clone(), view(&extra, Some(&anchor), &root, 0));
         listed.entry(anchor.clone()).or_default().push(extra);
     }
     let thread = json!({"thread": {"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&anchor, Some(&root), &root, 24),
         "parent": {"$type": "app.bsky.feed.defs#threadViewPost", "post": view(&root, None, &root, 1)},
         "replies": replies}});
-    Fixture { anchor, thread, listed, posts }
+    Fixture { rk, anchor, thread, listed, posts, edges }
+}
+
+/// The fixture's outline rows, written through the outline writer's
+/// flush, seen an hour ago, made one second apart in fixture order.
+async fn outline_rows(p: &sqlx::PgPool, f: &Fixture) {
+    use sqlx::Connection;
+
+    use crate::thread_outline::id::StreamId;
+    use crate::thread_outline::ops::{Key, Op, PostOp, tid_value};
+
+    let key = |u: &str| Key {
+        did: crate::db::locks::uri_author(u).expect("did").to_string(),
+        rkey: tid_value(u.rsplit('/').next().expect("rkey")).expect("tid"),
+    };
+    let t0 = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+    let ms = u64::try_from(t0.timestamp_millis()).expect("ms");
+    let root = key(&f.edges[0].0);
+    let ops: Vec<(StreamId, Op)> = f
+        .edges
+        .iter()
+        .zip(0u64..)
+        .map(|((u, parent), n)| {
+            let k = key(u);
+            let parent = parent.as_deref().map(key);
+            let op = PostOp {
+                author: k.did,
+                rkey: k.rkey,
+                root: parent.as_ref().map(|_| root.clone()),
+                parent,
+                created_at: t0 + chrono::TimeDelta::seconds(i64::try_from(n).expect("n")),
+                rev: 1,
+            };
+            (StreamId::new(ms, n), Op::Create(op))
+        })
+        .collect();
+    let mut conn = sqlx::PgConnection::connect_with(&p.connect_options()).await.expect("connect");
+    crate::thread_outline::flush::apply(&mut conn, &ops, &crate::thread_outline::flush::Progress::default()).await.expect("flush");
 }
 
 #[derive(Default)]
@@ -260,10 +322,15 @@ async fn setup(p: &sqlx::PgPool, f: &Fixture, d: Delays, viewer_did: &str) -> Se
 
 impl Setup {
     async fn read(&self, f: &Fixture, viewer_did: &str, cfg: &ThreadLensConfig) -> thread::Thread {
+        self.read_with(f, viewer_did, cfg, None).await
+    }
+
+    /// The fixture's thread, with the outline when `outline` is given.
+    async fn read_with(&self, f: &Fixture, viewer_did: &str, cfg: &ThreadLensConfig, outline: Option<&Reader>) -> thread::Thread {
         let viewer = Viewer { did: Some(viewer_did.to_string()), hydrate: true };
         let req = Requester::test();
         let request = thread::Request { viewer: &viewer, req: &req, anchor: &f.anchor, depth: 6, parent_height: 80 };
-        thread::get_thread(&self.ladder, cfg, &CursorKey::generated(), request, None).await.expect("thread")
+        thread::get_thread_outlined(&self.ladder, cfg, &CursorKey::generated(), outline, request, None).await.expect("thread")
     }
 
     /// `(getPostThread, getPosts, links, slingshot, farsight)` calls so far.
@@ -297,42 +364,77 @@ async fn lens_latency_bench_no_network() {
     bench("no network", NONE).await;
 }
 
+/// One pass's numbers: wall times, phases and calls per run.
+#[derive(Default)]
+struct Pass {
+    times: Vec<Duration>,
+    phases: HashMap<&'static str, Vec<u128>>,
+    order: Vec<&'static str>,
+    calls: Vec<(usize, usize, usize, usize, usize)>,
+}
+
+impl Pass {
+    fn add(&mut self, t: &thread::Thread, took: Duration, calls: (usize, usize, usize, usize, usize)) {
+        assert_eq!(t.nodes.len(), 46, "the whole fixture, bridged posts included");
+        self.times.push(took);
+        for (phase, took) in &t.phases {
+            if !self.order.contains(phase) {
+                self.order.push(phase);
+            }
+            self.phases.entry(phase).or_default().push(took.as_millis());
+        }
+        self.calls.push(calls);
+    }
+
+    fn print(&self, label: &str, mode: &str, kind: &str) {
+        let mut times = self.times.clone();
+        times.sort();
+        let ms: Vec<u128> = times.iter().map(Duration::as_millis).collect();
+        println!("lens bench ({label}, {mode}): {RUNS} {kind} runs, ms sorted {ms:?}, median {} ms", ms[RUNS / 2]);
+        let medians: Vec<String> = self
+            .order
+            .iter()
+            .map(|phase| {
+                let mut v = self.phases[phase].clone();
+                v.sort_unstable();
+                format!("{phase} {}", v[v.len() / 2])
+            })
+            .collect();
+        println!("lens bench ({label}, {mode}): {kind} phase medians ms: {}", medians.join(", "));
+        println!("lens bench ({label}, {mode}): {kind} calls per run (getPostThread, getPosts, links, slingshot, farsight) {:?}", self.calls[0]);
+    }
+}
+
+fn minus(a: (usize, usize, usize, usize, usize), b: (usize, usize, usize, usize, usize)) -> (usize, usize, usize, usize, usize) {
+    (a.0 - b.0, a.1 - b.1, a.2 - b.2, a.3 - b.3, a.4 - b.4)
+}
+
 async fn bench(label: &str, d: Delays) {
     let Some((db, viewer_did)) = member_db(&format!("threadlens_bench_{}", d.thread)).await else {
         return;
     };
     let f = fixture();
-    let mut times = Vec::new();
-    let mut counts = Vec::new();
-    let mut phases: HashMap<&'static str, Vec<u128>> = HashMap::new();
-    let mut order: Vec<&'static str> = Vec::new();
-    for _ in 0..RUNS {
-        let s = setup(&db.pool, &f, d, &viewer_did).await;
-        let started = Instant::now();
-        let t = s.read(&f, &viewer_did, &ThreadLensConfig::default()).await;
-        times.push(started.elapsed());
-        assert_eq!(t.nodes.len(), 46, "the whole fixture, bridged posts included");
-        for (phase, took) in &t.phases {
-            if !order.contains(phase) {
-                order.push(phase);
-            }
-            phases.entry(phase).or_default().push(took.as_millis());
+    outline_rows(&db.pool, &f).await;
+    let cfg = ThreadLensConfig::default();
+    for mode in ["today", "outline"] {
+        let (mut cold, mut warm) = (Pass::default(), Pass::default());
+        for _ in 0..RUNS {
+            let s = setup(&db.pool, &f, d, &viewer_did).await;
+            // A fresh reader per run: its in-process memory is cold too.
+            let reader = (mode == "outline").then(|| Reader::fresh_for_tests(crate::config::ThreadOutlineConfig::default()));
+            let started = Instant::now();
+            let t = s.read_with(&f, &viewer_did, &cfg, reader.as_ref()).await;
+            cold.add(&t, started.elapsed(), s.counts());
+            let want = if reader.is_some() { super::outline::Use::Tree } else { super::outline::Use::Off };
+            assert_eq!(t.outline, Some(want), "{mode}");
+            let before = s.counts();
+            let started = Instant::now();
+            let t = s.read_with(&f, &viewer_did, &cfg, reader.as_ref()).await;
+            warm.add(&t, started.elapsed(), minus(s.counts(), before));
         }
-        counts.push(s.counts());
+        cold.print(label, mode, "cold");
+        warm.print(label, mode, "warm");
     }
-    times.sort();
-    let ms: Vec<u128> = times.iter().map(Duration::as_millis).collect();
-    println!("lens bench ({label}): {RUNS} cold runs, ms sorted {ms:?}, median {} ms", ms[RUNS / 2]);
-    let medians: Vec<String> = order
-        .iter()
-        .map(|phase| {
-            let mut v = phases[phase].clone();
-            v.sort_unstable();
-            format!("{phase} {}", v[v.len() / 2])
-        })
-        .collect();
-    println!("lens bench ({label}): phase medians ms: {}", medians.join(", "));
-    println!("lens bench ({label}): calls per run (getPostThread, getPosts, links, slingshot, farsight) {:?}", counts[0]);
     db.drop_db().await;
 }
 
@@ -354,24 +456,57 @@ async fn the_fixture_is_read_with_one_thread_fetch_and_one_get_posts_per_level()
     let f = fixture();
     let s = setup(&db.pool, &f, NONE, &viewer_did).await;
     let t = s.read(&f, &viewer_did, &ThreadLensConfig::default()).await;
-    let op = did(1);
-    let mut want = vec![uri(&op, "3kroot"), f.anchor.clone()];
-    want.extend((0..20).map(|i| uri(&did(100 + i), "3kreply")));
-    for i in 0..8 {
-        want.extend((0..2).map(|j| uri(&did(200 + i * 2 + j), "3kdeep")));
-    }
-    want.extend((0..4).map(|i| uri(&did(400 + i), "3kextra")));
-    want.extend((0..4).map(|i| uri(&did(300 + i), "3kextra")));
-    assert_eq!(uris(&t.nodes), want);
+    assert_eq!(uris(&t.nodes), fixture_order(&f));
     // Each bridged reply sits under the parent it was listed for.
     for i in 0..4 {
-        let node = t.nodes.iter().find(|n| n.uri() == uri(&did(300 + i), "3kextra")).expect("bridged");
-        assert_eq!(node.parent_uri(), Some(uri(&did(100 + i), "3kreply").as_str()));
+        let node = t.nodes.iter().find(|n| n.uri() == uri(&did(300 + i), &f.rk.extra)).expect("bridged");
+        assert_eq!(node.parent_uri(), Some(uri(&did(100 + i), &f.rk.reply).as_str()));
     }
     assert_eq!(t.bridging, crate::hydration::lens::Bridging::Full);
     // One thread fetch; one `getPosts` per level that bridges; one page per
     // node with replies; one Farsight round per step.
     assert_eq!(s.counts(), (1, 2, 9, 0, 3));
+    assert!(t.nodes.iter().all(|n| !n.markers().any()), "nothing left to read");
+    db.drop_db().await;
+}
+
+/// The order the fixture's nodes always come in: the parent chain, the
+/// anchor, the baseline's replies level by level, then each level's
+/// bridged replies in level order.
+fn fixture_order(f: &Fixture) -> Vec<String> {
+    let op = did(1);
+    let mut want = vec![uri(&op, &f.rk.root), f.anchor.clone()];
+    want.extend((0..20).map(|i| uri(&did(100 + i), &f.rk.reply)));
+    for i in 0..8 {
+        want.extend((0..2).map(|j| uri(&did(200 + i * 2 + j), &f.rk.deep)));
+    }
+    want.extend((0..4).map(|i| uri(&did(400 + i), &f.rk.extra)));
+    want.extend((0..4).map(|i| uri(&did(300 + i), &f.rk.extra)));
+    want
+}
+
+/// T-O7 on the bench's fixture (thread outline design §7): with the outline
+/// holding its shape, the same nodes in the same order, from one thread
+/// fetch, one `getPosts` for both levels' bridged posts, F7 as the only
+/// listing page, and the baseline round plus one candidate round.
+#[tokio::test]
+async fn the_fixture_is_read_from_the_outline_with_one_fetch() {
+    let Some((db, viewer_did)) = member_db("threadlens_fixture_outline").await else {
+        return;
+    };
+    let f = fixture();
+    outline_rows(&db.pool, &f).await;
+    let s = setup(&db.pool, &f, NONE, &viewer_did).await;
+    let reader = Reader::fresh_for_tests(crate::config::ThreadOutlineConfig::default());
+    let t = s.read_with(&f, &viewer_did, &ThreadLensConfig::default(), Some(&reader)).await;
+    assert_eq!(t.outline, Some(super::outline::Use::Tree));
+    assert_eq!(uris(&t.nodes), fixture_order(&f));
+    for i in 0..4 {
+        let node = t.nodes.iter().find(|n| n.uri() == uri(&did(300 + i), &f.rk.extra)).expect("bridged");
+        assert_eq!(node.parent_uri(), Some(uri(&did(100 + i), &f.rk.reply).as_str()));
+    }
+    assert_eq!(t.bridging, crate::hydration::lens::Bridging::Full);
+    assert_eq!(s.counts(), (1, 1, 1, 0, 2));
     assert!(t.nodes.iter().all(|n| !n.markers().any()), "nothing left to read");
     db.drop_db().await;
 }

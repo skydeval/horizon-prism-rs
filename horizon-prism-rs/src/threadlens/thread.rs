@@ -35,12 +35,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
 use super::cursor::{CursorKey, Position};
 use super::gaps::Gap;
 use super::ladder::{Ladder, Mode, Resolved};
+use super::outline::{ChainNode, Check, Read, Reader, Tree, Use};
 use super::verdict::{Judge, Verdict};
 use crate::config::ThreadLensConfig;
 use crate::db::locks::uri_author;
@@ -79,6 +81,11 @@ pub struct Thread {
     /// (threadlens-hydration design §2.5). Also recorded as
     /// [`METRIC_PHASE_SECONDS`].
     pub phases: Vec<(&'static str, std::time::Duration)>,
+    /// How the thread outline served the request, when it could have
+    /// (`threadlens_outline_total{use}`, thread outline design §5.1).
+    pub outline: Option<Use>,
+    /// The anchor cross-check's result, when it ran (§5.6).
+    pub crosscheck: Option<Check>,
 }
 
 /// Metric: seconds a `getThread` or `resolve` request spent in each phase,
@@ -361,6 +368,7 @@ fn quote_is_whole(post: &Value, judge: &Judge) -> bool {
 }
 
 /// One reply read of a node's sequence.
+#[derive(Clone)]
 struct Reply {
     uri: String,
     /// It has a row here.
@@ -371,6 +379,7 @@ struct Reply {
 }
 
 /// One node's sequence as read.
+#[derive(Clone)]
 struct Seq {
     parent: String,
     replies: Vec<Reply>,
@@ -415,6 +424,9 @@ type Plan = (Vec<(String, Act)>, Option<usize>);
 enum Act {
     Gap(Gap),
     Fetch,
+    /// Fetch a reply only the outline names: a `not-found` answer is
+    /// skipped, not placed (thread outline design §5.3.3).
+    FetchOutline,
     Skip,
 }
 
@@ -460,6 +472,19 @@ struct Work<'a> {
     /// (threadlens-quoted-posts design §4). A node that replaces another
     /// for the URI decides it again.
     upstream: HashSet<String>,
+    /// The outline's tree, when the request is served from it (thread
+    /// outline design §5.3).
+    tree: Option<Arc<Tree>>,
+    /// Ladder answers fetched ahead for the tree's slices.
+    prefetched: HashMap<String, Resolved>,
+    /// Authors the outline reports gone, among those checked.
+    gone: HashSet<String>,
+    gone_checked: HashSet<String>,
+    /// The judge allowance kept for enforcement (`enforce_reserve`).
+    reserve: usize,
+    /// How the outline served the request, and the cross-check's result.
+    outline_use: Option<Use>,
+    crosscheck: Option<Check>,
 }
 
 impl Work<'_> {
@@ -975,9 +1000,13 @@ impl Work<'_> {
     /// Place one sequence's planned replies, from the level's fetches.
     fn place(&mut self, parent: &str, acts: Vec<(String, Act)>, fetched: &mut HashMap<String, Resolved>) {
         for (uri, act) in acts {
+            let outline_only = matches!(act, Act::FetchOutline);
             let node = match act {
                 Act::Gap(gap) => LensNode::gap(&uri, Some(parent.to_string()), gap),
-                Act::Fetch => match fetched.remove(&uri) {
+                Act::Fetch | Act::FetchOutline => match fetched.remove(&uri) {
+                    // An outline-only reply the ladder cannot find is not
+                    // placed (thread outline design §5.3.3).
+                    Some(Resolved::Gap(Gap::NotFound)) if outline_only => continue,
                     Some(resolved) => self.ladder_node(resolved, &uri, Some(parent.to_string())),
                     None => continue,
                 },
@@ -987,6 +1016,524 @@ impl Work<'_> {
             self.nodes.push(node);
             self.budget = self.budget.saturating_sub(1);
         }
+    }
+
+    // ---- The outline's tree (thread outline design §5.3). ----
+
+    fn more_parents_on_top(&mut self) {
+        if let Some(top) = self.nodes.first_mut() {
+            top.markers_mut().more_parents = true;
+        }
+    }
+
+    /// The walk above the response's top node, when the top is on the walk.
+    fn chain_rest(&self, tree: &Tree) -> Option<Vec<ChainNode>> {
+        let top = self.nodes.first()?.uri();
+        let k = tree.chain.iter().position(|c| c.uri == top)?;
+        Some(tree.chain[k + 1..].to_vec())
+    }
+
+    /// How many nodes the chain may still add: within `parentHeight` and
+    /// the page budget. Nothing above a top the walk cannot go past.
+    fn chain_room(&self) -> usize {
+        if !self.nodes.first().is_some_and(LensNode::walkable) {
+            return 0;
+        }
+        let parent_height = usize::try_from(self.r.parent_height).unwrap_or(usize::MAX);
+        parent_height.saturating_sub(self.index(self.r.anchor).unwrap_or(0)).min(self.budget)
+    }
+
+    /// The chain's candidates (§5.3.1): above the top, up to the first
+    /// deleted, by-form or gate-hidden node (the deleted or hidden one
+    /// included, as its author decides what it is placed as), within the
+    /// room left.
+    fn chain_candidates(&self, rest: &[ChainNode]) -> Vec<String> {
+        let mut out = Vec::new();
+        for c in rest.iter().take(self.chain_room()) {
+            if self.seen.contains(&c.uri) || gap_by_form(&c.uri).is_some() {
+                break;
+            }
+            out.push(c.uri.clone());
+            if c.hidden || c.deleted {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The chain as [`Self::place_chain`] would place it with the verdicts
+    /// known now, every fetched post taken to be a post: the posts to fetch
+    /// up to the first known stop, and how many nodes it adds.
+    fn chain_dry(&self, rest: &[ChainNode]) -> (Vec<String>, usize) {
+        let room = self.chain_room();
+        let (mut fetch, mut added) = (Vec::new(), 0);
+        for c in rest {
+            if added >= room || self.seen.contains(&c.uri) {
+                break;
+            }
+            added += 1;
+            if gap_by_form(&c.uri).is_some() {
+                break;
+            }
+            match self.judge.verdict(uri_author(&c.uri).unwrap_or_default()) {
+                None => {
+                    added -= 1;
+                    break;
+                }
+                Some(Verdict::Clear) => fetch.push(c.uri.clone()),
+                Some(v) if block_gap(Some(v)).is_some() => {}
+                Some(_) => break,
+            }
+            if c.hidden || c.deleted {
+                break;
+            }
+        }
+        (fetch, added)
+    }
+
+    /// The parents from the walk (§5.3.2): placed upward from the top with
+    /// the stop rules of [`Self::parents`], but with no round per step and
+    /// no `parent_rounds`: every link is the walk's, so nothing of a
+    /// blocked post's record is read. A deleted or gate-hidden node is
+    /// placed as today's walk places it (a `Clear` one through the ladder,
+    /// a blocked one as its gap) and ends the chain; an author no round
+    /// covered leaves `moreParents`, as an allowance running out does.
+    async fn place_chain(&mut self, rest: &[ChainNode]) -> Result<(), sqlx::Error> {
+        let parent_height = usize::try_from(self.r.parent_height).unwrap_or(usize::MAX);
+        for c in rest {
+            if !self.nodes.first().is_some_and(LensNode::walkable) {
+                return Ok(());
+            }
+            if let Some(LensNode::Gap { parent_uri, .. }) = self.nodes.first_mut()
+                && parent_uri.is_none()
+            {
+                *parent_uri = Some(c.uri.clone());
+            }
+            if self.seen.contains(&c.uri) {
+                return Ok(());
+            }
+            let chain = self.index(self.r.anchor).unwrap_or(0);
+            if chain >= parent_height || self.budget == 0 {
+                self.more_parents_on_top();
+                return Ok(());
+            }
+            let verdict = self.judge.verdict(uri_author(&c.uri).unwrap_or_default());
+            let node = match (gap_by_form(&c.uri), block_gap(verdict), verdict) {
+                (Some(gap), ..) => LensNode::gap(&c.uri, None, gap),
+                (None, _, None) => {
+                    self.more_parents_on_top();
+                    return Ok(());
+                }
+                (None, Some(gap), _) => LensNode::gap(&c.uri, None, gap),
+                (None, None, Some(Verdict::Clear)) => {
+                    let resolved = match self.prefetched.remove(&c.uri) {
+                        Some(resolved) => resolved,
+                        None => self.fetch(&c.uri).await?,
+                    };
+                    self.ladder_node(resolved, &c.uri, None)
+                }
+                _ => {
+                    self.limited = true;
+                    LensNode::gap(&c.uri, None, Gap::BlockStateUnknown)
+                }
+            };
+            let goes_on = node.walkable() && !c.hidden && !c.deleted;
+            self.seen.insert(c.uri.clone());
+            self.nodes.insert(0, node);
+            self.budget -= 1;
+            if !goes_on {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// The anchor's sequence from the tree, when the anchor may have
+    /// replies read.
+    fn anchor_seqs(&self, tree: &Tree) -> Vec<Seq> {
+        let start = self.start.as_ref().map(|(position, _)| position.clone());
+        match self.index(self.r.anchor).map(|i| &self.nodes[i]) {
+            Some(node) if node.walkable() && !node.no_replies() => vec![tree_seq(tree, self.r.anchor, start)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// What to do with each reply of a tree sequence: [`Self::plan`]'s
+    /// rules, except that an author no round covered stops the sequence
+    /// there (its cursor is the position before it), an outline-only reply
+    /// is fetched as one ([`Act::FetchOutline`]), and an outline-only reply
+    /// by a blocked author the outline reports gone is skipped, as a
+    /// listing would have dropped it. `dry` leaves `limited` alone.
+    fn tree_plan(&mut self, seq: &Seq, local_parent: bool, seen: &mut HashSet<String>, budget: &mut usize, dry: bool) -> Plan {
+        let mut acts: Vec<(String, Act)> = Vec::new();
+        let mut stopped = None;
+        for (i, reply) in seq.replies.iter().enumerate() {
+            if seen.contains(&reply.uri) || gap_by_form(&reply.uri).is_some() {
+                continue;
+            }
+            let author = uri_author(&reply.uri).unwrap_or_default();
+            let Some(verdict) = self.judge.verdict(author) else {
+                stopped = Some(i);
+                break;
+            };
+            let own_row = reply.local_row && local_parent;
+            let act = match (block_gap(Some(verdict)), verdict) {
+                (Some(_), _) if !reply.local_row && self.gone.contains(author) => Act::Skip,
+                (Some(gap), _) => Act::Gap(gap),
+                (None, _) if own_row => Act::Fetch,
+                (None, Verdict::Clear) if reply.local_row => Act::Fetch,
+                (None, Verdict::Clear) => Act::FetchOutline,
+                _ => {
+                    self.limited |= !dry;
+                    Act::Skip
+                }
+            };
+            if matches!(act, Act::Skip) {
+                continue;
+            }
+            if acts.len() >= *budget {
+                stopped = Some(i);
+                break;
+            }
+            acts.push((reply.uri.clone(), act));
+        }
+        *budget = budget.saturating_sub(acts.len());
+        seen.extend(acts.iter().map(|(uri, _)| uri.clone()));
+        (acts, stopped)
+    }
+
+    /// A dry run of the tree's levels from `seqs`, for `levels` levels.
+    /// With `fetches` false: the replies outside the response, breadth
+    /// first, up to `budget` of them, every node taken as walkable (the
+    /// candidates, §5.3.1). With `fetches` true: what [`Self::tree_plan`]
+    /// would fetch with the verdicts known now, every fetched post taken to
+    /// be a post.
+    fn simulate(&mut self, tree: &Tree, mut seqs: Vec<Seq>, levels: u32, mut budget: usize, fetches: bool) -> Vec<String> {
+        let mut seen = self.seen.clone();
+        let mut out = Vec::new();
+        let mut placed: HashSet<String> = HashSet::new();
+        // The response's nodes: which may have replies read, and each
+        // node's walkable children.
+        let mut eligible: HashMap<String, bool> = HashMap::new();
+        let mut held: HashMap<String, Vec<String>> = HashMap::new();
+        for n in &self.nodes {
+            eligible.insert(n.uri().to_string(), n.walkable() && !n.no_replies());
+            if n.walkable()
+                && let Some(parent) = n.parent_uri()
+            {
+                held.entry(parent.to_string()).or_default().push(n.uri().to_string());
+            }
+        }
+        for level in 0..levels {
+            let mut next: Vec<String> = Vec::new();
+            let mut queued: HashSet<String> = HashSet::new();
+            for seq in &seqs {
+                let mut under: Vec<String> = held.get(&seq.parent).cloned().unwrap_or_default();
+                if fetches {
+                    let (acts, _) = self.tree_plan(seq, tree.local.contains(&seq.parent), &mut seen, &mut budget, true);
+                    for (uri, act) in acts {
+                        if matches!(act, Act::Fetch | Act::FetchOutline) {
+                            out.push(uri.clone());
+                        }
+                        placed.insert(uri.clone());
+                        under.push(uri);
+                    }
+                } else {
+                    for reply in &seq.replies {
+                        if budget > 0 && gap_by_form(&reply.uri).is_none() && seen.insert(reply.uri.clone()) {
+                            out.push(reply.uri.clone());
+                            budget -= 1;
+                        }
+                        placed.insert(reply.uri.clone());
+                        under.push(reply.uri.clone());
+                    }
+                }
+                for uri in under {
+                    if queued.insert(uri.clone()) {
+                        next.push(uri);
+                    }
+                }
+            }
+            if level + 1 == levels {
+                break;
+            }
+            seqs = next
+                .iter()
+                .filter(|p| eligible.get(*p).copied().unwrap_or_else(|| placed.contains(*p)))
+                .map(|p| tree_seq(tree, p, None))
+                .collect();
+            if seqs.is_empty() {
+                break;
+            }
+        }
+        out
+    }
+
+    /// One slice (§5.3.1, §5.3.3): the candidates, the chain's first when
+    /// `chain` is given, then the replies from `seqs` down for `levels`
+    /// levels; `round_prefix` judges the longest prefix that fits; then
+    /// everything the plan would now fetch goes through the ladder in one
+    /// `fetch_many`. Returns whether any author was judged.
+    async fn slice(&mut self, tree: &Tree, chain: Option<&[ChainNode]>, seqs: &[Seq], levels: u32) -> Result<bool, sqlx::Error> {
+        let mut posts = chain.map(|c| self.chain_candidates(c)).unwrap_or_default();
+        let room = self.budget.saturating_sub(posts.len());
+        posts.extend(self.simulate(tree, seqs.to_vec(), levels, room, false));
+        let before = self.judge.dids_left();
+        let covered = self.judge.round_prefix(&posts, self.reserve).await?;
+        self.refresh_known();
+        let authors: Vec<String> = posts[..covered].iter().filter_map(|u| uri_author(u).map(str::to_string)).collect();
+        if !authors.is_empty() {
+            // The candidates' routes at once, when lodestar is set
+            // (lodestar-reads design §2.10).
+            self.ladder.router().prefetch(self.r.req, &authors).await;
+        }
+        let (mut fetches, added) = chain.map(|c| self.chain_dry(c)).unwrap_or_default();
+        let room = self.budget.saturating_sub(added);
+        fetches.extend(self.simulate(tree, seqs.to_vec(), levels, room, true));
+        let mut asked = HashSet::new();
+        fetches.retain(|u| !self.prefetched.contains_key(u) && asked.insert(u.clone()));
+        let got = self.fetch_many(&fetches).await?;
+        self.prefetched.extend(got);
+        Ok(self.judge.dids_left() < before)
+    }
+
+    /// The parents and the first slice (§5.3.1, §5.3.2): one candidate
+    /// round over the chain and the replies, one fetch, then the chain.
+    /// A top that is not on the walk takes today's walk up the parents.
+    async fn tree_parents(&mut self, tree: &Tree) -> Result<(), sqlx::Error> {
+        let seqs = self.anchor_seqs(tree);
+        match self.chain_rest(tree) {
+            Some(rest) => {
+                self.slice(tree, Some(&rest), &seqs, self.r.depth).await?;
+                self.place_chain(&rest).await
+            }
+            None => self.parents().await,
+        }
+    }
+
+    /// Of `seqs`, the outline-only replies by blocked authors whose gone
+    /// state is not known yet: read once (R4-2).
+    async fn check_gone(&mut self, seqs: &[Seq]) -> Result<(), sqlx::Error> {
+        let mut dids: Vec<String> = seqs
+            .iter()
+            .flat_map(|s| s.replies.iter())
+            .filter(|r| !r.local_row && !self.seen.contains(&r.uri))
+            .filter_map(|r| uri_author(&r.uri))
+            .filter(|a| block_gap(self.judge.verdict(a)).is_some() && !self.gone_checked.contains(*a))
+            .map(str::to_string)
+            .collect();
+        dids.sort_unstable();
+        dids.dedup();
+        if dids.is_empty() {
+            return Ok(());
+        }
+        let gone = crate::thread_outline::gone_dids(self.ladder.hydrator().pool(), &dids).await?;
+        self.gone.extend(gone);
+        self.gone_checked.extend(dids);
+        Ok(())
+    }
+
+    /// The replies from the tree (§5.3.3), level by level below the anchor
+    /// and node by node in response order: each node's stored replies,
+    /// then its outline-only children. No listing is read or spent. When
+    /// a level holds authors no round covered and budget is left, one more
+    /// slice judges and fetches the next part, at most `depth` times.
+    /// Budget, `seen`, gaps, markers and `limited` work as in
+    /// [`Self::replies`].
+    async fn tree_replies(&mut self, tree: &Tree) -> Result<(), sqlx::Error> {
+        let mut level: Vec<String> = vec![self.r.anchor.to_string()];
+        let mut start = self.start.as_ref().map(|(position, _)| position.clone());
+        let mut slices = self.r.depth;
+        for depth in 0..self.r.depth {
+            let mut seqs: Vec<Seq> = Vec::new();
+            for parent in &level {
+                let Some(node) = self.index(parent).map(|i| &self.nodes[i]) else {
+                    continue;
+                };
+                if !node.walkable() || node.no_replies() {
+                    continue;
+                }
+                // A node the reads did not cover (a stored reply not in
+                // the outline yet, a row it marks deleted, a baseline reply
+                // it lacks): its replies are not known, so the client opens
+                // it afresh.
+                if parent != self.r.anchor && !tree.walked.contains(parent) {
+                    self.mark_at(parent, None);
+                    continue;
+                }
+                let from = start.take();
+                if self.budget == 0 {
+                    self.mark_at(parent, from);
+                    continue;
+                }
+                seqs.push(tree_seq(tree, parent, from));
+            }
+            let unjudged = seqs
+                .iter()
+                .flat_map(|s| s.replies.iter())
+                .any(|r| !self.seen.contains(&r.uri) && gap_by_form(&r.uri).is_none() && self.judge.verdict(uri_author(&r.uri).unwrap_or_default()).is_none());
+            if unjudged && self.budget > 0 && slices > 0 {
+                slices -= 1;
+                if !self.slice(tree, None, &seqs, self.r.depth - depth).await? {
+                    slices = 0;
+                }
+            }
+            self.check_gone(&seqs).await?;
+            let (mut seen, mut budget) = (self.seen.clone(), self.budget);
+            let mut plans: Vec<Plan> = Vec::new();
+            for seq in &seqs {
+                plans.push(self.tree_plan(seq, tree.local.contains(&seq.parent), &mut seen, &mut budget, false));
+            }
+            // What the slices did not fetch ahead: budget a gap or a skip
+            // left over can reach replies the dry run did not.
+            let missing: Vec<String> = plans
+                .iter()
+                .flat_map(|(acts, _)| acts.iter())
+                .filter(|(uri, act)| matches!(act, Act::Fetch | Act::FetchOutline) && !self.prefetched.contains_key(uri))
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            let got = self.fetch_many(&missing).await?;
+            self.prefetched.extend(got);
+            let mut fetched = std::mem::take(&mut self.prefetched);
+            for (seq, (acts, stopped)) in seqs.iter().zip(plans) {
+                self.place(&seq.parent, acts, &mut fetched);
+                let resume = match stopped {
+                    Some(i) => Some(seq.replies[i].before.clone()),
+                    None => seq.rest.clone(),
+                };
+                if let Some(position) = resume {
+                    self.mark_at(&seq.parent, position);
+                }
+            }
+            self.prefetched = fetched;
+            let mut next: Vec<String> = Vec::new();
+            for parent in &level {
+                next.extend(self.nodes.iter().filter(|n| n.parent_uri() == Some(parent.as_str()) && n.walkable()).map(|n| n.uri().to_string()));
+            }
+            level = next;
+            if level.is_empty() {
+                return Ok(());
+            }
+        }
+        for uri in level {
+            if self.index(&uri).is_some_and(|i| !self.nodes[i].no_replies() && self.nodes[i].markers().more_replies.is_none()) {
+                self.mark_at(&uri, None);
+            }
+        }
+        Ok(())
+    }
+
+    /// The anchor cross-check (§5.6), against F7 if it has answered: a
+    /// listed reply that is neither stored, nor an outline row (live or
+    /// deleted), nor still on its way is a miss. F7 that has not answered
+    /// is `late`, and nothing waits for it. The page is kept for today's
+    /// path. `None` when there is no F7 (no Constellation).
+    async fn cross_check(&mut self, tree: &Tree, through_ms: Option<i64>) -> Result<Option<Check>, sqlx::Error> {
+        let Some(call) = self.anchor_page.take() else {
+            return Ok(None);
+        };
+        if !call.is_finished() {
+            self.anchor_page = Some(call);
+            return Ok(Some(self.checked(Check::Late)));
+        }
+        let page = call.await.ok().flatten();
+        let kept = page.clone();
+        self.anchor_page = Some(tokio::spawn(async move { kept }));
+        let Some((listed, _)) = page else {
+            return Ok(Some(self.checked(Check::Late)));
+        };
+        let unknown: Vec<String> = listed.into_iter().filter(|u| !tree.local.contains(u) && !tree.known.contains(u)).collect();
+        let found = if unknown.is_empty() { HashSet::new() } else { super::outline::with_rows(self.ladder.hydrator().pool(), &unknown).await? };
+        let (mut miss, mut pending) = (false, false);
+        for uri in unknown.iter().filter(|u| !found.contains(*u)) {
+            if through_ms.is_some_and(|t| super::outline::on_its_way(uri, t)) {
+                pending = true;
+            } else {
+                miss = true;
+            }
+        }
+        let check = if miss {
+            Check::Miss
+        } else if pending {
+            Check::Pending
+        } else {
+            Check::Match
+        };
+        Ok(Some(self.checked(check)))
+    }
+
+    fn checked(&mut self, check: Check) -> Check {
+        check.record();
+        self.crosscheck = Some(check);
+        check
+    }
+
+    /// Take the outline's reads (thread outline design §5.1): the tree when
+    /// every step passed and bridging is on; otherwise today's path, with
+    /// the reason kept. An `Outline` cursor with no tree reads as
+    /// `Listed { cursor: None }`: the stored replies were shown, so the
+    /// listing from its start.
+    async fn settle_outline(&mut self, outlined: Outlined) {
+        let tree = match outlined {
+            Outlined::No => None,
+            Outlined::Done(why) => {
+                self.outline_use = Some(why);
+                None
+            }
+            Outlined::Reading(task) if !self.bridging => {
+                task.abort();
+                self.outline_use = Some(Use::BridgingOff);
+                None
+            }
+            Outlined::Reading(mut task) => match tokio::time::timeout(super::outline::READ_WAIT, &mut task).await {
+                Err(_) => {
+                    task.abort();
+                    tracing::warn!(event = "threadlens_outline_read_slow", "thread outline reads took too long: today's path");
+                    self.outline_use = Some(Use::Error);
+                    None
+                }
+                Ok(joined) => match joined {
+                    Ok(Ok(Read::Tree(tree))) => {
+                        self.outline_use = Some(Use::Tree);
+                        Some(Arc::new(*tree))
+                    }
+                    Ok(Ok(Read::Fallback(why))) => {
+                        self.outline_use = Some(why);
+                        None
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(event = "threadlens_outline_read_failed", %error, "thread outline read failed: today's path");
+                        self.outline_use = Some(Use::Error);
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(event = "threadlens_outline_read_failed", %error, "thread outline read failed: today's path");
+                        self.outline_use = Some(Use::Error);
+                        None
+                    }
+                },
+            },
+        };
+        if tree.is_none()
+            && let Some((Position::Outline { .. }, raw)) = &self.start
+        {
+            self.start = Some((Position::Listed { cursor: None }, raw.clone()));
+        }
+        self.tree = tree;
+    }
+
+    /// The anchor cross-check, once the candidates are about to form
+    /// (§5.6): a miss drops the tree, and the request takes today's path.
+    async fn confirm_tree(&mut self, outline: Option<&Reader>) -> Result<(), sqlx::Error> {
+        let Some(tree) = self.tree.clone() else {
+            return Ok(());
+        };
+        let through = outline.and_then(|o| o.outline().through_ms());
+        if self.cross_check(&tree, through).await? == Some(Check::Miss) {
+            self.outline_use = Some(Use::Crosscheck);
+            self.tree = None;
+        }
+        Ok(())
     }
 
     /// Enforcement (§5.15.12): one pass over every view the response
@@ -1095,6 +1642,96 @@ impl Work<'_> {
     }
 }
 
+/// Where a tree sequence's outline phase starts, when no stored reply was
+/// read before it: an `Outline` position with an empty URI (§5.3.4).
+fn outline_start() -> Position {
+    Position::Outline { at: DateTime::UNIX_EPOCH, uri: String::new() }
+}
+
+/// One node's reply sequence from the tree (thread outline design §5.3.3):
+/// its stored replies, in `(created_at, uri)` order as the database orders
+/// them and at most a page of them, as [`Work::local_phase`] reads them;
+/// then its live outline-only children, in `(created_at, uri)` order on the
+/// URI's bytes. From a `Local` position the stored replies after it are
+/// read; from an `Outline` one, the outline-only children after it, and
+/// any child stored since that sorts after it, in one `(created_at, uri)`
+/// order.
+fn tree_seq(tree: &Tree, parent: &str, from: Option<Position>) -> Seq {
+    let page = usize::try_from(LISTING_PAGE).unwrap_or(usize::MAX);
+    let mut replies: Vec<Reply> = Vec::new();
+    let mut before = from.clone();
+    let outline_after = match &from {
+        Some(Position::Outline { at, uri }) => Some((*at, uri.clone())),
+        _ => None,
+    };
+    if outline_after.is_none() {
+        let local_cursor = matches!(from, Some(Position::Local { .. }));
+        let stored: Vec<&super::outline::Stored> = tree.stored.get(parent).into_iter().flatten().filter(|s| !local_cursor || s.after_cursor).collect();
+        let more = stored.len() > page;
+        for s in stored.into_iter().take(page) {
+            replies.push(Reply { uri: s.uri.clone(), local_row: true, before: before.clone() });
+            before = Some(Position::Local { at: s.created_at, uri: s.uri.clone() });
+        }
+        if more {
+            return Seq { parent: parent.to_string(), replies, rest: Some(before) };
+        }
+    }
+    let mut before = before.or_else(|| Some(outline_start()));
+    let after = |at: DateTime<Utc>, uri: &str| match &outline_after {
+        Some((from_at, from_uri)) => from_uri.is_empty() || (at, uri.as_bytes()) > (*from_at, from_uri.as_bytes()),
+        None => true,
+    };
+    // From an `Outline` position, a child stored since the last page is
+    // read in this phase too, in its place (a duplicate of one shown
+    // already is merged by URI on the client).
+    let mut phase: Vec<(DateTime<Utc>, &str, bool)> = tree.outline_children(parent).map(|c| (c.created_at, c.uri.as_str(), false)).collect();
+    if outline_after.is_some() {
+        phase.extend(tree.stored.get(parent).into_iter().flatten().map(|s| (s.created_at, s.uri.as_str(), true)));
+        phase.sort_by(|a, b| (a.0, a.1.as_bytes()).cmp(&(b.0, b.1.as_bytes())));
+    }
+    for (at, uri, local_row) in phase {
+        if !after(at, uri) {
+            continue;
+        }
+        replies.push(Reply { uri: uri.to_string(), local_row, before: before.clone() });
+        before = Some(Position::Outline { at, uri: uri.to_string() });
+    }
+    Seq { parent: parent.to_string(), replies, rest: None }
+}
+
+/// The outline's reads for one request, while the baseline is assembled.
+enum Outlined {
+    /// The request is not one the outline serves.
+    No,
+    /// It is, and cannot be served from it, for this reason.
+    Done(Use),
+    /// The reads are running.
+    Reading(tokio::task::JoinHandle<Result<Read, sqlx::Error>>),
+}
+
+/// Start the outline's reads for a request (thread outline design §5.1),
+/// when the outline is enabled, active and fresh, Farsight is configured,
+/// `depth > 0`, and there is no cursor, or a `Local` or `Outline` one
+/// (§5.3.4). The anchor is a post: other anchors never get here.
+fn start_outline(h: &crate::hydration::Hydrator, outline: Option<&Reader>, r: &Request<'_>, cursor: Option<&Position>) -> Outlined {
+    let continuing = matches!(cursor, Some(Position::Local { .. } | Position::Outline { .. }));
+    if h.farsight().is_none() || r.depth == 0 || !(cursor.is_none() || continuing) {
+        return Outlined::No;
+    }
+    let Some(reader) = outline else {
+        return Outlined::Done(Use::Off);
+    };
+    if let Some(why) = reader.unusable() {
+        return Outlined::Done(why);
+    }
+    let after = match cursor {
+        Some(Position::Local { at, uri }) => Some((*at, uri.clone())),
+        _ => None,
+    };
+    let (reader, h, req, anchor, depth) = (reader.clone(), h.clone(), r.req.clone(), r.anchor.to_string(), r.depth);
+    Outlined::Reading(tokio::spawn(async move { reader.read(&h, &req, &anchor, depth, after).await }))
+}
+
 /// Replace `post.author` with the remote `view` projected to
 /// `profileViewBasic`, keeping the author's own `viewer` and `labels`.
 pub(crate) fn set_author(post: &mut Value, view: &Value) {
@@ -1108,7 +1745,7 @@ pub(crate) fn set_author(post: &mut Value, view: &Value) {
     post["author"] = Value::Object(author);
 }
 
-/// The nodes for a `getThread` response.
+/// The nodes for a `getThread` response, without the thread outline.
 ///
 /// # Errors
 ///
@@ -1120,12 +1757,31 @@ pub async fn get_thread(
     r: Request<'_>,
     cursor: Option<(Position, String)>,
 ) -> Result<Thread, HydrationError> {
+    get_thread_outlined(ladder, cfg, key, None, r, cursor).await
+}
+
+/// The nodes for a `getThread` response, reading the thread outline when
+/// one is given and it can serve the request (thread outline design §5).
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn get_thread_outlined(
+    ladder: &Ladder,
+    cfg: &ThreadLensConfig,
+    key: &CursorKey,
+    outline: Option<&Reader>,
+    r: Request<'_>,
+    cursor: Option<(Position, String)>,
+) -> Result<Thread, HydrationError> {
     // Decided by the URI's form: one node, no round, no call.
     if let Some(gap) = gap_by_form(r.anchor) {
         return Ok(Thread {
             nodes: vec![LensNode::gap(r.anchor, None, gap)],
             bridging: Bridging::Off,
             phases: Vec::new(),
+            outline: None,
+            crosscheck: None,
         });
     }
     let h = ladder.hydrator();
@@ -1145,6 +1801,9 @@ pub async fn get_thread(
     // the baseline, when bridging can be on and the replies will be read.
     let anchor_page = (cursor.is_none() && r.depth > 0 && h.farsight().is_some() && h.lists_replies())
         .then(|| listing_call(h, r.req, r.anchor, None));
+    // The outline's reads, beside the baseline and F7 (thread outline
+    // design §5.1).
+    let outlined = start_outline(h, outline, &r, cursor.as_ref().map(|(position, _)| position));
     let memo = crate::hydration::thread::ThreadMemo::new();
     let collected = h.lens_baseline(r.viewer, r.req, r.anchor, depth, parent_height, &memo).await?;
     let mut authors: Vec<String> = collected.as_ref().map(|(tree, ..)| named_accounts(tree)).unwrap_or_default().into_iter().collect();
@@ -1192,26 +1851,50 @@ pub async fn get_thread(
         start: cursor,
         links,
         upstream,
+        tree: None,
+        prefetched: HashMap::new(),
+        gone: HashSet::new(),
+        gone_checked: HashSet::new(),
+        reserve: outline.map_or(0, Reader::enforce_reserve),
+        outline_use: None,
+        crosscheck: None,
     };
     phases.mark("emit");
+    work.settle_outline(outlined).await;
+    phases.mark("outline");
     let attach = if work.nodes.is_empty() { work.anchor_alone().await? } else { true };
     if work.start.is_some() {
+        let outlined_tree = work.tree.clone();
         // The anchor's sequence from the cursor. A post's stored replies
         // can be read in either state; anything else needs bridging. Where
         // nothing can be read, the anchor keeps the cursor it came with.
         let is_post = matches!(work.nodes.last(), Some(LensNode::Post { .. }));
         if attach && (bridging || is_post) {
-            work.replies().await?;
+            match &outlined_tree {
+                Some(tree) => work.tree_replies(tree).await?,
+                None => work.replies().await?,
+            }
         } else if attach {
             let from = work.start.as_ref().map(|(position, _)| position.clone());
             work.mark_at(r.anchor, from);
         }
     } else if bridging && attach {
         work.stubs().await?;
+        work.confirm_tree(outline).await?;
         phases.mark("stubs");
-        work.parents().await?;
-        phases.mark("parents");
-        work.replies().await?;
+        let outlined_tree = work.tree.clone();
+        match &outlined_tree {
+            Some(tree) => {
+                work.tree_parents(tree).await?;
+                phases.mark("parents");
+                work.tree_replies(tree).await?;
+            }
+            None => {
+                work.parents().await?;
+                phases.mark("parents");
+                work.replies().await?;
+            }
+        }
     } else if !bridging {
         // The response is the baseline. It says where the ordinary view
         // stopped: at `parentHeight`, and at the `depth` boundary.
@@ -1249,7 +1932,10 @@ pub async fn get_thread(
         (true, true) => Bridging::Limited,
         (true, false) => Bridging::Full,
     };
-    Ok(Thread { nodes: work.nodes, bridging, phases: phases.finish() })
+    if let Some(why) = work.outline_use {
+        why.record();
+    }
+    Ok(Thread { nodes: work.nodes, bridging, phases: phases.finish(), outline: work.outline_use, crosscheck: work.crosscheck })
 }
 
 /// The last path segment of an at-uri (its record key).
@@ -1443,7 +2129,7 @@ pub async fn resolve(
     // Inputs all decided by their form: no round, no call.
     if judged.is_empty() {
         let nodes = uris.iter().map(|uri| LensNode::gap(uri, None, gap_by_form(uri).unwrap_or(Gap::NotFound))).collect();
-        return Ok(Thread { nodes, bridging: Bridging::Off, phases: Vec::new() });
+        return Ok(Thread { nodes, bridging: Bridging::Off, phases: Vec::new(), outline: None, crosscheck: None });
     }
     let lookup = h.farsight().map(|farsight| lens_lookup(farsight, viewer, req));
     let mut judge = Judge::new(h.pool().clone(), &me, lookup, cfg);
@@ -1469,6 +2155,13 @@ pub async fn resolve(
         start: None,
         links: HashMap::new(),
         upstream: HashSet::new(),
+        tree: None,
+        prefetched: HashMap::new(),
+        gone: HashSet::new(),
+        gone_checked: HashSet::new(),
+        reserve: 0,
+        outline_use: None,
+        crosscheck: None,
     };
     let fetches: Vec<String> = uris
         .iter()
@@ -1500,7 +2193,7 @@ pub async fn resolve(
         (true, true) => Bridging::Limited,
         (true, false) => Bridging::Full,
     };
-    Ok(Thread { nodes: work.nodes, bridging, phases: Vec::new() })
+    Ok(Thread { nodes: work.nodes, bridging, phases: Vec::new(), outline: None, crosscheck: None })
 }
 
 #[cfg(test)]
