@@ -94,6 +94,11 @@ no tracker references.
 
 ### Changed
 
+- **`refract.fill` answers most new DIDs as final on the first call.** It
+  waits up to 300 ms for the identity resolves it starts. A DID hosted by no
+  listed community is then left out as final, not listed in `pending`, so a
+  client skips its re-ask. A resolve still running at 300 ms stays `pending`
+  as before.
 - **Thread Lens names a labeler as applied only when every upstream answer
   applied it.** `atproto-content-labelers` on `getThread` and `resolve` used
   to name a labeler if any upstream answer of the request said it applied

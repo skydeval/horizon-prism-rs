@@ -197,8 +197,10 @@ async fn visitors_unanswered_pairs_are_blocked() {
 }
 
 /// RF-S6 and `fill` leniency: a malformed item is dropped and the rest
-/// answered; a DID found on no listed community is pending once, then left
-/// out (no new resolve, no cap) until the communities change.
+/// answered; a DID found on no listed community is left out as final,
+/// already on the call that resolved it (the resolve finished inside
+/// `fill`'s short wait), and stays left out (no new resolve, no cap) until
+/// the communities change.
 #[tokio::test]
 async fn fill_remembers_not_hosted() {
     let Some(db) = fresh_db("refract_endpoint_not_hosted").await else {
@@ -210,19 +212,11 @@ async fn fill_remembers_not_hosted() {
     });
     let base = serve(&h, None).await;
     let (status, body) = call(&base, FILL, &format!("dids={THIRD}&dids=bogus&uris=nope"), Some("bsky_appview")).await;
-    assert_eq!((status, body["pending"].clone()), (200, json!([THIRD])), "{body}");
-    // The resolve lands: not hosted, so no row and, soon, not pending.
-    let mut left_out = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let (_, body) = call(&base, FILL, &format!("dids={THIRD}"), Some("bsky_appview")).await;
-        if body["pending"] == json!([]) {
-            left_out = true;
-            break;
-        }
-    }
-    assert!(left_out, "a not-hosted DID is left out of pending");
+    assert_eq!((status, body["pending"].clone()), (200, json!([])), "final on the first call: {body}");
     assert_eq!(h.state(THIRD).await, None, "nothing stored about it");
+    // Remembered: the next call is answered from the cache.
+    let (_, body) = call(&base, FILL, &format!("dids={THIRD}"), Some("bsky_appview")).await;
+    assert_eq!(body["pending"], json!([]), "{body}");
     // A change of the communities forgets it.
     let mut wide = tier1();
     wide.name = "elsewhere".into();

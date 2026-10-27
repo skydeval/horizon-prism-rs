@@ -620,6 +620,7 @@ impl RefractState {
         let communities = self.refract.communities();
         let mut pending = Vec::new();
         let mut withheld: Vec<(String, &'static str)> = Vec::new();
+        let mut started: Vec<(String, tokio::task::JoinHandle<&'static str>)> = Vec::new();
         for did in dids {
             if snapshot.is_restored(did) {
                 if snapshot.awaiting.contains(did) {
@@ -732,17 +733,32 @@ impl RefractState {
             pending.push(did.clone());
             let refract = self.refract.clone();
             let discovery = Arc::clone(&self.discovery);
-            let did = did.clone();
+            let task_did = did.clone();
             let judged = communities.clone();
-            tokio::spawn(async move {
-                let outcome = resolve_and_insert(&refract, &discovery.not_hosted, &did).await;
-                discovery.resolving.finish(&did, &judged, matches!(outcome, "resolve_failed" | "error"));
+            let handle = tokio::spawn(async move {
+                let outcome = resolve_and_insert(&refract, &discovery.not_hosted, &task_did).await;
+                discovery.resolving.finish(&task_did, &judged, matches!(outcome, "resolve_failed" | "error"));
                 metrics::counter!(METRIC_CANDIDATES, "source" => "fill", "outcome" => outcome).increment(1);
+                outcome
             });
+            started.push((did.clone(), handle));
+        }
+        // Wait briefly for the resolves this call started (2026-10-27): most
+        // finish in tens of milliseconds, and one hosted by no listed
+        // community is then answered as final here, not `pending`. A resolve
+        // still running at the deadline keeps going and stays `pending`.
+        let deadline = tokio::time::Instant::now() + FILL_RESOLVE_WAIT;
+        for (did, handle) in started {
+            if let Ok(Ok("not_hosted")) = tokio::time::timeout_at(deadline, handle).await {
+                pending.retain(|d| *d != did);
+            }
         }
         Ok(Discovered { pending, withheld })
     }
 }
+
+/// How long `fill` waits for the resolves it started before answering.
+const FILL_RESOLVE_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// A `fill`'s background resolve of `did`: insert it as a candidate when a
 /// listed community hosts it. A definite "hosted by none" (the document
