@@ -472,6 +472,11 @@ pub struct Consumer {
     /// A recreation gap is owed: the cache of `recreation_gap_owed`.
     owed: bool,
     step: StepStats,
+    /// The thread outline's sender, when the outline is on (thread outline
+    /// design §3.1).
+    outline: Option<crate::thread_outline::Sender>,
+    /// The entry in progress's outline ops, sent once it is processed.
+    outline_ops: Vec<crate::thread_outline::ops::Op>,
     #[cfg(test)]
     pub(crate) test: TestTuning,
 }
@@ -511,7 +516,18 @@ impl Consumer {
             prev_reanchor_added: None,
             owed: false,
             step: StepStats::default(),
+            outline: None,
+            outline_ops: Vec::new(),
         }
+    }
+
+    /// Hand each commit's thread outline ops to the outline writer
+    /// (thread outline design §3.1). The writer passed to [`Consumer::new`]
+    /// must collect them ([`Writer::with_outline`]).
+    #[must_use]
+    pub fn with_outline(mut self, sender: crate::thread_outline::Sender) -> Self {
+        self.outline = Some(sender);
+        self
     }
 
     /// Set `lists.sync_min_interval_secs`.
@@ -622,7 +638,7 @@ impl Consumer {
             crate::test_support::hooks::pause(crate::test_support::hooks::AFTER_RECREATION_CREATE, &self.test.db).await;
         }
         if self.owed {
-            self.gap(GapCause::GroupRecreated, false, true).await?;
+            self.gap(GapCause::GroupRecreated, false, true, None).await?;
         }
         Ok(())
     }
@@ -669,7 +685,7 @@ impl Consumer {
         }
         if interrupted || !deleted.is_empty() {
             let cause = if deleted.is_empty() { GapCause::InterruptedClaim } else { GapCause::Pending };
-            self.gap(cause, true, false).await?;
+            self.gap(cause, true, false, None).await?;
             self.ack(&deleted).await?;
         } else {
             gap::set_claim_in_progress(&self.pool, false).await?;
@@ -679,11 +695,26 @@ impl Consumer {
 
     /// Run the gap transaction, with `gap_blocked` set until it commits and,
     /// while a recreation gap is owed, until that one does. `clear_owed`
-    /// clears `recreation_gap_owed` in the same transaction.
-    async fn gap(&mut self, cause: GapCause, clear_claim: bool, clear_owed: bool) -> Result<(), ConsumerError> {
+    /// clears `recreation_gap_owed` in the same transaction. With the
+    /// thread outline on, the transaction also moves the outline's
+    /// `complete_since` (thread outline design §3.3, R3-4): a trim to the ms
+    /// of `last_generated_id`, the other causes to Redis's clock.
+    async fn gap(&mut self, cause: GapCause, clear_claim: bool, clear_owed: bool, last_generated_id: Option<&str>) -> Result<(), ConsumerError> {
         self.status.set_gap_blocked(true);
         let started = Instant::now();
         let private = Arc::clone(self.writer.private());
+        let outline_since = match &self.outline {
+            Some(_) => {
+                let now = match cause {
+                    GapCause::Pending | GapCause::InterruptedClaim | GapCause::GroupRecreated => {
+                        Some(crate::thread_outline::redis_time_ms(&mut self.redis).await?)
+                    }
+                    GapCause::Trim | GapCause::Operator => None,
+                };
+                crate::thread_outline::gap_value(cause, last_generated_id, now)
+            }
+            None => None,
+        };
         let _epoch = gap::run_gap_transaction_clearing(
             &self.pool,
             self.writer.scope(),
@@ -691,8 +722,18 @@ impl Consumer {
             cause,
             clear_claim,
             clear_owed,
+            outline_since,
         )
         .await?;
+        if let Some(sender) = &self.outline {
+            if let Some(ms) = outline_since {
+                sender.outline().raise_complete_since(ms);
+            }
+            // A recreated group may begin a new stream below `through`.
+            if cause == GapCause::GroupRecreated {
+                sender.reset_stream();
+            }
+        }
         let took = started.elapsed();
         self.step.gap = true;
         self.step.gap_time += took;
@@ -819,7 +860,7 @@ impl Consumer {
                 let (trimmed, live): (Vec<StreamEntry>, Vec<StreamEntry>) =
                     entries.into_iter().partition(|e| e.fields.is_none());
                 if !trimmed.is_empty() {
-                    self.gap(GapCause::Pending, false, false).await?;
+                    self.gap(GapCause::Pending, false, false, None).await?;
                     let ids: Vec<String> = trimmed.into_iter().map(|e| e.id).collect();
                     self.ack(&ids).await?;
                 }
@@ -869,7 +910,7 @@ impl Consumer {
             last_generated_id = %evidence.last_generated_id,
             "trim evidence"
         );
-        self.gap(GapCause::Trim, false, false).await?;
+        self.gap(GapCause::Trim, false, false, Some(&evidence.last_generated_id)).await?;
         let added = evidence.added();
         let window = self.throughput.delta(Instant::now(), added, self.running());
         let (wanted, mut reason) = reanchor_mode(self.prev_reanchor_added, &evidence, window);
@@ -961,9 +1002,19 @@ impl Consumer {
         self.test.record.lock().expect("record").batches.push((Instant::now(), entries.len()));
         let mut acks: Vec<String> = Vec::with_capacity(entries.len());
         for entry in &entries {
+            if let Some(o) = &mut self.outline {
+                o.before_entry(&entry.id);
+            }
+            self.outline_ops.clear();
             match self.process_entry(entry).await {
-                Ok(path) => self.count(entry, path),
+                Ok(path) => {
+                    self.count(entry, path);
+                    if let Some(o) = &mut self.outline {
+                        o.commit(&entry.id, std::mem::take(&mut self.outline_ops));
+                    }
+                }
                 Err(error) => {
+                    self.outline_through(&acks);
                     if let Err(ack_error) = self.ack(&acks).await {
                         tracing::warn!(event = "firehose_ack_failed", error = %ack_error, "acking committed entries failed; they will be re-applied");
                     }
@@ -972,7 +1023,16 @@ impl Consumer {
             }
             acks.push(entry.id.clone());
         }
+        self.outline_through(&acks);
         self.ack(&acks).await
+    }
+
+    /// Tell the outline writer every entry through the last of `processed`
+    /// is processed (thread outline design §3.1).
+    fn outline_through(&mut self, processed: &[String]) {
+        if let (Some(o), Some(last)) = (&mut self.outline, processed.last()) {
+            o.through(last);
+        }
     }
 
     /// Book one processed entry (§4.2).
@@ -1008,11 +1068,17 @@ impl Consumer {
         let event = match decode(entry) {
             Ok(e) => e,
             Err(error) => {
+                let readable = readable_despite(entry);
+                // Thread outline design §2, §3.1: a bad-rev commit's post
+                // ops, and a parseable dead letter's, record holes.
+                if self.outline.is_some() {
+                    self.outline_ops = crate::thread_outline::ops::refused_ops(entry, readable.as_ref());
+                }
                 // A refusal that could not matter is counted and dropped
                 // (actionable-warnings design §6): an event naming no DID,
                 // or a commit refused for its rev alone whose ops, with a
                 // valid rev, would have written nothing.
-                let dropped = match readable_despite(entry) {
+                let dropped = match readable {
                     Some(Readable::NotADid) => Some("did"),
                     Some(Readable::Commit { repo, ops }) => (!self.writer.would_write(&repo, &ops).await).then_some("rev"),
                     None => None,
@@ -1039,7 +1105,12 @@ impl Consumer {
             }
         };
         match event {
-            Event::Identity { kind, did, relay } => {
+            Event::Identity { kind, did, relay, active } => {
+                if self.outline.is_some()
+                    && let Some(key) = crate::thread_outline::ops::status_relay(&self.watermarks, relay.as_deref())
+                {
+                    self.outline_ops = crate::thread_outline::ops::status_op(kind, &did, &key, active, entry.seq()).into_iter().collect();
+                }
                 let queued = route_identity(&self.pool, kind, &did, &self.system_accounts).await?;
                 // The live feed counts every event and shows the queued ones
                 // (admin-ui-live-feed design §4.1).
@@ -1105,7 +1176,12 @@ impl Consumer {
         }
         if let Some(c) = contribution(entry.id_ms(), commit.time) {
             self.watermarks.observe(&label, c);
+            // Thread outline design §3.3 (R5-4): each relay's liveness ring.
+            if let Some(o) = &self.outline {
+                o.outline().observe_relay(&label, c.timestamp_millis());
+            }
         }
+        self.outline_ops = report.outline;
         Ok(if report.transaction { EntryPath::Tx } else { EntryPath::NoTx })
     }
 
@@ -1450,6 +1526,7 @@ mod tests {
 
     mod bench;
     mod live;
+    mod outline;
 
     fn bulk(s: &str) -> Value {
         Value::BulkString(s.as_bytes().to_vec())

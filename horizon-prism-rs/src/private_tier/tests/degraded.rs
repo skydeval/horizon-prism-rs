@@ -923,7 +923,7 @@ async fn tdm9_reindexing_at_the_private_gate_and_the_view_sites() {
     let base = serve_live(w.f.state_read(w.f.app.clone(), Some(Duration::from_secs(1)), floor, &TEST_CURSOR_KEY, &PrivateReadConfig::default())).await;
     let root = w.root.clone();
     let scope = ScopeState::new(w.f.sets.clone(), ScopePolicy::MembersAndOneHop, 10_000);
-    crate::firehose::gap::run_gap_transaction_clearing(&pool, &scope, &KryphocronPrivateTier, crate::firehose::gap::GapCause::Trim, false, false)
+    crate::firehose::gap::run_gap_transaction_clearing(&pool, &scope, &KryphocronPrivateTier, crate::firehose::gap::GapCause::Trim, false, false, None)
         .await
         .expect("gap");
     let expected = "{\"error\":\"Reindexing\",\"message\":\"Account re-indexing after an interruption; try again\",\"retryAfter\":30}";

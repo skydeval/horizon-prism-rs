@@ -119,6 +119,7 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     discovery(cfg, &mut out);
     refract(cfg, &mut out);
     plural(cfg, &mut out);
+    thread_outline(cfg, &mut out);
     #[cfg(feature = "standin-hosts")]
     crate::net::standin::problems(&cfg.standin, &mut out);
     out
@@ -248,6 +249,32 @@ fn plural(cfg: &FileConfig, out: &mut Vec<String>) {
     for (key, value) in [("fill_rate_per_sec", p.fill_rate_per_sec.0), ("per_host_rate_per_sec", p.per_host_rate_per_sec.0)] {
         if !(value.is_finite() && value > 0.0) {
             out.push(format!("plural.{key} must be above 0"));
+        }
+    }
+}
+
+/// `[thread_outline]` (thread outline design §4). Checked whether or not it
+/// is enabled: every value is a plain bound.
+fn thread_outline(cfg: &FileConfig, out: &mut Vec<String>) {
+    let t = &cfg.thread_outline;
+    if !(2..=365).contains(&t.window_days) {
+        out.push("thread_outline.window_days must be 2 to 365".to_string());
+    }
+    if t.flush_ms > 10_000 {
+        out.push("thread_outline.flush_ms must be at most 10000".to_string());
+    }
+    if u64::from(t.settle_secs) >= u64::from(t.window_days) * 86_400 {
+        out.push("thread_outline.settle_secs must be shorter than window_days".to_string());
+    }
+    for (key, value) in [
+        ("queue_messages", t.queue_messages),
+        ("flush_ms", t.flush_ms),
+        ("fresh_secs", t.fresh_secs),
+        ("max_tree", t.max_tree),
+        ("max_thread", t.max_thread),
+    ] {
+        if value == 0 {
+            out.push(format!("thread_outline.{key} must be at least 1"));
         }
     }
 }

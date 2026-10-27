@@ -688,6 +688,32 @@ reverify_hours = 24
 max_pending = 100000
 max_stream_lag_secs = 120
 
+# The thread outline: who replied to whom, for every public post the
+# firehose delivers, with no text, so Thread Lens knows a thread's shape up
+# front. Off by default. On, it records every author's posts network-wide,
+# about 3 million a day, whatever public_scope says: about 17 GB of disk at
+# 30 days. Restart to apply.
+#   window_days      days a post's structure is kept (2 to 365)
+#   queue_messages   messages the firehose may queue for the outline writer
+#   flush_ms         how often the writer writes a batch
+#   settle_secs      threads are trusted complete only for roots seen this
+#                    long after the outline's coverage began
+#   fresh_secs       how far behind the stream the outline may fall and
+#                    still be used
+#   max_tree         rows read under a thread's anchor
+#   max_thread       rows of one thread scanned for missing replies
+#   enforce_reserve  checks kept back for the final block pass
+[thread_outline]
+enabled = false
+window_days = 30
+queue_messages = 50000
+flush_ms = 250
+settle_secs = 900
+fresh_secs = 30
+max_tree = 5000
+max_thread = 20000
+enforce_reserve = 100
+
 # Showing a list that no other AppView could answer for: how many pages of
 # the list owner's records one request may read from the owner's server.
 [lists]

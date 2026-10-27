@@ -168,6 +168,10 @@ pub struct ApplyReport {
     /// The call opened a transaction: false for a commit with nothing to
     /// write (§5.5 "Nothing to write").
     pub transaction: bool,
+    /// The commit's thread outline ops (thread outline design §3.1), for a
+    /// [`WriteSource::Firehose`] call of a writer with the outline on;
+    /// empty otherwise. Collected whatever the ops' outcomes, for every DID.
+    pub outline: Vec<crate::thread_outline::ops::Op>,
 }
 
 /// A failure that must abort the call and retry it later (§5.3 transient).
@@ -321,6 +325,35 @@ fn prepare(repo: &str, op: &RawOp, now: DateTime<Utc>) -> Prepared {
         Ok(None) => Prepared::Skip("unindexed"),
         Err(e) => Prepared::Invalid(e.0),
     }
+}
+
+/// The thread outline ops of a commit's prepared ops (thread outline design
+/// §3.1).
+fn outline_from_prepared(repo: &str, rev: &str, ops: &[RawOp], prepared: &[Prepared]) -> Vec<crate::thread_outline::ops::Op> {
+    use crate::thread_outline::ops::{Seen, post_ops};
+    let seen = prepared.iter().map(|p| match p {
+        Prepared::Upsert(u) => match &u.body {
+            Body::Post(post) => Seen::Post {
+                created: u.created,
+                parent: post.reply_parent.as_ref().map(|r| r.uri.as_str()),
+                root: post.reply_root.as_ref().map(|r| r.uri.as_str()),
+                created_at: u.created_at,
+            },
+            _ => Seen::Other,
+        },
+        Prepared::Delete(_) => Seen::Delete,
+        Prepared::Invalid(_) => Seen::Invalid,
+        Prepared::Skip(_) => Seen::Other,
+    });
+    post_ops(repo, rev, ops, seen)
+}
+
+/// The thread outline ops of one commit, `prepare`d against `now` (the
+/// outline's replay, thread outline design §3.3 step 3, N7). Writes nothing.
+#[must_use]
+pub fn outline_ops(repo: &str, rev: &str, ops: &[RawOp], now: DateTime<Utc>) -> Vec<crate::thread_outline::ops::Op> {
+    let prepared: Vec<Prepared> = ops.iter().map(|op| prepare(repo, op, now)).collect();
+    outline_from_prepared(repo, rev, ops, &prepared)
 }
 
 /// One op's outcome when it runs no SQL, or `None` when it needs the
@@ -739,6 +772,9 @@ pub struct Writer {
     /// The admin UI's live feed (admin-ui-live-feed design §4), when the
     /// web UI is on.
     feed: Option<FeedTap>,
+    /// Collect thread outline ops for firehose commits (thread outline
+    /// design §3.1).
+    outline: bool,
 }
 
 /// The live feed's view of one call's ops (admin-ui-live-feed design
@@ -792,7 +828,16 @@ impl Writer {
             list_budget: Budget { max_references: 25, max_owners: 10 },
             applier: None,
             feed: None,
+            outline: false,
         }
+    }
+
+    /// Collect thread outline ops in [`ApplyReport::outline`] for
+    /// [`WriteSource::Firehose`] calls (thread outline design §3.1).
+    #[must_use]
+    pub fn with_outline(mut self, on: bool) -> Self {
+        self.outline = on;
+        self
     }
 
     /// Tell `tap` about every applied op (admin-ui-live-feed design §4.1).
@@ -924,6 +969,13 @@ impl Writer {
         }
         let now = Utc::now();
         let prepared: Vec<Prepared> = ops.iter().map(|op| prepare(repo, op, now)).collect();
+        // Thread outline design §3.1: after `prepare`, for every DID and
+        // every public-indexing mode, before admission decides anything.
+        let outline = if self.outline && options.source == WriteSource::Firehose {
+            outline_from_prepared(repo, rev, ops, &prepared)
+        } else {
+            Vec::new()
+        };
 
         // 1. Read guard before any connection.
         let guard = self.scope.read_guard().await;
@@ -998,7 +1050,8 @@ impl Writer {
         #[cfg(not(test))]
         let forced = false;
         if !forced && nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options) {
-            let report = report_without_writes(repo, &prepared, &admissions, ops, sets, owner_side);
+            let mut report = report_without_writes(repo, &prepared, &admissions, ops, sets, owner_side);
+            report.outline = outline;
             drop(guard);
             if let Some(tap) = &self.feed {
                 tap.observe(feed_view(&prepared, ops, &report), options.source, relay, repo);
@@ -1011,7 +1064,7 @@ impl Writer {
         lock_dids_shared(&mut tx, &lock_dids).await?;
         lock_uris(&mut tx, &lock_uri_list).await?;
 
-        let mut report = ApplyReport { transaction: true, ..ApplyReport::default() };
+        let mut report = ApplyReport { transaction: true, outline, ..ApplyReport::default() };
         let mut effects = MemoryEffects::default();
         let mut copied = copy::Effects::default();
         for (i, (p, op)) in prepared.iter().zip(ops).enumerate() {

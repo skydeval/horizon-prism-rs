@@ -168,7 +168,7 @@ pub trait RetentionInputs: Send + Sync {
 
 /// A bind parameter for one retention statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Bind {
+pub(crate) enum Bind {
     None,
     Days(i32),
     Dids(Vec<String>),
@@ -176,11 +176,11 @@ enum Bind {
 
 /// One retention delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Step {
-    table: &'static str,
+pub(crate) struct Step {
+    pub(crate) table: &'static str,
     /// The batched delete. For a per-DID step it also filters on the DID
     /// parameter that follows the step's own bind.
-    sql: String,
+    pub(crate) sql: String,
     /// Per-DID steps: the query listing DIDs that have deletable rows.
     candidates: Option<String>,
     bind: Bind,
@@ -224,6 +224,23 @@ fn batched(table: &'static str, key: &str, alias: &str, pred: &str, bind: Bind) 
         table,
         sql: format!(
             "DELETE FROM {table} WHERE {key} IN (SELECT {alias}.{key} FROM {table} {alias} WHERE {pred} LIMIT {BATCH_SIZE})"
+        ),
+        candidates: None,
+        bind,
+    }
+}
+
+/// [`batched`] for a table whose key is several columns (thread outline
+/// design §3.5): `DELETE FROM <table> WHERE (<k1>, <k2>…) IN (SELECT
+/// <alias>.<k1>, <alias>.<k2>… FROM <table> <alias> WHERE <pred> LIMIT n)`.
+pub(crate) fn batched_composite(table: &'static str, keys: &[&str], alias: &str, pred: &str, bind: Bind) -> Step {
+    let selected: Vec<String> = keys.iter().map(|k| format!("{alias}.{k}")).collect();
+    Step {
+        table,
+        sql: format!(
+            "DELETE FROM {table} WHERE ({}) IN (SELECT {} FROM {table} {alias} WHERE {pred} LIMIT {BATCH_SIZE})",
+            keys.join(", "),
+            selected.join(", ")
         ),
         candidates: None,
         bind,
@@ -680,7 +697,7 @@ async fn delete_for_did(
     }
 }
 
-async fn run_steps(
+pub(crate) async fn run_steps(
     pool: &PgPool,
     scope: &dyn ScopeGuard,
     steps: &[Step],

@@ -2146,6 +2146,49 @@ impl Default for PluralConfig {
     }
 }
 
+/// `[thread_outline]` (thread outline design §4): the reply structure of
+/// every public post the firehose delivers, with no text, for Thread Lens.
+/// Off by default: it ingests network-wide, which is the operator's call.
+/// File-only; a restart applies it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThreadOutlineConfig {
+    pub enabled: bool,
+    /// Days a post's structure is kept after it was seen (2–365).
+    pub window_days: u32,
+    /// Messages the consumer may queue for the outline writer.
+    pub queue_messages: u32,
+    /// The writer flushes this often, or at 2,000 ops.
+    pub flush_ms: u32,
+    /// A thread counts as complete only for roots seen this long after the
+    /// outline's coverage began.
+    pub settle_secs: u32,
+    /// The outline is fresh while it is at most this far behind the stream.
+    pub fresh_secs: u32,
+    /// Rows read under a Thread Lens anchor.
+    pub max_tree: u32,
+    /// Rows scanned by root for orphans.
+    pub max_thread: u32,
+    /// The judge allowance kept for enforcement.
+    pub enforce_reserve: u32,
+}
+
+impl Default for ThreadOutlineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_days: 30,
+            queue_messages: 50_000,
+            flush_ms: 250,
+            settle_secs: 900,
+            fresh_secs: 30,
+            max_tree: 5000,
+            max_thread: 20_000,
+            enforce_reserve: 100,
+        }
+    }
+}
+
 /// `[refract]` (refract design §3.3). `enabled` and `communities` are live
 /// settings; the rest take effect at restart.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -2265,6 +2308,7 @@ pub struct FileConfig {
     pub constellation: ConstellationConfig,
     pub refract: RefractConfig,
     pub plural: PluralConfig,
+    pub thread_outline: ThreadOutlineConfig,
     /// The B-5 bench's head source; only under `bench-heads`.
     #[cfg(feature = "bench-heads")]
     pub bench: BenchConfig,

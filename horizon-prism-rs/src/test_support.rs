@@ -418,6 +418,16 @@ pub mod hooks {
     /// Private notification preferences T-N11: the write holding the DID's
     /// shared lock, before its membership check. Key: `<database>/<did>`.
     pub const NOTIFICATION_PREFS_AFTER_LOCK: &str = "np_put_after_lock";
+    /// Thread outline (T-O4): a flush fails transiently, keyed by the
+    /// database's name.
+    pub const OUTLINE_FLUSH_TRANSIENT: &str = "to_flush_transient";
+    /// A flush holding a create by `<database>/<did>` fails
+    /// deterministically.
+    pub const OUTLINE_FLUSH_DETERMINISTIC: &str = "to_flush_deterministic";
+    /// The outline writer, before it handles a message.
+    pub const OUTLINE_WRITER_PAUSE: &str = "to_writer_pause";
+    /// The outline's replay, between chunks.
+    pub const OUTLINE_REPLAY_BETWEEN_CHUNKS: &str = "to_replay_between_chunks";
 
     /// How long [`Armed::reached`] waits before the test fails.
     const REACH_WITHIN: Duration = Duration::from_secs(20);

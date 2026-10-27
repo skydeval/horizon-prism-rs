@@ -14,6 +14,25 @@ no tracker references.
 
 ### Added
 
+- **Thread outline index** (`[thread_outline]`, off by default). When on,
+  Horizon-Prism records the reply structure of every public post the
+  firehose delivers: author, record key, parent, root, time and rev, and a
+  mark when deleted, with no text. It is network-wide post ingest, for
+  every author and whatever `public_scope` says (about 3 million posts a
+  day), so it costs about 17 GB of disk at the default 30-day window;
+  older rows are deleted by the daily retention run. Thread Lens will use
+  it to know a thread's shape up front; this release only builds it.
+  Ingest never waits on it: if its writer falls behind, it catches up from
+  the stream, and what the stream no longer holds restarts its coverage.
+  One process writes it at a time. Migration 0050 adds its tables, so this
+  upgrade needs one start with `APP_ALLOW_STARTUP_MIGRATE=1`. New metrics
+  `outline_ops_total{op}`, `outline_holes_total{reason}`,
+  `outline_missed_total{reason}`, `outline_replays_total{why}`,
+  `outline_flush_seconds`, `outline_queue_ops`, `outline_actor_ids`,
+  `outline_writer_active`, `outline_complete_since`,
+  `outline_through_age_seconds` and `outline_freshness{state}` (1 for the
+  current state: `fresh`, `inactive`, `resuming`, `replaying`, `behind`
+  or `no_live_relay`).
 - **Thread Lens takes a handle-form anchor.** `getThread` accepts
   `at://<handle>/app.bsky.feed.post/<rkey>` (any case) and resolves the
   handle itself, as `resolveHandle` does, so a client opening a thread from

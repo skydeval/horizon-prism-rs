@@ -539,16 +539,47 @@ pub async fn run() -> Result<Stopped, StartupError> {
     .spawn();
     tasks.push(coverage_task);
     let status = Arc::new(ConsumerStatus::default());
+    // The thread outline (thread outline design §3, §4): its writer is
+    // spawned before the consumer, which hands it each commit's ops.
+    let to = &cfg.file.thread_outline;
+    let outline_sender = if to.enabled {
+        // `_outline` is the readers' handle; S2 hands it to Thread Lens.
+        let (_outline, sender, outline_writer) =
+            crate::thread_outline::writer::start(to.clone(), pool.clone(), redis.clone(), fh.stream_key.clone(), watermarks.clone());
+        tasks.push(outline_writer.spawn());
+        Some(sender)
+    } else {
+        // Switching off deletes `through` and clears `complete_since`.
+        if let Err(error) = crate::thread_outline::switch_off(&pool).await {
+            tracing::warn!(event = "thread_outline_switch_off_failed", %error, "could not clear the thread outline's progress");
+        }
+        None
+    };
+    match crate::thread_outline::stored_progress(&pool).await {
+        Ok((through, complete_since)) => tracing::info!(
+            event = "thread_outline",
+            enabled = to.enabled,
+            through = ?through.map(|t| t.to_string()),
+            complete_since = ?complete_since,
+            window_days = to.window_days,
+            "thread outline"
+        ),
+        Err(error) => tracing::warn!(event = "thread_outline", enabled = to.enabled, %error, "thread outline: progress unreadable"),
+    }
     let consumer = Consumer::new(
         fh.clone(),
         consumer_redis,
-        writer.clone(),
+        writer.clone().with_outline(outline_sender.is_some()),
         watermarks.clone(),
         coverage,
         Arc::clone(&status),
     )
     .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
     .with_system_accounts(system_accounts.clone());
+    let consumer = match outline_sender {
+        Some(sender) => consumer.with_outline(sender),
+        None => consumer,
+    };
     let throughput = consumer.throughput_shared();
     tasks.push(consumer.spawn());
     tasks.push(spawn_lag_sampler(redis.clone(), fh.clone(), throughput, LAG_SAMPLE_INTERVAL));
@@ -566,6 +597,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
         Arc::new(crate::farsight::retention::MemoryRetention::new(&cfg.file.farsight.memory, farsight.clone())),
         // Rule 4's daily safety net (design-v4 §14.1 R4).
         Arc::new(crate::subscriptions::sweep::OrphanSweep::new(applier.clone(), cfg.file.lists.sync_min_interval_secs)),
+        // The thread outline's window (thread outline design §3.5).
+        Arc::new(crate::thread_outline::retention::OutlineRetention::new(cfg.file.thread_outline.window_days)),
     ];
     let guard: Arc<dyn ScopeGuard> = Arc::new(scope.clone());
     tasks.push(spawn_scheduler(

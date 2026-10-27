@@ -128,6 +128,8 @@ mod tests {
             "0048_system_accounts",
             // System accounts amendment 1: start without the key.
             "0049_system_accounts_pending",
+            // Thread outline index S1 (#922).
+            "0050_thread_outline",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

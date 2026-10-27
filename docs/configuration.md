@@ -48,6 +48,7 @@ A value saved in the admin UI wins over the file. Horizon-Prism never writes `ap
 | `[rate_limits]`, `[auth]` | Request limits per class; limits on token checks. |
 | `[admin]` | Admin UI on/off, session lifetimes, live feed snippets. |
 | `[threadlens]` | Who may use Thread Lens and how much one response reads. |
+| `[thread_outline]` | The thread outline: who replied to whom, for Thread Lens. Off by default; see below. |
 | `[farsight]` | Block-list index (optional), with its fallback and memory. |
 | `[refract]` | Restored accounts (optional, off by default). |
 | `[plural]` | Pronouns and plural-system reads. |
@@ -85,6 +86,24 @@ Horizon-Prism runs without any of these. Each is off until configured.
 | Refract | `[refract] enabled` and communities | Restored accounts. | Off by default. |
 
 The Farsight fallback sends a member's DID and the accounts on their page to another AppView. Read the warning in `app.toml` before turning it on. Farsight and Lodestar see which accounts your instance asks about, so point them at instances you run or trust.
+
+## Thread outline
+
+`[thread_outline]` keeps the reply structure of every public post the firehose delivers: author, record key, parent, root, time and rev, and a mark when deleted. It keeps no text. Thread Lens uses it to know a thread's shape before it fetches posts.
+
+It is off by default because, once on, it records every author's posts network-wide, whatever `public_scope` says: about 3 million posts a day, and about 17 GB of disk at the default `window_days = 30`. Rows older than `window_days` are deleted by the daily retention run.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Record the outline. |
+| `window_days` | `30` | Days a post's structure is kept (2 to 365). |
+| `queue_messages` | `50000` | Messages the firehose may queue for the outline writer. A full queue never slows ingest; the writer catches up from the stream. |
+| `flush_ms` | `250` | How often the writer writes a batch. |
+| `settle_secs` | `900` | Threads count as complete only for roots seen this long after the outline's coverage began. |
+| `fresh_secs` | `30` | How far behind the stream the outline may fall and still be used. |
+| `max_tree`, `max_thread`, `enforce_reserve` | `5000`, `20000`, `100` | Bounds on what Thread Lens reads from it. |
+
+All keys apply at restart. Switching it off clears its progress, so switching it on again starts coverage afresh; the rows already stored age out. One process writes it at a time (an advisory lock): a second process waits and takes over when the first stops. Watch `outline_writer_active`, `outline_through_age_seconds` and `outline_missed_total`.
 
 ## Rate limits
 

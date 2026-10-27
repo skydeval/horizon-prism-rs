@@ -36,6 +36,12 @@ impl StreamEntry {
             .map(|(_, v)| v.as_slice())
     }
 
+    /// The entry's relay-scoped, monotonic `seq` field.
+    #[must_use]
+    pub fn seq(&self) -> Option<i64> {
+        self.field("seq").and_then(|s| s.parse().ok())
+    }
+
     /// The stream id's millisecond part (the Redis clock at XADD).
     #[must_use]
     pub fn id_ms(&self) -> Option<i64> {
@@ -117,8 +123,9 @@ pub fn parse_read_reply(v: Value) -> Result<Vec<StreamEntry>, String> {
 pub enum Event {
     Commit(Commit),
     /// `identity`, `account`, `handle` or `tombstone`: routed to the identity
-    /// refresher (§5.6).
-    Identity { kind: IdentityKind, did: String, relay: Option<String> },
+    /// refresher (§5.6). `active` is an `#account` event's flag, when it
+    /// carries one (thread outline design §3.1).
+    Identity { kind: IdentityKind, did: String, relay: Option<String>, active: Option<bool> },
 }
 
 /// The non-commit event types.
@@ -188,6 +195,9 @@ struct DidData {
     did: String,
     #[serde(default, rename = "_relay")]
     relay: Option<String>,
+    /// `#account` only; anything but a boolean is no flag.
+    #[serde(default)]
+    active: Option<Json>,
 }
 
 /// Decode an entry. Errors are deterministic (§5.2 contract stability).
@@ -211,10 +221,15 @@ pub fn decode(entry: &StreamEntry) -> Result<Event, String> {
     if !proto_blue::syntax::Did::is_valid(&d.did) {
         return Err(format!("invalid did {:?}", d.did));
     }
+    let active = match kind {
+        IdentityKind::Account => d.active.as_ref().and_then(Json::as_bool),
+        _ => None,
+    };
     Ok(Event::Identity {
         kind,
         did: d.did,
         relay: d.relay,
+        active,
     })
 }
 
@@ -457,9 +472,29 @@ mod tests {
                 Event::Identity {
                     kind,
                     did: "did:plc:aaaa".into(),
-                    relay: Some("r".into())
+                    relay: Some("r".into()),
+                    active: None,
                 }
             );
         }
+    }
+
+    /// Thread outline §3.1: an `#account` event's `active` flag and the
+    /// entry's `seq`; other kinds carry no flag.
+    #[test]
+    fn decodes_account_active_and_seq() {
+        let account = |data: &Json| match decode(&entry("account", data)).expect("event") {
+            Event::Identity { active, .. } => active,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(account(&json!({"did": "did:plc:aaaa", "active": false, "status": "takendown"})), Some(false));
+        assert_eq!(account(&json!({"did": "did:plc:aaaa", "active": true})), Some(true));
+        assert_eq!(account(&json!({"did": "did:plc:aaaa", "active": "yes"})), None);
+        assert_eq!(account(&json!({"did": "did:plc:aaaa"})), None);
+        let Event::Identity { active, .. } = decode(&entry("identity", &json!({"did": "did:plc:aaaa", "active": false}))).expect("event") else {
+            panic!("identity");
+        };
+        assert_eq!(active, None);
+        assert_eq!(entry("account", &json!({})).seq(), Some(42));
     }
 }

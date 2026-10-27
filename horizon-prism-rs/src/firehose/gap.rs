@@ -89,12 +89,16 @@ pub async fn run_gap_transaction(
     cause: GapCause,
     clear_claim: bool,
 ) -> Result<i64, sqlx::Error> {
-    run_gap_transaction_clearing(pool, scope, private, cause, clear_claim, false).await
+    run_gap_transaction_clearing(pool, scope, private, cause, clear_claim, false, None).await
 }
 
 /// [`run_gap_transaction`], which with `clear_owed` also clears
 /// `recreation_gap_owed` in the same transaction (firehose throughput design
 /// §6.2): only a gap transaction ever clears it.
+///
+/// `outline_since_ms`, when the thread outline is on and the cause loses
+/// entries, is written into the outline's `complete_since` with `GREATEST`
+/// in the same transaction (thread outline design §3.3, R3-4).
 ///
 /// # Errors
 ///
@@ -106,6 +110,7 @@ pub async fn run_gap_transaction_clearing(
     cause: GapCause,
     clear_claim: bool,
     clear_owed: bool,
+    outline_since_ms: Option<i64>,
 ) -> Result<i64, sqlx::Error> {
     #[cfg(test)]
     if let Some(db) = pool.connect_options().get_database()
@@ -135,6 +140,9 @@ pub async fn run_gap_transaction_clearing(
     }
     if clear_owed {
         set_json(&mut tx, KEY_RECREATION_GAP_OWED, &serde_json::json!(false)).await?;
+    }
+    if let Some(ms) = outline_since_ms {
+        crate::thread_outline::raise_stored_complete_since(&mut tx, ms).await?;
     }
     // Last, in the firehose writer's order (`members` → jobs →
     // `sync_state`, §3.3). No counter: a settle holding the key commits

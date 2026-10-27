@@ -405,6 +405,17 @@ reverify_hours = 24
 max_pending = 100000
 max_stream_lag_secs = 120
 
+[thread_outline]
+enabled = false
+window_days = 30
+queue_messages = 50000
+flush_ms = 250
+settle_secs = 900
+fresh_secs = 30
+max_tree = 5000
+max_thread = 20000
+enforce_reserve = 100
+
 [lists]
 read_listing_pages = 5
 subscribed_max_per_member = 25
@@ -505,6 +516,38 @@ live_now = []
 fn docker_app_toml_equals_defaults() {
     let cfg = load(DOCKER_APP_TOML).expect("shipped config is valid");
     assert_eq!(cfg.file, FileConfig::default());
+}
+
+/// Thread outline §4: off by default, with the design's defaults; every
+/// bound is checked, on or off.
+#[test]
+fn thread_outline_defaults_and_bounds() {
+    let t = load("").expect("defaults").file.thread_outline;
+    assert!(!t.enabled);
+    assert_eq!(
+        (t.window_days, t.queue_messages, t.flush_ms, t.settle_secs, t.fresh_secs, t.max_tree, t.max_thread, t.enforce_reserve),
+        (30, 50_000, 250, 900, 30, 5000, 20_000, 100)
+    );
+    assert!(load("[thread_outline]\nenabled = true\nwindow_days = 2\n").is_ok());
+    for (text, needle) in [
+        ("[thread_outline]\nwindow_days = 1\n", "thread_outline.window_days must be 2 to 365"),
+        ("[thread_outline]\nwindow_days = 366\n", "thread_outline.window_days must be 2 to 365"),
+        ("[thread_outline]\nqueue_messages = 0\n", "thread_outline.queue_messages must be at least 1"),
+        ("[thread_outline]\nflush_ms = 0\n", "thread_outline.flush_ms must be at least 1"),
+        ("[thread_outline]\nflush_ms = 10001\n", "thread_outline.flush_ms must be at most 10000"),
+        ("[thread_outline]\nfresh_secs = 0\n", "thread_outline.fresh_secs must be at least 1"),
+        ("[thread_outline]\nmax_tree = 0\n", "thread_outline.max_tree must be at least 1"),
+        ("[thread_outline]\nmax_thread = 0\n", "thread_outline.max_thread must be at least 1"),
+        ("[thread_outline]\nwindow_days = 2\nsettle_secs = 172800\n", "settle_secs must be shorter than window_days"),
+        ("[thread_outline]\nwindow = 3\n", "unknown field"),
+    ] {
+        let problems = match load(text) {
+            Err(ConfigError::Invalid(p)) => p.join("; "),
+            Err(e) => e.to_string(),
+            Ok(_) => String::new(),
+        };
+        assert!(problems.contains(needle), "{text}: {problems}");
+    }
 }
 
 /// Refract T-15 (refract design §3.1): the default is off with Community A
