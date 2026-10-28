@@ -919,7 +919,9 @@ async fn tdm9_reindexing_at_the_private_gate_and_the_view_sites() {
     };
     let pool = w.f.pool.clone();
     exec(&pool, "UPDATE members SET first_ready_at = ready_at").await;
-    let floor = Duration::from_millis(400);
+    // Wide, so "answered before the floor" holds under a loaded test run: a
+    // floored answer takes at least this long, an unfloored one well under.
+    let floor = Duration::from_secs(2);
     let base = serve_live(w.f.state_read(w.f.app.clone(), Some(Duration::from_secs(1)), floor, &TEST_CURSOR_KEY, &PrivateReadConfig::default())).await;
     let root = w.root.clone();
     let scope = ScopeState::new(w.f.sets.clone(), ScopePolicy::MembersAndOneHop, 10_000);
