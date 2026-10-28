@@ -545,6 +545,14 @@ struct Rig {
 
 impl Rig {
     async fn new(test: &str) -> Option<Self> {
+        let mut rig = Self::idle(test).await?;
+        rig.start();
+        Some(rig)
+    }
+
+    /// A rig with no writer running yet: what is stored before `start`
+    /// is what the writer reads when it takes its lock.
+    async fn idle(test: &str) -> Option<Self> {
         let Ok(url) = std::env::var("HPRS_TEST_REDIS_URL") else {
             eprintln!("HPRS_TEST_REDIS_URL unset; skipping outline writer test {test}");
             return None;
@@ -554,9 +562,9 @@ impl Rig {
         let redis = ConnectionManager::new(client).await.expect("connect redis");
         let stream = format!("test:outline:{}", rand::random::<u32>());
         let outline = Outline::new(ThreadOutlineConfig { enabled: true, flush_ms: 20, ..ThreadOutlineConfig::default() });
-        let (sender, rx) = outline.channel();
+        let (sender, _rx) = outline.channel();
         let tx = sender.tx.clone();
-        let task = spawn_writer(&outline, &db.pool, &redis, &stream, rx);
+        let task = tokio::spawn(async {});
         Some(Self { db, redis, stream, outline, tx, task })
     }
 
@@ -593,6 +601,11 @@ impl Rig {
 
     /// A new writer on the same database and stream, as after a restart.
     fn restart(&mut self) {
+        self.start();
+    }
+
+    /// Start a writer on a fresh `Outline`.
+    fn start(&mut self) {
         self.outline = Outline::new(self.outline.config().clone());
         let (sender, rx) = self.outline.channel();
         self.tx = sender.tx.clone();
@@ -628,14 +641,16 @@ fn spawn_writer(outline: &Outline, pool: &PgPool, redis: &ConnectionManager, str
 /// alone.
 #[tokio::test]
 async fn t_o4_startup_replays_the_range_and_a_restart_nothing() {
-    let Some(mut rig) = Rig::new("to4_startup_replay").await else {
+    let Some(mut rig) = Rig::idle("to4_startup_replay").await else {
         return;
     };
     let mut ids = Vec::new();
     for n in 1..=5 {
         ids.push(rig.add(A, &[(&tid(n), None)]).await);
     }
+    // Stored before the writer starts, so it is what the writer reads.
     set_progress(&rig.db.pool, Some(ids[0]), Some(1000)).await;
+    rig.start();
     rig.active().await;
     rig.resume(ids[4]).await;
     assert!(eventually!(Duration::from_secs(10), rig.through().await == Some(ids[4].prev())));
@@ -658,8 +673,13 @@ async fn t_o4_startup_replays_the_range_and_a_restart_nothing() {
     rig.resume(through.next()).await;
     rig.send(Msg::Commit { id: ids[2], ops: vec![Op::Create(post(A, 3, None, 99))] }).await;
     rig.send(Msg::Through(ids[2])).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(rig.through().await, Some(through));
+    // The writer takes its messages in order: once the next entry's
+    // `Through` is stored, the repeat has been handled.
+    assert_eq!(through, ids[4].prev());
+    rig.send(Msg::Commit { id: ids[4], ops: vec![Op::Create(post(A, 5, None, 10))] }).await;
+    rig.send(Msg::Through(ids[4])).await;
+    assert!(eventually!(Duration::from_secs(10), rig.through().await == Some(ids[4])), "the next entry is written");
+    assert!(row(&rig.db.pool, A, t(5)).await.is_some());
     assert_eq!(rig.complete_since().await, Some(1000));
     assert_eq!(row(&rig.db.pool, A, t(3)).await.expect("row").rev, tid_value(REV).expect("rev"), "a repeat is skipped");
     assert_eq!(rig.outline.shared().resumed_epoch(), rig.outline.shared().want_epoch());
@@ -671,14 +691,16 @@ async fn t_o4_startup_replays_the_range_and_a_restart_nothing() {
 /// writes an `outline_holes` row.
 #[tokio::test]
 async fn t_o4_trimmed_ranges_move_complete_since() {
-    let Some(mut rig) = Rig::new("to4_trimmed").await else {
+    let Some(mut rig) = Rig::idle("to4_trimmed").await else {
         return;
     };
     let mut ids = Vec::new();
     for n in 1..=7 {
         ids.push(rig.add(A, &[(&tid(n), None)]).await);
     }
+    // Stored before the writer starts, so it is what the writer reads.
     set_progress(&rig.db.pool, Some(ids[0]), Some(1000)).await;
+    rig.start();
     rig.active().await;
     // Partway: the first chunk (2 entries) is written, then the head moves
     // past the rest.

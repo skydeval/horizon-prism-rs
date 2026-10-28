@@ -280,20 +280,57 @@ impl std::io::Write for Logs {
     }
 }
 
+/// The event `capture` writes once it is in place.
+const CAPTURE_MARKER: &str = "sysacct_log_capture_on";
+
+/// A capture of every event at every level on this thread while it lives.
+struct Capture {
+    logs: Logs,
+    _guard: tracing::dispatcher::DefaultGuard,
+    _second: tracing::Dispatch,
+}
+
+impl Capture {
+    fn new() -> Self {
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish(),
+        );
+        // With a single registered dispatcher, tracing-core asks only the
+        // registering thread's default whether a new callsite is wanted, so
+        // a callsite (sqlx's, say) another test's thread registers first
+        // would stay off here. A second one keeps every dispatcher asked,
+        // and the rebuild turns on what was registered before.
+        let second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+        tracing::trace!(event = CAPTURE_MARKER);
+        Self { logs, _guard: guard, _second: second }
+    }
+
+    /// What was written, having checked the capture saw the code under test:
+    /// its own marker and sqlx's statements, so a check on it is never
+    /// vacuous.
+    fn text(&self) -> String {
+        let text = String::from_utf8(self.logs.0.lock().expect("logs").clone()).expect("utf-8");
+        assert!(text.contains(CAPTURE_MARKER), "the subscriber captured the run:\n{text}");
+        assert!(text.contains("sqlx::query"), "the capture saw the run's statements:\n{text}");
+        text
+    }
+}
+
 /// T-7, T-8, T-11: the five methods end to end; `rev` only grows, across an
 /// emptied list too; idempotent add; leave; and afterwards no `sysacct_`
 /// row holds B's DID, and no log line at any level names A or B.
 #[tokio::test]
 async fn methods_end_to_end_store_nothing_in_clear_and_log_no_did() {
     let _serial = LOG_CAPTURE.lock().await;
-    let logs = Logs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::TRACE)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let capture = Capture::new();
     let Some(w) = world("sysacct_end_to_end", true, &[A, B, C, D]).await else {
         return;
     };
@@ -352,8 +389,7 @@ async fn methods_end_to_end_store_nothing_in_clear_and_log_no_did() {
             assert!(!row.windows(listed.len()).any(|win| win == listed.as_bytes()), "{listed} in a sysacct_ row");
         }
     }
-    let text = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("utf-8");
-    assert!(!text.is_empty(), "the subscriber captured the run");
+    let text = capture.text();
     for did in [A, B, C, D] {
         assert!(!text.contains(did), "{did} logged:\n{text}");
     }
@@ -723,24 +759,17 @@ async fn locked_events_are_applied_when_the_key_is_back() {
 
     // A step, logging no DID.
     let _serial = LOG_CAPTURE.lock().await;
-    let logs = Logs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::TRACE)
-        .finish();
     let mut catch_up = store::CatchUp::default();
-    let step = {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        catch_up.step(p, &w.keys).await.expect("step")
+    let (step, text) = {
+        let capture = Capture::new();
+        let step = catch_up.step(p, &w.keys).await.expect("step");
+        (step, capture.text())
     };
     assert_eq!(step, store::Step { dropped: 1, queued: 1, waiting: 1, left: 5 });
     assert_eq!(dids(&w.list(A).await), [B], "C, deleted while locked, left A's list");
     assert!(test_rows::rev(p, A).await > a_rev);
     assert_eq!(refresh(B).await, 1, "B, listed, is queued for the refresher");
     assert_eq!(refresh(D).await, 0, "D is on no list");
-    let text = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("utf8");
     for did in [A, B, C, D] {
         assert!(!text.contains(did), "a DID in the catch-up log: {text}");
     }
