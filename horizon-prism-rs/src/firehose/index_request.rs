@@ -8,7 +8,7 @@
 //!    create/update, `RecordNotFound` → delete.
 //!
 //! `requestRecord` then runs [`catch_up`] (private posting §3.8): a bounded
-//! full listing of the caller's three authorization collections at R, which
+//! full listing of the caller's two authorization collections at R, which
 //! may advance the caller's `applied_rev` to R as an `authz` job does.
 //! design-v4 §II-6.11.3's "exactly two writers" of `applied_rev` are three:
 //! the firehose worker, full-authorization jobs, and this catch-up, which is
@@ -208,11 +208,11 @@ enum Ended {
 /// 2. The gap epoch is read; the `sync_state` row is made sure of and its
 ///    follow counter read, in one statement (following-audience design
 ///    §3.2), before any listing.
-/// 3. The three authorization collections are listed to the end and each
+/// 3. The two authorization collections are listed to the end and each
 ///    record whose CID is not stored is written at `rev` as
 ///    [`WriteSource::CatchUp`], with `dead_letter_readiness`: a failed write
 ///    clears the DID's readiness and queues `authz` in its own transaction,
-///    as on the firehose. Then both listed revs rise to `rev` under the
+///    as on the firehose. Then the post listed rev rises to `rev` under the
 ///    DID's lock, unless a record skipped by CID is stored in a replayed
 ///    older version (`replayed_below`) or the lock stays held
 ///    (`listed_rev_busy`), either of which ends it unsettled
@@ -225,7 +225,7 @@ enum Ended {
 ///    contradiction has cleared the flag and queues `authz` a minute on.
 /// 5. Settle, under the scope read guard, the gap lock and the epoch read
 ///    under it first (§3.2, #722): `applied_rev = GREATEST(…, rev)`, when
-///    both listed revs cover `rev` (`settle_uncovered` otherwise), only
+///    the post listed rev covers `rev` (`settle_uncovered` otherwise), only
 ///    with the epoch unchanged, the DID not purging and still ready, every
 ///    listing complete, no reconcile candidate unconfirmed, and no write
 ///    failed; the follow-verification flag set beside it after a complete
@@ -347,7 +347,7 @@ async fn run_catch_up(
             skipped.push(kept);
         }
     }
-    // Every listing complete with no write failing: both listed revs rise
+    // Every listing complete with no write failing: the post listed rev rises
     // to R before the reconciles (replay-readiness design §4.2), in one
     // transaction with the check of the records skipped by CID. A stop
     // anywhere before it commits raises nothing.
@@ -369,7 +369,7 @@ async fn run_catch_up(
     let raised = if skip {
         Raise::Untracked
     } else {
-        raise_listed_rev(writer, did, rev, ListedRevs::BOTH, Instant::now() + left, Some(&skipped)).await.map_err(db)?
+        raise_listed_rev(writer, did, rev, ListedRevs::POST, Instant::now() + left, Some(&skipped)).await.map_err(db)?
     };
     match raised {
         Raise::Raised | Raise::Untracked => {}

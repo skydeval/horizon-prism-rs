@@ -411,6 +411,28 @@ pub mod hooks {
     /// Private appearance T-AP10: `putAppearance`'s write holding the DID's
     /// shared lock, before its membership check. Key: `<database>/<did>`.
     pub const APPEARANCE_AFTER_LOCK: &str = "ap_put_after_lock";
+    /// Private audiences T-A8: `createAudience`'s or `updateAudience`'s
+    /// write, past the gate, before the scope guard and the locks. Key:
+    /// `<database>/<did>` ([`pause_in`]).
+    pub const AUDIENCE_BEFORE_LOCK: &str = "pa_write_before_lock";
+    /// Private audiences T-A4: counts `updateAudience`'s writes reached.
+    /// Key: `<database>/<did>` ([`injected_in`]).
+    pub const AUDIENCE_UPDATE_REACHED: &str = "pa_update_reached";
+    /// Private audiences T-A16: `deleteAudience`'s write, its owner
+    /// re-evaluated, before its commit. Key: `<database>/<did>`.
+    pub const AUDIENCE_DELETE_BEFORE_COMMIT: &str = "pa_delete_before_commit";
+    /// Private audiences T-A16: `deleteAudience`, its read guard dropped,
+    /// before it asks for the write guard. Key: `<database>/<did>`.
+    pub const AUDIENCE_BEFORE_WRITE_GUARD: &str = "pa_delete_before_write_guard";
+    /// Private audiences T-A16: the in-memory owner set taken from the
+    /// transaction's report, not from the database. Key: `<database>/<did>`.
+    pub const OWNER_SET_FROM_REPORT: &str = "pa_owner_set_from_report";
+    /// Private audiences T-A16: `owners::lock` taken as a no-op. Key:
+    /// `<database>/<did>` ([`injected_on`]).
+    pub const OWNER_LOCK_OFF: &str = "pa_owner_lock_off";
+    /// Private audiences T-A16: the writer, just after it takes a
+    /// commit's owner lock. Key: `<database>/<did>`.
+    pub const WRITER_AFTER_OWNER_LOCK: &str = "pa_writer_after_owner_lock";
     /// Private notification preferences T-N11: `putNotificationPreferences`'
     /// write, its transaction begun, before the DID's shared lock. Key:
     /// `<database>/<did>` ([`pause_in`]).

@@ -43,10 +43,12 @@ impl H {
 }
 
 /// T-M4 (§2.3): Eve, a non-member outside S, has an audience naming Bob and
-/// a post under it, both stored. She is no owner; her post is a miss to
-/// Bob; her rows queued no job, and a `private` job queued by hand ends
-/// `done` without asking her PDS. `member add` makes her an owner and
-/// queues her `private` job, which runs; Bob then reads the post.
+/// a post under it, both stored (as ingest stored a non-member's rows). She
+/// is no owner; her post is a miss to Bob; her rows queued no job, and a
+/// `private` job queued by hand ends `done` without asking her PDS.
+/// Migration 0052 deletes her audience (private-audiences design C-12).
+/// `member add` makes her an owner by her post and queues her `private`
+/// job, which runs; the post stays her own: Bob does not read it.
 #[tokio::test]
 async fn t_m4_membership_is_the_only_owner_gate() {
     let Some(h) = H::new("membership-t-m4", PublicMode::On).await else {
@@ -67,7 +69,12 @@ async fn t_m4_membership_is_the_only_owner_gate() {
     assert!(!h.asked(EVE), "no network call");
     assert!(!h.owner_ready(EVE).await);
 
-    // Added: an owner, with its `private` job.
+    // 0052: a non-member's audience goes; her post stays.
+    sqlx::raw_sql(include_str!("../../../migrations/0052_audiences_held.sql")).execute(h.pool()).await.expect("0052");
+    let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM private_audiences WHERE uri = '{aud}'")).fetch_one(h.pool()).await.expect("rows");
+    assert_eq!(rows, 0, "deleted by 0052");
+
+    // Added: an owner by her post, with its `private` job.
     h.clear_jobs().await;
     assert_eq!(h.add(EVE).await, AddOutcome::Added { became_owner: true });
     assert!(h.f.writer.scope().read_guard().await.is_owner(EVE));
@@ -75,16 +82,17 @@ async fn t_m4_membership_is_the_only_owner_gate() {
     assert_eq!(h.rerun(&b, EVE, Depth::Private).await, JobOutcome::Ready);
     assert!(h.asked(EVE));
     h.head_at_applied(EVE).await;
-    assert!(h.reads(BOB, &post).await);
-    assert!(!h.reads(CAROL, &post).await, "the audience still decides");
+    assert!(!h.served(BOB, &post).await, "the audience is gone: author-only");
+    assert!(!h.served(CAROL, &post).await);
     h.finish().await;
 }
 
 /// T-M5 (§5.1): Eve a member and an owner, her post under an audience
 /// naming Bob and Carol, Bob's reply under it. After `member remove` (the
-/// whole purge) both are misses to Carol: Eve is no owner, and rule 5 needs
-/// the audience's owner ready. Re-added, both are served again once her
-/// `private` job has run.
+/// whole purge) both are misses to Carol: Eve is no owner, and her
+/// audience is deleted for good (private-audiences design C-7). Re-added,
+/// once her `private` job has run, both stay misses to Carol: the post and
+/// the reply are readable by their own authors alone.
 #[tokio::test]
 async fn t_m5_removal_stops_serving_and_a_re_add_restores() {
     let Some(h) = H::new("membership-t-m5", PublicMode::On).await else {
@@ -114,14 +122,19 @@ async fn t_m5_removal_stops_serving_and_a_re_add_restores() {
         .await
         .expect("stored");
     assert_eq!(stored, 2, "kept, not served");
+    let audiences: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM private_audiences WHERE owner_did = '{EVE}'"))
+        .fetch_one(h.pool())
+        .await
+        .expect("audiences");
+    assert_eq!(audiences, 0, "her audiences are purged");
 
     h.clear_jobs().await;
     assert_eq!(h.add(EVE).await, AddOutcome::Added { became_owner: true });
     assert!(!h.served(CAROL, &post).await, "not before readiness");
     assert_eq!(h.rerun(&b, EVE, Depth::Private).await, JobOutcome::Ready);
     h.head_at_applied(EVE).await;
-    assert!(h.reads(CAROL, &post).await);
-    assert!(h.reads(CAROL, &reply).await);
+    assert!(!h.served(CAROL, &post).await, "author-only");
+    assert!(!h.served(CAROL, &reply).await, "author-only");
     h.finish().await;
 }
 

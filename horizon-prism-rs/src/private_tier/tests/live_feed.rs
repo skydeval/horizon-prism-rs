@@ -48,8 +48,27 @@ async fn t_f4_private_content_never_in_a_line() {
 
     // The private records, each carrying a marker, and a public post.
     let audience = format!("at://{ALICE}/{NSID_AUDIENCE}/3kaudmarker1");
-    f.ingest(ALICE, NSID_AUDIENCE, "3kaudmarker1", json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [AUDIENCE_MEMBER], "createdAt": "2026-09-26T00:00:00Z"}))
-        .await;
+    let audience_record = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [AUDIENCE_MEMBER], "createdAt": "2026-09-26T00:00:00Z"});
+    // Held here; a repository copy through the writer is skipped, and its
+    // line is an `other` one (private-audiences design §4.5).
+    f.ingest(ALICE, NSID_AUDIENCE, "3kaudmarker1", audience_record.clone()).await;
+    let options = ApplyOptions {
+        advance_applied_rev: false,
+        dead_letter_readiness: false,
+        attempts: 1,
+        live: false,
+        subscription_rules: false,
+        source: WriteSource::Firehose,
+    };
+    let copy = RawOp {
+        action: Action::Create,
+        collection: NSID_AUDIENCE.into(),
+        rkey: "3kaudmarker1".into(),
+        cid: Some("bafyaudmarker".into()),
+        record: Some(audience_record),
+    };
+    let report = f.writer.apply(ALICE, REV, &[copy], options).await.expect("apply");
+    assert_eq!(report.outcomes, [OpOutcome::Skipped("kryphocron_unproduced")]);
     let encoded = f.encoded_post(ALICE, "3kprivmarker", PRIVATE_TEXT, Some(&audience)).await;
     let ciphertext = encoded["encodedContent"].as_str().expect("hex").to_string();
     f.ingest(ALICE, NSID_POST_PRIVATE, "3kprivmarker", encoded).await;
@@ -85,7 +104,9 @@ async fn t_f4_private_content_never_in_a_line() {
     }
     // The private kinds are on the feed, with the author only.
     let all = lines(&events);
-    for kind in ["audience", "private-post", "private-post-gate"] {
+    let skipped = all.iter().find(|l| l["k"] == "other" && l["did"] == ALICE).unwrap_or_else(|| panic!("the audience copy's line: {all:?}"));
+    assert!(skipped.get("text").is_none() && skipped.get("o").is_some(), "{skipped}");
+    for kind in ["private-post", "private-post-gate"] {
         let line = all.iter().find(|l| l["k"] == kind).unwrap_or_else(|| panic!("a {kind} line: {all:?}"));
         assert_eq!(line["did"], ALICE, "{kind}");
         assert_eq!(line["who"], "alice.test", "{kind}");

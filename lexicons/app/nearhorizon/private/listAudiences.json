@@ -1,0 +1,67 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.listAudiences",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List the requester's private audiences, newest first (by record key), with their members. Only the requester's own: no method gives anyone else an audience's members or their number. A page also ends early, with a cursor, once its audiences hold 20000 members together; it always holds at least one. Requires auth by a community member, whether or not its indexing is ready.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor from a previous response."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["audiences"],
+          "properties": {
+            "cursor": {
+              "type": "string",
+              "description": "Present when more of the requester's audiences may follow."
+            },
+            "audiences": {
+              "type": "array",
+              "items": { "type": "ref", "ref": "#audience" }
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "limit is out of range, or cursor is malformed."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        }
+      ]
+    },
+    "audience": {
+      "type": "object",
+      "required": ["uri", "cid", "record"],
+      "properties": {
+        "uri": { "type": "string", "format": "at-uri" },
+        "cid": {
+          "type": "string",
+          "description": "An opaque version token for updateAudience's swapCid, not a CID."
+        },
+        "record": {
+          "type": "unknown",
+          "description": "The tools.kryphocron.policy.audience record: $type, mode (absent when none), name (absent when none), members, createdAt, updatedAt."
+        }
+      }
+    }
+  }
+}

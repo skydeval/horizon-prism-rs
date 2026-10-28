@@ -722,7 +722,7 @@ mod tests {
         assert_eq!(diverged().await, None);
         // The settle path does the same (listed revs cover the rev).
         exec(p, "UPDATE sync_state SET diverged_since = now() - interval '1 hour', head_rev = '3kccccccccccc', \
-                 post_listed_rev = '3kccccccccccc', audience_listed_rev = '3kccccccccccc'").await;
+                 post_listed_rev = '3kccccccccccc'").await;
         crate::firehose::writer::advance_applied_rev_with_follows(&mut conn, DID, "3kccccccccccc", None).await.expect("settle");
         assert_eq!(diverged().await, None);
         drop(conn);

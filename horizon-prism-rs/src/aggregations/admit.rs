@@ -17,7 +17,6 @@ pub enum RecordKind {
     /// table. Admitted by rule 1 alone: it has no rule-2 subjects.
     Table(&'static str),
     PrivatePost,
-    PrivateAudience,
     /// A stock `app.bsky.feed.threadgate` or `postgate` whose `post` is a
     /// `postPrivate` URI (private posting §4.4, P-18). Its one subject is the
     /// gated post's author.
@@ -33,7 +32,7 @@ impl RecordKind {
     /// Private-tier kinds (`Kryphocron(Private)`, and gates of private posts).
     #[must_use]
     pub fn is_private(self) -> bool {
-        matches!(self, Self::PrivatePost | Self::PrivateAudience | Self::PrivateGate)
+        matches!(self, Self::PrivatePost | Self::PrivateGate)
     }
 
     /// Block records (§9.3 rule 3): `app.bsky.graph.block` only, since
@@ -161,10 +160,7 @@ fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
             return Admission::Reject(RejectReason::Purging(PurgeKind::AccountDeleted));
         }
         Some(PurgeKind::OutOfScope)
-            if matches!(
-                input.kind,
-                RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateGate
-            ) =>
+            if matches!(input.kind, RecordKind::PrivatePost | RecordKind::PrivateGate) =>
         {
             return Admission::Reject(RejectReason::Purging(PurgeKind::OutOfScope));
         }
@@ -297,7 +293,6 @@ fn off_rule(input: &AdmissionInput, sets: &ScopeSets) -> Option<Admission> {
         | RecordKind::Profile
         | RecordKind::Table("actor_self_records")
         | RecordKind::PrivatePost
-        | RecordKind::PrivateAudience
         | RecordKind::PrivateGate => None,
         // Decided before the off rule, through its public row.
         RecordKind::PublicRootGate => None,
@@ -542,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_scope_rejects_only_private_post_and_audience_records() {
+    fn out_of_scope_rejects_only_private_post_and_gate_records() {
         let mut s = sets();
         s.purging.insert(STRANGER.into(), PurgeKind::OutOfScope);
         assert_eq!(
@@ -550,7 +545,7 @@ mod tests {
             Admission::Reject(RejectReason::Purging(PurgeKind::OutOfScope))
         );
         assert_eq!(
-            admit(&input(STRANGER, RecordKind::PrivateAudience, &[]), &s),
+            admit(&input(STRANGER, RecordKind::PrivateGate, &[STRANGER]), &s),
             Admission::Reject(RejectReason::Purging(PurgeKind::OutOfScope))
         );
         assert_eq!(
@@ -720,7 +715,7 @@ mod tests {
             // Private kinds are unchanged.
             assert_eq!(a(SCOPED, RecordKind::PrivatePost, &[]), Admission::Admit(AdmitRule::AuthorInScope));
             assert_eq!(a(STRANGER, RecordKind::PrivatePost, &[MEMBER]), Admission::Admit(AdmitRule::InboundToMember));
-            assert_eq!(a(STRANGER, RecordKind::PrivateAudience, &[]), Admission::Reject(RejectReason::NotInScope));
+
             // The rejection is counted under its own label.
             assert_eq!(RejectReason::PublicOff.as_str(), "public_off");
         }

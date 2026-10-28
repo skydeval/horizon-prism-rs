@@ -45,8 +45,8 @@ mod root_gates;
 mod appearance;
 // Plural-pronouns T-F1: the fronters key.
 mod fronters;
-// The pre-upgrade `admin audiences check` (private-audiences design S0).
-mod audiences_check;
+// Audiences held by this AppView (private-audiences design §13).
+mod held_audiences;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -66,7 +66,7 @@ use tokio::net::TcpListener;
 
 use super::handlers::{PrivateState, router};
 use super::oracle::{OracleSnapshot, SnapshotInputs};
-use super::{KryphocronPrivateTier, PrivateTier, readiness, schema};
+use super::{KryphocronPrivateTier, PrivateTier, audiences, owners, readiness, schema};
 use crate::aggregations::{ScopeSets, ScopeState};
 use crate::config::{
     PrivateReadConfig, PrivateReadFloors, PrivateSearchConfig, ScopePolicy, SyncConfig, VideoConfig, VideoPlayback,
@@ -369,6 +369,13 @@ impl Fixture {
         record: Option<Value>,
     ) {
         let cid = record.as_ref().map(|_| if rev == REV { format!("bafy{rkey}") } else { format!("bafy{rkey}{rev}") });
+        // Audiences are held here, never ingested (private-audiences
+        // design): the fixture stores and edits them as a repository write
+        // once did, so the read-rule tests keep their meaning.
+        if collection == NSID_AUDIENCE {
+            self.seed_audience(source, repo, action, rkey, rev, cid.as_deref(), record.as_ref()).await;
+            return;
+        }
         let report = self
             .writer
             .apply(
@@ -393,6 +400,52 @@ impl Fixture {
             .await
             .expect("apply");
         assert!(report.failed.is_empty(), "{report:?}");
+    }
+
+    /// An audience op stored as held rows ([`audiences::seed`]), with the
+    /// owner set updated after commit as the writer updates it.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_audience(
+        &self,
+        source: WriteSource,
+        repo: &str,
+        action: Action,
+        rkey: &str,
+        rev: &str,
+        cid: Option<&str>,
+        record: Option<&Value>,
+    ) {
+        let mut tx = self.pool.begin().await.expect("tx");
+        let applied = match (action, record) {
+            (Action::Delete, _) | (_, None) => {
+                audiences::unseed(&mut tx, &format!("at://{repo}/{NSID_AUDIENCE}/{rkey}"), rev).await.expect("unseed")
+            }
+            (_, Some(record)) => audiences::seed(&mut tx, repo, rkey, cid.unwrap_or("bafy"), rev, record, source == WriteSource::Backfill)
+                .await
+                .expect("seed"),
+        };
+        tx.commit().await.expect("commit");
+        audiences::settle_owner_set(self.writer.scope(), &self.pool, &applied).await;
+    }
+
+    /// `owner` edits its audience `uri` to `record` through
+    /// `updateAudience`'s write, swapping against the stored token. The
+    /// record's times default to fixed ones.
+    async fn edit_audience(&self, owner: &str, uri: &str, record: &Value) {
+        let swap: String = sqlx::query_scalar("SELECT cid FROM private_audiences WHERE uri = $1")
+            .bind(uri)
+            .fetch_one(&self.pool)
+            .await
+            .expect("stored");
+        let mut record = record.clone();
+        for key in ["createdAt", "updatedAt"] {
+            if record.get(key).is_none() {
+                record[key] = json!("2026-10-02T00:00:00.000Z");
+            }
+        }
+        let checked = audiences::check_record(&record, owner).expect("a valid record");
+        let written = audiences::update(&self.pool, self.writer.scope(), owner, uri, &checked, &swap).await.expect("update");
+        assert!(matches!(written, audiences::Written::Done { .. }), "{written:?}");
     }
 
     async fn ready(&self, did: &str) {
@@ -2339,7 +2392,7 @@ async fn display_refill_fills_rows_stored_before_0023() {
     };
     let f = fixture(&db.pool, "s2-refill").await;
     let aud_record = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [BOB], "name": "Friends", "createdAt": "2026-09-26T00:00:00Z"});
-    f.ingest(ALICE, NSID_AUDIENCE, "3kaudience22", aud_record.clone()).await;
+    f.ingest(ALICE, NSID_AUDIENCE, "3kaudience22", aud_record).await;
     let aud = format!("at://{ALICE}/{NSID_AUDIENCE}/3kaudience22");
     let extra = json!({"embed": {"$type": format!("{KLEX}#embedImage"), "images": [{"image": blob("bafyimg"), "alt": ""}]}, "langs": ["en"]});
     let record = f.record_with(ALICE, "3kpost222222", &aud, &extra).await;
@@ -2355,16 +2408,16 @@ async fn display_refill_fills_rows_stored_before_0023() {
             .await
             .expect("post row")
     };
-    let audience_row = async || -> (Option<String>, bool) {
-        sqlx::query_as("SELECT name, display_filled FROM private_audiences")
-            .fetch_one(&f.pool)
-            .await
-            .expect("audience row")
-    };
 
-    // The refill is queued once, for the DID with unfilled rows.
+    // An unfilled audience alone queues nothing: audiences are not ingested
+    // (private-audiences design §4.4).
     let tier = KryphocronPrivateTier;
     exec(&f.pool, "DELETE FROM backfill_jobs").await;
+    exec(&f.pool, "UPDATE private_posts SET display_filled = true").await;
+    assert_eq!(tier.enqueue_display_refill(&f.pool, "audience_only_refill").await.expect("refill"), Some(0));
+    exec(&f.pool, "UPDATE private_posts SET display_filled = false").await;
+
+    // The refill is queued once, for the DID with unfilled rows.
     assert_eq!(tier.enqueue_display_refill(&f.pool, "private_display_refill").await.expect("refill"), Some(1));
     let jobs: Vec<(String, String, String)> =
         sqlx::query_as("SELECT did, depth, state FROM backfill_jobs").fetch_all(&f.pool).await.expect("jobs");
@@ -2379,12 +2432,10 @@ async fn display_refill_fills_rows_stored_before_0023() {
 
     // The job writes each listed record at the repo's latest rev: here the
     // rev the rows already carry.
-    f.apply_from(WriteSource::Backfill, ALICE, Action::Update, NSID_AUDIENCE, "3kaudience22", REV, Some(aud_record)).await;
     f.apply_from(WriteSource::Backfill, ALICE, Action::Update, NSID_POST_PRIVATE, "3kpost222222", REV, Some(record.clone())).await;
     let (embed, langs, filled) = post_row().await;
     assert_eq!(embed.as_ref().and_then(|e| e["images"][0]["image"]["ref"]["$link"].as_str()), Some("bafyimg"));
     assert_eq!((langs, filled), (Some(vec!["en".to_string()]), true));
-    assert_eq!(audience_row().await, (Some("Friends".to_string()), true));
 
     // Filled: neither an equal nor an older rev overwrites it.
     for rev in [REV, OLD_REV] {
@@ -2432,13 +2483,14 @@ async fn audience_view_in(mode: PublicMode, test: &str) {
     assert!(p.get("audience").is_none(), "{p}");
     assert_eq!(p["record"]["audienceList"], orphan.as_str());
 
-    // A rename reaches the view at the audience record's next ingest.
-    f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, "3kaudfollow2", REV2, Some(named(json!("Inner circle")))).await;
+    // A rename by `updateAudience` reaches the view at once.
+    f.edit_audience(ALICE, &followers, &named(json!("Inner circle"))).await;
     let (_, p) = one_post(&base, BOB, &p_followers).await;
     assert_eq!(p["audience"]["name"], "Inner circle");
-    // A `name` that is not a string is dropped; the audience still applies.
-    assert_eq!(super::ingest::AudienceFields::parse(&named(json!(5))).expect("not malformed").name, None);
-    f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, "3kaudfollow2", REV3, Some(named(json!(5)))).await;
+    // A `name` that is not a string is refused by the record check; with
+    // the name removed, the audience still applies.
+    assert!(audiences::check_record(&named(json!(5)), ALICE).is_err());
+    f.edit_audience(ALICE, &followers, &named(Value::Null)).await;
     let (_, p) = one_post(&base, BOB, &p_followers).await;
     assert_eq!(p["audience"], json!({"uri": followers, "mode": "followers"}));
     db.drop_db().await;
@@ -2680,7 +2732,7 @@ async fn bookmarks_in(mode: PublicMode, test: &str) {
     // Alice moves her audience to Carol: both of Bob's posts leave his
     // list, and a full page of rows still carries a cursor.
     let moved = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [CAROL], "createdAt": "2026-09-26T00:00:00Z"});
-    f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, "3kaudience22", REV2, Some(moved)).await;
+    f.edit_audience(ALICE, &format!("at://{ALICE}/{NSID_AUDIENCE}/3kaudience22"), &moved).await;
     let (page, _) = bookmarks_of(&base, BOB, "").await;
     assert_eq!(page, json!({"bookmarks": []}));
     let (page, _) = bookmarks_of(&base, BOB, "limit=2").await;
@@ -2774,7 +2826,7 @@ async fn private_router_methods_are_routed_in_every_mode() {
         .copied()
         .filter(|(n, _)| n.starts_with("app.nearhorizon.private."))
         .collect();
-    assert_eq!(methods.len(), 18);
+    assert_eq!(methods.len(), 22);
     for mode in [PublicMode::On, PublicMode::Off, PublicMode::Draining, PublicMode::Held, PublicMode::Filling] {
         set_mode(app.hydrator.scope(), mode).await;
         for &(nsid, verb) in &methods {
@@ -2803,10 +2855,12 @@ async fn private_router_methods_are_routed_in_every_mode() {
                     // `putActivitySubscription` (an off), `store` for
                     // `putAppearance`, `rev` for `releaseAppearance`; the
                     // others ignore them.
+                    // `record` for `createAudience`.
                     let body = json!({
                         "uri": uri, "cid": "bafy", "seenAt": "2026-10-01T00:00:00Z",
                         "subject": ALICE, "activitySubscription": {"post": false, "reply": false},
                         "store": "device", "rev": "1",
+                        "record": {"createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-01T00:00:00Z"},
                     });
                     let (status, answer) = post(&base, nsid, &body, BOB).await;
                     if nsid == "app.nearhorizon.private.releaseAppearance" {
@@ -2815,7 +2869,14 @@ async fn private_router_methods_are_routed_in_every_mode() {
                     status
                 }
             };
-            let served = if nsid == "app.nearhorizon.private.releaseAppearance" { 400 } else { 200 };
+            // `updateAudience` and `deleteAudience` refuse a URI that names
+            // no audience of the caller's, by parsing.
+            let refused = [
+                "app.nearhorizon.private.releaseAppearance",
+                "app.nearhorizon.private.updateAudience",
+                "app.nearhorizon.private.deleteAudience",
+            ];
+            let served = if refused.contains(&nsid) { 400 } else { 200 };
             assert_eq!(status, served, "{mode:?} {nsid}");
         }
     }
@@ -3080,7 +3141,7 @@ async fn gates_in(mode: PublicMode, test: &str) {
     assert_eq!(reply_uris(&t), std::slice::from_ref(&child));
     // (c): X's audience no longer holds Dave.
     let without_dave = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [BOB, CAROL], "createdAt": "2026-09-26T00:00:00Z"});
-    f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, "3kaudlist222", REV2, Some(without_dave)).await;
+    f.edit_audience(ALICE, &format!("at://{ALICE}/{NSID_AUDIENCE}/3kaudlist222"), &without_dave).await;
     assert_eq!(dave_answers(r.clone()).await, nothing, "(c) X without Dave");
     // (a) again: X deleted, its gate with it.
     f.apply_op(ALICE, Action::Delete, NSID_POST_PRIVATE, "3klb3root222", REV2, None).await;
@@ -3930,7 +3991,7 @@ async fn notification_reads_in(mode: PublicMode, test: &str) {
 
     // The audience admits Dave: listed and counted.
     let widened = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [CAROL, DAVE], "createdAt": "2026-09-26T00:00:00Z"});
-    f.apply_op(BOB, Action::Update, NSID_AUDIENCE, "3kaudbob2222", REV2, Some(widened)).await;
+    f.edit_audience(BOB, &format!("at://{BOB}/{NSID_AUDIENCE}/3kaudbob2222"), &widened).await;
     f.ready_all().await;
     let (page, _) = notifications_of(&base, DAVE, "").await;
     assert_eq!(page["notifications"][0]["uri"], m.as_str(), "{page}");
@@ -4400,7 +4461,7 @@ async fn request_record_catches_up_and_the_record_reads_at_once() {
     let index = index_server(&f, &repo).await;
     assert_eq!(request_record(&index, &p2).await, ("indexed".to_string(), true));
     assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(R1));
-    assert_eq!(repo.lists(), 3, "the three authorization collections, one page each");
+    assert_eq!(repo.lists(), 2, "the two authorization collections, one page each");
     for reader in [BOB, ALICE] {
         assert_eq!(readable(&base, reader, &[&p1, &p2]).await, [p1.clone(), p2.clone()], "{reader}");
     }
@@ -4411,7 +4472,7 @@ async fn request_record_catches_up_and_the_record_reads_at_once() {
     set_head(&f.pool, ALICE, R2).await;
     let (_, caught_up) = request_record(&index, &p1).await;
     assert!(!caught_up);
-    assert_eq!(repo.lists(), 3, "no listing");
+    assert_eq!(repo.lists(), 2, "no listing");
     assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(R1));
 
     // A delete, once the interval has passed (a new process's interval).
@@ -4427,9 +4488,9 @@ async fn request_record_catches_up_and_the_record_reads_at_once() {
     db.drop_db().await;
 }
 
-/// T-18, review 1 LB2: a listed audience that fails to write clears
+/// T-18, review 1 LB2: a listed private post that fails to write clears
 /// readiness and queues `authz`, as on the firehose; nothing settles, and
-/// Bob's read is a uniform miss, never a read under the stale audience row.
+/// Bob's read is a uniform miss, never a read of the stale row.
 #[tokio::test]
 async fn a_failed_catch_up_write_clears_readiness_and_settles_nothing() {
     let Some(db) = fresh_db("s7_catch_up_failed").await else {
@@ -4440,8 +4501,8 @@ async fn a_failed_catch_up_write_clears_readiness_and_settles_nothing() {
     let (_, p1) = alice_behind(&f, &repo).await;
     let base = serve(f.state(Some(Duration::from_secs(1)))).await;
     let (missing, _) = posts_of(&base, BOB, &[&format!("at://{ALICE}/{NSID_POST_PRIVATE}/3knothere001")]).await;
-    // Alice removes Bob, and the edit carries a malformed field.
-    repo.put(NSID_AUDIENCE, "3kaudience01", "bafyaudnew", json!({"$type": NSID_AUDIENCE, "mode": "list", "members": "not a list", "createdAt": "2026-09-26T00:00:00Z"}));
+    // Alice writes another post, and it carries a malformed field.
+    repo.put(NSID_POST_PRIVATE, "3kpostbad001", "bafypostbad", json!({"$type": NSID_POST_PRIVATE, "audienceList": 3, "createdAt": "2026-09-26T00:00:00Z"}));
     let index = index_server(&f, &repo).await;
     let (status, caught_up) = request_record(&index, &p1).await;
     assert_eq!((status.as_str(), caught_up), ("indexed", false));
@@ -4492,12 +4553,12 @@ async fn catch_up_is_bounded_and_settles_only_a_clean_listing() {
     repo.bump_epoch.store(true, std::sync::atomic::Ordering::SeqCst);
     let index = index_server(&f, &repo).await;
     assert!(!request_record(&index, &p1).await.1);
-    assert_eq!(repo.lists(), 3, "listed in pages of one");
+    assert_eq!(repo.lists(), 2, "listed in pages of one");
     assert_eq!(applied_rev_of(&f.pool, ALICE).await.as_deref(), Some(REV));
 
-    // Over the page cap (seven blocks in pages of one, nine pages in all):
+    // Over the page cap (eight blocks in pages of one, nine pages in all):
     // no advance.
-    for i in 0..7 {
+    for i in 0..8 {
         repo.put(
             crate::firehose::classifier::NSID_BLOCK,
             &format!("3kblock00000{i}"),

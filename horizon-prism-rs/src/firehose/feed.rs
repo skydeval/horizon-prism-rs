@@ -74,7 +74,6 @@ pub enum Kind {
     Poll,
     Setting,
     PrivatePost,
-    Audience,
     PrivateGate,
     Identity,
     Account,
@@ -82,7 +81,7 @@ pub enum Kind {
 }
 
 /// The number of kinds.
-pub const KINDS: usize = 23;
+pub const KINDS: usize = 22;
 
 impl Kind {
     /// Every kind, in table order.
@@ -105,7 +104,6 @@ impl Kind {
         Self::Poll,
         Self::Setting,
         Self::PrivatePost,
-        Self::Audience,
         Self::PrivateGate,
         Self::Identity,
         Self::Account,
@@ -139,7 +137,6 @@ impl Kind {
             Self::Poll => "poll",
             Self::Setting => "setting",
             Self::PrivatePost => "private-post",
-            Self::Audience => "audience",
             Self::PrivateGate => "private-post-gate",
             Self::Identity => "identity",
             Self::Account => "account",
@@ -175,7 +172,7 @@ impl Kind {
             Self::Block => "block",
             Self::Profile => "profile",
             Self::List | Self::ListItem | Self::ListBlock | Self::ListOptout => "list",
-            Self::PrivatePost | Self::Audience | Self::PrivateGate => "private",
+            Self::PrivatePost | Self::PrivateGate => "private",
             Self::Identity | Self::Account => "identity",
             Self::StarterPack | Self::Labeler | Self::Threadgate | Self::Postgate | Self::Poll | Self::Setting | Self::Other => "other",
         }
@@ -193,7 +190,6 @@ impl Kind {
             RecordKind::Block => Self::Block,
             RecordKind::Profile => Self::Profile,
             RecordKind::PrivatePost => Self::PrivatePost,
-            RecordKind::PrivateAudience => Self::Audience,
             RecordKind::PrivateGate => Self::PrivateGate,
             RecordKind::PublicRootGate => Self::Threadgate,
             RecordKind::Table(_) => Self::Other,
@@ -907,7 +903,6 @@ mod tests {
             RecordKind::Block,
             RecordKind::Profile,
             RecordKind::PrivatePost,
-            RecordKind::PrivateAudience,
             RecordKind::PrivateGate,
             RecordKind::PublicRootGate,
         ] {
@@ -931,7 +926,9 @@ mod tests {
         assert_eq!(Kind::from_class(classify(NSID_POST, "3k")), Kind::Post);
         assert_eq!(Kind::from_class(classify(NSID_BLOCK, "3k")), Kind::Block);
         assert_eq!(Kind::from_class(classify(NSID_POST_PRIVATE, "3k")), Kind::PrivatePost);
-        assert_eq!(Kind::from_class(classify(NSID_AUDIENCE, "3k")), Kind::Audience);
+        // Audiences are held here, not ingested (private-audiences design):
+        // a repository copy is skipped.
+        assert_eq!(Kind::from_class(classify(NSID_AUDIENCE, "3k")), Kind::Other);
         // Private blocks are skipped, not indexed (skydeval, 2026-10-24).
         assert_eq!(Kind::from_class(classify("tools.kryphocron.graph.block", "3k")), Kind::Other);
         // Table order matches the indexes, and slugs are distinct.

@@ -1,0 +1,59 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.createAudience",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Create one of the requester's private audiences, held by this AppView and never written to a repository. The AppView mints the record key (a TID). The audience is readable by the read rule as soon as the answer comes back, except a member's first private row, whose posts wait for the member's indexing. Requires auth by a ready community member.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["record"],
+          "properties": {
+            "record": {
+              "type": "unknown",
+              "description": "A tools.kryphocron.policy.audience record. $type: absent, or tools.kryphocron.policy.audience. mode: absent or null (read as list), or one of list, everyone, followers, following, nobody. name: absent or null, or a string of 1 to 64 graphemes and at most 640 bytes once trimmed of white space; stored trimmed. members: absent or null (none), or an array of DIDs of at most 256 bytes each; de-duplicated in order, the requester's own DID dropped, then at most 1000. createdAt and updatedAt: required datetimes. Other keys are not stored. The body is at most 512 KiB."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid"],
+          "properties": {
+            "uri": { "type": "string", "format": "at-uri" },
+            "cid": {
+              "type": "string",
+              "description": "An opaque version token for updateAudience's swapCid, not a CID."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "The input is not an object, carries an rkey (this AppView mints the record key), or its record fails a check above. The message says which."
+        },
+        {
+          "name": "LimitReached",
+          "description": "The requester already has 200 audiences."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        },
+        {
+          "name": "Reindexing",
+          "description": "The caller's account is being re-indexed after an interruption; retry after `retryAfter` seconds (in the body; also the Retry-After header). Not NotReady: the caller is still a member."
+        }
+      ]
+    }
+  }
+}

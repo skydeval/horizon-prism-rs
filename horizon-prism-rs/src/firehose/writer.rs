@@ -1063,6 +1063,20 @@ impl Writer {
         // 2 and 3: DID locks, then per-URI locks.
         lock_dids_shared(&mut tx, &lock_dids).await?;
         lock_uris(&mut tx, &lock_uri_list).await?;
+        // The repo's owner lock, once, before any op's row locks, when an op
+        // may change its owner rows: a private post upsert or a private
+        // delete (private-audiences design §11). The later takes inside
+        // `ingest` re-enter it.
+        let owner_rows = prepared.iter().any(|p| match p {
+            Prepared::Upsert(u) => u.body == Body::Private,
+            Prepared::Delete(d) => matches!(d.kind, RecordKind::PrivatePost | RecordKind::PrivateGate),
+            Prepared::Skip(_) | Prepared::Invalid(_) => false,
+        });
+        if owner_rows {
+            crate::private_tier::owners::lock(&mut tx, repo).await?;
+            #[cfg(test)]
+            crate::test_support::hooks::pause_in(crate::test_support::hooks::WRITER_AFTER_OWNER_LOCK, &self.pool, repo).await;
+        }
 
         let mut report = ApplyReport { transaction: true, outline, ..ApplyReport::default() };
         let mut effects = MemoryEffects::default();
@@ -1386,7 +1400,7 @@ impl Writer {
                 OpTarget::Upsert(u, _) | OpTarget::RejectedBlock(u, _) => matches!(u.body, Body::Private | Body::PrivateGate),
                 OpTarget::Delete(d) => matches!(
                     d.kind,
-                    RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateGate
+                    RecordKind::PrivatePost | RecordKind::PrivateGate
                 ),
                 OpTarget::GrowOnly(..) | OpTarget::RejectedFollow(..) | OpTarget::RootGate(..) => false,
             };
@@ -1781,7 +1795,7 @@ impl Writer {
         let author_in_scope = sets.in_scope(repo);
         let removed = match d.kind {
             // A delete carries no record, so it never classifies as a gate.
-            RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateGate => {
+            RecordKind::PrivatePost | RecordKind::PrivateGate => {
                 let applied = self.private.delete(conn, &d.uri, rev, author_in_scope).await?;
                 eff.owners_joined = applied.owners_joined;
                 eff.owners_left = applied.owners_left;
@@ -1990,16 +2004,17 @@ impl Writer {
         if eff.owners_joined.is_empty() && eff.owners_left.is_empty() && eff.member_follow_removed.is_none() {
             return;
         }
+        // Each DID's place in the owner set from the database, read under
+        // the write guard, so a task that applies its report late cannot
+        // undo a newer one (private-audiences design §11); the report when
+        // the read fails.
+        let report = crate::private_tier::Applied { changed: false, owners_joined: eff.owners_joined, owners_left: eff.owners_left };
+        crate::private_tier::audiences::settle_owner_set(&self.scope, &self.pool, &report).await;
+        let Some(m) = eff.member_follow_removed else {
+            return;
+        };
         let mut sets = self.scope.write_guard().await;
-        for d in eff.owners_joined {
-            sets.private_owners.insert(d);
-        }
-        for d in &eff.owners_left {
-            sets.private_owners.remove(d);
-        }
-        if let Some(m) = eff.member_follow_removed
-            && let Some(n) = sets.member_follows.get_mut(&m)
-        {
+        if let Some(n) = sets.member_follows.get_mut(&m) {
             *n = n.saturating_sub(1);
         }
     }
@@ -2312,7 +2327,7 @@ async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo
         RecordKind::Table(table) => vec![table],
         RecordKind::PublicRootGate => vec!["threadgates"],
         // The private tier keeps its own (`ingest::delete`).
-        RecordKind::PrivatePost | RecordKind::PrivateAudience | RecordKind::PrivateGate => {
+        RecordKind::PrivatePost | RecordKind::PrivateGate => {
             return Ok(false);
         }
     };
@@ -2595,7 +2610,7 @@ pub async fn advance_applied_rev(conn: &mut PgConnection, did: &str, rev: &str, 
 }
 
 /// What a settle wrote: whether it set the follow-verification flag, and
-/// whether both listed revs covered its rev (replay-readiness design §4.4).
+/// whether the post listed rev covered its rev (replay-readiness design §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settled {
     pub verified: bool,
@@ -2610,8 +2625,10 @@ pub struct Settled {
 /// other case, the `INSERT` branch included, writes NULL.
 /// `follows_verified_rev` is the `applied_rev` this leaves behind.
 ///
-/// `applied_rev` rises only to a rev both listed revs already cover
-/// (replay-readiness design §4.4, Invariant R): an uncovered settle leaves
+/// `applied_rev` rises only to a rev the post listed rev already covers
+/// (replay-readiness design §4.4, Invariant R; private-audiences design
+/// §4.3: no listing writes an audience, so it is the only one): an
+/// uncovered settle leaves
 /// it where it was and writes the flag NULL, and the `INSERT` branch (a row
 /// deleted mid-run, so no listed revs) writes `applied_rev` NULL.
 ///
@@ -2628,18 +2645,18 @@ pub async fn advance_applied_rev_with_follows(
         "INSERT INTO sync_state (did, applied_rev) VALUES ($1, NULL) \
          ON CONFLICT (did) DO UPDATE SET \
            applied_rev = GREATEST(sync_state.applied_rev, \
-             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+             CASE WHEN sync_state.post_listed_rev >= $2 THEN $2 END), \
            follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 \
-             AND sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN now() END, \
+             AND sync_state.post_listed_rev >= $2 THEN now() END, \
            follows_verified_rev = GREATEST(sync_state.applied_rev, \
-             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+             CASE WHEN sync_state.post_listed_rev >= $2 THEN $2 END), \
            chain_rev = GREATEST(sync_state.chain_rev, \
-             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+             CASE WHEN sync_state.post_listed_rev >= $2 THEN $2 END), \
            diverged_since = CASE WHEN GREATEST(sync_state.applied_rev, \
-               CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
+               CASE WHEN sync_state.post_listed_rev >= $2 THEN $2 END) \
                >= sync_state.head_rev THEN NULL ELSE sync_state.diverged_since END \
          RETURNING follows_verified_at IS NOT NULL, \
-           COALESCE(post_listed_rev >= $2 AND audience_listed_rev >= $2, false)",
+           COALESCE(post_listed_rev >= $2, false)",
     )
     .bind(did)
     .bind(rev)
@@ -2779,24 +2796,21 @@ pub const METRIC_LISTED_REV_LOCK_RETRIES: &str = "listed_rev_lock_retries_total"
 /// Metric: settles whose rev the listed revs did not cover, by `path`.
 pub const METRIC_SETTLE_UNCOVERED: &str = "settle_uncovered_total";
 
-/// Which listed revs a raise moves (replay-readiness design §4.1).
+/// Which listed revs a raise moves (replay-readiness design §4.1): the post
+/// listed rev, the one grant collection left once audiences are held here
+/// (private-audiences design §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListedRevs {
     pub post: bool,
-    pub audience: bool,
 }
 
 impl ListedRevs {
-    pub const BOTH: Self = Self { post: true, audience: true };
+    pub const POST: Self = Self { post: true };
 
     /// The listed rev of a grant collection; `None` for any other.
     #[must_use]
     pub fn of(nsid: &str) -> Option<Self> {
-        match nsid {
-            super::classifier::NSID_POST_PRIVATE => Some(Self { post: true, audience: false }),
-            super::classifier::NSID_AUDIENCE => Some(Self { post: false, audience: true }),
-            _ => None,
-        }
+        (nsid == super::classifier::NSID_POST_PRIVATE).then_some(Self::POST)
     }
 }
 
@@ -2870,16 +2884,13 @@ pub async fn raise_listed_rev(
                 }
             }
             sqlx::query(
-                "INSERT INTO sync_state (did, post_listed_rev, audience_listed_rev) \
-                 VALUES ($1, CASE WHEN $3 THEN $2 END, CASE WHEN $4 THEN $2 END) \
+                "INSERT INTO sync_state (did, post_listed_rev) VALUES ($1, CASE WHEN $3 THEN $2 END) \
                  ON CONFLICT (did) DO UPDATE SET \
-                   post_listed_rev = GREATEST(sync_state.post_listed_rev, EXCLUDED.post_listed_rev), \
-                   audience_listed_rev = GREATEST(sync_state.audience_listed_rev, EXCLUDED.audience_listed_rev)",
+                   post_listed_rev = GREATEST(sync_state.post_listed_rev, EXCLUDED.post_listed_rev)",
             )
             .bind(did)
             .bind(rev)
             .bind(which.post)
-            .bind(which.audience)
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -4873,7 +4884,7 @@ mod tests {
         /// A covered settle at `r`, as a job's or catch-up's.
         async fn settle_at(p: &PgPool, did: &str, r: &str) {
             sqlx::query("INSERT INTO sync_state (did) VALUES ($1) ON CONFLICT DO NOTHING").bind(did).execute(p).await.expect("row");
-            sqlx::query("UPDATE sync_state SET post_listed_rev = GREATEST(post_listed_rev, $2), audience_listed_rev = GREATEST(audience_listed_rev, $2) WHERE did = $1")
+            sqlx::query("UPDATE sync_state SET post_listed_rev = GREATEST(post_listed_rev, $2) WHERE did = $1")
                 .bind(did)
                 .bind(r)
                 .execute(p)
@@ -5001,7 +5012,7 @@ mod tests {
             assert_eq!(chain_of(p, AUTHOR).await, (s(29), s(33), vec![rev(31), rev(32), rev(33)]));
             // An uncovered settle moves nothing.
             let mut tx = p.begin().await.expect("tx");
-            sqlx::query("UPDATE sync_state SET post_listed_rev = $2, audience_listed_rev = $2 WHERE did = $1")
+            sqlx::query("UPDATE sync_state SET post_listed_rev = $2 WHERE did = $1")
                 .bind(AUTHOR)
                 .bind(rev(25))
                 .execute(&mut *tx)
@@ -5059,9 +5070,10 @@ mod tests {
 
             // Untracking a DID still in scope keeps its row, without its chain.
             sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)").bind(AUTHOR).execute(p).await.expect("scope");
-            let mut conn = p.acquire().await.expect("conn");
-            crate::private_tier::owners::reevaluate(&mut conn, AUTHOR).await.expect("reevaluate");
-            drop(conn);
+            // In a transaction, as every caller holds one (the owner lock).
+            let mut tx = p.begin().await.expect("tx");
+            crate::private_tier::owners::reevaluate(&mut tx, AUTHOR).await.expect("reevaluate");
+            tx.commit().await.expect("commit");
             assert_eq!(chain_of(p, AUTHOR).await, (None, None, vec![]));
             let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_state WHERE did = $1").bind(AUTHOR).fetch_one(p).await.expect("row");
             assert_eq!(rows, 1);
@@ -5072,9 +5084,10 @@ mod tests {
             assert_eq!(chain_commit(&mut tx, AUTHOR, &rev(200), &rev(199)).await.expect("chain"), ChainStep::Linked);
             tx.commit().await.expect("commit");
             assert_eq!(chain_of(p, AUTHOR).await.2, vec![rev(200)]);
-            let mut conn = p.acquire().await.expect("conn");
-            crate::private_tier::owners::reevaluate(&mut conn, AUTHOR).await.expect("reevaluate");
-            drop(conn);
+            // In a transaction, as every caller holds one (the owner lock).
+            let mut tx = p.begin().await.expect("tx");
+            crate::private_tier::owners::reevaluate(&mut tx, AUTHOR).await.expect("reevaluate");
+            tx.commit().await.expect("commit");
             let links: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_chain_links").fetch_one(p).await.expect("links");
             assert_eq!(links, 0);
             db.drop_db().await;

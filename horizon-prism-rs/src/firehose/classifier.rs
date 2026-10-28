@@ -75,11 +75,13 @@ pub enum EcosystemKind {
 /// Kryphocron records Prism indexes (§5.4 table). Private blocks
 /// (`tools.kryphocron.graph.block`) are not among them since skydeval's
 /// decision of 2026-10-24: a public block already keeps the two accounts
-/// apart, so the NSID is skipped like any unproduced one.
+/// apart, so the NSID is skipped like any unproduced one. Nor are audiences
+/// (`tools.kryphocron.policy.audience`): this AppView holds them, written
+/// through its own methods (private-audiences design §4.1), so a repository
+/// copy is skipped the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KryphocronKind {
     PostPrivate,
-    Audience,
 }
 
 /// The classification of one op.
@@ -111,7 +113,6 @@ impl RecordClass {
                 kind: Some(k),
             } => Some(match k {
                 KryphocronKind::PostPrivate => RecordKind::PrivatePost,
-                KryphocronKind::Audience => RecordKind::PrivateAudience,
             }),
             Self::Kryphocron { .. } | Self::Unindexed => None,
         }
@@ -126,7 +127,6 @@ pub fn classify(nsid: &str, rkey: &str) -> RecordClass {
     {
         let kind = match (tier, nsid) {
             (Tier::Private, NSID_POST_PRIVATE) => Some(KryphocronKind::PostPrivate),
-            (Tier::Private, NSID_AUDIENCE) => Some(KryphocronKind::Audience),
             _ => None,
         };
         return RecordClass::Kryphocron { tier, kind };
@@ -242,21 +242,16 @@ mod tests {
 
     #[test]
     fn produced_kryphocron_nsids_are_private() {
-        for (nsid, kind, rk) in [
-            (NSID_POST_PRIVATE, KryphocronKind::PostPrivate, RecordKind::PrivatePost),
-            (NSID_AUDIENCE, KryphocronKind::Audience, RecordKind::PrivateAudience),
-        ] {
-            let c = classify(nsid, "3k");
-            assert_eq!(
-                c,
-                RecordClass::Kryphocron {
-                    tier: Tier::Private,
-                    kind: Some(kind)
-                }
-            );
-            assert_eq!(c.record_kind(), Some(rk));
-            assert_eq!(skip_reason(c), None);
-        }
+        let c = classify(NSID_POST_PRIVATE, "3k");
+        assert_eq!(
+            c,
+            RecordClass::Kryphocron {
+                tier: Tier::Private,
+                kind: Some(KryphocronKind::PostPrivate)
+            }
+        );
+        assert_eq!(c.record_kind(), Some(RecordKind::PrivatePost));
+        assert_eq!(skip_reason(c), None);
     }
 
     #[test]
@@ -269,6 +264,8 @@ mod tests {
             "tools.kryphocron.graph.mute",
             // Private blocks, no longer indexed (skydeval, 2026-10-24).
             "tools.kryphocron.graph.block",
+            // Audiences, held by this AppView (private-audiences design).
+            NSID_AUDIENCE,
         ] {
             let c = classify(nsid, "3k");
             assert!(matches!(c, RecordClass::Kryphocron { .. }), "{nsid}");

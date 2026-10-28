@@ -130,6 +130,8 @@ mod tests {
             "0049_system_accounts_pending",
             // Thread outline index S1 (#922).
             "0050_thread_outline",
+            // Private audiences held by this AppView.
+            "0052_audiences_held",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

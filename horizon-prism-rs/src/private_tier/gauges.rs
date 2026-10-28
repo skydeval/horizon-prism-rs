@@ -60,23 +60,16 @@ pub(crate) async fn owners_not_ready(pool: &PgPool) -> Result<i64, sqlx::Error> 
     .await
 }
 
-/// Whether any private row is stored.
+/// Whether any private post is stored. Audiences are left out: the gauge
+/// measures relay delivery, and an audience is written by its methods, not
+/// delivered (private-audiences design §11).
 async fn rows_exist(pool: &PgPool) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM private_posts) OR EXISTS (SELECT 1 FROM private_audiences)",
-    )
-    .fetch_one(pool)
-    .await
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM private_posts)").fetch_one(pool).await
 }
 
-/// The newest private row's `indexed_at`: the seed before the first event.
+/// The newest private post's `indexed_at`: the seed before the first event.
 async fn newest_row(pool: &PgPool) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT max(t) FROM (SELECT max(indexed_at) AS t FROM private_posts \
-           UNION ALL SELECT max(indexed_at) FROM private_audiences) m",
-    )
-    .fetch_one(pool)
-    .await
+    sqlx::query_scalar("SELECT max(indexed_at) FROM private_posts").fetch_one(pool).await
 }
 
 /// The last event's age in seconds, seeding it from the rows first if no

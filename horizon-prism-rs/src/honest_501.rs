@@ -290,7 +290,9 @@ pub const PUBLIC_METHODS: &[PublicMethod] = &[
 /// `putNotificationPreferences`), and two more as of private activity
 /// subscriptions (`putActivitySubscription`, `listActivitySubscriptions`),
 /// and two more as of private appearance (`getAppearance`,
-/// `putAppearance`), and one as of its retention (`releaseAppearance`).
+/// `putAppearance`), and one as of its retention (`releaseAppearance`),
+/// and four as of private audiences (`createAudience`, `updateAudience`,
+/// `deleteAudience`, `listAudiences`).
 pub const KEPT_METHODS: &[&str] = &[
     "app.bsky.graph.getMutes",
     "app.bsky.graph.muteActor",
@@ -332,6 +334,10 @@ pub const KEPT_METHODS: &[&str] = &[
     "app.nearhorizon.private.getAppearance",
     "app.nearhorizon.private.putAppearance",
     "app.nearhorizon.private.releaseAppearance",
+    "app.nearhorizon.private.createAudience",
+    "app.nearhorizon.private.updateAudience",
+    "app.nearhorizon.private.deleteAudience",
+    "app.nearhorizon.private.listAudiences",
     "app.nearhorizon.threadLens.getThread",
     "app.nearhorizon.threadLens.resolve",
     "app.nearhorizon.index.requestRecord",
@@ -386,6 +392,10 @@ pub(crate) const PRIVATE_POSTING_METHODS: &[(&str, Verb)] = &[
     ("app.nearhorizon.private.getAppearance", Verb::Get),
     ("app.nearhorizon.private.putAppearance", Verb::Post),
     ("app.nearhorizon.private.releaseAppearance", Verb::Post),
+    ("app.nearhorizon.private.createAudience", Verb::Post),
+    ("app.nearhorizon.private.updateAudience", Verb::Post),
+    ("app.nearhorizon.private.deleteAudience", Verb::Post),
+    ("app.nearhorizon.private.listAudiences", Verb::Get),
 ];
 
 /// The public method for an NSID.
@@ -514,22 +524,23 @@ mod tests {
 
     /// T-6 (public-indexing design §6) and T-3 (private posting §3.2, at
     /// S11's running totals, private notification preferences' two,
-    /// private activity subscriptions' two, private appearance's two and
-    /// its retention's one): every served method is in exactly one of the
-    /// two sets, 56 public and 62 kept (Refract's eleven, the two plural
-    /// reads and the five system-accounts methods included), 118 served. Their verbs are checked
+    /// private activity subscriptions' two, private appearance's two, its
+    /// retention's one and private audiences' four): every served method is
+    /// in exactly one of the two sets, 56 public and 66 kept (Refract's
+    /// eleven, the two plural reads and the five system-accounts methods
+    /// included), 122 served. Their verbs are checked
     /// against the routes in `xrpc::router`'s and `private_tier`'s tests.
     #[test]
     fn public_and_kept_methods_classify_every_served_method() {
         use crate::xrpc::rate_limit::SERVED;
 
-        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 62));
+        assert_eq!((PUBLIC_METHODS.len(), KEPT_METHODS.len()), (56, 66));
         let public: BTreeSet<&str> = PUBLIC_METHODS.iter().map(|m| m.nsid).collect();
         let kept: BTreeSet<&str> = KEPT_METHODS.iter().copied().collect();
-        assert_eq!((public.len(), kept.len()), (56, 62), "no NSID twice");
+        assert_eq!((public.len(), kept.len()), (56, 66), "no NSID twice");
         assert!(public.is_disjoint(&kept));
         let served: BTreeSet<&str> = SERVED.iter().map(|s| s.nsid).collect();
-        assert_eq!(served.len(), 118);
+        assert_eq!(served.len(), 122);
         // Private posting's methods are kept, in the `private` family.
         for &(nsid, _) in PRIVATE_POSTING_METHODS {
             assert!(kept.contains(nsid), "{nsid}");

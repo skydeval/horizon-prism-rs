@@ -1,7 +1,8 @@
 //! Private-tier ingest (design-v2 §3.2, §4.5, §5.5, §6.11.1): LWW writes of
-//! admitted `postPrivate` and `policy.audience` records and private gates, with
+//! admitted `postPrivate` records and private gates, with
 //! `private_tombstones`, owner re-evaluation, and the purge and reconcile
-//! helpers.
+//! helpers. Audiences are not ingested: this AppView holds them
+//! (`audiences`, private-audiences design).
 //!
 //! **Defensive parsing (#235).** Aurora-Locus does not validate
 //! `tools.kryphocron.*` records on write, so every field is read defensively:
@@ -20,9 +21,7 @@ use sqlx::{PgConnection, PgPool};
 use super::media::{self, MEDIA_KINDS_FIELD};
 use super::{Applied, IngestError, PrivateOp, PublicNotify, QuoteRef, clear_fields, owners};
 use crate::db::locks::uri_author;
-use crate::firehose::classifier::{
-    NSID_AUDIENCE, NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_THREADGATE,
-};
+use crate::firehose::classifier::{NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_THREADGATE};
 use crate::firehose::jobs::{self, Depth};
 use crate::firehose::normalize::{bytes_field, strong_ref_cid};
 use crate::firehose::records::created_at;
@@ -304,47 +303,6 @@ impl PostPrivateFields {
     }
 }
 
-/// The stored fields of a `policy.audience` record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AudienceFields {
-    pub mode: Option<String>,
-    pub members: Vec<String>,
-    /// The operator-facing label (P-3): a string, else `None`. A `name` of
-    /// another type is dropped and counted, never malformed (C-16).
-    pub name: Option<String>,
-}
-
-impl AudienceFields {
-    /// Parse an audience record. Non-DID entries in `members` are dropped
-    /// (tolerated); a non-array `members` is malformed.
-    ///
-    /// # Errors
-    ///
-    /// [`IngestError::Malformed`].
-    pub(crate) fn parse(record: &Value) -> Result<Self, IngestError> {
-        let mode = opt_string(record, "mode")?;
-        let name = match record.get("name") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) if s.len() <= DISPLAY_FIELD_MAX_BYTES => Some(s.clone()),
-            Some(_) => {
-                metrics::counter!(METRIC_FIELD_DROPPED, "field" => "name").increment(1);
-                None
-            }
-        };
-        let members = match record.get("members") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(a)) => a
-                .iter()
-                .filter_map(|m| m.as_str().or_else(|| m.get("did").and_then(Value::as_str)))
-                .filter(|d| proto_blue::syntax::Did::is_valid(d))
-                .map(str::to_string)
-                .collect(),
-            Some(_) => return Err(malformed("members is not an array")),
-        };
-        Ok(Self { mode, members, name })
-    }
-}
-
 async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM private_tombstones WHERE uri = $1 AND rev >= $2)")
         .bind(uri)
@@ -357,20 +315,19 @@ async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<boo
 /// (replay-readiness design §4.3), by `collection`.
 pub(crate) const METRIC_BELOW_LISTED: &str = "private_ingest_below_listed_total";
 
-/// Whether an upsert of a grant collection (private posts, audiences) is
-/// history: tombstoned at or above `rev`, or below its author's listed rev
-/// for the collection (replay-readiness design §4.3). The listing at that
-/// rev already holds the op's effect or its undoing, so the op is never
-/// news, from any source. Strictly below: commit L's own op still writes.
-/// One statement, on the writer's transaction after its shared DID lock:
-/// every raise that committed before the lock is seen, and none commits
-/// before the transaction ends.
+/// Whether an upsert of the grant collection (private posts) is history:
+/// tombstoned at or above `rev`, or below its author's listed rev
+/// (replay-readiness design §4.3). The listing at that rev already holds
+/// the op's effect or its undoing, so the op is never news, from any
+/// source. Strictly below: commit L's own op still writes. One statement,
+/// on the writer's transaction after its shared DID lock: every raise that
+/// committed before the lock is seen, and none commits before the
+/// transaction ends.
 async fn superseded(conn: &mut PgConnection, op: &PrivateOp) -> Result<bool, sqlx::Error> {
-    let col = if op.nsid == NSID_POST_PRIVATE { "post_listed_rev" } else { "audience_listed_rev" };
-    let (tombstoned, below): (bool, bool) = sqlx::query_as(&format!(
+    let (tombstoned, below): (bool, bool) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM private_tombstones WHERE uri = $1 AND rev >= $2), \
-                EXISTS (SELECT 1 FROM sync_state WHERE did = $3 AND {col} > $2)"
-    ))
+                EXISTS (SELECT 1 FROM sync_state WHERE did = $3 AND post_listed_rev > $2)",
+    )
     .bind(&op.uri)
     .bind(&op.rev)
     .bind(&op.author_did)
@@ -389,7 +346,9 @@ async fn superseded(conn: &mut PgConnection, op: &PrivateOp) -> Result<bool, sql
     Ok(below)
 }
 
-async fn has_owner_rows(conn: &mut PgConnection, did: &str) -> Result<bool, sqlx::Error> {
+/// Whether `did` has a private post or audience row (one half of the owner
+/// condition).
+pub(super) async fn has_owner_rows(conn: &mut PgConnection, did: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM private_posts WHERE author_did = $1) \
              OR EXISTS (SELECT 1 FROM private_audiences WHERE owner_did = $1)",
@@ -401,7 +360,7 @@ async fn has_owner_rows(conn: &mut PgConnection, did: &str) -> Result<bool, sqlx
 
 /// Enqueue a `private` job unless one is already queued or running, so a
 /// burst of private posts does not keep resetting it.
-async fn enqueue_private(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+pub(super) async fn enqueue_private(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, updated_at) \
          VALUES ($1, $2, 'queued', 0, now(), now()) \
@@ -418,7 +377,7 @@ async fn enqueue_private(conn: &mut PgConnection, did: &str) -> Result<(), sqlx:
 
 /// The display refill (private-posting design §3.1, S2): once, at the first
 /// start after migration 0023, a `private` job for every DID with a private
-/// post or audience row stored before it (`display_filled` false), queued
+/// post stored before it (`display_filled` false), queued
 /// as [`enqueue_private`] queues one. The job lists the DID's private
 /// records to the end and writes them at the repo's latest rev, which fills
 /// those rows; an equal or older rev never overwrites a filled row.
@@ -447,9 +406,8 @@ pub(crate) async fn enqueue_display_refill(pool: &PgPool, marker: &str) -> Resul
     }
     let queued = sqlx::query(
         "INSERT INTO backfill_jobs (did, depth, state, attempts, not_before, updated_at) \
-         SELECT d.did, $1, 'queued', 0, now(), now() FROM ( \
-           SELECT author_did AS did FROM private_posts WHERE NOT display_filled \
-           UNION SELECT owner_did FROM private_audiences WHERE NOT display_filled) d \
+         SELECT DISTINCT d.did, $1, 'queued', 0, now(), now() FROM ( \
+           SELECT author_did AS did FROM private_posts WHERE NOT display_filled) d \
          ON CONFLICT (did, depth) DO UPDATE SET state = 'queued', attempts = 0, generation = backfill_jobs.generation + 1, \
            not_before = now(), last_error = NULL, updated_at = now() \
          WHERE backfill_jobs.state NOT IN ('queued', 'running')",
@@ -470,17 +428,19 @@ pub(crate) async fn enqueue_private_for_tests(conn: &mut PgConnection, did: &str
 
 /// `ingest::apply`: LWW create/update (§5.5) of an admitted private record.
 ///
-/// A `postPrivate` or `audience` row for a member with no prior rows
+/// A `postPrivate` row for a member with no prior post or audience
 /// re-evaluates owner status (§6.11.1): the member becomes an owner and gets
 /// a `private` job. A non-member's row is stored and nothing more
-/// (membership design §2.3). Gates never make their author an owner.
+/// (membership design §2.3). Gates never make their author an owner. A
+/// post takes the owner lock before it reads the owner rows
+/// (private-audiences design §11).
 ///
 /// # Errors
 ///
 /// [`IngestError`].
 pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<Applied, IngestError> {
     let now = Utc::now();
-    let owner_record = op.nsid == NSID_POST_PRIVATE || op.nsid == NSID_AUDIENCE;
+    let owner_record = op.nsid == NSID_POST_PRIVATE;
     // A grant collection's op below the listed rev is refused as a
     // tombstoned one is (replay-readiness design §4.3); any other op only by
     // its tombstone.
@@ -489,9 +449,10 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
         return Ok(Applied::default());
     }
     let author = op.author_did.as_str();
+    if owner_record {
+        owners::lock(&mut *conn, author).await?;
+    }
     let had_rows = owner_record && has_owner_rows(&mut *conn, author).await?;
-    // An audience written with mode exactly `following` (S10 §3.6).
-    let mut following = false;
     let changed = match op.nsid.as_str() {
         NSID_POST_PRIVATE => {
             let f = PostPrivateFields::parse(&op.record, now)?;
@@ -582,30 +543,6 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             }
             changed
         }
-        NSID_AUDIENCE => {
-            let f = AudienceFields::parse(&op.record)?;
-            following = f.mode.as_deref() == Some("following");
-            sqlx::query(
-                "INSERT INTO private_audiences (uri, owner_did, rkey, cid, rev, mode, members, name, display_filled) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true) \
-                 ON CONFLICT (uri) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, \
-                   mode = EXCLUDED.mode, members = EXCLUDED.members, name = EXCLUDED.name, display_filled = true \
-                 WHERE private_audiences.rev < EXCLUDED.rev \
-                    OR (NOT private_audiences.display_filled AND private_audiences.rev <= EXCLUDED.rev)",
-            )
-            .bind(&op.uri)
-            .bind(author)
-            .bind(&op.rkey)
-            .bind(&op.cid)
-            .bind(&op.rev)
-            .bind(&f.mode)
-            .bind(&f.members)
-            .bind(&f.name)
-            .execute(&mut *conn)
-            .await?
-            .rows_affected()
-                > 0
-        }
         other => return Err(malformed(format!("not a private-tier NSID: {other}"))),
     };
     let mut applied = Applied {
@@ -623,22 +560,13 @@ pub(crate) async fn apply(conn: &mut PgConnection, op: &PrivateOp) -> Result<App
             enqueue_private(&mut *conn, author).await?;
         }
     }
-    // A `following` audience written for an existing owner (following-
-    // audience design §3.6): an `authz` run verifies its follows, queued
-    // as `enqueue_private` queues a job, with no reset. It tests no flag, so
-    // a settle writing NULL beside it cannot leave the owner unqueued. A
-    // job's own write is skipped: its pass decision follows its
-    // authorization listings, and its settle re-checks. A DID that becomes
-    // an owner with this record gets its `private` job above.
-    if changed && following && had_rows && op.source != WriteSource::Backfill && owners::is_owner(&mut *conn, author).await? {
-        enqueue_authz(&mut *conn, author).await?;
-    }
     Ok(applied)
 }
 
 /// Enqueue an `authz` job unless one is already queued or running, as
-/// [`enqueue_private`] does for `private`.
-async fn enqueue_authz(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+/// [`enqueue_private`] does for `private`: a `following` audience's follow
+/// verification (following-audience design §3.6).
+pub(super) async fn enqueue_authz(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
     jobs::enqueue_if_idle(conn, did, Depth::Authz, Utc::now()).await
 }
 
@@ -1133,19 +1061,18 @@ fn canonical_private_gates(post_uri: &str) -> Option<[(&'static str, String); 2]
     ])
 }
 
-/// The private table and its author column for an at-uri, by NSID.
+/// The private table and its author column for an at-uri, by NSID: private
+/// posts only. An audience URI has none: audiences are never ingested
+/// (private-audiences design §4.2), so no delete or reconcile reaches one.
 fn table_of(uri: &str) -> Option<(&'static str, &'static str)> {
     let collection = uri.strip_prefix("at://")?.split('/').nth(1)?;
-    match collection {
-        NSID_POST_PRIVATE => Some(("private_posts", "author_did")),
-        NSID_AUDIENCE => Some(("private_audiences", "owner_did")),
-        _ => None,
-    }
+    (collection == NSID_POST_PRIVATE).then_some(("private_posts", "author_did"))
 }
 
 /// `ingest::delete`: `DELETE … WHERE rev <= R`; tombstone iff a row was
-/// removed or the author is in S (§5.5); owner re-evaluation when a post or
-/// audience row went.
+/// removed or the author is in S (§5.5); owner re-evaluation when a post
+/// went. The owner lock comes before the `DELETE` (private-audiences design
+/// §11).
 ///
 /// # Errors
 ///
@@ -1154,6 +1081,9 @@ pub(crate) async fn delete(conn: &mut PgConnection, uri: &str, rev: &str, author
     let Some((table, _)) = table_of(uri) else {
         return Ok(Applied::default());
     };
+    if let Some(author) = uri_author(uri) {
+        owners::lock(&mut *conn, author).await?;
+    }
     let removed = sqlx::query(&format!("DELETE FROM {table} WHERE uri = $1 AND rev <= $2"))
         .bind(uri)
         .bind(rev)
@@ -1223,19 +1153,17 @@ pub(crate) async fn local_uris(conn: &mut PgConnection, did: &str, nsid: &str, b
 }
 
 /// `ingest::stored_cids`: URI → CID of `did`'s stored rows in `nsid`, for the
-/// collections whose rows keep a CID (private posts and audiences). Catch-up
-/// skips a listed record whose CID is stored (private posting §3.8).
+/// collection whose rows keep a CID (private posts). Catch-up skips a
+/// listed record whose CID is stored (private posting §3.8).
 ///
 /// # Errors
 ///
 /// Database errors.
 pub(crate) async fn stored_cids(conn: &mut PgConnection, did: &str, nsid: &str) -> Result<HashMap<String, String>, sqlx::Error> {
-    let (table, col) = match nsid {
-        NSID_POST_PRIVATE => ("private_posts", "author_did"),
-        NSID_AUDIENCE => ("private_audiences", "owner_did"),
-        _ => return Ok(HashMap::new()),
-    };
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!("SELECT uri, cid FROM {table} WHERE {col} = $1"))
+    if nsid != NSID_POST_PRIVATE {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as("SELECT uri, cid FROM private_posts WHERE author_did = $1")
         .bind(did)
         .fetch_all(conn)
         .await?;
@@ -1247,7 +1175,7 @@ pub(crate) async fn stored_cids(conn: &mut PgConnection, did: &str, nsid: &str) 
 /// `cids[i]`) is stored in a version older than its listing at `rev`:
 /// present, below `rev`, with another CID. A row at or above `rev` is a
 /// newer state; a row that is gone only denies. Empty for a collection
-/// other than private posts and audiences.
+/// other than private posts.
 ///
 /// # Errors
 ///
@@ -1259,14 +1187,10 @@ pub(crate) async fn replayed_since_listing(
     cids: &[String],
     rev: &str,
 ) -> Result<bool, sqlx::Error> {
-    let table = match nsid {
-        NSID_POST_PRIVATE => "private_posts",
-        NSID_AUDIENCE => "private_audiences",
-        _ => return Ok(false),
-    };
-    if uris.is_empty() {
+    if nsid != NSID_POST_PRIVATE || uris.is_empty() {
         return Ok(false);
     }
+    let table = "private_posts";
     sqlx::query_scalar(&format!(
         "SELECT EXISTS (SELECT 1 FROM unnest($1::text[], $2::text[]) AS t(uri, cid) \
                         JOIN {table} p ON p.uri = t.uri \
@@ -1488,13 +1412,23 @@ pub(crate) async fn purge_out_of_scope(conn: &mut PgConnection, did: &str, limit
 /// received and authored, for the same reason; and the private
 /// subscriptions it holds or is the subject of (private-activity-subs §3.2).
 /// Its appearance setting is kept, not deleted: retained by the marker, or
-/// here by the backstop (private-appearance amendment 1 §4.2).
+/// here by the backstop (private-appearance amendment 1 §4.2). Its own
+/// audiences go, for good: this AppView holds the only copy, and a member
+/// who rejoins starts with none (private-audiences design §7, C-7).
 ///
 /// # Errors
 ///
 /// Database errors.
 pub(crate) async fn purge_member_removed(conn: &mut PgConnection, did: &str, limit: i64) -> Result<u64, sqlx::Error> {
     let mut n = purge_bookmarks(conn, did, limit).await?;
+    n += sqlx::query(
+        "DELETE FROM private_audiences WHERE uri IN (SELECT uri FROM private_audiences WHERE owner_did = $1 LIMIT $2)",
+    )
+    .bind(did)
+    .bind(limit)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
     n += purge_notifications(conn, did, limit).await?;
     n += purge_subscriptions(conn, did, limit).await?;
     n += retain_appearance_backstop(conn, did).await?;
@@ -1795,14 +1729,5 @@ mod tests {
             assert_eq!(crate::private_tier::notifies_post(source, created, at, max), expected, "{source:?} {created} {at}");
         }
         assert!(crate::private_tier::notifies(WriteSource::Firehose, old, max), "public records: unchanged");
-    }
-
-    #[test]
-    fn audiences_tolerate_junk_members() {
-        let a = AudienceFields::parse(&json!({"mode": "list", "members": ["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", 4, "bob", {"did": "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}]}))
-            .expect("audience");
-        assert_eq!(a.members, ["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"]);
-        assert!(AudienceFields::parse(&json!({"members": "x"})).is_err());
-        assert!(AudienceFields::parse(&json!({})).expect("empty").members.is_empty());
     }
 }

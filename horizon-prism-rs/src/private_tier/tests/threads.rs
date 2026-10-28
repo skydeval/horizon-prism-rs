@@ -33,10 +33,11 @@ impl Walk {
         self.f.apply_op(ALICE, Action::Update, NSID_POST_PRIVATE, "3kroot222222", rev, Some(record)).await;
     }
 
-    /// Rewrite Alice's audience `rkey` as `mode` of `members`, at `rev`.
-    pub(super) async fn edit_audience(&self, rkey: &str, mode: &str, members: &[&str], rev: &str) {
+    /// Rewrite Alice's audience `rkey` as `mode` of `members`, through
+    /// `updateAudience`'s write. `_rev` is kept for the callers' order.
+    pub(super) async fn edit_audience(&self, rkey: &str, mode: &str, members: &[&str], _rev: &str) {
         let record = json!({"$type": NSID_AUDIENCE, "mode": mode, "members": members, "createdAt": "2026-09-26T00:00:00Z"});
-        self.f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, rkey, rev, Some(record)).await;
+        self.f.edit_audience(ALICE, &format!("at://{ALICE}/{NSID_AUDIENCE}/{rkey}"), &record).await;
     }
 
     pub(super) async fn label(&self, subject: &str, val: &str) {

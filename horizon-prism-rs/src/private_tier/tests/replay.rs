@@ -1,8 +1,14 @@
 //! #723, replay below a settle (docs/internal/design/replay-readiness.md
-//! §11): the listed revs, the ingest refusal, the settle's coverage and
-//! catch-up's check, T-62 to T-82 (T-73 sits beside T-40). Built on the S10
+//! §11): the listed rev, the ingest refusal, the settle's coverage and
+//! catch-up's check, T-63 to T-82 (T-73 sits beside T-40). Built on the S10
 //! harness, whose items this module sees: the firehose's own commits through
 //! [`H::fire`], jobs and catch-ups from [`Pds`].
+//!
+//! Private posts are the one grant collection: audiences are held by this
+//! AppView and never listed (private-audiences design §4.2, §4.3), so T-62,
+//! which tested replayed audiences by mode, is gone, and the others replay
+//! posts (a stale post version moves it from a wide audience to a narrow
+//! one).
 //!
 //! The control (review 1, LB3): a test that asserts a miss also asserts, at
 //! the read, that O and V are ready and `applied_rev ≥ head_rev` for both
@@ -93,27 +99,26 @@ fn refusal_off(h: &H, did: &str, refusal: bool) -> Option<hooks::Armed> {
     (!refusal).then(|| hooks::arm(hooks::LISTED_REV_REFUSAL_OFF, &h.key(did)))
 }
 
-/// O (Alice) an owner, ready: an audience listing Bob, stored and in her
-/// repository. Its rkey.
+/// O (Alice) an owner, ready: an audience listing Bob, held here. Its URI.
 async fn owner(h: &H, tag: &str) -> String {
     let rkey = format!("3k{tag}base");
-    h.audience_of(ALICE, &rkey, "list", &[BOB]).await;
+    let aud = h.audience_of(ALICE, &rkey, "list", &[BOB]).await;
     h.f.ready_all().await;
-    rkey
+    aud
 }
 
-/// `did`'s listed revs: `(post, audience)`.
-async fn listed(h: &H, did: &str) -> (Option<String>, Option<String>) {
-    sqlx::query_as::<_, (Option<String>, Option<String>)>("SELECT post_listed_rev, audience_listed_rev FROM sync_state WHERE did = $1")
+/// `did`'s post listed rev.
+async fn listed(h: &H, did: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT post_listed_rev FROM sync_state WHERE did = $1")
         .bind(did)
         .fetch_optional(h.pool())
         .await
         .expect("sync_state")
-        .unwrap_or((None, None))
+        .flatten()
 }
 
-fn both(r: &str) -> (Option<String>, Option<String>) {
-    (Some(r.to_string()), Some(r.to_string()))
+fn at(r: &str) -> Option<String> {
+    Some(r.to_string())
 }
 
 /// The stored `(rev, cid)` of `uri` in `table`.
@@ -196,77 +201,31 @@ fn catch_up_outcome(handle: &PrometheusHandle, outcome: &str) -> f64 {
     series(&handle.render(), "index_request_catch_up_total", &[&format!("outcome=\"{outcome}\"")]).unwrap_or(0.0)
 }
 
-/// One ordering of the issue: in O's repository an audience A (mode
-/// `mode`, Bob listed) created at C1, a post P under it, A deleted at D, the
-/// head D. Nothing of it applied yet: the consumer is behind.
+/// One ordering of the issue: in O's repository a private post Q under O's
+/// audience (Bob listed) created at C1 and deleted at D, the head D.
+/// Nothing of it applied yet: the consumer is behind.
 struct Scene {
-    a_rkey: String,
-    a: String,
-    a_rec: Value,
-    p: String,
+    q_rkey: String,
+    q: String,
+    q_rec: Value,
     c1: String,
-    c2: String,
     d: String,
 }
 
 impl Scene {
-    async fn new(h: &H, tag: &str, mode: &str, n: u8) -> Self {
-        let (a_rkey, p_rkey) = (format!("3k{tag}aud"), format!("3k{tag}pst"));
-        let a = uri(ALICE, NSID_AUDIENCE, &a_rkey);
-        let p_rec = h.f.post_record(ALICE, &p_rkey, &a, None).await;
-        h.pds.put(ALICE, NSID_POST_PRIVATE, &p_rkey, p_rec);
-        let (c1, c2, d) = (rev(n), rev(n + 1), rev(n + 2));
+    async fn new(h: &H, tag: &str, audience: &str, n: u8) -> Self {
+        let q_rkey = format!("3k{tag}pst");
+        let q_rec = h.f.post_record(ALICE, &q_rkey, audience, None).await;
+        let (c1, d) = (rev(n), rev(n + 2));
         h.pds.set_rev(ALICE, &d);
-        Self { a_rec: audience_record(mode, &[BOB]), p: uri(ALICE, NSID_POST_PRIVATE, &p_rkey), a, a_rkey, c1, c2, d }
+        Self { q: uri(ALICE, NSID_POST_PRIVATE, &q_rkey), q_rkey, q_rec, c1, d }
     }
 
     /// The consumer's replay of C1.
     fn replay(&self) -> RawOp {
-        upsert(NSID_AUDIENCE, &self.a_rkey, &format!("bafy{}", self.a_rkey), self.a_rec.clone())
+        upsert(NSID_POST_PRIVATE, &self.q_rkey, &format!("bafy{}", self.q_rkey), self.q_rec.clone())
     }
 }
-
-// ---- T-62: the issue ----
-
-/// T-62: a `private` job at R ≥ D settles; the replay of C1 returns
-/// `Unchanged` and stores no A; V's `getPosts` of P misses byte-identically,
-/// before and after D replays. For `list`, `followers` (V follows O) and
-/// `everyone`. With the refusal off, V reads P: the HEAD behaviour.
-async fn t62_the_issue(test: &str, mode: PublicMode, refusal: bool) {
-    let Some(h) = H::new(test, mode).await else {
-        return;
-    };
-    let _off = refusal_off(&h, ALICE, refusal);
-    owner(&h, "t62").await;
-    exec(h.pool(), &follow_sql(BOB, ALICE)).await;
-    let b = h.backfill();
-    for (i, audience_mode) in ["list", "followers", "everyone"].into_iter().enumerate() {
-        let s = Scene::new(&h, &format!("t62{i}"), audience_mode, u8::try_from(i * 3).expect("small")).await;
-        assert_eq!(h.run(&b, ALICE, Depth::Private).await, JobOutcome::Ready, "{audience_mode}");
-        assert_eq!(listed(&h, ALICE).await, both(&s.d));
-        assert_eq!(h.applied(ALICE).await.as_deref(), Some(s.d.as_str()));
-        let report = h.fire(ALICE, &s.c1, vec![s.replay()]).await;
-        control(&h, ALICE, BOB, &s.d).await;
-        if refusal {
-            assert_eq!(report.outcomes, [OpOutcome::Unchanged], "{audience_mode}");
-            assert_eq!(row(&h, "private_audiences", &s.a).await, None);
-            assert!(misses(&h, BOB, &s.p).await, "{audience_mode}");
-        } else {
-            assert_eq!(report.outcomes, [OpOutcome::Written], "{audience_mode}");
-            assert!(h.reads(BOB, &s.p).await, "{audience_mode}: the HEAD leak");
-        }
-        // C2 (P itself) and D replay.
-        let p_rkey = s.p.rsplit('/').next().expect("rkey").to_string();
-        let p_rec = h.f.post_record(ALICE, &p_rkey, &s.a, None).await;
-        h.fire(ALICE, &s.c2, vec![upsert(NSID_POST_PRIVATE, &p_rkey, &format!("bafy{p_rkey}"), p_rec)]).await;
-        h.fire(ALICE, &s.d, vec![delete(NSID_AUDIENCE, &s.a_rkey)]).await;
-        control(&h, ALICE, BOB, &s.d).await;
-        assert!(misses(&h, BOB, &s.p).await, "{audience_mode}: after D");
-    }
-    h.finish().await;
-}
-
-with_control!(t62_the_issue: t62_the_issue_on, t62_the_issue_off, t62_control_on, t62_control_off);
 
 // ---- T-63: a deleted post ----
 
@@ -280,7 +239,7 @@ async fn t63_deleted_post(test: &str, mode: PublicMode, refusal: bool) {
     let _off = refusal_off(&h, ALICE, refusal);
     let base = owner(&h, "t63").await;
     let rkey = "3kt63pst001";
-    let mut record = h.f.post_record(ALICE, rkey, &uri(ALICE, NSID_AUDIENCE, &base), None).await;
+    let mut record = h.f.post_record(ALICE, rkey, &base, None).await;
     record["createdAt"] = json!(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true));
     record["facets"] = json!([{"index": {"byteStart": 0, "byteEnd": 4}, "features": [{"$type": "app.bsky.richtext.facet#mention", "did": BOB}]}]);
     h.pds.set_rev(ALICE, R2);
@@ -311,8 +270,8 @@ with_control!(t63_deleted_post: t63_deleted_post_on, t63_deleted_post_off, t63_c
 
 // ---- T-64: the interleavings of §4.5 ----
 
-/// T-64: (a) a replay committed between the audience listing and the raise
-/// is deleted by the reconcile before the settle; (b) a writer holding the
+/// T-64: (a) a replay committed between the post listing and the raise is
+/// deleted by the reconcile before the settle; (b) a writer holding the
 /// DID's lock shared when the raise starts: the raise retries without
 /// blocking another shared locker, the writer commits, the raise commits,
 /// the reconcile deletes the row; (c) a replay between the raise and the
@@ -324,14 +283,14 @@ async fn t64_interleavings(test: &str, mode: PublicMode, refusal: bool) {
         return;
     };
     let _off = refusal_off(&h, ALICE, refusal);
-    owner(&h, "t64").await;
+    let base = owner(&h, "t64").await;
     let b = h.backfill();
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let _local = metrics::set_default_local_recorder(&recorder);
 
     // (a) Before the raise.
-    let s = Scene::new(&h, "t64a", "list", 0).await;
+    let s = Scene::new(&h, "t64a", &base, 0).await;
     let hook = hooks::arm(hooks::LISTED_REV_BEFORE_RAISE, &h.key(ALICE));
     h.enqueue(ALICE, Depth::Private).await;
     let run = h.spawn_run(&b, ALICE, Depth::Private);
@@ -340,24 +299,24 @@ async fn t64_interleavings(test: &str, mode: PublicMode, refusal: bool) {
     hook.release();
     assert_eq!(run.await.expect("task").expect("db").expect("job").1, JobOutcome::Ready);
     drop(hook);
-    assert_eq!(row(&h, "private_audiences", &s.a).await, None, "(a) reconciled");
+    assert_eq!(row(&h, "private_posts", &s.q).await, None, "(a) reconciled");
 
     // (b) A writer in flight when the raise starts.
-    let s = Scene::new(&h, "t64b", "list", 3).await;
+    let s = Scene::new(&h, "t64b", &base, 3).await;
     let hook = hooks::arm(hooks::LISTED_REV_BEFORE_RAISE, &h.key(ALICE));
     h.enqueue(ALICE, Depth::Private).await;
     let run = h.spawn_run(&b, ALICE, Depth::Private);
     hook.reached().await;
     let mut writer_tx = hold_shared(h.pool(), ALICE).await;
     sqlx::query(
-        "INSERT INTO private_audiences (uri, owner_did, rkey, cid, rev, mode, members, display_filled) \
-         VALUES ($1, $2, $3, 'bafyt64b', $4, 'list', $5, true)",
+        "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, audience_uri, plaintext_text, created_at, display_filled) \
+         VALUES ($1, $2, $3, 'bafyt64b', $4, $5, 'x', now(), true)",
     )
-    .bind(&s.a)
+    .bind(&s.q)
     .bind(ALICE)
-    .bind(&s.a_rkey)
+    .bind(&s.q_rkey)
     .bind(&s.c1)
-    .bind(vec![BOB.to_string()])
+    .bind(&base)
     .execute(&mut *writer_tx)
     .await
     .expect("the writer's row");
@@ -368,34 +327,34 @@ async fn t64_interleavings(test: &str, mode: PublicMode, refusal: bool) {
     writer_tx.commit().await.expect("the writer commits");
     assert_eq!(run.await.expect("task").expect("db").expect("job").1, JobOutcome::Ready);
     drop(hook);
-    assert_eq!(row(&h, "private_audiences", &s.a).await, None, "(b) reconciled");
+    assert_eq!(row(&h, "private_posts", &s.q).await, None, "(b) reconciled");
 
     // (c) Between the raise and the reconcile.
-    let s = Scene::new(&h, "t64c", "list", 6).await;
+    let s = Scene::new(&h, "t64c", &base, 6).await;
     let hook = hooks::arm(hooks::LISTED_REV_AFTER_RAISE, &h.key(ALICE));
     h.enqueue(ALICE, Depth::Private).await;
     let run = h.spawn_run(&b, ALICE, Depth::Private);
     hook.reached().await;
-    assert_eq!(listed(&h, ALICE).await.1.as_deref(), Some(s.d.as_str()), "the audience raise committed");
+    assert_eq!(listed(&h, ALICE).await.as_deref(), Some(s.d.as_str()), "the raise committed");
     let expected = if refusal { OpOutcome::Unchanged } else { OpOutcome::Written };
     assert_eq!(h.fire(ALICE, &s.c1, vec![s.replay()]).await.outcomes, [expected], "(c)");
     hook.release();
     assert_eq!(run.await.expect("task").expect("db").expect("job").1, JobOutcome::Ready);
     drop(hook);
-    assert_eq!(row(&h, "private_audiences", &s.a).await, None, "(c)");
+    assert_eq!(row(&h, "private_posts", &s.q).await, None, "(c)");
 
     // (d) After the settle.
-    let s = Scene::new(&h, "t64d", "list", 9).await;
+    let s = Scene::new(&h, "t64d", &base, 9).await;
     assert_eq!(h.run(&b, ALICE, Depth::Private).await, JobOutcome::Ready);
     let report = h.fire(ALICE, &s.c1, vec![s.replay()]).await;
     control(&h, ALICE, BOB, &s.d).await;
     if refusal {
         assert_eq!(report.outcomes, [OpOutcome::Unchanged], "(d)");
-        assert_eq!(row(&h, "private_audiences", &s.a).await, None);
-        assert!(misses(&h, BOB, &s.p).await);
+        assert_eq!(row(&h, "private_posts", &s.q).await, None);
+        assert!(misses(&h, BOB, &s.q).await);
     } else {
         assert_eq!(report.outcomes, [OpOutcome::Written], "(d)");
-        assert!(h.reads(BOB, &s.p).await, "(d): the HEAD leak");
+        assert!(h.reads(BOB, &s.q).await, "(d): the HEAD leak");
     }
     h.finish().await;
 }
@@ -413,13 +372,17 @@ async fn t65_at_or_above_r(test: &str, mode: PublicMode) {
         return;
     };
     let base = owner(&h, "t65").await;
+    let listed_post = h.post(ALICE, "3kt65pst", &base, None).await;
     h.pds.set_rev(ALICE, R2);
     assert_eq!(h.run(&h.backfill(), ALICE, Depth::Private).await, JobOutcome::Ready);
-    assert_eq!(listed(&h, ALICE).await, both(R2));
-    let record = audience_record("list", &[BOB]);
-    assert_eq!(h.fire(ALICE, R2, vec![upsert(NSID_AUDIENCE, "3kt65atr", "bafyt65a", record.clone())]).await.outcomes, [OpOutcome::Written]);
-    assert_eq!(h.fire(ALICE, R3, vec![upsert(NSID_AUDIENCE, "3kt65above", "bafyt65b", record.clone())]).await.outcomes, [OpOutcome::Written]);
-    assert_eq!(h.fire(ALICE, R2, vec![upsert(NSID_AUDIENCE, &base, "bafyt65c", record)]).await.outcomes, [OpOutcome::Unchanged]);
+    assert_eq!(listed(&h, ALICE).await, at(R2));
+    assert_eq!(row(&h, "private_posts", &listed_post).await.map(|r| r.0), Some(R2.to_string()), "the run stored it at R");
+    for (r, rkey, cid) in [(R2, "3kt65atr", "bafyt65a"), (R3, "3kt65above", "bafyt65b")] {
+        let record = h.f.post_record(ALICE, rkey, &base, None).await;
+        assert_eq!(h.fire(ALICE, r, vec![upsert(NSID_POST_PRIVATE, rkey, cid, record)]).await.outcomes, [OpOutcome::Written], "{rkey}");
+    }
+    let record = h.f.post_record(ALICE, "3kt65pst", &base, None).await;
+    assert_eq!(h.fire(ALICE, R2, vec![upsert(NSID_POST_PRIVATE, "3kt65pst", "bafyt65c", record)]).await.outcomes, [OpOutcome::Unchanged]);
     h.finish().await;
 }
 
@@ -436,15 +399,16 @@ async fn t81_the_insert_branch(test: &str, mode: PublicMode) {
     exec(h.pool(), &format!("DELETE FROM sync_state WHERE did = '{ALICE}'")).await;
     let until = std::time::Instant::now() + LISTED_REV_LOCK_DEADLINE;
     let post = ListedRevs::of(NSID_POST_PRIVATE).expect("a grant collection");
+    assert_eq!(ListedRevs::of(NSID_AUDIENCE), None, "audiences are not listed");
     assert_eq!(raise_listed_rev(&h.f.writer, ALICE, R1, post, until, None).await.expect("raise"), Raise::Raised);
-    let stored: (Option<String>, Option<String>, Option<String>, Option<String>) =
-        sqlx::query_as("SELECT applied_rev, head_rev, post_listed_rev, audience_listed_rev FROM sync_state WHERE did = $1")
+    let stored: (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT applied_rev, head_rev, post_listed_rev FROM sync_state WHERE did = $1")
             .bind(ALICE)
             .fetch_one(h.pool())
             .await
             .expect("a row");
-    assert_eq!(stored, (None, None, Some(R1.to_string()), None));
-    assert_eq!(raise_listed_rev(&h.f.writer, NOBODY, R1, ListedRevs::BOTH, until, None).await.expect("raise"), Raise::Untracked);
+    assert_eq!(stored, (None, None, Some(R1.to_string())));
+    assert_eq!(raise_listed_rev(&h.f.writer, NOBODY, R1, ListedRevs::POST, until, None).await.expect("raise"), Raise::Untracked);
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_state WHERE did = $1").bind(NOBODY).fetch_one(h.pool()).await.expect("count");
     assert_eq!(rows, 0);
     h.finish().await;
@@ -455,31 +419,33 @@ in_both_modes!(t81_the_insert_branch: t81_the_insert_branch_on, t81_the_insert_b
 // ---- T-82: the check's boundary ----
 
 /// T-82: a skipped row at exactly R with another CID is not flagged; one
-/// below R with another CID is; one below R with the listed CID is not.
-/// T-79 (d): an older job at R_j < R writes a newer version onto a skipped
-/// URI before the raise: the catch-up ends `replayed_below`, and the next
-/// catch-up settles.
+/// below R with another CID is; one below R with the listed CID is not; an
+/// audience is never checked. T-79 (d): an older job at R_j < R writes a
+/// newer version onto a skipped URI before the raise: the catch-up ends
+/// `replayed_below`, and the next catch-up settles.
 async fn t82_the_checks_boundary(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
-    let rkey = "3kt82aud";
-    let a = h.audience_of(ALICE, rkey, "list", &[BOB]).await;
-    h.f.ready_all().await;
+    let base = owner(&h, "t82").await;
+    let rkey = "3kt82pst";
+    let a = h.post(ALICE, rkey, &base, None).await;
     let cid = format!("bafy{rkey}");
-    let check = |rev: &'static str, listed_cid: String| {
-        let (pool, a) = (h.pool().clone(), a.clone());
+    let check = |nsid: &'static str, rev: &'static str, listed_cid: String, uri: String| {
+        let pool = h.pool().clone();
         async move {
             let mut conn = pool.acquire().await.expect("conn");
-            KryphocronPrivateTier.replayed_since_listing(&mut conn, NSID_AUDIENCE, &[a], &[listed_cid], rev).await.expect("check")
+            KryphocronPrivateTier.replayed_since_listing(&mut conn, nsid, &[uri], &[listed_cid], rev).await.expect("check")
         }
     };
-    exec(h.pool(), &format!("UPDATE private_audiences SET rev = '{R2}' WHERE uri = '{a}'")).await;
-    assert!(!check(R2, "bafyother".into()).await, "at exactly R");
-    exec(h.pool(), &format!("UPDATE private_audiences SET rev = '{R1}' WHERE uri = '{a}'")).await;
-    assert!(check(R2, "bafyother".into()).await, "below R, another CID");
-    assert!(!check(R2, cid.clone()).await, "below R, the listed CID");
-    exec(h.pool(), &format!("UPDATE private_audiences SET rev = '{REV}' WHERE uri = '{a}'")).await;
+    exec(h.pool(), &format!("UPDATE private_posts SET rev = '{R2}' WHERE uri = '{a}'")).await;
+    assert!(!check(NSID_POST_PRIVATE, R2, "bafyother".into(), a.clone()).await, "at exactly R");
+    exec(h.pool(), &format!("UPDATE private_posts SET rev = '{R1}' WHERE uri = '{a}'")).await;
+    assert!(check(NSID_POST_PRIVATE, R2, "bafyother".into(), a.clone()).await, "below R, another CID");
+    assert!(!check(NSID_POST_PRIVATE, R2, cid.clone(), a.clone()).await, "below R, the listed CID");
+    exec(h.pool(), &format!("UPDATE private_audiences SET rev = '{R1}' WHERE uri = '{base}'")).await;
+    assert!(!check(NSID_AUDIENCE, R2, "bafyother".into(), base.clone()).await, "audiences are never checked");
+    exec(h.pool(), &format!("UPDATE private_posts SET rev = '{REV}' WHERE uri = '{a}'")).await;
 
     // T-79 (d).
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -489,17 +455,17 @@ async fn t82_the_checks_boundary(test: &str, mode: PublicMode) {
     let hook = hooks::arm(hooks::LISTED_REV_BEFORE_RAISE, &h.key(ALICE));
     let catch = spawn_catch_up(&h, ALICE, R3);
     hook.reached().await;
-    let newer = audience_record("list", &[BOB, CAROL]);
-    let report = h.f.writer.apply(ALICE, R1, &[upsert(NSID_AUDIENCE, rkey, "bafyt82new", newer.clone())], job_write()).await.expect("apply");
+    let newer = h.f.post_record(ALICE, rkey, &base, None).await;
+    let report = h.f.writer.apply(ALICE, R1, &[upsert(NSID_POST_PRIVATE, rkey, "bafyt82new", newer.clone())], job_write()).await.expect("apply");
     assert_eq!(report.outcomes, [OpOutcome::Written]);
-    h.pds.put_cid(ALICE, NSID_AUDIENCE, rkey, "bafyt82new", newer);
+    h.pds.put_cid(ALICE, NSID_POST_PRIVATE, rkey, "bafyt82new", newer);
     hook.release();
     assert!(!catch.await.expect("task"));
     drop(hook);
     assert_eq!(catch_up_outcome(&handle, "replayed_below"), 1.0);
-    assert_eq!(listed(&h, ALICE).await, (None, None));
+    assert_eq!(listed(&h, ALICE).await, None);
     assert!(h.catch_up(ALICE, R3).await, "the next catch-up settles");
-    assert_eq!(listed(&h, ALICE).await, both(R3));
+    assert_eq!(listed(&h, ALICE).await, at(R3));
     h.finish().await;
 }
 
@@ -507,43 +473,43 @@ in_both_modes!(t82_the_checks_boundary: t82_the_checks_boundary_on, t82_the_chec
 
 // ---- T-66: catch-up ----
 
-/// T-66: both listed revs rise after catch-up's listings and before its
+/// T-66: the listed rev rises after catch-up's listings and before its
 /// reconciles; a CID-skipped row nothing changed is untouched; a catch-up
 /// that stops at the page cap raises nothing; one that ends
-/// `reconcile_incomplete` leaves them raised.
+/// `reconcile_incomplete` leaves it raised.
 async fn t66_catch_up(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
-    let kept = h.audience_of(ALICE, "3kt66aud", "list", &[BOB]).await;
-    let gone = h.audience_of(ALICE, "3kt66gon", "list", &[BOB]).await;
-    h.pds.remove(ALICE, NSID_AUDIENCE, "3kt66gon");
-    h.f.ready_all().await;
+    let base = owner(&h, "t66").await;
+    let kept = h.post(ALICE, "3kt66pst", &base, None).await;
+    let gone = h.post(ALICE, "3kt66gon", &base, None).await;
+    h.pds.remove(ALICE, NSID_POST_PRIVATE, "3kt66gon");
     h.pds.set_rev(ALICE, R1);
     let run = |cfg: CatchUpConfig| {
         let (pds, writer) = (Arc::clone(&h.pds), h.f.writer.clone());
         async move { catch_up(pds.as_ref(), &writer, &CatchUp::new(cfg), ALICE, PDS, R1).await }
     };
     assert!(!run(CatchUpConfig { max_pages: 1, ..roomy() }).await, "the page cap");
-    assert_eq!(listed(&h, ALICE).await, (None, None));
+    assert_eq!(listed(&h, ALICE).await, None);
     assert!(!run(CatchUpConfig { reconcile_confirm_limit: 0, ..roomy() }).await, "reconcile_incomplete");
-    assert_eq!(listed(&h, ALICE).await, both(R1));
-    assert!(row(&h, "private_audiences", &gone).await.is_some());
+    assert_eq!(listed(&h, ALICE).await, at(R1));
+    assert!(row(&h, "private_posts", &gone).await.is_some());
 
     h.pds.set_rev(ALICE, R2);
     let before = hooks::arm(hooks::LISTED_REV_BEFORE_RAISE, &h.key(ALICE));
     let after = hooks::arm(hooks::LISTED_REV_AFTER_RAISE, &h.key(ALICE));
     let catch = spawn_catch_up(&h, ALICE, R2);
     before.reached().await;
-    assert_eq!(listed(&h, ALICE).await, both(R1), "listings done, nothing raised");
+    assert_eq!(listed(&h, ALICE).await, at(R1), "listings done, nothing raised");
     before.release();
     after.reached().await;
-    assert_eq!(listed(&h, ALICE).await, both(R2), "raised");
-    assert!(row(&h, "private_audiences", &gone).await.is_some(), "not yet reconciled");
+    assert_eq!(listed(&h, ALICE).await, at(R2), "raised");
+    assert!(row(&h, "private_posts", &gone).await.is_some(), "not yet reconciled");
     after.release();
     assert!(catch.await.expect("task"));
-    assert_eq!(row(&h, "private_audiences", &gone).await, None);
-    assert_eq!(row(&h, "private_audiences", &kept).await, Some((REV.to_string(), Some("bafy3kt66aud".to_string()))), "skipped, untouched");
+    assert_eq!(row(&h, "private_posts", &gone).await, None);
+    assert_eq!(row(&h, "private_posts", &kept).await, Some((REV.to_string(), Some("bafy3kt66pst".to_string()))), "skipped, untouched");
     h.finish().await;
 }
 
@@ -560,31 +526,30 @@ async fn t67_sources(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
-    owner(&h, "t67").await;
+    let base = owner(&h, "t67").await;
     let b = h.backfill();
-    let record = audience_record("list", &[BOB]);
     h.pds.set_rev(ALICE, R2);
     assert_eq!(h.run(&b, ALICE, Depth::Private).await, JobOutcome::Ready);
-    h.pds.put(ALICE, NSID_AUDIENCE, "3kt67new", record.clone());
+    h.pds.put(ALICE, NSID_POST_PRIVATE, "3kt67new", h.f.post_record(ALICE, "3kt67new", &base, None).await);
     h.pds.set_rev(ALICE, R3);
-    let indexed = index_record(h.pds.as_ref(), &h.f.writer, ALICE, NSID_AUDIENCE, "3kt67new", 1, false).await.expect("index");
+    let indexed = index_record(h.pds.as_ref(), &h.f.writer, ALICE, NSID_POST_PRIVATE, "3kt67new", 1, false).await.expect("index");
     assert_eq!(indexed.status, IndexStatus::Indexed);
 
     // A newer job at R4, then an older one at R3 whose listing saw a record
     // deleted before the newer listing.
     h.pds.set_rev(ALICE, R4);
     assert_eq!(h.run(&b, ALICE, Depth::Private).await, JobOutcome::Ready);
-    h.pds.put(ALICE, NSID_AUDIENCE, "3kt67old", record.clone());
+    h.pds.put(ALICE, NSID_POST_PRIVATE, "3kt67old", h.f.post_record(ALICE, "3kt67old", &base, None).await);
     h.pds.set_rev(ALICE, R3);
     assert_eq!(h.run(&b, ALICE, Depth::Private).await, JobOutcome::Ready, "no write failed");
-    assert_eq!(row(&h, "private_audiences", &uri(ALICE, NSID_AUDIENCE, "3kt67old")).await, None);
+    assert_eq!(row(&h, "private_posts", &uri(ALICE, NSID_POST_PRIVATE, "3kt67old")).await, None);
     assert_eq!(h.applied(ALICE).await.as_deref(), Some(R4));
-    assert_eq!(listed(&h, ALICE).await, both(R4));
+    assert_eq!(listed(&h, ALICE).await, at(R4));
 
-    h.pds.put(ALICE, NSID_AUDIENCE, "3kt67req", record);
-    let indexed = index_record(h.pds.as_ref(), &h.f.writer, ALICE, NSID_AUDIENCE, "3kt67req", 1, false).await.expect("index");
+    h.pds.put(ALICE, NSID_POST_PRIVATE, "3kt67req", h.f.post_record(ALICE, "3kt67req", &base, None).await);
+    let indexed = index_record(h.pds.as_ref(), &h.f.writer, ALICE, NSID_POST_PRIVATE, "3kt67req", 1, false).await.expect("index");
     assert_eq!(indexed.status, IndexStatus::Unchanged);
-    assert_eq!(row(&h, "private_audiences", &uri(ALICE, NSID_AUDIENCE, "3kt67req")).await, None);
+    assert_eq!(row(&h, "private_posts", &uri(ALICE, NSID_POST_PRIVATE, "3kt67req")).await, None);
     h.finish().await;
 }
 
@@ -592,39 +557,39 @@ in_both_modes!(t67_sources: t67_sources_on, t67_sources_off);
 
 // ---- T-68: deny-only classes ----
 
-/// T-68: below the listed revs, a block, a threadgate of a private post
-/// and a follow are applied, and so is a delete.
+/// T-68: below the listed rev, a block, a threadgate of a private post and
+/// a follow are applied, and so is a delete.
 async fn t68_deny_only_classes(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
     let base = owner(&h, "t68").await;
-    let p = h.post(ALICE, "3kt68pst", &uri(ALICE, NSID_AUDIENCE, &base), None).await;
+    let p = h.post(ALICE, "3kt68pst", &base, None).await;
     h.pds.set_rev(ALICE, R3);
     assert_eq!(h.run(&h.backfill(), ALICE, Depth::Private).await, JobOutcome::Ready);
-    assert_eq!(listed(&h, ALICE).await, both(R3));
-    let at = "2026-10-01T00:00:00Z";
+    assert_eq!(listed(&h, ALICE).await, at(R3));
+    let at_time = "2026-10-01T00:00:00Z";
     for (collection, rkey, record) in [
-        ("app.bsky.graph.block", "3kt68blk", json!({"$type": "app.bsky.graph.block", "subject": DAVE, "createdAt": at})),
-        (THREADGATE, "3kt68pst", json!({"$type": THREADGATE, "post": p, "allow": [], "createdAt": at})),
+        ("app.bsky.graph.block", "3kt68blk", json!({"$type": "app.bsky.graph.block", "subject": DAVE, "createdAt": at_time})),
+        (THREADGATE, "3kt68pst", json!({"$type": THREADGATE, "post": p, "allow": [], "createdAt": at_time})),
         (FOLLOW, "3kt68fol", follow_record(CAROL)),
     ] {
         let report = h.fire(ALICE, R1, vec![upsert(collection, rkey, &format!("bafy{rkey}"), record)]).await;
         assert_eq!(report.outcomes, [OpOutcome::Written], "{collection}");
     }
     // A row kept at an old rev (as catch-up keeps one by CID), deleted
-    // below the listed revs.
-    let kept = uri(ALICE, NSID_AUDIENCE, "3kt68old");
+    // below the listed rev.
+    let kept = uri(ALICE, NSID_POST_PRIVATE, "3kt68old");
     exec(
         h.pool(),
         &format!(
-            "INSERT INTO private_audiences (uri, owner_did, rkey, cid, rev, mode, members, display_filled) \
-             VALUES ('{kept}', '{ALICE}', '3kt68old', 'bafyold', '{REV}', 'list', '{{}}', true)"
+            "INSERT INTO private_posts (uri, author_did, rkey, cid, rev, audience_uri, plaintext_text, created_at, display_filled) \
+             VALUES ('{kept}', '{ALICE}', '3kt68old', 'bafyold', '{REV}', '{base}', 'x', now(), true)"
         ),
     )
     .await;
-    assert_eq!(h.fire(ALICE, R1, vec![delete(NSID_AUDIENCE, "3kt68old")]).await.outcomes, [OpOutcome::Written]);
-    assert_eq!(row(&h, "private_audiences", &kept).await, None);
+    assert_eq!(h.fire(ALICE, R1, vec![delete(NSID_POST_PRIVATE, "3kt68old")]).await.outcomes, [OpOutcome::Written]);
+    assert_eq!(row(&h, "private_posts", &kept).await, None);
     h.finish().await;
 }
 
@@ -632,7 +597,7 @@ in_both_modes!(t68_deny_only_classes: t68_deny_only_classes_on, t68_deny_only_cl
 
 // ---- T-69: settle coverage ----
 
-/// T-69: a job settle whose listed revs are below R (the raise skipped by a
+/// T-69: a job settle whose listed rev is below R (the raise skipped by a
 /// hook) leaves `applied_rev` unchanged, counts `settle_uncovered`, and
 /// writes the flag NULL after a complete follows pass, which queues the
 /// retry; the `INSERT` branch writes `applied_rev` NULL. The same for
@@ -653,7 +618,7 @@ async fn t69_settle_coverage(test: &str, mode: PublicMode) {
     h.clear_jobs().await;
     assert_eq!(h.run(&b, ALICE, Depth::Authz).await, JobOutcome::Ready);
     assert_eq!(h.applied(ALICE).await.as_deref(), Some(REV));
-    assert_eq!(listed(&h, ALICE).await, (None, None));
+    assert_eq!(listed(&h, ALICE).await, None);
     assert!(!h.flag(ALICE).await.set);
     let job = h.job(ALICE, Depth::Authz).await.expect("authz");
     assert_eq!((job.0.as_str(), job.1.as_deref()), ("queued", Some(FOLLOWS_RETRY)), "the retry");
@@ -695,6 +660,30 @@ async fn t69_settle_coverage(test: &str, mode: PublicMode) {
 
 in_both_modes!(t69_settle_coverage: t69_settle_coverage_on, t69_settle_coverage_off);
 
+/// T-A11 (private-audiences design §13): a job settle and a catch-up
+/// settle raise `applied_rev` with only the post listed rev raised; the
+/// settle is covered and `settle_uncovered_total` does not move.
+async fn t_a11_settles_cover_without_audiences(test: &str, mode: PublicMode) {
+    let Some(h) = H::new(test, mode).await else {
+        return;
+    };
+    owner(&h, "ta11").await;
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    h.pds.set_rev(ALICE, R1);
+    h.clear_jobs().await;
+    assert_eq!(h.run(&h.backfill(), ALICE, Depth::Private).await, JobOutcome::Ready);
+    assert_eq!((listed(&h, ALICE).await, h.applied(ALICE).await), (at(R1), at(R1)));
+    h.pds.set_rev(ALICE, R2);
+    assert!(h.catch_up(ALICE, R2).await);
+    assert_eq!((listed(&h, ALICE).await, h.applied(ALICE).await), (at(R2), at(R2)));
+    assert_eq!(series(&handle.render(), METRIC_SETTLE_UNCOVERED, &[]).unwrap_or(0.0), 0.0);
+    h.finish().await;
+}
+
+in_both_modes!(t_a11_settles_cover_without_audiences: t_a11_settles_cover_on, t_a11_settles_cover_off);
+
 // ---- T-70: lock contention ----
 
 /// T-70: O's lock held shared past the deadline. Another shared locker is
@@ -721,12 +710,12 @@ async fn t70_lock_contention(test: &str, mode: PublicMode) {
     let job = h.job(ALICE, Depth::Private).await.expect("private");
     assert_eq!((job.0.as_str(), job.3), ("queued", 0), "{job:?}");
     assert!((30..=90).contains(&job.2), "a minute on: {job:?}");
-    assert_eq!(listed(&h, ALICE).await, (None, None));
+    assert_eq!(listed(&h, ALICE).await, None);
     assert_eq!(h.applied(ALICE).await.as_deref(), Some(REV));
 
     assert!(!h.catch_up(ALICE, R1).await);
     assert_eq!(catch_up_outcome(&handle, "listed_rev_busy"), 1.0);
-    assert_eq!(listed(&h, ALICE).await, (None, None));
+    assert_eq!(listed(&h, ALICE).await, None);
     held.rollback().await.expect("rollback");
     h.finish().await;
 }
@@ -757,7 +746,8 @@ fn pre_listed_revs_count_query() {
 /// T-71: a row with `applied_rev` ahead of `firehose_rev` is seeded; one
 /// with `firehose_rev ≥ applied_rev` is not; one with `firehose_rev` NULL
 /// and `applied_rev` set is. `sync_state`'s `relfilenode` is unchanged
-/// across the `ALTER`. The pre-release count counts the same rows.
+/// across the `ALTER`. The pre-release count counts the same rows. (0030
+/// added both listed revs; 0052 later drops the audience one.)
 #[tokio::test]
 async fn t71_the_migration_seeds_settled_rows() {
     let Some(db) = crate::test_support::empty_db("i723-t71").await else {
@@ -811,20 +801,23 @@ async fn t71_the_migration_seeds_settled_rows() {
 
 // ---- T-72: untracked to tracked ----
 
-/// T-72: a replayed audience row of a DID with no `sync_state` row is
-/// inserted; the DID becomes an owner; its `private` job raises the listed
-/// revs, and the reconcile deletes the row before readiness is set. Passes
-/// at HEAD too: non-regression.
+/// T-72: a replayed post of a DID with no `sync_state` row is inserted; the
+/// DID becomes an owner; its `private` job raises the listed rev, and the
+/// reconcile deletes the row before readiness is set. Passes at HEAD too:
+/// non-regression.
 async fn t72_untracked_to_tracked(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
     actor(h.pool(), EVE, "eve.test", "eve.test").await;
     h.member_outside_s(EVE).await;
-    let replayed = h.direct(EVE, NSID_AUDIENCE, "3kt72aud", audience_record("list", &[BOB])).await;
-    h.pds.remove(EVE, NSID_AUDIENCE, "3kt72aud");
-    assert!(row(&h, "private_audiences", &replayed).await.is_some(), "inserted: no listed rev");
-    let kept = h.direct(EVE, NSID_AUDIENCE, "3kt72kep", audience_record("list", &[BOB])).await;
+    let aud = h.direct(EVE, NSID_AUDIENCE, "3kt72aud", audience_record("list", &[BOB])).await;
+    let rec = h.f.post_record(EVE, "3kt72rep", &aud, None).await;
+    let replayed = h.direct(EVE, NSID_POST_PRIVATE, "3kt72rep", rec).await;
+    h.pds.remove(EVE, NSID_POST_PRIVATE, "3kt72rep");
+    assert!(row(&h, "private_posts", &replayed).await.is_some(), "inserted: no listed rev");
+    let rec = h.f.post_record(EVE, "3kt72kep", &aud, None).await;
+    let kept = h.direct(EVE, NSID_POST_PRIVATE, "3kt72kep", rec).await;
     h.f.writer.scope().write_guard().await.private_owners.insert(EVE.into());
     h.pds.set_rev(EVE, R1);
     let hook = hooks::arm(hooks::SETTLE_BEFORE_GAP_LOCK, &h.key(EVE));
@@ -832,13 +825,14 @@ async fn t72_untracked_to_tracked(test: &str, mode: PublicMode) {
     h.enqueue(EVE, Depth::Private).await;
     let run = h.spawn_run(&h.backfill(), EVE, Depth::Private);
     hook.reached().await;
-    assert_eq!(listed(&h, EVE).await, both(R1));
-    assert_eq!(row(&h, "private_audiences", &replayed).await, None, "reconciled");
+    assert_eq!(listed(&h, EVE).await, at(R1));
+    assert_eq!(row(&h, "private_posts", &replayed).await, None, "reconciled");
     assert!(!h.owner_ready(EVE).await, "before readiness");
     hook.release();
     assert_eq!(run.await.expect("task").expect("db").expect("job").1, JobOutcome::Ready);
     assert!(h.owner_ready(EVE).await);
-    assert!(row(&h, "private_audiences", &kept).await.is_some());
+    assert!(row(&h, "private_posts", &kept).await.is_some());
+    assert!(row(&h, "private_audiences", &aud).await.is_some(), "the held audience is never reconciled");
     h.finish().await;
 }
 
@@ -846,56 +840,53 @@ in_both_modes!(t72_untracked_to_tracked: t72_untracked_to_tracked_on, t72_untrac
 
 // ---- T-74, T-75, T-77: a stale version after catch-up ----
 
-const STALE_RKEY: &str = "3kt74aud";
+const STALE_RKEY: &str = "3kt74pst";
 const U_PRIME_CID: &str = "bafyt74uprime";
 const U_CID: &str = "bafyt74u";
 
-/// U' (Bob listed), A's version at R2.
-fn u_prime() -> RawOp {
-    upsert(NSID_AUDIENCE, STALE_RKEY, U_PRIME_CID, audience_record("list", &[BOB]))
+/// O's post A with versions U' at R2 (under O's audience listing V) and U
+/// at R3 (under an audience listing no one). A job's live listing stored
+/// U's content at R_j = R1 < R2; O's head is now R4.
+struct Stale {
+    a: String,
+    u_prime: RawOp,
+    u: RawOp,
 }
 
-/// U (Bob removed), A's version at R3.
-fn u() -> RawOp {
-    upsert(NSID_AUDIENCE, STALE_RKEY, U_CID, audience_record("list", &[]))
-}
-
-/// O's audience A with versions U' at R2 and U at R3, and P under it. A
-/// job's live listing stored U's content at R_j = R1 < R2; O's head is now
-/// R4. Returns `(A, P)`.
-async fn stale_version(h: &H) -> (String, String) {
-    owner(h, "t74").await;
-    let a = uri(ALICE, NSID_AUDIENCE, STALE_RKEY);
-    h.pds.put_cid(ALICE, NSID_AUDIENCE, STALE_RKEY, U_CID, audience_record("list", &[]));
-    let p_rec = h.f.post_record(ALICE, "3kt74pst", &a, None).await;
-    h.pds.put(ALICE, NSID_POST_PRIVATE, "3kt74pst", p_rec);
+async fn stale_version(h: &H) -> Stale {
+    let wide = owner(h, "t74").await;
+    let narrow = h.audience_of(ALICE, "3kt74nar", "list", &[]).await;
+    let u_prime = h.f.post_record(ALICE, STALE_RKEY, &wide, None).await;
+    let u = h.f.post_record(ALICE, STALE_RKEY, &narrow, None).await;
+    h.pds.put_cid(ALICE, NSID_POST_PRIVATE, STALE_RKEY, U_CID, u.clone());
     h.pds.set_rev(ALICE, R1);
     assert_eq!(h.run(&h.backfill(), ALICE, Depth::Private).await, JobOutcome::Ready);
-    assert_eq!(row(h, "private_audiences", &a).await, Some((R1.to_string(), Some(U_CID.to_string()))));
+    let a = uri(ALICE, NSID_POST_PRIVATE, STALE_RKEY);
+    assert_eq!(row(h, "private_posts", &a).await, Some((R1.to_string(), Some(U_CID.to_string()))));
     h.pds.set_rev(ALICE, R4);
-    (a, uri(ALICE, NSID_POST_PRIVATE, "3kt74pst"))
+    Stale { a, u_prime: upsert(NSID_POST_PRIVATE, STALE_RKEY, U_PRIME_CID, u_prime), u: upsert(NSID_POST_PRIVATE, STALE_RKEY, U_CID, u) }
 }
 
 /// T-74: catch-up at R4 skips A by CID and settles; the replay of U' is
-/// refused and V does not read P under A. With the refusal off, V reads:
-/// the HEAD leak.
+/// refused and V does not read A. With the refusal off, V reads: the HEAD
+/// leak.
 async fn t74_a_stale_version_after_catch_up(test: &str, mode: PublicMode, refusal: bool) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
     let _off = refusal_off(&h, ALICE, refusal);
-    let (a, p) = stale_version(&h).await;
+    let s = stale_version(&h).await;
     assert!(h.catch_up(ALICE, R4).await);
-    assert_eq!(row(&h, "private_audiences", &a).await, Some((R1.to_string(), Some(U_CID.to_string()))), "skipped by CID");
-    assert_eq!(listed(&h, ALICE).await, both(R4));
-    let report = h.fire(ALICE, R2, vec![u_prime()]).await;
+    assert_eq!(row(&h, "private_posts", &s.a).await, Some((R1.to_string(), Some(U_CID.to_string()))), "skipped by CID");
+    assert_eq!(listed(&h, ALICE).await, at(R4));
+    let report = h.fire(ALICE, R2, vec![s.u_prime.clone()]).await;
     control(&h, ALICE, BOB, R4).await;
     if refusal {
         assert_eq!(report.outcomes, [OpOutcome::Unchanged]);
-        assert!(misses(&h, BOB, &p).await);
+        assert!(misses(&h, BOB, &s.a).await);
     } else {
         assert_eq!(report.outcomes, [OpOutcome::Written]);
-        assert!(h.reads(BOB, &p).await, "the HEAD leak");
+        assert!(h.reads(BOB, &s.a).await, "the HEAD leak");
     }
     h.finish().await;
 }
@@ -908,13 +899,13 @@ with_control!(t74_a_stale_version_after_catch_up: t74_stale_version_on, t74_stal
 /// `applied_rev` where the firehose left it; V misses on the head check
 /// (the cause shown: with the head at `applied_rev`, V would read) until U
 /// replays, after which V does not read. Without the check (`check` false):
-/// the raise and settle commit, and V reads P under U' with `applied_rev ≥
+/// the raise and settle commit, and V reads A at U' with `applied_rev ≥
 /// head`.
 async fn t75_catch_ups_check(test: &str, mode: PublicMode, check: bool) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
-    let (_, p) = stale_version(&h).await;
+    let s = stale_version(&h).await;
     let _off = (!check).then(|| hooks::arm(hooks::LISTED_REV_CHECK_OFF, &h.key(ALICE)));
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
@@ -922,30 +913,30 @@ async fn t75_catch_ups_check(test: &str, mode: PublicMode, check: bool) {
     let hook = hooks::arm(hooks::LISTED_REV_BEFORE_RAISE, &h.key(ALICE));
     let catch = spawn_catch_up(&h, ALICE, R4);
     hook.reached().await;
-    assert_eq!(h.fire(ALICE, R2, vec![u_prime()]).await.outcomes, [OpOutcome::Written], "above the listed rev R1");
+    assert_eq!(h.fire(ALICE, R2, vec![s.u_prime.clone()]).await.outcomes, [OpOutcome::Written], "above the listed rev R1");
     hook.release();
     let caught = catch.await.expect("task");
     drop(hook);
     if check {
         assert!(!caught);
         assert_eq!(catch_up_outcome(&handle, "replayed_below"), 1.0);
-        assert_eq!(listed(&h, ALICE).await, both(R1));
+        assert_eq!(listed(&h, ALICE).await, at(R1));
         assert_eq!(h.applied(ALICE).await.as_deref(), Some(R2), "the firehose's, not moved by the catch-up");
         exec(h.pool(), &format!("UPDATE sync_state SET head_rev = '{R4}', head_checked_at = now() WHERE did = '{ALICE}'")).await;
         assert!(h.owner_ready(ALICE).await && h.member_ready(BOB).await);
-        assert!(oracle_admits(h.pool(), BOB, &p).await, "the row admits V");
-        assert!(!h.served(BOB, &p).await, "the head check");
+        assert!(oracle_admits(h.pool(), BOB, &s.a).await, "the row admits V");
+        assert!(!h.served(BOB, &s.a).await, "the head check");
         exec(h.pool(), &format!("UPDATE sync_state SET head_rev = '{R2}' WHERE did = '{ALICE}'")).await;
-        assert!(h.served(BOB, &p).await, "the head check was the cause");
+        assert!(h.served(BOB, &s.a).await, "the head check was the cause");
         exec(h.pool(), &format!("UPDATE sync_state SET head_rev = '{R4}' WHERE did = '{ALICE}'")).await;
-        assert_eq!(h.fire(ALICE, R3, vec![u()]).await.outcomes, [OpOutcome::Written], "U by last-writer-wins");
-        assert!(!h.served(BOB, &p).await);
-        assert!(!oracle_admits(h.pool(), BOB, &p).await);
+        assert_eq!(h.fire(ALICE, R3, vec![s.u.clone()]).await.outcomes, [OpOutcome::Written], "U by last-writer-wins");
+        assert!(!h.served(BOB, &s.a).await);
+        assert!(!oracle_admits(h.pool(), BOB, &s.a).await);
     } else {
         assert!(caught);
-        assert_eq!(listed(&h, ALICE).await, both(R4));
+        assert_eq!(listed(&h, ALICE).await, at(R4));
         control(&h, ALICE, BOB, R4).await;
-        assert!(h.reads(BOB, &p).await, "the leak the check closes");
+        assert!(h.reads(BOB, &s.a).await, "the leak the check closes");
     }
     h.finish().await;
 }
@@ -959,17 +950,17 @@ async fn t77_error_before_the_raise(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
-    let (_, p) = stale_version(&h).await;
+    let s = stale_version(&h).await;
     let hook = hooks::arm(hooks::LISTED_REV_BEFORE_RAISE, &h.key(ALICE));
     let _fail = hooks::arm(hooks::CATCH_UP_FAILS_BEFORE_RAISE, &h.key(ALICE));
     let catch = spawn_catch_up(&h, ALICE, R4);
     hook.reached().await;
-    h.fire(ALICE, R2, vec![u_prime()]).await;
+    h.fire(ALICE, R2, vec![s.u_prime.clone()]).await;
     hook.release();
     assert!(!catch.await.expect("task"));
-    assert_eq!(listed(&h, ALICE).await, both(R1));
-    assert_eq!(h.fire(ALICE, R3, vec![u()]).await.outcomes, [OpOutcome::Written]);
-    assert!(!h.reads(BOB, &p).await);
+    assert_eq!(listed(&h, ALICE).await, at(R1));
+    assert_eq!(h.fire(ALICE, R3, vec![s.u.clone()]).await.outcomes, [OpOutcome::Written]);
+    assert!(!h.reads(BOB, &s.a).await);
     h.finish().await;
 }
 
@@ -980,17 +971,17 @@ async fn t77_dropped_before_the_raise(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
-    let (_, p) = stale_version(&h).await;
+    let s = stale_version(&h).await;
     let hook = hooks::arm(hooks::LISTED_REV_BEFORE_RAISE, &h.key(ALICE));
     let catch = spawn_catch_up(&h, ALICE, R4);
     hook.reached().await;
-    h.fire(ALICE, R2, vec![u_prime()]).await;
+    h.fire(ALICE, R2, vec![s.u_prime.clone()]).await;
     catch.abort();
     assert!(catch.await.expect_err("dropped").is_cancelled());
     drop(hook);
-    assert_eq!(listed(&h, ALICE).await, both(R1));
-    assert_eq!(h.fire(ALICE, R3, vec![u()]).await.outcomes, [OpOutcome::Written]);
-    assert!(!h.reads(BOB, &p).await);
+    assert_eq!(listed(&h, ALICE).await, at(R1));
+    assert_eq!(h.fire(ALICE, R3, vec![s.u.clone()]).await.outcomes, [OpOutcome::Written]);
+    assert!(!h.reads(BOB, &s.a).await);
     h.finish().await;
 }
 
@@ -1003,13 +994,13 @@ async fn t77_error_after_the_raise(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
-    let (a, p) = stale_version(&h).await;
+    let s = stale_version(&h).await;
     let _fail = hooks::arm(hooks::CATCH_UP_FAILS_AFTER_RAISE, &h.key(ALICE));
     assert!(!h.catch_up(ALICE, R4).await);
-    assert_eq!(listed(&h, ALICE).await, both(R4));
-    assert_eq!(row(&h, "private_audiences", &a).await, Some((R1.to_string(), Some(U_CID.to_string()))), "the listed version");
-    assert_eq!(h.fire(ALICE, R2, vec![u_prime()]).await.outcomes, [OpOutcome::Unchanged]);
-    assert!(!h.reads(BOB, &p).await);
+    assert_eq!(listed(&h, ALICE).await, at(R4));
+    assert_eq!(row(&h, "private_posts", &s.a).await, Some((R1.to_string(), Some(U_CID.to_string()))), "the listed version");
+    assert_eq!(h.fire(ALICE, R2, vec![s.u_prime.clone()]).await.outcomes, [OpOutcome::Unchanged]);
+    assert!(!h.reads(BOB, &s.a).await);
     h.finish().await;
 }
 
@@ -1017,32 +1008,33 @@ in_both_modes!(t77_error_after_the_raise: t77_error_after_the_raise_on, t77_erro
 
 // ---- T-76: no raise over a failed write ----
 
-/// T-76: A stored at X0 with V; O's next version X1 of A has a non-array
-/// `members`; then an unrelated commit X2. A job at X2 fails on A: the
-/// audience listed rev is not raised (the post one is), and the settle
-/// takes the no-readiness branch, leaving O ready. The consumer replays X1,
-/// then X2. As built (`default`): X1 fails on the firehose, O's readiness is
-/// cleared, and V misses on readiness alone. With the raise forced: X1 is
-/// refused as `Unchanged`, X2 brings `applied_rev` to the head, O stays
-/// ready, and V reads P under X0: the leak this guards against.
+/// T-76: A, O's post, stored at X0 under an audience listing V; O's next
+/// version X1 of A has an `audienceList` that is no at-uri; then an
+/// unrelated commit X2. A job at X2 fails on A: the listed rev is not
+/// raised, and the settle takes the no-readiness branch, leaving O ready.
+/// The consumer replays X1, then X2. As built (`default`): X1 fails on the
+/// firehose, O's readiness is cleared, and V misses on readiness alone.
+/// With the raise forced: X1 is refused as `Unchanged`, X2 brings
+/// `applied_rev` to the head, O stays ready, and V reads A at X0: the leak
+/// this guards against.
 async fn t76_no_raise_over_a_failed_write(test: &str, mode: PublicMode, default: bool) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
-    let a = h.audience_of(ALICE, "3kt76aud", "list", &[BOB]).await;
-    let p = h.post(ALICE, "3kt76pst", &a, None).await;
-    h.f.ready_all().await;
-    let x1 = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": "not an array", "createdAt": "2026-09-26T00:00:00Z"});
-    h.pds.put_cid(ALICE, NSID_AUDIENCE, "3kt76aud", "bafyt76x1", x1.clone());
+    let base = owner(&h, "t76").await;
+    let a = h.post(ALICE, "3kt76pst", &base, None).await;
+    let mut x1 = h.f.post_record(ALICE, "3kt76pst", &base, None).await;
+    x1["audienceList"] = json!(3);
+    h.pds.put_cid(ALICE, NSID_POST_PRIVATE, "3kt76pst", "bafyt76x1", x1.clone());
     h.pds.set_rev(ALICE, R2);
     let _force = (!default).then(|| hooks::arm(hooks::LISTED_REV_FORCE_RAISE, &h.key(ALICE)));
     assert_eq!(h.run(&h.backfill(), ALICE, Depth::Private).await, JobOutcome::Done);
     assert!(h.owner_ready(ALICE).await);
-    let expected = if default { (Some(R2.to_string()), None) } else { both(R2) };
+    let expected = if default { None } else { at(R2) };
     assert_eq!(listed(&h, ALICE).await, expected);
     exec(h.pool(), &format!("UPDATE sync_state SET head_rev = '{R2}', head_checked_at = now() WHERE did = '{ALICE}'")).await;
 
-    let report = h.fire(ALICE, R1, vec![upsert(NSID_AUDIENCE, "3kt76aud", "bafyt76x1", x1)]).await;
+    let report = h.fire(ALICE, R1, vec![upsert(NSID_POST_PRIVATE, "3kt76pst", "bafyt76x1", x1)]).await;
     if default {
         assert!(report.readiness_cleared, "{report:?}");
         assert!(!h.owner_ready(ALICE).await);
@@ -1055,10 +1047,10 @@ async fn t76_no_raise_over_a_failed_write(test: &str, mode: PublicMode, default:
     assert!(h.member_ready(BOB).await);
     if default {
         assert!(!h.owner_ready(ALICE).await);
-        assert!(!h.served(BOB, &p).await, "readiness alone");
+        assert!(!h.served(BOB, &a).await, "readiness alone");
     } else {
         assert!(h.owner_ready(ALICE).await);
-        assert!(h.reads(BOB, &p).await, "the leak");
+        assert!(h.reads(BOB, &a).await, "the leak");
     }
     h.finish().await;
 }
@@ -1075,9 +1067,9 @@ async fn t78_between_reconcile_and_settle(test: &str, mode: PublicMode, refusal:
         return;
     };
     let _off = refusal_off(&h, ALICE, refusal);
-    owner(&h, "t78").await;
+    let base = owner(&h, "t78").await;
     let b = h.backfill();
-    let s = Scene::new(&h, "t78", "list", 0).await;
+    let s = Scene::new(&h, "t78", &base, 0).await;
     let hook = hooks::arm(hooks::SETTLE_BEFORE_GAP_LOCK, &h.key(ALICE));
     h.enqueue(ALICE, Depth::Private).await;
     let run = h.spawn_run(&b, ALICE, Depth::Private);
@@ -1089,12 +1081,12 @@ async fn t78_between_reconcile_and_settle(test: &str, mode: PublicMode, refusal:
     control(&h, ALICE, BOB, &s.d).await;
     if refusal {
         assert_eq!(report.outcomes, [OpOutcome::Unchanged]);
-        assert_eq!(row(&h, "private_audiences", &s.a).await, None);
-        assert!(misses(&h, BOB, &s.p).await);
+        assert_eq!(row(&h, "private_posts", &s.q).await, None);
+        assert!(misses(&h, BOB, &s.q).await);
     } else {
         assert_eq!(report.outcomes, [OpOutcome::Written]);
-        assert!(row(&h, "private_audiences", &s.a).await.is_some(), "survives the settle");
-        assert!(h.reads(BOB, &s.p).await);
+        assert!(row(&h, "private_posts", &s.q).await.is_some(), "survives the settle");
+        assert!(h.reads(BOB, &s.q).await);
     }
     h.finish().await;
 }
@@ -1111,10 +1103,10 @@ async fn t79_newer_states_are_not_replays(test: &str, mode: PublicMode) {
     let Some(h) = H::new(test, mode).await else {
         return;
     };
-    for rkey in ["3kt79aud1", "3kt79aud2", "3kt79aud3"] {
-        h.audience_of(ALICE, rkey, "list", &[BOB]).await;
+    let base = owner(&h, "t79").await;
+    for rkey in ["3kt79pst1", "3kt79pst2", "3kt79pst3"] {
+        h.post(ALICE, rkey, &base, None).await;
     }
-    h.f.ready_all().await;
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let _local = metrics::set_default_local_recorder(&recorder);
@@ -1126,28 +1118,29 @@ async fn t79_newer_states_are_not_replays(test: &str, mode: PublicMode) {
         hook.reached().await;
         match case {
             "delete" => {
-                h.pds.remove(ALICE, NSID_AUDIENCE, "3kt79aud1");
+                h.pds.remove(ALICE, NSID_POST_PRIVATE, "3kt79pst1");
                 h.pds.set_rev(ALICE, &above);
-                assert_eq!(h.fire(ALICE, &above, vec![delete(NSID_AUDIENCE, "3kt79aud1")]).await.outcomes, [OpOutcome::Written]);
+                assert_eq!(h.fire(ALICE, &above, vec![delete(NSID_POST_PRIVATE, "3kt79pst1")]).await.outcomes, [OpOutcome::Written]);
             }
             "edit" => {
-                let edited = audience_record("list", &[BOB, CAROL]);
-                h.pds.put_cid(ALICE, NSID_AUDIENCE, "3kt79aud2", "bafyt79edit", edited.clone());
+                let edited = h.f.post_record(ALICE, "3kt79pst2", &base, None).await;
+                h.pds.put_cid(ALICE, NSID_POST_PRIVATE, "3kt79pst2", "bafyt79edit", edited.clone());
                 h.pds.set_rev(ALICE, &above);
-                let report = h.fire(ALICE, &above, vec![upsert(NSID_AUDIENCE, "3kt79aud2", "bafyt79edit", edited)]).await;
+                let report = h.fire(ALICE, &above, vec![upsert(NSID_POST_PRIVATE, "3kt79pst2", "bafyt79edit", edited)]).await;
                 assert_eq!(report.outcomes, [OpOutcome::Written]);
             }
             _ => {
-                h.pds.put_cid(ALICE, NSID_AUDIENCE, "3kt79aud3", "bafyt79req", audience_record("list", &[BOB, DAVE]));
+                let edited = h.f.post_record(ALICE, "3kt79pst3", &base, None).await;
+                h.pds.put_cid(ALICE, NSID_POST_PRIVATE, "3kt79pst3", "bafyt79req", edited);
                 h.pds.set_rev(ALICE, &above);
-                let indexed = index_record(h.pds.as_ref(), &h.f.writer, ALICE, NSID_AUDIENCE, "3kt79aud3", 1, false).await.expect("index");
+                let indexed = index_record(h.pds.as_ref(), &h.f.writer, ALICE, NSID_POST_PRIVATE, "3kt79pst3", 1, false).await.expect("index");
                 assert_eq!(indexed.status, IndexStatus::Indexed);
             }
         }
         hook.release();
         assert!(catch.await.expect("task"), "{case}");
         drop(hook);
-        assert_eq!(listed(&h, ALICE).await, both(&r), "{case}");
+        assert_eq!(listed(&h, ALICE).await, at(&r), "{case}");
         assert_eq!(series(&handle.render(), METRIC_LISTED_REV_LOCK_RETRIES, &[]).unwrap_or(0.0), 0.0, "{case}: the first try");
     }
     assert_eq!(catch_up_outcome(&handle, "settled"), 3.0);
@@ -1158,8 +1151,8 @@ in_both_modes!(t79_newer_states_are_not_replays: t79_newer_states_are_not_replay
 
 // ---- T-80: no resurrection ----
 
-/// T-80 (review 4's ordering): O an owner outside S; catch-up C
-/// skips A; O deletes A at D' > R; an older job reconciles A away with a
+/// T-80 (review 4's ordering): O an owner outside S; catch-up C skips A,
+/// O's post; O deletes A at D' > R; an older job reconciles A away with a
 /// tombstone at R_j < R; the firehose applies D' with no row and no
 /// tombstone. C's check finds nothing, C raises and settles, and A stays
 /// absent: V does not read.
@@ -1175,10 +1168,10 @@ async fn t80_no_resurrection(test: &str, mode: PublicMode) {
     )
     .await;
     h.f.writer.scope().write_guard().await.private_owners.insert(EVE.into());
-    let rkey = "3kt80aud";
-    let a = h.direct(EVE, NSID_AUDIENCE, rkey, audience_record("list", &[BOB])).await;
-    let p_rec = h.f.post_record(EVE, "3kt80pst", &a, None).await;
-    let p = h.direct(EVE, NSID_POST_PRIVATE, "3kt80pst", p_rec).await;
+    let aud = h.direct(EVE, NSID_AUDIENCE, "3kt80aud", audience_record("list", &[BOB])).await;
+    let rkey = "3kt80pst";
+    let p_rec = h.f.post_record(EVE, rkey, &aud, None).await;
+    let a = h.direct(EVE, NSID_POST_PRIVATE, rkey, p_rec).await;
     h.f.ready(EVE).await;
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
@@ -1187,20 +1180,20 @@ async fn t80_no_resurrection(test: &str, mode: PublicMode) {
     let hook = hooks::arm(hooks::LISTED_REV_BEFORE_RAISE, &h.key(EVE));
     let catch = spawn_catch_up(&h, EVE, R2);
     hook.reached().await;
-    h.pds.remove(EVE, NSID_AUDIENCE, rkey);
+    h.pds.remove(EVE, NSID_POST_PRIVATE, rkey);
     h.pds.set_rev(EVE, R3);
-    let report = h.f.writer.apply(EVE, R1, &[delete(NSID_AUDIENCE, rkey)], job_write()).await.expect("apply");
+    let report = h.f.writer.apply(EVE, R1, &[delete(NSID_POST_PRIVATE, rkey)], job_write()).await.expect("apply");
     assert_eq!(report.outcomes, [OpOutcome::Written], "the older job's reconcile");
-    h.fire(EVE, R3, vec![delete(NSID_AUDIENCE, rkey)]).await;
+    h.fire(EVE, R3, vec![delete(NSID_POST_PRIVATE, rkey)]).await;
     let tombstone: Option<String> = sqlx::query_scalar("SELECT rev FROM private_tombstones WHERE uri = $1").bind(&a).fetch_optional(h.pool()).await.expect("tombstone");
     assert_eq!(tombstone.as_deref(), Some(R1), "no tombstone at D'");
     hook.release();
     catch.await.expect("task");
     drop(hook);
     assert_eq!(catch_up_outcome(&handle, "settled"), 1.0);
-    assert_eq!(listed(&h, EVE).await, both(R2));
-    assert_eq!(row(&h, "private_audiences", &a).await, None, "not resurrected");
-    assert!(!h.served(BOB, &p).await);
+    assert_eq!(listed(&h, EVE).await, at(R2));
+    assert_eq!(row(&h, "private_posts", &a).await, None, "not resurrected");
+    assert!(!h.served(BOB, &a).await);
     h.finish().await;
 }
 

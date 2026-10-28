@@ -125,7 +125,7 @@
     },
     "audienceView": {
       "type": "object",
-      "description": "A post's audience (tools.kryphocron.policy.audience). Its member list is never included. A rename shows once the audience record is next indexed.",
+      "description": "A post's audience (tools.kryphocron.policy.audience). Its member list is never included. A rename shows at once (updateAudience).",
       "required": ["uri"],
       "properties": {
         "uri": { "type": "string", "format": "at-uri" },

@@ -1,0 +1,61 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.updateAudience",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Replace one of the requester's private audiences, if its version token is still swapCid. Any mode may replace any other. createdAt stays as created. A member taken off stops reading the audience's posts at the next request, and a member added starts. Requires auth by a ready community member.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "record", "swapCid"],
+          "properties": {
+            "uri": { "type": "string", "format": "at-uri", "description": "One of the requester's audiences." },
+            "record": {
+              "type": "unknown",
+              "description": "A tools.kryphocron.policy.audience record, checked as createAudience checks it."
+            },
+            "swapCid": { "type": "string", "description": "The token last read for this audience." }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri", "cid"],
+          "properties": {
+            "uri": { "type": "string", "format": "at-uri" },
+            "cid": {
+              "type": "string",
+              "description": "The new opaque version token for updateAudience's swapCid, not a CID."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "The input is not an object, uri is not one of the requester's audiences (decided from the URI alone), swapCid is not a string, or the record fails a check."
+        },
+        {
+          "name": "InvalidSwap",
+          "description": "swapCid does not match the stored token, or the audience no longer exists."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        },
+        {
+          "name": "NotReady",
+          "description": "The caller's account indexing is still in progress."
+        },
+        {
+          "name": "Reindexing",
+          "description": "The caller's account is being re-indexed after an interruption; retry after `retryAfter` seconds (in the body; also the Retry-After header). Not NotReady: the caller is still a member."
+        }
+      ]
+    }
+  }
+}

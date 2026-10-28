@@ -131,13 +131,12 @@ impl PrivateRetention {
             };
             tx.commit().await?;
             drop(guard);
+            // The owner set from the database under the write guard
+            // (private-audiences design §11).
             if let Some(a) = applied
                 && !a.owners_left.is_empty()
             {
-                let mut sets = self.scope.write_guard().await;
-                for d in &a.owners_left {
-                    sets.private_owners.remove(d);
-                }
+                super::audiences::settle_owner_set(&self.scope, pool, &super::Applied { owners_joined: Vec::new(), ..a }).await;
             }
             if last {
                 return Ok(total);

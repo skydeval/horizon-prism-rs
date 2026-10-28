@@ -97,7 +97,7 @@ async fn arrive(pool: &PgPool, x: &str) {
 /// A settle at [`H`] for `x` covering everything: the other way a hole
 /// mends.
 async fn settle(pool: &PgPool, x: &str) {
-    exec(pool, &format!("UPDATE sync_state SET post_listed_rev = '{H}', audience_listed_rev = '{H}' WHERE did = '{x}'")).await;
+    exec(pool, &format!("UPDATE sync_state SET post_listed_rev = '{H}' WHERE did = '{x}'")).await;
     let mut tx = pool.begin().await.expect("tx");
     let settled = crate::firehose::writer::advance_applied_rev_with_follows(&mut tx, x, H, None).await.expect("settle");
     tx.commit().await.expect("commit");

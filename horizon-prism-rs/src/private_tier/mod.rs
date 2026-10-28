@@ -251,6 +251,8 @@ pub const FEATURES: &[&str] = &[
     // includeRetained, retainedUntil and releaseAppearance: a removed
     // member's appearance kept 7 days (private-appearance amendment 1).
     "private.appearanceRetention",
+    // create/update/delete/listAudiences: audiences held by Prism, not ingested from repos (private-audiences design).
+    "private.audiences",
 ];
 
 /// The private tier as the rest of the crate may use it.

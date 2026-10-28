@@ -101,14 +101,39 @@ pub(crate) async fn is_eligible(conn: &mut PgConnection, did: &str) -> Result<bo
         .await
 }
 
+/// `owners::lock` (private-audiences design §11): an exclusive
+/// per-DID transaction lock that orders every writer of the DID's owner
+/// rows, so a write deciding from `has_owner_rows` and a write
+/// re-evaluating the owner never decide from each other's uncommitted
+/// state. Its place in the lock order is after per-URI locks and before
+/// row locks (`db::locks`). Re-entrant within a transaction; on an
+/// autocommit connection it ends at once, so take it in a transaction.
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn lock(conn: &mut PgConnection, did: &str) -> Result<(), sqlx::Error> {
+    #[cfg(test)]
+    if crate::test_support::hooks::injected_on(crate::test_support::hooks::OWNER_LOCK_OFF, &mut *conn, did).await {
+        return Ok(());
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('private-owner ' || $1, 0))")
+        .bind(did)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// `owners::reevaluate`: report the DID's owner status after this
 /// transaction's changes; on leaving, drop readiness and, unless still a
-/// member, `sync_state` (no longer tracked).
+/// member, `sync_state` (no longer tracked). It takes the owner lock
+/// ([`lock`]) first, so it is always called inside a transaction.
 ///
 /// # Errors
 ///
 /// Database errors.
 pub(crate) async fn reevaluate(conn: &mut PgConnection, did: &str) -> Result<Applied, sqlx::Error> {
+    lock(&mut *conn, did).await?;
     if is_owner(&mut *conn, did).await? {
         return Ok(Applied {
             changed: false,

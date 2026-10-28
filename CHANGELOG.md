@@ -14,26 +14,6 @@ no tracker references.
 
 ### Added
 
-- **`admin audiences check`** (read-only). A coming release stops reading
-  audience records from repositories and holds members' audiences itself;
-  before upgrading to it, every operator runs this check on the release
-  that still reads them. For each member it lists the repository's
-  `tools.kryphocron.policy.audience` records and compares them with the
-  stored audiences. Each member gets one outcome: `clean`; `refused`
-  (records no ingest would store, listed); `inactive` (tombstoned, no PDS,
-  repository not found or not active), which fails only when the member
-  has stored audiences; `mismatch` (a missing, extra or differing row),
-  which always fails; and `unchecked` (any other failure to read), which
-  fails. `--accept-unchecked <did>` (comma-separated or repeated) lets an
-  `unchecked` or `inactive` member pass, named in the report as unproven;
-  a refused record's stored row is named as unproven too. `--dids`
-  re-checks only the named members, and fails if one of them is not a
-  member. It also prints, without
-  failing on them, the consumer's lag and pending count, audience and
-  whole-entry dead letters, and open `member`, `private` and `authz` jobs,
-  with its start time and duration. It exits 0 when it passes and 1 when
-  it fails. Clear a mismatch with `admin backfill <did> --depth authz`,
-  wait for the job, and run the check again. It writes nothing.
 - **Refract community list**: `app.nearhorizon.refract.getCommunities`
   lists the enabled communities and their PDS host patterns, so a client can
   skip `fill` for an author no listed community could host.
@@ -169,8 +149,88 @@ no tracker references.
   accounts deleted meanwhile leave every list, the others on a list are
   checked as usual, and the methods serve again once that is done.
 
+### Changed (private audiences held by Horizon-Prism)
+
+- **Members' private audiences are held by Horizon-Prism, not read from
+  repositories.** Audience lists are no longer public records: four
+  owner-only methods hold them, and `getMembership` lists
+  `private.audiences`.
+  - `app.nearhorizon.private.createAudience {record}` → `{uri, cid}`: the
+    record key is minted here (an input `rkey` is refused). At most 200
+    audiences per member (`LimitReached`).
+  - `updateAudience {uri, record, swapCid}` → `{uri, cid}`: replaced only if
+    `swapCid` is the stored token (`InvalidSwap`). Any mode may become any
+    other.
+  - `deleteAudience {uri}` → `{}`, idempotent; posts naming the audience
+    become readable by their author alone.
+  - `listAudiences {limit, cursor}`: the caller's own, newest first; a page
+    also ends, with a cursor, once it holds 20 000 members.
+  - The record check: `mode` one of `list`, `everyone`, `followers`,
+    `following`, `nobody` (absent reads as `list`); `name` 1–64 graphemes and
+    at most 640 bytes once trimmed; `members` valid DIDs of at most 256
+    bytes, de-duplicated, the caller dropped, at most 1000; `createdAt` and
+    `updatedAt` required; a body of at most 512 KiB. `cid` is an opaque
+    version token, not a CID.
+  - `createAudience` and `updateAudience` need a ready member; `deleteAudience`
+    and `listAudiences` any member, so a list can always be withdrawn. All
+    four are in the `private` rate class, and answers are `private, no-store`.
+  - A change is read at the next request. A member's first private row
+    still waits for its `private` job before its posts are served.
+- **A `tools.kryphocron.policy.audience` record in a repository is ignored
+  everywhere**: the firehose, backfill jobs, catch-up, `requestRecord`
+  (`out_of_scope`) and dead-letter replays. Such ops count as
+  `firehose_ops_skipped_total{reason="kryphocron_unproduced"}`, and the admin
+  live feed shows them as `other`. Jobs and catch-up no longer list
+  audiences, and settles are covered by the post listed rev alone.
+- **The stored audiences are kept** at their URIs, so no post changes who can
+  read it. An existing audience's first token is its old repository CID; its
+  `createdAt` and `updatedAt` read as the time it was first stored.
+- **A member's removal now deletes its audiences, for good**: Horizon-Prism
+  holds the only copy, so a member who is added again starts with none,
+  whatever ended the membership. An account deletion deletes them as before.
+- The private-tier event-age gauge no longer counts audiences, which are
+  not delivered by relays.
+
 ### Upgrade notes
 
+- **Private audiences (migration 0052).** Before this upgrade, prove that the
+  stored audiences are current, then start it at once:
+  1. Deploy the build at commit `d96192c` first, the only one with
+     `admin audiences check` (this release removes it). It still reads
+     audiences from repositories and needs no migration.
+  2. If your members post through a PDS that checks private audiences
+     itself, upgrade it first to a release that accepts audiences it cannot
+     find in the author's repository.
+  3. Pull or build this release.
+  4. Pause audience edits, where you can.
+  5. In the running `d96192c` container, run `admin audiences check` until it
+     exits 0 (it writes nothing). For each member it compares the
+     repository's `tools.kryphocron.policy.audience` records with the stored
+     audiences and prints one outcome:
+     - `clean`, or `refused` (records no ingest would store, listed): passes;
+     - `mismatch` (a missing, extra or differing row): fails. Clear it with
+       `admin backfill <did> --depth authz`, wait for the job to finish, and
+       run the check again;
+     - `unchecked` (the repository could not be read): fails. Run again, or
+       pass `--accept-unchecked <did>`;
+     - `inactive` (tombstoned, no PDS, repository not found or not active):
+       passes with no stored audiences, and fails with some unless named
+       with `--accept-unchecked <did>`.
+
+     Accepted DIDs, and refused records with a stored row, are printed as
+     unproven. `--dids` re-checks only the named members (a DID that is not
+     a member fails the run). The consumer's lag, audience and whole-entry
+     dead letters and open jobs are printed but never fail it; drop the
+     audience dead letters with `admin deadletter drop <id>` once it passes.
+  6. Start this release straight after, with `APP_ALLOW_STARTUP_MIGRATE=1`.
+
+  Migration 0052 drops `sync_state.audience_listed_rev`, so it cannot be
+  rolled back by changing the image. It deletes the audiences of accounts
+  that are not members (they served no one, and would have gone live with
+  stale members at a later join), reads an unknown `mode` as `nobody` (as
+  it already read), and trims names. An audience whose stored name, member
+  count or member DIDs exceed the record check is served as stored, and must
+  be fixed in an update before one passes.
 - Migrations 0048 (system accounts) and 0049 (account events kept while the
   key is missing): one start with `APP_ALLOW_STARTUP_MIGRATE=1`.
 - System accounts are off until `APP_SYSTEM_ACCOUNTS_KEY_HEX` is set (64 hex;

@@ -28,7 +28,7 @@ use super::emit::{
     ThreadNode, ThreadParent,
 };
 use super::pipeline::{self, OVER_CLAIM, PipelineEnv, RequestState};
-use super::{media, stages};
+use super::{audiences, media, stages};
 use super::schema::{self, AuthorFilter, Interaction};
 use super::cursor as sealed;
 use crate::config::{PrivateReadConfig, PrivateSearchConfig};
@@ -66,6 +66,10 @@ pub const LIST_ACTIVITY_SUBSCRIPTIONS: &str = "app.nearhorizon.private.listActiv
 pub const GET_APPEARANCE: &str = "app.nearhorizon.private.getAppearance";
 pub const PUT_APPEARANCE: &str = "app.nearhorizon.private.putAppearance";
 pub const RELEASE_APPEARANCE: &str = "app.nearhorizon.private.releaseAppearance";
+pub const CREATE_AUDIENCE: &str = "app.nearhorizon.private.createAudience";
+pub const UPDATE_AUDIENCE: &str = "app.nearhorizon.private.updateAudience";
+pub const DELETE_AUDIENCE: &str = "app.nearhorizon.private.deleteAudience";
+pub const LIST_AUDIENCES: &str = "app.nearhorizon.private.listAudiences";
 
 /// `getAuthorFeed`'s `filter` values (P-20, §4.14; P-30); the first is the
 /// default.
@@ -269,6 +273,10 @@ pub fn router(state: PrivateState) -> Router {
         .route(&xrpc(GET_APPEARANCE), get(get_appearance))
         .route(&xrpc(PUT_APPEARANCE), post(put_appearance))
         .route(&xrpc(RELEASE_APPEARANCE), post(release_appearance))
+        .route(&xrpc(CREATE_AUDIENCE), post(create_audience))
+        .route(&xrpc(UPDATE_AUDIENCE), post(update_audience))
+        .route(&xrpc(DELETE_AUDIENCE), post(delete_audience))
+        .route(&xrpc(LIST_AUDIENCES), get(list_audiences))
         .with_state(state)
 }
 
@@ -2892,6 +2900,107 @@ pub async fn put_appearance(
             Err(XrpcError::new(StatusCode::BAD_REQUEST, "InvalidSwap", "Error: swapRev does not match the stored rev"))
         }
     }
+}
+
+/// An audience method's answer: never cached, as it carries members
+/// (private-audiences design §2).
+fn audience_answer(body: Value) -> Response {
+    let mut response = Json(body).into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("private, no-store"));
+    response
+}
+
+/// A create's or update's outcome as an answer.
+fn audience_written(written: audiences::Written) -> Result<Response, XrpcError> {
+    match written {
+        audiences::Written::Done { uri, cid } => Ok(audience_answer(json!({"uri": uri, "cid": cid}))),
+        audiences::Written::NotMember => Err(XrpcError::not_enrolled()),
+        audiences::Written::LimitReached => Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "LimitReached",
+            format!("Error: audience limit reached ({})", audiences::AUDIENCES_MAX),
+        )),
+        audiences::Written::InvalidSwap => {
+            Err(XrpcError::new(StatusCode::BAD_REQUEST, "InvalidSwap", "Error: swapCid does not match the stored audience"))
+        }
+    }
+}
+
+/// `app.nearhorizon.private.createAudience {record}` (private-audiences
+/// design §2.2) → `{uri, cid}`: one of the caller's audiences, held here,
+/// its record key minted. The gate runs before the body is read; the write
+/// re-checks membership under the DID's lock. No floor: nothing read
+/// depends on another account.
+pub async fn create_audience(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private(&s.app, &headers, peer, CREATE_AUDIENCE).await?;
+    let record = audiences::create_input(&body, &caller.did)?;
+    audience_written(audiences::create(&s.env.pool, s.app.hydrator.scope(), &caller.did, &record).await?)
+}
+
+/// `app.nearhorizon.private.updateAudience {uri, record, swapCid}` (§2.3)
+/// → `{uri, cid}`: the caller's audience replaced if its token is still
+/// `swapCid`. A URI naming anyone else's is refused by parsing alone.
+pub async fn update_audience(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private(&s.app, &headers, peer, UPDATE_AUDIENCE).await?;
+    let (uri, record, swap) = audiences::update_input(&body, &caller.did)?;
+    audience_written(audiences::update(&s.env.pool, s.app.hydrator.scope(), &caller.did, &uri, &record, &swap).await?)
+}
+
+/// `app.nearhorizon.private.deleteAudience {uri}` (§2.4) → `{}`, idempotent.
+/// Served to any member, ready or not (C-11): withdrawing a list only
+/// narrows who reads.
+pub async fn delete_audience(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private_own(&s.app, &headers, peer, DELETE_AUDIENCE).await?;
+    let uri = audiences::delete_input(&body, &caller.did)?;
+    if audiences::delete(&s.env.pool, s.app.hydrator.scope(), &caller.did, &uri).await? {
+        Ok(audience_answer(json!({})))
+    } else {
+        Err(XrpcError::not_enrolled())
+    }
+}
+
+/// `app.nearhorizon.private.listAudiences {limit 1-100 default 50, cursor}`
+/// (§2.5) → `{cursor?, audiences: [{uri, cid, record}]}`: the caller's own,
+/// newest first, a page ending early once it holds 20 000 members. The
+/// cursor is the last row's plain `rkey`: it walks only the caller's rows.
+/// Served to any member, ready or not (C-11).
+pub async fn list_audiences(
+    State(s): State<PrivateState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Result<Response, XrpcError> {
+    let caller = prepare_private_own(&s.app, &headers, peer, LIST_AUDIENCES).await?;
+    let p = Params::parse(q.as_deref());
+    let limit = page_limit(&p)?;
+    let before = p.one("cursor");
+    if before.is_some_and(|c| !proto_blue::syntax::RecordKey::is_valid(c)) {
+        return Err(XrpcError::invalid("Error: cursor is malformed"));
+    }
+    let rows = audiences::list(&s.env.pool, &caller.did, before, i64::try_from(limit).unwrap_or(i64::MAX)).await?;
+    let mut out = serde_json::Map::new();
+    if let Some(cursor) = audiences::next_cursor(&rows, limit) {
+        out.insert("cursor".into(), json!(cursor));
+    }
+    out.insert("audiences".into(), Value::Array(rows.iter().map(audiences::Listed::view).collect()));
+    Ok(audience_answer(Value::Object(out)))
 }
 
 #[cfg(test)]

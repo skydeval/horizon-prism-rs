@@ -279,7 +279,6 @@ pub fn private_subjects(kind: KryphocronKind, record: &Value) -> Vec<String> {
             push(audience.and_then(uri_author));
             out
         }
-        KryphocronKind::Audience => Vec::new(),
     }
 }
 
@@ -408,6 +407,5 @@ mod tests {
                                 "reply": {"parent": {"uri": "at://did:plc:p/tools.kryphocron.feed.postPrivate/1"},
                                           "root": {"uri": "at://did:plc:p/tools.kryphocron.feed.postPrivate/0"}}});
         assert_eq!(private_subjects(KryphocronKind::PostPrivate, &referenced), ["did:plc:p"]);
-        assert!(private_subjects(KryphocronKind::Audience, &json!({"members": []})).is_empty());
     }
 }

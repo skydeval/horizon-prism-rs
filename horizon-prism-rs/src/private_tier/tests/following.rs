@@ -32,6 +32,10 @@ mod replay;
 // module's harness.
 #[path = "membership.rs"]
 mod membership;
+// Audiences held by this AppView against every ingest source
+// (private-audiences design T-A10), on this module's harness.
+#[path = "held_ingest.rs"]
+mod held_ingest;
 
 const FOLLOW: &str = "app.bsky.graph.follow";
 const PDS: &str = "https://pds.example.com";
@@ -315,6 +319,15 @@ impl H {
     /// own audience), and in its repository.
     async fn direct(&self, author: &str, nsid: &str, rkey: &str, record: Value) -> String {
         let uri = format!("at://{author}/{nsid}/{rkey}");
+        // Audiences are held rows, never ingested: stored as the fixture
+        // stores them.
+        if nsid == NSID_AUDIENCE {
+            let mut tx = self.pool().begin().await.expect("tx");
+            audiences::seed(&mut tx, author, rkey, &format!("bafy{rkey}"), REV, &record, false).await.expect("seed");
+            tx.commit().await.expect("commit");
+            self.pds.put(author, nsid, rkey, record);
+            return uri;
+        }
         let op = crate::private_tier::PrivateOp {
             uri: uri.clone(),
             author_did: author.into(),
@@ -668,17 +681,17 @@ async fn t36_every_clear_clears_the_flag() {
     assert!(!after.set);
     assert_ne!(after.clears, before.clears);
 
-    // A failed catch-up write: a listed audience that does not parse.
+    // A failed catch-up write: a listed private post that does not parse.
     h.ready_again().await;
     set(&h).await;
     let before = h.flag(ALICE).await;
     h.pds.set_rev(ALICE, R2);
-    h.pds.put_cid(ALICE, NSID_AUDIENCE, "3kaudt36c00", "bafybroken", json!({"$type": NSID_AUDIENCE, "mode": "following", "members": "not a list", "createdAt": "2026-09-26T00:00:00Z"}));
+    h.pds.put_cid(ALICE, NSID_POST_PRIVATE, "3kpstt36c00", "bafybroken", json!({"$type": NSID_POST_PRIVATE, "audienceList": 3, "createdAt": "2026-09-26T00:00:00Z"}));
     assert!(!h.catch_up(ALICE, R2).await);
     let after = h.flag(ALICE).await;
     assert!(!after.set);
     assert_ne!(after.clears, before.clears);
-    h.pds.put(ALICE, NSID_AUDIENCE, "3kaudt36c00", json!({"$type": NSID_AUDIENCE, "mode": "following", "members": [], "createdAt": "2026-09-26T00:00:00Z"}));
+    h.pds.remove(ALICE, NSID_POST_PRIVATE, "3kpstt36c00");
 
     // The prober's divergence, past the grace with no `authz` in flight.
     h.ready_again().await;
@@ -1384,15 +1397,16 @@ async fn t41_a_contradiction_clears_whatever_the_settle_does() {
     let Some(h) = H::with_pds("s10-t41-ceiling", PublicMode::On, Pds::new(1, false)).await else {
         return;
     };
-    h.alice_following("t41e00").await;
-    h.audience(ALICE, "3kaudt41e01", "list").await;
+    let (aud, _) = h.alice_following("t41e00").await;
+    // A second post, so a listing of one record hits the ceiling.
+    h.post(ALICE, "3kpstt41e01", &aud, None).await;
     h.commit_follow(ALICE, "3kt41efolbob", BOB, R3).await;
     h.pds.remove(ALICE, FOLLOW, "3kt41efolbob");
     h.pds.set_rev(ALICE, R2);
     let ceiling = h.backfill_with(BackfillConfig { full_listing_ceiling: 1, ..BackfillConfig::default() });
     for (case, b) in [("ceiling_hit", &ceiling), ("auth_write_failed", &h.backfill())] {
         if case == "auth_write_failed" {
-            h.pds.put(ALICE, NSID_AUDIENCE, "3kt41ebadaud", json!({"$type": NSID_AUDIENCE, "mode": "list", "members": "not a list", "createdAt": "2026-09-26T00:00:00Z"}));
+            h.pds.put(ALICE, NSID_POST_PRIVATE, "3kt41ebadpst", json!({"$type": NSID_POST_PRIVATE, "audienceList": 3, "createdAt": "2026-09-26T00:00:00Z"}));
         }
         h.clear_jobs().await;
         set_follows_verified(h.pool(), ALICE, true).await;
@@ -1401,7 +1415,7 @@ async fn t41_a_contradiction_clears_whatever_the_settle_does() {
         assert!(!h.flag(ALICE).await.set, "{case}");
         assert_eq!(h.applied(ALICE).await, applied, "{case}");
     }
-    h.pds.remove(ALICE, NSID_AUDIENCE, "3kt41ebadaud");
+    h.pds.remove(ALICE, NSID_POST_PRIVATE, "3kt41ebadpst");
     // A catch-up.
     h.ready_again().await;
     set_follows_verified(h.pool(), ALICE, true).await;
@@ -1762,9 +1776,10 @@ async fn t42_catch_up_verifies_follows_within_its_budget() {
     assert!(!h.flag(BOB).await.set);
 
     // No `sync_state` row: made at step 2. Bob's audience switches to
-    // `following` in the listing: the pass runs in that call.
+    // `following` (held, through `updateAudience`): the pass runs in that
+    // call, which reads the table.
     exec(h.pool(), &format!("DELETE FROM sync_state WHERE did = '{BOB}'")).await;
-    h.pds.put_cid(BOB, NSID_AUDIENCE, "3kaudt42b01", "bafyswitched", json!({"$type": NSID_AUDIENCE, "mode": "following", "members": [], "createdAt": "2026-09-26T00:00:00Z"}));
+    h.f.edit_audience(BOB, &list, &json!({"$type": NSID_AUDIENCE, "mode": "following", "members": []})).await;
     h.pds.set_rev(BOB, R2);
     assert!(h.catch_up(BOB, R2).await);
     let flag = h.flag(BOB).await;
@@ -2428,8 +2443,9 @@ async fn t43_a_failed_fix_of_a_stale_row_clears() {
     let Some(h) = H::with_pds("s10-t43-failfix", PublicMode::On, Pds::new(1, false)).await else {
         return;
     };
-    h.alice_following("t43x00").await;
-    h.audience(ALICE, "3kaudt43x01", "list").await;
+    let (aud, _) = h.alice_following("t43x00").await;
+    // A second post, so a listing of one record hits the ceiling.
+    h.post(ALICE, "3kpstt43x01", &aud, None).await;
     h.commit_follow(ALICE, "3kt43xfolbob", BOB, R1).await;
     h.commit_follow(ALICE, "3kt43xfolcar", CAROL, R1).await;
     let b = h.backfill_with(BackfillConfig { full_listing_ceiling: 1, ..BackfillConfig::default() });
@@ -2836,7 +2852,6 @@ fn t73_listed_rev_names_name_no_private_table() {
     ];
     let names = [
         "post_listed_rev",
-        "audience_listed_rev",
         "raise_listed_rev",
         "LISTED_REV_LOCK_DEADLINE",
         "listed_rev_lock_retries_total",

@@ -474,11 +474,14 @@ fn t_ap14_the_feature_is_listed() {
     assert!(crate::private_tier::FEATURES.contains(&"private.appearance"));
 }
 
-/// T-AR13: `features` ends with `private.appearanceRetention` (amendment 1
-/// §9).
+/// T-AR13: `private.appearanceRetention` follows `private.appearance`
+/// (amendment 1 §9); it was listed last until private audiences appended
+/// theirs after it.
 #[test]
 fn t_ar13_the_retention_feature_is_listed_last() {
-    assert_eq!(crate::private_tier::FEATURES.last(), Some(&"private.appearanceRetention"));
+    let at = |f: &str| crate::private_tier::FEATURES.iter().position(|x| *x == f).expect(f);
+    assert_eq!(at("private.appearanceRetention"), at("private.appearance") + 1);
+    assert_eq!(at("private.audiences"), at("private.appearanceRetention") + 1);
 }
 
 // ---- Retention (private-appearance amendment 1 §13) ----

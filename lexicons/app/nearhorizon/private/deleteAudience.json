@@ -1,0 +1,34 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.private.deleteAudience",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Delete one of the requester's private audiences. Posts naming it become readable by their author alone. Idempotent: an audience that does not exist answers the same. Requires auth by a community member, whether or not its indexing is ready.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["uri"],
+          "properties": {
+            "uri": { "type": "string", "format": "at-uri", "description": "One of the requester's audiences." }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": { "type": "object", "properties": {} }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest",
+          "description": "The input is not an object, or uri is not one of the requester's audiences (decided from the URI alone)."
+        },
+        {
+          "name": "NotEnrolled",
+          "description": "The caller is not a community member of this AppView."
+        }
+      ]
+    }
+  }
+}

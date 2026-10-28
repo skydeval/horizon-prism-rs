@@ -188,7 +188,7 @@ async fn t_as5_only_the_audience_is_notified() {
     // Alice adds Carol to the list: nothing runs again, and a forced
     // attempt decides no one.
     let members = json!({"$type": NSID_AUDIENCE, "mode": "list", "members": [BOB, CAROL], "createdAt": "2026-09-26T00:00:00Z"});
-    f.apply_op(ALICE, Action::Update, NSID_AUDIENCE, AUDIENCE_RKEY, REV2, Some(members)).await;
+    f.edit_audience(ALICE, &format!("at://{ALICE}/{NSID_AUDIENCE}/{AUDIENCE_RKEY}"), &members).await;
     assert_eq!(w.run_uri(&uri).await.expect("run"), None, "done");
     exec(&f.pool, &format!("UPDATE private_post_fanout SET done_at = NULL WHERE uri = '{uri}'")).await;
     assert_eq!(run(&w, &uri).await, Finish::Done { outcome: "no_candidates", rows: 0 });

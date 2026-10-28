@@ -55,7 +55,7 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use super::classifier::{
-    NSID_ACTOR_STATUS, NSID_AUDIENCE, NSID_BLOCK, NSID_CONTENT_VISIBILITY, NSID_FOLLOW, NSID_LABELER_SERVICE, NSID_LIKE,
+    NSID_ACTOR_STATUS, NSID_BLOCK, NSID_CONTENT_VISIBILITY, NSID_FOLLOW, NSID_LABELER_SERVICE, NSID_LIKE,
     NSID_LIST, NSID_LIST_OPTOUT, NSID_LISTBLOCK, NSID_LISTITEM, NSID_NOTIFICATION_DECLARATION, NSID_POLL_POST,
     NSID_POST, NSID_POST_PRIVATE, NSID_POSTGATE, NSID_PROFILE, NSID_REPOST, NSID_STARTER_PACK,
     NSID_THREADGATE,
@@ -295,7 +295,7 @@ pub enum Limit {
 pub struct CollectionPlan {
     pub nsid: &'static str,
     pub limit: Limit,
-    /// One of the three authorization collections (§6.11.3).
+    /// One of the two authorization collections (§6.11.3).
     pub authorization: bool,
 }
 
@@ -326,16 +326,14 @@ const fn authorization(nsid: &'static str) -> CollectionPlan {
     }
 }
 
-/// The three authorization collections (§6.11.3), in listing order. Also
+/// The two authorization collections (§6.11.3), in listing order. Also
 /// what `requestRecord`'s catch-up lists (private posting §3.8). Private
-/// blocks are no longer one: they were removed (skydeval, 2026-10-24).
-pub const AUTHORIZATION_NSIDS: [&str; 3] = [NSID_BLOCK, NSID_AUDIENCE, NSID_POST_PRIVATE];
+/// blocks are no longer one: they were removed (skydeval, 2026-10-24). Nor
+/// are audiences: this AppView holds them and lists no repository copy
+/// (private-audiences design §4.2).
+pub const AUTHORIZATION_NSIDS: [&str; 2] = [NSID_BLOCK, NSID_POST_PRIVATE];
 
-const AUTHORIZATION: [CollectionPlan; 3] = [
-    authorization(AUTHORIZATION_NSIDS[0]),
-    authorization(AUTHORIZATION_NSIDS[1]),
-    authorization(AUTHORIZATION_NSIDS[2]),
-];
+const AUTHORIZATION: [CollectionPlan; 2] = [authorization(AUTHORIZATION_NSIDS[0]), authorization(AUTHORIZATION_NSIDS[1])];
 
 // Gates are listed after posts, with the posts' limit, and only gates of the
 // job's selected posts are kept (design-v3 §3.2, §II-5.10).
@@ -1484,9 +1482,10 @@ impl Backfill {
             }
         }
         // The follows pass, for an owner of a `following` audience only
-        // (C-F4), decided after the authorization listings, which wrote any
-        // `following` audience listed in this run (following-audience
-        // design §3.5). It leaves readiness as it was decided.
+        // (C-F4), decided after the authorization listings from the held
+        // audiences as they are at that point (following-audience design
+        // §3.5; private-audiences design §11). It leaves readiness as it
+        // was decided.
         if result.clears.is_some() {
             if let Step::Superseded = self.still_running(job).await? {
                 return Ok(None);
@@ -2051,7 +2050,7 @@ impl Backfill {
                     // `follows_verified_rev` is the `applied_rev` this
                     // leaves behind, which the firehose must reach before
                     // the flag holds.
-                    // `applied_rev` rises only to a rev both listed revs
+                    // `applied_rev` rises only to a rev the post listed rev
                     // cover (replay-readiness design §4.4, Invariant R):
                     // the run raised them before its reconciles, so this
                     // holds unless the row went mid-run. The `INSERT`
@@ -2061,19 +2060,19 @@ impl Backfill {
                         "INSERT INTO sync_state (did, applied_rev, last_resync_at) VALUES ($1, NULL, now()) \
                          ON CONFLICT (did) DO UPDATE SET \
                            applied_rev = GREATEST(sync_state.applied_rev, \
-                             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+                             CASE WHEN sync_state.post_listed_rev >= $2 THEN $2 END), \
                            last_resync_at = now(), \
                            follows_verified_at = CASE WHEN $3 AND sync_state.follows_clears = $4 \
-                             AND sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN now() END, \
+                             AND sync_state.post_listed_rev >= $2 THEN now() END, \
                            follows_verified_rev = GREATEST(sync_state.applied_rev, \
-                             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+                             CASE WHEN sync_state.post_listed_rev >= $2 THEN $2 END), \
                            chain_rev = GREATEST(sync_state.chain_rev, \
-                             CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END), \
+                             CASE WHEN sync_state.post_listed_rev >= $2 THEN $2 END), \
                            diverged_since = CASE WHEN GREATEST(sync_state.applied_rev, \
-                               CASE WHEN sync_state.post_listed_rev >= $2 AND sync_state.audience_listed_rev >= $2 THEN $2 END) \
+                               CASE WHEN sync_state.post_listed_rev >= $2 THEN $2 END) \
                                >= sync_state.head_rev THEN NULL ELSE sync_state.diverged_since END \
                          RETURNING follows_verified_at IS NOT NULL, \
-                           COALESCE(post_listed_rev >= $2 AND audience_listed_rev >= $2, false)",
+                           COALESCE(post_listed_rev >= $2, false)",
                     )
                     .bind(&job.did)
                     .bind(&result.rev)
@@ -2593,8 +2592,8 @@ mod tests {
         ]);
         let member = plan(Depth::Member, true);
         assert!(member.inbound_blocks && member.self_records == SELF_RECORDS);
-        assert_eq!(member.collections.len(), 15);
-        assert_eq!(member.collections.iter().filter(|c| c.authorization).count(), 3);
+        assert_eq!(member.collections.len(), 14);
+        assert_eq!(member.collections.iter().filter(|c| c.authorization).count(), 2, "blocks and private posts; no audiences");
         assert!(member.collections.iter().filter(|c| c.authorization).all(|c| c.limit == Limit::All));
         // A member's list collections are listed whole.
         for nsid in [NSID_LIST, NSID_LISTITEM, NSID_LISTBLOCK, NSID_LIST_OPTOUT, NSID_STARTER_PACK] {
@@ -2665,7 +2664,7 @@ mod tests {
                     assert!(p.self_records.is_empty() || p.self_records == SELF_RECORDS);
                 }
             }
-            assert_eq!(nsids(&plan(Depth::Member, true, mode)).len(), 15);
+            assert_eq!(nsids(&plan(Depth::Member, true, mode)).len(), 14);
         }
     }
 
