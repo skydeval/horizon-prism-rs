@@ -10,6 +10,8 @@
 //! counts (`stats`), endpoint usage (`usage`) and the Disk check. Slice S5:
 //! Labels, Look up, and the per-member actions (sync again, Farsight read
 //! and forget, list clean-up). Each operator's Appearance (`theme`, #810).
+//! Instance, everything about this instance on one page, and the custom
+//! lexicons it serves (`lexicons`).
 //!
 //! Served by `serve` itself on its own origin, merged before
 //! `xrpc::router::finalize`, so it sits inside the global per-IP limit
@@ -21,6 +23,7 @@
 
 pub mod auth;
 pub mod health;
+pub mod lexicons;
 pub mod live;
 pub mod oauth;
 pub mod operators;
@@ -348,6 +351,8 @@ pub fn router(state: AdminState) -> Router {
         .route("/health", route(get(pages::health::page)))
         .route("/health/resync", route(post(pages::health::resync)))
         .route("/stats", route(get(pages::stats::page)))
+        .route("/instance", route(get(pages::instance::page)))
+        .route("/lexicons/{*path}", route(get(lexicons::serve)))
         .route("/jobs", route(get(pages::jobs::page)))
         .route("/jobs/retry", route(post(pages::jobs::retry)))
         .route("/jobs/scope-check", route(post(pages::jobs::scope_check)))

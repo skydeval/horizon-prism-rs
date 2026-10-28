@@ -41,6 +41,8 @@ pub const WATCHED: &[&str] = &[
     crate::firehose::consumer::METRIC_GROUP_PRESENT,
     crate::firehose::consumer::METRIC_LAG,
     crate::firehose::consumer::METRIC_PROCESSED,
+    // The relays' input rate on the Instance page.
+    crate::firehose::consumer::METRIC_STREAM_ADDED,
     crate::firehose::watermark::METRIC_DELAY,
     crate::firehose::deadletter::METRIC_DEAD_LETTERS,
     crate::firehose::deadletter::METRIC_MALFORMED_DROPPED,
@@ -799,9 +801,12 @@ pub async fn timed_count(pool: &PgPool, sql: &str) -> Option<i64> {
     }
 }
 
-/// The checks now: the probes and the two counts run at once, the rest is
-/// read from memory and the ring. `banners` are the signed-in page's.
-pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
+/// The inputs that cost no query: the database and Redis probes (each a
+/// ping under [`PROBE_TIMEOUT`]), the audit latch, the held gap, the schema
+/// task and the relays the configuration names. The counts, the disks and
+/// the banners are left empty; [`gather`] adds them, and the Instance page
+/// uses these alone.
+pub async fn probes(state: &AdminState) -> Inputs {
     let h = &state.health;
     let redis = async {
         match &h.redis {
@@ -809,34 +814,43 @@ pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
             None => None,
         }
     };
-    let (db, redis, failed_jobs, unavailable_accounts, members_not_ready) = tokio::join!(
-        probe_db(&state.pool, PROBE_TIMEOUT),
-        redis,
-        timed_count(&state.pool, FAILED_JOBS_SQL),
-        timed_count(&state.pool, UNAVAILABLE_ACCOUNTS_SQL),
-        timed_count(&state.pool, "SELECT count(*) FROM members WHERE ready_at IS NULL AND added_at < now() - interval '24 hours'"),
-    );
+    let (db, redis) = tokio::join!(probe_db(&state.pool, PROBE_TIMEOUT), redis);
     let fh = &state.settings.running.firehose;
     let mut relays: Vec<String> = fh.relay_labels.values().cloned().collect();
     relays.sort();
     relays.dedup();
-    let inputs = Inputs {
+    Inputs {
         db: Some(db),
         redis,
         audit_ok: h.audit.as_ref().map(|a| !a.latched()),
         gap_blocked: h.consumer.as_ref().map(|c| c.gap_blocked()),
+        schema: h.schema.as_ref().map(|s| (s.backfill_done(), s.indexes_ready())),
+        lag_warn_entries: fh.lag_warn_entries,
+        relays,
+        private_relays: fh.private_relays.clone(),
+        ..Inputs::default()
+    }
+}
+
+/// The checks now: the probes and the two counts run at once, the rest is
+/// read from memory and the ring. `banners` are the signed-in page's.
+pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
+    let (base, failed_jobs, unavailable_accounts, members_not_ready) = tokio::join!(
+        probes(state),
+        timed_count(&state.pool, FAILED_JOBS_SQL),
+        timed_count(&state.pool, UNAVAILABLE_ACCOUNTS_SQL),
+        timed_count(&state.pool, "SELECT count(*) FROM members WHERE ready_at IS NULL AND added_at < now() - interval '24 hours'"),
+    );
+    let inputs = Inputs {
         failed_jobs,
         unavailable_accounts,
         members_not_ready,
         set_aside: banners.set_aside,
         waiting: banners.waiting,
-        schema: h.schema.as_ref().map(|s| (s.backfill_done(), s.indexes_ready())),
-        lag_warn_entries: fh.lag_warn_entries,
-        relays,
-        private_relays: fh.private_relays.clone(),
         disks: Some(super::stats::read_disks(&state.disks)),
+        ..base
     };
-    checks(&inputs, &h.ring)
+    checks(&inputs, &state.health.ring)
 }
 
 impl super::AdminState {

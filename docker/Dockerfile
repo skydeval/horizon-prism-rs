@@ -18,6 +18,9 @@ WORKDIR /build
 # sqlx::migrate!) and clippy.toml (the disallowed codec surface, enforced by the
 # clippy step below). target/ is excluded by .dockerignore.
 COPY horizon-prism-rs/ ./
+# The custom lexicons, compiled in by build.rs from ../lexicons (the admin
+# Instance page serves them).
+COPY lexicons/ /lexicons/
 
 # Private-table source check (design §4.2): private tables may only be named
 # under src/private_tier/. Any other source file naming one fails the build.

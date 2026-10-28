@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Everything about this instance on one page: what it is, how it stands, what it does here, and what it offers apps.
+Nothing on this page changes anything.</p>
+
+<h2>About</h2>
+<div class="card">
+<p>{{ v.about }} {{ v.does }}</p>
+<div class="fact"><span class="l">Version</span><span class="v">{{ v.version }}</span></div>
+<div class="fact"><span class="l">Public hostname</span><span class="v">{{ v.hostname }}</span></div>
+<div class="fact"><span class="l">Service DID</span><span class="v"><code>{{ v.service_did }}</code></span></div>
+<div class="fact"><span class="l">Running since</span><span class="v">{{ v.started }}</span></div>
+</div>
+
+<h2>Status</h2>
+{% for n in v.notices %}<div class="banner {{ n.class }}">{{ n.text }}</div>
+{% endfor %}
+<div class="scroll">
+<table>
+<thead><tr><th>Part</th><th>State</th><th>What it says</th></tr></thead>
+<tbody>
+{% for s in v.status %}
+<tr><td>{{ s.name }}</td><td><span class="pill {{ s.class }}">{{ s.word }}</span></td><td>{{ s.text }}</td></tr>
+{% endfor %}
+<tr><td>Account lookups</td><td></td><td>{{ v.lookups }}. The PLC directory is {{ v.plc }}.</td></tr>
+<tr><td>Block lists</td><td></td><td>{{ v.blocks }}. <a href="/admin/farsight">Blocks</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Relays</h3>
+<div class="scroll">
+<table>
+<thead><tr><th>Relay</th><th>Host</th><th>Behind the network</th><th>Last heard (its newest record)</th></tr></thead>
+<tbody>
+{% for r in v.relays %}
+<tr><td>{{ r.label }}{% if r.private %}<br><span class="muted">private posts wait for it</span>{% endif %}</td><td>{{ r.hosts }}</td><td><span class="pill {{ r.class }}">{{ r.behind }}</span></td><td>{{ r.last_heard }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<div class="fact"><span class="l">Input from the relays</span><span class="v">{{ v.input_rate }}</span></div>
+<p class="muted">How far behind is measured from the newest record Prism has processed from each relay, so it includes Prism's own processing.
+<a href="/admin/health">Health</a> has every check and the backlog.</p>
+
+<h2>What it does here</h2>
+<div class="card">
+<h3>Public data</h3>
+<div class="fact"><span class="l">Public data</span><span class="v">{{ v.public_phase }}</span></div>
+<p>{{ v.public_text }}</p>
+</div>
+
+<div class="card">
+<h3>Labels applied</h3>
+<div class="fact"><span class="l">This instance's own labels</span><span class="v"><code>{{ v.service_did }}</code> (<a href="/admin/labels">Labels</a>)</span></div>
+<div class="fact"><span class="l">Labelers it subscribes to</span><span class="v">None: Prism follows no labeler's stream.</span></div>
+{% for l in v.labelers %}<div class="fact"><span class="l">{{ l.name }}'s labeler, for its members' restored accounts</span><span class="v"><code>{{ l.did }}</code>, {{ l.how }}{% if !l.active %} (not in use now){% endif %}</span></div>
+{% endfor %}
+<p class="muted">Apps may also show labels from the labelers each reader follows.</p>
+</div>
+
+<div class="card">
+<h3>Refracted communities</h3>
+<p>Refract is {% if v.refract_on %}on{% else %}off{% endif %}. <a href="/admin/communities">Communities</a></p>
+{% if v.communities.is_empty() %}<p class="muted">No community is listed.</p>{% else %}
+<div class="scroll">
+<table>
+<thead><tr><th>Community</th><th>Tier</th><th>PDS hosts</th><th>AppView</th><th>State</th></tr></thead>
+<tbody>
+{% for c in v.communities %}
+<tr><td>{{ c.name }}</td><td>{{ c.tier }}</td><td>{% for p in c.patterns %}<code class="chip">{{ p }}</code> {% endfor %}</td><td>{{ c.appview }}</td><td>{% if c.enabled %}enabled{% else %}off{% endif %}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+</div>
+
+<div class="card">
+<h3>Moderation policy</h3>
+<p>{{ v.policy }}</p>
+</div>
+
+<h2>For developers</h2>
+<p>{{ v.served }} methods served, by namespace.{% if !v.public_off.is_empty() %} While public data is not on, {{ v.public_off.len() }} of the
+public reads answer "not offered" (501).{% endif %}</p>
+{% for g in v.methods %}
+<details>
+<summary><code>{{ g.namespace }}</code> ({{ g.methods.len() }})</summary>
+<div class="chips">{% for m in g.methods %}<code class="chip">{{ m }}</code> {% endfor %}</div>
+</details>
+{% endfor %}
+{% if !v.public_off.is_empty() %}
+<details>
+<summary>Public reads answered "not offered" while public data is not on ({{ v.public_off.len() }})</summary>
+<div class="chips">{% for m in v.public_off %}<code class="chip">{{ m }}</code> {% endfor %}</div>
+</details>
+{% endif %}
+
+<h3>Answered "not offered here"</h3>
+<div class="scroll">
+<table>
+<thead><tr><th>Method</th><th>What it answers</th></tr></thead>
+<tbody>
+{% for n in v.not_offered %}
+<tr><td><code>{{ n.nsid }}</code></td><td>{{ n.message }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+<h3>Custom lexicons ({{ v.lexicons.len() }})</h3>
+{% if v.lexicons.is_empty() %}<p class="muted">None were compiled in: this build had no lexicons/ folder beside the crate.</p>{% else %}
+<div class="chips">{% for l in v.lexicons %}<a href="/admin/lexicons/{{ l.path }}"><code class="chip">{{ l.nsid }}</code></a> {% endfor %}</div>
+{% endif %}
+
+<h2>Figures</h2>
+<div class="card">
+{% for f in v.figures %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+<p class="muted">"About" counts are Postgres's own estimates, measured every 5 minutes. <a href="/admin/stats">Stats</a> has every table.</p>
+</div>
+{% endblock %}

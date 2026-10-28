@@ -17,6 +17,8 @@ mod stats_pages;
 mod s5_pages;
 // Appearance, the menu's order and the product name (#810).
 mod appearance_pages;
+// Instance and the lexicons it serves.
+mod instance_pages;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -180,6 +182,11 @@ async fn harness_with(name: &str, timing: live::Timing, snippets: bool) -> Optio
 }
 
 async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: health::HealthInputs) -> Option<Harness> {
+    harness_config(name, timing, snippets, inputs, test_support::no_auto_join()).await
+}
+
+/// [`harness_full`] over the configuration `file`.
+async fn harness_config(name: &str, timing: live::Timing, snippets: bool, inputs: health::HealthInputs, file: crate::config::FileConfig) -> Option<Harness> {
     let db = fresh_db(name).await?;
     let identity = Arc::new(StubIdentity::default());
     let oauth = Arc::new(StubAs::default());
@@ -194,7 +201,7 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
         session_idle: Duration::from_secs(28_800),
         session_max: Duration::from_secs(604_800),
         setup_code_file: code_file.clone(),
-        settings: settings::SettingsContext::from_file(test_support::no_auto_join()),
+        settings: settings::SettingsContext::from_file(file),
         disks: stats::DiskPaths { data: dir.clone(), postgres: dir.clone(), redis: dir.join("no-redis-volume") },
     };
     let live_settings = settings.settings.live.clone();
@@ -878,6 +885,8 @@ async fn t_a16_headers_everywhere() {
         "/admin/settings/installed",
         "/admin/settings/running",
         "/admin/health",
+        "/admin/instance",
+        "/admin/lexicons/app/nearhorizon/actor/getMembership.json",
         "/admin/jobs",
         "/admin/problems",
         "/admin/farsight",

@@ -9,6 +9,7 @@ pub mod communities;
 pub mod farsight;
 pub mod health;
 pub mod home;
+pub mod instance;
 pub mod jobs;
 pub mod labels;
 pub mod login;
@@ -73,13 +74,14 @@ pub struct MenuLink {
 
 /// The top menu (§6), in its order: everyday pages first, Settings last
 /// (#810). `(current, href, label)`; `current` is [`Nav::current`]'s word.
-pub const MENU: [(&str, &str, &str); 14] = [
+pub const MENU: [(&str, &str, &str); 15] = [
     ("home", "/admin", "Home"),
     ("members", "/admin/members", "Members"),
     ("health", "/admin/health", "Health"),
     ("jobs", "/admin/jobs", "Jobs"),
     ("problems", "/admin/problems", "Problems"),
     ("stats", "/admin/stats", "Stats"),
+    ("instance", "/admin/instance", "Instance"),
     ("farsight", "/admin/farsight", "Blocks"),
     ("labels", "/admin/labels", "Labels"),
     ("communities", "/admin/communities", "Communities"),

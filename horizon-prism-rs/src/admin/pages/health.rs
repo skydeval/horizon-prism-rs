@@ -125,6 +125,16 @@ pub fn farsight_words(state: &AdminState) -> &'static str {
     }
 }
 
+/// Where account lookups go, from lodestar's gate.
+#[must_use]
+pub fn lookups_words(state: &AdminState) -> String {
+    match &state.settings.lodestar {
+        None => "off (the PLC directory is asked)".to_string(),
+        Some(l) if l.gate().is_open() => format!("{} is up to date; Prism reads from it first", l.host()),
+        Some(l) => format!("{} is behind or not answering; the PLC directory is asked", l.host()),
+    }
+}
+
 /// The public-data phase in a word.
 #[must_use]
 pub fn public_word(mode: PublicMode) -> &'static str {
@@ -209,14 +219,9 @@ fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
         note: String::new(),
     });
 
-    let lookups = match &state.settings.lodestar {
-        None => "off (the PLC directory is asked)".to_string(),
-        Some(l) if l.gate().is_open() => format!("{} is up to date; Prism reads from it first", l.host()),
-        Some(l) => format!("{} is behind or not answering; the PLC directory is asked", l.host()),
-    };
     groups.push(FigureGroup {
         title: "Services Prism asks",
-        figures: vec![fig("Farsight (blocks)", farsight_words(state)), fig("Lodestar (account lookups)", lookups)],
+        figures: vec![fig("Farsight (blocks)", farsight_words(state)), fig("Lodestar (account lookups)", lookups_words(state))],
         note: String::new(),
     });
 

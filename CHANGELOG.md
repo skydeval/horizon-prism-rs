@@ -14,6 +14,20 @@ no tracker references.
 
 ### Added
 
+- **Admin UI: Instance page** (`/admin/instance`, in the menu after
+  Stats). Everything about this instance on one page, for operators: what
+  it is and its version; the database, Redis and the audit guard; each
+  relay by its label and host, how far behind it is and when it was last
+  heard; the relays' input rate; account lookups and block lists; notices
+  (a problem and its cause, private posts catching up, public data being
+  turned on, search being prepared); public data, the labels applied, the
+  refracted communities and their PDS hosts; the methods served by
+  namespace and those answered "not offered here"; the custom lexicons;
+  and stored-data figures. It runs no query beyond the database and Redis
+  pings Health already makes. The custom lexicons are now compiled into
+  the binary and served to signed-in operators at
+  `/admin/lexicons/<path>`; the image copies `lexicons/` for the build.
+
 - **Refract community list**: `app.nearhorizon.refract.getCommunities`
   lists the enabled communities and their PDS host patterns, so a client can
   skip `fill` for an author no listed community could host.
