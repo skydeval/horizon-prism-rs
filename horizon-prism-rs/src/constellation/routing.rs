@@ -614,7 +614,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn table_with_community(community: &[&str]) -> RoutingTable {
-        let mut cfg = ConstellationConfig::default();
+        let mut cfg = ConstellationConfig::with_example();
         if let Some(n) = cfg.networks.iter_mut().find(|n| n.name == COMMUNITY_NETWORK) {
             n.pds_patterns = community.iter().map(|p| (*p).to_string()).collect();
         }
@@ -836,7 +836,7 @@ pub(crate) mod tests {
 
     #[test]
     fn enabling_a_network_adds_it_to_the_cascade() {
-        let mut cfg = ConstellationConfig::default();
+        let mut cfg = ConstellationConfig::with_example();
         let extra = |name: &str, enabled: bool| NetworkConfig {
             name: name.into(),
             pds_patterns: vec![],

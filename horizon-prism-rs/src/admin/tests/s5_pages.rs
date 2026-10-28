@@ -166,7 +166,10 @@ async fn labels_page() {
 /// and then saves the whole list, and pending ends are kept from here.
 #[tokio::test]
 async fn communities_page() {
-    let Some(h) = harness("admin_communities").await else {
+    let mut file = test_support::no_auto_join();
+    file.constellation = crate::config::ConstellationConfig::with_example();
+    file.refract.communities = vec![crate::config::RefractCommunity::example()];
+    let Some(h) = harness_config("admin_communities", quick(), true, HealthInputs::default(), file).await else {
         return;
     };
     let p = h.pool();

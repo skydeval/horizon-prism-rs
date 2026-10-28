@@ -102,7 +102,6 @@ coverage_capacity = 3000000
 [firehose.relay_labels]
 "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos" = "bsky"
 "wss://relay.fire.hose.cam/xrpc/com.atproto.sync.subscribeRepos" = "microcosm"
-"wss://relay.community-a.example/xrpc/com.atproto.sync.subscribeRepos" = "community-a"
 
 [identity]
 plc_url = "https://plc.directory"
@@ -361,14 +360,15 @@ enabled = true
 # background_rate_per_sec = 1.0
 # background_burst = 2
 
-[[constellation.networks]]
-name = "community-a"
-pds_patterns = ["community-a.example", "*.community-a.example"]
-appview_url = "https://api.community-a.example"
-auth = "unauth"
-rate_per_sec = 10
-burst = 20
-enabled = true
+# Another AppView, for the accounts its PDS hosts serve (example).
+# [[constellation.networks]]
+# name = "community-a"
+# pds_patterns = ["community-a.example", "*.community-a.example"]
+# appview_url = "https://api.community-a.example"
+# auth = "unauth"
+# rate_per_sec = 10
+# burst = 20
+# enabled = true
 
 [[constellation.networks]]
 name = "community"
@@ -379,7 +379,7 @@ auth = "unauth"
 enabled = true
 
 [constellation.cascade]
-order = ["bluesky", "community-a"]
+order = ["bluesky"]
 
 # Endpoints this AppView does not serve yet (feed generators, push,
 # preferences, reports, video, age assurance, contact import) answer
@@ -648,15 +648,15 @@ visitor_viewer_state = false
 
 # A tier 1 community: its PDS hosts and its AppView (a network above). Its
 # labeler, read through that AppView, decides which labels end a restore.
-[[refract.communities]]
-name = "community-a"
-pds_patterns = ["community-a.example", "*.community-a.example"]
-tier = 1
-appview_network = "community-a"
-labeler_did = "did:plc:cccccccccccccccccccccccc"
-label_source = "appview"
-gone_labels = ["!takedown", "!hide"]
-enabled = true
+# [[refract.communities]]
+# name = "community-a"
+# pds_patterns = ["community-a.example", "*.community-a.example"]
+# tier = 1
+# appview_network = "community-a"
+# labeler_did = "did:plc:cccccccccccccccccccccccc"
+# label_source = "appview"
+# gone_labels = ["!takedown", "!hide"]
+# enabled = true
 
 # A tier 2 community: its PDS hosts and a labeler read directly.
 # [[refract.communities]]

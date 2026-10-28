@@ -765,7 +765,7 @@ pub(crate) mod tests {
 
     /// A routing table whose outbound networks point at the given bases.
     pub(crate) fn cascade_for(bases: &[(&str, &str)]) -> Cascade {
-        let mut cfg = ConstellationConfig::default();
+        let mut cfg = ConstellationConfig::with_example();
         for n in &mut cfg.networks {
             if let Some((_, base)) = bases.iter().find(|(name, _)| *name == n.name) {
                 n.appview_url = (*base).to_string();
@@ -844,7 +844,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_empty_token_bucket_skips_the_network() {
         let (hit, calls) = fake_appview(StatusCode::OK, json!({})).await;
-        let mut cfg = ConstellationConfig::default();
+        let mut cfg = ConstellationConfig::with_example();
         for n in &mut cfg.networks {
             if n.name == "bluesky" {
                 n.appview_url = hit.clone();

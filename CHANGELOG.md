@@ -15,17 +15,9 @@ no tracker references.
 ### Added
 
 - **Admin UI: Instance page** (`/admin/instance`, in the menu after
-  Stats). Everything about this instance on one page, for operators: what
-  it is and its version; the database, Redis and the audit guard; each
-  relay by its label and host, how far behind it is and when it was last
-  heard; the relays' input rate; account lookups and block lists; notices
-  (a problem and its cause, private posts catching up, public data being
-  turned on, search being prepared); public data, the labels applied, the
-  refracted communities and their PDS hosts; the methods served by
-  namespace and those answered "not offered here"; the custom lexicons;
-  and stored-data figures. It runs no query beyond the database and Redis
-  pings Health already makes. The custom lexicons are now compiled into
-  the binary and served to signed-in operators at
+  Stats), for signed-in operators only. It runs no query beyond the
+  database and Redis pings Health already makes. The custom lexicons are
+  now compiled into the binary and served to signed-in operators at
   `/admin/lexicons/<path>`; the image copies `lexicons/` for the build.
 - **Public instance page at `/`.** A read-only page, the same for every
   visitor and with no sign-in: "Horizon-Prism, an AT Protocol AppView
@@ -144,6 +136,15 @@ no tracker references.
 
 ### Changed
 
+- **The shipped relays, AppViews and communities are Bluesky's only.** The
+  built-in defaults, `docker/config/app.toml` and `docker-compose.yml` no
+  longer include a third relay sidecar, a second AppView network or a
+  refract community: the relays are `bsky.network` and
+  `relay.fire.hose.cam`, `constellation.cascade.order` is `["bluesky"]`,
+  and `refract.communities` is empty. The config keeps commented examples
+  with placeholder names. An instance that relied on the old defaults sets
+  those entries in its own config (refract communities set in the admin UI
+  are stored and unaffected).
 - **`refract.fill` answers most new DIDs as final on the first call.** It
   waits up to 300 ms for the identity resolves it starts. A DID hosted by no
   listed community is then left out as final, not listed in `pending`, so a

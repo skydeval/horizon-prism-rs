@@ -308,6 +308,7 @@ async fn rf_s1_visitor_viewer_state() {
     let calls: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
     let base = own_links(a.clone(), Arc::clone(&calls)).await;
     let live = crate::admin::settings::LiveSettings::default();
+    live.update(|v| v.refract_communities = vec![crate::config::RefractCommunity::example()]);
     let h = Hydrator::new(
         p.clone(),
         crate::aggregations::ScopeState::new(sets(), crate::config::ScopePolicy::MembersAndOneHop, 10_000),

@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn clients_exist_only_for_enabled_outbound_networks() {
-        let mut cfg = ConstellationConfig::default();
+        let mut cfg = ConstellationConfig::with_example();
         cfg.networks.push(NetworkConfig {
             name: "extra".into(),
             pds_patterns: vec![],

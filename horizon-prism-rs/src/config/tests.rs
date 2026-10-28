@@ -50,7 +50,7 @@ fn empty_file_yields_design_defaults() {
     assert_eq!(cfg.file.identity.jwt_issuer_tracker_max, 20_000);
     assert_eq!(cfg.file.retention.run_at_utc.to_string(), "04:00");
     assert_eq!(cfg.file.kryphocron.oracle_freshness_bound_secs, 120);
-    assert_eq!(cfg.file.constellation.networks.len(), 3);
+    assert_eq!(cfg.file.constellation.networks.len(), 2);
 }
 
 /// The committed `docker/config/app.toml`, reproduced here because the image
@@ -107,7 +107,6 @@ coverage_capacity = 3000000
 [firehose.relay_labels]
 "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos" = "bsky"
 "wss://relay.fire.hose.cam/xrpc/com.atproto.sync.subscribeRepos" = "microcosm"
-"wss://relay.community-a.example/xrpc/com.atproto.sync.subscribeRepos" = "community-a"
 
 [identity]
 plc_url = "https://plc.directory"
@@ -247,15 +246,6 @@ burst = 40
 enabled = true
 
 [[constellation.networks]]
-name = "community-a"
-pds_patterns = ["community-a.example", "*.community-a.example"]
-appview_url = "https://api.community-a.example"
-auth = "unauth"
-rate_per_sec = 10
-burst = 20
-enabled = true
-
-[[constellation.networks]]
 name = "community"
 pds_patterns = []
 appview_url = "local"
@@ -263,7 +253,7 @@ auth = "unauth"
 enabled = true
 
 [constellation.cascade]
-order = ["bluesky", "community-a"]
+order = ["bluesky"]
 
 [honest_501]
 status_url = ""
@@ -383,16 +373,6 @@ label_ff_pages_per_sec = 5
 resync_days = 7
 event_days = 365
 resolves_per_caller_per_hour = 300
-
-[[refract.communities]]
-name = "community-a"
-pds_patterns = ["community-a.example", "*.community-a.example"]
-tier = 1
-appview_network = "community-a"
-labeler_did = "did:plc:cccccccccccccccccccccccc"
-label_source = "appview"
-gone_labels = ["!takedown", "!hide"]
-enabled = true
 
 [plural]
 enabled = true
@@ -587,19 +567,19 @@ fn thread_outline_defaults_and_bounds() {
     }
 }
 
-/// Refract T-15 (refract design §3.1): the default is off with Community A
+/// Refract T-15 (refract design §3.1): the default is off with no community
 /// listed; every communities rule is checked.
 #[test]
 fn refract_communities_are_validated() {
     let r = load("").expect("defaults").file.refract;
     assert!(!r.enabled);
-    assert_eq!(r.communities, vec![crate::config::RefractCommunity::example()]);
+    assert!(r.communities.is_empty());
     let tier2 = "[[refract.communities]]\nname = \"north\"\npds_patterns = [\"*.north.example\"]\ntier = 2\nlabeler_did = \"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"\nlabel_source = \"labeler\"\n";
     let cfg = load(tier2).expect("a tier 2 entry");
     assert_eq!(cfg.file.refract.communities[0].gone_labels, ["!takedown", "!hide"]);
     assert!(cfg.file.refract.communities[0].enabled);
     for (text, needle) in [
-        ("[[refract.communities]]\nname = \"x\"\npds_patterns = []\ntier = 1\nappview_network = \"community-a\"\n", "needs at least one server"),
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = []\ntier = 1\nappview_network = \"bluesky\"\n", "needs at least one server"),
         ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 1\n", "tier 1 needs appview_network"),
         ("[refract]\nenabled = true\n[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 1\nappview_network = \"community\"\n", "is not an enabled network"),
         ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 2\n", "tier 2 needs labeler_did"),
@@ -607,7 +587,7 @@ fn refract_communities_are_validated() {
         ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 2\nlabeler_did = \"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"\nlabel_source = \"appview\"\n", "appview is for tier 1 only"),
         ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 2\nlabeler_did = \"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"\n", "label_source is needed"),
         ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 2\nlabeler_did = \"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\"\nlabel_source = \"labeler\"\ngone_labels = []\n", "needs at least one label"),
-        ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 1\nappview_network = \"community-a\"\nappview_network2 = 1\n", "unknown field"),
+        ("[[refract.communities]]\nname = \"x\"\npds_patterns = [\"a.example\"]\ntier = 1\nappview_network = \"bluesky\"\nappview_network2 = 1\n", "unknown field"),
         (&format!("{tier2}{tier2}"), "the name is used twice"),
         (&format!("{tier2}{}", tier2.replace("north", "south")), "another community has the same labeler"),
         ("[refract]\nchecker_concurrency = 0\n", "refract.checker_concurrency must be at least 1"),

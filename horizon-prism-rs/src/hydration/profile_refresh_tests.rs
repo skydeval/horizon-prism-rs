@@ -125,7 +125,7 @@ async fn serve(net: Net) -> (Arc<Net>, String) {
 /// A cascade over the default table with these bases, and the request
 /// bucket of each named network set to `rate` (`(rate, burst)`).
 fn cascade(bases: &[(&str, &str)], rate: Option<(u32, u32)>, extra: Option<(&str, &str)>, order: Option<&[&str]>) -> Cascade {
-    let mut cfg = ConstellationConfig::default();
+    let mut cfg = ConstellationConfig::with_example();
     for n in &mut cfg.networks {
         if let Some((_, base)) = bases.iter().find(|(name, _)| *name == n.name) {
             n.appview_url = (*base).to_string();

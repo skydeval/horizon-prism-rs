@@ -230,7 +230,6 @@ impl Default for FirehoseConfig {
         let relay_labels = [
             ("wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos", "bsky"),
             ("wss://relay.fire.hose.cam/xrpc/com.atproto.sync.subscribeRepos", "microcosm"),
-            ("wss://relay.community-a.example/xrpc/com.atproto.sync.subscribeRepos", "community-a"),
         ]
         .into_iter()
         .map(|(url, label)| (url.to_string(), label.to_string()))
@@ -1037,7 +1036,7 @@ pub struct CascadeConfig {
 impl Default for CascadeConfig {
     fn default() -> Self {
         Self {
-            order: vec!["bluesky".to_string(), "community-a".to_string()],
+            order: vec!["bluesky".to_string()],
         }
     }
 }
@@ -1054,6 +1053,26 @@ pub struct ConstellationConfig {
     pub nonmember_fraction: Float,
     /// Capacity of the per-requester share cache.
     pub requester_share_max_entries: u64,
+}
+
+#[cfg(test)]
+impl ConstellationConfig {
+    /// The defaults plus a second AppView network, `community-a`, placed
+    /// before `community` and last in the cascade. For tests.
+    #[must_use]
+    pub fn with_example() -> Self {
+        let mut c = Self::default();
+        let mut n = c.networks[0].clone();
+        n.name = "community-a".to_string();
+        n.pds_patterns = vec!["community-a.example".to_string(), "*.community-a.example".to_string()];
+        n.appview_url = "https://api.community-a.example".to_string();
+        n.rate_per_sec = Some(10);
+        n.burst = Some(20);
+        let at = c.networks.iter().position(|n| n.name == COMMUNITY_NETWORK).unwrap_or(c.networks.len());
+        c.networks.insert(at, n);
+        c.cascade.order.push("community-a".to_string());
+        c
+    }
 }
 
 /// The `appview_url` value marking the network served by this AppView.
@@ -1092,14 +1111,6 @@ impl Default for ConstellationConfig {
                     "https://api.bsky.app",
                     NetworkAuth::Unauth,
                     Some((20, 40)),
-                    true,
-                ),
-                network(
-                    "community-a",
-                    &["community-a.example", "*.community-a.example"],
-                    "https://api.community-a.example",
-                    NetworkAuth::Unauth,
-                    Some((10, 20)),
                     true,
                 ),
                 network(
@@ -2136,7 +2147,8 @@ pub struct RefractCommunity {
 }
 
 impl RefractCommunity {
-    /// Community A, the shipped default (refract design §3.1, D-10).
+    /// A tier-1 example community, for tests.
+    #[cfg(test)]
     #[must_use]
     pub fn example() -> Self {
         Self {
@@ -2273,7 +2285,7 @@ impl Default for RefractConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            communities: vec![RefractCommunity::example()],
+            communities: Vec::new(),
             backfill_concurrency: 1,
             record_label_sweep_hours: 24,
             record_label_ttl_mins: 60,

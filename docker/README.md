@@ -11,7 +11,6 @@ This is the deployment runbook for the stack in `docker/`. Design references are
 | `app` | horizon-prism-rs (XRPC + worker) | `127.0.0.1:3030` (XRPC), `127.0.0.1:9091` (metrics) |
 | `horizon-firehose-bsky` | relay consumer, `bsky.network` | none |
 | `horizon-firehose-microcosm` | relay consumer, `relay.fire.hose.cam` | none |
-| `horizon-firehose-community-a` | relay consumer, `relay.community-a.example` | none |
 | `caddy` | TLS and reverse proxy | `80`, `443` |
 
 The horizon-firehose image is built from a pinned commit of `https://github.com/skydeval/horizon-firehose.git`. No registry image exists. The build needs outbound network access, because its build fetches its own dependencies from GitHub.
@@ -379,10 +378,10 @@ If the relay no longer has the saved cursor, accept the gap. Always run step 1 f
    docker compose exec app /app/horizon-prism-rs admin resync --private-and-members
    ```
 
-2. Compute the sidecar's cursor key: `firehose:cursor:` plus the unpadded URL-safe base64 of the relay URL in that sidecar's `firehose/*.toml`. For example, for the Community A sidecar:
+2. Compute the sidecar's cursor key: `firehose:cursor:` plus the unpadded URL-safe base64 of the relay URL in that sidecar's `firehose/*.toml`. For example, for the Bluesky sidecar:
 
    ```sh
-   printf '%s' 'wss://relay.community-a.example/xrpc/com.atproto.sync.subscribeRepos' | base64 | tr -d '\n=' | tr '+/' '-_'
+   printf '%s' 'wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos' | base64 | tr -d '\n=' | tr '+/' '-_'
    ```
 
 3. Delete that key. The sidecar restarts from live tip.
@@ -401,7 +400,7 @@ horizon-firehose drops three kinds of event, and none of them can be configured 
 Those drops are covered by the daily re-sync (design §6.11.5). Check for them:
 
 ```sh
-docker compose logs --no-log-prefix horizon-firehose-bsky horizon-firehose-microcosm horizon-firehose-community-a \
+docker compose logs --no-log-prefix horizon-firehose-bsky horizon-firehose-microcosm \
   | jq -R -c 'fromjson? // empty | select(.fields.message == "CBOR/CAR decode failed; dropping frame" or .fields.message == "decoder panicked on frame (isolated); dropping and continuing" or .fields.message == "dropping oversize event per on_oversize=skip_with_log")'
 ```
 

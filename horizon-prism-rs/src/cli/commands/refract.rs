@@ -200,7 +200,9 @@ mod tests {
             .execute(p)
             .await
             .expect("event");
-        let status = render_status(p, &FileConfig::default()).await.expect("status");
+        let mut file = FileConfig::default();
+        file.refract.communities = vec![RefractCommunity::example()];
+        let status = render_status(p, &file).await.expect("status");
         assert!(status.starts_with("refract.enabled: false"), "{status}");
         assert!(status.lines().any(|l| l.starts_with("community-a") && l.contains(&entry_hash(&RefractCommunity::example()))), "{status}");
         let listed = render_list(p, Some("restored")).await.expect("list");

@@ -11,7 +11,7 @@ Horizon-Prism only reads. It never writes to a repository. Clients such as Horiz
 ## Model
 
 ```
-  relays (bsky.network, relay.fire.hose.cam, relay.community-a.example, ...)
+  relays (bsky.network, relay.fire.hose.cam, ...)
      │   one horizon-firehose sidecar per relay
      ▼
   Redis stream  (capped, noeviction)
@@ -61,7 +61,7 @@ Each PDS host has its own request budget, so a community PDS sees bounded load.
 When a request needs an account or record outside scope, Horizon-Prism asks other sources in order:
 1. its own index, for accounts in scope;
 2. the account's home AppView, matched by its PDS host;
-3. the other enabled AppViews, in the configured `cascade.order` (the shipped config lists Bluesky's AppView, `api.bsky.app`, then Community A's; not `public.api.bsky.app`, which applies only Bluesky's own labeler);
+3. the other enabled AppViews, in the configured `cascade.order` (the shipped config lists Bluesky's AppView, `api.bsky.app`; not `public.api.bsky.app`, which applies only Bluesky's own labeler);
 4. Slingshot for a single record, or the author's PDS or Constellation for lists.
 
 Constellation also supplies counts and backlinks for content Horizon-Prism does not fully index. Each upstream has its own rate bucket, breaker and per-request deadline. Labels from upstream AppViews are stripped; moderation is local.

@@ -129,11 +129,6 @@ services:
     volumes:
       - ./firehose/microcosm.toml:/app/config/relay.toml:ro
 
-  horizon-firehose-community-a:
-    <<: *horizon-firehose
-    volumes:
-      - ./firehose/community-a.toml:/app/config/relay.toml:ro
-
   caddy:
     image: caddy:2-alpine
     environment:

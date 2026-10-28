@@ -1508,7 +1508,12 @@ pub(crate) mod testing {
             // what it just wrote.
             suggestions: crate::config::SuggestionsConfig { refresh_secs: 0, ..Default::default() },
             trends: crate::config::TrendsConfig { cache_ttl_secs: 0, ..Default::default() },
-            live: crate::admin::settings::LiveSettings::default(),
+            live: {
+                // One listed community, so restored markers have one to name.
+                let live = crate::admin::settings::LiveSettings::default();
+                live.update(|v| v.refract_communities = vec![crate::config::RefractCommunity::example()]);
+                live
+            },
             farsight: None,
             list_budget: Budget { max_references: 2, max_owners: 5 },
             list_applier: None,

@@ -8,7 +8,7 @@ Horizon-Prism learns about new records from relays. This doc covers how events g
 
 ### Several relays
 
-- The stack runs one horizon-firehose sidecar per relay. The shipped set is `bsky.network`, `relay.fire.hose.cam` and `relay.community-a.example`.
+- The stack runs one horizon-firehose sidecar per relay. The shipped set is `bsky.network` and `relay.fire.hose.cam`.
 - Each relay may miss some repositories or commits. Reading several gives better coverage than any one.
 - Each sidecar stays on its one relay. It has no fallback relay, because a cursor belongs to one relay and failing over would resume at the live tip and skip events.
 - Horizon-Prism counts commits that only one relay delivered (`firehose_commits_seen_only_by_total{relay}`), so the operator can see what each relay adds.
