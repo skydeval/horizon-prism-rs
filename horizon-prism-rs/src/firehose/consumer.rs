@@ -1527,6 +1527,9 @@ mod tests {
     mod bench;
     mod live;
     mod outline;
+    // The public page's live feed beside a running consumer (public-page
+    // design T-P17).
+    mod public_feed;
 
     fn bulk(s: &str) -> Value {
         Value::BulkString(s.as_bytes().to_vec())

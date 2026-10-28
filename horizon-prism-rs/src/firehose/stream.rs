@@ -90,7 +90,8 @@ pub fn parse_entry(v: Value) -> Result<StreamEntry, String> {
     Ok(StreamEntry { id, fields })
 }
 
-/// Parse an `XREADGROUP` reply for one stream: `[[stream, [entry…]]]`, or nil.
+/// Parse an `XREADGROUP` or `XREAD` reply for one stream:
+/// `[[stream, [entry…]]]`, or nil.
 ///
 /// # Errors
 ///

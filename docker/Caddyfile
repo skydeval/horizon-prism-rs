@@ -4,16 +4,17 @@
 # X-Forwarded-For/-Proto/-Host. trusted_proxies is deliberately unset, so client-
 # supplied X-Forwarded-For is replaced with the real client address.
 #
-# /admin/live is the admin UI's live feed, a server-sent event stream
-# (admin-ui-live-feed design §3.1): proxied without encode, which could hold
-# bytes in the compressor, and flushed at once.
+# /admin/live is the admin UI's live feed and /live the public page's, both
+# server-sent event streams (admin-ui-live-feed design §3.1, public-page
+# design §6.6): proxied without encode, which could hold bytes in the
+# compressor, and flushed at once.
 
 {
 	email {$CADDY_ACME_EMAIL}
 }
 
 {$APP_PUBLIC_HOSTNAME} {
-	@live path /admin/live
+	@live path /admin/live /live
 	handle @live {
 		reverse_proxy app:3030 {
 			flush_interval -1

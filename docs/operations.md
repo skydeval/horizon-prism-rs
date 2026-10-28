@@ -27,6 +27,43 @@ Key metrics:
 | `outline_freshness{state}`, `outline_replays_total{why}` | Whether Thread Lens may use the outline now (1 for the current state), and how often it caught up from the stream, by cause. |
 | `threadlens_outline_total{use}` | How each Thread Lens request that could use the outline was served: `tree`, or why not (`absent`, `incomplete`, `hole`, `too_big`, `stale`, `bridging_off`, `crosscheck`, `off`, `error`: the reads failed or took over 300 ms past the baseline). |
 | `outline_crosscheck_total{result}` | The anchor's first Constellation page checked against the outline: `match`, `miss` (the request used Constellation instead), `pending`, `late`. |
+| `public_feed_reader_lag_seconds` | How far the public page's live reader is behind the stream's own tail, or how long since it last finished a loop. Past 30 s it skips to the tail. |
+| `public_feed_late_total` | Live-feed lines released after their half-second slot: Redis or the host is near saturation. Should stay at 0. |
+| `public_feed_undecodable_total` | Stream entries the live reader could not read as an event; they give no line. |
+
+## The public page's live feed
+
+`/` shows every event the relays deliver, about half a second after the relay sidecar wrote it, from a reader of its own on the firehose stream: plain reads, no consumer group, its own Redis connection. It never waits for or follows Horizon-Prism's own processing, which may be minutes behind while the feed runs live. It reads the stream a second time, a few percent of a Redis core at the highest measured input, plus about 20 small reads and one `XINFO STREAM` a second. If the Redis clock is more than a second from the host's, the log says so (`public_feed_clock_offset`); the feed keeps Redis time.
+
+**Bandwidth.** Every viewer gets every event, so egress grows with viewers at the relay's own rate, and `[public_page] live_max_viewers` (default 50) is the only control. Past it, visitors get "busy", never a thinner feed. At about 43 bytes a line:
+
+| Events a second | Per viewer | 25 viewers | 50 viewers (default) | 100 viewers | 200 viewers |
+|---|---|---|---|---|---|
+| 800 | ~0.4 Mbit/s | ~10 Mbit/s | ~20 Mbit/s | ~40 Mbit/s | ~80 Mbit/s |
+| 4,500 | ~1.7 Mbit/s | ~42 Mbit/s | ~84 Mbit/s | ~170 Mbit/s | ~340 Mbit/s |
+| 11,700 | ~4.2 Mbit/s | ~105 Mbit/s | ~210 Mbit/s | ~420 Mbit/s | ~830 Mbit/s |
+| 15,300 (a relay replay) | ~5.4 Mbit/s | ~135 Mbit/s | ~270 Mbit/s | ~540 Mbit/s | ~1,080 Mbit/s |
+
+A relay replay reaches viewers at its full rate. On a metered or small link, set a lower cap, or `live_feed = false`. A viewer whose connection cannot keep up is ended with a count of what it missed, so it never slows anyone else. Hidden tabs close their stream.
+
+**Proxy.** `/live` is a server-sent event stream: proxy it without compression and flushed at once, as `/admin/live`. The shipped Caddyfile's matcher is `@live path /admin/live /live`; a Caddyfile of your own needs the same.
+
+**Client addresses behind a CDN.** Every per-address rule (2 live streams per address, `anon_read`) keys on the client address Horizon-Prism computes: the last `X-Forwarded-For` element when the request comes from `[http] trusted_proxy`. Behind a CDN, that element is the CDN's edge unless Caddy overwrites it with the real client. In Caddy's global options, and in **every** `reverse_proxy` block, the `@live` one included:
+
+```
+{
+	servers {
+		trusted_proxies static <the CDN's address ranges>
+		client_ip_headers CF-Connecting-IP
+	}
+}
+
+reverse_proxy app:3030 {
+	header_up X-Forwarded-For {client_ip}
+}
+```
+
+Use the header your CDN sets (`CF-Connecting-IP` is Cloudflare's). Without this, everyone behind one edge shares one address's limits.
 
 ## Logs
 

@@ -1010,6 +1010,66 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // The one-time re-sync that fetches the new collections of DIDs known
     // before the upgrade (design-v3 §12.3).
     tasks.push(crate::firehose::v3_resync::spawn(pool.clone()));
+    // The public page (public-page design §4.1): its status snapshot is
+    // built once here, before anything serves, then every 15 s. It counts
+    // the configured relays and names none.
+    let page = &cfg.file.public_page;
+    let public_feed: crate::public_page::status::FeedHandle = Arc::default();
+    let live_feed;
+    // The admin UI's "Public page" switch, read on every request: the
+    // routes are always merged and answer only while it is on.
+    let page_switch: crate::public_page::Switch = {
+        let l = live.clone();
+        Arc::new(move || l.load().public_page_enabled)
+    };
+    let public_routes = {
+        // The live feed's reader (§6.2), whenever the page is on, on a third
+        // connection of its own: its polls never queue behind the
+        // consumer's blocking read or the request handlers' commands.
+        let reader_redis = redis_manager(&cfg.env.redis_url).await?;
+        let (feed, feed_tasks) = crate::public_page::live::PublicFeed::start(
+            reader_redis,
+            &fh.stream_key,
+            crate::public_page::decode::Labels::new(&crate::public_page::relay_hosts(&fh.relay_labels)),
+            Arc::clone(&public_feed),
+            crate::public_page::reader::ReaderSettings::default(),
+            crate::public_page::live::FeedSettings::default(),
+            Arc::default(),
+        );
+        tasks.extend(feed_tasks);
+        live_feed = Some(feed);
+        let status = crate::public_page::status::Status::start(crate::public_page::status::StatusInputs {
+            pool: pool.clone(),
+            redis: Some(redis.clone()),
+            audit: AuditLatch::from_flag(glue.audit_latched()),
+            relays: crate::public_page::status::relay_list(&fh.relay_labels),
+            feed: Arc::clone(&public_feed),
+        })
+        .await;
+        tasks.push(status.spawn());
+        let page_state = crate::public_page::PageState {
+            snapshot: status.cell(),
+            fixed: Arc::new(crate::public_page::Fixed::from_config(page, &cfg.env.public_hostname)),
+            limits: app.limits.clone(),
+            trusted_proxy: app.trusted_proxy,
+            name: Some({
+                let l = live.clone();
+                Arc::new(move || l.load().public_page_name.clone())
+            }),
+        };
+        let live = match (&live_feed, page.live_feed) {
+            (Some(feed), true) => Some(crate::public_page::viewers::LiveState {
+                feed: feed.clone(),
+                viewers: Arc::new(crate::public_page::viewers::Viewers::new(crate::public_page::viewers::ViewerSettings::with_max(
+                    usize::try_from(page.live_max_viewers).unwrap_or(usize::MAX),
+                ))),
+                page: page_state.clone(),
+                hostname: cfg.env.public_hostname.clone(),
+            }),
+            _ => None,
+        };
+        Some((page_state, live))
+    };
     // What the admin UI's Health reads (admin-ui design §9).
     let admin_health = crate::admin::health::HealthInputs {
         metrics: Some(Arc::new(metrics_handle) as Arc<dyn crate::admin::health::MetricsText>),
@@ -1123,6 +1183,10 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // and CORS outermost. Nothing is merged after `finalize`.
     let merged = crate::xrpc::router(app.clone())
         .merge(admin_routes)
+        .merge(public_routes.map_or_else(axum::Router::new, |(p, live)| {
+            crate::public_page::gated(crate::public_page::router(p, live), page_switch)
+        }))
+        .merge(crate::public_page::favicon_router())
         .merge(crate::honest_501::router(&app, &cfg.file))
         .merge(proxied)
         .merge(crate::private_tier::handlers::router(private_state))
@@ -1164,6 +1228,11 @@ pub async fn run() -> Result<Stopped, StartupError> {
             }
             if let Some(hub) = live_hub {
                 hub.close();
+            }
+            // The public streams close with a random `retry` and no `end`
+            // (public-page design §6.5).
+            if let Some(feed) = live_feed {
+                feed.close();
             }
         })
         .await

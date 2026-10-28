@@ -512,6 +512,39 @@ td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
   #live-notstarted { display: none; }
 }
 
+/* The public page's live feed (public-page design §6.6): a fixed box of 20
+   one-line rows, so the page around it never moves at the relay's rate;
+   long fields are cut with an ellipsis, and nothing animates. */
+.pub-live { display: grid; grid-template-columns: minmax(12rem, 22%) minmax(0, 1fr); gap: 1.25rem; align-items: start; }
+.pub-live-side .fact .l { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pub-live-side .fact .v { flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pub-live-main { min-width: 0; }
+.pub-live-head { font-size: 0.78rem; margin-bottom: 0.25rem; }
+.pub-live-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.4rem;
+  height: 28rem;
+  overflow: hidden;
+  contain: strict;
+  border-top: 1px solid var(--line);
+}
+.pub-live-list li { display: flex; gap: 0 0.6rem; height: 1.4rem; white-space: nowrap; overflow: hidden; }
+.pub-live-list li > span { flex: none; }
+.pub-live-list li > span:nth-child(1) { color: var(--muted); }
+.pub-live-list li > span:nth-child(3) { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+.pub-live-list li > span:nth-child(4) { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#live-notes p { margin: 0 0 0.3rem; font-size: 0.85rem; }
+@media (scripting: none) {
+  #live-off { display: none; }
+}
+@media (max-width: 48rem) {
+  .pub-live { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* Narrow screens: Members, then the live feed, each full width. */
 @media (max-width: 48rem) {
   .home-row { grid-template-columns: minmax(0, 1fr); gap: 0; }

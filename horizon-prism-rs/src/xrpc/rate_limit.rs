@@ -656,6 +656,12 @@ mod tests {
         limits.check(Class::AuthRead, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").expect("another DID");
     }
 
+    /// The last `X-Forwarded-For` element, and only from the trusted proxy.
+    /// Behind a CDN that element is the CDN's edge unless Caddy overwrites
+    /// the header with the real client (`header_up X-Forwarded-For
+    /// {client_ip}` with `trusted_proxies` and `client_ip_headers`, in every
+    /// `reverse_proxy` block; `docs/operations.md`): every per-address rule,
+    /// the public page's included, keys on this address.
     #[test]
     fn xff_only_from_the_trusted_proxy() {
         let caddy: IpAddr = "172.30.0.10".parse().expect("ip");

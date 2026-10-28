@@ -47,6 +47,7 @@ A value saved in the admin UI wins over the file. Horizon-Prism never writes `ap
 | `[cache]` | In-process cache sizes. |
 | `[rate_limits]`, `[auth]` | Request limits per class; limits on token checks. |
 | `[admin]` | Admin UI on/off, session lifetimes, live feed snippets. |
+| `[public_page]` | The public page at `/` and its live relay feed: on/off and the operator's own text. See below. |
 | `[threadlens]` | Who may use Thread Lens and how much one response reads. |
 | `[thread_outline]` | The thread outline: who replied to whom, for Thread Lens. Off by default; see below. |
 | `[farsight]` | Block-list index (optional), with its fallback and memory. |
@@ -106,6 +107,24 @@ It is off by default because, once on, it records every author's posts network-w
 | `enforce_reserve` | `100` | Verdict lookups (of `threadlens.verdict_max_dids`) kept back from the outline's candidate round for the check of embedded posts. |
 
 All keys apply at restart. Switching it off clears its progress, so switching it on again starts coverage afresh; the rows already stored age out. One process writes it at a time (an advisory lock): a second process waits and takes over when the first stops. Watch `outline_writer_active`, `outline_through_age_seconds` and `outline_missed_total`.
+
+## Public page
+
+`[public_page]` sets the read-only page at `/` (see the [API guide](api.md#the-instance-page)). Its fixed text reads "Horizon-Prism, an AT Protocol AppView written in Rust" with the version; everything else about the instance is what you write here. It is file-only: every key applies at restart, and the admin UI lists them read-only.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Serve the page. `false` mounts none of its routes, so `/` is a 404. |
+| `name` | `""` | The page's title; empty is `APP_PUBLIC_HOSTNAME`. |
+| `about` | `""` | Your own text: plain text, a blank line starts a paragraph, at most 4,000 characters. Never HTML. |
+| `contact` | `""` | Plain text, one line; an `https:` or `mailto:` value is shown as a link. |
+| `source_url` | `""` | A link to the source (`https:`). Empty shows none. |
+| `live_feed` | `true` | The live feed of relay events at `/live`. `false` mounts no `/live`, and `/` shows no feed and loads no script; the reader still runs, for the status block's relay lines and input rate. |
+| `live_max_viewers` | `50` | Live-feed viewers at once, at least 1: the bandwidth control. Every viewer gets every event, about 0.4 Mbit/s each at 800 events a second and about 5.4 during a relay replay. Size it for your link ([operations](operations.md#the-public-pages-live-feed)). |
+| `clients` | `[]` | The apps that use this instance, as `[[public_page.clients]]` entries with `name` and an `https:` `url`; at most 20. Horizon-Prism cannot tell which apps call it, so this is what you write. |
+
+A link that is not `https:` stops the start. The page shows relay information only: no member, community, label, limit, address or count of private anything, and no relay's name: it says how many relays it receives from. The removed keys `self_check`, `policy_url` and `docs_url` stop the start like any unknown key.
+
 
 ## Rate limits
 

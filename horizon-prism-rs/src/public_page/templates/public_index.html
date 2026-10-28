@@ -1,0 +1,42 @@
+{% extends "public_base.html" %}
+{% block head %}{% if live %}<script src="{{ js }}" defer></script>{% endif %}{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<section class="card" id="about">
+<p><strong>{{ product }}</strong>, version {{ version }}.</p>
+{% for p in fixed.about %}<p>{{ p }}</p>
+{% endfor %}
+{% if !fixed.contact.is_empty() %}<div class="fact"><span class="l">Contact</span><span class="v">{% if let Some(href) = fixed.contact_link %}<a href="{{ href }}">{{ fixed.contact }}</a>{% else %}{{ fixed.contact }}{% endif %}</span></div>
+{% endif %}
+{% if !fixed.clients.is_empty() %}<div class="fact"><span class="l">Apps that use it</span><span class="v">{% for c in fixed.clients %}{% if !loop.first %}, {% endif %}<a href="{{ c.1 }}">{{ c.0 }}</a>{% endfor %}</span></div>
+{% endif %}
+{% if let Some(src) = fixed.source_url %}<div class="fact"><span class="l">Source</span><span class="v"><a href="{{ src }}">{{ src }}</a></span></div>
+{% endif %}
+</section>
+{% if live %}
+<section class="card" id="live">
+<h2>On the relay</h2>
+<noscript><p>The live feed needs JavaScript.</p></noscript>
+<div class="banner" id="live-off">The live feed did not start.</div>
+<div class="pub-live">
+<div class="pub-live-side">
+<div class="fact"><span class="l">Received in this tab</span><span class="v" id="live-received">0</span></div>
+<div class="fact"><span class="l">In this tab, a second</span><span class="v" id="live-rate">…</span></div>
+<div class="fact"><span class="l">Input, a second</span><span class="v" id="live-input">…</span></div>
+<div id="live-arrivals">
+<div class="fact"><span class="l">…</span><span class="v"></span></div>
+<div class="fact"><span class="l"></span><span class="v"></span></div>
+<div class="fact"><span class="l"></span><span class="v"></span></div>
+<div class="fact"><span class="l">identity events</span><span class="v"></span></div>
+</div>
+</div>
+<div class="pub-live-main">
+<div id="live-notes"></div>
+<div class="pub-live-head muted">Time (UTC) · action · collection · DID</div>
+<ol class="pub-live-list" id="live-list"></ol>
+<p class="muted" id="live-status" hidden></p>
+</div>
+</div>
+</section>
+{% endif %}
+{% endblock %}

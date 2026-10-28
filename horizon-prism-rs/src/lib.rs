@@ -35,6 +35,7 @@ pub mod moderation;
 pub mod net;
 pub mod plural;
 pub mod private_tier;
+pub mod public_page;
 pub mod refract;
 pub mod serve;
 pub mod services;

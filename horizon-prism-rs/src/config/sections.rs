@@ -714,6 +714,54 @@ impl Default for AdminConfig {
     }
 }
 
+/// `[public_page]` (public-page design §8): the read-only page at `/` and
+/// its live feed of relay events. All file-only, applied at a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PublicPageConfig {
+    /// Serve the page. With `false` none of its routes is mounted, so `/`
+    /// stays a 404.
+    pub enabled: bool,
+    /// The page's title; empty is the public hostname.
+    pub name: String,
+    /// The operator's own text: plain text, blank lines start paragraphs.
+    pub about: String,
+    /// Plain text; an `https:` or `mailto:` value is shown as a link.
+    pub contact: String,
+    /// The apps the operator says use this instance.
+    pub clients: Vec<PublicPageClient>,
+    /// A link to the source; empty shows none.
+    pub source_url: String,
+    /// The live feed of relay events at `/live`.
+    pub live_feed: bool,
+    /// Live-feed viewers at once, the bandwidth control.
+    pub live_max_viewers: u32,
+}
+
+impl Default for PublicPageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            name: String::new(),
+            about: String::new(),
+            contact: String::new(),
+            clients: Vec::new(),
+            source_url: String::new(),
+            live_feed: true,
+            live_max_viewers: 50,
+        }
+    }
+}
+
+/// One `[[public_page.clients]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicPageClient {
+    pub name: String,
+    /// `https:` only.
+    pub url: String,
+}
+
 /// `[cache]` (§7.6).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2299,6 +2347,7 @@ pub struct FileConfig {
     pub index_request: IndexRequestConfig,
     pub db: DbConfig,
     pub admin: AdminConfig,
+    pub public_page: PublicPageConfig,
     pub cache: CacheConfig,
     pub counts: CountsConfig,
     pub microcosm: MicrocosmConfig,

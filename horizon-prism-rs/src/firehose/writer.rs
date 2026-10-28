@@ -967,6 +967,11 @@ impl Writer {
         {
             return Err(Transient("injected hang".into()));
         }
+        // Public page T-P17: one repo's commits take longer, and succeed.
+        #[cfg(test)]
+        if let Some(db) = self.pool.connect_options().get_database() {
+            crate::test_support::hooks::delay(crate::test_support::hooks::WRITER_DELAY_REPO, &format!("{db}/{repo}")).await;
+        }
         let now = Utc::now();
         let prepared: Vec<Prepared> = ops.iter().map(|op| prepare(repo, op, now)).collect();
         // Thread outline design §3.1: after `prepare`, for every DID and

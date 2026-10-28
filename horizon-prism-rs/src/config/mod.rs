@@ -25,7 +25,7 @@ pub use sections::{
     CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, DraftsConfig, FeaturesConfig,
     FarsightConfig, FileConfig, Float, FirehoseConfig, FloorsSetting, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
     KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelersConfig, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetSectionConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig, ThreadLensAccess, ThreadLensConfig, FarsightFallbackConfig, FarsightMemoryConfig,
-    IndexRequestConfig, LabelSource, PluralConfig, PrivateAnyPdsConfig, RefractCommunity, RefractConfig, default_gone_labels, PrivateNotifyConfig, PrivateReadConfig, PrivateReadFloors, PrivateSearchConfig, PublicScope, RateClassConfig, RateLimitsConfig,
+    IndexRequestConfig, LabelSource, PluralConfig, PrivateAnyPdsConfig, RefractCommunity, RefractConfig, default_gone_labels, PrivateNotifyConfig, PrivateReadConfig, PrivateReadFloors, PrivateSearchConfig, PublicPageClient, PublicPageConfig, PublicScope, RateClassConfig, RateLimitsConfig,
     RetentionConfig, SchemaBackfillConfig, SearchConfig, SuggestionsConfig, LiveNow, UnspeccedConfig, SuggestedTopic, TrendsConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ScopeWindows, ServiceConfig, ServiceState, StorageConfig,
     StarterPacksConfig, SyncConfig, ThreadConfig, ThreadMutesConfig, ThreadOutlineConfig, ThreadV2Config, UtcTimeOfDay, VideoConfig,
     VideoPlayback, background_burst, background_rate_per_sec,

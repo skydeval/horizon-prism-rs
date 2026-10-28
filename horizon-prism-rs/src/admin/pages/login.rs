@@ -291,8 +291,11 @@ pub async fn callback(
     let Some(key) = q.state.as_deref() else {
         return failed("This sign-in link is incomplete.");
     };
+    // Sign-in's own flows only: a `check` row (migration 0051) is never
+    // this callback's to complete.
     let row: Option<StateRow> = match sqlx::query_as(
         "DELETE FROM admin_oauth_states WHERE state = $1 AND created_at > now() - interval '10 minutes' \
+         AND purpose IN ('login', 'setup') \
          RETURNING did, issuer, verifier, dpop_jwk, purpose, setup_code_hash, pds_endpoint",
     )
     .bind(key)

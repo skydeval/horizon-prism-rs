@@ -714,6 +714,33 @@ max_tree = 5000
 max_thread = 20000
 enforce_reserve = 100
 
+# The public page at / (docs/configuration.md, "Public page"): what this
+# instance is, its status (the database, how many relays it receives from,
+# the input rate) and a live feed of relay events. The same for every visitor; it
+# never names a member or shows Prism's own processing.
+#   enabled           false mounts none of its routes, so / is a 404
+#   name              the page's title; empty is APP_PUBLIC_HOSTNAME
+#   about             your own text: plain text, a blank line starts a
+#                     paragraph, at most 4000 characters
+#   contact           plain text; an https: or mailto: value is a link
+#   source_url        a link to the source (https:); empty shows none
+#   clients           the apps that use this instance, as
+#                     [[public_page.clients]] name = "…" url = "https://…"
+#                     (at most 20)
+#   live_feed         the live feed of relay events at /live
+#   live_max_viewers  live-feed viewers at once (at least 1). Every viewer
+#                     gets every event, about 0.4 Mbit/s each at 800 events
+#                     a second; size it for your link (docs/operations.md).
+[public_page]
+enabled = true
+name = ""
+about = ""
+contact = ""
+source_url = ""
+clients = []
+live_feed = true
+live_max_viewers = 50
+
 # Showing a list that no other AppView could answer for: how many pages of
 # the list owner's records one request may read from the owner's server.
 [lists]

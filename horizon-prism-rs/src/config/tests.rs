@@ -416,6 +416,16 @@ max_tree = 5000
 max_thread = 20000
 enforce_reserve = 100
 
+[public_page]
+enabled = true
+name = ""
+about = ""
+contact = ""
+source_url = ""
+clients = []
+live_feed = true
+live_max_viewers = 50
+
 [lists]
 read_listing_pages = 5
 subscribed_max_per_member = 25
@@ -516,6 +526,33 @@ live_now = []
 fn docker_app_toml_equals_defaults() {
     let cfg = load(DOCKER_APP_TOML).expect("shipped config is valid");
     assert_eq!(cfg.file, FileConfig::default());
+}
+
+/// Public page §8 (T-P9): on by default; a link that is not `https:` and a
+/// viewer cap of 0 stop the start.
+#[test]
+fn public_page_is_validated() {
+    let p = load("").expect("defaults").file.public_page;
+    assert!(p.enabled && p.live_feed);
+    assert_eq!((p.live_max_viewers, p.source_url.as_str()), (50, ""));
+    for (text, needle) in [
+        ("[public_page]\nsource_url = \"javascript:alert(1)\"\n", "public_page.source_url must be an https: URL"),
+        ("[public_page]\nsource_url = \"http://code.example\"\n", "public_page.source_url must be an https: URL"),
+        ("[public_page]\nlive_max_viewers = 0\n", "public_page.live_max_viewers must be at least 1"),
+        ("[[public_page.clients]]\nname = \"App\"\nurl = \"ftp://x.example\"\n", "public_page.clients[App]: url must be an https: URL"),
+    ] {
+        match load(text) {
+            Err(ConfigError::Invalid(problems)) => assert!(has(&problems, needle), "{text}: {problems:?}"),
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+    let ok = load("[public_page]\nsource_url = \"https://example.test/code\"\n[[public_page.clients]]\nname = \"App\"\nurl = \"https://app.example\"\n")
+        .expect("valid");
+    assert_eq!(ok.file.public_page.clients.len(), 1);
+    // The removed keys are refused like any unknown key.
+    for key in ["self_check = true", "policy_url = \"\"", "docs_url = \"\""] {
+        assert!(load(&format!("[public_page]\n{key}\n")).is_err(), "{key}");
+    }
 }
 
 /// Thread outline §4: off by default, with the design's defaults; every

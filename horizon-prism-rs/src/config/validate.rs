@@ -120,6 +120,7 @@ pub fn problems(cfg: &FileConfig, public_hostname: &str) -> Vec<String> {
     refract(cfg, &mut out);
     plural(cfg, &mut out);
     thread_outline(cfg, &mut out);
+    crate::public_page::config_problems(&cfg.public_page, &mut out);
     #[cfg(feature = "standin-hosts")]
     crate::net::standin::problems(&cfg.standin, &mut out);
     out

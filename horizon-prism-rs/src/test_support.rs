@@ -302,6 +302,10 @@ pub mod hooks {
     /// sleeps for the armed delay and fails transiently ([`delay`]). Key:
     /// the database.
     pub const WRITER_HANG: &str = "fh_writer_hang";
+    /// Public page T-P17: `Writer::apply_commit` sleeps for the armed delay
+    /// at its top and goes on, never failing ([`delay`]). Key:
+    /// `<database>/<repo>`.
+    pub const WRITER_DELAY_REPO: &str = "pp_writer_delay_repo";
     /// Firehose throughput §2.4: the consumer sleeps for the armed delay
     /// before it processes an entry ([`delay`]). Key: the database.
     pub const CONSUMER_STALL: &str = "fh_consumer_stall";

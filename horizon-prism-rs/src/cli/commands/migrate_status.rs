@@ -130,6 +130,11 @@ mod tests {
             "0049_system_accounts_pending",
             // Thread outline index S1 (#922).
             "0050_thread_outline",
+            // The public page's self-check, since removed. Kept, unchanged:
+            // it was applied on running instances, and the gate refuses a
+            // missing or edited applied migration. Nothing writes its
+            // `check` rows or `browser_hash` any more.
+            "0051_public_check",
             // Private audiences held by this AppView.
             "0052_audiences_held",
         ];

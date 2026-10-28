@@ -7,11 +7,12 @@
 {% block head %}{% endblock %}
 <title>{{ title }} · Horizon-Prism admin</title>
 <link rel="stylesheet" href="{{ css }}">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 </head>
 <body>
 <header class="top">
 <a class="brand" href="/admin">
-<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 3 20h18z"/><path d="M12 2v18"/><path d="m7.5 11 4.5 9"/></svg>
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 15.5h20"/><path d="M8 15.5 12 6l4 9.5"/><path d="M5 19.5h14" opacity=".55"/></svg>
 <span>Horizon-Prism</span>
 </a>
 {% if let Some(nav) = nav %}

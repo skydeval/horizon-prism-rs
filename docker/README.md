@@ -200,6 +200,8 @@ docker compose exec -T db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB
 - **Turning it off.** `admin.web_ui = false` in `config/app.toml` mounts no `/admin` route; the CLI is then the whole admin surface.
 - **Behind a CDN.** Every `/admin` response is sent with `Cache-Control: no-store, no-transform`, and only Home loads a script, one same-origin file. Keep CDN features that inject or rewrite scripts (for example Cloudflare's Rocket Loader and email obfuscation) off for `/admin*`: the page's security policy blocks what they inject, and Home says when its script did not start. The live stream sends a keepalive every 15 seconds, inside a CDN's usual idle limit. Putting `/admin*` behind your CDN's access control as well is optional.
 
+**The public page.** `/` is a read-only page about the instance and how many relays it receives from, with a live feed of relay events at `/live`; see `[public_page]` in `docs/configuration.md`. `/live` is a server-sent event stream like `/admin/live`: the shipped `Caddyfile`'s `@live` matcher covers both, and a Caddyfile of your own needs the same. Its bandwidth grows with viewers at the relay's own rate (`docs/operations.md`).
+
 **Upgrading to this version:** an existing deployment has no operator yet, so it enters first-run setup: read the code with `docker compose logs app | grep admin_setup_code` and finish at `/admin/setup`, or run `admin operator add` for your account.
 
 ## Admin commands
@@ -630,6 +632,7 @@ Other series, one line each (the sections above name the rest):
 - `refract_repost_fill_total{outcome}` and `refract_repost_fill_rows_total`: the one-time fill of a restored account's older reposts from Constellation (its newest 200 posts), per account `done`, `left` (it left the restored set mid-fill) or `error` (tried again after 10 minutes), and the rows it wrote.
 - `refract_visitor_pairs_total{outcome}`: block checks between a visitor and an author, `answered` or `unanswered` (treated as blocked).
 - `standin_hosts_build`: 1 in a test build that can reach private addresses; it never appears in a deploy build.
+- `public_feed_reader_lag_seconds`, `public_feed_late_total` and `public_feed_undecodable_total`: the public page's live reader, how far it is behind the stream's own tail (or how long since it last finished a loop; past 30 s it skips to the tail and the page says so), lines released after their half-second slot (should stay at 0), and stream entries it could not read as an event.
 
 A latched audit guard (design §6.5) makes `/xrpc/_health` return 503. `docker compose ps` then shows `app` as unhealthy. Restart `app` after investigating the logged panic.
 

@@ -923,3 +923,25 @@ async fn t_a16_headers_everywhere() {
     assert_admin_headers(&wrong_verb, "wrong verb");
     h.db.drop_db().await;
 }
+
+/// Migration 0051 widened `admin_oauth_states.purpose` with `check`, for a
+/// public self-check since removed: the callback takes only sign-in's own
+/// rows, so such a row is refused and left alone.
+#[tokio::test]
+async fn the_callback_takes_only_sign_in_rows() {
+    let Some(h) = harness("admin_callback_purpose").await else {
+        return;
+    };
+    sqlx::query("INSERT INTO admin_oauth_states (state, did, issuer, verifier, dpop_jwk, purpose, pds_endpoint) VALUES ('other-row', $1, $2, 'v', '{}', 'check', $3)")
+        .bind(ALICE)
+        .bind(AS)
+        .bind(PDS)
+        .execute(h.pool())
+        .await
+        .expect("row");
+    let b = Browser::new();
+    let page = callback(&h, &b, "other-row", AS).await;
+    assert_eq!(page.status, 400, "{}", page.body);
+    assert!(page.body.contains("expired or was already used"), "{}", page.body);
+    assert_eq!(count(h.pool(), "SELECT count(*) FROM admin_oauth_states WHERE state = 'other-row'").await, 1);
+}

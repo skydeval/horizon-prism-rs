@@ -27,7 +27,40 @@ no tracker references.
   pings Health already makes. The custom lexicons are now compiled into
   the binary and served to signed-in operators at
   `/admin/lexicons/<path>`; the image copies `lexicons/` for the build.
-
+- **Public instance page at `/`.** A read-only page, the same for every
+  visitor and with no sign-in: "Horizon-Prism, an AT Protocol AppView
+  written in Rust" and the version, the operator's own text, contact, apps
+  and an optional source link, and the live feed of relay events. It
+  renders from memory, may be cached for 30 s, is charged to `anon_read`,
+  and answers a wrong verb with `405`. **Public page** in the admin UI's
+  settings turns it on or off at once, no restart (off, `/` and `/live`
+  are a 404), and **Public page name** sets its title the same way. New `[public_page]` section: `enabled` (on by default; the
+  admin switch overrides it), `name`, `about`, `contact`, `source_url` and
+  `clients`. A link that is not `https:` stops the start.
+- **Live feed on the public page.** `/` shows every event the relays
+  deliver, as they arrive, at the relay's real rate and unsampled: time,
+  action, the first op's collection and the DID, released by entry time about half a second after the relay sidecar wrote it.
+  `tools.kryphocron.*` commits are left out. Beside it, arrivals a second
+  by kind and the relays' input rate. It reads the firehose stream on its own (plain reads
+  on a connection of its own, no consumer group), so it never follows or
+  waits for Horizon-Prism's processing. The stream is `GET /live`
+  (server-sent events, no sign-in), capped at `[public_page]
+  live_max_viewers` (default 50) and 2 per address; every viewer gets every
+  event, so the cap is the bandwidth control (`docs/operations.md` has the
+  figures). `live_feed = false` turns it off. New metrics
+  `public_feed_reader_lag_seconds`, `public_feed_late_total` and
+  `public_feed_undecodable_total`. **Proxy:** the shipped Caddyfile's
+  `@live` matcher now includes `/live`; a Caddyfile of your own needs the
+  same edit. Behind a CDN, set Caddy to pass the real client address
+  (`docs/operations.md`), or everyone behind one edge shares one address's
+  limits.
+- **A new mark and an icon.** The header mark of the admin UI and the
+  public page is a peak on a line, and `/favicon.svg` (also answered at
+  `/favicon.ico`) serves it as the site's icon, dark-mode aware.
+- **Migration 0051** widens the sign-in flows' table (one more allowed
+  purpose and a column, which nothing writes), so this upgrade needs one
+  start with `APP_ALLOW_STARTUP_MIGRATE=1`. The admin sign-in callback
+  takes only its own `login` and `setup` rows.
 - **Refract community list**: `app.nearhorizon.refract.getCommunities`
   lists the enabled communities and their PDS host patterns, so a client can
   skip `fill` for an author no listed community could host.

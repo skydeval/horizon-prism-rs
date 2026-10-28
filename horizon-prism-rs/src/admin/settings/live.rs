@@ -20,7 +20,7 @@ use crate::config::{FileConfig, RefractCommunity, SuggestedTopic, ThreadLensAcce
 
 /// The keys that apply at once (§8.5), besides `indexing.public_scope`,
 /// which has its own command.
-pub const LIVE_KEYS: [&str; 13] = [
+pub const LIVE_KEYS: [&str; 15] = [
     "community.auto_enroll",
     "community.enroll_pds_patterns",
     "community.max_members",
@@ -35,6 +35,9 @@ pub const LIVE_KEYS: [&str; 13] = [
     "refract.enabled",
     "refract.communities",
     "refract.visitor_viewer_state",
+    // The public page at `/`.
+    "public_page.enabled",
+    "public_page.name",
 ];
 
 /// Whether `key` applies at once.
@@ -64,6 +67,10 @@ pub struct LiveValues {
     /// `refract.visitor_viewer_state`: whether a visitor's own records are
     /// looked up on Constellation with its DID (RF-S1, RF-S12).
     pub refract_visitor_viewer_state: bool,
+    /// `public_page.enabled`: whether `/` and `/live` answer.
+    pub public_page_enabled: bool,
+    /// `public_page.name`: the page's title; empty is the hostname.
+    pub public_page_name: String,
 }
 
 impl LiveValues {
@@ -83,6 +90,8 @@ impl LiveValues {
             refract_enabled: f.refract.enabled,
             refract_communities: f.refract.communities.clone(),
             refract_visitor_viewer_state: f.refract.visitor_viewer_state,
+            public_page_enabled: f.public_page.enabled,
+            public_page_name: f.public_page.name.clone(),
         }
     }
 }
