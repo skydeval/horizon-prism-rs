@@ -47,4 +47,6 @@ pub mod threadlens;
 pub mod xrpc;
 
 #[cfg(test)]
+mod name_guard;
+#[cfg(test)]
 pub(crate) mod test_support;

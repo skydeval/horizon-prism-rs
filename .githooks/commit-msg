@@ -1,0 +1,3 @@
+#!/bin/sh
+# Refuse a commit message holding a blocked word (tools/name-guard.py).
+exec python3 -I "$(git rev-parse --show-toplevel)/tools/name-guard.py" --message "$1"

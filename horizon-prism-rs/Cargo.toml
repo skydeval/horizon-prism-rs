@@ -92,3 +92,5 @@ rustix = { version = "1", features = ["fs"] }
 [dev-dependencies]
 # tokio::time::pause for the lag sampler's hang test (firehose throughput §4.5).
 tokio = { version = "1", features = ["test-util"] }
+# The name_guard test's hashes (already in the tree through other crates).
+sha2 = "0.10"

@@ -1,0 +1,8 @@
+# Words that must not appear in this repository's text or commit messages,
+# as SHA-256 of the lowercase word. Read by tools/name-guard.py (git hooks)
+# and the name_guard test. One hash per line.
+5d753fbd8c8cdc6a801bbaaf6326f15c45116a9bdcc402193e747bf61d65fe9a
+253d259c982a57be880f483b17bf05952814678a2c9bfc0e35cb73234894f620
+5437a829ce660fdca1870595a06691a423ac5429597adfefe04707f681941a2d
+a5a72ab4c78292d892788af922476f4263f62a1786b446754ae2127439f1187c
+0ae811d2d396fc0f58a42c5f5f9808b063fee81eab064a1dca5c7dc3040811b7
