@@ -45,6 +45,8 @@ mod root_gates;
 mod appearance;
 // Plural-pronouns T-F1: the fronters key.
 mod fronters;
+// The pre-upgrade `admin audiences check` (private-audiences design S0).
+mod audiences_check;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

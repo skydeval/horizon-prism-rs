@@ -14,6 +14,26 @@ no tracker references.
 
 ### Added
 
+- **`admin audiences check`** (read-only). A coming release stops reading
+  audience records from repositories and holds members' audiences itself;
+  before upgrading to it, every operator runs this check on the release
+  that still reads them. For each member it lists the repository's
+  `tools.kryphocron.policy.audience` records and compares them with the
+  stored audiences. Each member gets one outcome: `clean`; `refused`
+  (records no ingest would store, listed); `inactive` (tombstoned, no PDS,
+  repository not found or not active), which fails only when the member
+  has stored audiences; `mismatch` (a missing, extra or differing row),
+  which always fails; and `unchecked` (any other failure to read), which
+  fails. `--accept-unchecked <did>` (comma-separated or repeated) lets an
+  `unchecked` or `inactive` member pass, named in the report as unproven;
+  a refused record's stored row is named as unproven too. `--dids`
+  re-checks only the named members, and fails if one of them is not a
+  member. It also prints, without
+  failing on them, the consumer's lag and pending count, audience and
+  whole-entry dead letters, and open `member`, `private` and `authz` jobs,
+  with its start time and duration. It exits 0 when it passes and 1 when
+  it fails. Clear a mismatch with `admin backfill <did> --depth authz`,
+  wait for the job, and run the check again. It writes nothing.
 - **Refract community list**: `app.nearhorizon.refract.getCommunities`
   lists the enabled communities and their PDS host patterns, so a client can
   skip `fill` for an author no listed community could host.

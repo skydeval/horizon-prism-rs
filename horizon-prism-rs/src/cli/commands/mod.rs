@@ -2,6 +2,7 @@
 //! never through the admin executor, and change nothing.
 
 pub mod admin_commands_list;
+pub mod audiences_check;
 pub mod deadletter_list;
 pub mod identity_compare;
 pub mod keygen;

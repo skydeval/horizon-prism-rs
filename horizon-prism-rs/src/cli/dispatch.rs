@@ -117,6 +117,28 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: RefractAction,
     },
+    /// Private audiences (read-only).
+    Audiences {
+        #[command(subcommand)]
+        action: AudiencesAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AudiencesAction {
+    /// Before the upgrade that stops audience ingest: prove the stored
+    /// audiences match every member's repository. Exits 0 when they do.
+    /// Changes nothing.
+    Check {
+        /// Only these members (comma-separated), e.g. those flagged by an
+        /// earlier run.
+        #[arg(long, value_delimiter = ',')]
+        dids: Vec<String>,
+        /// Members whose unreadable or inactive repository is accepted as
+        /// unproven (comma-separated or repeated). Never a mismatch.
+        #[arg(long = "accept-unchecked", value_delimiter = ',')]
+        accept_unchecked: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -357,6 +379,7 @@ impl AdminCmd {
             | Self::Identity { .. }
             | Self::Settings { action: SettingsAction::List | SettingsAction::Get { .. } }
             | Self::Refract { action: RefractAction::Status | RefractAction::List { .. } | RefractAction::Show { .. } }
+            | Self::Audiences { .. }
             | Self::Keygen => return Err("read-only commands run in the CLI".to_string()),
             // They read the saved row's version first: see `settings_change`.
             Self::Settings { action: SettingsAction::Set { .. } | SettingsAction::Reset { .. } } => {
@@ -599,6 +622,10 @@ pub async fn run_migrate(args: &MigrateArgs) -> u8 {
 /// Run one admin command from the CLI: read-only commands directly,
 /// mutating ones through `serve`'s executor. Returns the process exit code.
 pub async fn run(args: &AdminArgs) -> u8 {
+    // It exits 1 when the check fails, with the report on stdout.
+    if let AdminCmd::Audiences { action: AudiencesAction::Check { dids, accept_unchecked } } = &args.command {
+        return commands::audiences_check::run(dids, accept_unchecked).await;
+    }
     if let Some(result) = read_only(&args.command).await {
         return finish(result);
     }
@@ -721,5 +748,7 @@ mod tests {
         assert_eq!(keep.to_command(), Ok(AdminCommand::RefractKeep { scope: "feature".into(), keep: false }));
         assert!(AdminCmd::Refract { action: RefractAction::Keep { scope: "nope".into() } }.to_command().is_err());
         assert!(AdminCmd::Refract { action: RefractAction::Status }.to_command().is_err(), "read-only");
+        let check = AdminCmd::Audiences { action: AudiencesAction::Check { dids: Vec::new(), accept_unchecked: Vec::new() } };
+        assert!(check.to_command().is_err(), "read-only");
     }
 }
