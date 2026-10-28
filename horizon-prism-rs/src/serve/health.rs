@@ -1,10 +1,14 @@
 //! `GET /xrpc/_health` (design-v2 §7.1). Anonymous callers get
-//! `{"ok","version"}`; a caller whose service JWT verifies (`lxm` `_health`,
-//! no membership check) gets the detail:
+//! `{"ok","version"}`; an operator (a DID in `admin_operators`) whose service
+//! JWT verifies (`lxm` `_health`) gets the detail:
 //! `{"ok","version","db","redis","audit_ok","watermarks":{label: rfc3339|null},
 //! "private_watermark","gap_blocked","public_indexing"}`. 200 when db and redis are reachable
-//! and the audit guard has not latched (§6.5), else 503. An invalid token is
-//! answered as anonymous.
+//! and the audit guard has not latched (§6.5), else 503. An invalid token, or
+//! a valid one from anyone else, is answered as anonymous.
+//!
+//! The detail is for operators only because the watermarks show how far
+//! Prism's processing has got. An outsider can slow that processing in ways
+//! that depend on who is a member, so exact lag would tell them about members.
 //!
 //! Exempt from the global per-IP bucket, except that a request carrying an
 //! `Authorization` header is charged to it before verification (issuer
@@ -170,9 +174,19 @@ pub(crate) async fn probe_redis(redis: &ConnectionManager, within: Duration) -> 
     )
 }
 
-/// Whether the caller presented a verifying token.
-async fn authenticated(state: &HealthState, authorization: Option<&str>) -> bool {
-    authorization.is_some() && state.auth.verify(authorization, METHOD).await.is_ok()
+/// Whether the caller presented a verifying token and is an operator. A
+/// failed or slow operator lookup answers as anonymous.
+async fn authorized(state: &HealthState, authorization: Option<&str>) -> bool {
+    if authorization.is_none() {
+        return false;
+    }
+    let Ok(caller) = state.auth.verify(authorization, METHOD).await else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(state.probe_timeout, crate::admin::operators::is_operator(&state.pool, &caller.did)).await,
+        Ok(Ok(true))
+    )
 }
 
 async fn health(State(state): State<HealthState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
@@ -185,7 +199,7 @@ async fn health(State(state): State<HealthState>, ConnectInfo(peer): ConnectInfo
         }
     }
     let (detail, db, redis) = tokio::join!(
-        authenticated(&state, authorization),
+        authorized(&state, authorization),
         probe_db(&state.pool, state.probe_timeout),
         probe_redis(&state.redis, state.probe_timeout)
     );
@@ -253,10 +267,11 @@ mod tests {
         assert!(body(true, true, true, &w, true, &s).ok);
     }
 
-    /// Anonymous and invalid-token callers get `{ok, version}`; a verifying
-    /// `_health` token gets the detail.
+    /// Anonymous and invalid-token callers get `{ok, version}`, and so does a
+    /// verifying `_health` token from a non-operator; an operator's gets the
+    /// detail.
     #[tokio::test]
-    async fn detail_requires_a_verified_token() {
+    async fn detail_requires_an_operator_token() {
         use crate::kryphocron_glue::jwt::tests::{AUDIENCE_HOST, StubFetcher, mint, signing_key, verifier};
         use crate::test_support::fresh_db;
 
@@ -324,6 +339,12 @@ mod tests {
         let (status, v) = get(Some(other_lxm)).await;
         assert_eq!((status, &v), (200, &minimal));
 
+        // A valid `_health` token from someone who is not an operator.
+        let token = mint(&signing_key(3), ALICE, &aud, Some(METHOD));
+        let (status, v) = get(Some(token)).await;
+        assert_eq!((status, &v), (200, &minimal), "a non-operator gets no detail");
+
+        sqlx::query("INSERT INTO admin_operators (did, added_by) VALUES ($1, 'cli')").bind(ALICE).execute(&db.pool).await.expect("operator");
         let token = mint(&signing_key(3), ALICE, &aud, Some(METHOD));
         let (status, v) = get(Some(token)).await;
         assert_eq!(status, 200, "{v}");

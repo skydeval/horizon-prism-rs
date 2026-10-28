@@ -161,6 +161,11 @@ no tracker references.
 
 ### Fixed
 
+- **The `_health` detail is for operators only.** The full body (db, redis,
+  audit guard, relay watermarks, public indexing) went to any account with a
+  verifying `_health` service JWT. The watermarks show how far processing has
+  got, which an outsider could use to learn about members. Now only an account
+  in the operator list gets the detail; everyone else gets `ok` and `version`.
 - **Self-labels always carry `cts`.** A self-label on a record with no
   `createdAt` (some profile records have none) went out without `cts`, which
   `com.atproto.label.defs#label` requires, so strict clients refused the
