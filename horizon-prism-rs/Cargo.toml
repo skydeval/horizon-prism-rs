@@ -3,6 +3,8 @@ name = "horizon-prism-rs"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
+license = "MPL-2.0"
+repository = "https://github.com/skydeval/horizon-prism-rs"
 publish = false
 
 [lib]

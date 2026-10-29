@@ -60,3 +60,7 @@ Horizon-Prism-rs is not a fork of aurora-prism. It was built based on it: almost
 ## Status
 
 In active development. Expect schema migrations and config changes between versions; read [CHANGELOG.md](CHANGELOG.md) before upgrading.
+
+## License
+
+[MPL-2.0](LICENSE).
