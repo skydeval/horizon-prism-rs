@@ -68,9 +68,9 @@ A list mute takes effect once Horizon-Prism has synced its copy of the list. `ge
 
 ### Labels and the moderation gate
 
-**Operator labels.** The operator adds and removes labels with `admin label add` and `admin label remove`, or the admin UI. Allowed values: `!takedown`, `!hide`, `porn`, `sexual`, `nudity`, `graphic-media`. They are emitted with `src` set to the server's own DID (`did:web:prism.example.org`). `com.atproto.label.queryLabels` reads them; it never returns labels on private-tier records and cannot list the whole table.
+**Operator labels.** The operator adds and removes labels with `admin label add` and `admin label remove`, or the admin UI. Allowed values: `!takedown`, `!hide`, `porn`, `sexual`, `nudity`, `graphic-media`. They are emitted with `src` set to the server's own DID (`did:web:prism.example.org`). `com.atproto.label.queryLabels` reads them; it never returns labels on kryphocron records and cannot list the whole table.
 
-**The moderation gate** runs on every read path before any source is asked: local tables, upstream AppViews, Slingshot, Constellation, PDSes, Thread Lens and the private tier.
+**The moderation gate** runs on every read path before any source is asked: local tables, upstream AppViews, Slingshot, Constellation, PDSes, Thread Lens and kryphocron reads.
 
 | Input | Result |
 |---|---|
@@ -79,13 +79,13 @@ A list mute takes effect once Horizon-Prism has synced its copy of the list. `ge
 | `!hide` on the record | left out of lists and threads; a direct `getPosts` still returns it with the label |
 | otherwise | shown |
 
-Accounts restored by [Refract](refract.md) add their own rules to the gate. On public paths, account status is read only for accounts in scope and members.
+[Refract](refract.md) accounts add their own rules to the gate. On public paths, account status is read only for accounts in scope and members.
 
 **Other labelers.** Labels that an upstream AppView attaches are removed from ordinary views; only the operator's labels are shown. [Thread Lens](thread-lens.md) honours `atproto-accept-labelers` and keeps the labels the named labelers applied. Labels from other labelers only add to a view: they never change what the gate hides. `getServices` describes any labeler. `createReport` answers 501 and points to the PDS and a labeler.
 
 ### Hidden replies
 
-A thread root's `app.bsky.feed.threadgate` can list replies in `hiddenReplies`. Horizon-Prism leaves those replies, and what is beneath them, out of `getPostThread` for everyone but their own author. The V2 thread views move them aside with `hiddenByThreadgate`. `getPosts` still returns them. Horizon-Prism applies a gate it has stored, so this needs the root's gate to be indexed. For how a public root's gate hides private replies, see [private posts](private-posts.md).
+A thread root's `app.bsky.feed.threadgate` can list replies in `hiddenReplies`. Horizon-Prism leaves those replies, and what is beneath them, out of `getPostThread` for everyone but their own author. The V2 thread views move them aside with `hiddenByThreadgate`. `getPosts` still returns them. Horizon-Prism applies a gate it has stored, so this needs the root's gate to be indexed. For how a public root's gate hides kryphocron replies, see [kryphocron](kryphocron.md).
 
 ## Guarantees
 
@@ -98,7 +98,7 @@ A thread root's `app.bsky.feed.threadgate` can list replies in `hiddenReplies`. 
 ## Limits
 
 - **Blocks between two non-members are not stored.** Horizon-Prism does not hide a reply because its author and the parent's author block each other (stock "third-party" blocks).
-- **Inbound list blocks need Farsight.** They are best effort, apply only to ready members, and are not applied in the private tier, to anonymous callers or to non-members.
+- **Inbound list blocks need Farsight.** They are best effort, apply only to ready members, and are not applied to kryphocron reads, anonymous callers or non-members.
 - **Lists past the budget, unsynced lists and non-moderation lists** do nothing for list blocks and list mutes.
 - **Ordinary views show only the operator's labels**, not those of the labelers a member subscribes to.
 - **No moderation queue and no report intake.** The operator's labels and account status are the only moderation inputs.

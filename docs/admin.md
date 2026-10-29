@@ -18,7 +18,7 @@ Behind a CDN, keep features that inject or rewrite scripts off for `/admin*`. Th
 
 | Page | What it shows or does |
 |---|---|
-| Home | Status at a glance, and a live feed of the records Horizon-Prism writes (never private content). |
+| Home | Status at a glance, and a live feed of the records Horizon-Prism writes (never kryphocron content). |
 | Members | List with readiness; add, remove, deny, allow, re-sync. |
 | Lookup | Look up an account and what Horizon-Prism holds for it. |
 | Labels | Labels the operator applied; add and remove. |
@@ -29,7 +29,7 @@ Behind a CDN, keep features that inject or rewrite scripts off for `/admin*`. Th
 | Jobs | Backfill and sync jobs; retry, scope check. |
 | Problems | Dead letters and stream state; replay or drop. |
 | Farsight | Farsight's status (when configured). |
-| Communities, Refract | Refract's communities and restored accounts (when used). |
+| Communities, Refract | Refract (when used). |
 | Audit | Every change, who made it, how it ended, and sign-ins. |
 
 With `APP_SUPERVISED=1` (set in the shipped compose file), the UI can restart `app` to apply settings that need a restart.
@@ -59,7 +59,7 @@ Commands that change state are queued and executed by the running `app`. The CLI
 | `commands` | `list` | Queued admin commands and their state. |
 | `lists` | `sync`, `purge` | Copies of lists used by members' list mutes and blocks. |
 | `farsight` | `status`, `prime`, `forget` | Farsight (optional). |
-| `refract` | `status`, `list`, `show`, `check`, `end`, `keep`, `unkeep` | Restored accounts (optional). |
+| `refract` | `status`, `list`, `show`, `check`, `end`, `keep`, `unkeep` | Refract (optional). |
 | `identity` | `compare` | Compare identity reads with and without Lodestar. Changes nothing. |
 | `keygen` | | Print new signing and correlation keys. Reads no config. |
 | `setup-code` | | Print the first-run setup code again. |

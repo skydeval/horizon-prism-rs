@@ -37,7 +37,7 @@ Each node is a `postNode` (a `postView`) or a `gapNode`. A gap carries only the 
 | `block-state-unknown` | the caller's blocks with this author could not be checked, so it was not fetched |
 | `blocked` | a block the ordinary view reported that was not looked past |
 | `deleted`, `not-found`, `upstream-unavailable`, `content-stripped` | the post is gone, hidden by moderation, or a source failed |
-| `tier-hidden` | any private-tier URI, whether or not it exists |
+| `tier-hidden` | any kryphocron URI, whether or not it exists |
 
 The response's `bridging` is `off` (the ordinary view only), `limited` (some posts held back for want of a check) or `full`.
 
@@ -81,7 +81,7 @@ A marker means work was not done, never that there is a block. The client merges
 - No content of an author with a known block with the caller (either direction) is sent: no post, embed or profile. Embeds of such posts are blocked-record views.
 - A post is added beyond the ordinary view only when Farsight has cleared its author for this caller.
 - A response always holds at least what `getPostThread` would return, with the caller's known blocks enforced.
-- Private-tier records are never read: every private URI is a `tier-hidden` gap, looked up nowhere.
+- Kryphocron records are never read: every kryphocron URI is a `tier-hidden` gap, looked up nowhere.
 - Upstream sources are asked without the caller's identity.
 
 ## Limits
@@ -90,5 +90,5 @@ A marker means work was not done, never that there is a block. The client merges
 - **Visitors' direct blocks of non-members are not stored.** For a visitor they come from Farsight; where Farsight gives no answer, such an author can appear where the ordinary view shows it.
 - **Blocks the caller lifted can linger** for a visitor whose unblock was lost in a firehose gap: it hides more than it should, never less.
 - **`resolve` items** carry no paging links, and a gap item is never marked `hiddenByThreadgate`.
-- **A private root's gate is not applied**; the private tier applies its own (see [private posts](private-posts.md)).
+- **A kryphocron root's gate is not applied**; kryphocron reads apply their own (see [kryphocron](kryphocron.md)).
 - **Whoever runs Farsight** sees which accounts are in the threads callers open.

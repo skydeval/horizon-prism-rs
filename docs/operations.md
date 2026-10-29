@@ -12,8 +12,8 @@ Key metrics:
 | `firehose_worker_delay_seconds` | How far behind live each relay is. |
 | `firehose_trim_gap_total` | The stream was trimmed before entries were read. Horizon-Prism re-syncs affected accounts. |
 | `firehose_dead_letter_total` | Records that failed to index. |
-| `private_read_degraded` | 1 while private reads are degraded. |
-| `private_tier_last_event_age_seconds` | Time since the relays last delivered a private record. A day or more: check that the relays crawl your PDS. |
+| `private_read_degraded` | 1 while kryphocron reads are degraded. |
+| `private_tier_last_event_age_seconds` | Time since the relays last delivered a kryphocron record. A day or more: check that the relays crawl your PDS. |
 | `members_not_ready_total` | Members still in their first indexing. |
 | `backfill_jobs{state}` | Backfill queue; `failed` should stay at 0. |
 | `redis_memory_ratio` | Redis memory against `REDIS_MAXMEMORY`. |
@@ -33,9 +33,9 @@ Key metrics:
 
 ## The public page's live feed
 
-`/` shows every event the relays deliver, about half a second after the relay sidecar wrote it, from a reader of its own on the firehose stream: plain reads, no consumer group, its own Redis connection. It never waits for or follows Horizon-Prism's own processing, which may be minutes behind while the feed runs live. It reads the stream a second time, a few percent of a Redis core at the highest measured input, plus about 20 small reads and one `XINFO STREAM` a second. If the Redis clock is more than a second from the host's, the log says so (`public_feed_clock_offset`); the feed keeps Redis time.
+`/` shows every event the relays deliver, about half a second after the relay sidecar wrote it. It has its own reader on the firehose stream (plain reads, no consumer group, its own Redis connection), so it never waits on ingest. Cost: a few percent of a Redis core at the highest measured input. A Redis clock more than a second off the host's is logged as `public_feed_clock_offset`.
 
-**Bandwidth.** Every viewer gets every event, so egress grows with viewers at the relay's own rate, and `[public_page] live_max_viewers` (default 50) is the only control. Past it, visitors get "busy", never a thinner feed. At about 43 bytes a line:
+**Bandwidth.** Every viewer gets every event; `[public_page] live_max_viewers` (default 50) is the only control. Past it, visitors get "busy". At about 43 bytes a line:
 
 | Events a second | Per viewer | 25 viewers | 50 viewers (default) | 100 viewers | 200 viewers |
 |---|---|---|---|---|---|
@@ -44,11 +44,11 @@ Key metrics:
 | 11,700 | ~4.2 Mbit/s | ~105 Mbit/s | ~210 Mbit/s | ~420 Mbit/s | ~830 Mbit/s |
 | 15,300 (a relay replay) | ~5.4 Mbit/s | ~135 Mbit/s | ~270 Mbit/s | ~540 Mbit/s | ~1,080 Mbit/s |
 
-A relay replay reaches viewers at its full rate. On a metered or small link, set a lower cap, or `live_feed = false`. A viewer whose connection cannot keep up is ended with a count of what it missed, so it never slows anyone else. Hidden tabs close their stream.
+On a metered or small link, lower the cap or set `live_feed = false`. A viewer that cannot keep up is ended with a count of what it missed. Hidden tabs close their stream.
 
-**Proxy.** `/live` is a server-sent event stream: proxy it without compression and flushed at once, as `/admin/live`. The shipped Caddyfile's matcher is `@live path /admin/live /live`; a Caddyfile of your own needs the same.
+**Proxy.** `/live` is a server-sent event stream: proxy it uncompressed and flushed at once, like `/admin/live`. The shipped Caddyfile's matcher is `@live path /admin/live /live`.
 
-**Client addresses behind a CDN.** Every per-address rule (2 live streams per address, `anon_read`) keys on the client address Horizon-Prism computes: the last `X-Forwarded-For` element when the request comes from `[http] trusted_proxy`. Behind a CDN, that element is the CDN's edge unless Caddy overwrites it with the real client. In Caddy's global options, and in **every** `reverse_proxy` block, the `@live` one included:
+**Client addresses behind a CDN.** Per-address limits (2 live streams, `anon_read`) use the last `X-Forwarded-For` element from `[http] trusted_proxy`. Behind a CDN that is the edge, unless Caddy overwrites it. In Caddy's global options, and in **every** `reverse_proxy` block:
 
 ```
 {
@@ -79,10 +79,10 @@ docker compose logs --no-log-prefix app | jq -c 'select(.target == "audit")'
 
 ## Degraded mode
 
-Private reads depend on the private relays being current. When the slowest one falls behind (two minutes by default), Horizon-Prism is **degraded**:
+Kryphocron reads depend on the private relays being current. When the slowest falls behind (two minutes by default), Horizon-Prism is **degraded**:
 
-- A private read is still served if Horizon-Prism holds every commit the read depends on. Otherwise that post is missing from the answer.
-- Responses carry `degraded: true` and a `retryAfter` hint, so clients can say "try again" rather than "not found".
+- A read is still served if every commit it depends on is held. Otherwise that post is missing from the answer.
+- Responses carry `degraded: true` and a `retryAfter` hint.
 - `private_read_degraded` is 1. The log has `private_read_degraded_started` (naming the relays behind) and `private_read_degraded_ended`.
 
 Public reads are not affected. Degraded mode ends by itself when the relays catch up. See [degraded mode](design/degraded-mode.md).
@@ -102,7 +102,7 @@ Related client-visible states:
 
 **Redis is full.** Redis runs `noeviction`, so at the ceiling it refuses new entries and ingest stops. Raise `REDIS_MAXMEMORY` and recreate `redis`, or trim the stream and accept a gap. Horizon-Prism detects the gap and re-syncs members.
 
-**Private posts never appear.** Check `private_tier_last_event_age_seconds`. The community PDS must have federation on and be crawled by every relay in `firehose.private_relays`. Also check that the author is a ready member.
+**Kryphocron posts never appear.** Check `private_tier_last_event_age_seconds`. The community PDS must have federation on and be crawled by every relay in `firehose.private_relays`. Also check that the author is a ready member.
 
 **A member stays `NotReady`.** See the member's jobs on the admin UI's Members, Lookup or Jobs page. A record that fails to parse on every attempt keeps the member not ready (`authz_backfill_stuck_total`); the `authz_stuck` error log names it.
 

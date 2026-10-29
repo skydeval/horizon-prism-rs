@@ -7,9 +7,9 @@ It is a stack you run yourself, not a hosted service. This README calls it Horiz
 ## Features
 
 - **Stock AppView API.** Timelines, threads, profiles, notifications, search, lists, bookmarks and the rest of `app.bsky.*` for members.
-- **Private posts.** Posts shown only to an audience the author picks. See [private posts](docs/design/private-posts.md).
+- **[Kryphocron](https://github.com/skydeval/kryphocron).** Posts shown to an audience the author picks. See [kryphocron](docs/design/kryphocron.md).
 - **Thread Lens.** A thread view that can show replies the ordinary view leaves out. See [Thread Lens](docs/design/thread-lens.md).
-- **Restored accounts (Refract).** Optional. Keeps accounts that Bluesky's AppView took down readable while a listed community still hosts them. See [Refract](docs/design/refract.md).
+- **Refract.** Optional. See [Refract](docs/design/refract.md).
 - **Pronouns and plural systems.** Served for any account without sign-in. See [pronouns and plural](docs/design/pronouns-and-plural.md).
 - **Community scope.** Indexes members and the accounts they touch, not the whole network. Public indexing can be turned off.
 - **Operator tools.** A web admin UI and an `admin` CLI.

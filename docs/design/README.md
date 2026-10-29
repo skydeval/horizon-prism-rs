@@ -8,10 +8,10 @@ Short design notes, one per area. Each says what Horizon-Prism does, what it gua
 | [firehose-and-relays.md](firehose-and-relays.md) | Relays, sidecars, the stream, cursors, gaps, dead letters. |
 | [indexing-and-scope.md](indexing-and-scope.md) | Which accounts are indexed, public-indexing modes, what is stored, retention. |
 | [membership.md](membership.md) | Members, enrolment, readiness, `getMembership`. |
-| [private-posts.md](private-posts.md) | The private tier: audiences, the read rule, guarantees, notifications. |
+| [kryphocron.md](kryphocron.md) | Kryphocron posts: audiences, who reads, notifications. |
 | [blocks-and-moderation.md](blocks-and-moderation.md) | Blocks, list blocks, mutes, labels, the moderation gate, hidden replies. |
 | [thread-lens.md](thread-lens.md) | The thread view that shows what the ordinary view leaves out. |
-| [refract.md](refract.md) | Restored accounts. |
+| [refract.md](refract.md) | Refract. |
 | [pronouns-and-plural.md](pronouns-and-plural.md) | Pronouns and plural-system records. |
 | [system-accounts.md](system-accounts.md) | The private list of a plural system's accounts, and its privacy properties. |
 | [degraded-mode.md](degraded-mode.md) | What happens when a relay or Farsight falls behind. |

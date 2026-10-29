@@ -10,7 +10,7 @@ Horizon-Prism reads settings from three places:
 | `docker/config/app.toml` | Every non-secret setting. Every key shown is the default. Unknown keys stop startup. | at restart |
 | Admin UI (Settings) | Values saved over `app.toml`, kept in the database | some at once, the rest at restart |
 
-A value saved in the admin UI wins over the file. Horizon-Prism never writes `app.toml`. Saving checks the whole configuration first, so a value it would refuse to start with is never saved. Each setting's page says whether it applies at once or after a restart. `admin settings list|get|set|reset` does the same from the CLI.
+A value saved in the admin UI wins over the file, which Horizon-Prism never writes. A save is checked against the whole configuration first. Each setting's page says when it applies. `admin settings list|get|set|reset` does the same from the CLI.
 
 ## Environment
 
@@ -21,8 +21,8 @@ A value saved in the admin UI wins over the file. Horizon-Prism never writes `ap
 | `REDIS_MAXMEMORY` | Redis memory ceiling (default `6gb`). |
 | `APP_SERVICE_SIGNING_KEY_HEX` | The AppView's signing key, from `admin keygen`. |
 | `APP_CORRELATION_KEY_HEX` | Audit correlation key, from `admin keygen`. |
-| `APP_PRIVATE_CURSOR_KEY_HEX` | Private-feed cursor key. Required. Same on every replica. |
-| `APP_SYSTEM_ACCOUNTS_KEY_HEX` | Optional. Switches system accounts on, and seals and indexes their lists. 64 hex (`admin keygen` prints one, or `openssl rand -hex 32`). Same on every replica. Once lists are stored, keep it: see below. |
+| `APP_PRIVATE_CURSOR_KEY_HEX` | Cursor key for kryphocron feeds. Required. Same on every replica. |
+| `APP_SYSTEM_ACCOUNTS_KEY_HEX` | Optional. Switches system accounts on and seals their lists. 64 hex (`admin keygen` or `openssl rand -hex 32`). Same on every replica; keep it once lists exist (below). |
 | `APP_ALLOW_STARTUP_MIGRATE` | `1` only while applying migrations. |
 | `FARSIGHT_TOKEN` | Farsight API key, only if Farsight is used. |
 | `CADDY_ACME_EMAIL` | Certificate contact. |
@@ -39,7 +39,7 @@ A value saved in the admin UI wins over the file. Horizon-Prism never writes `ap
 | `[community]` | Auto-enroll, member cap, readiness retry hints. |
 | `[firehose]` | Stream names, batch size, dead letters, which relays are private relays. |
 | `[identity]` | PLC directory, caches, optional Lodestar. |
-| `[private_read]`, `[private_notify]`, `[private_search]`, `[private_any_pds]` | The private tier. |
+| `[private_read]`, `[private_notify]`, `[private_search]`, `[private_any_pds]` | [kryphocron](design/kryphocron.md) reads, notifications and search. |
 | `[sync]`, `[backfill]`, `[index_request]` | Load on PDSes: head checks, backfill rate, catch-up. |
 | `[constellation]` | Upstream AppViews by PDS pattern, their rates, and the lookup order. |
 | `[microcosm]`, `[counts]` | Constellation and Slingshot URLs; where public counts come from. |
@@ -47,11 +47,11 @@ A value saved in the admin UI wins over the file. Horizon-Prism never writes `ap
 | `[cache]` | In-process cache sizes. |
 | `[rate_limits]`, `[auth]` | Request limits per class; limits on token checks. |
 | `[admin]` | Admin UI on/off, session lifetimes, live feed snippets. |
-| `[public_page]` | The public page at `/` and its live relay feed: on/off and the operator's own text. See below. |
+| `[public_page]` | The public page at `/` and its live relay feed. See below. |
 | `[threadlens]` | Who may use Thread Lens and how much one response reads. |
-| `[thread_outline]` | The thread outline: who replied to whom, for Thread Lens. Off by default; see below. |
+| `[thread_outline]` | Who replied to whom, for Thread Lens. Off by default; see below. |
 | `[farsight]` | Block-list index (optional), with its fallback and memory. |
-| `[refract]` | Restored accounts (optional, off by default). |
+| `[refract]` | Refract (optional, off by default). |
 | `[plural]` | Pronouns and plural-system reads. |
 | `[lists]` | Members' own list mutes and list blocks. |
 | `[search]`, `[suggestions]`, `[trends]` | Search limits; suggestion and trend rules. |
@@ -63,16 +63,16 @@ The comments in `app.toml` describe every key.
 
 ## Setting up a new community
 
-1. **Hostname.** Set `APP_PUBLIC_HOSTNAME=prism.example.org`. Clients address the AppView as `did:web:prism.example.org`. The app publishes its DID document at `/.well-known/did.json`.
+1. **Hostname.** Set `APP_PUBLIC_HOSTNAME=prism.example.org`. Clients address the AppView as `did:web:prism.example.org`; its DID document is at `/.well-known/did.json`.
 2. **Community PDS.** In the `[[constellation.networks]]` entry named `community`, set `pds_patterns`:
    ```toml
    pds_patterns = ["pds.example.org", "*.pds.example.org"]
    ```
    A pattern is an exact host or `*.` plus a suffix. Accounts on these hosts are answered from local data.
-3. **Relays.** `[firehose] private_relays` lists the relays that must crawl the community PDS. Private reads wait for the slowest of them. Each label maps to a sidecar's relay URL in `[firehose.relay_labels]`. The sidecar configs are in `docker/firehose/`. See [firehose and relays](design/firehose-and-relays.md).
-4. **Members.** Add them with `admin member add` or the admin UI. To let accounts on your PDS join by themselves, set `[community] auto_enroll = true` (off by default). `enroll_pds_patterns` limits which hosts may auto-enroll; empty means the community patterns. `max_members` caps the total. See [membership](design/membership.md).
-5. **Public indexing.** A fresh install starts with `public_scope = "off"`: Horizon-Prism serves only what members' private posts, Thread Lens and the Horizon features need, and clients use a public AppView for the rest. Set `community_scoped` to serve public timelines, search and the rest of `app.bsky.*` too. See [indexing and scope](design/indexing-and-scope.md).
-6. **Upstreams.** The shipped `[constellation]` entries name Bluesky's public AppView and others. `[constellation.cascade] order` sets the order they are asked for accounts outside your community.
+3. **Relays.** `[firehose] private_relays` lists the relays that must crawl the community PDS; kryphocron reads wait for the slowest. Each label maps to a sidecar's relay URL in `[firehose.relay_labels]`; the sidecar configs are in `docker/firehose/`. See [firehose and relays](design/firehose-and-relays.md).
+4. **Members.** Add them with `admin member add` or the admin UI. `[community] auto_enroll = true` (off by default) lets accounts on your PDS join by themselves; `enroll_pds_patterns` limits the hosts (empty means the community patterns), and `max_members` caps the total. See [membership](design/membership.md).
+5. **Public indexing.** A fresh install starts with `public_scope = "off"`: only what kryphocron, Thread Lens and the Horizon features need, and clients use a public AppView for the rest. `community_scoped` also serves public timelines, search and the rest of `app.bsky.*`. See [indexing and scope](design/indexing-and-scope.md).
+6. **Upstreams.** `[constellation.cascade] order` sets the order upstream AppViews are asked for accounts outside your community.
 
 ## Optional services
 
@@ -80,51 +80,50 @@ Horizon-Prism runs without any of these. Each is off until configured.
 
 | Service | Setting | What it adds | Without it |
 |---|---|---|---|
-| Farsight | `[farsight] url` + `FARSIGHT_TOKEN` | Hides accounts that block a member through a block list. Lets Thread Lens show posts past blocks. | Those list blocks are not applied. Thread Lens shows the ordinary thread plus hidden replies, not posts past blocks. A member's own list blocks still work. |
+| Farsight | `[farsight] url` + `FARSIGHT_TOKEN` | Hides accounts that block a member through a block list. Lets Thread Lens show posts past blocks. | Those list blocks are not applied, and Thread Lens shows no posts past blocks. A member's own list blocks still work. |
 | Farsight fallback and memory | `[farsight.fallback]`, `[farsight.memory]` | Keep list blocks applying while Farsight is down. | List blocks lapse during a Farsight outage. |
-| Lodestar | `[identity] lodestar_url` | Faster identity and handle reads from a PLC mirror. | Identities come from `plc_url`, and Horizon-Prism checks handles itself. |
-| Constellation, Slingshot | `[microcosm]` | Counts, backlinks and records for content Horizon-Prism does not store; reply lists in threads. | Set `[counts] public_source = "local"` to count only stored data. Threads and counts for outside content are less complete. |
-| Refract | `[refract] enabled` and communities | Restored accounts. | Off by default. |
+| Lodestar | `[identity] lodestar_url` | Faster identity and handle reads from a PLC mirror. | Identities come from `plc_url`, and handles are checked locally. |
+| Constellation, Slingshot | `[microcosm]` | Counts, backlinks and records for content not stored here; reply lists in threads. | Set `[counts] public_source = "local"`. Threads and counts for outside content are less complete. |
+| Refract | `[refract] enabled` and communities | See [Refract](design/refract.md). | Off by default. |
 
-The Farsight fallback sends a member's DID and the accounts on their page to another AppView. Read the warning in `app.toml` before turning it on. Farsight and Lodestar see which accounts your instance asks about, so point them at instances you run or trust.
+The Farsight fallback sends a member's DID and the accounts on their page to another AppView; read the warning in `app.toml` first. Farsight and Lodestar see which accounts you ask about, so use instances you run or trust.
 
 ## Thread outline
 
-`[thread_outline]` keeps the reply structure of every public post the firehose delivers: author, record key, parent, root, time and rev, and a mark when deleted. It keeps no text. Thread Lens uses it to know a thread's shape before it fetches posts: when the outline is fresh, holds the whole thread and Farsight is configured, a `getThread` reads the parents and replies from it, judges their authors in one round and fetches them in one batch, instead of listing each node's replies from Constellation level by level. Anything it cannot vouch for (a thread older than its coverage, a gap it knows of, a reply Constellation lists that it lacks) falls back to Constellation for that request.
+`[thread_outline]` keeps the reply structure of every public post the firehose delivers (author, record key, parent, root, time, rev, a deleted mark; no text). When it is fresh, holds the whole thread and Farsight is configured, Thread Lens's `getThread` reads parents and replies from it in one batch instead of walking Constellation level by level. Anything it cannot vouch for falls back to Constellation for that request.
 
-It is off by default because, once on, it records every author's posts network-wide, whatever `public_scope` says: about 3 million posts a day, and about 17 GB of disk at the default `window_days = 30`. Rows older than `window_days` are deleted by the daily retention run.
+It records every author network-wide, whatever `public_scope` says: about 3 million posts a day, about 17 GB at the default 30-day window. The daily retention run deletes older rows.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Record the outline. |
 | `window_days` | `30` | Days a post's structure is kept (2 to 365). |
-| `queue_messages` | `50000` | Messages the firehose may queue for the outline writer. A full queue never slows ingest; the writer catches up from the stream. |
+| `queue_messages` | `50000` | Messages queued for the outline writer. A full queue never slows ingest; the writer catches up from the stream. |
 | `flush_ms` | `250` | How often the writer writes a batch. |
-| `settle_secs` | `900` | Threads count as complete only for roots seen this long after the outline's coverage began. |
-| `fresh_secs` | `30` | How far behind the stream the outline may fall and still be used. |
-| `max_tree` | `5000` | Rows Thread Lens reads under an anchor. A larger subtree takes the path without the outline, and is remembered for 10 minutes. |
-| `max_thread` | `20000` | Rows of one thread Thread Lens scans to check that nothing is missing. A larger thread takes the path without the outline. |
-| `enforce_reserve` | `100` | Verdict lookups (of `threadlens.verdict_max_dids`) kept back from the outline's candidate round for the check of embedded posts. |
+| `settle_secs` | `900` | Threads count as complete only for roots seen this long after coverage began. |
+| `fresh_secs` | `30` | How far behind the stream the outline may be and still be used. |
+| `max_tree` | `5000` | Rows read under an anchor. A larger subtree skips the outline, remembered for 10 minutes. |
+| `max_thread` | `20000` | Rows of one thread scanned to check nothing is missing. A larger thread skips the outline. |
+| `enforce_reserve` | `100` | Verdict lookups (of `threadlens.verdict_max_dids`) kept back for embedded posts. |
 
-All keys apply at restart. Switching it off clears its progress, so switching it on again starts coverage afresh; the rows already stored age out. One process writes it at a time (an advisory lock): a second process waits and takes over when the first stops. Watch `outline_writer_active`, `outline_through_age_seconds` and `outline_missed_total`.
+All keys apply at restart. Switching it off clears its progress; switching it on again starts coverage afresh. One process writes at a time (an advisory lock); a second waits and takes over. Watch `outline_writer_active`, `outline_through_age_seconds` and `outline_missed_total`.
 
 ## Public page
 
-`[public_page]` sets the read-only page at `/` (see the [API guide](api.md#the-instance-page)). Its fixed text reads "Horizon-Prism, an AT Protocol AppView written in Rust" with the version; everything else about the instance is what you write here. It is file-only: every key applies at restart, and the admin UI lists them read-only.
+`[public_page]` sets the read-only page at `/` (see the [API guide](api.md#the-instance-page)). All keys apply at restart and are read-only in the admin UI.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | Serve the page. `false` mounts none of its routes, so `/` is a 404. |
+| `enabled` | `true` | Serve the page. `false`: `/` is a 404. |
 | `name` | `""` | The page's title; empty is `APP_PUBLIC_HOSTNAME`. |
-| `about` | `""` | Your own text: plain text, a blank line starts a paragraph, at most 4,000 characters. Never HTML. |
-| `contact` | `""` | Plain text, one line; an `https:` or `mailto:` value is shown as a link. |
-| `source_url` | `""` | A link to the source (`https:`). Empty shows none. |
-| `live_feed` | `true` | The live feed of relay events at `/live`. `false` mounts no `/live`, and `/` shows no feed and loads no script; the reader still runs, for the status block's relay lines and input rate. |
-| `live_max_viewers` | `50` | Live-feed viewers at once, at least 1: the bandwidth control. Every viewer gets every event, about 0.4 Mbit/s each at 800 events a second and about 5.4 during a relay replay. Size it for your link ([operations](operations.md#the-public-pages-live-feed)). |
-| `clients` | `[]` | The apps that use this instance, as `[[public_page.clients]]` entries with `name` and an `https:` `url`; at most 20. Horizon-Prism cannot tell which apps call it, so this is what you write. |
+| `about` | `""` | Plain text, a blank line starts a paragraph, at most 4,000 characters. |
+| `contact` | `""` | One line; an `https:` or `mailto:` value is a link. |
+| `source_url` | `""` | A link to the source (`https:`). |
+| `live_feed` | `true` | The live relay feed at `/live`. `false` mounts no `/live` and `/` loads no script. |
+| `live_max_viewers` | `50` | Live-feed viewers at once, at least 1. Each viewer costs about 0.4 Mbit/s at 800 events a second, about 5.4 during a relay replay ([operations](operations.md#the-public-pages-live-feed)). |
+| `clients` | `[]` | Apps that use this instance, as `[[public_page.clients]]` with `name` and an `https:` `url`; at most 20. |
 
-A link that is not `https:` stops the start. The page shows relay information only: no member, community, label, limit, address or count of private anything, and no relay's name: it says how many relays it receives from. The removed keys `self_check`, `policy_url` and `docs_url` stop the start like any unknown key.
-
+A link that is not `https:` stops the start. The page names no relay, only how many it receives from. The removed keys `self_check`, `policy_url` and `docs_url` stop the start like any unknown key.
 
 ## Rate limits
 
@@ -132,18 +131,18 @@ Each request class is a token bucket: `per_sec` and `burst`. Anonymous callers a
 
 ## System-accounts key
 
-`APP_SYSTEM_ACCOUNTS_KEY_HEX` is a separate secret on purpose: its lists outlive any rotation of the other keys. Without it the feature is off and nothing is stored. Set it, and `getMembership` lists `account.systemAccounts` for every signed-in account.
+`APP_SYSTEM_ACCOUNTS_KEY_HEX` is separate from the other keys so lists survive their rotation. Without it the feature is off and nothing is stored. With it, `getMembership` lists `account.systemAccounts` for every signed-in account.
 
-Once a list is stored, the key must stay the same, so back it up. If a start finds lists but no key, or another key, Horizon-Prism still starts and only system accounts are off ("locked"):
+Once a list is stored, keep the key and back it up. If a start finds lists but no key, or another key, Horizon-Prism starts with only system accounts **locked**:
 
-- the five methods answer 501 with "System accounts are unavailable on this AppView for now; lists are kept", and `getMembership` leaves `account.systemAccounts` out;
-- no entry is read, added or removed, so a listed account cannot leave lists until the key is back (owners are still recognised, and a deleted account's own list is still deleted, since neither needs the key);
-- every identity, account, handle and tombstone event seen is recorded in `sysacct_pending` (any account's, so it says nothing about who is on a list; it grows by up to a few hundred thousand short rows a day on the full network);
+- the five methods answer 501 ("System accounts are unavailable on this AppView for now; lists are kept"), and `getMembership` leaves `account.systemAccounts` out;
+- no entry is read, added or removed (a deleted account's own list is still deleted);
+- every identity, account, handle and tombstone event is recorded in `sysacct_pending` (up to a few hundred thousand short rows a day on the full network);
 - the log (`system_accounts_locked`) and the Health page ("System accounts", red) say which case it is.
 
-Set the right key and restart. Accounts deleted meanwhile then leave every list, the recorded accounts that are on a list are checked by the identity refresher as usual, and the methods serve again once those checks are done: usually minutes, up to a few hours when an account's server is failing (Health's "System accounts" check is amber meanwhile; it runs in the background and never holds the start). A check the refresher gives up on counts as done, as it would with the key present. Every replica must have the same key. A replica started without it is locked and keeps recording. A replica that is already serving keeps serving and applies what a locked replica records, as soon as its own catch-up is not waiting on earlier checks; a replica that starts meanwhile waits to serve until no replica is locked. When several replicas start with the right key, each waits until the recorded checks are done, and a restart while catching up starts those checks again. While catching up, each process holds the recorded rows in memory, about 100 MB per week the key was missing on the full network; after a lock of months, give the process room for that or empty `sysacct_pending` first, accepting that deletions seen meanwhile then reach the lists only through later events.
+Set the right key and restart. Accounts deleted meanwhile leave every list, the recorded accounts are re-checked by the identity refresher, and the methods serve again once that is done: usually minutes, up to a few hours (Health is amber meanwhile; the start is never held). Every replica needs the same key: one started without it is locked and keeps recording, and a replica starting meanwhile waits to serve until none is locked. Catching up holds the recorded rows in memory, about 100 MB per week the key was missing; after a long lock, give the process room or empty `sysacct_pending` first (deletions seen meanwhile then reach lists only through later events).
 
-A key that is not 64 hex characters still stops the start (exit 78), as for any malformed setting. There is no rotation in this version. To start over, stop `app` and run, in the database:
+A key that is not 64 hex characters stops the start (exit 78). There is no rotation. To start over, stop `app` and run:
 
 ```sql
 TRUNCATE sysacct_entries, sysacct_lists, sysacct_used_tokens, sysacct_key, sysacct_pending;

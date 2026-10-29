@@ -80,7 +80,7 @@ Both are GET queries, served in every public-indexing mode, with CORS like every
 
 ### Fronters on posts
 
-A post record may carry a top-level `app.nearhorizon.plural.fronters` key: `{members: [{id, status?}]}`, 1 to 20 entries, each `id` a member record key. Every post view Horizon-Prism builds keeps the key as written, for public posts and for private posts alike (on private posts it is stored in the clear beside the encoded payload; an invalid value is dropped and the post still ingests). `getMembership.features` lists `plural.fronters`.
+A post record may carry a top-level `app.nearhorizon.plural.fronters` key: `{members: [{id, status?}]}`, 1 to 20 entries, each `id` a member record key. Every post view Horizon-Prism builds keeps the key as written, for public and [kryphocron](kryphocron.md) posts alike (on kryphocron posts it is stored in the clear; an invalid value is dropped and the post still ingests). `getMembership.features` lists `plural.fronters`.
 
 ## Guarantees
 
@@ -97,4 +97,4 @@ A post record may carry a top-level `app.nearhorizon.plural.fronters` key: `{mem
 - How fast an account answers shows that someone asked about it before. It does not show who.
 - Labels from outside labelers on member records are not served.
 
-See [configuration](../configuration.md) for `[plural]` and `[rate_limits]`, and [private posts](private-posts.md) for the private-post read path.
+See [configuration](../configuration.md) for `[plural]` and `[rate_limits]`, and [kryphocron](kryphocron.md) for kryphocron reads.

@@ -72,12 +72,12 @@ Any other well-formed NSID Horizon-Prism does not know answers `501 MethodNotImp
 | `feed` | `getAuthorPolls` | Public |
 | `constellation` | `resolveDid` | Public |
 
-- **private**: the private tier. A private post is a public post under another record type; its content is encoded, which is friction, not encryption. See [private-posts](design/private-posts.md).
-- **threadLens**: whole-thread views that bridge across AppViews and blocks. See [thread-lens](design/thread-lens.md). A post node with `embedWhole: true` has a quote card that is what the caller's own AppView would show, except for the caller's mutes, which the client applies to the quoted author: it came from an upstream AppView's answer for this request, the quoted author has no block with the caller as far as Farsight can tell, and every labeler in `atproto-accept-labelers` was applied by every upstream answer. A labeler the upstream does not recognise counts as not applied, and without Farsight nothing is marked. Without the flag, re-read the post as before.
-- **refract**: views of restored accounts that a listed community still hosts. Optional; with it off every method answers `400 NotEnabled`. `getCommunities` lists the enabled communities and their PDS host patterns, lowercased (`{"communities": [{"name", "pdsPatterns"}]}`, `Cache-Control: max-age=3600`): an author whose PDS host matches none is never restored, so skip `fill` for it. See [refract](design/refract.md).
+- **private**: [kryphocron](https://github.com/skydeval/kryphocron) posts. See [kryphocron](design/kryphocron.md).
+- **threadLens**: whole-thread views that bridge across AppViews and blocks. See [thread-lens](design/thread-lens.md). A post node with `embedWhole: true` has a quote card the caller's own AppView would show (apply mutes client-side); without it, re-read the post. Needs Farsight.
+- **refract**: optional; off, every method answers `400 NotEnabled`. Skip `fill` for an author whose PDS host matches none of `getCommunities`' patterns. See [refract](design/refract.md).
 - **plural**: pronouns and plural-system records. Optional; with `plural.enabled` off both methods answer 501. See [pronouns-and-plural](design/pronouns-and-plural.md).
-- **account**: system accounts, a private list of the other accounts of the caller's plural system, kept like mutes and readable only by the caller. Adding an account takes a proof minted by that account's own server (`lxm` `app.nearhorizon.account.confirmSystemAccount`, a name no route serves). The three writes and the proof take fresh tokens: each lives at most 65 s and is accepted once. A listed account can ask whether any list holds it (yes or no) and leave every list. Every write returns the list's `rev`, which only grows. Optional; off, every method answers 501. While the operator's key is missing or wrong, and for a while after it is back, every method answers 501 with "lists are kept": keep what you hold and try later. See [system-accounts](design/system-accounts.md).
-- **index.requestRecord**: ask Horizon-Prism to index a record the caller just wrote, in case no relay delivered it. Horizon-Prism fetches the record from the caller's PDS itself. The URI's repo must be the caller. It answers `status` (`indexed`, `deleted`, `out_of_scope`, `unchanged`) and `caughtUp`.
+- **account**: system accounts, a list of the other accounts of the caller's plural system, readable only by the caller. Adding one takes a proof from that account's server (`lxm` `app.nearhorizon.account.confirmSystemAccount`). Writes and proofs need fresh tokens (at most 65 s, used once). Off, or while the operator's key is unavailable, methods answer 501. See [system-accounts](design/system-accounts.md).
+- **index.requestRecord**: index a record the caller just wrote, fetched from the caller's PDS. Answers `status` (`indexed`, `deleted`, `out_of_scope`, `unchanged`) and `caughtUp`.
 - **constellation.resolveDid**: a routing hint for a DID: its PDS, handle, home network and home AppView.
 
 ## Feature discovery
@@ -93,37 +93,37 @@ The call also enrolls an eligible caller, as loading the timeline does.
 
 | Feature | Meaning |
 |---|---|
-| `private` | The private read methods |
-| `private.embeds` | Facets, embeds, langs, labels and audience on private post views |
-| `private.bookmarks` | Private bookmark methods and `viewer.bookmarked` |
-| `private.gates` | Threadgates and postgates on private posts |
-| `private.interactions` | Counts, viewer state, likes, reposts, quotes and thread mutes on private posts |
-| `private.notifications` | Private `listNotifications`, `getUnreadCount`, `updateSeen` |
-| `private.freshIndex` | `requestRecord` answers `caughtUp`; with `true`, the caller's private posts read at once |
+| `private` | The kryphocron read methods |
+| `private.embeds` | Facets, embeds, langs, labels and audience on post views |
+| `private.bookmarks` | Bookmark methods and `viewer.bookmarked` |
+| `private.gates` | Threadgates and postgates on kryphocron posts |
+| `private.interactions` | Counts, viewer state, likes, reposts, quotes and thread mutes on kryphocron posts |
+| `private.notifications` | `listNotifications`, `getUnreadCount`, `updateSeen` |
+| `private.freshIndex` | `requestRecord` answers `caughtUp`; with `true`, the caller's posts read at once |
 | `private.paging` | Sealed cursors that page past unreadable posts; `filter` on `getAuthorFeed`; `getReplies` |
 | `private.crossPdsReplies` | Replies under another account's audience, anchored in the thread, from any PDS |
 | `private.following` | The `following` audience mode |
-| `private.search` | Private `searchPosts` |
+| `private.search` | `searchPosts` |
 | `private.threadAudience` | A reply is read by its thread root's (or branch root's) audience |
 | `private.mediaFilters` | `posts_with_media` and `posts_with_video` on `getAuthorFeed` |
-| `private.notificationPreferences` | Private notification preferences, honoured by notifications and unread counts |
+| `private.notificationPreferences` | Notification preferences, honoured by notifications and unread counts |
 | `private.unreadReasons` | `getUnreadCount` takes `reasons` |
 | `private.replyContext` | Timeline and author-feed replies carry `reply` (root and parent) |
 | `private.notificationSubjects` | Notifications carry `reasonSubjectPost` |
 | `private.notServed` | The author's own views say when a post would be served to no reader, and why |
-| `private.degraded` | Degraded signals on private reads (see below) |
+| `private.degraded` | Degraded signals on reads (see below) |
 | `private.reindexing` | `503 Reindexing` and status `reindexing` for an interrupted member |
-| `private.listBlocks` | Moderation-list blocks count as blocks in private reads |
-| `private.activitySubscriptions` | Private activity subscriptions and `subscribed-post` notifications |
-| `private.publicRootGates` | A public root's threadgate hides the private replies it lists |
+| `private.listBlocks` | Moderation-list blocks count as blocks |
+| `private.activitySubscriptions` | Activity subscriptions and `subscribed-post` notifications |
+| `private.publicRootGates` | A public root's threadgate hides the kryphocron replies it lists |
 | `private.appearance` | `getAppearance` and `putAppearance` |
 | `private.appearanceRetention` | A removed member's appearance kept 7 days; `releaseAppearance` |
-| `private.anyPds` | Private posts from any PDS are served; a post without encoded content is served to no one, so encode in the client |
+| `private.anyPds` | Posts from any PDS are served; unencoded posts are served to no one |
 | `threadLens` | Thread Lens methods are served |
 | `threadLens.signedIn` | Thread Lens serves any signed-in account, not only members |
 | `threadLens.hydrated` | Thread Lens views carry `servedAs`, viewer state, counts and `replyDisabled` |
 | `threadLens.labelers` | Thread Lens honours `atproto-accept-labelers` |
-| `threadLens.handleAnchor` | `getThread` takes `at://<handle>/app.bsky.feed.post/<rkey>` (any case), resolves the handle as `resolveHandle` does and answers the DID-form `anchor`. Errors: `HandleNotFound` (400), `UpstreamFailure` (502), 429. Without Lodestar, a handle prism has not stored is resolved by DNS and HTTPS probes, up to about 3 s of the request |
+| `threadLens.handleAnchor` | `getThread` takes a handle-form anchor and answers the DID-form `anchor`. Errors: `HandleNotFound` (400), `UpstreamFailure` (502) |
 | `refract` | Refract methods are on |
 | `refract.search` | `refract.searchActors` and `refract.searchActorsTypeahead` are served (listed with `refract`) |
 | `plural.fronters` | Post records in views keep the plural fronters key |
@@ -149,7 +149,7 @@ Horizon-Prism publishes its DID document at `/.well-known/did.json`, with the `#
 | Member, ready or not | Mute management; `putAppearance` (`getAppearance` and `releaseAppearance` also serve a removed member's own retained row) |
 | Ready member | Other signed-in stock methods; `private.*` reads and writes; `threadLens.*` when limited to members |
 
-`GET /xrpc/_health` answers anyone with `ok` and `version`. A caller with a valid service token for `lxm` `_health` gets the detail as well.
+`GET /xrpc/_health` answers anyone with `ok` and `version`. An operator with a service token for `lxm` `_health` also gets the detail.
 
 ## Errors to handle
 
@@ -159,8 +159,8 @@ Horizon-Prism publishes its DID document at `/.well-known/did.json`, with the `#
 | `400 NotEnrolled` | Caller is not a member | Call `getMembership` again |
 | `400 NotReady` + `Retry-After` | Member's initial indexing is running | Retry after the hint |
 | `503 Reindexing` | Member is being re-indexed after an interruption; `retryAfter` in body and header | Keep the member a member; retry |
-| `503 Unavailable` | A private thread cannot be served yet; `retryAfter` in body | Retry |
-| `degraded`, `retryAfter`, `unavailable` fields | Private reads are behind; the page may be incomplete. `unavailable` names the caller's own posts not yet served | Show what came back; retry later |
+| `503 Unavailable` | A kryphocron thread cannot be served yet; `retryAfter` in body | Retry |
+| `degraded`, `retryAfter`, `unavailable` fields | Kryphocron reads are behind; the page may be incomplete. `unavailable` names the caller's own posts not yet served | Show what came back; retry later |
 | `501 NotImplemented` | Not served here (deferred, or public indexing off) | Use another AppView, or hide the feature |
 | `501 MethodNotImplemented` | Unknown method, or an optional family is off | Hide the feature |
 | `400 NotEnabled` | Refract is off | Hide Refract |
