@@ -1,5 +1,4 @@
-//! Membership not tied to hosting, S1 (docs/internal/design/membership.md
-//! §13): the owner rule (T-M4), removal (T-M5), migration 0031 (T-M6) and
+//! Membership not tied to hosting, S1: the owner rule (T-M4), removal (T-M5), migration 0031 (T-M6) and
 //! PB-M2's pre-release count. Built on the S10 harness, whose items this
 //! module sees: [`H`], and jobs from [`Pds`].
 
@@ -174,7 +173,7 @@ WHERE NOT EXISTS (SELECT 1 FROM members m WHERE m.did = e.did)
        OR EXISTS (SELECT 1 FROM private_audiences x WHERE x.owner_did = e.did))
 ORDER BY e.did";
 
-/// Prints PB-M2's queries for skydeval to run read-only on the deployed
+/// Prints PB-M2's queries for the operator to run read-only on the deployed
 /// database before S1 (migration 0031) deploys:
 /// `cargo test pre_s1_membership_count_query -- --ignored --nocapture`.
 #[test]

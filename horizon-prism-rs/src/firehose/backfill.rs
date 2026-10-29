@@ -328,9 +328,8 @@ const fn authorization(nsid: &'static str) -> CollectionPlan {
 
 /// The two authorization collections (§6.11.3), in listing order. Also
 /// what `requestRecord`'s catch-up lists (private posting §3.8). Private
-/// blocks are no longer one: they were removed (skydeval, 2026-10-24). Nor
-/// are audiences: this AppView holds them and lists no repository copy
-/// (private-audiences design §4.2).
+/// blocks are no longer one: they were removed. Nor are audiences: this
+/// AppView holds them and lists no repository copy.
 pub const AUTHORIZATION_NSIDS: [&str; 2] = [NSID_BLOCK, NSID_POST_PRIVATE];
 
 const AUTHORIZATION: [CollectionPlan; 2] = [authorization(AUTHORIZATION_NSIDS[0]), authorization(AUTHORIZATION_NSIDS[1])];

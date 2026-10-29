@@ -61,7 +61,7 @@ pub const FEATURE_THREAD_LENS_SIGNED_IN: &str = "threadLens.signedIn";
 /// where its own rows decide it. Labels are this AppView's own.
 pub const FEATURE_THREAD_LENS_HYDRATED: &str = "threadLens.hydrated";
 /// Thread Lens honours the request's `atproto-accept-labelers`
-/// (threadlens-hydration design §3.6 (b), skydeval 2026-10-24): post views
+/// (#887): post views
 /// carry the labels the named labelers applied beside this AppView's own,
 /// and the response names the applied ones in `atproto-content-labelers`.
 pub const FEATURE_THREAD_LENS_LABELERS: &str = "threadLens.labelers";

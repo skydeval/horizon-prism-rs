@@ -15,8 +15,7 @@
 //!     pool.
 //!
 //!   Responses are for the caller: [`gate`] returns who is asking.
-//! - **The reader's labelers** (threadlens-hydration design §3.6 (b),
-//!   skydeval 2026-10-24): a request's `atproto-accept-labelers`, its valid
+//! - **The reader's labelers:** a request's `atproto-accept-labelers`, its valid
 //!   entries only, goes with the upstream `getPostThread` and `getPosts`
 //!   calls the response makes; the labels those labelers applied are kept
 //!   on its views, and `atproto-content-labelers` names the ones applied.

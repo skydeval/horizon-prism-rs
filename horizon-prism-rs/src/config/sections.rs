@@ -368,8 +368,7 @@ pub struct PrivateReadFloors {
 
 impl Default for PrivateReadFloors {
     /// Every floor 0: off (timing-floors design). A private post is a public
-    /// post under another NSID and its existence is not secret (skydeval,
-    /// 2026-10-15), so a private read answers as soon as it is ready. An
+    /// post under another NSID and its existence is not secret, so a private read answers as soon as it is ready. An
     /// operator who wants floors sets every key.
     fn default() -> Self {
         Self {
@@ -704,8 +703,8 @@ impl Default for AdminConfig {
         Self {
             command_timeout_secs: 600,
             web_ui: true,
-            // 30 days unused, a year in all (skydeval 2026-10-25: an
-            // operator stays signed in for days, as on Bluesky).
+            // 30 days unused, a year in all: an operator stays signed in for
+            // days, as on Bluesky.
             session_idle_secs: 2_592_000,
             session_max_secs: 31_536_000,
             live_feed_snippets: true,

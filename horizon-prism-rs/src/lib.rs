@@ -9,8 +9,7 @@
 // hooks, to set its decode bound (private-embeds design S3).
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
-// The stand-in exception is test-only (docs/internal/design/
-// standin-guard-exception.md §3.1): it never builds without debug assertions.
+// The stand-in exception is test-only: it never builds without debug assertions.
 #[cfg(all(feature = "standin-hosts", not(debug_assertions)))]
 compile_error!("standin-hosts is test-only: build it with --profile standin, never --release");
 
@@ -46,7 +45,5 @@ pub mod thread_outline;
 pub mod threadlens;
 pub mod xrpc;
 
-#[cfg(test)]
-mod name_guard;
 #[cfg(test)]
 pub(crate) mod test_support;

@@ -1,4 +1,4 @@
-//! Refract (refract design, `docs/internal/refract/refract.md`): accounts
+//! Refract: accounts
 //! Bluesky's AppView withholds stay usable while a community the operator
 //! lists still hosts them and has not banned them.
 //!

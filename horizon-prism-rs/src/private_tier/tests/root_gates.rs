@@ -1,4 +1,4 @@
-//! Public root gates (docs/internal/design/public-root-gates.md §10): a
+//! Public root gates: a
 //! public thread root's threadgate is kept while a private post claims the
 //! root (T-2), fetched once when it may have been missed (T-3), and its
 //! `hiddenReplies` hide private replies in `getPostThread` and `getReplies`

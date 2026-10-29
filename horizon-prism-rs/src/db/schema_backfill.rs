@@ -66,19 +66,17 @@ pub const INDEXES: [(&str, &str); 13] = [
     ("likes_via", "CREATE INDEX CONCURRENTLY IF NOT EXISTS likes_via ON likes (via_uri) WHERE via_uri IS NOT NULL"),
     ("reposts_via", "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_via ON reposts (via_uri) WHERE via_uri IS NOT NULL"),
     // The pair lookups of the private tier's audience rules and candidate
-    // filter (docs/internal/design/private-audience-modes.md §6).
+    // filter.
     ("follows_pair", "CREATE INDEX CONCURRENTLY IF NOT EXISTS follows_pair ON follows (author_did, subject_did)"),
     ("blocks_pair", "CREATE INDEX CONCURRENTLY IF NOT EXISTS blocks_pair ON blocks (author_did, subject_did)"),
-    // The repost items of the private timeline and author feed
-    // (docs/internal/design/private-posting.md §3.1, §4.7).
+    // The repost items of the private timeline and author feed.
     (
         "reposts_private_subject",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_private_subject ON reposts (author_did, created_at DESC) \
          WHERE subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%'",
     ),
     // Reposts by the subject's author: Refract's purge and spares of
-    // reposts of restored posts, and `getTimeline`'s repost arm
-    // (docs/internal/refract/refract-reposts-v1.md §6).
+    // reposts of restored posts, and `getTimeline`'s repost arm.
     (
         "reposts_subject_did",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_subject_did ON reposts (split_part(subject_uri, '/', 3), created_at DESC)",

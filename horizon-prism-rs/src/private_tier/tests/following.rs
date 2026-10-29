@@ -1,5 +1,4 @@
-//! S10, the `following` audience mode (docs/internal/design/following-audience.md
-//! §11): rule 7 and condition 2 (T-35), the follow-verification flag's
+//! S10, the `following` audience mode: rule 7 and condition 2 (T-35), the follow-verification flag's
 //! lifecycle (T-36), the follows pass (T-41), catch-up (T-42), the writer's
 //! side (T-43), one snapshot (T-44), the pre-release count (T-45) and the
 //! isolation names (T-40). T-37's cases and T-23's pair 3 live with their
@@ -2759,8 +2758,8 @@ async fn t44_the_following_facts_are_one_statement() {
 
 // ---- T-45: the pre-release count ----
 
-/// Prints the pre-S10 count query (following-audience design §10) for
-/// skydeval to run read-only before migration 0028:
+/// Prints the pre-S10 count query for
+/// the operator to run read-only before migration 0028:
 /// `cargo test pre_s10_count_query -- --ignored --nocapture`.
 #[test]
 #[ignore = "prints the pre-S10 count query; run with --ignored --nocapture"]

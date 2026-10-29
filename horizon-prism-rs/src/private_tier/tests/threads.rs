@@ -1,5 +1,4 @@
-//! S12, private threads and branches (docs/internal/design/private-threads.md
-//! §6): who reads a reply (T-46, T-47), anchor validity (T-48), branches
+//! S12, private threads and branches: who reads a reply (T-46, T-47), anchor validity (T-48), branches
 //! (T-49), the cap (T-50), C-19 (T-51), the view's `audience` (T-53),
 //! self-service failures (T-58) and the self arm's gate (T-59). The one
 //! builder (T-52) and the pre-release count (T-55) are in `builder.rs`, the
@@ -114,8 +113,7 @@ impl Walk {
 /// under Bob. Alice moves T to L = {Carol, Dave}.
 /// - Carol and Dave read T, Carol's reply, Dave's reply and Q; Bob's reply
 ///   and the reply under it are hidden; Bob reads his own.
-/// - Self-read survives the owner's block either way (skydeval,
-///   2026-10-16): Bob reads his reply through `getPosts`, the
+/// - Self-read survives the owner's block either way: Bob reads his reply through `getPosts`, the
 ///   `getPostThread` anchor, his author feed and his bookmarks, while no
 ///   one else reads it; only `!takedown` or `!hide` on it, or `!takedown`
 ///   on Bob, hides it from him (T-59).

@@ -1,5 +1,4 @@
-//! #723, replay below a settle (docs/internal/design/replay-readiness.md
-//! §11): the listed rev, the ingest refusal, the settle's coverage and
+//! #723, replay below a settle: the listed rev, the ingest refusal, the settle's coverage and
 //! catch-up's check, T-63 to T-82 (T-73 sits beside T-40). Built on the S10
 //! harness, whose items this module sees: the firehose's own commits through
 //! [`H::fire`], jobs and catch-ups from [`Pds`].
@@ -734,7 +733,7 @@ const PRE_0030_COUNT_SQL: &str = "SELECT \
   count(*) AS sync_state_rows \
 FROM sync_state";
 
-/// Prints the pre-release count for skydeval to run read-only on the
+/// Prints the pre-release count for the operator to run read-only on the
 /// deployed database before migration 0030:
 /// `cargo test pre_listed_revs_count_query -- --ignored --nocapture`.
 #[test]

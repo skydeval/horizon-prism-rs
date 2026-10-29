@@ -1,5 +1,4 @@
-//! The reader's labelers on Thread Lens reads (threadlens-hydration design
-//! §3.6 (b), skydeval's decision of 2026-10-24).
+//! The reader's labelers on Thread Lens reads.
 //!
 //! A `threadLens.getThread` or `.resolve` request may carry
 //! `atproto-accept-labelers`, as a stock read does. Thread Lens then runs

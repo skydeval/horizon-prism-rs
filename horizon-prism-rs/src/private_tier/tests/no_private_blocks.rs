@@ -1,4 +1,4 @@
-//! Private blocks are not indexed (skydeval, 2026-10-24): a public block
+//! Private blocks are not indexed: a public block
 //! already keeps the two accounts apart, so `tools.kryphocron.graph.block`
 //! is skipped like any unproduced private NSID. Only `app.bsky.graph.block`
 //! and members' list blocks count. Written through the real writer and

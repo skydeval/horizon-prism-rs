@@ -1,4 +1,4 @@
-//! S12's T-56 (docs/internal/design/private-threads.md §3.3, §3.4, §6): the
+//! S12's T-56: the
 //! read cap, the prefiltered parents, root and quotes, and the head round,
 //! with a head source that records its calls; and C2 (b), the thread
 //! expansion's read cap (shared-walk amendment 1 §2.3 (b)).

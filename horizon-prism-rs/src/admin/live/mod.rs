@@ -22,8 +22,7 @@ use crate::firehose::feed::{FeedTap, Totals};
 pub const PAGES_PER_SESSION: usize = 2;
 /// Open streams in all (§3.4); beyond, `429`. Never evicts.
 pub const MAX_STREAMS: usize = 8;
-/// Lines per second to one browser, per ticker (C-F4; Changed by skydeval
-/// 2026-10-19): the arriving and the indexed ticker each get this many, so
+/// Lines per second to one browser, per ticker: the arriving and the indexed ticker each get this many, so
 /// one viewer gets at most twice it. The page shows far fewer: it paces.
 pub const LINES_PER_SEC: u32 = 25;
 /// Slots of the JavaScript-off ring, one per [`RING_EVERY`] (§5.5).

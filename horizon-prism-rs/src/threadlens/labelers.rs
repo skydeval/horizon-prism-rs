@@ -1,5 +1,4 @@
-//! The reader's labelers on the posts Prism built itself
-//! (threadlens-hydration design §3.6 (b), skydeval 2026-10-24).
+//! The reader's labelers on the posts Prism built itself.
 //!
 //! A post whose view came from an upstream call made with the request's
 //! labelers already carries their labels (normalization kept them). A post

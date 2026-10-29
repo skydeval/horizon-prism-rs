@@ -1,4 +1,4 @@
-//! The thread outline index (docs/internal/design/thread-outline.md): a
+//! The thread outline index: a
 //! table of every public post the firehose delivers, with its author, record
 //! key, parent, root, time and rev, and a mark when deleted. No text.
 //!

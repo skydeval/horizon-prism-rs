@@ -1718,7 +1718,7 @@ mod tests {
         db.drop_db().await;
     }
 
-    /// Self-labels (skydeval 2026-10-26): a stored post's record self-labels
+    /// Self-labels: a stored post's record self-labels
     /// show in its view's `labels` (src its author), as on Bluesky's
     /// AppView, on the post and on a quote of it; a post without any has
     /// none.

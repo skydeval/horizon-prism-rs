@@ -398,7 +398,7 @@ async fn t_p8_disabled_is_501() {
     db.drop_db().await;
 }
 
-/// T-P8 (§3, skydeval 2026-10-24): signed out, the tight per-IP class
+/// T-P8: signed out, the tight per-IP class
 /// (`plural_anon`, burst 10) answers 429 with `Retry-After` past its burst;
 /// a token that does not verify is refused, not charged as anonymous.
 #[tokio::test]

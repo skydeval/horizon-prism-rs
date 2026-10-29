@@ -612,8 +612,7 @@ impl Work<'_> {
     /// or `blocking-you`), the first of: the link the baseline gave it; the
     /// link the baseline knows above its blocked stubs; the parent a local
     /// row names; the parent the blocked post's record names, read through
-    /// the record source (design-v4 §5.15.11, as amended by skydeval
-    /// 2026-10-24). Only that URI is read from the record: nothing else of
+    /// the record source. Only that URI is read from the record: nothing else of
     /// the blocked post is kept or sent.
     async fn parent_of_top(&self) -> Result<Option<String>, sqlx::Error> {
         let h = self.ladder.hydrator();

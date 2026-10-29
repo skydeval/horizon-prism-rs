@@ -16,7 +16,7 @@
 //! This module depends on nothing in the admin UI's module; the admin UI's hub
 //! (`src/admin/live/`) owns the stream side.
 //!
-//! The backlog (Changed by skydeval 2026-10-19, second pass): the newest
+//! The backlog: the newest
 //! [`BACKLOG_LINES`] lines of each ticker, in memory only, so a reload
 //! repaints both tickers. The "Indexed here" ring fills whether or not
 //! anyone watches (its lines come through the indexed lane's buckets, so the
@@ -411,7 +411,7 @@ impl LineAction {
     }
 }
 
-/// A line's lanes (Changed by skydeval 2026-10-19): Home shows two tickers,
+/// A line's lanes: Home shows two tickers,
 /// "On the firehose" (every arriving op, its outcome marked) and "Indexed
 /// here" (what this instance wrote). Each lane is sampled on its own
 /// budgets, so a flood of skipped ops never crowds out indexed ones.
@@ -739,7 +739,7 @@ impl FeedTap {
             if !active && !op.outcome.indexed() {
                 continue;
             }
-            // Every op is a line now (Changed by skydeval 2026-10-19): a
+            // Every op is a line now: a
             // skipped, rejected, unchanged or failed one too, marked by its
             // outcome and never with text.
             let action = match (op.outcome, op.action) {
@@ -929,7 +929,7 @@ mod tests {
         // Audiences are held here, not ingested (private-audiences design):
         // a repository copy is skipped.
         assert_eq!(Kind::from_class(classify(NSID_AUDIENCE, "3k")), Kind::Other);
-        // Private blocks are skipped, not indexed (skydeval, 2026-10-24).
+        // Private blocks are skipped, not indexed.
         assert_eq!(Kind::from_class(classify("tools.kryphocron.graph.block", "3k")), Kind::Other);
         // Table order matches the indexes, and slugs are distinct.
         for (i, k) in Kind::ALL.iter().enumerate() {
@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(b.arriving.last().map(|l| l.seq), Some(b.last));
     }
 
-    /// Arriving events (Changed by skydeval 2026-10-19): a skipped,
+    /// Arriving events: a skipped,
     /// unchanged or failed op is a line on the arriving lane alone, marked
     /// by its outcome and never with text; a written post is on both lanes,
     /// with its snippet.

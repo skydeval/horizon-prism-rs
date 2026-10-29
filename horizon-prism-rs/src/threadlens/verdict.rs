@@ -9,8 +9,8 @@
 //!
 //! **The switch.** Bridging is on for a request when Farsight is
 //! configured and answered every call of the request's first round, at any
-//! coverage level (skydeval 2026-10-25: only Farsight unreachable, refusing
-//! or overloaded switches it off). An author is `Clear` when Farsight's
+//! coverage level (only Farsight unreachable, refusing or overloaded
+//! switches it off). An author is `Clear` when Farsight's
 //! answer names no block and does not flag that pair. Otherwise nothing is
 //! added to the ordinary view on that request.
 //!
@@ -303,7 +303,7 @@ impl Judge {
             got.answers.extend(forced.answers);
         }
         // On whenever Farsight answered every call of the round, at any
-        // coverage level (skydeval 2026-10-25): only Farsight unreachable,
+        // coverage level: only Farsight unreachable,
         // refusing or overloaded switches it off. A flagged pair still
         // stays undetermined, author by author.
         self.bridging = self.lookup.is_some() && got.calls > 0 && !got.unanswered;
@@ -496,7 +496,7 @@ mod tests {
         assert_eq!(fake.asked.lock().expect("asked").last().expect("asked"), &[V.to_string()]);
 
         // Farsight answers at level partial (a firehose gap being repaired):
-        // bridging stays on (skydeval 2026-10-25); an unflagged author is
+        // bridging stays on; an unflagged author is
         // Clear, and a block Farsight names still applies.
         *fake.level.lock().expect("level") = "partial";
         let fresh = "did:plc:ffffffffffffffffffffffff";

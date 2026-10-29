@@ -21,7 +21,7 @@ pub const NSID_MAX: usize = 317;
 pub const DID_MAX: usize = 256;
 /// The key of a relay whose URL is not a configured one.
 pub const OTHER: &str = crate::config::OTHER_RELAY_LABEL;
-/// The prefix whose commits are hidden from the lines (skydeval's choice);
+/// The prefix whose commits are hidden from the lines;
 /// they still count in the arrivals.
 pub const HIDDEN_PREFIX: &str = "tools.kryphocron.";
 

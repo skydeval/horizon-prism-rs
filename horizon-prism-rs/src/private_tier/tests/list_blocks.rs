@@ -1,5 +1,4 @@
-//! Members' list blocks in the private read rule (docs/internal/design/
-//! private-blocks.md §10): T-PB1 to T-PB9. A list block that applies
+//! Members' list blocks in the private read rule: T-PB1 to T-PB9. A list block that applies
 //! counts wherever the rule tests a block, both ways; one that does not
 //! apply changes nothing.
 

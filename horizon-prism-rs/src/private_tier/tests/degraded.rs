@@ -1,4 +1,4 @@
-//! Degraded mode (docs/internal/design/degraded-mode.md §10): the head
+//! Degraded mode: the head
 //! fallback's never-miss cases (T-DM3, T-DM3b), the climb (T-DM4), bind
 //! freshness (T-DM5), the fresh watermark unchanged (T-DM13), threads while
 //! degraded (T-DM14) and the author's own read (T-DM16). "Degraded" is a

@@ -3,8 +3,8 @@
 //! synchronous `BlockOracle`, `AudienceOracle` and `MuteOracle` calls from
 //! memory.
 //!
-//! `AudienceOracle::audience_state` is the read rule of
-//! docs/internal/design/private-threads.md §2.2 (first matching rule wins).
+//! `AudienceOracle::audience_state` is the read rule (first matching rule
+//! wins).
 //! A thread reply is read by the readers of its root's **current** audience
 //! G, and a reply in a private branch under a public post by those of its
 //! branch root's; O is G's owner, the root's (or branch root's) author:
@@ -37,9 +37,8 @@
 //! restate rules 7 and 8 over G. "Stands" is the PDS's write rule for the
 //! mode: `list` or none, listed in `members`; `followers`, a stored follow
 //! of O; `everyone`, always; `following`, O's stored follow with O's flag.
-//! These are Aurora-Locus's write rules applied on reads, checked live: Prism is
-//! stricter than Aurora-Locus, which checks a writer once at write and
-//! trusts the reply's own audience on a direct read.
+//! These are the write rules applied on reads, checked live, so a reply is
+//! never trusted on a write-time check or its own audience alone.
 
 use std::time::{Duration, SystemTime};
 

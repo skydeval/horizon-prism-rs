@@ -1,4 +1,4 @@
-//! `notServed` (docs/internal/design/not-served-reason.md §11): the
+//! `notServed`: the
 //! statement against the read rule (T-N1), the cap probe (T-N5), standing
 //! (T-N7) and the statement's own checks (T-N12); on the wire, per-reader
 //! exclusions never mark (T-N2), never for others (T-N3), `overClaim`

@@ -8,8 +8,7 @@
 //! 2. **Labels.** Upstream `labels` arrays are removed at every depth; local
 //!    labels (§7.8) are applied instead. A Thread Lens request that names
 //!    its labelers keeps the upstream labels those labelers applied, beside
-//!    the local ones and without repeats (threadlens-hydration design §3.6
-//!    (b), skydeval 2026-10-24); content stripping (1) reads the labels as
+//!    the local ones and without repeats; content stripping (1) reads the labels as
 //!    the upstream sent them, as before.
 //! 3. **Viewer state.** `viewer` objects are replaced with locally computed
 //!    state (§7.5); with an anonymous viewer, `viewer` is `{}`.
@@ -500,7 +499,7 @@ mod tests {
         normalize_upstream(&mut thread, &Overlay::default());
         // The record self-label blocks stay (record data), and each post's
         // labels hold its author's self-label only: every third-party
-        // upstream label is gone (self-labels: skydeval 2026-10-26).
+        // upstream label is gone.
         let after = count_key(&thread, "labels");
         assert_eq!(after, 6, "{thread:#}");
         assert_eq!(thread["thread"]["post"]["record"]["labels"]["values"][0]["val"], "nudity");
@@ -587,7 +586,7 @@ mod tests {
         assert_eq!(cts(&no_date, None), json!(EPOCH_CTS));
     }
 
-    /// Self-labels on cards (skydeval 2026-10-26): a feed, list, labeler or
+    /// Self-labels on cards: a feed, list, labeler or
     /// starter-pack view keeps the labels its creator set on it (`src` the
     /// creator) and loses every other upstream label, top level and quoted.
     #[test]

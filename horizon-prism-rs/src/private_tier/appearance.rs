@@ -20,8 +20,7 @@ pub(super) const VALUE_MAX: usize = 16_384;
 /// The three choices, as stored.
 const STORES: [&str; 3] = ["private", "public", "device"];
 
-/// How long a removed member's row is kept (amendment 1 §4), as SQL:
-/// 7 days (skydeval, 2026-10-24).
+/// How long a removed member's row is kept, as SQL: 7 days.
 pub(super) const RETAIN_FOR: &str = "interval '7 days'";
 /// `appearance_retention_total{event}`: `retained` (the removal marker set
 /// the retention), `backstop` (a purge batch did, for a marker committed

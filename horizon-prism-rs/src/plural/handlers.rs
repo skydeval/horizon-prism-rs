@@ -1,8 +1,7 @@
 //! `app.nearhorizon.plural.getRecords` and `listMembers` (plural-pronouns
 //! design §2.8): queries, no sign-in needed. Signed out they are charged by
 //! IP to the tight `plural_anon` class; with a service token that verifies,
-//! by DID to `plural_auth` (skydeval, 2026-10-24: signed-out re-asks a lot
-//! less frequent). Every 429 carries `Retry-After`. Kept in every
+//! by DID to `plural_auth` (signed-out re-asks a lot less frequent). Every 429 carries `Retry-After`. Kept in every
 //! public-indexing mode, CORS as every route. With `plural.enabled` off
 //! both answer 501 `MethodNotImplemented` from their own routes.
 

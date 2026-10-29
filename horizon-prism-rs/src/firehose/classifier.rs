@@ -73,8 +73,7 @@ pub enum EcosystemKind {
 }
 
 /// Kryphocron records Prism indexes (§5.4 table). Private blocks
-/// (`tools.kryphocron.graph.block`) are not among them since skydeval's
-/// decision of 2026-10-24: a public block already keeps the two accounts
+/// (`tools.kryphocron.graph.block`) are not among them: a public block already keeps the two accounts
 /// apart, so the NSID is skipped like any unproduced one. Nor are audiences
 /// (`tools.kryphocron.policy.audience`): this AppView holds them, written
 /// through its own methods (private-audiences design §4.1), so a repository
@@ -262,9 +261,9 @@ mod tests {
             "tools.kryphocron.feed.repost",
             "tools.kryphocron.feed.threadgate",
             "tools.kryphocron.graph.mute",
-            // Private blocks, no longer indexed (skydeval, 2026-10-24).
+            // Private blocks, no longer indexed.
             "tools.kryphocron.graph.block",
-            // Audiences, held by this AppView (private-audiences design).
+            // Audiences, held by this AppView.
             NSID_AUDIENCE,
         ] {
             let c = classify(nsid, "3k");

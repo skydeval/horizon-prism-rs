@@ -1,4 +1,4 @@
-//! The shared walk (docs/internal/design/shared-walk.md, #720): T-60, the
+//! The shared walk (#720): T-60, the
 //! statement equals the per-key walk it replaced on seeded random fixtures;
 //! T-61, the climb's bound; T-62, immunity to the planner's estimate of
 //! `c`; T-63, slices in one snapshot.

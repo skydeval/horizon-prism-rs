@@ -1,5 +1,4 @@
-//! The Phase B stand-in exception to the outbound guard
-//! (docs/internal/design/standin-guard-exception.md). Test-only: this
+//! The Phase B stand-in exception to the outbound guard. Test-only: this
 //! module exists only under the `standin-hosts` feature, which does not
 //! compile without debug assertions (`lib.rs`).
 //!

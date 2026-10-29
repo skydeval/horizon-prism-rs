@@ -1,5 +1,4 @@
-//! Pronouns and plural systems (plural-pronouns design,
-//! `docs/internal/design/plural-pronouns.md`): the public read of the four
+//! Pronouns and plural systems: the public read of the four
 //! collections for any DID, without sign-in, so a reader's browser never
 //! asks an author's server.
 //!

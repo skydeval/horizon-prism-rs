@@ -1,5 +1,4 @@
-//! System accounts (system-accounts design, `docs/internal/design/
-//! system-accounts.md`): a private, per-account list of the other accounts
+//! System accounts: a private, per-account list of the other accounts
 //! of a plural system, kept by this AppView the way an AppView keeps mutes.
 //! Never a repo record, never in any view, open to every signed-in account.
 //!

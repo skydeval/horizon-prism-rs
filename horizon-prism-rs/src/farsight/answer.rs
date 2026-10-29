@@ -66,9 +66,9 @@ pub struct PairAnswer {
     /// flag this pair. Only then does a clean answer mean "no block".
     pub vouched: bool,
     /// Farsight answered and did not flag this pair, at any coverage level.
-    /// Thread Lens bridges on it (skydeval 2026-10-25: a response-level
-    /// `partial`, such as a short firehose gap being repaired, must not
-    /// switch bridging off for every thread). It never removes a block:
+    /// Thread Lens bridges on it (a response-level `partial`, such as a
+    /// short firehose gap being repaired, must not switch bridging off for
+    /// every thread). It never removes a block:
     /// only `vouched` does.
     #[serde(default)]
     pub unflagged: bool,

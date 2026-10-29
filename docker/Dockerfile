@@ -45,8 +45,7 @@ RUN set -e; \
     leaks="$(grep -v '^src/system_accounts/' /tmp/sysacct_refs || true)"; \
     if [ -n "$leaks" ]; then echo "system-accounts table referenced outside src/system_accounts/:"; echo "$leaks"; exit 1; fi
 
-# A deploy image never carries the stand-in exception
-# (docs/internal/design/standin-guard-exception.md): no cargo config or
+# A deploy image never carries the stand-in exception: no cargo config or
 # flags that could turn debug assertions on in a release build.
 ENV RUSTFLAGS="" CARGO_ENCODED_RUSTFLAGS="" CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=false
 RUN test ! -e .cargo/config.toml && test ! -e .cargo/config

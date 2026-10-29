@@ -10,7 +10,7 @@
   var notice = document.getElementById('live-notstarted');
   if (notice) notice.hidden = true;
 
-  // The two tickers (Changed by skydeval 2026-10-19): "On the firehose"
+  // The two tickers: "On the firehose"
   // and "Indexed here", each a fixed-height box that shows one new line
   // every PACE_MS at the top and drops lines off the bottom.
   var PACE_MS = 200;    // one line per ticker this often: the one knob for pace

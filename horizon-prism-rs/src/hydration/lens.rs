@@ -611,8 +611,7 @@ impl Hydrator {
         Ok(rows.into_iter().collect())
     }
 
-    /// The parent a known-block gap's record names (design-v4 §5.15.11, as
-    /// amended by skydeval 2026-10-24): the record is read through the
+    /// The parent a known-block gap's record names: the record is read through the
     /// record source and only its `reply.parent.uri` is kept. Nothing else
     /// of it is returned, cached as a view, or emitted. `None` for a private
     /// or hidden URI, a record that is not a reply, or no answer.

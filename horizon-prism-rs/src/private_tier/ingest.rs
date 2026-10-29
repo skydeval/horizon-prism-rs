@@ -4,7 +4,7 @@
 //! helpers. Audiences are not ingested: this AppView holds them
 //! (`audiences`, private-audiences design).
 //!
-//! **Defensive parsing (#235).** Aurora-Locus does not validate
+//! **Defensive parsing (#235).** A PDS may not validate
 //! `tools.kryphocron.*` records on write, so every field is read defensively:
 //! absent optional fields are tolerated (the read path's
 //! `validate_record_for_read` rejects structurally invalid records behind the

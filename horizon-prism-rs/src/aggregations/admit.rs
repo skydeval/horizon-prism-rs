@@ -36,7 +36,7 @@ impl RecordKind {
     }
 
     /// Block records (§9.3 rule 3): `app.bsky.graph.block` only, since
-    /// private blocks were removed (skydeval, 2026-10-24).
+    /// private blocks were removed.
     #[must_use]
     pub fn is_block(self) -> bool {
         matches!(self, Self::Block)

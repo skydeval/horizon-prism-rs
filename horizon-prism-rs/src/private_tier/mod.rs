@@ -173,7 +173,7 @@ pub struct Applied {
 pub enum IngestError {
     #[error(transparent)]
     Db(#[from] sqlx::Error),
-    /// A field Aurora-Locus did not validate on write is malformed (#235).
+    /// A field the PDS did not validate on write is malformed (#235).
     /// Deterministic: the op is dead-lettered by the firehose discipline.
     #[error("malformed private record: {0}")]
     Malformed(String),

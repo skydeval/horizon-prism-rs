@@ -1,5 +1,4 @@
-//! B-5, S12's release gate (docs/internal/design/private-threads.md §4,
-//! C-T14 (a)), and T-54. Every test here is ignored: each builds the
+//! B-5, S12's release gate, and T-54. Every test here is ignored: each builds the
 //! synthetic snapshot (50 000 private posts, 5 000 members, 2 000
 //! audiences) and its fixtures in a fresh database, and prints what it
 //! measures. Run on the reference host with a release build:

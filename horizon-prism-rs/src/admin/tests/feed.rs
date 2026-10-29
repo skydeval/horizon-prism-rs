@@ -411,7 +411,7 @@ async fn t_f8_lines() {
     let reference = by(NO_HANDLE, "reference only").expect("the reference");
     assert!(reference.get("text").is_none());
     // A rejected op is a line on the firehose ticker alone, marked by its
-    // reason, never with text (Changed by skydeval 2026-10-19); an unknown
+    // reason, never with text; an unknown
     // DID's identity event is still no line.
     let outside: Vec<&Value> = lines.iter().filter(|l| l["did"] == OUTSIDER).collect();
     assert_eq!(outside.len(), 1, "{lines:?}");
@@ -454,7 +454,7 @@ fn seq(l: &Value) -> u64 {
     l["n"].as_u64().expect("every line has a number")
 }
 
-/// T-F12 the backlog (Changed by skydeval 2026-10-19, second pass): a new
+/// T-F12 the backlog: a new
 /// stream starts with each ticker's newest lines. "Indexed here" fills with
 /// nobody watching, "On the firehose" only while someone does and keeps its
 /// lines after; the stream's filter applies; a line that was not indexed
@@ -629,7 +629,7 @@ async fn t_f11_script_not_started() {
     assert!(row < members && members < live, "{}", home.body);
     assert!(!home.body.contains("Recent changes"), "{}", home.body);
     assert!(JS.contains("'first via '"), "the relay reads as the first to deliver");
-    // Two fixed-height tickers (Changed by skydeval 2026-10-19), paced by
+    // Two fixed-height tickers, paced by
     // one constant, with a short queue and lines removed past the bottom.
     let arriving = home.body.find("On the firehose").expect("the firehose ticker");
     let indexed = home.body.find("Indexed here").expect("the indexed ticker");
@@ -673,8 +673,7 @@ fn stat_rows(body: &str) -> Vec<usize> {
     rates.split("<h3>").skip(1).map(|col| col.matches("<div class=\"fact").count()).collect()
 }
 
-/// Nothing on Home moves when events arrive (Changed by skydeval
-/// 2026-10-19, second pass), and the help is a real button over the card.
+/// Nothing on Home moves when events arrive, and the help is a real button over the card.
 #[tokio::test]
 async fn t_f13_a_stable_card_and_its_help() {
     let Some(h) = harness("admin_t_f13").await else {

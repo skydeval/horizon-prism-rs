@@ -1,4 +1,4 @@
-//! The public page (docs/internal/design/public-page.md): a read-only page
+//! The public page: a read-only page
 //! at `/` on Prism's own origin, the same for every visitor. It says what
 //! this instance is, its status (the database, how many relays it receives
 //! from, the relays' input rate), and shows the relay events as they

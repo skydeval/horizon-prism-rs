@@ -23,7 +23,7 @@ mod plaintext;
 mod media;
 // Members' list blocks in the private read rule (private-blocks design).
 mod list_blocks;
-// Private blocks are not indexed (skydeval, 2026-10-24).
+// Private blocks are not indexed.
 mod no_private_blocks;
 // The author-only `notServed` marker (not-served-reason design).
 mod not_served;
@@ -299,7 +299,7 @@ impl Fixture {
         self.state_of_keyed(self.app.clone(), Some(Duration::from_secs(1)), FLOOR, cursor_key)
     }
 
-    /// Encode `text` with the real hooks, as Aurora-Locus would write it.
+    /// Encode `text` with the real hooks, as a PDS would write it.
     async fn encoded_post(&self, owner: &str, rkey: &str, text: &str, audience: Option<&str>) -> Value {
         self.encoded_bytes(owner, rkey, text.as_bytes(), audience).await
     }
@@ -756,7 +756,7 @@ async fn the_private_timeline_holds_readable_posts_of_followed_authors() {
     db.drop_db().await;
 }
 
-/// docs/internal/design/private-audience-modes.md §2, §5, §10: `followers`
+/// Audience modes: `followers`
 /// admits by the reader's own follow, `everyone` admits every ready
 /// member, and `nobody`, `following` and an unknown mode admit only the
 /// author; a block keeps a reader out; and under another account's
@@ -910,8 +910,7 @@ async fn blocks_in_either_direction_are_misses() {
     db.drop_db().await;
 }
 
-// Rule 4's anchored walk (docs/internal/design/private-posting.md §3.7,
-// §7.1 T-23, T-32, T-33, T-37 to T-39; slice S0, chainlink #718).
+// Rule 4's anchored walk (T-23, T-32, T-33, T-37 to T-39; #718).
 
 const DAVE_KEY: u8 = 6;
 /// A DID with no repository here: what a forged parent names (T-39).
@@ -1117,8 +1116,8 @@ async fn unanchored_cross_owner_posts(test: &str, layout: Layout) {
     // T-38: Bob's reply to that post, and the same reply in Alice's thread.
     let own_thread = w.f.private_post(BOB, "3kownreply22", &aud, Some((&top, &top))).await;
     let in_thread = w.reply(BOB, "3kinthread22", &root).await;
-    // T-39: a parent that names nothing (what aurora's participatePrivate
-    // accepts for a non-local parent), and Bob's reply to that post.
+    // T-39: a parent that names nothing (which a PDS may accept for a
+    // non-local parent), and Bob's reply to that post.
     let ghost = format!("at://{NOBODY}/{NSID_POST_PRIVATE}/x");
     let forged = w.f.private_post(BOB, "3kforged2222", &aud, Some((&ghost, &ghost))).await;
     let below = w.f.private_post(BOB, "3kbelow22222", &aud, Some((&ghost, &forged))).await;
@@ -1780,7 +1779,7 @@ fn every_shape_is_one_walked_statement() {
     assert!(schema::prefilter_uris_statement(100).contains("x.cur < 100 "));
 }
 
-/// Prints the pre-S0 count query (private-posting design §5) for skydeval
+/// Prints the pre-S0 count query for the operator
 /// to run read-only in `psql` against the deployed database:
 /// `cargo test pre_s0_count_query -- --ignored --nocapture`.
 #[test]
@@ -1819,8 +1818,8 @@ async fn pre_s0_count_query_counts_each_kind() {
     w.finish().await;
 }
 
-/// Prints the pre-S9 count query (private-posting design §5 S9, C-6) for
-/// skydeval to run read-only in `psql` against the deployed database:
+/// Prints the pre-S9 count query for
+/// the operator to run read-only in `psql` against the deployed database:
 /// `cargo test pre_s9_count_query -- --ignored --nocapture`.
 #[test]
 #[ignore = "prints the pre-S9 count query; run with --ignored --nocapture"]
@@ -1953,7 +1952,7 @@ fn blob_on_pds(did: &str, cid: &str) -> String {
 
 impl Fixture {
     /// An encoded private post by `author` whose text is its rkey, with the
-    /// fields of `extra` added to the record as Aurora-Locus stores them.
+    /// fields of `extra` added to the record as a PDS stores them.
     async fn post_with(&self, author: &str, rkey: &str, audience: &str, extra: Value) -> String {
         let record = self.record_with(author, rkey, audience, &extra).await;
         self.ingest(author, NSID_POST_PRIVATE, rkey, record).await;

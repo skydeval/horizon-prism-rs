@@ -60,7 +60,3 @@ Horizon-Prism-rs is not a fork of aurora-prism. It was built based on it: almost
 ## Status
 
 In active development. Expect schema migrations and config changes between versions; read [CHANGELOG.md](CHANGELOG.md) before upgrading.
-
-## Working on it
-
-After cloning, run `git config core.hooksPath .githooks` once. The hooks run `tools/name-guard.py`, which refuses commits and pushes holding a word from its list; the `name_guard` test checks the same over the whole tree.

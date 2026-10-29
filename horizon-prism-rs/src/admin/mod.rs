@@ -1,4 +1,4 @@
-//! The web admin UI (docs/internal/design/admin-ui.md), slice S1: the
+//! The web admin UI, slice S1: the
 //! shell under `/admin`, first-run setup, operator sign-in with ATProto
 //! OAuth and the host re-check, CSRF and confirmations, the members screen
 //! (#735), the audit log and the operators page; and Home's live feed of

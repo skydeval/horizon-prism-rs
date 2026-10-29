@@ -11,8 +11,7 @@ use super::*;
 use crate::admin::live::Hub;
 use crate::admin::test_support::{OPERATOR, OPERATOR_PDS, Sse, page_id, serve, session};
 
-/// A private block: skipped since they were removed (skydeval,
-/// 2026-10-24), and its subject is never on the feed either.
+/// A private block: skipped since they were removed, and its subject is never on the feed either.
 const NSID_PRIVATE_BLOCK: &str = "tools.kryphocron.graph.block";
 const PRIVATE_TEXT: &str = "marker-private-text-41f3";
 const AUDIENCE_MEMBER: &str = "did:plc:mmmmmmmmmmmmmmmmmmmmmmmm";

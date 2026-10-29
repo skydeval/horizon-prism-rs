@@ -1,5 +1,5 @@
 {
-  "generatedBy": "the PDS's content_payload and clear-field derivation (aurora-locus src/kryphocron_content.rs at 42280a4), serde_json with preserve_order",
+  "generatedBy": "kryphocron's content_payload and clear-field derivation, serde_json with preserve_order",
   "cases": [
     {
       "name": "text only",

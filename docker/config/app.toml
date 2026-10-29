@@ -173,7 +173,7 @@ degraded_retry_min_secs = 30
 degraded_retry_max_secs = 300
 
 # Whole-handler latency floors, off by default (design timing-floors.md). A
-# private post's existence is not secret (skydeval, 2026-10-15), so Prism
+# private post's existence is not secret, so Prism
 # answers as soon as the answer is ready. An operator who wants response time
 # independent of hidden rows sets every key above that endpoint's measured p99
 # (private_read_unfloored_seconds{endpoint}): a post can be timed through any

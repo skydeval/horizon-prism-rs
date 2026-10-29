@@ -64,7 +64,7 @@ pub(super) async fn audience_row(pool: &PgPool, uri: &str) -> Result<Option<Audi
 /// `(a blocks b, b blocks a)` over `blocks` and members' list blocks that
 /// apply (§6.4; private-blocks design §2.3), the sources [`blocked`] reads,
 /// so the oracle agrees with fact 8. Private blocks are not read: they were
-/// removed (skydeval, 2026-10-24).
+/// removed.
 ///
 /// # Errors
 ///
@@ -1229,7 +1229,7 @@ pub(super) async fn climb_authors(pool: &PgPool, uris: &[String], cap: u32) -> R
     Ok(out)
 }
 
-// ---- `notServed` (docs/internal/design/not-served-reason.md §4) ----
+// ---- `notServed` ----
 //
 // The read rule's statement with the reader removed: `$1` is bound to the
 // empty string, which no stored row names (every stored DID passed

@@ -1,5 +1,4 @@
-//! The public page's tests (public-page design §10, as cut back by skydeval
-//! to relay information only): T-P1 to T-P6, T-P9, the relay hosts, and the
+//! The public page's tests: T-P1 to T-P6, T-P9, the relay hosts, and the
 //! source checks of T-P15 that concern `/`.
 
 use std::collections::{BTreeMap, BTreeSet};

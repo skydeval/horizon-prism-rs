@@ -1,5 +1,4 @@
-//! S12's one builder (docs/internal/design/private-threads.md §3.1, §3.2,
-//! T-52) and the pre-release count (§8, T-55): every statement prepares; the
+//! S12's one builder (T-52) and the pre-release count (T-55): every statement prepares; the
 //! batches equal row-at-a-time evaluation, ties included; the order of
 //! evaluation; the reorder's equivalence; one walk per key; the guarded
 //! V–O term.
@@ -504,8 +503,8 @@ async fn t52_the_empty_climb() {
     w.finish().await;
 }
 
-/// Prints the pre-S12 count queries (private-threads design §8) for
-/// skydeval to run read-only in `psql` against the deployed database:
+/// Prints the pre-S12 count queries for
+/// the operator to run read-only in `psql` against the deployed database:
 /// `cargo test pre_s12_count_query -- --ignored --nocapture`.
 #[test]
 #[ignore = "prints the pre-S12 count queries; run with --ignored --nocapture"]

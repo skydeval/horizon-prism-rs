@@ -292,7 +292,7 @@ async fn replies_the_root_hid_are_flagged_on_every_path() {
 
     // Bridging off: the response is the baseline, which now holds the
     // hidden reply and what is beneath it, flagged.
-    // Farsight not answering (skydeval 2026-10-25: a partial level keeps bridging on).
+    // Farsight not answering (a partial level keeps bridging on).
     *fake.status.lock().expect("status") = 503;
     let off = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
     assert_eq!(off.bridging, Bridging::Off);
@@ -876,7 +876,7 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
 
     // Farsight answers without vouching: bridging is off and the response
     // is the ordinary view, which for viewer A is the anchor alone.
-    // Farsight not answering (skydeval 2026-10-25: a partial level keeps bridging on).
+    // Farsight not answering (a partial level keeps bridging on).
     *fake.status.lock().expect("status") = 503;
     let (_, body) = call(&url, GET_THREAD, VIEWER_A, 3, &thread_input).await;
     let off: Value = serde_json::from_str(&body).expect("json");
@@ -990,7 +990,7 @@ async fn a_response_is_paged_by_a_sealed_cursor() {
 
     // Farsight stops answering: replies to a gap are bridge candidates, so
     // nothing is read, and the marker keeps the cursor it came with.
-    // Farsight not answering (skydeval 2026-10-25: a partial level keeps bridging on).
+    // Farsight not answering (a partial level keeps bridging on).
     *fake.status.lock().expect("status") = 503;
     let off = thread::get_thread(&l, &cfg, &key, next, Some((position, cursor.clone()))).await.expect("thread");
     assert_eq!((uris(&off.nodes), off.bridging), (vec![gapped.clone()], Bridging::Off));
@@ -1145,7 +1145,7 @@ async fn the_parent_walk_goes_past_a_blocked_author() {
 
     // With bridging off the response is the ordinary view: it ends at the
     // blocked parent, and says nothing more.
-    // Farsight not answering (skydeval 2026-10-25: a partial level keeps bridging on).
+    // Farsight not answering (a partial level keeps bridging on).
     *fake.status.lock().expect("status") = 503;
     let got = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
     assert_eq!(shape(&got.nodes), [(middle, Some("blocked-by-you")), (leaf, None)]);
@@ -1261,7 +1261,7 @@ async fn the_walk_goes_past_blocked_posts_with_no_local_row() {
 
     // Bridging off: the ordinary view, which ends at the block and names no
     // parent for it.
-    // Farsight not answering (skydeval 2026-10-25: a partial level keeps bridging on).
+    // Farsight not answering (a partial level keeps bridging on).
     *fake.status.lock().expect("status") = 503;
     for (label, _, _, _, b2, anchor) in &cases {
         let request = thread::Request { viewer: &viewer, req: &req, anchor: anchor.as_str(), depth: 0, parent_height: 80 };
@@ -1403,7 +1403,7 @@ fn labels_of(v: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// #887 (threadlens-hydration design §3.6 (b), skydeval 2026-10-24): a
+/// #887: a
 /// request's `atproto-accept-labelers`, rebuilt from its valid entries,
 /// goes with the upstream calls; the labels those labelers applied are on
 /// the post and author views, beside Prism's own and without its upstream
