@@ -663,6 +663,34 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     if !(10..=120).contains(&notify.subscribed_post_retry_secs) {
         out.push("private_notify.subscribed_post_retry_secs must be 10 to 120".to_string());
     }
+    // The push service: url and service_did together, https, a DID.
+    let push = &cfg.private_push;
+    match (&push.url, &push.service_did) {
+        (None, None) => {}
+        (Some(url), Some(did)) => {
+            let checked = match url::Url::parse(url) {
+                Ok(u) if u.scheme() == "https" && u.host_str().is_some() => Ok(()),
+                Ok(_) => Err(format!("private_push.url = {url:?} must be an https URL")),
+                Err(e) => Err(format!("private_push.url = {url:?} is not a URL: {e}")),
+            };
+            if let Err(e) = with_leave(cfg, url, &[Intent::Public], checked) {
+                out.push(e);
+            }
+            if !proto_blue::syntax::Did::is_valid(did) {
+                out.push(format!("private_push.service_did = {did:?} is not a DID"));
+            }
+        }
+        _ => out.push("private_push.url and private_push.service_did must be set together".to_string()),
+    }
+    if !(1..=60).contains(&push.batch_secs) {
+        out.push("private_push.batch_secs must be 1 to 60".to_string());
+    }
+    if !(500..=30_000).contains(&push.timeout_ms) {
+        out.push("private_push.timeout_ms must be 500 to 30000".to_string());
+    }
+    if !(100..=1_000_000).contains(&push.max_pending) {
+        out.push("private_push.max_pending must be 100 to 1000000".to_string());
+    }
     // The private-threads walk and paging (private-threads design §5).
     let read = &cfg.private_read;
     if !(1..=100).contains(&read.max_chain) {
@@ -762,5 +790,33 @@ mod tests {
         assert!(!found("[farsight]\nurl = \"https://farsight.example.net\"\n").iter().any(|p| p.contains("farsight.url")));
         has("[farsight]\nurl = \"http://farsight.example.net\"\n", "farsight.url = \"http://farsight.example.net\" must be an https URL");
         has("[farsight]\nurl = \"farsight\"\n", "farsight.url = \"farsight\" is not a URL");
+    }
+
+    /// `[private_push]`: off by default; url and service_did together, the
+    /// url https, the DID a DID, the numbers in range.
+    #[test]
+    fn private_push_rules() {
+        let found = |toml: &str| problems(&FileConfig::parse(toml).expect("parse"), "appview.example.com");
+        let push = |toml: &str| found(toml).into_iter().filter(|p| p.contains("private_push")).collect::<Vec<_>>();
+        assert!(push("").is_empty());
+        assert!(push("[private_push]\nurl = \"https://push.example.net\"\nservice_did = \"did:web:push.example.net\"\n").is_empty());
+        assert_eq!(push("[private_push]\nurl = \"https://push.example.net\"\n"), ["private_push.url and private_push.service_did must be set together"]);
+        assert_eq!(push("[private_push]\nservice_did = \"did:web:push.example.net\"\n"), ["private_push.url and private_push.service_did must be set together"]);
+        assert_eq!(
+            push("[private_push]\nurl = \"http://push.example.net\"\nservice_did = \"did:web:push.example.net\"\n"),
+            ["private_push.url = \"http://push.example.net\" must be an https URL"]
+        );
+        assert_eq!(
+            push("[private_push]\nurl = \"https://push.example.net\"\nservice_did = \"push\"\n"),
+            ["private_push.service_did = \"push\" is not a DID"]
+        );
+        assert_eq!(
+            push("[private_push]\nbatch_secs = 0\ntimeout_ms = 1\nmax_pending = 1\n"),
+            [
+                "private_push.batch_secs must be 1 to 60",
+                "private_push.timeout_ms must be 500 to 30000",
+                "private_push.max_pending must be 100 to 1000000",
+            ]
+        );
     }
 }

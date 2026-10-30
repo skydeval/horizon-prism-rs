@@ -11,6 +11,14 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Added
 
+- **Push for kryphocron notifications** (`[private_push]`, off until `url` and
+  `service_did` are set): a new notification from a live write sends its
+  recipient's DID, and nothing else, to the push service, in batches, under
+  the `push` and `include` preferences and the list's exclusions. Backfill and
+  catch-up never push. `getMembership` lists `private.push` while it is on.
+  New `private_push_calls_total`, `private_push_dids_total` and
+  `private_push_dropped_total` metrics. No migration.
+
 - **Admin UI: Instance page** (`/admin/instance`), for signed-in operators
   only. The custom lexicons are compiled into the binary and served to
   operators at `/admin/lexicons/<path>`.

@@ -2499,7 +2499,7 @@ pub(super) async fn fanout_insert(
     recipients: &[String],
 ) -> Result<u64, sqlx::Error> {
     sqlx::query("SELECT 1 FROM private_posts WHERE uri = $1 FOR KEY SHARE").bind(uri).execute(&mut *conn).await?;
-    Ok(sqlx::query(&format!(
+    let ids: Vec<i64> = sqlx::query_scalar(&format!(
         "INSERT INTO private_notifications (recipient_did, author_did, reason, record_uri, record_cid, record_root) \
          SELECT r.did, $1, 'subscribed-post', $2, p.cid, p.reply_root_uri \
          FROM unnest($3::text[]) AS r(did) JOIN private_posts p ON p.uri = $2 \
@@ -2511,15 +2511,17 @@ pub(super) async fn fanout_insert(
            AND NOT {blocked} \
            AND NOT EXISTS (SELECT 1 FROM private_notifications n WHERE n.recipient_did = r.did AND n.record_uri = $2) \
            AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = r.did AND t.root_uri IN ($2, p.reply_root_uri)) \
-         ON CONFLICT DO NOTHING",
+         ON CONFLICT DO NOTHING RETURNING id",
         blocked = blocked("r.did", "$1"),
     ))
     .bind(author)
     .bind(uri)
     .bind(recipients)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected())
+    .fetch_all(&mut *conn)
+    .await?;
+    // A fan-out follows a live first store, so its rows push.
+    super::push::mark(&mut *conn, &ids).await?;
+    Ok(ids.len() as u64)
 }
 
 /// A private post's valid threadgate (private posting §4.4): the gate in
@@ -3310,6 +3312,41 @@ pub(super) const PREFERRED: &str = "CASE \
           -> (CASE n.reason WHEN 'subscribed-post' THEN 'subscribedPost' ELSE n.reason END)) ->> 'include') = 'follows' \
      THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = n.author_did) \
    ELSE true END";
+
+/// The recipient `$1`'s `push` preference passes the row `n`: not
+/// `push: false` for its reason's key ([`PREFERRED`]'s keys). No row, or no
+/// key for the reason, passes.
+const PUSHED: &str = "COALESCE((((SELECT q.prefs FROM private_notification_prefs q WHERE q.did = $1) \
+       -> (CASE n.reason WHEN 'subscribed-post' THEN 'subscribedPost' ELSE n.reason END)) ->> 'push'), 'true') <> 'false'";
+
+/// The recipients of the private notification rows `ids` to wake (push
+/// design): each with a row among them that still exists and that
+/// `listNotifications` would keep now ([`notification_kept`]), under its
+/// `push` preference ([`PUSHED`]). Sorted, each once.
+///
+/// # Errors
+///
+/// Database errors.
+pub(super) async fn push_recipients(pool: &PgPool, ids: &[i64]) -> Result<Vec<String>, sqlx::Error> {
+    let recipients: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT recipient_did FROM private_notifications WHERE id = ANY($1) ORDER BY 1")
+            .bind(ids)
+            .fetch_all(pool)
+            .await?;
+    let check = format!(
+        "SELECT EXISTS (SELECT 1 FROM private_notifications n WHERE n.recipient_did = $1 AND n.id = ANY($2) \
+           AND {kept} AND {PUSHED})",
+        kept = notification_kept(),
+    );
+    let mut out = Vec::with_capacity(recipients.len());
+    for did in recipients {
+        let pass: bool = sqlx::query_scalar(&check).bind(&did).bind(ids).fetch_one(pool).await?;
+        if pass {
+            out.push(did);
+        }
+    }
+    Ok(out)
+}
 
 /// Up to `limit` of `recipient`'s private notifications, newest first, after
 /// the plain `indexed_at::id` cursor, with the `reasons` filter (none: every

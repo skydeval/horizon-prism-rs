@@ -80,6 +80,11 @@ pub const FEATURE_REFRACT_SEARCH: &str = "refract.search";
 /// own values while `private_any_pds.enabled`.
 pub const FEATURE_ANY_PDS: &str = "private.anyPds";
 
+/// New private notifications wake the recipient through the push service
+/// `[private_push]` names, under its `push` preferences: listed after
+/// [`FEATURE_ANY_PDS`] while configured.
+pub const FEATURE_PUSH: &str = "private.push";
+
 /// What `getMembership` answers with besides the caller's state.
 #[derive(Debug, Clone)]
 pub struct MembershipSettings {
@@ -88,6 +93,9 @@ pub struct MembershipSettings {
     /// `private_any_pds.enabled`: [`FEATURE_ANY_PDS`] is listed, with the
     /// private values.
     pub any_pds: bool,
+    /// `[private_push]` names a service: [`FEATURE_PUSH`] is listed, with
+    /// the private values.
+    pub push: bool,
     /// `private_read.membership_retry_after_secs`.
     pub retry_after_secs: u64,
     /// `private_read.membership_valid_for_secs`: a `member` answer's
@@ -118,6 +126,7 @@ impl MembershipSettings {
         Self {
             private_features: private.features(),
             any_pds: PrivateAnyPdsConfig::default().enabled,
+            push: false,
             retry_after_secs: cfg.membership_retry_after_secs,
             valid_for_secs: cfg.membership_valid_for_secs,
             refusal_cache_secs: CommunityConfig::default().enroll_refusal_cache_secs,
@@ -214,6 +223,13 @@ impl MembershipSettings {
         self
     }
 
+    /// Whether `[private_push]` names a push service.
+    #[must_use]
+    pub fn with_push(mut self, enabled: bool) -> Self {
+        self.push = enabled;
+        self
+    }
+
     /// `features` as of this call: the private values (with
     /// [`FEATURE_ANY_PDS`] last while it is on), then Thread Lens's, from
     /// the live `threadlens.access`.
@@ -222,6 +238,9 @@ impl MembershipSettings {
         let mut out = self.private_features.to_vec();
         if self.any_pds && !self.private_features.is_empty() {
             out.push(FEATURE_ANY_PDS);
+        }
+        if self.push && !self.private_features.is_empty() {
+            out.push(FEATURE_PUSH);
         }
         out.push(FEATURE_THREAD_LENS);
         let live = self.live.load();
@@ -663,6 +682,18 @@ mod tests {
         assert_eq!(off.features().len(), FEATURES.len() + 7);
         let disabled = MembershipSettings::default().with_any_pds(true);
         assert_eq!(disabled.features(), [FEATURE_THREAD_LENS, FEATURE_THREAD_LENS_SIGNED_IN, FEATURE_THREAD_LENS_HYDRATED, FEATURE_THREAD_LENS_LABELERS, FEATURE_THREAD_LENS_HANDLE_ANCHOR, crate::plural::FEATURE_FRONTERS, crate::plural::FEATURE_READ]);
+    }
+
+    /// `private.push` is listed after `private.anyPds` exactly while
+    /// `[private_push]` names a service and the private tier serves.
+    #[test]
+    fn push_follows_its_config() {
+        let on = MembershipSettings::new(&KryphocronPrivateTier, &PrivateReadConfig::default()).with_push(true);
+        let f = on.features();
+        let any = f.iter().position(|v| *v == FEATURE_ANY_PDS).expect("anyPds");
+        assert_eq!(f[any + 1], FEATURE_PUSH);
+        assert!(!on.clone().with_push(false).features().contains(&FEATURE_PUSH));
+        assert!(!MembershipSettings::default().with_push(true).features().contains(&FEATURE_PUSH));
     }
 
     /// `refract` and `refract.search` are listed together, exactly while

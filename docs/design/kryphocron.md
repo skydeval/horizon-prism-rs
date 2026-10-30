@@ -42,6 +42,8 @@ Likes, reposts, quotes and public replies are stock `app.bsky.*` records. Counts
 
 Notification reasons: `reply`, `mention`, `quote`, `like`, `repost`, `subscribed-post`. The recipient must be a member who can read the post; blocks and mutes apply. Members set preferences per reason. Writes that are not live creates notify only for records under `[private_notify] backfill_max_age_hours` (default 48). Rows are kept 90 days.
 
+With `[private_push]` set, a new notification from a live write wakes its recipient: a few seconds later the push service gets the recipient's DID, and nothing else, if the reason's `push` and `include` preferences and the list's exclusions allow it. Backfill and catch-up never push. A wake can find nothing new; the app reads `listNotifications` as usual.
+
 Members can subscribe to an account's new kryphocron posts (`putActivitySubscription`, `listActivitySubscriptions`), up to `[private_notify] activity_subscriptions_max` accounts (default 1000).
 
 ## Other methods

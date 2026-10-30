@@ -206,6 +206,19 @@ backfill_max_age_hours = 48
 activity_subscriptions_max = 1000
 subscribed_post_retry_secs = 120
 
+# Push wakes for private notifications. With url and service_did set, the
+# push service is told which members have new private notifications from live
+# writes, by DID alone, batch_secs after the first, at most 100 DIDs a call,
+# with a service JWT (iss did:web:<APP_PUBLIC_HOSTNAME>, aud service_did, lxm
+# app.nearhorizon.push.notify). The push service learns who and when, nothing
+# more. Off while url is unset. Restart to apply.
+[private_push]
+# url = "https://push.example.org"
+# service_did = "did:web:push.example.org"
+batch_secs = 2
+timeout_ms = 5000
+max_pending = 10000
+
 # Private search (private posting §4.17): a bounded scan at query time, with no
 # index of decoded text. A page reads at most scan_candidates private posts the
 # requester may read, within span_hours below its cursor; a search reaches back

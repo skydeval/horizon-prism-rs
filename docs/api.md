@@ -119,6 +119,7 @@ The call also enrolls an eligible caller, as loading the timeline does.
 | `private.appearance` | `getAppearance` and `putAppearance` |
 | `private.appearanceRetention` | A removed member's appearance kept 7 days; `releaseAppearance` |
 | `private.anyPds` | Posts from any PDS are served; unencoded posts are served to no one |
+| `private.push` | New notifications wake devices through the configured push service; the `push` preference applies |
 | `threadLens` | Thread Lens methods are served |
 | `threadLens.signedIn` | Thread Lens serves any signed-in account, not only members |
 | `threadLens.hydrated` | Thread Lens views carry `servedAs`, viewer state, counts and `replyDisabled` |

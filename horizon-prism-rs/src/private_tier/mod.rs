@@ -40,6 +40,7 @@ pub(crate) mod ingest;
 mod media;
 mod oracle;
 pub(crate) mod owners;
+pub(crate) mod push;
 mod pipeline;
 pub(crate) mod readiness;
 pub(crate) mod retention;

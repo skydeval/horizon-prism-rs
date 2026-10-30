@@ -33,6 +33,8 @@ mod prefs;
 mod subscriptions;
 // Private activity subscriptions: the fan-out.
 mod fanout;
+// Push wakes for private notifications.
+mod push;
 mod round;
 mod threads;
 // The shared walk (#720): T-60 to T-63.

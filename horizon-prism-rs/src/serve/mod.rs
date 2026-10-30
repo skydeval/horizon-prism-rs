@@ -947,6 +947,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
     );
     let limits = RateLimits::from_config(&cfg.file.rate_limits).with_backstop(backstop);
     tasks.push(limits.spawn_housekeeping());
+    let push_on = cfg.file.private_push.url.is_some() && !private.features().is_empty();
     let app = AppState {
         hydrator,
         auth: Arc::new(glue.verifier.clone()),
@@ -960,6 +961,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         membership: crate::xrpc::handlers::membership::MembershipSettings::new(private.as_ref(), &cfg.file.private_read)
             .with_live(live.clone())
             .with_any_pds(cfg.file.private_any_pds.enabled)
+            .with_push(push_on)
             .with_refusal_cache(cfg.file.community.enroll_refusal_cache_secs)
             .with_reindex_retry(cfg.file.community.reindex_retry_secs)
             .with_plural_read(cfg.file.plural.enabled)
@@ -986,6 +988,20 @@ pub async fn run() -> Result<Stopped, StartupError> {
             crate::private_tier::fanout::Fanout::new(&private_state, scope.clone(), cfg.file.private_notify.subscribed_post_retry_secs).spawn(),
         );
     }
+    // Push wakes for new private notifications, while `[private_push]`
+    // names a service and the private tier is on.
+    if push_on
+        && let Some(sender) = crate::private_tier::push::PushSender::new(
+            pool.clone(),
+            nets.public().client().clone(),
+            glue.service_key.clone(),
+            &cfg.file.private_push,
+        )
+    {
+        crate::private_tier::push::enable();
+        tasks.push(sender.spawn());
+    }
+    tracing::info!(event = "private_push", enabled = push_on, "push wakes for private notifications");
     log_floors(&cfg.file.private_read.floor_ms);
     tracing::info!(
         event = "private_any_pds",

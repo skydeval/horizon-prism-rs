@@ -39,7 +39,7 @@ A value saved in the admin UI wins over the file, which Horizon-Prism never writ
 | `[community]` | Auto-enroll, member cap, readiness retry hints. |
 | `[firehose]` | Stream names, batch size, dead letters, which relays are private relays. |
 | `[identity]` | PLC directory, caches, optional Lodestar. |
-| `[private_read]`, `[private_notify]`, `[private_search]`, `[private_any_pds]` | [kryphocron](design/kryphocron.md) reads, notifications and search. |
+| `[private_read]`, `[private_notify]`, `[private_push]`, `[private_search]`, `[private_any_pds]` | [kryphocron](design/kryphocron.md) reads, notifications, push and search. |
 | `[sync]`, `[backfill]`, `[index_request]` | Load on PDSes: head checks, backfill rate, catch-up. |
 | `[constellation]` | Upstream AppViews by PDS pattern, their rates, and the lookup order. |
 | `[microcosm]`, `[counts]` | Constellation and Slingshot URLs; where public counts come from. |
@@ -85,8 +85,9 @@ Horizon-Prism runs without any of these. Each is off until configured.
 | Lodestar | `[identity] lodestar_url` | Faster identity and handle reads from a PLC mirror. | Identities come from `plc_url`, and handles are checked locally. |
 | Constellation, Slingshot | `[microcosm]` | Counts, backlinks and records for content not stored here; reply lists in threads. | Set `[counts] public_source = "local"`. Threads and counts for outside content are less complete. |
 | Refract | `[refract] enabled` and communities | See [Refract](design/refract.md). | Off by default. |
+| Push service | `[private_push] url` + `service_did` | New kryphocron notifications wake members' devices. | Apps find them when opened. |
 
-The Farsight fallback sends a member's DID and the accounts on their page to another AppView; read the warning in `app.toml` first. Farsight and Lodestar see which accounts you ask about, so use instances you run or trust.
+The Farsight fallback sends a member's DID and the accounts on their page to another AppView; read the warning in `app.toml` first. Farsight and Lodestar see which accounts you ask about, so use instances you run or trust. The push service sees which members have new kryphocron notifications and when, by DID alone; it must list this AppView's DID (`did:web:<APP_PUBLIC_HOSTNAME>`) as a sender.
 
 ## Thread outline
 

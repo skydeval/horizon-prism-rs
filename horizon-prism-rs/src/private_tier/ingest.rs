@@ -934,8 +934,10 @@ const INSERT_NOTIFICATION: &str = "INSERT INTO private_notifications \
              $5::text, $7::text, $4::text, \
              (SELECT p.reply_root_uri FROM private_posts p WHERE p.uri = $4::text), \
              (SELECT p.reply_root_uri FROM posts p WHERE p.uri = $4::text))) \
-     ON CONFLICT DO NOTHING";
+     ON CONFLICT DO NOTHING RETURNING id";
 
+/// Insert one private notification ([`INSERT_NOTIFICATION`]); a new row of
+/// a live write (`push`) is marked for push ([`super::push::mark`]).
 #[allow(clippy::too_many_arguments)]
 async fn insert_notification(
     conn: &mut PgConnection,
@@ -945,9 +947,10 @@ async fn insert_notification(
     record_cid: &str,
     record_root: Option<&str>,
     public_record: Option<&Value>,
+    push: bool,
 ) -> Result<(), sqlx::Error> {
     let (did, reason, subject) = recipient;
-    sqlx::query(INSERT_NOTIFICATION)
+    let id: Option<i64> = sqlx::query_scalar(INSERT_NOTIFICATION)
         .bind(did)
         .bind(author)
         .bind(*reason)
@@ -956,8 +959,11 @@ async fn insert_notification(
         .bind(record_cid)
         .bind(record_root)
         .bind(public_record)
-        .execute(conn)
+        .fetch_optional(&mut *conn)
         .await?;
+    if push && let Some(id) = id {
+        super::push::mark(conn, &[id]).await?;
+    }
     Ok(())
 }
 
@@ -973,7 +979,8 @@ async fn notify_post(conn: &mut PgConnection, op: &PrivateOp, f: &PostPrivateFie
             metrics::counter!(METRIC_NOTIFY_SUPPRESSED, "reason" => "known_recipient").increment(1);
             continue;
         }
-        insert_notification(&mut *conn, &r, &op.author_did, &op.uri, &op.cid, f.reply_root_uri.as_deref(), None).await?;
+        let push = super::push::live(op.source);
+        insert_notification(&mut *conn, &r, &op.author_did, &op.uri, &op.cid, f.reply_root_uri.as_deref(), None, push).await?;
     }
     Ok(())
 }
@@ -1017,6 +1024,7 @@ pub(crate) async fn notify_public(conn: &mut PgConnection, n: &PublicNotify) -> 
             &n.record_cid,
             n.record_root.as_deref(),
             n.public_record.as_ref(),
+            super::push::live(n.source),
         )
         .await?;
     }

@@ -566,6 +566,37 @@ impl Default for PrivateNotifyConfig {
     }
 }
 
+/// `[private_push]`: a push service told which members have new private
+/// notifications. Each call carries only DIDs. With `url` unset, no call is
+/// ever made. File-only; a restart applies it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivatePushConfig {
+    /// Base URL of the push service; `https` only. It is called at
+    /// `/xrpc/app.nearhorizon.push.notify`.
+    pub url: Option<String>,
+    /// The push service's DID: the service JWT's `aud`.
+    pub service_did: Option<String>,
+    /// How long new notifications are gathered before one call: 1 to 60.
+    pub batch_secs: u64,
+    /// One call's timeout.
+    pub timeout_ms: u64,
+    /// Notifications waiting to be sent; past it new ones are dropped.
+    pub max_pending: usize,
+}
+
+impl Default for PrivatePushConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            service_did: None,
+            batch_secs: 2,
+            timeout_ms: 5000,
+            max_pending: 10_000,
+        }
+    }
+}
+
 /// `[private_any_pds]` (private-encode design §7, S4, re-keyed when
 /// `encodePost` was withdrawn on 2026-10-21): whether private posts from
 /// any PDS are fully served, which means a private post must carry encoded
@@ -2352,6 +2383,7 @@ pub struct FileConfig {
     pub kryphocron: KryphocronConfig,
     pub private_read: PrivateReadConfig,
     pub private_notify: PrivateNotifyConfig,
+    pub private_push: PrivatePushConfig,
     pub private_search: PrivateSearchConfig,
     pub private_any_pds: PrivateAnyPdsConfig,
     pub sync: SyncConfig,

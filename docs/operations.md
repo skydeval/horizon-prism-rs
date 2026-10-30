@@ -22,6 +22,7 @@ Key metrics:
 | `upstream_skipped_total{network,reason}` | Upstream calls skipped for rate, deadline or a tripped breaker. |
 | `farsight_down`, `farsight_auth_failed_total` | Farsight outage or a bad key (if used). |
 | `lodestar_fresh` | 1 while Lodestar is used (if configured). |
+| `private_push_calls_total{outcome}` | Calls to the push service (if configured). `unauthorized` or `forbidden`: `[private_push] service_did` is wrong, or the push service does not list this AppView's DID. |
 | `outline_writer_active`, `outline_through_age_seconds` | The thread outline's writer holds its lock, and how far behind the stream it is (if enabled). |
 | `outline_missed_total{reason}`, `outline_holes_total{reason}` | Posts the thread outline could not record, and places it marked as missing a reply. |
 | `outline_freshness{state}`, `outline_replays_total{why}` | Whether Thread Lens may use the outline now (1 for the current state), and how often it caught up from the stream, by cause. |
