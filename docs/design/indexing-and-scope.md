@@ -61,7 +61,7 @@ An account a member interacts with again just before removal is kept.
 |---|---|
 | `off` (default for a fresh install) | Only what kryphocron, Thread Lens and Horizon features need. Public `app.bsky.*` reads answer `501 NotImplemented`. |
 | `community_scoped` | Everything in scope. Horizon-Prism also serves public reads for its members. |
-| `full` | Refused at startup. Horizon-Prism never indexes the whole network. |
+| `full` | Not built yet: refused at startup. |
 
 With it **off**, Horizon-Prism keeps:
 - every stored block, and follows with a member at either end;
