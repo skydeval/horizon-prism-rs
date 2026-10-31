@@ -2,9 +2,11 @@
 //! (design-v2 §3.2, §11.3).
 //!
 //! Loading order: read the TOML (unknown keys fail), read the environment
-//! overlay, then run [`AppConfig::validate`]. Any failure aborts startup.
+//! overlay, then run [`AppConfig::validate`]. A start loads through
+//! [`AppConfig::load_for_start`], which sets aside what is not core.
 
 mod env;
+pub mod lenient;
 mod sections;
 mod validate;
 
@@ -34,6 +36,7 @@ pub use sections::{
 pub use sections::BenchConfig;
 #[cfg(feature = "standin-hosts")]
 pub use sections::{StandinConfig, StandinHost, StandinIntent};
+pub use lenient::{CORE_KEYS, Loaded, SetAside};
 pub use validate::{MAX_HEAD_AGE_SECS, OTHER_RELAY_LABEL, pds_pattern};
 
 /// Configuration failures. Every variant aborts startup.
@@ -181,6 +184,20 @@ impl AppConfig {
         Ok(cfg)
     }
 
+    /// Load `APP_CONFIG_PATH` and the environment for a start: a setting
+    /// that is not core is set aside instead of stopping it (see
+    /// [`lenient`]).
+    ///
+    /// # Errors
+    ///
+    /// An unreadable file, TOML that is not TOML, or a core setting wrong.
+    pub fn load_for_start() -> Result<Loaded, ConfigError> {
+        let lookup = |var: &str| std::env::var(var).ok();
+        let path = config_path(&lookup);
+        let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io { path: path.clone(), source })?;
+        lenient::load(&text, &lookup)
+    }
+
     /// Check every cross-field rule (design-v2 §5.3, §8.1, §8.5, §9.1 and the
     /// runtime guards in `validate.rs`).
     ///
@@ -188,6 +205,17 @@ impl AppConfig {
     ///
     /// [`ConfigError::Invalid`] listing every problem found.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        let problems = self.problems();
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigError::Invalid(problems))
+        }
+    }
+
+    /// Every problem [`AppConfig::validate`] reports.
+    #[must_use]
+    pub fn problems(&self) -> Vec<String> {
         let mut problems = validate::problems(&self.file, &self.env.public_hostname);
         crate::farsight::config_problems(&self.file.farsight, self.env.farsight_token.is_some(), &mut problems);
         // The fallback's keys are checked only when it is switched on;
@@ -198,11 +226,7 @@ impl AppConfig {
         if self.file.farsight.memory.enabled {
             problems.extend(crate::farsight::memory_problems(&self.file.farsight));
         }
-        if problems.is_empty() {
-            Ok(())
-        } else {
-            Err(ConfigError::Invalid(problems))
-        }
+        problems
     }
 
     /// The AppView's service DID, `did:web:<APP_PUBLIC_HOSTNAME>` (§6.8).

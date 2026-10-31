@@ -613,10 +613,10 @@ pub async fn run(args: &AdminArgs) -> u8 {
             }
         },
     };
-    let cfg = match AppConfig::load_from_env() {
+    let cfg = match crate::cli::commands::lenient_config() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("config_error: {e}");
+            eprintln!("{e}");
             return 78;
         }
     };

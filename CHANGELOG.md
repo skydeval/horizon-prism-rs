@@ -9,6 +9,19 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ## [Unreleased]
 
+### Changed
+
+- **A bad setting no longer stops the start.** An unknown, mistyped or
+  out-of-range key in `app.toml` is set aside and its default applies; a bad
+  feature URL turns that feature off. A missing or malformed
+  `APP_PRIVATE_CURSOR_KEY_HEX` or `APP_CORRELATION_KEY_HEX` gets a key made for
+  the run; a malformed optional key turns its feature off. If kryphocron's
+  at-rest setup fails, kryphocron records are still indexed and encoded posts
+  are served to no one until it is fixed. Each is logged (`config_set_aside`),
+  counted, and listed on the admin Health page and in a banner. Only the
+  hostname, database, Redis, signing key, an unreadable `app.toml`, and the
+  core keys listed in `docs/configuration.md` still stop it.
+
 ### Added
 
 - **Push for kryphocron notifications** (`[private_push]`, off until `url` and

@@ -439,6 +439,9 @@ pub struct Inputs {
     pub members_not_ready: Option<i64>,
     pub set_aside: usize,
     pub waiting: usize,
+    /// Settings set aside at this start (key, problem): Prism started
+    /// without them.
+    pub started_without: Vec<(String, String)>,
     /// The schema task: back-fill done, indexes ready.
     pub schema: Option<(bool, bool)>,
     /// `firehose.lag_warn_entries`.
@@ -720,6 +723,22 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
         Some(_) => Check::new("Public data clean-up", Level::Ok, "Deleting public data is not stalled."),
     });
 
+    out.push(if i.started_without.is_empty() {
+        Check::new("Startup", Level::Ok, "Prism started with every setting in use.")
+    } else {
+        let list: Vec<String> = i.started_without.iter().map(|(key, problem)| format!("{key}: {problem}")).collect();
+        Check::new(
+            "Startup",
+            Level::Red,
+            format!(
+                "Prism started without {} setting{}, using defaults or with the feature off. Fix them and restart. {}",
+                i.started_without.len(),
+                if i.started_without.len() == 1 { "" } else { "s" },
+                list.join(" · ")
+            ),
+        )
+    });
+
     out.push(if i.set_aside > 0 {
         Check::new("Settings", Level::Red, format!("{} saved setting{} could not be used.", i.set_aside, if i.set_aside == 1 { "" } else { "s" })).link("/admin/settings", "Settings")
     } else if i.waiting > 0 {
@@ -847,6 +866,7 @@ pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
         members_not_ready,
         set_aside: banners.set_aside,
         waiting: banners.waiting,
+        started_without: crate::config::lenient::notices().into_iter().map(|s| (s.key, s.problem)).collect(),
         disks: Some(super::stats::read_disks(&state.disks)),
         ..base
     };
@@ -970,7 +990,8 @@ mod tests {
         let ring = Ring::default();
         let all = checks(&Inputs::default(), &ring);
         for c in &all {
-            if c.name != "Settings" {
+            // Both are read from memory, so they always have an answer.
+            if c.name != "Settings" && c.name != "Startup" {
                 assert_eq!(c.level, Level::NoData, "{c:?}");
             }
         }
@@ -996,6 +1017,7 @@ mod tests {
             members_not_ready: Some(0),
             set_aside: 0,
             waiting: 2,
+            started_without: vec![("private_push.url".into(), "must be an https URL".into())],
             schema: Some((true, false)),
             lag_warn_entries: 100,
             relays: vec!["bsky".into(), "microcosm".into()],
@@ -1019,6 +1041,7 @@ mod tests {
         assert_eq!(get("Farsight", "answering"), Level::Ok);
         assert_eq!(get("Farsight fallback", "off"), Level::Ok);
         assert_eq!(get("Settings", "2 changes wait"), Level::Info);
+        assert_eq!(get("Startup", "started without 1 setting, using defaults or with the feature off. Fix them and restart. private_push.url: must be an https URL"), Level::Red);
         assert_eq!(get("Search", "still being prepared"), Level::Info);
         assert_eq!(get("Trim gap", "No data"), Level::NoData, "a counter never incremented is absent");
         assert_eq!(get("Disk", "The disk holding the database (Postgres) has 15.0 GB free (2% free)"), Level::Red);

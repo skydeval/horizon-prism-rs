@@ -392,7 +392,7 @@ fn lists_problems(cfg: &FileConfig, out: &mut Vec<String>) {
 fn indexing(cfg: &FileConfig, out: &mut Vec<String>) {
     // §9.1 / lock #4: `full` is recognized, then refused.
     if cfg.indexing.public_scope == Some(PublicScope::Full) {
-        out.push("public_scope=full is not implemented in v1".to_string());
+        out.push("indexing.public_scope = \"full\" is not built yet".to_string());
     }
 }
 

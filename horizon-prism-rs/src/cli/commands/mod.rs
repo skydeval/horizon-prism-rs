@@ -55,7 +55,21 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
 ///
 /// A printable message.
 pub fn config() -> Result<AppConfig, String> {
-    AppConfig::load_from_env().map_err(|e| format!("config_error: {e}"))
+    lenient_config()
+}
+
+/// The configuration as a start loads it: what is not core is set aside,
+/// and each such setting is named on stderr.
+///
+/// # Errors
+///
+/// A printable message for a core problem.
+pub fn lenient_config() -> Result<AppConfig, String> {
+    let loaded = AppConfig::load_for_start().map_err(|e| format!("config_error: {e}"))?;
+    for s in &loaded.set_aside {
+        eprintln!("config: {} set aside: {}", s.key, s.problem);
+    }
+    Ok(loaded.cfg)
 }
 
 /// Connect to Postgres for a read-only command.

@@ -109,7 +109,7 @@ A new member gets `NotReady` from member-only endpoints until its initial indexi
 
 Kryphocron records reach this AppView only through the relays. Each community PDS needs federation on and must have requested a crawl from `bsky.network` and `relay.fire.hose.cam`. Check `private_tier_last_event_age_seconds` on `127.0.0.1:9091/metrics` after making a kryphocron post.
 
-**Upgrading to a build with `app.nearhorizon.actor.getMembership`:** set `APP_PRIVATE_CURSOR_KEY_HEX` first (see "Generate keys"); that build exits with code 78 without it.
+**Upgrading to a build with `app.nearhorizon.actor.getMembership`:** set `APP_PRIVATE_CURSOR_KEY_HEX` first (see "Generate keys"); without it, kryphocron feed cursors stop working at every restart.
 
 ## Schema migrations (operator-gated)
 
@@ -178,7 +178,7 @@ docker compose exec -T db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB
 
 `app` serves an admin UI at `https://<APP_PUBLIC_HOSTNAME>/admin`: Home with a live feed, members (readiness, add, remove, deny, allow), settings, operators, and the audit log (every change, who made it, how it ended, and sign-ins). Every change runs as the matching CLI command, with the operator recorded.
 
-- **Settings.** `/admin/settings` has a page per group. Each setting shows what it does, its current value, the default, the value in `config/app.toml`, the last change, and whether it applies at once or after a restart. Saved values live in the database (`operator_settings`) and are layered over `config/app.toml` at every start; the file is never written. A page is checked as a whole before saving, so a value the app would refuse to start with is never saved. History is in `operator_settings_history`.
+- **Settings.** `/admin/settings` has a page per group. Each setting shows what it does, its current value, the default, the value in `config/app.toml`, the last change, and whether it applies at once or after a restart. Saved values live in the database (`operator_settings`) and are layered over `config/app.toml` at every start; the file is never written. A page is checked as a whole before saving, so a value the app could not use is never saved. History is in `operator_settings_history`.
 - **File and saved value disagree.** The saved value wins. If an upgrade or edit changes the file under a saved value, Home lists it and its page offers "Use the file's value" or "Keep my value". A saved value that no longer works after an upgrade is set aside at start (`operator_setting_set_aside`), and every page says so until it is fixed or cleared.
 - **Restart.** With `APP_SUPERVISED=1` (set in the shipped compose, with `restart: unless-stopped`), the UI can restart `app`: it shuts down cleanly and exits with code 75. `admin restart` does the same.
 - **From the command line.** `admin settings list`, `get <key>`, `set <key> <value>` (comma-separated list or JSON) and `reset <key>`, with the same checks.

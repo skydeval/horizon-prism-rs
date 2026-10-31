@@ -7,10 +7,20 @@ Horizon-Prism reads settings from three places:
 | Source | Holds | Changes apply |
 |---|---|---|
 | `docker/.env` → `APP_*` environment | Hostname, database and Redis URLs, keys, secrets, the migration gate | at restart |
-| `docker/config/app.toml` | Every non-secret setting. Every key shown is the default. Unknown keys stop startup. | at restart |
+| `docker/config/app.toml` | Every non-secret setting. Every key shown is the default. | at restart |
 | Admin UI (Settings) | Values saved over `app.toml`, kept in the database | some at once, the rest at restart |
 
 A value saved in the admin UI wins over the file, which Horizon-Prism never writes. A save is checked against the whole configuration first. Each setting's page says when it applies. `admin settings list|get|set|reset` does the same from the CLI.
+
+### Bad settings
+
+Horizon-Prism starts whenever it can index. A setting that is unknown, of the wrong type or out of range is set aside: its default applies, or its feature is off. Each one is logged (`config_set_aside`), counted (`config_set_aside` gauge), and listed on the admin UI's Health page and in a banner on every page.
+
+Only these stop a start (exit 78):
+
+- `APP_PUBLIC_HOSTNAME`, the database and Redis URLs, and `APP_SERVICE_SIGNING_KEY_HEX`, missing or malformed;
+- `app.toml` that is not TOML or cannot be read;
+- `http.bind`, `http.trusted_proxy`, `firehose.stream_key`, `firehose.group`, `firehose.consumer_name`, `indexing.public_scope` and `scope.policy`, when wrong.
 
 ## Environment
 
@@ -20,8 +30,8 @@ A value saved in the admin UI wins over the file, which Horizon-Prism never writ
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Database. The password must be hex. |
 | `REDIS_MAXMEMORY` | Redis memory ceiling (default `6gb`). |
 | `APP_SERVICE_SIGNING_KEY_HEX` | The AppView's signing key, from `admin keygen`. |
-| `APP_CORRELATION_KEY_HEX` | Audit correlation key, from `admin keygen`. |
-| `APP_PRIVATE_CURSOR_KEY_HEX` | Cursor key for kryphocron feeds. Required. Same on every replica. |
+| `APP_CORRELATION_KEY_HEX` | Audit correlation key, from `admin keygen`. Without it a key is made at each start. |
+| `APP_PRIVATE_CURSOR_KEY_HEX` | Cursor key for kryphocron feeds. Same on every replica. Without it a key is made at each start, and cursors stop working at a restart. |
 | `APP_SYSTEM_ACCOUNTS_KEY_HEX` | Optional. Switches system accounts on and seals their lists. 64 hex (`admin keygen` or `openssl rand -hex 32`). Same on every replica; keep it once lists exist (below). |
 | `APP_ALLOW_STARTUP_MIGRATE` | `1` only while applying migrations. |
 | `FARSIGHT_TOKEN` | Farsight API key, only if Farsight is used. |
@@ -124,7 +134,7 @@ All keys apply at restart. Switching it off clears its progress; switching it on
 | `live_max_viewers` | `50` | Live-feed viewers at once, at least 1. Each viewer costs about 0.4 Mbit/s at 800 events a second, about 5.4 during a relay replay ([operations](operations.md#the-public-pages-live-feed)). |
 | `clients` | `[]` | Apps that use this instance, as `[[public_page.clients]]` with `name` and an `https:` `url`; at most 20. |
 
-A link that is not `https:` stops the start. The page names no relay, only how many it receives from. The removed keys `self_check`, `policy_url` and `docs_url` stop the start like any unknown key.
+A link that is not `https:` is set aside. The page names no relay, only how many it receives from. The removed keys `self_check`, `policy_url` and `docs_url` are set aside like any unknown key.
 
 ## Rate limits
 
@@ -143,7 +153,7 @@ Once a list is stored, keep the key and back it up. If a start finds lists but n
 
 Set the right key and restart. Accounts deleted meanwhile leave every list, the recorded accounts are re-checked by the identity refresher, and the methods serve again once that is done: usually minutes, up to a few hours (Health is amber meanwhile; the start is never held). Every replica needs the same key: one started without it is locked and keeps recording, and a replica starting meanwhile waits to serve until none is locked. Catching up holds the recorded rows in memory, about 100 MB per week the key was missing; after a long lock, give the process room or empty `sysacct_pending` first (deletions seen meanwhile then reach lists only through later events).
 
-A key that is not 64 hex characters stops the start (exit 78). There is no rotation. To start over, stop `app` and run:
+A key that is not 64 hex characters is set aside, and system accounts are off. There is no rotation. To start over, stop `app` and run:
 
 ```sql
 TRUNCATE sysacct_entries, sysacct_lists, sysacct_used_tokens, sysacct_key, sysacct_pending;

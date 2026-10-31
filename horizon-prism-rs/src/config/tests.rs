@@ -859,7 +859,7 @@ fn services_and_features_are_validated_at_load() {
 #[test]
 fn full_public_scope_is_refused() {
     let p = invalid_problems(load("[indexing]\npublic_scope = \"full\"\n"));
-    assert!(has(&p, "public_scope=full is not implemented in v1"));
+    assert!(has(&p, "indexing.public_scope = \"full\" is not built yet"));
 }
 
 /// T-1 (public-indexing design §3.1, §3.3): `off` parses; an absent key is

@@ -206,6 +206,9 @@ pub struct Banners {
     pub waiting: usize,
     /// Saved settings that could not be used at the last start.
     pub set_aside: usize,
+    /// Settings from `app.toml`, the environment or startup that Prism
+    /// started without.
+    pub started_without: usize,
     /// The restart button works here (`APP_SUPERVISED=1`).
     pub supervised: bool,
 }
@@ -220,7 +223,12 @@ pub async fn banners(state: &AdminState) -> Result<Banners, sqlx::Error> {
     let saved = store::rows(&state.pool).await?;
     let s = &state.settings;
     let counts = store::counts(&saved, &s.file_json, &s.running_json, &s.networks());
-    Ok(Banners { waiting: counts.waiting, set_aside: counts.set_aside, supervised: s.env.supervised })
+    Ok(Banners {
+        waiting: counts.waiting,
+        set_aside: counts.set_aside,
+        started_without: crate::config::lenient::notices().len(),
+        supervised: s.env.supervised,
+    })
 }
 
 impl Operator {

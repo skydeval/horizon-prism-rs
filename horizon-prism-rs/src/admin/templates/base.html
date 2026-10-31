@@ -29,6 +29,9 @@
 </header>
 <main{% block main_class %}{% endblock %}>
 {% if let Some(nav) = nav %}
+{% if nav.banners.started_without > 0 %}
+<div class="banner bad">Prism started without {{ nav.banners.started_without }} setting{% if nav.banners.started_without != 1 %}s{% endif %}: they were wrong or missing, so their defaults apply or their feature is off. <a href="/admin/health">See which, and why</a>.</div>
+{% endif %}
 {% if nav.banners.set_aside > 0 %}
 <div class="banner bad">Some saved settings could not be used: {{ nav.banners.set_aside }} saved setting{% if nav.banners.set_aside != 1 %}s{% endif %} could not be used when Prism last started. <a href="/admin/settings">See which, and why</a>.</div>
 {% endif %}

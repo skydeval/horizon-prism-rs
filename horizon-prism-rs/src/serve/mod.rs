@@ -154,9 +154,10 @@ pub async fn run() -> Result<Stopped, StartupError> {
         init_tracing(level.as_deref().unwrap_or(crate::config::DEFAULT_LOG_LEVEL));
         tracing::error!(event = "standin_hosts_build", marker = crate::net::standin::MARKER, "built with the standin-hosts feature: this binary can reach private test origins; never deploy this build");
     }
-    let cfg = AppConfig::load_from_env().map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
-    cfg.validate()
-        .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
+    // Only a core setting stops the start; anything else wrong is set
+    // aside, logged once tracing is up, and shown in the admin UI.
+    let loaded = AppConfig::load_for_start().map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {e}")))?;
+    let (cfg, file_table, set_aside) = (loaded.cfg, loaded.table, loaded.set_aside);
     // A test build never serves as an ordinary deployment: it needs its
     // listed origins, checked before any port is bound.
     #[cfg(feature = "standin-hosts")]
@@ -165,13 +166,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
         let origins: Vec<String> = cfg.file.standin.hosts.iter().map(|h| format!("{} {:?}", h.origin, h.intents)).collect();
         tracing::error!(event = "standin_hosts_origins", ?origins, "these private test origins are reachable on a request's first hop");
     }
-    // `app.toml` as a table, for the saved settings' overlay after the
-    // migration gate (admin-ui design §8.1).
+    // For the admin UI, which writes saved settings beside it.
     let config_path = crate::config::config_path(&|var| std::env::var(var).ok());
-    let file_table: toml::Table = std::fs::read_to_string(&config_path)
-        .map_err(|e| e.to_string())
-        .and_then(|text| text.parse().map_err(|e: toml::de::Error| e.to_string()))
-        .map_err(|e| StartupError::new(EXIT_CONFIG, format!("config_error: {}: {e}", config_path.display())))?;
     init_tracing(&cfg.env.log_level);
     // The recorder's handle is kept, so the admin UI can read the metrics
     // back in process (admin-ui design §9.1); `build` also spawns the
@@ -198,6 +194,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
     let metrics_handle = recorder.handle();
     tokio::spawn(exporter);
     metrics::set_global_recorder(recorder).map_err(|e| StartupError::new(1, format!("metrics exporter: {e}")))?;
+    for item in set_aside {
+        crate::config::lenient::note_at_start(item);
+    }
     #[cfg(feature = "standin-hosts")]
     metrics::gauge!("standin_hosts_build").set(1.0);
     // A bench build refuses to start without its heads file (private-threads
@@ -276,7 +275,12 @@ pub async fn run() -> Result<Stopped, StartupError> {
                 ));
             }
             Ok(None) => {}
-            Err(e) => return Err(StartupError::new(1, format!("admin setup code: {e}"))),
+            // No setup code: the admin UI cannot be set up this run, and
+            // nothing else needs it.
+            Err(e) => crate::config::lenient::note_at_start(crate::config::SetAside {
+                key: "admin setup code".to_string(),
+                problem: format!("{e}; the admin UI cannot be set up until this is fixed and Prism restarts"),
+            }),
         }
     }
     // The memory of learned blocks (§5.14.18.1) is off unless switched on.
@@ -401,10 +405,21 @@ pub async fn run() -> Result<Stopped, StartupError> {
         }
     }
     // The block-list index (design-v3 §5.14), only when configured.
-    let farsight = match (&cfg.file.farsight.url, &cfg.env.farsight_token) {
+    let farsight_client = match (&cfg.file.farsight.url, &cfg.env.farsight_token) {
         (Some(url), Some(token)) => {
-            let client = crate::farsight::FarsightClient::new(&nets, url, token.expose())
-                .ok_or_else(|| StartupError::new(78, "FARSIGHT_TOKEN is not a usable header value".to_string()))?;
+            let client = crate::farsight::FarsightClient::new(&nets, url, token.expose());
+            if client.is_none() {
+                crate::config::lenient::note_at_start(crate::config::SetAside {
+                    key: crate::config::ENV_FARSIGHT_TOKEN.to_string(),
+                    problem: "not a usable header value; Farsight is off".to_string(),
+                });
+            }
+            client
+        }
+        _ => None,
+    };
+    let farsight = match farsight_client {
+        Some(client) => {
             tracing::info!(event = "farsight_enabled", "inbound list blocks are read from Farsight");
             // One connection kept open, so a Thread Lens round never pays
             // for opening one.
@@ -432,7 +447,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
             }
             Some(farsight)
         }
-        _ => None,
+        None => None,
     };
     // The admin UI's Blocks page reads Farsight's status (admin-ui §6.8).
     let health_farsight = farsight.clone();
@@ -975,7 +990,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         Duration::from_secs(cfg.file.kryphocron.oracle_freshness_bound_secs),
         usize::try_from(cfg.file.sync.max_head_fetches_per_request).unwrap_or(16),
         &cfg.file.private_read,
-        // Required and never generated (private posting §3.6, C-14).
+        // Made for the run when the variable is missing or wrong.
         crate::cursor_key::CursorKey::new(cfg.env.private_cursor_key.expose()),
     )
     .with_search(&cfg.file.private_search)

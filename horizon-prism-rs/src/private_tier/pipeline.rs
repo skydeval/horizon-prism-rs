@@ -798,9 +798,11 @@ async fn read_inner(
                 trace,
                 Default::default(),
             );
+            // No hooks (they could not be built at start): no decode.
+            let hooks = env.glue.at_rest_hooks().ok_or(Miss::DecodeFailed)?;
             let bytes = kryphocron::decode_record_content(
                 rauth.authz(),
-                env.glue.at_rest_hooks(),
+                hooks,
                 env.glue.user_sink(),
                 &EncodedRecord::new(codec, encoded, generation),
                 &context,

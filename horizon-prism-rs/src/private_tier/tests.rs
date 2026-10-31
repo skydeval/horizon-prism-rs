@@ -322,7 +322,7 @@ impl Fixture {
             Default::default(),
         );
         let encoded = kryphocron::encode_record_content(
-            self.glue.at_rest_hooks(),
+            self.glue.at_rest_hooks().expect("hooks"),
             self.glue.user_sink(),
             bytes,
             &ctx,

@@ -23,7 +23,7 @@ pub use audit::GlueSinks;
 pub use jwt::{AuthError, JwtVerifier, VerifiedCaller};
 pub use service_key::{ServiceKey, ServiceKeyError, keygen};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SetAside};
 use crate::identity::fetch_cell::AuthBudget;
 use crate::identity::{GuardedDidFetcher, IdentityResolver, JwtFetchCell};
 
@@ -87,7 +87,9 @@ pub fn at_rest_hooks(data_dir: PathBuf) -> Result<Arc<dyn AtRestHooks>, GlueErro
 #[derive(Clone)]
 pub struct PipelineGlue {
     sinks: Arc<GlueSinks>,
-    hooks: Arc<dyn AtRestHooks>,
+    /// `None` when the hooks could not be built at start: encoded posts
+    /// are then served to no one, and everything else runs.
+    hooks: Option<Arc<dyn AtRestHooks>>,
 }
 
 impl PipelineGlue {
@@ -95,8 +97,14 @@ impl PipelineGlue {
     pub fn new(sinks: GlueSinks, hooks: Arc<dyn AtRestHooks>) -> Self {
         Self {
             sinks: Arc::new(sinks),
-            hooks,
+            hooks: Some(hooks),
         }
+    }
+
+    /// Glue whose at-rest hooks could not be built.
+    #[must_use]
+    pub fn without_hooks(sinks: GlueSinks) -> Self {
+        Self { sinks: Arc::new(sinks), hooks: None }
     }
 
     /// A fresh `AuditSinks<'_>` per record (§6.3 step 6).
@@ -115,9 +123,10 @@ impl PipelineGlue {
         self.sinks.substrate_sink()
     }
 
+    /// `None` when they could not be built at start.
     #[must_use]
-    pub fn at_rest_hooks(&self) -> &dyn AtRestHooks {
-        self.hooks.as_ref()
+    pub fn at_rest_hooks(&self) -> Option<&dyn AtRestHooks> {
+        self.hooks.as_deref()
     }
 
     /// `GlueContext::audit_latched` (§6.5): set when the user sink panicked.
@@ -140,8 +149,9 @@ impl GlueContext {
     ///
     /// # Errors
     ///
-    /// An invalid service key or hostname, or at-rest hooks that cannot be
-    /// built or validated. `serve` exits before any listener binds.
+    /// An invalid service key or hostname. `serve` exits before any
+    /// listener binds. At-rest hooks that cannot be built or validated do
+    /// not stop it: encoded posts are served to no one until they can be.
     pub fn new(cfg: &AppConfig, resolver: IdentityResolver, budget: AuthBudget) -> Result<(Self, JoinHandle<()>), GlueError> {
         let service_key = ServiceKey::new(&cfg.env.public_hostname, cfg.env.service_signing_key.expose())?;
         let identity = service_key.service_identity()?;
@@ -153,12 +163,21 @@ impl GlueContext {
             jwt::EVICTION_QUEUE,
         );
         let sinks = GlueSinks::log(CorrelationKey::from_bytes(*cfg.env.correlation_key.expose()));
-        let hooks = at_rest_hooks(cfg.env.data_dir.clone())?;
+        let pipeline = match at_rest_hooks(cfg.env.data_dir.clone()) {
+            Ok(hooks) => PipelineGlue::new(sinks, hooks),
+            Err(error) => {
+                crate::config::lenient::note_at_start(SetAside {
+                    key: "kryphocron at-rest hooks".to_string(),
+                    problem: format!("{error}; encoded kryphocron posts are indexed but served to no one until this is fixed and Prism restarts"),
+                });
+                PipelineGlue::without_hooks(sinks)
+            }
+        };
         Ok((
             Self {
                 service_key,
                 verifier,
-                pipeline: PipelineGlue::new(sinks, hooks),
+                pipeline,
             },
             drainer.spawn(),
         ))

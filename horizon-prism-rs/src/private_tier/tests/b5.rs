@@ -1176,7 +1176,7 @@ pub(super) async fn make_undecodable(pool: &PgPool, pattern: &str) {
         Default::default(),
     );
     let encoded = kryphocron::encode_record_content(
-        glue.at_rest_hooks(),
+        glue.at_rest_hooks().expect("hooks"),
         glue.user_sink(),
         b"undecodable",
         &ctx,

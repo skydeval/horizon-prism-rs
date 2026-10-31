@@ -8,7 +8,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use super::ConfigError;
+use super::{ConfigError, SetAside};
 
 pub const ENV_PUBLIC_HOSTNAME: &str = "APP_PUBLIC_HOSTNAME";
 pub const ENV_DATABASE_URL: &str = "APP_DATABASE_URL";
@@ -20,9 +20,9 @@ pub const ENV_CORRELATION_KEY_HEX: &str = "APP_CORRELATION_KEY_HEX";
 /// The key Thread Lens seals its paging cursors with (design-v3 §5.15.14).
 /// Optional: without it a key is made at each start.
 pub const ENV_THREADLENS_CURSOR_KEY_HEX: &str = "APP_THREADLENS_CURSOR_KEY_HEX";
-/// The key the private tier seals its paging cursors with (private posting
-/// §3.6, C-14). Required: a generated key would break every private cursor
-/// at each restart and between replicas, so it is never made at start.
+/// The key the private tier seals its paging cursors with. Set it: without
+/// it a start makes one for the run, so private cursors stop working at
+/// each restart.
 pub const ENV_PRIVATE_CURSOR_KEY_HEX: &str = "APP_PRIVATE_CURSOR_KEY_HEX";
 /// The key system-account lists are sealed and indexed with (system-accounts
 /// design §1 D-2). Optional: without it the feature is off. Once lists are
@@ -232,6 +232,69 @@ impl EnvConfig {
                 .filter(|v| !v.is_empty())
                 .map(SecretToken),
         })
+    }
+
+    /// Like [`EnvConfig::from_lookup`] for a start: only the core variables
+    /// (hostname, database, Redis, service signing key) stop it. Any other
+    /// variable that is missing or wrong is set aside: its feature is off,
+    /// or a key is made for this run.
+    ///
+    /// # Errors
+    ///
+    /// A core variable missing or wrong.
+    pub fn from_lookup_lenient(lookup: &dyn Fn(&str) -> Option<String>) -> Result<(Self, Vec<SetAside>), ConfigError> {
+        let mut aside = Vec::new();
+        let mut note = |var: &str, problem: String| aside.push(SetAside { key: var.to_string(), problem });
+        // The optional variables, each checked alone; a bad one is taken
+        // out so the strict read below sees it absent or at its default.
+        let set = |var: &str| lookup(var).filter(|v| !v.trim().is_empty());
+        let key = |var: &str| set(var).map(|v| Secret32::from_hex(&v));
+        let flag = |var: &str| match set(var).as_deref().map(str::trim) {
+            None | Some("0") => Ok(false),
+            Some("1") => Ok(true),
+            Some(other) => Err(format!("expected 0 or 1, got {other:?}")),
+        };
+        let mut generated: Vec<(&'static str, String)> = Vec::new();
+        let mut dropped: Vec<&'static str> = Vec::new();
+        for (var, made) in [
+            (ENV_CORRELATION_KEY_HEX, "a key is made for this run, so kryphocron audit correlation ids change at each restart"),
+            (ENV_PRIVATE_CURSOR_KEY_HEX, "a key is made for this run, so kryphocron paging cursors stop working at each restart"),
+        ] {
+            match key(var) {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    note(var, format!("{e}; {made}"));
+                    generated.push((var, hex::encode(rand::random::<[u8; 32]>())));
+                }
+                None => {
+                    note(var, format!("not set; {made}"));
+                    generated.push((var, hex::encode(rand::random::<[u8; 32]>())));
+                }
+            }
+        }
+        for (var, off) in [
+            (ENV_THREADLENS_CURSOR_KEY_HEX, "a key is made for this run, so Thread Lens cursors stop working at each restart"),
+            (ENV_SYSTEM_ACCOUNTS_KEY_HEX, "system accounts are off"),
+        ] {
+            if let Some(Err(e)) = key(var) {
+                note(var, format!("{e}; {off}"));
+                dropped.push(var);
+            }
+        }
+        for var in [ENV_ALLOW_STARTUP_MIGRATE, ENV_SUPERVISED] {
+            if let Err(e) = flag(var) {
+                note(var, format!("{e}; read as 0"));
+                dropped.push(var);
+            }
+        }
+        let patched = |var: &str| -> Option<String> {
+            if dropped.contains(&var) {
+                return None;
+            }
+            generated.iter().find(|(v, _)| *v == var).map(|(_, value)| value.clone()).or_else(|| lookup(var))
+        };
+        let env = Self::from_lookup(&patched)?;
+        Ok((env, aside))
     }
 
     /// `did:web:<public_hostname>` (§6.8).
