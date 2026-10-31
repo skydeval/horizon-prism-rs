@@ -77,8 +77,13 @@ async fn rig() -> Option<Rig> {
     Some(rig_with(conn, fast(), None).await)
 }
 
+/// Each test commit gets its own rev, as each real commit does: the feed
+/// counts a repo and rev once, whichever relay sent it.
+static NEXT_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(super) fn commit(repo: &str, ops: &Value, relay: &str, time: Option<String>) -> Vec<(String, String)> {
-    let mut data = json!({"repo": repo, "rev": "3kaaaaaaaaa22", "ops": ops, "_relay": relay});
+    let rev = format!("3k{:011}", NEXT_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let mut data = json!({"repo": repo, "rev": rev, "ops": ops, "_relay": relay});
     if let Some(t) = time {
         data["time"] = json!(t);
     }
@@ -926,7 +931,7 @@ fn t_p24_the_script() {
         "show(ev);",
         "ev.totals",
         "ev.events.total",
-        "Counted since Horizon-Prism started, ",
+        "ev.received.total",
         "reconnect(30000)",
         "10 * 60 * 1000",
         "The live feed is busy right now. The rest of this page is current.",

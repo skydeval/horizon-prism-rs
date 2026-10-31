@@ -21,7 +21,8 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
   records received and a second, likes, posts and reposts, blocks and
   identity events, counted since Horizon-Prism started, the same for every
   viewer and kept across reloads. The per-tab counts and the missed and
-  skipped notes are gone.
+  skipped notes are gone. Totals are kept across restarts, and each event is
+  counted once.
 - **A bad setting no longer stops the start.** An unknown, mistyped or
   out-of-range key in `app.toml` is set aside and its default applies; a bad
   feature URL turns that feature off. A missing or malformed

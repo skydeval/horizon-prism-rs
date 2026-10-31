@@ -1,7 +1,7 @@
 // The public page's live feed: every relay event, as it arrives. Rows are
 // built with createElement and textContent only, at most once per animation
 // frame, and the list keeps the newest 20. The counts are the server's,
-// since Horizon-Prism started, so every viewer sees the same numbers.
+// kept across restarts, each event counted once whichever relay sent it.
 (function () {
   'use strict';
   var off = document.getElementById('live-off');
@@ -90,8 +90,8 @@
   }
   function show(ev) {
     var t = ev.totals, a = ev.arrivals;
-    cells.received.textContent = sum(t, null).toLocaleString();
-    cells.rate.textContent = sum(a, null).toLocaleString();
+    cells.received.textContent = ev.received.total.toLocaleString();
+    cells.rate.textContent = ev.received.now.toLocaleString();
     cells.likes.textContent = both(sum(t, ['like']), sum(a, ['like']));
     var posts = ['post', 'reply', 'repost'];
     cells.posts.textContent = both(sum(t, posts), sum(a, posts));
@@ -141,7 +141,9 @@
       pending = [];
       backlogE = ev.e;
       if (ev.since) {
-        sinceEl.textContent = 'Counted since Horizon-Prism started, ' + ev.since + ' UTC.';
+        sinceEl.textContent = ev.kinds_since && ev.kinds_since !== ev.since
+          ? 'Events counted since ' + ev.since + ' UTC; the rest since ' + ev.kinds_since + ' UTC.'
+          : 'Counted since ' + ev.since + ' UTC.';
         sinceEl.hidden = false;
       }
       while (list.firstChild) { list.removeChild(list.firstChild); }

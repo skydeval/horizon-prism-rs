@@ -20,7 +20,7 @@
 //! "l":[[s, a, n, m, id], …]}`, with `s` seconds after `t0` and `m` the
 //! DID's method (`p`, `w`, or `""` for the whole string in `id`).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -103,7 +103,18 @@ struct Published {
     skipped_since_start: bool,
     /// Redis time of the last tick.
     now_ms: i64,
+    /// When the stored totals began ("YYYY-MM-DD HH:00", UTC): the events
+    /// total, and the per-kind totals. Empty until the store is read.
+    events_since: String,
+    kinds_since: String,
 }
+
+/// The Redis hash the totals are kept in, so they outlive a restart.
+pub const TOTALS_KEY: &str = "public_page:totals";
+/// A copy of an event from another relay within this long is not counted.
+const COPY_WINDOW_MS: i64 = 5 * 60 * 1000;
+/// How often the totals are written to the store.
+const FLUSH_MS: i64 = 10_000;
 
 /// The publisher's handle. Cheap to clone.
 #[derive(Clone)]
@@ -133,8 +144,9 @@ impl PublicFeed {
     pub fn start(conn: ConnectionManager, key: &str, labels: Labels, summary: FeedHandle, rs: ReaderSettings, s: FeedSettings, probe: Arc<Probe>) -> (Self, Vec<JoinHandle<()>>) {
         let (tx, rx) = mpsc::channel(s.channel);
         let feed = Self::new(s);
+        let store = conn.clone();
         let mut tasks = Reader::new(conn, key, labels, tx, rs, probe).spawn();
-        tasks.push(tokio::spawn(Publisher::new(feed.clone(), summary).run(rx)));
+        tasks.push(tokio::spawn(Publisher::new(feed.clone(), summary).with_store(store).run(rx)));
         (feed, tasks)
     }
 
@@ -169,8 +181,10 @@ impl PublicFeed {
         let rx = self.0.tx.subscribe();
         let oldest = st.now_ms - self.0.s.ring_age_ms;
         let lines: Vec<&PublicLine> = st.ring.iter().filter(|l| l.entry_ms >= oldest).collect();
-        let mut body = String::with_capacity(64 * lines.len() + 128);
-        let _ = write!(body, r#"{{"e":{},"c":{},"boot":"{}","since":"{}","#, st.e, st.c, self.0.boot, self.0.since);
+        let mut body = String::with_capacity(64 * lines.len() + 160);
+        let since = if st.events_since.is_empty() { &self.0.since } else { &st.events_since };
+        let kinds_since = if st.kinds_since.is_empty() { &self.0.since } else { &st.kinds_since };
+        let _ = write!(body, r#"{{"e":{},"c":{},"boot":"{}","since":"{since}","kinds_since":"{kinds_since}","#, st.e, st.c, self.0.boot);
         wire_lines(&mut body, &lines);
         let _ = write!(
             body,
@@ -328,6 +342,8 @@ impl Hist {
 struct Second {
     arrivals: [u64; KINDS],
     events: u64,
+    /// Events of every type, each counted once whichever relay sent it.
+    received: u64,
     /// By relay: heard in this second, with its delays.
     relays: HashMap<Arc<str>, Hist>,
 }
@@ -349,10 +365,26 @@ struct Publisher {
     offset: i64,
     totals: [u64; KINDS],
     events_total: u64,
+    received_total: u64,
     relays: BTreeMap<String, RelayFigure>,
     inputs: VecDeque<(i64, u64)>,
     last_line_ms: Option<i64>,
     lines_since_anchor: bool,
+    /// Event keys seen within the copy window, and their order.
+    seen: HashSet<u64>,
+    seen_order: VecDeque<(i64, u64)>,
+    /// Where the totals are kept, and what was last written there.
+    store: Option<ConnectionManager>,
+    flushed: Flushed,
+    last_flush_ms: i64,
+}
+
+/// The totals as last written to the store.
+#[derive(Debug, Clone, Copy)]
+struct Flushed {
+    totals: [u64; KINDS],
+    events: u64,
+    received: u64,
 }
 
 impl Publisher {
@@ -367,11 +399,90 @@ impl Publisher {
             offset: 0,
             totals: [0; KINDS],
             events_total: 0,
+            received_total: 0,
             relays: BTreeMap::new(),
             inputs: VecDeque::new(),
             last_line_ms: None,
             lines_since_anchor: false,
+            seen: HashSet::new(),
+            seen_order: VecDeque::new(),
+            store: None,
+            flushed: Flushed { totals: [0; KINDS], events: 0, received: 0 },
+            last_flush_ms: 0,
         }
+    }
+
+    fn with_store(mut self, conn: ConnectionManager) -> Self {
+        self.store = Some(conn);
+        self
+    }
+
+    /// Read the stored totals (and when they began), or start them now.
+    async fn load(&mut self) {
+        let Some(conn) = self.store.as_mut() else { return };
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:00").to_string();
+        let mut pipe = redis::pipe();
+        pipe.cmd("HSETNX").arg(TOTALS_KEY).arg("events_since").arg(&now).ignore();
+        pipe.cmd("HSETNX").arg(TOTALS_KEY).arg("kinds_since").arg(&now).ignore();
+        pipe.cmd("HGETALL").arg(TOTALS_KEY);
+        let stored: Result<(HashMap<String, String>,), _> = pipe.query_async(conn).await;
+        let Ok((stored,)) = stored else {
+            tracing::warn!(event = "public_feed_totals_unread", "the stored totals could not be read; they count from this start");
+            return;
+        };
+        let n = |field: &str| stored.get(field).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        for k in Kind::ALL {
+            self.totals[k.index()] = n(k.slug());
+        }
+        self.events_total = n("identity");
+        self.received_total = n("events");
+        self.flushed = Flushed { totals: self.totals, events: self.events_total, received: self.received_total };
+        let mut st = self.feed.state();
+        st.events_since = stored.get("events_since").cloned().unwrap_or_else(|| now.clone());
+        st.kinds_since = stored.get("kinds_since").cloned().unwrap_or(now);
+    }
+
+    /// Add what was counted since the last write to the stored totals.
+    async fn flush(&mut self) {
+        let Some(conn) = self.store.as_mut() else { return };
+        let mut pipe = redis::pipe();
+        let mut any = false;
+        for k in Kind::ALL {
+            let d = self.totals[k.index()] - self.flushed.totals[k.index()];
+            if d > 0 {
+                pipe.cmd("HINCRBY").arg(TOTALS_KEY).arg(k.slug()).arg(d).ignore();
+                any = true;
+            }
+        }
+        for (field, d) in [("identity", self.events_total - self.flushed.events), ("events", self.received_total - self.flushed.received)] {
+            if d > 0 {
+                pipe.cmd("HINCRBY").arg(TOTALS_KEY).arg(field).arg(d).ignore();
+                any = true;
+            }
+        }
+        if !any {
+            return;
+        }
+        match pipe.query_async::<()>(conn).await {
+            Ok(()) => self.flushed = Flushed { totals: self.totals, events: self.events_total, received: self.received_total },
+            // Kept for the next write: nothing counted is lost.
+            Err(error) => tracing::warn!(event = "public_feed_totals_unwritten", %error, "the totals could not be written; retried at the next write"),
+        }
+    }
+
+    /// Whether an event with this key was already counted from another
+    /// relay within the copy window; records it if not.
+    fn is_copy(&mut self, key: u64, entry_ms: i64) -> bool {
+        while self.seen_order.front().is_some_and(|(ms, _)| *ms < entry_ms - COPY_WINDOW_MS) {
+            if let Some((_, k)) = self.seen_order.pop_front() {
+                self.seen.remove(&k);
+            }
+        }
+        if !self.seen.insert(key) {
+            return true;
+        }
+        self.seen_order.push_back((entry_ms, key));
+        false
     }
 
     fn s(&self) -> FeedSettings {
@@ -389,11 +500,17 @@ impl Publisher {
         // The next grid point, kept across wakes: every point runs once and
         // in order, whatever the messages' timing, so a line's tick never
         // moves with the reader's latency.
+        self.load().await;
+        self.last_flush_ms = local_ms();
         let mut next = ((local_ms() + self.offset).div_euclid(tick) + 1) * tick;
         loop {
             while local_ms() + self.offset >= next {
                 self.tick(next);
                 next += tick;
+            }
+            if local_ms() - self.last_flush_ms >= FLUSH_MS {
+                self.last_flush_ms = local_ms();
+                self.flush().await;
             }
             let wait = u64::try_from(next - self.offset - local_ms()).unwrap_or(0);
             tokio::select! {
@@ -433,12 +550,25 @@ impl Publisher {
 
     fn entry(&mut self, d: Decoded) {
         let second = d.entry_ms.div_euclid(1000);
-        if self.last_published.is_some_and(|p| second <= p) {
+        let late = self.last_published.is_some_and(|p| second <= p);
+        // Every relay's copy still counts toward that relay's delay.
+        if !late {
+            let hist = self.seconds.entry(second).or_default().relays.entry(Arc::clone(&d.relay)).or_default();
+            if let Some(ms) = d.delay_ms {
+                hist.add(ms);
+            }
+        }
+        // A copy of an event another relay already sent: not counted, not shown.
+        if d.key.is_some_and(|k| self.is_copy(k, d.entry_ms)) {
+            return;
+        }
+        if late {
             // Its second is out: the totals only, once.
             for k in &d.kinds {
                 self.totals[k.index()] += 1;
             }
             self.events_total += u64::from(d.identity);
+            self.received_total += 1;
             self.feed.0.late_ops.fetch_add(d.kinds.len() as u64, Ordering::Relaxed);
         } else {
             let acc = self.seconds.entry(second).or_default();
@@ -446,10 +576,7 @@ impl Publisher {
                 acc.arrivals[k.index()] += 1;
             }
             acc.events += u64::from(d.identity);
-            let hist = acc.relays.entry(Arc::clone(&d.relay)).or_default();
-            if let Some(ms) = d.delay_ms {
-                hist.add(ms);
-            }
+            acc.received += 1;
         }
         if let Some(line) = d.line {
             let at = self.tick_of(line.entry_ms + self.s().release_ms);
@@ -581,12 +708,14 @@ impl Publisher {
                     acc.arrivals[i] += n;
                 }
                 acc.events += o.events;
+                acc.received += o.received;
             }
         }
         for (i, n) in acc.arrivals.iter().enumerate() {
             self.totals[i] += n;
         }
         self.events_total += acc.events;
+        self.received_total += acc.received;
         for (relay, hist) in &acc.relays {
             let f = self.relays.entry(relay.to_string()).or_insert(RelayFigure { last_heard_sec: second, delay: None });
             f.last_heard_sec = second;
@@ -612,12 +741,14 @@ impl Publisher {
             };
             let input = self.input_rate().map_or_else(|| "null".to_string(), |r| format!("{r:.1}"));
             let body = format!(
-                r#"{{"e":{},"t":{second},"arrivals":{{{}}},"totals":{{{}}},"events":{{"now":{},"total":{}}},"input":{input}}}"#,
+                r#"{{"e":{},"t":{second},"arrivals":{{{}}},"totals":{{{}}},"events":{{"now":{},"total":{}}},"received":{{"now":{},"total":{}}},"input":{input}}}"#,
                 st.e,
                 kinds(&acc.arrivals),
                 kinds(&self.totals),
                 acc.events,
-                self.events_total
+                self.events_total,
+                acc.received,
+                self.received_total
             );
             let frame = Frame { e: st.e, c: st.c, bytes: sse("counts", &body) };
             self.feed.0.framed.fetch_add(1, Ordering::Relaxed);
@@ -650,7 +781,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn decoded(ms: i64, kinds: Vec<Kind>, line: Option<PublicLine>) -> Decoded {
-        Decoded { entry_ms: ms, relay: Arc::from("one"), kinds, identity: false, delay_ms: None, line }
+        Decoded { entry_ms: ms, relay: Arc::from("one"), kinds, identity: false, delay_ms: None, line, key: None }
     }
 
     /// The `data` of a framed event, parsed.
@@ -756,8 +887,9 @@ pub(crate) mod tests {
         let second = counts.iter().find(|v| v["t"] == (base + 1000) / 1000).expect("the second");
         let mut keys: Vec<&str> = second.as_object().expect("object").keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["arrivals", "e", "events", "input", "t", "totals"]);
+        assert_eq!(keys, vec!["arrivals", "e", "events", "input", "received", "t", "totals"]);
         assert_eq!(second["arrivals"], serde_json::json!({"like": 8}));
+        assert_eq!(second["received"], serde_json::json!({"now": 8, "total": 8}));
         assert_eq!(second["input"], 4500.0);
         // Late: a second already out.
         p.absorb(Msg::Entries(vec![decoded(base + 1500, vec![Kind::Like, Kind::Post], None)]));
@@ -766,6 +898,30 @@ pub(crate) mod tests {
         let s = summary.load();
         assert_eq!(s.totals, vec![("post".to_string(), 1), ("like".to_string(), 9)]);
         assert_eq!(s.input_per_sec, Some(4500.0));
+    }
+
+    /// The same event from three relays is counted and shown once; another
+    /// event, and the same key past the copy window, count again.
+    #[test]
+    fn a_copy_from_another_relay_counts_once() {
+        let (mut p, mut rx, _summary) = publisher();
+        let base = 1_000_000_000_000_i64;
+        p.tick(base);
+        let copy = |ms: i64, relay: &str, key: u64| Decoded {
+            relay: Arc::from(relay),
+            key: Some(key),
+            ..decoded(ms, vec![Kind::Like], Some(line(ms, "app.bsky.feed.like", "did:plc:a")))
+        };
+        p.absorb(Msg::Entries(vec![copy(base + 1000, "one", 7), copy(base + 1100, "two", 7), copy(base + 1200, "three", 7), copy(base + 1300, "one", 8)]));
+        p.tick(base + 2500);
+        let frames = drain(&mut rx);
+        let counts = frames.iter().find(|(n, v)| n == "counts" && v["t"] == (base + 1000) / 1000).map(|(_, v)| v.clone()).expect("the second");
+        assert_eq!(counts["arrivals"], serde_json::json!({"like": 2}));
+        assert_eq!(counts["received"]["total"], 2);
+        let lines: usize = frames.iter().filter(|(n, _)| n == "lines").map(|(_, v)| lines_of(v).len()).sum();
+        assert_eq!(lines, 2);
+        // Past the window, the same key is a new event.
+        assert!(!p.is_copy(7, base + 1000 + COPY_WINDOW_MS + 1));
     }
 
     /// T-P5: a relay's figure is the lower edge of its median's bucket, over

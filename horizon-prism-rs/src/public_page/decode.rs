@@ -90,6 +90,20 @@ pub struct Decoded {
     pub delay_ms: Option<i64>,
     /// `None` for a hidden or empty commit.
     pub line: Option<PublicLine>,
+    /// The same event from another relay has the same key: a commit's repo
+    /// and rev, another event's type, DID and time. `None` when the entry
+    /// carries no such fields; it is then never taken for a copy.
+    pub key: Option<u64>,
+}
+
+/// A key that names one event, whichever relay sent it.
+fn event_key(parts: &[&str]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// A JSON value that is a string, or anything else (skipped).
@@ -184,6 +198,8 @@ struct LeanData<'a> {
     #[serde(borrow, default)]
     did: Option<Strict<'a>>,
     #[serde(borrow, default)]
+    rev: Option<Text<'a>>,
+    #[serde(borrow, default)]
     time: Option<Text<'a>>,
     #[serde(borrow, default, rename = "_relay")]
     relay: Option<Text<'a>>,
@@ -270,6 +286,7 @@ pub fn decode(entry: &StreamEntry, labels: &Labels) -> Option<Decoded> {
             ("#account", Some(false)) => Action::Inactive,
             _ => Action::None,
         };
+        let key = data.time.as_ref().and_then(Text::as_str).filter(|_| !did.is_empty()).map(|t| event_key(&[nsid, &did, t]));
         return Some(Decoded {
             entry_ms,
             relay,
@@ -277,6 +294,7 @@ pub fn decode(entry: &StreamEntry, labels: &Labels) -> Option<Decoded> {
             identity: true,
             delay_ms: None,
             line: Some(PublicLine { entry_ms, action, nsid: nsid.to_string(), did: bounded(&did, DID_MAX) }),
+            key,
         });
     }
     let ops = data.ops.unwrap_or_default();
@@ -294,16 +312,18 @@ pub fn decode(entry: &StreamEntry, labels: &Labels) -> Option<Decoded> {
         .and_then(Text::as_str)
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .map(|t| (entry_ms - t.timestamp_millis()).max(0));
+    let repo = data.repo.map(|r| r.0).unwrap_or_default();
+    let key = data.rev.as_ref().and_then(Text::as_str).filter(|_| !repo.is_empty()).map(|rev| event_key(&["commit", &repo, rev]));
     let line = match ops.first() {
         Some(first) if !ops.iter().any(|op| hidden(collection(&op.path.0))) => Some(PublicLine {
             entry_ms,
             action: Action::of_op(first.action.as_ref().and_then(Text::as_str)),
             nsid: bounded(collection(&first.path.0), NSID_MAX),
-            did: bounded(&data.repo.map(|r| r.0).unwrap_or_default(), DID_MAX),
+            did: bounded(&repo, DID_MAX),
         }),
         _ => None,
     };
-    Some(Decoded { entry_ms, relay, kinds, identity: false, delay_ms, line })
+    Some(Decoded { entry_ms, relay, kinds, identity: false, delay_ms, line, key })
 }
 
 #[cfg(test)]
