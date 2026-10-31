@@ -395,7 +395,7 @@ impl PublicIndexing {
         };
         let next = generation + 1;
         let at = now();
-        let filling = pending == json!(ScopeValue::CommunityScoped.as_str());
+        let filling = pending == json!(ScopeValue::Community.as_str());
         let t = if filling {
             Transition::filling(next, at)
         } else {
@@ -408,7 +408,7 @@ impl PublicIndexing {
         if filling {
             sqlx::query("UPDATE operator_settings SET value = $2, updated_at = now() WHERE key = $1")
                 .bind(super::public_mode::SETTING_KEY)
-                .bind(ScopeValue::CommunityScoped.to_json())
+                .bind(ScopeValue::Community.to_json())
                 .execute(&mut *tx)
                 .await?;
         }

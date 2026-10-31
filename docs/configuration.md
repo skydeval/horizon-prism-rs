@@ -44,7 +44,7 @@ Only these stop a start (exit 78):
 |---|---|
 | `[http]`, `[metrics]` | Listen addresses; the one proxy address trusted for client IPs. |
 | `[net]` | DNS resolvers for public and background lookups. |
-| `[indexing]` | Public indexing: `off` or `community_scoped`. |
+| `[indexing]` | What is indexed: `kryphocron_only` or `community` (`full` is not built yet). |
 | `[scope]` | Which accounts beyond members are indexed, and for how long. |
 | `[community]` | Auto-enroll, member cap, readiness retry hints. |
 | `[firehose]` | Stream names, batch size, dead letters, which relays are private relays. |
@@ -81,7 +81,7 @@ The comments in `app.toml` describe every key.
    A pattern is an exact host or `*.` plus a suffix. Accounts on these hosts are answered from local data.
 3. **Relays.** `[firehose] private_relays` lists the relays that must crawl the community PDS; kryphocron reads wait for the slowest. Each label maps to a sidecar's relay URL in `[firehose.relay_labels]`; the sidecar configs are in `docker/firehose/`. See [firehose and relays](design/firehose-and-relays.md).
 4. **Members.** Add them with `admin member add` or the admin UI. `[community] auto_enroll = true` (off by default) lets accounts on your PDS join by themselves; `enroll_pds_patterns` limits the hosts (empty means the community patterns), and `max_members` caps the total. See [membership](design/membership.md).
-5. **Public indexing.** A fresh install starts with `public_scope = "off"`: only what kryphocron, Thread Lens and the Horizon features need, and clients use a public AppView for the rest. `community_scoped` also serves public timelines, search and the rest of `app.bsky.*`. See [indexing and scope](design/indexing-and-scope.md).
+5. **Public indexing.** A fresh install starts with `public_scope = "kryphocron_only"`: only what kryphocron, Thread Lens and the Horizon features need, and clients use a public AppView for the rest. `community` also serves public timelines, search and the rest of `app.bsky.*`. See [indexing and scope](design/indexing-and-scope.md).
 6. **Upstreams.** `[constellation.cascade] order` sets the order upstream AppViews are asked for accounts outside your community.
 
 ## Optional services

@@ -151,9 +151,9 @@ async fn s1_an_upgrade_stays_on() {
     let p = &db.pool;
     exec(p, &format!("INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at) VALUES ('at://{B}/app.bsky.feed.post/1', '{B}', '1', 'c', '3k', '{{}}', now())")).await;
     let (pi, scope) = boot(p, settings()).await;
-    assert_eq!(pi.startup(&file(Some(PublicScope::Off))).await.expect("startup"), None);
+    assert_eq!(pi.startup(&file(Some(PublicScope::KryphocronOnly))).await.expect("startup"), None);
     let (value, file_value, by) = setting(p).await;
-    assert_eq!((value, file_value, by.as_str()), (json!("community_scoped"), Some(json!({"value": "off", "explicit": true})), "upgrade"));
+    assert_eq!((value, file_value, by.as_str()), (json!("community"), Some(json!({"value": "kryphocron_only", "explicit": true})), "upgrade"));
     let t = transition(p).await;
     assert_eq!((&t["phase"], &t["generation"], &t["last_fill_since"]), (&json!("on"), &json!(1), &Value::Null));
     assert_eq!(scope.public_mode(), PublicMode::On);
@@ -163,7 +163,7 @@ async fn s1_an_upgrade_stays_on() {
 }
 
 /// S2: an empty database is off with no key, and on with an explicit
-/// `community_scoped`; neither spawns anything.
+/// `community`; neither spawns anything.
 #[tokio::test]
 async fn s2_a_fresh_install_takes_the_file() {
     let Some(db) = fresh_db("public_s2").await else {
@@ -173,14 +173,14 @@ async fn s2_a_fresh_install_takes_the_file() {
     let (pi, scope) = boot(p, settings()).await;
     assert_eq!(pi.startup(&file(None)).await.expect("startup"), None);
     let (value, file_value, by) = setting(p).await;
-    assert_eq!((value, file_value, by.as_str()), (json!("off"), Some(json!({"value": "off", "explicit": false})), "startup"));
+    assert_eq!((value, file_value, by.as_str()), (json!("kryphocron_only"), Some(json!({"value": "kryphocron_only", "explicit": false})), "startup"));
     assert_eq!((&transition(p).await["phase"], &transition(p).await["generation"]), (&json!("off"), &json!(1)));
     assert_eq!(scope.public_mode(), PublicMode::Off);
 
     exec(p, "DELETE FROM operator_settings; DELETE FROM worker_state WHERE key = 'public_transition'").await;
     let (pi, scope) = boot(p, settings()).await;
-    assert_eq!(pi.startup(&file(Some(PublicScope::CommunityScoped))).await.expect("startup"), None);
-    assert_eq!(setting(p).await.0, json!("community_scoped"));
+    assert_eq!(pi.startup(&file(Some(PublicScope::Community))).await.expect("startup"), None);
+    assert_eq!(setting(p).await.0, json!("community"));
     assert_eq!(transition(p).await["phase"], "on");
     assert_eq!(scope.public_mode(), PublicMode::On);
     db.drop_db().await;
@@ -195,21 +195,21 @@ async fn s3_s4_s6_apply_nothing() {
     let p = &db.pool;
     let on = Transition::settled(Phase::On, 5, now(), None).to_json();
     // S3: first sight.
-    seed(p, "community_scoped", None, &on).await;
+    seed(p, "community", None, &on).await;
     let (pi, scope) = boot(p, settings()).await;
-    assert_eq!(pi.startup(&file(Some(PublicScope::Off))).await.expect("startup"), None);
-    assert_eq!(setting(p).await, (json!("community_scoped"), Some(json!({"value": "off", "explicit": true})), "cli".to_string()));
+    assert_eq!(pi.startup(&file(Some(PublicScope::KryphocronOnly))).await.expect("startup"), None);
+    assert_eq!(setting(p).await, (json!("community"), Some(json!({"value": "kryphocron_only", "explicit": true})), "cli".to_string()));
     assert_eq!((scope.public_mode(), transition(p).await["generation"].clone()), (PublicMode::On, json!(5)));
     // S4: a CLI-set value stands while the file is unchanged.
     let (pi, scope) = boot(p, settings()).await;
-    assert_eq!(pi.startup(&file(Some(PublicScope::Off))).await.expect("startup"), None);
-    assert_eq!(setting(p).await.0, json!("community_scoped"));
+    assert_eq!(pi.startup(&file(Some(PublicScope::KryphocronOnly))).await.expect("startup"), None);
+    assert_eq!(setting(p).await.0, json!("community"));
     assert_eq!(scope.public_mode(), PublicMode::On);
     // S6: the explicit key becomes a comment.
-    exec(p, "UPDATE operator_settings SET file_value = '{\"value\": \"community_scoped\", \"explicit\": true}'").await;
+    exec(p, "UPDATE operator_settings SET file_value = '{\"value\": \"community\", \"explicit\": true}'").await;
     let (pi, scope) = boot(p, settings()).await;
     assert_eq!(pi.startup(&file(None)).await.expect("startup"), None);
-    assert_eq!(setting(p).await, (json!("community_scoped"), Some(json!({"value": "off", "explicit": false})), "cli".to_string()));
+    assert_eq!(setting(p).await, (json!("community"), Some(json!({"value": "kryphocron_only", "explicit": false})), "cli".to_string()));
     assert_eq!(scope.public_mode(), PublicMode::On);
     assert_eq!(transition(p).await["generation"], 5);
     assert!(pi.hooks.spawned().is_empty());
@@ -224,14 +224,14 @@ async fn s5_from_off_spawns_one_fill_then_one_checker() {
         return;
     };
     let p = &db.pool;
-    seed(p, "off", Some(json!({"value": "off", "explicit": false})), &Transition::settled(Phase::Off, 2, now(), None).to_json()).await;
+    seed(p, "kryphocron_only", Some(json!({"value": "kryphocron_only", "explicit": false})), &Transition::settled(Phase::Off, 2, now(), None).to_json()).await;
     let (pi, scope) = boot(p, settings()).await;
-    let task = pi.startup(&file(Some(PublicScope::CommunityScoped))).await.expect("startup");
+    let task = pi.startup(&file(Some(PublicScope::Community))).await.expect("startup");
     assert_eq!(*pi.hooks.steps.lock().expect("hooks"), ["record", "validate", "map", "memory", "s5"]);
     let Some(task @ Spawn::Fill { generation: 3, .. }) = task else {
         panic!("expected the fill pass at generation 3, got {task:?}");
     };
-    assert_eq!(setting(p).await, (json!("community_scoped"), Some(json!({"value": "community_scoped", "explicit": true})), "file".to_string()));
+    assert_eq!(setting(p).await, (json!("community"), Some(json!({"value": "community", "explicit": true})), "file".to_string()));
     let t = transition(p).await;
     assert_eq!((&t["phase"], &t["generation"]), (&json!("filling"), &json!(3)));
     assert_eq!(t["last_fill_since"], t["fill"]["since"]);
@@ -250,13 +250,13 @@ async fn s5_from_draining_sets_pending() {
     };
     let p = &db.pool;
     exec(p, &feed_sql(2)).await;
-    seed(p, "off", Some(json!({"value": "off", "explicit": false})), &Transition::draining(4, now(), None).to_json()).await;
+    seed(p, "kryphocron_only", Some(json!({"value": "kryphocron_only", "explicit": false})), &Transition::draining(4, now(), None).to_json()).await;
     let (pi, scope) = boot(p, settings()).await;
-    let task = pi.startup(&file(Some(PublicScope::CommunityScoped))).await.expect("startup");
+    let task = pi.startup(&file(Some(PublicScope::Community))).await.expect("startup");
     assert!(matches!(task, Some(Spawn::Sweep { generation: 4, .. })), "{task:?}");
     let t = transition(p).await;
-    assert_eq!((&t["phase"], &t["generation"], &t["pending"]), (&json!("draining"), &json!(4), &json!("community_scoped")));
-    assert_eq!(setting(p).await.0, json!("off"));
+    assert_eq!((&t["phase"], &t["generation"], &t["pending"]), (&json!("draining"), &json!(4), &json!("community")));
+    assert_eq!(setting(p).await.0, json!("kryphocron_only"));
     drop(pi.spawn(task.expect("task")));
     eventually("on", async || scope.public_mode() == PublicMode::On).await;
     assert_eq!(pi.hooks.spawned(), ["sweep", "fill", "checker"]);
@@ -274,9 +274,9 @@ async fn s5_from_held_drains() {
     };
     let p = &db.pool;
     let held = json!({"phase": "draining", "generation": "x", "since": null, "pending": null, "last_fill_since": null, "sweep": null, "fill": null});
-    seed(p, "off", Some(json!({"value": "community_scoped", "explicit": true})), &held).await;
+    seed(p, "kryphocron_only", Some(json!({"value": "community", "explicit": true})), &held).await;
     let (pi, scope) = boot(p, settings()).await;
-    let task = pi.startup(&file(Some(PublicScope::Off))).await.expect("startup");
+    let task = pi.startup(&file(Some(PublicScope::KryphocronOnly))).await.expect("startup");
     assert!(matches!(task, Some(Spawn::Sweep { generation: 1, .. })), "{task:?}");
     assert_eq!(scope.public_mode(), PublicMode::Draining);
     let t = transition(p).await;
@@ -307,7 +307,7 @@ async fn bad_sweep_states_reset_and_complete() {
         exec(p, &feed_sql(2)).await;
         let mut t = Transition::draining(7, now(), None).to_json();
         t["sweep"] = bad.clone();
-        seed(p, "off", Some(json!({"value": "off", "explicit": false})), &t).await;
+        seed(p, "kryphocron_only", Some(json!({"value": "kryphocron_only", "explicit": false})), &t).await;
         let (pi, scope) = boot(p, settings()).await;
         let task = pi.startup(&file(None)).await.expect("startup");
         let Some(Spawn::Sweep { generation: 7, sweep }) = &task else {
@@ -343,21 +343,21 @@ async fn invalid_states_map_to_held() {
     let mut x = Transition::settled(Phase::On, 4, at, None).to_json();
     x["generation"] = json!("x");
     let mut pending = Transition::filling(3, at).to_json();
-    pending["pending"] = json!("community_scoped");
+    pending["pending"] = json!("community");
     let earlier = rfc3339(&(at - TimeDelta::seconds(1)));
     for (value, t) in [
-        ("community_scoped", x),
-        ("off", yesterday),
-        ("community_scoped", fill(json!({"waiting_since": rfc3339(&at)}))),
-        ("community_scoped", fill(json!({"stage": "waiting", "part": "members", "waiting_since": rfc3339(&at)}))),
-        ("community_scoped", fill(json!({"enqueued": -1}))),
-        ("community_scoped", fill(json!({"stage": "waiting", "part": "scope", "waiting_since": earlier}))),
-        ("community_scoped", pending),
+        ("community", x),
+        ("kryphocron_only", yesterday),
+        ("community", fill(json!({"waiting_since": rfc3339(&at)}))),
+        ("community", fill(json!({"stage": "waiting", "part": "members", "waiting_since": rfc3339(&at)}))),
+        ("community", fill(json!({"enqueued": -1}))),
+        ("community", fill(json!({"stage": "waiting", "part": "scope", "waiting_since": earlier}))),
+        ("community", pending),
         // Value and phase disagree.
-        ("off", Transition::settled(Phase::On, 2, at, None).to_json()),
+        ("kryphocron_only", Transition::settled(Phase::On, 2, at, None).to_json()),
     ] {
         exec(p, "DELETE FROM operator_settings; DELETE FROM worker_state WHERE key = 'public_transition'").await;
-        seed(p, value, Some(json!({"value": "off", "explicit": false})), &t).await;
+        seed(p, value, Some(json!({"value": "kryphocron_only", "explicit": false})), &t).await;
         let (pi, scope) = boot(p, settings()).await;
         assert_eq!(pi.startup(&file(None)).await.expect("startup"), None, "{t}");
         assert_eq!(scope.public_mode(), PublicMode::Held, "{t}");
@@ -376,11 +376,11 @@ async fn leaving_held() {
     let p = &db.pool;
     members(p, &[MEMBER]).await;
     in_scope(p, &[MEMBER, B]).await;
-    let fv = Some(json!({"value": "off", "explicit": false}));
+    let fv = Some(json!({"value": "kryphocron_only", "explicit": false}));
     // `last_fill_since = "yesterday"`: off writes null and stored + 1.
     let mut t = Transition::settled(Phase::Off, 4, now(), None).to_json();
     t["last_fill_since"] = json!("yesterday");
-    seed(p, "off", fv.clone(), &t).await;
+    seed(p, "kryphocron_only", fv.clone(), &t).await;
     let (pi, scope) = boot(p, settings()).await;
     pi.startup(&file(None)).await.expect("startup");
     assert_eq!(scope.public_mode(), PublicMode::Held);
@@ -396,7 +396,7 @@ async fn leaving_held() {
     assert_eq!(r.outcomes, [OpOutcome::Written]);
     assert!(pi.hooks.spawned().is_empty(), "no sweep or fill runs in Held");
 
-    let applied = pi.apply_scope(ScopeValue::Off, "cli").await.expect("apply");
+    let applied = pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("apply");
     assert_eq!((applied.action, applied.mode, applied.generation), ("draining", PublicMode::Draining, 5));
     let t = transition(p).await;
     assert_eq!((&t["phase"], &t["generation"], &t["last_fill_since"]), (&json!("draining"), &json!(5), &Value::Null));
@@ -407,14 +407,14 @@ async fn leaving_held() {
     // A Held state whose `last_fill_since` parses keeps it.
     let kept = now() - TimeDelta::days(3);
     let mut t = Transition::filling(8, now()).to_json();
-    t["pending"] = json!("community_scoped");
+    t["pending"] = json!("community");
     t["last_fill_since"] = json!(rfc3339(&kept));
     exec(p, "DELETE FROM operator_settings; DELETE FROM worker_state WHERE key = 'public_transition'").await;
-    seed(p, "community_scoped", fv.clone(), &t).await;
+    seed(p, "community", fv.clone(), &t).await;
     let (pi, scope) = boot(p, settings()).await;
     pi.startup(&file(None)).await.expect("startup");
     assert_eq!(scope.public_mode(), PublicMode::Held);
-    pi.apply_scope(ScopeValue::Off, "cli").await.expect("apply");
+    pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("apply");
     let t = transition(p).await;
     assert_eq!((&t["generation"], parse_ts(&t["last_fill_since"])), (&json!(9), Some(kept)));
     db.drop_db().await;
@@ -429,19 +429,19 @@ async fn restarts_resume_where_they_stopped() {
         return;
     };
     let p = &db.pool;
-    let fv = Some(json!({"value": "off", "explicit": false}));
+    let fv = Some(json!({"value": "kryphocron_only", "explicit": false}));
     exec(p, &feed_sql(5)).await;
-    seed(p, "community_scoped", fv.clone(), &Transition::settled(Phase::On, 1, now(), None).to_json()).await;
+    seed(p, "community", fv.clone(), &Transition::settled(Phase::On, 1, now(), None).to_json()).await;
     let (pi, _) = boot(p, settings()).await;
     pi.startup(&file(None)).await.expect("startup");
-    let Some(Spawn::Sweep { generation: 2, .. }) = pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").spawn else {
+    let Some(Spawn::Sweep { generation: 2, .. }) = pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").spawn else {
         panic!("expected a sweep");
     };
     // Draining, after one batch.
     let Batch::Advanced { deleted: 3, last } = pi.sweep_batch(2, 0, None, 3).await.expect("batch") else {
         panic!("expected three rows deleted");
     };
-    assert_eq!(pi.apply_scope(ScopeValue::CommunityScoped, "cli").await.expect("pending").action, "pending_set");
+    assert_eq!(pi.apply_scope(ScopeValue::Community, "cli").await.expect("pending").action, "pending_set");
     // Kill, and restart.
     let (pi, scope) = boot(p, settings()).await;
     let task = pi.startup(&file(None)).await.expect("startup");
@@ -449,7 +449,7 @@ async fn restarts_resume_where_they_stopped() {
         panic!("expected the sweep, got {task:?}");
     };
     assert_eq!((sweep.table.as_str(), &sweep.after), ("feed_items", &last.to_json()));
-    assert_eq!(transition(p).await["pending"], "community_scoped", "pending survives");
+    assert_eq!(transition(p).await["pending"], "community", "pending survives");
     drop(pi.spawn(task.expect("task")));
     eventually("filling", async || scope.public_mode() != PublicMode::Draining).await;
     assert_eq!(*pi.hooks.windows.lock().expect("hooks").first().expect("a window"), ("feed_items", 3));
@@ -467,7 +467,7 @@ async fn restarts_resume_where_they_stopped() {
         f.waiting_since = Some(ws);
     }
     exec(p, "DELETE FROM operator_settings; DELETE FROM worker_state WHERE key = 'public_transition'").await;
-    seed(p, "community_scoped", fv.clone(), &t.to_json()).await;
+    seed(p, "community", fv.clone(), &t.to_json()).await;
     let (pi, _) = boot(p, settings()).await;
     assert_eq!(pi.startup(&file(None)).await.expect("startup"), Some(Spawn::Checker { generation: 9, waiting_since: ws }));
     // Filling, stage `enqueue` in `members`.
@@ -477,7 +477,7 @@ async fn restarts_resume_where_they_stopped() {
         f.enqueued = 1;
     }
     exec(p, "DELETE FROM operator_settings; DELETE FROM worker_state WHERE key = 'public_transition'").await;
-    seed(p, "community_scoped", fv, &t.to_json()).await;
+    seed(p, "community", fv, &t.to_json()).await;
     let (pi, _) = boot(p, settings()).await;
     assert_eq!(pi.startup(&file(None)).await.expect("startup"), Some(Spawn::Fill { generation: 10, fill: t.fill.expect("fill") }));
     db.drop_db().await;
@@ -496,10 +496,10 @@ async fn a_fill_killed_in_scope_resumes_exactly() {
     members(p, &ms).await;
     in_scope(p, &ms).await;
     in_scope(p, &others).await;
-    seed(p, "off", Some(json!({"value": "off", "explicit": false})), &Transition::settled(Phase::Off, 1, now(), None).to_json()).await;
+    seed(p, "kryphocron_only", Some(json!({"value": "kryphocron_only", "explicit": false})), &Transition::settled(Phase::Off, 1, now(), None).to_json()).await;
     let (pi, _) = boot(p, settings()).await;
     pi.startup(&file(None)).await.expect("startup");
-    let Some(Spawn::Fill { generation: 2, mut fill }) = pi.apply_scope(ScopeValue::CommunityScoped, "cli").await.expect("on").spawn else {
+    let Some(Spawn::Fill { generation: 2, mut fill }) = pi.apply_scope(ScopeValue::Community, "cli").await.expect("on").spawn else {
         panic!("expected the fill");
     };
     let since = fill.since;
@@ -647,7 +647,7 @@ async fn the_sweep_empties_and_thins_every_table() {
     let (pi, scope) = boot(p, settings()).await;
     let filled = now() - TimeDelta::days(2);
     set_memory(&pi, PublicState { mode: PublicMode::On, generation: 1, last_fill_since: Some(filled) }).await;
-    let Some(Spawn::Sweep { generation: 2, .. }) = pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").spawn else {
+    let Some(Spawn::Sweep { generation: 2, .. }) = pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").spawn else {
         panic!("expected the sweep");
     };
     let (mut table, mut after, mut first) = (0, None::<Cursor>, true);
@@ -713,7 +713,7 @@ async fn a_concurrent_delete_never_ends_a_table() {
     let p = &db.pool;
     exec(p, &feed_sql(7)).await;
     let (pi, scope) = boot(p, settings()).await;
-    let task = pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").spawn.expect("sweep");
+    let task = pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").spawn.expect("sweep");
     let (reached, resume) = pi.hooks.arm("sweep_window");
     drop(pi.spawn(task));
     reached.notified().await;
@@ -736,7 +736,7 @@ async fn retries_halve_to_the_floor_and_double_back() {
     let p = &db.pool;
     exec(p, &feed_sql(25)).await;
     let (pi, scope) = boot(p, PublicModeSettings { sweep_window: Some(40), ..settings() }).await;
-    let task = pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").spawn.expect("sweep");
+    let task = pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").spawn.expect("sweep");
     pi.hooks.inject.lock().expect("hooks").extend(["40P01", "55P03", "57014", "57014", "57014"]);
     drop(pi.spawn(task));
     eventually("off", async || scope.public_mode() == PublicMode::Off).await;
@@ -759,7 +759,7 @@ async fn the_stall_alarm_rises_and_clears() {
     exec(p, &feed_sql(2)).await;
     let s = PublicModeSettings { stall_after: Duration::from_millis(100), retry_base: Duration::from_millis(80), ..settings() };
     let (pi, scope) = boot(p, s).await;
-    let task = pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").spawn.expect("sweep");
+    let task = pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").spawn.expect("sweep");
     pi.hooks.inject.lock().expect("hooks").extend(["55P03"; 5]);
     drop(pi.spawn(task));
     eventually("the alarm", async || pi.status().await.expect("status")["error"] == "sweep_stalled").await;
@@ -782,7 +782,7 @@ async fn a_hand_written_phase_change_rolls_the_batch_back() {
     let p = &db.pool;
     exec(p, &feed_sql(2)).await;
     let (pi, scope) = boot(p, settings()).await;
-    let task = pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").spawn.expect("sweep");
+    let task = pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").spawn.expect("sweep");
     let (reached, resume) = pi.hooks.arm("sweep_cursor");
     let handle = pi.spawn(task);
     reached.notified().await;
@@ -805,17 +805,17 @@ async fn on_while_draining_waits_for_the_sweep() {
     let p = &db.pool;
     exec(p, &feed_sql(5)).await;
     let (pi, scope) = boot(p, settings()).await;
-    let Some(Spawn::Sweep { generation: 1, sweep }) = pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").spawn else {
+    let Some(Spawn::Sweep { generation: 1, sweep }) = pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").spawn else {
         panic!("expected the sweep");
     };
     assert!(matches!(pi.sweep_batch(1, 0, None, 3).await.expect("batch"), Batch::Advanced { deleted: 3, .. }));
     let before = transition(p).await;
-    let applied = pi.apply_scope(ScopeValue::CommunityScoped, "cli").await.expect("pending");
+    let applied = pi.apply_scope(ScopeValue::Community, "cli").await.expect("pending");
     assert_eq!((applied.action, applied.spawn), ("pending_set", None));
     let after = transition(p).await;
-    assert_eq!(after["pending"], "community_scoped");
+    assert_eq!(after["pending"], "community");
     assert_eq!((&after["sweep"], &after["generation"]), (&before["sweep"], &before["generation"]));
-    assert_eq!(setting(p).await.0, json!("off"));
+    assert_eq!(setting(p).await.0, json!("kryphocron_only"));
     // The sweep runs to its end, which spawns the fill.
     let resumed = SweepState { after: before["sweep"]["after"].clone(), ..sweep };
     pi.clone().run_sweep(1, resumed).await;
@@ -823,18 +823,18 @@ async fn on_while_draining_waits_for_the_sweep() {
     assert_eq!((&t["phase"], &t["generation"], &t["pending"]), (&json!("filling"), &json!(2), &Value::Null));
     assert_eq!((&t["fill"]["stage"], &t["fill"]["part"], &t["fill"]["after"], &t["fill"]["enqueued"]), (&json!("enqueue"), &json!("members"), &json!(""), &json!(0)));
     assert_eq!(t["last_fill_since"], t["fill"]["since"]);
-    assert_eq!(setting(p).await.0, json!("community_scoped"));
+    assert_eq!(setting(p).await.0, json!("community"));
     assert_eq!(pi.hooks.spawned().first(), Some(&"fill"), "the sweep's end spawned the fill");
     eventually("on", async || scope.public_mode() == PublicMode::On).await;
     assert_eq!(pi.hooks.spawned(), ["fill", "checker"]);
 
     // Off, on (pending), off (cleared): the phase ends off.
-    let Some(Spawn::Sweep { generation, sweep }) = pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").spawn else {
+    let Some(Spawn::Sweep { generation, sweep }) = pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").spawn else {
         panic!("expected the sweep");
     };
-    assert_eq!(pi.apply_scope(ScopeValue::CommunityScoped, "cli").await.expect("on").action, "pending_set");
-    assert_eq!(pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").action, "pending_cleared");
-    assert_eq!(pi.apply_scope(ScopeValue::Off, "cli").await.expect("off").action, "no_op");
+    assert_eq!(pi.apply_scope(ScopeValue::Community, "cli").await.expect("on").action, "pending_set");
+    assert_eq!(pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").action, "pending_cleared");
+    assert_eq!(pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off").action, "no_op");
     assert_eq!(transition(p).await["pending"], Value::Null);
     pi.clone().run_sweep(generation, sweep).await;
     assert_eq!(transition(p).await["phase"], "off");
@@ -865,7 +865,7 @@ async fn the_switch_waits_for_writers() {
     let before = tokio::spawn(async move { w.apply(B, "3kaaaaaaaaaa2", &[like("3kbefore")], LIVE).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     let switcher = pi.clone();
-    let switch = tokio::spawn(async move { switcher.apply_scope(ScopeValue::Off, "cli").await });
+    let switch = tokio::spawn(async move { switcher.apply_scope(ScopeValue::KryphocronOnly, "cli").await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!switch.is_finished(), "the switch waits for the writer's read guard");
     assert_eq!(scope.public_mode(), PublicMode::On);
@@ -923,7 +923,7 @@ async fn the_bound_ends_a_fill_with_a_stuck_job() {
     let s = PublicModeSettings { fill_max_wait: Duration::from_secs(2), fill_batch: 1_000, ..settings() };
     let (pi, scope) = boot(p, s).await;
     set_memory(&pi, PublicState { mode: PublicMode::Off, generation: 1, last_fill_since: None }).await;
-    let task = pi.apply_scope(ScopeValue::CommunityScoped, "cli").await.expect("on").spawn.expect("fill");
+    let task = pi.apply_scope(ScopeValue::Community, "cli").await.expect("on").spawn.expect("fill");
     drop(pi.spawn(task));
     eventually("waiting", async || transition(p).await["fill"]["stage"] == "waiting").await;
     let ws = parse_ts(&transition(p).await["fill"]["waiting_since"]).expect("waiting_since");
@@ -957,12 +957,12 @@ async fn generations_stop_the_fill() {
     in_scope(p, &ms).await;
     let (pi, scope) = boot(p, settings()).await;
     set_memory(&pi, PublicState { mode: PublicMode::Off, generation: 1, last_fill_since: None }).await;
-    let task = pi.apply_scope(ScopeValue::CommunityScoped, "cli").await.expect("on").spawn.expect("fill");
+    let task = pi.apply_scope(ScopeValue::Community, "cli").await.expect("on").spawn.expect("fill");
     let (reached, resume) = pi.hooks.arm("fill_write");
     let fill = pi.spawn(task);
     reached.notified().await;
     let switcher = pi.clone();
-    let switch = tokio::spawn(async move { switcher.apply_scope(ScopeValue::Off, "cli").await });
+    let switch = tokio::spawn(async move { switcher.apply_scope(ScopeValue::KryphocronOnly, "cli").await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!switch.is_finished(), "the command waits for the batch");
     resume.notify_one();
@@ -974,7 +974,7 @@ async fn generations_stop_the_fill() {
     // The database barrier.
     exec(p, "DELETE FROM backfill_jobs").await;
     set_memory(&pi, PublicState { mode: PublicMode::Off, generation: 3, last_fill_since: None }).await;
-    let task = pi.apply_scope(ScopeValue::CommunityScoped, "cli").await.expect("on").spawn.expect("fill");
+    let task = pi.apply_scope(ScopeValue::Community, "cli").await.expect("on").spawn.expect("fill");
     let (reached, resume) = pi.hooks.arm("fill_write");
     let fill = pi.spawn(task);
     reached.notified().await;
@@ -998,10 +998,10 @@ async fn a_stale_checker_or_sweep_exits() {
     exec(p, &format!("INSERT INTO backfill_jobs (did, depth) VALUES ('{MEMBER}', 'resync')")).await;
     let (pi, scope) = boot(p, PublicModeSettings { check_every: Duration::from_millis(400), ..settings() }).await;
     set_memory(&pi, PublicState { mode: PublicMode::Off, generation: 1, last_fill_since: None }).await;
-    pi.apply_scope(ScopeValue::CommunityScoped, "cli").await.expect("on");
+    pi.apply_scope(ScopeValue::Community, "cli").await.expect("on");
     let checker = pi.spawn(Spawn::Checker { generation: 2, waiting_since: now() });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    pi.apply_scope(ScopeValue::Off, "cli").await.expect("off");
+    pi.apply_scope(ScopeValue::KryphocronOnly, "cli").await.expect("off");
     // The sweep's end with `pending`, by hand: Filling at g + 2.
     let t = Transition::filling(4, now());
     exec(p, &format!("UPDATE worker_state SET value = '{}' WHERE key = 'public_transition'", t.to_json())).await;

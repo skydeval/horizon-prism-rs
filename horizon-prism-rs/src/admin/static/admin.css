@@ -537,7 +537,7 @@ td.actions button { padding: 0.3rem 0.7rem; font-size: 0.85rem; }
 .pub-live-list li > span:nth-child(1) { color: var(--muted); }
 .pub-live-list li > span:nth-child(3) { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
 .pub-live-list li > span:nth-child(4) { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-#live-notes p { margin: 0 0 0.3rem; font-size: 0.85rem; }
+#live-since { margin: 0.5rem 0 0; font-size: 0.85rem; }
 @media (scripting: none) {
   #live-off { display: none; }
 }

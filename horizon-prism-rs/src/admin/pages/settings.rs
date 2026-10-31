@@ -334,9 +334,9 @@ pub async fn group(
             Ok(v) => v,
             Err(e) => return super::internal_error(&state, &e),
         };
-        let value = value.and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "off".to_string());
+        let value = value.and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "kryphocron_only".to_string());
         let mode = state.scope.public_mode();
-        Some(PublicView { on: value == ScopeValue::CommunityScoped.as_str(), value, phase: phase_words(mode).to_string() })
+        Some(PublicView { on: value == ScopeValue::Community.as_str(), value, phase: phase_words(mode).to_string() })
     } else {
         None
     };
@@ -573,21 +573,21 @@ pub async fn public_scope(
         Err(response) => return response,
     };
     let Some(value) = ScopeValue::parse(&form.value) else {
-        return refused(&state, &op, "/admin/settings/storage", "Choose on or off.");
+        return refused(&state, &op, "/admin/settings/storage", "Choose Kryphocron only or Community.");
     };
-    if value == ScopeValue::Off && state.scope.public_mode() != PublicMode::Off {
+    if value == ScopeValue::KryphocronOnly && state.scope.public_mode() != PublicMode::Off {
         let word = "OFF";
         let mut page = ConfirmPage {
             css: css(),
             nav: Some(Nav::new(&op, "settings")),
-            title: "Turn public data off".to_string(),
-            what: "Prism stops answering public Bluesky requests and deletes the public data it stored, in the background. Only what private posts need is kept: blocks, follows involving members, profiles, and members' own records.".to_string(),
-            undo: "Turning it back on refills public data; public requests come back when the refill is done.".to_string(),
+            title: "Switch to Kryphocron only".to_string(),
+            what: "Prism stops answering public Bluesky requests and deletes the public data it stored, in the background. Only what kryphocron posts and Horizon features need is kept: blocks, follows involving members, profiles, and members' own records.".to_string(),
+            undo: "Switching back to Community refills public data; public requests come back when the refill is done.".to_string(),
             action: "/admin/settings/public-scope".to_string(),
             csrf: op.csrf.clone(),
             hidden: vec![Hidden { name: "value".to_string(), value: value.as_str().to_string() }],
             typed: Some(word.to_string()),
-            button: "Turn off".to_string(),
+            button: "Switch".to_string(),
             error: None,
         };
         if form.confirm.as_deref() != Some("yes") {

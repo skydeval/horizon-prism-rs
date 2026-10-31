@@ -69,7 +69,7 @@ pub enum AdminCommand {
     /// `lists purge <did>`: delete the DID's list mutes and the list
     /// records it authored.
     ListsPurge { did: String },
-    /// `indexing public-scope <off|community_scoped>`: the public-indexing
+    /// `indexing public-scope <kryphocron_only|community>`: the public-indexing
     /// switch (public-indexing design §3.4).
     IndexingPublicScope { value: ScopeValue },
     /// `indexing status`: the switch's row, mode, phase and progress.
@@ -251,7 +251,7 @@ impl AdminCommand {
                 let value = s("value")?;
                 Self::IndexingPublicScope {
                     value: ScopeValue::parse(&value)
-                        .ok_or_else(|| InvalidCommand(format!("{command}: {value:?} is not off or community_scoped")))?,
+                        .ok_or_else(|| InvalidCommand(format!("{command}: {value:?} is not kryphocron_only or community")))?,
                 }
             }
             "indexing status" => Self::IndexingStatus,
@@ -1135,8 +1135,8 @@ mod tests {
         // The public-indexing commands round-trip, wait on no purge, and
         // refuse `full`.
         for cmd in [
-            AdminCommand::IndexingPublicScope { value: ScopeValue::Off },
-            AdminCommand::IndexingPublicScope { value: ScopeValue::CommunityScoped },
+            AdminCommand::IndexingPublicScope { value: ScopeValue::KryphocronOnly },
+            AdminCommand::IndexingPublicScope { value: ScopeValue::Community },
             AdminCommand::IndexingStatus,
         ] {
             let (name, args) = cmd.to_row();
@@ -1187,7 +1187,7 @@ mod tests {
         for args in [
             json!({"changes": []}),
             json!({"changes": [{"key": "http.bind", "value": "0.0.0.0:1", "base_version": 0}]}),
-            json!({"changes": [{"key": "indexing.public_scope", "value": "off", "base_version": 0}]}),
+            json!({"changes": [{"key": "indexing.public_scope", "value": "kryphocron_only", "base_version": 0}]}),
             json!({"changes": [{"key": "threadlens.access", "value": "members"}]}),
             json!({"changes": [{"key": "threadlens.access", "value": "members", "reset": true, "base_version": 0}]}),
             json!({"changes": [{"key": "threadlens.access", "value": "a", "base_version": 0}, {"key": "threadlens.access", "value": "b", "base_version": 0}]}),

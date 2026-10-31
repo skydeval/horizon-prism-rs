@@ -59,11 +59,11 @@ An account a member interacts with again just before removal is kept.
 
 | Value | What Horizon-Prism stores and serves |
 |---|---|
-| `off` (default for a fresh install) | Only what kryphocron, Thread Lens and Horizon features need. Public `app.bsky.*` reads answer `501 NotImplemented`. |
-| `community_scoped` | Everything in scope. Horizon-Prism also serves public reads for its members. |
+| `kryphocron_only` (default for a fresh install) | Only what kryphocron, Thread Lens and Horizon features need. Public `app.bsky.*` reads answer `501 NotImplemented`. |
+| `community` | Everything in scope. Horizon-Prism also serves public reads for its members. |
 | `full` | Not built yet: refused at startup. |
 
-With it **off**, Horizon-Prism keeps:
+In `kryphocron_only`, Horizon-Prism keeps:
 - every stored block, and follows with a member at either end;
 - members' own likes, reposts, lists, list items, list blocks and opt-outs;
 - profiles and identity of accounts in scope;
@@ -75,27 +75,27 @@ It drops posts, feeds, notifications, other accounts' likes, reposts, follows
 and lists, gates, starter packs, polls, labeler services, and the count and
 trend tables.
 
-The endpoints kept in `off` are the member's own mutes and blocks, drafts,
+The endpoints kept in `kryphocron_only` are the member's own mutes and blocks, drafts,
 labels, handle resolution, and the `app.nearhorizon.*` methods.
 [api.md](../api.md) lists each method.
 
 ### Changing it
 
-Run `admin indexing public-scope off|community_scoped`, use the switch on the
+Run `admin indexing public-scope kryphocron_only|community`, use the switch on the
 admin UI's storage settings page, or set the key in `app.toml` and restart.
 `admin indexing status` shows the current phase and progress.
 
-- **On → off** deletes the dropped data in the background, table by table, in
+- **`community` → `kryphocron_only`** deletes the dropped data in the background, table by table, in
   small batches. Public endpoints answer 501 at once.
-- **Off → on** refills each account in scope to backfill depth (below), with no
+- **`kryphocron_only` → `community`** refills each account in scope to backfill depth (below), with no
   old notifications. Public endpoints answer 501 ("being turned on") until the
   refill ends, at most `indexing.fill_max_wait_hours` (default 24). A refill
   waits for a running deletion to end.
-- **An upgrade never turns it off.** A deployment holding public data stays
-  `community_scoped`; the `app.toml` key applies only when it changed since the
+- **An upgrade never switches it to `kryphocron_only`.** A deployment holding public data stays
+  `community`; the `app.toml` key applies only when it changed since the
   last start.
 
-Take a `pg_dump` before turning it off: deleted data does not come back in
+Take a `pg_dump` before switching to `kryphocron_only`: deleted data does not come back in
 full.
 
 ## What is stored, and why
@@ -104,7 +104,7 @@ full.
 |---|---|
 | Members' records, in full depth | Their own views, their kryphocron posts and audiences, readiness |
 | Profiles and identity of accounts in scope | Author views on posts members see |
-| Posts, likes, reposts of accounts in scope (`community_scoped` only) | Public timelines, threads and counts |
+| Posts, likes, reposts of accounts in scope (`community` only) | Public timelines, threads and counts |
 | Blocks with a member side | Block enforcement in every read |
 | Kryphocron posts and audiences | [kryphocron.md](kryphocron.md) |
 | Refract accounts' records | [refract.md](refract.md) |

@@ -11,6 +11,17 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Indexing modes renamed.** `indexing.public_scope` is now
+  `kryphocron_only` (was `off`), `community` (was `community_scoped`) or
+  `full` (not built yet). **Upgrade:** change the value in `config/app.toml`
+  if it is set, and start once with `APP_ALLOW_STARTUP_MIGRATE=1`: migration
+  0053 renames the stored value. `admin indexing public-scope` takes the new
+  names.
+- **Public page counts are the server's.** The live feed's side column shows
+  records received and a second, likes, posts and reposts, blocks and
+  identity events, counted since Horizon-Prism started, the same for every
+  viewer and kept across reloads. The per-tab counts and the missed and
+  skipped notes are gone.
 - **A bad setting no longer stops the start.** An unknown, mistyped or
   out-of-range key in `app.toml` is set aside and its default applies; a bad
   feature URL turns that feature off. A missing or malformed

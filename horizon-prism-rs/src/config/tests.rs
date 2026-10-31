@@ -68,9 +68,9 @@ public_nameservers = []
 internal_nameservers = []
 
 [indexing]
-# off | community_scoped | full (full is refused). Default: off.
+# kryphocron_only | community | full (full is refused). Default: kryphocron_only.
 # Set this, or run `admin indexing public-scope`, to change it (design §3.3).
-# public_scope = "off"
+# public_scope = "kryphocron_only"
 fill_max_wait_hours = 24
 
 [scope]
@@ -862,17 +862,17 @@ fn full_public_scope_is_refused() {
     assert!(has(&p, "indexing.public_scope = \"full\" is not built yet"));
 }
 
-/// T-1 (public-indexing design §3.1, §3.3): `off` parses; an absent key is
-/// `None`, which is effectively `off`; the fill bound defaults to 24 hours.
+/// `kryphocron_only` parses; an absent key is
+/// `None`, which is effectively `kryphocron_only`; the fill bound defaults to 24 hours.
 #[test]
 fn public_scope_off_and_an_absent_key() {
-    let cfg = load("[indexing]\npublic_scope = \"off\"\n").expect("valid");
-    assert_eq!(cfg.file.indexing.public_scope, Some(PublicScope::Off));
-    let cfg = load("[indexing]\npublic_scope = \"community_scoped\"\n").expect("valid");
-    assert_eq!(cfg.file.indexing.public_scope(), PublicScope::CommunityScoped);
+    let cfg = load("[indexing]\npublic_scope = \"kryphocron_only\"\n").expect("valid");
+    assert_eq!(cfg.file.indexing.public_scope, Some(PublicScope::KryphocronOnly));
+    let cfg = load("[indexing]\npublic_scope = \"community\"\n").expect("valid");
+    assert_eq!(cfg.file.indexing.public_scope(), PublicScope::Community);
     let cfg = load("").expect("valid");
     assert_eq!(cfg.file.indexing.public_scope, None);
-    assert_eq!(cfg.file.indexing.public_scope(), PublicScope::Off);
+    assert_eq!(cfg.file.indexing.public_scope(), PublicScope::KryphocronOnly);
     assert_eq!(cfg.file.indexing.fill_max_wait_hours, 24);
     let cfg = load("[indexing]\nfill_max_wait_hours = 2\n").expect("valid");
     assert_eq!(cfg.file.indexing.fill_max_wait_hours, 2);
@@ -887,7 +887,7 @@ fn public_scope_off_and_an_absent_key() {
 #[test]
 fn the_template_carries_no_explicit_public_scope() {
     assert!(!DOCKER_APP_TOML.lines().any(|l| l.trim_start().starts_with("public_scope") && l.contains('=')));
-    assert!(DOCKER_APP_TOML.contains("# public_scope = \"off\""));
+    assert!(DOCKER_APP_TOML.contains("# public_scope = \"kryphocron_only\""));
 }
 
 #[test]

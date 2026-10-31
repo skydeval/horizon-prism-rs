@@ -211,7 +211,7 @@ pub enum IndexingAction {
     /// Turn public indexing off (its data is deleted in the background) or
     /// back on (it is refilled to backfill depth).
     PublicScope {
-        /// off | community_scoped
+        /// kryphocron_only | community
         value: String,
     },
     /// The setting, the running mode and phase, progress and any error.
@@ -411,7 +411,7 @@ impl AdminCmd {
             Self::Lists { action: ListsAction::Sync { uri } } => AdminCommand::ListsSync { uri: uri.clone() },
             Self::Lists { action: ListsAction::Purge { did } } => AdminCommand::ListsPurge { did: did.clone() },
             Self::Indexing { action: IndexingAction::PublicScope { value } } => AdminCommand::IndexingPublicScope {
-                value: ScopeValue::parse(value).ok_or_else(|| format!("public-scope takes off or community_scoped, not {value:?}"))?,
+                value: ScopeValue::parse(value).ok_or_else(|| format!("public-scope takes kryphocron_only or community, not {value:?}"))?,
             },
             Self::Indexing { action: IndexingAction::Status } => AdminCommand::IndexingStatus,
             Self::Refract { action: RefractAction::Check { did } } => AdminCommand::RefractCheck { did: did.clone() },
@@ -693,8 +693,8 @@ mod tests {
                 depth: Some(Depth::Authz)
             })
         );
-        let off = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "off".into() } };
-        assert_eq!(off.to_command(), Ok(AdminCommand::IndexingPublicScope { value: ScopeValue::Off }));
+        let off = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "kryphocron_only".into() } };
+        assert_eq!(off.to_command(), Ok(AdminCommand::IndexingPublicScope { value: ScopeValue::KryphocronOnly }));
         let full = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "full".into() } };
         assert!(full.to_command().is_err());
         let status = AdminCmd::Indexing { action: IndexingAction::Status };

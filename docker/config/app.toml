@@ -28,9 +28,9 @@ public_nameservers = []
 internal_nameservers = []
 
 [indexing]
-# off | community_scoped | full (full is refused). Default: off.
+# kryphocron_only | community | full (full is refused). Default: kryphocron_only.
 # Set this, or run `admin indexing public-scope`, to change it (design §3.3).
-# public_scope = "off"
+# public_scope = "kryphocron_only"
 fill_max_wait_hours = 24
 
 [scope]

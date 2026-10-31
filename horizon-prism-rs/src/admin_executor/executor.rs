@@ -613,10 +613,10 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        let r = done(run(&exec, p, AdminCommand::IndexingPublicScope { value: ScopeValue::Off }).await);
+        let r = done(run(&exec, p, AdminCommand::IndexingPublicScope { value: ScopeValue::KryphocronOnly }).await);
         assert_eq!((&r["action"], &r["mode"], &r["generation"], &r["task"]), (&json!("draining"), &json!("draining"), &json!(1), &json!("sweep")));
         let r = done(run(&exec, p, AdminCommand::IndexingStatus).await);
-        assert_eq!(r["value"], "off");
+        assert_eq!(r["value"], "kryphocron_only");
         assert_eq!(r["updated_by"], "cli");
         // The empty database's sweep ends by itself.
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -626,7 +626,7 @@ mod tests {
         }
         let r = done(run(&exec, p, AdminCommand::IndexingStatus).await);
         assert_eq!((&r["mode"], &r["phase"], &r["generation"], &r["error"]), (&json!("off"), &json!("off"), &json!(2), &Value::Null));
-        let r = done(run(&exec, p, AdminCommand::IndexingPublicScope { value: ScopeValue::Off }).await);
+        let r = done(run(&exec, p, AdminCommand::IndexingPublicScope { value: ScopeValue::KryphocronOnly }).await);
         assert_eq!((&r["action"], &r["task"]), (&json!("no_op"), &Value::Null));
         db.drop_db().await;
     }
@@ -732,7 +732,7 @@ mod tests {
         let by: String = sqlx::query_scalar("SELECT denied_by FROM member_denials WHERE did = $1").bind(CAROL).fetch_one(p).await.expect("denial");
         assert_eq!(by, "cli");
         // And the public-data switch.
-        done(ui(AdminCommand::IndexingPublicScope { value: crate::indexing::ScopeValue::Off }).await);
+        done(ui(AdminCommand::IndexingPublicScope { value: crate::indexing::ScopeValue::KryphocronOnly }).await);
         let r = done(run(&exec, p, AdminCommand::IndexingStatus).await);
         assert_eq!(r["updated_by"], ALICE);
         // The queue says who asked: NULL for the CLI.

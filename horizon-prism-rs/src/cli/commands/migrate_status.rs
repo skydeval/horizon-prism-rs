@@ -137,6 +137,8 @@ mod tests {
             "0051_public_check",
             // Private audiences held by this AppView.
             "0052_audiences_held",
+            // The indexing modes' new names.
+            "0053_indexing_mode_names",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

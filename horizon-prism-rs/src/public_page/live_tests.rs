@@ -814,7 +814,7 @@ async fn t_p20_t_p22_t_p23_live_route() {
     let home = client.get(format!("{base}/")).send().await.expect("home");
     assert_eq!(home.headers()["content-security-policy"], CSP_LIVE);
     let body = home.text().await.expect("body");
-    for needle in ["id=\"live-list\"", "id=\"live-arrivals\"", "id=\"live-received\"", "id=\"live-notes\"", &format!("<script src=\"{}\" defer></script>", *JS_HREF)] {
+    for needle in ["id=\"live-list\"", "id=\"live-arrivals\"", "id=\"live-received\"", "id=\"live-since\"", &format!("<script src=\"{}\" defer></script>", *JS_HREF)] {
         assert!(body.contains(needle), "{needle}");
     }
     // No status block, and nothing of any relay named.
@@ -923,11 +923,10 @@ fn t_p24_the_script() {
         "if (ev.e <= backlogE) { return; }",
         "readyState === EventSource.CLOSED",
         "page = newId();",
-        "events not received while reconnecting",
-        "events not received while Horizon-Prism restarted",
-        "the live reader fell behind",
-        "the event stream was reset",
-        "events missed: your connection could not keep up with the full feed",
+        "show(ev);",
+        "ev.totals",
+        "ev.events.total",
+        "Counted since Horizon-Prism started, ",
         "reconnect(30000)",
         "10 * 60 * 1000",
         "The live feed is busy right now. The rest of this page is current.",
@@ -935,28 +934,42 @@ fn t_p24_the_script() {
     ] {
         assert!(js.contains(needle), "{needle}");
     }
-    for absent in ["ev.r[", "r: ev", "innerHTML", ".style", "setAttribute('style'", "location.reload", "catching up", "not_shown", "'behind'", "ev.behind"] {
+    // No per-tab counting and no missed or skipped notes: the counts are
+    // the server's.
+    for absent in ["ev.r[", "r: ev", "innerHTML", ".style", "setAttribute('style'", "location.reload", "catching up", "not_shown", "'behind'", "ev.behind", "in this tab", "skipped", "missed", "not received", "thisSecond"] {
         assert!(!js.contains(absent), "{absent}");
     }
-    // `backlog` empties pending; a first stream shows no hole row.
+    // `backlog` empties pending.
     let backlog = js.split("on('backlog'").nth(1).expect("backlog handler");
     assert!(backlog.split("});").next().expect("body").contains("pending = [];"));
-    assert!(js.contains("if (lastC !== null)"), "no hole row without a stored c");
     // `es.close()` before every reconnect and stop.
     for f in ["function stop(", "function reconnect(", "function backOff(", "function open("] {
         let body = js.split(f).nth(1).expect(f);
         let first_line = body.lines().nth(1).expect("line");
         assert!(first_line.contains("es.close()"), "{f}: {first_line}");
     }
-    // The page template: the list, the counts column, the notes, the
-    // noscript line and the "did not start" notice; no totals line, no
-    // status block, and nothing about private posts.
+    // The page template: the list, the counts column with the server's
+    // totals and their start, the noscript line and the "did not start"
+    // notice; no notes, no per-tab wording, no status block, and nothing
+    // about private posts.
     let page = render_live();
-    for needle in ["id=\"live-list\"", "id=\"live-arrivals\"", "id=\"live-received\"", "id=\"live-notes\"", "<noscript>", "id=\"live-off\""] {
+    for needle in [
+        "id=\"live-list\"",
+        "id=\"live-arrivals\"",
+        "id=\"live-received\"",
+        "id=\"live-rate\"",
+        "id=\"live-likes\"",
+        "id=\"live-posts\"",
+        "id=\"live-blocks\"",
+        "id=\"live-identity\"",
+        "id=\"live-since\"",
+        "<noscript>",
+        "id=\"live-off\"",
+    ] {
         assert!(page.contains(needle), "{needle}");
     }
     let lower = page.to_lowercase();
-    for gone in ["id=\"live-totals\"", "id=\"live-since\"", "id=\"status\"", "kryphocron", "private", "member", "communit"] {
+    for gone in ["id=\"live-notes\"", "in this tab", "id=\"status\"", "kryphocron", "private", "member", "communit"] {
         assert!(!lower.contains(gone), "{gone}");
     }
 }

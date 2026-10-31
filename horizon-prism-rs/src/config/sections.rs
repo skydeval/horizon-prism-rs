@@ -58,16 +58,17 @@ impl Default for MetricsConfig {
     }
 }
 
-/// `indexing.public_scope` (§9.1; public-indexing design §3.1).
+/// `indexing.public_scope`: what is indexed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicScope {
-    /// Only what the private tier and Horizon features need is stored, and
+    /// Only what kryphocron and Horizon features need is stored, and
     /// public endpoints answer 501.
     #[default]
-    Off,
-    CommunityScoped,
-    /// Recognized so the config parses, then rejected by validation (lock #4).
+    KryphocronOnly,
+    /// Public records of members and the accounts around them.
+    Community,
+    /// The whole public network. Not built yet: refused by validation.
     Full,
 }
 
@@ -75,7 +76,7 @@ pub enum PublicScope {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexingConfig {
-    /// `None` when the key is absent. The effective value is then `off`,
+    /// `None` when the key is absent. The effective value is then `kryphocron_only`,
     /// but only a key written in the file is ever applied (public-indexing
     /// design §3.3).
     pub public_scope: Option<PublicScope>,
@@ -94,7 +95,7 @@ impl Default for IndexingConfig {
 }
 
 impl IndexingConfig {
-    /// The effective `public_scope`: the file's value, or `off`.
+    /// The effective `public_scope`: the file's value, or `kryphocron_only`.
     #[must_use]
     pub fn public_scope(&self) -> PublicScope {
         self.public_scope.unwrap_or_default()

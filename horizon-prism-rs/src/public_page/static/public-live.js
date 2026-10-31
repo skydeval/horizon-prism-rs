@@ -1,6 +1,7 @@
-// The public page's live feed (public-page design §6.6): every relay event,
-// as it arrives. Rows are built with createElement and textContent only, at
-// most once per animation frame, and the list keeps the newest 20.
+// The public page's live feed: every relay event, as it arrives. Rows are
+// built with createElement and textContent only, at most once per animation
+// frame, and the list keeps the newest 20. The counts are the server's,
+// since Horizon-Prism started, so every viewer sees the same numbers.
 (function () {
   'use strict';
   var off = document.getElementById('live-off');
@@ -8,12 +9,16 @@
   var list = document.getElementById('live-list');
   if (!list || !window.EventSource) { return; }
   var KEEP = 20;
-  var notes = document.getElementById('live-notes');
   var status = document.getElementById('live-status');
-  var received = document.getElementById('live-received');
-  var rateEl = document.getElementById('live-rate');
-  var inputEl = document.getElementById('live-input');
-  var arrivals = document.getElementById('live-arrivals');
+  var sinceEl = document.getElementById('live-since');
+  var cells = {
+    received: document.getElementById('live-received'),
+    rate: document.getElementById('live-rate'),
+    likes: document.getElementById('live-likes'),
+    posts: document.getElementById('live-posts'),
+    blocks: document.getElementById('live-blocks'),
+    identity: document.getElementById('live-identity')
+  };
 
   function newId() {
     var b = new Uint8Array(16);
@@ -26,21 +31,13 @@
   var es = null;
   var pending = [];
   var frame = 0;
-  var total = 0, thisSecond = 0;
-  var lastC = null, lastBoot = null, backlogE = -1, firstLines = true, lastSeenMs = null;
+  var backlogE = -1;
   var slowAt = 0, failingSince = 0, delay = 10000, retryTimer = 0;
 
   function two(n) { return (n < 10 ? '0' : '') + n; }
   function hms(secs) {
     var d = new Date(secs * 1000);
     return two(d.getUTCHours()) + ':' + two(d.getUTCMinutes()) + ':' + two(d.getUTCSeconds());
-  }
-  function note(text) {
-    var p = document.createElement('p');
-    p.className = 'muted';
-    p.textContent = '… ' + text;
-    notes.insertBefore(p, notes.firstChild);
-    while (notes.childNodes.length > 5) { notes.removeChild(notes.lastChild); }
   }
   function say(text) {
     status.textContent = text;
@@ -61,10 +58,10 @@
     for (var i = pending.length - 1; i >= 0; i--) {
       var l = pending[i];
       var li = document.createElement('li');
-      var cells = [hms(l.t), l.a, l.n, l.d];
-      for (var j = 0; j < cells.length; j++) {
+      var row = [hms(l.t), l.a, l.n, l.d];
+      for (var j = 0; j < row.length; j++) {
         var span = document.createElement('span');
-        span.textContent = cells[j];
+        span.textContent = row[j];
         li.appendChild(span);
       }
       frag.appendChild(li);
@@ -78,9 +75,29 @@
     if (pending.length > KEEP) { pending = pending.slice(pending.length - KEEP); }
     if (!frame) { frame = requestAnimationFrame(render); }
   }
-  function skippedText(s) {
-    var span = 'events from ' + hms(Math.floor(s.from / 1000)) + ' to ' + hms(Math.floor(s.to / 1000)) + ' UTC were skipped: ';
-    return span + (s.why === 'reset' ? 'the event stream was reset' : 'the live reader fell behind');
+  // The sum of `keys` in a counts map; every key when `keys` is null.
+  function sum(map, keys) {
+    var n = 0;
+    if (keys === null) {
+      for (var k in map) { n += map[k]; }
+    } else {
+      for (var i = 0; i < keys.length; i++) { n += map[keys[i]] || 0; }
+    }
+    return n;
+  }
+  function both(total, now) {
+    return total.toLocaleString() + ' · ' + now.toLocaleString() + ' a second';
+  }
+  function show(ev) {
+    var t = ev.totals, a = ev.arrivals;
+    cells.received.textContent = sum(t, null).toLocaleString();
+    cells.rate.textContent = sum(a, null).toLocaleString();
+    cells.likes.textContent = both(sum(t, ['like']), sum(a, ['like']));
+    var posts = ['post', 'reply', 'repost'];
+    cells.posts.textContent = both(sum(t, posts), sum(a, posts));
+    var blocks = ['block', 'list-block'];
+    cells.blocks.textContent = both(sum(t, blocks), sum(a, blocks));
+    cells.identity.textContent = both(ev.events.total, ev.events.now);
   }
   function stop(text) {
     if (es) { es.close(); es = null; }
@@ -114,7 +131,6 @@
   function open() {
     if (es) { es.close(); es = null; }
     if (document.hidden) { return; }
-    firstLines = true;
     es = new EventSource('/live?page=' + page);
     es.onopen = function () { failingSince = 0; delay = 10000; say(''); };
     es.onerror = function () {
@@ -122,71 +138,22 @@
       if (es && es.readyState === EventSource.CLOSED) { backOff(); }
     };
     on('backlog', function (ev) {
-      // Every backlog starts a stream, EventSource's own reconnects
-      // included: the next lines event is checked for a hole.
-      firstLines = true;
       pending = [];
       backlogE = ev.e;
-      if (lastBoot !== null && ev.boot !== lastBoot) {
-        note('events not received while Horizon-Prism restarted');
-        lastC = null;
+      if (ev.since) {
+        sinceEl.textContent = 'Counted since Horizon-Prism started, ' + ev.since + ' UTC.';
+        sinceEl.hidden = false;
       }
-      lastBoot = ev.boot;
       while (list.firstChild) { list.removeChild(list.firstChild); }
-      // A span that ended after the last line this tab saw: shown on return.
-      if (ev.skipped && lastSeenMs !== null && ev.skipped.to > lastSeenMs) { note(skippedText(ev.skipped)); }
       queue(decode(ev));
     });
     on('lines', function (ev) {
       if (ev.e <= backlogE) { return; }
-      var n = ev.l.length;
-      if (firstLines) {
-        firstLines = false;
-        if (lastC !== null) {
-          var hole = ev.c - n - lastC;
-          if (hole > 0) { note(hole + ' events not received while reconnecting'); }
-        }
-      }
-      lastC = ev.c;
-      if (n > 0) { lastSeenMs = (ev.t0 + ev.l[n - 1][0]) * 1000 + 999; }
-      total += n;
-      thisSecond += n;
-      received.textContent = total.toLocaleString();
       queue(decode(ev));
-    });
-    on('skipped', function (ev) {
-      if (ev.e <= backlogE) { return; }
-      note(skippedText(ev));
-      lastSeenMs = ev.to;
-    });
-    on('gap', function (ev) {
-      if (ev.lines > 0) { note(ev.lines + ' events missed: your connection could not keep up with the full feed'); }
-      lastC = ev.c;
     });
     on('counts', function (ev) {
       if (ev.e <= backlogE) { return; }
-      var kinds = [];
-      for (var k in ev.arrivals) { kinds.push([k, ev.arrivals[k]]); }
-      kinds.sort(function (a, b) { return b[1] - a[1]; });
-      var rows = arrivals.children;
-      for (var i = 0; i < 3; i++) {
-        var l = rows[i].firstChild, v = rows[i].lastChild;
-        l.removeAttribute('title');
-        if (i < 2 || kinds.length <= 3) {
-          l.textContent = kinds[i] ? kinds[i][0] : '';
-          v.textContent = kinds[i] ? kinds[i][1].toLocaleString() + ' a second' : '';
-        } else {
-          var rest = kinds.slice(2), sum = 0, tip = [];
-          for (var j = 0; j < rest.length; j++) { sum += rest[j][1]; tip.push(rest[j][0] + ' ' + rest[j][1]); }
-          l.textContent = '+' + rest.length + ' more';
-          l.title = tip.join(', ');
-          v.textContent = sum.toLocaleString() + ' a second';
-        }
-      }
-      rows[3].lastChild.textContent = ev.events.now.toLocaleString() + ' a second';
-      inputEl.textContent = ev.input === null ? 'unknown' : Math.round(ev.input).toLocaleString();
-      rateEl.textContent = thisSecond.toLocaleString();
-      thisSecond = 0;
+      show(ev);
     });
     on('end', function (ev) {
       if (es) { es.close(); es = null; }

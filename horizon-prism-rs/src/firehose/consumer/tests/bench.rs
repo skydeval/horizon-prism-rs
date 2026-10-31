@@ -9,7 +9,7 @@
 //!   database and only reads (`XREVRANGE`).
 //! - `throughput_corpus` reads `HPRS_BENCH_CORPUS` and reports `C0` (every
 //!   commit on the transaction path, `WRITER_FORCE_TX` armed for `*`) and
-//!   `C1` (as built), under `PublicMode::Off` and then `community_scoped`.
+//!   `C1` (as built), under `PublicMode::Off` and then `community`.
 
 use std::io::{BufRead, BufWriter, Write};
 use std::time::{Duration, Instant};
@@ -216,7 +216,7 @@ async fn throughput_corpus() {
     let corpus = read_corpus();
     println!("corpus: {} entries, {} members", corpus.entries.len(), corpus.members.len());
     let mut gate = None;
-    for (mode, label) in [(PublicMode::Off, "off"), (PublicMode::On, "community_scoped")] {
+    for (mode, label) in [(PublicMode::Off, "off"), (PublicMode::On, "community")] {
         let c0 = run(&corpus, mode, true).await;
         let c1 = run(&corpus, mode, false).await;
         for (name, r) in [("C0", &c0), ("C1", &c1)] {

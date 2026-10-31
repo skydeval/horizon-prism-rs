@@ -227,7 +227,7 @@ fn public_text(mode: PublicMode) -> &'static str {
         PublicMode::On => "Prism keeps public posts of its members and the accounts around them, and answers public requests.",
         PublicMode::Filling => "Public data is being turned on: Prism is refilling it, and answers public requests when that is done.",
         PublicMode::Off | PublicMode::Draining | PublicMode::Held => {
-            "Public data is off: Prism keeps only what private posts need, and apps use their usual AppView for public reads."
+            "Prism indexes kryphocron only: it keeps only what kryphocron posts and Horizon features need, and apps use their usual AppView for public reads."
         }
     }
 }

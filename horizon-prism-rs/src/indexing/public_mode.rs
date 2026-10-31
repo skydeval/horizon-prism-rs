@@ -169,24 +169,24 @@ impl PublicModeSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeValue {
-    Off,
-    CommunityScoped,
+    KryphocronOnly,
+    Community,
 }
 
 impl ScopeValue {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Off => "off",
-            Self::CommunityScoped => "community_scoped",
+            Self::KryphocronOnly => "kryphocron_only",
+            Self::Community => "community",
         }
     }
 
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "off" => Some(Self::Off),
-            "community_scoped" => Some(Self::CommunityScoped),
+            "kryphocron_only" => Some(Self::KryphocronOnly),
+            "community" => Some(Self::Community),
             _ => None,
         }
     }
@@ -202,8 +202,8 @@ impl ScopeValue {
     #[must_use]
     pub fn from_config(scope: PublicScope) -> Self {
         match scope {
-            PublicScope::CommunityScoped => Self::CommunityScoped,
-            PublicScope::Off | PublicScope::Full => Self::Off,
+            PublicScope::Community => Self::Community,
+            PublicScope::KryphocronOnly | PublicScope::Full => Self::KryphocronOnly,
         }
     }
 }
@@ -450,7 +450,7 @@ pub(super) fn validate(raw: &Value, now: DateTime<Utc>) -> (Validated, Option<Va
     // 2.4: `pending`.
     let pending = match raw.get("pending") {
         None | Some(Value::Null) => None,
-        Some(Value::String(s)) if s == "community_scoped" => Some(ScopeValue::CommunityScoped),
+        Some(Value::String(s)) if s == "community" => Some(ScopeValue::Community),
         Some(_) => return (held, reset),
     };
     let Some(phase) = phase else {
@@ -534,18 +534,18 @@ pub(super) fn map(value: Option<ScopeValue>, v: &Validated) -> (PublicState, Opt
     let state = |mode| PublicState { mode, generation: t.generation, last_fill_since: t.last_fill_since };
     let generation = t.generation;
     match (value, t.phase, t.pending, &t.sweep, &t.fill) {
-        (Some(ScopeValue::CommunityScoped), Phase::On, None, _, _) => (state(PublicMode::On), None),
-        (Some(ScopeValue::CommunityScoped), Phase::Filling, None, _, Some(fill)) => {
+        (Some(ScopeValue::Community), Phase::On, None, _, _) => (state(PublicMode::On), None),
+        (Some(ScopeValue::Community), Phase::Filling, None, _, Some(fill)) => {
             let task = match (fill.stage, fill.waiting_since) {
                 (FillStage::Waiting, Some(waiting_since)) => Spawn::Checker { generation, waiting_since },
                 _ => Spawn::Fill { generation, fill: fill.clone() },
             };
             (state(PublicMode::Filling), Some(task))
         }
-        (Some(ScopeValue::Off), Phase::Draining, _, Some(sweep), _) => {
+        (Some(ScopeValue::KryphocronOnly), Phase::Draining, _, Some(sweep), _) => {
             (state(PublicMode::Draining), Some(Spawn::Sweep { generation, sweep: sweep.clone() }))
         }
-        (Some(ScopeValue::Off), Phase::Off, None, _, _) => (state(PublicMode::Off), None),
+        (Some(ScopeValue::KryphocronOnly), Phase::Off, None, _, _) => (state(PublicMode::Off), None),
         _ => held(t.generation, t.last_fill_since),
     }
 }
@@ -734,10 +734,10 @@ impl PublicIndexing {
         let Some((stored, file_value)) = row else {
             // S1 or S2: seed both rows.
             let present = public_data_present(&self.pool).await?;
-            let (value, updated_by) = if present { (ScopeValue::CommunityScoped, "upgrade") } else { (f.value, "startup") };
+            let (value, updated_by) = if present { (ScopeValue::Community, "upgrade") } else { (f.value, "startup") };
             let phase = match value {
-                ScopeValue::CommunityScoped => Phase::On,
-                ScopeValue::Off => Phase::Off,
+                ScopeValue::Community => Phase::On,
+                ScopeValue::KryphocronOnly => Phase::Off,
             };
             let t = Transition::settled(phase, 1, now(), None);
             let mut tx = self.pool.begin().await?;
@@ -801,16 +801,16 @@ impl PublicIndexing {
             // A Held exit takes the parsed generation (0 when it did not
             // parse) + 1 and the parsed `last_fill_since`: exactly what
             // memory holds.
-            (PublicMode::On | PublicMode::Filling | PublicMode::Held, ScopeValue::Off) => {
+            (PublicMode::On | PublicMode::Filling | PublicMode::Held, ScopeValue::KryphocronOnly) => {
                 Transition::draining(next, at, current.last_fill_since)
             }
-            (PublicMode::Off | PublicMode::Held, ScopeValue::CommunityScoped) => Transition::filling(next, at),
+            (PublicMode::Off | PublicMode::Held, ScopeValue::Community) => Transition::filling(next, at),
             (PublicMode::Draining, _) => {
                 // Set or clear `pending` (§8.1); nothing else changes. A
                 // literal, so the JSON null is never an SQL NULL.
                 let pending = match value {
-                    ScopeValue::CommunityScoped => "'\"community_scoped\"'::jsonb",
-                    ScopeValue::Off => "'null'::jsonb",
+                    ScopeValue::Community => "'\"community\"'::jsonb",
+                    ScopeValue::KryphocronOnly => "'null'::jsonb",
                 };
                 let n = sqlx::query(&format!(
                     "UPDATE worker_state SET value = jsonb_set(value, '{{pending}}', {pending}), updated_at = now() \
@@ -825,11 +825,11 @@ impl PublicIndexing {
                 drop(sets);
                 return Ok(noop(match (value, n) {
                     (_, 0) => "no_op",
-                    (ScopeValue::CommunityScoped, _) => "pending_set",
-                    (ScopeValue::Off, _) => "pending_cleared",
+                    (ScopeValue::Community, _) => "pending_set",
+                    (ScopeValue::KryphocronOnly, _) => "pending_cleared",
                 }));
             }
-            (PublicMode::On | PublicMode::Filling, ScopeValue::CommunityScoped) | (PublicMode::Off, ScopeValue::Off) => {
+            (PublicMode::On | PublicMode::Filling, ScopeValue::Community) | (PublicMode::Off, ScopeValue::KryphocronOnly) => {
                 return Ok(noop("no_op"));
             }
         };

@@ -79,11 +79,11 @@ async fn settings_pages_and_their_forms() {
     assert_eq!(queued(p).await.last().map(|q| q.1["changes"][0]["key"].clone()), Some(json!("farsight.fallback.enabled")));
 
     // Public data off: its own command, typed OFF.
-    let confirm = post(&alice, &url("/admin/settings/public-scope"), &[("csrf", &csrf), ("value", "off")]).await;
+    let confirm = post(&alice, &url("/admin/settings/public-scope"), &[("csrf", &csrf), ("value", "kryphocron_only")]).await;
     assert!(confirm.body.contains("<code>OFF</code>"), "{}", confirm.body);
-    let off = post(&alice, &url("/admin/settings/public-scope"), &[("csrf", &csrf), ("value", "off"), ("confirm", "yes"), ("typed", "OFF")]).await;
+    let off = post(&alice, &url("/admin/settings/public-scope"), &[("csrf", &csrf), ("value", "kryphocron_only"), ("confirm", "yes"), ("typed", "OFF")]).await;
     assert_eq!(off.status, 303, "{}", off.body);
-    assert_eq!(queued(p).await.last().map(|q| (q.0.clone(), q.1.clone())), Some(("indexing public-scope".to_string(), json!({"value": "off"}))));
+    assert_eq!(queued(p).await.last().map(|q| (q.0.clone(), q.1.clone())), Some(("indexing public-scope".to_string(), json!({"value": "kryphocron_only"}))));
 
     // No supervisor here: the restart is refused and nothing is queued.
     let before = queued(p).await.len();

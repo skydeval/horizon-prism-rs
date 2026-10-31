@@ -280,12 +280,12 @@ Fallback metrics: `farsight_fallback_requests_total{endpoint,class}`, `farsight_
 
 ```sh
 docker compose exec app /app/horizon-prism-rs admin indexing status
-docker compose exec app /app/horizon-prism-rs admin indexing public-scope off
-docker compose exec app /app/horizon-prism-rs admin indexing public-scope community_scoped
+docker compose exec app /app/horizon-prism-rs admin indexing public-scope kryphocron_only
+docker compose exec app /app/horizon-prism-rs admin indexing public-scope community
 ```
 
 - **Off keeps:** every block; follows with a member at either end; members' likes, reposts, lists, list items, list blocks and opt-outs; profiles and identity in scope; labels, tombstones, mutes, bookmarks, drafts; all kryphocron records; and each member post's reply and quote targets. **Off drops:** posts, feeds, notifications, others' likes, reposts, follows and lists, gates, starter packs, polls, labeler services, and count and trend tables. Public endpoints answer 501.
-- **An upgrade never turns it off.** A deployment holding public data stays `community_scoped` whatever `app.toml` says, and logs `public_scope_file_not_applied`. A fresh install starts `off`. To turn an upgraded deployment off, run `admin indexing public-scope off`, or set `public_scope = "off"` in `config/app.toml` and restart after the upgraded build has started once.
+- **An upgrade never switches it to `kryphocron_only`.** A deployment holding public data stays `community` whatever `app.toml` says, and logs `public_scope_file_not_applied`. A fresh install starts `kryphocron_only`. To switch an upgraded deployment, run `admin indexing public-scope kryphocron_only`, or set `public_scope = "kryphocron_only"` in `config/app.toml` and restart after the upgraded build has started once.
 - **Only a written key applies,** and only when it changed since the last start.
 - **Turning off deletes** the dropped data in the background, in small batches; `status` shows progress. **Turning on refills only to backfill depth.** Take a `pg_dump` first.
 - **Disk comes back through autovacuum** as reusable space inside Postgres. No `VACUUM FULL` is run.
