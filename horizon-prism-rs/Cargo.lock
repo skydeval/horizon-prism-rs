@@ -1524,6 +1524,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "webpki-roots",
+ "zstd",
 ]
 
 [[package]]

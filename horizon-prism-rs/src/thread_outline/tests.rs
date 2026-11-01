@@ -64,7 +64,7 @@ type RowTuple = (Option<String>, Option<i64>, i64, bool, String);
 pub(crate) async fn row(pool: &PgPool, did: &str, rkey: i64) -> Option<Row> {
     let r: Option<RowTuple> = sqlx::query_as(
         "SELECT pa.did, o.parent_rkey, o.rev, o.deleted_at IS NOT NULL, o.xmin::text FROM outline_posts o \
-         JOIN outline_actors a ON a.id = o.author LEFT JOIN outline_actors pa ON pa.id = o.parent_author \
+         JOIN dids a ON a.id = o.author LEFT JOIN dids pa ON pa.id = o.parent_author \
          WHERE a.did = $1 AND o.rkey = $2",
     )
     .bind(did)
@@ -76,7 +76,7 @@ pub(crate) async fn row(pool: &PgPool, did: &str, rkey: i64) -> Option<Row> {
 }
 
 pub(crate) async fn holes(pool: &PgPool) -> Vec<(String, i64)> {
-    sqlx::query_as("SELECT a.did, h.rkey FROM outline_holes h JOIN outline_actors a ON a.id = h.author ORDER BY 1, 2")
+    sqlx::query_as("SELECT a.did, h.rkey FROM outline_holes h JOIN dids a ON a.id = h.author ORDER BY 1, 2")
         .fetch_all(pool)
         .await
         .expect("holes")
@@ -438,7 +438,7 @@ async fn t_o6_retention_in_composite_key_batches() {
         assert!(step.sql.contains("WHERE (author, rkey) IN (SELECT"), "{}", step.sql);
         assert!(step.sql.contains("LIMIT 10000"), "{}", step.sql);
     }
-    sqlx::query("INSERT INTO outline_actors (did) VALUES ($1)").bind(A).execute(&db.pool).await.expect("actor");
+    sqlx::query("INSERT INTO dids (did) VALUES ($1)").bind(A).execute(&db.pool).await.expect("actor");
     // 10,050 old posts (two batches) and 5 new ones.
     sqlx::query(
         "INSERT INTO outline_posts (author, rkey, created_at, seen_at, rev) \

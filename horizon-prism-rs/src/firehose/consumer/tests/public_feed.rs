@@ -24,8 +24,14 @@ use crate::test_support::hooks;
 /// ms)` per line, and `(second − base second, arrivals)` per counts event.
 type Run = (Vec<(String, i64, i64)>, Vec<(i64, Value)>);
 
+/// Each commit gets its own valid rev, as real commits do: the feed counts a
+/// repo and rev once.
+static NEXT_REV: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 fn fields(repo: &str, ops: &Value) -> Vec<(String, String)> {
-    let data = json!({"repo": repo, "rev": "3kaaaaaaaaa22", "ops": ops, "time": chrono::Utc::now().to_rfc3339()});
+    let n = NEXT_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rev = crate::db::ids::rev_string(crate::db::ids::rev_value("3kaaaaaaaaa22") + n);
+    let data = json!({"repo": repo, "rev": rev, "ops": ops, "time": chrono::Utc::now().to_rfc3339()});
     vec![("type".to_string(), "commit".to_string()), ("data".to_string(), data.to_string()), ("seq".to_string(), "1".to_string())]
 }
 

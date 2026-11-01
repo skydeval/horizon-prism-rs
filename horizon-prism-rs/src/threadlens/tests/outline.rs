@@ -973,7 +973,7 @@ async fn explain_region_read() {
         return;
     };
     let p = &db.pool;
-    exec(p, "INSERT INTO outline_actors (did) SELECT 'did:plc:explain' || g FROM generate_series(1, 1000) g").await;
+    exec(p, "INSERT INTO dids (did) SELECT 'did:plc:explain' || g FROM generate_series(1, 1000) g").await;
     // Threads of ten: a root every ten rows, each reply under the row
     // before it, so the region below a root is nine levels deep.
     exec(
@@ -986,7 +986,7 @@ async fn explain_region_read() {
     )
     .await;
     exec(p, "ANALYZE outline_posts").await;
-    exec(p, "ANALYZE outline_actors").await;
+    exec(p, "ANALYZE dids").await;
     let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, BUFFERS) {}", crate::threadlens::outline::REGION_SQL))
         .bind(11_i32)
         .bind(10_i64)

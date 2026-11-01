@@ -90,6 +90,9 @@ askama = "0.16"
 # The stats page's disk figures (admin-ui design §10.1): `statvfs` of the
 # app's data directory and the read-only volume mounts. Already in the graph.
 rustix = { version = "1", features = ["fs"] }
+# The record codec: zstd with trained dictionaries.
+# Already in the graph.
+zstd = "0.13"
 
 [dev-dependencies]
 # tokio::time::pause for the lag sampler's hang test (firehose throughput §4.5).

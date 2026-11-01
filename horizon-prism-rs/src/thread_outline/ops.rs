@@ -188,7 +188,7 @@ fn post_ref(uri: &str) -> Ref {
     let mut parts = rest.split('/');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         // A valid DID only: raw refs come from records no parser checked,
-        // and a forged authority would grow `outline_actors` (or, with a
+        // and a forged authority would grow `dids` (or, with a
         // NUL byte, fail every flush it is in).
         (Some(did), Some(NSID_POST), Some(rkey), None) if proto_blue::syntax::Did::is_valid(did) => match tid_value(rkey) {
             Some(rkey) => Ref::Post(Key { did: did.to_string(), rkey }),

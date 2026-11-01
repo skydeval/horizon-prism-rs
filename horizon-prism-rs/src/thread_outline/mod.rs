@@ -565,7 +565,7 @@ pub async fn switch_off(pool: &PgPool) -> Result<u64, sqlx::Error> {
 /// Any database error.
 pub async fn gone_dids(pool: &PgPool, dids: &[String]) -> Result<HashSet<String>, sqlx::Error> {
     let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT a.did FROM outline_gone g JOIN outline_actors a ON a.id = g.author \
+        "SELECT a.did FROM outline_gone g JOIN dids a ON a.id = g.author \
          WHERE a.did = ANY($1) GROUP BY a.did HAVING bool_and(NOT g.active)",
     )
     .bind(dids)

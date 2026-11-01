@@ -9,6 +9,14 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ## [Unreleased]
 
+### Added
+
+- **Compact storage groundwork.** Shared account ids, a fixed collection
+  list and record-key, reference and record codecs, for the smaller storage
+  layout coming in the next releases. Nothing is stored differently yet.
+  **Upgrade:** start once with `APP_ALLOW_STARTUP_MIGRATE=1` (migration
+  0054).
+
 ### Changed
 
 - **Indexing modes renamed.** `indexing.public_scope` is now

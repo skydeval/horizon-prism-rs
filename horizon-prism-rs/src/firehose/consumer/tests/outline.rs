@@ -275,7 +275,7 @@ async fn t_o14_disabled_writes_nothing() {
     f.add_n(5, Some(3)).await;
     assert!(c.run_until(|c| !c.test.record.lock().expect("record").gaps.is_empty(), Duration::from_secs(10)).await);
     assert_eq!(table_count(&f.db.pool, "outline_posts").await, 0);
-    assert_eq!(table_count(&f.db.pool, "outline_actors").await, 0);
+    assert_eq!(table_count(&f.db.pool, "dids").await, 0);
     assert_eq!(stored_progress(&f.db.pool).await.expect("progress"), (None, None), "a gap writes no coverage");
     set_progress(&f.db.pool, Some(StreamId::new(5, 0)), Some(1000)).await;
     assert_eq!(crate::thread_outline::switch_off(&f.db.pool).await.expect("switch off"), 2);

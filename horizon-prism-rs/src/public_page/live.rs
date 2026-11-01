@@ -109,8 +109,14 @@ struct Published {
     kinds_since: String,
 }
 
-/// The Redis hash the totals are kept in, so they outlive a restart.
-pub const TOTALS_KEY: &str = "public_page:totals";
+/// The Redis hash the totals are kept in, so they outlive a restart: one per
+/// stream key, so two streams on one Redis (and parallel tests) never share it.
+#[must_use]
+pub fn totals_key(stream_key: &str) -> String {
+    format!("{stream_key}:public_totals")
+}
+/// Where releases before per-stream keys kept the totals; moved on first load.
+const LEGACY_TOTALS_KEY: &str = "public_page:totals";
 /// A copy of an event from another relay within this long is not counted.
 const COPY_WINDOW_MS: i64 = 5 * 60 * 1000;
 /// How often the totals are written to the store.
@@ -146,7 +152,7 @@ impl PublicFeed {
         let feed = Self::new(s);
         let store = conn.clone();
         let mut tasks = Reader::new(conn, key, labels, tx, rs, probe).spawn();
-        tasks.push(tokio::spawn(Publisher::new(feed.clone(), summary).with_store(store).run(rx)));
+        tasks.push(tokio::spawn(Publisher::new(feed.clone(), summary).with_store(store, totals_key(key)).run(rx)));
         (feed, tasks)
     }
 
@@ -374,7 +380,7 @@ struct Publisher {
     seen: HashSet<u64>,
     seen_order: VecDeque<(i64, u64)>,
     /// Where the totals are kept, and what was last written there.
-    store: Option<ConnectionManager>,
+    store: Option<(ConnectionManager, String)>,
     flushed: Flushed,
     last_flush_ms: i64,
 }
@@ -412,19 +418,22 @@ impl Publisher {
         }
     }
 
-    fn with_store(mut self, conn: ConnectionManager) -> Self {
-        self.store = Some(conn);
+    fn with_store(mut self, conn: ConnectionManager, key: String) -> Self {
+        self.store = Some((conn, key));
         self
     }
 
     /// Read the stored totals (and when they began), or start them now.
     async fn load(&mut self) {
-        let Some(conn) = self.store.as_mut() else { return };
+        let Some((conn, key)) = self.store.as_mut() else { return };
+        // Totals kept under the old shared key move to this stream's key once;
+        // an error (no old key, or this key already set) leaves both alone.
+        let _: Result<bool, _> = redis::cmd("RENAMENX").arg(LEGACY_TOTALS_KEY).arg(&*key).query_async(conn).await;
         let now = chrono::Utc::now().format("%Y-%m-%d %H:00").to_string();
         let mut pipe = redis::pipe();
-        pipe.cmd("HSETNX").arg(TOTALS_KEY).arg("events_since").arg(&now).ignore();
-        pipe.cmd("HSETNX").arg(TOTALS_KEY).arg("kinds_since").arg(&now).ignore();
-        pipe.cmd("HGETALL").arg(TOTALS_KEY);
+        pipe.cmd("HSETNX").arg(&*key).arg("events_since").arg(&now).ignore();
+        pipe.cmd("HSETNX").arg(&*key).arg("kinds_since").arg(&now).ignore();
+        pipe.cmd("HGETALL").arg(&*key);
         let stored: Result<(HashMap<String, String>,), _> = pipe.query_async(conn).await;
         let Ok((stored,)) = stored else {
             tracing::warn!(event = "public_feed_totals_unread", "the stored totals could not be read; they count from this start");
@@ -444,19 +453,19 @@ impl Publisher {
 
     /// Add what was counted since the last write to the stored totals.
     async fn flush(&mut self) {
-        let Some(conn) = self.store.as_mut() else { return };
+        let Some((conn, key)) = self.store.as_mut() else { return };
         let mut pipe = redis::pipe();
         let mut any = false;
         for k in Kind::ALL {
             let d = self.totals[k.index()] - self.flushed.totals[k.index()];
             if d > 0 {
-                pipe.cmd("HINCRBY").arg(TOTALS_KEY).arg(k.slug()).arg(d).ignore();
+                pipe.cmd("HINCRBY").arg(&*key).arg(k.slug()).arg(d).ignore();
                 any = true;
             }
         }
         for (field, d) in [("identity", self.events_total - self.flushed.events), ("events", self.received_total - self.flushed.received)] {
             if d > 0 {
-                pipe.cmd("HINCRBY").arg(TOTALS_KEY).arg(field).arg(d).ignore();
+                pipe.cmd("HINCRBY").arg(&*key).arg(field).arg(d).ignore();
                 any = true;
             }
         }

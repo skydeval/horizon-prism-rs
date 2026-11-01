@@ -147,7 +147,7 @@ async fn actor_ids(conn: &mut PgConnection, dids: &[String]) -> Result<HashMap<S
     if dids.is_empty() {
         return Ok(ids);
     }
-    let found: Vec<(i32, String)> = sqlx::query_as("SELECT id, did FROM outline_actors WHERE did = ANY($1)")
+    let found: Vec<(i32, String)> = sqlx::query_as("SELECT id, did FROM dids WHERE did = ANY($1)")
         .bind(dids)
         .fetch_all(&mut *conn)
         .await?;
@@ -155,8 +155,8 @@ async fn actor_ids(conn: &mut PgConnection, dids: &[String]) -> Result<HashMap<S
     let missing: Vec<String> = dids.iter().filter(|d| !ids.contains_key(*d)).cloned().collect();
     if !missing.is_empty() {
         let added: Vec<(i32, String)> = sqlx::query_as(
-            "INSERT INTO outline_actors (did) SELECT d FROM unnest($1::text[]) AS d \
-             WHERE NOT EXISTS (SELECT 1 FROM outline_actors a WHERE a.did = d) \
+            "INSERT INTO dids (did) SELECT d FROM unnest($1::text[]) AS d \
+             WHERE NOT EXISTS (SELECT 1 FROM dids a WHERE a.did = d) \
              ON CONFLICT (did) DO NOTHING RETURNING id, did",
         )
         .bind(&missing)

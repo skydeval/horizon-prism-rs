@@ -221,7 +221,7 @@ impl Writer {
         if let Some(ms) = since {
             self.outline.raise_complete_since(ms);
         }
-        if let Ok(max) = sqlx::query_scalar::<_, i32>("SELECT coalesce(max(id), 0) FROM outline_actors").fetch_one(&mut conn).await {
+        if let Ok(max) = sqlx::query_scalar::<_, i32>("SELECT coalesce(max(id), 0) FROM dids").fetch_one(&mut conn).await {
             metrics::gauge!(super::METRIC_ACTOR_IDS).set(f64::from(max));
         }
         // R5-2: another writer may have taken entries meanwhile.

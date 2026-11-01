@@ -287,7 +287,7 @@ struct StoredRow {
 const WALK_SQL: &str = "WITH RECURSIVE up AS ( \
        SELECT o.author, o.rkey, o.parent_author, o.parent_rkey, o.root_author, o.root_rkey, o.seen_at, \
               o.deleted_at IS NOT NULL AS deleted, 0 AS step \
-         FROM outline_posts o JOIN outline_actors a ON a.id = o.author WHERE a.did = $1 AND o.rkey = $2 \
+         FROM outline_posts o JOIN dids a ON a.id = o.author WHERE a.did = $1 AND o.rkey = $2 \
        UNION ALL \
        SELECT o.author, o.rkey, o.parent_author, o.parent_rkey, o.root_author, o.root_rkey, o.seen_at, \
               o.deleted_at IS NOT NULL, u.step + 1 \
@@ -295,7 +295,7 @@ const WALK_SQL: &str = "WITH RECURSIVE up AS ( \
         WHERE u.step < $3 \
      ) CYCLE author, rkey SET looped USING path \
      SELECT u.author, u.rkey, a.did, u.parent_author, u.root_author, u.root_rkey, u.seen_at, u.deleted, u.step, u.looped \
-       FROM up u JOIN outline_actors a ON a.id = u.author ORDER BY u.step, u.looped";
+       FROM up u JOIN dids a ON a.id = u.author ORDER BY u.step, u.looped";
 
 /// Step 3: down `outline_posts_parent` from the anchor, levels `1..=depth`,
 /// not below a deleted row, bounded inside.
@@ -311,7 +311,7 @@ pub(crate) const REGION_SQL: &str = "WITH RECURSIVE down AS ( \
      ) \
      SELECT r.author, r.rkey, a.did, pa.did AS parent_did, r.parent_rkey, r.root_author, r.root_rkey, r.created_at, r.deleted, r.lvl \
        FROM (SELECT * FROM down LIMIT $4) r \
-       JOIN outline_actors a ON a.id = r.author JOIN outline_actors pa ON pa.id = r.parent_author";
+       JOIN dids a ON a.id = r.author JOIN dids pa ON pa.id = r.parent_author";
 
 /// Step 4: one root's rows, bounded, with whether any names a parent that
 /// has no row (R4-6, R4-10).
@@ -368,7 +368,7 @@ pub async fn with_rows(pool: &PgPool, uris: &[String]) -> Result<HashSet<String>
     }
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT a.did, o.rkey FROM unnest($1::text[], $2::int8[]) AS k(did, rkey) \
-         JOIN outline_actors a ON a.did = k.did JOIN outline_posts o ON o.author = a.id AND o.rkey = k.rkey",
+         JOIN dids a ON a.did = k.did JOIN outline_posts o ON o.author = a.id AND o.rkey = k.rkey",
     )
     .bind(&dids)
     .bind(&rkeys)

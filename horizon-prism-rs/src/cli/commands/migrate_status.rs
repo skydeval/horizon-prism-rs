@@ -139,6 +139,8 @@ mod tests {
             "0052_audiences_held",
             // The indexing modes' new names.
             "0053_indexing_mode_names",
+            // Compact storage: shared ids and codecs.
+            "0054_compact_ids",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));
