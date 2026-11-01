@@ -292,8 +292,10 @@ fn operators(query: &str) -> Result<Operators, ViewError> {
 pub(super) fn viewer_exclusions() -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did AND m.scope = 'full') \
-         AND NOT EXISTS (SELECT 1 FROM blocks b, dids x, dids y WHERE x.did = $1 AND y.did = n.author_did \
-                         AND ((b.author = x.id AND b.subject = y.id) OR (b.author = y.id AND b.subject = x.id))) \
+         AND NOT EXISTS (SELECT 1 FROM blocks b WHERE b.author = (SELECT id FROM dids WHERE did = $1) \
+                         AND b.subject = (SELECT id FROM dids WHERE did = n.author_did)) \
+         AND NOT EXISTS (SELECT 1 FROM blocks b WHERE b.author = (SELECT id FROM dids WHERE did = n.author_did) \
+                         AND b.subject = (SELECT id FROM dids WHERE did = $1)) \
          AND NOT EXISTS (SELECT 1 FROM list_references r \
                          JOIN subscribed_lists l ON l.list_uri = r.list_uri \
                          JOIN subscribed_list_items i ON i.list_uri = r.list_uri \

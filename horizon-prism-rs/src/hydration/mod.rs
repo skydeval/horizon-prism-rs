@@ -43,6 +43,10 @@ pub mod thread_v2;
 pub mod trends;
 pub mod upstream;
 #[cfg(test)]
+mod compact_notify_tests;
+#[cfg(test)]
+mod compact_ref_tests;
+#[cfg(test)]
 mod profile_refresh_tests;
 #[cfg(test)]
 mod row_filter_tests;

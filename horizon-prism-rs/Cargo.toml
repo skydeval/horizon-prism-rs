@@ -95,5 +95,7 @@ rustix = { version = "1", features = ["fs"] }
 zstd = "0.13"
 
 [dev-dependencies]
+# The SQL guards over the crate's own source (db/sql_guard.rs).
+regex = "1"
 # tokio::time::pause for the lag sampler's hang test (firehose throughput §4.5).
 tokio = { version = "1", features = ["test-util"] }

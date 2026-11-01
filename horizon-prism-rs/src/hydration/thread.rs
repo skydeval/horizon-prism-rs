@@ -388,14 +388,14 @@ impl Hydrator {
                         .await?
                 }
                 "app.bsky.feed.threadgate#followerRule" => {
-                    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = $2)")
+                    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND f.subject = (SELECT id FROM dids WHERE did = $2))")
                         .bind(me)
                         .bind(author)
                         .fetch_one(self.pool())
                         .await?
                 }
                 "app.bsky.feed.threadgate#followingRule" => {
-                    let follows: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = $2)")
+                    let follows: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND f.subject = (SELECT id FROM dids WHERE did = $2))")
                         .bind(author)
                         .bind(me)
                         .fetch_one(self.pool())

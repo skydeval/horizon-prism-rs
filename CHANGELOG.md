@@ -16,6 +16,10 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
   layout coming in the next releases. Nothing is stored differently yet.
   **Upgrade:** start once with `APP_ALLOW_STARTUP_MIGRATE=1` (migration
   0054).
+- **Account ids on Health.** An Account ids check and figure show how many
+  of the 2,147,483,647 account ids are used, and warn past half. The stored
+  records group shows dead rows for posts, profiles and other records, read
+  live.
 
 ### Changed
 
@@ -169,6 +173,8 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 - The Refract timeline builds the member's mutes and blocks once and takes
   each part's page before merging, so a page takes about 0.1 s instead of
   several seconds.
+- Notifications, search, thread gates and activity subscriptions check a
+  follow or block the same way, by looking up each account's id first.
 
 ### Upgrade notes
 

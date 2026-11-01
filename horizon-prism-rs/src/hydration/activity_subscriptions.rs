@@ -49,7 +49,7 @@ impl Hydrator {
         let follows = |from: &'_ str, to: &'_ str| {
             let (from, to) = (from.to_string(), to.to_string());
             async move {
-                sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = $2)")
+                sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND f.subject = (SELECT id FROM dids WHERE did = $2))")
                     .bind(from)
                     .bind(to)
                     .fetch_one(self.pool())

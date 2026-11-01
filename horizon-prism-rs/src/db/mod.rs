@@ -17,6 +17,8 @@ pub mod records;
 pub mod retention;
 pub mod sampler;
 pub mod schema_backfill;
+#[cfg(test)]
+mod sql_guard;
 pub mod tombstones;
 
 pub use migrations::{

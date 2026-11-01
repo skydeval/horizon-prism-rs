@@ -1017,3 +1017,40 @@ async fn migration_0060_moves_actors() {
     assert_eq!(indexes, ["actors_handle_prefix", "actors_handle_trgm", "actors_joined_via", "actors_name_prefix", "actors_name_trgm", "actors_pkey"]);
     db.drop_db().await;
 }
+
+/// A newer dictionary for a family leaves the rows written with the older
+/// one readable, and new writes take the newer one.
+#[tokio::test]
+async fn a_newer_dictionary_leaves_older_rows_readable() {
+    use crate::db::records::{self, FAMILY_POSTS};
+    let Some(db) = fresh_db("ids_newer_dictionary").await else {
+        return;
+    };
+    let p = &db.pool;
+    let record = serde_json::json!({"$type": "app.bsky.feed.post", "text": "kept across dictionaries", "createdAt": "2026-10-31T00:00:00Z"});
+    let samples = |word: &str| -> Vec<Vec<u8>> {
+        (0..2000)
+            .map(|i| format!(r#"{{"$type":"app.bsky.feed.post","text":"{word} sample {i}","createdAt":"2026-10-31T00:00:{:02}Z"}}"#, i % 60).into_bytes())
+            .collect()
+    };
+    let mut written = Vec::new();
+    for (id, word) in [(1i16, "first"), (2, "second other words")] {
+        let dict = train_dict(&samples(word), 16 * 1024).expect("train");
+        sqlx::query("INSERT INTO record_dicts (id, family, bytes) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(FAMILY_POSTS)
+            .bind(&dict)
+            .execute(p)
+            .await
+            .expect("dict");
+        assert_eq!(records::current_id(p, FAMILY_POSTS).await.expect("current"), u8::try_from(id).expect("id"));
+        let stored = records::encode(p, FAMILY_POSTS, &record).await.expect("encode");
+        assert_eq!(i16::from(stored[0]), id, "written with the newest dictionary");
+        written.push(stored);
+    }
+    assert_ne!(written[0], written[1]);
+    for stored in &written {
+        assert_eq!(records::decode_value(p, stored).await.expect("decode"), record);
+    }
+    db.drop_db().await;
+}

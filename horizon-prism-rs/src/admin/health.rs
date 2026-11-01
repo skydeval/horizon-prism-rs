@@ -458,6 +458,41 @@ pub struct Inputs {
     pub private_relays: Vec<String>,
     /// The disks (§10.1), read now.
     pub disks: Option<super::stats::Disks>,
+    /// The highest account id handed out ([`ACCOUNT_IDS_SQL`]).
+    pub account_ids: Option<i64>,
+}
+
+/// The account ids the database can hand out: `dids.id` is an `integer`
+/// (`i32::MAX`).
+pub const ACCOUNT_ID_LIMIT: i64 = 2_147_483_647;
+/// From this share of [`ACCOUNT_ID_LIMIT`] used the Account ids check warns.
+pub const ACCOUNT_IDS_WARN: f64 = 0.5;
+/// The highest account id handed out: the sequence's last value, which
+/// counts ids a rolled-back insert spent too. One read, no scan.
+pub const ACCOUNT_IDS_SQL: &str = "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM dids_id_seq";
+
+/// A share of the account ids in words, finer under 1%.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn id_share(used: i64) -> String {
+    let ratio = used as f64 / ACCOUNT_ID_LIMIT as f64;
+    if ratio > 0.0 && ratio < 0.01 { format!("{:.2}%", ratio * 100.0) } else { percent(ratio) }
+}
+
+/// The Account ids check: every account Prism stores gets an id, and the
+/// ids run out at [`ACCOUNT_ID_LIMIT`]; past half it warns.
+#[allow(clippy::cast_precision_loss)]
+fn account_ids_check(used: Option<i64>) -> Check {
+    const NAME: &str = "Account ids";
+    let Some(used) = used else {
+        return Check::no_data(NAME, "the count did not finish in time.");
+    };
+    let text = format!("{} of {} account ids are used ({}).", count(used as f64), count(ACCOUNT_ID_LIMIT as f64), id_share(used));
+    if used as f64 >= ACCOUNT_ID_LIMIT as f64 * ACCOUNT_IDS_WARN {
+        Check::new(NAME, Level::Amber, format!("{text} Over half are used; when they run out Prism cannot store new accounts."))
+    } else {
+        Check::new(NAME, Level::Ok, text)
+    }
 }
 
 /// Under this share free a disk is red (§9.2).
@@ -652,6 +687,8 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
         Some(r) => Check::new("Database budget", Level::Ok, format!("The database is at {} of its budget.", percent(r))),
     });
 
+    out.push(account_ids_check(i.account_ids));
+
     out.push(match latest.as_ref().and_then(|s| s.sum(crate::db::sampler::METRIC_REDIS_RATIO)) {
         None => Check::no_data("Redis memory", "not measured yet, or Redis has no memory limit."),
         Some(r) if r >= 0.8 => Check::new("Redis memory", Level::Amber, format!("Redis is at {} of its memory; at 100% Prism stops reading the network.", percent(r))),
@@ -824,6 +861,45 @@ pub async fn timed_count(pool: &PgPool, sql: &str) -> Option<i64> {
     }
 }
 
+/// Dead rows in the tables that keep their records, by record family: the
+/// recompression rewrites each row once and leaves a dead one behind until
+/// a vacuum (or a repack) takes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeadRows {
+    pub posts: i64,
+    pub profiles: i64,
+    pub other: i64,
+}
+
+/// [`DeadRows`] now, from Postgres's table statistics, under a 2-second
+/// statement timeout; `None` when the read fails.
+pub async fn record_dead_rows(pool: &PgPool) -> Option<DeadRows> {
+    use crate::db::schema_backfill::{OTHER, POSTS, PROFILES, RecordFamily};
+    let names: Vec<&str> = [POSTS, PROFILES, OTHER].iter().flat_map(|f| f.tables.iter().map(|t| t.table)).collect();
+    let run = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '2s'").execute(&mut *tx).await?;
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT relname::text, coalesce(n_dead_tup, 0) FROM pg_stat_user_tables WHERE schemaname = current_schema() AND relname = ANY($1)",
+        )
+        .bind(&names)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(rows)
+    };
+    match run.await {
+        Ok(rows) => {
+            let of = |family: RecordFamily| rows.iter().filter(|(t, _)| family.tables.iter().any(|f| f.table == t.as_str())).map(|(_, n)| *n).sum::<i64>();
+            Some(DeadRows { posts: of(POSTS), profiles: of(PROFILES), other: of(OTHER) })
+        }
+        Err(error) => {
+            tracing::warn!(event = "admin_health_count_failed", %error, "a health count did not finish");
+            None
+        }
+    }
+}
+
 /// The inputs that cost no query: the database and Redis probes (each a
 /// ping under [`PROBE_TIMEOUT`]), the audit latch, the held gap, the schema
 /// task and the relays the configuration names. The counts, the disks and
@@ -858,16 +934,18 @@ pub async fn probes(state: &AdminState) -> Inputs {
 /// The checks now: the probes and the two counts run at once, the rest is
 /// read from memory and the ring. `banners` are the signed-in page's.
 pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
-    let (base, failed_jobs, unavailable_accounts, members_not_ready) = tokio::join!(
+    let (base, failed_jobs, unavailable_accounts, members_not_ready, account_ids) = tokio::join!(
         probes(state),
         timed_count(&state.pool, FAILED_JOBS_SQL),
         timed_count(&state.pool, UNAVAILABLE_ACCOUNTS_SQL),
         timed_count(&state.pool, "SELECT count(*) FROM members WHERE ready_at IS NULL AND added_at < now() - interval '24 hours'"),
+        timed_count(&state.pool, ACCOUNT_IDS_SQL),
     );
     let inputs = Inputs {
         failed_jobs,
         unavailable_accounts,
         members_not_ready,
+        account_ids,
         set_aside: banners.set_aside,
         waiting: banners.waiting,
         started_without: crate::config::lenient::notices().into_iter().map(|s| (s.key, s.problem)).collect(),
@@ -1027,6 +1105,7 @@ mod tests {
             relays: vec!["bsky".into(), "microcosm".into()],
             private_relays: Vec::new(),
             disks: Some(disks(1_000_000_000_000, 15_000_000_000)),
+            account_ids: Some(1_200_000_000),
         };
         let all = checks(&inputs, &ring);
         let get = |name: &str, text: &str| all.iter().find(|c| c.name == name && c.text.contains(text)).unwrap_or_else(|| panic!("{name}: {all:#?}")).level;
@@ -1049,6 +1128,17 @@ mod tests {
         assert_eq!(get("Search", "still being prepared"), Level::Info);
         assert_eq!(get("Trim gap", "No data"), Level::NoData, "a counter never incremented is absent");
         assert_eq!(get("Disk", "The disk holding the database (Postgres) has 15.0 GB free (2% free)"), Level::Red);
+        assert_eq!(get("Account ids", "1,200,000,000 of 2,147,483,647 account ids are used (56%). Over half are used"), Level::Amber);
+    }
+
+    #[test]
+    fn account_ids_warn_past_half() {
+        let check = |used: Option<i64>| account_ids_check(used);
+        assert_eq!(check(None).level, Level::NoData);
+        assert_eq!(check(Some(1_468_627)), Check::new("Account ids", Level::Ok, "1,468,627 of 2,147,483,647 account ids are used (0.07%)."));
+        assert_eq!(check(Some(0)).text, "0 of 2,147,483,647 account ids are used (0%).");
+        assert_eq!(check(Some(ACCOUNT_ID_LIMIT / 2)).level, Level::Ok, "just under half");
+        assert_eq!(check(Some(ACCOUNT_ID_LIMIT / 2 + 1)).level, Level::Amber);
     }
 
     /// #737: a private relay that has never reported is a Problem naming

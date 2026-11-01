@@ -738,12 +738,11 @@ async fn delete_keys_batch(conn: &mut PgConnection, table: &str, keys: &[&str], 
 async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
     // A restored DID's interactions with the member stay: the restored rule
     // admits them (refract design §5.4).
-    let out_of_scope = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = t.author_did) \
-        AND NOT EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = t.author_did AND rf.state IN ('restored', 'grace'))";
+    // Every table names its accounts by id; `ta` and `ts` are the author's
+    // and subject's DID rows.
+    let graph_out_of_scope = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = ta.did) \
+        AND NOT EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = ta.did AND rf.state IN ('restored', 'grace'))";
     let mut n = 0;
-    // Likes, reposts, follows and blocks name their accounts by id; `ta`
-    // and `ts` are the author's and subject's DID rows.
-    let graph_out_of_scope = out_of_scope.replace("t.author_did", "ta.did");
     // Reposts of a removed member in R are kept by the restored-subject
     // rule (refract-reposts design §4).
     let subject_in_r = "EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = $1 AND rf.state IN ('restored', 'grace'))";

@@ -733,7 +733,7 @@ impl Hydrator {
     /// server that ignored the filter.
     async fn refract_follows(&self, req: &Requester, follower: &str, subject: &str, local: bool) -> Result<Option<bool>, sqlx::Error> {
         if local {
-            let found: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = $2)")
+            let found: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND f.subject = (SELECT id FROM dids WHERE did = $2))")
                 .bind(follower)
                 .bind(subject)
                 .fetch_one(self.pool())
