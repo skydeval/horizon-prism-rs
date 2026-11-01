@@ -955,7 +955,7 @@ mod tests {
         let p = &db.pool;
         actor(p, ALICE, "alice.test", "Alice").await;
         actor(p, BOB, "bob.test", "Bob").await;
-        exec(p, "INSERT INTO actor_counts (did, followers_count, follows_count, posts_count) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 3, 2, 1)").await;
+        crate::test_support::interactions::set_actor_counts(p, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", (3, 2, 1)).await;
         let h = hydrator(p, sets());
         let req = Requester::test();
         let v = h.get_profile(&Viewer::anonymous(), &req,ALICE).await.expect("db").expect("view");

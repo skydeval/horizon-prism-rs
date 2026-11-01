@@ -55,7 +55,7 @@ const LOCK_RETRY: Duration = Duration::from_millis(500);
 
 /// The large-table indexes, by name, with the one statement that builds
 /// each (§3.1: the names and definitions are normative).
-pub const INDEXES: [(&str, &str); 11] = [
+pub const INDEXES: [(&str, &str); 7] = [
     ("posts_search", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_search ON posts USING gin (search_tsv)"),
     ("posts_tags", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_tags ON posts USING gin (tags)"),
     ("posts_domains", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_domains ON posts USING gin (link_domains)"),
@@ -63,20 +63,6 @@ pub const INDEXES: [(&str, &str); 11] = [
     ("posts_mentions", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_mentions ON posts USING gin (mention_dids)"),
     ("posts_langs", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_langs ON posts USING gin (lang_prefixes)"),
     ("posts_created", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_created ON posts (created_at DESC, uri DESC)"),
-    ("likes_via", "CREATE INDEX CONCURRENTLY IF NOT EXISTS likes_via ON likes (via_uri) WHERE via_uri IS NOT NULL"),
-    ("reposts_via", "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_via ON reposts (via_uri) WHERE via_uri IS NOT NULL"),
-    // The repost items of the private timeline and author feed.
-    (
-        "reposts_private_subject",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_private_subject ON reposts (author_did, created_at DESC) \
-         WHERE subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%'",
-    ),
-    // Reposts by the subject's author: Refract's purge and spares of
-    // reposts of restored posts, and `getTimeline`'s repost arm.
-    (
-        "reposts_subject_did",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_subject_did ON reposts (split_part(subject_uri, '/', 3), created_at DESC)",
-    ),
 ];
 
 /// The task's settings.
@@ -606,7 +592,7 @@ mod tests {
             .fetch_one(p)
             .await
             .expect("recorded");
-        assert_eq!(recorded, 11);
+        assert_eq!(recorded, 7);
         // A second pass finds every index valid and builds nothing.
         t.run_index_builds().await.expect("again");
         db.drop_db().await;

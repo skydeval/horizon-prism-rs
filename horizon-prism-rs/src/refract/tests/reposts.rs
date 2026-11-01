@@ -112,7 +112,7 @@ async fn a2_a5_a6_stored_spared_and_purged() {
     exec(p, &format!("UPDATE refract_dids SET state = 'ending' WHERE did = '{SUBJECT}'")).await;
     let h = Harness::new(p, sets(PublicMode::Off, false), vec![tier1()]).await;
     assert!(h.refract.purge(SUBJECT).await.expect("purge"));
-    let left: Vec<String> = sqlx::query_scalar("SELECT author_did FROM reposts ORDER BY author_did").fetch_all(p).await.expect("left");
+    let left: Vec<String> = sqlx::query_scalar("SELECT d.did FROM reposts r JOIN dids d ON d.id = r.author ORDER BY d.did").fetch_all(p).await.expect("left");
     assert_eq!(left, [MEMBER.to_string(), R2.to_string()], "a member's (D-7) and a restored DID's stay");
     db.drop_db().await;
 }
@@ -137,7 +137,7 @@ async fn a5_on_mode_keeps_s_reposts() {
     exec(p, &format!("INSERT INTO refract_dids (did, community, pds_host, state, source) VALUES ('{SUBJECT}', 'sky', '127.0.0.1', 'ending', 'fill')")).await;
     let h = Harness::new(p, sets(PublicMode::On, false), vec![tier1()]).await;
     assert!(h.refract.purge(SUBJECT).await.expect("purge"));
-    let left: Vec<String> = sqlx::query_scalar("SELECT author_did FROM reposts").fetch_all(p).await.expect("left");
+    let left: Vec<String> = sqlx::query_scalar("SELECT d.did FROM reposts r JOIN dids d ON d.id = r.author").fetch_all(p).await.expect("left");
     assert_eq!(left, [OTHER.to_string()]);
     db.drop_db().await;
 }
@@ -154,9 +154,10 @@ fn read_sets() -> ScopeSets {
 }
 
 async fn insert_repost(p: &PgPool, author: &str, rkey: &str, subject: &str, at: &str) -> String {
-    let uri = format!("at://{author}/app.bsky.feed.repost/{rkey}");
-    exec(p, &format!("INSERT INTO reposts (uri, author_did, subject_uri, rev, created_at) VALUES ('{uri}', '{author}', '{subject}', '3k', '{at}')")).await;
-    uri
+    crate::test_support::interactions::Interaction::repost(author, rkey, subject)
+        .at(at.parse().expect("time"))
+        .put(p)
+        .await
 }
 
 fn remote(did: &str, handle: &str) -> Value {
@@ -328,8 +329,9 @@ async fn a7_the_fill() {
     *links.fail.lock().expect("fail") = false;
     let b = Backfill::new(writer(p, sets(PublicMode::Off, true)), links.clone(), BackfillConfig::default(), 1);
     assert_eq!(b.repost_fill_once().await.expect("fill").map(|(_, o)| o), Some("done"));
-    let rows: Vec<(String, Option<String>, String, chrono::DateTime<chrono::Utc>)> =
-        sqlx::query_as("SELECT uri, subject_cid, rev, created_at FROM reposts").fetch_all(p).await.expect("rows");
+    type Stored = (String, Option<Vec<u8>>, String, chrono::DateTime<chrono::Utc>);
+    let rows: Vec<Stored> =
+        sqlx::query_as("SELECT at_uri(author, 3::smallint, rkey), subj_cid, bigint_to_rev(rev), created_at FROM reposts").fetch_all(p).await.expect("rows");
     assert_eq!(rows.len(), 1, "the tombstoned and the malformed are skipped: {rows:?}");
     assert_eq!(rows[0].0, format!("at://{STRANGER}/app.bsky.feed.repost/{tid}"));
     assert_eq!((rows[0].1.as_deref(), rows[0].2.as_str()), (None, SENTINEL_REV));

@@ -156,14 +156,9 @@ async fn t_pb6_counts_reposts_and_notifications() {
     };
     let t = w.root.clone();
     let pool = w.f.pool.clone();
-    exec(&pool, &format!(
-        "INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) \
-         VALUES ('at://{BOB}/app.bsky.feed.like/3kpb6like222', '{BOB}', '{t}', 'bafyt', '3k', now())"
-    )).await;
-    exec(&pool, &format!(
-        "INSERT INTO reposts (uri, author_did, subject_uri, subject_cid, rev, created_at) \
-         VALUES ('at://{BOB}/app.bsky.feed.repost/3kpb6repost2', '{BOB}', '{t}', 'bafyt', '3k', now())"
-    )).await;
+    for (table, rkey) in [("likes", "3kpb6like222"), ("reposts", "3kpb6repost2")] {
+        exec(&pool, &crate::test_support::interactions::row_sql(table, BOB, rkey, &t, "now()")).await;
+    }
     let id: i64 = sqlx::query_scalar(&format!(
         "INSERT INTO private_notifications (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
          VALUES ('{DAVE}', '{BOB}', 'like', '{t}', 'at://{BOB}/app.bsky.feed.like/3kpb6like222', 'bafyl') RETURNING id"

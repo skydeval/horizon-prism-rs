@@ -51,7 +51,7 @@ async fn t8o_t8u_author_feed() {
     let shown = format!("at://{OTHER}/app.bsky.feed.post/3kshown");
     let gone = format!("at://{OTHER}/app.bsky.feed.post/3kgone");
     for (rkey, subject) in [("3krp1", &shown), ("3krp2", &gone)] {
-        exec(p, &format!("INSERT INTO reposts (uri, author_did, subject_uri, rev, created_at) VALUES ('at://{R}/app.bsky.feed.repost/{rkey}', '{R}', '{subject}', '3k', now())")).await;
+        crate::test_support::interactions::repost(p, R, rkey, subject).await;
     }
     exec(p, &format!("UPDATE actors SET profile_record = '{{\"pinnedPost\": {{\"uri\": \"at://{R}/app.bsky.feed.post/3kp05\", \"cid\": \"c\"}}}}'::jsonb WHERE did = '{R}'")).await;
     let pv = |uri: &str| json!({"uri": uri, "cid": "c", "author": {"did": OTHER, "handle": "o.test"}, "record": {"text": "upstream"}, "indexedAt": "2026-01-01T00:00:00Z"});

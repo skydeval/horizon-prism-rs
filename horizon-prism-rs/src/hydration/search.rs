@@ -598,7 +598,8 @@ impl Hydrator {
                 qb.push(" ORDER BY n.created_at DESC, n.uri DESC LIMIT ").push_bind(i64::from(cfg.top_candidates));
                 qb.push(
                     ") SELECT c.uri, c.created_at FROM c \
-                     LEFT JOIN post_counts pc ON pc.post_uri = c.uri \
+                     LEFT JOIN LATERAL ref_of(c.uri) k ON true \
+                     LEFT JOIN post_counts pc ON k.coll = 1 AND pc.author = k.author AND pc.rkey = k.rkey \
                      LEFT JOIN constellation_counts cc ON cc.target = c.uri",
                 );
                 // A stored Constellation count is used only while §II-9.6
@@ -759,7 +760,7 @@ mod tests {
         exec(p, "UPDATE posts SET created_at = now() - interval '2 hours' WHERE rkey = '3kb'").await;
         exec(p, "UPDATE posts SET created_at = now() - interval '3 hours' WHERE rkey = '3kc'").await;
         exec(p, "UPDATE posts SET created_at = now() - interval '4 hours' WHERE rkey = '3kd'").await;
-        exec(p, &format!("INSERT INTO post_counts (post_uri, like_count) VALUES ('at://{CAROL}/app.bsky.feed.post/3kd', 50)")).await;
+        crate::test_support::interactions::set_post_counts(p, &format!("at://{CAROL}/app.bsky.feed.post/3kd"), (50, 0, 0, 0)).await;
 
         let mut sets = ScopeSets::default();
         for did in [ALICE, BOB, CAROL] {

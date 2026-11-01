@@ -42,10 +42,14 @@ fn parse_cursor(c: Option<&str>) -> (Option<DateTime<Utc>>, i64) {
 //   rows were written in On or Filling before the writer stopped writing
 //   them; they age out with retention.
 const EXCLUSIONS: &str = "NOT COALESCE(n.reason_subject LIKE 'at://%/tools.kryphocron.feed.postPrivate/%', false) \
-     AND NOT EXISTS (SELECT 1 FROM likes l WHERE l.uri = n.record_uri \
-                     AND l.subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%') \
-     AND NOT EXISTS (SELECT 1 FROM reposts l WHERE l.uri = n.record_uri \
-                     AND l.subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%') \
+     AND NOT (n.reason IN ('like', 'like-via-repost') AND EXISTS (SELECT 1 FROM likes l, ref_of(n.record_uri) k \
+                     WHERE k.coll = 2 AND l.author = k.author AND l.rkey = k.rkey \
+                       AND (l.subj_coll = 27 OR (l.subj_coll = 0 AND ref_text(l.subj_author, l.subj_coll, l.subj_rkey, 2::smallint, \
+                            l.author, l.rkey, 4::smallint) LIKE 'at://%/tools.kryphocron.feed.postPrivate/%')))) \
+     AND NOT (n.reason IN ('repost', 'repost-via-repost') AND EXISTS (SELECT 1 FROM reposts l, ref_of(n.record_uri) k \
+                     WHERE k.coll = 3 AND l.author = k.author AND l.rkey = k.rkey \
+                       AND (l.subj_coll = 27 OR (l.subj_coll = 0 AND ref_text(l.subj_author, l.subj_coll, l.subj_rkey, 3::smallint, \
+                            l.author, l.rkey, 4::smallint) LIKE 'at://%/tools.kryphocron.feed.postPrivate/%')))) \
      AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did \
        AND (m.scope = 'full' \
          OR (m.scope IN ('reposts', 'reposts_and_quotes') AND n.reason IN ('repost', 'repost-via-repost')) \
@@ -95,7 +99,7 @@ const FARSIGHT_AUTHORS: usize = 100;
 
 /// A like or repost row: URI, subject URI and CID, `created_at`, `via` URI
 /// and CID.
-type SubjectRow = (String, String, Option<String>, DateTime<Utc>, Option<String>, Option<String>);
+type SubjectRow = (String, Option<String>, Option<Vec<u8>>, DateTime<Utc>, Option<String>, Option<Vec<u8>>);
 /// A follow row: URI, subject, `created_at`, `via` URI and CID.
 type FollowRow = (String, String, DateTime<Utc>, Option<String>, Option<Vec<u8>>);
 
@@ -130,17 +134,26 @@ impl Hydrator {
             .fetch_all(self.pool())
             .await?;
         out.extend(posts);
-        for (table, ty) in [("likes", "app.bsky.feed.like"), ("reposts", "app.bsky.feed.repost")] {
+        // A like's or repost's subject and `via` come back as their text:
+        // rebuilt from their keys, or read from `odd_refs` when odd.
+        for (table, ty, coll) in [("likes", "app.bsky.feed.like", 2), ("reposts", "app.bsky.feed.repost", 3)] {
             let rows: Vec<SubjectRow> = sqlx::query_as(&format!(
-                "SELECT uri, subject_uri, subject_cid, created_at, via_uri, via_cid FROM {table} WHERE uri = ANY($1)"
+                "SELECT u.uri, ref_text(l.subj_author, l.subj_coll, l.subj_rkey, {coll}::smallint, l.author, l.rkey, 4::smallint), \
+                   l.subj_cid, l.created_at, \
+                   ref_text(l.via_author, l.via_coll, l.via_rkey, {coll}::smallint, l.author, l.rkey, 5::smallint), l.via_cid \
+                 FROM unnest($1::text[]) AS u(uri) \
+                 CROSS JOIN LATERAL ref_of(u.uri) r \
+                 JOIN {table} l ON l.author = r.author AND l.rkey = r.rkey \
+                 WHERE r.coll = {coll}"
             ))
             .bind(&uris)
             .fetch_all(self.pool())
             .await?;
-            for (uri, subject, cid, created, via_uri, via_cid) in rows {
-                let mut record = json!({"$type": ty, "subject": {"uri": subject, "cid": cid.unwrap_or_default()}, "createdAt": ts(created)});
+            let cid = |c: Option<Vec<u8>>| c.as_deref().map(crate::db::ids::cid_from_db).unwrap_or_default();
+            for (uri, subject, subject_cid, created, via_uri, via_cid) in rows {
+                let mut record = json!({"$type": ty, "subject": {"uri": subject.unwrap_or_default(), "cid": cid(subject_cid)}, "createdAt": ts(created)});
                 if let Some(via) = via_uri {
-                    record["via"] = json!({"uri": via, "cid": via_cid.unwrap_or_default()});
+                    record["via"] = json!({"uri": via, "cid": cid(via_cid)});
                 }
                 out.insert(uri, record);
             }
@@ -627,8 +640,8 @@ mod tests {
             format!("at://{BOB}/app.bsky.feed.repost/3krepost"),
             format!("at://{BOB}/app.bsky.graph.follow/3kfollow"),
         );
-        exec(p, &format!("INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES ('{like}', '{BOB}', '{root}', 'bafyroot', '3k', now())")).await;
-        exec(p, &format!("INSERT INTO reposts (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES ('{repost}', '{BOB}', '{root}', 'bafyroot', '3k', now())")).await;
+        crate::test_support::interactions::Interaction::like(BOB, "3klike", &root).cid("bafyroot").put(p).await;
+        crate::test_support::interactions::Interaction::repost(BOB, "3krepost", &root).cid("bafyroot").put(p).await;
         crate::test_support::graph::follow(p, BOB, ALICE, "3kfollow").await;
         for (reason, uri, subject) in [
             ("reply", &reply, Some(&root)),
@@ -748,8 +761,7 @@ mod tests {
         actor(p, BOB, "bob.test", "Bob").await;
         let root = post(p, ALICE, "3kaaaaaaaaaa2", "root", None, None).await;
         let reply = post(p, BOB, "3kaaaaaaaaaa3", "reply", Some(&root), Some(&root)).await;
-        exec(p, &format!("INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES \
-                 ('at://{BOB}/app.bsky.feed.like/1', '{BOB}', '{root}', 'bafyroot', '3k', now())")).await;
+        crate::test_support::interactions::Interaction::like(BOB, "1", &root).cid("bafyroot").put(p).await;
         exec(p, &format!("INSERT INTO notifications (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) VALUES \
                  ('{ALICE}', '{BOB}', 'reply', '{root}', '{reply}', 'bafyr'), \
                  ('{ALICE}', '{BOB}', 'like', '{root}', 'at://{BOB}/app.bsky.feed.like/1', 'bafyl')")).await;

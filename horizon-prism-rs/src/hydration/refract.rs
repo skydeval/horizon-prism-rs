@@ -361,7 +361,9 @@ impl Hydrator {
                  CASE WHEN p.reply_parent_uri IS NULL THEN 'post' ELSE 'reply' END AS kind, p.created_at AS sort_at \
                FROM posts p WHERE p.author_did = $1 AND {posts_when} \
                UNION ALL \
-               SELECT r.uri, r.author_did, r.subject_uri, 'repost', r.created_at FROM reposts r WHERE r.author_did = $1 AND $5 \
+               SELECT at_uri(r.author, 3::smallint, r.rkey), $1, \
+                 ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint), 'repost', r.created_at \
+               FROM reposts r WHERE r.author = (SELECT id FROM dids WHERE did = $1) AND $5 \
              ) f WHERE ($2::timestamptz IS NULL OR (f.sort_at, f.uri) < ($2, $3)) \
              ORDER BY f.sort_at DESC, f.uri DESC LIMIT $4"
         );
@@ -529,11 +531,14 @@ impl Hydrator {
                  AND (p.reply_parent_uri IS NULL \
                       OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = split_part(p.reply_parent_uri, '/', 3))) \
                UNION ALL \
-               SELECT r.uri, r.author_did, r.subject_uri, 'repost', r.created_at, false FROM reposts r \
-               WHERE (r.author_did = ANY($2) \
-                      AND EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = r.author_did)) \
-                  OR (split_part(r.subject_uri, '/', 3) = ANY($2) AND split_part(r.subject_uri, '/', 4) = 'app.bsky.feed.post' \
-                      AND (r.author_did = $1 OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = r.author_did))) \
+               SELECT at_uri(r.author, 3::smallint, r.rkey), ra.did, \
+                 ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint), 'repost', r.created_at, false \
+               FROM reposts r JOIN dids ra ON ra.id = r.author \
+               WHERE (r.author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) \
+                      AND r.author IN (SELECT f.subject FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1))) \
+                  OR (r.subj_author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) AND r.subj_coll = 1 \
+                      AND (r.author = (SELECT id FROM dids WHERE did = $1) \
+                           OR r.author IN (SELECT f.subject FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1)))) \
              ) t WHERE ($3::timestamptz IS NULL OR (t.sort_at, t.uri) < ($3, $4)) \
                AND NOT {} AND NOT {} \
                AND NOT (t.kind = 'repost' AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
@@ -566,11 +571,14 @@ impl Hydrator {
     pub async fn refract_author_reposts_items(&self, actor: &str, restored: &[String], cursor: Option<&str>, limit: u32) -> Result<(Vec<FeedItem>, Option<String>), sqlx::Error> {
         let (at, after) = parse_local_cursor(cursor);
         let items: Vec<FeedItem> = sqlx::query_as(
-            "SELECT r.uri, r.author_did AS originator_did, r.subject_uri AS post_uri, 'repost' AS kind, r.created_at AS sort_at \
-             FROM reposts r WHERE r.author_did = $1 \
-               AND split_part(r.subject_uri, '/', 3) = ANY($2) AND split_part(r.subject_uri, '/', 4) = 'app.bsky.feed.post' \
-               AND ($3::timestamptz IS NULL OR (r.created_at, r.uri) < ($3, $4)) \
-             ORDER BY r.created_at DESC, r.uri DESC LIMIT $5",
+            "SELECT at_uri(r.author, 3::smallint, r.rkey) AS uri, $1::text AS originator_did, \
+               ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint) AS post_uri, \
+               'repost' AS kind, r.created_at AS sort_at \
+             FROM reposts r WHERE r.author = (SELECT id FROM dids WHERE did = $1) \
+               AND r.subj_author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) AND r.subj_coll = 1 \
+               AND ($3::timestamptz IS NULL OR (r.created_at, r.rkey) < ($3, \
+                    COALESCE((SELECT k.rkey FROM ref_of($4) k), '-9223372036854775808'::bigint))) \
+             ORDER BY r.created_at DESC, r.rkey DESC LIMIT $5",
         )
         .bind(actor)
         .bind(restored)

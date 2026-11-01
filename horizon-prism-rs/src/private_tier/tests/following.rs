@@ -1109,7 +1109,7 @@ async fn t41_a_complete_pass_sets_the_flag() {
     // clears the flag, and the settle writes NULL and re-queues itself a
     // minute on with the marker.
     let counts = || async {
-        let n: i32 = sqlx::query_scalar(&format!("SELECT followers_count FROM actor_counts WHERE did = '{BOB}'")).fetch_one(h.pool()).await.expect("counts");
+        let n: i32 = sqlx::query_scalar(&format!("SELECT followers_count FROM actor_counts WHERE id = (SELECT id FROM dids WHERE did = '{BOB}')")).fetch_one(h.pool()).await.expect("counts");
         n
     };
     let bob_count = counts().await;

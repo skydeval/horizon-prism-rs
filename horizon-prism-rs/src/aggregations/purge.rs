@@ -478,8 +478,8 @@ impl Purger {
                     ("feed_items", "originator_did"),
                     ("posts", "author_did"),
                     ("member_post_refs", "author_did"),
-                    ("likes", "author_did"),
-                    ("reposts", "author_did"),
+                    ("likes", "author"),
+                    ("reposts", "author"),
                     ("follows", "author"),
                     ("blocks", "author"),
                     // The record tables design-v3 added (§3.1).
@@ -496,7 +496,7 @@ impl Purger {
                     // Pronouns and plural records (plural-pronouns §2.3).
                     ("plural_records", "did"),
                 ] {
-                    n += if matches!(table, "follows" | "blocks") {
+                    n += if matches!(table, "likes" | "reposts" | "follows" | "blocks") {
                         delete_graph_batch(conn, table, "t.author = (SELECT id FROM dids WHERE did = $1)", did).await?
                     } else {
                         delete_batch(conn, table, "uri", &format!("{column} = $1"), did).await?
@@ -510,13 +510,16 @@ impl Purger {
                 n += remembered_batch(conn, did, "viewer_did = $1 OR other_did = $1").await?;
                 // Subscriptions others hold on the deleted account go too.
                 n += delete_batch(conn, "activity_subscriptions", "ctid", "subject_did = $1", did).await?;
-                for table in ["notification_seen", "actor_counts"] {
-                    n += sqlx::query(&format!("DELETE FROM {table} WHERE did = $1"))
-                        .bind(did)
-                        .execute(&mut *conn)
-                        .await?
-                        .rows_affected();
-                }
+                n += sqlx::query("DELETE FROM notification_seen WHERE did = $1")
+                    .bind(did)
+                    .execute(&mut *conn)
+                    .await?
+                    .rows_affected();
+                n += sqlx::query("DELETE FROM actor_counts WHERE id = (SELECT id FROM dids WHERE did = $1)")
+                    .bind(did)
+                    .execute(&mut *conn)
+                    .await?
+                    .rows_affected();
                 // The identity row stays (account_status = 'deleted'); its
                 // authored profile goes.
                 n += sqlx::query(
@@ -709,8 +712,8 @@ async fn delete_batch(
     Ok(sqlx::query(&sql).bind(did).execute(conn).await?.rows_affected())
 }
 
-/// [`delete_batch`] for `follows` or `blocks`, keyed by `(author, rkey)`;
-/// `predicate` names the table `t`.
+/// [`delete_batch`] for a table keyed by `(author, rkey)` (likes, reposts,
+/// follows, blocks); `predicate` names the table `t`.
 async fn delete_graph_batch(conn: &mut PgConnection, table: &str, predicate: &str, did: &str) -> Result<u64, sqlx::Error> {
     let sql = format!(
         "DELETE FROM {table} WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM {table} t WHERE {predicate} LIMIT {BATCH})"
@@ -731,15 +734,17 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Resu
     let out_of_scope = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = t.author_did) \
         AND NOT EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = t.author_did AND rf.state IN ('restored', 'grace'))";
     let mut n = 0;
+    // Likes, reposts, follows and blocks name their accounts by id; `ta`
+    // and `ts` are the author's and subject's DID rows.
+    let graph_out_of_scope = out_of_scope.replace("t.author_did", "ta.did");
     // Reposts of a removed member in R are kept by the restored-subject
     // rule (refract-reposts design §4).
     let subject_in_r = "EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = $1 AND rf.state IN ('restored', 'grace'))";
     for table in ["likes", "reposts"] {
         let spare = if table == "reposts" { format!(" AND NOT {subject_in_r}") } else { String::new() };
         let sql = format!(
-            "DELETE FROM {table} WHERE uri IN (SELECT uri FROM {table} t \
-             WHERE {} = $1 AND {out_of_scope}{spare} LIMIT {BATCH})",
-            author_of("t.subject_uri")
+            "DELETE FROM {table} WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM {table} t JOIN dids ta ON ta.id = t.author \
+             WHERE t.subj_author = (SELECT id FROM dids WHERE did = $1) AND {graph_out_of_scope}{spare} LIMIT {BATCH})"
         );
         n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
     }
@@ -761,9 +766,6 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Resu
         oq = other_member("t.quote_uri"),
     );
     n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
-    // Follows and blocks name their accounts by id; `ta` and `ts` are the
-    // author's and subject's DID rows.
-    let graph_out_of_scope = out_of_scope.replace("t.author_did", "ta.did");
     let sql = format!(
         "DELETE FROM follows WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM follows t JOIN dids ta ON ta.id = t.author \
          WHERE t.subject = (SELECT id FROM dids WHERE did = $1) AND {graph_out_of_scope} LIMIT {BATCH})"
@@ -807,17 +809,19 @@ async fn member_removed_off_batch(conn: &mut PgConnection, did: &str) -> Result<
     let in_r = |col: &str| format!("EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = {col} AND rf.state IN ('restored', 'grace'))");
     let removed_in_r = in_r("$1");
     let mut n = 0;
+    // Its likes and reposts, keyed by id. Its reposts of R authors' posts
+    // are kept by the restored-subject rule.
+    for table in ["likes", "reposts"] {
+        let spare = if table == "reposts" { format!(" AND NOT {}", in_r("(SELECT sd.did FROM dids sd WHERE sd.id = t.subj_author)")) } else { String::new() };
+        let predicate = format!("t.author = (SELECT id FROM dids WHERE did = $1) AND NOT {removed_in_r}{spare}");
+        n += delete_graph_batch(conn, table, &predicate, did).await?;
+    }
     for (table, column) in [
-        ("likes", "author_did"),
-        ("reposts", "author_did"),
         ("lists", "creator_did"),
         ("list_items", "author_did"),
         ("list_optouts", "author_did"),
     ] {
-        // Its reposts of R authors' posts are kept by the restored-subject
-        // rule (refract-reposts design §4).
-        let spare = if table == "reposts" { format!(" AND NOT {}", in_r("split_part(subject_uri, '/', 3)")) } else { String::new() };
-        n += delete_batch(conn, table, "uri", &format!("{column} = $1 AND NOT {removed_in_r}{spare}"), did).await?;
+        n += delete_batch(conn, table, "uri", &format!("{column} = $1 AND NOT {removed_in_r}"), did).await?;
     }
     // Follows name their accounts by id; `ta` and `ts` are the author's and
     // subject's DID rows.
@@ -903,21 +907,10 @@ mod tests {
                     .expect("member");
             }
         }
-        let insert_like = |uri: String, author: &'static str, subject: String| async move {
-            sqlx::query(
-                "INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES ($1, $2, $3, '3kaaaaaaaaaaa', now())",
-            )
-            .bind(uri)
-            .bind(author)
-            .bind(subject)
-            .execute(p)
-            .await
-            .expect("like");
-        };
         // An outsider's like of the member's post (class M) goes; an in-scope
         // author's like stays.
-        insert_like(format!("at://{OUTSIDER}/app.bsky.feed.like/1"), OUTSIDER, post_uri(MEMBER, "1")).await;
-        insert_like(format!("at://{SCOPED}/app.bsky.feed.like/1"), SCOPED, post_uri(MEMBER, "1")).await;
+        crate::test_support::interactions::like(p, OUTSIDER, "1", &post_uri(MEMBER, "1")).await;
+        crate::test_support::interactions::like(p, SCOPED, "1", &post_uri(MEMBER, "1")).await;
         // An outsider reply whose root author is another member stays.
         for (rkey, root) in [("1", MEMBER), ("2", OTHER_MEMBER)] {
             sqlx::query(
@@ -982,7 +975,7 @@ mod tests {
 
         purger.run_batches(MEMBER, PurgeKind::MemberRemoved).await.expect("batches");
         assert_eq!(count(p, "SELECT count(*) FROM likes").await, 1);
-        assert_eq!(count(p, "SELECT count(*) FROM likes WHERE author_did = 'did:plc:dddddddddddddddddddddddd'").await, 1);
+        assert_eq!(crate::test_support::interactions::count_by(p, "likes", "did:plc:dddddddddddddddddddddddd").await, 1);
         assert_eq!(count(p, "SELECT count(*) FROM posts").await, 1);
         assert_eq!(count(p, "SELECT count(*) FROM blocks").await, 0);
         assert_eq!(count(p, "SELECT count(*) FROM notification_seen").await, 0);
@@ -1092,16 +1085,11 @@ mod tests {
             crate::test_support::graph::follow(p, author, subject, rkey).await;
         }
         crate::test_support::graph::block(p, MEMBER, "did:plc:x", "1").await;
-        let subject = |table: &str, rkey: &str| {
-            format!(
-                "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES \
-                 ('at://{MEMBER}/x/{rkey}', '{MEMBER}', 'at://{OUTSIDER}/app.bsky.feed.post/1', '3k', now())"
-            )
-        };
+        let liked = format!("at://{OUTSIDER}/app.bsky.feed.post/1");
+        crate::test_support::interactions::like(p, MEMBER, "l1", &liked).await;
+        crate::test_support::interactions::repost(p, MEMBER, "r1", &liked).await;
         let authored = |sql: &str| sql.replace("$1", &format!("'{MEMBER}'"));
         for sql in [
-            subject("likes", "l1"),
-            subject("reposts", "r1"),
             authored("INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES ('at://' || $1 || '/l/1', $1, '1', 'c', '3k', 'n', 'p', '{}', now())"),
             authored("INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES ('at://' || $1 || '/li/1', $1, '1', 'c', '3k', 'l', 'did:plc:x', now())"),
             authored("INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lb/1', $1, '1', 'c', '3k', 'l', now())"),

@@ -839,11 +839,8 @@ mod tests {
         // `viewer.knownLikers` on the anchor: likers the viewer follows.
         // The viewer follows the OP (above), who liked the post; Bob liked
         // it too, and the viewer does not follow Bob.
-        for (who, n) in [(OP, 1), (BOB, 2)] {
-            exec(p, &format!(
-                "INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES \
-                 ('at://{who}/app.bsky.feed.like/{n}', '{who}', '{second}', 'bafy', '3k', now())"
-            )).await;
+        for (who, n) in [(OP, "1"), (BOB, "2")] {
+            crate::test_support::interactions::Interaction::like(who, n, &second).cid("bafy").put(p).await;
         }
         let v = h.get_post_thread_v2(&me, &req, &second, &options).await.expect("db").expect("view");
         let known = &v.inner()["thread"][1]["value"]["post"]["viewer"]["knownLikers"];

@@ -12,6 +12,7 @@ use super::normalize::is_private_uri;
 use super::{CountMode, Hydrator, PostRow, PublicEmit, ViewError, ViewResult, Viewer, ts};
 use crate::aggregations::counts::Counts;
 use crate::config::BookmarkCount;
+use crate::db::ids::{COLL_LIKE, COLL_REPOST, UriParts, uri_parts};
 use crate::db::locks::uri_author;
 use crate::moderation::Gate;
 use crate::hydration::HydrationError;
@@ -1017,14 +1018,45 @@ impl Hydrator {
         }
         // One entry per account, at its newest record of the subject, as
         // the counts count accounts (#727).
-        let table = if collection == NSID_LIKE { "likes" } else { "reposts" };
+        let (table, coll) = if collection == NSID_LIKE { ("likes", COLL_LIKE) } else { ("reposts", COLL_REPOST) };
+        // Rows of the subject: by its key when it is whole, else by its text
+        // in `odd_refs`. `x` is another row of the same subject.
+        // A whole subject's key is read first and written into the query as
+        // integers, so the planner sees how many rows it names.
+        let (rows_of, same_subject) = if matches!(uri_parts(uri), UriParts::Whole { .. }) {
+            let key: Option<(Option<i32>, Option<i16>, Option<i64>)> =
+                sqlx::query_as("SELECT author, coll, rkey FROM ref_of($1)").bind(uri).fetch_optional(self.pool()).await?;
+            let Some((Some(author), Some(subj_coll), Some(rkey))) = key else {
+                return Ok((Vec::new(), None));
+            };
+            (
+                format!(
+                    "{table} l WHERE $1::text IS NOT NULL AND l.subj_author = {author} AND l.subj_rkey = {rkey} AND l.subj_coll = {subj_coll}"
+                ),
+                "x.subj_author = l.subj_author AND x.subj_rkey = l.subj_rkey AND x.subj_coll = l.subj_coll".to_string(),
+            )
+        } else {
+            (
+                format!(
+                    "odd_refs o JOIN {table} l ON l.author = o.author AND l.rkey = o.rkey \
+                     WHERE o.tbl = {coll} AND o.slot = 4 AND o.raw = $1 AND l.subj_coll = 0"
+                ),
+                format!(
+                    "x.subj_coll = 0 AND EXISTS (SELECT 1 FROM odd_refs xo WHERE xo.tbl = {coll} AND xo.author = x.author \
+                       AND xo.rkey = x.rkey AND xo.slot = 4 AND xo.raw = $1)"
+                ),
+            )
+        };
         let (at, after) = parse_local_cursor(cursor);
         let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(&format!(
-            "SELECT l.author_did, l.uri, l.created_at FROM {table} l WHERE l.subject_uri = $1 \
-             AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.subject_uri = l.subject_uri AND x.author_did = l.author_did \
-               AND (x.created_at, x.uri) > (l.created_at, l.uri)) \
-             AND ($2::timestamptz IS NULL OR (l.created_at, l.uri) < ($2, $3)) \
-             ORDER BY l.created_at DESC, l.uri DESC LIMIT $4"
+            "SELECT (SELECT d.did FROM dids d WHERE d.id = l.author), at_uri(l.author, {coll}::smallint, l.rkey), l.created_at \
+             FROM {rows_of} \
+             AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.author = l.author AND {same_subject} \
+               AND (x.created_at, x.rkey) > (l.created_at, l.rkey)) \
+             AND ($2::timestamptz IS NULL OR (l.created_at, l.author, l.rkey) < ($2, \
+                  COALESCE((SELECT r.author FROM ref_of($3) r), '-2147483648'::integer), \
+                  COALESCE((SELECT r.rkey FROM ref_of($3) r), '-9223372036854775808'::bigint))) \
+             ORDER BY l.created_at DESC, l.author DESC, l.rkey DESC LIMIT $4"
         ))
         .bind(uri)
         .bind(at)
@@ -1218,10 +1250,13 @@ impl Hydrator {
             return Ok(Err(ViewError::new("InvalidRequest", "actor must be the requesting account")));
         }
         let (at, after) = parse_local_cursor(cursor);
-        let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT uri, subject_uri, created_at FROM likes WHERE author_did = $1 \
-               AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-             ORDER BY created_at DESC, uri DESC LIMIT $4",
+        let rows: Vec<(String, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT at_uri(l.author, 2::smallint, l.rkey), \
+               ref_text(l.subj_author, l.subj_coll, l.subj_rkey, 2::smallint, l.author, l.rkey, 4::smallint), l.created_at \
+             FROM likes l WHERE l.author = (SELECT id FROM dids WHERE did = $1) \
+               AND ($2::timestamptz IS NULL OR (l.created_at, l.rkey) < ($2, \
+                    COALESCE((SELECT r.rkey FROM ref_of($3) r), '-9223372036854775808'::bigint))) \
+             ORDER BY l.created_at DESC, l.rkey DESC LIMIT $4",
         )
         .bind(me)
         .bind(at)
@@ -1234,7 +1269,10 @@ impl Hydrator {
             .flatten();
         let mut uris: Vec<String> = Vec::new();
         for (_, subject, _) in rows {
-            if !is_private_uri(&subject) && !uris.contains(&subject) {
+            if let Some(subject) = subject
+                && !is_private_uri(&subject)
+                && !uris.contains(&subject)
+            {
                 uris.push(subject);
             }
         }
@@ -1556,10 +1594,12 @@ mod tests {
         let first = post(p, BOB, "3kaaaaaaaaaa2", "first", None, None).await;
         let second = post(p, BOB, "3kaaaaaaaaaa3", "second", None, None).await;
         for (n, subject) in [(1, &first), (2, &second)] {
-            exec(p, &format!(
-                "INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES \
-                 ('at://{ALICE}/app.bsky.feed.like/{n}', '{ALICE}', '{subject}', 'bafy', '3k', now() + interval '{n} seconds')"
-            )).await;
+            let rkey = n.to_string();
+            crate::test_support::interactions::Interaction::like(ALICE, &rkey, subject)
+                .cid("bafy")
+                .at(chrono::Utc::now() + chrono::TimeDelta::seconds(n))
+                .put(p)
+                .await;
         }
         // Alice is a member: her handle resolves locally (§11 G-9).
         let mut members = ScopeSets::default();
@@ -1916,8 +1956,7 @@ mod tests {
         assert_ne!(page.inner()["feed"][0]["post"]["uri"], next.inner()["feed"][0]["post"]["uri"]);
 
         // Local likes fallback (no Constellation in tests).
-        exec(p, &format!("INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES \
-                 ('at://{ALICE}/app.bsky.feed.like/1', '{ALICE}', '{root}', '3k', now())")).await;
+        crate::test_support::interactions::like(p, ALICE, "1", &root).await;
         let likes = h.get_likes(&anon, &req, &root, 50, None).await.expect("db").expect("view");
         assert_eq!(likes.inner()["likes"][0]["actor"]["did"], ALICE);
         let _ = reply;
@@ -1943,27 +1982,32 @@ mod tests {
         let anon = Viewer::anonymous();
         let req = Requester::test();
         let me = h.viewer(Some(ALICE)).await.expect("viewer");
-        for (table, column, collection) in [("likes", "like_count", NSID_LIKE), ("reposts", "repost_count", NSID_REPOST)] {
+        for (table, collection) in [("likes", NSID_LIKE), ("reposts", NSID_REPOST)] {
             let uri = |n: u32| format!("at://{ALICE}/{collection}/{n}");
             let counts = || async {
-                let n: Vec<(String, i32)> = sqlx::query_as(&format!("SELECT post_uri, {column} FROM post_counts ORDER BY post_uri"))
-                    .fetch_all(p)
-                    .await
-                    .expect("counts");
-                let of = |u: &str| n.iter().find(|(q, _)| q == u).map_or(0, |(_, c)| *c);
-                (of(&root), of(&other))
+                let of = |c: Option<(i32, i32, i32, i32)>| c.map_or(0, |c| if table == "likes" { c.0 } else { c.1 });
+                (
+                    of(crate::test_support::interactions::post_counts(p, &root).await),
+                    of(crate::test_support::interactions::post_counts(p, &other).await),
+                )
+            };
+            crate::test_support::interactions::intern(p, &[&uri(1), &uri(2), &uri(3), &root, &other]).await;
+            // The key of a row's URI, and a subject's three columns.
+            let key = |u: &str| format!("(SELECT r.author FROM ref_of('{u}') r), (SELECT r.rkey FROM ref_of('{u}') r)");
+            let subject = |u: &str| {
+                format!("(SELECT r.author FROM ref_of('{u}') r), (SELECT r.coll FROM ref_of('{u}') r), (SELECT r.rkey FROM ref_of('{u}') r)")
             };
             exec(p, &format!(
-                "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES \
-                 ('{}', '{ALICE}', '{root}', '3k', now() - interval '3 minutes'), \
-                 ('{}', '{ALICE}', '{root}', '3k', now() - interval '1 minute'), \
-                 ('{}', '{ALICE}', '{root}', '3k', now() - interval '2 minutes')",
-                uri(1), uri(2), uri(3)
+                "INSERT INTO {table} (author, rkey, subj_author, subj_coll, subj_rkey, rev, created_at) VALUES \
+                 ({}, {s}, rev_to_bigint('2222222222223'), now() - interval '3 minutes'), \
+                 ({}, {s}, rev_to_bigint('2222222222223'), now() - interval '1 minute'), \
+                 ({}, {s}, rev_to_bigint('2222222222223'), now() - interval '2 minutes')",
+                key(&uri(1)), key(&uri(2)), key(&uri(3)), s = subject(&root)
             )).await;
             assert_eq!(counts().await, (1, 0), "{table}: three records, one account");
             let v = h.get_posts(&anon, &req, std::slice::from_ref(&root)).await.expect("db").expect("view");
-            let key = if table == "likes" { "likeCount" } else { "repostCount" };
-            assert_eq!(v.inner()["posts"][0][key], 1, "{table}");
+            let count_key = if table == "likes" { "likeCount" } else { "repostCount" };
+            assert_eq!(v.inner()["posts"][0][count_key], 1, "{table}");
             let (list, list_key) = if table == "likes" {
                 (h.get_likes(&anon, &req, &root, 50, None).await.expect("db").expect("view"), "likes")
             } else {
@@ -1977,23 +2021,36 @@ mod tests {
 
             // The LWW upsert keeps the subject: nothing moves.
             exec(p, &format!(
-                "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES ('{}', '{ALICE}', '{root}', '3l', now()) \
-                 ON CONFLICT (uri) DO UPDATE SET subject_uri = EXCLUDED.subject_uri, rev = EXCLUDED.rev",
-                uri(1)
+                "INSERT INTO {table} (author, rkey, subj_author, subj_coll, subj_rkey, rev, created_at) VALUES \
+                 ({}, {}, rev_to_bigint('2222222222224'), now()) \
+                 ON CONFLICT (author, rkey) DO UPDATE SET subj_author = EXCLUDED.subj_author, subj_coll = EXCLUDED.subj_coll, \
+                   subj_rkey = EXCLUDED.subj_rkey, rev = EXCLUDED.rev",
+                key(&uri(1)), subject(&root)
             )).await;
             assert_eq!(counts().await, (1, 0), "{table}");
             // One record moves to another post, and back.
-            exec(p, &format!("UPDATE {table} SET subject_uri = '{other}' WHERE uri = '{}'", uri(1))).await;
+            let moved = |to: &str| {
+                format!(
+                    "UPDATE {table} t SET subj_author = s.author, subj_coll = s.coll, subj_rkey = s.rkey \
+                     FROM ref_of('{to}') s, ref_of('{}') r WHERE t.author = r.author AND t.rkey = r.rkey",
+                    uri(1)
+                )
+            };
+            exec(p, &moved(&other)).await;
             assert_eq!(counts().await, (1, 1), "{table}");
-            exec(p, &format!("UPDATE {table} SET subject_uri = '{root}' WHERE uri = '{}'", uri(1))).await;
+            exec(p, &moved(&root)).await;
             assert_eq!(counts().await, (1, 0), "{table}");
 
             // Two go in one statement; the third remains.
-            exec(p, &format!("DELETE FROM {table} WHERE uri IN ('{}', '{}')", uri(1), uri(2))).await;
+            let delete = |uris: &[String]| {
+                let list = uris.iter().map(|u| format!("'{u}'")).collect::<Vec<_>>().join(", ");
+                format!("DELETE FROM {table} WHERE (author, rkey) IN (SELECT r.author, r.rkey FROM unnest(ARRAY[{list}]) u, ref_of(u) r)")
+            };
+            exec(p, &delete(&[uri(1), uri(2)])).await;
             assert_eq!(counts().await, (1, 0), "{table}: two of three deleted");
             crate::aggregations::rebuild::repair_counts(p).await.expect("repair");
             assert_eq!(counts().await, (1, 0), "{table}: the repair agrees");
-            exec(p, &format!("DELETE FROM {table} WHERE uri = '{}'", uri(3))).await;
+            exec(p, &delete(&[uri(3)])).await;
             assert_eq!(counts().await, (0, 0), "{table}: the last deleted");
         }
         db.drop_db().await;

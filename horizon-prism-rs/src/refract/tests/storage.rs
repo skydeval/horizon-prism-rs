@@ -173,9 +173,9 @@ async fn t7_t8_purge_off_mode_outside_s() {
     exec(p, "DELETE FROM purging_dids").await;
     assert!(h.refract.purge_next().await.expect("purge"));
     assert_eq!(count(p, "SELECT count(*) FROM posts").await, 0);
-    assert_eq!(count(p, &format!("SELECT count(*) FROM likes WHERE author_did = '{SUBJECT}'")).await, 0);
+    assert_eq!(crate::test_support::interactions::count_by(p, "likes", SUBJECT).await, 0);
     assert_eq!(count(p, &format!("SELECT count(*) FROM follows WHERE author = (SELECT id FROM dids WHERE did = '{SUBJECT}')")).await, 1, "its follow of a member stays");
-    assert_eq!(count(p, &format!("SELECT count(*) FROM likes WHERE author_did = '{MEMBER}'")).await, 1, "a member's like of it stays (D-7)");
+    assert_eq!(crate::test_support::interactions::count_by(p, "likes", MEMBER).await, 1, "a member's like of it stays (D-7)");
     assert_eq!(count(p, &format!("SELECT count(*) FROM follows WHERE author = (SELECT id FROM dids WHERE did = '{MEMBER}')")).await, 1);
     assert_eq!(count(p, "SELECT count(*) FROM actors WHERE profile_record IS NOT NULL").await, 0, "its profile goes");
     assert_eq!(count(p, "SELECT count(*) FROM refract_dids").await, 0);
@@ -201,7 +201,7 @@ async fn t7b_purge_on_mode_keeps_rule_2_rows() {
     assert!(h.refract.purge(SUBJECT).await.expect("purge"));
     let posts: Vec<String> = sqlx::query_scalar("SELECT uri FROM posts").fetch_all(p).await.expect("posts");
     assert_eq!(posts, [format!("at://{SUBJECT}/app.bsky.feed.post/3kreply")]);
-    let likes: Vec<String> = sqlx::query_scalar("SELECT subject_uri FROM likes").fetch_all(p).await.expect("likes");
+    let likes = crate::test_support::interactions::subjects(p, "likes").await;
     assert_eq!(likes, [format!("at://{MEMBER}/app.bsky.feed.post/3kmember")]);
     let follows: Vec<String> = crate::test_support::graph::pairs(p, "follows").await.into_iter().map(|(_, s)| s).collect();
     assert_eq!(follows, [MEMBER]);
@@ -253,16 +253,17 @@ async fn t10_the_sweep_spares_r() {
     member_row(p).await;
     let w = writer(p, sets(PublicMode::On, true, false, false));
     write_history(&w).await;
-    exec(p, &format!("INSERT INTO post_counts (post_uri) VALUES ('at://{SUBJECT}/app.bsky.feed.post/3kpost') ON CONFLICT DO NOTHING")).await;
+    if crate::test_support::interactions::post_counts(p, &format!("at://{SUBJECT}/app.bsky.feed.post/3kpost")).await.is_none() {
+        crate::test_support::interactions::set_post_counts(p, &format!("at://{SUBJECT}/app.bsky.feed.post/3kpost"), (0, 0, 0, 0)).await;
+    }
     exec(p, "INSERT INTO refract_dids (did, community, state, source) VALUES ('did:plc:subjectaaaaaaaaaaaaaaaaa', 'sky', 'restored', 'fill')").await;
     let deletable = |state: &'static str| async move {
         exec(p, &format!("UPDATE refract_dids SET state = '{state}'")).await;
         let mut n = 0;
         for t in crate::indexing::public_sweep::TABLES.iter().filter(|t| ["posts", "likes", "reposts", "follows", "post_counts"].contains(&t.name)) {
             let mine = match t.name {
-                "post_counts" => format!("split_part(t.post_uri, '/', 3) = '{SUBJECT}'"),
-                "follows" => format!("t.author = (SELECT id FROM dids WHERE did = '{SUBJECT}')"),
-                _ => format!("t.author_did = '{SUBJECT}'"),
+                "posts" => format!("t.author_did = '{SUBJECT}'"),
+                _ => format!("t.author = (SELECT id FROM dids WHERE did = '{SUBJECT}')"),
             };
             n += count(p, &format!("SELECT count(*) FROM {} t WHERE {mine} AND {}", t.name, t.delete_when)).await;
         }
@@ -295,7 +296,7 @@ async fn t6_member_removal_spares_r_and_account_deleted_forgets() {
     write_history(&w).await;
     let purger = crate::aggregations::Purger::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier));
     purger.purge(MEMBER, crate::aggregations::PurgeKind::MemberRemoved).await.expect("member removed");
-    assert_eq!(count(p, &format!("SELECT count(*) FROM likes WHERE author_did = '{SUBJECT}'")).await, 2, "its likes stay");
+    assert_eq!(crate::test_support::interactions::count_by(p, "likes", SUBJECT).await, 2, "its likes stay");
     assert_eq!(count(p, &format!("SELECT count(*) FROM follows WHERE author = (SELECT id FROM dids WHERE did = '{SUBJECT}')")).await, 2, "its follows stay");
     assert_eq!(count(p, &format!("SELECT count(*) FROM posts WHERE author_did = '{SUBJECT}'")).await, 2, "its reply to the member stays");
     purger.purge(SUBJECT, crate::aggregations::PurgeKind::AccountDeleted).await.expect("account deleted");

@@ -963,13 +963,13 @@ impl Ord for ByRkey {
 }
 
 /// The public table, and its author column, of an ecosystem collection that
-/// is listed and reconciled. Follows and blocks name their author by id
-/// (`author`); `local_uris` reads them on its own.
+/// is listed and reconciled. Likes, reposts, follows and blocks name their
+/// author by id (`author`); `local_uris` reads them on its own.
 fn public_table(nsid: &str) -> Option<(&'static str, &'static str)> {
     Some(match nsid {
         NSID_POST => ("posts", "author_did"),
-        NSID_LIKE => ("likes", "author_did"),
-        NSID_REPOST => ("reposts", "author_did"),
+        NSID_LIKE => ("likes", "author"),
+        NSID_REPOST => ("reposts", "author"),
         NSID_FOLLOW => ("follows", "author"),
         NSID_BLOCK => ("blocks", "author"),
         NSID_THREADGATE => ("threadgates", "author_did"),
@@ -2426,9 +2426,14 @@ pub async fn local_uris(writer: &Writer, did: &str, nsid: &str, rev: &str, off_r
         .fetch_all(writer.pool())
         .await;
     }
-    // Follows and blocks are keyed by ids, with integer revs.
-    if matches!(nsid, NSID_FOLLOW | NSID_BLOCK) {
-        let (table, coll) = if nsid == NSID_FOLLOW { ("follows", 4) } else { ("blocks", 5) };
+    // Likes, reposts, follows and blocks are keyed by ids, with integer revs.
+    if matches!(nsid, NSID_LIKE | NSID_REPOST | NSID_FOLLOW | NSID_BLOCK) {
+        let (table, coll) = match nsid {
+            NSID_LIKE => ("likes", 2),
+            NSID_REPOST => ("reposts", 3),
+            NSID_FOLLOW => ("follows", 4),
+            _ => ("blocks", 5),
+        };
         return sqlx::query_scalar(&format!(
             "SELECT at_uri(t.author, {coll}::smallint, t.rkey) FROM {table} t \
              WHERE t.author = (SELECT id FROM dids WHERE did = $1) AND t.rev < $2"

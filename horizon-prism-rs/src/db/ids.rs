@@ -71,6 +71,8 @@ pub const ODD_COLL: i16 = 0;
 /// collection id of the records it holds, so it never changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OddTable {
+    Likes,
+    Reposts,
     Follows,
 }
 
@@ -78,10 +80,18 @@ impl OddTable {
     #[must_use]
     pub const fn id(self) -> i16 {
         match self {
+            Self::Likes => 2,
+            Self::Reposts => 3,
             Self::Follows => 4,
         }
     }
 }
+
+/// The collection ids SQL names most.
+pub const COLL_POST: i16 = 1;
+pub const COLL_LIKE: i16 = 2;
+pub const COLL_REPOST: i16 = 3;
+pub const COLL_PRIVATE_POST: i16 = 27;
 
 /// Which reference of its owner row an `odd_refs` row holds
 /// (`odd_refs.slot`). Stable: stored values.

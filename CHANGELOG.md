@@ -19,6 +19,14 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Smaller like, repost and count tables.** Likes, reposts and the post
+  and account counts are stored by account id and record key, about a
+  quarter of the space. Likes and reposts made at the same moment may list
+  in a different order, and the private `getLikes` gives each like's
+  `createdAt` as its `indexedAt`. Counts are kept for posts only.
+  **Upgrade:** start once with `APP_ALLOW_STARTUP_MIGRATE=1` (migration 0056
+  rewrites the four tables in one transaction; it needs free space for a
+  second copy of them).
 - **Smaller follow and block tables.** Follows and blocks are stored by
   account id and record key, about a quarter of the space. Follows created
   at the same moment may list in a different order. **Upgrade:** start once

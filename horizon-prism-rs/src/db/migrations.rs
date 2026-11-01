@@ -257,10 +257,7 @@ mod tests {
             )
         };
         let engage = |table: &str, rkey: &str, subject: &str| {
-            format!(
-                "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES \
-                 ('at://did:plc:b/x/{rkey}', 'did:plc:b', 'at://did:plc:a/app.bsky.feed.post/{subject}', '3k', now())"
-            )
+            crate::test_support::interactions::row_sql(table, "did:plc:b", rkey, &format!("at://did:plc:a/app.bsky.feed.post/{subject}"), "now()")
         };
         // (posts, likes, reposts, replies) summed over hours, per tag.
         let totals = || async {
@@ -292,7 +289,7 @@ mod tests {
         assert_eq!(totals().await, [row("cats", (1, 2, 1, 1)), row("rust", (2, 2, 1, 1))]);
 
         // Deletes take their contribution back.
-        exec("DELETE FROM likes WHERE uri = 'at://did:plc:b/x/l1'".into()).await;
+        exec("DELETE FROM likes l USING ref_of('at://did:plc:b/app.bsky.feed.like/l1') r WHERE l.author = r.author AND l.rkey = r.rkey".into()).await;
         exec("DELETE FROM posts WHERE rkey = 'reply'".into()).await;
         assert_eq!(totals().await, [row("cats", (1, 1, 1, 0)), row("rust", (1, 1, 1, 0))]);
 

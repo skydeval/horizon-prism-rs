@@ -74,13 +74,17 @@ const CREATOR_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHER
 // Follows name their accounts by id.
 const NO_MEMBER_END_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id IN (t.author, t.subject)) \
      AND NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace'))";
+// Likes and reposts name their author by id.
+const LIKE_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id = t.author) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace'))";
 // refract-reposts design §4: a repost whose subject's author is in R is
 // kept by the restored-subject rule, whoever wrote it.
-const REPOST_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did) \
-     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace')) \
-     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = split_part(t.subject_uri, '/', 3) AND r.state IN ('restored', 'grace'))";
+const REPOST_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id = t.author) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace')) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.subj_author AND r.state IN ('restored', 'grace'))";
+// Post counts are keyed by the post's author id.
 const POST_NOT_R: &str =
-    "NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = split_part(t.post_uri, '/', 3) AND r.state IN ('restored', 'grace'))";
+    "NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace'))";
 
 const fn table(name: &'static str, key: Key, delete_when: &'static str, start: u64) -> SweepTable {
     SweepTable { name, key, delete_when, start }
@@ -97,8 +101,8 @@ pub const TABLES: [SweepTable; 18] = [
     table("notifications", Key::Id, ALL, 10_000),
     // 2. Non-members' likes and reposts, while `posts` still exists for
     // their trend triggers.
-    table("likes", URI, AUTHOR_NOT_MEMBER_NOR_R, 1_000),
-    table("reposts", URI, REPOST_NOT_MEMBER_NOR_R, 1_000),
+    table("likes", Key::AuthorRkey, LIKE_NOT_MEMBER_NOR_R, 1_000),
+    table("reposts", Key::AuthorRkey, REPOST_NOT_MEMBER_NOR_R, 1_000),
     // 3.
     table("posts", URI, NOT_R_AUTHOR, 1_000),
     // 4.
@@ -115,7 +119,7 @@ pub const TABLES: [SweepTable; 18] = [
     table("follows", Key::AuthorRkey, NO_MEMBER_END_NOR_R, 10_000),
     // 6. Also removes the negative trend rows steps 2–3 created. The
     // counts of R's posts stay, as `load_posts` falls back to them.
-    table("post_counts", Key::Text("post_uri"), POST_NOT_R, 10_000),
+    table("post_counts", Key::AuthorRkey, POST_NOT_R, 10_000),
     table("tag_activity_hourly", Key::TagHour, ALL, 10_000),
     table("starter_pack_counts", Key::Text("pack_uri"), ALL, 10_000),
 ];
@@ -585,9 +589,14 @@ mod tests {
         let state = json!({"table": "follows", "after": "at://did:plc:a/app.bsky.graph.follow/1", "last_advanced_at": "2026-10-14T05:00:00Z"});
         let restarted = valid_state(&state).expect("still a valid state");
         assert_eq!((restarted.table.as_str(), &restarted.after), ("follows", &Value::Null));
+        // So does every other table keyed by ids.
+        for name in ["likes", "reposts", "post_counts"] {
+            let state = json!({"table": name, "after": "at://did:plc:a/app.bsky.feed.like/1", "last_advanced_at": "2026-10-14T05:00:00Z"});
+            assert_eq!(valid_state(&state).expect(name).after, Value::Null, "{name} starts again");
+        }
         // Any other table's mismatched cursor is still refused.
-        let likes = json!({"table": "likes", "after": 7, "last_advanced_at": "2026-10-14T05:00:00Z"});
-        assert!(valid_state(&likes).is_none());
+        let posts = json!({"table": "posts", "after": 7, "last_advanced_at": "2026-10-14T05:00:00Z"});
+        assert!(valid_state(&posts).is_none());
     }
 
     #[test]

@@ -85,12 +85,11 @@ impl T {
 
     /// `author` liked a post of `subject` `days_ago` days ago.
     async fn like(&self, author: &str, subject: &str, days_ago: i64) {
-        self.exec(&format!(
-            "INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES \
-             ('at://{author}/app.bsky.feed.like/{}', '{author}', 'at://{subject}/app.bsky.feed.post/1', '3k', now() - interval '{days_ago} days')",
-            &subject[8..16]
-        ))
-        .await;
+        let post = format!("at://{subject}/app.bsky.feed.post/1");
+        crate::test_support::interactions::Interaction::like(author, &subject[8..16], &post)
+            .at(chrono::Utc::now() - chrono::TimeDelta::days(days_ago))
+            .put(self.p())
+            .await;
     }
 
     /// `author` replied to a post of `parent` `days_ago` days ago.

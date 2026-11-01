@@ -246,8 +246,9 @@ enum Body {
 /// The op a savepoint attempt runs.
 #[derive(Clone, Copy)]
 enum OpTarget<'a> {
-    /// With a follow's or block's ids, interned before the transaction.
-    Upsert(&'a Upsert, &'a GrowthPlan, Option<&'a GraphIds>),
+    /// With a follow's, block's, like's or repost's ids, interned before the
+    /// transaction.
+    Upsert(&'a Upsert, &'a GrowthPlan, Option<&'a OpIds>),
     /// A member's post under the off rule (public-indexing design §4.1).
     GrowOnly(&'a Upsert, &'a GrowthPlan),
     Delete(&'a Delete),
@@ -287,6 +288,24 @@ struct GraphIds {
     rkey: i64,
     subject: AccountId,
     via: Option<(StoredRef, Option<Vec<u8>>)>,
+}
+
+/// A like's or repost's row ids: its key, its subject and `via` as stored,
+/// each with its CID as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubjectIds {
+    author: AccountId,
+    rkey: i64,
+    subject: StoredRef,
+    subject_cid: Option<Vec<u8>>,
+    via: Option<(StoredRef, Option<Vec<u8>>)>,
+}
+
+/// The ids an op's row is written with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpIds {
+    Graph(GraphIds),
+    Subject(SubjectIds),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1092,10 +1111,10 @@ impl Writer {
             return Ok(report);
         }
 
-        // Ids for the follows and blocks this commit writes, in their own
-        // statements before the transaction, so a rollback leaves no cached
-        // id that does not exist.
-        let graph = self.graph_ids(repo, &prepared, &admissions).await?;
+        // Ids for the rows this commit writes, in their own statements
+        // before the transaction, so a rollback leaves no cached id that
+        // does not exist.
+        let keyed = self.op_ids(repo, &prepared, &admissions).await?;
 
         let mut tx = self.pool.begin().await?;
         // 2 and 3: DID locks, then per-URI locks.
@@ -1154,7 +1173,7 @@ impl Writer {
                     }
                     // Reached by `Admit` only.
                     _ => {
-                        let target = OpTarget::Upsert(u, &plans[i], graph[i].as_ref());
+                        let target = OpTarget::Upsert(u, &plans[i], keyed[i].as_ref());
                         self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
                             .await?
                     }
@@ -1380,54 +1399,85 @@ impl Writer {
         Ok(inserted)
     }
 
-    /// The ids of every follow and block a commit writes (an admitted
-    /// upsert), interned in their own statements: the author, the subject,
-    /// the record key, and a follow's `via`. `None` for any other op, and
-    /// for one whose author or subject is not a valid DID.
-    async fn graph_ids(&self, repo: &str, prepared: &[Prepared], admissions: &[Option<Admission>]) -> Result<Vec<Option<GraphIds>>, sqlx::Error> {
-        let graphs: Vec<Option<(&Upsert, &GraphRecord)>> = prepared
+    /// The ids every admitted upsert of a commit writes with, interned in
+    /// their own statements: for a follow or block its key, subject and
+    /// `via`; for a like or repost its key, subject and `via`. A post's
+    /// author and the parent and quote it names are interned too, for its
+    /// counts, and get no entry. `None` for any other op, and for one whose
+    /// author, key or subject is not valid.
+    async fn op_ids(&self, repo: &str, prepared: &[Prepared], admissions: &[Option<Admission>]) -> Result<Vec<Option<OpIds>>, sqlx::Error> {
+        let admitted: Vec<Option<&Upsert>> = prepared
             .iter()
             .zip(admissions)
             .map(|(p, a)| match (p, a) {
                 (Prepared::Upsert(u), Some(Admission::Admit(rule))) if *rule != AdmitRule::PublicRootGate => match &u.body {
-                    Body::Follow(g) | Body::Block(g) => Some((u.as_ref(), g)),
+                    Body::Follow(_) | Body::Block(_) | Body::Like(_) | Body::Repost(_) | Body::Post(_) => Some(u.as_ref()),
                     _ => None,
                 },
                 _ => None,
             })
             .collect();
-        if graphs.iter().all(Option::is_none) {
+        if admitted.iter().all(Option::is_none) {
             return Ok(vec![None; prepared.len()]);
         }
+        // The references the rows name, as URIs.
         let mut dids = vec![repo.to_string()];
-        for (_, g) in graphs.iter().flatten() {
-            dids.push(g.subject_did.clone());
-            dids.extend(g.via.as_ref().and_then(|v| ref_did(&v.uri)));
+        let mut uris: Vec<&str> = Vec::new();
+        for u in admitted.iter().flatten() {
+            match &u.body {
+                Body::Follow(g) | Body::Block(g) => {
+                    dids.push(g.subject_did.clone());
+                    uris.extend(g.via.as_ref().map(|v| v.uri.as_str()));
+                }
+                Body::Like(s) | Body::Repost(s) => {
+                    uris.push(&s.subject.uri);
+                    uris.extend(s.via.as_ref().map(|v| v.uri.as_str()));
+                }
+                Body::Post(p) => {
+                    uris.extend(p.reply_parent.as_ref().map(|r| r.uri.as_str()));
+                    uris.extend(p.quote_uri.as_deref());
+                }
+                _ => {}
+            }
         }
+        dids.extend(uris.iter().filter_map(|u| ref_did(u)));
         let accounts = self.ids.account_ids(&dids).await?;
         let Some(&author) = accounts.get(repo) else {
             return Ok(vec![None; prepared.len()]);
         };
-        let mut keys: Vec<(AccountId, String)> = Vec::new();
-        for (u, g) in graphs.iter().flatten() {
-            keys.push((author, u.rkey.clone()));
-            if let Some((did, rkey)) = g.via.as_ref().and_then(|v| ref_rkey(&v.uri))
+        let mut keys: Vec<(AccountId, String)> = admitted
+            .iter()
+            .flatten()
+            .filter(|u| !matches!(u.body, Body::Post(_)))
+            .map(|u| (author, u.rkey.clone()))
+            .collect();
+        for uri in &uris {
+            if let Some((did, rkey)) = ref_rkey(uri)
                 && let Some(a) = accounts.get(&did)
             {
                 keys.push((*a, rkey));
             }
         }
         let rkeys = self.ids.rkey_ids(&keys).await?;
-        Ok(graphs
+        let stored = |r: &super::records::StrongRef| (stored_ref(&r.uri, &accounts, &rkeys), r.cid.as_deref().map(cid_to_db));
+        Ok(admitted
             .into_iter()
-            .map(|x| {
-                let (u, g) = x?;
-                Some(GraphIds {
-                    author,
-                    rkey: *rkeys.get(&(author, u.rkey.clone()))?,
-                    subject: *accounts.get(&g.subject_did)?,
-                    via: g.via.as_ref().map(|v| (stored_ref(&v.uri, &accounts, &rkeys), v.cid.as_deref().map(cid_to_db))),
-                })
+            .map(|u| {
+                let u = u?;
+                let rkey = rkeys.get(&(author, u.rkey.clone())).copied();
+                match &u.body {
+                    Body::Follow(g) | Body::Block(g) => Some(OpIds::Graph(GraphIds {
+                        author,
+                        rkey: rkey?,
+                        subject: *accounts.get(&g.subject_did)?,
+                        via: g.via.as_ref().map(stored),
+                    })),
+                    Body::Like(s) | Body::Repost(s) => {
+                        let (subject, subject_cid) = stored(&s.subject);
+                        Some(OpIds::Subject(SubjectIds { author, rkey: rkey?, subject, subject_cid, via: s.via.as_ref().map(stored) }))
+                    }
+                    _ => None,
+                }
             })
             .collect())
     }
@@ -1472,20 +1522,55 @@ impl Writer {
         if uris.is_empty() {
             return Ok(0);
         }
+        // Ids first, in their own statements, before the transaction. Only
+        // a whole post reference is written; a backlink names no other.
+        let mut named = dids.clone();
+        named.push(subject_author.to_string());
+        let accounts = self.ids.account_ids(&named).await?;
+        let mut keys: Vec<(AccountId, String)> = dids
+            .iter()
+            .zip(&uris)
+            .filter_map(|(did, uri)| accounts.get(did).map(|a| (*a, uri.rsplit('/').next().unwrap_or_default().to_string())))
+            .collect();
+        if let Some((did, rkey)) = ref_rkey(subject)
+            && let Some(a) = accounts.get(&did)
+        {
+            keys.push((*a, rkey));
+        }
+        let rkeys = self.ids.rkey_ids(&keys).await?;
+        let StoredRef::Whole { author: subj_author, coll: subj_coll, rkey: subj_rkey } = stored_ref(subject, &accounts, &rkeys) else {
+            return Ok(0);
+        };
+        let (mut authors, mut keyed, mut keyed_uris, mut keyed_times): (Vec<AccountId>, Vec<i64>, Vec<String>, Vec<DateTime<Utc>>) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for ((did, uri), at) in dids.iter().zip(&uris).zip(&times) {
+            let rkey = uri.rsplit('/').next().unwrap_or_default();
+            if let Some(a) = accounts.get(did)
+                && let Some(k) = rkeys.get(&(*a, rkey.to_string()))
+            {
+                authors.push(*a);
+                keyed.push(*k);
+                keyed_uris.push(uri.clone());
+                keyed_times.push(*at);
+            }
+        }
         let mut tx = self.pool.begin().await?;
         lock_dids_shared(&mut tx, &dids).await?;
         lock_uris(&mut tx, &uris).await?;
         let inserted = sqlx::query(
-            "INSERT INTO reposts (uri, author_did, subject_uri, subject_cid, rev, created_at, indexed_at) \
-             SELECT u, d, $4, NULL, $5, c, now() FROM unnest($1::text[], $2::text[], $3::timestamptz[]) AS t(u, d, c) \
+            "INSERT INTO reposts (author, rkey, subj_author, subj_coll, subj_rkey, subj_cid, rev, created_at) \
+             SELECT a, k, $5, $6, $7, NULL, $8, c FROM unnest($1::int[], $2::bigint[], $3::text[], $4::timestamptz[]) AS t(a, k, u, c) \
              WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.uri = t.u) \
-             ON CONFLICT (uri) DO NOTHING",
+             ON CONFLICT (author, rkey) DO NOTHING",
         )
-        .bind(&uris)
-        .bind(&dids)
-        .bind(&times)
-        .bind(subject)
-        .bind(SENTINEL_REV)
+        .bind(&authors)
+        .bind(&keyed)
+        .bind(&keyed_uris)
+        .bind(&keyed_times)
+        .bind(subj_author)
+        .bind(subj_coll)
+        .bind(subj_rkey)
+        .bind(rev_value(SENTINEL_REV))
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1526,7 +1611,7 @@ impl Writer {
         for _ in 0..options.attempts.max(1) {
             let mut sp = tx.begin().await?;
             let result = match target {
-                OpTarget::Upsert(u, plan, graph) => self.apply_upsert(&mut sp, u, plan, graph, rev, sets, options).await,
+                OpTarget::Upsert(u, plan, ids) => self.apply_upsert(&mut sp, u, plan, ids, rev, sets, options).await,
                 OpTarget::GrowOnly(u, plan) => self.apply_grow_only(&mut sp, u, plan, rev, options).await,
                 OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets).await,
                 OpTarget::RejectedFollow(u, reason) => self.apply_rejected_follow(&mut sp, u, reason, repo, rev, sets).await,
@@ -1649,14 +1734,22 @@ impl Writer {
         conn: &mut PgConnection,
         u: &Upsert,
         plan: &GrowthPlan,
-        graph: Option<&GraphIds>,
+        ids: Option<&OpIds>,
         rev: &str,
         sets: &ScopeSets,
         options: ApplyOptions,
     ) -> Result<(OpOutcome, MemoryEffects), OpError> {
         // A follow or block whose author or subject got no id is not a
-        // valid DID: it cannot be stored.
-        let keyed = || graph.ok_or_else(|| OpError::Deterministic("follow or block names an account that is not a valid DID".into()));
+        // valid DID, and a like or repost with no id has an author or key
+        // that is not valid: neither can be stored.
+        let keyed = || match ids {
+            Some(OpIds::Graph(g)) => Ok(g),
+            _ => Err(OpError::Deterministic("follow or block names an account that is not a valid DID".into())),
+        };
+        let subject_keyed = || match ids {
+            Some(OpIds::Subject(s)) => Ok(s),
+            _ => Err(OpError::Deterministic("like or repost has an author or record key that is not valid".into())),
+        };
         let live = options.live;
         let mut eff = MemoryEffects::default();
         let author = u.input.author.as_str();
@@ -1688,8 +1781,8 @@ impl Writer {
         let list_before = if member_list_block { list_block_target(conn, &u.uri).await? } else { None };
         let written = match &u.body {
             Body::Post(p) => upsert_post(conn, u, p, rev).await?,
-            Body::Like(s) => upsert_subject(conn, "likes", u, s, rev).await?,
-            Body::Repost(s) => upsert_subject(conn, "reposts", u, s, rev).await?,
+            Body::Like(s) => upsert_subject(conn, OddTable::Likes, subject_keyed()?, s, rev).await?,
+            Body::Repost(s) => upsert_subject(conn, OddTable::Reposts, subject_keyed()?, s, rev).await?,
             Body::Follow(g) => {
                 #[cfg(test)]
                 if crate::test_support::hooks::injected(crate::test_support::hooks::FOLLOW_WRITE_FAILS, &u.uri) {
@@ -1941,20 +2034,20 @@ impl Writer {
                 }
                 removed
             }
-            RecordKind::Like => delete_row(conn, "likes", &d.uri, rev).await?,
-            RecordKind::Repost => delete_row(conn, "reposts", &d.uri, rev).await?,
+            RecordKind::Like => delete_keyed(conn, "likes", &d.uri, rev).await?,
+            RecordKind::Repost => delete_keyed(conn, "reposts", &d.uri, rev).await?,
             RecordKind::Follow => {
                 #[cfg(test)]
                 if crate::test_support::hooks::injected(crate::test_support::hooks::FOLLOW_WRITE_FAILS, &d.uri) {
                     return Err(OpError::Deterministic("injected follow write failure".into()));
                 }
-                let removed = delete_graph(conn, "follows", &d.uri, rev).await?;
+                let removed = delete_keyed(conn, "follows", &d.uri, rev).await?;
                 if removed && sets.is_member(repo) {
                     eff.member_follow_removed = Some(repo.to_string());
                 }
                 removed
             }
-            RecordKind::Block => delete_graph(conn, "blocks", &d.uri, rev).await?,
+            RecordKind::Block => delete_keyed(conn, "blocks", &d.uri, rev).await?,
             // Rule 4 (§4.3): the reference a member's list block stood for
             // is derived again from the member's remaining list blocks.
             RecordKind::Table("list_blocks") if sets.is_member(repo) => {
@@ -2066,7 +2159,7 @@ impl Writer {
         if crate::test_support::hooks::injected(crate::test_support::hooks::FOLLOW_WRITE_FAILS, &u.uri) {
             return Err(OpError::Deterministic("injected follow write failure".into()));
         }
-        let removed = delete_graph(conn, "follows", &u.uri, rev).await?;
+        let removed = delete_keyed(conn, "follows", &u.uri, rev).await?;
         if removed && sets.is_member(repo) {
             eff.member_follow_removed = Some(repo.to_string());
         }
@@ -2101,7 +2194,7 @@ impl Writer {
         reason: &'static str,
         rev: &str,
     ) -> Result<(OpOutcome, MemoryEffects), OpError> {
-        delete_graph(conn, "blocks", &u.uri, rev).await?;
+        delete_keyed(conn, "blocks", &u.uri, rev).await?;
         sqlx::query(
             "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
              ON CONFLICT (uri) DO UPDATE SET rev = EXCLUDED.rev, deleted_at = now() \
@@ -2259,34 +2352,77 @@ fn quote_ref(u: &Upsert, p: &PostRecord, rev: &str) -> QuoteRef {
     }
 }
 
-async fn upsert_subject(
-    conn: &mut PgConnection,
-    table: &'static str,
-    u: &Upsert,
-    s: &SubjectRecord,
-    rev: &str,
-) -> Result<bool, sqlx::Error> {
-    let sql = format!(
-        "INSERT INTO {table} (uri, author_did, subject_uri, subject_cid, rev, created_at, via_uri, via_cid) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-         ON CONFLICT (uri) DO UPDATE SET author_did = EXCLUDED.author_did, subject_uri = EXCLUDED.subject_uri, \
-           subject_cid = EXCLUDED.subject_cid, rev = EXCLUDED.rev, created_at = EXCLUDED.created_at, \
-           via_uri = EXCLUDED.via_uri, via_cid = EXCLUDED.via_cid \
-         WHERE {table}.rev < EXCLUDED.rev"
-    );
-    let n = sqlx::query(&sql)
-        .bind(&u.uri)
-        .bind(&u.input.author)
-        .bind(&s.subject.uri)
-        .bind(s.subject.cid.as_deref())
-        .bind(rev)
-        .bind(s.created_at)
-        .bind(s.via.as_ref().map(|v| v.uri.as_str()))
-        .bind(s.via.as_ref().and_then(|v| v.cid.as_deref()))
-        .execute(conn)
-        .await?
-        .rows_affected();
-    Ok(n > 0)
+/// A like's or repost's last-writer-wins upsert, with its subject and `via`.
+/// Odd references keep their text in `odd_refs`, written in the same
+/// statement; when the new version has a slot that is not odd, a second
+/// statement removes any text an older version left there. Returns whether
+/// the row was written.
+async fn upsert_subject(conn: &mut PgConnection, tbl: OddTable, ids: &SubjectIds, s: &SubjectRecord, rev: &str) -> Result<bool, sqlx::Error> {
+    let table = if tbl == OddTable::Likes { "likes" } else { "reposts" };
+    let (subj_author, subj_coll, subj_rkey) = ids.subject.columns();
+    let (via_author, via_coll, via_rkey) = match &ids.via {
+        Some((r, _)) => {
+            let (a, c, k) = r.columns();
+            (a, Some(c), k)
+        }
+        None => (None, None, None),
+    };
+    let via_cid = ids.via.as_ref().and_then(|(_, cid)| cid.as_deref());
+    let odd_subject = ids.subject.odd_raw();
+    let odd_via = ids.via.as_ref().and_then(|(r, _)| r.odd_raw());
+    let written: Option<bool> = sqlx::query_scalar(&format!(
+        "WITH up AS ( \
+           INSERT INTO {table} (author, rkey, subj_author, subj_coll, subj_rkey, subj_cid, rev, created_at, \
+             via_author, via_coll, via_rkey, via_cid) \
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+           ON CONFLICT (author, rkey) DO UPDATE SET subj_author = EXCLUDED.subj_author, subj_coll = EXCLUDED.subj_coll, \
+             subj_rkey = EXCLUDED.subj_rkey, subj_cid = EXCLUDED.subj_cid, rev = EXCLUDED.rev, \
+             created_at = EXCLUDED.created_at, via_author = EXCLUDED.via_author, via_coll = EXCLUDED.via_coll, \
+             via_rkey = EXCLUDED.via_rkey, via_cid = EXCLUDED.via_cid \
+           WHERE {table}.rev < EXCLUDED.rev \
+           RETURNING author, rkey), \
+         odd AS ( \
+           INSERT INTO odd_refs (tbl, author, rkey, slot, raw) \
+           SELECT $13, up.author, up.rkey, v.slot, v.raw \
+           FROM up, (VALUES ($14::smallint, $15::text), ($16::smallint, $17::text)) AS v(slot, raw) \
+           WHERE v.raw IS NOT NULL \
+           ON CONFLICT (tbl, author, rkey, slot) DO UPDATE SET raw = EXCLUDED.raw) \
+         SELECT true FROM up"
+    ))
+    .bind(ids.author)
+    .bind(ids.rkey)
+    .bind(subj_author)
+    .bind(subj_coll)
+    .bind(subj_rkey)
+    .bind(ids.subject_cid.as_deref())
+    .bind(rev_value(rev))
+    .bind(s.created_at)
+    .bind(via_author)
+    .bind(via_coll)
+    .bind(via_rkey)
+    .bind(via_cid)
+    .bind(tbl.id())
+    .bind(Slot::Subject.id())
+    .bind(odd_subject)
+    .bind(Slot::Via.id())
+    .bind(odd_via)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let whole: Vec<i16> = [(Slot::Subject, odd_subject), (Slot::Via, odd_via)]
+        .into_iter()
+        .filter(|(_, odd)| odd.is_none())
+        .map(|(slot, _)| slot.id())
+        .collect();
+    if written.is_some() && !whole.is_empty() {
+        sqlx::query("DELETE FROM odd_refs WHERE tbl = $1 AND author = $2 AND rkey = $3 AND slot = ANY($4)")
+            .bind(tbl.id())
+            .bind(ids.author)
+            .bind(ids.rkey)
+            .bind(&whole)
+            .execute(conn)
+            .await?;
+    }
+    Ok(written.is_some())
 }
 
 /// A follow's last-writer-wins upsert, with its `via` (the starter pack that
@@ -2364,9 +2500,10 @@ async fn upsert_block(conn: &mut PgConnection, ids: &GraphIds, g: &GraphRecord, 
     .await
 }
 
-/// Delete a follow or block by its URI at or below `rev`. A URI that names
-/// no stored key deletes nothing.
-async fn delete_graph(conn: &mut PgConnection, table: &'static str, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
+/// Delete a row of a table keyed by ids (follows, blocks, likes, reposts)
+/// by its URI at or below `rev`. A URI that names no stored key deletes
+/// nothing.
+async fn delete_keyed(conn: &mut PgConnection, table: &'static str, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
     let sql = format!("DELETE FROM {table} t USING ref_of($1) r WHERE t.author = r.author AND t.rkey = r.rkey AND t.rev <= $2");
     Ok(sqlx::query(&sql)
         .bind(uri)
@@ -2490,11 +2627,14 @@ async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo
             .await;
         }
         RecordKind::Post => vec!["posts", "member_post_refs"],
-        RecordKind::Like => vec!["likes"],
-        RecordKind::Repost => vec!["reposts"],
         // Keyed by ids: the URI is read as its key.
-        RecordKind::Follow | RecordKind::Block => {
-            let table = if kind == RecordKind::Follow { "follows" } else { "blocks" };
+        RecordKind::Like | RecordKind::Repost | RecordKind::Follow | RecordKind::Block => {
+            let table = match kind {
+                RecordKind::Like => "likes",
+                RecordKind::Repost => "reposts",
+                RecordKind::Follow => "follows",
+                _ => "blocks",
+            };
             return sqlx::query_scalar(&format!(
                 "SELECT EXISTS (SELECT 1 FROM {table} t, ref_of($1) r WHERE t.author = r.author AND t.rkey = r.rkey AND t.rev > $2)"
             ))
@@ -2637,9 +2777,10 @@ async fn insert_via_notification_into(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(&format!(
         "INSERT INTO {table} (recipient_did, author_did, reason, reason_subject, record_uri, record_cid) \
-         SELECT r.author_did, $1, $2, r.uri, $3, $4 FROM reposts r \
-         WHERE r.uri = $5 AND r.subject_uri = $6 \
-           AND NOT EXISTS (SELECT 1 FROM {table} n WHERE n.recipient_did = r.author_did AND n.record_uri = $3) \
+         SELECT ra.did, $1, $2, $5, $3, $4 FROM reposts r, ref_of($5) v, dids ra \
+         WHERE v.coll = 3 AND r.author = v.author AND r.rkey = v.rkey AND ra.id = r.author \
+           AND ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint) = $6 \
+           AND NOT EXISTS (SELECT 1 FROM {table} n WHERE n.recipient_did = ra.did AND n.record_uri = $3) \
          ON CONFLICT DO NOTHING",
     ))
     .bind(author)
@@ -3763,6 +3904,60 @@ mod tests {
             db.drop_db().await;
         }
 
+        /// A like's odd subject keeps its text in `odd_refs` and counts
+        /// toward nothing; an update to a whole subject removes the text and
+        /// counts, an older write leaves the newer row alone, and the delete
+        /// takes the row and its count.
+        #[tokio::test]
+        async fn a_likes_odd_subject_lives_and_goes_with_its_row() {
+            let Some(db) = fresh_db("writer_odd_subject").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, false);
+            let odd = format!("at://{SUBJECT}/app.bsky.feed.post");
+            let whole = format!("at://{SUBJECT}/app.bsky.feed.post/3myp5txuf7s2c");
+            let like = |action: Action, subject: &str| RawOp {
+                action,
+                collection: "app.bsky.feed.like".into(),
+                rkey: "3myp5txuf7s2a".into(),
+                cid: (action != Action::Delete).then(|| "bafylike".to_string()),
+                record: (action != Action::Delete).then(|| {
+                    json!({"subject": {"uri": subject, "cid": "bafysubject"}, "createdAt": "2026-10-01T00:00:00Z"})
+                }),
+            };
+            let state = || async {
+                let row: (i16, Option<String>, Option<String>, i64) = sqlx::query_as(
+                    "SELECT l.subj_coll, (SELECT d.did FROM dids d WHERE d.id = l.subj_author), \
+                       ref_text(l.subj_author, l.subj_coll, l.subj_rkey, 2::smallint, l.author, l.rkey, 4::smallint), \
+                       (SELECT count(*) FROM odd_refs) \
+                     FROM likes l",
+                )
+                .fetch_one(p)
+                .await
+                .expect("like");
+                row
+            };
+            let report = w.apply(AUTHOR, "3myp5txuf7s2d", &[like(Action::Create, &odd)], OPTIONS).await.expect("apply");
+            assert_eq!(report.outcomes, [OpOutcome::Written]);
+            assert_eq!(state().await, (0, Some(SUBJECT.into()), Some(odd.clone()), 1));
+            let counted: i64 = sqlx::query_scalar("SELECT count(*) FROM post_counts").fetch_one(p).await.expect("counts");
+            assert_eq!(counted, 0, "an odd subject counts toward nothing");
+            w.apply(AUTHOR, "3myp5txuf7s2f", &[like(Action::Update, &whole)], OPTIONS).await.expect("whole");
+            assert_eq!(state().await, (1, Some(SUBJECT.into()), Some(whole.clone()), 0), "the old text is gone");
+            assert_eq!(crate::test_support::interactions::post_counts(p, &whole).await.map(|c| c.0), Some(1));
+            let stale = w.apply(AUTHOR, "3myp5txuf7s2e", &[like(Action::Update, &odd)], OPTIONS).await.expect("stale");
+            assert_eq!(stale.outcomes, [OpOutcome::Unchanged]);
+            assert_eq!(state().await, (1, Some(SUBJECT.into()), Some(whole.clone()), 0));
+            w.apply(AUTHOR, "3myp5txuf7s2g", &[like(Action::Update, &odd)], OPTIONS).await.expect("odd again");
+            assert_eq!(state().await, (0, Some(SUBJECT.into()), Some(odd.clone()), 1));
+            assert_eq!(crate::test_support::interactions::post_counts(p, &whole).await.map(|c| c.0), Some(0));
+            w.apply(AUTHOR, "3myp5txuf7s2h", &[like(Action::Delete, &odd)], OPTIONS).await.expect("delete");
+            let left: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM likes), (SELECT count(*) FROM odd_refs)").fetch_one(p).await.expect("left");
+            assert_eq!(left, (0, 0));
+            db.drop_db().await;
+        }
+
         /// design-v3 §3.1, §3.2: the columns the v3 migrations added.
         #[tokio::test]
         async fn new_columns_are_extracted_on_write() {
@@ -3827,8 +4022,10 @@ mod tests {
                 .expect("tags");
             assert_eq!(tagged, 2);
 
-            let like_via: (Option<String>, Option<String>) = sqlx::query_as("SELECT via_uri, via_cid FROM likes").fetch_one(p).await.expect("like");
-            assert_eq!(like_via, (Some("at://did:plc:pack/app.bsky.graph.starterpack/1".into()), Some("bafyvia".into())));
+            let like_via: (Option<String>, Option<Vec<u8>>) =
+                sqlx::query_as("SELECT at_uri(via_author, via_coll, via_rkey), via_cid FROM likes").fetch_one(p).await.expect("like");
+            assert_eq!(like_via.0.as_deref(), Some("at://did:plc:pack/app.bsky.graph.starterpack/1"));
+            assert_eq!(like_via.1.as_deref().map(crate::db::ids::cid_from_db).as_deref(), Some("bafyvia"));
             let follow_via: (Option<String>, i16, Option<Vec<u8>>) =
                 sqlx::query_as("SELECT at_uri(via_author, via_coll, via_rkey), via_coll, via_cid FROM follows").fetch_one(p).await.expect("follow");
             assert_eq!(follow_via.0.as_deref(), Some("at://did:plc:pack/app.bsky.graph.starterpack/1"));

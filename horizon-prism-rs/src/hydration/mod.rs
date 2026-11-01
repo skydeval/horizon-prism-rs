@@ -785,7 +785,7 @@ impl Hydrator {
             "SELECT a.did, a.handle, a.display_name, a.description, a.avatar_cid, a.banner_cid, a.pds_endpoint, \
                a.indexed_at, a.profile_record, a.pronouns, a.website, a.joined_via_starter_pack_uri, \
                c.followers_count, c.follows_count, c.posts_count \
-             FROM actors a LEFT JOIN actor_counts c ON c.did = a.did WHERE a.did = ANY($1)",
+             FROM actors a LEFT JOIN dids d ON d.did = a.did LEFT JOIN actor_counts c ON c.id = d.id WHERE a.did = ANY($1)",
         )
         .bind(dids)
         .fetch_all(self.pool())
@@ -806,7 +806,9 @@ impl Hydrator {
             "SELECT p.uri, p.author_did, p.cid, p.record, p.embed, p.reply_parent_uri, p.reply_root_uri, \
                p.quote_uri, p.created_at, p.indexed_at, \
                c.like_count, c.repost_count, c.reply_count, c.quote_count \
-             FROM posts p LEFT JOIN post_counts c ON c.post_uri = p.uri WHERE p.uri = ANY($1)",
+             FROM posts p LEFT JOIN LATERAL ref_of(p.uri) k ON true \
+             LEFT JOIN post_counts c ON k.coll = 1 AND c.author = k.author AND c.rkey = k.rkey \
+             WHERE p.uri = ANY($1)",
         )
         .bind(uris)
         .fetch_all(self.pool())
@@ -1125,22 +1127,26 @@ impl Hydrator {
         let Some(me) = viewer.state_did() else {
             return Ok(HashMap::new());
         };
-        let likes: Vec<(String, String)> = sqlx::query_as(
-            "SELECT DISTINCT ON (subject_uri) subject_uri, uri FROM likes WHERE author_did = $1 AND subject_uri = ANY($2) \
-             ORDER BY subject_uri, created_at DESC, uri DESC",
-        )
-        .bind(me)
-        .bind(uris)
-        .fetch_all(self.pool())
-        .await?;
-        let reposts: Vec<(String, String)> = sqlx::query_as(
-            "SELECT DISTINCT ON (subject_uri) subject_uri, uri FROM reposts WHERE author_did = $1 AND subject_uri = ANY($2) \
-             ORDER BY subject_uri, created_at DESC, uri DESC",
-        )
-        .bind(me)
-        .bind(uris)
-        .fetch_all(self.pool())
-        .await?;
+        // By the subject's key; ties at one time go to the higher key.
+        let own = |table: &str, coll: i16| {
+            format!(
+                "SELECT DISTINCT ON (u.uri) u.uri, at_uri(t.author, {coll}::smallint, t.rkey) \
+                 FROM unnest($2::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) s \
+                 JOIN {table} t ON t.subj_author = s.author AND t.subj_rkey = s.rkey AND t.subj_coll = s.coll \
+                 WHERE t.author = (SELECT id FROM dids WHERE did = $1) \
+                 ORDER BY u.uri, t.created_at DESC, t.rkey DESC"
+            )
+        };
+        let likes: Vec<(String, String)> = sqlx::query_as(&own("likes", crate::db::ids::COLL_LIKE))
+            .bind(me)
+            .bind(uris)
+            .fetch_all(self.pool())
+            .await?;
+        let reposts: Vec<(String, String)> = sqlx::query_as(&own("reposts", crate::db::ids::COLL_REPOST))
+            .bind(me)
+            .bind(uris)
+            .fetch_all(self.pool())
+            .await?;
         let mut out: HashMap<String, Value> = uris.iter().map(|u| (u.clone(), json!({}))).collect();
         for (subject, like) in likes {
             out.entry(subject).or_insert_with(|| json!({}))["like"] = json!(like);
@@ -1596,6 +1602,10 @@ pub(crate) mod testing {
         if let (Some(p), Some(r)) = (parent, root) {
             record["reply"] = json!({"parent": {"uri": p, "cid": "bafyparent"}, "root": {"uri": r, "cid": "bafyroot"}});
         }
+        // The ids the count trigger reads, as the writer interns them.
+        let mut named = vec![uri.as_str()];
+        named.extend(parent);
+        crate::test_support::interactions::intern(pool, &named).await;
         sqlx::query(
             "INSERT INTO posts (uri, author_did, rkey, cid, rev, text, reply_parent_uri, reply_root_uri, record, created_at) \
              VALUES ($1, $2, $3, $4, '3kaaaaaaaaaaa', $5, $6, $7, $8, now())",

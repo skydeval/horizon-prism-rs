@@ -172,7 +172,7 @@ impl Hydrator {
                 &self.suggestions().popular,
                 "popular",
                 "COALESCE((SELECT cc.followers FROM constellation_counts cc WHERE cc.target = a.did), \
-                          (SELECT c.followers_count FROM actor_counts c WHERE c.did = a.did), 0) DESC, \
+                          (SELECT c.followers_count FROM actor_counts c, dids cd WHERE cd.did = a.did AND c.id = cd.id), 0) DESC, \
                  (SELECT max(p.created_at) FROM posts p WHERE p.author_did = a.did) DESC NULLS LAST, a.did",
             ),
         };

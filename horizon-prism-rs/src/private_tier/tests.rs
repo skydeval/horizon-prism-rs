@@ -3346,7 +3346,8 @@ async fn interactions_in(mode: PublicMode, test: &str) {
     own_reply["embed"] = quote_of(&t)["embed"].clone();
     f.ingest(BOB, NSID_POST_PRIVATE, "3kownreply22", own_reply).await;
     f.ready_all().await;
-    let eve_rows: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM likes WHERE author_did = $1) + (SELECT count(*) FROM reposts WHERE author_did = $1)")
+    let eve_rows: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM likes WHERE author = (SELECT id FROM dids WHERE did = $1)) \
+         + (SELECT count(*) FROM reposts WHERE author = (SELECT id FROM dids WHERE did = $1))")
         .bind(EVE)
         .fetch_one(&f.pool)
         .await
@@ -3435,7 +3436,9 @@ async fn interactions_in(mode: PublicMode, test: &str) {
     let (_, page, _) = json_of(&base, GET_LIKES, &format!("uri={t}"), CAROL).await;
     let like = &page["likes"][0];
     assert_eq!(like["createdAt"], "2026-10-01T12:00:00.000Z");
-    assert!(like["indexedAt"].is_string() && like["actor"]["handle"] == "carol.test", "{like}");
+    // A like's `indexedAt` is its `createdAt`, as on the public getLikes.
+    assert_eq!(like["indexedAt"], like["createdAt"], "{like}");
+    assert_eq!(like["actor"]["handle"], "carol.test", "{like}");
 
     // T-13: getQuotes mixes the two item types, newest first, with a
     // sealed cursor bound to its caller and its uri.

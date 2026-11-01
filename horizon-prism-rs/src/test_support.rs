@@ -757,6 +757,289 @@ pub mod graph {
     }
 }
 
+/// Test rows of the id-keyed likes and reposts and of the count tables,
+/// written from DID text and URI text as ingest would store them.
+pub mod interactions {
+    use chrono::{DateTime, Utc};
+    use sqlx::PgPool;
+
+    use crate::db::ids::{Ids, OddTable, Slot, StoredRef, cid_to_db, ref_did, ref_rkey, rev_value, stored_ref};
+
+    pub use super::graph::REV;
+
+    /// A like or repost to write.
+    #[derive(Debug, Clone)]
+    pub struct Interaction<'a> {
+        pub table: &'static str,
+        pub author: &'a str,
+        pub rkey: &'a str,
+        pub subject: &'a str,
+        pub subject_cid: Option<&'a str>,
+        pub via: Option<(&'a str, Option<&'a str>)>,
+        pub rev: &'a str,
+        pub created_at: Option<DateTime<Utc>>,
+    }
+
+    impl<'a> Interaction<'a> {
+        /// A like at [`REV`], created now, with no CID.
+        #[must_use]
+        pub fn like(author: &'a str, rkey: &'a str, subject: &'a str) -> Self {
+            Self { table: "likes", author, rkey, subject, subject_cid: None, via: None, rev: REV, created_at: None }
+        }
+
+        /// A repost at [`REV`], created now, with no CID.
+        #[must_use]
+        pub fn repost(author: &'a str, rkey: &'a str, subject: &'a str) -> Self {
+            Self { table: "reposts", ..Self::like(author, rkey, subject) }
+        }
+
+        #[must_use]
+        pub fn cid(mut self, cid: &'a str) -> Self {
+            self.subject_cid = Some(cid);
+            self
+        }
+
+        #[must_use]
+        pub fn at(mut self, created_at: DateTime<Utc>) -> Self {
+            self.created_at = Some(created_at);
+            self
+        }
+
+        /// The row's URI.
+        #[must_use]
+        pub fn uri(&self) -> String {
+            let nsid = if self.table == "likes" { "app.bsky.feed.like" } else { "app.bsky.feed.repost" };
+            format!("at://{}/{nsid}/{}", self.author, self.rkey)
+        }
+
+        /// Write the row, interning its ids first; an odd subject or `via`
+        /// keeps its text in `odd_refs`. Returns the row's URI.
+        ///
+        /// # Panics
+        ///
+        /// On a database error or an author or key that is not valid.
+        pub async fn put(&self, pool: &PgPool) -> String {
+            let ids = Ids::new(pool.clone());
+            let via_uri = self.via.map(|(u, _)| u);
+            let mut dids = vec![self.author.to_string()];
+            dids.extend(ref_did(self.subject));
+            dids.extend(via_uri.and_then(ref_did));
+            let accounts = ids.account_ids(&dids).await.expect("intern");
+            let author = accounts[self.author];
+            let mut keys = vec![(author, self.rkey.to_string())];
+            for uri in std::iter::once(self.subject).chain(via_uri) {
+                if let Some((did, rkey)) = ref_rkey(uri)
+                    && let Some(a) = accounts.get(&did)
+                {
+                    keys.push((*a, rkey));
+                }
+            }
+            let rkeys = ids.rkey_ids(&keys).await.expect("alias");
+            let rkey = rkeys[&(author, self.rkey.to_string())];
+            let subject = stored_ref(self.subject, &accounts, &rkeys);
+            let via = via_uri.map(|u| stored_ref(u, &accounts, &rkeys));
+            let (sa, sc, sr) = subject.columns();
+            let (va, vc, vr) = via.as_ref().map_or((None, None, None), |v| {
+                let (a, c, r) = v.columns();
+                (a, Some(c), r)
+            });
+            sqlx::query(&format!(
+                "INSERT INTO {} (author, rkey, subj_author, subj_coll, subj_rkey, subj_cid, rev, created_at, \
+                   via_author, via_coll, via_rkey, via_cid) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()), $9, $10, $11, $12)",
+                self.table
+            ))
+            .bind(author)
+            .bind(rkey)
+            .bind(sa)
+            .bind(sc)
+            .bind(sr)
+            .bind(self.subject_cid.map(cid_to_db))
+            .bind(rev_value(self.rev))
+            .bind(self.created_at)
+            .bind(va)
+            .bind(vc)
+            .bind(vr)
+            .bind(self.via.and_then(|(_, c)| c).map(cid_to_db))
+            .execute(pool)
+            .await
+            .expect("interaction row");
+            let tbl = if self.table == "likes" { OddTable::Likes } else { OddTable::Reposts };
+            for (slot, r) in [(Slot::Subject, Some(&subject)), (Slot::Via, via.as_ref())] {
+                if let Some(StoredRef::Odd { raw, .. }) = r {
+                    sqlx::query("INSERT INTO odd_refs (tbl, author, rkey, slot, raw) VALUES ($1, $2, $3, $4, $5)")
+                        .bind(tbl.id())
+                        .bind(author)
+                        .bind(rkey)
+                        .bind(slot.id())
+                        .bind(raw)
+                        .execute(pool)
+                        .await
+                        .expect("odd ref");
+                }
+            }
+            self.uri()
+        }
+    }
+
+    /// The CTEs that intern every DID and record key `parts` names, as
+    /// `d(id, did)` and `ka(id, author, rkey)`. `parts` is a SELECT of
+    /// `(did, rkey)` text pairs (a NULL rkey interns the DID only). A test's
+    /// own fixture: it interns inside the statement, which only an
+    /// autocommit test write may do.
+    fn intern_ctes(parts: &str) -> String {
+        format!(
+            "x AS ({parts}), \
+             nd AS (INSERT INTO dids (did) SELECT DISTINCT x.did FROM x \
+                    WHERE did_is_valid(x.did) AND NOT EXISTS (SELECT 1 FROM dids o WHERE o.did = x.did) \
+                    ON CONFLICT (did) DO NOTHING RETURNING id, did), \
+             d AS (SELECT id, did FROM nd UNION ALL SELECT id, did FROM dids WHERE did IN (SELECT did FROM x)), \
+             na AS (INSERT INTO rkey_aliases (author, rkey) SELECT DISTINCT d.id, x.rkey FROM x JOIN d ON d.did = x.did \
+                    WHERE x.rkey IS NOT NULL AND rkey_to_bigint(x.rkey) IS NULL \
+                      AND NOT EXISTS (SELECT 1 FROM rkey_aliases o WHERE o.author = d.id AND o.rkey = x.rkey) \
+                    ON CONFLICT (author, rkey) DO NOTHING RETURNING id, author, rkey), \
+             ka AS (SELECT id, author, rkey FROM na \
+                    UNION ALL SELECT o.id, o.author, o.rkey FROM rkey_aliases o JOIN d ON d.id = o.author)"
+        )
+    }
+
+    /// One SQL statement that stores a like or repost (`table`) of a whole
+    /// subject from text, as ingest keys it, at [`REV`]; `created` is an SQL
+    /// expression. Every DID and key is interned in the statement.
+    #[must_use]
+    pub fn row_sql(table: &str, author: &str, rkey: &str, subject: &str, created: &str) -> String {
+        let ctes = intern_ctes(&format!(
+            "SELECT '{author}'::text AS did, '{rkey}'::text AS rkey \
+             UNION ALL SELECT split_part(substr('{subject}', 6), '/', 1), split_part(substr('{subject}', 6), '/', 3)"
+        ));
+        let key = |did: &str, rkey: &str| {
+            format!("COALESCE(rkey_to_bigint({rkey}), (SELECT ka.id FROM ka WHERE ka.author = {did} AND ka.rkey = {rkey} LIMIT 1))")
+        };
+        format!(
+            "WITH {ctes} \
+             INSERT INTO {table} (author, rkey, subj_author, subj_coll, subj_rkey, rev, created_at) \
+             SELECT da.id, {own}, ds.id, \
+                    (SELECT c.id FROM collections c WHERE c.nsid = split_part(substr('{subject}', 6), '/', 2)), {subj}, \
+                    rev_to_bigint('{REV}'), {created} \
+             FROM d da, d ds WHERE da.did = '{author}' AND ds.did = split_part(substr('{subject}', 6), '/', 1)",
+            own = key("da.id", &format!("'{rkey}'")),
+            subj = key("ds.id", &format!("split_part(substr('{subject}', 6), '/', 3)")),
+        )
+    }
+
+    /// One SQL statement that sets a post's four counts from its URI text,
+    /// interning its author and key in the statement.
+    #[must_use]
+    pub fn post_counts_sql(post: &str, like: i32, repost: i32, reply: i32, quote: i32) -> String {
+        let ctes = intern_ctes(&format!(
+            "SELECT split_part(substr('{post}', 6), '/', 1) AS did, split_part(substr('{post}', 6), '/', 3) AS rkey"
+        ));
+        format!(
+            "WITH {ctes} \
+             INSERT INTO post_counts (author, rkey, like_count, repost_count, reply_count, quote_count) \
+             SELECT d.id, COALESCE(rkey_to_bigint(split_part(substr('{post}', 6), '/', 3)), \
+                      (SELECT ka.id FROM ka WHERE ka.author = d.id AND ka.rkey = split_part(substr('{post}', 6), '/', 3) LIMIT 1)), \
+                    {like}, {repost}, {reply}, {quote} \
+             FROM d WHERE d.did = split_part(substr('{post}', 6), '/', 1) \
+             ON CONFLICT (author, rkey) DO UPDATE SET like_count = EXCLUDED.like_count, repost_count = EXCLUDED.repost_count, \
+               reply_count = EXCLUDED.reply_count, quote_count = EXCLUDED.quote_count"
+        )
+    }
+
+    /// A like at [`REV`], created now. Returns its URI.
+    pub async fn like(pool: &PgPool, author: &str, rkey: &str, subject: &str) -> String {
+        Interaction::like(author, rkey, subject).put(pool).await
+    }
+
+    /// A repost at [`REV`], created now. Returns its URI.
+    pub async fn repost(pool: &PgPool, author: &str, rkey: &str, subject: &str) -> String {
+        Interaction::repost(author, rkey, subject).put(pool).await
+    }
+
+    /// The subject text of every row of `table` (likes or reposts), ordered.
+    pub async fn subjects(pool: &PgPool, table: &str) -> Vec<String> {
+        let tbl = if table == "likes" { 2 } else { 3 };
+        sqlx::query_scalar(&format!(
+            "SELECT ref_text(subj_author, subj_coll, subj_rkey, {tbl}::smallint, author, rkey, 4::smallint) FROM {table} ORDER BY 1"
+        ))
+        .fetch_all(pool)
+        .await
+        .expect("interaction subjects")
+    }
+
+    /// The rows of `table` (likes or reposts) by `did`.
+    pub async fn count_by(pool: &PgPool, table: &str, did: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE author = (SELECT id FROM dids WHERE did = $1)"))
+            .bind(did)
+            .fetch_one(pool)
+            .await
+            .expect("interaction count")
+    }
+
+    /// Intern the authorities and record keys of these URIs, as the writer
+    /// does before it stores a record naming them.
+    pub async fn intern(pool: &PgPool, uris: &[&str]) {
+        let ids = Ids::new(pool.clone());
+        let dids: Vec<String> = uris.iter().filter_map(|u| ref_did(u)).collect();
+        let accounts = ids.account_ids(&dids).await.expect("intern");
+        let keys: Vec<_> = uris
+            .iter()
+            .filter_map(|u| ref_rkey(u))
+            .filter_map(|(did, rkey)| accounts.get(&did).map(|a| (*a, rkey)))
+            .collect();
+        ids.rkey_ids(&keys).await.expect("alias");
+    }
+
+    /// Set a post's four counts `(like, repost, reply, quote)`.
+    pub async fn set_post_counts(pool: &PgPool, post: &str, counts: (i32, i32, i32, i32)) {
+        intern(pool, &[post]).await;
+        sqlx::query(
+            "INSERT INTO post_counts (author, rkey, like_count, repost_count, reply_count, quote_count) \
+             SELECT r.author, r.rkey, $2, $3, $4, $5 FROM ref_of($1) r WHERE r.coll = 1 \
+             ON CONFLICT (author, rkey) DO UPDATE SET like_count = EXCLUDED.like_count, repost_count = EXCLUDED.repost_count, \
+               reply_count = EXCLUDED.reply_count, quote_count = EXCLUDED.quote_count",
+        )
+        .bind(post)
+        .bind(counts.0)
+        .bind(counts.1)
+        .bind(counts.2)
+        .bind(counts.3)
+        .execute(pool)
+        .await
+        .expect("post counts");
+    }
+
+    /// A post's four counts `(like, repost, reply, quote)`, when it has a row.
+    pub async fn post_counts(pool: &PgPool, post: &str) -> Option<(i32, i32, i32, i32)> {
+        sqlx::query_as(
+            "SELECT c.like_count, c.repost_count, c.reply_count, c.quote_count FROM post_counts c, ref_of($1) r \
+             WHERE r.coll = 1 AND c.author = r.author AND c.rkey = r.rkey",
+        )
+        .bind(post)
+        .fetch_optional(pool)
+        .await
+        .expect("post counts")
+    }
+
+    /// Set an account's three counts `(followers, follows, posts)`.
+    pub async fn set_actor_counts(pool: &PgPool, did: &str, counts: (i32, i32, i32)) {
+        let ids = Ids::new(pool.clone());
+        let id = ids.account_ids(&[did.to_string()]).await.expect("intern")[did];
+        sqlx::query(
+            "INSERT INTO actor_counts (id, followers_count, follows_count, posts_count) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (id) DO UPDATE SET followers_count = EXCLUDED.followers_count, \
+               follows_count = EXCLUDED.follows_count, posts_count = EXCLUDED.posts_count",
+        )
+        .bind(id)
+        .bind(counts.0)
+        .bind(counts.1)
+        .bind(counts.2)
+        .execute(pool)
+        .await
+        .expect("actor counts");
+    }
+}
+
 /// A fresh database with no migrations applied (migration tests).
 pub async fn empty_db(test: &str) -> Option<TestDb> {
     let Ok(admin_url) = std::env::var(ENV) else {

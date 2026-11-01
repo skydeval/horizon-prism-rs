@@ -220,7 +220,7 @@ impl World {
     /// A post stored here, with a reply count so its replies are read.
     async fn stored(&self, did: &str, n: u64, text: &str, parent: Option<&str>, root: Option<&str>) -> String {
         let uri = post(&self.db.pool, did, &self.rk(n), text, parent, root).await;
-        exec(&self.db.pool, &format!("INSERT INTO post_counts (post_uri, reply_count) VALUES ('{uri}', 1)")).await;
+        crate::test_support::interactions::set_post_counts(&self.db.pool, &uri, (0, 0, 1, 0)).await;
         uri
     }
 

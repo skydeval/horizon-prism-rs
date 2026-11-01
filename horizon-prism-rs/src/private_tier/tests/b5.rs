@@ -726,7 +726,7 @@ impl Part3 {
                         if table == "reposts" && i >= 50 {
                             continue;
                         }
-                        exec(pool, &format!("INSERT INTO {table} (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES ('at://{liker}/x/b5{table}{i}', '{liker}', '{p1}', 'bafyb5', '3k', now())")).await;
+                        exec(pool, &crate::test_support::interactions::row_sql(table, &liker, &format!("b5{table}{i}"), &p1, "now()")).await;
                     }
                 }
                 let mut b = Bulk::new("b5q");
@@ -1119,10 +1119,18 @@ impl Part3 {
             // 50 000 like records on one post.
             Self::Likes => {
                 let p1 = p1();
+                // The likers interned first; each like keyed by the TID of
+                // value `g`.
+                crate::test_support::interactions::intern(pool, &[&p1]).await;
                 exec(pool, &format!(
-                    "INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) \
-                     SELECT 'at://' || d || '/app.bsky.feed.like/b5lk', d, '{p1}', 'bafyb5', '3k', now() - make_interval(secs => g) \
-                     FROM (SELECT g, {MEMBER_SQL} AS d FROM generate_series(10001, 60000) g) s"
+                    "INSERT INTO dids (did) SELECT {MEMBER_SQL} FROM generate_series(10001, 60000) g ON CONFLICT (did) DO NOTHING"
+                ))
+                .await;
+                exec(pool, &format!(
+                    "INSERT INTO likes (author, rkey, subj_author, subj_coll, subj_rkey, subj_cid, rev, created_at) \
+                     SELECT a.id, g, r.author, r.coll, r.rkey, '\\x00'::bytea || convert_to('bafyb5', 'UTF8'), \
+                       rev_to_bigint('2222222222223'), now() - make_interval(secs => g) \
+                     FROM generate_series(10001, 60000) g JOIN dids a ON a.did = {MEMBER_SQL} CROSS JOIN ref_of('{p1}') r"
                 )).await;
                 vec![
                     ("getLikes", GET_LIKES, format!("uri={p1}"), false),

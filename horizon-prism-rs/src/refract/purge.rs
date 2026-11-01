@@ -28,7 +28,10 @@ pub const IDLE_POLL: Duration = Duration::from_secs(10);
 /// member (rule 2 keeps them in On and Filling).
 const POST_NAMES_MEMBER: &str = "EXISTS (SELECT 1 FROM members m WHERE m.did IN (split_part(t.reply_parent_uri, '/', 3), \
      split_part(t.reply_root_uri, '/', 3), split_part(t.quote_uri, '/', 3)))";
-const SUBJECT_AUTHOR_MEMBER: &str = "EXISTS (SELECT 1 FROM members m WHERE m.did = split_part(t.subject_uri, '/', 3))";
+// Likes and reposts name their subject's author by id.
+const SUBJECT_AUTHOR_MEMBER: &str = "EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id = t.subj_author)";
+/// The DID's own likes or reposts, as a predicate on `t`.
+const OWN: &str = "t.author = (SELECT id FROM dids WHERE did = $1)";
 /// One batch of the DID's follows of non-members. Follows are keyed by ids
 /// and name their subject by id.
 async fn delete_follows(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
@@ -40,6 +43,16 @@ async fn delete_follows(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx:
     let n = sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
     if n > 0 {
         metrics::counter!(METRIC_ROWS, "table" => "follows".to_string()).increment(n);
+    }
+    Ok(n)
+}
+
+/// [`delete`] for a table keyed by `(author, rkey)` (likes, reposts).
+async fn delete_keyed(conn: &mut PgConnection, table: &str, predicate: &str, did: &str) -> Result<u64, sqlx::Error> {
+    let sql = format!("DELETE FROM {table} WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM {table} t WHERE {predicate} LIMIT {BATCH})");
+    let n = sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
+    if n > 0 {
+        metrics::counter!(METRIC_ROWS, "table" => table.to_string()).increment(n);
     }
     Ok(n)
 }
@@ -64,10 +77,11 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
         (true, false) => {}
         (false, false) if in_s => {}
         (false, true) => {
+            for table in ["likes", "reposts"] {
+                n += delete_keyed(conn, table, OWN, did).await?;
+            }
             for (table, col) in [
                 ("posts", "author_did"),
-                ("likes", "author_did"),
-                ("reposts", "author_did"),
                 ("lists", "creator_did"),
                 ("list_items", "author_did"),
                 ("list_optouts", "author_did"),
@@ -84,7 +98,7 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
         (false, false) => {
             n += delete(conn, "posts", "uri", &format!("t.author_did = $1 AND NOT {POST_NAMES_MEMBER}"), did).await?;
             for table in ["likes", "reposts"] {
-                n += delete(conn, table, "uri", &format!("t.author_did = $1 AND NOT {SUBJECT_AUTHOR_MEMBER}"), did).await?;
+                n += delete_keyed(conn, table, &format!("{OWN} AND NOT {SUBJECT_AUTHOR_MEMBER}"), did).await?;
             }
             n += delete_follows(conn, did).await?;
             for (table, col) in [
@@ -105,15 +119,15 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
     // Filling, never one by a DID in S (rule 1), nor any when the DID is a
     // member (rule 2).
     if off || !member {
-        let s_spare = if off { "" } else { " AND NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = t.author_did)" };
-        n += delete(
+        let s_spare = if off { "" } else { " AND NOT EXISTS (SELECT 1 FROM scope_dids s JOIN dids d ON d.did = s.did WHERE d.id = t.author)" };
+        n += delete_keyed(
             conn,
             "reposts",
-            "uri",
             &format!(
-                "split_part(t.subject_uri, '/', 3) = $1 AND t.author_did <> $1 \
-                 AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did) \
-                 AND NOT EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = t.author_did AND rf.state IN ('restored', 'grace')){s_spare}"
+                "t.subj_author = (SELECT id FROM dids WHERE did = $1) AND t.author <> t.subj_author \
+                 AND NOT EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id = t.author) \
+                 AND NOT EXISTS (SELECT 1 FROM refract_dids rf JOIN dids d ON d.did = rf.did \
+                                 WHERE d.id = t.author AND rf.state IN ('restored', 'grace')){s_spare}"
             ),
             did,
         )
@@ -128,8 +142,10 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
         "id",
         "t.author_did = $1 AND NOT CASE split_part(t.record_uri, '/', 4) \
            WHEN 'app.bsky.feed.post' THEN EXISTS (SELECT 1 FROM posts x WHERE x.uri = t.record_uri) \
-           WHEN 'app.bsky.feed.like' THEN EXISTS (SELECT 1 FROM likes x WHERE x.uri = t.record_uri) \
-           WHEN 'app.bsky.feed.repost' THEN EXISTS (SELECT 1 FROM reposts x WHERE x.uri = t.record_uri) \
+           WHEN 'app.bsky.feed.like' THEN EXISTS (SELECT 1 FROM likes x, ref_of(t.record_uri) r \
+                                                  WHERE x.author = r.author AND x.rkey = r.rkey AND r.coll = 2) \
+           WHEN 'app.bsky.feed.repost' THEN EXISTS (SELECT 1 FROM reposts x, ref_of(t.record_uri) r \
+                                                    WHERE x.author = r.author AND x.rkey = r.rkey AND r.coll = 3) \
            WHEN 'app.bsky.graph.follow' THEN EXISTS (SELECT 1 FROM follows x, ref_of(t.record_uri) r \
                                                      WHERE x.author = r.author AND x.rkey = r.rkey AND r.coll = 4) \
            WHEN 'app.bsky.actor.profile' THEN EXISTS (SELECT 1 FROM actors x WHERE x.did = t.author_did AND x.profile_record IS NOT NULL) \

@@ -299,7 +299,7 @@ async fn bad_sweep_states_reset_and_complete() {
     let at = rfc3339(&now());
     for bad in [
         json!({"table": "no_such_table", "after": null, "last_advanced_at": at}),
-        json!({"table": "likes", "after": 7, "last_advanced_at": at}),
+        json!({"table": "posts", "after": 7, "last_advanced_at": at}),
         json!({"table": "notifications", "after": "7", "last_advanced_at": at}),
         json!({"table": "tag_activity_hourly", "after": ["rust"], "last_advanced_at": at}),
     ] {
@@ -566,8 +566,8 @@ fn sweep_seed() -> String {
     for (did, rkeys) in [(B, &["1"][..]), (MEMBER, &["1", "2", "3", "4", "5"][..]), (D, &["1"][..])] {
         for r in rkeys {
             for t in ["likes", "reposts"] {
-                let c = if t == "likes" { "like" } else { "repost" };
-                sql += &format!("INSERT INTO {t} (uri, author_did, subject_uri, rev, created_at) VALUES ('at://{did}/app.bsky.feed.{c}/{r}', '{did}', '{}', '3k', now());", post(B, "p1"));
+                sql += &crate::test_support::interactions::row_sql(t, did, r, &post(B, "p1"), "now()");
+                sql += ";";
             }
         }
     }
@@ -592,7 +592,8 @@ fn sweep_seed() -> String {
     for (author, subject, r) in [(B, D, "1"), (B, MEMBER, "2"), (MEMBER, D, "1")] {
         sql += &graph_row_sql("follows", author, subject, r);
     }
-    sql += &format!("INSERT INTO post_counts (post_uri, like_count) VALUES ('{}', 1) ON CONFLICT DO NOTHING;", post(D, "p9"));
+    sql += &crate::test_support::interactions::post_counts_sql(&post(D, "p9"), 1, 0, 0, 0);
+    sql += ";";
     for (tag, h) in [("a", 1), ("a", 2), ("b", 1), ("c", 3), ("c", 4)] {
         sql += &format!("INSERT INTO tag_activity_hourly (tag, hour, posts) VALUES ('{tag}', '2026-10-14T0{h}:00:00Z', 1);");
     }
@@ -611,8 +612,8 @@ fn sweep_seed() -> String {
 
 /// The rows the sweep keeps, as text, table by table.
 const KEPT: [(&str, &str); 14] = [
-    ("likes", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
-    ("reposts", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
+    ("likes", "author = (SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc')"),
+    ("reposts", "author = (SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc')"),
     ("lists", "creator_did = 'did:plc:cccccccccccccccccccccccc'"),
     ("list_items", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
     ("list_optouts", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
@@ -706,7 +707,10 @@ async fn the_sweep_empties_and_thins_every_table() {
     for t in ["feed_items", "notifications", "posts", "threadgates", "postgates", "starter_packs", "labeler_services", "nearhorizon_poll_posts", "post_counts", "tag_activity_hourly", "starter_pack_counts"] {
         assert_eq!(count(p, &format!("SELECT count(*) FROM {t}")).await, 0, "{t} is emptied");
     }
-    for t in ["likes", "reposts", "list_items", "list_optouts", "list_blocks"] {
+    for t in ["likes", "reposts"] {
+        assert_eq!(count(p, &format!("SELECT count(*) FROM {t} WHERE author <> (SELECT id FROM dids WHERE did = '{MEMBER}')")).await, 0, "{t} is thinned");
+    }
+    for t in ["list_items", "list_optouts", "list_blocks"] {
         assert_eq!(count(p, &format!("SELECT count(*) FROM {t} WHERE author_did <> '{MEMBER}'")).await, 0, "{t} is thinned");
     }
     assert_eq!(count(p, &format!("SELECT count(*) FROM lists WHERE creator_did <> '{MEMBER}'")).await, 0);
@@ -932,8 +936,7 @@ async fn the_bound_ends_a_fill_with_a_stuck_job() {
     let ms = ["did:plc:m1", "did:plc:m2", "did:plc:m3", "did:plc:m4", "did:plc:m5"];
     members(p, &ms).await;
     in_scope(p, &ms).await;
-    exec(p, "INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES \
-             ('at://did:plc:m1/app.bsky.feed.like/1', 'did:plc:m1', 'at://did:plc:m2/app.bsky.feed.post/1', '3k', now())").await;
+    crate::test_support::interactions::like(p, "did:plc:m1", "1", "at://did:plc:m2/app.bsky.feed.post/1").await;
     exec(p, "UPDATE post_counts SET like_count = 99").await;
     let s = PublicModeSettings { fill_max_wait: Duration::from_secs(2), fill_batch: 1_000, ..settings() };
     let (pi, scope) = boot(p, s).await;

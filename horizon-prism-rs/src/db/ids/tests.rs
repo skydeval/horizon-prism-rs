@@ -315,6 +315,190 @@ async fn migration_0055_moves_follows_and_blocks() {
     db.drop_db().await;
 }
 
+/// Migration 0056 over rows in the old shape: every like and repost is
+/// keyed and its subject and `via` read back as stored, odd texts land in
+/// `odd_refs`, post counts are copied for whole posts only and the rest
+/// dropped, account counts are keyed by id, a row that cannot be keyed is
+/// left out, and the new triggers work.
+#[tokio::test]
+async fn migration_0056_moves_likes_reposts_and_counts() {
+    const C: &str = "did:plc:compactccccccccccccccccc";
+    let Some(db) = crate::test_support::empty_db("migration_0056").await else { return };
+    let p = &db.pool;
+    let migrations: Vec<_> = crate::db::migrations::MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()).collect();
+    let at = migrations.iter().position(|m| m.version == 56).expect("0056");
+    for m in &migrations[..at] {
+        sqlx::raw_sql(&m.sql).execute(p).await.unwrap_or_else(|e| panic!("{}: {e}", m.version));
+    }
+    let post = |rkey: &str| format!("at://{B}/app.bsky.feed.post/{rkey}");
+    let (liked, kept, by_alias) = (post("3myp5txuf7s2d"), post("3myp5txuf7s2h"), post("self"));
+    let no_rkey = format!("at://{B}/app.bsky.feed.post");
+    let handle = "at://alice.example/app.bsky.feed.post/3myp5txuf7s2d".to_string();
+    let list = format!("at://{B}/app.bsky.graph.list/3myp5txuf7s2d");
+    let private = format!("at://{B}/tools.kryphocron.feed.postPrivate/3myp5txuf7s2d");
+    let via_whole = format!("at://{C}/app.bsky.feed.repost/self");
+    let via_odd = format!("at://{B}/com.example.thing/1");
+    let canonical = "bafyreidbcoifjdzsr3u5i74kbm427m5yic67grd54s4luhlt4xxntevd6m";
+    let like = |rkey: &str| format!("at://{A}/app.bsky.feed.like/{rkey}");
+    // (rkey, rev, subject, subject cid, via, via cid, subject coll)
+    type Old<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>, i16);
+    let likes: [Old; 4] = [
+        ("3myp5txuf7s2d", "3myp5txuf7s2d", liked.as_str(), Some(canonical), Some(via_whole.as_str()), Some("BAFYVIA"), 1),
+        ("self", "3myp5txuf7s2e", no_rkey.as_str(), None, None, None, 0),
+        ("3myp5txuf7s2e", "3myp5txuf7s2e", handle.as_str(), Some("bafyodd"), Some(via_odd.as_str()), None, 0),
+        ("3myp5txuf7s2f", "not-a-tid", list.as_str(), None, None, None, 7),
+    ];
+    for (rkey, rev, subject, cid, via, via_cid, _) in likes {
+        sqlx::query(
+            "INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at, via_uri, via_cid) \
+             VALUES ($1, $2, $3, $4, $5, '2026-10-01T00:00:00Z', $6, $7)",
+        )
+        .bind(like(rkey))
+        .bind(A)
+        .bind(subject)
+        .bind(cid)
+        .bind(rev)
+        .bind(via)
+        .bind(via_cid)
+        .execute(p)
+        .await
+        .expect("old like");
+    }
+    // Not keyable: a URI that is not the author's own record. Its subject's
+    // count row is still copied.
+    sqlx::query("INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES ($1, $2, $3, '3k', now())")
+        .bind(format!("at://{B}/app.bsky.feed.like/3myp5txuf7s2g"))
+        .bind(A)
+        .bind(&kept)
+        .execute(p)
+        .await
+        .expect("odd like");
+    for (rkey, subject) in [("3myp5txuf7s2d", &private), ("3myp5txuf7s2e", &by_alias)] {
+        sqlx::query("INSERT INTO reposts (uri, author_did, subject_uri, rev, created_at) VALUES ($1, $2, $3, '3myp5txuf7s2d', now())")
+            .bind(format!("at://{A}/app.bsky.feed.repost/{rkey}"))
+            .bind(A)
+            .bind(subject)
+            .execute(p)
+            .await
+            .expect("old repost");
+    }
+    sqlx::query("INSERT INTO actor_counts (did, followers_count, follows_count, posts_count) VALUES ($1, 3, 2, 1), ('bob.example', 1, 1, 1)")
+        .bind(C)
+        .execute(p)
+        .await
+        .expect("old actor counts");
+
+    sqlx::raw_sql(&migrations[at].sql).execute(p).await.expect("0056 applies over existing rows");
+
+    type Row = (String, Option<String>, i16, Option<Vec<u8>>, String, Option<String>, Option<Vec<u8>>, bool);
+    let got: Vec<Row> = sqlx::query_as(
+        "SELECT at_uri(l.author, 2::smallint, l.rkey), \
+           ref_text(l.subj_author, l.subj_coll, l.subj_rkey, 2::smallint, l.author, l.rkey, 4::smallint), l.subj_coll, l.subj_cid, \
+           bigint_to_rev(l.rev), ref_text(l.via_author, l.via_coll, l.via_rkey, 2::smallint, l.author, l.rkey, 5::smallint), l.via_cid, \
+           l.subj_author IS NOT NULL \
+         FROM likes l ORDER BY at_uri(l.author, 2::smallint, l.rkey) COLLATE \"C\"",
+    )
+    .fetch_all(p)
+    .await
+    .expect("likes");
+    let text = |c: Option<&str>| c.map(|c| [&[0u8][..], c.as_bytes()].concat());
+    let mut want: Vec<Row> = likes
+        .iter()
+        .map(|(rkey, rev, subject, cid, via, via_cid, coll)| {
+            let rev = if proto_blue::syntax::Tid::is_valid(rev) { (*rev).to_string() } else { "2222222222222".to_string() };
+            (like(rkey), Some((*subject).to_string()), *coll, text(*cid), rev, via.map(str::to_string), text(*via_cid), *subject != handle)
+        })
+        .collect();
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(got, want);
+    let odd: Vec<(i16, i16)> = sqlx::query_as("SELECT tbl, slot FROM odd_refs ORDER BY 1, 2").fetch_all(p).await.expect("odd");
+    assert_eq!(odd, [(2, 4), (2, 4), (2, 5)], "two odd subjects and one odd via");
+    assert!(!sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM dids WHERE did IN ('alice.example', 'bob.example'))").fetch_one(p).await.expect("dids"));
+
+    let reposts: Vec<(String, i16)> = sqlx::query_as(
+        "SELECT ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint), r.subj_coll FROM reposts r ORDER BY 2",
+    )
+    .fetch_all(p)
+    .await
+    .expect("reposts");
+    assert_eq!(reposts, [(by_alias.clone(), 1), (private.clone(), 27)]);
+
+    // Counts of whole posts only: the list, the odd texts and the private
+    // post are dropped.
+    let count_of = |uri: String| async move {
+        sqlx::query_as::<_, (i32, i32)>(
+            "SELECT c.like_count, c.repost_count FROM post_counts c, ref_of($1) r WHERE r.coll = 1 AND c.author = r.author AND c.rkey = r.rkey",
+        )
+        .bind(uri)
+        .fetch_optional(p)
+        .await
+        .expect("count")
+    };
+    assert_eq!(count_of(liked.clone()).await, Some((1, 0)));
+    assert_eq!(count_of(by_alias.clone()).await, Some((0, 1)));
+    assert_eq!(count_of(kept.clone()).await, Some((1, 0)));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM post_counts").fetch_one(p).await.expect("rows");
+    assert_eq!(rows, 3);
+    let actor: Vec<(String, i32, i32, i32)> = sqlx::query_as(
+        "SELECT d.did, c.followers_count, c.follows_count, c.posts_count FROM actor_counts c JOIN dids d ON d.id = c.id ORDER BY 1",
+    )
+    .fetch_all(p)
+    .await
+    .expect("actor counts");
+    assert_eq!(actor, [(C.to_string(), 3, 2, 1)], "an account that is not a valid DID is dropped");
+
+    // The new triggers: a like counts by account, a follow and a reply
+    // count, and an odd row's texts go with it.
+    let id = |did: &'static str| async move { sqlx::query_scalar::<_, i32>("SELECT id FROM dids WHERE did = $1").bind(did).fetch_one(p).await.expect("id") };
+    let (a, b, c) = (id(A).await, id(B).await, id(C).await);
+    let liked_rkey = rkey_value("3myp5txuf7s2d").expect("tid");
+    sqlx::query("INSERT INTO likes (author, rkey, subj_author, subj_coll, subj_rkey, rev, created_at) VALUES ($1, 1, $2, 1, $3, 0, now())")
+        .bind(c)
+        .bind(b)
+        .bind(liked_rkey)
+        .execute(p)
+        .await
+        .expect("new like");
+    assert_eq!(count_of(liked.clone()).await, Some((2, 0)));
+    // A like of a list with the post's key leaves the post's count alone.
+    sqlx::query("INSERT INTO likes (author, rkey, subj_author, subj_coll, subj_rkey, rev, created_at) VALUES ($1, 2, $2, 7, $3, 0, now())")
+        .bind(c)
+        .bind(b)
+        .bind(liked_rkey)
+        .execute(p)
+        .await
+        .expect("like of a list");
+    sqlx::query("INSERT INTO likes (author, rkey, subj_author, subj_coll, subj_rkey, rev, created_at) VALUES ($1, 3, $2, 7, $3, 0, now())")
+        .bind(a)
+        .bind(b)
+        .bind(liked_rkey)
+        .execute(p)
+        .await
+        .expect("another like of a list");
+    assert_eq!(count_of(liked.clone()).await, Some((2, 0)));
+    sqlx::query("INSERT INTO follows (author, rkey, subject, rev, created_at) VALUES ($1, 1, $2, 0, now())").bind(a).bind(c).execute(p).await.expect("follow");
+    let followers: i32 = sqlx::query_scalar("SELECT followers_count FROM actor_counts WHERE id = $1").bind(c).fetch_one(p).await.expect("followers");
+    assert_eq!(followers, 4);
+    sqlx::query(
+        "INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at, reply_parent_uri, reply_root_uri) \
+         VALUES ($1, $2, '3myp5txuf7s2k', 'c', '3myp5txuf7s2k', '{}'::jsonb, now(), $3, $3)",
+    )
+    .bind(format!("at://{A}/app.bsky.feed.post/3myp5txuf7s2k"))
+    .bind(A)
+    .bind(&liked)
+    .execute(p)
+    .await
+    .expect("reply");
+    let replies: i32 = sqlx::query_scalar("SELECT reply_count FROM post_counts WHERE author = $1 AND rkey = $2").bind(b).bind(liked_rkey).fetch_one(p).await.expect("replies");
+    assert_eq!(replies, 1);
+    let posts: i32 = sqlx::query_scalar("SELECT posts_count FROM actor_counts WHERE id = $1").bind(a).fetch_one(p).await.expect("posts");
+    assert_eq!(posts, 1);
+    sqlx::query("DELETE FROM likes WHERE subj_coll = 0").execute(p).await.expect("delete odd");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM odd_refs").fetch_one(p).await.expect("odd left");
+    assert_eq!(left, 0, "odd texts go with their rows");
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn aliases_are_per_author_and_negative() {
     let Some(db) = fresh_db("compact_aliases").await else { return };

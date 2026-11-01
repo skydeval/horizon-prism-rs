@@ -2712,12 +2712,20 @@ fn judged_feed(rows: Vec<FeedRow>) -> Vec<(FeedCandidate, bool)> {
 /// is a member, and no block stands between that author and the requester.
 fn repost_item() -> String {
     format!(
-        "rp.subject_uri LIKE 'at://%/tools.kryphocron.feed.postPrivate/%' \
-         AND EXISTS (SELECT 1 FROM members m WHERE m.did = rp.author_did) \
+        "rp.subj_coll = 27 \
+         AND EXISTS (SELECT 1 FROM members m WHERE m.did = rpa.did) \
          AND NOT {blocked}",
-        blocked = blocked("$1", "rp.author_did")
+        blocked = blocked("$1", "rpa.did")
     )
 }
+
+/// The repost arms' rows: a repost `rp` with its author's DID row `rpa`
+/// and the private post `p` it reposts, joined on the post's key.
+const REPOST_ARM_FROM: &str = "reposts rp JOIN dids rpa ON rpa.id = rp.author \
+     JOIN private_posts p ON p.uri = at_uri(rp.subj_author, rp.subj_coll, rp.subj_rkey)";
+
+/// A repost's URI text, rebuilt from its key: the repost arms' tie key.
+const REPOST_URI: &str = "at_uri(rp.author, 3::smallint, rp.rkey)";
 
 /// `$1` does not fully mute `did` (an SQL expression), directly or through
 /// a moderation list that applies, as on the public timeline.
@@ -2782,11 +2790,11 @@ pub(super) fn author_statement(filter: AuthorFilter, cap: u32) -> String {
         format!(
             "{posts} \
              UNION ALL \
-             (SELECT {COLS}, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
-              FROM reposts rp JOIN private_posts p ON p.uri = rp.subject_uri \
-              WHERE rp.author_did = $2 AND {repost} \
-                AND ($3::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
-              ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $5) \
+             (SELECT {COLS}, rp.created_at, {REPOST_URI} COLLATE \"C\", {REPOST_URI}, rpa.did \
+              FROM {REPOST_ARM_FROM} \
+              WHERE rp.author = (SELECT x.id FROM dids x WHERE x.did = $2) AND {repost} \
+                AND ($3::timestamptz IS NULL OR (rp.created_at, {REPOST_URI} COLLATE \"C\") < ($3, $4 COLLATE \"C\")) \
+              ORDER BY rp.created_at DESC, {REPOST_URI} COLLATE \"C\" DESC LIMIT $5) \
              ORDER BY created_at DESC, key DESC LIMIT $5",
             posts = posts(cond),
             repost = repost_item(),
@@ -2848,17 +2856,17 @@ pub(super) fn timeline_statement(cap: u32) -> String {
             AND ($2::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
           ORDER BY p.created_at DESC, p.uri COLLATE \"C\" DESC LIMIT $4) \
          UNION ALL \
-         (SELECT {COLS}, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
-          FROM reposts rp JOIN private_posts p ON p.uri = rp.subject_uri \
-          WHERE (rp.author_did = $1 OR rp.author_did IN (SELECT fs.did FROM follows f JOIN dids fs ON fs.id = f.subject \
-                                                         WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = $1))) \
+         (SELECT {COLS}, rp.created_at, {REPOST_URI} COLLATE \"C\", {REPOST_URI}, rpa.did \
+          FROM {REPOST_ARM_FROM} \
+          WHERE (rp.author = (SELECT fa.id FROM dids fa WHERE fa.did = $1) \
+                 OR rp.author IN (SELECT f.subject FROM follows f WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = $1))) \
             AND {repost} AND {reposter_muted} \
-            AND ($2::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
-          ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $4) \
+            AND ($2::timestamptz IS NULL OR (rp.created_at, {REPOST_URI} COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
+          ORDER BY rp.created_at DESC, {REPOST_URI} COLLATE \"C\" DESC LIMIT $4) \
          ORDER BY created_at DESC, key DESC LIMIT $4",
         post_muted = not_muted("p.author_did"),
         repost = repost_item(),
-        reposter_muted = not_muted("rp.author_did"),
+        reposter_muted = not_muted("rpa.did"),
     );
     walked(&c, "", &feed_final(), cap)
 }
@@ -2923,14 +2931,22 @@ impl Interaction {
             Self::Repost => "reposts",
         }
     }
+
+    /// The collection id of the table's own records.
+    fn coll(self) -> i16 {
+        match self {
+            Self::Like => 2,
+            Self::Repost => 3,
+        }
+    }
 }
 
-/// An interaction row `l` that counts for the reader `$1`: by a member,
-/// with no block either way with the reader (§3.4, C-2).
+/// An interaction row `l`, with its author's DID row `la`, that counts for
+/// the reader `$1`: by a member, with no block either way with the reader.
 fn counted_interaction() -> String {
     format!(
-        "EXISTS (SELECT 1 FROM members m WHERE m.did = l.author_did) AND NOT {blocked}",
-        blocked = blocked("$1", "l.author_did")
+        "EXISTS (SELECT 1 FROM members m WHERE m.did = la.did) AND NOT {blocked}",
+        blocked = blocked("$1", "la.did")
     )
 }
 
@@ -3001,8 +3017,12 @@ pub(super) async fn counts_sliced(
         out.entry(uri).or_default().reply = n;
     }
     for kind in [Interaction::Like, Interaction::Repost] {
+        // Each URI read as its subject's key; a private post's URI is whole.
         let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
-            "SELECT l.subject_uri, count(DISTINCT l.author_did) FROM {table} l WHERE l.subject_uri = ANY($2) AND {counted} GROUP BY l.subject_uri",
+            "SELECT u.uri, count(DISTINCT l.author) FROM unnest($2::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) s \
+             JOIN {table} l ON l.subj_author = s.author AND l.subj_rkey = s.rkey AND l.subj_coll = s.coll \
+             JOIN dids la ON la.id = l.author \
+             WHERE {counted} GROUP BY u.uri",
             table = kind.table(),
             counted = counted_interaction(),
         ))
@@ -3157,10 +3177,13 @@ pub(super) async fn own_interactions(
     uris: &[String],
 ) -> Result<HashMap<String, String>, sqlx::Error> {
     let rows: Vec<(String, String)> = sqlx::query_as(&format!(
-        "SELECT DISTINCT ON (subject_uri) subject_uri, uri FROM {table} \
-         WHERE author_did = $1 AND subject_uri = ANY($2) \
-         ORDER BY subject_uri, created_at DESC, uri DESC",
-        table = kind.table()
+        "SELECT DISTINCT ON (u.uri) u.uri, at_uri(l.author, {coll}::smallint, l.rkey) \
+         FROM unnest($2::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) s \
+         JOIN {table} l ON l.author = (SELECT x.id FROM dids x WHERE x.did = $1) \
+           AND l.subj_author = s.author AND l.subj_rkey = s.rkey AND l.subj_coll = s.coll \
+         ORDER BY u.uri, l.created_at DESC, l.rkey DESC",
+        table = kind.table(),
+        coll = kind.coll(),
     ))
     .bind(viewer)
     .bind(uris)
@@ -3184,15 +3207,16 @@ pub(super) async fn muted_roots(pool: &PgPool, viewer: &str, roots: &[String]) -
 }
 
 /// A liker or reposter of a readable private post: `(author, created_at,
-/// indexed_at, uri)`.
+/// indexed_at, uri)`. The row's `indexed_at` is its `created_at`.
 pub(super) type InteractionRow = (String, DateTime<Utc>, DateTime<Utc>, String);
 
 /// An interaction row `l` that is its author's newest of its subject, so a
 /// listing shows each account once, as [`counts`] counts it (#727).
 fn newest_of_account(table: &str) -> String {
     format!(
-        "NOT EXISTS (SELECT 1 FROM {table} x WHERE x.subject_uri = l.subject_uri AND x.author_did = l.author_did \
-           AND (x.created_at, x.uri) > (l.created_at, l.uri))"
+        "NOT EXISTS (SELECT 1 FROM {table} x WHERE x.subj_author = l.subj_author AND x.subj_rkey = l.subj_rkey \
+           AND x.subj_coll = l.subj_coll AND x.author = l.author \
+           AND (x.created_at, x.rkey) > (l.created_at, l.rkey))"
     )
 }
 
@@ -3215,10 +3239,12 @@ pub(super) async fn interactions(
 ) -> Result<Vec<InteractionRow>, sqlx::Error> {
     let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
     sqlx::query_as(&format!(
-        "SELECT l.author_did, l.created_at, l.indexed_at, l.uri FROM {table} l \
-         WHERE l.subject_uri = $2 AND {counted} AND {newest} \
-           AND ($3::timestamptz IS NULL OR (l.created_at, l.uri) < ($3, $4)) \
-         ORDER BY l.created_at DESC, l.uri DESC LIMIT $5",
+        "SELECT la.did, l.created_at, l.created_at, {uri} FROM {table} l \
+         JOIN dids la ON la.id = l.author CROSS JOIN ref_of($2) s \
+         WHERE l.subj_author = s.author AND l.subj_rkey = s.rkey AND l.subj_coll = s.coll AND {counted} AND {newest} \
+           AND ($3::timestamptz IS NULL OR (l.created_at, {uri}) < ($3, $4)) \
+         ORDER BY l.created_at DESC, {uri} DESC LIMIT $5",
+        uri = format!("at_uri(l.author, {}::smallint, l.rkey)", kind.coll()),
         table = kind.table(),
         counted = counted_interaction(),
         newest = newest_of_account(kind.table()),
@@ -3485,13 +3511,24 @@ pub(super) async fn interaction_records(
     kind: Interaction,
     uris: &[String],
 ) -> Result<Vec<InteractionRecordRow>, sqlx::Error> {
-    sqlx::query_as(&format!(
-        "SELECT uri, subject_uri, subject_cid, created_at FROM {table} WHERE uri = ANY($1)",
-        table = kind.table()
+    // The row as stored: its subject CID is bytes.
+    type Stored = (String, String, Option<Vec<u8>>, DateTime<Utc>);
+    let rows: Vec<Stored> = sqlx::query_as(&format!(
+        "SELECT u.uri, COALESCE(ref_text(l.subj_author, l.subj_coll, l.subj_rkey, {coll}::smallint, l.author, l.rkey, 4::smallint), ''), \
+           l.subj_cid, l.created_at \
+         FROM unnest($1::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) r \
+         JOIN {table} l ON l.author = r.author AND l.rkey = r.rkey \
+         WHERE r.coll = {coll}",
+        table = kind.table(),
+        coll = kind.coll(),
     ))
     .bind(uris)
     .fetch_all(pool)
-    .await
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(uri, subject, cid, at)| (uri, subject, cid.as_deref().map(crate::db::ids::cid_from_db), at))
+        .collect())
 }
 
 /// When `did` last saw its private notifications.

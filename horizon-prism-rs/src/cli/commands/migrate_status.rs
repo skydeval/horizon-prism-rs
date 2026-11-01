@@ -143,6 +143,8 @@ mod tests {
             "0054_compact_ids",
             // Compact storage: follows and blocks.
             "0055_compact_follows_blocks",
+            // Compact storage: likes, reposts and the count tables.
+            "0056_compact_likes_reposts",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

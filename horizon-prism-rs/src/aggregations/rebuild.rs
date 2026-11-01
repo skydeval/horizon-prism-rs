@@ -217,10 +217,12 @@ impl Rebuild {
             let reply_cutoff = t0 - TimeDelta::days(i64::from(windows.reply_quote_days));
             let interacted: Vec<String> = sqlx::query_scalar(
                 "SELECT DISTINCT d FROM ( \
-                   SELECT split_part(l.subject_uri, '/', 3) AS d FROM likes l JOIN members m ON m.did = l.author_did \
-                     WHERE $1 AND l.created_at >= $2 AND l.subject_uri LIKE 'at://%' \
-                   UNION ALL SELECT split_part(r.subject_uri, '/', 3) FROM reposts r JOIN members m ON m.did = r.author_did \
-                     WHERE $1 AND r.created_at >= $2 AND r.subject_uri LIKE 'at://%' \
+                   SELECT sd.did AS d FROM likes l JOIN dids la ON la.id = l.author JOIN members m ON m.did = la.did \
+                     JOIN dids sd ON sd.id = l.subj_author \
+                     WHERE $1 AND l.created_at >= $2 \
+                   UNION ALL SELECT sd.did FROM reposts r JOIN dids ra ON ra.id = r.author JOIN members m ON m.did = ra.did \
+                     JOIN dids sd ON sd.id = r.subj_author \
+                     WHERE $1 AND r.created_at >= $2 \
                    UNION ALL SELECT x FROM member_post_refs p JOIN members m ON m.did = p.author_did, \
                      LATERAL unnest(ARRAY[p.reply_parent_did, p.reply_root_did, p.quote_did]) x \
                      WHERE $3 AND p.created_at >= $4 \
@@ -678,23 +680,26 @@ pub async fn repair_counts(pool: &PgPool) -> Result<(), sqlx::Error> {
         .await?;
     sqlx::query("DELETE FROM post_counts").execute(&mut *tx).await?;
     sqlx::query(
-        "INSERT INTO post_counts (post_uri, like_count, repost_count, reply_count, quote_count) \
-         SELECT u, sum(l)::int, sum(r)::int, sum(p)::int, sum(q)::int FROM ( \
-           SELECT subject_uri AS u, count(DISTINCT author_did) AS l, 0 AS r, 0 AS p, 0 AS q FROM likes GROUP BY subject_uri \
-           UNION ALL SELECT subject_uri, 0, count(DISTINCT author_did), 0, 0 FROM reposts GROUP BY subject_uri \
-           UNION ALL SELECT reply_parent_uri, 0, 0, 1, 0 FROM posts WHERE reply_parent_uri IS NOT NULL \
-           UNION ALL SELECT quote_uri, 0, 0, 0, 1 FROM posts WHERE quote_uri IS NOT NULL \
-         ) t GROUP BY u",
+        "INSERT INTO post_counts (author, rkey, like_count, repost_count, reply_count, quote_count) \
+         SELECT a, k, sum(l)::int, sum(r)::int, sum(p)::int, sum(q)::int FROM ( \
+           SELECT subj_author AS a, subj_rkey AS k, count(DISTINCT author) AS l, 0 AS r, 0 AS p, 0 AS q FROM likes \
+             WHERE subj_coll = 1 GROUP BY 1, 2 \
+           UNION ALL SELECT subj_author, subj_rkey, 0, count(DISTINCT author), 0, 0 FROM reposts WHERE subj_coll = 1 GROUP BY 1, 2 \
+           UNION ALL SELECT r.author, r.rkey, 0, 0, 1, 0 FROM posts x CROSS JOIN LATERAL ref_of(x.reply_parent_uri) r \
+             WHERE x.reply_parent_uri IS NOT NULL AND r.coll = 1 \
+           UNION ALL SELECT r.author, r.rkey, 0, 0, 0, 1 FROM posts x CROSS JOIN LATERAL ref_of(x.quote_uri) r \
+             WHERE x.quote_uri IS NOT NULL AND r.coll = 1 \
+         ) t GROUP BY a, k",
     )
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM actor_counts").execute(&mut *tx).await?;
     sqlx::query(
-        "INSERT INTO actor_counts (did, followers_count, follows_count, posts_count) \
+        "INSERT INTO actor_counts (id, followers_count, follows_count, posts_count) \
          SELECT d, sum(fr)::int, sum(fs)::int, sum(p)::int FROM ( \
-           SELECT s.did AS d, 1 AS fr, 0 AS fs, 0 AS p FROM follows f JOIN dids s ON s.id = f.subject \
-           UNION ALL SELECT a.did, 0, 1, 0 FROM follows f JOIN dids a ON a.id = f.author \
-           UNION ALL SELECT author_did, 0, 0, 1 FROM posts \
+           SELECT subject AS d, 1 AS fr, 0 AS fs, 0 AS p FROM follows \
+           UNION ALL SELECT author, 0, 1, 0 FROM follows \
+           UNION ALL SELECT a.id, 0, 0, 1 FROM posts x JOIN dids a ON a.did = x.author_did \
          ) t GROUP BY d",
     )
     .execute(&mut *tx)
@@ -727,9 +732,7 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        exec(p, "INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES \
-                 ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.like/1', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', \
-                  'at://did:plc:cccccccccccccccccccccccc/app.bsky.feed.post/1', '3k', now())").await;
+        crate::test_support::interactions::like(p, MEMBER, "1", &format!("at://{LIKED}/app.bsky.feed.post/1")).await;
         exec(p, "UPDATE post_counts SET like_count = 99").await;
         for d in [MEMBER, FOLLOWED, LIKED] {
             exec(p, &format!("INSERT INTO scope_dids (did, reasons) VALUES ('{d}', 1)")).await;
@@ -737,12 +740,8 @@ mod tests {
         let scope = ScopeState::new(crate::aggregations::ScopeSets::default(), crate::config::ScopePolicy::MembersAndOneHop, 10);
         let rebuild = Rebuild::new(p.clone(), scope, Arc::new(crate::private_tier::DisabledPrivateTier), 0);
         rebuild.repair_counts().await.expect("repair");
-        let likes: i32 = sqlx::query_scalar("SELECT like_count FROM post_counts WHERE post_uri = $1")
-            .bind(format!("at://{LIKED}/app.bsky.feed.post/1"))
-            .fetch_one(p)
-            .await
-            .expect("post_counts");
-        assert_eq!(likes, 1);
+        let likes = crate::test_support::interactions::post_counts(p, &format!("at://{LIKED}/app.bsky.feed.post/1")).await.map(|c| c.0);
+        assert_eq!(likes, Some(1));
         assert_eq!(rebuild.enqueue_stale_resyncs().await.expect("resync"), 3);
         db.drop_db().await;
     }

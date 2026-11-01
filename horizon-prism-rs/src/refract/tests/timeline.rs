@@ -67,7 +67,7 @@ async fn t12_timeline() {
     let to_other = post(p, R1, "3kreplyother", "reply", Some(&theirs), Some(&theirs)).await;
     let to_self = post(p, R1, "3kreplyself", "self reply", Some(&top), Some(&top)).await;
     let r2_post = post(p, R2, "3kr2", "unfollowed", None, None).await;
-    exec(p, &format!("INSERT INTO reposts (uri, author_did, subject_uri, rev, created_at) VALUES ('at://{R1}/app.bsky.feed.repost/3krp', '{R1}', '{r2_post}', '3k', now())")).await;
+    crate::test_support::interactions::repost(p, R1, "3krp", &r2_post).await;
     let h = hydrator_with(p, sets(), Arc::new(FixedUpstream::default()));
     let got = timeline(&h).await;
     assert!(got.contains(&top) && got.contains(&to_self), "{got:?}");
@@ -201,7 +201,8 @@ async fn rf_s7_other_accounts_replies() {
     let root = format!("at://{OTHER}/app.bsky.feed.post/3kroot");
     let a = post(p, R1, "3ka", "replied to", Some(&root), Some(&root)).await;
     let b = post(p, R2, "3kb", "no replies", Some(&root), Some(&root)).await;
-    exec(p, &format!("INSERT INTO post_counts (post_uri, reply_count) VALUES ('{a}', 4), ('{b}', 0)")).await;
+    crate::test_support::interactions::set_post_counts(p, &a, (0, 0, 4, 0)).await;
+    crate::test_support::interactions::set_post_counts(p, &b, (0, 0, 0, 0)).await;
     let (ok, forged, hidden, blocked, unasked) = (kid("kidone"), kid("kidtwo"), kid("kidthree"), kid("kidfour"), kid("kidfive"));
     let uri = |d: &str| format!("at://{d}/app.bsky.feed.post/3kchild");
     let mut up = FixedUpstream::default();

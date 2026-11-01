@@ -109,17 +109,22 @@ impl Hydrator {
         let mut remote = self.constellation_counts(req, first, CountMode::Sync { started }).await;
         remote.extend(self.constellation_counts(req, rest, CountMode::List).await);
         // By account, and the viewer's newest like, as for posts (#727).
-        let local: HashMap<String, i64> =
-            sqlx::query_as("SELECT subject_uri, count(DISTINCT author_did) FROM likes WHERE subject_uri = ANY($1) GROUP BY subject_uri")
-                .bind(&shown_uris)
-                .fetch_all(self.pool())
-                .await?
-                .into_iter()
-                .collect();
+        let local: HashMap<String, i64> = sqlx::query_as(
+            "SELECT u.uri, count(DISTINCT l.author) FROM unnest($1::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) s \
+             JOIN likes l ON l.subj_author = s.author AND l.subj_rkey = s.rkey AND l.subj_coll = s.coll GROUP BY u.uri",
+        )
+        .bind(&shown_uris)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .collect();
         let mine: HashMap<String, String> = match viewer.state_did() {
             Some(me) => sqlx::query_as(
-                "SELECT DISTINCT ON (subject_uri) subject_uri, uri FROM likes WHERE author_did = $1 AND subject_uri = ANY($2) \
-                 ORDER BY subject_uri, created_at DESC, uri DESC",
+                "SELECT DISTINCT ON (u.uri) u.uri, at_uri(l.author, 2::smallint, l.rkey) \
+                 FROM unnest($2::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) s \
+                 JOIN likes l ON l.subj_author = s.author AND l.subj_rkey = s.rkey AND l.subj_coll = s.coll \
+                 WHERE l.author = (SELECT id FROM dids WHERE did = $1) \
+                 ORDER BY u.uri, l.created_at DESC, l.rkey DESC",
             )
             .bind(me)
             .bind(&shown_uris)
@@ -189,10 +194,8 @@ mod tests {
             "INSERT INTO labeler_services (uri, creator_did, cid, rev, policies, reason_types, record, created_at) VALUES \
              ('at://{LOCAL}/{NSID_SERVICE}/self', '{LOCAL}', 'bafylocal', '3k', '{policies}', '[\"com.atproto.moderation.defs#reasonSpam\"]', '{{}}', now())"
         )).await;
-        exec(p, &format!(
-            "INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES \
-             ('at://{ME}/app.bsky.feed.like/1', '{ME}', 'at://{LOCAL}/{NSID_SERVICE}/self', 'bafylocal', '3k', now())"
-        )).await;
+        let service = format!("at://{LOCAL}/{NSID_SERVICE}/self");
+        crate::test_support::interactions::Interaction::like(ME, "1", &service).cid("bafylocal").put(p).await;
         let mut up = FixedUpstream::default();
         up.records.insert(
             service_uri(FAR),

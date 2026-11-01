@@ -232,9 +232,11 @@ impl Hydrator {
         }
         // The posts that carry a candidate tag, by authors that count.
         let subjects = format!(
-            "SELECT t.tag, p.uri, p.author_did, p.created_at FROM unnest($1::text[]) AS t(tag) \
+            "SELECT t.tag, p.uri, p.author_did, p.created_at, pd.id AS author_id, \
+               COALESCE(rkey_to_bigint(p.rkey), (SELECT x.id FROM rkey_aliases x WHERE x.author = pd.id AND x.rkey = p.rkey)) AS rkey_id \
+             FROM unnest($1::text[]) AS t(tag) \
              JOIN posts p ON p.tags @> ARRAY[t.tag] AND p.created_at >= now() - make_interval(hours => $2 + $3) \
-             JOIN actors a ON a.did = p.author_did WHERE {}",
+             JOIN actors a ON a.did = p.author_did LEFT JOIN dids pd ON pd.did = p.author_did WHERE {}",
             eligible(None)
         );
         let counted = format!(
@@ -243,10 +245,11 @@ impl Hydrator {
         );
         // Engagement made in the window, on a post made at most the
         // lookback before it.
-        let engagement = |table: &str, subject: &str| {
+        // `on` joins the engagement row `e` to its subject post `s`.
+        let engagement = |table: &str, on: &str| {
             format!(
                 "SELECT s.tag, s.author_did, date_trunc('hour', e.created_at, 'UTC') AS hour FROM subj s \
-                 JOIN {table} e ON e.{subject} = s.uri \
+                 JOIN {table} e ON {on} \
                  WHERE e.created_at >= now() - make_interval(hours => $2) \
                    AND e.created_at <= s.created_at + make_interval(hours => $3)"
             )
@@ -254,9 +257,9 @@ impl Hydrator {
         let series = format!(
             "WITH subj AS ({subjects}), ev AS ({} UNION ALL {} UNION ALL {}) \
              SELECT tag, author_did, hour, count(*) FROM ev GROUP BY tag, author_did, hour",
-            engagement("likes", "subject_uri"),
-            engagement("reposts", "subject_uri"),
-            engagement("posts", "reply_parent_uri"),
+            engagement("likes", "e.subj_author = s.author_id AND e.subj_rkey = s.rkey_id AND e.subj_coll = 1"),
+            engagement("reposts", "e.subj_author = s.author_id AND e.subj_rkey = s.rkey_id AND e.subj_coll = 1"),
+            engagement("posts", "e.reply_parent_uri = s.uri"),
         );
         let mut tx = self.pool().begin().await?;
         set_timeout(&mut tx, cfg.refresh_timeout_ms).await?;
@@ -423,9 +426,7 @@ mod tests {
             sqlx::query("UPDATE posts SET tags = ARRAY[$2] WHERE uri = $1").bind(&uri).bind(tag).execute(p).await.expect("tag");
             uris.entry(tag).or_default().push(uri);
         }
-        let like = |n: usize, subject: &str| {
-            format!("INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES ('at://{c}/app.bsky.feed.like/{n}', '{c}', '{subject}', 'bafy', '3k', now())")
-        };
+        let like = |n: usize, subject: &str| crate::test_support::interactions::row_sql("likes", &c, &n.to_string(), subject, "now()");
         for n in 0..6 {
             exec(p, &like(n, &uris["rust"][n % 3])).await;
         }

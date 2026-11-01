@@ -80,7 +80,7 @@ async fn world(p: &sqlx::PgPool) -> Hydrator {
             ),
         )
         .await;
-        exec(p, &format!("INSERT INTO actor_counts (did, followers_count, follows_count, posts_count) VALUES ('{did}', 5, 6, 7)")).await;
+        crate::test_support::interactions::set_actor_counts(p, did, (5, 6, 7)).await;
     }
     // As the identity refresher stores a class-M author: its PDS, then its
     // handle once checked.

@@ -272,6 +272,24 @@ fn scoped(
     }
 }
 
+/// [`scoped`] for a table keyed by ids: `keys` are its key columns, `from`
+/// the table aliased `alias` with the `dids` joins that `did_col` and
+/// `pred` name. The DID is `$1`.
+fn scoped_ids(table: &'static str, keys: &[&str], alias: &str, from: &str, did_col: &str, pred: &str) -> Step {
+    let selected: Vec<String> = keys.iter().map(|k| format!("{alias}.{k}")).collect();
+    Step {
+        table,
+        sql: format!(
+            "DELETE FROM {table} WHERE ({}) IN (SELECT {} FROM {from} \
+             WHERE {did_col} = $1 AND {pred} LIMIT {BATCH_SIZE})",
+            keys.join(", "),
+            selected.join(", ")
+        ),
+        candidates: Some(format!("SELECT DISTINCT {did_col} AS did FROM {from} WHERE {pred} LIMIT {CANDIDATE_PAGE}")),
+        bind: Bind::None,
+    }
+}
+
 /// [`scoped`] for `follows` or `blocks`, keyed by `(author, rkey)`. Rows name
 /// their accounts by id: `<alias>a` and `<alias>s` are the author's and the
 /// subject's `dids` rows, which `pred` names. The DID is `$1`.
@@ -279,15 +297,20 @@ fn scoped_graph(table: &'static str, alias: &str, pred: &str) -> Step {
     let from = format!(
         "{table} {alias} JOIN dids {alias}a ON {alias}a.id = {alias}.author JOIN dids {alias}s ON {alias}s.id = {alias}.subject"
     );
-    Step {
-        table,
-        sql: format!(
-            "DELETE FROM {table} WHERE (author, rkey) IN (SELECT {alias}.author, {alias}.rkey FROM {from} \
-             WHERE {alias}a.did = $1 AND {pred} LIMIT {BATCH_SIZE})"
-        ),
-        candidates: Some(format!("SELECT DISTINCT {alias}a.did AS did FROM {from} WHERE {pred} LIMIT {CANDIDATE_PAGE}")),
-        bind: Bind::None,
-    }
+    scoped_ids(table, &["author", "rkey"], alias, &from, &format!("{alias}a.did"), pred)
+}
+
+/// [`scoped`] for `likes` or `reposts`, keyed by `(author, rkey)`;
+/// `<alias>a` is the author's `dids` row, which `pred` names. The DID is
+/// `$1`.
+fn scoped_interaction(table: &'static str, alias: &str, pred: &str) -> Step {
+    let from = format!("{table} {alias} JOIN dids {alias}a ON {alias}a.id = {alias}.author");
+    scoped_ids(table, &["author", "rkey"], alias, &from, &format!("{alias}a.did"), pred)
+}
+
+/// The DID of an id column.
+fn did_of(col: &str) -> String {
+    format!("(SELECT dx.did FROM dids dx WHERE dx.id = {col})")
 }
 
 /// Class S / M deletes (§4.4 retention predicates), in dependency order:
@@ -298,7 +321,7 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
         author_of("p.reply_root_uri"),
         author_of("p.quote_uri"),
     ]);
-    let subject_member = |alias: &str| member_among(&[author_of(&format!("{alias}.subject_uri"))]);
+    let subject_member = |alias: &str| member_among(&[did_of(&format!("{alias}.subj_author"))]);
     let mut steps = vec![
         scoped(
             "posts",
@@ -308,23 +331,13 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             &format!("{} AND NOT {post_member_exception}", out_and_not_r("p.author_did")),
             Bind::None,
         ),
-        scoped(
-            "likes",
-            "uri",
-            "l",
-            "l.author_did",
-            &format!("{} AND NOT {}", out_and_not_r("l.author_did"), subject_member("l")),
-            Bind::None,
-        ),
-        scoped(
+        scoped_interaction("likes", "l", &format!("{} AND NOT {}", out_and_not_r("la.did"), subject_member("l"))),
+        scoped_interaction(
             "reposts",
-            "uri",
             "r",
-            "r.author_did",
             // A repost of an R author's post is kept whoever wrote it
             // (refract-reposts design §4).
-            &format!("{} AND NOT {} AND {}", out_and_not_r("r.author_did"), subject_member("r"), not_in_r(&author_of("r.subject_uri"))),
-            Bind::None,
+            &format!("{} AND NOT {} AND {}", out_and_not_r("ra.did"), subject_member("r"), not_in_r(&did_of("r.subj_author"))),
         ),
         scoped_graph(
             "follows",
@@ -356,19 +369,19 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
         ),
         // Derived: counts for posts whose author left scope and that no
         // remaining interaction row references.
-        scoped(
+        scoped_ids(
             "post_counts",
-            "post_uri",
+            &["author", "rkey"],
             "pc",
-            "split_part(pc.post_uri, '/', 3)",
+            "post_counts pc JOIN dids pca ON pca.id = pc.author",
+            "pca.did",
             &format!(
-                "{} AND NOT EXISTS (SELECT 1 FROM likes x WHERE x.subject_uri = pc.post_uri) \
-                 AND NOT EXISTS (SELECT 1 FROM reposts x WHERE x.subject_uri = pc.post_uri) \
-                 AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.reply_parent_uri = pc.post_uri) \
-                 AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.quote_uri = pc.post_uri)",
-                out_and_not_r(&author_of("pc.post_uri"))
+                "{} AND NOT EXISTS (SELECT 1 FROM likes x WHERE x.subj_author = pc.author AND x.subj_rkey = pc.rkey AND x.subj_coll = 1) \
+                 AND NOT EXISTS (SELECT 1 FROM reposts x WHERE x.subj_author = pc.author AND x.subj_rkey = pc.rkey AND x.subj_coll = 1) \
+                 AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.reply_parent_uri = at_uri(pc.author, 1::smallint, pc.rkey)) \
+                 AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.quote_uri = at_uri(pc.author, 1::smallint, pc.rkey))",
+                out_and_not_r("pca.did")
             ),
-            Bind::None,
         ),
         // Identity rows: out of scope, not a member, and no class-M row
         // authored by the DID remains in any table.
@@ -380,8 +393,8 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             &format!(
                 "{} AND NOT {} \
                  AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.author_did = a.did) \
-                 AND NOT EXISTS (SELECT 1 FROM likes x WHERE x.author_did = a.did) \
-                 AND NOT EXISTS (SELECT 1 FROM reposts x WHERE x.author_did = a.did) \
+                 AND NOT EXISTS (SELECT 1 FROM likes x JOIN dids xd ON xd.id = x.author WHERE xd.did = a.did) \
+                 AND NOT EXISTS (SELECT 1 FROM reposts x JOIN dids xd ON xd.id = x.author WHERE xd.did = a.did) \
                  AND NOT EXISTS (SELECT 1 FROM follows x JOIN dids xd ON xd.id = x.author WHERE xd.did = a.did) \
                  AND NOT EXISTS (SELECT 1 FROM blocks x JOIN dids xd ON xd.id = x.author WHERE xd.did = a.did) \
                  AND NOT (a.did = ANY($1::text[]))",
@@ -391,16 +404,16 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             Bind::Dids(private_row_authors),
         ),
         // actor_counts (class S) follow their identity row.
-        scoped(
+        scoped_ids(
             "actor_counts",
-            "did",
+            &["id"],
             "ac",
-            "ac.did",
+            "actor_counts ac JOIN dids acd ON acd.id = ac.id",
+            "acd.did",
             &format!(
-                "{} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.did = ac.did)",
-                out_and_not_r("ac.did")
+                "{} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.did = acd.did)",
+                out_and_not_r("acd.did")
             ),
-            Bind::None,
         ),
     ];
     // The v3 record tables are content: after `feed_items`, before the
@@ -569,26 +582,26 @@ fn age_cap_steps(max_age_days: u32) -> Vec<Step> {
             ),
             Bind::Days(days),
         ),
-        batched(
+        batched_composite(
             "likes",
-            "uri",
+            &["author", "rkey"],
             "l",
             &format!(
                 "l.created_at < now() - make_interval(days => $1) AND {} AND NOT {}",
-                unprotected("l.author_did"),
-                member_among(&[author_of("l.subject_uri")])
+                unprotected(&did_of("l.author")),
+                member_among(&[did_of("l.subj_author")])
             ),
             Bind::Days(days),
         ),
-        batched(
+        batched_composite(
             "reposts",
-            "uri",
+            &["author", "rkey"],
             "r",
             &format!(
                 "r.created_at < now() - make_interval(days => $1) AND {} AND NOT {} AND {}",
-                unprotected("r.author_did"),
-                member_among(&[author_of("r.subject_uri")]),
-                not_in_r(&author_of("r.subject_uri"))
+                unprotected(&did_of("r.author")),
+                member_among(&[did_of("r.subj_author")]),
+                not_in_r(&did_of("r.subj_author"))
             ),
             Bind::Days(days),
         ),
@@ -967,7 +980,7 @@ mod tests {
         assert!(sql("posts").contains("split_part(p.reply_parent_uri, '/', 3)"));
         assert!(sql("posts").contains("split_part(p.reply_root_uri, '/', 3)"));
         assert!(sql("posts").contains("split_part(p.quote_uri, '/', 3)"));
-        assert!(sql("likes").contains("split_part(l.subject_uri, '/', 3)"));
+        assert!(sql("likes").contains("m.did IN ((SELECT dx.did FROM dids dx WHERE dx.id = l.subj_author))"));
         assert!(sql("follows").contains("m.did IN (fs.did)"));
         // Rule M (member-blocks-only design §8): blocks and list blocks by
         // member side, not by scope.
@@ -1120,7 +1133,8 @@ mod tests {
         let sql = |t: &str| steps.iter().find(|s| s.table == t).map(|s| s.sql.clone()).unwrap_or_default();
         assert!(sql("posts").contains("WHERE p.author_did = $1 AND "));
         assert!(sql("feed_items").contains("WHERE fi.originator_did = $1 AND "));
-        assert!(sql("post_counts").contains("WHERE split_part(pc.post_uri, '/', 3) = $1 AND "));
+        assert!(sql("post_counts").contains("WHERE pca.did = $1 AND "));
+        assert!(sql("likes").contains("WHERE la.did = $1 AND "));
         assert!(sql("blocks").contains("WHERE ba.did = $1 AND "));
         // actors binds a DID array first.
         assert!(sql("actors").contains("WHERE a.did = $2 AND "));
@@ -1397,13 +1411,16 @@ mod tests {
         for did in [r, other] {
             for sql in [
                 format!("INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at) VALUES ('at://{did}/app.bsky.feed.post/3k', '{did}', '3k', 'c', '3k', '{{}}'::jsonb, '2020-01-01')"),
-                format!("INSERT INTO likes (uri, author_did, subject_uri, rev, created_at) VALUES ('at://{did}/app.bsky.feed.like/3k', '{did}', 'at://did:plc:zzzz/app.bsky.feed.post/1', '3k', '2020-01-01')"),
-                format!("INSERT INTO post_counts (post_uri) VALUES ('at://{did}/app.bsky.feed.post/3k')"),
+                crate::test_support::interactions::post_counts_sql(&format!("at://{did}/app.bsky.feed.post/3k"), 0, 0, 0, 0),
                 format!("INSERT INTO actors (did) VALUES ('{did}')"),
             ] {
                 sqlx::query(&sql).execute(p).await.expect("seed");
             }
             crate::test_support::graph::Edge::follow(did, "did:plc:zzzz", "3k")
+                .at(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).single().expect("time"))
+                .put(p)
+                .await;
+            crate::test_support::interactions::Interaction::like(did, "3k", "at://did:plc:zzzz/app.bsky.feed.post/1")
                 .at(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).single().expect("time"))
                 .put(p)
                 .await;
@@ -1418,7 +1435,8 @@ mod tests {
         };
         let rows = |did: &'static str| async move {
             let mut n = 0i64;
-            for t in ["posts", "likes", "actors"] {
+            n += crate::test_support::interactions::count_by(p, "likes", did).await;
+            for t in ["posts", "actors"] {
                 let col = if t == "actors" { "did" } else { "author_did" };
                 n += sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {t} WHERE {col} = $1")).bind(did).fetch_one(p).await.expect("count");
             }
@@ -1427,7 +1445,11 @@ mod tests {
                 .fetch_one(p)
                 .await
                 .expect("count");
-            n += sqlx::query_scalar::<_, i64>("SELECT count(*) FROM post_counts WHERE split_part(post_uri, '/', 3) = $1").bind(did).fetch_one(p).await.expect("count");
+            n += sqlx::query_scalar::<_, i64>("SELECT count(*) FROM post_counts WHERE author = (SELECT id FROM dids WHERE did = $1)")
+                .bind(did)
+                .fetch_one(p)
+                .await
+                .expect("count");
             n
         };
         run().await;
