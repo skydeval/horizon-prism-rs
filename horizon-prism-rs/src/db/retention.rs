@@ -540,7 +540,7 @@ fn age_cap_steps(max_age_days: u32) -> Vec<Step> {
         format!(
             "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = {col}) \
              AND NOT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN members m ON m.did = fa.did \
-                             JOIN dids fs ON fs.id = f.subject WHERE fs.did = {col}) \
+                             WHERE f.subject = (SELECT fs.id FROM dids fs WHERE fs.did = {col})) \
              AND {}",
             not_in_r(col)
         )

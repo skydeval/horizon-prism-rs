@@ -246,21 +246,25 @@ fn owner_follows(owner: &str, subject: &str) -> String {
 }
 
 /// A stored follow by `author` of `subject` (SQL expressions of DID text).
-/// `follows` holds account ids, so both sides go through `dids`. The
-/// aliases are this builder's own, so callers' expressions never name them.
+/// `follows` holds account ids, so each side's id is looked up on its own
+/// and the pair probed by key. Joined to `dids` instead, a check inside an
+/// `OR` can be planned as a hashed subplan over every follow. The aliases
+/// are this builder's own, so callers' expressions never name them.
 fn follow_edge(author: &str, subject: &str) -> String {
     format!(
-        "EXISTS (SELECT 1 FROM follows fo JOIN dids foa ON foa.id = fo.author JOIN dids fos ON fos.id = fo.subject \
-           WHERE foa.did = {author} AND fos.did = {subject})"
+        "EXISTS (SELECT 1 FROM follows fo \
+           WHERE fo.author = (SELECT foa.id FROM dids foa WHERE foa.did = {author}) \
+             AND fo.subject = (SELECT fos.id FROM dids fos WHERE fos.did = {subject}))"
     )
 }
 
 /// A stored direct block by `author` of `subject` (SQL expressions of DID
-/// text), through `dids` as [`follow_edge`].
+/// text), by key as [`follow_edge`].
 fn block_edge(author: &str, subject: &str) -> String {
     format!(
-        "EXISTS (SELECT 1 FROM blocks bk JOIN dids bka ON bka.id = bk.author JOIN dids bks ON bks.id = bk.subject \
-           WHERE bka.did = {author} AND bks.did = {subject})"
+        "EXISTS (SELECT 1 FROM blocks bk \
+           WHERE bk.author = (SELECT bka.id FROM dids bka WHERE bka.did = {author}) \
+             AND bk.subject = (SELECT bks.id FROM dids bks WHERE bks.did = {subject}))"
     )
 }
 
@@ -2461,11 +2465,11 @@ pub(super) async fn fanout_candidates(
            AND EXISTS (SELECT 1 FROM scope_dids sd WHERE sd.did = $1) \
            AND EXISTS (SELECT 1 FROM sync_state y WHERE y.did = $1 AND y.last_resync_at IS NOT NULL) \
            AND d.allow IN ('followers', 'mutuals') \
-           AND EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
-                       WHERE fa.did = s.subscriber_did AND fs.did = $1) \
+           AND EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = s.subscriber_did) \
+                       AND f.subject = (SELECT fs.id FROM dids fs WHERE fs.did = $1)) \
            AND (d.allow <> 'mutuals' \
-                OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
-                           WHERE fa.did = $1 AND fs.did = s.subscriber_did)) \
+                OR EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = $1) \
+                           AND f.subject = (SELECT fs.id FROM dids fs WHERE fs.did = s.subscriber_did))) \
            AND NOT EXISTS (SELECT 1 FROM private_notifications n \
                            WHERE n.recipient_did = s.subscriber_did AND n.record_uri = $2) \
            AND NOT EXISTS (SELECT 1 FROM thread_mutes t \
@@ -3363,8 +3367,8 @@ pub(super) const PREFERRED: &str = "CASE \
           -> (CASE n.reason WHEN 'subscribed-post' THEN 'subscribedPost' ELSE n.reason END)) ->> 'list') = 'false' THEN false \
    WHEN (((SELECT q.prefs FROM private_notification_prefs q WHERE q.did = $1) \
           -> (CASE n.reason WHEN 'subscribed-post' THEN 'subscribedPost' ELSE n.reason END)) ->> 'include') = 'follows' \
-     THEN EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
-                  WHERE fa.did = $1 AND fs.did = n.author_did) \
+     THEN EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = $1) \
+                  AND f.subject = (SELECT fs.id FROM dids fs WHERE fs.did = n.author_did)) \
    ELSE true END";
 
 /// The recipient `$1`'s `push` preference passes the row `n`: not

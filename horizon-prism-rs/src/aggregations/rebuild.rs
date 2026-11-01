@@ -246,8 +246,8 @@ impl Rebuild {
             let subscribed: Vec<String> = sqlx::query_scalar(
                 "SELECT DISTINCT a.subject_did FROM activity_subscriptions a \
                    JOIN members m ON m.did = a.subscriber_did \
-                  WHERE EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
-                                WHERE fa.did = a.subscriber_did AND fs.did = a.subject_did) \
+                  WHERE EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = a.subscriber_did) \
+                                AND f.subject = (SELECT fs.id FROM dids fs WHERE fs.did = a.subject_did)) \
                     AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = a.subject_did)",
             )
             .fetch_all(&self.pool)

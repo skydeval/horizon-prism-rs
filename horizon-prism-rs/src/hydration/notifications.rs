@@ -74,8 +74,8 @@ const EXCLUSIONS: &str = "NOT COALESCE(n.reason_subject LIKE 'at://%/tools.kryph
 fn preference_clause(hidden: usize, follows: usize) -> String {
     format!(
         "n.reason <> ALL(${hidden}::text[]) AND (n.reason <> ALL(${follows}::text[]) \
-           OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
-                      WHERE fa.did = $1 AND fs.did = n.author_did))"
+           OR EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = $1) \
+                      AND f.subject = (SELECT fs.id FROM dids fs WHERE fs.did = n.author_did)))"
     )
 }
 

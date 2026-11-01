@@ -45,8 +45,8 @@ pub const BATCH: i64 = 10_000;
 const SUBSCRIPTION_HOLDS: &str = "SELECT EXISTS (SELECT 1 FROM activity_subscriptions a \
      JOIN members m ON m.did = a.subscriber_did \
      WHERE a.subject_did = $1 \
-       AND EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
-                   WHERE fa.did = a.subscriber_did AND fs.did = $1))";
+       AND EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = a.subscriber_did) \
+                   AND f.subject = (SELECT fs.id FROM dids fs WHERE fs.did = $1)))";
 /// Re-attempt interval for a marker step blocked by a running purge.
 pub const OVERLAP_RETRY: Duration = Duration::from_secs(10);
 

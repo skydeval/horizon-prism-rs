@@ -3207,11 +3207,11 @@ async fn insert_subscribed_post(
            AND EXISTS (SELECT 1 FROM members m WHERE m.did = s.subscriber_did) \
            AND EXISTS (SELECT 1 FROM sync_state y WHERE y.did = $1 AND y.last_resync_at IS NOT NULL) \
            AND d.allow IN ('followers', 'mutuals') \
-           AND EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
-                       WHERE fa.did = s.subscriber_did AND fs.did = $1) \
+           AND EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = s.subscriber_did) \
+                       AND f.subject = (SELECT fs.id FROM dids fs WHERE fs.did = $1)) \
            AND (d.allow <> 'mutuals' \
-                OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
-                           WHERE fa.did = $1 AND fs.did = s.subscriber_did)) \
+                OR EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = $1) \
+                           AND f.subject = (SELECT fs.id FROM dids fs WHERE fs.did = s.subscriber_did))) \
            AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.recipient_did = s.subscriber_did AND n.record_uri = $2) \
            AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = s.subscriber_did AND t.root_uri IN ($2, $6::text)) \
          ON CONFLICT DO NOTHING",

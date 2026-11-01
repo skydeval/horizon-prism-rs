@@ -163,6 +163,9 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 - Authors' self-labels show on posts, profiles and cards.
 - Saving notification preferences while being removed no longer leaves them
   behind.
+- Kryphocron reads no longer slow down on the smaller follow and block
+  tables: their follow and block checks look up both accounts first, so an
+  author feed of kryphocron posts takes under 50 ms instead of about 1 s.
 
 ### Upgrade notes
 

@@ -2748,7 +2748,8 @@ async fn t44_the_following_facts_are_one_statement() {
         return;
     };
     let facts = schema::following_facts_statement();
-    assert_eq!(facts.matches("SELECT").count(), 5, "one SELECT of two EXISTS pairs: {facts}");
+    // One SELECT of two EXISTS pairs; each follow probe looks up its two ids.
+    assert_eq!(facts.matches("SELECT").count(), 9, "one SELECT of two EXISTS pairs: {facts}");
     assert!(!facts.contains(';'));
     let (aud, root) = h.alice_following("t44000").await;
     let list = h.audience(BOB, "3kaudt44001", "list").await;
