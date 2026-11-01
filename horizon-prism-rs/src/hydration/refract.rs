@@ -482,21 +482,25 @@ impl SearchKey {
     }
 }
 
-/// What a member's own tables drop from a Refract timeline, for the DID
-/// expression `d` (refract design §7.1 "Member-only data"): a full mute,
-/// a block either way, and the list mutes and list blocks that apply.
-fn timeline_excluded(d: &str) -> String {
-    format!(
-        "(EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = {d} AND m.scope = 'full') \
-          OR EXISTS (SELECT 1 FROM blocks b, dids x, dids y WHERE x.did = $1 AND y.did = {d} \
-                     AND ((b.author = x.id AND b.subject = y.id) OR (b.author = y.id AND b.subject = x.id))) \
-          OR EXISTS (SELECT 1 FROM list_references r \
-                     JOIN subscribed_lists l ON l.list_uri = r.list_uri \
-                     JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
-                     WHERE r.member_did = $1 AND i.subject_did = {d} \
-                       AND r.admitted AND r.effective AND l.state = 'active' AND l.purpose = 'app.bsky.graph.defs#modlist'))"
-    )
-}
+/// The accounts a member's own tables drop from a Refract timeline, as
+/// `dids` ids, built once per statement (`$1` the member): a full mute, a
+/// block either way, and the list mutes and list blocks that apply. `rm`
+/// and `qm` hold the accounts whose reposts or quotes the member mutes.
+const TIMELINE_EXCLUDED: &str = "me AS MATERIALIZED (SELECT id FROM dids WHERE did = $1), \
+     ex AS MATERIALIZED ( \
+       SELECT d.id FROM mutes m JOIN dids d ON d.did = m.subject_did WHERE m.viewer_did = $1 AND m.scope = 'full' \
+       UNION SELECT b.subject FROM blocks b WHERE b.author = (SELECT id FROM me) \
+       UNION SELECT b.author FROM blocks b WHERE b.subject = (SELECT id FROM me) \
+       UNION SELECT d.id FROM list_references r \
+         JOIN subscribed_lists l ON l.list_uri = r.list_uri \
+         JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
+         JOIN dids d ON d.did = i.subject_did \
+        WHERE r.member_did = $1 AND r.admitted AND r.effective AND l.state = 'active' \
+          AND l.purpose = 'app.bsky.graph.defs#modlist'), \
+     rm AS MATERIALIZED (SELECT d.id FROM mutes m JOIN dids d ON d.did = m.subject_did \
+       WHERE m.viewer_did = $1 AND m.scope IN ('reposts', 'reposts_and_quotes')), \
+     qm AS MATERIALIZED (SELECT d.id FROM mutes m JOIN dids d ON d.did = m.subject_did \
+       WHERE m.viewer_did = $1 AND m.scope IN ('quotes', 'reposts_and_quotes'))";
 
 /// The most replies `refract.getReplies` returns.
 pub const REPLIES_MAX: i64 = 200;
@@ -529,37 +533,52 @@ impl Hydrator {
     /// Database errors.
     pub async fn refract_timeline_items(&self, me: &str, restored: &[String], cursor: Option<&str>, limit: u32) -> Result<(Vec<FeedItem>, Option<String>), sqlx::Error> {
         let (at, after) = parse_local_cursor(cursor);
+        // The exclusions are id sets built once; each arm filters by them and
+        // takes its own page in the feed's order, after the cursor, so the
+        // union's page is exact. URIs are built for the page only.
+        let after_key = |at: &str, author: &str, coll: i16, rkey: &str| {
+            format!(
+                "($3::timestamptz IS NULL OR ({at}, {author}, {coll}::smallint, {rkey}) < ($3, \
+                   COALESCE((SELECT ck.author FROM ck), '-2147483648'::integer), \
+                   COALESCE((SELECT ck.coll FROM ck), '-32768'::smallint), \
+                   COALESCE((SELECT ck.rkey FROM ck), '-9223372036854775808'::bigint)))"
+            )
+        };
         let sql = format!(
-            "SELECT at_uri(t.author, t.coll, t.rkey) AS uri, od.did AS originator_did, t.post_uri, t.kind, t.sort_at FROM ( \
-               SELECT p.author, 1::smallint AS coll, p.rkey, at_uri(p.author, 1::smallint, p.rkey) AS post_uri, p.author AS post_author, \
-                 CASE WHEN p.parent_coll IS NULL THEN 'post' ELSE 'reply' END AS kind, p.created_at AS sort_at, \
-                 p.quote_coll IS NOT NULL AS quote \
-               FROM posts p WHERE p.author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) \
-                 AND EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND f.subject = p.author) \
-                 AND (p.parent_coll IS NULL \
-                      OR EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND f.subject = p.parent_author)) \
+            "WITH {TIMELINE_EXCLUDED}, \
+               rs AS MATERIALIZED (SELECT id FROM dids WHERE did = ANY($2)), \
+               fl AS MATERIALIZED (SELECT f.subject AS id FROM follows f WHERE f.author = (SELECT id FROM me)), \
+               ck AS MATERIALIZED (SELECT k.author, k.coll, k.rkey FROM ref_of($4) k) \
+             SELECT at_uri(z.author, z.coll, z.rkey) AS uri, od.did AS originator_did, \
+               CASE WHEN z.coll = 1 THEN at_uri(z.author, 1::smallint, z.rkey) \
+                    ELSE ref_text(z.s_author, z.s_coll, z.s_rkey, 3::smallint, z.author, z.rkey, 4::smallint) END AS post_uri, \
+               z.kind, z.sort_at \
+             FROM (SELECT u.* FROM ( \
+               (SELECT p.author, 1::smallint AS coll, p.rkey, p.author AS s_author, 1::smallint AS s_coll, p.rkey AS s_rkey, \
+                  CASE WHEN p.parent_coll IS NULL THEN 'post' ELSE 'reply' END AS kind, p.created_at AS sort_at \
+                FROM posts p \
+                WHERE p.author IN (SELECT id FROM rs) AND p.author IN (SELECT id FROM fl) \
+                  AND (p.parent_coll IS NULL OR p.parent_author IN (SELECT id FROM fl)) \
+                  AND NOT EXISTS (SELECT 1 FROM ex WHERE ex.id = p.author) \
+                  AND NOT (p.quote_coll IS NOT NULL AND EXISTS (SELECT 1 FROM qm WHERE qm.id = p.author)) \
+                  AND {} \
+                ORDER BY p.created_at DESC, p.author DESC, p.rkey DESC LIMIT $5) \
                UNION ALL \
-               SELECT r.author, 3::smallint, r.rkey, \
-                 ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint), r.subj_author, 'repost', r.created_at, false \
-               FROM reposts r \
-               WHERE (r.author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) \
-                      AND r.author IN (SELECT f.subject FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1))) \
-                  OR (r.subj_author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) AND r.subj_coll = 1 \
-                      AND (r.author = (SELECT id FROM dids WHERE did = $1) \
-                           OR r.author IN (SELECT f.subject FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1)))) \
-             ) t JOIN dids od ON od.id = t.author LEFT JOIN dids pd ON pd.id = t.post_author \
-             WHERE ($3::timestamptz IS NULL OR (t.sort_at, t.author, t.coll, t.rkey) < ($3, \
-                    COALESCE((SELECT k.author FROM ref_of($4) k), '-2147483648'::integer), \
-                    COALESCE((SELECT k.coll FROM ref_of($4) k), '-32768'::smallint), \
-                    COALESCE((SELECT k.rkey FROM ref_of($4) k), '-9223372036854775808'::bigint))) \
-               AND NOT {} AND NOT {} \
-               AND NOT (t.kind = 'repost' AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
-                        AND m.subject_did = od.did AND m.scope IN ('reposts', 'reposts_and_quotes'))) \
-               AND NOT (t.quote AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
-                        AND m.subject_did = od.did AND m.scope IN ('quotes', 'reposts_and_quotes'))) \
-             ORDER BY t.sort_at DESC, t.author DESC, t.coll DESC, t.rkey DESC LIMIT $5",
-            timeline_excluded("od.did"),
-            timeline_excluded("pd.did"),
+               (SELECT r.author, 3::smallint, r.rkey, r.subj_author, r.subj_coll, r.subj_rkey, 'repost', r.created_at \
+                FROM reposts r \
+                WHERE ((r.author IN (SELECT id FROM rs) AND r.author IN (SELECT id FROM fl)) \
+                       OR (r.subj_author IN (SELECT id FROM rs) AND r.subj_coll = 1 \
+                           AND (r.author = (SELECT id FROM me) OR r.author IN (SELECT id FROM fl)))) \
+                  AND NOT EXISTS (SELECT 1 FROM ex WHERE ex.id = r.author) \
+                  AND NOT EXISTS (SELECT 1 FROM ex WHERE ex.id = r.subj_author) \
+                  AND NOT EXISTS (SELECT 1 FROM rm WHERE rm.id = r.author) \
+                  AND {} \
+                ORDER BY r.created_at DESC, r.author DESC, r.rkey DESC LIMIT $5) \
+             ) u ORDER BY u.sort_at DESC, u.author DESC, u.coll DESC, u.rkey DESC LIMIT $5) z \
+             JOIN dids od ON od.id = z.author \
+             ORDER BY z.sort_at DESC, z.author DESC, z.coll DESC, z.rkey DESC",
+            after_key("p.created_at", "p.author", 1, "p.rkey"),
+            after_key("r.created_at", "r.author", 3, "r.rkey"),
         );
         let items: Vec<FeedItem> = sqlx::query_as(&sql)
             .bind(me)

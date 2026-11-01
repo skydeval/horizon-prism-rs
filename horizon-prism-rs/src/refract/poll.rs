@@ -210,9 +210,12 @@ impl Refract {
             return Ok(0);
         }
         let due: Vec<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT p.uri, r.read_at FROM (SELECT 'at://' || d.did || '/app.bsky.feed.post/' || bigint_to_rkey(x.rkey) AS uri \
+            // The reads go through a materialized scan so they are hashed
+            // once, not probed by text key for every stored post.
+            "WITH rd AS MATERIALIZED (SELECT uri, read_at FROM refract_record_reads) \
+             SELECT p.uri, r.read_at FROM (SELECT 'at://' || d.did || '/app.bsky.feed.post/' || bigint_to_rkey(x.rkey) AS uri \
                 FROM dids d JOIN posts x ON x.author = d.id WHERE d.did = ANY($1)) p \
-             LEFT JOIN refract_record_reads r ON r.uri = p.uri \
+             LEFT JOIN rd r ON r.uri = p.uri \
              WHERE r.read_at IS NULL OR r.read_at < now() - make_interval(hours => $2) \
              ORDER BY r.read_at NULLS FIRST LIMIT 25",
         )

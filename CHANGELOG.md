@@ -166,6 +166,9 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 - Kryphocron reads no longer slow down on the smaller follow and block
   tables: their follow and block checks look up both accounts first, so an
   author feed of kryphocron posts takes under 50 ms instead of about 1 s.
+- The Refract timeline builds the member's mutes and blocks once and takes
+  each part's page before merging, so a page takes about 0.1 s instead of
+  several seconds.
 
 ### Upgrade notes
 
