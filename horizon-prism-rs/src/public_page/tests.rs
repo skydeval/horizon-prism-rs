@@ -516,3 +516,21 @@ async fn the_favicon() {
     }
     assert!(render(&snapshot(), &PublicPageConfig::default()).contains(link));
 }
+
+/// The page keeps the device's font: its `<html>` carries no font class and
+/// it names no font file, though its policies, the admin's, allow fonts
+/// from this origin.
+#[tokio::test]
+async fn the_page_uses_no_web_font() {
+    let pool = lazy_pool();
+    let (state, _drainer) = app_state(&pool);
+    let base = serve_app(finalized(&state, Some(public(page_state(snapshot(), &PublicPageConfig::default(), RateLimits::new()))))).await;
+    let body = reqwest::get(format!("{base}/")).await.expect("get").text().await.expect("body");
+    let html = &body[body.find("<html").expect("html")..];
+    let html = &html[..html.find('>').expect("html end")];
+    assert_eq!(html, "<html lang=\"en\"");
+    assert!(!body.contains("/admin/static/fonts/") && !body.contains("font-"), "{body}");
+    assert_eq!(CSP, crate::admin::CSP);
+    assert_eq!(CSP_LIVE, crate::admin::CSP_LIVE);
+    assert!(CSP.contains("font-src 'self'") && CSP_LIVE.contains("font-src 'self'"));
+}

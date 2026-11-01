@@ -154,6 +154,8 @@ mod tests {
             "0059_compact_records",
             // Compact storage: actors.
             "0060_compact_actors",
+            // Each operator's admin font.
+            "0061_admin_font",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

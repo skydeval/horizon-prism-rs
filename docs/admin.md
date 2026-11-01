@@ -31,6 +31,7 @@ Behind a CDN, keep features that inject or rewrite scripts off for `/admin*`. Th
 | Farsight | Farsight's status (when configured). |
 | Communities, Refract | Refract (when used). |
 | Audit | Every change, who made it, how it ended, and sign-ins. |
+| Appearance | Light, dark or the device's mode, a colour scheme and a font, for your account only. |
 
 With `APP_SUPERVISED=1` (set in the shipped compose file), the UI can restart `app` to apply settings that need a restart.
 

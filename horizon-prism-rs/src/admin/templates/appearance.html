@@ -16,8 +16,12 @@ and it changes nothing for other operators or for this server. It is not recorde
 <legend>Colours</legend>
 {% for s in schemes %}<label class="choice"><input type="radio" name="scheme" value="{{ s.value }}"{% if s.checked %} checked{% endif %}><span class="swatch scheme-{{ s.value }}" aria-hidden="true"></span> {{ s.label }}</label>
 {% endfor %}</fieldset>
+<fieldset class="choices">
+<legend>Font</legend>
+{% for f in fonts %}<label class="choice font-sample font-{{ f.value }}"><input type="radio" name="font" value="{{ f.value }}"{% if f.checked %} checked{% endif %}> {{ f.label }}</label>
+{% endfor %}</fieldset>
 <p class="muted">"Same as the device" follows the light or dark setting of the device you use. Each colour scheme has
-a light and a dark form.</p>
+a light and a dark form. Each font is shown in its own face; the fonts are served by this server.</p>
 <div class="row"><button type="submit">Save</button></div>
 </form>
 </div>

@@ -1,6 +1,6 @@
-//! Appearance (`/admin/settings/appearance`, #810): the signed-in
-//! operator's own look of these pages, light, dark or the device's, and a
-//! colour scheme. Saved for that operator alone (`theme`), straight away:
+//! Appearance (`/admin/settings/appearance`): the signed-in operator's own
+//! look of these pages, light, dark or the device's, a colour scheme and a
+//! font. Saved for that operator alone (`theme`), straight away:
 //! no command, since it changes nothing about this server, and so not in
 //! the audit log. The form is checked like every other (session, CSRF
 //! token, `Origin`, the one-change-a-second limit).
@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use super::{Nav, css, message, render};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
-use crate::admin::theme::{self, Mode, Scheme, Theme};
+use crate::admin::theme::{self, Font, Mode, Scheme, Theme};
 
 /// A choice on the page.
 pub struct Choice {
@@ -34,6 +34,7 @@ struct AppearancePage {
     csrf: String,
     modes: Vec<Choice>,
     schemes: Vec<Choice>,
+    fonts: Vec<Choice>,
     saved: bool,
 }
 
@@ -64,6 +65,7 @@ pub async fn page(
             csrf: op.csrf.clone(),
             modes: Mode::ALL.into_iter().map(|m| Choice { value: m.as_str(), label: m.label(), checked: m == now.mode }).collect(),
             schemes: Scheme::ALL.into_iter().map(|s| Choice { value: s.as_str(), label: s.label(), checked: s == now.scheme }).collect(),
+            fonts: Font::ALL.into_iter().map(|f| Choice { value: f.as_str(), label: f.label(), checked: f == now.font }).collect(),
             saved: q.saved.as_deref() == Some("1"),
         },
     )
@@ -78,6 +80,9 @@ pub struct AppearanceForm {
     pub mode: String,
     #[serde(default)]
     pub scheme: String,
+    /// Absent on a form from before the font choice: the font stays.
+    #[serde(default)]
+    pub font: Option<String>,
 }
 
 /// `POST /admin/settings/appearance`: save the operator's choice.
@@ -91,7 +96,11 @@ pub async fn save(
         Ok(op) => op,
         Err(response) => return response,
     };
-    let (Some(mode), Some(scheme)) = (Mode::parse(&form.mode), Scheme::parse(&form.scheme)) else {
+    let font = match form.font.as_deref() {
+        None => Some(op.theme.font),
+        Some(name) => Font::parse(name),
+    };
+    let (Some(mode), Some(scheme), Some(font)) = (Mode::parse(&form.mode), Scheme::parse(&form.scheme), font) else {
         return message(
             &state,
             Some(Nav::new(&op, "settings")),
@@ -101,10 +110,10 @@ pub async fn save(
             Some(("/admin/settings/appearance", "Appearance")),
         );
     };
-    let chosen = Theme { mode, scheme };
+    let chosen = Theme { mode, scheme, font };
     match theme::save(&state.pool, &op.did, chosen).await {
         Ok(_) => {
-            tracing::info!(event = "admin_appearance_saved", did = %op.did, mode = mode.as_str(), scheme = scheme.as_str(), "an operator changed their admin appearance");
+            tracing::info!(event = "admin_appearance_saved", did = %op.did, mode = mode.as_str(), scheme = scheme.as_str(), font = font.as_str(), "an operator changed their admin appearance");
             Redirect::to("/admin/settings/appearance?saved=1").into_response()
         }
         Err(error) => super::internal_error(&state, &error),

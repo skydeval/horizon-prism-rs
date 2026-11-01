@@ -565,14 +565,14 @@ pub async fn require(
     let did = session.did;
     // The handle, and the operator's own look, which every page carries
     // (a watching reload included, so it never draws in the default).
-    let row: Option<(Option<String>, String, String)> = sqlx::query_as(
-        "SELECT a.handle, o.theme_mode, o.theme_scheme FROM admin_operators o LEFT JOIN dids ad ON ad.did = o.did LEFT JOIN actors a ON a.id = ad.id WHERE o.did = $1",
+    let row: Option<(Option<String>, String, String, String)> = sqlx::query_as(
+        "SELECT a.handle, o.theme_mode, o.theme_scheme, o.theme_font FROM admin_operators o LEFT JOIN dids ad ON ad.did = o.did LEFT JOIN actors a ON a.id = ad.id WHERE o.did = $1",
     )
     .bind(&did)
     .fetch_optional(&state.pool)
     .await
     .map_err(internal)?;
-    let (handle, theme) = row.map_or((None, Theme::default()), |(h, mode, scheme)| (h, Theme::from_stored(&mode, &scheme)));
+    let (handle, theme) = row.map_or((None, Theme::default()), |(h, mode, scheme, font)| (h, Theme::from_stored(&mode, &scheme, &font)));
     // Watching needs no banners.
     let banners = if need == Need::Poll { Banners::default() } else { banners(state).await.map_err(internal)? };
     Ok(Operator { did, handle, csrf, banners, theme })

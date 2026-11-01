@@ -11,6 +11,12 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Added
 
+- **Admin fonts.** Appearance offers Atkinson Hyperlegible (default), the
+  device's font or IBM Plex. **Upgrade:** start once with
+  `APP_ALLOW_STARTUP_MIGRATE=1` (migration 0061). **Going back** to an
+  earlier release needs the database restored from before the upgrade, or
+  the 0061 row removed from `_sqlx_migrations` and
+  `admin_operators.theme_font` dropped.
 - **Compact storage groundwork.** Shared account ids, a fixed collection
   list and record-key, reference and record codecs, for the smaller storage
   layout coming in the next releases. Nothing is stored differently yet.

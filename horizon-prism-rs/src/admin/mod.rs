@@ -22,6 +22,7 @@
 //! same code as the CLI's. Reads query the database directly.
 
 pub mod auth;
+pub mod fonts;
 pub mod health;
 pub mod lexicons;
 pub mod live;
@@ -77,12 +78,11 @@ pub static JS_HREF: LazyLock<String> =
 
 /// The `Content-Security-Policy` of every `/admin` response (§3) but
 /// Home's.
-pub const CSP: &str =
-    "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+pub const CSP: &str = "default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 /// Home's policy (admin-ui-live-feed design §8): its one script and its
 /// stream, from this origin only.
-pub const CSP_LIVE: &str = "default-src 'none'; style-src 'self'; img-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+pub const CSP_LIVE: &str = "default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 /// Every `/admin` response's `Cache-Control` unless its handler set one.
 pub const NO_STORE: &str = "no-store, no-transform";
@@ -313,6 +313,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/tiles", route(get(pages::home::tiles)))
         .route("/live", route(get(live::stream::open)))
         .route("/static/{file}", route(get(static_file)))
+        .route("/static/fonts/{file}", route(get(fonts::serve)))
         .route("/setup", route(get(pages::setup::form).post(pages::setup::submit)))
         .route("/login", route(get(pages::login::form).post(pages::login::submit)))
         .route("/logout", route(post(pages::login::logout)))

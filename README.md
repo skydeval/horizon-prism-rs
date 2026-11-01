@@ -64,3 +64,5 @@ In active development. Expect schema migrations and config changes between versi
 ## License
 
 [MPL-2.0](LICENSE).
+
+The admin UI's bundled fonts (Atkinson Hyperlegible, JetBrains Mono, IBM Plex Sans and IBM Plex Mono) are under the SIL Open Font License 1.1; each licence file sits beside them in `horizon-prism-rs/src/admin/static/fonts/`.
