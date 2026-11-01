@@ -198,9 +198,9 @@ async fn a3_timeline_reposts_of_restored_posts() {
         actor(p, did, handle, handle).await;
     }
     for did in [STRANGER, GHOST, UNFOLLOWED] {
-        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{MEMBER}/app.bsky.graph.follow/{}', '{MEMBER}', '{did}', '3k', now())", &did[8..20])).await;
+        crate::test_support::graph::follow(p, MEMBER, did, &did[8..20]).await;
     }
-    exec(p, &format!("DELETE FROM follows WHERE subject_did = '{UNFOLLOWED}'")).await;
+    exec(p, &format!("DELETE FROM follows WHERE subject = (SELECT id FROM dids WHERE did = '{UNFOLLOWED}')")).await;
     let restored_post = post(p, R1, "3krpost", "restored", None, None).await;
     let other_post = format!("at://{OTHER}/app.bsky.feed.post/3kother");
     insert_repost(p, STRANGER, "3ka", &restored_post, "2026-10-20T00:00:00Z").await;

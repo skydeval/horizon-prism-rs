@@ -221,8 +221,10 @@ impl Judge {
         // The third column names the list for a list block, and is NULL for
         // a direct one.
         let rows: Vec<(String, bool, Option<String>)> = sqlx::query_as(&format!(
-            "SELECT subject_did, true, NULL::text FROM blocks WHERE author_did = $1 AND subject_did = ANY($2) \
-             UNION ALL SELECT author_did, false, NULL::text FROM blocks WHERE subject_did = $1 AND author_did = ANY($2) \
+            "SELECT bs.did, true, NULL::text FROM blocks b JOIN dids ba ON ba.id = b.author JOIN dids bs ON bs.id = b.subject \
+               WHERE ba.did = $1 AND bs.did = ANY($2) \
+             UNION ALL SELECT ba.did, false, NULL::text FROM blocks b JOIN dids ba ON ba.id = b.author JOIN dids bs ON bs.id = b.subject \
+               WHERE bs.did = $1 AND ba.did = ANY($2) \
              UNION ALL SELECT i.subject_did, true, r.list_uri FROM list_references r \
                JOIN subscribed_lists l ON l.list_uri = r.list_uri \
                JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
@@ -456,13 +458,7 @@ mod tests {
         fake.blockers.lock().expect("blockers").insert(A.to_string());
         // The viewer blocks C directly; D blocks the viewer.
         for (author, subject, rkey) in [(V, C, "1"), (D, V, "2")] {
-            sqlx::query("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, '3k', now())")
-                .bind(format!("at://{author}/app.bsky.graph.block/{rkey}"))
-                .bind(author)
-                .bind(subject)
-                .execute(p)
-                .await
-                .expect("block");
+            crate::test_support::graph::block(p, author, subject, rkey).await;
         }
         let cfg = ThreadLensConfig { verdict_max_dids: 2, ..ThreadLensConfig::default() };
         let lookup = || Some(farsight.request(&Requester::new(ChargeKey::member(V))));

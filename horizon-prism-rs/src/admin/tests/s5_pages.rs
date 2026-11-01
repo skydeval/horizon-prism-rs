@@ -356,13 +356,7 @@ async fn look_up() {
     sqlx::query("INSERT INTO sync_state (did) VALUES ($1)").bind(BOB).execute(p).await.expect("sync");
     sqlx::query("INSERT INTO backfill_jobs (did, depth, state, attempts, last_error) VALUES ($1, 'member', 'failed', 3, 'repo unavailable')").bind(BOB).execute(p).await.expect("job");
     sqlx::query("INSERT INTO labels (subject, val) VALUES ($1, 'porn')").bind(format!("at://{BOB}/app.bsky.feed.post/3kp")).execute(p).await.expect("label");
-    sqlx::query("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, '3k', now())")
-        .bind(format!("at://{BOB}/app.bsky.graph.block/3kb"))
-        .bind(BOB)
-        .bind(CAROL)
-        .execute(p)
-        .await
-        .expect("block");
+    crate::test_support::graph::block(p, BOB, CAROL, "3kb").await;
     {
         let mut sets = h.scope.write_guard().await;
         sets.members.insert(BOB.to_string());

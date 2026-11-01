@@ -190,10 +190,10 @@ impl Change {
             Self::OwnerBlocksReader => exec(pool, &block_sql(ALICE, DAVE)).await,
             Self::OwnerRemovesReader => w.edit_audience("3kaudmain222", "list", &[BOB, CAROL], REV2).await,
             Self::OwnerChangesMode => w.edit_audience("3kaudmain222", "list", &[BOB, CAROL], REV2).await,
-            Self::ReaderUnfollowsOwner => exec(pool, &format!("DELETE FROM follows WHERE author_did = '{DAVE}' AND subject_did = '{ALICE}'")).await,
-            Self::OwnerUnfollowsReader => exec(pool, &format!("DELETE FROM follows WHERE author_did = '{ALICE}' AND subject_did = '{DAVE}'")).await,
+            Self::ReaderUnfollowsOwner => exec(pool, &super::graph_delete_sql("follows", DAVE, Some(ALICE))).await,
+            Self::OwnerUnfollowsReader => exec(pool, &super::graph_delete_sql("follows", ALICE, Some(DAVE))).await,
             Self::ChainAuthorBlocksReader => exec(pool, &block_sql(CAROL, DAVE)).await,
-            Self::ChainAuthorUnfollowsOwner => exec(pool, &format!("DELETE FROM follows WHERE author_did = '{CAROL}' AND subject_did = '{ALICE}'")).await,
+            Self::ChainAuthorUnfollowsOwner => exec(pool, &super::graph_delete_sql("follows", CAROL, Some(ALICE))).await,
             Self::ChainAuthorDeletesRow => {
                 let rkey = chain_row.rsplit('/').next().expect("rkey");
                 w.f.apply_op(CAROL, Action::Delete, NSID_POST_PRIVATE, rkey, REV2, None).await;
@@ -358,7 +358,7 @@ async fn tdm3b_the_snapshot_follows_step_3_prime() {
         w.check(!got, "the block the snapshot holds denies the read".to_string());
         w.check(counted.outcome("hit") == hits && counted.outcome("fallback_behind") == behind, "a denial, not a fallback miss".to_string());
     }
-    exec(&w.f.pool, &format!("DELETE FROM blocks WHERE author_did = '{CAROL}'")).await;
+    exec(&w.f.pool, &super::graph_delete_sql("blocks", CAROL, None)).await;
     w.check(served(&s.on, DAVE, &p).await, "P is served again".to_string());
 
     // A chain row outside the climb: Bob's reply Q to a post X that is not

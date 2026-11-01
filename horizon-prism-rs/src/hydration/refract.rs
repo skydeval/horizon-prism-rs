@@ -478,7 +478,8 @@ impl SearchKey {
 fn timeline_excluded(d: &str) -> String {
     format!(
         "(EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = {d} AND m.scope = 'full') \
-          OR EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = {d}) OR (b.author_did = {d} AND b.subject_did = $1)) \
+          OR EXISTS (SELECT 1 FROM blocks b, dids x, dids y WHERE x.did = $1 AND y.did = {d} \
+                     AND ((b.author = x.id AND b.subject = y.id) OR (b.author = y.id AND b.subject = x.id))) \
           OR EXISTS (SELECT 1 FROM list_references r \
                      JOIN subscribed_lists l ON l.list_uri = r.list_uri \
                      JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
@@ -524,15 +525,15 @@ impl Hydrator {
                  CASE WHEN p.reply_parent_uri IS NULL THEN 'post' ELSE 'reply' END AS kind, p.created_at AS sort_at, \
                  p.quote_uri IS NOT NULL AS quote \
                FROM posts p WHERE p.author_did = ANY($2) \
-                 AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = p.author_did) \
+                 AND EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = p.author_did) \
                  AND (p.reply_parent_uri IS NULL \
-                      OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = split_part(p.reply_parent_uri, '/', 3))) \
+                      OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = split_part(p.reply_parent_uri, '/', 3))) \
                UNION ALL \
                SELECT r.uri, r.author_did, r.subject_uri, 'repost', r.created_at, false FROM reposts r \
                WHERE (r.author_did = ANY($2) \
-                      AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = r.author_did)) \
+                      AND EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = r.author_did)) \
                   OR (split_part(r.subject_uri, '/', 3) = ANY($2) AND split_part(r.subject_uri, '/', 4) = 'app.bsky.feed.post' \
-                      AND (r.author_did = $1 OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = r.author_did))) \
+                      AND (r.author_did = $1 OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = r.author_did))) \
              ) t WHERE ($3::timestamptz IS NULL OR (t.sort_at, t.uri) < ($3, $4)) \
                AND NOT {} AND NOT {} \
                AND NOT (t.kind = 'repost' AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
@@ -696,7 +697,7 @@ impl Hydrator {
     /// server that ignored the filter.
     async fn refract_follows(&self, req: &Requester, follower: &str, subject: &str, local: bool) -> Result<Option<bool>, sqlx::Error> {
         if local {
-            let found: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+            let found: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = $2)")
                 .bind(follower)
                 .bind(subject)
                 .fetch_one(self.pool())

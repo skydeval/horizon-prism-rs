@@ -255,8 +255,8 @@ fn operators(query: &str) -> Result<Operators, ViewError> {
 pub(super) fn viewer_exclusions() -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did AND m.scope = 'full') \
-         AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = n.author_did) \
-                         OR (b.author_did = n.author_did AND b.subject_did = $1)) \
+         AND NOT EXISTS (SELECT 1 FROM blocks b, dids x, dids y WHERE x.did = $1 AND y.did = n.author_did \
+                         AND ((b.author = x.id AND b.subject = y.id) OR (b.author = y.id AND b.subject = x.id))) \
          AND NOT EXISTS (SELECT 1 FROM list_references r \
                          JOIN subscribed_lists l ON l.list_uri = r.list_uri \
                          JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
@@ -334,7 +334,10 @@ impl Plan {
                     qb.push("n.reply_parent_uri IS NULL");
                 }
                 Filter::Following => {
-                    qb.push("n.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)");
+                    qb.push(
+                        "n.author_did IN (SELECT fs.did FROM follows f JOIN dids fs ON fs.id = f.subject \
+                         WHERE f.author = (SELECT id FROM dids WHERE did = $1))",
+                    );
                 }
                 Filter::Nothing => {
                     qb.push("false");
@@ -826,7 +829,7 @@ mod tests {
         exec(p, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{ALICE}', '{CAROL}')")).await;
         let found = search(alice.clone(), params("rust")).await.expect("view");
         assert_eq!((uris(&found), &found["hitsTotal"]), (vec!["3ka".to_string(), "3kb".to_string(), "3kc".to_string()], &json!(3)));
-        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ALICE}/app.bsky.graph.follow/1', '{ALICE}', '{BOB}', '3k', now())")).await;
+        crate::test_support::graph::follow(p, ALICE, BOB, "1").await;
         assert_eq!(uris(&search(alice.clone(), v2(&|p| p.following = true)).await.expect("view")), ["3kb", "3kc"]);
 
         // Signed out, an author who asks not to be shown is left out.

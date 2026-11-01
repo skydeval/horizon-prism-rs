@@ -45,6 +45,10 @@ pub enum Key {
     Id,
     /// `tag_activity_hourly (tag, hour)`: `[tag, RFC 3339 hour in UTC]`.
     TagHour,
+    /// A record table keyed by ids, `(author, rkey)`: `[author, rkey]`, two
+    /// integers. A text cursor stored before the table moved to ids does not
+    /// decode, so the sweep starts that table again.
+    AuthorRkey,
 }
 
 /// One swept table (§7.2's table).
@@ -67,8 +71,9 @@ const AUTHOR_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE
      AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace'))";
 const CREATOR_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.creator_did) \
      AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.creator_did AND r.state IN ('restored', 'grace'))";
-const NO_MEMBER_END_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did OR m.did = t.subject_did) \
-     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace'))";
+// Follows name their accounts by id.
+const NO_MEMBER_END_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id IN (t.author, t.subject)) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace'))";
 // refract-reposts design §4: a repost whose subject's author is in R is
 // kept by the restored-subject rule, whoever wrote it.
 const REPOST_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did) \
@@ -107,7 +112,7 @@ pub const TABLES: [SweepTable; 18] = [
     table("list_optouts", URI, AUTHOR_NOT_MEMBER_NOR_R, 10_000),
     table("list_blocks", URI, AUTHOR_NOT_MEMBER, 10_000),
     // 5.
-    table("follows", URI, NO_MEMBER_END_NOR_R, 10_000),
+    table("follows", Key::AuthorRkey, NO_MEMBER_END_NOR_R, 10_000),
     // 6. Also removes the negative trend rows steps 2–3 created. The
     // counts of R's posts stay, as `load_posts` falls back to them.
     table("post_counts", Key::Text("post_uri"), POST_NOT_R, 10_000),
@@ -121,6 +126,7 @@ pub enum Cursor {
     Text(String),
     Id(i64),
     TagHour(String, DateTime<Utc>),
+    AuthorRkey(i32, i64),
 }
 
 impl Cursor {
@@ -131,6 +137,7 @@ impl Cursor {
             Self::Text(s) => json!(s),
             Self::Id(id) => json!(id),
             Self::TagHour(tag, hour) => json!([tag, rfc3339(hour)]),
+            Self::AuthorRkey(author, rkey) => json!([author, rkey]),
         }
     }
 
@@ -145,6 +152,9 @@ impl Cursor {
             (Key::Text(_), Value::String(s)) => Self::Text(s.clone()),
             (Key::Id, Value::Number(n)) => Self::Id(n.as_i64()?),
             (Key::TagHour, Value::Array(a)) if a.len() == 2 => Self::TagHour(a[0].as_str()?.to_string(), parse_ts(&a[1])?),
+            (Key::AuthorRkey, Value::Array(a)) if a.len() == 2 => {
+                Self::AuthorRkey(i32::try_from(a[0].as_i64()?).ok()?, a[1].as_i64()?)
+            }
             _ => return None,
         };
         Some(Some(cursor))
@@ -156,8 +166,16 @@ impl Cursor {
 pub fn valid_state(v: &Value) -> Option<SweepState> {
     let name = v.get("table")?.as_str()?;
     let table = TABLES.iter().find(|t| t.name == name)?;
-    let after = v.get("after").cloned().unwrap_or(Value::Null);
-    Cursor::from_json(table.key, &after)?;
+    let mut after = v.get("after").cloned().unwrap_or(Value::Null);
+    if Cursor::from_json(table.key, &after).is_none() {
+        // A text cursor of a table that moved to ids: that table starts
+        // again from its first key, which only deletes again what the
+        // predicate drops. Any other mismatch is not a valid state.
+        if table.key != Key::AuthorRkey {
+            return None;
+        }
+        after = Value::Null;
+    }
     let last_advanced_at = parse_ts(v.get("last_advanced_at")?)?;
     Some(SweepState { table: name.to_string(), after, last_advanced_at })
 }
@@ -168,6 +186,7 @@ enum Window {
     Text(Vec<String>),
     Id(Vec<i64>),
     TagHour(Vec<String>, Vec<DateTime<Utc>>),
+    AuthorRkey(Vec<i32>, Vec<i64>),
 }
 
 impl Window {
@@ -176,6 +195,7 @@ impl Window {
             Self::Text(keys) => keys.last().cloned().map(Cursor::Text),
             Self::Id(keys) => keys.last().copied().map(Cursor::Id),
             Self::TagHour(tags, hours) => tags.last().cloned().zip(hours.last().copied()).map(|(t, h)| Cursor::TagHour(t, h)),
+            Self::AuthorRkey(authors, rkeys) => authors.last().copied().zip(rkeys.last().copied()).map(|(a, k)| Cursor::AuthorRkey(a, k)),
         }
     }
 }
@@ -476,6 +496,25 @@ async fn select_window(conn: &mut PgConnection, t: &SweepTable, after: Option<&C
             let (tags, hours) = rows.into_iter().unzip();
             Window::TagHour(tags, hours)
         }
+        Key::AuthorRkey => {
+            let (author, rkey) = match after {
+                Some(Cursor::AuthorRkey(author, rkey)) => (Some(*author), Some(*rkey)),
+                _ => (None, None),
+            };
+            let rows: Vec<(i32, i64)> = sqlx::query_as(&format!(
+                "SELECT author, rkey FROM {name} \
+                 WHERE ($1::integer IS NULL OR (author, rkey) > ($1, $2::bigint)) \
+                 ORDER BY author, rkey LIMIT $3",
+                name = t.name
+            ))
+            .bind(author)
+            .bind(rkey)
+            .bind(limit)
+            .fetch_all(conn)
+            .await?;
+            let (authors, rkeys) = rows.into_iter().unzip();
+            Window::AuthorRkey(authors, rkeys)
+        }
     })
 }
 
@@ -503,6 +542,15 @@ async fn delete_window(conn: &mut PgConnection, t: &SweepTable, window: &Window)
             .execute(conn)
             .await?
         }
+        (Key::AuthorRkey, Window::AuthorRkey(authors, rkeys)) => {
+            sqlx::query(&format!(
+                "DELETE FROM {name} t WHERE (t.author, t.rkey) IN (SELECT * FROM unnest($1::integer[], $2::bigint[])) AND {pred}"
+            ))
+            .bind(authors)
+            .bind(rkeys)
+            .execute(conn)
+            .await?
+        }
         _ => unreachable!("a window has its table's key"),
     };
     Ok(result.rows_affected())
@@ -520,6 +568,7 @@ mod tests {
             (URI, Cursor::Text("at://did:plc:a/app.bsky.feed.like/1".into())),
             (Key::Id, Cursor::Id(42)),
             (Key::TagHour, Cursor::TagHour("rust".into(), hour)),
+            (Key::AuthorRkey, Cursor::AuthorRkey(7, -3)),
         ] {
             assert_eq!(Cursor::from_json(key, &cursor.to_json()), Some(Some(cursor)));
             assert_eq!(Cursor::from_json(key, &Value::Null), Some(None));
@@ -528,6 +577,17 @@ mod tests {
         assert_eq!(Cursor::from_json(Key::Id, &json!("7")), None);
         assert_eq!(Cursor::from_json(Key::TagHour, &json!(["rust"])), None);
         assert_eq!(Cursor::from_json(Key::TagHour, &json!(["rust", "yesterday"])), None);
+        // A follows cursor stored as a URI before the table moved to ids
+        // does not decode, so the sweep starts that table again.
+        assert_eq!(Cursor::from_json(Key::AuthorRkey, &json!("at://did:plc:a/app.bsky.graph.follow/1")), None);
+        let follows = TABLES.iter().find(|t| t.name == "follows").expect("follows");
+        assert_eq!(follows.key, Key::AuthorRkey);
+        let state = json!({"table": "follows", "after": "at://did:plc:a/app.bsky.graph.follow/1", "last_advanced_at": "2026-10-14T05:00:00Z"});
+        let restarted = valid_state(&state).expect("still a valid state");
+        assert_eq!((restarted.table.as_str(), &restarted.after), ("follows", &Value::Null));
+        // Any other table's mismatched cursor is still refused.
+        let likes = json!({"table": "likes", "after": 7, "last_advanced_at": "2026-10-14T05:00:00Z"});
+        assert!(valid_state(&likes).is_none());
     }
 
     #[test]

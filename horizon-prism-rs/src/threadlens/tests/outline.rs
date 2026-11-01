@@ -200,7 +200,7 @@ impl World {
         }
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{V}', 'admin', now())")).await;
         for (i, blocked) in [BLK, BLK2].into_iter().enumerate() {
-            exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{V}/app.bsky.graph.block/3kb{i}', '{V}', '{blocked}', '3kaaaaaaaaaa2', now())")).await;
+            crate::test_support::graph::block(p, V, blocked, &format!("3kb{i}")).await;
         }
         let conn = PgConnection::connect_with(&p.connect_options()).await.expect("connect");
         let sources = Arc::new(Sources::default());

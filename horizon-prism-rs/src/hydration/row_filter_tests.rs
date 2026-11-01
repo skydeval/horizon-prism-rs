@@ -129,7 +129,7 @@ async fn surfaces(h: &Hydrator, did: &str) -> Vec<(&'static str, String)> {
     out.push(("getMutes", masked(v.inner(), did)));
     h.set_mute(&me, &req, did, None).await.expect("db").expect("unmuted");
 
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ALICE}/app.bsky.graph.block/3kblock', '{ALICE}', '{did}', '3k', '2026-01-01T00:00:00Z')")).await;
+    crate::test_support::graph::Edge::block(ALICE, did, "3kblock").at("2026-01-01T00:00:00Z".parse().expect("time")).put(p).await;
     let v = h.get_blocks(&me, &req, 50, None).await.expect("db").expect("blocks");
     out.push(("getBlocks", masked(v.inner(), did)));
     exec(p, "DELETE FROM blocks").await;

@@ -29,7 +29,20 @@ pub const IDLE_POLL: Duration = Duration::from_secs(10);
 const POST_NAMES_MEMBER: &str = "EXISTS (SELECT 1 FROM members m WHERE m.did IN (split_part(t.reply_parent_uri, '/', 3), \
      split_part(t.reply_root_uri, '/', 3), split_part(t.quote_uri, '/', 3)))";
 const SUBJECT_AUTHOR_MEMBER: &str = "EXISTS (SELECT 1 FROM members m WHERE m.did = split_part(t.subject_uri, '/', 3))";
-const FOLLOWS_MEMBER: &str = "EXISTS (SELECT 1 FROM members m WHERE m.did = t.subject_did)";
+/// One batch of the DID's follows of non-members. Follows are keyed by ids
+/// and name their subject by id.
+async fn delete_follows(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "DELETE FROM follows WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM follows t JOIN dids ts ON ts.id = t.subject \
+         WHERE t.author = (SELECT id FROM dids WHERE did = $1) \
+           AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = ts.did) LIMIT {BATCH})"
+    );
+    let n = sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
+    if n > 0 {
+        metrics::counter!(METRIC_ROWS, "table" => "follows".to_string()).increment(n);
+    }
+    Ok(n)
+}
 
 async fn delete(conn: &mut PgConnection, table: &str, key: &str, predicate: &str, did: &str) -> Result<u64, sqlx::Error> {
     let sql = format!("DELETE FROM {table} WHERE {key} IN (SELECT {key} FROM {table} t WHERE {predicate} LIMIT {BATCH})");
@@ -63,7 +76,7 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
             ] {
                 n += delete(conn, table, "uri", &format!("t.{col} = $1"), did).await?;
             }
-            n += delete(conn, "follows", "uri", &format!("t.author_did = $1 AND NOT {FOLLOWS_MEMBER}"), did).await?;
+            n += delete_follows(conn, did).await?;
             if !in_s {
                 n += profile(conn, did).await?;
             }
@@ -73,7 +86,7 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
             for table in ["likes", "reposts"] {
                 n += delete(conn, table, "uri", &format!("t.author_did = $1 AND NOT {SUBJECT_AUTHOR_MEMBER}"), did).await?;
             }
-            n += delete(conn, "follows", "uri", &format!("t.author_did = $1 AND NOT {FOLLOWS_MEMBER}"), did).await?;
+            n += delete_follows(conn, did).await?;
             for (table, col) in [
                 ("lists", "creator_did"),
                 ("list_items", "author_did"),
@@ -117,7 +130,8 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
            WHEN 'app.bsky.feed.post' THEN EXISTS (SELECT 1 FROM posts x WHERE x.uri = t.record_uri) \
            WHEN 'app.bsky.feed.like' THEN EXISTS (SELECT 1 FROM likes x WHERE x.uri = t.record_uri) \
            WHEN 'app.bsky.feed.repost' THEN EXISTS (SELECT 1 FROM reposts x WHERE x.uri = t.record_uri) \
-           WHEN 'app.bsky.graph.follow' THEN EXISTS (SELECT 1 FROM follows x WHERE x.uri = t.record_uri) \
+           WHEN 'app.bsky.graph.follow' THEN EXISTS (SELECT 1 FROM follows x, ref_of(t.record_uri) r \
+                                                     WHERE x.author = r.author AND x.rkey = r.rkey AND r.coll = 4) \
            WHEN 'app.bsky.actor.profile' THEN EXISTS (SELECT 1 FROM actors x WHERE x.did = t.author_did AND x.profile_record IS NOT NULL) \
            ELSE true END",
         did,

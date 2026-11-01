@@ -518,7 +518,7 @@ impl Hydrator {
 
     /// Whether `follower` follows `subject`, from the stored `follows`.
     async fn lens_follows(&self, follower: &str, subject: &str) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = $2)")
             .bind(follower)
             .bind(subject)
             .fetch_one(self.pool())

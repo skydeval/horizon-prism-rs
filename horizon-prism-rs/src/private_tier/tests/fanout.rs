@@ -250,7 +250,7 @@ async fn t_as6_the_public_rules() {
         ),
         ("declaration none", BOB, declaration("none"), undeclare.clone(), false),
         ("declaration mutuals, no follow back", BOB, declaration("mutuals"), undeclare.clone(), false),
-        ("no declaration, no follow", BOB, format!("DELETE FROM follows WHERE author_did = '{BOB}'"), follow_sql(BOB, ALICE), false),
+        ("no declaration, no follow", BOB, super::graph_delete_sql("follows", BOB, None), follow_sql(BOB, ALICE), false),
         (
             "the author never backfilled",
             BOB,

@@ -925,7 +925,8 @@ impl Hydrator {
         let (at, after_uri) = parse_local_cursor(cursor);
         let items: Vec<FeedItem> = sqlx::query_as(
             "SELECT f.uri, f.originator_did, f.post_uri, f.kind, f.sort_at FROM feed_items f \
-             WHERE (f.originator_did = $1 OR f.originator_did IN (SELECT subject_did FROM follows WHERE author_did = $1)) \
+             WHERE (f.originator_did = $1 OR f.originator_did IN (SELECT fs.did FROM follows fo JOIN dids fs ON fs.id = fo.subject \
+                                                         WHERE fo.author = (SELECT id FROM dids WHERE did = $1))) \
                AND ($2::timestamptz IS NULL OR (f.sort_at, f.uri) < ($2, $3)) \
              ORDER BY f.sort_at DESC, f.uri DESC LIMIT $4",
         )
@@ -1586,7 +1587,7 @@ mod tests {
         let rest = h.get_actor_likes(&me, &req, ALICE, 1, Some(&cursor)).await.expect("db").expect("view");
         assert_eq!(uris(rest.inner()), std::slice::from_ref(&first));
         // A block with the author leaves the post out.
-        exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{BOB}/app.bsky.graph.block/1', '{BOB}', '{ALICE}', '3k', now())")).await;
+        crate::test_support::graph::block(p, BOB, ALICE, "1").await;
         let l = h.get_actor_likes(&me, &req, ALICE, 50, None).await.expect("db").expect("view");
         assert_eq!(l.inner()["feed"], json!([]));
         db.drop_db().await;
@@ -1850,8 +1851,7 @@ mod tests {
         let me = h.viewer(Some(ALICE)).await.expect("viewer");
         let tl = h.get_timeline(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(tl.inner()["feed"].as_array().map(Vec::len), Some(1));
-        exec(p, "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.follow/1', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '3k', now())").await;
+        crate::test_support::graph::follow(p, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "1").await;
         let tl = h.get_timeline(&me, &req,50, None).await.expect("db").expect("view");
         assert_eq!(tl.inner()["feed"].as_array().map(Vec::len), Some(2));
         // Muting Bob removes his items (and Alice's reply stays).

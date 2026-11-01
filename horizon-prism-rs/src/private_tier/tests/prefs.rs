@@ -172,7 +172,7 @@ async fn t_n2_follows_filters_at_read_time() {
     // She unfollows Carol and follows Dave: read again, with no write to
     // the notifications.
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM private_notifications").fetch_one(&f.pool).await.expect("rows");
-    exec(&f.pool, &format!("DELETE FROM follows WHERE author_did = '{ALICE}'")).await;
+    exec(&f.pool, &super::graph_delete_sql("follows", ALICE, None)).await;
     exec(&f.pool, &follow_sql(ALICE, DAVE)).await;
     assert_eq!(likes_by(&listed(&base, ALICE).await), BTreeSet::from([DAVE.to_string()]));
     assert_eq!(counted_every_way(&f, &base, ALICE).await, 7);

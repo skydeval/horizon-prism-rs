@@ -186,7 +186,7 @@ async fn t46(test: &str, public: PublicMode, layout: Layout) {
     // Under `followers` again, an unfollow does the same.
     w.move_root(&w.aud.clone(), REV3).await;
     w.expect("back under followers", DAVE, &rc, true).await;
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{CAROL}'")).await;
+    exec(&w.f.pool, &super::graph_delete_sql("follows", CAROL, None)).await;
     w.expect("Carol unfollows", DAVE, &rc, false).await;
     w.expect("Carol unfollows, below her", BOB, &rd, false).await;
     w.expect("Carol unfollows, her own", CAROL, &rc, true).await;
@@ -255,13 +255,13 @@ async fn t47(test: &str, public: PublicMode, layout: Layout) {
         }
     }
     // Read exactly while the writer stands.
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}'")).await;
+    exec(&w.f.pool, &super::graph_delete_sql("follows", BOB, None)).await;
     w.expect_paths("another owner audience, its writer not standing", DAVE, &cases[2].1, &probes[2].0, &probes[2].1, false).await;
     exec(&w.f.pool, &follow_sql(BOB, ALICE)).await;
     w.expect_paths("another owner audience, its writer standing again", DAVE, &cases[2].1, &probes[2].0, &probes[2].1, true).await;
     // G's readers exactly: Dave, out of G, reads neither owner reply, though
     // the narrower lists him and the wider is `everyone`.
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{DAVE}'")).await;
+    exec(&w.f.pool, &super::graph_delete_sql("follows", DAVE, None)).await;
     for (case, p, ..) in &cases[7..] {
         w.expect(&format!("{case}, outside G"), DAVE, p, false).await;
     }
@@ -411,7 +411,7 @@ async fn t49(test: &str, public: PublicMode, layout: Layout) {
     w.expect("a forged branch root, its author", CAROL, &forged, true).await;
     w.expect("a reply to a forged branch root, its author", BOB, &to_forged, true).await;
     // Bob stops standing: B1, and B2 and Alice's B3 below it, are hidden.
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}'")).await;
+    exec(&w.f.pool, &super::graph_delete_sql("follows", BOB, None)).await;
     for (case, rows) in &branches {
         w.expect(&format!("public parent {case}, B0 above the hidden step"), DAVE, &rows[0], true).await;
         for (j, uri) in rows.iter().enumerate().skip(1) {
@@ -584,11 +584,11 @@ async fn c19(test: &str, public: PublicMode, layout: Layout, case: C19) {
     };
     w.f.ready_all().await;
     match case {
-        C19::NotStanding => exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}'")).await,
+        C19::NotStanding => exec(&w.f.pool, &super::graph_delete_sql("follows", BOB, None)).await,
         C19::BlocksReader => exec(&w.f.pool, &block_sql(BOB, DAVE)).await,
         C19::Takedown => w.label(&m, "!takedown").await,
         C19::OwnerNoActor => exec(&w.f.pool, &format!("DELETE FROM actors WHERE did = '{ALICE}'")).await,
-        C19::OwnerBelow => exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}'")).await,
+        C19::OwnerBelow => exec(&w.f.pool, &super::graph_delete_sql("follows", BOB, None)).await,
         C19::RootIdentity | C19::ForeignParentOfOwnerRow => {}
     }
     w.expect(&format!("{case:?}: M"), DAVE, &m, false).await;
@@ -650,7 +650,7 @@ async fn t53(test: &str, public: PublicMode, layout: Layout) {
     w.check(found == Some(None), format!("a reply under its author's own audience: {found:?}"));
     let found = audience(&w, ALICE, t.clone()).await;
     w.check(found == g, format!("the root: {found:?}"));
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}'")).await;
+    exec(&w.f.pool, &super::graph_delete_sql("follows", BOB, None)).await;
     let found = audience(&w, BOB, reply.clone()).await;
     w.check(found == Some(None), format!("an outsider's own read: {found:?}"));
     w.finish().await;
@@ -690,7 +690,7 @@ async fn t58(test: &str, public: PublicMode, layout: Layout) {
             format!("UPDATE actors SET account_status = 'active' WHERE did = '{BOB}'"),
         ),
         ("blocks the owner", block_sql(BOB, ALICE), undo.to_string()),
-        ("unfollows", format!("DELETE FROM follows WHERE author_did = '{BOB}'"), follow_sql(BOB, ALICE)),
+        ("unfollows", super::graph_delete_sql("follows", BOB, None), follow_sql(BOB, ALICE)),
     ] {
         exec(&w.f.pool, &apply).await;
         w.expect(case, DAVE, &rc, false).await;

@@ -228,12 +228,14 @@ impl Hydrator {
         }
         let cfg = &self.inner.cfg.suggestions;
         let sql = format!(
-            "WITH mine AS (SELECT f.subject_did FROM follows f WHERE f.author_did = $1 ORDER BY f.created_at DESC LIMIT $2) \
-             SELECT f.subject_did, count(*) FROM follows f \
-             JOIN mine ON mine.subject_did = f.author_did \
-             JOIN actors a ON a.did = f.subject_did \
-             WHERE f.subject_did <> $1 AND {} \
-             GROUP BY f.subject_did ORDER BY count(*) DESC LIMIT $3",
+            "WITH mine AS (SELECT f.subject FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) \
+                           ORDER BY f.created_at DESC LIMIT $2) \
+             SELECT a.did, count(*) FROM follows f \
+             JOIN mine ON mine.subject = f.author \
+             JOIN dids fs ON fs.id = f.subject \
+             JOIN actors a ON a.did = fs.did \
+             WHERE fs.did <> $1 AND {} \
+             GROUP BY a.did ORDER BY count(*) DESC LIMIT $3",
             eligible(Some(cfg.active_days))
         );
         let ranked = self.ranked_by_follows(&sql, me, cfg.fof_max_follows, endpoint).await?;
@@ -255,14 +257,16 @@ impl Hydrator {
         }
         let cfg = &self.inner.cfg.suggestions;
         let sql = format!(
-            "WITH fans AS (SELECT f.author_did FROM follows f WHERE f.subject_did = $1 \
-                             AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = f.author_did) \
+            "WITH fans AS (SELECT f.author FROM follows f JOIN dids fa ON fa.id = f.author \
+                           WHERE f.subject = (SELECT id FROM dids WHERE did = $1) \
+                             AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = fa.did) \
                            ORDER BY f.created_at DESC LIMIT $2) \
-             SELECT f.subject_did, count(*) FROM follows f \
-             JOIN fans ON fans.author_did = f.author_did \
-             JOIN actors a ON a.did = f.subject_did \
-             WHERE f.subject_did <> $1 AND {} \
-             GROUP BY f.subject_did ORDER BY count(*) DESC LIMIT $3",
+             SELECT a.did, count(*) FROM follows f \
+             JOIN fans ON fans.author = f.author \
+             JOIN dids fs ON fs.id = f.subject \
+             JOIN actors a ON a.did = fs.did \
+             WHERE fs.did <> $1 AND {} \
+             GROUP BY a.did ORDER BY count(*) DESC LIMIT $3",
             eligible(Some(cfg.active_days))
         );
         let mut dids = self.ranked_by_follows(&sql, actor, cfg.cofollow_sample_followers, "getSuggestedFollowsByActor").await?;
@@ -469,11 +473,10 @@ mod tests {
              ('at://{opted_out}/app.bsky.actor.contentVisibilityDeclaration/self', '{opted_out}', 'app.bsky.actor.contentVisibilityDeclaration', 'bafyd', '3k', \
               '{{\"hideFromAlgorithmicRecommendations\": true}}')"
         )).await;
-        let follow = |from: &str, to: &str| format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{from}/app.bsky.graph.follow/{}', '{from}', '{to}', '3k', now())", &to[8..12]);
         // The member follows A; A follows B and C; B follows C. So C has
         // the most followers, and B and C are friends of a friend.
         for (from, to) in [(&me, &a), (&a, &b), (&a, &c), (&b, &c)] {
-            exec(p, &follow(from, to)).await;
+            crate::test_support::graph::follow(p, from, to, &to[8..12]).await;
         }
 
         let h = hydrator(p, ScopeSets::default());

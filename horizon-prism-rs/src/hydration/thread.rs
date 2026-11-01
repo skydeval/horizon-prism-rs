@@ -308,7 +308,8 @@ impl Hydrator {
         };
         let mut likers: Vec<String> = sqlx::query_scalar(
             "SELECT author_did FROM likes WHERE subject_uri = $2 \
-               AND author_did IN (SELECT subject_did FROM follows WHERE author_did = $1) \
+               AND author_did IN (SELECT fs.did FROM follows fo JOIN dids fs ON fs.id = fo.subject \
+                                  WHERE fo.author = (SELECT d.id FROM dids d WHERE d.did = $1)) \
              GROUP BY author_did ORDER BY max(created_at) DESC, author_did",
         )
         .bind(me)
@@ -316,7 +317,9 @@ impl Hydrator {
         .fetch_all(self.pool())
         .await?;
         if let Some(client) = self.backlinks() {
-            let follows: HashSet<String> = sqlx::query_scalar("SELECT subject_did FROM follows WHERE author_did = $1")
+            let follows: HashSet<String> = sqlx::query_scalar(
+                "SELECT fs.did FROM follows f JOIN dids fs ON fs.id = f.subject WHERE f.author = (SELECT id FROM dids WHERE did = $1)",
+            )
                 .bind(me)
                 .fetch_all(self.pool())
                 .await?
@@ -399,14 +402,14 @@ impl Hydrator {
                         .await?
                 }
                 "app.bsky.feed.threadgate#followerRule" => {
-                    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+                    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = $2)")
                         .bind(me)
                         .bind(author)
                         .fetch_one(self.pool())
                         .await?
                 }
                 "app.bsky.feed.threadgate#followingRule" => {
-                    let follows: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+                    let follows: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = $2)")
                         .bind(author)
                         .bind(me)
                         .fetch_one(self.pool())

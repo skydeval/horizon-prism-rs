@@ -827,7 +827,7 @@ mod tests {
         // Followers may reply: not a follower, then a follower.
         exec(p, &format!("UPDATE threadgates SET allow = '[{{\"$type\": \"app.bsky.feed.threadgate#followerRule\"}}]' WHERE uri = '{gate}'")).await;
         assert_eq!(disabled(me.clone()).await, Some(json!(true)));
-        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ME}/app.bsky.graph.follow/1', '{ME}', '{OP}', '3k', now())")).await;
+        crate::test_support::graph::follow(p, ME, OP, "1").await;
         assert_eq!(disabled(me.clone()).await, Some(json!(false)));
         // A rule whose input this AppView does not hold in full: unknown.
         exec(p, &format!("UPDATE threadgates SET allow = '[{{\"$type\": \"app.bsky.feed.threadgate#listRule\", \"list\": \"at://{BOB}/app.bsky.graph.list/l\"}}]' WHERE uri = '{gate}'")).await;

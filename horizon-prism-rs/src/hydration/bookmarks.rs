@@ -194,7 +194,7 @@ mod tests {
         assert!(anon.inner()["posts"][0]["viewer"].get("bookmarked").is_none());
         // A block with the author shows as blockedPost; a hidden post as
         // notFoundPost.
-        exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ME}/app.bsky.graph.block/1', '{ME}', '{BOB}', '3k', now())")).await;
+        crate::test_support::graph::block(p, ME, BOB, "1").await;
         let l = h.get_bookmarks(&me, &req, 50, None).await.expect("db").expect("view");
         assert_eq!(l.inner()["bookmarks"][1]["item"]["$type"], "app.bsky.feed.defs#blockedPost");
         exec(p, "DELETE FROM blocks").await;

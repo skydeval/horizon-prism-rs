@@ -192,14 +192,9 @@ async fn members(p: &sqlx::PgPool) {
 
 async fn block(p: &sqlx::PgPool, author: &str, subjects: &[String]) {
     for (i, s) in subjects.iter().enumerate() {
-        exec(
-            p,
-            &format!(
-                "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://{author}/app.bsky.graph.block/3kb{i:06}', '{author}', '{s}', '3k', now() - interval '{i} seconds')"
-            ),
-        )
-        .await;
+        let rkey = format!("3kb{i:06}");
+        let age = chrono::TimeDelta::seconds(i64::try_from(i).expect("index"));
+        crate::test_support::graph::Edge::block(author, s, &rkey).at(chrono::Utc::now() - age).put(p).await;
     }
 }
 

@@ -85,7 +85,7 @@ async fn a_handle_form_anchor_is_resolved_and_answered_in_did_form() {
     exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
     let anchor = post(p, AUTHOR, "3kanchor2222", "anchor", None, None).await;
     let reply = post(p, R1, "3kreply12222", "one", Some(&anchor), Some(&anchor)).await;
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, VIEWER_A, R1, "3kb").await;
     // The anchor's author is indexed here: its stored handle answers.
     let mut sets = ScopeSets::default();
     sets.scope.insert(AUTHOR.into());

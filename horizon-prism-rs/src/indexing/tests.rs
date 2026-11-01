@@ -542,6 +542,20 @@ async fn a_fill_killed_in_scope_resumes_exactly() {
 
 /// Every swept table and every kept one (§4, §7.2), with the members'
 /// likes laid out so one window holds only kept rows.
+/// Statements that write one follows or blocks row as ingest stores it:
+/// the DIDs interned, an alias for a key that is not a TID, then the row.
+fn graph_row_sql(table: &str, author: &str, subject: &str, rkey: &str) -> String {
+    format!(
+        "INSERT INTO dids (did) VALUES ('{author}'), ('{subject}') ON CONFLICT (did) DO NOTHING; \
+         INSERT INTO rkey_aliases (author, rkey) SELECT id, '{rkey}' FROM dids WHERE did = '{author}' AND rkey_to_bigint('{rkey}') IS NULL \
+           ON CONFLICT (author, rkey) DO NOTHING; \
+         INSERT INTO {table} (author, rkey, subject, rev, created_at) \
+           SELECT a.id, COALESCE(rkey_to_bigint('{rkey}'), (SELECT x.id FROM rkey_aliases x WHERE x.author = a.id AND x.rkey = '{rkey}')), \
+                  s.id, rev_to_bigint('3k'), now() \
+           FROM dids a, dids s WHERE a.did = '{author}' AND s.did = '{subject}';"
+    )
+}
+
 fn sweep_seed() -> String {
     let post = |did: &str, r: &str| format!("at://{did}/app.bsky.feed.post/{r}");
     let mut sql = feed_sql(4);
@@ -576,7 +590,7 @@ fn sweep_seed() -> String {
     }
     // Follows: B → D goes; B → member and member → D stay.
     for (author, subject, r) in [(B, D, "1"), (B, MEMBER, "2"), (MEMBER, D, "1")] {
-        sql += &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{author}/app.bsky.graph.follow/{r}', '{author}', '{subject}', '3k', now());");
+        sql += &graph_row_sql("follows", author, subject, r);
     }
     sql += &format!("INSERT INTO post_counts (post_uri, like_count) VALUES ('{}', 1) ON CONFLICT DO NOTHING;", post(D, "p9"));
     for (tag, h) in [("a", 1), ("a", 2), ("b", 1), ("c", 3), ("c", 4)] {
@@ -586,7 +600,7 @@ fn sweep_seed() -> String {
         sql += &format!("INSERT INTO starter_pack_counts (pack_uri, all_time_source, refreshed_at) VALUES ('at://{B}/app.bsky.graph.starterpack/{i}', 'x', now());");
     }
     // Kept tables.
-    sql += &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{B}/app.bsky.graph.block/1', '{B}', '{MEMBER}', '3k', now());");
+    sql += &graph_row_sql("blocks", B, MEMBER, "1");
     sql += &format!("INSERT INTO actors (did, display_name) VALUES ('{B}', 'b'), ('{MEMBER}', 'm');");
     sql += &format!("INSERT INTO labels (subject, val) VALUES ('{B}', 'porn');");
     sql += &format!("INSERT INTO record_tombstones (uri, rev) VALUES ('{}', '3k');", post(B, "gone"));
@@ -603,7 +617,7 @@ const KEPT: [(&str, &str); 14] = [
     ("list_items", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
     ("list_optouts", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
     ("list_blocks", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
-    ("follows", "'did:plc:cccccccccccccccccccccccc' IN (author_did, subject_did)"),
+    ("follows", "(SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc') IN (author, subject)"),
     ("blocks", "TRUE"),
     ("actors", "TRUE"),
     ("labels", "TRUE"),
@@ -663,6 +677,7 @@ async fn the_sweep_empties_and_thins_every_table() {
                         Key::Text(_) => stored.is_string(),
                         Key::Id => stored.is_i64(),
                         Key::TagHour => stored.as_array().is_some_and(|a| a.len() == 2 && a[0].is_string() && parse_ts(&a[1]).is_some()),
+                        Key::AuthorRkey => stored.as_array().is_some_and(|a| a.len() == 2 && a[0].is_i64() && a[1].is_i64()),
                     };
                     assert!(ok, "{name}: cursor {stored}");
                 }

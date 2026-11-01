@@ -239,9 +239,9 @@ async fn replies_the_root_hid_are_flagged_on_every_path() {
     let never_stored = format!("at://{R1}/app.bsky.feed.post/3knever22222");
     gate(p, &root, &[&hidden, &gapped, &deep, &root, &never_stored]).await;
     let gate_uri = format!("at://{AUTHOR}/app.bsky.feed.threadgate/3kroot222222");
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, VIEWER_A, R1, "3kb").await;
     // The root's author blocks viewer B.
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{AUTHOR}/app.bsky.graph.block/3kb', '{AUTHOR}', '{VIEWER_B}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, AUTHOR, VIEWER_B, "3kb").await;
     let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
     let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
     let base = fake_upstream(Arc::new(Calls::default()), None).await;
@@ -478,9 +478,9 @@ async fn reply_disabled_comes_from_the_roots_gate_and_local_rows() {
     for (allow, with_root, facets, follows, member_wants, visitor_wants, why) in cases {
         exec(p, "DELETE FROM follows").await;
         if follows {
-            exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.follow/3kf', '{VIEWER_A}', '{AUTHOR}', '3k', now())")).await;
+            crate::test_support::graph::follow(p, VIEWER_A, AUTHOR, "3kf").await;
             // The author follows the member too: `followingRule` admits it.
-            exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{AUTHOR}/app.bsky.graph.follow/3kf', '{AUTHOR}', '{VIEWER_A}', '3k', now())")).await;
+            crate::test_support::graph::follow(p, AUTHOR, VIEWER_A, "3kf").await;
         }
         let mut up = FixedUpstream::default();
         up.threads.insert(anchor.clone(), json!({"thread": thread(with_root, facets), "threadgate": gate(allow.clone())}));
@@ -541,7 +541,7 @@ async fn a_blocked_by_you_gap_names_the_callers_list() {
         }
         exec(p, &format!("INSERT INTO list_references (member_did, list_uri, source, admitted, effective) VALUES ('{VIEWER_A}', '{list}', 'block', true, true)")).await;
     }
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kd', '{VIEWER_A}', '{D}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, VIEWER_A, D, "3kd").await;
     let anchor = post(p, AUTHOR, "3kanchor2222", "anchor", None, None).await;
     let by_r1 = post(p, R1, "3kbyr1222222", "secret r1", Some(&anchor), Some(&anchor)).await;
     let by_d = post(p, D, "3kbyd2222222", "secret d", Some(&anchor), Some(&anchor)).await;
@@ -754,19 +754,13 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     // The stranger, who is no member, has the same two: rows this AppView
     // holds for it.
     for (i, (author, subject)) in [(VIEWER_A, R1), (R2, VIEWER_A), (STRANGER, R1), (R2, STRANGER)].into_iter().enumerate() {
-        sqlx::query("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, '3kaaaaaaaaaa2', now())")
-            .bind(format!("at://{author}/app.bsky.graph.block/3kblock{i}"))
-            .bind(author)
-            .bind(subject)
-            .execute(p)
-            .await
-            .expect("block");
+        crate::test_support::graph::block(p, author, subject, &format!("3kblock{i}")).await;
     }
     exec(p, "INSERT INTO record_tombstones (uri, rev) VALUES ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kdeleted', '3kaaaaaaaaaa2')").await;
     // A ready member and a member that is not ready both follow the
     // anchor's author: viewer state only a ready member is shown.
     for follower in [VIEWER_B, R2] {
-        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{follower}/app.bsky.graph.follow/3kf', '{follower}', '{AUTHOR}', '3k', now())")).await;
+        crate::test_support::graph::follow(p, follower, AUTHOR, "3kf").await;
     }
     let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
     let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
@@ -928,7 +922,7 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     let (_, body) = call(&open, GET_THREAD, STRANGER, 5, &thread_input).await;
     let before: Value = serde_json::from_str(&body).expect("json");
     assert_eq!((summary(&before, "nodes")[0].clone(), &before["bridging"]), ((anchor.clone(), None), &json!("full")), "{body}");
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{AUTHOR}/app.bsky.graph.block/3kblocknew', '{AUTHOR}', '{STRANGER}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, AUTHOR, STRANGER, "3kblocknew").await;
     let (status, body) = call(&open, GET_THREAD, STRANGER, 5, &thread_input).await;
     assert_eq!(status, 200, "{body}");
     let after: Value = serde_json::from_str(&body).expect("json");
@@ -961,7 +955,7 @@ async fn a_response_is_paged_by_a_sealed_cursor() {
     for rkey in ["3kbeneath222", "3kbeneath333", "3kbeneath444"] {
         beneath.push(post(p, AUTHOR, rkey, "beneath", Some(&gapped), Some(&anchor)).await);
     }
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, VIEWER_A, R1, "3kb").await;
     let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
     let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
     let base = fake_upstream(Arc::new(Calls::default()), None).await;
@@ -1038,7 +1032,7 @@ async fn an_s_authors_thread_takes_the_upstream_baseline_unless_the_mode_is_on()
     exec(p, &format!("INSERT INTO thread_mutes (viewer_did, root_uri) VALUES ('{VIEWER_A}', '{root}')")).await;
     exec(p, &format!("INSERT INTO bookmarks (viewer_did, post_uri, post_cid) VALUES ('{VIEWER_A}', '{anchor}', 'bafy')")).await;
     exec(p, &format!("INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply) VALUES ('{VIEWER_A}', '{AUTHOR}', true, true)")).await;
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, VIEWER_A, R1, "3kb").await;
     let mut sets = ScopeSets::default();
     for did in [AUTHOR, R1] {
         sets.scope.insert(did.into());
@@ -1105,7 +1099,7 @@ async fn the_parent_walk_goes_past_a_blocked_author() {
     let root = post(p, AUTHOR, "3kroot222222", "root", None, None).await;
     let middle = post(p, R1, "3kmiddle2222", "middle", Some(&root), Some(&root)).await;
     let leaf = post(p, AUTHOR, "3kleaf222222", "leaf", Some(&middle), Some(&root)).await;
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, VIEWER_A, R1, "3kb").await;
     let (farsight, fake) = crate::farsight::lookup::tests::engine("").await;
     let h = hydrator_with_farsight(p, ScopeSets::default(), farsight);
     let base = fake_upstream(Arc::new(Calls::default()), None).await;
@@ -1210,8 +1204,8 @@ async fn the_walk_goes_past_blocked_posts_with_no_local_row() {
     }
     exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
     // The viewer blocks R1; R2 blocks the viewer.
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{R2}/app.bsky.graph.block/3kc', '{R2}', '{VIEWER_A}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, VIEWER_A, R1, "3kb").await;
+    crate::test_support::graph::block(p, R2, VIEWER_A, "3kc").await;
     let at = |did: &str, rkey: &str| format!("at://{did}/app.bsky.feed.post/{rkey}");
     let mut up = FixedUpstream::default();
     // A back-and-forth: the viewer's posts are stored, the other side's
@@ -1290,7 +1284,7 @@ async fn the_walk_reads_the_link_above_a_blocked_post_from_its_record() {
         actor(p, did, handle, handle).await;
     }
     exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{VIEWER_A}/app.bsky.graph.block/3kb', '{VIEWER_A}', '{R1}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, VIEWER_A, R1, "3kb").await;
     let at = |did: &str, rkey: &str| format!("at://{did}/app.bsky.feed.post/{rkey}");
     // root ← b1 ← v1 ← b2 ← anchor; the anchor is not stored, so the
     // baseline is an upstream thread, which ends at b2.

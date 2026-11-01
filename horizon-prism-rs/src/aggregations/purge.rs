@@ -26,6 +26,7 @@ use sqlx::{PgConnection, PgPool};
 
 use super::membership::{Denial, upsert_denial};
 use super::scope_state::{PurgeKind, ScopeState};
+use crate::db::ids::rev_value;
 use crate::db::locks::{lock_did_exclusive, lock_dids_shared};
 use crate::farsight::PurgeHook;
 use crate::firehose::jobs::{self, Depth};
@@ -44,7 +45,8 @@ pub const BATCH: i64 = 10_000;
 const SUBSCRIPTION_HOLDS: &str = "SELECT EXISTS (SELECT 1 FROM activity_subscriptions a \
      JOIN members m ON m.did = a.subscriber_did \
      WHERE a.subject_did = $1 \
-       AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = a.subscriber_did AND f.subject_did = $1))";
+       AND EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
+                   WHERE fa.did = a.subscriber_did AND fs.did = $1))";
 /// Re-attempt interval for a marker step blocked by a running purge.
 pub const OVERLAP_RETRY: Duration = Duration::from_secs(10);
 
@@ -229,10 +231,10 @@ impl Purger {
             // Some member follows the DID with fewer than the cap of its
             // follows before that one, in the sweep's order.
             let followed: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM follows f JOIN members m ON m.did = f.author_did \
-                 WHERE f.subject_did = $1 \
-                   AND (SELECT count(*) FROM follows e WHERE e.author_did = f.author_did \
-                          AND (e.created_at, e.uri) < (f.created_at, f.uri)) < $2)",
+                "SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN members m ON m.did = fa.did \
+                 WHERE f.subject = (SELECT id FROM dids WHERE did = $1) \
+                   AND (SELECT count(*) FROM follows e WHERE e.author = f.author \
+                          AND (e.created_at, e.author, e.rkey) < (f.created_at, f.author, f.rkey)) < $2)",
             )
             .bind(did)
             .bind(i64::from(self.scope.max_follow_scope_per_member()))
@@ -478,8 +480,8 @@ impl Purger {
                     ("member_post_refs", "author_did"),
                     ("likes", "author_did"),
                     ("reposts", "author_did"),
-                    ("follows", "author_did"),
-                    ("blocks", "author_did"),
+                    ("follows", "author"),
+                    ("blocks", "author"),
                     // The record tables design-v3 added (§3.1).
                     ("lists", "creator_did"),
                     ("list_items", "author_did"),
@@ -494,7 +496,11 @@ impl Purger {
                     // Pronouns and plural records (plural-pronouns §2.3).
                     ("plural_records", "did"),
                 ] {
-                    n += delete_batch(conn, table, "uri", &format!("{column} = $1"), did).await?;
+                    n += if matches!(table, "follows" | "blocks") {
+                        delete_graph_batch(conn, table, "t.author = (SELECT id FROM dids WHERE did = $1)", did).await?
+                    } else {
+                        delete_batch(conn, table, "uri", &format!("{column} = $1"), did).await?
+                    };
                 }
                 // Derived counts follow their pack row.
                 n += delete_batch(conn, "starter_pack_counts", "pack_uri", "split_part(pack_uri, '/', 3) = $1", did).await?;
@@ -703,6 +709,15 @@ async fn delete_batch(
     Ok(sqlx::query(&sql).bind(did).execute(conn).await?.rows_affected())
 }
 
+/// [`delete_batch`] for `follows` or `blocks`, keyed by `(author, rkey)`;
+/// `predicate` names the table `t`.
+async fn delete_graph_batch(conn: &mut PgConnection, table: &str, predicate: &str, did: &str) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "DELETE FROM {table} WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM {table} t WHERE {predicate} LIMIT {BATCH})"
+    );
+    Ok(sqlx::query(&sql).bind(did).execute(conn).await?.rows_affected())
+}
+
 /// Class-M public rows admitted only because `did` was a member (§6.11.7):
 /// rule-2 interactions on its content by authors outside S, inbound-block
 /// sentinel rows, and every block and list block with no member side left
@@ -746,29 +761,35 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Resu
         oq = other_member("t.quote_uri"),
     );
     n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
+    // Follows and blocks name their accounts by id; `ta` and `ts` are the
+    // author's and subject's DID rows.
+    let graph_out_of_scope = out_of_scope.replace("t.author_did", "ta.did");
     let sql = format!(
-        "DELETE FROM follows WHERE uri IN (SELECT uri FROM follows t WHERE subject_did = $1 AND {out_of_scope} LIMIT {BATCH})"
+        "DELETE FROM follows WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM follows t JOIN dids ta ON ta.id = t.author \
+         WHERE t.subject = (SELECT id FROM dids WHERE did = $1) AND {graph_out_of_scope} LIMIT {BATCH})"
     );
     n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
     // Blocks, by Rule M (member-blocks-only design §7): blocks of the member
     // by authors that are not members, and every inbound-block sentinel row
     // for it; the member's own blocks of non-members; its list blocks. A
     // block between it and another member stays.
-    let non_member = |col: &str| format!("NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.{col})");
+    let non_member = |col: &str| format!("NOT EXISTS (SELECT 1 FROM members m WHERE m.did = {col})");
     let sql = format!(
-        "DELETE FROM blocks WHERE uri IN (SELECT uri FROM blocks t WHERE subject_did = $1 \
+        "DELETE FROM blocks WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM blocks t JOIN dids ta ON ta.id = t.author \
+         WHERE t.subject = (SELECT id FROM dids WHERE did = $1) \
          AND (t.rev = $2 OR {}) LIMIT {BATCH})",
-        non_member("author_did")
+        non_member("ta.did")
     );
     n += sqlx::query(&sql)
         .bind(did)
-        .bind(SENTINEL_REV)
+        .bind(rev_value(SENTINEL_REV))
         .execute(&mut *conn)
         .await?
         .rows_affected();
     let sql = format!(
-        "DELETE FROM blocks WHERE uri IN (SELECT uri FROM blocks t WHERE author_did = $1 AND {} LIMIT {BATCH})",
-        non_member("subject_did")
+        "DELETE FROM blocks WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM blocks t JOIN dids ts ON ts.id = t.subject \
+         WHERE t.author = (SELECT id FROM dids WHERE did = $1) AND {} LIMIT {BATCH})",
+        non_member("ts.did")
     );
     n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
     n += delete_batch(conn, "list_blocks", "uri", "author_did = $1", did).await?;
@@ -798,10 +819,14 @@ async fn member_removed_off_batch(conn: &mut PgConnection, did: &str) -> Result<
         let spare = if table == "reposts" { format!(" AND NOT {}", in_r("split_part(subject_uri, '/', 3)")) } else { String::new() };
         n += delete_batch(conn, table, "uri", &format!("{column} = $1 AND NOT {removed_in_r}{spare}"), did).await?;
     }
-    let non_member = |col: &str| format!("NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.{col})");
-    for (own, other, spare) in [("author_did", "subject_did", removed_in_r.clone()), ("subject_did", "author_did", in_r("t.author_did"))] {
+    // Follows name their accounts by id; `ta` and `ts` are the author's and
+    // subject's DID rows.
+    let non_member = |col: &str| format!("NOT EXISTS (SELECT 1 FROM members m WHERE m.did = {col})");
+    for (own, other, spare) in [("ta.did", "ts.did", removed_in_r.clone()), ("ts.did", "ta.did", in_r("ta.did"))] {
         let sql = format!(
-            "DELETE FROM follows WHERE uri IN (SELECT uri FROM follows t WHERE t.{own} = $1 AND {} AND NOT {spare} LIMIT {BATCH})",
+            "DELETE FROM follows WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM follows t \
+             JOIN dids ta ON ta.id = t.author JOIN dids ts ON ts.id = t.subject \
+             WHERE {own} = $1 AND {} AND NOT {spare} LIMIT {BATCH})",
             non_member(other)
         );
         n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
@@ -911,16 +936,7 @@ mod tests {
         // A sentinel inbound block by an in-scope author goes; so does a real
         // one, which has no member side left (member-blocks-only design §7).
         for (rkey, rev) in [("1", SENTINEL_REV), ("2", "3kaaaaaaaaaaa")] {
-            sqlx::query(
-                "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, $4, now())",
-            )
-            .bind(format!("at://{SCOPED}/app.bsky.graph.block/{rkey}"))
-            .bind(SCOPED)
-            .bind(MEMBER)
-            .bind(rev)
-            .execute(p)
-            .await
-            .expect("block");
+            crate::test_support::graph::Edge::block(SCOPED, MEMBER, rkey).rev(rev).put(p).await;
         }
         exec(p, "INSERT INTO notification_seen (did, seen_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', now())").await;
         exec(p, "INSERT INTO backfill_jobs (did, depth, state) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'resync', 'queued')").await;
@@ -1066,12 +1082,16 @@ mod tests {
         for did in [MEMBER, OTHER_MEMBER, SCOPED] {
             sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 1)").bind(did).execute(p).await.expect("scope");
         }
-        let follow = |rkey: &str, author: &str, subject: &str| {
-            format!(
-                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://{author}/app.bsky.graph.follow/{rkey}', '{author}', '{subject}', '3k', now())"
-            )
-        };
+        for (rkey, author, subject) in [
+            ("1", OTHER_MEMBER, MEMBER),
+            ("2", MEMBER, OTHER_MEMBER),
+            ("3", MEMBER, OUTSIDER),
+            ("4", OUTSIDER, MEMBER),
+            ("5", SCOPED, MEMBER),
+        ] {
+            crate::test_support::graph::follow(p, author, subject, rkey).await;
+        }
+        crate::test_support::graph::block(p, MEMBER, "did:plc:x", "1").await;
         let subject = |table: &str, rkey: &str| {
             format!(
                 "INSERT INTO {table} (uri, author_did, subject_uri, rev, created_at) VALUES \
@@ -1080,11 +1100,6 @@ mod tests {
         };
         let authored = |sql: &str| sql.replace("$1", &format!("'{MEMBER}'"));
         for sql in [
-            follow("1", OTHER_MEMBER, MEMBER),
-            follow("2", MEMBER, OTHER_MEMBER),
-            follow("3", MEMBER, OUTSIDER),
-            follow("4", OUTSIDER, MEMBER),
-            follow("5", SCOPED, MEMBER),
             subject("likes", "l1"),
             subject("reposts", "r1"),
             authored("INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES ('at://' || $1 || '/l/1', $1, '1', 'c', '3k', 'n', 'p', '{}', now())"),
@@ -1092,7 +1107,6 @@ mod tests {
             authored("INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lb/1', $1, '1', 'c', '3k', 'l', now())"),
             authored("INSERT INTO list_optouts (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lo/1', $1, '1', 'c', '3k', 'l', now())"),
             authored("INSERT INTO member_post_refs (uri, author_did, rev, created_at) VALUES ('at://' || $1 || '/app.bsky.feed.post/1', $1, '3k', now())"),
-            authored("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://' || $1 || '/app.bsky.graph.block/1', $1, 'did:plc:x', '3k', now())"),
             authored("INSERT INTO actors (did, display_name, profile_record, profile_rev) VALUES ($1, 'M', '{}'::jsonb, '3k')"),
         ] {
             exec(p, &sql).await;
@@ -1113,6 +1127,17 @@ mod tests {
         (scope, purger)
     }
 
+    /// The record keys of the rows of `table` (follows or blocks), sorted.
+    async fn rkeys_of(p: &PgPool, table: &str) -> Vec<String> {
+        let mut keys: Vec<String> = crate::test_support::graph::uris(p, table)
+            .await
+            .into_iter()
+            .map(|u| u.rsplit('/').next().unwrap_or_default().to_string())
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// The removed member's rows that are left: its likes, reposts, list
     /// rows and references; the follows by `uri` rkey; its blocks and
     /// profile.
@@ -1124,7 +1149,7 @@ mod tests {
         )
         .await;
         let refs = count(p, "SELECT count(*) FROM member_post_refs").await;
-        let follows: Vec<String> = sqlx::query_scalar("SELECT split_part(uri, '/', 5) FROM follows ORDER BY 1").fetch_all(p).await.expect("follows");
+        let follows = rkeys_of(p, "follows").await;
         let kept = count(p, "SELECT (SELECT count(*) FROM blocks) + (SELECT count(*) FROM actors WHERE profile_record IS NOT NULL)").await;
         (own, refs, follows, kept)
     }
@@ -1211,17 +1236,10 @@ mod tests {
             for did in [MEMBER, OTHER_MEMBER, SCOPED] {
                 exec(p, &format!("INSERT INTO scope_dids (did, reasons) VALUES ('{did}', 1)")).await;
             }
-            let block = |rkey: &str, author: &str, subject: &str| {
-                format!(
-                    "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES \
-                     ('at://{author}/app.bsky.graph.block/{rkey}', '{author}', '{subject}', '3k', now())"
-                )
-            };
+            for (rkey, author, subject) in [("mn", MEMBER, OTHER_MEMBER), ("mx", MEMBER, OUTSIDER), ("ym", SCOPED, MEMBER), ("nm", OTHER_MEMBER, MEMBER)] {
+                crate::test_support::graph::block(p, author, subject, rkey).await;
+            }
             for sql in [
-                block("mn", MEMBER, OTHER_MEMBER),
-                block("mx", MEMBER, OUTSIDER),
-                block("ym", SCOPED, MEMBER),
-                block("nm", OTHER_MEMBER, MEMBER),
                 format!(
                     "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) \
                      VALUES ('at://{MEMBER}/app.bsky.graph.listblock/1', '{MEMBER}', '1', 'c', '3k', 'l', now())"
@@ -1231,7 +1249,7 @@ mod tests {
             }
             let (_, purger) = purger_in(p, mode);
             purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("purge");
-            let left: Vec<String> = sqlx::query_scalar("SELECT split_part(uri, '/', 5) FROM blocks ORDER BY 1").fetch_all(p).await.expect("blocks");
+            let left = rkeys_of(p, "blocks").await;
             assert_eq!(left, ["mn", "nm"], "{mode:?}");
             assert_eq!(count(p, "SELECT count(*) FROM list_blocks").await, 0, "{mode:?}");
             db.drop_db().await;

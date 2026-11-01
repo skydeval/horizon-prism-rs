@@ -963,14 +963,15 @@ impl Ord for ByRkey {
 }
 
 /// The public table, and its author column, of an ecosystem collection that
-/// is listed and reconciled.
+/// is listed and reconciled. Follows and blocks name their author by id
+/// (`author`); `local_uris` reads them on its own.
 fn public_table(nsid: &str) -> Option<(&'static str, &'static str)> {
     Some(match nsid {
         NSID_POST => ("posts", "author_did"),
         NSID_LIKE => ("likes", "author_did"),
         NSID_REPOST => ("reposts", "author_did"),
-        NSID_FOLLOW => ("follows", "author_did"),
-        NSID_BLOCK => ("blocks", "author_did"),
+        NSID_FOLLOW => ("follows", "author"),
+        NSID_BLOCK => ("blocks", "author"),
         NSID_THREADGATE => ("threadgates", "author_did"),
         NSID_POSTGATE => ("postgates", "author_did"),
         NSID_LIST => ("lists", "creator_did"),
@@ -2425,6 +2426,18 @@ pub async fn local_uris(writer: &Writer, did: &str, nsid: &str, rev: &str, off_r
         .fetch_all(writer.pool())
         .await;
     }
+    // Follows and blocks are keyed by ids, with integer revs.
+    if matches!(nsid, NSID_FOLLOW | NSID_BLOCK) {
+        let (table, coll) = if nsid == NSID_FOLLOW { ("follows", 4) } else { ("blocks", 5) };
+        return sqlx::query_scalar(&format!(
+            "SELECT at_uri(t.author, {coll}::smallint, t.rkey) FROM {table} t \
+             WHERE t.author = (SELECT id FROM dids WHERE did = $1) AND t.rev < $2"
+        ))
+        .bind(did)
+        .bind(crate::db::ids::rev_value(rev))
+        .fetch_all(writer.pool())
+        .await;
+    }
     let table = public_table(nsid);
     let mut uris = Vec::new();
     if let Some((table, author)) = table {
@@ -3210,7 +3223,7 @@ mod tests {
         assert_eq!(applied, "3kzzzzzzzzzzz");
         // The inbound block was written with the sentinel rev.
         let (author, subject, rev): (String, String, String) =
-            sqlx::query_as("SELECT author_did, subject_did, rev FROM blocks")
+            sqlx::query_as("SELECT a.did, s.did, bigint_to_rev(b.rev) FROM blocks b JOIN dids a ON a.id = b.author JOIN dids s ON s.id = b.subject")
                 .fetch_one(&db.pool)
                 .await
                 .expect("inbound block");
@@ -3315,7 +3328,7 @@ mod tests {
         jobs::enqueue(&mut conn, DID, Depth::Member).await.expect("enqueue");
         drop(conn);
         backfill.run_once().await.expect("run").expect("job");
-        let stored: Vec<String> = sqlx::query_scalar("SELECT subject_did FROM blocks ORDER BY subject_did").fetch_all(&db.pool).await.expect("blocks");
+        let stored: Vec<String> = crate::test_support::graph::pairs(&db.pool, "blocks").await.into_iter().map(|(_, s)| s).collect();
         assert_eq!(stored, [non_member.to_string(), other_member.to_string()]);
         db.drop_db().await;
     }

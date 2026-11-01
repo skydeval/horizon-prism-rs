@@ -123,11 +123,8 @@ async fn generate(pool: &PgPool, rng: &mut Rng, tag: &str, depth: usize) -> Gene
                 exec(pool, &follow_sql(a, b)).await;
             }
             if rng.chance(5) {
-                exec(pool, &format!(
-                    "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) \
-                     VALUES ('at://{a}/app.bsky.graph.block/t60{}', '{a}', '{b}', '3k', now()) ON CONFLICT DO NOTHING",
-                    &b[8..]
-                )).await;
+                let rkey = format!("t60{}", &b[8..]);
+                exec(pool, &format!("{} ON CONFLICT DO NOTHING", super::graph_row_sql("blocks", a, b, &rkey, "3k", "now()"))).await;
             }
         }
         if rng.chance(4) {

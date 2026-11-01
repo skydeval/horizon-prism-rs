@@ -426,7 +426,14 @@ impl H {
 
     /// The stored follow at `uri`: `(subject, rev)`.
     async fn stored(&self, uri: &str) -> Option<(String, String)> {
-        sqlx::query_as("SELECT subject_did, rev FROM follows WHERE uri = $1").bind(uri).fetch_optional(self.pool()).await.expect("follows")
+        sqlx::query_as(
+            "SELECT s.did, bigint_to_rev(f.rev) FROM follows f CROSS JOIN LATERAL ref_of($1) r JOIN dids s ON s.id = f.subject \
+             WHERE f.author = r.author AND f.rkey = r.rkey AND r.coll = 4",
+        )
+        .bind(uri)
+        .fetch_optional(self.pool())
+        .await
+        .expect("follows")
     }
 
     async fn tombstone(&self, uri: &str) -> Option<String> {
@@ -1547,7 +1554,7 @@ async fn t41_the_pass_has_its_own_budget() {
     let job = h.job(ALICE, Depth::Authz).await.expect("authz");
     assert_eq!(job.0, "queued");
     assert!((30..=90).contains(&job.2), "a minute on: {job:?}");
-    let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM follows WHERE author_did = '{ALICE}'")).fetch_one(h.pool()).await.expect("count");
+    let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM follows WHERE author = (SELECT id FROM dids WHERE did = '{ALICE}')")).fetch_one(h.pool()).await.expect("count");
     assert_eq!(left, 1, "two confirmed and deleted");
 
     // A member job: two stale posts use up the shared budget of 2 before
@@ -1561,7 +1568,7 @@ async fn t41_the_pass_has_its_own_budget() {
     }
     h.clear_jobs().await;
     assert_eq!(h.run(&b, ALICE, Depth::Member).await, JobOutcome::Ready);
-    let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM follows WHERE author_did = '{ALICE}'")).fetch_one(h.pool()).await.expect("count");
+    let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM follows WHERE author = (SELECT id FROM dids WHERE did = '{ALICE}')")).fetch_one(h.pool()).await.expect("count");
     assert_eq!(left, 0);
     assert!(h.flag(ALICE).await.set, "the pass completed on its own budget");
     h.finish().await;
@@ -1569,7 +1576,14 @@ async fn t41_the_pass_has_its_own_budget() {
 
 /// The stored follows of `did`, and `scope_dids`.
 async fn follows_and_scope(pool: &PgPool, did: &str) -> (Vec<(String, String)>, Vec<String>) {
-    let follows = sqlx::query_as("SELECT uri, subject_did FROM follows WHERE author_did = $1 ORDER BY uri").bind(did).fetch_all(pool).await.expect("follows");
+    let follows = sqlx::query_as(
+        "SELECT at_uri(f.author, 4::smallint, f.rkey), s.did FROM follows f JOIN dids s ON s.id = f.subject \
+         WHERE f.author = (SELECT id FROM dids WHERE did = $1) ORDER BY 1",
+    )
+    .bind(did)
+    .fetch_all(pool)
+    .await
+    .expect("follows");
     let scope = sqlx::query_scalar("SELECT did FROM scope_dids ORDER BY did").fetch_all(pool).await.expect("scope");
     (follows, scope)
 }
@@ -1893,7 +1907,7 @@ async fn t42_catch_up_contradictions_and_failures() {
     let queued = h.job(ALICE, Depth::Authz).await;
     assert!(!h.catch_up(ALICE, R2).await);
     assert_eq!(h.job(ALICE, Depth::Authz).await.map(|j| (j.0, j.4)), queued.map(|j| (j.0, j.4)));
-    exec(h.pool(), &format!("DELETE FROM follows WHERE author_did = '{ALICE}'")).await;
+    exec(h.pool(), &super::graph_delete_sql("follows", ALICE, None)).await;
 
     // A follow write that fails: readiness stays, unsettled.
     let failing = follow_uri(ALICE, "3kt42xfolcar");
@@ -2157,7 +2171,7 @@ async fn t43_rejected_follows_tombstone_forward_only() {
     let first = tombstones().await;
     assert_eq!(first.len(), 101);
     assert!(first.iter().all(|(_, rev, _)| rev == R1));
-    let stored: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM follows WHERE author_did = '{EVE}'")).fetch_one(h.pool()).await.expect("count");
+    let stored: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM follows WHERE author = (SELECT id FROM dids WHERE did = '{EVE}')")).fetch_one(h.pool()).await.expect("count");
     assert_eq!(stored, 0);
     h.commit_nothing(EVE, R1).await;
     assert!(h.flag(EVE).await.holds);
@@ -2296,7 +2310,15 @@ async fn older_listing(test: &str, a: ListingA, a_first: bool, twin: bool) {
     let never_reads = |h: &H| {
         let (h_base, pool, x, p) = (h.base.clone(), h.pool().clone(), x.clone(), p.clone());
         async move {
-            let stored: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE uri = $1 AND subject_did = $2)").bind(&x).bind(BOB).fetch_one(&pool).await.expect("stored");
+            let stored: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM follows f CROSS JOIN LATERAL ref_of($1) r \
+                 WHERE f.author = r.author AND f.rkey = r.rkey AND r.coll = 4 AND f.subject = (SELECT id FROM dids WHERE did = $2))",
+            )
+            .bind(&x)
+            .bind(BOB)
+            .fetch_one(&pool)
+            .await
+            .expect("stored");
             if stored {
                 exec(&pool, "UPDATE sync_state SET head_checked_at = now()").await;
                 let (_, body, _) = get(&h_base, POSTS, &format!("uris={p}"), BOB, BOB_KEY).await;
@@ -2398,7 +2420,7 @@ async fn t43_only_a_row_that_appears_or_changes_clears() {
     h.pds.set_rev(BOB, R1);
     h.clear_jobs().await;
     assert_eq!(h.run(&b, BOB, Depth::Member).await, JobOutcome::Ready);
-    let stored: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM follows WHERE author_did = '{BOB}'")).fetch_one(h.pool()).await.expect("count");
+    let stored: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM follows WHERE author = (SELECT id FROM dids WHERE did = '{BOB}')")).fetch_one(h.pool()).await.expect("count");
     assert_eq!(stored, 100);
     assert!(!h.flag(BOB).await.set);
     assert!(h.job(BOB, Depth::Authz).await.is_none());
@@ -2416,7 +2438,7 @@ async fn t43_only_a_row_that_appears_or_changes_clears() {
     h.pds.set_rev(ALICE, R2);
     h.clear_jobs().await;
     assert_eq!(h.run(&b, ALICE, Depth::Member).await, JobOutcome::Ready);
-    let revs: Vec<String> = sqlx::query_scalar(&format!("SELECT DISTINCT rev FROM follows WHERE author_did = '{ALICE}'")).fetch_all(h.pool()).await.expect("revs");
+    let revs: Vec<String> = sqlx::query_scalar(&format!("SELECT DISTINCT bigint_to_rev(rev) FROM follows WHERE author =(SELECT id FROM dids WHERE did = '{ALICE}')")).fetch_all(h.pool()).await.expect("revs");
     assert_eq!(revs, [R2]);
     let after = h.flag(ALICE).await;
     assert!(after.set);
@@ -2786,9 +2808,15 @@ async fn pre_s10_count_query_counts_each_kind() {
             "INSERT INTO private_audiences (uri, owner_did, rkey, cid, rev, mode, members) \
              VALUES ('at://{EVE}/{NSID_AUDIENCE}/3kt45eveaud1', '{EVE}', '3kt45eveaud1', 'bafy', '{REV}', 'following', '{{}}')"
         ),
+        // The DIDs interned first; each follow keyed by the TID of value `i`.
         format!(
-            "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) \
-             SELECT 'at://{EVE}/app.bsky.graph.follow/' || i, '{EVE}', 'did:plc:x' || i, '{REV}', now() FROM generate_series(1, 10000) AS i"
+            "INSERT INTO dids (did) SELECT d FROM (SELECT '{EVE}' AS d UNION SELECT 'did:plc:x' || i FROM generate_series(1, 10000) AS i) u \
+             ON CONFLICT (did) DO NOTHING"
+        ),
+        format!(
+            "INSERT INTO follows (author, rkey, subject, rev, created_at) \
+             SELECT (SELECT id FROM dids WHERE did = '{EVE}'), i, s.id, rev_to_bigint('{REV}'), now() \
+             FROM generate_series(1, 10000) AS i JOIN dids s ON s.did = 'did:plc:x' || i"
         ),
     ] {
         exec(&w.f.pool, &sql).await;

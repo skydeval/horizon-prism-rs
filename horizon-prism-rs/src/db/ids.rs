@@ -67,6 +67,115 @@ pub const COLLECTIONS: [(i16, &str); 34] = [
 /// The `coll` value of an odd reference.
 pub const ODD_COLL: i16 = 0;
 
+/// An owner table of `odd_refs` rows (`odd_refs.tbl`). Its id is the
+/// collection id of the records it holds, so it never changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OddTable {
+    Follows,
+}
+
+impl OddTable {
+    #[must_use]
+    pub const fn id(self) -> i16 {
+        match self {
+            Self::Follows => 4,
+        }
+    }
+}
+
+/// Which reference of its owner row an `odd_refs` row holds
+/// (`odd_refs.slot`). Stable: stored values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+    Root,
+    Parent,
+    Quote,
+    Subject,
+    Via,
+    List,
+}
+
+impl Slot {
+    #[must_use]
+    pub const fn id(self) -> i16 {
+        match self {
+            Self::Root => 1,
+            Self::Parent => 2,
+            Self::Quote => 3,
+            Self::Subject => 4,
+            Self::Via => 5,
+            Self::List => 6,
+        }
+    }
+}
+
+/// A reference as its owner row stores it: whole, or odd with its text and
+/// the authority's id when that is a valid DID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredRef {
+    Whole { author: AccountId, coll: i16, rkey: i64 },
+    Odd { author: Option<AccountId>, raw: String },
+}
+
+impl StoredRef {
+    /// The owner row's `(author, coll, rkey)` columns.
+    #[must_use]
+    pub fn columns(&self) -> (Option<AccountId>, i16, Option<i64>) {
+        match self {
+            Self::Whole { author, coll, rkey } => (Some(*author), *coll, Some(*rkey)),
+            Self::Odd { author, .. } => (*author, ODD_COLL, None),
+        }
+    }
+
+    /// The raw text of an odd reference.
+    #[must_use]
+    pub fn odd_raw(&self) -> Option<&str> {
+        match self {
+            Self::Odd { raw, .. } => Some(raw),
+            Self::Whole { .. } => None,
+        }
+    }
+}
+
+/// The DID a reference URI names, when it is a valid one: what to intern
+/// before [`stored_ref`].
+#[must_use]
+pub fn ref_did(uri: &str) -> Option<String> {
+    match uri_parts(uri) {
+        UriParts::Whole { did, .. } => Some(did),
+        UriParts::Odd { did } => did,
+    }
+}
+
+/// The record key a whole reference URI names, with its authority: what to
+/// give [`Ids::rkey_ids`] before [`stored_ref`].
+#[must_use]
+pub fn ref_rkey(uri: &str) -> Option<(String, String)> {
+    match uri_parts(uri) {
+        UriParts::Whole { did, rkey, .. } => Some((did, rkey)),
+        UriParts::Odd { .. } => None,
+    }
+}
+
+/// A reference URI as stored, from ids already interned. A whole URI whose
+/// authority or key has no id here is kept odd, which reads back the same.
+#[must_use]
+pub fn stored_ref(uri: &str, accounts: &HashMap<String, AccountId>, rkeys: &HashMap<(AccountId, String), i64>) -> StoredRef {
+    match uri_parts(uri) {
+        UriParts::Whole { did, coll, rkey } => {
+            let author = accounts.get(&did).copied();
+            match author.and_then(|a| rkeys.get(&(a, rkey)).map(|k| (a, *k))) {
+                Some((author, rkey)) => StoredRef::Whole { author, coll, rkey },
+                None => StoredRef::Odd { author, raw: uri.to_string() },
+            }
+        }
+        UriParts::Odd { did } => StoredRef::Odd {
+            author: did.and_then(|d| accounts.get(&d).copied()),
+            raw: uri.to_string(),
+        },
+    }
+}
+
 /// A collection's id in the fixed list.
 #[must_use]
 pub fn collection_id(nsid: &str) -> Option<i16> {

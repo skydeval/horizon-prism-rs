@@ -69,16 +69,18 @@ impl T {
 
     /// `author` follows `subject`, `minutes_ago` minutes ago.
     async fn follow(&self, author: &str, subject: &str, minutes_ago: i64) {
-        self.exec(&format!(
-            "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-             ('at://{author}/app.bsky.graph.follow/{}', '{author}', '{subject}', '3k', now() - interval '{minutes_ago} minutes')",
-            &subject[8..16]
-        ))
-        .await;
+        crate::test_support::graph::Edge::follow(author, subject, &subject[8..16])
+            .at(chrono::Utc::now() - chrono::TimeDelta::minutes(minutes_ago))
+            .put(self.p())
+            .await;
     }
 
     async fn unfollow(&self, author: &str, subject: &str) {
-        self.exec(&format!("DELETE FROM follows WHERE author_did = '{author}' AND subject_did = '{subject}'")).await;
+        self.exec(&format!(
+            "DELETE FROM follows WHERE author = (SELECT id FROM dids WHERE did = '{author}') \
+             AND subject = (SELECT id FROM dids WHERE did = '{subject}')"
+        ))
+        .await;
     }
 
     /// `author` liked a post of `subject` `days_ago` days ago.

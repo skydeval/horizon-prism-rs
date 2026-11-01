@@ -652,6 +652,111 @@ pub mod hooks {
     }
 }
 
+/// Test rows of the id-keyed graph tables, written from DID text and record
+/// key text as ingest would store them.
+pub mod graph {
+    use chrono::{DateTime, Utc};
+    use sqlx::PgPool;
+
+    use crate::db::ids::{Ids, rev_value};
+
+    /// A row to write: `table` is `follows` or `blocks`.
+    #[derive(Debug, Clone)]
+    pub struct Edge<'a> {
+        pub table: &'static str,
+        pub author: &'a str,
+        pub subject: &'a str,
+        pub rkey: &'a str,
+        pub rev: &'a str,
+        pub created_at: Option<DateTime<Utc>>,
+    }
+
+    /// The rev rows get unless a test names one: the lowest TID above the
+    /// inbound-block sentinel, so any real write wins and the row is not
+    /// taken for a sentinel row. (A rev that is not a TID is stored as the
+    /// sentinel's value.)
+    pub const REV: &str = "2222222222223";
+
+    impl<'a> Edge<'a> {
+        /// A follow at [`REV`], created now.
+        #[must_use]
+        pub fn follow(author: &'a str, subject: &'a str, rkey: &'a str) -> Self {
+            Self { table: "follows", author, subject, rkey, rev: REV, created_at: None }
+        }
+
+        /// A block at [`REV`], created now.
+        #[must_use]
+        pub fn block(author: &'a str, subject: &'a str, rkey: &'a str) -> Self {
+            Self { table: "blocks", author, subject, rkey, rev: REV, created_at: None }
+        }
+
+        #[must_use]
+        pub fn rev(mut self, rev: &'a str) -> Self {
+            self.rev = rev;
+            self
+        }
+
+        #[must_use]
+        pub fn at(mut self, created_at: DateTime<Utc>) -> Self {
+            self.created_at = Some(created_at);
+            self
+        }
+
+        /// Write the row, interning its DIDs and key first.
+        ///
+        /// # Panics
+        ///
+        /// On a database error or a DID or key that is not valid.
+        pub async fn put(&self, pool: &PgPool) {
+            let ids = Ids::new(pool.clone());
+            let accounts = ids.account_ids(&[self.author.to_string(), self.subject.to_string()]).await.expect("intern");
+            let author = accounts[self.author];
+            let rkey = ids.rkey_ids(&[(author, self.rkey.to_string())]).await.expect("alias")[&(author, self.rkey.to_string())];
+            sqlx::query(&format!(
+                "INSERT INTO {} (author, rkey, subject, rev, created_at) VALUES ($1, $2, $3, $4, COALESCE($5, now()))",
+                self.table
+            ))
+            .bind(author)
+            .bind(rkey)
+            .bind(accounts[self.subject])
+            .bind(rev_value(self.rev))
+            .bind(self.created_at)
+            .execute(pool)
+            .await
+            .expect("graph row");
+        }
+    }
+
+    /// A follow at [`REV`], created now.
+    pub async fn follow(pool: &PgPool, author: &str, subject: &str, rkey: &str) {
+        Edge::follow(author, subject, rkey).put(pool).await;
+    }
+
+    /// A block at [`REV`], created now.
+    pub async fn block(pool: &PgPool, author: &str, subject: &str, rkey: &str) {
+        Edge::block(author, subject, rkey).put(pool).await;
+    }
+
+    /// The URI of every row of `table`, ordered by URI text.
+    pub async fn uris(pool: &PgPool, table: &str) -> Vec<String> {
+        let coll = if table == "follows" { 4 } else { 5 };
+        sqlx::query_scalar(&format!("SELECT at_uri(author, {coll}::smallint, rkey) FROM {table} ORDER BY 1"))
+            .fetch_all(pool)
+            .await
+            .expect("graph uris")
+    }
+
+    /// Every row of `table` as `(author DID, subject DID)`, ordered.
+    pub async fn pairs(pool: &PgPool, table: &str) -> Vec<(String, String)> {
+        sqlx::query_as(&format!(
+            "SELECT a.did, s.did FROM {table} t JOIN dids a ON a.id = t.author JOIN dids s ON s.id = t.subject ORDER BY 1, 2"
+        ))
+        .fetch_all(pool)
+        .await
+        .expect("graph pairs")
+    }
+}
+
 /// A fresh database with no migrations applied (migration tests).
 pub async fn empty_db(test: &str) -> Option<TestDb> {
     let Ok(admin_url) = std::env::var(ENV) else {

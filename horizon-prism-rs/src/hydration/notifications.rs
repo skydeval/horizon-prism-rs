@@ -50,8 +50,8 @@ const EXCLUSIONS: &str = "NOT COALESCE(n.reason_subject LIKE 'at://%/tools.kryph
        AND (m.scope = 'full' \
          OR (m.scope IN ('reposts', 'reposts_and_quotes') AND n.reason IN ('repost', 'repost-via-repost')) \
          OR (m.scope IN ('quotes', 'reposts_and_quotes') AND n.reason = 'quote'))) \
-     AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = n.author_did) \
-                     OR (b.author_did = n.author_did AND b.subject_did = $1)) \
+     AND NOT EXISTS (SELECT 1 FROM blocks b, dids x, dids y WHERE x.did = $1 AND y.did = n.author_did \
+                     AND ((b.author = x.id AND b.subject = y.id) OR (b.author = y.id AND b.subject = x.id))) \
      AND NOT EXISTS (SELECT 1 FROM list_references r \
                      JOIN subscribed_lists l ON l.list_uri = r.list_uri \
                      JOIN subscribed_list_items i ON i.list_uri = r.list_uri \
@@ -68,7 +68,8 @@ const EXCLUSIONS: &str = "NOT COALESCE(n.reason_subject LIKE 'at://%/tools.kryph
 fn preference_clause(hidden: usize, follows: usize) -> String {
     format!(
         "n.reason <> ALL(${hidden}::text[]) AND (n.reason <> ALL(${follows}::text[]) \
-           OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = n.author_did))"
+           OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
+                      WHERE fa.did = $1 AND fs.did = n.author_did))"
     )
 }
 
@@ -96,7 +97,7 @@ const FARSIGHT_AUTHORS: usize = 100;
 /// and CID.
 type SubjectRow = (String, String, Option<String>, DateTime<Utc>, Option<String>, Option<String>);
 /// A follow row: URI, subject, `created_at`, `via` URI and CID.
-type FollowRow = (String, String, DateTime<Utc>, Option<String>, Option<String>);
+type FollowRow = (String, String, DateTime<Utc>, Option<String>, Option<Vec<u8>>);
 
 #[derive(Debug, sqlx::FromRow)]
 struct NotificationRow {
@@ -144,15 +145,27 @@ impl Hydrator {
                 out.insert(uri, record);
             }
         }
-        let follows: Vec<FollowRow> =
-            sqlx::query_as("SELECT uri, subject_did, created_at, via_uri, via_cid FROM follows WHERE uri = ANY($1)")
-                .bind(&uris)
-                .fetch_all(self.pool())
-                .await?;
+        // A follow's `via` comes back as its text: rebuilt from its key, or
+        // read from `odd_refs` when it is odd.
+        let follows: Vec<FollowRow> = sqlx::query_as(
+            "SELECT u.uri, fs.did, f.created_at, \
+               CASE WHEN f.via_coll = 0 THEN (SELECT o.raw FROM odd_refs o \
+                      WHERE o.tbl = 4 AND o.author = f.author AND o.rkey = f.rkey AND o.slot = 5) \
+                    WHEN f.via_coll IS NOT NULL THEN at_uri(f.via_author, f.via_coll, f.via_rkey) END, \
+               f.via_cid \
+             FROM unnest($1::text[]) AS u(uri) \
+             CROSS JOIN LATERAL ref_of(u.uri) r \
+             JOIN follows f ON f.author = r.author AND f.rkey = r.rkey \
+             JOIN dids fs ON fs.id = f.subject \
+             WHERE r.coll = 4",
+        )
+        .bind(&uris)
+        .fetch_all(self.pool())
+        .await?;
         for (uri, subject, created, via_uri, via_cid) in follows {
             let mut record = json!({"$type": "app.bsky.graph.follow", "subject": subject, "createdAt": ts(created)});
             if let Some(via) = via_uri {
-                record["via"] = json!({"uri": via, "cid": via_cid.unwrap_or_default()});
+                record["via"] = json!({"uri": via, "cid": via_cid.as_deref().map(crate::db::ids::cid_from_db).unwrap_or_default()});
             }
             out.insert(uri, record);
         }
@@ -303,7 +316,10 @@ impl Hydrator {
         let followed: std::collections::HashSet<String> = if prefs.follows_only.is_empty() {
             std::collections::HashSet::new()
         } else {
-            sqlx::query_scalar("SELECT subject_did FROM follows WHERE author_did = $1 AND subject_did = ANY($2)")
+            sqlx::query_scalar(
+                "SELECT fs.did FROM follows f JOIN dids fs ON fs.id = f.subject \
+                 WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND fs.did = ANY($2)",
+            )
                 .bind(me)
                 .bind(&authors)
                 .fetch_all(self.pool())
@@ -423,8 +439,8 @@ impl Hydrator {
                 "SELECT n.author_did FROM notifications n WHERE n.recipient_did = $1 \
                    AND n.indexed_at > COALESCE($2::timestamptz, \
                        (SELECT seen_at FROM notification_seen WHERE did = $1), '-infinity') \
-                   AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.author_did = $1 AND b.subject_did = n.author_did) \
-                                   OR (b.author_did = n.author_did AND b.subject_did = $1)) \
+                   AND NOT EXISTS (SELECT 1 FROM blocks b, dids x, dids y WHERE x.did = $1 AND y.did = n.author_did \
+                                   AND ((b.author = x.id AND b.subject = y.id) OR (b.author = y.id AND b.subject = x.id))) \
                  GROUP BY n.author_did ORDER BY max(n.indexed_at) DESC LIMIT $3",
             )
             .bind(me)
@@ -613,7 +629,7 @@ mod tests {
         );
         exec(p, &format!("INSERT INTO likes (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES ('{like}', '{BOB}', '{root}', 'bafyroot', '3k', now())")).await;
         exec(p, &format!("INSERT INTO reposts (uri, author_did, subject_uri, subject_cid, rev, created_at) VALUES ('{repost}', '{BOB}', '{root}', 'bafyroot', '3k', now())")).await;
-        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('{follow}', '{BOB}', '{ALICE}', '3k', now())")).await;
+        crate::test_support::graph::follow(p, BOB, ALICE, "3kfollow").await;
         for (reason, uri, subject) in [
             ("reply", &reply, Some(&root)),
             ("mention", &mention, None),
@@ -637,7 +653,7 @@ mod tests {
         }
         // Carol blocks Alice; Alice blocks Dave. Both directions exclude.
         for (i, (author, subject, n)) in [(CAROL, ALICE, "carol"), (ALICE, DAVE, "dave")].into_iter().enumerate() {
-            exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{author}/app.bsky.graph.block/{i}', '{author}', '{subject}', '3k', now())")).await;
+            crate::test_support::graph::block(p, author, subject, &i.to_string()).await;
             let other = if author == ALICE { subject } else { author };
             exec(p, &format!("INSERT INTO notifications (recipient_did, author_did, reason, record_uri, record_cid) VALUES ('{ALICE}', '{other}', 'follow', 'at://{other}/app.bsky.graph.follow/{n}', 'bafy')")).await;
         }
@@ -694,10 +710,7 @@ mod tests {
             actor(p, d, h, h).await;
         }
         for (author, n) in [(BOB, 1), (BOB, 2), (CAROL, 3)] {
-            exec(p, &format!(
-                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://{author}/app.bsky.graph.follow/{n}', '{author}', '{ALICE}', '3k', now())"
-            )).await;
+            crate::test_support::graph::follow(p, author, ALICE, &n.to_string()).await;
             exec(p, &format!(
                 "INSERT INTO notifications (recipient_did, author_did, reason, record_uri, record_cid) VALUES \
                  ('{ALICE}', '{author}', 'follow', 'at://{author}/app.bsky.graph.follow/{n}', 'bafy')"
@@ -781,7 +794,7 @@ mod tests {
         assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 0);
         let l = h.list_notifications(&me, &req, 50, None, &[]).await.expect("db").expect("view");
         assert_eq!(l.inner()["notifications"], json!([]));
-        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ALICE}/app.bsky.graph.follow/9', '{ALICE}', '{BOB}', '3k', now())")).await;
+        crate::test_support::graph::follow(p, ALICE, BOB, "9").await;
         assert_eq!(h.unread_count(&me).await.expect("db").expect("view").inner()["count"], 1);
         let l = h.list_notifications(&me, &req, 50, None, &[]).await.expect("db").expect("view");
         assert_eq!(reasons(l.inner()), ["reply"]);

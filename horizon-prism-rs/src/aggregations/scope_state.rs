@@ -394,8 +394,8 @@ async fn load_sets(pool: &PgPool, private: &dyn PrivateTier) -> Result<ScopeSets
         .fetch_all(pool)
         .await?;
     let follows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT f.author_did, count(*) FROM follows f \
-         WHERE EXISTS (SELECT 1 FROM members m WHERE m.did = f.author_did) GROUP BY f.author_did",
+        "SELECT fa.did, count(*) FROM follows f JOIN dids fa ON fa.id = f.author \
+         WHERE EXISTS (SELECT 1 FROM members m WHERE m.did = fa.did) GROUP BY fa.did",
     )
     .fetch_all(pool)
     .await?;

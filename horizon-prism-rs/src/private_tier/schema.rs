@@ -77,8 +77,8 @@ pub(super) async fn blocks_between(pool: &PgPool, a: &str, b: &str) -> Result<(b
 pub(super) fn blocks_between_statement() -> String {
     let one_way = |x: &str, y: &str| {
         format!(
-            "EXISTS (SELECT 1 FROM blocks WHERE author_did = {x} AND subject_did = {y}) \
-               OR {list}",
+            "{direct} OR {list}",
+            direct = block_edge(x, y),
             list = list_blocks(x, y),
         )
     };
@@ -177,9 +177,9 @@ pub(super) async fn snapshot(pool: &PgPool, rauth: &RecordAuthz) -> Result<Optio
 /// yet synced leaves the rule as it was without list blocks (§2.4).
 fn blocked(x: &str, y: &str) -> String {
     format!(
-        "(EXISTS (SELECT 1 FROM blocks b WHERE b.author_did = {x} AND b.subject_did = {y}) \
-          OR EXISTS (SELECT 1 FROM blocks b WHERE b.author_did = {y} AND b.subject_did = {x}) \
-          OR {xy} OR {yx})",
+        "({bxy} OR {byx} OR {xy} OR {yx})",
+        bxy = block_edge(x, y),
+        byx = block_edge(y, x),
         xy = list_blocks(x, y),
         yx = list_blocks(y, x),
     )
@@ -242,7 +242,26 @@ fn gate(uri: &str, author: &str, status: &str) -> String {
 /// A follow by `owner` naming `subject` is stored (SQL expressions;
 /// following-audience design §5.1).
 fn owner_follows(owner: &str, subject: &str) -> String {
-    format!("EXISTS (SELECT 1 FROM follows fo WHERE fo.author_did = {owner} AND fo.subject_did = {subject})")
+    follow_edge(owner, subject)
+}
+
+/// A stored follow by `author` of `subject` (SQL expressions of DID text).
+/// `follows` holds account ids, so both sides go through `dids`. The
+/// aliases are this builder's own, so callers' expressions never name them.
+fn follow_edge(author: &str, subject: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM follows fo JOIN dids foa ON foa.id = fo.author JOIN dids fos ON fos.id = fo.subject \
+           WHERE foa.did = {author} AND fos.did = {subject})"
+    )
+}
+
+/// A stored direct block by `author` of `subject` (SQL expressions of DID
+/// text), through `dids` as [`follow_edge`].
+fn block_edge(author: &str, subject: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM blocks bk JOIN dids bka ON bka.id = bk.author JOIN dids bks ON bks.id = bk.subject \
+           WHERE bka.did = {author} AND bks.did = {subject})"
+    )
 }
 
 /// The follow-verification flag holds for `owner` (SQL expression;
@@ -283,10 +302,11 @@ fn step_ok(owner: &str, mode: &str, members: &str, reader: &str) -> String {
                NOT {author_owner} \
                AND CASE COALESCE({mode}, 'list') \
                      WHEN 'list' THEN s.author_did = ANY({members}) \
-                     WHEN 'followers' THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = s.author_did AND f.subject_did = {owner}) \
+                     WHEN 'followers' THEN {author_follows_owner} \
                      WHEN 'everyone' THEN true \
                      WHEN 'following' THEN {owner_follows_author} AND {verified} \
                      ELSE false END))",
+        author_follows_owner = follow_edge("s.author_did", owner),
         reader_author = blocked(reader, "s.author_did"),
         gate = gate_shows("s.uri", "s.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = s.author_did)"),
         author_owner = blocked("s.author_did", owner),
@@ -525,10 +545,11 @@ fn standing(d: &str, o: &str, verified: &str, mapped: bool) -> String {
     format!(
         "CASE COALESCE(a.mode, 'list') \
            WHEN 'list' THEN {listed} \
-           WHEN 'followers' THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = {d} AND f.subject_did = {o}) \
+           WHEN 'followers' THEN {follower} \
            WHEN 'everyone' THEN true \
            WHEN 'following' THEN {follows} AND {verified} \
            ELSE false END",
+        follower = follow_edge(d, o),
         follows = owner_follows(o, d),
         listed = listed(d, mapped),
     )
@@ -541,11 +562,11 @@ fn reader_inside() -> String {
     format!(
         "CASE COALESCE(a.mode, 'list') \
            WHEN 'list' THEN {listed} \
-           WHEN 'followers' THEN a.owner_did = $1 OR EXISTS ( \
-             SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = a.owner_did) \
+           WHEN 'followers' THEN a.owner_did = $1 OR {follower} \
            WHEN 'everyone' THEN true \
            WHEN 'following' THEN a.owner_did = $1 OR ({follows} AND {verified}) \
            ELSE false END",
+        follower = follow_edge("$1", "a.owner_did"),
         follows = owner_follows("a.owner_did", "$1"),
         verified = follows_verified("a.owner_did"),
         listed = listed("$1", true),
@@ -1527,8 +1548,7 @@ pub(super) fn head_prefilter() -> String {
            a.uri IS NOT NULL \
            AND CASE COALESCE(a.mode, 'list') \
                  WHEN 'list' THEN $1 = ANY(a.members) \
-                 WHEN 'followers' THEN a.owner_did = $1 OR EXISTS ( \
-                   SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = a.owner_did) \
+                 WHEN 'followers' THEN a.owner_did = $1 OR {viewer_follows_owner} \
                  WHEN 'everyone' THEN true \
                  WHEN 'following' THEN a.owner_did = $1 OR ({owner_follows_viewer} AND {owner_verified}) \
                  ELSE false END \
@@ -1540,12 +1560,13 @@ pub(super) fn head_prefilter() -> String {
                     AND NOT {author_owner} \
                     AND CASE COALESCE(a.mode, 'list') \
                           WHEN 'list' THEN p.author_did = ANY(a.members) \
-                          WHEN 'followers' THEN EXISTS ( \
-                            SELECT 1 FROM follows f WHERE f.author_did = p.author_did AND f.subject_did = a.owner_did) \
+                          WHEN 'followers' THEN {author_follows_owner} \
                           WHEN 'everyone' THEN true \
                           WHEN 'following' THEN {owner_follows_author} AND {owner_verified} \
                           ELSE false END \
                     AND {walk})))))",
+        viewer_follows_owner = follow_edge("$1", "a.owner_did"),
+        author_follows_owner = follow_edge("p.author_did", "a.owner_did"),
         gate = gate_shows("p.uri", "p.author_did", "po.account_status"),
         viewer_author = blocked("$1", "p.author_did"),
         viewer_owner = blocked("$1", "a.owner_did"),
@@ -1578,7 +1599,7 @@ pub(super) fn pre_s0_count_sql_with_cap(cap: u32) -> String {
           AND ao.account_status = 'active') AS served_today,
          EXISTS (SELECT 1 FROM members m WHERE m.did = p.author_did) AS writer_member,
          EXISTS (SELECT 1 FROM members m WHERE m.did = a.owner_did) AS owner_member,
-         EXISTS (SELECT 1 FROM follows f WHERE f.author_did = p.author_did AND f.subject_did = a.owner_did) AS writer_follows
+         {writer_follows} AS writer_follows
   FROM private_posts p
   JOIN private_audiences a ON a.uri = p.audience_uri
   LEFT JOIN actors po ON po.did = p.author_did
@@ -1608,6 +1629,7 @@ SELECT
     AS starts_serving_status
 FROM y;",
         walk = anchored_with_cap("x.reply_parent_uri", "x.audience_uri", "x.owner_did", "x.mode", "x.members", "''", cap),
+        writer_follows = follow_edge("p.author_did", "a.owner_did"),
     )
 }
 
@@ -1750,7 +1772,7 @@ SELECT
   (SELECT count(*) FROM a) AS following_audiences,
   (SELECT count(*) FROM o) AS following_owners,
   (SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM members m WHERE m.did = o.owner_did)) AS following_owners_members,
-  (SELECT count(*) FROM o WHERE (SELECT count(*) FROM follows f WHERE f.author_did = o.owner_did) >= 10000)
+  (SELECT count(*) FROM o WHERE (SELECT count(*) FROM follows f JOIN dids fa ON fa.id = f.author WHERE fa.did = o.owner_did) >= 10000)
     AS owners_10k_stored_follows,
   (SELECT count(*) FROM x WHERE x.author_did = x.owner_did) AS own_posts,
   (SELECT count(*) FROM x WHERE x.author_did <> x.owner_did) AS cross_owner_posts,
@@ -1797,10 +1819,11 @@ SELECT
 pub(super) fn pre_s12_count_sql() -> String {
     let head_may_write = "CASE COALESCE(a0.mode, 'list') \
            WHEN 'list' THEN p.author_did = ANY(a0.members) \
-           WHEN 'followers' THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = p.author_did AND f.subject_did = a0.owner_did) \
+           WHEN 'followers' THEN {author_follows} \
            WHEN 'everyone' THEN true \
            WHEN 'following' THEN {owner_follows} AND {verified} \
            ELSE false END"
+        .replace("{author_follows}", &follow_edge("p.author_did", "a0.owner_did"))
         .replace("{owner_follows}", &owner_follows("a0.owner_did", "p.author_did"))
         .replace("{verified}", &follows_verified("a0.owner_did"));
     let head = |cap: u32| {
@@ -1897,7 +1920,7 @@ WHERE r.author_did = t.author_did
 ///
 /// Database errors.
 pub(super) async fn follows(pool: &PgPool, author: &str, subject: &str) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+    sqlx::query_scalar(&format!("SELECT {}", follow_edge("$1", "$2")))
         .bind(author)
         .bind(subject)
         .fetch_one(pool)
@@ -2438,9 +2461,11 @@ pub(super) async fn fanout_candidates(
            AND EXISTS (SELECT 1 FROM scope_dids sd WHERE sd.did = $1) \
            AND EXISTS (SELECT 1 FROM sync_state y WHERE y.did = $1 AND y.last_resync_at IS NOT NULL) \
            AND d.allow IN ('followers', 'mutuals') \
-           AND EXISTS (SELECT 1 FROM follows f WHERE f.author_did = s.subscriber_did AND f.subject_did = $1) \
+           AND EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
+                       WHERE fa.did = s.subscriber_did AND fs.did = $1) \
            AND (d.allow <> 'mutuals' \
-                OR EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = s.subscriber_did)) \
+                OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
+                           WHERE fa.did = $1 AND fs.did = s.subscriber_did)) \
            AND NOT EXISTS (SELECT 1 FROM private_notifications n \
                            WHERE n.recipient_did = s.subscriber_did AND n.record_uri = $2) \
            AND NOT EXISTS (SELECT 1 FROM thread_mutes t \
@@ -2817,14 +2842,16 @@ pub(super) fn timeline_statement(cap: u32) -> String {
     let c = format!(
         "(SELECT {COLS}, p.created_at, p.uri COLLATE \"C\" AS key, NULL::text AS repost_uri, NULL::text AS reposter \
           FROM private_posts p \
-          WHERE (p.author_did = $1 OR p.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
+          WHERE (p.author_did = $1 OR p.author_did IN (SELECT fs.did FROM follows f JOIN dids fs ON fs.id = f.subject \
+                                                       WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = $1))) \
             AND {post_muted} \
             AND ($2::timestamptz IS NULL OR (p.created_at, p.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
           ORDER BY p.created_at DESC, p.uri COLLATE \"C\" DESC LIMIT $4) \
          UNION ALL \
          (SELECT {COLS}, rp.created_at, rp.uri COLLATE \"C\", rp.uri, rp.author_did \
           FROM reposts rp JOIN private_posts p ON p.uri = rp.subject_uri \
-          WHERE (rp.author_did = $1 OR rp.author_did IN (SELECT f.subject_did FROM follows f WHERE f.author_did = $1)) \
+          WHERE (rp.author_did = $1 OR rp.author_did IN (SELECT fs.did FROM follows f JOIN dids fs ON fs.id = f.subject \
+                                                         WHERE f.author = (SELECT fa.id FROM dids fa WHERE fa.did = $1))) \
             AND {repost} AND {reposter_muted} \
             AND ($2::timestamptz IS NULL OR (rp.created_at, rp.uri COLLATE \"C\") < ($2, $3 COLLATE \"C\")) \
           ORDER BY rp.created_at DESC, rp.uri COLLATE \"C\" DESC LIMIT $4) \
@@ -3310,7 +3337,8 @@ pub(super) const PREFERRED: &str = "CASE \
           -> (CASE n.reason WHEN 'subscribed-post' THEN 'subscribedPost' ELSE n.reason END)) ->> 'list') = 'false' THEN false \
    WHEN (((SELECT q.prefs FROM private_notification_prefs q WHERE q.did = $1) \
           -> (CASE n.reason WHEN 'subscribed-post' THEN 'subscribedPost' ELSE n.reason END)) ->> 'include') = 'follows' \
-     THEN EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = n.author_did) \
+     THEN EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
+                  WHERE fa.did = $1 AND fs.did = n.author_did) \
    ELSE true END";
 
 /// The recipient `$1`'s `push` preference passes the row `n`: not

@@ -194,9 +194,10 @@ impl Rebuild {
             // Each member's earliest follows up to the cap (§9.4).
             let cap = i64::from(self.scope.max_follow_scope_per_member());
             let followed: Vec<String> = sqlx::query_scalar(
-                "SELECT DISTINCT subject_did FROM ( \
-                   SELECT f.subject_did, row_number() OVER (PARTITION BY f.author_did ORDER BY f.created_at, f.uri) AS n \
-                   FROM follows f JOIN members m ON m.did = f.author_did) t WHERE n <= $1",
+                "SELECT DISTINCT fs.did FROM ( \
+                   SELECT f.subject, row_number() OVER (PARTITION BY f.author ORDER BY f.created_at, f.author, f.rkey) AS n \
+                   FROM follows f JOIN dids fa ON fa.id = f.author JOIN members m ON m.did = fa.did) t \
+                 JOIN dids fs ON fs.id = t.subject WHERE n <= $1",
             )
             .bind(cap)
             .fetch_all(&self.pool)
@@ -241,7 +242,8 @@ impl Rebuild {
             let subscribed: Vec<String> = sqlx::query_scalar(
                 "SELECT DISTINCT a.subject_did FROM activity_subscriptions a \
                    JOIN members m ON m.did = a.subscriber_did \
-                  WHERE EXISTS (SELECT 1 FROM follows f WHERE f.author_did = a.subscriber_did AND f.subject_did = a.subject_did) \
+                  WHERE EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
+                                WHERE fa.did = a.subscriber_did AND fs.did = a.subject_did) \
                     AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = a.subject_did)",
             )
             .fetch_all(&self.pool)
@@ -505,8 +507,8 @@ impl Rebuild {
 
     async fn reload_follow_counts(&self) -> Result<(), sqlx::Error> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT f.author_did, count(*) FROM follows f \
-             WHERE EXISTS (SELECT 1 FROM members m WHERE m.did = f.author_did) GROUP BY f.author_did",
+            "SELECT fa.did, count(*) FROM follows f JOIN dids fa ON fa.id = f.author \
+             WHERE EXISTS (SELECT 1 FROM members m WHERE m.did = fa.did) GROUP BY fa.did",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -690,8 +692,8 @@ pub async fn repair_counts(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO actor_counts (did, followers_count, follows_count, posts_count) \
          SELECT d, sum(fr)::int, sum(fs)::int, sum(p)::int FROM ( \
-           SELECT subject_did AS d, 1 AS fr, 0 AS fs, 0 AS p FROM follows \
-           UNION ALL SELECT author_did, 0, 1, 0 FROM follows \
+           SELECT s.did AS d, 1 AS fr, 0 AS fs, 0 AS p FROM follows f JOIN dids s ON s.id = f.subject \
+           UNION ALL SELECT a.did, 0, 1, 0 FROM follows f JOIN dids a ON a.id = f.author \
            UNION ALL SELECT author_did, 0, 0, 1 FROM posts \
          ) t GROUP BY d",
     )

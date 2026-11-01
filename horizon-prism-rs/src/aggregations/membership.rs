@@ -152,7 +152,7 @@ pub async fn add_member(
     if became_owner {
         jobs::enqueue(&mut tx, did, Depth::Private).await?;
     }
-    let follows: i64 = sqlx::query_scalar("SELECT count(*) FROM follows WHERE author_did = $1")
+    let follows: i64 = sqlx::query_scalar("SELECT count(*) FROM follows WHERE author = (SELECT id FROM dids WHERE did = $1)")
         .bind(did)
         .fetch_one(&mut *tx)
         .await?;

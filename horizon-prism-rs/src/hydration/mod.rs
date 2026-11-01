@@ -864,26 +864,38 @@ impl Hydrator {
         }
         let p = self.pool();
         let following: Vec<(String, String)> =
-            sqlx::query_as("SELECT subject_did, uri FROM follows WHERE author_did = $1 AND subject_did = ANY($2)")
+            sqlx::query_as(
+                "SELECT fs.did, at_uri(f.author, 4::smallint, f.rkey) FROM follows f JOIN dids fs ON fs.id = f.subject \
+                 WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND fs.did = ANY($2)",
+            )
                 .bind(me)
                 .bind(dids)
                 .fetch_all(p)
                 .await?;
         let followed_by: Vec<(String, String)> =
-            sqlx::query_as("SELECT author_did, uri FROM follows WHERE subject_did = $1 AND author_did = ANY($2)")
+            sqlx::query_as(
+                "SELECT fa.did, at_uri(f.author, 4::smallint, f.rkey) FROM follows f JOIN dids fa ON fa.id = f.author \
+                 WHERE f.subject = (SELECT id FROM dids WHERE did = $1) AND fa.did = ANY($2)",
+            )
                 .bind(me)
                 .bind(dids)
                 .fetch_all(p)
                 .await?;
         // `blocks`: `app.bsky.graph.block` (§7.5).
         let blocking: Vec<(String, String)> =
-            sqlx::query_as("SELECT subject_did, uri FROM blocks WHERE author_did = $1 AND subject_did = ANY($2)")
+            sqlx::query_as(
+                "SELECT bs.did, at_uri(b.author, 5::smallint, b.rkey) FROM blocks b JOIN dids bs ON bs.id = b.subject \
+                 WHERE b.author = (SELECT id FROM dids WHERE did = $1) AND bs.did = ANY($2)",
+            )
                 .bind(me)
                 .bind(dids)
                 .fetch_all(p)
                 .await?;
         let blocked_by: Vec<String> =
-            sqlx::query_scalar("SELECT author_did FROM blocks WHERE subject_did = $1 AND author_did = ANY($2)")
+            sqlx::query_scalar(
+                "SELECT ba.did FROM blocks b JOIN dids ba ON ba.id = b.author \
+                 WHERE b.subject = (SELECT id FROM dids WHERE did = $1) AND ba.did = ANY($2)",
+            )
                 .bind(me)
                 .bind(dids)
                 .fetch_all(p)

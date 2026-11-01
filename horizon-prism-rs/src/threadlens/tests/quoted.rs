@@ -206,7 +206,7 @@ async fn upstream_quote_posts_are_marked_whole() {
     let base = fake_appview(Arc::clone(&fake)).await;
     let cache = ReadCache::new(1024 * 1024);
     let (farsight, _far) = crate::farsight::lookup::tests::engine("").await;
-    exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{BLOCKER}/app.bsky.graph.block/3kb', '{BLOCKER}', '{VIEWER_A}', '3kaaaaaaaaaa2', now())")).await;
+    crate::test_support::graph::block(p, BLOCKER, VIEWER_A, "3kb").await;
     let h = hydrator_with_upstream_and_farsight(p, ScopeSets::default(), Arc::new(real_upstream(&base, cache.clone())), farsight);
     let l = ladder(h.clone(), &base, Arc::new(StubLookup::default()));
     let url = serve(state(h, l, ThreadLensAccess::Members)).await;

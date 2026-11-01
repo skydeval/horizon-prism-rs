@@ -148,7 +148,7 @@ async fn tn1_the_reasons_agree_with_the_read_rule() {
 
     // Each change: its SQL, its undo, and the reasons it gives (the rest
     // stay served).
-    let unfollow = format!("DELETE FROM follows WHERE author_did = '{BOB}' AND subject_did = '{ALICE}'");
+    let unfollow = super::graph_delete_sql("follows", BOB, Some(ALICE));
     let status = |s: &str| format!("UPDATE actors SET account_status = '{s}' WHERE did = '{ALICE}'");
     let label = |subject: &str, val: &str| format!("INSERT INTO labels (subject, val) VALUES ('{subject}', '{val}')");
     let unblock = "DELETE FROM blocks".to_string();
@@ -256,7 +256,7 @@ async fn tn1_the_reasons_agree_with_the_read_rule() {
     // `not_served` keeps only the posts that are not served.
     let faults = schema::not_served(&w.f.pool, BOB, &asked, CAP).await.expect("not_served");
     w.check(faults.is_empty(), format!("faults while served: {faults:?}"));
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}'")).await;
+    exec(&w.f.pool, &super::graph_delete_sql("follows", BOB, None)).await;
     let faults = schema::not_served(&w.f.pool, BOB, &asked, CAP).await.expect("not_served");
     let want = schema::ThreadFault { standing: true, ..Default::default() };
     w.check(faults.len() == 1 && faults.get(&s.rb) == Some(&want), format!("faults after an unfollow: {faults:?}"));
@@ -575,7 +575,7 @@ async fn tn2_tn3_tn6_tn7_tn8_the_marker_is_the_authors_alone() {
     // tells a block from a missing follow), his reply below Carol's is
     // `standing` too; Carol, reading Bob's unserved reply, misses it and
     // sees no marker.
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}' AND subject_did = '{ALICE}'")).await;
+    exec(&w.f.pool, &super::graph_delete_sql("follows", BOB, Some(ALICE))).await;
     let unfollowed = body_of(&w, BOB, &[&rb]).await;
     w.check(unfollowed == bodies[0], format!("a block and an unfollow differ:\n{}\n{unfollowed}", bodies[0]));
     let (_, views) = posts_of(&w.base, BOB, &[&rb, &rb2]).await;

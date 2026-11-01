@@ -102,9 +102,16 @@ pub(super) async fn base_snapshot(pool: &PgPool) {
                    FROM generate_series(1, {BASE_POSTS}) g) s"
         ),
         format!("INSERT INTO private_owner_ready (did, ready_at) SELECT {m}, now() FROM generate_series(1, {BASE_AUDIENCES}) g"),
+        // Dave's follows, keyed by id: the DIDs interned first, then one
+        // row each with the TID of value `g` as its key.
         format!(
-            "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) \
-             SELECT 'at://{DAVE}/app.bsky.graph.follow/b5f' || g, '{DAVE}', {m}, '3k', now() FROM generate_series(1, 200) g"
+            "INSERT INTO dids (did) SELECT x FROM (SELECT '{DAVE}' AS x UNION SELECT {m} FROM generate_series(1, 200) g) u \
+             ON CONFLICT (did) DO NOTHING"
+        ),
+        format!(
+            "INSERT INTO follows (author, rkey, subject, rev, created_at) \
+             SELECT (SELECT id FROM dids WHERE did = '{DAVE}'), g, (SELECT id FROM dids WHERE did = {m}), rev_to_bigint('3k'), now() \
+             FROM generate_series(1, 200) g"
         ),
     ] {
         exec(pool, &sql).await;

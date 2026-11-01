@@ -631,7 +631,8 @@ impl Hydrator {
         }
         qb.push(
             " ORDER BY EXISTS (SELECT 1 FROM members m WHERE m.did = a.did) DESC, \
-                       EXISTS (SELECT 1 FROM follows f WHERE f.author_did = $1 AND f.subject_did = a.did) DESC, \
+                       EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
+                               WHERE fa.did = $1 AND fs.did = a.did) DESC, \
                        (a.handle = ",
         );
         qb.push_bind(q.clone()).push(") DESC, length(a.handle), a.handle LIMIT ").push_bind(i64::from(limit.clamp(1, 100)));
@@ -782,10 +783,8 @@ mod tests {
         actor(p, ALICE, "alice.test", "Alice").await;
         actor(p, BOB, "bob.test", "Bob").await;
         exec(p, "INSERT INTO members (did, source) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin')").await;
-        exec(p, "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.follow/1', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '3k', now())").await;
-        exec(p, "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.graph.block/1', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', '3k', now())").await;
+        crate::test_support::graph::follow(p, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "1").await;
+        crate::test_support::graph::block(p, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "1").await;
         exec(p, "INSERT INTO labels (subject, val) VALUES ('did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', 'porn')").await;
         let h = hydrator(p, sets());
         let req = Requester::test();
@@ -1041,10 +1040,7 @@ mod tests {
         let mut n = 0;
         for (author, subject) in [(ALICE, CAROL), (ALICE, DAVE), (CAROL, BOB), (DAVE, BOB), (ERIN, BOB)] {
             n += 1;
-            exec(p, &format!(
-                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://{author}/app.bsky.graph.follow/{n}', '{author}', '{subject}', '3k', now())"
-            )).await;
+            crate::test_support::graph::follow(p, author, subject, &n.to_string()).await;
         }
         let mut sets = ScopeSets::default();
         for d in [ALICE, BOB, CAROL] {
@@ -1159,11 +1155,11 @@ mod tests {
 
         // An account the viewer follows comes before the others; one it
         // mutes or blocks is left out of both searches.
-        exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{DAVE}/app.bsky.graph.follow/1', '{DAVE}', '{CAROL}', '3k', now())")).await;
+        crate::test_support::graph::follow(p, DAVE, CAROL, "1").await;
         let found = h.search_actors_typeahead(&me, &req, "al", 10).await.expect("db").expect("view");
         assert_eq!(dids(found.inner().clone()), [ALICE, CAROL, BOB]);
         exec(p, &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{DAVE}', '{BOB}')")).await;
-        exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ALICE}/app.bsky.graph.block/1', '{ALICE}', '{DAVE}', '3k', now())")).await;
+        crate::test_support::graph::block(p, ALICE, DAVE, "1").await;
         let found = h.search_actors_typeahead(&me, &req, "al", 10).await.expect("db").expect("view");
         assert_eq!(dids(found.inner().clone()), [CAROL]);
         let found = h.search_actors(&me, &req, "al", 10, None).await.expect("db").expect("view");

@@ -44,7 +44,7 @@ impl Hydrator {
         let follows = |from: &'_ str, to: &'_ str| {
             let (from, to) = (from.to_string(), to.to_string());
             async move {
-                sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM follows WHERE author_did = $1 AND subject_did = $2)")
+                sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = $2)")
                     .bind(from)
                     .bind(to)
                     .fetch_one(self.pool())
@@ -216,11 +216,7 @@ mod tests {
         };
         let req = Requester::test();
         let follow = |from: &'static str, to: &'static str| async move {
-            exec(p, &format!(
-                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://{from}/app.bsky.graph.follow/{}', '{from}', '{to}', '3k', now())",
-                &to[8..12]
-            )).await;
+            crate::test_support::graph::follow(p, from, to, &to[8..12]).await;
         };
         let declare = |did: &'static str, allow: &'static str| async move {
             exec(p, &format!(
@@ -307,11 +303,7 @@ mod tests {
         for (d, handle) in [(ME, "me.test"), (BOB, "bob.test")] {
             actor(p, d, handle, handle).await;
         }
-        exec(p, &format!(
-            "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-             ('at://{ME}/app.bsky.graph.follow/1', '{ME}', '{BOB}', '3k', now())"
-        ))
-        .await;
+        crate::test_support::graph::follow(p, ME, BOB, "1").await;
         let mut sets = ScopeSets::default();
         sets.scope.insert(ME.into());
         sets.scope.insert(BOB.into());

@@ -119,9 +119,11 @@ impl Hydrator {
         }
         let (at, after) = parse_local_cursor(cursor);
         let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT subject_did, uri, created_at FROM follows WHERE author_did = $1 \
-             AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-             ORDER BY created_at DESC, uri DESC LIMIT $4",
+            "SELECT fs.did, at_uri(f.author, 4::smallint, f.rkey), f.created_at FROM follows f \
+             JOIN dids fs ON fs.id = f.subject \
+             WHERE f.author = (SELECT id FROM dids WHERE did = $1) \
+             AND ($2::timestamptz IS NULL OR (f.created_at, f.rkey) < ($2, COALESCE((SELECT r.rkey FROM ref_of($3) r), '-9223372036854775808'::bigint))) \
+             ORDER BY f.created_at DESC, f.rkey DESC LIMIT $4",
         )
         .bind(&did)
         .bind(at)
@@ -164,9 +166,13 @@ impl Hydrator {
         }
         let (at, after) = parse_local_cursor(cursor);
         let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT author_did, uri, created_at FROM follows WHERE subject_did = $1 \
-             AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-             ORDER BY created_at DESC, uri DESC LIMIT $4",
+            "SELECT fa.did, at_uri(f.author, 4::smallint, f.rkey), f.created_at FROM follows f \
+             JOIN dids fa ON fa.id = f.author \
+             WHERE f.subject = (SELECT id FROM dids WHERE did = $1) \
+             AND ($2::timestamptz IS NULL OR (f.created_at, f.author, f.rkey) < ($2, \
+                  COALESCE((SELECT r.author FROM ref_of($3) r), '-2147483648'::integer), \
+                  COALESCE((SELECT r.rkey FROM ref_of($3) r), '-9223372036854775808'::bigint))) \
+             ORDER BY f.created_at DESC, f.author DESC, f.rkey DESC LIMIT $4",
         )
         .bind(&did)
         .bind(at)
@@ -274,9 +280,11 @@ impl Hydrator {
         };
         let (at, after) = parse_local_cursor(cursor);
         let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT subject_did, uri, created_at FROM blocks WHERE author_did = $1 \
-             AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-             ORDER BY created_at DESC, uri DESC LIMIT $4",
+            "SELECT bs.did, at_uri(b.author, 5::smallint, b.rkey), b.created_at FROM blocks b \
+             JOIN dids bs ON bs.id = b.subject \
+             WHERE b.author = (SELECT id FROM dids WHERE did = $1) \
+             AND ($2::timestamptz IS NULL OR (b.created_at, b.rkey) < ($2, COALESCE((SELECT r.rkey FROM ref_of($3) r), '-9223372036854775808'::bigint))) \
+             ORDER BY b.created_at DESC, b.rkey DESC LIMIT $4",
         )
         .bind(me)
         .bind(at)
@@ -316,16 +324,20 @@ impl Hydrator {
         pages: u32,
         deadline: Option<Instant>,
     ) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
-        let mine: HashSet<String> = sqlx::query_scalar("SELECT subject_did FROM follows WHERE author_did = $1")
+        let mine: HashSet<String> = sqlx::query_scalar(
+            "SELECT fs.did FROM follows f JOIN dids fs ON fs.id = f.subject WHERE f.author = (SELECT id FROM dids WHERE did = $1)",
+        )
             .bind(me)
             .fetch_all(self.pool())
             .await?
             .into_iter()
             .collect();
         let stored: Vec<(String, String)> = sqlx::query_as(
-            "SELECT subject_did, author_did FROM follows WHERE subject_did = ANY($2) \
-               AND author_did IN (SELECT subject_did FROM follows WHERE author_did = $1) \
-             ORDER BY created_at DESC, author_did",
+            "SELECT fs.did, fa.did FROM follows f \
+             JOIN dids fs ON fs.id = f.subject JOIN dids fa ON fa.id = f.author \
+             WHERE fs.did = ANY($2) \
+               AND f.author IN (SELECT m.subject FROM follows m WHERE m.author = (SELECT id FROM dids WHERE did = $1)) \
+             ORDER BY f.created_at DESC, f.author",
         )
         .bind(me)
         .bind(subjects)
@@ -576,8 +588,9 @@ fn is_post_uri(uri: &str) -> bool {
 mod tests {
     use super::*;
     use crate::aggregations::ScopeSets;
-    use crate::hydration::testing::{actor, exec, hydrator};
+    use crate::hydration::testing::{actor, hydrator};
     use crate::test_support::fresh_db;
+    use crate::test_support::graph::Edge;
 
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
@@ -598,12 +611,10 @@ mod tests {
         let mut n = 0;
         for (author, subject, age) in [(ALICE, BOB, 0), (ALICE, carol, 0), (ALICE, erin, 0), (BOB, dave, 2), (carol, dave, 1), (erin, dave, 0), ("did:plc:ssssssssssssssssssssssss", dave, 0)] {
             n += 1;
-            exec(p, &format!(
-                "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://{author}/app.bsky.graph.follow/{n}', '{author}', '{subject}', '3k', now() - interval '{age} minutes')"
-            )).await;
+            let rkey = n.to_string();
+            Edge::follow(author, subject, &rkey).at(chrono::Utc::now() - chrono::TimeDelta::minutes(age)).put(p).await;
         }
-        exec(p, &format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{erin}/app.bsky.graph.block/1', '{erin}', '{ALICE}', '3k', now())")).await;
+        crate::test_support::graph::block(p, erin, ALICE, "1").await;
         // Dave is in scope: his handle resolves locally (§11 G-9).
         let mut sets = ScopeSets::default();
         sets.scope.insert(dave.into());
@@ -652,9 +663,7 @@ mod tests {
         }
         // Alice follows Carol, whom only Constellation knows as Bob's
         // follower, on the first page. Every later page takes a minute.
-        exec(p, &format!(
-            "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{ALICE}/app.bsky.graph.follow/1', '{ALICE}', '{carol}', '3k', now())"
-        )).await;
+        crate::test_support::graph::follow(p, ALICE, carol, "1").await;
         let router = axum::Router::new().route(
             "/links/distinct-dids",
             get(move |Query(q): Query<HashMap<String, String>>| async move {
@@ -691,8 +700,7 @@ mod tests {
         let p = &db.pool;
         actor(p, ALICE, "alice.test", "Alice").await;
         actor(p, BOB, "bob.test", "Bob").await;
-        exec(p, "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.follow/1', 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '3k', now())").await;
+        crate::test_support::graph::follow(p, ALICE, BOB, "1").await;
         let mut sets = ScopeSets::default();
         sets.scope.insert(ALICE.into());
         sets.scope.insert(BOB.into());
@@ -771,10 +779,7 @@ mod tests {
         let carol = "did:plc:cccccccccccccccccccccccc";
         actor(p, carol, "carol.test", "Carol").await;
         for (author, subject, rkey, age) in [(ALICE, BOB, "b1", 2), (ALICE, carol, "b2", 1), (BOB, ALICE, "b3", 0)] {
-            exec(p, &format!(
-                "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES \
-                 ('at://{author}/app.bsky.graph.block/{rkey}', '{author}', '{subject}', '3k', now() - interval '{age} minutes')"
-            )).await;
+            Edge::block(author, subject, rkey).at(chrono::Utc::now() - chrono::TimeDelta::minutes(age)).put(p).await;
         }
         let b = h.get_blocks(&me, &req, 50, None).await.expect("db").expect("view");
         let blocks = b.inner()["blocks"].as_array().expect("blocks");

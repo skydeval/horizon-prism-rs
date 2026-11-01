@@ -19,6 +19,11 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Smaller follow and block tables.** Follows and blocks are stored by
+  account id and record key, about a quarter of the space. Follows created
+  at the same moment may list in a different order. **Upgrade:** start once
+  with `APP_ALLOW_STARTUP_MIGRATE=1` (migration 0055 rewrites both tables in
+  one transaction; it needs free space for a second copy of them).
 - **Indexing modes renamed.** `indexing.public_scope` is now
   `kryphocron_only` (was `off`), `community` (was `community_scoped`) or
   `full` (not built yet). **Upgrade:** change the value in `config/app.toml`

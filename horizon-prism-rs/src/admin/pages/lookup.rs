@@ -159,7 +159,10 @@ async fn read_rows(state: &AdminState, did: &str) -> Result<Rows, sqlx::Error> {
 async fn block_counts(state: &AdminState, did: &str) -> Result<(i64, i64), sqlx::Error> {
     let mut tx = state.pool.begin().await?;
     sqlx::query("SET LOCAL statement_timeout = '2s'").execute(&mut *tx).await?;
-    let counts = sqlx::query_as("SELECT (SELECT count(*) FROM blocks WHERE author_did = $1), (SELECT count(*) FROM blocks WHERE subject_did = $1)")
+    let counts = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM blocks WHERE author = (SELECT id FROM dids WHERE did = $1)), \
+                (SELECT count(*) FROM blocks WHERE subject = (SELECT id FROM dids WHERE did = $1))",
+    )
         .bind(did)
         .fetch_one(&mut *tx)
         .await?;

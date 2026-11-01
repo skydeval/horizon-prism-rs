@@ -238,7 +238,9 @@ pub async fn run(
             _ => {
                 #[cfg(test)]
                 crate::test_support::hooks::pause_in(crate::test_support::hooks::PASS_BEFORE_REREAD, writer.pool(), did).await;
-                let now_rev: Option<String> = sqlx::query_scalar("SELECT rev FROM follows WHERE uri = $1")
+                let now_rev: Option<String> = sqlx::query_scalar(
+                    "SELECT bigint_to_rev(f.rev) FROM follows f, ref_of($1) r WHERE f.author = r.author AND f.rkey = r.rkey",
+                )
                     .bind(uri)
                     .fetch_optional(writer.pool())
                     .await
@@ -274,7 +276,10 @@ async fn contradiction(writer: &Writer, did: &str, out: &mut PassOutcome, uri: &
 }
 
 async fn stored_follows(writer: &Writer, did: &str) -> Result<HashMap<String, Stored>, sqlx::Error> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT uri, subject_did, rev FROM follows WHERE author_did = $1")
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT at_uri(f.author, 4::smallint, f.rkey), s.did, bigint_to_rev(f.rev) FROM follows f JOIN dids s ON s.id = f.subject \
+         WHERE f.author = (SELECT id FROM dids WHERE did = $1)",
+    )
         .bind(did)
         .fetch_all(writer.pool())
         .await?;

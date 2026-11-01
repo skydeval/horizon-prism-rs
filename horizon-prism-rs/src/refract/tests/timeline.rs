@@ -61,7 +61,7 @@ async fn t12_timeline() {
     for (did, handle) in [(R1, "r1.test"), (R2, "r2.test"), (OTHER, "o.test"), (MEMBER, "m.test")] {
         actor(p, did, handle, handle).await;
     }
-    exec(p, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{MEMBER}/app.bsky.graph.follow/1', '{MEMBER}', '{R1}', '3k', now())")).await;
+    crate::test_support::graph::follow(p, MEMBER, R1, "1").await;
     let top = post(p, R1, "3ktop", "top", None, None).await;
     let theirs = post(p, OTHER, "3kother", "other", None, None).await;
     let to_other = post(p, R1, "3kreplyother", "reply", Some(&theirs), Some(&theirs)).await;

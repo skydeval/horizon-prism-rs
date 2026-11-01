@@ -364,7 +364,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // writer, so every clone of the writer carries its tap; only with the
     // web UI on.
     let live_hub = cfg.file.admin.web_ui.then(|| crate::admin::live::Hub::new(cfg.file.admin.live_feed_snippets));
-    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private));
+    // One id interning for the process: every writer shares its cache.
+    let ids = crate::db::ids::Ids::new(pool.clone());
+    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private)).with_ids(ids);
     let writer = match &live_hub {
         Some(hub) => writer.with_feed(hub.tap()),
         None => writer,

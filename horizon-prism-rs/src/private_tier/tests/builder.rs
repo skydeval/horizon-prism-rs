@@ -103,7 +103,7 @@ async fn mixed(w: &Walk) -> Vec<String> {
         uris.push(uri);
     }
     w.label(&uris[5], "!hide").await;
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{CAROL}' AND subject_did = '{ALICE}'")).await;
+    exec(&w.f.pool, &super::graph_delete_sql("follows", CAROL, Some(ALICE))).await;
     uris
 }
 

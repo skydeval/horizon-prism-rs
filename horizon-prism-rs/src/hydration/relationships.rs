@@ -39,9 +39,12 @@ impl Hydrator {
     /// Record URIs by the other party's DID: rows of `table` from `actor`
     /// to any of `others` (`outbound`), or from any of `others` to `actor`.
     async fn edges(&self, table: &str, actor: &str, others: &[String], outbound: bool) -> Result<Vec<(String, String, String)>, sqlx::Error> {
-        let (from, to) = if outbound { ("author_did = $1", "subject_did = ANY($2)") } else { ("subject_did = $1", "author_did = ANY($2)") };
+        let (from, to) = if outbound { ("a.did = $1", "s.did = ANY($2)") } else { ("s.did = $1", "a.did = ANY($2)") };
+        let coll = if table == "follows" { 4 } else { 5 };
         sqlx::query_as(&format!(
-            "SELECT author_did, subject_did, uri FROM {table} WHERE {from} AND {to} ORDER BY created_at, uri"
+            "SELECT a.did, s.did, at_uri(t.author, {coll}::smallint, t.rkey) FROM {table} t \
+             JOIN dids a ON a.id = t.author JOIN dids s ON s.id = t.subject \
+             WHERE {from} AND {to} ORDER BY t.created_at, t.author, t.rkey"
         ))
         .bind(actor)
         .bind(others)
@@ -187,9 +190,11 @@ mod tests {
     async fn edge(p: &sqlx::PgPool, table: &str, author: &str, subject: &str, rkey: &str) -> String {
         let collection = if table == "follows" { "follow" } else { "block" };
         let uri = format!("at://{author}/app.bsky.graph.{collection}/{rkey}");
-        exec(p, &format!(
-            "INSERT INTO {table} (uri, author_did, subject_did, rev, created_at) VALUES ('{uri}', '{author}', '{subject}', '3k', now())"
-        )).await;
+        if table == "follows" {
+            crate::test_support::graph::follow(p, author, subject, rkey).await;
+        } else {
+            crate::test_support::graph::block(p, author, subject, rkey).await;
+        }
         uri
     }
 

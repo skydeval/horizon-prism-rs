@@ -703,9 +703,7 @@ async fn the_private_timeline_holds_readable_posts_of_followed_authors() {
     f.ready(ALICE).await;
     f.ready(BOB).await;
     let base = serve(f.state(Some(Duration::from_secs(1)))).await;
-    let follow = |from: &str, to: &str| {
-        format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{from}/app.bsky.graph.follow/1', '{from}', '{to}', '3k', now())")
-    };
+    let follow = |from: &str, to: &str| graph_row_sql("follows", from, to, "1", "3k", "now()");
     let texts = |body: &str| {
         let v: Value = serde_json::from_str(body).expect("json");
         let mut texts: Vec<String> = v["feed"].as_array().expect("feed").iter().map(|p| p["record"]["text"].as_str().expect("text").to_string()).collect();
@@ -791,12 +789,8 @@ async fn audience_modes_admit_by_follow_and_respect_blocks() {
         let base = base.clone();
         async move { get(&base, FEED, &format!("actor={ALICE}"), did, key).await.1 }
     };
-    let follow = |from: &str, to: &str| {
-        format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ('at://{from}/app.bsky.graph.follow/1', '{from}', '{to}', '3k', now())")
-    };
-    let block = |from: &str, to: &str| {
-        format!("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ('at://{from}/app.bsky.graph.block/1', '{from}', '{to}', '3k', now())")
-    };
+    let follow = |from: &str, to: &str| graph_row_sql("follows", from, to, "1", "3k", "now()");
+    let block = |from: &str, to: &str| graph_row_sql("blocks", from, to, "1", "3k", "now()");
 
     // The author reads all five. A member that does not follow reads
     // `everyone` alone, though `members` names it.
@@ -819,7 +813,7 @@ async fn audience_modes_admit_by_follow_and_respect_blocks() {
     assert_eq!(miss, r#"{"posts":[]}"#);
 
     // Unfollowing ends it.
-    exec(&f.pool, &format!("DELETE FROM follows WHERE author_did = '{BOB}'")).await;
+    exec(&f.pool, &graph_delete_sql("follows", BOB, None)).await;
     assert_eq!(texts(&feed(BOB, BOB_KEY).await, "feed"), ["everyone"]);
     exec(&f.pool, &follow(BOB, ALICE)).await;
 
@@ -930,19 +924,40 @@ fn key_of(did: &str) -> u8 {
 }
 
 fn follow_sql(from: &str, to: &str) -> String {
-    format!(
-        "INSERT INTO follows (uri, author_did, subject_did, rev, created_at) \
-         VALUES ('at://{from}/app.bsky.graph.follow/{}', '{from}', '{to}', '3k', now())",
-        &to[8..]
-    )
+    graph_row_sql("follows", from, to, &to[8..], "3k", "now()")
 }
 
 fn block_sql(from: &str, to: &str) -> String {
+    graph_row_sql("blocks", from, to, &to[8..], "3k", "now()")
+}
+
+/// One statement that stores a `follows` or `blocks` row from DID text and
+/// record key text, as ingest keys it: both DIDs interned in `dids`, a key
+/// that is not a TID given an alias, the rev in rev order. `created` is an
+/// SQL expression. A test's own fixture: it interns inside the statement,
+/// which only an autocommit test write may do.
+fn graph_row_sql(table: &str, from: &str, to: &str, rkey: &str, rev: &str, created: &str) -> String {
     format!(
-        "INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) \
-         VALUES ('at://{from}/app.bsky.graph.block/{}', '{from}', '{to}', '3k', now())",
-        &to[8..]
+        "WITH v AS (SELECT '{from}'::text AS a, '{to}'::text AS s, '{rkey}'::text AS k), \
+         nd AS (INSERT INTO dids (did) SELECT u.x FROM (SELECT a AS x FROM v UNION SELECT s FROM v) u \
+                WHERE NOT EXISTS (SELECT 1 FROM dids o WHERE o.did = u.x) ON CONFLICT (did) DO NOTHING RETURNING id, did), \
+         d AS (SELECT id, did FROM nd UNION ALL SELECT id, did FROM dids WHERE did IN (SELECT a FROM v UNION SELECT s FROM v)), \
+         na AS (INSERT INTO rkey_aliases (author, rkey) SELECT d.id, v.k FROM v JOIN d ON d.did = v.a \
+                WHERE rkey_to_bigint(v.k) IS NULL \
+                  AND NOT EXISTS (SELECT 1 FROM rkey_aliases x WHERE x.author = d.id AND x.rkey = v.k) \
+                ON CONFLICT (author, rkey) DO NOTHING RETURNING id), \
+         k AS (SELECT id FROM na UNION ALL SELECT x.id FROM rkey_aliases x JOIN d ON d.id = x.author JOIN v ON v.a = d.did AND x.rkey = v.k) \
+         INSERT INTO {table} (author, rkey, subject, rev, created_at) \
+         SELECT da.id, COALESCE(rkey_to_bigint(v.k), (SELECT id FROM k LIMIT 1)), ds.id, rev_to_bigint('{rev}'), {created} \
+         FROM v JOIN d da ON da.did = v.a JOIN d ds ON ds.did = v.s"
     )
+}
+
+/// Delete the `follows` or `blocks` rows by `author` (and naming `subject`,
+/// when given), by DID text.
+fn graph_delete_sql(table: &str, author: &str, subject: Option<&str>) -> String {
+    let subject = subject.map_or(String::new(), |s| format!(" AND subject = (SELECT id FROM dids WHERE did = '{s}')"));
+    format!("DELETE FROM {table} WHERE author = (SELECT id FROM dids WHERE did = '{author}'){subject}")
 }
 
 /// A list block by `member` of `owner`'s list `rkey` naming `subjects`
@@ -1250,7 +1265,7 @@ async fn walk_limits(test: &str, layout: Layout) {
     }
     // Once Alice unfollows the level-3 author, levels 3 to 9 are read by
     // their authors only (the step at level 3 no longer stands).
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{ALICE}' AND subject_did = '{BOB}'")).await;
+    exec(&w.f.pool, &graph_delete_sql("follows", ALICE, Some(BOB))).await;
     for (i, (author, uri)) in follow_chain.iter().enumerate() {
         let level = i + 1;
         w.expect(&format!("following, level-3 author unfollowed, level {level}"), DAVE, uri, level < 3).await;
@@ -1327,7 +1342,7 @@ async fn modes_and_writers(test: &str, layout: Layout) {
         ("following, flag NULL", &[BOB, DAVE], false, false, false),
     ];
     for (case, follows, holds, dave_reads, alice_reads) in states {
-        exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{ALICE}'")).await;
+        exec(&w.f.pool, &graph_delete_sql("follows", ALICE, None)).await;
         for did in follows {
             exec(&w.f.pool, &follow_sql(ALICE, did)).await;
         }
@@ -1337,7 +1352,7 @@ async fn modes_and_writers(test: &str, layout: Layout) {
         w.expect(case, BOB, &following, true).await;
     }
     // The blocks below run with the first state.
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{ALICE}'")).await;
+    exec(&w.f.pool, &graph_delete_sql("follows", ALICE, None)).await;
     for did in [BOB, DAVE] {
         exec(&w.f.pool, &follow_sql(ALICE, did)).await;
     }
@@ -1808,7 +1823,7 @@ async fn pre_s0_count_query_counts_each_kind() {
     // Served before and after: Bob follows Alice.
     w.reply(BOB, "3kfine222222", &root).await;
     // The `followers` residual, member writer and member owner.
-    exec(&w.f.pool, &format!("DELETE FROM follows WHERE author_did = '{CAROL}'")).await;
+    exec(&w.f.pool, &graph_delete_sql("follows", CAROL, None)).await;
     w.reply(CAROL, "3kresidual22", &root).await;
     // Every Bob post starts being served under a non-hiding status.
     exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'throttled' WHERE did = '{BOB}'")).await;
@@ -3529,8 +3544,7 @@ async fn repost_items_in(mode: PublicMode, test: &str) {
     let bobs = f.private_post(BOB, "3kbobspost22", &aud_bob, None).await;
     // Carol follows Bob and Eve, not Alice.
     exec(&f.pool, &follow_sql(CAROL, BOB)).await;
-    exec(&f.pool, &format!("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) \
-                            VALUES ('at://{CAROL}/app.bsky.graph.follow/eve', '{CAROL}', '{EVE}', '3k', now())")).await;
+    exec(&f.pool, &graph_row_sql("follows", CAROL, EVE, "eve", "3k", "now()")).await;
     f.ready_all().await;
     let base = serve(f.state(Some(Duration::from_secs(1)))).await;
     let before = timeline_pages(&base).await;

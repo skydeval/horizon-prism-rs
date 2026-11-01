@@ -141,6 +141,8 @@ mod tests {
             "0053_indexing_mode_names",
             // Compact storage: shared ids and codecs.
             "0054_compact_ids",
+            // Compact storage: follows and blocks.
+            "0055_compact_follows_blocks",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

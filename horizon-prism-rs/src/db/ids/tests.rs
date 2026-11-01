@@ -175,6 +175,146 @@ async fn interning_selects_first_and_survives_a_race() {
     db.drop_db().await;
 }
 
+/// Migration 0055 over rows in the old shape: every follow and block is
+/// keyed and reads back as it was stored, odd `via` texts land in
+/// `odd_refs`, counts are copied as they are, a row that cannot be keyed is
+/// left out, and the new triggers work.
+#[tokio::test]
+async fn migration_0055_moves_follows_and_blocks() {
+    let Some(db) = crate::test_support::empty_db("migration_0055").await else { return };
+    let p = &db.pool;
+    let migrations: Vec<_> = crate::db::migrations::MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()).collect();
+    let at = migrations.iter().position(|m| m.version == 55).expect("0055");
+    for m in &migrations[..at] {
+        sqlx::raw_sql(&m.sql).execute(p).await.unwrap_or_else(|e| panic!("{}: {e}", m.version));
+    }
+    let pack = format!("at://{B}/app.bsky.graph.starterpack/3myp5txuf7s2d");
+    let odd = format!("at://{B}/com.example.pack/3myp5txuf7s2d/");
+    let handle = "at://alice.example/app.bsky.graph.starterpack/self".to_string();
+    let follow = |rkey: &str| format!("at://{A}/app.bsky.graph.follow/{rkey}");
+    // (rkey, rev, via, via cid)
+    let rows: [(&str, &str, Option<&str>, Option<&str>); 5] = [
+        ("3myp5txuf7s2d", "3myp5txuf7s2d", Some(pack.as_str()), Some("bafyreidbcoifjdzsr3u5i74kbm427m5yic67grd54s4luhlt4xxntevd6m")),
+        ("self", "3myp5txuf7s2e", Some(odd.as_str()), Some("BAFYODD")),
+        ("c222222222222", "2222222222222", Some(handle.as_str()), None),
+        ("3myp5txuf7s2f", "not-a-tid", None, None),
+        ("3myp5txuf7s2g", "3myp5txuf7s2g", None, None),
+    ];
+    for (rkey, rev, via, cid) in rows {
+        sqlx::query("INSERT INTO follows (uri, author_did, subject_did, rev, created_at, via_uri, via_cid) VALUES ($1, $2, $3, $4, '2026-10-01T00:00:00Z', $5, $6)")
+            .bind(follow(rkey))
+            .bind(A)
+            .bind(if rkey == "3myp5txuf7s2g" { A } else { B })
+            .bind(rev)
+            .bind(via)
+            .bind(cid)
+            .execute(p)
+            .await
+            .expect("old follow");
+    }
+    // Not keyable: a subject that is not a DID, and a URI that is not the
+    // author's own record.
+    for (uri, subject) in [(follow("3myp5txuf7s2h"), "bob.example"), (format!("at://{B}/app.bsky.graph.follow/3myp5txuf7s2i"), B)] {
+        sqlx::query("INSERT INTO follows (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, '3k', now())")
+            .bind(uri)
+            .bind(A)
+            .bind(subject)
+            .execute(p)
+            .await
+            .expect("odd follow");
+    }
+    sqlx::query("INSERT INTO blocks (uri, author_did, subject_did, rev, created_at) VALUES ($1, $2, $3, '2222222222222', now()), ($4, $3, $2, '3myp5txuf7s2d', now())")
+        .bind(format!("at://{A}/app.bsky.graph.block/3ka"))
+        .bind(A)
+        .bind(B)
+        .bind(format!("at://{B}/app.bsky.graph.block/3myp5txuf7s2d"))
+        .execute(p)
+        .await
+        .expect("old blocks");
+    let counts = || async {
+        let rows: Vec<(String, i32, i32)> = sqlx::query_as("SELECT did, follows_count, followers_count FROM actor_counts ORDER BY did")
+            .fetch_all(p)
+            .await
+            .expect("counts");
+        rows
+    };
+    let before = counts().await;
+
+    sqlx::raw_sql(&migrations[at].sql).execute(p).await.expect("0055 applies over existing rows");
+
+    assert_eq!(counts().await, before, "counts are copied as they are");
+    type Row = (String, String, String, Option<String>, Option<Vec<u8>>, i16);
+    let got: Vec<Row> = sqlx::query_as(
+        "SELECT at_uri(f.author, 4::smallint, f.rkey), s.did, bigint_to_rev(f.rev), \
+           CASE WHEN f.via_coll = 0 THEN (SELECT o.raw FROM odd_refs o WHERE o.tbl = 4 AND o.author = f.author AND o.rkey = f.rkey AND o.slot = 5) \
+                WHEN f.via_coll IS NOT NULL THEN at_uri(f.via_author, f.via_coll, f.via_rkey) END, \
+           f.via_cid, COALESCE(f.via_coll, -1::smallint) \
+         FROM follows f JOIN dids s ON s.id = f.subject ORDER BY at_uri(f.author, 4::smallint, f.rkey) COLLATE \"C\"",
+    )
+    .fetch_all(p)
+    .await
+    .expect("follows");
+    let want: Vec<Row> = {
+        let mut w: Vec<Row> = rows
+            .iter()
+            .map(|(rkey, rev, via, cid)| {
+                let rev = if proto_blue::syntax::Tid::is_valid(rev) { (*rev).to_string() } else { "2222222222222".to_string() };
+                let subject = if *rkey == "3myp5txuf7s2g" { A } else { B };
+                let coll = match *via {
+                    None => -1,
+                    Some(v) if v == pack => 11,
+                    Some(_) => 0,
+                };
+                (follow(rkey), subject.to_string(), rev, via.map(str::to_string), cid.map(|c| [&[0u8][..], c.as_bytes()].concat()), coll)
+            })
+            .collect();
+        w.sort();
+        w
+    };
+    assert_eq!(got, want);
+    for (_, _, _, _, cid, _) in &got {
+        if let Some(c) = cid {
+            assert_eq!(c[0], 0, "every CID is copied in its text form");
+        }
+    }
+    let odd_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM odd_refs WHERE tbl = 4 AND slot = 5").fetch_one(p).await.expect("odd");
+    assert_eq!(odd_rows, 2);
+    // A handle authority keeps no author; a valid DID's odd reference does.
+    let authors: Vec<Option<i32>> = sqlx::query_scalar("SELECT via_author FROM follows WHERE via_coll = 0 ORDER BY rkey").fetch_all(p).await.expect("authors");
+    assert_eq!(authors.iter().filter(|a| a.is_some()).count(), 1);
+    assert!(!sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM dids WHERE did = 'bob.example' OR did = 'alice.example')").fetch_one(p).await.expect("dids"));
+
+    let blocks: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT at_uri(b.author, 5::smallint, b.rkey), s.did, bigint_to_rev(b.rev) FROM blocks b JOIN dids s ON s.id = b.subject ORDER BY at_uri(b.author, 5::smallint, b.rkey) COLLATE \"C\"",
+    )
+    .fetch_all(p)
+    .await
+    .expect("blocks");
+    assert_eq!(
+        blocks,
+        [
+            (format!("at://{A}/app.bsky.graph.block/3ka"), B.to_string(), "2222222222222".to_string()),
+            (format!("at://{B}/app.bsky.graph.block/3myp5txuf7s2d"), A.to_string(), "3myp5txuf7s2d".to_string()),
+        ]
+    );
+    let sentinel: i64 = sqlx::query_scalar("SELECT min(rev) FROM blocks").fetch_one(p).await.expect("rev");
+    assert_eq!(sentinel, i64::MIN, "the sentinel rev is the lowest value");
+
+    // The new triggers: a follow counts, and an odd one's text goes with it.
+    let a: i32 = sqlx::query_scalar("SELECT id FROM dids WHERE did = $1").bind(A).fetch_one(p).await.expect("a");
+    let b: i32 = sqlx::query_scalar("SELECT id FROM dids WHERE did = $1").bind(B).fetch_one(p).await.expect("b");
+    sqlx::query("INSERT INTO follows (author, rkey, subject, rev, created_at) VALUES ($1, 1, $2, 0, now())").bind(b).bind(a).execute(p).await.expect("new follow");
+    let after = counts().await;
+    let of = |did: &str| after.iter().find(|r| r.0 == did).map(|r| (r.1, r.2));
+    let was = |did: &str| before.iter().find(|r| r.0 == did).map_or((0, 0), |r| (r.1, r.2));
+    assert_eq!(of(B), Some((was(B).0 + 1, was(B).1)));
+    assert_eq!(of(A), Some((was(A).0, was(A).1 + 1)));
+    sqlx::query("DELETE FROM follows WHERE via_coll = 0").execute(p).await.expect("delete odd");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM odd_refs").fetch_one(p).await.expect("odd left");
+    assert_eq!(left, 0, "odd texts go with their rows");
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn aliases_are_per_author_and_negative() {
     let Some(db) = fresh_db("compact_aliases").await else { return };
