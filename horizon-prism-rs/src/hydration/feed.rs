@@ -367,26 +367,19 @@ impl Hydrator {
         let counts = self.constellation_counts(req, &uris, mode).await;
         let gates = self.gate_many(req, &all_uris).await?;
         // A postgate counts only under its post's record key and author.
-        let detached: Vec<(String, Vec<String>)> = sqlx::query_as(
-            "SELECT post_uri, detached_embedding_uris FROM postgates WHERE post_uri = ANY($1) \
-               AND cardinality(detached_embedding_uris) > 0 \
-               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
-        )
-        .bind(&all_uris)
-        .fetch_all(self.pool())
-        .await?;
+        let detached: Vec<(String, Vec<String>)> = crate::db::gates::valid(self.pool(), crate::db::gates::Kind::Postgate, &all_uris)
+            .await?
+            .into_iter()
+            .map(|(post, g)| (post, g.detached()))
+            .filter(|(_, quotes)| !quotes.is_empty())
+            .collect();
         // A post's own valid threadgate, as its view (design-v3 §8.2).
-        let gate_rows: Vec<(String, String, String, Value, Option<Value>)> = sqlx::query_as(
-            "SELECT post_uri, uri, cid, record, allow FROM threadgates WHERE post_uri = ANY($1) \
-               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
-        )
-        .bind(&all_uris)
-        .fetch_all(self.pool())
-        .await?;
+        let gates_stored = crate::db::gates::valid(self.pool(), crate::db::gates::Kind::Threadgate, &all_uris).await?;
         let anonymous = Viewer::anonymous();
         let mut threadgates = HashMap::new();
-        for (post, uri, cid, record, allow) in gate_rows {
-            let view = self.threadgate_view(viewer.unwrap_or(&anonymous), req, &uri, &cid, record, allow.as_ref()).await?;
+        for (post, g) in gates_stored {
+            let allow = g.allow();
+            let view = self.threadgate_view(viewer.unwrap_or(&anonymous), req, &g.uri, &g.cid, g.record, allow.as_ref()).await?;
             threadgates.insert(post, view);
         }
         // `bookmarkCount`, when the operator lets it be shown (§8.2). In a
@@ -860,10 +853,7 @@ impl Hydrator {
             return Ok(Err(unknown()));
         }
         let members: Vec<String> = if local {
-            sqlx::query_scalar("SELECT DISTINCT subject_did FROM list_items WHERE list_uri = $1")
-                .bind(list)
-                .fetch_all(self.pool())
-                .await?
+            crate::db::lists::subjects(self.pool(), list).await?
         } else {
             Vec::new()
         };
@@ -1599,19 +1589,8 @@ mod tests {
         }
         // The valid gate detaches one quote. A gate under another record
         // key names the other, and is ignored.
-        for (rkey, names) in [("3kaaaaaaaaaa2", &detached), ("other", &kept)] {
-            sqlx::query(
-                "INSERT INTO postgates (uri, author_did, rkey, cid, rev, post_uri, detached_embedding_uris, record, created_at) \
-                 VALUES ($1, $2, $3, 'bafypg', '3k', $4, $5, '{}', now())",
-            )
-            .bind(format!("at://{ALICE}/app.bsky.feed.postgate/{rkey}"))
-            .bind(ALICE)
-            .bind(rkey)
-            .bind(&quoted)
-            .bind(vec![names.clone()])
-            .execute(p)
-            .await
-            .expect("postgate");
+        for (rkey, names) in [("3kaaaaaaaaaa2", &detached), ("3kaaaaaaaaaa7", &kept)] {
+            crate::test_support::records::postgate(p, ALICE, rkey, &quoted, None, &[names.as_str()]).await;
         }
         let h = hydrator(p, ScopeSets::default());
         let v = h.get_posts(&Viewer::anonymous(), &Requester::test(), &[detached.clone(), kept.clone()]).await.expect("db").expect("view");

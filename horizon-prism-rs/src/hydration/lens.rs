@@ -421,19 +421,13 @@ impl Hydrator {
         if roots.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows: Vec<(String, Option<Vec<String>>, Option<Value>)> = sqlx::query_as(
-            "SELECT post_uri, hidden_replies, allow FROM threadgates WHERE post_uri = ANY($1) \
-               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
-        )
-        .bind(roots)
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows
+        let gates = crate::db::gates::valid(self.pool(), crate::db::gates::Kind::Threadgate, roots).await?;
+        Ok(gates
             .into_iter()
-            .map(|(root, hidden, allow)| {
+            .map(|(root, g)| {
                 let gate = LensGate {
-                    hidden: hidden.unwrap_or_default().into_iter().collect(),
-                    allow: allow.and_then(|a| a.as_array().cloned()),
+                    hidden: g.hidden_replies().into_iter().collect(),
+                    allow: g.allow().and_then(|a| a.as_array().cloned()),
                 };
                 (root, gate)
             })
@@ -497,13 +491,7 @@ impl Hydrator {
                 "app.bsky.feed.threadgate#listRule" => {
                     let list = rule.get("list").and_then(Value::as_str).unwrap_or_default();
                     if super::lists::is_list_uri(list) && self.is_ready_member(uri_author(list).unwrap_or_default()).await? {
-                        Some(
-                            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_items WHERE list_uri = $1 AND subject_did = $2)")
-                                .bind(list)
-                                .bind(me)
-                                .fetch_one(self.pool())
-                                .await?,
-                        )
+                        Some(crate::db::lists::on_list(self.pool(), list, me).await?)
                     } else {
                         None
                     }

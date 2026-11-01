@@ -124,18 +124,8 @@ async fn covered_call_sites_fetch_viewer_private() {
 
     // `getBookmarks`' items: a stored post whose threadgate names G.
     let gated = post(p, BOB, "3kgated", "gated", None, None).await;
-    sqlx::query(
-        "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, hidden_replies, record, created_at) \
-         VALUES ($1, $2, '3kgated', 'bafygate', '3k', $3, $4, $5, '{\"$type\": \"app.bsky.feed.threadgate\"}', now())",
-    )
-    .bind(format!("at://{BOB}/app.bsky.feed.threadgate/3kgated"))
-    .bind(BOB)
-    .bind(&gated)
-    .bind(json!([{"$type": "app.bsky.feed.threadgate#listRule", "list": gate_list}]))
-    .bind(Vec::<String>::new())
-    .execute(p)
-    .await
-    .expect("gate");
+    let allow = json!([{"$type": "app.bsky.feed.threadgate#listRule", "list": gate_list}]);
+    crate::test_support::records::threadgate(p, BOB, "3kgated", &gated, Some(allow), &[]).await;
     exec(p, &format!("INSERT INTO bookmarks (viewer_did, post_uri, post_cid) VALUES ('{ALICE}', '{gated}', 'bafy')")).await;
     let marks = h.get_bookmarks(&me, &req, 50, None).await.expect("db").expect("bookmarks");
     assert_eq!(marks.inner()["bookmarks"][0]["item"]["threadgate"]["lists"][0]["uri"], json!(gate_list));
@@ -188,18 +178,8 @@ async fn private_context_hydration_fetches_nothing() {
     .await;
     // A stored public post whose threadgate names G.
     let gated = post(p, BOB, "3kgated", "gated", None, None).await;
-    sqlx::query(
-        "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, hidden_replies, record, created_at) \
-         VALUES ($1, $2, '3kgated', 'bafygate', '3k', $3, $4, $5, '{\"$type\": \"app.bsky.feed.threadgate\"}', now())",
-    )
-    .bind(format!("at://{BOB}/app.bsky.feed.threadgate/3kgated"))
-    .bind(BOB)
-    .bind(&gated)
-    .bind(json!([{"$type": "app.bsky.feed.threadgate#listRule", "list": gate_list}]))
-    .bind(Vec::<String>::new())
-    .execute(p)
-    .await
-    .expect("gate");
+    let allow = json!([{"$type": "app.bsky.feed.threadgate#listRule", "list": gate_list}]);
+    crate::test_support::records::threadgate(p, BOB, "3kgated", &gated, Some(allow), &[]).await;
     up.take_modes();
 
     let ctx = HydrationContext::private(&h, me.clone(), &req);

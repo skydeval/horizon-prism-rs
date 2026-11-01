@@ -297,7 +297,7 @@ async fn bad_sweep_states_reset_and_complete() {
     let at = rfc3339(&now());
     for bad in [
         json!({"table": "no_such_table", "after": null, "last_advanced_at": at}),
-        json!({"table": "threadgates", "after": 7, "last_advanced_at": at}),
+        json!({"table": "notifications", "after": [7], "last_advanced_at": at}),
         json!({"table": "notifications", "after": "7", "last_advanced_at": at}),
         json!({"table": "tag_activity_hourly", "after": ["rust"], "last_advanced_at": at}),
     ] {
@@ -572,18 +572,24 @@ fn sweep_seed() -> String {
     for (did, r) in [(B, "p1"), (B, "p2"), (MEMBER, "p3")] {
         sql += &crate::test_support::posts::row_sql(did, r);
     }
+    use crate::test_support::records::row_sql;
     for t in ["threadgates", "postgates"] {
-        sql += &format!("INSERT INTO {t} (uri, author_did, rkey, cid, rev, post_uri, record, created_at) VALUES ('at://{B}/app.bsky.feed.{t}/1', '{B}', '1', 'c', '3k', '{}', '{{}}', now());", post(B, "p1"));
+        sql += &row_sql(t, B, "p1", &[("post", &post(B, "p1"))], &[]);
     }
-    sql += &format!("INSERT INTO starter_packs (uri, creator_did, rkey, cid, rev, name, list_uri, record, created_at) VALUES ('at://{B}/app.bsky.graph.starterpack/1', '{B}', '1', 'c', '3k', 'n', 'at://{B}/app.bsky.graph.list/l', '{{}}', now());");
-    sql += &format!("INSERT INTO labeler_services (uri, creator_did, cid, rev, policies, record, created_at) VALUES ('at://{B}/app.bsky.labeler.service/self', '{B}', 'c', '3k', '{{}}', '{{}}', now());");
-    sql += &format!("INSERT INTO nearhorizon_poll_posts (uri, author_did, rkey, cid, rev, text, options, visibility, record, created_at) VALUES ('at://{B}/app.nearhorizon.poll/1', '{B}', '1', 'c', '3k', 't', '[]', 'public', '{{}}', now());");
+    let b_list = format!("at://{B}/app.bsky.graph.list/l");
+    sql += &row_sql("starter_packs", B, "1", &[("list", &b_list)], &[]);
+    sql += &row_sql("labeler_services", B, "self", &[], &[]);
+    sql += &row_sql("nearhorizon_poll_posts", B, "1", &[], &[("visibility", "'public'".to_string())]);
+    sql += &crate::test_support::posts::intern_sql(D, "1");
     for did in [B, MEMBER] {
         let list = format!("at://{did}/app.bsky.graph.list/l");
-        sql += &format!("INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES ('{list}', '{did}', 'l', 'c', '3k', 'n', 'app.bsky.graph.defs#modlist', '{{}}', now());");
-        sql += &format!("INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES ('at://{did}/app.bsky.graph.listitem/1', '{did}', '1', 'c', '3k', '{list}', '{D}', now());");
+        sql += &row_sql("lists", did, "l", &[], &[("purpose", "'app.bsky.graph.defs#modlist'".to_string())]);
+        sql += &row_sql("list_items", did, "1", &[], &[
+            ("list_rkey", crate::test_support::posts::key_sql(did, "l")),
+            ("subject", format!("(SELECT id FROM dids WHERE did = '{D}')")),
+        ]);
         for t in ["list_optouts", "list_blocks"] {
-            sql += &format!("INSERT INTO {t} (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://{did}/app.bsky.graph.{t}/1', '{did}', '1', 'c', '3k', '{list}', now());");
+            sql += &row_sql(t, did, "1", &[("subj", &list)], &[]);
         }
     }
     // Follows: B → D goes; B → member and member → D stay.
@@ -596,14 +602,21 @@ fn sweep_seed() -> String {
         sql += &format!("INSERT INTO tag_activity_hourly (tag, hour, posts) VALUES ('{tag}', '2026-10-14T0{h}:00:00Z', 1);");
     }
     for i in 1..=2 {
-        sql += &format!("INSERT INTO starter_pack_counts (pack_uri, all_time_source, refreshed_at) VALUES ('at://{B}/app.bsky.graph.starterpack/{i}', 'x', now());");
+        sql += &crate::test_support::posts::intern_sql(B, &i.to_string());
+        sql += &format!(
+            "INSERT INTO starter_pack_counts (author, rkey, all_time_source, refreshed_at) SELECT id, {}, 'x', now() FROM dids WHERE did = '{B}';",
+            crate::test_support::posts::key_sql(B, &i.to_string())
+        );
     }
     // Kept tables.
     sql += &graph_row_sql("blocks", B, MEMBER, "1");
     sql += &format!("INSERT INTO actors (did, display_name) VALUES ('{B}', 'b'), ('{MEMBER}', 'm');");
     sql += &format!("INSERT INTO labels (subject, val) VALUES ('{B}', 'porn');");
     sql += &crate::test_support::posts::tombstone_sql(&post(B, "gone"), "3kaaaaaaaaaaa");
-    sql += &format!("INSERT INTO member_post_refs (uri, author_did, rev, created_at) VALUES ('{}', '{MEMBER}', '3k', now());", post(MEMBER, "p3"));
+    sql += &format!(
+        "INSERT INTO member_post_refs (author, rkey, rev, created_at) SELECT id, {}, rev_to_bigint('3kaaaaaaaaaaa'), now() FROM dids WHERE did = '{MEMBER}';",
+        crate::test_support::posts::key_sql(MEMBER, "p3")
+    );
     sql += &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{MEMBER}', '{B}');");
     sql
 }
@@ -612,10 +625,10 @@ fn sweep_seed() -> String {
 const KEPT: [(&str, &str); 14] = [
     ("likes", "author = (SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc')"),
     ("reposts", "author = (SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc')"),
-    ("lists", "creator_did = 'did:plc:cccccccccccccccccccccccc'"),
-    ("list_items", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
-    ("list_optouts", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
-    ("list_blocks", "author_did = 'did:plc:cccccccccccccccccccccccc'"),
+    ("lists", "author = (SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc')"),
+    ("list_items", "author = (SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc')"),
+    ("list_optouts", "author = (SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc')"),
+    ("list_blocks", "author = (SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc')"),
     ("follows", "(SELECT id FROM dids WHERE did = 'did:plc:cccccccccccccccccccccccc') IN (author, subject)"),
     ("blocks", "TRUE"),
     ("actors", "TRUE"),
@@ -678,6 +691,7 @@ async fn the_sweep_empties_and_thins_every_table() {
                         Key::TagHour => stored.as_array().is_some_and(|a| a.len() == 2 && a[0].is_string() && parse_ts(&a[1]).is_some()),
                         Key::AuthorRkey => stored.as_array().is_some_and(|a| a.len() == 2 && a[0].is_i64() && a[1].is_i64()),
                         Key::FeedItem => stored.as_array().is_some_and(|a| a.len() == 3 && a[0].is_i64() && a[1].is_boolean() && a[2].is_i64()),
+                        Key::Author => stored.as_array().is_some_and(|a| a.len() == 1 && a[0].is_i64()),
                     };
                     assert!(ok, "{name}: cursor {stored}");
                 }
@@ -709,10 +723,9 @@ async fn the_sweep_empties_and_thins_every_table() {
     for t in ["likes", "reposts"] {
         assert_eq!(count(p, &format!("SELECT count(*) FROM {t} WHERE author <> (SELECT id FROM dids WHERE did = '{MEMBER}')")).await, 0, "{t} is thinned");
     }
-    for t in ["list_items", "list_optouts", "list_blocks"] {
-        assert_eq!(count(p, &format!("SELECT count(*) FROM {t} WHERE author_did <> '{MEMBER}'")).await, 0, "{t} is thinned");
+    for t in ["lists", "list_items", "list_optouts", "list_blocks"] {
+        assert_eq!(count(p, &format!("SELECT count(*) FROM {t} WHERE author <> (SELECT id FROM dids WHERE did = '{MEMBER}')")).await, 0, "{t} is thinned");
     }
-    assert_eq!(count(p, &format!("SELECT count(*) FROM lists WHERE creator_did <> '{MEMBER}'")).await, 0);
     assert_eq!(count(p, "SELECT count(*) FROM follows").await, 2);
     assert_eq!(kept_rows(p).await, kept, "kept rows are unchanged");
     let t = transition(p).await;

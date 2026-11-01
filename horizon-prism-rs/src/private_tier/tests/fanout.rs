@@ -219,10 +219,12 @@ async fn t_as6_the_public_rules() {
     let first = fresh_post(&f, ALICE, "3kas6base222", &aud, None).await;
     assert_eq!(run(&w, &first).await, notified(1), "the control");
     let declaration = |allow: &str| {
+        // One statement: the author's id, then the record as stored.
         format!(
-            "INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) VALUES \
-             ('at://{ALICE}/app.bsky.notification.declaration/self', '{ALICE}', 'app.bsky.notification.declaration', 'bafyd', '3k', \
-              '{{\"allowSubscriptions\": \"{allow}\"}}')"
+            "WITH a AS (INSERT INTO dids (did) VALUES ('{ALICE}') ON CONFLICT (did) DO UPDATE SET did = EXCLUDED.did RETURNING id) \
+             INSERT INTO actor_self_records (author, coll, cid, rev, record, allow_subscriptions) \
+             SELECT id, 13, '\\x00'::bytea || convert_to('bafyd', 'UTF8'), rev_to_bigint('3kaaaaaaaaaaa'), \
+                    '\\x00'::bytea || convert_to('{{\"allowSubscriptions\": \"{allow}\"}}', 'UTF8'), '{allow}' FROM a"
         )
     };
     let undeclare = "DELETE FROM actor_self_records".to_string();

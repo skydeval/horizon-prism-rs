@@ -33,9 +33,8 @@ struct Service {
     subject_collections: Option<Value>,
 }
 
-/// A stored labeler: URI, creator, CID, the four record fields,
-/// `indexed_at`.
-type ServiceRow = (String, String, String, Value, Option<Value>, Option<Value>, Option<Value>, DateTime<Utc>);
+/// A stored labeler: creator, CID, record, `indexed_at`.
+type ServiceRow = (String, Vec<u8>, Vec<u8>, DateTime<Utc>);
 
 fn service_uri(did: &str) -> String {
     format!("at://{did}/{NSID_SERVICE}/self")
@@ -60,18 +59,28 @@ impl Hydrator {
             }
         }
         let rows: Vec<ServiceRow> = sqlx::query_as(
-            "SELECT uri, creator_did, cid, policies, reason_types, subject_types, subject_collections, indexed_at \
-             FROM labeler_services WHERE creator_did = ANY($1)",
+            "SELECT d.did, s.cid, s.record, s.indexed_at FROM labeler_services s JOIN dids d ON d.id = s.author \
+             WHERE s.author IN (SELECT id FROM dids WHERE did = ANY($1))",
         )
         .bind(&wanted)
         .fetch_all(self.pool())
         .await?;
-        let mut services: HashMap<String, Service> = rows
-            .into_iter()
-            .map(|(uri, creator, cid, policies, reason_types, subject_types, subject_collections, indexed_at)| {
-                (creator, Service { uri, cid, indexed_at, policies, reason_types, subject_types, subject_collections })
-            })
-            .collect();
+        let mut services: HashMap<String, Service> = HashMap::with_capacity(rows.len());
+        for (creator, cid, record, indexed_at) in rows {
+            let value = crate::db::records::decode_value(self.pool(), &record).await?;
+            let field = |name: &str| value.get(name).filter(|v| !v.is_null()).cloned();
+            let Some(policies) = field("policies") else { continue };
+            let service = Service {
+                uri: service_uri(&creator),
+                cid: crate::db::ids::cid_from_db(&cid),
+                indexed_at,
+                policies,
+                reason_types: field("reasonTypes"),
+                subject_types: field("subjectTypes"),
+                subject_collections: field("subjectCollections"),
+            };
+            services.insert(creator, service);
+        }
         // The moderation gate comes before any fetch.
         let uris: Vec<String> = wanted.iter().map(|d| service_uri(d)).collect();
         let gated: Vec<String> = wanted.iter().chain(&uris).cloned().collect();
@@ -189,13 +198,10 @@ mod tests {
         };
         let p = &db.pool;
         actor(p, LOCAL, "labeler.test", "Labeler").await;
-        let policies = r#"{"labelValues": ["spam"]}"#;
-        exec(p, &format!(
-            "INSERT INTO labeler_services (uri, creator_did, cid, rev, policies, reason_types, record, created_at) VALUES \
-             ('at://{LOCAL}/{NSID_SERVICE}/self', '{LOCAL}', 'bafylocal', '3k', '{policies}', '[\"com.atproto.moderation.defs#reasonSpam\"]', '{{}}', now())"
-        )).await;
+        let record = json!({"$type": NSID_SERVICE, "policies": {"labelValues": ["spam"]}, "reasonTypes": ["com.atproto.moderation.defs#reasonSpam"]});
+        crate::test_support::records::put_record(p, LOCAL, NSID_SERVICE, "self", "bafylocal", crate::test_support::records::REV, &record).await;
         let service = format!("at://{LOCAL}/{NSID_SERVICE}/self");
-        crate::test_support::interactions::Interaction::like(ME, "1", &service).cid("bafylocal").put(p).await;
+        crate::test_support::interactions::Interaction::like(ME, "3klike2222222", &service).cid("bafylocal").put(p).await;
         let mut up = FixedUpstream::default();
         up.records.insert(
             service_uri(FAR),
@@ -225,7 +231,7 @@ mod tests {
         assert_eq!((&views[0]["cid"], &views[0]["likeCount"]), (&json!("bafyfar"), &json!(0)));
         // The stored one: its creator's profile, its likes, the viewer's.
         assert_eq!((&views[1]["creator"]["handle"], &views[1]["likeCount"]), (&json!("labeler.test"), &json!(1)));
-        assert_eq!(views[1]["viewer"]["like"], json!(format!("at://{ME}/app.bsky.feed.like/1")));
+        assert_eq!(views[1]["viewer"]["like"], json!(format!("at://{ME}/app.bsky.feed.like/3klike2222222")));
         // Detailed: the record's fields, only those it has.
         let v = h.get_labeler_services(&Viewer::anonymous(), &req, &dids, true).await.expect("db").expect("view");
         let views = v.inner()["views"].as_array().expect("views");

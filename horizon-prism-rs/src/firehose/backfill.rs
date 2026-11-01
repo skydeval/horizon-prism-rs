@@ -965,21 +965,21 @@ impl Ord for ByRkey {
 /// The public table, and its author column, of an ecosystem collection that
 /// is listed and reconciled. Posts, likes, reposts, follows and blocks name
 /// their author by id (`author`); `local_uris` reads them on its own.
-fn public_table(nsid: &str) -> Option<(&'static str, &'static str)> {
+fn public_table(nsid: &str) -> Option<&'static str> {
     Some(match nsid {
-        NSID_POST => ("posts", "author"),
-        NSID_LIKE => ("likes", "author"),
-        NSID_REPOST => ("reposts", "author"),
-        NSID_FOLLOW => ("follows", "author"),
-        NSID_BLOCK => ("blocks", "author"),
-        NSID_THREADGATE => ("threadgates", "author_did"),
-        NSID_POSTGATE => ("postgates", "author_did"),
-        NSID_LIST => ("lists", "creator_did"),
-        NSID_LISTITEM => ("list_items", "author_did"),
-        NSID_LISTBLOCK => ("list_blocks", "author_did"),
-        NSID_LIST_OPTOUT => ("list_optouts", "author_did"),
-        NSID_STARTER_PACK => ("starter_packs", "creator_did"),
-        NSID_POLL_POST => ("nearhorizon_poll_posts", "author_did"),
+        NSID_POST => "posts",
+        NSID_LIKE => "likes",
+        NSID_REPOST => "reposts",
+        NSID_FOLLOW => "follows",
+        NSID_BLOCK => "blocks",
+        NSID_THREADGATE => "threadgates",
+        NSID_POSTGATE => "postgates",
+        NSID_LIST => "lists",
+        NSID_LISTITEM => "list_items",
+        NSID_LISTBLOCK => "list_blocks",
+        NSID_LIST_OPTOUT => "list_optouts",
+        NSID_STARTER_PACK => "starter_packs",
+        NSID_POLL_POST => "nearhorizon_poll_posts",
         _ => return None,
     })
 }
@@ -2430,13 +2430,13 @@ pub async fn local_uris(writer: &Writer, did: &str, nsid: &str, rev: &str, off_r
     // off rule: its posts are read from `posts` too (refract design §6.1).
     if off_rule && nsid == NSID_POST {
         return sqlx::query_scalar(
-            "SELECT uri FROM member_post_refs WHERE author_did = $1 AND rev < $2 \
+            "SELECT at_uri(t.author, 1::smallint, t.rkey) FROM member_post_refs t \
+             WHERE t.author = (SELECT id FROM dids WHERE did = $1) AND t.rev < $2 \
              UNION SELECT at_uri(t.author, 1::smallint, t.rkey) FROM posts t \
-             WHERE t.author = (SELECT id FROM dids WHERE did = $1) AND t.rev < $3 \
+             WHERE t.author = (SELECT id FROM dids WHERE did = $1) AND t.rev < $2 \
                AND EXISTS (SELECT 1 FROM refract_dids WHERE did = $1 AND state IN ('restored', 'grace'))",
         )
         .bind(did)
-        .bind(rev)
         .bind(crate::db::ids::rev_value(rev))
         .fetch_all(writer.pool())
         .await;
@@ -2462,12 +2462,16 @@ pub async fn local_uris(writer: &Writer, did: &str, nsid: &str, rev: &str, off_r
     }
     let table = public_table(nsid);
     let mut uris = Vec::new();
-    if let Some((table, author)) = table {
-        uris = sqlx::query_scalar(&format!("SELECT uri FROM {table} WHERE {author} = $1 AND rev < $2"))
-            .bind(did)
-            .bind(rev)
-            .fetch_all(writer.pool())
-            .await?;
+    if let Some(table) = table {
+        // The v3 record tables listed here are keyed `(author, rkey)`.
+        uris = sqlx::query_scalar(&format!(
+            "SELECT {} FROM {table} t JOIN dids d ON d.id = t.author WHERE d.did = $1 AND t.rev < $2",
+            crate::db::lists::uri_sql("d.did", nsid, "t.rkey")
+        ))
+        .bind(did)
+        .bind(crate::db::ids::rev_value(rev))
+        .fetch_all(writer.pool())
+        .await?;
         // A gate may be stored by the private tier instead (private
         // posting §4.4).
         if !matches!(nsid, NSID_THREADGATE | NSID_POSTGATE) {
@@ -2930,14 +2934,10 @@ mod tests {
         listing(NSID_ACTOR_STATUS, vec![rec(DID, NSID_ACTOR_STATUS, "self", json!({"status": "app.bsky.actor.status#live"}))]);
         // A list item stored earlier that the repo no longer has, and a
         // declaration the repo no longer has.
-        for sql in [
-            "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) \
-             VALUES ('at://' || $1 || '/app.bsky.graph.listitem/3kgone', $1, '3kgone', 'c', '3kaaaaaaaaaaa', 'l', 'did:plc:x', now())",
-            "INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) \
-             VALUES ('at://' || $1 || '/app.bsky.notification.declaration/self', $1, 'app.bsky.notification.declaration', 'c', '3kaaaaaaaaaaa', '{}')",
-        ] {
-            sqlx::query(sql).bind(DID).execute(p).await.expect(sql);
-        }
+        let gone = json!({"$type": NSID_LISTITEM, "list": list, "subject": "did:plc:x"});
+        crate::test_support::records::put_record(p, DID, NSID_LISTITEM, "3kgone", "c", "3kaaaaaaaaaaa", &gone).await;
+        let declaration = json!({"$type": "app.bsky.notification.declaration", "allowSubscriptions": "none"});
+        crate::test_support::records::put_record(p, DID, "app.bsky.notification.declaration", "self", "c", "3kaaaaaaaaaaa", &declaration).await;
         let writer = Writer::new(p.clone(), state(true), Arc::new(DisabledPrivateTier));
         let backfill = Backfill::new(writer, Arc::new(source), BackfillConfig::default(), 5);
         let mut conn = p.acquire().await.expect("conn");
@@ -2946,10 +2946,7 @@ mod tests {
         let (_, outcome) = backfill.run_once().await.expect("run").expect("a job");
         assert_eq!(outcome, JobOutcome::Done);
 
-        let uris = |table: &'static str| async move {
-            let v: Vec<String> = sqlx::query_scalar(&format!("SELECT uri FROM {table} ORDER BY uri")).fetch_all(p).await.expect(table);
-            v
-        };
+        let uris = |table: &'static str| crate::test_support::records::uris(p, table);
         assert_eq!(uris("threadgates").await, [format!("at://{DID}/{NSID_THREADGATE}/3kpost")]);
         assert_eq!(uris("lists").await, std::slice::from_ref(&list));
         // The three listed items, and the one the repo no longer has is gone.
@@ -3123,12 +3120,7 @@ mod tests {
         let rev = "3kzzzzzzzzzzz";
         let subject = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
         let gone = format!("at://{DID}/{NSID_POST}/3kgone");
-        sqlx::query("INSERT INTO member_post_refs (uri, author_did, rev, created_at) VALUES ($1, $2, '3kaaaaaaaaaaa', now())")
-            .bind(&gone)
-            .bind(DID)
-            .execute(p)
-            .await
-            .expect("ref");
+        crate::test_support::records::post_ref(p, &gone, "3kaaaaaaaaaaa", (None, None, None), "now()").await;
         let mut source = FakeSource { rev: rev.to_string(), ..FakeSource::default() };
         let reply = json!({"text": "hi", "reply": {
             "root": {"uri": format!("at://{subject}/{NSID_POST}/1"), "cid": "c"},
@@ -3151,10 +3143,12 @@ mod tests {
         assert_eq!(outcome, JobOutcome::Done);
 
         assert!(post_uris(p).await.is_empty());
-        let refs: Vec<(String, Option<String>)> = sqlx::query_as("SELECT uri, reply_parent_did FROM member_post_refs ORDER BY uri")
-            .fetch_all(p)
-            .await
-            .expect("refs");
+        let refs: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT at_uri(r.author, 1::smallint, r.rkey), (SELECT d.did FROM dids d WHERE d.id = r.parent) FROM member_post_refs r ORDER BY 1",
+        )
+        .fetch_all(p)
+        .await
+        .expect("refs");
         assert_eq!(refs, [(format!("at://{DID}/{NSID_POST}/3kreply"), Some(subject.to_string()))]);
         assert!(scope.snapshot().await.in_scope(subject));
         let calls = source.get_record_calls.lock().expect("lock").clone();

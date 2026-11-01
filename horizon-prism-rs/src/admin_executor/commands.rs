@@ -603,14 +603,16 @@ impl Handlers {
         let mut tx = self.pool.begin().await.map_err(db)?;
         lock_did_exclusive(&mut tx, did).await.map_err(db)?;
         let mut deleted = serde_json::Map::new();
+        // The list records are keyed by ids; the mutes by DID text.
         for (table, column) in [
             ("list_mutes", "viewer_did"),
-            ("list_blocks", "author_did"),
-            ("list_optouts", "author_did"),
-            ("list_items", "author_did"),
-            ("lists", "creator_did"),
+            ("list_blocks", "author"),
+            ("list_optouts", "author"),
+            ("list_items", "author"),
+            ("lists", "author"),
         ] {
-            let n = sqlx::query(&format!("DELETE FROM {table} WHERE {column} = $1"))
+            let value = if table == "list_mutes" { "$1" } else { "(SELECT id FROM dids WHERE did = $1)" };
+            let n = sqlx::query(&format!("DELETE FROM {table} WHERE {column} = {value}"))
                 .bind(did)
                 .execute(&mut *tx)
                 .await

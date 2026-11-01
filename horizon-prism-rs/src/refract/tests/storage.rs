@@ -119,7 +119,8 @@ async fn t1_admission_through_the_writer() {
     let w = writer(p, sets(PublicMode::Off, true, true, true));
     w.apply(SUBJECT, "3krev2222222c", &[create("app.bsky.feed.post", "3kmem", post("member post", None))], options()).await.expect("apply");
     assert!(crate::test_support::posts::stored(p, &format!("at://{SUBJECT}/app.bsky.feed.post/3kmem")).await);
-    assert_eq!(count(p, "SELECT count(*) FROM member_post_refs WHERE uri LIKE '%3kmem'").await, 1);
+    let stored = crate::test_support::records::key_is("member_post_refs", "", &format!("at://{SUBJECT}/app.bsky.feed.post/3kmem"));
+    assert_eq!(count(p, &format!("SELECT count(*) FROM member_post_refs WHERE {stored}")).await, 1);
     db.drop_db().await;
 }
 

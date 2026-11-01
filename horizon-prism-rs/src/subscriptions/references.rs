@@ -324,15 +324,19 @@ pub async fn adopt_member(conn: &mut PgConnection, member: &str, budget: Budget)
     .execute(&mut *conn)
     .await?;
     // One block reference per list, named by its earliest record. A
-    // subject in any other collection makes no reference.
-    sqlx::query(
+    // subject that is not a whole list reference makes no reference.
+    sqlx::query(&format!(
         "INSERT INTO list_references (member_did, list_uri, source, source_uri, arrived_at, admitted) \
-         SELECT $1, b.list_uri, 'block', b.uri, clock_timestamp() + make_interval(secs => (row_number() OVER (ORDER BY b.created_at, b.uri)) * 0.000001), false \
-         FROM (SELECT DISTINCT ON (list_uri) list_uri, uri, created_at FROM list_blocks \
-               WHERE author_did = $1 AND split_part(list_uri, '/', 4) = 'app.bsky.graph.list' ORDER BY list_uri, created_at, uri) b \
-         ORDER BY b.created_at, b.uri \
+         SELECT $1, at_uri(b.subj_author, b.subj_coll, b.subj_rkey), 'block', at_uri(b.author, {block}::smallint, b.rkey), \
+                clock_timestamp() + make_interval(secs => (row_number() OVER (ORDER BY b.created_at, b.rkey)) * 0.000001), false \
+         FROM (SELECT DISTINCT ON (subj_author, subj_rkey) author, rkey, subj_author, subj_coll, subj_rkey, created_at FROM list_blocks \
+               WHERE author = (SELECT id FROM dids WHERE did = $1) AND subj_coll = {list} \
+               ORDER BY subj_author, subj_rkey, created_at, rkey) b \
+         ORDER BY b.created_at, b.rkey \
          ON CONFLICT DO NOTHING",
-    )
+        block = crate::db::ids::COLL_LISTBLOCK,
+        list = crate::db::ids::COLL_LIST
+    ))
     .bind(member)
     .execute(&mut *conn)
     .await?;
@@ -380,12 +384,23 @@ pub async fn drop_member(conn: &mut PgConnection, member: &str) -> Result<bool, 
 /// Database errors.
 pub async fn rederive_block(conn: &mut PgConnection, member: &str, list: &str, budget: Budget) -> Result<(), sqlx::Error> {
     lock_member(&mut *conn, member).await?;
-    let earliest: Option<String> =
-        sqlx::query_scalar("SELECT uri FROM list_blocks WHERE author_did = $1 AND list_uri = $2 ORDER BY created_at, uri LIMIT 1")
-            .bind(member)
-            .bind(list)
-            .fetch_optional(&mut *conn)
-            .await?;
+    // The list's key and the member's id first, bound as integers.
+    let key = crate::db::lists::key(&mut *conn, list).await?;
+    let me = crate::db::ids::account_id(&mut *conn, member).await?;
+    let earliest: Option<String> = match (key, me) {
+        (Some((list_author, list_rkey)), Some(me)) => sqlx::query_scalar(&format!(
+            "SELECT at_uri(author, {}::smallint, rkey) FROM list_blocks \
+             WHERE author = $1 AND subj_author = $2 AND subj_rkey = $3 AND subj_coll = {} ORDER BY created_at, rkey LIMIT 1",
+            crate::db::ids::COLL_LISTBLOCK,
+            crate::db::ids::COLL_LIST
+        ))
+        .bind(me)
+        .bind(list_author)
+        .bind(list_rkey)
+        .fetch_optional(&mut *conn)
+        .await?,
+        _ => None,
+    };
     let had: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_references WHERE member_did = $1 AND list_uri = $2 AND source = 'block')")
             .bind(member)
@@ -492,22 +507,13 @@ mod tests {
                 .expect("mute");
         }
         let block = |rkey: &'static str, subject: String, at: &'static str| async move {
-            sqlx::query(
-                "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) \
-                 VALUES ('at://' || $1 || '/app.bsky.graph.listblock/' || $2, $1, $2, 'c', '3k', $3, $4::timestamptz)",
-            )
-            .bind(ME)
-            .bind(rkey)
-            .bind(subject)
-            .bind(at)
-            .execute(p)
-            .await
-            .expect("block");
+            let at = format!("{at}T00:00:00Z").parse().expect("time");
+            crate::test_support::records::list_block_at(p, ME, rkey, &subject, Some(at)).await;
         };
         // Two records for one list, and one whose subject is not a list.
-        block("3kb2", list('b', 1), "2026-01-02").await;
-        block("3kb1", list('b', 1), "2026-01-01").await;
-        block("3kb3", format!("at://{OTHER}/app.bsky.feed.post/3k"), "2026-01-01").await;
+        block("3kblock22222c", list('b', 1), "2026-01-02").await;
+        block("3kblock22222b", list('b', 1), "2026-01-01").await;
+        block("3kblock22222d", format!("at://{OTHER}/app.bsky.feed.post/3k"), "2026-01-01").await;
 
         let mut conn = p.acquire().await.expect("conn");
         assert!(adopt_member(&mut conn, ME, budget).await.expect("adopt"));
@@ -518,7 +524,7 @@ mod tests {
         );
         assert_eq!(flags(p, ME, "block").await, vec![(list('b', 1), true, true)]);
         let source: Option<String> = sqlx::query_scalar("SELECT source_uri FROM list_references WHERE source = 'block'").fetch_one(p).await.expect("source");
-        assert!(source.expect("uri").ends_with("/3kb1"), "the earliest record names the reference");
+        assert!(source.expect("uri").ends_with("/3kblock22222b"), "the earliest record names the reference");
         assert_eq!(markers(p).await, vec![list('a', 2), list('a', 3), list('b', 1)]);
         // Again: nothing new.
         assert!(!adopt_member(&mut conn, ME, budget).await.expect("again"));
@@ -591,18 +597,7 @@ mod tests {
         let budget = Budget { max_references: 1, max_owners: 5 };
         let (first, second) = (list('a', 1), list('b', 1));
         let block = |rkey: &'static str, list: String, at: &'static str| async move {
-            sqlx::query(
-                "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) \
-                 VALUES ($1, $2, $3, 'bafy', '3k', $4, $5::timestamptz)",
-            )
-            .bind(format!("at://{ME}/app.bsky.graph.listblock/{rkey}"))
-            .bind(ME)
-            .bind(rkey)
-            .bind(list)
-            .bind(at)
-            .execute(p)
-            .await
-            .expect("listblock");
+            crate::test_support::records::list_block_at(p, ME, rkey, &list, Some(at.parse().expect("time"))).await;
         };
         let rederive = |list: String| async move {
             let mut tx = p.begin().await.expect("tx");
@@ -619,9 +614,9 @@ mod tests {
                 .flatten()
         };
 
-        block("3kb1", first.clone(), "2026-01-02T00:00:00Z").await;
+        block("3kblock22222b", first.clone(), "2026-01-02T00:00:00Z").await;
         rederive(first.clone()).await;
-        block("3kb2", second.clone(), "2026-01-03T00:00:00Z").await;
+        block("3kblock22222c", second.clone(), "2026-01-03T00:00:00Z").await;
         rederive(second.clone()).await;
         // The second is stored, outside the budget, with no marker.
         assert_eq!(flags(p, ME, "block").await, [(first.clone(), true, true), (second.clone(), false, false)]);
@@ -629,18 +624,18 @@ mod tests {
 
         // An earlier duplicate record of the first list: the reference
         // points at it and is otherwise untouched (no marker).
-        block("3kb0", first.clone(), "2026-01-01T00:00:00Z").await;
+        block("3kblock22222a", first.clone(), "2026-01-01T00:00:00Z").await;
         rederive(first.clone()).await;
-        assert_eq!(source(first.clone()).await, Some(format!("at://{ME}/app.bsky.graph.listblock/3kb0")));
+        assert_eq!(source(first.clone()).await, Some(format!("at://{ME}/app.bsky.graph.listblock/3kblock22222a")));
         assert!(markers(p).await.is_empty());
         // Deleting one of the two keeps the block.
-        sqlx::query("DELETE FROM list_blocks WHERE rkey = '3kb0'").execute(p).await.expect("delete");
+        sqlx::query("DELETE FROM list_blocks WHERE rkey = rkey_to_bigint('3kblock22222a')").execute(p).await.expect("delete");
         rederive(first.clone()).await;
-        assert_eq!(source(first.clone()).await, Some(format!("at://{ME}/app.bsky.graph.listblock/3kb1")));
+        assert_eq!(source(first.clone()).await, Some(format!("at://{ME}/app.bsky.graph.listblock/3kblock22222b")));
         assert!(markers(p).await.is_empty());
         // Deleting the last drops the reference and promotes the next one:
         // both lists are marked.
-        sqlx::query("DELETE FROM list_blocks WHERE rkey = '3kb1'").execute(p).await.expect("delete");
+        sqlx::query("DELETE FROM list_blocks WHERE rkey = rkey_to_bigint('3kblock22222b')").execute(p).await.expect("delete");
         rederive(first.clone()).await;
         assert_eq!(flags(p, ME, "block").await, [(second.clone(), true, true)]);
         assert_eq!(markers(p).await, [first, second]);

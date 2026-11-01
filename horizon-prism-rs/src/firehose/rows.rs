@@ -18,39 +18,89 @@
 //! missing a field its table requires is a deterministic failure, like any
 //! unparseable record.
 //!
+//! These tables are keyed by ids ([`Layout::Keyed`]): a row is
+//! `(author, rkey)`, a labeler service `(author)` and a self record
+//! `(author, coll)`. A table that shows its record keeps it whole, encoded;
+//! the only other columns are what a query filters or searches on, and the
+//! references, each as `(*_author, *_coll, *_rkey)`. The plural records keep
+//! their own layout, by URI ([`Layout::ByUri`]).
+//!
 //! **Listitems must name a list in their own repo.** A listitem whose `list`
-//! is not `at://<its own repo>/app.bsky.graph.list/<rkey>` is not indexed:
-//! [`row`] answers `Ok(None)` and the op is skipped as `unindexed`. Without
-//! that, any DID could add subjects to anyone's list.
+//! is not `at://<its own repo>/app.bsky.graph.list/<rkey>` with a valid
+//! record key is not indexed: [`row`] answers `Ok(None)` and the op is
+//! skipped as `unindexed`. Without that, any DID could add subjects to
+//! anyone's list.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::classifier::{EcosystemKind, NSID_LIST};
-use super::normalize::blob_cid;
 use super::records::{RecordError, created_at};
+use crate::db::ids::{
+    AccountId, COLL_LABELER, COLL_LIST, COLL_LIST_OPTOUT, COLL_LISTBLOCK, COLL_LISTITEM, COLL_POLL_POST, COLL_POSTGATE, COLL_STARTER_PACK,
+    COLL_THREADGATE, Slot, UriParts, collection_id, uri_parts,
+};
 use crate::db::locks::uri_author;
 
 /// One column value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
     Text(Option<String>),
-    TextArray(Vec<String>),
     Json(Option<Value>),
     Bool(Option<bool>),
     Time(Option<DateTime<Utc>>),
+    /// A reference, as the columns `<name>_author`, `<name>_coll` and
+    /// `<name>_rkey`; an odd one keeps its text in `odd_refs` at this slot.
+    Ref(Slot, String),
+    /// An account, as its `dids` id.
+    Account(String),
+    /// A record key of the author's own repo, as stored.
+    OwnRkey(String),
+    /// The `simple` text vector of this text.
+    Tsv(String),
 }
 
-/// One row of a v3 record table. The writer adds `uri`, the owner column,
-/// `rkey` (when the table has one), `cid` and `rev`.
+/// How a keyed table's rows are keyed besides their author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKey {
+    /// `(author, rkey)`.
+    Rkey,
+    /// `(author)`: a record whose key is always `self`.
+    Author,
+    /// `(author, coll)`: records of several collections whose key is
+    /// always `self`.
+    Coll,
+}
+
+/// How a table stores its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// By URI, with DID and rev text: `uri`, the owner column, `rkey`,
+    /// `cid` and `rev` added by the writer.
+    ByUri { owner_column: &'static str },
+    /// By ids. The writer adds the key, `cid`, `rev` and, when `record`, the
+    /// record encoded. `coll` is the records' collection id, which names an
+    /// odd reference's owner table (`odd_refs.tbl`).
+    Keyed { coll: i16, key: RowKey, record: bool },
+}
+
+/// One row of a v3 record table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub table: &'static str,
-    /// The column holding the record's author.
-    pub owner_column: &'static str,
-    /// rkey-self tables have no `rkey` column.
-    pub has_rkey: bool,
+    pub layout: Layout,
     pub cells: Vec<(&'static str, Cell)>,
+}
+
+impl Row {
+    /// The URI text of the reference cell `name`.
+    #[must_use]
+    pub fn reference(&self, name: &str) -> Option<&str> {
+        self.cells.iter().find_map(|(n, cell)| match cell {
+            Cell::Ref(_, uri) if *n == name => Some(uri.as_str()),
+            _ => None,
+        })
+    }
 }
 
 /// The table of the plural collections (plural-pronouns design §2.3).
@@ -93,6 +143,51 @@ pub fn table(kind: EcosystemKind) -> Option<&'static str> {
     })
 }
 
+/// How a v3 record table keyed by ids is keyed; `None` for one stored by
+/// URI (the plural records) or any other name.
+#[must_use]
+pub fn key_of(table: &str) -> Option<RowKey> {
+    Some(match table {
+        "lists" | "list_items" | "list_blocks" | "list_optouts" | "starter_packs" | "threadgates" | "postgates" | "nearhorizon_poll_posts" => {
+            RowKey::Rkey
+        }
+        "labeler_services" => RowKey::Author,
+        "actor_self_records" => RowKey::Coll,
+        _ => return None,
+    })
+}
+
+/// SQL: the condition that a row of a keyed table has the key `$1` (its
+/// author) and `$2` (a bigint: its rkey, or its coll; unused for a table
+/// keyed by its author alone).
+#[must_use]
+pub fn key_where(key: RowKey) -> &'static str {
+    match key {
+        RowKey::Rkey => "author = $1 AND rkey = $2",
+        RowKey::Author => "author = $1 AND $2::bigint IS NOT NULL",
+        RowKey::Coll => "author = $1 AND coll = $2",
+    }
+}
+
+/// The key of the row of a keyed table that `uri` names, read-only: its
+/// author and its rkey (or its coll; 0 for a table keyed by its author
+/// alone), as [`key_where`] binds them. `None` when the URI names no stored
+/// key.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn key_for<'e, E: sqlx::PgExecutor<'e>>(e: E, key: RowKey, uri: &str) -> Result<Option<(AccountId, i64)>, sqlx::Error> {
+    if key == RowKey::Rkey {
+        return Ok(crate::db::ids::whole_key(e, uri).await?.map(|(a, _, k)| (a, k)));
+    }
+    let UriParts::Whole { did, coll, .. } = uri_parts(uri) else {
+        return Ok(None);
+    };
+    let author = crate::db::ids::account_id(e, &did).await?;
+    Ok(author.map(|a| (a, if key == RowKey::Coll { i64::from(coll) } else { 0 })))
+}
+
 fn err(msg: impl Into<String>) -> RecordError {
     RecordError(msg.into())
 }
@@ -116,30 +211,26 @@ fn json(record: &Value, key: &str) -> Option<Value> {
     record.get(key).filter(|v| !v.is_null()).cloned()
 }
 
-fn strings(record: &Value, key: &str) -> Vec<String> {
-    record
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
-fn self_labels(record: &Value) -> Vec<String> {
-    record
-        .pointer("/labels/values")
-        .and_then(Value::as_array)
-        .map(|vals| vals.iter().filter_map(|v| v.get("val").and_then(Value::as_str)).map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
-/// Whether `uri` is `at://<repo>/app.bsky.graph.list/<rkey>`.
-fn own_list(uri: &str, repo: &str) -> bool {
+/// The record key of `uri` when it is `at://<repo>/app.bsky.graph.list/<rkey>`
+/// with a valid record key.
+fn own_list(uri: &str, repo: &str) -> Option<String> {
     uri.strip_prefix("at://")
         .and_then(|rest| rest.strip_prefix(repo))
         .and_then(|rest| rest.strip_prefix('/'))
         .and_then(|rest| rest.strip_prefix(NSID_LIST))
         .and_then(|rest| rest.strip_prefix('/'))
-        .is_some_and(|rkey| !rkey.is_empty() && !rkey.contains('/'))
+        .filter(|rkey| proto_blue::syntax::RecordKey::is_valid(rkey))
+        .map(str::to_string)
+}
+
+/// A JSON field as SQL's `->>` reads it: a string's text, any other value's
+/// JSON text, nothing for null.
+fn field_text(record: &Value, key: &str) -> Option<String> {
+    match record.get(key)? {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
 }
 
 /// The row for a v3 record of `kind` in `repo`.
@@ -161,130 +252,94 @@ pub fn row(
     now: DateTime<Utc>,
 ) -> Result<Option<Row>, RecordError> {
     let created = ("created_at", Cell::Time(Some(created_at(record, now))));
-    let stored = ("record", Cell::Json(Some(normalized.clone())));
-    let tid = |table, owner_column, cells| Row {
+    let keyed = |table, coll, record: bool, cells| Row {
         table,
-        owner_column,
-        has_rkey: true,
+        layout: Layout::Keyed { coll, key: RowKey::Rkey, record },
         cells,
     };
     Ok(Some(match kind {
-        EcosystemKind::List => tid(
-            "lists",
-            "creator_did",
-            vec![
-                ("name", Cell::Text(Some(required(record, "name")?))),
-                ("purpose", Cell::Text(Some(required(record, "purpose")?))),
-                ("description", Cell::Text(text(record, "description"))),
-                ("description_facets", Cell::Json(json(record, "descriptionFacets"))),
-                ("avatar_cid", Cell::Text(record.get("avatar").and_then(blob_cid))),
-                ("self_labels", Cell::TextArray(self_labels(record))),
-                stored,
-                created,
-            ],
-        ),
+        EcosystemKind::List => {
+            // The name is read from the record; a list must have one.
+            required(record, "name")?;
+            keyed("lists", COLL_LIST, true, vec![("purpose", Cell::Text(Some(required(record, "purpose")?))), created])
+        }
         EcosystemKind::ListItem => {
             let list = at_uri(record, "list")?;
-            if !own_list(&list, repo) {
+            let Some(list_rkey) = own_list(&list, repo) else {
                 return Ok(None);
-            }
+            };
             let subject = text(record, "subject")
                 .filter(|d| proto_blue::syntax::Did::is_valid(d))
                 .ok_or_else(|| err("subject is not a DID"))?;
-            tid(
+            keyed(
                 "list_items",
-                "author_did",
-                vec![("list_uri", Cell::Text(Some(list))), ("subject_did", Cell::Text(Some(subject))), created],
+                COLL_LISTITEM,
+                false,
+                vec![("list_rkey", Cell::OwnRkey(list_rkey)), ("subject", Cell::Account(subject)), created],
             )
         }
-        EcosystemKind::ListBlock => tid(
+        EcosystemKind::ListBlock => keyed(
             "list_blocks",
-            "author_did",
-            vec![("list_uri", Cell::Text(Some(at_uri(record, "subject")?))), created],
+            COLL_LISTBLOCK,
+            false,
+            vec![("subj", Cell::Ref(Slot::Subject, at_uri(record, "subject")?)), created],
         ),
-        EcosystemKind::ListOptout => tid(
+        EcosystemKind::ListOptout => keyed(
             "list_optouts",
-            "author_did",
-            vec![("list_uri", Cell::Text(Some(at_uri(record, "subject")?))), created],
+            COLL_LIST_OPTOUT,
+            false,
+            vec![("subj", Cell::Ref(Slot::Subject, at_uri(record, "subject")?)), created],
         ),
-        EcosystemKind::StarterPack => tid(
-            "starter_packs",
-            "creator_did",
-            vec![
-                ("name", Cell::Text(Some(required(record, "name")?))),
-                ("description", Cell::Text(text(record, "description"))),
-                ("list_uri", Cell::Text(Some(at_uri(record, "list")?))),
-                ("feeds", Cell::Json(json(record, "feeds"))),
-                stored,
-                created,
-            ],
-        ),
-        EcosystemKind::LabelerService => Row {
-            table: "labeler_services",
-            owner_column: "creator_did",
-            has_rkey: false,
-            cells: vec![
-                ("policies", Cell::Json(Some(json(record, "policies").ok_or_else(|| err("missing policies"))?))),
-                ("reason_types", Cell::Json(json(record, "reasonTypes"))),
-                ("subject_types", Cell::Json(json(record, "subjectTypes"))),
-                ("subject_collections", Cell::Json(json(record, "subjectCollections"))),
-                ("self_labels", Cell::TextArray(self_labels(record))),
-                stored,
-                created,
-            ],
-        },
-        EcosystemKind::SelfRecord => Row {
-            table: "actor_self_records",
-            owner_column: "did",
-            has_rkey: false,
-            cells: vec![("collection", Cell::Text(Some(collection.to_string()))), stored],
-        },
-        EcosystemKind::Threadgate => tid(
+        EcosystemKind::StarterPack => {
+            let name = required(record, "name")?;
+            // As the old generated column read them.
+            let search = format!("{name} {}", text(record, "description").unwrap_or_default());
+            keyed(
+                "starter_packs",
+                COLL_STARTER_PACK,
+                true,
+                vec![("list", Cell::Ref(Slot::List, at_uri(record, "list")?)), ("search_tsv", Cell::Tsv(search)), created],
+            )
+        }
+        EcosystemKind::LabelerService => {
+            json(record, "policies").ok_or_else(|| err("missing policies"))?;
+            Row {
+                table: "labeler_services",
+                layout: Layout::Keyed { coll: COLL_LABELER, key: RowKey::Author, record: true },
+                cells: vec![created],
+            }
+        }
+        EcosystemKind::SelfRecord => {
+            let coll = collection_id(collection).ok_or_else(|| err("not a self record collection"))?;
+            let hide = normalized.get("hideFromAlgorithmicRecommendations") == Some(&Value::Bool(true));
+            Row {
+                table: "actor_self_records",
+                layout: Layout::Keyed { coll, key: RowKey::Coll, record: true },
+                cells: vec![
+                    ("hide_from_recs", Cell::Bool(Some(hide))),
+                    ("allow_subscriptions", Cell::Text(field_text(normalized, "allowSubscriptions"))),
+                ],
+            }
+        }
+        EcosystemKind::Threadgate => keyed(
             "threadgates",
-            "author_did",
-            vec![
-                ("post_uri", Cell::Text(Some(at_uri(record, "post")?))),
-                // Absent: anyone may reply. An empty array: nobody.
-                ("allow", Cell::Json(json(record, "allow"))),
-                ("hidden_replies", Cell::TextArray(strings(record, "hiddenReplies"))),
-                stored,
-                created,
-            ],
+            COLL_THREADGATE,
+            true,
+            vec![("post", Cell::Ref(Slot::Subject, at_uri(record, "post")?)), created],
         ),
-        EcosystemKind::Postgate => tid(
+        EcosystemKind::Postgate => keyed(
             "postgates",
-            "author_did",
-            vec![
-                ("post_uri", Cell::Text(Some(at_uri(record, "post")?))),
-                ("embedding_rules", Cell::Json(json(record, "embeddingRules"))),
-                ("detached_embedding_uris", Cell::TextArray(strings(record, "detachedEmbeddingUris"))),
-                stored,
-                created,
-            ],
+            COLL_POSTGATE,
+            true,
+            vec![("post", Cell::Ref(Slot::Subject, at_uri(record, "post")?)), created],
         ),
         EcosystemKind::PollPost => {
-            let options = json(record, "options").filter(Value::is_array).ok_or_else(|| err("missing options"))?;
-            tid(
+            json(record, "options").filter(Value::is_array).ok_or_else(|| err("missing options"))?;
+            keyed(
                 "nearhorizon_poll_posts",
-                "author_did",
-                vec![
-                    ("text", Cell::Text(Some(text(record, "text").unwrap_or_default()))),
-                    ("options", Cell::Json(Some(options))),
-                    ("visibility", Cell::Text(Some(required(record, "visibility")?))),
-                    ("multi_select", Cell::Bool(record.get("multiSelect").and_then(Value::as_bool))),
-                    ("result_visibility", Cell::Text(text(record, "resultVisibility"))),
-                    // A string that is not a datetime is stored as NULL.
-                    (
-                        "deadline",
-                        Cell::Time(
-                            text(record, "deadline")
-                                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                                .map(|d| d.with_timezone(&Utc)),
-                        ),
-                    ),
-                    stored,
-                    created,
-                ],
+                COLL_POLL_POST,
+                true,
+                vec![("visibility", Cell::Text(Some(required(record, "visibility")?))), created],
             )
         }
         // Any author's (plural-pronouns design §2.2): the record whole, or
@@ -294,15 +349,15 @@ pub fn row(
             if !record.is_object() {
                 return Err(err("record is not an object"));
             }
-            tid(
-                PLURAL_TABLE,
-                "did",
-                vec![
+            Row {
+                table: PLURAL_TABLE,
+                layout: Layout::ByUri { owner_column: "did" },
+                cells: vec![
                     ("collection", Cell::Text(Some(collection.to_string()))),
                     ("record", Cell::Json(plural_value(normalized))),
                     ("indexed_at", Cell::Time(Some(now))),
                 ],
-            )
+            }
         }
         EcosystemKind::Post
         | EcosystemKind::Like
@@ -332,11 +387,12 @@ mod tests {
     #[test]
     fn a_listitem_must_name_a_list_in_its_own_repo() {
         let item = |list: &str| json!({"list": list, "subject": "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"});
-        let own = build(EcosystemKind::ListItem, "app.bsky.graph.listitem", &item(&format!("at://{REPO}/app.bsky.graph.list/3k")))
+        let own = build(EcosystemKind::ListItem, "app.bsky.graph.listitem", &item(&format!("at://{REPO}/app.bsky.graph.list/3kaaaaaaaaaaa")))
             .expect("valid")
             .expect("indexed");
         assert_eq!(own.table, "list_items");
-        assert_eq!(cell(&own, "subject_did"), &Cell::Text(Some("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into())));
+        assert_eq!(cell(&own, "subject"), &Cell::Account("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into()));
+        assert_eq!(cell(&own, "list_rkey"), &Cell::OwnRkey("3kaaaaaaaaaaa".into()));
         for foreign in [
             "at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3k".to_string(),
             // A longer DID with this repo as its prefix is another repo.
@@ -344,6 +400,8 @@ mod tests {
             format!("at://{REPO}/app.bsky.graph.starterpack/3k"),
             format!("at://{REPO}/app.bsky.graph.list/3k/extra"),
             format!("at://{REPO}/app.bsky.graph.list/"),
+            // A key that is not a valid record key names no list.
+            format!("at://{REPO}/app.bsky.graph.list/a b"),
         ] {
             assert_eq!(build(EcosystemKind::ListItem, "app.bsky.graph.listitem", &item(&foreign)), Ok(None), "{foreign}");
         }
@@ -359,43 +417,52 @@ mod tests {
             "avatar": {"$type": "blob", "ref": {"$link": "bafyavatar"}},
             "labels": {"values": [{"val": "nudity"}]}});
         let r = build(EcosystemKind::List, "app.bsky.graph.list", &list).expect("valid").expect("row");
-        assert_eq!((r.table, r.owner_column, r.has_rkey), ("lists", "creator_did", true));
+        assert_eq!((r.table, r.layout), ("lists", Layout::Keyed { coll: COLL_LIST, key: RowKey::Rkey, record: true }));
         assert_eq!(cell(&r, "purpose"), &Cell::Text(Some("app.bsky.graph.defs#modlist".into())));
-        assert_eq!(cell(&r, "avatar_cid"), &Cell::Text(Some("bafyavatar".into())));
-        assert_eq!(cell(&r, "self_labels"), &Cell::TextArray(vec!["nudity".into()]));
         assert!(build(EcosystemKind::List, "app.bsky.graph.list", &json!({"name": "x"})).is_err(), "purpose is required");
+        assert!(build(EcosystemKind::List, "app.bsky.graph.list", &json!({"purpose": "x"})).is_err(), "name is required");
 
         let block = json!({"subject": "at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3k"});
         let r = build(EcosystemKind::ListBlock, "app.bsky.graph.listblock", &block).expect("valid").expect("row");
-        assert_eq!(cell(&r, "list_uri"), &Cell::Text(Some("at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3k".into())));
+        assert_eq!(r.reference("subj"), Some("at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3k"));
+        assert_eq!(cell(&r, "subj"), &Cell::Ref(Slot::Subject, "at://did:plc:cccccccccccccccccccccccc/app.bsky.graph.list/3k".into()));
 
-        // A threadgate with no `allow` stores NULL; with `[]`, an empty array.
-        let gate = |allow: Option<Value>| {
-            let mut g = json!({"post": format!("at://{REPO}/app.bsky.feed.post/3k"), "hiddenReplies": ["at://x/y/z"]});
-            if let Some(a) = allow {
-                g["allow"] = a;
-            }
-            build(EcosystemKind::Threadgate, "app.bsky.feed.threadgate", &g).expect("valid").expect("row")
-        };
-        assert_eq!(cell(&gate(None), "allow"), &Cell::Json(None));
-        assert_eq!(cell(&gate(Some(json!([]))), "allow"), &Cell::Json(Some(json!([]))));
-        assert_eq!(cell(&gate(None), "hidden_replies"), &Cell::TextArray(vec!["at://x/y/z".into()]));
+        let gate = json!({"post": format!("at://{REPO}/app.bsky.feed.post/3k"), "hiddenReplies": ["at://x/y/z"]});
+        let r = build(EcosystemKind::Threadgate, "app.bsky.feed.threadgate", &gate).expect("valid").expect("row");
+        assert_eq!(r.reference("post"), Some(format!("at://{REPO}/app.bsky.feed.post/3k").as_str()));
+        assert!(matches!(r.layout, Layout::Keyed { record: true, .. }), "a gate keeps its record");
+
+        let pack = json!({"name": "Rust", "description": "people", "list": format!("at://{REPO}/app.bsky.graph.list/3k")});
+        let r = build(EcosystemKind::StarterPack, "app.bsky.graph.starterpack", &pack).expect("valid").expect("row");
+        assert_eq!(cell(&r, "search_tsv"), &Cell::Tsv("Rust people".into()));
 
         let own = json!({"allowSubscriptions": "followers"});
         let r = build(EcosystemKind::SelfRecord, "app.bsky.notification.declaration", &own).expect("valid").expect("row");
-        assert_eq!((r.table, r.owner_column, r.has_rkey), ("actor_self_records", "did", false));
-        assert_eq!(cell(&r, "collection"), &Cell::Text(Some("app.bsky.notification.declaration".into())));
+        assert_eq!((r.table, r.layout), ("actor_self_records", Layout::Keyed { coll: 13, key: RowKey::Coll, record: true }));
+        assert_eq!(cell(&r, "allow_subscriptions"), &Cell::Text(Some("followers".into())));
+        assert_eq!(cell(&r, "hide_from_recs"), &Cell::Bool(Some(false)));
+        let hidden = json!({"hideFromAlgorithmicRecommendations": true});
+        let r = build(EcosystemKind::SelfRecord, "app.bsky.actor.contentVisibilityDeclaration", &hidden).expect("valid").expect("row");
+        assert_eq!((cell(&r, "hide_from_recs"), cell(&r, "allow_subscriptions")), (&Cell::Bool(Some(true)), &Cell::Text(None)));
+
+        let labeler = build(EcosystemKind::LabelerService, "app.bsky.labeler.service", &json!({"policies": {}})).expect("valid").expect("row");
+        assert_eq!(labeler.layout, Layout::Keyed { coll: COLL_LABELER, key: RowKey::Author, record: true });
+        assert!(build(EcosystemKind::LabelerService, "app.bsky.labeler.service", &json!({})).is_err(), "policies are required");
 
         let poll = json!({"text": "which?", "options": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
             "visibility": "public", "multiSelect": true, "deadline": "tomorrow"});
         let r = build(EcosystemKind::PollPost, "app.nearhorizon.poll.post", &poll).expect("valid").expect("row");
-        assert_eq!(cell(&r, "multi_select"), &Cell::Bool(Some(true)));
-        assert_eq!(cell(&r, "deadline"), &Cell::Time(None), "an unparseable deadline is NULL");
+        assert_eq!(cell(&r, "visibility"), &Cell::Text(Some("public".into())));
         assert!(build(EcosystemKind::PollPost, "app.nearhorizon.poll.post", &json!({"text": "x", "visibility": "public"})).is_err());
+
+        let plural = build(EcosystemKind::Plural, "app.nearhorizon.plural.member", &json!({"name": "a"})).expect("valid").expect("row");
+        assert_eq!(plural.layout, Layout::ByUri { owner_column: "did" });
 
         for kind in [EcosystemKind::Post, EcosystemKind::Profile] {
             assert_eq!(table(kind), None);
         }
         assert_eq!(table(EcosystemKind::Postgate), Some("postgates"));
+        assert_eq!((key_of("postgates"), key_of("labeler_services"), key_of(PLURAL_TABLE)), (Some(RowKey::Rkey), Some(RowKey::Author), None));
+        assert_eq!(key_where(RowKey::Coll), "author = $1 AND coll = $2");
     }
 }

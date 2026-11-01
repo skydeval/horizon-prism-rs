@@ -679,15 +679,9 @@ impl Hydrator {
         let (Some(author), Some(rkey)) = (uri_author(root), root.rsplit('/').next()) else {
             return Ok(None);
         };
-        let stored: Option<(Vec<String>, Option<Value>)> = sqlx::query_as(
-            "SELECT hidden_replies, allow FROM threadgates WHERE post_uri = $1 \
-               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
-        )
-        .bind(root)
-        .fetch_optional(self.pool())
-        .await?;
-        let record = if let Some((hidden, allow)) = stored {
-            return Ok(Some(RootRules { hidden: hidden.into_iter().collect(), allow: allow.and_then(|a| a.as_array().cloned()) }));
+        let stored = crate::db::gates::valid_one(self.pool(), crate::db::gates::Kind::Threadgate, root).await?;
+        let record = if let Some(gate) = stored {
+            return Ok(Some(RootRules { hidden: gate.hidden_replies().into_iter().collect(), allow: gate.allow().and_then(|a| a.as_array().cloned()) }));
         } else if let Some(cached) = ROOT_GATES.get(root) {
             cached
         } else {
@@ -751,11 +745,7 @@ impl Hydrator {
             .fetch_one(self.pool())
             .await?;
         if member {
-            let found: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_items WHERE list_uri = $1 AND subject_did = $2)")
-                .bind(list)
-                .bind(replier)
-                .fetch_one(self.pool())
-                .await?;
+            let found = crate::db::lists::on_list(self.pool(), list, replier).await?;
             return Ok(Some(found));
         }
         let Some(client) = self.backlinks() else {

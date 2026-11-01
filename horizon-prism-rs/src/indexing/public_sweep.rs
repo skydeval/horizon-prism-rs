@@ -53,6 +53,10 @@ pub enum Key {
     /// is_repost, src_rkey]`. A text cursor starts the table again, as for
     /// [`Key::AuthorRkey`].
     FeedItem,
+    /// A record table keyed by its author alone (`labeler_services`):
+    /// `[author]`. A text cursor starts the table again, as for
+    /// [`Key::AuthorRkey`].
+    Author,
 }
 
 /// One swept table (§7.2's table).
@@ -67,14 +71,14 @@ pub struct SweepTable {
 }
 
 const ALL: &str = "TRUE";
-const AUTHOR_NOT_MEMBER: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did)";
+// Every swept table names its author by id.
+const AUTHOR_NOT_MEMBER: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id = t.author)";
 // Refract's spares (refract design §5.4): an author in R (database state)
 // keeps the rows the restored rule admitted.
-const NOT_R_AUTHOR: &str = "NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace'))";
-const AUTHOR_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.author_did) \
-     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.author_did AND r.state IN ('restored', 'grace'))";
-const CREATOR_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m WHERE m.did = t.creator_did) \
-     AND NOT EXISTS (SELECT 1 FROM refract_dids r WHERE r.did = t.creator_did AND r.state IN ('restored', 'grace'))";
+const NOT_R_AUTHOR: &str =
+    "NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace'))";
+const AUTHOR_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id = t.author) \
+     AND NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace'))";
 // Follows name their accounts by id.
 const NO_MEMBER_END_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id IN (t.author, t.subject)) \
      AND NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace'))";
@@ -94,6 +98,7 @@ const fn table(name: &'static str, key: Key, delete_when: &'static str, start: u
     SweepTable { name, key, delete_when, start }
 }
 
+#[cfg(test)]
 const URI: Key = Key::Text("uri");
 
 /// §7.4's order, with §7.2's predicates and starting sizes. Every name and
@@ -111,22 +116,22 @@ pub const TABLES: [SweepTable; 18] = [
     // A post's search row and odd references go with it.
     table("posts", Key::AuthorRkey, POST_NOT_R, 1_000),
     // 4.
-    table("threadgates", URI, NOT_R_AUTHOR, 10_000),
-    table("postgates", URI, NOT_R_AUTHOR, 10_000),
-    table("starter_packs", URI, ALL, 10_000),
-    table("labeler_services", URI, ALL, 10_000),
-    table("nearhorizon_poll_posts", URI, ALL, 10_000),
-    table("lists", URI, CREATOR_NOT_MEMBER_NOR_R, 10_000),
-    table("list_items", URI, AUTHOR_NOT_MEMBER_NOR_R, 10_000),
-    table("list_optouts", URI, AUTHOR_NOT_MEMBER_NOR_R, 10_000),
-    table("list_blocks", URI, AUTHOR_NOT_MEMBER, 10_000),
+    table("threadgates", Key::AuthorRkey, NOT_R_AUTHOR, 10_000),
+    table("postgates", Key::AuthorRkey, NOT_R_AUTHOR, 10_000),
+    table("starter_packs", Key::AuthorRkey, ALL, 10_000),
+    table("labeler_services", Key::Author, ALL, 10_000),
+    table("nearhorizon_poll_posts", Key::AuthorRkey, ALL, 10_000),
+    table("lists", Key::AuthorRkey, AUTHOR_NOT_MEMBER_NOR_R, 10_000),
+    table("list_items", Key::AuthorRkey, AUTHOR_NOT_MEMBER_NOR_R, 10_000),
+    table("list_optouts", Key::AuthorRkey, AUTHOR_NOT_MEMBER_NOR_R, 10_000),
+    table("list_blocks", Key::AuthorRkey, AUTHOR_NOT_MEMBER, 10_000),
     // 5.
     table("follows", Key::AuthorRkey, NO_MEMBER_END_NOR_R, 10_000),
     // 6. Also removes the negative trend rows steps 2–3 created. The
     // counts of R's posts stay, as `load_posts` falls back to them.
     table("post_counts", Key::AuthorRkey, POST_NOT_R, 10_000),
     table("tag_activity_hourly", Key::TagHour, ALL, 10_000),
-    table("starter_pack_counts", Key::Text("pack_uri"), ALL, 10_000),
+    table("starter_pack_counts", Key::AuthorRkey, ALL, 10_000),
 ];
 
 /// A window's largest key: the stored cursor.
@@ -137,6 +142,7 @@ pub enum Cursor {
     TagHour(String, DateTime<Utc>),
     AuthorRkey(i32, i64),
     FeedItem(i32, bool, i64),
+    Author(i32),
 }
 
 impl Cursor {
@@ -149,6 +155,7 @@ impl Cursor {
             Self::TagHour(tag, hour) => json!([tag, rfc3339(hour)]),
             Self::AuthorRkey(author, rkey) => json!([author, rkey]),
             Self::FeedItem(originator, is_repost, rkey) => json!([originator, is_repost, rkey]),
+            Self::Author(author) => json!([author]),
         }
     }
 
@@ -169,6 +176,7 @@ impl Cursor {
             (Key::FeedItem, Value::Array(a)) if a.len() == 3 => {
                 Self::FeedItem(i32::try_from(a[0].as_i64()?).ok()?, a[1].as_bool()?, a[2].as_i64()?)
             }
+            (Key::Author, Value::Array(a)) if a.len() == 1 => Self::Author(i32::try_from(a[0].as_i64()?).ok()?),
             _ => return None,
         };
         Some(Some(cursor))
@@ -185,7 +193,7 @@ pub fn valid_state(v: &Value) -> Option<SweepState> {
         // A text cursor of a table that moved to ids: that table starts
         // again from its first key, which only deletes again what the
         // predicate drops. Any other mismatch is not a valid state.
-        if !matches!(table.key, Key::AuthorRkey | Key::FeedItem) {
+        if !matches!(table.key, Key::AuthorRkey | Key::FeedItem | Key::Author) {
             return None;
         }
         after = Value::Null;
@@ -202,6 +210,7 @@ enum Window {
     TagHour(Vec<String>, Vec<DateTime<Utc>>),
     AuthorRkey(Vec<i32>, Vec<i64>),
     FeedItem(Vec<i32>, Vec<bool>, Vec<i64>),
+    Author(Vec<i32>),
 }
 
 impl Window {
@@ -215,6 +224,7 @@ impl Window {
                 (Some(o), Some(r), Some(k)) => Some(Cursor::FeedItem(*o, *r, *k)),
                 _ => None,
             },
+            Self::Author(authors) => authors.last().copied().map(Cursor::Author),
         }
     }
 }
@@ -559,6 +569,21 @@ async fn select_window(conn: &mut PgConnection, t: &SweepTable, after: Option<&C
             }
             Window::FeedItem(window.0, window.1, window.2)
         }
+        Key::Author => {
+            let after = match after {
+                Some(Cursor::Author(a)) => Some(*a),
+                _ => None,
+            };
+            let keys: Vec<i32> = sqlx::query_scalar(&format!(
+                "SELECT author FROM {name} WHERE ($1::integer IS NULL OR author > $1) ORDER BY author LIMIT $2",
+                name = t.name
+            ))
+            .bind(after)
+            .bind(limit)
+            .fetch_all(conn)
+            .await?;
+            Window::Author(keys)
+        }
     })
 }
 
@@ -606,6 +631,12 @@ async fn delete_window(conn: &mut PgConnection, t: &SweepTable, window: &Window)
             .execute(conn)
             .await?
         }
+        (Key::Author, Window::Author(authors)) => {
+            sqlx::query(&format!("DELETE FROM {name} t WHERE t.author = ANY($1) AND {pred}"))
+                .bind(authors)
+                .execute(conn)
+                .await?
+        }
         _ => unreachable!("a window has its table's key"),
     };
     Ok(result.rows_affected())
@@ -625,6 +656,7 @@ mod tests {
             (Key::TagHour, Cursor::TagHour("rust".into(), hour)),
             (Key::AuthorRkey, Cursor::AuthorRkey(7, -3)),
             (Key::FeedItem, Cursor::FeedItem(7, true, -3)),
+            (Key::Author, Cursor::Author(7)),
         ] {
             assert_eq!(Cursor::from_json(key, &cursor.to_json()), Some(Some(cursor)));
             assert_eq!(Cursor::from_json(key, &Value::Null), Some(None));
@@ -642,13 +674,16 @@ mod tests {
         let restarted = valid_state(&state).expect("still a valid state");
         assert_eq!((restarted.table.as_str(), &restarted.after), ("follows", &Value::Null));
         // So does every other table keyed by ids.
-        for name in ["likes", "reposts", "post_counts", "posts", "feed_items"] {
+        for name in [
+            "likes", "reposts", "post_counts", "posts", "feed_items", "threadgates", "postgates", "starter_packs", "labeler_services",
+            "nearhorizon_poll_posts", "lists", "list_items", "list_optouts", "list_blocks", "starter_pack_counts",
+        ] {
             let state = json!({"table": name, "after": "at://did:plc:a/app.bsky.feed.like/1", "last_advanced_at": "2026-10-14T05:00:00Z"});
             assert_eq!(valid_state(&state).expect(name).after, Value::Null, "{name} starts again");
         }
         // Any other table's mismatched cursor is still refused.
-        let gates = json!({"table": "threadgates", "after": 7, "last_advanced_at": "2026-10-14T05:00:00Z"});
-        assert!(valid_state(&gates).is_none());
+        let tags = json!({"table": "tag_activity_hourly", "after": 7, "last_advanced_at": "2026-10-14T05:00:00Z"});
+        assert!(valid_state(&tags).is_none());
     }
 
     #[test]

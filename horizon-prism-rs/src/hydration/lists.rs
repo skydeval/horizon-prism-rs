@@ -62,7 +62,7 @@ fn list_not_found() -> ViewError {
 }
 
 /// What a `listView` is built from: a `lists` row, or a fetched record.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub(super) struct ListRow {
     pub(super) uri: String,
     cid: String,
@@ -73,9 +73,22 @@ pub(super) struct ListRow {
     avatar_cid: Option<String>,
     indexed_at: DateTime<Utc>,
     created_at: DateTime<Utc>,
+    /// The stored row's key; none for a fetched record.
+    key: Option<(i32, i64)>,
 }
 
-const LIST_COLUMNS: &str = "uri, cid, name, purpose, description, description_facets, avatar_cid, indexed_at, created_at";
+/// A stored list as read: URI, CID, purpose, record, `indexed_at`,
+/// `created_at`, and its key.
+type StoredList = (String, Vec<u8>, String, Vec<u8>, DateTime<Utc>, DateTime<Utc>, i32, i64);
+
+/// SQL: a stored list's columns, as [`StoredList`], from `lists l` joined to
+/// its author's `dids` row `d`.
+fn list_columns() -> String {
+    format!(
+        "{} AS uri, l.cid, l.purpose, l.record, l.indexed_at, l.created_at, l.author, l.rkey",
+        crate::db::lists::uri_sql("d.did", NSID_LIST, "l.rkey")
+    )
+}
 
 impl ListRow {
     /// From a fetched `{uri, cid, value}` record. `None` when the value is
@@ -96,8 +109,69 @@ impl ListRow {
             avatar_cid: value.get("avatar").and_then(blob_cid),
             indexed_at: created,
             created_at: created,
+            key: None,
         })
     }
+
+    /// From a stored row: the fields from its record, as the writer read
+    /// them when it stored the row.
+    async fn from_stored(pool: &sqlx::PgPool, row: StoredList) -> Result<Self, sqlx::Error> {
+        let (uri, cid, purpose, record, indexed_at, created_at, author, rkey) = row;
+        let value = crate::db::records::decode_value(pool, &record).await?;
+        let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+        Ok(Self {
+            uri,
+            cid: crate::db::ids::cid_from_db(&cid),
+            name: text("name").unwrap_or_default(),
+            purpose,
+            description: text("description"),
+            description_facets: value.get("descriptionFacets").filter(|v| !v.is_null()).cloned(),
+            avatar_cid: value.get("avatar").and_then(blob_cid),
+            indexed_at,
+            created_at,
+            key: Some((author, rkey)),
+        })
+    }
+}
+
+/// Stored lists from a query over [`list_columns`].
+async fn stored_lists(pool: &sqlx::PgPool, rows: Vec<StoredList>) -> Result<Vec<ListRow>, sqlx::Error> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(ListRow::from_stored(pool, row).await?);
+    }
+    Ok(out)
+}
+
+/// The record key a local cursor's URI names, for a `(created_at, rkey)`
+/// order in one repo; the lowest key when it names none, so the cursor sorts
+/// below every row of its time.
+pub(super) async fn cursor_rkey(pool: &sqlx::PgPool, after: Option<&str>) -> Result<i64, sqlx::Error> {
+    Ok(match after {
+        Some(uri) => crate::db::ids::whole_key(pool, uri).await?.map_or(i64::MIN, |(_, _, k)| k),
+        None => i64::MIN,
+    })
+}
+
+/// Distinct subjects of each of `lists` (one author's stored lists), by URI.
+async fn item_counts(pool: &sqlx::PgPool, lists: &[ListRow]) -> Result<HashMap<String, i64>, sqlx::Error> {
+    let (authors, rkeys): (Vec<i32>, Vec<i64>) = lists.iter().filter_map(|l| l.key).unzip();
+    let counts: Vec<(i32, i64, i64)> = sqlx::query_as(
+        "SELECT i.author, i.list_rkey, count(DISTINCT i.subject) FROM unnest($1::int[], $2::bigint[]) AS k(author, rkey) \
+         JOIN list_items i ON i.author = k.author AND i.list_rkey = k.rkey GROUP BY i.author, i.list_rkey",
+    )
+    .bind(&authors)
+    .bind(&rkeys)
+    .fetch_all(pool)
+    .await?;
+    Ok(lists
+        .iter()
+        .filter_map(|l| {
+            let key = l.key?;
+            let n = counts.iter().find(|(a, k, _)| (*a, *k) == key).map_or(0, |(_, _, n)| *n);
+            Some((l.uri.clone(), n))
+        })
+        .collect())
 }
 
 /// The viewer's own state on lists: its list mute, its `listblock` record,
@@ -148,18 +222,29 @@ impl Hydrator {
 
     /// [`Self::list_viewer`] for the viewer `me`, whose state is hydrated.
     pub(super) async fn list_viewer_of(&self, me: &str, lists: &[String]) -> Result<ListViewer, sqlx::Error> {
+        let me_id = crate::db::ids::account_id(self.pool(), me).await?;
         let muted: Vec<String> = sqlx::query_scalar("SELECT list_uri FROM list_mutes WHERE viewer_did = $1 AND list_uri = ANY($2)")
             .bind(me)
             .bind(lists)
             .fetch_all(self.pool())
             .await?;
         let mut pairs = Vec::new();
-        for table in ["list_blocks", "list_optouts"] {
+        for (table, coll) in [("list_blocks", crate::db::ids::COLL_LISTBLOCK), ("list_optouts", crate::db::ids::COLL_LIST_OPTOUT)] {
+            // The viewer's earliest record for each list: a whole list
+            // reference by its key, an odd one by its text.
             let rows: Vec<(String, String)> = sqlx::query_as(&format!(
-                "SELECT DISTINCT ON (list_uri) list_uri, uri FROM {table} WHERE author_did = $1 AND list_uri = ANY($2) \
-                 ORDER BY list_uri, created_at, uri"
+                "SELECT DISTINCT ON (x.list_uri) x.list_uri, at_uri(x.author, {coll}::smallint, x.rkey) FROM ( \
+                   SELECT u.uri AS list_uri, b.author, b.rkey, b.created_at FROM unnest($2::text[]) AS u(uri) \
+                     CROSS JOIN LATERAL ref_of(u.uri) k \
+                     JOIN {table} b ON b.subj_author = k.author AND b.subj_rkey = k.rkey AND b.subj_coll = k.coll \
+                     WHERE b.author = $1 \
+                   UNION ALL SELECT o.raw, b.author, b.rkey, b.created_at FROM odd_refs o \
+                     JOIN {table} b ON b.author = o.author AND b.rkey = o.rkey AND b.subj_coll = 0 \
+                     WHERE o.tbl = {coll} AND o.author = $1 AND o.slot = {slot} AND o.raw = ANY($2)) x \
+                 ORDER BY x.list_uri, x.created_at, x.rkey",
+                slot = crate::db::ids::Slot::Subject.id()
             ))
-            .bind(me)
+            .bind(me_id)
             .bind(lists)
             .fetch_all(self.pool())
             .await?;
@@ -184,10 +269,18 @@ impl Hydrator {
         }
         let local = self.is_ready_member(uri_author(list).unwrap_or_default()).await?;
         let row: Option<ListRow> = if local {
-            sqlx::query_as(&format!("SELECT {LIST_COLUMNS} FROM lists WHERE uri = $1"))
-                .bind(list)
-                .fetch_optional(self.pool())
-                .await?
+            match crate::db::lists::key(self.pool(), list).await? {
+                Some((author, rkey)) => {
+                    let rows: Vec<StoredList> =
+                        sqlx::query_as(&format!("SELECT {} FROM lists l JOIN dids d ON d.id = l.author WHERE l.author = $1 AND l.rkey = $2", list_columns()))
+                            .bind(author)
+                            .bind(rkey)
+                            .fetch_all(self.pool())
+                            .await?;
+                    stored_lists(self.pool(), rows).await?.pop()
+                }
+                None => None,
+            }
         } else if req.is_local_only() {
             None
         } else {
@@ -223,10 +316,7 @@ impl Hydrator {
 
     /// Distinct subjects of a locally servable list.
     pub(super) async fn list_item_count(&self, list: &str) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar("SELECT count(DISTINCT subject_did) FROM list_items WHERE list_uri = $1")
-            .bind(list)
-            .fetch_one(self.pool())
-            .await
+        crate::db::lists::item_count(self.pool(), list).await
     }
 
     /// A `listView`. `count` is the number of distinct subjects when known.
@@ -284,27 +374,29 @@ impl Hydrator {
         // The items: `(listitem uri, subject view)`, with the subject's DID.
         let (mut items, next, count): (Vec<ListedItem>, Option<String>, Option<i64>) = if local {
             let (at, after) = parse_local_cursor(cursor);
+            let after_rkey = cursor_rkey(self.pool(), after.as_deref()).await?;
+            let (list_author, list_rkey) = row.key.unwrap_or((0, 0));
             // One row per subject: duplicates are stored and ignored here.
-            let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
-                "SELECT uri, subject_did, created_at FROM ( \
-                   SELECT DISTINCT ON (subject_did) uri, subject_did, created_at FROM list_items \
-                   WHERE list_uri = $1 ORDER BY subject_did, created_at DESC, uri DESC) i \
-                 WHERE ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-                 ORDER BY created_at DESC, uri DESC LIMIT $4",
-            )
-            .bind(list)
+            let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(&format!(
+                "SELECT {}, s.did, i.created_at FROM ( \
+                   SELECT DISTINCT ON (subject) rkey, subject, created_at FROM list_items \
+                   WHERE author = $1 AND list_rkey = $2 ORDER BY subject, created_at DESC, rkey DESC) i \
+                 JOIN dids s ON s.id = i.subject, dids d \
+                 WHERE d.id = $1 AND ($3::timestamptz IS NULL OR (i.created_at, i.rkey) < ($3, $4)) \
+                 ORDER BY i.created_at DESC, i.rkey DESC LIMIT $5",
+                crate::db::lists::uri_sql("d.did", crate::firehose::classifier::NSID_LISTITEM, "i.rkey")
+            ))
+            .bind(list_author)
+            .bind(list_rkey)
             .bind(at)
-            .bind(after.unwrap_or_default())
+            .bind(after_rkey)
             .bind(i64::from(limit))
             .fetch_all(self.pool())
             .await?;
             let next = (rows.len() == usize::try_from(limit).unwrap_or(usize::MAX))
                 .then(|| rows.last().map(|(u, _, t)| local_cursor(*t, u)))
                 .flatten();
-            let count: i64 = sqlx::query_scalar("SELECT count(DISTINCT subject_did) FROM list_items WHERE list_uri = $1")
-                .bind(list)
-                .fetch_one(self.pool())
-                .await?;
+            let count = self.list_item_count(list).await?;
             let dids: Vec<String> = rows.iter().map(|(_, d, _)| d.clone()).collect();
             let ctx = self.profile_context(viewer, req, &dids, None, super::Tiers::List).await?;
             let items = rows.into_iter().map(|(uri, did, _)| (uri, did.clone(), ctx.view(&did, ProfileKind::View))).collect();
@@ -334,13 +426,30 @@ impl Hydrator {
         // A reference list leaves out subjects who opted out, except for
         // its owner, who sees them marked.
         let opted_out: HashSet<String> = if row.purpose == PURPOSE_REFERENCE {
-            sqlx::query_scalar("SELECT DISTINCT author_did FROM list_optouts WHERE list_uri = $1 AND author_did = ANY($2)")
-                .bind(list)
-                .bind(&dids)
-                .fetch_all(self.pool())
-                .await?
-                .into_iter()
-                .collect()
+            // The list by its key, read first; an odd subject by its text.
+            let key = match row.key {
+                Some(key) => Some(key),
+                None => crate::db::lists::key(self.pool(), list).await?,
+            };
+            let (list_author, list_rkey) = key.map_or((None, None), |(a, k)| (Some(a), Some(k)));
+            sqlx::query_scalar(&format!(
+                "SELECT DISTINCT d.did FROM list_optouts o JOIN dids d ON d.id = o.author \
+                 WHERE o.subj_author = $3 AND o.subj_rkey = $4 AND o.subj_coll = {} AND d.did = ANY($2) \
+                 UNION SELECT d.did FROM odd_refs r JOIN list_optouts o ON o.author = r.author AND o.rkey = r.rkey AND o.subj_coll = 0 \
+                   JOIN dids d ON d.id = o.author \
+                 WHERE r.tbl = {} AND r.slot = {} AND r.raw = $1 AND d.did = ANY($2)",
+                crate::db::ids::COLL_LIST,
+                crate::db::ids::COLL_LIST_OPTOUT,
+                crate::db::ids::Slot::Subject.id()
+            ))
+            .bind(list)
+            .bind(&dids)
+            .bind(list_author)
+            .bind(list_rkey)
+            .fetch_all(self.pool())
+            .await?
+            .into_iter()
+            .collect()
         } else {
             HashSet::new()
         };
@@ -370,10 +479,15 @@ impl Hydrator {
 
     /// For each of `lists`, the newest `listitem` URI that names `subject`.
     pub(super) async fn memberships(&self, lists: &[String], subject: &str) -> Result<HashMap<String, String>, sqlx::Error> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT DISTINCT ON (list_uri) list_uri, uri FROM list_items WHERE list_uri = ANY($1) AND subject_did = $2 \
-             ORDER BY list_uri, created_at DESC, uri DESC",
-        )
+        let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+            "SELECT DISTINCT ON (u.uri) u.uri, at_uri(i.author, {}::smallint, i.rkey) \
+             FROM unnest($1::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) k \
+             JOIN list_items i ON k.coll = {} AND i.author = k.author AND i.list_rkey = k.rkey \
+             WHERE i.subject = (SELECT s.id FROM dids s WHERE s.did = $2) \
+             ORDER BY u.uri, i.created_at DESC, i.rkey DESC",
+            crate::db::ids::COLL_LISTITEM,
+            crate::db::ids::COLL_LIST
+        ))
         .bind(lists)
         .bind(subject)
         .fetch_all(self.pool())
@@ -407,29 +521,27 @@ impl Hydrator {
             Err(e) => return Ok(Err(e)),
         };
         let (at, after) = parse_local_cursor(cursor);
-        let rows: Vec<ListRow> = sqlx::query_as(&format!(
-            "SELECT {LIST_COLUMNS} FROM lists WHERE creator_did = $1 AND purpose = ANY($5) \
-               AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-             ORDER BY created_at DESC, uri DESC LIMIT $4"
+        let after_rkey = cursor_rkey(self.pool(), after.as_deref()).await?;
+        let found: Vec<StoredList> = sqlx::query_as(&format!(
+            "SELECT {} FROM lists l JOIN dids d ON d.id = l.author \
+             WHERE d.did = $1 AND l.purpose = ANY($5) \
+               AND ($2::timestamptz IS NULL OR (l.created_at, l.rkey) < ($2, $3)) \
+             ORDER BY l.created_at DESC, l.rkey DESC LIMIT $4",
+            list_columns()
         ))
         .bind(&me)
         .bind(at)
-        .bind(after.unwrap_or_default())
+        .bind(after_rkey)
         .bind(i64::from(limit))
         .bind(&tokens)
         .fetch_all(self.pool())
         .await?;
+        let rows = stored_lists(self.pool(), found).await?;
         let next = (rows.len() == usize::try_from(limit).unwrap_or(usize::MAX))
             .then(|| rows.last().map(|r| local_cursor(r.created_at, &r.uri)))
             .flatten();
         let uris: Vec<String> = rows.iter().map(|r| r.uri.clone()).collect();
-        let counts: HashMap<String, i64> =
-            sqlx::query_as("SELECT list_uri, count(DISTINCT subject_did) FROM list_items WHERE list_uri = ANY($1) GROUP BY list_uri")
-                .bind(&uris)
-                .fetch_all(self.pool())
-                .await?
-                .into_iter()
-                .collect();
+        let counts = item_counts(self.pool(), &rows).await?;
         let member_of = self.memberships(&uris, &did).await?;
         let people = self.profile_context(viewer, req, &[me.clone(), did.clone()], None, super::Tiers::List).await?;
         let labels = self.load_labels(&uris).await?;
@@ -498,30 +610,27 @@ impl Hydrator {
         }
 
         let (at, after) = parse_local_cursor(cursor);
-        let rows: Vec<ListRow> = sqlx::query_as(&format!(
-            "SELECT {LIST_COLUMNS} FROM lists WHERE creator_did = $1 \
-               AND (cardinality($5::text[]) = 0 OR purpose = ANY($5)) \
-               AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-             ORDER BY created_at DESC, uri DESC LIMIT $4"
+        let after_rkey = cursor_rkey(self.pool(), after.as_deref()).await?;
+        let found: Vec<StoredList> = sqlx::query_as(&format!(
+            "SELECT {} FROM lists l JOIN dids d ON d.id = l.author \
+             WHERE d.did = $1 AND (cardinality($5::text[]) = 0 OR l.purpose = ANY($5)) \
+               AND ($2::timestamptz IS NULL OR (l.created_at, l.rkey) < ($2, $3)) \
+             ORDER BY l.created_at DESC, l.rkey DESC LIMIT $4",
+            list_columns()
         ))
         .bind(&did)
         .bind(at)
-        .bind(after.unwrap_or_default())
+        .bind(after_rkey)
         .bind(i64::from(limit))
         .bind(&tokens)
         .fetch_all(self.pool())
         .await?;
+        let rows = stored_lists(self.pool(), found).await?;
         let next = (rows.len() == usize::try_from(limit).unwrap_or(usize::MAX))
             .then(|| rows.last().map(|r| local_cursor(r.created_at, &r.uri)))
             .flatten();
         let uris: Vec<String> = rows.iter().map(|r| r.uri.clone()).collect();
-        let counts: HashMap<String, i64> =
-            sqlx::query_as("SELECT list_uri, count(DISTINCT subject_did) FROM list_items WHERE list_uri = ANY($1) GROUP BY list_uri")
-                .bind(&uris)
-                .fetch_all(self.pool())
-                .await?
-                .into_iter()
-                .collect();
+        let counts = item_counts(self.pool(), &rows).await?;
         let gates = self.gate_many(req, &uris).await?;
         let creators = self.profile_context(viewer, req, std::slice::from_ref(&did), None, super::Tiers::List).await?;
         let labels = self.load_labels(&uris).await?;
@@ -546,7 +655,7 @@ mod tests {
     use super::*;
     use crate::aggregations::ScopeSets;
     use crate::hydration::testing::{FixedUpstream, actor, exec, hydrator, hydrator_with};
-    use crate::test_support::fresh_db;
+    use crate::test_support::{fresh_db, records};
 
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
@@ -557,21 +666,17 @@ mod tests {
         format!("at://{owner}/app.bsky.graph.list/{rkey}")
     }
 
+    fn ago(minutes: u32) -> Option<DateTime<Utc>> {
+        Some(Utc::now() - chrono::TimeDelta::minutes(i64::from(minutes)))
+    }
+
     async fn list(p: &sqlx::PgPool, owner: &str, rkey: &str, name: &str, purpose: &str, age_minutes: u32) -> String {
-        let uri = list_uri(owner, rkey);
-        exec(p, &format!(
-            "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, description, record, created_at) VALUES \
-             ('{uri}', '{owner}', '{rkey}', 'bafylist', '3k', '{name}', '{purpose}', 'about {name}', '{{}}', now() - interval '{age_minutes} minutes')"
-        )).await;
-        uri
+        records::list_at(p, owner, rkey, name, purpose, ago(age_minutes)).await
     }
 
     async fn item(p: &sqlx::PgPool, list: &str, rkey: &str, subject: &str, age_minutes: u32) {
         let owner = uri_author(list).expect("owner");
-        exec(p, &format!(
-            "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES \
-             ('at://{owner}/app.bsky.graph.listitem/{rkey}', '{owner}', '{rkey}', 'bafyitem', '3k', '{list}', '{subject}', now() - interval '{age_minutes} minutes')"
-        )).await;
+        records::list_item_at(p, owner, rkey, list, subject, ago(age_minutes)).await;
     }
 
     #[test]
@@ -604,19 +709,16 @@ mod tests {
             actor(p, d, h, h).await;
         }
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
-        let mods = list(p, ALICE, "mods", "Mods", PURPOSE_MOD, 3).await;
-        let refs = list(p, ALICE, "refs", "Refs", PURPOSE_REFERENCE, 2).await;
-        list(p, ALICE, "cur", "Curated", PURPOSE_CURATE, 1).await;
+        let mods = list(p, ALICE, "3kmods2222222", "Mods", PURPOSE_MOD, 3).await;
+        let refs = list(p, ALICE, "3krefs2222222", "Refs", PURPOSE_REFERENCE, 2).await;
+        list(p, ALICE, "3kcur22222222", "Curated", PURPOSE_CURATE, 1).await;
         // Bob is listed twice in one list: one item, one count.
-        item(p, &mods, "i1", BOB, 5).await;
-        item(p, &mods, "i2", BOB, 4).await;
-        item(p, &mods, "i3", CAROL, 3).await;
-        item(p, &refs, "r1", BOB, 2).await;
-        item(p, &refs, "r2", CAROL, 1).await;
-        exec(p, &format!(
-            "INSERT INTO list_optouts (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES \
-             ('at://{CAROL}/app.bsky.graph.referencelistoptout/o1', '{CAROL}', 'o1', 'bafy', '3k', '{refs}', now())"
-        )).await;
+        item(p, &mods, "3kitem222222a", BOB, 5).await;
+        item(p, &mods, "3kitem222222b", BOB, 4).await;
+        item(p, &mods, "3kitem222222c", CAROL, 3).await;
+        item(p, &refs, "3kref2222222a", BOB, 2).await;
+        item(p, &refs, "3kref2222222b", CAROL, 1).await;
+        records::optout(p, CAROL, "3kopt2222222a", &refs).await;
         // Alice is a member and Bob is in scope: their handles resolve
         // locally (§11 G-9).
         let mut members = ScopeSets::default();
@@ -633,7 +735,7 @@ mod tests {
         assert_eq!(v["list"]["viewer"], json!({}));
         let subjects: Vec<&str> = v["items"].as_array().expect("items").iter().map(|i| i["subject"]["did"].as_str().expect("did")).collect();
         assert_eq!(subjects, [CAROL, BOB]);
-        assert_eq!(v["items"][1]["uri"], format!("at://{ALICE}/app.bsky.graph.listitem/i2"));
+        assert_eq!(v["items"][1]["uri"], format!("at://{ALICE}/app.bsky.graph.listitem/3kitem222222b"));
         // Paging by the newest item of each subject.
         let first = h.get_list(&anon, &req, &mods, 1, None).await.expect("db").expect("view");
         let cursor = first.inner()["cursor"].as_str().expect("cursor").to_string();
@@ -659,16 +761,13 @@ mod tests {
             hydrate: true,
         };
         let v = h.get_list(&carol, &req, &refs, 50, None).await.expect("db").expect("view");
-        assert_eq!(v.inner()["list"]["viewer"]["referenceListOptOut"], format!("at://{CAROL}/app.bsky.graph.referencelistoptout/o1"));
+        assert_eq!(v.inner()["list"]["viewer"]["referenceListOptOut"], format!("at://{CAROL}/app.bsky.graph.referencelistoptout/3kopt2222222a"));
 
         // The viewer's own list mute and list block show on the list.
         exec(p, &format!("INSERT INTO list_mutes (viewer_did, list_uri) VALUES ('{CAROL}', '{mods}')")).await;
-        exec(p, &format!(
-            "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES \
-             ('at://{CAROL}/app.bsky.graph.listblock/lb1', '{CAROL}', 'lb1', 'bafy', '3k', '{mods}', now())"
-        )).await;
+        records::list_block(p, CAROL, "3kblock22222a", &mods).await;
         let v = h.get_list(&carol, &req, &mods, 50, None).await.expect("db").expect("view");
-        assert_eq!(v.inner()["list"]["viewer"], json!({"muted": true, "blocked": format!("at://{CAROL}/app.bsky.graph.listblock/lb1")}));
+        assert_eq!(v.inner()["list"]["viewer"], json!({"muted": true, "blocked": format!("at://{CAROL}/app.bsky.graph.listblock/3kblock22222a")}));
         let v = h.get_list(&anon, &req, &mods, 50, None).await.expect("db").expect("view");
         assert_eq!(v.inner()["list"]["viewer"], json!({}));
 
@@ -691,7 +790,7 @@ mod tests {
         let entries = w.inner()["listsWithMembership"].as_array().expect("entries");
         assert_eq!(entries.iter().map(|e| e["list"]["name"].as_str().expect("name")).collect::<Vec<_>>(), ["Curated", "Mods"]);
         assert!(entries[0].get("listItem").is_none());
-        assert_eq!(entries[1]["listItem"]["uri"], format!("at://{ALICE}/app.bsky.graph.listitem/i2"));
+        assert_eq!(entries[1]["listItem"]["uri"], format!("at://{ALICE}/app.bsky.graph.listitem/3kitem222222b"));
         assert_eq!(entries[1]["listItem"]["subject"]["did"], BOB);
         let w = h.get_lists_with_membership(&owner, &req, BOB, &["curatelist".into()], 50, None).await.expect("db").expect("view");
         assert_eq!(w.inner()["listsWithMembership"].as_array().map(Vec::len), Some(1));
@@ -725,9 +824,9 @@ mod tests {
             actor(p, d, h, h).await;
         }
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
-        let feed_list = list(p, ALICE, "feed", "Feed", PURPOSE_CURATE, 1).await;
-        item(p, &feed_list, "i1", BOB, 2).await;
-        item(p, &feed_list, "i2", CAROL, 1).await;
+        let feed_list = list(p, ALICE, "3kfeed2222222", "Feed", PURPOSE_CURATE, 1).await;
+        item(p, &feed_list, "3kitem222222a", BOB, 2).await;
+        item(p, &feed_list, "3kitem222222b", CAROL, 1).await;
         let bobs = post(p, BOB, "3kbbbbbbbbbb2", "from bob", None, None).await;
         let carols = post(p, CAROL, "3kcccccccccc2", "from carol", None, None).await;
         for (uri, age) in [(&bobs, 2), (&carols, 1)] {
@@ -800,8 +899,8 @@ mod tests {
         actor(p, BOB, "bob.test", "Bob").await;
         // Bob is in scope but not a member: a stored row and one stored
         // item, which must not be what is served.
-        let stored = list(p, BOB, "l1", "Stale name", PURPOSE_CURATE, 1).await;
-        item(p, &stored, "i1", ALICE, 1).await;
+        let stored = list(p, BOB, "3klist222222a", "Stale name", PURPOSE_CURATE, 1).await;
+        item(p, &stored, "3kitem222222a", ALICE, 1).await;
         let mut up = FixedUpstream::default();
         up.records.insert(
             stored.clone(),
@@ -840,7 +939,7 @@ mod tests {
         assert_eq!(v.inner()["cursor"], "more");
 
         // No record upstream: not found, though a row is stored.
-        let other = list(p, BOB, "l2", "Only stored", PURPOSE_CURATE, 1).await;
+        let other = list(p, BOB, "3klist222222b", "Only stored", PURPOSE_CURATE, 1).await;
         let e = h.get_list(&anon, &req, &other, 50, None).await.expect("db").expect_err("miss");
         assert_eq!(e.message, "List not found");
         db.drop_db().await;

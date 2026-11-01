@@ -720,18 +720,9 @@ mod tests {
         };
         // The author turned quoting off on `second`: every viewer but the
         // author is told. A postgate under another record key is ignored.
-        for (rkey, target) in [("3kaaaaaaaaaa3", &second), ("elsewhere", &root)] {
-            sqlx::query(
-                "INSERT INTO postgates (uri, author_did, rkey, cid, rev, post_uri, embedding_rules, record, created_at) \
-                 VALUES ($1, $2, $3, 'bafypg', '3k', $4, '[{\"$type\": \"app.bsky.feed.postgate#disableRule\"}]', '{}', now())",
-            )
-            .bind(format!("at://{OP}/app.bsky.feed.postgate/{rkey}"))
-            .bind(OP)
-            .bind(rkey)
-            .bind(target)
-            .execute(p)
-            .await
-            .expect("postgate");
+        for (rkey, target) in [("3kaaaaaaaaaa3", &second), ("3kaaaaaaaaaa7", &root)] {
+            let rules = json!([{"$type": "app.bsky.feed.postgate#disableRule"}]);
+            crate::test_support::records::postgate(p, OP, rkey, target, Some(rules), &[]).await;
         }
         let v = h.get_post_thread_v2(&me, &req, &second, &options).await.expect("db").expect("view");
         assert_eq!(v.inner()["thread"][1]["value"]["post"]["viewer"]["embeddingDisabled"], true);
@@ -765,20 +756,21 @@ mod tests {
         // "other" with its flag, and still shown to its own author. A gate
         // whose record key is not the post's is ignored.
         let gate = format!("at://{OP}/app.bsky.feed.threadgate/3kaaaaaaaaaa2");
-        for (uri, rkey, hides) in [(gate.as_str(), "3kaaaaaaaaaa2", reply.as_str()), ("at://x/app.bsky.feed.threadgate/other", "other", second.as_str())] {
-            sqlx::query(
-                "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, hidden_replies, record, created_at) \
-                 VALUES ($1, $2, $3, 'bafygate', '3k', $4, '[]', $5, '{\"$type\": \"app.bsky.feed.threadgate\"}', now())",
-            )
-            .bind(uri)
-            .bind(OP)
-            .bind(rkey)
-            .bind(&root)
-            .bind(vec![hides.to_string()])
-            .execute(p)
-            .await
-            .expect("gate");
-        }
+        // The root's gate, written again at a newer rev with other rules.
+        let revs = std::sync::atomic::AtomicUsize::new(0);
+        let put_gate = |rkey: &'static str, allow: Option<Value>, hides: String| {
+            let rev = crate::test_support::posts::tid(revs.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            let root = root.clone();
+            async move {
+                let mut record = json!({"$type": "app.bsky.feed.threadgate", "post": root, "hiddenReplies": [hides], "createdAt": "2026-01-01T00:00:00Z"});
+                if let Some(allow) = allow {
+                    record["allow"] = allow;
+                }
+                crate::test_support::records::put_record(p, OP, "app.bsky.feed.threadgate", rkey, "bafygate", &rev, &record).await;
+            }
+        };
+        put_gate("3kaaaaaaaaaa2", Some(json!([])), reply.clone()).await;
+        put_gate("3kaaaaaaaaaa7", Some(json!([])), second.clone()).await;
         let v = h.get_post_thread_v2(&anon, &req, &second, &options).await.expect("db").expect("view");
         assert_eq!(shape(v.inner()["thread"].as_array().expect("thread")), pairs(&[(root.as_str(), -1), (second.as_str(), 0)]));
         assert_eq!(v.inner()["hasOtherReplies"], true);
@@ -825,15 +817,15 @@ mod tests {
         let v = h.get_posts(&anon, &req, &both).await.expect("db").expect("view");
         assert!(v.inner()["posts"][0]["viewer"].get("replyDisabled").is_none());
         // Followers may reply: not a follower, then a follower.
-        exec(p, &format!("UPDATE threadgates SET allow = '[{{\"$type\": \"app.bsky.feed.threadgate#followerRule\"}}]' WHERE uri = '{gate}'")).await;
+        put_gate("3kaaaaaaaaaa2", Some(json!([{"$type": "app.bsky.feed.threadgate#followerRule"}])), reply.clone()).await;
         assert_eq!(disabled(me.clone()).await, Some(json!(true)));
         crate::test_support::graph::follow(p, ME, OP, "1").await;
         assert_eq!(disabled(me.clone()).await, Some(json!(false)));
         // A rule whose input this AppView does not hold in full: unknown.
-        exec(p, &format!("UPDATE threadgates SET allow = '[{{\"$type\": \"app.bsky.feed.threadgate#listRule\", \"list\": \"at://{BOB}/app.bsky.graph.list/l\"}}]' WHERE uri = '{gate}'")).await;
+        put_gate("3kaaaaaaaaaa2", Some(json!([{"$type": "app.bsky.feed.threadgate#listRule", "list": format!("at://{BOB}/app.bsky.graph.list/3klist2222222")}])), reply.clone()).await;
         assert_eq!(disabled(me.clone()).await, None);
         // No `allow` at all: anyone may reply, and the field is left out.
-        exec(p, &format!("UPDATE threadgates SET allow = NULL WHERE uri = '{gate}'")).await;
+        put_gate("3kaaaaaaaaaa2", None, reply.clone()).await;
         assert_eq!(disabled(me.clone()).await, None);
 
         // `viewer.knownLikers` on the anchor: likers the viewer follows.

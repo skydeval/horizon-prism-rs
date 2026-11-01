@@ -432,54 +432,41 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
 
 /// Class S deletes of the record tables design-v3 added (§14.1): kept while
 /// the author is in scope. Subscriptions never keep, create or delete rows
-/// of these tables.
+/// of these tables. Every table is keyed by ids; `<alias>a` is the author's
+/// `dids` row.
 fn v3_scope_steps() -> Vec<Step> {
-    let class_s = |table: &'static str, alias: &'static str, author: &'static str| {
-        let col = format!("{alias}.{author}");
-        scoped(table, "uri", alias, &col, &not_in_scope(&col), Bind::None)
+    let keyed = |table: &'static str, alias: &str, keys: &[&str], pred: &dyn Fn(&str) -> String| {
+        let from = format!("{table} {alias} JOIN dids {alias}a ON {alias}a.id = {alias}.author");
+        let col = format!("{alias}a.did");
+        scoped_ids(table, keys, alias, &from, &col, &pred(&col))
     };
-    // The tables Refract's restored rule writes (refract design §5.4).
-    let class_s_r = |table: &'static str, alias: &'static str, author: &'static str| {
-        let col = format!("{alias}.{author}");
-        scoped(table, "uri", alias, &col, &out_and_not_r(&col), Bind::None)
-    };
+    let rkey = &["author", "rkey"][..];
     // A gate is also kept while its post row is kept (class M).
-    let gate = |table: &'static str, alias: &'static str| {
-        let col = format!("{alias}.author_did");
-        let pred = format!(
-            "{} AND NOT EXISTS (SELECT 1 FROM ref_of({alias}.post_uri) k JOIN posts x ON k.coll = 1 AND x.author = k.author AND x.rkey = k.rkey)",
-            not_in_scope(&col)
-        );
-        scoped(table, "uri", alias, &col, &pred, Bind::None)
+    let gate = |table: &'static str, alias: &str| {
+        keyed(table, alias, rkey, &|col| {
+            format!(
+                "{} AND NOT ({alias}.post_coll = 1 AND EXISTS (SELECT 1 FROM posts x WHERE x.author = {alias}.post_author AND x.rkey = {alias}.post_rkey))",
+                not_in_scope(col)
+            )
+        })
     };
     vec![
-        class_s_r("lists", "ls", "creator_did"),
-        class_s_r("list_items", "li", "author_did"),
+        // The tables Refract's restored rule writes.
+        keyed("lists", "ls", rkey, &|col| out_and_not_r(col)),
+        keyed("list_items", "li", rkey, &|col| out_and_not_r(col)),
         // Rule M (member-blocks-only design §8): a member's list blocks only.
-        scoped(
-            "list_blocks",
-            "uri",
-            "lb",
-            "lb.author_did",
-            &format!("NOT {}", member_among(&["lb.author_did".to_string()])),
-            Bind::None,
-        ),
-        class_s_r("list_optouts", "lo", "author_did"),
-        class_s("starter_packs", "sp", "creator_did"),
-        class_s("labeler_services", "lsv", "creator_did"),
-        class_s_r("actor_self_records", "asr", "did"),
-        class_s("nearhorizon_poll_posts", "pp", "author_did"),
+        keyed("list_blocks", "lb", rkey, &|col| format!("NOT {}", member_among(&[col.to_string()]))),
+        keyed("list_optouts", "lo", rkey, &|col| out_and_not_r(col)),
+        keyed("starter_packs", "sp", rkey, &|col| not_in_scope(col)),
+        keyed("labeler_services", "lsv", &["author"], &|col| not_in_scope(col)),
+        keyed("actor_self_records", "asr", &["author", "coll"], &|col| out_and_not_r(col)),
+        keyed("nearhorizon_poll_posts", "pp", rkey, &|col| not_in_scope(col)),
         gate("threadgates", "tg"),
         gate("postgates", "pg"),
         // Derived counts follow their pack: an orphan sweep.
-        scoped(
-            "starter_pack_counts",
-            "pack_uri",
-            "spc",
-            "split_part(spc.pack_uri, '/', 3)",
-            "NOT EXISTS (SELECT 1 FROM starter_packs x WHERE x.uri = spc.pack_uri)",
-            Bind::None,
-        ),
+        keyed("starter_pack_counts", "spc", rkey, &|_| {
+            "NOT EXISTS (SELECT 1 FROM starter_packs x WHERE x.author = spc.author AND x.rkey = spc.rkey)".to_string()
+        }),
     ]
 }
 
@@ -975,7 +962,7 @@ mod tests {
         // A gate outlives its author's scope while its post row is kept.
         let steps = scope_steps(vec![]);
         let gate = steps.iter().find(|s| s.table == "threadgates").expect("gate step");
-        assert!(gate.sql.contains("NOT EXISTS (SELECT 1 FROM ref_of(tg.post_uri) k JOIN posts x ON k.coll = 1"));
+        assert!(gate.sql.contains("NOT (tg.post_coll = 1 AND EXISTS (SELECT 1 FROM posts x WHERE x.author = tg.post_author AND x.rkey = tg.post_rkey))"));
     }
 
     #[test]
@@ -991,7 +978,7 @@ mod tests {
         // member side, not by scope.
         assert!(sql("blocks").contains("m.did IN (ba.did)") && sql("blocks").contains("m.did IN (bs.did)"));
         assert!(!sql("blocks").contains("scope_dids"));
-        assert!(sql("list_blocks").contains("m.did IN (lb.author_did)") && !sql("list_blocks").contains("scope_dids"));
+        assert!(sql("list_blocks").contains("m.did IN (lba.did)") && !sql("list_blocks").contains("scope_dids"));
     }
 
     #[test]
@@ -1292,11 +1279,7 @@ mod tests {
         }
 
         async fn list_block(pool: &PgPool, author: &str) {
-            exec(pool, &format!(
-                "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) \
-                 VALUES ('at://{author}/app.bsky.graph.listblock/3klb', '{author}', '3klb', 'bafy', '3k', 'at://{OTHER}/app.bsky.graph.list/3kl', now())"
-            ))
-            .await;
+            crate::test_support::records::list_block(pool, author, "3kblock222222", &format!("at://{OTHER}/app.bsky.graph.list/3klist2222222")).await;
         }
 
         async fn rows(pool: &PgPool, sql: &str) -> Vec<String> {
@@ -1335,7 +1318,7 @@ mod tests {
                 left,
                 [format!("at://{MEMBER}/app.bsky.graph.block/mn"), format!("at://{STRANGER}/app.bsky.graph.block/nm")]
             );
-            assert_eq!(rows(p, "SELECT author_did FROM list_blocks").await, [MEMBER]);
+            assert_eq!(rows(p, "SELECT a.did FROM list_blocks b JOIN dids a ON a.id = b.author").await, [MEMBER]);
             // The identity row out of S went with its blocks; the one in S stays.
             assert_eq!(rows(p, "SELECT did FROM actors ORDER BY did").await, [SCOPED]);
             db.drop_db().await;
@@ -1368,7 +1351,7 @@ mod tests {
             join.commit().await.expect("commit member");
             retention.await.expect("retention task");
             assert_eq!(rows(&db.pool, "SELECT a.did FROM blocks b JOIN dids a ON a.id = b.author").await, [SCOPED]);
-            assert_eq!(rows(&db.pool, "SELECT author_did FROM list_blocks").await, [SCOPED]);
+            assert_eq!(rows(&db.pool, "SELECT a.did FROM list_blocks b JOIN dids a ON a.id = b.author").await, [SCOPED]);
             db.drop_db().await;
         }
     }

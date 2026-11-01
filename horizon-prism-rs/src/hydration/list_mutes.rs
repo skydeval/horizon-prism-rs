@@ -100,17 +100,26 @@ impl Hydrator {
 
     /// One page of the viewer's own list references of a kind, as
     /// `{lists, cursor?}`. `sql` selects `(list_uri, created_at)` for
-    /// `$1 = viewer`, before the cursor `($2, $3)`, limited to `$4`.
+    /// `$1 = viewer`, before the cursor `($2, $3)`, limited to `$4`; `$5`
+    /// and `$6` are the key of the cursor's list (the lowest key when it
+    /// names none).
     async fn own_lists(&self, viewer: &Viewer, req: &Requester, sql: &str, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
         let Some(me) = viewer.did.as_deref() else {
             return Ok(Err(ViewError::new("AuthRequired", "Authentication required")));
         };
         let (at, after) = parse_local_cursor(cursor);
+        let after_key = match after.as_deref() {
+            Some(uri) => crate::db::lists::key(self.pool(), uri).await?,
+            None => None,
+        };
+        let (after_author, after_rkey) = after_key.unwrap_or((i32::MIN, i64::MIN));
         let page: Vec<(String, DateTime<Utc>)> = sqlx::query_as(sql)
             .bind(me)
             .bind(at)
             .bind(after.unwrap_or_default())
             .bind(i64::from(limit))
+            .bind(after_author)
+            .bind(after_rkey)
             .fetch_all(self.pool())
             .await?;
         let next = (page.len() == usize::try_from(limit).unwrap_or(usize::MAX))
@@ -149,12 +158,16 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn get_list_blocks(&self, viewer: &Viewer, req: &Requester, limit: u32, cursor: Option<&str>) -> ViewResult<Value> {
-        let sql = "SELECT list_uri, created_at FROM ( \
-                     SELECT list_uri, min(created_at) AS created_at FROM list_blocks \
-                     WHERE author_did = $1 AND split_part(list_uri, '/', 4) = 'app.bsky.graph.list' GROUP BY list_uri) b \
-                   WHERE ($2::timestamptz IS NULL OR (created_at, list_uri) < ($2, $3)) \
-                   ORDER BY created_at DESC, list_uri DESC LIMIT $4";
-        self.own_lists(viewer, req, sql, limit, cursor).await
+        // Blocks of whole list references, by the list's key.
+        let sql = format!(
+            "SELECT at_uri(b.subj_author, {coll}::smallint, b.subj_rkey), b.created_at FROM ( \
+               SELECT subj_author, subj_rkey, min(created_at) AS created_at FROM list_blocks \
+               WHERE author = (SELECT id FROM dids WHERE did = $1) AND subj_coll = {coll} GROUP BY subj_author, subj_rkey) b \
+             WHERE ($2::timestamptz IS NULL OR (b.created_at, b.subj_author, b.subj_rkey) < ($2, $5, $6)) \
+             ORDER BY b.created_at DESC, b.subj_author DESC, b.subj_rkey DESC LIMIT $4",
+            coll = crate::db::ids::COLL_LIST
+        );
+        self.own_lists(viewer, req, &sql, limit, cursor).await
     }
 }
 
@@ -165,22 +178,14 @@ mod tests {
     use crate::hydration::lists::PURPOSE_CURATE;
     use crate::hydration::testing::{FixedUpstream, actor, exec, hydrator, hydrator_with, set_mode};
     use crate::indexing::PublicMode;
-    use crate::test_support::fresh_db;
+    use crate::test_support::{fresh_db, records};
 
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
 
-    async fn list(p: &sqlx::PgPool, rkey: &str, purpose: &str) -> String {
-        let uri = format!("at://{BOB}/app.bsky.graph.list/{rkey}");
-        exec(
-            p,
-            &format!(
-                "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES \
-                 ('{uri}', '{BOB}', '{rkey}', 'bafylist', '3k', '{rkey}', '{purpose}', '{{}}', now())"
-            ),
-        )
-        .await;
-        uri
+    /// Bob's list `name`, at a TID record key.
+    async fn list(p: &sqlx::PgPool, rkey: &str, name: &str, purpose: &str) -> String {
+        records::list(p, BOB, rkey, name, purpose).await
     }
 
     /// A list mute or list block hides its list's members only when it
@@ -210,7 +215,7 @@ mod tests {
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now()), ('{BOB}', 'admin', now())")).await;
         // One list of a ready member (read from its row) and one of an
         // outside owner (read from its record). Carol is on both.
-        let local = list(p, "3kmods", PURPOSE_MOD).await;
+        let local = list(p, "3kmods2222222", "3kmods", PURPOSE_MOD).await;
         let outside = format!("at://{OWNER}/app.bsky.graph.list/3kout");
         let mut up = FixedUpstream::default();
         up.records.insert(
@@ -445,10 +450,10 @@ mod tests {
         set_mode(h.scope(), mode).await;
         let req = Requester::test();
         let me = Viewer { did: Some(ALICE.into()), hydrate: true };
-        let mods = list(p, "3kmods", PURPOSE_MOD).await;
-        let more = list(p, "3kmore", PURPOSE_MOD).await;
-        let third = list(p, "3kthird", PURPOSE_MOD).await;
-        let curated = list(p, "3kcurated", PURPOSE_CURATE).await;
+        let mods = list(p, "3kmods2222222", "3kmods", PURPOSE_MOD).await;
+        let more = list(p, "3kmore2222222", "3kmore", PURPOSE_MOD).await;
+        let third = list(p, "3kthird222222", "3kthird", PURPOSE_MOD).await;
+        let curated = list(p, "3kcurated2222", "3kcurated", PURPOSE_CURATE).await;
         let count = |sql: &'static str| async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(p).await.expect(sql) };
 
         let refused = |list: String| {
@@ -486,26 +491,12 @@ mod tests {
         assert_eq!(count("SELECT count(*) FROM list_references WHERE source = 'mute'").await, 2);
 
         // List blocks: one entry per list, whatever the number of records.
-        for (rkey, target) in [("3kb1", &mods), ("3kb2", &mods), ("3kb3", &more)] {
-            exec(
-                p,
-                &format!(
-                    "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES \
-                     ('at://{ALICE}/app.bsky.graph.listblock/{rkey}', '{ALICE}', '{rkey}', 'c', '3k', '{target}', now())"
-                ),
-            )
-            .await;
+        for (rkey, target) in [("3kblock22222a", &mods), ("3kblock22222b", &mods), ("3kblock22222c", &more)] {
+            records::list_block(p, ALICE, rkey, target).await;
         }
         // Two subjects on the member's `mods` list.
-        for (rkey, subject) in [("3ki1", ALICE), ("3ki2", "did:plc:cccccccccccccccccccccccc")] {
-            exec(
-                p,
-                &format!(
-                    "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES \
-                     ('at://{BOB}/app.bsky.graph.listitem/{rkey}', '{BOB}', '{rkey}', 'c', '3k', '{mods}', '{subject}', now())"
-                ),
-            )
-            .await;
+        for (rkey, subject) in [("3kitem222222a", ALICE), ("3kitem222222b", "did:plc:cccccccccccccccccccccccc")] {
+            records::list_item(p, BOB, rkey, &mods, subject).await;
         }
         let blocked = h.get_list_blocks(&me, &req, 50, None).await.expect("db").expect("blocks").inner().clone();
         assert_eq!(blocked["lists"].as_array().map(Vec::len), Some(2));

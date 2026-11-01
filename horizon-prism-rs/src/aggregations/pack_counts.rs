@@ -114,10 +114,15 @@ impl PackCounts {
                 (n, "local")
             }
         };
-        let stored: Option<Value> = sqlx::query_scalar("SELECT all_time_daily FROM starter_pack_counts WHERE pack_uri = $1")
-            .bind(pack)
-            .fetch_optional(&self.pool)
-            .await?;
+        let key = crate::db::ids::record_key(&self.pool, pack, crate::db::ids::COLL_STARTER_PACK).await?;
+        let stored: Option<Value> = match key {
+            Some((author, rkey)) => sqlx::query_scalar("SELECT all_time_daily FROM starter_pack_counts WHERE author = $1 AND rkey = $2")
+                .bind(author)
+                .bind(rkey)
+                .fetch_optional(&self.pool)
+                .await?,
+            None => None,
+        };
         let (days, week) = advance(stored.as_ref().map(parse_history).unwrap_or_default(), Utc::now().date_naive(), source, all_time);
         let week = match week {
             Some(n) => n,
@@ -132,20 +137,23 @@ impl PackCounts {
             }
         };
         let clamp = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
-        sqlx::query(
-            "INSERT INTO starter_pack_counts (pack_uri, joined_week_count, joined_all_time_count, all_time_source, all_time_daily, refreshed_at) \
-             SELECT $1, $2, $3, $4, $5, now() WHERE EXISTS (SELECT 1 FROM starter_packs WHERE uri = $1) \
-             ON CONFLICT (pack_uri) DO UPDATE SET joined_week_count = EXCLUDED.joined_week_count, \
-               joined_all_time_count = EXCLUDED.joined_all_time_count, all_time_source = EXCLUDED.all_time_source, \
-               all_time_daily = EXCLUDED.all_time_daily, refreshed_at = EXCLUDED.refreshed_at",
-        )
-        .bind(pack)
-        .bind(clamp(week))
-        .bind(clamp(all_time))
-        .bind(source)
-        .bind(history_json(&days))
-        .execute(&self.pool)
-        .await?;
+        if let Some((author, rkey)) = key {
+            sqlx::query(
+                "INSERT INTO starter_pack_counts (author, rkey, joined_week_count, joined_all_time_count, all_time_source, all_time_daily, refreshed_at) \
+                 SELECT $1, $2, $3, $4, $5, $6, now() WHERE EXISTS (SELECT 1 FROM starter_packs WHERE author = $1 AND rkey = $2) \
+                 ON CONFLICT (author, rkey) DO UPDATE SET joined_week_count = EXCLUDED.joined_week_count, \
+                   joined_all_time_count = EXCLUDED.joined_all_time_count, all_time_source = EXCLUDED.all_time_source, \
+                   all_time_daily = EXCLUDED.all_time_daily, refreshed_at = EXCLUDED.refreshed_at",
+            )
+            .bind(author)
+            .bind(rkey)
+            .bind(clamp(week))
+            .bind(clamp(all_time))
+            .bind(source)
+            .bind(history_json(&days))
+            .execute(&self.pool)
+            .await?;
+        }
         metrics::counter!(METRIC_REFRESHED, "source" => source).increment(1);
         Ok(())
     }
@@ -156,9 +164,12 @@ impl PackCounts {
     ///
     /// Database errors.
     pub async fn refresh_all(&self) -> Result<usize, sqlx::Error> {
-        let packs: Vec<String> = sqlx::query_scalar("SELECT uri FROM starter_packs ORDER BY uri")
-            .fetch_all(&self.pool)
-            .await?;
+        let packs: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM starter_packs s JOIN dids d ON d.id = s.author ORDER BY s.author, s.rkey",
+            crate::db::lists::uri_sql("d.did", "app.bsky.graph.starterpack", "s.rkey")
+        ))
+        .fetch_all(&self.pool)
+        .await?;
         for pack in &packs {
             self.refresh(pack).await?;
         }
@@ -236,11 +247,8 @@ mod tests {
         };
         let p = &db.pool;
         let owner = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-        let pack = format!("at://{owner}/app.bsky.graph.starterpack/p1");
-        exec(p, &format!(
-            "INSERT INTO starter_packs (uri, creator_did, rkey, cid, rev, name, list_uri, record, created_at) VALUES \
-             ('{pack}', '{owner}', 'p1', 'bafy', '3k', 'Pack', 'at://{owner}/app.bsky.graph.list/l', '{{}}', now())"
-        )).await;
+        let list = format!("at://{owner}/app.bsky.graph.list/3klist2222222");
+        let pack = crate::test_support::records::starter_pack(p, owner, "3kpack2222222", "Pack", &list).await;
         for (i, age_days) in [1, 3, 30].into_iter().enumerate() {
             exec(p, &format!(
                 "INSERT INTO actors (did, handle, joined_via_starter_pack_uri, profile_created_at) VALUES \
@@ -249,12 +257,14 @@ mod tests {
         }
         let job = PackCounts::new(p.clone(), None, Duration::from_secs(3600));
         assert_eq!(job.refresh_all().await.expect("refresh"), 1);
-        let row: (i32, i32, String) =
-            sqlx::query_as("SELECT joined_week_count, joined_all_time_count, all_time_source FROM starter_pack_counts WHERE pack_uri = $1")
-                .bind(&pack)
-                .fetch_one(p)
-                .await
-                .expect("row");
+        let row: (i32, i32, String) = sqlx::query_as(
+            "SELECT c.joined_week_count, c.joined_all_time_count, c.all_time_source FROM starter_pack_counts c, ref_of($1) r \
+             WHERE c.author = r.author AND c.rkey = r.rkey",
+        )
+        .bind(&pack)
+        .fetch_one(p)
+        .await
+        .expect("row");
         assert_eq!(row, (2, 3, "local".to_string()));
         // A second run updates in place.
         job.refresh(&pack).await.expect("again");

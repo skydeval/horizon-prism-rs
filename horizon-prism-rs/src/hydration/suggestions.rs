@@ -132,9 +132,8 @@ pub(super) fn eligible(active_days: Option<u32>) -> String {
     let mut sql = "EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = a.did) \
          AND a.account_status = 'active' AND a.handle IS NOT NULL AND a.handle <> 'handle.invalid' \
          AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = a.did AND l.val IN ('!takedown', '!hide')) \
-         AND NOT EXISTS (SELECT 1 FROM actor_self_records r WHERE r.did = a.did \
-                         AND r.collection = 'app.bsky.actor.contentVisibilityDeclaration' \
-                         AND r.record -> 'hideFromAlgorithmicRecommendations' = 'true'::jsonb)"
+         AND NOT EXISTS (SELECT 1 FROM actor_self_records r JOIN dids rd ON rd.id = r.author \
+                         WHERE rd.did = a.did AND r.coll = 15 AND r.hide_from_recs)"
         .to_string();
     if let Some(days) = active_days {
         sql.push_str(&format!(
@@ -388,9 +387,10 @@ impl Hydrator {
             let mut slot = self.suggestions().packs.lock().await;
             if slot.1.is_none_or(|at| at.elapsed() >= Duration::from_secs(cfg.refresh_secs)) {
                 let sql = format!(
-                    "SELECT sp.uri FROM starter_packs sp JOIN actors a ON a.did = sp.creator_did \
-                     LEFT JOIN starter_pack_counts c ON c.pack_uri = sp.uri WHERE {} \
-                     ORDER BY COALESCE(c.joined_week_count, 0) DESC, COALESCE(c.joined_all_time_count, 0) DESC, sp.uri LIMIT $1",
+                    "SELECT {} FROM starter_packs sp JOIN dids spd ON spd.id = sp.author JOIN actors a ON a.did = spd.did \
+                     LEFT JOIN starter_pack_counts c ON c.author = sp.author AND c.rkey = sp.rkey WHERE {} \
+                     ORDER BY COALESCE(c.joined_week_count, 0) DESC, COALESCE(c.joined_all_time_count, 0) DESC, sp.author, sp.rkey LIMIT $1",
+                    crate::db::lists::uri_sql("spd.did", "app.bsky.graph.starterpack", "sp.rkey"),
                     eligible(None)
                 );
                 slot.0 = Arc::new(sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).fetch_all(self.pool()).await?);
@@ -468,11 +468,8 @@ mod tests {
         }
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{me}', 'admin', now())")).await;
         exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{hidden}', '!hide')")).await;
-        exec(p, &format!(
-            "INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) VALUES \
-             ('at://{opted_out}/app.bsky.actor.contentVisibilityDeclaration/self', '{opted_out}', 'app.bsky.actor.contentVisibilityDeclaration', 'bafyd', '3k', \
-              '{{\"hideFromAlgorithmicRecommendations\": true}}')"
-        )).await;
+        let declaration = json!({"$type": "app.bsky.actor.contentVisibilityDeclaration", "hideFromAlgorithmicRecommendations": true});
+        crate::test_support::records::self_record(p, &opted_out, "app.bsky.actor.contentVisibilityDeclaration", &declaration).await;
         // The member follows A; A follows B and C; B follows C. So C has
         // the most followers, and B and C are friends of a friend.
         for (from, to) in [(&me, &a), (&a, &b), (&a, &c), (&b, &c)] {
@@ -529,17 +526,14 @@ mod tests {
         // Packs: of eligible creators, most joined this week first; never
         // the viewer's own, nor one whose creator the viewer mutes.
         for (owner, rkey, week) in [(&a, "pa", 1), (&c, "pc", 7), (&me, "pm", 9), (&hidden, "ph", 9), (&b, "pb", 3)] {
-            let uri = format!("at://{owner}/app.bsky.graph.starterpack/{rkey}");
-            exec(p, &format!(
-                "INSERT INTO starter_packs (uri, creator_did, rkey, cid, rev, name, list_uri, record, created_at) VALUES \
-                 ('{uri}', '{owner}', '{rkey}', 'bafyp', '3k', 'Pack', 'at://{owner}/app.bsky.graph.list/l', '{{\"name\": \"Pack\"}}', now())"
-            )).await;
-            exec(p, &format!(
-                "INSERT INTO starter_pack_counts (pack_uri, joined_week_count, joined_all_time_count, all_time_source, refreshed_at) \
-                 VALUES ('{uri}', {week}, {week}, 'local', now())"
-            )).await;
+            let list = format!("at://{owner}/app.bsky.graph.list/3klist2222222");
+            let uri = crate::test_support::records::starter_pack(p, owner, &format!("3kpack22222{rkey}"), "Pack", &list).await;
+            crate::test_support::records::pack_counts(p, &uri, week, week).await;
         }
-        let packs = |view: &Value| view["starterPacks"].as_array().expect("packs").iter().map(|s| s["uri"].as_str().expect("uri").rsplit('/').next().expect("rkey").to_string()).collect::<Vec<_>>();
+        // Each pack by the last two letters of its record key.
+        let packs = |view: &Value| {
+            view["starterPacks"].as_array().expect("packs").iter().map(|s| s["uri"].as_str().expect("uri")[s["uri"].as_str().expect("uri").len() - 2..].to_string()).collect::<Vec<_>>()
+        };
         let all = h.suggested_starter_packs(&anon, &req, 10).await.expect("db").expect("view").inner().clone();
         assert_eq!(packs(&all), ["pm", "pc", "pb", "pa"]);
         let mine = h.suggested_starter_packs(&member, &req, 10).await.expect("db").expect("view").inner().clone();

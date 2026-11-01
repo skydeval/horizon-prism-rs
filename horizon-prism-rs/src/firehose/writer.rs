@@ -24,10 +24,10 @@ use super::feed::{FeedOp, FeedTap, Kind as FeedKind, Outcome as FeedOutcome};
 use super::jobs::{self, Depth};
 use super::normalize::normalize_record;
 use super::records::{GraphRecord, PostRecord, ProfileRecord, RecordError, SubjectRecord, private_subjects};
-use super::rows::{self, Cell, Row};
+use super::rows::{self, Cell, Layout, Row, RowKey};
 use crate::aggregations::growth::{self, GrowthPlan};
 use crate::aggregations::{Admission, AdmissionInput, AdmitRule, PurgeKind, RecordKind, RejectReason, ScopeSets, ScopeState, admit};
-use crate::db::ids::{AccountId, COLL_POST, Ids, OddTable, Slot, StoredRef, cid_to_db, ref_did, ref_rkey, rev_value, stored_ref};
+use crate::db::ids::{AccountId, COLL_LIST, COLL_POST, Ids, OddTable, Slot, StoredRef, cid_to_db, ref_did, ref_rkey, rev_value, stored_ref};
 use crate::db::posts::{FEED_POST, FEED_REPLY, FEED_REPOST, embed_kind};
 use crate::db::records;
 use crate::db::tombstones::{self, Put};
@@ -253,7 +253,7 @@ enum OpTarget<'a> {
     /// transaction.
     Upsert(&'a Upsert, &'a GrowthPlan, Option<&'a OpIds>),
     /// A member's post under the off rule (public-indexing design §4.1).
-    GrowOnly(&'a Upsert, &'a GrowthPlan),
+    GrowOnly(&'a Upsert, &'a GrowthPlan, Option<&'a OpIds>),
     Delete(&'a Delete),
     /// A follow of a tracked repo that admission rejected, with the reason
     /// (following-audience design §4.2): the old row goes, and a tombstone
@@ -314,8 +314,31 @@ struct PostIds {
     parent: Option<StoredRef>,
     quote: Option<StoredRef>,
     mention_ids: Option<Vec<AccountId>>,
+    created_at: DateTime<Utc>,
     cid: Vec<u8>,
     record: Vec<u8>,
+}
+
+/// A cell of a keyed v3 row, with its ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CellIds {
+    /// A cell with no ids.
+    Plain,
+    Ref(StoredRef),
+    Account(AccountId),
+    Rkey(i64),
+}
+
+/// A keyed v3 row's ids: its key (its rkey, or its collection for a self
+/// record; unused for a labeler service), its cells' ids in the row's
+/// order, and its CID and record as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowIds {
+    author: AccountId,
+    key: i64,
+    cells: Vec<CellIds>,
+    cid: Vec<u8>,
+    record: Option<Vec<u8>>,
 }
 
 /// The ids an op's row is written with.
@@ -324,6 +347,7 @@ enum OpIds {
     Graph(GraphIds),
     Subject(SubjectIds),
     Post(Box<PostIds>),
+    Row(Box<RowIds>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -572,10 +596,7 @@ fn private_gate_subject(row: &Row) -> Option<String> {
     if !matches!(row.table, "threadgates" | "postgates") {
         return None;
     }
-    let post = row.cells.iter().find_map(|(name, cell)| match (name, cell) {
-        (&"post_uri", Cell::Text(Some(uri))) => Some(uri.as_str()),
-        _ => None,
-    })?;
+    let post = row.reference("post")?;
     if post.split('/').nth(3) != Some(super::classifier::NSID_POST_PRIVATE) {
         return None;
     }
@@ -589,10 +610,7 @@ fn is_public_root_gate(row: &Row, repo: &str, rkey: &str) -> bool {
     if row.table != "threadgates" {
         return false;
     }
-    let Some(post) = row.cells.iter().find_map(|(name, cell)| match (name, cell) {
-        (&"post_uri", Cell::Text(Some(uri))) => Some(uri.as_str()),
-        _ => None,
-    }) else {
+    let Some(post) = row.reference("post") else {
         return false;
     };
     let mut parts = post.strip_prefix("at://").unwrap_or_default().split('/');
@@ -1181,7 +1199,7 @@ impl Writer {
                             .await?
                     }
                     Some(Admission::GrowOnly) => {
-                        let target = OpTarget::GrowOnly(u, &plans[i]);
+                        let target = OpTarget::GrowOnly(u, &plans[i], keyed[i].as_ref());
                         self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
                             .await?
                     }
@@ -1430,8 +1448,11 @@ impl Writer {
             .map(|(p, a)| match (p, a) {
                 (Prepared::Upsert(u), Some(Admission::Admit(rule))) if *rule != AdmitRule::PublicRootGate => match &u.body {
                     Body::Follow(_) | Body::Block(_) | Body::Like(_) | Body::Repost(_) | Body::Post(_) => Some(u.as_ref()),
+                    Body::Row(row) if matches!(row.layout, Layout::Keyed { .. }) => Some(u.as_ref()),
                     _ => None,
                 },
+                // A member's post under the off rule writes its reference.
+                (Prepared::Upsert(u), Some(Admission::GrowOnly)) if matches!(u.body, Body::Post(_)) => Some(u.as_ref()),
                 _ => None,
             })
             .collect();
@@ -1468,6 +1489,15 @@ impl Writer {
                     uris.extend(post_references(p));
                     dids.extend(p.mention_dids.iter().cloned());
                 }
+                Body::Row(row) => {
+                    for (_, cell) in &row.cells {
+                        match cell {
+                            Cell::Ref(_, uri) => uris.push(uri),
+                            Cell::Account(did) => dids.push(did.clone()),
+                            _ => {}
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1476,7 +1506,17 @@ impl Writer {
         let Some(&author) = accounts.get(repo) else {
             return Ok(vec![None; prepared.len()]);
         };
-        let mut keys: Vec<(AccountId, String)> = admitted.iter().flatten().map(|u| (author, u.rkey.clone())).collect();
+        // A row keyed by its author or collection has no key of its own.
+        let own_key = |u: &Upsert| !matches!(&u.body, Body::Row(Row { layout: Layout::Keyed { key: RowKey::Author | RowKey::Coll, .. }, .. }));
+        let mut keys: Vec<(AccountId, String)> = admitted.iter().flatten().filter(|u| own_key(u)).map(|u| (author, u.rkey.clone())).collect();
+        for u in admitted.iter().flatten() {
+            if let Body::Row(row) = &u.body {
+                keys.extend(row.cells.iter().filter_map(|(_, cell)| match cell {
+                    Cell::OwnRkey(rkey) => Some((author, rkey.clone())),
+                    _ => None,
+                }));
+            }
+        }
         keys.extend(tombstoning.iter().map(|rkey| (author, (*rkey).to_string())));
         for uri in &uris {
             if let Some((did, rkey)) = ref_rkey(uri)
@@ -1507,6 +1547,7 @@ impl Writer {
                     Some(rkey) => Some(OpIds::Post(Box::new(post_ids(&self.pool, &accounts, &rkeys, (author, rkey), u, p).await?))),
                     None => None,
                 },
+                Body::Row(row) => row_ids(&self.pool, &accounts, &rkeys, author, rkey, u, row).await?.map(|ids| OpIds::Row(Box::new(ids))),
                 _ => None,
             });
         }
@@ -1640,7 +1681,7 @@ impl Writer {
             let mut sp = tx.begin().await?;
             let result = match target {
                 OpTarget::Upsert(u, plan, ids) => self.apply_upsert(&mut sp, u, plan, ids, rev, sets, options).await,
-                OpTarget::GrowOnly(u, plan) => self.apply_grow_only(&mut sp, u, plan, rev, options).await,
+                OpTarget::GrowOnly(u, plan, ids) => self.apply_grow_only(&mut sp, u, plan, ids, rev, options).await,
                 OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets).await,
                 OpTarget::RejectedFollow(u, reason) => self.apply_rejected_follow(&mut sp, u, reason, repo, rev, sets).await,
                 OpTarget::RejectedBlock(u, reason) => self.apply_rejected_block(&mut sp, u, reason, rev).await,
@@ -1675,6 +1716,7 @@ impl Writer {
         conn: &mut PgConnection,
         u: &Upsert,
         plan: &GrowthPlan,
+        ids: Option<&OpIds>,
         rev: &str,
         options: ApplyOptions,
     ) -> Result<(OpOutcome, MemoryEffects), OpError> {
@@ -1684,7 +1726,10 @@ impl Writer {
             return Ok((OpOutcome::Unchanged, eff));
         }
         if let Body::Post(p) = &u.body {
-            upsert_post_ref(conn, u, p, rev).await?;
+            let Some(OpIds::Post(ids)) = ids else {
+                return Err(OpError::Deterministic("post has an author or record key that is not valid".into()));
+            };
+            upsert_post_ref(conn, ids, rev).await?;
             self.private.upsert_quote_ref(conn, &quote_ref(u, p, rev)).await?;
         }
         if let Some(n) = self.public_notify(u, options) {
@@ -1851,7 +1896,13 @@ impl Writer {
             }
             Body::Block(g) => upsert_block(conn, keyed()?, g, rev).await?.is_some(),
             Body::Profile(p) => upsert_profile(conn, u, p, rev).await?,
-            Body::Row(row) => upsert_row(conn, u, row, rev).await?,
+            Body::Row(row) => match (row.layout, ids) {
+                (Layout::ByUri { owner_column }, _) => upsert_uri_row(conn, u, row, owner_column, rev).await?,
+                (Layout::Keyed { .. }, Some(OpIds::Row(r))) => upsert_row(conn, row, r, rev).await?,
+                (Layout::Keyed { .. }, _) => {
+                    return Err(OpError::Deterministic("record has an author, record key or account that is not valid".into()));
+                }
+            },
             Body::Private | Body::PrivateGate => false,
         };
         // A member's post has a reference in every mode, whatever became
@@ -1860,7 +1911,7 @@ impl Writer {
         if let Body::Post(p) = &u.body
             && sets.is_member(author)
         {
-            upsert_post_ref(conn, u, p, rev).await?;
+            upsert_post_ref(conn, post_keyed()?, rev).await?;
             self.private.upsert_quote_ref(conn, &quote_ref(u, p, rev)).await?;
         }
         if !written {
@@ -2065,14 +2116,16 @@ impl Writer {
             RecordKind::Post => {
                 // The reference goes by its own rev, whatever became of the
                 // row (public-indexing design §4.1).
-                delete_row(conn, "member_post_refs", &d.uri, rev).await?;
+                delete_keyed(conn, "member_post_refs", &d.uri, rev).await?;
                 self.private.delete_quote_ref(conn, &d.uri, rev).await?;
                 let removed = delete_keyed(conn, "posts", &d.uri, rev).await?;
-                if removed {
-                    // The gates of a post that is gone gate nothing.
-                    for (table, gate) in ["threadgates", "postgates"].into_iter().zip(canonical_gates(&d.uri)) {
-                        sqlx::query(&format!("DELETE FROM {table} WHERE uri = $1"))
-                            .bind(gate)
+                // The gates of a post that is gone gate nothing: its
+                // canonical gates share its author and key.
+                if removed && let Some((author, rkey)) = crate::db::ids::record_key(&mut *conn, &d.uri, COLL_POST).await? {
+                    for table in ["threadgates", "postgates"] {
+                        sqlx::query(&format!("DELETE FROM {table} WHERE author = $1 AND rkey = $2"))
+                            .bind(author)
+                            .bind(rkey)
                             .execute(&mut *conn)
                             .await?;
                     }
@@ -2274,11 +2327,19 @@ fn inbound_block_admitted(admission: Admission) -> bool {
     }
 }
 
-/// The list a stored list block names. A subject in any other collection
-/// makes no reference.
+/// The list a stored list block names. A subject that is not a whole list
+/// reference makes no reference.
 async fn list_block_target(conn: &mut PgConnection, uri: &str) -> Result<Option<String>, sqlx::Error> {
-    let subject: Option<String> = sqlx::query_scalar("SELECT list_uri FROM list_blocks WHERE uri = $1").bind(uri).fetch_optional(conn).await?;
-    Ok(subject.filter(|s| s.split('/').nth(3) == Some(NSID_LIST)))
+    let Some((author, rkey)) = crate::db::ids::record_key(&mut *conn, uri, crate::db::ids::COLL_LISTBLOCK).await? else {
+        return Ok(None);
+    };
+    sqlx::query_scalar("SELECT at_uri(subj_author, subj_coll, subj_rkey) FROM list_blocks WHERE author = $1 AND rkey = $2 AND subj_coll = $3")
+        .bind(author)
+        .bind(rkey)
+        .bind(COLL_LIST)
+        .fetch_optional(conn)
+        .await
+        .map(Option::flatten)
 }
 
 async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
@@ -2310,6 +2371,7 @@ async fn post_ids(
         parent: p.reply_parent.as_ref().map(|r| reference(&r.uri)),
         quote: p.quote_uri.as_deref().map(reference),
         mention_ids: (!mention_ids.is_empty()).then_some(mention_ids),
+        created_at: p.created_at,
         cid: cid_to_db(&u.cid),
         record: records::encode(pool, records::FAMILY_POSTS, &u.record).await?,
     })
@@ -2407,25 +2469,25 @@ async fn upsert_post(conn: &mut PgConnection, ids: &PostIds, p: &PostRecord, rev
     Ok(written.is_some())
 }
 
-/// The last-writer-wins upsert of a member's post reference
-/// (public-indexing design §4.1): the DIDs the post replies to and quotes,
-/// as the scope rebuild reads them.
-async fn upsert_post_ref(conn: &mut PgConnection, u: &Upsert, p: &PostRecord, rev: &str) -> Result<(), sqlx::Error> {
+/// The last-writer-wins upsert of a member's post reference: the accounts the post replies to and
+/// quotes, as the scope rebuild reads them (a reference whose authority is
+/// not a valid DID names none).
+async fn upsert_post_ref(conn: &mut PgConnection, ids: &PostIds, rev: &str) -> Result<(), sqlx::Error> {
+    let account = |r: &Option<StoredRef>| r.as_ref().and_then(|r| r.columns().0);
     sqlx::query(
-        "INSERT INTO member_post_refs (uri, author_did, rev, reply_parent_did, reply_root_did, quote_did, created_at) \
+        "INSERT INTO member_post_refs (author, rkey, rev, parent, root, quote, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         ON CONFLICT (uri) DO UPDATE SET author_did = EXCLUDED.author_did, rev = EXCLUDED.rev, \
-           reply_parent_did = EXCLUDED.reply_parent_did, reply_root_did = EXCLUDED.reply_root_did, \
-           quote_did = EXCLUDED.quote_did, created_at = EXCLUDED.created_at \
+         ON CONFLICT (author, rkey) DO UPDATE SET rev = EXCLUDED.rev, parent = EXCLUDED.parent, root = EXCLUDED.root, \
+           quote = EXCLUDED.quote, created_at = EXCLUDED.created_at \
          WHERE member_post_refs.rev < EXCLUDED.rev",
     )
-    .bind(&u.uri)
-    .bind(&u.input.author)
-    .bind(rev)
-    .bind(p.reply_parent.as_ref().and_then(|r| uri_author(&r.uri)))
-    .bind(p.reply_root.as_ref().and_then(|r| uri_author(&r.uri)))
-    .bind(p.quote_uri.as_deref().and_then(uri_author))
-    .bind(p.created_at)
+    .bind(ids.author)
+    .bind(ids.rkey)
+    .bind(rev_value(rev))
+    .bind(account(&ids.parent))
+    .bind(account(&ids.root))
+    .bind(account(&ids.quote))
+    .bind(ids.created_at)
     .execute(conn)
     .await?;
     Ok(())
@@ -2658,15 +2720,177 @@ async fn upsert_profile(
     Ok(n > 0)
 }
 
-/// The last-writer-wins upsert of a v3 record table (§II-5.5): every column
-/// of the row is set, and an older or equal rev changes nothing.
-async fn upsert_row(conn: &mut PgConnection, u: &Upsert, row: &Row, rev: &str) -> Result<bool, sqlx::Error> {
-    let table = row.table;
-    let mut columns: Vec<&str> = vec!["uri", row.owner_column];
-    if row.has_rkey {
-        columns.push("rkey");
+/// A keyed v3 row's ids from ids already interned, with its record encoded
+/// when the table keeps it. `None` when its key, an account or a key of its
+/// own repo it names has no id: none of those can be stored.
+#[allow(clippy::too_many_arguments)]
+async fn row_ids(
+    pool: &PgPool,
+    accounts: &std::collections::HashMap<String, AccountId>,
+    rkeys: &std::collections::HashMap<(AccountId, String), i64>,
+    author: AccountId,
+    rkey: Option<i64>,
+    u: &Upsert,
+    row: &Row,
+) -> Result<Option<RowIds>, sqlx::Error> {
+    let Layout::Keyed { coll, key, record } = row.layout else {
+        return Ok(None);
+    };
+    let key = match key {
+        RowKey::Rkey => match rkey {
+            Some(k) => k,
+            None => return Ok(None),
+        },
+        RowKey::Author => 0,
+        RowKey::Coll => i64::from(coll),
+    };
+    let mut cells = Vec::with_capacity(row.cells.len());
+    for (_, cell) in &row.cells {
+        cells.push(match cell {
+            Cell::Ref(_, uri) => CellIds::Ref(stored_ref(uri, accounts, rkeys)),
+            Cell::Account(did) => match accounts.get(did) {
+                Some(id) => CellIds::Account(*id),
+                None => return Ok(None),
+            },
+            Cell::OwnRkey(k) => match rkeys.get(&(author, k.clone())) {
+                Some(v) => CellIds::Rkey(*v),
+                None => return Ok(None),
+            },
+            _ => CellIds::Plain,
+        });
     }
-    columns.extend(["cid", "rev"]);
+    let record = if record { Some(records::encode(pool, records::FAMILY_OTHER, &u.record).await?) } else { None };
+    Ok(Some(RowIds { author, key, cells, cid: cid_to_db(&u.cid), record }))
+}
+
+/// The last-writer-wins upsert of a keyed v3 record table: every
+/// column of the row is set, and an older or equal rev changes nothing. An
+/// odd reference keeps its text in `odd_refs`, written in the same
+/// statement; for each reference the new version has that is not odd, a
+/// second statement removes any text an older version left. Returns whether
+/// the row was written.
+async fn upsert_row(conn: &mut PgConnection, row: &Row, ids: &RowIds, rev: &str) -> Result<bool, sqlx::Error> {
+    let Layout::Keyed { coll, key, .. } = row.layout else {
+        return Ok(false);
+    };
+    let table = row.table;
+    let mut columns: Vec<String> = vec!["author".into()];
+    let conflict = match key {
+        RowKey::Rkey => {
+            columns.push("rkey".into());
+            "author, rkey"
+        }
+        RowKey::Coll => {
+            columns.push("coll".into());
+            "author, coll"
+        }
+        RowKey::Author => "author",
+    };
+    let keys = columns.len();
+    columns.extend(["cid".to_string(), "rev".to_string()]);
+    if ids.record.is_some() {
+        columns.push("record".into());
+    }
+    let mut values: Vec<String> = (1..=columns.len()).map(|i| format!("${i}")).collect();
+    // The reference slots, with their odd texts.
+    let mut slots: Vec<(i16, Option<&str>)> = Vec::new();
+    for ((name, cell), cell_ids) in row.cells.iter().zip(&ids.cells) {
+        match cell {
+            Cell::Ref(slot, _) => {
+                for part in ["author", "coll", "rkey"] {
+                    columns.push(format!("{name}_{part}"));
+                    values.push(format!("${}", values.len() + 1));
+                }
+                let raw = match cell_ids {
+                    CellIds::Ref(r) => r.odd_raw(),
+                    _ => None,
+                };
+                slots.push((slot.id(), raw));
+            }
+            Cell::Tsv(_) => {
+                columns.push((*name).to_string());
+                values.push(format!("to_tsvector('simple', ${})", values.len() + 1));
+            }
+            _ => {
+                columns.push((*name).to_string());
+                values.push(format!("${}", values.len() + 1));
+            }
+        }
+    }
+    let updates: Vec<String> = columns.iter().skip(keys).map(|c| format!("{c} = EXCLUDED.{c}")).collect();
+    let mut sql = format!(
+        "WITH up AS ( \
+           INSERT INTO {table} ({}) VALUES ({}) \
+           ON CONFLICT ({conflict}) DO UPDATE SET {} WHERE {table}.rev < EXCLUDED.rev \
+           RETURNING author)",
+        columns.join(", "),
+        values.join(", "),
+        updates.join(", "),
+    );
+    let first_raw = values.len() + 1;
+    if !slots.is_empty() {
+        let pairs: Vec<String> = slots.iter().enumerate().map(|(i, (slot, _))| format!("({slot}::smallint, ${}::text)", first_raw + i)).collect();
+        sql.push_str(&format!(
+            ", odd AS ( \
+               INSERT INTO odd_refs (tbl, author, rkey, slot, raw) \
+               SELECT {coll}, up.author, $2, v.slot, v.raw FROM up, (VALUES {}) AS v(slot, raw) WHERE v.raw IS NOT NULL \
+               ON CONFLICT (tbl, author, rkey, slot) DO UPDATE SET raw = EXCLUDED.raw)",
+            pairs.join(", ")
+        ));
+    }
+    sql.push_str(" SELECT true FROM up");
+    let mut query = sqlx::query_scalar::<_, bool>(&sql).bind(ids.author);
+    query = match key {
+        RowKey::Rkey => query.bind(ids.key),
+        RowKey::Coll => query.bind(i16::try_from(ids.key).unwrap_or_default()),
+        RowKey::Author => query,
+    };
+    query = query.bind(&ids.cid).bind(rev_value(rev));
+    if let Some(record) = &ids.record {
+        query = query.bind(record);
+    }
+    for ((_, cell), cell_ids) in row.cells.iter().zip(&ids.cells) {
+        query = match (cell, cell_ids) {
+            (Cell::Ref(..), CellIds::Ref(r)) => {
+                let (a, c, k) = r.columns();
+                query.bind(a).bind(c).bind(k)
+            }
+            (Cell::Account(_), CellIds::Account(id)) => query.bind(*id),
+            (Cell::OwnRkey(_), CellIds::Rkey(k)) => query.bind(*k),
+            (Cell::Tsv(text), _) => query.bind(text.as_str()),
+            (Cell::Text(v), _) => query.bind(v.as_deref()),
+            (Cell::Json(v), _) => query.bind(v.as_ref()),
+            (Cell::Bool(v), _) => query.bind(*v),
+            (Cell::Time(v), _) => query.bind(*v),
+            // `row_ids` gives every id cell its ids.
+            (Cell::Ref(..), _) => query.bind(None::<i32>).bind(crate::db::ids::ODD_COLL).bind(None::<i64>),
+            (Cell::Account(_), _) => query.bind(None::<i32>),
+            (Cell::OwnRkey(_), _) => query.bind(None::<i64>),
+        };
+    }
+    for (_, raw) in &slots {
+        query = query.bind(*raw);
+    }
+    let written = query.fetch_optional(&mut *conn).await?.is_some();
+    let whole: Vec<i16> = slots.iter().filter(|(_, raw)| raw.is_none()).map(|(slot, _)| *slot).collect();
+    if written && !whole.is_empty() {
+        sqlx::query("DELETE FROM odd_refs WHERE tbl = $1 AND author = $2 AND rkey = $3 AND slot = ANY($4)")
+            .bind(coll)
+            .bind(ids.author)
+            .bind(ids.key)
+            .bind(&whole)
+            .execute(conn)
+            .await?;
+    }
+    Ok(written)
+}
+
+/// The last-writer-wins upsert of a v3 table stored by URI (the plural
+/// records): every column of the row is set, and an older or equal rev
+/// changes nothing.
+async fn upsert_uri_row(conn: &mut PgConnection, u: &Upsert, row: &Row, owner_column: &str, rev: &str) -> Result<bool, sqlx::Error> {
+    let table = row.table;
+    let mut columns: Vec<&str> = vec!["uri", owner_column, "rkey", "cid", "rev"];
     columns.extend(row.cells.iter().map(|(name, _)| *name));
     let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${i}")).collect();
     let updates: Vec<String> = columns.iter().skip(1).map(|c| format!("{c} = EXCLUDED.{c}")).collect();
@@ -2676,28 +2900,33 @@ async fn upsert_row(conn: &mut PgConnection, u: &Upsert, row: &Row, rev: &str) -
         placeholders.join(", "),
         updates.join(", "),
     );
-    let mut query = sqlx::query(&sql).bind(&u.uri).bind(&u.input.author);
-    if row.has_rkey {
-        query = query.bind(&u.rkey);
-    }
-    query = query.bind(&u.cid).bind(rev);
+    let mut query = sqlx::query(&sql).bind(&u.uri).bind(&u.input.author).bind(&u.rkey).bind(&u.cid).bind(rev);
     for (_, cell) in &row.cells {
         query = match cell {
             Cell::Text(v) => query.bind(v.as_deref()),
-            Cell::TextArray(v) => query.bind(v),
             Cell::Json(v) => query.bind(v.as_ref()),
             Cell::Bool(v) => query.bind(*v),
             Cell::Time(v) => query.bind(*v),
+            Cell::Ref(_, v) | Cell::Account(v) | Cell::OwnRkey(v) | Cell::Tsv(v) => query.bind(v.as_str()),
         };
     }
     Ok(query.execute(conn).await?.rows_affected() > 0)
 }
 
+/// Delete a v3 record row by its URI at or below `rev`.
 async fn delete_row(conn: &mut PgConnection, table: &'static str, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
-    let sql = format!("DELETE FROM {table} WHERE uri = $1 AND rev <= $2");
+    let Some(key) = rows::key_of(table) else {
+        let sql = format!("DELETE FROM {table} WHERE uri = $1 AND rev <= $2");
+        return Ok(sqlx::query(&sql).bind(uri).bind(rev).execute(conn).await?.rows_affected() > 0);
+    };
+    let Some((author, k)) = rows::key_for(&mut *conn, key, uri).await? else {
+        return Ok(false);
+    };
+    let sql = format!("DELETE FROM {table} WHERE {} AND rev <= $3", rows::key_where(key));
     Ok(sqlx::query(&sql)
-        .bind(uri)
-        .bind(rev)
+        .bind(author)
+        .bind(k)
+        .bind(rev_value(rev))
         .execute(conn)
         .await?
         .rows_affected()
@@ -2709,7 +2938,7 @@ async fn delete_row(conn: &mut PgConnection, table: &'static str, uri: &str, rev
 /// reference, which a post under the off rule has without a row (public
 /// indexing design §4.1). A profile's is the repo's stored profile.
 async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo: &str, rev: &str) -> Result<bool, sqlx::Error> {
-    let tables: Vec<&str> = match kind {
+    let table = match kind {
         RecordKind::Profile => {
             return sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM actors WHERE did = $1 AND profile_record IS NOT NULL AND profile_rev > $2)",
@@ -2719,14 +2948,17 @@ async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo
             .fetch_one(conn)
             .await;
         }
-        // The post by its key; its member reference by URI.
+        // The post and its member reference, by its key.
         RecordKind::Post => {
+            let Some((author, rkey)) = crate::db::ids::record_key(&mut *conn, uri, COLL_POST).await? else {
+                return Ok(false);
+            };
             return sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM posts t, ref_of($1) r WHERE r.coll = 1 AND t.author = r.author AND t.rkey = r.rkey AND t.rev > $3) \
-                     OR EXISTS (SELECT 1 FROM member_post_refs WHERE uri = $1 AND rev > $2)",
+                "SELECT EXISTS (SELECT 1 FROM posts WHERE author = $1 AND rkey = $2 AND rev > $3) \
+                     OR EXISTS (SELECT 1 FROM member_post_refs WHERE author = $1 AND rkey = $2 AND rev > $3)",
             )
-            .bind(uri)
-            .bind(rev)
+            .bind(author)
+            .bind(rkey)
             .bind(rev_value(rev))
             .fetch_one(conn)
             .await;
@@ -2747,19 +2979,29 @@ async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo
             .fetch_one(conn)
             .await;
         }
-        RecordKind::Table(table) => vec![table],
-        RecordKind::PublicRootGate => vec!["threadgates"],
+        RecordKind::Table(table) => table,
+        RecordKind::PublicRootGate => "threadgates",
         // The private tier keeps its own (`ingest::delete`).
         RecordKind::PrivatePost | RecordKind::PrivateGate => {
             return Ok(false);
         }
     };
-    let sql = tables
-        .iter()
-        .map(|t| format!("EXISTS (SELECT 1 FROM {t} WHERE uri = $1 AND rev > $2)"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    sqlx::query_scalar(&format!("SELECT {sql}")).bind(uri).bind(rev).fetch_one(conn).await
+    let Some(key) = rows::key_of(table) else {
+        return sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE uri = $1 AND rev > $2)"))
+            .bind(uri)
+            .bind(rev)
+            .fetch_one(conn)
+            .await;
+    };
+    let Some((author, k)) = rows::key_for(&mut *conn, key, uri).await? else {
+        return Ok(false);
+    };
+    sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE {} AND rev > $3)", rows::key_where(key)))
+        .bind(author)
+        .bind(k)
+        .bind(rev_value(rev))
+        .fetch_one(conn)
+        .await
 }
 
 async fn delete_profile(conn: &mut PgConnection, did: &str, rev: &str) -> Result<bool, sqlx::Error> {
@@ -2930,8 +3172,8 @@ async fn insert_subscribed_post(
         "INSERT INTO notifications (recipient_did, author_did, reason, record_uri, record_cid) \
          SELECT s.subscriber_did, $1, 'subscribed-post', $2, $3 \
          FROM activity_subscriptions s \
-         CROSS JOIN (SELECT COALESCE((SELECT record->>'allowSubscriptions' FROM actor_self_records \
-                                      WHERE did = $1 AND collection = 'app.bsky.notification.declaration'), \
+         CROSS JOIN (SELECT COALESCE((SELECT r.allow_subscriptions FROM actor_self_records r, dids rd \
+                                      WHERE rd.did = $1 AND r.author = rd.id AND r.coll = 13), \
                                      'followers') AS allow) d \
          WHERE s.subject_did = $1 AND s.subscriber_did <> $1 \
            AND CASE WHEN $4 THEN s.reply ELSE s.post END \
@@ -3406,6 +3648,50 @@ pub(crate) mod fixtures {
         let (author, rkey, cid, rev, created_at) = row;
         let next = crate::db::ids::rev_string(rev.saturating_add(1));
         put_post(pool, &author, &rkey, &crate::db::ids::cid_from_db(&cid), &next, record, Some(created_at)).await;
+    }
+
+    /// Store a record of a keyed v3 table (a list, list item, list block,
+    /// opt-out, starter pack, labeler service, self record, gate or poll)
+    /// from its record at `rev`, as the writer does, interning its ids
+    /// first. Returns its URI.
+    ///
+    /// # Panics
+    ///
+    /// On a database error, or a record the writer would refuse or store
+    /// elsewhere.
+    pub async fn put_record(pool: &PgPool, author: &str, collection: &str, rkey: &str, cid: &str, rev: &str, record: &Value) -> String {
+        let op = RawOp { action: Action::Create, collection: collection.to_string(), rkey: rkey.to_string(), cid: Some(cid.to_string()), record: Some(record.clone()) };
+        let Prepared::Upsert(u) = prepare(author, &op, Utc::now()) else {
+            panic!("not stored: {collection} {record}");
+        };
+        let Body::Row(row) = &u.body else {
+            panic!("not a v3 row: {collection} {record}");
+        };
+        let ids = Ids::new(pool.clone());
+        let mut dids = vec![author.to_string()];
+        for (_, cell) in &row.cells {
+            match cell {
+                Cell::Account(did) => dids.push(did.clone()),
+                Cell::Ref(_, uri) => dids.extend(ref_did(uri)),
+                _ => {}
+            }
+        }
+        let accounts = ids.account_ids(&dids).await.expect("intern");
+        let me = accounts[author];
+        let mut keys = vec![(me, rkey.to_string())];
+        for (_, cell) in &row.cells {
+            match cell {
+                Cell::OwnRkey(k) => keys.push((me, k.clone())),
+                Cell::Ref(_, uri) => keys.extend(ref_rkey(uri).and_then(|(d, k)| accounts.get(&d).map(|a| (*a, k)))),
+                _ => {}
+            }
+        }
+        let rkeys = ids.rkey_ids(&keys).await.expect("alias");
+        let own = rkeys.get(&(me, rkey.to_string())).copied();
+        let row_ids = row_ids(pool, &accounts, &rkeys, me, own, &u, row).await.expect("ids").expect("keyable");
+        let mut conn = pool.acquire().await.expect("conn");
+        upsert_row(&mut conn, row, &row_ids, rev).await.expect("row");
+        u.uri.clone()
     }
 
     /// Store a feed item of `originator`: its own record `item` (a post or a
@@ -4004,12 +4290,8 @@ mod tests {
             w.apply(AUTHOR, &rev(4), &[post("3kfresh", fresh(), false)], OPTIONS).await.expect("apply");
             assert_eq!(notified().await, [format!("at://{AUTHOR}/app.bsky.feed.post/3kfresh")]);
             // The author's declaration now refuses: skipped, the row kept.
-            exec(format!(
-                "INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) VALUES \
-                 ('at://{AUTHOR}/app.bsky.notification.declaration/self', '{AUTHOR}', 'app.bsky.notification.declaration', \
-                  'bafyd', '3k', '{{\"allowSubscriptions\": \"none\"}}')"
-            ))
-            .await;
+            let declaration = json!({"$type": "app.bsky.notification.declaration", "allowSubscriptions": "none"});
+            crate::test_support::records::self_record(p, AUTHOR, "app.bsky.notification.declaration", &declaration).await;
             w.apply(AUTHOR, &rev(5), &[post("3krefused", fresh(), false)], OPTIONS).await.expect("apply");
             assert_eq!(notified().await.len(), 1);
             let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM activity_subscriptions").fetch_one(p).await.expect("count");
@@ -4447,14 +4729,32 @@ mod tests {
             ] {
                 assert_eq!(count(table).await, rows, "{table}");
             }
-            let gate: (String, Option<Value>, Vec<String>) =
-                sqlx::query_as("SELECT post_uri, allow, hidden_replies FROM threadgates").fetch_one(p).await.expect("gate");
-            assert_eq!(gate, (post.clone(), Some(json!([])), Vec::new()));
-            let pack: (String, bool) = sqlx::query_as("SELECT creator_did, search_tsv @@ to_tsquery('simple', 'starter') FROM starter_packs")
+            let gate: (Option<String>, i16) = sqlx::query_as("SELECT at_uri(post_author, post_coll, post_rkey), post_coll FROM threadgates")
                 .fetch_one(p)
                 .await
-                .expect("pack");
+                .expect("gate");
+            assert_eq!(gate, (Some(post.clone()), COLL_POST));
+            let gate_uri = format!("at://{AUTHOR}/app.bsky.feed.threadgate/3kpost");
+            let record = crate::test_support::records::record(p, "threadgates", &gate_uri).await.expect("gate record");
+            assert_eq!((&record["allow"], record.get("hiddenReplies")), (&json!([]), None));
+            let pack: (String, bool) = sqlx::query_as(
+                "SELECT d.did, s.search_tsv @@ to_tsquery('simple', 'starter') FROM starter_packs s JOIN dids d ON d.id = s.author",
+            )
+            .fetch_one(p)
+            .await
+            .expect("pack");
             assert_eq!(pack, (AUTHOR.to_string(), true));
+            // Self records keep the fields queries read; an odd reference
+            // keeps its text.
+            let declaration: Option<String> = sqlx::query_scalar("SELECT allow_subscriptions FROM actor_self_records WHERE coll = 13")
+                .fetch_one(p)
+                .await
+                .expect("declaration");
+            assert_eq!(declaration.as_deref(), Some("followers"));
+            let odd = [create("app.bsky.feed.postgate", "3kodd", json!({"post": "at://not-a-did/app.bsky.feed.post/3kodd"}))];
+            assert_eq!(w.apply(AUTHOR, &rev(1), &odd, OPTIONS).await.expect("apply").outcomes, [OpOutcome::Written]);
+            let odd_texts: Vec<(i16, i16, String)> = sqlx::query_as("SELECT tbl, slot, raw FROM odd_refs").fetch_all(p).await.expect("odd");
+            assert_eq!(odd_texts, [(17, 4, "at://not-a-did/app.bsky.feed.post/3kodd".to_string())]);
 
             // An older or equal rev changes nothing; a newer one replaces.
             let rename = |name: &str| [raw(Action::Update, "app.bsky.graph.list", "3klist", json!({"name": name, "purpose": "app.bsky.graph.defs#curatelist"}))];
@@ -4462,8 +4762,9 @@ mod tests {
             assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
             let r = w.apply(AUTHOR, &rev(2), &rename("Renamed"), OPTIONS).await.expect("apply");
             assert_eq!(r.outcomes, [OpOutcome::Written]);
-            let name: (String, String) = sqlx::query_as("SELECT name, purpose FROM lists").fetch_one(p).await.expect("list");
-            assert_eq!(name, ("Renamed".to_string(), "app.bsky.graph.defs#curatelist".to_string()));
+            let purpose: String = sqlx::query_scalar("SELECT purpose FROM lists").fetch_one(p).await.expect("list");
+            let record = crate::test_support::records::record(p, "lists", &list).await.expect("list record");
+            assert_eq!((record["name"].as_str(), purpose.as_str()), (Some("Renamed"), "app.bsky.graph.defs#curatelist"));
 
             // Deletes remove the row and leave a tombstone that stops an
             // older write from bringing it back.
@@ -4487,10 +4788,14 @@ mod tests {
                 create("app.bsky.feed.postgate", "3kgated", json!({"post": format!("at://{AUTHOR}/app.bsky.feed.post/3kgated")})),
             ];
             w.apply(AUTHOR, &rev(4), &gated, OPTIONS).await.expect("apply");
-            assert_eq!((count("threadgates").await, count("postgates").await), (1, 2));
+            assert_eq!((count("threadgates").await, count("postgates").await), (1, 3));
             let gone = [raw(Action::Delete, "app.bsky.feed.post", "3kgated", Value::Null)];
             w.apply(AUTHOR, &rev(5), &gone, OPTIONS).await.expect("apply");
-            assert_eq!((count("threadgates").await, count("postgates").await), (0, 1), "the other post's postgate stays");
+            assert_eq!((count("threadgates").await, count("postgates").await), (0, 2), "the other posts' postgates stay");
+            // Deleting the odd postgate takes its text with it.
+            let gone = [raw(Action::Delete, "app.bsky.feed.postgate", "3kodd", Value::Null)];
+            w.apply(AUTHOR, &rev(6), &gone, OPTIONS).await.expect("apply");
+            assert_eq!((count("postgates").await, count("odd_refs").await), (1, 0));
 
             // An author outside the scope is not admitted for these.
             let stranger = [create("app.bsky.graph.list", "3klist", json!({"name": "Theirs", "purpose": "app.bsky.graph.defs#modlist"}))];
@@ -4933,11 +5238,14 @@ mod tests {
             assert_eq!(report.outcomes, [OpOutcome::GrowOnly]);
 
             assert_eq!(count(p, "SELECT count(*) FROM posts").await, 0);
-            let r: (String, String, Option<String>, Option<String>, Option<String>) =
-                sqlx::query_as("SELECT author_did, rev, reply_parent_did, reply_root_did, quote_did FROM member_post_refs")
-                    .fetch_one(p)
-                    .await
-                    .expect("ref");
+            let r: (String, String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT (SELECT d.did FROM dids d WHERE d.id = r.author), bigint_to_rev(r.rev), \
+                   (SELECT d.did FROM dids d WHERE d.id = r.parent), (SELECT d.did FROM dids d WHERE d.id = r.root), \
+                   (SELECT d.did FROM dids d WHERE d.id = r.quote) FROM member_post_refs r",
+            )
+            .fetch_one(p)
+            .await
+            .expect("ref");
             assert_eq!(r, (AUTHOR.to_string(), rev(2), Some(SUBJECT.to_string()), Some(SUBJECT.to_string()), None));
             let reasons: i16 = sqlx::query_scalar("SELECT reasons FROM scope_dids WHERE did = $1").bind(SUBJECT).fetch_one(p).await.expect("scope");
             assert_eq!(reasons, crate::aggregations::REASON_INTERACTED);
@@ -4967,9 +5275,10 @@ mod tests {
             // deletes it (T-17).
             let delete = RawOp { action: Action::Delete, collection: "app.bsky.feed.post".into(), rkey: RKEY.into(), cid: None, record: None };
             w.apply(AUTHOR, &rev(1), std::slice::from_ref(&delete), OPTIONS).await.expect("apply");
-            assert_eq!(count(p, &format!("SELECT count(*) FROM member_post_refs WHERE uri = 'at://{AUTHOR}/app.bsky.feed.post/{RKEY}'")).await, 1);
+            let stored = crate::test_support::records::key_is("member_post_refs", "", &format!("at://{AUTHOR}/app.bsky.feed.post/{RKEY}"));
+            assert_eq!(count(p, &format!("SELECT count(*) FROM member_post_refs WHERE {stored}")).await, 1);
             w.apply(AUTHOR, &rev(5), &[delete], OPTIONS).await.expect("apply");
-            assert_eq!(count(p, &format!("SELECT count(*) FROM member_post_refs WHERE uri = 'at://{AUTHOR}/app.bsky.feed.post/{RKEY}'")).await, 0);
+            assert_eq!(count(p, &format!("SELECT count(*) FROM member_post_refs WHERE {stored}")).await, 0);
             db.drop_db().await;
         }
 
@@ -4988,7 +5297,7 @@ mod tests {
             // A not-newer write still keeps the reference current with its
             // own rev check, which an older rev does not pass.
             w.apply(AUTHOR, &rev(0), &[post_op(Action::Update, "older")], OPTIONS).await.expect("apply");
-            let r: String = sqlx::query_scalar("SELECT rev FROM member_post_refs").fetch_one(p).await.expect("ref");
+            let r: String = sqlx::query_scalar("SELECT bigint_to_rev(rev) FROM member_post_refs").fetch_one(p).await.expect("ref");
             assert_eq!(r, rev(1));
             // The same author, in S but no member.
             let other = writer(p, false);

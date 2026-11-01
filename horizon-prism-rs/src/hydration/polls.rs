@@ -19,7 +19,7 @@ pub const DEFAULT_LIMIT: u32 = 25;
 pub const MAX_LIMIT: u32 = 100;
 
 /// A stored poll: URI, rkey, CID, record, `created_at`, `indexed_at`.
-type PollRow = (String, String, String, Value, DateTime<Utc>, DateTime<Utc>);
+type PollRow = (String, String, Vec<u8>, Vec<u8>, DateTime<Utc>, DateTime<Utc>);
 
 impl Hydrator {
     /// `app.nearhorizon.feed.getAuthorPolls`.
@@ -52,15 +52,29 @@ impl Hydrator {
             };
         }
         let (at, after) = parse_local_cursor(cursor);
-        let rows: Vec<PollRow> = sqlx::query_as(
-            "SELECT uri, rkey, cid, record, created_at, indexed_at FROM nearhorizon_poll_posts \
-             WHERE author_did = $1 AND visibility = 'public' \
-               AND ($2::timestamptz IS NULL OR (created_at, rkey) < ($2, $3)) \
-             ORDER BY created_at DESC, rkey DESC LIMIT $4",
-        )
+        // The cursor names the last poll's record key.
+        let after_rkey = match after.as_deref() {
+            Some(rkey) => match crate::db::ids::rkey_value(rkey) {
+                Some(k) => Some(k),
+                None => sqlx::query_scalar("SELECT x.id FROM rkey_aliases x, dids d WHERE d.did = $1 AND x.author = d.id AND x.rkey = $2")
+                    .bind(&did)
+                    .bind(rkey)
+                    .fetch_optional(self.pool())
+                    .await?,
+            },
+            None => None,
+        };
+        let rows: Vec<PollRow> = sqlx::query_as(&format!(
+            "SELECT {}, bigint_to_rkey(p.rkey), p.cid, p.record, p.created_at, p.indexed_at \
+             FROM nearhorizon_poll_posts p JOIN dids d ON d.id = p.author \
+             WHERE d.did = $1 AND p.visibility = 'public' \
+               AND ($2::timestamptz IS NULL OR (p.created_at, p.rkey) < ($2, $3)) \
+             ORDER BY p.created_at DESC, p.rkey DESC LIMIT $4",
+            crate::db::lists::uri_sql("d.did", "app.nearhorizon.poll.post", "p.rkey")
+        ))
         .bind(&did)
         .bind(at)
-        .bind(after.unwrap_or_default())
+        .bind(after_rkey.unwrap_or(i64::MIN))
         .bind(i64::from(limit))
         .fetch_all(self.pool())
         .await?;
@@ -71,11 +85,13 @@ impl Hydrator {
         let gates = self.gate_many(req, &labelled).await?;
         let ctx = self.profile_context(viewer, req, std::slice::from_ref(&did), None, super::Tiers::List).await?;
         let author = ctx.view(&did, ProfileKind::Basic);
-        let polls: Vec<Value> = rows
-            .into_iter()
-            .filter(|(uri, ..)| gates.get(uri).is_none_or(|g| g.listable()))
-            .map(|(uri, _, cid, record, _, indexed)| json!({"uri": uri, "cid": cid, "author": author, "record": record, "indexedAt": ts(indexed)}))
-            .collect();
+        let mut polls: Vec<Value> = Vec::with_capacity(rows.len());
+        for (uri, _, cid, record, _, indexed) in rows {
+            if gates.get(&uri).is_none_or(|g| g.listable()) {
+                let record = crate::db::records::decode_value(self.pool(), &record).await?;
+                polls.push(json!({"uri": uri, "cid": crate::db::ids::cid_from_db(&cid), "author": author, "record": record, "indexedAt": ts(indexed)}));
+            }
+        }
         let mut out = json!({ "polls": polls });
         if let Some(c) = next {
             out["cursor"] = json!(c);
@@ -111,8 +127,9 @@ impl Hydrator {
 mod tests {
     use super::*;
     use crate::aggregations::ScopeSets;
-    use crate::hydration::testing::{actor, exec, hydrator};
+    use crate::hydration::testing::{actor, hydrator};
     use crate::test_support::fresh_db;
+    use crate::test_support::records::REV;
 
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -124,12 +141,15 @@ mod tests {
         };
         let p = &db.pool;
         actor(p, ALICE, "alice.test", "Alice").await;
-        for (n, visibility) in [(1, "public"), (2, "followers"), (3, "public")] {
-            exec(p, &format!(
-                "INSERT INTO nearhorizon_poll_posts (uri, author_did, rkey, cid, rev, text, options, visibility, record, created_at) VALUES \
-                 ('at://{ALICE}/app.nearhorizon.poll.post/3kpoll{n}', '{ALICE}', '3kpoll{n}', 'bafy{n}', '3k', 'q{n}', '[]', '{visibility}', \
-                  '{{\"text\": \"q{n}\", \"visibility\": \"{visibility}\"}}', now() + interval '{n} seconds')"
-            )).await;
+        for (n, visibility) in [(2, "public"), (3, "followers"), (4, "public")] {
+            let record = json!({"$type": "app.nearhorizon.poll.post", "text": format!("q{n}"), "options": [], "visibility": visibility});
+            let at = Utc::now() - chrono::TimeDelta::seconds(10 - n);
+            crate::test_support::records::put_record(p, ALICE, "app.nearhorizon.poll.post", &format!("3kpoll222222{n}"), &format!("bafy{n}"), REV, &{
+                let mut r = record;
+                r["createdAt"] = json!(at.to_rfc3339());
+                r
+            })
+            .await;
         }
         let mut sets = ScopeSets::default();
         sets.scope.insert(ALICE.into());
@@ -137,14 +157,14 @@ mod tests {
         let (anon, req) = (Viewer::anonymous(), Requester::test());
         let v = h.get_author_polls(&anon, &req, "alice.test", 25, None).await.expect("db").expect("view");
         let polls = v.inner()["polls"].as_array().expect("polls");
-        assert_eq!(polls.iter().map(|x| x["record"]["text"].as_str().expect("text")).collect::<Vec<_>>(), ["q3", "q1"]);
-        assert_eq!((&polls[0]["author"]["handle"], &polls[0]["cid"]), (&json!("alice.test"), &json!("bafy3")));
+        assert_eq!(polls.iter().map(|x| x["record"]["text"].as_str().expect("text")).collect::<Vec<_>>(), ["q4", "q2"]);
+        assert_eq!((&polls[0]["author"]["handle"], &polls[0]["cid"]), (&json!("alice.test"), &json!("bafy4")));
         assert!(polls[0]["author"].get("description").is_none() && polls[0]["indexedAt"].is_string());
         // Paging over the public ones.
         let page = h.get_author_polls(&anon, &req, ALICE, 1, None).await.expect("db").expect("view");
         let cursor = page.inner()["cursor"].as_str().expect("cursor").to_string();
         let rest = h.get_author_polls(&anon, &req, ALICE, 1, Some(&cursor)).await.expect("db").expect("view");
-        assert_eq!(rest.inner()["polls"][0]["record"]["text"], "q1");
+        assert_eq!(rest.inner()["polls"][0]["record"]["text"], "q2");
         // The limit is bounded.
         for bad in [0, 101] {
             assert_eq!(h.get_author_polls(&anon, &req, ALICE, bad, None).await.expect("db").expect_err("limit").error, "InvalidRequest");
@@ -166,11 +186,8 @@ mod tests {
         };
         let p = &db.pool;
         actor(p, ALICE, "alice.test", "Alice").await;
-        exec(p, &format!(
-            "INSERT INTO nearhorizon_poll_posts (uri, author_did, rkey, cid, rev, text, options, visibility, record, created_at) VALUES \
-             ('at://{ALICE}/app.nearhorizon.poll.post/3kpoll1', '{ALICE}', '3kpoll1', 'bafy1', '3k', 'local', '[]', 'public', \
-              '{{\"text\": \"local\", \"visibility\": \"public\"}}', now())"
-        )).await;
+        let record = json!({"$type": "app.nearhorizon.poll.post", "text": "local", "options": [], "visibility": "public"});
+        crate::test_support::records::put(p, ALICE, "app.nearhorizon.poll.post", "3kpoll2222222", &record).await;
         let mut up = FixedUpstream::default();
         let listed = json!({"uri": format!("at://{ALICE}/app.nearhorizon.poll.post/3kpoll2"), "cid": "bafy2",
                             "author": {"did": ALICE, "handle": "alice.test"}, "record": {"text": "from the pds"}});

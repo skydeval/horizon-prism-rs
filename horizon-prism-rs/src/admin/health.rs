@@ -61,6 +61,7 @@ pub const WATCHED: &[&str] = &[
     crate::db::schema_backfill::METRIC_REMAINING,
     crate::db::schema_backfill::METRIC_INDEX_PENDING,
     crate::db::schema_backfill::METRIC_RECOMPRESS_REMAINING,
+    crate::db::schema_backfill::METRIC_OTHER_RECOMPRESS_REMAINING,
     crate::db::schema_backfill::METRIC_POSTS_DEAD_ROWS,
     crate::aggregations::rebuild::METRIC_SWEEP_RUNS,
     // Private posts' new form (private-embeds design §9): the read side's

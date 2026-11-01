@@ -75,16 +75,26 @@ pub enum OddTable {
     Likes,
     Reposts,
     Follows,
+    ListBlocks,
+    ListOptouts,
+    StarterPacks,
+    Threadgates,
+    Postgates,
 }
 
 impl OddTable {
     #[must_use]
     pub const fn id(self) -> i16 {
         match self {
-            Self::Posts => 1,
-            Self::Likes => 2,
-            Self::Reposts => 3,
+            Self::Posts => COLL_POST,
+            Self::Likes => COLL_LIKE,
+            Self::Reposts => COLL_REPOST,
             Self::Follows => 4,
+            Self::ListBlocks => COLL_LISTBLOCK,
+            Self::ListOptouts => COLL_LIST_OPTOUT,
+            Self::StarterPacks => COLL_STARTER_PACK,
+            Self::Threadgates => COLL_THREADGATE,
+            Self::Postgates => COLL_POSTGATE,
         }
     }
 }
@@ -93,8 +103,18 @@ impl OddTable {
 pub const COLL_POST: i16 = 1;
 pub const COLL_LIKE: i16 = 2;
 pub const COLL_REPOST: i16 = 3;
+pub const COLL_LIST: i16 = 7;
+pub const COLL_LISTITEM: i16 = 8;
+pub const COLL_LISTBLOCK: i16 = 9;
+pub const COLL_LIST_OPTOUT: i16 = 10;
+pub const COLL_STARTER_PACK: i16 = 11;
+pub const COLL_LABELER: i16 = 12;
+pub const COLL_DECLARATION: i16 = 13;
+pub const COLL_STATUS: i16 = 14;
+pub const COLL_CONTENT_VISIBILITY: i16 = 15;
 pub const COLL_THREADGATE: i16 = 16;
 pub const COLL_POSTGATE: i16 = 17;
+pub const COLL_POLL_POST: i16 = 20;
 pub const COLL_PRIVATE_POST: i16 = 27;
 
 /// Which reference of its owner row an `odd_refs` row holds
@@ -206,6 +226,25 @@ pub async fn whole_key<'e, E: sqlx::PgExecutor<'e>>(e: E, uri: &str) -> Result<O
         Some((Some(author), Some(coll), Some(rkey))) => Some((author, coll, rkey)),
         _ => None,
     })
+}
+
+/// The `(author, rkey)` of the record in collection `coll` that `uri` names,
+/// read-only: `None` for any other URI (see [`whole_key`]).
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn record_key<'e, E: sqlx::PgExecutor<'e>>(e: E, uri: &str, coll: i16) -> Result<Option<(AccountId, i64)>, sqlx::Error> {
+    Ok(whole_key(e, uri).await?.filter(|(_, c, _)| *c == coll).map(|(a, _, k)| (a, k)))
+}
+
+/// A DID's account id, read-only: `None` when it has none.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn account_id<'e, E: sqlx::PgExecutor<'e>>(e: E, did: &str) -> Result<Option<AccountId>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM dids WHERE did = $1").bind(did).fetch_optional(e).await
 }
 
 /// A collection's id in the fixed list.

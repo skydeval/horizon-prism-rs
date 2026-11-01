@@ -109,15 +109,20 @@ impl Hydrator {
         }
         // The actor's list blocks, for moderation lists served locally.
         let by_list: Pairs = if member {
-            sqlx::query_as::<_, (String, String)>(
-                "SELECT DISTINCT ON (i.subject_did) i.subject_did, b.uri \
+            sqlx::query_as::<_, (String, String)>(&format!(
+                "SELECT DISTINCT ON (i.subject) sd.did, at_uri(b.author, {}::smallint, b.rkey) \
                  FROM list_blocks b \
-                 JOIN lists l ON l.uri = b.list_uri AND l.purpose = $3 \
-                 JOIN members m ON m.did = l.creator_did AND m.ready_at IS NOT NULL \
-                 JOIN list_items i ON i.list_uri = b.list_uri \
-                 WHERE b.author_did = $1 AND i.subject_did = ANY($2) \
-                 ORDER BY i.subject_did, b.created_at, b.uri",
-            )
+                 JOIN lists l ON b.subj_coll = {} AND l.author = b.subj_author AND l.rkey = b.subj_rkey AND l.purpose = $3 \
+                 JOIN dids ld ON ld.id = l.author \
+                 JOIN members m ON m.did = ld.did AND m.ready_at IS NOT NULL \
+                 JOIN list_items i ON i.author = l.author AND i.list_rkey = l.rkey \
+                 JOIN dids sd ON sd.id = i.subject \
+                 WHERE b.author = (SELECT id FROM dids WHERE did = $1) \
+                   AND i.subject IN (SELECT id FROM dids WHERE did = ANY($2)) \
+                 ORDER BY i.subject, b.created_at, b.rkey",
+                crate::db::ids::COLL_LISTBLOCK,
+                crate::db::ids::COLL_LIST
+            ))
             .bind(&actor)
             .bind(&dids)
             .bind(PURPOSE_MOD)
@@ -199,25 +204,13 @@ mod tests {
     }
 
     async fn list_with(p: &sqlx::PgPool, owner: &str, rkey: &str, purpose: &str, subject: &str) -> String {
-        let uri = format!("at://{owner}/app.bsky.graph.list/{rkey}");
-        exec(p, &format!(
-            "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES \
-             ('{uri}', '{owner}', '{rkey}', 'bafy', '3k', 'L', '{purpose}', '{{}}', now())"
-        )).await;
-        exec(p, &format!(
-            "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES \
-             ('at://{owner}/app.bsky.graph.listitem/{rkey}', '{owner}', '{rkey}', 'bafy', '3k', '{uri}', '{subject}', now())"
-        )).await;
+        let uri = crate::test_support::records::list(p, owner, rkey, "L", purpose).await;
+        crate::test_support::records::list_item(p, owner, rkey, &uri, subject).await;
         uri
     }
 
     async fn list_block(p: &sqlx::PgPool, author: &str, rkey: &str, list: &str) -> String {
-        let uri = format!("at://{author}/app.bsky.graph.listblock/{rkey}");
-        exec(p, &format!(
-            "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES \
-             ('{uri}', '{author}', '{rkey}', 'bafy', '3k', '{list}', now())"
-        )).await;
-        uri
+        crate::test_support::records::list_block(p, author, rkey, list).await
     }
 
     /// B-55: a ready member's relationships come from local rows.
@@ -238,12 +231,12 @@ mod tests {
         // A moderation list of a ready member names Bob; a curate list of
         // the same owner names Carol; a moderation list of a non-member
         // names Dave. Alice list-blocks all three.
-        let mods = list_with(p, OWNER, "mods", PURPOSE_MOD, BOB).await;
-        let curated = list_with(p, OWNER, "cur", PURPOSE_CURATE, CAROL).await;
-        let foreign = list_with(p, BOB, "theirs", PURPOSE_MOD, DAVE).await;
-        let by_list = list_block(p, ALICE, "lb1", &mods).await;
-        list_block(p, ALICE, "lb2", &curated).await;
-        list_block(p, ALICE, "lb3", &foreign).await;
+        let mods = list_with(p, OWNER, "3kmods2222222", PURPOSE_MOD, BOB).await;
+        let curated = list_with(p, OWNER, "3kcur22222222", PURPOSE_CURATE, CAROL).await;
+        let foreign = list_with(p, BOB, "3ktheirs22222", PURPOSE_MOD, DAVE).await;
+        let by_list = list_block(p, ALICE, "3kblock22222a", &mods).await;
+        list_block(p, ALICE, "3kblock22222b", &curated).await;
+        list_block(p, ALICE, "3kblock22222c", &foreign).await;
         let mut sets = ScopeSets::default();
         sets.members.insert(ALICE.into());
         for d in [ALICE, BOB, CAROL, DAVE] {

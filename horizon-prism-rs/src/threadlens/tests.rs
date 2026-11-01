@@ -195,20 +195,16 @@ async fn gate(p: &PgPool, root: &str, hidden: &[&str]) {
     let rkey = root.rsplit('/').next().expect("rkey");
     let uri = format!("at://{author}/app.bsky.feed.threadgate/{rkey}");
     let record = json!({"$type": "app.bsky.feed.threadgate", "post": root, "hiddenReplies": hidden, "createdAt": "2026-09-26T12:00:00.000Z"});
-    sqlx::query("DELETE FROM threadgates WHERE uri = $1").bind(&uri).execute(p).await.expect("delete");
-    sqlx::query(
-        "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, hidden_replies, record, created_at) \
-         VALUES ($1, $2, $3, 'bafygate', '3k', $4, NULL, $5, $6, now())",
-    )
-    .bind(&uri)
-    .bind(author)
-    .bind(rkey)
-    .bind(root)
-    .bind(hidden.iter().map(ToString::to_string).collect::<Vec<_>>())
-    .bind(&record)
-    .execute(p)
-    .await
-    .expect("gate");
+    let stored = crate::test_support::records::key_is("threadgates", "", &uri);
+    sqlx::query(&format!("DELETE FROM threadgates WHERE {stored}")).execute(p).await.expect("delete");
+    // The writer keeps a gate on a private post in the private tier only:
+    // a public row naming one is planted bare, to show it is never read.
+    if !root.contains("/app.bsky.feed.post/") {
+        let sql = crate::test_support::records::row_sql("threadgates", author, rkey, &[("post", root)], &[]);
+        sqlx::raw_sql(&sql).execute(p).await.expect("gate");
+        return;
+    }
+    crate::test_support::records::put_record(p, author, "app.bsky.feed.threadgate", rkey, "bafygate", crate::test_support::records::REV, &record).await;
 }
 
 /// T-3 – T-5, T-7 – T-9 (Thread Lens amendment 1 §2): replies the root's

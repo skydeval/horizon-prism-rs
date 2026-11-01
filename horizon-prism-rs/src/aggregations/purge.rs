@@ -474,44 +474,35 @@ impl Purger {
         let mut n = 0;
         match kind {
             PurgeKind::AccountDeleted => {
-                for (table, column) in [
+                for (table, keys) in [
                     // Keyed by ids; a post's search row and odd references go
-                    // with it.
-                    ("feed_items", "originator"),
-                    ("posts", "author"),
-                    ("member_post_refs", "author_did"),
-                    ("likes", "author"),
-                    ("reposts", "author"),
-                    ("follows", "author"),
-                    ("blocks", "author"),
+                    // with it, and so do any row's odd references.
+                    ("feed_items", &["originator", "is_repost", "src_rkey"][..]),
+                    ("posts", &["author", "rkey"][..]),
+                    ("member_post_refs", &["author", "rkey"][..]),
+                    ("likes", &["author", "rkey"][..]),
+                    ("reposts", &["author", "rkey"][..]),
+                    ("follows", &["author", "rkey"][..]),
+                    ("blocks", &["author", "rkey"][..]),
                     // The record tables design-v3 added (§3.1).
-                    ("lists", "creator_did"),
-                    ("list_items", "author_did"),
-                    ("list_blocks", "author_did"),
-                    ("list_optouts", "author_did"),
-                    ("starter_packs", "creator_did"),
-                    ("labeler_services", "creator_did"),
-                    ("actor_self_records", "did"),
-                    ("threadgates", "author_did"),
-                    ("postgates", "author_did"),
-                    ("nearhorizon_poll_posts", "author_did"),
-                    // Pronouns and plural records (plural-pronouns §2.3).
-                    ("plural_records", "did"),
+                    ("lists", &["author", "rkey"][..]),
+                    ("list_items", &["author", "rkey"][..]),
+                    ("list_blocks", &["author", "rkey"][..]),
+                    ("list_optouts", &["author", "rkey"][..]),
+                    ("starter_packs", &["author", "rkey"][..]),
+                    ("labeler_services", &["author"][..]),
+                    ("actor_self_records", &["author", "coll"][..]),
+                    ("threadgates", &["author", "rkey"][..]),
+                    ("postgates", &["author", "rkey"][..]),
+                    ("nearhorizon_poll_posts", &["author", "rkey"][..]),
+                    // Derived counts follow their pack row.
+                    ("starter_pack_counts", &["author", "rkey"][..]),
                 ] {
-                    n += if matches!(table, "posts" | "likes" | "reposts" | "follows" | "blocks") {
-                        delete_graph_batch(conn, table, "t.author = (SELECT id FROM dids WHERE did = $1)", did).await?
-                    } else if table == "feed_items" {
-                        let sql = format!(
-                            "DELETE FROM feed_items WHERE (originator, is_repost, src_rkey) IN (SELECT t.originator, t.is_repost, t.src_rkey \
-                             FROM feed_items t WHERE t.originator = (SELECT id FROM dids WHERE did = $1) LIMIT {BATCH})"
-                        );
-                        sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected()
-                    } else {
-                        delete_batch(conn, table, "uri", &format!("{column} = $1"), did).await?
-                    };
+                    let own = if table == "feed_items" { "t.originator" } else { "t.author" };
+                    n += delete_keys_batch(conn, table, keys, &format!("{own} = (SELECT id FROM dids WHERE did = $1)"), did).await?;
                 }
-                // Derived counts follow their pack row.
-                n += delete_batch(conn, "starter_pack_counts", "pack_uri", "split_part(pack_uri, '/', 3) = $1", did).await?;
+                // Pronouns and plural records.
+                n += delete_batch(conn, "plural_records", "uri", "did = $1", did).await?;
                 n += delete_batch(conn, "notifications", "id", "author_did = $1 OR recipient_did = $1", did).await?;
                 n += delete_batch(conn, "mutes", "ctid", "viewer_did = $1", did).await?;
                 n += viewer_private_batch(conn, did).await?;
@@ -559,7 +550,7 @@ impl Purger {
                 n += delete_batch(conn, "refract_notifications", "id", "recipient_did = $1", did).await?;
                 // A non-member's posts have no references (public-indexing
                 // design §4.1).
-                n += delete_batch(conn, "member_post_refs", "uri", "author_did = $1", did).await?;
+                n += delete_graph_batch(conn, "member_post_refs", "t.author = (SELECT id FROM dids WHERE did = $1)", did).await?;
                 n += member_removed_public_batch(conn, did).await?;
                 if off_rule {
                     n += member_removed_off_batch(conn, did).await?;
@@ -721,10 +712,20 @@ async fn delete_batch(
 }
 
 /// [`delete_batch`] for a table keyed by `(author, rkey)` (posts, likes,
-/// reposts, follows, blocks); `predicate` names the table `t`.
+/// reposts, follows, blocks, the v3 record tables); `predicate` names the
+/// table `t`.
 async fn delete_graph_batch(conn: &mut PgConnection, table: &str, predicate: &str, did: &str) -> Result<u64, sqlx::Error> {
+    delete_keys_batch(conn, table, &["author", "rkey"], predicate, did).await
+}
+
+/// [`delete_batch`] for a table keyed by the columns `keys`; `predicate`
+/// names the table `t`.
+async fn delete_keys_batch(conn: &mut PgConnection, table: &str, keys: &[&str], predicate: &str, did: &str) -> Result<u64, sqlx::Error> {
+    let selected: Vec<String> = keys.iter().map(|k| format!("t.{k}")).collect();
     let sql = format!(
-        "DELETE FROM {table} WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM {table} t WHERE {predicate} LIMIT {BATCH})"
+        "DELETE FROM {table} WHERE ({}) IN (SELECT {} FROM {table} t WHERE {predicate} LIMIT {BATCH})",
+        keys.join(", "),
+        selected.join(", ")
     );
     Ok(sqlx::query(&sql).bind(did).execute(conn).await?.rows_affected())
 }
@@ -798,7 +799,7 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Resu
         non_member("ts.did")
     );
     n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
-    n += delete_batch(conn, "list_blocks", "uri", "author_did = $1", did).await?;
+    n += delete_graph_batch(conn, "list_blocks", "t.author = (SELECT id FROM dids WHERE did = $1)", did).await?;
     Ok(n)
 }
 
@@ -820,12 +821,9 @@ async fn member_removed_off_batch(conn: &mut PgConnection, did: &str) -> Result<
         let predicate = format!("t.author = (SELECT id FROM dids WHERE did = $1) AND NOT {removed_in_r}{spare}");
         n += delete_graph_batch(conn, table, &predicate, did).await?;
     }
-    for (table, column) in [
-        ("lists", "creator_did"),
-        ("list_items", "author_did"),
-        ("list_optouts", "author_did"),
-    ] {
-        n += delete_batch(conn, table, "uri", &format!("{column} = $1 AND NOT {removed_in_r}"), did).await?;
+    for table in ["lists", "list_items", "list_optouts"] {
+        let predicate = format!("t.author = (SELECT id FROM dids WHERE did = $1) AND NOT {removed_in_r}");
+        n += delete_graph_batch(conn, table, &predicate, did).await?;
     }
     // Follows name their accounts by id; `ta` and `ts` are the author's and
     // subject's DID rows.
@@ -938,11 +936,10 @@ mod tests {
                 "INSERT INTO drafts (owner_did, id, draft) VALUES ($1, '3k', '{}')",
                 "INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply) VALUES ($1, 'did:plc:x', true, false)",
                 "INSERT INTO notification_preferences_v2 (did, prefs) VALUES ($1, '{}')",
-                "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) \
-                 VALUES ('at://' || $1 || '/app.bsky.graph.list/1', $1, '1', 'c', '3k', 'n', 'p', '{}', now())",
             ] {
                 sqlx::query(sql).bind(viewer).execute(p).await.expect(sql);
             }
+            crate::test_support::records::list(p, viewer, "3klist2222222", "n", "p").await;
         }
 
         let mut sets = ScopeSets::default();
@@ -1001,18 +998,8 @@ mod tests {
         crate::test_support::posts::plain(p, SCOPED, "1", "").await;
         // Every v3 record table, a pack's derived counts, the account's own
         // private state, and a subscription someone else holds on it.
+        authored_records(p, SCOPED).await;
         let authored = [
-            "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES ('at://' || $1 || '/l/1', $1, '1', 'c', '3k', 'n', 'p', '{}', now())",
-            "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES ('at://' || $1 || '/li/1', $1, '1', 'c', '3k', 'l', 'did:plc:x', now())",
-            "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lb/1', $1, '1', 'c', '3k', 'l', now())",
-            "INSERT INTO list_optouts (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lo/1', $1, '1', 'c', '3k', 'l', now())",
-            "INSERT INTO starter_packs (uri, creator_did, rkey, cid, rev, name, list_uri, record, created_at) VALUES ('at://' || $1 || '/sp/1', $1, '1', 'c', '3k', 'n', 'l', '{}', now())",
-            "INSERT INTO starter_pack_counts (pack_uri, all_time_source, refreshed_at) VALUES ('at://' || $1 || '/sp/1', 'local', now())",
-            "INSERT INTO labeler_services (uri, creator_did, cid, rev, policies, record, created_at) VALUES ('at://' || $1 || '/ls/self', $1, 'c', '3k', '{}', '{}', now())",
-            "INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) VALUES ('at://' || $1 || '/s/self', $1, 's', 'c', '3k', '{}')",
-            "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, record, created_at) VALUES ('at://' || $1 || '/tg/1', $1, '1', 'c', '3k', 'p', '{}', now())",
-            "INSERT INTO postgates (uri, author_did, rkey, cid, rev, post_uri, record, created_at) VALUES ('at://' || $1 || '/pg/1', $1, '1', 'c', '3k', 'p', '{}', now())",
-            "INSERT INTO nearhorizon_poll_posts (uri, author_did, rkey, cid, rev, text, options, visibility, record, created_at) VALUES ('at://' || $1 || '/pp/1', $1, '1', 'c', '3k', 't', '[]', 'public', '{}', now())",
             "INSERT INTO bookmarks (viewer_did, post_uri, post_cid) VALUES ($1, 'at://x/app.bsky.feed.post/1', 'c')",
             "INSERT INTO activity_subscriptions (subscriber_did, subject_did, post, reply) VALUES ('did:plc:x', $1, true, false)",
         ];
@@ -1046,6 +1033,7 @@ mod tests {
             "nearhorizon_poll_posts",
             "bookmarks",
             "activity_subscriptions",
+            "odd_refs",
         ] {
             assert_eq!(count(p, &format!("SELECT count(*) FROM {table}")).await, 0, "{table}");
         }
@@ -1053,6 +1041,26 @@ mod tests {
         // Idempotent through the lifecycle hook.
         PurgeLifecycle::new(purger).account_deleted(SCOPED).await.expect("again");
         db.drop_db().await;
+    }
+
+    /// One record of every v3 record table by `did`, each odd reference
+    /// with its text, and its pack's derived counts.
+    async fn authored_records(p: &PgPool, did: &str) {
+        use crate::test_support::records;
+        let list = records::list(p, did, "3klist2222222", "n", "app.bsky.graph.defs#modlist").await;
+        records::list_item(p, did, "3kitem2222222", &list, "did:plc:x").await;
+        // Odd subjects, which keep their text.
+        records::list_block(p, did, "3kblock222222", "at://x/app.bsky.graph.list/l").await;
+        records::optout(p, did, "3koptout22222", "at://x/app.bsky.graph.list/l").await;
+        let pack = records::starter_pack(p, did, "3kpack2222222", "n", &list).await;
+        records::pack_counts(p, &pack, 1, 1).await;
+        records::labeler(p, did, &serde_json::json!({"$type": "app.bsky.labeler.service", "policies": {}})).await;
+        records::self_record(p, did, "app.bsky.actor.status", &serde_json::json!({"$type": "app.bsky.actor.status", "status": "x"})).await;
+        let post = format!("at://{did}/app.bsky.feed.post/3kpost2222222");
+        records::threadgate(p, did, "3kpost2222222", &post, None, &[]).await;
+        records::postgate(p, did, "3kpost2222222", &post, None, &[]).await;
+        let poll = serde_json::json!({"$type": "app.nearhorizon.poll.post", "text": "t", "options": [], "visibility": "public"});
+        records::put(p, did, "app.nearhorizon.poll.post", "3kpoll2222222", &poll).await;
     }
 
     /// What a removed member left behind, by kind (T-19).
@@ -1076,17 +1084,15 @@ mod tests {
         let liked = format!("at://{OUTSIDER}/app.bsky.feed.post/1");
         crate::test_support::interactions::like(p, MEMBER, "l1", &liked).await;
         crate::test_support::interactions::repost(p, MEMBER, "r1", &liked).await;
-        let authored = |sql: &str| sql.replace("$1", &format!("'{MEMBER}'"));
-        for sql in [
-            authored("INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES ('at://' || $1 || '/l/1', $1, '1', 'c', '3k', 'n', 'p', '{}', now())"),
-            authored("INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES ('at://' || $1 || '/li/1', $1, '1', 'c', '3k', 'l', 'did:plc:x', now())"),
-            authored("INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lb/1', $1, '1', 'c', '3k', 'l', now())"),
-            authored("INSERT INTO list_optouts (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES ('at://' || $1 || '/lo/1', $1, '1', 'c', '3k', 'l', now())"),
-            authored("INSERT INTO member_post_refs (uri, author_did, rev, created_at) VALUES ('at://' || $1 || '/app.bsky.feed.post/1', $1, '3k', now())"),
-            authored("INSERT INTO actors (did, display_name, profile_record, profile_rev) VALUES ($1, 'M', '{}'::jsonb, '3k')"),
-        ] {
-            exec(p, &sql).await;
+        {
+            use crate::test_support::records;
+            let list = records::list(p, MEMBER, "3klist2222222", "n", "app.bsky.graph.defs#modlist").await;
+            records::list_item(p, MEMBER, "3kitem2222222", &list, "did:plc:x").await;
+            records::list_block(p, MEMBER, "3kblock222222", "at://x/app.bsky.graph.list/l").await;
+            records::optout(p, MEMBER, "3koptout22222", "at://x/app.bsky.graph.list/l").await;
+            records::post_ref(p, &format!("at://{MEMBER}/app.bsky.feed.post/3kpost2222222"), "3kaaaaaaaaaaa", (None, None, None), "now()").await;
         }
+        exec(p, &format!("INSERT INTO actors (did, display_name, profile_record, profile_rev) VALUES ('{MEMBER}', 'M', '{{}}'::jsonb, '3k')")).await;
     }
 
     fn purger_in(p: &PgPool, mode: crate::indexing::PublicMode) -> (ScopeState, Purger) {
@@ -1215,14 +1221,7 @@ mod tests {
             for (rkey, author, subject) in [("mn", MEMBER, OTHER_MEMBER), ("mx", MEMBER, OUTSIDER), ("ym", SCOPED, MEMBER), ("nm", OTHER_MEMBER, MEMBER)] {
                 crate::test_support::graph::block(p, author, subject, rkey).await;
             }
-            for sql in [
-                format!(
-                    "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) \
-                     VALUES ('at://{MEMBER}/app.bsky.graph.listblock/1', '{MEMBER}', '1', 'c', '3k', 'l', now())"
-                ),
-            ] {
-                exec(p, &sql).await;
-            }
+            crate::test_support::records::list_block(p, MEMBER, "3kblock222222", "at://x/app.bsky.graph.list/l").await;
             let (_, purger) = purger_in(p, mode);
             purger.purge(MEMBER, PurgeKind::MemberRemoved).await.expect("purge");
             let left = rkeys_of(p, "blocks").await;
@@ -1239,9 +1238,10 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        exec(p, "INSERT INTO member_post_refs (uri, author_did, rev, created_at) VALUES \
-                 ('at://did:plc:dddddddddddddddddddddddd/app.bsky.feed.post/1', 'did:plc:dddddddddddddddddddddddd', '3k', now()), \
-                 ('at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/1', 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', '3k', now())").await;
+        for did in ["did:plc:dddddddddddddddddddddddd", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"] {
+            let uri = format!("at://{did}/app.bsky.feed.post/3kpost2222222");
+            crate::test_support::records::post_ref(p, &uri, "3kaaaaaaaaaaa", (None, None, None), "now()").await;
+        }
         let scope = ScopeState::new(ScopeSets::default(), ScopePolicy::MembersAndOneHop, 10);
         let purger = Purger::new(p.clone(), scope, Arc::new(DisabledPrivateTier));
         purger.purge(SCOPED, PurgeKind::AccountDeleted).await.expect("purge");

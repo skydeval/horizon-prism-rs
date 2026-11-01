@@ -31,11 +31,16 @@ impl Hydrator {
     /// (also with no record) needs `me` to follow the subject, `mutuals`
     /// the follow back as well, `none` nobody.
     pub(crate) async fn may_subscribe(&self, me: &str, subject: &str) -> Result<bool, sqlx::Error> {
-        let record: Option<Value> = sqlx::query_scalar("SELECT record FROM actor_self_records WHERE did = $1 AND collection = $2")
-            .bind(subject)
-            .bind(NSID_DECLARATION)
-            .fetch_optional(self.pool())
-            .await?;
+        let stored: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT r.record FROM actor_self_records r JOIN dids d ON d.id = r.author WHERE d.did = $1 AND r.coll = $2")
+                .bind(subject)
+                .bind(crate::db::ids::COLL_DECLARATION)
+                .fetch_optional(self.pool())
+                .await?;
+        let record: Option<Value> = match stored {
+            Some(bytes) => Some(crate::db::records::decode_value(self.pool(), &bytes).await?),
+            None => None,
+        };
         let allow = record
             .as_ref()
             .and_then(|r| r.get("allowSubscriptions"))
@@ -186,7 +191,7 @@ impl Hydrator {
 mod tests {
     use super::*;
     use crate::aggregations::ScopeSets;
-    use crate::hydration::testing::{actor, exec, hydrator};
+    use crate::hydration::testing::{actor, hydrator};
     use crate::test_support::fresh_db;
 
     const ME: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -218,12 +223,14 @@ mod tests {
         let follow = |from: &'static str, to: &'static str| async move {
             crate::test_support::graph::follow(p, from, to, &to[8..12]).await;
         };
-        let declare = |did: &'static str, allow: &'static str| async move {
-            exec(p, &format!(
-                "INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) VALUES \
-                 ('at://{did}/{NSID_DECLARATION}/self', '{did}', '{NSID_DECLARATION}', 'bafyd', '3k', '{{\"allowSubscriptions\": \"{allow}\"}}') \
-                 ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record"
-            )).await;
+        // Each declaration at a newer rev than the last, as a newer write.
+        let revs = std::sync::atomic::AtomicUsize::new(0);
+        let declare = |did: &'static str, allow: &'static str| {
+            let rev = crate::test_support::posts::tid(revs.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            async move {
+                let record = serde_json::json!({"$type": NSID_DECLARATION, "allowSubscriptions": allow});
+                crate::test_support::records::put_record(p, did, NSID_DECLARATION, "self", "bafyd", &rev, &record).await;
+            }
         };
         let put = |subject: &'static str, post: bool, reply: bool| {
             let (h, me) = (&h, &me);

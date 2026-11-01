@@ -19,14 +19,16 @@
 //! waited for while a backend is still building it, and dropped otherwise.
 //! A failed build is retried after a backoff that doubles up to an hour.
 //!
-//! **Phase 3: post records compressed.** Once the instance holds
-//! [`TRAIN_RECORDS`] posts, a dictionary is trained from the earliest of
-//! them and stored in `record_dicts`; writes use it from then on. Then the
-//! rows still stored as dict 0 (the JSON text) are rewritten with it, in
-//! keyset batches by `(author, rkey)`, each update guarded by the rev and
-//! the dict byte it read, so a newer write, a delete or a purge in between
-//! makes it a no-op and nothing deleted comes back. Progress is kept in
-//! `worker_state` (`records:recompress_posts`).
+//! **Phase 3: records compressed**, one record family at a time, the
+//! families side by side: posts, and the other kept records (lists, starter
+//! packs, gates, polls, labeler services, self records). Once the instance
+//! holds [`TRAIN_RECORDS`] records of a family, a dictionary is trained from
+//! the earliest of them and stored in `record_dicts`; writes use it from
+//! then on. Then the rows still stored as dict 0 (the JSON text) are
+//! rewritten with it, table by table in keyset batches by key, each update
+//! guarded by the rev and the dict byte it read, so a newer write, a delete
+//! or a purge in between makes it a no-op and nothing deleted comes back.
+//! Progress is kept in `worker_state` (`records:recompress_<table>`).
 //!
 //! Until the task finishes, search runs without its indexes, and trends
 //! wait for the tag index.
@@ -67,6 +69,65 @@ const TRAIN_RETRY: Duration = Duration::from_secs(3600);
 pub const KEY_RECOMPRESS: &str = "records:recompress_posts";
 /// `record_recompress_remaining`: an estimate of post rows not yet visited.
 pub const METRIC_RECOMPRESS_REMAINING: &str = "record_recompress_remaining";
+/// `other_record_recompress_remaining`: an estimate of the other kept
+/// records' rows not yet visited.
+pub const METRIC_OTHER_RECOMPRESS_REMAINING: &str = "other_record_recompress_remaining";
+
+/// A table whose rows keep their record, as the recompression visits it:
+/// keyed by `author` and `key` (a column, or `None` for a table keyed by its
+/// author alone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordTable {
+    pub table: &'static str,
+    pub key: Option<&'static str>,
+}
+
+impl RecordTable {
+    const fn rkey(table: &'static str) -> Self {
+        Self { table, key: Some("rkey") }
+    }
+
+    /// SQL: the row's second key over alias `t`, as a bigint.
+    fn key_sql(self) -> String {
+        self.key.map_or_else(|| "0::bigint".to_string(), |k| format!("t.{k}::bigint"))
+    }
+
+    /// Its progress key in `worker_state`.
+    fn progress_key(self) -> String {
+        format!("records:recompress_{}", self.table)
+    }
+}
+
+/// A record family's tables, with what the family trains from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordFamily {
+    pub family: &'static str,
+    pub tables: &'static [RecordTable],
+    /// `record_recompress_remaining`-style gauge of the family.
+    metric: &'static str,
+}
+
+/// The posts.
+pub const POSTS: RecordFamily = RecordFamily {
+    family: super::records::FAMILY_POSTS,
+    tables: &[RecordTable::rkey("posts")],
+    metric: METRIC_RECOMPRESS_REMAINING,
+};
+
+/// The other kept records.
+pub const OTHER: RecordFamily = RecordFamily {
+    family: super::records::FAMILY_OTHER,
+    tables: &[
+        RecordTable::rkey("lists"),
+        RecordTable::rkey("starter_packs"),
+        RecordTable::rkey("threadgates"),
+        RecordTable::rkey("postgates"),
+        RecordTable::rkey("nearhorizon_poll_posts"),
+        RecordTable { table: "labeler_services", key: None },
+        RecordTable { table: "actor_self_records", key: Some("coll") },
+    ],
+    metric: METRIC_OTHER_RECOMPRESS_REMAINING,
+};
 /// `posts_dead_rows`: dead tuples in `posts`, which the rewrites leave until
 /// a vacuum (or a repack) takes them.
 pub const METRIC_POSTS_DEAD_ROWS: &str = "posts_dead_rows";
@@ -218,14 +279,39 @@ async fn actors_batch(pool: &PgPool, after: &str, limit: i64) -> Result<Option<(
 ///
 /// Database errors, and a stored record that does not decode.
 pub async fn train_posts_dict(pool: &PgPool) -> Result<Option<i16>, sqlx::Error> {
+    train_dict(pool, POSTS).await
+}
+
+/// SQL: the records a family trains from, its earliest stored first.
+fn samples_sql(family: RecordFamily) -> String {
+    let arms: Vec<String> = family
+        .tables
+        .iter()
+        .map(|t| {
+            // Self records keep no creation time; their first-seen time
+            // stands in.
+            let at = if t.table == "actor_self_records" { "indexed_at" } else { "created_at" };
+            format!("SELECT record, {at} AS at FROM {}", t.table)
+        })
+        .collect();
+    format!("SELECT record FROM ({}) r ORDER BY at LIMIT $1", arms.join(" UNION ALL "))
+}
+
+/// Train a family's dictionary, when none is stored yet and the instance
+/// holds [`TRAIN_RECORDS`] of its records: its id, or `None`.
+///
+/// # Errors
+///
+/// Database errors, and a stored record that does not decode.
+pub async fn train_dict(pool: &PgPool, family: RecordFamily) -> Result<Option<i16>, sqlx::Error> {
     let have: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM record_dicts WHERE family = $1)")
-        .bind(super::records::FAMILY_POSTS)
+        .bind(family.family)
         .fetch_one(pool)
         .await?;
     if have {
         return Ok(None);
     }
-    let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT record FROM posts ORDER BY created_at LIMIT $1").bind(TRAIN_RECORDS).fetch_all(pool).await?;
+    let stored: Vec<Vec<u8>> = sqlx::query_scalar(&samples_sql(family)).bind(TRAIN_RECORDS).fetch_all(pool).await?;
     if i64::try_from(stored.len()).unwrap_or(0) < TRAIN_RECORDS {
         return Ok(None);
     }
@@ -236,19 +322,19 @@ pub async fn train_posts_dict(pool: &PgPool) -> Result<Option<i16>, sqlx::Error>
     let dict = match super::ids::train_dict(&samples, DICT_BYTES) {
         Ok(dict) => dict,
         Err(error) => {
-            tracing::warn!(event = "record_dict_training_failed", %error, "the posts dictionary could not be trained");
+            tracing::warn!(event = "record_dict_training_failed", family = family.family, %error, "a record dictionary could not be trained");
             return Ok(None);
         }
     };
     let id: i16 = sqlx::query_scalar(
         "INSERT INTO record_dicts (id, family, bytes) SELECT COALESCE(max(id), 0) + 1, $1, $2 FROM record_dicts RETURNING id",
     )
-    .bind(super::records::FAMILY_POSTS)
+    .bind(family.family)
     .bind(&dict)
     .fetch_one(pool)
     .await?;
     super::records::reload(pool).await?;
-    tracing::info!(event = "record_dict_trained", id, family = super::records::FAMILY_POSTS, bytes = dict.len(), "a record dictionary was trained");
+    tracing::info!(event = "record_dict_trained", id, family = family.family, bytes = dict.len(), "a record dictionary was trained");
     Ok(Some(id))
 }
 
@@ -262,17 +348,19 @@ struct Rewrites {
     records: Vec<Vec<u8>>,
 }
 
-/// Read one recompression batch after `after` (`author:rkey`): the last key
-/// read, the rows read, and the rows stored as dict 0 with their records
-/// encoded again; `None` at the end of the table.
-async fn recompress_read(pool: &PgPool, after: &str, limit: i64) -> Result<Option<(String, i64, Rewrites)>, sqlx::Error> {
+/// Read one recompression batch of `table` after `after` (`author:key`):
+/// the last key read, the rows read, and the rows stored as dict 0 with
+/// their records encoded again in `family`; `None` at the end of the table.
+async fn recompress_read(pool: &PgPool, family: &str, table: RecordTable, after: &str, limit: i64) -> Result<Option<(String, i64, Rewrites)>, sqlx::Error> {
     let (author, rkey) = after
         .split_once(':')
         .and_then(|(a, k)| Some((a.parse::<i32>().ok()?, k.parse::<i64>().ok()?)))
         .unwrap_or((i32::MIN, i64::MIN));
-    let rows: Vec<(i32, i64, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT author, rkey, rev, record FROM posts WHERE (author, rkey) > ($1, $2) ORDER BY author, rkey LIMIT $3",
-    )
+    let key = table.key_sql();
+    let rows: Vec<(i32, i64, i64, Vec<u8>)> = sqlx::query_as(&format!(
+        "SELECT t.author, {key}, t.rev, t.record FROM {} t WHERE (t.author, {key}) > ($1, $2) ORDER BY t.author, {key} LIMIT $3",
+        table.table
+    ))
     .bind(author)
     .bind(rkey)
     .bind(limit)
@@ -287,7 +375,7 @@ async fn recompress_read(pool: &PgPool, after: &str, limit: i64) -> Result<Optio
             continue;
         }
         let text = super::records::decode(pool, stored).await?;
-        let packed = super::records::encode_text(pool, super::records::FAMILY_POSTS, &text).await?;
+        let packed = super::records::encode_text(pool, family, &text).await?;
         if packed.first() == Some(&0) {
             continue;
         }
@@ -301,15 +389,17 @@ async fn recompress_read(pool: &PgPool, after: &str, limit: i64) -> Result<Optio
 
 /// Write a batch's rewrites: a row whose rev moved on, or that is no longer
 /// dict 0, or no longer there, is left as it is.
-async fn recompress_write(pool: &PgPool, rewrites: &Rewrites) -> Result<u64, sqlx::Error> {
+async fn recompress_write(pool: &PgPool, table: RecordTable, rewrites: &Rewrites) -> Result<u64, sqlx::Error> {
     if rewrites.authors.is_empty() {
         return Ok(0);
     }
-    Ok(sqlx::query(
-        "UPDATE posts p SET record = v.record \
+    Ok(sqlx::query(&format!(
+        "UPDATE {} t SET record = v.record \
          FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::bytea[]) AS v(author, rkey, rev, record) \
-         WHERE p.author = v.author AND p.rkey = v.rkey AND p.rev = v.rev AND get_byte(p.record, 0) = 0",
-    )
+         WHERE t.author = v.author AND {} = v.rkey AND t.rev = v.rev AND get_byte(t.record, 0) = 0",
+        table.table,
+        table.key_sql()
+    ))
     .bind(&rewrites.authors)
     .bind(&rewrites.rkeys)
     .bind(&rewrites.revs)
@@ -321,11 +411,11 @@ async fn recompress_write(pool: &PgPool, rewrites: &Rewrites) -> Result<u64, sql
 
 /// One recompression batch after `after`: the last key read and the rows
 /// read, or `None` at the end of the table.
-async fn recompress_batch(pool: &PgPool, after: &str, limit: i64) -> Result<Option<(String, i64)>, sqlx::Error> {
-    let Some((last, rows, rewrites)) = recompress_read(pool, after, limit).await? else {
+async fn recompress_batch(pool: &PgPool, family: &str, table: RecordTable, after: &str, limit: i64) -> Result<Option<(String, i64)>, sqlx::Error> {
+    let Some((last, rows, rewrites)) = recompress_read(pool, family, table, after, limit).await? else {
         return Ok(None);
     };
-    recompress_write(pool, &rewrites).await?;
+    recompress_write(pool, table, &rewrites).await?;
     Ok(Some((last, rows)))
 }
 
@@ -508,49 +598,68 @@ impl SchemaBackfill {
         Ok(())
     }
 
-    /// Phase 3: train the posts dictionary once there are records enough,
-    /// waiting for them, then rewrite the rows stored as dict 0 with it.
+    /// Phase 3 for one family: train its dictionary once there are records
+    /// enough, waiting for them, then rewrite the rows stored as dict 0 with
+    /// it, table by table.
     ///
     /// # Errors
     ///
     /// Any database error other than a lost lock race.
-    pub async fn run_recompression(&self) -> Result<(), sqlx::Error> {
-        let mut progress = load_progress(&self.pool, KEY_RECOMPRESS).await?;
-        if progress.done {
+    pub async fn run_recompression(&self, family: RecordFamily) -> Result<(), sqlx::Error> {
+        let mut pending = Vec::new();
+        for table in family.tables {
+            let key = if family == POSTS { KEY_RECOMPRESS.to_string() } else { table.progress_key() };
+            let progress = load_progress(&self.pool, &key).await?;
+            if !progress.done {
+                pending.push((*table, key, progress));
+            }
+        }
+        if pending.is_empty() {
             return Ok(());
         }
-        while super::records::current_id(&self.pool, super::records::FAMILY_POSTS).await? == 0 {
-            if train_posts_dict(&self.pool).await?.is_none() {
+        while super::records::current_id(&self.pool, family.family).await? == 0 {
+            if train_dict(&self.pool, family).await?.is_none() {
                 tokio::time::sleep(TRAIN_RETRY).await;
             }
         }
         let limit = i64::from(self.cfg.batch_size.max(1));
-        let estimate = estimated_rows(&self.pool, "posts").await;
-        while !progress.done {
-            match recompress_batch(&self.pool, &progress.cursor, limit).await {
-                Ok(Some((last, rows))) => {
-                    progress.cursor = last;
-                    progress.visited += rows;
+        let mut estimate = 0;
+        for (table, _, _) in &pending {
+            estimate += estimated_rows(&self.pool, table.table).await;
+        }
+        let mut visited = 0;
+        for (table, key, mut progress) in pending {
+            while !progress.done {
+                match recompress_batch(&self.pool, family.family, table, &progress.cursor, limit).await {
+                    Ok(Some((last, rows))) => {
+                        progress.cursor = last;
+                        progress.visited += rows;
+                        visited += rows;
+                    }
+                    Ok(None) => progress.done = true,
+                    Err(e) if lost_a_lock_race(&e) => {
+                        tokio::time::sleep(LOCK_RETRY).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Ok(None) => progress.done = true,
-                Err(e) if lost_a_lock_race(&e) => {
-                    tokio::time::sleep(LOCK_RETRY).await;
-                    continue;
+                save_progress(&self.pool, &key, &progress).await?;
+                metrics::gauge!(family.metric).set((estimate - visited).max(0) as f64);
+                if !progress.done {
+                    tokio::time::sleep(Duration::from_millis(self.cfg.pause_ms)).await;
                 }
-                Err(e) => return Err(e),
-            }
-            save_progress(&self.pool, KEY_RECOMPRESS, &progress).await?;
-            let remaining = if progress.done { 0 } else { (estimate - progress.visited).max(0) };
-            metrics::gauge!(METRIC_RECOMPRESS_REMAINING).set(remaining as f64);
-            if !progress.done {
-                tokio::time::sleep(Duration::from_millis(self.cfg.pause_ms)).await;
             }
         }
-        let dead: Option<i64> = sqlx::query_scalar("SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname = 'posts'")
-            .fetch_optional(&self.pool)
-            .await?;
-        metrics::gauge!(METRIC_POSTS_DEAD_ROWS).set(dead.unwrap_or(0) as f64);
-        tracing::info!(event = "record_recompress_done", rows = progress.visited, dead_rows = dead.unwrap_or(0), "post records are compressed");
+        metrics::gauge!(family.metric).set(0.0);
+        if family == POSTS {
+            let dead: Option<i64> = sqlx::query_scalar("SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname = 'posts'")
+                .fetch_optional(&self.pool)
+                .await?;
+            metrics::gauge!(METRIC_POSTS_DEAD_ROWS).set(dead.unwrap_or(0) as f64);
+            tracing::info!(event = "record_recompress_done", family = family.family, rows = visited, dead_rows = dead.unwrap_or(0), "post records are compressed");
+        } else {
+            tracing::info!(event = "record_recompress_done", family = family.family, rows = visited, "records are compressed");
+        }
         Ok(())
     }
 
@@ -564,7 +673,10 @@ impl SchemaBackfill {
                 let result = async {
                     self.run_column_backfill().await?;
                     self.run_index_builds().await?;
-                    self.run_recompression().await
+                    // Each family waits for its own records; neither holds
+                    // the other back.
+                    tokio::try_join!(self.run_recompression(POSTS), self.run_recompression(OTHER))?;
+                    Ok::<(), sqlx::Error>(())
                 }
                 .await;
                 match result {
@@ -704,13 +816,14 @@ mod tests {
         sqlx::query("INSERT INTO record_dicts (id, family, bytes) VALUES (1, 'posts', $1)").bind(&dict).execute(p).await.expect("dict");
         crate::db::records::reload(p).await.expect("reload");
 
-        let (_, read, rewrites) = recompress_read(p, "", 100).await.expect("read").expect("rows");
+        let posts_table = POSTS.tables[0];
+        let (_, read, rewrites) = recompress_read(p, POSTS.family, posts_table, "", 100).await.expect("read").expect("rows");
         assert_eq!((read, rewrites.authors.len()), (3, 3));
         // Between the read and the write: one post is written again, one
         // deleted.
         posts::edit(p, &uris[1], |r| r["text"] = json!("rewritten")).await;
         sqlx::query(&format!("DELETE FROM posts WHERE {}", posts::key_is("", &uris[2]))).execute(p).await.expect("delete");
-        assert_eq!(recompress_write(p, &rewrites).await.expect("write"), 1);
+        assert_eq!(recompress_write(p, posts_table, &rewrites).await.expect("write"), 1);
         let dict_of = |uri: String| async move {
             sqlx::query_scalar::<_, Vec<u8>>(&format!("SELECT record FROM posts WHERE {}", posts::key_is("", &uri)))
                 .fetch_one(p)
@@ -725,12 +838,55 @@ mod tests {
 
         // The task runs the rest to its end, and once only.
         let t = task(p, 2);
-        t.run_recompression().await.expect("recompress");
+        t.run_recompression(POSTS).await.expect("recompress");
         assert!(load_progress(p, KEY_RECOMPRESS).await.expect("progress").done);
-        t.run_recompression().await.expect("again");
+        t.run_recompression(POSTS).await.expect("again");
 
         // A dictionary that is not stored is an error, never an empty record.
         assert!(matches!(crate::db::records::decode(p, &[9, 1, 2, 3]).await, Err(sqlx::Error::Decode(_))));
+        db.drop_db().await;
+    }
+
+    /// The other kept records: stored as dict 0, trained from once there
+    /// are enough of them, then rewritten table by table, a self record
+    /// and a labeler service (keyed without an rkey) among them.
+    #[tokio::test]
+    async fn other_records_are_compressed_table_by_table() {
+        use crate::test_support::records;
+
+        let Some(db) = fresh_db("schema_backfill_recompress_other").await else {
+            return;
+        };
+        let p = &db.pool;
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let list = records::list(p, did, "3klist2222222", "Rust people", "app.bsky.graph.defs#curatelist").await;
+        let declaration = json!({"$type": "app.bsky.notification.declaration", "allowSubscriptions": "followers"});
+        let own = records::self_record(p, did, "app.bsky.notification.declaration", &declaration).await;
+        let labeler = records::labeler(p, did, &json!({"$type": "app.bsky.labeler.service", "policies": {"labelValues": ["spam"]}})).await;
+        assert_eq!(train_dict(p, OTHER).await.expect("train"), None, "too few records to train from");
+        let before = records::record(p, "lists", &list).await.expect("dict 0 reads");
+
+        let samples: Vec<Vec<u8>> = (0..500)
+            .map(|i| json!({"$type": "app.bsky.graph.list", "name": format!("list {i}"), "purpose": "app.bsky.graph.defs#curatelist"}).to_string().into_bytes())
+            .collect();
+        let dict = crate::db::ids::train_dict(&samples, 16 * 1024).expect("dictionary");
+        sqlx::query("INSERT INTO record_dicts (id, family, bytes) VALUES (1, 'other', $1)").bind(&dict).execute(p).await.expect("dict");
+        crate::db::records::reload(p).await.expect("reload");
+
+        let t = task(p, 1);
+        t.run_recompression(OTHER).await.expect("recompress");
+        for (table, uri) in [("lists", &list), ("actor_self_records", &own), ("labeler_services", &labeler)] {
+            let stored: Vec<u8> = sqlx::query_scalar(&format!("SELECT record FROM {table} WHERE {}", records::key_is(table, "", uri)))
+                .fetch_one(p)
+                .await
+                .expect("record");
+            assert_eq!(stored[0], 1, "{table}: rewritten with the dictionary");
+            assert!(load_progress(p, &format!("records:recompress_{table}")).await.expect("progress").done, "{table}");
+        }
+        assert_eq!(records::record(p, "lists", &list).await, Some(before));
+        assert_eq!(records::record(p, "actor_self_records", &own).await, Some(declaration));
+        // Done: a second run reads nothing.
+        t.run_recompression(OTHER).await.expect("again");
         db.drop_db().await;
     }
 

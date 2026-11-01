@@ -19,6 +19,22 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Smaller list, starter pack, gate, poll, labeler and settings tables.**
+  Lists, list entries, list blocks and opt-outs, starter packs and their
+  joined counts, threadgates and postgates, polls, labeler services,
+  account settings records (notification declaration, status, content
+  visibility) and members' post references are stored by account id and
+  record key. A record that is shown whole keeps its whole record,
+  compressed in the background once 10,000 such records are stored. Lists,
+  list entries, starter packs and polls made at the same moment may list in
+  a different order. A list entry naming a list whose record key is not
+  valid is no longer indexed; a list block whose subject is not a plain
+  list address is kept but no longer blocks through that list, nor shows
+  in `getListBlocks`; a post reference names only accounts with a
+  valid DID. **Upgrade:** start once with `APP_ALLOW_STARTUP_MIGRATE=1`
+  (migration 0059 rewrites the twelve tables in one transaction; it needs
+  free space for a second copy of them). A public sweep in progress starts
+  these tables again.
 - **Faster reads of stored keys.** Turning a stored record key, rev or
   reference back into text is several times faster, so jobs that read many
   rows at once no longer slow down. **Upgrade:** start once with

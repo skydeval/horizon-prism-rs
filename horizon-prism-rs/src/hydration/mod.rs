@@ -372,9 +372,9 @@ fn apply_known_blocks(out: &mut ActorViewer, me: &str, dids: &[String]) {
     }
 }
 
-/// A locally servable list, for a `listViewBasic`: uri, cid, name,
-/// purpose, avatar CID, indexed time, and its creator's PDS.
-type LocalListRow = (String, String, String, String, Option<String>, DateTime<Utc>, Option<String>);
+/// A locally servable list, for a `listViewBasic`: uri, cid, purpose,
+/// record, indexed time, and its creator's PDS.
+type LocalListRow = (String, Vec<u8>, String, Vec<u8>, DateTime<Utc>, Option<String>);
 
 /// When a list reference `r` to the list row `l` **applies** (design-v3
 /// §4.3 "Effective references", "List purpose"): it is admitted, a sync
@@ -1053,11 +1053,14 @@ impl Hydrator {
         if uris.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows: Vec<LocalListRow> = sqlx::query_as(
-            "SELECT l.uri, l.cid, l.name, l.purpose, l.avatar_cid, l.indexed_at, a.pds_endpoint FROM lists l \
-             JOIN members m ON m.did = l.creator_did AND m.ready_at IS NOT NULL \
-             LEFT JOIN actors a ON a.did = l.creator_did WHERE l.uri = ANY($1)",
-        )
+        let rows: Vec<LocalListRow> = sqlx::query_as(&format!(
+            "SELECT u.uri, l.cid, l.purpose, l.record, l.indexed_at, a.pds_endpoint \
+             FROM unnest($1::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) k \
+             JOIN lists l ON k.coll = {} AND l.author = k.author AND l.rkey = k.rkey \
+             JOIN dids d ON d.id = l.author JOIN members m ON m.did = d.did AND m.ready_at IS NOT NULL \
+             LEFT JOIN actors a ON a.did = d.did",
+            crate::db::ids::COLL_LIST
+        ))
         .bind(&uris)
         .fetch_all(self.pool())
         .await?;
@@ -1065,25 +1068,26 @@ impl Hydrator {
         // list view is the same whichever path rendered it (B-73).
         let list_viewer = self.list_viewer_of(me, &uris).await?;
         let labels = self.load_labels(&uris).await?;
-        Ok(rows
-            .into_iter()
-            .map(|(uri, cid, name, purpose, avatar_cid, indexed_at, pds)| {
-                let mut view = json!({
-                    "uri": uri,
-                    "cid": cid,
-                    "name": name,
-                    "purpose": purpose,
-                    "labels": labels.get(&uri).cloned().unwrap_or_default(),
-                    "viewer": list_viewer.view(&uri),
-                    "indexedAt": ts(indexed_at),
-                });
-                let creator = uri_author(&uri).unwrap_or_default();
-                if let Some(url) = avatar_cid.as_deref().and_then(|cid| blob_url(pds.as_deref(), creator, cid)) {
-                    view["avatar"] = json!(url);
-                }
-                (uri, view)
-            })
-            .collect())
+        let mut out = HashMap::with_capacity(rows.len());
+        for (uri, cid, purpose, record, indexed_at, pds) in rows {
+            let record = crate::db::records::decode_value(self.pool(), &record).await?;
+            let mut view = json!({
+                "uri": uri,
+                "cid": crate::db::ids::cid_from_db(&cid),
+                "name": record.get("name").and_then(Value::as_str).unwrap_or_default(),
+                "purpose": purpose,
+                "labels": labels.get(&uri).cloned().unwrap_or_default(),
+                "viewer": list_viewer.view(&uri),
+                "indexedAt": ts(indexed_at),
+            });
+            let creator = uri_author(&uri).unwrap_or_default();
+            let avatar = record.get("avatar").and_then(crate::firehose::normalize::blob_cid);
+            if let Some(url) = avatar.as_deref().and_then(|cid| blob_url(pds.as_deref(), creator, cid)) {
+                view["avatar"] = json!(url);
+            }
+            out.insert(uri, view);
+        }
+        Ok(out)
     }
 
     /// Normalize an upstream view for `viewer` (§8.6): local viewer state
@@ -1210,15 +1214,8 @@ impl Hydrator {
         }
         // A post whose author turned quoting off (design-v3 §8.3): a valid
         // postgate with a `disableRule`. Not for the author's own view.
-        let gated: Vec<String> = sqlx::query_scalar(
-            "SELECT post_uri FROM postgates WHERE post_uri = ANY($1) \
-               AND embedding_rules @> '[{\"$type\": \"app.bsky.feed.postgate#disableRule\"}]'::jsonb \
-               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
-        )
-        .bind(uris)
-        .fetch_all(self.pool())
-        .await?;
-        for uri in gated {
+        let postgates = crate::db::gates::valid(self.pool(), crate::db::gates::Kind::Postgate, uris).await?;
+        for (uri, _) in postgates.into_iter().filter(|(_, g)| g.embedding_disabled()) {
             if uri_author(&uri) != Some(me) {
                 out.entry(uri).or_insert_with(|| json!({}))["embeddingDisabled"] = json!(true);
             }

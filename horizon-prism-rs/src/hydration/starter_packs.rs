@@ -49,7 +49,7 @@ fn pack_not_found() -> ViewError {
     ViewError::new("InvalidRequest", "Starter pack not found")
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 struct PackRow {
     uri: String,
     cid: String,
@@ -59,7 +59,38 @@ struct PackRow {
     created_at: DateTime<Utc>,
 }
 
-const PACK_COLUMNS: &str = "uri, cid, list_uri, record, indexed_at, created_at";
+/// A stored pack as read: URI, CID, list URI, record, `indexed_at`,
+/// `created_at`.
+type StoredPack = (String, Vec<u8>, Option<String>, Vec<u8>, DateTime<Utc>, DateTime<Utc>);
+
+/// SQL: a stored pack's columns, as [`StoredPack`], from `starter_packs s`
+/// joined to its author's `dids` row `d`. The list is its URI text, or an
+/// odd one's text.
+fn pack_columns() -> String {
+    format!(
+        "{} AS uri, s.cid, ref_text(s.list_author, s.list_coll, s.list_rkey, {}::smallint, s.author, s.rkey, {}::smallint) AS list_uri, \
+         s.record, s.indexed_at, s.created_at",
+        crate::db::lists::uri_sql("d.did", NSID_STARTERPACK, "s.rkey"),
+        crate::db::ids::COLL_STARTER_PACK,
+        crate::db::ids::Slot::List.id()
+    )
+}
+
+/// Stored packs from a query over [`pack_columns`], their records decoded.
+async fn stored_packs(pool: &sqlx::PgPool, rows: Vec<StoredPack>) -> Result<Vec<PackRow>, sqlx::Error> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (uri, cid, list_uri, record, indexed_at, created_at) in rows {
+        out.push(PackRow {
+            uri,
+            cid: crate::db::ids::cid_from_db(&cid),
+            list_uri: list_uri.unwrap_or_default(),
+            record: crate::db::records::decode_value(pool, &record).await?,
+            indexed_at,
+            created_at,
+        });
+    }
+    Ok(out)
+}
 
 impl PackRow {
     /// From a fetched `{uri, cid, value}` record.
@@ -89,11 +120,14 @@ type Joined = HashMap<String, (i32, i32)>;
 
 impl Hydrator {
     async fn joined_counts(&self, uris: &[String]) -> Result<Joined, sqlx::Error> {
-        let rows: Vec<(String, i32, i32)> =
-            sqlx::query_as("SELECT pack_uri, joined_week_count, joined_all_time_count FROM starter_pack_counts WHERE pack_uri = ANY($1)")
-                .bind(uris)
-                .fetch_all(self.pool())
-                .await?;
+        let rows: Vec<(String, i32, i32)> = sqlx::query_as(&format!(
+            "SELECT u.uri, c.joined_week_count, c.joined_all_time_count FROM unnest($1::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) k \
+             JOIN starter_pack_counts c ON k.coll = {} AND c.author = k.author AND c.rkey = k.rkey",
+            crate::db::ids::COLL_STARTER_PACK
+        ))
+        .bind(uris)
+        .fetch_all(self.pool())
+        .await?;
         Ok(rows.into_iter().map(|(uri, week, all)| (uri, (week, all))).collect())
     }
 
@@ -101,10 +135,16 @@ impl Hydrator {
     /// and packs of hidden creators are left out.
     async fn load_packs(&self, req: &Requester, uris: &[String]) -> Result<HashMap<String, PackRow>, sqlx::Error> {
         let wanted: Vec<String> = uris.iter().filter(|u| is_pack_uri(u)).cloned().collect();
-        let rows: Vec<PackRow> = sqlx::query_as(&format!("SELECT {PACK_COLUMNS} FROM starter_packs WHERE uri = ANY($1)"))
-            .bind(&wanted)
-            .fetch_all(self.pool())
-            .await?;
+        let found: Vec<StoredPack> = sqlx::query_as(&format!(
+            "SELECT {} FROM unnest($1::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) k \
+             JOIN starter_packs s ON k.coll = {} AND s.author = k.author AND s.rkey = k.rkey JOIN dids d ON d.id = s.author",
+            pack_columns(),
+            crate::db::ids::COLL_STARTER_PACK
+        ))
+        .bind(&wanted)
+        .fetch_all(self.pool())
+        .await?;
+        let rows = stored_packs(self.pool(), found).await?;
         let mut out: HashMap<String, PackRow> = rows.into_iter().map(|r| (r.uri.clone(), r)).collect();
         for uri in &wanted {
             if !out.contains_key(uri)
@@ -219,19 +259,20 @@ impl Hydrator {
         }
         let limit = i64::from(limit.clamp(1, 100));
         let from = format!(
-            " FROM starter_packs sp CROSS JOIN LATERAL (SELECT sp.creator_did AS author_did) n \
-              LEFT JOIN actors a ON a.did = sp.creator_did \
+            " FROM starter_packs sp JOIN dids spd ON spd.id = sp.author CROSS JOIN LATERAL (SELECT spd.did AS author_did) n \
+              LEFT JOIN actors a ON a.did = spd.did \
               WHERE ($1::text IS NULL OR ({exclusions})) \
                 AND sp.search_tsv @@ websearch_to_tsquery('simple', $2) \
-                AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = sp.creator_did) \
+                AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = spd.did) \
                 AND COALESCE(a.account_status, 'active') = 'active' AND ($3 OR {SHOWN_SIGNED_OUT})",
             exclusions = viewer_exclusions(),
         );
         let page = format!(
-            "SELECT sp.uri{from} \
-             ORDER BY COALESCE((SELECT c.joined_all_time_count FROM starter_pack_counts c WHERE c.pack_uri = sp.uri), 0) DESC, \
-                      ts_rank_cd(sp.search_tsv, websearch_to_tsquery('simple', $2)) DESC, sp.uri \
-             LIMIT $4 OFFSET $5"
+            "SELECT {}{from} \
+             ORDER BY COALESCE((SELECT c.joined_all_time_count FROM starter_pack_counts c WHERE c.author = sp.author AND c.rkey = sp.rkey), 0) DESC, \
+                      ts_rank_cd(sp.search_tsv, websearch_to_tsquery('simple', $2)) DESC, sp.author, sp.rkey \
+             LIMIT $4 OFFSET $5",
+            crate::db::lists::uri_sql("spd.did", NSID_STARTERPACK, "sp.rkey")
         );
         let me = viewer.state_did();
         let signed_in = viewer.did.is_some();
@@ -335,13 +376,18 @@ impl Hydrator {
         // The sample and the count: local rows for a locally servable list,
         // an upstream AppView's view of the pack otherwise.
         let (sample, count): (Vec<Value>, Option<i64>) = if local_list {
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT uri, subject_did FROM ( \
-                   SELECT DISTINCT ON (subject_did) uri, subject_did, created_at FROM list_items \
-                   WHERE list_uri = $1 ORDER BY subject_did, created_at, uri) i \
-                 ORDER BY created_at, uri LIMIT $2",
-            )
-            .bind(&row.list_uri)
+            let (list_author, list_rkey) = crate::db::lists::key(self.pool(), &row.list_uri).await?.unwrap_or((0, 0));
+            let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+                "SELECT {}, s.did FROM ( \
+                   SELECT DISTINCT ON (subject) rkey, subject, created_at FROM list_items \
+                   WHERE author = $1 AND list_rkey = $2 ORDER BY subject, created_at, rkey) i \
+                 JOIN dids s ON s.id = i.subject, dids d \
+                 WHERE d.id = $1 \
+                 ORDER BY i.created_at, i.rkey LIMIT $3",
+                crate::db::lists::uri_sql("d.did", crate::firehose::classifier::NSID_LISTITEM, "i.rkey")
+            ))
+            .bind(list_author)
+            .bind(list_rkey)
             .bind(SAMPLE)
             .fetch_all(self.pool())
             .await?;
@@ -411,17 +457,20 @@ impl Hydrator {
             Err(e) => return Ok(Err(e)),
         };
         let (at, after) = parse_local_cursor(cursor);
-        let rows: Vec<PackRow> = sqlx::query_as(&format!(
-            "SELECT {PACK_COLUMNS} FROM starter_packs WHERE creator_did = $1 \
-               AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-             ORDER BY created_at DESC, uri DESC LIMIT $4"
+        let after_rkey = super::lists::cursor_rkey(self.pool(), after.as_deref()).await?;
+        let found: Vec<StoredPack> = sqlx::query_as(&format!(
+            "SELECT {} FROM starter_packs s JOIN dids d ON d.id = s.author WHERE d.did = $1 \
+               AND ($2::timestamptz IS NULL OR (s.created_at, s.rkey) < ($2, $3)) \
+             ORDER BY s.created_at DESC, s.rkey DESC LIMIT $4",
+            pack_columns()
         ))
         .bind(&me)
         .bind(at)
-        .bind(after.unwrap_or_default())
+        .bind(after_rkey)
         .bind(i64::from(limit))
         .fetch_all(self.pool())
         .await?;
+        let rows = stored_packs(self.pool(), found).await?;
         let next = (rows.len() == usize::try_from(limit).unwrap_or(usize::MAX))
             .then(|| rows.last().map(|r| local_cursor(r.created_at, &r.uri)))
             .flatten();
@@ -489,17 +538,20 @@ impl Hydrator {
         }
 
         let (at, after) = parse_local_cursor(cursor);
-        let rows: Vec<PackRow> = sqlx::query_as(&format!(
-            "SELECT {PACK_COLUMNS} FROM starter_packs WHERE creator_did = $1 \
-               AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-             ORDER BY created_at DESC, uri DESC LIMIT $4"
+        let after_rkey = super::lists::cursor_rkey(self.pool(), after.as_deref()).await?;
+        let found: Vec<StoredPack> = sqlx::query_as(&format!(
+            "SELECT {} FROM starter_packs s JOIN dids d ON d.id = s.author WHERE d.did = $1 \
+               AND ($2::timestamptz IS NULL OR (s.created_at, s.rkey) < ($2, $3)) \
+             ORDER BY s.created_at DESC, s.rkey DESC LIMIT $4",
+            pack_columns()
         ))
         .bind(&did)
         .bind(at)
-        .bind(after.unwrap_or_default())
+        .bind(after_rkey)
         .bind(i64::from(limit))
         .fetch_all(self.pool())
         .await?;
+        let rows = stored_packs(self.pool(), found).await?;
         let next = (rows.len() == usize::try_from(limit).unwrap_or(usize::MAX))
             .then(|| rows.last().map(|r| local_cursor(r.created_at, &r.uri)))
             .flatten();
@@ -530,7 +582,7 @@ mod tests {
     use crate::aggregations::ScopeSets;
     use crate::hydration::lists::{NSID_LIST, PURPOSE_REFERENCE};
     use crate::hydration::testing::{FixedUpstream, actor, exec, hydrator, hydrator_with};
-    use crate::test_support::fresh_db;
+    use crate::test_support::{fresh_db, records};
 
     const ALICE: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const BOB: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
@@ -541,23 +593,8 @@ mod tests {
     }
 
     async fn pack(p: &sqlx::PgPool, owner: &str, rkey: &str, name: &str, list: &str, age_minutes: u32) -> String {
-        let uri = pack_uri(owner, rkey);
-        let record = json!({"$type": NSID_STARTERPACK, "name": name, "list": list, "createdAt": "2026-01-01T00:00:00Z"});
-        sqlx::query(
-            "INSERT INTO starter_packs (uri, creator_did, rkey, cid, rev, name, list_uri, record, created_at) \
-             VALUES ($1, $2, $3, 'bafypack', '3k', $4, $5, $6, now() - make_interval(mins => $7))",
-        )
-        .bind(&uri)
-        .bind(owner)
-        .bind(rkey)
-        .bind(name)
-        .bind(list)
-        .bind(&record)
-        .bind(i32::try_from(age_minutes).expect("minutes"))
-        .execute(p)
-        .await
-        .expect("pack");
-        uri
+        let at = Utc::now() - chrono::TimeDelta::minutes(i64::from(age_minutes));
+        records::starter_pack_at(p, owner, rkey, name, list, Some(at)).await
     }
 
     /// B-42 (design-v3 §9.5): packs are found by their text, of creators in
@@ -577,12 +614,12 @@ mod tests {
             sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)").bind(did).execute(p).await.expect("scope");
         }
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
-        let list = format!("at://{ALICE}/{NSID_LIST}/sp");
-        let a = pack(p, ALICE, "a", "Rust people", &list, 3).await;
-        let b = pack(p, BOB, "b", "More rust people", &list, 2).await;
-        pack(p, BOB, "c", "Gardeners", &list, 1).await;
-        pack(p, outside, "d", "Rust outside the scope", &list, 1).await;
-        exec(p, &format!("INSERT INTO starter_pack_counts (pack_uri, joined_week_count, joined_all_time_count, all_time_source, refreshed_at) VALUES ('{b}', 1, 9, 'local', now())")).await;
+        let list = format!("at://{ALICE}/{NSID_LIST}/3klist2222222");
+        let a = pack(p, ALICE, "3kpack222222a", "Rust people", &list, 3).await;
+        let b = pack(p, BOB, "3kpack222222b", "More rust people", &list, 2).await;
+        pack(p, BOB, "3kpack222222c", "Gardeners", &list, 1).await;
+        pack(p, outside, "3kpack222222d", "Rust outside the scope", &list, 1).await;
+        records::pack_counts(p, &b, 1, 9).await;
 
         let h = hydrator(p, ScopeSets::default());
         let req = Requester::test();
@@ -620,26 +657,16 @@ mod tests {
         actor(p, ALICE, "alice.test", "Alice").await;
         actor(p, BOB, "bob.test", "Bob").await;
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
-        let list = format!("at://{ALICE}/{NSID_LIST}/sp");
-        exec(p, &format!(
-            "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES \
-             ('{list}', '{ALICE}', 'sp', 'bafylist', '3k', 'Pack list', '{PURPOSE_REFERENCE}', '{{}}', now())"
-        )).await;
+        let list = records::list(p, ALICE, "3klist2222222", "Pack list", PURPOSE_REFERENCE).await;
         for i in 0..14 {
             // Two items name Bob; the rest name accounts with no row here.
             let subject = if i < 2 { BOB.to_string() } else { format!("did:plc:{:a>24}", i) };
-            exec(p, &format!(
-                "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES \
-                 ('at://{ALICE}/app.bsky.graph.listitem/i{i:02}', '{ALICE}', 'i{i:02}', 'bafy', '3k', '{list}', '{subject}', now() - interval '{} minutes')",
-                20 - i
-            )).await;
+            let at = Utc::now() - chrono::TimeDelta::minutes(20 - i);
+            records::list_item_at(p, ALICE, &crate::test_support::posts::tid(usize::try_from(i).expect("i")), &list, &subject, Some(at)).await;
         }
-        let first = pack(p, ALICE, "p1", "First", &list, 2).await;
-        let second = pack(p, ALICE, "p2", "Second", &list, 1).await;
-        exec(p, &format!(
-            "INSERT INTO starter_pack_counts (pack_uri, joined_week_count, joined_all_time_count, all_time_source, refreshed_at) \
-             VALUES ('{first}', 3, 40, 'local', now())"
-        )).await;
+        let first = pack(p, ALICE, "3kpack222222a", "First", &list, 2).await;
+        let second = pack(p, ALICE, "3kpack222222b", "Second", &list, 1).await;
+        records::pack_counts(p, &first, 3, 40).await;
         // Alice is a member and Bob is in scope: their handles resolve
         // locally (§11 G-9).
         let mut members = ScopeSets::default();
@@ -684,12 +711,12 @@ mod tests {
         let entries = w.inner()["starterPacksWithMembership"].as_array().expect("entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["starterPack"]["list"]["listItemCount"], 13);
-        assert_eq!(entries[0]["listItem"]["uri"], format!("at://{ALICE}/app.bsky.graph.listitem/i01"));
+        assert_eq!(entries[0]["listItem"]["uri"], format!("at://{ALICE}/app.bsky.graph.listitem/{}", crate::test_support::posts::tid(1)));
         let w = h.get_starter_packs_with_membership(&owner, &req, ALICE, 50, None).await.expect("db").expect("view");
         assert!(w.inner()["starterPacksWithMembership"][0].get("listItem").is_none());
         assert!(h.get_starter_packs_with_membership(&anon, &req, BOB, 50, None).await.expect("db").is_err());
 
-        for miss in [pack_uri(ALICE, "none"), format!("at://{ALICE}/app.bsky.graph.list/sp"), "garbage".to_string()] {
+        for miss in [pack_uri(ALICE, "none"), format!("at://{ALICE}/app.bsky.graph.list/3klist2222222"), "garbage".to_string()] {
             let e = h.get_starter_pack(&anon, &req, &miss).await.expect("db").expect_err("miss");
             assert_eq!(e.message, "Starter pack not found", "{miss}");
         }

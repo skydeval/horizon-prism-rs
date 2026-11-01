@@ -30,9 +30,9 @@ const NO_RECORD_JSON: [&str; 7] = [
     "app.bsky.graph.referencelistoptout",
 ];
 
-/// Collections stored one row per URI with `cid` and `record` columns.
-/// Posts are keyed by ids, with their record encoded.
-const BY_URI: [(&str, &str); 5] = [
+/// Collections stored one row per record with `cid` and `record` columns,
+/// keyed by ids, with their record encoded (posts apart).
+const BY_KEY: [(&str, &str); 5] = [
     (NSID_LIST, "lists"),
     ("app.bsky.graph.starterpack", "starter_packs"),
     (NSID_LABELER, "labeler_services"),
@@ -88,14 +88,11 @@ impl Hydrator {
                 .await;
         }
         if SELF_RECORDS.contains(&collection) {
-            return sqlx::query_as("SELECT cid, record FROM actor_self_records WHERE uri = $1").bind(uri).fetch_optional(self.pool()).await;
+            return self.keyed_record("actor_self_records", uri, "").await;
         }
         if collection == NSID_POLL {
             // As `getAuthorPolls`: only public polls.
-            return sqlx::query_as("SELECT cid, record FROM nearhorizon_poll_posts WHERE uri = $1 AND visibility = 'public'")
-                .bind(uri)
-                .fetch_optional(self.pool())
-                .await;
+            return self.keyed_record("nearhorizon_poll_posts", uri, " AND visibility = 'public'").await;
         }
         if collection == crate::hydration::feed::NSID_POST {
             let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(&format!("SELECT p.cid, p.record FROM {}", crate::db::posts::rows_named(1)))
@@ -107,7 +104,7 @@ impl Hydrator {
                 None => Ok(None),
             };
         }
-        let Some((_, table)) = BY_URI.iter().find(|(nsid, _)| *nsid == collection) else {
+        let Some((_, table)) = BY_KEY.iter().find(|(nsid, _)| *nsid == collection) else {
             return Ok(None);
         };
         // A list's record is served exactly when every other public path
@@ -115,7 +112,28 @@ impl Hydrator {
         if collection == NSID_LIST && !self.is_ready_member(did).await? {
             return Ok(None);
         }
-        sqlx::query_as(&format!("SELECT cid, record FROM {table} WHERE uri = $1")).bind(uri).fetch_optional(self.pool()).await
+        self.keyed_record(table, uri, "").await
+    }
+
+    /// The stored `(cid, record)` of `uri` in a keyed v3 record table, with
+    /// `extra` added to its condition.
+    async fn keyed_record(&self, table: &str, uri: &str, extra: &str) -> Result<Option<(String, Value)>, sqlx::Error> {
+        let Some(key) = crate::firehose::rows::key_of(table) else {
+            return Ok(None);
+        };
+        let Some((author, k)) = crate::firehose::rows::key_for(self.pool(), key, uri).await? else {
+            return Ok(None);
+        };
+        let row: Option<(Vec<u8>, Vec<u8>)> =
+            sqlx::query_as(&format!("SELECT cid, record FROM {table} WHERE {}{extra}", crate::firehose::rows::key_where(key)))
+                .bind(author)
+                .bind(k)
+                .fetch_optional(self.pool())
+                .await?;
+        match row {
+            Some((cid, record)) => Ok(Some((crate::db::ids::cid_from_db(&cid), crate::db::records::decode_value(self.pool(), &record).await?))),
+            None => Ok(None),
+        }
     }
 
     /// `com.atproto.repo.getRecord`.
@@ -213,13 +231,22 @@ mod tests {
         assert_eq!(error(get(BOB, "app.bsky.actor.profile", "self", None).await), "RecordNotFound");
 
         // A list is served only when its owner is a ready member.
-        exec(p, &format!(
-            "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES \
-             ('at://{ALICE}/app.bsky.graph.list/3klist', '{ALICE}', '3klist', 'bafylist', '3k', 'L', 'app.bsky.graph.defs#modlist', '{{\"name\": \"L\"}}', now())"
-        )).await;
-        assert_eq!(error(get(ALICE, "app.bsky.graph.list", "3klist", None).await), "RecordNotFound");
+        crate::test_support::records::list(p, ALICE, "3klist2222222", "L", "app.bsky.graph.defs#modlist").await;
+        assert_eq!(error(get(ALICE, "app.bsky.graph.list", "3klist2222222", None).await), "RecordNotFound");
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
-        get(ALICE, "app.bsky.graph.list", "3klist", None).await.expect("list");
+        let v = get(ALICE, "app.bsky.graph.list", "3klist2222222", None).await.expect("list");
+        assert_eq!((&v.inner()["cid"], &v.inner()["value"]["name"]), (&json!("bafy3klist2222222"), &json!("L")));
+        // A self record and a public poll; a poll for followers is not served.
+        let declaration = json!({"$type": "app.bsky.notification.declaration", "allowSubscriptions": "mutuals"});
+        crate::test_support::records::self_record(p, ALICE, "app.bsky.notification.declaration", &declaration).await;
+        let v = get(ALICE, "app.bsky.notification.declaration", "self", None).await.expect("self record");
+        assert_eq!(v.inner()["value"], declaration);
+        for (rkey, visibility) in [("3kpoll222222a", "public"), ("3kpoll222222b", "followers")] {
+            let poll = json!({"$type": "app.nearhorizon.poll.post", "text": "q", "options": [], "visibility": visibility});
+            crate::test_support::records::put(p, ALICE, "app.nearhorizon.poll.post", rkey, &poll).await;
+        }
+        get(ALICE, "app.nearhorizon.poll.post", "3kpoll222222a", None).await.expect("public poll");
+        assert_eq!(error(get(ALICE, "app.nearhorizon.poll.post", "3kpoll222222b", None).await), "RecordNotFound");
 
         // Taken down: not found. Collapsed (`!hide`): still a record.
         exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{uri}', '!hide')")).await;

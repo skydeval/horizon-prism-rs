@@ -48,7 +48,8 @@ async fn delete_follows(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx:
     Ok(n)
 }
 
-/// [`delete`] for a table keyed by `(author, rkey)` (posts, likes, reposts).
+/// [`delete`] for a table keyed by `(author, rkey)` (posts, likes, reposts,
+/// the v3 record tables).
 async fn delete_keyed(conn: &mut PgConnection, table: &str, predicate: &str, did: &str) -> Result<u64, sqlx::Error> {
     let sql = format!("DELETE FROM {table} WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM {table} t WHERE {predicate} LIMIT {BATCH})");
     let n = sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
@@ -81,14 +82,8 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
             for table in ["likes", "reposts", "posts"] {
                 n += delete_keyed(conn, table, OWN, did).await?;
             }
-            for (table, col) in [
-                ("lists", "creator_did"),
-                ("list_items", "author_did"),
-                ("list_optouts", "author_did"),
-                ("threadgates", "author_did"),
-                ("postgates", "author_did"),
-            ] {
-                n += delete(conn, table, "uri", &format!("t.{col} = $1"), did).await?;
+            for table in ["lists", "list_items", "list_optouts", "threadgates", "postgates"] {
+                n += delete_keyed(conn, table, OWN, did).await?;
             }
             n += delete_follows(conn, did).await?;
             if !in_s {
@@ -101,14 +96,8 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
                 n += delete_keyed(conn, table, &format!("{OWN} AND NOT {SUBJECT_AUTHOR_MEMBER}"), did).await?;
             }
             n += delete_follows(conn, did).await?;
-            for (table, col) in [
-                ("lists", "creator_did"),
-                ("list_items", "author_did"),
-                ("list_optouts", "author_did"),
-                ("threadgates", "author_did"),
-                ("postgates", "author_did"),
-            ] {
-                n += delete(conn, table, "uri", &format!("t.{col} = $1"), did).await?;
+            for table in ["lists", "list_items", "list_optouts", "threadgates", "postgates"] {
+                n += delete_keyed(conn, table, OWN, did).await?;
             }
             n += profile(conn, did).await?;
         }
@@ -159,7 +148,13 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
 
 /// The self records and the profile columns of a DID outside S.
 async fn profile(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
-    let mut n = delete(conn, "actor_self_records", "uri", "t.did = $1", did).await?;
+    let sql = format!(
+        "DELETE FROM actor_self_records WHERE (author, coll) IN (SELECT t.author, t.coll FROM actor_self_records t WHERE {OWN} LIMIT {BATCH})"
+    );
+    let mut n = sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
+    if n > 0 {
+        metrics::counter!(METRIC_ROWS, "table" => "actor_self_records".to_string()).increment(n);
+    }
     n += sqlx::query(
         "UPDATE actors SET display_name = NULL, description = NULL, avatar_cid = NULL, \
          banner_cid = NULL, profile_record = NULL, profile_rev = NULL, profile_cid = NULL, \

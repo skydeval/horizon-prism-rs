@@ -729,14 +729,8 @@ async fn b74_a_held_list_row_never_slows_a_members_mute() {
     actor(p, OWNER, "owner.test", "Owner").await;
     exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{A}', 'admin', now()), ('{OWNER}', 'admin', now())")).await;
     let list = list_of(OWNER);
-    exec(
-        p,
-        &format!(
-            "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES \
-             ('{list}', '{OWNER}', '3klist1', 'bafylist', '3k', 'Mods', 'app.bsky.graph.defs#modlist', '{{}}', now())"
-        ),
-    )
-    .await;
+    let rkey = list.rsplit('/').next().expect("rkey").to_string();
+    assert_eq!(crate::test_support::records::list(p, OWNER, &rkey, "Mods", "app.bsky.graph.defs#modlist").await, list);
     let mut sets = ScopeSets::default();
     for did in [A, OWNER] {
         sets.members.insert(did.into());

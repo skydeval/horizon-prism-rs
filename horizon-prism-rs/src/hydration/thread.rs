@@ -68,9 +68,6 @@ struct RootGate {
     allow: Option<Value>,
 }
 
-/// A `threadgates` row: URI, CID, record, hidden replies, `allow`.
-type GateRow = (String, String, Value, Vec<String>, Option<Value>);
-
 /// A thread tree and the root's `threadgateView`, if the root has a valid
 /// threadgate.
 pub(super) type Tree = (Value, Option<Value>);
@@ -224,19 +221,11 @@ impl Hydrator {
     /// author is the post's author. A hidden reply is not hidden from its
     /// own author.
     async fn threadgate(&self, viewer: &Viewer, req: &Requester, root: &str) -> Result<Option<RootGate>, sqlx::Error> {
-        let rows: Vec<GateRow> =
-            sqlx::query_as("SELECT uri, cid, record, hidden_replies, allow FROM threadgates WHERE post_uri = $1")
-                .bind(root)
-                .fetch_all(self.pool())
-                .await?;
-        let rkey = |uri: &str| uri.rsplit('/').next().unwrap_or_default().to_string();
-        let Some((uri, cid, record, hidden, allow)) = rows
-            .into_iter()
-            .find(|(gate, ..)| uri_author(gate) == uri_author(root) && rkey(gate) == rkey(root))
-        else {
+        let Some(gate) = crate::db::gates::valid_one(self.pool(), crate::db::gates::Kind::Threadgate, root).await? else {
             return Ok(None);
         };
-        let view = self.threadgate_view(viewer, req, &uri, &cid, record, allow.as_ref()).await?;
+        let (allow, hidden) = (gate.allow(), gate.hidden_replies());
+        let view = self.threadgate_view(viewer, req, &gate.uri, &gate.cid, gate.record, allow.as_ref()).await?;
         let me = viewer.did.as_deref();
         let hidden = hidden.into_iter().filter(|reply| me.is_none() || uri_author(reply) != me).collect();
         Ok(Some(RootGate { view, hidden, allow }))
@@ -253,14 +242,8 @@ impl Hydrator {
         if viewer.state_did().is_none() {
             return Ok(None);
         }
-        let allow: Option<Option<Value>> = sqlx::query_scalar(
-            "SELECT allow FROM threadgates WHERE post_uri = $1 \
-               AND author_did = split_part(post_uri, '/', 3) AND rkey = split_part(post_uri, '/', 5)",
-        )
-        .bind(root)
-        .fetch_optional(self.pool())
-        .await?;
-        self.reply_disabled(viewer, req, root, allow.flatten().as_ref()).await
+        let allow = crate::db::gates::valid_one(self.pool(), crate::db::gates::Kind::Threadgate, root).await?.and_then(|g| g.allow());
+        self.reply_disabled(viewer, req, root, allow.as_ref()).await
     }
 
     /// A `threadgateView`: the gate's record and the lists its rules name,
@@ -435,11 +418,7 @@ impl Hydrator {
                     // Only a list served from this AppView's own rows is a
                     // complete input.
                     if is_list_uri(list) && self.is_ready_member(uri_author(list).unwrap_or_default()).await? {
-                        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_items WHERE list_uri = $1 AND subject_did = $2)")
-                            .bind(list)
-                            .bind(me)
-                            .fetch_one(self.pool())
-                            .await?
+                        crate::db::lists::on_list(self.pool(), list, me).await?
                     } else {
                         complete = false;
                         false

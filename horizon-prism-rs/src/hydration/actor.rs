@@ -223,30 +223,34 @@ impl Hydrator {
             None => HashMap::new(),
         };
         let declarations: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT did, record->>'allowSubscriptions' FROM actor_self_records WHERE did = ANY($1) AND collection = $2",
+            "SELECT d.did, r.allow_subscriptions FROM actor_self_records r JOIN dids d ON d.id = r.author \
+             WHERE r.author IN (SELECT id FROM dids WHERE did = ANY($1)) AND r.coll = $2",
         )
         .bind(&readable)
-        .bind(super::activity_subscriptions::NSID_DECLARATION)
+        .bind(crate::db::ids::COLL_DECLARATION)
         .fetch_all(self.pool())
         .await?;
-        let stored: Vec<(String, String, String, Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-            "SELECT did, uri, cid, record, indexed_at FROM actor_self_records WHERE did = ANY($1) AND collection = $2",
+        type StoredStatus = (String, Vec<u8>, Vec<u8>, chrono::DateTime<chrono::Utc>);
+        let stored: Vec<StoredStatus> = sqlx::query_as(
+            "SELECT d.did, r.cid, r.record, r.indexed_at FROM actor_self_records r JOIN dids d ON d.id = r.author \
+             WHERE r.author IN (SELECT id FROM dids WHERE did = ANY($1)) AND r.coll = $2",
         )
         .bind(&readable)
-        .bind(NSID_STATUS)
+        .bind(crate::db::ids::COLL_STATUS)
         .fetch_all(self.pool())
         .await?;
         let now = chrono::Utc::now();
         let live = self.inner.cfg.live.load();
         let live_now = &live.unspecced.live_now;
-        let statuses = stored
-            .into_iter()
-            .filter_map(|(did, uri, cid, record, indexed_at)| {
-                let pds = rows.get(&did).and_then(|r| r.pds_endpoint.as_deref());
-                let view = status_view(&did, &uri, &cid, &record, indexed_at, now, pds, live_now)?;
-                Some((did, view))
-            })
-            .collect();
+        let mut statuses = HashMap::with_capacity(stored.len());
+        for (did, cid, record, indexed_at) in stored {
+            let record = crate::db::records::decode_value(self.pool(), &record).await?;
+            let uri = format!("at://{did}/{NSID_STATUS}/self");
+            let pds = rows.get(&did).and_then(|r| r.pds_endpoint.as_deref());
+            if let Some(view) = status_view(&did, &uri, &crate::db::ids::cid_from_db(&cid), &record, indexed_at, now, pds, live_now) {
+                statuses.insert(did, view);
+            }
+        }
         Ok(ProfileContext {
             rows,
             viewer: actor_viewer,
@@ -322,21 +326,25 @@ impl Hydrator {
             .await?;
         let mut counts: Vec<HashMap<String, i64>> = Vec::new();
         for table in ["lists", "starter_packs"] {
-            let rows: Vec<(String, i64)> =
-                sqlx::query_as(&format!("SELECT creator_did, count(*) FROM {table} WHERE creator_did = ANY($1) GROUP BY creator_did"))
-                    .bind(&ready)
-                    .fetch_all(p)
-                    .await?;
+            let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+                "SELECT d.did, count(*) FROM {table} t JOIN dids d ON d.id = t.author \
+                 WHERE t.author IN (SELECT id FROM dids WHERE did = ANY($1)) GROUP BY d.did"
+            ))
+            .bind(&ready)
+            .fetch_all(p)
+            .await?;
             counts.push(rows.into_iter().collect());
         }
         let pack_counts = counts.pop().unwrap_or_default();
         let list_counts = counts.pop().unwrap_or_default();
-        let labelers: std::collections::HashSet<String> = sqlx::query_scalar("SELECT creator_did FROM labeler_services WHERE creator_did = ANY($1)")
-            .bind(&dids)
-            .fetch_all(p)
-            .await?
-            .into_iter()
-            .collect();
+        let labelers: std::collections::HashSet<String> = sqlx::query_scalar(
+            "SELECT d.did FROM labeler_services s JOIN dids d ON d.id = s.author WHERE s.author IN (SELECT id FROM dids WHERE did = ANY($1))",
+        )
+        .bind(&dids)
+        .fetch_all(p)
+        .await?
+        .into_iter()
+        .collect();
         let in_scope: Vec<String> = {
             let sets = self.scope().read_guard().await;
             dids.iter().filter(|d| sets.in_scope(d)).cloned().collect()
@@ -1012,30 +1020,21 @@ mod tests {
         for (did, handle) in [(ALICE, "alice.test"), (BOB, "bob.test"), (CAROL, "carol.test"), (DAVE, "dave.test"), (ERIN, "erin.test")] {
             actor(p, did, handle, handle).await;
         }
-        let pack = format!("at://{CAROL}/app.bsky.graph.starterpack/3kpack");
+        let pack = format!("at://{CAROL}/app.bsky.graph.starterpack/3kpack2222222");
         exec(p, &format!(
             "UPDATE actors SET pronouns = 'they/them', website = 'https://bob.example', joined_via_starter_pack_uri = '{pack}' WHERE did = '{BOB}'"
         )).await;
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now()), ('{BOB}', 'admin', now())")).await;
         // Bob: two lists, a starter pack and a labeler. Carol made the pack
         // Bob joined through.
-        for rkey in ["3kl1", "3kl2"] {
-            exec(p, &format!(
-                "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES \
-                 ('at://{BOB}/app.bsky.graph.list/{rkey}', '{BOB}', '{rkey}', 'bafyl', '3k', 'L', 'app.bsky.graph.defs#curatelist', '{{}}', now())"
-            )).await;
+        for rkey in ["3klist222222a", "3klist222222b"] {
+            crate::test_support::records::list(p, BOB, rkey, "L", "app.bsky.graph.defs#curatelist").await;
         }
-        for (author, rkey) in [(BOB, "3kmine"), (CAROL, "3kpack")] {
-            exec(p, &format!(
-                "INSERT INTO starter_packs (uri, creator_did, rkey, cid, rev, name, list_uri, record, created_at) VALUES \
-                 ('at://{author}/app.bsky.graph.starterpack/{rkey}', '{author}', '{rkey}', 'bafyp', '3k', 'P', \
-                  'at://{author}/app.bsky.graph.list/3kl1', '{{\"name\": \"P\"}}', now())"
-            )).await;
+        for (author, rkey) in [(BOB, "3kmine2222222"), (CAROL, "3kpack2222222")] {
+            let list = format!("at://{author}/app.bsky.graph.list/3klist222222a");
+            crate::test_support::records::starter_pack(p, author, rkey, "P", &list).await;
         }
-        exec(p, &format!(
-            "INSERT INTO labeler_services (uri, creator_did, cid, rev, policies, record, created_at) VALUES \
-             ('at://{BOB}/app.bsky.labeler.service/self', '{BOB}', 'bafys', '3k', '{{}}', '{{}}', now())"
-        )).await;
+        crate::test_support::records::labeler(p, BOB, &json!({"$type": "app.bsky.labeler.service", "policies": {}})).await;
         // Alice follows Carol and Dave; Carol, Dave and Erin follow Bob.
         let mut n = 0;
         for (author, subject) in [(ALICE, CAROL), (ALICE, DAVE), (CAROL, BOB), (DAVE, BOB), (ERIN, BOB)] {

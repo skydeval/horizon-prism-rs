@@ -1227,6 +1227,281 @@ pub mod posts {
     }
 }
 
+/// Test rows of the id-keyed v3 record tables (lists and their records,
+/// starter packs, gates, polls, labeler services, self records) and of
+/// members' post references, written from their records as ingest would
+/// store them.
+pub mod records {
+    use chrono::{DateTime, Utc};
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+
+    pub use super::graph::REV;
+    pub use crate::firehose::writer::fixtures::put_record;
+
+    /// A record's `createdAt`, or now's.
+    fn created(at: Option<DateTime<Utc>>) -> String {
+        at.unwrap_or_else(Utc::now).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// Store `record` in `collection` at [`REV`]. Returns its URI.
+    pub async fn put(pool: &PgPool, author: &str, collection: &str, rkey: &str, record: &Value) -> String {
+        put_record(pool, author, collection, rkey, &format!("bafy{rkey}"), REV, record).await
+    }
+
+    /// A list, created at `at` (or now).
+    pub async fn list_at(pool: &PgPool, owner: &str, rkey: &str, name: &str, purpose: &str, at: Option<DateTime<Utc>>) -> String {
+        let record = json!({"$type": "app.bsky.graph.list", "name": name, "purpose": purpose, "description": format!("about {name}"), "createdAt": created(at)});
+        put(pool, owner, "app.bsky.graph.list", rkey, &record).await
+    }
+
+    /// A list, created now.
+    pub async fn list(pool: &PgPool, owner: &str, rkey: &str, name: &str, purpose: &str) -> String {
+        list_at(pool, owner, rkey, name, purpose, None).await
+    }
+
+    /// A list item of the owner's list `list`, created at `at` (or now).
+    pub async fn list_item_at(pool: &PgPool, owner: &str, rkey: &str, list: &str, subject: &str, at: Option<DateTime<Utc>>) -> String {
+        let record = json!({"$type": "app.bsky.graph.listitem", "list": list, "subject": subject, "createdAt": created(at)});
+        put(pool, owner, "app.bsky.graph.listitem", rkey, &record).await
+    }
+
+    /// A list item, created now.
+    pub async fn list_item(pool: &PgPool, owner: &str, rkey: &str, list: &str, subject: &str) -> String {
+        list_item_at(pool, owner, rkey, list, subject, None).await
+    }
+
+    /// A list block of `list`, created at `at` (or now).
+    pub async fn list_block_at(pool: &PgPool, author: &str, rkey: &str, list: &str, at: Option<DateTime<Utc>>) -> String {
+        let record = json!({"$type": "app.bsky.graph.listblock", "subject": list, "createdAt": created(at)});
+        put(pool, author, "app.bsky.graph.listblock", rkey, &record).await
+    }
+
+    /// A list block, created now.
+    pub async fn list_block(pool: &PgPool, author: &str, rkey: &str, list: &str) -> String {
+        list_block_at(pool, author, rkey, list, None).await
+    }
+
+    /// A reference-list opt-out of `list`, created now.
+    pub async fn optout(pool: &PgPool, author: &str, rkey: &str, list: &str) -> String {
+        let record = json!({"$type": "app.bsky.graph.referencelistoptout", "subject": list, "createdAt": created(None)});
+        put(pool, author, "app.bsky.graph.referencelistoptout", rkey, &record).await
+    }
+
+    /// A starter pack of `list`, created at `at` (or now).
+    pub async fn starter_pack_at(pool: &PgPool, owner: &str, rkey: &str, name: &str, list: &str, at: Option<DateTime<Utc>>) -> String {
+        let record = json!({"$type": "app.bsky.graph.starterpack", "name": name, "list": list, "createdAt": created(at)});
+        put(pool, owner, "app.bsky.graph.starterpack", rkey, &record).await
+    }
+
+    /// A starter pack, created now.
+    pub async fn starter_pack(pool: &PgPool, owner: &str, rkey: &str, name: &str, list: &str) -> String {
+        starter_pack_at(pool, owner, rkey, name, list, None).await
+    }
+
+    /// A threadgate at `rkey` naming `post`, with these rules: `allow`
+    /// left out when `None`.
+    pub async fn threadgate(pool: &PgPool, author: &str, rkey: &str, post: &str, allow: Option<Value>, hidden: &[&str]) -> String {
+        let mut record = json!({"$type": "app.bsky.feed.threadgate", "post": post, "hiddenReplies": hidden, "createdAt": created(None)});
+        if let Some(allow) = allow {
+            record["allow"] = allow;
+        }
+        put(pool, author, "app.bsky.feed.threadgate", rkey, &record).await
+    }
+
+    /// A postgate at `rkey` naming `post`, with these rules and detached
+    /// quotes.
+    pub async fn postgate(pool: &PgPool, author: &str, rkey: &str, post: &str, rules: Option<Value>, detached: &[&str]) -> String {
+        let mut record = json!({"$type": "app.bsky.feed.postgate", "post": post, "detachedEmbeddingUris": detached, "createdAt": created(None)});
+        if let Some(rules) = rules {
+            record["embeddingRules"] = rules;
+        }
+        put(pool, author, "app.bsky.feed.postgate", rkey, &record).await
+    }
+
+    /// A labeler service with this record.
+    pub async fn labeler(pool: &PgPool, did: &str, record: &Value) -> String {
+        put(pool, did, "app.bsky.labeler.service", "self", record).await
+    }
+
+    /// A self record of `collection` with this record.
+    pub async fn self_record(pool: &PgPool, did: &str, collection: &str, record: &Value) -> String {
+        put(pool, did, collection, "self", record).await
+    }
+
+    /// Set a starter pack's joined counts.
+    pub async fn pack_counts(pool: &PgPool, pack: &str, week: i32, all_time: i32) {
+        super::interactions::intern(pool, &[pack]).await;
+        sqlx::query(
+            "INSERT INTO starter_pack_counts (author, rkey, joined_week_count, joined_all_time_count, all_time_source, refreshed_at) \
+             SELECT r.author, r.rkey, $2, $3, 'local', now() FROM ref_of($1) r WHERE r.coll = 11 \
+             ON CONFLICT (author, rkey) DO UPDATE SET joined_week_count = EXCLUDED.joined_week_count, \
+               joined_all_time_count = EXCLUDED.joined_all_time_count",
+        )
+        .bind(pack)
+        .bind(week)
+        .bind(all_time)
+        .execute(pool)
+        .await
+        .expect("pack counts");
+    }
+
+    /// SQL: the row of the keyed `table` (alias `alias`, or none) is the
+    /// one `uri` names.
+    #[must_use]
+    pub fn key_is(table: &str, alias: &str, uri: &str) -> String {
+        let dot = if alias.is_empty() { String::new() } else { format!("{alias}.") };
+        match table {
+            "labeler_services" => format!("{dot}author = (SELECT r.author FROM ref_of('{uri}') r)"),
+            "actor_self_records" => {
+                let nsid = uri.split('/').nth(3).unwrap_or_default();
+                format!(
+                    "({dot}author, {dot}coll) = (SELECT d.id, c.id FROM dids d, collections c WHERE d.did = '{}' AND c.nsid = '{nsid}')",
+                    crate::db::locks::uri_author(uri).unwrap_or_default()
+                )
+            }
+            _ => format!("({dot}author, {dot}rkey) = (SELECT r.author, r.rkey FROM ref_of('{uri}') r)"),
+        }
+    }
+
+    /// The collection of a keyed table's rows.
+    fn nsid_of(table: &str) -> &'static str {
+        match table {
+            "lists" => "app.bsky.graph.list",
+            "list_items" => "app.bsky.graph.listitem",
+            "list_blocks" => "app.bsky.graph.listblock",
+            "list_optouts" => "app.bsky.graph.referencelistoptout",
+            "starter_packs" => "app.bsky.graph.starterpack",
+            "threadgates" => "app.bsky.feed.threadgate",
+            "postgates" => "app.bsky.feed.postgate",
+            "nearhorizon_poll_posts" => "app.nearhorizon.poll.post",
+            "labeler_services" => "app.bsky.labeler.service",
+            "member_post_refs" | "starter_pack_counts" => "",
+            other => panic!("not a keyed record table: {other}"),
+        }
+    }
+
+    /// The URI of every row of the keyed `table`, ordered by text.
+    pub async fn uris(pool: &PgPool, table: &str) -> Vec<String> {
+        let sql = match table {
+            "actor_self_records" => "SELECT 'at://' || d.did || '/' || c.nsid || '/self' FROM actor_self_records t \
+                 JOIN dids d ON d.id = t.author JOIN collections c ON c.id = t.coll ORDER BY 1"
+                .to_string(),
+            "labeler_services" => "SELECT 'at://' || d.did || '/app.bsky.labeler.service/self' FROM labeler_services t \
+                 JOIN dids d ON d.id = t.author ORDER BY 1"
+                .to_string(),
+            "member_post_refs" => "SELECT at_uri(t.author, 1::smallint, t.rkey) FROM member_post_refs t ORDER BY 1".to_string(),
+            "starter_pack_counts" => "SELECT at_uri(t.author, 11::smallint, t.rkey) FROM starter_pack_counts t ORDER BY 1".to_string(),
+            _ => format!(
+                "SELECT {} FROM {table} t JOIN dids d ON d.id = t.author ORDER BY 1",
+                crate::db::lists::uri_sql("d.did", nsid_of(table), "t.rkey")
+            ),
+        };
+        sqlx::query_scalar(&sql).fetch_all(pool).await.expect("uris")
+    }
+
+    /// A stored record of a keyed table, decoded.
+    pub async fn record(pool: &PgPool, table: &str, uri: &str) -> Option<Value> {
+        let stored: Option<Vec<u8>> = sqlx::query_scalar(&format!("SELECT record FROM {table} WHERE {}", key_is(table, "", uri)))
+            .fetch_optional(pool)
+            .await
+            .expect("record");
+        match stored {
+            Some(bytes) => Some(crate::db::records::decode_value(pool, &bytes).await.expect("decode")),
+            None => None,
+        }
+    }
+
+    /// A member's post reference, at `rev`, naming the accounts its post
+    /// replies to (`parent`, `root`) and quotes, created at `created` (an
+    /// SQL expression).
+    pub async fn post_ref(pool: &PgPool, uri: &str, rev: &str, refs: (Option<&str>, Option<&str>, Option<&str>), created: &str) {
+        let (parent, root, quote) = refs;
+        let named: Vec<String> = [parent, root, quote].into_iter().flatten().map(str::to_string).collect();
+        super::interactions::intern(pool, &[uri]).await;
+        crate::db::ids::Ids::new(pool.clone()).account_ids(&named).await.expect("intern");
+        sqlx::query(&format!(
+            "INSERT INTO member_post_refs (author, rkey, rev, parent, root, quote, created_at) \
+             SELECT r.author, r.rkey, rev_to_bigint($2), (SELECT id FROM dids WHERE did = $3), (SELECT id FROM dids WHERE did = $4), \
+                    (SELECT id FROM dids WHERE did = $5), {created} \
+             FROM ref_of($1) r WHERE r.coll = 1"
+        ))
+        .bind(uri)
+        .bind(rev)
+        .bind(parent)
+        .bind(root)
+        .bind(quote)
+        .execute(pool)
+        .await
+        .expect("post ref");
+    }
+
+    /// Statements that intern the authority and key of each URI (SQL-only
+    /// fixtures, run with `raw_sql`).
+    fn intern_uris_sql(uris: &[&str]) -> String {
+        uris.iter()
+            .filter_map(|u| u.strip_prefix("at://"))
+            .map(|rest| {
+                let mut parts = rest.split('/');
+                let (did, rkey) = (parts.next().unwrap_or(""), parts.nth(1).unwrap_or(""));
+                super::posts::intern_sql(did, rkey)
+            })
+            .collect()
+    }
+
+    /// Statements that store a bare row of the keyed `table` by `author` at
+    /// `rkey` (ignored for a labeler service; the collection for a self
+    /// record), created now, with an empty record where the table keeps
+    /// one: `refs` are its references as `(column prefix, URI)` and `extra`
+    /// its other columns as `(column, SQL expression)` (SQL-only fixtures,
+    /// run with `raw_sql`).
+    #[must_use]
+    pub fn row_sql(table: &str, author: &str, rkey: &str, refs: &[(&str, &str)], extra: &[(&str, String)]) -> String {
+        let uris: Vec<&str> = refs.iter().map(|(_, u)| *u).collect();
+        let mut sql = intern_uris_sql(&uris);
+        sql += &super::posts::intern_sql(author, rkey);
+        let mut columns: Vec<String> = vec!["author".into(), "cid".into(), "rev".into()];
+        let mut values: Vec<String> = vec!["a.id".into(), format!("'\\x00'::bytea || convert_to('bafy{rkey}', 'UTF8')"), format!("rev_to_bigint('{REV}')")];
+        match table {
+            "labeler_services" => {}
+            "actor_self_records" => {
+                columns.push("coll".into());
+                values.push(format!("(SELECT id FROM collections WHERE nsid = '{rkey}')"));
+            }
+            _ => {
+                columns.push("rkey".into());
+                values.push(super::posts::key_sql(author, rkey));
+            }
+        }
+        if !matches!(table, "list_items" | "list_blocks" | "list_optouts") {
+            columns.push("record".into());
+            values.push("'\\x00'::bytea || convert_to('{}', 'UTF8')".into());
+        }
+        if !matches!(table, "actor_self_records") {
+            columns.push("created_at".into());
+            values.push("now()".into());
+        }
+        for (prefix, uri) in refs {
+            columns.extend([format!("{prefix}_author"), format!("{prefix}_coll"), format!("{prefix}_rkey")]);
+            values.extend([
+                format!("(SELECT r.author FROM ref_of('{uri}') r)"),
+                format!("COALESCE((SELECT r.coll FROM ref_of('{uri}') r), 0)"),
+                format!("(SELECT r.rkey FROM ref_of('{uri}') r)"),
+            ]);
+        }
+        for (column, value) in extra {
+            columns.push((*column).to_string());
+            values.push(value.clone());
+        }
+        sql += &format!(
+            "INSERT INTO {table} ({}) SELECT {} FROM dids a WHERE a.did = '{author}';",
+            columns.join(", "),
+            values.join(", ")
+        );
+        sql
+    }
+}
+
 /// A fresh database with no migrations applied (migration tests).
 pub async fn empty_db(test: &str) -> Option<TestDb> {
     let Ok(admin_url) = std::env::var(ENV) else {

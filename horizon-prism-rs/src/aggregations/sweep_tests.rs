@@ -94,12 +94,11 @@ impl T {
 
     /// `author` replied to a post of `parent` `days_ago` days ago.
     async fn reply(&self, author: &str, parent: &str, days_ago: i64) {
-        self.exec(&format!(
-            "INSERT INTO member_post_refs (uri, author_did, rev, reply_parent_did, reply_root_did, created_at) VALUES \
-             ('at://{author}/app.bsky.feed.post/{}', '{author}', '3k', '{parent}', '{parent}', now() - interval '{days_ago} days')",
-            &parent[8..16]
-        ))
-        .await;
+        // A TID key per parent: its first letters spelled into the key.
+        let rkey = format!("3k{}22222", &parent[8..14]);
+        let uri = format!("at://{author}/app.bsky.feed.post/{rkey}");
+        crate::test_support::records::post_ref(self.p(), &uri, "3kaaaaaaaaaaa", (Some(parent), Some(parent), None), &format!("now() - interval '{days_ago} days'"))
+            .await;
     }
 
     async fn subscribe(&self, subscriber: &str, subject: &str) {

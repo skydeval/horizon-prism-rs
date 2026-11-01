@@ -223,9 +223,11 @@ impl Rebuild {
                    UNION ALL SELECT sd.did FROM reposts r JOIN dids ra ON ra.id = r.author JOIN members m ON m.did = ra.did \
                      JOIN dids sd ON sd.id = r.subj_author \
                      WHERE $1 AND r.created_at >= $2 \
-                   UNION ALL SELECT x FROM member_post_refs p JOIN members m ON m.did = p.author_did, \
-                     LATERAL unnest(ARRAY[p.reply_parent_did, p.reply_root_did, p.quote_did]) x \
-                     WHERE $3 AND p.created_at >= $4 \
+                   UNION ALL SELECT xd.did FROM ( \
+                     SELECT DISTINCT x.id FROM member_post_refs p JOIN dids pa ON pa.id = p.author \
+                       JOIN members m ON m.did = pa.did, \
+                       LATERAL unnest(ARRAY[p.parent, p.root, p.quote]) x(id) \
+                       WHERE $3 AND p.created_at >= $4) r JOIN dids xd ON xd.id = r.id \
                  ) t WHERE d IS NOT NULL",
             )
             .bind(likes_on)

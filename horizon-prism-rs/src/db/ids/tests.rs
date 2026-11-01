@@ -749,3 +749,169 @@ async fn migration_0057_moves_posts_feed_items_and_tombstones() {
     assert_eq!(left, (0, 1));
     db.drop_db().await;
 }
+
+/// Migration 0059: the list, pack, gate, poll, labeler, self-record and
+/// post-reference tables are keyed by ids; references are whole or odd
+/// (their text in `odd_refs`, their author kept when it is a valid DID);
+/// records and CIDs are kept in their exact text form; the fields queries
+/// read are copied; rows that cannot be keyed are left out, and pack counts
+/// of anything but a whole pack are dropped; an odd reference's text goes
+/// with its row.
+#[tokio::test]
+async fn migration_0059_moves_the_record_tables() {
+    use serde_json::{Value, json};
+
+    let Some(db) = crate::test_support::empty_db("migration_0059").await else { return };
+    let p = &db.pool;
+    let migrations: Vec<_> = crate::db::migrations::MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()).collect();
+    let at = migrations.iter().position(|m| m.version == 59).expect("0059");
+    for m in &migrations[..at] {
+        sqlx::raw_sql(&m.sql).execute(p).await.unwrap_or_else(|e| panic!("{}: {e}", m.version));
+    }
+    let canonical = "bafyreidbcoifjdzsr3u5i74kbm427m5yic67grd54s4luhlt4xxntevd6m";
+    let uri = |did: &str, nsid: &str, rkey: &str| format!("at://{did}/{nsid}/{rkey}");
+    let list = uri(A, "app.bsky.graph.list", "3myp5txuf7s2d");
+    let list_record = json!({"$type": "app.bsky.graph.list", "name": "Mods", "purpose": "app.bsky.graph.defs#modlist"});
+    let exec = |sql: String| async move { sqlx::raw_sql(&sql).execute(p).await.unwrap_or_else(|e| panic!("{sql}: {e}")) };
+    exec(format!(
+        "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES \
+           ('{list}', '{A}', '3myp5txuf7s2d', '{canonical}', '3myp5txuf7s2d', 'Mods', 'app.bsky.graph.defs#modlist', '{list_record}', '2026-10-01T00:00:00Z'), \
+           ('{}', '{B}', '3myp5txuf7s2e', 'c', '3myp5txuf7s2e', 'Not B''s', 'p', '{{}}', now())",
+        uri(A, "app.bsky.graph.list", "3myp5txuf7s2e")
+    ))
+    .await;
+    exec(format!(
+        "INSERT INTO list_items (uri, author_did, rkey, cid, rev, list_uri, subject_did, created_at) VALUES \
+           ('{}', '{A}', 'self', 'c', 'not-a-tid', '{list}', '{B}', now()), \
+           ('{}', '{A}', '3myp5txuf7s2f', 'c', '3myp5txuf7s2f', '{}', '{B}', now())",
+        uri(A, "app.bsky.graph.listitem", "self"),
+        uri(A, "app.bsky.graph.listitem", "3myp5txuf7s2f"),
+        uri(B, "app.bsky.graph.list", "3myp5txuf7s2d")
+    ))
+    .await;
+    let odd_list = "at://alice.example/app.bsky.graph.list/3myp5txuf7s2d";
+    exec(format!(
+        "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES \
+           ('{}', '{B}', '3myp5txuf7s2d', 'c', '3myp5txuf7s2d', '{list}', now()), \
+           ('{}', '{B}', '3myp5txuf7s2e', 'c', '3myp5txuf7s2e', '{odd_list}', now()); \
+         INSERT INTO list_optouts (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES \
+           ('{}', '{B}', '3myp5txuf7s2d', 'c', '3myp5txuf7s2d', '{list}', now())",
+        uri(B, "app.bsky.graph.listblock", "3myp5txuf7s2d"),
+        uri(B, "app.bsky.graph.listblock", "3myp5txuf7s2e"),
+        uri(B, "app.bsky.graph.referencelistoptout", "3myp5txuf7s2d")
+    ))
+    .await;
+    let pack = uri(A, "app.bsky.graph.starterpack", "3myp5txuf7s2d");
+    let pack_record = json!({"$type": "app.bsky.graph.starterpack", "name": "Rust", "list": list});
+    exec(format!(
+        "INSERT INTO starter_packs (uri, creator_did, rkey, cid, rev, name, description, list_uri, record, created_at) VALUES \
+           ('{pack}', '{A}', '3myp5txuf7s2d', 'c', '3myp5txuf7s2d', 'Rust', 'people', '{list}', '{pack_record}', now()); \
+         INSERT INTO starter_pack_counts (pack_uri, joined_week_count, joined_all_time_count, all_time_source, refreshed_at) VALUES \
+           ('{pack}', 2, 5, 'local', now()), ('{list}', 1, 1, 'local', now())"
+    ))
+    .await;
+    let post = uri(A, "app.bsky.feed.post", "3myp5txuf7s2d");
+    let gate_record = json!({"$type": "app.bsky.feed.threadgate", "post": post, "allow": []});
+    exec(format!(
+        "INSERT INTO threadgates (uri, author_did, rkey, cid, rev, post_uri, allow, record, created_at) VALUES \
+           ('{}', '{A}', '3myp5txuf7s2d', 'c', '3myp5txuf7s2d', '{post}', '[]', '{gate_record}', now()); \
+         INSERT INTO postgates (uri, author_did, rkey, cid, rev, post_uri, record, created_at) VALUES \
+           ('{}', '{A}', '3myp5txuf7s2d', 'c', '3myp5txuf7s2d', 'at://{A}/com.example.thing/1', '{{}}', now())",
+        uri(A, "app.bsky.feed.threadgate", "3myp5txuf7s2d"),
+        uri(A, "app.bsky.feed.postgate", "3myp5txuf7s2d")
+    ))
+    .await;
+    exec(format!(
+        "INSERT INTO nearhorizon_poll_posts (uri, author_did, rkey, cid, rev, text, options, visibility, record, created_at) VALUES \
+           ('{}', '{A}', '3myp5txuf7s2d', 'c', '3myp5txuf7s2d', 'q', '[]', 'public', '{{\"text\": \"q\"}}', now()); \
+         INSERT INTO labeler_services (uri, creator_did, cid, rev, policies, record, created_at) VALUES \
+           ('{}', '{A}', 'c', '3myp5txuf7s2d', '{{}}', '{{\"policies\": {{}}}}', now()); \
+         INSERT INTO actor_self_records (uri, did, collection, cid, rev, record) VALUES \
+           ('{}', '{A}', 'app.bsky.notification.declaration', 'c', '3myp5txuf7s2d', '{{\"allowSubscriptions\": \"mutuals\"}}'), \
+           ('{}', '{A}', 'app.bsky.actor.contentVisibilityDeclaration', 'c', '3myp5txuf7s2d', '{{\"hideFromAlgorithmicRecommendations\": true}}'), \
+           ('{}', '{A}', 'com.example.self', 'c', '3myp5txuf7s2d', '{{}}')",
+        uri(A, "app.nearhorizon.poll.post", "3myp5txuf7s2d"),
+        uri(A, "app.bsky.labeler.service", "self"),
+        uri(A, "app.bsky.notification.declaration", "self"),
+        uri(A, "app.bsky.actor.contentVisibilityDeclaration", "self"),
+        uri(A, "com.example.self", "self")
+    ))
+    .await;
+    exec(format!(
+        "INSERT INTO member_post_refs (uri, author_did, rev, reply_parent_did, reply_root_did, quote_did, created_at) VALUES \
+           ('{post}', '{A}', '3myp5txuf7s2d', '{B}', 'alice.example', NULL, now())"
+    ))
+    .await;
+
+    sqlx::raw_sql(&migrations[at].sql).execute(p).await.expect("0059 applies over existing rows");
+
+    let id = |did: &'static str| async move { sqlx::query_scalar::<_, i32>("SELECT id FROM dids WHERE did = $1").bind(did).fetch_one(p).await.expect("id") };
+    let (a, b) = (id(A).await, id(B).await);
+    let text = |s: &str| [&[0u8][..], s.as_bytes()].concat();
+    let k = |s: &str| rkey_value(s).expect("tid");
+
+    // Lists: keyed, the CID and record in their text form, the purpose kept;
+    // a row that is not its author's own record is left out.
+    type ListRow = (i32, i64, Vec<u8>, String, String, Vec<u8>);
+    let lists: Vec<ListRow> =
+        sqlx::query_as("SELECT author, rkey, cid, bigint_to_rev(rev), purpose, record FROM lists").fetch_all(p).await.expect("lists");
+    assert_eq!(lists.len(), 1);
+    assert_eq!((lists[0].0, lists[0].1, &lists[0].2, lists[0].3.as_str()), (a, k("3myp5txuf7s2d"), &text(canonical), "3myp5txuf7s2d"));
+    assert_eq!(lists[0].4, "app.bsky.graph.defs#modlist");
+    assert_eq!(lists[0].5[0], 0, "the record as dict 0");
+    assert_eq!(serde_json::from_slice::<Value>(&lists[0].5[1..]).expect("json"), list_record);
+    // List items: an alias key, a rev that is not a TID stored as the
+    // lowest, the list's key; an item naming another repo's list is left
+    // out.
+    let items: Vec<(i64, String, i64, i32)> =
+        sqlx::query_as("SELECT rkey, bigint_to_rev(rev), list_rkey, subject FROM list_items").fetch_all(p).await.expect("items");
+    assert_eq!(items.len(), 1);
+    assert!(items[0].0 < 0, "an alias");
+    assert_eq!((items[0].1.as_str(), items[0].2, items[0].3), ("2222222222222", k("3myp5txuf7s2d"), b));
+    // List blocks and opt-outs: whole and odd subjects.
+    let blocks: Vec<(i64, Option<i32>, i16, Option<i64>)> =
+        sqlx::query_as("SELECT rkey, subj_author, subj_coll, subj_rkey FROM list_blocks ORDER BY rkey").fetch_all(p).await.expect("blocks");
+    assert_eq!(blocks, [(k("3myp5txuf7s2d"), Some(a), 7, Some(k("3myp5txuf7s2d"))), (k("3myp5txuf7s2e"), None, 0, None)]);
+    let optouts: i64 = sqlx::query_scalar("SELECT count(*) FROM list_optouts WHERE subj_coll = 7").fetch_one(p).await.expect("optouts");
+    assert_eq!(optouts, 1);
+    // A starter pack: its list, its search text; its counts, and only its.
+    let packs: Vec<(i16, bool)> = sqlx::query_as("SELECT list_coll, search_tsv @@ to_tsquery('simple', 'people') FROM starter_packs")
+        .fetch_all(p)
+        .await
+        .expect("packs");
+    assert_eq!(packs, [(7, true)]);
+    let counts: Vec<(i32, i64, i32, i32)> =
+        sqlx::query_as("SELECT author, rkey, joined_week_count, joined_all_time_count FROM starter_pack_counts").fetch_all(p).await.expect("counts");
+    assert_eq!(counts, [(a, k("3myp5txuf7s2d"), 2, 5)]);
+    // Gates: a whole post and an odd one.
+    let gates: Vec<(i16, Option<i32>, Option<i64>)> =
+        sqlx::query_as("SELECT post_coll, post_author, post_rkey FROM threadgates UNION ALL SELECT post_coll, post_author, post_rkey FROM postgates ORDER BY 1 DESC")
+            .fetch_all(p)
+            .await
+            .expect("gates");
+    assert_eq!(gates, [(1, Some(a), Some(k("3myp5txuf7s2d"))), (0, Some(a), None)]);
+    // Polls keep their visibility; the labeler is keyed by its author.
+    let polls: Vec<String> = sqlx::query_scalar("SELECT visibility FROM nearhorizon_poll_posts").fetch_all(p).await.expect("polls");
+    assert_eq!(polls, ["public"]);
+    let labelers: Vec<i32> = sqlx::query_scalar("SELECT author FROM labeler_services").fetch_all(p).await.expect("labelers");
+    assert_eq!(labelers, [a]);
+    // Self records keep the fields queries read; a collection outside the
+    // fixed list is left out.
+    let own: Vec<(i16, bool, Option<String>)> =
+        sqlx::query_as("SELECT coll, hide_from_recs, allow_subscriptions FROM actor_self_records ORDER BY coll").fetch_all(p).await.expect("self");
+    assert_eq!(own, [(13, false, Some("mutuals".to_string())), (15, true, None)]);
+    // A member's post reference names its accounts by id; one that is not
+    // a valid DID names none.
+    let refs: Vec<(i32, i64, Option<i32>, Option<i32>)> =
+        sqlx::query_as("SELECT author, rkey, parent, root FROM member_post_refs").fetch_all(p).await.expect("refs");
+    assert_eq!(refs, [(a, k("3myp5txuf7s2d"), Some(b), None)]);
+
+    // The odd texts, by the owner's collection and slot.
+    let odd: Vec<(i16, i16, String)> = sqlx::query_as("SELECT tbl, slot, raw FROM odd_refs ORDER BY tbl").fetch_all(p).await.expect("odd");
+    assert_eq!(odd, [(9, 4, odd_list.to_string()), (17, 4, format!("at://{A}/com.example.thing/1"))]);
+    // They go with their row.
+    exec("DELETE FROM list_blocks; DELETE FROM postgates".to_string()).await;
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM odd_refs").fetch_one(p).await.expect("left");
+    assert_eq!(left, 0);
+    db.drop_db().await;
+}

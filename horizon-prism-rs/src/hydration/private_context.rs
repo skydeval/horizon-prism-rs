@@ -115,12 +115,7 @@ impl HydrationContext {
         if !super::lists::is_list_uri(list) || !hydrator.is_ready_member(uri_author(list).unwrap_or_default()).await? {
             return Ok(None);
         }
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_items WHERE list_uri = $1 AND subject_did = $2)")
-            .bind(list)
-            .bind(did)
-            .fetch_one(hydrator.pool())
-            .await
-            .map(Some)
+        crate::db::lists::on_list(hydrator.pool(), list, did).await.map(Some)
     }
 
     /// The labels stored for `subjects` (the `labels` table), by subject, in

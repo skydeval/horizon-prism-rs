@@ -86,15 +86,9 @@ async fn world(p: &sqlx::PgPool) -> Hydrator {
     // handle once checked.
     exec(p, &format!("INSERT INTO actors (did, pds_endpoint, handle, handle_checked_at) VALUES ('{REPLIER}', 'https://pds.example.com', 'replier.test', now())")).await;
     // A ready member's list is served from its stored row.
-    exec(
-        p,
-        &format!(
-            "INSERT INTO lists (uri, creator_did, rkey, cid, rev, name, purpose, record, created_at) VALUES \
-             ('{}', '{BOB}', '3kmods', 'bafylist', '3k', 'Mods', '{PURPOSE_MOD}', '{{}}', '2026-01-01T00:00:00Z')",
-            list_uri(BOB)
-        ),
-    )
-    .await;
+    let record = json!({"$type": "app.bsky.graph.list", "name": "Mods", "purpose": PURPOSE_MOD, "createdAt": "2026-01-01T00:00:00Z"});
+    let rkey = list_uri(BOB).rsplit('/').next().expect("rkey").to_string();
+    crate::test_support::records::put_record(p, BOB, "app.bsky.graph.list", &rkey, "bafylist", crate::test_support::records::REV, &record).await;
 
     let mut sets = ScopeSets::default();
     for did in [ALICE, BOB] {
@@ -140,14 +134,7 @@ async fn surfaces(h: &Hydrator, did: &str) -> Vec<(&'static str, String)> {
     out.push(("getListMutes", masked(v.inner(), did)));
     exec(p, "DELETE FROM list_mutes").await;
 
-    exec(
-        p,
-        &format!(
-            "INSERT INTO list_blocks (uri, author_did, rkey, cid, rev, list_uri, created_at) VALUES \
-             ('at://{ALICE}/app.bsky.graph.listblock/3klb', '{ALICE}', '3klb', 'bafy', '3k', '{list}', '2026-01-01T00:00:00Z')"
-        ),
-    )
-    .await;
+    crate::test_support::records::list_block_at(p, ALICE, "3klblock2222a", &list, Some("2026-01-01T00:00:00Z".parse().expect("time"))).await;
     let v = h.get_list_blocks(&me, &req, 50, None).await.expect("db").expect("list blocks");
     out.push(("getListBlocks", masked(v.inner(), did)));
     exec(p, "DELETE FROM list_blocks").await;

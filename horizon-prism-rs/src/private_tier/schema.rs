@@ -2451,8 +2451,8 @@ pub(super) async fn fanout_candidates(
         "SELECT s.subscriber_did, m.ready_at IS NOT NULL \
          FROM private_activity_subscriptions s \
          JOIN members m ON m.did = s.subscriber_did \
-         CROSS JOIN (SELECT COALESCE((SELECT record->>'allowSubscriptions' FROM actor_self_records \
-                                      WHERE did = $1 AND collection = 'app.bsky.notification.declaration'), \
+         CROSS JOIN (SELECT COALESCE((SELECT r.allow_subscriptions FROM actor_self_records r, dids rd \
+                                      WHERE rd.did = $1 AND r.author = rd.id AND r.coll = 13), \
                                      'followers') AS allow) d \
          WHERE s.subject_did = $1 AND s.subscriber_did <> $1 \
            AND ($6::text[] IS NULL OR s.subscriber_did = ANY($6)) \
