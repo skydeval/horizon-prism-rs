@@ -121,6 +121,23 @@ async fn sql_helpers_agree_with_rust() {
             assert_eq!(Some(back), rkey_string(v));
         }
     }
+    // The bit-read text matches the numeric one at the edges.
+    for v in [0, 1, 31, 32, (1 << 60) - 1, 1 << 60, i64::MAX - 1, i64::MAX, -1, i64::MIN, i64::MIN + 1, -(1 << 60), 1_820_642_958_438_400_004] {
+        let (rev, rev_old): (String, String) =
+            sqlx::query_as("SELECT bigint_to_rev($1), bigint_to_tid_numeric($1::numeric + 9223372036854775808)").bind(v).fetch_one(p).await.expect("rev text");
+        assert_eq!(rev, rev_old, "{v}");
+        if v >= 0 {
+            let (rkey, rkey_old): (String, String) =
+                sqlx::query_as("SELECT bigint_to_rkey($1), bigint_to_tid_numeric($1::numeric)").bind(v).fetch_one(p).await.expect("rkey text");
+            assert_eq!(rkey, rkey_old, "{v}");
+        }
+    }
+    let nulls: (Option<String>, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT bigint_to_rkey(NULL), bigint_to_rev(NULL), at_uri(NULL, 1::smallint, 0), at_uri(2147483647, 1::smallint, 0)")
+            .fetch_one(p)
+            .await
+            .expect("nulls");
+    assert_eq!(nulls, (None, None, None, None));
     let long = "a".repeat(512);
     let too_long = "a".repeat(513);
     for k in ["self", "3myp5txuf7s2d", ".", "..", "...", "a:b~c_d-e.f", "bad key", "", long.as_str(), too_long.as_str()] {

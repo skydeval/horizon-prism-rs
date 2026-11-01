@@ -19,6 +19,10 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Faster reads of stored keys.** Turning a stored record key, rev or
+  reference back into text is several times faster, so jobs that read many
+  rows at once no longer slow down. **Upgrade:** start once with
+  `APP_ALLOW_STARTUP_MIGRATE=1` (migration 0058).
 - **Smaller post tables.** Posts, feed items and deleted-record tombstones
   are stored by account id and record key. A post keeps its whole record,
   compressed in the background once 10,000 posts are stored; search keeps
