@@ -19,6 +19,14 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Smaller profile table.** Accounts' stored profiles, handles and
+  statuses are stored by account id, with the profile record kept whole and
+  compressed in the background once 10,000 profiles are stored. In
+  `searchActors`, accounts that match equally well may list in a different
+  order, so a page can start or end on a different account. An account row
+  whose DID is not valid is no longer kept. **Upgrade:** start once with
+  `APP_ALLOW_STARTUP_MIGRATE=1` (migration 0060 rewrites the table in one
+  transaction; it needs free space for a second copy of it).
 - **Smaller list, starter pack, gate, poll, labeler and settings tables.**
   Lists, list entries, list blocks and opt-outs, starter packs and their
   joined counts, threadgates and postgates, polls, labeler services,

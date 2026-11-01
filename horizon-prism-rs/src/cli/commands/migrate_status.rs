@@ -152,6 +152,8 @@ mod tests {
             // Compact storage: lists, starter packs, gates, polls, labeler
             // services, self records and members' post references.
             "0059_compact_records",
+            // Compact storage: actors.
+            "0060_compact_actors",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

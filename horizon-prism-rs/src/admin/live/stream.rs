@@ -489,7 +489,7 @@ async fn handles(state: &AdminState, hub: &Hub, dids: &[&str]) -> Vec<Option<Str
         let outcome = match state.pool.try_acquire() {
             None => "skipped",
             Some(mut conn) => {
-                let query = sqlx::query_as::<_, (String, Option<String>)>("SELECT did, handle FROM actors WHERE did = ANY($1)")
+                let query = sqlx::query_as::<_, (String, Option<String>)>("SELECT d.did, a.handle FROM dids d JOIN actors a ON a.id = d.id WHERE d.did = ANY($1)")
                     .bind(&misses)
                     .fetch_all(&mut *conn);
                 match tokio::time::timeout(HANDLE_TIMEOUT, query).await {

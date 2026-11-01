@@ -126,18 +126,17 @@ pub(super) fn computed_at() -> [u8; 8] {
     Utc::now().timestamp_micros().to_be_bytes()
 }
 
-/// The pool conditions on `a` (an `actors` row), with the activity
-/// requirement when `active_days` is given.
+/// The pool conditions on `a` (an `actors` row, whose `dids` row is `ad`),
+/// with the activity requirement when `active_days` is given.
 pub(super) fn eligible(active_days: Option<u32>) -> String {
-    let mut sql = "EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = a.did) \
+    let mut sql = "EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = ad.did) \
          AND a.account_status = 'active' AND a.handle IS NOT NULL AND a.handle <> 'handle.invalid' \
-         AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = a.did AND l.val IN ('!takedown', '!hide')) \
-         AND NOT EXISTS (SELECT 1 FROM actor_self_records r JOIN dids rd ON rd.id = r.author \
-                         WHERE rd.did = a.did AND r.coll = 15 AND r.hide_from_recs)"
+         AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = ad.did AND l.val IN ('!takedown', '!hide')) \
+         AND NOT EXISTS (SELECT 1 FROM actor_self_records r WHERE r.author = a.id AND r.coll = 15 AND r.hide_from_recs)"
         .to_string();
     if let Some(days) = active_days {
         sql.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM posts p, dids pd WHERE pd.did = a.did AND p.author = pd.id AND p.created_at > now() - interval '{days} days')"
+            " AND EXISTS (SELECT 1 FROM posts p WHERE p.author = a.id AND p.created_at > now() - interval '{days} days')"
         ));
     }
     sql
@@ -166,18 +165,18 @@ impl Hydrator {
         let cfg = &self.inner.cfg.suggestions;
         let (slot, label, order) = match ordering {
             // A profile dated in the future cannot hold the top.
-            Ordering::Newest => (&self.suggestions().newest, "newest", "LEAST(COALESCE(a.profile_created_at, a.indexed_at), now()) DESC, a.did"),
+            Ordering::Newest => (&self.suggestions().newest, "newest", "LEAST(COALESCE(a.profile_created_at, a.indexed_at), now()) DESC, ad.did"),
             Ordering::Popular => (
                 &self.suggestions().popular,
                 "popular",
-                "COALESCE((SELECT cc.followers FROM constellation_counts cc WHERE cc.target = a.did), \
-                          (SELECT c.followers_count FROM actor_counts c, dids cd WHERE cd.did = a.did AND c.id = cd.id), 0) DESC, \
-                 (SELECT max(p.created_at) FROM posts p, dids pd WHERE pd.did = a.did AND p.author = pd.id) DESC NULLS LAST, a.did",
+                "COALESCE((SELECT cc.followers FROM constellation_counts cc WHERE cc.target = ad.did), \
+                          (SELECT c.followers_count FROM actor_counts c WHERE c.id = a.id), 0) DESC, \
+                 (SELECT max(p.created_at) FROM posts p WHERE p.author = a.id) DESC NULLS LAST, ad.did",
             ),
         };
         let mut slot = slot.lock().await;
         if slot.at.is_none_or(|at| at.elapsed() >= Duration::from_secs(cfg.refresh_secs)) {
-            let sql = format!("SELECT a.did FROM actors a WHERE {} ORDER BY {order} LIMIT $1", eligible(Some(cfg.active_days)));
+            let sql = format!("SELECT ad.did FROM actors a JOIN dids ad ON ad.id = a.id WHERE {} ORDER BY {order} LIMIT $1", eligible(Some(cfg.active_days)));
             let started = Instant::now();
             let found = sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).fetch_all(self.pool()).await;
             metrics::histogram!(METRIC_REFRESH_SECONDS).record(started.elapsed().as_secs_f64());
@@ -229,12 +228,12 @@ impl Hydrator {
         let sql = format!(
             "WITH mine AS (SELECT f.subject FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) \
                            ORDER BY f.created_at DESC LIMIT $2) \
-             SELECT a.did, count(*) FROM follows f \
+             SELECT ad.did, count(*) FROM follows f \
              JOIN mine ON mine.subject = f.author \
-             JOIN dids fs ON fs.id = f.subject \
-             JOIN actors a ON a.did = fs.did \
-             WHERE fs.did <> $1 AND {} \
-             GROUP BY a.did ORDER BY count(*) DESC LIMIT $3",
+             JOIN dids ad ON ad.id = f.subject \
+             JOIN actors a ON a.id = f.subject \
+             WHERE ad.did <> $1 AND {} \
+             GROUP BY ad.did ORDER BY count(*) DESC LIMIT $3",
             eligible(Some(cfg.active_days))
         );
         let ranked = self.ranked_by_follows(&sql, me, cfg.fof_max_follows, endpoint).await?;
@@ -260,12 +259,12 @@ impl Hydrator {
                            WHERE f.subject = (SELECT id FROM dids WHERE did = $1) \
                              AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = fa.did) \
                            ORDER BY f.created_at DESC LIMIT $2) \
-             SELECT a.did, count(*) FROM follows f \
+             SELECT ad.did, count(*) FROM follows f \
              JOIN fans ON fans.author = f.author \
-             JOIN dids fs ON fs.id = f.subject \
-             JOIN actors a ON a.did = fs.did \
-             WHERE fs.did <> $1 AND {} \
-             GROUP BY a.did ORDER BY count(*) DESC LIMIT $3",
+             JOIN dids ad ON ad.id = f.subject \
+             JOIN actors a ON a.id = f.subject \
+             WHERE ad.did <> $1 AND {} \
+             GROUP BY ad.did ORDER BY count(*) DESC LIMIT $3",
             eligible(Some(cfg.active_days))
         );
         let mut dids = self.ranked_by_follows(&sql, actor, cfg.cofollow_sample_followers, "getSuggestedFollowsByActor").await?;
@@ -387,10 +386,10 @@ impl Hydrator {
             let mut slot = self.suggestions().packs.lock().await;
             if slot.1.is_none_or(|at| at.elapsed() >= Duration::from_secs(cfg.refresh_secs)) {
                 let sql = format!(
-                    "SELECT {} FROM starter_packs sp JOIN dids spd ON spd.id = sp.author JOIN actors a ON a.did = spd.did \
+                    "SELECT {} FROM starter_packs sp JOIN dids ad ON ad.id = sp.author JOIN actors a ON a.id = sp.author \
                      LEFT JOIN starter_pack_counts c ON c.author = sp.author AND c.rkey = sp.rkey WHERE {} \
                      ORDER BY COALESCE(c.joined_week_count, 0) DESC, COALESCE(c.joined_all_time_count, 0) DESC, sp.author, sp.rkey LIMIT $1",
-                    crate::db::lists::uri_sql("spd.did", "app.bsky.graph.starterpack", "sp.rkey"),
+                    crate::db::lists::uri_sql("ad.did", "app.bsky.graph.starterpack", "sp.rkey"),
                     eligible(None)
                 );
                 slot.0 = Arc::new(sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).fetch_all(self.pool()).await?);
@@ -459,7 +458,7 @@ mod tests {
                 post(p, d, "3ka", "hello", None, None).await;
             }
             // Later rows are newer profiles.
-            sqlx::query("UPDATE actors SET profile_created_at = now() - make_interval(days => $2) WHERE did = $1")
+            sqlx::query("UPDATE actors SET profile_created_at = now() - make_interval(days => $2) WHERE id = (SELECT id FROM dids WHERE did = $1)")
                 .bind(d)
                 .bind(20 - i32::try_from(i).expect("i"))
                 .execute(p)

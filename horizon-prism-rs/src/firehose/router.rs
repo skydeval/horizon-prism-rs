@@ -41,18 +41,21 @@ pub async fn route_identity(
     did: &str,
     system_accounts: &crate::system_accounts::State,
 ) -> Result<bool, sqlx::Error> {
+    // The account's id first: an `actors` row is keyed by it.
+    let id = crate::db::ids::account_id(pool, did).await?;
     let queued = sqlx::query(
         "INSERT INTO identity_refresh (did, reasons, not_before) \
          SELECT $1, $2, now() + make_interval(secs => $3) \
          WHERE EXISTS (SELECT 1 FROM scope_dids WHERE did = $1) \
             OR EXISTS (SELECT 1 FROM members WHERE did = $1) \
-            OR EXISTS (SELECT 1 FROM actors WHERE did = $1) \
+            OR EXISTS (SELECT 1 FROM actors WHERE id = $4) \
             OR EXISTS (SELECT 1 FROM refract_dids WHERE did = $1) \
          ON CONFLICT (did) DO UPDATE SET reasons = identity_refresh.reasons | EXCLUDED.reasons",
     )
     .bind(did)
     .bind(kind.reason_bit())
     .bind(DEBOUNCE_SECS)
+    .bind(id)
     .execute(pool)
     .await?
     .rows_affected()
@@ -94,11 +97,7 @@ mod tests {
             return;
         };
         let known = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-        sqlx::query("INSERT INTO actors (did) VALUES ($1)")
-            .bind(known)
-            .execute(&db.pool)
-            .await
-            .expect("actor");
+        crate::test_support::actors::put(&db.pool, known, &[]).await;
         assert!(!route_identity(&db.pool, IdentityKind::Handle, "did:plc:stranger", &crate::system_accounts::State::Off).await.expect("route"));
         // A Refract candidate's events are routed too (refract design §4.4).
         sqlx::query("INSERT INTO refract_dids (did, community, state, source) VALUES ('did:plc:candidate', 'community-a', 'candidate', 'fill')")

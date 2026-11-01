@@ -610,7 +610,10 @@ fn sweep_seed() -> String {
     }
     // Kept tables.
     sql += &graph_row_sql("blocks", B, MEMBER, "1");
-    sql += &format!("INSERT INTO actors (did, display_name) VALUES ('{B}', 'b'), ('{MEMBER}', 'm');");
+    sql += &crate::test_support::actors::put_sql(B, &[("display_name", "'b'")]);
+    sql += ";";
+    sql += &crate::test_support::actors::put_sql(MEMBER, &[("display_name", "'m'")]);
+    sql += ";";
     sql += &format!("INSERT INTO labels (subject, val) VALUES ('{B}', 'porn');");
     sql += &crate::test_support::posts::tombstone_sql(&post(B, "gone"), "3kaaaaaaaaaaa");
     sql += &format!(

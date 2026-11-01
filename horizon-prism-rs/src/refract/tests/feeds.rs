@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::aggregations::ScopeSets;
-use crate::hydration::testing::{FixedUpstream, actor, exec, hydrator_with, post};
+use crate::hydration::testing::{FixedUpstream, actor, hydrator_with, post};
 use crate::hydration::{Hydrator, Viewer};
 use crate::indexing::PublicMode;
 use crate::test_support::fresh_db;
@@ -54,7 +54,7 @@ async fn t8o_t8u_author_feed() {
     for (rkey, subject) in [("3krp1", &shown), ("3krp2", &gone)] {
         crate::test_support::interactions::repost(p, R, rkey, subject).await;
     }
-    exec(p, &format!("UPDATE actors SET profile_record = '{{\"pinnedPost\": {{\"uri\": \"at://{R}/app.bsky.feed.post/3kp05\", \"cid\": \"c\"}}}}'::jsonb WHERE did = '{R}'")).await;
+    crate::test_support::actors::set_record(p, R, &serde_json::json!({"pinnedPost": {"uri": format!("at://{R}/app.bsky.feed.post/3kp05"), "cid": "c"}})).await;
     let pv = |uri: &str| json!({"uri": uri, "cid": "c", "author": {"did": OTHER, "handle": "o.test"}, "record": {"text": "upstream"}, "indexedAt": "2026-01-01T00:00:00Z"});
     let mut up = FixedUpstream::default();
     up.posts.insert(shown.clone(), pv(&shown));
@@ -88,7 +88,7 @@ async fn t8r_t8x_remote_profiles_for_restored_dids() {
         return;
     };
     let p = &db.pool;
-    exec(p, &format!("INSERT INTO actors (did, handle, pds_endpoint) VALUES ('{BARE}', 'bare.test', 'https://pds.example.com')")).await;
+    crate::test_support::actors::put(p, BARE, &[("handle", "'bare.test'"), ("pds_endpoint", "'https://pds.example.com'")]).await;
     let mut up = FixedUpstream::default();
     up.records.insert(
         format!("at://{BARE}/app.bsky.actor.profile/self"),

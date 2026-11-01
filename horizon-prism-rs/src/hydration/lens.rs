@@ -573,7 +573,7 @@ impl Hydrator {
         if !self.in_scope_or_member(did).await {
             return Ok(false);
         }
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM actors WHERE did = $1 AND account_status = 'active')")
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1) AND account_status = 'active')")
             .bind(did)
             .fetch_one(self.pool())
             .await

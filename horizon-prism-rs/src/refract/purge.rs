@@ -138,7 +138,8 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
                                                     WHERE x.author = r.author AND x.rkey = r.rkey AND r.coll = 3) \
            WHEN 'app.bsky.graph.follow' THEN EXISTS (SELECT 1 FROM follows x, ref_of(t.record_uri) r \
                                                      WHERE x.author = r.author AND x.rkey = r.rkey AND r.coll = 4) \
-           WHEN 'app.bsky.actor.profile' THEN EXISTS (SELECT 1 FROM actors x WHERE x.did = t.author_did AND x.profile_record IS NOT NULL) \
+           WHEN 'app.bsky.actor.profile' THEN EXISTS (SELECT 1 FROM actors x WHERE x.id = (SELECT id FROM dids WHERE did = $1) \
+                                                       AND x.profile_record IS NOT NULL) \
            ELSE true END",
         did,
     )
@@ -159,8 +160,8 @@ async fn profile(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error>
         "UPDATE actors SET display_name = NULL, description = NULL, avatar_cid = NULL, \
          banner_cid = NULL, profile_record = NULL, profile_rev = NULL, profile_cid = NULL, \
          pronouns = NULL, website = NULL, joined_via_starter_pack_uri = NULL, \
-         joined_via_starter_pack_cid = NULL, profile_created_at = NULL \
-         WHERE did = $1 AND profile_record IS NOT NULL",
+         joined_via_starter_pack_cid = NULL, profile_created_at = NULL, self_labels = NULL \
+         WHERE id = (SELECT id FROM dids WHERE did = $1) AND profile_record IS NOT NULL",
     )
     .bind(did)
     .execute(&mut *conn)

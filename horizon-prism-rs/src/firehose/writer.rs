@@ -341,6 +341,13 @@ struct RowIds {
     record: Option<Vec<u8>>,
 }
 
+/// A profile's row ids: its author, and its record as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileIds {
+    author: AccountId,
+    record: Vec<u8>,
+}
+
 /// The ids an op's row is written with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpIds {
@@ -348,6 +355,7 @@ enum OpIds {
     Subject(SubjectIds),
     Post(Box<PostIds>),
     Row(Box<RowIds>),
+    Profile(Box<ProfileIds>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1447,7 +1455,7 @@ impl Writer {
             .zip(admissions)
             .map(|(p, a)| match (p, a) {
                 (Prepared::Upsert(u), Some(Admission::Admit(rule))) if *rule != AdmitRule::PublicRootGate => match &u.body {
-                    Body::Follow(_) | Body::Block(_) | Body::Like(_) | Body::Repost(_) | Body::Post(_) => Some(u.as_ref()),
+                    Body::Follow(_) | Body::Block(_) | Body::Like(_) | Body::Repost(_) | Body::Post(_) | Body::Profile(_) => Some(u.as_ref()),
                     Body::Row(row) if matches!(row.layout, Layout::Keyed { .. }) => Some(u.as_ref()),
                     _ => None,
                 },
@@ -1506,8 +1514,11 @@ impl Writer {
         let Some(&author) = accounts.get(repo) else {
             return Ok(vec![None; prepared.len()]);
         };
-        // A row keyed by its author or collection has no key of its own.
-        let own_key = |u: &Upsert| !matches!(&u.body, Body::Row(Row { layout: Layout::Keyed { key: RowKey::Author | RowKey::Coll, .. }, .. }));
+        // A row keyed by its author or collection, and a profile, has no key
+        // of its own.
+        let own_key = |u: &Upsert| {
+            !matches!(&u.body, Body::Profile(_) | Body::Row(Row { layout: Layout::Keyed { key: RowKey::Author | RowKey::Coll, .. }, .. }))
+        };
         let mut keys: Vec<(AccountId, String)> = admitted.iter().flatten().filter(|u| own_key(u)).map(|u| (author, u.rkey.clone())).collect();
         for u in admitted.iter().flatten() {
             if let Body::Row(row) = &u.body {
@@ -1548,6 +1559,10 @@ impl Writer {
                     None => None,
                 },
                 Body::Row(row) => row_ids(&self.pool, &accounts, &rkeys, author, rkey, u, row).await?.map(|ids| OpIds::Row(Box::new(ids))),
+                Body::Profile(_) => Some(OpIds::Profile(Box::new(ProfileIds {
+                    author,
+                    record: records::encode(&self.pool, records::FAMILY_PROFILES, &u.record).await?,
+                }))),
                 _ => None,
             });
         }
@@ -1895,7 +1910,10 @@ impl Writer {
                 inserted.is_some()
             }
             Body::Block(g) => upsert_block(conn, keyed()?, g, rev).await?.is_some(),
-            Body::Profile(p) => upsert_profile(conn, u, p, rev).await?,
+            Body::Profile(p) => match ids {
+                Some(OpIds::Profile(ids)) => upsert_profile(conn, ids, u, p, rev).await?,
+                _ => return Err(OpError::Deterministic("profile's account is not a valid DID".into())),
+            },
             Body::Row(row) => match (row.layout, ids) {
                 (Layout::ByUri { owner_column }, _) => upsert_uri_row(conn, u, row, owner_column, rev).await?,
                 (Layout::Keyed { .. }, Some(OpIds::Row(r))) => upsert_row(conn, row, r, rev).await?,
@@ -2671,6 +2689,7 @@ async fn delete_keyed(conn: &mut PgConnection, table: &'static str, uri: &str, r
 
 async fn upsert_profile(
     conn: &mut PgConnection,
+    ids: &ProfileIds,
     u: &Upsert,
     p: &ProfileRecord,
     rev: &str,
@@ -2679,41 +2698,46 @@ async fn upsert_profile(
     // `profile_cid` (design-v3 §12.2): rows written before the column
     // existed get their CID from a re-sync whose rev equals the stored one,
     // and nothing else of the row changes in that case.
-    let n = sqlx::query(
-        "INSERT INTO actors AS a (did, display_name, description, avatar_cid, banner_cid, profile_rev, profile_record, \
-           profile_cid, pronouns, website, joined_via_starter_pack_uri, joined_via_starter_pack_cid, profile_created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
-         ON CONFLICT (did) DO UPDATE SET \
-           display_name = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.display_name ELSE EXCLUDED.display_name END, \
-           description = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.description ELSE EXCLUDED.description END, \
-           avatar_cid = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.avatar_cid ELSE EXCLUDED.avatar_cid END, \
-           banner_cid = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.banner_cid ELSE EXCLUDED.banner_cid END, \
-           profile_record = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.profile_record ELSE EXCLUDED.profile_record END, \
-           pronouns = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.pronouns ELSE EXCLUDED.pronouns END, \
-           website = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.website ELSE EXCLUDED.website END, \
-           joined_via_starter_pack_uri = CASE WHEN a.profile_rev = EXCLUDED.profile_rev \
-             THEN a.joined_via_starter_pack_uri ELSE EXCLUDED.joined_via_starter_pack_uri END, \
-           joined_via_starter_pack_cid = CASE WHEN a.profile_rev = EXCLUDED.profile_rev \
-             THEN a.joined_via_starter_pack_cid ELSE EXCLUDED.joined_via_starter_pack_cid END, \
-           profile_created_at = CASE WHEN a.profile_rev = EXCLUDED.profile_rev \
-             THEN a.profile_created_at ELSE EXCLUDED.profile_created_at END, \
-           profile_cid = EXCLUDED.profile_cid, profile_rev = EXCLUDED.profile_rev \
+    let kept = |c: &str| format!("{c} = CASE WHEN a.profile_rev = EXCLUDED.profile_rev THEN a.{c} ELSE EXCLUDED.{c} END");
+    let replaced: Vec<String> = [
+        "display_name",
+        "description",
+        "avatar_cid",
+        "banner_cid",
+        "profile_record",
+        "pronouns",
+        "website",
+        "joined_via_starter_pack_uri",
+        "joined_via_starter_pack_cid",
+        "profile_created_at",
+        "self_labels",
+    ]
+    .iter()
+    .map(|c| kept(c))
+    .collect();
+    let n = sqlx::query(&format!(
+        "INSERT INTO actors AS a (id, display_name, description, avatar_cid, banner_cid, profile_rev, profile_record, \
+           profile_cid, pronouns, website, joined_via_starter_pack_uri, joined_via_starter_pack_cid, profile_created_at, self_labels) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+         ON CONFLICT (id) DO UPDATE SET {}, profile_cid = EXCLUDED.profile_cid, profile_rev = EXCLUDED.profile_rev \
          WHERE a.profile_rev IS NULL OR a.profile_rev < EXCLUDED.profile_rev \
             OR (a.profile_cid IS NULL AND a.profile_record IS NOT NULL AND a.profile_rev = EXCLUDED.profile_rev)",
-    )
-    .bind(&u.input.author)
+        replaced.join(", ")
+    ))
+    .bind(ids.author)
     .bind(p.display_name.as_deref())
     .bind(p.description.as_deref())
-    .bind(p.avatar_cid.as_deref())
-    .bind(p.banner_cid.as_deref())
-    .bind(rev)
-    .bind(&u.record)
-    .bind(&u.cid)
+    .bind(p.avatar_cid.as_deref().map(cid_to_db))
+    .bind(p.banner_cid.as_deref().map(cid_to_db))
+    .bind(rev_value(rev))
+    .bind(&ids.record)
+    .bind(cid_to_db(&u.cid))
     .bind(p.pronouns.as_deref())
     .bind(p.website.as_deref())
     .bind(p.joined_via_starter_pack.as_ref().map(|s| s.uri.as_str()))
-    .bind(p.joined_via_starter_pack.as_ref().and_then(|s| s.cid.as_deref()))
+    .bind(p.joined_via_starter_pack.as_ref().and_then(|s| s.cid.as_deref()).map(cid_to_db))
     .bind(p.created_at)
+    .bind((!p.self_labels.is_empty()).then_some(&p.self_labels))
     .execute(conn)
     .await?
     .rows_affected();
@@ -2941,10 +2965,11 @@ async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo
     let table = match kind {
         RecordKind::Profile => {
             return sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM actors WHERE did = $1 AND profile_record IS NOT NULL AND profile_rev > $2)",
+                "SELECT EXISTS (SELECT 1 FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1) \
+                   AND profile_record IS NOT NULL AND profile_rev > $2)",
             )
             .bind(repo)
-            .bind(rev)
+            .bind(rev_value(rev))
             .fetch_one(conn)
             .await;
         }
@@ -3009,11 +3034,12 @@ async fn delete_profile(conn: &mut PgConnection, did: &str, rev: &str) -> Result
         "UPDATE actors SET display_name = NULL, description = NULL, avatar_cid = NULL, \
            banner_cid = NULL, profile_record = NULL, profile_cid = NULL, pronouns = NULL, website = NULL, \
            joined_via_starter_pack_uri = NULL, joined_via_starter_pack_cid = NULL, profile_created_at = NULL, \
-           profile_rev = $2 \
-         WHERE did = $1 AND profile_record IS NOT NULL AND (profile_rev IS NULL OR profile_rev <= $2)",
+           self_labels = NULL, profile_rev = $2 \
+         WHERE id = (SELECT id FROM dids WHERE did = $1) AND profile_record IS NOT NULL \
+           AND (profile_rev IS NULL OR profile_rev <= $2)",
     )
     .bind(did)
-    .bind(rev)
+    .bind(rev_value(rev))
     .execute(conn)
     .await?
     .rows_affected()
@@ -4635,27 +4661,28 @@ mod tests {
             let blocks: i64 = sqlx::query_scalar("SELECT count(*) FROM blocks").fetch_one(p).await.expect("block");
             assert_eq!(blocks, 0);
 
-            type ProfileRow = (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, bool);
+            type ProfileRow = (Option<Vec<u8>>, Option<String>, Option<String>, Option<String>, Option<String>, bool);
             let profile_sql = "SELECT profile_cid, pronouns, website, joined_via_starter_pack_uri, display_name, \
-                               profile_created_at = '2026-01-01T00:00:00Z' FROM actors WHERE did = $1";
+                               profile_created_at = '2026-01-01T00:00:00Z' FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1)";
+            let cid = |c: &Option<Vec<u8>>| c.as_deref().map(crate::db::ids::cid_from_db);
             let profile: ProfileRow = sqlx::query_as(profile_sql).bind(AUTHOR).fetch_one(p).await.expect("profile");
-            assert_eq!(profile.0.as_deref(), Some("bafyprofile"));
+            assert_eq!(cid(&profile.0).as_deref(), Some("bafyprofile"));
             assert_eq!((profile.1.as_deref(), profile.2.as_deref()), (Some("it/its"), Some("https://a.example")));
             assert_eq!(profile.3.as_deref(), Some("at://did:plc:pack/app.bsky.graph.starterpack/1"));
             assert!(profile.5);
 
             // A row written before `profile_cid` existed gets it from a
             // re-sync at the same rev, and nothing else of the row changes.
-            sqlx::query("UPDATE actors SET profile_cid = NULL WHERE did = $1").bind(AUTHOR).execute(p).await.expect("clear");
+            sqlx::query("UPDATE actors SET profile_cid = NULL WHERE id = (SELECT id FROM dids WHERE did = $1)").bind(AUTHOR).execute(p).await.expect("clear");
             let resync = [raw("app.bsky.actor.profile", "self", "bafyprofile", json!({"displayName": "Changed"}))];
             w.apply(AUTHOR, &rev(1), &resync, OPTIONS).await.expect("apply");
             let profile: ProfileRow = sqlx::query_as(profile_sql).bind(AUTHOR).fetch_one(p).await.expect("profile");
-            assert_eq!((profile.0.as_deref(), profile.4.as_deref(), profile.1.as_deref()), (Some("bafyprofile"), Some("A"), Some("it/its")));
+            assert_eq!((cid(&profile.0).as_deref(), profile.4.as_deref(), profile.1.as_deref()), (Some("bafyprofile"), Some("A"), Some("it/its")));
             // With the CID present, an equal rev changes nothing.
             let again = [raw("app.bsky.actor.profile", "self", "bafyother", json!({"displayName": "Changed"}))];
             w.apply(AUTHOR, &rev(1), &again, OPTIONS).await.expect("apply");
             let profile: ProfileRow = sqlx::query_as(profile_sql).bind(AUTHOR).fetch_one(p).await.expect("profile");
-            assert_eq!((profile.0.as_deref(), profile.4.as_deref()), (Some("bafyprofile"), Some("A")));
+            assert_eq!((cid(&profile.0).as_deref(), profile.4.as_deref()), (Some("bafyprofile"), Some("A")));
             db.drop_db().await;
         }
 
@@ -4868,7 +4895,7 @@ mod tests {
                 .await
                 .expect("tombstones");
             assert_eq!(tombstones, 2);
-            let actors: i64 = sqlx::query_scalar("SELECT count(*) FROM actors WHERE did = $1").bind(SUBJECT).fetch_one(p).await.expect("actors");
+            let actors: i64 = sqlx::query_scalar("SELECT count(*) FROM actors a JOIN dids d ON d.id = a.id WHERE d.did = $1").bind(SUBJECT).fetch_one(p).await.expect("actors");
             assert_eq!(actors, 0, "no actors row for the author");
             db.drop_db().await;
         }

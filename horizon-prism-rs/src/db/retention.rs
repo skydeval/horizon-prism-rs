@@ -250,49 +250,32 @@ pub(crate) fn batched_composite(table: &'static str, keys: &[&str], alias: &str,
 }
 
 /// A per-DID step (§6.11.7): rows are deleted one DID at a time, under that
-/// DID's exclusive advisory lock. `did_col` is the expression naming the DID a
-/// row belongs to. The DID is the parameter after the step's own bind.
-fn scoped(
-    table: &'static str,
-    key: &str,
-    alias: &str,
-    did_col: &str,
-    pred: &str,
-    bind: Bind,
-) -> Step {
+/// DID's exclusive advisory lock. The table is keyed by ids: `keys` are its
+/// key columns, `from` the table aliased `alias` with the `dids` joins that
+/// `did_col` (the expression naming the DID a row belongs to) and `pred`
+/// name. The DID is `$1`.
+fn scoped_ids(table: &'static str, keys: &[&str], alias: &str, from: &str, did_col: &str, pred: &str) -> Step {
+    scoped_ids_with(table, keys, alias, from, did_col, pred, Bind::None)
+}
+
+/// [`scoped_ids`] with the step's own bind first: the DID is then `$2`.
+fn scoped_ids_with(table: &'static str, keys: &[&str], alias: &str, from: &str, did_col: &str, pred: &str, bind: Bind) -> Step {
+    let selected: Vec<String> = keys.iter().map(|k| format!("{alias}.{k}")).collect();
     let did_param = if matches!(bind, Bind::None) { 1 } else { 2 };
     Step {
         table,
         sql: format!(
-            "DELETE FROM {table} WHERE {key} IN (SELECT {alias}.{key} FROM {table} {alias} \
-             WHERE {did_col} = ${did_param} AND {pred} LIMIT {BATCH_SIZE})"
-        ),
-        candidates: Some(format!(
-            "SELECT DISTINCT {did_col} AS did FROM {table} {alias} WHERE {pred} LIMIT {CANDIDATE_PAGE}"
-        )),
-        bind,
-    }
-}
-
-/// [`scoped`] for a table keyed by ids: `keys` are its key columns, `from`
-/// the table aliased `alias` with the `dids` joins that `did_col` and
-/// `pred` name. The DID is `$1`.
-fn scoped_ids(table: &'static str, keys: &[&str], alias: &str, from: &str, did_col: &str, pred: &str) -> Step {
-    let selected: Vec<String> = keys.iter().map(|k| format!("{alias}.{k}")).collect();
-    Step {
-        table,
-        sql: format!(
             "DELETE FROM {table} WHERE ({}) IN (SELECT {} FROM {from} \
-             WHERE {did_col} = $1 AND {pred} LIMIT {BATCH_SIZE})",
+             WHERE {did_col} = ${did_param} AND {pred} LIMIT {BATCH_SIZE})",
             keys.join(", "),
             selected.join(", ")
         ),
         candidates: Some(format!("SELECT DISTINCT {did_col} AS did FROM {from} WHERE {pred} LIMIT {CANDIDATE_PAGE}")),
-        bind: Bind::None,
+        bind,
     }
 }
 
-/// [`scoped`] for `follows` or `blocks`, keyed by `(author, rkey)`. Rows name
+/// [`scoped_ids`] for `follows` or `blocks`, keyed by `(author, rkey)`. Rows name
 /// their accounts by id: `<alias>a` and `<alias>s` are the author's and the
 /// subject's `dids` rows, which `pred` names. The DID is `$1`.
 fn scoped_graph(table: &'static str, alias: &str, pred: &str) -> Step {
@@ -302,7 +285,7 @@ fn scoped_graph(table: &'static str, alias: &str, pred: &str) -> Step {
     scoped_ids(table, &["author", "rkey"], alias, &from, &format!("{alias}a.did"), pred)
 }
 
-/// [`scoped`] for `likes` or `reposts`, keyed by `(author, rkey)`;
+/// [`scoped_ids`] for `likes` or `reposts`, keyed by `(author, rkey)`;
 /// `<alias>a` is the author's `dids` row, which `pred` names. The DID is
 /// `$1`.
 fn scoped_interaction(table: &'static str, alias: &str, pred: &str) -> Step {
@@ -393,21 +376,22 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
         ),
         // Identity rows: out of scope, not a member, and no class-M row
         // authored by the DID remains in any table.
-        scoped(
+        scoped_ids_with(
             "actors",
-            "did",
+            &["id"],
             "a",
-            "a.did",
+            "actors a JOIN dids ad ON ad.id = a.id",
+            "ad.did",
             &format!(
                 "{} AND NOT {} \
-                 AND NOT EXISTS (SELECT 1 FROM posts x JOIN dids xd ON xd.id = x.author WHERE xd.did = a.did) \
-                 AND NOT EXISTS (SELECT 1 FROM likes x JOIN dids xd ON xd.id = x.author WHERE xd.did = a.did) \
-                 AND NOT EXISTS (SELECT 1 FROM reposts x JOIN dids xd ON xd.id = x.author WHERE xd.did = a.did) \
-                 AND NOT EXISTS (SELECT 1 FROM follows x JOIN dids xd ON xd.id = x.author WHERE xd.did = a.did) \
-                 AND NOT EXISTS (SELECT 1 FROM blocks x JOIN dids xd ON xd.id = x.author WHERE xd.did = a.did) \
-                 AND NOT (a.did = ANY($1::text[]))",
-                out_and_not_r("a.did"),
-                member_among(&["a.did".to_string()])
+                 AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.author = a.id) \
+                 AND NOT EXISTS (SELECT 1 FROM likes x WHERE x.author = a.id) \
+                 AND NOT EXISTS (SELECT 1 FROM reposts x WHERE x.author = a.id) \
+                 AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.author = a.id) \
+                 AND NOT EXISTS (SELECT 1 FROM blocks x WHERE x.author = a.id) \
+                 AND NOT (ad.did = ANY($1::text[]))",
+                out_and_not_r("ad.did"),
+                member_among(&["ad.did".to_string()])
             ),
             Bind::Dids(private_row_authors),
         ),
@@ -419,7 +403,7 @@ fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
             "actor_counts ac JOIN dids acd ON acd.id = ac.id",
             "acd.did",
             &format!(
-                "{} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.did = acd.did)",
+                "{} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.id = ac.id)",
                 out_and_not_r("acd.did")
             ),
         ),
@@ -1129,7 +1113,7 @@ mod tests {
         assert!(sql("likes").contains("WHERE la.did = $1 AND "));
         assert!(sql("blocks").contains("WHERE ba.did = $1 AND "));
         // actors binds a DID array first.
-        assert!(sql("actors").contains("WHERE a.did = $2 AND "));
+        assert!(sql("actors").contains("WHERE ad.did = $2 AND "));
     }
 
     #[test]
@@ -1297,10 +1281,8 @@ mod tests {
             exec(p, &format!("INSERT INTO members (did, source) VALUES ('{MEMBER}', 'admin')")).await;
             exec(p, &format!("INSERT INTO scope_dids (did, reasons) VALUES ('{MEMBER}', 1), ('{SCOPED}', 4)")).await;
             for d in [SCOPED, LONE] {
-                exec(p, &format!(
-                    "INSERT INTO actors (did, handle, pds_endpoint, profile_record) VALUES ('{d}', '{d}', 'https://pds.example.com', '{{}}'::jsonb)"
-                ))
-                .await;
+                let handle = format!("'{d}'");
+                exec(p, &crate::test_support::actors::put_sql(d, &[("handle", &handle), ("pds_endpoint", "'https://pds.example.com'"), ("profile_record", "'{}'")])).await;
             }
             block(p, STRANGER, "nn", OTHER).await; // no member side: goes
             block(p, STRANGER, "nm", MEMBER).await; // names a member: stays
@@ -1320,7 +1302,7 @@ mod tests {
             );
             assert_eq!(rows(p, "SELECT a.did FROM list_blocks b JOIN dids a ON a.id = b.author").await, [MEMBER]);
             // The identity row out of S went with its blocks; the one in S stays.
-            assert_eq!(rows(p, "SELECT did FROM actors ORDER BY did").await, [SCOPED]);
+            assert_eq!(crate::test_support::actors::dids(p).await, [SCOPED]);
             db.drop_db().await;
         }
 
@@ -1388,7 +1370,7 @@ mod tests {
             crate::test_support::posts::put(p, did, "3k", &record, Some(old)).await;
             for sql in [
                 crate::test_support::interactions::post_counts_sql(&format!("at://{did}/app.bsky.feed.post/3k"), 0, 0, 0, 0),
-                format!("INSERT INTO actors (did) VALUES ('{did}')"),
+                crate::test_support::actors::put_sql(did, &[]),
             ] {
                 sqlx::query(&sql).execute(p).await.expect("seed");
             }
@@ -1413,7 +1395,7 @@ mod tests {
             let mut n = 0i64;
             n += crate::test_support::interactions::count_by(p, "likes", did).await;
             n += crate::test_support::posts::count_by(p, did).await;
-            n += sqlx::query_scalar::<_, i64>("SELECT count(*) FROM actors WHERE did = $1").bind(did).fetch_one(p).await.expect("count");
+            n += sqlx::query_scalar::<_, i64>("SELECT count(*) FROM actors a JOIN dids d ON d.id = a.id WHERE d.did = $1").bind(did).fetch_one(p).await.expect("count");
             n += sqlx::query_scalar::<_, i64>("SELECT count(*) FROM follows f JOIN dids a ON a.id = f.author WHERE a.did = $1")
                 .bind(did)
                 .fetch_one(p)

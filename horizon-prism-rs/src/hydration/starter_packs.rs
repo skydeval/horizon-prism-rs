@@ -260,7 +260,7 @@ impl Hydrator {
         let limit = i64::from(limit.clamp(1, 100));
         let from = format!(
             " FROM starter_packs sp JOIN dids spd ON spd.id = sp.author CROSS JOIN LATERAL (SELECT spd.did AS author_did) n \
-              LEFT JOIN actors a ON a.did = spd.did \
+              LEFT JOIN actors a ON a.id = sp.author \
               WHERE ($1::text IS NULL OR ({exclusions})) \
                 AND sp.search_tsv @@ websearch_to_tsquery('simple', $2) \
                 AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = spd.did) \

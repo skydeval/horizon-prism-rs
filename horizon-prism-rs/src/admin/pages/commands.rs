@@ -46,7 +46,7 @@ pub async fn page(
         Err(response) => return response,
     };
     let row: Option<CommandTuple> = match sqlx::query_as(&format!(
-        "SELECT {COMMAND_COLUMNS} FROM admin_commands c LEFT JOIN actors a ON a.did = c.requested_by WHERE c.id = $1"
+        "SELECT {COMMAND_COLUMNS} FROM admin_commands c LEFT JOIN dids ad ON ad.did = c.requested_by LEFT JOIN actors a ON a.id = ad.id WHERE c.id = $1"
     ))
     .bind(id)
     .fetch_optional(&state.pool)

@@ -96,17 +96,7 @@ impl PostRecord {
         let quote_uri = embed.as_ref().and_then(quote_target);
         let facets = record.get("facets").filter(|f| !f.is_null()).cloned();
         let mention_dids = facets.as_ref().map(mentions).unwrap_or_default();
-        let self_labels = record
-            .get("labels")
-            .and_then(|l| l.get("values"))
-            .and_then(Value::as_array)
-            .map(|vals| {
-                vals.iter()
-                    .filter_map(|v| v.get("val").and_then(Value::as_str))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let self_labels = self_label_values(record);
         let langs = record.get("langs").and_then(Value::as_array).map(|a| {
             a.iter()
                 .filter_map(Value::as_str)
@@ -132,6 +122,18 @@ impl PostRecord {
             created_at: created_at(record, now),
         })
     }
+}
+
+/// A record's self-label values: the string `val` of each entry of
+/// `labels.values`.
+#[must_use]
+pub fn self_label_values(record: &Value) -> Vec<String> {
+    record
+        .get("labels")
+        .and_then(|l| l.get("values"))
+        .and_then(Value::as_array)
+        .map(|vals| vals.iter().filter_map(|v| v.get("val").and_then(Value::as_str)).map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// The quoted post of an `app.bsky.embed.record` or `recordWithMedia` embed.
@@ -227,6 +229,8 @@ pub struct ProfileRecord {
     pub pronouns: Option<String>,
     pub website: Option<String>,
     pub joined_via_starter_pack: Option<StrongRef>,
+    /// Its self-label values.
+    pub self_labels: Vec<String>,
     /// The record's `createdAt`, clamped as for posts; `None` when the
     /// record has none or it does not parse.
     pub created_at: Option<DateTime<Utc>>,
@@ -244,6 +248,7 @@ impl ProfileRecord {
             pronouns: text("pronouns"),
             website: text("website"),
             joined_via_starter_pack: optional_ref(record.get("joinedViaStarterPack")),
+            self_labels: self_label_values(record),
             created_at: record
                 .get("createdAt")
                 .and_then(Value::as_str)

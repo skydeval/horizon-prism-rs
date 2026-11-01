@@ -4,13 +4,14 @@
 //!
 //! **Phase 1: column backfill.**
 //! - `actors`: sets the profile columns from `profile_record`, in keyset
-//!   batches by `did`. A batch updates only rows whose `profile_rev` is the
+//!   batches by account id. A batch updates only rows whose `profile_rev` is the
 //!   one it read, so a row the ingest writer rewrote meanwhile is never
 //!   overwritten with values derived from a stale read. `profile_cid` is not
 //!   derived here: it comes with the record on the next profile write or
 //!   re-sync.
 //! - Progress is kept in `worker_state` (`backfill:actors_v3`), so a
-//!   restart resumes. (The search columns of posts were filled here once;
+//!   restart resumes; a cursor stored before rows were keyed by id starts
+//!   the table again. (The search columns of posts were filled here once;
 //!   they now live in `post_search`, which migration 0057 filled.)
 //!
 //! **Phase 2: large-table indexes**, after phase 1, one at a time, each with
@@ -20,8 +21,9 @@
 //! A failed build is retried after a backoff that doubles up to an hour.
 //!
 //! **Phase 3: records compressed**, one record family at a time, the
-//! families side by side: posts, and the other kept records (lists, starter
-//! packs, gates, polls, labeler services, self records). Once the instance
+//! families side by side: posts, profiles, and the other kept records
+//! (lists, starter packs, gates, polls, labeler services, self records).
+//! Once the instance
 //! holds [`TRAIN_RECORDS`] records of a family, a dictionary is trained from
 //! the earliest of them and stored in `record_dicts`; writes use it from
 //! then on. Then the rows still stored as dict 0 (the JSON text) are
@@ -72,19 +74,31 @@ pub const METRIC_RECOMPRESS_REMAINING: &str = "record_recompress_remaining";
 /// `other_record_recompress_remaining`: an estimate of the other kept
 /// records' rows not yet visited.
 pub const METRIC_OTHER_RECOMPRESS_REMAINING: &str = "other_record_recompress_remaining";
+/// `profile_record_recompress_remaining`: an estimate of the profile rows
+/// not yet visited.
+pub const METRIC_PROFILE_RECOMPRESS_REMAINING: &str = "profile_record_recompress_remaining";
 
 /// A table whose rows keep their record, as the recompression visits it:
-/// keyed by `author` and `key` (a column, or `None` for a table keyed by its
-/// author alone).
+/// keyed by its `author` column and `key` (a column, or `None` for a table
+/// keyed by its author alone), its record in `record` at rev `rev`, its
+/// rows ordered in time by `at` for training.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordTable {
     pub table: &'static str,
+    pub author: &'static str,
     pub key: Option<&'static str>,
+    pub rev: &'static str,
+    pub record: &'static str,
+    pub at: &'static str,
 }
 
 impl RecordTable {
     const fn rkey(table: &'static str) -> Self {
-        Self { table, key: Some("rkey") }
+        Self::keyed(table, Some("rkey"))
+    }
+
+    const fn keyed(table: &'static str, key: Option<&'static str>) -> Self {
+        Self { table, author: "author", key, rev: "rev", record: "record", at: "created_at" }
     }
 
     /// SQL: the row's second key over alias `t`, as a bigint.
@@ -123,10 +137,20 @@ pub const OTHER: RecordFamily = RecordFamily {
         RecordTable::rkey("threadgates"),
         RecordTable::rkey("postgates"),
         RecordTable::rkey("nearhorizon_poll_posts"),
-        RecordTable { table: "labeler_services", key: None },
-        RecordTable { table: "actor_self_records", key: Some("coll") },
+        RecordTable::keyed("labeler_services", None),
+        // Self records keep no creation time; their first-seen time stands
+        // in.
+        RecordTable { at: "indexed_at", ..RecordTable::keyed("actor_self_records", Some("coll")) },
     ],
     metric: METRIC_OTHER_RECOMPRESS_REMAINING,
+};
+
+/// The profiles, kept on their account's `actors` row, which has none until
+/// a profile is stored. The row's first-seen time orders them.
+pub const PROFILES: RecordFamily = RecordFamily {
+    family: super::records::FAMILY_PROFILES,
+    tables: &[RecordTable { table: "actors", author: "id", key: None, rev: "profile_rev", record: "profile_record", at: "indexed_at" }],
+    metric: METRIC_PROFILE_RECOMPRESS_REMAINING,
 };
 /// `posts_dead_rows`: dead tuples in `posts`, which the rewrites leave until
 /// a vacuum (or a repack) takes them.
@@ -231,40 +255,42 @@ fn lost_a_lock_race(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().is_some_and(|c| c == "40P01" || c == "55P03"))
 }
 
-/// One `actors` batch after `after`, over rows that have a profile rev.
+/// One `actors` batch after `after` (an account id; anything else starts
+/// from the first), over rows that have a profile rev.
 async fn actors_batch(pool: &PgPool, after: &str, limit: i64) -> Result<Option<(String, i64)>, sqlx::Error> {
-    let rows: Vec<(String, String, Option<Value>)> = sqlx::query_as(
-        "SELECT did, profile_rev, profile_record FROM actors WHERE did > $1 AND profile_rev IS NOT NULL ORDER BY did LIMIT $2",
+    let after: i32 = after.parse().unwrap_or(i32::MIN);
+    let rows: Vec<(i32, i64, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT id, profile_rev, profile_record FROM actors WHERE id > $1 AND profile_rev IS NOT NULL ORDER BY id LIMIT $2",
     )
     .bind(after)
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    let Some(last) = rows.last().map(|r| r.0.clone()) else {
+    let Some(last) = rows.last().map(|r| r.0.to_string()) else {
         return Ok(None);
     };
     let now = Utc::now();
-    let values: Vec<Value> = rows
-        .iter()
-        .filter_map(|(did, rev, record)| {
-            let p = ProfileRecord::parse(record.as_ref()?, now);
-            Some(json!({
-                "did": did, "rev": rev, "pronouns": p.pronouns, "website": p.website,
-                "via_uri": p.joined_via_starter_pack.as_ref().map(|s| s.uri.clone()),
-                "via_cid": p.joined_via_starter_pack.as_ref().and_then(|s| s.cid.clone()),
-                "created": p.created_at.map(|t| t.to_rfc3339()),
-            }))
-        })
-        .collect();
+    let mut values: Vec<Value> = Vec::with_capacity(rows.len());
+    for (id, rev, stored) in &rows {
+        let Some(stored) = stored else { continue };
+        let record = super::records::decode_value(pool, stored).await?;
+        let p = ProfileRecord::parse(&record, now);
+        values.push(json!({
+            "id": id, "rev": rev, "pronouns": p.pronouns, "website": p.website,
+            "via_uri": p.joined_via_starter_pack.as_ref().map(|s| s.uri.clone()),
+            "via_cid": p.joined_via_starter_pack.as_ref().and_then(|s| s.cid.clone()),
+            "created": p.created_at.map(|t| t.to_rfc3339()),
+        }));
+    }
     // `profile_created_at` is clamped to the row's first-seen time plus five
-    // minutes, as a post's is (§3.1).
+    // minutes, as a post's is. The CID is kept in its text form.
     sqlx::query(
         "UPDATE actors a SET pronouns = v.pronouns, website = v.website, \
-           joined_via_starter_pack_uri = v.via_uri, joined_via_starter_pack_cid = v.via_cid, \
+           joined_via_starter_pack_uri = v.via_uri, joined_via_starter_pack_cid = '\\x00'::bytea || convert_to(v.via_cid, 'UTF8'), \
            profile_created_at = LEAST(v.created, a.indexed_at + interval '5 minutes') \
-         FROM jsonb_to_recordset($1::jsonb) AS v(did text, rev text, pronouns text, website text, \
+         FROM jsonb_to_recordset($1::jsonb) AS v(id integer, rev bigint, pronouns text, website text, \
            via_uri text, via_cid text, created timestamptz) \
-         WHERE a.did = v.did AND a.profile_rev = v.rev",
+         WHERE a.id = v.id AND a.profile_rev = v.rev",
     )
     .bind(Value::Array(values))
     .execute(pool)
@@ -287,12 +313,7 @@ fn samples_sql(family: RecordFamily) -> String {
     let arms: Vec<String> = family
         .tables
         .iter()
-        .map(|t| {
-            // Self records keep no creation time; their first-seen time
-            // stands in.
-            let at = if t.table == "actor_self_records" { "indexed_at" } else { "created_at" };
-            format!("SELECT record, {at} AS at FROM {}", t.table)
-        })
+        .map(|t| format!("SELECT {} AS record, {} AS at FROM {} WHERE {0} IS NOT NULL", t.record, t.at, t.table))
         .collect();
     format!("SELECT record FROM ({}) r ORDER BY at LIMIT $1", arms.join(" UNION ALL "))
 }
@@ -348,6 +369,10 @@ struct Rewrites {
     records: Vec<Vec<u8>>,
 }
 
+/// A row as the recompression reads it: its key, its rev and its record
+/// (both `None` on an account with no profile).
+type StoredRecordRow = (i32, i64, Option<i64>, Option<Vec<u8>>);
+
 /// Read one recompression batch of `table` after `after` (`author:key`):
 /// the last key read, the rows read, and the rows stored as dict 0 with
 /// their records encoded again in `family`; `None` at the end of the table.
@@ -357,8 +382,10 @@ async fn recompress_read(pool: &PgPool, family: &str, table: RecordTable, after:
         .and_then(|(a, k)| Some((a.parse::<i32>().ok()?, k.parse::<i64>().ok()?)))
         .unwrap_or((i32::MIN, i64::MIN));
     let key = table.key_sql();
-    let rows: Vec<(i32, i64, i64, Vec<u8>)> = sqlx::query_as(&format!(
-        "SELECT t.author, {key}, t.rev, t.record FROM {} t WHERE (t.author, {key}) > ($1, $2) ORDER BY t.author, {key} LIMIT $3",
+    let (author_col, rev_col, record_col) = (table.author, table.rev, table.record);
+    let rows: Vec<StoredRecordRow> = sqlx::query_as(&format!(
+        "SELECT t.{author_col}, {key}, t.{rev_col}, t.{record_col} FROM {} t WHERE (t.{author_col}, {key}) > ($1, $2) \
+         ORDER BY t.{author_col}, {key} LIMIT $3",
         table.table
     ))
     .bind(author)
@@ -371,6 +398,9 @@ async fn recompress_read(pool: &PgPool, family: &str, table: RecordTable, after:
     };
     let mut out = Rewrites::default();
     for (a, k, rev, stored) in &rows {
+        // A row without a record (an account with no profile) has nothing
+        // to compress.
+        let (Some(rev), Some(stored)) = (rev, stored) else { continue };
         if stored.first() != Some(&0) {
             continue;
         }
@@ -393,10 +423,11 @@ async fn recompress_write(pool: &PgPool, table: RecordTable, rewrites: &Rewrites
     if rewrites.authors.is_empty() {
         return Ok(0);
     }
+    let (author_col, rev_col, record_col) = (table.author, table.rev, table.record);
     Ok(sqlx::query(&format!(
-        "UPDATE {} t SET record = v.record \
+        "UPDATE {} t SET {record_col} = v.record \
          FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::bytea[]) AS v(author, rkey, rev, record) \
-         WHERE t.author = v.author AND {} = v.rkey AND t.rev = v.rev AND get_byte(t.record, 0) = 0",
+         WHERE t.{author_col} = v.author AND {} = v.rkey AND t.{rev_col} = v.rev AND get_byte(t.{record_col}, 0) = 0",
         table.table,
         table.key_sql()
     ))
@@ -675,7 +706,7 @@ impl SchemaBackfill {
                     self.run_index_builds().await?;
                     // Each family waits for its own records; neither holds
                     // the other back.
-                    tokio::try_join!(self.run_recompression(POSTS), self.run_recompression(OTHER))?;
+                    tokio::try_join!(self.run_recompression(POSTS), self.run_recompression(PROFILES), self.run_recompression(OTHER))?;
                     Ok::<(), sqlx::Error>(())
                 }
                 .await;
@@ -710,15 +741,25 @@ mod tests {
         )
     }
 
+    const REV_A: &str = "3kaaaaaaaaaaa";
+    const REV_B: &str = "3kbbbbbbbbbbb";
+
     /// An actor row as written before the profile columns existed.
     async fn old_actor(pool: &PgPool, did: &str, rev: Option<&str>, record: Option<Value>) {
-        sqlx::query("INSERT INTO actors (did, profile_rev, profile_record, indexed_at) VALUES ($1, $2, $3, '2026-01-01T00:00:00Z')")
-            .bind(did)
-            .bind(rev)
-            .bind(record)
-            .execute(pool)
-            .await
-            .expect("actor");
+        let rev = rev.map(|r| format!("'{r}'"));
+        let record = record.map(|r| format!("'{r}'"));
+        let mut columns: Vec<(&str, &str)> = vec![("indexed_at", "'2026-01-01T00:00:00Z'")];
+        if let Some(r) = &rev {
+            columns.push(("profile_rev", r));
+        }
+        if let Some(r) = &record {
+            columns.push(("profile_record", r));
+        }
+        crate::test_support::actors::put(pool, did, &columns).await;
+    }
+
+    async fn id_of(pool: &PgPool, did: &str) -> i32 {
+        crate::db::ids::account_id(pool, did).await.expect("id").expect("interned")
     }
 
     #[tokio::test]
@@ -729,16 +770,16 @@ mod tests {
         let p = &db.pool;
         for i in 0..5 {
             let record = json!({"pronouns": format!("p{i}"), "website": "https://a.example", "createdAt": "2030-01-01T00:00:00Z"});
-            old_actor(p, &format!("did:plc:a{i}"), Some("3k"), Some(record)).await;
+            old_actor(p, &format!("did:plc:a{i}"), Some(REV_A), Some(record)).await;
         }
         // Rows with no rev, or no record, are passed over.
         old_actor(p, "did:plc:b", None, None).await;
-        old_actor(p, "did:plc:c", Some("3k"), None).await;
+        old_actor(p, "did:plc:c", Some(REV_A), None).await;
 
         // A batch of two, interrupted after one batch: the cursor is kept.
         let t = task(p, 2);
         let first = actors_batch(p, "", 2).await.expect("batch").expect("rows");
-        assert_eq!(first, ("did:plc:a1".to_string(), 2));
+        assert_eq!(first, (id_of(p, "did:plc:a1").await.to_string(), 2));
         save_progress(p, KEY_ACTORS, &Progress { cursor: first.0, done: false, visited: 2 }).await.expect("save");
 
         assert!(!t.status().backfill_done());
@@ -747,7 +788,8 @@ mod tests {
         assert!(load_progress(p, KEY_ACTORS).await.expect("progress").done);
 
         let filled: Vec<(String, Option<String>, bool)> = sqlx::query_as(
-            "SELECT did, pronouns, profile_created_at = '2026-01-01T00:05:00Z' FROM actors WHERE did LIKE 'did:plc:a%' ORDER BY did",
+            "SELECT d.did, a.pronouns, a.profile_created_at = '2026-01-01T00:05:00Z' FROM actors a JOIN dids d ON d.id = a.id \
+             WHERE d.did LIKE 'did:plc:a%' ORDER BY d.did",
         )
         .fetch_all(p)
         .await
@@ -755,11 +797,16 @@ mod tests {
         // The future createdAt is clamped to first-seen plus five minutes.
         let expected: Vec<(String, Option<String>, bool)> = (0..5).map(|i| (format!("did:plc:a{i}"), Some(format!("p{i}")), true)).collect();
         assert_eq!(filled, expected);
-        let cid: Option<String> = sqlx::query_scalar("SELECT profile_cid FROM actors WHERE did = 'did:plc:a0'").fetch_one(p).await.expect("cid");
+        let cid: Option<Vec<u8>> = sqlx::query_scalar(&format!("SELECT profile_cid FROM actors WHERE {}", crate::test_support::actors::is("", "did:plc:a0")))
+            .fetch_one(p)
+            .await
+            .expect("cid");
         assert_eq!(cid, None, "the CID is left for the next write");
 
-        // Running again does nothing and stays done.
+        // A cursor stored before rows were keyed by id starts again.
+        save_progress(p, KEY_ACTORS, &Progress { cursor: "did:plc:a1".into(), done: false, visited: 0 }).await.expect("save");
         t.run_column_backfill().await.expect("again");
+        assert!(load_progress(p, KEY_ACTORS).await.expect("progress").done);
         db.drop_db().await;
     }
 
@@ -769,21 +816,65 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        old_actor(p, "did:plc:a", Some("3k"), Some(json!({"pronouns": "old"}))).await;
+        old_actor(p, "did:plc:a", Some(REV_A), Some(json!({"pronouns": "old"}))).await;
         // The batch's update names the rev it read; the row has since been
         // rewritten by the writer, so the guard on the rev leaves it alone.
-        sqlx::query("UPDATE actors SET profile_rev = '3l', pronouns = 'new' WHERE did = 'did:plc:a'").execute(p).await.expect("rewrite");
+        let rewrite = crate::test_support::actors::update_sql("did:plc:a", &format!("profile_rev = rev_to_bigint('{REV_B}'), pronouns = 'new'"));
+        sqlx::query(&rewrite).execute(p).await.expect("rewrite");
         let n = sqlx::query(
             "UPDATE actors a SET pronouns = v.pronouns \
-             FROM jsonb_to_recordset($1::jsonb) AS v(did text, rev text, pronouns text) \
-             WHERE a.did = v.did AND a.profile_rev = v.rev",
+             FROM jsonb_to_recordset($1::jsonb) AS v(id integer, rev bigint, pronouns text) \
+             WHERE a.id = v.id AND a.profile_rev = v.rev",
         )
-        .bind(json!([{"did": "did:plc:a", "rev": "3k", "pronouns": "old"}]))
+        .bind(json!([{"id": id_of(p, "did:plc:a").await, "rev": crate::db::ids::rev_value(REV_A), "pronouns": "old"}]))
         .execute(p)
         .await
         .expect("update")
         .rows_affected();
         assert_eq!(n, 0);
+        db.drop_db().await;
+    }
+
+    /// Profiles: stored as dict 0, rewritten with their dictionary once
+    /// there is one; an account with no profile is passed over, and a
+    /// profile purged between a batch's read and its write stays purged.
+    #[tokio::test]
+    async fn profile_records_are_compressed_and_a_purge_is_kept() {
+        let Some(db) = fresh_db("schema_backfill_recompress_profiles").await else {
+            return;
+        };
+        let p = &db.pool;
+        let profile = |name: &str| json!({"$type": "app.bsky.actor.profile", "displayName": name, "description": format!("about {name}")});
+        for (did, name) in [("did:plc:a", "Ann"), ("did:plc:b", "Bea")] {
+            old_actor(p, did, Some(REV_A), Some(profile(name))).await;
+        }
+        old_actor(p, "did:plc:c", None, None).await;
+        assert_eq!(train_dict(p, PROFILES).await.expect("train"), None, "too few records to train from");
+
+        let samples: Vec<Vec<u8>> = (0..500).map(|i| profile(&format!("name {i}")).to_string().into_bytes()).collect();
+        let dict = crate::db::ids::train_dict(&samples, 16 * 1024).expect("dictionary");
+        sqlx::query("INSERT INTO record_dicts (id, family, bytes) VALUES (1, 'profiles', $1)").bind(&dict).execute(p).await.expect("dict");
+        crate::db::records::reload(p).await.expect("reload");
+
+        let actors = PROFILES.tables[0];
+        let (_, read, rewrites) = recompress_read(p, PROFILES.family, actors, "", 100).await.expect("read").expect("rows");
+        assert_eq!((read, rewrites.authors.len()), (3, 2), "the account with no profile is read and passed over");
+        // A purge between the read and the write.
+        let purge = crate::test_support::actors::update_sql("did:plc:b", "profile_record = NULL, profile_rev = NULL, display_name = NULL");
+        sqlx::query(&purge).execute(p).await.expect("purge");
+        assert_eq!(recompress_write(p, actors, &rewrites).await.expect("write"), 1);
+        assert_eq!(crate::test_support::actors::record(p, "did:plc:b").await, None, "the purged profile stays purged");
+        let stored: Vec<u8> = sqlx::query_scalar(&format!("SELECT profile_record FROM actors WHERE {}", crate::test_support::actors::is("", "did:plc:a")))
+            .fetch_one(p)
+            .await
+            .expect("record");
+        assert_eq!(stored[0], 1, "rewritten with the dictionary");
+        assert_eq!(crate::test_support::actors::record(p, "did:plc:a").await, Some(profile("Ann")));
+
+        let t = task(p, 1);
+        t.run_recompression(PROFILES).await.expect("recompress");
+        assert!(load_progress(p, "records:recompress_actors").await.expect("progress").done);
+        t.run_recompression(PROFILES).await.expect("again");
         db.drop_db().await;
     }
 

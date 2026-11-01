@@ -30,7 +30,7 @@ const BOB_HANDLE: &str = "bob.example.com";
 /// Bob as a member with a stored handle.
 async fn bob_member(h: &Harness) {
     let p = h.pool();
-    sqlx::query("INSERT INTO actors (did, handle, pds_endpoint) VALUES ($1, $2, 'https://pds.bob.example')").bind(BOB).bind(BOB_HANDLE).execute(p).await.expect("actor");
+    crate::test_support::actors::put(p, BOB, &[("handle", &format!("'{BOB_HANDLE}'")), ("pds_endpoint", "'https://pds.bob.example'")]).await;
     sqlx::query("INSERT INTO members (did, source, ready_at, first_ready_at) VALUES ($1, 'admin', now(), now())").bind(BOB).execute(p).await.expect("member");
 }
 
@@ -219,7 +219,7 @@ async fn refract_accounts_page() {
     };
     let p = h.pool();
     let alice = complete_setup(&h, ALICE).await;
-    sqlx::query("INSERT INTO actors (did, handle, pds_endpoint) VALUES ($1, $2, 'https://community-a.example')").bind(BOB).bind(BOB_HANDLE).execute(p).await.expect("actor");
+    crate::test_support::actors::put(p, BOB, &[("handle", &format!("'{BOB_HANDLE}'")), ("pds_endpoint", "'https://community-a.example'")]).await;
     let verdict = json!({"at": "2026-10-22T00:00:00Z", "rules": [{"rule": 1, "result": "pass", "detail": "AccountTakedown"}]});
     sqlx::query(
         "INSERT INTO refract_dids (did, community, pds_host, state, source, since, last_verdict) VALUES ($1, 'community-a', 'community-a.example', 'restored', 'fill', now(), $2)",

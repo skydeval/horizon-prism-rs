@@ -139,7 +139,9 @@ impl Hydrator {
     ) -> Result<PublicEmit<Value>, HydrationError> {
         let mut out_profiles = Vec::new();
         let mut missing_profiles: Vec<String> = Vec::new();
-        let stored: HashSet<String> = sqlx::query_scalar("SELECT did FROM actors WHERE did = ANY($1) AND profile_record IS NOT NULL")
+        let stored: HashSet<String> = sqlx::query_scalar(
+            "SELECT d.did FROM dids d JOIN actors a ON a.id = d.id WHERE d.did = ANY($1) AND a.profile_record IS NOT NULL",
+        )
             .bind(profiles)
             .fetch_all(self.pool())
             .await?
@@ -387,11 +389,7 @@ impl Hydrator {
             .await?;
         let next = (items.len() == usize::try_from(limit).unwrap_or(usize::MAX)).then(|| items.last().map(|i| local_cursor(i.sort_at, &i.uri))).flatten();
         if include_pins && cursor.is_none() {
-            let pinned: Option<String> = sqlx::query_scalar("SELECT profile_record #>> '{pinnedPost,uri}' FROM actors WHERE did = $1")
-                .bind(did)
-                .fetch_optional(self.pool())
-                .await?
-                .flatten();
+            let pinned = crate::db::actors::pinned_post(self.pool(), did).await?;
             if let Some(pin) = pinned.filter(|u| uri_author(u) == Some(did)) {
                 items.retain(|i| i.post_uri != pin || i.kind == "repost");
                 items.insert(0, FeedItem { uri: pin.clone(), originator_did: did.to_string(), post_uri: pin, kind: "pin".to_string(), sort_at: chrono::Utc::now() });
@@ -617,7 +615,10 @@ impl Hydrator {
     /// Database errors.
     pub async fn refract_search_page(&self, restored: &[String], q: &str, after: Option<&SearchKey>, limit: usize) -> Result<(Vec<String>, Option<SearchKey>), sqlx::Error> {
         let rows: Vec<(String, String, Option<String>)> =
-            sqlx::query_as("SELECT did, handle, display_name FROM actors WHERE did = ANY($1) AND handle IS NOT NULL AND handle <> $2")
+            sqlx::query_as(
+                "SELECT d.did, a.handle, a.display_name FROM dids d JOIN actors a ON a.id = d.id \
+                 WHERE d.did = ANY($1) AND a.handle IS NOT NULL AND a.handle <> $2",
+            )
                 .bind(restored)
                 .bind(super::INVALID_HANDLE)
                 .fetch_all(self.pool())

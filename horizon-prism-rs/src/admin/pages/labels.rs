@@ -164,7 +164,8 @@ pub async fn labels_of(state: &AdminState, filter: Option<&Subject>, val: Option
     };
     let rows: Vec<LabelTuple> = sqlx::query_as(
         "SELECT l.subject, l.val, l.created_at, a.handle FROM labels l \
-         LEFT JOIN actors a ON a.did = CASE WHEN l.subject LIKE 'at://%' THEN split_part(substr(l.subject, 6), '/', 1) ELSE l.subject END \
+         LEFT JOIN dids ad ON ad.did = CASE WHEN l.subject LIKE 'at://%' THEN split_part(substr(l.subject, 6), '/', 1) ELSE l.subject END \
+         LEFT JOIN actors a ON a.id = ad.id \
          WHERE ($1::text IS NULL OR ($2::text IS NULL AND (l.subject = $1 OR left(l.subject, length($1) + 6) = 'at://' || $1 || '/')) OR l.subject = $2) \
            AND ($3::text IS NULL OR l.val = $3) \
          ORDER BY l.created_at DESC, l.id DESC LIMIT $4 OFFSET $5",

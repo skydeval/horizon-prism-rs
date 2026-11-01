@@ -18,6 +18,7 @@ use super::net::Answer;
 use super::state::{ABSENT, State};
 use crate::config::{LabelSource, RefractCommunity};
 use crate::constellation::matcher::pds_host;
+use crate::db::ids::AccountId;
 use crate::identity::refresher::{RepoStatus, Suspicion, account_status, advance_suspicion, is_repo_not_found};
 use crate::identity::resolver::extract_info;
 
@@ -494,6 +495,9 @@ impl Refract {
         let did = row.did.clone();
         let communities = self.communities();
         let mut sets = self.inner.scope.write_guard().await;
+        // The account's id, in its own statement before the transaction: a
+        // DID entering R gets an `actors` row keyed by it.
+        let account = crate::db::ids::intern_account(&self.inner.pool, &did).await?;
         let mut tx = self.inner.pool.begin().await?;
         let current: Option<(i64, i64)> = sqlx::query_as("SELECT version, due_seq FROM refract_dids WHERE did = $1 FOR UPDATE")
             .bind(&did)
@@ -627,8 +631,10 @@ impl Refract {
         .execute(&mut *tx)
         .await?;
         // What a DID entering or in R tells the gate (§4.1 rule 3).
-        if decision.to.in_r() || decision.to == State::Ending {
-            write_actor(&mut tx, &did, w.endpoint.as_deref(), w.status.as_deref()).await?;
+        if (decision.to.in_r() || decision.to == State::Ending)
+            && let Some(account) = account
+        {
+            write_actor(&mut tx, account, w.endpoint.as_deref(), w.status.as_deref()).await?;
         }
         if clear_awaiting {
             super::enqueue_backfill(&mut tx, &did).await?;
@@ -661,13 +667,13 @@ struct Written {
 }
 
 /// The `actors` facts the gate reads for a DID in R (§4.1 rule 3, §5.5).
-async fn write_actor(conn: &mut PgConnection, did: &str, endpoint: Option<&str>, status: Option<&str>) -> Result<(), sqlx::Error> {
+async fn write_actor(conn: &mut PgConnection, account: AccountId, endpoint: Option<&str>, status: Option<&str>) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO actors (did, pds_endpoint, account_status, status_checked_at) VALUES ($1, $2, COALESCE($3, 'active'), CASE WHEN $3 IS NULL THEN NULL ELSE now() END) \
-         ON CONFLICT (did) DO UPDATE SET pds_endpoint = COALESCE(EXCLUDED.pds_endpoint, actors.pds_endpoint), \
+        "INSERT INTO actors (id, pds_endpoint, account_status, status_checked_at) VALUES ($1, $2, COALESCE($3, 'active'), CASE WHEN $3 IS NULL THEN NULL ELSE now() END) \
+         ON CONFLICT (id) DO UPDATE SET pds_endpoint = COALESCE(EXCLUDED.pds_endpoint, actors.pds_endpoint), \
            account_status = COALESCE($3, actors.account_status), status_checked_at = CASE WHEN $3 IS NULL THEN actors.status_checked_at ELSE now() END",
     )
-    .bind(did)
+    .bind(account)
     .bind(endpoint)
     .bind(status)
     .execute(conn)

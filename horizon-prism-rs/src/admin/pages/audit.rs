@@ -136,7 +136,7 @@ pub async fn page(
     let st = f.state.as_deref().filter(|v| !v.is_empty());
     let read = async {
         let commands: Vec<CommandTuple> = sqlx::query_as(&format!(
-            "SELECT {COMMAND_COLUMNS} FROM admin_commands c LEFT JOIN actors a ON a.did = c.requested_by \
+            "SELECT {COMMAND_COLUMNS} FROM admin_commands c LEFT JOIN dids ad ON ad.did = c.requested_by LEFT JOIN actors a ON a.id = ad.id \
              WHERE ($1::text IS NULL OR ($1 = 'cli' AND c.requested_by IS NULL) OR c.requested_by = $1 OR a.handle = $1) \
                AND ($2::text IS NULL OR c.command = $2) AND ($3::text IS NULL OR c.state = $3) \
              ORDER BY c.id DESC LIMIT $4 OFFSET $5"
@@ -149,7 +149,7 @@ pub async fn page(
         .fetch_all(&state.pool)
         .await?;
         let logins: Vec<LoginTuple> = sqlx::query_as(
-            "SELECT l.at, l.did, a.handle, l.outcome, l.client_ip FROM admin_logins l LEFT JOIN actors a ON a.did = l.did \
+            "SELECT l.at, l.did, a.handle, l.outcome, l.client_ip FROM admin_logins l LEFT JOIN dids ad ON ad.did = l.did LEFT JOIN actors a ON a.id = ad.id \
              ORDER BY l.id DESC LIMIT 100",
         )
         .fetch_all(&state.pool)

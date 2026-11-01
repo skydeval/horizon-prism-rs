@@ -289,7 +289,7 @@ async fn t8ao_t8l_label_writes_need_the_row() {
     // T-8l.
     h.row(OTHER, "north", "candidate").await;
     assert!(crate::refract::make_due_on_event(&h.pool, OTHER).await.expect("event"), "candidate-only: nothing else is written");
-    sqlx::query("INSERT INTO actors (did) VALUES ($1)").bind(OTHER).execute(&h.pool).await.expect("actor");
+    crate::test_support::actors::put(&h.pool, OTHER, &[]).await;
     assert!(!crate::refract::make_due_on_event(&h.pool, OTHER).await.expect("event"));
     assert!(!crate::refract::make_due_on_event(&h.pool, "did:plc:nobody").await.expect("event"));
     db.drop_db().await;

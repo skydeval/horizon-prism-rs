@@ -58,10 +58,7 @@ impl Hydrator {
         if repo.starts_with("did:") {
             return Ok(proto_blue::syntax::Did::is_valid(repo).then(|| repo.to_string()));
         }
-        let did: Option<String> = sqlx::query_scalar("SELECT did FROM actors WHERE handle = $1")
-            .bind(repo.to_ascii_lowercase())
-            .fetch_optional(self.pool())
-            .await?;
+        let did = crate::db::actors::did_of_handle(self.pool(), &repo.to_ascii_lowercase()).await?;
         let Some(did) = did else { return Ok(None) };
         let scope = self.scope().read_guard().await;
         Ok((scope.in_scope(&did) || scope.is_member(&did)).then_some(did))
@@ -82,10 +79,7 @@ impl Hydrator {
             if !self.in_scope_or_member(did).await {
                 return Ok(None);
             }
-            return sqlx::query_as("SELECT profile_cid, profile_record FROM actors WHERE did = $1 AND profile_cid IS NOT NULL AND profile_record IS NOT NULL")
-                .bind(did)
-                .fetch_optional(self.pool())
-                .await;
+            return crate::db::actors::record_with_cid(self.pool(), did).await;
         }
         if SELF_RECORDS.contains(&collection) {
             return self.keyed_record("actor_self_records", uri, "").await;
@@ -222,12 +216,12 @@ mod tests {
 
         // The profile needs its CID, and only `self` names it.
         assert_eq!(error(get(ALICE, "app.bsky.actor.profile", "self", None).await), "RecordNotFound");
-        exec(p, &format!("UPDATE actors SET profile_cid = 'bafyprofile' WHERE did = '{ALICE}'")).await;
+        exec(p, &crate::test_support::actors::update_sql(ALICE, "profile_cid = '\\x00'::bytea || convert_to('bafyprofile', 'UTF8')")).await;
         let v = get(ALICE, "app.bsky.actor.profile", "self", None).await.expect("profile");
         assert_eq!(v.inner()["cid"], "bafyprofile");
         assert_eq!(error(get(ALICE, "app.bsky.actor.profile", "other", None).await), "RecordNotFound");
         // G-9: Bob's row is kept, but Bob is neither in scope nor a member.
-        exec(p, &format!("UPDATE actors SET profile_cid = 'bafyprofile' WHERE did = '{BOB}'")).await;
+        exec(p, &crate::test_support::actors::update_sql(BOB, "profile_cid = '\\x00'::bytea || convert_to('bafyprofile', 'UTF8')")).await;
         assert_eq!(error(get(BOB, "app.bsky.actor.profile", "self", None).await), "RecordNotFound");
 
         // A list is served only when its owner is a ready member.

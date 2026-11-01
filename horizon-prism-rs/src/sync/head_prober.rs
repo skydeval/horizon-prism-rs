@@ -202,9 +202,9 @@ impl HeadProber {
     async fn plan(&self) -> Result<HashMap<String, Vec<(String, String)>>, sqlx::Error> {
         let tracked = self.scope.read_guard().await.tracked();
         let rows: Vec<(String, Option<String>, bool)> = sqlx::query_as(
-            "SELECT a.did, a.pds_endpoint, \
+            "SELECT ad.did, a.pds_endpoint, \
                (s.head_checked_at IS NULL OR s.head_checked_at < now() - make_interval(secs => $2)) AS due \
-             FROM actors a LEFT JOIN sync_state s ON s.did = a.did WHERE a.did = ANY($1)",
+             FROM dids ad JOIN actors a ON a.id = ad.id LEFT JOIN sync_state s ON s.did = ad.did WHERE ad.did = ANY($1)",
         )
         .bind(&tracked)
         .bind(self.refresh_window_secs())
@@ -412,7 +412,7 @@ impl HeadProber {
         let row: Option<HeadRow> = sqlx::query_as(
             "SELECT s.head_rev, \
                COALESCE(s.head_checked_at > now() - make_interval(secs => $2), false), a.pds_endpoint, s.applied_rev \
-             FROM actors a LEFT JOIN sync_state s ON s.did = a.did WHERE a.did = $1",
+             FROM dids ad JOIN actors a ON a.id = ad.id LEFT JOIN sync_state s ON s.did = ad.did WHERE ad.did = $1",
         )
         .bind(did)
         .bind(self.cfg.head_max_age_secs as f64)
@@ -475,7 +475,7 @@ impl HeadProber {
             "SELECT s.head_rev, \
                COALESCE(s.head_checked_at > now() - make_interval(secs => $2), false), a.pds_endpoint, s.applied_rev, \
                s.chain_rev, s.head_checked_at \
-             FROM actors a LEFT JOIN sync_state s ON s.did = a.did WHERE a.did = $1",
+             FROM dids ad JOIN actors a ON a.id = ad.id LEFT JOIN sync_state s ON s.did = ad.did WHERE ad.did = $1",
         )
         .bind(did)
         .bind(self.cfg.head_max_age_secs as f64)
@@ -606,7 +606,7 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        exec(p, "INSERT INTO actors (did, pds_endpoint) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'https://pds.example.com')").await;
+        crate::test_support::actors::put(p, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", &[("pds_endpoint", "'https://pds.example.com'")]).await;
         exec(p, "INSERT INTO members (did, source, ready_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin', now())").await;
         exec(p, "INSERT INTO sync_state (did, applied_rev) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', '3kaaaaaaaaaaa')").await;
         let mut sets = ScopeSets::default();
@@ -690,7 +690,7 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        exec(p, "INSERT INTO actors (did, pds_endpoint) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'https://pds.example.com')").await;
+        crate::test_support::actors::put(p, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", &[("pds_endpoint", "'https://pds.example.com'")]).await;
         let mut sets = ScopeSets::default();
         sets.members.insert(DID.into());
         sets.scope.insert(DID.into());
@@ -741,7 +741,7 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        exec(p, "INSERT INTO actors (did, pds_endpoint) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'https://pds.example.com')").await;
+        crate::test_support::actors::put(p, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", &[("pds_endpoint", "'https://pds.example.com'")]).await;
         exec(p, "INSERT INTO sync_state (did, head_rev, head_checked_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', '3kaaaaaaaaaaa', now())").await;
         let heads = Arc::new(FakeHeads {
             rev: Mutex::new("3kccccccccccc".into()),
@@ -785,8 +785,9 @@ mod tests {
         let p = &db.pool;
         const NO_ROW: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
         const NO_PDS: &str = "did:plc:cccccccccccccccccccccccc";
-        exec(p, "INSERT INTO actors (did, pds_endpoint) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'https://pds.example.com'), \
-                 ('did:plc:bbbbbbbbbbbbbbbbbbbbbbbb', 'https://pds.example.com'), ('did:plc:cccccccccccccccccccccccc', NULL)").await;
+        for (did, pds) in [("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "'https://pds.example.com'"), ("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "'https://pds.example.com'"), ("did:plc:cccccccccccccccccccccccc", "NULL")] {
+            crate::test_support::actors::put(p, did, &[("pds_endpoint", pds)]).await;
+        }
         exec(p, "INSERT INTO sync_state (did, head_rev, applied_rev, head_checked_at) VALUES \
                  ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', '3kaaaaaaaaaaa', '3kaaaaaaaaaaa', now()), \
                  ('did:plc:cccccccccccccccccccccccc', '3kaaaaaaaaaaa', '3kaaaaaaaaaaa', now() - interval '5 minutes')").await;
@@ -834,7 +835,7 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        exec(p, "INSERT INTO actors (did, pds_endpoint) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'https://pds.example.com')").await;
+        crate::test_support::actors::put(p, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", &[("pds_endpoint", "'https://pds.example.com'")]).await;
         exec(p, "INSERT INTO members (did, source, ready_at) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', 'admin', now())").await;
         // Applied up to the head, so no divergence; the chain is behind.
         exec(p, "INSERT INTO sync_state (did, applied_rev, chain_rev) VALUES ('did:plc:aaaaaaaaaaaaaaaaaaaaaaaa', '3kbbbbbbbbbbb', '3kaaaaaaaaaaa')").await;

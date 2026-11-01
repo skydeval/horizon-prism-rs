@@ -321,7 +321,12 @@ async fn t5_a_stored_row_and_no_row_answer_alike() {
     let p = &db.pool;
     members(p).await;
     let (stored, unknown) = (far(1), far(2));
-    exec(p, &format!("INSERT INTO actors (did, pds_endpoint, handle, handle_checked_at, display_name) VALUES ('{stored}', 'https://pds.example.com', 'stored.test', now(), 'Stored')")).await;
+    crate::test_support::actors::put(
+        p,
+        &stored,
+        &[("pds_endpoint", "'https://pds.example.com'"), ("handle", "'stored.test'"), ("handle_checked_at", "now()"), ("display_name", "'Stored'")],
+    )
+    .await;
     let entry = |h: Hydrator, did: String| async move {
         exec(h.pool(), "DELETE FROM blocks").await;
         block(h.pool(), ALICE, std::slice::from_ref(&did)).await;

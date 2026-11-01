@@ -30,10 +30,7 @@ impl Hydrator {
         if !Handle::is_valid(&handle) {
             return Ok(Err(ViewError::new("InvalidRequest", "Error: handle must be a valid handle")));
         }
-        let stored: Option<String> = sqlx::query_scalar("SELECT did FROM actors WHERE handle = $1")
-            .bind(&handle)
-            .fetch_optional(self.pool())
-            .await?;
+        let stored = crate::db::actors::did_of_handle(self.pool(), &handle).await?;
         if let Some(did) = stored {
             let indexed = {
                 let scope = self.scope().read_guard().await;

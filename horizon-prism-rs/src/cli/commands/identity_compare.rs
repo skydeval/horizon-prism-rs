@@ -254,16 +254,16 @@ async fn compare(lodestar: &Lodestar, resolver: &IdentityResolver, mut dids: Vec
 /// A sample of DIDs from `actors`: `n` random `did:plc`, one `did:web` per
 /// [`WEB_SHARE`], and a few marked deleted.
 async fn sample(pool: &PgPool, n: u32) -> Result<Vec<String>, sqlx::Error> {
-    let mut dids: Vec<String> = sqlx::query_scalar("SELECT did FROM actors WHERE did LIKE 'did:plc:%' ORDER BY random() LIMIT $1")
+    let mut dids: Vec<String> = sqlx::query_scalar("SELECT d.did FROM actors a JOIN dids d ON d.id = a.id WHERE d.did LIKE 'did:plc:%' ORDER BY random() LIMIT $1")
         .bind(i64::from(n))
         .fetch_all(pool)
         .await?;
-    let web: Vec<String> = sqlx::query_scalar("SELECT did FROM actors WHERE did LIKE 'did:web:%' ORDER BY random() LIMIT $1")
+    let web: Vec<String> = sqlx::query_scalar("SELECT d.did FROM actors a JOIN dids d ON d.id = a.id WHERE d.did LIKE 'did:web:%' ORDER BY random() LIMIT $1")
         .bind(i64::from(n.div_ceil(WEB_SHARE)))
         .fetch_all(pool)
         .await?;
     let deleted: Vec<String> =
-        sqlx::query_scalar("SELECT did FROM actors WHERE account_status = 'deleted' AND did LIKE 'did:plc:%' ORDER BY random() LIMIT $1")
+        sqlx::query_scalar("SELECT d.did FROM actors a JOIN dids d ON d.id = a.id WHERE a.account_status = 'deleted' AND d.did LIKE 'did:plc:%' ORDER BY random() LIMIT $1")
             .bind(DELETED_MAX)
             .fetch_all(pool)
             .await?;

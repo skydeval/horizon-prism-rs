@@ -149,7 +149,7 @@ async fn tn1_the_reasons_agree_with_the_read_rule() {
     // Each change: its SQL, its undo, and the reasons it gives (the rest
     // stay served).
     let unfollow = super::graph_delete_sql("follows", BOB, Some(ALICE));
-    let status = |s: &str| format!("UPDATE actors SET account_status = '{s}' WHERE did = '{ALICE}'");
+    let status = |s: &str| format!("UPDATE actors SET account_status = '{s}' WHERE id = (SELECT id FROM dids WHERE did = '{ALICE}')");
     let label = |subject: &str, val: &str| format!("INSERT INTO labels (subject, val) VALUES ('{subject}', '{val}')");
     let unblock = "DELETE FROM blocks".to_string();
     let standing_bob = vec![(BOB, s.rb.clone(), vec!["standing"]), (CAROL, s.rc_under_b.clone(), vec!["placement"]), (BOB, s.a12.clone(), vec!["standing"])];

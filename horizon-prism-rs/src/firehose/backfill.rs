@@ -721,14 +721,17 @@ impl BackfillSource for NetSource {
             .json()
             .map_err(|e| PrepareError::Failed(format!("getRepoStatus: {e}")))?;
         let account = account_status(&repo);
+        let Some(id) = crate::db::ids::intern_account(&self.pool, did).await.map_err(|e| PrepareError::Failed(e.to_string()))? else {
+            return Err(PrepareError::Negative("not a valid DID".to_string()));
+        };
         sqlx::query(
-            "INSERT INTO actors (did, pds_endpoint, handle, handle_checked_at, account_status, status_checked_at) \
+            "INSERT INTO actors (id, pds_endpoint, handle, handle_checked_at, account_status, status_checked_at) \
              VALUES ($1, $2, $3, now(), $4, now()) \
-             ON CONFLICT (did) DO UPDATE SET pds_endpoint = EXCLUDED.pds_endpoint, handle = EXCLUDED.handle, \
+             ON CONFLICT (id) DO UPDATE SET pds_endpoint = EXCLUDED.pds_endpoint, handle = EXCLUDED.handle, \
                handle_checked_at = now(), account_status = EXCLUDED.account_status, status_checked_at = now(), \
                deletion_suspect_at = NULL, deletion_suspect_pds = NULL",
         )
-        .bind(did)
+        .bind(id)
         .bind(&pds)
         .bind(handle)
         .bind(&account)

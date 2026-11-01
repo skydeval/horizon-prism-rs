@@ -1502,6 +1502,115 @@ pub mod records {
     }
 }
 
+/// `actors` rows, keyed by the account's `dids` id.
+pub mod actors {
+    use serde_json::Value;
+    use sqlx::PgPool;
+
+    /// SQL: the condition that an `actors` row (aliased `alias`, or none)
+    /// is `did`'s.
+    #[must_use]
+    pub fn is(alias: &str, did: &str) -> String {
+        let dot = if alias.is_empty() { String::new() } else { format!("{alias}.") };
+        format!("{dot}id = (SELECT id FROM dids WHERE did = '{did}')")
+    }
+
+    /// SQL: a record's JSON text as stored, dict 0.
+    #[must_use]
+    pub fn record_sql(json: &str) -> String {
+        format!("'\\x00'::bytea || convert_to(({json})::jsonb::text, 'UTF8')")
+    }
+
+    /// SQL: a CID text as stored.
+    fn cid_sql(cid: &str) -> String {
+        format!("'\\x00'::bytea || convert_to({cid}, 'UTF8')")
+    }
+
+    /// SQL: a record's self-label values, as the writer stores them.
+    fn self_labels_sql(json: &str) -> String {
+        format!(
+            "NULLIF(ARRAY(SELECT v ->> 'val' FROM jsonb_array_elements(CASE WHEN jsonb_typeof(({json})::jsonb -> 'labels' -> 'values') = 'array' \
+             THEN ({json})::jsonb -> 'labels' -> 'values' ELSE '[]'::jsonb END) v WHERE jsonb_typeof(v -> 'val') = 'string'), '{{}}')"
+        )
+    }
+
+    /// One statement that stores `did`'s row, interning the DID first, with
+    /// `columns` as `(column, SQL expression)` in today's terms: a profile
+    /// record as JSON (its self-labels follow it), its rev as a TID, CIDs as
+    /// text. A stored row is updated.
+    #[must_use]
+    pub fn put_sql(did: &str, columns: &[(&str, &str)]) -> String {
+        let mut names: Vec<String> = vec!["id".into()];
+        let mut values: Vec<String> = vec!["d.id".into()];
+        for (column, value) in columns {
+            names.push((*column).to_string());
+            values.push(match *column {
+                "profile_record" => record_sql(value),
+                "profile_rev" => format!("rev_to_bigint({value})"),
+                "profile_cid" | "avatar_cid" | "banner_cid" | "joined_via_starter_pack_cid" => cid_sql(value),
+                _ => (*value).to_string(),
+            });
+            if *column == "profile_record" && !columns.iter().any(|(c, _)| *c == "self_labels") {
+                names.push("self_labels".into());
+                values.push(self_labels_sql(value));
+            }
+        }
+        let conflict = if names.len() == 1 {
+            "DO NOTHING".to_string()
+        } else {
+            let sets: Vec<String> = names.iter().skip(1).map(|c| format!("{c} = EXCLUDED.{c}")).collect();
+            format!("DO UPDATE SET {}", sets.join(", "))
+        };
+        format!(
+            "WITH n AS (INSERT INTO dids (did) SELECT '{did}' WHERE NOT EXISTS (SELECT 1 FROM dids WHERE did = '{did}') RETURNING id), \
+             d AS (SELECT id FROM n UNION ALL SELECT id FROM dids WHERE did = '{did}') \
+             INSERT INTO actors ({}) SELECT {} FROM d ON CONFLICT (id) {conflict}",
+            names.join(", "),
+            values.join(", ")
+        )
+    }
+
+    /// Store `did`'s row (see [`put_sql`]).
+    pub async fn put(pool: &PgPool, did: &str, columns: &[(&str, &str)]) {
+        let sql = put_sql(did, columns);
+        sqlx::query(&sql).execute(pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// One statement that sets `set` (SQL) on `did`'s row.
+    #[must_use]
+    pub fn update_sql(did: &str, set: &str) -> String {
+        format!("UPDATE actors SET {set} WHERE {}", is("", did))
+    }
+
+    /// Set `did`'s profile record (dict 0) and its self-labels.
+    pub async fn set_record(pool: &PgPool, did: &str, record: &Value) {
+        let json = format!("'{}'", record.to_string().replace('\'', "''"));
+        let sql = update_sql(did, &format!("profile_record = {}, self_labels = {}", record_sql(&json), self_labels_sql(&json)));
+        sqlx::query(&sql).execute(pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// `did`'s stored profile record, decoded.
+    pub async fn record(pool: &PgPool, did: &str) -> Option<Value> {
+        let stored: Option<Vec<u8>> = sqlx::query_scalar(&format!("SELECT profile_record FROM actors WHERE {}", is("", did)))
+            .fetch_optional(pool)
+            .await
+            .expect("profile record")
+            .flatten();
+        match stored {
+            Some(bytes) => Some(crate::db::records::decode_value(pool, &bytes).await.expect("decode")),
+            None => None,
+        }
+    }
+
+    /// The DIDs with an `actors` row, in DID order.
+    pub async fn dids(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar("SELECT d.did FROM actors a JOIN dids d ON d.id = a.id ORDER BY d.did")
+            .fetch_all(pool)
+            .await
+            .expect("actors")
+    }
+}
+
 /// A fresh database with no migrations applied (migration tests).
 pub async fn empty_db(test: &str) -> Option<TestDb> {
     let Ok(admin_url) = std::env::var(ENV) else {

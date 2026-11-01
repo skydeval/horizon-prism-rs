@@ -82,7 +82,7 @@ async fn generate(pool: &PgPool, rng: &mut Rng, tag: &str, depth: usize) -> Gene
             actor(pool, a, &format!("{}.test", &a[8..]), "t60").await;
             if rng.chance(10) {
                 let status = rng.pick(&["suspended", "deactivated", "takendown"]);
-                exec(pool, &format!("UPDATE actors SET account_status = '{status}' WHERE did = '{a}'")).await;
+                exec(pool, &format!("UPDATE actors SET account_status = '{status}' WHERE id = (SELECT id FROM dids WHERE did = '{a}')")).await;
             }
         }
         let holds = rng.chance(60);

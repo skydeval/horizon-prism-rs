@@ -140,7 +140,7 @@ struct Rows {
 
 async fn read_rows(state: &AdminState, did: &str) -> Result<Rows, sqlx::Error> {
     let pool = &state.pool;
-    let actor = sqlx::query_as("SELECT handle, pds_endpoint, account_status FROM actors WHERE did = $1").bind(did).fetch_optional(pool).await?;
+    let actor = sqlx::query_as("SELECT handle, pds_endpoint, account_status FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1)").bind(did).fetch_optional(pool).await?;
     let member = sqlx::query_as("SELECT source, added_at, ready_at, first_ready_at FROM members WHERE did = $1").bind(did).fetch_optional(pool).await?;
     let denial = sqlx::query_as("SELECT reason, denied_by, denied_at FROM member_denials WHERE did = $1").bind(did).fetch_optional(pool).await?;
     let scope = sqlx::query_as("SELECT reasons, added_at, justified_at FROM scope_dids WHERE did = $1").bind(did).fetch_optional(pool).await?;

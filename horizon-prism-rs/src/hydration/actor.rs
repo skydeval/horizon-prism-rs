@@ -528,10 +528,10 @@ impl Hydrator {
         let limit = i64::from(limit.clamp(1, 100));
         let pattern = format!("%{}%", like_escape(&q));
         let sql = format!(
-            "SELECT a.did FROM actors a CROSS JOIN LATERAL (SELECT a.did AS author_did) n \
+            "SELECT ad.did FROM actors a JOIN dids ad ON ad.id = a.id CROSS JOIN LATERAL (SELECT ad.did AS author_did) n \
              WHERE ($1::text IS NULL OR ({exclusions})) AND {IN_CORPUS} AND ($5 OR {SHOWN_SIGNED_OUT}) \
                AND (a.handle ILIKE $2 OR a.display_name ILIKE $2) \
-             ORDER BY GREATEST(similarity(coalesce(a.handle, ''), $3), similarity(coalesce(a.display_name, ''), $3)) DESC, a.did \
+             ORDER BY GREATEST(similarity(coalesce(a.handle, ''), $3), similarity(coalesce(a.display_name, ''), $3)) DESC, a.id \
              LIMIT $4 OFFSET $6",
             exclusions = viewer_exclusions(),
         );
@@ -615,32 +615,35 @@ impl Hydrator {
         let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new("WITH v AS (SELECT ");
         qb.push_bind(viewer.state_did().map(str::to_string)).push("::text AS did)");
         for (name, column) in [("h", "a.handle"), ("d", "lower(a.display_name)")] {
-            qb.push(format!(", {name} AS (SELECT a.did FROM actors a WHERE {column} ~>=~ ")).push_bind(q.clone());
+            qb.push(format!(", {name} AS (SELECT a.id FROM actors a JOIN dids ad ON ad.id = a.id WHERE {column} ~>=~ ")).push_bind(q.clone());
             if let Some(upper) = &upper {
                 qb.push(format!(" AND {column} ~<~ ")).push_bind(upper.clone());
             }
             qb.push(format!(" AND {column} LIKE ")).push_bind(prefix.clone());
             qb.push(format!(" AND {IN_CORPUS} ORDER BY {column} USING ~<~ LIMIT ")).push_bind(candidates).push(")");
         }
-        qb.push(", e AS (SELECT a.did FROM actors a WHERE a.handle = ").push_bind(q.clone()).push(format!(" AND {IN_CORPUS})"));
-        let mut branches = "SELECT did FROM h UNION SELECT did FROM d UNION SELECT did FROM e".to_string();
+        qb.push(", e AS (SELECT a.id FROM actors a JOIN dids ad ON ad.id = a.id WHERE a.handle = ")
+            .push_bind(q.clone())
+            .push(format!(" AND {IN_CORPUS})"));
+        let mut branches = "SELECT id FROM h UNION SELECT id FROM d UNION SELECT id FROM e".to_string();
         if q.chars().count() >= 3 {
-            qb.push(", w AS (SELECT a.did FROM actors a WHERE a.display_name ILIKE ").push_bind(format!("% {}%", like_escape(&q)));
+            qb.push(", w AS (SELECT a.id FROM actors a JOIN dids ad ON ad.id = a.id WHERE a.display_name ILIKE ")
+                .push_bind(format!("% {}%", like_escape(&q)));
             qb.push(format!(" AND {IN_CORPUS} LIMIT ")).push_bind(candidates).push(")");
-            branches.push_str(" UNION SELECT did FROM w");
+            branches.push_str(" UNION SELECT id FROM w");
         }
         qb.push(format!(
-            " SELECT a.did FROM actors a CROSS JOIN LATERAL (SELECT a.did AS author_did) n \
-              WHERE a.did IN ({branches}) AND ($1::text IS NULL OR ({exclusions}))",
+            " SELECT ad.did FROM actors a JOIN dids ad ON ad.id = a.id CROSS JOIN LATERAL (SELECT ad.did AS author_did) n \
+              WHERE a.id IN ({branches}) AND ($1::text IS NULL OR ({exclusions}))",
             exclusions = viewer_exclusions(),
         ));
         if viewer.did.is_none() {
             qb.push(format!(" AND {SHOWN_SIGNED_OUT}"));
         }
         qb.push(
-            " ORDER BY EXISTS (SELECT 1 FROM members m WHERE m.did = a.did) DESC, \
-                       EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject \
-                               WHERE fa.did = $1 AND fs.did = a.did) DESC, \
+            " ORDER BY EXISTS (SELECT 1 FROM members m WHERE m.did = ad.did) DESC, \
+                       EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author \
+                               WHERE fa.did = $1 AND f.subject = a.id) DESC, \
                        (a.handle = ",
         );
         qb.push_bind(q.clone()).push(") DESC, length(a.handle), a.handle LIMIT ").push_bind(i64::from(limit.clamp(1, 100)));
@@ -727,14 +730,14 @@ fn status_view(
     Some(view)
 }
 
-/// The accounts a search may find: active, and in scope or a member.
+/// The accounts a search may find: active, and in scope or a member. `a`
+/// is the `actors` row and `ad` its `dids` row.
 pub(super) const IN_CORPUS: &str = "a.account_status = 'active' \
-     AND (EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = a.did) OR EXISTS (SELECT 1 FROM members m WHERE m.did = a.did))";
+     AND (EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = ad.did) OR EXISTS (SELECT 1 FROM members m WHERE m.did = ad.did))";
 
 /// What a signed-out search leaves out: an account whose profile asks not
 /// to be shown to signed-out viewers.
-pub(super) const SHOWN_SIGNED_OUT: &str =
-    "NOT COALESCE(a.profile_record -> 'labels' -> 'values' @> '[{\"val\": \"!no-unauthenticated\"}]'::jsonb, false)";
+pub(super) const SHOWN_SIGNED_OUT: &str = "NOT COALESCE('!no-unauthenticated' = ANY(a.self_labels), false)";
 
 /// The error of a search that passed its statement timeout, for the
 /// methods that declare no error of their own (design-v3 §9.0).
@@ -1022,7 +1025,7 @@ mod tests {
         }
         let pack = format!("at://{CAROL}/app.bsky.graph.starterpack/3kpack2222222");
         exec(p, &format!(
-            "UPDATE actors SET pronouns = 'they/them', website = 'https://bob.example', joined_via_starter_pack_uri = '{pack}' WHERE did = '{BOB}'"
+            "UPDATE actors SET pronouns = 'they/them', website = 'https://bob.example', joined_via_starter_pack_uri = '{pack}' WHERE id = (SELECT id FROM dids WHERE did = '{BOB}')"
         )).await;
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now()), ('{BOB}', 'admin', now())")).await;
         // Bob: two lists, a starter pack and a labeler. Carol made the pack
@@ -1164,7 +1167,7 @@ mod tests {
         let found = h.search_actors(&me, &req, "al", 10, None).await.expect("db").expect("view");
         assert_eq!(dids(found.inner().clone()), [CAROL]);
         // Signed out, an account that asks not to be shown is left out.
-        exec(p, &format!("UPDATE actors SET profile_record = '{{\"labels\": {{\"values\": [{{\"val\": \"!no-unauthenticated\"}}]}}}}' WHERE did = '{CAROL}'")).await;
+        crate::test_support::actors::set_record(p, CAROL, &json!({"labels": {"values": [{"val": "!no-unauthenticated"}]}})).await;
         let found = h.search_actors(&anon, &req, "alf", 10, None).await.expect("db").expect("view");
         assert_eq!(dids(found.inner().clone()), Vec::<String>::new());
         db.drop_db().await;

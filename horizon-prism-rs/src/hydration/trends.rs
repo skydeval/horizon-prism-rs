@@ -159,7 +159,7 @@ impl Hydrator {
             let sql = format!(
                 "SELECT t.tag FROM unnest($1::text[]) AS t(tag) \
                  JOIN post_search p ON p.tags @> ARRAY[t.tag] AND p.created_at >= now() - make_interval(hours => $2) \
-                 JOIN dids pd ON pd.id = p.author JOIN actors a ON a.did = pd.did WHERE {} \
+                 JOIN dids ad ON ad.id = p.author JOIN actors a ON a.id = p.author WHERE {} \
                  GROUP BY t.tag HAVING count(*) >= $3 AND count(DISTINCT p.author) >= $4 \
                  ORDER BY count(*) DESC, t.tag",
                 eligible(None)
@@ -232,10 +232,10 @@ impl Hydrator {
         }
         // The posts that carry a candidate tag, by authors that count.
         let subjects = format!(
-            "SELECT t.tag, pd.did AS author_did, p.created_at, p.author AS author_id, p.rkey AS rkey_id \
+            "SELECT t.tag, ad.did AS author_did, p.created_at, p.author AS author_id, p.rkey AS rkey_id \
              FROM unnest($1::text[]) AS t(tag) \
              JOIN post_search p ON p.tags @> ARRAY[t.tag] AND p.created_at >= now() - make_interval(hours => $2 + $3) \
-             JOIN dids pd ON pd.id = p.author JOIN actors a ON a.did = pd.did WHERE {}",
+             JOIN dids ad ON ad.id = p.author JOIN actors a ON a.id = p.author WHERE {}",
             eligible(None)
         );
         let counted = format!(

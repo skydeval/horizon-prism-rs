@@ -308,7 +308,7 @@ fn step_ok(owner: &str, mode: &str, members: &str, reader: &str) -> String {
                      ELSE false END))",
         author_follows_owner = follow_edge("s.author_did", owner),
         reader_author = blocked(reader, "s.author_did"),
-        gate = gate_shows("s.uri", "s.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = s.author_did)"),
+        gate = gate_shows("s.uri", "s.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = s.author_did)"),
         author_owner = blocked("s.author_did", owner),
         owner_follows_author = owner_follows(owner, "s.author_did"),
         verified = follows_verified(owner),
@@ -349,7 +349,7 @@ fn anchored_with_cap(parent: &str, audience: &str, owner: &str, mode: &str, memb
 ///
 /// Database errors.
 pub(super) async fn account_active(pool: &PgPool, did: &str) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM actors WHERE did = $1 AND account_status = 'active')")
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1) AND account_status = 'active')")
         .bind(did)
         .fetch_one(pool)
         .await
@@ -511,7 +511,7 @@ fn anchor_join(br: &str) -> String {
     let own = self_anchored();
     let pick = |own_col: &str, map_col: &str, name: &str| format!("CASE WHEN {own} THEN {own_col} ELSE {map_col} END AS {name}");
     format!(
-        "LEFT JOIN actors po ON po.did = c.author_did \
+        "LEFT JOIN dids pod ON pod.did = c.author_did LEFT JOIN actors po ON po.id = pod.id \
          CROSS JOIN LATERAL (SELECT (SELECT m FROM akm) -> {other} AS v) ak \
          CROSS JOIN LATERAL (SELECT (SELECT m FROM gm) -> (ak.v ->> 'audience_uri') AS v) gk \
          LEFT JOIN private_audiences a0 ON a0.uri = CASE WHEN {own} THEN c.audience_uri END \
@@ -535,7 +535,7 @@ fn anchor_join(br: &str) -> String {
 /// lookup.
 fn ao_status() -> &'static str {
     "CASE WHEN an.author_did = c.author_did THEN po.account_status \
-     ELSE (SELECT x.account_status FROM actors x WHERE x.did = an.author_did) END"
+     ELSE (SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = an.author_did) END"
 }
 
 /// `d` stands under G (`a` in scope) as O's (`o`) writer (§2.4): by the
@@ -675,7 +675,7 @@ fn walk_step() -> String {
         gate = gate_shows(
             "s.uri",
             "s.author_did",
-            "CASE WHEN s.author_did = k.owner THEN NULL ELSE (SELECT x.account_status FROM actors x WHERE x.did = s.author_did) END"
+            "CASE WHEN s.author_did = k.owner THEN NULL ELSE (SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = s.author_did) END"
         ),
         reader_author = blocked("$1", "s.author_did"),
         author_owner = blocked("s.author_did", "k.owner"),
@@ -932,7 +932,7 @@ fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -
            SELECT q.d, q.o, q.g, COALESCE( \
              NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = q.d AND l.val = '!takedown') \
              AND (q.d = q.o OR ( \
-               COALESCE((SELECT x.account_status FROM actors x WHERE x.did = q.d), 'active') NOT IN {HIDING_STATUSES} \
+               COALESCE((SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = q.d), 'active') NOT IN {HIDING_STATUSES} \
                AND NOT {reader_author} \
                AND NOT {author_owner} \
                AND {standing})), false) AS ok \
@@ -1093,7 +1093,7 @@ pub(super) fn fact8_final() -> String {
         role = role_kind("s1", "an"),
         anchor_owned = owned("an.audience_uri", "an.author_did"),
         post_owned = owned("s1.audience_uri", "an.author_did"),
-        anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
+        anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = an.author_did)"),
     )
 }
 
@@ -1137,7 +1137,7 @@ fn fact8_with_authors_final() -> String {
         role = role_kind("s1", "an"),
         anchor_owned = owned("an.audience_uri", "an.author_did"),
         post_owned = owned("s1.audience_uri", "an.author_did"),
-        anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
+        anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = an.author_did)"),
     )
 }
 
@@ -1355,7 +1355,7 @@ pub(super) fn not_served_final(cap: u32) -> String {
         "SELECT s1.uri, {served} AS served, \
            COALESCE(an.uri IS NOT NULL AND {role} AND {anchor_owned} AND {post_owned} AND {anchor_gate} AND a.uri IS NOT NULL, false) AS placed, \
            COALESCE(s1.author_did = s1.owner OR ( \
-             (SELECT x.account_status FROM actors x WHERE x.did = s1.owner) = 'active' \
+             (SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = s1.owner) = 'active' \
              AND NOT {author_owner} AND {standing}), false) AS standing_ok, \
            COALESCE(CASE WHEN NOT {served} AND s1.walks THEN {probe} END, false) AS capped \
          FROM {PV_JOIN} \
@@ -1364,7 +1364,7 @@ pub(super) fn not_served_final(cap: u32) -> String {
         role = role_kind("s1", "an"),
         anchor_owned = owned("an.audience_uri", "an.author_did"),
         post_owned = owned("s1.audience_uri", "an.author_did"),
-        anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
+        anchor_gate = gate("an.uri", "an.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = an.author_did)"),
         author_owner = blocked("s1.author_did", "s1.owner"),
         standing = standing("s1.author_did", "s1.owner", &follows_verified("s1.owner"), false),
         probe = cap_probe(cap),
@@ -1602,8 +1602,8 @@ pub(super) fn pre_s0_count_sql_with_cap(cap: u32) -> String {
          {writer_follows} AS writer_follows
   FROM private_posts p
   JOIN private_audiences a ON a.uri = p.audience_uri
-  LEFT JOIN actors po ON po.did = p.author_did
-  LEFT JOIN actors ao ON ao.did = a.owner_did
+  LEFT JOIN dids pod ON pod.did = p.author_did LEFT JOIN actors po ON po.id = pod.id
+  LEFT JOIN dids aod ON aod.did = a.owner_did LEFT JOIN actors ao ON ao.id = aod.id
   WHERE a.owner_did <> p.author_did
 ), y AS (
   SELECT x.*, {walk} AS anchored
@@ -1624,7 +1624,7 @@ SELECT
     AS stops_followers_nonmember_writer_nonmember_owner,
   count(*) FILTER (WHERE anchored AND mode = 'followers' AND NOT writer_follows AND writer_member)
     AS c5c_member_writer_residual,
-  (SELECT count(*) FROM private_posts p2 JOIN actors ac ON ac.did = p2.author_did
+  (SELECT count(*) FROM private_posts p2 JOIN dids acd ON acd.did = p2.author_did JOIN actors ac ON ac.id = acd.id
     WHERE ac.account_status NOT IN ('active', 'deactivated', 'takendown', 'suspended', 'deleted'))
     AS starts_serving_status
 FROM y;",
@@ -1669,7 +1669,7 @@ pub(super) fn pre_s9_count_sql() -> String {
          {author_owner} AS author_owner_blocked
   FROM private_posts p
   JOIN private_audiences a ON a.uri = p.audience_uri
-  JOIN actors ao ON ao.did = a.owner_did AND ao.account_status = 'active'
+  JOIN dids aod ON aod.did = a.owner_did JOIN actors ao ON ao.id = aod.id AND ao.account_status = 'active'
   WHERE a.owner_did <> p.author_did
     AND COALESCE(a.mode, 'list') = 'list'
     AND p.author_did = ANY(a.members)
@@ -1838,7 +1838,7 @@ pub(super) fn pre_s12_count_sql() -> String {
     let c = format!(
         "SELECT {COLS}, {head8} AS head_ok, {head100} AS head_deep \
          FROM private_posts p LEFT JOIN private_audiences a0 ON a0.uri = p.audience_uri \
-         LEFT JOIN actors po0 ON po0.did = p.author_did LEFT JOIN actors ao0 ON ao0.did = a0.owner_did",
+         LEFT JOIN dids po0d ON po0d.did = p.author_did LEFT JOIN actors po0 ON po0.id = po0d.id LEFT JOIN dids ao0d ON ao0d.did = a0.owner_did LEFT JOIN actors ao0 ON ao0.id = ao0d.id",
         head8 = head(RULE4_MAX_HOPS),
         head100 = head(100),
     );
@@ -1862,10 +1862,10 @@ pub(super) fn pre_s12_count_sql() -> String {
             none_root = is_private("s1.reply_root_uri"),
             role = role_kind("s1", "an"),
             anchor_owned = owned("an.audience_uri", "an.author_did"),
-            anchor_gate = gate_shows("an.uri", "an.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = an.author_did)"),
+            anchor_gate = gate_shows("an.uri", "an.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = an.author_did)"),
             post_owned = owned("s1.audience_uri", "an.author_did"),
             thread_reply = is_thread_reply("s1"),
-            parent_gate = gate_shows("pp.uri", "pp.author_did", "(SELECT x.account_status FROM actors x WHERE x.did = pp.author_did)"),
+            parent_gate = gate_shows("pp.uri", "pp.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = pp.author_did)"),
         ),
         16,
         &stage1,
@@ -1931,8 +1931,8 @@ pub(super) async fn follows(pool: &PgPool, author: &str, subject: &str) -> Resul
 #[cfg(test)]
 pub(super) const PREFILTER_FROM: &str = "private_posts p \
      LEFT JOIN private_audiences a ON a.uri = p.audience_uri \
-     LEFT JOIN actors po ON po.did = p.author_did \
-     LEFT JOIN actors ao ON ao.did = a.owner_did";
+     LEFT JOIN dids pod ON pod.did = p.author_did LEFT JOIN actors po ON po.id = pod.id \
+     LEFT JOIN dids aod ON aod.did = a.owner_did LEFT JOIN actors ao ON ao.id = aod.id";
 
 /// `prefilter_uris`' statement (§3.2): `$1` the reader, `$2` the URIs.
 pub(super) fn prefilter_uris_statement(cap: u32) -> String {

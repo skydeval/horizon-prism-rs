@@ -264,8 +264,9 @@ pub struct Hydrator {
     inner: Arc<Inner>,
 }
 
-/// One `actors` row joined with `actor_counts`.
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// One `actors` row joined with `actor_counts`, its CIDs as text and its
+/// profile record decoded.
+#[derive(Debug, Clone)]
 pub struct ActorRow {
     pub did: String,
     pub handle: Option<String>,
@@ -282,6 +283,26 @@ pub struct ActorRow {
     pub followers_count: Option<i32>,
     pub follows_count: Option<i32>,
     pub posts_count: Option<i32>,
+}
+
+/// An `actors` row as read, before its CIDs and record are decoded.
+#[derive(sqlx::FromRow)]
+struct StoredActorRow {
+    did: String,
+    handle: Option<String>,
+    display_name: Option<String>,
+    description: Option<String>,
+    avatar_cid: Option<Vec<u8>>,
+    banner_cid: Option<Vec<u8>>,
+    pds_endpoint: Option<String>,
+    indexed_at: DateTime<Utc>,
+    profile_record: Option<Vec<u8>>,
+    pronouns: Option<String>,
+    website: Option<String>,
+    joined_via_starter_pack_uri: Option<String>,
+    followers_count: Option<i32>,
+    follows_count: Option<i32>,
+    posts_count: Option<i32>,
 }
 
 /// One `posts` row joined with `post_counts`, its record decoded.
@@ -659,10 +680,7 @@ impl Hydrator {
         if actor.starts_with("did:") {
             return Ok(proto_blue::syntax::Did::is_valid(actor).then(|| actor.to_string()));
         }
-        let local: Option<String> = sqlx::query_scalar("SELECT did FROM actors WHERE handle = $1")
-            .bind(actor.to_ascii_lowercase())
-            .fetch_optional(self.pool())
-            .await?;
+        let local = crate::db::actors::did_of_handle(self.pool(), &actor.to_ascii_lowercase()).await?;
         // Only the row of an account in scope or a member answers; any
         // other is treated as absent, so a row kept for a private owner or
         // the author of a private reply is never observable (§11 G-9).
@@ -799,16 +817,44 @@ impl Hydrator {
         if dids.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows: Vec<ActorRow> = sqlx::query_as(
-            "SELECT a.did, a.handle, a.display_name, a.description, a.avatar_cid, a.banner_cid, a.pds_endpoint, \
+        let rows: Vec<StoredActorRow> = sqlx::query_as(
+            "SELECT d.did, a.handle, a.display_name, a.description, a.avatar_cid, a.banner_cid, a.pds_endpoint, \
                a.indexed_at, a.profile_record, a.pronouns, a.website, a.joined_via_starter_pack_uri, \
                c.followers_count, c.follows_count, c.posts_count \
-             FROM actors a LEFT JOIN dids d ON d.did = a.did LEFT JOIN actor_counts c ON c.id = d.id WHERE a.did = ANY($1)",
+             FROM dids d JOIN actors a ON a.id = d.id LEFT JOIN actor_counts c ON c.id = d.id WHERE d.did = ANY($1)",
         )
         .bind(dids)
         .fetch_all(self.pool())
         .await?;
-        Ok(rows.into_iter().map(|r| (r.did.clone(), r)).collect())
+        let cid = |b: Option<Vec<u8>>| b.as_deref().map(crate::db::ids::cid_from_db);
+        let mut out = HashMap::with_capacity(rows.len());
+        for r in rows {
+            let profile_record = match &r.profile_record {
+                Some(stored) => Some(crate::db::records::decode_value(self.pool(), stored).await?),
+                None => None,
+            };
+            out.insert(
+                r.did.clone(),
+                ActorRow {
+                    did: r.did,
+                    handle: r.handle,
+                    display_name: r.display_name,
+                    description: r.description,
+                    avatar_cid: cid(r.avatar_cid),
+                    banner_cid: cid(r.banner_cid),
+                    pds_endpoint: r.pds_endpoint,
+                    indexed_at: r.indexed_at,
+                    profile_record,
+                    pronouns: r.pronouns,
+                    website: r.website,
+                    joined_via_starter_pack_uri: r.joined_via_starter_pack_uri,
+                    followers_count: r.followers_count,
+                    follows_count: r.follows_count,
+                    posts_count: r.posts_count,
+                },
+            );
+        }
+        Ok(out)
     }
 
     /// The key a whole reference URI names (`db::ids::whole_key`).
@@ -1058,7 +1104,7 @@ impl Hydrator {
              FROM unnest($1::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) k \
              JOIN lists l ON k.coll = {} AND l.author = k.author AND l.rkey = k.rkey \
              JOIN dids d ON d.id = l.author JOIN members m ON m.did = d.did AND m.ready_at IS NOT NULL \
-             LEFT JOIN actors a ON a.did = d.did",
+             LEFT JOIN actors a ON a.id = l.author",
             crate::db::ids::COLL_LIST
         ))
         .bind(&uris)
@@ -1635,16 +1681,18 @@ pub(crate) mod testing {
     }
 
     pub(crate) async fn actor(pool: &PgPool, did: &str, handle: &str, name: &str) {
-        sqlx::query(
-            "INSERT INTO actors (did, handle, display_name, pds_endpoint, profile_record) \
-             VALUES ($1, $2, $3, 'https://pds.example.com', '{\"createdAt\":\"2026-01-01T00:00:00Z\"}'::jsonb)",
+        let (handle, name) = (format!("'{handle}'"), format!("'{}'", name.replace('\'', "''")));
+        crate::test_support::actors::put(
+            pool,
+            did,
+            &[
+                ("handle", &handle),
+                ("display_name", &name),
+                ("pds_endpoint", "'https://pds.example.com'"),
+                ("profile_record", "'{\"createdAt\":\"2026-01-01T00:00:00Z\"}'"),
+            ],
         )
-        .bind(did)
-        .bind(handle)
-        .bind(name)
-        .execute(pool)
-        .await
-        .expect("actor");
+        .await;
     }
 
     pub(crate) async fn post(pool: &PgPool, author: &str, rkey: &str, text: &str, parent: Option<&str>, root: Option<&str>) -> String {

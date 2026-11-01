@@ -316,12 +316,9 @@ impl Plan {
         qb.push_bind(viewer.map(str::to_string));
         qb.push("::text IS NULL OR (").push(viewer_exclusions()).push("))");
         qb.push(" AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = n.author_did)");
-        qb.push(" AND NOT EXISTS (SELECT 1 FROM actors a WHERE a.did = n.author_did AND a.account_status <> 'active')");
+        qb.push(" AND NOT EXISTS (SELECT 1 FROM actors a WHERE a.id = n.author AND a.account_status <> 'active')");
         if anonymous {
-            qb.push(
-                " AND NOT EXISTS (SELECT 1 FROM actors a WHERE a.did = n.author_did \
-                   AND a.profile_record -> 'labels' -> 'values' @> '[{\"val\": \"!no-unauthenticated\"}]'::jsonb)",
-            );
+            qb.push(" AND NOT EXISTS (SELECT 1 FROM actors a WHERE a.id = n.author AND '!no-unauthenticated' = ANY(a.self_labels))");
         }
         if let Some(since) = self.since {
             qb.push(" AND n.created_at >= ").push_bind(since);
@@ -426,9 +423,9 @@ impl Hydrator {
         }
         if !handles.is_empty() {
             let found: Vec<String> = sqlx::query_scalar(
-                "SELECT a.did FROM actors a WHERE a.handle = ANY($1) \
-                   AND (EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = a.did) \
-                     OR EXISTS (SELECT 1 FROM members m WHERE m.did = a.did))",
+                "SELECT ad.did FROM actors a JOIN dids ad ON ad.id = a.id WHERE a.handle = ANY($1) \
+                   AND (EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = ad.did) \
+                     OR EXISTS (SELECT 1 FROM members m WHERE m.did = ad.did))",
             )
             .bind(&handles)
             .fetch_all(self.pool())
@@ -917,7 +914,7 @@ mod tests {
         assert_eq!(uris(&search(alice.clone(), v2(&|p| p.following = true)).await.expect("view")), ["3kb", "3kc"]);
 
         // Signed out, an author who asks not to be shown is left out.
-        exec(p, &format!("UPDATE actors SET profile_record = '{{\"labels\": {{\"values\": [{{\"val\": \"!no-unauthenticated\"}}]}}}}' WHERE did = '{BOB}'")).await;
+        crate::test_support::actors::set_record(p, BOB, &json!({"labels": {"values": [{"val": "!no-unauthenticated"}]}})).await;
         assert_eq!(uris(&search(anon.clone(), params("rust")).await.expect("view")), ["3ka", "3kd"]);
         assert_eq!(uris(&search(alice, params("tokio")).await.expect("view")), ["3kb"]);
         // `search_duration_seconds{endpoint}`: every query that ran is timed.

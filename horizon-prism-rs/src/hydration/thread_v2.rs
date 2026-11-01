@@ -361,10 +361,10 @@ impl Hydrator {
             let mut dids = Vec::new();
             authors(&tree, &mut dids);
             let withheld: HashSet<String> = sqlx::query_scalar(
-                "SELECT did FROM actors WHERE did = ANY($1) AND profile_record->'labels'->'values' @> $2",
+                "SELECT d.did FROM dids d JOIN actors a ON a.id = d.id WHERE d.did = ANY($1) AND $2 = ANY(a.self_labels)",
             )
             .bind(&dids)
-            .bind(json!([{ "val": NO_UNAUTHENTICATED }]))
+            .bind(NO_UNAUTHENTICATED)
             .fetch_all(self.pool())
             .await?
             .into_iter()
@@ -578,8 +578,8 @@ mod tests {
         let (anon, req) = (Viewer::anonymous(), Requester::test());
         let options = opts(DEFAULT_BELOW, DEFAULT_BRANCHING, Sort::Oldest);
         let label = |did: &'static str, on: bool| async move {
-            let labels = if on { r#"{"labels": {"$type": "com.atproto.label.defs#selfLabels", "values": [{"val": "!no-unauthenticated"}]}}"# } else { "{}" };
-            exec(p, &format!("UPDATE actors SET profile_record = '{labels}' WHERE did = '{did}'")).await;
+            let labels = if on { json!({"labels": {"$type": "com.atproto.label.defs#selfLabels", "values": [{"val": "!no-unauthenticated"}]}}) } else { json!({}) };
+            crate::test_support::actors::set_record(p, did, &labels).await;
         };
         const WITHHELD: &str = "app.bsky.unspecced.defs#threadItemNoUnauthenticated";
         const POST: &str = "app.bsky.unspecced.defs#threadItemPost";

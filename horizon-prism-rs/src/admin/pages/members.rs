@@ -98,7 +98,7 @@ pub async fn page(
     let read = async {
         let members: Vec<MemberTuple> = sqlx::query_as(
             "SELECT m.did, a.handle, m.source, m.added_at, m.ready_at, m.first_ready_at, s.diverged_since \
-             FROM members m LEFT JOIN actors a ON a.did = m.did LEFT JOIN sync_state s ON s.did = m.did \
+             FROM members m LEFT JOIN dids ad ON ad.did = m.did LEFT JOIN actors a ON a.id = ad.id LEFT JOIN sync_state s ON s.did = m.did \
              ORDER BY m.added_at, m.did LIMIT $1 OFFSET $2",
         )
         .bind(PAGE + 1)
@@ -110,7 +110,7 @@ pub async fn page(
             .await?;
         let denials: Vec<DenialTuple> = sqlx::query_as(
             "SELECT d.did, a.handle, d.reason, d.denied_by, d.denied_at FROM member_denials d \
-             LEFT JOIN actors a ON a.did = d.did ORDER BY d.denied_at DESC, d.did",
+             LEFT JOIN dids ad ON ad.did = d.did LEFT JOIN actors a ON a.id = ad.id ORDER BY d.denied_at DESC, d.did",
         )
         .fetch_all(&state.pool)
         .await?;

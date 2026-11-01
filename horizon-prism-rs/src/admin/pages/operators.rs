@@ -69,7 +69,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
     let read = async {
         let operators: Vec<OperatorTuple> = sqlx::query_as(
             "SELECT o.did, a.handle, o.note, o.pds_endpoint, o.pds_checked_at, o.added_by, o.added_at \
-             FROM admin_operators o LEFT JOIN actors a ON a.did = o.did ORDER BY o.added_at, o.did",
+             FROM admin_operators o LEFT JOIN dids ad ON ad.did = o.did LEFT JOIN actors a ON a.id = ad.id ORDER BY o.added_at, o.did",
         )
         .fetch_all(&state.pool)
         .await?;

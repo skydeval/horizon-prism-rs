@@ -566,7 +566,7 @@ pub async fn require(
     // The handle, and the operator's own look, which every page carries
     // (a watching reload included, so it never draws in the default).
     let row: Option<(Option<String>, String, String)> = sqlx::query_as(
-        "SELECT a.handle, o.theme_mode, o.theme_scheme FROM admin_operators o LEFT JOIN actors a ON a.did = o.did WHERE o.did = $1",
+        "SELECT a.handle, o.theme_mode, o.theme_scheme FROM admin_operators o LEFT JOIN dids ad ON ad.did = o.did LEFT JOIN actors a ON a.id = ad.id WHERE o.did = $1",
     )
     .bind(&did)
     .fetch_optional(&state.pool)

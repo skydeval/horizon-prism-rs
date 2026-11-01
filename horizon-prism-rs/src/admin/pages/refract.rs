@@ -161,7 +161,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         let rows: Vec<ListTuple> = sqlx::query_as(&format!(
             "SELECT d.did, a.handle, d.community, d.state, coalesce(d.since, d.candidate_since, d.created_at), d.checked_at, d.next_check_at, \
                     j.state, j.refract_cursor, j.last_error \
-             FROM refract_dids d LEFT JOIN actors a ON a.did = d.did {JOB_JOIN} \
+             FROM refract_dids d LEFT JOIN dids ad ON ad.did = d.did LEFT JOIN actors a ON a.id = ad.id {JOB_JOIN} \
              WHERE ($1::text IS NULL OR d.state = $1) AND ($2::text IS NULL OR d.community = $2) \
              ORDER BY d.community, d.state, d.did LIMIT $3 OFFSET $4"
         ))
@@ -340,7 +340,7 @@ pub async fn account(State(state): State<AdminState>, ConnectInfo(peer): Connect
             "SELECT d.community, d.pds_host, d.state, d.source, d.since, d.candidate_since, d.checked_at, d.next_check_at, d.attempts, d.last_verdict, \
                     d.grace_until, d.ended_reason, d.unverified_since, d.awaiting_labels_since, d.resync_at, d.created_at, a.handle, \
                     j.state AS job, j.refract_cursor AS cursor, j.last_error AS job_error \
-             FROM refract_dids d LEFT JOIN actors a ON a.did = d.did {JOB_JOIN} WHERE d.did = $1"
+             FROM refract_dids d LEFT JOIN dids ad ON ad.did = d.did LEFT JOIN actors a ON a.id = ad.id {JOB_JOIN} WHERE d.did = $1"
         ))
         .bind(&did)
         .fetch_optional(&state.pool)

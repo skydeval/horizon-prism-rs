@@ -130,7 +130,7 @@ pub async fn gate_many_among(
     .fetch_all(pool)
     .await?;
     let statuses: Vec<(String, String)> =
-        sqlx::query_as("SELECT did, account_status FROM actors WHERE did = ANY($1) AND account_status <> 'active'")
+        sqlx::query_as("SELECT d.did, a.account_status FROM dids d JOIN actors a ON a.id = d.id WHERE d.did = ANY($1) AND a.account_status <> 'active'")
             .bind(&authors_v)
             .fetch_all(pool)
             .await?;
@@ -199,11 +199,7 @@ mod tests {
                 .await
                 .expect("label");
         }
-        sqlx::query("INSERT INTO actors (did, account_status) VALUES ($1, 'deactivated')")
-            .bind(C)
-            .execute(p)
-            .await
-            .expect("actor");
+        crate::test_support::actors::put(p, C, &[("account_status", "'deactivated'")]).await;
         let g = gate_many(p, &[post_a.clone(), post_b.clone(), post_c.clone(), B.to_string(), C.to_string()], RefractView::empty())
             .await
             .expect("gate");
@@ -236,7 +232,7 @@ mod tests {
         let like_b = format!("at://{B}/app.bsky.feed.like/1");
         let profile_b = format!("at://{B}/app.bsky.actor.profile/self");
         let post_c = format!("at://{C}/app.bsky.feed.post/1");
-        sqlx::query("INSERT INTO actors (did, account_status) VALUES ($1, 'deactivated')").bind(C).execute(p).await.expect("actor");
+        crate::test_support::actors::put(p, C, &[("account_status", "'deactivated'")]).await;
         let mut sets = ScopeSets::default();
         sets.public.mode = PublicMode::Off;
         sets.scope.insert(B.into());

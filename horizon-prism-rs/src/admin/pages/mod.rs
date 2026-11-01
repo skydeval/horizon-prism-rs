@@ -456,7 +456,7 @@ impl CommandRow {
 /// The word a typed confirmation needs for an account (§5.5): its stored
 /// handle, else the last eight characters of its DID.
 pub async fn typed_word(state: &AdminState, did: &str) -> Result<String, sqlx::Error> {
-    let handle: Option<String> = sqlx::query_scalar("SELECT handle FROM actors WHERE did = $1")
+    let handle: Option<String> = sqlx::query_scalar("SELECT handle FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1)")
         .bind(did)
         .fetch_optional(&state.pool)
         .await?

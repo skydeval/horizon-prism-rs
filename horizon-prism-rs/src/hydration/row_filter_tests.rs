@@ -69,22 +69,30 @@ async fn world(p: &sqlx::PgPool) -> Hydrator {
     // As backfill `prepare` and a `private` depth's profile fetch store a
     // private owner (§5.10).
     for (did, handle, status) in [(OWNER, "owner.test", "active"), (GONE, "gone.test", "deactivated")] {
-        exec(
+        let (handle, status) = (format!("'{handle}'"), format!("'{status}'"));
+        crate::test_support::actors::put(
             p,
-            &format!(
-                "INSERT INTO actors (did, pds_endpoint, handle, handle_checked_at, account_status, status_checked_at, \
-                   display_name, description, avatar_cid, pronouns, website, profile_record) \
-                 VALUES ('{did}', 'https://pds.example.com', '{handle}', now(), '{status}', now(), \
-                   'Private Owner', 'about me', 'bafyavatar', 'they/them', 'https://owner.example', \
-                   '{{\"createdAt\":\"2026-01-01T00:00:00Z\"}}'::jsonb)"
-            ),
+            did,
+            &[
+                ("pds_endpoint", "'https://pds.example.com'"),
+                ("handle", &handle),
+                ("handle_checked_at", "now()"),
+                ("account_status", &status),
+                ("status_checked_at", "now()"),
+                ("display_name", "'Private Owner'"),
+                ("description", "'about me'"),
+                ("avatar_cid", "'bafyavatar'"),
+                ("pronouns", "'they/them'"),
+                ("website", "'https://owner.example'"),
+                ("profile_record", "'{\"createdAt\":\"2026-01-01T00:00:00Z\"}'"),
+            ],
         )
         .await;
         crate::test_support::interactions::set_actor_counts(p, did, (5, 6, 7)).await;
     }
     // As the identity refresher stores a class-M author: its PDS, then its
     // handle once checked.
-    exec(p, &format!("INSERT INTO actors (did, pds_endpoint, handle, handle_checked_at) VALUES ('{REPLIER}', 'https://pds.example.com', 'replier.test', now())")).await;
+    crate::test_support::actors::put(p, REPLIER, &[("pds_endpoint", "'https://pds.example.com'"), ("handle", "'replier.test'"), ("handle_checked_at", "now()")]).await;
     // A ready member's list is served from its stored row.
     let record = json!({"$type": "app.bsky.graph.list", "name": "Mods", "purpose": PURPOSE_MOD, "createdAt": "2026-01-01T00:00:00Z"});
     let rkey = list_uri(BOB).rsplit('/').next().expect("rkey").to_string();
@@ -204,7 +212,7 @@ async fn members_and_scope_render_in_full() {
         assert_eq!(lens["displayName"], name, "{did}");
     }
     // A deactivated account in S is still hidden by the gate.
-    exec(&db.pool, &format!("UPDATE actors SET account_status = 'deactivated' WHERE did = '{SCOPED}'")).await;
+    exec(&db.pool, &format!("UPDATE actors SET account_status = 'deactivated' WHERE id = (SELECT id FROM dids WHERE did = '{SCOPED}')")).await;
     assert!(!h.lens_visible(&Requester::test(), &post_uri(SCOPED)).await.expect("db"));
     let me = Viewer { did: Some(ALICE.into()), hydrate: true };
     let e = h.get_profile(&me, &Requester::test(), SCOPED).await.expect("db").expect_err("hidden");

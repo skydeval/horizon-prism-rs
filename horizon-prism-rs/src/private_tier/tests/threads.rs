@@ -327,7 +327,7 @@ async fn t48(test: &str, public: PublicMode, layout: Layout) {
     w.f.apply_op(ALICE, Action::Delete, NSID_POST_PRIVATE, "3kt48deleted", REV2, None).await;
     w.label(&taken_down, "!takedown").await;
     w.label(&hidden, "!hide").await;
-    exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'deactivated' WHERE did = '{CAROL}'")).await;
+    exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'deactivated' WHERE id = (SELECT id FROM dids WHERE did = '{CAROL}')")).await;
     for (case, by_bob, by_owner, owner) in &replies {
         w.expect(&format!("{case}, Bob's reply, its author"), BOB, by_bob, true).await;
         if *owner == ALICE {
@@ -342,7 +342,7 @@ async fn t48(test: &str, public: PublicMode, layout: Layout) {
             }
         }
     }
-    exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'active' WHERE did = '{CAROL}'")).await;
+    exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'active' WHERE id = (SELECT id FROM dids WHERE did = '{CAROL}')")).await;
     for uri in [&self_rooted, &below_self] {
         w.expect("self-rooted, its author", BOB, uri, true).await;
         for reader in [ALICE, CAROL, DAVE] {
@@ -587,7 +587,7 @@ async fn c19(test: &str, public: PublicMode, layout: Layout, case: C19) {
         C19::NotStanding => exec(&w.f.pool, &super::graph_delete_sql("follows", BOB, None)).await,
         C19::BlocksReader => exec(&w.f.pool, &block_sql(BOB, DAVE)).await,
         C19::Takedown => w.label(&m, "!takedown").await,
-        C19::OwnerNoActor => exec(&w.f.pool, &format!("DELETE FROM actors WHERE did = '{ALICE}'")).await,
+        C19::OwnerNoActor => exec(&w.f.pool, &format!("DELETE FROM actors WHERE id = (SELECT id FROM dids WHERE did = '{ALICE}')")).await,
         C19::OwnerBelow => exec(&w.f.pool, &super::graph_delete_sql("follows", BOB, None)).await,
         C19::RootIdentity | C19::ForeignParentOfOwnerRow => {}
     }
@@ -686,8 +686,8 @@ async fn t58(test: &str, public: PublicMode, layout: Layout) {
         ("blocks the reader", block_sql(BOB, DAVE), undo.to_string()),
         (
             "deactivates",
-            format!("UPDATE actors SET account_status = 'deactivated' WHERE did = '{BOB}'"),
-            format!("UPDATE actors SET account_status = 'active' WHERE did = '{BOB}'"),
+            format!("UPDATE actors SET account_status = 'deactivated' WHERE id = (SELECT id FROM dids WHERE did = '{BOB}')"),
+            format!("UPDATE actors SET account_status = 'active' WHERE id = (SELECT id FROM dids WHERE did = '{BOB}')"),
         ),
         ("blocks the owner", block_sql(BOB, ALICE), undo.to_string()),
         ("unfollows", super::graph_delete_sql("follows", BOB, None), follow_sql(BOB, ALICE)),

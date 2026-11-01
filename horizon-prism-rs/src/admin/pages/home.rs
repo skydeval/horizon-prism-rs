@@ -208,7 +208,7 @@ async fn load_tiles(state: &AdminState, banners: Banners) -> Result<Tiles, sqlx:
     .fetch_one(&state.pool)
     .await?;
     let commands: Vec<CommandTuple> = sqlx::query_as(&format!(
-        "SELECT {COMMAND_COLUMNS} FROM admin_commands c LEFT JOIN actors a ON a.did = c.requested_by ORDER BY c.id DESC LIMIT 5"
+        "SELECT {COMMAND_COLUMNS} FROM admin_commands c LEFT JOIN dids ad ON ad.did = c.requested_by LEFT JOIN actors a ON a.id = ad.id ORDER BY c.id DESC LIMIT 5"
     ))
     .fetch_all(&state.pool)
     .await?;

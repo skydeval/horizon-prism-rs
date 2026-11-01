@@ -743,11 +743,7 @@ impl Hydrator {
         .await?;
         let mut feed = self.feed_views(viewer, req, &items).await?;
         if include_pins && cursor.is_none() {
-            let pinned: Option<String> = sqlx::query_scalar("SELECT profile_record #>> '{pinnedPost,uri}' FROM actors WHERE did = $1")
-                .bind(&did)
-                .fetch_optional(self.pool())
-                .await?
-                .flatten();
+            let pinned = crate::db::actors::pinned_post(self.pool(), &did).await?;
             if let Some(uri) = pinned.filter(|u| uri_author(u) == Some(did.as_str())) {
                 let ctx = self.post_context(viewer, req, std::slice::from_ref(&uri), CountMode::List).await?;
                 if let Some(post) = ctx.post_view(&uri) {

@@ -18,7 +18,7 @@ Key metrics:
 | `backfill_jobs{state}` | Backfill queue; `failed` should stay at 0. |
 | `redis_memory_ratio` | Redis memory against `REDIS_MAXMEMORY`. |
 | `db_budget_ratio` | Database size against `storage.budget_bytes`. |
-| `record_recompress_remaining`, `other_record_recompress_remaining`, `posts_dead_rows` | Post records and other kept records (lists, starter packs, gates, polls, labelers, settings) not yet compressed after an upgrade, and the dead rows the rewrite left in `posts`. |
+| `record_recompress_remaining`, `profile_record_recompress_remaining`, `other_record_recompress_remaining`, `posts_dead_rows` | Post records, profile records and other kept records (lists, starter packs, gates, polls, labelers, settings) not yet compressed after an upgrade, and the dead rows the rewrite left in `posts`. |
 | `xrpc_requests_total{nsid,class}`, `xrpc_request_seconds{nsid}` | Requests and latency per method. |
 | `upstream_skipped_total{network,reason}` | Upstream calls skipped for rate, deadline or a tripped breaker. |
 | `farsight_down`, `farsight_auth_failed_total` | Farsight outage or a bad key (if used). |

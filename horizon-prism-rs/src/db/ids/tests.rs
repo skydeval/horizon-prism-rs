@@ -915,3 +915,105 @@ async fn migration_0059_moves_the_record_tables() {
     assert_eq!(left, 0);
     db.drop_db().await;
 }
+
+/// One DID interned outside the writers: created once, read back after,
+/// and never for a string that is not a DID.
+#[tokio::test]
+async fn one_account_is_interned_select_first() {
+    let Some(db) = fresh_db("intern_account").await else { return };
+    let p = &db.pool;
+    let first = intern_account(p, A).await.expect("intern").expect("an id");
+    assert_eq!(intern_account(p, A).await.expect("again"), Some(first));
+    assert_eq!(account_id(p, A).await.expect("read"), Some(first));
+    assert_eq!(intern_account(p, "alice.example").await.expect("handle"), None, "a handle is not interned");
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM dids WHERE did = 'alice.example'").fetch_one(p).await.expect("count");
+    assert_eq!(n, 0);
+    db.drop_db().await;
+}
+
+/// Migration 0060 over rows of the old shape: each row is keyed by its
+/// account's id, interned first; every column is kept, the CIDs and the
+/// record in their exact text form, the rev in rev order (one that is not
+/// a TID as the lowest); the profile's self-label values gain their column;
+/// a row whose DID is not valid is left out.
+#[tokio::test]
+async fn migration_0060_moves_actors() {
+    use serde_json::{Value, json};
+
+    let Some(db) = crate::test_support::empty_db("migration_0060").await else { return };
+    let p = &db.pool;
+    let migrations: Vec<_> = crate::db::migrations::MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()).collect();
+    let at = migrations.iter().position(|m| m.version == 60).expect("0060");
+    for m in &migrations[..at] {
+        sqlx::raw_sql(&m.sql).execute(p).await.unwrap_or_else(|e| panic!("{}: {e}", m.version));
+    }
+    let canonical = "bafyreidbcoifjdzsr3u5i74kbm427m5yic67grd54s4luhlt4xxntevd6m";
+    let pack = format!("at://{B}/app.bsky.graph.starterpack/3myp5txuf7s2d");
+    let record = json!({
+        "$type": "app.bsky.actor.profile",
+        "displayName": "Ann",
+        "labels": {"$type": "com.atproto.label.defs#selfLabels", "values": [{"val": "!no-unauthenticated"}, {"val": 7}, {"val": "porn"}]},
+        "pinnedPost": {"uri": format!("at://{A}/app.bsky.feed.post/3myp5txuf7s2d"), "cid": canonical},
+    });
+    // A is known already (an outline row); B is not; C has no profile.
+    const C: &str = "did:plc:compactccccccccccccccccc";
+    sqlx::raw_sql(&format!(
+        "INSERT INTO dids (did) VALUES ('{A}'); \
+         INSERT INTO actors (did, handle, handle_checked_at, pds_endpoint, account_status, display_name, description, avatar_cid, banner_cid, \
+           profile_rev, profile_record, indexed_at, profile_cid, pronouns, website, joined_via_starter_pack_uri, joined_via_starter_pack_cid, \
+           profile_created_at) VALUES \
+           ('{A}', 'ann.test', now(), 'https://pds.example.com', 'active', 'Ann', 'about', '{canonical}', 'Bafy', \
+            '3myp5txuf7s2d', '{record}', '2026-01-01T00:00:00Z', '{canonical}', 'she/her', 'https://ann.example', '{pack}', '{canonical}', \
+            '2026-01-01T00:01:00Z'), \
+           ('{B}', 'bea.test', NULL, NULL, 'deactivated', NULL, NULL, NULL, NULL, 'not-a-tid', '{{}}', now(), NULL, NULL, NULL, NULL, NULL, NULL), \
+           ('{C}', NULL, NULL, NULL, 'active', NULL, NULL, NULL, NULL, NULL, NULL, now(), NULL, NULL, NULL, NULL, NULL, NULL), \
+           ('alice.example', 'x.test', NULL, NULL, 'active', NULL, NULL, NULL, NULL, NULL, NULL, now(), NULL, NULL, NULL, NULL, NULL, NULL)"
+    ))
+    .execute(p)
+    .await
+    .expect("old rows");
+    let a_before: i32 = sqlx::query_scalar("SELECT id FROM dids WHERE did = $1").bind(A).fetch_one(p).await.expect("a");
+
+    sqlx::raw_sql(&migrations[at].sql).execute(p).await.expect("0060 applies over existing rows");
+
+    let id = |did: &'static str| async move { sqlx::query_scalar::<_, i32>("SELECT id FROM dids WHERE did = $1").bind(did).fetch_one(p).await.expect("id") };
+    let (a, b, c) = (id(A).await, id(B).await, id(C).await);
+    assert_eq!(a, a_before, "a known DID keeps its id");
+    let text = |s: &str| [&[0u8][..], s.as_bytes()].concat();
+    type Row = (i32, Option<String>, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<String>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<String>, Option<Vec<String>>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id, handle, account_status, avatar_cid, banner_cid, bigint_to_rev(profile_rev), profile_record, profile_cid, \
+           joined_via_starter_pack_cid, joined_via_starter_pack_uri, self_labels FROM actors ORDER BY id",
+    )
+    .fetch_all(p)
+    .await
+    .expect("actors");
+    assert_eq!(rows.len(), 3, "the row whose DID is not valid is left out");
+    let ann = rows.iter().find(|r| r.0 == a).expect("A");
+    assert_eq!((ann.1.as_deref(), ann.2.as_str()), (Some("ann.test"), "active"));
+    assert_eq!((ann.3.as_deref(), ann.4.as_deref()), (Some(&text(canonical)[..]), Some(&text("Bafy")[..])));
+    assert_eq!(ann.5.as_deref(), Some("3myp5txuf7s2d"));
+    let stored = ann.6.as_ref().expect("record");
+    assert_eq!(stored[0], 0, "the record as dict 0");
+    assert_eq!(serde_json::from_slice::<Value>(&stored[1..]).expect("json"), record);
+    assert_eq!((ann.7.as_deref(), ann.8.as_deref()), (Some(&text(canonical)[..]), Some(&text(canonical)[..])));
+    assert_eq!(ann.9.as_deref(), Some(pack.as_str()));
+    assert_eq!(ann.10.as_deref(), Some(&["!no-unauthenticated".to_string(), "porn".to_string()][..]), "string values only");
+    let bea = rows.iter().find(|r| r.0 == b).expect("B");
+    assert_eq!((bea.2.as_str(), bea.5.as_deref(), bea.10.as_ref()), ("deactivated", Some("2222222222222"), None));
+    let cee = rows.iter().find(|r| r.0 == c).expect("C");
+    assert_eq!((cee.5.as_ref(), cee.6.as_ref(), cee.10.as_ref()), (None, None, None), "no profile, nothing made up");
+    let kept: (String, Option<String>, String, String, bool, bool) = sqlx::query_as(
+        "SELECT pds_endpoint, description, pronouns, website, indexed_at = '2026-01-01T00:00:00Z', profile_created_at = '2026-01-01T00:01:00Z' \
+         FROM actors WHERE id = $1",
+    )
+    .bind(a)
+    .fetch_one(p)
+    .await
+    .expect("kept");
+    assert_eq!(kept, ("https://pds.example.com".into(), Some("about".into()), "she/her".into(), "https://ann.example".into(), true, true));
+    // The indexes reads use are there.
+    let indexes: Vec<String> = sqlx::query_scalar("SELECT indexname FROM pg_indexes WHERE tablename = 'actors' ORDER BY 1").fetch_all(p).await.expect("indexes");
+    assert_eq!(indexes, ["actors_handle_prefix", "actors_handle_trgm", "actors_joined_via", "actors_name_prefix", "actors_name_trgm", "actors_pkey"]);
+    db.drop_db().await;
+}

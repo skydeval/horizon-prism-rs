@@ -341,7 +341,7 @@ impl IdentityRefresher {
 
     async fn actor_state(&self, did: &str) -> Result<Option<ActorState>, sqlx::Error> {
         sqlx::query_as::<_, ActorState>(
-            "SELECT deletion_suspect_at, deletion_suspect_pds FROM actors WHERE did = $1",
+            "SELECT deletion_suspect_at, deletion_suspect_pds FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1)",
         )
         .bind(did)
         .fetch_optional(&self.pool)
@@ -391,7 +391,7 @@ impl IdentityRefresher {
                 .resolver
                 .verify_handle(did, info.claimed_handle.as_deref())
                 .await;
-            sqlx::query("UPDATE actors SET handle = $2, handle_checked_at = now() WHERE did = $1")
+            sqlx::query("UPDATE actors SET handle = $2, handle_checked_at = now() WHERE id = (SELECT id FROM dids WHERE did = $1)")
                 .bind(did)
                 .bind(verified)
                 .execute(&self.pool)
@@ -468,8 +468,8 @@ impl IdentityRefresher {
             let before: Option<Option<String>> = sqlx::query_scalar(
                 "UPDATE actors a SET account_status = $2, status_checked_at = now(), \
                  deletion_suspect_at = NULL, deletion_suspect_pds = NULL \
-                 FROM (SELECT did, account_status FROM actors WHERE did = $1 FOR UPDATE) old \
-                 WHERE a.did = old.did RETURNING old.account_status",
+                 FROM (SELECT id, account_status FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1) FOR UPDATE) old \
+                 WHERE a.id = old.id RETURNING old.account_status",
             )
             .bind(did)
             .bind(&account)
@@ -521,20 +521,23 @@ impl IdentityRefresher {
         endpoint: Option<&str>,
         clear_did_web_suspicion: bool,
     ) -> Result<(), sqlx::Error> {
+        let Some(id) = crate::db::ids::intern_account(&self.pool, did).await? else {
+            return Ok(());
+        };
         sqlx::query(
-            "INSERT INTO actors (did, pds_endpoint) VALUES ($1, $2) \
-             ON CONFLICT (did) DO UPDATE SET pds_endpoint = EXCLUDED.pds_endpoint",
+            "INSERT INTO actors (id, pds_endpoint) VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET pds_endpoint = EXCLUDED.pds_endpoint",
         )
-        .bind(did)
+        .bind(id)
         .bind(endpoint)
         .execute(&self.pool)
         .await?;
         if clear_did_web_suspicion {
             sqlx::query(
                 "UPDATE actors SET deletion_suspect_at = NULL, deletion_suspect_pds = NULL \
-                 WHERE did = $1 AND deletion_suspect_pds = $2",
+                 WHERE id = $1 AND deletion_suspect_pds = $2",
             )
-            .bind(did)
+            .bind(id)
             .bind(DID_WEB_SUSPECT)
             .execute(&self.pool)
             .await?;
@@ -543,12 +546,15 @@ impl IdentityRefresher {
     }
 
     async fn set_suspicion(&self, did: &str, since: DateTime<Utc>, source: &str) -> Result<(), sqlx::Error> {
+        let Some(id) = crate::db::ids::intern_account(&self.pool, did).await? else {
+            return Ok(());
+        };
         sqlx::query(
-            "INSERT INTO actors (did, deletion_suspect_at, deletion_suspect_pds) VALUES ($1, $2, $3) \
-             ON CONFLICT (did) DO UPDATE SET deletion_suspect_at = EXCLUDED.deletion_suspect_at, \
+            "INSERT INTO actors (id, deletion_suspect_at, deletion_suspect_pds) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET deletion_suspect_at = EXCLUDED.deletion_suspect_at, \
              deletion_suspect_pds = EXCLUDED.deletion_suspect_pds",
         )
-        .bind(did)
+        .bind(id)
         .bind(since)
         .bind(source)
         .execute(&self.pool)
@@ -557,13 +563,15 @@ impl IdentityRefresher {
     }
 
     async fn mark_deleted(&self, did: &str, cause: &'static str) -> Result<Outcome, IdentityError> {
-        sqlx::query(
-            "INSERT INTO actors (did, account_status, status_checked_at) VALUES ($1, 'deleted', now()) \
-             ON CONFLICT (did) DO UPDATE SET account_status = 'deleted', status_checked_at = now()",
-        )
-        .bind(did)
-        .execute(&self.pool)
-        .await?;
+        if let Some(id) = crate::db::ids::intern_account(&self.pool, did).await? {
+            sqlx::query(
+                "INSERT INTO actors (id, account_status, status_checked_at) VALUES ($1, 'deleted', now()) \
+                 ON CONFLICT (id) DO UPDATE SET account_status = 'deleted', status_checked_at = now()",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
         tracing::info!(event = "account_deleted", did, cause, "DID transitioned to deleted; purging");
         self.lifecycle
             .account_deleted(did)
@@ -722,7 +730,7 @@ mod tests {
         let lifecycle = Arc::new(Recorded(std::sync::Mutex::new(Vec::new())));
         let refresher = IdentityRefresher::new(db.pool.clone(), resolver, Arc::clone(&lifecycle) as Arc<dyn AccountLifecycle>);
         assert_eq!(refresher.run_batch().await.expect("batch"), 1);
-        let status: Option<String> = sqlx::query_scalar("SELECT account_status FROM actors WHERE did = $1")
+        let status: Option<String> = sqlx::query_scalar("SELECT a.account_status FROM actors a JOIN dids d ON d.id = a.id WHERE d.did = $1")
             .bind(did)
             .fetch_one(&db.pool)
             .await
@@ -815,7 +823,7 @@ mod tests {
         };
         exec(format!("INSERT INTO scope_dids (did, reasons) VALUES ('{did}', 1), ('{member}', 1)")).await;
         exec(format!("INSERT INTO members (did, source) VALUES ('{member}', 'admin')")).await;
-        exec(format!("INSERT INTO actors (did, account_status) VALUES ('{did}', 'takendown')")).await;
+        exec(crate::test_support::actors::put_sql(did, &[("account_status", "'takendown'")])).await;
 
         // Still taken down: nothing moves.
         seed().await;

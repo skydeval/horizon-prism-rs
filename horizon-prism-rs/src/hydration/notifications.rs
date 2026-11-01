@@ -188,14 +188,9 @@ impl Hydrator {
         }
         // `starterpack-joined` points at the joiner's profile record, as it
         // is now.
-        let profiles: Vec<(String, Value)> = sqlx::query_as(
-            "SELECT 'at://' || did || '/app.bsky.actor.profile/self', profile_record FROM actors \
-             WHERE profile_record IS NOT NULL AND 'at://' || did || '/app.bsky.actor.profile/self' = ANY($1)",
-        )
-        .bind(&uris)
-        .fetch_all(self.pool())
-        .await?;
-        out.extend(profiles);
+        let joiners: Vec<String> = uris.iter().filter_map(|u| crate::db::actors::profile_did(u)).map(str::to_string).collect();
+        let profiles = crate::db::actors::records(self.pool(), &joiners).await?;
+        out.extend(profiles.into_iter().map(|(did, record)| (crate::db::actors::profile_uri(&did), record)));
         Ok(out)
     }
 
@@ -207,11 +202,7 @@ impl Hydrator {
         if joiners.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let found: Vec<(String, String)> = sqlx::query_as("SELECT did, profile_cid FROM actors WHERE did = ANY($1) AND profile_cid IS NOT NULL")
-            .bind(&joiners)
-            .fetch_all(self.pool())
-            .await?;
-        Ok(found.into_iter().collect())
+        crate::db::actors::profile_cids(self.pool(), &joiners).await
     }
 
     /// `app.bsky.notification.listNotifications` (limit ≤ 100).
@@ -536,7 +527,7 @@ impl Hydrator {
                AND n.author_did <> ALL($5) AND n.record_uri <> ALL($6) \
                AND NOT (n.author_did = ANY($7) AND split_part(n.record_uri, '/', 4) <> ALL($9)) \
                AND NOT (n.author_did = ANY($8) AND split_part(n.record_uri, '/', 4) = 'app.bsky.feed.post') \
-               AND NOT EXISTS (SELECT 1 FROM actors a WHERE a.did = n.author_did \
+               AND NOT EXISTS (SELECT 1 FROM actors a JOIN dids ad ON ad.id = a.id WHERE ad.did = n.author_did \
                                AND a.account_status IN ('deactivated', 'takendown', 'suspended', 'deleted')) \
                AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject IN (n.record_uri, n.author_did) AND l.val = '!takedown') \
                AND ($10::text[] IS NULL OR n.author_did = ANY($10))",

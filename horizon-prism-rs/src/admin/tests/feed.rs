@@ -368,7 +368,7 @@ async fn t_f8_lines() {
     };
     let p = h.pool();
     let _alice = complete_setup(&h, ALICE).await;
-    sqlx::query("INSERT INTO actors (did, handle) VALUES ($1, 'author.test')").bind(AUTHOR).execute(p).await.expect("actor");
+    crate::test_support::actors::put(p, AUTHOR, &[("handle", "'author.test'")]).await;
     let cookie = session(p, ALICE, PDS).await;
     let mut all = open(&h, &cookie, &page_id(), "").await;
     let mut blocks = open(&h, &cookie, &page_id(), "&kinds=block").await;

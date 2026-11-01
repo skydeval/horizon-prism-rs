@@ -360,7 +360,7 @@ async fn t52_the_reorder_is_an_equivalence() {
     let uris = mixed(&w).await;
     w.label(&uris[7], "!takedown").await;
     w.label(BOB, "!takedown").await;
-    exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'suspended' WHERE did = '{CAROL}'")).await;
+    exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'suspended' WHERE id = (SELECT id FROM dids WHERE did = '{CAROL}')")).await;
     w.f.ready_all().await;
     let gate = "NOT EXISTS (SELECT 1 FROM labels l WHERE (l.subject = c.uri AND l.val IN ('!takedown', '!hide')) \
                 OR (l.subject = c.author_did AND l.val = '!takedown')) \
@@ -373,7 +373,7 @@ async fn t52_the_reorder_is_an_equivalence() {
         "SELECT s1.uri, s1.s1ok, {reference} FROM s1 c \
          LEFT JOIN private_posts an ON an.uri = c.anchor \
          LEFT JOIN LATERAL (SELECT g.*, NULL::jsonb AS members_j FROM private_audiences g WHERE g.uri = an.audience_uri) a ON true \
-         LEFT JOIN actors po ON po.did = c.author_did JOIN s1 ON s1.uri = c.uri"
+         LEFT JOIN dids pod ON pod.did = c.author_did LEFT JOIN actors po ON po.id = pod.id JOIN s1 ON s1.uri = c.uri"
     );
     let sql = schema::walked(&format!("SELECT {} FROM private_posts p WHERE p.uri = ANY($2)", schema::COLS), "", &final_, CAP);
     for reader in [ALICE, BOB, CAROL, DAVE] {

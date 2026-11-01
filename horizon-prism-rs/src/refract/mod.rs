@@ -302,11 +302,13 @@ pub async fn make_due(pool: &PgPool, dids: &[String]) -> Result<u64, sqlx::Error
 ///
 /// Database errors.
 pub async fn make_due_on_event(pool: &PgPool, did: &str) -> Result<bool, sqlx::Error> {
+    let account = crate::db::ids::account_id(pool, did).await?;
     let row: Option<(String, bool)> = sqlx::query_as(
-        "SELECT state, (EXISTS (SELECT 1 FROM actors WHERE did = $1) OR EXISTS (SELECT 1 FROM scope_dids WHERE did = $1) \
+        "SELECT state, (EXISTS (SELECT 1 FROM actors WHERE id = $2) OR EXISTS (SELECT 1 FROM scope_dids WHERE did = $1) \
            OR EXISTS (SELECT 1 FROM members WHERE did = $1)) FROM refract_dids WHERE did = $1",
     )
     .bind(did)
+    .bind(account)
     .fetch_optional(pool)
     .await?;
     let Some((state, other_tie)) = row else {

@@ -95,7 +95,7 @@ impl Chain {
         let mut everyone = vec![ALICE.to_string(), BOB.to_string(), CAROL.to_string(), DAVE.to_string()];
         everyone.extend(extra.iter().cloned());
         for (i, d) in everyone.iter().enumerate() {
-            exec(&w.f.pool, &format!("UPDATE actors SET pds_endpoint = 'https://bench-{tag}{i}.invalid' WHERE did = '{d}'")).await;
+            exec(&w.f.pool, &format!("UPDATE actors SET pds_endpoint = 'https://bench-{tag}{i}.invalid' WHERE id = (SELECT id FROM dids WHERE did = '{d}')")).await;
         }
         let chain = Self { w, heads, authors, rows, more };
         chain.ready().await;

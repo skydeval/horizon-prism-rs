@@ -250,10 +250,12 @@ mod tests {
         let list = format!("at://{owner}/app.bsky.graph.list/3klist2222222");
         let pack = crate::test_support::records::starter_pack(p, owner, "3kpack2222222", "Pack", &list).await;
         for (i, age_days) in [1, 3, 30].into_iter().enumerate() {
-            exec(p, &format!(
-                "INSERT INTO actors (did, handle, joined_via_starter_pack_uri, profile_created_at) VALUES \
-                 ('did:plc:joiner{i}', 'j{i}.test', '{pack}', now() - interval '{age_days} days')"
-            )).await;
+            let (handle, via, created) = (format!("'j{i}.test'"), format!("'{pack}'"), format!("now() - interval '{age_days} days'"));
+            exec(p, &crate::test_support::actors::put_sql(
+                &format!("did:plc:joiner{i}"),
+                &[("handle", &handle), ("joined_via_starter_pack_uri", &via), ("profile_created_at", &created)],
+            ))
+            .await;
         }
         let job = PackCounts::new(p.clone(), None, Duration::from_secs(3600));
         assert_eq!(job.refresh_all().await.expect("refresh"), 1);

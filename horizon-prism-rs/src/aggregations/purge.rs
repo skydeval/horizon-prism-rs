@@ -525,8 +525,8 @@ impl Purger {
                     "UPDATE actors SET display_name = NULL, description = NULL, avatar_cid = NULL, \
                      banner_cid = NULL, profile_record = NULL, profile_rev = NULL, profile_cid = NULL, \
                      pronouns = NULL, website = NULL, joined_via_starter_pack_uri = NULL, \
-                     joined_via_starter_pack_cid = NULL, profile_created_at = NULL \
-                     WHERE did = $1 AND profile_record IS NOT NULL",
+                     joined_via_starter_pack_cid = NULL, profile_created_at = NULL, self_labels = NULL \
+                     WHERE id = (SELECT id FROM dids WHERE did = $1) AND profile_record IS NOT NULL",
                 )
                 .bind(did)
                 .execute(&mut *conn)
@@ -994,7 +994,7 @@ mod tests {
         };
         let p = &db.pool;
         exec(p, "INSERT INTO scope_dids (did, reasons) VALUES ('did:plc:dddddddddddddddddddddddd', 2)").await;
-        exec(p, "INSERT INTO actors (did, display_name, profile_record, profile_rev) VALUES ('did:plc:dddddddddddddddddddddddd', 'D', '{}'::jsonb, '3k')").await;
+        exec(p, &crate::test_support::actors::put_sql("did:plc:dddddddddddddddddddddddd", &[("display_name", "'D'"), ("profile_record", "'{}'"), ("profile_rev", "'3kaaaaaaaaaaa'")])).await;
         crate::test_support::posts::plain(p, SCOPED, "1", "").await;
         // Every v3 record table, a pack's derived counts, the account's own
         // private state, and a subscription someone else holds on it.
@@ -1092,7 +1092,7 @@ mod tests {
             records::optout(p, MEMBER, "3koptout22222", "at://x/app.bsky.graph.list/l").await;
             records::post_ref(p, &format!("at://{MEMBER}/app.bsky.feed.post/3kpost2222222"), "3kaaaaaaaaaaa", (None, None, None), "now()").await;
         }
-        exec(p, &format!("INSERT INTO actors (did, display_name, profile_record, profile_rev) VALUES ('{MEMBER}', 'M', '{{}}'::jsonb, '3k')")).await;
+        exec(p, &crate::test_support::actors::put_sql(MEMBER, &[("display_name", "'M'"), ("profile_record", "'{}'"), ("profile_rev", "'3kaaaaaaaaaaa'")])).await;
     }
 
     fn purger_in(p: &PgPool, mode: crate::indexing::PublicMode) -> (ScopeState, Purger) {

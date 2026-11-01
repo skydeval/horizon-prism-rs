@@ -247,6 +247,29 @@ pub async fn account_id<'e, E: sqlx::PgExecutor<'e>>(e: E, did: &str) -> Result<
     sqlx::query_scalar("SELECT id FROM dids WHERE did = $1").bind(did).fetch_optional(e).await
 }
 
+/// One DID's id, created when missing, by the rule [`Ids::account_ids`]
+/// keeps (select first, insert only a missing one, read it back), without
+/// a cache: for writers that hold no [`Ids`]. Runs its own autocommit
+/// statements on the pool, so call it before any transaction. `None` for a
+/// string that is not a valid DID.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn intern_account(pool: &PgPool, did: &str) -> Result<Option<AccountId>, sqlx::Error> {
+    if !proto_blue::syntax::Did::is_valid(did) {
+        return Ok(None);
+    }
+    if let Some(id) = account_id(pool, did).await? {
+        return Ok(Some(id));
+    }
+    sqlx::query("INSERT INTO dids (did) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM dids WHERE did = $1) ON CONFLICT (did) DO NOTHING")
+        .bind(did)
+        .execute(pool)
+        .await?;
+    account_id(pool, did).await
+}
+
 /// A collection's id in the fixed list.
 #[must_use]
 pub fn collection_id(nsid: &str) -> Option<i16> {

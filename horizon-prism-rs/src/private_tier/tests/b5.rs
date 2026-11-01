@@ -68,9 +68,11 @@ pub(super) async fn base_snapshot(pool: &PgPool) {
     let t0 = std::time::Instant::now();
     let m = MEMBER_SQL;
     for sql in [
+        format!("INSERT INTO dids (did) SELECT {m} FROM generate_series(1, {BASE_MEMBERS}) g ON CONFLICT (did) DO NOTHING"),
         format!(
-            "INSERT INTO actors (did, handle, display_name, pds_endpoint, profile_record) \
-             SELECT {m}, 'b5m' || g || '.test', 'b5m' || g, 'https://pds.example.com', '{{\"createdAt\":\"2026-01-01T00:00:00Z\"}}'::jsonb \
+            "INSERT INTO actors (id, handle, display_name, pds_endpoint, profile_record) \
+             SELECT (SELECT id FROM dids WHERE did = {m}), 'b5m' || g || '.test', 'b5m' || g, 'https://pds.example.com', \
+                    '\\x00'::bytea || convert_to('{{\"createdAt\":\"2026-01-01T00:00:00Z\"}}', 'UTF8') \
              FROM generate_series(1, {BASE_MEMBERS}) g"
         ),
         format!("INSERT INTO members (did, source, ready_at) SELECT {m}, 'admin', now() FROM generate_series(1, {BASE_MEMBERS}) g"),
@@ -1029,7 +1031,7 @@ impl Part3 {
                 }
                 b.write(pool).await;
                 exec(pool, &block_sql(&writers[0], DAVE)).await;
-                exec(pool, &format!("UPDATE actors SET account_status = 'deactivated' WHERE did = '{}'", writers[1])).await;
+                exec(pool, &format!("UPDATE actors SET account_status = 'deactivated' WHERE id = (SELECT id FROM dids WHERE did = '{}')", writers[1])).await;
                 exec(pool, &block_sql(&writers[2], ALICE)).await;
                 let mut ready: Vec<String> = writers.clone();
                 ready.extend([ALICE.into(), CAROL.into()]);

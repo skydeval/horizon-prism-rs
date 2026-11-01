@@ -143,7 +143,7 @@ async fn read_jobs(state: &AdminState) -> Result<JobReads, sqlx::Error> {
     let counts: Vec<(String, String, i64)> = sqlx::query_as("SELECT depth, state, count(*) FROM backfill_jobs GROUP BY 1, 2").fetch_all(&mut *tx).await?;
     let failed: Vec<FailedTuple> = sqlx::query_as(&format!(
         "SELECT j.did, a.handle, j.depth, j.attempts, j.last_error, j.updated_at FROM backfill_jobs j \
-         LEFT JOIN actors a ON a.did = j.did WHERE j.state = 'failed' AND {STILL_NEEDED} ORDER BY j.updated_at DESC LIMIT 100"
+         LEFT JOIN dids ad ON ad.did = j.did LEFT JOIN actors a ON a.id = ad.id WHERE j.state = 'failed' AND {STILL_NEEDED} ORDER BY j.updated_at DESC LIMIT 100"
     ))
     .fetch_all(&mut *tx)
     .await?;

@@ -223,7 +223,7 @@ async fn load(which: Which) -> Option<Loaded> {
             stale = vec![ALICE.to_string(), DAVE.to_string()];
             stale.extend(extra.iter().cloned());
             for (i, d) in stale.iter().enumerate() {
-                exec(&pool, &format!("UPDATE actors SET pds_endpoint = 'https://bench-{i}.invalid' WHERE did = '{d}'")).await;
+                exec(&pool, &format!("UPDATE actors SET pds_endpoint = 'https://bench-{i}.invalid' WHERE id = (SELECT id FROM dids WHERE did = '{d}')")).await;
             }
             let text: String = stale
                 .iter()
@@ -239,7 +239,7 @@ async fn load(which: Which) -> Option<Loaded> {
     // Fresh, applied heads for every actor, readers included (§4 of the
     // parent: an upsert, so no actor is left without a row).
     exec(&pool, &format!(
-        "INSERT INTO sync_state (did, applied_rev, head_rev, head_checked_at) SELECT did, '{APPLIED}', '{APPLIED}', now() FROM actors \
+        "INSERT INTO sync_state (did, applied_rev, head_rev, head_checked_at) SELECT d.did, '{APPLIED}', '{APPLIED}', now() FROM actors a JOIN dids d ON d.id = a.id \
          ON CONFLICT (did) DO UPDATE SET applied_rev = '{APPLIED}', head_rev = '{APPLIED}', head_checked_at = now()"
     )).await;
     // A deployment past its first day: the one-time v3 re-sync is done, and

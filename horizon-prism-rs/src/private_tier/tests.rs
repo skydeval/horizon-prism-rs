@@ -1064,7 +1064,7 @@ impl Walk {
         let mut f = fixture_custom(&db.pool, test, public, extra, heads).await;
         f.app.limits = roomy_limits();
         if layout == Layout::OffPds {
-            exec(&f.pool, &format!("UPDATE actors SET pds_endpoint = 'https://pds.elsewhere.net' WHERE did <> '{ALICE}'")).await;
+            exec(&f.pool, &format!("UPDATE actors SET pds_endpoint = 'https://pds.elsewhere.net' WHERE id <> (SELECT id FROM dids WHERE did = '{ALICE}')")).await;
         }
         let aud = f.audience(ALICE, "3kaudmain222", mode, members).await;
         let root = f.private_post(ALICE, "3kroot222222", &aud, None).await;
@@ -1389,7 +1389,7 @@ async fn modes_and_writers(test: &str, layout: Layout) {
     }
 
     // Condition 4: an audience owner with no `actors` row is not active.
-    exec(&w.f.pool, &format!("DELETE FROM actors WHERE did = '{ALICE}'")).await;
+    exec(&w.f.pool, &format!("DELETE FROM actors WHERE id = (SELECT id FROM dids WHERE did = '{ALICE}')")).await;
     w.expect("owner has no actors row, followers", DAVE, &main_reply, false).await;
     w.expect("owner has no actors row, everyone", DAVE, &everyone, false).await;
     w.expect("owner has no actors row, following", DAVE, &following, false).await;
@@ -1548,7 +1548,7 @@ async fn pair_two(test: &str, middle: Middle) {
         Middle::Takedown => exec(&w.f.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{m}', '!takedown')")).await,
         Middle::Unlisted => {}
         Middle::BlocksOwner => exec(&w.f.pool, &block_sql(BOB, ALICE)).await,
-        Middle::Throttled => exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'throttled' WHERE did = '{BOB}'")).await,
+        Middle::Throttled => exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'throttled' WHERE id = (SELECT id FROM dids WHERE did = '{BOB}')")).await,
     }
     w.f.ready_all().await;
     if middle == Middle::Throttled {
@@ -1826,7 +1826,7 @@ async fn pre_s0_count_query_counts_each_kind() {
     exec(&w.f.pool, &graph_delete_sql("follows", CAROL, None)).await;
     w.reply(CAROL, "3kresidual22", &root).await;
     // Every Bob post starts being served under a non-hiding status.
-    exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'throttled' WHERE did = '{BOB}'")).await;
+    exec(&w.f.pool, &format!("UPDATE actors SET account_status = 'throttled' WHERE id = (SELECT id FROM dids WHERE did = '{BOB}')")).await;
     for sql in [schema::pre_s0_count_sql(), schema::pre_s0_count_sql_with_cap(64)] {
         let counts: (i64, i64, i64, i64, i64, i64, i64, i64) =
             sqlx::query_as(&sql).fetch_one(&w.f.pool).await.expect("count query");
@@ -2262,7 +2262,7 @@ async fn private_videos_in(mode: PublicMode, test: &str) {
     }
 
     // T-PV2: Alice's PDS unknown. V reads, with no media view.
-    exec(&f.pool, &format!("UPDATE actors SET pds_endpoint = NULL WHERE did = '{ALICE}'")).await;
+    exec(&f.pool, &format!("UPDATE actors SET pds_endpoint = NULL WHERE id = (SELECT id FROM dids WHERE did = '{ALICE}')")).await;
     let (body, p) = one_post(&base, BOB, &v).await;
     assert_no_cdn("no PDS", &body);
     assert_eq!(p["uri"], v.as_str(), "{body}");
