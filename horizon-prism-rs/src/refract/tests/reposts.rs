@@ -82,7 +82,7 @@ async fn a2_a5_a6_stored_spared_and_purged() {
     let stranger = w
         .apply(
             STRANGER,
-            "3krev0000000a",
+            "3krev2222222a",
             &[
                 op(Action::Create, "app.bsky.feed.repost", "3krp1", Some(repost(&subject_post))),
                 op(Action::Create, "app.bsky.feed.repost", "3krp2", Some(repost(&subject_post))),
@@ -96,12 +96,12 @@ async fn a2_a5_a6_stored_spared_and_purged() {
     assert_eq!(stranger.outcomes[..2], [OpOutcome::Written, OpOutcome::Written], "{stranger:?}");
     assert!(matches!(stranger.outcomes[2], OpOutcome::Rejected(_)), "a private subject: {stranger:?}");
     assert!(matches!(stranger.outcomes[3], OpOutcome::Rejected(_)), "a like is unchanged: {stranger:?}");
-    w.apply(MEMBER, "3krev0000000a", &[op(Action::Create, "app.bsky.feed.repost", "3krpm", Some(repost(&subject_post)))], options()).await.expect("member");
-    w.apply(R2, "3krev0000000a", &[op(Action::Create, "app.bsky.feed.repost", "3krpr", Some(repost(&subject_post)))], options()).await.expect("r2");
+    w.apply(MEMBER, "3krev2222222a", &[op(Action::Create, "app.bsky.feed.repost", "3krpm", Some(repost(&subject_post)))], options()).await.expect("member");
+    w.apply(R2, "3krev2222222a", &[op(Action::Create, "app.bsky.feed.repost", "3krpr", Some(repost(&subject_post)))], options()).await.expect("r2");
     assert_eq!(count(p, "SELECT count(*) FROM reposts").await, 4);
     // A delete removes the row and tombstones it.
-    w.apply(STRANGER, "3krev0000000b", &[op(Action::Delete, "app.bsky.feed.repost", "3krp2", None)], options()).await.expect("delete");
-    assert_eq!(count(p, &format!("SELECT count(*) FROM record_tombstones WHERE uri = 'at://{STRANGER}/app.bsky.feed.repost/3krp2'")).await, 1);
+    w.apply(STRANGER, "3krev2222222b", &[op(Action::Delete, "app.bsky.feed.repost", "3krp2", None)], options()).await.expect("delete");
+    assert!(crate::test_support::posts::tombstone_rev(p, &format!("at://{STRANGER}/app.bsky.feed.repost/3krp2")).await.is_some());
     assert_eq!(count(p, "SELECT count(*) FROM reposts").await, 3);
     // The on→off sweep's predicate keeps them while SUBJECT is in R.
     exec(p, &format!("INSERT INTO refract_dids (did, community, pds_host, state, source) VALUES ('{SUBJECT}', 'sky', '127.0.0.1', 'restored', 'fill')")).await;
@@ -130,7 +130,7 @@ async fn a5_on_mode_keeps_s_reposts() {
     let w = writer(p, s);
     let subject_post = format!("at://{SUBJECT}/app.bsky.feed.post/3kpost");
     for did in [STRANGER, OTHER] {
-        w.apply(did, "3krev0000000a", &[op(Action::Create, "app.bsky.feed.repost", "3krp", Some(repost(&subject_post)))], options()).await.expect("apply");
+        w.apply(did, "3krev2222222a", &[op(Action::Create, "app.bsky.feed.repost", "3krp", Some(repost(&subject_post)))], options()).await.expect("apply");
     }
     assert_eq!(count(p, "SELECT count(*) FROM reposts").await, 2);
     exec(p, &format!("INSERT INTO scope_dids (did, reasons) VALUES ('{OTHER}', 2) ON CONFLICT DO NOTHING")).await;
@@ -315,7 +315,7 @@ async fn a7_the_fill() {
         target.clone(),
         vec![(STRANGER.into(), tid.into()), (OTHER.into(), "3kgone".into()), ("not a did".into(), "3kbad".into())],
     );
-    exec(p, &format!("INSERT INTO record_tombstones (uri, rev) VALUES ('at://{OTHER}/app.bsky.feed.repost/3kgone', '3k')")).await;
+    crate::test_support::posts::tombstone(p, &format!("at://{OTHER}/app.bsky.feed.repost/3kgone"), "3kaaaaaaaaaaa").await;
     let w = writer(p, sets(PublicMode::Off, true));
     let b = Backfill::new(w, links.clone(), BackfillConfig::default(), 1);
     // A queued refract job holds it back.

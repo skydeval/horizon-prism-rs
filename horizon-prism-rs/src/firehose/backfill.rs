@@ -963,11 +963,11 @@ impl Ord for ByRkey {
 }
 
 /// The public table, and its author column, of an ecosystem collection that
-/// is listed and reconciled. Likes, reposts, follows and blocks name their
-/// author by id (`author`); `local_uris` reads them on its own.
+/// is listed and reconciled. Posts, likes, reposts, follows and blocks name
+/// their author by id (`author`); `local_uris` reads them on its own.
 fn public_table(nsid: &str) -> Option<(&'static str, &'static str)> {
     Some(match nsid {
-        NSID_POST => ("posts", "author_did"),
+        NSID_POST => ("posts", "author"),
         NSID_LIKE => ("likes", "author"),
         NSID_REPOST => ("reposts", "author"),
         NSID_FOLLOW => ("follows", "author"),
@@ -1162,8 +1162,11 @@ impl Backfill {
         let Some(did) = picked else {
             return Ok(None);
         };
-        let posts: Vec<String> = sqlx::query_scalar("SELECT uri FROM posts WHERE author_did = $1 ORDER BY created_at DESC, uri DESC LIMIT $2")
-            .bind(&did)
+        let posts: Vec<String> = sqlx::query_scalar(
+            "SELECT at_uri(p.author, 1::smallint, p.rkey) FROM posts p WHERE p.author = (SELECT id FROM dids WHERE did = $1) \
+             ORDER BY p.created_at DESC, p.rkey DESC LIMIT $2",
+        )
+        .bind(&did)
             .bind(REPOST_FILL_POSTS)
             .fetch_all(&self.pool)
             .await?;
@@ -1302,6 +1305,16 @@ impl Backfill {
 
     /// Run a claimed job and settle it.
     async fn run_claimed(&self, job: Job) -> Result<(Job, JobOutcome), sqlx::Error> {
+        // An account that joined S or became a member: the posts stored of
+        // it before get their search rows. A failure here is logged; the
+        // next job of the account tries again.
+        if matches!(job.depth, Depth::Scope | Depth::Member | Depth::Resync) {
+            match super::post_search::fill_author(&self.writer, &job.did).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(event = "post_search_filled", did = %job.did, rows = n, "stored posts became searchable"),
+                Err(error) => tracing::warn!(event = "post_search_fill_failed", did = %job.did, %error, "search rows were not written"),
+            }
+        }
         let outcome = match self.run(&job).await {
             Ok(Some(result)) => self.settle(&job, &result).await?,
             Ok(None) => JobOutcome::Superseded,
@@ -2418,17 +2431,21 @@ pub async fn local_uris(writer: &Writer, did: &str, nsid: &str, rev: &str, off_r
     if off_rule && nsid == NSID_POST {
         return sqlx::query_scalar(
             "SELECT uri FROM member_post_refs WHERE author_did = $1 AND rev < $2 \
-             UNION SELECT uri FROM posts WHERE author_did = $1 AND rev < $2 \
+             UNION SELECT at_uri(t.author, 1::smallint, t.rkey) FROM posts t \
+             WHERE t.author = (SELECT id FROM dids WHERE did = $1) AND t.rev < $3 \
                AND EXISTS (SELECT 1 FROM refract_dids WHERE did = $1 AND state IN ('restored', 'grace'))",
         )
         .bind(did)
         .bind(rev)
+        .bind(crate::db::ids::rev_value(rev))
         .fetch_all(writer.pool())
         .await;
     }
-    // Likes, reposts, follows and blocks are keyed by ids, with integer revs.
-    if matches!(nsid, NSID_LIKE | NSID_REPOST | NSID_FOLLOW | NSID_BLOCK) {
+    // Posts, likes, reposts, follows and blocks are keyed by ids, with
+    // integer revs.
+    if matches!(nsid, NSID_POST | NSID_LIKE | NSID_REPOST | NSID_FOLLOW | NSID_BLOCK) {
         let (table, coll) = match nsid {
+            NSID_POST => ("posts", 1),
             NSID_LIKE => ("likes", 2),
             NSID_REPOST => ("reposts", 3),
             NSID_FOLLOW => ("follows", 4),
@@ -2788,24 +2805,12 @@ mod tests {
     }
 
     async fn insert_post(pool: &PgPool, rkey: &str, rev: &str) {
-        sqlx::query(
-            "INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at) \
-             VALUES ($1, $2, $3, 'bafyold', $4, '{}'::jsonb, now())",
-        )
-        .bind(format!("at://{DID}/{NSID_POST}/{rkey}"))
-        .bind(DID)
-        .bind(rkey)
-        .bind(rev)
-        .execute(pool)
-        .await
-        .expect("insert post");
+        let record = json!({"$type": NSID_POST, "text": "", "createdAt": "2026-10-22T00:00:00.000Z"});
+        crate::test_support::posts::put_post(pool, DID, rkey, "bafyold", rev, &record, None).await;
     }
 
     async fn post_uris(pool: &PgPool) -> Vec<String> {
-        sqlx::query_scalar("SELECT uri FROM posts ORDER BY uri")
-            .fetch_all(pool)
-            .await
-            .expect("posts")
+        crate::test_support::posts::uris(pool).await
     }
 
     /// Refract T-12-r3, T-8i (refract design §6.1): a `refract` job is never
@@ -3094,12 +3099,8 @@ mod tests {
             ]
         );
         // The confirmed deletion went through the delete path with rev R.
-        let tomb: String = sqlx::query_scalar("SELECT rev FROM record_tombstones WHERE uri = $1")
-            .bind(format!("at://{DID}/{NSID_POST}/3kbbbbbbbbbbb"))
-            .fetch_one(&db.pool)
-            .await
-            .expect("tombstone");
-        assert_eq!(tomb, rev);
+        let tomb = crate::test_support::posts::tombstone_rev(&db.pool, &format!("at://{DID}/{NSID_POST}/3kbbbbbbbbbbb")).await;
+        assert_eq!(tomb.as_deref(), Some(rev));
         let state: String = sqlx::query_scalar("SELECT state FROM backfill_jobs WHERE did = $1")
             .bind(DID)
             .fetch_one(&db.pool)

@@ -3,17 +3,15 @@
 //! It is resumable, idempotent and paced, and it changes no semantics.
 //!
 //! **Phase 1: column backfill.**
-//! - `posts`: fills `tags`, `link_domains`, `link_urls`, `lang_prefixes`,
-//!   `embed_type`, `media_type` and `search_tsv` from `posts.record`, in
-//!   keyset batches by `uri`. A batch updates only rows whose `search_tsv`
-//!   is still NULL and whose `cid` is the one it read, so a row the ingest
-//!   writer rewrote meanwhile (and filled itself) is never overwritten with
-//!   values derived from a stale read.
-//! - `actors`: sets the profile columns from `profile_record`, with the
-//!   same guard on `profile_rev`. `profile_cid` is not derived here: it
-//!   comes with the record on the next profile write or re-sync.
-//! - Progress is kept in `worker_state` (`backfill:posts_v3`,
-//!   `backfill:actors_v3`), so a restart resumes.
+//! - `actors`: sets the profile columns from `profile_record`, in keyset
+//!   batches by `did`. A batch updates only rows whose `profile_rev` is the
+//!   one it read, so a row the ingest writer rewrote meanwhile is never
+//!   overwritten with values derived from a stale read. `profile_cid` is not
+//!   derived here: it comes with the record on the next profile write or
+//!   re-sync.
+//! - Progress is kept in `worker_state` (`backfill:actors_v3`), so a
+//!   restart resumes. (The search columns of posts were filled here once;
+//!   they now live in `post_search`, which migration 0057 filled.)
 //!
 //! **Phase 2: large-table indexes**, after phase 1, one at a time, each with
 //! `CREATE INDEX CONCURRENTLY` on a dedicated connection that has no lock or
@@ -21,8 +19,17 @@
 //! waited for while a backend is still building it, and dropped otherwise.
 //! A failed build is retried after a backoff that doubles up to an hour.
 //!
-//! Until the task finishes, search and trends are incomplete for old rows,
-//! and search runs without its indexes.
+//! **Phase 3: post records compressed.** Once the instance holds
+//! [`TRAIN_RECORDS`] posts, a dictionary is trained from the earliest of
+//! them and stored in `record_dicts`; writes use it from then on. Then the
+//! rows still stored as dict 0 (the JSON text) are rewritten with it, in
+//! keyset batches by `(author, rkey)`, each update guarded by the rev and
+//! the dict byte it read, so a newer write, a delete or a purge in between
+//! makes it a no-op and nothing deleted comes back. Progress is kept in
+//! `worker_state` (`records:recompress_posts`).
+//!
+//! Until the task finishes, search runs without its indexes, and trends
+//! wait for the tag index.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,11 +42,8 @@ use sqlx::{ConnectOptions, PgConnection, PgPool};
 use tokio::task::JoinHandle;
 
 use crate::config::FileConfig;
-use crate::firehose::extract::PostExtract;
 use crate::firehose::records::ProfileRecord;
-use crate::hydration::feed::media_type;
 
-pub const KEY_POSTS: &str = "backfill:posts_v3";
 pub const KEY_ACTORS: &str = "backfill:actors_v3";
 /// `schema_backfill_remaining{table}`: an estimate of rows not yet visited.
 pub const METRIC_REMAINING: &str = "schema_backfill_remaining";
@@ -53,16 +57,33 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 /// Waits between retries of a batch that lost a lock race.
 const LOCK_RETRY: Duration = Duration::from_millis(500);
 
+/// Post records a dictionary is trained from: the earliest stored. Training
+/// waits until the instance holds this many.
+pub const TRAIN_RECORDS: i64 = 10_000;
+/// A trained dictionary's size.
+pub const DICT_BYTES: usize = 64 * 1024;
+/// How long to wait before looking again for enough records to train from.
+const TRAIN_RETRY: Duration = Duration::from_secs(3600);
+pub const KEY_RECOMPRESS: &str = "records:recompress_posts";
+/// `record_recompress_remaining`: an estimate of post rows not yet visited.
+pub const METRIC_RECOMPRESS_REMAINING: &str = "record_recompress_remaining";
+/// `posts_dead_rows`: dead tuples in `posts`, which the rewrites leave until
+/// a vacuum (or a repack) takes them.
+pub const METRIC_POSTS_DEAD_ROWS: &str = "posts_dead_rows";
+
 /// The large-table indexes, by name, with the one statement that builds
-/// each (§3.1: the names and definitions are normative).
+/// each: the search indexes of `post_search`.
 pub const INDEXES: [(&str, &str); 7] = [
-    ("posts_search", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_search ON posts USING gin (search_tsv)"),
-    ("posts_tags", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_tags ON posts USING gin (tags)"),
-    ("posts_domains", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_domains ON posts USING gin (link_domains)"),
-    ("posts_urls", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_urls ON posts USING gin (link_urls)"),
-    ("posts_mentions", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_mentions ON posts USING gin (mention_dids)"),
-    ("posts_langs", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_langs ON posts USING gin (lang_prefixes)"),
-    ("posts_created", "CREATE INDEX CONCURRENTLY IF NOT EXISTS posts_created ON posts (created_at DESC, uri DESC)"),
+    ("post_search_tsv", "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_tsv ON post_search USING gin (search_tsv)"),
+    ("post_search_tags", "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_tags ON post_search USING gin (tags)"),
+    ("post_search_domains", "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_domains ON post_search USING gin (link_domains)"),
+    ("post_search_urls", "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_urls ON post_search USING gin (link_urls)"),
+    ("post_search_mentions", "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_mentions ON post_search USING gin (mention_ids)"),
+    ("post_search_langs", "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_langs ON post_search USING gin (lang_prefixes)"),
+    (
+        "post_search_created",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_created ON post_search (created_at DESC, author DESC, rkey DESC)",
+    ),
 ];
 
 /// The task's settings.
@@ -149,42 +170,6 @@ fn lost_a_lock_race(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().is_some_and(|c| c == "40P01" || c == "55P03"))
 }
 
-/// One `posts` batch after `after`: the last `uri` read and the rows read,
-/// or `None` at the end of the table.
-async fn posts_batch(pool: &PgPool, after: &str, limit: i64) -> Result<Option<(String, i64)>, sqlx::Error> {
-    let rows: Vec<(String, String, Value)> =
-        sqlx::query_as("SELECT uri, cid, record FROM posts WHERE uri > $1 AND search_tsv IS NULL ORDER BY uri LIMIT $2")
-            .bind(after)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?;
-    let Some(last) = rows.last().map(|r| r.0.clone()) else {
-        return Ok(None);
-    };
-    let values: Vec<Value> = rows
-        .iter()
-        .map(|(uri, cid, record)| {
-            let x = PostExtract::of(record);
-            json!({
-                "uri": uri, "cid": cid, "tags": x.tags, "link_domains": x.link_domains, "link_urls": x.link_urls,
-                "lang_prefixes": x.lang_prefixes, "embed_type": x.embed_type, "media_type": media_type(record),
-            })
-        })
-        .collect();
-    sqlx::query(
-        "UPDATE posts p SET tags = v.tags, link_domains = v.link_domains, link_urls = v.link_urls, \
-           lang_prefixes = v.lang_prefixes, embed_type = v.embed_type, media_type = v.media_type, \
-           search_tsv = to_tsvector('simple', p.text) \
-         FROM jsonb_to_recordset($1::jsonb) AS v(uri text, cid text, tags text[], link_domains text[], \
-           link_urls text[], lang_prefixes text[], embed_type text, media_type text) \
-         WHERE p.uri = v.uri AND p.search_tsv IS NULL AND p.cid = v.cid",
-    )
-    .bind(Value::Array(values))
-    .execute(pool)
-    .await?;
-    Ok(Some((last, i64::try_from(rows.len()).unwrap_or(i64::MAX))))
-}
-
 /// One `actors` batch after `after`, over rows that have a profile rev.
 async fn actors_batch(pool: &PgPool, after: &str, limit: i64) -> Result<Option<(String, i64)>, sqlx::Error> {
     let rows: Vec<(String, String, Option<Value>)> = sqlx::query_as(
@@ -224,6 +209,124 @@ async fn actors_batch(pool: &PgPool, after: &str, limit: i64) -> Result<Option<(
     .execute(pool)
     .await?;
     Ok(Some((last, i64::try_from(rows.len()).unwrap_or(i64::MAX))))
+}
+
+/// Train the posts dictionary, when none is stored yet and the instance
+/// holds [`TRAIN_RECORDS`] posts: its id, or `None`.
+///
+/// # Errors
+///
+/// Database errors, and a stored record that does not decode.
+pub async fn train_posts_dict(pool: &PgPool) -> Result<Option<i16>, sqlx::Error> {
+    let have: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM record_dicts WHERE family = $1)")
+        .bind(super::records::FAMILY_POSTS)
+        .fetch_one(pool)
+        .await?;
+    if have {
+        return Ok(None);
+    }
+    let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT record FROM posts ORDER BY created_at LIMIT $1").bind(TRAIN_RECORDS).fetch_all(pool).await?;
+    if i64::try_from(stored.len()).unwrap_or(0) < TRAIN_RECORDS {
+        return Ok(None);
+    }
+    let mut samples = Vec::with_capacity(stored.len());
+    for record in &stored {
+        samples.push(super::records::decode(pool, record).await?.into_bytes());
+    }
+    let dict = match super::ids::train_dict(&samples, DICT_BYTES) {
+        Ok(dict) => dict,
+        Err(error) => {
+            tracing::warn!(event = "record_dict_training_failed", %error, "the posts dictionary could not be trained");
+            return Ok(None);
+        }
+    };
+    let id: i16 = sqlx::query_scalar(
+        "INSERT INTO record_dicts (id, family, bytes) SELECT COALESCE(max(id), 0) + 1, $1, $2 FROM record_dicts RETURNING id",
+    )
+    .bind(super::records::FAMILY_POSTS)
+    .bind(&dict)
+    .fetch_one(pool)
+    .await?;
+    super::records::reload(pool).await?;
+    tracing::info!(event = "record_dict_trained", id, family = super::records::FAMILY_POSTS, bytes = dict.len(), "a record dictionary was trained");
+    Ok(Some(id))
+}
+
+/// The rows of one recompression batch to rewrite: each key, the rev it was
+/// read at, and its record with the current dictionary.
+#[derive(Debug, Default)]
+struct Rewrites {
+    authors: Vec<i32>,
+    rkeys: Vec<i64>,
+    revs: Vec<i64>,
+    records: Vec<Vec<u8>>,
+}
+
+/// Read one recompression batch after `after` (`author:rkey`): the last key
+/// read, the rows read, and the rows stored as dict 0 with their records
+/// encoded again; `None` at the end of the table.
+async fn recompress_read(pool: &PgPool, after: &str, limit: i64) -> Result<Option<(String, i64, Rewrites)>, sqlx::Error> {
+    let (author, rkey) = after
+        .split_once(':')
+        .and_then(|(a, k)| Some((a.parse::<i32>().ok()?, k.parse::<i64>().ok()?)))
+        .unwrap_or((i32::MIN, i64::MIN));
+    let rows: Vec<(i32, i64, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT author, rkey, rev, record FROM posts WHERE (author, rkey) > ($1, $2) ORDER BY author, rkey LIMIT $3",
+    )
+    .bind(author)
+    .bind(rkey)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let Some(&(last_author, last_rkey, _, _)) = rows.last() else {
+        return Ok(None);
+    };
+    let mut out = Rewrites::default();
+    for (a, k, rev, stored) in &rows {
+        if stored.first() != Some(&0) {
+            continue;
+        }
+        let text = super::records::decode(pool, stored).await?;
+        let packed = super::records::encode_text(pool, super::records::FAMILY_POSTS, &text).await?;
+        if packed.first() == Some(&0) {
+            continue;
+        }
+        out.authors.push(*a);
+        out.rkeys.push(*k);
+        out.revs.push(*rev);
+        out.records.push(packed);
+    }
+    Ok(Some((format!("{last_author}:{last_rkey}"), i64::try_from(rows.len()).unwrap_or(i64::MAX), out)))
+}
+
+/// Write a batch's rewrites: a row whose rev moved on, or that is no longer
+/// dict 0, or no longer there, is left as it is.
+async fn recompress_write(pool: &PgPool, rewrites: &Rewrites) -> Result<u64, sqlx::Error> {
+    if rewrites.authors.is_empty() {
+        return Ok(0);
+    }
+    Ok(sqlx::query(
+        "UPDATE posts p SET record = v.record \
+         FROM unnest($1::int[], $2::bigint[], $3::bigint[], $4::bytea[]) AS v(author, rkey, rev, record) \
+         WHERE p.author = v.author AND p.rkey = v.rkey AND p.rev = v.rev AND get_byte(p.record, 0) = 0",
+    )
+    .bind(&rewrites.authors)
+    .bind(&rewrites.rkeys)
+    .bind(&rewrites.revs)
+    .bind(&rewrites.records)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+/// One recompression batch after `after`: the last key read and the rows
+/// read, or `None` at the end of the table.
+async fn recompress_batch(pool: &PgPool, after: &str, limit: i64) -> Result<Option<(String, i64)>, sqlx::Error> {
+    let Some((last, rows, rewrites)) = recompress_read(pool, after, limit).await? else {
+        return Ok(None);
+    };
+    recompress_write(pool, &rewrites).await?;
+    Ok(Some((last, rows)))
 }
 
 /// The planner's row estimate for `table`.
@@ -290,11 +393,7 @@ impl SchemaBackfill {
         let mut estimate = estimated_rows(&self.pool, table).await;
         let mut estimated_at = std::time::Instant::now();
         while !progress.done {
-            let batch = if table == "posts" {
-                posts_batch(&self.pool, &progress.cursor, limit).await
-            } else {
-                actors_batch(&self.pool, &progress.cursor, limit).await
-            };
+            let batch = actors_batch(&self.pool, &progress.cursor, limit).await;
             match batch {
                 Ok(Some((last, rows))) => {
                     progress.cursor = last;
@@ -324,13 +423,12 @@ impl SchemaBackfill {
         Ok(())
     }
 
-    /// Phase 1: the column backfill of `posts`, then `actors`.
+    /// Phase 1: the column backfill of `actors`.
     ///
     /// # Errors
     ///
     /// Any database error other than a lost lock race.
     pub async fn run_column_backfill(&self) -> Result<(), sqlx::Error> {
-        self.backfill_table("posts", KEY_POSTS).await?;
         self.backfill_table("actors", KEY_ACTORS).await?;
         self.status.backfill_done.store(true, Ordering::Relaxed);
         Ok(())
@@ -410,7 +508,53 @@ impl SchemaBackfill {
         Ok(())
     }
 
-    /// Run both phases in the background. A database error ends the pass,
+    /// Phase 3: train the posts dictionary once there are records enough,
+    /// waiting for them, then rewrite the rows stored as dict 0 with it.
+    ///
+    /// # Errors
+    ///
+    /// Any database error other than a lost lock race.
+    pub async fn run_recompression(&self) -> Result<(), sqlx::Error> {
+        let mut progress = load_progress(&self.pool, KEY_RECOMPRESS).await?;
+        if progress.done {
+            return Ok(());
+        }
+        while super::records::current_id(&self.pool, super::records::FAMILY_POSTS).await? == 0 {
+            if train_posts_dict(&self.pool).await?.is_none() {
+                tokio::time::sleep(TRAIN_RETRY).await;
+            }
+        }
+        let limit = i64::from(self.cfg.batch_size.max(1));
+        let estimate = estimated_rows(&self.pool, "posts").await;
+        while !progress.done {
+            match recompress_batch(&self.pool, &progress.cursor, limit).await {
+                Ok(Some((last, rows))) => {
+                    progress.cursor = last;
+                    progress.visited += rows;
+                }
+                Ok(None) => progress.done = true,
+                Err(e) if lost_a_lock_race(&e) => {
+                    tokio::time::sleep(LOCK_RETRY).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            save_progress(&self.pool, KEY_RECOMPRESS, &progress).await?;
+            let remaining = if progress.done { 0 } else { (estimate - progress.visited).max(0) };
+            metrics::gauge!(METRIC_RECOMPRESS_REMAINING).set(remaining as f64);
+            if !progress.done {
+                tokio::time::sleep(Duration::from_millis(self.cfg.pause_ms)).await;
+            }
+        }
+        let dead: Option<i64> = sqlx::query_scalar("SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname = 'posts'")
+            .fetch_optional(&self.pool)
+            .await?;
+        metrics::gauge!(METRIC_POSTS_DEAD_ROWS).set(dead.unwrap_or(0) as f64);
+        tracing::info!(event = "record_recompress_done", rows = progress.visited, dead_rows = dead.unwrap_or(0), "post records are compressed");
+        Ok(())
+    }
+
+    /// Run every phase in the background. A database error ends the pass,
     /// and the task tries again after a minute: every step resumes from
     /// what is recorded.
     #[must_use]
@@ -419,12 +563,13 @@ impl SchemaBackfill {
             loop {
                 let result = async {
                     self.run_column_backfill().await?;
-                    self.run_index_builds().await
+                    self.run_index_builds().await?;
+                    self.run_recompression().await
                 }
                 .await;
                 match result {
                     Ok(()) => {
-                        tracing::info!(event = "schema_backfill_done", "column backfill and index builds finished");
+                        tracing::info!(event = "schema_backfill_done", "column backfill, index builds and recompression finished");
                         return;
                     }
                     Err(error) => {
@@ -453,20 +598,15 @@ mod tests {
         )
     }
 
-    async fn old_post(pool: &PgPool, rkey: &str, cid: &str, record: Value) {
-        // As written before the columns existed: every new column NULL.
-        sqlx::query(
-            "INSERT INTO posts (uri, author_did, rkey, cid, rev, text, record, created_at) \
-             VALUES ($1, 'did:plc:a', $2, $3, '3k', $4, $5, now() - interval '30 days')",
-        )
-        .bind(format!("at://did:plc:a/app.bsky.feed.post/{rkey}"))
-        .bind(rkey)
-        .bind(cid)
-        .bind(record.get("text").and_then(Value::as_str).unwrap_or_default().to_string())
-        .bind(&record)
-        .execute(pool)
-        .await
-        .expect("post");
+    /// An actor row as written before the profile columns existed.
+    async fn old_actor(pool: &PgPool, did: &str, rev: Option<&str>, record: Option<Value>) {
+        sqlx::query("INSERT INTO actors (did, profile_rev, profile_record, indexed_at) VALUES ($1, $2, $3, '2026-01-01T00:00:00Z')")
+            .bind(did)
+            .bind(rev)
+            .bind(record)
+            .execute(pool)
+            .await
+            .expect("actor");
     }
 
     #[tokio::test]
@@ -475,60 +615,36 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        for i in 0..7 {
-            let record = json!({"text": format!("post number {i}"), "tags": ["Cats"], "langs": ["en-GB"],
-                "facets": [{"features": [{"$type": "app.bsky.richtext.facet#link", "uri": "https://a.example.com/x"}]}]});
-            old_post(p, &format!("3k{i}"), "bafyold", record).await;
+        for i in 0..5 {
+            let record = json!({"pronouns": format!("p{i}"), "website": "https://a.example", "createdAt": "2030-01-01T00:00:00Z"});
+            old_actor(p, &format!("did:plc:a{i}"), Some("3k"), Some(record)).await;
         }
-        // A row the writer already filled keeps what it has.
-        sqlx::query("UPDATE posts SET tags = '{writer}', search_tsv = to_tsvector('simple', 'writer') WHERE rkey = '3k6'")
-            .execute(p)
-            .await
-            .expect("filled");
-        sqlx::query(
-            "INSERT INTO actors (did, profile_rev, profile_record, indexed_at) VALUES \
-             ('did:plc:a', '3k', '{\"pronouns\": \"it/its\", \"website\": \"https://a.example\", \"createdAt\": \"2030-01-01T00:00:00Z\"}', '2026-01-01T00:00:00Z'), \
-             ('did:plc:b', NULL, NULL, now()), \
-             ('did:plc:c', '3k', NULL, now())",
-        )
-        .execute(p)
-        .await
-        .expect("actors");
+        // Rows with no rev, or no record, are passed over.
+        old_actor(p, "did:plc:b", None, None).await;
+        old_actor(p, "did:plc:c", Some("3k"), None).await;
 
-        // A batch of three, interrupted after one batch: the cursor is kept.
-        let t = task(p, 3);
-        let first = posts_batch(p, "", 3).await.expect("batch").expect("rows");
-        assert_eq!(first, ("at://did:plc:a/app.bsky.feed.post/3k2".to_string(), 3));
-        save_progress(p, KEY_POSTS, &Progress { cursor: first.0, done: false, visited: 3 }).await.expect("save");
+        // A batch of two, interrupted after one batch: the cursor is kept.
+        let t = task(p, 2);
+        let first = actors_batch(p, "", 2).await.expect("batch").expect("rows");
+        assert_eq!(first, ("did:plc:a1".to_string(), 2));
+        save_progress(p, KEY_ACTORS, &Progress { cursor: first.0, done: false, visited: 2 }).await.expect("save");
 
         assert!(!t.status().backfill_done());
         t.run_column_backfill().await.expect("backfill");
         assert!(t.status().backfill_done());
-        assert!(load_progress(p, KEY_POSTS).await.expect("progress").done);
+        assert!(load_progress(p, KEY_ACTORS).await.expect("progress").done);
 
-        type Filled = (String, Vec<String>, Vec<String>, Vec<String>, bool);
-        let filled: Vec<Filled> = sqlx::query_as(
-            "SELECT rkey, tags, COALESCE(link_domains, '{}'), COALESCE(lang_prefixes, '{}'), \
-                    search_tsv @@ to_tsquery('simple', 'number') FROM posts ORDER BY rkey",
+        let filled: Vec<(String, Option<String>, bool)> = sqlx::query_as(
+            "SELECT did, pronouns, profile_created_at = '2026-01-01T00:05:00Z' FROM actors WHERE did LIKE 'did:plc:a%' ORDER BY did",
         )
         .fetch_all(p)
         .await
-        .expect("posts");
-        assert_eq!(filled.len(), 7);
-        for row in &filled[..6] {
-            assert_eq!((&row.1, &row.2, &row.3, row.4), (&vec!["cats".to_string()], &vec!["a.example.com".to_string(), "example.com".to_string()], &vec!["en".to_string(), "en-gb".to_string()], true), "{}", row.0);
-        }
-        assert_eq!(filled[6].1, ["writer"], "the writer's values are kept");
-
-        let actor: (Option<String>, Option<String>, bool, Option<String>) = sqlx::query_as(
-            "SELECT pronouns, website, profile_created_at = '2026-01-01T00:05:00Z', profile_cid FROM actors WHERE did = 'did:plc:a'",
-        )
-        .fetch_one(p)
-        .await
-        .expect("actor");
-        // The future createdAt is clamped to first-seen plus five minutes,
-        // and the CID is left for the next write.
-        assert_eq!(actor, (Some("it/its".into()), Some("https://a.example".into()), true, None));
+        .expect("actors");
+        // The future createdAt is clamped to first-seen plus five minutes.
+        let expected: Vec<(String, Option<String>, bool)> = (0..5).map(|i| (format!("did:plc:a{i}"), Some(format!("p{i}")), true)).collect();
+        assert_eq!(filled, expected);
+        let cid: Option<String> = sqlx::query_scalar("SELECT profile_cid FROM actors WHERE did = 'did:plc:a0'").fetch_one(p).await.expect("cid");
+        assert_eq!(cid, None, "the CID is left for the next write");
 
         // Running again does nothing and stays done.
         t.run_column_backfill().await.expect("again");
@@ -541,24 +657,80 @@ mod tests {
             return;
         };
         let p = &db.pool;
-        old_post(p, "3k1", "bafyold", json!({"text": "old text", "tags": ["old"]})).await;
-        // The batch's update names the cid it read; the row has since been
-        // rewritten by the writer (new cid, columns still NULL in this
-        // contrived case), so the guard on cid leaves it alone.
-        let values = json!([{"uri": "at://did:plc:a/app.bsky.feed.post/3k1", "cid": "bafyold", "tags": ["old"],
-            "link_domains": [], "link_urls": [], "lang_prefixes": [], "embed_type": null, "media_type": null}]);
-        sqlx::query("UPDATE posts SET cid = 'bafynew' WHERE rkey = '3k1'").execute(p).await.expect("rewrite");
+        old_actor(p, "did:plc:a", Some("3k"), Some(json!({"pronouns": "old"}))).await;
+        // The batch's update names the rev it read; the row has since been
+        // rewritten by the writer, so the guard on the rev leaves it alone.
+        sqlx::query("UPDATE actors SET profile_rev = '3l', pronouns = 'new' WHERE did = 'did:plc:a'").execute(p).await.expect("rewrite");
         let n = sqlx::query(
-            "UPDATE posts p SET tags = v.tags, search_tsv = to_tsvector('simple', p.text) \
-             FROM jsonb_to_recordset($1::jsonb) AS v(uri text, cid text, tags text[]) \
-             WHERE p.uri = v.uri AND p.search_tsv IS NULL AND p.cid = v.cid",
+            "UPDATE actors a SET pronouns = v.pronouns \
+             FROM jsonb_to_recordset($1::jsonb) AS v(did text, rev text, pronouns text) \
+             WHERE a.did = v.did AND a.profile_rev = v.rev",
         )
-        .bind(values)
+        .bind(json!([{"did": "did:plc:a", "rev": "3k", "pronouns": "old"}]))
         .execute(p)
         .await
         .expect("update")
         .rows_affected();
         assert_eq!(n, 0);
+        db.drop_db().await;
+    }
+
+    /// Post records: dict 0 reads; no dictionary is trained from too few
+    /// records; with one, the rows still stored as dict 0 are rewritten, a
+    /// row written again between the batch's read and its write keeps the
+    /// newer record, and a row deleted meanwhile stays deleted; a record
+    /// naming a dictionary that does not exist is an error, never empty.
+    #[tokio::test]
+    async fn post_records_are_compressed_and_newer_writes_kept() {
+        use crate::test_support::posts;
+
+        let Some(db) = fresh_db("schema_backfill_recompress").await else {
+            return;
+        };
+        let p = &db.pool;
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut uris = Vec::new();
+        for n in 0..3 {
+            uris.push(posts::plain(p, did, &posts::tid(n), &format!("post number {n} about rust")).await);
+        }
+        let first = posts::record(p, &uris[0]).await.expect("dict 0 reads");
+        assert_eq!(first["text"], "post number 0 about rust");
+        assert_eq!(train_posts_dict(p).await.expect("train"), None, "too few records to train from");
+
+        let samples: Vec<Vec<u8>> = (0..500)
+            .map(|i| json!({"$type": "app.bsky.feed.post", "text": format!("sample {i} about rust and tokio"), "createdAt": "2026-10-01T00:00:00Z"}).to_string().into_bytes())
+            .collect();
+        let dict = crate::db::ids::train_dict(&samples, 16 * 1024).expect("dictionary");
+        sqlx::query("INSERT INTO record_dicts (id, family, bytes) VALUES (1, 'posts', $1)").bind(&dict).execute(p).await.expect("dict");
+        crate::db::records::reload(p).await.expect("reload");
+
+        let (_, read, rewrites) = recompress_read(p, "", 100).await.expect("read").expect("rows");
+        assert_eq!((read, rewrites.authors.len()), (3, 3));
+        // Between the read and the write: one post is written again, one
+        // deleted.
+        posts::edit(p, &uris[1], |r| r["text"] = json!("rewritten")).await;
+        sqlx::query(&format!("DELETE FROM posts WHERE {}", posts::key_is("", &uris[2]))).execute(p).await.expect("delete");
+        assert_eq!(recompress_write(p, &rewrites).await.expect("write"), 1);
+        let dict_of = |uri: String| async move {
+            sqlx::query_scalar::<_, Vec<u8>>(&format!("SELECT record FROM posts WHERE {}", posts::key_is("", &uri)))
+                .fetch_one(p)
+                .await
+                .expect("record")[0]
+        };
+        assert_eq!(dict_of(uris[0].clone()).await, 1, "rewritten with the dictionary");
+        assert_eq!(posts::record(p, &uris[0]).await, Some(first));
+        assert_eq!(dict_of(uris[1].clone()).await, 1, "the newer write used the dictionary itself");
+        assert_eq!(posts::record(p, &uris[1]).await.expect("newer")["text"], "rewritten");
+        assert!(!posts::stored(p, &uris[2]).await, "a deleted row stays deleted");
+
+        // The task runs the rest to its end, and once only.
+        let t = task(p, 2);
+        t.run_recompression().await.expect("recompress");
+        assert!(load_progress(p, KEY_RECOMPRESS).await.expect("progress").done);
+        t.run_recompression().await.expect("again");
+
+        // A dictionary that is not stored is an error, never an empty record.
+        assert!(matches!(crate::db::records::decode(p, &[9, 1, 2, 3]).await, Err(sqlx::Error::Decode(_))));
         db.drop_db().await;
     }
 
@@ -573,14 +745,14 @@ mod tests {
             let mut conn = p.acquire().await.expect("conn");
             index_valid(&mut conn, name).await.expect("lookup")
         };
-        assert_eq!(valid("posts_tags").await, None);
+        assert_eq!(valid("post_search_tags").await, None);
         // An invalid index, as an interrupted concurrent build leaves one.
-        sqlx::query("CREATE INDEX posts_tags ON posts USING gin (tags)").execute(p).await.expect("index");
-        sqlx::query("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'posts_tags'::regclass")
+        sqlx::query("CREATE INDEX post_search_tags ON post_search USING gin (tags)").execute(p).await.expect("index");
+        sqlx::query("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'post_search_tags'::regclass")
             .execute(p)
             .await
             .expect("invalidate");
-        assert_eq!(valid("posts_tags").await, Some(false));
+        assert_eq!(valid("post_search_tags").await, Some(false));
 
         assert!(!t.status().indexes_ready());
         t.run_index_builds().await.expect("builds");

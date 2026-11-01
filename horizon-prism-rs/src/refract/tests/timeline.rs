@@ -103,13 +103,12 @@ async fn restored_indexed_at_is_the_earlier_time() {
     let theirs = post(p, OTHER, "3ktheirs", "not restored", None, None).await;
     let quoting = post(p, OTHER, "3kquoting", "quotes the old one", None, None).await;
     exec(p, "UPDATE posts SET indexed_at = '2026-10-20T00:00:00Z'").await;
-    exec(p, &format!("UPDATE posts SET created_at = '2024-05-01T00:00:00Z' WHERE uri IN ('{old}', '{theirs}')")).await;
-    exec(p, &format!("UPDATE posts SET created_at = '2030-01-01T00:00:00Z' WHERE uri = '{ahead}'")).await;
-    exec(
-        p,
-        &format!("UPDATE posts SET quote_uri = '{old}', embed = '{{\"$type\": \"app.bsky.embed.record\", \"record\": {{\"uri\": \"{old}\", \"cid\": \"bafy3kold\"}}}}'::jsonb WHERE uri = '{quoting}'"),
-    )
-    .await;
+    use crate::test_support::posts::set_created_at;
+    set_created_at(p, &old, "'2024-05-01T00:00:00Z'").await;
+    set_created_at(p, &theirs, "'2024-05-01T00:00:00Z'").await;
+    set_created_at(p, &ahead, "'2030-01-01T00:00:00Z'").await;
+    let embed = json!({"$type": "app.bsky.embed.record", "record": {"uri": old, "cid": "bafy3kold"}});
+    crate::test_support::posts::edit(p, &quoting, |r| r["embed"] = embed).await;
     let h = hydrator_with(p, sets(), Arc::new(FixedUpstream::default()));
     let viewer = Viewer { did: Some(MEMBER.into()), hydrate: true };
     let uris = vec![old.clone(), ahead.clone(), theirs.clone(), quoting.clone()];

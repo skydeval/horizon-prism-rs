@@ -63,8 +63,10 @@ const EXCLUSIONS: &str = "NOT COALESCE(n.reason_subject LIKE 'at://%/tools.kryph
                        AND r.admitted AND r.effective AND l.state = 'active' AND l.purpose = 'app.bsky.graph.defs#modlist') \
      AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
                        n.record_uri, n.reason_subject, \
-                       (SELECT p.reply_root_uri FROM posts p WHERE p.uri = n.record_uri), \
-                       (SELECT p.reply_root_uri FROM posts p WHERE p.uri = n.reason_subject)))";
+                       (SELECT ref_text(p.root_author, p.root_coll, p.root_rkey, 1::smallint, p.author, p.rkey, 1::smallint) \
+                          FROM posts p, ref_of(n.record_uri) k WHERE k.coll = 1 AND p.author = k.author AND p.rkey = k.rkey), \
+                       (SELECT ref_text(p.root_author, p.root_coll, p.root_rkey, 1::smallint, p.author, p.rkey, 1::smallint) \
+                          FROM posts p, ref_of(n.reason_subject) k WHERE k.coll = 1 AND p.author = k.author AND p.rkey = k.rkey)))";
 
 /// The member's notification preferences as a condition on `n` (design-v3
 /// §5.6): `hidden` and `follows` are the placeholders of the reasons with
@@ -129,11 +131,13 @@ impl Hydrator {
     async fn notification_records(&self, rows: &[NotificationRow]) -> Result<std::collections::HashMap<String, Value>, sqlx::Error> {
         let uris: Vec<String> = rows.iter().map(|r| r.record_uri.clone()).collect();
         let mut out = std::collections::HashMap::new();
-        let posts: Vec<(String, Value)> = sqlx::query_as("SELECT uri, record FROM posts WHERE uri = ANY($1)")
+        let posts: Vec<(String, Vec<u8>)> = sqlx::query_as(&format!("SELECT u.uri, p.record FROM {}", crate::db::posts::rows_named(1)))
             .bind(&uris)
             .fetch_all(self.pool())
             .await?;
-        out.extend(posts);
+        for (uri, record) in posts {
+            out.insert(uri, crate::db::records::decode_value(self.pool(), &record).await?);
+        }
         // A like's or repost's subject and `via` come back as their text:
         // rebuilt from their keys, or read from `odd_refs` when odd.
         for (table, ty, coll) in [("likes", "app.bsky.feed.like", 2), ("reposts", "app.bsky.feed.repost", 3)] {

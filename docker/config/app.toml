@@ -438,8 +438,9 @@ system_accounts = { per_sec = 1.0, burst = 20 }
 
 # After an upgrade, a background task fills new columns for rows written
 # before it (in batches, with a pause between them), then builds the large
-# search indexes one at a time without blocking writes. Until it finishes,
-# search and trends are incomplete for old posts. `_health` detail shows
+# search indexes one at a time without blocking writes, then compresses
+# stored post records in the same batches. Until it finishes, search and
+# trends are incomplete for old posts. `_health` detail shows
 # schema_backfill_done and search_indexes_ready.
 [schema_backfill]
 batch_size = 10000

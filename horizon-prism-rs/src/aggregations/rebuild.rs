@@ -685,10 +685,8 @@ pub async fn repair_counts(pool: &PgPool) -> Result<(), sqlx::Error> {
            SELECT subj_author AS a, subj_rkey AS k, count(DISTINCT author) AS l, 0 AS r, 0 AS p, 0 AS q FROM likes \
              WHERE subj_coll = 1 GROUP BY 1, 2 \
            UNION ALL SELECT subj_author, subj_rkey, 0, count(DISTINCT author), 0, 0 FROM reposts WHERE subj_coll = 1 GROUP BY 1, 2 \
-           UNION ALL SELECT r.author, r.rkey, 0, 0, 1, 0 FROM posts x CROSS JOIN LATERAL ref_of(x.reply_parent_uri) r \
-             WHERE x.reply_parent_uri IS NOT NULL AND r.coll = 1 \
-           UNION ALL SELECT r.author, r.rkey, 0, 0, 0, 1 FROM posts x CROSS JOIN LATERAL ref_of(x.quote_uri) r \
-             WHERE x.quote_uri IS NOT NULL AND r.coll = 1 \
+           UNION ALL SELECT parent_author, parent_rkey, 0, 0, 1, 0 FROM posts WHERE parent_coll = 1 \
+           UNION ALL SELECT quote_author, quote_rkey, 0, 0, 0, 1 FROM posts WHERE quote_coll = 1 \
          ) t GROUP BY a, k",
     )
     .execute(&mut *tx)
@@ -699,7 +697,7 @@ pub async fn repair_counts(pool: &PgPool) -> Result<(), sqlx::Error> {
          SELECT d, sum(fr)::int, sum(fs)::int, sum(p)::int FROM ( \
            SELECT subject AS d, 1 AS fr, 0 AS fs, 0 AS p FROM follows \
            UNION ALL SELECT author, 0, 1, 0 FROM follows \
-           UNION ALL SELECT a.id, 0, 0, 1 FROM posts x JOIN dids a ON a.did = x.author_did \
+           UNION ALL SELECT author, 0, 0, 1 FROM posts \
          ) t GROUP BY d",
     )
     .execute(&mut *tx)

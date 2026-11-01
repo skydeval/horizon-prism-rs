@@ -18,6 +18,7 @@ Key metrics:
 | `backfill_jobs{state}` | Backfill queue; `failed` should stay at 0. |
 | `redis_memory_ratio` | Redis memory against `REDIS_MAXMEMORY`. |
 | `db_budget_ratio` | Database size against `storage.budget_bytes`. |
+| `record_recompress_remaining`, `posts_dead_rows` | Post records not yet compressed after an upgrade, and the dead rows the rewrite left in `posts`. |
 | `xrpc_requests_total{nsid,class}`, `xrpc_request_seconds{nsid}` | Requests and latency per method. |
 | `upstream_skipped_total{network,reason}` | Upstream calls skipped for rate, deadline or a tripped breaker. |
 | `farsight_down`, `farsight_auth_failed_total` | Farsight outage or a bad key (if used). |
@@ -111,6 +112,8 @@ Related client-visible states:
 **Dead letters.** `admin deadletter list`, then `replay` to fetch the record again from its PDS, or `drop`. Replaying one for a member also re-syncs that member.
 
 **Disk filling.** Horizon-Prism warns at 80% and 95% of `storage.budget_bytes`. The admin Health page turns amber under 10% free. Space freed by deletions is reused by Postgres, not returned to the filesystem.
+
+**Space after the 0057 upgrade.** Once 10,000 posts are stored, their records are compressed in the background. The old row versions are dead space that Postgres reuses but does not return to the disk. To return it, run `VACUUM FULL posts` in a quiet hour (it locks the table), or `pg_repack -t posts` without the lock.
 
 **Slow search after an upgrade.** Search indexes build in the background after some upgrades. `_health` detail shows `search_indexes_ready`.
 

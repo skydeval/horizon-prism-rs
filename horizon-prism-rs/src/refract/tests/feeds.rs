@@ -47,7 +47,8 @@ async fn t8o_t8u_author_feed() {
     }
     let parent = format!("at://{OTHER}/app.bsky.feed.post/3kparent");
     post(p, R, "3kreply", "a reply", Some(&parent), Some(&parent)).await;
-    exec(p, &format!("UPDATE posts SET embed = '{{\"$type\": \"app.bsky.embed.images\", \"images\": [{{\"alt\": \"\", \"image\": {{\"$type\": \"blob\", \"ref\": {{\"$link\": \"bafyimg\"}}, \"mimeType\": \"image/png\", \"size\": 1}}}}]}}' WHERE uri = 'at://{R}/app.bsky.feed.post/3kp00'")).await;
+    let images = json!({"$type": "app.bsky.embed.images", "images": [{"alt": "", "image": {"$type": "blob", "ref": {"$link": "bafyimg"}, "mimeType": "image/png", "size": 1}}]});
+    crate::test_support::posts::edit(p, &format!("at://{R}/app.bsky.feed.post/3kp00"), |r| r["embed"] = images).await;
     let shown = format!("at://{OTHER}/app.bsky.feed.post/3kshown");
     let gone = format!("at://{OTHER}/app.bsky.feed.post/3kgone");
     for (rkey, subject) in [("3krp1", &shown), ("3krp2", &gone)] {

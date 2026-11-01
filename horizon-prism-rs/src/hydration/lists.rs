@@ -730,11 +730,8 @@ mod tests {
         item(p, &feed_list, "i2", CAROL, 1).await;
         let bobs = post(p, BOB, "3kbbbbbbbbbb2", "from bob", None, None).await;
         let carols = post(p, CAROL, "3kcccccccccc2", "from carol", None, None).await;
-        for (uri, who, age) in [(&bobs, BOB, 2), (&carols, CAROL, 1)] {
-            exec(p, &format!(
-                "INSERT INTO feed_items (uri, originator_did, post_uri, kind, sort_at) VALUES ('{uri}', '{who}', '{uri}', 'post', now() - interval '{age} minutes') \
-                 ON CONFLICT (uri) DO NOTHING"
-            )).await;
+        for (uri, age) in [(&bobs, 2), (&carols, 1)] {
+            crate::test_support::posts::put_feed_item(p, uri, uri, "post", chrono::Utc::now() - chrono::TimeDelta::minutes(age)).await;
         }
         let texts = |v: &Value| -> Vec<String> {
             v["feed"].as_array().expect("feed").iter().map(|i| i["post"]["record"]["text"].as_str().expect("text").to_string()).collect()

@@ -71,6 +71,7 @@ pub const ODD_COLL: i16 = 0;
 /// collection id of the records it holds, so it never changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OddTable {
+    Posts,
     Likes,
     Reposts,
     Follows,
@@ -80,6 +81,7 @@ impl OddTable {
     #[must_use]
     pub const fn id(self) -> i16 {
         match self {
+            Self::Posts => 1,
             Self::Likes => 2,
             Self::Reposts => 3,
             Self::Follows => 4,
@@ -91,6 +93,8 @@ impl OddTable {
 pub const COLL_POST: i16 = 1;
 pub const COLL_LIKE: i16 = 2;
 pub const COLL_REPOST: i16 = 3;
+pub const COLL_THREADGATE: i16 = 16;
+pub const COLL_POSTGATE: i16 = 17;
 pub const COLL_PRIVATE_POST: i16 = 27;
 
 /// Which reference of its owner row an `odd_refs` row holds
@@ -184,6 +188,24 @@ pub fn stored_ref(uri: &str, accounts: &HashMap<String, AccountId>, rkeys: &Hash
             raw: uri.to_string(),
         },
     }
+}
+
+/// The key a whole reference URI names, read-only: `None` for an odd URI,
+/// or one whose authority or key has no id.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn whole_key<'e, E: sqlx::PgExecutor<'e>>(e: E, uri: &str) -> Result<Option<(AccountId, i16, i64)>, sqlx::Error> {
+    if !matches!(uri_parts(uri), UriParts::Whole { .. }) {
+        return Ok(None);
+    }
+    let key: Option<(Option<AccountId>, Option<i16>, Option<i64>)> =
+        sqlx::query_as("SELECT author, coll, rkey FROM ref_of($1)").bind(uri).fetch_optional(e).await?;
+    Ok(match key {
+        Some((Some(author), Some(coll), Some(rkey))) => Some((author, coll, rkey)),
+        _ => None,
+    })
 }
 
 /// A collection's id in the fixed list.

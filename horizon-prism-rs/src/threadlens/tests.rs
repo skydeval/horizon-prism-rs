@@ -756,7 +756,7 @@ async fn threads_are_viewer_relative_and_blocks_are_enforced() {
     for (i, (author, subject)) in [(VIEWER_A, R1), (R2, VIEWER_A), (STRANGER, R1), (R2, STRANGER)].into_iter().enumerate() {
         crate::test_support::graph::block(p, author, subject, &format!("3kblock{i}")).await;
     }
-    exec(p, "INSERT INTO record_tombstones (uri, rev) VALUES ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kdeleted', '3kaaaaaaaaaa2')").await;
+    crate::test_support::posts::tombstone(p, "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kdeleted", "3kaaaaaaaaaa2").await;
     // A ready member and a member that is not ready both follow the
     // anchor's author: viewer state only a ready member is shown.
     for follower in [VIEWER_B, R2] {

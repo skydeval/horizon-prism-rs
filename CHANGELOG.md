@@ -19,6 +19,17 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Smaller post tables.** Posts, feed items and deleted-record tombstones
+  are stored by account id and record key. A post keeps its whole record,
+  compressed in the background once 10,000 posts are stored; search keeps
+  its own table, for the accounts Horizon-Prism follows and members only.
+  Posts and feed items made at the same moment may list in a different
+  order, a repost of anything but a post no longer shows in feeds, and
+  trending topics come from followed accounts' posts only. **Upgrade:**
+  start once with `APP_ALLOW_STARTUP_MIGRATE=1` (migration 0057 rewrites the
+  four tables in one transaction; it needs free space for a second copy of
+  them). The search indexes are built again in the background; see
+  `docs/operations.md` to return the space the compression leaves.
 - **Smaller like, repost and count tables.** Likes, reposts and the post
   and account counts are stored by account id and record key, about a
   quarter of the space. Likes and reposts made at the same moment may list

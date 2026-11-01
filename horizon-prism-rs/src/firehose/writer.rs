@@ -27,7 +27,10 @@ use super::records::{GraphRecord, PostRecord, ProfileRecord, RecordError, Subjec
 use super::rows::{self, Cell, Row};
 use crate::aggregations::growth::{self, GrowthPlan};
 use crate::aggregations::{Admission, AdmissionInput, AdmitRule, PurgeKind, RecordKind, RejectReason, ScopeSets, ScopeState, admit};
-use crate::db::ids::{AccountId, Ids, OddTable, Slot, StoredRef, cid_to_db, ref_did, ref_rkey, rev_value, stored_ref};
+use crate::db::ids::{AccountId, COLL_POST, Ids, OddTable, Slot, StoredRef, cid_to_db, ref_did, ref_rkey, rev_value, stored_ref};
+use crate::db::posts::{FEED_POST, FEED_REPLY, FEED_REPOST, embed_kind};
+use crate::db::records;
+use crate::db::tombstones::{self, Put};
 use crate::db::locks::{lock_dids_shared, lock_uris, uri_author};
 use crate::hydration::normalize::is_private_uri;
 use crate::private_tier::{IngestError, PrivateOp, PrivateTier, PublicNotify, QuoteRef};
@@ -301,11 +304,26 @@ struct SubjectIds {
     via: Option<(StoredRef, Option<Vec<u8>>)>,
 }
 
+/// A post's row ids: its key, its references as stored, the accounts it
+/// mentions, and its CID and record as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostIds {
+    author: AccountId,
+    rkey: i64,
+    root: Option<StoredRef>,
+    parent: Option<StoredRef>,
+    quote: Option<StoredRef>,
+    mention_ids: Option<Vec<AccountId>>,
+    cid: Vec<u8>,
+    record: Vec<u8>,
+}
+
 /// The ids an op's row is written with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpIds {
     Graph(GraphIds),
     Subject(SubjectIds),
+    Post(Box<PostIds>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1366,7 +1384,7 @@ impl Writer {
             .filter_map(|(did, rkey)| accounts.get(did).map(|a| (*a, rkey.clone())))
             .collect();
         let rkeys = self.ids.rkey_ids(&keys).await?;
-        let (mut authors, mut keyed, mut keyed_uris): (Vec<AccountId>, Vec<i64>, Vec<String>) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut authors, mut keyed): (Vec<AccountId>, Vec<i64>) = (Vec::new(), Vec::new());
         for (did, uri) in dids.iter().zip(&uris) {
             let rkey = uri.rsplit('/').next().unwrap_or_default();
             if let Some(a) = accounts.get(did)
@@ -1374,7 +1392,6 @@ impl Writer {
             {
                 authors.push(*a);
                 keyed.push(*k);
-                keyed_uris.push(uri.clone());
             }
         }
         let mut tx = self.pool.begin().await?;
@@ -1382,13 +1399,12 @@ impl Writer {
         lock_uris(&mut tx, &uris).await?;
         let inserted = sqlx::query(
             "INSERT INTO blocks (author, rkey, subject, rev, created_at) \
-             SELECT a, k, $4, $5, now() FROM unnest($1::int[], $2::bigint[], $3::text[]) AS t(a, k, u) \
-             WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.uri = t.u) \
+             SELECT a, k, $3, $4, now() FROM unnest($1::int[], $2::bigint[]) AS t(a, k) \
+             WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.author = t.a AND rt.coll = 5 AND rt.rkey = t.k) \
              ON CONFLICT (author, rkey) DO NOTHING",
         )
         .bind(&authors)
         .bind(&keyed)
-        .bind(&keyed_uris)
         .bind(subject)
         .bind(rev_value(SENTINEL_REV))
         .execute(&mut *tx)
@@ -1401,10 +1417,12 @@ impl Writer {
 
     /// The ids every admitted upsert of a commit writes with, interned in
     /// their own statements: for a follow or block its key, subject and
-    /// `via`; for a like or repost its key, subject and `via`. A post's
-    /// author and the parent and quote it names are interned too, for its
-    /// counts, and get no entry. `None` for any other op, and for one whose
-    /// author, key or subject is not valid.
+    /// `via`; for a like or repost its key, subject and `via`; for a post
+    /// its key, its references and the accounts it mentions, with its
+    /// record encoded. A delete's author and key, and a rejected follow's
+    /// or block's, are interned too, for the tombstone it may leave, and
+    /// get no entry. `None` for any other op, and for one whose author, key
+    /// or subject is not valid.
     async fn op_ids(&self, repo: &str, prepared: &[Prepared], admissions: &[Option<Admission>]) -> Result<Vec<Option<OpIds>>, sqlx::Error> {
         let admitted: Vec<Option<&Upsert>> = prepared
             .iter()
@@ -1417,7 +1435,20 @@ impl Writer {
                 _ => None,
             })
             .collect();
-        if admitted.iter().all(Option::is_none) {
+        // The ops that may leave a tombstone: deletes of public records, and
+        // the rejected follows and blocks that take their own path.
+        let tombstoning: Vec<&str> = prepared
+            .iter()
+            .zip(admissions)
+            .filter_map(|(p, a)| match (p, a) {
+                (Prepared::Delete(d), _) if !matches!(d.kind, RecordKind::PrivatePost | RecordKind::PrivateGate) => {
+                    d.uri.rsplit('/').next()
+                }
+                (Prepared::Upsert(u), Some(Admission::Reject(_))) if matches!(u.body, Body::Follow(_) | Body::Block(_)) => Some(u.rkey.as_str()),
+                _ => None,
+            })
+            .collect();
+        if admitted.iter().all(Option::is_none) && tombstoning.is_empty() {
             return Ok(vec![None; prepared.len()]);
         }
         // The references the rows name, as URIs.
@@ -1434,8 +1465,8 @@ impl Writer {
                     uris.extend(s.via.as_ref().map(|v| v.uri.as_str()));
                 }
                 Body::Post(p) => {
-                    uris.extend(p.reply_parent.as_ref().map(|r| r.uri.as_str()));
-                    uris.extend(p.quote_uri.as_deref());
+                    uris.extend(post_references(p));
+                    dids.extend(p.mention_dids.iter().cloned());
                 }
                 _ => {}
             }
@@ -1445,12 +1476,8 @@ impl Writer {
         let Some(&author) = accounts.get(repo) else {
             return Ok(vec![None; prepared.len()]);
         };
-        let mut keys: Vec<(AccountId, String)> = admitted
-            .iter()
-            .flatten()
-            .filter(|u| !matches!(u.body, Body::Post(_)))
-            .map(|u| (author, u.rkey.clone()))
-            .collect();
+        let mut keys: Vec<(AccountId, String)> = admitted.iter().flatten().map(|u| (author, u.rkey.clone())).collect();
+        keys.extend(tombstoning.iter().map(|rkey| (author, (*rkey).to_string())));
         for uri in &uris {
             if let Some((did, rkey)) = ref_rkey(uri)
                 && let Some(a) = accounts.get(&did)
@@ -1460,26 +1487,30 @@ impl Writer {
         }
         let rkeys = self.ids.rkey_ids(&keys).await?;
         let stored = |r: &super::records::StrongRef| (stored_ref(&r.uri, &accounts, &rkeys), r.cid.as_deref().map(cid_to_db));
-        Ok(admitted
-            .into_iter()
-            .map(|u| {
-                let u = u?;
-                let rkey = rkeys.get(&(author, u.rkey.clone())).copied();
-                match &u.body {
-                    Body::Follow(g) | Body::Block(g) => Some(OpIds::Graph(GraphIds {
-                        author,
-                        rkey: rkey?,
-                        subject: *accounts.get(&g.subject_did)?,
-                        via: g.via.as_ref().map(stored),
-                    })),
-                    Body::Like(s) | Body::Repost(s) => {
-                        let (subject, subject_cid) = stored(&s.subject);
-                        Some(OpIds::Subject(SubjectIds { author, rkey: rkey?, subject, subject_cid, via: s.via.as_ref().map(stored) }))
-                    }
+        let mut out = Vec::with_capacity(admitted.len());
+        for u in admitted {
+            let Some(u) = u else {
+                out.push(None);
+                continue;
+            };
+            let rkey = rkeys.get(&(author, u.rkey.clone())).copied();
+            out.push(match &u.body {
+                Body::Follow(g) | Body::Block(g) => match (rkey, accounts.get(&g.subject_did)) {
+                    (Some(rkey), Some(&subject)) => Some(OpIds::Graph(GraphIds { author, rkey, subject, via: g.via.as_ref().map(stored) })),
                     _ => None,
-                }
-            })
-            .collect())
+                },
+                Body::Like(s) | Body::Repost(s) => rkey.map(|rkey| {
+                    let (subject, subject_cid) = stored(&s.subject);
+                    OpIds::Subject(SubjectIds { author, rkey, subject, subject_cid, via: s.via.as_ref().map(stored) })
+                }),
+                Body::Post(p) => match rkey {
+                    Some(rkey) => Some(OpIds::Post(Box::new(post_ids(&self.pool, &accounts, &rkeys, (author, rkey), u, p).await?))),
+                    None => None,
+                },
+                _ => None,
+            });
+        }
+        Ok(out)
     }
 
     /// Reposts of the public post `subject` found through Constellation
@@ -1541,8 +1572,7 @@ impl Writer {
         let StoredRef::Whole { author: subj_author, coll: subj_coll, rkey: subj_rkey } = stored_ref(subject, &accounts, &rkeys) else {
             return Ok(0);
         };
-        let (mut authors, mut keyed, mut keyed_uris, mut keyed_times): (Vec<AccountId>, Vec<i64>, Vec<String>, Vec<DateTime<Utc>>) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut authors, mut keyed, mut keyed_times): (Vec<AccountId>, Vec<i64>, Vec<DateTime<Utc>>) = (Vec::new(), Vec::new(), Vec::new());
         for ((did, uri), at) in dids.iter().zip(&uris).zip(&times) {
             let rkey = uri.rsplit('/').next().unwrap_or_default();
             if let Some(a) = accounts.get(did)
@@ -1550,7 +1580,6 @@ impl Writer {
             {
                 authors.push(*a);
                 keyed.push(*k);
-                keyed_uris.push(uri.clone());
                 keyed_times.push(*at);
             }
         }
@@ -1559,13 +1588,12 @@ impl Writer {
         lock_uris(&mut tx, &uris).await?;
         let inserted = sqlx::query(
             "INSERT INTO reposts (author, rkey, subj_author, subj_coll, subj_rkey, subj_cid, rev, created_at) \
-             SELECT a, k, $5, $6, $7, NULL, $8, c FROM unnest($1::int[], $2::bigint[], $3::text[], $4::timestamptz[]) AS t(a, k, u, c) \
-             WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.uri = t.u) \
+             SELECT a, k, $4, $5, $6, NULL, $7, c FROM unnest($1::int[], $2::bigint[], $3::timestamptz[]) AS t(a, k, c) \
+             WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.author = t.a AND rt.coll = 3 AND rt.rkey = t.k) \
              ON CONFLICT (author, rkey) DO NOTHING",
         )
         .bind(&authors)
         .bind(&keyed)
-        .bind(&keyed_uris)
         .bind(&keyed_times)
         .bind(subj_author)
         .bind(subj_coll)
@@ -1750,6 +1778,10 @@ impl Writer {
             Some(OpIds::Subject(s)) => Ok(s),
             _ => Err(OpError::Deterministic("like or repost has an author or record key that is not valid".into())),
         };
+        let post_keyed = || match ids {
+            Some(OpIds::Post(p)) => Ok(p.as_ref()),
+            _ => Err(OpError::Deterministic("post has an author or record key that is not valid".into())),
+        };
         let live = options.live;
         let mut eff = MemoryEffects::default();
         let author = u.input.author.as_str();
@@ -1780,7 +1812,7 @@ impl Writer {
         let member_list_block = u.collection == NSID_LISTBLOCK && sets.is_member(author);
         let list_before = if member_list_block { list_block_target(conn, &u.uri).await? } else { None };
         let written = match &u.body {
-            Body::Post(p) => upsert_post(conn, u, p, rev).await?,
+            Body::Post(p) => upsert_post(conn, post_keyed()?, p, rev, sets.in_scope(author) || sets.is_member(author)).await?,
             Body::Like(s) => upsert_subject(conn, OddTable::Likes, subject_keyed()?, s, rev).await?,
             Body::Repost(s) => upsert_subject(conn, OddTable::Reposts, subject_keyed()?, s, rev).await?,
             Body::Follow(g) => {
@@ -1854,16 +1886,29 @@ impl Writer {
             }
             eff.list_references = true;
         }
-        // §5.12: feed items only for public records whose author is in S.
+        // Feed items only for public records whose author is in S, and for
+        // a repost only of a post: an update that reposts anything else
+        // takes the old item away.
         if !off && sets.in_scope(author) {
-            match &u.body {
-                Body::Post(p) => {
-                    let kind = if p.reply_parent.is_some() { "reply" } else { "post" };
-                    upsert_feed_item(conn, &u.uri, author, &u.uri, kind, p.created_at).await?;
+            match (&u.body, ids) {
+                (Body::Post(p), Some(OpIds::Post(k))) => {
+                    let kind = if p.reply_parent.is_some() { FEED_REPLY } else { FEED_POST };
+                    let item = FeedItemRow { originator: k.author, is_repost: false, src_rkey: k.rkey, kind, post: (k.author, k.rkey) };
+                    upsert_feed_item(conn, &item, p.created_at).await?;
                 }
-                Body::Repost(s) => {
-                    upsert_feed_item(conn, &u.uri, author, &s.subject.uri, "repost", s.created_at).await?;
-                }
+                (Body::Repost(s), Some(OpIds::Subject(k))) => match k.subject {
+                    StoredRef::Whole { author: post_author, coll: COLL_POST, rkey: post_rkey } => {
+                        let item = FeedItemRow { originator: k.author, is_repost: true, src_rkey: k.rkey, kind: FEED_REPOST, post: (post_author, post_rkey) };
+                        upsert_feed_item(conn, &item, s.created_at).await?;
+                    }
+                    _ => {
+                        sqlx::query("DELETE FROM feed_items WHERE originator = $1 AND is_repost AND src_rkey = $2")
+                            .bind(k.author)
+                            .bind(k.rkey)
+                            .execute(&mut *conn)
+                            .await?;
+                    }
+                },
                 _ => {}
             }
         }
@@ -2022,7 +2067,7 @@ impl Writer {
                 // row (public-indexing design §4.1).
                 delete_row(conn, "member_post_refs", &d.uri, rev).await?;
                 self.private.delete_quote_ref(conn, &d.uri, rev).await?;
-                let removed = delete_row(conn, "posts", &d.uri, rev).await?;
+                let removed = delete_keyed(conn, "posts", &d.uri, rev).await?;
                 if removed {
                     // The gates of a post that is gone gate nothing.
                     for (table, gate) in ["threadgates", "postgates"].into_iter().zip(canonical_gates(&d.uri)) {
@@ -2084,24 +2129,20 @@ impl Writer {
         // §2.3), so a listing that read the record first cannot store it.
         let plural = d.kind == RecordKind::Table(rows::PLURAL_TABLE);
         if removed || author_in_scope || in_r_or_candidate || plural || (d.kind == RecordKind::Follow && sets.is_tracked(repo)) {
-            sqlx::query(
-                "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
-                 ON CONFLICT (uri) DO UPDATE SET rev = GREATEST(record_tombstones.rev, EXCLUDED.rev), deleted_at = now()",
-            )
-            .bind(&d.uri)
-            .bind(rev)
-            .execute(&mut *conn)
-            .await?;
+            tombstones::put(&mut *conn, &d.uri, rev, Put::Highest).await?;
         }
         // The URI's feed items and notifications go with the record, unless
         // a newer record lives at the URI: they are its own then, and a late
         // copy of an older delete leaves them (#725). A delete that found no
         // row still cleans up, for records whose row was never stored.
         if !newer_record(conn, d.kind, &d.uri, repo, rev).await? {
-            sqlx::query("DELETE FROM feed_items WHERE uri = $1")
-                .bind(&d.uri)
-                .execute(&mut *conn)
-                .await?;
+            sqlx::query(
+                "DELETE FROM feed_items f USING ref_of($1) r \
+                 WHERE r.coll IN (1, 3) AND f.originator = r.author AND f.is_repost = (r.coll = 3) AND f.src_rkey = r.rkey",
+            )
+            .bind(&d.uri)
+            .execute(&mut *conn)
+            .await?;
             sqlx::query("DELETE FROM notifications WHERE record_uri = $1")
                 .bind(&d.uri)
                 .execute(&mut *conn)
@@ -2163,15 +2204,7 @@ impl Writer {
         if removed && sets.is_member(repo) {
             eff.member_follow_removed = Some(repo.to_string());
         }
-        sqlx::query(
-            "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
-             ON CONFLICT (uri) DO UPDATE SET rev = EXCLUDED.rev, deleted_at = now() \
-             WHERE record_tombstones.rev < EXCLUDED.rev",
-        )
-        .bind(&u.uri)
-        .bind(rev)
-        .execute(&mut *conn)
-        .await?;
+        tombstones::put(&mut *conn, &u.uri, rev, Put::Forward).await?;
         if removed {
             sqlx::query("DELETE FROM notifications WHERE record_uri = $1")
                 .bind(&u.uri)
@@ -2195,15 +2228,7 @@ impl Writer {
         rev: &str,
     ) -> Result<(OpOutcome, MemoryEffects), OpError> {
         delete_keyed(conn, "blocks", &u.uri, rev).await?;
-        sqlx::query(
-            "INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2) \
-             ON CONFLICT (uri) DO UPDATE SET rev = EXCLUDED.rev, deleted_at = now() \
-             WHERE record_tombstones.rev < EXCLUDED.rev",
-        )
-        .bind(&u.uri)
-        .bind(rev)
-        .execute(&mut *conn)
-        .await?;
+        tombstones::put(&mut *conn, &u.uri, rev, Put::Forward).await?;
         Ok((OpOutcome::Rejected(reason), MemoryEffects::default()))
     }
 
@@ -2257,61 +2282,129 @@ async fn list_block_target(conn: &mut PgConnection, uri: &str) -> Result<Option<
 }
 
 async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM record_tombstones WHERE uri = $1 AND rev >= $2)")
-        .bind(uri)
-        .bind(rev)
-        .fetch_one(conn)
-        .await
+    tombstones::tombstoned_at(conn, uri, rev).await
 }
 
-async fn upsert_post(conn: &mut PgConnection, u: &Upsert, p: &PostRecord, rev: &str) -> Result<bool, sqlx::Error> {
-    let n = sqlx::query(
-        "INSERT INTO posts (uri, author_did, rkey, cid, rev, text, langs, \
-           reply_root_uri, reply_root_cid, reply_parent_uri, reply_parent_cid, quote_uri, \
-           embed, facets, mention_dids, self_labels, record, created_at, \
-           tags, link_domains, link_urls, lang_prefixes, embed_type, media_type, search_tsv) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-           $19, $20, $21, $22, $23, $24, to_tsvector('simple', $6)) \
-         ON CONFLICT (uri) DO UPDATE SET author_did = EXCLUDED.author_did, rkey = EXCLUDED.rkey, \
-           cid = EXCLUDED.cid, rev = EXCLUDED.rev, text = EXCLUDED.text, langs = EXCLUDED.langs, \
-           reply_root_uri = EXCLUDED.reply_root_uri, reply_root_cid = EXCLUDED.reply_root_cid, \
-           reply_parent_uri = EXCLUDED.reply_parent_uri, reply_parent_cid = EXCLUDED.reply_parent_cid, \
-           quote_uri = EXCLUDED.quote_uri, embed = EXCLUDED.embed, facets = EXCLUDED.facets, \
-           mention_dids = EXCLUDED.mention_dids, self_labels = EXCLUDED.self_labels, \
-           record = EXCLUDED.record, created_at = EXCLUDED.created_at, \
-           tags = EXCLUDED.tags, link_domains = EXCLUDED.link_domains, link_urls = EXCLUDED.link_urls, \
-           lang_prefixes = EXCLUDED.lang_prefixes, embed_type = EXCLUDED.embed_type, \
-           media_type = EXCLUDED.media_type, search_tsv = EXCLUDED.search_tsv \
-         WHERE posts.rev < EXCLUDED.rev",
+/// The references a post names: its reply root and parent, and its quote.
+fn post_references(p: &PostRecord) -> impl Iterator<Item = &str> {
+    [p.reply_root.as_ref().map(|r| r.uri.as_str()), p.reply_parent.as_ref().map(|r| r.uri.as_str()), p.quote_uri.as_deref()]
+        .into_iter()
+        .flatten()
+}
+
+/// A post's row ids from ids already interned, with its record encoded.
+async fn post_ids(
+    pool: &PgPool,
+    accounts: &std::collections::HashMap<String, AccountId>,
+    rkeys: &std::collections::HashMap<(AccountId, String), i64>,
+    key: (AccountId, i64),
+    u: &Upsert,
+    p: &PostRecord,
+) -> Result<PostIds, sqlx::Error> {
+    let reference = |uri: &str| stored_ref(uri, accounts, rkeys);
+    let mention_ids: Vec<AccountId> = p.mention_dids.iter().filter_map(|d| accounts.get(d).copied()).collect();
+    Ok(PostIds {
+        author: key.0,
+        rkey: key.1,
+        root: p.reply_root.as_ref().map(|r| reference(&r.uri)),
+        parent: p.reply_parent.as_ref().map(|r| reference(&r.uri)),
+        quote: p.quote_uri.as_deref().map(reference),
+        mention_ids: (!mention_ids.is_empty()).then_some(mention_ids),
+        cid: cid_to_db(&u.cid),
+        record: records::encode(pool, records::FAMILY_POSTS, &u.record).await?,
+    })
+}
+
+/// A post's last-writer-wins upsert, with its search row when `search` (its
+/// author is in S or a member; a written post of anyone else has none).
+/// Odd references keep their text in `odd_refs`, written in the same
+/// statement; for each reference the new version has that is not odd, a
+/// second statement removes any text an older version left. Returns whether
+/// the row was written.
+async fn upsert_post(conn: &mut PgConnection, ids: &PostIds, p: &PostRecord, rev: &str, search: bool) -> Result<bool, sqlx::Error> {
+    let columns = |r: &Option<StoredRef>| match r {
+        Some(r) => {
+            let (a, c, k) = r.columns();
+            (a, Some(c), k)
+        }
+        None => (None, None, None),
+    };
+    let (root_author, root_coll, root_rkey) = columns(&ids.root);
+    let (parent_author, parent_coll, parent_rkey) = columns(&ids.parent);
+    let (quote_author, quote_coll, quote_rkey) = columns(&ids.quote);
+    fn odd(r: &Option<StoredRef>) -> Option<&str> {
+        r.as_ref().and_then(StoredRef::odd_raw)
+    }
+    let written: Option<bool> = sqlx::query_scalar(
+        "WITH up AS ( \
+           INSERT INTO posts (author, rkey, cid, rev, created_at, root_author, root_coll, root_rkey, \
+             parent_author, parent_coll, parent_rkey, quote_author, quote_coll, quote_rkey, embed_kind, mention_ids, record) \
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+           ON CONFLICT (author, rkey) DO UPDATE SET cid = EXCLUDED.cid, rev = EXCLUDED.rev, created_at = EXCLUDED.created_at, \
+             root_author = EXCLUDED.root_author, root_coll = EXCLUDED.root_coll, root_rkey = EXCLUDED.root_rkey, \
+             parent_author = EXCLUDED.parent_author, parent_coll = EXCLUDED.parent_coll, parent_rkey = EXCLUDED.parent_rkey, \
+             quote_author = EXCLUDED.quote_author, quote_coll = EXCLUDED.quote_coll, quote_rkey = EXCLUDED.quote_rkey, \
+             embed_kind = EXCLUDED.embed_kind, mention_ids = EXCLUDED.mention_ids, record = EXCLUDED.record \
+           WHERE posts.rev < EXCLUDED.rev \
+           RETURNING author, rkey), \
+         odd AS ( \
+           INSERT INTO odd_refs (tbl, author, rkey, slot, raw) \
+           SELECT 1, up.author, up.rkey, v.slot, v.raw \
+           FROM up, (VALUES (1::smallint, $18::text), (2::smallint, $19::text), (3::smallint, $20::text)) AS v(slot, raw) \
+           WHERE v.raw IS NOT NULL \
+           ON CONFLICT (tbl, author, rkey, slot) DO UPDATE SET raw = EXCLUDED.raw), \
+         search AS ( \
+           INSERT INTO post_search (author, rkey, created_at, text, search_tsv, tags, link_domains, link_urls, lang_prefixes, mention_ids) \
+           SELECT up.author, up.rkey, $5, $21, to_tsvector('simple', $21), $22, $23, $24, $25, $16 FROM up WHERE $26 \
+           ON CONFLICT (author, rkey) DO UPDATE SET created_at = EXCLUDED.created_at, text = EXCLUDED.text, \
+             search_tsv = EXCLUDED.search_tsv, tags = EXCLUDED.tags, link_domains = EXCLUDED.link_domains, \
+             link_urls = EXCLUDED.link_urls, lang_prefixes = EXCLUDED.lang_prefixes, mention_ids = EXCLUDED.mention_ids), \
+         unsearched AS (DELETE FROM post_search s USING up WHERE NOT $26 AND s.author = up.author AND s.rkey = up.rkey) \
+         SELECT true FROM up",
     )
-    .bind(&u.uri)
-    .bind(&u.input.author)
-    .bind(&u.rkey)
-    .bind(&u.cid)
-    .bind(rev)
-    .bind(&p.text)
-    .bind(&p.langs)
-    .bind(p.reply_root.as_ref().map(|r| r.uri.as_str()))
-    .bind(p.reply_root.as_ref().and_then(|r| r.cid.as_deref()))
-    .bind(p.reply_parent.as_ref().map(|r| r.uri.as_str()))
-    .bind(p.reply_parent.as_ref().and_then(|r| r.cid.as_deref()))
-    .bind(p.quote_uri.as_deref())
-    .bind(p.embed.as_ref())
-    .bind(p.facets.as_ref())
-    .bind(&p.mention_dids)
-    .bind(&p.self_labels)
-    .bind(&u.record)
+    .bind(ids.author)
+    .bind(ids.rkey)
+    .bind(&ids.cid)
+    .bind(rev_value(rev))
     .bind(p.created_at)
+    .bind(root_author)
+    .bind(root_coll)
+    .bind(root_rkey)
+    .bind(parent_author)
+    .bind(parent_coll)
+    .bind(parent_rkey)
+    .bind(quote_author)
+    .bind(quote_coll)
+    .bind(quote_rkey)
+    .bind(embed_kind(p.embed.as_ref()))
+    .bind(ids.mention_ids.as_deref())
+    .bind(&ids.record)
+    .bind(odd(&ids.root))
+    .bind(odd(&ids.parent))
+    .bind(odd(&ids.quote))
+    .bind(&p.text)
     .bind(&p.extract.tags)
     .bind(&p.extract.link_domains)
     .bind(&p.extract.link_urls)
     .bind(&p.extract.lang_prefixes)
-    .bind(p.extract.embed_type.as_deref())
-    .bind(p.media_type)
-    .execute(conn)
-    .await?
-    .rows_affected();
-    Ok(n > 0)
+    .bind(search)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let whole: Vec<i16> = [(Slot::Root, &ids.root), (Slot::Parent, &ids.parent), (Slot::Quote, &ids.quote)]
+        .into_iter()
+        .filter(|(_, r)| odd(r).is_none())
+        .map(|(slot, _)| slot.id())
+        .collect();
+    if written.is_some() && !whole.is_empty() {
+        sqlx::query("DELETE FROM odd_refs WHERE tbl = $1 AND author = $2 AND rkey = $3 AND slot = ANY($4)")
+            .bind(OddTable::Posts.id())
+            .bind(ids.author)
+            .bind(ids.rkey)
+            .bind(&whole)
+            .execute(conn)
+            .await?;
+    }
+    Ok(written.is_some())
 }
 
 /// The last-writer-wins upsert of a member's post reference
@@ -2500,9 +2593,9 @@ async fn upsert_block(conn: &mut PgConnection, ids: &GraphIds, g: &GraphRecord, 
     .await
 }
 
-/// Delete a row of a table keyed by ids (follows, blocks, likes, reposts)
-/// by its URI at or below `rev`. A URI that names no stored key deletes
-/// nothing.
+/// Delete a row of a table keyed by ids (posts, follows, blocks, likes,
+/// reposts) by its URI at or below `rev`. A URI that names no stored key
+/// deletes nothing.
 async fn delete_keyed(conn: &mut PgConnection, table: &'static str, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
     let sql = format!("DELETE FROM {table} t USING ref_of($1) r WHERE t.author = r.author AND t.rkey = r.rkey AND t.rev <= $2");
     Ok(sqlx::query(&sql)
@@ -2626,7 +2719,18 @@ async fn newer_record(conn: &mut PgConnection, kind: RecordKind, uri: &str, repo
             .fetch_one(conn)
             .await;
         }
-        RecordKind::Post => vec!["posts", "member_post_refs"],
+        // The post by its key; its member reference by URI.
+        RecordKind::Post => {
+            return sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM posts t, ref_of($1) r WHERE r.coll = 1 AND t.author = r.author AND t.rkey = r.rkey AND t.rev > $3) \
+                     OR EXISTS (SELECT 1 FROM member_post_refs WHERE uri = $1 AND rev > $2)",
+            )
+            .bind(uri)
+            .bind(rev)
+            .bind(rev_value(rev))
+            .fetch_one(conn)
+            .await;
+        }
         // Keyed by ids: the URI is read as its key.
         RecordKind::Like | RecordKind::Repost | RecordKind::Follow | RecordKind::Block => {
             let table = match kind {
@@ -2674,23 +2778,29 @@ async fn delete_profile(conn: &mut PgConnection, did: &str, rev: &str) -> Result
         > 0)
 }
 
-async fn upsert_feed_item(
-    conn: &mut PgConnection,
-    uri: &str,
-    originator: &str,
-    post_uri: &str,
-    kind: &str,
-    sort_at: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
+/// A feed item's key and the post it shows.
+#[derive(Debug, Clone, Copy)]
+struct FeedItemRow {
+    originator: AccountId,
+    is_repost: bool,
+    src_rkey: i64,
+    kind: i16,
+    post: (AccountId, i64),
+}
+
+async fn upsert_feed_item(conn: &mut PgConnection, item: &FeedItemRow, sort_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO feed_items (uri, originator_did, post_uri, kind, sort_at) VALUES ($1, $2, $3, $4, $5) \
-         ON CONFLICT (uri) DO UPDATE SET originator_did = EXCLUDED.originator_did, \
-           post_uri = EXCLUDED.post_uri, kind = EXCLUDED.kind, sort_at = EXCLUDED.sort_at",
+        "INSERT INTO feed_items (originator, is_repost, src_rkey, kind, post_author, post_rkey, sort_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (originator, is_repost, src_rkey) DO UPDATE SET kind = EXCLUDED.kind, \
+           post_author = EXCLUDED.post_author, post_rkey = EXCLUDED.post_rkey, sort_at = EXCLUDED.sort_at",
     )
-    .bind(uri)
-    .bind(originator)
-    .bind(post_uri)
-    .bind(kind)
+    .bind(item.originator)
+    .bind(item.is_repost)
+    .bind(item.src_rkey)
+    .bind(item.kind)
+    .bind(item.post.0)
+    .bind(item.post.1)
     .bind(sort_at)
     .execute(conn)
     .await?;
@@ -2703,7 +2813,9 @@ async fn upsert_feed_item(
 /// (design-v3 §5.3 `muteThread`; B-59). The same rule as the read-time
 /// exclusion in `hydration::notifications`.
 const THREAD_MUTED: &str = "EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
-       $2::text, $3::text, $4::text, (SELECT p.reply_root_uri FROM posts p WHERE p.uri = $4::text)))";
+       $2::text, $3::text, $4::text, \
+       (SELECT ref_text(p.root_author, p.root_coll, p.root_rkey, 1::smallint, p.author, p.rkey, 1::smallint) \
+          FROM posts p, ref_of($4::text) k WHERE k.coll = 1 AND p.author = k.author AND p.rkey = k.rkey)))";
 
 /// Insert one notification, unless its recipient muted the thread it is in
 /// (`record_root`: the thread root a reply names). A muted thread writes
@@ -3229,6 +3341,105 @@ pub async fn raise_listed_rev(
     }
 }
 
+/// Test fixtures that store rows as the writer does, with their ids
+/// interned first.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use chrono::{DateTime, Utc};
+    use serde_json::Value;
+    use sqlx::PgPool;
+
+    use super::*;
+
+    /// Store a post (no feed item) from its record, at `rev`, created at
+    /// `created_at` or the record's own time. Returns its URI.
+    ///
+    /// # Panics
+    ///
+    /// On a database error or a record the writer would refuse.
+    pub async fn put_post(pool: &PgPool, author: &str, rkey: &str, cid: &str, rev: &str, record: &Value, created_at: Option<DateTime<Utc>>) -> String {
+        let op = RawOp { action: Action::Create, collection: super::super::classifier::NSID_POST.to_string(), rkey: rkey.to_string(), cid: Some(cid.to_string()), record: Some(record.clone()) };
+        let Prepared::Upsert(u) = prepare(author, &op, Utc::now()) else {
+            panic!("not a post: {record}");
+        };
+        let Body::Post(p) = &u.body else {
+            panic!("not a post: {record}");
+        };
+        let mut p = p.as_ref().clone();
+        if let Some(at) = created_at {
+            p.created_at = at;
+        }
+        let ids = Ids::new(pool.clone());
+        let mut dids = vec![author.to_string()];
+        dids.extend(post_references(&p).filter_map(ref_did));
+        dids.extend(p.mention_dids.iter().cloned());
+        let accounts = ids.account_ids(&dids).await.expect("intern");
+        let me = accounts[author];
+        let mut keys = vec![(me, rkey.to_string())];
+        keys.extend(post_references(&p).filter_map(ref_rkey).filter_map(|(d, k)| accounts.get(&d).map(|a| (*a, k))));
+        let rkeys = ids.rkey_ids(&keys).await.expect("alias");
+        let key = (me, rkeys[&(me, rkey.to_string())]);
+        let post = post_ids(pool, &accounts, &rkeys, key, &u, &p).await.expect("ids");
+        let mut conn = pool.acquire().await.expect("conn");
+        upsert_post(&mut conn, &post, &p, rev, true).await.expect("post");
+        u.uri.clone()
+    }
+
+    /// Replace a stored post's record, as a newer write of it would, keeping
+    /// its key, its CID and its times: every column read from the record
+    /// (references, embed kind, mentions, search columns) follows.
+    ///
+    /// # Panics
+    ///
+    /// On a database error, a post that is not stored, or a record the
+    /// writer would refuse.
+    pub async fn rewrite_post(pool: &PgPool, uri: &str, record: &Value) {
+        type Stored = (String, String, Vec<u8>, i64, DateTime<Utc>);
+        let row: Stored = sqlx::query_as(
+            "SELECT d.did, bigint_to_rkey(p.rkey), p.cid, p.rev, p.created_at FROM posts p JOIN dids d ON d.id = p.author, ref_of($1) k \
+             WHERE k.coll = 1 AND p.author = k.author AND p.rkey = k.rkey",
+        )
+        .bind(uri)
+        .fetch_one(pool)
+        .await
+        .expect("stored post");
+        let (author, rkey, cid, rev, created_at) = row;
+        let next = crate::db::ids::rev_string(rev.saturating_add(1));
+        put_post(pool, &author, &rkey, &crate::db::ids::cid_from_db(&cid), &next, record, Some(created_at)).await;
+    }
+
+    /// Store a feed item of `originator`: its own record `item` (a post or a
+    /// repost) showing the post `post`.
+    ///
+    /// # Panics
+    ///
+    /// On a database error or a URI that cannot be keyed.
+    pub async fn put_feed_item(pool: &PgPool, item: &str, post: &str, kind: &str, sort_at: DateTime<Utc>) {
+        crate::test_support::interactions::intern(pool, &[item, post]).await;
+        type Keys = (Option<i32>, Option<i16>, Option<i64>, Option<i32>, Option<i64>);
+        let key: Keys = sqlx::query_as(
+            "SELECT i.author, i.coll, i.rkey, p.author, p.rkey FROM ref_of($1) i, ref_of($2) p WHERE p.coll = 1",
+        )
+        .bind(item)
+        .bind(post)
+        .fetch_one(pool)
+        .await
+        .expect("keys");
+        let (Some(originator), Some(coll), Some(src_rkey), Some(post_author), Some(post_rkey)) = key else {
+            panic!("not keyable: {item} {post}");
+        };
+        let row = FeedItemRow {
+            originator,
+            is_repost: coll == crate::db::ids::COLL_REPOST,
+            src_rkey,
+            kind: crate::db::posts::feed_kind(kind),
+            post: (post_author, post_rkey),
+        };
+        let mut conn = pool.acquire().await.expect("conn");
+        upsert_feed_item(&mut conn, &row, sort_at).await.expect("feed item");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -3456,16 +3667,21 @@ mod tests {
             }
         }
 
+        /// The `n`th of a run of valid TID revs, in order.
         fn rev(n: usize) -> String {
-            format!("3kaaaaaaaa{n:03}")
+            const ALPHABET: &[u8] = b"234567abcdefghijklmnopqrstuvwxyz";
+            let digit = |d: usize| char::from(ALPHABET[d % 32]);
+            format!("3kaaaaaaaa{}{}{}", digit(n / 1024), digit(n / 32), digit(n))
         }
 
         async fn post_rev(pool: &PgPool) -> Option<(String, String)> {
-            sqlx::query_as("SELECT rev, text FROM posts WHERE uri = $1")
-                .bind(format!("at://{AUTHOR}/app.bsky.feed.post/{RKEY}"))
-                .fetch_optional(pool)
-                .await
-                .expect("query post")
+            sqlx::query_as(&format!(
+                "SELECT bigint_to_rev(p.rev), s.text FROM posts p JOIN post_search s ON s.author = p.author AND s.rkey = p.rkey WHERE {}",
+                crate::test_support::posts::key_is("p", &format!("at://{AUTHOR}/app.bsky.feed.post/{RKEY}"))
+            ))
+            .fetch_optional(pool)
+            .await
+            .expect("query post")
         }
 
         /// design-v3 §4.3: a list owner outside scope has its list items
@@ -3958,6 +4174,106 @@ mod tests {
             db.drop_db().await;
         }
 
+        /// A reply whose root and parent name collections outside the fixed
+        /// list keeps both texts in `odd_refs`, each with its author, and
+        /// counts toward nothing; a quote of a list is whole. An update that
+        /// drops the reply changes its one feed item's kind, and one that
+        /// replies to a post again counts; the delete takes the texts, the
+        /// search row and the feed item.
+        #[tokio::test]
+        async fn a_posts_odd_references_live_and_go_with_it() {
+            let Some(db) = fresh_db("writer_post_odd_refs").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, false);
+            let odd_root = format!("at://{SUBJECT}/com.example.thing/3myp5txuf7s2c");
+            let odd_parent = format!("at://{SUBJECT}/app.bsky.feed.post/3myp5txuf7s2c/x");
+            let parent = format!("at://{SUBJECT}/app.bsky.feed.post/3myp5txuf7s2c");
+            let list = format!("at://{SUBJECT}/app.bsky.graph.list/3myp5txuf7s2c");
+            let op = |action: Action, reply: Option<(&str, &str)>, quote: Option<&str>| {
+                let mut record = json!({"text": "hello", "createdAt": "2026-10-01T00:00:00Z"});
+                if let Some((root, parent)) = reply {
+                    record["reply"] = json!({"root": {"uri": root, "cid": "bafyroot"}, "parent": {"uri": parent, "cid": "bafyparent"}});
+                }
+                if let Some(q) = quote {
+                    record["embed"] = json!({"$type": "app.bsky.embed.record", "record": {"uri": q, "cid": "bafyq"}});
+                }
+                RawOp {
+                    action,
+                    collection: "app.bsky.feed.post".into(),
+                    rkey: RKEY.into(),
+                    cid: (action != Action::Delete).then(|| "bafypost".to_string()),
+                    record: (action != Action::Delete).then_some(record),
+                }
+            };
+            type State = (Option<i16>, Option<i16>, Option<i16>, Option<String>, Option<String>, Option<String>, Option<String>, i64, Vec<i16>, i64);
+            let state = || async {
+                let row: State = sqlx::query_as(
+                    "SELECT p.root_coll, p.parent_coll, p.quote_coll, (SELECT d.did FROM dids d WHERE d.id = p.parent_author), \
+                       ref_text(p.root_author, p.root_coll, p.root_rkey, 1::smallint, p.author, p.rkey, 1::smallint), \
+                       ref_text(p.parent_author, p.parent_coll, p.parent_rkey, 1::smallint, p.author, p.rkey, 2::smallint), \
+                       ref_text(p.quote_author, p.quote_coll, p.quote_rkey, 1::smallint, p.author, p.rkey, 3::smallint), \
+                       (SELECT count(*) FROM odd_refs), ARRAY(SELECT kind FROM feed_items), (SELECT count(*) FROM post_search) \
+                     FROM posts p",
+                )
+                .fetch_one(p)
+                .await
+                .expect("post");
+                row
+            };
+            w.apply(AUTHOR, "3myp5txuf7s2d", &[op(Action::Create, Some((&odd_root, &odd_parent)), Some(&list))], OPTIONS).await.expect("create");
+            assert_eq!(
+                state().await,
+                (Some(0), Some(0), Some(7), Some(SUBJECT.into()), Some(odd_root.clone()), Some(odd_parent.clone()), Some(list.clone()), 2, vec![FEED_REPLY], 1)
+            );
+            let counted: i64 = sqlx::query_scalar("SELECT count(*) FROM post_counts").fetch_one(p).await.expect("counts");
+            assert_eq!(counted, 0, "odd references count toward nothing, nor does a quote of a list");
+            w.apply(AUTHOR, "3myp5txuf7s2e", &[op(Action::Update, None, None)], OPTIONS).await.expect("no reply");
+            assert_eq!(state().await, (None, None, None, None, None, None, None, 0, vec![FEED_POST], 1));
+            w.apply(AUTHOR, "3myp5txuf7s2f", &[op(Action::Update, Some((&odd_root, &parent)), None)], OPTIONS).await.expect("reply again");
+            assert_eq!(state().await, (Some(0), Some(1), None, Some(SUBJECT.into()), Some(odd_root.clone()), Some(parent.clone()), None, 1, vec![FEED_REPLY], 1));
+            assert_eq!(crate::test_support::interactions::post_counts(p, &parent).await.map(|c| c.2), Some(1));
+            w.apply(AUTHOR, "3myp5txuf7s2g", &[op(Action::Delete, None, None)], OPTIONS).await.expect("delete");
+            let left: (i64, i64, i64, i64) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM posts), (SELECT count(*) FROM odd_refs), (SELECT count(*) FROM feed_items), (SELECT count(*) FROM post_search)",
+            )
+            .fetch_one(p)
+            .await
+            .expect("left");
+            assert_eq!(left, (0, 0, 0, 0));
+            assert_eq!(crate::test_support::interactions::post_counts(p, &parent).await.map(|c| c.2), Some(0));
+            db.drop_db().await;
+        }
+
+        /// A post's search row follows S: a post by an author outside S and
+        /// the members has none; once the author joins S, its stored posts
+        /// get theirs from their records.
+        #[tokio::test]
+        async fn search_rows_follow_s() {
+            let Some(db) = fresh_db("writer_search_follows_s").await else {
+                return;
+            };
+            let p = &db.pool;
+            let w = writer(p, false);
+            {
+                let mut sets = w.scope().write_guard().await;
+                sets.scope.remove(AUTHOR);
+                Arc::make_mut(&mut sets.restored).insert(AUTHOR.into(), "sky".into());
+            }
+            let r = w.apply(AUTHOR, &rev(1), &[post_op(Action::Create, "rust lang")], OPTIONS).await.expect("apply");
+            assert_eq!(r.outcomes, [OpOutcome::Written], "a restored author's post is stored");
+            let searched = || async { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM post_search").fetch_one(p).await.expect("count") };
+            assert_eq!(searched().await, 0, "out of S: no search row");
+            assert_eq!(crate::firehose::post_search::fill_author(&w, AUTHOR).await.expect("fill"), 0, "not while out of S");
+            w.scope().write_guard().await.scope.insert(AUTHOR.into());
+            assert_eq!(crate::firehose::post_search::fill_author(&w, AUTHOR).await.expect("fill"), 1);
+            let row: (String, bool) = sqlx::query_as("SELECT text, search_tsv @@ to_tsquery('simple', 'rust') FROM post_search").fetch_one(p).await.expect("row");
+            assert_eq!(row, ("rust lang".to_string(), true));
+            assert_eq!(crate::firehose::post_search::fill_author(&w, AUTHOR).await.expect("again"), 0, "nothing twice");
+            db.drop_db().await;
+        }
+
         /// design-v3 §3.1, §3.2: the columns the v3 migrations added.
         #[tokio::test]
         async fn new_columns_are_extracted_on_write() {
@@ -4002,10 +4318,11 @@ mod tests {
             let report = w.apply(AUTHOR, &rev(1), &ops, OPTIONS).await.expect("apply");
             assert!(report.failed.is_empty(), "{:?}", report.failed);
 
-            type PostRow = (Vec<String>, Vec<String>, Vec<String>, Vec<String>, Option<String>, Option<String>, bool);
+            type PostRow = (Vec<String>, Vec<String>, Vec<String>, Vec<String>, i16, bool);
             let post: PostRow = sqlx::query_as(
-                "SELECT tags, link_domains, link_urls, lang_prefixes, embed_type, media_type, \
-                        search_tsv @@ websearch_to_tsquery('simple', 'rust world') FROM posts",
+                "SELECT s.tags, s.link_domains, s.link_urls, s.lang_prefixes, p.embed_kind, \
+                        s.search_tsv @@ websearch_to_tsquery('simple', 'rust world') \
+                 FROM posts p JOIN post_search s ON s.author = p.author AND s.rkey = p.rkey",
             )
             .fetch_one(p)
             .await
@@ -4014,7 +4331,7 @@ mod tests {
             assert_eq!(post.1, ["example.com", "news.example.com"]);
             assert_eq!(post.2, ["https://news.example.com/a"]);
             assert_eq!(post.3, ["en", "en-us"]);
-            assert_eq!((post.4.as_deref(), post.5.as_deref(), post.6), (Some("app.bsky.embed.video"), Some("video"), true));
+            assert_eq!((post.4, post.5), (crate::db::posts::EMBED_VIDEO, true));
             // The tag trigger saw the tags the writer stored.
             let tagged: i64 = sqlx::query_scalar("SELECT count(*) FROM tag_activity_hourly WHERE posts = 1")
                 .fetch_one(p)
@@ -4236,9 +4553,13 @@ mod tests {
             let deletes = [raw(Action::Delete, member, "3kwren", None), raw(Action::Delete, member, "3knever", None)];
             w.apply(SUBJECT, &rev(4), &deletes, OPTIONS).await.expect("delete");
             assert!(row("3kwren").await.is_none());
-            let tombstones: i64 = sqlx::query_scalar("SELECT count(*) FROM record_tombstones WHERE uri LIKE $1")
-                .bind(format!("at://{SUBJECT}/{member}/%"))
-                .fetch_one(p)
+            let tombstones: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM record_tombstones WHERE author = (SELECT id FROM dids WHERE did = $1) \
+                   AND coll = (SELECT id FROM collections WHERE nsid = $2)",
+            )
+            .bind(SUBJECT)
+            .bind(member)
+            .fetch_one(p)
                 .await
                 .expect("tombstones");
             assert_eq!(tombstones, 2);
@@ -4291,12 +4612,8 @@ mod tests {
             a.expect("delete");
             b.expect("create");
             assert_eq!(post_rev(&db.pool).await, None);
-            let tomb: String = sqlx::query_scalar("SELECT rev FROM record_tombstones WHERE uri = $1")
-                .bind(format!("at://{AUTHOR}/app.bsky.feed.post/{RKEY}"))
-                .fetch_one(&db.pool)
-                .await
-                .expect("tombstone");
-            assert_eq!(tomb, rev(40));
+            let tomb = crate::test_support::posts::tombstone_rev(&db.pool, &format!("at://{AUTHOR}/app.bsky.feed.post/{RKEY}")).await;
+            assert_eq!(tomb, Some(rev(40)));
 
             // A newer create after the tombstone is written again.
             w.apply(AUTHOR, &rev(50), &[post_op(Action::Create, "again")], OPTIONS).await.expect("apply");
@@ -4389,11 +4706,11 @@ mod tests {
             };
             let r = w.apply(other, &rev(1), &[reply], OPTIONS).await.expect("apply");
             assert_eq!(r.outcomes, [OpOutcome::Written]);
-            let kind: String = sqlx::query_scalar("SELECT kind FROM feed_items")
+            let kind: i16 = sqlx::query_scalar("SELECT kind FROM feed_items")
                 .fetch_one(&db.pool)
                 .await
                 .expect("feed item");
-            assert_eq!(kind, "reply");
+            assert_eq!(kind, FEED_REPLY);
             let (recipient, reason): (String, String) =
                 sqlx::query_as("SELECT recipient_did, reason FROM notifications")
                     .fetch_one(&db.pool)
@@ -4426,7 +4743,7 @@ mod tests {
             };
             w.apply(other, &rev(2), &[del], OPTIONS).await.expect("apply");
             let left: i64 = sqlx::query_scalar(
-                "SELECT (SELECT count(*) FROM notifications) + (SELECT count(*) FROM feed_items WHERE originator_did = $1)",
+                "SELECT (SELECT count(*) FROM notifications) + (SELECT count(*) FROM feed_items WHERE originator = (SELECT id FROM dids WHERE did = $1))",
             )
             .bind(other)
             .fetch_one(&db.pool)
@@ -4565,7 +4882,13 @@ mod tests {
             };
             assert_eq!([source_total(Source::Network), source_total(Source::Backfill)], by_source);
             let rows = |p: PgPool| async move {
-                sqlx::query_as::<_, (String, String, String)>("SELECT uri, cid, text FROM posts ORDER BY uri").fetch_all(&p).await.expect("posts")
+                sqlx::query_as::<_, (String, Vec<u8>, String)>(
+                    "SELECT at_uri(p.author, 1::smallint, p.rkey), p.cid, s.text FROM posts p \
+                     JOIN post_search s ON s.author = p.author AND s.rkey = p.rkey ORDER BY 1",
+                )
+                .fetch_all(&p)
+                .await
+                .expect("posts")
             };
             let written = rows(tapped_db.pool.clone()).await;
             assert_eq!(written.len(), 50 * 50);
@@ -4627,12 +4950,7 @@ mod tests {
             assert_eq!(r.outcomes, [OpOutcome::GrowOnly]);
             assert_eq!(count(p, "SELECT count(*) FROM member_post_refs").await, 1);
             // A tombstoned URI writes no reference.
-            sqlx::query("INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2)")
-                .bind(format!("at://{AUTHOR}/app.bsky.feed.post/3kgone"))
-                .bind(rev(9))
-                .execute(p)
-                .await
-                .expect("tombstone");
+            crate::test_support::posts::tombstone(p, &format!("at://{AUTHOR}/app.bsky.feed.post/3kgone"), &rev(9)).await;
             let r = w.apply(AUTHOR, &rev(3), &[reply("3kgone")], OPTIONS).await.expect("apply");
             assert_eq!(r.outcomes, [OpOutcome::Unchanged]);
             assert_eq!(count(p, "SELECT count(*) FROM member_post_refs").await, 1);
@@ -5104,8 +5422,8 @@ mod tests {
             assert_eq!(r.outcomes, [OpOutcome::Rejected("not_in_scope")]);
             assert!(r.transaction);
             assert_eq!(count(p, "SELECT count(*) FROM follows").await, 0);
-            let tomb: String = sqlx::query_scalar("SELECT rev FROM record_tombstones WHERE uri = $1").bind(&uri).fetch_one(p).await.expect("tombstone");
-            assert_eq!(tomb, rev(2));
+            let tomb = crate::test_support::posts::tombstone_rev(p, &uri).await;
+            assert_eq!(tomb, Some(rev(2)));
             let verified: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT follows_verified_at FROM sync_state WHERE did = $1")
                 .bind(owner)
                 .fetch_one(p)
@@ -5200,8 +5518,8 @@ mod tests {
             assert_eq!(r.outcomes, [OpOutcome::Rejected("no_member_side")]);
             assert!(r.transaction);
             assert_eq!(count(p, &format!("SELECT count(*) FROM blocks b JOIN dids s ON s.id = b.subject WHERE s.did = '{MEMBER_B}'")).await, 0);
-            let tomb: String = sqlx::query_scalar("SELECT rev FROM record_tombstones WHERE uri = $1").bind(&uri).fetch_one(p).await.expect("tombstone");
-            assert_eq!(tomb, rev(2));
+            let tomb = crate::test_support::posts::tombstone_rev(p, &uri).await;
+            assert_eq!(tomb, Some(rev(2)));
 
             // The older create, replayed, stores nothing.
             let r = w.apply(AUTHOR, &rev(1), &[block_op(Action::Create, "3kblk", MEMBER_B)], OPTIONS).await.expect("apply");

@@ -399,8 +399,12 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn lens_stored_root(&self, uri: &str) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(Option<String>,)> = sqlx::query_as("SELECT reply_root_uri FROM posts WHERE uri = $1")
-            .bind(uri)
+        let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
+            "SELECT {} FROM {}",
+            crate::db::posts::ref_sql("p", crate::db::ids::Slot::Root),
+            crate::db::posts::rows_named(1)
+        ))
+        .bind(std::slice::from_ref(&uri.to_string()))
             .fetch_optional(self.pool())
             .await?;
         Ok(row.map(|(root,)| root.unwrap_or_else(|| uri.to_string())))
@@ -557,10 +561,7 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn tombstoned(&self, uri: &str) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM record_tombstones WHERE uri = $1)")
-            .bind(uri)
-            .fetch_one(self.pool())
-            .await
+        Ok(!crate::db::tombstones::tombstoned(self.pool(), &[uri.to_string()]).await?.is_empty())
     }
 
     /// Of `uris`, those `record_tombstones` holds, in one read.
@@ -569,14 +570,7 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn tombstoned_many(&self, uris: &[String]) -> Result<HashSet<String>, sqlx::Error> {
-        if uris.is_empty() {
-            return Ok(HashSet::new());
-        }
-        let rows: Vec<String> = sqlx::query_scalar("SELECT uri FROM record_tombstones WHERE uri = ANY($1)")
-            .bind(uris)
-            .fetch_all(self.pool())
-            .await?;
-        Ok(rows.into_iter().collect())
+        crate::db::tombstones::tombstoned(self.pool(), uris).await
     }
 
     /// Whether the author's account is locally known to be `active`.
@@ -604,8 +598,12 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn lens_local_rows(&self, uris: &[String]) -> Result<HashMap<String, Option<String>>, sqlx::Error> {
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as("SELECT uri, reply_parent_uri FROM posts WHERE uri = ANY($1)")
-            .bind(uris)
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT u.uri, {} FROM {}",
+            crate::db::posts::ref_sql("p", crate::db::ids::Slot::Parent),
+            crate::db::posts::rows_named(1)
+        ))
+        .bind(uris)
             .fetch_all(self.pool())
             .await?;
         Ok(rows.into_iter().collect())
@@ -630,18 +628,25 @@ impl Hydrator {
     }
 
     /// The local phase of a post's reply sequence (§5.15.14): the stored
-    /// replies to `uri` after the position `after`, in `(created_at, uri)`
-    /// order, at most `limit`, each with its `created_at`.
+    /// replies to `uri` after the position `after`, in `(created_at, author,
+    /// rkey)` order, at most `limit`, each with its `created_at`.
     ///
     /// # Errors
     ///
     /// Database errors.
     pub async fn lens_local_replies(&self, uri: &str, after: Option<(DateTime<Utc>, &str)>, limit: u32) -> Result<Vec<(String, DateTime<Utc>)>, sqlx::Error> {
-        sqlx::query_as(
-            "SELECT uri, created_at FROM posts WHERE reply_parent_uri = $1 \
-               AND ($2::timestamptz IS NULL OR (created_at, uri) > ($2, $3)) \
-             ORDER BY created_at, uri LIMIT $4",
-        )
+        // The parent's key is read first and written into the query as
+        // integers, so the planner sees how many replies it has.
+        let Some((author, coll, rkey)) = self.whole_key(uri).await?.filter(|k| k.1 == crate::db::ids::COLL_POST) else {
+            return Ok(Vec::new());
+        };
+        sqlx::query_as(&format!(
+            "SELECT {}, p.created_at FROM posts p \
+             WHERE $1::text IS NOT NULL AND p.parent_author = {author} AND p.parent_rkey = {rkey} AND p.parent_coll = {coll} AND {} \
+             ORDER BY p.created_at, p.author, p.rkey LIMIT $4",
+            crate::db::posts::uri_sql("p"),
+            crate::db::posts::post_beyond("p", ">", 2, 3),
+        ))
         .bind(uri)
         .bind(after.map(|(at, _)| at))
         .bind(after.map_or("", |(_, uri)| uri))

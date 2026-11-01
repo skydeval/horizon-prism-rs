@@ -475,8 +475,10 @@ impl Purger {
         match kind {
             PurgeKind::AccountDeleted => {
                 for (table, column) in [
-                    ("feed_items", "originator_did"),
-                    ("posts", "author_did"),
+                    // Keyed by ids; a post's search row and odd references go
+                    // with it.
+                    ("feed_items", "originator"),
+                    ("posts", "author"),
                     ("member_post_refs", "author_did"),
                     ("likes", "author"),
                     ("reposts", "author"),
@@ -496,8 +498,14 @@ impl Purger {
                     // Pronouns and plural records (plural-pronouns §2.3).
                     ("plural_records", "did"),
                 ] {
-                    n += if matches!(table, "likes" | "reposts" | "follows" | "blocks") {
+                    n += if matches!(table, "posts" | "likes" | "reposts" | "follows" | "blocks") {
                         delete_graph_batch(conn, table, "t.author = (SELECT id FROM dids WHERE did = $1)", did).await?
+                    } else if table == "feed_items" {
+                        let sql = format!(
+                            "DELETE FROM feed_items WHERE (originator, is_repost, src_rkey) IN (SELECT t.originator, t.is_repost, t.src_rkey \
+                             FROM feed_items t WHERE t.originator = (SELECT id FROM dids WHERE did = $1) LIMIT {BATCH})"
+                        );
+                        sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected()
                     } else {
                         delete_batch(conn, table, "uri", &format!("{column} = $1"), did).await?
                     };
@@ -712,8 +720,8 @@ async fn delete_batch(
     Ok(sqlx::query(&sql).bind(did).execute(conn).await?.rows_affected())
 }
 
-/// [`delete_batch`] for a table keyed by `(author, rkey)` (likes, reposts,
-/// follows, blocks); `predicate` names the table `t`.
+/// [`delete_batch`] for a table keyed by `(author, rkey)` (posts, likes,
+/// reposts, follows, blocks); `predicate` names the table `t`.
 async fn delete_graph_batch(conn: &mut PgConnection, table: &str, predicate: &str, did: &str) -> Result<u64, sqlx::Error> {
     let sql = format!(
         "DELETE FROM {table} WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM {table} t WHERE {predicate} LIMIT {BATCH})"
@@ -727,8 +735,6 @@ async fn delete_graph_batch(conn: &mut PgConnection, table: &str, predicate: &st
 /// (member-blocks-only design §7). A post that also names another current
 /// member as parent, root or quote author stays.
 async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx::Error> {
-    const AUTHOR_OF: &str = "split_part(%s, '/', 3)";
-    let author_of = |col: &str| AUTHOR_OF.replace("%s", col);
     // A restored DID's interactions with the member stay: the restored rule
     // admits them (refract design §5.4).
     let out_of_scope = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = t.author_did) \
@@ -748,22 +754,20 @@ async fn member_removed_public_batch(conn: &mut PgConnection, did: &str) -> Resu
         );
         n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
     }
+    // A post's references name their authors by id (an odd one too, when
+    // its authority is a valid DID).
     let other_member = |col: &str| {
-        format!(
-            "EXISTS (SELECT 1 FROM members m WHERE m.did = {} AND m.did <> $1)",
-            author_of(col)
-        )
+        format!("EXISTS (SELECT 1 FROM dids md JOIN members m ON m.did = md.did WHERE md.id = {col} AND m.did <> $1)")
     };
     let sql = format!(
-        "DELETE FROM posts WHERE uri IN (SELECT uri FROM posts t WHERE {out_of_scope} \
-         AND ({p} = $1 OR {r} = $1 OR {q} = $1) \
+        "DELETE FROM posts WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM posts t JOIN dids ta ON ta.id = t.author \
+         WHERE {graph_out_of_scope} \
+         AND (t.parent_author = (SELECT id FROM dids WHERE did = $1) OR t.root_author = (SELECT id FROM dids WHERE did = $1) \
+              OR t.quote_author = (SELECT id FROM dids WHERE did = $1)) \
          AND NOT ({op} OR {or} OR {oq}) LIMIT {BATCH})",
-        p = author_of("t.reply_parent_uri"),
-        r = author_of("t.reply_root_uri"),
-        q = author_of("t.quote_uri"),
-        op = other_member("t.reply_parent_uri"),
-        or = other_member("t.reply_root_uri"),
-        oq = other_member("t.quote_uri"),
+        op = other_member("t.parent_author"),
+        or = other_member("t.root_author"),
+        oq = other_member("t.quote_author"),
     );
     n += sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
     let sql = format!(
@@ -913,18 +917,9 @@ mod tests {
         crate::test_support::interactions::like(p, SCOPED, "1", &post_uri(MEMBER, "1")).await;
         // An outsider reply whose root author is another member stays.
         for (rkey, root) in [("1", MEMBER), ("2", OTHER_MEMBER)] {
-            sqlx::query(
-                "INSERT INTO posts (uri, author_did, rkey, cid, rev, reply_parent_uri, reply_root_uri, record, created_at) \
-                 VALUES ($1, $2, $3, 'c', '3kaaaaaaaaaaa', $4, $5, '{}'::jsonb, now())",
-            )
-            .bind(post_uri(OUTSIDER, rkey))
-            .bind(OUTSIDER)
-            .bind(rkey)
-            .bind(post_uri(MEMBER, "1"))
-            .bind(post_uri(root, "1"))
-            .execute(p)
-            .await
-            .expect("post");
+            let record = serde_json::json!({"$type": "app.bsky.feed.post", "text": "", "createdAt": "2026-09-26T12:00:00Z",
+                "reply": {"parent": {"uri": post_uri(MEMBER, "1"), "cid": "c"}, "root": {"uri": post_uri(root, "1"), "cid": "c"}}});
+            crate::test_support::posts::put(p, OUTSIDER, rkey, &record, None).await;
         }
         // A sentinel inbound block by an in-scope author goes; so does a real
         // one, which has no member side left (member-blocks-only design §7).
@@ -1003,14 +998,7 @@ mod tests {
         let p = &db.pool;
         exec(p, "INSERT INTO scope_dids (did, reasons) VALUES ('did:plc:dddddddddddddddddddddddd', 2)").await;
         exec(p, "INSERT INTO actors (did, display_name, profile_record, profile_rev) VALUES ('did:plc:dddddddddddddddddddddddd', 'D', '{}'::jsonb, '3k')").await;
-        sqlx::query(
-            "INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at) VALUES ($1, $2, '1', 'c', '3k', '{}'::jsonb, now())",
-        )
-        .bind(post_uri(SCOPED, "1"))
-        .bind(SCOPED)
-        .execute(p)
-        .await
-        .expect("post");
+        crate::test_support::posts::plain(p, SCOPED, "1", "").await;
         // Every v3 record table, a pack's derived counts, the account's own
         // private state, and a subscription someone else holds on it.
         let authored = [

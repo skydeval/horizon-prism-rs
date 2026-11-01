@@ -138,7 +138,7 @@ pub(super) fn eligible(active_days: Option<u32>) -> String {
         .to_string();
     if let Some(days) = active_days {
         sql.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM posts p WHERE p.author_did = a.did AND p.created_at > now() - interval '{days} days')"
+            " AND EXISTS (SELECT 1 FROM posts p, dids pd WHERE pd.did = a.did AND p.author = pd.id AND p.created_at > now() - interval '{days} days')"
         ));
     }
     sql
@@ -173,7 +173,7 @@ impl Hydrator {
                 "popular",
                 "COALESCE((SELECT cc.followers FROM constellation_counts cc WHERE cc.target = a.did), \
                           (SELECT c.followers_count FROM actor_counts c, dids cd WHERE cd.did = a.did AND c.id = cd.id), 0) DESC, \
-                 (SELECT max(p.created_at) FROM posts p WHERE p.author_did = a.did) DESC NULLS LAST, a.did",
+                 (SELECT max(p.created_at) FROM posts p, dids pd WHERE pd.did = a.did AND p.author = pd.id) DESC NULLS LAST, a.did",
             ),
         };
         let mut slot = slot.lock().await;

@@ -437,7 +437,7 @@ impl H {
     }
 
     async fn tombstone(&self, uri: &str) -> Option<String> {
-        sqlx::query_scalar("SELECT rev FROM record_tombstones WHERE uri = $1").bind(uri).fetch_optional(self.pool()).await.expect("tombstone")
+        crate::test_support::posts::tombstone_rev(self.pool(), uri).await
     }
 
     /// The job `(did, depth)`: `(state, last_error, seconds until due,
@@ -1560,11 +1560,8 @@ async fn t41_the_pass_has_its_own_budget() {
     // A member job: two stale posts use up the shared budget of 2 before
     // the plan's follows; the pass still reconciles the last follow.
     for rkey in ["3kt41upst001", "3kt41upst002"] {
-        exec(
-            h.pool(),
-            &format!("INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at) VALUES ('at://{ALICE}/app.bsky.feed.post/{rkey}', '{ALICE}', '{rkey}', 'bafy', '{REV}', '{{}}'::jsonb, now())"),
-        )
-        .await;
+        let record = serde_json::json!({"$type": "app.bsky.feed.post", "text": "", "createdAt": "2026-10-01T00:00:00Z"});
+        crate::test_support::posts::put_post(h.pool(), ALICE, rkey, "bafy", REV, &record, None).await;
     }
     h.clear_jobs().await;
     assert_eq!(h.run(&b, ALICE, Depth::Member).await, JobOutcome::Ready);
@@ -2161,7 +2158,10 @@ async fn t43_rejected_follows_tombstone_forward_only() {
     let b = h.backfill();
     let tombstones = || async {
         let rows: Vec<(String, String, DateTime<Utc>)> =
-            sqlx::query_as(&format!("SELECT uri, rev, deleted_at FROM record_tombstones WHERE uri LIKE 'at://{EVE}/{FOLLOW}/%' ORDER BY uri"))
+            sqlx::query_as(&format!(
+                "SELECT at_uri(author, coll, rkey), bigint_to_rev(rev), deleted_at FROM record_tombstones \
+                 WHERE author = (SELECT id FROM dids WHERE did = '{EVE}') AND coll = (SELECT id FROM collections WHERE nsid = '{FOLLOW}') ORDER BY 1"
+            ))
                 .fetch_all(h.pool())
                 .await
                 .expect("tombstones");

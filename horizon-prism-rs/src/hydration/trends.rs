@@ -139,7 +139,7 @@ impl Hydrator {
     /// Whether the tag index exists yet (design-v3 §12.2). Until it does
     /// the refreshes are skipped: without it each would scan every post.
     async fn tags_indexed(&self) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar("SELECT to_regclass('posts_tags') IS NOT NULL").fetch_one(self.pool()).await
+        sqlx::query_scalar("SELECT to_regclass('post_search_tags') IS NOT NULL").fetch_one(self.pool()).await
     }
 
     async fn topics_snapshot(&self) -> Result<Arc<Vec<Topic>>, sqlx::Error> {
@@ -158,9 +158,9 @@ impl Hydrator {
             // The count that ranks, from the posts themselves.
             let sql = format!(
                 "SELECT t.tag FROM unnest($1::text[]) AS t(tag) \
-                 JOIN posts p ON p.tags @> ARRAY[t.tag] AND p.created_at >= now() - make_interval(hours => $2) \
-                 JOIN actors a ON a.did = p.author_did WHERE {} \
-                 GROUP BY t.tag HAVING count(*) >= $3 AND count(DISTINCT p.author_did) >= $4 \
+                 JOIN post_search p ON p.tags @> ARRAY[t.tag] AND p.created_at >= now() - make_interval(hours => $2) \
+                 JOIN dids pd ON pd.id = p.author JOIN actors a ON a.did = pd.did WHERE {} \
+                 GROUP BY t.tag HAVING count(*) >= $3 AND count(DISTINCT p.author) >= $4 \
                  ORDER BY count(*) DESC, t.tag",
                 eligible(None)
             );
@@ -232,11 +232,10 @@ impl Hydrator {
         }
         // The posts that carry a candidate tag, by authors that count.
         let subjects = format!(
-            "SELECT t.tag, p.uri, p.author_did, p.created_at, pd.id AS author_id, \
-               COALESCE(rkey_to_bigint(p.rkey), (SELECT x.id FROM rkey_aliases x WHERE x.author = pd.id AND x.rkey = p.rkey)) AS rkey_id \
+            "SELECT t.tag, pd.did AS author_did, p.created_at, p.author AS author_id, p.rkey AS rkey_id \
              FROM unnest($1::text[]) AS t(tag) \
-             JOIN posts p ON p.tags @> ARRAY[t.tag] AND p.created_at >= now() - make_interval(hours => $2 + $3) \
-             JOIN actors a ON a.did = p.author_did LEFT JOIN dids pd ON pd.did = p.author_did WHERE {}",
+             JOIN post_search p ON p.tags @> ARRAY[t.tag] AND p.created_at >= now() - make_interval(hours => $2 + $3) \
+             JOIN dids pd ON pd.id = p.author JOIN actors a ON a.did = pd.did WHERE {}",
             eligible(None)
         );
         let counted = format!(
@@ -259,7 +258,7 @@ impl Hydrator {
              SELECT tag, author_did, hour, count(*) FROM ev GROUP BY tag, author_did, hour",
             engagement("likes", "e.subj_author = s.author_id AND e.subj_rkey = s.rkey_id AND e.subj_coll = 1"),
             engagement("reposts", "e.subj_author = s.author_id AND e.subj_rkey = s.rkey_id AND e.subj_coll = 1"),
-            engagement("posts", "e.reply_parent_uri = s.uri"),
+            engagement("posts", "e.parent_author = s.author_id AND e.parent_rkey = s.rkey_id AND e.parent_coll = 1"),
         );
         let mut tx = self.pool().begin().await?;
         set_timeout(&mut tx, cfg.refresh_timeout_ms).await?;
@@ -411,7 +410,7 @@ mod tests {
             sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)").bind(d).execute(p).await.expect("scope");
         }
         exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{hidden}', '!hide')")).await;
-        exec(p, "CREATE INDEX posts_tags ON posts USING gin (tags)").await;
+        exec(p, "CREATE INDEX post_search_tags ON post_search USING gin (tags)").await;
         // #rust: three posts by two authors. #solo: three posts by one.
         // #quiet: three posts by two authors, liked less. #ghost: carried
         // by a hidden author.
@@ -423,7 +422,8 @@ mod tests {
             (&hidden, "3kk", "ghost"), (&hidden, "3kl", "ghost"), (&a, "3km", "ghost"),
         ] {
             let uri = post(p, author, rkey, "tagged", None, None).await;
-            sqlx::query("UPDATE posts SET tags = ARRAY[$2] WHERE uri = $1").bind(&uri).bind(tag).execute(p).await.expect("tag");
+            let sql = format!("UPDATE post_search SET tags = ARRAY[$1] WHERE {}", crate::test_support::posts::key_is("", &uri));
+            sqlx::query(&sql).bind(tag).execute(p).await.expect("tag");
             uris.entry(tag).or_default().push(uri);
         }
         let like = |n: usize, subject: &str| crate::test_support::interactions::row_sql("likes", &c, &n.to_string(), subject, "now()");

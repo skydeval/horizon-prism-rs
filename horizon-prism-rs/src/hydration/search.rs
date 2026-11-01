@@ -2,8 +2,8 @@
 //! `app.bsky.feed.searchPostsV2`, two parameter parsers over one query
 //! builder (locked decision 34).
 //!
-//! - **Corpus:** rows of `posts` whose author is in scope. Private-tier
-//!   posts are never in `posts`.
+//! - **Corpus:** rows of `post_search` (beside their `posts` rows) whose
+//!   author is in scope. Private-tier posts are never in `posts`.
 //! - **Text:** `search_tsv @@ websearch_to_tsquery('simple', text)`, which
 //!   accepts quoted phrases, `OR` and `-term` and never raises on input.
 //! - **Inline operators** in the text (`from:`, `to:`, `mentions:`,
@@ -80,23 +80,60 @@ enum Match {
     None,
 }
 
+/// The records a reference filter names: by key when whole, by text when
+/// odd. A whole URI whose ids are not known names no stored reference.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Refs {
+    authors: Vec<i32>,
+    colls: Vec<i16>,
+    rkeys: Vec<i64>,
+    raws: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Filter {
     Text(String),
     Authors(Vec<String>),
     NotAuthors(Vec<String>),
     Array(&'static str, Match, Vec<String>),
-    Quotes(Vec<String>),
-    NotQuotes(Vec<String>),
+    /// The mentioned accounts, by id.
+    Mentions(Match, Vec<i32>),
+    Quotes(Refs),
+    NotQuotes(Refs),
     HasMedia,
     HasVideo,
-    ReplyParent(String),
-    ThreadRoot(String),
+    ReplyParent(Refs),
+    /// The root's references, and the root itself by key.
+    ThreadRoot(Refs),
     RepliesOnly,
     NoReplies,
     Following,
     /// A filter no row can meet.
     Nothing,
+}
+
+impl Filter {
+    /// Whether the filter reads the post row beside the search row.
+    fn reads_post(&self) -> bool {
+        matches!(
+            self,
+            Self::Quotes(_) | Self::NotQuotes(_) | Self::HasMedia | Self::HasVideo | Self::ReplyParent(_) | Self::ThreadRoot(_) | Self::RepliesOnly | Self::NoReplies
+        )
+    }
+}
+
+/// Push a match of the post row `p`'s reference `column` (root, parent or
+/// quote, odd slot `slot`) against `refs`.
+fn push_refs(qb: &mut QueryBuilder<'_, Postgres>, column: &str, slot: crate::db::ids::Slot, refs: &Refs) {
+    qb.push(format!("((p.{column}_author, p.{column}_coll, p.{column}_rkey) IN (SELECT * FROM unnest("));
+    qb.push_bind(refs.authors.clone()).push("::int[], ").push_bind(refs.colls.clone()).push("::smallint[], ");
+    qb.push_bind(refs.rkeys.clone()).push("::bigint[]))");
+    qb.push(format!(
+        " OR (p.{column}_coll = 0 AND EXISTS (SELECT 1 FROM odd_refs o WHERE o.tbl = 1 AND o.author = p.author \
+           AND o.rkey = p.rkey AND o.slot = {} AND o.raw = ANY(",
+        slot.id()
+    ));
+    qb.push_bind(refs.raws.clone()).push("))))");
 }
 
 /// The parameters of either endpoint, as the handler read them. V1's
@@ -249,9 +286,9 @@ fn operators(query: &str) -> Result<Operators, ViewError> {
     Ok(out)
 }
 
-/// The viewer's own mutes and blocks as a condition on `n`, with the
-/// viewer as `$1`: a full mute, a block either way, and a list mute or
-/// list block of the viewer's that applies (design-v3 §5.0).
+/// The viewer's own mutes and blocks as a condition on `n` (whose author's
+/// DID is `n.author_did`), with the viewer as `$1`: a full mute, a block
+/// either way, and a list mute or list block of the viewer's that applies.
 pub(super) fn viewer_exclusions() -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 AND m.subject_did = n.author_did AND m.scope = 'full') \
@@ -265,11 +302,17 @@ pub(super) fn viewer_exclusions() -> String {
 }
 
 impl Plan {
-    /// ` FROM posts n WHERE …`: the corpus, the exclusions and the filters.
-    /// The viewer is the first bind, which the exclusions and `following`
-    /// name as `$1`; so this must be the first thing that binds.
+    /// ` FROM … n WHERE …`: the corpus, the exclusions and the filters. `n`
+    /// is the search row with its author's DID (`author_did`), and `p` the
+    /// post row beside it when a filter reads one. The viewer is the first
+    /// bind, which the exclusions and `following` name as `$1`; so this must
+    /// be the first thing that binds.
     fn push_from(&self, qb: &mut QueryBuilder<'_, Postgres>, viewer: Option<&str>, anonymous: bool) {
-        qb.push(" FROM posts n WHERE (");
+        qb.push(" FROM (SELECT s.*, d.did AS author_did FROM post_search s JOIN dids d ON d.id = s.author) n");
+        if self.filters.iter().any(Filter::reads_post) {
+            qb.push(" JOIN posts p ON p.author = n.author AND p.rkey = n.rkey");
+        }
+        qb.push(" WHERE (");
         qb.push_bind(viewer.map(str::to_string));
         qb.push("::text IS NULL OR (").push(viewer_exclusions()).push("))");
         qb.push(" AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = n.author_did)");
@@ -293,10 +336,10 @@ impl Plan {
                     qb.push("n.search_tsv @@ websearch_to_tsquery('simple', ").push_bind(text.clone()).push(")");
                 }
                 Filter::Authors(dids) => {
-                    qb.push("n.author_did = ANY(").push_bind(dids.clone()).push(")");
+                    qb.push("n.author = ANY(ARRAY(SELECT x.id FROM dids x WHERE x.did = ANY(").push_bind(dids.clone()).push(")))");
                 }
                 Filter::NotAuthors(dids) => {
-                    qb.push("n.author_did <> ALL(").push_bind(dids.clone()).push(")");
+                    qb.push("n.author <> ALL(ARRAY(SELECT x.id FROM dids x WHERE x.did = ANY(").push_bind(dids.clone()).push(")))");
                 }
                 Filter::Array(column, Match::All, values) => {
                     qb.push(format!("n.{column} @> ")).push_bind(values.clone());
@@ -309,35 +352,43 @@ impl Plan {
                 Filter::Array(column, Match::None, values) => {
                     qb.push(format!("NOT COALESCE(n.{column} && ")).push_bind(values.clone()).push(", false)");
                 }
-                Filter::Quotes(uris) => {
-                    qb.push("n.quote_uri = ANY(").push_bind(uris.clone()).push(")");
+                Filter::Mentions(Match::All, ids) => {
+                    qb.push("n.mention_ids @> ").push_bind(ids.clone()).push("::int[]");
                 }
-                Filter::NotQuotes(uris) => {
-                    qb.push("NOT COALESCE(n.quote_uri = ANY(").push_bind(uris.clone()).push("), false)");
+                Filter::Mentions(Match::Any, ids) => {
+                    qb.push("n.mention_ids && ").push_bind(ids.clone()).push("::int[]");
+                }
+                Filter::Mentions(Match::None, ids) => {
+                    qb.push("NOT COALESCE(n.mention_ids && ").push_bind(ids.clone()).push("::int[], false)");
+                }
+                Filter::Quotes(refs) => push_refs(qb, "quote", crate::db::ids::Slot::Quote, refs),
+                Filter::NotQuotes(refs) => {
+                    qb.push("NOT COALESCE(");
+                    push_refs(qb, "quote", crate::db::ids::Slot::Quote, refs);
+                    qb.push(", false)");
                 }
                 Filter::HasMedia => {
-                    qb.push("n.media_type IS NOT NULL");
+                    qb.push("p.embed_kind = ANY(").push_bind(crate::db::posts::ANY_MEDIA_KINDS.to_vec()).push(")");
                 }
                 Filter::HasVideo => {
-                    qb.push("n.media_type = 'video'");
+                    qb.push("p.embed_kind = ANY(").push_bind(crate::db::posts::VIDEO_KINDS.to_vec()).push(")");
                 }
-                Filter::ReplyParent(uri) => {
-                    qb.push("n.reply_parent_uri = ").push_bind(uri.clone());
-                }
-                Filter::ThreadRoot(uri) => {
-                    qb.push("(n.reply_root_uri = ").push_bind(uri.clone()).push(" OR n.uri = ").push_bind(uri.clone()).push(")");
+                Filter::ReplyParent(refs) => push_refs(qb, "parent", crate::db::ids::Slot::Parent, refs),
+                Filter::ThreadRoot(refs) => {
+                    qb.push("(");
+                    push_refs(qb, "root", crate::db::ids::Slot::Root, refs);
+                    qb.push(" OR (1::smallint, p.author, p.rkey) IN (SELECT * FROM unnest(");
+                    qb.push_bind(refs.colls.clone()).push("::smallint[], ").push_bind(refs.authors.clone()).push("::int[], ");
+                    qb.push_bind(refs.rkeys.clone()).push("::bigint[])))");
                 }
                 Filter::RepliesOnly => {
-                    qb.push("n.reply_parent_uri IS NOT NULL");
+                    qb.push("p.parent_coll IS NOT NULL");
                 }
                 Filter::NoReplies => {
-                    qb.push("n.reply_parent_uri IS NULL");
+                    qb.push("p.parent_coll IS NULL");
                 }
                 Filter::Following => {
-                    qb.push(
-                        "n.author_did IN (SELECT fs.did FROM follows f JOIN dids fs ON fs.id = f.subject \
-                         WHERE f.author = (SELECT id FROM dids WHERE did = $1))",
-                    );
+                    qb.push("n.author IN (SELECT f.subject FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1))");
                 }
                 Filter::Nothing => {
                     qb.push("false");
@@ -387,6 +438,29 @@ impl Hydrator {
         dids.sort();
         dids.dedup();
         Ok(Ok(dids))
+    }
+
+    /// The account ids of `dids` that have one.
+    async fn known_ids(&self, dids: &[String]) -> Result<Vec<i32>, sqlx::Error> {
+        if dids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar("SELECT id FROM dids WHERE did = ANY($1) ORDER BY id").bind(dids).fetch_all(self.pool()).await
+    }
+
+    /// The references `uris` name, as a reference filter matches them.
+    async fn refs_of(&self, uris: &[String]) -> Result<Refs, sqlx::Error> {
+        let mut refs = Refs::default();
+        for uri in uris {
+            if let Some((author, coll, rkey)) = self.whole_key(uri).await? {
+                refs.authors.push(author);
+                refs.colls.push(coll);
+                refs.rkeys.push(rkey);
+            } else if !matches!(crate::db::ids::uri_parts(uri), crate::db::ids::UriParts::Whole { .. }) {
+                refs.raws.push(uri.clone());
+            }
+        }
+        Ok(refs)
     }
 
     /// Turn the parameters into a plan, or the lexicon error they earn.
@@ -463,15 +537,20 @@ impl Hydrator {
         if !excluded.is_empty() {
             filters.push(Filter::NotAuthors(excluded));
         }
+        // Mentions are stored by account id: a DID with none is mentioned by
+        // no stored post.
         if !p.mentions.is_empty() {
-            filters.push(some_or_nothing(resolved!(&p.mentions), &|v| Filter::Array("mention_dids", Match::Any, v)));
+            let ids = self.known_ids(&resolved!(&p.mentions)).await?;
+            filters.push(if ids.is_empty() { Filter::Nothing } else { Filter::Mentions(Match::Any, ids) });
         }
         for one in &ops.mentions {
-            filters.push(some_or_nothing(resolved!(std::slice::from_ref(one)), &|v| Filter::Array("mention_dids", Match::All, v)));
+            let dids = resolved!(std::slice::from_ref(one));
+            let ids = self.known_ids(&dids).await?;
+            filters.push(if ids.is_empty() || ids.len() < dids.len() { Filter::Nothing } else { Filter::Mentions(Match::All, ids) });
         }
-        let excluded = resolved!(&p.exclude_mentions);
+        let excluded = self.known_ids(&resolved!(&p.exclude_mentions)).await?;
         if !excluded.is_empty() {
-            filters.push(Filter::Array("mention_dids", Match::None, excluded));
+            filters.push(Filter::Mentions(Match::None, excluded));
         }
 
         // Links, tags and languages, each normalized as it is stored. A
@@ -512,17 +591,17 @@ impl Hydrator {
         // reaches a comparison.
         if !p.embedded.is_empty() {
             let public: Vec<String> = p.embedded.iter().filter(|u| !is_private_uri(u)).cloned().collect();
-            filters.push(some_or_nothing(public, &Filter::Quotes));
+            filters.push(if public.is_empty() { Filter::Nothing } else { Filter::Quotes(self.refs_of(&public).await?) });
         }
         let excluded: Vec<String> = p.exclude_embedded.iter().filter(|u| !is_private_uri(u)).cloned().collect();
         if !excluded.is_empty() {
-            filters.push(Filter::NotQuotes(excluded));
+            filters.push(Filter::NotQuotes(self.refs_of(&excluded).await?));
         }
         if let Some(uri) = &p.reply_parent {
-            filters.push(if is_private_uri(uri) { Filter::Nothing } else { Filter::ReplyParent(uri.clone()) });
+            filters.push(if is_private_uri(uri) { Filter::Nothing } else { Filter::ReplyParent(self.refs_of(std::slice::from_ref(uri)).await?) });
         }
         if let Some(uri) = &p.thread_root {
-            filters.push(if is_private_uri(uri) { Filter::Nothing } else { Filter::ThreadRoot(uri.clone()) });
+            filters.push(if is_private_uri(uri) { Filter::Nothing } else { Filter::ThreadRoot(self.refs_of(std::slice::from_ref(uri)).await?) });
         }
         if p.has_media {
             filters.push(Filter::HasMedia);
@@ -579,12 +658,16 @@ impl Hydrator {
         let mut offset = 0;
         match plan.sort {
             Sort::Latest => {
-                qb.push("SELECT n.uri, n.created_at");
+                qb.push("SELECT at_uri(n.author, 1::smallint, n.rkey), n.created_at");
                 plan.push_from(&mut qb, me, anonymous);
                 if let (Some(at), Some(uri)) = parse_local_cursor(p.cursor.as_deref()) {
-                    qb.push(" AND (n.created_at, n.uri) < (").push_bind(at).push(", ").push_bind(uri).push(")");
+                    // A cursor URI that names no key sorts below every row of
+                    // its time.
+                    let key = self.whole_key(&uri).await?.filter(|k| k.1 == crate::db::ids::COLL_POST);
+                    let (author, rkey) = key.map_or((i32::MIN, i64::MIN), |k| (k.0, k.2));
+                    qb.push(" AND (n.created_at, n.author, n.rkey) < (").push_bind(at).push(", ").push_bind(author).push(", ").push_bind(rkey).push(")");
                 }
-                qb.push(" ORDER BY n.created_at DESC, n.uri DESC LIMIT ").push_bind(limit);
+                qb.push(" ORDER BY n.created_at DESC, n.author DESC, n.rkey DESC LIMIT ").push_bind(limit);
             }
             // "Top among the most recent matches": only the newest
             // candidates are scored, from stored counts. No call is made.
@@ -593,13 +676,12 @@ impl Hydrator {
                 if offset > max_offset {
                     return Ok(Ok(Self::emit(json!({ "posts": [] }))));
                 }
-                qb.push("WITH c AS (SELECT n.uri, n.created_at, n.search_tsv");
+                qb.push("WITH c AS (SELECT n.author, n.rkey, at_uri(n.author, 1::smallint, n.rkey) AS uri, n.created_at, n.search_tsv");
                 plan.push_from(&mut qb, me, anonymous);
-                qb.push(" ORDER BY n.created_at DESC, n.uri DESC LIMIT ").push_bind(i64::from(cfg.top_candidates));
+                qb.push(" ORDER BY n.created_at DESC, n.author DESC, n.rkey DESC LIMIT ").push_bind(i64::from(cfg.top_candidates));
                 qb.push(
                     ") SELECT c.uri, c.created_at FROM c \
-                     LEFT JOIN LATERAL ref_of(c.uri) k ON true \
-                     LEFT JOIN post_counts pc ON k.coll = 1 AND pc.author = k.author AND pc.rkey = k.rkey \
+                     LEFT JOIN post_counts pc ON pc.author = c.author AND pc.rkey = c.rkey \
                      LEFT JOIN constellation_counts cc ON cc.target = c.uri",
                 );
                 // A stored Constellation count is used only while §II-9.6
@@ -623,7 +705,7 @@ impl Hydrator {
                         qb.push("1");
                     }
                 }
-                qb.push(" DESC, c.created_at DESC, c.uri DESC LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+                qb.push(" DESC, c.created_at DESC, c.author DESC, c.rkey DESC LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
             }
         }
 
@@ -747,19 +829,20 @@ mod tests {
             sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)").bind(did).execute(p).await.expect("scope");
         }
         exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{ALICE}', 'admin', now())")).await;
-        post(p, ALICE, "3ka", "rust is a fine language", None, None).await;
+        let a = post(p, ALICE, "3ka", "rust is a fine language", None, None).await;
         let bob_post = post(p, BOB, "3kb", "rust and tokio", None, None).await;
-        post(p, BOB, "3kc", "a reply about rust", Some(&bob_post), Some(&bob_post)).await;
-        post(p, CAROL, "3kd", "rust from carol", None, None).await;
+        let c = post(p, BOB, "3kc", "a reply about rust", Some(&bob_post), Some(&bob_post)).await;
+        let d = post(p, CAROL, "3kd", "rust from carol", None, None).await;
         post(p, OUTSIDE, "3ke", "rust from outside the scope", None, None).await;
-        post(p, BOB, "3kf", "an old post about rust", None, None).await;
-        exec(p, "UPDATE posts SET search_tsv = to_tsvector('simple', text), tags = '{}', link_domains = '{}', link_urls = '{}', lang_prefixes = '{en}'").await;
-        exec(p, "UPDATE posts SET tags = '{tokio}', link_domains = '{example.org,docs.example.org}', lang_prefixes = '{pt,pt-br}' WHERE rkey = '3kb'").await;
-        exec(p, "UPDATE posts SET created_at = now() - interval '90 days' WHERE rkey = '3kf'").await;
-        exec(p, "UPDATE posts SET created_at = now() - interval '1 hour' WHERE rkey = '3ka'").await;
-        exec(p, "UPDATE posts SET created_at = now() - interval '2 hours' WHERE rkey = '3kb'").await;
-        exec(p, "UPDATE posts SET created_at = now() - interval '3 hours' WHERE rkey = '3kc'").await;
-        exec(p, "UPDATE posts SET created_at = now() - interval '4 hours' WHERE rkey = '3kd'").await;
+        let f = post(p, BOB, "3kf", "an old post about rust", None, None).await;
+        use crate::test_support::posts::{key_is, set_created_at};
+        exec(p, "UPDATE post_search SET tags = '{}', link_domains = '{}', link_urls = '{}', lang_prefixes = '{en}'").await;
+        exec(p, &format!("UPDATE post_search SET tags = '{{tokio}}', link_domains = '{{example.org,docs.example.org}}', lang_prefixes = '{{pt,pt-br}}' WHERE {}", key_is("", &bob_post))).await;
+        set_created_at(p, &f, "now() - interval '90 days'").await;
+        set_created_at(p, &a, "now() - interval '1 hour'").await;
+        set_created_at(p, &bob_post, "now() - interval '2 hours'").await;
+        set_created_at(p, &c, "now() - interval '3 hours'").await;
+        set_created_at(p, &d, "now() - interval '4 hours'").await;
         crate::test_support::interactions::set_post_counts(p, &format!("at://{CAROL}/app.bsky.feed.post/3kd"), (50, 0, 0, 0)).await;
 
         let mut sets = ScopeSets::default();

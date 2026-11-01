@@ -3460,7 +3460,8 @@ fn notification_kept() -> String {
          AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
                n.record_uri, n.record_root, n.reason_subject, \
                (SELECT s.reply_root_uri FROM private_posts s WHERE s.uri = n.reason_subject), \
-               (SELECT s.reply_root_uri FROM posts s WHERE s.uri = n.reason_subject))) \
+               (SELECT ref_text(s.root_author, s.root_coll, s.root_rkey, 1::smallint, s.author, s.rkey, 1::smallint) \
+                  FROM posts s, ref_of(n.reason_subject) k WHERE k.coll = 1 AND s.author = k.author AND s.rkey = k.rkey))) \
          AND {PREFERRED}",
         blocked = blocked("$1", "n.author_did"),
         applies = crate::hydration::APPLIES,

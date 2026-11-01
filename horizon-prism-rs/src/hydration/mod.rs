@@ -284,8 +284,8 @@ pub struct ActorRow {
     pub posts_count: Option<i32>,
 }
 
-/// One `posts` row joined with `post_counts`.
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// One `posts` row joined with `post_counts`, its record decoded.
+#[derive(Debug, Clone)]
 pub struct PostRow {
     pub uri: String,
     pub author_did: String,
@@ -301,6 +301,24 @@ pub struct PostRow {
     pub repost_count: Option<i32>,
     pub reply_count: Option<i32>,
     pub quote_count: Option<i32>,
+}
+
+/// A `posts` row as read, before its record is decoded.
+#[derive(sqlx::FromRow)]
+struct StoredPostRow {
+    uri: String,
+    author_did: String,
+    cid: Vec<u8>,
+    record: Vec<u8>,
+    reply_parent_uri: Option<String>,
+    reply_root_uri: Option<String>,
+    quote_uri: Option<String>,
+    created_at: DateTime<Utc>,
+    indexed_at: DateTime<Utc>,
+    like_count: Option<i32>,
+    repost_count: Option<i32>,
+    reply_count: Option<i32>,
+    quote_count: Option<i32>,
 }
 
 /// Blocks a request knows beyond what local rows show (design-v3
@@ -793,6 +811,15 @@ impl Hydrator {
         Ok(rows.into_iter().map(|r| (r.did.clone(), r)).collect())
     }
 
+    /// The key a whole reference URI names (`db::ids::whole_key`).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub(crate) async fn whole_key(&self, uri: &str) -> Result<Option<(i32, i16, i64)>, sqlx::Error> {
+        crate::db::ids::whole_key(self.pool(), uri).await
+    }
+
     /// Local post rows (never private-tier: those live only in `private_tier`).
     ///
     /// # Errors
@@ -802,18 +829,45 @@ impl Hydrator {
         if uris.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows: Vec<PostRow> = sqlx::query_as(
-            "SELECT p.uri, p.author_did, p.cid, p.record, p.embed, p.reply_parent_uri, p.reply_root_uri, \
-               p.quote_uri, p.created_at, p.indexed_at, \
+        let rows: Vec<StoredPostRow> = sqlx::query_as(&format!(
+            "SELECT u.uri, d.did AS author_did, p.cid, p.record, {} AS reply_parent_uri, \
+               {} AS reply_root_uri, {} AS quote_uri, p.created_at, p.indexed_at, \
                c.like_count, c.repost_count, c.reply_count, c.quote_count \
-             FROM posts p LEFT JOIN LATERAL ref_of(p.uri) k ON true \
-             LEFT JOIN post_counts c ON k.coll = 1 AND c.author = k.author AND c.rkey = k.rkey \
-             WHERE p.uri = ANY($1)",
-        )
+             FROM {} JOIN dids d ON d.id = p.author \
+             LEFT JOIN post_counts c ON c.author = p.author AND c.rkey = p.rkey",
+            crate::db::posts::ref_sql("p", crate::db::ids::Slot::Parent),
+            crate::db::posts::ref_sql("p", crate::db::ids::Slot::Root),
+            crate::db::posts::ref_sql("p", crate::db::ids::Slot::Quote),
+            crate::db::posts::rows_named(1),
+        ))
         .bind(uris)
         .fetch_all(self.pool())
         .await?;
-        Ok(rows.into_iter().map(|r| (r.uri.clone(), r)).collect())
+        let mut out = HashMap::with_capacity(rows.len());
+        for r in rows {
+            let record = crate::db::records::decode_value(self.pool(), &r.record).await?;
+            let embed = record.get("embed").filter(|e| !e.is_null()).cloned();
+            out.insert(
+                r.uri.clone(),
+                PostRow {
+                    uri: r.uri,
+                    author_did: r.author_did,
+                    cid: crate::db::ids::cid_from_db(&r.cid),
+                    record,
+                    embed,
+                    reply_parent_uri: r.reply_parent_uri,
+                    reply_root_uri: r.reply_root_uri,
+                    quote_uri: r.quote_uri,
+                    created_at: r.created_at,
+                    indexed_at: r.indexed_at,
+                    like_count: r.like_count,
+                    repost_count: r.repost_count,
+                    reply_count: r.reply_count,
+                    quote_count: r.quote_count,
+                },
+            );
+        }
+        Ok(out)
     }
 
     /// Local labels (§7.8) by subject, as lexicon label objects.
@@ -1597,38 +1651,19 @@ pub(crate) mod testing {
     }
 
     pub(crate) async fn post(pool: &PgPool, author: &str, rkey: &str, text: &str, parent: Option<&str>, root: Option<&str>) -> String {
-        let uri = format!("at://{author}/app.bsky.feed.post/{rkey}");
         let mut record = json!({"$type": "app.bsky.feed.post", "text": text, "createdAt": "2026-09-26T12:00:00.000Z"});
         if let (Some(p), Some(r)) = (parent, root) {
             record["reply"] = json!({"parent": {"uri": p, "cid": "bafyparent"}, "root": {"uri": r, "cid": "bafyroot"}});
         }
-        // The ids the count trigger reads, as the writer interns them.
-        let mut named = vec![uri.as_str()];
-        named.extend(parent);
-        crate::test_support::interactions::intern(pool, &named).await;
-        sqlx::query(
-            "INSERT INTO posts (uri, author_did, rkey, cid, rev, text, reply_parent_uri, reply_root_uri, record, created_at) \
-             VALUES ($1, $2, $3, $4, '3kaaaaaaaaaaa', $5, $6, $7, $8, now())",
-        )
-        .bind(&uri)
-        .bind(author)
-        .bind(rkey)
-        .bind(format!("bafy{rkey}"))
-        .bind(text)
-        .bind(parent)
-        .bind(root)
-        .bind(&record)
-        .execute(pool)
-        .await
-        .expect("post");
-        let kind = if parent.is_some() { "reply" } else { "post" };
-        sqlx::query("INSERT INTO feed_items (uri, originator_did, post_uri, kind, sort_at) VALUES ($1, $2, $1, $3, now())")
-            .bind(&uri)
-            .bind(author)
-            .bind(kind)
-            .execute(pool)
-            .await
-            .expect("feed item");
+        post_record(pool, author, rkey, &record).await
+    }
+
+    /// A stored post with this record, created now, with its feed item.
+    pub(crate) async fn post_record(pool: &PgPool, author: &str, rkey: &str, record: &Value) -> String {
+        let now = Utc::now();
+        let uri = crate::firehose::writer::fixtures::put_post(pool, author, rkey, &format!("bafy{rkey}"), "3kaaaaaaaaaaa", record, Some(now)).await;
+        let kind = if record.get("reply").is_some() { "reply" } else { "post" };
+        crate::firehose::writer::fixtures::put_feed_item(pool, &uri, &uri, kind, now).await;
         uri
     }
 }

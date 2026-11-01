@@ -316,7 +316,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
     let mut record_facts = Vec::new();
     if let Some(uri) = &subject.uri {
         if super::labels::kind(uri) == "post" {
-            let stored: Result<bool, sqlx::Error> = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM posts WHERE uri = $1)").bind(uri).fetch_one(&state.pool).await;
+            let stored: Result<bool, sqlx::Error> = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM posts p, ref_of($1) k WHERE k.coll = 1 AND p.author = k.author AND p.rkey = k.rkey)").bind(uri).fetch_one(&state.pool).await;
             match stored {
                 Ok(s) => record_facts.push(fact("Prism holds this post", if s { "yes" } else { "no" })),
                 Err(e) => return super::internal_error(&state, &e),

@@ -1648,8 +1648,9 @@ fn outline_start() -> Position {
 }
 
 /// One node's reply sequence from the tree (thread outline design §5.3.3):
-/// its stored replies, in `(created_at, uri)` order as the database orders
-/// them and at most a page of them, as [`Work::local_phase`] reads them;
+/// its stored replies, in `(created_at, author, rkey)` order as the
+/// database orders them and at most a page of them, as [`Work::local_phase`]
+/// reads them;
 /// then its live outline-only children, in `(created_at, uri)` order on the
 /// URI's bytes. From a `Local` position the stored replies after it are
 /// read; from an `Outline` one, the outline-only children after it, and

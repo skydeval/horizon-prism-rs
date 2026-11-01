@@ -92,7 +92,7 @@ async fn write_history(w: &Writer) {
         create("app.bsky.graph.follow", "3kfollows", follow(STRANGER)),
         create("app.bsky.actor.profile", "self", json!({"$type": "app.bsky.actor.profile", "displayName": "Restored"})),
     ];
-    let report = w.apply(SUBJECT, "3krev0000000a", &ops, options()).await.expect("apply");
+    let report = w.apply(SUBJECT, "3krev2222222a", &ops, options()).await.expect("apply");
     assert!(report.outcomes.iter().all(|o| *o == OpOutcome::Written), "{report:?}");
 }
 
@@ -113,12 +113,12 @@ async fn t1_admission_through_the_writer() {
     assert_eq!(count(p, "SELECT count(*) FROM actors WHERE profile_record IS NOT NULL").await, 1);
     // A candidate (not in R-live): refused under the off rule.
     let w = writer(p, sets(PublicMode::Off, false, false, false));
-    let report = w.apply(SUBJECT, "3krev0000000b", &[create("app.bsky.feed.post", "3knew", post("x", None))], options()).await.expect("apply");
+    let report = w.apply(SUBJECT, "3krev2222222b", &[create("app.bsky.feed.post", "3knew", post("x", None))], options()).await.expect("apply");
     assert!(matches!(report.outcomes[0], OpOutcome::Rejected(_)), "{report:?}");
     // A member in R: a full row and its reference.
     let w = writer(p, sets(PublicMode::Off, true, true, true));
-    w.apply(SUBJECT, "3krev0000000c", &[create("app.bsky.feed.post", "3kmem", post("member post", None))], options()).await.expect("apply");
-    assert_eq!(count(p, "SELECT count(*) FROM posts WHERE uri LIKE '%3kmem'").await, 1);
+    w.apply(SUBJECT, "3krev2222222c", &[create("app.bsky.feed.post", "3kmem", post("member post", None))], options()).await.expect("apply");
+    assert!(crate::test_support::posts::stored(p, &format!("at://{SUBJECT}/app.bsky.feed.post/3kmem")).await);
     assert_eq!(count(p, "SELECT count(*) FROM member_post_refs WHERE uri LIKE '%3kmem'").await, 1);
     db.drop_db().await;
 }
@@ -133,10 +133,10 @@ async fn t9_a_delete_before_the_backfill_wins() {
     let p = &db.pool;
     let w = writer(p, sets(PublicMode::Off, true, false, false));
     let delete = RawOp { action: Action::Delete, collection: "app.bsky.feed.post".into(), rkey: "3kgone".into(), cid: None, record: None };
-    w.apply(SUBJECT, "3krev0000000z", &[delete], options()).await.expect("delete");
+    w.apply(SUBJECT, "3krev2222222z", &[delete], options()).await.expect("delete");
     assert_eq!(count(p, "SELECT count(*) FROM record_tombstones").await, 1);
     let backfilled = ApplyOptions { live: false, source: WriteSource::Backfill, ..options() };
-    let report = w.apply(SUBJECT, "3krev0000000a", &[create("app.bsky.feed.post", "3kgone", post("old", None))], backfilled).await.expect("write");
+    let report = w.apply(SUBJECT, "3krev2222222a", &[create("app.bsky.feed.post", "3kgone", post("old", None))], backfilled).await.expect("write");
     assert_eq!(report.outcomes, [OpOutcome::Unchanged]);
     assert_eq!(count(p, "SELECT count(*) FROM posts").await, 0);
     db.drop_db().await;
@@ -164,7 +164,7 @@ async fn t7_t8_purge_off_mode_outside_s() {
         create("app.bsky.feed.like", "3kmlike", like(&format!("at://{SUBJECT}/app.bsky.feed.post/3kpost"))),
         create("app.bsky.graph.follow", "3kmfollow", follow(SUBJECT)),
     ];
-    w.apply(MEMBER, "3krev0000000a", &ops, options()).await.expect("member");
+    w.apply(MEMBER, "3krev2222222a", &ops, options()).await.expect("member");
     let h = Harness::new(p, sets(PublicMode::Off, false, false, false), vec![tier1()]).await;
     ending(&h).await;
     exec(p, "INSERT INTO purging_dids (did, kind) VALUES ('did:plc:subjectaaaaaaaaaaaaaaaaa', 'out_of_scope')").await;
@@ -199,7 +199,7 @@ async fn t7b_purge_on_mode_keeps_rule_2_rows() {
     let h = Harness::new(p, sets(PublicMode::On, false, false, false), vec![tier1()]).await;
     ending(&h).await;
     assert!(h.refract.purge(SUBJECT).await.expect("purge"));
-    let posts: Vec<String> = sqlx::query_scalar("SELECT uri FROM posts").fetch_all(p).await.expect("posts");
+    let posts: Vec<String> = crate::test_support::posts::uris(p).await;
     assert_eq!(posts, [format!("at://{SUBJECT}/app.bsky.feed.post/3kreply")]);
     let likes = crate::test_support::interactions::subjects(p, "likes").await;
     assert_eq!(likes, [format!("at://{MEMBER}/app.bsky.feed.post/3kmember")]);
@@ -261,10 +261,7 @@ async fn t10_the_sweep_spares_r() {
         exec(p, &format!("UPDATE refract_dids SET state = '{state}'")).await;
         let mut n = 0;
         for t in crate::indexing::public_sweep::TABLES.iter().filter(|t| ["posts", "likes", "reposts", "follows", "post_counts"].contains(&t.name)) {
-            let mine = match t.name {
-                "posts" => format!("t.author_did = '{SUBJECT}'"),
-                _ => format!("t.author = (SELECT id FROM dids WHERE did = '{SUBJECT}')"),
-            };
+            let mine = format!("t.author = (SELECT id FROM dids WHERE did = '{SUBJECT}')");
             n += count(p, &format!("SELECT count(*) FROM {} t WHERE {mine} AND {}", t.name, t.delete_when)).await;
         }
         n
@@ -298,7 +295,7 @@ async fn t6_member_removal_spares_r_and_account_deleted_forgets() {
     purger.purge(MEMBER, crate::aggregations::PurgeKind::MemberRemoved).await.expect("member removed");
     assert_eq!(crate::test_support::interactions::count_by(p, "likes", SUBJECT).await, 2, "its likes stay");
     assert_eq!(count(p, &format!("SELECT count(*) FROM follows WHERE author = (SELECT id FROM dids WHERE did = '{SUBJECT}')")).await, 2, "its follows stay");
-    assert_eq!(count(p, &format!("SELECT count(*) FROM posts WHERE author_did = '{SUBJECT}'")).await, 2, "its reply to the member stays");
+    assert_eq!(crate::test_support::posts::count_by(p, SUBJECT).await, 2, "its reply to the member stays");
     purger.purge(SUBJECT, crate::aggregations::PurgeKind::AccountDeleted).await.expect("account deleted");
     assert_eq!(count(p, "SELECT count(*) FROM refract_dids").await, 0);
     assert_eq!(count(p, "SELECT count(*) FROM refract_labels").await, 0);

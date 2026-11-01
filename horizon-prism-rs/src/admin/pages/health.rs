@@ -218,6 +218,14 @@ fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
         ],
         note: String::new(),
     });
+    groups.push(FigureGroup {
+        title: "Stored records",
+        figures: vec![
+            fig("Post records left to compress", or_unknown(get(crate::db::schema_backfill::METRIC_RECOMPRESS_REMAINING), count)),
+            fig("Dead rows in posts", or_unknown(get(crate::db::schema_backfill::METRIC_POSTS_DEAD_ROWS), count)),
+        ],
+        note: "Compression starts once 10,000 posts are stored. Dead rows are reused by Postgres; `VACUUM FULL posts` or pg_repack returns their space.".to_string(),
+    });
 
     groups.push(FigureGroup {
         title: "Services Prism asks",

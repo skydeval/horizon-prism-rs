@@ -31,8 +31,8 @@ const NO_RECORD_JSON: [&str; 7] = [
 ];
 
 /// Collections stored one row per URI with `cid` and `record` columns.
-const BY_URI: [(&str, &str); 6] = [
-    ("app.bsky.feed.post", "posts"),
+/// Posts are keyed by ids, with their record encoded.
+const BY_URI: [(&str, &str); 5] = [
     (NSID_LIST, "lists"),
     ("app.bsky.graph.starterpack", "starter_packs"),
     (NSID_LABELER, "labeler_services"),
@@ -96,6 +96,16 @@ impl Hydrator {
                 .bind(uri)
                 .fetch_optional(self.pool())
                 .await;
+        }
+        if collection == crate::hydration::feed::NSID_POST {
+            let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(&format!("SELECT p.cid, p.record FROM {}", crate::db::posts::rows_named(1)))
+                .bind(std::slice::from_ref(&uri.to_string()))
+                .fetch_optional(self.pool())
+                .await?;
+            return match row {
+                Some((cid, record)) => Ok(Some((crate::db::ids::cid_from_db(&cid), crate::db::records::decode_value(self.pool(), &record).await?))),
+                None => Ok(None),
+            };
         }
         let Some((_, table)) = BY_URI.iter().find(|(nsid, _)| *nsid == collection) else {
             return Ok(None);
@@ -162,7 +172,11 @@ mod tests {
         actor(p, ALICE, "alice.test", "Alice").await;
         actor(p, BOB, "bob.test", "Bob").await;
         let uri = post(p, ALICE, "3kaaaaaaaaaa2", "hello", None, None).await;
-        let cid: String = sqlx::query_scalar("SELECT cid FROM posts WHERE uri = $1").bind(&uri).fetch_one(p).await.expect("cid");
+        let stored: Vec<u8> = sqlx::query_scalar(&format!("SELECT cid FROM posts WHERE {}", crate::test_support::posts::key_is("", &uri)))
+            .fetch_one(p)
+            .await
+            .expect("cid");
+        let cid = crate::db::ids::cid_from_db(&stored);
         let mut sets = ScopeSets::default();
         sets.scope.insert(ALICE.into());
         let h = hydrator(p, sets);

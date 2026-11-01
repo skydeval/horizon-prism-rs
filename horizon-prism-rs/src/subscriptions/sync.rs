@@ -462,7 +462,8 @@ async fn write_batch(
     sqlx::query(
         "INSERT INTO subscribed_list_items (uri, list_uri, owner_did, rkey, cid, rev, subject_did) \
          SELECT k.uri, $5, $6, k.rkey, k.cid, $7, k.subject FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS k(uri, rkey, cid, subject) \
-         WHERE NOT EXISTS (SELECT 1 FROM record_tombstones t WHERE t.uri = k.uri) \
+         WHERE NOT EXISTS (SELECT 1 FROM ref_of(k.uri) r JOIN record_tombstones t \
+                           ON t.author = r.author AND t.coll = r.coll AND t.rkey = r.rkey) \
            AND NOT EXISTS (SELECT 1 FROM subscription_tombstones t WHERE t.uri = k.uri AND t.rev > $7) \
          ON CONFLICT (uri) DO UPDATE SET list_uri = EXCLUDED.list_uri, rkey = EXCLUDED.rkey, cid = EXCLUDED.cid, rev = EXCLUDED.rev, \
            subject_did = EXCLUDED.subject_did, missing_count = 0 \

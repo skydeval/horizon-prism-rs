@@ -578,7 +578,7 @@ async fn resolve_many_answers_each_uri_as_resolve_does() {
     let hidden = uri(&outsider, "3khidden");
     exec(p, &format!("INSERT INTO labels (subject, val) VALUES ('{hidden}', '!takedown')")).await;
     let deleted = uri(&outsider, "3kdeleted");
-    exec(p, &format!("INSERT INTO record_tombstones (uri, rev) VALUES ('{deleted}', '3k')")).await;
+    crate::test_support::posts::tombstone(p, &deleted, "3kaaaaaaaaaaa").await;
     let upstream = uri(&outsider, "3kupstream");
     f.posts.insert(upstream.clone(), view(&upstream, None, &upstream, 0));
     let stripped = uri(&outsider, "3kstripped");

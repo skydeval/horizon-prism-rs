@@ -199,7 +199,16 @@ async fn t_p4_the_fill() {
     .await;
     // A delete after the listing began: its tombstone keeps the record out.
     pds.put(ALICE, member, "3kgone", json!({"n": 5}));
-    exec(p, "INSERT INTO record_tombstones (uri, rev, deleted_at) VALUES ('at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.nearhorizon.plural.member/3kgone', '3kzzzzzzzzzzz', now() + interval '1 minute')").await;
+    let gone = "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.nearhorizon.plural.member/3kgone";
+    crate::test_support::posts::tombstone(p, gone, "3kzzzzzzzzzzz").await;
+    exec(
+        p,
+        &format!(
+            "UPDATE record_tombstones SET deleted_at = now() + interval '1 minute' \
+             WHERE (author, coll, rkey) = (SELECT r.author, r.coll, r.rkey FROM ref_of('{gone}') r)"
+        ),
+    )
+    .await;
     assert_eq!(f.fill_now(ALICE).await.expect("fill"), Outcome::Complete { truncated: false });
     let rows = stored(p, ALICE).await;
     assert_eq!(rows.iter().map(|r| (r.0.as_str(), r.1.as_str())).collect::<Vec<_>>(), [("3klater", "bafylater"), ("3kwren", "bafy4")]);
@@ -483,7 +492,7 @@ async fn t_f2_public_posts_keep_the_fronters_key() {
         "embed": {"$type": "app.bsky.embed.record", "record": {"uri": root, "cid": "bafy3kroot"}}});
     w.apply(BOB, "3kaaaaaaaaaa3", &[op("3kreply", reply_record), op("3kquote", quote_record)], options).await.expect("bob");
     // The stored row.
-    let stored: Value = sqlx::query_scalar("SELECT record FROM posts WHERE uri = $1").bind(&root).fetch_one(p).await.expect("row");
+    let stored: Value = crate::test_support::posts::record(p, &root).await.expect("row");
     assert_eq!(stored[FRONTERS_KEY], fronters);
     let h = hydrator(p, sets);
     let req = Requester::test();

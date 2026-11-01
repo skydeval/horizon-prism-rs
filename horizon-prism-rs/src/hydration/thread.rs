@@ -395,9 +395,12 @@ impl Hydrator {
         for rule in rules {
             let allowed = match rule.get("$type").and_then(Value::as_str).unwrap_or_default() {
                 "app.bsky.feed.threadgate#mentionRule" => {
-                    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM posts WHERE uri = $1 AND $2 = ANY(mention_dids))")
-                        .bind(root)
-                        .bind(me)
+                    sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM posts p, ref_of($1) k, dids m \
+                           WHERE k.coll = 1 AND p.author = k.author AND p.rkey = k.rkey AND m.did = $2 AND m.id = ANY(p.mention_ids))",
+                    )
+                    .bind(root)
+                    .bind(me)
                         .fetch_one(self.pool())
                         .await?
                 }
@@ -593,10 +596,14 @@ impl Hydrator {
                 break;
             }
             let parents = frontier.clone();
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT uri, reply_parent_uri FROM posts WHERE reply_parent_uri = ANY($1) \
-                 ORDER BY created_at, uri LIMIT $2",
-            )
+            // A reply names its parent by key, and only a post's (a gate shares
+            // its post's key).
+            let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+                "SELECT {}, u.uri FROM unnest($1::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) k \
+                 JOIN posts c ON c.parent_author = k.author AND c.parent_rkey = k.rkey AND c.parent_coll = 1 \
+                 WHERE k.coll = 1 ORDER BY c.created_at, c.author, c.rkey LIMIT $2",
+                crate::db::posts::uri_sql("c")
+            ))
             .bind(&frontier)
             .bind(i64::try_from(budget).unwrap_or(i64::MAX))
             .fetch_all(self.pool())

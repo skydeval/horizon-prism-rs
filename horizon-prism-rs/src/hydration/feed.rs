@@ -509,13 +509,7 @@ impl Hydrator {
             // A post this AppView saw deleted is not fetched from upstream,
             // whose copies (and the read-time cache of them) can outlive the
             // delete.
-            let deleted: HashSet<String> =
-                sqlx::query_scalar("SELECT uri FROM record_tombstones WHERE uri = ANY($1)")
-                    .bind(&missing)
-                    .fetch_all(self.pool())
-                    .await?
-                    .into_iter()
-                    .collect();
+            let deleted: HashSet<String> = crate::db::tombstones::tombstoned(self.pool(), &missing).await?;
             let allowed: Vec<String> = missing
                 .into_iter()
                 .filter(|u| !gates.get(u).copied().unwrap_or(Gate::Visible).is_hidden() && !deleted.contains(u))
@@ -569,17 +563,18 @@ impl Hydrator {
         }
         // Up: each step must be the author's earliest reply to a post by the
         // same author. The walk is on the run only when it ends at a root.
-        let up: Vec<(String, i32, bool)> = sqlx::query_as(
-            "WITH RECURSIVE up(start, uri, parent, author, at, n) AS ( \
-               SELECT uri, uri, reply_parent_uri, author_did, created_at, 0 FROM posts WHERE uri = ANY($1) \
+        let up: Vec<(String, i32, bool)> = sqlx::query_as(&format!(
+            "WITH RECURSIVE up(start, author, rkey, pa, pc, pr, at, n) AS ( \
+               SELECT u.uri, p.author, p.rkey, p.parent_author, p.parent_coll, p.parent_rkey, p.created_at, 0 FROM {} \
                UNION ALL \
-               SELECT up.start, q.uri, q.reply_parent_uri, up.author, q.created_at, up.n + 1 \
-               FROM up JOIN posts q ON q.uri = up.parent \
-               WHERE up.n < $2 AND q.author_did = up.author \
-                 AND NOT EXISTS (SELECT 1 FROM posts s WHERE s.reply_parent_uri = up.parent AND s.author_did = up.author \
-                                 AND (s.created_at, s.uri) < (up.at, up.uri)) \
-             ) SELECT DISTINCT ON (start) start, n, parent IS NULL FROM up ORDER BY start, n DESC",
-        )
+               SELECT up.start, q.author, q.rkey, q.parent_author, q.parent_coll, q.parent_rkey, q.created_at, up.n + 1 \
+               FROM up JOIN posts q ON up.pc = 1 AND q.author = up.pa AND q.rkey = up.pr \
+               WHERE up.n < $2 AND q.author = up.author \
+                 AND NOT EXISTS (SELECT 1 FROM posts s WHERE s.parent_author = up.pa AND s.parent_rkey = up.pr \
+                                 AND s.parent_coll = 1 AND s.author = up.author AND (s.created_at, s.rkey) < (up.at, up.rkey)) \
+             ) SELECT DISTINCT ON (start) start, n, pc IS NULL FROM up ORDER BY start, n DESC",
+            crate::db::posts::rows_named(1)
+        ))
         .bind(&starts)
         .bind(max)
         .fetch_all(self.pool())
@@ -590,16 +585,17 @@ impl Hydrator {
         }
         let on_run: Vec<String> = above.keys().cloned().collect();
         // Down: the author's earliest reply to each post in turn.
-        let down: Vec<(String, Option<i32>)> = sqlx::query_as(
-            "WITH RECURSIVE down(start, uri, author, n) AS ( \
-               SELECT uri, uri, author_did, 0 FROM posts WHERE uri = ANY($1) \
+        let down: Vec<(String, Option<i32>)> = sqlx::query_as(&format!(
+            "WITH RECURSIVE down(start, author, rkey, n) AS ( \
+               SELECT u.uri, p.author, p.rkey, 0 FROM {} \
                UNION ALL \
-               SELECT d.start, nx.uri, d.author, d.n + 1 FROM down d \
-               CROSS JOIN LATERAL (SELECT s.uri FROM posts s WHERE s.reply_parent_uri = d.uri AND s.author_did = d.author \
-                                   ORDER BY s.created_at, s.uri LIMIT 1) nx \
+               SELECT d.start, nx.author, nx.rkey, d.n + 1 FROM down d \
+               CROSS JOIN LATERAL (SELECT s.author, s.rkey FROM posts s WHERE s.parent_author = d.author AND s.parent_rkey = d.rkey \
+                                   AND s.parent_coll = 1 AND s.author = d.author ORDER BY s.created_at, s.rkey LIMIT 1) nx \
                WHERE d.n < $2 \
              ) SELECT start, max(n) FROM down GROUP BY start",
-        )
+            crate::db::posts::rows_named(1)
+        ))
         .bind(&on_run)
         .bind(max)
         .fetch_all(self.pool())
@@ -719,28 +715,32 @@ impl Hydrator {
             _ => &["post", "reply", "repost"],
         };
         let threads = filter == "posts_and_author_threads";
-        // The media embed types a media filter keeps (§8.4): the same test
-        // as `media_type`, on the top-level embed or on recordWithMedia's
-        // media. Video is its own filter. `posts.media_type` replaces the
-        // expression once its migration lands (§II-15 item 11).
-        let media: Option<Vec<&str>> = match filter {
-            "posts_with_media" => Some(vec!["app.bsky.embed.images", "app.bsky.embed.gallery"]),
-            "posts_with_video" => Some(vec!["app.bsky.embed.video"]),
+        // The embed kinds a media filter keeps: the same test as
+        // `media_type`, on the top-level embed or on recordWithMedia's
+        // media. Video is its own filter.
+        let media: Option<Vec<i16>> = match filter {
+            "posts_with_media" => Some(crate::db::posts::MEDIA_KINDS.to_vec()),
+            "posts_with_video" => Some(crate::db::posts::VIDEO_KINDS.to_vec()),
             _ => None,
         };
-        let items: Vec<FeedItem> = sqlx::query_as(
-            "SELECT f.uri, f.originator_did, f.post_uri, f.kind, f.sort_at FROM feed_items f \
-             LEFT JOIN posts p ON p.uri = f.post_uri \
-             WHERE f.originator_did = $1 AND f.kind = ANY($2) \
-               AND ($3::timestamptz IS NULL OR (f.sort_at, f.uri) < ($3, $4)) \
-               AND ($6::text[] IS NULL OR (f.kind <> 'repost' AND \
-                    (CASE WHEN p.embed->>'$type' = 'app.bsky.embed.recordWithMedia' \
-                          THEN p.embed->'media'->>'$type' ELSE p.embed->>'$type' END) = ANY($6))) \
-               AND (NOT $7 OR f.kind <> 'reply' OR split_part(p.reply_root_uri, '/', 3) = $1) \
-             ORDER BY f.sort_at DESC, f.uri DESC LIMIT $5",
-        )
-        .bind(&did)
-        .bind(kinds)
+        let kinds: Vec<i16> = kinds.iter().map(|k| crate::db::posts::feed_kind(k)).collect();
+        // The author's id is read first and bound, so the planner sees the
+        // one originator it names.
+        let originator: Option<i32> = sqlx::query_scalar("SELECT id FROM dids WHERE did = $1").bind(&did).fetch_optional(self.pool()).await?;
+        let items: Vec<FeedItem> = sqlx::query_as(&format!(
+            "SELECT {} FROM feed_items f \
+             LEFT JOIN posts p ON p.author = f.post_author AND p.rkey = f.post_rkey \
+             WHERE f.originator = $1 AND f.kind = ANY($2) \
+               AND {} \
+               AND ($6::smallint[] IS NULL OR (NOT f.is_repost AND p.embed_kind = ANY($6))) \
+               AND (NOT $7 OR f.kind <> 2 OR p.root_author = $1) \
+             {} LIMIT $5",
+            crate::db::posts::FEED_ITEM_COLUMNS,
+            crate::db::posts::feed_after(3, 4),
+            crate::db::posts::FEED_ORDER,
+        ))
+        .bind(originator)
+        .bind(&kinds)
         .bind(at)
         .bind(after_uri.unwrap_or_default())
         .bind(i64::from(limit))
@@ -772,12 +772,13 @@ impl Hydrator {
             // The local rows are exhausted. On a PDS that lists newest
             // first, the feed continues there, below the oldest record of
             // each collection stored here (§II-7.1). On any other PDS it
-            // ends here.
+            // ends here. Only TID keys count: a key that is not one sorts
+            // nowhere in a PDS listing's order.
             let (posts, reposts): (Option<String>, Option<String>) = sqlx::query_as(
-                "SELECT (SELECT min(rkey) FROM posts WHERE author_did = $1), \
-                        (SELECT min(split_part(uri, '/', 5)) FROM feed_items WHERE originator_did = $1 AND kind = 'repost')",
+                "SELECT (SELECT bigint_to_rkey(min(rkey)) FROM posts WHERE author = $1 AND rkey >= 0), \
+                        (SELECT bigint_to_rkey(min(src_rkey)) FROM feed_items WHERE originator = $1 AND is_repost AND src_rkey >= 0)",
             )
-            .bind(&did)
+            .bind(originator)
             .fetch_one(self.pool())
             .await?;
             out["cursor"] = json!(format!("P:{}:{}", posts.unwrap_or_default(), reposts.unwrap_or_default()));
@@ -812,7 +813,7 @@ impl Hydrator {
         // A quote post: by its stored row, or, for a post that is not
         // stored, by its record's embed.
         let uris: Vec<String> = feed.iter().filter_map(|item| did(item, "/post/uri")).collect();
-        let stored_quotes: HashSet<String> = sqlx::query_scalar("SELECT uri FROM posts WHERE uri = ANY($1) AND quote_uri IS NOT NULL")
+        let stored_quotes: HashSet<String> = sqlx::query_scalar(&format!("SELECT u.uri FROM {} WHERE p.quote_coll IS NOT NULL", crate::db::posts::rows_named(1)))
             .bind(&uris)
             .fetch_all(self.pool())
             .await?
@@ -889,12 +890,14 @@ impl Hydrator {
             metrics::counter!(METRIC_LIST_FEED_PARTIAL).increment(1);
         }
         let (at, after_uri) = parse_local_cursor(partial_cursor.or(cursor));
-        let items: Vec<FeedItem> = sqlx::query_as(
-            "SELECT f.uri, f.originator_did, f.post_uri, f.kind, f.sort_at FROM feed_items f \
-             WHERE f.originator_did = ANY($1) AND f.kind IN ('post', 'reply', 'repost') \
-               AND ($2::timestamptz IS NULL OR (f.sort_at, f.uri) < ($2, $3)) \
-             ORDER BY f.sort_at DESC, f.uri DESC LIMIT $4",
-        )
+        let items: Vec<FeedItem> = sqlx::query_as(&format!(
+            "SELECT {} FROM feed_items f \
+             WHERE f.originator = ANY(ARRAY(SELECT d.id FROM dids d WHERE d.did = ANY($1))) AND {} \
+             {} LIMIT $4",
+            crate::db::posts::FEED_ITEM_COLUMNS,
+            crate::db::posts::feed_after(2, 3),
+            crate::db::posts::FEED_ORDER,
+        ))
         .bind(&in_scope)
         .bind(at)
         .bind(after_uri.unwrap_or_default())
@@ -924,13 +927,16 @@ impl Hydrator {
             return Ok(Err(ViewError::not_ready_for(self.pool(), viewer.did.as_deref(), self.reindex_retry_secs()).await?));
         };
         let (at, after_uri) = parse_local_cursor(cursor);
-        let items: Vec<FeedItem> = sqlx::query_as(
-            "SELECT f.uri, f.originator_did, f.post_uri, f.kind, f.sort_at FROM feed_items f \
-             WHERE (f.originator_did = $1 OR f.originator_did IN (SELECT fs.did FROM follows fo JOIN dids fs ON fs.id = fo.subject \
-                                                         WHERE fo.author = (SELECT id FROM dids WHERE did = $1))) \
-               AND ($2::timestamptz IS NULL OR (f.sort_at, f.uri) < ($2, $3)) \
-             ORDER BY f.sort_at DESC, f.uri DESC LIMIT $4",
-        )
+        let items: Vec<FeedItem> = sqlx::query_as(&format!(
+            "SELECT {} FROM feed_items f \
+             WHERE (f.originator = (SELECT id FROM dids WHERE did = $1) \
+                    OR f.originator IN (SELECT fo.subject FROM follows fo WHERE fo.author = (SELECT id FROM dids WHERE did = $1))) \
+               AND {} \
+             {} LIMIT $4",
+            crate::db::posts::FEED_ITEM_COLUMNS,
+            crate::db::posts::feed_after(2, 3),
+            crate::db::posts::FEED_ORDER,
+        ))
         .bind(me)
         .bind(at)
         .bind(after_uri.unwrap_or_default())
@@ -1178,11 +1184,24 @@ impl Hydrator {
             }
         } else {
             let (at, after) = parse_local_cursor(cursor);
-            let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
-                "SELECT uri, created_at FROM posts WHERE quote_uri = $1 \
-                 AND ($2::timestamptz IS NULL OR (created_at, uri) < ($2, $3)) \
-                 ORDER BY created_at DESC, uri DESC LIMIT $4",
-            )
+            // The quoting posts: by the quoted record's key when it is whole
+            // (read first and written into the query as integers, so the
+            // planner sees how many rows it names), else by its text in
+            // `odd_refs`.
+            let rows_of = match self.whole_key(uri).await? {
+                Some((author, coll, rkey)) => {
+                    format!("posts p WHERE $1::text IS NOT NULL AND p.quote_author = {author} AND p.quote_rkey = {rkey} AND p.quote_coll = {coll}")
+                }
+                None => "odd_refs o JOIN posts p ON p.author = o.author AND p.rkey = o.rkey \
+                         WHERE o.tbl = 1 AND o.slot = 3 AND o.raw = $1 AND p.quote_coll = 0"
+                    .to_string(),
+            };
+            let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(&format!(
+                "SELECT {}, p.created_at FROM {rows_of} AND {} \
+                 ORDER BY p.created_at DESC, p.author DESC, p.rkey DESC LIMIT $4",
+                crate::db::posts::uri_sql("p"),
+                crate::db::posts::post_beyond("p", "<", 2, 3),
+            ))
             .bind(uri)
             .bind(at)
             .bind(after.unwrap_or_default())
@@ -1431,6 +1450,71 @@ mod tests {
         db.drop_db().await;
     }
 
+    /// The `P:` handoff's reposts part is the lowest TID key: a repost whose
+    /// key is not a TID sorts nowhere in a PDS listing, so it is passed over.
+    #[tokio::test]
+    async fn the_handoff_takes_tid_keys_only() {
+        use std::sync::Arc;
+
+        use crate::hydration::testing::{FixedUpstream, hydrator_with};
+
+        let Some(db) = fresh_db("hydration_handoff_tid_keys").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        post(p, ALICE, "3kbbbbbbbbbb2", "mine", None, None).await;
+        let theirs = post(p, BOB, "3kcccccccccc2", "theirs", None, None).await;
+        for rkey in ["3kaaaaaaaaaa3", "2aaa"] {
+            let repost = crate::test_support::interactions::repost(p, ALICE, rkey, &theirs).await;
+            crate::test_support::posts::put_feed_item(p, &repost, &theirs, "repost", Utc::now()).await;
+        }
+        let up = FixedUpstream { descending: true, ..FixedUpstream::default() };
+        let h = hydrator_with(p, sets(), Arc::new(up));
+        let page = h.get_author_feed(&Viewer::anonymous(), &Requester::test(), ALICE, 50, None, "posts_with_replies", false).await.expect("db").expect("view");
+        assert_eq!(page.inner()["feed"].as_array().map(Vec::len), Some(3));
+        assert_eq!(page.inner()["cursor"], json!("P:3kbbbbbbbbbb2:3kaaaaaaaaaa3"));
+        db.drop_db().await;
+    }
+
+    /// With no Constellation, `getQuotes` finds the posts quoting a record
+    /// whole by its key and an odd one by its text; a reply to a post's
+    /// threadgate (which shares the post's key) is not one of the post's
+    /// replies.
+    #[tokio::test]
+    async fn local_quotes_and_replies_match_the_collection() {
+        let Some(db) = fresh_db("hydration_local_quotes").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        actor(p, BOB, "bob.test", "Bob").await;
+        let quoted = post(p, ALICE, "3kaaaaaaaaaa2", "quoted", None, None).await;
+        let odd = format!("at://{ALICE}/com.example.thing/3kaaaaaaaaaa2");
+        let quote = |rkey: &'static str, target: &str| {
+            let record = json!({"$type": NSID_POST, "text": "a quote", "createdAt": "2026-09-26T12:00:00.000Z",
+                "embed": {"$type": "app.bsky.embed.record", "record": {"uri": target, "cid": "bafyq"}}});
+            async move { crate::hydration::testing::post_record(p, BOB, rkey, &record).await }
+        };
+        let of_post = quote("3kaaaaaaaaaa3", &quoted).await;
+        let of_odd = quote("3kaaaaaaaaaa4", &odd).await;
+        let gate = format!("at://{ALICE}/app.bsky.feed.threadgate/3kaaaaaaaaaa2");
+        let reply = post(p, BOB, "3kaaaaaaaaaa5", "a reply", Some(&quoted), Some(&quoted)).await;
+        post(p, BOB, "3kaaaaaaaaaa6", "to the gate", Some(&gate), Some(&quoted)).await;
+        let h = hydrator(p, sets());
+        let (anon, req) = (Viewer::anonymous(), Requester::test());
+        let uris = |v: &Value| -> Vec<String> { v["posts"].as_array().expect("posts").iter().map(|x| x["uri"].as_str().expect("uri").to_string()).collect() };
+        let q = h.get_quotes(&anon, &req, &quoted, 50, None).await.expect("db").expect("view");
+        assert_eq!(uris(q.inner()), [of_post]);
+        let q = h.get_quotes(&anon, &req, &odd, 50, None).await.expect("db").expect("view");
+        assert_eq!(uris(q.inner()), [of_odd]);
+        let thread = h.get_post_thread(&anon, &req, &quoted, 6, 20).await.expect("db").expect("view");
+        let replies: Vec<&str> = thread.inner()["thread"]["replies"].as_array().expect("replies").iter().filter_map(|r| r["post"]["uri"].as_str()).collect();
+        assert_eq!(replies, [reply.as_str()]);
+        db.drop_db().await;
+    }
+
     /// design-v3 §11 G-7: quoting posts not stored here come from Slingshot.
     #[tokio::test]
     async fn get_quotes_fetches_quoting_posts_it_does_not_store() {
@@ -1510,13 +1594,8 @@ mod tests {
         let detached = post(p, BOB, "3kaaaaaaaaaa3", "detached quote", None, None).await;
         let kept = post(p, BOB, "3kaaaaaaaaaa4", "kept quote", None, None).await;
         for quoting in [&detached, &kept] {
-            sqlx::query("UPDATE posts SET quote_uri = $1, embed = $2 WHERE uri = $3")
-                .bind(&quoted)
-                .bind(json!({"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "bafyq"}}))
-                .bind(quoting)
-                .execute(p)
-                .await
-                .expect("embed");
+            let embed = json!({"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "bafyq"}});
+            crate::test_support::posts::edit(p, quoting, |r| r["embed"] = embed).await;
         }
         // The valid gate detaches one quote. A gate under another record
         // key names the other, and is ignored.
@@ -1657,12 +1736,7 @@ mod tests {
         let with_gallery = post(p, BOB, "3kaaaaaaaaaa5", "gallery", None, None).await;
         let quote_gallery = post(p, BOB, "3kaaaaaaaaaa6", "quote with gallery", None, None).await;
         let set = |uri: String, embed: Value| async move {
-            sqlx::query("UPDATE posts SET embed = $1 WHERE uri = $2")
-                .bind(embed)
-                .bind(uri)
-                .execute(p)
-                .await
-                .expect("embed");
+            crate::test_support::posts::edit(p, &uri, |r| r["embed"] = embed).await;
         };
         set(images.clone(), json!({"$type": "app.bsky.embed.images", "images": [{"image": blob("bafyi1"), "alt": "i"}]})).await;
         set(video.clone(), json!({"$type": "app.bsky.embed.video", "video": blob("bafyv1")})).await;
@@ -1747,7 +1821,7 @@ mod tests {
         let mut up = crate::hydration::testing::FixedUpstream::default();
         up.posts.insert(deleted.clone(), view(&deleted));
         up.posts.insert(elsewhere.clone(), view(&elsewhere));
-        exec(p, &format!("INSERT INTO record_tombstones (uri, rev) VALUES ('{deleted}', '3kaaaaaaaaaa9')")).await;
+        crate::test_support::posts::tombstone(p, &deleted, "3kaaaaaaaaaa9").await;
         let h = crate::hydration::testing::hydrator_with(p, sets(), std::sync::Arc::new(up));
         let v = h
             .get_posts(&Viewer::anonymous(), &Requester::test(), &[deleted.clone(), elsewhere.clone()])
@@ -1773,12 +1847,9 @@ mod tests {
         actor(p, BOB, "bob.test", "Bob").await;
         let marked = post(p, BOB, "3kself222222", "spicy", None, None).await;
         let plain = post(p, BOB, "3kplain22222", "plain", None, None).await;
-        exec(
-            p,
-            &format!(
-                "UPDATE posts SET record = record || '{{\"labels\": {{\"$type\": \"com.atproto.label.defs#selfLabels\", \"values\": [{{\"val\": \"porn\"}}]}}}}'::jsonb WHERE uri = '{marked}'"
-            ),
-        )
+        crate::test_support::posts::edit(p, &marked, |r| {
+            r["labels"] = json!({"$type": "com.atproto.label.defs#selfLabels", "values": [{"val": "porn"}]});
+        })
         .await;
         let h = hydrator(p, sets());
         let v = h.get_posts(&Viewer::anonymous(), &Requester::test(), &[marked.clone(), plain.clone()]).await.expect("db").expect("view");
@@ -1903,11 +1974,10 @@ mod tests {
         // his quote post.
         exec(p, "DELETE FROM mutes").await;
         let quote = post(p, BOB, "3kaaaaaaaaaa6", "quoting", None, None).await;
-        exec(p, &format!("UPDATE posts SET quote_uri = '{reply}' WHERE uri = '{quote}'")).await;
-        exec(p, &format!(
-            "INSERT INTO feed_items (uri, originator_did, post_uri, kind, sort_at) VALUES \
-             ('at://{BOB}/app.bsky.feed.repost/1', '{BOB}', '{reply}', 'repost', now())"
-        )).await;
+        let embed = json!({"$type": "app.bsky.embed.record", "record": {"uri": reply, "cid": "bafyreply"}});
+        crate::test_support::posts::edit(p, &quote, |r| r["embed"] = embed).await;
+        let repost = format!("at://{BOB}/app.bsky.feed.repost/1");
+        crate::test_support::posts::put_feed_item(p, &repost, &reply, "repost", chrono::Utc::now()).await;
         let kinds = |v: &Value| -> Vec<(String, bool)> {
             v["feed"]
                 .as_array()
@@ -1943,10 +2013,9 @@ mod tests {
         let k = kinds(tl.inner());
         assert_eq!(k.len(), 2, "{k:?}");
         assert!(k.iter().any(|(u, _)| *u == root) && k.iter().any(|(u, _)| *u == reply));
-        exec(p, &format!(
-            "DELETE FROM feed_items WHERE uri = 'at://{BOB}/app.bsky.feed.repost/1' OR post_uri = '{quote}'"
-        )).await;
-        exec(p, &format!("DELETE FROM posts WHERE uri = '{quote}'")).await;
+        crate::test_support::posts::delete_feed_item(p, &repost).await;
+        crate::test_support::posts::delete_feed_item(p, &quote).await;
+        exec(p, &format!("DELETE FROM posts WHERE {}", crate::test_support::posts::key_is("", &quote))).await;
 
         // Paging.
         exec(p, "DELETE FROM mutes").await;

@@ -64,7 +64,7 @@ async fn write(w: &Writer) {
         create("app.bsky.feed.like", "3klike", json!({"$type": "app.bsky.feed.like", "subject": {"uri": parent, "cid": CID}, "createdAt": "2026-10-22T00:00:00.000Z"})),
         create("app.bsky.graph.follow", "3kfollow", json!({"$type": "app.bsky.graph.follow", "subject": MEMBER, "createdAt": "2026-10-22T00:00:00.000Z"})),
     ];
-    w.apply(SUBJECT, "3krev0000000a", &ops, options(WriteSource::Firehose)).await.expect("apply");
+    w.apply(SUBJECT, "3krev2222222a", &ops, options(WriteSource::Firehose)).await.expect("apply");
 }
 
 async fn list(h: &Hydrator, viewer: &Viewer, member: bool) -> Value {
@@ -91,7 +91,7 @@ async fn t11_written_from_the_stream_and_read_by_members() {
     assert_eq!(count(p, "SELECT count(*) FROM refract_notifications WHERE recipient_did = 'did:plc:memberaaaaaaaaaaaaaaaaaa'").await, 3);
     assert_eq!(count(p, "SELECT count(*) FROM notifications").await, 0);
     let backfilled = create("app.bsky.feed.repost", "3krepost", json!({"$type": "app.bsky.feed.repost", "subject": {"uri": member_post(), "cid": CID}, "createdAt": "2026-10-22T00:00:00.000Z"}));
-    w.apply(SUBJECT, "3krev0000000b", &[backfilled], options(WriteSource::Backfill)).await.expect("apply");
+    w.apply(SUBJECT, "3krev2222222b", &[backfilled], options(WriteSource::Backfill)).await.expect("apply");
     assert_eq!(count(p, "SELECT count(*) FROM refract_notifications").await, 3, "a backfill notifies nobody");
     let h = hydrator_with(p, sets(PublicMode::Off), Arc::new(FixedUpstream::default()));
     let me = Viewer { did: Some(MEMBER.into()), hydrate: true };
@@ -107,7 +107,7 @@ async fn t11_written_from_the_stream_and_read_by_members() {
     assert_eq!(unread(&h, &stranger, false).await, 0);
     // A delete takes its row with it.
     let delete = RawOp { action: Action::Delete, collection: "app.bsky.feed.like".into(), rkey: "3klike".into(), cid: None, record: None };
-    w.apply(SUBJECT, "3krev0000000c", &[delete], options(WriteSource::Firehose)).await.expect("delete");
+    w.apply(SUBJECT, "3krev2222222c", &[delete], options(WriteSource::Firehose)).await.expect("delete");
     assert_eq!(count(p, "SELECT count(*) FROM refract_notifications").await, 2);
     db.drop_db().await;
 }

@@ -111,9 +111,7 @@ async fn in_scope(pool: &PgPool, dids: &[&str]) {
 }
 
 fn feed_sql(n: usize) -> String {
-    (1..=n)
-        .map(|i| format!("INSERT INTO feed_items (uri, originator_did, post_uri, kind, sort_at) VALUES ('at://{B}/app.bsky.feed.post/f{i}', '{B}', 'at://{B}/app.bsky.feed.post/f{i}', 'post', now());"))
-        .collect()
+    (1..=n).map(|i| crate::test_support::posts::feed_item_sql(B, &crate::test_support::posts::tid(i))).collect()
 }
 
 fn op(collection: &str, rkey: &str, record: Value) -> RawOp {
@@ -149,7 +147,7 @@ async fn s1_an_upgrade_stays_on() {
         return;
     };
     let p = &db.pool;
-    exec(p, &format!("INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at) VALUES ('at://{B}/app.bsky.feed.post/1', '{B}', '1', 'c', '3k', '{{}}', now())")).await;
+    exec(p, &crate::test_support::posts::row_sql(B, "1")).await;
     let (pi, scope) = boot(p, settings()).await;
     assert_eq!(pi.startup(&file(Some(PublicScope::KryphocronOnly))).await.expect("startup"), None);
     let (value, file_value, by) = setting(p).await;
@@ -299,7 +297,7 @@ async fn bad_sweep_states_reset_and_complete() {
     let at = rfc3339(&now());
     for bad in [
         json!({"table": "no_such_table", "after": null, "last_advanced_at": at}),
-        json!({"table": "posts", "after": 7, "last_advanced_at": at}),
+        json!({"table": "threadgates", "after": 7, "last_advanced_at": at}),
         json!({"table": "notifications", "after": "7", "last_advanced_at": at}),
         json!({"table": "tag_activity_hourly", "after": ["rust"], "last_advanced_at": at}),
     ] {
@@ -572,7 +570,7 @@ fn sweep_seed() -> String {
         }
     }
     for (did, r) in [(B, "p1"), (B, "p2"), (MEMBER, "p3")] {
-        sql += &format!("INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at) VALUES ('{}', '{did}', '{r}', 'c', '3k', '{{}}', now());", post(did, r));
+        sql += &crate::test_support::posts::row_sql(did, r);
     }
     for t in ["threadgates", "postgates"] {
         sql += &format!("INSERT INTO {t} (uri, author_did, rkey, cid, rev, post_uri, record, created_at) VALUES ('at://{B}/app.bsky.feed.{t}/1', '{B}', '1', 'c', '3k', '{}', '{{}}', now());", post(B, "p1"));
@@ -604,7 +602,7 @@ fn sweep_seed() -> String {
     sql += &graph_row_sql("blocks", B, MEMBER, "1");
     sql += &format!("INSERT INTO actors (did, display_name) VALUES ('{B}', 'b'), ('{MEMBER}', 'm');");
     sql += &format!("INSERT INTO labels (subject, val) VALUES ('{B}', 'porn');");
-    sql += &format!("INSERT INTO record_tombstones (uri, rev) VALUES ('{}', '3k');", post(B, "gone"));
+    sql += &crate::test_support::posts::tombstone_sql(&post(B, "gone"), "3kaaaaaaaaaaa");
     sql += &format!("INSERT INTO member_post_refs (uri, author_did, rev, created_at) VALUES ('{}', '{MEMBER}', '3k', now());", post(MEMBER, "p3"));
     sql += &format!("INSERT INTO mutes (viewer_did, subject_did) VALUES ('{MEMBER}', '{B}');");
     sql
@@ -679,6 +677,7 @@ async fn the_sweep_empties_and_thins_every_table() {
                         Key::Id => stored.is_i64(),
                         Key::TagHour => stored.as_array().is_some_and(|a| a.len() == 2 && a[0].is_string() && parse_ts(&a[1]).is_some()),
                         Key::AuthorRkey => stored.as_array().is_some_and(|a| a.len() == 2 && a[0].is_i64() && a[1].is_i64()),
+                        Key::FeedItem => stored.as_array().is_some_and(|a| a.len() == 3 && a[0].is_i64() && a[1].is_boolean() && a[2].is_i64()),
                     };
                     assert!(ok, "{name}: cursor {stored}");
                 }
@@ -736,7 +735,15 @@ async fn a_concurrent_delete_never_ends_a_table() {
     let (reached, resume) = pi.hooks.arm("sweep_window");
     drop(pi.spawn(task));
     reached.notified().await;
-    exec(p, &format!("DELETE FROM feed_items WHERE uri IN ('at://{B}/app.bsky.feed.post/f1', 'at://{B}/app.bsky.feed.post/f2')")).await;
+    exec(
+        p,
+        &format!(
+            "DELETE FROM feed_items WHERE originator = (SELECT id FROM dids WHERE did = '{B}') AND src_rkey IN ({}, {})",
+            crate::test_support::posts::key_sql(B, &crate::test_support::posts::tid(1)),
+            crate::test_support::posts::key_sql(B, &crate::test_support::posts::tid(2))
+        ),
+    )
+    .await;
     resume.notify_one();
     eventually("off", async || scope.public_mode() == PublicMode::Off).await;
     assert_eq!(count(p, "SELECT count(*) FROM feed_items").await, 0);

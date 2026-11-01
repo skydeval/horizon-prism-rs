@@ -527,3 +527,208 @@ async fn aliases_are_per_author_and_negative() {
     }
     db.drop_db().await;
 }
+
+/// Migration 0057: posts, their search rows, feed items and tombstones are
+/// keyed by ids; references are whole or odd (their text in `odd_refs`,
+/// their author kept when it is a valid DID); records and CIDs are kept in
+/// their exact text form; the embed kind agrees with `db::posts`; search rows
+/// are kept for S and members only; feed items of anything but a whole post
+/// and tombstones outside the fixed collections are dropped; the triggers
+/// work on the new keys.
+#[tokio::test]
+async fn migration_0057_moves_posts_feed_items_and_tombstones() {
+    use serde_json::{Value, json};
+
+    let Some(db) = crate::test_support::empty_db("migration_0057").await else { return };
+    let p = &db.pool;
+    let migrations: Vec<_> = crate::db::migrations::MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()).collect();
+    let at = migrations.iter().position(|m| m.version == 57).expect("0057");
+    for m in &migrations[..at] {
+        sqlx::raw_sql(&m.sql).execute(p).await.unwrap_or_else(|e| panic!("{}: {e}", m.version));
+    }
+    let post = |did: &str, rkey: &str| format!("at://{did}/app.bsky.feed.post/{rkey}");
+    let canonical = "bafyreidbcoifjdzsr3u5i74kbm427m5yic67grd54s4luhlt4xxntevd6m";
+    sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 1)").bind(A).execute(p).await.expect("scope");
+    let old_post = |uri: String, author: &'static str, rkey: &'static str, rev: &'static str, refs: (Option<String>, Option<String>, Option<String>), embed: Option<Value>| {
+        let (root, parent, quote) = refs;
+        async move {
+            let record = json!({"$type": "app.bsky.feed.post", "text": format!("text of {rkey}"), "embed": embed.clone()});
+            sqlx::query(
+                "INSERT INTO posts (uri, author_did, rkey, cid, rev, text, reply_root_uri, reply_parent_uri, quote_uri, embed, \
+                   mention_dids, record, created_at, tags) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, '2026-10-01T00:00:00Z', ARRAY['cats'])",
+            )
+            .bind(&uri)
+            .bind(author)
+            .bind(rkey)
+            .bind(canonical)
+            .bind(rev)
+            .bind(format!("text of {rkey}"))
+            .bind(root)
+            .bind(parent)
+            .bind(quote)
+            .bind(embed)
+            .bind(vec![B.to_string(), "not a did".to_string()])
+            .bind(&record)
+            .execute(p)
+            .await
+            .expect("old post");
+            record
+        }
+    };
+    let whole = (Some(post(B, "3myp5txuf7s2e")), Some(post(B, "3myp5txuf7s2e")), Some(format!("at://{B}/app.bsky.graph.list/3myp5txuf7s2d")));
+    let rwm = json!({"$type": "app.bsky.embed.recordWithMedia", "media": {"$type": "app.bsky.embed.images"}});
+    let first = old_post(post(A, "3myp5txuf7s2d"), A, "3myp5txuf7s2d", "3myp5txuf7s2d", whole, Some(rwm.clone())).await;
+    let odd_parent = format!("at://{B}/com.example.thing/1");
+    let odd_root = "at://alice.example/app.bsky.feed.post/3myp5txuf7s2e".to_string();
+    old_post(post(A, "self"), A, "self", "not-a-tid", (Some(odd_root.clone()), Some(odd_parent.clone()), None), None).await;
+    old_post(post(B, "3myp5txuf7s2e"), B, "3myp5txuf7s2e", "3myp5txuf7s2e", (None, None, None), None).await;
+    // Not keyable: a URI that is not its author's own record.
+    old_post(post(B, "3myp5txuf7s2f"), A, "3myp5txuf7s2f", "3myp5txuf7s2f", (None, None, None), None).await;
+    // Each embed kind, by B (in neither S nor members: no search row).
+    let embeds = [
+        json!({"$type": "app.bsky.embed.images"}),
+        json!({"$type": "app.bsky.embed.video"}),
+        json!({"$type": "app.bsky.embed.gallery"}),
+        json!({"$type": "app.bsky.embed.external"}),
+        json!({"$type": "app.bsky.embed.record"}),
+        json!({"$type": "app.bsky.embed.recordWithMedia", "media": {"$type": "app.bsky.embed.video"}}),
+        json!({"$type": "app.bsky.embed.recordWithMedia", "media": {"$type": "app.bsky.embed.gallery"}}),
+        json!({"$type": "app.bsky.embed.recordWithMedia", "media": {"$type": "app.bsky.embed.external"}}),
+        json!({"$type": "app.bsky.embed.recordWithMedia"}),
+        json!({"$type": "app.example.other"}),
+    ];
+    let embed_rkeys = ["3myp5txuf7s3a", "3myp5txuf7s3b", "3myp5txuf7s3c", "3myp5txuf7s3d", "3myp5txuf7s3e", "3myp5txuf7s3f", "3myp5txuf7s3g", "3myp5txuf7s3h", "3myp5txuf7s3i", "3myp5txuf7s3j"];
+    for (rkey, embed) in embed_rkeys.iter().zip(&embeds) {
+        old_post(post(B, rkey), B, rkey, "3myp5txuf7s2d", (None, None, None), Some(embed.clone())).await;
+    }
+    let repost = format!("at://{A}/app.bsky.feed.repost/3myp5txuf7s2f");
+    for (uri, post_uri, kind) in [
+        (post(A, "3myp5txuf7s2d"), post(A, "3myp5txuf7s2d"), "reply"),
+        (repost.clone(), post(B, "3myp5txuf7s2e"), "repost"),
+        (format!("at://{A}/app.bsky.feed.repost/3myp5txuf7s2g"), format!("at://{B}/app.bsky.graph.list/3myp5txuf7s2d"), "repost"),
+    ] {
+        sqlx::query("INSERT INTO feed_items (uri, originator_did, post_uri, kind, sort_at) VALUES ($1, $2, $3, $4, now())")
+            .bind(uri)
+            .bind(A)
+            .bind(post_uri)
+            .bind(kind)
+            .execute(p)
+            .await
+            .expect("old feed item");
+    }
+    for (uri, rev) in [
+        (post(A, "3myp5txuf7s2z"), "3myp5txuf7s2z"),
+        (format!("at://{A}/app.bsky.actor.profile/self"), "3myp5txuf7s2y"),
+        (format!("at://{A}/com.example.thing/1"), "3myp5txuf7s2x"),
+    ] {
+        sqlx::query("INSERT INTO record_tombstones (uri, rev) VALUES ($1, $2)").bind(uri).bind(rev).execute(p).await.expect("old tombstone");
+    }
+
+    sqlx::raw_sql(&migrations[at].sql).execute(p).await.expect("0057 applies over existing rows");
+
+    type Row = (String, String, i16, Option<String>, Option<String>, Option<String>, Option<i16>, Option<i16>, Option<i16>, Option<i32>, Vec<u8>, Vec<u8>, Option<Vec<i32>>);
+    let row = |uri: String| async move {
+        let r: Row = sqlx::query_as(
+            "SELECT at_uri(p.author, 1::smallint, p.rkey), bigint_to_rev(p.rev), p.embed_kind, \
+               ref_text(p.root_author, p.root_coll, p.root_rkey, 1::smallint, p.author, p.rkey, 1::smallint), \
+               ref_text(p.parent_author, p.parent_coll, p.parent_rkey, 1::smallint, p.author, p.rkey, 2::smallint), \
+               ref_text(p.quote_author, p.quote_coll, p.quote_rkey, 1::smallint, p.author, p.rkey, 3::smallint), \
+               p.root_coll, p.parent_coll, p.quote_coll, p.parent_author, p.cid, p.record, p.mention_ids \
+             FROM posts p, ref_of($1) k WHERE p.author = k.author AND p.rkey = k.rkey",
+        )
+        .bind(uri)
+        .fetch_one(p)
+        .await
+        .expect("post row");
+        r
+    };
+    let id = |did: &'static str| async move { sqlx::query_scalar::<_, i32>("SELECT id FROM dids WHERE did = $1").bind(did).fetch_one(p).await.expect("id") };
+    let (a, b) = (id(A).await, id(B).await);
+    let text = |s: &str| [&[0u8][..], s.as_bytes()].concat();
+
+    let r = row(post(A, "3myp5txuf7s2d")).await;
+    assert_eq!((r.0.as_str(), r.1.as_str(), r.2), (post(A, "3myp5txuf7s2d").as_str(), "3myp5txuf7s2d", crate::db::posts::embed_kind(Some(&rwm))));
+    assert_eq!((r.3, r.4, r.5), (Some(post(B, "3myp5txuf7s2e")), Some(post(B, "3myp5txuf7s2e")), Some(format!("at://{B}/app.bsky.graph.list/3myp5txuf7s2d"))));
+    assert_eq!((r.6, r.7, r.8, r.9), (Some(1), Some(1), Some(7), Some(b)));
+    assert_eq!(r.10, text(canonical), "the CID in its exact text form");
+    assert_eq!(r.11[0], 0, "the record as dict 0");
+    let stored: Value = serde_json::from_slice(&r.11[1..]).expect("record JSON");
+    assert_eq!(stored, first);
+    assert_eq!(r.12, Some(vec![b]), "a mention that is not a valid DID is dropped");
+
+    // Odd references: their text in `odd_refs`, the author kept when the
+    // authority is a valid DID; a rev that is not a TID is the lowest.
+    let r = row(post(A, "self")).await;
+    assert_eq!((r.1.as_str(), r.3, r.4, r.5), ("2222222222222", Some(odd_root.clone()), Some(odd_parent.clone()), None));
+    assert_eq!((r.6, r.7, r.8, r.9), (Some(0), Some(0), None, Some(b)));
+    let odd: Vec<(i16, i16, String)> = sqlx::query_as("SELECT tbl, slot, raw FROM odd_refs ORDER BY tbl, slot").fetch_all(p).await.expect("odd");
+    assert_eq!(odd, [(1, 1, odd_root.clone()), (1, 2, odd_parent.clone())]);
+
+    // Every embed kind, as `db::posts` names it.
+    for (rkey, embed) in embed_rkeys.iter().zip(&embeds) {
+        assert_eq!(row(post(B, rkey)).await.2, crate::db::posts::embed_kind(Some(embed)), "{embed}");
+    }
+    let posts: i64 = sqlx::query_scalar("SELECT count(*) FROM posts").fetch_one(p).await.expect("posts");
+    assert_eq!(posts, 13, "the unkeyable row is left out");
+
+    // Search rows for S's posts only, the text vector filled.
+    let search: Vec<(String, Vec<String>, bool)> = sqlx::query_as(
+        "SELECT at_uri(author, 1::smallint, rkey), tags, search_tsv @@ to_tsquery('simple', 'text') FROM post_search ORDER BY 1",
+    )
+    .fetch_all(p)
+    .await
+    .expect("search");
+    assert_eq!(
+        search,
+        [(post(A, "3myp5txuf7s2d"), vec!["cats".to_string()], true), (post(A, "self"), vec!["cats".to_string()], true)]
+    );
+
+    // Feed items of whole posts only.
+    let items: Vec<(i32, bool, i16, String)> = sqlx::query_as(
+        "SELECT originator, is_repost, kind, at_uri(post_author, 1::smallint, post_rkey) FROM feed_items ORDER BY kind",
+    )
+    .fetch_all(p)
+    .await
+    .expect("feed items");
+    assert_eq!(items, [(a, false, 2, post(A, "3myp5txuf7s2d")), (a, true, 3, post(B, "3myp5txuf7s2e"))]);
+
+    // Tombstones in the fixed collections, an alias for `self`.
+    let tombstones: Vec<(String, String)> =
+        sqlx::query_as("SELECT at_uri(author, coll, rkey), bigint_to_rev(rev) FROM record_tombstones ORDER BY 1").fetch_all(p).await.expect("tombstones");
+    assert_eq!(
+        tombstones,
+        [(format!("at://{A}/app.bsky.actor.profile/self"), "3myp5txuf7s2y".to_string()), (post(A, "3myp5txuf7s2z"), "3myp5txuf7s2z".to_string())]
+    );
+
+    // The triggers: a new reply counts toward its parent; a deleted post
+    // takes its odd texts and its search row with it.
+    let liked_rkey = rkey_value("3myp5txuf7s2e").expect("tid");
+    let replies = || async move {
+        sqlx::query_scalar::<_, Option<i32>>("SELECT reply_count FROM post_counts WHERE author = $1 AND rkey = $2")
+            .bind(b)
+            .bind(liked_rkey)
+            .fetch_optional(p)
+            .await
+            .expect("count")
+            .flatten()
+            .unwrap_or(0)
+    };
+    let before = replies().await;
+    sqlx::query(
+        "INSERT INTO posts (author, rkey, cid, rev, created_at, parent_author, parent_coll, parent_rkey, record) \
+         VALUES ($1, $2, '\\x00'::bytea, 0, now(), $3, 1, $4, '\\x007b7d'::bytea)",
+    )
+    .bind(a)
+    .bind(rkey_value("3myp5txuf7s4a").expect("tid"))
+    .bind(b)
+    .bind(liked_rkey)
+    .execute(p)
+    .await
+    .expect("reply");
+    assert_eq!(replies().await, before + 1);
+    sqlx::query("DELETE FROM posts p USING ref_of($1) k WHERE p.author = k.author AND p.rkey = k.rkey").bind(post(A, "self")).execute(p).await.expect("delete");
+    let left: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM odd_refs), (SELECT count(*) FROM post_search)").fetch_one(p).await.expect("left");
+    assert_eq!(left, (0, 1));
+    db.drop_db().await;
+}

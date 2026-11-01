@@ -520,16 +520,11 @@ mod tests {
         let gone_id: String = add("app.bsky.feed.post/gone").query_async(&mut redis).await.expect("xadd");
         let r = done(run(&exec, p, AdminCommand::DeadletterReplay { id: keep_id.clone() }).await);
         assert_eq!(r["status"], "indexed", "{r}");
-        let text: String = sqlx::query_scalar("SELECT text FROM posts WHERE uri = $1")
-            .bind(format!("at://{MEMBER}/app.bsky.feed.post/keep"))
-            .fetch_one(p)
-            .await
-            .expect("replayed post");
-        assert_eq!(text, "replayed");
+        let text = crate::test_support::posts::text(p, &format!("at://{MEMBER}/app.bsky.feed.post/keep")).await;
+        assert_eq!(text.as_deref(), Some("replayed"));
         let r = done(run(&exec, p, AdminCommand::DeadletterReplay { id: gone_id.clone() }).await);
         assert_eq!(r["status"], "deleted", "{r}");
-        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM posts WHERE uri = $1").bind(&gone).fetch_one(p).await.expect("count");
-        assert_eq!(left, 0);
+        assert!(!crate::test_support::posts::stored(p, &gone).await);
         // Replay leaves the entry listed (§5.9); drop removes it.
         let len: i64 = redis::cmd("XLEN").arg(&stream).query_async(&mut redis).await.expect("xlen");
         assert_eq!(len, 2);

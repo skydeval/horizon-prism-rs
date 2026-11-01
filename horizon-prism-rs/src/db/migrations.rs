@@ -241,8 +241,8 @@ mod tests {
         }
     }
 
-    /// Migration 0016's triggers (design-v3 §7.5): `tag_activity_hourly`
-    /// follows posts, replies, likes and reposts.
+    /// The tag triggers: `tag_activity_hourly` follows
+    /// posts (their search rows), replies, likes and reposts.
     #[tokio::test]
     async fn tag_activity_follows_posts_and_engagement() {
         let Some(db) = crate::test_support::fresh_db("tag_activity_triggers").await else {
@@ -250,11 +250,14 @@ mod tests {
         };
         let p = &db.pool;
         let exec = |sql: String| async move { sqlx::query(&sql).execute(p).await.unwrap_or_else(|e| panic!("{sql}: {e}")) };
-        let post = |rkey: &str, tags: &str, age: &str, parent: &str| {
-            format!(
-                "INSERT INTO posts (uri, author_did, rkey, cid, rev, record, created_at, tags, reply_parent_uri) VALUES \
-                 ('at://did:plc:a/app.bsky.feed.post/{rkey}', 'did:plc:a', '{rkey}', 'c', '3k', '{{}}', now() - interval '{age}', {tags}, {parent})"
-            )
+        let post = |rkey: &'static str, tags: &'static [&'static str], minutes: i64, parent: Option<&'static str>| async move {
+            let mut record = serde_json::json!({"$type": "app.bsky.feed.post", "text": "", "tags": tags, "createdAt": "2026-01-01T00:00:00Z"});
+            if let Some(rkey) = parent {
+                let uri = format!("at://did:plc:a/app.bsky.feed.post/{rkey}");
+                record["reply"] = serde_json::json!({"parent": {"uri": uri, "cid": "c"}, "root": {"uri": uri, "cid": "c"}});
+            }
+            let at = chrono::Utc::now() - chrono::TimeDelta::minutes(minutes);
+            crate::test_support::posts::put(p, "did:plc:a", rkey, &record, Some(at)).await
         };
         let engage = |table: &str, rkey: &str, subject: &str| {
             crate::test_support::interactions::row_sql(table, "did:plc:b", rkey, &format!("at://did:plc:a/app.bsky.feed.post/{subject}"), "now()")
@@ -272,14 +275,14 @@ mod tests {
         };
         let row = |tag: &str, n: (i64, i64, i64, i64)| (tag.to_string(), n.0, n.1, n.2, n.3);
 
-        exec(post("root", "ARRAY['cats','rust']", "1 minute", "NULL")).await;
+        let root = post("root", &["cats", "rust"], 1, None).await;
         // A post with no tags, and one too old to aggregate.
-        exec(post("plain", "NULL", "1 minute", "NULL")).await;
-        exec(post("old", "ARRAY['old']", "100 hours", "NULL")).await;
+        post("plain", &[], 1, None).await;
+        post("old", &["old"], 100 * 60, None).await;
         assert_eq!(totals().await, [row("cats", (1, 0, 0, 0)), row("rust", (1, 0, 0, 0))]);
 
         // A reply counts for its parent's tags and for its own.
-        exec(post("reply", "ARRAY['rust']", "0 minutes", "'at://did:plc:a/app.bsky.feed.post/root'")).await;
+        let reply = post("reply", &["rust"], 0, Some("root")).await;
         exec(engage("likes", "l1", "root")).await;
         exec(engage("likes", "l2", "root")).await;
         exec(engage("reposts", "r1", "root")).await;
@@ -290,11 +293,11 @@ mod tests {
 
         // Deletes take their contribution back.
         exec("DELETE FROM likes l USING ref_of('at://did:plc:b/app.bsky.feed.like/l1') r WHERE l.author = r.author AND l.rkey = r.rkey".into()).await;
-        exec("DELETE FROM posts WHERE rkey = 'reply'".into()).await;
+        exec(format!("DELETE FROM posts WHERE {}", crate::test_support::posts::key_is("", &reply))).await;
         assert_eq!(totals().await, [row("cats", (1, 1, 1, 0)), row("rust", (1, 1, 1, 0))]);
 
         // Retagging a post moves its own count.
-        exec("UPDATE posts SET tags = ARRAY['dogs','rust'] WHERE rkey = 'root'".into()).await;
+        exec(format!("UPDATE post_search SET tags = ARRAY['dogs','rust'] WHERE {}", crate::test_support::posts::key_is("", &root))).await;
         assert_eq!(
             totals().await,
             [row("cats", (0, 1, 1, 0)), row("dogs", (1, 0, 0, 0)), row("rust", (1, 1, 1, 0))]

@@ -2195,12 +2195,7 @@ async fn private_videos_in(mode: PublicMode, test: &str) {
     // A stored public post with a video, quoted by a private post.
     let public = crate::hydration::testing::post(&f.pool, CAROL, "3kpublicvid2", "public video", None, None).await;
     let public_video = json!({"$type": "app.bsky.embed.video", "video": blob("bafypublic")});
-    sqlx::query("UPDATE posts SET embed = $1 WHERE uri = $2")
-        .bind(&public_video)
-        .bind(&public)
-        .execute(&f.pool)
-        .await
-        .expect("embed");
+    crate::test_support::posts::edit(&f.pool, &public, |r| r["embed"] = public_video).await;
     // By Dave, so it stays out of Alice's feed and Bob's timeline, whose
     // bodies must name no CDN.
     let dave_aud = f.audience(DAVE, "3kauddave222", Some("list"), &[BOB]).await;

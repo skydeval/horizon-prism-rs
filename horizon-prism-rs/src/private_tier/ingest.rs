@@ -933,7 +933,8 @@ const INSERT_NOTIFICATION: &str = "INSERT INTO private_notifications \
        AND NOT EXISTS (SELECT 1 FROM thread_mutes t WHERE t.viewer_did = $1 AND t.root_uri IN ( \
              $5::text, $7::text, $4::text, \
              (SELECT p.reply_root_uri FROM private_posts p WHERE p.uri = $4::text), \
-             (SELECT p.reply_root_uri FROM posts p WHERE p.uri = $4::text))) \
+             (SELECT ref_text(p.root_author, p.root_coll, p.root_rkey, 1::smallint, p.author, p.rkey, 1::smallint) \
+                FROM posts p, ref_of($4::text) k WHERE k.coll = 1 AND p.author = k.author AND p.rkey = k.rkey))) \
      ON CONFLICT DO NOTHING RETURNING id";
 
 /// Insert one private notification ([`INSERT_NOTIFICATION`]); a new row of

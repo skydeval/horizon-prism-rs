@@ -302,7 +302,8 @@ async fn resolve_marks_by_the_ladder_step() {
     // a label batch.
     let stored_quoted = post(p, AUTHOR, "3kstoredq222", "stored quoted", None, None).await;
     let local = post(p, AUTHOR, "3klocalq2222", "local quote", None, None).await;
-    exec(p, &format!("UPDATE posts SET quote_uri = '{stored_quoted}', embed = '{{\"$type\": \"app.bsky.embed.record\", \"record\": {{\"uri\": \"{stored_quoted}\", \"cid\": \"bafy3kstoredq222\"}}}}'::jsonb WHERE uri = '{local}'")).await;
+    let embed = json!({"$type": "app.bsky.embed.record", "record": {"uri": stored_quoted, "cid": "bafy3kstoredq222"}});
+    crate::test_support::posts::edit(p, &local, |r| r["embed"] = embed).await;
     let plain = post(p, AUTHOR, "3kplain22222", "plain", None, None).await;
     // Not stored: QUOTED's post quoting the stored quote post.
     let remote = at(QUOTED, "3kremote2222");
@@ -369,7 +370,8 @@ async fn stubs_and_the_emit_branch_decide_upstream() {
     let quoted = post(p, AUTHOR, "3kstoredq222", "stored quoted", None, None).await;
     // A stored reply quoting a stored post, and one only the AppView has.
     let stored = post(p, R2, "3kstored2222", "stored reply", Some(&anchor), Some(&anchor)).await;
-    exec(p, &format!("UPDATE posts SET quote_uri = '{quoted}', embed = '{{\"$type\": \"app.bsky.embed.record\", \"record\": {{\"uri\": \"{quoted}\", \"cid\": \"bafy3kstoredq222\"}}}}'::jsonb WHERE uri = '{stored}'")).await;
+    let embed = json!({"$type": "app.bsky.embed.record", "record": {"uri": quoted, "cid": "bafy3kstoredq222"}});
+    crate::test_support::posts::edit(p, &stored, |r| r["embed"] = embed).await;
     let fetched = at(QUOTED, "3kfetched222");
     let stub = |uri: &str| json!({"$type": "app.bsky.feed.defs#notFoundPost", "uri": uri, "notFound": true});
     let fake = Arc::new(Fake::default());

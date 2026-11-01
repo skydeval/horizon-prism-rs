@@ -186,7 +186,8 @@ pub struct Stored {
     pub uri: String,
     pub created_at: DateTime<Utc>,
     /// After the request's `Local` cursor position, by the database's own
-    /// `(created_at, uri)` order (as `lens_local_replies` compares it).
+    /// `(created_at, author, rkey)` order (as `lens_local_replies` compares
+    /// it).
     pub after_cursor: bool,
 }
 
@@ -198,7 +199,8 @@ pub struct Tree {
     /// Each region node's outline children (live or deleted), in
     /// `(created_at, uri)` order on the URI's bytes.
     pub children: HashMap<String, Vec<Child>>,
-    /// Each region node's stored replies, in `(created_at, uri)` order.
+    /// Each region node's stored replies, in `(created_at, author, rkey)`
+    /// order.
     pub stored: HashMap<String, Vec<Stored>>,
     /// The posts stored here among the walk and the region.
     pub local: HashSet<String>,
@@ -323,12 +325,25 @@ const ORPHAN_SQL: &str = "SELECT count(*), coalesce(bool_or(c.parent_author IS N
 const HOLES_SQL: &str = "SELECT EXISTS (SELECT 1 FROM outline_holes h \
        JOIN unnest($1::int4[], $2::int8[]) AS k(author, rkey) ON h.author = k.author AND h.rkey = k.rkey)";
 
-/// Step 7: the stored replies of the region's posts, and the walk's own
-/// rows, in `(created_at, uri)` order, bounded.
-const STORED_SQL: &str = "SELECT uri, reply_parent_uri, created_at, indexed_at, \
-            ($3::timestamptz IS NOT NULL AND (created_at, uri) > ($3::timestamptz, $4::text)) AS after_cursor \
-       FROM posts WHERE reply_parent_uri = ANY($1) OR uri = ANY($2) \
-      ORDER BY created_at, uri LIMIT $5";
+/// Step 7: the stored replies of the region's posts (a reply names its
+/// parent by key, and only a post's), and the walk's own rows, in
+/// `(created_at, author, rkey)` order, bounded.
+const STORED_SQL: &str = "SELECT at_uri(p.author, 1::smallint, p.rkey) AS uri, \
+            ref_text(p.parent_author, p.parent_coll, p.parent_rkey, 1::smallint, p.author, p.rkey, 2::smallint) AS reply_parent_uri, \
+            p.created_at, p.indexed_at, \
+            ($3::timestamptz IS NOT NULL AND (p.created_at, p.author, p.rkey) > ($3::timestamptz, \
+               COALESCE((SELECT r.author FROM ref_of($4::text) r), 2147483647), \
+               COALESCE((SELECT r.rkey FROM ref_of($4::text) r), 9223372036854775807::bigint))) AS after_cursor \
+       FROM ( \
+         SELECT c.author, c.rkey, c.parent_author, c.parent_coll, c.parent_rkey, c.created_at, c.indexed_at \
+           FROM unnest($1::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) k \
+           JOIN posts c ON c.parent_author = k.author AND c.parent_rkey = k.rkey AND c.parent_coll = 1 WHERE k.coll = 1 \
+         UNION \
+         SELECT c.author, c.rkey, c.parent_author, c.parent_coll, c.parent_rkey, c.created_at, c.indexed_at \
+           FROM unnest($2::text[]) AS u(uri) CROSS JOIN LATERAL ref_of(u.uri) k \
+           JOIN posts c ON c.author = k.author AND c.rkey = k.rkey WHERE k.coll = 1 \
+       ) p \
+      ORDER BY p.created_at, p.author, p.rkey LIMIT $5";
 
 /// The post a URI names, as an outline key: its DID and decoded TID.
 fn post_key(uri: &str) -> Option<(&str, i64)> {

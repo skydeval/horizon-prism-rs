@@ -192,12 +192,7 @@ impl Hydrator {
         if !missing_profiles.is_empty() || !missing_posts.is_empty() {
             let subjects: Vec<String> = missing_profiles.iter().chain(missing_posts.iter()).cloned().collect();
             let gates = self.gate_many(req, &subjects).await?;
-            let deleted: HashSet<String> = sqlx::query_scalar("SELECT uri FROM record_tombstones WHERE uri = ANY($1)")
-                .bind(&missing_posts)
-                .fetch_all(self.pool())
-                .await?
-                .into_iter()
-                .collect();
+            let deleted: HashSet<String> = crate::db::tombstones::tombstoned(self.pool(), &missing_posts).await?;
             let hidden = |s: &str| gates.get(s).is_some_and(|g| g.is_hidden());
             for id in subjects.iter().filter(|s| !hidden(s) && !deleted.contains(*s)) {
                 held.push(json!({"id": id, "reason": "unavailable"}));
@@ -348,31 +343,46 @@ impl Hydrator {
     /// Database errors.
     pub async fn refract_author_items(&self, did: &str, filter: &str, cursor: Option<&str>, limit: u32, include_pins: bool) -> Result<(Vec<FeedItem>, Option<String>), sqlx::Error> {
         let (at, after) = parse_local_cursor(cursor);
+        let media = |kinds: &[i16]| format!("p.embed_kind IN ({})", kinds.iter().map(i16::to_string).collect::<Vec<_>>().join(", "));
         let (posts_when, reposts) = match filter {
-            "posts_no_replies" => ("p.reply_parent_uri IS NULL", true),
-            "posts_with_media" => ("p.embed->>'$type' IN ('app.bsky.embed.images', 'app.bsky.embed.video', 'app.bsky.embed.recordWithMedia')", false),
-            "posts_with_video" => ("(p.embed->>'$type' = 'app.bsky.embed.video' OR p.embed#>>'{media,$type}' = 'app.bsky.embed.video')", false),
-            "posts_and_author_threads" => ("(p.reply_parent_uri IS NULL OR split_part(p.reply_root_uri, '/', 3) = $1)", true),
-            _ => ("TRUE", true),
+            "posts_no_replies" => ("p.parent_coll IS NULL".to_string(), true),
+            "posts_with_media" => (media(&crate::db::posts::REFRACT_MEDIA_KINDS), false),
+            "posts_with_video" => (media(&crate::db::posts::VIDEO_KINDS), false),
+            "posts_and_author_threads" => ("(p.parent_coll IS NULL OR p.root_author = $1)".to_string(), true),
+            _ => ("TRUE".to_string(), true),
+        };
+        // Each arm takes its page by its own index, after the cursor, in
+        // `(sort_at, coll, rkey)` order (the author is fixed).
+        let author: Option<i32> = sqlx::query_scalar("SELECT id FROM dids WHERE did = $1").bind(did).fetch_optional(self.pool()).await?;
+        let after_key = |at: &str, coll: i16, rkey: &str| {
+            format!(
+                "($2::timestamptz IS NULL OR ({at}, {coll}::smallint, {rkey}) < ($2, \
+                   COALESCE((SELECT k.coll FROM ref_of($3) k), '-32768'::smallint), \
+                   COALESCE((SELECT k.rkey FROM ref_of($3) k), '-9223372036854775808'::bigint)))"
+            )
         };
         let sql = format!(
-            "SELECT uri, originator_did, post_uri, kind, sort_at FROM ( \
-               SELECT p.uri, p.author_did AS originator_did, p.uri AS post_uri, \
-                 CASE WHEN p.reply_parent_uri IS NULL THEN 'post' ELSE 'reply' END AS kind, p.created_at AS sort_at \
-               FROM posts p WHERE p.author_did = $1 AND {posts_when} \
+            "SELECT at_uri($1, t.coll, t.rkey) AS uri, $6::text AS originator_did, t.post_uri, t.kind, t.sort_at FROM ( \
+               (SELECT 1::smallint AS coll, p.rkey, at_uri(p.author, 1::smallint, p.rkey) AS post_uri, \
+                  CASE WHEN p.parent_coll IS NULL THEN 'post' ELSE 'reply' END AS kind, p.created_at AS sort_at \
+                FROM posts p WHERE p.author = $1 AND {posts_when} AND {} \
+                ORDER BY p.created_at DESC, p.rkey DESC LIMIT $4) \
                UNION ALL \
-               SELECT at_uri(r.author, 3::smallint, r.rkey), $1, \
-                 ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint), 'repost', r.created_at \
-               FROM reposts r WHERE r.author = (SELECT id FROM dids WHERE did = $1) AND $5 \
-             ) f WHERE ($2::timestamptz IS NULL OR (f.sort_at, f.uri) < ($2, $3)) \
-             ORDER BY f.sort_at DESC, f.uri DESC LIMIT $4"
+               (SELECT 3::smallint, r.rkey, \
+                  ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint), 'repost', r.created_at \
+                FROM reposts r WHERE r.author = $1 AND $5 AND {} \
+                ORDER BY r.created_at DESC, r.rkey DESC LIMIT $4) \
+             ) t ORDER BY t.sort_at DESC, t.coll DESC, t.rkey DESC LIMIT $4",
+            after_key("p.created_at", 1, "p.rkey"),
+            after_key("r.created_at", 3, "r.rkey"),
         );
         let mut items: Vec<FeedItem> = sqlx::query_as(&sql)
-            .bind(did)
+            .bind(author)
             .bind(at)
             .bind(after.unwrap_or_default())
             .bind(i64::from(limit))
             .bind(reposts)
+            .bind(did)
             .fetch_all(self.pool())
             .await?;
         let next = (items.len() == usize::try_from(limit).unwrap_or(usize::MAX)).then(|| items.last().map(|i| local_cursor(i.sort_at, &i.uri))).flatten();
@@ -522,32 +532,36 @@ impl Hydrator {
     pub async fn refract_timeline_items(&self, me: &str, restored: &[String], cursor: Option<&str>, limit: u32) -> Result<(Vec<FeedItem>, Option<String>), sqlx::Error> {
         let (at, after) = parse_local_cursor(cursor);
         let sql = format!(
-            "SELECT uri, originator_did, post_uri, kind, sort_at FROM ( \
-               SELECT p.uri, p.author_did AS originator_did, p.uri AS post_uri, \
-                 CASE WHEN p.reply_parent_uri IS NULL THEN 'post' ELSE 'reply' END AS kind, p.created_at AS sort_at, \
-                 p.quote_uri IS NOT NULL AS quote \
-               FROM posts p WHERE p.author_did = ANY($2) \
-                 AND EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = p.author_did) \
-                 AND (p.reply_parent_uri IS NULL \
-                      OR EXISTS (SELECT 1 FROM follows f JOIN dids fa ON fa.id = f.author JOIN dids fs ON fs.id = f.subject WHERE fa.did = $1 AND fs.did = split_part(p.reply_parent_uri, '/', 3))) \
+            "SELECT at_uri(t.author, t.coll, t.rkey) AS uri, od.did AS originator_did, t.post_uri, t.kind, t.sort_at FROM ( \
+               SELECT p.author, 1::smallint AS coll, p.rkey, at_uri(p.author, 1::smallint, p.rkey) AS post_uri, p.author AS post_author, \
+                 CASE WHEN p.parent_coll IS NULL THEN 'post' ELSE 'reply' END AS kind, p.created_at AS sort_at, \
+                 p.quote_coll IS NOT NULL AS quote \
+               FROM posts p WHERE p.author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) \
+                 AND EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND f.subject = p.author) \
+                 AND (p.parent_coll IS NULL \
+                      OR EXISTS (SELECT 1 FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND f.subject = p.parent_author)) \
                UNION ALL \
-               SELECT at_uri(r.author, 3::smallint, r.rkey), ra.did, \
-                 ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint), 'repost', r.created_at, false \
-               FROM reposts r JOIN dids ra ON ra.id = r.author \
+               SELECT r.author, 3::smallint, r.rkey, \
+                 ref_text(r.subj_author, r.subj_coll, r.subj_rkey, 3::smallint, r.author, r.rkey, 4::smallint), r.subj_author, 'repost', r.created_at, false \
+               FROM reposts r \
                WHERE (r.author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) \
                       AND r.author IN (SELECT f.subject FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1))) \
                   OR (r.subj_author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) AND r.subj_coll = 1 \
                       AND (r.author = (SELECT id FROM dids WHERE did = $1) \
                            OR r.author IN (SELECT f.subject FROM follows f WHERE f.author = (SELECT id FROM dids WHERE did = $1)))) \
-             ) t WHERE ($3::timestamptz IS NULL OR (t.sort_at, t.uri) < ($3, $4)) \
+             ) t JOIN dids od ON od.id = t.author LEFT JOIN dids pd ON pd.id = t.post_author \
+             WHERE ($3::timestamptz IS NULL OR (t.sort_at, t.author, t.coll, t.rkey) < ($3, \
+                    COALESCE((SELECT k.author FROM ref_of($4) k), '-2147483648'::integer), \
+                    COALESCE((SELECT k.coll FROM ref_of($4) k), '-32768'::smallint), \
+                    COALESCE((SELECT k.rkey FROM ref_of($4) k), '-9223372036854775808'::bigint))) \
                AND NOT {} AND NOT {} \
                AND NOT (t.kind = 'repost' AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
-                        AND m.subject_did = t.originator_did AND m.scope IN ('reposts', 'reposts_and_quotes'))) \
+                        AND m.subject_did = od.did AND m.scope IN ('reposts', 'reposts_and_quotes'))) \
                AND NOT (t.quote AND EXISTS (SELECT 1 FROM mutes m WHERE m.viewer_did = $1 \
-                        AND m.subject_did = t.originator_did AND m.scope IN ('quotes', 'reposts_and_quotes'))) \
-             ORDER BY t.sort_at DESC, t.uri DESC LIMIT $5",
-            timeline_excluded("t.originator_did"),
-            timeline_excluded("split_part(t.post_uri, '/', 3)"),
+                        AND m.subject_did = od.did AND m.scope IN ('quotes', 'reposts_and_quotes'))) \
+             ORDER BY t.sort_at DESC, t.author DESC, t.coll DESC, t.rkey DESC LIMIT $5",
+            timeline_excluded("od.did"),
+            timeline_excluded("pd.did"),
         );
         let items: Vec<FeedItem> = sqlx::query_as(&sql)
             .bind(me)
@@ -806,10 +820,13 @@ impl Hydrator {
 
     /// The DIDs the root post mentions, from its stored row or its record.
     async fn refract_root_mentions(&self, req: &Requester, root: &str) -> Result<Option<HashSet<String>>, sqlx::Error> {
-        let stored: Option<Option<Vec<String>>> = sqlx::query_scalar("SELECT mention_dids FROM posts WHERE uri = $1")
-            .bind(root)
-            .fetch_optional(self.pool())
-            .await?;
+        let stored: Option<Option<Vec<String>>> = sqlx::query_scalar(&format!(
+            "SELECT ARRAY(SELECT d.did FROM unnest(p.mention_ids) WITH ORDINALITY m(id, i) JOIN dids d ON d.id = m.id ORDER BY m.i) FROM {}",
+            crate::db::posts::rows_named(1)
+        ))
+        .bind(std::slice::from_ref(&root.to_string()))
+        .fetch_optional(self.pool())
+        .await?;
         if let Some(m) = stored {
             return Ok(Some(m.unwrap_or_default().into_iter().collect()));
         }
@@ -835,10 +852,18 @@ impl Hydrator {
     ///
     /// Database errors.
     pub async fn refract_reply_rows(&self, root: &str, restored: &[String]) -> Result<Vec<(String, String)>, sqlx::Error> {
-        sqlx::query_as(
-            "SELECT uri, author_did FROM posts WHERE reply_root_uri = $1 AND author_did = ANY($2) \
-             ORDER BY created_at DESC, uri DESC LIMIT $3",
-        )
+        // The root's key is read first and written into the query as
+        // integers, so the planner sees how many replies it has.
+        let Some((author, coll, rkey)) = self.whole_key(root).await?.filter(|k| k.1 == crate::db::ids::COLL_POST) else {
+            return Ok(Vec::new());
+        };
+        sqlx::query_as(&format!(
+            "SELECT {}, d.did FROM posts p JOIN dids d ON d.id = p.author \
+             WHERE $1::text IS NOT NULL AND p.root_author = {author} AND p.root_rkey = {rkey} AND p.root_coll = {coll} \
+               AND p.author = ANY(ARRAY(SELECT id FROM dids WHERE did = ANY($2))) \
+             ORDER BY p.created_at DESC, p.author DESC, p.rkey DESC LIMIT $3",
+            crate::db::posts::uri_sql("p")
+        ))
         .bind(root)
         .bind(restored)
         .bind(REPLIES_MAX)

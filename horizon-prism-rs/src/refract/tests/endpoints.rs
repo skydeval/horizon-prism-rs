@@ -296,7 +296,7 @@ async fn fill_names_what_it_could_not_fetch() {
     h.refract.apply_config().await.expect("load");
     let unfetched = format!("at://{SUBJECT}/app.bsky.feed.post/3kunfetched");
     let deleted = format!("at://{SUBJECT}/app.bsky.feed.post/3kdeleted");
-    exec(&h.pool, &format!("INSERT INTO record_tombstones (uri, rev) VALUES ('{deleted}', '3kaaaaaaaaaa9')")).await;
+    crate::test_support::posts::tombstone(&h.pool, &deleted, "3kaaaaaaaaaa9").await;
     let base = serve(&h, None).await;
     let q = format!("dids={SUBJECT}&dids={FOURTH}&uris={}&uris={}&uris={}", urlencode(&uri), urlencode(&unfetched), urlencode(&deleted));
     let (status, body) = call(&base, FILL, &q, Some("bsky_appview")).await;

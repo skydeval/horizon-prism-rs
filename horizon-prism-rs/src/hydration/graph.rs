@@ -554,11 +554,13 @@ impl Hydrator {
         if uris.is_empty() {
             return Ok(HashSet::new());
         }
-        let rows: Vec<String> = sqlx::query_scalar(
+        let rows: Vec<String> = sqlx::query_scalar(&format!(
             "SELECT u.uri FROM unnest($2::text[]) AS u(uri) \
-             LEFT JOIN posts p ON p.uri = u.uri \
-             JOIN thread_mutes t ON t.viewer_did = $1 AND t.root_uri = COALESCE(p.reply_root_uri, u.uri)",
-        )
+             LEFT JOIN LATERAL (SELECT {} AS root FROM ref_of(u.uri) k \
+                                JOIN posts p ON k.coll = 1 AND p.author = k.author AND p.rkey = k.rkey) p ON true \
+             JOIN thread_mutes t ON t.viewer_did = $1 AND t.root_uri = COALESCE(p.root, u.uri)",
+            crate::db::posts::ref_sql("p", crate::db::ids::Slot::Root)
+        ))
         .bind(me)
         .bind(uris)
         .fetch_all(self.pool())

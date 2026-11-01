@@ -25,12 +25,13 @@ pub const METRIC_ROWS: &str = "refract_purge_rows_total";
 pub const IDLE_POLL: Duration = Duration::from_secs(10);
 
 /// The posts of `t` whose reply parent, root or quote author is a current
-/// member (rule 2 keeps them in On and Filling).
-const POST_NAMES_MEMBER: &str = "EXISTS (SELECT 1 FROM members m WHERE m.did IN (split_part(t.reply_parent_uri, '/', 3), \
-     split_part(t.reply_root_uri, '/', 3), split_part(t.quote_uri, '/', 3)))";
+/// member (rule 2 keeps them in On and Filling). References name their
+/// authors by id.
+const POST_NAMES_MEMBER: &str = "EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did \
+     WHERE d.id IN (t.parent_author, t.root_author, t.quote_author))";
 // Likes and reposts name their subject's author by id.
 const SUBJECT_AUTHOR_MEMBER: &str = "EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id = t.subj_author)";
-/// The DID's own likes or reposts, as a predicate on `t`.
+/// The DID's own posts, likes or reposts, as a predicate on `t`.
 const OWN: &str = "t.author = (SELECT id FROM dids WHERE did = $1)";
 /// One batch of the DID's follows of non-members. Follows are keyed by ids
 /// and name their subject by id.
@@ -47,7 +48,7 @@ async fn delete_follows(conn: &mut PgConnection, did: &str) -> Result<u64, sqlx:
     Ok(n)
 }
 
-/// [`delete`] for a table keyed by `(author, rkey)` (likes, reposts).
+/// [`delete`] for a table keyed by `(author, rkey)` (posts, likes, reposts).
 async fn delete_keyed(conn: &mut PgConnection, table: &str, predicate: &str, did: &str) -> Result<u64, sqlx::Error> {
     let sql = format!("DELETE FROM {table} WHERE (author, rkey) IN (SELECT t.author, t.rkey FROM {table} t WHERE {predicate} LIMIT {BATCH})");
     let n = sqlx::query(&sql).bind(did).execute(&mut *conn).await?.rows_affected();
@@ -72,16 +73,15 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
     let mut n = 0;
     match (member, off) {
         // A member: its posts in off modes (its references stay).
-        (true, true) => n += delete(conn, "posts", "uri", "t.author_did = $1", did).await?,
+        (true, true) => n += delete_keyed(conn, "posts", OWN, did).await?,
         // In On and Filling rule 1 keeps everything of a member or an S DID.
         (true, false) => {}
         (false, false) if in_s => {}
         (false, true) => {
-            for table in ["likes", "reposts"] {
+            for table in ["likes", "reposts", "posts"] {
                 n += delete_keyed(conn, table, OWN, did).await?;
             }
             for (table, col) in [
-                ("posts", "author_did"),
                 ("lists", "creator_did"),
                 ("list_items", "author_did"),
                 ("list_optouts", "author_did"),
@@ -96,7 +96,7 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
             }
         }
         (false, false) => {
-            n += delete(conn, "posts", "uri", &format!("t.author_did = $1 AND NOT {POST_NAMES_MEMBER}"), did).await?;
+            n += delete_keyed(conn, "posts", &format!("{OWN} AND NOT {POST_NAMES_MEMBER}"), did).await?;
             for table in ["likes", "reposts"] {
                 n += delete_keyed(conn, table, &format!("{OWN} AND NOT {SUBJECT_AUTHOR_MEMBER}"), did).await?;
             }
@@ -141,7 +141,8 @@ async fn batch(conn: &mut PgConnection, did: &str, member: bool, in_s: bool, off
         "notifications",
         "id",
         "t.author_did = $1 AND NOT CASE split_part(t.record_uri, '/', 4) \
-           WHEN 'app.bsky.feed.post' THEN EXISTS (SELECT 1 FROM posts x WHERE x.uri = t.record_uri) \
+           WHEN 'app.bsky.feed.post' THEN EXISTS (SELECT 1 FROM posts x, ref_of(t.record_uri) r \
+                                                  WHERE x.author = r.author AND x.rkey = r.rkey AND r.coll = 1) \
            WHEN 'app.bsky.feed.like' THEN EXISTS (SELECT 1 FROM likes x, ref_of(t.record_uri) r \
                                                   WHERE x.author = r.author AND x.rkey = r.rkey AND r.coll = 2) \
            WHEN 'app.bsky.feed.repost' THEN EXISTS (SELECT 1 FROM reposts x, ref_of(t.record_uri) r \

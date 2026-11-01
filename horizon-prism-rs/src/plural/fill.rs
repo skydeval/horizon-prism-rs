@@ -402,7 +402,8 @@ impl Filler {
                     sqlx::query(
                         "INSERT INTO plural_records (uri, did, rkey, cid, rev, collection, record, indexed_at) \
                          SELECT $1, $2, $3, $4, $5, $6, $7, now() \
-                         WHERE NOT EXISTS (SELECT 1 FROM record_tombstones WHERE uri = $1 AND deleted_at >= $8) \
+                         WHERE NOT EXISTS (SELECT 1 FROM ref_of($1) k JOIN record_tombstones t \
+                                           ON t.author = k.author AND t.coll = k.coll AND t.rkey = k.rkey WHERE t.deleted_at >= $8) \
                          ON CONFLICT (uri) DO NOTHING",
                     )
                     .bind(&l.uri)

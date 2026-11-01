@@ -1040,6 +1040,193 @@ pub mod interactions {
     }
 }
 
+/// Test rows of the id-keyed `posts`, `feed_items` and `record_tombstones`,
+/// written from URI text as ingest would store them.
+pub mod posts {
+    use chrono::{DateTime, Utc};
+    use serde_json::Value;
+    use sqlx::PgPool;
+
+    pub use crate::firehose::writer::fixtures::{put_feed_item, put_post, rewrite_post};
+
+    /// SQL: the post row (alias `alias`, or none) is the one `uri` names.
+    #[must_use]
+    pub fn key_is(alias: &str, uri: &str) -> String {
+        let dot = if alias.is_empty() { String::new() } else { format!("{alias}.") };
+        format!("({dot}author, {dot}rkey) = (SELECT r.author, r.rkey FROM ref_of('{uri}') r WHERE r.coll = 1)")
+    }
+
+    /// A stored post with this record at rev `REV`, created at
+    /// `created_at` (or now), with no feed item. Returns its URI.
+    pub async fn put(pool: &PgPool, author: &str, rkey: &str, record: &Value, created_at: Option<DateTime<Utc>>) -> String {
+        put_post(pool, author, rkey, &format!("bafy{rkey}"), super::graph::REV, record, Some(created_at.unwrap_or_else(Utc::now))).await
+    }
+
+    /// A plain stored post (`text`), created now, with no feed item.
+    pub async fn plain(pool: &PgPool, author: &str, rkey: &str, text: &str) -> String {
+        let record = serde_json::json!({"$type": "app.bsky.feed.post", "text": text, "createdAt": "2026-09-26T12:00:00.000Z"});
+        put(pool, author, rkey, &record, None).await
+    }
+
+    /// A stored post's record.
+    pub async fn record(pool: &PgPool, uri: &str) -> Option<Value> {
+        let stored: Option<Vec<u8>> = sqlx::query_scalar(&format!("SELECT record FROM posts WHERE {}", key_is("", uri)))
+            .fetch_optional(pool)
+            .await
+            .expect("record");
+        match stored {
+            Some(bytes) => Some(crate::db::records::decode_value(pool, &bytes).await.expect("decode")),
+            None => None,
+        }
+    }
+
+    /// Change a stored post's record with `edit`, as a newer write would.
+    pub async fn edit(pool: &PgPool, uri: &str, edit: impl FnOnce(&mut Value)) {
+        let mut record = record(pool, uri).await.expect("stored post");
+        edit(&mut record);
+        rewrite_post(pool, uri, &record).await;
+    }
+
+    /// Set a stored post's `created_at` (an SQL expression), on its search
+    /// row too.
+    pub async fn set_created_at(pool: &PgPool, uri: &str, at: &str) {
+        for table in ["posts", "post_search"] {
+            sqlx::query(&format!("UPDATE {table} SET created_at = {at} WHERE {}", key_is("", uri)))
+                .execute(pool)
+                .await
+                .expect("created_at");
+        }
+    }
+
+    /// The URI of every stored post, ordered by text.
+    pub async fn uris(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar("SELECT at_uri(author, 1::smallint, rkey) FROM posts ORDER BY 1").fetch_all(pool).await.expect("posts")
+    }
+
+    /// A stored post's text, from its search row.
+    pub async fn text(pool: &PgPool, uri: &str) -> Option<String> {
+        sqlx::query_scalar(&format!("SELECT text FROM post_search WHERE {}", key_is("", uri)))
+            .fetch_optional(pool)
+            .await
+            .expect("text")
+    }
+
+    /// Whether `uri` names a stored post.
+    pub async fn stored(pool: &PgPool, uri: &str) -> bool {
+        sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM posts WHERE {})", key_is("", uri)))
+            .fetch_one(pool)
+            .await
+            .expect("stored")
+    }
+
+    /// The stored posts by `did`.
+    pub async fn count_by(pool: &PgPool, did: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM posts WHERE author = (SELECT id FROM dids WHERE did = $1)")
+            .bind(did)
+            .fetch_one(pool)
+            .await
+            .expect("count")
+    }
+
+    /// Remove the feed item of the record `item`.
+    pub async fn delete_feed_item(pool: &PgPool, item: &str) {
+        sqlx::query(
+            "DELETE FROM feed_items f USING ref_of($1) r \
+             WHERE f.originator = r.author AND f.is_repost = (r.coll = 3) AND f.src_rkey = r.rkey",
+        )
+        .bind(item)
+        .execute(pool)
+        .await
+        .expect("feed item");
+    }
+
+    /// Store a tombstone of `uri` at `rev`, interning its author and key.
+    pub async fn tombstone(pool: &PgPool, uri: &str, rev: &str) {
+        super::interactions::intern(pool, &[uri]).await;
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::db::tombstones::put(&mut *conn, uri, rev, crate::db::tombstones::Put::Highest).await.expect("tombstone");
+    }
+
+    /// The rev of the tombstone of `uri`, if there is one.
+    pub async fn tombstone_rev(pool: &PgPool, uri: &str) -> Option<String> {
+        let rev: Option<i64> = sqlx::query_scalar(
+            "SELECT t.rev FROM record_tombstones t, ref_of($1) k WHERE t.author = k.author AND t.coll = k.coll AND t.rkey = k.rkey",
+        )
+        .bind(uri)
+        .fetch_optional(pool)
+        .await
+        .expect("tombstone");
+        rev.map(crate::db::ids::rev_string)
+    }
+
+    /// The `n`th of a run of TID record keys, in order.
+    #[must_use]
+    pub fn tid(n: usize) -> String {
+        const ALPHABET: &[u8] = b"234567abcdefghijklmnopqrstuvwxyz";
+        let digit = |d: usize| char::from(ALPHABET[d % 32]);
+        format!("3kaaaaaaaa{}{}{}", digit(n / 1024), digit(n / 32), digit(n))
+    }
+
+    /// Statements that intern a DID, and an alias for `rkey` when it is not
+    /// a TID (SQL-only fixtures, run with `raw_sql`).
+    #[must_use]
+    pub fn intern_sql(did: &str, rkey: &str) -> String {
+        format!(
+            "INSERT INTO dids (did) VALUES ('{did}') ON CONFLICT (did) DO NOTHING; \
+             INSERT INTO rkey_aliases (author, rkey) SELECT id, '{rkey}' FROM dids WHERE did = '{did}' AND rkey_to_bigint('{rkey}') IS NULL \
+               ON CONFLICT (author, rkey) DO NOTHING;"
+        )
+    }
+
+    /// SQL: the stored key of `rkey` in `did`'s repo, after [`intern_sql`].
+    #[must_use]
+    pub fn key_sql(did: &str, rkey: &str) -> String {
+        format!(
+            "COALESCE(rkey_to_bigint('{rkey}'), (SELECT x.id FROM rkey_aliases x WHERE x.author = (SELECT id FROM dids WHERE did = '{did}') AND x.rkey = '{rkey}'))"
+        )
+    }
+
+    /// Statements that store a bare post row (an empty record, created
+    /// now) with no search row.
+    #[must_use]
+    pub fn row_sql(did: &str, rkey: &str) -> String {
+        format!(
+            "{} INSERT INTO posts (author, rkey, cid, rev, created_at, record) \
+               SELECT id, {}, '\\x00'::bytea || convert_to('bafy{rkey}', 'UTF8'), rev_to_bigint('{}'), now(), \
+                      '\\x00'::bytea || convert_to('{{}}', 'UTF8') \
+               FROM dids WHERE did = '{did}';",
+            intern_sql(did, rkey),
+            key_sql(did, rkey),
+            super::graph::REV
+        )
+    }
+
+    /// Statements that store a post's own feed item (kind post, now).
+    #[must_use]
+    pub fn feed_item_sql(did: &str, rkey: &str) -> String {
+        format!(
+            "{} INSERT INTO feed_items (originator, is_repost, src_rkey, kind, post_author, post_rkey, sort_at) \
+               SELECT id, false, {k}, 1, id, {k}, now() FROM dids WHERE did = '{did}';",
+            intern_sql(did, rkey),
+            k = key_sql(did, rkey)
+        )
+    }
+
+    /// Statements that store a tombstone of the record `uri` at `rev`.
+    #[must_use]
+    pub fn tombstone_sql(uri: &str, rev: &str) -> String {
+        let rest = uri.strip_prefix("at://").unwrap_or(uri);
+        let mut parts = rest.split('/');
+        let (did, nsid, rkey) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        format!(
+            "{} INSERT INTO record_tombstones (author, coll, rkey, rev) \
+               SELECT d.id, c.id, {}, rev_to_bigint('{rev}') FROM dids d, collections c WHERE d.did = '{did}' AND c.nsid = '{nsid}';",
+            intern_sql(did, rkey),
+            key_sql(did, rkey)
+        )
+    }
+}
+
 /// A fresh database with no migrations applied (migration tests).
 pub async fn empty_db(test: &str) -> Option<TestDb> {
     let Ok(admin_url) = std::env::var(ENV) else {

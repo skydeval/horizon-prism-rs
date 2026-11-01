@@ -443,7 +443,7 @@ async fn t_o8_wholeness() {
     assert_eq!((t.outline, uris(&t)), (Some(Use::Tree), vec![r4.clone(), late.clone()]));
     // Its own replies are not known to the reads: the client opens it.
     assert_eq!(node(&t, &late).map(|n| n.markers().more_replies.clone()), Some(Some(None)));
-    exec(&w.db.pool, &format!("UPDATE posts SET indexed_at = now() - interval '10 minutes' WHERE uri = '{late}'")).await;
+    exec(&w.db.pool, &format!("UPDATE posts SET indexed_at = now() - interval '10 minutes' WHERE {}", crate::test_support::posts::key_is("", &late))).await;
     assert_eq!(lens.read(Some(&outline), &r4, 6, 80, None, &cfg).await.outline, Some(Use::Hole));
 
     // A hole at the root, with the chain longer than `parentHeight`.

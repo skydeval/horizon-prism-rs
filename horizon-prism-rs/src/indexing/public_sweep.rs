@@ -49,6 +49,10 @@ pub enum Key {
     /// integers. A text cursor stored before the table moved to ids does not
     /// decode, so the sweep starts that table again.
     AuthorRkey,
+    /// `feed_items (originator, is_repost, src_rkey)`: `[originator,
+    /// is_repost, src_rkey]`. A text cursor starts the table again, as for
+    /// [`Key::AuthorRkey`].
+    FeedItem,
 }
 
 /// One swept table (§7.2's table).
@@ -82,7 +86,7 @@ const LIKE_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN di
 const REPOST_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN dids d ON d.did = m.did WHERE d.id = t.author) \
      AND NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace')) \
      AND NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.subj_author AND r.state IN ('restored', 'grace'))";
-// Post counts are keyed by the post's author id.
+// Posts and their counts are keyed by the post's author id.
 const POST_NOT_R: &str =
     "NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace'))";
 
@@ -97,14 +101,15 @@ const URI: Key = Key::Text("uri");
 /// 0016). `member_post_refs` is not swept.
 pub const TABLES: [SweepTable; 18] = [
     // 1.
-    table("feed_items", URI, ALL, 10_000),
+    table("feed_items", Key::FeedItem, ALL, 10_000),
     table("notifications", Key::Id, ALL, 10_000),
     // 2. Non-members' likes and reposts, while `posts` still exists for
     // their trend triggers.
     table("likes", Key::AuthorRkey, LIKE_NOT_MEMBER_NOR_R, 1_000),
     table("reposts", Key::AuthorRkey, REPOST_NOT_MEMBER_NOR_R, 1_000),
     // 3.
-    table("posts", URI, NOT_R_AUTHOR, 1_000),
+    // A post's search row and odd references go with it.
+    table("posts", Key::AuthorRkey, POST_NOT_R, 1_000),
     // 4.
     table("threadgates", URI, NOT_R_AUTHOR, 10_000),
     table("postgates", URI, NOT_R_AUTHOR, 10_000),
@@ -131,6 +136,7 @@ pub enum Cursor {
     Id(i64),
     TagHour(String, DateTime<Utc>),
     AuthorRkey(i32, i64),
+    FeedItem(i32, bool, i64),
 }
 
 impl Cursor {
@@ -142,6 +148,7 @@ impl Cursor {
             Self::Id(id) => json!(id),
             Self::TagHour(tag, hour) => json!([tag, rfc3339(hour)]),
             Self::AuthorRkey(author, rkey) => json!([author, rkey]),
+            Self::FeedItem(originator, is_repost, rkey) => json!([originator, is_repost, rkey]),
         }
     }
 
@@ -159,6 +166,9 @@ impl Cursor {
             (Key::AuthorRkey, Value::Array(a)) if a.len() == 2 => {
                 Self::AuthorRkey(i32::try_from(a[0].as_i64()?).ok()?, a[1].as_i64()?)
             }
+            (Key::FeedItem, Value::Array(a)) if a.len() == 3 => {
+                Self::FeedItem(i32::try_from(a[0].as_i64()?).ok()?, a[1].as_bool()?, a[2].as_i64()?)
+            }
             _ => return None,
         };
         Some(Some(cursor))
@@ -175,7 +185,7 @@ pub fn valid_state(v: &Value) -> Option<SweepState> {
         // A text cursor of a table that moved to ids: that table starts
         // again from its first key, which only deletes again what the
         // predicate drops. Any other mismatch is not a valid state.
-        if table.key != Key::AuthorRkey {
+        if !matches!(table.key, Key::AuthorRkey | Key::FeedItem) {
             return None;
         }
         after = Value::Null;
@@ -191,6 +201,7 @@ enum Window {
     Id(Vec<i64>),
     TagHour(Vec<String>, Vec<DateTime<Utc>>),
     AuthorRkey(Vec<i32>, Vec<i64>),
+    FeedItem(Vec<i32>, Vec<bool>, Vec<i64>),
 }
 
 impl Window {
@@ -200,6 +211,10 @@ impl Window {
             Self::Id(keys) => keys.last().copied().map(Cursor::Id),
             Self::TagHour(tags, hours) => tags.last().cloned().zip(hours.last().copied()).map(|(t, h)| Cursor::TagHour(t, h)),
             Self::AuthorRkey(authors, rkeys) => authors.last().copied().zip(rkeys.last().copied()).map(|(a, k)| Cursor::AuthorRkey(a, k)),
+            Self::FeedItem(originators, reposts, rkeys) => match (originators.last(), reposts.last(), rkeys.last()) {
+                (Some(o), Some(r), Some(k)) => Some(Cursor::FeedItem(*o, *r, *k)),
+                _ => None,
+            },
         }
     }
 }
@@ -519,6 +534,31 @@ async fn select_window(conn: &mut PgConnection, t: &SweepTable, after: Option<&C
             let (authors, rkeys) = rows.into_iter().unzip();
             Window::AuthorRkey(authors, rkeys)
         }
+        Key::FeedItem => {
+            let (originator, is_repost, rkey) = match after {
+                Some(Cursor::FeedItem(o, r, k)) => (Some(*o), Some(*r), Some(*k)),
+                _ => (None, None, None),
+            };
+            let rows: Vec<(i32, bool, i64)> = sqlx::query_as(&format!(
+                "SELECT originator, is_repost, src_rkey FROM {name} \
+                 WHERE ($1::integer IS NULL OR (originator, is_repost, src_rkey) > ($1, $2::boolean, $3::bigint)) \
+                 ORDER BY originator, is_repost, src_rkey LIMIT $4",
+                name = t.name
+            ))
+            .bind(originator)
+            .bind(is_repost)
+            .bind(rkey)
+            .bind(limit)
+            .fetch_all(conn)
+            .await?;
+            let mut window = (Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()), Vec::with_capacity(rows.len()));
+            for (o, r, k) in rows {
+                window.0.push(o);
+                window.1.push(r);
+                window.2.push(k);
+            }
+            Window::FeedItem(window.0, window.1, window.2)
+        }
     })
 }
 
@@ -555,6 +595,17 @@ async fn delete_window(conn: &mut PgConnection, t: &SweepTable, window: &Window)
             .execute(conn)
             .await?
         }
+        (Key::FeedItem, Window::FeedItem(originators, reposts, rkeys)) => {
+            sqlx::query(&format!(
+                "DELETE FROM {name} t WHERE (t.originator, t.is_repost, t.src_rkey) IN \
+                   (SELECT * FROM unnest($1::integer[], $2::boolean[], $3::bigint[])) AND {pred}"
+            ))
+            .bind(originators)
+            .bind(reposts)
+            .bind(rkeys)
+            .execute(conn)
+            .await?
+        }
         _ => unreachable!("a window has its table's key"),
     };
     Ok(result.rows_affected())
@@ -573,6 +624,7 @@ mod tests {
             (Key::Id, Cursor::Id(42)),
             (Key::TagHour, Cursor::TagHour("rust".into(), hour)),
             (Key::AuthorRkey, Cursor::AuthorRkey(7, -3)),
+            (Key::FeedItem, Cursor::FeedItem(7, true, -3)),
         ] {
             assert_eq!(Cursor::from_json(key, &cursor.to_json()), Some(Some(cursor)));
             assert_eq!(Cursor::from_json(key, &Value::Null), Some(None));
@@ -590,13 +642,13 @@ mod tests {
         let restarted = valid_state(&state).expect("still a valid state");
         assert_eq!((restarted.table.as_str(), &restarted.after), ("follows", &Value::Null));
         // So does every other table keyed by ids.
-        for name in ["likes", "reposts", "post_counts"] {
+        for name in ["likes", "reposts", "post_counts", "posts", "feed_items"] {
             let state = json!({"table": name, "after": "at://did:plc:a/app.bsky.feed.like/1", "last_advanced_at": "2026-10-14T05:00:00Z"});
             assert_eq!(valid_state(&state).expect(name).after, Value::Null, "{name} starts again");
         }
         // Any other table's mismatched cursor is still refused.
-        let posts = json!({"table": "posts", "after": 7, "last_advanced_at": "2026-10-14T05:00:00Z"});
-        assert!(valid_state(&posts).is_none());
+        let gates = json!({"table": "threadgates", "after": 7, "last_advanced_at": "2026-10-14T05:00:00Z"});
+        assert!(valid_state(&gates).is_none());
     }
 
     #[test]

@@ -224,12 +224,8 @@ mod tests {
         assert_eq!((status, v["status"].as_str()), (200, Some("indexed")), "{v}");
         // A member that is not ready gets no catch-up (private posting §3.8).
         assert_eq!(v["caughtUp"], json!(false), "{v}");
-        let text: String = sqlx::query_scalar("SELECT text FROM posts WHERE uri = $1")
-            .bind(post_uri(MEMBER, "keep1"))
-            .fetch_one(p)
-            .await
-            .expect("indexed row");
-        assert_eq!(text, "fetched keep1");
+        let text = crate::test_support::posts::text(p, &post_uri(MEMBER, "keep1")).await;
+        assert_eq!(text.as_deref(), Some("fetched keep1"));
 
         // Unchanged: the same rev is already indexed.
         let (status, v) = call(MEMBER, 3, post_uri(MEMBER, "keep1")).await;
@@ -239,8 +235,7 @@ mod tests {
         let gone = post(p, MEMBER, "gone", "stale", None, None).await;
         let (status, v) = call(MEMBER, 3, gone.clone()).await;
         assert_eq!((status, v["status"].as_str()), (200, Some("deleted")));
-        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM posts WHERE uri = $1").bind(&gone).fetch_one(p).await.expect("count");
-        assert_eq!(left, 0);
+        assert!(!crate::test_support::posts::stored(p, &gone).await);
 
         // Out of scope: a non-member's own post that admission rejects (any
         // authenticated DID may call).
