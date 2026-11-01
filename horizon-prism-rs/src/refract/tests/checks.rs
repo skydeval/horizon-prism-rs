@@ -235,11 +235,11 @@ async fn t12c_labels_follow_the_home_community() {
     let Some(db) = fresh_db("refract_t12c").await else {
         return;
     };
-    let mut north = tier2();
-    north.pds_patterns = vec!["pds.north.invalid".into()];
-    let mut sky = tier1();
-    sky.labeler_did = Some(OTHER_LABELER.into());
-    let h = Harness::new(&db.pool, ScopeSets::default(), vec![north, sky]).await;
+    let mut second = tier2();
+    second.pds_patterns = vec!["pds.north.invalid".into()];
+    let mut first = tier1();
+    first.labeler_did = Some(OTHER_LABELER.into());
+    let h = Harness::new(&db.pool, ScopeSets::default(), vec![second, first]).await;
     h.all_pass();
     h.row(SUBJECT, "north", "restored").await;
     sqlx::query("INSERT INTO refract_labels (labeler_did, subject, val, did, gone, verified) VALUES ($1, $2, '!takedown', $2, true, true)")

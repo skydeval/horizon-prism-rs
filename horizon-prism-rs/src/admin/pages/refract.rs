@@ -578,7 +578,7 @@ mod tests {
         let cursor = json!({"collection": "app.bsky.feed.post", "cursor": "x", "done": ["app.bsky.actor.profile"]});
         assert_eq!(history(Some("running"), Some(&cursor), None), "fetching, 1 collection fetched, now app.bsky.feed.post");
         assert_eq!(history(Some("failed"), None, Some("timeout")), "failed: timeout");
-        assert_eq!(link("restored", "black sky", 2), "/admin/refract?state=restored&community=black+sky&page=2");
+        assert_eq!(link("restored", "community a", 2), "/admin/refract?state=restored&community=community+a&page=2");
         assert_eq!(link("", "", 0), "/admin/refract");
     }
 }
