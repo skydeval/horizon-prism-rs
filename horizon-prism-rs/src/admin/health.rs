@@ -47,7 +47,6 @@ pub const WATCHED: &[&str] = &[
     crate::firehose::deadletter::METRIC_DEAD_LETTERS,
     crate::firehose::deadletter::METRIC_MALFORMED_DROPPED,
     crate::firehose::gap::METRIC_GAPS,
-    crate::db::sampler::METRIC_DB_BUDGET_RATIO,
     crate::db::sampler::METRIC_DB_SIZE,
     crate::db::sampler::METRIC_REDIS_RATIO,
     crate::db::sampler::METRIC_REDIS_USED,
@@ -460,6 +459,8 @@ pub struct Inputs {
     pub disks: Option<super::stats::Disks>,
     /// The highest account id handed out ([`ACCOUNT_IDS_SQL`]).
     pub account_ids: Option<i64>,
+    /// `storage.budget_bytes`; `None` when no budget is set.
+    pub budget_bytes: Option<u64>,
 }
 
 /// The account ids the database can hand out: `dids.id` is an `integer`
@@ -493,6 +494,35 @@ fn account_ids_check(used: Option<i64>) -> Check {
     } else {
         Check::new(NAME, Level::Ok, text)
     }
+}
+
+/// The Storage budget check: amber while no budget is set, since nothing
+/// can warn before the disk fills; set, the database against it, amber
+/// and red at the sampler's thresholds.
+#[allow(clippy::cast_precision_loss)]
+fn budget_check(budget_bytes: Option<u64>, db_size: Option<f64>) -> Check {
+    const NAME: &str = "Storage budget";
+    const SETTINGS: &str = "/admin/settings/storage";
+    let Some(budget) = budget_bytes.filter(|b| *b > 0) else {
+        return Check::new(
+            NAME,
+            Level::Amber,
+            "No storage budget is set, so Prism cannot warn you before the disk fills. Set one under Settings → Storage: the space the database may use, leaving room for the disk's other uses.",
+        )
+        .link(SETTINGS, "Storage settings");
+    };
+    let Some(size) = db_size else {
+        return Check::no_data(NAME, "not measured yet (every 5 minutes).");
+    };
+    let r = size / budget as f64;
+    let text = format!("The database is at {} of its budget ({} of {}).", percent(r), super::pages::bytes(size), super::pages::bytes(budget as f64));
+    let level = match crate::db::sampler::budget_level(r) {
+        crate::db::sampler::BudgetLevel::Critical => Level::Red,
+        crate::db::sampler::BudgetLevel::Warn => Level::Amber,
+        crate::db::sampler::BudgetLevel::Ok => Level::Ok,
+    };
+    let check = Check::new(NAME, level, text);
+    if level == Level::Ok { check } else { check.link(SETTINGS, "Storage settings") }
 }
 
 /// Under this share free a disk is red (§9.2).
@@ -680,12 +710,7 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
         Some(_) => Check::new("Trim gap", Level::Ok, "No network records were dropped in the last 15 minutes."),
     });
 
-    out.push(match latest.as_ref().and_then(|s| s.sum(crate::db::sampler::METRIC_DB_BUDGET_RATIO)) {
-        None => Check::no_data("Database budget", "not measured yet (every 5 minutes)."),
-        Some(r) if r >= 0.95 => Check::new("Database budget", Level::Red, format!("The database is at {} of its budget.", percent(r))).link("/admin/settings/storage", "Storage settings"),
-        Some(r) if r >= 0.8 => Check::new("Database budget", Level::Amber, format!("The database is at {} of its budget.", percent(r))).link("/admin/settings/storage", "Storage settings"),
-        Some(r) => Check::new("Database budget", Level::Ok, format!("The database is at {} of its budget.", percent(r))),
-    });
+    out.push(budget_check(i.budget_bytes, latest.as_ref().and_then(|s| s.sum(crate::db::sampler::METRIC_DB_SIZE))));
 
     out.push(account_ids_check(i.account_ids));
 
@@ -927,6 +952,7 @@ pub async fn probes(state: &AdminState) -> Inputs {
         lag_warn_entries: fh.lag_warn_entries,
         relays,
         private_relays: fh.private_relays.clone(),
+        budget_bytes: state.settings.running.storage.budget_bytes,
         ..Inputs::default()
     }
 }
@@ -1072,8 +1098,9 @@ mod tests {
         let ring = Ring::default();
         let all = checks(&Inputs::default(), &ring);
         for c in &all {
-            // Both are read from memory, so they always have an answer.
-            if c.name != "Settings" && c.name != "Startup" {
+            // Read from memory or the configuration, so they always have
+            // an answer.
+            if c.name != "Settings" && c.name != "Startup" && c.name != "Storage budget" {
                 assert_eq!(c.level, Level::NoData, "{c:?}");
             }
         }
@@ -1084,7 +1111,7 @@ mod tests {
     fn checks_turn_amber_and_red() {
         let ring = Ring::default();
         let text = "firehose_consumer_group_present 0\nfirehose_consumer_lag_entries 500\n\
-            firehose_worker_delay_seconds{relay=\"bsky\"} +Inf\ndb_budget_ratio 0.97\nredis_memory_ratio 0.5\n\
+            firehose_worker_delay_seconds{relay=\"bsky\"} +Inf\ndb_size_bytes 97000000000\nredis_memory_ratio 0.5\n\
             firehose_dead_letter_total{type=\"commit\"} 2\nfarsight_down 0\nfarsight_fallback_withheld{reason=\"off\"} 0";
         for m in 0..=5 {
             ring.push(snap(text, m));
@@ -1106,6 +1133,7 @@ mod tests {
             private_relays: Vec::new(),
             disks: Some(disks(1_000_000_000_000, 15_000_000_000)),
             account_ids: Some(1_200_000_000),
+            budget_bytes: Some(100_000_000_000),
         };
         let all = checks(&inputs, &ring);
         let get = |name: &str, text: &str| all.iter().find(|c| c.name == name && c.text.contains(text)).unwrap_or_else(|| panic!("{name}: {all:#?}")).level;
@@ -1117,7 +1145,7 @@ mod tests {
         assert_eq!(get("Relay delay", "bsky has never reported."), Level::Amber, "not a private relay");
         assert_eq!(get("Relay delay", "microcosm"), Level::NoData, "a configured relay with no series");
         assert_eq!(get("Unprocessed records", "2 records"), Level::Amber);
-        assert_eq!(get("Database budget", "97%"), Level::Red);
+        assert_eq!(get("Storage budget", "97% of its budget (97.0 GB of 100.0 GB)"), Level::Red);
         assert_eq!(get("Redis memory", "50%"), Level::Ok);
         assert_eq!(get("Failed jobs", "3 sync jobs failed after trying again several times"), Level::Amber);
         assert_eq!(get("Members not ready", "Every member"), Level::Ok);
@@ -1129,6 +1157,25 @@ mod tests {
         assert_eq!(get("Trim gap", "No data"), Level::NoData, "a counter never incremented is absent");
         assert_eq!(get("Disk", "The disk holding the database (Postgres) has 15.0 GB free (2% free)"), Level::Red);
         assert_eq!(get("Account ids", "1,200,000,000 of 2,147,483,647 account ids are used (56%). Over half are used"), Level::Amber);
+    }
+
+    #[test]
+    fn storage_budget_is_amber_until_set() {
+        let unset = budget_check(None, Some(4_700_000_000.0));
+        assert_eq!(unset.level, Level::Amber);
+        assert_eq!(
+            unset.text,
+            "No storage budget is set, so Prism cannot warn you before the disk fills. Set one under Settings → Storage: the space the database may use, leaving room for the disk's other uses."
+        );
+        assert_eq!(unset.link, Some(("/admin/settings/storage", "Storage settings")));
+        assert_eq!(budget_check(None, None).level, Level::Amber, "known from the configuration, measured or not");
+        assert_eq!(budget_check(Some(0), None).level, Level::Amber, "0 is refused at load; never a ratio");
+        assert_eq!(budget_check(Some(100), None).level, Level::NoData);
+        let ok = budget_check(Some(1_000_000_000_000), Some(4_700_000_000.0));
+        assert_eq!((ok.level, ok.text.as_str(), ok.link), (Level::Ok, "The database is at 0% of its budget (4.7 GB of 1.0 TB).", None));
+        assert_eq!(budget_check(Some(100), Some(80.0)).level, Level::Amber);
+        assert_eq!(budget_check(Some(100), Some(79.0)).level, Level::Ok);
+        assert_eq!(budget_check(Some(100), Some(95.0)).level, Level::Red);
     }
 
     #[test]

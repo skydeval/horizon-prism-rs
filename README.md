@@ -19,7 +19,7 @@ It is a stack you run yourself, not a hosted service. This README calls it Horiz
 - A Linux host with Docker and Docker Compose.
 - A public DNS name for the AppView, with ports 80 and 443 reachable (Caddy obtains the certificate).
 - Outbound network access. The relay sidecar (horizon-firehose) is built from source at a pinned commit.
-- Disk for Postgres (the default storage budget is 200 GiB) and about 6 GB of memory for Redis.
+- Disk for Postgres (set its storage budget in `app.toml`; there is none by default) and about 6 GB of memory for Redis.
 - At least one community PDS whose accounts will be members, crawled by the relays.
 
 Building outside Docker needs Rust 1.90 or newer. The crate is in `horizon-prism-rs/`.

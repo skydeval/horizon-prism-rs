@@ -4,6 +4,8 @@
 //! firehose stream length, the scope and member counts, and rule 4's row
 //! counts and storage bound ([`gauges`]). Every 30 s: Redis
 //! `INFO memory`. Budget and Redis-memory warnings are logged once per sample.
+//! With no `storage.budget_bytes` set there is no budget ratio: the gauge is
+//! not exported and no budget warning is logged.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -114,7 +116,8 @@ pub struct TableSample {
 pub struct DbSample {
     pub tables: Vec<TableSample>,
     pub db_size_bytes: i64,
-    pub budget_ratio: f64,
+    /// `None` when no budget is set.
+    pub budget_ratio: Option<f64>,
     pub scope_dids_total: i64,
     pub members_total: i64,
     pub member_denials_total: i64,
@@ -125,7 +128,7 @@ pub struct DbSample {
 /// # Errors
 ///
 /// Any database error.
-pub async fn sample_db(pool: &PgPool, budget_bytes: u64) -> Result<DbSample, sqlx::Error> {
+pub async fn sample_db(pool: &PgPool, budget_bytes: Option<u64>) -> Result<DbSample, sqlx::Error> {
     let tables = sqlx::query_as::<_, TableSample>(
         "SELECT relname::text AS \"table\", n_live_tup AS \"rows\", \
          pg_total_relation_size(relid) AS \"bytes\" \
@@ -148,11 +151,17 @@ pub async fn sample_db(pool: &PgPool, budget_bytes: u64) -> Result<DbSample, sql
     Ok(DbSample {
         tables,
         db_size_bytes,
-        budget_ratio: ratio(u64::try_from(db_size_bytes).unwrap_or(0), budget_bytes),
+        budget_ratio: budget_ratio(db_size_bytes, budget_bytes),
         scope_dids_total,
         members_total,
         member_denials_total,
     })
+}
+
+/// The database's share of its budget; `None` with no budget set.
+#[must_use]
+pub fn budget_ratio(db_size_bytes: i64, budget_bytes: Option<u64>) -> Option<f64> {
+    budget_bytes.filter(|b| *b > 0).map(|b| ratio(u64::try_from(db_size_bytes).unwrap_or(0), b))
 }
 
 /// When the last database sample was exported, in unix milliseconds; 0 for
@@ -168,32 +177,36 @@ pub fn last_db_sample() -> Option<DateTime<Utc>> {
     }
 }
 
-/// Export a database sample and log budget warnings.
-pub fn record_db_sample(sample: &DbSample, budget_bytes: u64) {
+/// Export a database sample and log budget warnings. With no budget set
+/// the ratio is not exported and nothing is logged.
+pub fn record_db_sample(sample: &DbSample, budget_bytes: Option<u64>) {
     LAST_DB_SAMPLE_MS.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
     for t in &sample.tables {
         metrics::gauge!(METRIC_TABLE_ROWS, "table" => t.table.clone()).set(t.rows as f64);
         metrics::gauge!(METRIC_TABLE_BYTES, "table" => t.table.clone()).set(t.bytes as f64);
     }
     metrics::gauge!(METRIC_DB_SIZE).set(sample.db_size_bytes as f64);
-    metrics::gauge!(METRIC_DB_BUDGET_RATIO).set(sample.budget_ratio);
     metrics::gauge!(METRIC_SCOPE_DIDS).set(sample.scope_dids_total as f64);
     metrics::gauge!(METRIC_MEMBERS).set(sample.members_total as f64);
     metrics::gauge!(METRIC_MEMBER_DENIALS).set(sample.member_denials_total as f64);
-    match budget_level(sample.budget_ratio) {
+    let (Some(ratio), Some(budget_bytes)) = (sample.budget_ratio, budget_bytes) else {
+        return;
+    };
+    metrics::gauge!(METRIC_DB_BUDGET_RATIO).set(ratio);
+    match budget_level(ratio) {
         BudgetLevel::Ok => {}
         BudgetLevel::Warn => tracing::warn!(
             event = "storage_budget_warn",
             db_size_bytes = sample.db_size_bytes,
             budget_bytes,
-            ratio = sample.budget_ratio,
+            ratio,
             "database size is at or above 80% of storage.budget_bytes",
         ),
         BudgetLevel::Critical => tracing::error!(
             event = "storage_budget_critical",
             db_size_bytes = sample.db_size_bytes,
             budget_bytes,
-            ratio = sample.budget_ratio,
+            ratio,
             "database size is at or above 95% of storage.budget_bytes",
         ),
     }
@@ -222,8 +235,8 @@ pub struct StorageSampler {
     pub redis: ConnectionManager,
     /// `firehose.stream_key`.
     pub stream_key: String,
-    /// `storage.budget_bytes`.
-    pub budget_bytes: u64,
+    /// `storage.budget_bytes`; `None` for no budget.
+    pub budget_bytes: Option<u64>,
     /// `lists.subscribed_max_per_member`, for `list_subscription_rows_bound`.
     pub subscribed_max_per_member: u32,
     /// `lists.subscribed_max_items`, for `list_subscription_rows_bound`.
@@ -311,6 +324,63 @@ mod tests {
         assert_eq!(budget_level(0.949), BudgetLevel::Warn);
         assert_eq!(budget_level(0.95), BudgetLevel::Critical);
         assert_eq!(budget_level(1.2), BudgetLevel::Critical);
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The exported series and the log lines of one sample.
+    fn record(budget_bytes: Option<u64>) -> (String, String) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).with_max_level(tracing::Level::INFO).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let db_size_bytes = 97_000;
+        let sample = DbSample {
+            tables: vec![TableSample { table: "posts".into(), rows: 3, bytes: 8192 }],
+            db_size_bytes,
+            budget_ratio: budget_ratio(db_size_bytes, budget_bytes),
+            scope_dids_total: 1,
+            members_total: 1,
+            member_denials_total: 0,
+        };
+        record_db_sample(&sample, budget_bytes);
+        let text = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("utf-8");
+        (handle.render(), text)
+    }
+
+    #[test]
+    fn no_budget_exports_no_ratio_and_logs_no_warning() {
+        assert_eq!(budget_ratio(97_000, None), None);
+        let (metrics, logs) = record(None);
+        assert!(!metrics.contains(METRIC_DB_BUDGET_RATIO), "{metrics}");
+        assert!(metrics.contains("db_size_bytes 97000"), "{metrics}");
+        assert!(metrics.contains("db_table_bytes{table=\"posts\"} 8192"), "{metrics}");
+        assert!(!logs.contains("storage_budget"), "{logs}");
+    }
+
+    #[test]
+    fn a_budget_exports_the_ratio_and_warns() {
+        assert_eq!(budget_ratio(50, Some(100)), Some(0.5));
+        let (metrics, logs) = record(Some(100_000));
+        assert!(metrics.contains("db_budget_ratio 0.97"), "{metrics}");
+        assert!(logs.contains("storage_budget_critical") && logs.contains("ERROR"), "{logs}");
+        let (metrics, logs) = record(Some(1_000_000));
+        assert!(metrics.contains("db_budget_ratio 0.097"), "{metrics}");
+        assert!(!logs.contains("storage_budget"), "{logs}");
     }
 
     #[test]

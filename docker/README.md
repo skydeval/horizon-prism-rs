@@ -382,7 +382,7 @@ If any appear, run `admin resync --private-and-members` now.
   ```
 
 - **Stalls:** if all sidecars stall, kryphocron reads fail closed within about 2 minutes and recover once ingest catches up.
-- **Disk:** the app warns at 80% and 95% of `storage.budget_bytes` (default 200 GiB).
+- **Disk:** the app warns at 80% and 95% of `storage.budget_bytes`. It is not set by default; until it is, Health shows an amber Storage budget check and nothing warns.
 - **Load on the community PDS:** per PDS host, at most about 25 head checks/s, 20 read-time checks/s and 5 backfill requests/s (`[sync]`, `[backfill]`). At 25/s, about 1100 tracked accounts per host stay fresh. Lower `community.max_members` to reduce it.
 
 ## Forwarding a service to another server

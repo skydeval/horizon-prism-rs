@@ -994,18 +994,12 @@ impl Default for RetentionConfig {
 }
 
 /// `[storage]` (§4.6).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
-    pub budget_bytes: u64,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            budget_bytes: 200 * 1024 * 1024 * 1024,
-        }
-    }
+    /// The space the database may use. `None` (the default) is no budget:
+    /// no ratio, no budget warnings, and an amber Health check.
+    pub budget_bytes: Option<u64>,
 }
 
 /// Upstream auth mode for a routing-table network (§8.1).

@@ -53,7 +53,7 @@ Only these stop a start (exit 78):
 | `[sync]`, `[backfill]`, `[index_request]` | Load on PDSes: head checks, backfill rate, catch-up. |
 | `[constellation]` | Upstream AppViews by PDS pattern, their rates, and the lookup order. |
 | `[microcosm]`, `[counts]` | Constellation and Slingshot URLs; where public counts come from. |
-| `[retention]`, `[storage]` | What is deleted and when; the disk budget. |
+| `[retention]`, `[storage]` | What is deleted and when; the storage budget (`budget_bytes`, the space the database may use; not set by default, and Health warns until it is). |
 | `[cache]` | In-process cache sizes. |
 | `[rate_limits]`, `[auth]` | Request limits per class; limits on token checks. |
 | `[admin]` | Admin UI on/off, session lifetimes, live feed snippets. |

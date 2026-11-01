@@ -117,7 +117,7 @@ pub enum Kind {
     Service(&'static str),
     /// A whole number in a range, with its unit in words.
     Whole { min: i64, max: i64, unit: &'static str },
-    /// A size in bytes, entered and shown in GB.
+    /// A size in bytes, entered and shown in GB; empty means not set.
     Gigabytes,
     /// A number above 0.
     Decimal { max: f64, unit: &'static str },
@@ -257,7 +257,7 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
         one(Storage, "retention.tombstone_days", "Remember deleted records for", "How long Prism remembers deleted records, so a late copy of one is not stored again.", whole(1, 3650, "days")),
         one(Storage, "retention.max_age_days", "Delete public records older than", "Public records older than this are deleted, except those kept for members. 0 keeps them.", whole(0, 36_500, "days")),
         one(Storage, "retention.run_at_utc", "Daily clean-up time", "When the daily clean-up runs (UTC).", Kind::TimeOfDay),
-        one(Storage, "storage.budget_bytes", "Database size before a warning", "How big the database may grow before Prism warns you. Shown in GB.", Kind::Gigabytes),
+        one(Storage, "storage.budget_bytes", "Storage budget", "The space the database may use, leaving room for the disk's other uses. Prism warns at 80% and 95% of it. Shown in GB. Empty means not set, and then nothing warns before the disk fills.", Kind::Gigabytes),
         one(Storage, "scope.reply_quote_days", "Keep accounts members replied to or quoted", "How long an account a member replied to or quoted stays indexed after the member's last reply or quote. 0: replies and quotes never keep an account indexed.", whole(0, 3650, "days")),
         one(Storage, "scope.like_repost_days", "Keep accounts members liked or reposted", "How long an account a member liked or reposted stays indexed after the member's last like or repost. 0: likes and reposts never keep an account indexed.", whole(0, 3650, "days")),
         one(Storage, "scope.rebuild_grace_days", "Extra days before an account is removed", "Extra days an account nobody follows, subscribes to or has interacted with recently stays indexed before it is removed. 0 removes it at the next nightly check.", whole(0, 30, "days")),
@@ -645,6 +645,7 @@ pub fn words(kind: &Kind, v: &Value, ctx: &Context) -> String {
     let text = form_text(kind, v);
     match kind {
         Kind::Whole { unit, .. } => format!("{text} {unit}"),
+        Kind::Gigabytes if v.is_null() => "not set".to_string(),
         Kind::Gigabytes => format!("{text} GB"),
         Kind::Decimal { unit, .. } => format!("{text} {unit}"),
         Kind::OptionalText if v.is_null() => "Prism's own text".to_string(),
@@ -693,7 +694,10 @@ pub fn parse(kind: &Kind, text: &str, ctx: &Context) -> Result<Value, String> {
             if (*min..=*max).contains(&n) { Ok(Value::from(n)) } else { Err(format!("enter a whole number from {min} to {max}")) }
         }
         Kind::Gigabytes => {
-            let gb: f64 = number(text).parse().map_err(|_| "enter a size in GB, such as 200".to_string())?;
+            if number(text).is_empty() {
+                return Ok(Value::Null);
+            }
+            let gb: f64 = number(text).parse().map_err(|_| "enter a size in GB, such as 900, or leave it empty for no budget".to_string())?;
             if !(gb.is_finite() && gb > 0.0 && gb <= 1_000_000.0) {
                 return Err("enter a size in GB above 0".to_string());
             }
@@ -823,7 +827,7 @@ mod tests {
             let overrides: Vec<(String, Value)> = unit.iter().map(|k| (k.clone(), value_at(&json, k))).collect();
             let cfg = overlay::build(&toml::Table::new(), &overrides, &defaults).unwrap_or_else(|e| panic!("{key}: {e}"));
             let v = value_at(&json, key);
-            assert!(!v.is_null() || key.starts_with("honest_501.public_"), "{key} has a default");
+            assert!(!v.is_null() || key.starts_with("honest_501.public_") || key == "storage.budget_bytes", "{key} has a default");
             assert!(overlay::same(&value_at(&overlay::json(&cfg), key), &v), "{key}");
             // An extra service written out is a block of its own; every
             // other key leaves the configuration exactly the default.
@@ -875,6 +879,16 @@ mod tests {
         assert_eq!(parse(&k("community.max_members"), "1,000", &ctx), Ok(json!(1000)));
         assert_eq!(parse(&k("storage.budget_bytes"), "200", &ctx), Ok(json!(214_748_364_800u64)));
         assert_eq!(form_text(&k("storage.budget_bytes"), &json!(214_748_364_800u64)), "200");
+        assert_eq!(words(&k("storage.budget_bytes"), &json!(214_748_364_800u64), &ctx), "200 GB");
+        // The budget may be left unset: empty is null, and null reads back
+        // empty and is "not set".
+        for empty in ["", "  "] {
+            assert_eq!(parse(&k("storage.budget_bytes"), empty, &ctx), Ok(Value::Null));
+        }
+        assert_eq!(form_text(&k("storage.budget_bytes"), &Value::Null), "");
+        assert_eq!(words(&k("storage.budget_bytes"), &Value::Null, &ctx), "not set");
+        assert_eq!(parse(&k("storage.budget_bytes"), "0", &ctx), Err("enter a size in GB above 0".into()));
+        assert!(parse(&k("storage.budget_bytes"), "lots", &ctx).is_err());
         assert_eq!(parse(&k("community.enroll_pds_patterns"), "PDS.example.com\n*.example.net", &ctx), Ok(json!(["pds.example.com", "*.example.net"])));
         assert!(parse(&k("community.enroll_pds_patterns"), "https://x", &ctx).is_err());
         assert_eq!(parse(&k("trends.descriptions"), "#rust: about Rust\n", &ctx), Ok(json!({"rust": "about Rust"})));

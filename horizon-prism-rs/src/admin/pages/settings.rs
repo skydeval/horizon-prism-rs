@@ -144,8 +144,14 @@ fn group_of(key: &str, ctx: &SettingsContext) -> Option<Group> {
     registry::lookup(key, &ctx.networks()).map(|(s, _)| s.group)
 }
 
+/// Where `key` is changed. The Communities settings have their own page,
+/// not a generic settings page.
 fn href(key: &str, ctx: &SettingsContext) -> String {
-    group_of(key, ctx).map_or_else(|| "/admin/settings".to_string(), |g| format!("/admin/settings/{}", g.slug()))
+    match group_of(key, ctx) {
+        Some(Group::Communities) => "/admin/communities".to_string(),
+        Some(g) => format!("/admin/settings/{}", g.slug()),
+        None => "/admin/settings".to_string(),
+    }
 }
 
 /// The saved value of `key`, else the file's.

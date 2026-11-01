@@ -23,6 +23,15 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **No default storage budget.** `[storage] budget_bytes` is no longer
+  200 GiB unless set. Until an operator sets one, Health shows an amber
+  Storage budget check, `db_budget_ratio` is not exported and no budget
+  warnings are logged; the database figures read "(no budget set)". The
+  admin UI's field may be left empty for not set. The sample `app.toml`
+  ships it commented out. An instance that set it keeps its value.
+  **Upgrade:** an instance that relied on the old default has no budget
+  until it sets one. The Health check "Database budget" is now "Storage
+  budget".
 - **Smaller profile table.** Accounts' stored profiles, handles and
   statuses are stored by account id, with the profile record kept whole and
   compressed in the background once 10,000 profiles are stored. In

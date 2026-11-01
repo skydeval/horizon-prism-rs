@@ -42,7 +42,6 @@ const METRICS: &str = "firehose_consumer_group_present 1\n\
     firehose_consumer_lag_entries 200000\n\
     firehose_worker_delay_seconds{relay=\"bsky\"} 4\n\
     firehose_entries_processed_total{path=\"live\"} 1000\n\
-    db_budget_ratio 0.85\n\
     db_size_bytes 1000000000\n\
     redis_memory_ratio 0.1\n\
     private_read_content_total{form=\"content\"} 7\n";
@@ -56,6 +55,13 @@ fn ring() -> Arc<Ring> {
     ring
 }
 
+/// The test configuration with a storage budget the database is 85% of.
+fn with_budget() -> crate::config::FileConfig {
+    let mut file = test_support::no_auto_join();
+    file.storage.budget_bytes = Some(1_176_470_588);
+    file
+}
+
 fn last_command(q: &[Queued]) -> (String, Value, Option<String>) {
     q.last().cloned().expect("a command")
 }
@@ -64,7 +70,7 @@ fn last_command(q: &[Queued]) -> (String, Value, Option<String>) {
 #[allow(clippy::too_many_lines)]
 async fn health_jobs_and_home() {
     let inputs = HealthInputs { metrics: Some(Arc::new(Fixed(METRICS.to_string()))), ring: ring(), ..HealthInputs::default() };
-    let Some(h) = harness_full("admin_health_pages", quick(), true, inputs).await else {
+    let Some(h) = harness_config("admin_health_pages", quick(), true, inputs, with_budget()).await else {
         return;
     };
     let alice = complete_setup(&h, ALICE).await;
@@ -77,7 +83,8 @@ async fn health_jobs_and_home() {
     assert_eq!(health.status, 200, "{}", health.body);
     for text in [
         "Prism is 200,000 records behind the network.",
-        "The database is at 85% of its budget.",
+        "The database is at 85% of its budget (1.0 GB of 1.2 GB).",
+        "1.0 GB of 1.2 GB (85%)",
         "Prism is reading the network stream.",
         "bsky is up to date",
         "No data: none have been counted since Prism started.",
@@ -200,7 +207,7 @@ async fn health_jobs_and_home() {
 /// never fine, and the figures say "unknown".
 #[tokio::test]
 async fn no_metrics_means_no_data() {
-    let Some(h) = harness("admin_health_no_metrics").await else {
+    let Some(h) = harness_config("admin_health_no_metrics", quick(), true, HealthInputs::default(), with_budget()).await else {
         return;
     };
     let alice = complete_setup(&h, ALICE).await;
@@ -212,6 +219,30 @@ async fn no_metrics_means_no_data() {
     assert!(health.body.contains("unknown"), "{}", health.body);
     let home = get(&alice, &format!("{}/admin", h.base)).await;
     assert!(home.body.contains("no data yet"), "{}", home.body);
+    h.db.drop_db().await;
+}
+
+/// With no storage budget set, Health's Storage budget check is amber and
+/// says how to set one, the figures say so, and Home lists it.
+#[tokio::test]
+async fn no_budget_is_a_warning() {
+    let inputs = HealthInputs { metrics: Some(Arc::new(Fixed(METRICS.to_string()))), ring: ring(), ..HealthInputs::default() };
+    let Some(h) = harness_full("admin_health_no_budget", quick(), true, inputs).await else {
+        return;
+    };
+    assert_eq!(test_support::no_auto_join().storage.budget_bytes, None, "not set by default");
+    let alice = complete_setup(&h, ALICE).await;
+    let warning = "No storage budget is set, so Prism cannot warn you before the disk fills. Set one under Settings → Storage: the space the database may use, leaving room for the disk";
+    let health = get(&alice, &format!("{}/admin/health", h.base)).await;
+    assert_eq!(health.status, 200);
+    for text in ["Storage budget", warning, "1.0 GB (no budget set)", "/admin/settings/storage"] {
+        assert!(health.body.contains(text), "{text}: {}", health.body);
+    }
+    assert!(!health.body.contains("of its budget ("), "{}", health.body);
+    let home = get(&alice, &format!("{}/admin", h.base)).await;
+    assert!(home.body.contains("Needs attention") && home.body.contains(warning) && home.body.contains("1.0 GB (no budget set)"), "{}", home.body);
+    let stats = get(&alice, &format!("{}/admin/stats", h.base)).await;
+    assert_eq!(stats.status, 200);
     h.db.drop_db().await;
 }
 

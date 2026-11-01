@@ -92,6 +92,14 @@ pub struct PendingView {
     pub dids: i64,
 }
 
+/// `app.toml` changed under a value saved on this page: what it says now.
+pub struct FileChange {
+    pub key: &'static str,
+    pub what: &'static str,
+    pub file: String,
+    pub version: i64,
+}
+
 #[derive(Template)]
 #[template(path = "communities.html")]
 struct CommunitiesPage {
@@ -103,6 +111,30 @@ struct CommunitiesPage {
     communities: Vec<CommunityView>,
     pending: Vec<PendingView>,
     unlisted: Vec<Unlisted>,
+    file_changes: Vec<FileChange>,
+}
+
+/// This page's two settings whose `app.toml` value changed under the saved
+/// one. Only keeping the saved value is offered here: taking the file's can
+/// end restored accounts, so it goes through the list's own edits and their
+/// confirmation.
+async fn file_changes(state: &AdminState) -> Result<Vec<FileChange>, sqlx::Error> {
+    let rows = crate::admin::settings::store::rows(&state.pool).await?;
+    Ok([(ENABLED, "Keep these accounts"), (LIST, "Communities")]
+        .into_iter()
+        .filter_map(|(key, what)| {
+            let row = rows.iter().find(|r| r.key == key && r.file_notice)?;
+            let file = row.file_value.as_ref().and_then(|f| f.get("value")).cloned().unwrap_or(Value::Null);
+            let file = match &file {
+                Value::Bool(on) => if *on { "on" } else { "off" }.to_string(),
+                Value::Array(list) if list.is_empty() => "no communities".to_string(),
+                Value::Array(list) => list.iter().filter_map(|c| c.get("name").and_then(Value::as_str)).collect::<Vec<_>>().join(", "),
+                Value::Null => "nothing".to_string(),
+                other => other.to_string(),
+            };
+            Some(FileChange { key, what, file, version: row.version })
+        })
+        .collect())
 }
 
 /// The value `serve` runs with, and the saved row's version.
@@ -178,6 +210,10 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         }
     }
     unlisted.sort_by(|a, b| a.name.cmp(&b.name));
+    let file_changes = match file_changes(&state).await {
+        Ok(f) => f,
+        Err(e) => return super::internal_error(&state, &e),
+    };
     render(
         StatusCode::OK,
         &CommunitiesPage {
@@ -189,6 +225,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             communities: list.iter().map(|c| view(c, &counts)).collect(),
             pending,
             unlisted,
+            file_changes,
         },
     )
 }

@@ -106,10 +106,10 @@ pub fn stream_words(now: Option<&Snapshot>) -> String {
 #[allow(clippy::cast_precision_loss)]
 pub fn database_words(state: &AdminState, now: Option<&Snapshot>) -> String {
     let budget = state.settings.running.storage.budget_bytes;
-    match now.and_then(|s| s.sum(crate::db::sampler::METRIC_DB_SIZE)) {
-        None => UNKNOWN.to_string(),
-        Some(size) if budget > 0 => format!("{} of {} ({:.0}%)", bytes(size), bytes(budget as f64), size / budget as f64 * 100.0),
-        Some(size) => bytes(size),
+    match (now.and_then(|s| s.sum(crate::db::sampler::METRIC_DB_SIZE)), budget) {
+        (None, _) => UNKNOWN.to_string(),
+        (Some(size), Some(budget)) if budget > 0 => format!("{} of {} ({:.0}%)", bytes(size), bytes(budget as f64), size / budget as f64 * 100.0),
+        (Some(size), _) => format!("{} (no budget set)", bytes(size)),
     }
 }
 

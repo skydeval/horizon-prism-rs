@@ -229,7 +229,7 @@ notification_days = 90
 run_at_utc = "04:00"
 
 [storage]
-budget_bytes = 214748364800
+# budget_bytes = 1000000000000
 
 [constellation]
 requester_share = 0.25
@@ -1125,13 +1125,26 @@ fn zero_values_that_break_runtime_are_rejected() {
         ("private_search", "scan_candidates"),
         ("private_search", "span_hours"),
         ("private_search", "max_age_days"),
-        ("storage", "budget_bytes"),
         ("identity", "jwt_issuer_tracker_max"),
     ] {
         let text = format!("[{section}]\n{key} = 0\n");
         let p = invalid_problems(load(&text));
         assert!(has(&p, &format!("{section}.{key} must be greater than 0")), "{section}.{key}");
     }
+}
+
+/// The storage budget is not set unless the file sets it; set, it is
+/// kept; 0 is refused.
+#[test]
+fn storage_budget_is_unset_by_default() {
+    assert_eq!(FileConfig::default().storage.budget_bytes, None);
+    assert_eq!(load("").expect("defaults").file.storage.budget_bytes, None);
+    assert_eq!(load("[storage]\n").expect("an empty section").file.storage.budget_bytes, None);
+    assert_eq!(load("[storage]\nbudget_bytes = 214748364800\n").expect("set").file.storage.budget_bytes, Some(214_748_364_800));
+    let p = invalid_problems(load("[storage]\nbudget_bytes = 0\n"));
+    assert!(has(&p, "storage.budget_bytes must be greater than 0"), "{p:?}");
+    assert!(load("[storage]\nbudget_bytes = -1\n").is_err());
+    assert!(load("[storage]\nbudget = 1\n").is_err(), "unknown keys are still refused");
 }
 
 /// T-F5 (fast-reads design §4.1): `membership_valid_for_secs` is 60 to

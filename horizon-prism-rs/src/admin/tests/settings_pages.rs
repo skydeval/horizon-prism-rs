@@ -127,10 +127,57 @@ async fn settings_pages_and_their_forms() {
     let keep = post(&alice, &url("/admin/settings/keep"), &[("csrf", &csrf), ("key", "retention.tombstone_days"), ("version", "1")]).await;
     assert_eq!(keep.status, 303, "{}", keep.body);
     assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "retention.tombstone_days", "value": 3, "base_version": 1}]})));
+
+    // The storage budget is not set by default: an empty field is no
+    // change, a size is saved in bytes, and emptying a saved size saves
+    // "not set" (null).
+    let storage = alice.get(&url("/admin/settings/storage")).await;
+    assert!(storage.body.contains("name=\"storage.budget_bytes\"") && storage.body.contains("not set"), "{}", storage.body);
+    let unchanged = post(&alice, &url("/admin/settings/storage"), &[("csrf", &csrf), ("storage.budget_bytes", "")]).await;
+    assert!(unchanged.body.contains("Nothing changed"), "{}", unchanged.body);
+    let sized = post(&alice, &url("/admin/settings/storage"), &[("csrf", &csrf), ("storage.budget_bytes", "900"), ("version:storage.budget_bytes", "0")]).await;
+    assert_eq!(sized.status, 303, "{}", sized.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "storage.budget_bytes", "value": 966_367_641_600u64, "base_version": 0}]})));
+    sqlx::query("INSERT INTO operator_settings (key, value, updated_by) VALUES ('storage.budget_bytes', '966367641600', 'cli')").execute(p).await.expect("row");
+    let storage = alice.get(&url("/admin/settings/storage")).await;
+    assert!(storage.body.contains("900 GB") && storage.body.contains("Use the default (not set)"), "{}", storage.body);
+    let emptied = post(&alice, &url("/admin/settings/storage"), &[("csrf", &csrf), ("storage.budget_bytes", " "), ("version:storage.budget_bytes", "1")]).await;
+    assert_eq!(emptied.status, 303, "{}", emptied.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "storage.budget_bytes", "value": null, "base_version": 1}]})));
     // A forged form changes nothing (T-A7).
     let before = queued(p).await.len();
     let forged = post(&alice, &url("/admin/settings/access"), &[("csrf", "forged"), ("threadlens.access", "members")]).await;
     assert_eq!(forged.status, 403);
     assert_eq!(queued(p).await.len(), before);
+    h.db.drop_db().await;
+}
+
+/// A file change under a Communities setting links to the Communities page,
+/// which offers to keep the saved value, and keeping it queues the same value.
+#[tokio::test]
+async fn a_communities_file_change_links_to_its_page() {
+    let Some(h) = harness("admin_settings_communities_notice").await else {
+        return;
+    };
+    let alice = complete_setup(&h, ALICE).await;
+    let p = h.pool();
+    let url = |path: &str| format!("{}{path}", h.base);
+    sqlx::query(
+        "INSERT INTO operator_settings (key, value, updated_by, file_notice, file_value) \
+         VALUES ('refract.enabled', 'true', 'cli', true, '{\"value\": false, \"explicit\": true}')",
+    )
+    .execute(p)
+    .await
+    .expect("row");
+    let home = alice.get(&url("/admin")).await;
+    assert!(home.body.contains("href=\"/admin/communities\""), "{}", home.body);
+    assert!(!home.body.contains("href=\"/admin/settings/communities\""), "{}", home.body);
+    let page = alice.get(&url("/admin/communities")).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("app.toml now says off") && page.body.contains("Keep the saved value"), "{}", page.body);
+    let csrf = csrf_of(&page);
+    let keep = post(&alice, &url("/admin/settings/keep"), &[("csrf", &csrf), ("key", "refract.enabled"), ("version", "1")]).await;
+    assert_eq!(keep.status, 303, "{}", keep.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "refract.enabled", "value": true, "base_version": 1}]})));
     h.db.drop_db().await;
 }

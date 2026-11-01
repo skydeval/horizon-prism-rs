@@ -17,7 +17,7 @@ Key metrics:
 | `members_not_ready_total` | Members still in their first indexing. |
 | `backfill_jobs{state}` | Backfill queue; `failed` should stay at 0. |
 | `redis_memory_ratio` | Redis memory against `REDIS_MAXMEMORY`. |
-| `db_budget_ratio` | Database size against `storage.budget_bytes`. |
+| `db_budget_ratio` | Database size against `storage.budget_bytes`; not exported while no budget is set. |
 | `record_recompress_remaining`, `profile_record_recompress_remaining`, `other_record_recompress_remaining`, `posts_dead_rows` | Post records, profile records and other kept records (lists, starter packs, gates, polls, labelers, settings) not yet compressed after an upgrade, and the dead rows the rewrite left in `posts`. |
 | `xrpc_requests_total{nsid,class}`, `xrpc_request_seconds{nsid}` | Requests and latency per method. |
 | `upstream_skipped_total{network,reason}` | Upstream calls skipped for rate, deadline or a tripped breaker. |
@@ -111,7 +111,7 @@ Related client-visible states:
 
 **Dead letters.** `admin deadletter list`, then `replay` to fetch the record again from its PDS, or `drop`. Replaying one for a member also re-syncs that member.
 
-**Disk filling.** Horizon-Prism warns at 80% and 95% of `storage.budget_bytes`. The admin Health page turns amber under 10% free. Space freed by deletions is reused by Postgres, not returned to the filesystem.
+**Disk filling.** Horizon-Prism warns at 80% and 95% of `storage.budget_bytes`, which is not set by default: set it, or nothing warns before the disk fills. The admin Health page turns amber under 10% free. Space freed by deletions is reused by Postgres, not returned to the filesystem.
 
 **Space after the 0057 upgrade.** Once 10,000 posts are stored, their records are compressed in the background. The old row versions are dead space that Postgres reuses but does not return to the disk. To return it, run `VACUUM FULL posts` in a quiet hour (it locks the table), or `pg_repack -t posts` without the lock.
 

@@ -346,8 +346,10 @@ notification_days = 90
 run_at_utc = "04:00"
 
 [storage]
-# 200 GiB. Drives db_budget_ratio and the budget warnings.
-budget_bytes = 214748364800
+# The space the database may use; Prism warns at 80% and 95%. Not set by
+# default: set it for this host, e.g. the disk's free space less room for
+# its other uses.
+# budget_bytes = 1000000000000
 
 # Every upstream that public requests reach has one request bucket. Each is
 # split in two: signed-in members of this AppView draw on their own part

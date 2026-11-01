@@ -214,6 +214,39 @@ async fn t_a10_startup_rule() {
     f.finish().await;
 }
 
+/// The storage budget may be unset: a saved null over a file that sets it
+/// is no budget at the next start, kept in the row and the history as
+/// null; a size saved later applies; 0 is refused.
+#[tokio::test]
+async fn storage_budget_saved_as_not_set() {
+    const KEY: &str = "storage.budget_bytes";
+    let Some(f) = fixture("settings_budget_null", "[storage]\nbudget_bytes = 900000000000\n").await else {
+        return;
+    };
+    let (p, env) = (f.pool(), env(false, false));
+    let (cfg, _) = f.load(false);
+    assert_eq!(cfg.file.storage.budget_bytes, Some(900_000_000_000));
+    let saved = store::set(p, &f.path, &env, &[set(KEY, Value::Null, 0)], OPERATOR, None).await.expect("db").expect("saved");
+    assert_eq!(saved.candidate.storage.budget_bytes, None);
+    let (value, version, _, _, _, file_value) = row(p, KEY).await.expect("row");
+    assert_eq!((value, version), (Value::Null, 1));
+    assert_eq!(file_value, Some(json!({"value": 900_000_000_000u64, "explicit": true})));
+    assert_eq!(history(p, KEY).await, [(None, Some(Value::Null), OPERATOR.to_string(), None)]);
+    let (cfg, table) = f.load(false);
+    let started = store::at_startup(p, cfg, &table).await.expect("startup");
+    assert_eq!(started.cfg.file.storage.budget_bytes, None, "the saved null wins over the file");
+    assert!(started.set_aside.is_empty() && started.file_changed.is_empty());
+    let running = super::overlay::json(&started.cfg.file);
+    assert!(store::waiting(&store::rows(p).await.expect("rows"), &super::overlay::json(&f.load(false).0.file), &running, &[]).is_empty());
+    // A size saved later applies; 0 is refused.
+    store::set(p, &f.path, &env, &[set(KEY, json!(1_000_000_000_000u64), 1)], OPERATOR, None).await.expect("db").expect("saved");
+    let (cfg, table) = f.load(false);
+    assert_eq!(store::at_startup(p, cfg, &table).await.expect("startup").cfg.file.storage.budget_bytes, Some(1_000_000_000_000));
+    let zero = store::set(p, &f.path, &env, &[set(KEY, json!(0), 2)], OPERATOR, None).await.expect("db");
+    assert!(zero.as_ref().is_err_and(|e| e.starts_with("Not saved") && e.contains("storage.budget_bytes must be greater than 0")), "{zero:?}");
+    f.finish().await;
+}
+
 /// T-A17 at the overlay: with `farsight.memory.enabled = false` in the
 /// file and `true` saved, the effective configuration the startup
 /// truncation reads has the memory on; with nothing saved, off.
