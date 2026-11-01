@@ -699,7 +699,7 @@ fn the_checks_find_their_shapes() {
     assert_eq!(count(r#"const Q: &str = "SELECT at_uri(author, 2::smallint, rkey) AS uri FROM likes";"#, text_column_findings), 0);
     assert_eq!(count(r#"const Q: &str = "INSERT INTO follows (author, rkey, subject_did) VALUES (1, 2, 3)";"#, text_column_findings), 1);
     // A nested group that binds the alias again is that table's.
-    let shadow = r#"const Q: &str = "SELECT 1 FROM posts p WHERE EXISTS (SELECT 1 FROM private_posts p WHERE p.uri = $1)";"#;
+    let shadow = r#"const Q: &str = "SELECT 1 FROM posts p WHERE EXISTS (SELECT 1 FROM uri_rows p WHERE p.uri = $1)";"#;
     assert_eq!(count(shadow, text_column_findings), 0);
     assert_eq!(count(r#"const Q: &str = "SELECT 1 FROM thread_mutes t WHERE t.root_uri LIKE 'at://%'";"#, uri_like_findings), 1);
     assert_eq!(count(r#"const Q: &str = "SELECT 1 FROM actors a WHERE a.handle ILIKE $2";"#, uri_like_findings), 0);
