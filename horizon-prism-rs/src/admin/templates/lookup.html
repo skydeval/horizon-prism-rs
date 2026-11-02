@@ -60,6 +60,14 @@ member follows, or someone a member replied to, quoted, liked or reposted lately
 {% endfor %}
 <p class="muted">Counts only. Prism never shows private posts here.</p>
 </div>
+{% if let Some(r) = f.refract %}
+<div class="card">
+<h3>Communities · Refract</h3>
+{% for x in r.facts %}<div class="fact"><span class="l">{{ x.label }}</span><span class="v">{{ x.value }}</span></div>
+{% endfor %}
+<p><a href="{{ r.href }}">See the account</a></p>
+</div>
+{% endif %}
 </div>
 
 <h2>Labels</h2>

@@ -28,7 +28,8 @@ use super::members::farsight_flags;
 use super::{Nav, css, render, when, when_opt};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
-use crate::admin::menu::PageId;
+use super::refract::state_words;
+use crate::admin::menu::{PageId, account_href};
 use crate::admin::health::count;
 use crate::admin::operators::endpoint_host;
 use crate::aggregations::policy::{REASON_FOLLOWED, REASON_INTERACTED, REASON_MEMBER, REASON_SUBSCRIBED};
@@ -100,6 +101,15 @@ pub struct Found {
     /// The add-a-label form's subject: the record, else the account.
     pub label_subject: String,
     pub choices: Vec<Choice>,
+    /// What Refract keeps of it, when it knows the account.
+    pub refract: Option<RefractCard>,
+}
+
+/// An account Refract knows: its state, its community, since when, and its
+/// page.
+pub struct RefractCard {
+    pub facts: Vec<Fact>,
+    pub href: String,
 }
 
 #[derive(Template)]
@@ -126,6 +136,7 @@ type DenialTuple = (Option<String>, String, DateTime<Utc>);
 type ScopeTuple = (i16, DateTime<Utc>, DateTime<Utc>);
 type SyncTuple = (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 type JobTuple = (String, String, i32, Option<String>, DateTime<Utc>);
+type RefractTuple = (String, String, DateTime<Utc>);
 
 /// The rows Look up reads about one account.
 struct Rows {
@@ -137,6 +148,7 @@ struct Rows {
     jobs: Vec<JobTuple>,
     remembered: i64,
     labels: Vec<LabelRow>,
+    refract: Option<RefractTuple>,
 }
 
 async fn read_rows(state: &AdminState, did: &str) -> Result<Rows, sqlx::Error> {
@@ -152,7 +164,8 @@ async fn read_rows(state: &AdminState, did: &str) -> Result<Rows, sqlx::Error> {
         .await?;
     let remembered = sqlx::query_scalar("SELECT count(*) FROM learned_inbound_blocks WHERE viewer_did = $1").bind(did).fetch_one(pool).await?;
     let labels = labels_of(state, Some(&Subject { did: did.to_string(), uri: None }), None, 50, 0).await?;
-    Ok(Rows { actor, member, denial, scope, sync, jobs, remembered, labels })
+    let refract = sqlx::query_as("SELECT community, state, coalesce(since, candidate_since, created_at) FROM refract_dids WHERE did = $1").bind(did).fetch_optional(pool).await?;
+    Ok(Rows { actor, member, denial, scope, sync, jobs, remembered, labels, refract })
 }
 
 /// The blocks Prism keeps with this account on one side, under a 2-second
@@ -339,7 +352,12 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         })
         .collect();
     let (farsight, memory) = farsight_flags(&state);
+    let refract = rows.refract.map(|(community, refract_state, since)| RefractCard {
+        facts: vec![fact("State", state_words(&refract_state)), fact("Community", community), fact("Since", when(since))],
+        href: account_href(&did),
+    });
     page.found = Some(Found {
+        refract,
         label_subject: subject.key().to_string(),
         record: subject.uri.clone(),
         record_facts,

@@ -19,6 +19,7 @@ use super::{ConfirmPage, Hidden, Nav, back_to, css, enqueue, message, render, ty
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
 use crate::admin::menu::{PageId, lookup_href};
+use crate::admin::settings::view::{self, SettingsBlock};
 use crate::admin_executor::AdminCommand;
 
 /// Members per page.
@@ -66,6 +67,8 @@ struct MembersPage {
     farsight: bool,
     /// Farsight's memory of blocks is on: offer "forget".
     memory: bool,
+    /// Auto-join and the member limit.
+    settings: SettingsBlock,
 }
 
 /// Whether Farsight is set up, and whether its memory of blocks is on.
@@ -81,6 +84,8 @@ pub fn farsight_flags(state: &AdminState) -> (bool, bool) {
 #[derive(Debug, Deserialize)]
 pub struct PageQuery {
     pub page: Option<i64>,
+    /// `advanced` opens the settings' Advanced fold.
+    pub open: Option<String>,
 }
 
 type MemberTuple = (String, Option<String>, String, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
@@ -158,6 +163,11 @@ pub async fn page(
         members.enroll_pds_patterns.join(", ")
     };
     let (farsight, memory) = farsight_flags(&state);
+    let sections = view::sections_at(view::Place::Page(PageId::Members), &state.settings.networks());
+    let settings = match view::settings_block(&state, &op.csrf, &sections, q.open.as_deref() == Some("advanced")).await {
+        Ok(b) => b,
+        Err(e) => return super::internal_error(&state, &e),
+    };
     render(
         StatusCode::OK,
         &MembersPage {
@@ -177,6 +187,7 @@ pub async fn page(
             next: has_next.then_some(page + 1),
             farsight,
             memory,
+            settings,
         },
     )
 }

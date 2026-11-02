@@ -21,9 +21,9 @@ The menu groups the pages by task. Appearance sits under your name at the top of
 | Section | Page | What it shows or does |
 |---|---|---|
 | Overview | Home | Status at a glance, and a live feed of the records Horizon-Prism writes (never kryphocron content). |
-| People | Members | List with readiness; add, remove, deny, allow, re-sync. |
+| People | Members | List with readiness; add, remove, deny, allow, re-sync; auto-join and the member limit. |
 | People | Operators | Operators and allowed sign-in hosts. |
-| People | Look up | Look up an account and what Horizon-Prism holds for it. |
+| People | Look up | Look up an account and what Horizon-Prism holds for it, including its Refract state. |
 | Moderation | Labels | Labels the operator applied; add and remove. |
 | Moderation | Blocks · Farsight | Farsight's status (when configured). |
 | Moderation | Communities · Refract | Refract (when used): the communities, and an Accounts tab with each account. |
@@ -33,7 +33,7 @@ The menu groups the pages by task. Appearance sits under your name at the top of
 | System | Stats | Disk use, database size against its budget, Redis memory, index sizes, requests per method. |
 | System | About this server | Read-only facts about this server. |
 | System | Audit log | Every change, who made it, how it ended, and sign-ins. |
-| System | All settings | One page per group, with the current value, default, file value and when it applies. Also read-only pages for install-time values and the full running configuration (no secrets). |
+| System | All settings | Links to the pages that hold their own settings, and one page per remaining group. Each setting shows its current value, default, file value and when it applies; rarely changed ones sit under Advanced. Also read-only pages for install-time values and the full running configuration (no secrets). |
 | Your account | Appearance | Light, dark or the device's mode, a colour scheme and a font, for your account only. |
 
 Old admin addresses redirect to their new pages.

@@ -29,6 +29,8 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Admin:** Members holds auto-join and the member limit (was "Most
+  members"); Look up shows an account's Refract state.
 - **Admin menu.** A sidebar grouped by task, with new page names (Blocks ·
   Farsight, Communities · Refract, About this server, All settings);
   Appearance sits under your name. Old admin addresses redirect. Pages use

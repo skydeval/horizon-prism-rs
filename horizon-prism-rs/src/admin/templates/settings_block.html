@@ -1,0 +1,20 @@
+<form id="settings" class="stack" method="post" action="/admin/settings/save">
+<input type="hidden" name="csrf" value="{{ settings.csrf }}">
+{% if !settings.everyday.is_empty() %}
+<div class="settings-cards">
+{% for s in settings.everyday %}{% include "settings_card.html" %}{% endfor %}
+</div>
+{% endif %}
+{% if !settings.advanced.is_empty() %}
+<details class="advanced" id="advanced"{% if settings.open %} open{% endif %}><summary>Advanced</summary>
+<div class="settings-cards">
+{% for s in settings.advanced %}{% include "settings_card.html" %}{% endfor %}
+</div>
+</details>
+{% endif %}
+<div class="row"><button type="submit">Save changes</button></div>
+</form>
+{% for s in settings.cards() %}{% for f in s.fields %}{% if f.reset.is_some() %}
+<form id="reset-{{ f.key }}" method="post" action="/admin/settings/reset"><input type="hidden" name="csrf" value="{{ settings.csrf }}"><input type="hidden" name="key" value="{{ f.key }}"><input type="hidden" name="version" value="{{ f.version }}"></form>
+<form id="keep-{{ f.key }}" method="post" action="/admin/settings/keep"><input type="hidden" name="csrf" value="{{ settings.csrf }}"><input type="hidden" name="key" value="{{ f.key }}"><input type="hidden" name="version" value="{{ f.version }}"></form>
+{% endif %}{% endfor %}{% endfor %}

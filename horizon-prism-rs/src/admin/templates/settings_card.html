@@ -1,0 +1,32 @@
+<div class="card" id="s-{{ s.slug }}">
+<h2>{{ s.title }}</h2>
+<p>{{ s.help }}</p>
+<p><span class="pill{% if s.applies == "Applies at once" %} on{% endif %}">{{ s.applies }}</span></p>
+{% if let Some(w) = s.warning %}<div class="banner bad">{{ w }}</div>{% endif %}
+{% for f in s.fields %}
+{% if s.fields.len() > 1 %}<h3>{{ f.label }}</h3>{% endif %}
+{% if let Some(problem) = f.set_aside %}<div class="banner bad">This saved value could not be used when Prism last started, so app.toml's value is in use: {{ problem }}</div>{% endif %}
+{% if let Some(file) = f.file_notice %}<div class="banner">app.toml now says {{ file }}; your saved value {{ f.current }} still applies.
+<button class="secondary" type="submit" form="reset-{{ f.key }}">Use the file's value</button>
+<button class="secondary" type="submit" form="keep-{{ f.key }}">Keep my value</button></div>{% endif %}
+<input type="hidden" name="version:{{ f.key }}" value="{{ f.version }}">
+<label for="{{ f.key }}">{% if s.fields.len() > 1 %}New value{% else %}{{ f.label }}{% endif %}{% if !f.unit.is_empty() %} ({{ f.unit }}){% endif %}</label>
+{% if f.input == "select" %}
+<select id="{{ f.key }}" name="{{ f.key }}">
+{% for o in f.options %}<option value="{{ o.value }}"{% if o.selected %} selected{% endif %}>{{ o.label }}</option>
+{% endfor %}
+</select>
+{% else if f.input == "textarea" %}
+<textarea id="{{ f.key }}" name="{{ f.key }}" rows="4" spellcheck="false">{{ f.value }}</textarea>
+{% else %}
+<input type="text" id="{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" spellcheck="false">
+{% endif %}
+<div class="fact"><span class="l">Saved now</span><span class="v">{{ f.current }}</span></div>
+{% if let Some(r) = f.running %}<div class="fact"><span class="l">In use until a restart</span><span class="v">{{ r }}</span></div>{% endif %}
+<div class="fact"><span class="l">Default</span><span class="v">{{ f.default }}</span></div>
+{% if let Some(file) = f.file %}<div class="fact"><span class="l">app.toml says</span><span class="v">{{ file }}</span></div>{% endif %}
+{% if let Some(saved) = f.saved %}<div class="fact"><span class="l">Last change</span><span class="v">{{ saved }}</span></div>{% endif %}
+{% if let Some(reset) = f.reset %}{% if f.file_notice.is_none() %}<div class="row"><button class="secondary" type="submit" form="reset-{{ f.key }}">{{ reset }}</button></div>{% endif %}{% endif %}
+<p class="muted tech">technical name: {{ f.key }}</p>
+{% endfor %}
+</div>

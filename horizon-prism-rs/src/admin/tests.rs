@@ -22,6 +22,9 @@ mod instance_pages;
 // The sidebar, the page names, the redirects from old addresses, where
 // Cancel goes, and the tables' cells.
 mod frame_pages;
+// Settings on their feature pages, the one save, and Look up's Refract
+// state.
+mod settings_homes;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

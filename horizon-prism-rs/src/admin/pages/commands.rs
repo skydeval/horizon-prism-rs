@@ -12,6 +12,7 @@ use serde_json::Value;
 use super::{COMMAND_COLUMNS, CommandRow, CommandTuple, Link, Nav, css, message, render};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
+use crate::admin::settings::view;
 
 /// An `operator add` refused for its host can be sent again allowing it.
 pub struct HostOffer {
@@ -28,10 +29,21 @@ struct CommandPage {
     row: CommandRow,
     offer: Option<HostOffer>,
     csrf: String,
-    /// The page of the account a Refract command was about.
+    /// The page of the account a Refract command was about, or of the
+    /// settings a change was to.
     follow: Option<Link>,
     /// A done restart: whether Prism is back.
     restart: Option<bool>,
+}
+
+/// A `settings set`'s way back: the page its first setting is on.
+fn settings_follow(state: &AdminState, row: &CommandRow) -> Option<Link> {
+    if row.command != "settings set" {
+        return None;
+    }
+    let key = row.args.get("changes")?.as_array()?.first()?.get("key")?.as_str()?;
+    let place = view::place_of(key, &state.settings)?;
+    Some(Link { href: view::href(key, &state.settings), label: format!("Back to {}", place.name()) })
 }
 
 /// `GET /admin/commands/{id}`.
@@ -75,13 +87,15 @@ pub async fn page(
         input: row.args.get("input").and_then(Value::as_str).unwrap_or_default().to_string(),
         note: row.args.get("note").and_then(Value::as_str).unwrap_or_default().to_string(),
     });
-    // A Refract check or end: the account's page, once it has run.
+    // A Refract check or end: the account's page, once it has run. A
+    // settings change: the page of its first setting.
     let follow = row
         .args
         .get("did")
         .and_then(Value::as_str)
         .filter(|_| matches!(row.command.as_str(), "refract check" | "refract end") && !row.pending())
-        .map(|did| Link { href: crate::admin::menu::account_href(did), label: "See the account".to_string() });
+        .map(|did| Link { href: crate::admin::menu::account_href(did), label: "See the account".to_string() })
+        .or_else(|| settings_follow(&state, &row));
     render(
         StatusCode::OK,
         &CommandPage {

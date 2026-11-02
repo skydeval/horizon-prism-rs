@@ -6,6 +6,7 @@ pub mod live;
 pub mod overlay;
 pub mod registry;
 pub mod store;
+pub mod view;
 
 #[cfg(test)]
 pub(crate) mod tests;

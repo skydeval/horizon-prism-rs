@@ -5,17 +5,13 @@
 <div class="card">
 <div class="stat"><span class="l">Members</span><span class="n">{{ total }}</span></div>
 <div class="stat"><span class="l">Ready</span><span class="n">{{ ready }}</span></div>
-<div class="stat"><span class="l">Limit for auto-join</span><span class="n">{{ max_members }}</span></div>
-<p class="muted">Members you add yourself are always accepted and count toward the limit.</p>
-</div>
-<div class="card">
-<h2>Auto-join</h2>
+<div class="stat"><span class="l">Member limit</span><span class="n">{{ max_members }}</span></div>
 {% if auto_enroll %}
-<p>On. An account on {{ patterns }} becomes a member the first time it opens a Horizon app.</p>
+<p class="muted">Auto-join is on: an account on {{ patterns }} becomes a member the first time it opens a Horizon app.</p>
 {% else %}
-<p>Off. Only the people you add are members.</p>
+<p class="muted">Auto-join is off: only the people you add are members.</p>
 {% endif %}
-<p class="muted tech">technical name: community.auto_enroll, community.enroll_pds_patterns</p>
+<p class="muted">Members you add yourself are always accepted and count toward the limit. <a href="#settings">Auto-join and the limit</a> are set below.</p>
 </div>
 <div class="card">
 <h2>Add a member</h2>
@@ -105,4 +101,7 @@ not add them.</p>
 </tbody>
 </table>
 </div>
+
+<h2>Settings</h2>
+{% include "settings_block.html" %}
 {% endblock %}

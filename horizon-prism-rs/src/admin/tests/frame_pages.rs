@@ -190,6 +190,10 @@ fn pinned() -> Vec<Rule> {
         rule("", ".layout td.text", "overflow-wrap: anywhere"),
         rule("", ".layout td.text > .cell-text", "min-width: 16rem"),
         rule("", ".layout td .wrap", "white-space: normal"),
+        rule("", ".layout .settings-cards", "display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 36rem), 1fr)); gap: 1.25rem; align-items: start"),
+        rule("", ".layout .settings-cards > .card", "margin: 0"),
+        rule("", ".layout details.advanced", "margin: 1.25rem 0"),
+        rule("", ".layout details.advanced > summary", "font-weight: 600; font-size: 0.92rem; margin-bottom: 0.75rem"),
     ]
 }
 
@@ -395,7 +399,7 @@ fn the_sidebar_css_is_the_mocks() {
     let layout = rules.iter().find(|r| r.context.is_empty() && r.selectors == ".layout").expect(".layout");
     assert!(!layout.declarations.contains("max-width"));
     assert!(!rules.iter().any(|r| r.selectors.contains(".layout.wide") || r.selectors.contains(".layout .grid > *")));
-    for s in [".layout > main", ".layout td.text"] {
+    for s in [".layout > main", ".layout td.text", ".layout .settings-cards > .card"] {
         assert!(rules.iter().filter(|r| r.selectors == s).all(|r| !r.declarations.contains("min-width")), "{s}");
     }
     // Home's 48rem rule is gone; the public page's stays.
@@ -737,18 +741,26 @@ const OLD_PATHS: &[&str] = &[
     "/admin/settings/access",
 ];
 
-/// The old paths of moved forms, which no page may post to.
+/// The old paths of moved forms, which no page may post to: each also an
+/// old group's page, `/admin/settings/{slug}`.
 const ALIASES: &[&str] = &["/admin/refract/add", "/admin/refract/check", "/admin/refract/end", "/admin/settings/appearance"];
 
-/// Every `href` and `action` of a page, as paths.
-fn targets(body: &str) -> Vec<String> {
+/// Whether a form's `action` is an old path kept only for pages loaded
+/// before it moved.
+fn is_alias(action: &str) -> bool {
+    ALIASES.contains(&action) || action.strip_prefix("/admin/settings/").is_some_and(|slug| menu::OLD_GROUP_SLUGS.contains(&slug))
+}
+
+/// Every `href` and `action` of a page, as paths, each with whether it is
+/// an `action`.
+fn targets(body: &str) -> Vec<(bool, String)> {
     let mut out = Vec::new();
     for key in ["href=\"", "action=\""] {
         for (i, _) in body.match_indices(key) {
             let rest = &body[i + key.len()..];
             let v = &rest[..rest.find('"').unwrap_or(0)];
             let path = v.split(['?', '#']).next().unwrap_or_default();
-            out.push(path.to_string());
+            out.push((key == "action=\"", path.to_string()));
         }
     }
     out
@@ -902,17 +914,23 @@ async fn only_built_pages_and_no_stale_links() {
     let resync = post(&alice, &url("/admin/members/resync"), &[("csrf", &csrf), ("did", BOB)]).await;
     let command = location(&resync).expect("command").to_string();
     pages.push((command.clone(), get(&alice, &url(&command)).await));
+    // A typed settings change's confirmation, from a group page.
+    let typed = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), ("farsight.fallback.enabled", "on")]).await;
+    assert_eq!(typed.status, 200, "{}", typed.body);
+    pages.push(("the settings confirmation".to_string(), typed));
     for (path, page) in &pages {
         let body = &page.body;
-        for t in targets(body) {
+        for (action, t) in targets(body) {
             assert!(!REDIRECTS.iter().any(|(old, _, _)| *old == t), "{path} links {t}");
             assert!(!t.starts_with(menu::OLD_ACCOUNT_PREFIX), "{path} links {t}");
-            assert!(!ALIASES.contains(&t.as_str()), "{path} posts to {t}");
+            assert!(!(action && is_alias(&t)), "{path} posts to {t}");
         }
         assert!(!body.contains("style="), "{path}: an inline style");
         assert!(!body.contains("tabindex"), "{path}: a tab index");
         assert_eq!(body.contains("<script"), path == "/admin", "{path}: scripts");
-        assert!(!body.contains("Refract accounts") && !body.contains("<h1>Instance</h1>"), "{path}: an old name");
+        for old in ["Refract accounts", "<h1>Instance</h1>", "Most members", "Limit for auto-join"] {
+            assert!(!body.contains(old), "{path}: an old name, {old}");
+        }
         assert!(current_item(body).is_some(), "{path}: not exactly one marked item: {}", sidebar(body));
     }
     h.db.drop_db().await;
@@ -970,9 +988,11 @@ async fn moved_forms_check_the_token() {
         "/admin/refract/add",
         "/admin/refract/check",
         "/admin/refract/end",
+        "/admin/settings/save",
+        "/admin/settings/access",
     ] {
         let target = format!("{}{path}", h.base);
-        let fields = [("mode", "dark"), ("scheme", "teal"), ("input", CAROL), ("did", BOB), ("confirm", "yes"), ("typed", "bbbbbbbb")];
+        let fields = [("mode", "dark"), ("scheme", "teal"), ("input", CAROL), ("did", BOB), ("confirm", "yes"), ("typed", "bbbbbbbb"), ("community.max_members", "5")];
         let mut with = vec![("csrf", other.as_str())];
         with.extend(fields);
         let mut own = vec![("csrf", csrf.as_str())];

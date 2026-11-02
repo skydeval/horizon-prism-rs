@@ -748,3 +748,10 @@ label.choice input { margin: 0; accent-color: var(--accent); }
 .layout td.text { overflow-wrap: anywhere; }
 .layout td.text > .cell-text { min-width: 16rem; }
 .layout td .wrap { white-space: normal; }
+
+/* A page's settings: its cards side by side where the column is wide
+   enough, and the rarely changed ones folded under Advanced. */
+.layout .settings-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 36rem), 1fr)); gap: 1.25rem; align-items: start; }
+.layout .settings-cards > .card { margin: 0; }
+.layout details.advanced { margin: 1.25rem 0; }
+.layout details.advanced > summary { font-weight: 600; font-size: 0.92rem; margin-bottom: 0.75rem; }

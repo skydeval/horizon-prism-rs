@@ -1,12 +1,10 @@
-//! Settings (`/admin/settings`, admin-ui design §6.3, §8): one page per
-//! group, each a form with one section per setting: its explanation, the
-//! value saved now, the default, whether it applies at once or after a
-//! restart, the value `app.toml` writes if it writes one, and the last
-//! change. Saving a group sends one `settings set` command with every
-//! changed field; the executor validates the whole configuration before
-//! anything is saved. Public data has its own form and command. Two
-//! read-only pages: what was set at install, and everything Prism is
-//! running with. And the restart (C-A4).
+//! Settings (`/admin/settings`): the index of every page that holds
+//! settings, the old group pages for the settings whose feature page does
+//! not hold them yet, and the one save every settings form posts to. A save
+//! sends one `settings set` command with every changed field; the executor
+//! validates the whole configuration before anything is saved. Public data
+//! has its own form and command. Two read-only pages: what was set at
+//! install, and everything Prism is running with. And the restart.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -14,76 +12,35 @@ use std::net::SocketAddr;
 use askama::Template;
 use axum::Form;
 use axum::extract::rejection::PathRejection;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
 
-use super::{ConfirmPage, Hidden, Nav, back_to, css, enqueue, message, render, setting_name, typed_matches, when};
+use super::{ConfirmPage, Hidden, Link, Nav, back_to, css, enqueue, message, render, setting_name, typed_matches};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
-use crate::admin::menu::PageId;
-use crate::admin::settings::registry::{self, Group, Kind, Section};
+use crate::admin::menu::{self, MENU, PageId, SETTINGS_LIVE};
+use crate::admin::settings::SettingsContext;
+use crate::admin::settings::overlay;
+use crate::admin::settings::registry::{self, Group};
 use crate::admin::settings::store::{self, Change, PUBLIC_SCOPE_KEY, Row};
-use crate::admin::settings::{SettingsContext, overlay};
+use crate::admin::settings::view::{self, Place, SettingsBlock, href, saved_rows, saved_value};
 use crate::admin_executor::AdminCommand;
 use crate::indexing::{PublicMode, ScopeValue};
 
-/// A choice of a select.
-pub struct Opt {
-    pub value: String,
-    pub label: String,
-    pub selected: bool,
-}
-
-/// One setting on its page.
-pub struct FieldView {
-    pub key: String,
-    pub label: String,
-    /// `select`, `text` or `textarea`.
-    pub input: &'static str,
-    pub value: String,
-    pub options: Vec<Opt>,
-    /// The unit beside a number.
-    pub unit: String,
-    pub current: String,
-    pub default: String,
-    /// What `app.toml` writes, when it writes the key.
-    pub file: Option<String>,
-    pub version: i64,
-    /// "by …, on …" when a value is saved.
-    pub saved: Option<String>,
-    /// Why the saved value could not be used at the last start.
-    pub set_aside: Option<String>,
-    /// `app.toml` changed under the saved value: its new value.
-    pub file_notice: Option<String>,
-    /// A restart key whose saved value is not in use yet: what is.
-    pub running: Option<String>,
-    /// The reset button's words, when a value is saved.
-    pub reset: Option<String>,
-}
-
-/// Settings explained together.
-pub struct SectionView {
-    pub title: String,
-    pub help: String,
-    pub applies: &'static str,
-    pub warning: Option<String>,
-    pub fields: Vec<FieldView>,
-}
-
-/// The public-data form (§6.3).
+/// The public-data form.
 pub struct PublicView {
     pub value: String,
     pub phase: String,
     pub on: bool,
 }
 
-/// A group in the index.
+/// A group in the index, with the titles of the settings still on it.
 pub struct GroupLink {
     pub slug: &'static str,
     pub title: &'static str,
-    pub summary: &'static str,
+    pub summary: String,
 }
 
 #[derive(Template)]
@@ -92,6 +49,8 @@ struct IndexPage {
     css: &'static str,
     nav: Option<Nav>,
     title: String,
+    /// The pages that hold their own settings.
+    own: Vec<Link>,
     groups: Vec<GroupLink>,
     aside: Vec<Notice>,
     waiting: Vec<Notice>,
@@ -103,11 +62,10 @@ struct GroupPage {
     css: &'static str,
     nav: Option<Nav>,
     title: String,
-    slug: &'static str,
     csrf: String,
-    sections: Vec<SectionView>,
     public: Option<PublicView>,
     lodestar: Option<String>,
+    settings: SettingsBlock,
 }
 
 /// A read-only row: what, its value, and why it is fixed.
@@ -142,25 +100,6 @@ pub struct Notice {
     pub text: String,
 }
 
-fn group_of(key: &str, ctx: &SettingsContext) -> Option<Group> {
-    registry::lookup(key, &ctx.networks()).map(|(s, _)| s.group)
-}
-
-/// Where `key` is changed. The Communities settings have their own page,
-/// not a generic settings page.
-fn href(key: &str, ctx: &SettingsContext) -> String {
-    match group_of(key, ctx) {
-        Some(Group::Communities) => "/admin/communities".to_string(),
-        Some(g) => format!("/admin/settings/{}", g.slug()),
-        None => "/admin/settings".to_string(),
-    }
-}
-
-/// The saved value of `key`, else the file's.
-fn saved_value(key: &str, rows: &BTreeMap<String, Row>, ctx: &SettingsContext) -> Value {
-    rows.get(key).map_or_else(|| registry::value_at(&ctx.file_json, key), |r| r.value.clone())
-}
-
 fn words_of(key: &str, v: &Value, ctx: &SettingsContext) -> String {
     let rctx = ctx.registry();
     registry::lookup(key, &rctx.networks).map_or_else(|| v.to_string(), |(_, f)| registry::words(&f.kind, v, &rctx))
@@ -189,16 +128,30 @@ pub async fn file_notices(state: &AdminState) -> Result<Vec<Notice>, sqlx::Error
         .collect())
 }
 
-fn by(label: &str) -> String {
-    match label {
-        "cli" => "the command line".to_string(),
-        "file" => "app.toml".to_string(),
-        other => other.to_string(),
-    }
+/// The pages that hold their own settings, in the menu's order:
+/// Communities, whose own forms are there, and every page live as a home.
+fn own_pages() -> Vec<Link> {
+    MENU.iter()
+        .flat_map(|(_, ids)| ids.iter())
+        .filter(|id| **id == PageId::Communities || SETTINGS_LIVE.contains(id))
+        .map(|id| Link { href: id.page().href.to_string(), label: id.title() })
+        .collect()
 }
 
-async fn saved_rows(state: &AdminState) -> Result<BTreeMap<String, Row>, sqlx::Error> {
-    Ok(store::rows(&state.pool).await?.into_iter().map(|r| (r.key.clone(), r)).collect())
+/// The groups with settings still on their page, each summed up by the
+/// titles of those settings.
+fn groups_left(ctx: &SettingsContext) -> Vec<GroupLink> {
+    let networks = ctx.networks();
+    Group::ALL
+        .into_iter()
+        .filter_map(|g| {
+            let mut titles: Vec<String> = view::sections_at(Place::Group(g), &networks).into_iter().map(|s| s.title).collect();
+            if g == Group::Storage {
+                titles.insert(0, "Public data".to_string());
+            }
+            (!titles.is_empty()).then(|| GroupLink { slug: g.slug(), title: g.title(), summary: titles.join(", ") })
+        })
+        .collect()
 }
 
 /// `GET /admin/settings`.
@@ -231,76 +184,18 @@ pub async fn index(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
             Notice { name: setting_name(&key), href: href(&key, ctx), text }
         })
         .collect();
-    let groups = Group::ALL.into_iter().map(|g| GroupLink { slug: g.slug(), title: g.title(), summary: g.summary() }).collect();
-    render(StatusCode::OK, &IndexPage { css: css(), nav: Some(Nav::page(&op, PageId::Settings)), title: "All settings".to_string(), groups, aside, waiting })
-}
-
-fn field_view(section: &Section, f: &registry::Field, rows: &BTreeMap<String, Row>, ctx: &SettingsContext) -> FieldView {
-    let rctx = ctx.registry();
-    let row = rows.get(&f.key);
-    let current = saved_value(&f.key, rows, ctx);
-    let default = registry::value_at(&crate::admin::settings::overlay::json(&crate::config::FileConfig::default()), &f.key);
-    let file_explicit = overlay::has(&ctx.file_table, &f.key);
-    let file_value = registry::value_at(&ctx.file_json, &f.key);
-    let running = registry::value_at(&ctx.running_json, &f.key);
-    let words = |v: &Value| registry::words(&f.kind, v, &rctx);
-    let mut options: Vec<Opt> = registry::options(&f.kind, &rctx)
-        .into_iter()
-        .map(|(value, label)| Opt { selected: value == registry::form_text(&f.kind, &current), value, label })
-        .collect();
-    // A saved or file value the choices do not offer stays selectable.
-    if registry::is_choice(&f.kind) && !options.iter().any(|o| o.selected) {
-        let text = registry::form_text(&f.kind, &current);
-        options.push(Opt { label: text.clone(), value: text, selected: true });
-    }
-    let unit = match &f.kind {
-        Kind::Whole { unit, .. } | Kind::Decimal { unit, .. } => (*unit).to_string(),
-        Kind::Gigabytes => "GB".to_string(),
-        Kind::TimeOfDay => "UTC".to_string(),
-        _ => String::new(),
-    };
-    let set_aside = row.and_then(|r| r.set_aside.as_ref()).map(|a| a.get("problem").and_then(Value::as_str).unwrap_or("a problem").to_string());
-    let waiting = !section.live && set_aside.is_none() && !overlay::same(&current, &running);
-    FieldView {
-        key: f.key.clone(),
-        label: f.label.clone(),
-        input: if registry::is_choice(&f.kind) {
-            "select"
-        } else if f.kind.multiline() {
-            "textarea"
-        } else {
-            "text"
+    render(
+        StatusCode::OK,
+        &IndexPage {
+            css: css(),
+            nav: Some(Nav::page(&op, PageId::Settings)),
+            title: "All settings".to_string(),
+            own: own_pages(),
+            groups: groups_left(ctx),
+            aside,
+            waiting,
         },
-        value: registry::form_text(&f.kind, &current),
-        options,
-        unit,
-        current: words(&current),
-        default: words(&default),
-        file: file_explicit.then(|| words(&file_value)),
-        version: row.map_or(0, |r| r.version),
-        saved: row.map(|r| format!("saved by {}, {}", by(&r.updated_by), when(r.updated_at))),
-        set_aside,
-        file_notice: row.filter(|r| r.file_notice).map(|r| {
-            let file = r.file_value.as_ref().and_then(|f| f.get("value")).cloned().unwrap_or(Value::Null);
-            words(&file)
-        }),
-        running: waiting.then(|| words(&running)),
-        reset: row.map(|_| if file_explicit { format!("Use app.toml's value ({})", words(&file_value)) } else { format!("Use the default ({})", words(&default)) }),
-    }
-}
-
-/// A warning a section needs: floors set on only some reads.
-fn section_warning(section: &Section, rows: &BTreeMap<String, Row>, ctx: &SettingsContext) -> Option<String> {
-    let floors: Vec<i64> = section
-        .fields
-        .iter()
-        .filter(|f| f.key.starts_with("private_read.floor_ms."))
-        .map(|f| saved_value(&f.key, rows, ctx).as_i64().unwrap_or(0))
-        .collect();
-    let set = floors.iter().filter(|ms| **ms > 0).count();
-    (set > 0 && set < floors.len()).then(|| {
-        "Only some floors are set. The reads without one still answer as soon as they can, so their timing can still hint at what the floors hide.".to_string()
-    })
+    )
 }
 
 /// The settings group an old page slug names: one of
@@ -309,16 +204,25 @@ fn old_group(slug: Result<Path<String>, PathRejection>) -> Option<Group> {
     let Ok(Path(slug)) = slug else {
         return None;
     };
-    crate::admin::menu::OLD_GROUP_SLUGS.contains(&slug.as_str()).then(|| Group::from_slug(&slug)).flatten()
+    menu::OLD_GROUP_SLUGS.contains(&slug.as_str()).then(|| Group::from_slug(&slug)).flatten()
 }
 
-/// `GET /admin/settings/{group}`: a group's page. Any other slug, or a
-/// segment that is not text, is the plain 404 page, without a session.
+/// A settings page's query.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct OpenQuery {
+    /// `advanced` opens the Advanced fold.
+    pub open: Option<String>,
+}
+
+/// `GET /admin/settings/{group}`: a group's page, with the settings whose
+/// feature page does not hold them yet. Any other slug, or a segment that
+/// is not text, is the plain 404 page, without a session.
 pub async fn group(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     slug: Result<Path<String>, PathRejection>,
+    Query(q): Query<OpenQuery>,
 ) -> Response {
     let Some(group) = old_group(slug) else {
         return super::not_found().await;
@@ -327,22 +231,12 @@ pub async fn group(
         Ok(op) => op,
         Err(response) => return response,
     };
-    let rows = match saved_rows(&state).await {
-        Ok(r) => r,
+    let ctx = &state.settings;
+    let sections = view::sections_at(Place::Group(group), &ctx.networks());
+    let settings = match view::settings_block(&state, &op.csrf, &sections, q.open.as_deref() == Some("advanced")).await {
+        Ok(b) => b,
         Err(e) => return super::internal_error(&state, &e),
     };
-    let ctx = &state.settings;
-    let sections = registry::sections(&ctx.networks())
-        .into_iter()
-        .filter(|s| s.group == group)
-        .map(|s| SectionView {
-            title: s.title.clone(),
-            help: s.help.clone(),
-            applies: if s.live { "Applies at once" } else { "Applies after a restart" },
-            warning: section_warning(&s, &rows, ctx),
-            fields: s.fields.iter().map(|f| field_view(&s, f, &rows, ctx)).collect(),
-        })
-        .collect();
     let public = if group == Group::Storage {
         let value: Option<Value> = match sqlx::query_scalar("SELECT value FROM operator_settings WHERE key = $1").bind(PUBLIC_SCOPE_KEY).fetch_optional(&state.pool).await {
             Ok(v) => v,
@@ -361,20 +255,11 @@ pub async fn group(
     });
     render(
         StatusCode::OK,
-        &GroupPage {
-            css: css(),
-            nav: Some(Nav::under(&op, PageId::Settings)),
-            title: group.title().to_string(),
-            slug: group.slug(),
-            csrf: op.csrf.clone(),
-            sections,
-            public,
-            lodestar,
-        },
+        &GroupPage { css: css(), nav: Some(Nav::under(&op, PageId::Settings)), title: group.title().to_string(), csrf: op.csrf.clone(), public, lodestar, settings },
     )
 }
 
-/// The public-data phase in words (§6.3); Health and Home say it too.
+/// The public-data phase in words; Health and Home say it too.
 #[must_use]
 pub fn phase_words(mode: PublicMode) -> &'static str {
     match mode {
@@ -386,8 +271,20 @@ pub fn phase_words(mode: PublicMode) -> &'static str {
     }
 }
 
+/// The name of the page at `back`, for a "Back to …" link.
+fn back_label(back: &str) -> String {
+    let path = back.split_once('?').map_or(back, |(p, _)| p);
+    if let Some(g) = path.strip_prefix("/admin/settings/").and_then(Group::from_slug) {
+        return format!("Back to {}", g.title());
+    }
+    match menu::locate(back) {
+        Some((id, _, _)) => format!("Back to {}", id.page().name),
+        None => "Back to the settings".to_string(),
+    }
+}
+
 fn refused(state: &AdminState, op: &Operator, back: &str, text: &str) -> Response {
-    message(state, Some(Nav::at(op, back)), StatusCode::BAD_REQUEST, "Not saved", text, Some((back, "Back to the settings")))
+    message(state, Some(Nav::at(op, back)), StatusCode::BAD_REQUEST, "Not saved", text, Some((back, &back_label(back))))
 }
 
 /// What a typed change does, in words.
@@ -429,36 +326,58 @@ fn confirm_typed(op: &Operator, back: String, action: &str, pairs: &[(String, St
     }
 }
 
-/// `POST /admin/settings/{group}`: one `settings set` with every field the
-/// form changed (§8.3); typed changes are confirmed first (§5.5).
-pub async fn save(
+/// `POST /admin/settings/save`: one `settings set` with every field the
+/// form changed, whichever page the form was on; typed changes are
+/// confirmed first. Settings with forms of their own are refused.
+pub async fn save(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Form(pairs): Form<Vec<(String, String)>>) -> Response {
+    save_form(&state, peer, &headers, &pairs).await
+}
+
+/// `POST /admin/settings/{group}`: the save, kept at the old group pages'
+/// address for pages loaded before they moved. Only the old groups' slugs
+/// answer; any other is the plain 404 page.
+pub async fn save_at_group(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     slug: Result<Path<String>, PathRejection>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
-    let Some(group) = old_group(slug) else {
+    if old_group(slug).is_none() {
         return super::not_found().await;
-    };
-    let op = match require(&state, &headers, peer, Need::Change, first(&pairs, "csrf")).await {
+    }
+    save_form(&state, peer, &headers, &pairs).await
+}
+
+async fn save_form(state: &AdminState, peer: SocketAddr, headers: &HeaderMap, pairs: &[(String, String)]) -> Response {
+    let op = match require(state, headers, peer, Need::Change, first(pairs, "csrf")).await {
         Ok(op) => op,
         Err(response) => return response,
     };
-    let back = format!("/admin/settings/{}", group.slug());
-    let rows = match saved_rows(&state).await {
+    let rows = match saved_rows(state).await {
         Ok(r) => r,
-        Err(e) => return super::internal_error(&state, &e),
+        Err(e) => return super::internal_error(state, &e),
     };
     let ctx = &state.settings;
     let rctx = ctx.registry();
+    let sections = registry::sections(&rctx.networks);
+    let named = |s: &registry::Section| s.fields.iter().any(|f| first(pairs, &f.key).is_some());
+    // A setting with forms of its own is never saved here.
+    if let Some(own) = sections.iter().find(|s| s.own_form && named(s)) {
+        let back = back_to(state, headers, first(pairs, "back"), &view::place(own).path());
+        return refused(state, &op, &back, "That setting is changed on its own page.");
+    }
     let (mut changes, mut problems, mut words) = (Vec::new(), Vec::new(), Vec::new());
     let mut whats = Vec::new();
-    for section in registry::sections(&rctx.networks).into_iter().filter(|s| s.group == group) {
+    // Where Back and Cancel go without a `back`: the page of the first
+    // setting changed, else of the first the form named.
+    let (mut changed_at, mut named_at) = (None, None);
+    for section in sections.iter().filter(|s| !s.own_form) {
         for f in &section.fields {
-            let Some(text) = first(&pairs, &f.key) else {
+            let Some(text) = first(pairs, &f.key) else {
                 continue;
             };
+            named_at.get_or_insert_with(|| view::place(section).path());
             let value = match registry::parse(&f.kind, text, &rctx) {
                 Ok(v) => v,
                 Err(e) => {
@@ -470,31 +389,33 @@ pub async fn save(
             if overlay::same(&value, &current) {
                 continue;
             }
+            changed_at.get_or_insert_with(|| view::place(section).path());
             if let Some(word) = registry::typed_word(f, &current, &value) {
                 words.push(word);
                 whats.push(typed_what(&f.key));
             }
-            let base_version = first(&pairs, &format!("version:{}", f.key)).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let base_version = first(pairs, &format!("version:{}", f.key)).and_then(|v| v.parse().ok()).unwrap_or(0);
             changes.push(Change { key: f.key.clone(), value: Some(value), base_version });
         }
     }
+    let fallback = changed_at.or(named_at).filter(|_| !problems.is_empty() || !changes.is_empty()).unwrap_or_else(|| PageId::Settings.page().href.to_string());
+    let back = back_to(state, headers, first(pairs, "back"), &fallback);
     if !problems.is_empty() {
-        return refused(&state, &op, &back, &format!("Nothing was saved. {}", problems.join(" ")));
+        return refused(state, &op, &back, &format!("Nothing was saved. {}", problems.join(" ")));
     }
     if changes.is_empty() {
-        return message(&state, Some(Nav::at(&op, &back)), StatusCode::OK, "Nothing changed", "The form had no changes to save.", Some((&back, "Back to the settings")));
+        return message(state, Some(Nav::at(&op, &back)), StatusCode::OK, "Nothing changed", "The form had no changes to save.", Some((&back, &back_label(&back))));
     }
     if !words.is_empty() {
         let word = words.join(" ");
-        let typed = first(&pairs, "typed");
-        if first(&pairs, "confirm") != Some("yes") || !typed_matches(&word, typed) {
-            let error = (first(&pairs, "confirm") == Some("yes")).then(|| format!("Type {word} exactly to confirm."));
+        let typed = first(pairs, "typed");
+        if first(pairs, "confirm") != Some("yes") || !typed_matches(&word, typed) {
+            let error = (first(pairs, "confirm") == Some("yes")).then(|| format!("Type {word} exactly to confirm."));
             let status = if error.is_some() { StatusCode::BAD_REQUEST } else { StatusCode::OK };
-            let cancel = back_to(&state, &headers, first(&pairs, "back"), &back);
-            return render(status, &confirm_typed(&op, cancel, &back, &pairs, whats.join(" "), word, error));
+            return render(status, &confirm_typed(&op, back, "/admin/settings/save", pairs, whats.join(" "), word, error));
         }
     }
-    enqueue(&state, &op, &AdminCommand::SettingsSet { changes }).await
+    enqueue(state, &op, &AdminCommand::SettingsSet { changes }).await
 }
 
 /// The key and version of a one-setting form.
@@ -525,8 +446,9 @@ pub async fn reset(
         Err(response) => return response,
     };
     let ctx = &state.settings;
-    let Some((_, field)) = registry::lookup(&form.key, &ctx.networks()) else {
-        return refused(&state, &op, "/admin/settings", "That is not a setting that can be changed here.");
+    let Some((section, field)) = registry::lookup(&form.key, &ctx.networks()) else {
+        let back = back_to(&state, &headers, form.back.as_deref(), "/admin/settings");
+        return refused(&state, &op, &back, "That is not a setting that can be changed here.");
     };
     let rows = match saved_rows(&state).await {
         Ok(r) => r,
@@ -540,7 +462,9 @@ pub async fn reset(
             let pairs = vec![("key".to_string(), form.key.clone()), ("version".to_string(), form.version.to_string())];
             let error = confirmed.then(|| format!("Type {word} exactly to confirm."));
             let status = if error.is_some() { StatusCode::BAD_REQUEST } else { StatusCode::OK };
-            let cancel = back_to(&state, &headers, form.back.as_deref(), "/admin/settings");
+            // Cancel goes back to the page the reset was asked from, carried
+            // through a wrong typed word; else to where the setting is.
+            let cancel = back_to(&state, &headers, form.back.as_deref(), &view::place(&section).path());
             return render(status, &confirm_typed(&op, cancel, "/admin/settings/reset", &pairs, typed_what(&form.key).to_string(), word.to_string(), error));
         }
     }
@@ -564,7 +488,8 @@ pub async fn keep(
         Err(e) => return super::internal_error(&state, &e),
     };
     let Some(row) = rows.get(&form.key) else {
-        return refused(&state, &op, "/admin/settings", "That setting has no saved value any more.");
+        let back = back_to(&state, &headers, form.back.as_deref(), "/admin/settings");
+        return refused(&state, &op, &back, "That setting has no saved value any more.");
     };
     let change = Change { key: form.key.clone(), value: Some(row.value.clone()), base_version: form.version };
     enqueue(&state, &op, &AdminCommand::SettingsSet { changes: vec![change] }).await

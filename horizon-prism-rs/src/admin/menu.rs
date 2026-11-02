@@ -119,6 +119,11 @@ pub const MENU: &[(SectionKey, &[PageId])] = &[
     (SectionKey::System, &[PageId::Health, PageId::Stats, PageId::About, PageId::Audit, PageId::Settings]),
 ];
 
+/// The pages that hold their own settings now. Every other key still
+/// renders on its old settings group page, apart from the Communities
+/// page's own forms.
+pub const SETTINGS_LIVE: &[PageId] = &[PageId::Members];
+
 /// A tab of Communities · Refract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
@@ -449,6 +454,8 @@ mod tests {
         assert_eq!(Tab::Accounts.title(), "Accounts · Communities · Refract");
         assert!(PageId::Blocks.built() && PageId::Appearance.built() && !PageId::Storage.built());
         assert!(Tab::Accounts.built() && !Tab::Pending.built());
+        // A page holds its settings only once it is built.
+        assert!(SETTINGS_LIVE.iter().all(|id| id.built()));
     }
 
     #[test]
