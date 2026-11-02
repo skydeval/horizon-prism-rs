@@ -29,6 +29,8 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Admin:** What apps see, Extra services and Public page have pages of
+  their own.
 - **Admin:** a kryphocron page holds its settings and figures.
 - **Admin:** Indexing and Storage pages; the disk, database and
   public-data checks link to them.

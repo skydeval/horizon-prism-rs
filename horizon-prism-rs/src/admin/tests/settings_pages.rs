@@ -36,7 +36,7 @@ async fn settings_pages_and_their_forms() {
     let networks: Vec<String> = Vec::new();
     let mut homes: Vec<(String, &str)> = SETTINGS_LIVE.iter().map(|id| (id.page().href.to_string(), id.page().name)).collect();
     homes.extend(Group::ALL.into_iter().filter(|g| !view::sections_at(Place::Group(*g), &networks).is_empty()).map(|g| (format!("/admin/settings/{}", g.slug()), g.title())));
-    assert_eq!(homes.len(), 12);
+    assert_eq!(homes.len(), 13);
     for (path, title) in homes {
         tokio::time::sleep(Duration::from_millis(120)).await;
         let page = alice.get(&url(&path)).await;

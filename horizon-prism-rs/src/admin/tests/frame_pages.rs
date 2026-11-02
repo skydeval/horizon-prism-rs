@@ -112,6 +112,7 @@ async fn the_sidebar_markup_is_the_mocks() {
             &[("/admin/indexing", "Indexing", None), ("/admin/storage", "Storage", None), ("/admin/jobs", "Jobs", None), ("/admin/problems", "Problems", None)],
         ),
         ("private", "Private posts", &[("/admin/private", "Private posts", Some("kryphocron"))]),
+        ("apps", "Apps", &[("/admin/apps", "What apps see", None), ("/admin/services", "Extra services", None), ("/admin/public-page", "Public page", None)]),
         (
             "system",
             "System",
@@ -668,6 +669,9 @@ const TABLES: &[Expected] = &[
     ("/admin/indexing", &[]),
     ("/admin/storage", &[]),
     ("/admin/private", &[]),
+    ("/admin/apps", &[]),
+    ("/admin/services", &[]),
+    ("/admin/public-page", &[]),
     ("/admin/health", &[("Check", &["name", "state", "text"])]),
     ("/admin/stats", &[("Request", &["name", "num", "num", "num", "num", "num", "num", "when"]), ("Request", &["name"])]),
     (
@@ -843,7 +847,7 @@ async fn every_old_address_redirects() {
             assert_eq!(get(&alice, &url(&format!("{to}{q}"))).await.status, 200, "{to}{q}");
         }
     }
-    assert_eq!(GROUP_REDIRECTS.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(), ["communities", "blocks", "access", "storage", "private"]);
+    assert_eq!(GROUP_REDIRECTS.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(), ["communities", "blocks", "access", "storage", "private", "apps", "services"]);
     // The encoded port reaches the account page as one DID.
     let account = get(&alice, &url("/admin/communities/accounts/did:web:h%253A8080")).await;
     assert!(account.body.contains("did:web:h%3A8080") && !account.body.contains("did:web:h:8080"), "{}", account.body);
@@ -886,9 +890,9 @@ async fn every_old_address_redirects() {
     assert_eq!(communities.status, 404);
     assert_eq!(count(h.pool(), "SELECT count(*) FROM admin_commands").await, before);
     // A group with keys left is still its page.
-    let apps = get(&alice, &url("/admin/settings/apps")).await;
-    assert_eq!(apps.status, 200);
-    assert_eq!(current_item(&apps.body), Some(("All settings".to_string(), "true".to_string())), "{}", apps.body);
+    let limits = get(&alice, &url("/admin/settings/limits")).await;
+    assert_eq!(limits.status, 200);
+    assert_eq!(current_item(&limits.body), Some(("All settings".to_string(), "true".to_string())), "{}", limits.body);
     h.db.drop_db().await;
 }
 
@@ -938,7 +942,7 @@ async fn only_built_pages_and_no_stale_links() {
         "/admin/communities/accounts/did:plc:nobodynobodynobodynobody".to_string(),
         "/admin/settings/installed".to_string(),
         "/admin/settings/running".to_string(),
-        "/admin/settings/apps".to_string(),
+        "/admin/settings/limits".to_string(),
         format!("/admin/lookup?q={BOB}"),
     ] {
         pages.push((path.clone(), get(&alice, &url(&path)).await));
@@ -1002,7 +1006,7 @@ async fn sub_pages_mark_their_parent() {
         ("/admin/communities/pending".to_string(), "Communities"),
         ("/admin/settings/installed".to_string(), "All settings"),
         ("/admin/settings/running".to_string(), "All settings"),
-        ("/admin/settings/apps".to_string(), "All settings"),
+        ("/admin/settings/limits".to_string(), "All settings"),
     ] {
         let page = get(&alice, &format!("{}{path}", h.base)).await;
         assert_eq!(page.status, 200, "{path}");
@@ -1046,6 +1050,8 @@ async fn moved_forms_check_the_token() {
         "/admin/settings/blocks",
         "/admin/settings/storage",
         "/admin/settings/private",
+        "/admin/settings/apps",
+        "/admin/settings/services",
         "/admin/indexing/switch",
         "/admin/settings/public-scope",
         "/admin/communities/keep",
@@ -1065,6 +1071,9 @@ async fn moved_forms_check_the_token() {
             ("value", "kryphocron_only"),
             ("storage.budget_bytes", "5"),
             ("private_read.max_chain", "5"),
+            ("bookmarks.count_floor", "5"),
+            ("services.push.state", "off"),
+            ("public_page.name", "x"),
         ];
         let mut with = vec![("csrf", other.as_str())];
         with.extend(fields);
@@ -1128,8 +1137,8 @@ async fn cancel_goes_back() {
         (None, None),
         (Some("//evil.example"), None),
         (Some("https://evil.example/admin"), None),
-        (Some("/admin/apps"), None),
-        (None, Some("https://prism.example.com/admin/apps")),
+        (Some("/admin/relays"), None),
+        (None, Some("https://prism.example.com/admin/relays")),
     ] {
         let mut form = vec![("csrf", csrf.as_str()), ("did", CAROL)];
         if let Some(b) = back {

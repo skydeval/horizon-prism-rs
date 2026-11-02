@@ -1,8 +1,9 @@
-//! The admin pages (admin-ui design §6), one file per screen, and what
-//! they share: the navigation, the message page, command rows in plain
-//! words, and enqueuing a command.
+//! The admin pages, one file per screen, and what they share: the
+//! navigation, the message page, command rows in plain words, and
+//! enqueuing a command.
 
 pub mod appearance;
+pub mod apps;
 pub mod audit;
 pub mod commands;
 pub mod communities;

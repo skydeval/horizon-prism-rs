@@ -33,6 +33,9 @@ The menu groups the pages by task. Appearance sits under your name at the top of
 | Data | Jobs | Backfill and sync jobs; retry, scope check. |
 | Data | Problems | Dead letters and stream state; replay or drop. |
 | kryphocron | kryphocron | Reads, failed reads and stored counts; how deep threads go, how fresh reads must be, late notifications and how far back search reaches; timing floors under Advanced. |
+| Apps | What apps see | Email confirmation, live now, trending topics, texts for features Horizon-Prism does not offer, bookmark counts and where public videos play from. |
+| Apps | Extra services | Push notifications, age checks and contact import: passed on to their service or not offered. |
+| Apps | Public page | The public page on or off and its name, with a link to it while it is on. |
 | System | Health | Database, Redis, relays, disk and background checks. |
 | System | Stats | How much is indexed, table sizes, requests per method. |
 | System | About this server | Read-only facts about this server. |

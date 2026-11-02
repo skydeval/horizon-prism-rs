@@ -117,13 +117,25 @@ pub const MENU: &[(SectionKey, &[PageId])] = &[
     (SectionKey::Moderation, &[PageId::Labels, PageId::Blocks, PageId::Communities, PageId::ThreadLens]),
     (SectionKey::Data, &[PageId::Indexing, PageId::Storage, PageId::Jobs, PageId::Problems]),
     (SectionKey::Private, &[PageId::Private]),
+    (SectionKey::Apps, &[PageId::Apps, PageId::Services, PageId::PublicPage]),
     (SectionKey::System, &[PageId::Health, PageId::Stats, PageId::About, PageId::Audit, PageId::Settings]),
 ];
 
 /// The pages that hold their own settings now. Every other key still
 /// renders on its old settings group page, apart from the Communities
 /// page's own forms.
-pub const SETTINGS_LIVE: &[PageId] = &[PageId::Members, PageId::Blocks, PageId::Communities, PageId::ThreadLens, PageId::Indexing, PageId::Storage, PageId::Private];
+pub const SETTINGS_LIVE: &[PageId] = &[
+    PageId::Members,
+    PageId::Blocks,
+    PageId::Communities,
+    PageId::ThreadLens,
+    PageId::Indexing,
+    PageId::Storage,
+    PageId::Private,
+    PageId::Apps,
+    PageId::Services,
+    PageId::PublicPage,
+];
 
 /// A tab of Communities · Refract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -268,6 +280,8 @@ pub const GROUP_REDIRECTS: &[(&str, &str, &str)] = &[
     ("access", "/admin/members", "settings"),
     ("storage", "/admin/storage", "settings"),
     ("private", "/admin/private", "settings"),
+    ("apps", "/admin/apps", ""),
+    ("services", "/admin/services", ""),
 ];
 
 /// Where an old group slug's GET now goes, once its page has no settings
@@ -458,7 +472,7 @@ mod tests {
                 assert_eq!(id.page().section, Some(*key), "{id:?}");
             }
         }
-        assert_eq!(menu.len(), 18);
+        assert_eq!(menu.len(), 21);
     }
 
     #[test]
@@ -471,7 +485,7 @@ mod tests {
         assert_eq!(PageId::Appearance.eyebrow(), "Your account");
         assert_eq!(Tab::Communities.title(), "Communities · Refract");
         assert_eq!(Tab::Accounts.title(), "Accounts · Communities · Refract");
-        assert!(PageId::Blocks.built() && PageId::Appearance.built() && PageId::Storage.built() && PageId::Private.built() && !PageId::Apps.built());
+        assert!(PageId::Blocks.built() && PageId::Appearance.built() && PageId::Storage.built() && PageId::Private.built() && PageId::PublicPage.built() && !PageId::Relays.built());
         assert_eq!(PageId::Private.title(), "Private posts · kryphocron");
         assert!(Tab::Accounts.built() && Tab::Pending.built() && PageId::ThreadLens.built());
         assert_eq!(Tab::Pending.title(), "Pending ends · Communities · Refract");
@@ -503,7 +517,9 @@ mod tests {
         assert_eq!(locate("/admin/appearance"), Some((PageId::Appearance, Current::Page, None)));
         assert_eq!(locate("/admin/storage"), Some((PageId::Storage, Current::Page, None)));
         assert_eq!(locate("/admin/private"), Some((PageId::Private, Current::Page, None)));
-        assert_eq!(locate("/admin/apps"), None);
+        assert_eq!(locate("/admin/apps"), Some((PageId::Apps, Current::Page, None)));
+        assert_eq!(locate("/admin/public-page"), Some((PageId::PublicPage, Current::Page, None)));
+        assert_eq!(locate("/admin/relays"), None);
     }
 
     /// Cancel goes only to a page of this admin that exists now.
@@ -517,7 +533,10 @@ mod tests {
             "/admin/communities/accounts?state=restored",
             "/admin/commands/12",
             "/admin/settings/running",
-            "/admin/settings/apps",
+            "/admin/settings/limits",
+            "/admin/apps",
+            "/admin/services",
+            "/admin/public-page?open=advanced",
             "/admin/appearance",
             "/admin/communities/pending",
             "/admin/thread-lens",
@@ -545,7 +564,9 @@ mod tests {
             "/admin/communities/accounts/not-a-did",
             "/admin/commands/12a",
             "/admin/commands/",
-            "/admin/apps",
+            "/admin/relays",
+            "/admin/settings/apps",
+            "/admin/settings/services",
             "/admin/settings/private",
             "/admin/settings/storage",
             "/admin/settings/access",
@@ -576,6 +597,8 @@ mod tests {
         assert_eq!(group_redirect("blocks"), Some(("/admin/blocks", "settings")));
         assert_eq!(group_redirect("storage"), Some(("/admin/storage", "settings")));
         assert_eq!(group_redirect("private"), Some(("/admin/private", "settings")));
-        assert_eq!(group_redirect("apps"), None);
+        assert_eq!(group_redirect("apps"), Some(("/admin/apps", "")));
+        assert_eq!(group_redirect("services"), Some(("/admin/services", "")));
+        assert_eq!(group_redirect("limits"), None);
     }
 }

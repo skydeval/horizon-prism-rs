@@ -7,7 +7,7 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::admin::menu::{PAGES, TABS};
+use crate::admin::menu::{PAGES, PageId, TABS};
 use crate::admin::settings::registry::{self, Group};
 use crate::admin::settings::view::{self, Place};
 
@@ -502,6 +502,82 @@ async fn kryphocron_page_holds_its_settings() {
     h.db.drop_db().await;
 }
 
+/// What apps see, Extra services and Public page each hold their settings,
+/// none folded; each saves from its page, and the old group addresses
+/// redirect to the page itself and still save; Public page links the page
+/// while it is on.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn apps_pages_hold_their_settings() {
+    let mut file = test_support::no_auto_join();
+    file.public_page.enabled = false;
+    file.services.insert("push".to_string(), crate::config::ServiceConfig { proxy_url: Some("https://push.example.com".to_string()), ..Default::default() });
+    let Some(h) = harness_config("admin_homes_apps", quick(), true, health::HealthInputs::default(), file).await else {
+        return;
+    };
+    let p = h.pool();
+    let alice = complete_setup(&h, ALICE).await;
+    let url = |path: &str| format!("{}{path}", h.base);
+    let networks: Vec<String> = Vec::new();
+    for (id, keys) in [(PageId::Apps, 11), (PageId::Services, 3), (PageId::PublicPage, 2)] {
+        let path = id.page().href;
+        let page = get(&alice, &url(path)).await;
+        assert_eq!(page.status, 200, "{path}: {}", page.body);
+        let body = &page.body;
+        assert!(body.contains(&format!("<h1>{}</h1>", id.page().name)), "{path}: {body}");
+        assert!(body.contains("<form id=\"settings\" class=\"stack\" method=\"post\" action=\"/admin/settings/save\">"), "{path}: {body}");
+        assert!(!body.contains("<details class=\"advanced\""), "{path}: nothing is folded");
+        // Only Public page holds more than its settings.
+        assert_eq!(body.contains("<h2>Settings</h2>"), id == PageId::PublicPage, "{path}");
+        let fields: Vec<String> = view::sections_at(Place::Page(id), &networks).iter().flat_map(|s| s.fields.iter().map(|f| f.key.clone())).collect();
+        assert_eq!(fields.len(), keys, "{path}");
+        for key in &fields {
+            assert!(body.contains(&format!("name=\"{key}\"")), "{path}: {key}");
+        }
+    }
+    // The public page is off: no link to it.
+    let public = get(&alice, &url("/admin/public-page")).await;
+    assert!(!public.body.contains("View it"), "{}", public.body);
+    let csrf = csrf_of(&public);
+
+    // Saving from each page: nothing changed leads back to it; a change
+    // queues one setting.
+    let save = url("/admin/settings/save");
+    for (back, key, same, new, value, name) in [
+        ("/admin/apps", "bookmarks.count_floor", "10", "3", json!(3), "Back to What apps see"),
+        ("/admin/services", "services.push.state", "disabled", "proxy", json!("proxy"), "Back to Extra services"),
+        ("/admin/public-page", "public_page.name", "", "Our server", json!("Our server"), "Back to Public page"),
+    ] {
+        let version = format!("version:{key}");
+        let unchanged = post(&alice, &save, &[("csrf", &csrf), ("back", back), (key, same)]).await;
+        assert!(unchanged.body.contains("Nothing changed"), "{key}: {}", unchanged.body);
+        assert_eq!(link_before(&unchanged.body, name), back);
+        let saved = post(&alice, &save, &[("csrf", &csrf), ("back", back), (key, new), (&version, "0")]).await;
+        assert_eq!(saved.status, 303, "{key}: {}", saved.body);
+        assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": key, "value": value, "base_version": 0}]})), "{key}");
+    }
+    // The old group addresses go to the pages themselves, and still save.
+    for (slug, to, key, value, want) in [
+        ("apps", "/admin/apps", "video.playback", "pds_blob", json!("pds_blob")),
+        ("apps", "/admin/apps", "public_page.enabled", "on", json!(true)),
+        ("services", "/admin/services", "services.push.state", "proxy", json!("proxy")),
+    ] {
+        let old = get(&alice, &url(&format!("/admin/settings/{slug}"))).await;
+        assert_eq!(old.status, 308, "{slug}");
+        assert_eq!(location(&old), to);
+        let version = format!("version:{key}");
+        let alias = post(&alice, &url(&format!("/admin/settings/{slug}")), &[("csrf", &csrf), (key, value), (&version, "0")]).await;
+        assert_eq!(alias.status, 303, "{slug} {key}: {}", alias.body);
+        assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": key, "value": want, "base_version": 0}]})), "{key}");
+    }
+
+    // On, the page links to the public page itself.
+    h.live.update(|v| v.public_page_enabled = true);
+    let on = get(&alice, &url("/admin/public-page")).await;
+    assert!(on.body.contains(&format!("<a class=\"button secondary\" href=\"https://{HOST}/\">View it</a>")), "{}", on.body);
+    h.db.drop_db().await;
+}
+
 /// Reset and keep from Members, a typed reset's Cancel kept through a
 /// wrong word, and each file notice on Home leading to the setting.
 #[tokio::test]
@@ -581,6 +657,8 @@ async fn the_command_page_leads_back() {
         ("scope.sweep_max_purges", "9", "/admin/storage?open=advanced#s-scope-sweep_max_purges", "Back to Storage"),
         ("private_read.max_chain", "9", "/admin/private#s-private_read-max_chain", "Back to Private posts"),
         ("private_read.degraded_retry_max_secs", "90", "/admin/private?open=advanced#s-private_read-degraded_retry_min_secs", "Back to Private posts"),
+        ("bookmarks.count_floor", "4", "/admin/apps#s-bookmarks-emit_count", "Back to What apps see"),
+        ("public_page.name", "Our server", "/admin/public-page#s-public_page-name", "Back to Public page"),
     ] {
         let version = format!("version:{key}");
         let saved = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), (key, value), (&version, "0")]).await;
@@ -605,7 +683,7 @@ async fn all_settings_lists_where_settings_are() {
     let own = &body[body.find("<h2>On their own pages</h2>").expect("own pages")..];
     let own = &own[..own.find("</div>").expect("card end")];
     let hrefs: Vec<&str> = own.match_indices("href=\"").map(|(i, _)| &own[i + 6..i + 6 + own[i + 6..].find('"').expect("end")]).collect();
-    assert_eq!(hrefs, ["/admin/members", "/admin/blocks", "/admin/communities", "/admin/thread-lens", "/admin/indexing", "/admin/storage", "/admin/private"], "{own}");
+    assert_eq!(hrefs, ["/admin/members", "/admin/blocks", "/admin/communities", "/admin/thread-lens", "/admin/indexing", "/admin/storage", "/admin/private", "/admin/apps", "/admin/services", "/admin/public-page"], "{own}");
     assert!(own.contains(">Private posts · kryphocron</a>"), "{own}");
     assert!(own.contains(">Communities · Refract</a>") && own.contains(">Blocks · Farsight</a>"), "{own}");
     let networks: Vec<String> = Vec::new();
