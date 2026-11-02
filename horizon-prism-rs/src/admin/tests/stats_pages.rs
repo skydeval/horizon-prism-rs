@@ -1,9 +1,10 @@
-//! Stats and Storage over HTTP: on Storage the disks (two paths on one
-//! filesystem shown once, a missing mount "not visible") and the storage
-//! figures; on Stats one line of them, the counts from the sampler's series
-//! and the scope sets, the private tier's figures through its own labels,
-//! endpoint usage with the never-used list; and the Disk check and the
-//! fullest-disk tile, both leading to Storage.
+//! Stats, Storage and Private posts over HTTP: on Storage the disks (two
+//! paths on one filesystem shown once, a missing mount "not visible") and
+//! the storage figures; on Private posts the private tier's figures through
+//! its own labels; on Stats one line of each, the counts from the sampler's
+//! series and the scope sets, endpoint usage with the never-used list; and
+//! the Disk check and the fullest-disk tile, both leading to Storage, and
+//! Health's private-post line, leading to Private posts.
 
 use super::*;
 use crate::admin::health::{HealthInputs, MetricsText};
@@ -62,11 +63,9 @@ async fn stats_page_and_the_disk_tile() {
         "<span class=\"v\">40</span>",
         "not measured yet",
         "Members ready (first sync done)",
-        // Private posts through the private tier's labels.
-        "about 77",
-        "With images",
-        "Read in the new form since Prism started</span><span class=\"v\">7</span>",
-        "Private posts",
+        // Private posts in one line, through the private tier's labels,
+        // leading to their page.
+        "Private posts stored: about 77 — <a href=\"/admin/private\">Private posts</a>",
         "2.0 GB",
         // Blocks and lodestar.
         "Not kept since Prism started (no member involved)",
@@ -83,6 +82,22 @@ async fn stats_page_and_the_disk_tile() {
     assert!(!page.body.contains("<h2>Disks</h2>") && !page.body.contains("Disk holding") && !page.body.contains("Redis memory"), "{}", page.body);
     // The private table is listed under its label, its own name in grey.
     assert!(page.body.contains(&format!("Private posts<br><span class=\"muted tech\">{private}</span>")), "{}", page.body);
+    assert!(!page.body.contains("With images") && !page.body.contains("Read in the new form"), "{}", page.body);
+
+    // Private posts: what is stored and how it is read, and the settings.
+    let private_page = get(&alice, &format!("{}/admin/private", h.base)).await;
+    assert_eq!(private_page.status, 200, "{}", private_page.body);
+    for text in [
+        "<span class=\"l\">Stored</span><span class=\"v\">about 77</span>",
+        "<span class=\"l\">With images</span><span class=\"v\">0</span>",
+        "<span class=\"l\">With a video</span><span class=\"v\">0</span>",
+        "<span class=\"l\">Read in the new form (text, links and embeds together)</span><span class=\"v\">7</span>",
+        "<span class=\"l\">Read in the older form (text only)</span><span class=\"v\">unknown</span>",
+        "name=\"private_read.max_chain\"",
+    ] {
+        assert!(private_page.body.contains(text), "{text}: {}", private_page.body);
+    }
+    assert!(!private_page.body.contains(private), "{}", private_page.body);
 
     // Storage: one filesystem, shown once; Redis's mount is missing; the
     // database against its budget.
@@ -109,6 +124,13 @@ async fn stats_page_and_the_disk_tile() {
     let disk = &health.body[health.body.find("<td class=\"name\">Disk</td>").expect("disk")..];
     let disk = &disk[..disk.find("</tr>").expect("row end")];
     assert!(disk.contains("<a href=\"/admin/storage\">Storage</a>"), "{disk}");
+    // Health keeps private posts to one line, which leads to their page.
+    assert!(
+        health.body.contains("<span class=\"l\">Could not be read (last hour)</span><span class=\"v\">unknown — <a href=\"/admin/private\">Private posts</a></span>"),
+        "{}",
+        health.body
+    );
+    assert!(!health.body.contains("Quotes and mentions"), "{}", health.body);
     let home = get(&alice, &format!("{}/admin", h.base)).await;
     assert!(home.body.contains("Fullest disk") && home.body.contains("% used), "), "{}", home.body);
     assert!(home.body.contains("<span class=\"v\"><a href=\"/admin/storage\">"), "{}", home.body);

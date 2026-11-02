@@ -1,6 +1,6 @@
 //! Stats (`/admin/stats`): how much is indexed, and the endpoints in use
-//! since Prism started, with one line on the space used, which Storage
-//! shows in full. Nothing here changes anything, and nothing counts a large
+//! since Prism started, with one line each on the space used and the
+//! private posts stored, which Storage and Private posts show in full. Nothing here changes anything, and nothing counts a large
 //! table: big tables are Postgres's own estimates from the storage sampler,
 //! marked "about".
 
@@ -15,7 +15,7 @@ use super::health::{Figure, FigureGroup, database_words};
 use super::{Nav, ago, bytes, css, render, when};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
-use crate::admin::health::{PRIVATE_READ_CONTENT, Snapshot, count, timed_count};
+use crate::admin::health::{Snapshot, count, timed_count};
 use crate::admin::stats::{self, PUBLIC_TABLES, HEADLINE};
 use crate::admin::usage::{self, Class};
 use crate::firehose::feed::{Kind, Outcome, Source, Totals};
@@ -57,6 +57,8 @@ struct StatsPage {
     title: String,
     /// The database against its budget, in words.
     database: String,
+    /// The private posts stored, in words.
+    private_stored: String,
     groups: Vec<FigureGroup>,
     /// When the sampler last measured the tables.
     as_of: String,
@@ -154,11 +156,10 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         Err(response) => return response,
     };
     let s = state.health.metrics.as_ref().map_or_else(|| stats::series(""), |m| stats::series(&m.render()));
-    let (members, ready, denied, media, sizes) = tokio::join!(
+    let (members, ready, denied, sizes) = tokio::join!(
         timed_count(&state.pool, "SELECT count(*) FROM members"),
         timed_count(&state.pool, "SELECT count(*) FROM members WHERE ready_at IS NOT NULL"),
         timed_count(&state.pool, "SELECT count(*) FROM member_denials"),
-        crate::private_tier::stats::media_post_counts(&state.pool),
         stats::scope_sizes(&state.scope),
     );
     let mut groups = vec![FigureGroup {
@@ -185,26 +186,6 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         title: "Records",
         figures: PUBLIC_TABLES[..HEADLINE].iter().chain(PUBLIC_TABLES.iter().filter(|(t, _)| *t == "actors")).map(|(t, l)| fig(l, about(rows_of(&s, t)))).collect(),
         note: String::new(),
-    });
-
-    let (images, video) = match media {
-        Ok((i, v)) => (exact(Some(i)), exact(Some(v))),
-        Err(error) => {
-            tracing::warn!(event = "admin_stats_media_failed", %error, "the private media counts did not finish");
-            (UNKNOWN.to_string(), UNKNOWN.to_string())
-        }
-    };
-    let form = |f: &str| s.sum_where(PRIVATE_READ_CONTENT, "form", f).map_or_else(|| "none yet".to_string(), count);
-    groups.push(FigureGroup {
-        title: "Private posts",
-        figures: vec![
-            fig("Stored", about(rows_of(&s, crate::private_tier::stats::admin_posts_table()))),
-            fig("With images", images),
-            fig("With a video", video),
-            fig("Read in the new form since Prism started", form("content")),
-            fig("Read in the older form since Prism started", form("text")),
-        ],
-        note: "Images and video are exact. A post stored before Prism recorded media counts as having none until its server sends it again.".to_string(),
     });
 
     let (kept, refused) = blocks_since_start(&state.live.tap().totals());
@@ -239,6 +220,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             nav: Some(Nav::page(&op, crate::admin::menu::PageId::Stats)),
             title: "Stats".to_string(),
             database: database_words(&state, Some(&s)),
+            private_stored: super::private::stored_words(&s),
             groups,
             as_of,
             tables,

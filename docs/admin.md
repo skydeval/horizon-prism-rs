@@ -32,6 +32,7 @@ The menu groups the pages by task. Appearance sits under your name at the top of
 | Data | Storage | Database size against its budget, Redis, account ids, disks and compression; the budget and how long records are kept. |
 | Data | Jobs | Backfill and sync jobs; retry, scope check. |
 | Data | Problems | Dead letters and stream state; replay or drop. |
+| kryphocron | kryphocron | Reads, failed reads and stored counts; how deep threads go, how fresh reads must be, late notifications and how far back search reaches; timing floors under Advanced. |
 | System | Health | Database, Redis, relays, disk and background checks. |
 | System | Stats | How much is indexed, table sizes, requests per method. |
 | System | About this server | Read-only facts about this server. |

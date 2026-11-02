@@ -17,6 +17,7 @@ pub mod login;
 pub mod lookup;
 pub mod members;
 pub mod operators;
+pub mod private;
 pub mod problems;
 pub mod refract;
 pub mod settings;

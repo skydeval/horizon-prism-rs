@@ -373,6 +373,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/indexing", route(get(pages::indexing::page)))
         .route("/indexing/switch", route(post(pages::indexing::switch)))
         .route("/storage", route(get(pages::storage::page)))
+        .route("/private", route(get(pages::private::page)))
         .route("/about", route(get(pages::instance::page)))
         .route("/lexicons/{*path}", route(get(lexicons::serve)))
         .route("/jobs", route(get(pages::jobs::page)))

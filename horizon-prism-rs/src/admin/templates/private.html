@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">How Prism reads and stores kryphocron's private posts, then how deep, how fresh and how far back it
+serves them.</p>
+
+<div class="grid">
+<div class="card">
+<h2>Reads</h2>
+{% for f in reads %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+<p class="muted">Counted since Prism started. A post that could not be read means its server and Prism disagree on the new form.</p>
+</div>
+
+<div class="card">
+<h2>Stored</h2>
+{% for f in stored %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+<p class="muted">"About" is Postgres's own estimate, measured every 5 minutes. Images and video are exact. A post stored
+before Prism recorded media counts as having none until its server sends it again.</p>
+</div>
+</div>
+
+<h2>Settings</h2>
+{% include "settings_block.html" %}
+{% endblock %}

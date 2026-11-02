@@ -445,6 +445,63 @@ async fn data_pages_hold_their_settings() {
     h.db.drop_db().await;
 }
 
+/// Private posts holds its settings, the timing floors, the retry hints and
+/// the membership answer's lifetime folded; it saves from there and through
+/// the old group address once that redirects.
+#[tokio::test]
+async fn kryphocron_page_holds_its_settings() {
+    let Some(h) = harness("admin_homes_private").await else {
+        return;
+    };
+    let p = h.pool();
+    let alice = complete_setup(&h, ALICE).await;
+    let url = |path: &str| format!("{}{path}", h.base);
+    let page = get(&alice, &url("/admin/private")).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let body = &page.body;
+    assert!(body.contains("<h1>Private posts</h1>") && body.contains("<title>Private posts · kryphocron · Horizon-Prism admin</title>"), "{body}");
+    assert!(body.contains("<form id=\"settings\" class=\"stack\" method=\"post\" action=\"/admin/settings/save\">"), "{body}");
+    assert!(body.contains("<details class=\"advanced\" id=\"advanced\"><summary>Advanced</summary>"), "{body}");
+    for key in ["private_read.max_chain", "sync.head_max_age_secs", "private_read.head_fallback", "private_notify.backfill_max_age_hours", "private_search.max_age_days"] {
+        assert!(!folded(body, key), "{key} is folded");
+    }
+    // The twelve floors and the three others, folded.
+    let networks: Vec<String> = Vec::new();
+    let mut folds = 0;
+    for s in view::sections_at(Place::Page(crate::admin::menu::PageId::Private), &networks) {
+        for f in &s.fields {
+            assert_eq!(folded(body, &f.key), s.advanced, "{}", f.key);
+            folds += usize::from(s.advanced);
+            assert_eq!(s.advanced, f.key.starts_with("private_read.floor_ms.") || f.key.starts_with("private_read.degraded_retry_") || f.key == "private_read.membership_valid_for_secs", "{}", f.key);
+        }
+    }
+    assert_eq!(folds, 15);
+    // Twenty settings with their facts stay a short page.
+    eprintln!("/admin/private: {} bytes of HTML", body.len());
+    assert!(body.len() < 150_000, "{} bytes", body.len());
+    assert!(get(&alice, &url("/admin/private?open=advanced")).await.body.contains("<details class=\"advanced\" id=\"advanced\" open>"));
+    let csrf = csrf_of(&page);
+
+    // Saving from the page: nothing changed leads back to it; a change
+    // queues one setting.
+    let save = url("/admin/settings/save");
+    let depth = field(body, "private_read.max_chain").expect("depth");
+    let same = post(&alice, &save, &[("csrf", &csrf), ("back", "/admin/private"), ("private_read.max_chain", &depth)]).await;
+    assert!(same.body.contains("Nothing changed"), "{}", same.body);
+    assert_eq!(link_before(&same.body, "Back to Private posts"), "/admin/private");
+    let saved = post(&alice, &save, &[("csrf", &csrf), ("back", "/admin/private"), ("private_read.max_chain", "12"), ("version:private_read.max_chain", "0")]).await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "private_read.max_chain", "value": 12, "base_version": 0}]})));
+    // The old group address redirects to the settings, and still saves.
+    let old = get(&alice, &url("/admin/settings/private")).await;
+    assert_eq!(old.status, 308);
+    assert_eq!(location(&old), "/admin/private#settings");
+    let alias = post(&alice, &url("/admin/settings/private"), &[("csrf", &csrf), ("private_read.membership_valid_for_secs", "120"), ("version:private_read.membership_valid_for_secs", "0")]).await;
+    assert_eq!(alias.status, 303, "{}", alias.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "private_read.membership_valid_for_secs", "value": 120, "base_version": 0}]})));
+    h.db.drop_db().await;
+}
+
 /// Reset and keep from Members, a typed reset's Cancel kept through a
 /// wrong word, and each file notice on Home leading to the setting.
 #[tokio::test]
@@ -522,6 +579,8 @@ async fn the_command_page_leads_back() {
         ("indexing.fill_max_wait_hours", "5", "/admin/indexing#s-indexing-fill_max_wait_hours", "Back to Indexing"),
         ("retention.notification_days", "9", "/admin/storage#s-retention-notification_days", "Back to Storage"),
         ("scope.sweep_max_purges", "9", "/admin/storage?open=advanced#s-scope-sweep_max_purges", "Back to Storage"),
+        ("private_read.max_chain", "9", "/admin/private#s-private_read-max_chain", "Back to Private posts"),
+        ("private_read.degraded_retry_max_secs", "90", "/admin/private?open=advanced#s-private_read-degraded_retry_min_secs", "Back to Private posts"),
     ] {
         let version = format!("version:{key}");
         let saved = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), (key, value), (&version, "0")]).await;
@@ -546,7 +605,8 @@ async fn all_settings_lists_where_settings_are() {
     let own = &body[body.find("<h2>On their own pages</h2>").expect("own pages")..];
     let own = &own[..own.find("</div>").expect("card end")];
     let hrefs: Vec<&str> = own.match_indices("href=\"").map(|(i, _)| &own[i + 6..i + 6 + own[i + 6..].find('"').expect("end")]).collect();
-    assert_eq!(hrefs, ["/admin/members", "/admin/blocks", "/admin/communities", "/admin/thread-lens", "/admin/indexing", "/admin/storage"], "{own}");
+    assert_eq!(hrefs, ["/admin/members", "/admin/blocks", "/admin/communities", "/admin/thread-lens", "/admin/indexing", "/admin/storage", "/admin/private"], "{own}");
+    assert!(own.contains(">Private posts · kryphocron</a>"), "{own}");
     assert!(own.contains(">Communities · Refract</a>") && own.contains(">Blocks · Farsight</a>"), "{own}");
     let networks: Vec<String> = Vec::new();
     for g in Group::ALL {

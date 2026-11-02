@@ -3,6 +3,7 @@
 <h1>{{ title }}</h1>
 <p class="muted">How much Prism holds, and which requests apps make. Nothing on this page changes anything.</p>
 <p>Database: {{ database }} — <a href="/admin/storage">Storage</a></p>
+<p>Private posts stored: {{ private_stored }} — <a href="/admin/private">Private posts</a></p>
 
 <h2>How much is indexed</h2>
 <p class="muted">"About" counts are Postgres's own estimates, measured {{ as_of }}. They can drift a little until Postgres next tidies the table.</p>

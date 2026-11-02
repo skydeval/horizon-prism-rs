@@ -18,7 +18,7 @@ use super::home::HomeQuery;
 use super::{Confirm, Nav, ago, bytes, confirmed, css, enqueue, render, when};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, banners, require};
-use crate::admin::health::{self, Action, Check, PRIVATE_INGEST_SOURCE, PRIVATE_READ_CONTENT, PRIVATE_READ_OUTCOMES, Snapshot, count, gather};
+use crate::admin::health::{self, Action, Check, Snapshot, count, gather};
 use crate::admin_executor::AdminCommand;
 use crate::indexing::PublicMode;
 
@@ -85,7 +85,6 @@ struct HealthPage {
 
 const UNKNOWN: &str = "unknown";
 const FIVE_MIN: Duration = Duration::from_secs(300);
-const HOUR: Duration = Duration::from_secs(3600);
 
 /// The network stream in one phrase, for Home's tile: the furthest relay's
 /// delay.
@@ -153,8 +152,8 @@ fn or_unknown(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
     v.map_or_else(|| UNKNOWN.to_string(), f)
 }
 
-/// The key figures. Storage and public data are one line each, linking the
-/// page that shows them in full.
+/// The key figures. Storage, public data and private posts are one line
+/// each, linking the page that shows them in full.
 #[allow(clippy::too_many_lines)]
 fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
     let ring = &state.health.ring;
@@ -223,30 +222,13 @@ fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
         note: String::new(),
     });
 
-    // Private posts' new form (private-embeds design §9).
-    let form = |f: &str| now.and_then(|s| s.sum_where(PRIVATE_READ_CONTENT, "form", f));
-    // Quotes and mentions only: the same metric also counts `field="media"`
-    // (private-media-filters design §8).
-    let source = |s: &str| {
-        now.and_then(|n| {
-            let of = |field: &str| n.sum_where_all(PRIVATE_INGEST_SOURCE, &[("field", field), ("source", s)]);
-            match (of("quote"), of("mentions")) {
-                (None, None) => None,
-                (q, m) => Some(q.unwrap_or(0.0) + m.unwrap_or(0.0)),
-            }
-        })
-    };
-    let bad = ring.rise(HOUR, |s| Some(s.sum_where(PRIVATE_READ_OUTCOMES, "outcome", "bad_content").unwrap_or(0.0)));
     groups.push(FigureGroup {
         title: "Private posts",
-        figures: vec![
-            fig("Read in the new form (text, links and embeds together)", or_unknown(form("content"), count)),
-            fig("Read in the older form (text only)", or_unknown(form("text"), count)),
-            fig("Could not be read (last hour)", or_unknown(bad, count)),
-            fig("Quotes and mentions from the new fields", or_unknown(source("dedicated"), count)),
-            fig("Quotes and mentions from the older fields", or_unknown(source("clear"), count)),
-        ],
-        note: "Counted since Prism started. A post that could not be read means its server and Prism disagree on the new form.".to_string(),
+        figures: vec![Figure {
+            link: Some(("/admin/private", "Private posts")),
+            ..fig("Could not be read (last hour)", or_unknown(super::private::bad_reads(state), count))
+        }],
+        note: String::new(),
     });
     groups
 }

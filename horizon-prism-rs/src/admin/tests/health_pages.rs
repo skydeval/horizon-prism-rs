@@ -91,11 +91,16 @@ async fn health_jobs_and_home() {
         "Records waiting",
         "200,000",
         "1.0 GB of",
-        "Read in the new form",
+        "<span class=\"l\">Could not be read (last hour)</span><span class=\"v\">0 — <a href=\"/admin/private\">Private posts</a></span>",
         "url=/admin/health?auto=1",
     ] {
         assert!(health.body.contains(text), "{text}: {}", health.body);
     }
+    // The private posts' figures are on their page.
+    assert!(!health.body.contains("Read in the new form"), "{}", health.body);
+    let private = get(&alice, &url("/admin/private")).await;
+    assert!(private.body.contains("<span class=\"l\">Read in the new form (text, links and embeds together)</span><span class=\"v\">7</span>"), "{}", private.body);
+    assert!(private.body.contains("<span class=\"l\">Could not be read (last hour)</span><span class=\"v\">0</span>"), "{}", private.body);
     // Its own reload is a poll, and still counts the settings banners.
     let auto = get(&alice, &url("/admin/health?auto=1")).await;
     assert_eq!(auto.status, 200);
