@@ -1,4 +1,5 @@
-//! Communities (`/admin/communities`, refract design §9.1): the accounts
+//! Communities · Refract, its Communities tab (`/admin/communities`): the
+//! accounts
 //! Prism keeps serving because a listed community still hosts them after
 //! Bluesky took them down.
 //!
@@ -24,9 +25,10 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Confirm, Nav, confirmed, css, enqueue, hidden_field, message, render};
+use super::{Confirm, Nav, back_to, confirmed, css, enqueue, hidden_field, message, render};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
+use crate::admin::menu::Tab;
 use crate::admin::settings::store::Change;
 use crate::admin_executor::AdminCommand;
 use crate::config::{LabelSource, RefractCommunity, default_gone_labels};
@@ -218,7 +220,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &CommunitiesPage {
             css: css(),
-            nav: Some(Nav::new(&op, "communities")),
+            nav: Some(Nav::tab(&op, Tab::Communities)),
             title: "Communities".to_string(),
             csrf: op.csrf.clone(),
             enabled,
@@ -231,7 +233,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
 }
 
 fn refuse(state: &AdminState, op: &Operator, text: &str) -> Response {
-    message(state, Some(Nav::new(op, "communities")), StatusCode::BAD_REQUEST, "Not saved", text, Some(("/admin/communities", "Communities")))
+    message(state, Some(Nav::at(op, "/admin/communities")), StatusCode::BAD_REQUEST, "Not saved", text, Some(("/admin/communities", "Communities")))
 }
 
 /// Save the whole list (and nothing else) as one `settings set`.
@@ -263,6 +265,13 @@ pub struct SwitchForm {
     #[serde(default)]
     pub enabled: String,
     pub confirm: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
+}
+
+/// Where Cancel goes from this page's confirmations.
+fn back(state: &AdminState, headers: &HeaderMap, form_back: Option<&str>) -> String {
+    back_to(state, headers, form_back, "/admin/communities")
 }
 
 /// `POST /admin/communities/switch`: `refract.enabled`. Turning it off
@@ -288,7 +297,7 @@ pub async fn switch(State(state): State<AdminState>, ConnectInfo(peer): ConnectI
                 typed: None,
                 button: "Turn off",
             }
-            .page(&op, "communities");
+            .page(&op, &back(&state, &headers, form.back.as_deref()));
             if let Some(response) = confirmed(page, form.confirm.as_deref(), None) {
                 return response;
             }
@@ -325,6 +334,8 @@ pub struct CommunityForm {
     pub gone_labels: String,
     pub enabled: Option<String>,
     pub confirm: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 fn words_list(text: &str) -> Vec<String> {
@@ -371,8 +382,19 @@ pub fn may_make_pending(old: &RefractCommunity, new: &RefractCommunity) -> bool 
     (old.enabled && !new.enabled) || old.pds_patterns != new.pds_patterns
 }
 
-/// Ask first when `n` restored accounts of `name` would become pending.
-async fn ask(state: &AdminState, op: &Operator, name: &str, title: &'static str, action: &'static str, hidden: Vec<super::Hidden>, confirm: Option<&str>) -> Option<Response> {
+/// Ask first when `n` restored accounts of `name` would become pending;
+/// Cancel goes to `back`.
+#[allow(clippy::too_many_arguments)]
+async fn ask(
+    state: &AdminState,
+    op: &Operator,
+    back: &str,
+    name: &str,
+    title: &'static str,
+    action: &'static str,
+    hidden: Vec<super::Hidden>,
+    confirm: Option<&str>,
+) -> Option<Response> {
     let n = match restored(state, Some(name)).await {
         Ok(n) => n,
         Err(e) => return Some(super::internal_error(state, &e)),
@@ -389,7 +411,7 @@ async fn ask(state: &AdminState, op: &Operator, name: &str, title: &'static str,
         typed: None,
         button: title,
     }
-    .page(op, "communities");
+    .page(op, back);
     confirmed(page, confirm, None)
 }
 
@@ -432,7 +454,7 @@ pub async fn save(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             return refuse(&state, &op, "That community is no longer listed; reload the page.");
         };
         if may_make_pending(&list[at], &new)
-            && let Some(response) = ask(&state, &op, original, "Save", "/admin/communities/save", form_fields(&form), form.confirm.as_deref()).await
+            && let Some(response) = ask(&state, &op, &back(&state, &headers, form.back.as_deref()), original, "Save", "/admin/communities/save", form_fields(&form), form.confirm.as_deref()).await
         {
             return response;
         }
@@ -449,6 +471,8 @@ pub struct NameForm {
     #[serde(default)]
     pub name: String,
     pub confirm: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 /// `POST /admin/communities/toggle`: enable or disable one community.
@@ -462,7 +486,7 @@ pub async fn toggle(State(state): State<AdminState>, ConnectInfo(peer): ConnectI
         return refuse(&state, &op, "That community is no longer listed; reload the page.");
     };
     if list[at].enabled
-        && let Some(response) = ask(&state, &op, &form.name, "Disable", "/admin/communities/toggle", vec![hidden_field("name", &form.name)], form.confirm.as_deref()).await
+        && let Some(response) = ask(&state, &op, &back(&state, &headers, form.back.as_deref()), &form.name, "Disable", "/admin/communities/toggle", vec![hidden_field("name", &form.name)], form.confirm.as_deref()).await
     {
         return response;
     }
@@ -480,7 +504,7 @@ pub async fn remove(State(state): State<AdminState>, ConnectInfo(peer): ConnectI
     let Some(at) = list.iter().position(|c| c.name == form.name) else {
         return refuse(&state, &op, "That community is no longer listed; reload the page.");
     };
-    if let Some(response) = ask(&state, &op, &form.name, "Remove", "/admin/communities/remove", vec![hidden_field("name", &form.name)], form.confirm.as_deref()).await {
+    if let Some(response) = ask(&state, &op, &back(&state, &headers, form.back.as_deref()), &form.name, "Remove", "/admin/communities/remove", vec![hidden_field("name", &form.name)], form.confirm.as_deref()).await {
         return response;
     }
     list.remove(at);

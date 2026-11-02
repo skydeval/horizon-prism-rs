@@ -1,4 +1,6 @@
-//! Appearance (`/admin/settings/appearance`): the signed-in operator's own
+//! Appearance (`/admin/appearance`, under the operator's name in the
+//! sidebar; the old `/admin/settings/appearance` redirects, and its POST
+//! still saves): the signed-in operator's own
 //! look of these pages, light, dark or the device's, a colour scheme and a
 //! font. Saved for that operator alone (`theme`), straight away:
 //! no command, since it changes nothing about this server, and so not in
@@ -16,6 +18,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use super::{Nav, css, message, render};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
+use crate::admin::menu::PageId;
 use crate::admin::theme::{self, Font, Mode, Scheme, Theme};
 
 /// A choice on the page.
@@ -44,7 +47,7 @@ pub struct PageQuery {
     pub saved: Option<String>,
 }
 
-/// `GET /admin/settings/appearance`.
+/// `GET /admin/appearance`.
 pub async fn page(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -60,7 +63,7 @@ pub async fn page(
         StatusCode::OK,
         &AppearancePage {
             css: css(),
-            nav: Some(Nav::new(&op, "settings")),
+            nav: Some(Nav::page(&op, PageId::Appearance)),
             title: "Appearance".to_string(),
             csrf: op.csrf.clone(),
             modes: Mode::ALL.into_iter().map(|m| Choice { value: m.as_str(), label: m.label(), checked: m == now.mode }).collect(),
@@ -85,7 +88,8 @@ pub struct AppearanceForm {
     pub font: Option<String>,
 }
 
-/// `POST /admin/settings/appearance`: save the operator's choice.
+/// `POST /admin/appearance` (and the old `/admin/settings/appearance`):
+/// save the operator's choice.
 pub async fn save(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -103,18 +107,18 @@ pub async fn save(
     let (Some(mode), Some(scheme), Some(font)) = (Mode::parse(&form.mode), Scheme::parse(&form.scheme), font) else {
         return message(
             &state,
-            Some(Nav::new(&op, "settings")),
+            Some(Nav::at(&op, "/admin/appearance")),
             StatusCode::BAD_REQUEST,
             "Not saved",
             "Choose one of the offered looks.",
-            Some(("/admin/settings/appearance", "Appearance")),
+            Some(("/admin/appearance", "Appearance")),
         );
     };
     let chosen = Theme { mode, scheme, font };
     match theme::save(&state.pool, &op.did, chosen).await {
         Ok(_) => {
             tracing::info!(event = "admin_appearance_saved", did = %op.did, mode = mode.as_str(), scheme = scheme.as_str(), font = font.as_str(), "an operator changed their admin appearance");
-            Redirect::to("/admin/settings/appearance?saved=1").into_response()
+            Redirect::to("/admin/appearance?saved=1").into_response()
         }
         Err(error) => super::internal_error(&state, &error),
     }

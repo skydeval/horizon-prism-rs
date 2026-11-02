@@ -598,10 +598,11 @@ async fn t_f9_audit_log() {
     assert_eq!(moved.headers.get(LOCATION).and_then(|v| v.to_str().ok()), Some("/admin/audit?who=cli"));
     let bare = alice.get(&format!("{}/admin/activity", h.base)).await;
     assert_eq!((bare.status, bare.headers.get(LOCATION).and_then(|v| v.to_str().ok())), (308, Some("/admin/audit")));
-    let nav = &audit.body[audit.body.find("<nav>").expect("nav")..audit.body.find("</nav>").expect("nav end")];
-    // Settings is last since #810; the audit log is still in the menu.
-    let last = nav.rfind("<a ").expect("a link");
-    assert!(nav[last..].contains("/admin/settings") && nav.contains("aria-current=\"page\">Audit log</a>"), "{nav}");
+    let nav = crate::admin::test_support::sidebar(&audit.body);
+    // All settings is the last item; the audit log is marked.
+    let last = nav.rfind("<li><a ").expect("a link");
+    assert!(nav[last..].contains("href=\"/admin/settings\""), "{nav}");
+    assert_eq!(crate::admin::test_support::current_item(&audit.body), Some(("Audit log".to_string(), "page".to_string())), "{nav}");
     assert!(!audit.body.contains(">Activity<"));
     h.db.drop_db().await;
 }
@@ -641,7 +642,9 @@ async fn t_f11_script_not_started() {
     let rule = &CSS[CSS.find(".live-list {").expect("the list rule")..];
     let rule = &rule[..rule.find('}').expect("rule end")];
     assert!(rule.contains("overflow: hidden;") && rule.contains("height: calc("), "{rule}");
-    assert!(!CSS.contains("overflow-y"), "no scrollbar");
+    // No scrollbar on the feed; the sidebar alone scrolls inside itself.
+    let rules = crate::admin::test_support::css::rules(CSS);
+    assert!(rules.iter().all(|r| r.selectors == ".sidebar" || !r.declarations.contains("overflow-y")), "no scrollbar");
     assert!(home.body.replace("&#x2f;", "/").contains(&format!("<script src=\"{}\" defer></script>", *JS_HREF)), "{}", home.body);
     assert!(home.body.contains("<noscript><meta http-equiv=\"refresh\" content=\"30;url=/admin?auto=1\"></noscript>"));
     assert!(home.body.contains("The live feed needs JavaScript."));

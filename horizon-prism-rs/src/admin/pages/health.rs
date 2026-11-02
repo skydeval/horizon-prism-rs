@@ -283,6 +283,8 @@ pub struct ResyncForm {
     pub csrf: String,
     pub confirm: Option<String>,
     pub typed: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 /// `GET /admin/health`; with `?auto=1` (its own reload) a [`Need::Poll`].
@@ -309,7 +311,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &HealthPage {
             css: css(),
-            nav: Some(Nav { banners: b, ..Nav::new(&op, "health") }),
+            nav: Some(Nav { banners: b, ..Nav::page(&op, crate::admin::menu::PageId::Health) }),
             title: "Health".to_string(),
             csrf: op.csrf.clone(),
             started: format!("{} ({})", when(started), ago(started)),
@@ -336,7 +338,7 @@ pub async fn resync(State(state): State<AdminState>, ConnectInfo(peer): ConnectI
         typed: Some("RESYNC".to_string()),
         button: "Re-sync",
     }
-    .page(&op, "health");
+    .page(&op, &super::back_to(&state, &headers, form.back.as_deref(), "/admin/health"));
     if let Some(response) = confirmed(page, form.confirm.as_deref(), form.typed.as_deref()) {
         return response;
     }

@@ -15,9 +15,10 @@ use axum::response::Response;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use super::{ConfirmPage, Hidden, Nav, css, enqueue, message, render, typed_matches, typed_word, when};
+use super::{ConfirmPage, Hidden, Nav, back_to, css, enqueue, message, render, typed_matches, typed_word, when};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
+use crate::admin::menu::PageId;
 use crate::admin::operators::{endpoint_host, host_allowed, parse_pattern};
 use crate::admin_executor::AdminCommand;
 
@@ -120,7 +121,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &OperatorsPage {
             css: css(),
-            nav: Some(Nav::new(&op, "operators")),
+            nav: Some(Nav::page(&op, PageId::Operators)),
             title: "Operators".to_string(),
             csrf: op.csrf.clone(),
             operators,
@@ -144,17 +145,20 @@ pub struct OperatorForm {
     pub add_host: Option<String>,
     pub confirm: Option<String>,
     pub typed: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 fn refused(op: &Operator, state: &AdminState, status: StatusCode, text: &str) -> Response {
-    message(state, Some(Nav::new(op, "operators")), status, "Not done", text, Some(("/admin/operators", "Operators")))
+    message(state, Some(Nav::at(op, "/admin/operators")), status, "Not done", text, Some(("/admin/operators", "Operators")))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn confirm_page(op: &Operator, title: &str, what: String, undo: &str, action: &str, hidden: Vec<Hidden>, typed: Option<String>, button: &str) -> ConfirmPage {
+fn confirm_page(op: &Operator, back: String, title: &str, what: String, undo: &str, action: &str, hidden: Vec<Hidden>, typed: Option<String>, button: &str) -> ConfirmPage {
     ConfirmPage {
         css: css(),
-        nav: Some(Nav::new(op, "operators")),
+        nav: Some(Nav::at(op, &back)),
+        back,
         title: title.to_string(),
         what,
         undo: undo.to_string(),
@@ -198,6 +202,7 @@ pub async fn add(
         }
         let page = confirm_page(
             &op,
+            back_to(&state, &headers, form.back.as_deref(), "/admin/operators"),
             "Add an operator and allow their server",
             format!("{input} becomes an operator, and sign-in from their account's server is allowed. Anyone who can make an account on that server with a stolen identity could then try to sign in here."),
             "You can remove the operator and the server again later.",
@@ -239,7 +244,7 @@ pub async fn remove(
     } else {
         format!("{did} stops being an operator and is signed out at once.")
     };
-    let mut page = confirm_page(&op, "Remove an operator", what, "They can be added again later.", "/admin/operators/remove", vec![hidden("did", &did)], Some(word.clone()), "Remove operator");
+    let mut page = confirm_page(&op, back_to(&state, &headers, form.back.as_deref(), "/admin/operators"), "Remove an operator", what, "They can be added again later.", "/admin/operators/remove", vec![hidden("did", &did)], Some(word.clone()), "Remove operator");
     if form.confirm.as_deref() != Some("yes") {
         return render(StatusCode::OK, &page);
     }
@@ -293,7 +298,7 @@ pub async fn host_remove(
     } else {
         (format!("Sign-in from {pattern} stops. Operators whose account is there are signed out at their next request."), None)
     };
-    let mut page = confirm_page(&op, "Stop allowing a server", what, "You can allow it again later.", "/admin/operators/hosts/remove", vec![hidden("pattern", &pattern)], typed.clone(), "Remove");
+    let mut page = confirm_page(&op, back_to(&state, &headers, form.back.as_deref(), "/admin/operators"), "Stop allowing a server", what, "You can allow it again later.", "/admin/operators/hosts/remove", vec![hidden("pattern", &pattern)], typed.clone(), "Remove");
     if form.confirm.as_deref() != Some("yes") {
         return render(StatusCode::OK, &page);
     }

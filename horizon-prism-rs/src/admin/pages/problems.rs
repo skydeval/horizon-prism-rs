@@ -153,7 +153,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &ProblemsPage {
             css: css(),
-            nav: Some(Nav::new(&op, "problems")),
+            nav: Some(Nav::page(&op, crate::admin::menu::PageId::Problems)),
             title: "Problems".to_string(),
             csrf: op.csrf.clone(),
             letters,
@@ -169,10 +169,12 @@ pub struct LetterForm {
     #[serde(default)]
     pub id: String,
     pub confirm: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 fn bad_id(state: &AdminState, op: &crate::admin::auth::Operator) -> Response {
-    message(state, Some(Nav::new(op, "problems")), StatusCode::BAD_REQUEST, "Not done", "That is not a record on this page.", Some(("/admin/problems", "Problems")))
+    message(state, Some(Nav::at(op, "/admin/problems")), StatusCode::BAD_REQUEST, "Not done", "That is not a record on this page.", Some(("/admin/problems", "Problems")))
 }
 
 /// `POST /admin/problems/replay`: `deadletter replay`.
@@ -207,7 +209,7 @@ pub async fn dismiss(State(state): State<AdminState>, ConnectInfo(peer): Connect
         typed: None,
         button: "Dismiss",
     }
-    .page(&op, "problems");
+    .page(&op, &super::back_to(&state, &headers, form.back.as_deref(), "/admin/problems"));
     if let Some(response) = confirmed(page, form.confirm.as_deref(), None) {
         return response;
     }
@@ -219,6 +221,8 @@ pub struct SweepForm {
     #[serde(default)]
     pub csrf: String,
     pub confirm: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 /// `POST /admin/problems/sweep`: `deadletter sweep`, confirmed
@@ -237,7 +241,7 @@ pub async fn sweep(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
         typed: None,
         button: "Clear out",
     }
-    .page(&op, "problems");
+    .page(&op, &super::back_to(&state, &headers, form.back.as_deref(), "/admin/problems"));
     if let Some(response) = confirmed(page, form.confirm.as_deref(), None) {
         return response;
     }

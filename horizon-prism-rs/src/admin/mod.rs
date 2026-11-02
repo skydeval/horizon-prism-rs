@@ -11,7 +11,8 @@
 //! Labels, Look up, and the per-member actions (sync again, Farsight read
 //! and forget, list clean-up). Each operator's Appearance (`theme`, #810).
 //! Instance, everything about this instance on one page, and the custom
-//! lexicons it serves (`lexicons`).
+//! lexicons it serves (`lexicons`). The sidebar, the pages' names and
+//! addresses, and the redirects from old addresses (`menu`).
 //!
 //! Served by `serve` itself on its own origin, merged before
 //! `xrpc::router::finalize`, so it sits inside the global per-IP limit
@@ -26,6 +27,7 @@ pub mod fonts;
 pub mod health;
 pub mod lexicons;
 pub mod live;
+pub mod menu;
 pub mod oauth;
 pub mod operators;
 pub mod pages;
@@ -42,8 +44,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Path, Request};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -306,9 +308,24 @@ fn route(m: MethodRouter<AdminState>) -> MethodRouter<AdminState> {
     m.fallback(method_not_allowed)
 }
 
+/// `308 Permanent Redirect` to `to`, with the request's own query and then
+/// `fragment`. It needs no session and reads no database; a `Location`
+/// that is not a valid header value is the plain 404 page.
+pub async fn moved_to(to: &str, query: Option<&str>, fragment: &str) -> Response {
+    match HeaderValue::try_from(menu::location(to, query, fragment)) {
+        Ok(location) => (StatusCode::PERMANENT_REDIRECT, [(LOCATION, location)]).into_response(),
+        Err(_) => pages::not_found().await,
+    }
+}
+
+/// A GET answered by [`moved_to`].
+fn moved(to: &'static str, fragment: &'static str) -> MethodRouter<AdminState> {
+    get(move |RawQuery(query): RawQuery| async move { moved_to(to, query.as_deref(), fragment).await })
+}
+
 /// The admin router, nested at `/admin`. Merge it before `finalize`.
 pub fn router(state: AdminState) -> Router {
-    let admin = Router::new()
+    let mut admin = Router::new()
         .route("/", route(get(pages::home::page)))
         .route("/tiles", route(get(pages::home::tiles)))
         .route("/live", route(get(live::stream::open)))
@@ -334,7 +351,6 @@ pub fn router(state: AdminState) -> Router {
         .route("/lookup", route(get(pages::lookup::page)))
         .route("/commands/{id}", route(get(pages::commands::page)))
         .route("/audit", route(get(pages::audit::page)))
-        .route("/activity", route(get(pages::audit::moved)))
         .route("/operators", route(get(pages::operators::page)))
         .route("/operators/add", route(post(pages::operators::add)))
         .route("/operators/remove", route(post(pages::operators::remove)))
@@ -346,13 +362,14 @@ pub fn router(state: AdminState) -> Router {
         .route("/settings/reset", route(post(pages::settings::reset)))
         .route("/settings/keep", route(post(pages::settings::keep)))
         .route("/settings/public-scope", route(post(pages::settings::public_scope)))
-        .route("/settings/appearance", route(get(pages::appearance::page).post(pages::appearance::save)))
+        .route("/settings/appearance", route(moved("/admin/appearance", "").post(pages::appearance::save)))
+        .route("/appearance", route(get(pages::appearance::page).post(pages::appearance::save)))
         .route("/settings/{group}", route(get(pages::settings::group).post(pages::settings::save)))
         .route("/restart", route(post(pages::settings::restart)))
         .route("/health", route(get(pages::health::page)))
         .route("/health/resync", route(post(pages::health::resync)))
         .route("/stats", route(get(pages::stats::page)))
-        .route("/instance", route(get(pages::instance::page)))
+        .route("/about", route(get(pages::instance::page)))
         .route("/lexicons/{*path}", route(get(lexicons::serve)))
         .route("/jobs", route(get(pages::jobs::page)))
         .route("/jobs/retry", route(post(pages::jobs::retry)))
@@ -362,18 +379,34 @@ pub fn router(state: AdminState) -> Router {
         .route("/problems/replay", route(post(pages::problems::replay)))
         .route("/problems/dismiss", route(post(pages::problems::dismiss)))
         .route("/problems/sweep", route(post(pages::problems::sweep)))
-        .route("/farsight", route(get(pages::farsight::page)))
+        .route("/blocks", route(get(pages::farsight::page)))
         .route("/communities", route(get(pages::communities::page)))
         .route("/communities/switch", route(post(pages::communities::switch)))
         .route("/communities/save", route(post(pages::communities::save)))
         .route("/communities/toggle", route(post(pages::communities::toggle)))
         .route("/communities/remove", route(post(pages::communities::remove)))
         .route("/communities/keep", route(post(pages::communities::keep)))
-        .route("/refract", route(get(pages::refract::page)))
+        .route("/communities/accounts", route(get(pages::refract::page)))
+        .route("/communities/accounts/add", route(post(pages::refract::add)))
+        .route("/communities/accounts/check", route(post(pages::refract::check)))
+        .route("/communities/accounts/end", route(post(pages::refract::end)))
+        .route("/communities/accounts/{did}", route(get(pages::refract::account)))
+        // The old paths of the Accounts tab's forms, for pages a browser
+        // loaded before they moved.
         .route("/refract/add", route(post(pages::refract::add)))
         .route("/refract/check", route(post(pages::refract::check)))
         .route("/refract/end", route(post(pages::refract::end)))
-        .route("/refract/{did}", route(get(pages::refract::account)))
+        .route("/refract/{did}", route(get(pages::refract::moved)));
+    // Old addresses with no POST of their own answer 308 (Appearance's old
+    // path, which also takes the POST, is routed above).
+    for (old, new, fragment) in menu::REDIRECTS {
+        if let Some(path) = old.strip_prefix("/admin")
+            && *old != "/admin/settings/appearance"
+        {
+            admin = admin.route(path, route(moved(new, fragment)));
+        }
+    }
+    let admin = admin
         .fallback(pages::not_found)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(headers))

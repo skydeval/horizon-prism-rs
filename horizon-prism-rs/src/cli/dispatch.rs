@@ -31,22 +31,22 @@ pub struct AdminArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AdminCmd {
-    /// Community membership (§9.2).
+    /// Community membership.
     Member {
         #[command(subcommand)]
         action: MemberAction,
     },
-    /// Local labels (§7.8).
+    /// Local labels.
     Label {
         #[command(subcommand)]
         action: LabelAction,
     },
-    /// Scope maintenance (§9.4).
+    /// Scope maintenance: the nightly clean-up of the accounts Prism keeps.
     Scope {
         #[command(subcommand)]
         action: ScopeAction,
     },
-    /// Enqueue a backfill (§5.10).
+    /// Enqueue a backfill.
     Backfill {
         did: String,
         /// member | scope | private | authz | resync (default: member for a
@@ -54,12 +54,12 @@ pub enum AdminCmd {
         #[arg(long)]
         depth: Option<String>,
     },
-    /// Clear readiness and re-sync every member and private owner (§5.7).
+    /// Clear readiness and re-sync every member and private owner.
     Resync {
         #[arg(long, required = true)]
         private_and_members: bool,
     },
-    /// Dead-letter handling (§5.3).
+    /// Problems: records Prism could not process.
     Deadletter {
         #[command(subcommand)]
         action: DeadletterAction,
@@ -74,25 +74,25 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: CommandsAction,
     },
-    /// The block-list index, Farsight (design-v3 §5.14.11).
+    /// Blocks · Farsight: the block-list index.
     Farsight {
         #[command(subcommand)]
         action: FarsightAction,
     },
-    /// Lists that members mute or block (design-v3 §4.3).
+    /// Lists that members mute or block.
     Lists {
         #[command(subcommand)]
         action: ListsAction,
     },
-    /// Public indexing as an operator switch (public-indexing design §3.4).
+    /// Public indexing as an operator switch.
     Indexing {
         #[command(subcommand)]
         action: IndexingAction,
     },
     /// Print a fresh service signing key, its did:key and a correlation key.
     Keygen,
-    /// Who may use the web admin UI, and from which servers (admin-ui
-    /// design §5.7). The break-glass when nobody can sign in.
+    /// Who may use the web admin UI, and from which servers. The
+    /// break-glass when nobody can sign in.
     Operator {
         #[command(subcommand)]
         action: OperatorAction,
@@ -104,7 +104,7 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: IdentityAction,
     },
-    /// The settings the web admin UI changes (admin-ui design §8).
+    /// Every setting the web admin changes (All settings).
     Settings {
         #[command(subcommand)]
         action: SettingsAction,
@@ -112,7 +112,7 @@ pub enum AdminCmd {
     /// Restart serve: it shuts down as at SIGTERM and exits for its
     /// supervisor to start it again (needs APP_SUPERVISED=1).
     Restart,
-    /// Accounts served for the listed communities (refract design §9).
+    /// Communities · Refract: accounts kept for the listed communities.
     Refract {
         #[command(subcommand)]
         action: RefractAction,
@@ -162,8 +162,7 @@ pub enum SettingsAction {
 #[derive(Debug, Subcommand)]
 pub enum IdentityAction {
     /// Resolve DIDs and handles as with `identity.lodestar_url` empty and
-    /// as with it set, side by side (lodestar-reads design §6.2). Changes
-    /// nothing.
+    /// as with it set, side by side. Changes nothing.
     Compare {
         /// Also compare this many DIDs picked at random from `actors`, plus
         /// a few `did:web` and accounts marked deleted.

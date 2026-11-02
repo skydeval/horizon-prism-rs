@@ -1,4 +1,5 @@
-//! Refract accounts (`/admin/refract`, refract design §9): every account
+//! Communities · Refract, its Accounts tab (`/admin/communities/accounts`;
+//! the old `/admin/refract` redirects): every account
 //! Refract knows, with its community, state, checks and, once restored, how
 //! far the fetch of its history has got. Add an account (a handle or a
 //! DID: `refract check`, so it becomes a candidate checked now), check one
@@ -11,7 +12,8 @@ use std::net::SocketAddr;
 
 use askama::Template;
 use axum::Form;
-use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::extract::rejection::PathRejection;
+use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
@@ -19,19 +21,24 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::communities::PendingView;
-use super::{ConfirmPage, Hidden, Nav, confirmed, css, enqueue, message, render, typed_word, when, when_opt};
+use super::{ConfirmPage, Hidden, Nav, back_to, confirmed, css, enqueue, message, render, typed_word, when, when_opt};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
+use crate::admin::menu::{PageId, Tab, account_href, lookup_href};
 use crate::admin_executor::AdminCommand;
 
 /// Accounts per page.
 pub const PAGE: i64 = 100;
 /// The states, in the order the filter offers them.
 const STATES: [&str; 5] = ["candidate", "restored", "grace", "ending", "rejected"];
+/// The Accounts tab.
+const ACCOUNTS: &str = "/admin/communities/accounts";
 
 /// One account in the list.
 pub struct AccountRow {
     pub did: String,
+    /// The account's page.
+    pub href: String,
     pub handle: String,
     pub community: String,
     pub state: String,
@@ -143,10 +150,19 @@ pub fn link(state: &str, community: &str, page: i64) -> String {
         q.append_pair("page", &page.to_string());
     }
     let q = q.finish();
-    if q.is_empty() { "/admin/refract".to_string() } else { format!("/admin/refract?{q}") }
+    if q.is_empty() { ACCOUNTS.to_string() } else { format!("{ACCOUNTS}?{q}") }
 }
 
-/// `GET /admin/refract`.
+/// `GET /admin/refract/{did}`: moved to the account's page on the Accounts
+/// tab, its query kept. Anything but a DID is the plain 404 page.
+pub async fn moved(did: Result<Path<String>, PathRejection>, RawQuery(query): RawQuery) -> Response {
+    match did {
+        Ok(Path(did)) if proto_blue::syntax::Did::is_valid(&did) => crate::admin::moved_to(&account_href(&did), query.as_deref(), "").await,
+        _ => super::not_found().await,
+    }
+}
+
+/// `GET /admin/communities/accounts`.
 pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Query(q): Query<ListQuery>) -> Response {
     let op = match require(&state, &headers, peer, Need::Page, None).await {
         Ok(op) => op,
@@ -204,6 +220,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             } else {
                 "—".to_string()
             },
+            href: account_href(&did),
             did,
             handle: handle.unwrap_or_default(),
             community,
@@ -217,8 +234,8 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &RefractPage {
             css: css(),
-            nav: Some(Nav::new(&op, "refract")),
-            title: "Refract accounts".to_string(),
+            nav: Some(Nav::tab(&op, Tab::Accounts)),
+            title: PageId::Communities.page().name.to_string(),
             csrf: op.csrf.clone(),
             enabled: live.refract_enabled,
             states: STATES.to_vec(),
@@ -283,6 +300,8 @@ struct AccountPage {
     labels: Vec<LabelView>,
     events: Vec<EventView>,
     pending: Vec<String>,
+    /// Look up's page for the account.
+    lookup: String,
     /// `refract end` is allowed: restored or in grace.
     can_end: bool,
     /// `refract check` makes sense: anything but ending.
@@ -329,8 +348,17 @@ struct Row {
 type LabelRow = (String, String, String, Option<DateTime<Utc>>, Option<DateTime<Utc>>, bool, bool);
 type EventRow = (DateTime<Utc>, Option<String>, String, Option<String>);
 
-/// `GET /admin/refract/{did}`: what `admin refract show` gives.
-pub async fn account(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Path(did): Path<String>) -> Response {
+/// `GET /admin/communities/accounts/{did}`: what `admin refract show`
+/// gives. A segment that is not text is the plain 404 page.
+pub async fn account(
+    State(state): State<AdminState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    did: Result<Path<String>, PathRejection>,
+) -> Response {
+    let Ok(Path(did)) = did else {
+        return super::not_found().await;
+    };
     let op = match require(&state, &headers, peer, Need::Page, None).await {
         Ok(op) => op,
         Err(response) => return response,
@@ -364,11 +392,11 @@ pub async fn account(State(state): State<AdminState>, ConnectInfo(peer): Connect
     let Some(row) = row else {
         return message(
             &state,
-            Some(Nav::new(&op, "refract")),
+            Some(Nav::at(&op, ACCOUNTS)),
             StatusCode::NOT_FOUND,
             "Not known",
-            &format!("Refract has no row for {did}. Add it on the Refract accounts page to check it."),
-            Some(("/admin/refract", "Refract accounts")),
+            &format!("Refract has no row for {did}. Add it on the Accounts tab to check it."),
+            Some((ACCOUNTS, "the Accounts tab")),
         );
     };
     let verdict = row.last_verdict.clone().unwrap_or(Value::Null);
@@ -427,8 +455,9 @@ pub async fn account(State(state): State<AdminState>, ConnectInfo(peer): Connect
         StatusCode::OK,
         &AccountPage {
             css: css(),
-            nav: Some(Nav::new(&op, "refract")),
+            nav: Some(Nav::under(&op, PageId::Communities)),
             title: if handle.is_empty() { did.clone() } else { handle.clone() },
+            lookup: lookup_href(&did),
             csrf: op.csrf.clone(),
             enabled: state.settings.live.load().refract_enabled,
             state_words: state_words(&row.state),
@@ -455,13 +484,13 @@ pub async fn account(State(state): State<AdminState>, ConnectInfo(peer): Connect
 
 /// A refusal on this page.
 fn refuse(state: &AdminState, op: &Operator, title: &str, text: &str) -> Response {
-    message(state, Some(Nav::new(op, "refract")), StatusCode::BAD_REQUEST, title, text, Some(("/admin/refract", "Refract accounts")))
+    message(state, Some(Nav::at(op, ACCOUNTS)), StatusCode::BAD_REQUEST, title, text, Some((ACCOUNTS, "the Accounts tab")))
 }
 
 /// The refusal of a check while Refract is off: the command would fail.
 fn off(state: &AdminState, op: &Operator) -> Option<Response> {
     (!state.settings.live.load().refract_enabled).then(|| {
-        refuse(state, op, "Not checked", "Refract is off, so nothing is checked. Turn it on on the Communities page first.")
+        refuse(state, op, "Not checked", "Refract is off, so nothing is checked. Turn it on on the Communities tab first.")
     })
 }
 
@@ -473,7 +502,8 @@ pub struct AddForm {
     pub input: String,
 }
 
-/// `POST /admin/refract/add`: a handle or DID → `refract check` (a
+/// `POST /admin/communities/accounts/add` (and the old `/admin/refract/add`):
+/// a handle or DID → `refract check` (a
 /// candidate checked now, or due now if known).
 pub async fn add(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Form(form): Form<AddForm>) -> Response {
     let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
@@ -498,13 +528,16 @@ pub struct DidForm {
     pub confirm: Option<String>,
     pub typed: Option<String>,
     pub reason: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 fn invalid_did(state: &AdminState, op: &Operator, did: &str) -> Option<Response> {
     (!proto_blue::syntax::Did::is_valid(did)).then(|| refuse(state, op, "Not done", "That is not a valid DID."))
 }
 
-/// `POST /admin/refract/check`: check a known account again now.
+/// `POST /admin/communities/accounts/check` (and the old
+/// `/admin/refract/check`): check a known account again now.
 pub async fn check(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Form(form): Form<DidForm>) -> Response {
     let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
         Ok(op) => op,
@@ -516,7 +549,8 @@ pub async fn check(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
     enqueue(&state, &op, &AdminCommand::RefractCheck { did: form.did.clone() }).await
 }
 
-/// `POST /admin/refract/end` (typed: the account's handle): stop keeping a
+/// `POST /admin/communities/accounts/end` (and the old
+/// `/admin/refract/end`; typed: the account's handle): stop keeping a
 /// restored account; `refract end`.
 pub async fn end(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Form(form): Form<DidForm>) -> Response {
     let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
@@ -542,16 +576,18 @@ pub async fn end(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo
     if let Some(r) = &reason {
         hidden.push(Hidden { name: "reason".to_string(), value: r.clone() });
     }
+    let back = back_to(&state, &headers, form.back.as_deref(), &account_href(&form.did));
     let page = ConfirmPage {
         css: css(),
-        nav: Some(Nav::new(&op, "refract")),
+        nav: Some(Nav::at(&op, &back)),
+        back,
         title: "Remove a restored account".to_string(),
         what: format!(
             "Prism stops keeping {} and hides it at once, then deletes what it stored for that account only because Refract kept it: its posts, its history and its Refract records. Members' own records that point at it (their likes, follows, replies and quotes) are kept.",
             form.did
         ),
         undo: "This cannot be undone. Adding the account again later checks it from the start and fetches its history again.".to_string(),
-        action: "/admin/refract/end".to_string(),
+        action: "/admin/communities/accounts/end".to_string(),
         csrf: op.csrf.clone(),
         hidden,
         typed: Some(word),
@@ -578,7 +614,7 @@ mod tests {
         let cursor = json!({"collection": "app.bsky.feed.post", "cursor": "x", "done": ["app.bsky.actor.profile"]});
         assert_eq!(history(Some("running"), Some(&cursor), None), "fetching, 1 collection fetched, now app.bsky.feed.post");
         assert_eq!(history(Some("failed"), None, Some("timeout")), "failed: timeout");
-        assert_eq!(link("restored", "community a", 2), "/admin/refract?state=restored&community=community+a&page=2");
-        assert_eq!(link("", "", 0), "/admin/refract");
+        assert_eq!(link("restored", "community a", 2), "/admin/communities/accounts?state=restored&community=community+a&page=2");
+        assert_eq!(link("", "", 0), "/admin/communities/accounts");
     }
 }

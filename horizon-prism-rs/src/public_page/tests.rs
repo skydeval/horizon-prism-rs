@@ -534,3 +534,17 @@ async fn the_page_uses_no_web_font() {
     assert_eq!(CSP_LIVE, crate::admin::CSP_LIVE);
     assert!(CSP.contains("font-src 'self'") && CSP_LIVE.contains("font-src 'self'"));
 }
+
+/// The page keeps its own look beside the admin's sidebar: its top bar
+/// with the brand, no font class and no font file, none of the admin's
+/// frame, and the admin's policies.
+#[test]
+fn the_page_keeps_its_look() {
+    let body = render(&snapshot(), &PublicPageConfig::default());
+    assert!(body.contains("<header class=\"top\">") && body.contains("<a class=\"brand\""), "{body}");
+    assert!(body.contains("<html lang=\"en\">") && !body.contains("font-"), "{body}");
+    assert!(!body.contains("/admin/static/fonts/"), "{body}");
+    assert!(!body.contains("class=\"sidebar\"") && !body.contains("class=\"layout\"") && !body.contains("class=\"eyebrow\""), "{body}");
+    assert_eq!((CSP, CSP_LIVE), (crate::admin::CSP, crate::admin::CSP_LIVE));
+    assert!(CSP.contains("font-src 'self'") && CSP_LIVE.contains("font-src 'self'"));
+}

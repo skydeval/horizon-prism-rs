@@ -315,7 +315,7 @@ pub async fn page(
         &HomePage {
             css: css(),
             js: JS_HREF.as_str(),
-            nav: Some(Nav { banners: b, ..Nav::new(&op, "home") }),
+            nav: Some(Nav { banners: b, ..Nav::page(&op, crate::admin::menu::PageId::Home) }),
             title: "Home".to_string(),
             tiles,
             live: live_section(&state),

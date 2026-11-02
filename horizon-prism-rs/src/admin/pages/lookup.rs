@@ -28,6 +28,7 @@ use super::members::farsight_flags;
 use super::{Nav, css, render, when, when_opt};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
+use crate::admin::menu::PageId;
 use crate::admin::health::count;
 use crate::admin::operators::endpoint_host;
 use crate::aggregations::policy::{REASON_FOLLOWED, REASON_INTERACTED, REASON_MEMBER, REASON_SUBSCRIBED};
@@ -217,7 +218,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
     let q = query.q.trim().to_string();
     let mut page = LookupPage {
         css: css(),
-        nav: Some(Nav::new(&op, "lookup")),
+        nav: Some(Nav::page(&op, PageId::LookUp)),
         title: "Look up".to_string(),
         csrf: op.csrf.clone(),
         q: q.clone(),

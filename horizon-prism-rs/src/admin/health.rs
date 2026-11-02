@@ -666,10 +666,11 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
                 Level::Red,
                 format!(
                     "{relay} has never reported. Private posts wait for it, so every private read misses as stale. \
-                     Start its relay reader, or remove it from the relays private posts wait for."
+                     Start its relay reader, or remove it from firehose.private_relays in app.toml and restart Prism; \
+                     it cannot be changed here."
                 ),
             )
-            .link("/admin/settings", "Settings"),
+            .link("/admin/settings/running", "Running"),
             (Held::Yes, Some(d)) if d.is_infinite() => Check::new("Relay delay", Level::Amber, format!("{relay} has never reported.")),
             (Held::Yes, d) if private => Check::new(
                 "Relay delay",
@@ -767,19 +768,19 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
 
     out.push(match ring.held_for(FIVE_MIN, |s| s.sum(crate::farsight::gate::METRIC_DOWN).map(|v| v >= 1.0)) {
         Held::NoData => Check::no_data("Farsight", "Farsight is not set up, or Prism needs five minutes of readings first."),
-        Held::Yes => Check::new("Farsight", Level::Amber, "Farsight is not answering; block-list blocks may be missing.").link("/admin/farsight", "Blocks"),
-        Held::No => Check::new("Farsight", Level::Ok, "Farsight is answering.").link("/admin/farsight", "Blocks"),
+        Held::Yes => Check::new("Farsight", Level::Amber, "Farsight is not answering; block-list blocks may be missing.").link("/admin/blocks", "Blocks"),
+        Held::No => Check::new("Farsight", Level::Ok, "Farsight is answering.").link("/admin/blocks", "Blocks"),
     });
 
     out.push(match ring.rise(FIFTEEN_MIN, |s| s.sum(crate::farsight::lookup::METRIC_AUTH_FAILED)) {
         None => Check::no_data("Farsight sign-in", "no refusal has been counted since Prism started."),
-        Some(n) if n > 0.0 => Check::new("Farsight sign-in", Level::Red, "Farsight refuses Prism's token.").link("/admin/farsight", "Blocks"),
+        Some(n) if n > 0.0 => Check::new("Farsight sign-in", Level::Red, "Farsight refuses Prism's token.").link("/admin/blocks", "Blocks"),
         Some(_) => Check::new("Farsight sign-in", Level::Ok, "Farsight accepts Prism's token."),
     });
 
     out.push(match ring.held_for(FIVE_MIN, |s| s.max(crate::farsight::gate::METRIC_WITHHELD).map(|v| v >= 1.0)) {
         Held::NoData => Check::no_data("Farsight fallback", "Farsight is not set up, or Prism needs five minutes of readings first."),
-        Held::Yes => Check::new("Farsight fallback", Level::Amber, "The Farsight fallback is on but not being used.").link("/admin/farsight", "Blocks"),
+        Held::Yes => Check::new("Farsight fallback", Level::Amber, "The Farsight fallback is on but not being used.").link("/admin/blocks", "Blocks"),
         Held::No => Check::new("Farsight fallback", Level::Ok, "The Farsight fallback is off, or ready when needed."),
     });
 
@@ -806,9 +807,9 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
     });
 
     out.push(if i.set_aside > 0 {
-        Check::new("Settings", Level::Red, format!("{} saved setting{} could not be used.", i.set_aside, if i.set_aside == 1 { "" } else { "s" })).link("/admin/settings", "Settings")
+        Check::new("Settings", Level::Red, format!("{} saved setting{} could not be used.", i.set_aside, if i.set_aside == 1 { "" } else { "s" })).link("/admin/settings#aside", "All settings")
     } else if i.waiting > 0 {
-        Check::new("Settings", Level::Info, format!("{} change{} wait for a restart.", i.waiting, if i.waiting == 1 { "" } else { "s" })).link("/admin/settings", "Settings")
+        Check::new("Settings", Level::Info, format!("{} change{} wait for a restart.", i.waiting, if i.waiting == 1 { "" } else { "s" })).link("/admin/settings#waiting", "All settings")
     } else {
         Check::new("Settings", Level::Ok, "Every saved setting is in use.")
     });
@@ -1214,6 +1215,11 @@ mod tests {
         let (level, text) = relay("microcosm");
         assert_eq!(level, Level::Red);
         assert!(text.starts_with("microcosm has never reported. Private posts wait for it, so every private read misses as stale."), "{text}");
+        // The list is set in app.toml only, so the check says so and links
+        // Running, which shows it.
+        assert!(text.contains("firehose.private_relays in app.toml") && text.contains("cannot be changed here"), "{text}");
+        let link = checks(&inputs, &ring).into_iter().find(|c| c.name == "Relay delay" && c.text.starts_with("microcosm")).and_then(|c| c.link);
+        assert_eq!(link, Some(("/admin/settings/running", "Running")));
         assert_eq!(relay("bsky").0, Level::Ok);
         assert_eq!(relay("community-a"), (Level::Amber, "community-a is 15 minutes behind; private posts newer than that miss as stale.".to_string()));
     }

@@ -24,14 +24,14 @@
 <h2>Changes</h2>
 <div class="scroll">
 <table>
-<thead><tr><th>When</th><th>Who</th><th>What</th><th>Outcome</th></tr></thead>
+<thead><tr><th class="when">When</th><th class="name">Who</th><th class="text">What</th><th class="text">Outcome</th></tr></thead>
 <tbody>
 {% for c in commands %}
 <tr>
-<td>{{ c.when }}</td>
-<td>{{ c.who }}</td>
-<td><a href="/admin/commands/{{ c.id }}">{{ c.what }}</a></td>
-<td>{{ c.outcome }}{% if !c.raw.is_empty() %}<details><summary>Details</summary><pre>{{ c.raw }}</pre></details>{% endif %}</td>
+<td class="when">{{ c.when }}</td>
+<td class="name">{{ c.who }}</td>
+<td class="text"><div class="cell-text"><a href="/admin/commands/{{ c.id }}">{{ c.what }}</a></div></td>
+<td class="text"><div class="cell-text">{{ c.outcome }}{% if !c.raw.is_empty() %}<details><summary>Details</summary><pre>{{ c.raw }}</pre></details>{% endif %}</div></td>
 </tr>
 {% else %}
 <tr><td colspan="4" class="muted">No changes match.</td></tr>
@@ -47,10 +47,10 @@
 <h2>Sign-ins</h2>
 <div class="scroll">
 <table>
-<thead><tr><th>When</th><th>Account</th><th>What happened</th><th>From</th></tr></thead>
+<thead><tr><th class="when">When</th><th class="name">Account</th><th class="text">What happened</th><th class="name">From</th></tr></thead>
 <tbody>
 {% for l in logins %}
-<tr><td>{{ l.at }}</td><td>{{ l.who }}</td><td>{{ l.outcome }}</td><td><code>{{ l.client_ip }}</code></td></tr>
+<tr><td class="when">{{ l.at }}</td><td class="name">{{ l.who }}</td><td class="text"><div class="cell-text">{{ l.outcome }}</div></td><td class="name"><code>{{ l.client_ip }}</code></td></tr>
 {% else %}
 <tr><td colspan="4" class="muted">No sign-ins yet.</td></tr>
 {% endfor %}

@@ -29,6 +29,11 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Admin menu.** A sidebar grouped by task, with new page names (Blocks ·
+  Farsight, Communities · Refract, About this server, All settings);
+  Appearance sits under your name. Old admin addresses redirect. Pages use
+  the full width of wide screens, and tables scroll sideways instead of
+  breaking short values across lines.
 - **No default storage budget.** `[storage] budget_bytes` is no longer
   200 GiB unless set. Until an operator sets one, Health shows an amber
   Storage budget check, `db_budget_ratio` is not exported and no budget
@@ -177,6 +182,10 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Fixed
 
+- **Admin:** Cancel on a confirmation returns to the page it came from, not
+  Home. The health check for a relay in `firehose.private_relays` says the
+  list is set in app.toml and links Running. Account and Look up links work
+  for a DID holding `%`.
 - The `_health` detail is shown to operators only.
 - Self-labels always carry `cts`.
 - Authors' self-labels show on posts, profiles and cards.

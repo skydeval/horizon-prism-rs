@@ -5,14 +5,14 @@
 the others apply after a restart. Every change is recorded in the audit log.</p>
 
 {% if !aside.is_empty() %}
-<h2>Saved settings that could not be used</h2>
+<h2 id="aside">Saved settings that could not be used</h2>
 <div class="banner bad">When Prism last started, these saved values did not work with the rest of the settings, so Prism
 used the values from app.toml instead. Change or clear them on their page.</div>
 <div class="scroll">
 <table>
-<thead><tr><th>Setting</th><th>Problem</th></tr></thead>
+<thead><tr><th class="name">Setting</th><th class="text">Problem</th></tr></thead>
 <tbody>
-{% for n in aside %}<tr><td><a href="{{ n.href }}">{{ n.name }}</a></td><td>{{ n.text }}</td></tr>
+{% for n in aside %}<tr><td class="name"><a href="{{ n.href }}">{{ n.name }}</a></td><td class="text"><div class="cell-text">{{ n.text }}</div></td></tr>
 {% endfor %}
 </tbody>
 </table>
@@ -20,12 +20,12 @@ used the values from app.toml instead. Change or clear them on their page.</div>
 {% endif %}
 
 {% if !waiting.is_empty() %}
-<h2>Changes waiting for a restart</h2>
+<h2 id="waiting">Changes waiting for a restart</h2>
 <div class="scroll">
 <table>
-<thead><tr><th>Setting</th><th>Change</th></tr></thead>
+<thead><tr><th class="name">Setting</th><th class="text">Change</th></tr></thead>
 <tbody>
-{% for n in waiting %}<tr><td><a href="{{ n.href }}">{{ n.name }}</a></td><td>{{ n.text }}</td></tr>
+{% for n in waiting %}<tr><td class="name"><a href="{{ n.href }}">{{ n.name }}</a></td><td class="text"><div class="cell-text">{{ n.text }}</div></td></tr>
 {% endfor %}
 </tbody>
 </table>
@@ -43,8 +43,8 @@ used the values from app.toml instead. Change or clear them on their page.</div>
 
 <h2>Yours alone</h2>
 <div class="card">
-<p><a href="/admin/settings/appearance">Appearance</a>: light, dark or as your device is, and the colours of these
-pages. Saved for your account only, and not recorded in the audit log.</p>
+<p><a href="/admin/appearance">Appearance</a>, under your name in the menu: light, dark or as your device is, the colours
+and the font of these pages. Saved for your account only, and not recorded in the audit log.</p>
 </div>
 
 <h2>Read only</h2>

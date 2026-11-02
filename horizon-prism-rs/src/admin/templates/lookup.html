@@ -65,13 +65,13 @@ member follows, or someone a member replied to, quoted, liked or reposted lately
 <h2>Labels</h2>
 <div class="scroll">
 <table>
-<thead><tr><th>On</th><th>Label</th><th>Added</th><th></th></tr></thead>
+<thead><tr><th class="name">On</th><th class="name">Label</th><th class="when">Added</th><th class="actions"></th></tr></thead>
 <tbody>
 {% for l in f.labels %}
 <tr>
-<td>{{ l.kind }}<br><code>{{ l.subject }}</code></td>
-<td>{{ l.name }}<br><span class="muted tech">{{ l.val }}</span></td>
-<td>{{ l.when }}</td>
+<td class="name">{{ l.kind }}<br><code>{{ l.subject }}</code></td>
+<td class="name">{{ l.name }}<br><span class="muted tech">{{ l.val }}</span></td>
+<td class="when">{{ l.when }}</td>
 <td class="actions"><form class="inline" method="post" action="/admin/labels/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="subject" value="{{ l.subject }}"><input type="hidden" name="val" value="{{ l.val }}"><button class="secondary" type="submit">Remove…</button></form></td>
 </tr>
 {% else %}
@@ -97,10 +97,10 @@ member follows, or someone a member replied to, quoted, liked or reposted lately
 <h2>Sync jobs</h2>
 <div class="scroll">
 <table>
-<thead><tr><th>Kind</th><th>State</th><th>Tries</th><th>Last problem</th><th>When</th></tr></thead>
+<thead><tr><th class="state">Kind</th><th class="state">State</th><th class="num">Tries</th><th class="text">Last problem</th><th class="when">When</th></tr></thead>
 <tbody>
 {% for j in f.jobs %}
-<tr><td>{{ j.kind }}</td><td>{{ j.state }}</td><td>{{ j.attempts }}</td><td>{{ j.error }}</td><td>{{ j.when }}</td></tr>
+<tr><td class="state">{{ j.kind }}</td><td class="state">{{ j.state }}</td><td class="num">{{ j.attempts }}</td><td class="text"><div class="cell-text">{{ j.error }}</div></td><td class="when">{{ j.when }}</td></tr>
 {% else %}
 <tr><td colspan="5" class="muted">No sync jobs for this account.</td></tr>
 {% endfor %}

@@ -19,9 +19,10 @@ use axum::response::Response;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use super::{Confirm, Nav, confirmed, css, enqueue, hidden_field, message, render, typed_word, when};
+use super::{Confirm, Nav, back_to, confirmed, css, enqueue, hidden_field, message, render, typed_word, when};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
+use crate::admin::menu::PageId;
 use crate::admin_executor::AdminCommand;
 use crate::admin_executor::commands::LABEL_VALUES;
 use crate::db::locks::uri_author;
@@ -277,7 +278,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &LabelsPage {
             css: css(),
-            nav: Some(Nav::new(&op, "labels")),
+            nav: Some(Nav::page(&op, PageId::Labels)),
             title: "Labels".to_string(),
             csrf: op.csrf.clone(),
             subject: filter.as_ref().map(|s| s.key().to_string()).unwrap_or_default(),
@@ -306,10 +307,12 @@ pub struct LabelForm {
     pub val: String,
     pub confirm: Option<String>,
     pub typed: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 fn refuse(state: &AdminState, op: &crate::admin::auth::Operator, text: &str) -> Response {
-    message(state, Some(Nav::new(op, "labels")), StatusCode::BAD_REQUEST, "Not done", text, Some(("/admin/labels", "Labels")))
+    message(state, Some(Nav::at(op, "/admin/labels")), StatusCode::BAD_REQUEST, "Not done", text, Some(("/admin/labels", "Labels")))
 }
 
 /// What a label does to its subject, for a confirmation.
@@ -356,7 +359,7 @@ pub async fn add(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo
             typed: Some(word),
             button: "Take down",
         }
-        .page(&op, "labels");
+        .page(&op, &back_to(&state, &headers, form.back.as_deref(), "/admin/labels"));
         if let Some(response) = confirmed(page, form.confirm.as_deref(), form.typed.as_deref()) {
             return response;
         }
@@ -386,7 +389,7 @@ pub async fn remove(State(state): State<AdminState>, ConnectInfo(peer): ConnectI
         typed: Some(word),
         button: "Remove label",
     }
-    .page(&op, "labels");
+    .page(&op, &back_to(&state, &headers, form.back.as_deref(), "/admin/labels"));
     if let Some(response) = confirmed(page, form.confirm.as_deref(), form.typed.as_deref()) {
         return response;
     }

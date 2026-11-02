@@ -15,9 +15,10 @@ use axum::response::Response;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use super::{ConfirmPage, Hidden, Nav, css, enqueue, message, render, typed_matches, typed_word, when, when_opt};
+use super::{ConfirmPage, Hidden, Nav, back_to, css, enqueue, message, render, typed_matches, typed_word, when, when_opt};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
+use crate::admin::menu::{PageId, lookup_href};
 use crate::admin_executor::AdminCommand;
 
 /// Members per page.
@@ -25,6 +26,8 @@ pub const PAGE: i64 = 100;
 
 pub struct MemberRow {
     pub did: String,
+    /// Look up's page for the account.
+    pub lookup: String,
     pub handle: String,
     pub source: String,
     pub added: String,
@@ -133,6 +136,7 @@ pub async fn page(
             ready: when_opt(ready_at),
             first_ready: when_opt(first_ready),
             diverged: diverged.map(when).unwrap_or_default(),
+            lookup: lookup_href(&did),
             did,
         })
         .collect();
@@ -158,7 +162,7 @@ pub async fn page(
         StatusCode::OK,
         &MembersPage {
             css: css(),
-            nav: Some(Nav::new(&op, "members")),
+            nav: Some(Nav::page(&op, PageId::Members)),
             title: "Members".to_string(),
             csrf: op.csrf.clone(),
             rows,
@@ -216,7 +220,7 @@ pub async fn add(
     };
     match account(&state, &form.input).await {
         Ok(did) => enqueue(&state, &op, &AdminCommand::MemberAdd { did }).await,
-        Err(problem) => message(&state, Some(Nav::new(&op, "members")), StatusCode::BAD_REQUEST, "Not added", &problem, Some(("/admin/members", "Members"))),
+        Err(problem) => message(&state, Some(Nav::at(&op, "/admin/members")), StatusCode::BAD_REQUEST, "Not added", &problem, Some(("/admin/members", "Members"))),
     }
 }
 
@@ -229,12 +233,19 @@ pub struct DidForm {
     pub confirm: Option<String>,
     pub typed: Option<String>,
     pub reason: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
+}
+
+/// Where Cancel goes from a member action's confirmation.
+fn back(state: &AdminState, headers: &HeaderMap, form: &DidForm) -> String {
+    back_to(state, headers, form.back.as_deref(), "/admin/members")
 }
 
 /// The refusal of a DID that is not one.
 fn invalid_did(state: &AdminState, op: &Operator, did: &str) -> Option<Response> {
     (!proto_blue::syntax::Did::is_valid(did)).then(|| {
-        message(state, Some(Nav::new(op, "members")), StatusCode::BAD_REQUEST, "Not done", "That is not a valid DID.", Some(("/admin/members", "Members")))
+        message(state, Some(Nav::at(op, "/admin/members")), StatusCode::BAD_REQUEST, "Not done", "That is not a valid DID.", Some(("/admin/members", "Members")))
     })
 }
 
@@ -268,9 +279,11 @@ pub async fn remove(
     if let Some(r) = invalid_did(&state, &op, &form.did) {
         return r;
     }
+    let back = back(&state, &headers, &form);
     let page = ConfirmPage {
         css: css(),
-        nav: Some(Nav::new(&op, "members")),
+        nav: Some(Nav::at(&op, &back)),
+        back,
         title: "Remove a member".to_string(),
         what: format!("{} stops being a member. Prism deletes what it holds for them as a member: their private reading, their bookmarks and mutes here, and the data only their membership kept.", form.did),
         undo: "This cannot be undone. Adding them again starts their sync from the beginning.".to_string(),
@@ -306,9 +319,11 @@ pub async fn deny(
     if let Some(r) = &reason {
         hidden.push(Hidden { name: "reason".to_string(), value: r.clone() });
     }
+    let back = back(&state, &headers, &form);
     let page = ConfirmPage {
         css: css(),
-        nav: Some(Nav::new(&op, "members")),
+        nav: Some(Nav::at(&op, &back)),
+        back,
         title: "Deny an account".to_string(),
         what: format!("{} can never join by itself, and cannot be added until the denial is lifted. If they are a member now, they are removed and what Prism holds for them as a member is deleted.", form.did),
         undo: "Lifting the denial later does not make them a member again; they must be added.".to_string(),
@@ -348,7 +363,7 @@ fn no_farsight(state: &AdminState, op: &Operator) -> Option<Response> {
     state.health.farsight.is_none().then(|| {
         message(
             state,
-            Some(Nav::new(op, "members")),
+            Some(Nav::at(op, "/admin/members")),
             StatusCode::BAD_REQUEST,
             "Not done",
             "Farsight is not set up on this Prism, so there is nothing to ask it.",
@@ -391,9 +406,11 @@ pub async fn farsight_forget(
     if let Some(r) = invalid_did(&state, &op, &form.did).or_else(|| no_farsight(&state, &op)) {
         return r;
     }
+    let back = back(&state, &headers, &form);
     let page = ConfirmPage {
         css: css(),
-        nav: Some(Nav::new(&op, "members")),
+        nav: Some(Nav::at(&op, &back)),
+        back,
         title: "Forget remembered blocks".to_string(),
         what: format!(
             "Prism deletes the list blocks it remembered from Farsight for {}. While Farsight answers, nothing changes for them: Prism asks Farsight again as they read. While Farsight is down, those blocks are missing until it is back.",
@@ -428,9 +445,11 @@ pub async fn lists_purge(
     if let Some(r) = invalid_did(&state, &op, &form.did) {
         return r;
     }
+    let back = back(&state, &headers, &form);
     let page = ConfirmPage {
         css: css(),
-        nav: Some(Nav::new(&op, "members")),
+        nav: Some(Nav::at(&op, &back)),
+        back,
         title: "Clean up lists".to_string(),
         what: format!(
             "Prism deletes what it holds of {}'s lists: the lists they made, who is on them, their list blocks and their list mutes. Lists of other people that only they used are let go. Nothing is deleted from their own server.",

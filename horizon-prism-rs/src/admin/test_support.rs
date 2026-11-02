@@ -229,3 +229,240 @@ impl Sse {
         self.response.is_none()
     }
 }
+
+/// The signed-in sidebar of a page, `<nav class="sidebar"` to its `</nav>`;
+/// empty when the page has none.
+#[must_use]
+pub fn sidebar(body: &str) -> &str {
+    let Some(start) = body.find("<nav class=\"sidebar\"") else {
+        return "";
+    };
+    let end = body[start..].find("</nav>").map_or(body.len(), |e| start + e + "</nav>".len());
+    &body[start..end]
+}
+
+/// The one element of the sidebar carrying `aria-current`: its text (a menu
+/// item's name, or "Appearance") and the attribute's value. `None` when no
+/// element, or more than one, carries it.
+#[must_use]
+pub fn current_item(body: &str) -> Option<(String, String)> {
+    let nav = sidebar(body);
+    let marks: Vec<usize> = nav.match_indices(" aria-current=\"").map(|(i, _)| i).collect();
+    let [at] = marks.as_slice() else {
+        return None;
+    };
+    let rest = &nav[at + " aria-current=\"".len()..];
+    let value = rest[..rest.find('"')?].to_string();
+    let after = &rest[rest.find('>')? + 1..];
+    let text = after.strip_prefix("<span>").unwrap_or(after);
+    let text = text[..text.find('<')?].to_string();
+    Some((text, value))
+}
+
+/// A hand-written reader of the admin stylesheet, enough for its tests: no
+/// CSS parser is a dependency.
+pub mod css {
+    /// One rule in file order: the enclosing at-rule (whitespace
+    /// normalised, `""` at top level), the whole selector list, and the
+    /// declarations, each normalised. An `@font-face` or `@keyframes` block
+    /// is one opaque entry: its selector is the at-rule's prelude and its
+    /// declarations its body.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Rule {
+        pub context: String,
+        pub selectors: String,
+        pub declarations: String,
+    }
+
+    fn normal(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Declarations as `name: value; …`, each one normalised, in order.
+    #[must_use]
+    pub fn declarations(body: &str) -> String {
+        body.split(';').map(normal).filter(|d| !d.is_empty()).map(|d| format!("{d};")).collect::<Vec<_>>().join(" ")
+    }
+
+    fn strip_comments(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find("/*") {
+            out.push_str(&rest[..at]);
+            rest = rest[at + 2..].find("*/").map_or("", |e| &rest[at + 2 + e + 2..]);
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The block after an opening brace at `open`: its body and the index
+    /// just past its closing brace.
+    fn block(text: &str, open: usize) -> (&str, usize) {
+        let mut depth = 0;
+        for (i, c) in text[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (&text[open + 1..open + i], open + i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (&text[open + 1..], text.len())
+    }
+
+    fn read(text: &str, context: &str, out: &mut Vec<Rule>) {
+        let mut at = 0;
+        while let Some(open) = text[at..].find('{').map(|o| at + o) {
+            let prelude = normal(&text[at..open]);
+            let (body, next) = block(text, open);
+            if prelude.starts_with("@media") || prelude.starts_with("@supports") {
+                read(body, &prelude, out);
+            } else {
+                out.push(Rule { context: context.to_string(), selectors: prelude, declarations: declarations(body) });
+            }
+            at = next;
+        }
+    }
+
+    /// Every rule of `text`, in file order.
+    #[must_use]
+    pub fn rules(text: &str) -> Vec<Rule> {
+        let mut out = Vec::new();
+        read(&strip_comments(text), "", &mut out);
+        out
+    }
+}
+
+/// A hand-written reader of the admin pages' tables, enough for their
+/// tests: no HTML parser is a dependency.
+pub mod html {
+    /// A cell: its classes and, for a body cell, whether it is a text cell
+    /// holding exactly one `div.cell-text` and nothing else.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Cell {
+        pub classes: Vec<String>,
+        pub text: String,
+        pub colspan: bool,
+        pub cell_text_only: bool,
+    }
+
+    /// A table in page order.
+    #[derive(Debug, Clone)]
+    pub struct Table {
+        /// The class of the element the table sits in, and whether the
+        /// table is all that element holds.
+        pub parent_class: String,
+        pub alone: bool,
+        pub head: Vec<Cell>,
+        pub rows: Vec<Vec<Cell>>,
+    }
+
+    fn attr(tag: &str, name: &str) -> Option<String> {
+        let key = format!(" {name}=\"");
+        let at = tag.find(&key)? + key.len();
+        Some(tag[at..at + tag[at..].find('"')?].to_string())
+    }
+
+    /// Text with the tags taken out, whitespace normalised.
+    #[must_use]
+    pub fn text_of(s: &str) -> String {
+        let mut out = String::new();
+        let mut inside = false;
+        for c in s.chars() {
+            match c {
+                '<' => inside = true,
+                '>' => inside = false,
+                c if !inside => out.push(c),
+                _ => {}
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn cells(row: &str, tag: &str) -> Vec<Cell> {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(start) = row[at..].find(&open).map(|s| at + s) {
+            // `<th` also begins `<thead>`: only the cell's own tag counts.
+            if !matches!(row.as_bytes().get(start + open.len()), Some(b'>' | b' ')) {
+                at = start + open.len();
+                continue;
+            }
+            let tag_end = start + row[start..].find('>').unwrap_or(0);
+            let head = &row[start..=tag_end];
+            let end = row[tag_end..].find(&close).map_or(row.len(), |e| tag_end + e);
+            let inner = &row[tag_end + 1..end];
+            let classes: Vec<String> = attr(head, "class").map(|c| c.split_whitespace().map(str::to_string).collect()).unwrap_or_default();
+            let trimmed = inner.trim();
+            let cell_text_only = trimmed.starts_with("<div class=\"cell-text\">")
+                && trimmed.ends_with("</div>")
+                && {
+                    // One div: the first closing </div> that balances the
+                    // opening one is the last thing in the cell.
+                    let mut depth = 0usize;
+                    let mut balanced_at = None;
+                    let mut i = 0;
+                    while i < trimmed.len() {
+                        if trimmed[i..].starts_with("<div") {
+                            depth += 1;
+                        } else if trimmed[i..].starts_with("</div>") {
+                            depth -= 1;
+                            if depth == 0 {
+                                balanced_at = Some(i + "</div>".len());
+                                break;
+                            }
+                        }
+                        i += trimmed[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                    balanced_at == Some(trimmed.len())
+                };
+            out.push(Cell { classes, text: text_of(inner), colspan: head.contains(" colspan="), cell_text_only });
+            at = end + close.len();
+        }
+        out
+    }
+
+    /// Every `<table` of `body`, in order.
+    #[must_use]
+    pub fn tables(body: &str) -> Vec<Table> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(start) = body[at..].find("<table").map(|s| at + s) {
+            let end = body[start..].find("</table>").map_or(body.len(), |e| start + e + "</table>".len());
+            let table = &body[start..end];
+            // The element just before: the last opening tag before the
+            // table, and what follows the table up to its closing tag.
+            let before = &body[..start];
+            let open_at = before.rfind('<').unwrap_or(0);
+            let open = &before[open_at..];
+            let parent_class = if open.starts_with("<div") && !open.starts_with("</") { attr(open, "class").unwrap_or_default() } else { String::new() };
+            let gap_before = before[open_at + open.find('>').map_or(0, |e| e + 1)..].trim().is_empty();
+            let after = body[end..].trim_start();
+            let alone = gap_before && after.starts_with("</div>");
+            let head = table.find("<thead>").map(|h| {
+                let e = table[h..].find("</thead>").map_or(table.len(), |e| h + e);
+                cells(&table[h..e], "th")
+            });
+            let mut rows = Vec::new();
+            if let Some(b) = table.find("<tbody>") {
+                let body_end = table[b..].find("</tbody>").map_or(table.len(), |e| b + e);
+                let tbody = &table[b..body_end];
+                let mut r = 0;
+                while let Some(s) = tbody[r..].find("<tr").map(|s| r + s) {
+                    let e = tbody[s..].find("</tr>").map_or(tbody.len(), |e| s + e);
+                    rows.push(cells(&tbody[s..e], "td"));
+                    r = e + "</tr>".len();
+                }
+            }
+            out.push(Table { parent_class, alone, head: head.unwrap_or_default(), rows });
+            at = end;
+        }
+        out
+    }
+}

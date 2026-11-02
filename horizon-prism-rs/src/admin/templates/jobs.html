@@ -10,10 +10,10 @@ private posts and who may see them, and subscribed lists. They run in the backgr
 {% if rows.is_empty() %}<p class="muted">No sync jobs yet.</p>{% else %}
 <div class="scroll">
 <table>
-<thead><tr><th>Kind</th>{% for s in states %}<th>{{ s }}</th>{% endfor %}</tr></thead>
+<thead><tr><th class="state">Kind</th>{% for s in states %}<th class="num">{{ s }}</th>{% endfor %}</tr></thead>
 <tbody>
 {% for r in rows %}
-<tr><td>{{ r.name }}<br><span class="muted tech">{{ r.tech }}</span></td>{% for c in r.counts %}<td>{{ c }}</td>{% endfor %}</tr>
+<tr><td class="state">{{ r.name }}<br><span class="muted tech">{{ r.tech }}</span></td>{% for c in r.counts %}<td class="num">{{ c }}</td>{% endfor %}</tr>
 {% endfor %}
 </tbody>
 </table>
@@ -29,10 +29,10 @@ the network and nothing needs doing: Prism reads them again by itself when they 
 {% if unavailable.is_empty() %}<p class="muted">None.</p>{% else %}
 <div class="scroll">
 <table>
-<thead><tr><th>Why</th><th>Jobs</th></tr></thead>
+<thead><tr><th class="text">Why</th><th class="num">Jobs</th></tr></thead>
 <tbody>
 {% for u in unavailable %}
-<tr><td>{{ u.0 }}</td><td>{{ u.1 }}</td></tr>
+<tr><td class="text"><div class="cell-text">{{ u.0 }}</div></td><td class="num">{{ u.1 }}</td></tr>
 {% endfor %}
 </tbody>
 </table>
@@ -49,15 +49,15 @@ couple of hours for members' own). Try again once the cause is fixed, or wait: P
 hours. The 100 most recent. "Try again" queues the same kind of sync for that account.</p>
 <div class="scroll">
 <table>
-<thead><tr><th>Account</th><th>Kind</th><th>Tries</th><th>What went wrong</th><th>When</th><th></th></tr></thead>
+<thead><tr><th class="name">Account</th><th class="state">Kind</th><th class="num">Tries</th><th class="text">What went wrong</th><th class="when">When</th><th class="actions"></th></tr></thead>
 <tbody>
 {% for f in rows %}
 <tr>
-<td>{{ f.who }}{% if f.who != f.did %}<br><code>{{ f.did }}</code>{% endif %}</td>
-<td>{{ f.kind }}</td>
-<td>{{ f.attempts }}</td>
-<td>{{ f.error }}</td>
-<td>{{ f.when }}</td>
+<td class="name">{{ f.who }}{% if f.who != f.did %}<br><code>{{ f.did }}</code>{% endif %}</td>
+<td class="state">{{ f.kind }}</td>
+<td class="num">{{ f.attempts }}</td>
+<td class="text"><div class="cell-text">{{ f.error }}</div></td>
+<td class="when">{{ f.when }}</td>
 <td class="actions">{% if f.retry %}<form class="inline" method="post" action="/admin/jobs/retry"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ f.did }}"><input type="hidden" name="depth" value="{{ f.depth }}"><button class="secondary" type="submit">Try again</button></form>{% endif %}</td>
 </tr>
 {% endfor %}

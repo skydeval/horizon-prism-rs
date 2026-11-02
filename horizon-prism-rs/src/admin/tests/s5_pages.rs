@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::admin::health::HealthInputs;
+use crate::admin::test_support::current_item;
 
 /// A page past the ten-pages-a-second limit.
 async fn get(b: &Browser, url: &str) -> Page {
@@ -102,7 +103,8 @@ async fn labels_page() {
     h.identity.handles.lock().expect("lock").insert(BOB_HANDLE.to_string(), BOB.to_string());
     let page = get(&alice, &format!("{}/admin/labels", h.base)).await;
     assert_eq!(page.status, 200, "{}", page.body);
-    for text in ["aria-current=\"page\">Labels</a>", "Take down", "as if it did not exist, everywhere", "Graphic (violence or gore)", "No labels."] {
+    assert_eq!(current_item(&page.body), Some(("Labels".to_string(), "page".to_string())), "{}", page.body);
+    for text in ["Take down", "as if it did not exist, everywhere", "Graphic (violence or gore)", "No labels."] {
         assert!(page.body.contains(text), "{text}: {}", page.body);
     }
     let csrf = csrf_of(&page);
@@ -182,9 +184,20 @@ async fn communities_page() {
     sqlx::query("INSERT INTO refract_pending (scope) VALUES ('feature')").execute(p).await.expect("pending");
     let page = get(&alice, &format!("{}/admin/communities", h.base)).await;
     assert_eq!(page.status, 200, "{}", page.body);
-    for text in ["aria-current=\"page\">Communities</a>", "<strong>community-a</strong>", "Pending ends", "Add a community"] {
+    assert_eq!(current_item(&page.body), Some(("Communities".to_string(), "page".to_string())), "{}", page.body);
+    for text in [
+        "<strong>community-a</strong>",
+        "Pending ends",
+        "Add a community",
+        "<title>Communities · Refract · Horizon-Prism admin</title>",
+        "<p class=\"eyebrow\">Moderation · Refract</p>",
+        "<h1>Communities</h1>",
+        "<nav class=\"tabs\" aria-label=\"Communities · Refract\"><a href=\"/admin/communities\" aria-current=\"page\">Communities</a><a href=\"/admin/communities/accounts\">Accounts</a></nav>",
+        "on <a href=\"/admin/communities/accounts\">the Accounts tab</a>",
+    ] {
         assert!(page.body.contains(text), "{text}: {}", page.body);
     }
+    assert!(!page.body.contains("href=\"/admin/refract"), "{}", page.body);
     let csrf = csrf_of(&page);
     let toggle = format!("{}/admin/communities/toggle", h.base);
     let before = count(p, "SELECT count(*) FROM admin_commands").await;
@@ -206,7 +219,7 @@ async fn communities_page() {
     h.db.drop_db().await;
 }
 
-/// The Refract accounts page (refract design §9): the list with its state
+/// The Accounts tab of Communities · Refract: the list with its state
 /// filter and history progress; adding by handle and by DID (refused while
 /// Refract is off); an account's page; check again; a removal typed with
 /// the handle and offered only for restored accounts; the command's page
@@ -239,26 +252,32 @@ async fn refract_accounts_page() {
     sqlx::query("INSERT INTO refract_events (did, from_state, to_state, reason) VALUES ($1, 'candidate', 'restored', 'rules')").bind(BOB).execute(p).await.expect("event");
     sqlx::query("INSERT INTO refract_pending (scope, keep) VALUES ('feature', true)").execute(p).await.expect("pending");
     sqlx::query("INSERT INTO refract_pending_dids (scope, did) VALUES ('feature', $1)").bind(BOB).execute(p).await.expect("pending did");
-    let list = format!("{}/admin/refract", h.base);
-    let url = |path: &str| format!("{}/admin/refract/{path}", h.base);
+    let list = format!("{}/admin/communities/accounts", h.base);
+    let url = |path: &str| format!("{}/admin/communities/accounts/{path}", h.base);
+    // The old paths of the tab's forms, still taken.
+    let old = |path: &str| format!("{}/admin/refract/{path}", h.base);
 
     // Off: everything listed, said plainly, and nothing can be added.
     let page = get(&alice, &list).await;
     assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(current_item(&page.body), Some(("Communities".to_string(), "true".to_string())), "{}", page.body);
     for text in [
-        "aria-current=\"page\">Refract accounts</a>",
+        "<title>Accounts · Communities · Refract · Horizon-Prism admin</title>",
+        "<h1>Communities</h1>",
+        "<a href=\"/admin/communities/accounts\" aria-current=\"page\">Accounts</a>",
+        "action=\"/admin/communities/accounts\"",
         "Refract is off",
         BOB_HANDLE,
         CAROL,
         "fetching, 1 collection fetched, now app.bsky.feed.post",
         "Pending ends",
         ">Release</button>",
-        "<main class=\"wide\">",
+        "<main id=\"main\" class=\"wide\">",
         "<table class=\"dense\">",
     ] {
         assert!(page.body.contains(text), "{text}: {}", page.body);
     }
-    assert!(!page.body.contains("action=\"/admin/refract/add\""), "{}", page.body);
+    assert!(!page.body.contains("action=\"/admin/communities/accounts/add\"") && !page.body.contains("Refract accounts"), "{}", page.body);
     let csrf = csrf_of(&page);
     let before = count(p, "SELECT count(*) FROM admin_commands").await;
     let refused = post(&alice, &url("add"), &[("csrf", &csrf), ("input", DAN)]).await;
@@ -270,13 +289,13 @@ async fn refract_accounts_page() {
     // On: add by handle and by DID; a bad one is refused.
     h.live.update(|v| v.refract_enabled = true);
     let page = get(&alice, &list).await;
-    assert!(page.body.contains("action=\"/admin/refract/add\"") && !page.body.contains("Refract is off"), "{}", page.body);
+    assert!(page.body.contains("action=\"/admin/communities/accounts/add\"") && !page.body.contains("Refract is off"), "{}", page.body);
     h.identity.handles.lock().expect("lock").insert("dan.example.com".to_string(), DAN.to_string());
     let added = post(&alice, &url("add"), &[("csrf", &csrf), ("input", "@Dan.example.com")]).await;
     assert_eq!(added.status, 303, "{}", added.body);
     let (command, args, by) = newest(p).await;
     assert_eq!((command.as_str(), args, by.as_deref()), ("refract check", json!({"did": DAN}), Some(ALICE)));
-    let added = post(&alice, &url("add"), &[("csrf", &csrf), ("input", CAROL)]).await;
+    let added = post(&alice, &old("add"), &[("csrf", &csrf), ("input", CAROL)]).await;
     assert_eq!(added.status, 303, "{}", added.body);
     assert_eq!(newest(p).await.1, json!({"did": CAROL}));
     let before = count(p, "SELECT count(*) FROM admin_commands").await;
@@ -287,7 +306,13 @@ async fn refract_accounts_page() {
     // The account's page: what `admin refract show` gives.
     let detail = get(&alice, &url(BOB)).await;
     assert_eq!(detail.status, 200, "{}", detail.body);
+    assert_eq!(current_item(&detail.body), Some(("Communities".to_string(), "true".to_string())), "{}", detail.body);
     for text in [
+        "<p class=\"eyebrow\">Moderation · Refract</p>",
+        "<a href=\"/admin/communities/accounts\">All accounts</a>",
+        "See <a href=\"/admin/communities/accounts\">Pending ends</a>",
+        "action=\"/admin/communities/accounts/check\"",
+        "action=\"/admin/communities/accounts/end\"",
         "restored: kept and served",
         "1. Bluesky withholds it",
         "AccountTakedown",
@@ -304,7 +329,7 @@ async fn refract_accounts_page() {
     assert_eq!(get(&alice, &url("did:plc:nobodynobodynobodynobody")).await.status, 404);
 
     // Check again.
-    let checked = post(&alice, &url("check"), &[("csrf", &csrf), ("did", BOB)]).await;
+    let checked = post(&alice, &old("check"), &[("csrf", &csrf), ("did", BOB)]).await;
     assert_eq!(checked.status, 303, "{}", checked.body);
     assert_eq!(newest(p).await.0, "refract check");
 
@@ -313,9 +338,13 @@ async fn refract_accounts_page() {
     let ask = post(&alice, &url("end"), &[("csrf", &csrf), ("did", BOB), ("reason", "spam")]).await;
     assert_eq!(ask.status, 200, "{}", ask.body);
     assert!(ask.body.contains(&format!("type <code>{BOB_HANDLE}</code>")) && ask.body.contains("that point at it (their likes, follows, replies and quotes) are kept"), "{}", ask.body);
+    // It posts to the tab's own path; with no page to go back to, Cancel
+    // goes to the account's page.
+    let account = crate::admin::menu::account_href(BOB);
+    assert!(ask.body.contains("action=\"/admin/communities/accounts/end\"") && ask.body.contains(&format!("href=\"{account}\">Cancel</a>")), "{}", ask.body);
     let wrong = post(&alice, &url("end"), &[("csrf", &csrf), ("did", BOB), ("reason", "spam"), ("confirm", "yes"), ("typed", "bbbbbbbb")]).await;
     assert_eq!(wrong.status, 400, "{}", wrong.body);
-    let missing = post(&alice, &url("end"), &[("csrf", &csrf), ("did", BOB), ("confirm", "yes")]).await;
+    let missing = post(&alice, &old("end"), &[("csrf", &csrf), ("did", BOB), ("confirm", "yes")]).await;
     assert_eq!(missing.status, 400, "{}", missing.body);
     let not_restored = post(&alice, &url("end"), &[("csrf", &csrf), ("did", CAROL), ("confirm", "yes"), ("typed", "cccccccc")]).await;
     assert_eq!(not_restored.status, 400, "{}", not_restored.body);
@@ -331,7 +360,8 @@ async fn refract_accounts_page() {
     assert!(!waiting.body.contains("See the account"), "{}", waiting.body);
     sqlx::query("UPDATE admin_commands SET state = 'done', result = '{}' WHERE id = $1").bind(id).execute(p).await.expect("done");
     let ran = get(&alice, &format!("{}/admin/commands/{id}", h.base)).await;
-    assert!(ran.body.contains(&format!("href=\"/admin/refract/{BOB}\"")), "{}", ran.body);
+    assert!(ran.body.contains(&format!("href=\"{account}\"")), "{}", ran.body);
+    assert_eq!(current_item(&ran.body), Some(("Audit log".to_string(), "true".to_string())), "{}", ran.body);
 
     // Pending ends: release.
     let release = post(&alice, &format!("{}/admin/communities/keep", h.base), &[("csrf", &csrf), ("scope", "feature"), ("keep", "false")]).await;
@@ -364,7 +394,7 @@ async fn look_up() {
     }
 
     let empty = get(&alice, &format!("{}/admin/lookup", h.base)).await;
-    assert!(empty.status == 200 && empty.body.contains("aria-current=\"page\">Look up</a>"), "{}", empty.body);
+    assert!(empty.status == 200 && current_item(&empty.body) == Some(("Look up".to_string(), "page".to_string())), "{}", empty.body);
     let page = get(&alice, &format!("{}/admin/lookup?q=%40bob.example.com", h.base)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     for text in [

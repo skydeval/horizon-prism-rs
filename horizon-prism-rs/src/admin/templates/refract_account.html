@@ -2,12 +2,12 @@
 {% block main_class %} class="wide"{% endblock %}
 {% block content %}
 <h1>{{ title }}</h1>
-<p><code>{{ did }}</code> · <a href="/admin/refract">All Refract accounts</a> · <a href="/admin/lookup?q={{ did }}">Look up</a></p>
+<p><code>{{ did }}</code> · <a href="/admin/communities/accounts">All accounts</a> · <a href="{{ lookup }}">Look up</a></p>
 {% if !enabled %}
-<div class="banner">Refract is off: nothing is checked and no account is kept. Turn it on on the <a href="/admin/communities">Communities</a> page.</div>
+<div class="banner">Refract is off: nothing is checked and no account is kept. Turn it on on <a href="/admin/communities">the Communities tab</a>.</div>
 {% endif %}
 {% if !pending.is_empty() %}
-<div class="banner">Hidden while a pending end runs: {% for p in pending %}<code>{{ p }}</code>{% if !loop.last %}, {% endif %}{% endfor %}. See <a href="/admin/refract">Pending ends</a>.</div>
+<div class="banner">Hidden while a pending end runs: {% for p in pending %}<code>{{ p }}</code>{% if !loop.last %}, {% endif %}{% endfor %}. See <a href="/admin/communities/accounts">Pending ends</a>.</div>
 {% endif %}
 <div class="grid">
 <div class="card">
@@ -32,10 +32,10 @@
 <h2>Actions</h2>
 <div class="card">
 {% if can_check && enabled %}
-<form class="inline" method="post" action="/admin/refract/check"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ did }}"><button class="secondary" type="submit">Check again</button></form>
+<form class="inline" method="post" action="/admin/communities/accounts/check"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ did }}"><button class="secondary" type="submit">Check again</button></form>
 {% endif %}
 {% if can_end %}
-<form class="stack" method="post" action="/admin/refract/end">
+<form class="stack" method="post" action="/admin/communities/accounts/end">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="did" value="{{ did }}">
 <label for="end-reason">Your note (optional)</label>
@@ -51,10 +51,10 @@
 <h2>Labels from its community</h2>
 <div class="scroll">
 <table class="dense">
-<thead><tr><th>Labeler</th><th>On</th><th>Label</th><th>Made</th><th>Expires</th><th>Ends it</th><th>Verified</th></tr></thead>
+<thead><tr><th class="name">Labeler</th><th class="name">On</th><th class="name">Label</th><th class="when">Made</th><th class="when">Expires</th><th class="state">Ends it</th><th class="state">Verified</th></tr></thead>
 <tbody>
 {% for l in labels %}
-<tr><td><code class="chip">{{ l.labeler }}</code></td><td><code class="chip">{{ l.subject }}</code></td><td class="nowrap"><code class="chip">{{ l.val }}</code></td><td class="nowrap">{{ l.cts }}</td><td class="nowrap">{{ l.exp }}</td><td>{% if l.gone %}yes{% else %}no{% endif %}</td><td>{% if l.verified %}yes{% else %}no{% endif %}</td></tr>
+<tr><td class="name"><code class="chip">{{ l.labeler }}</code></td><td class="name"><code class="chip">{{ l.subject }}</code></td><td class="name"><code class="chip">{{ l.val }}</code></td><td class="when">{{ l.cts }}</td><td class="when">{{ l.exp }}</td><td class="state">{% if l.gone %}yes{% else %}no{% endif %}</td><td class="state">{% if l.verified %}yes{% else %}no{% endif %}</td></tr>
 {% else %}
 <tr><td colspan="7" class="muted">No labels stored for this account.</td></tr>
 {% endfor %}
@@ -65,10 +65,10 @@
 <h2>What happened</h2>
 <div class="scroll">
 <table class="dense">
-<thead><tr><th>When</th><th>From</th><th>To</th><th>Why</th></tr></thead>
+<thead><tr><th class="when">When</th><th class="state">From</th><th class="state">To</th><th class="text">Why</th></tr></thead>
 <tbody>
 {% for e in events %}
-<tr><td class="nowrap">{{ e.at }}</td><td class="nowrap">{{ e.from }}</td><td class="nowrap">{{ e.to }}</td><td>{{ e.reason }}</td></tr>
+<tr><td class="when">{{ e.at }}</td><td class="state">{{ e.from }}</td><td class="state">{{ e.to }}</td><td class="text"><div class="cell-text">{{ e.reason }}</div></td></tr>
 {% else %}
 <tr><td colspan="4" class="muted">Nothing recorded yet.</td></tr>
 {% endfor %}

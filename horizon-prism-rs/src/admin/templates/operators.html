@@ -7,14 +7,14 @@ server; that server must be on the list below.</p>
 <h2>Operators</h2>
 <div class="scroll">
 <table>
-<thead><tr><th>Account</th><th>Note</th><th>Server (last seen)</th><th>Added</th><th></th></tr></thead>
+<thead><tr><th class="name">Account</th><th class="text">Note</th><th class="name">Server (last seen)</th><th class="when">Added</th><th class="actions"></th></tr></thead>
 <tbody>
 {% for o in operators %}
 <tr>
-<td>{% if !o.handle.is_empty() %}<strong>{{ o.handle }}</strong><br>{% endif %}<code>{{ o.did }}</code></td>
-<td>{{ o.note }}</td>
-<td>{% if o.host.is_empty() %}unknown{% else %}{{ o.host }}{% endif %}<br><span class="muted">checked {{ o.checked }}</span>{% if !o.can_sign_in %}<br><span class="bad">cannot sign in: server not allowed</span>{% endif %}</td>
-<td>{{ o.added }}<br><span class="muted">by {{ o.added_by }}</span></td>
+<td class="name">{% if !o.handle.is_empty() %}<strong>{{ o.handle }}</strong><br>{% endif %}<code>{{ o.did }}</code></td>
+<td class="text"><div class="cell-text">{{ o.note }}</div></td>
+<td class="name">{% if o.host.is_empty() %}unknown{% else %}{{ o.host }}{% endif %}<br><span class="muted">checked {{ o.checked }}</span>{% if !o.can_sign_in %}<br><span class="bad wrap">cannot sign in: server not allowed</span>{% endif %}</td>
+<td class="when">{{ o.added }}<br><span class="muted">by {{ o.added_by }}</span></td>
 <td class="actions"><form class="inline" method="post" action="/admin/operators/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="did" value="{{ o.did }}"><button class="secondary" type="submit">Remove</button></form></td>
 </tr>
 {% endfor %}
@@ -44,13 +44,13 @@ who.</div>
 {% endif %}
 <div class="scroll">
 <table>
-<thead><tr><th>Server</th><th>Operators it covers</th><th>Added</th><th></th></tr></thead>
+<thead><tr><th class="name">Server</th><th class="text">Operators it covers</th><th class="when">Added</th><th class="actions"></th></tr></thead>
 <tbody>
 {% for h in hosts %}
 <tr>
-<td><code>{{ h.pattern }}</code></td>
-<td>{{ h.covers }}</td>
-<td>{{ h.added }}<br><span class="muted">by {{ h.added_by }}</span></td>
+<td class="name"><code>{{ h.pattern }}</code></td>
+<td class="text"><div class="cell-text">{{ h.covers }}</div></td>
+<td class="when">{{ h.added }}<br><span class="muted">by {{ h.added_by }}</span></td>
 <td class="actions"><form class="inline" method="post" action="/admin/operators/hosts/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pattern" value="{{ h.pattern }}"><button class="secondary" type="submit">Remove</button></form></td>
 </tr>
 {% endfor %}

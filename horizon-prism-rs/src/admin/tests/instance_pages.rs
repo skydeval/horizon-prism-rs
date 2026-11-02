@@ -1,4 +1,5 @@
-//! Instance (`/admin/instance`) and the lexicons it serves, over HTTP:
+//! About this server (`/admin/about`, formerly Instance) and the lexicons
+//! it serves, over HTTP:
 //! operator sign-in, every section from fixture state (relays by label and
 //! host, the refracted communities, the notices, the methods, the lexicons,
 //! the figures), no live feed, and the lexicon route.
@@ -105,13 +106,13 @@ async fn instance_page_and_lexicons() {
     // session of an account that is not an operator.
     let alice = complete_setup(&h, ALICE).await;
     let stranger = Browser::new();
-    for path in ["/admin/instance", "/admin/lexicons/app/nearhorizon/actor/getMembership.json"] {
+    for path in ["/admin/about", "/admin/lexicons/app/nearhorizon/actor/getMembership.json"] {
         let page = get(&stranger, &url(path)).await;
         assert_eq!((page.status, page.headers.get(LOCATION).and_then(|v| v.to_str().ok())), (303, Some("/admin/login")), "{path}");
     }
     let not_operator = test_support::session(h.pool(), BOB, PDS).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let refused = stranger.http.get(url("/admin/instance")).header("cookie", &not_operator).send().await.expect("request");
+    let refused = stranger.http.get(url("/admin/about")).header("cookie", &not_operator).send().await.expect("request");
     assert_eq!(
         (refused.status().as_u16(), refused.headers().get(LOCATION).and_then(|v| v.to_str().ok())),
         (401, None),
@@ -119,13 +120,17 @@ async fn instance_page_and_lexicons() {
     );
     assert_eq!(count(h.pool(), &format!("SELECT count(*) FROM admin_sessions WHERE did = '{BOB}'")).await, 0, "its session is cut");
 
-    let page = get(&alice, &url("/admin/instance")).await;
+    let page = get(&alice, &url("/admin/about")).await;
     assert_eq!(page.status, 200, "{}", page.body);
-    assert_admin_headers(&page, "/admin/instance");
+    assert_admin_headers(&page, "/admin/about");
+    let old = get(&alice, &url("/admin/instance")).await;
+    assert_eq!((old.status, old.headers.get(LOCATION).and_then(|v| v.to_str().ok())), (308, Some("/admin/about")));
     let body = &page.body;
     for text in [
         // About.
-        "<h1>Instance</h1>",
+        "<h1>About this server</h1>",
+        "<title>About this server · Horizon-Prism admin</title>",
+        "<p class=\"eyebrow\">System</p>",
         "Horizon-Prism, an AT Protocol AppView written in Rust.",
         env!("CARGO_PKG_VERSION"),
         "did:web:prism.example.com",
@@ -134,10 +139,10 @@ async fn instance_page_and_lexicons() {
         "Prism can reach its database.",
         "No data: Redis is not connected to these pages.",
         "Prism stopped because its private-post audit log failed.",
-        "<td>relay-a<",
-        "<td>relay-a.example</td>",
+        "<td class=\"name\">relay-a<",
+        "<td class=\"list\">relay-a.example</td>",
         "5 s behind",
-        "<td>relay-b.example</td>",
+        "<td class=\"list\">relay-b.example</td>",
         "never reported on this database",
         "private posts wait for it",
         "100.0 events a second, over the last 5 minutes",
@@ -157,10 +162,10 @@ async fn instance_page_and_lexicons() {
         "did:plc:labelerofcommunitya000",
         "read through its labeler",
         "Refract is on.",
-        "<td>community-a</td>",
+        "<td class=\"name\">community-a</td>",
         "pds.community-a.example",
         "*.community-a.example",
-        "<td>community-b</td>",
+        "<td class=\"name\">community-b</td>",
         "<code class=\"chip\">community-b.example</code>",
         "network-b",
         "Not configured",

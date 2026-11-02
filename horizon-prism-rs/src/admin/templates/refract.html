@@ -2,18 +2,19 @@
 {% block main_class %} class="wide"{% endblock %}
 {% block content %}
 <h1>{{ title }}</h1>
+{% include "tabs.html" %}
 <p class="muted">Accounts Bluesky took down that a listed community still hosts. A candidate is being checked; a restored
 account is kept and served, marked with its community; one in grace failed a check and is still served for a while;
-an ending one's data here is being deleted. The communities themselves are on the <a href="/admin/communities">Communities</a> page.</p>
+an ending one's data here is being deleted. The communities themselves are on <a href="/admin/communities">the Communities tab</a>.</p>
 {% if !enabled %}
-<div class="banner">Refract is off: nothing is checked and no account is kept. Turn it on on the <a href="/admin/communities">Communities</a> page.</div>
+<div class="banner">Refract is off: nothing is checked and no account is kept. Turn it on on <a href="/admin/communities">the Communities tab</a>.</div>
 {% endif %}
 
 <div class="grid">
 <div class="card">
 <h2>Add an account</h2>
 {% if enabled %}
-<form class="stack" method="post" action="/admin/refract/add">
+<form class="stack" method="post" action="/admin/communities/accounts/add">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="add-input">Handle or DID</label>
 <input type="text" id="add-input" name="input" spellcheck="false" placeholder="someone.example.social" required>
@@ -27,7 +28,7 @@ an ending one's data here is being deleted. The communities themselves are on th
 </div>
 
 <h2>Accounts</h2>
-<form class="filters card" method="get" action="/admin/refract">
+<form class="filters card" method="get" action="/admin/communities/accounts">
 <label for="state">State</label>
 <select id="state" name="state">
 <option value="">any</option>
@@ -45,18 +46,18 @@ an ending one's data here is being deleted. The communities themselves are on th
 <p class="muted">{{ total }} account{% if total != 1 %}s{% endif %}.</p>
 <div class="scroll">
 <table class="dense">
-<thead><tr><th>Account</th><th>Community</th><th>State</th><th>Since</th><th>Last checked</th><th>Next check</th><th>History</th><th></th></tr></thead>
+<thead><tr><th class="name">Account</th><th class="name">Community</th><th class="state">State</th><th class="when">Since</th><th class="when">Last checked</th><th class="when">Next check</th><th class="text">History</th><th class="actions"></th></tr></thead>
 <tbody>
 {% for r in rows %}
 <tr>
-<td class="nowrap">{% if !r.handle.is_empty() %}<strong>{{ r.handle }}</strong><br>{% endif %}<code class="chip">{{ r.did }}</code></td>
-<td class="nowrap">{{ r.community }}</td>
-<td class="nowrap">{{ r.state }}</td>
-<td class="nowrap">{{ r.since }}</td>
-<td class="nowrap">{{ r.checked }}</td>
-<td class="nowrap">{{ r.next }}</td>
-<td>{{ r.history }}</td>
-<td class="actions"><a class="button secondary" href="/admin/refract/{{ r.did }}">Details</a></td>
+<td class="name">{% if !r.handle.is_empty() %}<strong>{{ r.handle }}</strong><br>{% endif %}<code class="chip">{{ r.did }}</code></td>
+<td class="name">{{ r.community }}</td>
+<td class="state">{{ r.state }}</td>
+<td class="when">{{ r.since }}</td>
+<td class="when">{{ r.checked }}</td>
+<td class="when">{{ r.next }}</td>
+<td class="text"><div class="cell-text">{{ r.history }}</div></td>
+<td class="actions"><a class="button secondary" href="{{ r.href }}">Details</a></td>
 </tr>
 {% else %}
 <tr><td colspan="8" class="muted">No accounts{% if !state.is_empty() || !community.is_empty() %} match{% endif %}.</td></tr>
@@ -76,14 +77,14 @@ accounts are hidden at once and ended at the time shown. Keep holds them hidden 
 their time again.</p>
 <div class="scroll">
 <table class="dense">
-<thead><tr><th>Why</th><th>Accounts</th><th>Since</th><th>Ends</th><th></th></tr></thead>
+<thead><tr><th class="name">Why</th><th class="num">Accounts</th><th class="when">Since</th><th class="when">Ends</th><th class="actions"></th></tr></thead>
 <tbody>
 {% for p in pending %}
 <tr>
-<td><code class="chip">{{ p.scope }}</code></td>
-<td>{{ p.dids }}</td>
-<td class="nowrap">{{ p.since }}</td>
-<td class="nowrap">{{ p.ends }}</td>
+<td class="name"><code class="chip">{{ p.scope }}</code></td>
+<td class="num">{{ p.dids }}</td>
+<td class="when">{{ p.since }}</td>
+<td class="when">{{ p.ends }}</td>
 <td class="actions"><form class="inline" method="post" action="/admin/communities/keep"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="scope" value="{{ p.scope }}">{% if p.keep %}<input type="hidden" name="keep" value="false"><button class="secondary" type="submit">Release</button>{% else %}<input type="hidden" name="keep" value="true"><button class="secondary" type="submit">Keep</button>{% endif %}</form></td>
 </tr>
 {% else %}

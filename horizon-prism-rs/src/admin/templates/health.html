@@ -9,14 +9,14 @@
 <h2>Checks</h2>
 <div class="scroll">
 <table>
-<thead><tr><th>Check</th><th>State</th><th>What it says</th></tr></thead>
+<thead><tr><th class="name">Check</th><th class="state">State</th><th class="text">What it says</th></tr></thead>
 <tbody>
 {% for c in checks %}
 <tr>
-<td>{{ c.name }}</td>
-<td><span class="pill {{ c.class }}">{{ c.word }}</span></td>
-<td>{{ c.text }}{% if !c.href.is_empty() %} <a href="{{ c.href }}">{{ c.link }}</a>{% endif %}
-{% if c.resync %}<form class="inline" method="post" action="/admin/health/resync"><input type="hidden" name="csrf" value="{{ csrf }}"> <button class="secondary" type="submit">Re-sync private data and members…</button></form>{% endif %}</td>
+<td class="name">{{ c.name }}</td>
+<td class="state"><span class="pill {{ c.class }}">{{ c.word }}</span></td>
+<td class="text"><div class="cell-text">{{ c.text }}{% if !c.href.is_empty() %} <a href="{{ c.href }}">{{ c.link }}</a>{% endif %}
+{% if c.resync %}<form class="inline" method="post" action="/admin/health/resync"><input type="hidden" name="csrf" value="{{ csrf }}"> <button class="secondary" type="submit">Re-sync private data and members…</button></form>{% endif %}</div></td>
 </tr>
 {% endfor %}
 </tbody>

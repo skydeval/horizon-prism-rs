@@ -5,42 +5,55 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 {% block head %}{% endblock %}
-<title>{{ title }} · Horizon-Prism admin</title>
+<title>{% if let Some(nav) = nav %}{{ nav.title_or(title) }}{% else %}{{ title }}{% endif %} · Horizon-Prism admin</title>
 <link rel="stylesheet" href="{{ css }}">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 </head>
 <body>
+{% if let Some(nav) = nav %}
+<a class="skip" href="#main">Skip to content</a>
+<div class="layout">
+<nav class="sidebar" aria-label="Admin menu">
+<div class="brand"><span>Horizon-Prism</span>
+<details class="who"{% if nav.on_appearance() %} open{% endif %}><summary><span class="who-name">{{ nav.who }}</span> <span aria-hidden="true">▾</span></summary>
+<div class="who-menu">
+<a class="item" href="/admin/appearance"{% if nav.on_appearance() %} aria-current="page"{% endif %}>Appearance</a>
+<form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ nav.csrf }}"><button class="item" type="submit">Sign out</button></form>
+</div>
+</details>
+</div>
+{% for s in nav.sections() %}
+<p class="sec" id="sec-{{ s.key }}">{{ s.label }}</p>
+<ul aria-labelledby="sec-{{ s.key }}">
+{% for i in s.items %}<li><a class="item" href="{{ i.href }}"{{ i.current_attr|safe }}><span>{{ i.name }}</span>{% if let Some(tag) = i.tag %}<span class="tag">{{ tag }}</span>{% endif %}</a></li>
+{% endfor %}</ul>
+{% endfor %}
+</nav>
+{% else %}
 <header class="top">
 <a class="brand" href="/admin">
 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 15.5h20"/><path d="M8 15.5 12 6l4 9.5"/><path d="M5 19.5h14" opacity=".55"/></svg>
 <span>Horizon-Prism</span>
 </a>
-{% if let Some(nav) = nav %}
-<nav>
-{% for m in nav.menu() %}<a href="{{ m.href }}"{% if m.current %} aria-current="page"{% endif %}>{{ m.label }}</a>
-{% endfor %}</nav>
-<span class="bar-end">
-<span class="muted who">{{ nav.who }}</span>
-<form class="inline" method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ nav.csrf }}"><button class="secondary" type="submit">Sign out</button></form>
-</span>
-{% else %}
 <span class="muted">admin</span>
-{% endif %}
 </header>
-<main{% block main_class %}{% endblock %}>
+{% endif %}
+<main id="main"{% block main_class %}{% endblock %}>
 {% if let Some(nav) = nav %}
 {% if nav.banners.started_without > 0 %}
 <div class="banner bad">Prism started without {{ nav.banners.started_without }} setting{% if nav.banners.started_without != 1 %}s{% endif %}: they were wrong or missing, so their defaults apply or their feature is off. <a href="/admin/health">See which, and why</a>.</div>
 {% endif %}
 {% if nav.banners.set_aside > 0 %}
-<div class="banner bad">Some saved settings could not be used: {{ nav.banners.set_aside }} saved setting{% if nav.banners.set_aside != 1 %}s{% endif %} could not be used when Prism last started. <a href="/admin/settings">See which, and why</a>.</div>
+<div class="banner bad">Some saved settings could not be used: {{ nav.banners.set_aside }} saved setting{% if nav.banners.set_aside != 1 %}s{% endif %} could not be used when Prism last started. <a href="/admin/settings#aside">See which, and why</a>.</div>
 {% endif %}
 {% if nav.banners.waiting > 0 %}
-<div class="banner">Changes waiting for a restart: {{ nav.banners.waiting }} saved change{% if nav.banners.waiting != 1 %}s{% endif %} will apply when Prism restarts. <a href="/admin/settings">See which</a>.
+<div class="banner">Changes waiting for a restart: {{ nav.banners.waiting }} saved change{% if nav.banners.waiting != 1 %}s{% endif %} will apply when Prism restarts. <a href="/admin/settings#waiting">See which</a>.
 {% if nav.banners.supervised %}<form class="inline" method="post" action="/admin/restart"><input type="hidden" name="csrf" value="{{ nav.csrf }}"> <button class="secondary" type="submit">Restart Prism…</button></form>{% else %} Ask whoever runs the server to restart Prism.{% endif %}</div>
 {% endif %}
+<p class="eyebrow">{{ nav.eyebrow() }}</p>
 {% endif %}
 {% block content %}{% endblock %}
 </main>
+{% if nav.is_some() %}</div>{% endif %}
 </body>
 </html>

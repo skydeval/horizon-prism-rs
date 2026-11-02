@@ -298,7 +298,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &StatsPage {
             css: css(),
-            nav: Some(Nav::new(&op, "stats")),
+            nav: Some(Nav::page(&op, crate::admin::menu::PageId::Stats)),
             title: "Stats".to_string(),
             disks: disk_views(&disks),
             not_visible: stats::join_words(&disks.not_visible),

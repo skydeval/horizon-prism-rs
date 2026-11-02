@@ -44,10 +44,10 @@ see it: the install notes say how (a read-only mount; Prism only reads the disk'
 {% if tables.is_empty() %}<p class="muted">Not measured yet since Prism started (every 5 minutes).</p>{% else %}
 <div class="scroll">
 <table>
-<thead><tr><th>Table</th><th>Rows</th><th>Size on disk</th></tr></thead>
+<thead><tr><th class="name">Table</th><th class="num">Rows</th><th class="num">Size on disk</th></tr></thead>
 <tbody>
 {% for t in tables %}
-<tr><td>{{ t.label }}{% if t.label != t.table %}<br><span class="muted tech">{{ t.table }}</span>{% endif %}</td><td>{{ t.rows }}</td><td>{{ t.size }}</td></tr>
+<tr><td class="name">{{ t.label }}{% if t.label != t.table %}<br><span class="muted tech">{{ t.table }}</span>{% endif %}</td><td class="num">{{ t.rows }}</td><td class="num">{{ t.size }}</td></tr>
 {% endfor %}
 </tbody>
 </table>
@@ -62,10 +62,10 @@ something Prism does not provide, or public data while it is off; "Errors" went 
 {% if used.is_empty() %}<p class="muted">No requests yet since Prism started.</p>{% else %}
 <div class="scroll">
 <table>
-<thead><tr><th>Request</th><th>All</th><th>Answered</th><th>Refused</th><th>Too many</th><th>Not offered</th><th>Errors</th><th>Last used</th></tr></thead>
+<thead><tr><th class="name">Request</th><th class="num">All</th><th class="num">Answered</th><th class="num">Refused</th><th class="num">Too many</th><th class="num">Not offered</th><th class="num">Errors</th><th class="when">Last used</th></tr></thead>
 <tbody>
 {% for e in used %}
-<tr><td>{{ e.name }}<br><span class="muted tech">{{ e.nsid }}</span></td><td>{{ e.total }}</td>{% for c in e.counts %}<td>{{ c }}</td>{% endfor %}<td>{{ e.last }}</td></tr>
+<tr><td class="name">{{ e.name }}<br><span class="muted tech">{{ e.nsid }}</span></td><td class="num">{{ e.total }}</td>{% for c in e.counts %}<td class="num">{{ c }}</td>{% endfor %}<td class="when">{{ e.last }}</td></tr>
 {% endfor %}
 </tbody>
 </table>
@@ -75,10 +75,10 @@ something Prism does not provide, or public data while it is off; "Errors" went 
 <summary>{{ never.len() }} request{% if never.len() != 1 %}s{% endif %} never used since Prism started</summary>
 <div class="scroll">
 <table>
-<thead><tr><th>Request</th></tr></thead>
+<thead><tr><th class="name">Request</th></tr></thead>
 <tbody>
 {% for n in never %}
-<tr><td>{{ n.name }}<br><span class="muted tech">{{ n.nsid }}</span></td></tr>
+<tr><td class="name">{{ n.name }}<br><span class="muted tech">{{ n.nsid }}</span></td></tr>
 {% endfor %}
 </tbody>
 </table>

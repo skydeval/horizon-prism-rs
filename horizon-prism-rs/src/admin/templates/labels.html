@@ -41,13 +41,13 @@ who uses this Prism.</p>
 {% if let Some(p) = problem %}<div class="banner bad">{{ p }}</div>{% endif %}
 <div class="scroll">
 <table>
-<thead><tr><th>On</th><th>Label</th><th>Added</th><th></th></tr></thead>
+<thead><tr><th class="name">On</th><th class="name">Label</th><th class="when">Added</th><th class="actions"></th></tr></thead>
 <tbody>
 {% for l in rows %}
 <tr>
-<td>{{ l.kind }} of <strong>{{ l.who }}</strong><br><code>{{ l.subject }}</code></td>
-<td>{{ l.name }}<br><span class="muted tech">{{ l.val }}</span></td>
-<td>{{ l.when }}</td>
+<td class="name">{{ l.kind }} of <strong>{{ l.who }}</strong><br><code>{{ l.subject }}</code></td>
+<td class="name">{{ l.name }}<br><span class="muted tech">{{ l.val }}</span></td>
+<td class="when">{{ l.when }}</td>
 <td class="actions"><form class="inline" method="post" action="/admin/labels/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="subject" value="{{ l.subject }}"><input type="hidden" name="val" value="{{ l.val }}"><button class="secondary" type="submit">Remove…</button></form></td>
 </tr>
 {% else %}

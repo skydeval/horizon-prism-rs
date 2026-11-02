@@ -13,14 +13,16 @@ use std::net::SocketAddr;
 
 use askama::Template;
 use axum::Form;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
 
-use super::{ConfirmPage, Hidden, Nav, css, enqueue, message, render, setting_name, typed_matches, when};
+use super::{ConfirmPage, Hidden, Nav, back_to, css, enqueue, message, render, setting_name, typed_matches, when};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
+use crate::admin::menu::PageId;
 use crate::admin::settings::registry::{self, Group, Kind, Section};
 use crate::admin::settings::store::{self, Change, PUBLIC_SCOPE_KEY, Row};
 use crate::admin::settings::{SettingsContext, overlay};
@@ -230,7 +232,7 @@ pub async fn index(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
         })
         .collect();
     let groups = Group::ALL.into_iter().map(|g| GroupLink { slug: g.slug(), title: g.title(), summary: g.summary() }).collect();
-    render(StatusCode::OK, &IndexPage { css: css(), nav: Some(Nav::new(&op, "settings")), title: "Settings".to_string(), groups, aside, waiting })
+    render(StatusCode::OK, &IndexPage { css: css(), nav: Some(Nav::page(&op, PageId::Settings)), title: "All settings".to_string(), groups, aside, waiting })
 }
 
 fn field_view(section: &Section, f: &registry::Field, rows: &BTreeMap<String, Row>, ctx: &SettingsContext) -> FieldView {
@@ -301,23 +303,29 @@ fn section_warning(section: &Section, rows: &BTreeMap<String, Row>, ctx: &Settin
     })
 }
 
-fn not_found(state: &AdminState, op: &Operator) -> Response {
-    message(state, Some(Nav::new(op, "settings")), StatusCode::NOT_FOUND, "Not found", "There is no such settings page.", Some(("/admin/settings", "Settings")))
+/// The settings group an old page slug names: one of
+/// [`crate::admin::menu::OLD_GROUP_SLUGS`], else `None`.
+fn old_group(slug: Result<Path<String>, PathRejection>) -> Option<Group> {
+    let Ok(Path(slug)) = slug else {
+        return None;
+    };
+    crate::admin::menu::OLD_GROUP_SLUGS.contains(&slug.as_str()).then(|| Group::from_slug(&slug)).flatten()
 }
 
-/// `GET /admin/settings/{group}`.
+/// `GET /admin/settings/{group}`: a group's page. Any other slug, or a
+/// segment that is not text, is the plain 404 page, without a session.
 pub async fn group(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path(slug): Path<String>,
+    slug: Result<Path<String>, PathRejection>,
 ) -> Response {
+    let Some(group) = old_group(slug) else {
+        return super::not_found().await;
+    };
     let op = match require(&state, &headers, peer, Need::Page, None).await {
         Ok(op) => op,
         Err(response) => return response,
-    };
-    let Some(group) = Group::from_slug(&slug) else {
-        return not_found(&state, &op);
     };
     let rows = match saved_rows(&state).await {
         Ok(r) => r,
@@ -355,7 +363,7 @@ pub async fn group(
         StatusCode::OK,
         &GroupPage {
             css: css(),
-            nav: Some(Nav::new(&op, "settings")),
+            nav: Some(Nav::under(&op, PageId::Settings)),
             title: group.title().to_string(),
             slug: group.slug(),
             csrf: op.csrf.clone(),
@@ -379,7 +387,7 @@ pub fn phase_words(mode: PublicMode) -> &'static str {
 }
 
 fn refused(state: &AdminState, op: &Operator, back: &str, text: &str) -> Response {
-    message(state, Some(Nav::new(op, "settings")), StatusCode::BAD_REQUEST, "Not saved", text, Some((back, "Back to the settings")))
+    message(state, Some(Nav::at(op, back)), StatusCode::BAD_REQUEST, "Not saved", text, Some((back, "Back to the settings")))
 }
 
 /// What a typed change does, in words.
@@ -397,11 +405,14 @@ fn first<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
     pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
 }
 
-/// The confirmation of typed changes, carrying the whole form again.
-fn confirm_typed(op: &Operator, action: &str, pairs: &[(String, String)], what: String, word: String, error: Option<String>) -> ConfirmPage {
+/// The confirmation of typed changes, carrying the whole form again, with
+/// Cancel going to `back`.
+#[allow(clippy::too_many_arguments)]
+fn confirm_typed(op: &Operator, back: String, action: &str, pairs: &[(String, String)], what: String, word: String, error: Option<String>) -> ConfirmPage {
     ConfirmPage {
         css: css(),
-        nav: Some(Nav::new(op, "settings")),
+        nav: Some(Nav::at(op, &back)),
+        back,
         title: "Confirm the change".to_string(),
         what,
         undo: "You can change it back later.".to_string(),
@@ -409,7 +420,7 @@ fn confirm_typed(op: &Operator, action: &str, pairs: &[(String, String)], what: 
         csrf: op.csrf.clone(),
         hidden: pairs
             .iter()
-            .filter(|(k, _)| !matches!(k.as_str(), "csrf" | "confirm" | "typed"))
+            .filter(|(k, _)| !matches!(k.as_str(), "csrf" | "confirm" | "typed" | "back"))
             .map(|(name, value)| Hidden { name: name.clone(), value: value.clone() })
             .collect(),
         typed: Some(word),
@@ -424,17 +435,17 @@ pub async fn save(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path(slug): Path<String>,
+    slug: Result<Path<String>, PathRejection>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let Some(group) = old_group(slug) else {
+        return super::not_found().await;
+    };
     let op = match require(&state, &headers, peer, Need::Change, first(&pairs, "csrf")).await {
         Ok(op) => op,
         Err(response) => return response,
     };
-    let Some(group) = Group::from_slug(&slug) else {
-        return not_found(&state, &op);
-    };
-    let back = format!("/admin/settings/{slug}");
+    let back = format!("/admin/settings/{}", group.slug());
     let rows = match saved_rows(&state).await {
         Ok(r) => r,
         Err(e) => return super::internal_error(&state, &e),
@@ -471,7 +482,7 @@ pub async fn save(
         return refused(&state, &op, &back, &format!("Nothing was saved. {}", problems.join(" ")));
     }
     if changes.is_empty() {
-        return message(&state, Some(Nav::new(&op, "settings")), StatusCode::OK, "Nothing changed", "The form had no changes to save.", Some((&back, "Back to the settings")));
+        return message(&state, Some(Nav::at(&op, &back)), StatusCode::OK, "Nothing changed", "The form had no changes to save.", Some((&back, "Back to the settings")));
     }
     if !words.is_empty() {
         let word = words.join(" ");
@@ -479,7 +490,8 @@ pub async fn save(
         if first(&pairs, "confirm") != Some("yes") || !typed_matches(&word, typed) {
             let error = (first(&pairs, "confirm") == Some("yes")).then(|| format!("Type {word} exactly to confirm."));
             let status = if error.is_some() { StatusCode::BAD_REQUEST } else { StatusCode::OK };
-            return render(status, &confirm_typed(&op, &back, &pairs, whats.join(" "), word, error));
+            let cancel = back_to(&state, &headers, first(&pairs, "back"), &back);
+            return render(status, &confirm_typed(&op, cancel, &back, &pairs, whats.join(" "), word, error));
         }
     }
     enqueue(&state, &op, &AdminCommand::SettingsSet { changes }).await
@@ -496,6 +508,8 @@ pub struct KeyForm {
     pub version: i64,
     pub confirm: Option<String>,
     pub typed: Option<String>,
+    /// The page the form was on, for Cancel and Back.
+    pub back: Option<String>,
 }
 
 /// `POST /admin/settings/reset`: remove the saved value, back to the
@@ -526,7 +540,8 @@ pub async fn reset(
             let pairs = vec![("key".to_string(), form.key.clone()), ("version".to_string(), form.version.to_string())];
             let error = confirmed.then(|| format!("Type {word} exactly to confirm."));
             let status = if error.is_some() { StatusCode::BAD_REQUEST } else { StatusCode::OK };
-            return render(status, &confirm_typed(&op, "/admin/settings/reset", &pairs, typed_what(&form.key).to_string(), word.to_string(), error));
+            let cancel = back_to(&state, &headers, form.back.as_deref(), "/admin/settings");
+            return render(status, &confirm_typed(&op, cancel, "/admin/settings/reset", &pairs, typed_what(&form.key).to_string(), word.to_string(), error));
         }
     }
     enqueue(&state, &op, &AdminCommand::SettingsSet { changes: vec![Change { key: form.key, value: None, base_version: form.version }] }).await
@@ -564,6 +579,8 @@ pub struct PublicForm {
     pub value: String,
     pub confirm: Option<String>,
     pub typed: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 /// `POST /admin/settings/public-scope`: its own command, which moves
@@ -583,9 +600,11 @@ pub async fn public_scope(
     };
     if value == ScopeValue::KryphocronOnly && state.scope.public_mode() != PublicMode::Off {
         let word = "OFF";
+        let back = back_to(&state, &headers, form.back.as_deref(), "/admin/settings/storage");
         let mut page = ConfirmPage {
             css: css(),
-            nav: Some(Nav::new(&op, "settings")),
+            nav: Some(Nav::at(&op, &back)),
+            back,
             title: "Switch to Kryphocron only".to_string(),
             what: "Prism stops answering public Bluesky requests and deletes the public data it stored, in the background. Only what kryphocron posts and Horizon features need is kept: blocks, follows involving members, profiles, and members' own records.".to_string(),
             undo: "Switching back to Community refills public data; public requests come back when the refill is done.".to_string(),
@@ -613,6 +632,8 @@ pub struct RestartForm {
     #[serde(default)]
     pub csrf: String,
     pub confirm: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 /// `POST /admin/restart` (§8.5, C-A4): confirmed, then a `restart`
@@ -630,19 +651,21 @@ pub async fn restart(
     if !state.settings.env.supervised {
         return message(
             &state,
-            Some(Nav::new(&op, "settings")),
+            Some(Nav::at(&op, "/admin/settings")),
             StatusCode::CONFLICT,
             "Cannot restart here",
             "Prism cannot restart itself on this server; ask whoever runs it to restart Prism.",
-            Some(("/admin/settings", "Settings")),
+            Some(("/admin/settings", "All settings")),
         );
     }
     if form.confirm.as_deref() != Some("yes") {
+        let back = back_to(&state, &headers, form.back.as_deref(), "/admin/settings");
         return render(
             StatusCode::OK,
             &ConfirmPage {
                 css: css(),
-                nav: Some(Nav::new(&op, "settings")),
+                nav: Some(Nav::at(&op, &back)),
+                back,
                 title: "Restart Prism".to_string(),
                 what: "Prism will be unavailable for about a minute. Apps will show errors until it is back. Background work (removals, clean-ups, syncs) stops and carries on after the restart.".to_string(),
                 undo: "Saved changes that wait for a restart are applied when Prism starts again.".to_string(),
@@ -700,7 +723,7 @@ pub async fn running(State(state): State<AdminState>, ConnectInfo(peer): Connect
         StatusCode::OK,
         &RunningPage {
             css: css(),
-            nav: Some(Nav::new(&op, "settings")),
+            nav: Some(Nav::under(&op, PageId::Settings)),
             title: "Everything Prism is running with".to_string(),
             text: running_text(&state.settings.running),
         },
@@ -774,7 +797,7 @@ pub async fn installed(State(state): State<AdminState>, ConnectInfo(peer): Conne
         StatusCode::OK,
         &InstalledPage {
             css: css(),
-            nav: Some(Nav::new(&op, "settings")),
+            nav: Some(Nav::under(&op, PageId::Settings)),
             title: "Set when Prism was installed".to_string(),
             rows: installed_rows(&state.settings),
         },

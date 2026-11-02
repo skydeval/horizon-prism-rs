@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
-<p class="muted"><a href="/admin/settings">Settings</a></p>
+<p class="muted"><a href="/admin/settings">All settings</a></p>
 <h1>{{ title }}</h1>
 <p class="muted">These were set when Prism was installed, in .env or app.toml. Only whoever runs the server can change
 them, because a wrong value can make Prism unreachable or unsafe. Secrets are never shown, only whether they are set.</p>
 <div class="scroll">
 <table>
-<thead><tr><th>What</th><th>Value</th><th>Why it is not changed here</th></tr></thead>
+<thead><tr><th class="name">What</th><th class="text">Value</th><th class="text">Why it is not changed here</th></tr></thead>
 <tbody>
-{% for r in rows %}<tr><td>{{ r.what }}</td><td><code>{{ r.value }}</code></td><td>{{ r.why }}</td></tr>
+{% for r in rows %}<tr><td class="name">{{ r.what }}</td><td class="text"><div class="cell-text"><code>{{ r.value }}</code></div></td><td class="text"><div class="cell-text">{{ r.why }}</div></td></tr>
 {% endfor %}
 </tbody>
 </table>

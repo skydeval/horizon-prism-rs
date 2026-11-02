@@ -17,8 +17,11 @@ mod stats_pages;
 mod s5_pages;
 // Appearance, the menu's order and the product name (#810).
 mod appearance_pages;
-// Instance and the lexicons it serves.
+// About this server and the lexicons it serves.
 mod instance_pages;
+// The sidebar, the page names, the redirects from old addresses, where
+// Cancel goes, and the tables' cells.
+mod frame_pages;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -885,11 +888,18 @@ async fn t_a16_headers_everywhere() {
         "/admin/settings/installed",
         "/admin/settings/running",
         "/admin/health",
+        "/admin/about",
         "/admin/instance",
         "/admin/lexicons/app/nearhorizon/actor/getMembership.json",
         "/admin/jobs",
         "/admin/problems",
+        "/admin/blocks",
         "/admin/farsight",
+        "/admin/communities",
+        "/admin/communities/accounts",
+        "/admin/refract",
+        "/admin/appearance",
+        "/admin/settings/appearance",
         "/admin/labels",
         "/admin/lookup",
         "/admin/nowhere",

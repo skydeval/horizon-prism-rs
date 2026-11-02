@@ -56,7 +56,7 @@ pub async fn page(
         Err(e) => return super::internal_error(&state, &e),
     };
     let Some(row) = row else {
-        return message(&state, Some(Nav::new(&op, "audit")), StatusCode::NOT_FOUND, "Not found", "There is no such command.", Some(("/admin/audit", "Audit log")));
+        return message(&state, Some(Nav::at(&op, "/admin/audit")), StatusCode::NOT_FOUND, "Not found", "There is no such command.", Some(("/admin/audit", "Audit log")));
     };
     let row = CommandRow::from_tuple(row);
     // A restart's page reloads every 5 seconds until this process is a
@@ -81,12 +81,12 @@ pub async fn page(
         .get("did")
         .and_then(Value::as_str)
         .filter(|_| matches!(row.command.as_str(), "refract check" | "refract end") && !row.pending())
-        .map(|did| Link { href: format!("/admin/refract/{did}"), label: "See the account".to_string() });
+        .map(|did| Link { href: crate::admin::menu::account_href(did), label: "See the account".to_string() });
     render(
         StatusCode::OK,
         &CommandPage {
             css: css(),
-            nav: Some(Nav::new(&op, "audit")),
+            nav: Some(Nav::under(&op, crate::admin::menu::PageId::Audit)),
             title: format!("Command {id}"),
             row,
             offer,

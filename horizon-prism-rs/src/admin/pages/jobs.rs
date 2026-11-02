@@ -276,7 +276,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &JobsPage {
             css: css(),
-            nav: Some(Nav::new(&op, "jobs")),
+            nav: Some(Nav::page(&op, crate::admin::menu::PageId::Jobs)),
             title: "Jobs".to_string(),
             csrf: op.csrf.clone(),
             depths,
@@ -300,6 +300,8 @@ pub struct JobForm {
     pub depth: String,
     pub confirm: Option<String>,
     pub typed: Option<String>,
+    /// The page the form was on, for Cancel.
+    pub back: Option<String>,
 }
 
 /// `POST /admin/jobs/retry`: a `backfill` of the failed job's kind.
@@ -313,7 +315,7 @@ pub async fn retry(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
         Some(depth) if proto_blue::syntax::Did::is_valid(&did) => enqueue(&state, &op, &AdminCommand::Backfill { did, depth: Some(depth) }).await,
         _ => message(
             &state,
-            Some(Nav::new(&op, "jobs")),
+            Some(Nav::at(&op, "/admin/jobs")),
             StatusCode::BAD_REQUEST,
             "Not done",
             "That job cannot be tried again from here.",
@@ -350,7 +352,7 @@ pub async fn scope_rebuild(State(state): State<AdminState>, ConnectInfo(peer): C
         typed: Some("REBUILD".to_string()),
         button: "Clean up now",
     }
-    .page(&op, "jobs");
+    .page(&op, &super::back_to(&state, &headers, form.back.as_deref(), "/admin/jobs"));
     if let Some(response) = confirmed(page, form.confirm.as_deref(), form.typed.as_deref()) {
         return response;
     }

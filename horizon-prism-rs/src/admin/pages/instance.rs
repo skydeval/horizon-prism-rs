@@ -414,7 +414,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
     let now = state.health.metrics.as_ref().map(|m| Snapshot { at, series: parse(&m.render(), |n| SERIES.contains(&n)) });
     render(
         StatusCode::OK,
-        &InstancePage { css: css(), nav: Some(Nav::new(&op, "instance")), title: "Instance".to_string(), v: view(&state, &inputs, now.as_ref(), at) },
+        &InstancePage { css: css(), nav: Some(Nav::page(&op, crate::admin::menu::PageId::About)), title: "About this server".to_string(), v: view(&state, &inputs, now.as_ref(), at) },
     )
 }
 

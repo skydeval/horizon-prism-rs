@@ -51,8 +51,8 @@ async fn stats_page_and_the_disk_tile() {
 
     let page = get(&alice, &format!("{}/admin/stats", h.base)).await;
     assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(crate::admin::test_support::current_item(&page.body), Some(("Stats".to_string(), "page".to_string())), "{}", page.body);
     for text in [
-        "aria-current=\"page\">Stats</a>",
         // One filesystem, shown once; Redis's mount is missing.
         "the database (Postgres)</h3>",
         "Prism cannot see the disk of Redis.",
@@ -88,7 +88,7 @@ async fn stats_page_and_the_disk_tile() {
 
     // The Disk check on Health, and the fullest disk on Home.
     let health = get(&alice, &format!("{}/admin/health", h.base)).await;
-    assert!(health.body.contains("<td>Disk</td>") && health.body.contains("The disk holding"), "{}", health.body);
+    assert!(health.body.contains("<td class=\"name\">Disk</td>") && health.body.contains("The disk holding"), "{}", health.body);
     let home = get(&alice, &format!("{}/admin", h.base)).await;
     assert!(home.body.contains("Fullest disk") && home.body.contains("% used), "), "{}", home.body);
     h.db.drop_db().await;

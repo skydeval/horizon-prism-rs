@@ -18,13 +18,13 @@ Nothing on this page changes anything.</p>
 {% endfor %}
 <div class="scroll">
 <table>
-<thead><tr><th>Part</th><th>State</th><th>What it says</th></tr></thead>
+<thead><tr><th class="name">Part</th><th class="state">State</th><th class="text">What it says</th></tr></thead>
 <tbody>
 {% for s in v.status %}
-<tr><td>{{ s.name }}</td><td><span class="pill {{ s.class }}">{{ s.word }}</span></td><td>{{ s.text }}</td></tr>
+<tr><td class="name">{{ s.name }}</td><td class="state"><span class="pill {{ s.class }}">{{ s.word }}</span></td><td class="text"><div class="cell-text">{{ s.text }}</div></td></tr>
 {% endfor %}
-<tr><td>Account lookups</td><td></td><td>{{ v.lookups }}. The PLC directory is {{ v.plc }}.</td></tr>
-<tr><td>Block lists</td><td></td><td>{{ v.blocks }}. <a href="/admin/farsight">Blocks</a></td></tr>
+<tr><td class="name">Account lookups</td><td class="state"></td><td class="text"><div class="cell-text">{{ v.lookups }}. The PLC directory is {{ v.plc }}.</div></td></tr>
+<tr><td class="name">Block lists</td><td class="state"></td><td class="text"><div class="cell-text">{{ v.blocks }}. <a href="/admin/blocks">Blocks</a></div></td></tr>
 </tbody>
 </table>
 </div>
@@ -32,10 +32,10 @@ Nothing on this page changes anything.</p>
 <h3>Relays</h3>
 <div class="scroll">
 <table>
-<thead><tr><th>Relay</th><th>Host</th><th>Behind the network</th><th>Last heard (its newest record)</th></tr></thead>
+<thead><tr><th class="name">Relay</th><th class="list">Host</th><th class="state">Behind the network</th><th class="when">Last heard (its newest record)</th></tr></thead>
 <tbody>
 {% for r in v.relays %}
-<tr><td>{{ r.label }}{% if r.private %}<br><span class="muted">private posts wait for it</span>{% endif %}</td><td>{{ r.hosts }}</td><td><span class="pill {{ r.class }}">{{ r.behind }}</span></td><td>{{ r.last_heard }}</td></tr>
+<tr><td class="name">{{ r.label }}{% if r.private %}<br><span class="muted wrap">private posts wait for it</span>{% endif %}</td><td class="list">{{ r.hosts }}</td><td class="state"><span class="pill {{ r.class }}">{{ r.behind }}</span></td><td class="when">{{ r.last_heard }}</td></tr>
 {% endfor %}
 </tbody>
 </table>
@@ -66,10 +66,10 @@ Nothing on this page changes anything.</p>
 {% if v.communities.is_empty() %}<p class="muted">No community is listed.</p>{% else %}
 <div class="scroll">
 <table>
-<thead><tr><th>Community</th><th>Tier</th><th>PDS hosts</th><th>AppView</th><th>State</th></tr></thead>
+<thead><tr><th class="name">Community</th><th class="num">Tier</th><th class="list">PDS hosts</th><th class="name">AppView</th><th class="state">State</th></tr></thead>
 <tbody>
 {% for c in v.communities %}
-<tr><td>{{ c.name }}</td><td>{{ c.tier }}</td><td>{% for p in c.patterns %}<code class="chip">{{ p }}</code> {% endfor %}</td><td>{{ c.appview }}</td><td>{% if c.enabled %}enabled{% else %}off{% endif %}</td></tr>
+<tr><td class="name">{{ c.name }}</td><td class="num">{{ c.tier }}</td><td class="list">{% for p in c.patterns %}<code class="chip">{{ p }}</code> {% endfor %}</td><td class="name">{{ c.appview }}</td><td class="state">{% if c.enabled %}enabled{% else %}off{% endif %}</td></tr>
 {% endfor %}
 </tbody>
 </table>
@@ -101,10 +101,10 @@ public reads answer "not offered" (501).{% endif %}</p>
 <h3>Answered "not offered here"</h3>
 <div class="scroll">
 <table>
-<thead><tr><th>Method</th><th>What it answers</th></tr></thead>
+<thead><tr><th class="name">Method</th><th class="text">What it answers</th></tr></thead>
 <tbody>
 {% for n in v.not_offered %}
-<tr><td><code>{{ n.nsid }}</code></td><td>{{ n.message }}</td></tr>
+<tr><td class="name"><code>{{ n.nsid }}</code></td><td class="text"><div class="cell-text">{{ n.message }}</div></td></tr>
 {% endfor %}
 </tbody>
 </table>

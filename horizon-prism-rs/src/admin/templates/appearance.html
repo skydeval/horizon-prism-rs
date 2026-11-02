@@ -1,12 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
-<p class="muted"><a href="/admin/settings">Settings</a></p>
 <h1>{{ title }}</h1>
 <p class="muted">How these pages look to you. It is saved with your operator account, so it follows you to any device,
 and it changes nothing for other operators or for this server. It is not recorded in the audit log.</p>
 {% if saved %}<div class="banner ok">Saved. These pages now use it.</div>{% endif %}
 <div class="card">
-<form class="appearance" method="post" action="/admin/settings/appearance">
+<form class="appearance" method="post" action="/admin/appearance">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <fieldset class="choices">
 <legend>Light or dark</legend>

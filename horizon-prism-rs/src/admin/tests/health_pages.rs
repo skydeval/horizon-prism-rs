@@ -128,10 +128,10 @@ async fn health_jobs_and_home() {
         "Accounts around members",
         "Subscribed lists",
         "getRepoStatus: HTTP 502",
-        "<th>Unavailable</th>",
+        "<th class=\"num\">Unavailable</th>",
         "Accounts Prism could not read",
-        "<td>Deleted from the directory</td><td>2</td>",
-        "<td>Taken down by its server</td><td>1</td>",
+        "<td class=\"text\"><div class=\"cell-text\">Deleted from the directory</div></td><td class=\"num\">2</td>",
+        "<td class=\"text\"><div class=\"cell-text\">Taken down by its server</div></td><td class=\"num\">1</td>",
         "2 more failed jobs are for accounts Prism no longer follows.",
     ] {
         assert!(jobs.body.contains(text), "{text}: {}", jobs.body);
@@ -186,7 +186,7 @@ async fn health_jobs_and_home() {
     assert!(tiles.body.contains("id=\"attention\"") && tiles.body.contains("id=\"tiles\"") && tiles.body.contains("Needs attention"), "{}", tiles.body);
 
     // Blocks: not set up here.
-    let farsight = get(&alice, &url("/admin/farsight")).await;
+    let farsight = get(&alice, &url("/admin/blocks")).await;
     assert_eq!(farsight.status, 200);
     assert!(farsight.body.contains("Farsight is not set up"), "{}", farsight.body);
 

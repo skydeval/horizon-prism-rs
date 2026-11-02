@@ -23,74 +23,202 @@ pub mod setup;
 pub mod stats;
 
 use askama::Template;
-use axum::http::StatusCode;
+use axum::http::header::REFERER;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::auth::{Banners, Operator};
+use super::menu::{self, Current, MENU, PageId, SECTIONS, TABS, Tab};
 use super::{AdminState, CSS_HREF};
 use crate::admin_executor::AdminCommand;
 use crate::cli::dispatch::submit_as;
 
-/// The navigation bar of a signed-in page.
+/// Where a page's `<title>` comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleFrom {
+    /// The menu page's own name and product.
+    Page,
+    /// The Communities tab's title.
+    Tab,
+    /// The page's own title, the same text as its h1.
+    Own,
+}
+
+/// The sidebar and frame of a signed-in page: who is signed in, where the
+/// page sits in the menu, and the banners.
 pub struct Nav {
     /// How the operator is named: handle, else DID.
     pub who: String,
     pub csrf: String,
-    /// The current screen: the first word of an entry of [`MENU`].
-    pub current: &'static str,
+    /// The menu item the page marks, or Appearance.
+    pub current: PageId,
+    /// Whether it marks it as the page itself or as a sub-page's parent.
+    pub mark: Current,
+    /// The Communities tab shown, if any.
+    pub tab: Option<Tab>,
+    /// Where `<title>` comes from.
+    pub title_from: TitleFrom,
     /// Changes waiting for a restart, and settings that could not be used.
     pub banners: Banners,
-    /// The classes of `<html>`: the operator's own look (#810).
+    /// The classes of `<html>`: the operator's own look.
     pub theme: String,
 }
 
+/// A heading of the sidebar with its items.
+pub struct SectionView {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub items: Vec<ItemView>,
+}
+
+/// An item of the sidebar.
+pub struct ItemView {
+    pub href: &'static str,
+    pub name: &'static str,
+    pub tag: Option<&'static str>,
+    /// ` aria-current="…"`, or nothing.
+    pub current_attr: &'static str,
+}
+
+/// A Communities tab's link.
+pub struct TabLink {
+    pub href: &'static str,
+    pub name: &'static str,
+    pub current: bool,
+}
+
 impl Nav {
-    #[must_use]
-    pub fn new(op: &Operator, current: &'static str) -> Self {
+    fn with(op: &Operator, current: PageId, mark: Current, tab: Option<Tab>, title_from: TitleFrom) -> Self {
+        debug_assert!(current.built(), "{current:?} is not built");
         Self {
             who: op.who().to_string(),
             csrf: op.csrf.clone(),
             current,
+            mark,
+            tab,
+            title_from,
             banners: op.banners,
             theme: op.theme.class(),
         }
     }
 
-    /// The top menu's links, the current page marked.
+    /// A menu page's own GET, and Appearance's.
     #[must_use]
-    pub fn menu(&self) -> Vec<MenuLink> {
-        MENU.iter().map(|&(word, href, label)| MenuLink { href, label, current: word == self.current }).collect()
+    pub fn page(op: &Operator, id: PageId) -> Self {
+        Self::with(op, id, Current::Page, None, TitleFrom::Page)
+    }
+
+    /// A sub-page with a fixed parent: an account page, a command page,
+    /// Installed, Running and a settings group page.
+    #[must_use]
+    pub fn under(op: &Operator, id: PageId) -> Self {
+        let tab = (id == PageId::Communities).then_some(Tab::Accounts);
+        Self::with(op, id, Current::Parent, tab, TitleFrom::Own)
+    }
+
+    /// A Communities tab.
+    #[must_use]
+    pub fn tab(op: &Operator, tab: Tab) -> Self {
+        debug_assert!(tab.built(), "{tab:?} is not built");
+        let mark = if tab == Tab::Communities { Current::Page } else { Current::Parent };
+        Self::with(op, PageId::Communities, mark, Some(tab), TitleFrom::Tab)
+    }
+
+    /// A page with no page of its own (a confirmation, a message, a
+    /// refusal): it marks the page `back` is on.
+    #[must_use]
+    pub fn at(op: &Operator, back: &str) -> Self {
+        match menu::locate(back) {
+            Some((id, mark, tab)) => Self::with(op, id, mark, tab, TitleFrom::Own),
+            None => Self::under(op, PageId::Settings),
+        }
+    }
+
+    /// The sidebar's headings with their built items, the current one
+    /// marked.
+    #[must_use]
+    pub fn sections(&self) -> Vec<SectionView> {
+        MENU.iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(key, ids)| {
+                let (_, k, label) = SECTIONS.iter().find(|(s, _, _)| s == key).copied().unwrap_or((*key, "", ""));
+                SectionView {
+                    key: k,
+                    label,
+                    items: ids
+                        .iter()
+                        .map(|id| {
+                            let p = id.page();
+                            let mark = if *id == self.current { self.mark } else { Current::No };
+                            ItemView { href: p.href, name: p.name, tag: p.tag, current_attr: mark.attr() }
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the page shown is `id` (or a sub-page of it).
+    #[must_use]
+    pub fn is(&self, id: PageId) -> bool {
+        self.current == id
+    }
+
+    /// Whether the page shown is Appearance.
+    #[must_use]
+    pub fn on_appearance(&self) -> bool {
+        self.is(PageId::Appearance)
+    }
+
+    /// The `<title>` text, before " · Horizon-Prism admin".
+    #[must_use]
+    pub fn title_or(&self, title: &str) -> String {
+        match (self.title_from, self.tab) {
+            (TitleFrom::Page, _) => self.current.title(),
+            (TitleFrom::Tab, Some(tab)) => tab.title(),
+            _ => title.to_string(),
+        }
+    }
+
+    /// The line above the h1.
+    #[must_use]
+    pub fn eyebrow(&self) -> String {
+        self.current.eyebrow()
+    }
+
+    /// The Communities tabs, the current one marked.
+    #[must_use]
+    pub fn tabs(&self) -> Vec<TabLink> {
+        TABS.iter().map(|t| TabLink { href: t.href(), name: t.name(), current: self.tab == Some(*t) }).collect()
     }
 }
 
-/// A link of the top menu.
-pub struct MenuLink {
-    pub href: &'static str,
-    pub label: &'static str,
-    pub current: bool,
+/// Where Cancel and Back go: the form's own `back` field, else the page the
+/// browser came from (`Referer`, this host only), else `fallback`. Each is
+/// used only when [`menu::safe_back`] accepts it, so the result is always a
+/// page of this admin, written as a relative path.
+#[must_use]
+pub fn back_to(state: &AdminState, headers: &HeaderMap, form_back: Option<&str>, fallback: &str) -> String {
+    if let Some(b) = form_back.filter(|b| menu::safe_back(b)) {
+        return b.to_string();
+    }
+    let referer = headers.get(REFERER).and_then(|v| v.to_str().ok()).and_then(|r| url::Url::parse(r).ok()).and_then(|u| {
+        let host = match u.port() {
+            Some(port) => format!("{}:{port}", u.host_str()?),
+            None => u.host_str()?.to_string(),
+        };
+        (u.scheme() == "https" && host.eq_ignore_ascii_case(&state.public_hostname)).then(|| match u.query() {
+            Some(q) => format!("{}?{q}", u.path()),
+            None => u.path().to_string(),
+        })
+    });
+    if let Some(r) = referer.filter(|r| menu::safe_back(r)) {
+        return r;
+    }
+    fallback.to_string()
 }
-
-/// The top menu (§6), in its order: everyday pages first, Settings last
-/// (#810). `(current, href, label)`; `current` is [`Nav::current`]'s word.
-pub const MENU: [(&str, &str, &str); 15] = [
-    ("home", "/admin", "Home"),
-    ("members", "/admin/members", "Members"),
-    ("health", "/admin/health", "Health"),
-    ("jobs", "/admin/jobs", "Jobs"),
-    ("problems", "/admin/problems", "Problems"),
-    ("stats", "/admin/stats", "Stats"),
-    ("instance", "/admin/instance", "Instance"),
-    ("farsight", "/admin/farsight", "Blocks"),
-    ("labels", "/admin/labels", "Labels"),
-    ("communities", "/admin/communities", "Communities"),
-    ("refract", "/admin/refract", "Refract accounts"),
-    ("lookup", "/admin/lookup", "Look up"),
-    ("audit", "/admin/audit", "Audit log"),
-    ("operators", "/admin/operators", "Operators"),
-    ("settings", "/admin/settings", "Settings"),
-];
 
 /// A link on a message page.
 pub struct Link {
@@ -492,6 +620,9 @@ pub struct ConfirmPage {
     pub typed: Option<String>,
     pub button: String,
     pub error: Option<String>,
+    /// Where Cancel goes, carried as a hidden field so a wrong typed word
+    /// keeps it.
+    pub back: String,
 }
 
 /// What a confirmation page says and sends (§5.5).
@@ -506,12 +637,12 @@ pub struct Confirm<'a> {
 }
 
 impl Confirm<'_> {
-    /// The page, for `op` on the screen `current`.
+    /// The page, for `op`, with Cancel going to `back`.
     #[must_use]
-    pub fn page(self, op: &Operator, current: &'static str) -> ConfirmPage {
+    pub fn page(self, op: &Operator, back: &str) -> ConfirmPage {
         ConfirmPage {
             css: css(),
-            nav: Some(Nav::new(op, current)),
+            nav: Some(Nav::at(op, back)),
             title: self.title.to_string(),
             what: self.what,
             undo: self.undo.to_string(),
@@ -521,6 +652,7 @@ impl Confirm<'_> {
             typed: self.typed,
             button: self.button.to_string(),
             error: None,
+            back: back.to_string(),
         }
     }
 }

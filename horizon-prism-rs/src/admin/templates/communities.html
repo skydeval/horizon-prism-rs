@@ -2,9 +2,10 @@
 {% block main_class %} class="wide"{% endblock %}
 {% block content %}
 <h1>{{ title }}</h1>
+{% include "tabs.html" %}
 <p class="muted">Accounts Bluesky took down that a community listed here still hosts and has not banned stay visible
 through this Prism, marked with their community. Each change below saves the whole list at once and applies
-without a restart. The accounts themselves, one by one, are on the <a href="/admin/refract">Refract accounts</a> page.</p>
+without a restart. The accounts themselves, one by one, are on <a href="/admin/communities/accounts">the Accounts tab</a>.</p>
 
 {% for c in file_changes %}
 <div class="banner">{{ c.what }}: app.toml now says {{ c.file }}; the value saved here still applies.
@@ -26,15 +27,15 @@ To use app.toml's instead, change it below.
 <h2>Communities</h2>
 <div class="scroll">
 <table class="dense">
-<thead><tr><th>Community</th><th>Servers</th><th>Decisions read from</th><th>Ends on</th><th>Accounts</th><th></th></tr></thead>
+<thead><tr><th class="name">Community</th><th class="list">Servers</th><th class="name">Decisions read from</th><th class="list">Ends on</th><th class="list">Accounts</th><th class="actions"></th></tr></thead>
 <tbody>
 {% for c in communities %}
 <tr>
-<td class="nowrap"><strong>{{ c.name }}</strong><br><span class="muted">tier {{ c.tier }}{% if !c.enabled %}, disabled{% endif %}</span></td>
-<td><div class="chips">{% for p in c.pattern_list %}<code class="chip">{{ p }}</code>{% endfor %}</div></td>
-<td>{% if !c.appview.is_empty() %}<div class="nowrap">AppView <code class="chip">{{ c.appview }}</code></div>{% endif %}{% if !c.labeler.is_empty() %}<div class="nowrap">labeler <code class="chip" title="{{ c.labeler }}">{{ c.labeler_short }}</code> ({{ c.source }})</div>{% endif %}</td>
-<td><div class="chips">{% for g in c.gone_list %}<code class="chip">{{ g }}</code>{% endfor %}</div></td>
-<td><div class="counts">{% for n in c.counts %}<a href="{{ n.href }}"{% if n.n == 0 %} class="zero"{% endif %}>{{ n.n }} {{ n.state }}</a>{% endfor %}</div></td>
+<td class="name"><strong>{{ c.name }}</strong><br><span class="muted">tier {{ c.tier }}{% if !c.enabled %}, disabled{% endif %}</span></td>
+<td class="list"><div class="chips">{% for p in c.pattern_list %}<code class="chip">{{ p }}</code>{% endfor %}</div></td>
+<td class="name">{% if !c.appview.is_empty() %}<div class="nowrap">AppView <code class="chip">{{ c.appview }}</code></div>{% endif %}{% if !c.labeler.is_empty() %}<div class="nowrap">labeler <code class="chip" title="{{ c.labeler }}">{{ c.labeler_short }}</code> ({{ c.source }})</div>{% endif %}</td>
+<td class="list"><div class="chips">{% for g in c.gone_list %}<code class="chip">{{ g }}</code>{% endfor %}</div></td>
+<td class="list"><div class="counts">{% for n in c.counts %}<a href="{{ n.href }}"{% if n.n == 0 %} class="zero"{% endif %}>{{ n.n }} {{ n.state }}</a>{% endfor %}</div></td>
 <td class="actions">
 <form class="inline" method="post" action="/admin/communities/toggle"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="name" value="{{ c.name }}"><button class="secondary" type="submit">{% if c.enabled %}Disable…{% else %}Enable{% endif %}</button></form>
 <form class="inline" method="post" action="/admin/communities/remove"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="name" value="{{ c.name }}"><button class="secondary" type="submit">Remove…</button></form>
@@ -55,14 +56,14 @@ To use app.toml's instead, change it below.
 <p class="muted">These accounts are hidden now and end at the time shown, unless kept.</p>
 <div class="scroll">
 <table class="dense">
-<thead><tr><th>Why</th><th>Accounts</th><th>Since</th><th>Ends</th><th></th></tr></thead>
+<thead><tr><th class="name">Why</th><th class="num">Accounts</th><th class="when">Since</th><th class="when">Ends</th><th class="actions"></th></tr></thead>
 <tbody>
 {% for p in pending %}
 <tr>
-<td><code>{{ p.scope }}</code></td>
-<td>{{ p.dids }}</td>
-<td>{{ p.since }}</td>
-<td>{{ p.ends }}</td>
+<td class="name"><code>{{ p.scope }}</code></td>
+<td class="num">{{ p.dids }}</td>
+<td class="when">{{ p.since }}</td>
+<td class="when">{{ p.ends }}</td>
 <td class="actions"><form class="inline" method="post" action="/admin/communities/keep"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="scope" value="{{ p.scope }}">{% if p.keep %}<input type="hidden" name="keep" value="false"><button class="secondary" type="submit">Release</button>{% else %}<input type="hidden" name="keep" value="true"><button class="secondary" type="submit">Keep</button>{% endif %}</form></td>
 </tr>
 {% endfor %}
