@@ -28,10 +28,12 @@ The menu groups the pages by task. Appearance sits under your name at the top of
 | Moderation | Blocks · Farsight | Farsight's status (when configured); the fallback and the memory of blocks. |
 | Moderation | Communities · Refract | Refract (when used): the communities and visitors' own likes, an Accounts tab with each account, and a Pending ends tab. |
 | Moderation | Thread Lens | Who may use Thread Lens, and its request limit. |
+| Data | Indexing | What Horizon-Prism indexes, the switch between kryphocron only and community, and a refill's progress. |
+| Data | Storage | Database size against its budget, Redis, account ids, disks and compression; the budget and how long records are kept. |
 | Data | Jobs | Backfill and sync jobs; retry, scope check. |
 | Data | Problems | Dead letters and stream state; replay or drop. |
 | System | Health | Database, Redis, relays, disk and background checks. |
-| System | Stats | Disk use, database size against its budget, Redis memory, index sizes, requests per method. |
+| System | Stats | How much is indexed, table sizes, requests per method. |
 | System | About this server | Read-only facts about this server. |
 | System | Audit log | Every change, who made it, how it ended, and sign-ins. |
 | System | All settings | Links to the pages that hold their own settings, and one page per remaining group. Each setting shows its current value, default, file value and when it applies; rarely changed ones sit under Advanced. Also read-only pages for install-time values and the full running configuration (no secrets). |

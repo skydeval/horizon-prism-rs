@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">How much room Prism has and how much it uses, then what it keeps and for how long.</p>
+
+<div class="card">
+<h2>Database and Redis</h2>
+{% for f in space %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+<p class="muted">The database and Redis are measured every 5 minutes and every 30 seconds, the account ids now. Every
+account Prism stores takes an id; past half used, the Account ids check warns.</p>
+</div>
+
+<h2>Disks</h2>
+{% if disks.is_empty() %}<div class="banner">Prism cannot see any of its disks.</div>{% endif %}
+<div class="grid">
+{% for d in disks %}
+<div class="card">
+<h3>Disk holding {{ d.holds }}</h3>
+<div class="fact"><span class="l">Size</span><span class="v">{{ d.total }}</span></div>
+<div class="fact"><span class="l">Used</span><span class="v">{{ d.used }} <span class="pill {{ d.class }}">{{ d.used_share }}</span></span></div>
+<div class="fact"><span class="l">Free</span><span class="v">{{ d.free }}</span></div>
+</div>
+{% endfor %}
+</div>
+{% if !not_visible.is_empty() %}<div class="banner">Prism cannot see the disk of {{ not_visible }}. Whoever runs the server can let Prism
+see it: the install notes say how (a read-only mount; Prism only reads the disk's size and free space).</div>{% endif %}
+<p class="muted">Measured now. A disk turns amber under 10% or 5 GB free, red under 2%.</p>
+
+<div class="card">
+<h2>Stored records</h2>
+{% for f in records %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+<p class="muted">Compression starts once 10,000 posts are stored, once 10,000 profiles are, and once 10,000 other records
+(lists, starter packs, gates, polls, labelers, settings) are. Each compressed row leaves a dead row behind, which Postgres
+reuses; <code>VACUUM FULL</code> on its table (posts, actors, lists, …) or pg_repack returns the space.</p>
+</div>
+
+<h2>Settings</h2>
+{% include "settings_block.html" %}
+{% endblock %}

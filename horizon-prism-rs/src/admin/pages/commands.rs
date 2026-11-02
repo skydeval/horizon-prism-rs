@@ -88,14 +88,16 @@ pub async fn page(
         note: row.args.get("note").and_then(Value::as_str).unwrap_or_default().to_string(),
     });
     // A Refract check or end: the account's page, once it has run. A
-    // settings change: the page of its first setting.
+    // settings change: the page of its first setting. The indexing switch:
+    // Indexing.
     let follow = row
         .args
         .get("did")
         .and_then(Value::as_str)
         .filter(|_| matches!(row.command.as_str(), "refract check" | "refract end") && !row.pending())
         .map(|did| Link { href: crate::admin::menu::account_href(did), label: "See the account".to_string() })
-        .or_else(|| settings_follow(&state, &row));
+        .or_else(|| settings_follow(&state, &row))
+        .or_else(|| (row.command == "indexing public-scope").then(|| Link { href: "/admin/indexing".to_string(), label: "Back to Indexing".to_string() }));
     render(
         StatusCode::OK,
         &CommandPage {

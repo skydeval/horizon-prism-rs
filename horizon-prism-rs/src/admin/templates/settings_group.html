@@ -3,28 +3,6 @@
 <p class="muted"><a href="/admin/settings">All settings</a></p>
 <h1>{{ title }}</h1>
 
-{% if let Some(p) = public %}
-<div class="card">
-<h2>Public data</h2>
-<p>What Prism indexes. 'Kryphocron only' keeps only what kryphocron posts and Horizon features need (blocks, follows
-involving members, profiles, members' own records), and Prism stops answering public Bluesky requests. Switching to it
-deletes the stored public data in the background. 'Community' keeps public posts and interactions of your members and
-the accounts around them; switching to it refills them, and public requests come back when the refill is done.</p>
-<div class="fact"><span class="l">Now</span><span class="v">{{ p.phase }}</span></div>
-<p><span class="pill">Applies at once</span></p>
-<form class="stack" method="post" action="/admin/settings/public-scope">
-<input type="hidden" name="csrf" value="{{ csrf }}">
-<label for="public-scope">Public data</label>
-<select id="public-scope" name="value">
-<option value="community"{% if p.on %} selected{% endif %}>Community</option>
-<option value="kryphocron_only"{% if !p.on %} selected{% endif %}>Kryphocron only</option>
-</select>
-<div class="row"><button type="submit">Save public data</button></div>
-</form>
-<p class="muted tech">technical name: indexing.public_scope</p>
-</div>
-{% endif %}
-
 {% if let Some(l) = lodestar %}<div class="banner">{{ l }}</div>{% endif %}
 
 {% include "settings_block.html" %}

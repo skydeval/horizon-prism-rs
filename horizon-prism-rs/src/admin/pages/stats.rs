@@ -1,6 +1,6 @@
-//! Stats (`/admin/stats`, admin-ui design §6.5, §10): the disks, the other
-//! storage figures, how much is indexed, and the endpoints in use since
-//! Prism started. Nothing here changes anything, and nothing counts a large
+//! Stats (`/admin/stats`): how much is indexed, and the endpoints in use
+//! since Prism started, with one line on the space used, which Storage
+//! shows in full. Nothing here changes anything, and nothing counts a large
 //! table: big tables are Postgres's own estimates from the storage sampler,
 //! marked "about".
 
@@ -16,7 +16,7 @@ use super::{Nav, ago, bytes, css, render, when};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
 use crate::admin::health::{PRIVATE_READ_CONTENT, Snapshot, count, timed_count};
-use crate::admin::stats::{self, Disks, PUBLIC_TABLES, HEADLINE};
+use crate::admin::stats::{self, PUBLIC_TABLES, HEADLINE};
 use crate::admin::usage::{self, Class};
 use crate::firehose::feed::{Kind, Outcome, Source, Totals};
 
@@ -24,17 +24,6 @@ const UNKNOWN: &str = "unknown";
 
 fn fig(label: &str, value: impl Into<String>) -> Figure {
     Figure { label: label.to_string(), value: value.into(), link: None }
-}
-
-/// A disk as the page shows it.
-pub struct DiskView {
-    pub holds: String,
-    pub total: String,
-    pub used: String,
-    pub free: String,
-    pub used_share: String,
-    /// `fine`, `amber` or `red`, as the Disk check judges it.
-    pub class: &'static str,
 }
 
 /// A table's size.
@@ -66,10 +55,8 @@ struct StatsPage {
     css: &'static str,
     nav: Option<Nav>,
     title: String,
-    disks: Vec<DiskView>,
-    /// What Prism cannot see the disk of, in words; empty when it sees all.
-    not_visible: String,
-    storage: Vec<Figure>,
+    /// The database against its budget, in words.
+    database: String,
     groups: Vec<FigureGroup>,
     /// When the sampler last measured the tables.
     as_of: String,
@@ -78,34 +65,6 @@ struct StatsPage {
     counting_since: String,
     used: Vec<EndpointRow>,
     never: Vec<NeverRow>,
-}
-
-/// The disks in words, each judged as the Disk check does.
-#[allow(clippy::cast_precision_loss)]
-fn disk_views(d: &Disks) -> Vec<DiskView> {
-    use crate::admin::health::{DISK_AMBER_BYTES, DISK_AMBER_FREE, DISK_RED_FREE};
-    d.disks
-        .iter()
-        .map(|disk| {
-            let s = disk.space;
-            let free_share = 1.0 - s.used_ratio();
-            let class = if free_share < DISK_RED_FREE {
-                "red"
-            } else if free_share < DISK_AMBER_FREE || s.free < DISK_AMBER_BYTES {
-                "amber"
-            } else {
-                "fine"
-            };
-            DiskView {
-                holds: disk.holds_words(),
-                total: bytes(s.total as f64),
-                used: bytes(s.used as f64),
-                free: bytes(s.free as f64),
-                used_share: format!("{:.0}% used", s.used_ratio() * 100.0),
-                class,
-            }
-        })
-        .collect()
 }
 
 fn about(v: Option<f64>) -> String {
@@ -195,34 +154,13 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         Err(response) => return response,
     };
     let s = state.health.metrics.as_ref().map_or_else(|| stats::series(""), |m| stats::series(&m.render()));
-    let (members, ready, denied, wal, aof, media, sizes) = tokio::join!(
+    let (members, ready, denied, media, sizes) = tokio::join!(
         timed_count(&state.pool, "SELECT count(*) FROM members"),
         timed_count(&state.pool, "SELECT count(*) FROM members WHERE ready_at IS NOT NULL"),
         timed_count(&state.pool, "SELECT count(*) FROM member_denials"),
-        stats::wal_bytes(&state.pool),
-        stats::aof_bytes(state.health.redis.as_ref()),
         crate::private_tier::stats::media_post_counts(&state.pool),
         stats::scope_sizes(&state.scope),
     );
-    let disks = stats::read_disks(&state.disks);
-
-    #[allow(clippy::cast_precision_loss)]
-    let redis = match (s.sum(crate::db::sampler::METRIC_REDIS_USED), s.sum(crate::db::sampler::METRIC_REDIS_MAX)) {
-        (Some(used), Some(max)) if max > 0.0 => format!("{} of {} ({:.0}%)", bytes(used), bytes(max), used / max * 100.0),
-        (Some(used), _) => format!("{} (no limit set)", bytes(used)),
-        _ => UNKNOWN.to_string(),
-    };
-    #[allow(clippy::cast_precision_loss)]
-    let storage = vec![
-        fig("Database (of its budget)", database_words(&state, Some(&s))),
-        fig(
-            "Database change log (write-ahead log)",
-            wal.map_or_else(|| "unknown (Prism's database account may not read it)".to_string(), |n| bytes(n as f64)),
-        ),
-        fig("Redis memory (of its limit)", redis),
-        fig("Redis copy on disk (append-only file)", aof.map_or_else(|| UNKNOWN.to_string(), |n| bytes(n as f64))),
-    ];
-
     let mut groups = vec![FigureGroup {
         title: "People",
         figures: vec![
@@ -300,9 +238,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             css: css(),
             nav: Some(Nav::page(&op, crate::admin::menu::PageId::Stats)),
             title: "Stats".to_string(),
-            disks: disk_views(&disks),
-            not_visible: stats::join_words(&disks.not_visible),
-            storage,
+            database: database_words(&state, Some(&s)),
             groups,
             as_of,
             tables,

@@ -489,11 +489,12 @@ fn account_ids_check(used: Option<i64>) -> Check {
         return Check::no_data(NAME, "the count did not finish in time.");
     };
     let text = format!("{} of {} account ids are used ({}).", count(used as f64), count(ACCOUNT_ID_LIMIT as f64), id_share(used));
-    if used as f64 >= ACCOUNT_ID_LIMIT as f64 * ACCOUNT_IDS_WARN {
+    let check = if used as f64 >= ACCOUNT_ID_LIMIT as f64 * ACCOUNT_IDS_WARN {
         Check::new(NAME, Level::Amber, format!("{text} Over half are used; when they run out Prism cannot store new accounts."))
     } else {
         Check::new(NAME, Level::Ok, text)
-    }
+    };
+    check.link("/admin/storage", "Storage")
 }
 
 /// The Storage budget check: amber while no budget is set, since nothing
@@ -502,14 +503,14 @@ fn account_ids_check(used: Option<i64>) -> Check {
 #[allow(clippy::cast_precision_loss)]
 fn budget_check(budget_bytes: Option<u64>, db_size: Option<f64>) -> Check {
     const NAME: &str = "Storage budget";
-    const SETTINGS: &str = "/admin/settings/storage";
+    const STORAGE: &str = "/admin/storage";
     let Some(budget) = budget_bytes.filter(|b| *b > 0) else {
         return Check::new(
             NAME,
             Level::Amber,
-            "No storage budget is set, so Prism cannot warn you before the disk fills. Set one under Settings → Storage: the space the database may use, leaving room for the disk's other uses.",
+            "No storage budget is set, so Prism cannot warn you before the disk fills. Set one on Storage: the space the database may use, leaving room for the disk's other uses.",
         )
-        .link(SETTINGS, "Storage settings");
+        .link(STORAGE, "Storage");
     };
     let Some(size) = db_size else {
         return Check::no_data(NAME, "not measured yet (every 5 minutes).");
@@ -522,7 +523,7 @@ fn budget_check(budget_bytes: Option<u64>, db_size: Option<f64>) -> Check {
         crate::db::sampler::BudgetLevel::Ok => Level::Ok,
     };
     let check = Check::new(NAME, level, text);
-    if level == Level::Ok { check } else { check.link(SETTINGS, "Storage settings") }
+    if level == Level::Ok { check } else { check.link(STORAGE, "Storage") }
 }
 
 /// Under this share free a disk is red (§9.2).
@@ -557,7 +558,7 @@ fn disk_check(disks: Option<&super::stats::Disks>) -> Check {
     } else {
         Check::new(NAME, Level::Ok, format!("{text}{unseen}"))
     };
-    check.link("/admin/stats", "Stats")
+    check.link("/admin/storage", "Storage")
 }
 
 const FIVE_MIN: Duration = Duration::from_secs(300);
@@ -786,7 +787,7 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
 
     out.push(match latest.as_ref().and_then(|s| s.sum(crate::indexing::public_sweep::METRIC_STALLED)) {
         None => Check::no_data("Public data clean-up", "nothing is being deleted, or it has not been measured yet."),
-        Some(v) if v >= 1.0 => Check::new("Public data clean-up", Level::Amber, "Deleting public data has stalled.").link("/admin/settings/storage", "Public data"),
+        Some(v) if v >= 1.0 => Check::new("Public data clean-up", Level::Amber, "Deleting public data has stalled.").link("/admin/indexing", "Indexing"),
         Some(_) => Check::new("Public data clean-up", Level::Ok, "Deleting public data is not stalled."),
     });
 
@@ -1158,6 +1159,11 @@ mod tests {
         assert_eq!(get("Trim gap", "No data"), Level::NoData, "a counter never incremented is absent");
         assert_eq!(get("Disk", "The disk holding the database (Postgres) has 15.0 GB free (2% free)"), Level::Red);
         assert_eq!(get("Account ids", "1,200,000,000 of 2,147,483,647 account ids are used (56%). Over half are used"), Level::Amber);
+        // The storage checks link the page that shows what they measure.
+        let link = |name: &str| all.iter().find(|c| c.name == name).and_then(|c| c.link);
+        for name in ["Storage budget", "Disk", "Account ids"] {
+            assert_eq!(link(name), Some(("/admin/storage", "Storage")), "{name}");
+        }
     }
 
     #[test]
@@ -1166,9 +1172,9 @@ mod tests {
         assert_eq!(unset.level, Level::Amber);
         assert_eq!(
             unset.text,
-            "No storage budget is set, so Prism cannot warn you before the disk fills. Set one under Settings → Storage: the space the database may use, leaving room for the disk's other uses."
+            "No storage budget is set, so Prism cannot warn you before the disk fills. Set one on Storage: the space the database may use, leaving room for the disk's other uses."
         );
-        assert_eq!(unset.link, Some(("/admin/settings/storage", "Storage settings")));
+        assert_eq!(unset.link, Some(("/admin/storage", "Storage")));
         assert_eq!(budget_check(None, None).level, Level::Amber, "known from the configuration, measured or not");
         assert_eq!(budget_check(Some(0), None).level, Level::Amber, "0 is refused at load; never a ratio");
         assert_eq!(budget_check(Some(100), None).level, Level::NoData);
@@ -1183,7 +1189,7 @@ mod tests {
     fn account_ids_warn_past_half() {
         let check = |used: Option<i64>| account_ids_check(used);
         assert_eq!(check(None).level, Level::NoData);
-        assert_eq!(check(Some(1_468_627)), Check::new("Account ids", Level::Ok, "1,468,627 of 2,147,483,647 account ids are used (0.07%)."));
+        assert_eq!(check(Some(1_468_627)), Check::new("Account ids", Level::Ok, "1,468,627 of 2,147,483,647 account ids are used (0.07%).").link("/admin/storage", "Storage"));
         assert_eq!(check(Some(0)).text, "0 of 2,147,483,647 account ids are used (0%).");
         assert_eq!(check(Some(ACCOUNT_ID_LIMIT / 2)).level, Level::Ok, "just under half");
         assert_eq!(check(Some(ACCOUNT_ID_LIMIT / 2 + 1)).level, Level::Amber);

@@ -1,30 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>{{ title }}</h1>
-<p class="muted">How much room Prism has, how much it holds, and which requests apps make. Nothing on this page changes anything.</p>
-
-<h2>Disks</h2>
-{% if disks.is_empty() %}<div class="banner">Prism cannot see any of its disks.</div>{% endif %}
-<div class="grid">
-{% for d in disks %}
-<div class="card">
-<h3>Disk holding {{ d.holds }}</h3>
-<div class="fact"><span class="l">Size</span><span class="v">{{ d.total }}</span></div>
-<div class="fact"><span class="l">Used</span><span class="v">{{ d.used }} <span class="pill {{ d.class }}">{{ d.used_share }}</span></span></div>
-<div class="fact"><span class="l">Free</span><span class="v">{{ d.free }}</span></div>
-</div>
-{% endfor %}
-</div>
-{% if !not_visible.is_empty() %}<div class="banner">Prism cannot see the disk of {{ not_visible }}. Whoever runs the server can let Prism
-see it: the install notes say how (a read-only mount; Prism only reads the disk's size and free space).</div>{% endif %}
-<p class="muted">Measured now. A disk turns amber under 10% or 5 GB free, red under 2%.</p>
-
-<div class="card">
-<h3>Storage</h3>
-{% for f in storage %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
-{% endfor %}
-<p class="muted">The database and Redis are measured every 5 minutes and every 30 seconds.</p>
-</div>
+<p class="muted">How much Prism holds, and which requests apps make. Nothing on this page changes anything.</p>
+<p>Database: {{ database }} — <a href="/admin/storage">Storage</a></p>
 
 <h2>How much is indexed</h2>
 <p class="muted">"About" counts are Postgres's own estimates, measured {{ as_of }}. They can drift a little until Postgres next tidies the table.</p>

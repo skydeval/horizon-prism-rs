@@ -232,10 +232,10 @@ async fn no_budget_is_a_warning() {
     };
     assert_eq!(test_support::no_auto_join().storage.budget_bytes, None, "not set by default");
     let alice = complete_setup(&h, ALICE).await;
-    let warning = "No storage budget is set, so Prism cannot warn you before the disk fills. Set one under Settings → Storage: the space the database may use, leaving room for the disk";
+    let warning = "No storage budget is set, so Prism cannot warn you before the disk fills. Set one on Storage: the space the database may use, leaving room for the disk";
     let health = get(&alice, &format!("{}/admin/health", h.base)).await;
     assert_eq!(health.status, 200);
-    for text in ["Storage budget", warning, "1.0 GB (no budget set)", "/admin/settings/storage"] {
+    for text in ["Storage budget", warning, "1.0 GB (no budget set)", "href=\"/admin/storage\">Storage</a>"] {
         assert!(health.body.contains(text), "{text}: {}", health.body);
     }
     assert!(!health.body.contains("of its budget ("), "{}", health.body);

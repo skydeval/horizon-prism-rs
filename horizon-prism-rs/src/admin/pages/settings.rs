@@ -2,9 +2,9 @@
 //! settings, the old group pages for the settings whose feature page does
 //! not hold them yet, and the one save every settings form posts to. A save
 //! sends one `settings set` command with every changed field; the executor
-//! validates the whole configuration before anything is saved. Public data
-//! has its own form and command. Two read-only pages: what was set at
-//! install, and everything Prism is running with. And the restart.
+//! validates the whole configuration before anything is saved. Two
+//! read-only pages: what was set at install, and everything Prism is
+//! running with. And the restart.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -24,17 +24,9 @@ use crate::admin::menu::{self, MENU, PageId, SETTINGS_LIVE};
 use crate::admin::settings::SettingsContext;
 use crate::admin::settings::overlay;
 use crate::admin::settings::registry::{self, Group};
-use crate::admin::settings::store::{self, Change, PUBLIC_SCOPE_KEY, Row};
+use crate::admin::settings::store::{self, Change, Row};
 use crate::admin::settings::view::{self, Place, SettingsBlock, href, saved_rows, saved_value};
 use crate::admin_executor::AdminCommand;
-use crate::indexing::{PublicMode, ScopeValue};
-
-/// The public-data form.
-pub struct PublicView {
-    pub value: String,
-    pub phase: String,
-    pub on: bool,
-}
 
 /// A group in the index, with the titles of the settings still on it.
 pub struct GroupLink {
@@ -62,8 +54,6 @@ struct GroupPage {
     css: &'static str,
     nav: Option<Nav>,
     title: String,
-    csrf: String,
-    public: Option<PublicView>,
     lodestar: Option<String>,
     settings: SettingsBlock,
 }
@@ -145,10 +135,7 @@ fn groups_left(ctx: &SettingsContext) -> Vec<GroupLink> {
     Group::ALL
         .into_iter()
         .filter_map(|g| {
-            let mut titles: Vec<String> = view::sections_at(Place::Group(g), &networks).into_iter().map(|s| s.title).collect();
-            if g == Group::Storage {
-                titles.insert(0, "Public data".to_string());
-            }
+            let titles: Vec<String> = view::sections_at(Place::Group(g), &networks).into_iter().map(|s| s.title).collect();
             (!titles.is_empty()).then(|| GroupLink { slug: g.slug(), title: g.title(), summary: titles.join(", ") })
         })
         .collect()
@@ -246,17 +233,6 @@ pub async fn group(
         Ok(b) => b,
         Err(e) => return super::internal_error(&state, &e),
     };
-    let public = if group == Group::Storage {
-        let value: Option<Value> = match sqlx::query_scalar("SELECT value FROM operator_settings WHERE key = $1").bind(PUBLIC_SCOPE_KEY).fetch_optional(&state.pool).await {
-            Ok(v) => v,
-            Err(e) => return super::internal_error(&state, &e),
-        };
-        let value = value.and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "kryphocron_only".to_string());
-        let mode = state.scope.public_mode();
-        Some(PublicView { on: value == ScopeValue::Community.as_str(), value, phase: phase_words(mode).to_string() })
-    } else {
-        None
-    };
     let lodestar = (group == Group::Lookups).then(|| match &ctx.lodestar {
         None => "Lodestar is off: no address was set when Prism started.".to_string(),
         Some(l) if l.gate().is_open() => format!("Lodestar ({}) is answering and up to date, so Prism is reading from it.", l.host()),
@@ -264,20 +240,8 @@ pub async fn group(
     });
     render(
         StatusCode::OK,
-        &GroupPage { css: css(), nav: Some(Nav::under(&op, PageId::Settings)), title: group.title().to_string(), csrf: op.csrf.clone(), public, lodestar, settings },
+        &GroupPage { css: css(), nav: Some(Nav::under(&op, PageId::Settings)), title: group.title().to_string(), lodestar, settings },
     )
-}
-
-/// The public-data phase in words; Health and Home say it too.
-#[must_use]
-pub fn phase_words(mode: PublicMode) -> &'static str {
-    match mode {
-        PublicMode::On => "on",
-        PublicMode::Filling => "filling: public data is being refilled, and public requests come back when it is done",
-        PublicMode::Draining => "draining: stored public data is being deleted in the background",
-        PublicMode::Off => "off",
-        PublicMode::Held => "held: Prism could not read the state of this switch, so it keeps public data off and changes nothing until it is set again",
-    }
 }
 
 /// The name of the page at `back`, for a "Back to …" link.
@@ -502,62 +466,6 @@ pub async fn keep(
     };
     let change = Change { key: form.key.clone(), value: Some(row.value.clone()), base_version: form.version };
     enqueue(&state, &op, &AdminCommand::SettingsSet { changes: vec![change] }).await
-}
-
-/// The public-data form.
-#[derive(Debug, serde::Deserialize)]
-pub struct PublicForm {
-    #[serde(default)]
-    pub csrf: String,
-    #[serde(default)]
-    pub value: String,
-    pub confirm: Option<String>,
-    pub typed: Option<String>,
-    /// The page the form was on, for Cancel.
-    pub back: Option<String>,
-}
-
-/// `POST /admin/settings/public-scope`: its own command, which moves
-/// through phases (§6.3). Turning it off is typed (`OFF`).
-pub async fn public_scope(
-    State(state): State<AdminState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Form(form): Form<PublicForm>,
-) -> Response {
-    let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
-        Ok(op) => op,
-        Err(response) => return response,
-    };
-    let Some(value) = ScopeValue::parse(&form.value) else {
-        return refused(&state, &op, "/admin/settings/storage", "Choose Kryphocron only or Community.");
-    };
-    if value == ScopeValue::KryphocronOnly && state.scope.public_mode() != PublicMode::Off {
-        let word = "OFF";
-        let back = back_to(&state, &headers, form.back.as_deref(), "/admin/settings/storage");
-        let mut page = ConfirmPage {
-            css: css(),
-            nav: Some(Nav::at(&op, &back)),
-            back,
-            title: "Switch to Kryphocron only".to_string(),
-            what: "Prism stops answering public Bluesky requests and deletes the public data it stored, in the background. Only what kryphocron posts and Horizon features need is kept: blocks, follows involving members, profiles, and members' own records.".to_string(),
-            undo: "Switching back to Community refills public data; public requests come back when the refill is done.".to_string(),
-            action: "/admin/settings/public-scope".to_string(),
-            csrf: op.csrf.clone(),
-            hidden: vec![Hidden { name: "value".to_string(), value: value.as_str().to_string() }],
-            typed: Some(word.to_string()),
-            button: "Switch".to_string(),
-            error: None,
-        };
-        if form.confirm.as_deref() != Some("yes") {
-            return render(StatusCode::OK, &page);
-        }
-        if !typed_matches(word, form.typed.as_deref()) {
-            page.error = Some(format!("Type {word} exactly to confirm."));
-            return render(StatusCode::BAD_REQUEST, &page);
-        }
-    }
-    enqueue(&state, &op, &AdminCommand::IndexingPublicScope { value }).await
 }
 
 /// The confirmation of a restart.

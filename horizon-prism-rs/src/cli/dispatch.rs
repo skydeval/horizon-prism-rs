@@ -41,7 +41,7 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: LabelAction,
     },
-    /// Scope maintenance: the nightly clean-up of the accounts Prism keeps.
+    /// The nightly clean-up of the accounts Prism keeps (Storage, Jobs).
     Scope {
         #[command(subcommand)]
         action: ScopeAction,
@@ -84,7 +84,7 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: ListsAction,
     },
-    /// Public indexing as an operator switch.
+    /// Indexing: what Prism indexes, and its progress.
     Indexing {
         #[command(subcommand)]
         action: IndexingAction,
@@ -207,8 +207,8 @@ pub enum HostAction {
 
 #[derive(Debug, Subcommand)]
 pub enum IndexingAction {
-    /// Turn public indexing off (its data is deleted in the background) or
-    /// back on (it is refilled to backfill depth).
+    /// Set what Prism indexes: kryphocron_only (stored public data is
+    /// deleted in the background) or community (it is refilled).
     PublicScope {
         /// kryphocron_only | community
         value: String,

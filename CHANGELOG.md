@@ -29,6 +29,8 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Admin:** Indexing and Storage pages; the disk, database and
+  public-data checks link to them.
 - **Admin:** Blocks · Farsight and Communities · Refract hold their
   settings; pending ends have their own tab; Thread Lens has a page.
 - **Admin:** Members holds auto-join and the member limit (was "Most

@@ -106,7 +106,11 @@ async fn the_sidebar_markup_is_the_mocks() {
                 ("/admin/thread-lens", "Thread Lens", None),
             ],
         ),
-        ("data", "Data", &[("/admin/jobs", "Jobs", None), ("/admin/problems", "Problems", None)]),
+        (
+            "data",
+            "Data",
+            &[("/admin/indexing", "Indexing", None), ("/admin/storage", "Storage", None), ("/admin/jobs", "Jobs", None), ("/admin/problems", "Problems", None)],
+        ),
         (
             "system",
             "System",
@@ -660,6 +664,8 @@ const TABLES: &[Expected] = &[
     ("/admin/communities/pending", &[("Why", PENDING)]),
     ("/admin/communities/accounts/{BOB}", &[("Labeler", &["name", "name", "name", "when", "when", "state", "state"]), ("When", &["when", "state", "state", "text"])]),
     ("/admin/jobs", &[("Kind", &["state", "num", "num", "num", "num", "num", "num"]), ("Why", &["text", "num"]), ("Account", &["name", "state", "num", "text", "when", "actions"])]),
+    ("/admin/indexing", &[]),
+    ("/admin/storage", &[]),
     ("/admin/health", &[("Check", &["name", "state", "text"])]),
     ("/admin/stats", &[("Request", &["name", "num", "num", "num", "num", "num", "num", "when"]), ("Request", &["name"])]),
     (
@@ -763,7 +769,7 @@ fn redirected(path: &str) -> bool {
 
 /// The old paths of moved forms, which no page may post to: each also an
 /// old group's page, `/admin/settings/{slug}`.
-const ALIASES: &[&str] = &["/admin/refract/add", "/admin/refract/check", "/admin/refract/end", "/admin/settings/appearance"];
+const ALIASES: &[&str] = &["/admin/refract/add", "/admin/refract/check", "/admin/refract/end", "/admin/settings/appearance", "/admin/settings/public-scope"];
 
 /// Whether a form's `action` is an old path kept only for pages loaded
 /// before it moved.
@@ -835,7 +841,7 @@ async fn every_old_address_redirects() {
             assert_eq!(get(&alice, &url(&format!("{to}{q}"))).await.status, 200, "{to}{q}");
         }
     }
-    assert_eq!(GROUP_REDIRECTS.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(), ["communities", "blocks", "access"]);
+    assert_eq!(GROUP_REDIRECTS.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(), ["communities", "blocks", "access", "storage"]);
     // The encoded port reaches the account page as one DID.
     let account = get(&alice, &url("/admin/communities/accounts/did:web:h%253A8080")).await;
     assert!(account.body.contains("did:web:h%3A8080") && !account.body.contains("did:web:h:8080"), "{}", account.body);
@@ -878,9 +884,9 @@ async fn every_old_address_redirects() {
     assert_eq!(communities.status, 404);
     assert_eq!(count(h.pool(), "SELECT count(*) FROM admin_commands").await, before);
     // A group with keys left is still its page.
-    let storage = get(&alice, &url("/admin/settings/storage")).await;
-    assert_eq!(storage.status, 200);
-    assert_eq!(current_item(&storage.body), Some(("All settings".to_string(), "true".to_string())), "{}", storage.body);
+    let private = get(&alice, &url("/admin/settings/private")).await;
+    assert_eq!(private.status, 200);
+    assert_eq!(current_item(&private.body), Some(("All settings".to_string(), "true".to_string())), "{}", private.body);
     h.db.drop_db().await;
 }
 
@@ -930,7 +936,7 @@ async fn only_built_pages_and_no_stale_links() {
         "/admin/communities/accounts/did:plc:nobodynobodynobodynobody".to_string(),
         "/admin/settings/installed".to_string(),
         "/admin/settings/running".to_string(),
-        "/admin/settings/storage".to_string(),
+        "/admin/settings/private".to_string(),
         format!("/admin/lookup?q={BOB}"),
     ] {
         pages.push((path.clone(), get(&alice, &url(&path)).await));
@@ -953,6 +959,15 @@ async fn only_built_pages_and_no_stale_links() {
     let typed = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), ("farsight.fallback.enabled", "on")]).await;
     assert_eq!(typed.status, 200, "{}", typed.body);
     pages.push(("the settings confirmation".to_string(), typed));
+    // The indexing switch's typed confirmation, and its refusal.
+    let switch = post(&alice, &url("/admin/indexing/switch"), &[("csrf", &csrf), ("value", "kryphocron_only")]).await;
+    assert_eq!(switch.status, 200, "{}", switch.body);
+    assert!(switch.body.contains("action=\"/admin/indexing/switch\""), "{}", switch.body);
+    pages.push(("the indexing confirmation".to_string(), switch));
+    let bad = post(&alice, &url("/admin/indexing/switch"), &[("csrf", &csrf), ("value", "everything")]).await;
+    assert_eq!(bad.status, 400, "{}", bad.body);
+    assert!(bad.body.contains("href=\"/admin/indexing\">Indexing</a>"), "{}", bad.body);
+    pages.push(("the indexing refusal".to_string(), bad));
     for (path, page) in &pages {
         let body = &page.body;
         for (action, t) in targets(body) {
@@ -963,7 +978,7 @@ async fn only_built_pages_and_no_stale_links() {
         assert!(!body.contains("style="), "{path}: an inline style");
         assert!(!body.contains("tabindex"), "{path}: a tab index");
         assert_eq!(body.contains("<script"), path == "/admin", "{path}: scripts");
-        for old in ["Refract accounts", "<h1>Instance</h1>", "Most members", "Limit for auto-join", "Blocks (Farsight)", "Who can use Prism", "Fallback and memory settings"] {
+        for old in ["Refract accounts", "<h1>Instance</h1>", "Most members", "Limit for auto-join", "Blocks (Farsight)", "Who can use Prism", "Fallback and memory settings", "What Prism stores"] {
             assert!(!body.contains(old), "{path}: an old name, {old}");
         }
         assert!(current_item(body).is_some(), "{path}: not exactly one marked item: {}", sidebar(body));
@@ -985,7 +1000,7 @@ async fn sub_pages_mark_their_parent() {
         ("/admin/communities/pending".to_string(), "Communities"),
         ("/admin/settings/installed".to_string(), "All settings"),
         ("/admin/settings/running".to_string(), "All settings"),
-        ("/admin/settings/storage".to_string(), "All settings"),
+        ("/admin/settings/private".to_string(), "All settings"),
     ] {
         let page = get(&alice, &format!("{}{path}", h.base)).await;
         assert_eq!(page.status, 200, "{path}");
@@ -1027,6 +1042,9 @@ async fn moved_forms_check_the_token() {
         "/admin/settings/save",
         "/admin/settings/access",
         "/admin/settings/blocks",
+        "/admin/settings/storage",
+        "/admin/indexing/switch",
+        "/admin/settings/public-scope",
         "/admin/communities/keep",
     ] {
         let target = format!("{}{path}", h.base);
@@ -1041,6 +1059,8 @@ async fn moved_forms_check_the_token() {
             ("farsight.memory.max_total", "5"),
             ("scope", "feature"),
             ("keep", "true"),
+            ("value", "kryphocron_only"),
+            ("storage.budget_bytes", "5"),
         ];
         let mut with = vec![("csrf", other.as_str())];
         with.extend(fields);
@@ -1104,8 +1124,8 @@ async fn cancel_goes_back() {
         (None, None),
         (Some("//evil.example"), None),
         (Some("https://evil.example/admin"), None),
-        (Some("/admin/storage"), None),
-        (None, Some("https://prism.example.com/admin/storage")),
+        (Some("/admin/private"), None),
+        (None, Some("https://prism.example.com/admin/private")),
     ] {
         let mut form = vec![("csrf", csrf.as_str()), ("did", CAROL)];
         if let Some(b) = back {

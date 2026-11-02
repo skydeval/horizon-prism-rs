@@ -22,7 +22,7 @@ use axum::response::Response;
 use chrono::{DateTime, TimeDelta, Utc};
 
 use super::health::{Figure, farsight_words, lookups_words};
-use super::settings::phase_words;
+use super::indexing::phase_words;
 use super::{Nav, ago, css, render, when};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};

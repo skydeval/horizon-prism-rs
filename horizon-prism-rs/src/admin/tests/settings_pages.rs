@@ -36,7 +36,7 @@ async fn settings_pages_and_their_forms() {
     let networks: Vec<String> = Vec::new();
     let mut homes: Vec<(String, &str)> = SETTINGS_LIVE.iter().map(|id| (id.page().href.to_string(), id.page().name)).collect();
     homes.extend(Group::ALL.into_iter().filter(|g| !view::sections_at(Place::Group(*g), &networks).is_empty()).map(|g| (format!("/admin/settings/{}", g.slug()), g.title())));
-    assert_eq!(homes.len(), 11);
+    assert_eq!(homes.len(), 12);
     for (path, title) in homes {
         tokio::time::sleep(Duration::from_millis(120)).await;
         let page = alice.get(&url(&path)).await;
@@ -46,7 +46,7 @@ async fn settings_pages_and_their_forms() {
     // Past the ten-pages-a-second limit (§5.6).
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let index = alice.get(&url("/admin/settings")).await;
-    assert!(index.body.contains("Set when Prism was installed") && index.body.contains("What Prism stores") && !index.body.contains("Who can use Prism"), "{}", index.body);
+    assert!(index.body.contains("Set when Prism was installed") && !index.body.contains("What Prism stores") && !index.body.contains("Who can use Prism"), "{}", index.body);
     assert_eq!(alice.get(&url("/admin/settings/installed")).await.status, 200);
     let running = alice.get(&url("/admin/settings/running")).await;
     assert!(running.body.contains("[community]"), "{}", running.body);
@@ -88,9 +88,10 @@ async fn settings_pages_and_their_forms() {
     assert_eq!(typed.status, 303, "{}", typed.body);
     assert_eq!(queued(p).await.last().map(|q| q.1["changes"][0]["key"].clone()), Some(json!("farsight.fallback.enabled")));
 
-    // Public data off: its own command, typed OFF.
-    let confirm = post(&alice, &url("/admin/settings/public-scope"), &[("csrf", &csrf), ("value", "kryphocron_only")]).await;
-    assert!(confirm.body.contains("<code>OFF</code>"), "{}", confirm.body);
+    // Public data off: its own command, typed OFF, on Indexing; the old
+    // address still takes the confirmed form.
+    let confirm = post(&alice, &url("/admin/indexing/switch"), &[("csrf", &csrf), ("value", "kryphocron_only")]).await;
+    assert!(confirm.body.contains("<code>OFF</code>") && confirm.body.contains("action=\"/admin/indexing/switch\""), "{}", confirm.body);
     let off = post(&alice, &url("/admin/settings/public-scope"), &[("csrf", &csrf), ("value", "kryphocron_only"), ("confirm", "yes"), ("typed", "OFF")]).await;
     assert_eq!(off.status, 303, "{}", off.body);
     assert_eq!(queued(p).await.last().map(|q| (q.0.clone(), q.1.clone())), Some(("indexing public-scope".to_string(), json!({"value": "kryphocron_only"}))));
@@ -116,7 +117,7 @@ async fn settings_pages_and_their_forms() {
     let index = alice.get(&url("/admin/settings")).await;
     assert!(index.body.contains("must be 1 to 100") && index.body.contains("In use until a restart: 7 days"), "{}", index.body);
     // The setting's own page says both.
-    let storage = alice.get(&url("/admin/settings/storage")).await;
+    let storage = alice.get(&url("/admin/storage")).await;
     assert!(storage.body.contains("In use until a restart") && storage.body.contains("Use the default (7 days)"), "{}", storage.body);
 
     // Reset: one change with no value.
@@ -132,7 +133,7 @@ async fn settings_pages_and_their_forms() {
         .expect("notice");
     let home = alice.get(&url("/admin")).await;
     assert!(home.body.contains("app.toml now says 9 days; your saved value 3 days still applies."), "{}", home.body);
-    let storage = alice.get(&url("/admin/settings/storage")).await;
+    let storage = alice.get(&url("/admin/storage")).await;
     assert!(storage.body.contains("Keep my value") && storage.body.contains("Use the file's value"), "{}", storage.body);
     let keep = post(&alice, &url("/admin/settings/keep"), &[("csrf", &csrf), ("key", "retention.tombstone_days"), ("version", "1")]).await;
     assert_eq!(keep.status, 303, "{}", keep.body);
@@ -141,17 +142,19 @@ async fn settings_pages_and_their_forms() {
     // The storage budget is not set by default: an empty field is no
     // change, a size is saved in bytes, and emptying a saved size saves
     // "not set" (null).
-    let storage = alice.get(&url("/admin/settings/storage")).await;
+    let storage = alice.get(&url("/admin/storage")).await;
     assert!(storage.body.contains("name=\"storage.budget_bytes\"") && storage.body.contains("not set"), "{}", storage.body);
-    let unchanged = post(&alice, &url("/admin/settings/storage"), &[("csrf", &csrf), ("storage.budget_bytes", "")]).await;
+    let unchanged = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), ("storage.budget_bytes", "")]).await;
     assert!(unchanged.body.contains("Nothing changed"), "{}", unchanged.body);
+    // Through the old group address, which still saves once it redirects.
+    assert_eq!(alice.get(&url("/admin/settings/storage")).await.status, 308);
     let sized = post(&alice, &url("/admin/settings/storage"), &[("csrf", &csrf), ("storage.budget_bytes", "900"), ("version:storage.budget_bytes", "0")]).await;
     assert_eq!(sized.status, 303, "{}", sized.body);
     assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "storage.budget_bytes", "value": 966_367_641_600u64, "base_version": 0}]})));
     sqlx::query("INSERT INTO operator_settings (key, value, updated_by) VALUES ('storage.budget_bytes', '966367641600', 'cli')").execute(p).await.expect("row");
-    let storage = alice.get(&url("/admin/settings/storage")).await;
+    let storage = alice.get(&url("/admin/storage")).await;
     assert!(storage.body.contains("900 GB") && storage.body.contains("Use the default (not set)"), "{}", storage.body);
-    let emptied = post(&alice, &url("/admin/settings/storage"), &[("csrf", &csrf), ("storage.budget_bytes", " "), ("version:storage.budget_bytes", "1")]).await;
+    let emptied = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), ("storage.budget_bytes", " "), ("version:storage.budget_bytes", "1")]).await;
     assert_eq!(emptied.status, 303, "{}", emptied.body);
     assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "storage.budget_bytes", "value": null, "base_version": 1}]})));
     // A forged form changes nothing (T-A7).

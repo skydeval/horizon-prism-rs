@@ -904,6 +904,8 @@ async fn t_a16_headers_everywhere() {
         "/admin/communities/accounts",
         "/admin/communities/pending",
         "/admin/thread-lens",
+        "/admin/indexing",
+        "/admin/storage",
         "/admin/refract",
         "/admin/appearance",
         "/admin/settings/appearance",

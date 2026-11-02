@@ -9,6 +9,7 @@ pub mod communities;
 pub mod farsight;
 pub mod health;
 pub mod home;
+pub mod indexing;
 pub mod instance;
 pub mod jobs;
 pub mod labels;
@@ -21,6 +22,7 @@ pub mod refract;
 pub mod settings;
 pub mod setup;
 pub mod stats;
+pub mod storage;
 pub mod thread_lens;
 
 use askama::Template;
@@ -381,7 +383,14 @@ pub fn describe(command: &str, args: &Value) -> String {
         "farsight forget" => format!("Forget remembered blocks of {}", arg(args, "did")),
         "lists sync" => format!("Sync list {}", arg(args, "uri")),
         "lists purge" => format!("Clean up the lists of {}", arg(args, "did")),
-        "indexing public-scope" => format!("Set public data to {}", arg(args, "value")),
+        "indexing public-scope" => format!(
+            "Set indexing to {}",
+            match arg(args, "value") {
+                "kryphocron_only" => "Kryphocron only",
+                "community" => "Community",
+                other => other,
+            }
+        ),
         "indexing status" => "Read the public data status".to_string(),
         "settings set" => {
             let names: Vec<String> = args

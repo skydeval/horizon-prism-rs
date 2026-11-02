@@ -18,7 +18,7 @@ use super::home::HomeQuery;
 use super::{Confirm, Nav, ago, bytes, confirmed, css, enqueue, render, when};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, banners, require};
-use crate::admin::health::{self, Action, Check, DeadRows, PRIVATE_INGEST_SOURCE, PRIVATE_READ_CONTENT, PRIVATE_READ_OUTCOMES, Snapshot, count, gather};
+use crate::admin::health::{self, Action, Check, PRIVATE_INGEST_SOURCE, PRIVATE_READ_CONTENT, PRIVATE_READ_OUTCOMES, Snapshot, count, gather};
 use crate::admin_executor::AdminCommand;
 use crate::indexing::PublicMode;
 
@@ -153,17 +153,10 @@ fn or_unknown(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
     v.map_or_else(|| UNKNOWN.to_string(), f)
 }
 
-/// The storage figures read from the database for this request.
-#[derive(Debug, Clone, Copy, Default)]
-struct Stored {
-    /// The highest account id handed out.
-    account_ids: Option<i64>,
-    dead: Option<DeadRows>,
-}
-
-/// The key figures (§6.4).
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-fn figures(state: &AdminState, now: Option<&Snapshot>, stored: Stored) -> Vec<FigureGroup> {
+/// The key figures. Storage and public data are one line each, linking the
+/// page that shows them in full.
+#[allow(clippy::too_many_lines)]
+fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
     let ring = &state.health.ring;
     let get = |name: &str| now.and_then(|s| s.sum(name));
     let mut groups = Vec::new();
@@ -195,27 +188,16 @@ fn figures(state: &AdminState, now: Option<&Snapshot>, stored: Stored) -> Vec<Fi
         note: "The live feed on Home shows what is indexed as it happens.".to_string(),
     });
 
-    let redis = match (get(crate::db::sampler::METRIC_REDIS_USED), get(crate::db::sampler::METRIC_REDIS_MAX)) {
-        (Some(used), Some(max)) if max > 0.0 => format!("{} of {} ({:.0}%)", bytes(used), bytes(max), used / max * 100.0),
-        (Some(used), _) => format!("{} (no limit set)", bytes(used)),
-        _ => UNKNOWN.to_string(),
-    };
-    let ids = stored.account_ids.map_or_else(
-        || UNKNOWN.to_string(),
-        |n| format!("{} of {} ({})", count(n as f64), count(health::ACCOUNT_ID_LIMIT as f64), health::id_share(n)),
-    );
     groups.push(FigureGroup {
         title: "Storage",
-        figures: vec![fig("Database (of its budget)", database_words(state, now)), fig("Redis memory", redis), fig("Account ids used", ids)],
-        note: "Measured every 5 minutes (Redis every 30 seconds, account ids now). Every account Prism stores takes an id; past half used, the Account ids check warns.".to_string(),
+        figures: vec![Figure { link: Some(("/admin/storage", "Storage")), ..fig("Database (of its budget)", database_words(state, now)) }],
+        note: String::new(),
     });
-
-    let mode = state.scope.public_mode();
-    let mut public = vec![fig("Public data", super::settings::phase_words(mode))];
-    if mode == PublicMode::Filling {
-        public.push(fig("Accounts left to refill", or_unknown(get(crate::indexing::public_fill::METRIC_REMAINING), count)));
-    }
-    groups.push(FigureGroup { title: "Public data", figures: public, note: String::new() });
+    groups.push(FigureGroup {
+        title: "Public data",
+        figures: vec![Figure { link: Some(("/admin/indexing", "Indexing")), ..fig("Public data", super::indexing::phase_words(state.scope.public_mode())) }],
+        note: String::new(),
+    });
 
     let schema = match &state.health.schema {
         None => UNKNOWN.to_string(),
@@ -232,19 +214,6 @@ fn figures(state: &AdminState, now: Option<&Snapshot>, stored: Stored) -> Vec<Fi
         ],
         note: String::new(),
     });
-    groups.push(FigureGroup {
-        title: "Stored records",
-        figures: vec![
-            fig("Post records left to compress", or_unknown(get(crate::db::schema_backfill::METRIC_RECOMPRESS_REMAINING), count)),
-            fig("Profile records left to compress", or_unknown(get(crate::db::schema_backfill::METRIC_PROFILE_RECOMPRESS_REMAINING), count)),
-            fig("Other records left to compress", or_unknown(get(crate::db::schema_backfill::METRIC_OTHER_RECOMPRESS_REMAINING), count)),
-            fig("Dead rows in posts", or_unknown(stored.dead.map(|d| d.posts as f64).or_else(|| get(crate::db::schema_backfill::METRIC_POSTS_DEAD_ROWS)), count)),
-            fig("Dead rows in profiles", or_unknown(stored.dead.map(|d| d.profiles as f64), count)),
-            fig("Dead rows in other records", or_unknown(stored.dead.map(|d| d.other as f64), count)),
-        ],
-        note: "Compression starts once 10,000 posts are stored, once 10,000 profiles are, and once 10,000 other records (lists, starter packs, gates, polls, labelers, settings) are. Each compressed row leaves a dead row behind, which Postgres reuses; `VACUUM FULL` on its table (posts, actors, lists, …) or pg_repack returns the space.".to_string(),
-    });
-
     groups.push(FigureGroup {
         title: "Services Prism asks",
         figures: vec![
@@ -308,8 +277,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
     } else {
         op.banners
     };
-    let (checks, account_ids, dead) =
-        tokio::join!(gather(&state, b), health::timed_count(&state.pool, health::ACCOUNT_IDS_SQL), health::record_dead_rows(&state.pool));
+    let checks = gather(&state, b).await;
     let now = state.health.now();
     let started = state.settings.started_at;
     render(
@@ -322,7 +290,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             started: format!("{} ({})", when(started), ago(started)),
             young: chrono::Utc::now() - started < chrono::TimeDelta::minutes(5),
             checks: checks.into_iter().map(CheckView::from).collect(),
-            groups: figures(&state, now.as_ref(), Stored { account_ids, dead }),
+            groups: figures(&state, now.as_ref()),
         },
     )
 }

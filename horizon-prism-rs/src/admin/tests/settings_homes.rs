@@ -330,6 +330,121 @@ async fn moderation_pages_hold_their_settings() {
     h.db.drop_db().await;
 }
 
+/// Indexing and Storage hold their settings, Storage's rarer ones folded.
+/// The indexing switch asks OFF, keeps Cancel on Indexing, and queues on the
+/// right word, also through its old address; its command page leads back.
+/// Health, Jobs and Home keep one line each, leading to the two pages.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn data_pages_hold_their_settings() {
+    let Some(h) = harness("admin_homes_data").await else {
+        return;
+    };
+    let p = h.pool();
+    let alice = complete_setup(&h, ALICE).await;
+    let url = |path: &str| format!("{}{path}", h.base);
+    let storage = get(&alice, &url("/admin/storage")).await;
+    assert_eq!(storage.status, 200, "{}", storage.body);
+    let body = &storage.body;
+    assert!(body.contains("<form id=\"settings\" class=\"stack\" method=\"post\" action=\"/admin/settings/save\">"), "{body}");
+    assert!(body.contains("<details class=\"advanced\" id=\"advanced\"><summary>Advanced</summary>"), "{body}");
+    for key in ["storage.budget_bytes", "retention.notification_days", "retention.max_age_days", "retention.run_at_utc", "scope.reply_quote_days", "scope.like_repost_days"] {
+        assert!(!folded(body, key), "{key} is folded");
+    }
+    for key in ["retention.tombstone_days", "scope.rebuild_grace_days", "scope.sweep_max_purges"] {
+        assert!(folded(body, key), "{key} is not folded");
+    }
+    assert!(get(&alice, &url("/admin/storage?open=advanced")).await.body.contains("<details class=\"advanced\" id=\"advanced\" open>"));
+    let indexing = get(&alice, &url("/admin/indexing")).await;
+    assert_eq!(indexing.status, 200, "{}", indexing.body);
+    let body = &indexing.body;
+    assert!(body.contains("<form class=\"stack\" method=\"post\" action=\"/admin/indexing/switch\">") && body.contains("technical name: indexing.public_scope"), "{body}");
+    assert!(body.contains("<span class=\"l\">Now</span><span class=\"v\">on</span>") && !folded(body, "indexing.fill_max_wait_hours"), "{body}");
+    assert!(!body.contains("<details class=\"advanced\"") && !body.contains("Accounts left to refill"), "{body}");
+    let csrf = csrf_of(&indexing);
+
+    // The switch to Kryphocron only: asked, Cancel back to Indexing, then
+    // queued; the old address takes it too.
+    let switch = url("/admin/indexing/switch");
+    let before = queued(p).await.len();
+    let ask = post_from(&alice, &switch, &[("csrf", &csrf), ("value", "kryphocron_only")], &format!("https://{HOST}/admin/indexing")).await;
+    assert_eq!(ask.status, 200, "{}", ask.body);
+    assert!(ask.body.contains("<code>OFF</code>") && ask.body.contains("action=\"/admin/indexing/switch\""), "{}", ask.body);
+    assert_eq!(link_before(&ask.body, "Cancel"), "/admin/indexing");
+    assert_eq!(crate::admin::test_support::current_item(&ask.body), Some(("Indexing".to_string(), "page".to_string())));
+    let wrong = post(&alice, &switch, &[("csrf", &csrf), ("value", "kryphocron_only"), ("confirm", "yes"), ("typed", "nope"), ("back", "/admin/indexing")]).await;
+    assert_eq!(wrong.status, 400, "{}", wrong.body);
+    assert_eq!(link_before(&wrong.body, "Cancel"), "/admin/indexing");
+    let bad = post(&alice, &switch, &[("csrf", &csrf), ("value", "everything")]).await;
+    assert_eq!(bad.status, 400, "{}", bad.body);
+    assert_eq!(link_before(&bad.body, "Indexing"), "/admin/indexing");
+    assert_eq!(queued(p).await.len(), before, "nothing queued unconfirmed");
+    let right = post(&alice, &switch, &[("csrf", &csrf), ("value", "kryphocron_only"), ("confirm", "yes"), ("typed", "OFF")]).await;
+    assert_eq!(right.status, 303, "{}", right.body);
+    assert_eq!(queued(p).await.last().cloned(), Some(("indexing public-scope".to_string(), json!({"value": "kryphocron_only"}))));
+    let command = get(&alice, &url(location(&right))).await;
+    assert!(command.body.contains("Set indexing to Kryphocron only"), "{}", command.body);
+    assert!(command.body.contains("<a class=\"button\" href=\"/admin/indexing\">Back to Indexing</a>"), "{}", command.body);
+    let old = post(&alice, &url("/admin/settings/public-scope"), &[("csrf", &csrf), ("value", "community")]).await;
+    assert_eq!(old.status, 303, "{}", old.body);
+    assert_eq!(queued(p).await.last().cloned(), Some(("indexing public-scope".to_string(), json!({"value": "community"}))));
+
+    // Saving from Storage, and through the old group address once it
+    // redirects.
+    let save = url("/admin/settings/save");
+    let same = post(&alice, &save, &[("csrf", &csrf), ("back", "/admin/storage"), ("retention.notification_days", "90")]).await;
+    assert!(same.body.contains("Nothing changed"), "{}", same.body);
+    assert_eq!(link_before(&same.body, "Back to Storage"), "/admin/storage");
+    let saved = post(&alice, &save, &[("csrf", &csrf), ("back", "/admin/storage"), ("scope.sweep_max_purges", "7"), ("version:scope.sweep_max_purges", "0")]).await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "scope.sweep_max_purges", "value": 7, "base_version": 0}]})));
+    assert_eq!(get(&alice, &url("/admin/settings/storage")).await.status, 308);
+    let old = post(&alice, &url("/admin/settings/storage"), &[("csrf", &csrf), ("retention.notification_days", "12"), ("version:retention.notification_days", "0")]).await;
+    assert_eq!(old.status, 303, "{}", old.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "retention.notification_days", "value": 12, "base_version": 0}]})));
+
+    // Health: one line each, leading to the page; the rest is on Storage.
+    let health = get(&alice, &url("/admin/health")).await;
+    for line in [
+        "<span class=\"l\">Public data</span><span class=\"v\">on — <a href=\"/admin/indexing\">Indexing</a></span>",
+        "<span class=\"l\">Database (of its budget)</span><span class=\"v\">unknown — <a href=\"/admin/storage\">Storage</a></span>",
+    ] {
+        assert!(health.body.contains(line), "{line}: {}", health.body);
+    }
+    for gone in ["Account ids used", "Dead rows in posts", "Post records left to compress", "<h3>Stored records</h3>", "Redis memory</span>"] {
+        assert!(!health.body.contains(gone), "{gone}: {}", health.body);
+    }
+    // The jobs' clean-up timing is on Storage.
+    let jobs = get(&alice, &url("/admin/jobs")).await;
+    assert!(jobs.body.contains("are on <a href=\"/admin/storage\">Storage</a>."), "{}", jobs.body);
+    // Home's tiles lead to both.
+    let home = get(&alice, &url("/admin")).await;
+    for href in ["<a href=\"/admin/indexing\">", "<a href=\"/admin/storage\">"] {
+        assert!(home.body.contains(href), "{href}: {}", home.body);
+    }
+
+    // While a refill runs: Jobs' line leads to Indexing, which shows the
+    // accounts left and when the longest wait ends.
+    {
+        let mut sets = h.scope.write_guard().await;
+        h.scope.set_public(&mut sets, crate::indexing::PublicState { mode: crate::indexing::PublicMode::Filling, generation: 2, last_fill_since: None });
+    }
+    let jobs = get(&alice, &url("/admin/jobs")).await;
+    assert!(jobs.body.contains("Public requests come back when it is done. — <a href=\"/admin/indexing\">Indexing</a></div>"), "{}", jobs.body);
+    let filling = get(&alice, &url("/admin/indexing")).await;
+    assert!(filling.body.contains("Accounts left to refill") && filling.body.contains("24 hours from when every account is queued"), "{}", filling.body);
+    sqlx::query(
+        "INSERT INTO worker_state (key, value) VALUES ('public_transition', jsonb_build_object('fill', jsonb_build_object('waiting_since', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')))) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(p)
+    .await
+    .expect("transition");
+    let waiting = get(&alice, &url("/admin/indexing")).await;
+    assert!(waiting.body.contains("Waiting for the last accounts since") && waiting.body.contains("(in 24 hours)"), "{}", waiting.body);
+    h.db.drop_db().await;
+}
+
 /// Reset and keep from Members, a typed reset's Cancel kept through a
 /// wrong word, and each file notice on Home leading to the setting.
 #[tokio::test]
@@ -404,6 +519,9 @@ async fn the_command_page_leads_back() {
         ("threadlens.access", "members", "/admin/thread-lens#s-threadlens-access", "Back to Thread Lens"),
         ("farsight.burst", "77", "/admin/blocks?open=advanced#s-farsight-rate_per_sec", "Back to Blocks"),
         ("rate_limits.refract.burst", "77", "/admin/communities?open=advanced#s-rate_limits-refract-per_sec", "Back to Communities"),
+        ("indexing.fill_max_wait_hours", "5", "/admin/indexing#s-indexing-fill_max_wait_hours", "Back to Indexing"),
+        ("retention.notification_days", "9", "/admin/storage#s-retention-notification_days", "Back to Storage"),
+        ("scope.sweep_max_purges", "9", "/admin/storage?open=advanced#s-scope-sweep_max_purges", "Back to Storage"),
     ] {
         let version = format!("version:{key}");
         let saved = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), (key, value), (&version, "0")]).await;
@@ -428,7 +546,7 @@ async fn all_settings_lists_where_settings_are() {
     let own = &body[body.find("<h2>On their own pages</h2>").expect("own pages")..];
     let own = &own[..own.find("</div>").expect("card end")];
     let hrefs: Vec<&str> = own.match_indices("href=\"").map(|(i, _)| &own[i + 6..i + 6 + own[i + 6..].find('"').expect("end")]).collect();
-    assert_eq!(hrefs, ["/admin/members", "/admin/blocks", "/admin/communities", "/admin/thread-lens"], "{own}");
+    assert_eq!(hrefs, ["/admin/members", "/admin/blocks", "/admin/communities", "/admin/thread-lens", "/admin/indexing", "/admin/storage"], "{own}");
     assert!(own.contains(">Communities · Refract</a>") && own.contains(">Blocks · Farsight</a>"), "{own}");
     let networks: Vec<String> = Vec::new();
     for g in Group::ALL {
@@ -436,6 +554,7 @@ async fn all_settings_lists_where_settings_are() {
         assert_eq!(body.contains(&card), !view::sections_at(Place::Group(g), &networks).is_empty(), "{}", g.slug());
     }
     assert!(!body.contains("Who can use Prism") && !body.contains("Blocks (Farsight)") && !body.contains("/admin/settings/blocks"), "{body}");
+    assert!(!body.contains("What Prism stores") && !body.contains("/admin/settings/storage"), "{body}");
     // A group that lost some settings names only those left.
     assert!(body.contains("<h2><a href=\"/admin/settings/limits\">Limits</a></h2>"), "{body}");
     let limits = &body[body.find("/admin/settings/limits").expect("limits")..];

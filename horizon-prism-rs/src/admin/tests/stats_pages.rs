@@ -1,8 +1,9 @@
-//! Stats over HTTP (admin-ui design §6.5, §10; T-A14): the disks (two
-//! paths on one filesystem shown once, a missing mount "not visible"), the
-//! storage figures, the counts from the sampler's series and the scope
-//! sets, the private tier's figures through its own labels, endpoint usage
-//! with the never-used list, and the Disk check and the fullest-disk tile.
+//! Stats and Storage over HTTP: on Storage the disks (two paths on one
+//! filesystem shown once, a missing mount "not visible") and the storage
+//! figures; on Stats one line of them, the counts from the sampler's series
+//! and the scope sets, the private tier's figures through its own labels,
+//! endpoint usage with the never-used list; and the Disk check and the
+//! fullest-disk tile, both leading to Storage.
 
 use super::*;
 use crate::admin::health::{HealthInputs, MetricsText};
@@ -53,12 +54,9 @@ async fn stats_page_and_the_disk_tile() {
     assert_eq!(page.status, 200, "{}", page.body);
     assert_eq!(crate::admin::test_support::current_item(&page.body), Some(("Stats".to_string(), "page".to_string())), "{}", page.body);
     for text in [
-        // One filesystem, shown once; Redis's mount is missing.
-        "the database (Postgres)</h3>",
-        "Prism cannot see the disk of Redis.",
-        "% used",
-        // Storage and counts.
-        "3.0 GB",
+        // Storage in one line, leading to its page.
+        "Database: 3.0 GB (no budget set) — <a href=\"/admin/storage\">Storage</a>",
+        // Counts.
         "about 12,345",
         "Followed by a member",
         "<span class=\"v\">40</span>",
@@ -82,14 +80,37 @@ async fn stats_page_and_the_disk_tile() {
     ] {
         assert!(page.body.contains(text), "{text}: {}", page.body);
     }
-    assert_eq!(page.body.matches("<h3>Disk holding").count(), 1, "{}", page.body);
+    assert!(!page.body.contains("<h2>Disks</h2>") && !page.body.contains("Disk holding") && !page.body.contains("Redis memory"), "{}", page.body);
     // The private table is listed under its label, its own name in grey.
     assert!(page.body.contains(&format!("Private posts<br><span class=\"muted tech\">{private}</span>")), "{}", page.body);
 
-    // The Disk check on Health, and the fullest disk on Home.
+    // Storage: one filesystem, shown once; Redis's mount is missing; the
+    // database against its budget.
+    let storage = get(&alice, &format!("{}/admin/storage", h.base)).await;
+    assert_eq!(storage.status, 200, "{}", storage.body);
+    for text in [
+        "the database (Postgres)</h3>",
+        "Prism cannot see the disk of Redis.",
+        "% used",
+        "<span class=\"l\">Database (of its budget)</span><span class=\"v\">3.0 GB (no budget set)</span>",
+        "Redis memory (of its limit)",
+        "Account ids used",
+        "Post records left to compress",
+        "Dead rows in posts",
+        "name=\"storage.budget_bytes\"",
+    ] {
+        assert!(storage.body.contains(text), "{text}: {}", storage.body);
+    }
+    assert_eq!(storage.body.matches("<h3>Disk holding").count(), 1, "{}", storage.body);
+
+    // The Disk check on Health, and the fullest disk on Home, lead there.
     let health = get(&alice, &format!("{}/admin/health", h.base)).await;
     assert!(health.body.contains("<td class=\"name\">Disk</td>") && health.body.contains("The disk holding"), "{}", health.body);
+    let disk = &health.body[health.body.find("<td class=\"name\">Disk</td>").expect("disk")..];
+    let disk = &disk[..disk.find("</tr>").expect("row end")];
+    assert!(disk.contains("<a href=\"/admin/storage\">Storage</a>"), "{disk}");
     let home = get(&alice, &format!("{}/admin", h.base)).await;
     assert!(home.body.contains("Fullest disk") && home.body.contains("% used), "), "{}", home.body);
+    assert!(home.body.contains("<span class=\"v\"><a href=\"/admin/storage\">"), "{}", home.body);
     h.db.drop_db().await;
 }
